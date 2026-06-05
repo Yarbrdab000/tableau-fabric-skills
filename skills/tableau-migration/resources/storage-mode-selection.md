@@ -41,7 +41,12 @@ fields that drive the decision:
 
 > A `collection` relation (a container of **independent** sheets/tables, e.g. multi-sheet Excel) is NOT a
 > join/union — the parser drops the container and emits each child as its own table, so it stays a clean
-> multi-table Import.
+> multi-table Import. The same applies to the **federated cloud-warehouse object model** (Tableau 2023+):
+> a real Snowflake / Databricks / Azure SQL `.tds` nests the true class in a `federated` named connection
+> and lists its tables as a `collection` of three-part `[catalog].[schema].[table]` relations. The parser
+> promotes those to typed `table` relations (validated against real Snowflake and Databricks Superstore
+> exports — 3 tables each), so they rebuild as **N DirectQuery tables** instead of falling back to
+> land-to-Delta. See [connection-binding.md](connection-binding.md) for the parsing details.
 
 ### Connector support tiers
 
@@ -158,6 +163,12 @@ else:
 | M / connection parameters | On-prem **gateway** setup for DirectQuery |
 | Column typing, relationship inference | Reviewing custom-SQL folding before refresh |
 | Connection bind inputs | Repairing calc → DAX stubs |
+| Auth-method label → advised credential type | Setting a Snowflake **compute warehouse** when the `.tds` carried an empty one |
+
+> **Empty Snowflake warehouse.** When a real Snowflake `.tds` stores `warehouse=''`, the rebuild still
+> chooses DirectQuery and emits a valid `#"Warehouse"` parameter, but `manual_followups` flags that a
+> compute warehouse must be set before refresh (and the emitted M carries a `///` TMDL description saying
+> the same). Snowflake cannot run queries without a warehouse, so this stays a user step.
 
 ## DirectLake is never auto-selected here
 

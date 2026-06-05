@@ -268,6 +268,93 @@ SYNAPSE_SERVERLESS = """<?xml version='1.0' encoding='utf-8' ?>
   </connection>
 </datasource>"""
 
+# Authored federated three-part-name collections (Tableau 2023+ object model). The same physical
+# tables appear under a <relation type='collection'> AND again under a logical object-model layer;
+# their columns live in <metadata-record class='column'> keyed by the bare relation name. These are
+# original fixtures (own catalog/schema/table/column names), not reproductions of any live .tds.
+SNOWFLAKE_COLLECTION = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Retail' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='sf' name='snowflake.x'>
+        <connection authentication='Username Password' class='snowflake' dbname='RETAILDB'
+                    schema='SALESM' server='myorg-acct.snowflakecomputing.com'
+                    username='svc_loader' warehouse='' />
+      </named-connection>
+    </named-connections>
+    <relation type='collection'>
+      <relation connection='snowflake.x' name='INVOICE' table='[RETAILDB].[SALESM].[INVOICE]' type='table' />
+      <relation connection='snowflake.x' name='CUSTOMER' table='[RETAILDB].[SALESM].[CUSTOMER]' type='table' />
+    </relation>
+    <object-model>
+      <relation type='collection'>
+        <relation connection='snowflake.x' name='INVOICE' table='[RETAILDB].[SALESM].[INVOICE]' type='table' />
+        <relation connection='snowflake.x' name='CUSTOMER' table='[RETAILDB].[SALESM].[CUSTOMER]' type='table' />
+      </relation>
+    </object-model>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>INVOICE_NO</remote-name><local-name>[INVOICE_NO]</local-name>
+        <parent-name>[INVOICE]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>AMOUNT</remote-name><local-name>[AMOUNT]</local-name>
+        <parent-name>[INVOICE]</parent-name><local-type>real</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>CUSTOMER_NO</remote-name><local-name>[CUSTOMER_NO]</local-name>
+        <parent-name>[CUSTOMER]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>TIER</remote-name><local-name>[TIER]</local-name>
+        <parent-name>[CUSTOMER]</parent-name><local-type>string</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+DATABRICKS_COLLECTION = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Lake' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='dbx' name='databricks.y'>
+        <connection authentication='oauth' class='databricks' dbname='lakehouse_cat'
+                    instanceurl='https://adb-evt.example.net/oidc' oauth-config-id='oauth-secret-id'
+                    schema='silver' server='adb-evt.example.net'
+                    username='svc_admin@example.com' v-http-path='/sql/1.0/warehouses/cafe1234' />
+      </named-connection>
+    </named-connections>
+    <relation type='collection'>
+      <relation connection='databricks.y' name='WEB_EVENT' table='[lakehouse_cat].[silver].[WEB_EVENT]' type='table' />
+      <relation connection='databricks.y' name='ACCOUNT' table='[lakehouse_cat].[silver].[ACCOUNT]' type='table' />
+    </relation>
+    <object-model>
+      <relation type='collection'>
+        <relation connection='databricks.y' name='WEB_EVENT' table='[lakehouse_cat].[silver].[WEB_EVENT]' type='table' />
+        <relation connection='databricks.y' name='ACCOUNT' table='[lakehouse_cat].[silver].[ACCOUNT]' type='table' />
+      </relation>
+    </object-model>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>EVENT_ID</remote-name><local-name>[EVENT_ID]</local-name>
+        <parent-name>[WEB_EVENT]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>EVENT_TS</remote-name><local-name>[EVENT_TS]</local-name>
+        <parent-name>[WEB_EVENT]</parent-name><local-type>datetime</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>ACCOUNT_ID</remote-name><local-name>[ACCOUNT_ID]</local-name>
+        <parent-name>[ACCOUNT]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>PLAN</remote-name><local-name>[PLAN]</local-name>
+        <parent-name>[ACCOUNT]</parent-name><local-type>string</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
 # Faithful reproduction of a modern multi-sheet Excel ``.tds`` (the published Superstore
 # sample): a <relation type='collection'> container wrapping the physical sheet tables, the
 # SAME tables duplicated under the logical <properties> layer, and columns in <metadata-records>.
@@ -700,6 +787,132 @@ def test_emit_databricks_custom_sql_is_scaffold():
     assert "TODO" in body
     assert "Databricks.Catalogs" in body
     assert "Value.NativeQuery" not in body
+
+
+# -- federated three-part-name collections (Tableau 2023+ object model) ---------
+def test_parse_snowflake_federated_collection_yields_directquery_tables():
+    # A <relation type='collection'> of three-part-name tables (duplicated under the logical layer)
+    # must promote to independent kind='table' relations WITH columns + a parsed catalog/schema/item
+    # -- and de-duplicate across the two layers -- so the datasource rebuilds as N DirectQuery tables
+    # instead of collapsing to the land-to-Delta fallback.
+    d = parse_tds(SNOWFLAKE_COLLECTION)
+    assert d["connection_class"] == "snowflake"
+    assert d["unsupported_reasons"] == []
+    tables = [r for r in d["relations"] if r["kind"] == "table"]
+    assert len(tables) == 2                                   # de-duplicated across both layers
+    by_item = {t["item"]: t for t in tables}
+    assert set(by_item) == {"INVOICE", "CUSTOMER"}
+    assert by_item["INVOICE"]["catalog"] == "RETAILDB"
+    assert by_item["INVOICE"]["schema"] == "SALESM"
+    assert len(by_item["INVOICE"]["columns"]) == 2
+    assert len(by_item["CUSTOMER"]["columns"]) == 2
+    from storage_mode import select_storage_mode
+    decision = select_storage_mode(d)
+    assert decision["mode"] == "DirectQuery"
+    assert decision["connector"] == "Snowflake.Databases"
+    assert decision["fully_supported"] is True
+    assert decision["fallback"] is None
+
+
+def test_snowflake_collection_emits_three_part_navigation():
+    d = parse_tds(SNOWFLAKE_COLLECTION)
+    inv = next(r for r in d["relations"] if r.get("item") == "INVOICE")
+    body = emit_m_partition_source(inv, d, "DirectQuery")
+    assert 'Source = Snowflake.Databases(#"Server", #"Warehouse")' in body
+    assert 'Source{[Name="RETAILDB", Kind="Database"]}[Data]' in body
+    assert 'Db{[Name="SALESM", Kind="Schema"]}[Data]' in body
+    assert 'Schema{[Name="INVOICE", Kind="Table"]}[Data]' in body
+    assert "TODO" not in body
+
+
+def test_snowflake_empty_warehouse_emits_flagged_param():
+    # warehouse='' in the .tds -> keep #"Warehouse" so Snowflake.Databases stays a valid call, but
+    # flag it loudly rather than silently emitting a broken empty-arg connection.
+    d = parse_tds(SNOWFLAKE_COLLECTION)
+    assert d["warehouse"] == ""
+    params = emit_connection_parameters(d)
+    assert 'expression Warehouse = ""' in params
+    assert "TODO" in params and "warehouse" in params.lower()
+    from storage_mode import select_storage_mode
+    followups = select_storage_mode(d)["manual_followups"]
+    assert any("Warehouse" in f for f in followups)
+
+
+def test_snowflake_collection_auth_method_maps_to_basic_no_secret_leak():
+    d = parse_tds(SNOWFLAKE_COLLECTION)
+    assert d["auth_method"] == "Username Password"
+    details = connection_details_for_bind(d)
+    assert details["credential_kind"] == "Basic"               # 'Username Password' -> Basic
+    blob = repr(d) + repr(details)
+    assert "svc_loader" not in blob                            # the username value is never read
+
+
+def test_parse_databricks_federated_collection_yields_directquery_tables():
+    d = parse_tds(DATABRICKS_COLLECTION)
+    assert d["connection_class"] == "databricks"
+    assert d["unsupported_reasons"] == []
+    tables = [r for r in d["relations"] if r["kind"] == "table"]
+    assert len(tables) == 2
+    by_item = {t["item"]: t for t in tables}
+    assert set(by_item) == {"WEB_EVENT", "ACCOUNT"}
+    assert by_item["WEB_EVENT"]["catalog"] == "lakehouse_cat"
+    assert by_item["WEB_EVENT"]["schema"] == "silver"
+    assert len(by_item["WEB_EVENT"]["columns"]) == 2
+    from storage_mode import select_storage_mode
+    decision = select_storage_mode(d)
+    assert decision["mode"] == "DirectQuery"
+    assert decision["connector"] == "Databricks.Catalogs"
+    assert decision["fully_supported"] is True
+    assert decision["fallback"] is None
+
+
+def test_databricks_collection_reads_v_http_path_and_emits_unity_nav():
+    d = parse_tds(DATABRICKS_COLLECTION)
+    assert d["http_path"] == "/sql/1.0/warehouses/cafe1234"    # read from the v-http-path attribute
+    evt = next(r for r in d["relations"] if r.get("item") == "WEB_EVENT")
+    body = emit_m_partition_source(evt, d, "DirectQuery")
+    assert 'Source = Databricks.Catalogs(#"Server", #"HttpPath")' in body
+    assert 'Source{[Name="lakehouse_cat", Kind="Database"]}[Data]' in body
+    assert 'Db{[Name="silver", Kind="Schema"]}[Data]' in body
+    assert 'Schema{[Name="WEB_EVENT", Kind="Table"]}[Data]' in body
+    assert "TODO" not in body
+    params = emit_connection_parameters(d)
+    assert 'expression HttpPath = "/sql/1.0/warehouses/cafe1234"' in params
+
+
+def test_databricks_collection_auth_method_maps_to_oauth_no_secret_leak():
+    d = parse_tds(DATABRICKS_COLLECTION)
+    assert d["auth_method"] == "oauth"
+    details = connection_details_for_bind(d)
+    assert details["credential_kind"] == "OAuth2"              # 'oauth' -> OAuth2
+    blob = repr(d) + repr(details)
+    for secret in ("svc_admin@example.com", "oauth-secret-id", "adb-evt.example.net/oidc"):
+        assert secret not in blob                              # only non-secret fields are read
+
+
+def test_sqlserver_cross_database_three_part_name_is_scaffold():
+    # A SQL Server table fully-qualified to a DIFFERENT catalog than the connection database is a
+    # cross-database reference. Sql.Database(server, database) scopes a single database, so we
+    # scaffold rather than silently bind the connection's default database (which the older 2-part
+    # parser avoided by rejecting the 3-part name outright).
+    rel = {"kind": "table", "name": "Orders", "catalog": "OtherDb", "schema": "dbo",
+           "item": "Orders", "columns": []}
+    body = emit_m_partition_source(
+        rel, {"connection_class": "sqlserver", "database": "Sales"}, "DirectQuery")
+    assert "TODO" in body
+    assert "cross-database" in body
+    assert 'Source{[Schema=' not in body
+
+
+def test_sqlserver_three_part_name_matching_database_emits_normally():
+    # A redundant catalog qualifier equal to the connection database is dropped -> normal flat nav.
+    rel = {"kind": "table", "name": "Orders", "catalog": "Sales", "schema": "dbo",
+           "item": "Orders", "columns": []}
+    body = emit_m_partition_source(
+        rel, {"connection_class": "sqlserver", "database": "Sales"}, "DirectQuery")
+    assert 'Source = Sql.Database(#"Server", #"Database")' in body
+    assert 'Source{[Schema="dbo", Item="Orders"]}[Data]' in body
+    assert "TODO" not in body
 
 
 # Analysis Services (SSAS / MSOLAP) is already a tabular/multidimensional model -- never a naive
