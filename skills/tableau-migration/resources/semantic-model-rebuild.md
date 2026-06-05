@@ -98,9 +98,12 @@ the two assemblers underneath. Deploy itself is **delegated** — see
 
 ## What is NOT rebuilt
 
-Hierarchies, calculated columns, sets/groups/bins, what-if parameters, calc groups, field parameters, RLS
-roles, perspectives, and display folders are **not generated** by v1. The scripts do **not** auto-detect
-them — the assembler's `report` covers only the storage decision, tables, skipped tables, measures, and
-relationships. When the agent has the Tableau metadata it should enumerate any of these objects the
-datasource uses and list them as manual follow-ups; they are never approximated. See
+Calculated columns, sets/groups/bins, what-if parameters, calc groups, field parameters, and perspectives
+are **not generated** by v1. The scripts do **not** auto-detect them; when the agent has the Tableau
+metadata it should enumerate any the datasource uses and list them as manual follow-ups — they are never
+approximated.
+
+**Hierarchies, display folders, and RLS roles _are_ rebuilt** (additively) by the model-object enrichment
+layer — auto-derived from the `.tds`, resolved against the rebuilt model, and reported in
+`report["model_objects"]`. See [model-enrichment.md](model-enrichment.md) and
 [feature-parity.md](feature-parity.md).

@@ -262,9 +262,10 @@ Full matrix in [feature-parity.md](resources/feature-parity.md). Headline parity
 | Storage mode / upstream connection | ✅ Auto-selected; `Sql.Database` family (SQL Server/Azure SQL DB/Postgres/MySQL/Redshift) fully emitted; Oracle/Teradata/Snowflake/BigQuery scaffolded (verified per-connector M in progress). |
 | LOD expressions (FIXED/INCLUDE/EXCLUDE), table calcs (WINDOW_*/RUNNING_*) | ❌ Not translated — preserved as stubs for manual/LLM completion. |
 | Worksheet / dashboard → Power BI report | ❌ **Roadmap (v2)** — not in v1. |
-| Row-level security, parameters, sets, groups | ❌ Not migrated in v1 — flagged in the report. |
+| Row-level security (wired user filters) | ⚠️ Translatable `USERNAME()` filters → TMDL `role`; group/compound logic fails closed (`FALSE()` + manual-review). |
+| Parameters, sets, groups | ❌ Not migrated in v1 — flagged in the report. |
 
-> **Key gaps**: calc coverage is a deterministic safe subset (not full); dashboards are deferred to v2; RLS/parameters/sets are **not rebuilt** and are not auto-detected (the agent should flag any present from the Tableau metadata). The preserved `TableauFormula` annotations make every translated/stubbed measure auditable and repairable.
+> **Key gaps**: calc coverage is a deterministic safe subset (not full); dashboards are deferred to v2; parameters/sets/groups are **not rebuilt** (the agent flags any present from the Tableau metadata). RLS is partially automated — wired `USERNAME()` filters become roles, while group/compound logic fails closed for deliberate review. The preserved `TableauFormula` annotations make every translated/stubbed measure auditable and repairable.
 
 ---
 

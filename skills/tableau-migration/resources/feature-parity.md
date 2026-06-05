@@ -43,13 +43,26 @@ Every stub is an inert `= 0` with the original formula kept as a `TableauFormula
 
 ---
 
+## Model objects
+
+| Tableau construct | Power BI target | v1 status |
+|---|---|---|
+| Drill path | TMDL `hierarchy` | ✅ Auto-derived when all levels resolve to one table; else skipped + reported |
+| Field folder | `displayFolder` on column / measure | ✅ Auto-derived (flat folders) |
+| User filter (wired RLS) | TMDL `role` | ✅ `[Field] = USERNAME()` → `USERPRINCIPALNAME()`; anything else fails closed (`FALSE()` + manual-review annotation), never guessed |
+
+Auto-derived from the `.tds` by `migrate_tds_to_semantic_model`; every object is resolved or reported in
+`report["model_objects"]`, never silently dropped. See [model-enrichment.md](model-enrichment.md).
+
+---
+
 ## Not migrated by v1 (not rebuilt)
 
-Hierarchies, calculated columns, sets / groups / bins, what-if parameters, calc groups, field parameters,
-**RLS** and other governance objects, perspectives, and display folders. The scripts do not auto-detect
-these; when the agent has the Tableau metadata it should enumerate any present and list them as manual
-follow-ups so the customer adds them deliberately (RLS especially is left manual on purpose — see
-[security-governance.md](security-governance.md)).
+Calculated columns, sets / groups / bins, what-if parameters, calc groups, field parameters, perspectives,
+and other governance objects. The scripts do not auto-detect these; when the agent has the Tableau metadata
+it should enumerate any present and list them as manual follow-ups so the customer adds them deliberately.
+(Hierarchies, display folders, and RLS roles **are** rebuilt — see **Model objects** above and
+[security-governance.md](security-governance.md) for the RLS safety boundary.)
 
 ---
 
