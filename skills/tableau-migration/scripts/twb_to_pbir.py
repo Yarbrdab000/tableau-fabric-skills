@@ -68,6 +68,8 @@ VT_MATRIX = "matrix"      # pivotTable
 VT_SCATTER = "scatter"    # scatterChart (X/Y measures disaggregated by a dimension)
 VT_CARD = "card"          # card (1 measure) / multiRowCard (>=2 measures), no dimension
 VT_PIE = "pie"            # pieChart (angle measure + legend dimension)
+VT_FILLED_MAP = "filled_map"  # filledMap (choropleth: geo Location + measure Color)
+VT_MAP = "map"            # map (symbol/bubble: geo Location + measure Size/Color)
 VT_UNSUPPORTED = "unsupported"
 
 _VT_TO_PBIR = {
@@ -78,7 +80,13 @@ _VT_TO_PBIR = {
     VT_MATRIX: "pivotTable",
     VT_SCATTER: "scatterChart",
     VT_PIE: "pieChart",
+    VT_FILLED_MAP: "filledMap",
+    VT_MAP: "map",
 }
+
+# Mark classes for geometry-backed / custom-spatial maps we deliberately defer (basics only:
+# filled + symbol map). These degrade to a structured warning rather than a guessed visual.
+_DEFER_MAP_MARKS = {"multipolygon", "polygon", "density", "heatmap"}
 
 # Tableau derivation -> Power BI QueryAggregateFunction code.
 _AGG_FUNC = {
@@ -97,6 +105,27 @@ _DATE_PARTS = {
 # Tableau internal pseudo-fields that have no model binding.
 _SPECIAL_FIELDS = {":Measure Names", "Measure Names", "Measure Values",
                    ":Measure Values", "Number of Records", "Multiple Values"}
+
+_GEO_ROLE_RE = re.compile(r"\[([^\]]+)\]")
+
+
+def _geo_area(semantic_role):
+    """Map a Tableau ``semantic-role`` to its geographic area name, or ``None``.
+
+    Tableau tags a geographic column with ``semantic-role='[State].[Name]'`` /
+    ``[City].[Name]`` / ``[Country].[ISO3166_2]`` / ``[ZipCode].[Name]`` etc. The area name is
+    the first bracketed token. The generated ``[Latitude]`` / ``[Longitude]`` point roles are
+    deliberately excluded: a geographic *area* dimension (not lat/lon) is the map trigger.
+    """
+    if not semantic_role:
+        return None
+    m = _GEO_ROLE_RE.match(semantic_role.strip())
+    if not m:
+        return None
+    area = m.group(1)
+    if area.lower() in ("latitude", "longitude"):
+        return None
+    return area
 
 
 def tableau_type_to_simple(local_type):
@@ -231,6 +260,7 @@ def _parse_dependencies(view):
                 "role": (c.get("role") or "").lower(),
                 "datatype": (c.get("datatype") or "").lower(),
                 "is_calc": bool(_children_local(c, "calculation")),
+                "geo_role": c.get("semantic-role") or "",
             }
         for ci in _children_local(dep, "column-instance"):
             iid = _strip_brackets(ci.get("name") or "")
@@ -254,6 +284,11 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
     if not field_id or field_id in _SPECIAL_FIELDS or field_id.startswith(":"):
         warnings.append(_warn("worksheet", worksheet,
                               f"field '{field_id}' has no model binding (skipped)"))
+        return None
+
+    # Tableau auto-generated helpers (Latitude/Longitude/Geometry "(generated)") carry no model
+    # binding; drop them quietly. Their presence is read separately as a map signal.
+    if field_id.endswith("(generated)"):
         return None
 
     inst = instances.get((ds, field_id))
@@ -294,6 +329,7 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
         "derivation": deriv, "aggregation": None,
         "entity": entity, "property": prop,
         "binding": None, "kind": None,
+        "geo_area": _geo_area(base.get("geo_role", "")) if role != "measure" else None,
     }
 
     # measure calc: only valid in a value role; an axis role is flagged + dropped later.
@@ -374,6 +410,20 @@ def _parse_encodings(pane, ds_default, base_cols, instances, index, ds_caption,
     return enc
 
 
+def _has_geometry(pane):
+    """True if the marks card carries a ``<geometry>`` encoding (custom spatial geometry).
+
+    A geometry encoding (e.g. ``Geometry (generated)``) is a strong "this view is a map"
+    signal, used to disambiguate an ambiguous mark from an ordinary chart.
+    """
+    if pane is None:
+        return False
+    holder = _first(pane, "encodings")
+    if holder is None:
+        return False
+    return any(_local(c.tag) == "geometry" for c in list(holder))
+
+
 def _split_token_attr(value):
     if not value:
         return None, None
@@ -382,14 +432,18 @@ def _split_token_attr(value):
 
 
 def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
-                 enc_dims=(), enc_meas=()):
+                 enc_dims=(), enc_meas=(), geo_detail=False, map_meas=False,
+                 map_signal=False):
     """Pick the internal visual-type enum from the mark class + shelf/encoding layout.
 
     Deliberately conservative: only proven layouts map to a chart; ambiguous or unrecognized
     layouts return ``unsupported`` so the caller warns instead of guessing. ``enc_dims`` /
     ``enc_meas`` are dimension / measure fields carried on the marks-card encodings (color,
     size, label, detail), which matter for card (a measure on the label with empty shelves)
-    and scatter (a dimension on detail/color).
+    and scatter (a dimension on detail/color). ``geo_detail`` is True when a geographic-role
+    dimension sits on the Detail encoding (the map Location); ``map_signal`` is an extra
+    spatial confirmation (generated lat/lon on the axes or a geometry encoding) used to keep
+    ambiguous marks from hijacking ordinary charts.
     """
     m = (mark or "").strip().lower()
     axis_dim = bool(dims_rows or dims_cols)
@@ -399,6 +453,21 @@ def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
 
     if not has_meas and not has_dim:
         return VT_UNSUPPORTED
+
+    # Geographic maps (basics only): a geo-role dimension on Detail + a measure. The geo dim
+    # being on Detail (not an axis) is what separates a map from an ordinary chart that merely
+    # uses a geographic dimension on a shelf. Custom-geometry marks are deferred; ambiguous
+    # marks additionally require a spatial signal (generated lat/lon or a geometry encoding).
+    if geo_detail and map_meas:
+        if m in _DEFER_MAP_MARKS:
+            return VT_UNSUPPORTED
+        if m in ("map", "filled", "filledmap"):
+            return VT_FILLED_MAP
+        if m in ("circle", "square", "shape", "point") and map_signal:
+            return VT_MAP
+        if m in ("automatic", "") and map_signal:
+            return VT_FILLED_MAP
+        # geo on Detail but no confirming spatial signal -> fall through to chart heuristics
 
     # measure(s) with no dimension anywhere -> a single-value card / multi-row card tile
     if has_meas and not has_dim:
@@ -507,9 +576,11 @@ def _parse_worksheet(ws, index, ds_caption, warnings):
 
     rows_el = _first(table, "rows")
     cols_el = _first(table, "cols")
-    rows = _resolve_shelf(rows_el.text if rows_el is not None else "", ds_default,
+    rows_text = (rows_el.text if rows_el is not None else "") or ""
+    cols_text = (cols_el.text if cols_el is not None else "") or ""
+    rows = _resolve_shelf(rows_text, ds_default,
                           base_cols, instances, index, ds_caption, name, warnings)
-    cols = _resolve_shelf(cols_el.text if cols_el is not None else "", ds_default,
+    cols = _resolve_shelf(cols_text, ds_default,
                           base_cols, instances, index, ds_caption, name, warnings)
     encodings = _parse_encodings(pane, ds_default, base_cols, instances, index,
                                  ds_caption, name, warnings)
@@ -526,13 +597,34 @@ def _parse_worksheet(ws, index, ds_caption, warnings):
                 if f and f["kind"] == "category"]
     enc_meas = [f for f in (encodings["size"], encodings["label"])
                 if f and f["kind"] == "value"]
+    # geographic map signals: a geo-role dimension on Detail is the Location; a measure on any
+    # shelf/encoding feeds Color/Size; generated lat/lon on the axes or a geometry encoding is
+    # the extra spatial confirmation that disambiguates an ambiguous mark from a normal chart.
+    detail = encodings["detail"]
+    color = encodings["color"]
+    geo_detail = bool(detail and detail["kind"] == "category" and detail.get("geo_area"))
+    map_meas = bool(meas_rows or meas_cols
+                    or (color and color["kind"] == "value")
+                    or (encodings["size"] and encodings["size"]["kind"] == "value")
+                    or (encodings["label"] and encodings["label"]["kind"] == "value"))
+    shelf_text = (rows_text + " " + cols_text).lower()
+    has_latlon_axes = ("latitude (generated)" in shelf_text
+                       and "longitude (generated)" in shelf_text)
+    map_signal = has_latlon_axes or _has_geometry(pane)
     visual_type = _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
-                               enc_dims, enc_meas)
+                               enc_dims, enc_meas, geo_detail=geo_detail,
+                               map_meas=map_meas, map_signal=map_signal)
 
     if visual_type == VT_UNSUPPORTED:
-        warnings.append(_warn(
-            "worksheet", name,
-            f"mark class '{mark}' / shelf layout not supported -> no visual emitted"))
+        if (mark or "").strip().lower() in _DEFER_MAP_MARKS or (geo_detail and map_meas):
+            warnings.append(_warn(
+                "worksheet", name,
+                f"spatial/custom-geometry map (mark '{mark}') deferred "
+                f"(basics only: filled + symbol map) -> no visual emitted"))
+        else:
+            warnings.append(_warn(
+                "worksheet", name,
+                f"mark class '{mark}' / shelf layout not supported -> no visual emitted"))
 
     return {
         "name": name,
@@ -817,6 +909,43 @@ def _build_query_state(ws, model_table, field_map, warnings):
         if vals:
             state["Values"] = {"projections": _role_projections(
                 vals, model_table, field_map, used_refs)}
+    elif vt == VT_FILLED_MAP:
+        # choropleth: the geo-role dimension on Detail is the Location, a single measure
+        # (prefer the color saturation encoding, else any available) drives Color.
+        loc = drop_calc_axis(_dedupe(
+            [detail] if detail and detail["kind"] == "category" else []))
+        meas = _dedupe(
+            ([color] if color and color["kind"] == "value" else [])
+            + values(rows) + values(cols)
+            + ([size] if size and size["kind"] == "value" else [])
+            + ([label] if label and label["kind"] == "value" else []))
+        if loc:
+            state["Location"] = {"projections": _role_projections(
+                loc, model_table, field_map, used_refs)}
+        if meas:
+            state["Color"] = {"projections": _role_projections(
+                meas[:1], model_table, field_map, used_refs)}
+    elif vt == VT_MAP:
+        # symbol / bubble map: geo Location, a measure on Size (prefer the size encoding),
+        # and a distinct color measure on Color when present.
+        loc = drop_calc_axis(_dedupe(
+            [detail] if detail and detail["kind"] == "category" else []))
+        size_pref = _dedupe(
+            ([size] if size and size["kind"] == "value" else [])
+            + values(rows) + values(cols)
+            + ([label] if label and label["kind"] == "value" else []))
+        size_sel = size_pref[:1]
+        color_meas = [color] if (color and color["kind"] == "value") else []
+        color_sel = [f for f in color_meas if f not in size_sel][:1]
+        if loc:
+            state["Location"] = {"projections": _role_projections(
+                loc, model_table, field_map, used_refs)}
+        if size_sel:
+            state["Size"] = {"projections": _role_projections(
+                size_sel, model_table, field_map, used_refs)}
+        if color_sel:
+            state["Color"] = {"projections": _role_projections(
+                color_sel, model_table, field_map, used_refs)}
     return state
 
 
@@ -832,6 +961,10 @@ def _query_state_complete(vt, state):
         return "X" in state and "Y" in state
     if vt == VT_CARD:
         return "Values" in state
+    if vt == VT_FILLED_MAP:
+        return "Location" in state and "Color" in state
+    if vt == VT_MAP:
+        return "Location" in state and ("Size" in state or "Color" in state)
     if vt == VT_MATRIX:
         return "Values" in state and ("Rows" in state or "Columns" in state)
     if vt == VT_TABLE:

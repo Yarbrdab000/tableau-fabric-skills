@@ -63,6 +63,8 @@ fixtures, no disk, no network); the live open/deploy is a separate manual pass.
 | Text, dimensions on **both** axes                   | `matrix`         | `pivotTable`           | Rows / Columns / Values |
 | Pie, legend dimension + angle measure               | `pie`            | `pieChart`             | Category / Y          |
 | Circle/square/shape/point, measure on **both** axes + a disaggregating dimension | `scatter` | `scatterChart` | X / Y / Category / Series / Size |
+| Geo-role dimension on **detail** + measure (area/`Map`/`Automatic`+spatial signal) | `filled_map` | `filledMap` | Location / Color |
+| Geo-role dimension on **detail** + measure, **point** mark (`Circle`/…+spatial signal) | `map` | `map` | Location / Size / Color |
 | Measure(s) with **no** dimension anywhere (one)     | `card`           | `card`                 | Values                |
 | Measure(s) with **no** dimension anywhere (≥2)      | `card`           | `multiRowCard`         | Values                |
 | Categorical / date / numeric **filter**             | (slicer)         | `slicer`               | Values                |
@@ -85,6 +87,29 @@ measure on the `label`/`text` or `size` encoding with empty shelves drives a **c
   target/trend metadata.
 - **Pie** (`pieChart`): the legend dimension (axis dim or `color`) → `Category`, the angle/size
   measure → `Y`.
+
+### Geographic maps (basics: filled + symbol)
+
+Tableau tags a geographic field with a `semantic-role` on its column metadata
+(`semantic-role='[State].[Name]'`, `[City].[Name]`, `[Country].[ISO3166_2]`, `[ZipCode].[Name]`,
+…) and auto-generates `Latitude (generated)` / `Longitude (generated)` helper fields. A map is
+recognized from the **geo-role signal**, *not* the generated lat/lon:
+
+- **Trigger:** a geo-role **dimension sits on the `detail` (level-of-detail) encoding** *and* a
+  measure is available. A geo dimension on an **axis** stays an ordinary bar/line/table chart, so
+  the many Superstore charts that put State/Region/City on an axis are never hijacked.
+- **Spatial signal (anti-hijack):** for an ambiguous mark (`Automatic`/empty, or a point mark such
+  as `Circle`/`Square`/`Shape`/`Point`) the geo-on-detail trigger additionally requires a spatial
+  signal — `Latitude (generated)` **and** `Longitude (generated)` on the axes, or a `<geometry>`
+  encoding. Explicit `Map`/`Filled` marks are self-signaling and need no extra signal.
+- **Filled map** (`filledMap`, choropleth): an area/`Map`/qualifying `Automatic` mark → the geo
+  dimension → `Location`, the (color-preferred) measure → `Color` saturation.
+- **Symbol / bubble map** (`map`): a point mark → the geo dimension → `Location`, the
+  (size-preferred) measure → `Size`, a distinct color measure → `Color`.
+
+The generated `Latitude`/`Longitude`/`Geometry` helper fields are dropped quietly (they only act
+as the spatial signal); the geo dimension binds like any column — `Location` = entity
+`<relation>` / property `clean_col(<remote-name>)`.
 
 ## Binding contract (matches the v1 model exactly)
 
@@ -134,11 +159,13 @@ definition/pages/<page>/visuals/<v>/visual.json   (visualContainer 1.0.0)
 Every warning is `{"scope": "worksheet"|"dashboard", "name": <name>, "reason": "manual attention required: ..."}`.
 Cases that degrade to a warning instead of a visual/binding:
 
-- **Unsupported marks**: area, polygon, density/heatmap, Gantt (non-bar), filled/symbol
-  **maps**, etc. → the worksheet emits **no** visual.
-- **Geographic maps are a documented gap** (deferred): a faithful Power BI map needs a
-  latitude/longitude pair or a geo-hierarchy role that `.twb` mark geometry does not expose
-  cleanly, so map marks degrade to a warning instead of a guessed visual.
+- **Unsupported marks**: area, polygon, density/heatmap, Gantt (non-bar), etc. → the worksheet
+  emits **no** visual.
+- **Spatial / custom-geometry maps are deferred** (basics only — filled + symbol map are
+  supported, see above). A worksheet degrades to a warning when it needs custom geometry rather
+  than a plain geo-role binding: `Multipolygon`/custom spatial polygons, `MAKEPOINT`/`MAKELINE`/
+  `BUFFER` constructed geometry, density/heatmap layers, and dual-axis (layered) maps. The real
+  Superstore "Sale Map" (a `Multipolygon` mark) defers this way rather than being rebuilt wrong.
 - **KPI target/trend**: a single measure with no dimension becomes a `card`/`multiRowCard`; the
   richer PBIR `kpi` visual (with `Indicator`/`TrendAxis`/`TargetValue` roles) is deferred
   because the workbook carries no target or trend metadata to bind those roles.
