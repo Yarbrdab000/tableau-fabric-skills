@@ -130,6 +130,17 @@ A `cross_db_join` datasource then splits on **how** the blend is expressed:
   and — when a Snowflake `warehouse=''` — a manual-warehouse prompt remain; the empty warehouse never fails the
   rebuild). A key that cannot be bound to exactly one column per side is **reported** as an unresolved-key
   follow-up rather than emitted wrong, and a partially-landed datasource lists its skipped sides.
+  The realization is **storage-mode-agnostic**: each side keeps whatever mode `select_storage_mode`
+  picks for it — `DirectQuery` for a live relational source, `Import` for a flat-file/extract side —
+  so sides may legitimately differ. Nothing is landed to Delta by default; **land-to-Delta + DirectLake
+  is only a fallback** (a side whose columns can't be resolved) or an explicit strong-relationship
+  alternative the customer may choose. The report's `storage_mode` is derived from the actual per-side
+  modes (e.g. `Composite (DirectQuery)` or `Composite (DirectQuery, Import)`), never hardwired. Because
+  the sides stay in **separate storage source groups**, a relationship across them is a **LIMITED (weak)
+  relationship** in Power BI; this is surfaced honestly (`report.relationship_fidelity == "limited"`,
+  `report.limited_relationships`, plus a follow-up) offering the two strong-relationship tradeoffs —
+  **Import** every side (copies data into VertiPaq) or **land-to-Delta + DirectLake** (Fabric-native) —
+  rather than silently choosing one.
 - **Physical `<clause>` join / union → deferred `fallback`.** When the relations are collapsed into ONE logical
   table by a physical `join`/`union` tree (`_is_physical_join`), there is a real cross-source join to replicate,
   which cannot be a single Import partition or independent tables. It is routed to `fallback` with a
@@ -204,11 +215,14 @@ only — no model `parts`, no raw XML, no credentials, secrets, paths, or GUIDs 
 ## Deferred scope
 
 - **Cross-database joins** split by shape: a **logical** blend (a `collection` of independent tables with a
-  `<relationships>` key block) is **rebuilt** — each side landed via its own per-connector M, with the join
-  keys emitted as model relationships (a per-source / composite model; no federated cross-DB query). Only a
-  **physical** `<clause>` join/union tree (one logical table whose rows come from a cross-source join) is
-  **deferred** to `fallback` with land-to-Delta / composite-model guidance. Relationship **cardinality** is
-  emitted as the default many-to-one (Tableau's logical model encodes no cardinality) and flagged for review.
+  `<relationships>` key block) is **rebuilt** — each side landed via its own per-connector M in whatever mode
+  `select_storage_mode` picks for it (DirectQuery / Import — never a forced Delta landing), with the join
+  keys emitted as model relationships (a per-source / composite model; no federated cross-DB query). Cross-source
+  relationships are flagged as **LIMITED (weak)** with the Import-vs-DirectLake strong-relationship tradeoff
+  surfaced for the customer. Only a **physical** `<clause>` join/union tree (one logical table whose rows come
+  from a cross-source join) is **deferred** to `fallback` with land-to-Delta / composite-model guidance.
+  Relationship **cardinality** is emitted as the default many-to-one (Tableau's logical model encodes no
+  cardinality) and flagged for review.
 - **Spatial** (`ogrdirect`) datasources are routed to `fallback` rather than approximated.
 - **Packaged data extraction** — packaged files are read only to confirm columns and auto-detect the CSV
   delimiter; the `FilePath` parameter still defaults to the original Tableau path and is a repoint follow-up.

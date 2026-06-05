@@ -537,6 +537,25 @@ def test_cross_db_logical_direct_builder_returns_parts():
     assert "definition/relationships.tmdl" in out["parts"]
 
 
+def test_cross_db_logical_report_is_storage_neutral_and_flags_limited_relationships():
+    # The realization is storage-mode-agnostic: the report describes the composite from the actual
+    # per-side modes the shared chooser picked (no hardwired single mode, no forced Delta). Three
+    # live DirectQuery sources mean cross-source relationships become LIMITED (weak); that must be
+    # surfaced honestly with the two strong-relationship alternatives, not silently chosen.
+    out = build_cross_db_model(XDB_LOGICAL_DS, model_name="Orders+ (Multiple Connections)")
+    report = out["report"]
+    assert report["storage_mode"] == "Composite (DirectQuery)"   # derived from per-side modes
+    assert report["relationship_fidelity"] == "limited"
+    assert report["limited_relationships"]                       # the cross-source keys are listed
+    msgs = [f for f in out["followups"]]
+    fidelity = [m for m in msgs if "LIMITED" in m]
+    assert fidelity, "composite-model fidelity follow-up missing"
+    note = fidelity[0]
+    assert "Import" in note and "DirectLake" in note            # both strong-relationship options offered
+    # Delta is offered only as one alternative -- it is never the default realization.
+    assert "definition/relationships.tmdl" in out["parts"]
+
+
 # A minimal TWO-connection logical datasource (two Azure SQL hosts -> still cross-DB by connection
 # span) used to exercise the harder edge cases: identifier-unsafe table names, casefold-only column
 # collisions, duplicate emitted display names, and compound/unsupported relationship predicates.

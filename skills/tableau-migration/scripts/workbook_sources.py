@@ -904,6 +904,19 @@ def _cross_db_relationships(ds, sides):
     return rels, unresolved
 
 
+def _source_group(side_report):
+    """The composite-model storage 'source group' a rebuilt side lands in.
+
+    Every Import table shares the single in-memory (VertiPaq) group; each live source is its own
+    DirectQuery group. A relationship whose two endpoints fall in different groups is a LIMITED
+    (weak) relationship in Power BI -- this is surfaced as a fidelity follow-up rather than silently
+    chosen, so the customer picks the storage tradeoff."""
+    if (side_report.get("mode") or "").lower() == "import":
+        return "import"
+    return "dq:" + "|".join(
+        str(side_report.get(k) or "") for k in ("connection_class", "server", "database"))
+
+
 def build_cross_db_model(datasource_xml, *, model_name):
     """Rebuild a MODERN logical cross-database-join datasource into one composite model.
 
@@ -1024,6 +1037,16 @@ def build_cross_db_model(datasource_xml, *, model_name):
     rels, unresolved = _cross_db_relationships(ds, sides)
     relationships_tmdl = generate_relationships_tmdl(rels)
 
+    # Storage-neutral realization: each side already carries the mode the shared chooser picked
+    # (Import for flat-file/extract, DirectQuery for live relational). Describe the composite from
+    # those actual per-side modes -- never hardwire one global mode or a land-to-Delta outcome.
+    group_of = {s["display"]: _source_group(s["report"]) for s in sides}
+    limited_rels = [r for r in rels
+                    if group_of.get(r["from_table"]) != group_of.get(r["to_table"])]
+    side_modes = sorted({(s["report"]["mode"] or "Import") for s in sides})
+    is_composite = len(set(group_of.values())) > 1
+    storage_label = ("Composite (" + ", ".join(side_modes) + ")") if is_composite else side_modes[0]
+
     parts["definition/tables/_Measures.tmdl"] = generate_measures_table_tmdl("")
     parts["definition/expressions.tmdl"] = "\n\n".join(expr_blocks) + "\n"
     if relationships_tmdl:
@@ -1037,6 +1060,15 @@ def build_cross_db_model(datasource_xml, *, model_name):
         followups.append(f'Verify relationship cardinality for "{model_name}": the cross-database '
                          f"keys were emitted as the default many-to-one (no cardinality is encoded "
                          f"in the Tableau logical model); set the \"one\" side per key as needed.")
+    if limited_rels:
+        crossing = ", ".join(sorted({f'{r["from_table"]} <-> {r["to_table"]}' for r in limited_rels}))
+        followups.append(
+            f'Composite-model fidelity for "{model_name}": relationship(s) {crossing} cross storage '
+            f"source groups, so Power BI treats them as LIMITED (weak) relationships (no cross-source "
+            f"query folding; some DAX/RLS restrictions apply). For STRONG relationships pick one "
+            f"tradeoff: (a) Import every side (copies data into VertiPaq), or (b) land each side to "
+            f"Delta and use DirectLake (Fabric-native). Left as-is, the per-source live composite "
+            f"keeps weak relationships.")
     for u in unresolved:
         followups.append(f'Could not bind join key {u["operands"]} in "{model_name}" to exactly one '
                          f"column per side (case/name mismatch or ambiguous); add that relationship "
@@ -1051,7 +1083,9 @@ def build_cross_db_model(datasource_xml, *, model_name):
     report = {
         "model_name": model_name,
         "kind": "cross_db_join_logical",
-        "storage_mode": "Composite (per-source DirectQuery)",
+        "storage_mode": storage_label,
+        "relationship_fidelity": ("limited" if limited_rels else "strong" if rels else "none"),
+        "limited_relationships": limited_rels,
         "connections": [s["report"] for s in sides],
         "tables": table_names,
         "join_keys": rels,
