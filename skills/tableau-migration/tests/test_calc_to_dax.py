@@ -3,7 +3,8 @@
 Started from the Play 4 notebook self-test cell (aggregation + arithmetic safe
 subset) and extended to cover the conditional/null-handling grammar: IF/ELSEIF/ELSE,
 IIF, comparisons, AND/OR/NOT, ZN/IFNULL/ISNULL, string literals, scalar math over
-aggregated operands (ABS/ROUND/CEILING/FLOOR/POWER/SQRT/SIGN/EXP/LOG/LN), and
+aggregated operands (ABS/ROUND/CEILING/FLOOR/POWER/SQUARE/SQRT/SIGN/EXP/LOG/LN/DIV/PI
+and the SIN/COS/TAN/ASIN/ACOS/ATAN/COT trig family), and
 CASE/WHEN -> SWITCH (searched and simple forms). They lock the deterministic translator's behavior: the supported subset must produce the documented
 DAX, and everything outside it (including type-inconsistent or non-boolean-condition
 forms) must fall back (return None) so the caller keeps an inert ``= 0`` stub.
@@ -114,6 +115,20 @@ TRANSLATIONS = [
     ("CEILING(SUM([Sales]))", "CEILING(SUM('Orders'[Sales]), 1)"),  # DAX needs a significance
     ("FLOOR(SUM([Sales]))", "FLOOR(SUM('Orders'[Sales]), 1)"),
     ("POWER(SUM([Sales]), 2)", "POWER(SUM('Orders'[Sales]), 2)"),
+    ("SQUARE(SUM([Sales]))", "POWER(SUM('Orders'[Sales]), 2)"),     # DAX has no SQUARE
+    ("LOG(SUM([Sales]), 2)", "LOG(SUM('Orders'[Sales]), 2)"),       # explicit log base
+    ("DIV(SUM([Sales]), SUM([Quantity]))",                          # integer division
+     "QUOTIENT(SUM('Orders'[Sales]), SUM('Orders'[Quantity]))"),
+    ("PI()", "PI()"),                                               # nullary numeric constant
+    ("SUM([Sales]) * PI()", "SUM('Orders'[Sales]) * PI()"),         # PI() composes with aggregates
+    # trig family (single numeric operand, identity names)
+    ("SIN(SUM([Sales]))", "SIN(SUM('Orders'[Sales]))"),
+    ("COS(SUM([Sales]))", "COS(SUM('Orders'[Sales]))"),
+    ("TAN(SUM([Sales]))", "TAN(SUM('Orders'[Sales]))"),
+    ("ASIN(SUM([Sales]))", "ASIN(SUM('Orders'[Sales]))"),
+    ("ACOS(SUM([Sales]))", "ACOS(SUM('Orders'[Sales]))"),
+    ("ATAN(SUM([Sales]))", "ATAN(SUM('Orders'[Sales]))"),
+    ("COT(SUM([Sales]))", "COT(SUM('Orders'[Sales]))"),
     # scalar math composes with arithmetic and nests (operands stay numeric)
     ("ABS(SUM([Profit])) / SUM([Sales])",
      "DIVIDE(ABS(SUM('Orders'[Profit])), SUM('Orders'[Sales]))"),
@@ -181,9 +196,14 @@ FALLBACKS = [
     "ABS(MIN([Order Date]))",                     # date operand (MIN on dateTime -> date)
     "SQRT(SUM([Sales]), 2)",                      # wrong arity (1-arg fn given 2)
     "POWER(SUM([Sales]))",                        # wrong arity (POWER needs 2)
+    "DIV(SUM([Sales]))",                          # wrong arity (DIV needs 2)
+    "SQUARE(SUM([Sales]), 2)",                    # wrong arity (SQUARE takes 1)
     "ROUND(SUM([Sales]), 2, 3)",                  # wrong arity (ROUND takes 1 or 2)
+    "LOG(SUM([Sales]), 2, 3)",                    # wrong arity (LOG takes 1 or 2)
+    "PI(SUM([Sales]))",                           # PI is nullary
     'ROUND(SUM([Sales]), "2")',                   # non-numeric digit count
-    "LOG(SUM([Sales]), 2)",                       # 2-arg LOG intentionally unsupported
+    "SIN([Sales])",                               # bare row-level operand in a trig fn
+    'COS("x")',                                   # non-numeric trig operand
     "CEILING(SUM([Region]))",                     # SUM on string fails before CEILING
     # --- CASE/WHEN fallbacks (measure-context / type violations) ---
     "CASE END",                                   # no WHEN clause

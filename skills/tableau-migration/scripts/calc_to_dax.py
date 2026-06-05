@@ -13,8 +13,9 @@ Translates a SAFE subset of Tableau calculated fields into working DAX measures:
     SWITCH(e, v, r, ..., z); measure-context-safe only (the comparand, values, and a single
     consistent result type must be aggregations or literals)
   * scalar math over NUMERIC (aggregated) operands: ABS, ROUND (1-arg -> ROUND(x, 0)),
-    CEILING(x) -> CEILING(x, 1), FLOOR(x) -> FLOOR(x, 1), POWER, SQRT, SIGN, EXP,
-    LOG (1-arg, base-10), LN
+    CEILING(x) -> CEILING(x, 1), FLOOR(x) -> FLOOR(x, 1), POWER, SQRT, SQUARE(x) ->
+    POWER(x, 2), SIGN, EXP, LOG (base-10, or 2-arg LOG(x, base)), LN, DIV(a, b) ->
+    QUOTIENT(a, b), PI(), and the trig family SIN/COS/TAN/ASIN/ACOS/ATAN/COT
   * comparison operators: = == <> != > >= < <=  (== -> = ; != -> <>)
   * boolean logic: AND -> && , OR -> || , NOT(x)
   * null handling: ZN(x) -> COALESCE(x, 0) ; IFNULL(a, b) -> COALESCE(a, b) ;
@@ -37,9 +38,9 @@ between incomparable types) so it never emits DAX that would error or silently c
 
 Anything outside this subset (INCLUDE/EXCLUDE LODs, table calcs WINDOW_/RUNNING_/RANK/LOOKUP/
 INDEX/TOTAL, scalar date/string/regex functions, row-level operands inside a scalar math
-function or CASE, a 2-arg LOG, nested arithmetic inside an aggregation, 4-arg IIF, references
-to other calcs, unresolved or ambiguous fields, cross-table terms) deterministically FALLS
-BACK by returning ``None`` so the caller keeps an inert ``= 0`` stub.
+function or CASE, nested arithmetic inside an aggregation, 4-arg IIF, references to other
+calcs, unresolved or ambiguous fields, cross-table terms) deterministically FALLS BACK by
+returning ``None`` so the caller keeps an inert ``= 0`` stub.
 The original Tableau formula is preserved as a ``TableauFormula`` annotation by the renderer
 either way.
 
@@ -87,15 +88,22 @@ _NUMERIC_TYPES = {"int64", "double", "decimal"}
 
 # Scalar math functions that wrap a NUMERIC (aggregated) operand and stay valid in a measure
 # (they compose with the existing arithmetic). Operand(s) must be numeric or the whole calc
-# falls back. Tableau name -> DAX is identity here, so we just re-emit the (uppercased) name.
-#   _MATH_1     : single numeric operand -> FN(x). LOG is the 1-arg base-10 form (DAX LOG
-#                 defaults to base 10); LN is natural log.
+# falls back. Most Tableau math names map identically to DAX, so we re-emit the (uppercased)
+# name; the handful that don't are listed explicitly below.
+#   _MATH_1     : single numeric operand -> FN(x). Includes the trig family; LN is natural log.
 #   _MATH_1_SIG : single numeric operand -> FN(x, <significance>). Tableau CEILING/FLOOR take
 #                 one argument (round to the nearest integer); DAX requires a significance step.
-# ROUND (1-or-2 arg) and POWER (2 arg) have their own arity and are handled in _scalar_fn.
-_MATH_1 = {"ABS", "SQRT", "SIGN", "EXP", "LN", "LOG"}
+#   _MATH_2     : two numeric operands -> DAXNAME(a, b). Tableau DIV (integer division) maps to
+#                 DAX QUOTIENT; POWER is identical.
+# Functions with their own arity/shape are handled directly in _scalar_fn: ROUND (1-or-2 arg),
+# LOG (1-arg base-10 or 2-arg LOG(x, base)), SQUARE(x) -> POWER(x, 2), and PI() (nullary).
+_MATH_1 = {
+    "ABS", "SQRT", "SIGN", "EXP", "LN",
+    "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "COT",
+}
 _MATH_1_SIG = {"CEILING": "1", "FLOOR": "1"}
-_SCALAR_MATH = _MATH_1 | set(_MATH_1_SIG) | {"ROUND", "POWER"}
+_MATH_2 = {"POWER": "POWER", "DIV": "QUOTIENT"}
+_SCALAR_MATH = _MATH_1 | set(_MATH_1_SIG) | set(_MATH_2) | {"ROUND", "LOG", "SQUARE", "PI"}
 
 
 class _CalcError(Exception):
@@ -438,6 +446,10 @@ class _Parser:
         # a text/date operand, or wrong arity all raise -> the whole calc falls back.
         self._next()  # function name
         self._expect_op("(")
+        if name == "PI":
+            # Nullary numeric constant; PI() composes with aggregates (e.g. SUM([x]) * PI()).
+            self._expect_op(")")
+            return ("PI()", "number")
         x = self._expect_number(self._expr())
         if name in _MATH_1:
             self._expect_op(")")
@@ -446,6 +458,10 @@ class _Parser:
             # DAX CEILING/FLOOR need a significance; Tableau's 1-arg form rounds to the integer.
             self._expect_op(")")
             return (f"{name}({x[0]}, {_MATH_1_SIG[name]})", "number")
+        if name == "SQUARE":
+            # DAX has no SQUARE; x squared is POWER(x, 2).
+            self._expect_op(")")
+            return (f"POWER({x[0]}, 2)", "number")
         if name == "ROUND":
             # Tableau ROUND(x) -> DAX ROUND(x, 0); ROUND(x, n) passes the digit count through.
             if self._peek() == ("op", ","):
@@ -455,11 +471,20 @@ class _Parser:
                 return (f"ROUND({x[0]}, {digits[0]})", "number")
             self._expect_op(")")
             return (f"ROUND({x[0]}, 0)", "number")
-        # POWER(x, n): base and exponent must both be numeric.
+        if name == "LOG":
+            # Tableau LOG(x) is base 10 (so is DAX LOG(x)); LOG(x, base) passes the base through.
+            if self._peek() == ("op", ","):
+                self._next()
+                base = self._expect_number(self._expr())
+                self._expect_op(")")
+                return (f"LOG({x[0]}, {base[0]})", "number")
+            self._expect_op(")")
+            return (f"LOG({x[0]})", "number")
+        # Two-operand numeric functions: POWER(x, n) and DIV(a, b) -> QUOTIENT(a, b).
         self._expect_op(",")
-        exponent = self._expect_number(self._expr())
+        second = self._expect_number(self._expr())
         self._expect_op(")")
-        return (f"POWER({x[0]}, {exponent[0]})", "number")
+        return (f"{_MATH_2[name]}({x[0]}, {second[0]})", "number")
 
     def _case(self):
         # CASE/WHEN -> DAX SWITCH. Parsed at expression-statement level (like IF) so the END
