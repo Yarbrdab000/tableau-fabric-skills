@@ -54,8 +54,8 @@ relation kind:
 
 | Tableau class | Power Query connector | Tier |
 |---|---|---|
-| `sqlserver` / `azure_sqldb` | `Sql.Database` | Fully supported |
-| `azure_sql_dw` (Azure Synapse Analytics) | `Sql.Database` | Fully supported (TDS protocol) |
+| `sqlserver` / `azure_sqldb` | `Sql.Database` | Fully supported (incl. Azure SQL Managed Instance, which arrives as `sqlserver`) |
+| `azure_sql_dw` (Azure Synapse Analytics) | `Sql.Database` | Fully supported (TDS protocol — covers both dedicated and serverless SQL pool) |
 | `postgres` | `PostgreSQL.Database` | Fully supported |
 | `mysql` | `MySQL.Database` | Fully supported |
 | `redshift` | `AmazonRedshift.Database` | Fully supported |

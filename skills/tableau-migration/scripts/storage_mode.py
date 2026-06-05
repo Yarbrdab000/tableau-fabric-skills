@@ -41,15 +41,30 @@ from __future__ import annotations
 #     "schema_item"            -> Source{[Schema=.., Item=..]}[Data]     (flat ADO.NET navigation)
 #     "database_schema_table"  -> 3 hops keyed by [Name=.., Kind=..]     (Snowflake + Databricks)
 #
+# The Microsoft SQL Server TDS-protocol family: every Tableau class here speaks the SQL Server
+# wire protocol, so each binds through the SAME emitter -- Sql.Database(#"Server", #"Database")
+# with flat [Schema, Item] navigation, DirectQuery-capable. Grouped explicitly so a new Microsoft
+# TDS surface is a one-line addition. Verified Tableau connection-class strings:
+#   'sqlserver'                     -> Microsoft SQL Server AND Azure SQL Managed Instance
+#                                      (Tableau connects to Managed Instance with the SQL Server
+#                                      connector, so MI arrives as 'sqlserver').
+#   'azure_sqldb'                   -> Azure SQL Database.
+#   'azure_sql_dw'                  -> Azure Synapse Analytics, BOTH dedicated and serverless SQL
+#                                      pool (the Synapse connector emits one class for either pool).
+#   'microsoft_fabric_sql_endpoint' -> Microsoft Fabric Warehouse / Lakehouse SQL analytics endpoint.
+# ('sqlserver' / 'azure_sqldb' are confirmed by real .tds; 'azure_sql_dw' /
+# 'microsoft_fabric_sql_endpoint' are web-verified -- a wrong class string only causes a safe
+# fallback, never wrong M, since the TDS->Sql.Database mapping itself is the verified fact.)
+SQL_SERVER_TDS_FAMILY = (
+    "sqlserver",
+    "azure_sqldb",
+    "azure_sql_dw",
+    "microsoft_fabric_sql_endpoint",
+)
+
 # Verified facts (Microsoft Power Query M / connector docs):
 #  * Sql/PostgreSQL/MySQL/AmazonRedshift.Database take (server, database) + flat [Schema, Item].
-#    Azure SQL Database / Azure Synapse Analytics (dedicated + serverless SQL pool) / Azure SQL
-#    Managed Instance / Microsoft Fabric SQL endpoints all speak the SQL Server TDS protocol, so
-#    they bind through Sql.Database too. Managed Instance + serverless Synapse connect through the
-#    SQL Server / Azure SQL connector ('sqlserver' / 'azure_sqldb'); dedicated Synapse uses
-#    'azure_sql_dw'; the dedicated Fabric SQL endpoint uses 'microsoft_fabric_sql_endpoint'
-#    (class strings web-verified -- a wrong class only causes a safe fallback, never wrong M; the
-#    TDS->Sql.Database mapping is the verified fact).
+#    The whole SQL_SERVER_TDS_FAMILY above binds through Sql.Database on this same shape.
 #  * Oracle.Database(server, [options]) and Teradata.Database(server, [options]) are both
 #    server-only (the M function reference pages confirm both signatures), and HierarchicalNavigation
 #    defaults false on each, so the flat [Schema, Item] navigation (schema = owner / Teradata
@@ -65,10 +80,8 @@ from __future__ import annotations
 #    is a connection parameter (#"HttpPath") that is not stored portably in the .tds; live
 #    reconciliation is pending (no live Databricks instance).
 DIRECT_CONNECTORS = {
-    "sqlserver":    ("Sql.Database",            "server_database",  "schema_item"),
-    "azure_sqldb":  ("Sql.Database",            "server_database",  "schema_item"),  # Azure SQL Database / Managed Instance (SQL Server protocol)
-    "azure_sql_dw": ("Sql.Database",            "server_database",  "schema_item"),  # Azure Synapse Analytics (dedicated SQL pool)
-    "microsoft_fabric_sql_endpoint": ("Sql.Database", "server_database", "schema_item"),  # Fabric Warehouse / Lakehouse SQL endpoint (best-effort class; fails safe to fallback)
+    # Microsoft SQL Server TDS family -> Sql.Database(server, database) + flat [Schema, Item].
+    **{cls: ("Sql.Database", "server_database", "schema_item") for cls in SQL_SERVER_TDS_FAMILY},
     "postgres":     ("PostgreSQL.Database",     "server_database",  "schema_item"),
     "mysql":        ("MySQL.Database",          "server_database",  "schema_item"),
     "redshift":     ("AmazonRedshift.Database", "server_database",  "schema_item"),
