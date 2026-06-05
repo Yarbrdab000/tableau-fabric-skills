@@ -5,7 +5,9 @@ aggregation+arithmetic-only safe subset, then extended in-place into a typed
 recursive-descent parser that also covers conditional and null-handling logic.
 
 Translates a SAFE subset of Tableau calculated fields into working DAX measures:
-  * aggregations over a single bare field: SUM, AVG, MIN, MAX, COUNT, COUNTD, MEDIAN
+  * aggregations over a single bare field: SUM, AVG, MIN, MAX, COUNT, COUNTD, MEDIAN,
+    STDEV/STDEVP (-> STDEV.S/STDEV.P), VAR/VARP (-> VAR.S/VAR.P), PERCENTILE([f], n)
+    (-> PERCENTILE.INC)
   * arithmetic between those terms / numeric literals: + - * /, parentheses, unary minus
   * conditional logic: IF/THEN/ELSEIF/ELSE/END and IIF(cond, a, b)
   * CASE/WHEN -> SWITCH: searched form CASE WHEN c THEN r ... [ELSE z] END ->
@@ -72,9 +74,15 @@ import re
 _AGG_MAP = {
     "SUM": "SUM", "AVG": "AVERAGE", "MIN": "MIN", "MAX": "MAX",
     "MEDIAN": "MEDIAN", "COUNT": "COUNTA", "COUNTD": "DISTINCTCOUNTNOBLANK",
+    "STDEV": "STDEV.S", "STDEVP": "STDEV.P", "VAR": "VAR.S", "VARP": "VAR.P",
 }
 # COUNT  -> COUNTA               (Tableau COUNT = non-null of ANY type; DAX COUNT errors on text)
 # COUNTD -> DISTINCTCOUNTNOBLANK (plain DISTINCTCOUNT counts BLANK -> off-by-one vs Tableau)
+# STDEV/VAR  -> STDEV.S/VAR.S    (Tableau STDEV/VAR are the SAMPLE statistics)
+# STDEVP/VARP-> STDEV.P/VAR.P    (the POPULATION statistics)
+
+# Aggregations that require a NUMERIC column (emit DAX that errors on text/date otherwise).
+_NUMERIC_ONLY_AGGS = {"SUM", "AVG", "MEDIAN", "STDEV", "STDEVP", "VAR", "VARP"}
 
 # Outer aggregation -> DAX iterator used to RE-AGGREGATE a FIXED LOD over its own grain:
 # SUMMARIZE materializes the LOD grain, CALCULATE re-enters row context for the inner measure.
@@ -94,7 +102,7 @@ _NUMERIC_TYPES = {"int64", "double", "decimal"}
 #   _MATH_1_SIG : single numeric operand -> FN(x, <significance>). Tableau CEILING/FLOOR take
 #                 one argument (round to the nearest integer); DAX requires a significance step.
 #   _MATH_2     : two numeric operands -> DAXNAME(a, b). Tableau DIV (integer division) maps to
-#                 DAX QUOTIENT; POWER is identical.
+#                 DAX QUOTIENT; POWER and MOD are identical.
 # Functions with their own arity/shape are handled directly in _scalar_fn: ROUND (1-or-2 arg),
 # LOG (1-arg base-10 or 2-arg LOG(x, base)), SQUARE(x) -> POWER(x, 2), and PI() (nullary).
 _MATH_1 = {
@@ -102,7 +110,7 @@ _MATH_1 = {
     "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "COT",
 }
 _MATH_1_SIG = {"CEILING": "1", "FLOOR": "1"}
-_MATH_2 = {"POWER": "POWER", "DIV": "QUOTIENT"}
+_MATH_2 = {"POWER": "POWER", "DIV": "QUOTIENT", "MOD": "MOD"}
 _SCALAR_MATH = _MATH_1 | set(_MATH_1_SIG) | set(_MATH_2) | {"ROUND", "LOG", "SQUARE", "PI"}
 
 
@@ -395,6 +403,8 @@ class _Parser:
                 return self._isnull()
             if u in _SCALAR_MATH:
                 return self._scalar_fn(u)
+            if u == "PERCENTILE":
+                return self._percentile()
             raise _CalcError(f"unsupported function {v}")
         if k == "field":
             raise _CalcError("bare row-level field [..] not valid in a measure")
@@ -564,7 +574,7 @@ class _Parser:
             raise _CalcError(f"unresolved/ambiguous field [{v}]")
         table, col, tmdl_type = resolved
         # Reject aggregates invalid for the column's data type (would emit DAX that errors).
-        if name in ("SUM", "AVG", "MEDIAN") and tmdl_type not in _NUMERIC_TYPES:
+        if name in _NUMERIC_ONLY_AGGS and tmdl_type not in _NUMERIC_TYPES:
             raise _CalcError(f"{name} requires a numeric field, got {tmdl_type} for [{v}]")
         if name in ("MIN", "MAX") and tmdl_type not in (_NUMERIC_TYPES | {"dateTime"}):
             raise _CalcError(f"{name} requires a numeric/date field, got {tmdl_type} for [{v}]")
@@ -574,6 +584,28 @@ class _Parser:
         else:
             dtype = "number"  # SUM/AVG/MEDIAN/COUNT/COUNTD and numeric MIN/MAX
         return (f"{_AGG_MAP[name]}({_dax_table(table)}{_dax_col(col)})", dtype)
+
+    def _percentile(self):
+        # PERCENTILE([field], n) -> PERCENTILE.INC('T'[field], n). Aggregation over a single
+        # numeric field; n (the 0..1 fraction) must be numeric. A non-numeric field or a bare
+        # row-level / aggregated first argument falls back.
+        self._next()  # PERCENTILE
+        self._expect_op("(")
+        k, v = self._peek()
+        if k != "field":
+            raise _CalcError("PERCENTILE first argument must be a single bare [field]")
+        self._next()
+        self._expect_op(",")
+        n = self._expect_number(self._expr())
+        self._expect_op(")")
+        resolved = self.resolver(v)
+        if resolved is None:
+            raise _CalcError(f"unresolved/ambiguous field [{v}]")
+        table, col, tmdl_type = resolved
+        if tmdl_type not in _NUMERIC_TYPES:
+            raise _CalcError(f"PERCENTILE requires a numeric field, got {tmdl_type} for [{v}]")
+        self.tables_used.add(table)
+        return (f"PERCENTILE.INC({_dax_table(table)}{_dax_col(col)}, {n[0]})", "number")
 
     def _lod_core(self):
         # Parse a {FIXED d1, d2, ... : inner} body. Returns (table, [clean_cols], inner_node).

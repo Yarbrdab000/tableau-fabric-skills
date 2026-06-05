@@ -32,6 +32,9 @@ dax, reason, tables_used = translate_tableau_calc_to_dax(formula, resolver)
 | Tableau construct | DAX emitted | Notes |
 |---|---|---|
 | `SUM/AVG/MIN/MAX/MEDIAN/COUNT/COUNTD([field])` | `SUM/AVERAGE/MIN/MAX/MEDIAN/COUNTA/DISTINCTCOUNTNOBLANK('T'[Col])` | Single **bare** field only |
+| `STDEV/STDEVP/VAR/VARP([field])` | `STDEV.S/STDEV.P/VAR.S/VAR.P('T'[Col])` | Tableau STDEV/VAR are the **sample** stats |
+| `PERCENTILE([field], n)` | `PERCENTILE.INC('T'[Col], n)` | `n` is the 0..1 fraction |
+| `DIV(a, b)` / `MOD(a, b)` | `QUOTIENT(a, b)` / `MOD(a, b)` | Integer division / modulo; numeric |
 | Arithmetic `+ - * /`, unary `-`, parentheses | same, with `/` → `DIVIDE(...)` | Operands must be numeric |
 | `IF c THEN a ELSEIF c2 THEN b ELSE z END` | nested `IF(c, a, IF(c2, b, z))` | No `ELSE` → 2-arg `IF` (BLANK when unmatched) |
 | `IIF(cond, a, b)` | `IF(cond, a, b)` | 4-arg `IIF` is **not** supported |
@@ -43,7 +46,6 @@ dax, reason, tables_used = translate_tableau_calc_to_dax(formula, resolver)
 | `ROUND(x)` / `ROUND(x, n)` | `ROUND(x, 0)` / `ROUND(x, n)` | Tableau 1-arg `ROUND` → 0 decimals |
 | `CEILING(x)` / `FLOOR(x)` | `CEILING(x, 1)` / `FLOOR(x, 1)` | DAX requires a significance step |
 | `POWER(x, n)` / `SQUARE(x)` | `POWER(x, n)` / `POWER(x, 2)` | DAX has no `SQUARE` |
-| `DIV(a, b)` | `QUOTIENT(a, b)` | Integer division; both numeric |
 | `PI()` | `PI()` | Nullary numeric constant |
 | `= == <> != > >= < <=` | `=` / `<>` / `>` … | `==`→`=`, `!=`→`<>` |
 | `AND` / `OR` / `NOT(x)` | `&&` / `||` / `NOT(x)` | Operands must be boolean |
@@ -86,8 +88,9 @@ mismatch, so it never emits DAX that would error or silently coerce:
   booleans); `AND`/`OR`/`NOT` require booleans.
 - `IF` / `IIF` / `IFNULL` branches must all return the **same** type.
 - Scalar math functions (`ABS`, `ROUND`, `CEILING`, `FLOOR`, `POWER`, `SQUARE`, `SQRT`, `SIGN`, `EXP`,
-  `LOG`, `LN`, `DIV`, `PI`, and the `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`/`COT` trig family) require
-  **numeric** operands, so a row-level field, a text/date operand, or wrong arity falls back.
+  `LOG`, `LN`, `DIV`, `MOD`, `PI`, and the `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`/`COT` trig family) require
+  **numeric** operands, so a row-level field, a text/date operand, or wrong arity falls back. `STDEV`,
+  `STDEVP`, `VAR`, `VARP`, and `PERCENTILE` likewise require a numeric field.
 - `CASE` → `SWITCH` needs **one** consistent result type across every `THEN`/`ELSE`; the simple form also
   requires each `WHEN` value to match the comparand's type. `CASE` is parsed like `IF` (it self-terminates
   at `END` and does not compose into surrounding arithmetic).

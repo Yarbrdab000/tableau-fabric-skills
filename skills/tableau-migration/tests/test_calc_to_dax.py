@@ -43,6 +43,14 @@ TRANSLATIONS = [
     ("MEDIAN([Sales])", "MEDIAN('Orders'[Sales])"),
     ("COUNT([Sales])", "COUNTA('Orders'[Sales])"),
     ("COUNTD([Region])", "DISTINCTCOUNTNOBLANK('Orders'[Region])"),
+    # --- statistical aggregations (sample vs population) ---
+    ("STDEV([Sales])", "STDEV.S('Orders'[Sales])"),
+    ("STDEVP([Sales])", "STDEV.P('Orders'[Sales])"),
+    ("VAR([Sales])", "VAR.S('Orders'[Sales])"),
+    ("VARP([Sales])", "VAR.P('Orders'[Sales])"),
+    ("PERCENTILE([Sales], 0.9)", "PERCENTILE.INC('Orders'[Sales], 0.9)"),
+    ("STDEV([Sales]) / AVG([Sales])",
+     "DIVIDE(STDEV.S('Orders'[Sales]), AVERAGE('Orders'[Sales]))"),
     ("MIN([Order Date])", "MIN('Orders'[Order_Date])"),
     ("SUM([Sales])+SUM([Profit])", "SUM('Orders'[Sales]) + SUM('Orders'[Profit])"),
     ("SUM([Sales])-SUM([Profit])", "SUM('Orders'[Sales]) - SUM('Orders'[Profit])"),
@@ -119,6 +127,7 @@ TRANSLATIONS = [
     ("LOG(SUM([Sales]), 2)", "LOG(SUM('Orders'[Sales]), 2)"),       # explicit log base
     ("DIV(SUM([Sales]), SUM([Quantity]))",                          # integer division
      "QUOTIENT(SUM('Orders'[Sales]), SUM('Orders'[Quantity]))"),
+    ("MOD(SUM([Quantity]), 2)", "MOD(SUM('Orders'[Quantity]), 2)"),  # modulo
     ("PI()", "PI()"),                                               # nullary numeric constant
     ("SUM([Sales]) * PI()", "SUM('Orders'[Sales]) * PI()"),         # PI() composes with aggregates
     # trig family (single numeric operand, identity names)
@@ -173,6 +182,11 @@ FALLBACKS = [
     "SUM([Region])",                              # SUM on string
     "AVG([Order Date])",                          # AVG on dateTime
     "MEDIAN([Region])",                           # MEDIAN on string
+    "STDEV([Region])",                            # STDEV on string
+    "VAR([Order Date])",                          # VAR on dateTime
+    "PERCENTILE([Region], 0.5)",                  # PERCENTILE on string
+    "PERCENTILE([Sales])",                        # PERCENTILE missing the fraction arg
+    "MOD(SUM([Quantity]))",                       # MOD needs 2 operands
     # type-soundness failures in the conditional grammar
     'IF SUM([Sales]) > 0 THEN SUM([Profit]) ELSE "n/a" END',   # mixed number/text branches
     'IFNULL(SUM([Sales]), "n/a")',                # inconsistent IFNULL arg types
