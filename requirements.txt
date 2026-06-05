@@ -1,0 +1,3 @@
+# Runtime: the skill's bundled scripts are pure Python standard library only (no runtime deps).
+# Development / testing only:
+pytest>=7.0

@@ -1,0 +1,35 @@
+# Sensitive Tableau artifacts — NEVER commit (plaintext source/connection details)
+*.tds
+*.tdsx
+*.twb
+*.twbx
+*.hyper
+
+# Secrets / credentials
+*.pat
+.env
+.env.*
+*secret*
+*credential*
+!**/security-governance.md
+
+# Temp / scratch harnesses
+_*.py
+!__init__.py
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
