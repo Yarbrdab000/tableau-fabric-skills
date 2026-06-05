@@ -43,7 +43,7 @@ ROW-LEVEL (CALCULATED-COLUMN) COMPANION: translate_tableau_calc_to_column_dax sh
 public shape but parses in row context (mode="column"): a bare ``[field]`` resolves to
 ``'Table'[Col]`` and the row-level string / date / numeric-cast functions become available
 (LEN/LEFT/RIGHT/MID/UPPER/LOWER/REPLACE/CONTAINS/STARTSWITH/ENDSWITH/FIND; YEAR/MONTH/DAY/TODAY/
-NOW/DATEPART/DATEADD/DATEDIFF/DATETRUNC/DATE; INT/FLOAT; string ``+`` -> null-preserving
+NOW/DATEPART/DATEADD/DATEDIFF/DATETRUNC/DATE/MAKEDATE; INT/FLOAT; string ``+`` -> null-preserving
 concatenation). Aggregations, PERCENTILE, and LODs are invalid there and fall back. Mappings whose
 DAX equivalent is NOT faithful are deliberately left to fall back: TRIM/LTRIM/RTRIM (DAX TRIM also
 collapses internal whitespace), SPLIT (no general DAX form), STR and DATE(text) (culture-sensitive
@@ -149,7 +149,7 @@ _STRING_FNS = {
 }
 _DATE_FNS = {
     "YEAR", "MONTH", "DAY", "TODAY", "NOW",
-    "DATEPART", "DATEADD", "DATEDIFF", "DATETRUNC", "DATE",
+    "DATEPART", "DATEADD", "DATEDIFF", "DATETRUNC", "DATE", "MAKEDATE",
 }
 _CAST_FNS = {"INT", "FLOAT"}
 _COLUMN_ONLY_FNS = _STRING_FNS | _DATE_FNS | _CAST_FNS
@@ -827,6 +827,16 @@ class _Parser:
             x = self._expect_date(self._expr())
             self._expect_op(")")
             return (f"DATE(YEAR({x[0]}), MONTH({x[0]}), DAY({x[0]}))", "date")
+        if name == "MAKEDATE":
+            # Tableau MAKEDATE(year, month, day) -> DAX DATE(year, month, day): an exact,
+            # culture-independent mapping (all three operands must be numeric).
+            y = self._expect_number(self._expr())
+            self._expect_op(",")
+            m = self._expect_number(self._expr())
+            self._expect_op(",")
+            d = self._expect_number(self._expr())
+            self._expect_op(")")
+            return (f"DATE({y[0]}, {m[0]}, {d[0]})", "date")
         if name == "DATEPART":
             part = self._part_literal()
             self._expect_op(",")
@@ -1032,7 +1042,7 @@ def translate_tableau_calc_to_column_dax(formula, resolver):
       * a bare ``[field]`` resolves to ``'Table'[Col]`` (in a measure this falls back), and
       * the row-level string / date / numeric-cast functions become available
         (LEN/LEFT/RIGHT/MID/UPPER/LOWER/REPLACE/CONTAINS/STARTSWITH/ENDSWITH/FIND;
-        YEAR/MONTH/DAY/TODAY/NOW/DATEPART/DATEADD/DATEDIFF/DATETRUNC/DATE; INT/FLOAT),
+        YEAR/MONTH/DAY/TODAY/NOW/DATEPART/DATEADD/DATEDIFF/DATETRUNC/DATE/MAKEDATE; INT/FLOAT),
         plus string ``+`` -> null-preserving concatenation.
     Aggregations, PERCENTILE, and LOD expressions are NOT valid in a row-level column and
     fall back here (use the measure entry point for those).

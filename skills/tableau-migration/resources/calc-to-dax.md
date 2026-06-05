@@ -122,13 +122,16 @@ a column.
 | `DATEDIFF("part", d1, d2)` | `DATEDIFF(d1, d2, UNIT)` | Args reorder; `week` falls back |
 | `DATETRUNC("part", d)` | `DATE(YEAR(d), MONTH(d), 1)` etc. | `day`/`month`/`year`; `quarter`/`week` fall back |
 | `DATE(d)` | `DATE(YEAR(d), MONTH(d), DAY(d))` | Strips the time component |
+| `MAKEDATE(y, m, d)` | `DATE(y, m, d)` | Exact, culture-independent; operands must be numeric |
 
 Row-level numeric math (`ABS`, `ROUND`, …) and the full conditional/logical grammar (`IF`, `CASE`,
 comparisons, `AND`/`OR`/`NOT`, `ZN`/`IFNULL`/`ISNULL`) also work in column context over row-level fields.
 
 **Deliberately left to fall back** (no faithful DAX equivalent): `TRIM`/`LTRIM`/`RTRIM` (DAX `TRIM` also
 collapses internal whitespace), `SPLIT` (no general DAX form), `STR` and `DATE("...")` (culture-sensitive
-formatting/parsing), and the start-of-week-dependent `DATEPART("week"/"weekday")` / `DATEDIFF("week", …)`.
+formatting/parsing), the start-of-week-dependent `DATEPART("week"/"weekday")` / `DATEDIFF("week", …)`,
+`DATENAME` (returns a localized part name), and the `MAKETIME`/`MAKEDATETIME` constructors (DAX `TIME` uses
+a different epoch date and the multi-arg forms are version-dependent).
 
 ---
 
@@ -198,6 +201,15 @@ row-level forms above do translate — via their respective entry points.)
 
 > **Cross-table fallback is intentional.** Even when a relationship path exists, the DAX filter context is
 > not guaranteed to reproduce Tableau's blended result, so those measures are stubbed rather than guessed.
+
+### Permanent fallbacks (out-of-engine — never translated)
+
+A small set of constructs has **no in-engine DAX equivalent** and is always preserved-as-annotation + stub,
+from both entry points: raw upstream SQL (`RAWSQL*`, `RAWSQLAGG*`), external R/Python service calls
+(`SCRIPT_BOOL/INT/REAL/STR`), regular expressions (`REGEXP_MATCH/EXTRACT/REPLACE`; DAX has no regex engine),
+session identity / security functions (`USERNAME`, `FULLNAME`, `ISMEMBEROF`), and spatial builders
+(`MAKEPOINT`, `HEXBINX`, `HEXBINY`). These are the only categories that are out of scope by nature rather
+than by caution — the guardrail test `test_out_of_engine_constructs_never_translate` pins the boundary.
 
 ---
 

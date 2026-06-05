@@ -339,6 +339,8 @@ COLUMN_TRANSLATIONS = [
     ('DATETRUNC("month", [Order Date])', "DATE(YEAR('Orders'[Order_Date]), MONTH('Orders'[Order_Date]), 1)"),
     ("DATE([Order Date])",
      "DATE(YEAR('Orders'[Order_Date]), MONTH('Orders'[Order_Date]), DAY('Orders'[Order_Date]))"),  # strips time
+    ("MAKEDATE(2024, 1, 15)", "DATE(2024, 1, 15)"),                       # exact, culture-independent
+    ("MAKEDATE(YEAR([Order Date]), 1, 1)", "DATE(YEAR('Orders'[Order_Date]), 1, 1)"),  # composes with parts
     ("TODAY()", "TODAY()"),
     ("NOW()", "NOW()"),
 ]
@@ -360,6 +362,9 @@ COLUMN_FALLBACKS = [
     'DATEDIFF("week", [Order Date], TODAY())',
     'DATETRUNC("quarter", [Order Date])',
     'DATEADD("fortnight", 1, [Order Date])',      # unknown part
+    'MAKEDATE("x", 1, 1)',                        # non-numeric year operand
+    "MAKETIME(10, 30, 0)",                        # DAX TIME uses a different epoch date
+    "MAKEDATETIME(2024, 1, 1)",                   # ambiguous arg forms across versions
     # type violations
     "LEN([Sales])",                               # LEN on a numeric field
     "UPPER([Sales])",                             # UPPER on a numeric field
@@ -392,7 +397,8 @@ def test_every_emitted_column_dax_passes_the_guardrail():
 def test_row_level_functions_are_rejected_in_measure_context():
     # The two entry points are distinct: row-level fields/functions translate as a column
     # but must STILL fall back as a measure (the measure-context invariant is preserved).
-    for formula in ("UPPER([Region])", "LEFT([Region], 3)", '[Region] + "!"', "YEAR([Order Date])"):
+    for formula in ("UPPER([Region])", "LEFT([Region], 3)", '[Region] + "!"',
+                    "YEAR([Order Date])", "MAKEDATE(2024, 1, 15)"):
         assert _tx(formula) is None
         assert _col(formula) is not None
 
@@ -543,5 +549,39 @@ def test_real_superstore_measure_reconciliation_contract(name, formula, expected
     assert reason == "ok"
     assert tables == expected_tables
     assert validate_dax(dax) == ""
+
+
+# ---------------------------------------------------------------------------
+# Out-of-engine / no-faithful-equivalent constructs. Per the migration contract
+# these are the ONLY permanent fallbacks: external SQL/script passthroughs, regex
+# (DAX has no regex engine), user-identity & security functions, spatial builders,
+# and the culture-/epoch-sensitive date constructors. Each must return None from
+# BOTH public entry points (measure AND column) -- the translator preserves the
+# original formula as an annotation but never emits risky DAX for them.
+# ---------------------------------------------------------------------------
+OUT_OF_ENGINE = [
+    'RAWSQL_REAL("sum(x)", [Sales])',             # raw upstream SQL passthrough
+    'RAWSQLAGG_INT("count(x)", [Quantity])',
+    'SCRIPT_REAL("return 1", SUM([Sales]))',      # external R/Python service call
+    'SCRIPT_STR("upper(x)", [Region])',
+    'REGEXP_MATCH([Region], "^E")',               # no DAX regex engine
+    'REGEXP_REPLACE([Region], " ", "_")',
+    'REGEXP_EXTRACT([Region], "(.+)")',
+    "USERNAME()",                                 # session identity (non-deterministic)
+    "FULLNAME()",
+    'ISMEMBEROF("Analysts")',                     # security-group membership
+    "MAKEPOINT([Profit], [Sales])",               # spatial constructors
+    "HEXBINX([Sales], [Profit])",
+    'DATENAME("month", [Order Date])',            # localized part NAME (culture-sensitive)
+    "MAKETIME(10, 30, 0)",                        # DAX TIME uses a different epoch date
+    "MAKEDATETIME(2024, 1, 1)",                   # ambiguous arg forms across versions
+]
+
+
+@pytest.mark.parametrize("formula", OUT_OF_ENGINE, ids=[repr(f) for f in OUT_OF_ENGINE])
+def test_out_of_engine_constructs_never_translate(formula):
+    # The permanent-fallback boundary: neither entry point may emit DAX for these.
+    assert translate_tableau_calc_to_dax(formula, _resolver)[0] is None
+    assert translate_tableau_calc_to_column_dax(formula, _resolver)[0] is None
 
 
