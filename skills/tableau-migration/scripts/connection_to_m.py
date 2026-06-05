@@ -162,6 +162,39 @@ def _live_connection(datasource):
     return (None, None, None, None, None, None, len(named))
 
 
+# Non-secret routing facts lifted from one inner <connection>. A federated datasource can carry
+# several named connections (one per upstream), each driving its OWN connector/navigation, so we
+# capture each connection's facts to route per relation. STRICT secret boundary: only the class,
+# server, database, warehouse, HTTP path, schema, and the authentication LABEL are read -- never
+# username / password / token / oauth-config-id / instanceurl.
+def _connection_facts(c):
+    return {
+        "connection_class": c.get("class"),
+        "server": c.get("server"),
+        "database": c.get("dbname"),
+        "warehouse": c.get("warehouse"),
+        "http_path": _http_path_of(c),
+        "schema": c.get("schema"),
+        "auth_method": c.get("authentication"),
+    }
+
+
+def _named_connection_map(datasource):
+    """Map each ``<named-connection>`` id -> its inner connection's non-secret routing facts.
+
+    A relation's ``connection`` attribute is a named-connection id; this map lets a federated
+    datasource bind EACH relation to its own upstream connection (so a multi-connector source picks
+    the right connector function / navigation per table). Only non-secret attributes are read.
+    """
+    out = {}
+    for nc in _named_connections(datasource):
+        nc_id = nc.get("name")
+        inner = _children_local(nc, "connection")
+        if nc_id and inner:
+            out[nc_id] = _connection_facts(inner[0])
+    return out
+
+
 def _columns_by_parent(datasource):
     """Map relation item-name -> [ {remote_name, model_name, tmdl_type, local_name} ].
 
@@ -221,7 +254,7 @@ def _is_combination_relation(rel):
     return bool(_children_local(rel, "relation"))
 
 
-def _extract_relations(datasource, cols_by_parent):
+def _extract_relations(datasource, cols_by_parent, nc_map=None):
     """Walk ``<relation>`` elements into a flat, de-duplicated descriptor list.
 
     Handles the modern Tableau "object model" ``.tds`` shape, where the same physical tables
@@ -233,8 +266,10 @@ def _extract_relations(datasource, cols_by_parent):
     * ``join``/``union`` trees collapse to a single combination entry; their leaf tables are
       consumed (never leaked as standalone tables) so the policy can fall back cleanly.
     * duplicate physical/logical copies of the same table (same ``item``) are de-duplicated,
-      preferring the copy that actually resolves column metadata.
+      preferring the copy that actually resolves column metadata, while preserving a resolved
+      per-relation ``connection`` from whichever copy carried it.
     """
+    nc_map = nc_map or {}
     parent_map = _build_parent_map(datasource)
     relations = []
     table_index = {}  # dedupe key -> index into `relations`
@@ -251,7 +286,7 @@ def _extract_relations(datasource, cols_by_parent):
             anc = _nearest_relation_ancestor(anc, parent_map)
         if consumed:
             continue
-        entry = _classify_relation(rel, cols_by_parent)
+        entry = _classify_relation(rel, cols_by_parent, nc_map)
         if entry["kind"] in ("table", "custom_sql"):
             # De-dup on the fully-qualified path so the physical + logical copies of ONE table
             # collapse, but two genuinely different tables that merely share a leaf name (different
@@ -262,17 +297,30 @@ def _extract_relations(datasource, cols_by_parent):
                 (entry.get("item") or entry.get("name") or "").lower(),
             )
             if key in table_index:
-                prev = relations[table_index[key]]
+                idx = table_index[key]
+                prev = relations[idx]
                 if not prev.get("columns") and entry.get("columns"):
-                    relations[table_index[key]] = entry  # upgrade a column-less duplicate
+                    # Upgrade a column-less duplicate, but never lose a connection either copy had.
+                    if not entry.get("connection") and prev.get("connection"):
+                        entry["connection"] = prev["connection"]
+                    relations[idx] = entry
+                elif not prev.get("connection") and entry.get("connection"):
+                    prev["connection"] = entry["connection"]
                 continue
             table_index[key] = len(relations)
         relations.append(entry)
     return relations
 
 
-def _classify_relation(rel, cols_by_parent):
-    """Classify one ``<relation>`` element into a descriptor entry."""
+def _classify_relation(rel, cols_by_parent, nc_map=None):
+    """Classify one ``<relation>`` element into a descriptor entry.
+
+    When the relation carries a ``connection`` attribute that resolves in ``nc_map``, the resolved
+    non-secret connection facts are attached as ``connection`` so a multi-connector federated source
+    can route this table to its own upstream.
+    """
+    nc_map = nc_map or {}
+    conn = nc_map.get(rel.get("connection")) if rel.get("connection") else None
     rtype = (rel.get("type") or "").lower()
     name = rel.get("name")
     # A join/union is either an explicit type or a relation that nests child relations.
@@ -280,18 +328,21 @@ def _classify_relation(rel, cols_by_parent):
         return {"kind": rtype or "join", "name": name}
     if rtype == "text":  # custom SQL
         item_key = _strip_brackets(name) if name else None
-        return {
+        entry = {
             "kind": "custom_sql",
             "name": name,
             "sql": (rel.text or "").strip(),
             "columns": cols_by_parent.get(item_key, []),
         }
+        if conn:
+            entry["connection"] = conn
+        return entry
     if rtype == "table" or rel.get("table"):
         catalog, schema, item = _parse_table_name(rel.get("table"))
         if item is None:
             return {"kind": "unknown", "name": name, "raw_table": rel.get("table")}
         cols = cols_by_parent.get(item) or cols_by_parent.get(_strip_brackets(name) if name else "", [])
-        return {
+        entry = {
             "kind": "table",
             "name": name,
             "raw_table": rel.get("table"),
@@ -300,7 +351,180 @@ def _classify_relation(rel, cols_by_parent):
             "item": item,
             "columns": cols,
         }
+        if conn:
+            entry["connection"] = conn
+        return entry
     return {"kind": "unknown", "name": name, "raw_table": rel.get("table")}
+
+
+def _table_display(rel):
+    """The display name we emit for a table/custom-SQL relation (``table <name>`` in TMDL)."""
+    return rel.get("name") or rel.get("item")
+
+
+def _columns_index(relations):
+    """Case-insensitive map of emitted-table display name -> its column list."""
+    idx = {}
+    for r in relations:
+        if r.get("kind") in ("table", "custom_sql"):
+            name = _table_display(r)
+            if name:
+                idx[name.lower()] = r.get("columns") or []
+    return idx
+
+
+def _object_table_map(datasource, relations):
+    """Map ``<object-graph>`` object-id -> the emitted table display name it refers to.
+
+    Each ``<object>`` nests the same ``<relation name=...>`` that becomes a parsed table, so we
+    resolve the object's nested relation ``name`` (falling back to ``caption`` then the ``id``
+    attribute -- never empty), then snap it to an ACTUAL parsed table display name. An object that
+    doesn't line up with a parsed table is left unresolved so its relationships are skipped rather
+    than pointed at a non-existent table.
+    """
+    disp = {}
+    for r in relations:
+        if r.get("kind") in ("table", "custom_sql"):
+            name = _table_display(r)
+            if name:
+                disp.setdefault(name.lower(), name)
+    out = {}
+    for og in _findall_local(datasource, "object-graph"):
+        for obj in _findall_local(og, "object"):
+            oid = obj.get("id")
+            if not oid:
+                continue
+            nested = _findall_local(obj, "relation")
+            cand = (nested[0].get("name") if nested else None) or obj.get("caption") or oid
+            out[oid] = disp.get((cand or "").lower())  # None when it doesn't match a parsed table
+    return out
+
+
+# A relationship operand carrying a trailing Tableau rename caption, e.g. 'Region (people)'. The
+# last parenthetical is the disambiguating caption; the base before it is the field name. Tried
+# only AFTER an exact (verbatim) match, so a column whose real name contains parentheses survives.
+_REL_CAPTION_SUFFIX = re.compile(r"^(?P<base>.+?)\s*\([^()]*\)$")
+
+
+def _resolve_rel_column(raw_op, columns):
+    """Resolve a relationship operand like ``[Region (people)]`` to the EMITTED model column name.
+
+    Matches case-insensitively against each column's local / remote / model name (so a case-only or
+    rename-caption difference still binds -- Power BI relationships are case-insensitive), and
+    returns the column's ``model_name`` (the identifier actually emitted in TMDL) so a downstream
+    relationship references a real column. Returns ``None`` when nothing matches, so the caller skips
+    the relationship and records a warning rather than emitting a dangling reference.
+    """
+    if not raw_op:
+        return None
+    name = _strip_brackets(raw_op.strip())
+    lookup = {}
+    for c in columns:
+        for key in (c.get("local_name"), c.get("remote_name"), c.get("model_name")):
+            if key:
+                lookup.setdefault(key.lower(), c.get("model_name"))
+    hit = lookup.get((name or "").lower())
+    if hit:
+        return hit
+    m = _REL_CAPTION_SUFFIX.match(name or "")
+    if m:
+        base = m.group("base").rstrip()
+        hit = lookup.get(base.lower())
+        if hit:
+            return hit
+    return None
+
+
+def _equality_operands(relationship):
+    """Return the two leaf column operands of a single-column ``=`` relationship, else ``None``.
+
+    Only the relationship's SINGLE top-level ``<expression op='='>`` with exactly two ``[Column]``
+    leaf operands is accepted. A composite predicate (an ``AND``/``OR`` wrapper, multiple top-level
+    expressions, a calculated operand, or any non-equality op) returns ``None`` so the caller warns
+    and skips rather than silently emitting only one arm of a multi-column join.
+    """
+    tops = _children_local(relationship, "expression")
+    if len(tops) != 1:
+        return None
+    expr = tops[0]
+    if (expr.get("op") or "") != "=":
+        return None
+    kids = _children_local(expr, "expression")
+    if len(kids) != 2:
+        return None
+    if not all((k.get("op") or "").startswith("[") for k in kids):
+        return None  # an operand is a nested/calculated expression, not a bare [Column]
+    return kids[0].get("op"), kids[1].get("op")
+
+
+def _extract_relationships(datasource, relations):
+    """Parse ``<object-graph><relationships>`` into ``[{from_table, from_col, to_table, to_col}]``.
+
+    Endpoints are resolved to emitted table display names and operands to emitted model column
+    names; a relationship is emitted ONLY when both tables and both columns resolve to real emitted
+    identifiers (operand order is validated, swapping if the authored order is reversed). Anything
+    that can't be resolved cleanly -- unknown endpoint, composite/calculated key, a column that
+    isn't an emitted column -- is skipped and recorded in the returned warnings list (kept OUT of
+    ``unsupported_reasons`` so a fuzzy relationship never forces the whole datasource to fall back).
+
+    Returns ``(relationships, warnings)``.
+    """
+    oid_to_table = _object_table_map(datasource, relations)
+    cols_index = _columns_index(relations)
+    out, warnings, seen = [], [], set()
+    for og in _findall_local(datasource, "object-graph"):
+        for rship in _findall_local(og, "relationship"):
+            fep = _findall_local(rship, "first-end-point")
+            sep = _findall_local(rship, "second-end-point")
+            if not fep or not sep:
+                warnings.append("relationship is missing an end-point; skipped")
+                continue
+            from_table = oid_to_table.get(fep[0].get("object-id"))
+            to_table = oid_to_table.get(sep[0].get("object-id"))
+            if not from_table or not to_table:
+                warnings.append(
+                    "relationship endpoint did not resolve to a parsed table "
+                    f"({fep[0].get('object-id')!r} / {sep[0].get('object-id')!r}); skipped")
+                continue
+            ops = _equality_operands(rship)
+            if not ops:
+                warnings.append(
+                    f"relationship '{from_table}'<->'{to_table}' is not a single-column equality "
+                    "(composite / calculated / non-'=' predicate); skipped")
+                continue
+            op1, op2 = ops
+            from_cols = cols_index.get(from_table.lower(), [])
+            to_cols = cols_index.get(to_table.lower(), [])
+
+            def _orient(a, b):
+                fc = _resolve_rel_column(a, from_cols)
+                tc = _resolve_rel_column(b, to_cols)
+                return (fc, tc) if (fc and tc) else None
+
+            # Tableau does not pin operand order to end-point order, so resolve BOTH orientations.
+            forward = _orient(op1, op2)              # op1 on from-table, op2 on to-table
+            reverse = _orient(op2, op1)              # authored in reverse order
+            if forward and reverse and forward != reverse:
+                # Both readings resolve to DIFFERENT column pairs (e.g. both keys exist on both
+                # tables): genuinely ambiguous -> skip rather than pick a possibly-wrong pairing.
+                warnings.append(
+                    f"relationship '{from_table}'<->'{to_table}' columns ({op1} / {op2}) are "
+                    "ambiguous (both orientations resolve differently); skipped")
+                continue
+            resolved = forward or reverse
+            if not resolved:
+                warnings.append(
+                    f"relationship '{from_table}'<->'{to_table}' columns ({op1} / {op2}) did "
+                    "not resolve to emitted columns; skipped")
+                continue
+            from_col, to_col = resolved
+            dedup = (from_table.lower(), from_col.lower(), to_table.lower(), to_col.lower())
+            if dedup in seen:
+                continue
+            seen.add(dedup)
+            out.append({"from_table": from_table, "from_col": from_col,
+                        "to_table": to_table, "to_col": to_col})
+    return out, warnings
 
 
 def parse_tds(xml_text):
@@ -308,7 +532,9 @@ def parse_tds(xml_text):
 
     The descriptor is JSON-serializable (suitable for a migration report) and contains NO
     credentials. ``unsupported_reasons`` collects shape problems found during parsing so the
-    storage-mode policy can fall back cleanly.
+    storage-mode policy can fall back cleanly. Additive context keys: ``connections`` (named-
+    connection id -> non-secret routing facts), ``relationships`` (inferred table->table joins from
+    the object graph), and ``relationship_warnings`` (relationships that could not be resolved).
     """
     root = ET.fromstring(xml_text)
     datasource = root if _local(root.tag) == "datasource" else (
@@ -316,8 +542,10 @@ def parse_tds(xml_text):
 
     cls, server, dbname, warehouse, http_path, auth_method, nconns = _live_connection(datasource)
     cols_by_parent = _columns_by_parent(datasource)
+    nc_map = _named_connection_map(datasource)
 
-    relations = _extract_relations(datasource, cols_by_parent)
+    relations = _extract_relations(datasource, cols_by_parent, nc_map)
+    relationships, relationship_warnings = _extract_relationships(datasource, relations)
 
     is_extract = False
     for ex in _findall_local(datasource, "extract"):
@@ -341,7 +569,10 @@ def parse_tds(xml_text):
         "auth_method": auth_method,
         "is_extract": is_extract,
         "named_connection_count": nconns,
+        "connections": nc_map,
         "relations": relations,
+        "relationships": relationships,
+        "relationship_warnings": relationship_warnings,
         "unsupported_reasons": unsupported,
     }
 
@@ -416,15 +647,34 @@ def _connect_expr(connector, connect_style):
     if connect_style == "server_database":  # SQL Server protocol family
         return f'{connector}(#"Server", #"Database")'
     if connect_style == "server_only":
-        # Oracle / Teradata: the service/SID (Oracle) lives in #"Server" and there is no separate
-        # database argument; HierarchicalNavigation defaults false on both, so we set it explicitly
-        # so the flat Schema/Item selector is correct rather than default-reliant.
+        # Oracle: the service/SID lives in #"Server" and there is no separate database argument;
+        # HierarchicalNavigation defaults false, so we set it explicitly so the flat Schema/Item
+        # selector is correct rather than default-reliant.
         return f'{connector}(#"Server", [HierarchicalNavigation=false])'
     if connect_style == "server_warehouse":
         return f'{connector}(#"Server", #"Warehouse")'
     if connect_style == "server_httppath":  # Databricks SQL warehouse (host, httpPath)
         return f'{connector}(#"Server", #"HttpPath")'
     raise ValueError(f"unhandled connect_style {connect_style!r} for connector {connector!r}")
+
+
+def _effective_connection(relation, descriptor):
+    """Return the connection facts to bind THIS relation against.
+
+    For a federated datasource with MORE THAN ONE named connection, each relation routes to its OWN
+    upstream connection (so a per-table connector function / navigation is chosen from the relation's
+    own class + database). For the single-connection case the global descriptor is returned
+    unchanged, so emitted M is byte-identical to the pre-routing behavior.
+
+    NOTE: the shared ``#"Server"`` / ``#"Database"`` / ``#"Warehouse"`` / ``#"HttpPath"`` parameters
+    are still emitted once per datasource by ``emit_connection_parameters``; full multi-connection
+    deployment additionally needs per-connection parameters. Multi-connection sources are routed to
+    the land-to-Delta fallback by ``select_storage_mode`` today, so this routing is groundwork that
+    is never the deployed artifact on its own.
+    """
+    if descriptor.get("named_connection_count", 1) > 1 and relation.get("connection"):
+        return relation["connection"]
+    return descriptor
 
 
 def emit_m_partition_source(relation, descriptor, mode):
@@ -434,9 +684,11 @@ def emit_m_partition_source(relation, descriptor, mode):
     with its own connect signature + navigation); any other connector returns a clearly-commented
     scaffold so the structure is valid TMDL but obviously needs manual completion (never silently
     wrong). Custom SQL is emitted deploy-ready only for the ``(server, database)`` family, where
-    ``Value.NativeQuery`` folds against the database handle.
+    ``Value.NativeQuery`` folds against the database handle. For a multi-connection federated source
+    each relation is bound against its OWN connection (see ``_effective_connection``).
     """
-    cls = (descriptor.get("connection_class") or "").lower()
+    conn = _effective_connection(relation, descriptor)
+    cls = (conn.get("connection_class") or "").lower()
     if cls in ANALYSIS_SERVICES_CLASSES:
         # SSAS / MSOLAP is already a tabular/multidimensional model -- never emit a naive M
         # partition for it; flag it for the separate model-migration path.
@@ -480,7 +732,7 @@ def emit_m_partition_source(relation, descriptor, mode):
         # relation's three-part [catalog].[schema].[item] name when present, else the connection's
         # database; without the catalog + schema the navigation can't be resolved, so we scaffold
         # rather than guess.
-        database = relation.get("catalog") or descriptor.get("database")
+        database = relation.get("catalog") or conn.get("database")
         schema = relation.get("schema")
         item = relation["item"]
         if not database or not schema:
@@ -502,14 +754,14 @@ def emit_m_partition_source(relation, descriptor, mode):
     if nav_style != "schema_item":
         raise ValueError(f"unhandled nav_style {nav_style!r} for connector {connector!r}")
 
-    # schema_item: flat ADO.NET navigation (SQL Server family + Oracle / Teradata). These bind one
-    # database via Sql.Database(server, database) (or reach it through the server string), so a
-    # three-part [catalog].[schema].[item] name whose catalog differs from (or has no) connection
-    # database is a cross-database reference we can't scope safely -> scaffold rather than silently
-    # query the connection's default database. A catalog that equals the database is just a
-    # redundant qualifier and is dropped.
+    # schema_item: flat ADO.NET navigation (SQL Server family + Oracle). These bind one database via
+    # Sql.Database(server, database) (or reach it through the server string), so a three-part
+    # [catalog].[schema].[item] name whose catalog differs from (or has no) connection database is a
+    # cross-database reference we can't scope safely -> scaffold rather than silently query the
+    # connection's default database. A catalog that equals the database is just a redundant
+    # qualifier and is dropped.
     catalog = relation.get("catalog")
-    database = descriptor.get("database")
+    database = conn.get("database")
     if catalog and (not database or catalog.lower() != database.lower()):
         return _scaffold_source(
             cls, connector,
