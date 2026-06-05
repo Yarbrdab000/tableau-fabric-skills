@@ -217,13 +217,13 @@ def test_calculated_field_binds_to_measures_table_by_caption():
 
 # -- unsupported handling ------------------------------------------------------
 def test_unsupported_mark_produces_warning_and_no_visual():
-    ws = _worksheet("Pie Chart", "Pie",
+    ws = _worksheet("Area Chart", "Area",
                     rows="[federated.abc].[sum:Sales:qk]",
                     cols="[federated.abc].[none:Category:nk]",
                     deps_extra=_INST)
     ir = parse_twb(_workbook(ws))
     assert ir["worksheets"][0]["visual_type"] == "unsupported"
-    assert any(x["scope"] == "worksheet" and "Pie" in x["reason"] for x in ir["warnings"])
+    assert any(x["scope"] == "worksheet" and "Area" in x["reason"] for x in ir["warnings"])
     parts = emit_pbir(ir)
     assert _visual_parts(parts) == {}  # no visual emitted for the unsupported mark
 
@@ -405,14 +405,17 @@ def test_gantt_mark_is_unsupported():
     assert _visual_parts(emit_pbir(ir)) == {}
 
 
-def test_bar_with_measures_on_both_axes_is_unsupported():
-    # measure on rows AND cols, no dimension -> orientation is ambiguous -> no guess
-    ws = _worksheet("Ambiguous", "Bar",
+def test_bar_with_measures_on_both_axes_and_no_dimension_is_card():
+    # measure on rows AND cols, no dimension -> a multi-row card (two big numbers), not a chart
+    ws = _worksheet("KPIs", "Bar",
                     rows="[federated.abc].[sum:Sales:qk]",
                     cols="[federated.abc].[sum:Profit:qk]",
                     deps_extra=_INST)
     ir = parse_twb(_workbook(ws))
-    assert ir["worksheets"][0]["visual_type"] == "unsupported"
+    assert ir["worksheets"][0]["visual_type"] == "card"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "multiRowCard"
+    assert len(_query_state(vis)["Values"]["projections"]) == 2
 
 
 def test_color_dimension_encoding_populates_series_role():
@@ -428,16 +431,115 @@ def test_color_dimension_encoding_populates_series_role():
 
 
 # -- degenerate visuals are skipped (not emitted as empty shells) --------------
-def test_line_without_category_is_skipped_with_warning():
-    ws = _worksheet("MeasureOnly", "Line",
-                    rows="[federated.abc].[sum:Sales:qk]",
-                    cols="",
+def test_chart_missing_required_role_is_skipped_by_emit_gate():
+    # a column visual whose shelves resolved to nothing must not emit an empty shell
+    ir = {
+        "worksheets": [{
+            "name": "Empty", "visual_type": "column", "rows": [], "cols": [],
+            "encodings": {"color": None, "size": None, "label": None, "detail": None},
+            "filters": [],
+        }],
+        "dashboards": [], "warnings": [],
+    }
+    parts = emit_pbir(ir)
+    assert _visual_parts(parts) == {}
+    assert any("no usable field bindings" in w["reason"] for w in ir["warnings"])
+
+
+# -- card / KPI (single measure, no dimension) ---------------------------------
+def test_single_measure_no_dimension_is_card():
+    ws = _worksheet("Total Sales", "Text",
+                    rows="[federated.abc].[sum:Sales:qk]", cols="",
                     deps_extra=_INST)
     ir = parse_twb(_workbook(ws))
-    assert ir["worksheets"][0]["visual_type"] == "line"  # mark-level still line
-    parts = emit_pbir(ir)
-    assert _visual_parts(parts) == {}  # but no usable Category -> not emitted
-    assert any("no usable field bindings" in x["reason"] for x in ir["warnings"])
+    assert ir["worksheets"][0]["visual_type"] == "card"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "card"
+    proj = _query_state(vis)["Values"]["projections"][0]
+    assert proj["field"]["Aggregation"]["Function"] == 0  # Sum
+    assert proj["field"]["Aggregation"]["Expression"]["Column"]["Property"] == "Sales_Amount"
+
+
+def test_measure_on_label_encoding_with_empty_shelves_is_card():
+    enc = "<encodings><text column='[federated.abc].[sum:Profit:qk]' /></encodings>"
+    ws = _worksheet("Profit KPI", "Text", rows="", cols="",
+                    deps_extra=_INST, encodings=enc)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["visual_type"] == "card"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "card"
+    assert _query_state(vis)["Values"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
+
+
+# -- scatter (two axis measures + a disaggregating dimension) -------------------
+def test_circle_mark_two_measures_with_detail_dimension_is_scatter():
+    enc = "<encodings><lod column='[federated.abc].[none:Category:nk]' /></encodings>"
+    ws = _worksheet("Sales vs Profit", "Circle",
+                    rows="[federated.abc].[sum:Profit:qk]",
+                    cols="[federated.abc].[sum:Sales:qk]",
+                    deps_extra=_INST, encodings=enc)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["visual_type"] == "scatter"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "scatterChart"
+    state = _query_state(vis)
+    assert set(state) >= {"X", "Y", "Category"}
+    # X = measure on columns (Sales), Y = measure on rows (Profit), Category = detail dim
+    assert state["X"]["projections"][0]["field"]["Aggregation"]["Expression"]["Column"]["Property"] == "Sales_Amount"
+    assert state["Y"]["projections"][0]["field"]["Aggregation"]["Expression"]["Column"]["Property"] == "Profit"
+    assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "Category"
+
+
+def test_automatic_mark_two_measures_with_dimension_is_scatter():
+    enc = "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings>"
+    ws = _worksheet("Auto Scatter", "Automatic",
+                    rows="[federated.abc].[sum:Profit:qk]",
+                    cols="[federated.abc].[sum:Sales:qk]",
+                    deps_extra=_INST, encodings=enc)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["visual_type"] == "scatter"
+    state = _query_state(list(_visual_parts(emit_pbir(ir)).values())[0])
+    # the color dimension lands on Series, not Category
+    assert state["Series"]["projections"][0]["field"]["Column"]["Property"] == "Region"
+
+
+def test_scatter_layout_without_dimension_falls_back_to_card():
+    # two measures, no disaggregating dimension -> a multi-row card, not a scatter
+    ws = _worksheet("No Detail", "Circle",
+                    rows="[federated.abc].[sum:Profit:qk]",
+                    cols="[federated.abc].[sum:Sales:qk]",
+                    deps_extra=_INST)
+    assert parse_twb(_workbook(ws))["worksheets"][0]["visual_type"] == "card"
+
+
+def test_scatter_size_measure_already_on_axis_is_not_double_bound():
+    enc = ("<encodings>"
+           "<lod column='[federated.abc].[none:Category:nk]' />"
+           "<size column='[federated.abc].[sum:Sales:qk]' />"
+           "</encodings>")
+    ws = _worksheet("Sized Scatter", "Circle",
+                    rows="[federated.abc].[sum:Profit:qk]",
+                    cols="[federated.abc].[sum:Sales:qk]",
+                    deps_extra=_INST, encodings=enc)
+    ir = parse_twb(_workbook(ws))
+    state = _query_state(list(_visual_parts(emit_pbir(ir)).values())[0])
+    assert "Size" not in state  # Sales is already on X, not re-bound to Size
+    assert state["X"]["projections"][0]["field"]["Aggregation"]["Expression"]["Column"]["Property"] == "Sales_Amount"
+
+
+# -- pie -----------------------------------------------------------------------
+def test_pie_mark_is_pie_chart_with_category_and_value():
+    ws = _worksheet("Sales Share", "Pie",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["visual_type"] == "pie"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "pieChart"
+    state = _query_state(vis)
+    assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "Category"
+    assert state["Y"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
 
 
 # -- aggregate / measure filters do NOT become slicers -------------------------

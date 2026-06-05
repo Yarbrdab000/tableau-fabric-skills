@@ -10,6 +10,15 @@ It is built only from primary sources: the Tableau workbook XML grammar (workshe
 `<datasources>`, `<mark class>`, rows/cols shelves, encodings, filters) and Microsoft's
 public PBIR JSON schemas.
 
+## Clean-room methodology
+
+This module was written independently from primary specifications — the Tableau `.twb` XML
+grammar (Tableau docs) for the input and Microsoft's PBIR / `.pbip` JSON schema for the output.
+Reference implementations were consulted **only to fact-check discrete mappings** (e.g. a mark
+class → a PBIR `visualType`, a data-role name); no expression, file/function structure, naming,
+comments, or test data were copied. Third-party attribution lives in the repository-root
+`THIRD_PARTY_NOTICES`.
+
 ## Pipeline
 
 ```
@@ -52,10 +61,30 @@ fixtures, no disk, no network); the live open/deploy is a separate manual pass.
 | Line (needs ≥1 measure)                             | `line`           | `lineChart`            | Category / Y / Series |
 | Text, dimensions on **one** axis                    | `table`          | `tableEx`              | Values                |
 | Text, dimensions on **both** axes                   | `matrix`         | `pivotTable`           | Rows / Columns / Values |
+| Pie, legend dimension + angle measure               | `pie`            | `pieChart`             | Category / Y          |
+| Circle/square/shape/point, measure on **both** axes + a disaggregating dimension | `scatter` | `scatterChart` | X / Y / Category / Series / Size |
+| Measure(s) with **no** dimension anywhere (one)     | `card`           | `card`                 | Values                |
+| Measure(s) with **no** dimension anywhere (≥2)      | `card`           | `multiRowCard`         | Values                |
 | Categorical / date / numeric **filter**             | (slicer)         | `slicer`               | Values                |
 
 `Automatic` marks are inferred from the shelves (dim+measure → column; dims only → table or
-matrix). A `color` encoding on a dimension populates the **Series** role.
+matrix; two measures + a dimension → scatter). A `color` encoding on a dimension populates the
+**Series** role; a `detail`/level-of-detail dimension disaggregates a scatter (**Category**); a
+measure on the `label`/`text` or `size` encoding with empty shelves drives a **card**.
+
+### Scatter / card / pie role mapping
+
+- **Scatter** (`scatterChart`): the measure on **columns** → `X`, the measure on **rows** → `Y`,
+  the disaggregating dimension (`detail` or an axis dim) → `Category`, a `color` dimension →
+  `Series`, a `size` measure → `Size`. Two measures with *no* dimension fall back to a card
+  (orientation/series would be a guess), per the small-correct-slice rule.
+- **Card / KPI** (`card` for a single value, `multiRowCard` for several): a measure on the marks
+  shelf (rows/cols) or on the `label`/`size` encoding with no dimension. A bare big-number KPI
+  tile (e.g. `SUM(Sales)` on the Text encoding) is detected this way; the dedicated PBIR `kpi`
+  visual (with target/trend `Indicator` roles) is left to a later pass since `.twb` carries no
+  target/trend metadata.
+- **Pie** (`pieChart`): the legend dimension (axis dim or `color`) → `Category`, the angle/size
+  measure → `Y`.
 
 ## Binding contract (matches the v1 model exactly)
 
@@ -105,9 +134,14 @@ definition/pages/<page>/visuals/<v>/visual.json   (visualContainer 1.0.0)
 Every warning is `{"scope": "worksheet"|"dashboard", "name": <name>, "reason": "manual attention required: ..."}`.
 Cases that degrade to a warning instead of a visual/binding:
 
-- **Unsupported marks**: pie, area, polygon, shape, map / filled map, density/heatmap,
-  Gantt (non-bar), circle/square scatter, etc. → the worksheet emits **no** visual.
-- **Scatter and card/KPI** are out of scope for this slice (deferred to a later pass).
+- **Unsupported marks**: area, polygon, density/heatmap, Gantt (non-bar), filled/symbol
+  **maps**, etc. → the worksheet emits **no** visual.
+- **Geographic maps are a documented gap** (deferred): a faithful Power BI map needs a
+  latitude/longitude pair or a geo-hierarchy role that `.twb` mark geometry does not expose
+  cleanly, so map marks degrade to a warning instead of a guessed visual.
+- **KPI target/trend**: a single measure with no dimension becomes a `card`/`multiRowCard`; the
+  richer PBIR `kpi` visual (with `Indicator`/`TrendAxis`/`TargetValue` roles) is deferred
+  because the workbook carries no target or trend metadata to bind those roles.
 - **Table calculations** and other window/running derivations (e.g. `WindowSum`) → field skipped.
 - **Aggregation/type mismatch**: `Sum`/`Avg`/`Median` on a non-numeric column, or `Min`/`Max`
   on a non-numeric/non-date column → field skipped.
