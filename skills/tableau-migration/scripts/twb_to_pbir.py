@@ -65,6 +65,9 @@ VT_BAR = "bar"            # clusteredBarChart   (horizontal bars: dim on y / row
 VT_LINE = "line"          # lineChart
 VT_TABLE = "table"        # tableEx
 VT_MATRIX = "matrix"      # pivotTable
+VT_SCATTER = "scatter"    # scatterChart (X/Y measures disaggregated by a dimension)
+VT_CARD = "card"          # card (1 measure) / multiRowCard (>=2 measures), no dimension
+VT_PIE = "pie"            # pieChart (angle measure + legend dimension)
 VT_UNSUPPORTED = "unsupported"
 
 _VT_TO_PBIR = {
@@ -73,6 +76,8 @@ _VT_TO_PBIR = {
     VT_LINE: "lineChart",
     VT_TABLE: "tableEx",
     VT_MATRIX: "pivotTable",
+    VT_SCATTER: "scatterChart",
+    VT_PIE: "pieChart",
 }
 
 # Tableau derivation -> Power BI QueryAggregateFunction code.
@@ -376,18 +381,41 @@ def _split_token_attr(value):
     return _split_token(m.group(0)) if m else (None, None)
 
 
-def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols):
-    """Pick the internal visual-type enum from the mark class + shelf layout.
+def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
+                 enc_dims=(), enc_meas=()):
+    """Pick the internal visual-type enum from the mark class + shelf/encoding layout.
 
-    Deliberately conservative: only the proven orientations become bar/column; ambiguous
-    or unrecognized layouts return ``unsupported`` so the caller warns instead of guessing.
+    Deliberately conservative: only proven layouts map to a chart; ambiguous or unrecognized
+    layouts return ``unsupported`` so the caller warns instead of guessing. ``enc_dims`` /
+    ``enc_meas`` are dimension / measure fields carried on the marks-card encodings (color,
+    size, label, detail), which matter for card (a measure on the label with empty shelves)
+    and scatter (a dimension on detail/color).
     """
     m = (mark or "").strip().lower()
-    has_dim = bool(dims_rows or dims_cols)
-    has_meas = bool(meas_rows or meas_cols)
+    axis_dim = bool(dims_rows or dims_cols)
+    axis_meas = bool(meas_rows or meas_cols)
+    has_dim = axis_dim or bool(enc_dims)
+    has_meas = axis_meas or bool(enc_meas)
+
+    if not has_meas and not has_dim:
+        return VT_UNSUPPORTED
+
+    # measure(s) with no dimension anywhere -> a single-value card / multi-row card tile
+    if has_meas and not has_dim:
+        return VT_CARD
 
     if m == "line":
         return VT_LINE if has_meas else VT_UNSUPPORTED
+
+    if m == "pie":
+        # an angle measure split by a legend dimension -> pie
+        return VT_PIE if (has_meas and has_dim) else VT_UNSUPPORTED
+
+    if m in ("circle", "square", "shape", "point"):
+        # a measure on each axis, disaggregated by a dimension -> scatter
+        if meas_rows and meas_cols and has_dim:
+            return VT_SCATTER
+        return VT_UNSUPPORTED
 
     if m in ("bar", "automatic", ""):
         # vertical bars: category on cols (x), measure on rows (y)
@@ -397,12 +425,15 @@ def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols):
         if dims_rows and meas_cols and not meas_rows:
             return VT_BAR
         if m in ("automatic", ""):
-            if dims_rows and dims_cols and not has_meas:
+            # measures on both axes + a dimension -> scatter
+            if meas_rows and meas_cols and has_dim:
+                return VT_SCATTER
+            if dims_rows and dims_cols and not axis_meas:
                 return VT_MATRIX
-            if has_dim and not has_meas:
+            if axis_dim and not axis_meas:
                 return VT_TABLE
             # Automatic with one dimension + one measure defaults to a column chart.
-            if has_dim and has_meas:
+            if has_dim and axis_meas:
                 return VT_COLUMN
         return VT_UNSUPPORTED
 
@@ -489,7 +520,14 @@ def _parse_worksheet(ws, index, ds_caption, warnings):
     dims_cols = [f for f in cols if f["kind"] == "category"]
     meas_rows = [f for f in rows if f["kind"] == "value"]
     meas_cols = [f for f in cols if f["kind"] == "value"]
-    visual_type = _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols)
+    # marks-card encodings also carry fields: color/detail can be the disaggregating
+    # dimension (scatter) and label/size can be the measure of a bare card / KPI tile.
+    enc_dims = [f for f in (encodings["color"], encodings["detail"])
+                if f and f["kind"] == "category"]
+    enc_meas = [f for f in (encodings["size"], encodings["label"])
+                if f and f["kind"] == "value"]
+    visual_type = _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
+                               enc_dims, enc_meas)
 
     if visual_type == VT_UNSUPPORTED:
         warnings.append(_warn(
@@ -669,6 +707,8 @@ def _build_query_state(ws, model_table, field_map, warnings):
     rows, cols = ws["rows"], ws["cols"]
     color = ws["encodings"]["color"]
     label = ws["encodings"]["label"]
+    size = ws["encodings"]["size"]
+    detail = ws["encodings"]["detail"]
 
     def categories(fs):
         return [f for f in fs if f["kind"] == "category"]
@@ -727,6 +767,56 @@ def _build_query_state(ws, model_table, field_map, warnings):
         if ordered:
             state["Values"] = {"projections": _role_projections(
                 ordered, model_table, field_map, used_refs)}
+    elif vt == VT_SCATTER:
+        x = _dedupe(values(cols))   # measure(s) on columns -> X axis
+        y = _dedupe(values(rows))   # measure(s) on rows    -> Y axis
+        cat = drop_calc_axis(_dedupe(
+            categories(rows) + categories(cols)
+            + ([detail] if detail and detail["kind"] == "category" else [])))
+        series = [color] if (color and color["kind"] == "category"
+                             and not color["is_calc"]) else []
+        cat = [f for f in cat if f not in series]
+        # only bind Size if that measure is not already an axis (avoid double-binding)
+        axis_keys = {(f["entity"], f["property"], f["binding"], f["aggregation"])
+                     for f in x + y}
+        size_f = ([size] if (size and size["kind"] == "value"
+                  and (size["entity"], size["property"], size["binding"],
+                       size["aggregation"]) not in axis_keys) else [])
+        if x:
+            state["X"] = {"projections": _role_projections(
+                x, model_table, field_map, used_refs)}
+        if y:
+            state["Y"] = {"projections": _role_projections(
+                y, model_table, field_map, used_refs)}
+        if cat:
+            state["Category"] = {"projections": _role_projections(
+                cat, model_table, field_map, used_refs)}
+        if series:
+            state["Series"] = {"projections": _role_projections(
+                series, model_table, field_map, used_refs)}
+        if size_f:
+            state["Size"] = {"projections": _role_projections(
+                size_f, model_table, field_map, used_refs)}
+    elif vt == VT_PIE:
+        legend = drop_calc_axis(_dedupe(
+            categories(rows) + categories(cols)
+            + ([color] if color and color["kind"] == "category" else [])))
+        vals = _dedupe(values(rows) + values(cols)
+                       + ([label] if label and label["kind"] == "value" else [])
+                       + ([size] if size and size["kind"] == "value" else []))
+        if legend:
+            state["Category"] = {"projections": _role_projections(
+                legend, model_table, field_map, used_refs)}
+        if vals:
+            state["Y"] = {"projections": _role_projections(
+                vals, model_table, field_map, used_refs)}
+    elif vt == VT_CARD:
+        vals = _dedupe(values(rows) + values(cols)
+                       + ([label] if label and label["kind"] == "value" else [])
+                       + ([size] if size and size["kind"] == "value" else []))
+        if vals:
+            state["Values"] = {"projections": _role_projections(
+                vals, model_table, field_map, used_refs)}
     return state
 
 
@@ -736,13 +826,25 @@ def _query_state_complete(vt, state):
     Guards against a visual whose fields were all dropped by aggregation/type/calc guards
     (e.g. a line chart left with a measure but no category) being emitted as an empty shell.
     """
-    if vt in (VT_COLUMN, VT_BAR, VT_LINE):
+    if vt in (VT_COLUMN, VT_BAR, VT_LINE, VT_PIE):
         return "Category" in state and "Y" in state
+    if vt == VT_SCATTER:
+        return "X" in state and "Y" in state
+    if vt == VT_CARD:
+        return "Values" in state
     if vt == VT_MATRIX:
         return "Values" in state and ("Rows" in state or "Columns" in state)
     if vt == VT_TABLE:
         return "Values" in state
     return False
+
+
+def _pbir_vtype(vt, state):
+    """Resolve the PBIR ``visualType`` string; a card splits into card vs multiRowCard."""
+    if vt == VT_CARD:
+        n = len(state.get("Values", {}).get("projections", []))
+        return "multiRowCard" if n > 1 else "card"
+    return _VT_TO_PBIR[vt]
 
 
 # -- PBIR JSON part assembly ---------------------------------------------------
@@ -879,7 +981,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             x, y, w, h = _scale_zone(zone, ref_w, ref_h)
             vname = _sanitize(f"v-{page_name}-{i}-{ws['name']}")
             visuals.append(_visual_json(
-                vname, _VT_TO_PBIR[ws["visual_type"]],
+                vname, _pbir_vtype(ws["visual_type"], state),
                 _position(x, y, w, h, tab=i), state))
         visuals += _emit_slicers(page_ws, page_name, model_table, field_map)
         if not visuals:
@@ -900,7 +1002,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 f"{ws['visual_type']} visual has no usable field bindings (skipped)"))
             continue
         main = _visual_json(
-            _sanitize("v-" + ws["name"]), _VT_TO_PBIR[ws["visual_type"]],
+            _sanitize("v-" + ws["name"]), _pbir_vtype(ws["visual_type"], state),
             _position(40, 40, 880, 620), state)
         visuals = [main] + _emit_slicers([ws], page_name, model_table, field_map)
         _emit_page(parts, page_name, ws["name"], visuals)
