@@ -45,6 +45,17 @@ def test_azure_sqldb_is_directquery_fully_supported():
     assert d["fallback"] is None
 
 
+def test_azure_sqldb_extract_is_import_with_live_directquery_alternative():
+    # If the Azure SQL Superstore datasource ships as a .hyper extract, Import preserves the
+    # snapshot while still advertising the live Sql.Database DirectQuery rebuild as an option.
+    d = select_storage_mode(_desc(connection_class="azure_sqldb", is_extract=True))
+    assert d["mode"] == "Import"
+    assert d["connector"] == "Sql.Database"
+    assert d["fully_supported"] is True
+    assert d["direct_upstream_available"] is True
+    assert d["recommended_mode"] == "Import"
+
+
 def test_extract_is_import_with_live_alternative():
     d = select_storage_mode(_desc(is_extract=True))
     assert d["mode"] == "Import"
