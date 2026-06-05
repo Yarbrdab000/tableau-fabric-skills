@@ -2,8 +2,9 @@
 
 Started from the Play 4 notebook self-test cell (aggregation + arithmetic safe
 subset) and extended to cover the conditional/null-handling grammar: IF/ELSEIF/ELSE,
-IIF, comparisons, AND/OR/NOT, ZN/IFNULL/ISNULL, and string literals. They lock the
-deterministic translator's behavior: the supported subset must produce the documented
+IIF, comparisons, AND/OR/NOT, ZN/IFNULL/ISNULL, string literals, scalar math over
+aggregated operands (ABS/ROUND/CEILING/FLOOR/POWER/SQRT/SIGN/EXP/LOG/LN), and
+CASE/WHEN -> SWITCH (searched and simple forms). They lock the deterministic translator's behavior: the supported subset must produce the documented
 DAX, and everything outside it (including type-inconsistent or non-boolean-condition
 forms) must fall back (return None) so the caller keeps an inert ``= 0`` stub.
 """
@@ -101,6 +102,38 @@ TRANSLATIONS = [
      "AVERAGEX(SUMMARIZE('Orders', 'Orders'[Region]), "
      "CALCULATE(MAXX(SUMMARIZE('Orders', 'Orders'[Region], 'Orders'[Order_Date]), "
      "CALCULATE(SUM('Orders'[Sales])))))"),
+    # --- scalar math over numeric (aggregated) operands ---
+    ("ABS(SUM([Profit]))", "ABS(SUM('Orders'[Profit]))"),
+    ("SIGN(SUM([Profit]))", "SIGN(SUM('Orders'[Profit]))"),
+    ("SQRT(SUM([Sales]))", "SQRT(SUM('Orders'[Sales]))"),
+    ("EXP(SUM([Quantity]))", "EXP(SUM('Orders'[Quantity]))"),
+    ("LN(SUM([Sales]))", "LN(SUM('Orders'[Sales]))"),
+    ("LOG(SUM([Sales]))", "LOG(SUM('Orders'[Sales]))"),          # Tableau 1-arg LOG = base 10
+    ("ROUND(SUM([Sales]))", "ROUND(SUM('Orders'[Sales]), 0)"),   # 1-arg ROUND -> ROUND(x, 0)
+    ("ROUND(SUM([Sales]), 2)", "ROUND(SUM('Orders'[Sales]), 2)"),
+    ("CEILING(SUM([Sales]))", "CEILING(SUM('Orders'[Sales]), 1)"),  # DAX needs a significance
+    ("FLOOR(SUM([Sales]))", "FLOOR(SUM('Orders'[Sales]), 1)"),
+    ("POWER(SUM([Sales]), 2)", "POWER(SUM('Orders'[Sales]), 2)"),
+    # scalar math composes with arithmetic and nests (operands stay numeric)
+    ("ABS(SUM([Profit])) / SUM([Sales])",
+     "DIVIDE(ABS(SUM('Orders'[Profit])), SUM('Orders'[Sales]))"),
+    ("ROUND(SUM([Profit]) / SUM([Sales]), 2)",
+     "ROUND(DIVIDE(SUM('Orders'[Profit]), SUM('Orders'[Sales])), 2)"),
+    ("ABS(ROUND(SUM([Sales])))", "ABS(ROUND(SUM('Orders'[Sales]), 0))"),
+    # --- CASE/WHEN -> SWITCH (searched form) ---
+    ("CASE WHEN SUM([Sales]) > 0 THEN 1 ELSE 0 END",
+     "SWITCH(TRUE(), SUM('Orders'[Sales]) > 0, 1, 0)"),
+    ("CASE WHEN SUM([Sales]) > 100 THEN 1 WHEN SUM([Sales]) > 0 THEN 2 ELSE 3 END",
+     "SWITCH(TRUE(), SUM('Orders'[Sales]) > 100, 1, SUM('Orders'[Sales]) > 0, 2, 3)"),
+    ("CASE WHEN SUM([Sales]) > 0 THEN SUM([Profit]) END",               # no ELSE -> BLANK default
+     "SWITCH(TRUE(), SUM('Orders'[Sales]) > 0, SUM('Orders'[Profit]))"),
+    ('CASE WHEN SUM([Sales]) > 0 THEN "hi" ELSE "lo" END',             # text results are consistent
+     'SWITCH(TRUE(), SUM(\'Orders\'[Sales]) > 0, "hi", "lo")'),
+    # --- CASE/WHEN -> SWITCH (simple form; comparand must be aggregated/literal) ---
+    ("CASE SUM([Quantity]) WHEN 0 THEN 1 ELSE 0 END",
+     "SWITCH(SUM('Orders'[Quantity]), 0, 1, 0)"),
+    ("CASE SUM([Quantity]) WHEN 0 THEN 10 WHEN 1 THEN 20 ELSE 30 END",
+     "SWITCH(SUM('Orders'[Quantity]), 0, 10, 1, 20, 30)"),
 ]
 
 # Each of these MUST fall back (translator returns None).
@@ -142,6 +175,24 @@ FALLBACKS = [
     "COUNTD({FIXED [Region] : SUM([Sales])})",    # COUNTD cannot re-aggregate an LOD
     "{FIXED [Region], [People Count] : SUM([Sales])}",            # cross-table LOD dimensions
     "AVG({FIXED [Region], [Order Date] : MAX({FIXED [Region] : SUM([Sales])})})",  # nested non-superset
+    # --- scalar math fallbacks (type / arity / measure-context violations) ---
+    "ABS([Profit])",                              # bare row-level operand
+    'ABS("x")',                                   # non-numeric operand
+    "ABS(MIN([Order Date]))",                     # date operand (MIN on dateTime -> date)
+    "SQRT(SUM([Sales]), 2)",                      # wrong arity (1-arg fn given 2)
+    "POWER(SUM([Sales]))",                        # wrong arity (POWER needs 2)
+    "ROUND(SUM([Sales]), 2, 3)",                  # wrong arity (ROUND takes 1 or 2)
+    'ROUND(SUM([Sales]), "2")',                   # non-numeric digit count
+    "LOG(SUM([Sales]), 2)",                       # 2-arg LOG intentionally unsupported
+    "CEILING(SUM([Region]))",                     # SUM on string fails before CEILING
+    # --- CASE/WHEN fallbacks (measure-context / type violations) ---
+    "CASE END",                                   # no WHEN clause
+    "CASE WHEN SUM([Sales]) THEN 1 ELSE 0 END",   # non-boolean searched condition
+    'CASE SUM([Quantity]) WHEN "x" THEN 1 ELSE 0 END',  # value type != comparand type
+    'CASE SUM([Quantity]) WHEN 1 THEN "a" ELSE 0 END',  # mixed result types (text vs number)
+    "CASE WHEN SUM([Sales]) > 0 THEN [Profit] END",     # row-level result inside CASE
+    "CASE WHEN SUM([Sales]) > 0 THEN 1 END + 1",        # CASE self-terminates; no arithmetic compose
+    "CASE WHEN SUM([Sales]) > 0 THEN SUM([People Count]) ELSE 0 END",  # cross-table result
 ]
 
 

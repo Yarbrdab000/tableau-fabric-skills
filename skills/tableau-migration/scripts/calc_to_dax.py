@@ -8,6 +8,13 @@ Translates a SAFE subset of Tableau calculated fields into working DAX measures:
   * aggregations over a single bare field: SUM, AVG, MIN, MAX, COUNT, COUNTD, MEDIAN
   * arithmetic between those terms / numeric literals: + - * /, parentheses, unary minus
   * conditional logic: IF/THEN/ELSEIF/ELSE/END and IIF(cond, a, b)
+  * CASE/WHEN -> SWITCH: searched form CASE WHEN c THEN r ... [ELSE z] END ->
+    SWITCH(TRUE(), c, r, ..., z) and simple form CASE e WHEN v THEN r ... [ELSE z] END ->
+    SWITCH(e, v, r, ..., z); measure-context-safe only (the comparand, values, and a single
+    consistent result type must be aggregations or literals)
+  * scalar math over NUMERIC (aggregated) operands: ABS, ROUND (1-arg -> ROUND(x, 0)),
+    CEILING(x) -> CEILING(x, 1), FLOOR(x) -> FLOOR(x, 1), POWER, SQRT, SIGN, EXP,
+    LOG (1-arg, base-10), LN
   * comparison operators: = == <> != > >= < <=  (== -> = ; != -> <>)
   * boolean logic: AND -> && , OR -> || , NOT(x)
   * null handling: ZN(x) -> COALESCE(x, 0) ; IFNULL(a, b) -> COALESCE(a, b) ;
@@ -29,9 +36,10 @@ whose branches return different types, an arithmetic op on a non-numeric term, o
 between incomparable types) so it never emits DAX that would error or silently coerce.
 
 Anything outside this subset (INCLUDE/EXCLUDE LODs, table calcs WINDOW_/RUNNING_/RANK/LOOKUP/
-INDEX/TOTAL, CASE/WHEN, scalar date/string functions, nested arithmetic inside an aggregation,
-4-arg IIF, references to other calcs, unresolved or ambiguous fields, cross-table terms)
-deterministically FALLS BACK by returning ``None`` so the caller keeps an inert ``= 0`` stub.
+INDEX/TOTAL, scalar date/string/regex functions, row-level operands inside a scalar math
+function or CASE, a 2-arg LOG, nested arithmetic inside an aggregation, 4-arg IIF, references
+to other calcs, unresolved or ambiguous fields, cross-table terms) deterministically FALLS
+BACK by returning ``None`` so the caller keeps an inert ``= 0`` stub.
 The original Tableau formula is preserved as a ``TableauFormula`` annotation by the renderer
 either way.
 
@@ -76,6 +84,18 @@ _AGG_X = {
     "MEDIAN": "MEDIANX", "COUNT": "COUNTAX",
 }
 _NUMERIC_TYPES = {"int64", "double", "decimal"}
+
+# Scalar math functions that wrap a NUMERIC (aggregated) operand and stay valid in a measure
+# (they compose with the existing arithmetic). Operand(s) must be numeric or the whole calc
+# falls back. Tableau name -> DAX is identity here, so we just re-emit the (uppercased) name.
+#   _MATH_1     : single numeric operand -> FN(x). LOG is the 1-arg base-10 form (DAX LOG
+#                 defaults to base 10); LN is natural log.
+#   _MATH_1_SIG : single numeric operand -> FN(x, <significance>). Tableau CEILING/FLOOR take
+#                 one argument (round to the nearest integer); DAX requires a significance step.
+# ROUND (1-or-2 arg) and POWER (2 arg) have their own arity and are handled in _scalar_fn.
+_MATH_1 = {"ABS", "SQRT", "SIGN", "EXP", "LN", "LOG"}
+_MATH_1_SIG = {"CEILING": "1", "FLOOR": "1"}
+_SCALAR_MATH = _MATH_1 | set(_MATH_1_SIG) | {"ROUND", "POWER"}
 
 
 class _CalcError(Exception):
@@ -233,6 +253,8 @@ class _Parser:
     def _expr(self):
         if self._is_kw("IF"):
             return self._if()
+        if self._is_kw("CASE"):
+            return self._case()
         return self._or()
 
     def _if(self):
@@ -363,6 +385,8 @@ class _Parser:
                 return self._ifnull()
             if u == "ISNULL":
                 return self._isnull()
+            if u in _SCALAR_MATH:
+                return self._scalar_fn(u)
             raise _CalcError(f"unsupported function {v}")
         if k == "field":
             raise _CalcError("bare row-level field [..] not valid in a measure")
@@ -407,6 +431,94 @@ class _Parser:
         x = self._expr()
         self._expect_op(")")
         return (f"ISBLANK({x[0]})", "bool")
+
+    def _scalar_fn(self, name):
+        # Scalar math over a NUMERIC (aggregated) operand. Each operand is parsed as a full
+        # expression but must be numeric: a bare row-level [field] (parse error in a measure),
+        # a text/date operand, or wrong arity all raise -> the whole calc falls back.
+        self._next()  # function name
+        self._expect_op("(")
+        x = self._expect_number(self._expr())
+        if name in _MATH_1:
+            self._expect_op(")")
+            return (f"{name}({x[0]})", "number")
+        if name in _MATH_1_SIG:
+            # DAX CEILING/FLOOR need a significance; Tableau's 1-arg form rounds to the integer.
+            self._expect_op(")")
+            return (f"{name}({x[0]}, {_MATH_1_SIG[name]})", "number")
+        if name == "ROUND":
+            # Tableau ROUND(x) -> DAX ROUND(x, 0); ROUND(x, n) passes the digit count through.
+            if self._peek() == ("op", ","):
+                self._next()
+                digits = self._expect_number(self._expr())
+                self._expect_op(")")
+                return (f"ROUND({x[0]}, {digits[0]})", "number")
+            self._expect_op(")")
+            return (f"ROUND({x[0]}, 0)", "number")
+        # POWER(x, n): base and exponent must both be numeric.
+        self._expect_op(",")
+        exponent = self._expect_number(self._expr())
+        self._expect_op(")")
+        return (f"POWER({x[0]}, {exponent[0]})", "number")
+
+    def _case(self):
+        # CASE/WHEN -> DAX SWITCH. Parsed at expression-statement level (like IF) so the END
+        # self-terminates the construct and it never composes into arithmetic (which would
+        # otherwise expose DAX's BLANK coercion on an unmatched no-ELSE CASE).
+        self._next()  # CASE
+        if self._is_kw("WHEN"):
+            return self._case_searched()
+        return self._case_simple()
+
+    def _case_searched(self):
+        # CASE WHEN c1 THEN r1 ... [ELSE z] END  ->  SWITCH(TRUE(), c1, r1, ..., z)
+        pairs = []
+        while self._is_kw("WHEN"):
+            self._next()
+            cond = self._expect_bool(self._or())
+            self._expect_kw("THEN")
+            pairs.append((cond[0], self._expr()))
+        return self._switch_emit("TRUE()", pairs)
+
+    def _case_simple(self):
+        # CASE e WHEN v1 THEN r1 ... [ELSE z] END  ->  SWITCH(e, v1, r1, ..., z)
+        # e and every v must be aggregations/literals of one consistent type (a bare row-level
+        # comparand like CASE [Region] WHEN ... is a parse error -> falls back).
+        comparand = self._or()
+        pairs = []
+        while self._is_kw("WHEN"):
+            self._next()
+            value = self._or()
+            if value[1] != comparand[1]:
+                raise _CalcError("CASE WHEN value type does not match the CASE expression")
+            self._expect_kw("THEN")
+            pairs.append((value[0], self._expr()))
+        return self._switch_emit(comparand[0], pairs)
+
+    def _switch_emit(self, head, pairs):
+        # Shared tail for both CASE forms: require >=1 WHEN, then a single consistent return type
+        # across every THEN branch and the optional ELSE (DAX SWITCH needs one return type; mixed
+        # number/text/etc. would error or silently coerce, so fall back instead).
+        if not pairs:
+            raise _CalcError("CASE requires at least one WHEN")
+        else_node = None
+        if self._is_kw("ELSE"):
+            self._next()
+            else_node = self._expr()
+        self._expect_kw("END")
+        rtype = pairs[0][1][1]
+        for _, result in pairs:
+            if result[1] != rtype:
+                raise _CalcError("CASE results return inconsistent types")
+        if else_node is not None and else_node[1] != rtype:
+            raise _CalcError("CASE/ELSE results return inconsistent types")
+        args = [head]
+        for key, result in pairs:
+            args.append(key)
+            args.append(result[0])
+        if else_node is not None:
+            args.append(else_node[0])
+        return (f"SWITCH({', '.join(args)})", rtype)
 
     def _agg(self):
         name = self._next()[1].upper()
