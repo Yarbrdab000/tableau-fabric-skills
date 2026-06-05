@@ -224,6 +224,50 @@ FABRIC_SQL = """<?xml version='1.0' encoding='utf-8' ?>
   </connection>
 </datasource>"""
 
+# Azure SQL Managed Instance: Tableau reaches a Managed Instance through the ordinary SQL Server
+# connector, so it arrives as connection class 'sqlserver' (the MI host just carries the
+# instance-specific endpoint, often with a port). It must still bind through Sql.Database.
+MANAGED_INSTANCE = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Mi' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='mi' name='sqlserver.a'>
+        <connection class='sqlserver' dbname='Sales'
+                    server='myinst.public.0a1b2c3d4e5f.database.windows.net,3342' />
+      </named-connection>
+    </named-connections>
+    <relation name='Orders' table='[dbo].[Orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+# Azure Synapse Analytics serverless SQL pool: the Synapse connector emits the SAME class
+# ('azure_sql_dw') for the serverless (on-demand) endpoint as for the dedicated pool, so a
+# serverless workspace endpoint must bind through Sql.Database identically.
+SYNAPSE_SERVERLESS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='SynS' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='syns' name='azure_sql_dw.b'>
+        <connection class='azure_sql_dw' dbname='Lake'
+                    server='myws-ondemand.sql.azuresynapse.net' />
+      </named-connection>
+    </named-connections>
+    <relation name='Orders' table='[dbo].[Orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
 # Faithful reproduction of a modern multi-sheet Excel ``.tds`` (the published Superstore
 # sample): a <relation type='collection'> container wrapping the physical sheet tables, the
 # SAME tables duplicated under the logical <properties> layer, and columns in <metadata-records>.
@@ -573,6 +617,50 @@ def test_emit_synapse_is_deploy_ready_sql_database():
     params = emit_connection_parameters(d)
     assert 'expression Server = "syn.sql.azuresynapse.net"' in params
     assert 'expression Database = "WideWorld"' in params
+
+
+def test_emit_managed_instance_is_deploy_ready_sql_database():
+    # Azure SQL Managed Instance reaches Tableau through the SQL Server connector (class
+    # 'sqlserver'), so it must bind through Sql.Database like any other SQL Server endpoint -- the
+    # instance-specific host (here carrying a port) round-trips verbatim into the #"Server" param.
+    from storage_mode import select_storage_mode
+    d = parse_tds(MANAGED_INSTANCE)
+    assert d["connection_class"] == "sqlserver"
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert 'Source = Sql.Database(#"Server", #"Database")' in body
+    assert 'Source{[Schema="dbo", Item="Orders"]}[Data]' in body
+    assert "TODO" not in body
+    params = emit_connection_parameters(d)
+    assert 'expression Server = "myinst.public.0a1b2c3d4e5f.database.windows.net,3342"' in params
+    assert 'expression Database = "Sales"' in params
+    decision = select_storage_mode(d)
+    assert decision["mode"] == "DirectQuery"
+    assert decision["connector"] == "Sql.Database"
+    assert decision["fully_supported"] is True
+    assert decision["recommended_mode"] == "DirectQuery"
+    assert decision["fallback"] is None
+
+
+def test_emit_synapse_serverless_is_deploy_ready_sql_database():
+    # The Synapse connector emits the same class ('azure_sql_dw') for the serverless (on-demand)
+    # endpoint as for a dedicated pool, so a serverless workspace endpoint binds through
+    # Sql.Database identically -- no separate class, no scaffold.
+    from storage_mode import select_storage_mode
+    d = parse_tds(SYNAPSE_SERVERLESS)
+    assert d["connection_class"] == "azure_sql_dw"
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert 'Source = Sql.Database(#"Server", #"Database")' in body
+    assert 'Source{[Schema="dbo", Item="Orders"]}[Data]' in body
+    assert "TODO" not in body
+    params = emit_connection_parameters(d)
+    assert 'expression Server = "myws-ondemand.sql.azuresynapse.net"' in params
+    assert 'expression Database = "Lake"' in params
+    decision = select_storage_mode(d)
+    assert decision["mode"] == "DirectQuery"
+    assert decision["connector"] == "Sql.Database"
+    assert decision["fully_supported"] is True
+    assert decision["recommended_mode"] == "DirectQuery"
+    assert decision["fallback"] is None
 
 
 def test_emit_databricks_table_is_deploy_ready_catalogs_navigation():
