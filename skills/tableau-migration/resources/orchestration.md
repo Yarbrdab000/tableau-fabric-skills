@@ -66,9 +66,16 @@ Three adapters ship:
 - **`InMemoryTableauSource(datasources=, workbooks=)`** — *(offline fake)*. Serves `.tds`/`.twb`
   text from in-memory `{name: xml}` maps. It is the unit-test double for a live source, so the
   whole orchestrator is exercised with no files, network, or credentials.
-- **`LiveTableauSource(...)`** — *(documented seam, not implemented in v1)*. The method surface
-  for a real Tableau Server / Cloud connection is fixed; every method raises `NotImplementedError`
-  today. See [Finishing `LiveTableauSource`](#finishing-livetableausource).
+- **`LiveTableauSource(...)`** — *(documented seam; network calls not built yet)*. The method
+  surface **and** the configuration surface for a real Tableau Server / Cloud connection are fixed.
+  Construction does no I/O and stores **only names/pointers — never a secret or GUID**: a Key Vault
+  name + secret name (to fetch a PAT at run time), the token name, the Tableau `server_url` / `site`,
+  the asset **names** to migrate (`datasource_names` / `workbook_names`), and the target
+  `fabric_workspace`. Each falls back to an environment variable (see below). The pure
+  `_select_by_name(catalog, names)` helper that implements *discovery by name* is built and tested;
+  only the REST catalog/download/auth calls remain. The `list_*` / `read_*` / `_resolve_pat` /
+  `_signin` methods raise `NotImplementedError` today. See
+  [Finishing `LiveTableauSource`](#finishing-livetableausource).
 
 `.tds` files are treated as **datasources** (semantic-model path); `.twb` files are treated as
 **workbooks** (viz path). Extracting datasources embedded *inside* a `.twb` is intentionally out of
@@ -179,25 +186,58 @@ reconciliation story — every approximation is enumerated, never silently emitt
 - Fallbacks are listed with a reason; nothing is emitted wrong silently.
 - **No credentials** are read, stored, or written anywhere in the bundle (the parser never captures
   usernames/passwords; the report carries only model structure, formulas, and DAX).
+- A live run's `report.json` carries `source` *config names* (Tableau server/site, Key Vault name,
+  secret name, Fabric workspace) for reconciliation — never a resolved PAT/token. These are runtime
+  values; the emitted bundle from a real run is an output artifact and should not be committed.
 
 ---
 
 ## Finishing `LiveTableauSource`
 
 The orchestrator already runs end-to-end against files and the in-memory fake; the only remaining
-work to pull straight from a live site is implementing this adapter's four methods. The rest of the
-pipeline does not change.
+work to pull straight from a live site is wiring this adapter's REST/Metadata calls. The
+configuration surface is already in place, and the pipeline downstream does not change.
 
-1. **Authenticate.** Pull a PAT (name + secret) from **Azure Key Vault** — never inline
-   credentials — and `POST /api/<ver>/auth/signin` to exchange it for a site-scoped
-   `X-Tableau-Auth` token. Keep the token out of all output.
-2. **List datasources.** `GET /api/<ver>/sites/<site-id>/datasources` (paged) → ids / LUIDs.
-3. **List workbooks.** `GET /api/<ver>/sites/<site-id>/workbooks` (paged) → ids / LUIDs.
+### Configuration (names/pointers only — nothing secret is committed)
+
+```python
+LiveTableauSource(
+    server_url="https://<pod>.online.tableau.com",
+    site="<site-content-url>",
+    key_vault_name="Migration-skill-Kv",   # vault NAME, not a secret
+    pat_secret_name="<secret-holding-the-PAT>",
+    pat_name="<tableau-PAT-token-name>",
+    datasource_names=["Superstore"],       # discover BY NAME, not LUID/GUID
+    workbook_names=[...],
+    fabric_workspace="Tableau-migration-wps",
+)
+```
+
+Every argument also reads from an environment variable when omitted, so nothing site-specific is
+baked into source or tests: `TABLEAU_SERVER_URL`, `TABLEAU_SITE`, `TABLEAU_MIGRATION_KEYVAULT`,
+`TABLEAU_MIGRATION_PAT_SECRET`, `TABLEAU_MIGRATION_PAT_NAME`, `FABRIC_WORKSPACE`,
+`TABLEAU_DATASOURCE_NAMES` / `TABLEAU_WORKBOOK_NAMES` (comma-separated). `describe()` echoes these
+names into the report's `source` block (handy for reconciliation) but **never** the resolved token.
+
+### Implementation steps
+
+1. **Resolve the PAT at run time** (`_resolve_pat`). Read the secret from **Azure Key Vault** with
+   the `az` login already on the box —
+   `az keyvault secret show --vault-name <key_vault_name> --name <pat_secret_name> --query value -o tsv` —
+   or `azure-identity` `DefaultAzureCredential` + `azure-keyvault-secrets` `SecretClient`. Return the
+   string; never log, persist, or report it.
+2. **Authenticate** (`_signin`). `POST /api/<ver>/auth/signin` with `tokenName=pat_name` +
+   the resolved secret to exchange it for a site-scoped `X-Tableau-Auth` token.
+3. **List + filter by name.** `GET /api/<ver>/sites/<site-id>/datasources` and `.../workbooks`
+   (paged) → a `[{"id", "name"}, ...]` catalog, then `_select_by_name(catalog, self.datasource_names)`
+   (already implemented + tested) to narrow to the requested names and populate the id→name map.
 4. **Download each.** `GET .../datasources/<id>/content` and `.../workbooks/<id>/content`; a
    `.tdsx` / `.twbx` is a zip — extract the inner `.tds` / `.twb` (root or `Data/`) and decode as
    `utf-8-sig`.
 5. **(Optional) enrich.** Pull lineage / relationship metadata from the Tableau **Metadata API**
    (GraphQL) to feed relationship inference and the report.
+6. **Deploy target.** `fabric_workspace` records where the emitted bundle should land; the
+   integrator's deploy/import step (outside this seam) publishes the `*.SemanticModel` folders there.
 
-Credentials and any on-premises gateway setup stay with the user (security boundary). Until this is
-implemented, substitute `InMemoryTableauSource` (or `LocalFilesSource`) for offline runs.
+Credentials and any on-premises gateway setup stay with the user (security boundary). Until the
+network calls are built, substitute `InMemoryTableauSource` (or `LocalFilesSource`) for offline runs.

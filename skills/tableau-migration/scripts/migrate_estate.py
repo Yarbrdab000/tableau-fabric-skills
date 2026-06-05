@@ -159,59 +159,163 @@ class InMemoryTableauSource(TableauSource):
         return self._workbooks[wb_id]
 
 
+def _csv_env(value):
+    """Split a comma-separated environment value into a clean list (or ``None``)."""
+    if not value:
+        return None
+    items = [part.strip() for part in value.split(",") if part.strip()]
+    return items or None
+
+
 class LiveTableauSource(TableauSource):
-    """Documented SEAM for a live Tableau Server / Cloud connection -- NOT implemented in v1.
+    """Documented SEAM for a live Tableau Server / Cloud connection -- network calls NOT built yet.
 
     The orchestrator already runs end-to-end against :class:`LocalFilesSource` /
     :class:`InMemoryTableauSource`; finishing this adapter is the only remaining work to make the
     one-button flow pull straight from a live site. The method surface is fixed here so the rest
-    of the pipeline never has to change.
+    of the pipeline never has to change, and the *configuration* surface already captures the
+    three live concerns the integrator wires up -- without ever holding a secret or a GUID:
+
+    * **Runtime PAT from Key Vault.** The object stores only the *names* needed to fetch a
+      Personal Access Token at run time (the vault name, the secret name, the token name). The
+      token value is resolved lazily by :meth:`_resolve_pat` and is never an attribute, never
+      logged, and never written to the report.
+    * **Discovery by NAME.** Assets are targeted by human name (``datasource_names`` /
+      ``workbook_names``), not by LUID/GUID, so nothing environment-specific is baked in. The
+      pure :meth:`_select_by_name` helper does the matching and *is* implemented and unit-tested;
+      only the REST catalog fetch around it is the seam.
+    * **Fabric target.** ``fabric_workspace`` records the destination workspace *name* so the
+      report/deploy step knows where the bundle is headed.
 
     Intended implementation path (offline-safe seam -- no network calls are made today):
 
-    1. **Authenticate.** Pull a Personal Access Token (PAT name + secret) from Azure Key Vault --
-       never inline credentials -- and POST to ``/api/<ver>/auth/signin`` to exchange it for a
-       site-scoped credentials token (``X-Tableau-Auth``). Keep the token out of all output.
-    2. **List datasources.** GET ``/api/<ver>/sites/<site-id>/datasources`` (paged) -> ids/LUIDs.
-    3. **List workbooks.** GET ``/api/<ver>/sites/<site-id>/workbooks`` (paged) -> ids/LUIDs.
-    4. **Download each.** GET ``.../datasources/<id>/content`` and ``.../workbooks/<id>/content``;
+    1. **Authenticate.** :meth:`_resolve_pat` pulls the PAT secret from Azure Key Vault at run
+       time (Azure CLI ``az keyvault secret show`` or ``azure-identity`` +
+       ``azure-keyvault-secrets``); :meth:`_signin` POSTs ``tokenName`` + that secret to
+       ``/api/<ver>/auth/signin`` and exchanges it for a site-scoped ``X-Tableau-Auth`` token.
+       Keep the token out of all output.
+    2. **List datasources / workbooks.** GET ``/api/<ver>/sites/<site-id>/datasources`` and
+       ``.../workbooks`` (paged) -> a ``[{"id", "name"}, ...]`` catalog, then narrow it with
+       :meth:`_select_by_name` against ``datasource_names`` / ``workbook_names``.
+    3. **Download each.** GET ``.../datasources/<id>/content`` and ``.../workbooks/<id>/content``;
        a ``.tdsx`` / ``.twbx`` is a zip -- extract the inner ``.tds`` / ``.twb`` (root or
        ``Data/``) and decode as ``utf-8-sig``.
-    5. **(Optional) enrich.** Pull lineage / relationship metadata from the Tableau **Metadata
+    4. **(Optional) enrich.** Pull lineage / relationship metadata from the Tableau **Metadata
        API** (GraphQL) to feed relationship inference and the report.
 
-    Credentials and on-prem gateway setup stay with the user (security boundary). Until this is
-    implemented, every method raises :class:`NotImplementedError`; unit tests substitute
-    :class:`InMemoryTableauSource`.
+    Credentials and on-prem gateway setup stay with the user (security boundary). Until the
+    network calls are built, the ``list_*`` / ``read_*`` / auth methods raise
+    :class:`NotImplementedError`; unit tests substitute :class:`InMemoryTableauSource`.
     """
 
-    def __init__(self, server_url=None, site=None, pat_name=None, key_vault_secret=None,
-                 api_version="3.21"):
-        # Configuration only -- constructing this object performs NO network I/O.
-        self.server_url = server_url
-        self.site = site
-        self.pat_name = pat_name
-        self.key_vault_secret = key_vault_secret  # a Key Vault reference, never a literal secret
+    def __init__(self, server_url=None, site=None, *, key_vault_name=None, pat_secret_name=None,
+                 pat_name=None, datasource_names=None, workbook_names=None,
+                 fabric_workspace=None, api_version="3.21"):
+        # Configuration only -- constructing this object performs NO network I/O and holds NO
+        # secret material: just the *names* used to fetch a PAT and locate assets at run time.
+        # Each value falls back to an environment variable so nothing site-specific is hardcoded.
+        self.server_url = server_url or os.environ.get("TABLEAU_SERVER_URL")
+        self.site = site or os.environ.get("TABLEAU_SITE")
+        self.key_vault_name = key_vault_name or os.environ.get("TABLEAU_MIGRATION_KEYVAULT")
+        self.pat_secret_name = pat_secret_name or os.environ.get("TABLEAU_MIGRATION_PAT_SECRET")
+        self.pat_name = pat_name or os.environ.get("TABLEAU_MIGRATION_PAT_NAME")
+        self.fabric_workspace = fabric_workspace or os.environ.get("FABRIC_WORKSPACE")
+        self.datasource_names = (list(datasource_names) if datasource_names is not None
+                                 else _csv_env(os.environ.get("TABLEAU_DATASOURCE_NAMES")))
+        self.workbook_names = (list(workbook_names) if workbook_names is not None
+                               else _csv_env(os.environ.get("TABLEAU_WORKBOOK_NAMES")))
         self.api_version = api_version
+        # Populated by the real list_* implementation (catalog id -> display name) so asset_name
+        # can report human names; empty until the network seam is built.
+        self._name_by_id = {}
+
+    @staticmethod
+    def _select_by_name(catalog, wanted_names):
+        """Pick assets from a fetched catalog *by name* -- pure, deterministic, no I/O.
+
+        ``catalog`` is an iterable of ``{"id":.., "name":..}`` dicts (what a Tableau REST *list*
+        call yields). ``wanted_names`` is the names to keep, matched case-insensitively; an empty
+        / ``None`` filter keeps everything. Returns a list of ``(id, name)`` sorted by name then
+        id. Entries without an id are skipped; duplicate names each yield their own id.
+
+        This is the implemented heart of "discover by name" -- the real ``list_*`` methods only
+        have to supply ``catalog`` from the network and store the resulting id->name map.
+        """
+        wanted = None
+        if wanted_names:
+            wanted = {str(n).strip().casefold() for n in wanted_names if str(n).strip()}
+            if not wanted:  # an all-blank filter is treated as "keep everything"
+                wanted = None
+        picked = []
+        for entry in catalog:
+            cid = entry.get("id")
+            if cid is None:
+                continue
+            name = str(entry.get("name", "")).strip()
+            if wanted is None or name.casefold() in wanted:
+                picked.append((cid, name))
+        picked.sort(key=lambda pair: (pair[1].casefold(), str(pair[0])))
+        return picked
 
     def _not_implemented(self, what):
         return NotImplementedError(
-            f"LiveTableauSource.{what} is a v1 seam: implement Tableau REST/Metadata-API "
-            f"access (see the class docstring and resources/orchestration.md). Use "
+            f"LiveTableauSource.{what} is a seam: implement Tableau REST/Metadata-API access "
+            f"(see the class docstring and resources/orchestration.md). Use "
             f"InMemoryTableauSource or LocalFilesSource for offline runs."
         )
 
+    def _resolve_pat(self):
+        """SEAM: fetch the PAT *secret* from Azure Key Vault at run time.
+
+        Implement with the Azure CLI already on the box::
+
+            az keyvault secret show --vault-name <self.key_vault_name> \\
+                --name <self.pat_secret_name> --query value -o tsv
+
+        or ``azure-identity`` ``DefaultAzureCredential`` + ``azure-keyvault-secrets``
+        ``SecretClient``. Return the token string; never log it, never persist it, never place it
+        in the report. Raises until implemented.
+        """
+        raise self._not_implemented("_resolve_pat")
+
+    def _signin(self, pat_secret):
+        """SEAM: exchange ``self.pat_name`` + ``pat_secret`` for an ``X-Tableau-Auth`` token."""
+        raise self._not_implemented("_signin")
+
     def list_datasources(self):
+        # Real impl: catalog = <GET .../datasources, paged>; then
+        #   picked = self._select_by_name(catalog, self.datasource_names)
+        #   self._name_by_id.update(dict(picked)); return [cid for cid, _ in picked]
         raise self._not_implemented("list_datasources")
 
     def read_datasource(self, ds_id):
         raise self._not_implemented("read_datasource")
 
     def list_workbooks(self):
+        # Real impl mirrors list_datasources against .../workbooks and self.workbook_names.
         raise self._not_implemented("list_workbooks")
 
     def read_workbook(self, wb_id):
         raise self._not_implemented("read_workbook")
+
+    def asset_name(self, asset_id):
+        return self._name_by_id.get(asset_id, str(asset_id))
+
+    def describe(self):
+        # Names and pointers only -- never the PAT value or any secret/GUID.
+        return {
+            "kind": type(self).__name__,
+            "server_url": self.server_url,
+            "site": self.site,
+            "key_vault": self.key_vault_name,
+            "pat_secret_name": self.pat_secret_name,
+            "pat_name": self.pat_name,
+            "fabric_workspace": self.fabric_workspace,
+            "datasource_names": self.datasource_names,
+            "workbook_names": self.workbook_names,
+            "api_version": self.api_version,
+            "implemented": False,
+        }
 
 
 # -- calculated-field extraction ----------------------------------------------
