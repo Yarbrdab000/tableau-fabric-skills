@@ -31,10 +31,14 @@ description: >
 
 # Tableau → Microsoft Fabric Semantic Model Migration
 
-This skill packages a proven Tableau → Fabric toolkit as a reusable migration skill. **v1 scope is the
-semantic-model path**: rebuild the datasource (data model + relationships), translate calculated fields to
-DAX, and wire the connection. Dashboard / worksheet → Power BI report translation is **roadmap (v2)** and is
-explicitly out of scope here (see [§ Feature Parity](#feature-parity-reference)).
+This skill packages a proven Tableau → Fabric toolkit as a reusable migration skill. The **north star
+is estate-wide rebuild** — point at a Tableau deployment and rebuild its datasources, calculated fields,
+and workbooks as equivalent Fabric / Power BI assets, with **executed reconciliation** verifying the
+numbers actually match. **Available today:** the semantic-model path — rebuild the datasource (data model
++ relationships), translate calculated fields to DAX, and wire the connection. **Actively landing:**
+workbook / worksheet → Power BI (PBIR) report rebuild, single-entry estate orchestration, and
+model-object enrichment (hierarchies / display folders / RLS). See
+[§ Feature Parity](#feature-parity-reference) for current vs. in-progress coverage.
 
 ## Prerequisite Knowledge
 
