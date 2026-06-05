@@ -31,6 +31,7 @@ from __future__ import annotations
 # `<Connector>.Database(server, db)` + `Source{[Schema=..,Item=..]}[Data]` navigation.
 SQL_DATABASE_FAMILY = {
     "sqlserver": "Sql.Database",
+    "azure_sqldb": "Sql.Database",  # Azure SQL Database speaks the SQL Server protocol -> same connector
     "postgres": "PostgreSQL.Database",
     "oracle": "Oracle.Database",
     "mysql": "MySQL.Database",

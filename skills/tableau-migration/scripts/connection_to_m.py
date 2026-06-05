@@ -426,6 +426,7 @@ def build_m_field_resolver(descriptor):
 # Power BI "List Item Connections" data-source types keyed by Tableau connector class.
 _BIND_TYPE = {
     "sqlserver": "SQL",
+    "azure_sqldb": "SQL",
     "postgres": "PostgreSql",
     "oracle": "Oracle",
     "mysql": "MySql",

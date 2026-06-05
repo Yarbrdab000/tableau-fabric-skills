@@ -27,7 +27,7 @@ description: >
 > 2. To find the item details (including its ID) from workspace ID, item type, and item name: list all items of that type in that workspace, then use JMESPath filtering.
 > 3. **Column types are driven by the source schema, never guessed.** The DirectLake path types columns from the landed Delta schema; the Import/DirectQuery path types them from the Tableau `.tds` `<metadata-records>`. A datasource with no resolvable column metadata falls back to the land-to-Delta path — it is never deployed with inferred types.
 > 4. **Calculated-field translation is a deterministic safe subset, not full coverage.** Anything outside the subset stays an inert `= 0` stub; the original Tableau formula is ALWAYS preserved as a `TableauFormula` annotation so a human (or an optional validation-gated LLM pass) can finish it. Never claim full DAX parity.
-> 5. **Credentials and on-premises gateways are a manual security boundary.** This skill emits the model, the connection parameters, and the bind request, but the user enters credentials and selects/sets up the gateway. On a credential error, stop and have the user configure the connection.
+> 5. **Credentials and on-premises gateways are a manual security boundary.** This skill emits the model, the connection parameters, and the structured **bind inputs** (`connection_details_for_bind`), but the user enters credentials and selects/sets up the gateway, and request construction/execution is delegated to `semantic-model-authoring`. On a credential error, stop and have the user configure the connection.
 
 # Tableau → Microsoft Fabric Semantic Model Migration
 
@@ -89,13 +89,14 @@ The pure-Python cores are offline, deterministic, and stdlib-only (no Spark / pa
 
 | Script | Purpose |
 |---|---|
-| [`scripts/calc_to_dax.py`](scripts/calc_to_dax.py) | Deterministic Tableau calc → DAX translator (safe subset; `None` on fallback). |
+| `calc_to_dax.py` | Deterministic, typed Tableau calc → DAX translator. Recursive-descent parser: single-field aggregations + arithmetic, `IF`/`ELSEIF`/`IIF` conditionals, comparison + `AND`/`OR`/`NOT`, and `ZN`/`IFNULL`/`ISNULL`; `None` on fallback. |
 | [`scripts/tmdl_generate.py`](scripts/tmdl_generate.py) | TMDL generators: typed columns, tables, measures, relationship inference, model files. |
 | [`scripts/field_resolver.py`](scripts/field_resolver.py) | Unambiguous caption → column resolver for the DirectLake (landed-Delta) path. |
 | [`scripts/storage_mode.py`](scripts/storage_mode.py) | Per-datasource storage-mode auto-selection (pure policy). |
 | [`scripts/connection_to_m.py`](scripts/connection_to_m.py) | Parse Tableau `.tds` → descriptor; emit M partitions + bind details; M-path field resolver. |
+| [`scripts/assemble_model.py`](scripts/assemble_model.py) | Tier-1 orchestrator: `.tds` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`), base64 deploy payload. |
 
-Run the test suite with `pytest` from `skills/tableau-migration/` (113 offline assertions).
+Run the test suite with `pytest` from `skills/tableau-migration/` (144 offline assertions).
 
 ---
 
@@ -142,7 +143,7 @@ This skill rebuilds Tableau artifacts via REST APIs — no Tableau or Fabric UI 
 | **Extract** (`.hyper`) | **Import** model | Snapshot-to-snapshot; live DirectQuery offered as an alternative when the source is supported. |
 | **Live connection** (SQL Server/Snowflake/Postgres/…) | **DirectQuery** model | Live-to-live via an M partition + Fabric Data Connection. |
 | **Custom SQL** in a connection | **`Value.NativeQuery`** partition | Native query preserved with `[EnableFolding=true]`. |
-| **Calculated field** (safe subset) | **DAX measure** | `SUM/AVG/MIN/MAX/MEDIAN/COUNT/COUNTD` + arithmetic; everything else → preserved-formula stub. |
+| **Calculated field** (safe subset) | **DAX measure** | Aggregations (`SUM/AVG/MIN/MAX/MEDIAN/COUNT/COUNTD`) + arithmetic, `IF`/`ELSEIF`/`IIF`, comparisons + `AND`/`OR`/`NOT`, `ZN`/`IFNULL`/`ISNULL`; everything else → preserved-formula stub. |
 | **Hidden join keys** (`<Base> (<Table>)`) | **Model relationship** | Direction inferred from real landed cardinality. |
 | **Worksheet / Dashboard** | **Power BI report (PBIR)** | **Roadmap (v2)** — not migrated by v1. |
 
@@ -198,6 +199,13 @@ Tableau:  SUM([Profit]) / SUM([Sales])
 DAX:      DIVIDE(SUM('Orders'[Profit]), SUM('Orders'[Sales]))
 ```
 
+**Conditional + null handling → DAX (still inside the subset)**
+
+```text
+Tableau:  IF SUM([Sales]) > 0 THEN ZN(SUM([Profit])) / SUM([Sales]) ELSE 0 END
+DAX:      IF(SUM('Orders'[Sales]) > 0, DIVIDE(COALESCE(SUM('Orders'[Profit]), 0), SUM('Orders'[Sales])), 0)
+```
+
 **Calculated field → preserved stub (outside the subset)**
 
 ```tmdl
@@ -246,13 +254,13 @@ Full matrix in [feature-parity.md](resources/feature-parity.md). Headline parity
 |---|---|
 | Datasource → semantic model (tables, typed columns) | ✅ High parity (types from source schema). |
 | Relationship inference (hidden join keys) | ✅ Inferred from real landed cardinality (DirectLake path). |
-| Calculated field → DAX | ⚠️ **Safe subset only** — single-field aggregations + arithmetic; everything else is a preserved stub. |
+| Calculated field → DAX | ⚠️ **Safe subset only** — aggregations + arithmetic, `IF`/`ELSEIF`/`IIF`, comparisons + boolean logic, and null handling (`ZN`/`IFNULL`/`ISNULL`); LOD expressions, table calcs, and row-level/date/string functions are preserved stubs. |
 | Storage mode / upstream connection | ✅ Auto-selected; Sql.Database family fully emitted, Snowflake/BigQuery scaffolded. |
 | LOD expressions (FIXED/INCLUDE/EXCLUDE), table calcs (WINDOW_*/RUNNING_*) | ❌ Not translated — preserved as stubs for manual/LLM completion. |
 | Worksheet / dashboard → Power BI report | ❌ **Roadmap (v2)** — not in v1. |
 | Row-level security, parameters, sets, groups | ❌ Not migrated in v1 — flagged in the report. |
 
-> **Key gaps**: calc coverage is a deterministic safe subset (not full); dashboards are deferred to v2; RLS/parameters/sets are reported but not rebuilt. The preserved `TableauFormula` annotations make every gap auditable and repairable.
+> **Key gaps**: calc coverage is a deterministic safe subset (not full); dashboards are deferred to v2; RLS/parameters/sets are **not rebuilt** and are not auto-detected (the agent should flag any present from the Tableau metadata). The preserved `TableauFormula` annotations make every translated/stubbed measure auditable and repairable.
 
 ---
 
@@ -277,7 +285,7 @@ Full guide in [migration-gotchas.md](resources/migration-gotchas.md).
 See [validation-reconciliation.md](resources/validation-reconciliation.md). The migration is validated by:
 
 1. **Structural** — model deploys and refreshes (DirectLake frames / Import loads / DirectQuery connects) without error.
-2. **Translation self-tests** — `pytest` runs the 113 offline assertions (translator subset + fallbacks + TMDL render + storage-mode policy + `.tds` parsing).
+2. **Translation self-tests** — `pytest` runs the 144 offline assertions (translator subset + fallbacks + TMDL render + storage-mode policy + `.tds` parsing).
 3. **Value reconciliation (highest value)** — run each translated measure via `semantic-model-consumption` (`ExecuteQuery`) and compare to the Tableau VDS value pulled by the profiler. A measure is "verified" only when the numbers match.
 
 ---

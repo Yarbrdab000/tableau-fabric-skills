@@ -92,7 +92,8 @@ else:
 - **Live → DirectQuery.** Keeps the live-to-live contract the Tableau datasource had, via an M partition +
   Fabric Data Connection (plus a gateway if the source is on-premises).
 - **Custom SQL → native query (preserved).** The Tableau custom SQL becomes a `Value.NativeQuery(...,
-  [EnableFolding=true])` partition so it folds to the source instead of being re-expressed.
+  [EnableFolding=true])` partition so it can fold to the source instead of being re-expressed. Folding is
+  requested, not guaranteed — verify it folds before refresh.
 - **Fallback → land-to-Delta + DirectLake.** Join/union trees, multi-connection datasources, missing
   column metadata, and unmapped connectors are landed as Delta first (Play 2/3) and bound via DirectLake
   (Play 4) — the proven path that does not depend on guessing the upstream shape.
@@ -104,7 +105,7 @@ else:
 | Storage-mode choice | Entering connection **credentials** |
 | M / connection parameters | On-prem **gateway** setup for DirectQuery |
 | Column typing, relationship inference | Reviewing custom-SQL folding before refresh |
-| Connection bind request | Repairing calc → DAX stubs |
+| Connection bind inputs | Repairing calc → DAX stubs |
 
 ## DirectLake is never auto-selected here
 

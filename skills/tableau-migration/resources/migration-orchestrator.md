@@ -94,7 +94,7 @@ For each calculated field, build a field resolver and translate:
 
 ```python
 from connection_to_m import build_m_field_resolver   # Import/DirectQuery path
-# (or field_resolver.build_resolver for the DirectLake/landed-Delta path)
+# (or field_resolver.build_field_resolver for the DirectLake/landed-Delta path)
 from calc_to_dax import translate_tableau_calc_to_dax
 
 resolve = build_m_field_resolver(descriptor)

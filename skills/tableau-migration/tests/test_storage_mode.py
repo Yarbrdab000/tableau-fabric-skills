@@ -33,6 +33,16 @@ def test_live_sqlserver_is_directquery():
     assert any("gateway" in f.lower() for f in d["manual_followups"])
 
 
+def test_azure_sqldb_is_directquery_fully_supported():
+    # Azure SQL Database (Tableau class 'azure_sqldb') speaks the SQL Server protocol, so it
+    # rebuilds as a fully-supported Sql.Database DirectQuery model (verified on a live datasource).
+    d = select_storage_mode(_desc(connection_class="azure_sqldb"))
+    assert d["mode"] == "DirectQuery"
+    assert d["connector"] == "Sql.Database"
+    assert d["fully_supported"] is True
+    assert d["fallback"] is None
+
+
 def test_extract_is_import_with_live_alternative():
     d = select_storage_mode(_desc(is_extract=True))
     assert d["mode"] == "Import"
