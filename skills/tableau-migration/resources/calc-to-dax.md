@@ -48,7 +48,8 @@ dax, reason, tables_used = translate_tableau_calc_to_dax(formula, resolver)
 | `CEILING(x)` / `FLOOR(x)` | `CEILING(x, 1)` / `FLOOR(x, 1)` | DAX requires a significance step |
 | `POWER(x, n)` / `SQUARE(x)` | `POWER(x, n)` / `POWER(x, 2)` | DAX has no `SQUARE` |
 | `PI()` | `PI()` | Nullary numeric constant |
-| `= == <> != > >= < <=` | `=` / `<>` / `>` … | `==`→`=`, `!=`→`<>` |
+| `= == <> != > >= < <=` | `=` / `<>` / `>` … | `==`→`=`, `!=`→`<>`; booleans are equatable (`=`/`<>`) but not ordered |
+| `true` / `false` | `TRUE()` / `FALSE()` | Boolean literals; usable in `=`/`<>`, `IF`/`IIF`/`CASE` branches, `AND`/`OR` |
 | `AND` / `OR` / `NOT(x)` | `&&` / `||` / `NOT(x)` | Operands must be boolean |
 | `x IN (a, b, …)` | numeric/date: `x IN { a, b, … }`; text: `(EXACT(x, a) \|\| EXACT(x, b) …)` | Text uses case-sensitive `EXACT` (DAX set membership is collation/case-insensitive); one consistent element type |
 | `ZN(x)` | `COALESCE(x, 0)` | |
@@ -173,8 +174,9 @@ spec falls back with a clear reason.
 The parser tracks a data type per node — `number`, `text`, `date`, or `bool` — and falls back on any
 mismatch, so it never emits DAX that would error or silently coerce:
 
-- Arithmetic requires numeric operands; comparisons require two like, ordered/equatable types (never two
-  booleans); `AND`/`OR`/`NOT` require booleans.
+- Arithmetic requires numeric operands; comparisons require two like types. Booleans are **equatable**
+  (`=` / `<>`, including against `true`/`false` literals) but **not ordered** (`<` `>` `<=` `>=` on a boolean
+  falls back); `AND`/`OR`/`NOT` require booleans.
 - `IF` / `IIF` / `IFNULL` branches must all return the **same** type.
 - Scalar math functions (`ABS`, `ROUND`, `CEILING`, `FLOOR`, `POWER`, `SQUARE`, `SQRT`, `SIGN`, `EXP`,
   `LOG`, `LN`, `DIV`, `MOD`, `PI`, the `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`/`COT` trig family, and
@@ -207,6 +209,20 @@ row-level forms above do translate — via their respective entry points.)
 
 > **Cross-table fallback is intentional.** Even when a relationship path exists, the DAX filter context is
 > not guaranteed to reproduce Tableau's blended result, so those measures are stubbed rather than guessed.
+
+### Qualified references `[A].[B]` (tokenized cleanly, fall back with a specific reason)
+
+A dotted bracket reference — a Tableau parameter (`[Parameters].[X]`), a datasource-qualified field, or a
+data-blend token (`[federated.<hash>].[field]`) — is tokenized as a **single** qualified reference rather than
+choking on the `.`. None of these are modeled by the field-caption resolver yet, so they fall back with a
+**specific** reason instead of a cryptic tokenizer error:
+
+- `[Parameters].[X]` → `parameter reference [Parameters].[X] (unmodeled)`
+- any other dotted ref → `qualified reference [A].[B] (unmodeled)`
+
+This keeps the stub honest and lets the orchestrator model parameters / cross-source fields later and revisit.
+(In measure context a formula like `IF [Region] = [Parameters].[P] …` may hit the bare row-level field
+invariant on `[Region]` first — also a clean fallback.)
 
 ### Permanent fallbacks (out-of-engine — never translated)
 

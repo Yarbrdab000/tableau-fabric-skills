@@ -25,6 +25,7 @@ _FIELDS = {
     "Quantity": ("Orders", "Quantity", "int64"),
     "Order Date": ("Orders", "Order_Date", "dateTime"),
     "Region": ("Orders", "Region", "string"),
+    "Returned": ("Orders", "Returned", "boolean"),
     "People Count": ("People", "People_Count", "int64"),
 }
 
@@ -151,6 +152,11 @@ TRANSLATIONS = [
     ("RADIANS(SUM([Sales]))", "RADIANS(SUM('Orders'[Sales]))"),   # degrees -> radians
     # IN -> DAX set membership over a list literal (operand stays an aggregate here)
     ("SUM([Quantity]) IN (1, 2, 3)", "SUM('Orders'[Quantity]) IN {1, 2, 3}"),
+    # boolean literals true/false -> TRUE()/FALSE(), usable as IIF/CASE branches
+    ("IIF(SUM([Sales]) > 0, true, false)",
+     "IF(SUM('Orders'[Sales]) > 0, TRUE(), FALSE())"),
+    ("CASE WHEN SUM([Sales]) > 0 THEN true ELSE false END",
+     "SWITCH(TRUE(), SUM('Orders'[Sales]) > 0, TRUE(), FALSE())"),
     # scalar math composes with arithmetic and nests (operands stay numeric)
     ("ABS(SUM([Profit])) / SUM([Sales])",
      "DIVIDE(ABS(SUM('Orders'[Profit])), SUM('Orders'[Sales]))"),
@@ -246,6 +252,16 @@ FALLBACKS = [
     "CASE WHEN SUM([Sales]) > 0 THEN [Profit] END",     # row-level result inside CASE
     "CASE WHEN SUM([Sales]) > 0 THEN 1 END + 1",        # CASE self-terminates; no arithmetic compose
     "CASE WHEN SUM([Sales]) > 0 THEN SUM([People Count]) ELSE 0 END",  # cross-table result
+    # --- qualified [A].[B] references: tokenized (no '.' crash) but unmodeled -> clean fallback ---
+    "[Parameters].[Region Param]",                # parameter reference (no parameter model yet)
+    "CASE [Parameters].[Choice] WHEN 1 THEN SUM([Sales]) END",  # parameter as CASE comparand
+    "[Datasource].[Sales]",                       # datasource-qualified field reference
+    "SUM([Datasource].[Sales])",                  # qualified field inside an aggregate
+    "PERCENTILE([Datasource].[Sales], 0.5)",      # qualified field inside PERCENTILE
+    "{FIXED [Datasource].[Region] : SUM([Sales])}",  # qualified field as a FIXED dimension
+    # --- boolean comparison violations ---
+    "true > false",                               # booleans are equatable, not ordered
+    "true = 1",                                   # bool vs number type mismatch
 ]
 
 
@@ -270,6 +286,24 @@ def test_cross_table_reason_is_explicit():
     dax, reason, _ = translate_tableau_calc_to_dax("SUM([Sales])/SUM([People Count])", _resolver)
     assert dax is None
     assert "cross-table" in reason
+
+
+def test_qualified_reference_reason_is_clean_not_a_dot_error():
+    # A qualified [A].[B] reference must NOT crash the tokenizer on the '.'; it falls back with a
+    # specific, actionable reason so the orchestrator can recognize unmodeled parameters / sources.
+    _, param_reason, _ = translate_tableau_calc_to_column_dax(
+        "[Parameters].[Facility Name Parameter]", _resolver)
+    assert "parameter reference" in param_reason
+    assert "[Parameters].[Facility Name Parameter]" in param_reason
+    _, ds_reason, _ = translate_tableau_calc_to_column_dax("[Datasource].[Sales]", _resolver)
+    assert "qualified reference" in ds_reason
+    # The specific diagnostic also reaches qualified refs nested inside an aggregate (measure path),
+    # not just bare ones, so the orchestrator sees the same actionable reason everywhere.
+    _, agg_reason, _ = translate_tableau_calc_to_dax("SUM([Datasource].[Sales])", _resolver)
+    assert "qualified reference" in agg_reason
+    # Crucially: NOT the cryptic tokenizer-level "unsupported character '.'" of the old behavior.
+    for bad in ("unsupported character", "expected a value"):
+        assert bad not in param_reason and bad not in ds_reason
 
 
 def test_count_maps_to_counta_not_count():
@@ -322,6 +356,12 @@ COLUMN_TRANSLATIONS = [
      'IF((EXACT(\'Orders\'[Region], "East") || EXACT(\'Orders\'[Region], "West")), 1, 0)'),  # composes
     ('[Region] IN ("East")', '(EXACT(\'Orders\'[Region], "East"))'),  # single text element still uses EXACT
     ("[Quantity] IN (1, 2, 3)", "'Orders'[Quantity] IN {1, 2, 3}"),   # numeric operand keeps DAX set form
+    # --- boolean field vs true/false literal (= and <> only) ---
+    ("[Returned] = true", "'Orders'[Returned] = TRUE()"),
+    ("[Returned] <> false", "'Orders'[Returned] <> FALSE()"),
+    ('IF [Returned] = true THEN "R" ELSE "N" END', 'IF(\'Orders\'[Returned] = TRUE(), "R", "N")'),
+    ("([Returned] = true) AND ([Sales] > 0)",
+     "('Orders'[Returned] = TRUE()) && ('Orders'[Sales] > 0)"),
     # --- string functions ---
     ("UPPER([Region])", "UPPER('Orders'[Region])"),
     ("LOWER([Region])", "LOWER('Orders'[Region])"),
@@ -392,6 +432,11 @@ COLUMN_FALLBACKS = [
     '[Region] + [Profit]',                        # text + number (mixed)
     '[Region] IN ("East", 5)',                    # mixed-type IN list (text vs number)
     '[Sales] IN ("East", "West")',                # numeric operand vs text list
+    "[Returned] < true",                          # booleans are equatable, not ordered
+    "[Returned] = 5",                             # bool field vs number literal (type mismatch)
+    # qualified [A].[B] references: tokenized cleanly but unmodeled -> fall back
+    "[Parameters].[Facility Name Parameter]",     # parameter reference
+    "[federated.a1b2c3].[Latitude Start]",        # blend (federated) qualified field
     # cross-table row-level column (cannot span tables)
     "[Sales] + [People Count]",
 ]
