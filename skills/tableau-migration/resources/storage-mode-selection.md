@@ -47,10 +47,16 @@ fields that drive the decision:
 
 | Tier | Connector classes | M emission |
 |---|---|---|
-| **Fully supported** (`Sql.Database` family) | `sqlserver`→`Sql.Database`, `postgres`→`PostgreSQL.Database`, `oracle`→`Oracle.Database`, `mysql`→`MySQL.Database`, `redshift`→`AmazonRedshift.Database` | Deploy-ready M |
-| **Partial (scaffold)** | `snowflake`→`Snowflake.Databases`, `bigquery`→`GoogleBigQuery.Database` | Mode chosen, M emitted as a clearly-flagged scaffold (navigation differs) |
+| **Fully supported** (`(server, database)` family) | `sqlserver`/`azure_sqldb`→`Sql.Database`, `postgres`→`PostgreSQL.Database`, `mysql`→`MySQL.Database`, `redshift`→`AmazonRedshift.Database` | Deploy-ready M |
+| **Partial (scaffold)** | `oracle`→`Oracle.Database`, `teradata`→`Teradata.Database` (server-only signature), `snowflake`→`Snowflake.Databases`, `bigquery`→`GoogleBigQuery.Database` (multi-level navigation) | Mode chosen, M emitted as a clearly-flagged scaffold |
 | **Flat file** | `excel-direct`/`excel`→`Excel.Workbook`, `textscan`/`csv`→`Csv.Document` | Import; path-based scaffold (needs file path) |
 | **Unmapped** | anything else | Fall back to land-to-Delta + DirectLake |
+
+> Tier membership is decided by one verified fact (from the Power Query M docs): only connectors whose
+> documented signature is `<Connector>.Database(server, database)` are **Fully supported**, so the two-argument
+> call is correct rather than guessed. `Oracle.Database(server, [options])` and `Teradata.Database(server,
+> [options])` take a server only, and `Snowflake.Databases` / `GoogleBigQuery.Database` navigate differently —
+> so they are recognized but emitted as flagged scaffolds, never wrong M.
 
 ---
 
@@ -62,12 +68,31 @@ fields that drive the decision:
 |---|---|
 | `mode` | `"Import"`, `"DirectQuery"`, or `None` (fall back) |
 | `connector` | Power Query connector function, or `None` |
-| `fully_supported` | `True` only for the `Sql.Database` family; `False` ⇒ scaffold |
+| `fully_supported` | `True` only for the `(server, database)` family; `False` ⇒ scaffold |
 | `uses_native_query` | `True` if a custom-SQL relation is present |
 | `direct_upstream_available` | For an extract: a live DirectQuery rebuild is also possible |
 | `fallback` | `"land-to-delta-directlake"` when `mode is None` |
+| `score` | Confidence 0–100 in the recommendation (higher ⇒ less manual remapping) |
+| `recommended_mode` | The storage mode to default to (`"Import"`/`"DirectQuery"`); `"Import"` when `mode is None` (the manual-rebuild default — the `fallback` pipeline is otherwise authoritative) |
 | `rationale` | Human-readable reason (goes into the migration report) |
 | `manual_followups` | Security-boundary steps that stay with the user |
+
+### Scored recommendation
+
+`score` ranks **feasibility**, not data quality — how little hand-finishing the rebuild needs:
+
+| Signal | Score |
+|---|---|
+| Live, fully-supported connector → DirectQuery | 95 |
+| Extract over a fully-supported live source → Import | 90 |
+| Flat file (Excel/CSV) → Import | 80 |
+| Recognized scaffold connector (Oracle/Teradata/Snowflake/BigQuery) | 60 |
+| Unknown / structurally unsupported → fallback | 30 |
+| *Custom-SQL native query present* | −10 (folding review needed) |
+
+`recommended_mode` is always populated so callers have an actionable default: it equals `mode` for a direct
+rebuild, and for the **unknown / unsupported** fallback case it defaults to **Import** (the safe choice if the
+model is rebuilt directly instead of routed through the land-to-Delta + DirectLake pipeline named by `fallback`).
 
 ```python
 from connection_to_m import parse_tds

@@ -122,6 +122,24 @@ SNOWFLAKE = """<?xml version='1.0' encoding='utf-8' ?>
   </connection>
 </datasource>"""
 
+TERADATA = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='TD' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='td' name='teradata.a'>
+        <connection class='teradata' dbname='ANALYTICS' server='td.example.com' />
+      </named-connection>
+    </named-connections>
+    <relation name='ORDERS' table='[ANALYTICS].[ORDERS]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>SALES</remote-name><local-name>[SALES]</local-name>
+        <parent-name>[ORDERS]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
 # Faithful reproduction of a modern multi-sheet Excel ``.tds`` (the published Superstore
 # sample): a <relation type='collection'> container wrapping the physical sheet tables, the
 # SAME tables duplicated under the logical <properties> layer, and columns in <metadata-records>.
@@ -166,6 +184,64 @@ EXCEL_COLLECTION = """<?xml version='1.0' encoding='utf-8' ?>
       </properties></object>
       <object caption='Returns'><properties>
         <relation connection='excel-direct.0' name='Returns' table='[Returns$]' type='table' />
+      </properties></object>
+    </objects>
+  </_.fcp.ObjectModelEncapsulateLegacy.true...object-graph>
+</datasource>"""
+
+
+# Faithful modern Azure SQL (`azure_sqldb`) Superstore .tds: a federated named-connection of
+# class 'azure_sqldb', three independent physical tables wrapped in a <relation type='collection'>
+# and duplicated under the object-model layer, with typed columns in <metadata-records>. Mirrors
+# the live validation datasource (Orders / People / Returns on Azure SQL) so the exact deploy-ready
+# M is pinned offline. Server/credentials here are placeholders -- never real values.
+AZURE_SQL_SUPERSTORE = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Superstore (Azure SQL)' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='azuresql' name='azure_sqldb.0a1b2c'>
+        <connection authentication='sqlserver' class='azure_sqldb' dbname='Superstore'
+                    server='example.database.windows.net' username='svc' />
+      </named-connection>
+    </named-connections>
+    <relation type='collection'>
+      <relation connection='azure_sqldb.0a1b2c' name='Orders' table='[dbo].[Orders]' type='table' />
+      <relation connection='azure_sqldb.0a1b2c' name='People' table='[dbo].[People]' type='table' />
+      <relation connection='azure_sqldb.0a1b2c' name='Returns' table='[dbo].[Returns]' type='table' />
+    </relation>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Order ID</remote-name><local-name>[Order ID]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>real</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Person</remote-name><local-name>[Person]</local-name>
+        <parent-name>[People]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Region</remote-name><local-name>[Region]</local-name>
+        <parent-name>[People]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Returned</remote-name><local-name>[Returned]</local-name>
+        <parent-name>[Returns]</parent-name><local-type>boolean</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+  <_.fcp.ObjectModelEncapsulateLegacy.true...object-graph>
+    <objects>
+      <object caption='Orders'><properties>
+        <relation connection='azure_sqldb.0a1b2c' name='Orders' table='[dbo].[Orders]' type='table' />
+      </properties></object>
+      <object caption='People'><properties>
+        <relation connection='azure_sqldb.0a1b2c' name='People' table='[dbo].[People]' type='table' />
+      </properties></object>
+      <object caption='Returns'><properties>
+        <relation connection='azure_sqldb.0a1b2c' name='Returns' table='[dbo].[Returns]' type='table' />
       </properties></object>
     </objects>
   </_.fcp.ObjectModelEncapsulateLegacy.true...object-graph>
@@ -296,6 +372,58 @@ def test_emit_snowflake_is_scaffold_not_wrong_m():
     assert "Sql.Database" not in body   # must not emit the wrong connector
 
 
+# Each fully-supported connector takes the verified `(server, database)` signature, so the
+# two-argument call + Schema/Item navigation is emitted as deploy-ready M.
+@pytest.mark.parametrize("cls,connector", [
+    ("sqlserver", "Sql.Database"),
+    ("azure_sqldb", "Sql.Database"),
+    ("postgres", "PostgreSQL.Database"),
+    ("mysql", "MySQL.Database"),
+    ("redshift", "AmazonRedshift.Database"),
+])
+def test_emit_fully_supported_connector_dispatch(cls, connector):
+    rel = {"kind": "table", "name": "Orders", "item": "Orders", "schema": "dbo", "columns": []}
+    body = emit_m_partition_source(rel, {"connection_class": cls}, "DirectQuery")
+    assert f'Source = {connector}(#"Server", #"Database")' in body
+    assert 'Source{[Schema="dbo", Item="Orders"]}[Data]' in body
+
+
+# Recognized-but-partial connectors map to the right M function NAME, but their real signature
+# differs from `(server, database)`, so the body must be a named scaffold, never a guessed call.
+@pytest.mark.parametrize("cls,connector", [
+    ("oracle", "Oracle.Database"),        # Oracle.Database(server, [options]) -- server only
+    ("teradata", "Teradata.Database"),    # Teradata.Database(server, [options]) -- server only
+    ("snowflake", "Snowflake.Databases"), # server + warehouse navigation
+    ("bigquery", "GoogleBigQuery.Database"),
+])
+def test_emit_partial_connector_is_named_scaffold_not_guessed_m(cls, connector):
+    rel = {"kind": "table", "name": "T", "item": "T", "schema": "s", "columns": []}
+    body = emit_m_partition_source(rel, {"connection_class": cls}, "DirectQuery")
+    assert "TODO" in body
+    assert connector in body                     # names the intended connector as a hint
+    assert '(#"Server", #"Database")' not in body  # but never a guessed 2-arg upstream call
+    assert "Sql.Database" not in body
+
+
+def test_emit_unsupported_class_falls_back_to_scaffold():
+    # A connector class outside the verified set is emitted as a bare scaffold, never wrong M.
+    rel = {"kind": "table", "name": "T", "item": "T", "schema": "s", "columns": []}
+    body = emit_m_partition_source(rel, {"connection_class": "saphana"}, "Import")
+    assert "TODO" in body
+    assert "'saphana'" in body
+    assert '(#"Server", #"Database")' not in body
+
+
+def test_emit_teradata_parsed_is_named_scaffold():
+    d = parse_tds(TERADATA)
+    assert d["connection_class"] == "teradata"
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert "TODO" in body
+    assert "Teradata.Database" in body
+    assert "Sql.Database" not in body
+    assert '(#"Server", #"Database")' not in body
+
+
 def test_emit_table_none_when_no_columns():
     rel = {"kind": "table", "name": "Empty", "item": "Empty", "columns": []}
     assert emit_table_tmdl_m(rel, {"connection_class": "sqlserver"}, "Import") is None
@@ -326,3 +454,60 @@ def test_connection_details_for_bind():
     assert details["server"] == "myserver.database.windows.net"
     assert details["database"] == "Superstore"
     assert details["path"] == "myserver.database.windows.net;Superstore"
+
+
+def test_connection_details_bind_type_for_teradata():
+    details = connection_details_for_bind(
+        {"connection_class": "teradata", "server": "td.example.com", "database": "ANALYTICS"})
+    assert details["bind_type"] == "Teradata"
+    assert details["path"] == "td.example.com;ANALYTICS"
+
+
+# -- azure_sqldb first-class path (live-validation target, pinned offline) ------
+def test_parse_azure_sql_superstore_first_class_path():
+    d = parse_tds(AZURE_SQL_SUPERSTORE)
+    assert d["connection_class"] == "azure_sqldb"
+    assert d["database"] == "Superstore"
+    assert d["is_extract"] is False
+    assert d["named_connection_count"] == 1
+    # collection container dropped + object-model duplicates deduped -> 3 independent tables.
+    assert [r["kind"] for r in d["relations"]] == ["table", "table", "table"]
+    assert {r["name"] for r in d["relations"]} == {"Orders", "People", "Returns"}
+    assert d["unsupported_reasons"] == []
+    # credentials are never carried into the descriptor.
+    blob = repr(d)
+    assert "username" not in blob and "svc" not in blob
+
+
+def test_azure_sqldb_full_pipeline_emits_deploy_ready_sql_database_m():
+    from storage_mode import select_storage_mode
+    d = parse_tds(AZURE_SQL_SUPERSTORE)
+
+    decision = select_storage_mode(d)
+    assert decision["mode"] == "DirectQuery"
+    assert decision["connector"] == "Sql.Database"     # azure_sqldb speaks the SQL Server protocol
+    assert decision["fully_supported"] is True
+    assert decision["recommended_mode"] == "DirectQuery"
+    assert decision["fallback"] is None
+
+    by_name = {r["name"]: r for r in d["relations"]}
+    orders = emit_table_tmdl_m(by_name["Orders"], d, decision["mode"])
+    assert "partition Orders = m" in orders
+    assert "mode: directQuery" in orders
+    assert 'Source = Sql.Database(#"Server", #"Database")' in orders
+    assert 'Source{[Schema="dbo", Item="Orders"]}[Data]' in orders
+    assert "dataType: double" in orders   # Sales typed from Tableau metadata, not PBI inference
+
+    # every table is deploy-ready M (no scaffold), with its own schema/item navigation.
+    for name in ("Orders", "People", "Returns"):
+        tmdl = emit_table_tmdl_m(by_name[name], d, decision["mode"])
+        assert f'Source{{[Schema="dbo", Item="{name}"]}}[Data]' in tmdl
+        assert "TODO" not in tmdl
+
+    params = emit_connection_parameters(d)
+    assert 'expression Server = "example.database.windows.net"' in params
+    assert 'expression Database = "Superstore"' in params
+
+    bind = connection_details_for_bind(d)
+    assert bind["bind_type"] == "SQL"
+    assert bind["path"] == "example.database.windows.net;Superstore"
