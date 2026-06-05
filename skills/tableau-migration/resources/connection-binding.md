@@ -58,21 +58,40 @@ relation kind:
 | `postgres` | `PostgreSQL.Database` | Fully supported |
 | `mysql` | `MySQL.Database` | Fully supported |
 | `redshift` | `AmazonRedshift.Database` | Fully supported |
-| `oracle` | `Oracle.Database` | Scaffold (server-only signature) |
-| `teradata` | `Teradata.Database` | Scaffold (server-only signature) |
-| `snowflake` | `Snowflake.Databases` | Scaffold (server + warehouse navigation) |
-| `bigquery` | `GoogleBigQuery.Database` | Scaffold (project/dataset navigation) |
+| `oracle` | `Oracle.Database` | Fully supported (server-only) |
+| `snowflake` | `Snowflake.Databases` | Fully supported (server + warehouse) |
+| `teradata` | `Teradata.Database` | Scaffold (navigation selector unverified) |
+| `bigquery` | `GoogleBigQuery.Database` | Scaffold (no server; identifier mapping unverified) |
 | `excel-direct` / `excel` | `Excel.Workbook` | Flat file (needs path) |
 | `textscan` / `csv` | `Csv.Document` | Flat file (needs path) |
 | anything else | — | Fall back to land-to-Delta |
 
-**Fully supported** is gated on one verified fact from the Power Query M docs: the connector takes the
-`<Connector>.Database(server, database)` signature, so the two-argument call + `Source{[Schema=…, Item=…]}[Data]`
-navigation is correct rather than guessed. **Scaffold** connectors map to the right M function *name*, but
-their real signature differs — `Oracle.Database(server, [options])` and `Teradata.Database(server, [options])`
-take a server only (no `database` positional), and `Snowflake.Databases` / `GoogleBigQuery.Database` use
-multi-level navigation — so the partition is emitted as a clearly-flagged `// TODO` that names the intended
-connector but never a wrong `(server, database)` call.
+Each **fully supported** connector is emitted as deploy-ready M from a verified fact, recorded in
+the `DIRECT_CONNECTORS` registry as `(function, connect_style, nav_style)`:
+
+| Connect style | First step | Navigation | Connectors |
+|---|---|---|---|
+| `server_database` | `Fn(#"Server", #"Database")` | `Source{[Schema=…, Item=…]}[Data]` | Sql / PostgreSQL / MySQL / AmazonRedshift |
+| `server_only` | `Oracle.Database(#"Server", [HierarchicalNavigation=false])` | `Source{[Schema=…, Item=…]}[Data]` | Oracle |
+| `server_warehouse` | `Snowflake.Databases(#"Server", #"Warehouse")` | `[Name=…, Kind="Database"]` → `[Name=…, Kind="Schema"]` → `[Name=…, Kind="Table"]` | Snowflake |
+
+Oracle is server-only because its service/SID is carried in the server string (so no unused
+`#"Database"` parameter is emitted), and `HierarchicalNavigation=false` is set explicitly so the
+flat `Schema`/`Item` selector is correct rather than default-reliant. Snowflake adds a `#"Warehouse"`
+parameter and reaches the table by `database → schema → table` navigation; if the `.tds` doesn't
+carry a resolvable database it falls back to a scaffold rather than guess the first hop.
+
+> **Verification status.** Oracle and the `(server, database)` family are doc-verified against the
+> official Power Query M function reference. Snowflake's navigation is doc-informed (the connector
+> doc confirms Server + Warehouse and the database/schema/table hierarchy, but Snowflake has no M
+> function reference page) — **live reconciliation pending** (no live Snowflake/Oracle instance in
+> the validation environment, which has Azure SQL only).
+
+**Scaffold** connectors (`teradata`, `bigquery`) map to the right M function *name*, but a fact we
+need is not verifiable offline — Teradata's exact navigation selector, and BigQuery's billing-project
+vs project identifier mapping (it has no server) — so the partition is emitted as a clearly-flagged
+`// TODO` that names the intended connector and never a guessed call. They are deferred for promotion
+once a real datasource confirms the shape.
 
 ---
 

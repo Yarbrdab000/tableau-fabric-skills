@@ -47,16 +47,19 @@ fields that drive the decision:
 
 | Tier | Connector classes | M emission |
 |---|---|---|
-| **Fully supported** (`(server, database)` family) | `sqlserver`/`azure_sqldb`→`Sql.Database`, `postgres`→`PostgreSQL.Database`, `mysql`→`MySQL.Database`, `redshift`→`AmazonRedshift.Database` | Deploy-ready M |
-| **Partial (scaffold)** | `oracle`→`Oracle.Database`, `teradata`→`Teradata.Database` (server-only signature), `snowflake`→`Snowflake.Databases`, `bigquery`→`GoogleBigQuery.Database` (multi-level navigation) | Mode chosen, M emitted as a clearly-flagged scaffold |
+| **Fully supported** | `sqlserver`/`azure_sqldb`→`Sql.Database`, `postgres`→`PostgreSQL.Database`, `mysql`→`MySQL.Database`, `redshift`→`AmazonRedshift.Database` (server+database), `oracle`→`Oracle.Database` (server-only), `snowflake`→`Snowflake.Databases` (server+warehouse, db→schema→table nav) | Deploy-ready M |
+| **Partial (scaffold)** | `teradata`→`Teradata.Database`, `bigquery`→`GoogleBigQuery.Database` | Mode chosen, M emitted as a clearly-flagged scaffold |
 | **Flat file** | `excel-direct`/`excel`→`Excel.Workbook`, `textscan`/`csv`→`Csv.Document` | Import; path-based scaffold (needs file path) |
 | **Unmapped** | anything else | Fall back to land-to-Delta + DirectLake |
 
-> Tier membership is decided by one verified fact (from the Power Query M docs): only connectors whose
-> documented signature is `<Connector>.Database(server, database)` are **Fully supported**, so the two-argument
-> call is correct rather than guessed. `Oracle.Database(server, [options])` and `Teradata.Database(server,
-> [options])` take a server only, and `Snowflake.Databases` / `GoogleBigQuery.Database` navigate differently —
-> so they are recognized but emitted as flagged scaffolds, never wrong M.
+> Tier membership is gated on a verified fact (from the Power Query M docs). The `(server, database)`
+> family, Oracle (`Oracle.Database(server, [options])`, server-only with `HierarchicalNavigation=false`),
+> and Snowflake (`Snowflake.Databases(server, warehouse)` then `[Name, Kind]` navigation) are **Fully
+> supported** — each emitted from its own verified signature, never a guessed call. Oracle and the
+> `(server, database)` family are doc-verified; Snowflake is doc-informed (no M function reference page
+> exists) and **live reconciliation is pending**. `Teradata.Database`'s exact navigation selector and
+> BigQuery's billing-project/project identifiers (it has no server) aren't verifiable offline, so they
+> are recognized but emitted as flagged scaffolds, never wrong M.
 
 ---
 
@@ -68,7 +71,7 @@ fields that drive the decision:
 |---|---|
 | `mode` | `"Import"`, `"DirectQuery"`, or `None` (fall back) |
 | `connector` | Power Query connector function, or `None` |
-| `fully_supported` | `True` only for the `(server, database)` family; `False` ⇒ scaffold |
+| `fully_supported` | `True` for a doc-verified deploy-ready connector (the `(server, database)` family plus Oracle and Snowflake); `False` ⇒ scaffold |
 | `uses_native_query` | `True` if a custom-SQL relation is present |
 | `direct_upstream_available` | For an extract: a live DirectQuery rebuild is also possible |
 | `fallback` | `"land-to-delta-directlake"` when `mode is None` |
@@ -86,7 +89,7 @@ fields that drive the decision:
 | Live, fully-supported connector → DirectQuery | 95 |
 | Extract over a fully-supported live source → Import | 90 |
 | Flat file (Excel/CSV) → Import | 80 |
-| Recognized scaffold connector (Oracle/Teradata/Snowflake/BigQuery) | 60 |
+| Recognized scaffold connector (Teradata/BigQuery) | 60 |
 | Unknown / structurally unsupported → fallback | 30 |
 | *Custom-SQL native query present* | −10 (folding review needed) |
 

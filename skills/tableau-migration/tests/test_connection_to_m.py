@@ -109,11 +109,34 @@ SNOWFLAKE = """<?xml version='1.0' encoding='utf-8' ?>
   <connection class='federated'>
     <named-connections>
       <named-connection caption='acct' name='snowflake.a'>
-        <connection class='snowflake' dbname='ANALYTICS' server='acct.snowflakecomputing.com' />
+        <connection class='snowflake' dbname='ANALYTICS' server='acct.snowflakecomputing.com'
+                    warehouse='COMPUTE_WH' />
       </named-connection>
     </named-connections>
     <relation name='ORDERS' table='[PUBLIC].[ORDERS]' type='table' />
     <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>SALES</remote-name><local-name>[SALES]</local-name>
+        <parent-name>[ORDERS]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+ORACLE = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Ora' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='ora' name='oracle.a'>
+        <connection class='oracle' server='oradb.example.com:1521/ORCL' username='app' />
+      </named-connection>
+    </named-connections>
+    <relation name='ORDERS' table='[SALES].[ORDERS]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>ORDER_ID</remote-name><local-name>[ORDER_ID]</local-name>
+        <parent-name>[ORDERS]</parent-name><local-type>string</local-type>
+      </metadata-record>
       <metadata-record class='column'>
         <remote-name>SALES</remote-name><local-name>[SALES]</local-name>
         <parent-name>[ORDERS]</parent-name><local-type>real</local-type>
@@ -365,11 +388,48 @@ def test_emit_custom_sql_uses_native_query_with_folding():
     assert '""Region""' in body
 
 
-def test_emit_snowflake_is_scaffold_not_wrong_m():
+def test_emit_oracle_table_is_deploy_ready_server_only_m():
+    # Oracle.Database is server-only (service/SID embedded in the server); flat schema/item
+    # navigation with hierarchy off. No unused #"Database" parameter is carried.
+    d = parse_tds(ORACLE)
+    assert d["connection_class"] == "oracle"
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert 'Source = Oracle.Database(#"Server", [HierarchicalNavigation=false])' in body
+    assert 'Source{[Schema="SALES", Item="ORDERS"]}[Data]' in body
+    assert "TODO" not in body
+    assert '#"Database"' not in body            # Oracle's database is in the server string
+    params = emit_connection_parameters(d)
+    assert 'expression Server = "oradb.example.com:1521/ORCL"' in params
+    assert "Database" not in params             # no unused database parameter
+
+
+def test_emit_snowflake_table_is_deploy_ready_three_level_navigation():
+    # Snowflake.Databases(server, warehouse) then database -> schema -> table, keyed by [Name, Kind].
     d = parse_tds(SNOWFLAKE)
+    assert d["connection_class"] == "snowflake"
+    assert d["warehouse"] == "COMPUTE_WH"
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert 'Source = Snowflake.Databases(#"Server", #"Warehouse")' in body
+    assert 'Source{[Name="ANALYTICS", Kind="Database"]}[Data]' in body
+    assert 'Db{[Name="PUBLIC", Kind="Schema"]}[Data]' in body
+    assert 'Schema{[Name="ORDERS", Kind="Table"]}[Data]' in body
+    assert "TODO" not in body
+    assert "Sql.Database" not in body
+    # the warehouse is parameterized (declared from the .tds), not hardcoded into the call.
+    params = emit_connection_parameters(d)
+    assert 'expression Warehouse = "COMPUTE_WH"' in params
+    assert 'expression Server = "acct.snowflakecomputing.com"' in params
+    assert "Database" not in params             # Snowflake reaches the database by navigation
+
+
+def test_emit_snowflake_scaffolds_when_database_missing():
+    # Without a resolvable database the first navigation hop can't be built -> scaffold, not a guess.
+    d = parse_tds(SNOWFLAKE)
+    d["database"] = None
     body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
     assert "TODO" in body
-    assert "Sql.Database" not in body   # must not emit the wrong connector
+    assert "Snowflake.Databases" in body
+    assert "[Name=" not in body
 
 
 # Each fully-supported connector takes the verified `(server, database)` signature, so the
@@ -388,12 +448,11 @@ def test_emit_fully_supported_connector_dispatch(cls, connector):
     assert 'Source{[Schema="dbo", Item="Orders"]}[Data]' in body
 
 
-# Recognized-but-partial connectors map to the right M function NAME, but their real signature
-# differs from `(server, database)`, so the body must be a named scaffold, never a guessed call.
+# Recognized connectors we deliberately do NOT auto-emit yet: the body must be a named scaffold
+# that hints the intended connector, never a guessed call (Teradata's navigation selector and
+# BigQuery's identifiers aren't verifiable offline).
 @pytest.mark.parametrize("cls,connector", [
-    ("oracle", "Oracle.Database"),        # Oracle.Database(server, [options]) -- server only
-    ("teradata", "Teradata.Database"),    # Teradata.Database(server, [options]) -- server only
-    ("snowflake", "Snowflake.Databases"), # server + warehouse navigation
+    ("teradata", "Teradata.Database"),
     ("bigquery", "GoogleBigQuery.Database"),
 ])
 def test_emit_partial_connector_is_named_scaffold_not_guessed_m(cls, connector):

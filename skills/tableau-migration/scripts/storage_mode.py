@@ -27,30 +27,48 @@ surfaced as ``manual_followups``.
 """
 from __future__ import annotations
 
-# Connector classes whose M shape we can emit with confidence in v1. Membership is gated on
-# one verified fact (from the Microsoft Power Query M docs): the connector takes the
-# `<Connector>.Database(server, database)` shape and uses `Source{[Schema=..,Item=..]}[Data]`
-# navigation, so the two-argument emission is correct rather than guessed.
-SQL_DATABASE_FAMILY = {
-    "sqlserver": "Sql.Database",
-    "azure_sqldb": "Sql.Database",  # Azure SQL Database speaks the SQL Server protocol -> same connector
-    "postgres": "PostgreSQL.Database",
-    "mysql": "MySQL.Database",
-    "redshift": "AmazonRedshift.Database",
+# Connectors whose M we emit as deploy-ready, doc-verified partitions (never a guessed
+# scaffold). Each entry is `(function, connect_style, nav_style)` -- the two style facts are
+# what make the emission correct rather than guessed:
+#
+#   connect_style:
+#     "server_database"  -> Fn(#"Server", #"Database")                  (SQL Server protocol family)
+#     "server_only"      -> Fn(#"Server", [HierarchicalNavigation=false])  (Oracle: service/SID is
+#                            in the server string; flat schema navigation, hierarchy off)
+#     "server_warehouse" -> Fn(#"Server", #"Warehouse")                 (Snowflake)
+#   nav_style:
+#     "schema_item"            -> Source{[Schema=.., Item=..]}[Data]     (flat ADO.NET navigation)
+#     "database_schema_table"  -> 3 hops keyed by [Name=.., Kind=..]     (Snowflake)
+#
+# Verified facts (Microsoft Power Query M / connector docs):
+#  * Sql/PostgreSQL/MySQL/AmazonRedshift.Database take (server, database) + flat [Schema, Item].
+#  * Oracle.Database(server, [options]) is server-only; HierarchicalNavigation defaults false,
+#    so the flat [Schema, Item] navigation (schema = owner) applies. We set it explicitly.
+#  * Snowflake connector: connection inputs are Server + Warehouse; navigation is
+#    database -> schema -> table. (Snowflake.Databases has no M function reference page, so its
+#    navigation selectors are doc-informed; live reconciliation is pending -- see docs.)
+DIRECT_CONNECTORS = {
+    "sqlserver":   ("Sql.Database",            "server_database",  "schema_item"),
+    "azure_sqldb": ("Sql.Database",            "server_database",  "schema_item"),  # Azure SQL speaks the SQL Server protocol
+    "postgres":    ("PostgreSQL.Database",     "server_database",  "schema_item"),
+    "mysql":       ("MySQL.Database",          "server_database",  "schema_item"),
+    "redshift":    ("AmazonRedshift.Database", "server_database",  "schema_item"),
+    "oracle":      ("Oracle.Database",         "server_only",      "schema_item"),
+    "snowflake":   ("Snowflake.Databases",     "server_warehouse", "database_schema_table"),
 }
 
-# Live connectors that are recognized (verified Tableau class -> M function) but whose M
-# signature or navigation differs from the `(server, database)` family, so emitting a
-# two-argument call blind would be wrong. We pick a mode but mark it not fully supported and
-# emit a clearly-flagged scaffold (or fall back) rather than guessing the call body.
+# Recognized live connectors that are deliberately NOT auto-emitted yet: their navigation
+# selector or required identifiers cannot be verified offline, so emitting a call body would be
+# a guess. We pick a mode but mark it not fully supported and emit a clearly-flagged scaffold
+# that names the intended connector. Promotion is gated on doc-verified correctness.
 PARTIAL_LIVE_CONNECTORS = {
-    # Server-only signature: `<Connector>.Database(server, [options])` -- no (server, database)
-    # form (database is reached by navigation), so the family's 2-arg emission does not apply.
-    "oracle": "Oracle.Database",
+    # Teradata.Database(server, [options]) is server-only (signature verified), but the exact
+    # navigation selector (flat [Schema, Item] vs [Name]-keyed database/table hops) is not
+    # established from an official source, so it stays a scaffold pending real navigator evidence.
     "teradata": "Teradata.Database",
-    # Differently-shaped: Snowflake.Databases(server, [warehouse]) and
-    # GoogleBigQuery.Database(location) use multi-level navigation, not Schema/Item.
-    "snowflake": "Snowflake.Databases",
+    # GoogleBigQuery.Database([BillingProject=..]) has no server and an ambiguous
+    # billing-project vs project mapping in the .tds, so the project/dataset/table navigation
+    # can't be resolved offline -- scaffold pending a real BigQuery datasource.
     "bigquery": "GoogleBigQuery.Database",
 }
 
@@ -63,7 +81,21 @@ FLAT_FILE_CLASSES = {
 
 # Connector classes a hyper extract may sit over; used only to report whether a live
 # alternative exists for an extracted datasource.
-_LIVE_CLASSES = set(SQL_DATABASE_FAMILY) | set(PARTIAL_LIVE_CONNECTORS)
+_LIVE_CLASSES = set(DIRECT_CONNECTORS) | set(PARTIAL_LIVE_CONNECTORS)
+
+
+def connector_spec(cls):
+    """Return the ``(function, connect_style, nav_style)`` spec for a fully-supported direct
+    connector class, or ``None`` if the class is not auto-emitted (scaffold / flat / unknown)."""
+    return DIRECT_CONNECTORS.get((cls or "").lower())
+
+
+def connector_function(cls):
+    """Return the Power Query M function for a connector class (fully-supported or recognized
+    scaffold), or ``None`` if the class is unmapped."""
+    cls = (cls or "").lower()
+    spec = DIRECT_CONNECTORS.get(cls)
+    return spec[0] if spec else PARTIAL_LIVE_CONNECTORS.get(cls)
 
 FALLBACK_LAND_TO_DELTA = "land-to-delta-directlake"
 
@@ -172,9 +204,9 @@ def select_storage_mode(descriptor):
 
     # 4. extract enabled -> Import snapshot; offer live alternative when the connector is live.
     if descriptor.get("is_extract"):
-        connector = SQL_DATABASE_FAMILY.get(cls) or PARTIAL_LIVE_CONNECTORS.get(cls)
+        connector = connector_function(cls)
         live_available = cls in _LIVE_CLASSES
-        fully = cls in SQL_DATABASE_FAMILY
+        fully = cls in DIRECT_CONNECTORS
         followups = list(base_followups)
         if uses_native:
             followups.append(_NATIVE_QUERY_FOLLOWUP)
@@ -192,8 +224,8 @@ def select_storage_mode(descriptor):
         )
 
     # 5. live relational -> DirectQuery.
-    connector = SQL_DATABASE_FAMILY.get(cls) or PARTIAL_LIVE_CONNECTORS.get(cls)
-    fully = cls in SQL_DATABASE_FAMILY
+    connector = connector_function(cls)
+    fully = cls in DIRECT_CONNECTORS
     followups = base_followups + [_GATEWAY_FOLLOWUP]
     if uses_native:
         followups.append(_NATIVE_QUERY_FOLLOWUP)

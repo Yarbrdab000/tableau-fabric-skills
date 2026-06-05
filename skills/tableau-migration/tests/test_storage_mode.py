@@ -70,12 +70,25 @@ def test_postgres_is_directquery_fully_supported():
     assert d["fully_supported"] is True
 
 
-def test_snowflake_is_directquery_but_not_fully_supported():
+def test_snowflake_is_directquery_fully_supported():
+    # Snowflake.Databases(server, warehouse) + database/schema/table navigation is auto-emitted,
+    # so Snowflake is a fully-supported DirectQuery rebuild (navigation doc-informed; live
+    # reconciliation pending -- no live Snowflake instance in the validation environment).
     d = select_storage_mode(_desc(connection_class="snowflake"))
     assert d["mode"] == "DirectQuery"
     assert d["connector"] == "Snowflake.Databases"
-    assert d["fully_supported"] is False
-    assert any("snowflake.databases" in f.lower() for f in d["manual_followups"])
+    assert d["fully_supported"] is True
+    assert d["fallback"] is None
+
+
+def test_oracle_is_directquery_fully_supported():
+    # Oracle.Database(server, [HierarchicalNavigation=false]) + flat schema/item navigation is
+    # auto-emitted (server-only signature verified from the official M reference).
+    d = select_storage_mode(_desc(connection_class="oracle"))
+    assert d["mode"] == "DirectQuery"
+    assert d["connector"] == "Oracle.Database"
+    assert d["fully_supported"] is True
+    assert d["fallback"] is None
 
 
 def test_flat_file_is_import_scaffold():
@@ -128,6 +141,8 @@ def test_no_columns_falls_back():
     ("postgres", "PostgreSQL.Database"),
     ("mysql", "MySQL.Database"),
     ("redshift", "AmazonRedshift.Database"),
+    ("oracle", "Oracle.Database"),
+    ("snowflake", "Snowflake.Databases"),
 ])
 def test_fully_supported_family_is_directquery(cls, connector):
     d = select_storage_mode(_desc(connection_class=cls))
@@ -138,14 +153,12 @@ def test_fully_supported_family_is_directquery(cls, connector):
 
 
 @pytest.mark.parametrize("cls,connector", [
-    ("oracle", "Oracle.Database"),
     ("teradata", "Teradata.Database"),
-    ("snowflake", "Snowflake.Databases"),
     ("bigquery", "GoogleBigQuery.Database"),
 ])
 def test_partial_live_connector_is_directquery_scaffold(cls, connector):
-    # Recognized connector, DirectQuery chosen, but M is a flagged scaffold (signature/navigation
-    # differs from the (server, database) family), so it is not fully supported.
+    # Recognized connector, DirectQuery chosen, but M is a flagged scaffold (its navigation or
+    # required identifiers aren't verified offline), so it is not fully supported.
     d = select_storage_mode(_desc(connection_class=cls))
     assert d["mode"] == "DirectQuery"
     assert d["connector"] == connector
@@ -158,7 +171,7 @@ def test_partial_live_connector_is_directquery_scaffold(cls, connector):
 def test_decision_always_carries_score_and_recommended_mode():
     paths = [
         _desc(),                                                              # live, fully supported
-        _desc(connection_class="snowflake"),                                 # live, partial scaffold
+        _desc(connection_class="bigquery"),                                  # live, partial scaffold
         _desc(is_extract=True),                                              # extract
         _desc(connection_class="excel-direct", server=None, database=None),  # flat file
         _desc(connection_class="saphana"),                                   # unknown -> fallback
@@ -172,7 +185,7 @@ def test_decision_always_carries_score_and_recommended_mode():
 
 def test_score_ranks_full_above_partial_above_fallback():
     full = select_storage_mode(_desc())
-    partial = select_storage_mode(_desc(connection_class="snowflake"))
+    partial = select_storage_mode(_desc(connection_class="bigquery"))
     fallback = select_storage_mode(_desc(connection_class="saphana"))
     assert full["score"] > partial["score"] > fallback["score"]
 
