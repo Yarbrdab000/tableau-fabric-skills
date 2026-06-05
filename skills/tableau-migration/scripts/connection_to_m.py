@@ -26,11 +26,13 @@ import xml.etree.ElementTree as ET
 try:  # works whether imported as a package or run with scripts/ on sys.path
     from .tmdl_generate import clean_col, generate_column_tmdl, q
     from .storage_mode import (
-        DIRECT_CONNECTORS, FLAT_FILE_CLASSES, PARTIAL_LIVE_CONNECTORS, connector_spec)
+        ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
+        PARTIAL_LIVE_CONNECTORS, connector_spec)
 except ImportError:
     from tmdl_generate import clean_col, generate_column_tmdl, q
     from storage_mode import (
-        DIRECT_CONNECTORS, FLAT_FILE_CLASSES, PARTIAL_LIVE_CONNECTORS, connector_spec)
+        ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
+        PARTIAL_LIVE_CONNECTORS, connector_spec)
 
 
 # -- type mapping --------------------------------------------------------------
@@ -107,11 +109,12 @@ def _named_connections(datasource):
 
 
 def _live_connection(datasource):
-    """Return (class, server, dbname, warehouse, named_connection_count) for the live source.
+    """Return (class, server, dbname, warehouse, http_path, named_connection_count) for the live source.
 
     Descends through a ``federated`` wrapper into the inner named-connection. Falls back to
     a direct ``<connection>`` on the datasource for the older non-federated layout. ``warehouse``
-    is the Snowflake compute warehouse (``None`` for other connectors).
+    is the Snowflake compute warehouse; ``http_path`` is the Databricks SQL-warehouse HTTP path
+    (best-effort -- ``None`` when the attribute isn't present / for other connectors).
     """
     named = _named_connections(datasource)
     inner_conns = []
@@ -119,12 +122,14 @@ def _live_connection(datasource):
         inner_conns.extend(_children_local(nc, "connection"))
     if inner_conns:
         c = inner_conns[0]
-        return (c.get("class"), c.get("server"), c.get("dbname"), c.get("warehouse"), len(named))
+        return (c.get("class"), c.get("server"), c.get("dbname"),
+                c.get("warehouse"), c.get("http-path"), len(named))
     # non-federated: first <connection> that is not the federated wrapper
     for c in _children_local(datasource, "connection"):
         if (c.get("class") or "").lower() != "federated":
-            return (c.get("class"), c.get("server"), c.get("dbname"), c.get("warehouse"), 1)
-    return (None, None, None, None, len(named))
+            return (c.get("class"), c.get("server"), c.get("dbname"),
+                    c.get("warehouse"), c.get("http-path"), 1)
+    return (None, None, None, None, None, len(named))
 
 
 def _columns_by_parent(datasource):
@@ -271,7 +276,7 @@ def parse_tds(xml_text):
     datasource = root if _local(root.tag) == "datasource" else (
         _findall_local(root, "datasource") or [root])[0]
 
-    cls, server, dbname, warehouse, nconns = _live_connection(datasource)
+    cls, server, dbname, warehouse, http_path, nconns = _live_connection(datasource)
     cols_by_parent = _columns_by_parent(datasource)
 
     relations = _extract_relations(datasource, cols_by_parent)
@@ -294,6 +299,7 @@ def parse_tds(xml_text):
         "server": server,
         "database": dbname,
         "warehouse": warehouse,
+        "http_path": http_path,
         "is_extract": is_extract,
         "named_connection_count": nconns,
         "relations": relations,
@@ -306,25 +312,31 @@ _PARAM_META = 'meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequire
 
 
 def emit_connection_parameters(descriptor):
-    """Emit ``expression Server``/``Database``/``Warehouse`` parameter TMDL for a relational
-    descriptor.
+    """Emit ``expression Server``/``Database``/``Warehouse``/``HttpPath`` parameter TMDL for a
+    relational descriptor.
 
     Returns an empty string when there is no server/database (e.g. flat files), so callers can
     concatenate unconditionally. ``Database`` is emitted only when it is an actual connect
     argument (the ``(server, database)`` family); a server-only connector (Oracle) reaches its
-    database through the server string and Snowflake reaches it by navigation, so no unused
-    ``#"Database"`` parameter is carried for them. ``Warehouse`` is emitted for Snowflake.
+    database through the server string, while Snowflake and Databricks reach it by navigation, so
+    no unused ``#"Database"`` parameter is carried for them. ``Warehouse`` is emitted for
+    Snowflake; ``HttpPath`` for Databricks (its value is best-effort -- the .tds does not carry
+    the SQL-warehouse HTTP path portably, so it may be empty and require manual completion).
     """
     spec = connector_spec(descriptor.get("connection_class"))
     connect_style = spec[1] if spec else None
+    no_database = ("server_only", "server_warehouse", "server_httppath")
     lines = []
     if descriptor.get("server"):
         lines.append(f'expression Server = "{escape_m_string(descriptor["server"])}" {_PARAM_META}\n')
-    if descriptor.get("database") and connect_style not in ("server_only", "server_warehouse"):
+    if descriptor.get("database") and connect_style not in no_database:
         lines.append(f'expression Database = "{escape_m_string(descriptor["database"])}" {_PARAM_META}\n')
     if connect_style == "server_warehouse":
         warehouse = escape_m_string(descriptor.get("warehouse") or "")
         lines.append(f'expression Warehouse = "{warehouse}" {_PARAM_META}\n')
+    if connect_style == "server_httppath":
+        http_path = escape_m_string(descriptor.get("http_path") or "")
+        lines.append(f'expression HttpPath = "{http_path}" {_PARAM_META}\n')
     return "\n".join(lines)
 
 
@@ -346,14 +358,22 @@ def _scaffold_source(cls, intended, detail):
 
 
 def _connect_expr(connector, connect_style):
-    """Build the right-hand side of ``Source = ...`` for a fully-supported connector."""
+    """Build the right-hand side of ``Source = ...`` for a fully-supported connector.
+
+    Exhaustive on ``connect_style`` -- an unrecognized style raises rather than silently falling
+    back to the ``(server, database)`` form (which would emit wrong M for a different connector).
+    """
+    if connect_style == "server_database":  # SQL Server protocol family
+        return f'{connector}(#"Server", #"Database")'
     if connect_style == "server_only":
         # Oracle: service/SID is embedded in #"Server"; set the flat (non-hierarchical)
         # navigation explicitly so the Schema/Item selector is correct rather than default-reliant.
         return f'{connector}(#"Server", [HierarchicalNavigation=false])'
     if connect_style == "server_warehouse":
         return f'{connector}(#"Server", #"Warehouse")'
-    return f'{connector}(#"Server", #"Database")'  # server_database (SQL Server protocol family)
+    if connect_style == "server_httppath":  # Databricks SQL warehouse (host, httpPath)
+        return f'{connector}(#"Server", #"HttpPath")'
+    raise ValueError(f"unhandled connect_style {connect_style!r} for connector {connector!r}")
 
 
 def emit_m_partition_source(relation, descriptor, mode):
@@ -366,6 +386,13 @@ def emit_m_partition_source(relation, descriptor, mode):
     ``Value.NativeQuery`` folds against the database handle.
     """
     cls = (descriptor.get("connection_class") or "").lower()
+    if cls in ANALYSIS_SERVICES_CLASSES:
+        # SSAS / MSOLAP is already a tabular/multidimensional model -- never emit a naive M
+        # partition for it; flag it for the separate model-migration path.
+        return _scaffold_source(
+            cls, None,
+            "Microsoft Analysis Services is already a tabular/multidimensional semantic model; "
+            "migrate the model directly (XMLA endpoint / semantic-model import), not as an M partition")
     spec = connector_spec(cls)
     if spec is None:
         intended = PARTIAL_LIVE_CONNECTORS.get(cls) or FLAT_FILE_CLASSES.get(cls)
@@ -397,16 +424,18 @@ def emit_m_partition_source(relation, descriptor, mode):
     source = _connect_expr(connector, connect_style)
 
     if nav_style == "database_schema_table":
-        # Snowflake: database -> schema -> table, each hop keyed by [Name, Kind]. The first hop
-        # needs the database name; without database + schema the navigation can't be resolved, so
-        # we scaffold rather than guess.
+        # Snowflake / Databricks: database(or catalog) -> schema -> table, each hop keyed by
+        # [Name, Kind] (the catalog level is keyed Kind="Database"). The first hop needs the
+        # database/catalog name; without it + the schema the navigation can't be resolved, so we
+        # scaffold rather than guess.
         database = descriptor.get("database")
         schema = relation.get("schema")
         item = relation["item"]
         if not database or not schema:
             return _scaffold_source(
                 cls, connector,
-                "Snowflake navigation needs database + schema; not resolvable from this .tds")
+                f"{connector} navigation needs the database/catalog + schema names; "
+                "not resolvable from this .tds")
         db, sch, it = escape_m_string(database), escape_m_string(schema), escape_m_string(item)
         return (
             "let\n"
@@ -417,6 +446,9 @@ def emit_m_partition_source(relation, descriptor, mode):
             "\t\t\tin\n"
             "\t\t\t\tData"
         )
+
+    if nav_style != "schema_item":
+        raise ValueError(f"unhandled nav_style {nav_style!r} for connector {connector!r}")
 
     # schema_item: flat ADO.NET navigation (SQL Server family + Oracle).
     schema = relation.get("schema") or "dbo"
@@ -503,12 +535,14 @@ def build_m_field_resolver(descriptor):
 _BIND_TYPE = {
     "sqlserver": "SQL",
     "azure_sqldb": "SQL",
+    "azure_sql_dw": "SQL",        # Azure Synapse Analytics binds via the SQL data-source type
     "postgres": "PostgreSql",
     "oracle": "Oracle",
     "mysql": "MySql",
     "redshift": "AmazonRedshift",
     "teradata": "Teradata",
     "snowflake": "Snowflake",
+    "databricks": "Databricks",
     "bigquery": "GoogleBigQuery",
 }
 

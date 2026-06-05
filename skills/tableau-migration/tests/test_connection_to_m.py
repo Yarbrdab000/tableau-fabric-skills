@@ -163,6 +163,46 @@ TERADATA = """<?xml version='1.0' encoding='utf-8' ?>
   </connection>
 </datasource>"""
 
+# Azure Synapse Analytics (Tableau class 'azure_sql_dw') speaks the SQL Server TDS protocol, so
+# it binds through Sql.Database exactly like sqlserver / azure_sqldb.
+SYNAPSE = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Syn' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='syn' name='azure_sql_dw.a'>
+        <connection class='azure_sql_dw' dbname='WideWorld' server='syn.sql.azuresynapse.net' />
+      </named-connection>
+    </named-connections>
+    <relation name='Orders' table='[dbo].[Orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+# Databricks: host + SQL-warehouse HTTP path, Unity Catalog catalog in dbname, [schema].[table].
+DATABRICKS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Dbx' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='dbx' name='databricks.a'>
+        <connection class='databricks' dbname='main' server='adb-123.azuredatabricks.net'
+                    http-path='/sql/1.0/warehouses/abc123' />
+      </named-connection>
+    </named-connections>
+    <relation name='ORDERS' table='[sales].[orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>amount</remote-name><local-name>[amount]</local-name>
+        <parent-name>[orders]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
 # Faithful reproduction of a modern multi-sheet Excel ``.tds`` (the published Superstore
 # sample): a <relation type='collection'> container wrapping the physical sheet tables, the
 # SAME tables duplicated under the logical <properties> layer, and columns in <metadata-records>.
@@ -483,6 +523,72 @@ def test_emit_teradata_parsed_is_named_scaffold():
     assert '(#"Server", #"Database")' not in body
 
 
+def test_emit_synapse_is_deploy_ready_sql_database():
+    # Azure Synapse Analytics speaks the SQL Server TDS protocol -> Sql.Database, byte-identical
+    # to the sqlserver / azure_sqldb path.
+    d = parse_tds(SYNAPSE)
+    assert d["connection_class"] == "azure_sql_dw"
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert 'Source = Sql.Database(#"Server", #"Database")' in body
+    assert 'Source{[Schema="dbo", Item="Orders"]}[Data]' in body
+    assert "TODO" not in body
+    params = emit_connection_parameters(d)
+    assert 'expression Server = "syn.sql.azuresynapse.net"' in params
+    assert 'expression Database = "WideWorld"' in params
+
+
+def test_emit_databricks_table_is_deploy_ready_catalogs_navigation():
+    # Databricks.Catalogs(host, httpPath) then catalog -> schema -> table, keyed [Name, Kind]
+    # (catalog level is Kind="Database"). Server + HttpPath are parameterized; no Database param.
+    d = parse_tds(DATABRICKS)
+    assert d["connection_class"] == "databricks"
+    assert d["http_path"] == "/sql/1.0/warehouses/abc123"
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert 'Source = Databricks.Catalogs(#"Server", #"HttpPath")' in body
+    assert 'Source{[Name="main", Kind="Database"]}[Data]' in body
+    assert 'Db{[Name="sales", Kind="Schema"]}[Data]' in body
+    assert 'Schema{[Name="orders", Kind="Table"]}[Data]' in body
+    assert "TODO" not in body
+    assert "Sql.Database" not in body
+    params = emit_connection_parameters(d)
+    assert 'expression Server = "adb-123.azuredatabricks.net"' in params
+    assert 'expression HttpPath = "/sql/1.0/warehouses/abc123"' in params
+    assert "Database" not in params            # the catalog is reached by navigation
+
+
+def test_emit_databricks_scaffolds_when_catalog_missing():
+    # Without a resolvable catalog (the first navigation hop) we scaffold rather than guess.
+    d = parse_tds(DATABRICKS)
+    d["database"] = None
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert "TODO" in body
+    assert "Databricks.Catalogs" in body
+    assert "[Name=" not in body
+
+
+def test_emit_databricks_custom_sql_is_scaffold():
+    # Native SQL folding for Databricks isn't auto-emitted (only the (server, database) family is),
+    # so a custom-SQL relation is a named scaffold, never a guessed Value.NativeQuery.
+    rel = {"kind": "custom_sql", "name": "Q", "item": "Q", "sql": "SELECT 1", "columns": []}
+    body = emit_m_partition_source(rel, {"connection_class": "databricks"}, "DirectQuery")
+    assert "TODO" in body
+    assert "Databricks.Catalogs" in body
+    assert "Value.NativeQuery" not in body
+
+
+# Analysis Services (SSAS / MSOLAP) is already a tabular/multidimensional model -- never a naive
+# M partition. It is flagged for the separate model-migration path, not emitted as upstream M.
+@pytest.mark.parametrize("cls", ["msolap", "sqlserver-analysis-services"])
+def test_emit_analysis_services_is_flagged_scaffold_not_m(cls):
+    rel = {"kind": "table", "name": "Sales", "item": "Sales", "schema": "", "columns": []}
+    body = emit_m_partition_source(rel, {"connection_class": cls}, "DirectQuery")
+    assert "TODO" in body
+    assert "Analysis Services" in body
+    assert "model" in body.lower()
+    assert "Sql.Database" not in body
+    assert '(#"Server", #"Database")' not in body
+
+
 def test_emit_table_none_when_no_columns():
     rel = {"kind": "table", "name": "Empty", "item": "Empty", "columns": []}
     assert emit_table_tmdl_m(rel, {"connection_class": "sqlserver"}, "Import") is None
@@ -520,6 +626,20 @@ def test_connection_details_bind_type_for_teradata():
         {"connection_class": "teradata", "server": "td.example.com", "database": "ANALYTICS"})
     assert details["bind_type"] == "Teradata"
     assert details["path"] == "td.example.com;ANALYTICS"
+
+
+def test_connection_details_bind_type_for_synapse():
+    details = connection_details_for_bind(
+        {"connection_class": "azure_sql_dw", "server": "syn.sql.azuresynapse.net", "database": "Pool"})
+    assert details["bind_type"] == "SQL"
+    assert details["path"] == "syn.sql.azuresynapse.net;Pool"
+
+
+def test_connection_details_bind_type_for_databricks():
+    details = connection_details_for_bind(
+        {"connection_class": "databricks", "server": "adb.example.azuredatabricks.net", "database": "main"})
+    assert details["bind_type"] == "Databricks"
+    assert details["path"] == "adb.example.azuredatabricks.net;main"
 
 
 # -- azure_sqldb first-class path (live-validation target, pinned offline) ------

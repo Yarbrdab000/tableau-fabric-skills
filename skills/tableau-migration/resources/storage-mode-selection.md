@@ -47,19 +47,36 @@ fields that drive the decision:
 
 | Tier | Connector classes | M emission |
 |---|---|---|
-| **Fully supported** | `sqlserver`/`azure_sqldb`→`Sql.Database`, `postgres`→`PostgreSQL.Database`, `mysql`→`MySQL.Database`, `redshift`→`AmazonRedshift.Database` (server+database), `oracle`→`Oracle.Database` (server-only), `snowflake`→`Snowflake.Databases` (server+warehouse, db→schema→table nav) | Deploy-ready M |
+| **Fully supported** | `sqlserver`/`azure_sqldb`/`azure_sql_dw` (Synapse)→`Sql.Database`, `postgres`→`PostgreSQL.Database`, `mysql`→`MySQL.Database`, `redshift`→`AmazonRedshift.Database` (server+database), `oracle`→`Oracle.Database` (server-only), `snowflake`→`Snowflake.Databases` (server+warehouse, db→schema→table nav), `databricks`→`Databricks.Catalogs` (host+HTTP path, catalog→schema→table nav) | Deploy-ready M |
 | **Partial (scaffold)** | `teradata`→`Teradata.Database`, `bigquery`→`GoogleBigQuery.Database` | Mode chosen, M emitted as a clearly-flagged scaffold |
 | **Flat file** | `excel-direct`/`excel`→`Excel.Workbook`, `textscan`/`csv`→`Csv.Document` | Import; path-based scaffold (needs file path) |
+| **Analysis Services** | `msolap`, `sqlserver-analysis-services` | Not an M rebuild — routed to `analysis-services-model-migration` (migrate the model directly via XMLA / semantic-model import) |
 | **Unmapped** | anything else | Fall back to land-to-Delta + DirectLake |
 
+> **All Microsoft TDS-protocol sources are Fully supported via `Sql.Database`.** Azure SQL Database
+> (`azure_sqldb`), Azure Synapse Analytics — dedicated and serverless (`azure_sql_dw`), Azure SQL
+> Managed Instance, and the Microsoft Fabric Warehouse / Lakehouse SQL endpoint all speak the SQL
+> Server protocol; Managed Instance and the Fabric endpoint arrive as Tableau class `sqlserver`
+> (already mapped), Synapse as `azure_sql_dw`.
+
 > Tier membership is gated on a verified fact (from the Power Query M docs). The `(server, database)`
-> family, Oracle (`Oracle.Database(server, [options])`, server-only with `HierarchicalNavigation=false`),
-> and Snowflake (`Snowflake.Databases(server, warehouse)` then `[Name, Kind]` navigation) are **Fully
-> supported** — each emitted from its own verified signature, never a guessed call. Oracle and the
-> `(server, database)` family are doc-verified; Snowflake is doc-informed (no M function reference page
-> exists) and **live reconciliation is pending**. `Teradata.Database`'s exact navigation selector and
-> BigQuery's billing-project/project identifiers (it has no server) aren't verifiable offline, so they
-> are recognized but emitted as flagged scaffolds, never wrong M.
+> family (including Synapse), Oracle (`Oracle.Database(server, [options])`, server-only with
+> `HierarchicalNavigation=false`), Snowflake (`Snowflake.Databases(server, warehouse)` then `[Name, Kind]`
+> navigation), and Databricks (`Databricks.Catalogs(host, httpPath, [options])` then catalog→schema→table
+> `[Name, Kind]` navigation) are **Fully supported** — each emitted from its own verified signature, never
+> a guessed call. Oracle, Databricks, and the `(server, database)` family are doc-verified; Snowflake is
+> doc-informed (no M function reference page exists). Oracle, Snowflake, and Databricks have **no live
+> instance** in the validation environment (Azure SQL only), so **live reconciliation is pending**; for
+> Databricks the HTTP path value and Unity Catalog name aren't carried portably in the `.tds`, so they are
+> surfaced as a manual follow-up rather than guessed. `Teradata.Database`'s exact navigation selector and
+> BigQuery's billing-project/project identifiers (it has no server) aren't verifiable offline, so they are
+> recognized but emitted as flagged scaffolds, never wrong M.
+
+> **Analysis Services is not a datasource→M rebuild.** `msolap` / `sqlserver-analysis-services` is already a
+> tabular/multidimensional semantic model. `select_storage_mode` returns `mode=None` with
+> `fallback="analysis-services-model-migration"` (distinct from the relational land-to-Delta fallback) and a
+> rationale to migrate the model directly through its XMLA endpoint / semantic-model import;
+> `emit_m_partition_source` returns a flagged scaffold rather than a naive M partition.
 
 ---
 
@@ -71,10 +88,10 @@ fields that drive the decision:
 |---|---|
 | `mode` | `"Import"`, `"DirectQuery"`, or `None` (fall back) |
 | `connector` | Power Query connector function, or `None` |
-| `fully_supported` | `True` for a doc-verified deploy-ready connector (the `(server, database)` family plus Oracle and Snowflake); `False` ⇒ scaffold |
+| `fully_supported` | `True` for a doc-verified deploy-ready connector (the `(server, database)` family incl. Synapse, plus Oracle, Snowflake, and Databricks); `False` ⇒ scaffold |
 | `uses_native_query` | `True` if a custom-SQL relation is present |
 | `direct_upstream_available` | For an extract: a live DirectQuery rebuild is also possible |
-| `fallback` | `"land-to-delta-directlake"` when `mode is None` |
+| `fallback` | `"land-to-delta-directlake"` when `mode is None` for a relational source; `"analysis-services-model-migration"` for an SSAS/MSOLAP source |
 | `score` | Confidence 0–100 in the recommendation (higher ⇒ less manual remapping) |
 | `recommended_mode` | The storage mode to default to (`"Import"`/`"DirectQuery"`); `"Import"` when `mode is None` (the manual-rebuild default — the `fallback` pipeline is otherwise authoritative) |
 | `rationale` | Human-readable reason (goes into the migration report) |
@@ -91,6 +108,7 @@ fields that drive the decision:
 | Flat file (Excel/CSV) → Import | 80 |
 | Recognized scaffold connector (Teradata/BigQuery) | 60 |
 | Unknown / structurally unsupported → fallback | 30 |
+| Analysis Services (`msolap`) → model-migration fallback | 30 |
 | *Custom-SQL native query present* | −10 (folding review needed) |
 
 `recommended_mode` is always populated so callers have an actionable default: it equals `mode` for a direct

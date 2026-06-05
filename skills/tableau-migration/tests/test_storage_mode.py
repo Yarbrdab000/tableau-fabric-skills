@@ -4,7 +4,8 @@ Locks the per-datasource decision tree: extract->Import, live relational->Direct
 flat file->Import, and the fallback to land-to-Delta + DirectLake for shapes that can't be
 rebuilt directly (join trees, multi-connection, unknown/partial connectors).
 """
-from storage_mode import FALLBACK_LAND_TO_DELTA, select_storage_mode
+from storage_mode import (
+    FALLBACK_ANALYSIS_SERVICES, FALLBACK_LAND_TO_DELTA, select_storage_mode)
 
 import pytest
 
@@ -138,11 +139,13 @@ def test_no_columns_falls_back():
 @pytest.mark.parametrize("cls,connector", [
     ("sqlserver", "Sql.Database"),
     ("azure_sqldb", "Sql.Database"),
+    ("azure_sql_dw", "Sql.Database"),       # Azure Synapse Analytics (TDS protocol)
     ("postgres", "PostgreSQL.Database"),
     ("mysql", "MySQL.Database"),
     ("redshift", "AmazonRedshift.Database"),
     ("oracle", "Oracle.Database"),
     ("snowflake", "Snowflake.Databases"),
+    ("databricks", "Databricks.Catalogs"),
 ])
 def test_fully_supported_family_is_directquery(cls, connector):
     d = select_storage_mode(_desc(connection_class=cls))
@@ -150,6 +153,28 @@ def test_fully_supported_family_is_directquery(cls, connector):
     assert d["connector"] == connector
     assert d["fully_supported"] is True
     assert d["fallback"] is None
+
+
+def test_databricks_directquery_flags_httppath_followup():
+    # Databricks emits a doc-verified shape, but the SQL-warehouse HTTP path + catalog can't be
+    # sourced portably from the .tds, so the decision surfaces a loud manual follow-up.
+    d = select_storage_mode(_desc(connection_class="databricks"))
+    assert d["mode"] == "DirectQuery"
+    assert d["fully_supported"] is True
+    assert any("httppath" in f.lower() for f in d["manual_followups"])
+
+
+@pytest.mark.parametrize("cls", ["msolap", "sqlserver-analysis-services"])
+def test_analysis_services_is_model_migration_not_relational_fallback(cls):
+    # SSAS / MSOLAP is already a semantic model: no Import/DirectQuery rebuild, and NOT the
+    # relational land-to-Delta path -- it gets its own model-migration routing + rationale.
+    d = select_storage_mode(_desc(connection_class=cls))
+    assert d["mode"] is None
+    assert d["connector"] is None
+    assert d["fallback"] == FALLBACK_ANALYSIS_SERVICES
+    assert d["fallback"] != FALLBACK_LAND_TO_DELTA
+    assert "model" in d["rationale"].lower()
+    assert any("xmla" in f.lower() or "semantic-model" in f.lower() for f in d["manual_followups"])
 
 
 @pytest.mark.parametrize("cls,connector", [
