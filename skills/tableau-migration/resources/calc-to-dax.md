@@ -50,7 +50,7 @@ dax, reason, tables_used = translate_tableau_calc_to_dax(formula, resolver)
 | `PI()` | `PI()` | Nullary numeric constant |
 | `= == <> != > >= < <=` | `=` / `<>` / `>` … | `==`→`=`, `!=`→`<>` |
 | `AND` / `OR` / `NOT(x)` | `&&` / `||` / `NOT(x)` | Operands must be boolean |
-| `x IN (a, b, …)` | `x IN { a, b, … }` | Set membership; one consistent element type |
+| `x IN (a, b, …)` | numeric/date: `x IN { a, b, … }`; text: `(EXACT(x, a) \|\| EXACT(x, b) …)` | Text uses case-sensitive `EXACT` (DAX set membership is collation/case-insensitive); one consistent element type |
 | `ZN(x)` | `COALESCE(x, 0)` | |
 | `IFNULL(a, b)` | `COALESCE(a, b)` | Branch types must match |
 | `ISNULL(x)` | `ISBLANK(x)` | |
@@ -180,8 +180,10 @@ mismatch, so it never emits DAX that would error or silently coerce:
   `LOG`, `LN`, `DIV`, `MOD`, `PI`, the `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`/`COT` trig family, and
   `DEGREES`/`RADIANS`) require **numeric** operands, so a row-level field, a text/date operand, or wrong
   arity falls back. `STDEV`, `STDEVP`, `VAR`, `VARP`, and `PERCENTILE` likewise require a numeric field.
-- `x IN (a, b, …)` → `x IN { a, b, … }` (DAX set membership) requires every list element to share the
-  operand's type; a boolean operand or a mixed-type list falls back.
+- `x IN (a, b, …)` → DAX set membership requires every list element to share the operand's type; a
+  boolean operand or a mixed-type list falls back. Numeric/date operands emit `x IN { a, b, … }`; **text**
+  operands emit a parenthesised `(EXACT(x, a) || EXACT(x, b) …)` chain because DAX `IN { … }` follows the
+  model's (usually case-insensitive) collation, whereas Tableau string comparison is case-sensitive.
 - `CASE` → `SWITCH` needs **one** consistent result type across every `THEN`/`ELSE`; the simple form also
   requires each `WHEN` value to match the comparand's type. `CASE` is parsed like `IF` (it self-terminates
   at `END` and does not compose into surrounding arithmetic).
