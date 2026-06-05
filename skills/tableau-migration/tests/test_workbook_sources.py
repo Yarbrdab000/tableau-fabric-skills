@@ -101,6 +101,39 @@ RESOLVED_TDS = """<?xml version='1.0' encoding='utf-8'?>
   </connection>
 </datasource>"""
 
+# A CROSS-DATABASE JOIN: one federated datasource whose <relation type='join'> tree spans TWO
+# <named-connection>s (Snowflake JOIN a local CSV), each leaf relation carrying a different
+# connection= id. This cannot be one Import partition -> must fall back, not be rebuilt wrong.
+CROSS_DB_DS = """
+    <datasource name='federated.xdb' caption='Blended Sales'>
+      <connection class='federated'>
+        <named-connections>
+          <named-connection caption='snow' name='snowflake.0'>
+            <connection class='snowflake' server='acct.snowflakecomputing.com' dbname='SALES' warehouse='WH'/>
+          </named-connection>
+          <named-connection caption='local' name='textscan.0'>
+            <connection class='textscan' filename='targets.csv' directory='C:\\\\Data'/>
+          </named-connection>
+        </named-connections>
+        <relation join='inner' type='join'>
+          <clause type='join'>
+            <expression op='='>
+              <expression op='[snowflake.0].[ORDERS].[REGION]'/>
+              <expression op='[textscan.0].[targets#csv].[Region]'/>
+            </expression>
+          </clause>
+          <relation connection='snowflake.0' name='ORDERS' table='[SALES].[ORDERS]' type='table'/>
+          <relation connection='textscan.0' name='targets' table='[targets#csv]' type='table'/>
+        </relation>
+        <metadata-records>
+          <metadata-record class='column'><remote-name>REGION</remote-name>
+            <local-name>[REGION]</local-name><parent-name>[ORDERS]</parent-name><local-type>string</local-type></metadata-record>
+          <metadata-record class='column'><remote-name>Target</remote-name>
+            <local-name>[Target]</local-name><parent-name>[targets#csv]</parent-name><local-type>real</local-type></metadata-record>
+        </metadata-records>
+      </connection>
+    </datasource>"""
+
 
 def _workbook(*datasources):
     inner = "".join(datasources)
@@ -283,6 +316,44 @@ def test_flatfile_clean_name_collision_falls_back():
     </datasource>"""
     res = rebuild_workbook_models(_workbook(collide))
     assert res["models"]["Collide"]["status"] == "fallback"
+
+
+# -- cross-database join detection (multi-source join rebuild deferred) -------
+def test_cross_db_join_detected_in_enumeration():
+    entry = enumerate_workbook_datasources(_workbook(CROSS_DB_DS))[0]
+    assert entry["cross_db_join"] is True
+    # the SET of distinct named-connections the relation tree spans
+    assert set(entry["named_connections"]) == {"snowflake.0", "textscan.0"}
+    assert entry["classification"] == "cross_db_join"
+
+
+def test_cross_db_join_falls_back_with_reason_not_one_partition():
+    res = rebuild_workbook_models(_workbook(CROSS_DB_DS))
+    model = res["models"]["Blended Sales"]
+    assert model["status"] == "fallback"
+    assert model["parts"] == {}                      # never emitted as a single Import partition
+    assert model["report"]["reason"] == "cross_db_join"
+    assert set(model["report"]["connection_classes"]) == {"snowflake", "textscan"}
+
+    msgs = [f["message"] for f in res["followups"] if f["datasource"] == "Blended Sales"]
+    assert any("Cross-database join" in m for m in msgs)
+    assert any(("lakehouse" in m or "composite model" in m) for m in msgs)
+
+
+def test_single_connection_relational_not_flagged_cross_db():
+    # a normal single-connection federated source must NOT be misread as a cross-database join
+    entry = enumerate_workbook_datasources(_workbook(SQLSERVER_DS))[0]
+    assert entry["cross_db_join"] is False
+    assert entry["named_connections"] == ["sqlserver.0"]
+    assert entry["classification"] == "relational"
+
+
+def test_cross_db_join_isolated_from_healthy_sources():
+    # a cross-database join falls back but never blocks the other datasources in the estate
+    res = rebuild_workbook_models(_workbook(CROSS_DB_DS, EXCEL_DS, SQLSERVER_DS))
+    assert res["models"]["Blended Sales"]["status"] == "fallback"
+    assert res["models"]["Sample - Superstore"]["status"] == "migrated_with_followups"
+    assert res["models"]["Live Orders"]["status"] == "migrated"
 
 
 # -- packaged .twbx: zip read + CSV delimiter auto-detection -------------------

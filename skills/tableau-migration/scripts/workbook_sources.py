@@ -37,6 +37,13 @@ Classification of each embedded ``<datasource>`` is by its inner ``<connection c
 * anything relational (``sqlserver`` / ``snowflake`` / ``postgres`` / ...) -> rebuilt via the
   existing spine (slice the element -> ``parse_tds`` -> ``assemble_import_model``).
 
+A single federated datasource can also be a CROSS-DATABASE JOIN: one ``<relation type='join'>``
+tree spanning more than one ``<named-connection>`` (e.g. Snowflake joined to a local CSV), each
+leaf relation carrying a different ``connection=`` id. That cannot be represented as one Import
+partition, so it is detected up front (the set of connections each datasource's relations span)
+and routed to ``fallback`` with a ``cross_db_join`` follow-up (land each side to Delta and join
+in the lakehouse, or use a composite model); the multi-source join rebuild itself is deferred.
+
 Honesty boundaries are inherited from the cores: column types come from Tableau metadata,
 structurally unsafe shapes (join/union trees, multi-connection datasources) fall back instead
 of being emitted wrong, and credentials are never read, stored, or written.
@@ -163,6 +170,32 @@ def _file_type(connection_class):
     return None
 
 
+def _connection_span(ds):
+    """Describe the connections a datasource's relation tree spans (cross-DB-join detection).
+
+    Returns ``{"connections": [...], "classes": [...], "cross_db_join": bool}``. ``connections``
+    is the sorted set of distinct named-connection ids the ``<relation>`` tree references -- a
+    cross-database join carries a different ``connection=`` id on each joined leaf relation --
+    unioned with the ids declared under ``<named-connections>``. ``classes`` is the distinct set
+    of inner ``<connection class>`` values across those connections. ``cross_db_join`` is true
+    when the datasource spans more than one connection: such a join cannot be rebuilt as a single
+    Import partition, so it is routed to a fallback (the multi-source join rebuild is deferred).
+    The check is a cheap, namespace-agnostic XML walk -- no ``parse_tds`` round-trip needed.
+    """
+    declared = {}
+    for holder in _findall_local(ds, "named-connections"):
+        for nc in _children_local(holder, "named-connection"):
+            cls = next((c.get("class").lower() for c in _children_local(nc, "connection")
+                        if c.get("class")), None)
+            declared[nc.get("name") or f"__nc{len(declared)}"] = cls
+    referenced = {rel.get("connection") for rel in _findall_local(ds, "relation")
+                  if rel.get("connection")}
+    connections = sorted(referenced | set(declared))
+    classes = sorted({c for c in declared.values() if c})
+    cross_db_join = max(len(referenced), len(declared)) > 1
+    return {"connections": connections, "classes": classes, "cross_db_join": cross_db_join}
+
+
 # -- source loading ------------------------------------------------------------
 def _looks_like_xml(text):
     return isinstance(text, str) and text.lstrip("\ufeff \t\r\n").startswith("<")
@@ -259,9 +292,11 @@ def enumerate_workbook_datasources(source):
           "name": <internal datasource name>,
           "caption": <caption or name>,
           "connection_class": <inner connection class>,
-          "classification": "flat_file"|"published_reference"|"relational"|"spatial",
+          "classification": "flat_file"|"published_reference"|"relational"|"spatial"|"cross_db_join",
           "file_type": "Excel"|"CSV"|"Spatial"|None,
           "relations": [ {kind, name, item, columns:[{remote_name, model_name, tmdl_type}]} ],
+          "named_connections": [<distinct connection ids the relations span>],
+          "cross_db_join": <bool: relations span >1 connection -> not single-partition rebuildable>,
           "published": {referenced_name, server, site, port, channel} | None,
           "flat_file": {filename, directory, separator, charset} | None,
           "datasource_xml": <the sliced <datasource> element as text>,
@@ -284,6 +319,11 @@ def enumerate_workbook_datasources(source):
         caption = ds.get("caption") or name or connection_class
         sliced = ET.tostring(ds, encoding="unicode")
         classification = _classify(connection_class)
+        span = _connection_span(ds)
+        if span["cross_db_join"]:
+            # A relation tree spanning >1 connection can't be one Import partition; it owns its
+            # own classification so the rebuild emits a cross_db_join fallback, not a wrong model.
+            classification = "cross_db_join"
 
         relations, parse_error = [], None
         try:
@@ -320,6 +360,8 @@ def enumerate_workbook_datasources(source):
             "relations": relations,
             "published": published,
             "flat_file": flat_file,
+            "named_connections": span["connections"],
+            "cross_db_join": span["cross_db_join"],
             "datasource_xml": sliced,
             "package_path": package_path,
             "parse_error": parse_error,
@@ -622,12 +664,40 @@ def build_relational_model(descriptor, *, model_name):
 
 
 # -- per-datasource dispatch ---------------------------------------------------
+def _cross_db_fallback(span, model_name):
+    """A cross-database join cannot be one Import partition -> fallback with guidance.
+
+    ``span`` is a :func:`_connection_span` result. The follow-up recommends landing each side to
+    its own Delta table (or DirectQuery per source) and joining in the lakehouse, or a composite
+    model. The actual multi-source join rebuild is deferred.
+    """
+    conns = span["connections"]
+    classes = span["classes"]
+    sides = ", ".join(classes) if classes else f"{len(conns)} sources"
+    return {
+        "status": "fallback",
+        "parts": {},
+        "report": {"model_name": model_name, "reason": "cross_db_join",
+                   "named_connections": conns, "connection_classes": classes},
+        "followups": [
+            f'Cross-database join: "{model_name}" blends {len(conns)} connections ({sides}) in a '
+            f"single datasource, which cannot be rebuilt as one Import partition. Land each side "
+            f"to its own Delta table (or DirectQuery each source) and perform the join in the "
+            f"lakehouse, or build a Power BI composite model. Multi-source join rebuild is "
+            f"deferred."],
+    }
+
+
 def _rebuild_from_xml(datasource_xml, *, model_name, package_path=None, flat_file=None):
     """Parse a single ``<datasource>`` slice and dispatch it to the right builder.
 
     Shared by the relational path and the resolved-published path so a published ``.tds`` that
-    turns out to be a flat file is rebuilt with real Excel/CSV M, not a null scaffold.
+    turns out to be a flat file is rebuilt with real Excel/CSV M, not a null scaffold (and a
+    published ``.tds`` that is itself a cross-database join falls back honestly).
     """
+    span = _connection_span(ET.fromstring(datasource_xml))
+    if span["cross_db_join"]:
+        return _cross_db_fallback(span, model_name)
     descriptor = parse_tds(datasource_xml)
     connection_class = (descriptor.get("connection_class") or "").lower()
     classification = _classify(connection_class)
@@ -685,8 +755,10 @@ def rebuild_workbook_models(source, *, resolve_published=None, output_dir=None):
 
     Statuses: ``migrated`` / ``migrated_with_followups`` / ``fallback`` / ``error`` mirror the
     estate orchestrator; ``published_unresolved`` additionally marks a published reference with
-    no resolver (or one that returned nothing). Each datasource is processed under its own
-    try/except, so one bad source never aborts the rest.
+    no resolver (or one that returned nothing). A cross-database join (a datasource whose relation
+    tree spans more than one connection) is routed to ``fallback`` with a ``cross_db_join``
+    follow-up reason; the multi-source join rebuild is deferred. Each datasource is processed under
+    its own try/except, so one bad source never aborts the rest.
     """
     entries = enumerate_workbook_datasources(source)
     _attach_resolver(entries, resolve_published)
@@ -737,6 +809,8 @@ def rebuild_workbook_models(source, *, resolve_published=None, output_dir=None):
 def _rebuild_entry(entry, caption):
     """Rebuild a single enumeration entry into a model result dict (may raise; caller isolates)."""
     classification = entry["classification"]
+    if classification == "cross_db_join":
+        return _cross_db_fallback(_connection_span(ET.fromstring(entry["datasource_xml"])), caption)
     if classification == "published_reference":
         return _rebuild_published(entry, caption)
     if classification == "spatial":
