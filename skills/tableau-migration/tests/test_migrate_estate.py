@@ -460,11 +460,37 @@ def test_viz_stage_failure_isolated_as_error(tmp_path):
 
 
 # -- LiveTableauSource seam ---------------------------------------------------
-def test_live_source_is_a_seam_with_no_network():
-    live = LiveTableauSource(server_url="https://tableau.example.com", site="finance",
-                             pat_name="migrator", key_vault_secret="kv://pat")
+_LIVE_ENV_VARS = (
+    "TABLEAU_SERVER_URL", "TABLEAU_SITE", "TABLEAU_MIGRATION_KEYVAULT",
+    "TABLEAU_MIGRATION_PAT_SECRET", "TABLEAU_MIGRATION_PAT_NAME",
+    "FABRIC_WORKSPACE", "TABLEAU_DATASOURCE_NAMES", "TABLEAU_WORKBOOK_NAMES",
+)
+
+
+@pytest.fixture
+def clean_live_env(monkeypatch):
+    """Clear every LiveTableauSource env var so config tests don't pick up the real shell."""
+    for key in _LIVE_ENV_VARS:
+        monkeypatch.delenv(key, raising=False)
+    return monkeypatch
+
+
+def test_live_source_is_a_seam_with_no_network(clean_live_env):
+    live = LiveTableauSource(
+        server_url="https://tableau.example.com", site="finance",
+        key_vault_name="vault-x", pat_secret_name="pat-secret", pat_name="migrator",
+        datasource_names=["Superstore"], workbook_names=["Sales Dashboard"],
+        fabric_workspace="workspace-x",
+    )
     # constructing it performs no I/O; config is retained
     assert live.server_url == "https://tableau.example.com"
+    assert live.site == "finance"
+    assert live.key_vault_name == "vault-x"
+    assert live.pat_secret_name == "pat-secret"
+    assert live.fabric_workspace == "workspace-x"
+    assert live.datasource_names == ["Superstore"]
+    assert live.workbook_names == ["Sales Dashboard"]
+    # every network-touching method is a seam until implemented
     for call in (live.list_datasources, live.list_workbooks):
         with pytest.raises(NotImplementedError):
             call()
@@ -472,6 +498,81 @@ def test_live_source_is_a_seam_with_no_network():
         live.read_datasource("anything")
     with pytest.raises(NotImplementedError):
         live.read_workbook("anything")
+    with pytest.raises(NotImplementedError):
+        live._resolve_pat()
+    with pytest.raises(NotImplementedError):
+        live._signin("token-secret")
+
+
+def test_live_source_describe_exposes_config_without_secrets(clean_live_env):
+    live = LiveTableauSource(
+        server_url="https://tableau.example.com", site="finance",
+        key_vault_name="vault-x", pat_secret_name="pat-secret", pat_name="migrator",
+        datasource_names=["Superstore"], fabric_workspace="workspace-x",
+    )
+    desc = live.describe()
+    # describe() is an exact allowlist of names/pointers -- no secret-bearing key can sneak in
+    assert set(desc) == {
+        "kind", "server_url", "site", "key_vault", "pat_secret_name", "pat_name",
+        "fabric_workspace", "datasource_names", "workbook_names", "api_version", "implemented",
+    }
+    assert desc["kind"] == "LiveTableauSource"
+    assert desc["implemented"] is False
+    assert desc["key_vault"] == "vault-x"
+    assert desc["pat_secret_name"] == "pat-secret"
+    assert desc["fabric_workspace"] == "workspace-x"
+    assert desc["datasource_names"] == ["Superstore"]
+    assert desc["workbook_names"] is None  # omitted + env cleared -> deterministically None
+    # only the secret *name* is recorded, never a resolved token / X-Tableau-Auth value
+    blob = json.dumps(desc)
+    assert "pat-secret" in blob
+    assert "X-Tableau-Auth" not in blob
+
+
+def test_live_source_reads_config_from_environment(clean_live_env):
+    clean_live_env.setenv("TABLEAU_SERVER_URL", "https://env.example.com")
+    clean_live_env.setenv("TABLEAU_SITE", "env-site")
+    clean_live_env.setenv("TABLEAU_MIGRATION_KEYVAULT", "env-vault")
+    clean_live_env.setenv("TABLEAU_MIGRATION_PAT_SECRET", "env-secret")
+    clean_live_env.setenv("FABRIC_WORKSPACE", "env-workspace")
+    clean_live_env.setenv("TABLEAU_DATASOURCE_NAMES", "Superstore, Orders ")
+    live = LiveTableauSource()
+    assert live.server_url == "https://env.example.com"
+    assert live.site == "env-site"
+    assert live.key_vault_name == "env-vault"
+    assert live.pat_secret_name == "env-secret"
+    assert live.fabric_workspace == "env-workspace"
+    # comma-separated env list is parsed and trimmed
+    assert live.datasource_names == ["Superstore", "Orders"]
+    # explicit args win over the environment; an explicit [] suppresses the env filter
+    assert LiveTableauSource(server_url="https://explicit").server_url == "https://explicit"
+    assert LiveTableauSource(datasource_names=[]).datasource_names == []
+
+
+def test_select_by_name_filters_catalog_offline():
+    catalog = [
+        {"id": "luid-1", "name": "Superstore"},
+        {"id": "luid-2", "name": "People"},
+        {"id": "luid-3", "name": "superstore"},  # case-variant duplicate name
+        {"name": "no-id-skipped"},               # missing id -> skipped
+    ]
+    # case-insensitive match; both Superstore variants returned, sorted by name then id
+    picked = LiveTableauSource._select_by_name(catalog, ["superstore"])
+    assert picked == [("luid-1", "Superstore"), ("luid-3", "superstore")]
+    # a name not present yields nothing
+    assert LiveTableauSource._select_by_name(catalog, ["Returns"]) == []
+    # no filter (None or all-blank) -> everything with an id, deterministically sorted
+    everything = [("luid-2", "People"), ("luid-1", "Superstore"), ("luid-3", "superstore")]
+    assert LiveTableauSource._select_by_name(catalog, None) == everything
+    assert LiveTableauSource._select_by_name(catalog, ["   "]) == everything
+
+
+def test_inmemory_source_is_the_live_double(tmp_path):
+    # The offline fake stands in for LiveTableauSource so the orchestrator is fully testable.
+    src = InMemoryTableauSource(datasources={"Widget Sales": WIDGET_SALES_TDS})
+    report = migrate_estate(src, str(tmp_path / "b"))
+    assert report["source"]["kind"] == "InMemoryTableauSource"
+    assert report["summary"]["datasources_total"] == 1
 
 
 # -- folder safety / determinism ----------------------------------------------
