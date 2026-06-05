@@ -20,9 +20,10 @@ and the actual bind call are **delegated** to `semantic-model-authoring`.
 | `datasource_name` | Display name from the `.tds` |
 | `connection_class` | Tableau connector class (`sqlserver`, `snowflake`, `excel-direct`, …) |
 | `server` / `database` | Upstream server + database (from the live connection) |
+| `auth_method` | Non-secret authentication *label* from the inner connection (e.g. `Username Password`, `oauth`) — never the credential itself |
 | `is_extract` | Whether a `.hyper` extract is enabled |
 | `named_connection_count` | >1 ⇒ federated multi-connection (fallback) |
-| `relations` | One entry per logical table: `kind`, `name`, `schema`/`item`, typed `columns` |
+| `relations` | One entry per logical table: `kind`, `name`, `catalog`/`schema`/`item`, typed `columns` |
 | `unsupported_reasons` | Shape problems found during parsing |
 
 ```python
@@ -31,6 +32,24 @@ descriptor = parse_tds(open("datasource.tds", encoding="utf-8-sig").read())
 ```
 
 > Always open `.tds` with `encoding="utf-8-sig"` — Tableau writes a UTF-8 BOM.
+
+### Federated collection datasources (Tableau 2023+ object model)
+
+Modern cloud-warehouse `.tds` files (real Snowflake / Databricks / Azure SQL exports) wrap the upstream
+in a `<connection class='federated'>` whose **named** inner connection carries the true class, and list
+tables as a `<relation type='collection'>` of `<relation type='table' table='[catalog].[schema].[table]'/>`
+children — physically once and again under the logical object-model layer. The parser:
+
+- promotes those collection table relations to `kind='table'` (they are a flat star, not a join/union),
+- parses the **three-part** `[catalog].[schema].[table]` name into `catalog` / `schema` / `item`,
+- attaches each relation's typed `columns` (matched on the bare `<parent-name>`), and
+- de-duplicates the physical + logical copies on the fully-qualified `(catalog, schema, item)` path.
+
+The result is **N DirectQuery tables** (validated against real Snowflake and Databricks Superstore
+exports — 3 tables each, columns intact) instead of the old "no table relations found" land-to-Delta
+fallback. A three-part name whose **catalog ≠ the connection database** on a single-database `Sql.Database`
+connector is treated as a cross-database reference and scaffolded (never silently bound to the wrong
+database); a catalog equal to the database is just dropped as a redundant qualifier.
 
 ---
 
@@ -96,10 +115,15 @@ Oracle and Teradata are server-only because the database/service is carried in t
 no unused `#"Database"` parameter is emitted), and `HierarchicalNavigation=false` is set explicitly so
 the flat `Schema`/`Item` selector is correct rather than default-reliant. Snowflake adds a
 `#"Warehouse"` parameter and reaches the table by `database → schema → table` navigation. Databricks
-adds a `#"HttpPath"` parameter (the SQL-warehouse HTTP path) and uses the **same** `[Name, Kind]`
-navigation — the Unity Catalog catalog is the first hop, keyed `Kind="Database"`. Snowflake and
-Databricks both scaffold a relation rather than guess when the `.tds` doesn't carry a resolvable
-database/catalog + schema.
+adds a `#"HttpPath"` parameter (the SQL-warehouse HTTP path, read from the `.tds` `v-http-path`
+attribute) and uses the **same** `[Name, Kind]` navigation — the Unity Catalog catalog is the first hop,
+keyed `Kind="Database"`. Snowflake and Databricks both scaffold a relation rather than guess when the
+`.tds` doesn't carry a resolvable database/catalog + schema. When a real Snowflake `.tds` carries an
+**empty warehouse** (`warehouse=''`), the `#"Warehouse"` parameter is still emitted — so
+`Snowflake.Databases(#"Server", #"Warehouse")` stays a valid call — but it is prefixed with a `///` TMDL
+description flagging that a compute warehouse must be set before refresh (a `///` description is
+deploy-safe; a bare `//` comment is not guaranteed to parse), and `select_storage_mode` adds a matching
+follow-up.
 
 > **Verification status.** Oracle, Teradata, Databricks, and the `(server, database)` family (incl.
 > Synapse and Fabric via the SQL Server protocol) are doc-verified against the official Power Query M
@@ -143,6 +167,8 @@ API:
   "server":   "myserver.database.windows.net",
   "database": "Superstore",
   "path":     "myserver.database.windows.net;Superstore",
+  "auth_method":     "Username Password",  # non-secret label from the .tds
+  "credential_kind": "Basic",              # advised Fabric credential type
 }
 ```
 
@@ -151,6 +177,23 @@ endpoint `microsoft_fabric_sql_endpoint`) plus Oracle, Teradata, Snowflake, Data
 (`SQL`, `PostgreSql`, `Oracle`, `MySql`, `AmazonRedshift`, `Teradata`, `Snowflake`, `Databricks`,
 `GoogleBigQuery`). A binding adapter flattens `path` to the connector's exact requirement; the
 structured fields are preserved so nothing is lost for non-SQL connectors.
+
+### Authentication method → Fabric credential type
+
+The descriptor surfaces the inner connection's `authentication` attribute as a **non-secret label**
+(`auth_method`), and `connection_details_for_bind` maps it to an advised Fabric `credential_kind`:
+
+| `.tds` `auth_method` label | Advised Fabric credential | Typical source |
+|---|---|---|
+| `Username Password` | `Basic` | Snowflake (user/password) |
+| `oauth` | `OAuth2` | Databricks (Entra), Entra-based sources |
+| anything else / absent | `null` (configure manually) | — |
+
+> **Strict secret boundary.** Only the auth *label* is read. The skill never reads or emits username,
+> password, token, OAuth config id, or instance URL — verified against the real Snowflake and Databricks
+> `.tds` exports (the secret fields are present in the file but absent from the descriptor and bind
+> details). The advised `credential_kind` is guidance for configuring the Fabric connection; the user
+> still supplies the actual credential.
 
 The bind sequence itself — discover → match → create → bind → validate — is owned by `semantic-model-authoring`'s
 connection workflow. Hand it `connection_details_for_bind(...)` and let it drive the Fabric REST calls.

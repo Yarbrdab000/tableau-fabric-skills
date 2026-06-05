@@ -156,6 +156,10 @@ _NATIVE_QUERY_FOLLOWUP = "Review the preserved custom SQL native query (folding 
 # the .tds: the SQL-warehouse HTTP path and (depending on the workbook) the Unity Catalog name.
 _DATABRICKS_FOLLOWUP = ('Databricks: set the SQL-warehouse HTTP Path parameter (#"HttpPath") and confirm '
                         "the catalog name (mapped from the Tableau database) matches your Unity Catalog catalog.")
+# Snowflake stores the compute warehouse as a connection attribute that can be empty in the .tds;
+# Snowflake.Databases needs a real warehouse to run queries, so flag it when it's missing.
+_SNOWFLAKE_WAREHOUSE_FOLLOWUP = ('Snowflake: the .tds carried no compute warehouse; set the #"Warehouse" '
+                                 "parameter to a valid warehouse before refresh.")
 
 
 def _decision(mode, connector, **kw):
@@ -215,6 +219,8 @@ def select_storage_mode(descriptor):
     base_followups = [_CREDENTIALS_FOLLOWUP]
     if cls == "databricks":
         base_followups = base_followups + [_DATABRICKS_FOLLOWUP]
+    if cls == "snowflake" and not (descriptor.get("warehouse") or "").strip():
+        base_followups = base_followups + [_SNOWFLAKE_WAREHOUSE_FOLLOWUP]
 
     # 0. Analysis Services (SSAS / MSOLAP): the source is already a tabular/multidimensional
     #    semantic model. It is NOT a datasource->M rebuild and must NOT be routed to the

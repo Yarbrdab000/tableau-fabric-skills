@@ -64,26 +64,39 @@ def _children_local(elem, name):
     return [c for c in list(elem) if _local(c.tag) == name]
 
 
+_BRACKET_THREE = re.compile(
+    r"^\[(?P<catalog>[^\[\]]+)\]\.\[(?P<schema>[^\[\]]+)\]\.\[(?P<item>[^\[\]]+)\]$")
 _BRACKET_PAIR = re.compile(r"^\[(?P<schema>[^\[\]]+)\]\.\[(?P<item>[^\[\]]+)\]$")
 _BRACKET_ONE = re.compile(r"^\[(?P<item>[^\[\]]+)\]$")
 
 
 def _parse_table_name(raw):
-    """Conservatively split a relation ``table`` attribute into (schema, item).
+    """Conservatively split a relation ``table`` attribute into ``(catalog, schema, item)``.
 
-    Handles the common ``[schema].[item]`` and ``[item]`` shapes. Anything else returns
-    ``(None, None)`` so the caller falls back rather than guessing a wrong schema/item.
+    Handles the three bracketed shapes Tableau emits, widest first:
+
+    * ``[catalog].[schema].[item]`` -- the Tableau 2023+ object-model shape over three-part-name
+      backends (Snowflake ``DB.SCHEMA.TABLE``, Databricks Unity ``catalog.schema.table``); the
+      first segment is the catalog/database, reached by the connector's first navigation hop.
+    * ``[schema].[item]``           -- the classic two-part relational shape.
+    * ``[item]``                    -- a bare table name.
+
+    Anything else returns ``(None, None, None)`` so the caller falls back rather than guessing a
+    wrong schema/item. ``catalog`` is ``None`` for the two- and one-part shapes.
     """
     if not raw:
-        return None, None
+        return None, None, None
     raw = raw.strip()
+    m = _BRACKET_THREE.match(raw)
+    if m:
+        return m.group("catalog"), m.group("schema"), m.group("item")
     m = _BRACKET_PAIR.match(raw)
     if m:
-        return m.group("schema"), m.group("item")
+        return None, m.group("schema"), m.group("item")
     m = _BRACKET_ONE.match(raw)
     if m:
-        return None, m.group("item")
-    return None, None
+        return None, None, m.group("item")
+    return None, None, None
 
 
 def _strip_brackets(name):
@@ -108,13 +121,30 @@ def _named_connections(datasource):
     return out
 
 
+# Tableau spells the Databricks SQL-warehouse HTTP path differently across driver/connector
+# versions; check each known attribute (newest first) so a real .tds resolves regardless.
+_HTTP_PATH_ATTRS = ("v-http-path", "http-path", "httppath", "http_path")
+
+
+def _http_path_of(conn):
+    """Return the Databricks SQL-warehouse HTTP path from whichever attribute carries it, or None."""
+    for attr in _HTTP_PATH_ATTRS:
+        v = conn.get(attr)
+        if v:
+            return v
+    return None
+
+
 def _live_connection(datasource):
-    """Return (class, server, dbname, warehouse, http_path, named_connection_count) for the live source.
+    """Return ``(class, server, dbname, warehouse, http_path, auth_method, named_connection_count)``.
 
     Descends through a ``federated`` wrapper into the inner named-connection. Falls back to
     a direct ``<connection>`` on the datasource for the older non-federated layout. ``warehouse``
     is the Snowflake compute warehouse; ``http_path`` is the Databricks SQL-warehouse HTTP path
-    (best-effort -- ``None`` when the attribute isn't present / for other connectors).
+    (read from whichever attribute carries it -- ``None`` when absent / for other connectors).
+    ``auth_method`` is the inner connection's ``authentication`` attribute LABEL ONLY (a non-secret
+    hint for the Fabric credential type, e.g. 'Username Password' or 'oauth'); NO secret attribute
+    (username / password / token / oauth-config-id / instanceurl) is ever read.
     """
     named = _named_connections(datasource)
     inner_conns = []
@@ -123,13 +153,13 @@ def _live_connection(datasource):
     if inner_conns:
         c = inner_conns[0]
         return (c.get("class"), c.get("server"), c.get("dbname"),
-                c.get("warehouse"), c.get("http-path"), len(named))
+                c.get("warehouse"), _http_path_of(c), c.get("authentication"), len(named))
     # non-federated: first <connection> that is not the federated wrapper
     for c in _children_local(datasource, "connection"):
         if (c.get("class") or "").lower() != "federated":
             return (c.get("class"), c.get("server"), c.get("dbname"),
-                    c.get("warehouse"), c.get("http-path"), 1)
-    return (None, None, None, None, None, len(named))
+                    c.get("warehouse"), _http_path_of(c), c.get("authentication"), 1)
+    return (None, None, None, None, None, None, len(named))
 
 
 def _columns_by_parent(datasource):
@@ -223,7 +253,14 @@ def _extract_relations(datasource, cols_by_parent):
             continue
         entry = _classify_relation(rel, cols_by_parent)
         if entry["kind"] in ("table", "custom_sql"):
-            key = (entry.get("item") or entry.get("name") or "").lower()
+            # De-dup on the fully-qualified path so the physical + logical copies of ONE table
+            # collapse, but two genuinely different tables that merely share a leaf name (different
+            # catalog/schema) stay distinct.
+            key = (
+                (entry.get("catalog") or "").lower(),
+                (entry.get("schema") or "").lower(),
+                (entry.get("item") or entry.get("name") or "").lower(),
+            )
             if key in table_index:
                 prev = relations[table_index[key]]
                 if not prev.get("columns") and entry.get("columns"):
@@ -250,7 +287,7 @@ def _classify_relation(rel, cols_by_parent):
             "columns": cols_by_parent.get(item_key, []),
         }
     if rtype == "table" or rel.get("table"):
-        schema, item = _parse_table_name(rel.get("table"))
+        catalog, schema, item = _parse_table_name(rel.get("table"))
         if item is None:
             return {"kind": "unknown", "name": name, "raw_table": rel.get("table")}
         cols = cols_by_parent.get(item) or cols_by_parent.get(_strip_brackets(name) if name else "", [])
@@ -258,6 +295,7 @@ def _classify_relation(rel, cols_by_parent):
             "kind": "table",
             "name": name,
             "raw_table": rel.get("table"),
+            "catalog": catalog,
             "schema": schema,
             "item": item,
             "columns": cols,
@@ -276,7 +314,7 @@ def parse_tds(xml_text):
     datasource = root if _local(root.tag) == "datasource" else (
         _findall_local(root, "datasource") or [root])[0]
 
-    cls, server, dbname, warehouse, http_path, nconns = _live_connection(datasource)
+    cls, server, dbname, warehouse, http_path, auth_method, nconns = _live_connection(datasource)
     cols_by_parent = _columns_by_parent(datasource)
 
     relations = _extract_relations(datasource, cols_by_parent)
@@ -300,6 +338,7 @@ def parse_tds(xml_text):
         "database": dbname,
         "warehouse": warehouse,
         "http_path": http_path,
+        "auth_method": auth_method,
         "is_extract": is_extract,
         "named_connection_count": nconns,
         "relations": relations,
@@ -332,8 +371,19 @@ def emit_connection_parameters(descriptor):
     if descriptor.get("database") and connect_style not in no_database:
         lines.append(f'expression Database = "{escape_m_string(descriptor["database"])}" {_PARAM_META}\n')
     if connect_style == "server_warehouse":
-        warehouse = escape_m_string(descriptor.get("warehouse") or "")
-        lines.append(f'expression Warehouse = "{warehouse}" {_PARAM_META}\n')
+        raw_warehouse = (descriptor.get("warehouse") or "").strip()
+        warehouse = escape_m_string(raw_warehouse)
+        wh_line = f'expression Warehouse = "{warehouse}" {_PARAM_META}\n'
+        if not raw_warehouse:
+            # The .tds carried no compute warehouse (Snowflake stores it as warehouse=''). Keep the
+            # #"Warehouse" parameter so Snowflake.Databases(#"Server", #"Warehouse") stays a valid
+            # call, but attach a TMDL description (///, documented + deploy-safe) flagging that an
+            # empty warehouse cannot run queries and must be set before refresh. Combined into one
+            # element so the description sits immediately above the expression it annotates.
+            wh_line = (
+                '/// TODO: the Snowflake warehouse was empty in the .tds; set #"Warehouse" '
+                "to a valid compute warehouse before refresh\n" + wh_line)
+        lines.append(wh_line)
     if connect_style == "server_httppath":
         http_path = escape_m_string(descriptor.get("http_path") or "")
         lines.append(f'expression HttpPath = "{http_path}" {_PARAM_META}\n')
@@ -426,10 +476,11 @@ def emit_m_partition_source(relation, descriptor, mode):
 
     if nav_style == "database_schema_table":
         # Snowflake / Databricks: database(or catalog) -> schema -> table, each hop keyed by
-        # [Name, Kind] (the catalog level is keyed Kind="Database"). The first hop needs the
-        # database/catalog name; without it + the schema the navigation can't be resolved, so we
-        # scaffold rather than guess.
-        database = descriptor.get("database")
+        # [Name, Kind] (the catalog level is keyed Kind="Database"). The catalog comes from the
+        # relation's three-part [catalog].[schema].[item] name when present, else the connection's
+        # database; without the catalog + schema the navigation can't be resolved, so we scaffold
+        # rather than guess.
+        database = relation.get("catalog") or descriptor.get("database")
         schema = relation.get("schema")
         item = relation["item"]
         if not database or not schema:
@@ -451,7 +502,20 @@ def emit_m_partition_source(relation, descriptor, mode):
     if nav_style != "schema_item":
         raise ValueError(f"unhandled nav_style {nav_style!r} for connector {connector!r}")
 
-    # schema_item: flat ADO.NET navigation (SQL Server family + Oracle).
+    # schema_item: flat ADO.NET navigation (SQL Server family + Oracle / Teradata). These bind one
+    # database via Sql.Database(server, database) (or reach it through the server string), so a
+    # three-part [catalog].[schema].[item] name whose catalog differs from (or has no) connection
+    # database is a cross-database reference we can't scope safely -> scaffold rather than silently
+    # query the connection's default database. A catalog that equals the database is just a
+    # redundant qualifier and is dropped.
+    catalog = relation.get("catalog")
+    database = descriptor.get("database")
+    if catalog and (not database or catalog.lower() != database.lower()):
+        return _scaffold_source(
+            cls, connector,
+            f"table is qualified to catalog '{catalog}' but the connection database is "
+            f"'{database or '(none)'}'; cross-database references aren't auto-emitted for the "
+            f"{connector}(server, database) navigation")
     schema = relation.get("schema") or "dbo"
     item = relation["item"]
     nav = f'Source{{[Schema="{escape_m_string(schema)}", Item="{escape_m_string(item)}"]}}[Data]'
@@ -549,20 +613,41 @@ _BIND_TYPE = {
 }
 
 
+# Non-secret Tableau ``authentication`` label -> Fabric/Power BI credential kind. Used only to
+# advise which credential type to configure; we map the labels we can verify and return None
+# otherwise rather than guessing. NO secret is ever read -- only the method label.
+_AUTH_TO_CREDENTIAL = {
+    "username password": "Basic",
+    "oauth": "OAuth2",
+}
+
+
+def _fabric_credential_kind(auth_method):
+    """Map a Tableau ``authentication`` label to a Fabric credential kind, or None if unknown."""
+    if not auth_method:
+        return None
+    return _AUTH_TO_CREDENTIAL.get(auth_method.strip().lower())
+
+
 def connection_details_for_bind(descriptor):
     """Return structured connection details for the Bind Semantic Model Connection API.
 
     A later binding adapter flattens ``path`` per the connector's exact requirement; the
-    structured fields are kept so nothing is lost for non-SQL connectors.
+    structured fields are kept so nothing is lost for non-SQL connectors. ``auth_method`` is the
+    non-secret Tableau authentication label and ``credential_kind`` is its mapped Fabric credential
+    type (advisory only) -- no secret value is ever included.
     """
     cls = (descriptor.get("connection_class") or "").lower()
     server = descriptor.get("server")
     database = descriptor.get("database")
     path = ";".join(p for p in (server, database) if p) or None
+    auth_method = descriptor.get("auth_method")
     return {
         "connector": cls or None,
         "bind_type": _BIND_TYPE.get(cls),
         "server": server,
         "database": database,
         "path": path,
+        "auth_method": auth_method,
+        "credential_kind": _fabric_credential_kind(auth_method),
     }
