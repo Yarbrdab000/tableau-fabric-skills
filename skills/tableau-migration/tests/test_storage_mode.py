@@ -4,7 +4,8 @@ Locks the per-datasource decision tree: extract->Import, live relational->Direct
 flat file->Import, and the fallback to land-to-Delta + DirectLake for shapes that can't be
 rebuilt directly (join trees, multi-connection, unknown/partial connectors).
 """
-from storage_mode import FALLBACK_LAND_TO_DELTA, select_storage_mode
+from storage_mode import (
+    FALLBACK_ANALYSIS_SERVICES, FALLBACK_LAND_TO_DELTA, select_storage_mode)
 
 import pytest
 
@@ -70,12 +71,25 @@ def test_postgres_is_directquery_fully_supported():
     assert d["fully_supported"] is True
 
 
-def test_snowflake_is_directquery_but_not_fully_supported():
+def test_snowflake_is_directquery_fully_supported():
+    # Snowflake.Databases(server, warehouse) + database/schema/table navigation is auto-emitted,
+    # so Snowflake is a fully-supported DirectQuery rebuild (navigation doc-informed; live
+    # reconciliation pending -- no live Snowflake instance in the validation environment).
     d = select_storage_mode(_desc(connection_class="snowflake"))
     assert d["mode"] == "DirectQuery"
     assert d["connector"] == "Snowflake.Databases"
-    assert d["fully_supported"] is False
-    assert any("snowflake.databases" in f.lower() for f in d["manual_followups"])
+    assert d["fully_supported"] is True
+    assert d["fallback"] is None
+
+
+def test_oracle_is_directquery_fully_supported():
+    # Oracle.Database(server, [HierarchicalNavigation=false]) + flat schema/item navigation is
+    # auto-emitted (server-only signature verified from the official M reference).
+    d = select_storage_mode(_desc(connection_class="oracle"))
+    assert d["mode"] == "DirectQuery"
+    assert d["connector"] == "Oracle.Database"
+    assert d["fully_supported"] is True
+    assert d["fallback"] is None
 
 
 def test_flat_file_is_import_scaffold():
@@ -125,9 +139,13 @@ def test_no_columns_falls_back():
 @pytest.mark.parametrize("cls,connector", [
     ("sqlserver", "Sql.Database"),
     ("azure_sqldb", "Sql.Database"),
+    ("azure_sql_dw", "Sql.Database"),       # Azure Synapse Analytics (TDS protocol)
     ("postgres", "PostgreSQL.Database"),
     ("mysql", "MySQL.Database"),
     ("redshift", "AmazonRedshift.Database"),
+    ("oracle", "Oracle.Database"),
+    ("snowflake", "Snowflake.Databases"),
+    ("databricks", "Databricks.Catalogs"),
 ])
 def test_fully_supported_family_is_directquery(cls, connector):
     d = select_storage_mode(_desc(connection_class=cls))
@@ -137,15 +155,35 @@ def test_fully_supported_family_is_directquery(cls, connector):
     assert d["fallback"] is None
 
 
+def test_databricks_directquery_flags_httppath_followup():
+    # Databricks emits a doc-verified shape, but the SQL-warehouse HTTP path + catalog can't be
+    # sourced portably from the .tds, so the decision surfaces a loud manual follow-up.
+    d = select_storage_mode(_desc(connection_class="databricks"))
+    assert d["mode"] == "DirectQuery"
+    assert d["fully_supported"] is True
+    assert any("httppath" in f.lower() for f in d["manual_followups"])
+
+
+@pytest.mark.parametrize("cls", ["msolap", "sqlserver-analysis-services"])
+def test_analysis_services_is_model_migration_not_relational_fallback(cls):
+    # SSAS / MSOLAP is already a semantic model: no Import/DirectQuery rebuild, and NOT the
+    # relational land-to-Delta path -- it gets its own model-migration routing + rationale.
+    d = select_storage_mode(_desc(connection_class=cls))
+    assert d["mode"] is None
+    assert d["connector"] is None
+    assert d["fallback"] == FALLBACK_ANALYSIS_SERVICES
+    assert d["fallback"] != FALLBACK_LAND_TO_DELTA
+    assert "model" in d["rationale"].lower()
+    assert any("xmla" in f.lower() or "semantic-model" in f.lower() for f in d["manual_followups"])
+
+
 @pytest.mark.parametrize("cls,connector", [
-    ("oracle", "Oracle.Database"),
     ("teradata", "Teradata.Database"),
-    ("snowflake", "Snowflake.Databases"),
     ("bigquery", "GoogleBigQuery.Database"),
 ])
 def test_partial_live_connector_is_directquery_scaffold(cls, connector):
-    # Recognized connector, DirectQuery chosen, but M is a flagged scaffold (signature/navigation
-    # differs from the (server, database) family), so it is not fully supported.
+    # Recognized connector, DirectQuery chosen, but M is a flagged scaffold (its navigation or
+    # required identifiers aren't verified offline), so it is not fully supported.
     d = select_storage_mode(_desc(connection_class=cls))
     assert d["mode"] == "DirectQuery"
     assert d["connector"] == connector
@@ -158,7 +196,7 @@ def test_partial_live_connector_is_directquery_scaffold(cls, connector):
 def test_decision_always_carries_score_and_recommended_mode():
     paths = [
         _desc(),                                                              # live, fully supported
-        _desc(connection_class="snowflake"),                                 # live, partial scaffold
+        _desc(connection_class="bigquery"),                                  # live, partial scaffold
         _desc(is_extract=True),                                              # extract
         _desc(connection_class="excel-direct", server=None, database=None),  # flat file
         _desc(connection_class="saphana"),                                   # unknown -> fallback
@@ -172,7 +210,7 @@ def test_decision_always_carries_score_and_recommended_mode():
 
 def test_score_ranks_full_above_partial_above_fallback():
     full = select_storage_mode(_desc())
-    partial = select_storage_mode(_desc(connection_class="snowflake"))
+    partial = select_storage_mode(_desc(connection_class="bigquery"))
     fallback = select_storage_mode(_desc(connection_class="saphana"))
     assert full["score"] > partial["score"] > fallback["score"]
 

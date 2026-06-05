@@ -109,11 +109,34 @@ SNOWFLAKE = """<?xml version='1.0' encoding='utf-8' ?>
   <connection class='federated'>
     <named-connections>
       <named-connection caption='acct' name='snowflake.a'>
-        <connection class='snowflake' dbname='ANALYTICS' server='acct.snowflakecomputing.com' />
+        <connection class='snowflake' dbname='ANALYTICS' server='acct.snowflakecomputing.com'
+                    warehouse='COMPUTE_WH' />
       </named-connection>
     </named-connections>
     <relation name='ORDERS' table='[PUBLIC].[ORDERS]' type='table' />
     <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>SALES</remote-name><local-name>[SALES]</local-name>
+        <parent-name>[ORDERS]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+ORACLE = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Ora' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='ora' name='oracle.a'>
+        <connection class='oracle' server='oradb.example.com:1521/ORCL' username='app' />
+      </named-connection>
+    </named-connections>
+    <relation name='ORDERS' table='[SALES].[ORDERS]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>ORDER_ID</remote-name><local-name>[ORDER_ID]</local-name>
+        <parent-name>[ORDERS]</parent-name><local-type>string</local-type>
+      </metadata-record>
       <metadata-record class='column'>
         <remote-name>SALES</remote-name><local-name>[SALES]</local-name>
         <parent-name>[ORDERS]</parent-name><local-type>real</local-type>
@@ -135,6 +158,46 @@ TERADATA = """<?xml version='1.0' encoding='utf-8' ?>
       <metadata-record class='column'>
         <remote-name>SALES</remote-name><local-name>[SALES]</local-name>
         <parent-name>[ORDERS]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+# Azure Synapse Analytics (Tableau class 'azure_sql_dw') speaks the SQL Server TDS protocol, so
+# it binds through Sql.Database exactly like sqlserver / azure_sqldb.
+SYNAPSE = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Syn' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='syn' name='azure_sql_dw.a'>
+        <connection class='azure_sql_dw' dbname='WideWorld' server='syn.sql.azuresynapse.net' />
+      </named-connection>
+    </named-connections>
+    <relation name='Orders' table='[dbo].[Orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+# Databricks: host + SQL-warehouse HTTP path, Unity Catalog catalog in dbname, [schema].[table].
+DATABRICKS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Dbx' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='dbx' name='databricks.a'>
+        <connection class='databricks' dbname='main' server='adb-123.azuredatabricks.net'
+                    http-path='/sql/1.0/warehouses/abc123' />
+      </named-connection>
+    </named-connections>
+    <relation name='ORDERS' table='[sales].[orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>amount</remote-name><local-name>[amount]</local-name>
+        <parent-name>[orders]</parent-name><local-type>real</local-type>
       </metadata-record>
     </metadata-records>
   </connection>
@@ -365,11 +428,48 @@ def test_emit_custom_sql_uses_native_query_with_folding():
     assert '""Region""' in body
 
 
-def test_emit_snowflake_is_scaffold_not_wrong_m():
+def test_emit_oracle_table_is_deploy_ready_server_only_m():
+    # Oracle.Database is server-only (service/SID embedded in the server); flat schema/item
+    # navigation with hierarchy off. No unused #"Database" parameter is carried.
+    d = parse_tds(ORACLE)
+    assert d["connection_class"] == "oracle"
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert 'Source = Oracle.Database(#"Server", [HierarchicalNavigation=false])' in body
+    assert 'Source{[Schema="SALES", Item="ORDERS"]}[Data]' in body
+    assert "TODO" not in body
+    assert '#"Database"' not in body            # Oracle's database is in the server string
+    params = emit_connection_parameters(d)
+    assert 'expression Server = "oradb.example.com:1521/ORCL"' in params
+    assert "Database" not in params             # no unused database parameter
+
+
+def test_emit_snowflake_table_is_deploy_ready_three_level_navigation():
+    # Snowflake.Databases(server, warehouse) then database -> schema -> table, keyed by [Name, Kind].
     d = parse_tds(SNOWFLAKE)
+    assert d["connection_class"] == "snowflake"
+    assert d["warehouse"] == "COMPUTE_WH"
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert 'Source = Snowflake.Databases(#"Server", #"Warehouse")' in body
+    assert 'Source{[Name="ANALYTICS", Kind="Database"]}[Data]' in body
+    assert 'Db{[Name="PUBLIC", Kind="Schema"]}[Data]' in body
+    assert 'Schema{[Name="ORDERS", Kind="Table"]}[Data]' in body
+    assert "TODO" not in body
+    assert "Sql.Database" not in body
+    # the warehouse is parameterized (declared from the .tds), not hardcoded into the call.
+    params = emit_connection_parameters(d)
+    assert 'expression Warehouse = "COMPUTE_WH"' in params
+    assert 'expression Server = "acct.snowflakecomputing.com"' in params
+    assert "Database" not in params             # Snowflake reaches the database by navigation
+
+
+def test_emit_snowflake_scaffolds_when_database_missing():
+    # Without a resolvable database the first navigation hop can't be built -> scaffold, not a guess.
+    d = parse_tds(SNOWFLAKE)
+    d["database"] = None
     body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
     assert "TODO" in body
-    assert "Sql.Database" not in body   # must not emit the wrong connector
+    assert "Snowflake.Databases" in body
+    assert "[Name=" not in body
 
 
 # Each fully-supported connector takes the verified `(server, database)` signature, so the
@@ -388,12 +488,11 @@ def test_emit_fully_supported_connector_dispatch(cls, connector):
     assert 'Source{[Schema="dbo", Item="Orders"]}[Data]' in body
 
 
-# Recognized-but-partial connectors map to the right M function NAME, but their real signature
-# differs from `(server, database)`, so the body must be a named scaffold, never a guessed call.
+# Recognized connectors we deliberately do NOT auto-emit yet: the body must be a named scaffold
+# that hints the intended connector, never a guessed call (Teradata's navigation selector and
+# BigQuery's identifiers aren't verifiable offline).
 @pytest.mark.parametrize("cls,connector", [
-    ("oracle", "Oracle.Database"),        # Oracle.Database(server, [options]) -- server only
-    ("teradata", "Teradata.Database"),    # Teradata.Database(server, [options]) -- server only
-    ("snowflake", "Snowflake.Databases"), # server + warehouse navigation
+    ("teradata", "Teradata.Database"),
     ("bigquery", "GoogleBigQuery.Database"),
 ])
 def test_emit_partial_connector_is_named_scaffold_not_guessed_m(cls, connector):
@@ -420,6 +519,72 @@ def test_emit_teradata_parsed_is_named_scaffold():
     body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
     assert "TODO" in body
     assert "Teradata.Database" in body
+    assert "Sql.Database" not in body
+    assert '(#"Server", #"Database")' not in body
+
+
+def test_emit_synapse_is_deploy_ready_sql_database():
+    # Azure Synapse Analytics speaks the SQL Server TDS protocol -> Sql.Database, byte-identical
+    # to the sqlserver / azure_sqldb path.
+    d = parse_tds(SYNAPSE)
+    assert d["connection_class"] == "azure_sql_dw"
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert 'Source = Sql.Database(#"Server", #"Database")' in body
+    assert 'Source{[Schema="dbo", Item="Orders"]}[Data]' in body
+    assert "TODO" not in body
+    params = emit_connection_parameters(d)
+    assert 'expression Server = "syn.sql.azuresynapse.net"' in params
+    assert 'expression Database = "WideWorld"' in params
+
+
+def test_emit_databricks_table_is_deploy_ready_catalogs_navigation():
+    # Databricks.Catalogs(host, httpPath) then catalog -> schema -> table, keyed [Name, Kind]
+    # (catalog level is Kind="Database"). Server + HttpPath are parameterized; no Database param.
+    d = parse_tds(DATABRICKS)
+    assert d["connection_class"] == "databricks"
+    assert d["http_path"] == "/sql/1.0/warehouses/abc123"
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert 'Source = Databricks.Catalogs(#"Server", #"HttpPath")' in body
+    assert 'Source{[Name="main", Kind="Database"]}[Data]' in body
+    assert 'Db{[Name="sales", Kind="Schema"]}[Data]' in body
+    assert 'Schema{[Name="orders", Kind="Table"]}[Data]' in body
+    assert "TODO" not in body
+    assert "Sql.Database" not in body
+    params = emit_connection_parameters(d)
+    assert 'expression Server = "adb-123.azuredatabricks.net"' in params
+    assert 'expression HttpPath = "/sql/1.0/warehouses/abc123"' in params
+    assert "Database" not in params            # the catalog is reached by navigation
+
+
+def test_emit_databricks_scaffolds_when_catalog_missing():
+    # Without a resolvable catalog (the first navigation hop) we scaffold rather than guess.
+    d = parse_tds(DATABRICKS)
+    d["database"] = None
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert "TODO" in body
+    assert "Databricks.Catalogs" in body
+    assert "[Name=" not in body
+
+
+def test_emit_databricks_custom_sql_is_scaffold():
+    # Native SQL folding for Databricks isn't auto-emitted (only the (server, database) family is),
+    # so a custom-SQL relation is a named scaffold, never a guessed Value.NativeQuery.
+    rel = {"kind": "custom_sql", "name": "Q", "item": "Q", "sql": "SELECT 1", "columns": []}
+    body = emit_m_partition_source(rel, {"connection_class": "databricks"}, "DirectQuery")
+    assert "TODO" in body
+    assert "Databricks.Catalogs" in body
+    assert "Value.NativeQuery" not in body
+
+
+# Analysis Services (SSAS / MSOLAP) is already a tabular/multidimensional model -- never a naive
+# M partition. It is flagged for the separate model-migration path, not emitted as upstream M.
+@pytest.mark.parametrize("cls", ["msolap", "sqlserver-analysis-services"])
+def test_emit_analysis_services_is_flagged_scaffold_not_m(cls):
+    rel = {"kind": "table", "name": "Sales", "item": "Sales", "schema": "", "columns": []}
+    body = emit_m_partition_source(rel, {"connection_class": cls}, "DirectQuery")
+    assert "TODO" in body
+    assert "Analysis Services" in body
+    assert "model" in body.lower()
     assert "Sql.Database" not in body
     assert '(#"Server", #"Database")' not in body
 
@@ -461,6 +626,20 @@ def test_connection_details_bind_type_for_teradata():
         {"connection_class": "teradata", "server": "td.example.com", "database": "ANALYTICS"})
     assert details["bind_type"] == "Teradata"
     assert details["path"] == "td.example.com;ANALYTICS"
+
+
+def test_connection_details_bind_type_for_synapse():
+    details = connection_details_for_bind(
+        {"connection_class": "azure_sql_dw", "server": "syn.sql.azuresynapse.net", "database": "Pool"})
+    assert details["bind_type"] == "SQL"
+    assert details["path"] == "syn.sql.azuresynapse.net;Pool"
+
+
+def test_connection_details_bind_type_for_databricks():
+    details = connection_details_for_bind(
+        {"connection_class": "databricks", "server": "adb.example.azuredatabricks.net", "database": "main"})
+    assert details["bind_type"] == "Databricks"
+    assert details["path"] == "adb.example.azuredatabricks.net;main"
 
 
 # -- azure_sqldb first-class path (live-validation target, pinned offline) ------

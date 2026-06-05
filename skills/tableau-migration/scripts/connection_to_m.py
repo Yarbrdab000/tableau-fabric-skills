@@ -14,8 +14,9 @@ land-to-Delta + DirectLake path:
 
 Honesty boundaries (validated by design review): column types come from Tableau metadata,
 never deferred to "Power BI will infer it"; join/union relation trees, multi-connection
-datasources, and connectors outside the Sql.Database family are detected and flagged for
-fallback rather than guessed. Credentials are NEVER read from or written to the output.
+datasources, and connectors whose M we can't yet emit with verified correctness are detected
+and flagged (scaffold / fallback) rather than guessed. Credentials are NEVER read from or
+written to the output.
 """
 from __future__ import annotations
 
@@ -24,10 +25,14 @@ import xml.etree.ElementTree as ET
 
 try:  # works whether imported as a package or run with scripts/ on sys.path
     from .tmdl_generate import clean_col, generate_column_tmdl, q
-    from .storage_mode import FLAT_FILE_CLASSES, PARTIAL_LIVE_CONNECTORS, SQL_DATABASE_FAMILY
+    from .storage_mode import (
+        ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
+        PARTIAL_LIVE_CONNECTORS, connector_spec)
 except ImportError:
     from tmdl_generate import clean_col, generate_column_tmdl, q
-    from storage_mode import FLAT_FILE_CLASSES, PARTIAL_LIVE_CONNECTORS, SQL_DATABASE_FAMILY
+    from storage_mode import (
+        ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
+        PARTIAL_LIVE_CONNECTORS, connector_spec)
 
 
 # -- type mapping --------------------------------------------------------------
@@ -104,10 +109,12 @@ def _named_connections(datasource):
 
 
 def _live_connection(datasource):
-    """Return (class, server, dbname, named_connection_count) for the live source.
+    """Return (class, server, dbname, warehouse, http_path, named_connection_count) for the live source.
 
     Descends through a ``federated`` wrapper into the inner named-connection. Falls back to
-    a direct ``<connection>`` on the datasource for the older non-federated layout.
+    a direct ``<connection>`` on the datasource for the older non-federated layout. ``warehouse``
+    is the Snowflake compute warehouse; ``http_path`` is the Databricks SQL-warehouse HTTP path
+    (best-effort -- ``None`` when the attribute isn't present / for other connectors).
     """
     named = _named_connections(datasource)
     inner_conns = []
@@ -115,12 +122,14 @@ def _live_connection(datasource):
         inner_conns.extend(_children_local(nc, "connection"))
     if inner_conns:
         c = inner_conns[0]
-        return (c.get("class"), c.get("server"), c.get("dbname"), len(named))
+        return (c.get("class"), c.get("server"), c.get("dbname"),
+                c.get("warehouse"), c.get("http-path"), len(named))
     # non-federated: first <connection> that is not the federated wrapper
     for c in _children_local(datasource, "connection"):
         if (c.get("class") or "").lower() != "federated":
-            return (c.get("class"), c.get("server"), c.get("dbname"), 1)
-    return (None, None, None, len(named))
+            return (c.get("class"), c.get("server"), c.get("dbname"),
+                    c.get("warehouse"), c.get("http-path"), 1)
+    return (None, None, None, None, None, len(named))
 
 
 def _columns_by_parent(datasource):
@@ -267,7 +276,7 @@ def parse_tds(xml_text):
     datasource = root if _local(root.tag) == "datasource" else (
         _findall_local(root, "datasource") or [root])[0]
 
-    cls, server, dbname, nconns = _live_connection(datasource)
+    cls, server, dbname, warehouse, http_path, nconns = _live_connection(datasource)
     cols_by_parent = _columns_by_parent(datasource)
 
     relations = _extract_relations(datasource, cols_by_parent)
@@ -289,6 +298,8 @@ def parse_tds(xml_text):
         "connection_class": cls,
         "server": server,
         "database": dbname,
+        "warehouse": warehouse,
+        "http_path": http_path,
         "is_extract": is_extract,
         "named_connection_count": nconns,
         "relations": relations,
@@ -301,16 +312,31 @@ _PARAM_META = 'meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequire
 
 
 def emit_connection_parameters(descriptor):
-    """Emit ``expression Server/Database`` parameter TMDL for a relational descriptor.
+    """Emit ``expression Server``/``Database``/``Warehouse``/``HttpPath`` parameter TMDL for a
+    relational descriptor.
 
-    Returns an empty string when there is no server/database (e.g. flat files), so callers
-    can concatenate unconditionally.
+    Returns an empty string when there is no server/database (e.g. flat files), so callers can
+    concatenate unconditionally. ``Database`` is emitted only when it is an actual connect
+    argument (the ``(server, database)`` family); a server-only connector (Oracle) reaches its
+    database through the server string, while Snowflake and Databricks reach it by navigation, so
+    no unused ``#"Database"`` parameter is carried for them. ``Warehouse`` is emitted for
+    Snowflake; ``HttpPath`` for Databricks (its value is best-effort -- the .tds does not carry
+    the SQL-warehouse HTTP path portably, so it may be empty and require manual completion).
     """
+    spec = connector_spec(descriptor.get("connection_class"))
+    connect_style = spec[1] if spec else None
+    no_database = ("server_only", "server_warehouse", "server_httppath")
     lines = []
     if descriptor.get("server"):
         lines.append(f'expression Server = "{escape_m_string(descriptor["server"])}" {_PARAM_META}\n')
-    if descriptor.get("database"):
+    if descriptor.get("database") and connect_style not in no_database:
         lines.append(f'expression Database = "{escape_m_string(descriptor["database"])}" {_PARAM_META}\n')
+    if connect_style == "server_warehouse":
+        warehouse = escape_m_string(descriptor.get("warehouse") or "")
+        lines.append(f'expression Warehouse = "{warehouse}" {_PARAM_META}\n')
+    if connect_style == "server_httppath":
+        http_path = escape_m_string(descriptor.get("http_path") or "")
+        lines.append(f'expression HttpPath = "{http_path}" {_PARAM_META}\n')
     return "\n".join(lines)
 
 
@@ -318,27 +344,73 @@ def _m_mode_keyword(mode):
     return "directQuery" if (mode or "").lower() == "directquery" else "import"
 
 
+def _scaffold_source(cls, intended, detail):
+    """Return a clearly-flagged, valid-but-incomplete partition source.
+
+    Used for any connector/relation we will not auto-emit: it names the intended connector as a
+    hint but never emits a guessed upstream call, so the structure is valid TMDL that obviously
+    needs manual completion (never silently wrong).
+    """
+    hint = f" using {intended}" if intended else ""
+    return ("\t\t\t// TODO: complete the M partition for connector class "
+            f"'{cls or 'unknown'}'{hint} ({detail})\n"
+            '\t\t\tlet Source = null in Source')
+
+
+def _connect_expr(connector, connect_style):
+    """Build the right-hand side of ``Source = ...`` for a fully-supported connector.
+
+    Exhaustive on ``connect_style`` -- an unrecognized style raises rather than silently falling
+    back to the ``(server, database)`` form (which would emit wrong M for a different connector).
+    """
+    if connect_style == "server_database":  # SQL Server protocol family
+        return f'{connector}(#"Server", #"Database")'
+    if connect_style == "server_only":
+        # Oracle: service/SID is embedded in #"Server"; set the flat (non-hierarchical)
+        # navigation explicitly so the Schema/Item selector is correct rather than default-reliant.
+        return f'{connector}(#"Server", [HierarchicalNavigation=false])'
+    if connect_style == "server_warehouse":
+        return f'{connector}(#"Server", #"Warehouse")'
+    if connect_style == "server_httppath":  # Databricks SQL warehouse (host, httpPath)
+        return f'{connector}(#"Server", #"HttpPath")'
+    raise ValueError(f"unhandled connect_style {connect_style!r} for connector {connector!r}")
+
+
 def emit_m_partition_source(relation, descriptor, mode):
     """Emit the ``source = let ... in ...`` body for one relation's M partition.
 
-    Only the Sql.Database connector family is emitted as deploy-ready M; other connectors
-    return a clearly-commented scaffold so the structure is valid TMDL but obviously needs
-    manual completion (never silently wrong).
+    Deploy-ready, doc-verified M is emitted for the connectors in ``DIRECT_CONNECTORS`` (each
+    with its own connect signature + navigation); any other connector returns a clearly-commented
+    scaffold so the structure is valid TMDL but obviously needs manual completion (never silently
+    wrong). Custom SQL is emitted deploy-ready only for the ``(server, database)`` family, where
+    ``Value.NativeQuery`` folds against the database handle.
     """
     cls = (descriptor.get("connection_class") or "").lower()
-    connector = SQL_DATABASE_FAMILY.get(cls)
-    if connector is None:
-        # Recognized-but-partial / flat-file / unknown: name the intended connector as a hint
-        # but never emit a guessed `(server, database)` call when the real signature differs.
+    if cls in ANALYSIS_SERVICES_CLASSES:
+        # SSAS / MSOLAP is already a tabular/multidimensional model -- never emit a naive M
+        # partition for it; flag it for the separate model-migration path.
+        return _scaffold_source(
+            cls, None,
+            "Microsoft Analysis Services is already a tabular/multidimensional semantic model; "
+            "migrate the model directly (XMLA endpoint / semantic-model import), not as an M partition")
+    spec = connector_spec(cls)
+    if spec is None:
         intended = PARTIAL_LIVE_CONNECTORS.get(cls) or FLAT_FILE_CLASSES.get(cls)
-        hint = f" using {intended}" if intended else ""
-        return ("\t\t\t// TODO: complete the M partition for connector class "
-                f"'{cls or 'unknown'}'{hint} "
-                "(signature/navigation differs from the supported (server, database) family; "
-                "not auto-emitted in v1)\n"
-                '\t\t\tlet Source = null in Source')
+        if cls in PARTIAL_LIVE_CONNECTORS:
+            detail = "recognized connector, but its navigation/identifiers aren't verified offline; complete manually"
+        elif cls in FLAT_FILE_CLASSES:
+            detail = f"flat-file source; set the file path (and sheet/range) for the {intended} partition"
+        else:
+            detail = "connector class not mapped for direct M; route to land-to-Delta + DirectLake"
+        return _scaffold_source(cls, intended, detail)
+
+    connector, connect_style, nav_style = spec
 
     if relation["kind"] == "custom_sql":
+        if connect_style != "server_database":
+            return _scaffold_source(
+                cls, connector,
+                "custom SQL native query for this connector isn't auto-emitted; complete it manually")
         sql = escape_m_string(relation.get("sql", ""))
         # EnableFolding lets DirectQuery push the native query down to the source.
         return (
@@ -349,12 +421,42 @@ def emit_m_partition_source(relation, descriptor, mode):
             "\t\t\t\tResult"
         )
 
+    source = _connect_expr(connector, connect_style)
+
+    if nav_style == "database_schema_table":
+        # Snowflake / Databricks: database(or catalog) -> schema -> table, each hop keyed by
+        # [Name, Kind] (the catalog level is keyed Kind="Database"). The first hop needs the
+        # database/catalog name; without it + the schema the navigation can't be resolved, so we
+        # scaffold rather than guess.
+        database = descriptor.get("database")
+        schema = relation.get("schema")
+        item = relation["item"]
+        if not database or not schema:
+            return _scaffold_source(
+                cls, connector,
+                f"{connector} navigation needs the database/catalog + schema names; "
+                "not resolvable from this .tds")
+        db, sch, it = escape_m_string(database), escape_m_string(schema), escape_m_string(item)
+        return (
+            "let\n"
+            f'\t\t\t\tSource = {source},\n'
+            f'\t\t\t\tDb = Source{{[Name="{db}", Kind="Database"]}}[Data],\n'
+            f'\t\t\t\tSchema = Db{{[Name="{sch}", Kind="Schema"]}}[Data],\n'
+            f'\t\t\t\tData = Schema{{[Name="{it}", Kind="Table"]}}[Data]\n'
+            "\t\t\tin\n"
+            "\t\t\t\tData"
+        )
+
+    if nav_style != "schema_item":
+        raise ValueError(f"unhandled nav_style {nav_style!r} for connector {connector!r}")
+
+    # schema_item: flat ADO.NET navigation (SQL Server family + Oracle).
     schema = relation.get("schema") or "dbo"
     item = relation["item"]
     nav = f'Source{{[Schema="{escape_m_string(schema)}", Item="{escape_m_string(item)}"]}}[Data]'
     return (
         "let\n"
-        f'\t\t\t\tSource = {connector}(#"Server", #"Database"),\n'
+        f'\t\t\t\tSource = {source},\n'
         f"\t\t\t\tData = {nav}\n"
         "\t\t\tin\n"
         "\t\t\t\tData"
@@ -433,12 +535,14 @@ def build_m_field_resolver(descriptor):
 _BIND_TYPE = {
     "sqlserver": "SQL",
     "azure_sqldb": "SQL",
+    "azure_sql_dw": "SQL",        # Azure Synapse Analytics binds via the SQL data-source type
     "postgres": "PostgreSql",
     "oracle": "Oracle",
     "mysql": "MySql",
     "redshift": "AmazonRedshift",
     "teradata": "Teradata",
     "snowflake": "Snowflake",
+    "databricks": "Databricks",
     "bigquery": "GoogleBigQuery",
 }
 

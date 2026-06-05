@@ -27,32 +27,68 @@ surfaced as ``manual_followups``.
 """
 from __future__ import annotations
 
-# Connector classes whose M shape we can emit with confidence in v1. Membership is gated on
-# one verified fact (from the Microsoft Power Query M docs): the connector takes the
-# `<Connector>.Database(server, database)` shape and uses `Source{[Schema=..,Item=..]}[Data]`
-# navigation, so the two-argument emission is correct rather than guessed.
-SQL_DATABASE_FAMILY = {
-    "sqlserver": "Sql.Database",
-    "azure_sqldb": "Sql.Database",  # Azure SQL Database speaks the SQL Server protocol -> same connector
-    "postgres": "PostgreSQL.Database",
-    "mysql": "MySQL.Database",
-    "redshift": "AmazonRedshift.Database",
+# Connectors whose M we emit as deploy-ready, doc-verified partitions (never a guessed
+# scaffold). Each entry is `(function, connect_style, nav_style)` -- the two style facts are
+# what make the emission correct rather than guessed:
+#
+#   connect_style:
+#     "server_database"  -> Fn(#"Server", #"Database")                  (SQL Server protocol family)
+#     "server_only"      -> Fn(#"Server", [HierarchicalNavigation=false])  (Oracle: service/SID is
+#                            in the server string; flat schema navigation, hierarchy off)
+#     "server_warehouse" -> Fn(#"Server", #"Warehouse")                 (Snowflake)
+#     "server_httppath"  -> Fn(#"Server", #"HttpPath")                  (Databricks SQL warehouse)
+#   nav_style:
+#     "schema_item"            -> Source{[Schema=.., Item=..]}[Data]     (flat ADO.NET navigation)
+#     "database_schema_table"  -> 3 hops keyed by [Name=.., Kind=..]     (Snowflake + Databricks)
+#
+# Verified facts (Microsoft Power Query M / connector docs):
+#  * Sql/PostgreSQL/MySQL/AmazonRedshift.Database take (server, database) + flat [Schema, Item].
+#    Azure SQL Database / Azure Synapse Analytics (dedicated + serverless SQL pool) / Azure SQL
+#    Managed Instance / Microsoft Fabric SQL endpoints all speak the SQL Server TDS protocol, so
+#    they bind through Sql.Database too (MI + Fabric use the Tableau 'sqlserver' class; Synapse
+#    uses 'azure_sql_dw').
+#  * Oracle.Database(server, [options]) is server-only; HierarchicalNavigation defaults false,
+#    so the flat [Schema, Item] navigation (schema = owner) applies. We set it explicitly.
+#  * Snowflake connector: connection inputs are Server + Warehouse; navigation is
+#    database -> schema -> table. (Snowflake.Databases has no M function reference page, so its
+#    navigation selectors are doc-informed; live reconciliation is pending -- see docs.)
+#  * Databricks.Catalogs(host, httpPath, [options]) (official MS doc): navigation is
+#    catalog -> schema -> table, and the catalog hop is keyed Kind="Database" -- byte-identical
+#    to Snowflake's [Name, Kind] navigation, so it reuses "database_schema_table". The HTTP path
+#    is a connection parameter (#"HttpPath") that is not stored portably in the .tds; live
+#    reconciliation is pending (no live Databricks instance).
+DIRECT_CONNECTORS = {
+    "sqlserver":    ("Sql.Database",            "server_database",  "schema_item"),
+    "azure_sqldb":  ("Sql.Database",            "server_database",  "schema_item"),  # Azure SQL Database (SQL Server protocol)
+    "azure_sql_dw": ("Sql.Database",            "server_database",  "schema_item"),  # Azure Synapse Analytics (class-string web-verified; TDS->Sql.Database is the verified fact)
+    "postgres":     ("PostgreSQL.Database",     "server_database",  "schema_item"),
+    "mysql":        ("MySQL.Database",          "server_database",  "schema_item"),
+    "redshift":     ("AmazonRedshift.Database", "server_database",  "schema_item"),
+    "oracle":       ("Oracle.Database",         "server_only",      "schema_item"),
+    "snowflake":    ("Snowflake.Databases",     "server_warehouse", "database_schema_table"),
+    "databricks":   ("Databricks.Catalogs",     "server_httppath",  "database_schema_table"),
 }
 
-# Live connectors that are recognized (verified Tableau class -> M function) but whose M
-# signature or navigation differs from the `(server, database)` family, so emitting a
-# two-argument call blind would be wrong. We pick a mode but mark it not fully supported and
-# emit a clearly-flagged scaffold (or fall back) rather than guessing the call body.
+# Recognized live connectors that are deliberately NOT auto-emitted yet: their navigation
+# selector or required identifiers cannot be verified offline, so emitting a call body would be
+# a guess. We pick a mode but mark it not fully supported and emit a clearly-flagged scaffold
+# that names the intended connector. Promotion is gated on doc-verified correctness.
 PARTIAL_LIVE_CONNECTORS = {
-    # Server-only signature: `<Connector>.Database(server, [options])` -- no (server, database)
-    # form (database is reached by navigation), so the family's 2-arg emission does not apply.
-    "oracle": "Oracle.Database",
+    # Teradata.Database(server, [options]) is server-only (signature verified), but the exact
+    # navigation selector (flat [Schema, Item] vs [Name]-keyed database/table hops) is not
+    # established from an official source, so it stays a scaffold pending real navigator evidence.
     "teradata": "Teradata.Database",
-    # Differently-shaped: Snowflake.Databases(server, [warehouse]) and
-    # GoogleBigQuery.Database(location) use multi-level navigation, not Schema/Item.
-    "snowflake": "Snowflake.Databases",
+    # GoogleBigQuery.Database([BillingProject=..]) has no server and an ambiguous
+    # billing-project vs project mapping in the .tds, so the project/dataset/table navigation
+    # can't be resolved offline -- scaffold pending a real BigQuery datasource.
     "bigquery": "GoogleBigQuery.Database",
 }
+
+# Microsoft Analysis Services (SSAS / MSOLAP). This is NOT a relational datasource we rebuild
+# into an M partition: the source is ALREADY a tabular/multidimensional semantic model. It needs
+# a separate model-migration path (e.g. XMLA / semantic-model import), so we recognize it, route
+# it away from both the M emitters and the land-to-Delta pipeline, and flag it explicitly.
+ANALYSIS_SERVICES_CLASSES = {"msolap", "sqlserver-analysis-services"}
 
 FLAT_FILE_CLASSES = {
     "excel-direct": "Excel.Workbook",
@@ -63,9 +99,26 @@ FLAT_FILE_CLASSES = {
 
 # Connector classes a hyper extract may sit over; used only to report whether a live
 # alternative exists for an extracted datasource.
-_LIVE_CLASSES = set(SQL_DATABASE_FAMILY) | set(PARTIAL_LIVE_CONNECTORS)
+_LIVE_CLASSES = set(DIRECT_CONNECTORS) | set(PARTIAL_LIVE_CONNECTORS)
+
+
+def connector_spec(cls):
+    """Return the ``(function, connect_style, nav_style)`` spec for a fully-supported direct
+    connector class, or ``None`` if the class is not auto-emitted (scaffold / flat / unknown)."""
+    return DIRECT_CONNECTORS.get((cls or "").lower())
+
+
+def connector_function(cls):
+    """Return the Power Query M function for a connector class (fully-supported or recognized
+    scaffold), or ``None`` if the class is unmapped."""
+    cls = (cls or "").lower()
+    spec = DIRECT_CONNECTORS.get(cls)
+    return spec[0] if spec else PARTIAL_LIVE_CONNECTORS.get(cls)
 
 FALLBACK_LAND_TO_DELTA = "land-to-delta-directlake"
+# Analysis Services is a finished semantic model, not a datasource to rebuild -- it gets its own
+# routing label so callers don't mistake it for the relational land-to-Delta fallback.
+FALLBACK_ANALYSIS_SERVICES = "analysis-services-model-migration"
 
 # Confidence scores (0-100) for the scored recommendation: higher == less manual remapping.
 # They rank feasibility, not data quality -- a fully-supported live connector needs the least
@@ -80,6 +133,10 @@ NATIVE_QUERY_PENALTY = 10     # custom-SQL native query needs a folding review b
 _CREDENTIALS_FOLLOWUP = "Configure connection credentials in Fabric (bind links IDs only)."
 _GATEWAY_FOLLOWUP = "If the source is on-premises, set up / select a data gateway for the connection."
 _NATIVE_QUERY_FOLLOWUP = "Review the preserved custom SQL native query (folding / approval) before refresh."
+# Databricks emits a doc-verified function shape, but two values can't be sourced portably from
+# the .tds: the SQL-warehouse HTTP path and (depending on the workbook) the Unity Catalog name.
+_DATABRICKS_FOLLOWUP = ('Databricks: set the SQL-warehouse HTTP Path parameter (#"HttpPath") and confirm '
+                        "the catalog name (mapped from the Tableau database) matches your Unity Catalog catalog.")
 
 
 def _decision(mode, connector, **kw):
@@ -137,6 +194,24 @@ def select_storage_mode(descriptor):
     cls = (descriptor.get("connection_class") or "").lower()
     uses_native = _has_custom_sql(descriptor)
     base_followups = [_CREDENTIALS_FOLLOWUP]
+    if cls == "databricks":
+        base_followups = base_followups + [_DATABRICKS_FOLLOWUP]
+
+    # 0. Analysis Services (SSAS / MSOLAP): the source is already a tabular/multidimensional
+    #    semantic model. It is NOT a datasource->M rebuild and must NOT be routed to the
+    #    relational land-to-Delta path -- migrate the model directly (XMLA / semantic model).
+    if cls in ANALYSIS_SERVICES_CLASSES:
+        return _decision(
+            None, None,
+            fallback=FALLBACK_ANALYSIS_SERVICES,
+            score=SCORE_FALLBACK,
+            rationale=(f"Microsoft Analysis Services ({cls}) is already a tabular/multidimensional "
+                       "semantic model, not a datasource to rebuild; migrate the model directly "
+                       "(XMLA endpoint / semantic-model import) rather than emitting an M partition."),
+            manual_followups=base_followups + [
+                "Migrate the SSAS/MSOLAP model via its XMLA endpoint or a semantic-model import; "
+                "do not rebuild it from a datasource M query."],
+        )
 
     # 1. structurally unsupported -> fall back to the proven land-to-Delta path.
     reason = _structurally_unsupported_reason(descriptor)
@@ -172,9 +247,9 @@ def select_storage_mode(descriptor):
 
     # 4. extract enabled -> Import snapshot; offer live alternative when the connector is live.
     if descriptor.get("is_extract"):
-        connector = SQL_DATABASE_FAMILY.get(cls) or PARTIAL_LIVE_CONNECTORS.get(cls)
+        connector = connector_function(cls)
         live_available = cls in _LIVE_CLASSES
-        fully = cls in SQL_DATABASE_FAMILY
+        fully = cls in DIRECT_CONNECTORS
         followups = list(base_followups)
         if uses_native:
             followups.append(_NATIVE_QUERY_FOLLOWUP)
@@ -192,8 +267,8 @@ def select_storage_mode(descriptor):
         )
 
     # 5. live relational -> DirectQuery.
-    connector = SQL_DATABASE_FAMILY.get(cls) or PARTIAL_LIVE_CONNECTORS.get(cls)
-    fully = cls in SQL_DATABASE_FAMILY
+    connector = connector_function(cls)
+    fully = cls in DIRECT_CONNECTORS
     followups = base_followups + [_GATEWAY_FOLLOWUP]
     if uses_native:
         followups.append(_NATIVE_QUERY_FOLLOWUP)
