@@ -57,10 +57,13 @@ returning ``None`` so the caller keeps an inert ``= 0`` stub.
 The original Tableau formula is preserved as a ``TableauFormula`` annotation by the renderer
 either way.
 
-Table calculations are intentionally NOT translated here: their result depends on the
-worksheet's Compute-Using / addressing / sort, which lives in the workbook (``.twb``), not the
-datasource (``.tds``) this skill operates on. They become tractable once worksheets are parsed
-(roadmap v2). FIXED LODs, by contrast, are datasource-level semantics and ARE translated.
+Table calculations are translated by a SEPARATE seam, translate_tableau_table_calc_to_dax, because
+their result depends on the worksheet's Compute-Using / addressing / sort, which lives in the
+workbook (``.twb``), not the datasource (``.tds``) this module parses. That entry point therefore
+takes the partition/order spec explicitly and emits the modern-DAX window-function pattern
+(INDEX -> ROWNUMBER; RUNNING_*/WINDOW_* -> WINDOW; LOOKUP -> OFFSET); the orchestrator/viz layer
+supplies the real addressing once worksheets are parsed. FIXED LODs, by contrast, are
+datasource-level semantics and are translated inline by the measure path above.
 
 Known semantic notes:
   * Emitted comparison/arithmetic operators follow DAX's BLANK coercion (an empty aggregation
@@ -161,6 +164,26 @@ _DATEDIFF_UNITS = {
     "day": "DAY", "month": "MONTH", "year": "YEAR", "quarter": "QUARTER",
     "hour": "HOUR", "minute": "MINUTE", "second": "SECOND",
 }
+
+# ---------------------------------------------------------------------------
+# Table calculations (translate_tableau_table_calc_to_dax). These depend on the
+# worksheet's addressing (Compute-Using partition + sort), which lives in the .twb,
+# NOT the .tds. So this is a SEAM: the caller passes the partition/order spec
+# explicitly and we emit the modern-DAX window-function pattern. Each window/offset
+# function omits its <relation> argument, which per the DAX spec defaults to
+# ALLSELECTED() of the ORDERBY()/PARTITIONBY() columns -- the standard measure form.
+# A RUNNING_/WINDOW_ aggregate is re-evaluated per addressed row via CALCULATE (context
+# transition) and folded with the matching iterator, mirroring the FIXED-LOD pattern.
+# ---------------------------------------------------------------------------
+_TABLECALC_X = {            # RUNNING_*: partition start -> current row
+    "RUNNING_SUM": "SUMX", "RUNNING_AVG": "AVERAGEX",
+    "RUNNING_MIN": "MINX", "RUNNING_MAX": "MAXX",
+}
+_TABLECALC_WINDOW_X = {     # WINDOW_*: entire partition (first -> last row)
+    "WINDOW_SUM": "SUMX", "WINDOW_AVG": "AVERAGEX",
+    "WINDOW_MIN": "MINX", "WINDOW_MAX": "MAXX",
+}
+_TABLE_CALCS = {"INDEX", "LOOKUP"} | set(_TABLECALC_X) | set(_TABLECALC_WINDOW_X)
 
 
 class _CalcError(Exception):
@@ -1028,6 +1051,128 @@ def translate_tableau_calc_to_column_dax(formula, resolver):
         if not toks:
             return None, "empty formula", tables_used
         dax, _dtype = _Parser(toks, resolver, tables_used, mode="column").parse()
+        if len(tables_used) > 1:
+            return None, "cross-table terms (fields span multiple tables)", tables_used
+        leak = validate_dax(dax)
+        if leak:
+            return None, f"emit guardrail: {leak}", tables_used
+        return dax, "ok", tables_used
+    except _CalcError as e:
+        return None, str(e), tables_used
+
+
+def _orderby_clause(order_by, resolver, tables_used):
+    # order_by items are a caption or a (caption, "ASC"|"DESC") pair. An explicit order is
+    # REQUIRED for every table calc (the window functions omit <relation>, so DAX requires an
+    # ORDERBY). Returns None when no order is supplied -> the caller falls back.
+    parts = []
+    for item in order_by:
+        if isinstance(item, (tuple, list)):
+            cap = item[0]
+            direction = str(item[1]).upper() if len(item) > 1 and item[1] else "ASC"
+        else:
+            cap, direction = item, "ASC"
+        if direction not in ("ASC", "DESC"):
+            raise _CalcError(f"invalid sort direction {direction!r}")
+        resolved = resolver(cap)
+        if resolved is None:
+            raise _CalcError(f"unresolved/ambiguous order-by field [{cap}]")
+        table, col, _ty = resolved
+        tables_used.add(table)
+        parts.append(f"{_dax_table(table)}{_dax_col(col)}, {direction}")
+    if not parts:
+        return None
+    return "ORDERBY(" + ", ".join(parts) + ")"
+
+
+def _partitionby_clause(partition_by, resolver, tables_used):
+    cols = []
+    for cap in partition_by:
+        resolved = resolver(cap)
+        if resolved is None:
+            raise _CalcError(f"unresolved/ambiguous partition field [{cap}]")
+        table, col, _ty = resolved
+        tables_used.add(table)
+        cols.append(f"{_dax_table(table)}{_dax_col(col)}")
+    if not cols:
+        return None
+    return "PARTITIONBY(" + ", ".join(cols) + ")"
+
+
+def _emit_table_calc(name, p, spec):
+    # p is a measure-context _Parser positioned just after the table-calc's '('. spec is the
+    # "ORDERBY(...)[, PARTITIONBY(...)]" addressing tail shared by every window function.
+    if name == "INDEX":
+        p._expect_op(")")
+        # Tableau INDEX() is the 1-based row position within the partition.
+        return f"ROWNUMBER({spec})"
+    inner = p._expr()  # measure-context inner (must be an aggregate, else it falls back)
+    if name in _TABLECALC_X or name in _TABLECALC_WINDOW_X:
+        aggx = _TABLECALC_X.get(name) or _TABLECALC_WINDOW_X[name]
+        if aggx in ("SUMX", "AVERAGEX") and inner[1] != "number":
+            raise _CalcError(f"{name} requires a numeric expression")
+        if aggx in ("MINX", "MAXX") and inner[1] not in ("number", "date"):
+            raise _CalcError(f"{name} requires a numeric/date expression")
+        p._expect_op(")")
+        # RUNNING_*: from the partition's first row (1, ABS) to the current row (0, REL).
+        # WINDOW_*:  the whole partition, first row (1, ABS) to last row (-1, ABS).
+        bounds = "1, ABS, 0, REL" if name in _TABLECALC_X else "1, ABS, -1, ABS"
+        return f"{aggx}(WINDOW({bounds}, {spec}), CALCULATE({inner[0]}))"
+    if name == "LOOKUP":
+        p._expect_op(",")
+        offset = p._expect_number(p._expr())
+        p._expect_op(")")
+        # Tableau LOOKUP(expr, offset): value of expr at a row offset (signed) from the current
+        # row along the addressing -> OFFSET picks that row, CALCULATE re-evaluates expr there.
+        return f"CALCULATE({inner[0]}, OFFSET({offset[0]}, {spec}))"
+    raise _CalcError(f"unsupported table calculation {name}")
+
+
+def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), order_by=()):
+    """Translate a Tableau TABLE CALCULATION to a modern-DAX window-function measure.
+
+    Same (dax|None, reason, tables_used) shape as the other entry points, plus the explicit
+    addressing a table calc needs (and which the .tds does not carry): ``partition_by`` is an
+    iterable of field captions (Tableau's Compute-Using partition) and ``order_by`` is an
+    iterable of captions or ``(caption, "ASC"|"DESC")`` pairs (the addressing sort). An order
+    spec is REQUIRED; without one the calc falls back.
+
+    Supported (the inner expression is translated in measure context, so it must be an
+    aggregation):
+      * ``INDEX()`` -> ``ROWNUMBER(ORDERBY(...)[, PARTITIONBY(...)])``
+      * ``RUNNING_SUM/AVG/MIN/MAX(<agg>)`` -> ``<X>(WINDOW(1, ABS, 0, REL, <spec>), CALCULATE(<agg>))``
+      * ``WINDOW_SUM/AVG/MIN/MAX(<agg>)``  -> ``<X>(WINDOW(1, ABS, -1, ABS, <spec>), CALCULATE(<agg>))``
+      * ``LOOKUP(<agg>, offset)`` -> ``CALCULATE(<agg>, OFFSET(offset, <spec>))``
+    Each window function omits its <relation> argument; per the DAX spec that defaults to
+    ``ALLSELECTED()`` of the ORDERBY/PARTITIONBY columns, so the result is correct when the
+    measure is evaluated against the marks the addressing describes. RANK/FIRST/LAST and other
+    forms fall back for now.
+
+    This is the DAX-pattern side of the seam; the orchestrator/viz layer supplies the real
+    addressing once worksheets are parsed. Cross-table terms (inner + addressing spanning more
+    than one table) fall back, consistent with the measure path.
+    """
+    tables_used = set()
+    f = (formula or "").strip()
+    if not f:
+        return None, "empty formula", tables_used
+    try:
+        toks = _tokenize(f)
+        if len(toks) < 3 or toks[0][0] != "id" or toks[1] != ("op", "("):
+            return None, "not a table calculation", tables_used
+        name = toks[0][1].upper()
+        if name not in _TABLE_CALCS:
+            return None, f"unsupported table calculation {toks[0][1]}", tables_used
+        order_clause = _orderby_clause(order_by, resolver, tables_used)
+        if order_clause is None:
+            return None, "table calc requires an explicit order-by spec", tables_used
+        part_clause = _partitionby_clause(partition_by, resolver, tables_used)
+        spec = order_clause if part_clause is None else f"{order_clause}, {part_clause}"
+        p = _Parser(toks, resolver, tables_used, mode="measure")
+        p.pos = 2  # consume the table-calc name and '('
+        dax = _emit_table_calc(name, p, spec)
+        if p.pos != len(toks):
+            raise _CalcError("unexpected trailing tokens after table calculation")
         if len(tables_used) > 1:
             return None, "cross-table terms (fields span multiple tables)", tables_used
         leak = validate_dax(dax)

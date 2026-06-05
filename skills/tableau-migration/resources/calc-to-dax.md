@@ -132,6 +132,37 @@ formatting/parsing), and the start-of-week-dependent `DATEPART("week"/"weekday")
 
 ---
 
+## Table calculations (addressing seam)
+
+A Tableau **table calc** (`RUNNING_SUM`, `WINDOW_*`, `INDEX`, `LOOKUP`, …) depends on the worksheet's
+*Compute-Using* — the partition (addressing) and sort — which lives in the `.twb`, **not** the `.tds`.
+So `translate_tableau_table_calc_to_dax(formula, resolver, partition_by, order_by)` is a **seam**: the
+caller passes the addressing explicitly and the function emits the modern-DAX window-function pattern.
+The orchestrator/viz layer fills in `partition_by`/`order_by` once worksheets are parsed.
+
+```python
+from calc_to_dax import translate_tableau_table_calc_to_dax
+# partition_by: list of field captions; order_by: captions or (caption, "ASC"|"DESC") pairs
+dax, reason, tables_used = translate_tableau_table_calc_to_dax(formula, resolver, partition_by, order_by)
+```
+
+An **order spec is required** (the window functions omit their `<relation>` argument, which per the DAX
+spec defaults to `ALLSELECTED()` of the `ORDERBY()`/`PARTITIONBY()` columns). The inner expression is
+translated in **measure context**, so it must be an aggregation.
+
+| Tableau table calc | DAX emitted (spec = `ORDERBY(…)[, PARTITIONBY(…)]`) | Notes |
+|---|---|---|
+| `INDEX()` | `ROWNUMBER(spec)` | 1-based row position in the partition |
+| `RUNNING_SUM/AVG/MIN/MAX(agg)` | `SUMX/AVERAGEX/MINX/MAXX(WINDOW(1, ABS, 0, REL, spec), CALCULATE(agg))` | Partition start → current row |
+| `WINDOW_SUM/AVG/MIN/MAX(agg)` | `…(WINDOW(1, ABS, -1, ABS, spec), CALCULATE(agg))` | Whole partition (first → last) |
+| `LOOKUP(agg, offset)` | `CALCULATE(agg, OFFSET(offset, spec))` | Signed offset along the order |
+
+`RANK`/`FIRST`/`LAST`/`PREVIOUS_VALUE` and other forms fall back for now. Cross-table terms (inner +
+addressing spanning more than one table) fall back, consistent with the measure path. A missing order
+spec falls back with a clear reason.
+
+---
+
 ## Static type checking
 
 The parser tracks a data type per node — `number`, `text`, `date`, or `bool` — and falls back on any
@@ -159,11 +190,11 @@ IF SUM([Sales]) > 0 THEN SUM([Profit]) ELSE 0 END        → IF(SUM('Orders'[Sal
 
 ## What falls back (stub, formula preserved)
 
-LOD expressions (`{FIXED/INCLUDE/EXCLUDE}`), table calcs (`WINDOW_*`, `RUNNING_*`, `RANK`, `LOOKUP`,
-`INDEX`), scalar date/string/regex functions, a row-level operand inside a scalar math function or `CASE`,
-a `CASE` with mixed result types, nested arithmetic *inside* an aggregation,
-4-arg `IIF`, references to other calcs, unresolved/ambiguous fields, and **cross-table** terms (a formula
-whose fields span more than one model table) all return `None`.
+LOD `INCLUDE`/`EXCLUDE` expressions, unsupported table calcs (`RANK`, `FIRST`/`LAST`, `PREVIOUS_VALUE`)
+and table calcs with no addressing spec, `SPLIT`/`TRIM` and other non-faithful row functions, 4-arg
+`IIF`, references to other calcs, unresolved/ambiguous fields, and **cross-table** terms (a formula whose
+fields span more than one model table) all return `None`. (`{FIXED}` LODs and the supported table-calc and
+row-level forms above do translate — via their respective entry points.)
 
 > **Cross-table fallback is intentional.** Even when a relationship path exists, the DAX filter context is
 > not guaranteed to reproduce Tableau's blended result, so those measures are stubbed rather than guessed.

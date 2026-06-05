@@ -417,3 +417,91 @@ def test_column_with_no_field_has_empty_tables_used():
     assert reason == "ok"
     assert tables == set()  # no field refs -> bindable anywhere
 
+
+# ---------------------------------------------------------------------------
+# Table calculations: translate_tableau_table_calc_to_dax. The caller supplies the
+# addressing (partition + order) that the .tds does not carry; the seam emits the
+# modern-DAX window-function pattern. order_by is required.
+# ---------------------------------------------------------------------------
+from calc_to_dax import translate_tableau_table_calc_to_dax  # noqa: E402
+
+_ORDER = ["Order Date"]
+_PART = ["Region"]
+
+
+def _tc(formula, partition_by=(), order_by=_ORDER):
+    return translate_tableau_table_calc_to_dax(formula, _resolver, partition_by, order_by)[0]
+
+
+TABLE_CALC_TRANSLATIONS = [
+    # (formula, partition_by, order_by, expected)
+    ("INDEX()", _PART, _ORDER,
+     "ROWNUMBER(ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region]))"),
+    ("INDEX()", (), [("Order Date", "DESC")],
+     "ROWNUMBER(ORDERBY('Orders'[Order_Date], DESC))"),               # no partition, desc sort
+    ("RUNNING_SUM(SUM([Sales]))", _PART, _ORDER,
+     "SUMX(WINDOW(1, ABS, 0, REL, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("RUNNING_AVG(SUM([Sales]))", _PART, _ORDER,
+     "AVERAGEX(WINDOW(1, ABS, 0, REL, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("RUNNING_MAX(MIN([Order Date]))", (), _ORDER,
+     "MAXX(WINDOW(1, ABS, 0, REL, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(MIN('Orders'[Order_Date])))"),                        # date inner is allowed for MAX
+    ("WINDOW_SUM(SUM([Sales]))", _PART, _ORDER,
+     "SUMX(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("LOOKUP(SUM([Sales]), -1)", (), _ORDER,
+     "CALCULATE(SUM('Orders'[Sales]), OFFSET(-(1), ORDERBY('Orders'[Order_Date], ASC)))"),
+]
+
+
+@pytest.mark.parametrize(
+    "formula,partition_by,order_by,expected",
+    TABLE_CALC_TRANSLATIONS,
+    ids=[t[0] for t in TABLE_CALC_TRANSLATIONS],
+)
+def test_table_calc_translates(formula, partition_by, order_by, expected):
+    assert translate_tableau_table_calc_to_dax(formula, _resolver, partition_by, order_by)[0] == expected
+
+
+TABLE_CALC_FALLBACKS = [
+    # (formula, order_by) -- everything here must return None
+    ("RUNNING_SUM(SUM([Sales]))", ()),            # no order spec
+    ("RANK(SUM([Sales]))", _ORDER),               # RANK not in the supported seam
+    ("PREVIOUS_VALUE(SUM([Sales]))", _ORDER),     # unsupported table calc
+    ("SUM([Sales])", _ORDER),                     # not a table calc
+    ("RUNNING_SUM([Sales])", _ORDER),             # bare row-level inner (not an aggregate)
+    ("RUNNING_SUM(SUM([Region]))", _ORDER),       # SUM on a string inner
+    ("RUNNING_AVG(MIN([Order Date]))", _ORDER),   # AVG of a date inner is invalid
+    ("INDEX(SUM([Sales]))", _ORDER),              # INDEX takes no argument
+    ("LOOKUP(SUM([Sales]))", _ORDER),             # LOOKUP missing its offset
+]
+
+
+@pytest.mark.parametrize("formula,order_by", TABLE_CALC_FALLBACKS, ids=[repr(f[0]) for f in TABLE_CALC_FALLBACKS])
+def test_table_calc_falls_back(formula, order_by):
+    assert translate_tableau_table_calc_to_dax(formula, _resolver, (), order_by)[0] is None
+
+
+def test_table_calc_cross_table_falls_back():
+    # Inner field (People) and addressing (Orders) span two tables -> fallback.
+    dax, reason, _ = translate_tableau_table_calc_to_dax(
+        "RUNNING_SUM(SUM([People Count]))", _resolver, (), _ORDER)
+    assert dax is None
+    assert "cross-table" in reason
+
+
+def test_table_calc_unresolved_order_field_falls_back():
+    dax, reason, _ = translate_tableau_table_calc_to_dax("INDEX()", _resolver, (), ["Nope"])
+    assert dax is None
+    assert "order-by" in reason
+
+
+def test_every_emitted_table_calc_passes_the_guardrail():
+    for formula, partition_by, order_by, _ in TABLE_CALC_TRANSLATIONS:
+        dax = translate_tableau_table_calc_to_dax(formula, _resolver, partition_by, order_by)[0]
+        assert dax is not None
+        assert validate_dax(dax) == ""
+
+
