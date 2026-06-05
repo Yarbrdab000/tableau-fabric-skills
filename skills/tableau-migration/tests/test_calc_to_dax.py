@@ -505,3 +505,43 @@ def test_every_emitted_table_calc_passes_the_guardrail():
         assert validate_dax(dax) == ""
 
 
+# ---------------------------------------------------------------------------
+# Real-datasource reconciliation targets (offline fixtures).
+#
+# These pin the DAX our translator must emit for ACTUAL calculated fields in the
+# live "Superstore" Tableau datasource (Azure SQL; Orders / People / Returns), so
+# the integrator's post-merge live pass can ExecuteQueries-reconcile each measure
+# against its Tableau VizQL Data Service value. The committed suite stays fully
+# offline/deterministic -- only the formula->DAX fact is locked here, never a live
+# value. The returned (dax, reason, tables_used) triple IS the reconciliation
+# contract: `dax` is executed via ExecuteQuery; `tables_used` names the source
+# table the VDS aggregates for the Tableau-side value. Append newly discovered
+# real calcs to the list -- each is reconciled the same way.
+# See resources/validation-reconciliation.md.
+# ---------------------------------------------------------------------------
+REAL_SUPERSTORE_MEASURES = [
+    # (measure_name, tableau_formula, expected_dax, expected_tables_used)
+    (
+        "Profit Ratio",
+        "SUM([Profit])/SUM([Sales])",
+        "DIVIDE(SUM('Orders'[Profit]), SUM('Orders'[Sales]))",
+        {"Orders"},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "name,formula,expected_dax,expected_tables",
+    REAL_SUPERSTORE_MEASURES,
+    ids=[m[0] for m in REAL_SUPERSTORE_MEASURES],
+)
+def test_real_superstore_measure_reconciliation_contract(name, formula, expected_dax, expected_tables):
+    # Lock the full triple the live reconciliation binds to: dax -> ExecuteQuery,
+    # tables_used -> which VDS table supplies the Tableau-side comparison value.
+    dax, reason, tables = translate_tableau_calc_to_dax(formula, _resolver)
+    assert dax == expected_dax
+    assert reason == "ok"
+    assert tables == expected_tables
+    assert validate_dax(dax) == ""
+
+

@@ -232,6 +232,27 @@ So every measure — translated or stubbed — carries its original Tableau form
 
 ---
 
+## Live reconciliation targets (real Superstore)
+
+The public triple `(dax, reason, tables_used)` is exactly the contract the
+[validation-reconciliation](validation-reconciliation.md) step binds to. For the live **Superstore**
+datasource (Azure SQL; `Orders` / `People` / `Returns`), the real calculated field
+**Profit Ratio** = `SUM([Profit])/SUM([Sales])` translates to:
+
+| Signal | Value | Used by reconciliation |
+|---|---|---|
+| `dax` | `DIVIDE(SUM('Orders'[Profit]), SUM('Orders'[Sales]))` | `ExecuteQuery`: `EVALUATE ROW("Profit Ratio", [Profit Ratio])` |
+| `reason` | `ok` | translated-vs-stub status in the report |
+| `tables_used` | `{Orders}` | which table the VizQL Data Service aggregates for the Tableau-side value |
+
+Reconcile under the **same filter context** on both sides — e.g. the grand total `SUM(Profit)/SUM(Sales)`
+over all rows — and compare with a small relative epsilon (it is a float ratio). This formula→DAX fact is
+pinned as an offline fixture (`REAL_SUPERSTORE_MEASURES` in `tests/test_calc_to_dax.py`); the committed suite
+stays fully offline and the integrator runs the single authoritative live pass post-merge. Append further
+real calcs to that fixture as they are discovered — each is reconciled the same way.
+
+---
+
 ## DAX quality alignment (delegated)
 
 The translator already prefers `DIVIDE()` over `/` and fully qualifies every column as `'Table'[Column]`,
