@@ -17,8 +17,10 @@ Translates a SAFE subset of Tableau calculated fields into working DAX measures:
   * scalar math over NUMERIC (aggregated) operands: ABS, ROUND (1-arg -> ROUND(x, 0)),
     CEILING(x) -> CEILING(x, 1), FLOOR(x) -> FLOOR(x, 1), POWER, SQRT, SQUARE(x) ->
     POWER(x, 2), SIGN, EXP, LOG (base-10, or 2-arg LOG(x, base)), LN, DIV(a, b) ->
-    QUOTIENT(a, b), PI(), and the trig family SIN/COS/TAN/ASIN/ACOS/ATAN/COT
+    QUOTIENT(a, b), PI(), the trig family SIN/COS/TAN/ASIN/ACOS/ATAN/COT, and
+    DEGREES/RADIANS (radian<->degree conversion)
   * comparison operators: = == <> != > >= < <=  (== -> = ; != -> <>)
+  * set membership: x IN (a, b, ...) -> x IN { a, b, ... } (one consistent element type)
   * boolean logic: AND -> && , OR -> || , NOT(x)
   * null handling: ZN(x) -> COALESCE(x, 0) ; IFNULL(a, b) -> COALESCE(a, b) ;
     ISNULL(x) -> ISBLANK(x)
@@ -122,6 +124,7 @@ _NUMERIC_TYPES = {"int64", "double", "decimal"}
 _MATH_1 = {
     "ABS", "SQRT", "SIGN", "EXP", "LN",
     "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "COT",
+    "DEGREES", "RADIANS",
 }
 _MATH_1_SIG = {"CEILING": "1", "FLOOR": "1"}
 _MATH_2 = {"POWER": "POWER", "DIV": "QUOTIENT", "MOD": "MOD"}
@@ -419,6 +422,8 @@ class _Parser:
 
     def _cmp(self):
         left = self._add()
+        if self._is_kw("IN"):
+            return self._in_list(left)
         k, v = self._peek()
         if k == "cmp":
             self._next()
@@ -428,6 +433,25 @@ class _Parser:
                 raise _CalcError("incomparable types in comparison")
             return (f"{left[0]} {v} {right[0]}", "bool")
         return left
+
+    def _in_list(self, left):
+        # Tableau `x IN (a, b, ...)` -> DAX `x IN { a, b, ... }` (set membership). Every list
+        # element must share the operand's type; a boolean operand or a mixed-type list falls
+        # back. In a measure a bare row-level operand already fails before reaching IN.
+        self._next()  # IN
+        self._expect_op("(")
+        if left[1] == "bool":
+            raise _CalcError("IN requires a non-boolean operand")
+        items = [self._expr()]
+        while self._peek() == ("op", ","):
+            self._next()
+            items.append(self._expr())
+        self._expect_op(")")
+        for it in items:
+            if it[1] != left[1]:
+                raise _CalcError("IN list element type does not match the operand")
+        joined = ", ".join(it[0] for it in items)
+        return (f"{left[0]} IN {{{joined}}}", "bool")
 
     def _add(self):
         left = self._mul()

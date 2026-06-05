@@ -4,7 +4,8 @@ Started from the Play 4 notebook self-test cell (aggregation + arithmetic safe
 subset) and extended to cover the conditional/null-handling grammar: IF/ELSEIF/ELSE,
 IIF, comparisons, AND/OR/NOT, ZN/IFNULL/ISNULL, string literals, scalar math over
 aggregated operands (ABS/ROUND/CEILING/FLOOR/POWER/SQUARE/SQRT/SIGN/EXP/LOG/LN/DIV/PI
-and the SIN/COS/TAN/ASIN/ACOS/ATAN/COT trig family), and
+and the SIN/COS/TAN/ASIN/ACOS/ATAN/COT trig family plus DEGREES/RADIANS), the IN
+set-membership operator, and
 CASE/WHEN -> SWITCH (searched and simple forms). They lock the deterministic translator's behavior: the supported subset must produce the documented
 DAX, and everything outside it (including type-inconsistent or non-boolean-condition
 forms) must fall back (return None) so the caller keeps an inert ``= 0`` stub.
@@ -146,6 +147,10 @@ TRANSLATIONS = [
     ("ACOS(SUM([Sales]))", "ACOS(SUM('Orders'[Sales]))"),
     ("ATAN(SUM([Sales]))", "ATAN(SUM('Orders'[Sales]))"),
     ("COT(SUM([Sales]))", "COT(SUM('Orders'[Sales]))"),
+    ("DEGREES(SUM([Sales]))", "DEGREES(SUM('Orders'[Sales]))"),   # radians -> degrees
+    ("RADIANS(SUM([Sales]))", "RADIANS(SUM('Orders'[Sales]))"),   # degrees -> radians
+    # IN -> DAX set membership over a list literal (operand stays an aggregate here)
+    ("SUM([Quantity]) IN (1, 2, 3)", "SUM('Orders'[Quantity]) IN {1, 2, 3}"),
     # scalar math composes with arithmetic and nests (operands stay numeric)
     ("ABS(SUM([Profit])) / SUM([Sales])",
      "DIVIDE(ABS(SUM('Orders'[Profit])), SUM('Orders'[Sales]))"),
@@ -227,6 +232,12 @@ FALLBACKS = [
     "SIN([Sales])",                               # bare row-level operand in a trig fn
     'COS("x")',                                   # non-numeric trig operand
     "CEILING(SUM([Region]))",                     # SUM on string fails before CEILING
+    "DEGREES([Sales])",                           # bare row-level operand (measure context)
+    "DEGREES(SUM([Region]))",                     # SUM on string fails before DEGREES
+    # --- IN operator fallbacks (measure-context / type violations) ---
+    '[Region] IN ("East", "West")',               # bare row-level field -> invalid in a measure
+    'SUM([Quantity]) IN (1, "x")',                # mixed-type IN list
+    "SUM([Sales]) > 0 IN (1, 2)",                 # IN cannot follow a boolean comparison
     # --- CASE/WHEN fallbacks (measure-context / type violations) ---
     "CASE END",                                   # no WHEN clause
     "CASE WHEN SUM([Sales]) THEN 1 ELSE 0 END",   # non-boolean searched condition
@@ -303,7 +314,11 @@ COLUMN_TRANSLATIONS = [
     ("[Sales] + [Profit]", "'Orders'[Sales] + 'Orders'[Profit]"),
     ("ABS([Profit])", "ABS('Orders'[Profit])"),
     ("ROUND([Sales], 2)", "ROUND('Orders'[Sales], 2)"),
+    ("DEGREES([Sales])", "DEGREES('Orders'[Sales])"),                  # scalar math over a row field
     ('IF [Sales] > 100 THEN "high" ELSE "low" END', 'IF(\'Orders\'[Sales] > 100, "high", "low")'),
+    ('[Region] IN ("East", "West")', '\'Orders\'[Region] IN {"East", "West"}'),  # set membership
+    ('IF [Region] IN ("East", "West") THEN 1 ELSE 0 END',
+     'IF(\'Orders\'[Region] IN {"East", "West"}, 1, 0)'),              # IN composes in a conditional
     # --- string functions ---
     ("UPPER([Region])", "UPPER('Orders'[Region])"),
     ("LOWER([Region])", "LOWER('Orders'[Region])"),
@@ -372,6 +387,8 @@ COLUMN_FALLBACKS = [
     "YEAR([Region])",                             # date function on text
     "INT([Region])",                              # numeric cast of text
     '[Region] + [Profit]',                        # text + number (mixed)
+    '[Region] IN ("East", 5)',                    # mixed-type IN list (text vs number)
+    '[Sales] IN ("East", "West")',                # numeric operand vs text list
     # cross-table row-level column (cannot span tables)
     "[Sales] + [People Count]",
 ]

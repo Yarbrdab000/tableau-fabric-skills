@@ -42,6 +42,7 @@ dax, reason, tables_used = translate_tableau_calc_to_dax(formula, resolver)
 | `CASE e WHEN v THEN r … [ELSE z] END` | `SWITCH(e, v, r, …, z)` | Simple form; `e` and values must be aggregated/literal |
 | `ABS/SQRT/SIGN/EXP/LN(x)` | same name, `FN(x)` | `x` must be numeric |
 | `SIN/COS/TAN/ASIN/ACOS/ATAN/COT(x)` | same name, `FN(x)` | Trig family; `x` numeric |
+| `DEGREES(x)` / `RADIANS(x)` | `DEGREES(x)` / `RADIANS(x)` | Radian↔degree conversion; `x` numeric |
 | `LOG(x)` / `LOG(x, base)` | `LOG(x)` / `LOG(x, base)` | 1-arg is base-10 |
 | `ROUND(x)` / `ROUND(x, n)` | `ROUND(x, 0)` / `ROUND(x, n)` | Tableau 1-arg `ROUND` → 0 decimals |
 | `CEILING(x)` / `FLOOR(x)` | `CEILING(x, 1)` / `FLOOR(x, 1)` | DAX requires a significance step |
@@ -49,6 +50,7 @@ dax, reason, tables_used = translate_tableau_calc_to_dax(formula, resolver)
 | `PI()` | `PI()` | Nullary numeric constant |
 | `= == <> != > >= < <=` | `=` / `<>` / `>` … | `==`→`=`, `!=`→`<>` |
 | `AND` / `OR` / `NOT(x)` | `&&` / `||` / `NOT(x)` | Operands must be boolean |
+| `x IN (a, b, …)` | `x IN { a, b, … }` | Set membership; one consistent element type |
 | `ZN(x)` | `COALESCE(x, 0)` | |
 | `IFNULL(a, b)` | `COALESCE(a, b)` | Branch types must match |
 | `ISNULL(x)` | `ISBLANK(x)` | |
@@ -175,9 +177,11 @@ mismatch, so it never emits DAX that would error or silently coerce:
   booleans); `AND`/`OR`/`NOT` require booleans.
 - `IF` / `IIF` / `IFNULL` branches must all return the **same** type.
 - Scalar math functions (`ABS`, `ROUND`, `CEILING`, `FLOOR`, `POWER`, `SQUARE`, `SQRT`, `SIGN`, `EXP`,
-  `LOG`, `LN`, `DIV`, `MOD`, `PI`, and the `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`/`COT` trig family) require
-  **numeric** operands, so a row-level field, a text/date operand, or wrong arity falls back. `STDEV`,
-  `STDEVP`, `VAR`, `VARP`, and `PERCENTILE` likewise require a numeric field.
+  `LOG`, `LN`, `DIV`, `MOD`, `PI`, the `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`/`COT` trig family, and
+  `DEGREES`/`RADIANS`) require **numeric** operands, so a row-level field, a text/date operand, or wrong
+  arity falls back. `STDEV`, `STDEVP`, `VAR`, `VARP`, and `PERCENTILE` likewise require a numeric field.
+- `x IN (a, b, …)` → `x IN { a, b, … }` (DAX set membership) requires every list element to share the
+  operand's type; a boolean operand or a mixed-type list falls back.
 - `CASE` → `SWITCH` needs **one** consistent result type across every `THEN`/`ELSE`; the simple form also
   requires each `WHEN` value to match the comparand's type. `CASE` is parsed like `IF` (it self-terminates
   at `END` and does not compose into surrounding arithmetic).
