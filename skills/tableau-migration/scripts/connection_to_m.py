@@ -366,8 +366,9 @@ def _connect_expr(connector, connect_style):
     if connect_style == "server_database":  # SQL Server protocol family
         return f'{connector}(#"Server", #"Database")'
     if connect_style == "server_only":
-        # Oracle: service/SID is embedded in #"Server"; set the flat (non-hierarchical)
-        # navigation explicitly so the Schema/Item selector is correct rather than default-reliant.
+        # Oracle / Teradata: the service/SID (Oracle) lives in #"Server" and there is no separate
+        # database argument; HierarchicalNavigation defaults false on both, so we set it explicitly
+        # so the flat Schema/Item selector is correct rather than default-reliant.
         return f'{connector}(#"Server", [HierarchicalNavigation=false])'
     if connect_style == "server_warehouse":
         return f'{connector}(#"Server", #"Warehouse")'
@@ -536,6 +537,7 @@ _BIND_TYPE = {
     "sqlserver": "SQL",
     "azure_sqldb": "SQL",
     "azure_sql_dw": "SQL",        # Azure Synapse Analytics binds via the SQL data-source type
+    "microsoft_fabric_sql_endpoint": "SQL",   # Fabric Warehouse / Lakehouse SQL endpoint (TDS)
     "postgres": "PostgreSql",
     "oracle": "Oracle",
     "mysql": "MySql",

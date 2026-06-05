@@ -140,10 +140,12 @@ def test_no_columns_falls_back():
     ("sqlserver", "Sql.Database"),
     ("azure_sqldb", "Sql.Database"),
     ("azure_sql_dw", "Sql.Database"),       # Azure Synapse Analytics (TDS protocol)
+    ("microsoft_fabric_sql_endpoint", "Sql.Database"),  # Fabric Warehouse / Lakehouse SQL endpoint
     ("postgres", "PostgreSQL.Database"),
     ("mysql", "MySQL.Database"),
     ("redshift", "AmazonRedshift.Database"),
     ("oracle", "Oracle.Database"),
+    ("teradata", "Teradata.Database"),      # server-only, reuses Oracle's verified flat nav
     ("snowflake", "Snowflake.Databases"),
     ("databricks", "Databricks.Catalogs"),
 ])
@@ -178,7 +180,6 @@ def test_analysis_services_is_model_migration_not_relational_fallback(cls):
 
 
 @pytest.mark.parametrize("cls,connector", [
-    ("teradata", "Teradata.Database"),
     ("bigquery", "GoogleBigQuery.Database"),
 ])
 def test_partial_live_connector_is_directquery_scaffold(cls, connector):
