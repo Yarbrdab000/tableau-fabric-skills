@@ -5,9 +5,19 @@ aggregation+arithmetic-only safe subset, then extended in-place into a typed
 recursive-descent parser that also covers conditional and null-handling logic.
 
 Translates a SAFE subset of Tableau calculated fields into working DAX measures:
-  * aggregations over a single bare field: SUM, AVG, MIN, MAX, COUNT, COUNTD, MEDIAN
+  * aggregations over a single bare field: SUM, AVG, MIN, MAX, COUNT, COUNTD, MEDIAN,
+    STDEV/STDEVP (-> STDEV.S/STDEV.P), VAR/VARP (-> VAR.S/VAR.P), PERCENTILE([f], n)
+    (-> PERCENTILE.INC)
   * arithmetic between those terms / numeric literals: + - * /, parentheses, unary minus
   * conditional logic: IF/THEN/ELSEIF/ELSE/END and IIF(cond, a, b)
+  * CASE/WHEN -> SWITCH: searched form CASE WHEN c THEN r ... [ELSE z] END ->
+    SWITCH(TRUE(), c, r, ..., z) and simple form CASE e WHEN v THEN r ... [ELSE z] END ->
+    SWITCH(e, v, r, ..., z); measure-context-safe only (the comparand, values, and a single
+    consistent result type must be aggregations or literals)
+  * scalar math over NUMERIC (aggregated) operands: ABS, ROUND (1-arg -> ROUND(x, 0)),
+    CEILING(x) -> CEILING(x, 1), FLOOR(x) -> FLOOR(x, 1), POWER, SQRT, SQUARE(x) ->
+    POWER(x, 2), SIGN, EXP, LOG (base-10, or 2-arg LOG(x, base)), LN, DIV(a, b) ->
+    QUOTIENT(a, b), PI(), and the trig family SIN/COS/TAN/ASIN/ACOS/ATAN/COT
   * comparison operators: = == <> != > >= < <=  (== -> = ; != -> <>)
   * boolean logic: AND -> && , OR -> || , NOT(x)
   * null handling: ZN(x) -> COALESCE(x, 0) ; IFNULL(a, b) -> COALESCE(a, b) ;
@@ -29,9 +39,10 @@ whose branches return different types, an arithmetic op on a non-numeric term, o
 between incomparable types) so it never emits DAX that would error or silently coerce.
 
 Anything outside this subset (INCLUDE/EXCLUDE LODs, table calcs WINDOW_/RUNNING_/RANK/LOOKUP/
-INDEX/TOTAL, CASE/WHEN, scalar date/string functions, nested arithmetic inside an aggregation,
-4-arg IIF, references to other calcs, unresolved or ambiguous fields, cross-table terms)
-deterministically FALLS BACK by returning ``None`` so the caller keeps an inert ``= 0`` stub.
+INDEX/TOTAL, scalar date/string/regex functions, row-level operands inside a scalar math
+function or CASE, nested arithmetic inside an aggregation, 4-arg IIF, references to other
+calcs, unresolved or ambiguous fields, cross-table terms) deterministically FALLS BACK by
+returning ``None`` so the caller keeps an inert ``= 0`` stub.
 The original Tableau formula is preserved as a ``TableauFormula`` annotation by the renderer
 either way.
 
@@ -63,9 +74,15 @@ import re
 _AGG_MAP = {
     "SUM": "SUM", "AVG": "AVERAGE", "MIN": "MIN", "MAX": "MAX",
     "MEDIAN": "MEDIAN", "COUNT": "COUNTA", "COUNTD": "DISTINCTCOUNTNOBLANK",
+    "STDEV": "STDEV.S", "STDEVP": "STDEV.P", "VAR": "VAR.S", "VARP": "VAR.P",
 }
 # COUNT  -> COUNTA               (Tableau COUNT = non-null of ANY type; DAX COUNT errors on text)
 # COUNTD -> DISTINCTCOUNTNOBLANK (plain DISTINCTCOUNT counts BLANK -> off-by-one vs Tableau)
+# STDEV/VAR  -> STDEV.S/VAR.S    (Tableau STDEV/VAR are the SAMPLE statistics)
+# STDEVP/VARP-> STDEV.P/VAR.P    (the POPULATION statistics)
+
+# Aggregations that require a NUMERIC column (emit DAX that errors on text/date otherwise).
+_NUMERIC_ONLY_AGGS = {"SUM", "AVG", "MEDIAN", "STDEV", "STDEVP", "VAR", "VARP"}
 
 # Outer aggregation -> DAX iterator used to RE-AGGREGATE a FIXED LOD over its own grain:
 # SUMMARIZE materializes the LOD grain, CALCULATE re-enters row context for the inner measure.
@@ -76,6 +93,25 @@ _AGG_X = {
     "MEDIAN": "MEDIANX", "COUNT": "COUNTAX",
 }
 _NUMERIC_TYPES = {"int64", "double", "decimal"}
+
+# Scalar math functions that wrap a NUMERIC (aggregated) operand and stay valid in a measure
+# (they compose with the existing arithmetic). Operand(s) must be numeric or the whole calc
+# falls back. Most Tableau math names map identically to DAX, so we re-emit the (uppercased)
+# name; the handful that don't are listed explicitly below.
+#   _MATH_1     : single numeric operand -> FN(x). Includes the trig family; LN is natural log.
+#   _MATH_1_SIG : single numeric operand -> FN(x, <significance>). Tableau CEILING/FLOOR take
+#                 one argument (round to the nearest integer); DAX requires a significance step.
+#   _MATH_2     : two numeric operands -> DAXNAME(a, b). Tableau DIV (integer division) maps to
+#                 DAX QUOTIENT; POWER and MOD are identical.
+# Functions with their own arity/shape are handled directly in _scalar_fn: ROUND (1-or-2 arg),
+# LOG (1-arg base-10 or 2-arg LOG(x, base)), SQUARE(x) -> POWER(x, 2), and PI() (nullary).
+_MATH_1 = {
+    "ABS", "SQRT", "SIGN", "EXP", "LN",
+    "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "COT",
+}
+_MATH_1_SIG = {"CEILING": "1", "FLOOR": "1"}
+_MATH_2 = {"POWER": "POWER", "DIV": "QUOTIENT", "MOD": "MOD"}
+_SCALAR_MATH = _MATH_1 | set(_MATH_1_SIG) | set(_MATH_2) | {"ROUND", "LOG", "SQUARE", "PI"}
 
 
 class _CalcError(Exception):
@@ -233,6 +269,8 @@ class _Parser:
     def _expr(self):
         if self._is_kw("IF"):
             return self._if()
+        if self._is_kw("CASE"):
+            return self._case()
         return self._or()
 
     def _if(self):
@@ -363,6 +401,10 @@ class _Parser:
                 return self._ifnull()
             if u == "ISNULL":
                 return self._isnull()
+            if u in _SCALAR_MATH:
+                return self._scalar_fn(u)
+            if u == "PERCENTILE":
+                return self._percentile()
             raise _CalcError(f"unsupported function {v}")
         if k == "field":
             raise _CalcError("bare row-level field [..] not valid in a measure")
@@ -408,6 +450,111 @@ class _Parser:
         self._expect_op(")")
         return (f"ISBLANK({x[0]})", "bool")
 
+    def _scalar_fn(self, name):
+        # Scalar math over a NUMERIC (aggregated) operand. Each operand is parsed as a full
+        # expression but must be numeric: a bare row-level [field] (parse error in a measure),
+        # a text/date operand, or wrong arity all raise -> the whole calc falls back.
+        self._next()  # function name
+        self._expect_op("(")
+        if name == "PI":
+            # Nullary numeric constant; PI() composes with aggregates (e.g. SUM([x]) * PI()).
+            self._expect_op(")")
+            return ("PI()", "number")
+        x = self._expect_number(self._expr())
+        if name in _MATH_1:
+            self._expect_op(")")
+            return (f"{name}({x[0]})", "number")
+        if name in _MATH_1_SIG:
+            # DAX CEILING/FLOOR need a significance; Tableau's 1-arg form rounds to the integer.
+            self._expect_op(")")
+            return (f"{name}({x[0]}, {_MATH_1_SIG[name]})", "number")
+        if name == "SQUARE":
+            # DAX has no SQUARE; x squared is POWER(x, 2).
+            self._expect_op(")")
+            return (f"POWER({x[0]}, 2)", "number")
+        if name == "ROUND":
+            # Tableau ROUND(x) -> DAX ROUND(x, 0); ROUND(x, n) passes the digit count through.
+            if self._peek() == ("op", ","):
+                self._next()
+                digits = self._expect_number(self._expr())
+                self._expect_op(")")
+                return (f"ROUND({x[0]}, {digits[0]})", "number")
+            self._expect_op(")")
+            return (f"ROUND({x[0]}, 0)", "number")
+        if name == "LOG":
+            # Tableau LOG(x) is base 10 (so is DAX LOG(x)); LOG(x, base) passes the base through.
+            if self._peek() == ("op", ","):
+                self._next()
+                base = self._expect_number(self._expr())
+                self._expect_op(")")
+                return (f"LOG({x[0]}, {base[0]})", "number")
+            self._expect_op(")")
+            return (f"LOG({x[0]})", "number")
+        # Two-operand numeric functions: POWER(x, n) and DIV(a, b) -> QUOTIENT(a, b).
+        self._expect_op(",")
+        second = self._expect_number(self._expr())
+        self._expect_op(")")
+        return (f"{_MATH_2[name]}({x[0]}, {second[0]})", "number")
+
+    def _case(self):
+        # CASE/WHEN -> DAX SWITCH. Parsed at expression-statement level (like IF) so the END
+        # self-terminates the construct and it never composes into arithmetic (which would
+        # otherwise expose DAX's BLANK coercion on an unmatched no-ELSE CASE).
+        self._next()  # CASE
+        if self._is_kw("WHEN"):
+            return self._case_searched()
+        return self._case_simple()
+
+    def _case_searched(self):
+        # CASE WHEN c1 THEN r1 ... [ELSE z] END  ->  SWITCH(TRUE(), c1, r1, ..., z)
+        pairs = []
+        while self._is_kw("WHEN"):
+            self._next()
+            cond = self._expect_bool(self._or())
+            self._expect_kw("THEN")
+            pairs.append((cond[0], self._expr()))
+        return self._switch_emit("TRUE()", pairs)
+
+    def _case_simple(self):
+        # CASE e WHEN v1 THEN r1 ... [ELSE z] END  ->  SWITCH(e, v1, r1, ..., z)
+        # e and every v must be aggregations/literals of one consistent type (a bare row-level
+        # comparand like CASE [Region] WHEN ... is a parse error -> falls back).
+        comparand = self._or()
+        pairs = []
+        while self._is_kw("WHEN"):
+            self._next()
+            value = self._or()
+            if value[1] != comparand[1]:
+                raise _CalcError("CASE WHEN value type does not match the CASE expression")
+            self._expect_kw("THEN")
+            pairs.append((value[0], self._expr()))
+        return self._switch_emit(comparand[0], pairs)
+
+    def _switch_emit(self, head, pairs):
+        # Shared tail for both CASE forms: require >=1 WHEN, then a single consistent return type
+        # across every THEN branch and the optional ELSE (DAX SWITCH needs one return type; mixed
+        # number/text/etc. would error or silently coerce, so fall back instead).
+        if not pairs:
+            raise _CalcError("CASE requires at least one WHEN")
+        else_node = None
+        if self._is_kw("ELSE"):
+            self._next()
+            else_node = self._expr()
+        self._expect_kw("END")
+        rtype = pairs[0][1][1]
+        for _, result in pairs:
+            if result[1] != rtype:
+                raise _CalcError("CASE results return inconsistent types")
+        if else_node is not None and else_node[1] != rtype:
+            raise _CalcError("CASE/ELSE results return inconsistent types")
+        args = [head]
+        for key, result in pairs:
+            args.append(key)
+            args.append(result[0])
+        if else_node is not None:
+            args.append(else_node[0])
+        return (f"SWITCH({', '.join(args)})", rtype)
+
     def _agg(self):
         name = self._next()[1].upper()
         if name not in _AGG_MAP:
@@ -427,7 +574,7 @@ class _Parser:
             raise _CalcError(f"unresolved/ambiguous field [{v}]")
         table, col, tmdl_type = resolved
         # Reject aggregates invalid for the column's data type (would emit DAX that errors).
-        if name in ("SUM", "AVG", "MEDIAN") and tmdl_type not in _NUMERIC_TYPES:
+        if name in _NUMERIC_ONLY_AGGS and tmdl_type not in _NUMERIC_TYPES:
             raise _CalcError(f"{name} requires a numeric field, got {tmdl_type} for [{v}]")
         if name in ("MIN", "MAX") and tmdl_type not in (_NUMERIC_TYPES | {"dateTime"}):
             raise _CalcError(f"{name} requires a numeric/date field, got {tmdl_type} for [{v}]")
@@ -437,6 +584,28 @@ class _Parser:
         else:
             dtype = "number"  # SUM/AVG/MEDIAN/COUNT/COUNTD and numeric MIN/MAX
         return (f"{_AGG_MAP[name]}({_dax_table(table)}{_dax_col(col)})", dtype)
+
+    def _percentile(self):
+        # PERCENTILE([field], n) -> PERCENTILE.INC('T'[field], n). Aggregation over a single
+        # numeric field; n (the 0..1 fraction) must be numeric. A non-numeric field or a bare
+        # row-level / aggregated first argument falls back.
+        self._next()  # PERCENTILE
+        self._expect_op("(")
+        k, v = self._peek()
+        if k != "field":
+            raise _CalcError("PERCENTILE first argument must be a single bare [field]")
+        self._next()
+        self._expect_op(",")
+        n = self._expect_number(self._expr())
+        self._expect_op(")")
+        resolved = self.resolver(v)
+        if resolved is None:
+            raise _CalcError(f"unresolved/ambiguous field [{v}]")
+        table, col, tmdl_type = resolved
+        if tmdl_type not in _NUMERIC_TYPES:
+            raise _CalcError(f"PERCENTILE requires a numeric field, got {tmdl_type} for [{v}]")
+        self.tables_used.add(table)
+        return (f"PERCENTILE.INC({_dax_table(table)}{_dax_col(col)}, {n[0]})", "number")
 
     def _lod_core(self):
         # Parse a {FIXED d1, d2, ... : inner} body. Returns (table, [clean_cols], inner_node).
