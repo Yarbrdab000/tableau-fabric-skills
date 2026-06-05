@@ -29,6 +29,17 @@ nothing is silently dropped.
 The per-run audit lives in `report["model_objects"]` with `display_folders`, `hierarchies`, and `rls`
 sub-reports (`translated` / `manual_review` / `unwired`).
 
+### Field-reference shapes
+
+Every field reference parsed from the `.tds` — drill-path levels, folder items, calculation column
+names, and filter `column` attributes — is normalized to its **local token** before resolution. Real
+Tableau documents frequently **qualify** a reference with a leading connection/relation segment
+(`[Orders].[Category]`, `[sqlserver.0].[RegionFilter]`); the trailing bracketed segment is the local
+field name, so a qualified `[Orders].[Category]` and a bare `[Category]` resolve identically. The same
+normalization is applied to the calc column name and the data-source `<filter column>`, so RLS wiring
+matches regardless of whether either side is qualified. Folder `role` attributes and other decorative
+attributes are ignored.
+
 ---
 
 ## Hierarchies (Tableau drill paths → TMDL `hierarchy`)

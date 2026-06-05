@@ -324,3 +324,85 @@ def test_enrich_handles_quoted_member_names():
     tmdl = "table T\n\tcolumn 'Order ID'\n\t\tdataType: string\n\n\tpartition T = m\n"
     out = T.enrich_table_tmdl(tmdl, display_folders={"Order ID": "Keys"})
     assert 'displayFolder: "Keys"' in out
+
+
+# -- real .tds shape robustness ------------------------------------------------
+# Real Tableau ``.tds`` documents qualify field references with a leading connection /
+# relation segment (``[Orders].[Category]``), tag folders with a ``role`` attribute, and
+# store calculation formulas with surrounding whitespace / newlines. These fixtures are
+# synthetic but mirror those real shapes so the offline suite stays deterministic while
+# proving the derivation survives them. (Live validation against the real Superstore
+# datasource is done out-of-band; nothing here touches the network or any credential.)
+REAL_SHAPE_TDS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Superstore' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='srv' name='sqlserver.0'>
+        <connection class='sqlserver' dbname='Superstore' server='srv.example.com' />
+      </named-connection>
+    </named-connections>
+    <relation connection='sqlserver.0' name='Orders' table='[dbo].[Orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'><remote-name>Category</remote-name>
+        <local-name>[Category]</local-name><parent-name>[Orders]</parent-name><local-type>string</local-type></metadata-record>
+      <metadata-record class='column'><remote-name>Sub-Category</remote-name>
+        <local-name>[Sub-Category]</local-name><parent-name>[Orders]</parent-name><local-type>string</local-type></metadata-record>
+      <metadata-record class='column'><remote-name>Region</remote-name>
+        <local-name>[Region]</local-name><parent-name>[Orders]</parent-name><local-type>string</local-type></metadata-record>
+    </metadata-records>
+  </connection>
+  <drill-paths>
+    <drill-path name='Product Hierarchy'>
+      <field>[Orders].[Category]</field>
+      <field>[Orders].[Sub-Category]</field>
+    </drill-path>
+  </drill-paths>
+  <folder name='Geography' role='dimensions'>
+    <folder-item name='[Orders].[Region]' type='field' />
+  </folder>
+  <column name='[sqlserver.0].[RegionFilter]' caption='Region Access' datatype='boolean'>
+    <calculation class='tableau' formula='&#10;  [Orders].[Region] = USERNAME()  &#10;' /></column>
+  <filter class='categorical' column='[sqlserver.0].[RegionFilter]'>
+    <groupfilter function='member' level='[RegionFilter]' member='true' /></filter>
+</datasource>"""
+
+
+def test_field_token_takes_trailing_segment_of_qualified_reference():
+    assert T._field_token("[Orders].[Category]") == "Category"
+    assert T._field_token("[Category]") == "Category"           # simple stays simple
+    assert T._field_token("[a].[b].[Sub-Category]") == "Sub-Category"
+    assert T._field_token("Region") == "Region"                # bare token untouched
+    assert T._field_token("  [x].[Region]  ") == "Region"
+
+
+def test_parse_handles_qualified_tokens_in_real_shape():
+    parsed = T.parse_model_objects(REAL_SHAPE_TDS)
+    # qualified drill-path fields collapse to their local names, order preserved
+    assert parsed["hierarchies"] == [
+        {"name": "Product Hierarchy", "levels": ["Category", "Sub-Category"]}
+    ]
+    # qualified folder-item resolves to the local field; the role attr is ignored
+    assert parsed["display_folders"] == {"Region": "Geography"}
+    # the calc column name is qualified too; wiring still matches the datasource filter
+    wired = {c["name"] for c in parsed["user_filters"]["wired"]}
+    assert wired == {"Region Access"}
+
+
+def test_qualified_and_whitespaced_user_filter_still_translates():
+    # qualified field ref + leading/trailing whitespace + newline must still translate
+    resolve = lambda c: ("Orders", "Region", "string") if c == "Region" else None
+    dax, table, reason = T.translate_user_filter_to_dax(
+        "\n  [Orders].[Region] = USERNAME()  \n", resolve)
+    assert dax == "'Orders'[Region] = USERPRINCIPALNAME()"
+    assert table == "Orders" and reason == "translated"
+
+
+def test_real_shape_end_to_end_emits_all_three_objects():
+    out = migrate_tds_to_semantic_model(REAL_SHAPE_TDS, model_name="Superstore")
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "hierarchy 'Product Hierarchy'" in orders
+    assert orders.index("level Category") < orders.index("level Sub-Category")
+    assert 'displayFolder: "Geography"' in orders   # on the Region column
+    role = out["parts"]["definition/roles/Region Access.tmdl"]
+    assert "tablePermission Orders = 'Orders'[Region] = USERPRINCIPALNAME()" in role
+    assert "ref role 'Region Access'" in out["parts"]["definition/model.tmdl"]

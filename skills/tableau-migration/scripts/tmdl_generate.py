@@ -348,10 +348,23 @@ def _children_local(elem, name):
     return [c for c in list(elem) if _ns_local(c.tag) == name]
 
 
-def _strip_brackets(s):
+def _field_token(s):
+    """Normalize a Tableau field reference to its bare local token.
+
+    Tableau references a field as ``[Name]`` and frequently QUALIFIES it with one or more
+    leading segments (``[connection].[Name]``, ``[Orders].[Category]``) in real ``.tds``
+    documents. The trailing bracketed segment is the field's local name, so this returns the
+    inner text of the LAST bracketed segment -- which also leaves a simple ``[Name]`` or a
+    bare ``Name`` untouched. Applying it uniformly to drill-path levels, folder items, calc
+    column names, and filter columns keeps wiring consistent across qualified/unqualified
+    forms.
+    """
     s = (s or "").strip()
-    if s.startswith("[") and s.endswith("]"):
-        return s[1:-1]
+    if not s:
+        return ""
+    segments = re.findall(r"\[([^\]]*)\]", s)
+    if segments:
+        return segments[-1].strip()
     return s
 
 
@@ -383,7 +396,7 @@ def parse_model_objects(tds_text):
     hierarchies = []
     for dp in _iter_local(root, "drill-path"):
         name = dp.get("name")
-        levels = [_strip_brackets(f.text) for f in _children_local(dp, "field")
+        levels = [_field_token(f.text) for f in _children_local(dp, "field")
                   if (f.text or "").strip()]
         if name and levels:
             hierarchies.append({"name": name, "levels": levels})
@@ -394,14 +407,14 @@ def parse_model_objects(tds_text):
         if not fname:
             continue
         for item in _children_local(fld, "folder-item"):
-            member = _strip_brackets(item.get("name"))
+            member = _field_token(item.get("name"))
             if member:
                 folders[member] = fname
 
     field_index = {}
     user_calcs = []
     for col in _iter_local(root, "column"):
-        internal = _strip_brackets(col.get("name"))
+        internal = _field_token(col.get("name"))
         if not internal:
             continue
         field_index.setdefault(internal, col.get("caption") or internal)
@@ -413,7 +426,7 @@ def parse_model_objects(tds_text):
                                    "name": col.get("caption") or internal,
                                    "formula": formula})
 
-    wired_cols = {_strip_brackets(f.get("column"))
+    wired_cols = {_field_token(f.get("column"))
                   for f in _iter_local(root, "filter") if f.get("column")}
     wired = [c for c in user_calcs if c["internal"] in wired_cols]
     unwired = [c for c in user_calcs if c["internal"] not in wired_cols]
@@ -430,8 +443,11 @@ def parse_model_objects(tds_text):
 # (ISMEMBEROF group logic, USERDOMAIN, compound boolean, an unresolvable field) has no
 # safe deterministic DAX equivalent and is deliberately NOT guessed -- it becomes a
 # fail-closed manual-review scaffold instead (see :func:`resolve_model_objects`).
-_UF_EQ_LEFT = re.compile(r"^\[(?P<f>[^\]]+)\]\s*=\s*USERNAME\s*\(\s*\)$", re.IGNORECASE)
-_UF_EQ_RIGHT = re.compile(r"^USERNAME\s*\(\s*\)\s*=\s*\[(?P<f>[^\]]+)\]$", re.IGNORECASE)
+# A field reference may be qualified (``[connection].[Field]``); the trailing bracketed
+# segment is the local field name, so the capture group always lands on that segment.
+_UF_FIELD = r"(?:\[[^\]]+\]\.)*\[(?P<f>[^\]]+)\]"
+_UF_EQ_LEFT = re.compile(r"^" + _UF_FIELD + r"\s*=\s*USERNAME\s*\(\s*\)$", re.IGNORECASE)
+_UF_EQ_RIGHT = re.compile(r"^USERNAME\s*\(\s*\)\s*=\s*" + _UF_FIELD + r"$", re.IGNORECASE)
 _FIELD_REF_RE = re.compile(r"\[([^\]]+)\]")
 
 
