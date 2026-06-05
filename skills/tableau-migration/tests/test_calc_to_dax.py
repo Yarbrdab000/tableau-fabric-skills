@@ -4,14 +4,19 @@ Started from the Play 4 notebook self-test cell (aggregation + arithmetic safe
 subset) and extended to cover the conditional/null-handling grammar: IF/ELSEIF/ELSE,
 IIF, comparisons, AND/OR/NOT, ZN/IFNULL/ISNULL, string literals, scalar math over
 aggregated operands (ABS/ROUND/CEILING/FLOOR/POWER/SQUARE/SQRT/SIGN/EXP/LOG/LN/DIV/PI
-and the SIN/COS/TAN/ASIN/ACOS/ATAN/COT trig family), and
+and the SIN/COS/TAN/ASIN/ACOS/ATAN/COT trig family plus DEGREES/RADIANS), the IN
+set-membership operator, and
 CASE/WHEN -> SWITCH (searched and simple forms). They lock the deterministic translator's behavior: the supported subset must produce the documented
 DAX, and everything outside it (including type-inconsistent or non-boolean-condition
 forms) must fall back (return None) so the caller keeps an inert ``= 0`` stub.
 """
 import pytest
 
-from calc_to_dax import translate_tableau_calc_to_dax, validate_dax
+from calc_to_dax import (
+    translate_tableau_calc_to_dax,
+    translate_tableau_calc_to_column_dax,
+    validate_dax,
+)
 
 # Shared resolver: caption -> (table_display_name, clean_col, tmdl_type).
 _FIELDS = {
@@ -30,6 +35,10 @@ def _resolver(caption):
 
 def _tx(formula):
     return translate_tableau_calc_to_dax(formula, _resolver)[0]
+
+
+def _col(formula):
+    return translate_tableau_calc_to_column_dax(formula, _resolver)[0]
 
 
 # Formula -> expected DAX. Anything in this table MUST translate exactly.
@@ -138,6 +147,10 @@ TRANSLATIONS = [
     ("ACOS(SUM([Sales]))", "ACOS(SUM('Orders'[Sales]))"),
     ("ATAN(SUM([Sales]))", "ATAN(SUM('Orders'[Sales]))"),
     ("COT(SUM([Sales]))", "COT(SUM('Orders'[Sales]))"),
+    ("DEGREES(SUM([Sales]))", "DEGREES(SUM('Orders'[Sales]))"),   # radians -> degrees
+    ("RADIANS(SUM([Sales]))", "RADIANS(SUM('Orders'[Sales]))"),   # degrees -> radians
+    # IN -> DAX set membership over a list literal (operand stays an aggregate here)
+    ("SUM([Quantity]) IN (1, 2, 3)", "SUM('Orders'[Quantity]) IN {1, 2, 3}"),
     # scalar math composes with arithmetic and nests (operands stay numeric)
     ("ABS(SUM([Profit])) / SUM([Sales])",
      "DIVIDE(ABS(SUM('Orders'[Profit])), SUM('Orders'[Sales]))"),
@@ -219,6 +232,12 @@ FALLBACKS = [
     "SIN([Sales])",                               # bare row-level operand in a trig fn
     'COS("x")',                                   # non-numeric trig operand
     "CEILING(SUM([Region]))",                     # SUM on string fails before CEILING
+    "DEGREES([Sales])",                           # bare row-level operand (measure context)
+    "DEGREES(SUM([Region]))",                     # SUM on string fails before DEGREES
+    # --- IN operator fallbacks (measure-context / type violations) ---
+    '[Region] IN ("East", "West")',               # bare row-level field -> invalid in a measure
+    'SUM([Quantity]) IN (1, "x")',                # mixed-type IN list
+    "SUM([Sales]) > 0 IN (1, 2)",                 # IN cannot follow a boolean comparison
     # --- CASE/WHEN fallbacks (measure-context / type violations) ---
     "CASE END",                                   # no WHEN clause
     "CASE WHEN SUM([Sales]) THEN 1 ELSE 0 END",   # non-boolean searched condition
@@ -283,3 +302,303 @@ def test_elseif_reason_ok():
     assert reason == "ok"
     assert tables == {"Orders"}
     assert dax.count("IF(") == 2  # nested ELSEIF
+
+
+# ---------------------------------------------------------------------------
+# Row-level (calculated-COLUMN) translation: translate_tableau_calc_to_column_dax.
+# Here a bare [field] resolves to 'Table'[Col] and the row-level string/date/cast
+# functions are available. Anything not faithfully expressible in DAX falls back.
+# ---------------------------------------------------------------------------
+COLUMN_TRANSLATIONS = [
+    # --- bare row-level fields + numeric/logical reuse (free in column context) ---
+    ("[Sales] + [Profit]", "'Orders'[Sales] + 'Orders'[Profit]"),
+    ("ABS([Profit])", "ABS('Orders'[Profit])"),
+    ("ROUND([Sales], 2)", "ROUND('Orders'[Sales], 2)"),
+    ("DEGREES([Sales])", "DEGREES('Orders'[Sales])"),                  # scalar math over a row field
+    ('IF [Sales] > 100 THEN "high" ELSE "low" END', 'IF(\'Orders\'[Sales] > 100, "high", "low")'),
+    ('[Region] IN ("East", "West")', '\'Orders\'[Region] IN {"East", "West"}'),  # set membership
+    ('IF [Region] IN ("East", "West") THEN 1 ELSE 0 END',
+     'IF(\'Orders\'[Region] IN {"East", "West"}, 1, 0)'),              # IN composes in a conditional
+    # --- string functions ---
+    ("UPPER([Region])", "UPPER('Orders'[Region])"),
+    ("LOWER([Region])", "LOWER('Orders'[Region])"),
+    ("LEN([Region])", "LEN('Orders'[Region])"),
+    ("LEFT([Region], 3)", "LEFT('Orders'[Region], 3)"),
+    ("RIGHT([Region], 2)", "RIGHT('Orders'[Region], 2)"),
+    ("MID([Region], 2)", "MID('Orders'[Region], 2, LEN('Orders'[Region]))"),   # 2-arg runs to end
+    ("MID([Region], 2, 3)", "MID('Orders'[Region], 2, 3)"),
+    ('REPLACE([Region], "a", "b")', "SUBSTITUTE('Orders'[Region], \"a\", \"b\")"),
+    ('CONTAINS([Region], "East")', "CONTAINSSTRINGEXACT('Orders'[Region], \"East\")"),  # case-sensitive
+    ('STARTSWITH([Region], "E")', "EXACT(LEFT('Orders'[Region], LEN(\"E\")), \"E\")"),
+    ('ENDSWITH([Region], "t")', "EXACT(RIGHT('Orders'[Region], LEN(\"t\")), \"t\")"),
+    ('FIND([Region], "a")', "FIND(\"a\", 'Orders'[Region], 1, 0)"),                    # default start 1
+    ('FIND([Region], "a", 2)', "FIND(\"a\", 'Orders'[Region], 2, 0)"),
+    # string '+' concatenation propagates null (unlike a bare DAX '&')
+    ('[Region] + "!"',
+     "IF(ISBLANK('Orders'[Region]) || ISBLANK(\"!\"), BLANK(), 'Orders'[Region] & \"!\")"),
+    # --- numeric casts ---
+    ("INT([Sales])", "TRUNC('Orders'[Sales])"),                 # truncates toward zero
+    ("FLOAT([Quantity])", "CONVERT('Orders'[Quantity], DOUBLE)"),
+    # --- date functions ---
+    ("YEAR([Order Date])", "YEAR('Orders'[Order_Date])"),
+    ("MONTH([Order Date])", "MONTH('Orders'[Order_Date])"),
+    ("DAY([Order Date])", "DAY('Orders'[Order_Date])"),
+    ('DATEPART("month", [Order Date])', "MONTH('Orders'[Order_Date])"),
+    ('DATEPART("quarter", [Order Date])', "QUARTER('Orders'[Order_Date])"),
+    ('DATEADD("day", 7, [Order Date])', "('Orders'[Order_Date] + (7))"),
+    ('DATEADD("month", 3, [Order Date])',
+     "(EDATE('Orders'[Order_Date], 3) + MOD('Orders'[Order_Date], 1))"),               # keeps time-of-day
+    ('DATEADD("year", 1, [Order Date])',
+     "(EDATE('Orders'[Order_Date], (1) * 12) + MOD('Orders'[Order_Date], 1))"),
+    ('DATEDIFF("day", [Order Date], TODAY())', "DATEDIFF('Orders'[Order_Date], TODAY(), DAY)"),
+    ('DATETRUNC("month", [Order Date])', "DATE(YEAR('Orders'[Order_Date]), MONTH('Orders'[Order_Date]), 1)"),
+    ("DATE([Order Date])",
+     "DATE(YEAR('Orders'[Order_Date]), MONTH('Orders'[Order_Date]), DAY('Orders'[Order_Date]))"),  # strips time
+    ("MAKEDATE(2024, 1, 15)", "DATE(2024, 1, 15)"),                       # exact, culture-independent
+    ("MAKEDATE(YEAR([Order Date]), 1, 1)", "DATE(YEAR('Orders'[Order_Date]), 1, 1)"),  # composes with parts
+    ("TODAY()", "TODAY()"),
+    ("NOW()", "NOW()"),
+]
+
+COLUMN_FALLBACKS = [
+    # measure-only constructs are invalid in a row-level column
+    "SUM([Sales])",                               # aggregation
+    "PERCENTILE([Sales], 0.5)",                   # aggregation
+    "{FIXED [Region] : SUM([Sales])}",            # LOD
+    # functions whose DAX equivalent is not faithful -> deferred to fallback
+    "TRIM([Region])",                             # DAX TRIM also collapses internal spaces
+    "LTRIM([Region])",
+    "RTRIM([Region])",
+    'SPLIT([Region], ",", 1)',                    # no general DAX equivalent
+    "STR([Sales])",                               # culture-sensitive formatting
+    'DATE("2020-01-01")',                         # DATE(text) is culture-sensitive parsing
+    'DATEPART("week", [Order Date])',             # start-of-week dependent
+    'DATEPART("weekday", [Order Date])',
+    'DATEDIFF("week", [Order Date], TODAY())',
+    'DATETRUNC("quarter", [Order Date])',
+    'DATEADD("fortnight", 1, [Order Date])',      # unknown part
+    'MAKEDATE("x", 1, 1)',                        # non-numeric year operand
+    "MAKETIME(10, 30, 0)",                        # DAX TIME uses a different epoch date
+    "MAKEDATETIME(2024, 1, 1)",                   # ambiguous arg forms across versions
+    # type violations
+    "LEN([Sales])",                               # LEN on a numeric field
+    "UPPER([Sales])",                             # UPPER on a numeric field
+    'LEFT([Region], "x")',                        # non-numeric length
+    "YEAR([Region])",                             # date function on text
+    "INT([Region])",                              # numeric cast of text
+    '[Region] + [Profit]',                        # text + number (mixed)
+    '[Region] IN ("East", 5)',                    # mixed-type IN list (text vs number)
+    '[Sales] IN ("East", "West")',                # numeric operand vs text list
+    # cross-table row-level column (cannot span tables)
+    "[Sales] + [People Count]",
+]
+
+
+@pytest.mark.parametrize("formula,expected", COLUMN_TRANSLATIONS, ids=[t[0] for t in COLUMN_TRANSLATIONS])
+def test_column_subset_translates(formula, expected):
+    assert _col(formula) == expected
+
+
+@pytest.mark.parametrize("formula", COLUMN_FALLBACKS, ids=[repr(f) for f in COLUMN_FALLBACKS])
+def test_column_unsupported_falls_back(formula):
+    assert _col(formula) is None
+
+
+def test_every_emitted_column_dax_passes_the_guardrail():
+    for formula, _ in COLUMN_TRANSLATIONS:
+        dax = _col(formula)
+        assert dax is not None
+        assert validate_dax(dax) == ""
+
+
+def test_row_level_functions_are_rejected_in_measure_context():
+    # The two entry points are distinct: row-level fields/functions translate as a column
+    # but must STILL fall back as a measure (the measure-context invariant is preserved).
+    for formula in ("UPPER([Region])", "LEFT([Region], 3)", '[Region] + "!"',
+                    "YEAR([Order Date])", "MAKEDATE(2024, 1, 15)"):
+        assert _tx(formula) is None
+        assert _col(formula) is not None
+
+
+def test_aggregations_are_rejected_in_column_context():
+    # ...and the inverse: aggregations translate as a measure but fall back as a column.
+    for formula in ("SUM([Sales])", "AVG([Profit])", "COUNTD([Region])"):
+        assert _tx(formula) is not None
+        assert _col(formula) is None
+
+
+def test_column_binding_contract_reports_single_table():
+    dax, reason, tables = translate_tableau_calc_to_column_dax("UPPER([Region])", _resolver)
+    assert dax == "UPPER('Orders'[Region])"
+    assert reason == "ok"
+    assert tables == {"Orders"}  # caller binds the calculated column to this table
+
+
+def test_column_with_no_field_has_empty_tables_used():
+    dax, reason, tables = translate_tableau_calc_to_column_dax("TODAY()", _resolver)
+    assert dax == "TODAY()"
+    assert reason == "ok"
+    assert tables == set()  # no field refs -> bindable anywhere
+
+
+# ---------------------------------------------------------------------------
+# Table calculations: translate_tableau_table_calc_to_dax. The caller supplies the
+# addressing (partition + order) that the .tds does not carry; the seam emits the
+# modern-DAX window-function pattern. order_by is required.
+# ---------------------------------------------------------------------------
+from calc_to_dax import translate_tableau_table_calc_to_dax  # noqa: E402
+
+_ORDER = ["Order Date"]
+_PART = ["Region"]
+
+
+def _tc(formula, partition_by=(), order_by=_ORDER):
+    return translate_tableau_table_calc_to_dax(formula, _resolver, partition_by, order_by)[0]
+
+
+TABLE_CALC_TRANSLATIONS = [
+    # (formula, partition_by, order_by, expected)
+    ("INDEX()", _PART, _ORDER,
+     "ROWNUMBER(ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region]))"),
+    ("INDEX()", (), [("Order Date", "DESC")],
+     "ROWNUMBER(ORDERBY('Orders'[Order_Date], DESC))"),               # no partition, desc sort
+    ("RUNNING_SUM(SUM([Sales]))", _PART, _ORDER,
+     "SUMX(WINDOW(1, ABS, 0, REL, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("RUNNING_AVG(SUM([Sales]))", _PART, _ORDER,
+     "AVERAGEX(WINDOW(1, ABS, 0, REL, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("RUNNING_MAX(MIN([Order Date]))", (), _ORDER,
+     "MAXX(WINDOW(1, ABS, 0, REL, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(MIN('Orders'[Order_Date])))"),                        # date inner is allowed for MAX
+    ("WINDOW_SUM(SUM([Sales]))", _PART, _ORDER,
+     "SUMX(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("LOOKUP(SUM([Sales]), -1)", (), _ORDER,
+     "CALCULATE(SUM('Orders'[Sales]), OFFSET(-(1), ORDERBY('Orders'[Order_Date], ASC)))"),
+]
+
+
+@pytest.mark.parametrize(
+    "formula,partition_by,order_by,expected",
+    TABLE_CALC_TRANSLATIONS,
+    ids=[t[0] for t in TABLE_CALC_TRANSLATIONS],
+)
+def test_table_calc_translates(formula, partition_by, order_by, expected):
+    assert translate_tableau_table_calc_to_dax(formula, _resolver, partition_by, order_by)[0] == expected
+
+
+TABLE_CALC_FALLBACKS = [
+    # (formula, order_by) -- everything here must return None
+    ("RUNNING_SUM(SUM([Sales]))", ()),            # no order spec
+    ("RANK(SUM([Sales]))", _ORDER),               # RANK not in the supported seam
+    ("PREVIOUS_VALUE(SUM([Sales]))", _ORDER),     # unsupported table calc
+    ("SUM([Sales])", _ORDER),                     # not a table calc
+    ("RUNNING_SUM([Sales])", _ORDER),             # bare row-level inner (not an aggregate)
+    ("RUNNING_SUM(SUM([Region]))", _ORDER),       # SUM on a string inner
+    ("RUNNING_AVG(MIN([Order Date]))", _ORDER),   # AVG of a date inner is invalid
+    ("INDEX(SUM([Sales]))", _ORDER),              # INDEX takes no argument
+    ("LOOKUP(SUM([Sales]))", _ORDER),             # LOOKUP missing its offset
+]
+
+
+@pytest.mark.parametrize("formula,order_by", TABLE_CALC_FALLBACKS, ids=[repr(f[0]) for f in TABLE_CALC_FALLBACKS])
+def test_table_calc_falls_back(formula, order_by):
+    assert translate_tableau_table_calc_to_dax(formula, _resolver, (), order_by)[0] is None
+
+
+def test_table_calc_cross_table_falls_back():
+    # Inner field (People) and addressing (Orders) span two tables -> fallback.
+    dax, reason, _ = translate_tableau_table_calc_to_dax(
+        "RUNNING_SUM(SUM([People Count]))", _resolver, (), _ORDER)
+    assert dax is None
+    assert "cross-table" in reason
+
+
+def test_table_calc_unresolved_order_field_falls_back():
+    dax, reason, _ = translate_tableau_table_calc_to_dax("INDEX()", _resolver, (), ["Nope"])
+    assert dax is None
+    assert "order-by" in reason
+
+
+def test_every_emitted_table_calc_passes_the_guardrail():
+    for formula, partition_by, order_by, _ in TABLE_CALC_TRANSLATIONS:
+        dax = translate_tableau_table_calc_to_dax(formula, _resolver, partition_by, order_by)[0]
+        assert dax is not None
+        assert validate_dax(dax) == ""
+
+
+# ---------------------------------------------------------------------------
+# Real-datasource reconciliation targets (offline fixtures).
+#
+# These pin the DAX our translator must emit for ACTUAL calculated fields in the
+# live "Superstore" Tableau datasource (Azure SQL; Orders / People / Returns), so
+# the integrator's post-merge live pass can ExecuteQueries-reconcile each measure
+# against its Tableau VizQL Data Service value. The committed suite stays fully
+# offline/deterministic -- only the formula->DAX fact is locked here, never a live
+# value. The returned (dax, reason, tables_used) triple IS the reconciliation
+# contract: `dax` is executed via ExecuteQuery; `tables_used` names the source
+# table the VDS aggregates for the Tableau-side value. Append newly discovered
+# real calcs to the list -- each is reconciled the same way.
+# See resources/validation-reconciliation.md.
+# ---------------------------------------------------------------------------
+REAL_SUPERSTORE_MEASURES = [
+    # (measure_name, tableau_formula, expected_dax, expected_tables_used)
+    (
+        "Profit Ratio",
+        "SUM([Profit])/SUM([Sales])",
+        "DIVIDE(SUM('Orders'[Profit]), SUM('Orders'[Sales]))",
+        {"Orders"},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "name,formula,expected_dax,expected_tables",
+    REAL_SUPERSTORE_MEASURES,
+    ids=[m[0] for m in REAL_SUPERSTORE_MEASURES],
+)
+def test_real_superstore_measure_reconciliation_contract(name, formula, expected_dax, expected_tables):
+    # Lock the full triple the live reconciliation binds to: dax -> ExecuteQuery,
+    # tables_used -> which VDS table supplies the Tableau-side comparison value.
+    dax, reason, tables = translate_tableau_calc_to_dax(formula, _resolver)
+    assert dax == expected_dax
+    assert reason == "ok"
+    assert tables == expected_tables
+    assert validate_dax(dax) == ""
+
+
+# ---------------------------------------------------------------------------
+# Out-of-engine / no-faithful-equivalent constructs. Per the migration contract
+# these are the ONLY permanent fallbacks: external SQL/script passthroughs, regex
+# (DAX has no regex engine), user-identity & security functions, spatial builders,
+# and the culture-/epoch-sensitive date constructors. Each must return None from
+# BOTH public entry points (measure AND column) -- the translator preserves the
+# original formula as an annotation but never emits risky DAX for them.
+# ---------------------------------------------------------------------------
+OUT_OF_ENGINE = [
+    'RAWSQL_REAL("sum(x)", [Sales])',             # raw upstream SQL passthrough
+    'RAWSQLAGG_INT("count(x)", [Quantity])',
+    'SCRIPT_REAL("return 1", SUM([Sales]))',      # external R/Python service call
+    'SCRIPT_STR("upper(x)", [Region])',
+    'REGEXP_MATCH([Region], "^E")',               # no DAX regex engine
+    'REGEXP_REPLACE([Region], " ", "_")',
+    'REGEXP_EXTRACT([Region], "(.+)")',
+    "USERNAME()",                                 # session identity (non-deterministic)
+    "FULLNAME()",
+    'ISMEMBEROF("Analysts")',                     # security-group membership
+    "MAKEPOINT([Profit], [Sales])",               # spatial constructors
+    "HEXBINX([Sales], [Profit])",
+    'DATENAME("month", [Order Date])',            # localized part NAME (culture-sensitive)
+    "MAKETIME(10, 30, 0)",                        # DAX TIME uses a different epoch date
+    "MAKEDATETIME(2024, 1, 1)",                   # ambiguous arg forms across versions
+]
+
+
+@pytest.mark.parametrize("formula", OUT_OF_ENGINE, ids=[repr(f) for f in OUT_OF_ENGINE])
+def test_out_of_engine_constructs_never_translate(formula):
+    # The permanent-fallback boundary: neither entry point may emit DAX for these.
+    assert translate_tableau_calc_to_dax(formula, _resolver)[0] is None
+    assert translate_tableau_calc_to_column_dax(formula, _resolver)[0] is None
+
+

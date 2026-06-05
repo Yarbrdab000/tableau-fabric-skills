@@ -17,8 +17,10 @@ Translates a SAFE subset of Tableau calculated fields into working DAX measures:
   * scalar math over NUMERIC (aggregated) operands: ABS, ROUND (1-arg -> ROUND(x, 0)),
     CEILING(x) -> CEILING(x, 1), FLOOR(x) -> FLOOR(x, 1), POWER, SQRT, SQUARE(x) ->
     POWER(x, 2), SIGN, EXP, LOG (base-10, or 2-arg LOG(x, base)), LN, DIV(a, b) ->
-    QUOTIENT(a, b), PI(), and the trig family SIN/COS/TAN/ASIN/ACOS/ATAN/COT
+    QUOTIENT(a, b), PI(), the trig family SIN/COS/TAN/ASIN/ACOS/ATAN/COT, and
+    DEGREES/RADIANS (radian<->degree conversion)
   * comparison operators: = == <> != > >= < <=  (== -> = ; != -> <>)
+  * set membership: x IN (a, b, ...) -> x IN { a, b, ... } (one consistent element type)
   * boolean logic: AND -> && , OR -> || , NOT(x)
   * null handling: ZN(x) -> COALESCE(x, 0) ; IFNULL(a, b) -> COALESCE(a, b) ;
     ISNULL(x) -> ISBLANK(x)
@@ -31,12 +33,23 @@ Translates a SAFE subset of Tableau calculated fields into working DAX measures:
     compute the wrong number, so it falls back). INCLUDE/EXCLUDE, zero-dimension (grand-total)
     LODs, COUNTD over an LOD, and a bare LOD not wrapped in an outer aggregation all fall back.
 
-MEASURE-CONTEXT INVARIANT: output is a DAX *measure*, so every leaf operand must be an
-aggregation or a literal. A bare row-level field (e.g. ``[Sales]`` outside an aggregation) is
-invalid in a measure and deterministically FALLS BACK. The parser also tracks a static data
-type per node (number / text / date / bool) and falls back on any type mismatch (e.g. an IF
-whose branches return different types, an arithmetic op on a non-numeric term, or a comparison
-between incomparable types) so it never emits DAX that would error or silently coerce.
+MEASURE-CONTEXT INVARIANT: the default entry point (translate_tableau_calc_to_dax) emits a
+DAX *measure*, so every leaf operand must be an aggregation or a literal. A bare row-level field
+(e.g. ``[Sales]`` outside an aggregation) is invalid in a measure and deterministically FALLS
+BACK. The parser also tracks a static data type per node (number / text / date / bool) and falls
+back on any type mismatch (e.g. an IF whose branches return different types, an arithmetic op on
+a non-numeric term, or a comparison between incomparable types) so it never emits DAX that would
+error or silently coerce.
+
+ROW-LEVEL (CALCULATED-COLUMN) COMPANION: translate_tableau_calc_to_column_dax shares the same
+public shape but parses in row context (mode="column"): a bare ``[field]`` resolves to
+``'Table'[Col]`` and the row-level string / date / numeric-cast functions become available
+(LEN/LEFT/RIGHT/MID/UPPER/LOWER/REPLACE/CONTAINS/STARTSWITH/ENDSWITH/FIND; YEAR/MONTH/DAY/TODAY/
+NOW/DATEPART/DATEADD/DATEDIFF/DATETRUNC/DATE/MAKEDATE; INT/FLOAT; string ``+`` -> null-preserving
+concatenation). Aggregations, PERCENTILE, and LODs are invalid there and fall back. Mappings whose
+DAX equivalent is NOT faithful are deliberately left to fall back: TRIM/LTRIM/RTRIM (DAX TRIM also
+collapses internal whitespace), SPLIT (no general DAX form), STR and DATE(text) (culture-sensitive
+formatting/parsing), and the start-of-week-dependent DATEPART('week'/'weekday')/DATEDIFF('week').
 
 Anything outside this subset (INCLUDE/EXCLUDE LODs, table calcs WINDOW_/RUNNING_/RANK/LOOKUP/
 INDEX/TOTAL, scalar date/string/regex functions, row-level operands inside a scalar math
@@ -46,10 +59,13 @@ returning ``None`` so the caller keeps an inert ``= 0`` stub.
 The original Tableau formula is preserved as a ``TableauFormula`` annotation by the renderer
 either way.
 
-Table calculations are intentionally NOT translated here: their result depends on the
-worksheet's Compute-Using / addressing / sort, which lives in the workbook (``.twb``), not the
-datasource (``.tds``) this skill operates on. They become tractable once worksheets are parsed
-(roadmap v2). FIXED LODs, by contrast, are datasource-level semantics and ARE translated.
+Table calculations are translated by a SEPARATE seam, translate_tableau_table_calc_to_dax, because
+their result depends on the worksheet's Compute-Using / addressing / sort, which lives in the
+workbook (``.twb``), not the datasource (``.tds``) this module parses. That entry point therefore
+takes the partition/order spec explicitly and emits the modern-DAX window-function pattern
+(INDEX -> ROWNUMBER; RUNNING_*/WINDOW_* -> WINDOW; LOOKUP -> OFFSET); the orchestrator/viz layer
+supplies the real addressing once worksheets are parsed. FIXED LODs, by contrast, are
+datasource-level semantics and are translated inline by the measure path above.
 
 Known semantic notes:
   * Emitted comparison/arithmetic operators follow DAX's BLANK coercion (an empty aggregation
@@ -108,10 +124,69 @@ _NUMERIC_TYPES = {"int64", "double", "decimal"}
 _MATH_1 = {
     "ABS", "SQRT", "SIGN", "EXP", "LN",
     "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "COT",
+    "DEGREES", "RADIANS",
 }
 _MATH_1_SIG = {"CEILING": "1", "FLOOR": "1"}
 _MATH_2 = {"POWER": "POWER", "DIV": "QUOTIENT", "MOD": "MOD"}
 _SCALAR_MATH = _MATH_1 | set(_MATH_1_SIG) | set(_MATH_2) | {"ROUND", "LOG", "SQUARE", "PI"}
+
+# ---------------------------------------------------------------------------
+# Row-level (calculated-COLUMN) context. The functions below are NOT valid in a
+# measure: they operate on a bare row-level field, so they are reachable only via
+# translate_tableau_calc_to_column_dax (mode="column"), where a [field] token
+# resolves to 'Table'[Col] instead of falling back. Mappings are built from the
+# Tableau function reference and the DAX function reference; anything whose DAX
+# equivalent is not faithful (collapses internal spaces, is culture-sensitive, or
+# depends on a workbook start-of-week setting) is deliberately left to fall back.
+# ---------------------------------------------------------------------------
+# Map a TMDL/storage data type to this parser's static dtype.
+_DTYPE_BY_TMDL = {
+    "string": "text",
+    "int64": "number", "double": "number", "decimal": "number",
+    "dateTime": "date", "date": "date",
+    "boolean": "bool",
+}
+_STRING_FNS = {
+    "LEN", "UPPER", "LOWER", "LEFT", "RIGHT", "MID",
+    "REPLACE", "CONTAINS", "STARTSWITH", "ENDSWITH", "FIND",
+}
+_DATE_FNS = {
+    "YEAR", "MONTH", "DAY", "TODAY", "NOW",
+    "DATEPART", "DATEADD", "DATEDIFF", "DATETRUNC", "DATE", "MAKEDATE",
+}
+_CAST_FNS = {"INT", "FLOAT"}
+_COLUMN_ONLY_FNS = _STRING_FNS | _DATE_FNS | _CAST_FNS
+# DATEPART(part, d) -> scalar DAX extractor. 'week'/'weekday' omitted on purpose:
+# their result depends on the workbook's start-of-week, so they fall back.
+_DATEPART_FN = {
+    "year": "YEAR", "month": "MONTH", "day": "DAY",
+    "hour": "HOUR", "minute": "MINUTE", "second": "SECOND", "quarter": "QUARTER",
+}
+# DATEDIFF('part', d1, d2) -> DAX DATEDIFF(d1, d2, UNIT). 'week' omitted (start-of-week).
+_DATEDIFF_UNITS = {
+    "day": "DAY", "month": "MONTH", "year": "YEAR", "quarter": "QUARTER",
+    "hour": "HOUR", "minute": "MINUTE", "second": "SECOND",
+}
+
+# ---------------------------------------------------------------------------
+# Table calculations (translate_tableau_table_calc_to_dax). These depend on the
+# worksheet's addressing (Compute-Using partition + sort), which lives in the .twb,
+# NOT the .tds. So this is a SEAM: the caller passes the partition/order spec
+# explicitly and we emit the modern-DAX window-function pattern. Each window/offset
+# function omits its <relation> argument, which per the DAX spec defaults to
+# ALLSELECTED() of the ORDERBY()/PARTITIONBY() columns -- the standard measure form.
+# A RUNNING_/WINDOW_ aggregate is re-evaluated per addressed row via CALCULATE (context
+# transition) and folded with the matching iterator, mirroring the FIXED-LOD pattern.
+# ---------------------------------------------------------------------------
+_TABLECALC_X = {            # RUNNING_*: partition start -> current row
+    "RUNNING_SUM": "SUMX", "RUNNING_AVG": "AVERAGEX",
+    "RUNNING_MIN": "MINX", "RUNNING_MAX": "MAXX",
+}
+_TABLECALC_WINDOW_X = {     # WINDOW_*: entire partition (first -> last row)
+    "WINDOW_SUM": "SUMX", "WINDOW_AVG": "AVERAGEX",
+    "WINDOW_MIN": "MINX", "WINDOW_MAX": "MAXX",
+}
+_TABLE_CALCS = {"INDEX", "LOOKUP"} | set(_TABLECALC_X) | set(_TABLECALC_WINDOW_X)
 
 
 class _CalcError(Exception):
@@ -218,11 +293,12 @@ def _tokenize(formula):
 # The measure-context invariant is enforced structurally: a bare [field] only ever
 # appears inside agg, so a row-level field reference is a parse error (-> fallback).
 class _Parser:
-    def __init__(self, toks, resolver, tables_used):
+    def __init__(self, toks, resolver, tables_used, mode="measure"):
         self.toks = toks
         self.pos = 0
         self.resolver = resolver
         self.tables_used = tables_used
+        self.mode = mode          # "measure" (default) or "column" (row-level)
         self._lod_dim_stack = []
 
     def _peek(self):
@@ -258,6 +334,18 @@ class _Parser:
     def _expect_number(node):
         if node[1] != "number":
             raise _CalcError("expected a numeric expression")
+        return node
+
+    @staticmethod
+    def _expect_text(node):
+        if node[1] != "text":
+            raise _CalcError("expected a text expression")
+        return node
+
+    @staticmethod
+    def _expect_date(node):
+        if node[1] != "date":
+            raise _CalcError("expected a date expression")
         return node
 
     def parse(self):
@@ -334,6 +422,8 @@ class _Parser:
 
     def _cmp(self):
         left = self._add()
+        if self._is_kw("IN"):
+            return self._in_list(left)
         k, v = self._peek()
         if k == "cmp":
             self._next()
@@ -344,11 +434,38 @@ class _Parser:
             return (f"{left[0]} {v} {right[0]}", "bool")
         return left
 
+    def _in_list(self, left):
+        # Tableau `x IN (a, b, ...)` -> DAX `x IN { a, b, ... }` (set membership). Every list
+        # element must share the operand's type; a boolean operand or a mixed-type list falls
+        # back. In a measure a bare row-level operand already fails before reaching IN.
+        self._next()  # IN
+        self._expect_op("(")
+        if left[1] == "bool":
+            raise _CalcError("IN requires a non-boolean operand")
+        items = [self._expr()]
+        while self._peek() == ("op", ","):
+            self._next()
+            items.append(self._expr())
+        self._expect_op(")")
+        for it in items:
+            if it[1] != left[1]:
+                raise _CalcError("IN list element type does not match the operand")
+        joined = ", ".join(it[0] for it in items)
+        return (f"{left[0]} IN {{{joined}}}", "bool")
+
     def _add(self):
         left = self._mul()
         while self._peek() == ("op", "+") or self._peek() == ("op", "-"):
             op = self._next()[1]
             right = self._mul()
+            if op == "+" and self.mode == "column" and left[1] == "text" and right[1] == "text":
+                # Tableau '+' concatenates strings and PROPAGATES null; DAX '&' coerces a
+                # BLANK operand to "", so wrap to keep Tableau's null-propagating semantics.
+                left = (
+                    f"IF(ISBLANK({left[0]}) || ISBLANK({right[0]}), BLANK(), {left[0]} & {right[0]})",
+                    "text",
+                )
+                continue
             self._expect_number(left)
             self._expect_number(right)
             left = (f"{left[0]} {op} {right[0]}", "number")
@@ -388,11 +505,19 @@ class _Parser:
             self._expect_op(")")
             return (f"({inner[0]})", inner[1])
         if k == "op" and v == "{":
+            if self.mode == "column":
+                raise _CalcError("LOD expression not valid in a row-level column calc")
             return self._fixed_lod_bare()
         if k == "id":
             u = v.upper()
             if u in _AGG_MAP:
+                if self.mode == "column":
+                    raise _CalcError(f"aggregation {u} not valid in a row-level column calc")
                 return self._agg()
+            if u == "PERCENTILE":
+                if self.mode == "column":
+                    raise _CalcError("PERCENTILE not valid in a row-level column calc")
+                return self._percentile()
             if u == "IIF":
                 return self._iif()
             if u == "ZN":
@@ -403,10 +528,12 @@ class _Parser:
                 return self._isnull()
             if u in _SCALAR_MATH:
                 return self._scalar_fn(u)
-            if u == "PERCENTILE":
-                return self._percentile()
+            if self.mode == "column" and u in _COLUMN_ONLY_FNS:
+                return self._row_fn(u)
             raise _CalcError(f"unsupported function {v}")
         if k == "field":
+            if self.mode == "column":
+                return self._row_field()
             raise _CalcError("bare row-level field [..] not valid in a measure")
         raise _CalcError("expected a value")
 
@@ -607,6 +734,208 @@ class _Parser:
         self.tables_used.add(table)
         return (f"PERCENTILE.INC({_dax_table(table)}{_dax_col(col)}, {n[0]})", "number")
 
+    # ----- Row-level (calculated-column) constructs; reachable only in mode="column" -----
+
+    def _row_field(self):
+        # A bare [field] in column context resolves to 'Table'[Col] (in measure context this
+        # token raises -> fallback). The single table is tracked so the caller can bind the
+        # calculated column to it; a row-level calc spanning >1 table falls back upstream.
+        _, cap = self._next()
+        resolved = self.resolver(cap)
+        if resolved is None:
+            raise _CalcError(f"unresolved/ambiguous field [{cap}]")
+        table, col, tmdl_type = resolved
+        dtype = _DTYPE_BY_TMDL.get(tmdl_type)
+        if dtype is None:
+            raise _CalcError(f"unsupported field type {tmdl_type} for [{cap}]")
+        self.tables_used.add(table)
+        return (f"{_dax_table(table)}{_dax_col(col)}", dtype)
+
+    def _row_fn(self, name):
+        if name in _STRING_FNS:
+            return self._string_fn(name)
+        if name in _CAST_FNS:
+            return self._cast_fn(name)
+        return self._date_fn(name)
+
+    def _string_fn(self, name):
+        self._next()  # function name
+        self._expect_op("(")
+        s = self._expect_text(self._expr())
+        if name == "LEN":
+            self._expect_op(")")
+            return (f"LEN({s[0]})", "number")
+        if name in ("UPPER", "LOWER"):
+            self._expect_op(")")
+            return (f"{name}({s[0]})", "text")
+        if name in ("LEFT", "RIGHT"):
+            self._expect_op(",")
+            n = self._expect_number(self._expr())
+            self._expect_op(")")
+            return (f"{name}({s[0]}, {n[0]})", "text")
+        if name == "MID":
+            self._expect_op(",")
+            start = self._expect_number(self._expr())
+            if self._peek() == ("op", ","):
+                self._next()
+                length = self._expect_number(self._expr())
+                self._expect_op(")")
+                return (f"MID({s[0]}, {start[0]}, {length[0]})", "text")
+            self._expect_op(")")
+            # Tableau 2-arg MID runs to the end of the string; DAX MID needs a length.
+            return (f"MID({s[0]}, {start[0]}, LEN({s[0]}))", "text")
+        if name == "REPLACE":
+            self._expect_op(",")
+            old = self._expect_text(self._expr())
+            self._expect_op(",")
+            new = self._expect_text(self._expr())
+            self._expect_op(")")
+            return (f"SUBSTITUTE({s[0]}, {old[0]}, {new[0]})", "text")
+        if name == "CONTAINS":
+            self._expect_op(",")
+            sub = self._expect_text(self._expr())
+            self._expect_op(")")
+            # CONTAINSSTRINGEXACT is the case-SENSITIVE form (Tableau CONTAINS is case-sensitive;
+            # plain CONTAINSSTRING is case-insensitive and would change results).
+            return (f"CONTAINSSTRINGEXACT({s[0]}, {sub[0]})", "bool")
+        if name in ("STARTSWITH", "ENDSWITH"):
+            self._expect_op(",")
+            sub = self._expect_text(self._expr())
+            self._expect_op(")")
+            side = "LEFT" if name == "STARTSWITH" else "RIGHT"
+            # EXACT keeps the prefix/suffix test case-sensitive, matching Tableau.
+            return (f"EXACT({side}({s[0]}, LEN({sub[0]})), {sub[0]})", "bool")
+        if name == "FIND":
+            self._expect_op(",")
+            sub = self._expect_text(self._expr())
+            start = ("1", "number")
+            if self._peek() == ("op", ","):
+                self._next()
+                start = self._expect_number(self._expr())
+            self._expect_op(")")
+            # DAX FIND(find, within, start, NotFound) is case-sensitive and returns 0 when the
+            # substring is absent -- matching Tableau FIND's case-sensitivity and 0 sentinel.
+            return (f"FIND({sub[0]}, {s[0]}, {start[0]}, 0)", "number")
+        raise _CalcError(f"unsupported string function {name}")
+
+    def _cast_fn(self, name):
+        self._next()  # INT / FLOAT
+        self._expect_op("(")
+        x = self._expect_number(self._expr())
+        self._expect_op(")")
+        if name == "INT":
+            # Tableau INT truncates toward zero; DAX INT() floors toward -inf, so TRUNC is the
+            # faithful mapping (they differ for negative values).
+            return (f"TRUNC({x[0]})", "number")
+        return (f"CONVERT({x[0]}, DOUBLE)", "number")  # FLOAT
+
+    def _part_literal(self):
+        k, v = self._peek()
+        if k != "str":
+            raise _CalcError("date part must be a string literal")
+        self._next()
+        return v.lower()
+
+    def _date_fn(self, name):
+        self._next()  # function name
+        self._expect_op("(")
+        if name in ("TODAY", "NOW"):
+            self._expect_op(")")
+            return (f"{name}()", "date")
+        if name in ("YEAR", "MONTH", "DAY"):
+            d = self._expect_date(self._expr())
+            self._expect_op(")")
+            return (f"{name}({d[0]})", "number")
+        if name == "DATE":
+            # Tableau DATE(x) casts to a date and strips any time-of-day component.
+            x = self._expect_date(self._expr())
+            self._expect_op(")")
+            return (f"DATE(YEAR({x[0]}), MONTH({x[0]}), DAY({x[0]}))", "date")
+        if name == "MAKEDATE":
+            # Tableau MAKEDATE(year, month, day) -> DAX DATE(year, month, day): an exact,
+            # culture-independent mapping (all three operands must be numeric).
+            y = self._expect_number(self._expr())
+            self._expect_op(",")
+            m = self._expect_number(self._expr())
+            self._expect_op(",")
+            d = self._expect_number(self._expr())
+            self._expect_op(")")
+            return (f"DATE({y[0]}, {m[0]}, {d[0]})", "date")
+        if name == "DATEPART":
+            part = self._part_literal()
+            self._expect_op(",")
+            d = self._expect_date(self._expr())
+            self._expect_op(")")
+            fn = _DATEPART_FN.get(part)
+            if fn is None:
+                raise _CalcError(f"unsupported DATEPART part {part!r}")
+            return (f"{fn}({d[0]})", "number")
+        if name == "DATEADD":
+            part = self._part_literal()
+            self._expect_op(",")
+            n = self._expect_number(self._expr())
+            self._expect_op(",")
+            d = self._expect_date(self._expr())
+            self._expect_op(")")
+            return (self._dateadd_emit(part, n[0], d[0]), "date")
+        if name == "DATEDIFF":
+            part = self._part_literal()
+            self._expect_op(",")
+            d1 = self._expect_date(self._expr())
+            self._expect_op(",")
+            d2 = self._expect_date(self._expr())
+            self._expect_op(")")
+            unit = _DATEDIFF_UNITS.get(part)
+            if unit is None:
+                raise _CalcError(f"unsupported DATEDIFF part {part!r}")
+            # Tableau DATEDIFF('part', start, end) -> DAX DATEDIFF(start, end, UNIT) (args reorder).
+            return (f"DATEDIFF({d1[0]}, {d2[0]}, {unit})", "number")
+        if name == "DATETRUNC":
+            part = self._part_literal()
+            self._expect_op(",")
+            d = self._expect_date(self._expr())
+            self._expect_op(")")
+            return (self._datetrunc_emit(part, d[0]), "date")
+        raise _CalcError(f"unsupported date function {name}")
+
+    @staticmethod
+    def _dateadd_emit(part, n, d):
+        # DAX has no scalar DATEADD (the DATEADD function is time-intelligence over a column),
+        # so add an interval directly. EDATE handles calendar months; MOD(d, 1) restores the
+        # time-of-day that EDATE drops, so a dateTime keeps its time. Result is parenthesized so
+        # it composes safely inside a larger expression.
+        if part == "day":
+            expr = f"{d} + ({n})"
+        elif part == "week":
+            expr = f"{d} + ({n}) * 7"
+        elif part == "hour":
+            expr = f"{d} + ({n}) / 24"
+        elif part == "minute":
+            expr = f"{d} + ({n}) / 1440"
+        elif part == "second":
+            expr = f"{d} + ({n}) / 86400"
+        elif part == "month":
+            expr = f"EDATE({d}, {n}) + MOD({d}, 1)"
+        elif part == "quarter":
+            expr = f"EDATE({d}, ({n}) * 3) + MOD({d}, 1)"
+        elif part == "year":
+            expr = f"EDATE({d}, ({n}) * 12) + MOD({d}, 1)"
+        else:
+            raise _CalcError(f"unsupported DATEADD part {part!r}")
+        return f"({expr})"
+
+    @staticmethod
+    def _datetrunc_emit(part, d):
+        # No scalar DATETRUNC in DAX; rebuild the date at the start of the period.
+        if part == "day":
+            return f"DATE(YEAR({d}), MONTH({d}), DAY({d}))"
+        if part == "month":
+            return f"DATE(YEAR({d}), MONTH({d}), 1)"
+        if part == "year":
+            return f"DATE(YEAR({d}), 1, 1)"
+        # 'quarter'/'week' need extra arithmetic / a start-of-week setting -> fall back.
+        raise _CalcError(f"unsupported DATETRUNC part {part!r}")
+
     def _lod_core(self):
         # Parse a {FIXED d1, d2, ... : inner} body. Returns (table, [clean_cols], inner_node).
         # Only FIXED is datasource-level and deterministically translatable. INCLUDE/EXCLUDE
@@ -719,6 +1048,165 @@ def translate_tableau_calc_to_dax(formula, resolver):
         dax, _dtype = _Parser(toks, resolver, tables_used).parse()
         # Single-table only: terms spanning >1 table fall back (a relationship path
         # does not guarantee the DAX filter context reproduces Tableau's result).
+        if len(tables_used) > 1:
+            return None, "cross-table terms (fields span multiple tables)", tables_used
+        leak = validate_dax(dax)
+        if leak:
+            return None, f"emit guardrail: {leak}", tables_used
+        return dax, "ok", tables_used
+    except _CalcError as e:
+        return None, str(e), tables_used
+
+
+def translate_tableau_calc_to_column_dax(formula, resolver):
+    """Translate a ROW-LEVEL Tableau calc to a DAX *calculated-column* expression.
+
+    Companion to translate_tableau_calc_to_dax with the SAME public shape --
+    (dax|None, reason, tables_used) -- but it parses in row (calculated-column) context:
+      * a bare ``[field]`` resolves to ``'Table'[Col]`` (in a measure this falls back), and
+      * the row-level string / date / numeric-cast functions become available
+        (LEN/LEFT/RIGHT/MID/UPPER/LOWER/REPLACE/CONTAINS/STARTSWITH/ENDSWITH/FIND;
+        YEAR/MONTH/DAY/TODAY/NOW/DATEPART/DATEADD/DATEDIFF/DATETRUNC/DATE/MAKEDATE; INT/FLOAT),
+        plus string ``+`` -> null-preserving concatenation.
+    Aggregations, PERCENTILE, and LOD expressions are NOT valid in a row-level column and
+    fall back here (use the measure entry point for those).
+
+    Caller binding contract (the orchestrator/renderer owns the actual binding): when
+    ``tables_used`` is a single ``{T}``, the emitted expression must be materialized as a
+    calculated column on table ``T``. Empty ``tables_used`` -> no field references, bindable
+    anywhere. More than one table -> falls back here (a row-level column cannot span tables).
+    """
+    tables_used = set()
+    f = (formula or "").strip()
+    if not f:
+        return None, "empty formula", tables_used
+    try:
+        toks = _tokenize(f)
+        if not toks:
+            return None, "empty formula", tables_used
+        dax, _dtype = _Parser(toks, resolver, tables_used, mode="column").parse()
+        if len(tables_used) > 1:
+            return None, "cross-table terms (fields span multiple tables)", tables_used
+        leak = validate_dax(dax)
+        if leak:
+            return None, f"emit guardrail: {leak}", tables_used
+        return dax, "ok", tables_used
+    except _CalcError as e:
+        return None, str(e), tables_used
+
+
+def _orderby_clause(order_by, resolver, tables_used):
+    # order_by items are a caption or a (caption, "ASC"|"DESC") pair. An explicit order is
+    # REQUIRED for every table calc (the window functions omit <relation>, so DAX requires an
+    # ORDERBY). Returns None when no order is supplied -> the caller falls back.
+    parts = []
+    for item in order_by:
+        if isinstance(item, (tuple, list)):
+            cap = item[0]
+            direction = str(item[1]).upper() if len(item) > 1 and item[1] else "ASC"
+        else:
+            cap, direction = item, "ASC"
+        if direction not in ("ASC", "DESC"):
+            raise _CalcError(f"invalid sort direction {direction!r}")
+        resolved = resolver(cap)
+        if resolved is None:
+            raise _CalcError(f"unresolved/ambiguous order-by field [{cap}]")
+        table, col, _ty = resolved
+        tables_used.add(table)
+        parts.append(f"{_dax_table(table)}{_dax_col(col)}, {direction}")
+    if not parts:
+        return None
+    return "ORDERBY(" + ", ".join(parts) + ")"
+
+
+def _partitionby_clause(partition_by, resolver, tables_used):
+    cols = []
+    for cap in partition_by:
+        resolved = resolver(cap)
+        if resolved is None:
+            raise _CalcError(f"unresolved/ambiguous partition field [{cap}]")
+        table, col, _ty = resolved
+        tables_used.add(table)
+        cols.append(f"{_dax_table(table)}{_dax_col(col)}")
+    if not cols:
+        return None
+    return "PARTITIONBY(" + ", ".join(cols) + ")"
+
+
+def _emit_table_calc(name, p, spec):
+    # p is a measure-context _Parser positioned just after the table-calc's '('. spec is the
+    # "ORDERBY(...)[, PARTITIONBY(...)]" addressing tail shared by every window function.
+    if name == "INDEX":
+        p._expect_op(")")
+        # Tableau INDEX() is the 1-based row position within the partition.
+        return f"ROWNUMBER({spec})"
+    inner = p._expr()  # measure-context inner (must be an aggregate, else it falls back)
+    if name in _TABLECALC_X or name in _TABLECALC_WINDOW_X:
+        aggx = _TABLECALC_X.get(name) or _TABLECALC_WINDOW_X[name]
+        if aggx in ("SUMX", "AVERAGEX") and inner[1] != "number":
+            raise _CalcError(f"{name} requires a numeric expression")
+        if aggx in ("MINX", "MAXX") and inner[1] not in ("number", "date"):
+            raise _CalcError(f"{name} requires a numeric/date expression")
+        p._expect_op(")")
+        # RUNNING_*: from the partition's first row (1, ABS) to the current row (0, REL).
+        # WINDOW_*:  the whole partition, first row (1, ABS) to last row (-1, ABS).
+        bounds = "1, ABS, 0, REL" if name in _TABLECALC_X else "1, ABS, -1, ABS"
+        return f"{aggx}(WINDOW({bounds}, {spec}), CALCULATE({inner[0]}))"
+    if name == "LOOKUP":
+        p._expect_op(",")
+        offset = p._expect_number(p._expr())
+        p._expect_op(")")
+        # Tableau LOOKUP(expr, offset): value of expr at a row offset (signed) from the current
+        # row along the addressing -> OFFSET picks that row, CALCULATE re-evaluates expr there.
+        return f"CALCULATE({inner[0]}, OFFSET({offset[0]}, {spec}))"
+    raise _CalcError(f"unsupported table calculation {name}")
+
+
+def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), order_by=()):
+    """Translate a Tableau TABLE CALCULATION to a modern-DAX window-function measure.
+
+    Same (dax|None, reason, tables_used) shape as the other entry points, plus the explicit
+    addressing a table calc needs (and which the .tds does not carry): ``partition_by`` is an
+    iterable of field captions (Tableau's Compute-Using partition) and ``order_by`` is an
+    iterable of captions or ``(caption, "ASC"|"DESC")`` pairs (the addressing sort). An order
+    spec is REQUIRED; without one the calc falls back.
+
+    Supported (the inner expression is translated in measure context, so it must be an
+    aggregation):
+      * ``INDEX()`` -> ``ROWNUMBER(ORDERBY(...)[, PARTITIONBY(...)])``
+      * ``RUNNING_SUM/AVG/MIN/MAX(<agg>)`` -> ``<X>(WINDOW(1, ABS, 0, REL, <spec>), CALCULATE(<agg>))``
+      * ``WINDOW_SUM/AVG/MIN/MAX(<agg>)``  -> ``<X>(WINDOW(1, ABS, -1, ABS, <spec>), CALCULATE(<agg>))``
+      * ``LOOKUP(<agg>, offset)`` -> ``CALCULATE(<agg>, OFFSET(offset, <spec>))``
+    Each window function omits its <relation> argument; per the DAX spec that defaults to
+    ``ALLSELECTED()`` of the ORDERBY/PARTITIONBY columns, so the result is correct when the
+    measure is evaluated against the marks the addressing describes. RANK/FIRST/LAST and other
+    forms fall back for now.
+
+    This is the DAX-pattern side of the seam; the orchestrator/viz layer supplies the real
+    addressing once worksheets are parsed. Cross-table terms (inner + addressing spanning more
+    than one table) fall back, consistent with the measure path.
+    """
+    tables_used = set()
+    f = (formula or "").strip()
+    if not f:
+        return None, "empty formula", tables_used
+    try:
+        toks = _tokenize(f)
+        if len(toks) < 3 or toks[0][0] != "id" or toks[1] != ("op", "("):
+            return None, "not a table calculation", tables_used
+        name = toks[0][1].upper()
+        if name not in _TABLE_CALCS:
+            return None, f"unsupported table calculation {toks[0][1]}", tables_used
+        order_clause = _orderby_clause(order_by, resolver, tables_used)
+        if order_clause is None:
+            return None, "table calc requires an explicit order-by spec", tables_used
+        part_clause = _partitionby_clause(partition_by, resolver, tables_used)
+        spec = order_clause if part_clause is None else f"{order_clause}, {part_clause}"
+        p = _Parser(toks, resolver, tables_used, mode="measure")
+        p.pos = 2  # consume the table-calc name and '('
+        dax = _emit_table_calc(name, p, spec)
+        if p.pos != len(toks):
+            raise _CalcError("unexpected trailing tokens after table calculation")
         if len(tables_used) > 1:
             return None, "cross-table terms (fields span multiple tables)", tables_used
         leak = validate_dax(dax)
