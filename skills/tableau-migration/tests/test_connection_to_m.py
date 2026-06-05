@@ -203,6 +203,27 @@ DATABRICKS = """<?xml version='1.0' encoding='utf-8' ?>
   </connection>
 </datasource>"""
 
+# Microsoft Fabric Warehouse / Lakehouse SQL endpoint (Tableau class
+# 'microsoft_fabric_sql_endpoint'): a SQL Server TDS endpoint -> Sql.Database, like sqlserver.
+FABRIC_SQL = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Fab' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='fab' name='fabric.a'>
+        <connection class='microsoft_fabric_sql_endpoint' dbname='SalesWH'
+                    server='abc.datawarehouse.fabric.microsoft.com' />
+      </named-connection>
+    </named-connections>
+    <relation name='Orders' table='[dbo].[Orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
 # Faithful reproduction of a modern multi-sheet Excel ``.tds`` (the published Superstore
 # sample): a <relation type='collection'> container wrapping the physical sheet tables, the
 # SAME tables duplicated under the logical <properties> layer, and columns in <metadata-records>.
@@ -489,10 +510,9 @@ def test_emit_fully_supported_connector_dispatch(cls, connector):
 
 
 # Recognized connectors we deliberately do NOT auto-emit yet: the body must be a named scaffold
-# that hints the intended connector, never a guessed call (Teradata's navigation selector and
-# BigQuery's identifiers aren't verifiable offline).
+# that hints the intended connector, never a guessed call (BigQuery has no M function reference
+# page, so its navigation selectors / project identifiers aren't verifiable offline).
 @pytest.mark.parametrize("cls,connector", [
-    ("teradata", "Teradata.Database"),
     ("bigquery", "GoogleBigQuery.Database"),
 ])
 def test_emit_partial_connector_is_named_scaffold_not_guessed_m(cls, connector):
@@ -513,14 +533,32 @@ def test_emit_unsupported_class_falls_back_to_scaffold():
     assert '(#"Server", #"Database")' not in body
 
 
-def test_emit_teradata_parsed_is_named_scaffold():
+def test_emit_teradata_parsed_is_deploy_ready_server_only():
+    # Teradata.Database(server, [options]) is server-only (doc-verified signature) with
+    # HierarchicalNavigation=false, so it reuses Oracle's verified flat [Schema, Item] path:
+    # no #"Database" parameter, and the Teradata database is the navigation Schema.
     d = parse_tds(TERADATA)
     assert d["connection_class"] == "teradata"
     body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
-    assert "TODO" in body
-    assert "Teradata.Database" in body
+    assert 'Source = Teradata.Database(#"Server", [HierarchicalNavigation=false])' in body
+    assert 'Source{[Schema="ANALYTICS", Item="ORDERS"]}[Data]' in body
+    assert "TODO" not in body
     assert "Sql.Database" not in body
-    assert '(#"Server", #"Database")' not in body
+    assert '(#"Server", #"Database")' not in body   # server-only: no Database argument
+    params = emit_connection_parameters(d)
+    assert 'expression Server = "td.example.com"' in params
+    assert "Database" not in params                 # reached through the server string, like Oracle
+
+
+def test_emit_fabric_sql_endpoint_is_deploy_ready_sql_database():
+    # Microsoft Fabric Warehouse / Lakehouse SQL endpoint speaks the SQL Server TDS protocol ->
+    # Sql.Database(server, database), identical to the sqlserver / azure_sqldb path.
+    d = parse_tds(FABRIC_SQL)
+    assert d["connection_class"] == "microsoft_fabric_sql_endpoint"
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert 'Source = Sql.Database(#"Server", #"Database")' in body
+    assert 'Source{[Schema="dbo", Item="Orders"]}[Data]' in body
+    assert "TODO" not in body
 
 
 def test_emit_synapse_is_deploy_ready_sql_database():
@@ -640,6 +678,14 @@ def test_connection_details_bind_type_for_databricks():
         {"connection_class": "databricks", "server": "adb.example.azuredatabricks.net", "database": "main"})
     assert details["bind_type"] == "Databricks"
     assert details["path"] == "adb.example.azuredatabricks.net;main"
+
+
+def test_connection_details_bind_type_for_fabric_sql_endpoint():
+    details = connection_details_for_bind(
+        {"connection_class": "microsoft_fabric_sql_endpoint",
+         "server": "abc.datawarehouse.fabric.microsoft.com", "database": "SalesWH"})
+    assert details["bind_type"] == "SQL"
+    assert details["path"] == "abc.datawarehouse.fabric.microsoft.com;SalesWH"
 
 
 # -- azure_sqldb first-class path (live-validation target, pinned offline) ------

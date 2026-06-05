@@ -45,10 +45,17 @@ from __future__ import annotations
 #  * Sql/PostgreSQL/MySQL/AmazonRedshift.Database take (server, database) + flat [Schema, Item].
 #    Azure SQL Database / Azure Synapse Analytics (dedicated + serverless SQL pool) / Azure SQL
 #    Managed Instance / Microsoft Fabric SQL endpoints all speak the SQL Server TDS protocol, so
-#    they bind through Sql.Database too (MI + Fabric use the Tableau 'sqlserver' class; Synapse
-#    uses 'azure_sql_dw').
-#  * Oracle.Database(server, [options]) is server-only; HierarchicalNavigation defaults false,
-#    so the flat [Schema, Item] navigation (schema = owner) applies. We set it explicitly.
+#    they bind through Sql.Database too. Managed Instance + serverless Synapse connect through the
+#    SQL Server / Azure SQL connector ('sqlserver' / 'azure_sqldb'); dedicated Synapse uses
+#    'azure_sql_dw'; the dedicated Fabric SQL endpoint uses 'microsoft_fabric_sql_endpoint'
+#    (class strings web-verified -- a wrong class only causes a safe fallback, never wrong M; the
+#    TDS->Sql.Database mapping is the verified fact).
+#  * Oracle.Database(server, [options]) and Teradata.Database(server, [options]) are both
+#    server-only (the M function reference pages confirm both signatures), and HierarchicalNavigation
+#    defaults false on each, so the flat [Schema, Item] navigation (schema = owner / Teradata
+#    database) applies. We set HierarchicalNavigation=false explicitly so the flat selector is
+#    correct rather than default-reliant. Teradata reuses Oracle's verified server-only path; it has
+#    no live instance here, so live reconciliation is pending.
 #  * Snowflake connector: connection inputs are Server + Warehouse; navigation is
 #    database -> schema -> table. (Snowflake.Databases has no M function reference page, so its
 #    navigation selectors are doc-informed; live reconciliation is pending -- see docs.)
@@ -59,12 +66,14 @@ from __future__ import annotations
 #    reconciliation is pending (no live Databricks instance).
 DIRECT_CONNECTORS = {
     "sqlserver":    ("Sql.Database",            "server_database",  "schema_item"),
-    "azure_sqldb":  ("Sql.Database",            "server_database",  "schema_item"),  # Azure SQL Database (SQL Server protocol)
-    "azure_sql_dw": ("Sql.Database",            "server_database",  "schema_item"),  # Azure Synapse Analytics (class-string web-verified; TDS->Sql.Database is the verified fact)
+    "azure_sqldb":  ("Sql.Database",            "server_database",  "schema_item"),  # Azure SQL Database / Managed Instance (SQL Server protocol)
+    "azure_sql_dw": ("Sql.Database",            "server_database",  "schema_item"),  # Azure Synapse Analytics (dedicated SQL pool)
+    "microsoft_fabric_sql_endpoint": ("Sql.Database", "server_database", "schema_item"),  # Fabric Warehouse / Lakehouse SQL endpoint (best-effort class; fails safe to fallback)
     "postgres":     ("PostgreSQL.Database",     "server_database",  "schema_item"),
     "mysql":        ("MySQL.Database",          "server_database",  "schema_item"),
     "redshift":     ("AmazonRedshift.Database", "server_database",  "schema_item"),
     "oracle":       ("Oracle.Database",         "server_only",      "schema_item"),
+    "teradata":     ("Teradata.Database",       "server_only",      "schema_item"),
     "snowflake":    ("Snowflake.Databases",     "server_warehouse", "database_schema_table"),
     "databricks":   ("Databricks.Catalogs",     "server_httppath",  "database_schema_table"),
 }
@@ -74,13 +83,10 @@ DIRECT_CONNECTORS = {
 # a guess. We pick a mode but mark it not fully supported and emit a clearly-flagged scaffold
 # that names the intended connector. Promotion is gated on doc-verified correctness.
 PARTIAL_LIVE_CONNECTORS = {
-    # Teradata.Database(server, [options]) is server-only (signature verified), but the exact
-    # navigation selector (flat [Schema, Item] vs [Name]-keyed database/table hops) is not
-    # established from an official source, so it stays a scaffold pending real navigator evidence.
-    "teradata": "Teradata.Database",
-    # GoogleBigQuery.Database([BillingProject=..]) has no server and an ambiguous
-    # billing-project vs project mapping in the .tds, so the project/dataset/table navigation
-    # can't be resolved offline -- scaffold pending a real BigQuery datasource.
+    # GoogleBigQuery.Database([BillingProject=..]) has no M function reference page (the connector
+    # doc lists no function reference), so neither the project/dataset/table navigation selectors
+    # nor the billing-project vs project mapping in the .tds can be verified from an official
+    # source -- it stays a scaffold pending a primary-doc shape or a real BigQuery datasource.
     "bigquery": "GoogleBigQuery.Database",
 }
 
