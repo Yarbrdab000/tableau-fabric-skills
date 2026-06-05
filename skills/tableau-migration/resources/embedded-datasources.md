@@ -58,7 +58,7 @@ named connection underneath it, not `federated` itself):
 | `textscan`, `csv` | **flat file** (CSV) | real Import M, built here |
 | `ogrdirect`, spatial | **spatial** | `fallback` (deferred) |
 | `federated` → relational (`sqlserver`, `snowflake`, `postgres`, …) | **relational** | existing spine |
-| relation tree spans >1 `<named-connection>` | **cross-database join** | `fallback` (deferred — see below) |
+| relation tree spans >1 `<named-connection>` | **cross-database join** | logical → rebuilt (per-source land + relationships); physical `<clause>` join → `fallback` (deferred) |
 
 A single datasource's connection span is detected **before** the per-class rebuild dispatch: when its
 `<relation>` tree references more than one named-connection, the `cross_db_join` classification takes
@@ -103,21 +103,38 @@ existing spine unchanged: `parse_tds` → `select_storage_mode` → `assemble_im
 and DirectQuery/Import/land-to-Delta selection are exactly as documented in
 [storage-mode-selection.md](storage-mode-selection.md).
 
-### Cross-database joins (detection only; rebuild deferred)
+### Cross-database joins (logical rebuilt; physical join deferred)
 
-A single Tableau `<datasource>` can be a **cross-database join** — one federated datasource whose
-`<relation type='join'>` tree spans multiple `<named-connection>`s (e.g. Snowflake joined to a local CSV),
-each joined leaf relation carrying a different `connection=` id pointing at a different inner connection class.
-Such a datasource **cannot** be represented as one Import partition, so it must not be rebuilt as a single
-model.
+A single Tableau `<datasource>` can blend **more than one `<named-connection>`** — each joined leaf relation
+carrying a different `connection=` id pointing at a different inner connection class (e.g. Azure SQL ⋈
+Snowflake ⋈ Databricks). Detection is a cheap, namespace-agnostic XML walk (`_connection_span`): per datasource
+it collects the distinct named-connections the relations reference (unioned with the declared
+`<named-connection>` ids); a span greater than one classifies the datasource `cross_db_join` **before** any
+per-class rebuild. The enumeration entry exposes `named_connections` and a `cross_db_join` flag up front.
 
-Detection is a cheap, namespace-agnostic XML walk (`_connection_span`): per datasource it collects the set of
-distinct named-connections the relations reference (unioned with the declared `<named-connection>` ids). When
-that span is greater than one, the datasource is classified `cross_db_join` **before** any per-class rebuild is
-attempted, and `rebuild_workbook_models` returns it with status `fallback`, empty `parts`, a
-`report.reason == "cross_db_join"` (plus the per-side `connection_classes`), and a follow-up recommending that
-each side be landed to its own Delta table (or DirectQuery'd) and joined in the lakehouse, or stitched with a
-Power BI composite model. The actual multi-source join rebuild is **deferred** (see below).
+A `cross_db_join` datasource then splits on **how** the blend is expressed:
+
+- **Modern logical / noli model → REBUILT.** When the datasource is a `<relation type='collection'>` of
+  **independent** tables (no physical `<clause>` join) with its join keys in a top-level `<relationships>`
+  block, each table is independent in the logical layer — the clean Fabric shape. `build_cross_db_model`
+  slices out **each side** to a single-connection `<datasource>`, runs it through the shared spine
+  (`parse_tds` → `select_storage_mode` → `emit_table_tmdl_m` / `emit_connection_parameters`), and lands it as
+  its **own** table via its **own** per-connector M (`Sql.Database` / `Snowflake.Databases` /
+  `Databricks.Catalogs`). The four global connection parameters (`Server` / `Database` / `Warehouse` /
+  `HttpPath`) are **renamed per side** (e.g. `#"Server_Orders"`, `#"Warehouse_RETURNS"`) so the combined model
+  never collides them. The join keys then become **model relationships**: each `<relationship>`'s
+  `<expression op='='>` operand pair is resolved by **relation + field, case-insensitively**, so a cross-DB
+  case mismatch (`Order_ID` vs `ORDER_ID`) and a Tableau-disambiguated key (`Region` vs the local name
+  `Region (people)`) both bind correctly. **No single federated cross-database query is attempted** — the sides
+  stay independent (a per-source / composite model). Status is `migrated_with_followups` (credentials, gateway,
+  and — when a Snowflake `warehouse=''` — a manual-warehouse prompt remain; the empty warehouse never fails the
+  rebuild). A key that cannot be bound to exactly one column per side is **reported** as an unresolved-key
+  follow-up rather than emitted wrong, and a partially-landed datasource lists its skipped sides.
+- **Physical `<clause>` join / union → deferred `fallback`.** When the relations are collapsed into ONE logical
+  table by a physical `join`/`union` tree (`_is_physical_join`), there is a real cross-source join to replicate,
+  which cannot be a single Import partition or independent tables. It is routed to `fallback` with a
+  `report.reason == "cross_db_join"` (plus per-side `connection_classes`) and a follow-up to land each side to
+  Delta and join in the lakehouse, or use a Power BI composite model. That rebuild is **deferred**.
 
 ---
 
@@ -128,9 +145,9 @@ Per-datasource status mirrors the estate model, with one documented marker for t
 | Status | Meaning |
 |---|---|
 | `migrated` | Rebuilt and fully supported (e.g. a clean relational DirectQuery/Import) |
-| `migrated_with_followups` | Rebuilt but needs manual action — flat-file `FilePath` repointing, or storage caveats |
+| `migrated_with_followups` | Rebuilt but needs manual action — flat-file `FilePath` repointing, storage caveats, or a **logical cross-database** model (per-side credentials / gateway / warehouse + relationship-cardinality review) |
 | `published_unresolved` | A `sqlproxy` reference with no resolver result; the referenced datasource is a follow-up |
-| `fallback` | Not safely rebuildable — spatial, **cross-database join**, structurally unsupported shape, or a clean-name column collision |
+| `fallback` | Not safely rebuildable — spatial, a **physical** cross-database `<clause>` join, structurally unsupported shape, or a clean-name column collision |
 | `error` | An exception was caught for this datasource |
 
 Each datasource is rebuilt inside its own `try/except`, so one bad source (including a resolver that raises)
@@ -186,9 +203,12 @@ only — no model `parts`, no raw XML, no credentials, secrets, paths, or GUIDs 
 
 ## Deferred scope
 
-- **Cross-database joins** are **detected** (span > 1 connection → `cross_db_join` fallback with land-to-Delta
-  / composite-model guidance), but the actual multi-source join rebuild — landing each side and re-expressing
-  the join — is deferred. A reference workbook with a cross-database-join datasource will drive that work.
+- **Cross-database joins** split by shape: a **logical** blend (a `collection` of independent tables with a
+  `<relationships>` key block) is **rebuilt** — each side landed via its own per-connector M, with the join
+  keys emitted as model relationships (a per-source / composite model; no federated cross-DB query). Only a
+  **physical** `<clause>` join/union tree (one logical table whose rows come from a cross-source join) is
+  **deferred** to `fallback` with land-to-Delta / composite-model guidance. Relationship **cardinality** is
+  emitted as the default many-to-one (Tableau's logical model encodes no cardinality) and flagged for review.
 - **Spatial** (`ogrdirect`) datasources are routed to `fallback` rather than approximated.
 - **Packaged data extraction** — packaged files are read only to confirm columns and auto-detect the CSV
   delimiter; the `FilePath` parameter still defaults to the original Tableau path and is a repoint follow-up.

@@ -37,12 +37,20 @@ Classification of each embedded ``<datasource>`` is by its inner ``<connection c
 * anything relational (``sqlserver`` / ``snowflake`` / ``postgres`` / ...) -> rebuilt via the
   existing spine (slice the element -> ``parse_tds`` -> ``assemble_import_model``).
 
-A single federated datasource can also be a CROSS-DATABASE JOIN: one ``<relation type='join'>``
-tree spanning more than one ``<named-connection>`` (e.g. Snowflake joined to a local CSV), each
-leaf relation carrying a different ``connection=`` id. That cannot be represented as one Import
-partition, so it is detected up front (the set of connections each datasource's relations span)
-and routed to ``fallback`` with a ``cross_db_join`` follow-up (land each side to Delta and join
-in the lakehouse, or use a composite model); the multi-source join rebuild itself is deferred.
+A single federated datasource can also be a CROSS-DATABASE JOIN: one ``<datasource>`` whose
+relation tree spans more than one ``<named-connection>`` (e.g. Snowflake blended with Azure SQL),
+each leaf relation carrying a different ``connection=`` id. Two shapes are handled differently:
+
+* A MODERN LOGICAL model (a ``<relation type='collection'>`` of INDEPENDENT tables, with the join
+  keys in a top-level ``<relationships>`` block and NO physical ``<clause>`` join) is REBUILT: each
+  side is landed through its own per-connector M (``Sql.Database`` / ``Snowflake.Databases`` /
+  ``Databricks.Catalogs``) as an independent table, and model relationships are emitted from the
+  ``op='='`` key pairs (tolerating case-mismatched / disambiguated key names). No single federated
+  cross-database query is attempted -- the result is a composite (per-source) model.
+* A PHYSICAL ``<clause>`` join/union tree (one logical table whose rows are produced by a
+  cross-source join) cannot be represented that way, so it is routed to ``fallback`` with a
+  ``cross_db_join`` follow-up (land each side to Delta and join in the lakehouse); that rebuild
+  is deferred.
 
 Honesty boundaries are inherited from the cores: column types come from Tableau metadata,
 structurally unsafe shapes (join/union trees, multi-connection datasources) fall back instead
@@ -51,6 +59,7 @@ of being emitted wrong, and credentials are never read, stored, or written.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import os
@@ -60,21 +69,23 @@ import zipfile
 import xml.etree.ElementTree as ET
 
 try:  # works whether imported as a package or run with scripts/ on sys.path
-    from .connection_to_m import parse_tds, escape_m_string
+    from .connection_to_m import (
+        parse_tds, escape_m_string, emit_table_tmdl_m, emit_connection_parameters)
     from .storage_mode import select_storage_mode
     from .assemble_model import assemble_import_model, write_model_folder
     from .tmdl_generate import (
         clean_col, generate_column_tmdl, q,
         generate_database_tmdl, generate_pbism, generate_platform,
-        generate_measures_table_tmdl)
+        generate_measures_table_tmdl, generate_relationships_tmdl)
 except ImportError:
-    from connection_to_m import parse_tds, escape_m_string
+    from connection_to_m import (
+        parse_tds, escape_m_string, emit_table_tmdl_m, emit_connection_parameters)
     from storage_mode import select_storage_mode
     from assemble_model import assemble_import_model, write_model_folder
     from tmdl_generate import (
         clean_col, generate_column_tmdl, q,
         generate_database_tmdl, generate_pbism, generate_platform,
-        generate_measures_table_tmdl)
+        generate_measures_table_tmdl, generate_relationships_tmdl)
 
 
 # -- connection-class taxonomy -------------------------------------------------
@@ -643,6 +654,19 @@ def _safe_part(name, used):
     return candidate
 
 
+def _param_suffix(name, used):
+    """A de-duplicated, identifier-safe suffix for per-side connection-parameter renaming.
+
+    Reduced to ``[A-Za-z0-9_]`` so the renamed ``expression Server_<suffix>`` declaration is a valid
+    unquoted TMDL identifier and the name is safe to list verbatim in ``PBI_QueryOrder``."""
+    base = re.sub(r"[^A-Za-z0-9_]+", "_", name or "").strip("_") or "T"
+    candidate, i = base, 2
+    while candidate.lower() in used:
+        candidate, i = f"{base}_{i}", i + 1
+    used.add(candidate.lower())
+    return candidate
+
+
 # -- relational rebuild (delegates to the spine) ------------------------------
 def build_relational_model(descriptor, *, model_name):
     """Rebuild a relational embedded datasource through the existing spine.
@@ -688,16 +712,377 @@ def _cross_db_fallback(span, model_name):
     }
 
 
+# -- cross-database LOGICAL rebuild (per-source land + model relationships) -----
+# The connection parameters the spine's M references as global ``#"Name"`` tokens. Combining
+# several single-connection sides into one model would collide them, so each side's tokens are
+# renamed to a per-table-suffixed name (in BOTH the table M and the expression declarations).
+_CROSS_DB_PARAM_TOKENS = ("Server", "Database", "Warehouse", "HttpPath")
+
+
+def _is_physical_join(ds):
+    """True when the datasource carries a PHYSICAL ``join`` / ``union`` relation tree.
+
+    Mirrors the connector core's combination test (``_is_combination_relation``): a ``join`` /
+    ``union`` relation, or any non-``collection`` relation that nests child ``<relation>``s,
+    collapses its leaves into ONE logical table whose rows come from a cross-source join -- that
+    cannot be landed as independent tables, so it stays a deferred fallback. A ``collection`` of
+    independent tables (the modern logical/noli model) is NOT a physical join and is rebuilt.
+    """
+    for rel in _findall_local(ds, "relation"):
+        rtype = (rel.get("type") or "").lower()
+        if rtype in ("join", "union"):
+            return True
+        if rtype != "collection" and _children_local(rel, "relation"):
+            return True
+    return False
+
+
+def _named_connection_map(ds):
+    """Map each declared ``<named-connection>`` id to its element (for per-side slicing)."""
+    out = {}
+    for holder in _findall_local(ds, "named-connections"):
+        for nc in _children_local(holder, "named-connection"):
+            name = nc.get("name")
+            if name:
+                out[name] = nc
+    return out
+
+
+def _cross_db_leaf_tables(ds):
+    """Distinct ``<relation type='table'>`` leaves that carry a ``connection=`` id.
+
+    De-duplicated by ``(connection id, table/name)`` so a physical/logical duplicate of the same
+    table is not landed twice. Each leaf names the connection it draws from -- the signal that
+    routes it to its own per-source slice.
+    """
+    leaves, seen = [], set()
+    for rel in _findall_local(ds, "relation"):
+        if (rel.get("type") or "").lower() != "table":
+            continue
+        conn_id = rel.get("connection")
+        if not conn_id:
+            continue
+        key = (conn_id, (rel.get("table") or rel.get("name") or "").lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        leaves.append((conn_id, rel))
+    return leaves
+
+
+def _slice_side_xml(named_conn_el, relation_el, metadata_records):
+    """Build a single-connection ``<datasource>`` slice for one cross-DB side.
+
+    Deep-copies the ONE matching ``<named-connection>``, the ONE leaf ``<relation>`` (lifted out of
+    its collection so it is a standalone table), and ALL column ``<metadata-record>``s. Carrying
+    every metadata-record is harmless -- ``parse_tds`` groups columns by ``<parent-name>`` and only
+    this relation's parent attaches; the others sit unused -- and keeps the slice independent of
+    where the records were nested in the original workbook.
+    """
+    new_ds = ET.Element("datasource")
+    conn = ET.SubElement(new_ds, "connection")
+    conn.set("class", "federated")
+    ncs = ET.SubElement(conn, "named-connections")
+    ncs.append(copy.deepcopy(named_conn_el))
+    conn.append(copy.deepcopy(relation_el))
+    mrs = ET.SubElement(conn, "metadata-records")
+    for mr in metadata_records:
+        mrs.append(copy.deepcopy(mr))
+    return ET.tostring(new_ds, encoding="unicode")
+
+
+def _rename_side_params(table_tmdl, expr_tmdl, suffix):
+    """Suffix the four global connection params in one side's TMDL so sides don't collide.
+
+    Returns ``(table_tmdl, expr_tmdl, [renamed names])``. The table M references each param as a
+    whole ``#"Name"`` token (the only ``#"..."`` tokens the connector emits -- schema/db/item are
+    plain-quoted literals), so a literal token replace is unambiguous; the declaration is rewritten
+    with a line-anchored substitution so a value that happens to contain the prefix is untouched.
+    """
+    renamed = []
+    for tok in _CROSS_DB_PARAM_TOKENS:
+        token_ref = f'#"{tok}"'
+        decl_re = re.compile(r'(?m)^expression %s = ' % re.escape(tok))
+        in_table = token_ref in table_tmdl
+        in_expr = bool(decl_re.search(expr_tmdl))
+        if not (in_table or in_expr):
+            continue
+        new_name = f"{tok}_{suffix}"
+        if in_table:
+            table_tmdl = table_tmdl.replace(token_ref, f'#"{new_name}"')
+        if in_expr:
+            expr_tmdl = decl_re.sub(f"expression {new_name} = ", expr_tmdl)
+        renamed.append(new_name)
+    return table_tmdl, expr_tmdl, renamed
+
+
+def _column_index(columns):
+    """Index a relation's columns for relationship resolution: each casefolded source/model/local
+    name -> the SET of model column names that name could refer to. A set (not a single value) lets
+    ``_resolve_operand`` treat a casefold collision between two distinct columns as ambiguous rather
+    than silently binding the first one."""
+    index = {}
+    for c in columns:
+        model = c["model_name"]
+        for key in (c.get("model_name"), c.get("remote_name"), c.get("local_name")):
+            if key:
+                index.setdefault(key.casefold(), set()).add(model)
+    return index
+
+
+def _operand_field(op):
+    """Split a relationship operand (``[Table].[Field]`` / ``[Field]`` / ``[a].[b].[Field]``) into
+    ``(table_or_None, field)``. The last bracket segment is the field; the one before it (if any)
+    is the table. Returns ``None`` when no bracketed segment is present."""
+    segs = re.findall(r"\[([^\[\]]+)\]", op or "")
+    if not segs:
+        return None
+    field = segs[-1]
+    table = segs[-2] if len(segs) >= 2 else None
+    return table, field
+
+
+def _resolve_operand(op, sides):
+    """Resolve one operand to ``(emitted_table, model_column)`` against the rebuilt sides.
+
+    Table and field are matched case-insensitively (cross-DB keys differ in case, and a join key may
+    be a Tableau-disambiguated ``Base (Table)`` local name), so resolution is by relation + field
+    rather than by exact text. A table-qualified operand is matched on the side's ORIGINAL Tableau
+    name but returns its EMITTED (possibly de-duplicated) display, so a renamed side still binds. A
+    field that resolves to more than one model column on a side (a casefold collision), or a bare
+    field exposed by more than one side, is ambiguous and left unresolved rather than emitted wrong.
+    Returns ``None`` when unresolved.
+    """
+    parsed = _operand_field(op)
+    if parsed is None:
+        return None
+    table, field = parsed
+    key = field.casefold()
+    matches = []
+    for side in sides:
+        if table is not None and side["match_name"].casefold() != table.casefold():
+            continue
+        models = side["index"].get(key)
+        if not models:
+            continue
+        if len(models) > 1:
+            return None  # ambiguous column within a side -> refuse to guess
+        matches.append((side["display"], next(iter(models))))
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _cross_db_relationships(ds, sides):
+    """Resolve the datasource's ``<relationships>`` key pairs into model relationships.
+
+    Returns ``(rels, unresolved)`` where ``rels`` feeds ``generate_relationships_tmdl`` (operand[0]
+    -> from, operand[1] -> to). A ``<relationship>`` that is not a single simple ``op='='`` equality
+    of two operands (e.g. a compound ``AND`` of keys or a non-equality predicate), or whose operands
+    cannot each bind to exactly one column per side, is recorded in ``unresolved`` (a follow-up)
+    rather than dropped silently or emitted wrong.
+    """
+    rels, unresolved = [], []
+    for relg in _findall_local(ds, "relationship"):
+        child_exprs = _children_local(relg, "expression")
+        eq = next((ex for ex in child_exprs if (ex.get("op") or "") == "="), None)
+        if eq is None:
+            if child_exprs:  # a relationship is declared but not a simple equality we can map
+                unresolved.append({"operands": [ex.get("op") for ex in child_exprs]})
+            continue
+        operands = [o.get("op") for o in _children_local(eq, "expression")]
+        if len(operands) != 2:
+            unresolved.append({"operands": operands})
+            continue
+        left = _resolve_operand(operands[0], sides)
+        right = _resolve_operand(operands[1], sides)
+        if left and right and left[0] != right[0]:
+            rels.append({"from_table": left[0], "from_col": left[1],
+                         "to_table": right[0], "to_col": right[1]})
+        else:
+            unresolved.append({"operands": operands})
+    return rels, unresolved
+
+
+def build_cross_db_model(datasource_xml, *, model_name):
+    """Rebuild a MODERN logical cross-database-join datasource into one composite model.
+
+    Each independent side (a ``<relation type='table'>`` drawing from its own ``<named-connection>``)
+    is sliced out, parsed through the shared spine (``parse_tds`` -> ``select_storage_mode`` ->
+    ``emit_table_tmdl_m`` / ``emit_connection_parameters``), and landed as its own table with its
+    connection parameters renamed per side to avoid collisions. Model relationships are then emitted
+    from the datasource's ``<relationships>`` key pairs. No single federated cross-database query is
+    attempted -- the sides stay independent (a per-source / composite model).
+
+    Returns ``{"status", "parts", "report", "followups"}``. ``status`` is ``migrated_with_followups``
+    when at least one side is landed (credentials / gateway / warehouse steps always remain), or
+    ``fallback`` when no side can be rebuilt.
+    """
+    ds = ET.fromstring(datasource_xml)
+    named_map = _named_connection_map(ds)
+    metadata_records = [mr for mr in _findall_local(ds, "metadata-record")
+                        if (mr.get("class") or "").lower() == "column"]
+    leaves = _cross_db_leaf_tables(ds)
+
+    sides = []
+    parts = {}
+    table_names = []
+    param_names = []
+    expr_blocks = []
+    followups = []
+    skipped = []
+    used_files = set()
+    used_suffixes = set()
+    used_displays = set()
+
+    for conn_id, relation_el in leaves:
+        named_conn_el = named_map.get(conn_id)
+        side_label = relation_el.get("name") or relation_el.get("table") or conn_id
+        if named_conn_el is None:
+            skipped.append({"table": side_label, "reason": f"no named-connection '{conn_id}'"})
+            followups.append(f'Side "{side_label}" references connection "{conn_id}", which is not '
+                             f"declared in <named-connections>; could not land it.")
+            continue
+
+        slice_xml = _slice_side_xml(named_conn_el, relation_el, metadata_records)
+        side_desc = parse_tds(slice_xml)
+        decision = select_storage_mode(side_desc)
+        table_rels = [r for r in side_desc.get("relations", [])
+                      if r.get("kind") in ("table", "custom_sql") and r.get("columns")]
+        if decision.get("mode") is None or not table_rels:
+            skipped.append({"table": side_label,
+                            "reason": decision.get("rationale") or "no typed columns"})
+            followups.append(f'Side "{side_label}" ({side_desc.get("connection_class") or "?"}) '
+                             f"could not be rebuilt directly ("
+                             f'{decision.get("rationale") or "no resolvable columns"}); land it to '
+                             f"Delta and add it to the model manually.")
+            continue
+
+        rel = table_rels[0]
+        clash = _collision(rel)
+        if clash:
+            skipped.append({"table": side_label,
+                            "reason": f"columns {clash[1]} both clean to '{clash[0]}'"})
+            followups.append(f'Side "{side_label}" has columns {clash[1]} that both clean to '
+                             f"'{clash[0]}'; cannot emit an unambiguous table.")
+            continue
+
+        table_tmdl = emit_table_tmdl_m(rel, side_desc, decision["mode"])
+        if table_tmdl is None:
+            skipped.append({"table": side_label, "reason": "no table TMDL emitted"})
+            continue
+        expr_tmdl = emit_connection_parameters(side_desc)
+
+        display = rel.get("name") or rel.get("item") or side_label
+        final_display = _safe_folder(display, used_displays)  # de-dupe table names case-insensitively
+        if final_display != display:
+            table_tmdl = table_tmdl.replace(f"table {q(display)}\n",
+                                            f"table {q(final_display)}\n", 1)
+
+        suffix = _param_suffix(display, used_suffixes)
+        table_tmdl, expr_tmdl, renamed = _rename_side_params(table_tmdl, expr_tmdl, suffix)
+
+        parts[f"definition/tables/{_safe_part(final_display, used_files)}.tmdl"] = table_tmdl
+        table_names.append(final_display)
+        param_names.extend(renamed)
+        if expr_tmdl.strip():
+            expr_blocks.append(expr_tmdl.rstrip("\n"))
+
+        if (side_desc.get("connection_class") or "").lower() == "snowflake" \
+                and not (side_desc.get("warehouse") or "").strip():
+            followups.append(f'Set the Snowflake warehouse for "{final_display}" '
+                             f'(#"Warehouse_{suffix}"); it was empty in the workbook.')
+
+        followups.extend(decision.get("manual_followups", []))
+        sides.append({
+            "display": final_display,
+            "match_name": display,  # original Tableau relation name, for operand resolution
+            "index": _column_index(rel["columns"]),
+            "n_columns": len(rel["columns"]),
+            "report": {
+                "relation": display,
+                "connection_class": side_desc.get("connection_class"),
+                "server": side_desc.get("server"),
+                "database": side_desc.get("database"),
+                "schema": rel.get("schema"),
+                "table": rel.get("item") or display,
+                "mode": decision.get("mode"),
+            },
+        })
+
+    if not sides:
+        return {
+            "status": "fallback",
+            "parts": {},
+            "report": {"model_name": model_name, "reason": "cross_db_join",
+                       "kind": "cross_db_join_logical", "skipped_sides": skipped},
+            "followups": followups or [
+                f'Cross-database datasource "{model_name}" had no independently rebuildable side; '
+                f"land each source to Delta and assemble the model manually."],
+        }
+
+    rels, unresolved = _cross_db_relationships(ds, sides)
+    relationships_tmdl = generate_relationships_tmdl(rels)
+
+    parts["definition/tables/_Measures.tmdl"] = generate_measures_table_tmdl("")
+    parts["definition/expressions.tmdl"] = "\n\n".join(expr_blocks) + "\n"
+    if relationships_tmdl:
+        parts["definition/relationships.tmdl"] = relationships_tmdl
+    parts["definition/model.tmdl"] = _model_tmdl_import(table_names + ["_Measures"], param_names)
+    parts["definition/database.tmdl"] = generate_database_tmdl()
+    parts["definition.pbism"] = generate_pbism()
+    parts[".platform"] = generate_platform(model_name)
+
+    if rels:
+        followups.append(f'Verify relationship cardinality for "{model_name}": the cross-database '
+                         f"keys were emitted as the default many-to-one (no cardinality is encoded "
+                         f"in the Tableau logical model); set the \"one\" side per key as needed.")
+    for u in unresolved:
+        followups.append(f'Could not bind join key {u["operands"]} in "{model_name}" to exactly one '
+                         f"column per side (case/name mismatch or ambiguous); add that relationship "
+                         f"manually.")
+    if skipped:
+        followups.append(f'"{model_name}" was rebuilt partially: '
+                         f"{', '.join(s['table'] for s in skipped)} could not be landed; "
+                         f"relationships touching those tables were omitted.")
+
+    # de-dupe follow-ups while preserving first-seen order
+    followups = list(dict.fromkeys(followups))
+    report = {
+        "model_name": model_name,
+        "kind": "cross_db_join_logical",
+        "storage_mode": "Composite (per-source DirectQuery)",
+        "connections": [s["report"] for s in sides],
+        "tables": table_names,
+        "join_keys": rels,
+        "unresolved_join_keys": unresolved,
+        "skipped_sides": skipped,
+        "column_count": sum(s["n_columns"] for s in sides),
+    }
+    return {"status": "migrated_with_followups", "parts": parts,
+            "report": report, "followups": followups}
+
+
+def _rebuild_cross_db(datasource_xml, model_name):
+    """Route a cross-database-join datasource: PHYSICAL ``<clause>`` join -> deferred fallback;
+    MODERN logical (collection + ``<relationships>``) -> per-source rebuild."""
+    ds = ET.fromstring(datasource_xml)
+    if _is_physical_join(ds):
+        return _cross_db_fallback(_connection_span(ds), model_name)
+    return build_cross_db_model(datasource_xml, model_name=model_name)
+
+
 def _rebuild_from_xml(datasource_xml, *, model_name, package_path=None, flat_file=None):
     """Parse a single ``<datasource>`` slice and dispatch it to the right builder.
 
     Shared by the relational path and the resolved-published path so a published ``.tds`` that
     turns out to be a flat file is rebuilt with real Excel/CSV M, not a null scaffold (and a
-    published ``.tds`` that is itself a cross-database join falls back honestly).
+    published ``.tds`` that is itself a cross-database join is split into a logical rebuild or a
+    deferred physical-join fallback exactly like an embedded one).
     """
     span = _connection_span(ET.fromstring(datasource_xml))
     if span["cross_db_join"]:
-        return _cross_db_fallback(span, model_name)
+        return _rebuild_cross_db(datasource_xml, model_name)
     descriptor = parse_tds(datasource_xml)
     connection_class = (descriptor.get("connection_class") or "").lower()
     classification = _classify(connection_class)
@@ -810,7 +1195,7 @@ def _rebuild_entry(entry, caption):
     """Rebuild a single enumeration entry into a model result dict (may raise; caller isolates)."""
     classification = entry["classification"]
     if classification == "cross_db_join":
-        return _cross_db_fallback(_connection_span(ET.fromstring(entry["datasource_xml"])), caption)
+        return _rebuild_cross_db(entry["datasource_xml"], caption)
     if classification == "published_reference":
         return _rebuild_published(entry, caption)
     if classification == "spatial":

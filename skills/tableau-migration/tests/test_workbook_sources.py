@@ -6,6 +6,7 @@ CSV header auto-detection paths are all exercised without any network or credent
 """
 import json
 import os
+import re
 import zipfile
 
 import pytest
@@ -14,10 +15,13 @@ from workbook_sources import (
     enumerate_workbook_datasources,
     rebuild_workbook_models,
     build_flatfile_model,
+    build_cross_db_model,
+    _is_physical_join,
     _manifest,
     main,
 )
 from connection_to_m import parse_tds
+import xml.etree.ElementTree as ET
 
 
 # -- fixtures (structurally faithful, trimmed) --------------------------------
@@ -354,6 +358,306 @@ def test_cross_db_join_isolated_from_healthy_sources():
     assert res["models"]["Blended Sales"]["status"] == "fallback"
     assert res["models"]["Sample - Superstore"]["status"] == "migrated_with_followups"
     assert res["models"]["Live Orders"]["status"] == "migrated"
+
+
+# -- cross-database join LOGICAL rebuild (per-source land + model relationships) ----
+# A SINGLE federated datasource whose <relation type='collection'> groups THREE INDEPENDENT
+# tables, each from a DIFFERENT cloud connection (Azure SQL / Snowflake / Databricks). There is
+# NO physical <clause> join -- the join keys live in a top-level <relationships> block. This is
+# the modern logical/noli model: each side is landed via its own per-connector M and the keys
+# become model relationships (NOT a deferred fallback). Placeholder hosts only -- no real
+# credentials. Snowflake warehouse is empty (-> P4 prompt, must not fail). The two join keys
+# exercise a cross-DB case mismatch (Order_ID vs ORDER_ID) and a disambiguated/renamed key
+# (Region vs the local name "Region (people)").
+XDB_LOGICAL_DS = """
+    <datasource caption='Orders+ (Multiple Connections)' inline='true' name='federated.multi'>
+      <connection class='federated'>
+        <named-connections>
+          <named-connection caption='HOST_A' name='azure_sqldb.A'>
+            <connection class='azure_sqldb' authentication='sqlserver' dbname='DB_A'
+                        server='host-a.placeholder.net' username='USER_A'/>
+          </named-connection>
+          <named-connection caption='HOST_B' name='snowflake.B'>
+            <connection class='snowflake' authentication='Username Password' dbname='DB_B'
+                        schema='PUBLIC' server='host-b.placeholder.net' username='USER_B' warehouse=''/>
+          </named-connection>
+          <named-connection caption='HOST_C' name='databricks.C'>
+            <connection class='databricks' authentication='oauth' dbname='CATALOG_C' schema='default'
+                        server='host-c.placeholder.net' http-path='/sql/1.0/warehouses/WID'/>
+          </named-connection>
+        </named-connections>
+        <relation type='collection'>
+          <relation connection='azure_sqldb.A' name='Orders'  table='[dbo].[Orders]' type='table'/>
+          <relation connection='snowflake.B'   name='RETURNS' table='[PUBLIC].[RETURNS]' type='table'/>
+          <relation connection='databricks.C'  name='people'  table='[default].[people]' type='table'/>
+        </relation>
+        <metadata-records>
+          <metadata-record class='column'><remote-name>Order_ID</remote-name>
+            <local-name>[Order_ID]</local-name><parent-name>[Orders]</parent-name><local-type>integer</local-type></metadata-record>
+          <metadata-record class='column'><remote-name>Region</remote-name>
+            <local-name>[Region]</local-name><parent-name>[Orders]</parent-name><local-type>string</local-type></metadata-record>
+          <metadata-record class='column'><remote-name>ORDER_ID</remote-name>
+            <local-name>[ORDER_ID]</local-name><parent-name>[RETURNS]</parent-name><local-type>integer</local-type></metadata-record>
+          <metadata-record class='column'><remote-name>Reason</remote-name>
+            <local-name>[Reason]</local-name><parent-name>[RETURNS]</parent-name><local-type>string</local-type></metadata-record>
+          <metadata-record class='column'><remote-name>Region</remote-name>
+            <local-name>[Region (people)]</local-name><parent-name>[people]</parent-name><local-type>string</local-type></metadata-record>
+          <metadata-record class='column'><remote-name>Manager</remote-name>
+            <local-name>[Manager]</local-name><parent-name>[people]</parent-name><local-type>string</local-type></metadata-record>
+        </metadata-records>
+      </connection>
+      <relationships>
+        <relationship><expression op='='>
+          <expression op='[Orders].[Order_ID]'/><expression op='[RETURNS].[ORDER_ID]'/></expression></relationship>
+        <relationship><expression op='='>
+          <expression op='[Orders].[Region]'/><expression op='[people].[Region (people)]'/></expression></relationship>
+      </relationships>
+    </datasource>"""
+
+
+def test_cross_db_logical_detected_in_enumeration():
+    entry = enumerate_workbook_datasources(_workbook(XDB_LOGICAL_DS))[0]
+    assert entry["cross_db_join"] is True
+    assert entry["classification"] == "cross_db_join"
+    assert set(entry["named_connections"]) == {"azure_sqldb.A", "snowflake.B", "databricks.C"}
+
+
+def test_physical_vs_logical_split():
+    # the modern logical (collection) shape is rebuildable; a physical <clause> join is not
+    assert _is_physical_join(ET.fromstring(CROSS_DB_DS)) is True
+    assert _is_physical_join(ET.fromstring(XDB_LOGICAL_DS)) is False
+
+
+def test_cross_db_logical_rebuilds_each_side_with_its_own_connector():
+    res = rebuild_workbook_models(_workbook(XDB_LOGICAL_DS))
+    model = res["models"]["Orders+ (Multiple Connections)"]
+    assert model["status"] == "migrated_with_followups"
+    assert model["report"]["kind"] == "cross_db_join_logical"
+
+    # each side lands through its OWN per-connector M, with per-side renamed connection params
+    orders = model["parts"]["definition/tables/Orders.tmdl"]
+    assert 'Sql.Database(#"Server_Orders", #"Database_Orders")' in orders
+    assert 'Source{[Schema="dbo", Item="Orders"]}[Data]' in orders
+    assert "mode: directQuery" in orders
+
+    returns = model["parts"]["definition/tables/RETURNS.tmdl"]
+    assert 'Snowflake.Databases(#"Server_RETURNS", #"Warehouse_RETURNS")' in returns
+    assert '[Name="DB_B", Kind="Database"]' in returns
+    assert '[Name="RETURNS", Kind="Table"]' in returns
+
+    people = model["parts"]["definition/tables/people.tmdl"]
+    assert 'Databricks.Catalogs(#"Server_people", #"HttpPath_people")' in people
+    assert '[Name="CATALOG_C", Kind="Database"]' in people
+
+    # NO single federated cross-database query: three independent partitions, no shared param tokens
+    exprs = model["parts"]["definition/expressions.tmdl"]
+    for name in ("Server_Orders", "Database_Orders", "Server_RETURNS", "Warehouse_RETURNS",
+                 "Server_people", "HttpPath_people"):
+        assert f"expression {name} =" in exprs
+    # the un-suffixed (colliding) tokens never survive into the combined model
+    assert '#"Server"' not in orders + returns + people
+    assert '#"Database"' not in orders + returns + people
+
+    model_tmdl = model["parts"]["definition/model.tmdl"]
+    for t in ("Orders", "RETURNS", "people", "_Measures"):
+        assert f"ref table {t}" in model_tmdl
+
+
+def test_cross_db_logical_emits_relationships_tolerating_case_and_rename():
+    res = rebuild_workbook_models(_workbook(XDB_LOGICAL_DS))
+    model = res["models"]["Orders+ (Multiple Connections)"]
+    rels = model["parts"]["definition/relationships.tmdl"]
+    # case-mismatched key across DBs resolves by relation+field (Order_ID -> ORDER_ID)
+    assert "fromColumn: Orders.Order_ID" in rels
+    assert "toColumn: RETURNS.ORDER_ID" in rels
+    # disambiguated/renamed key: the local name "Region (people)" binds to the model column "Region"
+    assert "fromColumn: Orders.Region" in rels
+    assert "toColumn: people.Region" in rels
+
+    keys = model["report"]["join_keys"]
+    assert {"from_table": "Orders", "from_col": "Order_ID",
+            "to_table": "RETURNS", "to_col": "ORDER_ID"} in keys
+    assert model["report"]["unresolved_join_keys"] == []
+
+
+def test_cross_db_logical_records_each_side_in_report():
+    res = rebuild_workbook_models(_workbook(XDB_LOGICAL_DS))
+    report = res["models"]["Orders+ (Multiple Connections)"]["report"]
+    by_class = {c["connection_class"]: c for c in report["connections"]}
+    assert by_class["azure_sqldb"]["table"] == "Orders"
+    assert by_class["azure_sqldb"]["database"] == "DB_A"
+    assert by_class["snowflake"]["schema"] == "PUBLIC"
+    assert by_class["snowflake"]["server"] == "host-b.placeholder.net"
+    assert by_class["databricks"]["database"] == "CATALOG_C"
+    assert all(c["mode"] == "DirectQuery" for c in report["connections"])
+
+
+def test_cross_db_logical_empty_snowflake_warehouse_prompts_not_fails():
+    res = rebuild_workbook_models(_workbook(XDB_LOGICAL_DS))
+    model = res["models"]["Orders+ (Multiple Connections)"]
+    # the empty warehouse must NOT abort the rebuild
+    assert model["status"] == "migrated_with_followups"
+    assert 'expression Warehouse_RETURNS = ""' in model["parts"]["definition/expressions.tmdl"]
+    msgs = [f["message"] for f in res["followups"]
+            if f["datasource"] == "Orders+ (Multiple Connections)"]
+    assert any("Snowflake warehouse" in m and "Warehouse_RETURNS" in m for m in msgs)
+    assert any("cardinality" in m for m in msgs)
+
+
+def test_cross_db_logical_unresolvable_key_reported_not_emitted_wrong():
+    # a relationship operand that names no real field stays unresolved (reported), and the rest
+    # of the model is still built honestly.
+    variant = XDB_LOGICAL_DS.replace(
+        "<expression op='[Orders].[Region]'/><expression op='[people].[Region (people)]'/>",
+        "<expression op='[Orders].[Nonexistent]'/><expression op='[people].[Region (people)]'/>")
+    res = rebuild_workbook_models(_workbook(variant))
+    model = res["models"]["Orders+ (Multiple Connections)"]
+    assert model["status"] == "migrated_with_followups"
+    rels = model["parts"]["definition/relationships.tmdl"]
+    assert "Orders.Order_ID" in rels                  # the good key still emits
+    assert "people.Region" not in rels                # the unresolvable one does not
+    assert len(model["report"]["unresolved_join_keys"]) == 1
+    msgs = [f["message"] for f in res["followups"]]
+    assert any("Could not bind join key" in m for m in msgs)
+
+
+def test_cross_db_logical_isolated_from_healthy_sources():
+    res = rebuild_workbook_models(_workbook(XDB_LOGICAL_DS, EXCEL_DS, SQLSERVER_DS))
+    assert res["models"]["Orders+ (Multiple Connections)"]["status"] == "migrated_with_followups"
+    assert res["models"]["Sample - Superstore"]["status"] == "migrated_with_followups"
+    assert res["models"]["Live Orders"]["status"] == "migrated"
+
+
+def test_cross_db_logical_direct_builder_returns_parts():
+    # the public builder seam the orchestrator calls returns a complete model definition
+    out = build_cross_db_model(XDB_LOGICAL_DS, model_name="Orders+ (Multiple Connections)")
+    assert out["status"] == "migrated_with_followups"
+    assert set(out["report"]["tables"]) == {"Orders", "RETURNS", "people"}
+    assert "definition/model.tmdl" in out["parts"]
+    assert "definition/relationships.tmdl" in out["parts"]
+
+
+# A minimal TWO-connection logical datasource (two Azure SQL hosts -> still cross-DB by connection
+# span) used to exercise the harder edge cases: identifier-unsafe table names, casefold-only column
+# collisions, duplicate emitted display names, and compound/unsupported relationship predicates.
+def _logical_two(rel_a, cols_a, rel_b, cols_b, relationships):
+    def _records(parent, cols):
+        return "".join(
+            f"<metadata-record class='column'><remote-name>{r}</remote-name>"
+            f"<local-name>[{l}]</local-name><parent-name>[{parent}]</parent-name>"
+            f"<local-type>{t}</local-type></metadata-record>"
+            for r, l, t in cols)
+    return f"""
+    <datasource caption='Edge' name='federated.edge'>
+      <connection class='federated'>
+        <named-connections>
+          <named-connection caption='A' name='azure_sqldb.A'>
+            <connection class='azure_sqldb' dbname='DB_A' server='a.placeholder.net'/>
+          </named-connection>
+          <named-connection caption='B' name='azure_sqldb.B'>
+            <connection class='azure_sqldb' dbname='DB_B' server='b.placeholder.net'/>
+          </named-connection>
+        </named-connections>
+        <relation type='collection'>
+          <relation connection='azure_sqldb.A' name="{rel_a}" table='[dbo].[{rel_a}]' type='table'/>
+          <relation connection='azure_sqldb.B' name="{rel_b}" table='[dbo].[{rel_b}]' type='table'/>
+        </relation>
+        <metadata-records>
+          {_records(rel_a, cols_a)}
+          {_records(rel_b, cols_b)}
+        </metadata-records>
+      </connection>
+      <relationships>{relationships}</relationships>
+    </datasource>"""
+
+
+def test_cross_db_logical_param_suffix_is_identifier_safe():
+    # a relation name with apostrophes/dots/brackets must not leak into the (unquoted) expression
+    # name or the PBI_QueryOrder annotation, or the TMDL would be invalid. (The messy text lives in
+    # the relation NAME, which drives the param suffix; the table item stays clean.)
+    ds = """
+    <datasource caption='Edge' name='federated.edge'>
+      <connection class='federated'>
+        <named-connections>
+          <named-connection caption='A' name='azure_sqldb.A'>
+            <connection class='azure_sqldb' dbname='DB_A' server='a.placeholder.net'/>
+          </named-connection>
+          <named-connection caption='B' name='azure_sqldb.B'>
+            <connection class='azure_sqldb' dbname='DB_B' server='b.placeholder.net'/>
+          </named-connection>
+        </named-connections>
+        <relation type='collection'>
+          <relation connection='azure_sqldb.A' name="O'Brien.Sales[2024]" table='[dbo].[Sales]' type='table'/>
+          <relation connection='azure_sqldb.B' name='People' table='[dbo].[People]' type='table'/>
+        </relation>
+        <metadata-records>
+          <metadata-record class='column'><remote-name>K</remote-name>
+            <local-name>[K]</local-name><parent-name>[Sales]</parent-name><local-type>integer</local-type></metadata-record>
+          <metadata-record class='column'><remote-name>K</remote-name>
+            <local-name>[K]</local-name><parent-name>[People]</parent-name><local-type>integer</local-type></metadata-record>
+        </metadata-records>
+      </connection>
+    </datasource>"""
+    model = rebuild_workbook_models(_workbook(ds))["models"]["Edge"]
+    assert model["status"] == "migrated_with_followups"
+    exprs = model["parts"]["definition/expressions.tmdl"]
+    names = re.findall(r"(?m)^expression (\S+) =", exprs)
+    assert names                                   # params were emitted
+    for n in names:
+        assert re.fullmatch(r"[A-Za-z0-9_]+", n), f"unsafe expression name: {n}"
+    # the messy original text never reaches the query-order annotation
+    order_line = [ln for ln in model["parts"]["definition/model.tmdl"].splitlines()
+                  if "PBI_QueryOrder" in ln][0]
+    assert "O'Brien" not in order_line and "[2024]" not in order_line
+
+
+def test_cross_db_logical_casefold_column_collision_is_ambiguous_not_wrong():
+    # 'Region' and 'REGION' are DISTINCT model columns but collide under casefold; a key on that
+    # name must be left unresolved rather than silently bound to the first one.
+    rels = ("<relationship><expression op='='>"
+            "<expression op='[A].[Region]'/><expression op='[B].[Key]'/></expression></relationship>")
+    ds = _logical_two(
+        "A", [("Region", "Region", "string"), ("REGION", "REGION", "string")],
+        "B", [("Key", "Key", "integer")],
+        rels)
+    model = rebuild_workbook_models(_workbook(ds))["models"]["Edge"]
+    assert model["status"] == "migrated_with_followups"
+    assert "definition/relationships.tmdl" not in model["parts"]   # nothing bound
+    assert len(model["report"]["unresolved_join_keys"]) == 1
+
+
+def test_cross_db_logical_duplicate_display_names_do_not_overwrite():
+    # two leaves that share a name from different connections must each get a distinct table part
+    # and a distinct ref, never silently clobbering one another.
+    ds = _logical_two(
+        "Shared", [("K", "K", "integer")],
+        "Shared", [("K", "K", "integer")],
+        "")
+    model = rebuild_workbook_models(_workbook(ds))["models"]["Edge"]
+    assert model["status"] == "migrated_with_followups"
+    table_parts = [p for p in model["parts"] if p.startswith("definition/tables/")
+                   and not p.endswith("_Measures.tmdl")]
+    assert len(table_parts) == 2                                   # both landed, no overwrite
+    assert len(set(model["report"]["tables"])) == 2               # distinct emitted names
+
+
+def test_cross_db_logical_compound_relationship_is_surfaced_not_dropped():
+    # a compound (AND of equalities) predicate is not a simple key we can map -> it must surface as
+    # an unresolved follow-up rather than vanish silently.
+    rels = ("<relationship><expression op='AND'>"
+            "<expression op='='><expression op='[A].[K]'/><expression op='[B].[K]'/></expression>"
+            "<expression op='='><expression op='[A].[J]'/><expression op='[B].[J]'/></expression>"
+            "</expression></relationship>")
+    ds = _logical_two(
+        "A", [("K", "K", "integer"), ("J", "J", "integer")],
+        "B", [("K", "K", "integer"), ("J", "J", "integer")],
+        rels)
+    model = rebuild_workbook_models(_workbook(ds))["models"]["Edge"]
+    assert model["status"] == "migrated_with_followups"
+    assert "definition/relationships.tmdl" not in model["parts"]
+    assert len(model["report"]["unresolved_join_keys"]) == 1
+    assert any("Could not bind join key" in f["message"] for f in
+               rebuild_workbook_models(_workbook(ds))["followups"])
 
 
 # -- packaged .twbx: zip read + CSV delimiter auto-detection -------------------
