@@ -52,8 +52,8 @@ fields that drive the decision:
 
 | Tier | Connector classes | M emission |
 |---|---|---|
-| **Fully supported** | `sqlserver`/`azure_sqldb`/`azure_sql_dw` (Synapse)/`microsoft_fabric_sql_endpoint` (Fabric)→`Sql.Database`, `postgres`→`PostgreSQL.Database`, `mysql`→`MySQL.Database`, `redshift`→`AmazonRedshift.Database` (server+database), `oracle`/`teradata`→`Oracle.Database`/`Teradata.Database` (server-only, flat nav), `snowflake`→`Snowflake.Databases` (server+warehouse, db→schema→table nav), `databricks`→`Databricks.Catalogs` (host+HTTP path, catalog→schema→table nav) | Deploy-ready M |
-| **Partial (scaffold)** | `bigquery`→`GoogleBigQuery.Database` | Mode chosen, M emitted as a clearly-flagged scaffold |
+| **Fully supported** | `sqlserver`/`azure_sqldb`/`azure_sql_dw` (Synapse)/`microsoft_fabric_sql_endpoint` (Fabric)→`Sql.Database`, `postgres`→`PostgreSQL.Database`, `mysql`→`MySQL.Database`, `redshift`→`AmazonRedshift.Database` (server+database), `oracle`→`Oracle.Database` (server-only, flat nav), `snowflake`→`Snowflake.Databases` (server+warehouse, db→schema→table nav), `databricks`→`Databricks.Catalogs` (host+HTTP path, catalog→schema→table nav) | Deploy-ready M |
+| **Partial (scaffold)** | `bigquery`→`GoogleBigQuery.Database`, `teradata`→`Teradata.Database` | Mode chosen, M emitted as a clearly-flagged scaffold |
 | **Flat file** | `excel-direct`/`excel`→`Excel.Workbook`, `textscan`/`csv`→`Csv.Document` | Import; path-based scaffold (needs file path) |
 | **Analysis Services** | `msolap`, `sqlserver-analysis-services` | Not an M rebuild — routed to `analysis-services-model-migration` (migrate the model directly via XMLA / semantic-model import) |
 | **Unmapped** | anything else | Fall back to land-to-Delta + DirectLake |
@@ -68,20 +68,20 @@ fields that drive the decision:
 > string only causes a safe fallback (never wrong M); the TDS→`Sql.Database` mapping is the verified fact.
 
 > Tier membership is gated on a verified fact (from the Power Query M docs). The `(server, database)`
-> family (including Synapse + Fabric), Oracle and Teradata (`Fn(server, [options])`, server-only with
+> family (including Synapse + Fabric), Oracle (`Oracle.Database(server, [options])`, server-only with
 > `HierarchicalNavigation=false` and flat `[Schema, Item]` navigation), Snowflake
 > (`Snowflake.Databases(server, warehouse)` then `[Name, Kind]` navigation), and Databricks
 > (`Databricks.Catalogs(host, httpPath, [options])` then catalog→schema→table `[Name, Kind]` navigation)
 > are **Fully supported** — each emitted from its own verified signature, never a guessed call. Oracle,
-> Teradata, Databricks, and the `(server, database)` family are doc-verified (Teradata reuses Oracle's
-> verified server-only flat-nav path; both share the documented `HierarchicalNavigation=false` behavior);
-> Snowflake is doc-informed (no M function reference page exists). Oracle, Teradata, Snowflake, and
-> Databricks have **no live instance** in the validation environment (Azure SQL only), so **live
-> reconciliation is pending**; for Databricks the HTTP path value and Unity Catalog name aren't carried
-> portably in the `.tds`, so they are surfaced as a manual follow-up rather than guessed. `bigquery`
-> (`GoogleBigQuery.Database`) has no M function reference page, so its project/dataset/table navigation
-> and billing-project/project identifiers (it has no server) aren't verifiable offline — it is recognized
-> but emitted as a flagged scaffold, never wrong M.
+> Databricks, and the `(server, database)` family are doc-verified; Snowflake is doc-informed (no M
+> function reference page exists). Oracle, Snowflake, and Databricks have **no live instance** in the
+> validation environment (Azure SQL only), so **live reconciliation is pending**; for Databricks the HTTP
+> path value and Unity Catalog name aren't carried portably in the `.tds`, so they are surfaced as a manual
+> follow-up rather than guessed. `teradata` (`Teradata.Database`) has a documented server-only signature,
+> but with **no live navigator** to confirm the emitted body binds it is held at the scaffold tier rather
+> than shipped as deploy-ready M; `bigquery` (`GoogleBigQuery.Database`) has no M function reference page,
+> so its project/dataset/table navigation and billing-project/project identifiers (it has no server) aren't
+> verifiable offline. Both are recognized but emitted as flagged scaffolds, never wrong M.
 
 > **Analysis Services is not a datasource→M rebuild.** `msolap` / `sqlserver-analysis-services` is already a
 > tabular/multidimensional semantic model. `select_storage_mode` returns `mode=None` with
@@ -99,7 +99,7 @@ fields that drive the decision:
 |---|---|
 | `mode` | `"Import"`, `"DirectQuery"`, or `None` (fall back) |
 | `connector` | Power Query connector function, or `None` |
-| `fully_supported` | `True` for a doc-verified deploy-ready connector (the `(server, database)` family incl. Synapse + Fabric, plus Oracle, Teradata, Snowflake, and Databricks); `False` ⇒ scaffold |
+| `fully_supported` | `True` for a doc-verified deploy-ready connector (the `(server, database)` family incl. Synapse + Fabric, plus Oracle, Snowflake, and Databricks); `False` ⇒ scaffold (e.g. Teradata, BigQuery) |
 | `uses_native_query` | `True` if a custom-SQL relation is present |
 | `direct_upstream_available` | For an extract: a live DirectQuery rebuild is also possible |
 | `fallback` | `"land-to-delta-directlake"` when `mode is None` for a relational source; `"analysis-services-model-migration"` for an SSAS/MSOLAP source |
@@ -117,7 +117,7 @@ fields that drive the decision:
 | Live, fully-supported connector → DirectQuery | 95 |
 | Extract over a fully-supported live source → Import | 90 |
 | Flat file (Excel/CSV) → Import | 80 |
-| Recognized scaffold connector (BigQuery) | 60 |
+| Recognized scaffold connector (Teradata, BigQuery) | 60 |
 | Unknown / structurally unsupported → fallback | 30 |
 | Analysis Services (`msolap`) → model-migration fallback | 30 |
 | *Custom-SQL native query present* | −10 (folding review needed) |

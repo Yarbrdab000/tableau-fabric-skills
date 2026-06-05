@@ -355,6 +355,246 @@ DATABRICKS_COLLECTION = """<?xml version='1.0' encoding='utf-8' ?>
   </connection>
 </datasource>"""
 
+# A single-connection federated star whose joins live in <object-graph><relationships>.
+# Authored (not derived from any real .tds): tables SALE / REP / RMA, with one join key that
+# carries a space ("Order Key") so the emitted relationship must reference the cleaned model
+# identifier ("Order_Key"), and one renamed endpoint ("[REGION (REP)]") whose ' (REP)' caption
+# suffix must be stripped before resolving against REP's columns.
+FEDERATED_STAR = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Star' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='sf' name='snowflake.s'>
+        <connection authentication='Username Password' class='snowflake' dbname='ANALYTICS'
+                    schema='PUBLIC' server='acct.snowflakecomputing.com'
+                    username='svc_loader' warehouse='WH1' />
+      </named-connection>
+    </named-connections>
+    <relation type='collection'>
+      <relation connection='snowflake.s' name='SALE' table='[ANALYTICS].[PUBLIC].[SALE]' type='table' />
+      <relation connection='snowflake.s' name='REP' table='[ANALYTICS].[PUBLIC].[REP]' type='table' />
+      <relation connection='snowflake.s' name='RMA' table='[ANALYTICS].[PUBLIC].[RMA]' type='table' />
+    </relation>
+    <object-graph>
+      <objects>
+        <object caption='SALE' id='SALE (ANALYTICS.SALE)_A1'>
+          <properties>
+            <relation connection='snowflake.s' name='SALE' table='[ANALYTICS].[PUBLIC].[SALE]' type='table' />
+          </properties>
+        </object>
+        <object caption='REP' id='REP (ANALYTICS.REP)_B2'>
+          <properties>
+            <relation connection='snowflake.s' name='REP' table='[ANALYTICS].[PUBLIC].[REP]' type='table' />
+          </properties>
+        </object>
+        <object caption='RMA' id='RMA (ANALYTICS.RMA)_C3'>
+          <properties>
+            <relation connection='snowflake.s' name='RMA' table='[ANALYTICS].[PUBLIC].[RMA]' type='table' />
+          </properties>
+        </object>
+      </objects>
+      <relationships>
+        <relationship>
+          <expression op='='>
+            <expression op='[REGION]' />
+            <expression op='[REGION (REP)]' />
+          </expression>
+          <first-end-point object-id='SALE (ANALYTICS.SALE)_A1' />
+          <second-end-point object-id='REP (ANALYTICS.REP)_B2' />
+        </relationship>
+        <relationship>
+          <expression op='='>
+            <expression op='[Order Key]' />
+            <expression op='[Order Key (RMA)]' />
+          </expression>
+          <first-end-point object-id='SALE (ANALYTICS.SALE)_A1' />
+          <second-end-point object-id='RMA (ANALYTICS.RMA)_C3' />
+        </relationship>
+      </relationships>
+    </object-graph>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Order Key</remote-name><local-name>[Order Key]</local-name>
+        <parent-name>[SALE]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>REGION</remote-name><local-name>[REGION]</local-name>
+        <parent-name>[SALE]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>AMT</remote-name><local-name>[AMT]</local-name>
+        <parent-name>[SALE]</parent-name><local-type>real</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>REGION</remote-name><local-name>[REGION]</local-name>
+        <parent-name>[REP]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>REP_NAME</remote-name><local-name>[REP_NAME]</local-name>
+        <parent-name>[REP]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Order Key</remote-name><local-name>[Order Key]</local-name>
+        <parent-name>[RMA]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>RMA_FLAG</remote-name><local-name>[RMA_FLAG]</local-name>
+        <parent-name>[RMA]</parent-name><local-type>string</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+# Same object-graph shape, but with relationships that must each be skipped + recorded in
+# relationship_warnings rather than emitted: one references a column absent from the endpoint
+# table (stale/calculated join), one is a composite AND predicate (multi-column), and one is
+# genuinely ambiguous (both join keys exist on both tables, so the orientation can't be trusted).
+FEDERATED_REL_EDGECASE = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Edge' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='sf' name='snowflake.s'>
+        <connection authentication='Username Password' class='snowflake' dbname='ANALYTICS'
+                    schema='PUBLIC' server='acct.snowflakecomputing.com' warehouse='WH1' />
+      </named-connection>
+    </named-connections>
+    <relation type='collection'>
+      <relation connection='snowflake.s' name='SALE' table='[ANALYTICS].[PUBLIC].[SALE]' type='table' />
+      <relation connection='snowflake.s' name='REP' table='[ANALYTICS].[PUBLIC].[REP]' type='table' />
+    </relation>
+    <object-graph>
+      <objects>
+        <object caption='SALE' id='SALE (ANALYTICS.SALE)_A1'>
+          <properties>
+            <relation connection='snowflake.s' name='SALE' table='[ANALYTICS].[PUBLIC].[SALE]' type='table' />
+          </properties>
+        </object>
+        <object caption='REP' id='REP (ANALYTICS.REP)_B2'>
+          <properties>
+            <relation connection='snowflake.s' name='REP' table='[ANALYTICS].[PUBLIC].[REP]' type='table' />
+          </properties>
+        </object>
+      </objects>
+      <relationships>
+        <relationship>
+          <expression op='='>
+            <expression op='[REGION]' />
+            <expression op='[REGION]' />
+          </expression>
+          <first-end-point object-id='SALE (ANALYTICS.SALE)_A1' />
+          <second-end-point object-id='REP (ANALYTICS.REP)_B2' />
+        </relationship>
+        <relationship>
+          <expression op='='>
+            <expression op='[GHOST_KEY]' />
+            <expression op='[REGION]' />
+          </expression>
+          <first-end-point object-id='SALE (ANALYTICS.SALE)_A1' />
+          <second-end-point object-id='REP (ANALYTICS.REP)_B2' />
+        </relationship>
+        <relationship>
+          <expression op='AND'>
+            <expression op='='>
+              <expression op='[REGION]' />
+              <expression op='[REGION]' />
+            </expression>
+            <expression op='='>
+              <expression op='[SEGMENT]' />
+              <expression op='[SEGMENT]' />
+            </expression>
+          </expression>
+          <first-end-point object-id='SALE (ANALYTICS.SALE)_A1' />
+          <second-end-point object-id='REP (ANALYTICS.REP)_B2' />
+        </relationship>
+        <relationship>
+          <expression op='='>
+            <expression op='[REGION]' />
+            <expression op='[SEGMENT]' />
+          </expression>
+          <first-end-point object-id='SALE (ANALYTICS.SALE)_A1' />
+          <second-end-point object-id='REP (ANALYTICS.REP)_B2' />
+        </relationship>
+      </relationships>
+    </object-graph>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>REGION</remote-name><local-name>[REGION]</local-name>
+        <parent-name>[SALE]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>SEGMENT</remote-name><local-name>[SEGMENT]</local-name>
+        <parent-name>[SALE]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>REGION</remote-name><local-name>[REGION]</local-name>
+        <parent-name>[REP]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>SEGMENT</remote-name><local-name>[SEGMENT]</local-name>
+        <parent-name>[REP]</parent-name><local-type>string</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+# Two named connections in one federated source (snowflake + sqlserver), each owning one table.
+# Used to prove per-relation connector routing: emit must pick each relation's OWN connection
+# class, not a single global one. (storage_mode still gates multi-connection to fallback; this
+# only verifies the per-relation connector function + the exposed descriptor['connections'] map.)
+MULTI_CONN = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Blend' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='sf' name='snowflake.s'>
+        <connection authentication='Username Password' class='snowflake' dbname='ANALYTICS'
+                    schema='PUBLIC' server='acct.snowflakecomputing.com' warehouse='WH1' />
+      </named-connection>
+      <named-connection caption='ss' name='sqlserver.t'>
+        <connection authentication='SqlServer' class='sqlserver' dbname='Sales'
+                    server='sql.example.com' />
+      </named-connection>
+    </named-connections>
+    <relation type='collection'>
+      <relation connection='snowflake.s' name='SALE' table='[ANALYTICS].[PUBLIC].[SALE]' type='table' />
+      <relation connection='sqlserver.t' name='DimDate' table='[dbo].[DimDate]' type='table' />
+    </relation>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>SALE_ID</remote-name><local-name>[SALE_ID]</local-name>
+        <parent-name>[SALE]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>DateKey</remote-name><local-name>[DateKey]</local-name>
+        <parent-name>[DimDate]</parent-name><local-type>integer</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+# Databricks federated source spelling the warehouse path as 'http-path' (older variant) rather
+# than 'v-http-path', to confirm the attribute-name fallback resolves either spelling.
+DATABRICKS_HTTPPATH_ALT = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Lake2' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='dbx' name='databricks.z'>
+        <connection authentication='oauth' class='databricks' dbname='cat2'
+                    http-path='/sql/1.0/warehouses/beef5678' schema='gold'
+                    server='adb-2.example.net' />
+      </named-connection>
+    </named-connections>
+    <relation type='collection'>
+      <relation connection='databricks.z' name='FACT' table='[cat2].[gold].[FACT]' type='table' />
+    </relation>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>FACT_ID</remote-name><local-name>[FACT_ID]</local-name>
+        <parent-name>[FACT]</parent-name><local-type>string</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
 # Faithful reproduction of a modern multi-sheet Excel ``.tds`` (the published Superstore
 # sample): a <relation type='collection'> container wrapping the physical sheet tables, the
 # SAME tables duplicated under the logical <properties> layer, and columns in <metadata-records>.
@@ -664,21 +904,18 @@ def test_emit_unsupported_class_falls_back_to_scaffold():
     assert '(#"Server", #"Database")' not in body
 
 
-def test_emit_teradata_parsed_is_deploy_ready_server_only():
-    # Teradata.Database(server, [options]) is server-only (doc-verified signature) with
-    # HierarchicalNavigation=false, so it reuses Oracle's verified flat [Schema, Item] path:
-    # no #"Database" parameter, and the Teradata database is the navigation Schema.
+def test_emit_teradata_parsed_is_scaffold_pending_live_navigator():
+    # Teradata.Database(server, [options]) has a documented server-only signature, but with no live
+    # Teradata navigator to confirm the emitted body actually binds, it is held as a flagged
+    # scaffold (recognized + named) rather than shipped as deploy-ready M we have never resolved.
     d = parse_tds(TERADATA)
     assert d["connection_class"] == "teradata"
     body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
-    assert 'Source = Teradata.Database(#"Server", [HierarchicalNavigation=false])' in body
-    assert 'Source{[Schema="ANALYTICS", Item="ORDERS"]}[Data]' in body
-    assert "TODO" not in body
-    assert "Sql.Database" not in body
-    assert '(#"Server", #"Database")' not in body   # server-only: no Database argument
-    params = emit_connection_parameters(d)
-    assert 'expression Server = "td.example.com"' in params
-    assert "Database" not in params                 # reached through the server string, like Oracle
+    assert "TODO" in body
+    assert "'teradata'" in body
+    assert "Teradata.Database" in body                 # names the intended connector as a hint
+    assert 'Source = Teradata.Database(#"Server"' not in body   # but never a guessed call body
+    assert "let Source = null in Source" in body
 
 
 def test_emit_fabric_sql_endpoint_is_deploy_ready_sql_database():
@@ -888,6 +1125,119 @@ def test_databricks_collection_auth_method_maps_to_oauth_no_secret_leak():
     blob = repr(d) + repr(details)
     for secret in ("svc_admin@example.com", "oauth-secret-id", "adb-evt.example.net/oidc"):
         assert secret not in blob                              # only non-secret fields are read
+
+
+# -- object-graph relationships (P2) -------------------------------------------
+def test_object_graph_relationships_parsed_with_model_names():
+    # The two physical joins declared under <object-graph><relationships> become an explicit,
+    # direction-preserving relationships list whose columns are the EMITTED model identifiers --
+    # so "Order Key" (which clean_col turns into "Order_Key") is referenced as "Order_Key", not
+    # the raw Tableau spelling, and a renamed endpoint "[REGION (REP)]" resolves to plain "REGION".
+    d = parse_tds(FEDERATED_STAR)
+    pairs = {(r["from_table"], r["from_col"], r["to_table"], r["to_col"])
+             for r in d["relationships"]}
+    assert pairs == {
+        ("SALE", "REGION", "REP", "REGION"),
+        ("SALE", "Order_Key", "RMA", "Order_Key"),
+    }
+    assert d["relationship_warnings"] == []
+    # the join key with a space must surface as the cleaned identifier the table actually emits
+    sale_cols = {c["model_name"] for c in
+                 next(r for r in d["relations"] if r["name"] == "SALE")["columns"]}
+    assert "Order_Key" in sale_cols and "Order Key" not in sale_cols
+
+
+def test_object_graph_relationships_do_not_flip_source_to_fallback():
+    # A fuzzy/unused relationship must never demote an otherwise-supported datasource: relationship
+    # warnings are tracked separately from unsupported_reasons, so the star still rebuilds 1:1.
+    from storage_mode import select_storage_mode
+    d = parse_tds(FEDERATED_STAR)
+    decision = select_storage_mode(d)
+    assert decision["fully_supported"] is True
+    assert decision["mode"] == "DirectQuery"
+    assert "relationship" not in " ".join(decision.get("unsupported_reasons", [])).lower()
+
+
+def test_object_graph_relationship_unresolved_column_is_skipped_and_warned():
+    # Only the clean single-column join survives; the stale-column, composite-AND, and ambiguous
+    # joins are each dropped and recorded in relationship_warnings rather than emitted as M that
+    # would point at a phantom column or pick an untrustworthy orientation.
+    d = parse_tds(FEDERATED_REL_EDGECASE)
+    pairs = {(r["from_table"], r["from_col"], r["to_table"], r["to_col"])
+             for r in d["relationships"]}
+    assert pairs == {("SALE", "REGION", "REP", "REGION")}
+    warnings = d["relationship_warnings"]
+    assert len(warnings) == 3
+    assert any("GHOST_KEY" in w for w in warnings)         # stale / absent column
+    assert any("single-column equality" in w for w in warnings)  # composite AND predicate
+    assert any("ambiguous" in w for w in warnings)         # both orientations resolve differently
+
+
+# -- per-connection routing (P1-B) ---------------------------------------------
+def test_multi_connection_exposes_connections_map_secret_free():
+    d = parse_tds(MULTI_CONN)
+    assert d["named_connection_count"] == 2
+    conns = d["connections"]
+    assert set(conns) == {"snowflake.s", "sqlserver.t"}
+    assert conns["snowflake.s"]["connection_class"] == "snowflake"
+    assert conns["sqlserver.t"]["connection_class"] == "sqlserver"
+    # each fact dict carries ONLY the non-secret routing whitelist -- never a credential field
+    allowed = {"connection_class", "server", "database", "warehouse", "http_path",
+               "schema", "auth_method"}
+    for facts in conns.values():
+        assert set(facts) <= allowed
+    # the actual username VALUE in the fixture must never surface (auth_method is a label, not a secret)
+    assert "svc_loader" not in repr(d)
+    assert all("svc_loader" not in repr(facts) for facts in conns.values())
+
+
+def test_multi_connection_gated_to_fallback_by_storage_mode():
+    # The per-relation routing below is groundwork: a >1 named-connection source is still sent to
+    # the land-to-Delta fallback by the advisor, so the routed bodies are never the deployed
+    # artifact on their own. Pin that contract so the routing test isn't read as "deployable".
+    from storage_mode import select_storage_mode
+    decision = select_storage_mode(parse_tds(MULTI_CONN))
+    assert decision["fully_supported"] is False
+
+
+def test_multi_connection_routes_each_relation_to_its_own_connector():
+    # Each relation must emit using ITS OWN named connection's connector function, not a single
+    # global one: the snowflake table emits Snowflake.Databases, the sqlserver table Sql.Database.
+    d = parse_tds(MULTI_CONN)
+    by_name = {r["name"]: r for r in d["relations"]}
+    assert "connection" in by_name["SALE"] and "connection" in by_name["DimDate"]
+    sale_body = emit_m_partition_source(by_name["SALE"], d, "DirectQuery")
+    date_body = emit_m_partition_source(by_name["DimDate"], d, "DirectQuery")
+    assert "Snowflake.Databases" in sale_body
+    assert "Sql.Database" not in sale_body
+    assert 'Source = Sql.Database(#"Server", #"Database")' in date_body
+    assert "Snowflake.Databases" not in date_body
+
+
+def test_single_connection_ignores_per_relation_connection_byte_identical():
+    # For a single-connection source the global descriptor connection wins, so a (hypothetical)
+    # mismatched per-relation connection is ignored and emission stays byte-identical -- this is
+    # what guarantees the established single-connector output never shifts under the new routing.
+    rel = {"kind": "table", "name": "SALE", "schema": "dbo", "item": "SALE", "columns": [],
+           "connection": {"connection_class": "snowflake", "server": "x",
+                          "warehouse": "W", "database": "D"}}
+    desc = {"connection_class": "sqlserver", "database": "Sales", "named_connection_count": 1}
+    rel_plain = {k: v for k, v in rel.items() if k != "connection"}
+    assert (emit_m_partition_source(rel, desc, "DirectQuery")
+            == emit_m_partition_source(rel_plain, desc, "DirectQuery"))
+    assert 'Sql.Database(#"Server", #"Database")' in emit_m_partition_source(rel, desc, "DirectQuery")
+
+
+# -- databricks http-path attribute fallback (P4-G) ----------------------------
+def test_databricks_http_path_attribute_spelling_fallback():
+    # Older Tableau builds spell the warehouse path 'http-path' instead of 'v-http-path'; both
+    # must resolve so the emitted Databricks.Catalogs partition still gets its HttpPath parameter.
+    d = parse_tds(DATABRICKS_HTTPPATH_ALT)
+    assert d["http_path"] == "/sql/1.0/warehouses/beef5678"
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert 'Source = Databricks.Catalogs(#"Server", #"HttpPath")' in body
+    params = emit_connection_parameters(d)
+    assert 'expression HttpPath = "/sql/1.0/warehouses/beef5678"' in params
 
 
 def test_sqlserver_cross_database_three_part_name_is_scaffold():

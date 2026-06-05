@@ -23,7 +23,10 @@ and the actual bind call are **delegated** to `semantic-model-authoring`.
 | `auth_method` | Non-secret authentication *label* from the inner connection (e.g. `Username Password`, `oauth`) — never the credential itself |
 | `is_extract` | Whether a `.hyper` extract is enabled |
 | `named_connection_count` | >1 ⇒ federated multi-connection (fallback) |
-| `relations` | One entry per logical table: `kind`, `name`, `catalog`/`schema`/`item`, typed `columns` |
+| `relations` | One entry per logical table: `kind`, `name`, `catalog`/`schema`/`item`, typed `columns`, and (federated only) the resolved `connection` facts that table routes through |
+| `relationships` | Physical joins lifted from `<object-graph><relationships>`: `[{from_table, from_col, to_table, to_col}]`, using the **emitted model column names** |
+| `relationship_warnings` | Joins that could not be resolved cleanly and were skipped (kept **out** of `unsupported_reasons`) |
+| `connections` | Federated named-connection map `nc_id → {connection_class, server, database, warehouse, http_path, schema, auth_method}` (non-secret routing facts only) |
 | `unsupported_reasons` | Shape problems found during parsing |
 
 ```python
@@ -50,6 +53,41 @@ exports — 3 tables each, columns intact) instead of the old "no table relation
 fallback. A three-part name whose **catalog ≠ the connection database** on a single-database `Sql.Database`
 connector is treated as a cross-database reference and scaffolded (never silently bound to the wrong
 database); a catalog equal to the database is just dropped as a redundant qualifier.
+
+### Relationships (Tableau object-graph → model relationships)
+
+Tableau 2023+ datasources carry their physical joins in `<object-graph><relationships>`, separate from
+the table list. `parse_tds` lifts each single-column equality into `descriptor['relationships']` as
+`{from_table, from_col, to_table, to_col}` so the rebuilt model can recreate the star 1:1. Resolution is
+deliberately conservative:
+
+- **Endpoints** (`first-end-point` / `second-end-point` object-ids) are resolved to a real **emitted table
+  display name** via the `<objects><object id caption>` map; an endpoint that doesn't line up with a parsed
+  table is skipped (never pointed at a phantom table).
+- **Columns** are matched case-insensitively against each column's local / remote / model name (Power BI
+  relationships are case-insensitive) and emitted as the column's **model name** — the identifier the table
+  actually emits — so a renamed key like `[Region (People)]` resolves to `Region` and a spaced key like
+  `[Order ID]` resolves to `Order_ID`, never a dangling reference.
+- Both operand orientations are resolved; if they resolve to **different** column pairs (both keys exist on
+  both tables) the join is **ambiguous** and skipped.
+- A **composite** (multi-column `AND`), calculated, or non-`=` predicate is skipped rather than emitting only
+  one arm of the join.
+
+Anything skipped is recorded in `descriptor['relationship_warnings']` — kept **out** of `unsupported_reasons`,
+so a single fuzzy join never demotes an otherwise-supported datasource to the land-to-Delta fallback.
+Validated against the real Snowflake and Databricks Superstore exports (Orders↔People on Region, Orders↔Returns
+on Order ID), which rebuild as two relationships with no warnings.
+
+### Per-connection routing (federated multi-connection)
+
+When a federated source has **more than one** named connection, each `<relation>` carries its own
+`connection=` id. The parser builds `descriptor['connections']` (`nc_id → routing facts`) and attaches the
+resolved connection to **each relation**, so `emit_m_partition_source` binds every table against **its own**
+upstream connector function and navigation rather than a single global one. Single-connection output is
+unchanged (the global descriptor is used), so existing emitted M is byte-identical. This is groundwork: a
+multi-connection source is still routed to the land-to-Delta fallback by `select_storage_mode`, and the shared
+`#"Server"`/`#"Database"`/`#"Warehouse"`/`#"HttpPath"` parameters are still emitted once per datasource, so the
+per-relation routing is never the deployed artifact on its own.
 
 ---
 
@@ -79,10 +117,10 @@ relation kind:
 | `mysql` | `MySQL.Database` | Fully supported |
 | `redshift` | `AmazonRedshift.Database` | Fully supported |
 | `oracle` | `Oracle.Database` | Fully supported (server-only) |
-| `teradata` | `Teradata.Database` | Fully supported (server-only) |
 | `snowflake` | `Snowflake.Databases` | Fully supported (server + warehouse) |
 | `databricks` | `Databricks.Catalogs` | Fully supported (host + HTTP path) |
 | `microsoft_fabric_sql_endpoint` | `Sql.Database` | Fully supported (TDS protocol) |
+| `teradata` | `Teradata.Database` | Scaffold (documented signature, but no live navigator to confirm — held) |
 | `bigquery` | `GoogleBigQuery.Database` | Scaffold (no M function reference page; identifiers unverified) |
 | `msolap` / `sqlserver-analysis-services` | — | Analysis Services model (migrate directly — see below) |
 | `excel-direct` / `excel` | `Excel.Workbook` | Flat file (needs path) |
@@ -107,11 +145,11 @@ the `DIRECT_CONNECTORS` registry as `(function, connect_style, nav_style)`:
 | Connect style | First step | Navigation | Connectors |
 |---|---|---|---|
 | `server_database` | `Fn(#"Server", #"Database")` | `Source{[Schema=…, Item=…]}[Data]` | Sql (incl. Synapse + Fabric) / PostgreSQL / MySQL / AmazonRedshift |
-| `server_only` | `Fn(#"Server", [HierarchicalNavigation=false])` | `Source{[Schema=…, Item=…]}[Data]` | Oracle, Teradata |
+| `server_only` | `Fn(#"Server", [HierarchicalNavigation=false])` | `Source{[Schema=…, Item=…]}[Data]` | Oracle |
 | `server_warehouse` | `Snowflake.Databases(#"Server", #"Warehouse")` | `[Name=…, Kind="Database"]` → `[Name=…, Kind="Schema"]` → `[Name=…, Kind="Table"]` | Snowflake |
 | `server_httppath` | `Databricks.Catalogs(#"Server", #"HttpPath")` | `[Name=…, Kind="Database"]` (catalog) → `[Name=…, Kind="Schema"]` → `[Name=…, Kind="Table"]` | Databricks |
 
-Oracle and Teradata are server-only because the database/service is carried in the server string (so
+Oracle is server-only because the database/service is carried in the server string (so
 no unused `#"Database"` parameter is emitted), and `HierarchicalNavigation=false` is set explicitly so
 the flat `Schema`/`Item` selector is correct rather than default-reliant. Snowflake adds a
 `#"Warehouse"` parameter and reaches the table by `database → schema → table` navigation. Databricks
@@ -125,25 +163,30 @@ description flagging that a compute warehouse must be set before refresh (a `///
 deploy-safe; a bare `//` comment is not guaranteed to parse), and `select_storage_mode` adds a matching
 follow-up.
 
-> **Verification status.** Oracle, Teradata, Databricks, and the `(server, database)` family (incl.
+> **Verification status.** Oracle, Databricks, and the `(server, database)` family (incl.
 > Synapse and Fabric via the SQL Server protocol) are doc-verified against the official Power Query M
-> function/connector references — Oracle's and Teradata's `Fn(server, [options])` signatures and shared
-> `HierarchicalNavigation=false` flat `[Schema, Item]` behavior are confirmed by their M function
-> reference pages, and Databricks' `Databricks.Catalogs(host, httpPath, [options])` signature plus
+> function/connector references — Oracle's `Fn(server, [options])` signature and
+> `HierarchicalNavigation=false` flat `[Schema, Item]` behavior are confirmed by its M function
+> reference page, and Databricks' `Databricks.Catalogs(host, httpPath, [options])` signature plus
 > catalog/schema/table `[Name, Kind]` navigation come straight from the Microsoft connector doc.
-> Snowflake's navigation is doc-informed (no M function reference page exists). The `azure_sql_dw` and
+> Snowflake's navigation is doc-informed (no M function reference page exists). **Teradata** has a
+> documented `Teradata.Database(server, [options])` signature, but with no live Teradata navigator to
+> confirm the emitted body actually binds it is held as a **flagged scaffold** (recognized + named,
+> never a guessed call) until a real instance reconciles it. The `azure_sql_dw` and
 > `microsoft_fabric_sql_endpoint` class strings are web-verified (a wrong class string only causes a
-> safe fallback; the TDS→`Sql.Database` mapping is the verified fact). Oracle, Teradata, Snowflake, and
+> safe fallback; the TDS→`Sql.Database` mapping is the verified fact). Oracle, Snowflake, and
 > Databricks have **no live instance** in the validation environment (Azure SQL only) — **live
 > reconciliation pending**; for Databricks the `#"HttpPath"` value and catalog name are not stored
 > portably in the `.tds` and are surfaced as a manual follow-up.
 
-**Scaffold** connector `bigquery` maps to the right M function *name* (`GoogleBigQuery.Database`), but
-the BigQuery connector has **no M function reference page**, so neither its project/dataset/table
-navigation selectors nor its billing-project vs project identifier mapping (it has no server) can be
-verified from an official source — the partition is emitted as a clearly-flagged `// TODO` that names
-the intended connector and never a guessed call. It is deferred for promotion until a primary-doc shape
-or a real BigQuery datasource confirms the navigation.
+**Scaffold** connectors `bigquery` and `teradata` map to the right M function *name*
+(`GoogleBigQuery.Database`, `Teradata.Database`) but are emitted as a clearly-flagged `// TODO` that
+names the intended connector and never a guessed call. BigQuery has **no M function reference page**, so
+neither its project/dataset/table navigation selectors nor its billing-project vs project identifier
+mapping (it has no server) can be verified from an official source. Teradata's signature *is* documented,
+but it has **no live navigator** in the validation environment to confirm the emitted body binds, so it
+is held at the scaffold tier rather than shipped as deploy-ready M we have never resolved. Both are
+deferred for promotion until a primary-doc shape or a real datasource confirms the navigation.
 
 ### Microsoft Analysis Services (SSAS / MSOLAP) — separate handling
 
