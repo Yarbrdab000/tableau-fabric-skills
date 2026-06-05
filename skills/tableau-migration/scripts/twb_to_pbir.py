@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import sys
 import xml.etree.ElementTree as ET
 
 try:  # package or scripts-on-path (mirrors the other cores)
@@ -940,3 +942,82 @@ def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
     parts = emit_pbir(ir, dataset_name=dataset_name, report_name=report_name,
                       model_table=model_table, field_map=field_map)
     return {"ir": ir, "parts": parts, "warnings": ir["warnings"]}
+
+
+# -- command-line entry point --------------------------------------------------
+# Turns the library into a runnable tool so a real exported workbook can be converted
+# and the resulting ``<report>.Report`` folder opened in Power BI Desktop or deployed to
+# Fabric. It is purely local: it reads a ``.twb`` file (or stdin) and writes JSON files --
+# no network, no credentials, no secrets. All target names come from args / env, never the
+# code. (The committed pytest suite stays offline; live open/deploy is a separate manual pass.)
+def _write_parts(out_dir, report_name, parts):
+    """Write ``{relative_path: text}`` PBIR parts under ``<out_dir>/<report_name>.Report``."""
+    root = os.path.join(out_dir, report_name + ".Report")
+    written = []
+    for rel, text in parts.items():
+        dest = os.path.join(root, *rel.split("/"))
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        written.append(dest)
+    return root, written
+
+
+def main(argv=None):
+    """CLI: ``twb_to_pbir <input.twb|-> [-o OUT] [--dataset N] [--report N]``.
+
+    With ``-o/--out`` the PBIR parts are written to ``<OUT>/<report>.Report``; without it a
+    JSON manifest (part paths + warnings) is printed to stdout for a no-write dry run.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="twb_to_pbir",
+        description="Convert a Tableau .twb workbook into a PBIR report wireframe.")
+    parser.add_argument(
+        "input", help="path to a .twb workbook, or '-' to read workbook XML from stdin")
+    parser.add_argument(
+        "-o", "--out", default=os.environ.get("TWB_PBIR_OUT"),
+        help="output directory; a <report>.Report folder is written inside it. "
+             "If omitted, a JSON manifest is printed to stdout (dry run).")
+    parser.add_argument(
+        "--dataset", default=os.environ.get("TWB_PBIR_DATASET", "Model"),
+        help="semantic model name the report binds to (datasetReference byPath).")
+    parser.add_argument(
+        "--report", default=os.environ.get("TWB_PBIR_REPORT", "Report"),
+        help="report display name and .Report folder name.")
+    parser.add_argument(
+        "--model-table", default=os.environ.get("TWB_PBIR_MODEL_TABLE"),
+        help="optional: pin every column binding to this single model table.")
+    args = parser.parse_args(argv)
+
+    if args.input == "-":
+        xml_text = sys.stdin.read()
+    else:
+        with open(args.input, "r", encoding="utf-8-sig") as fh:
+            xml_text = fh.read()
+
+    result = migrate_twb_to_pbir(
+        xml_text, dataset_name=args.dataset, report_name=args.report,
+        model_table=args.model_table)
+    parts, warnings = result["parts"], result["warnings"]
+
+    if args.out:
+        root, written = _write_parts(args.out, args.report, parts)
+        print("wrote {0} PBIR part(s) to {1}".format(len(written), root), file=sys.stderr)
+        if warnings:
+            print("{0} warning(s) need manual attention:".format(len(warnings)),
+                  file=sys.stderr)
+            for w in warnings:
+                print("  - [{0}:{1}] {2}".format(w["scope"], w["name"], w["reason"]),
+                      file=sys.stderr)
+    else:
+        print(json.dumps({"parts": sorted(parts), "warnings": warnings},
+                         indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

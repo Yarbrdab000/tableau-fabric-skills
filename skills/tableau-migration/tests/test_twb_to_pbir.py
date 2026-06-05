@@ -511,3 +511,27 @@ def test_multiple_datasources_bind_to_their_own_entities():
     # the SAME local id [Category] resolves to the Returns relation + its remote source column
     assert (cat["entity"], cat["property"]) == ("Returns", "Return_Reason")
     assert (w["rows"][0]["entity"], w["rows"][0]["property"]) == ("Returns", "Qty")
+
+
+# -- CLI (live-validatable, but tested offline via stdin/stdout, no disk) -------
+def test_cli_dry_run_prints_manifest_to_stdout(monkeypatch, capsys):
+    import io
+    import sys as _sys
+
+    from twb_to_pbir import main
+
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST)
+    monkeypatch.setattr(_sys, "stdin", io.StringIO(_workbook(ws)))
+    rc = main(["-", "--dataset", "Superstore", "--report", "Superstore Report"])
+    assert rc == 0
+
+    out = json.loads(capsys.readouterr().out)
+    assert "definition.pbir" in out["parts"]
+    assert any(p.endswith("visual.json") for p in out["parts"])
+    # dataset name flows through to the dataset reference part
+    pbir = json.loads(emit_pbir(parse_twb(_workbook(ws)), dataset_name="Superstore")
+                      ["definition.pbir"])
+    assert pbir["datasetReference"]["byPath"]["path"] == "../Superstore.SemanticModel"

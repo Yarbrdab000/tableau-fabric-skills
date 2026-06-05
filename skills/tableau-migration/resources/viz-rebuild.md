@@ -21,6 +21,28 @@ public PBIR JSON schemas.
 - `emit_pbir(ir, *, dataset_name, report_name, model_table=None, field_map=None) -> {path: text}`
 - `migrate_twb_to_pbir(xml_text, ...) -> {"ir", "parts", "warnings"}` (convenience wrapper).
 
+## Command line (live validation)
+
+The module is also runnable, so a real exported workbook can be converted and the resulting
+`<report>.Report` folder opened in Power BI Desktop or deployed to a Fabric workspace. It is
+purely local — it reads a `.twb` file (or stdin) and writes JSON files; **no network, no
+credentials, no secrets**, and every target name comes from an argument / environment
+variable, never the code:
+
+```
+py twb_to_pbir.py <input.twb> -o <out-dir> --dataset "Superstore" --report "Superstore Report"
+py twb_to_pbir.py - --dataset Superstore        # read XML from stdin, print a JSON manifest
+```
+
+- `-o/--out` writes the parts under `<out-dir>/<report>.Report/…`; without it a JSON manifest
+  (part paths + warnings) is printed to stdout for a no-write dry run.
+- Defaults also read `TWB_PBIR_OUT` / `TWB_PBIR_DATASET` / `TWB_PBIR_REPORT` /
+  `TWB_PBIR_MODEL_TABLE` from the environment.
+- Warnings are printed to stderr (when writing) or included in the dry-run manifest.
+
+The committed pytest suite stays fully offline/deterministic (synthetic `.twb` string
+fixtures, no disk, no network); the live open/deploy is a separate manual pass.
+
 ## Supported visual types
 
 | Tableau mark + shelf layout                         | IR `visual_type` | PBIR `visualType`      | Data roles            |
