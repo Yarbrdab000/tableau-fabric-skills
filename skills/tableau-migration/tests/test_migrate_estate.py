@@ -250,7 +250,7 @@ def test_migrate_estate_local_full(fixtures_dir, tmp_path):
     report = migrate_estate(LocalFilesSource(fixtures_dir), out)
     s = report["summary"]
 
-    # counts: one migrated SQL Server DS, one SAP HANA (saphana) fallback, one warned workbook
+    # counts: one migrated SQL Server DS, one SAP HANA (saphana) fallback, one built workbook
     assert s["datasources_total"] == 2
     assert s["datasources_migrated"] == 1
     assert s["datasources_fallback"] == 1
@@ -263,8 +263,9 @@ def test_migrate_estate_local_full(fixtures_dir, tmp_path):
     assert s["storage_modes"] == {"Import": 0, "DirectQuery": 1, "fallback": 1}
     assert s["connectors_seen"] == ["saphana", "sqlserver"]
     assert s["workbooks_total"] == 1
-    assert s["workbooks_viz_warned"] == 1
-    assert s["viz_stage_available"] is False
+    assert s["workbooks_viz_built"] == 1
+    assert s["workbooks_viz_warned"] == 0
+    assert s["viz_stage_available"] is True
 
     # emitted Fabric semantic-model folder layout
     sm = tmp_path / "bundle" / "semantic_models" / "widget_sales.SemanticModel"
@@ -273,6 +274,10 @@ def test_migrate_estate_local_full(fixtures_dir, tmp_path):
     assert (sm / "definition" / "model.tmdl").is_file()
     assert (sm / "definition" / "tables" / "Sales.tmdl").is_file()
     assert (sm / "definition" / "tables" / "_Measures.tmdl").is_file()
+
+    # the workbook viz stage (Stream B) rebuilt the dashboard into a PBIR report folder
+    rep = tmp_path / "bundle" / "reports" / "widget_dashboard.Report"
+    assert (rep / "definition.pbir").is_file()
 
     # report.json + summary.md written to disk and machine-readable
     on_disk = json.load(open(os.path.join(out, "report.json"), encoding="utf-8"))
@@ -401,12 +406,17 @@ def test_path_unsafe_table_name_is_error(tmp_path):
 
 
 # -- viz stage (optional, pluggable) ------------------------------------------
-def test_viz_stage_absent_warns(tmp_path):
+def test_viz_stage_absent_warns(tmp_path, monkeypatch):
+    # Stream B's twb_to_pbir now ships in this repo, so explicitly force the "viz stage
+    # unavailable" path (no module + none injected) to prove the orchestrator still degrades
+    # gracefully into a warning rather than failing.
+    monkeypatch.setattr(me, "_resolve_viz_stage", lambda injected: injected)
     src = InMemoryTableauSource(workbooks={"Dash": "<workbook/>"})
-    report = migrate_estate(src, str(tmp_path / "b"))  # no twb_to_pbir, none injected
+    report = migrate_estate(src, str(tmp_path / "b"))  # none injected -> viz None
     wb = report["workbooks"][0]
     assert wb["viz_status"] == "warned"
     assert "not available" in wb["note"]
+    assert report["summary"]["viz_stage_available"] is False
 
 
 def test_viz_stage_injected_builds_and_writes_parts(tmp_path):

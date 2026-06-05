@@ -38,8 +38,7 @@ are read, stored, or written anywhere in the bundle.
 from __future__ import annotations
 
 import argparse
-import importlib
-import importlib.util
+import inspect
 import json
 import os
 import re
@@ -226,7 +225,7 @@ def _strip_brackets(name):
 
 
 # Viz-stage entry-point names tried (in order) when auto-loading Stream B's module.
-_VIZ_ENTRY_POINTS = ("migrate_workbook", "build_pbir", "twb_to_pbir", "build_report")
+_VIZ_ENTRY_POINTS = ("migrate_workbook", "migrate_twb_to_pbir", "build_pbir", "build_report")
 
 
 def extract_calculations(xml_text):
@@ -302,6 +301,25 @@ def _eligible_tables(descriptor):
             if r.get("kind") in ("table", "custom_sql") and r.get("columns")]
 
 
+def _viz_adapter(cand):
+    """Adapt a viz entry point to the orchestrator's ``callable(twb_text, name) -> dict`` contract.
+
+    Stream B's ``migrate_twb_to_pbir(text, *, report_name, dataset_name)`` takes the target name as
+    keyword-only args, while a generic plugin may take ``(text, name)`` positionally. Inspect the
+    signature so the workbook display name flows through as the report/dataset name either way.
+    """
+    try:
+        params = set(inspect.signature(cand).parameters)
+    except (TypeError, ValueError):
+        params = set()
+    name_kwargs = {"report_name", "dataset_name"} & params
+    def _call(twb_text, name):
+        if name_kwargs:
+            return cand(twb_text, **{k: name for k in name_kwargs})
+        return cand(twb_text, name)
+    return _call
+
+
 def _resolve_viz_stage(injected):
     """Resolve the optional workbook viz stage without ever hard-depending on it.
 
@@ -311,16 +329,17 @@ def _resolve_viz_stage(injected):
     """
     if injected is not None:
         return injected
-    try:
-        if importlib.util.find_spec("twb_to_pbir") is None:
+    try:  # mirror the package-or-flat import strategy used for the sibling modules above
+        from . import twb_to_pbir as mod
+    except ImportError:
+        try:
+            import twb_to_pbir as mod
+        except ImportError:
             return None
-        mod = importlib.import_module("twb_to_pbir")
-    except Exception:
-        return None
     for fn in _VIZ_ENTRY_POINTS:
         cand = getattr(mod, fn, None)
         if callable(cand):
-            return lambda text, name, _c=cand: _c(text, name)
+            return _viz_adapter(cand)
     return None
 
 
