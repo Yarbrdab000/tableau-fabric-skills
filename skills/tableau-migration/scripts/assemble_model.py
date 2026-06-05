@@ -52,6 +52,34 @@ def _table_display(rel):
     return rel.get("name") or rel.get("item") or "Table"
 
 
+def _build_ci_field_index(descriptor, resolve_field):
+    """A ``lower(caption) -> [(table, column, type), ...]`` index for case-insensitive
+    fallback resolution of model-object field tokens.
+
+    Each distinct Tableau caption present in the descriptor is resolved with the EXACT
+    resolver (so the resolver's own unambiguity rules are inherited rather than
+    reimplemented), then grouped by its lowercased form. A lowercase key that maps to more
+    than one distinct target is ambiguous and the fallback will decline it.
+    """
+    index = {}
+    seen = set()
+    for rel in descriptor.get("relations", []):
+        if rel.get("kind") not in ("table", "custom_sql"):
+            continue
+        for col in rel.get("columns", []):
+            cap = col.get("local_name") or col.get("remote_name")
+            if not cap or cap in seen:
+                continue
+            seen.add(cap)
+            target = resolve_field(cap)
+            if not target:
+                continue
+            bucket = index.setdefault(cap.strip().lower(), [])
+            if target not in bucket:
+                bucket.append(target)
+    return index
+
+
 def _expression_names(descriptor):
     names = []
     if descriptor.get("server"):
@@ -304,6 +332,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relations
     if hierarchies is None and display_folders is None and rls_roles is None:
         parsed = T.parse_model_objects(tds_text)
         resolve = build_m_field_resolver(descriptor)
+        resolve = T.make_case_insensitive_resolver(
+            resolve, _build_ci_field_index(descriptor, resolve))
         data_tables = [_table_display(r) for r in descriptor.get("relations", [])
                        if r.get("kind") in ("table", "custom_sql") and r.get("columns")]
         resolved = T.resolve_model_objects(parsed, resolve, calcs=calcs, data_tables=data_tables)

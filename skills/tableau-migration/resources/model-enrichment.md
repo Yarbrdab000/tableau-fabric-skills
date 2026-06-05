@@ -33,12 +33,32 @@ sub-reports (`translated` / `manual_review` / `unwired`).
 
 Every field reference parsed from the `.tds` — drill-path levels, folder items, calculation column
 names, and filter `column` attributes — is normalized to its **local token** before resolution. Real
-Tableau documents frequently **qualify** a reference with a leading connection/relation segment
-(`[Orders].[Category]`, `[sqlserver.0].[RegionFilter]`); the trailing bracketed segment is the local
-field name, so a qualified `[Orders].[Category]` and a bare `[Category]` resolve identically. The same
-normalization is applied to the calc column name and the data-source `<filter column>`, so RLS wiring
-matches regardless of whether either side is qualified. Folder `role` attributes and other decorative
-attributes are ignored.
+Tableau documents reference a field in several shapes, all of which collapse to the same local token:
+
+- **Bare** — `[Category]`.
+- **Caption-qualified** — `[Parameters].[Base Salary]`, `[Sample - Superstore].[Sales]`. The qualifier
+  is a datasource caption and may contain **spaces and dots**; the brackets are the only delimiter, so
+  the parser never splits on `.`.
+- **Internal federated-id qualified** — `[federated.0hgpf0j1fdpvv316shikk0mmdlec].[Sales Target]`. Blend
+  / secondary references use the **internal** datasource id (not the caption), and that id contains a
+  dot *inside* the brackets. Only the trailing bracketed segment (`Sales Target`) is taken.
+
+The same normalization is applied to the calc column name and the data-source `<filter column>`, so RLS
+wiring matches regardless of whether either side is qualified. Folder `role` attributes and other
+decorative attributes are ignored. A formula table-scan (used for fail-closed RLS) is likewise
+qualifier-aware, so a qualifier segment is never mistaken for a field.
+
+**Case-insensitive fallback.** Field captions resolve **exactly** first (unchanged behavior). On an
+exact miss the token is retried **case-insensitively** against the rebuilt columns — real workbooks
+reference one physical field with drifting case across sheets and blends (`[Order_ID]` vs `[ORDER_ID]`).
+The fallback resolves **only when exactly one** column matches case-insensitively; a lowercase name
+shared by two columns stays unresolved (fail-closed) rather than being guessed between.
+
+> **Boundary.** The trailing-token + case-insensitive resolution covers field-name drift, but it does
+> **not** use the qualifier to pick between same-named fields in different datasources (e.g. a blend
+> rename like `[Region (people)]`). Disambiguating duplicate field names by *relation* depends on the
+> shared field resolver (`connection_to_m.build_m_field_resolver`); when a blend reference is genuinely
+> ambiguous the object is reported unresolved / fails closed rather than binding to the wrong table.
 
 ---
 
@@ -162,6 +182,7 @@ behavior exactly. Existing positional parameters and return shapes are unchanged
 |---|---|
 | `parse_model_objects(tds_text)` | Parse RAW hierarchies / folders / user filters + a field index from a `.tds` |
 | `resolve_model_objects(parsed, resolve_field, *, calcs=None, data_tables=None)` | Resolve RAW objects to a model; returns resolved structures + an audit `report` |
+| `make_case_insensitive_resolver(resolve_field, ci_index)` | Wrap a resolver with an unambiguous case-insensitive fallback (exact match still wins) |
 | `translate_user_filter_to_dax(formula, resolve_field)` | `(dax \| None, table \| None, reason)` for a user filter |
 | `generate_hierarchy_tmdl(name, levels)` | Render one table-child `hierarchy` block |
 | `generate_role_tmdl(role)` | Render one `role` file |

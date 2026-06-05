@@ -406,3 +406,103 @@ def test_real_shape_end_to_end_emits_all_three_objects():
     role = out["parts"]["definition/roles/Region Access.tmdl"]
     assert "tablePermission Orders = 'Orders'[Region] = USERPRINCIPALNAME()" in role
     assert "ref role 'Region Access'" in out["parts"]["definition/model.tmdl"]
+
+
+# -- real-shape tokens: caption / internal-federated qualifiers, dots, LOD --------
+def test_field_token_handles_caption_federated_and_dotted_qualifiers():
+    # datasource-caption qualified (caption may contain spaces/dashes -- bracket-delimited)
+    assert T._field_token("[Parameters].[Base Salary]") == "Base Salary"
+    assert T._field_token("[Sample - Superstore].[Sales]") == "Sales"
+    # INTERNAL federated datasource id (contains a dot INSIDE the brackets) must not split
+    assert T._field_token("[federated.0hgpf0j1fdpvv316shikk0mmdlec].[Sales Target]") == "Sales Target"
+    # a caption that itself contains a dot stays intact (brackets are the only delimiter)
+    assert T._field_token("[Sales.Commission].[Rate]") == "Rate"
+
+
+def test_translate_federated_qualified_user_filter():
+    # a blend/secondary reference uses the internal federated id; trailing token still wins
+    resolve = lambda c: ("People", "Region", "string") if c == "Region" else None
+    dax, table, reason = T.translate_user_filter_to_dax(
+        "USERNAME() = [federated.0hgpf0j1fdpvv316shikk0mmdlec].[Region]", resolve)
+    assert dax == "'People'[Region] = USERPRINCIPALNAME()"
+    assert table == "People" and reason == "translated"
+
+
+def test_lod_and_compound_user_filters_fail_closed_not_mistranslated():
+    resolve = lambda c: ("Orders", "Region", "string")
+    # a FIXED LOD expression has no safe DAX table-permission equivalent
+    dax, _t, reason = T.translate_user_filter_to_dax(
+        "{fixed [Order ID]:sum([Profit])} > 0", resolve)
+    assert dax is None and "no safe DAX equivalent" in reason
+    # a compound boolean is likewise never approximated
+    dax2, _t2, _r2 = T.translate_user_filter_to_dax(
+        "[Region] = USERNAME() AND [Sales] > 0", resolve)
+    assert dax2 is None
+
+
+def test_tables_from_formula_ignores_qualifier_segments():
+    # only the trailing local token contributes a table; the federated qualifier does not
+    def resolve(c):
+        return {"Sales Target": ("Targets", "Sales_Target", "double")}.get(c)
+    tables = T._tables_from_formula(
+        "IF [federated.abc123].[Sales Target] > 0 THEN 1 ELSE 0 END", resolve)
+    assert tables == ["Targets"]
+
+
+def test_escaped_closing_bracket_preserved_to_match_resolver():
+    # Tableau doubles a literal ] inside a name (A]B -> [A]]B]); the shared resolver strips
+    # only the OUTER brackets and keeps ]] , so the token must keep ]] too (not un-double).
+    assert T._field_token("[A]]B]") == "A]]B"
+    assert T._field_token("[ds].[A]]B]") == "A]]B"        # qualified, still trailing token
+    resolve = lambda c: ("T", "A]]B", "string") if c == "A]]B" else None
+    dax, table, reason = T.translate_user_filter_to_dax("[ds].[A]]B] = USERNAME()", resolve)
+    assert table == "T" and reason == "translated"
+
+
+# -- case-insensitive resolution -----------------------------------------------
+def test_make_case_insensitive_resolver_unambiguous_only():
+    exact = lambda c: ("Orders", "Order_ID", "int64") if c == "Order_ID" else None
+    ci = {"order_id": [("Orders", "Order_ID", "int64")],
+          "region": [("A", "Region", "string"), ("B", "Region", "string")]}
+    resolve = T.make_case_insensitive_resolver(exact, ci)
+    # exact match passes straight through (existing behavior unchanged)
+    assert resolve("Order_ID") == ("Orders", "Order_ID", "int64")
+    # case-drifted token resolves via the unambiguous fallback
+    assert resolve("ORDER_ID") == ("Orders", "Order_ID", "int64")
+    # an ambiguous lowercase key is declined (fail-closed), never guessed
+    assert resolve("REGION") is None
+    # an unknown token stays unresolved
+    assert resolve("ghost") is None
+
+
+# A datasource whose folder references a field with DRIFTED case ([ORDER_ID] vs the
+# column's [Order_ID]); the case-insensitive fallback must still land the display folder.
+CASE_DRIFT_TDS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='People' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='srv' name='sqlserver.0'>
+        <connection class='sqlserver' dbname='People' server='srv.example.com' />
+      </named-connection>
+    </named-connections>
+    <relation connection='sqlserver.0' name='People' table='[dbo].[People]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'><remote-name>Order_ID</remote-name>
+        <local-name>[Order_ID]</local-name><parent-name>[People]</parent-name><local-type>integer</local-type></metadata-record>
+      <metadata-record class='column'><remote-name>Manager</remote-name>
+        <local-name>[Manager]</local-name><parent-name>[People]</parent-name><local-type>string</local-type></metadata-record>
+    </metadata-records>
+  </connection>
+  <folder name='Keys'>
+    <folder-item name='[ORDER_ID]' type='field' />
+  </folder>
+</datasource>"""
+
+
+def test_case_drifted_folder_member_resolves_via_fallback():
+    out = migrate_tds_to_semantic_model(CASE_DRIFT_TDS, model_name="People")
+    people = out["parts"]["definition/tables/People.tmdl"]
+    # [ORDER_ID] (folder) -> Order_ID column via the case-insensitive fallback
+    assert "column Order_ID" in people
+    assert 'displayFolder: "Keys"' in people
+    assert out["report"]["model_objects"]["display_folders"]["unresolved"] == []
