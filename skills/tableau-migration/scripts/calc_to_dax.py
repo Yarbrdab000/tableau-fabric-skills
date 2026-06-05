@@ -20,7 +20,8 @@ Translates a SAFE subset of Tableau calculated fields into working DAX measures:
     QUOTIENT(a, b), PI(), the trig family SIN/COS/TAN/ASIN/ACOS/ATAN/COT, and
     DEGREES/RADIANS (radian<->degree conversion)
   * comparison operators: = == <> != > >= < <=  (== -> = ; != -> <>)
-  * set membership: x IN (a, b, ...) -> x IN { a, b, ... } (one consistent element type)
+  * set membership: x IN (a, b, ...) -> numeric/date x IN { a, b, ... }; text uses a
+    case-sensitive EXACT chain (EXACT(x, a) || EXACT(x, b) ...); one consistent element type
   * boolean logic: AND -> && , OR -> || , NOT(x)
   * null handling: ZN(x) -> COALESCE(x, 0) ; IFNULL(a, b) -> COALESCE(a, b) ;
     ISNULL(x) -> ISBLANK(x)
@@ -435,9 +436,16 @@ class _Parser:
         return left
 
     def _in_list(self, left):
-        # Tableau `x IN (a, b, ...)` -> DAX `x IN { a, b, ... }` (set membership). Every list
-        # element must share the operand's type; a boolean operand or a mixed-type list falls
-        # back. In a measure a bare row-level operand already fails before reaching IN.
+        # Tableau `x IN (a, b, ...)` set membership. Every list element must share the operand's
+        # type; a boolean operand or a mixed-type list falls back. In a measure a bare row-level
+        # operand already fails before reaching IN.
+        #
+        # Numeric/date operands -> DAX `x IN { a, b, ... }`. TEXT operands cannot use `IN { ... }`
+        # because DAX set membership follows the model's (usually case-INSENSITIVE) collation,
+        # whereas Tableau string comparison is case-SENSITIVE; we instead emit a parenthesised
+        # `EXACT(x, a) || EXACT(x, b) || ...` chain (EXACT is the case-sensitive form, matching the
+        # CONTAINS/STARTSWITH mappings). The wrapping parens are required because DAX `&&` binds
+        # tighter than `||`, so an unparenthesised chain would mis-group inside a surrounding `&&`.
         self._next()  # IN
         self._expect_op("(")
         if left[1] == "bool":
@@ -450,6 +458,9 @@ class _Parser:
         for it in items:
             if it[1] != left[1]:
                 raise _CalcError("IN list element type does not match the operand")
+        if left[1] == "text":
+            chain = " || ".join(f"EXACT({left[0]}, {it[0]})" for it in items)
+            return (f"({chain})", "bool")
         joined = ", ".join(it[0] for it in items)
         return (f"{left[0]} IN {{{joined}}}", "bool")
 

@@ -316,9 +316,12 @@ COLUMN_TRANSLATIONS = [
     ("ROUND([Sales], 2)", "ROUND('Orders'[Sales], 2)"),
     ("DEGREES([Sales])", "DEGREES('Orders'[Sales])"),                  # scalar math over a row field
     ('IF [Sales] > 100 THEN "high" ELSE "low" END', 'IF(\'Orders\'[Sales] > 100, "high", "low")'),
-    ('[Region] IN ("East", "West")', '\'Orders\'[Region] IN {"East", "West"}'),  # set membership
+    ('[Region] IN ("East", "West")',
+     '(EXACT(\'Orders\'[Region], "East") || EXACT(\'Orders\'[Region], "West"))'),  # case-sensitive set
     ('IF [Region] IN ("East", "West") THEN 1 ELSE 0 END',
-     'IF(\'Orders\'[Region] IN {"East", "West"}, 1, 0)'),              # IN composes in a conditional
+     'IF((EXACT(\'Orders\'[Region], "East") || EXACT(\'Orders\'[Region], "West")), 1, 0)'),  # composes
+    ('[Region] IN ("East")', '(EXACT(\'Orders\'[Region], "East"))'),  # single text element still uses EXACT
+    ("[Quantity] IN (1, 2, 3)", "'Orders'[Quantity] IN {1, 2, 3}"),   # numeric operand keeps DAX set form
     # --- string functions ---
     ("UPPER([Region])", "UPPER('Orders'[Region])"),
     ("LOWER([Region])", "LOWER('Orders'[Region])"),
