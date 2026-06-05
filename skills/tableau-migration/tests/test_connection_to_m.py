@@ -122,6 +122,24 @@ SNOWFLAKE = """<?xml version='1.0' encoding='utf-8' ?>
   </connection>
 </datasource>"""
 
+TERADATA = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='TD' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='td' name='teradata.a'>
+        <connection class='teradata' dbname='ANALYTICS' server='td.example.com' />
+      </named-connection>
+    </named-connections>
+    <relation name='ORDERS' table='[ANALYTICS].[ORDERS]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>SALES</remote-name><local-name>[SALES]</local-name>
+        <parent-name>[ORDERS]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
 # Faithful reproduction of a modern multi-sheet Excel ``.tds`` (the published Superstore
 # sample): a <relation type='collection'> container wrapping the physical sheet tables, the
 # SAME tables duplicated under the logical <properties> layer, and columns in <metadata-records>.
@@ -296,6 +314,58 @@ def test_emit_snowflake_is_scaffold_not_wrong_m():
     assert "Sql.Database" not in body   # must not emit the wrong connector
 
 
+# Each fully-supported connector takes the verified `(server, database)` signature, so the
+# two-argument call + Schema/Item navigation is emitted as deploy-ready M.
+@pytest.mark.parametrize("cls,connector", [
+    ("sqlserver", "Sql.Database"),
+    ("azure_sqldb", "Sql.Database"),
+    ("postgres", "PostgreSQL.Database"),
+    ("mysql", "MySQL.Database"),
+    ("redshift", "AmazonRedshift.Database"),
+])
+def test_emit_fully_supported_connector_dispatch(cls, connector):
+    rel = {"kind": "table", "name": "Orders", "item": "Orders", "schema": "dbo", "columns": []}
+    body = emit_m_partition_source(rel, {"connection_class": cls}, "DirectQuery")
+    assert f'Source = {connector}(#"Server", #"Database")' in body
+    assert 'Source{[Schema="dbo", Item="Orders"]}[Data]' in body
+
+
+# Recognized-but-partial connectors map to the right M function NAME, but their real signature
+# differs from `(server, database)`, so the body must be a named scaffold, never a guessed call.
+@pytest.mark.parametrize("cls,connector", [
+    ("oracle", "Oracle.Database"),        # Oracle.Database(server, [options]) -- server only
+    ("teradata", "Teradata.Database"),    # Teradata.Database(server, [options]) -- server only
+    ("snowflake", "Snowflake.Databases"), # server + warehouse navigation
+    ("bigquery", "GoogleBigQuery.Database"),
+])
+def test_emit_partial_connector_is_named_scaffold_not_guessed_m(cls, connector):
+    rel = {"kind": "table", "name": "T", "item": "T", "schema": "s", "columns": []}
+    body = emit_m_partition_source(rel, {"connection_class": cls}, "DirectQuery")
+    assert "TODO" in body
+    assert connector in body                     # names the intended connector as a hint
+    assert '(#"Server", #"Database")' not in body  # but never a guessed 2-arg upstream call
+    assert "Sql.Database" not in body
+
+
+def test_emit_unsupported_class_falls_back_to_scaffold():
+    # A connector class outside the verified set is emitted as a bare scaffold, never wrong M.
+    rel = {"kind": "table", "name": "T", "item": "T", "schema": "s", "columns": []}
+    body = emit_m_partition_source(rel, {"connection_class": "saphana"}, "Import")
+    assert "TODO" in body
+    assert "'saphana'" in body
+    assert '(#"Server", #"Database")' not in body
+
+
+def test_emit_teradata_parsed_is_named_scaffold():
+    d = parse_tds(TERADATA)
+    assert d["connection_class"] == "teradata"
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    assert "TODO" in body
+    assert "Teradata.Database" in body
+    assert "Sql.Database" not in body
+    assert '(#"Server", #"Database")' not in body
+
+
 def test_emit_table_none_when_no_columns():
     rel = {"kind": "table", "name": "Empty", "item": "Empty", "columns": []}
     assert emit_table_tmdl_m(rel, {"connection_class": "sqlserver"}, "Import") is None
@@ -326,3 +396,10 @@ def test_connection_details_for_bind():
     assert details["server"] == "myserver.database.windows.net"
     assert details["database"] == "Superstore"
     assert details["path"] == "myserver.database.windows.net;Superstore"
+
+
+def test_connection_details_bind_type_for_teradata():
+    details = connection_details_for_bind(
+        {"connection_class": "teradata", "server": "td.example.com", "database": "ANALYTICS"})
+    assert details["bind_type"] == "Teradata"
+    assert details["path"] == "td.example.com;ANALYTICS"

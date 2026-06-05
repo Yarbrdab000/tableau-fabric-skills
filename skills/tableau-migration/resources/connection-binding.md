@@ -54,14 +54,25 @@ relation kind:
 
 | Tableau class | Power Query connector | Tier |
 |---|---|---|
-| `sqlserver` | `Sql.Database` | Fully supported |
+| `sqlserver` / `azure_sqldb` | `Sql.Database` | Fully supported |
 | `postgres` | `PostgreSQL.Database` | Fully supported |
-| `oracle` | `Oracle.Database` | Fully supported |
 | `mysql` | `MySQL.Database` | Fully supported |
 | `redshift` | `AmazonRedshift.Database` | Fully supported |
-| `snowflake` / `bigquery` | `Snowflake.Databases` / `GoogleBigQuery.Database` | Scaffold (navigation differs) |
-| `excel-direct` / `csv` | `Excel.Workbook` / `Csv.Document` | Flat file (needs path) |
+| `oracle` | `Oracle.Database` | Scaffold (server-only signature) |
+| `teradata` | `Teradata.Database` | Scaffold (server-only signature) |
+| `snowflake` | `Snowflake.Databases` | Scaffold (server + warehouse navigation) |
+| `bigquery` | `GoogleBigQuery.Database` | Scaffold (project/dataset navigation) |
+| `excel-direct` / `excel` | `Excel.Workbook` | Flat file (needs path) |
+| `textscan` / `csv` | `Csv.Document` | Flat file (needs path) |
 | anything else | — | Fall back to land-to-Delta |
+
+**Fully supported** is gated on one verified fact from the Power Query M docs: the connector takes the
+`<Connector>.Database(server, database)` signature, so the two-argument call + `Source{[Schema=…, Item=…]}[Data]`
+navigation is correct rather than guessed. **Scaffold** connectors map to the right M function *name*, but
+their real signature differs — `Oracle.Database(server, [options])` and `Teradata.Database(server, [options])`
+take a server only (no `database` positional), and `Snowflake.Databases` / `GoogleBigQuery.Database` use
+multi-level navigation — so the partition is emitted as a clearly-flagged `// TODO` that names the intended
+connector but never a wrong `(server, database)` call.
 
 ---
 
@@ -80,9 +91,10 @@ API:
 }
 ```
 
-`bind_type` is mapped for the SQL family plus Snowflake/BigQuery (`SQL`, `PostgreSql`, `Oracle`, `MySql`,
-`AmazonRedshift`, `Snowflake`, `GoogleBigQuery`). A binding adapter flattens `path` to the connector's exact
-requirement; the structured fields are preserved so nothing is lost for non-SQL connectors.
+`bind_type` is mapped for the SQL family plus Oracle, Teradata, Snowflake, and BigQuery (`SQL`, `PostgreSql`,
+`Oracle`, `MySql`, `AmazonRedshift`, `Teradata`, `Snowflake`, `GoogleBigQuery`). A binding adapter flattens
+`path` to the connector's exact requirement; the structured fields are preserved so nothing is lost for
+non-SQL connectors.
 
 The bind sequence itself — discover → match → create → bind → validate — is owned by `semantic-model-authoring`'s
 connection workflow. Hand it `connection_details_for_bind(...)` and let it drive the Fabric REST calls.

@@ -24,10 +24,10 @@ import xml.etree.ElementTree as ET
 
 try:  # works whether imported as a package or run with scripts/ on sys.path
     from .tmdl_generate import clean_col, generate_column_tmdl, q
-    from .storage_mode import SQL_DATABASE_FAMILY
+    from .storage_mode import FLAT_FILE_CLASSES, PARTIAL_LIVE_CONNECTORS, SQL_DATABASE_FAMILY
 except ImportError:
     from tmdl_generate import clean_col, generate_column_tmdl, q
-    from storage_mode import SQL_DATABASE_FAMILY
+    from storage_mode import FLAT_FILE_CLASSES, PARTIAL_LIVE_CONNECTORS, SQL_DATABASE_FAMILY
 
 
 # -- type mapping --------------------------------------------------------------
@@ -328,8 +328,14 @@ def emit_m_partition_source(relation, descriptor, mode):
     cls = (descriptor.get("connection_class") or "").lower()
     connector = SQL_DATABASE_FAMILY.get(cls)
     if connector is None:
-        return ("\t\t\t// TODO: complete M for connector class "
-                f"'{cls or 'unknown'}' (not auto-emitted in v1)\n"
+        # Recognized-but-partial / flat-file / unknown: name the intended connector as a hint
+        # but never emit a guessed `(server, database)` call when the real signature differs.
+        intended = PARTIAL_LIVE_CONNECTORS.get(cls) or FLAT_FILE_CLASSES.get(cls)
+        hint = f" using {intended}" if intended else ""
+        return ("\t\t\t// TODO: complete the M partition for connector class "
+                f"'{cls or 'unknown'}'{hint} "
+                "(signature/navigation differs from the supported (server, database) family; "
+                "not auto-emitted in v1)\n"
                 '\t\t\tlet Source = null in Source')
 
     if relation["kind"] == "custom_sql":
@@ -431,6 +437,7 @@ _BIND_TYPE = {
     "oracle": "Oracle",
     "mysql": "MySql",
     "redshift": "AmazonRedshift",
+    "teradata": "Teradata",
     "snowflake": "Snowflake",
     "bigquery": "GoogleBigQuery",
 }
