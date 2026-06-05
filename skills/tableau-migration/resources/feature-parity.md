@@ -18,7 +18,7 @@ before a migration and to populate the "Not migrated" section of the report.
 | Column + data type | Typed model column | ✅ Typed from source schema |
 | Hidden join keys | Model relationship | ✅ Inferred, oriented by real cardinality |
 | Extract (`.hyper`) | Import model | ✅ |
-| Live connection | DirectQuery model | ✅ (`Sql.Database` family fully; Snowflake/BigQuery scaffold) |
+| Live connection | DirectQuery model | ✅ (`Sql.Database` family fully; Oracle/Teradata/Snowflake/BigQuery scaffold — verified per-connector M in progress) |
 | Custom SQL | `Value.NativeQuery` partition | ✅ Preserved; folding requested (verify before refresh) |
 | Federated / blended / join tree | — | ⚠️ Fallback to land-to-Delta + DirectLake |
 

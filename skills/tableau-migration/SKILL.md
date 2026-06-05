@@ -159,8 +159,8 @@ Tableau datasource
 ├── unknown/unmapped connector class                         → FALL BACK: land-to-Delta + DirectLake
 ├── flat file (Excel/CSV)                                    → Import (set file path)
 ├── extract enabled                                          → Import (snapshot); offer live DirectQuery if source supported
-└── live relational (SQL Server/Postgres/Oracle/MySQL/Redshift) → DirectQuery
-    └── Snowflake / BigQuery                                 → DirectQuery mode, but M emitted as a flagged scaffold
+└── live relational (SQL Server/Azure SQL DB/Postgres/MySQL/Redshift) → DirectQuery (M fully emitted)
+    └── Oracle / Teradata / Snowflake / BigQuery            → DirectQuery mode; verified per-connector M in progress (flagged scaffold until then)
 ```
 
 See [storage-mode-selection.md](resources/storage-mode-selection.md) for the full policy and `scripts/storage_mode.py` for the executable version.
@@ -186,7 +186,7 @@ See [storage-mode-selection.md](resources/storage-mode-selection.md) for the ful
 ### AVOID
 - **Do not type Power BI columns from Tableau field roles or names** — use the physical source schema.
 - **Do not claim a calculated field was translated** unless the deterministic translator produced DAX (or a gated LLM pass was reconciliation-verified). A stub is `= 0`, not a translation.
-- **Do not auto-emit M for Snowflake/BigQuery** — their navigation differs; emit a flagged scaffold or fall back.
+- **Do not emit a blind `(server, database)` call for Oracle/Teradata/Snowflake/BigQuery** — their signature/navigation differs; emit the verified per-connector M, or a flagged scaffold, but never a guessed 2-arg call.
 - **Do not expand a Tableau join/union tree into independent Power BI tables** — that changes grain and breaks measures. Fall back.
 - **Do not put credentials in the model, M code, `.tds` artifacts, or the migration report** — binding links IDs only; credentials are entered by the user on the connection.
 
@@ -259,7 +259,7 @@ Full matrix in [feature-parity.md](resources/feature-parity.md). Headline parity
 | Datasource → semantic model (tables, typed columns) | ✅ High parity (types from source schema). |
 | Relationship inference (hidden join keys) | ✅ Inferred from real landed cardinality (DirectLake path). |
 | Calculated field → DAX | ⚠️ **Safe subset only** — aggregations + arithmetic, `IF`/`ELSEIF`/`IIF`, comparisons + boolean logic, and null handling (`ZN`/`IFNULL`/`ISNULL`); LOD expressions, table calcs, and row-level/date/string functions are preserved stubs. |
-| Storage mode / upstream connection | ✅ Auto-selected; Sql.Database family fully emitted, Snowflake/BigQuery scaffolded. |
+| Storage mode / upstream connection | ✅ Auto-selected; `Sql.Database` family (SQL Server/Azure SQL DB/Postgres/MySQL/Redshift) fully emitted; Oracle/Teradata/Snowflake/BigQuery scaffolded (verified per-connector M in progress). |
 | LOD expressions (FIXED/INCLUDE/EXCLUDE), table calcs (WINDOW_*/RUNNING_*) | ❌ Not translated — preserved as stubs for manual/LLM completion. |
 | Worksheet / dashboard → Power BI report | ❌ **Roadmap (v2)** — not in v1. |
 | Row-level security, parameters, sets, groups | ❌ Not migrated in v1 — flagged in the report. |
@@ -277,7 +277,7 @@ Full guide in [migration-gotchas.md](resources/migration-gotchas.md).
 | G1 | `TYPE_FROM_TABLEAU_METADATA` | Column typed from Tableau role/name instead of the physical schema → DirectLake bind fails | Yes | Type from landed Delta / `.tds` metadata; if absent, fall back. |
 | G2 | `CALC_FALLBACK_STUB` | Calculated field outside the safe subset emitted as `= 0` | No | Expected — original formula preserved; repair manually or via gated LLM. |
 | G3 | `JOIN_TREE_UNSUPPORTED` | Federated join/union tree treated as one logical table | Yes | Fall back to land-to-Delta + DirectLake; do not split into tables. |
-| G4 | `CONNECTOR_NOT_EMITTED` | Snowflake/BigQuery M navigation differs from Sql.Database | Partial | Emit flagged scaffold; complete M manually or fall back. |
+| G4 | `CONNECTOR_NOT_EMITTED` | Oracle/Teradata/Snowflake/BigQuery signature/navigation differs from `Sql.Database` | Partial | Emit verified per-connector M when available, else a flagged scaffold; never a guessed 2-arg call. |
 | G5 | `NATIVE_QUERY_NO_FOLD` | Custom SQL native query won't fold in DirectQuery | Partial | Keep `[EnableFolding=true]`; if it still fails, switch that table to Import. |
 | G6 | `CREDENTIALS_MANUAL` | Bind succeeds but refresh fails (no credentials) | Yes | User configures credentials on the connection; bind links IDs only. |
 | G7 | `GATEWAY_REQUIRED` | DirectQuery to an on-premises source needs a data gateway | Yes | User sets up / selects a gateway for the connection. |
