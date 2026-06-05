@@ -11,7 +11,11 @@ forms) must fall back (return None) so the caller keeps an inert ``= 0`` stub.
 """
 import pytest
 
-from calc_to_dax import translate_tableau_calc_to_dax, validate_dax
+from calc_to_dax import (
+    translate_tableau_calc_to_dax,
+    translate_tableau_calc_to_column_dax,
+    validate_dax,
+)
 
 # Shared resolver: caption -> (table_display_name, clean_col, tmdl_type).
 _FIELDS = {
@@ -30,6 +34,10 @@ def _resolver(caption):
 
 def _tx(formula):
     return translate_tableau_calc_to_dax(formula, _resolver)[0]
+
+
+def _col(formula):
+    return translate_tableau_calc_to_column_dax(formula, _resolver)[0]
 
 
 # Formula -> expected DAX. Anything in this table MUST translate exactly.
@@ -283,3 +291,129 @@ def test_elseif_reason_ok():
     assert reason == "ok"
     assert tables == {"Orders"}
     assert dax.count("IF(") == 2  # nested ELSEIF
+
+
+# ---------------------------------------------------------------------------
+# Row-level (calculated-COLUMN) translation: translate_tableau_calc_to_column_dax.
+# Here a bare [field] resolves to 'Table'[Col] and the row-level string/date/cast
+# functions are available. Anything not faithfully expressible in DAX falls back.
+# ---------------------------------------------------------------------------
+COLUMN_TRANSLATIONS = [
+    # --- bare row-level fields + numeric/logical reuse (free in column context) ---
+    ("[Sales] + [Profit]", "'Orders'[Sales] + 'Orders'[Profit]"),
+    ("ABS([Profit])", "ABS('Orders'[Profit])"),
+    ("ROUND([Sales], 2)", "ROUND('Orders'[Sales], 2)"),
+    ('IF [Sales] > 100 THEN "high" ELSE "low" END', 'IF(\'Orders\'[Sales] > 100, "high", "low")'),
+    # --- string functions ---
+    ("UPPER([Region])", "UPPER('Orders'[Region])"),
+    ("LOWER([Region])", "LOWER('Orders'[Region])"),
+    ("LEN([Region])", "LEN('Orders'[Region])"),
+    ("LEFT([Region], 3)", "LEFT('Orders'[Region], 3)"),
+    ("RIGHT([Region], 2)", "RIGHT('Orders'[Region], 2)"),
+    ("MID([Region], 2)", "MID('Orders'[Region], 2, LEN('Orders'[Region]))"),   # 2-arg runs to end
+    ("MID([Region], 2, 3)", "MID('Orders'[Region], 2, 3)"),
+    ('REPLACE([Region], "a", "b")', "SUBSTITUTE('Orders'[Region], \"a\", \"b\")"),
+    ('CONTAINS([Region], "East")', "CONTAINSSTRINGEXACT('Orders'[Region], \"East\")"),  # case-sensitive
+    ('STARTSWITH([Region], "E")', "EXACT(LEFT('Orders'[Region], LEN(\"E\")), \"E\")"),
+    ('ENDSWITH([Region], "t")', "EXACT(RIGHT('Orders'[Region], LEN(\"t\")), \"t\")"),
+    ('FIND([Region], "a")', "FIND(\"a\", 'Orders'[Region], 1, 0)"),                    # default start 1
+    ('FIND([Region], "a", 2)', "FIND(\"a\", 'Orders'[Region], 2, 0)"),
+    # string '+' concatenation propagates null (unlike a bare DAX '&')
+    ('[Region] + "!"',
+     "IF(ISBLANK('Orders'[Region]) || ISBLANK(\"!\"), BLANK(), 'Orders'[Region] & \"!\")"),
+    # --- numeric casts ---
+    ("INT([Sales])", "TRUNC('Orders'[Sales])"),                 # truncates toward zero
+    ("FLOAT([Quantity])", "CONVERT('Orders'[Quantity], DOUBLE)"),
+    # --- date functions ---
+    ("YEAR([Order Date])", "YEAR('Orders'[Order_Date])"),
+    ("MONTH([Order Date])", "MONTH('Orders'[Order_Date])"),
+    ("DAY([Order Date])", "DAY('Orders'[Order_Date])"),
+    ('DATEPART("month", [Order Date])', "MONTH('Orders'[Order_Date])"),
+    ('DATEPART("quarter", [Order Date])', "QUARTER('Orders'[Order_Date])"),
+    ('DATEADD("day", 7, [Order Date])', "('Orders'[Order_Date] + (7))"),
+    ('DATEADD("month", 3, [Order Date])',
+     "(EDATE('Orders'[Order_Date], 3) + MOD('Orders'[Order_Date], 1))"),               # keeps time-of-day
+    ('DATEADD("year", 1, [Order Date])',
+     "(EDATE('Orders'[Order_Date], (1) * 12) + MOD('Orders'[Order_Date], 1))"),
+    ('DATEDIFF("day", [Order Date], TODAY())', "DATEDIFF('Orders'[Order_Date], TODAY(), DAY)"),
+    ('DATETRUNC("month", [Order Date])', "DATE(YEAR('Orders'[Order_Date]), MONTH('Orders'[Order_Date]), 1)"),
+    ("DATE([Order Date])",
+     "DATE(YEAR('Orders'[Order_Date]), MONTH('Orders'[Order_Date]), DAY('Orders'[Order_Date]))"),  # strips time
+    ("TODAY()", "TODAY()"),
+    ("NOW()", "NOW()"),
+]
+
+COLUMN_FALLBACKS = [
+    # measure-only constructs are invalid in a row-level column
+    "SUM([Sales])",                               # aggregation
+    "PERCENTILE([Sales], 0.5)",                   # aggregation
+    "{FIXED [Region] : SUM([Sales])}",            # LOD
+    # functions whose DAX equivalent is not faithful -> deferred to fallback
+    "TRIM([Region])",                             # DAX TRIM also collapses internal spaces
+    "LTRIM([Region])",
+    "RTRIM([Region])",
+    'SPLIT([Region], ",", 1)',                    # no general DAX equivalent
+    "STR([Sales])",                               # culture-sensitive formatting
+    'DATE("2020-01-01")',                         # DATE(text) is culture-sensitive parsing
+    'DATEPART("week", [Order Date])',             # start-of-week dependent
+    'DATEPART("weekday", [Order Date])',
+    'DATEDIFF("week", [Order Date], TODAY())',
+    'DATETRUNC("quarter", [Order Date])',
+    'DATEADD("fortnight", 1, [Order Date])',      # unknown part
+    # type violations
+    "LEN([Sales])",                               # LEN on a numeric field
+    "UPPER([Sales])",                             # UPPER on a numeric field
+    'LEFT([Region], "x")',                        # non-numeric length
+    "YEAR([Region])",                             # date function on text
+    "INT([Region])",                              # numeric cast of text
+    '[Region] + [Profit]',                        # text + number (mixed)
+    # cross-table row-level column (cannot span tables)
+    "[Sales] + [People Count]",
+]
+
+
+@pytest.mark.parametrize("formula,expected", COLUMN_TRANSLATIONS, ids=[t[0] for t in COLUMN_TRANSLATIONS])
+def test_column_subset_translates(formula, expected):
+    assert _col(formula) == expected
+
+
+@pytest.mark.parametrize("formula", COLUMN_FALLBACKS, ids=[repr(f) for f in COLUMN_FALLBACKS])
+def test_column_unsupported_falls_back(formula):
+    assert _col(formula) is None
+
+
+def test_every_emitted_column_dax_passes_the_guardrail():
+    for formula, _ in COLUMN_TRANSLATIONS:
+        dax = _col(formula)
+        assert dax is not None
+        assert validate_dax(dax) == ""
+
+
+def test_row_level_functions_are_rejected_in_measure_context():
+    # The two entry points are distinct: row-level fields/functions translate as a column
+    # but must STILL fall back as a measure (the measure-context invariant is preserved).
+    for formula in ("UPPER([Region])", "LEFT([Region], 3)", '[Region] + "!"', "YEAR([Order Date])"):
+        assert _tx(formula) is None
+        assert _col(formula) is not None
+
+
+def test_aggregations_are_rejected_in_column_context():
+    # ...and the inverse: aggregations translate as a measure but fall back as a column.
+    for formula in ("SUM([Sales])", "AVG([Profit])", "COUNTD([Region])"):
+        assert _tx(formula) is not None
+        assert _col(formula) is None
+
+
+def test_column_binding_contract_reports_single_table():
+    dax, reason, tables = translate_tableau_calc_to_column_dax("UPPER([Region])", _resolver)
+    assert dax == "UPPER('Orders'[Region])"
+    assert reason == "ok"
+    assert tables == {"Orders"}  # caller binds the calculated column to this table
+
+
+def test_column_with_no_field_has_empty_tables_used():
+    dax, reason, tables = translate_tableau_calc_to_column_dax("TODAY()", _resolver)
+    assert dax == "TODAY()"
+    assert reason == "ok"
+    assert tables == set()  # no field refs -> bindable anywhere
+

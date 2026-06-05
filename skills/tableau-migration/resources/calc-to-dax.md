@@ -74,8 +74,61 @@ SUM([Sales]) - [Discount]      → stub   (bare [Discount] is row-level)
 SUM([Sales]) - SUM([Discount]) → DIVIDE-free arithmetic, translates
 ```
 
-To get a row-level calc, the customer would author a **calculated column** upstream; this skill targets
-measures.
+To get a row-level calc, the customer would author a **calculated column** upstream. The skill also
+provides a companion entry point for exactly that case — see the next section.
+
+---
+
+## Row-level calculated columns (companion path)
+
+Some Tableau calcs are inherently **row-level** (string slicing, date parts, casts) and cannot be a
+measure. For those, `translate_tableau_calc_to_column_dax(formula, resolver)` parses in *column context*
+and returns the same `(dax, reason, tables_used)` triple, but for a **calculated column** instead of a
+measure:
+
+```python
+from calc_to_dax import translate_tableau_calc_to_column_dax
+dax, reason, tables_used = translate_tableau_calc_to_column_dax(formula, resolver)
+```
+
+In column context a bare `[field]` resolves to `'Table'[Col]` (the measure path falls back on it), and the
+row-level pack becomes available. **Aggregations, `PERCENTILE`, and LOD expressions are invalid here and
+fall back** (use the measure entry point for those). The two entry points are mirror images: a row-level
+calc translates as a column but stubs as a measure, and an aggregation translates as a measure but stubs as
+a column.
+
+> **Binding contract.** When `tables_used` is a single `{T}`, the caller must materialize the expression as
+> a calculated column **on table `T`**. Empty `tables_used` (e.g. `TODAY()`) → no field refs, bindable
+> anywhere. More than one table → falls back (a row-level column cannot span tables). The actual binding is
+> owned by the orchestrator/renderer; this function only emits the expression behind that clean seam.
+
+| Tableau construct | DAX emitted | Notes |
+|---|---|---|
+| `[field]` (bare, row-level) | `'T'[Col]` | Resolves instead of falling back |
+| `LEN/UPPER/LOWER(s)` | `LEN/UPPER/LOWER(s)` | `s` must be text |
+| `LEFT/RIGHT(s, n)` | `LEFT/RIGHT(s, n)` | |
+| `MID(s, start)` / `MID(s, start, len)` | `MID(s, start, LEN(s))` / `MID(s, start, len)` | 2-arg runs to end of string |
+| `REPLACE(s, old, new)` | `SUBSTITUTE(s, old, new)` | Replaces all occurrences |
+| `CONTAINS(s, sub)` | `CONTAINSSTRINGEXACT(s, sub)` | **Case-sensitive** (plain `CONTAINSSTRING` is not) |
+| `STARTSWITH/ENDSWITH(s, sub)` | `EXACT(LEFT/RIGHT(s, LEN(sub)), sub)` | Case-sensitive prefix/suffix |
+| `FIND(s, sub[, start])` | `FIND(sub, s, start, 0)` | Args reorder; case-sensitive; `0` = not found |
+| `s1 + s2` (text) | `IF(ISBLANK(s1) \|\| ISBLANK(s2), BLANK(), s1 & s2)` | Tableau `+` propagates null, unlike `&` |
+| `INT(x)` | `TRUNC(x)` | Truncates toward zero (DAX `INT` floors) |
+| `FLOAT(x)` | `CONVERT(x, DOUBLE)` | |
+| `YEAR/MONTH/DAY(d)` | `YEAR/MONTH/DAY(d)` | |
+| `TODAY()` / `NOW()` | `TODAY()` / `NOW()` | |
+| `DATEPART("part", d)` | `YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/QUARTER(d)` | `week`/`weekday` fall back (start-of-week) |
+| `DATEADD("part", n, d)` | `d + n` … / `EDATE(d, n) + MOD(d, 1)` | `EDATE` form keeps the time-of-day |
+| `DATEDIFF("part", d1, d2)` | `DATEDIFF(d1, d2, UNIT)` | Args reorder; `week` falls back |
+| `DATETRUNC("part", d)` | `DATE(YEAR(d), MONTH(d), 1)` etc. | `day`/`month`/`year`; `quarter`/`week` fall back |
+| `DATE(d)` | `DATE(YEAR(d), MONTH(d), DAY(d))` | Strips the time component |
+
+Row-level numeric math (`ABS`, `ROUND`, …) and the full conditional/logical grammar (`IF`, `CASE`,
+comparisons, `AND`/`OR`/`NOT`, `ZN`/`IFNULL`/`ISNULL`) also work in column context over row-level fields.
+
+**Deliberately left to fall back** (no faithful DAX equivalent): `TRIM`/`LTRIM`/`RTRIM` (DAX `TRIM` also
+collapses internal whitespace), `SPLIT` (no general DAX form), `STR` and `DATE("...")` (culture-sensitive
+formatting/parsing), and the start-of-week-dependent `DATEPART("week"/"weekday")` / `DATEDIFF("week", …)`.
 
 ---
 
