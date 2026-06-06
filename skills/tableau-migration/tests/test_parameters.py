@@ -14,14 +14,20 @@ from parameters import (
     CLASS_TOP_N,
     CLASS_VISUAL_FILTER,
     STRAT_DEFAULT_ONLY,
+    ParamSpec,
     classify_parameter,
     emit_parameter,
     extract_parameters,
+    param_dependent_flag_measure,
+    param_filter_measure,
     param_order_column,
+    param_rank_measure,
     param_ref_name,
     param_slicer_column,
+    param_switch_measure,
     param_table_name,
     param_table_tmdl,
+    param_topn_filter_measure,
     param_value_column,
     param_value_measure,
 )
@@ -399,3 +405,94 @@ def test_emit_parameter_bundle(by_caption):
     assert out["deploy_ready"] is True
     assert "DATATABLE" in out["table_tmdl"]
     assert out["value_measure"][0] == "Facility Name Parameter Value"
+
+
+# -- Tier 2: TREATAS filter (dimension-swap / visual-filter) ------------------
+def test_treatas_filter_measure(by_caption):
+    s = by_caption["Facility Name Parameter"]
+    name, dax = param_filter_measure(s, "FactHospital", "Facility", "Sales")
+    assert name == "Sales (filtered by Facility Name Parameter)"
+    assert dax == (
+        "CALCULATE([Sales], TREATAS({ [Facility Name Parameter Value] }, "
+        "FactHospital[Facility]))"
+    )
+
+
+def test_treatas_filter_accepts_bracketed_base():
+    s = ParamSpec(name="[P]", caption="Region", datatype="string", domain_type="list",
+                  members=[("East", None)], default="East")
+    _name, dax = param_filter_measure(s, "Sales", "Region", "[Total Sales]")
+    assert "CALCULATE([Total Sales], TREATAS({ [Region Value] }, Sales[Region]))" == dax
+
+
+# -- Tier 2: measure-swap (SWITCH) --------------------------------------------
+def test_switch_measure():
+    s = ParamSpec(name="[Metric]", caption="Metric Selector", datatype="string",
+                  domain_type="list",
+                  members=[("Sales", None), ("Profit", None)], default="Sales")
+    name, dax = param_switch_measure(s, [("Sales", "Sales"), ("Profit", "Profit")])
+    assert name == "Metric Selector Selected"
+    assert dax == (
+        'SWITCH([Metric Selector Value], "Sales", [Sales], "Profit", [Profit], BLANK())'
+    )
+
+
+def test_switch_measure_with_default_expression():
+    s = ParamSpec(name="[Metric]", caption="Metric Selector", datatype="string",
+                  domain_type="list", members=[("Sales", None)], default="Sales")
+    _name, dax = param_switch_measure(s, [("Sales", "Sales")], default="[Fallback]")
+    assert dax.endswith(', [Fallback])')
+
+
+# -- Tier 2: cascading dependent flag -----------------------------------------
+def test_dependent_flag_measure():
+    parent = ParamSpec(name="[Cluster]", caption="Cluster", datatype="string",
+                       domain_type="list", members=[("North", None)], default="North")
+    child = ParamSpec(name="[SubCluster]", caption="SubCluster", datatype="string",
+                      domain_type="list", members=[("N1", None)], default="N1")
+    name, dax = param_dependent_flag_measure(child, parent, "Geo", "Cluster", "SubCluster")
+    assert name == "SubCluster Allowed For Cluster"
+    assert dax == (
+        "IF(NOT ISFILTERED(Cluster[Cluster]), 1, "
+        "INT(NOT ISEMPTY(CALCULATETABLE(Geo, "
+        "TREATAS({ [Cluster Value] }, Geo[Cluster]), "
+        "TREATAS(VALUES(SubCluster[SubCluster]), Geo[SubCluster])))))"
+    )
+
+
+# -- Tier 3: Top-N (RANKX + filter measure) -----------------------------------
+def test_rank_measure():
+    name, dax = param_rank_measure("Hospital", "Facility", "Sales")
+    assert name == "Rank of Facility by Sales"
+    assert dax == "RANKX(ALLSELECTED(Hospital[Facility]), [Sales], , DESC, SKIP)"
+
+
+def test_topn_filter_measure():
+    s = ParamSpec(name="[Top N]", caption="Top N", datatype="integer", domain_type="list",
+                  members=[(5, None), (10, None), (20, None)], default=10)
+    name, dax = param_topn_filter_measure(s, "Rank of Facility by Sales")
+    assert name == "Top N Top N Filter"
+    assert dax == (
+        "IF(NOT ISFILTERED('Top N'[Top N]), 1, "
+        "IF([Rank of Facility by Sales] <= SELECTEDVALUE('Top N'[Top N]), 1, 0))"
+    )
+
+
+def test_topn_filter_measure_with_blank_guard():
+    s = ParamSpec(name="[Top N]", caption="Top N", datatype="integer", domain_type="list",
+                  members=[(5, None), (10, None)], default=5)
+    _name, dax = param_topn_filter_measure(s, "Rank of Facility by Sales", metric="Sales")
+    assert dax == (
+        "IF(NOT ISFILTERED('Top N'[Top N]), 1, "
+        "IF(NOT ISBLANK([Sales]) && [Rank of Facility by Sales] <= "
+        "SELECTEDVALUE('Top N'[Top N]), 1, 0))"
+    )
+
+
+def test_topn_table_is_a_value_param_table():
+    # The Top-N candidate table is just the value-parameter table (5/10/20).
+    s = ParamSpec(name="[Top N]", caption="Top N", datatype="integer", domain_type="list",
+                  members=[(5, None), (10, None), (20, None)], default=10)
+    tmdl = param_table_tmdl(s)
+    assert 'DATATABLE("Top N", INTEGER, "Top N Order", INTEGER, {' in tmdl
+    assert "{ 5, 1 }" in tmdl and "{ 10, 2 }" in tmdl and "{ 20, 3 }" in tmdl

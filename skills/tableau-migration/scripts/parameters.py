@@ -16,10 +16,10 @@ Three capability tiers (all disconnected-table + DAX):
   (``DATATABLE`` list with an ordinal Sort-By column / ``GENERATESERIES`` numeric range /
   ``CALENDAR`` date range) plus a single-select-safe *value measure*
   ``X Value = IF(HASONEVALUE('X'[X]), SELECTEDVALUE('X'[X]), <default>)``.
-* **Tier 2 -- dimension-swap / dependent** (Phase 2): a ``TREATAS`` filter measure that pushes the
+* **Tier 2 -- dimension-swap / dependent**: a ``TREATAS`` filter measure that pushes the
   disconnected selection onto a real fact column, and a cascading 1/0 flag measure for dependent
   (parent -> child) parameters. Measure-swap is a ``SWITCH`` over the value measure.
-* **Tier 3 -- Top-N** (Phase 2): a disconnected N table + a ``RANKX`` ranking measure + a filter
+* **Tier 3 -- Top-N**: a disconnected N table + a ``RANKX`` ranking measure + a filter
   measure whose "nothing selected = show all" semantics make Top-N a calculation, not a static
   visual filter.
 
@@ -566,7 +566,7 @@ def classify_parameter(spec, usages=None, storage_mode=None):
             CLASS_MEASURE_SWAP, 2, STRAT_SWITCH_MEASURE, True,
             extra=[
                 "Measure-swap parameter: build a SWITCH measure over the value measure that returns "
-                "the chosen metric. (Phase 2 emitter.)",
+                "the chosen metric (param_switch_measure).",
             ],
         )
     if u & {USAGE_AXIS, USAGE_DIMENSION}:
@@ -574,7 +574,7 @@ def classify_parameter(spec, usages=None, storage_mode=None):
             CLASS_DIMENSION_SWAP, 2, STRAT_TREATAS_FILTER, True,
             extra=[
                 "Dimension/axis-swap parameter: apply the selection to the real fact column with "
-                "TREATAS (or a Field Parameter). (Phase 2 emitter.)",
+                "TREATAS (param_filter_measure), or a Field Parameter for an axis swap.",
             ],
         )
     if USAGE_FILTER in u:
@@ -582,7 +582,7 @@ def classify_parameter(spec, usages=None, storage_mode=None):
             CLASS_VISUAL_FILTER, 2, STRAT_TREATAS_FILTER, True,
             extra=[
                 "Visual-filter parameter: apply the selection to the fact table via a "
-                "CALCULATE(..., TREATAS(...)) measure rather than a relationship. (Phase 2 emitter.)",
+                "CALCULATE(..., TREATAS(...)) measure (param_filter_measure), not a relationship.",
             ],
         )
 
@@ -780,3 +780,133 @@ def emit_parameter(spec, usages=None, storage_mode="import"):
         "deploy_ready": capability.deploy_ready,
         "warnings": list(capability.warnings),
     }
+
+
+# -- Tier 2 / Tier 3 emitters --------------------------------------------------
+# These take the real fact/dimension column bindings the workbook-parsing / model-emit streams
+# resolve (the parameter XML alone does not name the fact column a parameter drives). They emit the
+# DAX text; the caller adds the measures to the model and applies any "= 1" visual-level filters.
+def _measure_ref(target):
+    """Normalize a measure name or DAX expression into an embeddable DAX reference.
+
+    A bare measure name becomes ``[Name]``; anything already bracketed, quoted, or containing a
+    call/operator is treated as a DAX expression and kept verbatim. ``None`` -> ``BLANK()``.
+    """
+    if target is None:
+        return "BLANK()"
+    s = str(target).strip()
+    if not s:
+        return "BLANK()"
+    if s[0] in "['" or any(ch in s for ch in "()+-*/"):
+        return s
+    return "[" + _brk(s) + "]"
+
+
+def _strip_brackets(name):
+    s = str(name).strip()
+    if s.startswith("[") and s.endswith("]"):
+        return s[1:-1]
+    return s
+
+
+def _value_ref(spec):
+    """``[<X> Value]`` -- the Tier-1 value measure reference these tiers build on."""
+    return "[" + _brk(param_ref_name(spec)) + "]"
+
+
+def _table_col_ref(spec):
+    return "%s[%s]" % (q(param_table_name(spec)), _brk(param_value_column(spec)))
+
+
+def param_filter_measure(spec, fact_table, target_column, base_measure, measure_name=None):
+    """Tier-2 TREATAS filter measure (dimension-swap / visual-filter).
+
+    Recompute ``base_measure`` with the parameter's selection transferred onto a REAL fact column
+    via ``TREATAS`` -- recreating Tableau's param-driven filtering with no relationship::
+
+        <base> (filtered by <X>) =
+        CALCULATE([<base>], TREATAS({ [<X> Value] }, '<fact>'[<col>]))
+    """
+    name = measure_name or "%s (filtered by %s)" % (_strip_brackets(base_measure), _base_name(spec))
+    dax = "CALCULATE(%s, TREATAS({ %s }, %s[%s]))" % (
+        _measure_ref(base_measure), _value_ref(spec), q(fact_table), _brk(target_column),
+    )
+    return name, dax
+
+
+def param_switch_measure(spec, choices, default=None, measure_name=None):
+    """Tier-2 measure-swap: a ``SWITCH`` over the value measure that returns the chosen metric.
+
+    ``choices`` is an ordered iterable of ``(member_value, target)`` where ``target`` is a measure
+    name or a DAX expression. ``default`` is the ELSE branch (``BLANK()`` when omitted)::
+
+        <X> Selected = SWITCH([<X> Value], "Sales", [Sales], "Profit", [Profit], BLANK())
+    """
+    name = measure_name or (_base_name(spec) + " Selected")
+    parts = [_value_ref(spec)]
+    for member_value, target in choices:
+        parts.append(_dax_literal(member_value, spec.datatype))
+        parts.append(_measure_ref(target))
+    parts.append(_measure_ref(default))
+    return name, "SWITCH(" + ", ".join(parts) + ")"
+
+
+def param_dependent_flag_measure(child_spec, parent_spec, bridge_table,
+                                 parent_bridge_column, child_bridge_column, measure_name=None):
+    """Tier-2 cascading (parent -> child) flag measure, applied as a child-slicer visual filter (= 1).
+
+    Returns 1 only for child values that co-occur with the selected parent value in ``bridge_table``
+    (the fact/bridge carrying both columns), so the child slicer shows only values valid for the
+    parent selection. When the parent is unfiltered, every child value is allowed.
+    """
+    name = measure_name or "%s Allowed For %s" % (_base_name(child_spec), _base_name(parent_spec))
+    parent_ref = _table_col_ref(parent_spec)
+    child_ref = _table_col_ref(child_spec)
+    dax = (
+        "IF(NOT ISFILTERED(%s), 1, "
+        "INT(NOT ISEMPTY(CALCULATETABLE(%s, "
+        "TREATAS({ %s }, %s[%s]), "
+        "TREATAS(VALUES(%s), %s[%s])))))"
+    ) % (
+        parent_ref,
+        q(bridge_table),
+        _value_ref(parent_spec), q(bridge_table), _brk(parent_bridge_column),
+        child_ref, q(bridge_table), _brk(child_bridge_column),
+    )
+    return name, dax
+
+
+def param_rank_measure(dim_table, dim_column, metric, measure_name=None,
+                       scope="ALLSELECTED", ties="SKIP"):
+    """Tier-3 ranking measure: ``RANKX`` over a dimension by a metric (descending).
+
+    ``ties`` defaults to ``SKIP`` (competition ranking) so tied members consume rank slots and a
+    ``rank <= N`` filter keeps about N members -- ``DENSE`` would let the value after a run of ties
+    leak past the cut::
+
+        Rank of <dim> by <metric> = RANKX(ALLSELECTED('<dim table>'[<dim col>]), [<metric>], , DESC, SKIP)
+    """
+    name = measure_name or "Rank of %s by %s" % (dim_column, _strip_brackets(metric))
+    dax = "RANKX(%s(%s[%s]), %s, , DESC, %s)" % (
+        scope, q(dim_table), _brk(dim_column), _measure_ref(metric), ties,
+    )
+    return name, dax
+
+
+def param_topn_filter_measure(spec, rank_measure, measure_name=None, metric=None):
+    """Tier-3 Top-N filter measure, applied as a visual-level filter (= 1).
+
+    "Nothing selected = show all" -- Top-N is a calculation, not a static visual filter. Pass
+    ``metric`` to add a blank-metric guard (RANKX ranks a blank metric as 0, which would otherwise
+    let no-data members slip into the Top-N)::
+
+        <X> Top N Filter =
+        IF(NOT ISFILTERED('<X>'[<X>]), 1, IF([<rank>] <= SELECTEDVALUE('<X>'[<X>]), 1, 0))
+    """
+    name = measure_name or (_base_name(spec) + " Top N Filter")
+    tref = _table_col_ref(spec)
+    cond = "%s <= SELECTEDVALUE(%s)" % (_measure_ref(rank_measure), tref)
+    if metric is not None:
+        cond = "NOT ISBLANK(%s) && %s" % (_measure_ref(metric), cond)
+    dax = "IF(NOT ISFILTERED(%s), 1, IF(%s, 1, 0))" % (tref, cond)
+    return name, dax

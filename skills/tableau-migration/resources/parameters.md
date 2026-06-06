@@ -47,6 +47,13 @@ param_value_column(spec) -> str        # column the value measure reads
 param_slicer_column(spec) -> str       # column a slicer binds to (label column when aliases differ)
 param_order_column(spec) -> str        # hidden ordinal Sort-By column (list only)
 emit_parameter(spec, usages=None, storage_mode="import") -> dict   # convenience bundle
+
+# Tier 2 / Tier 3 emitters (caller supplies the real fact/dim column bindings):
+param_filter_measure(spec, fact_table, target_column, base_measure) -> (name, dax)
+param_switch_measure(spec, choices, default=None) -> (name, dax)
+param_dependent_flag_measure(child, parent, bridge_table, parent_bridge_col, child_bridge_col) -> (name, dax)
+param_rank_measure(dim_table, dim_column, metric) -> (name, dax)
+param_topn_filter_measure(spec, rank_measure, metric=None) -> (name, dax)
 ```
 
 ### `ParamSpec`
@@ -92,23 +99,37 @@ A parameter read **inside a measure**.
   (Equivalent to `SELECTEDVALUE(col, default)`; the explicit form is emitted for clarity and to
   make the single-select fallback obvious.)
 
-### Tier 2 — dimension-swap / dependent / measure-swap *(Phase 2)*
-- **Measure-swap** → `SWITCH([X Value], "Sales", [Sales], "Profit", [Profit], …)`.
-- **Dimension/axis-swap & visual-filter** → push the disconnected selection onto the real fact
-  column with `CALCULATE(<measure>, TREATAS(VALUES('X'[X]), Fact[Col]))` (no relationship), or a
-  Field Parameter for axis swaps.
-- **Cascading (parent → child)** → a dependent `1/0` flag measure used as a visual-level filter so
-  the child slicer only shows values valid for the parent selection.
+### Tier 2 — dimension-swap / dependent / measure-swap *(implemented)*
+- **Measure-swap** (`param_switch_measure(spec, choices, default=None)`) →
+  `SWITCH([X Value], "Sales", [Sales], "Profit", [Profit], BLANK())`.
+- **Dimension/axis-swap & visual-filter** (`param_filter_measure(spec, fact_table, target_column,
+  base_measure)`) → push the disconnected selection onto the real fact column with
+  `CALCULATE([base], TREATAS({ [X Value] }, Fact[Col]))` (no relationship). For an axis swap a Power
+  BI Field Parameter is the richer option (Phase 3); the TREATAS measure covers value/visual
+  filtering today.
+- **Cascading (parent → child)** (`param_dependent_flag_measure(child, parent, bridge_table,
+  parent_bridge_col, child_bridge_col)`) → a `1/0` flag applied as the child slicer's visual-level
+  filter (`= 1`); returns 1 only for child values that co-occur with the selected parent value in
+  the bridge, so the child slicer shows only values valid for the parent. The caller supplies the
+  real bridge/fact column names (the parameter XML does not).
 
-### Tier 3 — Top-N *(Phase 2)*
-Disconnected N table (e.g. 5/10/All) + a `RANKX` ranking measure + a filter measure:
-```DAX
-Top N Filter =
-IF(NOT ISFILTERED('Top N'[Top N]), 1,
-   IF([Rank] <= SELECTEDVALUE('Top N'[Top N]), 1, 0))
-```
-applied as a visual-level filter (`= 1`). "Nothing selected = show all" — Top-N is a *calculation*,
-not a static visual filter.
+### Tier 3 — Top-N *(implemented)*
+The Top-N candidate table is just the value-parameter table (`param_table_tmdl` over the 5/10/20…
+list). Two measures drive it:
+- **Ranking** (`param_rank_measure(dim_table, dim_col, metric)`) →
+  `RANKX(ALLSELECTED('Dim'[Col]), [Metric], , DESC, SKIP)`. `SKIP` (competition ranking) is used so
+  ties consume rank slots and `rank <= N` keeps ~N members; `DENSE` would let the value after a run
+  of ties leak past the cut.
+- **Filter** (`param_topn_filter_measure(spec, rank_measure, metric=None)`), applied as a
+  visual-level filter (`= 1`):
+  ```DAX
+  Top N Filter =
+  IF(NOT ISFILTERED('Top N'[Top N]), 1,
+     IF([Rank] <= SELECTEDVALUE('Top N'[Top N]), 1, 0))
+  ```
+  Pass `metric` to add a `NOT ISBLANK([metric]) &&` guard (RANKX ranks a blank metric as 0, which
+  would otherwise slip no-data members into the Top-N). "Nothing selected = show all" — Top-N is a
+  *calculation*, not a static visual filter.
 
 ---
 
