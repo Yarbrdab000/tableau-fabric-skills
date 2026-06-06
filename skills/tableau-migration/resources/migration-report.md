@@ -50,9 +50,9 @@ not-evaluated). Every stub keeps its `TableauFormula` annotation in the model.
 
 ### 6. Not migrated (by design — v1)
 
-Hierarchies, calculated columns, sets/groups/bins, what-if parameters, calc groups, field parameters, RLS,
-perspectives, display folders, and **worksheets/dashboards** (roadmap v2). See
-[feature-parity.md](feature-parity.md).
+Calculated columns, sets/groups/bins, what-if parameters, calc groups, field parameters, perspectives, and
+**worksheets/dashboards** (roadmap v2). (Hierarchies, display folders, and RLS roles **are** rebuilt — see
+[model-enrichment.md](model-enrichment.md).) See [feature-parity.md](feature-parity.md).
 
 ---
 

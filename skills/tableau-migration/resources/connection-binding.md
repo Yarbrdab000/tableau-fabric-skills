@@ -20,9 +20,13 @@ and the actual bind call are **delegated** to `semantic-model-authoring`.
 | `datasource_name` | Display name from the `.tds` |
 | `connection_class` | Tableau connector class (`sqlserver`, `snowflake`, `excel-direct`, …) |
 | `server` / `database` | Upstream server + database (from the live connection) |
+| `auth_method` | Non-secret authentication *label* from the inner connection (e.g. `Username Password`, `oauth`) — never the credential itself |
 | `is_extract` | Whether a `.hyper` extract is enabled |
 | `named_connection_count` | >1 ⇒ federated multi-connection (fallback) |
-| `relations` | One entry per logical table: `kind`, `name`, `schema`/`item`, typed `columns` |
+| `relations` | One entry per logical table: `kind`, `name`, `catalog`/`schema`/`item`, typed `columns`, and (federated only) the resolved `connection` facts that table routes through |
+| `relationships` | Physical joins lifted from `<object-graph><relationships>`: `[{from_table, from_col, to_table, to_col}]`, using the **emitted model column names** |
+| `relationship_warnings` | Joins that could not be resolved cleanly and were skipped (kept **out** of `unsupported_reasons`) |
+| `connections` | Federated named-connection map `nc_id → {connection_class, server, database, warehouse, http_path, schema, auth_method}` (non-secret routing facts only) |
 | `unsupported_reasons` | Shape problems found during parsing |
 
 ```python
@@ -31,6 +35,59 @@ descriptor = parse_tds(open("datasource.tds", encoding="utf-8-sig").read())
 ```
 
 > Always open `.tds` with `encoding="utf-8-sig"` — Tableau writes a UTF-8 BOM.
+
+### Federated collection datasources (Tableau 2023+ object model)
+
+Modern cloud-warehouse `.tds` files (real Snowflake / Databricks / Azure SQL exports) wrap the upstream
+in a `<connection class='federated'>` whose **named** inner connection carries the true class, and list
+tables as a `<relation type='collection'>` of `<relation type='table' table='[catalog].[schema].[table]'/>`
+children — physically once and again under the logical object-model layer. The parser:
+
+- promotes those collection table relations to `kind='table'` (they are a flat star, not a join/union),
+- parses the **three-part** `[catalog].[schema].[table]` name into `catalog` / `schema` / `item`,
+- attaches each relation's typed `columns` (matched on the bare `<parent-name>`), and
+- de-duplicates the physical + logical copies on the fully-qualified `(catalog, schema, item)` path.
+
+The result is **N DirectQuery tables** (validated against real Snowflake and Databricks Superstore
+exports — 3 tables each, columns intact) instead of the old "no table relations found" land-to-Delta
+fallback. A three-part name whose **catalog ≠ the connection database** on a single-database `Sql.Database`
+connector is treated as a cross-database reference and scaffolded (never silently bound to the wrong
+database); a catalog equal to the database is just dropped as a redundant qualifier.
+
+### Relationships (Tableau object-graph → model relationships)
+
+Tableau 2023+ datasources carry their physical joins in `<object-graph><relationships>`, separate from
+the table list. `parse_tds` lifts each single-column equality into `descriptor['relationships']` as
+`{from_table, from_col, to_table, to_col}` so the rebuilt model can recreate the star 1:1. Resolution is
+deliberately conservative:
+
+- **Endpoints** (`first-end-point` / `second-end-point` object-ids) are resolved to a real **emitted table
+  display name** via the `<objects><object id caption>` map; an endpoint that doesn't line up with a parsed
+  table is skipped (never pointed at a phantom table).
+- **Columns** are matched case-insensitively against each column's local / remote / model name (Power BI
+  relationships are case-insensitive) and emitted as the column's **model name** — the identifier the table
+  actually emits — so a renamed key like `[Region (People)]` resolves to `Region` and a spaced key like
+  `[Order ID]` resolves to `Order_ID`, never a dangling reference.
+- Both operand orientations are resolved; if they resolve to **different** column pairs (both keys exist on
+  both tables) the join is **ambiguous** and skipped.
+- A **composite** (multi-column `AND`), calculated, or non-`=` predicate is skipped rather than emitting only
+  one arm of the join.
+
+Anything skipped is recorded in `descriptor['relationship_warnings']` — kept **out** of `unsupported_reasons`,
+so a single fuzzy join never demotes an otherwise-supported datasource to the land-to-Delta fallback.
+Validated against the real Snowflake and Databricks Superstore exports (Orders↔People on Region, Orders↔Returns
+on Order ID), which rebuild as two relationships with no warnings.
+
+### Per-connection routing (federated multi-connection)
+
+When a federated source has **more than one** named connection, each `<relation>` carries its own
+`connection=` id. The parser builds `descriptor['connections']` (`nc_id → routing facts`) and attaches the
+resolved connection to **each relation**, so `emit_m_partition_source` binds every table against **its own**
+upstream connector function and navigation rather than a single global one. Single-connection output is
+unchanged (the global descriptor is used), so existing emitted M is byte-identical. This is groundwork: a
+multi-connection source is still routed to the land-to-Delta fallback by `select_storage_mode`, and the shared
+`#"Server"`/`#"Database"`/`#"Warehouse"`/`#"HttpPath"` parameters are still emitted once per datasource, so the
+per-relation routing is never the deployed artifact on its own.
 
 ---
 
@@ -54,62 +111,82 @@ relation kind:
 
 | Tableau class | Power Query connector | Tier |
 |---|---|---|
-| `sqlserver` / `azure_sqldb` | `Sql.Database` | Fully supported |
-| `azure_sql_dw` (Azure Synapse Analytics) | `Sql.Database` | Fully supported (TDS protocol) |
+| `sqlserver` / `azure_sqldb` | `Sql.Database` | Fully supported (incl. Azure SQL Managed Instance, which arrives as `sqlserver`) |
+| `azure_sql_dw` (Azure Synapse Analytics) | `Sql.Database` | Fully supported (TDS protocol — covers both dedicated and serverless SQL pool) |
 | `postgres` | `PostgreSQL.Database` | Fully supported |
 | `mysql` | `MySQL.Database` | Fully supported |
 | `redshift` | `AmazonRedshift.Database` | Fully supported |
 | `oracle` | `Oracle.Database` | Fully supported (server-only) |
 | `snowflake` | `Snowflake.Databases` | Fully supported (server + warehouse) |
 | `databricks` | `Databricks.Catalogs` | Fully supported (host + HTTP path) |
-| `teradata` | `Teradata.Database` | Scaffold (navigation selector unverified) |
-| `bigquery` | `GoogleBigQuery.Database` | Scaffold (no server; identifier mapping unverified) |
+| `microsoft_fabric_sql_endpoint` | `Sql.Database` | Fully supported (TDS protocol) |
+| `teradata` | `Teradata.Database` | Scaffold (documented signature, but no live navigator to confirm — held) |
+| `bigquery` | `GoogleBigQuery.Database` | Scaffold (no M function reference page; identifiers unverified) |
 | `msolap` / `sqlserver-analysis-services` | — | Analysis Services model (migrate directly — see below) |
 | `excel-direct` / `excel` | `Excel.Workbook` | Flat file (needs path) |
 | `textscan` / `csv` | `Csv.Document` | Flat file (needs path) |
 | anything else | — | Fall back to land-to-Delta |
 
 > **All Microsoft TDS-protocol sources bind through `Sql.Database`.** Azure SQL Database
-> (`azure_sqldb`), Azure Synapse Analytics — dedicated **and** serverless SQL pool — (`azure_sql_dw`),
-> **Azure SQL Managed Instance**, and the **Microsoft Fabric** Warehouse / Lakehouse SQL endpoint all
-> speak the SQL Server protocol. Tableau connects to Managed Instance and the Fabric SQL endpoint
-> through its ordinary **SQL Server** connector, so they arrive as class `sqlserver` and are already
-> fully supported with no extra mapping; Synapse arrives as its own `azure_sql_dw` class.
+> (`azure_sqldb`), Azure Synapse Analytics — dedicated SQL pool (`azure_sql_dw`), **Azure SQL
+> Managed Instance**, and the **Microsoft Fabric** Warehouse / Lakehouse SQL endpoint
+> (`microsoft_fabric_sql_endpoint`) all speak the SQL Server protocol. Managed Instance and the
+> Synapse **serverless** SQL pool are reached through Tableau's ordinary **SQL Server** / **Azure
+> SQL** connector, so they arrive as class `sqlserver` / `azure_sqldb` and are already covered with
+> no extra mapping; dedicated Synapse and the dedicated Fabric endpoint have their own classes
+> (`azure_sql_dw`, `microsoft_fabric_sql_endpoint`). The `azure_sql_dw` and
+> `microsoft_fabric_sql_endpoint` class strings are web-verified, not primary-doc — a wrong class
+> string only causes a safe fallback (never wrong M); the TDS→`Sql.Database` mapping is the verified
+> fact.
 
 Each **fully supported** connector is emitted as deploy-ready M from a verified fact, recorded in
 the `DIRECT_CONNECTORS` registry as `(function, connect_style, nav_style)`:
 
 | Connect style | First step | Navigation | Connectors |
 |---|---|---|---|
-| `server_database` | `Fn(#"Server", #"Database")` | `Source{[Schema=…, Item=…]}[Data]` | Sql (incl. Synapse) / PostgreSQL / MySQL / AmazonRedshift |
-| `server_only` | `Oracle.Database(#"Server", [HierarchicalNavigation=false])` | `Source{[Schema=…, Item=…]}[Data]` | Oracle |
+| `server_database` | `Fn(#"Server", #"Database")` | `Source{[Schema=…, Item=…]}[Data]` | Sql (incl. Synapse + Fabric) / PostgreSQL / MySQL / AmazonRedshift |
+| `server_only` | `Fn(#"Server", [HierarchicalNavigation=false])` | `Source{[Schema=…, Item=…]}[Data]` | Oracle |
 | `server_warehouse` | `Snowflake.Databases(#"Server", #"Warehouse")` | `[Name=…, Kind="Database"]` → `[Name=…, Kind="Schema"]` → `[Name=…, Kind="Table"]` | Snowflake |
 | `server_httppath` | `Databricks.Catalogs(#"Server", #"HttpPath")` | `[Name=…, Kind="Database"]` (catalog) → `[Name=…, Kind="Schema"]` → `[Name=…, Kind="Table"]` | Databricks |
 
-Oracle is server-only because its service/SID is carried in the server string (so no unused
-`#"Database"` parameter is emitted), and `HierarchicalNavigation=false` is set explicitly so the
-flat `Schema`/`Item` selector is correct rather than default-reliant. Snowflake adds a `#"Warehouse"`
-parameter and reaches the table by `database → schema → table` navigation. Databricks adds a
-`#"HttpPath"` parameter (the SQL-warehouse HTTP path) and uses the **same** `[Name, Kind]` navigation
-— the Unity Catalog catalog is the first hop, keyed `Kind="Database"`. Snowflake and Databricks both
-scaffold a relation rather than guess when the `.tds` doesn't carry a resolvable database/catalog + schema.
+Oracle is server-only because the database/service is carried in the server string (so
+no unused `#"Database"` parameter is emitted), and `HierarchicalNavigation=false` is set explicitly so
+the flat `Schema`/`Item` selector is correct rather than default-reliant. Snowflake adds a
+`#"Warehouse"` parameter and reaches the table by `database → schema → table` navigation. Databricks
+adds a `#"HttpPath"` parameter (the SQL-warehouse HTTP path, read from the `.tds` `v-http-path`
+attribute) and uses the **same** `[Name, Kind]` navigation — the Unity Catalog catalog is the first hop,
+keyed `Kind="Database"`. Snowflake and Databricks both scaffold a relation rather than guess when the
+`.tds` doesn't carry a resolvable database/catalog + schema. When a real Snowflake `.tds` carries an
+**empty warehouse** (`warehouse=''`), the `#"Warehouse"` parameter is still emitted — so
+`Snowflake.Databases(#"Server", #"Warehouse")` stays a valid call — but it is prefixed with a `///` TMDL
+description flagging that a compute warehouse must be set before refresh (a `///` description is
+deploy-safe; a bare `//` comment is not guaranteed to parse), and `select_storage_mode` adds a matching
+follow-up.
 
-> **Verification status.** Oracle, Databricks, and the `(server, database)` family (incl. Synapse via
-> the SQL Server protocol) are doc-verified against the official Power Query M function/connector
-> references — Databricks' `Databricks.Catalogs(host, httpPath, [options])` signature and
+> **Verification status.** Oracle, Databricks, and the `(server, database)` family (incl.
+> Synapse and Fabric via the SQL Server protocol) are doc-verified against the official Power Query M
+> function/connector references — Oracle's `Fn(server, [options])` signature and
+> `HierarchicalNavigation=false` flat `[Schema, Item]` behavior are confirmed by its M function
+> reference page, and Databricks' `Databricks.Catalogs(host, httpPath, [options])` signature plus
 > catalog/schema/table `[Name, Kind]` navigation come straight from the Microsoft connector doc.
-> Snowflake's navigation is doc-informed (no M function reference page exists). The Synapse
-> `azure_sql_dw` class string is web-verified (a wrong class string only causes a safe fallback; the
-> TDS→`Sql.Database` mapping is the verified fact). Oracle, Snowflake, and Databricks have **no live
-> instance** in the validation environment (Azure SQL only) — **live reconciliation pending**; for
-> Databricks the `#"HttpPath"` value and catalog name are not stored portably in the `.tds` and are
-> surfaced as a manual follow-up.
+> Snowflake's navigation is doc-informed (no M function reference page exists). **Teradata** has a
+> documented `Teradata.Database(server, [options])` signature, but with no live Teradata navigator to
+> confirm the emitted body actually binds it is held as a **flagged scaffold** (recognized + named,
+> never a guessed call) until a real instance reconciles it. The `azure_sql_dw` and
+> `microsoft_fabric_sql_endpoint` class strings are web-verified (a wrong class string only causes a
+> safe fallback; the TDS→`Sql.Database` mapping is the verified fact). Oracle, Snowflake, and
+> Databricks have **no live instance** in the validation environment (Azure SQL only) — **live
+> reconciliation pending**; for Databricks the `#"HttpPath"` value and catalog name are not stored
+> portably in the `.tds` and are surfaced as a manual follow-up.
 
-**Scaffold** connectors (`teradata`, `bigquery`) map to the right M function *name*, but a fact we
-need is not verifiable offline — Teradata's exact navigation selector, and BigQuery's billing-project
-vs project identifier mapping (it has no server) — so the partition is emitted as a clearly-flagged
-`// TODO` that names the intended connector and never a guessed call. They are deferred for promotion
-once a real datasource confirms the shape.
+**Scaffold** connectors `bigquery` and `teradata` map to the right M function *name*
+(`GoogleBigQuery.Database`, `Teradata.Database`) but are emitted as a clearly-flagged `// TODO` that
+names the intended connector and never a guessed call. BigQuery has **no M function reference page**, so
+neither its project/dataset/table navigation selectors nor its billing-project vs project identifier
+mapping (it has no server) can be verified from an official source. Teradata's signature *is* documented,
+but it has **no live navigator** in the validation environment to confirm the emitted body binds, so it
+is held at the scaffold tier rather than shipped as deploy-ready M we have never resolved. Both are
+deferred for promotion until a primary-doc shape or a real datasource confirms the navigation.
 
 ### Microsoft Analysis Services (SSAS / MSOLAP) — separate handling
 
@@ -133,13 +210,33 @@ API:
   "server":   "myserver.database.windows.net",
   "database": "Superstore",
   "path":     "myserver.database.windows.net;Superstore",
+  "auth_method":     "Username Password",  # non-secret label from the .tds
+  "credential_kind": "Basic",              # advised Fabric credential type
 }
 ```
 
-`bind_type` is mapped for the SQL family (including Azure Synapse `azure_sql_dw`) plus Oracle, Teradata,
-Snowflake, Databricks, and BigQuery (`SQL`, `PostgreSql`, `Oracle`, `MySql`, `AmazonRedshift`, `Teradata`,
-`Snowflake`, `Databricks`, `GoogleBigQuery`). A binding adapter flattens `path` to the connector's exact
-requirement; the structured fields are preserved so nothing is lost for non-SQL connectors.
+`bind_type` is mapped for the SQL family (including Azure Synapse `azure_sql_dw` and the Fabric SQL
+endpoint `microsoft_fabric_sql_endpoint`) plus Oracle, Teradata, Snowflake, Databricks, and BigQuery
+(`SQL`, `PostgreSql`, `Oracle`, `MySql`, `AmazonRedshift`, `Teradata`, `Snowflake`, `Databricks`,
+`GoogleBigQuery`). A binding adapter flattens `path` to the connector's exact requirement; the
+structured fields are preserved so nothing is lost for non-SQL connectors.
+
+### Authentication method → Fabric credential type
+
+The descriptor surfaces the inner connection's `authentication` attribute as a **non-secret label**
+(`auth_method`), and `connection_details_for_bind` maps it to an advised Fabric `credential_kind`:
+
+| `.tds` `auth_method` label | Advised Fabric credential | Typical source |
+|---|---|---|
+| `Username Password` | `Basic` | Snowflake (user/password) |
+| `oauth` | `OAuth2` | Databricks (Entra), Entra-based sources |
+| anything else / absent | `null` (configure manually) | — |
+
+> **Strict secret boundary.** Only the auth *label* is read. The skill never reads or emits username,
+> password, token, OAuth config id, or instance URL — verified against the real Snowflake and Databricks
+> `.tds` exports (the secret fields are present in the file but absent from the descriptor and bind
+> details). The advised `credential_kind` is guidance for configuring the Fabric connection; the user
+> still supplies the actual credential.
 
 The bind sequence itself — discover → match → create → bind → validate — is owned by `semantic-model-authoring`'s
 connection workflow. Hand it `connection_details_for_bind(...)` and let it drive the Fabric REST calls.

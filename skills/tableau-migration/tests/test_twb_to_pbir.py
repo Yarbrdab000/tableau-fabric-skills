@@ -46,6 +46,10 @@ _DATASOURCE = """
             <remote-name>Order Date</remote-name><local-name>[Order Date]</local-name>
             <parent-name>[Orders]</parent-name><local-type>datetime</local-type>
           </metadata-record>
+          <metadata-record class='column'>
+            <remote-name>State</remote-name><local-name>[State]</local-name>
+            <parent-name>[Orders]</parent-name><local-type>string</local-type>
+          </metadata-record>
         </metadata-records>
       </connection>
     </datasource>
@@ -57,7 +61,8 @@ _DEPS_COLUMNS = """
             <column caption='Region' datatype='string' name='[Region]' role='dimension' type='nominal' />
             <column caption='Sales' datatype='real' name='[Sales]' role='measure' type='quantitative' />
             <column caption='Profit' datatype='real' name='[Profit]' role='measure' type='quantitative' />
-            <column caption='Order Date' datatype='datetime' name='[Order Date]' role='dimension' type='ordinal' />"""
+            <column caption='Order Date' datatype='datetime' name='[Order Date]' role='dimension' type='ordinal' />
+            <column caption='State' datatype='string' name='[State]' role='dimension' semantic-role='[State].[Name]' type='nominal' />"""
 
 
 def _workbook(worksheets, dashboards=""):
@@ -95,7 +100,8 @@ _CI_REGION = "<column-instance column='[Region]' derivation='None' name='[none:R
 _CI_SUM_SALES = "<column-instance column='[Sales]' derivation='Sum' name='[sum:Sales:qk]' pivot='key' type='quantitative' />"
 _CI_SUM_PROFIT = "<column-instance column='[Profit]' derivation='Sum' name='[sum:Profit:qk]' pivot='key' type='quantitative' />"
 _CI_MONTH_DATE = "<column-instance column='[Order Date]' derivation='Month' name='[mn:Order Date:ok]' pivot='key' type='ordinal' />"
-_INST = _CI_CAT + _CI_REGION + _CI_SUM_SALES + _CI_SUM_PROFIT + _CI_MONTH_DATE
+_CI_STATE = "<column-instance column='[State]' derivation='None' name='[none:State:nk]' pivot='key' type='nominal' />"
+_INST = _CI_CAT + _CI_REGION + _CI_SUM_SALES + _CI_SUM_PROFIT + _CI_MONTH_DATE + _CI_STATE
 
 
 def _visual_parts(parts):
@@ -542,7 +548,100 @@ def test_pie_mark_is_pie_chart_with_category_and_value():
     assert state["Y"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
 
 
-# -- aggregate / measure filters do NOT become slicers -------------------------
+# -- geographic maps (filled + symbol; basics only) ----------------------------
+# Latitude/Longitude (generated) on the axes is the realistic spatial signal; the geo-role
+# dimension (State, semantic-role='[State].[Name]') sits on the Detail (lod) encoding.
+_LATLON = ("rows=\"[federated.abc].[Latitude (generated)]\" "
+           "cols=\"[federated.abc].[Longitude (generated)]\"")
+
+
+def _geo_ws(name, mark, encodings, rows="[federated.abc].[Latitude (generated)]",
+            cols="[federated.abc].[Longitude (generated)]"):
+    return _worksheet(name, mark, rows=rows, cols=cols,
+                      deps_extra=_INST, encodings=encodings)
+
+
+def test_filled_map_from_geo_detail_and_color_measure():
+    enc = ("<encodings>"
+           "<color column='[federated.abc].[sum:Sales:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Sales by State", "Automatic", enc)))
+    assert ir["worksheets"][0]["visual_type"] == "filled_map"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "filledMap"
+    state = _query_state(vis)
+    # Location = the geographic dimension; Color = the saturation measure
+    assert state["Location"]["projections"][0]["field"]["Column"]["Property"] == "State"
+    assert state["Color"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
+    # generated lat/lon are dropped quietly, not bound as fields
+    assert "no model binding" not in json.dumps(ir["warnings"])
+
+
+def test_filled_map_explicit_map_mark_needs_no_latlon_signal():
+    enc = ("<encodings>"
+           "<color column='[federated.abc].[sum:Profit:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    # explicit Map mark is self-signaling: no generated lat/lon on the (empty) axes
+    ir = parse_twb(_workbook(_geo_ws("Profit Map", "Map", enc, rows="", cols="")))
+    assert ir["worksheets"][0]["visual_type"] == "filled_map"
+    state = _query_state(list(_visual_parts(emit_pbir(ir)).values())[0])
+    assert state["Location"]["projections"][0]["field"]["Column"]["Property"] == "State"
+
+
+def test_symbol_map_circle_mark_with_size_measure():
+    enc = ("<encodings>"
+           "<size column='[federated.abc].[sum:Sales:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Bubble Map", "Circle", enc)))
+    assert ir["worksheets"][0]["visual_type"] == "map"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "map"
+    state = _query_state(vis)
+    assert state["Location"]["projections"][0]["field"]["Column"]["Property"] == "State"
+    assert state["Size"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
+
+
+def test_multipolygon_custom_geometry_is_deferred_with_warning():
+    enc = ("<encodings>"
+           "<color column='[federated.abc].[sum:Sales:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "<geometry column='[federated.abc].[Geometry (generated)]' />"
+           "</encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Spatial", "Multipolygon", enc)))
+    assert ir["worksheets"][0]["visual_type"] == "unsupported"
+    assert _visual_parts(emit_pbir(ir)) == {}
+    assert any("deferred" in w["reason"] and "Spatial" == w["name"] for w in ir["warnings"])
+
+
+def test_geo_dimension_on_axis_is_not_a_map():
+    # State on a column AXIS (not Detail) with a measure -> an ordinary bar/column chart, not
+    # a map. This is the anti-hijack guard: a geographic dimension alone must not force a map.
+    ws = _worksheet("Sales by State Bars", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:State:nk]",
+                    deps_extra=_INST)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["visual_type"] == "column"
+    assert _visual_parts(emit_pbir(ir))  # a real chart is emitted
+
+
+def test_geo_detail_without_spatial_signal_does_not_force_map():
+    # geo dim on Detail but mark is automatic and there is NO generated lat/lon and no
+    # geometry -> not enough signal to call it a map; it must not emit a filledMap.
+    enc = ("<encodings>"
+           "<color column='[federated.abc].[sum:Sales:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    ws = _worksheet("Ambiguous Geo", "Automatic", rows="", cols="", deps_extra=_INST,
+                    encodings=enc)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["visual_type"] != "filled_map"
+
+
+
 def test_aggregate_filter_is_not_emitted_as_a_slicer():
     filt = "<filter class='quantitative' column='[federated.abc].[sum:Sales:qk]' />"
     ws = _worksheet("AggFilter", "Bar",

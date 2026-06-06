@@ -335,6 +335,15 @@ def encode(text):
 _USER_FUNC_RE = re.compile(
     r"\b(USERNAME|USERDOMAIN|ISMEMBEROF|ISUSERNAME|FULLNAME)\s*\(", re.IGNORECASE)
 
+# A Tableau bracketed name. A literal ``]`` inside a name is escaped by DOUBLING it
+# (``]]``), so a name segment is "non-bracket chars, or a doubled ``]``". The shared
+# resolver (connection_to_m) strips only the OUTER brackets and PRESERVES the doubled
+# ``]]``, so the patterns below must NOT un-double either -- the captured token has to match
+# the resolver's caption byte-for-byte (e.g. ``[A]]B]`` -> ``A]]B``).
+_NAME_INNER = r"(?:[^\]]|\]\])*"
+_NAME_INNER1 = r"(?:[^\]]|\]\])+"
+_BRACKETED_NAME = re.compile(r"\[(" + _NAME_INNER + r")\]")
+
 
 def _ns_local(tag):
     return tag.rsplit("}", 1)[-1] if "}" in tag else tag
@@ -355,14 +364,15 @@ def _field_token(s):
     leading segments (``[connection].[Name]``, ``[Orders].[Category]``) in real ``.tds``
     documents. The trailing bracketed segment is the field's local name, so this returns the
     inner text of the LAST bracketed segment -- which also leaves a simple ``[Name]`` or a
-    bare ``Name`` untouched. Applying it uniformly to drill-path levels, folder items, calc
-    column names, and filter columns keeps wiring consistent across qualified/unqualified
+    bare ``Name`` untouched. A literal ``]`` inside a name is kept doubled (``]]``) to match
+    the shared resolver's caption. Applying it uniformly to drill-path levels, folder items,
+    calc column names, and filter columns keeps wiring consistent across qualified/unqualified
     forms.
     """
     s = (s or "").strip()
     if not s:
         return ""
-    segments = re.findall(r"\[([^\]]*)\]", s)
+    segments = _BRACKETED_NAME.findall(s)
     if segments:
         return segments[-1].strip()
     return s
@@ -444,11 +454,17 @@ def parse_model_objects(tds_text):
 # safe deterministic DAX equivalent and is deliberately NOT guessed -- it becomes a
 # fail-closed manual-review scaffold instead (see :func:`resolve_model_objects`).
 # A field reference may be qualified (``[connection].[Field]``); the trailing bracketed
-# segment is the local field name, so the capture group always lands on that segment.
-_UF_FIELD = r"(?:\[[^\]]+\]\.)*\[(?P<f>[^\]]+)\]"
+# segment is the local field name, so the capture group always lands on that segment. Names
+# keep doubled ``]]`` (see ``_NAME_INNER1``) to match the resolver's caption.
+_UF_FIELD = r"(?:\[" + _NAME_INNER1 + r"\]\.)*\[(?P<f>" + _NAME_INNER1 + r")\]"
 _UF_EQ_LEFT = re.compile(r"^" + _UF_FIELD + r"\s*=\s*USERNAME\s*\(\s*\)$", re.IGNORECASE)
 _UF_EQ_RIGHT = re.compile(r"^USERNAME\s*\(\s*\)\s*=\s*" + _UF_FIELD + r"$", re.IGNORECASE)
-_FIELD_REF_RE = re.compile(r"\[([^\]]+)\]")
+# Field references inside a formula, qualifier-aware: a leading ``[seg].`` chain (a
+# datasource caption or an INTERNAL federated id like ``federated.<hash>``) is consumed so
+# only the trailing LOCAL field token is captured -- a qualifier segment is never mistaken
+# for a field.
+_QUALIFIED_FIELD_RE = re.compile(
+    r"(?:\[" + _NAME_INNER1 + r"\]\.)*\[(?P<f>" + _NAME_INNER1 + r")\]")
 
 
 def _dax_table_ref(name):
@@ -482,13 +498,38 @@ def translate_user_filter_to_dax(formula, resolve_field):
 
 
 def _tables_from_formula(formula, resolve_field):
-    """Distinct rebuilt tables referenced by ``[Field]`` tokens in a formula (ordered)."""
+    """Distinct rebuilt tables referenced by field tokens in a formula (ordered).
+
+    Qualifier-aware: ``[ds].[Field]`` contributes the table behind ``Field``, never one
+    behind the qualifier segment.
+    """
     out = []
-    for caption in _FIELD_REF_RE.findall(formula or ""):
-        resolved = resolve_field(caption)
+    for m in _QUALIFIED_FIELD_RE.finditer(formula or ""):
+        resolved = resolve_field(m.group("f"))
         if resolved and resolved[0] not in out:
             out.append(resolved[0])
     return out
+
+
+def make_case_insensitive_resolver(resolve_field, ci_index):
+    """Wrap ``resolve_field`` with an UNAMBIGUOUS case-insensitive fallback.
+
+    Real Tableau workbooks reference one physical field with drifting case across sheets and
+    blends (``[Order_ID]`` vs ``[ORDER_ID]``). The exact resolver is always tried first, so
+    existing resolution is byte-for-byte unchanged; only on an exact miss does the fallback
+    look the token up case-insensitively, and ONLY when exactly one column matches -- two
+    columns whose names differ only by case stay unresolved (fail-closed) rather than being
+    guessed between. ``ci_index`` maps ``lower(caption) -> [(table, column, type), ...]``.
+    """
+    def resolve(token):
+        hit = resolve_field(token)
+        if hit:
+            return hit
+        bucket = ci_index.get((token or "").strip().lower())
+        if bucket and len(bucket) == 1:
+            return bucket[0]
+        return None
+    return resolve
 
 
 # -- field-token resolution ----------------------------------------------------

@@ -19,7 +19,9 @@ Translates a SAFE subset of Tableau calculated fields into working DAX measures:
     POWER(x, 2), SIGN, EXP, LOG (base-10, or 2-arg LOG(x, base)), LN, DIV(a, b) ->
     QUOTIENT(a, b), PI(), the trig family SIN/COS/TAN/ASIN/ACOS/ATAN/COT, and
     DEGREES/RADIANS (radian<->degree conversion)
-  * comparison operators: = == <> != > >= < <=  (== -> = ; != -> <>)
+  * comparison operators: = == <> != > >= < <=  (== -> = ; != -> <>). Booleans are equatable
+    (= / <>) but not ordered (< > <= >=).
+  * boolean literals: true / false -> TRUE() / FALSE()
   * set membership: x IN (a, b, ...) -> numeric/date x IN { a, b, ... }; text uses a
     case-sensitive EXACT chain (EXACT(x, a) || EXACT(x, b) ...); one consistent element type
   * boolean logic: AND -> && , OR -> || , NOT(x)
@@ -57,6 +59,11 @@ INDEX/TOTAL, scalar date/string/regex functions, row-level operands inside a sca
 function or CASE, nested arithmetic inside an aggregation, 4-arg IIF, references to other
 calcs, unresolved or ambiguous fields, cross-table terms) deterministically FALLS BACK by
 returning ``None`` so the caller keeps an inert ``= 0`` stub.
+A qualified bracket reference ``[A].[B]`` (Tableau parameter ``[Parameters].[X]``, a
+datasource-qualified field, or a data-blend ``[federated.<hash>].[field]`` token) is tokenized
+as a single reference and falls back with a SPECIFIC reason ("parameter reference ...
+(unmodeled)" or "qualified reference ... (unmodeled)") rather than choking on the dot, so the
+orchestrator can model parameters / cross-source fields later and revisit.
 The original Tableau formula is preserved as a ``TableauFormula`` annotation by the renderer
 either way.
 
@@ -240,8 +247,22 @@ def _tokenize(formula):
             j = s.find("]", i + 1)
             if j == -1:
                 raise _CalcError("unterminated field reference")
-            toks.append(("field", s[i + 1:j]))
+            parts = [s[i + 1:j]]
             i = j + 1
+            # Qualified references: [A].[B] (and longer chains). Tableau uses this shape for
+            # parameters ([Parameters].[X]), datasource-qualified fields, and blend fields
+            # ([federated.<hash>].[field]). Fold the whole dotted chain into ONE token so the
+            # '.' never trips the scanner; the parser decides how to handle it.
+            while i + 1 < n and s[i] == "." and s[i + 1] == "[":
+                k = s.find("]", i + 2)
+                if k == -1:
+                    raise _CalcError("unterminated field reference")
+                parts.append(s[i + 2:k])
+                i = k + 1
+            if len(parts) == 1:
+                toks.append(("field", parts[0]))
+            else:
+                toks.append(("qfield", parts))
             continue
         if c == '"' or c == "'":
             j = s.find(c, i + 1)
@@ -429,9 +450,12 @@ class _Parser:
         if k == "cmp":
             self._next()
             right = self._add()
-            # Only compare like, ordered/equatable types; never two booleans.
-            if left[1] != right[1] or left[1] == "bool":
+            if left[1] != right[1]:
                 raise _CalcError("incomparable types in comparison")
+            # Booleans are equatable (= / <>) but not ordered (< > <= >=): `flag = true` is
+            # meaningful, `flag < true` is not.
+            if left[1] == "bool" and v not in ("=", "<>"):
+                raise _CalcError("booleans support only = and <> comparison")
             return (f"{left[0]} {v} {right[0]}", "bool")
         return left
 
@@ -521,6 +545,11 @@ class _Parser:
             return self._fixed_lod_bare()
         if k == "id":
             u = v.upper()
+            if u == "TRUE" or u == "FALSE":
+                # Tableau boolean literals -> DAX TRUE()/FALSE() (so `flag = true`, IIF/IF/CASE
+                # branches, and AND/OR operands carrying a literal all translate).
+                self._next()
+                return (f"{u}()", "bool")
             if u in _AGG_MAP:
                 if self.mode == "column":
                     raise _CalcError(f"aggregation {u} not valid in a row-level column calc")
@@ -546,6 +575,8 @@ class _Parser:
             if self.mode == "column":
                 return self._row_field()
             raise _CalcError("bare row-level field [..] not valid in a measure")
+        if k == "qfield":
+            return self._qualified_ref(v)
         raise _CalcError("expected a value")
 
     def _iif(self):
@@ -703,6 +734,8 @@ class _Parser:
             self._expect_op(")")
             return node
         k, v = self._peek()
+        if k == "qfield":
+            self._qualified_ref(v)  # specific "(unmodeled)" reason instead of the generic one
         if k != "field":
             raise _CalcError(f"{name} argument must be a single bare [field]")
         self._next()
@@ -730,6 +763,8 @@ class _Parser:
         self._next()  # PERCENTILE
         self._expect_op("(")
         k, v = self._peek()
+        if k == "qfield":
+            self._qualified_ref(v)  # specific "(unmodeled)" reason instead of the generic one
         if k != "field":
             raise _CalcError("PERCENTILE first argument must be a single bare [field]")
         self._next()
@@ -761,6 +796,16 @@ class _Parser:
             raise _CalcError(f"unsupported field type {tmdl_type} for [{cap}]")
         self.tables_used.add(table)
         return (f"{_dax_table(table)}{_dax_col(col)}", dtype)
+
+    def _qualified_ref(self, parts):
+        # Tableau qualified reference [A].[B] (parameter, datasource-qualified, or blend field).
+        # None of these are modeled by the (field-caption) resolver yet, so emit a CLEAN,
+        # specific fallback reason rather than choking on the '.' -- the orchestrator can model
+        # parameters / cross-source fields later and revisit. Reachable in both modes.
+        pretty = ".".join(f"[{p}]" for p in parts)
+        if parts and parts[0].strip().lower() == "parameters":
+            raise _CalcError(f"parameter reference {pretty} (unmodeled)")
+        raise _CalcError(f"qualified reference {pretty} (unmodeled)")
 
     def _row_fn(self, name):
         if name in _STRING_FNS:
@@ -962,6 +1007,8 @@ class _Parser:
         table = None
         while True:
             k, v = self._peek()
+            if k == "qfield":
+                self._qualified_ref(v)  # specific "(unmodeled)" reason instead of the generic one
             if k != "field":
                 raise _CalcError("FIXED LOD requires at least one [dimension]")
             self._next()

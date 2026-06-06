@@ -41,14 +41,34 @@ from __future__ import annotations
 #     "schema_item"            -> Source{[Schema=.., Item=..]}[Data]     (flat ADO.NET navigation)
 #     "database_schema_table"  -> 3 hops keyed by [Name=.., Kind=..]     (Snowflake + Databricks)
 #
+# The Microsoft SQL Server TDS-protocol family: every Tableau class here speaks the SQL Server
+# wire protocol, so each binds through the SAME emitter -- Sql.Database(#"Server", #"Database")
+# with flat [Schema, Item] navigation, DirectQuery-capable. Grouped explicitly so a new Microsoft
+# TDS surface is a one-line addition. Verified Tableau connection-class strings:
+#   'sqlserver'                     -> Microsoft SQL Server AND Azure SQL Managed Instance
+#                                      (Tableau connects to Managed Instance with the SQL Server
+#                                      connector, so MI arrives as 'sqlserver').
+#   'azure_sqldb'                   -> Azure SQL Database.
+#   'azure_sql_dw'                  -> Azure Synapse Analytics, BOTH dedicated and serverless SQL
+#                                      pool (the Synapse connector emits one class for either pool).
+#   'microsoft_fabric_sql_endpoint' -> Microsoft Fabric Warehouse / Lakehouse SQL analytics endpoint.
+# ('sqlserver' / 'azure_sqldb' are confirmed by real .tds; 'azure_sql_dw' /
+# 'microsoft_fabric_sql_endpoint' are web-verified -- a wrong class string only causes a safe
+# fallback, never wrong M, since the TDS->Sql.Database mapping itself is the verified fact.)
+SQL_SERVER_TDS_FAMILY = (
+    "sqlserver",
+    "azure_sqldb",
+    "azure_sql_dw",
+    "microsoft_fabric_sql_endpoint",
+)
+
 # Verified facts (Microsoft Power Query M / connector docs):
 #  * Sql/PostgreSQL/MySQL/AmazonRedshift.Database take (server, database) + flat [Schema, Item].
-#    Azure SQL Database / Azure Synapse Analytics (dedicated + serverless SQL pool) / Azure SQL
-#    Managed Instance / Microsoft Fabric SQL endpoints all speak the SQL Server TDS protocol, so
-#    they bind through Sql.Database too (MI + Fabric use the Tableau 'sqlserver' class; Synapse
-#    uses 'azure_sql_dw').
-#  * Oracle.Database(server, [options]) is server-only; HierarchicalNavigation defaults false,
-#    so the flat [Schema, Item] navigation (schema = owner) applies. We set it explicitly.
+#    The whole SQL_SERVER_TDS_FAMILY above binds through Sql.Database on this same shape.
+#  * Oracle.Database(server, [options]) is server-only (the M function reference page confirms the
+#    signature), and HierarchicalNavigation defaults false, so the flat [Schema, Item] navigation
+#    (schema = owner) applies. We set HierarchicalNavigation=false explicitly so the flat selector
+#    is correct rather than default-reliant.
 #  * Snowflake connector: connection inputs are Server + Warehouse; navigation is
 #    database -> schema -> table. (Snowflake.Databases has no M function reference page, so its
 #    navigation selectors are doc-informed; live reconciliation is pending -- see docs.)
@@ -58,9 +78,8 @@ from __future__ import annotations
 #    is a connection parameter (#"HttpPath") that is not stored portably in the .tds; live
 #    reconciliation is pending (no live Databricks instance).
 DIRECT_CONNECTORS = {
-    "sqlserver":    ("Sql.Database",            "server_database",  "schema_item"),
-    "azure_sqldb":  ("Sql.Database",            "server_database",  "schema_item"),  # Azure SQL Database (SQL Server protocol)
-    "azure_sql_dw": ("Sql.Database",            "server_database",  "schema_item"),  # Azure Synapse Analytics (class-string web-verified; TDS->Sql.Database is the verified fact)
+    # Microsoft SQL Server TDS family -> Sql.Database(server, database) + flat [Schema, Item].
+    **{cls: ("Sql.Database", "server_database", "schema_item") for cls in SQL_SERVER_TDS_FAMILY},
     "postgres":     ("PostgreSQL.Database",     "server_database",  "schema_item"),
     "mysql":        ("MySQL.Database",          "server_database",  "schema_item"),
     "redshift":     ("AmazonRedshift.Database", "server_database",  "schema_item"),
@@ -74,14 +93,17 @@ DIRECT_CONNECTORS = {
 # a guess. We pick a mode but mark it not fully supported and emit a clearly-flagged scaffold
 # that names the intended connector. Promotion is gated on doc-verified correctness.
 PARTIAL_LIVE_CONNECTORS = {
-    # Teradata.Database(server, [options]) is server-only (signature verified), but the exact
-    # navigation selector (flat [Schema, Item] vs [Name]-keyed database/table hops) is not
-    # established from an official source, so it stays a scaffold pending real navigator evidence.
-    "teradata": "Teradata.Database",
-    # GoogleBigQuery.Database([BillingProject=..]) has no server and an ambiguous
-    # billing-project vs project mapping in the .tds, so the project/dataset/table navigation
-    # can't be resolved offline -- scaffold pending a real BigQuery datasource.
+    # GoogleBigQuery.Database([BillingProject=..]) has no M function reference page (the connector
+    # doc lists no function reference), so neither the project/dataset/table navigation selectors
+    # nor the billing-project vs project mapping in the .tds can be verified from an official
+    # source -- it stays a scaffold pending a primary-doc shape or a real BigQuery datasource.
     "bigquery": "GoogleBigQuery.Database",
+    # Teradata.Database(server, [options]) has a documented server-only signature, BUT there is no
+    # live Teradata navigator in the validation environment to confirm the emitted flat-navigation
+    # body actually binds (schema = Teradata database). Rather than ship M that has never resolved
+    # against a real instance, Teradata is held as a flagged scaffold (recognized + mode chosen)
+    # until a real navigator confirms it -- consistent with "never ship unverified-against-live M".
+    "teradata": "Teradata.Database",
 }
 
 # Microsoft Analysis Services (SSAS / MSOLAP). This is NOT a relational datasource we rebuild
@@ -137,6 +159,10 @@ _NATIVE_QUERY_FOLLOWUP = "Review the preserved custom SQL native query (folding 
 # the .tds: the SQL-warehouse HTTP path and (depending on the workbook) the Unity Catalog name.
 _DATABRICKS_FOLLOWUP = ('Databricks: set the SQL-warehouse HTTP Path parameter (#"HttpPath") and confirm '
                         "the catalog name (mapped from the Tableau database) matches your Unity Catalog catalog.")
+# Snowflake stores the compute warehouse as a connection attribute that can be empty in the .tds;
+# Snowflake.Databases needs a real warehouse to run queries, so flag it when it's missing.
+_SNOWFLAKE_WAREHOUSE_FOLLOWUP = ('Snowflake: the .tds carried no compute warehouse; set the #"Warehouse" '
+                                 "parameter to a valid warehouse before refresh.")
 
 
 def _decision(mode, connector, **kw):
@@ -196,6 +222,8 @@ def select_storage_mode(descriptor):
     base_followups = [_CREDENTIALS_FOLLOWUP]
     if cls == "databricks":
         base_followups = base_followups + [_DATABRICKS_FOLLOWUP]
+    if cls == "snowflake" and not (descriptor.get("warehouse") or "").strip():
+        base_followups = base_followups + [_SNOWFLAKE_WAREHOUSE_FOLLOWUP]
 
     # 0. Analysis Services (SSAS / MSOLAP): the source is already a tabular/multidimensional
     #    semantic model. It is NOT a datasource->M rebuild and must NOT be routed to the

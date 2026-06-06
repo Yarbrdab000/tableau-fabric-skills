@@ -59,9 +59,14 @@ sets up. The skill flags this in `decision["manual_followups"]`; it cannot provi
 
 ## Row-level security and governance objects
 
-RLS roles, object-level security, perspectives, and sensitivity labels are **not migrated** by v1 — they are
-**reported** so the customer re-applies them deliberately in Fabric rather than having the skill approximate
-a security boundary. Re-creating RLS incorrectly is worse than not creating it; this is intentional.
+RLS roles **are** rebuilt where it is provably safe: a user filter wired as a data-source filter with a
+`[Field] = USERNAME()` shape becomes a TMDL `role` (`USERNAME()` → `USERPRINCIPALNAME()`). Anything without a
+safe deterministic DAX equivalent (`ISMEMBEROF` group logic, `USERDOMAIN()`, compound expressions, an
+unresolvable field) **fails closed** — `FALSE()` on every table plus a `RequiresManualReview` annotation that
+preserves the original formula — and an unwired user-function calc is reported, never turned into a role. The
+principle is unchanged: re-creating RLS incorrectly is worse than not creating it, so the boundary is either
+provably correct or explicitly handed to a human. Object-level security, perspectives, and sensitivity labels
+remain **not migrated** and are reported. See [model-enrichment.md](model-enrichment.md).
 
 ---
 
@@ -76,6 +81,7 @@ a security boundary. Re-creating RLS incorrectly is worse than not creating it; 
 
 ## What stays manual (summary)
 
-Entering connection **credentials**, selecting/standing up an on-prem **gateway**, re-applying **RLS** and
-other governance objects, and reviewing **custom-SQL folding** before refresh. Everything else — model,
+Entering connection **credentials**, selecting/standing up an on-prem **gateway**, completing any
+**fail-closed RLS** roles (group logic / non-deterministic filters) and re-applying other governance
+objects, and reviewing **custom-SQL folding** before refresh. Everything else — model, translatable RLS,
 parameters, bind inputs — the skill produces.
