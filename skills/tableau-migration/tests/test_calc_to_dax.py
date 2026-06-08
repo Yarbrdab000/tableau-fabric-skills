@@ -177,18 +177,39 @@ TRANSLATIONS = [
      "SWITCH(SUM('Orders'[Quantity]), 0, 1, 0)"),
     ("CASE SUM([Quantity]) WHEN 0 THEN 10 WHEN 1 THEN 20 ELSE 30 END",
      "SWITCH(SUM('Orders'[Quantity]), 0, 10, 1, 20, 30)"),
+    # --- expression aggregation: AGG(<row arithmetic>) -> AGGX('T', <expr>) ---
+    ("SUM([Sales]-[Profit])", "SUMX('Orders', 'Orders'[Sales] - 'Orders'[Profit])"),
+    ("SUM([Sales]+1)", "SUMX('Orders', 'Orders'[Sales] + 1)"),
+    ("SUM(-[Sales])", "SUMX('Orders', -('Orders'[Sales]))"),
+    ("SUM([Sales]*[Quantity])", "SUMX('Orders', 'Orders'[Sales] * 'Orders'[Quantity])"),
+    ("MEDIAN([Sales]*[Quantity])", "MEDIANX('Orders', 'Orders'[Sales] * 'Orders'[Quantity])"),
+    # --- conditional aggregation: AGG(IF c THEN v END) -> AGGX('T', IF(c, v)) ---
+    # No-ELSE IF -> BLANK when unmatched; the X-iterators skip BLANK, so this reproduces
+    # Tableau's "aggregate over the rows where the condition holds".
+    ("SUM(IF [Region] = \"East\" THEN [Sales] END)",
+     "SUMX('Orders', IF(EXACT('Orders'[Region], \"East\"), 'Orders'[Sales]))"),
+    ("AVG(IF [Returned] THEN [Sales] END)",
+     "AVERAGEX('Orders', IF('Orders'[Returned], 'Orders'[Sales]))"),
+    ("COUNT(IF [Region] = \"East\" THEN [Sales] END)",
+     "COUNTAX('Orders', IF(EXACT('Orders'[Region], \"East\"), 'Orders'[Sales]))"),
+    ("MIN(IF [Region] = \"East\" THEN [Order Date] END)",
+     "MINX('Orders', IF(EXACT('Orders'[Region], \"East\"), 'Orders'[Order_Date]))"),
+    # COUNTD has no DISTINCTCOUNTX -> COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK(col), FILTER('T', cond)), 0).
+    # NOBLANK matches Tableau COUNTD (excludes nulls); plain DISTINCTCOUNT would count a blank
+    # [Quantity] on a matched row as a distinct value -> off-by-one. COALESCE(..., 0) matches
+    # Tableau COUNTD of an empty (no-match) set = 0 (verified live), not BLANK. The text condition
+    # uses EXACT for Tableau's case-sensitive string equality.
+    ("COUNTD(IF [Region] = \"East\" THEN [Quantity] END)",
+     "COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK('Orders'[Quantity]), FILTER('Orders', EXACT('Orders'[Region], \"East\"))), 0)"),
 ]
 
 # Each of these MUST fall back (translator returns None).
 FALLBACKS = [
     # row-level / unsupported constructs
     'IF [Sales]>0 THEN "y" ELSE "n" END',         # row-level (bare fields)
-    "SUM([Sales]-[Profit])",
-    "SUM([Sales]+1)",
-    "SUM(-[Sales])",
     "[Sales]+[Profit]",
     "SUM([Nonexistent])",
-    "SUM(5)",
+    "SUM(5)",                                     # expression aggregate with no field -> no table
     "",
     "LEFT([Region],3)",
     "SUM([Sales]) SUM([Profit])",
@@ -197,6 +218,13 @@ FALLBACKS = [
     # cross-table (terms span Orders + People)
     "SUM([Sales])/SUM([People Count])",
     "IF SUM([Sales]) > SUM([People Count]) THEN 1 ELSE 0 END",
+    "SUM([Sales] - [People Count])",              # cross-table expression aggregate
+    'SUM(IF [Region] = "East" THEN [Sales] ELSE [People Count] END)',  # cross-table conditional agg
+    # expression / conditional aggregation forms that must still fall back
+    "STDEV([Sales]*[Quantity])",                  # stats iterator (STDEVX) not yet supported
+    'SUM(IF [Region] = "East" THEN [Region] END)',   # SUM over a text expression
+    "COUNTD([Sales]*[Quantity])",                 # COUNTD supports only the IF-of-field shape
+    'COUNTD(IF [Region] = "East" THEN [Quantity] ELSE [Profit] END)',  # COUNTD(IF ... ELSE) unsupported
     # type-invalid aggregations
     "SUM([Region])",                              # SUM on string
     "AVG([Order Date])",                          # AVG on dateTime
@@ -399,6 +427,14 @@ COLUMN_TRANSLATIONS = [
      "DATE(YEAR('Orders'[Order_Date]), MONTH('Orders'[Order_Date]), DAY('Orders'[Order_Date]))"),  # strips time
     ("MAKEDATE(2024, 1, 15)", "DATE(2024, 1, 15)"),                       # exact, culture-independent
     ("MAKEDATE(YEAR([Order Date]), 1, 1)", "DATE(YEAR('Orders'[Order_Date]), 1, 1)"),  # composes with parts
+    # --- simple CASE on a string dimension: case-SENSITIVE, so EXACT chain (not SWITCH) ---
+    ('CASE [Region] WHEN "East" THEN 1 WHEN "West" THEN 2 ELSE 0 END',
+     "IF(EXACT('Orders'[Region], \"East\"), 1, IF(EXACT('Orders'[Region], \"West\"), 2, 0))"),
+    ('CASE [Region] WHEN "East" THEN 1 END',                           # no ELSE -> BLANK when unmatched
+     "IF(EXACT('Orders'[Region], \"East\"), 1)"),
+    # simple CASE on a numeric column still uses SWITCH (numeric keys match exactly)
+    ("CASE [Quantity] WHEN 1 THEN 10 WHEN 2 THEN 20 ELSE 0 END",
+     "SWITCH('Orders'[Quantity], 1, 10, 2, 20, 0)"),
     ("TODAY()", "TODAY()"),
     ("NOW()", "NOW()"),
 ]

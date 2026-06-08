@@ -311,9 +311,11 @@ def _tokenize(formula):
 #   cmp    := add (CMP add)?           ; add := mul (('+'|'-') mul)*
 #   mul    := unary (('*'|'/') unary)* ; unary := '-' unary | primary
 #   primary:= agg | number | string | IIF(...) | ZN(...) | IFNULL(...) | ISNULL(...) | '(' expr ')'
-#   agg    := AGGFUNC '(' '[' fieldref ']' ')'
-# The measure-context invariant is enforced structurally: a bare [field] only ever
-# appears inside agg, so a row-level field reference is a parse error (-> fallback).
+#   agg    := AGGFUNC '(' ( '[' fieldref ']' | '{' FIXED-lod '}' | rowexpr ) ')'
+# A bare [field] is legal only inside an aggregate -- either directly, or within an
+# aggregate's row-level expression argument (parsed in column context and folded with the
+# matching X-iterator, e.g. SUM(IF c THEN v END) -> SUMX('T', IF(c, v))). A row-level field
+# at measure top level is therefore a parse error (-> fallback).
 class _Parser:
     def __init__(self, toks, resolver, tables_used, mode="measure"):
         self.toks = toks
@@ -330,6 +332,10 @@ class _Parser:
         t = self._peek()
         self.pos += 1
         return t
+
+    def _peek_at(self, n):
+        i = self.pos + n
+        return self.toks[i] if i < len(self.toks) else (None, None)
 
     def _expect_op(self, ch):
         k, v = self._peek()
@@ -456,6 +462,17 @@ class _Parser:
             # meaningful, `flag < true` is not.
             if left[1] == "bool" and v not in ("=", "<>"):
                 raise _CalcError("booleans support only = and <> comparison")
+            if left[1] == "text":
+                # Tableau text comparison is case-SENSITIVE; DAX '='/'<>' follow the model's
+                # (usually case-INSENSITIVE) collation -- the same reason IN uses EXACT above.
+                # EXACT is also null-safe: EXACT(BLANK(), "x") is FALSE, matching Tableau's
+                # unmatched-null. Ordered text comparisons (< > <= >=) have no case-sensitive
+                # DAX form, so fall back rather than emit a case-insensitive ordering.
+                if v == "=":
+                    return (f"EXACT({left[0]}, {right[0]})", "bool")
+                if v == "<>":
+                    return (f"NOT(EXACT({left[0]}, {right[0]}))", "bool")
+                raise _CalcError("ordered text comparison is case-sensitive in Tableau; no faithful DAX form")
             return (f"{left[0]} {v} {right[0]}", "bool")
         return left
 
@@ -685,9 +702,11 @@ class _Parser:
         return self._switch_emit("TRUE()", pairs)
 
     def _case_simple(self):
-        # CASE e WHEN v1 THEN r1 ... [ELSE z] END  ->  SWITCH(e, v1, r1, ..., z)
+        # CASE e WHEN v1 THEN r1 ... [ELSE z] END
+        #   numeric/date/bool comparand -> SWITCH(e, v1, r1, ..., z)
+        #   text comparand            -> nested IF(EXACT(e, v), r, ...) chain
         # e and every v must be aggregations/literals of one consistent type (a bare row-level
-        # comparand like CASE [Region] WHEN ... is a parse error -> falls back).
+        # comparand like CASE [Region] WHEN ... is a parse error in measure mode -> falls back).
         comparand = self._or()
         pairs = []
         while self._is_kw("WHEN"):
@@ -697,9 +716,13 @@ class _Parser:
                 raise _CalcError("CASE WHEN value type does not match the CASE expression")
             self._expect_kw("THEN")
             pairs.append((value[0], self._expr()))
-        return self._switch_emit(comparand[0], pairs)
+        # Tableau CASE string matching is case-SENSITIVE; DAX SWITCH compares its keys with '='
+        # which is case-INSENSITIVE. For a text comparand emit a nested IF(EXACT(...)) chain (the
+        # same form the IF/ELSEIF path uses) so matching stays case-sensitive. Numeric/date/bool
+        # keys compare exactly, so SWITCH is faithful there.
+        return self._switch_emit(comparand[0], pairs, text_comparand=comparand[1] == "text")
 
-    def _switch_emit(self, head, pairs):
+    def _switch_emit(self, head, pairs, text_comparand=False):
         # Shared tail for both CASE forms: require >=1 WHEN, then a single consistent return type
         # across every THEN branch and the optional ELSE (DAX SWITCH needs one return type; mixed
         # number/text/etc. would error or silently coerce, so fall back instead).
@@ -716,6 +739,14 @@ class _Parser:
                 raise _CalcError("CASE results return inconsistent types")
         if else_node is not None and else_node[1] != rtype:
             raise _CalcError("CASE/ELSE results return inconsistent types")
+        if text_comparand:
+            # Fold inside-out into nested IF(EXACT(head, key), result[, inner]). No ELSE -> the
+            # innermost IF is 2-arg (BLANK when unmatched), matching Tableau's null for no match.
+            inner = else_node[0] if else_node is not None else None
+            for key, result in reversed(pairs):
+                cond = f"EXACT({head}, {key})"
+                inner = f"IF({cond}, {result[0]})" if inner is None else f"IF({cond}, {result[0]}, {inner})"
+            return (inner, rtype)
         args = [head]
         for key, result in pairs:
             args.append(key)
@@ -736,25 +767,106 @@ class _Parser:
         k, v = self._peek()
         if k == "qfield":
             self._qualified_ref(v)  # specific "(unmodeled)" reason instead of the generic one
+        # Fast path: AGG([field]) over a single bare field -> the scalar aggregate AGG('T'[Col]).
+        if k == "field" and self._peek_at(1) == ("op", ")"):
+            self._next()
+            self._expect_op(")")
+            resolved = self.resolver(v)
+            if resolved is None:
+                raise _CalcError(f"unresolved/ambiguous field [{v}]")
+            table, col, tmdl_type = resolved
+            # Reject aggregates invalid for the column's data type (would emit DAX that errors).
+            if name in _NUMERIC_ONLY_AGGS and tmdl_type not in _NUMERIC_TYPES:
+                raise _CalcError(f"{name} requires a numeric field, got {tmdl_type} for [{v}]")
+            if name in ("MIN", "MAX") and tmdl_type not in (_NUMERIC_TYPES | {"dateTime"}):
+                raise _CalcError(f"{name} requires a numeric/date field, got {tmdl_type} for [{v}]")
+            self.tables_used.add(table)
+            if name in ("MIN", "MAX") and tmdl_type == "dateTime":
+                dtype = "date"
+            else:
+                dtype = "number"  # SUM/AVG/MEDIAN/COUNT/COUNTD and numeric MIN/MAX
+            return (f"{_AGG_MAP[name]}({_dax_table(table)}{_dax_col(col)})", dtype)
+        # Otherwise the argument is a conditional/arithmetic ROW-level expression
+        # (e.g. SUM(IF c THEN v END), SUM([x] * [y])) -> fold with the X-iterator.
+        return self._agg_iterator(name)
+
+    def _in_row_context(self, parse_fn):
+        # Run *parse_fn* in ROW (column) context, isolating the tables it references so the
+        # caller can infer a single iteration table. The instance's table set is swapped for a
+        # fresh one during the sub-parse, then merged back into the shared set. Returns
+        # (node, tables_touched). Aggregations and LOD braces are illegal in column mode, so a
+        # nested aggregate inside the expression argument falls back cleanly.
+        saved_mode = self.mode
+        saved_tables = self.tables_used
+        inner_tables = set()
+        self.mode = "column"
+        self.tables_used = inner_tables
+        try:
+            node = parse_fn()
+        finally:
+            self.mode = saved_mode
+            self.tables_used = saved_tables
+        self.tables_used |= inner_tables
+        return node, inner_tables
+
+    def _agg_iterator(self, name):
+        # AGG(<row expression>) -> AGGX('T', <expr>). The argument is parsed at row level so a
+        # bare [field] resolves to 'T'[Col] and IF/arithmetic become a row-level expression; the
+        # matching X-iterator re-aggregates it. A no-ELSE IF yields a 2-arg DAX IF (BLANK when
+        # unmatched), which SUMX/AVERAGEX/MINX/MAXX/MEDIANX/COUNTAX all skip -- reproducing
+        # Tableau's "SUM(IF c THEN v END)" = sum over the rows where c holds.
+        if name == "COUNTD":
+            return self._countd_if()  # no DISTINCTCOUNTX exists -> CALCULATE + FILTER form
+        if name not in _AGG_X:
+            raise _CalcError(f"{name} does not support an expression argument")
+        inner, inner_tables = self._in_row_context(self._expr)
+        self._expect_op(")")
+        if len(inner_tables) != 1:
+            raise _CalcError(f"{name}(expr) must reference exactly one table")
+        table = next(iter(inner_tables))
+        if name in ("SUM", "AVG", "MEDIAN") and inner[1] != "number":
+            raise _CalcError(f"{name}(expr) requires a numeric expression")
+        if name in ("MIN", "MAX") and inner[1] not in ("number", "date"):
+            raise _CalcError(f"{name}(expr) requires a numeric/date expression")
+        out_dtype = "date" if (name in ("MIN", "MAX") and inner[1] == "date") else "number"
+        return (f"{_AGG_X[name]}({_dax_table(table)}, {inner[0]})", out_dtype)
+
+    def _countd_if(self):
+        # COUNTD(IF cond THEN [field] END) ->
+        #   COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK('T'[field]), FILTER('T', cond)), 0).
+        # DAX has no DISTINCTCOUNTX, so a distinct count under a row-level condition is expressed as
+        # a CALCULATE with a FILTER. When the FILTER matches no rows, DISTINCTCOUNTNOBLANK returns
+        # BLANK, but Tableau COUNTD of an empty set is 0 (verified live), so COALESCE(..., 0) keeps
+        # the count numeric. Only this exact shape (a bare-field value, single THEN, no ELSE) is
+        # supported; anything else falls back.
+        if not self._is_kw("IF"):
+            raise _CalcError("COUNTD(...) supports only COUNTD(IF cond THEN [field] END)")
+        self._next()  # IF
+        cond, cond_tables = self._in_row_context(self._or)
+        self._expect_bool(cond)
+        self._expect_kw("THEN")
+        k, v = self._peek()
+        if k == "qfield":
+            self._qualified_ref(v)  # specific "(unmodeled)" reason instead of the generic one
         if k != "field":
-            raise _CalcError(f"{name} argument must be a single bare [field]")
+            raise _CalcError("COUNTD(IF ...) value must be a single bare [field]")
         self._next()
+        if self._is_kw("ELSEIF") or self._is_kw("ELSE"):
+            raise _CalcError("COUNTD(IF ...) supports only a single THEN with no ELSE")
+        self._expect_kw("END")
         self._expect_op(")")
         resolved = self.resolver(v)
         if resolved is None:
             raise _CalcError(f"unresolved/ambiguous field [{v}]")
-        table, col, tmdl_type = resolved
-        # Reject aggregates invalid for the column's data type (would emit DAX that errors).
-        if name in _NUMERIC_ONLY_AGGS and tmdl_type not in _NUMERIC_TYPES:
-            raise _CalcError(f"{name} requires a numeric field, got {tmdl_type} for [{v}]")
-        if name in ("MIN", "MAX") and tmdl_type not in (_NUMERIC_TYPES | {"dateTime"}):
-            raise _CalcError(f"{name} requires a numeric/date field, got {tmdl_type} for [{v}]")
+        table, col, _tmdl_type = resolved
         self.tables_used.add(table)
-        if name in ("MIN", "MAX") and tmdl_type == "dateTime":
-            dtype = "date"
-        else:
-            dtype = "number"  # SUM/AVG/MEDIAN/COUNT/COUNTD and numeric MIN/MAX
-        return (f"{_AGG_MAP[name]}({_dax_table(table)}{_dax_col(col)})", dtype)
+        if len(set(cond_tables) | {table}) != 1:
+            raise _CalcError("COUNTD(IF ...) must reference exactly one table")
+        return (
+            f"COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK({_dax_table(table)}{_dax_col(col)}), "
+            f"FILTER({_dax_table(table)}, {cond[0]})), 0)",
+            "number",
+        )
 
     def _percentile(self):
         # PERCENTILE([field], n) -> PERCENTILE.INC('T'[field], n). Aggregation over a single
