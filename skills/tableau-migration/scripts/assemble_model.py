@@ -326,8 +326,15 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relations
     override any of the three by passing a resolved structure explicitly (in which case no
     auto-derivation runs); passing nothing reproduces the original, un-enriched behavior
     for datasources that have no such objects.
+
+    Table **relationships** are likewise auto-wired: the joins ``parse_tds`` infers from the
+    ``.tds`` ``<object-graph><relationships>`` (already resolved to emitted model columns) are
+    emitted as TMDL when ``relationships`` is ``None``. Pass an explicit list (including ``[]``)
+    to take full control and skip the auto-wiring -- so ``[]`` deliberately emits no relationships.
     """
     descriptor = parse_tds(tds_text)
+    if relationships is None:
+        relationships = descriptor.get("relationships") or []
     enrichment_report = None
     if hierarchies is None and display_folders is None and rls_roles is None:
         parsed = T.parse_model_objects(tds_text)

@@ -10,7 +10,7 @@ from assemble_model import (
     migrate_tds_to_semantic_model,
     write_model_folder,
 )
-from test_connection_to_m import EXCEL_COLLECTION, LIVE_SQLSERVER, JOIN_TREE
+from test_connection_to_m import EXCEL_COLLECTION, LIVE_SQLSERVER, JOIN_TREE, FEDERATED_STAR
 
 
 def _decode(part):
@@ -87,6 +87,31 @@ def test_assemble_join_tree_raises_for_fallback():
     with pytest.raises(ValueError) as ei:
         migrate_tds_to_semantic_model(JOIN_TREE, model_name="Joined")
     assert "land-to-delta" in str(ei.value).lower()
+
+
+def test_migrate_auto_wires_parsed_relationships():
+    # The convenience entry point must emit the joins parse_tds already inferred from the
+    # <object-graph><relationships> WITHOUT the caller passing them explicitly -- so a
+    # double-clickable model arrives with relationships as declared metadata (no manual draw,
+    # no DirectQuery cardinality-detection round-trip).
+    out = migrate_tds_to_semantic_model(FEDERATED_STAR, model_name="Star")
+    rels = out["parts"]["definition/relationships.tmdl"]
+    assert "fromColumn: SALE.REGION" in rels and "toColumn: REP.REGION" in rels
+    assert "fromColumn: SALE.Order_Key" in rels and "toColumn: RMA.Order_Key" in rels
+    reported = {(r["from_table"], r["from_col"], r["to_table"], r["to_col"])
+                for r in out["report"]["relationships"]}
+    assert reported == {
+        ("SALE", "REGION", "REP", "REGION"),
+        ("SALE", "Order_Key", "RMA", "Order_Key"),
+    }
+
+
+def test_migrate_explicit_empty_relationships_opts_out():
+    # An explicit list (here empty) takes full control and skips auto-wiring, so a caller can
+    # deliberately suppress relationships even when the .tds declares them.
+    out = migrate_tds_to_semantic_model(FEDERATED_STAR, model_name="Star", relationships=[])
+    assert "definition/relationships.tmdl" not in out["parts"]
+    assert out["report"]["relationships"] == []
 
 
 def test_no_credentials_in_any_part():
