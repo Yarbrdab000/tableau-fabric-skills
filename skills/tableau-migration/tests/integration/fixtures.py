@@ -339,7 +339,8 @@ EXPECTED = {
     "Superstore": {
         # model side (one relational datasource -> one table 'Orders' + the _Measures table)
         "model_name": "Superstore",
-        "tables": ["Orders"],            # excludes _Measures
+        "tables": ["Orders"],            # excludes _Measures and the generated Date dimension
+        "date_table": "Date",            # additive CALENDARAUTO calendar (Orders has Order Date)
         "measures_total": 3,             # Total Sales, Profit Ratio, Running Sales
         "measures_translated": 2,        # Total Sales, Profit Ratio
         "measures_stubbed": 1,           # Running Sales (table calc)

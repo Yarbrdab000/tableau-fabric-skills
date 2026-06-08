@@ -176,7 +176,42 @@ def _connection_facts(c):
         "http_path": _http_path_of(c),
         "schema": c.get("schema"),
         "auth_method": c.get("authentication"),
+        "filename": c.get("filename"),
+        "directory": c.get("directory"),
     }
+
+
+def _flatfile_location(datasource):
+    """The inner connection's flat-file location ``(filename, directory)``.
+
+    Descended the same way as ``_live_connection`` (federated named-connection inner first, then a
+    direct non-federated ``<connection>``). Flat-file sources (Excel / text) carry the workbook or
+    CSV path here; both are ``None`` for live database connections. Only non-secret path attributes
+    are read.
+    """
+    for nc in _named_connections(datasource):
+        for c in _children_local(nc, "connection"):
+            if c.get("filename") or c.get("directory"):
+                return c.get("filename"), c.get("directory")
+    for c in _children_local(datasource, "connection"):
+        if (c.get("class") or "").lower() != "federated" and (
+                c.get("filename") or c.get("directory")):
+            return c.get("filename"), c.get("directory")
+    return None, None
+
+
+def _flatfile_join(directory, filename):
+    """Join a flat-file ``directory`` + ``filename`` into a single path (forward-slash, M-safe).
+
+    Returns ``None`` when there is no filename. The path Tableau stored is RELATIVE to the workbook;
+    a driver overrides ``flatfile_path`` with the absolute path of the copied data file before
+    assembly (relative paths aren't portable in a deployed PBIP).
+    """
+    if not filename:
+        return None
+    if directory:
+        return directory.rstrip("/\\") + "/" + filename
+    return filename
 
 
 def _named_connection_map(datasource):
@@ -601,6 +636,7 @@ def parse_tds(xml_text):
 
     relations = _extract_relations(datasource, cols_by_parent, nc_map)
     relationships, relationship_warnings = _extract_relationships(datasource, relations)
+    ff_filename, ff_directory = _flatfile_location(datasource)
 
     is_extract = False
     for ex in _findall_local(datasource, "extract"):
@@ -625,6 +661,9 @@ def parse_tds(xml_text):
         "is_extract": is_extract,
         "named_connection_count": nconns,
         "connections": nc_map,
+        "flatfile_filename": ff_filename,
+        "flatfile_directory": ff_directory,
+        "flatfile_path": _flatfile_join(ff_directory, ff_filename),
         "relations": relations,
         "relationships": relationships,
         "relationship_warnings": relationship_warnings,
@@ -694,6 +733,91 @@ def _scaffold_source(cls, intended, detail):
             '\t\t\tlet Source = null in Source')
 
 
+# Flat-file column types: a TMDL dataType -> the Power Query ascription used in
+# Table.TransformColumnTypes. (``Int64.Type`` is the M type value for a 64-bit integer; the rest
+# use the ``type <primitive>`` form.)
+_M_TYPE = {
+    "int64": "Int64.Type",
+    "double": "type number",
+    "decimal": "type number",
+    "dateTime": "type datetime",
+    "boolean": "type logical",
+    "string": "type text",
+}
+
+
+def _excel_sheet_name(relation):
+    """The Excel sheet name to navigate for a relation (``[Orders$]`` -> ``Orders``).
+
+    Tableau exposes a worksheet as ``[<sheet>$]`` (the ODBC sheet convention); Power Query's
+    ``Excel.Workbook`` navigation keys the sheet by its bare name with ``Kind="Sheet"``.
+    """
+    raw = relation.get("raw_table") or relation.get("item") or relation.get("name") or ""
+    s = _strip_brackets(raw).strip()
+    return s[:-1] if s.endswith("$") else s
+
+
+def _flatfile_path_for(conn):
+    """Resolve the flat-file path from either a descriptor (single-connection) or a per-connection
+    facts dict (federated). A driver-set absolute ``flatfile_path`` wins; otherwise it's rebuilt
+    from the captured filename/directory."""
+    return conn.get("flatfile_path") or _flatfile_join(
+        conn.get("flatfile_directory") or conn.get("directory"),
+        conn.get("flatfile_filename") or conn.get("filename"))
+
+
+def emit_flatfile_source(relation, conn, cls):
+    """Emit a real, typed Import ``let ... in`` body for an Excel/CSV ("full data") relation.
+
+    Builds a deterministic, deploy-ready Power Query: read the file, promote the header row, set
+    each column's type from the parsed Tableau metadata, and rename the promoted headers to the
+    model column names (``clean_col``) so they match each column's ``sourceColumn`` in the TMDL.
+    Returns ``None`` (caller falls back to a scaffold) when the file path or columns are unknown,
+    so a flat file we can't fully resolve is never emitted as a silently-empty partition.
+    """
+    path = _flatfile_path_for(conn)
+    cols = relation.get("columns") or []
+    connector = FLAT_FILE_CLASSES.get((cls or "").lower())
+    if not path or not cols or connector is None:
+        return None
+
+    p = escape_m_string(path)
+    steps = []
+    if connector == "Excel.Workbook":
+        sheet = escape_m_string(_excel_sheet_name(relation))
+        steps.append(f'Source = Excel.Workbook(File.Contents("{p}"), null, true)')
+        steps.append(f'Navigation = Source{{[Item="{sheet}", Kind="Sheet"]}}[Data]')
+        steps.append("Promoted = Table.PromoteHeaders(Navigation, [PromoteAllScalars=true])")
+    else:  # Csv.Document
+        steps.append(
+            f'Source = Csv.Document(File.Contents("{p}"), '
+            '[Delimiter=",", Encoding=1252, QuoteStyle=QuoteStyle.Csv])')
+        steps.append("Promoted = Table.PromoteHeaders(Source, [PromoteAllScalars=true])")
+    prev = "Promoted"
+
+    # Type by the RAW promoted header (the Tableau remote name), then rename to the model name so
+    # the query output column names equal each TMDL column's sourceColumn (clean_col of remote).
+    type_pairs, rename_pairs = [], []
+    for c in cols:
+        remote = c.get("remote_name") or c["model_name"]
+        mt = _M_TYPE.get(c["tmdl_type"])
+        if mt:
+            type_pairs.append(f'{{"{escape_m_string(remote)}", {mt}}}')
+        if remote != c["model_name"]:
+            rename_pairs.append(
+                f'{{"{escape_m_string(remote)}", "{escape_m_string(c["model_name"])}"}}')
+    if type_pairs:
+        steps.append(f"Typed = Table.TransformColumnTypes({prev}, {{{', '.join(type_pairs)}}})")
+        prev = "Typed"
+    if rename_pairs:
+        steps.append(f"Renamed = Table.RenameColumns({prev}, "
+                     f"{{{', '.join(rename_pairs)}}}, MissingField.Ignore)")
+        prev = "Renamed"
+
+    body = ",\n\t\t\t\t".join(steps)
+    return f"let\n\t\t\t\t{body}\n\t\t\tin\n\t\t\t\t{prev}"
+
+
 def _connect_expr(connector, connect_style):
     """Build the right-hand side of ``Source = ...`` for a fully-supported connector.
 
@@ -754,6 +878,10 @@ def emit_m_partition_source(relation, descriptor, mode):
             "migrate the model directly (XMLA endpoint / semantic-model import), not as an M partition")
     spec = connector_spec(cls)
     if spec is None:
+        if cls in FLAT_FILE_CLASSES:
+            flat = emit_flatfile_source(relation, conn, cls)
+            if flat is not None:
+                return flat
         intended = PARTIAL_LIVE_CONNECTORS.get(cls) or FLAT_FILE_CLASSES.get(cls)
         if cls in PARTIAL_LIVE_CONNECTORS:
             detail = "recognized connector, but its navigation/identifiers aren't verified offline; complete manually"

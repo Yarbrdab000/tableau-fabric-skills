@@ -1243,7 +1243,7 @@ def test_multi_connection_exposes_connections_map_secret_free():
     assert conns["sqlserver.t"]["connection_class"] == "sqlserver"
     # each fact dict carries ONLY the non-secret routing whitelist -- never a credential field
     allowed = {"connection_class", "server", "database", "warehouse", "http_path",
-               "schema", "auth_method"}
+               "schema", "auth_method", "filename", "directory"}
     for facts in conns.values():
         assert set(facts) <= allowed
     # the actual username VALUE in the fixture must never surface (auth_method is a label, not a secret)

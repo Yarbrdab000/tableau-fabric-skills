@@ -161,6 +161,94 @@ def generate_measures_table_tmdl(measures_tmdl):
         f"\tannotation PBI_Id = _Measures\n\n"
     )
 
+# -- DATE DIMENSION ------------------------------------------------------------
+# A generated calendar dimension so date fields support Year/Quarter/Month/Week/Day
+# drilldown and time intelligence. A plain dateTime column alone only groups at the daily
+# grain once auto date/time is disabled (__PBI_TimeIntelligenceEnabled = 0), so we attach a
+# shared Date table instead. It is a calculated CALENDARAUTO() table, which ALWAYS spans
+# Jan 1 of the earliest year through Dec 31 of the latest year across the model's date
+# columns -- i.e. full, contiguous years, which is exactly what "Mark as Date Table"
+# requires. Derived parts are calculated columns; Month/Quarter sort by a numeric helper so
+# they order chronologically rather than alphabetically.
+_DATE_INT_FMT = "0"  # no thousands separator (years/days/weeks must not render as "2,025")
+
+def _date_calc_column(name, dax, *, hidden=False, fmt=None, sort_by=None):
+    """One calculated column on the Date table (``column <name> = <dax>``)."""
+    lines = [f"\tcolumn {q(name)} = {dax}"]
+    if hidden:
+        lines.append("\t\tisHidden")
+    if fmt is not None:
+        lines.append(f"\t\tformatString: {fmt}")
+    lines.append(f"\t\tlineageTag: {uuid.uuid4()}")
+    lines.append("\t\tsummarizeBy: none")
+    if sort_by is not None:
+        lines.append(f"\t\tsortByColumn: {q(sort_by)}")
+    lines.append("")
+    lines.append("\t\tannotation SummarizationSetBy = Automatic")
+    return "\n" + "\n".join(lines) + "\n"
+
+def generate_date_table_tmdl(table_name="Date", *, mark_as_date=True,
+                             hierarchy_name="Calendar", source_expr="CALENDARAUTO()"):
+    """Render a calculated calendar Date dimension as TMDL.
+
+    A CALENDARAUTO() calculated table (full contiguous years) with derived Year / Quarter /
+    Month / Week-of-month / Day calculated columns, an ISO Week-of-Year column, and a single
+    drill ``hierarchy`` Year->Quarter->Month->Week->Day. When ``mark_as_date`` is True the
+    table is marked as a Power BI date table (table ``dataCategory: Time`` + an ``isKey`` date
+    column), enabling time intelligence.
+
+    ``table_name`` is referenced verbatim (single-quoted) inside the derived-column DAX, so a
+    de-duplicated name (e.g. ``"Date Dimension"``) stays self-consistent.
+    """
+    d = "'" + table_name.replace("'", "''") + "'[Date]"  # DAX ref to the key column
+
+    base = ["\tcolumn Date", "\t\tdataType: dateTime"]
+    if mark_as_date:
+        base.append("\t\tisKey")
+    base += [
+        "\t\tformatString: Short Date",
+        f"\t\tlineageTag: {uuid.uuid4()}",
+        "\t\tsummarizeBy: none",
+        "\t\tisNameInferred",
+        "\t\tsourceColumn: [Date]",
+        "",
+        "\t\tannotation SummarizationSetBy = Automatic",
+    ]
+    cols = "\n" + "\n".join(base) + "\n"
+    cols += _date_calc_column("Year", f"YEAR({d})", fmt=_DATE_INT_FMT)
+    cols += _date_calc_column("Quarter No", f"QUARTER({d})", hidden=True, fmt=_DATE_INT_FMT)
+    cols += _date_calc_column("Quarter", f'"Q" & QUARTER({d})', sort_by="Quarter No")
+    cols += _date_calc_column("Month No", f"MONTH({d})", hidden=True, fmt=_DATE_INT_FMT)
+    cols += _date_calc_column("Month", f'FORMAT({d}, "MMM")', sort_by="Month No")
+    cols += _date_calc_column(
+        "Week of Month",
+        f"WEEKNUM({d}) - WEEKNUM(DATE(YEAR({d}), MONTH({d}), 1)) + 1",
+        fmt=_DATE_INT_FMT)
+    cols += _date_calc_column("Week of Year", f"WEEKNUM({d}, 21)", fmt=_DATE_INT_FMT)
+    cols += _date_calc_column("Day", f"DAY({d})", fmt=_DATE_INT_FMT)
+
+    hier = generate_hierarchy_tmdl(hierarchy_name, [
+        ("Year", "Year"), ("Quarter", "Quarter"), ("Month", "Month"),
+        ("Week", "Week of Month"), ("Day", "Day"),
+    ])
+
+    header = [f"table {q(table_name)}", f"\tlineageTag: {uuid.uuid4()}"]
+    if mark_as_date:
+        header.append("\tdataCategory: Time")
+    partition = (
+        f"\tpartition {q(table_name)} = calculated\n"
+        f"\t\tmode: import\n"
+        f"\t\tsource = {source_expr}\n"
+    )
+    return (
+        "\n".join(header) + "\n"
+        + cols
+        + hier
+        + "\n"
+        + partition
+        + f"\n\tannotation PBI_Id = {q(table_name)}\n"
+    )
+
 def generate_expressions_tmdl(expression_name, directlake_url):
     return (
         f"expression {q(expression_name)} =\n"
@@ -288,16 +376,26 @@ def infer_relationships(meta_fields, landed_tables, count_fn):
 
 def generate_relationships_tmdl(rels):
     """One TMDL relationship per inferred join. Default cardinality is many-to-one,
-    which matches from=many -> to=one, so no explicit cardinality props are required."""
+    which matches from=many -> to=one, so no explicit cardinality props are required.
+
+    Optional per-relationship keys (default off, so existing callers are byte-identical):
+    ``is_active`` -- when explicitly ``False`` the relationship is emitted ``isActive: false``
+    (a role-playing/secondary join activated via ``USERELATIONSHIP``); ``join_on_date_behavior``
+    -- e.g. ``"datePartOnly"`` so a Date-dimension join ignores any time component on the fact
+    column (otherwise a timestamp at 13:45 silently fails to match a midnight calendar key).
+    """
     if not rels:
         return None
     blocks = []
     for r in rels:
-        blocks.append("\n".join([
-            f"relationship {uuid.uuid4()}",
-            f"\tfromColumn: {q(r['from_table'])}.{q(r['from_col'])}",
-            f"\ttoColumn: {q(r['to_table'])}.{q(r['to_col'])}",
-        ]))
+        lines = [f"relationship {uuid.uuid4()}"]
+        if r.get("is_active") is False:
+            lines.append("\tisActive: false")
+        if r.get("join_on_date_behavior"):
+            lines.append(f"\tjoinOnDateBehavior: {r['join_on_date_behavior']}")
+        lines.append(f"\tfromColumn: {q(r['from_table'])}.{q(r['from_col'])}")
+        lines.append(f"\ttoColumn: {q(r['to_table'])}.{q(r['to_col'])}")
+        blocks.append("\n".join(lines))
     return "\n\n".join(blocks) + "\n"
 
 def generate_pbism():

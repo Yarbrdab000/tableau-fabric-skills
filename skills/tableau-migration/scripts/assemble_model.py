@@ -175,8 +175,90 @@ def _apply_enrichment(parts, *, hierarchies=None, display_folders=None, rls_role
     return role_names
 
 
+def _select_primary_date(date_cols):
+    """Pick the primary (active-relationship) date column, or None when it's ambiguous.
+
+    A single date column is always primary. With several, prefer an ORDER_DATE-like name (or a
+    column literally named 'Date'); if exactly one matches it is primary, otherwise the choice is
+    ambiguous and we return None so EVERY date relationship is emitted inactive -- never silently
+    picking the wrong business date (e.g. defaulting the calendar to Ship Date over Order Date).
+    """
+    if len(date_cols) == 1:
+        return date_cols[0]
+
+    def _norm(s):
+        return (s or "").strip().lower().replace("_", " ").replace("-", " ")
+
+    hints = [c for c in date_cols
+             if _norm(c) == "date" or ("order" in _norm(c) and "date" in _norm(c))]
+    return hints[0] if len(hints) == 1 else None
+
+
+def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=True,
+                          name_pref="Date"):
+    """Detect fact date columns and build a shared Date dimension + its relationships.
+
+    Returns ``(date_table_name|None, date_table_tmdl|None, date_relationships, report)``. Only
+    fact-like tables contribute date columns: a table that is purely the ``one`` side of an
+    existing join (a dimension) is skipped so the calendar relates to the star's fact(s) and
+    doesn't introduce ambiguous snowflake paths. For each eligible table the primary date column
+    gets an ACTIVE relationship and any others are inactive (role-playing, via USERELATIONSHIP);
+    all date relationships carry ``joinOnDateBehavior: datePartOnly`` so a timestamp's time
+    component can't silently drop rows against the midnight calendar key.
+    """
+    emitted = {n.lower() for n in emitted_names}
+    to_tables = {(r.get("to_table") or "").lower() for r in relationships}
+    from_tables = {(r.get("from_table") or "").lower() for r in relationships}
+    pure_dims = {t for t in to_tables if t and t not in from_tables}
+
+    by_table = []  # (display_name, [date col model_name, ...]) for eligible tables, in order
+    for rel in tables:
+        disp = _table_display(rel)
+        if not disp or disp.lower() not in emitted or disp.lower() in pure_dims:
+            continue
+        date_cols = [c["model_name"] for c in (rel.get("columns") or [])
+                     if c.get("tmdl_type") == "dateTime"]
+        if date_cols:
+            by_table.append((disp, date_cols))
+
+    if not by_table:
+        return None, None, [], {"generated": False, "reason": "no fact date columns"}
+
+    reserved = set(emitted) | {"_measures"}
+    date_name = next((c for c in (name_pref, f"{name_pref} Dimension", "Calendar", "Calendar Date")
+                      if c.lower() not in reserved), None)
+    if date_name is None:
+        i = 2
+        while f"{name_pref} {i}".lower() in reserved:
+            i += 1
+        date_name = f"{name_pref} {i}"
+
+    rels, warnings, details = [], [], []
+    for disp, date_cols in by_table:
+        primary = _select_primary_date(date_cols)
+        if primary is None:
+            warnings.append(
+                f"table '{disp}' has multiple date columns with no clearly primary one "
+                f"({', '.join(date_cols)}); all emitted inactive -- set the active date via "
+                f"USERELATIONSHIP or a model edit.")
+        for col in date_cols:
+            active = col == primary
+            rels.append({
+                "from_table": disp, "from_col": col,
+                "to_table": date_name, "to_col": "Date",
+                "is_active": active, "join_on_date_behavior": "datePartOnly",
+            })
+            details.append({"table": disp, "column": col, "active": active})
+
+    part = T.generate_date_table_tmdl(date_name, mark_as_date=mark_as_date)
+    report = {"generated": True, "table": date_name, "mark_as_date": mark_as_date,
+              "relationships": details, "warnings": warnings}
+    return date_name, part, rels, report
+
+
 def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=None,
-                          hierarchies=None, display_folders=None, rls_roles=None):
+                          hierarchies=None, display_folders=None, rls_roles=None,
+                          date_table=True, mark_as_date=True, flatfile_path=None):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -187,7 +269,14 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
     ``display_folders`` is ``{table: {member: folder}}``, ``hierarchies`` is
     ``{table: [hierarchy, ...]}``, and ``rls_roles`` is a list of role descriptors. They
     default to ``None`` so existing callers get byte-for-byte identical output.
+
+    ``flatfile_path`` overrides the workbook/CSV path emitted into a flat-file (Excel/CSV)
+    Import partition. The path parsed from a ``.tds`` is relative to the workbook and not
+    portable; a deploying caller passes the ABSOLUTE path of the data file it has staged so the
+    emitted ``File.Contents(...)`` resolves. Ignored for non-flat-file datasources.
     """
+    if flatfile_path is not None:
+        descriptor = {**descriptor, "flatfile_path": flatfile_path}
     decision = select_storage_mode(descriptor)
     if decision["mode"] is None:
         raise ValueError(
@@ -225,7 +314,17 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
     if expr.strip():
         parts["definition/expressions.tmdl"] = expr
 
-    rels_tmdl = T.generate_relationships_tmdl(relationships or [])
+    all_rels = list(relationships or [])
+    date_report = {"generated": False, "reason": "date_table disabled"}
+    if date_table:
+        date_name, date_part, date_rels, date_report = _build_date_dimension(
+            tables, table_names, all_rels, mark_as_date=mark_as_date)
+        if date_part is not None:
+            parts[f"definition/tables/{date_name}.tmdl"] = date_part
+            table_names.insert(table_names.index("_Measures"), date_name)
+            all_rels = all_rels + date_rels
+
+    rels_tmdl = T.generate_relationships_tmdl(all_rels)
     if rels_tmdl:
         parts["definition/relationships.tmdl"] = rels_tmdl
 
@@ -245,6 +344,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
         "skipped_tables": skipped,
         "measures": measure_report,
         "relationships": relationships or [],
+        "date_table": date_report,
         "roles": [r["name"] for r in rls_roles or []],
     }
     return {"parts": parts, "report": report}
@@ -318,7 +418,8 @@ def write_model_folder(parts, dest_dir):
 
 
 def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relationships=None,
-                                  hierarchies=None, display_folders=None, rls_roles=None):
+                                  hierarchies=None, display_folders=None, rls_roles=None,
+                                  date_table=True, mark_as_date=True, flatfile_path=None):
     """One-call convenience: parse ``.tds`` text and assemble the Import/DirectQuery model.
 
     Model objects (hierarchies, display folders, RLS roles) are AUTO-DERIVED from the
@@ -351,7 +452,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relations
     result = assemble_import_model(descriptor, model_name=model_name,
                                    calcs=calcs, relationships=relationships,
                                    hierarchies=hierarchies, display_folders=display_folders,
-                                   rls_roles=rls_roles)
+                                   rls_roles=rls_roles, date_table=date_table,
+                                   mark_as_date=mark_as_date, flatfile_path=flatfile_path)
     if enrichment_report is not None:
         result["report"]["model_objects"] = enrichment_report
     return result

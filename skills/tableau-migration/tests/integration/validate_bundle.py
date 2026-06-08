@@ -162,6 +162,30 @@ def parse_model_tables(model_dir):
     return tables
 
 
+def generated_date_tables(model_dir):
+    """Names of synthetic Date-dimension tables (calculated ``CALENDARAUTO()`` calendars).
+
+    These are ADDITIVE scaffolding the generator injects for date intelligence -- not derived
+    from any source relation -- so the source<->bundle faithfulness count excludes them exactly
+    like the generated ``_Measures`` table. The signature (a calculated partition sourced from
+    ``CALENDARAUTO()``) is specific enough that a wrongly-calculated SOURCE table is NOT hidden.
+    """
+    names = set()
+    tdir = os.path.join(model_dir, "definition", "tables")
+    if not os.path.isdir(tdir):
+        return names
+    for fn in sorted(os.listdir(tdir)):
+        if not fn.endswith(".tmdl"):
+            continue
+        with open(os.path.join(tdir, fn), encoding="utf-8") as fh:
+            text = fh.read()
+        if "CALENDARAUTO()" in text:
+            name, _cols, _meas = parse_table_tmdl(text)
+            if name:
+                names.add(name)
+    return names
+
+
 # =============================================================================
 # PBIR helpers
 # =============================================================================
@@ -701,7 +725,8 @@ def target_5_faithfulness(ctx):
         calcs, _ = extract_calculations(_read_source(src_id))
         model_dir = os.path.join(ctx.output_dir, *out_folder.split("/"))
         tables = parse_model_tables(model_dir)
-        emitted_tables = [t for t in tables if t != "_Measures"]
+        aux = generated_date_tables(model_dir)
+        emitted_tables = [t for t in tables if t != "_Measures" and t not in aux]
         emitted_measures = len(tables.get("_Measures", {}).get("measures", set()))
         name = d.get("name")
         if len(emitted_tables) != len(exp_tables):
