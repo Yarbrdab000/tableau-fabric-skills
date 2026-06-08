@@ -100,7 +100,7 @@ The pure-Python cores are offline, deterministic, and stdlib-only (no Spark / pa
 | [`scripts/connection_to_m.py`](scripts/connection_to_m.py) | Parse Tableau `.tds` → descriptor; emit M partitions + bind details; M-path field resolver. |
 | [`scripts/assemble_model.py`](scripts/assemble_model.py) | Tier-1 orchestrator: `.tds` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`), base64 deploy payload. |
 
-Run the test suite with `pytest` from `skills/tableau-migration/` (144 offline assertions).
+Run the test suite with `pytest` from `skills/tableau-migration/` (587 offline assertions).
 
 ---
 
@@ -290,7 +290,7 @@ Full guide in [migration-gotchas.md](resources/migration-gotchas.md).
 See [validation-reconciliation.md](resources/validation-reconciliation.md). The migration is validated by:
 
 1. **Structural** — model deploys and refreshes (DirectLake frames / Import loads / DirectQuery connects) without error.
-2. **Translation self-tests** — `pytest` runs the 144 offline assertions (translator subset + fallbacks + TMDL render + storage-mode policy + `.tds` parsing).
+2. **Translation self-tests** — `pytest` runs the 587 offline assertions (translator subset + fallbacks + TMDL render + storage-mode policy + `.tds` parsing).
 3. **Value reconciliation (highest value)** — run each translated measure via `semantic-model-consumption` (`ExecuteQuery`) and compare to the Tableau VDS value pulled by the profiler. A measure is "verified" only when the numbers match.
 
 ---
