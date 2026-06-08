@@ -45,6 +45,66 @@ LIVE_SQLSERVER = """<?xml version='1.0' encoding='utf-8' ?>
   </connection>
 </datasource>"""
 
+# Snowflake (case-sensitive backend): metadata-records keep the physical UPPERCASE name as the
+# local-name (no friendly caption), so a calc's caption ([Sales]) resolves ONLY through the
+# logical <column caption> + <cols> map layer. Physical REGION appears in two collection tables,
+# disambiguated by caption (Region -> ORDERS, Region (People) -> PEOPLE). The calculated column
+# carries a nested <calculation> and must be excluded from physical binding.
+LIVE_SNOWFLAKE_LOGICAL = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Snowflake-Superstore' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='snow' name='snowflake.12zi'>
+        <connection class='snowflake' dbname='TABLEAUCONNECT'
+                    server='x.snowflakecomputing.com' warehouse='' />
+      </named-connection>
+    </named-connections>
+    <relation type='collection'>
+      <relation connection='snowflake.12zi' name='ORDERS' table='[TABLEAUCONNECT].[PUBLIC].[ORDERS]' type='table' />
+      <relation connection='snowflake.12zi' name='PEOPLE' table='[TABLEAUCONNECT].[PUBLIC].[PEOPLE]' type='table' />
+    </relation>
+    <cols>
+      <map key='[SALES]' value='[ORDERS].[SALES]' />
+      <map key='[REGION]' value='[ORDERS].[REGION]' />
+      <map key='[STATE]' value='[ORDERS].[STATE]' />
+      <map key='[REGION (PEOPLE)]' value='[PEOPLE].[REGION]' />
+    </cols>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>SALES</remote-name>
+        <local-name>[SALES]</local-name>
+        <parent-name>[ORDERS]</parent-name>
+        <local-type>real</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>REGION</remote-name>
+        <local-name>[REGION]</local-name>
+        <parent-name>[ORDERS]</parent-name>
+        <local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>STATE</remote-name>
+        <local-name>[STATE]</local-name>
+        <parent-name>[ORDERS]</parent-name>
+        <local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>REGION</remote-name>
+        <local-name>[REGION]</local-name>
+        <parent-name>[PEOPLE]</parent-name>
+        <local-type>string</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+  <column caption='Sales' datatype='real' name='[SALES]' role='measure' type='quantitative' />
+  <column caption='Region' datatype='string' name='[REGION]' role='dimension' type='nominal' />
+  <column caption='State' datatype='string' name='[STATE]' role='dimension' type='nominal' />
+  <column caption='Region (People)' datatype='string' name='[REGION (PEOPLE)]' role='dimension' type='nominal' />
+  <column caption='Profit Ratio' datatype='real' name='[Calculation_123]' role='measure' type='quantitative'>
+    <calculation class='tableau' formula='SUM([Profit])/SUM([Sales])' />
+  </column>
+</datasource>"""
+
 EXTRACT_OVER_SQLSERVER = """<?xml version='1.0' encoding='utf-8' ?>
 <datasource formatted-name='SuperstoreExtract' version='18.1'>
   <connection class='federated'>
@@ -1298,6 +1358,92 @@ def test_m_field_resolver_feeds_calc_to_dax():
     resolve = build_m_field_resolver(d)
     dax, reason, _ = translate_tableau_calc_to_dax("SUM([Sales])/SUM([Quantity])", resolve)
     assert dax == "DIVIDE(SUM('Orders'[Sales]), SUM('Orders'[Quantity]))"
+
+
+# -- logical-layer field resolution (case-sensitive backends) ------------------
+def test_logical_fields_bridges_caption_to_uppercase_physical():
+    d = parse_tds(LIVE_SNOWFLAKE_LOGICAL)
+    by_caption = {f["caption"]: f for f in d["logical_fields"]}
+    # The calculated column (<calculation> child) is NOT a physical binding and is excluded.
+    assert "Profit Ratio" not in by_caption
+    assert by_caption["Sales"]["table"] == "ORDERS"
+    assert by_caption["Sales"]["physical_col"] == "SALES"
+    assert by_caption["Sales"]["tmdl_type"] == "double"
+    assert by_caption["Region (People)"]["table"] == "PEOPLE"
+
+
+def test_m_field_resolver_logical_caption_is_case_insensitive():
+    # The calc references [Sales] but the Snowflake backend column is SALES; resolve via the
+    # logical layer regardless of the caption's case.
+    d = parse_tds(LIVE_SNOWFLAKE_LOGICAL)
+    resolve = build_m_field_resolver(d)
+    assert resolve("Sales") == ("ORDERS", "SALES", "double")
+    assert resolve("sales") == ("ORDERS", "SALES", "double")
+    assert resolve("SALES") == ("ORDERS", "SALES", "double")
+    assert resolve("Nonexistent") is None
+
+
+def test_m_field_resolver_logical_disambiguates_physical_collision():
+    # Physical REGION exists in both ORDERS and PEOPLE; the caption picks the right one rather
+    # than failing closed on the ambiguous physical name.
+    d = parse_tds(LIVE_SNOWFLAKE_LOGICAL)
+    resolve = build_m_field_resolver(d)
+    assert resolve("Region") == ("ORDERS", "REGION", "string")
+    assert resolve("Region (People)") == ("PEOPLE", "REGION", "string")
+
+
+def test_m_field_resolver_logical_feeds_conditional_agg_to_dax():
+    from calc_to_dax import translate_tableau_calc_to_dax
+    d = parse_tds(LIVE_SNOWFLAKE_LOGICAL)
+    resolve = build_m_field_resolver(d)
+    dax, _reason, _ = translate_tableau_calc_to_dax(
+        'SUM(IF [Region]="West" THEN [Sales] END)', resolve)
+    assert dax == "SUMX('ORDERS', IF(EXACT('ORDERS'[REGION], \"West\"), 'ORDERS'[SALES]))"
+
+
+def test_logical_resolver_fails_closed_on_duplicate_map_key():
+    # The same logical id is remapped to two different physical columns; the bridge must refuse
+    # to bind it rather than pick whichever <map> parsed last.
+    tds = LIVE_SNOWFLAKE_LOGICAL.replace(
+        "<map key='[STATE]' value='[ORDERS].[STATE]' />",
+        "<map key='[STATE]' value='[ORDERS].[STATE]' />\n"
+        "      <map key='[SALES]' value='[ORDERS].[REGION]' />")
+    d = parse_tds(tds)
+    assert "Sales" not in {f["caption"] for f in d["logical_fields"]}
+    assert build_m_field_resolver(d)("Sales") is None
+
+
+def test_logical_resolver_fails_closed_on_case_distinct_physical():
+    # ORDERS exposes both QUOTA and quota (legal on a case-sensitive backend); a logical map to
+    # the case-folded name must not silently bind to the wrong one.
+    extra_meta = (
+        "      <metadata-record class='column'>\n"
+        "        <remote-name>QUOTA</remote-name>\n"
+        "        <local-name>[QUOTA]</local-name>\n"
+        "        <parent-name>[ORDERS]</parent-name>\n"
+        "        <local-type>real</local-type>\n"
+        "      </metadata-record>\n"
+        "      <metadata-record class='column'>\n"
+        "        <remote-name>quota</remote-name>\n"
+        "        <local-name>[quota]</local-name>\n"
+        "        <parent-name>[ORDERS]</parent-name>\n"
+        "        <local-type>real</local-type>\n"
+        "      </metadata-record>\n")
+    tds = LIVE_SNOWFLAKE_LOGICAL.replace(
+        "    </metadata-records>", extra_meta + "    </metadata-records>")
+    # A caption whose <cols> map points at 'Quota' (case-folds to two physical columns).
+    tds = tds.replace(
+        "<map key='[STATE]' value='[ORDERS].[STATE]' />",
+        "<map key='[STATE]' value='[ORDERS].[STATE]' />\n"
+        "      <map key='[QUOTA_CAP]' value='[ORDERS].[Quota]' />")
+    tds = tds.replace(
+        "  <column caption='State'",
+        "  <column caption='Quota Cap' datatype='real' name='[QUOTA_CAP]' role='measure' type='quantitative' />\n"
+        "  <column caption='State'")
+    d = parse_tds(tds)
+    # Exact 'QUOTA' / 'quota' still resolve (exact wins); the case-folded 'Quota' bridge fails closed.
+    resolve = build_m_field_resolver(d)
+    assert resolve("Quota Cap") is None
 
 
 # -- bind details --------------------------------------------------------------

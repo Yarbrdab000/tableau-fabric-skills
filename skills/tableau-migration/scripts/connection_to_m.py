@@ -223,6 +223,61 @@ def _columns_by_parent(datasource):
     return out
 
 
+def _logical_fields(datasource):
+    """Bridge Tableau's LOGICAL field layer to physical columns, for calc->DAX resolution.
+
+    A live (non-extract) ``.tds`` over a case-sensitive backend (Snowflake / Databricks Unity)
+    keeps the physical column names verbatim in ``<metadata-records>`` (e.g. ``SALES``), so the
+    metadata-record ``local-name`` equals the ``remote-name`` and carries no friendly caption.
+    Calc formulas, however, reference the user-facing caption (``[Sales]``). The caption->physical
+    mapping lives in two sibling structures Tableau writes for the logical model:
+
+    * ``<column caption='Sales' datatype='real' name='[SALES]' .../>`` -- caption -> logical id + type
+    * ``<cols><map key='[SALES]' value='[ORDERS].[SALES]' /></cols>``  -- logical id -> table.physical
+
+    Joining them yields ``caption -> (table, physical_col, tmdl_type)``. Calculated fields (a
+    ``<column>`` with a nested ``<calculation>``) are skipped -- they carry no ``<cols>`` map entry
+    and must translate from their formula, not bind as a physical column. Object/table columns
+    (``datatype='table'``) type to ``None`` and are skipped. Returns ``[]`` when the ``.tds`` has no
+    logical layer (e.g. the metadata-record-only fixtures), so callers degrade to the physical path.
+    """
+    # logical id -> set of (table, physical_col). A set so a duplicate/conflicting <map key>
+    # (multiple <cols> blocks, or a key remapped in two scopes) is detected and the field is
+    # dropped rather than bound to whichever mapping parsed last (fail closed).
+    logical_to_physical = {}
+    for cols in _findall_local(datasource, "cols"):
+        for m in _children_local(cols, "map"):
+            key = _strip_brackets((m.get("key") or "").strip())
+            _cat, table, col = _parse_table_name((m.get("value") or "").strip())
+            if key and table and col:
+                logical_to_physical.setdefault(key, set()).add((table, col))
+
+    out = []
+    for col in _children_local(datasource, "column"):
+        if _children_local(col, "calculation"):
+            continue  # calculated field -- translated from formula, not a physical binding
+        caption = (col.get("caption") or "").strip()
+        lid = _strip_brackets((col.get("name") or "").strip())
+        if not caption or not lid:
+            continue
+        phys = logical_to_physical.get(lid)
+        if not phys or len(phys) != 1:
+            continue  # unmapped, or ambiguously mapped -> never guess
+        tmdl_type = tableau_type_to_tmdl(col.get("datatype"))
+        if tmdl_type is None:
+            continue
+        table, physical_col = next(iter(phys))
+        out.append({
+            "caption": caption,
+            "logical_id": lid,
+            "table": table,
+            "physical_col": physical_col,
+            "model_col": clean_col(physical_col),
+            "tmdl_type": tmdl_type,
+        })
+    return out
+
+
 def _build_parent_map(root):
     """Map ``id(child) -> parent`` (ElementTree elements have no parent pointer)."""
     parent = {}
@@ -573,6 +628,7 @@ def parse_tds(xml_text):
         "relations": relations,
         "relationships": relationships,
         "relationship_warnings": relationship_warnings,
+        "logical_fields": _logical_fields(datasource),
         "unsupported_reasons": unsupported,
     }
 
@@ -816,9 +872,23 @@ def build_m_field_resolver(descriptor):
     metadata instead of landed Delta. Resolves only when exactly one table exposes the caption
     unambiguously (the column's Tableau ``local-name``), so a measure never binds to the wrong
     column.
+
+    Two resolution layers, tried in order so existing behavior is byte-for-byte unchanged:
+
+    1. **metadata-record** -- the column's friendly ``local-name`` (SQL Server / extract .tds keep
+       a title-case ``[Sales]`` here, so a calc's ``[Sales]`` binds directly).
+    2. **logical layer** (case-insensitive) -- consulted only on a miss. A live ``.tds`` over a
+       case-sensitive backend stores the physical name verbatim (``SALES``) in the metadata-record
+       while the calc references the caption (``[Sales]``); the ``<column caption>`` + ``<cols>``
+       map bridges ``[Sales] -> [ORDERS].[SALES]``. Lowercasing the lookup also lets a formula use
+       either the caption (``[Sales]``) or the physical/logical id (``[SALES]``). The caption
+       disambiguates a physical-name collision that the physical layer alone cannot (``Region`` ->
+       ``ORDERS.REGION`` while ``Region (People)`` -> ``PEOPLE.REGION``).
     """
     cap_to = {}   # (table, caption) -> (clean_col, tmdl_type)
     counts = {}   # (table, clean_col) -> set(captions)  (collision detector)
+    phys_exact = {}   # (table, remote) -> (table, clean_col, tmdl_type)  -- exact, case-sensitive
+    phys_ci = {}      # (lower(table), lower(remote)) -> set of those targets (case collisions)
     for rel in descriptor.get("relations", []):
         if rel.get("kind") not in ("table", "custom_sql"):
             continue
@@ -828,10 +898,43 @@ def build_m_field_resolver(descriptor):
             cc = c["model_name"]
             cap_to[(table, cap)] = (cc, c["tmdl_type"])
             counts.setdefault((table, cc), set()).add(cap)
+            remote = c.get("remote_name")
+            if table and remote:
+                target = (table, cc, c["tmdl_type"])
+                phys_exact[(table, remote)] = target
+                phys_ci.setdefault((table.strip().lower(), remote.strip().lower()),
+                                   set()).add(target)
 
     tables = {(rel.get("name") or rel.get("item"))
               for rel in descriptor.get("relations", [])
               if rel.get("kind") in ("table", "custom_sql")}
+
+    def _phys_target(table, physical):
+        """Resolve a logical map's (table, physical) to the EMITTED relation column target.
+
+        Exact (case-sensitive) match wins; only on an exact miss is a case-insensitive match
+        accepted, and ONLY when it is unique (a backend can expose ``ID`` and ``id`` as distinct
+        columns, so a case-folded collision must fail closed rather than guess). Returns ``None``
+        when nothing provably emitted matches -- never an invented target.
+        """
+        hit = phys_exact.get((table, physical))
+        if hit is not None:
+            return hit
+        bucket = phys_ci.get((table.strip().lower(), physical.strip().lower()))
+        return next(iter(bucket)) if bucket and len(bucket) == 1 else None
+
+    # Logical caption/id -> target, built from the <column caption> + <cols> bridge. A key that
+    # maps to more than one distinct target stays ambiguous (fail-closed, never guess). A logical
+    # field whose physical column is not provably emitted is dropped (no invented binding).
+    logical = {}   # lower(caption|logical_id) -> set of (table, clean_col, tmdl_type)
+    for lf in descriptor.get("logical_fields", []):
+        target = _phys_target(lf["table"], lf["physical_col"])
+        if target is None:
+            continue
+        for key in (lf["caption"], lf["logical_id"]):
+            k = (key or "").strip().lower()
+            if k:
+                logical.setdefault(k, set()).add(target)
 
     def resolve_field(caption):
         hits = []
@@ -843,7 +946,16 @@ def build_m_field_resolver(descriptor):
             if len(counts.get((table, cc), ())) != 1:
                 continue
             hits.append((table, cc, tmdl_type))
-        return hits[0] if len(hits) == 1 else None
+        if len(hits) == 1:
+            return hits[0]
+        # Exact metadata-record resolution was empty OR ambiguous: defer to the logical layer,
+        # which is the authoritative disambiguator for a caption / logical-id reference (e.g. a
+        # physical ``REGION`` present in two joined tables resolves by the caption ``Region`` ->
+        # ORDERS vs ``Region (People)`` -> PEOPLE). Only an unambiguous logical hit binds.
+        bucket = logical.get((caption or "").strip().lower())
+        if bucket and len(bucket) == 1:
+            return next(iter(bucket))
+        return None
 
     return resolve_field
 
