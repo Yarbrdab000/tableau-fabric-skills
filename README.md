@@ -25,7 +25,7 @@ installed you just describe the migration and the Copilot drives it (including a
 
 ```text
 /plugin marketplace add Yarbrdab000/tableau-migration-skill
-/plugin install tableau-migration@tableau-migration-marketplace
+/plugin install tableau-migration@tableau-collection
 ```
 
 **Option B — Manual copy (works in any agent):** clone, then drop the skill folder where your agent discovers skills.

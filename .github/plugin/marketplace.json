@@ -1,7 +1,7 @@
-﻿{
+{
   "name": "tableau-collection",
   "metadata": {
-    "description": "Tableau -> Microsoft Fabric / Power BI migration skill for code-executing Copilots (GitHub Copilot CLI, Claude Code, Cursor)",
+    "description": "Tableau -> Microsoft Fabric / Power BI migration skill for GitHub Copilot CLI",
     "version": "0.1.0"
   },
   "owner": {
@@ -34,4 +34,3 @@
     }
   ]
 }
-
