@@ -153,6 +153,22 @@ def test_build_date_dimension_active_and_inactive():
     assert not report["warnings"]
 
 
+def test_build_date_dimension_directquery_omits_datepartonly():
+    # On a DirectQuery model a datePartOnly (datetime-to-date) join is illegal -- Power BI refuses
+    # to open the model. The calendar relationships must still be emitted (active + inactive
+    # role-playing) but as plain dateTime joins, with no joinOnDateBehavior, plus a report warning.
+    tables = [_rel("Orders", "Order_Date", "Ship_Date")]
+    name, part, date_rels, report = _build_date_dimension(
+        tables, ["Orders"], [], mode="DirectQuery")
+    assert name == "Date" and part is not None
+    assert {r["from_table"] for r in date_rels} == {"Orders"}
+    assert all("join_on_date_behavior" not in r for r in date_rels)
+    by_col = {r["from_col"]: r for r in date_rels}
+    assert by_col["Order_Date"]["is_active"] is True
+    assert by_col["Ship_Date"]["is_active"] is False
+    assert any("DirectQuery" in w for w in report["warnings"])
+
+
 def test_build_date_dimension_dedupes_table_name():
     # a (degenerate) source table literally named 'Date' forces the calendar to a free name
     tables = [_rel("Date", "Event_Date")]
@@ -184,7 +200,10 @@ def test_migrate_generates_date_table_by_default():
     assert "fromColumn: Orders.Order_Date" in rels
     assert "toColumn: Date.Date" in rels
     assert "fromColumn: Orders.Ship_Date" in rels
-    assert "joinOnDateBehavior: datePartOnly" in rels
+    # DATES_SQLSERVER resolves to DirectQuery, where a datePartOnly (datetime-to-date) join is
+    # illegal -- Power BI rejects such a model. The calendar relationships must be plain dateTime
+    # joins instead, so no joinOnDateBehavior is emitted.
+    assert "joinOnDateBehavior" not in rels
     assert "isActive: false" in rels   # exactly the secondary (Ship Date) role
 
     dt = out["report"]["date_table"]

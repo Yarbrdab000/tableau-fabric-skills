@@ -36,7 +36,6 @@ try:  # package or scripts-on-path
     from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from .calc_to_dax import translate_tableau_calc_to_dax
     from . import tmdl_generate as T
-    from . import parameters as PARAMS
 except ImportError:
     from connection_to_m import (
         build_m_field_resolver,
@@ -47,7 +46,6 @@ except ImportError:
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from calc_to_dax import translate_tableau_calc_to_dax
     import tmdl_generate as T
-    import parameters as PARAMS
 
 
 def _table_display(rel):
@@ -120,13 +118,18 @@ def _generate_model_tmdl_import(table_names, expression_names, role_names=None):
     )
 
 
-def _measures_part(calcs, resolve, consumed=None):
+def _measures_part(calcs, resolve, consumed=None, param_resolver=None):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
     ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
     ``consumed`` (case-insensitive) are skipped -- they have already become field-parameter
     tables and must NOT also be emitted as measures. Returns ``(measures_table_tmdl, report)``
     where report rows record translated/stub status.
+
+    ``param_resolver`` (from ``emit_value_parameters``) inlines a value/what-if
+    ``[Parameters].[X]`` reference as its ``[<Param> Value]`` measure. It defaults to ``None``;
+    a resolver that returns ``None`` for an unknown parameter falls back to the same inert stub as
+    no resolver, so callers that pass no parameters get byte-for-byte identical output.
     """
     consumed_lower = {(c or "").lower() for c in (consumed or set())}
     measures_tmdl = ""
@@ -135,7 +138,7 @@ def _measures_part(calcs, resolve, consumed=None):
         name, formula = calc["name"], calc.get("formula", "")
         if name.lower() in consumed_lower:
             continue
-        dax, reason, _ = translate_tableau_calc_to_dax(formula, resolve)
+        dax, reason, _ = translate_tableau_calc_to_dax(formula, resolve, param_resolver=param_resolver)
         measures_tmdl += T.generate_measure_tmdl(name, formula, dax)
         report.append({
             "measure": name,
@@ -182,36 +185,6 @@ def _apply_enrichment(parts, *, hierarchies=None, display_folders=None, rls_role
     return role_names
 
 
-def _resolve_to_locator(resolve):
-    """Adapt a ``resolve_field(caption) -> (table, column, type)`` resolver into the
-    ``field_locator(field) -> (table, column, is_measure)`` shape ``parameters`` expects.
-    Import/DirectLake data-table fields are always columns, so ``is_measure`` is ``False``."""
-    def loc(field):
-        try:
-            r = resolve(field)
-        except Exception:
-            r = None
-        return (r[0], r[1], False) if r else None
-    return loc
-
-
-def _label_aliases_by_controller(parameters):
-    """``{controller-key -> {literal: alias}}`` so a measure-swap selector like ``1`` can be
-    labelled with its Tableau alias (e.g. ``1 -> "Sales"``). Keyed by every name a swap calc's
-    controller might use (caption, bracketed and bare internal name)."""
-    out = {}
-    for p in (parameters or []):
-        aliases = p.get("aliases") or {}
-        if not aliases:
-            continue
-        raw = (p.get("internal_name") or "").strip()
-        for key in {(p.get("caption") or "").strip().lower(), raw.lower(),
-                    raw.strip("[]").strip().lower()}:
-            if key:
-                out[key] = aliases
-    return out
-
-
 def _inject_field_param_tables(parts, table_names, fp_parts, fp_names):
     """Write field-parameter table parts and register their names just BEFORE ``_Measures``.
 
@@ -251,17 +224,24 @@ def _select_primary_date(date_cols):
 
 
 def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=True,
-                          name_pref="Date"):
+                          name_pref="Date", mode="import"):
     """Detect fact date columns and build a shared Date dimension + its relationships.
 
     Returns ``(date_table_name|None, date_table_tmdl|None, date_relationships, report)``. Only
     fact-like tables contribute date columns: a table that is purely the ``one`` side of an
     existing join (a dimension) is skipped so the calendar relates to the star's fact(s) and
     doesn't introduce ambiguous snowflake paths. For each eligible table the primary date column
-    gets an ACTIVE relationship and any others are inactive (role-playing, via USERELATIONSHIP);
-    all date relationships carry ``joinOnDateBehavior: datePartOnly`` so a timestamp's time
-    component can't silently drop rows against the midnight calendar key.
+    gets an ACTIVE relationship and any others are inactive (role-playing, via USERELATIONSHIP).
+
+    For an **Import** model the date relationships carry ``joinOnDateBehavior: datePartOnly`` so a
+    timestamp's time component can't silently drop rows against the midnight calendar key. For a
+    **DirectQuery** (``mode == 'DirectQuery'``) model that behavior is ILLEGAL -- Power BI rejects a
+    DirectQuery table that participates in a datePartOnly (datetime-to-date) relationship ("...must
+    have its query mode set to Import") -- so the relationships are emitted as plain dateTime joins
+    instead (both endpoints are already dateTime; a source DATE lands at midnight and matches the
+    midnight CALENDARAUTO key exactly). A report warning flags the exact-join caveat.
     """
+    is_directquery = (mode or "").lower() == "directquery"
     emitted = {n.lower() for n in emitted_names}
     to_tables = {(r.get("to_table") or "").lower() for r in relationships}
     from_tables = {(r.get("from_table") or "").lower() for r in relationships}
@@ -299,12 +279,24 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
                 f"USERELATIONSHIP or a model edit.")
         for col in date_cols:
             active = col == primary
-            rels.append({
+            rel = {
                 "from_table": disp, "from_col": col,
                 "to_table": date_name, "to_col": "Date",
-                "is_active": active, "join_on_date_behavior": "datePartOnly",
-            })
+                "is_active": active,
+            }
+            # datePartOnly (a datetime-to-date join) is illegal on a DirectQuery table; relate on the
+            # full dateTime there instead (see this function's docstring).
+            if not is_directquery:
+                rel["join_on_date_behavior"] = "datePartOnly"
+            rels.append(rel)
             details.append({"table": disp, "column": col, "active": active})
+
+    if is_directquery and rels:
+        warnings.append(
+            "DirectQuery model: date relationships use an exact dateTime join (datePartOnly is not "
+            "permitted on a DirectQuery table). Source DATE columns match the calendar exactly; a "
+            "true timestamp column with a time-of-day component may under-match -- normalize it to a "
+            "date at the source (e.g. CAST(... AS DATE)) if exact date-part matching is required.")
 
     part = T.generate_date_table_tmdl(date_name, mark_as_date=mark_as_date)
     report = {"generated": True, "table": date_name, "mark_as_date": mark_as_date,
@@ -314,8 +306,7 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
 
 def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=None,
                           hierarchies=None, display_folders=None, rls_roles=None,
-                          date_table=True, mark_as_date=True, flatfile_path=None,
-                          parameters=None):
+                          date_table=True, mark_as_date=True, flatfile_path=None):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -364,17 +355,12 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
 
     resolve = build_m_field_resolver(descriptor)
 
-    # Field parameters: a Tableau `CASE/IF [Parameters].[X] WHEN <lit> THEN [fieldA] ...` calc that
-    # *swaps fields* becomes a Power BI field-parameter table (consumed here, NOT emitted as a
-    # measure). Detection is fail-closed: a calc only converts when every branch resolves to a model
-    # column and >= 2 survive; otherwise it falls through to normal translation (a preserved stub).
-    fp = PARAMS.emit_field_parameters(
-        calcs, field_locator=_resolve_to_locator(resolve),
-        existing_tables=list(table_names) + ["_Measures"],
-        label_aliases_by_controller=_label_aliases_by_controller(parameters))
-    _inject_field_param_tables(parts, table_names, fp["parts"], fp["table_names"])
-
-    measures_table, measure_report = _measures_part(calcs, resolve, consumed=fp["consumed"])
+    # Tableau parameters are NOT translated: a calc that references `[Parameters].[X]` (a field
+    # swap, value/what-if, or filter parameter) has no deterministic Power BI equivalent, so it
+    # flows through normal translation and lands as a preserved `= 0` stub -- its original Tableau
+    # formula is kept verbatim as the `TableauFormula` annotation. Rebuild parameter behaviour in
+    # Power BI Desktop with native field parameters, which are trivial to author there.
+    measures_table, measure_report = _measures_part(calcs, resolve)
     parts["definition/tables/_Measures.tmdl"] = measures_table
     table_names.append("_Measures")
 
@@ -386,7 +372,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
     date_report = {"generated": False, "reason": "date_table disabled"}
     if date_table:
         date_name, date_part, date_rels, date_report = _build_date_dimension(
-            tables, table_names, all_rels, mark_as_date=mark_as_date)
+            tables, table_names, all_rels, mark_as_date=mark_as_date, mode=mode)
         if date_part is not None:
             parts[f"definition/tables/{date_name}.tmdl"] = date_part
             table_names.insert(table_names.index("_Measures"), date_name)
@@ -414,8 +400,6 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
         "relationships": relationships or [],
         "date_table": date_report,
         "roles": [r["name"] for r in rls_roles or []],
-        "field_parameters": {"tables": fp["table_names"], "consumed": sorted(fp["consumed"]),
-                             "warnings": fp["warnings"]},
     }
     return {"parts": parts, "report": report}
 
@@ -499,8 +483,7 @@ def write_model_folder(parts, dest_dir):
 
 def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relationships=None,
                                   hierarchies=None, display_folders=None, rls_roles=None,
-                                  date_table=True, mark_as_date=True, flatfile_path=None,
-                                  parameters=None):
+                                  date_table=True, mark_as_date=True, flatfile_path=None):
     """One-call convenience: parse ``.tds`` text and assemble the Import/DirectQuery model.
 
     Model objects (hierarchies, display folders, RLS roles) are AUTO-DERIVED from the
@@ -517,8 +500,6 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relations
     descriptor = parse_tds(tds_text)
     if relationships is None:
         relationships = descriptor.get("relationships") or []
-    if parameters is None:
-        parameters = PARAMS.parse_parameters(tds_text)
     enrichment_report = None
     if hierarchies is None and display_folders is None and rls_roles is None:
         parsed = T.parse_model_objects(tds_text)
@@ -536,8 +517,7 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relations
                                    calcs=calcs, relationships=relationships,
                                    hierarchies=hierarchies, display_folders=display_folders,
                                    rls_roles=rls_roles, date_table=date_table,
-                                   mark_as_date=mark_as_date, flatfile_path=flatfile_path,
-                                   parameters=parameters)
+                                   mark_as_date=mark_as_date, flatfile_path=flatfile_path)
     if enrichment_report is not None:
         result["report"]["model_objects"] = enrichment_report
     return result

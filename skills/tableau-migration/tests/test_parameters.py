@@ -250,8 +250,8 @@ def test_extract_field_swap_calcs_includes_dimension_role():
     assert swaps[0]["role"] == "dimension"
 
 
-# -- end-to-end assembly --------------------------------------------------------------------
-def test_assemble_import_model_emits_field_parameter():
+# -- end-to-end assembly: parameter calcs are NOT translated, they become preserved stubs ----
+def test_assemble_import_model_stubs_parameter_calc():
     calcs = [
         {"name": "Profit Ratio", "formula": "SUM([Sales])/SUM([Quantity])"},
         {"name": "Metric", "formula": "CASE [Parameters].[m] WHEN 1 THEN [Sales] WHEN 2 THEN [Quantity] END"},
@@ -259,23 +259,24 @@ def test_assemble_import_model_emits_field_parameter():
     out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore", calcs=calcs)
     parts, report = out["parts"], out["report"]
 
-    # the swap calc became a field-parameter table part, not a measure
-    assert "definition/tables/Metric.tmdl" in parts
-    fp = parts["definition/tables/Metric.tmdl"]
-    assert "extendedProperty ParameterMetadata =" in fp
-    assert "NAMEOF('Orders'[Sales])" in fp and "NAMEOF('Orders'[Quantity])" in fp
-    assert "Metric" not in parts["definition/tables/_Measures.tmdl"]
+    # the parameter-driven swap calc is NOT a field-parameter table anymore
+    assert "definition/tables/Metric.tmdl" not in parts
 
-    # it is listed in the model but never wired into relationships
-    assert "ref table Metric" in parts["definition/model.tmdl"]
-    assert "Metric" not in parts.get("definition/relationships.tmdl", "")
+    # it lands in _Measures as an inert `= 0` stub with its Tableau formula preserved verbatim
+    measures = parts["definition/tables/_Measures.tmdl"]
+    assert "measure Metric = 0" in measures
+    assert "CASE [Parameters].[m] WHEN 1 THEN [Sales] WHEN 2 THEN [Quantity] END" in measures
 
-    # the still-translatable calc remains a measure
-    assert "Profit Ratio" in parts["definition/tables/_Measures.tmdl"]
+    # the still-translatable calc remains a real translated measure
+    assert "Profit Ratio" in measures
+    assert "DIVIDE(" in measures
 
-    # the report records the consumption
-    assert "Metric" in report["field_parameters"]["consumed"]
-    assert report["field_parameters"]["tables"] == ["Metric"]
+    # the report records Metric as a stub and exposes no parameter keys
+    statuses = {r["measure"]: r["status"] for r in report["measures"]}
+    assert statuses["Metric"] == "stub"
+    assert statuses["Profit Ratio"] == "translated"
+    assert "field_parameters" not in report
+    assert "value_parameters" not in report
 
 
 def test_assemble_directlake_model_injects_field_parameters():
