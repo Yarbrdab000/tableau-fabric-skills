@@ -294,3 +294,133 @@ def test_assemble_directlake_model_injects_field_parameters():
     # registered in model.tmdl just before _Measures, not in relationships
     model = parts["definition/model.tmdl"]
     assert "ref table 'Dim calc 1'" in model or "ref table Dim calc 1" in model
+
+
+# -- value / what-if parameters (scalar param used inside a calc) ----------------------------
+from calc_to_dax import translate_tableau_calc_to_dax  # noqa: E402
+
+
+def _num_param(caption="Sales Multiplier", internal="[Parameter 7]", default="19.470149254",
+               mn="1.0", mx="100.0", step=None, fmt="n#,##0.00"):
+    return {"caption": caption, "internal_name": internal, "datatype": "real", "domain": "range",
+            "default": default, "format": fmt, "range": {"min": mn, "max": mx, "step": step},
+            "members": [], "aliases": {}}
+
+
+def _str_param(caption="Segment Parameter", internal="[Parameter 2]", default='"Consumer"',
+               members=("Consumer", "Corporate", "Home Office")):
+    return {"caption": caption, "internal_name": internal, "datatype": "string", "domain": "list",
+            "default": default, "format": None, "range": None, "members": list(members),
+            "aliases": {}}
+
+
+def test_canon_num_key_trailing_dot():
+    # Tableau serializes integer alias keys with a trailing dot; they must canonicalize by value.
+    assert P._canon_num_key("1.") == P._canon_num_key("1") == P._canon_num_key("1.0") == "1"
+    assert P._canon_num_key("Consumer") == "consumer"
+
+
+def test_on_grid():
+    assert P._on_grid(50, 1, 100, 1) is True
+    assert P._on_grid(19.47, 1, 100, 1) is False      # off the integer grid
+    assert P._on_grid(150, 1, 100, 1) is False         # out of range
+    assert P._on_grid(None, 1, 100, 1) is True         # no usable default -> nothing to union
+
+
+def test_parse_parameters_captures_format():
+    xml = ('<workbook><datasource name="Parameters"><column name="[P]" caption="Rate" '
+           'datatype="real" param-domain-type="range" value="0.1" default-format="p0.00%">'
+           '<range min="0" max="1"/></column></datasource></workbook>')
+    assert P.parse_parameters(xml)[0]["format"] == "p0.00%"
+
+
+def test_emit_value_parameter_numeric_whatif():
+    calc = {"name": "Adj Sales", "role": "measure",
+            "formula": "SUM([Sales]) * [Parameters].[Sales Multiplier]"}
+    res = P.emit_value_parameters([_num_param()], calcs=[calc],
+                                  reserved_names={"orders", "sales"})
+    assert res["table_names"] == ["Sales Multiplier"]        # no collision -> bare caption
+    assert res["measure_names"] == ["Sales Multiplier Value"]
+    _fn, tmdl = res["parts"][0]
+    assert "GENERATESERIES(1.0, 100.0, 1.0)" in tmdl
+    assert 'ROW("Value", 19.47014925)' in tmdl               # off-grid default unioned in
+    assert "sourceColumn: [Value]" in tmdl                   # physical partition column is "Value"
+    assert "SELECTEDVALUE('Sales Multiplier'[Sales Multiplier], 19.47014925)" in tmdl
+    assert res["param_resolver"]("Sales Multiplier") == "[Sales Multiplier Value]"
+    assert res["param_resolver"]("Parameter 7") == "[Sales Multiplier Value]"   # by internal name
+
+
+def test_emit_value_parameter_string_slicer():
+    calc = {"name": "Seg Filter", "role": "dimension",
+            "formula": "IF [Segment] = [Parameters].[Segment Parameter] THEN True ELSE False END"}
+    res = P.emit_value_parameters([_str_param()], calcs=[calc], reserved_names=set())
+    assert res["table_names"] == ["Segment Parameter"]
+    _fn, tmdl = res["parts"][0]
+    assert "DATATABLE(" in tmdl
+    assert all(s in tmdl for s in ('"Consumer"', '"Corporate"', '"Home Office"'))
+    assert "SELECTEDVALUE(" in tmdl                          # default fallback is "Consumer"
+
+
+def test_emit_value_parameter_name_collision_gets_suffix():
+    # A param caption equal to an existing measure name must be pushed to "<caption> Parameter"
+    # (Tabular forbids a measure name equal to any column name anywhere in the model).
+    calc = {"name": "x", "role": "measure",
+            "formula": "SUM([Sales]) * [Parameters].[Sales Multiplier]"}
+    res = P.emit_value_parameters([_num_param()], calcs=[calc],
+                                  reserved_names={"sales multiplier"})
+    assert res["table_names"] == ["Sales Multiplier Parameter"]
+    assert res["measure_names"] == ["Sales Multiplier Value"]
+
+
+def test_emit_value_parameter_only_referenced_params():
+    # A param referenced by NO provided calc is skipped (keeps the model lean; a swap controller
+    # whose only references are consumed swaps is naturally excluded this way).
+    res = P.emit_value_parameters(
+        [_num_param(caption="Unused", internal="[Parameter 9]")],
+        calcs=[{"name": "m", "role": "measure", "formula": "SUM([Sales])"}], reserved_names=set())
+    assert res["parts"] == [] and res["table_names"] == []
+
+
+def _sales_resolver(field):
+    return {"sales": ("Orders", "Sales", "double")}.get((field or "").strip().lower())
+
+
+def test_value_param_resolver_inlines_into_measure():
+    calc = {"name": "Adj Sales", "role": "measure",
+            "formula": "SUM([Sales]) * [Parameters].[Sales Multiplier]"}
+    res = P.emit_value_parameters([_num_param()], calcs=[calc],
+                                  reserved_names={"orders", "sales"})
+    dax, _reason, tables = translate_tableau_calc_to_dax(
+        calc["formula"], _sales_resolver, param_resolver=res["param_resolver"])
+    assert dax == "SUM('Orders'[Sales]) * [Sales Multiplier Value]"
+    assert tables == {"Orders"}             # the disconnected param table is NOT added to tables_used
+
+
+def test_value_param_without_resolver_stubs():
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        "SUM([Sales]) * [Parameters].[X]", _sales_resolver)
+    assert dax is None and "parameter reference" in reason
+
+
+def test_param_not_resolved_inside_aggregation():
+    # A parameter is a scalar -> SUM([Parameters].[X]) must still stub even WITH a resolver.
+    dax, _reason, _ = translate_tableau_calc_to_dax(
+        "SUM([Parameters].[X])", _sales_resolver, param_resolver=lambda n: "[X Value]")
+    assert dax is None
+
+
+def test_value_params_merge_into_directlake_model():
+    # Value-param tables are injected (before _Measures, never related) just like field params.
+    res = P.emit_value_parameters(
+        [_num_param()],
+        calcs=[{"name": "Adj Sales", "role": "measure",
+                "formula": "SUM([Sales]) * [Parameters].[Sales Multiplier]"}],
+        reserved_names={"orders"})
+    out = assemble_directlake_model(
+        model_name="DL", tables=[("Orders", "ds_orders", "")], measures_tmdl="",
+        expression_name="DL", directlake_url="https://x", field_parameters=res)
+    parts = out["parts"]
+    assert "definition/tables/Sales Multiplier.tmdl" in parts
+    model = parts["definition/model.tmdl"]
+    assert "ref table 'Sales Multiplier'" in model
+    assert "Sales Multiplier" not in parts.get("definition/relationships.tmdl", "")

@@ -317,12 +317,13 @@ def _tokenize(formula):
 # matching X-iterator, e.g. SUM(IF c THEN v END) -> SUMX('T', IF(c, v))). A row-level field
 # at measure top level is therefore a parse error (-> fallback).
 class _Parser:
-    def __init__(self, toks, resolver, tables_used, mode="measure"):
+    def __init__(self, toks, resolver, tables_used, mode="measure", param_resolver=None):
         self.toks = toks
         self.pos = 0
         self.resolver = resolver
         self.tables_used = tables_used
         self.mode = mode          # "measure" (default) or "column" (row-level)
+        self.param_resolver = param_resolver
         self._lod_dim_stack = []
 
     def _peek(self):
@@ -593,7 +594,8 @@ class _Parser:
                 return self._row_field()
             raise _CalcError("bare row-level field [..] not valid in a measure")
         if k == "qfield":
-            return self._qualified_ref(v)
+            self._next()
+            return self._qualified_ref(v, allow_param=True)
         raise _CalcError("expected a value")
 
     def _iif(self):
@@ -909,13 +911,20 @@ class _Parser:
         self.tables_used.add(table)
         return (f"{_dax_table(table)}{_dax_col(col)}", dtype)
 
-    def _qualified_ref(self, parts):
+    def _qualified_ref(self, parts, *, allow_param=False):
         # Tableau qualified reference [A].[B] (parameter, datasource-qualified, or blend field).
-        # None of these are modeled by the (field-caption) resolver yet, so emit a CLEAN,
-        # specific fallback reason rather than choking on the '.' -- the orchestrator can model
-        # parameters / cross-source fields later and revisit. Reachable in both modes.
+        # A value/what-if PARAMETER resolves to its SELECTEDVALUE measure -- a scalar, model-global
+        # ref deliberately NOT registered in tables_used so the host expression stays single-table.
+        # Only the SCALAR position (``_primary``) passes ``allow_param``; the other call sites
+        # invoke this purely for its specific "(unmodeled)" raise (a param can't be aggregated or
+        # used row-level), so they must keep failing even when a param_resolver is present.
+        # Everything else stays an explicit "(unmodeled)" fallback so the caller keeps the stub.
         pretty = ".".join(f"[{p}]" for p in parts)
         if parts and parts[0].strip().lower() == "parameters":
+            if allow_param and self.param_resolver and len(parts) >= 2:
+                ref = self.param_resolver(parts[1])
+                if ref:
+                    return ref, "number"
             raise _CalcError(f"parameter reference {pretty} (unmodeled)")
         raise _CalcError(f"qualified reference {pretty} (unmodeled)")
 
@@ -1201,11 +1210,14 @@ def validate_dax(text):
     return ""
 
 
-def translate_tableau_calc_to_dax(formula, resolver):
+def translate_tableau_calc_to_dax(formula, resolver, param_resolver=None):
     """Translate a SAFE-subset Tableau calc to DAX. Returns (dax|None, reason, tables_used).
 
     dax is None on any unsupported construct -> caller keeps the inert `= 0` stub.
     resolver(caption) -> (table_display_name, clean_col, tmdl_type) | None.
+    param_resolver(name) -> "[Measure]" | None: turns a value/what-if ``[Parameters].[X]`` into
+    its SELECTEDVALUE measure reference (measure-translation path only; omit it for calculated
+    columns, where a slicer selection cannot be read and the calc should stub).
     """
     tables_used = set()
     f = (formula or "").strip()
@@ -1215,7 +1227,7 @@ def translate_tableau_calc_to_dax(formula, resolver):
         toks = _tokenize(f)
         if not toks:
             return None, "empty formula", tables_used
-        dax, _dtype = _Parser(toks, resolver, tables_used).parse()
+        dax, _dtype = _Parser(toks, resolver, tables_used, param_resolver=param_resolver).parse()
         # Single-table only: terms spanning >1 table fall back (a relationship path
         # does not guarantee the DAX filter context reproduces Tableau's result).
         if len(tables_used) > 1:

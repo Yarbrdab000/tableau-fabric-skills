@@ -61,6 +61,16 @@ def _num(value):
     return "%.10g" % f
 
 
+def _dec(value):
+    """Like ``_num`` but ALWAYS decimal-typed (``20`` -> ``20.0``). A double what-if series must
+    stay decimal so a ``UNION`` with an off-grid decimal default can't coerce an integer series and
+    truncate the default (e.g. 19.47 -> 19)."""
+    f = float(value)
+    if f == int(f):
+        return f"{int(f)}.0"
+    return "%.10g" % f
+
+
 def _dax_string(value):
     return '"' + str(value).replace('"', '""') + '"'
 
@@ -114,6 +124,7 @@ def parse_parameters(xml):
             "datatype": (col.get("datatype") or "string").lower(),
             "domain": col.get("param-domain-type"),
             "default": col.get("value"),
+            "format": col.get("default-format") or col.get("format"),
             "range": rng,
             "members": members,
             "aliases": aliases,
@@ -216,23 +227,29 @@ def _uniquify(name, used_lower):
     return final
 
 
-def _value_table_tmdl(table_name, column_name, tmdl_type, fmt, source_expr,
+def _value_table_tmdl(table_name, *, display_col, source_col, tmdl_type, fmt, source_expr,
                       measure_name, default_literal, measure_fmt):
     """One disconnected what-if table: a value column, a SELECTEDVALUE measure, a calculated
-    partition (GENERATESERIES / DATATABLE), modelled on the existing _Measures/Date tables."""
-    col = [f"\tcolumn {q(column_name)}", f"\t\tdataType: {tmdl_type}"]
+    partition (GENERATESERIES / DATATABLE), modelled on the existing _Measures/Date tables.
+
+    The column's *display* name (``display_col``) may differ from the *physical* partition column
+    it binds to (``source_col``): GENERATESERIES always names its column ``Value`` while the model
+    column is named after the parameter, so ``sourceColumn`` must point at the physical name or the
+    table will not load. The SELECTEDVALUE measure reads the column by its display (model) name.
+    """
+    col = [f"\tcolumn {q(display_col)}", f"\t\tdataType: {tmdl_type}"]
     if fmt:
         col.append(f"\t\tformatString: {fmt}")
     col += [
         f"\t\tlineageTag: {uuid.uuid4()}",
         "\t\tsummarizeBy: none",
-        f"\t\tsourceColumn: [{column_name}]",
+        f"\t\tsourceColumn: [{source_col}]",
         "",
         "\t\tannotation SummarizationSetBy = Automatic",
     ]
     col_block = "\n" + "\n".join(col) + "\n"
 
-    col_ref = f"{q(table_name)}[{column_name}]"
+    col_ref = dax_ref(table_name, display_col)
     measure = [f"\n\tmeasure {q(measure_name)} = SELECTEDVALUE({col_ref}, {default_literal})"]
     if measure_fmt:
         measure.append(f"\t\tformatString: {measure_fmt}")
@@ -251,38 +268,64 @@ def _value_table_tmdl(table_name, column_name, tmdl_type, fmt, source_expr,
         f"{col_block}"
         f"{measure_block}\n"
         f"{partition}"
-        f"\n\tannotation PBI_Id = {q(table_name)}\n"
+        f"\n\tannotation PBI_Id = {uuid.uuid4().hex}\n"
     )
 
 
-def _emit_one_value_param(param, table_name, measure_name):
-    """Build the TMDL for one value param. Returns (tmdl_text, dtype) or (None, None) if the
-    param can't be represented as a value control."""
+def _on_grid(value, minv, maxv, step):
+    """Whether ``value`` lands exactly on the GENERATESERIES grid ``min..max`` stepped by ``step``
+    (within float tolerance). An off-grid Tableau default (e.g. 19.47 on a 1..100 step-1 series)
+    must be unioned into the series or it cannot be selected."""
+    try:
+        v, lo, hi, st = float(value), float(minv), float(maxv), float(step)
+    except (TypeError, ValueError):
+        return True  # no usable default -> nothing to union in
+    if st == 0:
+        return True
+    if v < lo - 1e-9 or v > hi + 1e-9:
+        return False
+    k = round((v - lo) / st)
+    return abs(lo + k * st - v) <= 1e-9
+
+
+def _emit_one_value_param(param, table_name, column_name, measure_name):
+    """Build the TMDL for one value param. Returns ``(tmdl_text, dtype, warnings)`` or
+    ``(None, None, [])`` if the param can't be represented as a value control."""
     datatype = param.get("datatype", "string")
     tmdl_type, dtype = _TYPE_MAP.get(datatype, ("string", "text"))
 
     if datatype in ("integer", "real"):
-        minv, maxv, step, default, _warn = _synth_range(param)
-        source = f"GENERATESERIES({_num(minv)}, {_num(maxv)}, {_num(step)})"
+        minv, maxv, step, default, warnings = _synth_range(param)
+        # A double series stays decimal-typed so the UNION below can't coerce/truncate the default.
+        nfmt = _dec if tmdl_type == "double" else _num
+        series = f"GENERATESERIES({nfmt(minv)}, {nfmt(maxv)}, {nfmt(step)})"
+        # Keep an off-grid Tableau default selectable by unioning it into the series.
+        if not _on_grid(default, minv, maxv, step):
+            series = f'DISTINCT(UNION({series}, ROW("Value", {nfmt(default)})))'
         fmt = _format_string(param, tmdl_type)
-        default_literal = _num(default)
+        default_literal = nfmt(default)
         # GENERATESERIES emits its column literally named "Value".
-        return _value_table_tmdl(table_name, "Value" if False else param["caption"],
-                                 tmdl_type, fmt, source, measure_name,
-                                 default_literal, fmt), dtype
+        tmdl = _value_table_tmdl(
+            table_name, display_col=column_name, source_col="Value", tmdl_type=tmdl_type,
+            fmt=fmt, source_expr=series, measure_name=measure_name,
+            default_literal=default_literal, measure_fmt=fmt)
+        return tmdl, dtype, warnings
 
     if datatype == "string":
         members = param.get("members") or []
         if not members:
-            return None, None
+            return None, None, []
         rows = ", ".join("{" + _dax_string(m) + "}" for m in members)
-        col = param["caption"]
-        source = f'DATATABLE("{col}", STRING, {{{rows}}})'
+        # DATATABLE names its column "Value"; the model column carries the param's display name.
+        source = f'DATATABLE("Value", STRING, {{{rows}}})'
         default_literal = _dax_string(_unescape_member(param.get("default")))
-        return _value_table_tmdl(table_name, col, "string", None, source,
-                                 measure_name, default_literal, None), dtype
+        tmdl = _value_table_tmdl(
+            table_name, display_col=column_name, source_col="Value", tmdl_type="string",
+            fmt=None, source_expr=source, measure_name=measure_name,
+            default_literal=default_literal, measure_fmt=None)
+        return tmdl, dtype, []
 
-    return None, None
+    return None, None, []
 
 
 # =============================================================================
@@ -325,6 +368,20 @@ def dax_ref(table, field, *, measure=False):
 
 def _is_numeric_literal(s):
     return bool(_NUMERIC_LITERAL.match((s or "").strip()))
+
+
+def _canon_num_key(s):
+    """Canonical key for matching a swap branch literal to a parameter alias key. Numeric values
+    compare by value so a branch ``1`` matches an alias keyed ``1.`` or ``1.0`` (Tableau commonly
+    serializes integer alias keys with a trailing dot); everything else compares case-insensitively.
+    Uses ``float`` directly so trailing-dot forms like ``"1."`` (which a strict regex rejects) still
+    canonicalize."""
+    t = (s or "").strip()
+    try:
+        f = float(t)
+    except (TypeError, ValueError):
+        return t.lower()
+    return str(int(f)) if f == int(f) else ("%.10g" % f)
 
 
 def _safe_filename(name):
@@ -530,6 +587,7 @@ def emit_field_parameter(display_name, swap, *, field_locator, used_names, label
     label_aliases = label_aliases or {}
 
     table_name = _uniquify(display_name, used_names)
+    norm_aliases = {_canon_num_key(k): v for k, v in label_aliases.items()}
     entries, used_labels = [], set()
     for br in branches:
         field = br.get("field")
@@ -544,8 +602,8 @@ def emit_field_parameter(display_name, swap, *, field_locator, used_names, label
         raw = br.get("label")
         if br.get("is_else") or raw is None:
             label = col
-        elif raw in label_aliases:
-            label = label_aliases[raw]
+        elif _canon_num_key(raw) in norm_aliases:
+            label = norm_aliases[_canon_num_key(raw)]
         elif _is_numeric_literal(raw):
             label = col  # numeric measure-swap selector -> use the field's own name
         else:
@@ -625,6 +683,87 @@ def emit_field_parameters(calcs, *, field_locator, used_names=None, existing_tab
         table_names.append(res["table_name"])
         consumed.add(name)
     return {"parts": parts, "table_names": table_names, "consumed": consumed, "warnings": warnings}
+
+
+# =============================================================================
+# VALUE PARAMETERS  (Tableau scalar param used inside a calc -> what-if table + measure)
+# =============================================================================
+
+def _uniquify_reserved(name, reserved_lower, *, prefer_suffix=None):
+    """Pick a model-unique name against a shared lowercased ``reserved_lower`` set spanning every
+    table/column/measure already in the model (Tabular forbids a measure name equal to ANY column
+    name anywhere). Tries the bare ``name`` first; if it is taken and ``prefer_suffix`` is given,
+    tries ``name + prefer_suffix`` next; then appends incrementing integers. The chosen name is
+    added to ``reserved_lower``.
+    """
+    candidates = [name] + ([name + prefer_suffix] if prefer_suffix else [])
+    for cand in candidates:
+        if cand.lower() not in reserved_lower:
+            reserved_lower.add(cand.lower())
+            return cand
+    base, final, i = candidates[-1], candidates[-1], 2
+    while final.lower() in reserved_lower:
+        final, i = f"{base} {i}", i + 1
+    reserved_lower.add(final.lower())
+    return final
+
+
+def emit_value_parameters(params, *, calcs, reserved_names=None):
+    """Emit a disconnected what-if table + value measure for every scalar parameter that any
+    ``calcs`` formula references via ``[Parameters].[X]``.
+
+    Returns ``{parts:[(filename, tmdl)], table_names:[...], measure_names:[...], param_resolver,
+    warnings:[...]}``. ``param_resolver(name)`` maps a parameter reference (by caption or
+    bracket-less internal name) to its value measure ``[<Param> Value]`` so the calc translator can
+    inline the selection; it deliberately registers NO table in ``tables_used`` so the host
+    expression stays single-table (e.g. ``SUM('Orders'[Sales]) * [Sales Multiplier Value]`` does not
+    trip the cross-table fallback). ``reserved_names`` is a shared lowercased set of every existing
+    table/column/measure name so emitted names never collide; the caller seeds it with the data
+    table + its columns + the translated measure names BEFORE calling this.
+
+    Pass only the NON-consumed calcs: a param referenced solely by a consumed field-swap (a swap
+    *controller*) is correctly excluded, while a param behind a deferred/stubbed calc still gets its
+    slicer table so the report can keep the control.
+    """
+    reserved = reserved_names if reserved_names is not None else set()
+    wanted = referenced_parameters(params, calcs)
+
+    parts, table_names, measure_names, warnings = [], [], [], []
+    resolver_map, used_files = {}, set()
+    for p in wanted:
+        caption = p.get("caption") or p.get("internal_name") or "Parameter"
+        datatype = p.get("datatype", "string")
+        # Reserve a globally-unique measure and a table whose display column shares its name.
+        measure_name = _uniquify_reserved(caption + " Value", reserved)
+        table_name = _uniquify_reserved(caption, reserved, prefer_suffix=" Parameter")
+        column_name = table_name
+        tmdl, _dtype, warn = _emit_one_value_param(p, table_name, column_name, measure_name)
+        if tmdl is None:
+            reserved.discard(measure_name.lower())
+            reserved.discard(table_name.lower())
+            warnings.append(
+                f"parameter '{caption}' (datatype {datatype}) is not a representable value "
+                f"control (no range/members); left unmodelled and its calcs will stub (=0)")
+            continue
+        warnings.extend(warn)
+        fn = _safe_filename(table_name)
+        base, ext = (fn[:-5], ".tmdl") if fn.endswith(".tmdl") else (fn, "")
+        final, i = fn, 2
+        while final.lower() in used_files:
+            final, i = f"{base}_{i}{ext}", i + 1
+        used_files.add(final.lower())
+        parts.append((final, tmdl))
+        table_names.append(table_name)
+        measure_names.append(measure_name)
+        ref = dax_ref(None, measure_name, measure=True)
+        for k in _param_keys(p):
+            resolver_map[k] = ref
+
+    def param_resolver(name):
+        return resolver_map.get((name or "").strip().lower())
+
+    return {"parts": parts, "table_names": table_names, "measure_names": measure_names,
+            "param_resolver": param_resolver, "warnings": warnings}
 
 
 def extract_field_swap_calcs(xml):
