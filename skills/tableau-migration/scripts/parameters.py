@@ -303,6 +303,9 @@ def _emit_one_value_param(param, table_name, measure_name):
 _FIELD_ONLY = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 _NUMERIC_LITERAL = re.compile(r"^-?\d+(?:\.\d+)?$")
 _INVALID_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# A swap branch's compared value must be a lone literal (quoted string or number); a
+# compound/typed condition (``... AND ...``, another comparison) is NOT a clean swap.
+_SIMPLE_MEMBER = re.compile(r"""^\s*("[^"]*"|'[^']*'|-?\d+(?:\.\d+)?)\s*$""")
 
 
 def dax_ref(table, field, *, measure=False):
@@ -385,20 +388,41 @@ def _detect_case_swap(f, role):
             "role": (role or "measure").lower(), "form": "case"}
 
 
+def _parse_if_condition(cond):
+    """Pull ``(controller, member_value)`` from a single IF-branch condition that compares
+    ``[Parameters].[X]`` to a simple literal, accepting EITHER operand order
+    (``[Parameters].[X] = "A"`` or ``"A" = [Parameters].[X]``). Returns ``None`` for
+    compound/typed conditions (``AND``/``OR``, a non-literal value, a field-to-field
+    comparison) so non-swap IFs fall through to normal translation."""
+    c = cond.strip()
+    m = re.match(r"(?is)^\[Parameters\]\.\[([^\]]+)\]\s*=\s*(.+)$", c)
+    if m and _SIMPLE_MEMBER.match(m.group(2)):
+        return m.group(1).strip(), m.group(2).strip()
+    m = re.match(r"(?is)^(.+?)\s*=\s*\[Parameters\]\.\[([^\]]+)\]$", c)
+    if m and _SIMPLE_MEMBER.match(m.group(1)):
+        return m.group(2).strip(), m.group(1).strip()
+    return None
+
+
 def _detect_if_swap(f, role):
-    body = re.sub(r"(?is)\bend\b\s*$", "", f).strip()
+    # Tableau accepts both one-word ``ELSEIF`` and two-word ``ELSE IF`` (a nested IF, each
+    # closed by its own END). Normalise ``ELSE IF`` -> ``ELSEIF`` and strip the resulting run
+    # of trailing ENDs so both spellings parse identically.
+    norm = re.sub(r"(?is)\belse\s+if\b", "ELSEIF", f)
+    body = re.sub(r"(?is)(?:\s*\bend\b)+\s*$", "", norm).strip()
     body = re.sub(r"(?is)^if\b\s*", "", body)
     segs = re.split(r"(?is)\belseif\b", body)
     branches, else_field, controllers = [], None, []
     for i, seg in enumerate(segs):
         parts = re.split(r"(?is)\belse\b", seg)
-        m = re.match(
-            r"(?is)^\s*\[Parameters\]\.\[([^\]]+)\]\s*=\s*(.+?)\s*\bthen\b\s*\[([^\]]+)\]\s*$",
-            parts[0])
+        m = re.match(r"(?is)^\s*(.+?)\s*\bthen\b\s*\[([^\]]+)\]\s*$", parts[0])
         if not m:
             return None
-        controllers.append(m.group(1).strip())
-        branches.append({"label": _unescape_member(m.group(2).strip()), "field": m.group(3).strip()})
+        cond = _parse_if_condition(m.group(1))
+        if not cond:
+            return None
+        controllers.append(cond[0])
+        branches.append({"label": _unescape_member(cond[1]), "field": m.group(2).strip()})
         if len(parts) > 1:
             if i != len(segs) - 1 or len(parts) > 2:
                 return None

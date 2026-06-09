@@ -69,6 +69,35 @@ def test_detect_if_elseif_else_swap():
     assert [b["field"] for b in sw["branches"]] == ["Segment", "Region", "Sales"]
 
 
+def test_detect_if_two_word_else_if_swap():
+    # Tableau's two-word ``ELSE IF`` is a nested IF (each closed by its own END); it must
+    # parse identically to the one-word ELSEIF form.
+    f = ('IF [Parameters].[p] = "A" THEN [Segment] ELSE IF [Parameters].[p] = "B" THEN [Region] '
+         'ELSE [Sales] END END')
+    sw = P.detect_field_swap(f, role="dimension")
+    assert sw is not None
+    assert sw["form"] == "if"
+    assert sw["controller"] == "p"
+    assert [b["field"] for b in sw["branches"]] == ["Segment", "Region", "Sales"]
+    assert sw["branches"][-1]["is_else"] is True
+
+
+def test_detect_if_reversed_operand_swap():
+    # Some authors put the literal on the left: ``"A" = [Parameters].[p]``.
+    f = ('IF "A" = [Parameters].[p] THEN [Segment] ELSEIF "B" = [Parameters].[p] THEN [Region] END')
+    sw = P.detect_field_swap(f, role="dimension")
+    assert sw is not None
+    assert sw["controller"] == "p"
+    assert [(b["label"], b["field"]) for b in sw["branches"]] == [
+        ("A", "Segment"), ("B", "Region")]
+
+
+def test_detect_if_rejects_compound_condition():
+    # A compound condition (extra AND clause) is not a clean single-parameter swap.
+    f = 'IF [Parameters].[p] = "A" AND [x] = "y" THEN [Segment] ELSE [Region] END'
+    assert P.detect_field_swap(f, role="dimension") is None
+
+
 @pytest.mark.parametrize("formula", [
     "SUM([Sales]) / SUM([Profit])",                                    # not a CASE/IF at all
     'case [Parameters].[p] when "A" then [Sales] + 1 END',            # branch not a bare field
