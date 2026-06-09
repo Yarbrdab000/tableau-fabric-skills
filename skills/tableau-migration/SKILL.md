@@ -27,7 +27,7 @@ description: >
 > 2. To find the item details (including its ID) from workspace ID, item type, and item name: list all items of that type in that workspace, then use JMESPath filtering.
 > 3. **Column types are driven by the source schema, never guessed.** The DirectLake path types columns from the landed Delta schema; the Import/DirectQuery path types them from the Tableau `.tds` `<metadata-records>`. A datasource with no resolvable column metadata falls back to the land-to-Delta path — it is never deployed with inferred types.
 > 4. **Calculated-field translation is a deterministic safe subset, not full coverage.** Anything outside the subset stays an inert `= 0` stub; the original Tableau formula is ALWAYS preserved as a `TableauFormula` annotation so a human (or an optional validation-gated LLM pass) can finish it. Never claim full DAX parity.
-> 5. **Credentials and on-premises gateways are a manual security boundary.** This skill emits the model, the connection parameters, and the structured **bind inputs** (`connection_details_for_bind`), but the user enters credentials and selects/sets up the gateway, and request construction/execution is delegated to `semantic-model-authoring`. On a credential error, stop and have the user configure the connection.
+> 5. **Credentials and on-premises gateways are a manual security boundary.** This skill emits the model, the connection parameters, and the structured **bind inputs** (`connection_details_for_bind`), and can deploy the model itself via the bundled `scripts/deploy_to_fabric.py` (or delegate to `semantic-model-authoring`) — but the user enters credentials and selects/sets up the gateway. On a credential error, stop and have the user configure the connection.
 
 # Tableau → Microsoft Fabric Semantic Model Migration
 
@@ -47,7 +47,7 @@ These companion documents provide general Fabric REST patterns. **Do NOT read th
 - [COMMON-CORE.md](../../common/COMMON-CORE.md) — General Fabric REST API patterns, authentication & token audiences, item discovery via JMESPath.
 - [COMMON-CLI.md](../../common/COMMON-CLI.md) — `az rest` / `az login` CLI patterns, authentication recipes.
 
-> **This skill delegates model deploy / edit / refresh / best-practice analysis and connection binding to the `semantic-model-authoring` skill, and DAX round-trip validation to `semantic-model-consumption` (FabricIQ `ExecuteQuery`).** It owns the Tableau-side reconstruction (datasource → TMDL, calc → DAX, connection → M); it does not re-implement model deployment.
+> **This skill can deploy the model itself via the bundled `scripts/deploy_to_fabric.py`, or delegate model deploy / edit / refresh / best-practice analysis and connection binding to the `semantic-model-authoring` skill, with DAX round-trip validation via `semantic-model-consumption` (FabricIQ `ExecuteQuery`).** It owns the Tableau-side reconstruction (datasource → TMDL, calc → DAX, connection → M).
 
 ---
 
@@ -99,8 +99,9 @@ The pure-Python cores are offline, deterministic, and stdlib-only (no Spark / pa
 | [`scripts/storage_mode.py`](scripts/storage_mode.py) | Per-datasource storage-mode auto-selection (pure policy). |
 | [`scripts/connection_to_m.py`](scripts/connection_to_m.py) | Parse Tableau `.tds` → descriptor; emit M partitions + bind details; M-path field resolver. |
 | [`scripts/assemble_model.py`](scripts/assemble_model.py) | Tier-1 orchestrator: `.tds` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`), base64 deploy payload. |
+| [`scripts/deploy_to_fabric.py`](scripts/deploy_to_fabric.py) | Self-contained Fabric REST deploy (stdlib-only urllib): createOrUpdate / updateDefinition of the SemanticModel, 202 LRO polling, optional refresh + gateway bind. Lets the skill finish **in Fabric** without depending on a peer skill. |
 
-Run the test suite with `pytest` from `skills/tableau-migration/` (587 offline assertions).
+Run the test suite with `pytest` from `skills/tableau-migration/` (636 offline assertions).
 
 ---
 
@@ -130,7 +131,7 @@ This skill rebuilds Tableau artifacts via REST APIs — no Tableau or Fabric UI 
 | Phase 3 | Schema + fields | TMDL tables, typed columns, relationships | [semantic-model-rebuild.md](resources/semantic-model-rebuild.md) |
 | Phase 4 | Calculated fields | DAX measures (+ preserved formula annotations) | [calc-to-dax.md](resources/calc-to-dax.md) |
 | Phase 5 | Connection | M partitions + Fabric connection bind | [connection-binding.md](resources/connection-binding.md) |
-| Phase 6 | Deploy & refresh | Semantic model (delegate to `semantic-model-authoring`) | [migration-orchestrator.md](resources/migration-orchestrator.md) |
+| Phase 6 | Deploy & refresh | Semantic model (bundled `scripts/deploy_to_fabric.py`; or delegate to `semantic-model-authoring`) | [migration-orchestrator.md](resources/migration-orchestrator.md) |
 | Final | Validation & reconciliation | Verified model | [validation-reconciliation.md](resources/validation-reconciliation.md) |
 | Optional | Security & Governance | — | [security-governance.md](resources/security-governance.md) |
 
@@ -174,7 +175,7 @@ See [storage-mode-selection.md](resources/storage-mode-selection.md) for the ful
 - **Preserve every original Tableau formula** as a `TableauFormula` annotation on its measure, translated or not. This is the audit/repair safety net.
 - **Fall back to land-to-Delta + DirectLake** for any datasource shape that cannot be rebuilt directly: join/union relation trees, multiple named connections, unmapped connectors, or missing column metadata.
 - **Run Play 3 (land data as Delta) before generating a DirectLake model** — DirectLake binds to OneLake Delta, so the tables must exist first.
-- **Delegate deploy / bind / refresh / best-practice analysis** to `semantic-model-authoring`; do not hand-roll model deployment when that skill is available.
+- **Deploy with the bundled `scripts/deploy_to_fabric.py`** (self-contained Fabric REST) so the migration finishes in Fabric without a peer-skill dependency; **or delegate deploy / bind / refresh / best-practice analysis** to `semantic-model-authoring` when that skill is available. Either way, do not hand-roll the `createItem` request inline.
 - **Validate translated measures** by reconciling `ExecuteQuery` results against Tableau VDS values before declaring parity (see [validation-reconciliation.md](resources/validation-reconciliation.md)).
 
 ### PREFER
@@ -290,7 +291,7 @@ Full guide in [migration-gotchas.md](resources/migration-gotchas.md).
 See [validation-reconciliation.md](resources/validation-reconciliation.md). The migration is validated by:
 
 1. **Structural** — model deploys and refreshes (DirectLake frames / Import loads / DirectQuery connects) without error.
-2. **Translation self-tests** — `pytest` runs the 587 offline assertions (translator subset + fallbacks + TMDL render + storage-mode policy + `.tds` parsing).
+2. **Translation self-tests** — `pytest` runs the 636 offline assertions (translator subset + fallbacks + TMDL render + storage-mode policy + `.tds` parsing + deploy payload builders).
 3. **Value reconciliation (highest value)** — run each translated measure via `semantic-model-consumption` (`ExecuteQuery`) and compare to the Tableau VDS value pulled by the profiler. A measure is "verified" only when the numbers match.
 
 ---
@@ -313,7 +314,7 @@ See [migration-report.md](resources/migration-report.md). Every run produces an 
 
 ## Post-Migration: What's Next
 
-1. **Deploy & manage** the model with `semantic-model-authoring` (best-practice analysis, refresh, edits).
+1. **Deploy** with the bundled `scripts/deploy_to_fabric.py` (self-contained Fabric REST), or **deploy & manage** with `semantic-model-authoring` when available (best-practice analysis, refresh, edits).
 2. **Query & explore** with `semantic-model-consumption` and `fabriciq` (natural-language analysis over the migrated model).
 3. **Repair stubs** — work the migration report's stub list, optionally with the validation-gated LLM pass.
 4. **(v2) Rebuild reports** — once measures are trusted, regenerate Tableau worksheets/dashboards as Power BI report pages (roadmap).

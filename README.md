@@ -12,6 +12,37 @@ original formula), and auto-select a storage mode per datasource so the rebuilt 
 its original upstream source (or falls back to land-to-Delta + DirectLake when a direct rebuild is not safe).
 Worksheet / dashboard → Power BI report translation is **roadmap (v2)**.
 
+## Install
+
+This is an **agent skill**: install it into a *code-executing* Copilot (GitHub Copilot CLI, VS Code Copilot,
+Claude Code, Cursor, …). The agent reads `SKILL.md`, and its `description` triggers (e.g. *"migrate from
+tableau"*, *"tableau to fabric"*, *"convert tableau calculation to dax"*) fire automatically — so once it's
+installed you just describe the migration and the Copilot drives it (including a self-contained Fabric deploy).
+
+> M365 / Office Copilot is **not** a target — it can't execute the scripts. Use a coding-agent Copilot.
+
+**Option A — One command (GitHub Copilot CLI plugin marketplace):**
+
+```text
+/plugin marketplace add Yarbrdab000/tableau-migration-skill
+/plugin install tableau-migration@tableau-migration-marketplace
+```
+
+**Option B — Manual copy (works in any agent):** clone, then drop the skill folder where your agent discovers skills.
+
+```bash
+git clone https://github.com/Yarbrdab000/tableau-migration-skill.git
+```
+
+| Agent | Copy `skills/tableau-migration/` to |
+|---|---|
+| GitHub Copilot CLI / VS Code | your repo's `.github/skills/tableau-migration/` |
+| Claude Code | `.claude/skills/tableau-migration/` |
+| Cursor / Windsurf / Codex | anywhere in the repo, then point the agent at `skills/tableau-migration/SKILL.md` |
+
+Then start a chat and say e.g. *"migrate my Tableau Superstore datasource to a Fabric semantic model."*
+The only Python requirement is **3.11+** (the scripts are stdlib-only — no pip install needed to run them).
+
 ## Layout
 
 ```
@@ -36,6 +67,8 @@ All scripts are deterministic, offline, and stdlib-only (no Spark / pandas requi
 | `field_resolver.py` | Caption → column resolver for the DirectLake (landed-Delta) path. |
 | `storage_mode.py` | Per-datasource storage-mode auto-selection (pure policy). |
 | `connection_to_m.py` | Parse Tableau `.tds` → descriptor; emit M partitions + bind details. |
+| `assemble_model.py` | Orchestrator: `.tds` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`). |
+| `deploy_to_fabric.py` | Self-contained Fabric REST deploy (stdlib-only): createOrUpdate / updateDefinition, 202 LRO polling, optional refresh + gateway bind — finishes the migration **in Fabric** without a peer-skill dependency. |
 
 ## Tests
 

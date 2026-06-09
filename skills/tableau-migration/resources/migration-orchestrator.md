@@ -33,7 +33,7 @@ Phase 2  Storage mode .......... select_storage_mode(descriptor) -> Import | Dir
 Phase 3  Rebuild model ......... TMDL tables + typed columns + inferred relationships
 Phase 4  Calc -> DAX ........... translate the safe subset; preserve every formula as annotation
 Phase 5  Connection ............ emit M partitions + bind the Fabric Data Connection
-Phase 6  Deploy & refresh ...... DELEGATE to semantic-model-authoring
+Phase 6  Deploy & refresh ...... bundled deploy_to_fabric.py (or DELEGATE to semantic-model-authoring)
 Final    Validate ............... reconcile ExecuteQuery vs VDS ; emit the migration report
 ```
 
@@ -110,11 +110,29 @@ See `calc-to-dax.md`.
 Emit the M partition(s) and connection parameters, then bind the Fabric Data Connection (delegated). See
 `connection-binding.md`. Credentials and any on-prem gateway stay with the user.
 
-## Phase 6 — Deploy & refresh (delegate)
+## Phase 6 — Deploy & refresh
 
-> **Delegate to `semantic-model-authoring`** for createOrUpdate of the TMDL model, best-practice analysis
-> on the translated measures, connection binding, and refresh. Do not hand-roll Fabric `createItem` when
-> that skill is available.
+**Two paths — pick one:**
+
+**A. Self-contained (bundled).** Deploy straight to Fabric with `scripts/deploy_to_fabric.py` (stdlib-only
+Fabric REST — `createOrUpdate` / `updateDefinition`, 202 LRO polling, optional refresh + gateway bind):
+
+```bash
+# Dry run first — read the model folder, build the payload, print the plan (no network):
+py -3.11 scripts/deploy_to_fabric.py --model-dir <ModelFolder>.SemanticModel --workspace "<workspace>" --dry-run
+
+# Real deploy (token from --token, env var, or --use-az → `az account get-access-token`):
+py -3.11 scripts/deploy_to_fabric.py --model-dir <ModelFolder>.SemanticModel --workspace "<workspace>" --refresh
+```
+
+Inside a **Fabric notebook**, get a token with no `az login`:
+`notebookutils.credentials.getToken("https://api.fabric.microsoft.com")` → pass to `deploy_model(token=...)`.
+
+**B. Delegate.** Use `semantic-model-authoring` for `createOrUpdate` of the TMDL model, best-practice analysis
+on the translated measures, connection binding, and refresh.
+
+> **Either path:** entering connection **credentials** and selecting/setting up an on-prem **gateway** stay
+> manual (security boundary). The deploy step links connection IDs only — it never enters credentials.
 
 ## Final — Validate & report
 

@@ -1,0 +1,36 @@
+{
+  "name": "tableau-migration-marketplace",
+  "metadata": {
+    "description": "Tableau -> Microsoft Fabric / Power BI migration skill for code-executing Copilots (GitHub Copilot CLI, Claude Code, Cursor)",
+    "version": "0.1.0"
+  },
+  "owner": {
+    "name": "Yarbrdab000",
+    "email": "noreply@github.com"
+  },
+  "plugins": [
+    {
+      "name": "tableau-migration",
+      "source": ".",
+      "description": "Rebuild Tableau datasources as Microsoft Fabric / Power BI semantic models: typed TMDL, inferred relationships, deterministic calc -> DAX (preserving every original formula), storage-mode auto-selection, and a self-contained Fabric REST deploy.",
+      "version": "0.1.0",
+      "skills": [
+        "./skills/tableau-migration"
+      ],
+      "agents": [],
+      "mcpServers": {},
+      "repository": "https://github.com/Yarbrdab000/tableau-migration-skill",
+      "keywords": [
+        "tableau",
+        "fabric",
+        "microsoft-fabric",
+        "power-bi",
+        "semantic-model",
+        "tmdl",
+        "dax",
+        "migration"
+      ],
+      "license": "MIT"
+    }
+  ]
+}
