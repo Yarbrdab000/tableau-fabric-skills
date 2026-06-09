@@ -231,6 +231,20 @@ def test_extract_calculations_dedupes_and_tolerates_bom_and_garbage():
     assert extract_calculations("<broken") == ([], [])
 
 
+def test_extract_calculations_skips_embedded_parameters():
+    # A Tableau parameter embedded in a real datasource as a <column param-domain-type=..>
+    # whose <calculation> formula is just its default value -- it must NOT become a measure.
+    xml = ("<datasource>"
+           "<column caption='Real Measure' role='measure'><calculation formula='SUM([Sales])'/></column>"
+           "<column caption='measure parameter' name='[Parameter 1]' role='measure' "
+           "param-domain-type='list'><calculation class='tableau' formula='1.'/></column>"
+           "</datasource>")
+    calcs, skipped = extract_calculations(xml)
+    assert [c["name"] for c in calcs] == ["Real Measure"]
+    assert any(s["name"] == "measure parameter" and "parameter" in s["reason"].lower()
+               for s in skipped)
+
+
 # -- LocalFilesSource ----------------------------------------------------------
 def test_local_files_source_enumeration_and_naming(fixtures_dir):
     src = LocalFilesSource(fixtures_dir)

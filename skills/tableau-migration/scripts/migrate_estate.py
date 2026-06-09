@@ -361,6 +361,12 @@ def extract_calculations(xml_text):
         formula = calc_el.get("formula") or ""
         role = (col.get("role") or "measure").lower()
 
+        if col.get("param-domain-type") is not None:
+            # A Tableau PARAMETER embedded as a column (its `<calculation>` formula is just the
+            # default value, e.g. `"Sub Category"`). Parameters are handled by the parameter
+            # translator, never emitted as measures -- otherwise they become phantom constants.
+            skipped.append({"name": caption, "reason": "Tableau parameter (not a measure)"})
+            continue
         if cls == "categorical-bin" or not formula.strip():
             skipped.append({"name": caption, "reason": "no formula / bin calculation"})
             continue

@@ -616,6 +616,8 @@ def extract_field_swap_calcs(xml):
     except ET.ParseError:
         return out
     for col in (e for e in root.iter() if _localname(e.tag) == "column"):
+        if col.get("param-domain-type") is not None:
+            continue  # a Tableau parameter, not a swap calc
         calc_el = next((c for c in list(col) if _localname(c.tag) == "calculation"), None)
         if calc_el is None:
             continue
