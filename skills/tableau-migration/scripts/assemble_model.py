@@ -36,6 +36,7 @@ try:  # package or scripts-on-path
     from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from .calc_to_dax import translate_tableau_calc_to_dax
     from . import tmdl_generate as T
+    from . import parameters as PARAMS
 except ImportError:
     from connection_to_m import (
         build_m_field_resolver,
@@ -46,6 +47,7 @@ except ImportError:
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from calc_to_dax import translate_tableau_calc_to_dax
     import tmdl_generate as T
+    import parameters as PARAMS
 
 
 def _table_display(rel):
@@ -118,16 +120,21 @@ def _generate_model_tmdl_import(table_names, expression_names, role_names=None):
     )
 
 
-def _measures_part(calcs, resolve):
+def _measures_part(calcs, resolve, consumed=None):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
-    ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Returns
-    ``(measures_table_tmdl, report)`` where report rows record translated/stub status.
+    ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
+    ``consumed`` (case-insensitive) are skipped -- they have already become field-parameter
+    tables and must NOT also be emitted as measures. Returns ``(measures_table_tmdl, report)``
+    where report rows record translated/stub status.
     """
+    consumed_lower = {(c or "").lower() for c in (consumed or set())}
     measures_tmdl = ""
     report = []
     for calc in calcs or []:
         name, formula = calc["name"], calc.get("formula", "")
+        if name.lower() in consumed_lower:
+            continue
         dax, reason, _ = translate_tableau_calc_to_dax(formula, resolve)
         measures_tmdl += T.generate_measure_tmdl(name, formula, dax)
         report.append({
@@ -173,6 +180,55 @@ def _apply_enrichment(parts, *, hierarchies=None, display_folders=None, rls_role
             parts[f"definition/roles/{fname}.tmdl"] = T.generate_role_tmdl(role)
             role_names.append(role["name"])
     return role_names
+
+
+def _resolve_to_locator(resolve):
+    """Adapt a ``resolve_field(caption) -> (table, column, type)`` resolver into the
+    ``field_locator(field) -> (table, column, is_measure)`` shape ``parameters`` expects.
+    Import/DirectLake data-table fields are always columns, so ``is_measure`` is ``False``."""
+    def loc(field):
+        try:
+            r = resolve(field)
+        except Exception:
+            r = None
+        return (r[0], r[1], False) if r else None
+    return loc
+
+
+def _label_aliases_by_controller(parameters):
+    """``{controller-key -> {literal: alias}}`` so a measure-swap selector like ``1`` can be
+    labelled with its Tableau alias (e.g. ``1 -> "Sales"``). Keyed by every name a swap calc's
+    controller might use (caption, bracketed and bare internal name)."""
+    out = {}
+    for p in (parameters or []):
+        aliases = p.get("aliases") or {}
+        if not aliases:
+            continue
+        raw = (p.get("internal_name") or "").strip()
+        for key in {(p.get("caption") or "").strip().lower(), raw.lower(),
+                    raw.strip("[]").strip().lower()}:
+            if key:
+                out[key] = aliases
+    return out
+
+
+def _inject_field_param_tables(parts, table_names, fp_parts, fp_names):
+    """Write field-parameter table parts and register their names just BEFORE ``_Measures``.
+
+    Field-parameter tables are additive, disconnected scaffolding (a slicer-driven selector);
+    like the Date table and ``_Measures`` they go in ``model.tmdl``'s table list but are NEVER
+    wired into ``relationships.tmdl``.
+    """
+    for filename, tmdl in fp_parts:
+        parts[f"definition/tables/{filename}"] = tmdl
+    if not fp_names:
+        return
+    if "_Measures" in table_names:
+        idx = table_names.index("_Measures")
+        for offset, nm in enumerate(fp_names):
+            table_names.insert(idx + offset, nm)
+    else:
+        table_names.extend(fp_names)
 
 
 def _select_primary_date(date_cols):
@@ -258,7 +314,8 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
 
 def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=None,
                           hierarchies=None, display_folders=None, rls_roles=None,
-                          date_table=True, mark_as_date=True, flatfile_path=None):
+                          date_table=True, mark_as_date=True, flatfile_path=None,
+                          parameters=None):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -306,7 +363,18 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
         )
 
     resolve = build_m_field_resolver(descriptor)
-    measures_table, measure_report = _measures_part(calcs, resolve)
+
+    # Field parameters: a Tableau `CASE/IF [Parameters].[X] WHEN <lit> THEN [fieldA] ...` calc that
+    # *swaps fields* becomes a Power BI field-parameter table (consumed here, NOT emitted as a
+    # measure). Detection is fail-closed: a calc only converts when every branch resolves to a model
+    # column and >= 2 survive; otherwise it falls through to normal translation (a preserved stub).
+    fp = PARAMS.emit_field_parameters(
+        calcs, field_locator=_resolve_to_locator(resolve),
+        existing_tables=list(table_names) + ["_Measures"],
+        label_aliases_by_controller=_label_aliases_by_controller(parameters))
+    _inject_field_param_tables(parts, table_names, fp["parts"], fp["table_names"])
+
+    measures_table, measure_report = _measures_part(calcs, resolve, consumed=fp["consumed"])
     parts["definition/tables/_Measures.tmdl"] = measures_table
     table_names.append("_Measures")
 
@@ -346,13 +414,16 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
         "relationships": relationships or [],
         "date_table": date_report,
         "roles": [r["name"] for r in rls_roles or []],
+        "field_parameters": {"tables": fp["table_names"], "consumed": sorted(fp["consumed"]),
+                             "warnings": fp["warnings"]},
     }
     return {"parts": parts, "report": report}
 
 
 def assemble_directlake_model(*, model_name, tables, measures_tmdl, expression_name,
                               directlake_url, relationships_tmdl=None,
-                              hierarchies=None, display_folders=None, rls_roles=None):
+                              hierarchies=None, display_folders=None, rls_roles=None,
+                              field_parameters=None):
     """Assemble a DirectLake model from ALREADY-LANDED Delta tables (the fallback path).
 
     ``tables`` is a list of ``(display_name, delta_table_name, columns_tmdl)`` tuples (the
@@ -364,6 +435,11 @@ def assemble_directlake_model(*, model_name, tables, measures_tmdl, expression_n
     same RESOLVED model objects as ``assemble_import_model`` (keyed by the caller's display
     names and the landed Delta column names). They default to ``None`` so existing callers
     are unaffected.
+
+    ``field_parameters`` is an ``emit_field_parameters`` result (``{"parts": [(filename, tmdl)],
+    "table_names": [...]}``) the caller built from its swap calcs; its tables are injected as
+    additive scaffolding (before ``_Measures``, never in relationships). The caller is responsible
+    for excluding the consumed swap calcs from ``measures_tmdl``.
     """
     parts = {}
     table_names = []
@@ -374,6 +450,10 @@ def assemble_directlake_model(*, model_name, tables, measures_tmdl, expression_n
     if measures_tmdl is not None:
         parts["definition/tables/_Measures.tmdl"] = T.generate_measures_table_tmdl(measures_tmdl)
         table_names.append("_Measures")
+    if field_parameters:
+        _inject_field_param_tables(parts, table_names,
+                                   field_parameters.get("parts") or [],
+                                   field_parameters.get("table_names") or [])
     parts["definition/expressions.tmdl"] = T.generate_expressions_tmdl(expression_name, directlake_url)
     if relationships_tmdl:
         parts["definition/relationships.tmdl"] = relationships_tmdl
@@ -419,7 +499,8 @@ def write_model_folder(parts, dest_dir):
 
 def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relationships=None,
                                   hierarchies=None, display_folders=None, rls_roles=None,
-                                  date_table=True, mark_as_date=True, flatfile_path=None):
+                                  date_table=True, mark_as_date=True, flatfile_path=None,
+                                  parameters=None):
     """One-call convenience: parse ``.tds`` text and assemble the Import/DirectQuery model.
 
     Model objects (hierarchies, display folders, RLS roles) are AUTO-DERIVED from the
@@ -436,6 +517,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relations
     descriptor = parse_tds(tds_text)
     if relationships is None:
         relationships = descriptor.get("relationships") or []
+    if parameters is None:
+        parameters = PARAMS.parse_parameters(tds_text)
     enrichment_report = None
     if hierarchies is None and display_folders is None and rls_roles is None:
         parsed = T.parse_model_objects(tds_text)
@@ -453,7 +536,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relations
                                    calcs=calcs, relationships=relationships,
                                    hierarchies=hierarchies, display_folders=display_folders,
                                    rls_roles=rls_roles, date_table=date_table,
-                                   mark_as_date=mark_as_date, flatfile_path=flatfile_path)
+                                   mark_as_date=mark_as_date, flatfile_path=flatfile_path,
+                                   parameters=parameters)
     if enrichment_report is not None:
         result["report"]["model_objects"] = enrichment_report
     return result
