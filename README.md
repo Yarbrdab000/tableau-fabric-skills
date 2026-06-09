@@ -50,6 +50,17 @@ The only Python requirement is **3.11+** (the scripts are stdlib-only — no pip
 > use the folder copy above, which always works. A marketplace manifest is included in the repo for
 > clients that do support it.
 
+### Updating an installed copy
+
+The skill ships a version stamp at `skills/tableau-migration/VERSION` and a self-update runbook the
+agent can execute. To upgrade, just tell your Copilot **"check for updates / update the tableau-migration
+skill"** — it reads the installed `VERSION`, compares it against this repo, and (if newer) reinstalls by
+overwriting `scripts/` + `resources/` + `SKILL.md` wholesale, verifies the result (asserts key functions
+exist + runs the tests), and reports the version delta (`1.0.0 → 1.1.0`). Full procedure:
+[`skills/tableau-migration/resources/self-update.md`](skills/tableau-migration/resources/self-update.md).
+Because skills load at session start, start a **new** chat for the update to take effect. If your client
+supports `gh skill`, `gh skill update tableau-migration` is an equivalent managed path.
+
 ## Layout
 
 ```

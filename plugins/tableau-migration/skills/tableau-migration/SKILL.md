@@ -16,11 +16,11 @@ description: >
   "tableau calculated field to dax", "rebuild tableau datasource in fabric".
 ---
 
-> **Update Check — optional, once per session**
-> If a **check-updates** skill is installed alongside this one, run it the first time this skill is used in a session. This skill is commonly installed **standalone**, in which case there is no `check-updates` skill or `package.json` — **skip this silently and proceed to the migration.** It is not required and must never block the workflow.
-> - **GitHub Copilot CLI / VS Code**: invoke the `check-updates` skill only if it appears in your available skills; otherwise skip.
-> - **Claude Code / Cursor / Windsurf / Codex**: if this skill was cloned from its repo, you may compare the local `package.json` version against `git show origin/main:package.json`. If neither is present, skip.
-> - Skip if already checked this session, or if no update mechanism is available.
+> **Updating this skill — only when the user asks**
+> There is **no** mandatory per-session update check. When the user asks to *check for updates / update / upgrade / refresh the `tableau-migration` skill* (or "update yourself"), follow [`resources/self-update.md`](resources/self-update.md). It is a **version-aware reinstaller**, not a guess:
+> - **Source of truth:** repo `https://github.com/Yarbrdab000/tableau-migration-skill`, skill subpath `skills/tableau-migration`, version stamp `skills/tableau-migration/VERSION`. **Install target** (Copilot user scope) `~/.copilot/skills/tableau-migration` — or the folder this `SKILL.md` was loaded from.
+> - **Compare, then act:** read installed `VERSION` → read remote `VERSION` → only reinstall if remote is newer (or the user forces). Install is an **explicit wholesale overwrite** (`scripts/` + `resources/` + `SKILL.md` + `VERSION`), then a **fail-loud verification** (assert `migrate_datasource` / `extract_calcs` / `fetch_tds` exist + run `pytest`; on failure, restore the backup and stop). Finish by reporting the delta (`1.2.0 → 1.4.0`).
+> - **Mid-session caveat:** skills load at session start, so the update is not live until a **new** session.
 
 > **CRITICAL NOTES**
 > 1. To find the workspace details (including its ID) from a workspace name: list all workspaces, then use JMESPath filtering.
@@ -73,6 +73,7 @@ This skill is **self-contained** — the bundled scripts cover the full migratio
 | Migration Gotchas | [migration-gotchas.md](resources/migration-gotchas.md) |
 | Security & Governance | [security-governance.md](resources/security-governance.md) |
 | Migration Report | [migration-report.md](resources/migration-report.md) |
+| Updating / upgrading this skill | [self-update.md](resources/self-update.md) |
 | Feature Parity Reference | [§ Feature Parity Reference](#feature-parity-reference) + [feature-parity.md](resources/feature-parity.md) |
 | Must / Prefer / Avoid | [§ Must / Prefer / Avoid](#must--prefer--avoid) |
 
@@ -91,6 +92,7 @@ This skill is **self-contained** — the bundled scripts cover the full migratio
 | Troubleshooting failures | [migration-gotchas.md](resources/migration-gotchas.md) | ~120 |
 | Production security setup | [security-governance.md](resources/security-governance.md) | ~110 |
 | Generating the migration report | [migration-report.md](resources/migration-report.md) | ~90 |
+| User asks to **update / upgrade this skill** | [self-update.md](resources/self-update.md) | ~110 |
 | Feature parity / what is NOT migrated | [feature-parity.md](resources/feature-parity.md) | ~80 |
 
 ### Bundled Scripts
