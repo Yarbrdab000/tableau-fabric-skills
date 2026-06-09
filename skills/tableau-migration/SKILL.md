@@ -42,10 +42,7 @@ model-object enrichment (hierarchies / display folders / RLS). See
 
 ## Prerequisite Knowledge
 
-These companion documents provide general Fabric REST patterns. **Do NOT read them upfront** — reference only when a phase needs a pattern not already covered here:
-
-- [COMMON-CORE.md](../../common/COMMON-CORE.md) — General Fabric REST API patterns, authentication & token audiences, item discovery via JMESPath.
-- [COMMON-CLI.md](../../common/COMMON-CLI.md) — `az rest` / `az login` CLI patterns, authentication recipes.
+This skill is **self-contained** — the bundled scripts cover the full migration (parse → TMDL → calc→DAX → connection → deploy). Fabric token audiences and the deploy REST flow are documented inline below and in `scripts/deploy_to_fabric.py`. When the optional peer skills (`semantic-model-authoring`, `semantic-model-consumption`) are installed alongside this one, they provide deeper general-Fabric REST / `az` references and best-practice analysis — but they are **not required**.
 
 > **This skill can deploy the model itself via the bundled `scripts/deploy_to_fabric.py`, or delegate model deploy / edit / refresh / best-practice analysis and connection binding to the `semantic-model-authoring` skill, with DAX round-trip validation via `semantic-model-consumption` (FabricIQ `ExecuteQuery`).** It owns the Tableau-side reconstruction (datasource → TMDL, calc → DAX, connection → M).
 
@@ -117,7 +114,7 @@ This skill rebuilds Tableau artifacts via REST APIs — no Tableau or Fabric UI 
 | Fabric REST API (deploy, bind) | `https://api.fabric.microsoft.com` |
 | Power BI dataset refresh | `https://analysis.windows.net/powerbi/api` |
 
-> Use the token-acquisition recipe in [COMMON-CLI § Authentication Recipes](../../common/COMMON-CLI.md#authentication-recipes) for the Fabric/Power BI audiences. Tableau tokens come from the source Tableau Server/Cloud.
+> The bundled `scripts/deploy_to_fabric.py` acquires the Fabric / Power BI token for you (`--token`, the `FABRIC_TOKEN` env var, or `--use-az` → `az account get-access-token`). Tableau tokens come from the source Tableau Server/Cloud.
 
 > **Source extraction**: the Tableau **Download Data Source** REST API returns a `.tds` (or `.tdsx` zip) — the authoritative source for connection class, server, database, relations, and column types. The **Metadata API** (GraphQL) supplies datasource/field/lineage metadata. The **VizQL Data Service** supplies real values used for reconciliation. Treat all downloaded artifacts as **sensitive plaintext**.
 
@@ -180,7 +177,7 @@ See [storage-mode-selection.md](resources/storage-mode-selection.md) for the ful
 
 ### PREFER
 - **The lowest-friction storage mode per datasource** (extract→Import, live→DirectQuery) over forcing one mode across the estate.
-- **`DIVIDE()` over `/`** and fully qualified `'Table'[Column]` references in generated DAX — align to [`semantic-model-authoring` dax-guidelines](../semantic-model-authoring/references/dax-guidelines.md) so measures pass best-practice analysis.
+- **`DIVIDE()` over `/`** and fully qualified `'Table'[Column]` references in generated DAX — the translator already emits these, aligning to standard Power BI DAX best practices (and `semantic-model-authoring`'s dax-guidelines when that peer skill is installed) so measures pass best-practice analysis.
 - **DirectQuery native query with `[EnableFolding=true]`** for custom SQL so the query folds to the source.
 - **A validation-gated LLM fallback** (opt-in) for stub measures — attempt a translation grounded by the preserved formula + DAX guidelines, accept it **only** if reconciliation passes, otherwise keep the inert stub.
 

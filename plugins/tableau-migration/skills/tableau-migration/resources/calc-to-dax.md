@@ -290,6 +290,5 @@ real calcs to that fixture as they are discovered — each is reconciled the sam
 ## DAX quality alignment (delegated)
 
 The translator already prefers `DIVIDE()` over `/` and fully qualifies every column as `'Table'[Column]`,
-matching `semantic-model-authoring`'s
-[dax-guidelines](../../semantic-model-authoring/references/dax-guidelines.md). After deploy, run that skill's
+matching `semantic-model-authoring`'s dax-guidelines (when that peer skill is installed). After deploy, run that skill's
 best-practice analysis on the translated measures so they pass DAX BPA out of the box.

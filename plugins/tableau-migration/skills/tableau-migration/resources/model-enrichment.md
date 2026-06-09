@@ -215,4 +215,4 @@ rls_roles       = [{"name": "Region Access",
 The hierarchy / role / displayFolder grammar comes from Microsoft's official TMDL documentation (linked
 above). The Tableau drill-path ↔ hierarchy, folder ↔ displayFolder, and user-filter ↔ RLS correspondences
 are factual language-to-language equivalences. No third-party source code, structure, naming, comments, or
-test data were copied. See [`THIRD_PARTY_NOTICES.md`](../../../THIRD_PARTY_NOTICES.md).
+test data were copied. See `THIRD_PARTY_NOTICES.md` at the repository root.

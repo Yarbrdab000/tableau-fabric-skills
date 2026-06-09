@@ -48,7 +48,7 @@ toolkit's Play 2/3) before a model can bind.
 
 - Acquire a Tableau token (PAT name + secret, or Connected-App JWT). Sign in to the REST API to get a
   site-scoped credentials token; keep it out of all output.
-- Acquire a Fabric token for `https://api.fabric.microsoft.com` (see [COMMON-CLI](../../common/COMMON-CLI.md)).
+- Acquire a Fabric token for `https://api.fabric.microsoft.com` (the bundled `scripts/deploy_to_fabric.py` does this via `--token` / `FABRIC_TOKEN` / `--use-az`).
 - Resolve the target Fabric **workspace ID** by listing workspaces and filtering by name (JMESPath).
 
 ## Phase 1 — Extract the source

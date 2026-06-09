@@ -42,7 +42,7 @@ credentials**. The user supplies them when creating/binding the Fabric Data Conn
 | Token | Audience | Notes |
 |---|---|---|
 | Tableau REST/Metadata/VDS | Tableau Server / Cloud | From a PAT (name + secret) or Connected-App JWT; keep out of all output |
-| Fabric REST | `https://api.fabric.microsoft.com` | Acquire via `az` per [COMMON-CLI](../../common/COMMON-CLI.md) |
+| Fabric REST | `https://api.fabric.microsoft.com` | Acquire via `az account get-access-token`, or the bundled `scripts/deploy_to_fabric.py` (`--use-az` / `--token` / `FABRIC_TOKEN`) |
 
 - Acquire tokens at the start (orchestrator Phase 0), keep them in memory, and never write them to disk or
   the report.
