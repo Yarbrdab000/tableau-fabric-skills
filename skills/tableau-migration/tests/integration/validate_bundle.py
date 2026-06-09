@@ -163,12 +163,13 @@ def parse_model_tables(model_dir):
 
 
 def generated_date_tables(model_dir):
-    """Names of synthetic Date-dimension tables (calculated ``CALENDARAUTO()`` calendars).
+    """Names of synthetic Date-dimension tables (calculated calendar tables).
 
     These are ADDITIVE scaffolding the generator injects for date intelligence -- not derived
     from any source relation -- so the source<->bundle faithfulness count excludes them exactly
     like the generated ``_Measures`` table. The signature (a calculated partition sourced from
-    ``CALENDARAUTO()``) is specific enough that a wrongly-calculated SOURCE table is NOT hidden.
+    ``CALENDARAUTO()`` for Import, or a fixed-range ``CALENDAR(DATE(...), DATE(...))`` for
+    DirectQuery) is specific enough that a wrongly-calculated SOURCE table is NOT hidden.
     """
     names = set()
     tdir = os.path.join(model_dir, "definition", "tables")
@@ -179,7 +180,7 @@ def generated_date_tables(model_dir):
             continue
         with open(os.path.join(tdir, fn), encoding="utf-8") as fh:
             text = fh.read()
-        if "CALENDARAUTO()" in text:
+        if "CALENDARAUTO()" in text or "= CALENDAR(DATE(" in text:
             name, _cols, _meas = parse_table_tmdl(text)
             if name:
                 names.add(name)

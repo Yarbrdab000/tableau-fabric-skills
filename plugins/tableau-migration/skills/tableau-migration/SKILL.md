@@ -99,15 +99,18 @@ The pure-Python cores are offline, deterministic, and stdlib-only (no Spark / pa
 
 | Script | Purpose |
 |---|---|
-| `calc_to_dax.py` | Deterministic, typed Tableau calc → DAX translator. Recursive-descent parser: single-field aggregations + arithmetic, `IF`/`ELSEIF`/`IIF` conditionals, comparison + `AND`/`OR`/`NOT`, and `ZN`/`IFNULL`/`ISNULL`; `None` on fallback. |
+| [`scripts/fetch_tds.py`](scripts/fetch_tds.py) | **Tableau-side download** (stdlib-only): REST sign-in (PAT **or** Connected-App JWT), find a published datasource by name, download it, and extract the inner `.tds` from a `.tdsx`. CLI **and** importable (`sign_in`, `resolve_datasource_luid`, `download_datasource`, `inner_tds_from_zip`). Use this instead of hand-writing Tableau REST. |
+| `calc_to_dax.py` | Deterministic, typed Tableau calc → DAX translator. Recursive-descent parser: single-field aggregations + arithmetic, `IF`/`ELSEIF`/`IIF` conditionals, comparison + `AND`/`OR`/`NOT`, and `ZN`/`IFNULL`/`ISNULL`; `None` on fallback. Plus `suggest_assisted_dax` — opt-in idiom suggestions (e.g. argmax-over-a-dimension) emitted for human approval, never silently live. |
 | [`scripts/tmdl_generate.py`](scripts/tmdl_generate.py) | TMDL generators: typed columns, tables, measures, relationship inference, model files. |
 | [`scripts/field_resolver.py`](scripts/field_resolver.py) | Unambiguous caption → column resolver for the DirectLake (landed-Delta) path. |
 | [`scripts/storage_mode.py`](scripts/storage_mode.py) | Per-datasource storage-mode auto-selection (pure policy). |
-| [`scripts/connection_to_m.py`](scripts/connection_to_m.py) | Parse Tableau `.tds` → descriptor; emit M partitions + bind details; M-path field resolver. |
-| [`scripts/assemble_model.py`](scripts/assemble_model.py) | Tier-1 orchestrator: `.tds` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`), base64 deploy payload. |
-| [`scripts/deploy_to_fabric.py`](scripts/deploy_to_fabric.py) | Self-contained Fabric REST deploy (stdlib-only urllib): createOrUpdate / updateDefinition of the SemanticModel, 202 LRO polling, optional refresh + gateway bind. Lets the skill finish **in Fabric** without depending on a peer skill. |
+| [`scripts/connection_to_m.py`](scripts/connection_to_m.py) | Parse Tableau `.tds` → descriptor; **`extract_calcs`** (calculated fields → `calcs=`); emit M partitions + bind details (`connection_details_for_bind`); M-path field resolver. |
+| [`scripts/assemble_model.py`](scripts/assemble_model.py) | Tier-1 orchestrator: `.tds` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`), base64 deploy payload. **One-call `migrate_datasource(.tdsx/.tds/text)` → `{parts, report, bind}`** (auto-extracts calcs); `write_model_folder` / **`write_local_pbip`** for local output. |
+| [`scripts/deploy_to_fabric.py`](scripts/deploy_to_fabric.py) | Self-contained Fabric REST deploy (stdlib-only urllib): createOrUpdate / updateDefinition of the SemanticModel, 202 LRO polling, optional refresh + gateway bind. Importable `acquire_token` (handles `az` on Windows) + `refresh_dataset` for post-deploy ops. Lets the skill finish **in Fabric** without depending on a peer skill. |
 
-Run the test suite with `pytest` from `skills/tableau-migration/` (636 offline assertions).
+For exact signatures and a copy-paste **download → migrate → deploy** snippet, see [public-api.md](resources/public-api.md).
+
+Run the test suite with `pytest` from `skills/tableau-migration/` (700+ offline assertions).
 
 ---
 
@@ -224,6 +227,38 @@ measure 'Profit Bucket' = 0
     annotation TableauFormula = IF [Profit] > 0 THEN "Gain" ELSE "Loss" END
 ```
 
+**Assisted translation → labeled suggestion → human approval (opt-in)**
+
+When a calc falls back to a stub, an **idiom registry** (`suggest_assisted_dax`) is consulted for
+higher-level patterns whose faithful DAX is a *semantic* rewrite — e.g. **argmax-over-a-dimension**
+("the city with the most sales", `IF [max city sales] = {FIXED [State],[City]:SUM([Sales])} THEN [City] END`).
+A match is emitted as a **non-binding suggestion** on the still-inert measure — never silently live —
+and surfaced in `report["assisted_suggestions"]`:
+
+```tmdl
+measure 'city with the most sales' = 0
+    annotation TableauFormula = IF [Calculation_99] = {FIXED [State],[City]:SUM([Sales])} THEN [City] END
+    annotation TranslationSuggestion = VAR __detail = CALCULATETABLE(ADDCOLUMNS(SUMMARIZE('Orders', 'Orders'[State], 'Orders'[City]), "@value", CALCULATE(SUM('Orders'[Sales]))), ALLEXCEPT('Orders', 'Orders'[State])) VAR __max = MAXX(__detail, [@value]) RETURN CONCATENATEX(FILTER(__detail, [@value] = __max), 'Orders'[City], ", ")
+    annotation TranslationSuggestionPattern = argmax-dimension
+```
+
+Approval is **batch, not per-calc**: review the `assisted_suggestions` list, then re-run with the
+approved subset to flip them into real measures in one pass (tagged `TranslatedBy = assisted
+translation (human-approved)`). The deterministic safe-subset behavior is unchanged for everything else.
+
+```python
+from assemble_model import migrate_tds_to_semantic_model
+
+# Pass 1 — see what the idiom registry can offer (nothing is live yet):
+out = migrate_tds_to_semantic_model(tds_text, model_name="Superstore", calcs=calcs)
+pending = out["report"]["assisted_suggestions"]   # [{measure, pattern, dax, confidence, caveats}, ...]
+
+# Human approves (all / by pattern / a subset). Pass 2 — flip the approved ones into real measures:
+approved = {s["measure"]: s["dax"] for s in pending}   # or filter by s["pattern"] == "argmax-dimension"
+final = migrate_tds_to_semantic_model(tds_text, model_name="Superstore",
+                                      calcs=calcs, approved_calc_dax=approved)
+```
+
 **Live SQL Server datasource → DirectQuery M partition**
 
 ```tmdl
@@ -308,13 +343,51 @@ See [security-governance.md](resources/security-governance.md). Key boundaries:
 
 - **Credentials never leave the user.** Downloaded `.tds`/`.tdsx`/workbook artifacts are sensitive plaintext — do not commit them, embed them in the model/report, or include them in the migration report.
 - **Binding links connection IDs only**; the user supplies credentials on the Fabric connection and sets up any on-prem gateway.
+- **Never bind a source credential for the user — even via API.** A semantic model's TMDL has no password field; credentials live on a separate Fabric data connection the model binds to by ID. Setting them via REST still means transmitting the secret *and* requires the gateway's asymmetric (RSA-OAEP) credential flow — out of bounds. If a user pastes a secret in chat, do not write it anywhere and advise them to rotate it.
 - **Least privilege** for the Tableau token (read/download scope) and the Fabric identity (`SemanticModel.ReadWrite.All` / `Item.ReadWrite.All`, model owner).
+
+### After deploy: the credential-binding wall (expected)
+
+A freshly deployed Import/DirectQuery model has **no credential bound**, so the first refresh fails with
+`ModelRefreshFailed_CredentialsNotSpecified`. **This is success, not a bug** — the model is correct; the
+human-owned bind is the only thing left. Hand off, then offer to re-trigger the refresh via API once bound:
+
+1. Portal route — workspace → semantic model → **Settings → Data source credentials → Edit** (Basic auth + gateway if the source isn't publicly reachable).
+2. **Licensing reality:** editing data-source credentials needs a **Pro / Fabric per-user** license — **F2 (or any capacity) alone is not enough**, and a trial may be expired. If the per-dataset Settings page is gated, try **Manage connections and gateways** (capacity-backed) to create a cloud connection and bind by ID, or have any Pro/Fabric-licensed colleague bind it once (it persists on the connection, not per-user).
+3. Once bound by any route, re-run the refresh via the Power BI REST API (no portal needed for that step).
 
 ---
 
 ## Migration Report
 
-See [migration-report.md](resources/migration-report.md). Every run produces an auditable report: per-datasource storage-mode decision + rationale, per-measure translation status (translated / stub + reason + preserved formula), inferred relationships, skipped tables, and the manual follow-ups (credentials, gateway, stub repair). This report is the trust artifact — it makes every gap explicit.
+See [migration-report.md](resources/migration-report.md). Every run produces an auditable report: per-datasource storage-mode decision + rationale, per-measure translation status (translated / stub + reason + preserved formula), **assisted-translation suggestions** (`report["assisted_suggestions"]` — labeled idiom matches awaiting batch human approval, never live until approved), inferred relationships, skipped tables, and the manual follow-ups (credentials, gateway, stub repair). This report is the trust artifact — it makes every gap explicit.
+
+---
+
+## Output: deploy to Fabric **or** write a local `.pbip`
+
+The assemblers return `parts` (a TMDL `dict`). Three ways to land it — the agent should **not** improvise the layout (a prior pilot hand-rolled the `.pbip` and set the wrong `$schema`, which Power BI Desktop rejects):
+
+- **Deploy to Fabric** — `fabric_definition_payload(parts)` → base64 parts for `scripts/deploy_to_fabric.py` (Fabric REST `createOrUpdate`).
+- **Local semantic-model folder** — `write_model_folder(parts, "<Name>.SemanticModel")` writes a complete, valid **TMDL `.SemanticModel`** item (opens in Tabular Editor, git-reviewable, deployable). This alone is the model deliverable.
+- **Openable Power BI project (`.pbip`)** — call the bundled helper; do **not** assemble the scaffold by hand:
+
+```python
+from assemble_model import write_local_pbip
+write_local_pbip(parts, dest_dir, model_name="Superstore")   # → Superstore.pbip (double-click → Desktop)
+```
+
+It writes the proven layout with the **exact** schemas baked in (the part agents get wrong):
+
+```
+<Name>.pbip                  # $schema .../fabric/pbip/pbipProperties/1.0.0/schema.json ; artifacts→<Name>.Report
+<Name>.SemanticModel/        # from write_model_folder(...) — the deliverable
+<Name>.Report/               # thin one-page shell; definition.pbir datasetReference.byPath = ../<Name>.SemanticModel
+```
+
+The `.pbir` **`datasetReference.byPath`** is the report→model link. The `.Report` is a thin shell until
+report rebuild ships (v2) — the dataset is fully functional on its own; pass `report_parts=` (e.g. from
+`twb_to_pbir`) to supply a real rebuilt report. See [semantic-model-rebuild.md](resources/semantic-model-rebuild.md).
 
 ---
 

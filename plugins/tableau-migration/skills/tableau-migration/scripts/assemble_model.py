@@ -29,27 +29,36 @@ import re
 try:  # package or scripts-on-path
     from .connection_to_m import (
         build_m_field_resolver,
+        connection_details_for_bind,
         emit_connection_parameters,
         emit_table_tmdl_m,
+        extract_calcs,
         parse_tds,
     )
     from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
-    from .calc_to_dax import translate_tableau_calc_to_dax
+    from .calc_to_dax import translate_tableau_calc_to_dax, suggest_assisted_dax
     from . import tmdl_generate as T
 except ImportError:
     from connection_to_m import (
         build_m_field_resolver,
+        connection_details_for_bind,
         emit_connection_parameters,
         emit_table_tmdl_m,
+        extract_calcs,
         parse_tds,
     )
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
-    from calc_to_dax import translate_tableau_calc_to_dax
+    from calc_to_dax import translate_tableau_calc_to_dax, suggest_assisted_dax
     import tmdl_generate as T
 
 
 def _table_display(rel):
     return rel.get("name") or rel.get("item") or "Table"
+
+
+# Fixed calendar span for a DirectQuery Date table (see _build_date_dimension). A wide, static,
+# self-contained window so the calculated table always processes; override via date_range=.
+_DEFAULT_DQ_DATE_RANGE = (2015, 2035)
 
 
 def _build_ci_field_index(descriptor, resolve_field):
@@ -118,36 +127,87 @@ def _generate_model_tmdl_import(table_names, expression_names, role_names=None):
     )
 
 
-def _measures_part(calcs, resolve, consumed=None, param_resolver=None):
+def _calc_lookup_from(calcs):
+    """Map a lowercased calc reference (``name`` AND internal ``Calculation_*`` name) to its
+    Tableau formula, for cross-calc reference resolution in assisted translation."""
+    lookup = {}
+    for calc in calcs or []:
+        formula = calc.get("formula")
+        if not formula:
+            continue
+        for key in (calc.get("name"), calc.get("internal_name")):
+            if key:
+                lookup.setdefault(key.lower(), formula)
+    return lookup
+
+
+def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
+                   calc_lookup=None, approved_calc_dax=None):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
     ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
     ``consumed`` (case-insensitive) are skipped -- they have already become field-parameter
-    tables and must NOT also be emitted as measures. Returns ``(measures_table_tmdl, report)``
-    where report rows record translated/stub status.
+    tables and must NOT also be emitted as measures. Returns
+    ``(measures_table_tmdl, report, suggestions)`` where report rows record translated/stub
+    status and ``suggestions`` is the list of pending assisted-translation suggestions.
 
     ``param_resolver`` (from ``emit_value_parameters``) inlines a value/what-if
     ``[Parameters].[X]`` reference as its ``[<Param> Value]`` measure. It defaults to ``None``;
     a resolver that returns ``None`` for an unknown parameter falls back to the same inert stub as
     no resolver, so callers that pass no parameters get byte-for-byte identical output.
+
+    ASSISTED TRANSLATION (opt-in): when the deterministic translator falls back to a stub,
+    ``suggest_assisted_dax`` is consulted for a recognized idiom (e.g. argmax-over-a-dimension).
+    A match is recorded as a clearly-labeled ``TranslationSuggestion`` annotation on the still-inert
+    measure and surfaced in ``suggestions`` for human review -- it is NEVER the live expression.
+    ``approved_calc_dax`` (``{calc_name: dax}``, case-insensitive) flips a human-approved suggestion
+    into the real measure, tagged ``TranslatedBy = assisted translation (human-approved)``. The
+    deterministic safe-subset behavior is unchanged: with neither a matching idiom nor an approval,
+    output is byte-for-byte identical to before.
     """
     consumed_lower = {(c or "").lower() for c in (consumed or set())}
+    approved_lower = {(k or "").lower(): v for k, v in (approved_calc_dax or {}).items()}
     measures_tmdl = ""
     report = []
+    suggestions = []
     for calc in calcs or []:
         name, formula = calc["name"], calc.get("formula", "")
         if name.lower() in consumed_lower:
             continue
         dax, reason, _ = translate_tableau_calc_to_dax(formula, resolve, param_resolver=param_resolver)
-        measures_tmdl += T.generate_measure_tmdl(name, formula, dax)
-        report.append({
+        row = {
             "measure": name,
             "status": "translated" if dax else "stub",
             "reason": reason,
             "dax": dax,
             "tableau_formula": formula,
-        })
-    return T.generate_measures_table_tmdl(measures_tmdl), report
+        }
+        if dax:
+            measures_tmdl += T.generate_measure_tmdl(name, formula, dax)
+            report.append(row)
+            continue
+
+        # Deterministic fallback -> consult the assisted-translation idiom registry.
+        sugg = suggest_assisted_dax(formula, resolve, calc_lookup=calc_lookup)
+        approved = approved_lower.get(name.lower())
+        if approved:
+            approved_expr = " ".join(approved.split())  # collapse to one valid DAX line
+            measures_tmdl += T.generate_measure_tmdl(
+                name, formula, approved_expr,
+                translated_by="assisted translation (human-approved)")
+            row["status"] = "assisted-approved"
+            row["dax"] = approved_expr
+            if sugg:
+                row["assisted_pattern"] = sugg["pattern"]
+        elif sugg:
+            measures_tmdl += T.generate_measure_tmdl(name, formula, None, suggestion=sugg)
+            row["status"] = "assisted-suggested"
+            row["assisted_suggestion"] = sugg
+            suggestions.append({"measure": name, **sugg})
+        else:
+            measures_tmdl += T.generate_measure_tmdl(name, formula, None)
+        report.append(row)
+    return T.generate_measures_table_tmdl(measures_tmdl), report, suggestions
 
 
 def _safe_role_filename(name, used):
@@ -224,7 +284,7 @@ def _select_primary_date(date_cols):
 
 
 def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=True,
-                          name_pref="Date", mode="import"):
+                          name_pref="Date", mode="import", date_range=None):
     """Detect fact date columns and build a shared Date dimension + its relationships.
 
     Returns ``(date_table_name|None, date_table_tmdl|None, date_relationships, report)``. Only
@@ -239,7 +299,13 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
     DirectQuery table that participates in a datePartOnly (datetime-to-date) relationship ("...must
     have its query mode set to Import") -- so the relationships are emitted as plain dateTime joins
     instead (both endpoints are already dateTime; a source DATE lands at midnight and matches the
-    midnight CALENDARAUTO key exactly). A report warning flags the exact-join caveat.
+    midnight calendar key exactly). A report warning flags the exact-join caveat.
+
+    The calendar source also differs by mode: Import uses ``CALENDARAUTO()`` (the model holds the
+    data, so its date-column scan works at refresh); DirectQuery uses a self-contained fixed-range
+    ``CALENDAR(DATE(start,1,1), DATE(end,12,31))`` (``date_range`` or ``_DEFAULT_DQ_DATE_RANGE``)
+    because a CALENDARAUTO calculated table would have to query the source to find its span and
+    fails to process without it.
     """
     is_directquery = (mode or "").lower() == "directquery"
     emitted = {n.lower() for n in emitted_names}
@@ -298,7 +364,23 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
             "true timestamp column with a time-of-day component may under-match -- normalize it to a "
             "date at the source (e.g. CAST(... AS DATE)) if exact date-part matching is required.")
 
-    part = T.generate_date_table_tmdl(date_name, mark_as_date=mark_as_date)
+    # CALENDARAUTO() derives its span by scanning the model's date columns. In a DirectQuery model
+    # those columns live in the source, so the calculated Date table cannot process without querying
+    # it (and fails outright before any credential is bound) -- the user's "the date table isn't
+    # working". Emit a SELF-CONTAINED fixed-range CALENDAR() instead so the Date table always
+    # processes. Import models keep CALENDARAUTO() (their data is in the model, so the scan works).
+    if is_directquery:
+        start, end = date_range or _DEFAULT_DQ_DATE_RANGE
+        source_expr = f"CALENDAR(DATE({start}, 1, 1), DATE({end}, 12, 31))"
+        warnings.append(
+            f"DirectQuery model: Date table uses a fixed-range CALENDAR(DATE({start},1,1), "
+            f"DATE({end},12,31)) instead of CALENDARAUTO() -- a CALENDARAUTO calculated table would "
+            f"have to query the DirectQuery source to discover the date span and fails to process "
+            f"without it. Pass date_range=(start_year, end_year) (e.g. from the datasource profile's "
+            f"date MIN/MAX) to fit the calendar to your data.")
+    else:
+        source_expr = "CALENDARAUTO()"
+    part = T.generate_date_table_tmdl(date_name, mark_as_date=mark_as_date, source_expr=source_expr)
     report = {"generated": True, "table": date_name, "mark_as_date": mark_as_date,
               "relationships": details, "warnings": warnings}
     return date_name, part, rels, report
@@ -306,7 +388,8 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
 
 def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=None,
                           hierarchies=None, display_folders=None, rls_roles=None,
-                          date_table=True, mark_as_date=True, flatfile_path=None):
+                          date_table=True, mark_as_date=True, flatfile_path=None,
+                          calc_lookup=None, approved_calc_dax=None, date_range=None):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -360,7 +443,10 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
     # flows through normal translation and lands as a preserved `= 0` stub -- its original Tableau
     # formula is kept verbatim as the `TableauFormula` annotation. Rebuild parameter behaviour in
     # Power BI Desktop with native field parameters, which are trivial to author there.
-    measures_table, measure_report = _measures_part(calcs, resolve)
+    measures_table, measure_report, assisted_suggestions = _measures_part(
+        calcs, resolve,
+        calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
+        approved_calc_dax=approved_calc_dax)
     parts["definition/tables/_Measures.tmdl"] = measures_table
     table_names.append("_Measures")
 
@@ -372,7 +458,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
     date_report = {"generated": False, "reason": "date_table disabled"}
     if date_table:
         date_name, date_part, date_rels, date_report = _build_date_dimension(
-            tables, table_names, all_rels, mark_as_date=mark_as_date, mode=mode)
+            tables, table_names, all_rels, mark_as_date=mark_as_date, mode=mode,
+            date_range=date_range)
         if date_part is not None:
             parts[f"definition/tables/{date_name}.tmdl"] = date_part
             table_names.insert(table_names.index("_Measures"), date_name)
@@ -397,6 +484,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
         "tables": [t for t in table_names if t != "_Measures"],
         "skipped_tables": skipped,
         "measures": measure_report,
+        "assisted_suggestions": assisted_suggestions,
         "relationships": relationships or [],
         "date_table": date_report,
         "roles": [r["name"] for r in rls_roles or []],
@@ -481,9 +569,81 @@ def write_model_folder(parts, dest_dir):
     return written
 
 
+def build_thin_report_parts(model_name, *, report_name=None, page_display="Overview"):
+    """Build a minimal, **openable** PBIR report bound by *relative path* to a sibling
+    ``<model_name>.SemanticModel`` folder.
+
+    The report has one empty page — it exists only so the ``.pbip`` opens in Power BI Desktop;
+    the semantic model is the deliverable. Full worksheet/dashboard rebuild is the v2 viz seam
+    (see ``twb_to_pbir.migrate_twb_to_pbir``). All ``$schema`` values come from ``twb_to_pbir`` so
+    they are always the versions Desktop accepts.
+    """
+    try:
+        from . import twb_to_pbir as R
+    except ImportError:
+        import twb_to_pbir as R
+    report_name = report_name or model_name
+    parts = {}
+    parts["definition.pbir"] = R._dumps({
+        "$schema": R.SCHEMA_DEFINITION_PROPERTIES,
+        "version": "4.0",
+        "datasetReference": {"byPath": {"path": f"../{model_name}.SemanticModel"}},
+    })
+    parts["definition/version.json"] = R._dumps({"$schema": R.SCHEMA_VERSION, "version": "2.0.0"})
+    parts["definition/report.json"] = R._dumps({
+        "$schema": R.SCHEMA_REPORT,
+        "layoutOptimization": "None",
+    })
+    parts[".platform"] = R._dumps({
+        "$schema": R.SCHEMA_PLATFORM,
+        "metadata": {"type": "Report", "displayName": report_name},
+        "config": {"version": "2.0", "logicalId": "00000000-0000-0000-0000-000000000000"},
+    })
+    R._emit_page(parts, "page1", page_display, [])
+    parts["definition/pages/pages.json"] = R._dumps({
+        "$schema": R.SCHEMA_PAGES, "pageOrder": ["page1"], "activePageName": "page1"})
+    return parts
+
+
+# The .pbip pointer's $schema — Power BI Desktop rejects the project if this is wrong.
+PBIP_PROPERTIES_SCHEMA = ("https://developer.microsoft.com/json-schemas/fabric/"
+                          "pbip/pbipProperties/1.0.0/schema.json")
+
+
+def write_local_pbip(parts, dest_dir, *, model_name, report_name=None, report_parts=None):
+    """Write an **openable** Power BI project (``.pbip``) under ``dest_dir``:
+
+    - ``<model_name>.SemanticModel/`` — the TMDL model (from ``parts``)
+    - ``<report_name>.Report/``       — a report bound *by path* to that model (thin one-page
+      shell by default; pass ``report_parts`` to supply a real rebuilt report)
+    - ``<model_name>.pbip``           — the project pointer (correct ``pbipProperties/1.0.0`` schema)
+
+    Double-click the ``.pbip`` to open it in Power BI Desktop. The semantic model is fully
+    functional on its own; the thin report exists only so the project opens. Returns the .pbip path.
+    """
+    import json
+    import os
+    report_name = report_name or model_name
+    write_model_folder(parts, os.path.join(dest_dir, f"{model_name}.SemanticModel"))
+    if report_parts is None:
+        report_parts = build_thin_report_parts(model_name, report_name=report_name)
+    write_model_folder(report_parts, os.path.join(dest_dir, f"{report_name}.Report"))
+    os.makedirs(dest_dir, exist_ok=True)
+    pbip_path = os.path.join(dest_dir, f"{model_name}.pbip")
+    with open(pbip_path, "w", encoding="utf-8") as fh:
+        json.dump({
+            "$schema": PBIP_PROPERTIES_SCHEMA,
+            "version": "1.0",
+            "artifacts": [{"report": {"path": f"{report_name}.Report"}}],
+            "settings": {"enableAutoRecovery": True},
+        }, fh, indent=2)
+    return pbip_path
+
+
 def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relationships=None,
                                   hierarchies=None, display_folders=None, rls_roles=None,
-                                  date_table=True, mark_as_date=True, flatfile_path=None):
+                                  date_table=True, mark_as_date=True, flatfile_path=None,
+                                  approved_calc_dax=None, date_range=None):
     """One-call convenience: parse ``.tds`` text and assemble the Import/DirectQuery model.
 
     Model objects (hierarchies, display folders, RLS roles) are AUTO-DERIVED from the
@@ -496,10 +656,20 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relations
     ``.tds`` ``<object-graph><relationships>`` (already resolved to emitted model columns) are
     emitted as TMDL when ``relationships`` is ``None``. Pass an explicit list (including ``[]``)
     to take full control and skip the auto-wiring -- so ``[]`` deliberately emits no relationships.
+
+    ``approved_calc_dax`` (``{calc_name: dax}``, case-insensitive) flips human-approved assisted
+    suggestions into real measures (see ``_measures_part``). On a first pass omit it: the report's
+    ``assisted_suggestions`` lists every idiom match for review; re-run with the approved subset to
+    emit them. A cross-calc reference lookup is built from the FULL ``.tds`` (captions + internal
+    ``Calculation_*`` names) so an argmax calc that points at a separate "max" calc resolves.
     """
     descriptor = parse_tds(tds_text)
     if relationships is None:
         relationships = descriptor.get("relationships") or []
+    try:
+        calc_lookup = _calc_lookup_from(extract_calcs(tds_text))
+    except Exception:
+        calc_lookup = _calc_lookup_from(calcs)
     enrichment_report = None
     if hierarchies is None and display_folders is None and rls_roles is None:
         parsed = T.parse_model_objects(tds_text)
@@ -517,7 +687,71 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relations
                                    calcs=calcs, relationships=relationships,
                                    hierarchies=hierarchies, display_folders=display_folders,
                                    rls_roles=rls_roles, date_table=date_table,
-                                   mark_as_date=mark_as_date, flatfile_path=flatfile_path)
+                                   mark_as_date=mark_as_date, flatfile_path=flatfile_path,
+                                   calc_lookup=calc_lookup, approved_calc_dax=approved_calc_dax,
+                                   date_range=date_range)
     if enrichment_report is not None:
         result["report"]["model_objects"] = enrichment_report
+    return result
+
+
+def _read_tds_source(source):
+    """Return ``.tds`` XML text from a ``.tdsx``/``.tds`` filesystem path, raw bytes, or XML text.
+
+    A ``.tdsx`` is a zip whose inner ``.tds`` is extracted; a ``.tds`` file is read as UTF-8 (BOM
+    tolerant). A string that is already XML (or contains newlines, so it can't be a path) is
+    returned as-is, so callers can pass a path **or** the text they already have.
+    """
+    import os
+    try:
+        from . import fetch_tds as F
+    except ImportError:
+        import fetch_tds as F
+    if isinstance(source, (bytes, bytearray)):
+        raw = bytes(source)
+        return F.inner_tds_from_zip(raw) if F.is_zip(raw) else raw.decode("utf-8-sig")
+    if isinstance(source, str) and "\n" not in source and "<" not in source and os.path.isfile(source):
+        with open(source, "rb") as fh:
+            raw = fh.read()
+        return F.inner_tds_from_zip(raw) if F.is_zip(raw) else raw.decode("utf-8-sig")
+    return source  # already .tds XML text
+
+
+def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False,
+                       calcs=None, approved_calc_dax=None, date_range=None, **kwargs):
+    """**One call** from a downloaded datasource to everything needed to land it in Fabric.
+
+    ``source`` may be a path to a ``.tdsx`` or ``.tds``, raw bytes, or ``.tds`` XML text. Calculated
+    fields are **auto-extracted** (pass ``calcs`` to override, or ``calcs=[]`` to emit no measures).
+    Returns ``{"parts", "report", "bind"}`` -- ``bind`` is the credential-free connection target from
+    ``connection_details_for_bind`` -- plus, when ``write_to`` is given, the path it persisted to:
+
+    * ``as_pbip=False`` (default) writes ``<model_name>.SemanticModel/`` and adds ``"model_dir"``.
+    * ``as_pbip=True`` writes an openable ``.pbip`` project and adds ``"pbip"``.
+
+    Extra keyword args (``relationships``, ``hierarchies``, ``mark_as_date``, ``flatfile_path`` ...)
+    pass straight through to ``migrate_tds_to_semantic_model``. Deploy stays a separate, explicit
+    step (``deploy_to_fabric.py``) -- this function never touches the network or credentials.
+    """
+    tds_text = _read_tds_source(source)
+    if calcs is None:
+        try:
+            calcs = extract_calcs(tds_text)
+        except Exception:
+            calcs = None
+    result = migrate_tds_to_semantic_model(
+        tds_text, model_name=model_name, calcs=calcs,
+        approved_calc_dax=approved_calc_dax, date_range=date_range, **kwargs)
+    try:
+        result["bind"] = connection_details_for_bind(parse_tds(tds_text))
+    except Exception as exc:  # never fail the migration over the (advisory) bind target
+        result["bind"] = {"error": str(exc)}
+    if write_to:
+        import os
+        if as_pbip:
+            result["pbip"] = write_local_pbip(result["parts"], write_to, model_name=model_name)
+        else:
+            model_dir = os.path.join(write_to, f"{model_name}.SemanticModel")
+            write_model_folder(result["parts"], model_dir)
+            result["model_dir"] = model_dir
     return result

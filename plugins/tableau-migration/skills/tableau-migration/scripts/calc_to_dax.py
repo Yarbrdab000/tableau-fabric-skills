@@ -1399,6 +1399,328 @@ def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), orde
         return None, str(e), tables_used
 
 
+# ===========================================================================
+# Assisted translation (opt-in, human-approved) -- a SEPARATE layer ABOVE the
+# deterministic safe-subset translator.
+#
+# translate_tableau_calc_to_dax only emits DAX when the mapping is provably 1:1;
+# everything else FALLS BACK to an inert `= 0` stub. That contract is unchanged.
+# This layer runs ONLY on those fallbacks and recognizes a small registry of
+# higher-level Tableau IDIOMS whose faithful DAX is a *semantic* rewrite (not a
+# syntax swap) -- e.g. argmax-over-a-dimension ("the city with the most sales").
+# Because the rewrite has real correctness forks (ties, filter context), the
+# result is a clearly-labeled SUGGESTION a human approves, NEVER silently emitted
+# as the live measure. The orchestrator records every suggestion in
+# report["assisted_suggestions"] and emits it as a `TranslationSuggestion`
+# annotation on the (still inert) measure; on bulk approval it flips into the real
+# expression tagged `TranslatedBy = assisted translation (human-approved)`.
+# ===========================================================================
+
+# AGG token -> scalar DAX aggregation used inside the argmax detail table.
+_ASSISTED_AGG_DAX = {
+    "SUM": "SUM", "AVG": "AVERAGE", "MIN": "MIN", "MAX": "MAX",
+    "COUNT": "COUNTA", "COUNTD": "DISTINCTCOUNTNOBLANK", "MEDIAN": "MEDIAN",
+}
+
+
+def _tok_is_kw(tok, kw):
+    return tok[0] == "id" and tok[1].upper() == kw.upper()
+
+
+def _split_top_level(toks, sep_kw):
+    """Split ``toks`` at the FIRST top-level (paren/brace depth 0) keyword ``sep_kw``.
+    Returns ``(before, after)`` or ``None`` when the keyword is absent at depth 0."""
+    depth = 0
+    for i, t in enumerate(toks):
+        if t[0] == "op" and t[1] in "({":
+            depth += 1
+        elif t[0] == "op" and t[1] in ")}":
+            depth -= 1
+        elif depth == 0 and _tok_is_kw(t, sep_kw):
+            return toks[:i], toks[i + 1:]
+    return None
+
+
+def _split_top_level_eq(toks):
+    """Split on the SINGLE top-level ``=`` comparison. Returns ``(left, right)`` or
+    ``None`` (no top-level ``=``, or more than one -> ambiguous)."""
+    depth = 0
+    found = None
+    for i, t in enumerate(toks):
+        if t[0] == "op" and t[1] in "({":
+            depth += 1
+        elif t[0] == "op" and t[1] in ")}":
+            depth -= 1
+        elif depth == 0 and t[0] == "cmp" and t[1] == "=":
+            if found is not None:
+                return None
+            found = i
+    return None if found is None else (toks[:found], toks[found + 1:])
+
+
+def _strip_outer_parens(toks):
+    """Remove a fully-wrapping outer ``( ... )`` pair (repeatedly), leaving inner unchanged."""
+    while len(toks) >= 2 and toks[0] == ("op", "(") and toks[-1] == ("op", ")"):
+        depth, ok = 0, True
+        for i, t in enumerate(toks):
+            if t == ("op", "("):
+                depth += 1
+            elif t == ("op", ")"):
+                depth -= 1
+                if depth == 0 and i != len(toks) - 1:
+                    ok = False
+                    break
+        if not ok:
+            break
+        toks = toks[1:-1]
+    return toks
+
+
+def _parse_simple_field(toks):
+    """``[Field]`` -> the caption string, else ``None``."""
+    toks = _strip_outer_parens(toks)
+    if len(toks) == 1 and toks[0][0] == "field":
+        return toks[0][1]
+    return None
+
+
+def _parse_simple_agg(toks):
+    """``AGG([Field])`` -> ``(AGG_upper, field_caption)`` for one bare field, else ``None``."""
+    toks = _strip_outer_parens(toks)
+    if (len(toks) == 4 and toks[0][0] == "id" and toks[1] == ("op", "(")
+            and toks[2][0] == "field" and toks[3] == ("op", ")")):
+        return toks[0][1].upper(), toks[2][1]
+    return None
+
+
+def _parse_fixed_lod(toks):
+    """``{FIXED [d1], [d2], ... : <inner>}`` -> ``(dims, inner_toks)``; else ``None``.
+    Only FIXED is recognized and every dimension must be a bare ``[field]`` reference."""
+    toks = _strip_outer_parens(toks)
+    if len(toks) < 2 or toks[0] != ("op", "{") or toks[-1] != ("op", "}"):
+        return None
+    body = toks[1:-1]
+    if not body or not _tok_is_kw(body[0], "FIXED"):
+        return None
+    body = body[1:]
+    depth, split = 0, None
+    for i, t in enumerate(body):
+        if t[0] == "op" and t[1] in "({":
+            depth += 1
+        elif t[0] == "op" and t[1] in ")}":
+            depth -= 1
+        elif depth == 0 and t == ("op", ":"):
+            split = i
+            break
+    if split is None:
+        return None
+    dim_toks, inner = body[:split], body[split + 1:]
+    dims, expect_field = [], True
+    for t in dim_toks:
+        if expect_field:
+            if t[0] != "field":
+                return None
+            dims.append(t[1])
+            expect_field = False
+        elif t != ("op", ","):
+            return None
+        else:
+            expect_field = True
+    if not dims or expect_field:  # empty or trailing comma
+        return None
+    return dims, inner
+
+
+def _parse_max_of_fixed(toks):
+    """``{FIXED P : MAX({FIXED Q : AGG([f])})}`` -> ``(P, Q, AGG, f)``; else ``None``."""
+    outer = _parse_fixed_lod(toks)
+    if outer is None:
+        return None
+    p_dims, inner = outer
+    inner = _strip_outer_parens(inner)
+    if (len(inner) < 4 or inner[0][0] != "id" or inner[0][1].upper() != "MAX"
+            or inner[1] != ("op", "(") or inner[-1] != ("op", ")")):
+        return None
+    fl = _parse_fixed_lod(inner[2:-1])
+    if fl is None:
+        return None
+    q_dims, agg_inner = fl
+    agg = _parse_simple_agg(agg_inner)
+    if agg is None:
+        return None
+    return p_dims, q_dims, agg[0], agg[1]
+
+
+def _detect_argmax_dimension(formula, resolver, calc_lookup):
+    """Detect Tableau's argmax-over-a-dimension idiom and emit faithful, tie-aware DAX.
+
+    Shape:  ``IF <A> = {FIXED P, C : AGG([f])} THEN [C] END``  where ``<A>`` -- inline or
+    via another calc -- is ``{FIXED P : MAX({FIXED P, C : AGG([f])})}``. Reads as "the member
+    of dimension C whose AGG([f]) equals the per-P maximum" (e.g. the city with the most
+    sales in each state). Returns a suggestion dict or ``None``.
+    """
+    try:
+        toks = _tokenize(formula)
+    except _CalcError:
+        return None
+    if not toks or not _tok_is_kw(toks[0], "IF"):
+        return None
+    cond_then = _split_top_level(toks[1:], "THEN")
+    if cond_then is None:
+        return None
+    cond, after_then = cond_then
+    then_end = _split_top_level(after_then, "END")
+    if then_end is None:
+        return None
+    result, tail = then_end
+    if tail:  # nothing may follow END (a single IF/THEN/END only)
+        return None
+    # the THEN branch must be exactly one bare dimension C (this also rejects ELSEIF/ELSE,
+    # which would leave extra tokens in `result`).
+    c = _parse_simple_field(result)
+    if c is None:
+        return None
+    eq = _split_top_level_eq(cond)
+    if eq is None:
+        return None
+    left, right = eq
+    # Identify which side is the detail FIXED LOD B = {FIXED dims : AGG([f])} (a SIMPLE-agg
+    # inner) and which is A (the per-partition max). Try both orders -- the equality may be
+    # written either way round.
+    b = a_side = None
+    for cand_b, cand_a in ((left, right), (right, left)):
+        fl = _parse_fixed_lod(cand_b)
+        if fl and _parse_simple_agg(fl[1]) is not None:
+            b, a_side = fl, cand_a
+            break
+    if b is None:
+        return None
+    b_dims, b_inner = b
+    b_aggname, b_field = _parse_simple_agg(b_inner)
+    # resolve A: an inline max-of-fixed, OR a reference to a calc that is one.
+    a = _parse_max_of_fixed(a_side)
+    if a is None:
+        ref = _parse_simple_field(a_side)
+        if ref is None or not calc_lookup:
+            return None
+        ref_formula = calc_lookup.get(ref.lower())
+        if not ref_formula:
+            return None
+        try:
+            a = _parse_max_of_fixed(_tokenize(ref_formula))
+        except _CalcError:
+            return None
+        if a is None:
+            return None
+    p_dims, q_dims, a_aggname, a_field = a
+
+    # ---- structural validation on RESOLVED (table, col) identities --------
+    def rid(cap):
+        r = resolver(cap)
+        return None if r is None else (r[0], r[1])
+
+    def dim_ids(dims):
+        out = []
+        for d in dims:
+            r = rid(d)
+            if r is None:
+                return None
+            out.append(r)
+        return out
+
+    b_field_id, a_field_id = rid(b_field), rid(a_field)
+    if not b_field_id or not a_field_id or a_field_id != b_field_id:
+        return None
+    if a_aggname != b_aggname:
+        return None
+    b_ids, q_ids, p_ids, c_id = dim_ids(b_dims), dim_ids(q_dims), dim_ids(p_dims), rid(c)
+    if b_ids is None or q_ids is None or p_ids is None or c_id is None:
+        return None
+    if set(q_ids) != set(b_ids):            # A's inner grain must equal B's grain
+        return None
+    if not (set(p_ids) < set(b_ids)):        # P must be a STRICT subset of the grain
+        return None
+    if set(b_ids) - set(p_ids) != {c_id}:    # exactly one dim argmax'd over, == the THEN dim
+        return None
+    if c_id in set(p_ids):
+        return None
+    tables = {t for (t, _c) in b_ids} | {b_field_id[0]}
+    if len(tables) != 1:                      # single-table only
+        return None
+    table = next(iter(tables))
+    agg_dax = _ASSISTED_AGG_DAX.get(b_aggname)
+    if agg_dax is None:
+        return None
+
+    # ---- emit faithful, tie-aware DAX -------------------------------------
+    p_cols = [col for (_t, col) in p_ids]
+    c_col, field_col = c_id[1], b_field_id[1]
+    tdax = _dax_table(table)
+    summarize_cols = ", ".join(tdax + _dax_col(col) for col in p_cols + [c_col])
+    allexcept_cols = ", ".join(tdax + _dax_col(col) for col in p_cols)
+    detail_measure = f"{agg_dax}({tdax}{_dax_col(field_col)})"
+    dax = (
+        "VAR __detail =\n"
+        "    CALCULATETABLE(\n"
+        "        ADDCOLUMNS(\n"
+        f"            SUMMARIZE({tdax}, {summarize_cols}),\n"
+        f'            "@value", CALCULATE({detail_measure})\n'
+        "        ),\n"
+        f"        ALLEXCEPT({tdax}, {allexcept_cols})\n"
+        "    )\n"
+        "VAR __max = MAXX(__detail, [@value])\n"
+        "RETURN\n"
+        f'    CONCATENATEX(FILTER(__detail, [@value] = __max), {tdax}{_dax_col(c_col)}, ", ")'
+    )
+    caveats = [
+        "Emitted as a MEASURE (text), not the row-level dimension Tableau modeled -- "
+        "the faithful Power BI shape for an argmax.",
+        f"Ties: every {c_col} sharing the maximum is returned, comma-joined. Confirm this "
+        "matches your intended tie handling (a single-value form uses TOPN/SELECTEDVALUE).",
+        f"FIXED semantics mapped via ALLEXCEPT({table}, {', '.join(p_cols)}): respects current "
+        f"filter context on the partition but ignores filters on {c_col}. Matches Tableau FIXED "
+        "at totals/context filters; can differ under a viz dimension filter.",
+    ]
+    return {
+        "pattern": "argmax-dimension",
+        "dax": dax,
+        "confidence": "medium",
+        "requires_approval": True,
+        "caveats": caveats,
+    }
+
+
+# Idiom registry. Each detector takes (formula, resolver, calc_lookup) and returns a
+# suggestion dict or None. First match wins. Add new idioms here.
+_ASSISTED_DETECTORS = (_detect_argmax_dimension,)
+
+
+def suggest_assisted_dax(formula, resolver, *, calc_lookup=None):
+    """Second-opinion idiom matcher for a calc the deterministic translator FELL BACK on.
+
+    Returns a SUGGESTION dict (``pattern``, ``dax``, ``confidence``, ``requires_approval``,
+    ``caveats``) for a human to approve, or ``None`` when no idiom matches. This is a
+    fallback-only helper -- never call it in place of ``translate_tableau_calc_to_dax``; its
+    output requires explicit human sign-off before it becomes a live measure.
+
+    ``calc_lookup`` maps a lowercased calc reference (caption AND the internal ``Calculation_*``
+    name) to its Tableau formula, so an idiom that references a SEPARATE calc (argmax pointing at
+    a standalone "max" calc) can resolve it. Optional; omit it for self-contained formulas.
+    """
+    f = (formula or "").strip()
+    if not f:
+        return None
+    lookup = {(k or "").lower(): v for k, v in (calc_lookup or {}).items()}
+    for detector in _ASSISTED_DETECTORS:
+        try:
+            sugg = detector(f, resolver, lookup)
+        except Exception:
+            sugg = None
+        if sugg:
+            return sugg
+    return None
+
+
 if __name__ == "__main__":
     _demo = {
         "Profit": ("Orders", "Profit", "decimal"),

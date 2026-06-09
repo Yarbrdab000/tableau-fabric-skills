@@ -1,0 +1,192 @@
+"""Tests for the ASSISTED-TRANSLATION layer (opt-in, human-approved).
+
+The deterministic translator only emits DAX for a provable 1:1 subset; everything else
+falls back to an inert ``= 0`` stub. This layer runs ONLY on those fallbacks, recognizes a
+small registry of higher-level Tableau idioms whose faithful DAX is a *semantic* rewrite
+(here: argmax-over-a-dimension), and returns a clearly-labeled SUGGESTION a human approves --
+it is never silently emitted as a live measure.
+
+These tests lock:
+  * the argmax detector (inline and via a referenced calc), with exact DAX, plus the negatives
+    that MUST abstain (so the suggester never fires on something it cannot rewrite faithfully);
+  * the orchestrator wiring -- a stub gains a ``TranslationSuggestion`` annotation and a
+    ``report["assisted_suggestions"]`` entry, while ``approved_calc_dax`` flips an approved
+    suggestion into a real measure tagged ``assisted translation (human-approved)``;
+  * that the deterministic safe-subset behavior is unchanged for non-idiom calcs.
+"""
+import assemble_model as A
+from calc_to_dax import suggest_assisted_dax
+
+
+# Shared resolver: caption -> (table_display_name, clean_col, tmdl_type).
+_FIELDS = {
+    "Sales": ("Orders", "Sales", "decimal"),
+    "Profit": ("Orders", "Profit", "decimal"),
+    "State": ("Orders", "State", "string"),
+    "City": ("Orders", "City", "string"),
+    "Region": ("Orders", "Region", "string"),
+    "People Count": ("People", "People_Count", "int64"),
+}
+
+
+def _resolver(caption):
+    return _FIELDS.get(caption)
+
+
+# The canonical idiom: "the city with the most sales in each state".
+_DETAIL = "{FIXED [State], [City] : SUM([Sales])}"
+_MAX = "{FIXED [State] : MAX({FIXED [State], [City] : SUM([Sales])})}"
+_ARGMAX_INLINE = f"IF {_MAX} = {_DETAIL} THEN [City] END"
+
+_EXPECTED_DAX = (
+    "VAR __detail =\n"
+    "    CALCULATETABLE(\n"
+    "        ADDCOLUMNS(\n"
+    "            SUMMARIZE('Orders', 'Orders'[State], 'Orders'[City]),\n"
+    '            "@value", CALCULATE(SUM(\'Orders\'[Sales]))\n'
+    "        ),\n"
+    "        ALLEXCEPT('Orders', 'Orders'[State])\n"
+    "    )\n"
+    "VAR __max = MAXX(__detail, [@value])\n"
+    "RETURN\n"
+    '    CONCATENATEX(FILTER(__detail, [@value] = __max), \'Orders\'[City], ", ")'
+)
+
+
+# --------------------------------------------------------------------------- detector
+def test_argmax_inline_detected_with_exact_dax():
+    s = suggest_assisted_dax(_ARGMAX_INLINE, _resolver)
+    assert s is not None
+    assert s["pattern"] == "argmax-dimension"
+    assert s["requires_approval"] is True
+    assert s["dax"] == _EXPECTED_DAX
+    assert any("Ties" in c for c in s["caveats"])
+
+
+def test_argmax_detected_when_max_is_on_the_left_or_right():
+    # The equality may be written either way round; both must detect identically.
+    flipped = f"IF {_DETAIL} = {_MAX} THEN [City] END"
+    a = suggest_assisted_dax(_ARGMAX_INLINE, _resolver)
+    b = suggest_assisted_dax(flipped, _resolver)
+    assert a is not None and b is not None
+    assert a["dax"] == b["dax"] == _EXPECTED_DAX
+
+
+def test_argmax_via_referenced_calc():
+    # The real Tableau shape: the IF references a SEPARATE "max" calc by its internal name.
+    formula = f"IF [Calculation_99] = {_DETAIL} THEN [City] END"
+    lookup = {"calculation_99": _MAX, "max city sales": _MAX}
+    s = suggest_assisted_dax(formula, _resolver, calc_lookup=lookup)
+    assert s is not None and s["dax"] == _EXPECTED_DAX
+
+
+def test_argmax_ref_without_lookup_abstains():
+    formula = f"IF [Calculation_99] = {_DETAIL} THEN [City] END"
+    assert suggest_assisted_dax(formula, _resolver) is None
+
+
+def test_non_if_formula_abstains():
+    assert suggest_assisted_dax("SUM([Sales])", _resolver) is None
+    assert suggest_assisted_dax(_MAX, _resolver) is None
+
+
+def test_multibranch_if_abstains():
+    # an ELSE means the THEN branch is not the whole result -> not a faithful argmax
+    formula = f"IF {_MAX} = {_DETAIL} THEN [City] ELSE [Region] END"
+    assert suggest_assisted_dax(formula, _resolver) is None
+
+
+def test_aggregate_mismatch_abstains():
+    # detail uses SUM, the max calc re-aggregates AVG -> not the same measure, abstain
+    bad_max = "{FIXED [State] : MAX({FIXED [State], [City] : AVG([Sales])})}"
+    formula = f"IF {bad_max} = {_DETAIL} THEN [City] END"
+    assert suggest_assisted_dax(formula, _resolver) is None
+
+
+def test_field_mismatch_abstains():
+    bad_max = "{FIXED [State] : MAX({FIXED [State], [City] : SUM([Profit])})}"
+    formula = f"IF {bad_max} = {_DETAIL} THEN [City] END"
+    assert suggest_assisted_dax(formula, _resolver) is None
+
+
+def test_then_dimension_must_be_the_extra_grain_dim():
+    # THEN returns [Region], which is NOT the dimension being argmax'd over ([City]) -> abstain
+    formula = f"IF {_MAX} = {_DETAIL} THEN [Region] END"
+    assert suggest_assisted_dax(formula, _resolver) is None
+
+
+def test_partition_must_be_strict_subset_abstains():
+    # partition == grain (no dimension is actually argmax'd over) -> abstain
+    deg_max = "{FIXED [State], [City] : MAX({FIXED [State], [City] : SUM([Sales])})}"
+    deg_detail = "{FIXED [State], [City] : SUM([Sales])}"
+    formula = f"IF {deg_max} = {deg_detail} THEN [City] END"
+    assert suggest_assisted_dax(formula, _resolver) is None
+
+
+def test_cross_table_abstains():
+    # the argmax dimension lives on a different table than the measure -> single-table only
+    detail = "{FIXED [Region], [People Count] : SUM([Sales])}"
+    mx = "{FIXED [Region] : MAX({FIXED [Region], [People Count] : SUM([Sales])})}"
+    formula = f"IF {mx} = {detail} THEN [People Count] END"
+    assert suggest_assisted_dax(formula, _resolver) is None
+
+
+def test_unresolved_field_abstains():
+    formula = "IF {FIXED [Nope] : MAX({FIXED [Nope], [Gone] : SUM([Sales])})} = " \
+              "{FIXED [Nope], [Gone] : SUM([Sales])} THEN [Gone] END"
+    assert suggest_assisted_dax(formula, _resolver) is None
+
+
+# --------------------------------------------------------------------------- orchestrator wiring
+_CALCS = [
+    {"name": "max city sales", "formula": _MAX, "internal_name": "Calculation_99"},
+    {"name": "city with the most sales",
+     "formula": "IF [Calculation_99] = " + _DETAIL + " THEN [City] END",
+     "internal_name": "Calculation_100"},
+]
+
+
+def _measures(calcs, **kw):
+    lookup = A._calc_lookup_from(calcs)
+    return A._measures_part(calcs, _resolver, calc_lookup=lookup, **kw)
+
+
+def test_measures_part_surfaces_suggestion_and_keeps_stub():
+    tmdl, report, suggestions = _measures(_CALCS)
+    by = {r["measure"]: r for r in report}
+    # the deterministic max calc still translates
+    assert by["max city sales"]["status"] == "translated"
+    # the argmax calc stays an inert stub but gains a suggestion
+    arg = by["city with the most sales"]
+    assert arg["status"] == "assisted-suggested"
+    assert arg["assisted_suggestion"]["pattern"] == "argmax-dimension"
+    assert [s["measure"] for s in suggestions] == ["city with the most sales"]
+    # the live measure is STILL inert; the suggestion is a non-binding annotation
+    assert "TranslationSuggestion = " in tmdl
+    assert "TranslationSuggestionPattern = argmax-dimension" in tmdl
+    assert "\tmeasure 'city with the most sales' = 0\n" in tmdl
+
+
+def test_measures_part_approval_flips_to_real_measure():
+    s = suggest_assisted_dax(_CALCS[1]["formula"], _resolver, calc_lookup=A._calc_lookup_from(_CALCS))
+    tmdl, report, suggestions = _measures(
+        _CALCS, approved_calc_dax={"city with the most sales": s["dax"]})
+    by = {r["measure"]: r for r in report}
+    assert by["city with the most sales"]["status"] == "assisted-approved"
+    # approved DAX is collapsed to a single valid line and tagged as assisted+approved
+    assert "annotation TranslatedBy = assisted translation (human-approved)" in tmdl
+    assert "\tmeasure 'city with the most sales' = VAR __detail =" in tmdl
+    # nothing left pending once approved
+    assert suggestions == []
+    assert "TranslationSuggestion = " not in tmdl
+
+
+def test_non_idiom_stub_is_byte_for_byte_unchanged():
+    # A stub with no recognized idiom must produce exactly the legacy output: an inert
+    # `= 0` with only the TableauFormula annotation -- no suggestion machinery leaks in.
+    calcs = [{"name": "weird calc", "formula": "WINDOW_SUM(SUM([Sales]))"}]
+    tmdl, report, suggestions = _measures(calcs)
+    assert report[0]["status"] == "stub"
+    assert suggestions == []
+    assert "TranslationSuggestion" not in tmdl
+    assert "\tmeasure 'weird calc' = 0\n" in tmdl

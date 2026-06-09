@@ -672,6 +672,66 @@ def parse_tds(xml_text):
     }
 
 
+def extract_calcs(xml_text):
+    """Pull Tableau calculated fields from a ``.tds`` as ``[{"name", "formula", "role"}]``.
+
+    This is the calc list the assembler's ``calcs=`` argument expects, so a caller can go straight
+    from a downloaded ``.tds`` to a model *with measures* without hand-parsing the XML::
+
+        calcs = extract_calcs(tds_text)
+        out = migrate_tds_to_semantic_model(tds_text, model_name="X", calcs=calcs)
+
+    A calculated field is a logical ``<column>`` whose nested ``<calculation class='tableau'>``
+    carries a ``formula``. Excluded on purpose:
+
+    * **Parameters** -- a ``<column>`` with a ``param-domain-type``; the migration handles
+      ``[Parameters].[X]`` references separately (they become preserved ``= 0`` stubs).
+    * **Non-formula calculations** -- bins / groups / sets, whose ``<calculation class>`` is not
+      ``tableau`` (e.g. ``bin`` / ``categorical-bin``) and which carry no ``formula``.
+
+    The field name is the user-facing ``caption`` (falling back to the de-bracketed internal
+    ``name``); the Tableau ``role`` (``dimension`` / ``measure``) is carried through when present.
+    The de-bracketed internal ``Calculation_*`` name -- what OTHER calcs reference -- is included
+    as ``internal_name`` when it differs from ``name``, so cross-calc references resolve downstream.
+    Formula text comes back already XML-unescaped (``&gt;`` -> ``>`` etc.), ready for the translator.
+    Names are de-duplicated case-insensitively, keeping the first occurrence.
+    """
+    root = ET.fromstring(xml_text)
+    datasource = root if _local(root.tag) == "datasource" else (
+        _findall_local(root, "datasource") or [root])[0]
+    out = []
+    seen = set()
+    for col in _children_local(datasource, "column"):
+        if (col.get("param-domain-type") or "").strip():
+            continue  # a parameter, not a calculated field
+        formula = None
+        for c in _children_local(col, "calculation"):
+            if (c.get("class") or "").strip().lower() == "tableau" and c.get("formula") is not None:
+                formula = c.get("formula")
+                break
+        if formula is None or not formula.strip():
+            continue
+        internal = _strip_brackets((col.get("name") or "").strip())
+        name = (col.get("caption") or "").strip() or internal
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = {"name": name, "formula": formula}
+        # The internal Calculation_* name is what OTHER calcs reference in their formulas
+        # (a caption is for display only). Carry it so cross-calc references -- e.g. an
+        # argmax calc pointing at a separate "max" calc -- can be resolved downstream.
+        if internal and internal.lower() != key:
+            entry["internal_name"] = internal
+        role = (col.get("role") or "").strip()
+        if role:
+            entry["role"] = role
+        out.append(entry)
+    return out
+
+
 # -- M / TMDL emission ---------------------------------------------------------
 _PARAM_META = 'meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=true]'
 

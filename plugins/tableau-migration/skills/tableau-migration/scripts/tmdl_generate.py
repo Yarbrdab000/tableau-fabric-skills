@@ -118,11 +118,21 @@ def tmdl_annotation_value(name, value, indent="\t\t"):
     v = " ".join((value or "").split())
     return f"{indent}annotation {name} = {v}\n"
 
-def generate_measure_tmdl(field_name, formula, dax=None):
+def generate_measure_tmdl(field_name, formula, dax=None, *, suggestion=None,
+                          translated_by="Play4 deterministic translator"):
     """One measure for the _Measures table. When `dax` is provided the measure carries
     the translated DAX expression; otherwise it stays an inert `= 0` stub. EITHER WAY
     the original Tableau formula is ALWAYS preserved as a TableauFormula annotation --
-    the unconditional audit/repair safety net for any mistranslation."""
+    the unconditional audit/repair safety net for any mistranslation.
+
+    `translated_by` tags the provenance of a translated measure (default: the deterministic
+    translator; the orchestrator passes an assisted/approved tag when a human-approved
+    suggestion is flipped into the live expression).
+
+    `suggestion` is an OPTIONAL assisted-translation suggestion dict (``{"pattern", "dax"}``)
+    attached ONLY to a stub (`dax` is None): the measure stays inert `= 0` but carries
+    `TranslationSuggestion` + `TranslationSuggestionPattern` annotations so a human can review
+    and approve it. The suggestion is NEVER the live expression until approved."""
     expr = dax if dax else "0"
     out = (
         f"\n\tmeasure {q(field_name)} = {expr}\n"
@@ -130,7 +140,10 @@ def generate_measure_tmdl(field_name, formula, dax=None):
     )
     out += tmdl_annotation_value("TableauFormula", formula)
     if dax:
-        out += tmdl_annotation_value("TranslatedBy", "Play4 deterministic translator")
+        out += tmdl_annotation_value("TranslatedBy", translated_by)
+    elif suggestion:
+        out += tmdl_annotation_value("TranslationSuggestion", suggestion.get("dax", ""))
+        out += tmdl_annotation_value("TranslationSuggestionPattern", suggestion.get("pattern", ""))
     out += "\t\tannotation SummarizationSetBy = Automatic\n"
     return out
 

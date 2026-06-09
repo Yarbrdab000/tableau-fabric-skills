@@ -169,6 +169,34 @@ def test_build_date_dimension_directquery_omits_datepartonly():
     assert any("DirectQuery" in w for w in report["warnings"])
 
 
+def test_build_date_dimension_import_uses_calendarauto():
+    # An Import model keeps CALENDARAUTO() -- its data is in the model, so the date-column scan
+    # works at refresh and yields the exact span needed for Mark-as-Date.
+    tables = [_rel("Orders", "Order_Date")]
+    _name, part, _rels, _report = _build_date_dimension(tables, ["Orders"], [], mode="import")
+    assert "source = CALENDARAUTO()" in part
+    assert "CALENDAR(DATE(" not in part
+
+
+def test_build_date_dimension_directquery_uses_fixed_range_calendar():
+    # CALENDARAUTO() on a DirectQuery model has to query the source to find its span and fails to
+    # process without it (the user's "date table isn't working"). A self-contained fixed-range
+    # CALENDAR(...) is emitted instead, with a warning explaining how to fit it to the data.
+    tables = [_rel("Orders", "Order_Date")]
+    _name, part, _rels, report = _build_date_dimension(
+        tables, ["Orders"], [], mode="DirectQuery")
+    assert "source = CALENDAR(DATE(2015, 1, 1), DATE(2035, 12, 31))" in part
+    assert "CALENDARAUTO" not in part
+    assert any("fixed-range" in w and "CALENDARAUTO" in w for w in report["warnings"])
+
+
+def test_build_date_dimension_directquery_honors_custom_range():
+    tables = [_rel("Orders", "Order_Date")]
+    _name, part, _rels, _report = _build_date_dimension(
+        tables, ["Orders"], [], mode="DirectQuery", date_range=(2020, 2024))
+    assert "source = CALENDAR(DATE(2020, 1, 1), DATE(2024, 12, 31))" in part
+
+
 def test_build_date_dimension_dedupes_table_name():
     # a (degenerate) source table literally named 'Date' forces the calendar to a free name
     tables = [_rel("Date", "Event_Date")]
@@ -192,7 +220,11 @@ def test_migrate_generates_date_table_by_default():
     parts = out["parts"]
 
     assert "definition/tables/Date.tmdl" in parts
-    assert "source = CALENDARAUTO()" in parts["definition/tables/Date.tmdl"]
+    # DATES_SQLSERVER resolves to DirectQuery: a CALENDARAUTO() calculated table would have to query
+    # the source to discover its span (and fails to process without it), so a self-contained
+    # fixed-range CALENDAR(...) is emitted instead. (Import models keep CALENDARAUTO -- see below.)
+    assert "source = CALENDAR(DATE(2015, 1, 1), DATE(2035, 12, 31))" in parts["definition/tables/Date.tmdl"]
+    assert "CALENDARAUTO" not in parts["definition/tables/Date.tmdl"]
     # the calendar is referenced by the model like any other table
     assert "ref table Date" in parts["definition/model.tmdl"]
 
