@@ -16,11 +16,11 @@ description: >
   "tableau calculated field to dax", "rebuild tableau datasource in fabric".
 ---
 
-> **Update Check — ONCE PER SESSION (mandatory)**
-> The first time this skill is used in a session, run the **check-updates** skill before proceeding.
-> - **GitHub Copilot CLI / VS Code**: invoke the `check-updates` skill (e.g., `/fabric-skills:check-updates`).
-> - **Claude Code / Cowork / Cursor / Windsurf / Codex**: read the local `package.json` version, then compare it against the remote version via `git fetch origin main --quiet && git show origin/main:package.json` (or the GitHub API). If the remote version is newer, show the changelog and update instructions.
-> - Skip if the check was already performed earlier in this session.
+> **Update Check — optional, once per session**
+> If a **check-updates** skill is installed alongside this one, run it the first time this skill is used in a session. This skill is commonly installed **standalone**, in which case there is no `check-updates` skill or `package.json` — **skip this silently and proceed to the migration.** It is not required and must never block the workflow.
+> - **GitHub Copilot CLI / VS Code**: invoke the `check-updates` skill only if it appears in your available skills; otherwise skip.
+> - **Claude Code / Cursor / Windsurf / Codex**: if this skill was cloned from its repo, you may compare the local `package.json` version against `git show origin/main:package.json`. If neither is present, skip.
+> - Skip if already checked this session, or if no update mechanism is available.
 
 > **CRITICAL NOTES**
 > 1. To find the workspace details (including its ID) from a workspace name: list all workspaces, then use JMESPath filtering.
@@ -39,6 +39,15 @@ numbers actually match. **Available today:** the semantic-model path — rebuild
 workbook / worksheet → Power BI (PBIR) report rebuild, single-entry estate orchestration, and
 model-object enrichment (hierarchies / display folders / RLS). See
 [§ Feature Parity](#feature-parity-reference) for current vs. in-progress coverage.
+
+## Inputs — Locate the Datasource FIRST
+
+> **The datasource to migrate is supplied by the user. Do NOT assume it lives in the current repo or working directory.** This skill is the migration *toolkit*, not a datasource — a fresh checkout contains no `.tds`. Do **not** search the working directory, find nothing, and stall. Before any other phase, establish the input by asking the user which route applies:
+>
+> - **(A) Local file** *(simplest — no Tableau credentials)* — the user has a Tableau file. Ask for the path to a `.tds`, `.tdsx`, `.twb`, or `.twbx`. `.tdsx`/`.twbx` are zips: extract the inner `.tds`/`.twb` first. Always read with `encoding="utf-8-sig"` (the files carry a UTF-8 BOM).
+> - **(B) Live published datasource** — the user names a datasource published on Tableau Server / Cloud (a *name*, not a file path). Pull it down first with the **`tableau-datasource-profiler`** skill (or the Tableau **Download Data Source** REST API + Metadata API) using a PAT or Connected-App JWT; that yields the `.tds` this skill consumes, plus field/lineage metadata and reconciliation values.
+>
+> If the user just says "migrate my Tableau datasource" without specifying, **ask which route** (file path vs. published-datasource name + Tableau connection) rather than guessing. Once you hold the `.tds`, continue to the Migration Phases below.
 
 ## Prerequisite Knowledge
 

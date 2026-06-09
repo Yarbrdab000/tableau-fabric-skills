@@ -21,27 +21,34 @@ installed you just describe the migration and the Copilot drives it (including a
 
 > M365 / Office Copilot is **not** a target — it can't execute the scripts. Use a coding-agent Copilot.
 
-**Option A — One command (GitHub Copilot CLI plugin marketplace):**
-
-```text
-/plugin marketplace add Yarbrdab000/tableau-migration-skill
-/plugin install tableau-migration@tableau-collection
-```
-
-**Option B — Manual copy (works in any agent):** clone, then drop the skill folder where your agent discovers skills.
+**Install = drop the skill folder where your agent discovers skills.** Agent skills are loaded from
+well-known directories — there is no build step. Clone the repo, then copy `skills/tableau-migration/`
+to one of these locations:
 
 ```bash
 git clone https://github.com/Yarbrdab000/tableau-migration-skill.git
 ```
 
-| Agent | Copy `skills/tableau-migration/` to |
-|---|---|
-| GitHub Copilot CLI / VS Code | your repo's `.github/skills/tableau-migration/` |
-| Claude Code | `.claude/skills/tableau-migration/` |
-| Cursor / Windsurf / Codex | anywhere in the repo, then point the agent at `skills/tableau-migration/SKILL.md` |
+| Agent | Copy `skills/tableau-migration/` to | Scope |
+|---|---|---|
+| **GitHub Copilot CLI — personal (recommended)** | `~/.copilot/skills/tableau-migration/` | Every chat, any repo — true plug-and-play |
+| GitHub Copilot CLI / VS Code — project | your repo's `.github/skills/tableau-migration/` | That repo only (shared with the team) |
+| Claude Code | `~/.claude/skills/` (personal) or `.claude/skills/` (project) | Personal or project |
+| Cursor / Windsurf / Codex | anywhere in the repo, then point the agent at `skills/tableau-migration/SKILL.md` | Project |
+
+The **personal** path (`~/.copilot/skills/`) is the smoothest: install once and the skill is available
+in every new Copilot CLI chat regardless of which repo you're in. See GitHub's docs:
+[Adding agent skills for GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills).
 
 Then start a chat and say e.g. *"migrate my Tableau Superstore datasource to a Fabric semantic model."*
+The agent will ask whether your datasource is a **local file** (`.tds`/`.tdsx`/`.twb`/`.twbx`) or a
+**live published datasource** (pulled via Tableau's REST/Metadata API) and drive the rest.
 The only Python requirement is **3.11+** (the scripts are stdlib-only — no pip install needed to run them).
+
+> **Plugin marketplace (`/plugin marketplace add …`)** is a separate, newer Copilot CLI / Claude Code
+> packaging mechanism and is **not available in every build** — if `/plugin` does nothing in your client,
+> use the folder copy above, which always works. A marketplace manifest is included in the repo for
+> clients that do support it.
 
 ## Layout
 
