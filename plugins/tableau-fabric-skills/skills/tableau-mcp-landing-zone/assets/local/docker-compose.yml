@@ -28,6 +28,9 @@ services:
       PORT: "8000"
       # The sidecar is our auth boundary, so disable the official OAuth 2.1 front door.
       DANGEROUSLY_DISABLE_OAUTH: "true"
+      # tableau-mcp 2.7.x: skip the startup site-settings probe (needs a scope a direct-trust
+      # Connected App usually lacks -> initialize 500). Disabling it only skips that read.
+      ENABLE_MCP_SITE_SETTINGS: "false"
       # Enables the X-Tableau-Auth passthrough middleware (used in passthrough mode).
       ENABLE_PASSTHROUGH_AUTH: "${ENABLE_PASSTHROUGH_AUTH:-false}"
       SERVER: ${TABLEAU_SERVER}
@@ -51,7 +54,9 @@ services:
       - "9000:9000"
     environment:
       PORT: "9000"
-      UPSTREAM_MCP_URL: http://tableau-mcp:8000/mcp
+      # Version-coupled to the tableau-mcp image tag: 2.x serves Streamable HTTP at /tableau-mcp
+      # (older tags used /mcp). Re-check this path if you pin a different tag above.
+      UPSTREAM_MCP_URL: http://tableau-mcp:8000/tableau-mcp
       # Caller auth.
       ALLOW_API_KEY: "true"
       SIDECAR_API_KEY: ${SIDECAR_API_KEY}

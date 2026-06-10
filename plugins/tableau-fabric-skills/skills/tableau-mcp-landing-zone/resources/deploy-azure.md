@@ -14,6 +14,25 @@ when you're driving from a shell). Both produce the same Container App with HTTP
 > `assets/azure/main.parameters.json`. The Bicep marks both `@secure()`, so they stay out of Azure
 > deployment history; the only remaining leak vector is your shell/agent, so keep them out of it.
 
+### Source secrets from Key Vault (recommended, especially for agents)
+
+To keep secret material out of args, chat, and logs, read each secret from an existing Key Vault
+into a local variable at deploy time instead of pasting it:
+
+```powershell
+$secret = az keyvault secret show --vault-name <your-vault> --name <connected-app-secret-name> --query value -o tsv
+./deploy.ps1 -ResourceGroup my-rg ... -ConnectedAppSecretValue $secret
+```
+
+- The value lives only in a local variable for the call — never echo it.
+- **Don't print the Sidecar Api Key.** If `deploy.ps1` generates one it is printed so a human can
+  copy it; when an *agent* drives the deploy, either pre-generate the key and store it in Key Vault
+  (passing it via the same `az keyvault secret show` pattern) or redact stdout, so the key never
+  lands in a transcript. Hand only a Key Vault *reference* downstream, not the raw value.
+- A pasted browser URL like `https://10ay.online.tableau.com/#/site/<slug>/...` is **not** the
+  `-TableauServer` value: pass the pod URL only (`https://10ay.online.tableau.com`) and the
+  `<slug>` segment as `-TableauSite` (an empty slug means the **Default** site).
+
 ## Option A — Deploy to Azure button (portal form, no CLI)
 
 [![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FYarbrdab000%2Ftableau-fabric-skills%2Fmain%2Fskills%2Ftableau-mcp-landing-zone%2Fassets%2Fazure%2Fazuredeploy.json)
@@ -80,11 +99,29 @@ capture it. On success the script prints `mcpEndpoint`, the `x-api-key` to send,
 
 1. Open `healthUrl` → expect `{"status":"ok"}` (first hit after idle may cold-start ~15s).
 2. Proceed to [copilot-studio-wiring.md](copilot-studio-wiring.md) and run one NL query.
+3. (Optional) Run the bundled [`scripts/verify_deployment.py`](../scripts/verify_deployment.py) — a
+   stdlib, fail-loud probe that sends a real `initialize` + `tools/list` and asserts the identity
+   mode and a minimum tool count. It reads the api key from `$env:SIDECAR_API_KEY` (never an arg);
+   `--base-url` is non-secret. Expect a brief cold-start on the first call.
 
 ## Cost
 
 The Container App **scales to zero** when idle (`minReplicas=0`), so occasional use is typically a
 few dollars/month or less.
+
+## Tear down
+
+A test or demo deployment still bills for storage, the Log Analytics workspace, and any non-idle
+replicas until you remove it. When you're done verifying (including through Microsoft 365 Copilot),
+delete the deployment. If you deployed into a **dedicated** resource group, the simplest cleanup is:
+
+```powershell
+az group delete --name <your-resource-group> --yes --no-wait
+```
+
+That removes the Container App, its managed environment, the Log Analytics workspace, and (if used)
+the Key Vault created by the deploy. If the resource group also holds resources you want to keep,
+delete just the Container App and its `*-env` managed environment instead.
 
 ## Common parameters (beyond the form)
 
@@ -92,6 +129,19 @@ Override these via `deploy.ps1` params or the Bicep ([`assets/azure/main.bicep`]
 `includeTools` / `maxResultLimits` (tool curation), `useKeyVault` (secrets in Key Vault via managed
 identity), `minReplicas` / `maxReplicas`, `tableauMcpImage` / `sidecarImage`.
 
-> **Pin images by digest for production.** Replace the tag defaults of `tableauMcpImage` and
-> `sidecarImage` with `…@sha256:<digest>` so deploys are reproducible and can't silently pull a
-> changed image. Resolve a digest with `docker buildx imagetools inspect <image:tag>`.
+> **Pin images by digest for production.** The defaults use readable tags (`tableauMcpImage`
+> `…:2.7.4`, `sidecarImage` `…:latest`). For deploys that must be byte-reproducible and immune to a
+> retag, override with `…@sha256:<digest>`. The verified `2.7.4` digest is
+> `sha256:10a043fea52c6152ab1d86222540aa1bc2ba021411dc772bc3f48a3c36b54de1`; resolve others with
+> `docker buildx imagetools inspect <image:tag>`. **Version note:** the upstream HTTP path
+> (`/tableau-mcp`) and the `ENABLE_MCP_SITE_SETTINGS=false` default are coupled to the 2.7.x line —
+> re-verify both if you move to a different tag/digest.
+
+## Tool governance: site-driven overrides (opt-in)
+
+The deploy sets `ENABLE_MCP_SITE_SETTINGS=false`. The official server otherwise runs a startup
+site-settings probe that needs the `tableau:mcp_site_settings:read` scope, which a Direct-Trust
+Connected App typically does not grant — leaving it on **500s the `initialize` handshake**. The
+curated tool set still registers with it off. To instead let Tableau **site settings** govern which
+tools are enabled, grant the Connected App `tableau:mcp_site_settings:read` and set
+`ENABLE_MCP_SITE_SETTINGS=true` (requires Tableau REST API ≥ 3.29 and the feature live on your site).

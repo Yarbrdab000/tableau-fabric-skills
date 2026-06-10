@@ -248,6 +248,11 @@ var mcpEnv = concat(
     { name: 'TRANSPORT', value: 'http' }
     { name: 'PORT', value: string(mcpPort) }
     { name: 'DANGEROUSLY_DISABLE_OAUTH', value: 'true' }
+    // Version-sensitive (tableau-mcp 2.7.x): a startup site-settings probe needs the scope
+    // tableau:mcp_site_settings:read, which a direct-trust Connected App typically does not
+    // grant -> the initialize handshake 500s. Disabling it only skips that one read; the
+    // curated tool set still registers. Re-evaluate if a future image changes this default.
+    { name: 'ENABLE_MCP_SITE_SETTINGS', value: 'false' }
     { name: 'ENABLE_PASSTHROUGH_AUTH', value: isPassthrough ? 'true' : 'false' }
     { name: 'SERVER', value: tableauServer }
     { name: 'SITE_NAME', value: tableauSite }
@@ -270,7 +275,10 @@ var mcpEnv = concat(
 var sidecarEnv = concat(
   [
     { name: 'PORT', value: string(sidecarPort) }
-    { name: 'UPSTREAM_MCP_URL', value: 'http://localhost:${mcpPort}/mcp' }
+    // Version-coupled to the pinned tableauMcpImage tag: tableau-mcp 2.x serves Streamable HTTP
+    // at /tableau-mcp; older tags used /mcp. A wrong path returns an Express 404 ("Cannot POST").
+    // Re-verify this path if you bump the image tag.
+    { name: 'UPSTREAM_MCP_URL', value: 'http://localhost:${mcpPort}/tableau-mcp' }
     { name: 'ALLOW_API_KEY', value: allowApiKey ? 'true' : 'false' }
     { name: 'TRUST_EASY_AUTH', value: (enableEasyAuth || isPassthrough) ? 'true' : 'false' }
     { name: 'IDENTITY_MODE', value: identityMode }

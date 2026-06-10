@@ -12,7 +12,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+- **tableau-mcp-landing-zone:** corrected the default `tableauMcpImage` pin. The previous
+  default `:2.4.3` returns `MANIFEST_UNKNOWN` on GHCR (published stable tags jump 2.2.4 ->
+  2.7.4), so a fresh deploy could not pull the image. Now defaults to the readable tag
+  `:2.7.4` (still overridable) consistently across `main.bicep`, `azuredeploy.json`,
+  `main.parameters.json`, and `deploy.ps1`, with the resolved `@sha256:` digest recorded as a
+  hardening opt-in (template comment + `deploy-azure.md`).
+- **tableau-mcp-landing-zone:** fixed the sidecar `UPSTREAM_MCP_URL` path. tableau-mcp 2.x
+  serves Streamable HTTP at `/tableau-mcp` (older tags used `/mcp`); the stale path returned an
+  Express 404 ("Cannot POST"). Updated in `main.bicep`, `azuredeploy.json`, and the local
+  `docker-compose.yml`.
+- **tableau-mcp-landing-zone:** set `ENABLE_MCP_SITE_SETTINGS=false` for the official server.
+  2.7.x runs a startup site-settings probe needing the `tableau:mcp_site_settings:read` scope a
+  direct-trust Connected App typically lacks, which 500'd the `initialize` handshake; disabling
+  it skips only that read (the curated tool set still registers). Verified end-to-end against a
+  live 2.7.4 deploy.
 
 ## [0.3.0] - 2026-06-10
 

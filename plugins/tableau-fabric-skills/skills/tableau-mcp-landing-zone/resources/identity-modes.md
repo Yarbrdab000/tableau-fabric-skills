@@ -25,6 +25,15 @@ This lets the server query Tableau without storing anyone's password.
 5. **Generate New Secret** and copy: **Client ID**, **Secret ID**, **Secret Value** (shown once),
    and your **site content URL** (the slug in the site URL).
 
+> **Store the Connected App in Key Vault (recommended).** Rather than pasting the three values on
+> every deploy, keep them in a vault — either as one JSON secret
+> `{ "clientId": "...", "secretId": "...", "secretValue": "..." }` or as three secrets with stable
+> names (`clientId`, `secretId`, `secretValue`). Hydrate them at deploy time with
+> `az keyvault secret show --vault-name <vault> --name <name> --query value -o tsv` (see
+> [deploy-azure.md](deploy-azure.md) → "Source secrets from Key Vault"), so no secret material is
+> typed into args, chat, or logs. The **Secret Value** is shown only once at generation — capture it
+> straight into the vault.
+
 ## Step 2 — Choose the service account deliberately
 
 `serviceAccountUsername` is required by the official server at startup and is the identity used for
