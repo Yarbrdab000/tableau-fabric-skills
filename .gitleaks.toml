@@ -1,0 +1,47 @@
+# Gitleaks configuration for tableau-fabric-skills.
+#
+# Extends the default Gitleaks ruleset with project-specific rules for the credential
+# types this collection handles (Tableau PATs, Connected App Direct Trust secrets, and the
+# MCP landing-zone sidecar key), and allowlists the committed template/example/doc files
+# that intentionally contain placeholder values.
+
+title = "tableau-fabric-skills gitleaks config"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "tableau-personal-access-token"
+description = "Tableau personal access token secret value"
+regex = '''(?i)(tableau[_-]?(pat|personal[_-]?access[_-]?token|pat[_-]?secret))['"\s:=]{1,5}[A-Za-z0-9+/=_-]{20,}'''
+tags = ["tableau", "pat"]
+
+[[rules]]
+id = "tableau-connected-app-secret"
+description = "Tableau Connected App (Direct Trust) secret value"
+regex = '''(?i)(connected[_-]?app[_-]?secret[_-]?value|tableau[_-]?connected[_-]?app[_-]?secret[_-]?value)['"\s:=]{1,5}[A-Za-z0-9+/=]{20,}'''
+tags = ["tableau", "connected-app"]
+
+[[rules]]
+id = "mcp-sidecar-api-key"
+description = "MCP landing-zone sidecar shared API key"
+regex = '''(?i)(sidecar[_-]?api[_-]?key)['"\s:=]{1,5}[A-Za-z0-9+/=_-]{16,}'''
+tags = ["mcp", "api-key"]
+
+[allowlist]
+description = "Committed templates, examples, and docs that intentionally show placeholder secrets"
+paths = [
+  '''(^|.*/)\.env\.example$''',
+  '''.*/assets/.*\.example$''',
+  '''CLEANROOM\.md$''',
+  '''THIRD_PARTY_NOTICES\.md$''',
+  '''SECURITY\.md$''',
+  '''.*/resources/.*\.md$''',
+]
+regexes = [
+  '''(?i)your-?[a-z-]*-?api-?key''',
+  '''(?i)your-sidecar-api-key''',
+  '''<[A-Za-z0-9_.-]+>''',
+  '''(?i)example\.com''',
+  '''(?i)changeme|placeholder|replace[_-]?me''',
+]
