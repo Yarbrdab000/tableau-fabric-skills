@@ -10,7 +10,7 @@
 
 .EXAMPLE
   # Simplest: service-account mode, api-key auth (Copilot Studio custom connector).
-  ./deploy.ps1 -ResourceGroup RY-fabric-demo `
+  ./deploy.ps1 -ResourceGroup rg-tableau-mcp `
                -TableauServer https://10ay.online.tableau.com `
                -TableauSite my-site `
                -ConnectedAppClientId <id> -ConnectedAppSecretId <id> `
@@ -20,7 +20,7 @@
 
 .EXAMPLE
   # Per-user RLS: passthrough mode behind Easy Auth (Entra).
-  ./deploy.ps1 -ResourceGroup RY-fabric-demo `
+  ./deploy.ps1 -ResourceGroup rg-tableau-mcp `
                -TableauServer https://10ay.online.tableau.com -TableauSite my-site `
                -ConnectedAppClientId <id> -ConnectedAppSecretId <id> -ConnectedAppSecretValue <value> `
                -ServiceAccountUsername svc-mcp@company.com `

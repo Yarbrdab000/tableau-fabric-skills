@@ -32,8 +32,8 @@ Copilot Studio's built-in "Add a tool" MCP flow if your tenant has it.
 1. Open the swagger file in this folder: **`mcp-connector.swagger.yaml`**.
 2. Edit one line — set `host:` to **your** Container App FQDN (the `mcpEndpoint`
    without `https://` and without the trailing `/mcp`). For example, for
-   `https://tableau-mcp.graysea-5a3f72c8.westus3.azurecontainerapps.io/mcp`, the host is
-   `tableau-mcp.graysea-5a3f72c8.westus3.azurecontainerapps.io`.
+   `https://tableau-mcp.<your-env>.westus3.azurecontainerapps.io/mcp`, the host is
+   `tableau-mcp.<your-env>.westus3.azurecontainerapps.io`.
 3. Go to **Power Apps** → <https://make.powerapps.com> → pick the same environment your
    agent uses → **More** → **Discover all** → **Custom connectors**
    (or **Solutions** → your solution → **New** → **Automation** → **Custom connector**).

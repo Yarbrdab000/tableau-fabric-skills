@@ -36,7 +36,7 @@ Usage
 -----
     # by name, PAT from env, save into a folder
     py -3.11 fetch_tds.py --server 10ay.online.tableau.com \
-        --site fabricmigration-72a36cc231 --datasource-name "Snowflake-Superstore" \
+        --site mysite --datasource-name "Snowflake-Superstore" \
         --pat-name Migration-PAT --pat-secret "$env:TABLEAU_PAT_VALUE" --out .\\pulled
 
     # by LUID, Connected-App JWT acting as an admin
