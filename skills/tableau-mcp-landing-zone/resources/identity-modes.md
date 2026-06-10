@@ -21,7 +21,7 @@ This lets the server query Tableau without storing anyone's password.
 2. **New Connected App → Direct Trust**; name it (e.g. `Copilot MCP Bridge`); **Create**.
 3. Set it to **Enabled**.
 4. Under **Scopes**, enable `tableau:content:read` and `tableau:viz_data_service:read`
-   (+ `tableau:insights:read` only if you'll expose Pulse).
+   (plus the Pulse insight scopes only if you'll expose Pulse — see *Scopes by capability* below).
 5. **Generate New Secret** and copy: **Client ID**, **Secret ID**, **Secret Value** (shown once),
    and your **site content URL** (the slug in the site URL).
 
@@ -33,6 +33,39 @@ This lets the server query Tableau without storing anyone's password.
 > [deploy-azure.md](deploy-azure.md) → "Source secrets from Key Vault"), so no secret material is
 > typed into args, chat, or logs. The **Secret Value** is shown only once at generation — capture it
 > straight into the vault.
+
+### Scopes by capability — grant only what your enabled tools need
+
+A tool returns **401/403 at call time** (not a deploy error) if the Connected App is missing the
+scope its Tableau REST / VizQL / Pulse calls need. Grant the **minimum** for the tool groups you turn
+on with `includeTools`, and add scopes only when you enable the capability that needs them. (These
+names come straight from the official server's `getRequiredApiScopesForTool` map.)
+
+| Capability / tool group (`includeTools`) | Tools | Connected App scope(s) to grant |
+|---|---|---|
+| **NL data queries — default** | `datasource` (`list-datasources`, `get-datasource-metadata`, `query-datasource`) | `tableau:content:read` **+** `tableau:viz_data_service:read` |
+| **Content search — default** | `content-exploration` (`search-content`) | `tableau:content:read` |
+| **Workbooks / projects** | `workbook`, `project` | `tableau:content:read` |
+| **Views — data & image/PDF export** | `view` (`get-view-data`, `get-view-image`, custom-view variants) | `tableau:content:read` **+** `tableau:views:download` |
+| **Pulse — metrics & insights** | `pulse` (list metric definitions / metrics / subscriptions, generate insight bundle & brief) | `tableau:insight_definitions_metrics:read`, `tableau:insight_metrics:read`, `tableau:metric_subscriptions:read`, `tableau:insights:read`, `tableau:insight_brief:create` |
+
+**Minimum for the default deploy** (`includeTools=datasource,content-exploration`):
+`tableau:content:read` + `tableau:viz_data_service:read`. Those two are all most users ever need.
+
+> **Pulse needs a *family* of scopes, not just one.** Granting only `tableau:insights:read` covers
+> the *generate insight bundle* tool, but the Pulse **list** tools still 401 — grant all five Pulse
+> scopes above and deploy with `-IncludeTools '...,pulse'`.
+
+> **`tableau:datasources:download` is *not* an MCP tool scope.** No landing-zone tool downloads a
+> datasource, so the MCP server never needs it. You only need it for the sibling
+> **`tableau-datasource-profiler`** / **`tableau-migration`** skills, which reuse this same Connected
+> App to pull `.tdsx` files over REST. Add it to the app if you'll run those skills; it has no effect
+> on the MCP server.
+
+> **You do *not* need `tableau:mcp_site_settings:read`.** The landing zone sets
+> `ENABLE_MCP_SITE_SETTINGS=false`, so the server skips the site-settings probe that scope gates.
+> Grant it only if you opt into site-settings tool governance (see
+> [deploy-azure.md](deploy-azure.md) → *Tool governance*).
 
 ## Step 2 — Choose the service account deliberately
 

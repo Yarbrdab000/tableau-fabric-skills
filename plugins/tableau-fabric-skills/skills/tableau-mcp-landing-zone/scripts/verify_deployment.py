@@ -91,6 +91,7 @@ def _parse_payload(headers, raw):
 class Report:
     def __init__(self):
         self.gates = []  # (name, ok, detail)
+        self.tools = []  # tool names discovered via tools/list (curation visibility)
 
     def add(self, name, ok, detail=""):
         self.gates.append((name, bool(ok), detail))
@@ -103,6 +104,8 @@ class Report:
         return {
             "passed": self.ok,
             "gates": [{"gate": n, "ok": o, "detail": d} for (n, o, d) in self.gates],
+            "tools": self.tools,
+            "pulse_enabled": any("pulse" in (t or "").lower() for t in self.tools),
         }
 
     def print_human(self):
@@ -215,11 +218,32 @@ def gate_mcp(report, root, args):
     payload2 = _parse_payload(rh2, raw2)
     tools = (payload2 or {}).get("result", {}).get("tools", []) if isinstance(payload2, dict) else []
     names = [t.get("name") for t in tools if isinstance(t, dict)]
+    report.tools = [n for n in names if n]
     ok = status == 200 and len(names) >= args.min_tools
     detail = f"status={status} tools={len(names)}"
     if names:
         detail += " -> " + ", ".join(n for n in names[:8] if n) + ("..." if len(names) > 8 else "")
     report.add(f"mcp: tools/list exposes >= {args.min_tools} tool(s)", ok, detail)
+    if args.expect_tools:
+        have = {n.lower() for n in report.tools}
+        for want in args.expect_tools:
+            present = want.lower() in have
+            report.add(f"mcp: tool '{want}' present", present,
+                       "" if present else "not in tools/list")
+
+
+# ----------------------------------------------------------------------------- tool curation
+def _print_tool_curation(report):
+    """Make the enabled tool set + Pulse gating visible (the deploy curates ~20 tools down)."""
+    if not report.tools:
+        return
+    print("-" * 60)
+    print(f"Enabled tools ({len(report.tools)}): " + ", ".join(sorted(report.tools)))
+    if any("pulse" in t.lower() for t in report.tools):
+        print("Pulse: ENABLED (insights tools present).")
+    else:
+        print("Pulse: OFF. To enable, grant the Connected App 'tableau:insights:read' and "
+              "redeploy with INCLUDE_TOOLS including 'pulse'.")
 
 
 # ----------------------------------------------------------------------------- main
@@ -238,12 +262,15 @@ def main(argv=None):
     p.add_argument("--expect-identity-mode", choices=["service_account", "passthrough"], default=None)
     p.add_argument("--expect-easy-auth", type=_str2bool, default=None)
     p.add_argument("--min-tools", type=int, default=1)
+    p.add_argument("--expect-tools", default="",
+                   help="Comma-separated tool names to assert are present (e.g. list-datasources,query-datasource).")
     p.add_argument("--retries", type=int, default=5, help="Health retries for scale-to-zero cold start.")
     p.add_argument("--retry-wait", type=float, default=5.0)
     p.add_argument("--timeout", type=float, default=30.0)
     p.add_argument("--json", action="store_true", help="Emit the report as JSON.")
     args = p.parse_args(argv)
     args.api_key_present = bool(args.api_key)
+    args.expect_tools = [t.strip() for t in args.expect_tools.split(",") if t.strip()]
 
     root = _base_root(args.base_url)
     report = Report()
@@ -260,6 +287,7 @@ def main(argv=None):
         print(json.dumps(report.to_dict(), indent=2))
     else:
         report.print_human()
+        _print_tool_curation(report)
     return 0 if report.ok else 1
 
 

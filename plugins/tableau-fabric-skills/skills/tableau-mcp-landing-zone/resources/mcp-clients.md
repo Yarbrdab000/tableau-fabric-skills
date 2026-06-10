@@ -39,6 +39,12 @@ this. (Per-client setup detail lives in the sections further down.)
 - Or add the server to **[GitHub Copilot CLI](#3-github-copilot-cli-this-client)** and ask
   *"list my Tableau data sources."* A clean tool response means you're live.
 
+> ⚠️ **Don't smoke-test `/mcp` with PowerShell `Invoke-WebRequest` (or `curl.exe`).** The endpoint
+> streams Server-Sent Events, so `Invoke-WebRequest` blocks on the open stream and can mangle the
+> console. Use the stdlib Python probes instead — they parse SSE cleanly: `verify_deployment.py`
+> (health + handshake) and `query.py` (`... list` then `... query --datasource <luid>`; it won't
+> guess a datasource).
+
 **Path B — real end-user experience (the M365-like path).** A person prompts an agent and gets a
 formatted answer from live Tableau data.
 
@@ -52,8 +58,10 @@ formatted answer from live Tableau data.
 > *"Which Tableau data sources can you see, and what are the top 3 regions by sales in one of them?"*
 
 PASS = the agent calls the MCP tools (`list-datasources` → `query-datasource`) and answers from
-**live Tableau data**, not a guess — i.e. agent → MCP → data → formatted answer. (The endpoint
-exposes Tableau *query* tools; rebuilding a datasource into a Power BI semantic model is the
+**live Tableau data**, not a guess — i.e. agent → MCP → data → formatted answer. If more than one
+datasource could match, a well-behaved agent **asks which one** before querying rather than picking
+for you — see [Query discipline & grounding](#query-discipline--grounding-agent-behavior). (The
+endpoint exposes Tableau *query* tools; rebuilding a datasource into a Power BI semantic model is the
 separate `tableau-migration` skill, not this endpoint.)
 
 **Cold-start caveat.** The Container App scales to zero when idle, so the **first** call after a
@@ -73,6 +81,28 @@ quiet period can take ~15s or briefly fail — just retry once.
 > ⚠️ **Client config syntax changes fast.** The configs below are current at time of writing;
 > where a step is version-sensitive it's flagged **"confirm for your version"** with a link to the
 > vendor's MCP docs. Prefer the client's guided "add server" command over hand-editing when one exists.
+
+## Query discipline & grounding (agent behavior)
+
+These rules are for the **agent answering questions through this endpoint** — they apply to every
+client below. The endpoint exposes query tools, not judgement: the agent must **verify, not infer**.
+A confidently wrong answer is worse than a short clarifying question.
+
+- **Pick the datasource explicitly — never guess.** First call `list-datasources`. If more than one
+  source could match the user's intent (e.g. several "Superstore" sources over different
+  connections), **present the candidates and ask which one** before querying. Don't silently pick.
+- **Validate fields before querying.** Call `get-datasource-metadata` to confirm the exact field
+  captions, roles, and types exist — don't assume names like `Region` / `Sales`.
+- **Ground every temporal claim in a query.** For any "latest / most recent / this quarter"
+  question, first query `MAX(date)` / `MIN(date)` and **state the boundary explicitly**. A
+  `… DESC` sort looks authoritative but does not prove the period boundary.
+- **"Data exists" ≠ "data is current or complete."** Sample/extract data can run into the future or
+  end years ago. Distinguish the **latest populated** period from the **latest elapsed** period, and
+  flag partial/incomplete periods instead of reporting them as a trend.
+- **Never assert freshness or live-vs-extract without checking.** Don't call a source "static", "a
+  sample", or "live" unless you've confirmed it (metadata / connection info). State what you verified.
+- **Prefer aggregation; keep result sets small.** Use `TOP` / filters and grouped aggregates rather
+  than pulling raw rows.
 
 ## Where do you want to consume this?
 
@@ -163,18 +193,8 @@ pane, and tool curation) lives in **[copilot-studio-wiring.md](copilot-studio-wi
 
 ## 3. GitHub Copilot CLI (this client)
 
-**Interactive:** run `/mcp add`, then fill the form:
-
-- **Server Name** `tableau`
-- **Server Type** `HTTP` (Streamable HTTP)
-- **URL** your MCP endpoint (ends in `/mcp`)
-- **HTTP Headers** `{"x-api-key": "YOUR-SIDECAR-API-KEY"}`
-- **Tools** `*`
-
-Save with <kbd>Ctrl</kbd>+<kbd>S</kbd>; it's available immediately. Manage with `/mcp show`,
-`/mcp show tableau`, `/mcp edit tableau`, `/mcp delete tableau`.
-
-**Config file** — `~/.copilot/mcp-config.json` (Windows: `%USERPROFILE%\.copilot\mcp-config.json`):
+**Config file (primary — deterministic and copy-paste).** Create or edit
+`~/.copilot/mcp-config.json` (Windows: `%USERPROFILE%\.copilot\mcp-config.json`):
 
 ```json
 {
@@ -188,6 +208,26 @@ Save with <kbd>Ctrl</kbd>+<kbd>S</kbd>; it's available immediately. Manage with 
   }
 }
 ```
+
+Then **restart the CLI session** to load it — the deterministic path that always works. (Newer CLI
+versions may also support `/mcp reload` to pick it up without restarting.) Confirm with `/mcp show`
+(or `/mcp show tableau`).
+
+**Interactive form (optional convenience).** The `/mcp` commands (`/mcp add`, `/mcp show`,
+`/mcp edit tableau`, `/mcp delete tableau`) are handled by the **CLI client itself**. `/mcp add`
+opens a form — Server Name `tableau`, Server Type `HTTP` (Streamable HTTP), URL your `/mcp`
+endpoint, HTTP Headers `{"x-api-key": "YOUR-SIDECAR-API-KEY"}`, Tools `*`; save with
+<kbd>Ctrl</kbd>+<kbd>S</kbd>.
+
+> **Agent-behavior note.** Slash commands are **client-side** — an AI agent running inside the CLI
+> **cannot execute `/mcp add` itself**. If a `/mcp add` instruction "falls through" to the agent,
+> don't loop on it: write the JSON above to `~/.copilot/mcp-config.json` and tell the user to
+> **restart the CLI session** (or run `/mcp reload` if their version supports it). The config-file
+> path is the one an agent can actually complete.
+
+> 🔴 **Secret discipline.** `~/.copilot/mcp-config.json` is user-global (outside any repo), but the
+> key is a live secret. Source it from Key Vault, and **never paste, print, or echo the literal key
+> back into chat.** See [Secret discipline](#secret-discipline).
 
 **Test** — ask: *"What Tableau datasources can you see?"* → the agent calls `list-datasources`.
 
@@ -400,7 +440,10 @@ with Easy Auth/OAuth rather than relying on the shared key alone.
    - *"What fields are in the Superstore datasource?"* → `get-datasource-metadata`
    - *"What were the top 3 regions by total sales?"* → `query-datasource`
 
-The agent should call the tools and answer from live Tableau data.
+The agent should call the tools and answer from live Tableau data. If more than one datasource
+matches, it should **ask which one**; for any "latest / most recent" question it should confirm the
+date boundary with `MAX(date)` before analyzing — see
+[Query discipline & grounding](#query-discipline--grounding-agent-behavior).
 
 ## Troubleshooting
 
@@ -409,6 +452,7 @@ The agent should call the tools and answer from live Tableau data.
 | Tools don't appear | Confirm the server is connected (`/mcp show` in Copilot CLI, `/mcp` in Claude Code, **Configure Tools** in VS Code, **Settings → MCP** in Cursor, hammer icon in Claude Desktop); check the URL ends in `/mcp` and the key is right. |
 | `401` from the server | The API key is wrong or not sent as `x-api-key` (or `Authorization: Bearer <key>`). |
 | First call hangs a few seconds | The Container App scaled to zero; the first request after idle is a cold start. Retry. |
+| PowerShell `Invoke-WebRequest` hangs on `/mcp` | The endpoint streams Server-Sent Events; `Invoke-WebRequest` blocks on the open stream and can mangle the console. Smoke-test with the stdlib Python probe `verify_deployment.py` (it parses SSE), not `Invoke-WebRequest`. |
 | Empty / partial results | In `service_account` mode the account's RLS may legitimately limit rows. |
 | Claude Desktop won't connect | Check Node 18+; use `--transport http-only` and the no-space `--header`; clear `~/.mcp-auth` and restart. |
 | M365 Copilot agent won't call tools | Generative orchestration must be ON; the connection's API key must match the deployed `sidecarApiKey`. |

@@ -19,7 +19,8 @@ before exposing the endpoint beyond a demo.
 - **Secrets:** plain Container App secrets by default; opt into **Key Vault + managed identity**
   with `useKeyVault=true`.
 - **Least privilege:** scope the Connected App to `tableau:content:read` +
-  `tableau:viz_data_service:read` (+ `tableau:insights:read` only for Pulse). In `service_account`
+  `tableau:viz_data_service:read` (plus the Pulse insight scopes only for Pulse — see *Scopes by
+  capability* in [identity-modes.md](identity-modes.md)). In `service_account`
   mode use a least-privilege Tableau user — a Site Admin bypasses RLS.
 
 ## Harden with Microsoft Entra (recommended for production)
@@ -42,6 +43,19 @@ front door**:
 
 Rotate immediately if a key was ever pasted into chat, a ticket, or a commit.
 
+## Rotate the Connected App secret
+
+The Connected App **Secret Value** signs the Tableau JWT — treat it like the api key.
+
+1. Tableau -> **Settings -> Connected Apps -> Direct Trust** -> open the app -> **Generate New
+   Secret**, then delete the old secret.
+2. Store the new value in Key Vault (or your secret store) and update the `connected-app-secret`
+   Container App secret (or redeploy) so the sidecar signs with the new value.
+3. The old secret stops working the moment it is deleted in Tableau.
+
+**Rotate immediately if the secret value or the api key ever appeared in chat, a ticket, a log, or
+a commit** — a secret that entered a transcript is compromised even if later deleted.
+
 ## Curate tools
 
 The landing zone ships `includeTools=datasource,content-exploration` and
@@ -51,6 +65,13 @@ high-signal NL-query set with a sane row cap. Adjust at deploy time:
 - Add a group (e.g. `pulse`, `view`) by extending `includeTools`.
 - Raise/lower row caps via `maxResultLimits`.
 - Fewer, well-described tools orchestrate more reliably on weaker models.
+
+> **Scopes follow tools.** Each group needs matching Connected App scopes — e.g. the `view` group
+> needs `tableau:views:download`, and the `pulse` group needs the Pulse insight scope family
+> (`tableau:insight_definitions_metrics:read`, `tableau:insight_metrics:read`,
+> `tableau:metric_subscriptions:read`, `tableau:insights:read`, `tableau:insight_brief:create`).
+> Enabling a tool without its scope yields a **401/403 at call time**, not a deploy error. Full map:
+> the *Scopes by capability* table in [identity-modes.md](identity-modes.md).
 
 ## Troubleshooting
 

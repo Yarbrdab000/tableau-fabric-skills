@@ -148,6 +148,12 @@ Flags: `--query-json` or `--query-file` (required), `--row-limit` (default 100, 
 - To answer a data question, first run `profile_datasource.py` to learn the exact field captions,
   then build a `query_datasource.py` query. Prefer aggregation and use `TOP`/filters to keep
   responses small. VDS allows ~100 calls/hour per Creator, so batch intent into one query.
+- **Ground answers; don't infer.** If `--datasource-name` resolves to more than one datasource, list
+  the candidates (name + project + LUID) and **ask which one** before querying — don't pick
+  arbitrarily. For any "latest/most recent" question, first query `MAX`/`MIN` of the date field and
+  state the boundary explicitly. Remember **"data exists" ≠ "data is current or complete"**: sample
+  data can run into the future or end years ago, so flag partial/incomplete periods. Never assert
+  data freshness or live-vs-extract without checking it.
 - The tool is strictly read-only and always signs out. It never writes to Tableau.
 - For complete value stats unaffected by RLS, use a Site Admin PAT, or `--auth jwt` with
   `TABLEAU_JWT_USERNAME` set to a Site Admin (Connected App Direct Trust impersonation).

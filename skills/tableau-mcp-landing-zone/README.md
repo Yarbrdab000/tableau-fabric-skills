@@ -7,10 +7,10 @@ Foundry**.
 
 This skill is the **navigator/operator**, and it **vendors a self-contained deploy bundle** under
 [`assets/`](assets/) (Bicep, compiled ARM, `deploy.ps1`, the Copilot Studio connector, a
-docker-compose harness) so it deploys without cloning anything else. The bundle is synced from the
-bridge repo's `Play1/deploy/` (the upstream source of truth for the infra); the heavier **sidecar
-source** stays in the [bridge repo](https://github.com/Yarbrdab000/Tableau-Fabric-AI-Bridge/tree/main/Play1/sidecar)
-and ships as a published container image.
+docker-compose harness) so it deploys without cloning anything else. The bundle is **maintained here**
+and is the source of truth for the deploy infra. The auth **sidecar** ships as a prebuilt container
+image (`ghcr.io/yarbrdab000/tableau-fabric-ai-bridge-sidecar`), so you never need its source — or any
+other repo — to deploy or run this skill.
 
 ## What it does
 
@@ -31,17 +31,21 @@ tableau-mcp-landing-zone/
 │   ├── deploy-azure.md              # button + deploy.ps1, params, outputs, verify
 │   ├── identity-modes.md            # service_account vs passthrough, Connected App, UPN mapping, RLS reqs
 │   ├── copilot-studio-wiring.md     # custom connector + built-in MCP tool, test prompts
-│   ├── local-dev.md                 # docker-compose harness + sidecar tests (source in bridge repo)
+│   ├── local-dev.md                 # docker-compose harness + sidecar tests (dev-only; not needed to deploy)
 │   └── security-operations.md       # security boundaries, key rotation, Entra hardening, troubleshooting
 ├── scripts/
 │   └── verify_deployment.py         # stdlib fail-loud deploy verifier (health + auth + MCP handshake)
-└── assets/                          # vendored deploy bundle (synced from bridge Play1/deploy/)
+└── assets/                          # self-contained deploy bundle (maintained in this skill)
     ├── azure/                       # main.bicep, azuredeploy.json, deploy.ps1, main.parameters.json
     ├── copilot-studio/              # mcp-connector.swagger.yaml + README
     └── local/                       # docker-compose.yml + .env.example
 ```
 
 ## Start here
+
+> **Heads-up — a skill is not a slash command.** Do not type `/tableau-mcp-landing-zone`
+> (or any `/`-command). Just describe what you want in plain language — e.g. *deploy the
+> Tableau MCP landing zone to Azure* — and the agent loads this skill automatically.
 
 Open **[SKILL.md](SKILL.md)** → the *Information to collect* checklist tells you exactly what to
 gather (and how), then the *Workflow Selector* routes you to the right resource doc. For a deploy,

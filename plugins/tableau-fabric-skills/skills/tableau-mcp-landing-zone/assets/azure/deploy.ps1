@@ -30,7 +30,8 @@
 [CmdletBinding()]
 param(
   [Parameter(Mandatory = $true)][string]$ResourceGroup,
-  [string]$Location = "eastus",
+  # Default "" => derived from the resource group's region (falls back to eastus only when creating a new RG).
+  [string]$Location = "",
   [string]$ContainerAppName = "tableau-mcp",
   # Readable tag default. Hardening opt-in: pin by digest so a retag can't change the deploy:
   #   ghcr.io/tableau/tableau-mcp:2.7.4@sha256:10a043fea52c6152ab1d86222540aa1bc2ba021411dc772bc3f48a3c36b54de1
@@ -53,6 +54,10 @@ param(
   [switch]$EnableEasyAuth,
   [string]$EntraClientId = "",
   [switch]$UseKeyVault,
+  # Tool curation forwarded to the official server (defaults match main.bicep). Add 'pulse' to expose
+  # Pulse tools (also requires the Pulse insight scope family on the Connected App -- see resources/identity-modes.md).
+  [string]$IncludeTools = "datasource,content-exploration",
+  [string]$MaxResultLimits = "query-datasource:100",
   [int]$MinReplicas = 0,
   [int]$MaxReplicas = 2
 )
@@ -60,9 +65,30 @@ param(
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+# Resolve the deploy region from the resource group so resources never land cross-region.
+# An existing RG's region wins (the deployment targets that RG); fall back to -Location (or eastus)
+# only when the RG has to be created.
+$rgExists = (az group exists --name $ResourceGroup) -eq "true"
+if ($rgExists) {
+  $rgLocation = (az group show --name $ResourceGroup --query location -o tsv).Trim()
+  if ([string]::IsNullOrWhiteSpace($Location)) {
+    $Location = $rgLocation
+    Write-Host "Using resource group '$ResourceGroup' region: $Location" -ForegroundColor Cyan
+  }
+  elseif ($Location -ne $rgLocation) {
+    Write-Host "WARNING: -Location '$Location' differs from resource group region '$rgLocation'; using '$rgLocation' to avoid cross-region resources." -ForegroundColor Yellow
+    $Location = $rgLocation
+  }
+}
+else {
+  if ([string]::IsNullOrWhiteSpace($Location)) { $Location = "eastus" }
+  Write-Host "Resource group '$ResourceGroup' not found; creating it in '$Location'." -ForegroundColor Cyan
+  az group create --name $ResourceGroup --location $Location | Out-Null
+}
+
 if ($AllowApiKey -and [string]::IsNullOrWhiteSpace($SidecarApiKey)) {
   $SidecarApiKey = (New-Guid).Guid
-  Write-Host "No -SidecarApiKey provided; generated one: $SidecarApiKey" -ForegroundColor Yellow
+  Write-Host "No -SidecarApiKey provided; generated a random key (not printed). Retrieve it after deploy from the 'sidecar-api-key' Container App secret (command shown below)." -ForegroundColor Yellow
 }
 
 Write-Host "Deploying Play 1 landing zone to resource group '$ResourceGroup'..." -ForegroundColor Cyan
@@ -93,6 +119,8 @@ $result = az deployment group create `
     useKeyVault=$($UseKeyVault.IsPresent) `
     minReplicas=$MinReplicas `
     maxReplicas=$MaxReplicas `
+    includeTools=$IncludeTools `
+    maxResultLimits=$MaxResultLimits `
   --query properties.outputs -o json | ConvertFrom-Json
 
 Write-Host ""
@@ -101,7 +129,31 @@ Write-Host "Identity mode: $($result.identityModeOut.value)  |  Easy Auth: $($re
 Write-Host "MCP endpoint (register this in Copilot Studio):" -ForegroundColor Yellow
 Write-Host "  $($result.mcpEndpoint.value)"
 if ($AllowApiKey) {
-  Write-Host "Send header  x-api-key: $SidecarApiKey" -ForegroundColor Yellow
+  Write-Host "Caller auth: send the shared key as header  x-api-key: <sidecarApiKey>" -ForegroundColor Yellow
+  Write-Host "  The key is stored as the 'sidecar-api-key' Container App secret and is NOT printed here."
+  Write-Host "  Retrieve it without echoing it into a transcript, e.g.:"
+  Write-Host "    az containerapp secret show -n $ContainerAppName -g $ResourceGroup --secret-name sidecar-api-key --query value -o tsv"
+  Write-Host "  (If you deployed with -UseKeyVault, read it from your Key Vault instead.)"
 }
 Write-Host "Health check:"
 Write-Host "  $($result.healthUrl.value)"
+
+# Tool-curation visibility: make the enabled set + Pulse gating obvious instead of a mystery.
+Write-Host ""
+Write-Host "Curated tools (INCLUDE_TOOLS = '$IncludeTools'):" -ForegroundColor Cyan
+Write-Host "  Default groups expose the NL-query set: list-datasources, get-datasource-metadata, query-datasource, search-content."
+Write-Host "  Row caps (MAX_RESULT_LIMITS = '$MaxResultLimits')."
+Write-Host "  Pulse is OFF unless 'pulse' is included. To enable: grant the Connected App the Pulse insight scopes (tableau:insight_definitions_metrics:read, tableau:insight_metrics:read, tableau:metric_subscriptions:read, tableau:insights:read, tableau:insight_brief:create) and redeploy with -IncludeTools '$IncludeTools,pulse'."
+
+# Emit a ready-to-import Copilot Studio connector with host pre-filled (removes the manual host edit).
+$fqdn = (($result.mcpEndpoint.value) -replace '^https://', '') -replace '/mcp/?$', ''
+$swaggerSrc = Join-Path $here '..\copilot-studio\mcp-connector.swagger.yaml'
+if (Test-Path $swaggerSrc) {
+  $swaggerOut = Join-Path (Get-Location) 'mcp-connector.generated.swagger.yaml'
+  $swagger = Get-Content -Raw $swaggerSrc
+  $swagger = [regex]::Replace($swagger, '(?m)^host:.*$', "host: $fqdn")
+  [System.IO.File]::WriteAllText($swaggerOut, $swagger, (New-Object System.Text.UTF8Encoding($false)))
+  Write-Host ""
+  Write-Host "Copilot Studio connector written with host pre-filled (no manual edit needed):" -ForegroundColor Cyan
+  Write-Host "  $swaggerOut"
+}

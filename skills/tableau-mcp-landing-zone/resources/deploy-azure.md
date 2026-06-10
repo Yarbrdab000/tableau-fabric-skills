@@ -13,6 +13,9 @@ when you're driving from a shell). Both produce the same Container App with HTTP
 > never commit them, never echo them into chat/logs, and never write them into the repo's
 > `assets/azure/main.parameters.json`. The Bicep marks both `@secure()`, so they stay out of Azure
 > deployment history; the only remaining leak vector is your shell/agent, so keep them out of it.
+> **Never ask the user to paste a secret into chat, and never paste one yourself** — read it
+> from Key Vault / an env var (below). If a secret ever appears in the transcript it is compromised;
+> have the user rotate it (new Connected App secret / new api key) before deploying.
 
 ### Source secrets from Key Vault (recommended, especially for agents)
 
@@ -25,10 +28,16 @@ $secret = az keyvault secret show --vault-name <your-vault> --name <connected-ap
 ```
 
 - The value lives only in a local variable for the call — never echo it.
-- **Don't print the Sidecar Api Key.** If `deploy.ps1` generates one it is printed so a human can
-  copy it; when an *agent* drives the deploy, either pre-generate the key and store it in Key Vault
-  (passing it via the same `az keyvault secret show` pattern) or redact stdout, so the key never
-  lands in a transcript. Hand only a Key Vault *reference* downstream, not the raw value.
+- **The Sidecar Api Key is never printed.** `deploy.ps1` does not echo the key — if it generates one,
+  it tells you to read it back from the `sidecar-api-key` Container App secret (or your Key Vault when
+  `-UseKeyVault`), so the value never lands in a transcript:
+
+  ```powershell
+  az containerapp secret show -n <container-app> -g <resource-group> --secret-name sidecar-api-key --query value -o tsv
+  ```
+
+  Prefer pre-generating the key and storing it in Key Vault, then passing it via the same
+  `az keyvault secret show` pattern; hand only a Key Vault *reference* downstream, not the raw value.
 - A pasted browser URL like `https://10ay.online.tableau.com/#/site/<slug>/...` is **not** the
   `-TableauServer` value: pass the pod URL only (`https://10ay.online.tableau.com`) and the
   `<slug>` segment as `-TableauSite` (an empty slug means the **Default** site).
@@ -59,15 +68,17 @@ $secret = az keyvault secret show --vault-name <your-vault> --name <connected-ap
 Requires `az login` first. The OFFICIAL image is pulled from GHCR; the sidecar image is the
 vendor-published one referenced in the script's `-SidecarImage` default.
 
-Service-account mode, api-key auth (the common case):
+Service-account mode, api-key auth (the common case). **Read the secret from Key Vault into a
+variable first — never type the literal secret value into the command:**
 
 ```powershell
 cd assets/azure            # from the skill folder: skills/tableau-mcp-landing-zone/assets/azure
+$secret = az keyvault secret show --vault-name <your-vault> --name tableau-ca-secret-value --query value -o tsv
 ./deploy.ps1 -ResourceGroup my-rg `
              -TableauServer https://10ay.online.tableau.com `
              -TableauSite my-site `
              -ConnectedAppClientId <id> -ConnectedAppSecretId <id> `
-             -ConnectedAppSecretValue <value> `
+             -ConnectedAppSecretValue $secret `
              -ServiceAccountUsername svc-mcp@company.com `
              -SidecarApiKey (New-Guid).Guid
 ```
@@ -75,16 +86,24 @@ cd assets/azure            # from the skill folder: skills/tableau-mcp-landing-z
 Per-user RLS (passthrough behind Easy Auth) — see [identity-modes.md](identity-modes.md):
 
 ```powershell
+$secret = az keyvault secret show --vault-name <your-vault> --name tableau-ca-secret-value --query value -o tsv
 ./deploy.ps1 -ResourceGroup my-rg `
              -TableauServer https://10ay.online.tableau.com -TableauSite my-site `
-             -ConnectedAppClientId <id> -ConnectedAppSecretId <id> -ConnectedAppSecretValue <value> `
+             -ConnectedAppClientId <id> -ConnectedAppSecretId <id> -ConnectedAppSecretValue $secret `
              -ServiceAccountUsername svc-mcp@company.com `
              -IdentityMode passthrough -EnableEasyAuth `
              -EntraTenantId <tenant-guid> -EntraClientId <app-client-id>
 ```
 
-If `-SidecarApiKey` is omitted while api-key auth is on, the script **generates one and prints it** —
-capture it. On success the script prints `mcpEndpoint`, the `x-api-key` to send, and `healthUrl`.
+If `-SidecarApiKey` is omitted while api-key auth is on, the script **generates a random one but does
+not print it** — read it back from the `sidecar-api-key` Container App secret (command above). On
+success the script prints `mcpEndpoint` and `healthUrl`, the curated tool set (with a Pulse hint), and
+writes a host-filled `mcp-connector.generated.swagger.yaml` for Copilot Studio.
+
+> **Region is auto-derived.** `-Location` defaults to the **resource group's** region (the deployment
+> targets that RG), so resources never land cross-region. The script creates the RG in `eastus` only
+> if it doesn't exist and no `-Location` is given; an explicit `-Location` that differs from an
+> existing RG is overridden (with a warning) to the RG's region.
 
 ## Outputs to capture
 
@@ -102,7 +121,12 @@ capture it. On success the script prints `mcpEndpoint`, the `x-api-key` to send,
 3. (Optional) Run the bundled [`scripts/verify_deployment.py`](../scripts/verify_deployment.py) — a
    stdlib, fail-loud probe that sends a real `initialize` + `tools/list` and asserts the identity
    mode and a minimum tool count. It reads the api key from `$env:SIDECAR_API_KEY` (never an arg);
-   `--base-url` is non-secret. Expect a brief cold-start on the first call.
+   `--base-url` is non-secret. Expect a brief cold-start on the first call. It also prints the enabled
+   tool set and whether Pulse is on.
+4. (Optional) Smoke-query live data with the stdlib [`scripts/query.py`](../scripts/query.py):
+   `py -3.11 scripts/query.py --base-url <mcpEndpoint> list` (reads `$env:SIDECAR_API_KEY`). Use it
+   instead of PowerShell `Invoke-WebRequest`, which hangs on the SSE stream. It refuses to guess a
+   datasource — run `list` first, then pass `--datasource <luid>` to `metadata` / `query`.
 
 ## Cost
 

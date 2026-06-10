@@ -3,38 +3,30 @@
 This folder is a **self-contained snapshot** of the Tableau MCP landing-zone deploy assets, so the
 `tableau-mcp-landing-zone` skill can deploy without cloning anything else.
 
-## Upstream source of truth
+## Source of truth
 
-These files are **synced from the bridge repo**, which remains the upstream source of truth for the
-infrastructure (Bicep, sidecar, CI):
+These files are **maintained here, in this skill** — this `assets/` bundle is the source of truth for
+the deploy infrastructure. Nothing is synced from another repository; edit these files directly.
 
-> <https://github.com/Yarbrdab000/Tableau-Fabric-AI-Bridge> → `Play1/deploy/`
-
-| Vendored file | Upstream (bridge repo) |
+| File | Purpose |
 |---|---|
-| `azure/main.bicep` | `Play1/deploy/azure/main.bicep` |
-| `azure/azuredeploy.json` | `Play1/deploy/azure/azuredeploy.json` (compiled from the Bicep) |
-| `azure/deploy.ps1` | `Play1/deploy/azure/deploy.ps1` |
-| `azure/main.parameters.json` | `Play1/deploy/azure/main.parameters.json` (placeholders only) |
-| `copilot-studio/mcp-connector.swagger.yaml` + `README.md` | `Play1/deploy/copilot-studio/` |
-| `local/docker-compose.yml` + `.env.example` | `Play1/deploy/local/` |
+| `azure/main.bicep` | Container App + sidecar + official image, identity wiring, optional Key Vault / Easy Auth. |
+| `azure/azuredeploy.json` | Portal template compiled from the Bicep (backs the Deploy-to-Azure button). |
+| `azure/deploy.ps1` | `az`-based CLI deploy (prints `mcpEndpoint` + `healthUrl`). |
+| `azure/main.parameters.json` | Parameter shape (placeholders only). |
+| `copilot-studio/mcp-connector.swagger.yaml` + `README.md` | Custom-connector swagger + wiring guide. |
+| `local/docker-compose.yml` + `.env.example` | Local evaluation harness. |
 
-## Not vendored — referenced in the bridge repo
+## Not vendored (ships as a prebuilt image)
 
 - **Sidecar source + 31 tests** (`Play1/sidecar/`): shipped as the published container image
   `ghcr.io/yarbrdab000/tableau-fabric-ai-bridge-sidecar`. Clone the bridge repo only to develop or
   test the sidecar source.
 
-## One local change vs. upstream
+## Local harness
 
-`local/docker-compose.yml` here uses the **published** sidecar image (`image:`) instead of building
-from `../../sidecar` (`build:`), so the bundle runs without a source checkout. Everything else is a
-verbatim copy.
-
-## Re-syncing
-
-If the bridge repo's `Play1/deploy/` changes, re-copy these files and re-apply the one local edit
-above.
+`local/docker-compose.yml` uses the **published** sidecar image (`image:`) rather than building from
+source, so the bundle runs without a separate source checkout.
 
 > **Never commit secrets** into any file here. `azure/main.parameters.json` is a *shape* template
 > only — the Connected App Secret Value and the Sidecar Api Key are supplied at deploy time.

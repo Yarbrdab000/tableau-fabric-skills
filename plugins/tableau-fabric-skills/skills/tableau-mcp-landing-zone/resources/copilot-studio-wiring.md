@@ -24,6 +24,10 @@ In Copilot Studio open the agent → **Settings → Generative AI → Orchestrat
 
 Uses [`assets/copilot-studio/mcp-connector.swagger.yaml`](../assets/copilot-studio/mcp-connector.swagger.yaml).
 
+> **Tip:** if you deployed with `deploy.ps1`, it already wrote `mcp-connector.generated.swagger.yaml`
+> (in the folder you ran it from) with `host:` **pre-filled** from your `mcpEndpoint` — import that
+> file and skip the manual edit in step 2.
+
 1. Open that swagger file.
 2. Edit one line — set `host:` to **your** Container App FQDN (the `mcpEndpoint` **without**
    `https://` and **without** the trailing `/mcp`). E.g. for
