@@ -78,8 +78,17 @@ Three adapters ship:
   [Finishing `LiveTableauSource`](#finishing-livetableausource).
 
 `.tds` files are treated as **datasources** (semantic-model path); `.twb` files are treated as
-**workbooks** (viz path). Extracting datasources embedded *inside* a `.twb` is intentionally out of
-v1 scope to keep estate counts unambiguous.
+**workbooks** (viz path). To keep estate **counts** unambiguous, the orchestrator does not
+*auto-fan-out* a workbook into its embedded datasources during enumeration — one `.twb` counts as one
+workbook, not N datasources.
+
+That is an **enumeration-scoping choice, not an engine limit.** The per-datasource path fully extracts
+and migrates a datasource embedded in a `.twb`/`.twbx`: enumerate them with
+`list_workbook_datasources(source)`, then migrate a chosen one with
+`migrate_datasource(source, model_name=..., datasource="<caption or name>")` — it reads the inner
+`.twb` from a `.twbx` (`fetch_tds.inner_doc_from_zip`), skips the `Parameters` pseudo-datasource and
+per-worksheet reference stubs, and raises `AmbiguousDatasourceError` when several are present and none
+is chosen. See [public-api.md](public-api.md) and the SKILL's "Inputs — Locate the Datasource FIRST".
 
 ---
 
