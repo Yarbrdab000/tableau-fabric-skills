@@ -3,7 +3,7 @@
 A read-only Copilot CLI skill that profiles a published Tableau datasource and reports its
 fields, types, calculated-field formulas, lineage, and (optionally) value-level statistics.
 
-Built directly on Tableau's REST + Metadata + VizQL Data Service APIs — **no
+Built directly on Tableau's REST + Metadata + Hyper +  VizQL Data Service APIs — **no
 `tableauserverclient`**, so it works against both **Tableau Cloud** and **Tableau Server**.
 
 See [`SKILL.md`](./SKILL.md) for full setup, usage, and agent guidance. Quick version:
