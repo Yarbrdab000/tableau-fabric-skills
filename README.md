@@ -1,123 +1,75 @@
-# tableau-migration-skill
+# tableau-fabric-skills
 
-A reusable **Tableau → Microsoft Fabric / Power BI** migration skill, authored to the
-[`microsoft/skills-for-fabric`](https://github.com/microsoft/skills-for-fabric) conventions so it can sit
-alongside the existing `synapse-migration`, `databricks-migration`, and `hdinsight-migration` skills (which
-have no Tableau peer — this fills that gap).
+A collection of **agent skills** for moving from **Tableau** to **Microsoft Fabric / Power BI**,
+authored to the [`microsoft/skills-for-fabric`](https://github.com/microsoft/skills-for-fabric)
+conventions (one `skills/` folder, one marketplace manifest) so they install into code-executing
+Copilots — **GitHub Copilot CLI**, VS Code Copilot, Claude Code, Cursor.
 
-It packages a proven Tableau → Fabric toolkit into an agent-loadable skill. **v1 scope is the semantic-model
-path**: rebuild a Tableau published data source as a Power BI semantic model (typed TMDL, inferred
-relationships), translate the safe subset of Tableau calculated fields into working DAX (preserving every
-original formula), and auto-select a storage mode per datasource. By default every table is rebuilt bound
-directly to its own upstream source — including a federated, multi-connection datasource, since Power BI
-relates the tables in the model layer — with land-to-Delta + DirectLake offered as an explicit option only
-when a direct rebuild genuinely isn't safe. Accepts a `.tds`/`.tdsx` datasource or a `.twb`/`.twbx` workbook
-(selecting one of several embedded datasources).
-Worksheet / dashboard → Power BI report translation is **roadmap (v2)**.
+> These are the **agent-driven** counterpart to the do-it-yourself notebooks in the
+> [`Tableau-Fabric-AI-Bridge`](https://github.com/Yarbrdab000/Tableau-Fabric-AI-Bridge) repo. The
+> bridge is the manual toolkit; this repo packages the same capabilities as skills a Copilot drives.
+
+## The skills
+
+| Skill | What it does | Use when |
+|---|---|---|
+| **[`tableau-datasource-profiler`](skills/tableau-datasource-profiler/)** | Read-only profile of a published Tableau datasource (fields, types, calc formulas, lineage, migration signals) and natural-language querying via the VizQL Data Service. | You want to inventory, audit, or query a datasource — or validate a Connected App — before migrating. |
+| **[`tableau-mcp-landing-zone`](skills/tableau-mcp-landing-zone/)** | Deploy the **official** Tableau MCP server behind a Microsoft auth sidecar to Azure and wire it into Copilot Studio, so business users ask natural-language questions about Tableau data. Optional Entra to Tableau per-user RLS. | You want live, governed natural-language access to Tableau from Microsoft Copilot. |
+| **[`tableau-migration`](skills/tableau-migration/)** | Rebuild Tableau datasources as Power BI semantic models: typed TMDL, inferred relationships, deterministic calc to DAX (every formula preserved), storage-mode auto-selection, self-contained Fabric REST deploy. | You want to migrate a datasource into a Fabric / Power BI semantic model. |
+
+They share one Tableau Connected App and compose naturally: **profile** to validate, **serve** live
+over MCP, **migrate** into Fabric.
 
 ## Install
 
-This is an **agent skill**: install it into a *code-executing* Copilot (GitHub Copilot CLI, VS Code Copilot,
-Claude Code, Cursor, …). The agent reads `SKILL.md`, and its `description` triggers (e.g. *"migrate from
-tableau"*, *"tableau to fabric"*, *"convert tableau calculation to dax"*) fire automatically — so once it's
-installed you just describe the migration and the Copilot drives it (including a self-contained Fabric deploy).
+These are agent skills — **no build step**. Either copy a skill folder where your agent discovers
+skills, or (on clients that support it) add the plugin marketplace.
 
-> M365 / Office Copilot is **not** a target — it can't execute the scripts. Use a coding-agent Copilot.
-
-**Install = drop the skill folder where your agent discovers skills.** Agent skills are loaded from
-well-known directories — there is no build step. Clone the repo, then copy `skills/tableau-migration/`
-to one of these locations:
+### Folder copy (always works)
 
 ```bash
-git clone https://github.com/Yarbrdab000/tableau-migration-skill.git
+git clone https://github.com/Yarbrdab000/tableau-fabric-skills.git
 ```
 
-| Agent | Copy `skills/tableau-migration/` to | Scope |
+Then copy whichever skill folder(s) you want:
+
+| Agent | Copy `skills/<name>/` to | Scope |
 |---|---|---|
-| **GitHub Copilot CLI — personal (recommended)** | `~/.copilot/skills/tableau-migration/` | Every chat, any repo — true plug-and-play |
-| GitHub Copilot CLI / VS Code — project | your repo's `.github/skills/tableau-migration/` | That repo only (shared with the team) |
+| **GitHub Copilot CLI — personal (recommended)** | `~/.copilot/skills/<name>/` | Every chat, any repo |
+| GitHub Copilot CLI / VS Code — project | your repo's `.github/skills/<name>/` | That repo only |
 | Claude Code | `~/.claude/skills/` (personal) or `.claude/skills/` (project) | Personal or project |
-| Cursor / Windsurf / Codex | anywhere in the repo, then point the agent at `skills/tableau-migration/SKILL.md` | Project |
 
-The **personal** path (`~/.copilot/skills/`) is the smoothest: install once and the skill is available
-in every new Copilot CLI chat regardless of which repo you're in. See GitHub's docs:
-[Adding agent skills for GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills).
+### Plugin marketplace (clients that support `/plugin`)
 
-Then start a chat and say e.g. *"migrate my Tableau Superstore datasource to a Fabric semantic model."*
-The agent will ask whether your datasource is a **local file** (`.tds`/`.tdsx`/`.twb`/`.twbx`) or a
-**live published datasource** (pulled via Tableau's REST/Metadata API) and drive the rest.
-The only Python requirement is **3.11+** (the scripts are stdlib-only — no pip install needed to run them).
+```
+/plugin marketplace add Yarbrdab000/tableau-fabric-skills
+/plugin install tableau-fabric-skills@tableau-collection
+```
 
-> **Plugin marketplace (`/plugin marketplace add …`)** is a separate, newer Copilot CLI / Claude Code
-> packaging mechanism and is **not available in every build** — if `/plugin` does nothing in your client,
-> use the folder copy above, which always works. A marketplace manifest is included in the repo for
-> clients that do support it.
-
-### Updating an installed copy
-
-The skill ships a version stamp at `skills/tableau-migration/VERSION` and a self-update runbook the
-agent can execute. To upgrade, just tell your Copilot **"check for updates / update the tableau-migration
-skill"** — it reads the installed `VERSION`, compares it against this repo, and (if newer) reinstalls by
-overwriting `scripts/` + `resources/` + `SKILL.md` wholesale, verifies the result (asserts key functions
-exist + runs the tests), and reports the version delta (`1.0.0 → 1.1.0`). Full procedure:
-[`skills/tableau-migration/resources/self-update.md`](skills/tableau-migration/resources/self-update.md).
-Because skills load at session start, start a **new** chat for the update to take effect. If your client
-supports `gh skill`, `gh skill update tableau-migration` is an equivalent managed path.
+Installs all three skills. (`/plugin` is newer and not in every build — use the folder copy if it is
+unavailable.)
 
 ## Layout
 
 ```
-skills/tableau-migration/
-  SKILL.md            # the skill (full skills-for-fabric authoring contract)
-  resources/          # on-demand .md docs, loaded per migration phase
-  scripts/            # pure-Python, stdlib-only, offline-tested cores
-  tests/              # pytest suite (offline assertions)
+skills/                              # canonical skills (source of truth)
+  tableau-datasource-profiler/
+  tableau-mcp-landing-zone/          # includes a vendored assets/ deploy bundle
+  tableau-migration/
+plugins/
+  tableau-fabric-skills/             # self-contained bundle plugin (mirrors skills/)
+.claude-plugin/marketplace.json      # marketplace manifest (+ .github/plugin/marketplace.json)
 ```
 
-The repo mirrors the upstream `skills/<name>/` layout so the `tableau-migration` folder is portable into
-`microsoft/skills-for-fabric` later (via a fork + CLA).
+## Requirements
 
-## Scripts
+Python **3.11+**. `tableau-migration` is standard-library only; `tableau-datasource-profiler` needs
+`requests` (`pip install -r skills/tableau-datasource-profiler/requirements.txt`);
+`tableau-mcp-landing-zone` deploys with the Azure CLI / Docker.
 
-All scripts are deterministic, offline, and stdlib-only (no Spark / pandas required to run them):
+## Provenance & license
 
-| Script | Purpose |
-|---|---|
-| `calc_to_dax.py` | Deterministic, typed Tableau calc → DAX translator. Recursive-descent parser covering single-field aggregations, arithmetic, `IF`/`ELSEIF`/`IIF`, comparison + `AND`/`OR`/`NOT`, and `ZN`/`IFNULL`/`ISNULL`; returns `None` (→ stub) on anything outside the safe, type-checked subset. |
-| `tmdl_generate.py` | TMDL generators: typed columns, tables, measures, relationship inference. |
-| `field_resolver.py` | Caption → column resolver for the DirectLake (landed-Delta) path. |
-| `storage_mode.py` | Per-datasource storage-mode auto-selection (pure policy). |
-| `connection_to_m.py` | Parse Tableau `.tds` → descriptor; emit M partitions + bind details. |
-| `assemble_model.py` | Orchestrator: `.tds` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`). |
-| `deploy_to_fabric.py` | Self-contained Fabric REST deploy (stdlib-only): createOrUpdate / updateDefinition, 202 LRO polling, optional refresh + gateway bind — finishes the migration **in Fabric** without a peer-skill dependency. |
-
-## Tests
-
-```bash
-cd skills/tableau-migration
-python -m pytest tests -q
-```
-
-## Provenance
-
-Distilled from the [`Yarbrdab000/Tableau-Fabric-AI-Bridge`](https://github.com/Yarbrdab000/Tableau-Fabric-AI-Bridge)
-6-play toolkit (Play 4 semantic-model generator + calc→DAX translator). This repo is additive packaging — it
-does not modify the bridge repo's notebooks.
-
-### Prior art
-
-The breadth of the Tableau → DAX / Power Query mapping space was informed by surveying the MIT-licensed
-[`cyphou/Tableau-To-PowerBI`](https://github.com/cyphou/Tableau-To-PowerBI) project, which gave a useful
-reference for which Tableau constructs have clean Power BI equivalents. **No third-party source code is
-vendored in this repository** — the engine here is an independent recursive-descent implementation, and only
-the (non-copyrightable) language-to-language equivalences were used. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
-
-## Security
-
-Downloaded Tableau artifacts (`.tds` / `.tdsx` / `.twb` / `.twbx` / `.hyper`) are **sensitive plaintext** and
-are git-ignored. Credentials and on-premises gateway setup are a manual security boundary — the skill emits
-the model, connection parameters, and the structured bind inputs, but the user enters credentials.
-
-## License
-
-MIT (see `LICENSE`).
+Distilled from the [`Tableau-Fabric-AI-Bridge`](https://github.com/Yarbrdab000/Tableau-Fabric-AI-Bridge)
+6-play toolkit. The `tableau-mcp-landing-zone` skill **wraps the official, unmodified**
+`ghcr.io/tableau/tableau-mcp` image (Apache-2.0). See [`CLEANROOM.md`](CLEANROOM.md) and
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). MIT licensed (see [`LICENSE`](LICENSE)).

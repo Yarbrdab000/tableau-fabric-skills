@@ -12,10 +12,10 @@ the previous copy rather than leaving a half-synced skill.
 
 | Thing | Value |
 |---|---|
-| Canonical repo | `https://github.com/Yarbrdab000/tableau-migration-skill` |
+| Canonical repo | `https://github.com/Yarbrdab000/tableau-fabric-skills` |
 | Skill subpath in repo | `skills/tableau-migration` |
 | Version stamp (in repo) | `skills/tableau-migration/VERSION` (a single semver line, e.g. `1.0.0`) |
-| Version stamp (raw URL) | `https://raw.githubusercontent.com/Yarbrdab000/tableau-migration-skill/main/skills/tableau-migration/VERSION` |
+| Version stamp (raw URL) | `https://raw.githubusercontent.com/Yarbrdab000/tableau-fabric-skills/main/skills/tableau-migration/VERSION` |
 | **Default install target** (GitHub Copilot CLI, user scope) | `~/.copilot/skills/tableau-migration` → on Windows `"$HOME\.copilot\skills\tableau-migration"` |
 | Installed version stamp | `<INSTALL_DIR>/VERSION` |
 
@@ -41,7 +41,7 @@ Always finish by **reporting the version delta** (Step 4): `old → new`, or `al
 Windows / PowerShell (lead — the user is on Windows):
 
 ```powershell
-$RepoRaw = "https://raw.githubusercontent.com/Yarbrdab000/tableau-migration-skill/main/skills/tableau-migration/VERSION"
+$RepoRaw = "https://raw.githubusercontent.com/Yarbrdab000/tableau-fabric-skills/main/skills/tableau-migration/VERSION"
 $Install = "$HOME\.copilot\skills\tableau-migration"   # OR the actual folder this SKILL.md loaded from
 
 $localRaw  = (Get-Content (Join-Path $Install "VERSION") -ErrorAction SilentlyContinue | Select-Object -First 1)
@@ -63,7 +63,7 @@ Fetch the repo to a temp dir, **back up** the current install, then **replace `s
 what removes files that no longer exist upstream — a half-synced copy cannot survive.
 
 ```powershell
-$Repo = "https://github.com/Yarbrdab000/tableau-migration-skill.git"
+$Repo = "https://github.com/Yarbrdab000/tableau-fabric-skills.git"
 $Sub  = "skills\tableau-migration"
 $Tmp  = Join-Path $env:TEMP ("tms_" + [guid]::NewGuid().ToString('N'))
 
@@ -163,11 +163,11 @@ Same logic, POSIX tools (no `Copy-Item`/`Invoke-RestMethod`):
 
 ```bash
 Install="$HOME/.copilot/skills/tableau-migration"
-RepoRaw="https://raw.githubusercontent.com/Yarbrdab000/tableau-migration-skill/main/skills/tableau-migration/VERSION"
+RepoRaw="https://raw.githubusercontent.com/Yarbrdab000/tableau-fabric-skills/main/skills/tableau-migration/VERSION"
 local_ver="$(head -n1 "$Install/VERSION" 2>/dev/null | tr -d '[:space:]')"; : "${local_ver:=0.0.0}"
 remote_ver="$(curl -fsSL "$RepoRaw" | tr -d '[:space:]')"
 # compare, then:
-tmp="$(mktemp -d)"; git clone --depth 1 https://github.com/Yarbrdab000/tableau-migration-skill.git "$tmp"
+tmp="$(mktemp -d)"; git clone --depth 1 https://github.com/Yarbrdab000/tableau-fabric-skills.git "$tmp"
 cp -a "$Install" "$Install.bak-$(date +%Y%m%d%H%M%S)"
 rsync -a --delete --exclude '.git' --exclude '__pycache__' --exclude '.pytest_cache' \
   "$tmp/skills/tableau-migration/" "$Install/"

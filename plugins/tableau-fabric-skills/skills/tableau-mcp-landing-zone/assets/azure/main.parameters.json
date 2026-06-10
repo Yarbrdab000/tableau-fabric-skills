@@ -1,0 +1,29 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "containerAppName": { "value": "tableau-mcp" },
+    "tableauMcpImage": { "value": "ghcr.io/tableau/tableau-mcp:2.4.3" },
+    "sidecarImage": { "value": "ghcr.io/yarbrdab000/tableau-fabric-ai-bridge-sidecar:latest" },
+    "tableauServer": { "value": "https://10ay.online.tableau.com" },
+    "tableauSite": { "value": "your-site-content-url" },
+    "connectedAppClientId": { "value": "" },
+    "connectedAppSecretId": { "value": "" },
+    "connectedAppSecretValue": { "value": "" },
+    "serviceAccountUsername": { "value": "svc-mcp@yourcompany.com" },
+    "includeTools": { "value": "datasource,content-exploration" },
+    "maxResultLimits": { "value": "query-datasource:100" },
+    "allowApiKey": { "value": true },
+    "sidecarApiKey": { "value": "REPLACE-WITH-A-LONG-RANDOM-STRING" },
+    "identityMode": { "value": "service_account" },
+    "upnMappingMode": { "value": "direct" },
+    "upnDomainFrom": { "value": "" },
+    "upnDomainTo": { "value": "" },
+    "entraTenantId": { "value": "" },
+    "enableEasyAuth": { "value": false },
+    "entraClientId": { "value": "" },
+    "useKeyVault": { "value": false },
+    "minReplicas": { "value": 0 },
+    "maxReplicas": { "value": 2 }
+  }
+}

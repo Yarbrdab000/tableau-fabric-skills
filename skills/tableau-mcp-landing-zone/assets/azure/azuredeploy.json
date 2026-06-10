@@ -1,0 +1,476 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.43.8.12551",
+      "templateHash": "12588509939603510080"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for all resources. Defaults to the resource group location."
+      }
+    },
+    "containerAppName": {
+      "type": "string",
+      "defaultValue": "tableau-mcp",
+      "metadata": {
+        "description": "Name for the Container App (also used as the public subdomain)."
+      }
+    },
+    "tableauMcpImage": {
+      "type": "string",
+      "defaultValue": "ghcr.io/tableau/tableau-mcp:2.4.3",
+      "metadata": {
+        "description": "OFFICIAL Tableau MCP image. Pin by digest for production (ghcr.io/tableau/tableau-mcp@sha256:...)."
+      }
+    },
+    "sidecarImage": {
+      "type": "string",
+      "defaultValue": "ghcr.io/yarbrdab000/tableau-fabric-ai-bridge-sidecar:latest",
+      "metadata": {
+        "description": "Our auth sidecar image (built + published by .github/workflows/build-sidecar-image.yml)."
+      }
+    },
+    "tableauServer": {
+      "type": "string",
+      "metadata": {
+        "description": "Tableau server/pod URL, e.g. https://10ay.online.tableau.com"
+      }
+    },
+    "tableauSite": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Tableau site content URL (the slug in the site URL). Empty = Default site."
+      }
+    },
+    "connectedAppClientId": {
+      "type": "string",
+      "metadata": {
+        "description": "Connected App client ID (Tableau > Settings > Connected Apps)."
+      }
+    },
+    "connectedAppSecretId": {
+      "type": "string",
+      "metadata": {
+        "description": "Connected App secret ID (the non-sensitive identifier shown next to the client ID)."
+      }
+    },
+    "connectedAppSecretValue": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Connected App secret VALUE (sensitive)."
+      }
+    },
+    "serviceAccountUsername": {
+      "type": "string",
+      "metadata": {
+        "description": "Tableau username the SERVICE ACCOUNT acts as. Required by the official server at startup; also the identity used in service_account mode. A Site Admin bypasses RLS."
+      }
+    },
+    "includeTools": {
+      "type": "string",
+      "defaultValue": "datasource,content-exploration",
+      "metadata": {
+        "description": "Official server INCLUDE_TOOLS — comma-separated tool or group names to expose. Default trims ~20 tools to the high-signal NL-query set. Empty = all tools."
+      }
+    },
+    "maxResultLimits": {
+      "type": "string",
+      "defaultValue": "query-datasource:100",
+      "metadata": {
+        "description": "Official server MAX_RESULT_LIMITS — per-tool row caps (e.g. \"query-datasource:100\") to prevent payload blowups. Empty = server defaults."
+      }
+    },
+    "allowApiKey": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "Allow callers to authenticate to the sidecar with a shared x-api-key. Recommended for Copilot Studio custom connectors."
+      }
+    },
+    "sidecarApiKey": {
+      "type": "securestring",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Shared API key callers present as the \"x-api-key\" header (or \"Authorization: Bearer <key>\"). Required when allowApiKey is true. Invent a long random string."
+      }
+    },
+    "identityMode": {
+      "type": "string",
+      "defaultValue": "service_account",
+      "allowedValues": [
+        "service_account",
+        "passthrough"
+      ],
+      "metadata": {
+        "description": "Identity mode. service_account = all queries run as the service account (no per-user RLS, works anywhere). passthrough = map the caller Entra UPN -> Tableau user for per-user RLS (requires Easy Auth or APIM in front)."
+      }
+    },
+    "upnMappingMode": {
+      "type": "string",
+      "defaultValue": "direct",
+      "allowedValues": [
+        "direct",
+        "transform",
+        "explicit"
+      ],
+      "metadata": {
+        "description": "UPN -> Tableau username mapping (passthrough only). direct = UPN is the username; transform = swap domain; explicit = use a JSON map provided to the sidecar out-of-band."
+      }
+    },
+    "upnDomainFrom": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Source UPN domain for upnMappingMode=transform (e.g. contoso.com)."
+      }
+    },
+    "upnDomainTo": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Target Tableau domain for upnMappingMode=transform."
+      }
+    },
+    "entraTenantId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Entra tenant ID. Used for the Easy Auth issuer and recorded for the sidecar identity cache key."
+      }
+    },
+    "enableEasyAuth": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Enable Container Apps Easy Auth (Microsoft Entra) in front of the sidecar. Required for passthrough unless an external gateway (APIM) supplies the identity. You must pre-create an Entra app registration and pass its client ID."
+      }
+    },
+    "entraClientId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Entra app registration (client) ID for Easy Auth. Required when enableEasyAuth is true."
+      }
+    },
+    "useKeyVault": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Store secrets in Azure Key Vault (pulled via a user-assigned managed identity) instead of plain Container App secrets. Production-leaning; adds a role-assignment propagation step. Leave false for the simplest reliable one-click."
+      }
+    },
+    "minReplicas": {
+      "type": "int",
+      "defaultValue": 0,
+      "minValue": 0,
+      "maxValue": 5,
+      "metadata": {
+        "description": "Minimum replicas. 0 enables scale-to-zero (near-zero idle cost)."
+      }
+    },
+    "maxReplicas": {
+      "type": "int",
+      "defaultValue": 2,
+      "minValue": 1,
+      "maxValue": 10,
+      "metadata": {
+        "description": "Maximum replicas."
+      }
+    }
+  },
+  "variables": {
+    "isPassthrough": "[equals(parameters('identityMode'), 'passthrough')]",
+    "easyAuthIssuer": "[format('https://login.microsoftonline.com/{0}/v2.0', parameters('entraTenantId'))]",
+    "sidecarPort": 9000,
+    "mcpPort": 8000,
+    "logName": "[format('{0}-logs', parameters('containerAppName'))]",
+    "envName": "[format('{0}-env', parameters('containerAppName'))]",
+    "secretSpecs": "[concat(if(parameters('allowApiKey'), createArray(createObject('name', 'sidecar-api-key', 'value', parameters('sidecarApiKey'))), createArray()), createArray(createObject('name', 'connected-app-secret-value', 'value', parameters('connectedAppSecretValue'))))]",
+    "kvName": "[take(format('{0}kv{1}', replace(parameters('containerAppName'), '-', ''), uniqueString(resourceGroup().id, parameters('containerAppName'))), 24)]",
+    "kvSecretsUserRoleId": "4633458b-17de-408a-b874-0445c86b69e6",
+    "mcpEnv": "[concat(createArray(createObject('name', 'TRANSPORT', 'value', 'http'), createObject('name', 'PORT', 'value', string(variables('mcpPort'))), createObject('name', 'DANGEROUSLY_DISABLE_OAUTH', 'value', 'true'), createObject('name', 'ENABLE_PASSTHROUGH_AUTH', 'value', if(variables('isPassthrough'), 'true', 'false')), createObject('name', 'SERVER', 'value', parameters('tableauServer')), createObject('name', 'SITE_NAME', 'value', parameters('tableauSite')), createObject('name', 'AUTH', 'value', 'direct-trust'), createObject('name', 'JWT_SUB_CLAIM', 'value', parameters('serviceAccountUsername')), createObject('name', 'CONNECTED_APP_CLIENT_ID', 'value', parameters('connectedAppClientId')), createObject('name', 'CONNECTED_APP_SECRET_ID', 'value', parameters('connectedAppSecretId')), createObject('name', 'CONNECTED_APP_SECRET_VALUE', 'secretRef', 'connected-app-secret-value'), createObject('name', 'DEFAULT_LOG_LEVEL', 'value', 'info')), if(empty(parameters('includeTools')), createArray(), createArray(createObject('name', 'INCLUDE_TOOLS', 'value', parameters('includeTools')))), if(empty(parameters('maxResultLimits')), createArray(), createArray(createObject('name', 'MAX_RESULT_LIMITS', 'value', parameters('maxResultLimits')))))]",
+    "sidecarEnv": "[concat(createArray(createObject('name', 'PORT', 'value', string(variables('sidecarPort'))), createObject('name', 'UPSTREAM_MCP_URL', 'value', format('http://localhost:{0}/mcp', variables('mcpPort'))), createObject('name', 'ALLOW_API_KEY', 'value', if(parameters('allowApiKey'), 'true', 'false')), createObject('name', 'TRUST_EASY_AUTH', 'value', if(or(parameters('enableEasyAuth'), variables('isPassthrough')), 'true', 'false')), createObject('name', 'IDENTITY_MODE', 'value', parameters('identityMode')), createObject('name', 'ON_UNRESOLVED_IDENTITY', 'value', 'deny'), createObject('name', 'TABLEAU_SERVER', 'value', parameters('tableauServer')), createObject('name', 'TABLEAU_SITE', 'value', parameters('tableauSite')), createObject('name', 'ENTRA_TENANT_ID', 'value', parameters('entraTenantId'))), if(parameters('allowApiKey'), createArray(createObject('name', 'SIDECAR_API_KEY', 'secretRef', 'sidecar-api-key')), createArray()), if(variables('isPassthrough'), createArray(createObject('name', 'TABLEAU_CONNECTED_APP_CLIENT_ID', 'value', parameters('connectedAppClientId')), createObject('name', 'TABLEAU_CONNECTED_APP_SECRET_ID', 'value', parameters('connectedAppSecretId')), createObject('name', 'TABLEAU_CONNECTED_APP_SECRET_VALUE', 'secretRef', 'connected-app-secret-value'), createObject('name', 'UPN_MAPPING_MODE', 'value', parameters('upnMappingMode')), createObject('name', 'UPN_DOMAIN_FROM', 'value', parameters('upnDomainFrom')), createObject('name', 'UPN_DOMAIN_TO', 'value', parameters('upnDomainTo'))), createArray()))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2023-09-01",
+      "name": "[variables('logName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "sku": {
+          "name": "PerGB2018"
+        },
+        "retentionInDays": 30
+      }
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('envName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "appLogsConfiguration": {
+          "destination": "log-analytics",
+          "logAnalyticsConfiguration": {
+            "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', variables('logName')), '2023-09-01').customerId]",
+            "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', variables('logName')), '2023-09-01').primarySharedKey]"
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', variables('logName'))]"
+      ]
+    },
+    {
+      "condition": "[parameters('useKeyVault')]",
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2023-01-31",
+      "name": "[format('{0}-mi', parameters('containerAppName'))]",
+      "location": "[parameters('location')]"
+    },
+    {
+      "condition": "[parameters('useKeyVault')]",
+      "type": "Microsoft.KeyVault/vaults",
+      "apiVersion": "2023-07-01",
+      "name": "[variables('kvName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "sku": {
+          "family": "A",
+          "name": "standard"
+        },
+        "tenantId": "[subscription().tenantId]",
+        "enableRbacAuthorization": true,
+        "enableSoftDelete": true,
+        "softDeleteRetentionInDays": 7
+      }
+    },
+    {
+      "copy": {
+        "name": "kvSecrets",
+        "count": "[length(variables('secretSpecs'))]"
+      },
+      "condition": "[parameters('useKeyVault')]",
+      "type": "Microsoft.KeyVault/vaults/secrets",
+      "apiVersion": "2023-07-01",
+      "name": "[format('{0}/{1}', variables('kvName'), variables('secretSpecs')[copyIndex()].name)]",
+      "properties": {
+        "value": "[variables('secretSpecs')[copyIndex()].value]"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.KeyVault/vaults', variables('kvName'))]"
+      ]
+    },
+    {
+      "condition": "[parameters('useKeyVault')]",
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.KeyVault/vaults', variables('kvName'))]",
+      "name": "[guid(resourceId('Microsoft.KeyVault/vaults', variables('kvName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-mi', parameters('containerAppName'))), variables('kvSecretsUserRoleId'))]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('kvSecretsUserRoleId'))]",
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-mi', parameters('containerAppName'))), '2023-01-31').principalId]",
+        "principalType": "ServicePrincipal"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.KeyVault/vaults', variables('kvName'))]",
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-mi', parameters('containerAppName')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "[parameters('containerAppName')]",
+      "location": "[parameters('location')]",
+      "identity": "[if(parameters('useKeyVault'), createObject('type', 'UserAssigned', 'userAssignedIdentities', createObject(format('{0}', resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-mi', parameters('containerAppName')))), createObject())), createObject('type', 'None'))]",
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('envName'))]",
+        "configuration": {
+          "copy": [
+            {
+              "name": "secrets",
+              "count": "[length(variables('secretSpecs'))]",
+              "input": "[if(parameters('useKeyVault'), createObject('name', variables('secretSpecs')[copyIndex('secrets')].name, 'keyVaultUrl', reference(resourceId('Microsoft.KeyVault/vaults/secrets', variables('kvName'), variables('secretSpecs')[copyIndex('secrets')].name), '2023-07-01').secretUri, 'identity', resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-mi', parameters('containerAppName')))), createObject('name', variables('secretSpecs')[copyIndex('secrets')].name, 'value', variables('secretSpecs')[copyIndex('secrets')].value))]"
+            }
+          ],
+          "activeRevisionsMode": "Single",
+          "ingress": {
+            "external": true,
+            "targetPort": "[variables('sidecarPort')]",
+            "transport": "auto",
+            "allowInsecure": false
+          }
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "tableau-mcp",
+              "image": "[parameters('tableauMcpImage')]",
+              "resources": {
+                "cpu": "[json('0.5')]",
+                "memory": "1Gi"
+              },
+              "env": "[variables('mcpEnv')]",
+              "probes": [
+                {
+                  "type": "Liveness",
+                  "tcpSocket": {
+                    "port": "[variables('mcpPort')]"
+                  },
+                  "initialDelaySeconds": 10,
+                  "periodSeconds": 30
+                },
+                {
+                  "type": "Readiness",
+                  "tcpSocket": {
+                    "port": "[variables('mcpPort')]"
+                  },
+                  "initialDelaySeconds": 5,
+                  "periodSeconds": 10,
+                  "failureThreshold": 30
+                }
+              ]
+            },
+            {
+              "name": "sidecar",
+              "image": "[parameters('sidecarImage')]",
+              "resources": {
+                "cpu": "[json('0.5')]",
+                "memory": "1Gi"
+              },
+              "env": "[variables('sidecarEnv')]",
+              "probes": [
+                {
+                  "type": "Liveness",
+                  "httpGet": {
+                    "path": "/healthz",
+                    "port": "[variables('sidecarPort')]"
+                  },
+                  "initialDelaySeconds": 5,
+                  "periodSeconds": 30
+                },
+                {
+                  "type": "Readiness",
+                  "httpGet": {
+                    "path": "/healthz",
+                    "port": "[variables('sidecarPort')]"
+                  },
+                  "initialDelaySeconds": 3,
+                  "periodSeconds": 10
+                },
+                {
+                  "type": "Startup",
+                  "httpGet": {
+                    "path": "/healthz",
+                    "port": "[variables('sidecarPort')]"
+                  },
+                  "initialDelaySeconds": 3,
+                  "periodSeconds": 5,
+                  "failureThreshold": 30
+                }
+              ]
+            }
+          ],
+          "scale": {
+            "minReplicas": "[parameters('minReplicas')]",
+            "maxReplicas": "[parameters('maxReplicas')]",
+            "rules": [
+              {
+                "name": "http-scale",
+                "http": {
+                  "metadata": {
+                    "concurrentRequests": "20"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "dependsOn": [
+        "[extensionResourceId(resourceId('Microsoft.KeyVault/vaults', variables('kvName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.KeyVault/vaults', variables('kvName')), resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-mi', parameters('containerAppName'))), variables('kvSecretsUserRoleId')))]",
+        "kvSecrets",
+        "[resourceId('Microsoft.App/managedEnvironments', variables('envName'))]",
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', format('{0}-mi', parameters('containerAppName')))]"
+      ]
+    },
+    {
+      "condition": "[parameters('enableEasyAuth')]",
+      "type": "Microsoft.App/containerApps/authConfigs",
+      "apiVersion": "2024-03-01",
+      "name": "[format('{0}/{1}', parameters('containerAppName'), 'current')]",
+      "properties": {
+        "platform": {
+          "enabled": true
+        },
+        "globalValidation": {
+          "unauthenticatedClientAction": "[if(parameters('allowApiKey'), 'AllowAnonymous', 'Return401')]"
+        },
+        "identityProviders": {
+          "azureActiveDirectory": {
+            "enabled": true,
+            "registration": {
+              "openIdIssuer": "[variables('easyAuthIssuer')]",
+              "clientId": "[parameters('entraClientId')]"
+            },
+            "validation": {
+              "allowedAudiences": [
+                "[parameters('entraClientId')]",
+                "[format('api://{0}', parameters('entraClientId'))]"
+              ]
+            }
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/containerApps', parameters('containerAppName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "mcpBaseUrl": {
+      "type": "string",
+      "metadata": {
+        "description": "The public base URL of the deployed landing zone (the sidecar)."
+      },
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01').configuration.ingress.fqdn)]"
+    },
+    "mcpEndpoint": {
+      "type": "string",
+      "metadata": {
+        "description": "The MCP endpoint to register in Copilot Studio (Streamable HTTP)."
+      },
+      "value": "[format('https://{0}/mcp', reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01').configuration.ingress.fqdn)]"
+    },
+    "healthUrl": {
+      "type": "string",
+      "metadata": {
+        "description": "Health check URL."
+      },
+      "value": "[format('https://{0}/healthz', reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2024-03-01').configuration.ingress.fqdn)]"
+    },
+    "identityModeOut": {
+      "type": "string",
+      "metadata": {
+        "description": "Resolved identity mode."
+      },
+      "value": "[parameters('identityMode')]"
+    },
+    "easyAuthEnabled": {
+      "type": "bool",
+      "metadata": {
+        "description": "Whether Easy Auth (Entra front door) is enabled."
+      },
+      "value": "[parameters('enableEasyAuth')]"
+    }
+  }
+}

@@ -21,7 +21,7 @@ description: >
 
 > **Updating this skill — only when the user asks**
 > There is **no** mandatory per-session update check. When the user asks to *check for updates / update / upgrade / refresh the `tableau-migration` skill* (or "update yourself"), follow [`resources/self-update.md`](resources/self-update.md). It is a **version-aware reinstaller**, not a guess:
-> - **Source of truth:** repo `https://github.com/Yarbrdab000/tableau-migration-skill`, skill subpath `skills/tableau-migration`, version stamp `skills/tableau-migration/VERSION`. **Install target** (Copilot user scope) `~/.copilot/skills/tableau-migration` — or the folder this `SKILL.md` was loaded from.
+> - **Source of truth:** repo `https://github.com/Yarbrdab000/tableau-fabric-skills`, skill subpath `skills/tableau-migration`, version stamp `skills/tableau-migration/VERSION`. **Install target** (Copilot user scope) `~/.copilot/skills/tableau-migration` — or the folder this `SKILL.md` was loaded from.
 > - **Compare, then act:** read installed `VERSION` → read remote `VERSION` → only reinstall if remote is newer (or the user forces). Install is an **explicit wholesale overwrite** (`scripts/` + `resources/` + `SKILL.md` + `VERSION`), then a **fail-loud verification** (assert `migrate_datasource` / `extract_calcs` / `fetch_tds` exist + run `pytest`; on failure, restore the backup and stop). Finish by reporting the delta (`1.2.0 → 1.4.0`).
 > - **Mid-session caveat:** skills load at session start, so the update is not live until a **new** session.
 

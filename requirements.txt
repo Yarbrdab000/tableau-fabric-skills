@@ -1,3 +1,6 @@
-# Runtime: the skill's bundled scripts are pure Python standard library only (no runtime deps).
+# Per-skill runtime requirements live in each skill folder:
+#   - skills/tableau-migration:            standard library only (no runtime deps)
+#   - skills/tableau-datasource-profiler:  requests>=2.28  (see its requirements.txt)
+#   - skills/tableau-mcp-landing-zone:     deploys via Azure CLI / Docker (no python runtime deps)
 # Development / testing only:
 pytest>=7.0

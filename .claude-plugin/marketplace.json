@@ -1,8 +1,8 @@
-﻿{
+{
   "name": "tableau-collection",
   "metadata": {
-    "description": "Tableau -> Microsoft Fabric / Power BI migration skill for code-executing Copilots (GitHub Copilot CLI, Claude Code, Cursor)",
-    "version": "0.1.0"
+    "description": "Tableau -> Microsoft Fabric / Power BI agent skills: live MCP landing zone, datasource profiling / NL-query, and semantic-model migration. For code-executing Copilots (GitHub Copilot CLI, Claude Code, Cursor).",
+    "version": "0.2.0"
   },
   "owner": {
     "name": "Yarbrdab000",
@@ -10,28 +10,34 @@
   },
   "plugins": [
     {
+      "name": "tableau-fabric-skills",
+      "source": "./plugins/tableau-fabric-skills",
+      "description": "All three Tableau -> Microsoft Fabric / Power BI agent skills: profile & NL-query a Tableau datasource, stand up the official Tableau MCP server on Azure for Copilot, and rebuild Tableau datasources as Fabric / Power BI semantic models (calc -> DAX).",
+      "version": "0.2.0",
+      "skills": [
+        "./skills/tableau-datasource-profiler",
+        "./skills/tableau-mcp-landing-zone",
+        "./skills/tableau-migration"
+      ],
+      "agents": [],
+      "mcpServers": {},
+      "repository": "https://github.com/Yarbrdab000/tableau-fabric-skills",
+      "keywords": ["tableau","fabric","microsoft-fabric","power-bi","semantic-model","tmdl","dax","mcp","copilot-studio","migration"],
+      "license": "MIT"
+    },
+    {
       "name": "tableau-migration",
-      "source": "./plugins/tableau-migration",
-      "description": "Rebuild Tableau datasources as Microsoft Fabric / Power BI semantic models: typed TMDL, inferred relationships, deterministic calc -> DAX (preserving every original formula), storage-mode auto-selection, and a self-contained Fabric REST deploy.",
-      "version": "0.1.0",
+      "source": "./plugins/tableau-fabric-skills",
+      "description": "[DEPRECATED ALIAS of tableau-fabric-skills@tableau-collection -- pre-0.2.0 users only; new installs should use tableau-fabric-skills.] Rebuild Tableau datasources as Microsoft Fabric / Power BI semantic models: typed TMDL, inferred relationships, deterministic calc -> DAX (preserving every original formula), storage-mode auto-selection, and a self-contained Fabric REST deploy.",
+      "version": "0.2.0",
       "skills": [
         "./skills/tableau-migration"
       ],
       "agents": [],
       "mcpServers": {},
-      "repository": "https://github.com/Yarbrdab000/tableau-migration-skill",
-      "keywords": [
-        "tableau",
-        "fabric",
-        "microsoft-fabric",
-        "power-bi",
-        "semantic-model",
-        "tmdl",
-        "dax",
-        "migration"
-      ],
+      "repository": "https://github.com/Yarbrdab000/tableau-fabric-skills",
+      "keywords": ["tableau","fabric","microsoft-fabric","power-bi","semantic-model","tmdl","dax","migration"],
       "license": "MIT"
     }
   ]
 }
-

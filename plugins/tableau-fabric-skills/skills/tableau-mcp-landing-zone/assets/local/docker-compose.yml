@@ -1,0 +1,72 @@
+# Local spike harness: the OFFICIAL Tableau MCP image behind our auth sidecar.
+#
+#   client ──> sidecar :9000 (public) ──> tableau-mcp :8000 (internal only) ──> Tableau
+#
+# The official container is NEVER published to the host — only the sidecar is reachable,
+# so the sidecar is the complete auth boundary (DANGEROUSLY_DISABLE_OAUTH=true is safe).
+#
+# Usage:
+#   1. cp .env.example .env  and fill in your Tableau Connected App values
+#   2. docker compose up --build
+#   3. curl -s localhost:9000/healthz
+#   4. MCP over HTTP at  http://localhost:9000/mcp  (send  x-api-key: $SIDECAR_API_KEY )
+#
+# Default mode is service_account (simplest). For the Entra->Tableau passthrough hero,
+# set IDENTITY_MODE=passthrough + TRUST_EASY_AUTH=true and (locally only) send the
+# X-MS-CLIENT-PRINCIPAL-NAME header yourself. In Azure, Container Apps Easy Auth / APIM
+# sets that header authentically — locally it is spoofable, so this is for testing only.
+
+services:
+  tableau-mcp:
+    # PIN by digest in real deployments, e.g. ghcr.io/tableau/tableau-mcp@sha256:...
+    image: ${TABLEAU_MCP_IMAGE:-ghcr.io/tableau/tableau-mcp:latest}
+    restart: unless-stopped
+    expose:
+      - "8000"
+    environment:
+      TRANSPORT: http
+      PORT: "8000"
+      # The sidecar is our auth boundary, so disable the official OAuth 2.1 front door.
+      DANGEROUSLY_DISABLE_OAUTH: "true"
+      # Enables the X-Tableau-Auth passthrough middleware (used in passthrough mode).
+      ENABLE_PASSTHROUGH_AUTH: "${ENABLE_PASSTHROUGH_AUTH:-false}"
+      SERVER: ${TABLEAU_SERVER}
+      SITE_NAME: ${TABLEAU_SITE}
+      AUTH: direct-trust
+      # Static service-account identity for non-passthrough calls / startup validation.
+      JWT_SUB_CLAIM: ${TABLEAU_SERVICE_ACCOUNT_USERNAME}
+      CONNECTED_APP_CLIENT_ID: ${TABLEAU_CONNECTED_APP_CLIENT_ID}
+      CONNECTED_APP_SECRET_ID: ${TABLEAU_CONNECTED_APP_SECRET_ID}
+      CONNECTED_APP_SECRET_VALUE: ${TABLEAU_CONNECTED_APP_SECRET_VALUE}
+      DEFAULT_LOG_LEVEL: ${DEFAULT_LOG_LEVEL:-info}
+
+  sidecar:
+    # Published sidecar image — keeps this vendored bundle self-contained (no source tree needed).
+    # To build from source instead, clone the bridge repo and use:  build: <path>/Play1/sidecar
+    image: ${SIDECAR_IMAGE:-ghcr.io/yarbrdab000/tableau-fabric-ai-bridge-sidecar:latest}
+    restart: unless-stopped
+    depends_on:
+      - tableau-mcp
+    ports:
+      - "9000:9000"
+    environment:
+      PORT: "9000"
+      UPSTREAM_MCP_URL: http://tableau-mcp:8000/mcp
+      # Caller auth.
+      ALLOW_API_KEY: "true"
+      SIDECAR_API_KEY: ${SIDECAR_API_KEY}
+      TRUST_EASY_AUTH: ${TRUST_EASY_AUTH:-false}
+      # Identity mode.
+      IDENTITY_MODE: ${IDENTITY_MODE:-service_account}
+      ON_UNRESOLVED_IDENTITY: deny
+      # Tableau / Connected App (passthrough only — signs per-user JWTs).
+      TABLEAU_SERVER: ${TABLEAU_SERVER}
+      TABLEAU_SITE: ${TABLEAU_SITE}
+      TABLEAU_CONNECTED_APP_CLIENT_ID: ${TABLEAU_CONNECTED_APP_CLIENT_ID}
+      TABLEAU_CONNECTED_APP_SECRET_ID: ${TABLEAU_CONNECTED_APP_SECRET_ID}
+      TABLEAU_CONNECTED_APP_SECRET_VALUE: ${TABLEAU_CONNECTED_APP_SECRET_VALUE}
+      # Entra -> Tableau username mapping (passthrough only).
+      UPN_MAPPING_MODE: ${UPN_MAPPING_MODE:-direct}
+      UPN_DOMAIN_FROM: ${UPN_DOMAIN_FROM:-}
+      UPN_DOMAIN_TO: ${UPN_DOMAIN_TO:-}
+      ENTRA_TENANT_ID: ${ENTRA_TENANT_ID:-}

@@ -1,11 +1,27 @@
 # Clean-Room Provenance & Authorship Statement
 
-This document records how `tableau-migration-skill` was built, so its provenance is transparent
+This document records how `tableau-fabric-skills` was built, so its provenance is transparent
 to downstream reviewers — in particular for a potential contribution to
 [`microsoft/skills-for-fabric`](https://github.com/microsoft/skills-for-fabric), which requires
 contributors to attest that their contribution is their **own original work**.
 
 It is the engineering-process companion to [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+## Skills in this collection
+
+This repository packages three skills; the clean-room concern below centers on the
+`tableau-migration` calc → DAX translator (the substantive original IP). The others are
+straightforward:
+
+- **`tableau-datasource-profiler`** — calls Tableau's own REST / Metadata / VizQL Data Service APIs
+  and signs a Connected App JWT with the Python standard library (its one runtime dependency is
+  `requests`). No third-party code copied; original work.
+- **`tableau-mcp-landing-zone`** — **wraps the official `ghcr.io/tableau/tableau-mcp` image
+  unmodified** (it does not fork or reimplement it) behind an original auth sidecar. The deploy
+  assets vendored under its `assets/` folder are original infrastructure-as-code synced from the
+  bridge repo; the official image is pulled at deploy time, not vendored. See
+  [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+- **`tableau-migration`** — original parser/emitter; provenance detailed below.
 
 ## Summary attestation
 

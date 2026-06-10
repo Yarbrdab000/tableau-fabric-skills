@@ -1,0 +1,41 @@
+swagger: '2.0'
+info:
+  title: Tableau Fabric AI Bridge (MCP)
+  description: >-
+    Model Context Protocol server that lets a Microsoft Copilot Studio agent
+    inventory and query published Tableau datasources in natural language. Backed
+    by the official Tableau MCP server (tools: list-datasources,
+    get-datasource-metadata, query-datasource, search-content) behind an auth
+    sidecar that accepts a shared x-api-key.
+  version: '1.0.0'
+# Replace `host` with YOUR deployed Container App FQDN (the mcpEndpoint output of the
+# Deploy-to-Azure step, without the https:// prefix and without the /mcp suffix).
+host: REPLACE-WITH-YOUR-APP.region.azurecontainerapps.io
+basePath: /
+schemes:
+  - https
+consumes:
+  - application/json
+produces:
+  - application/json
+paths:
+  /mcp:
+    post:
+      summary: Tableau MCP (Streamable HTTP)
+      description: Streamable HTTP MCP endpoint exposed by the Tableau-Fabric-AI-Bridge server.
+      operationId: InvokeMCP
+      # This extension is what tells Copilot Studio to treat the connector as an MCP
+      # server and dynamically discover its tools, rather than as a plain REST action.
+      x-ms-agentic-protocol: mcp-streamable-1.0
+      responses:
+        '200':
+          description: Success
+securityDefinitions:
+  api_key:
+    type: apiKey
+    in: header
+    # The server accepts the shared key via the `x-api-key` header (preferred) or
+    # `Authorization: Bearer <key>`. The custom connector uses x-api-key.
+    name: x-api-key
+security:
+  - api_key: []

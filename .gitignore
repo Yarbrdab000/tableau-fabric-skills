@@ -33,3 +33,7 @@ venv/
 Thumbs.db
 .vscode/
 .idea/
+
+# Allow committed example/template env files (never real secrets)
+!.env.example
+!**/.env.example
