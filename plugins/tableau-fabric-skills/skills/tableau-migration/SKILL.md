@@ -411,3 +411,12 @@ report rebuild ships (v2) — the dataset is fully functional on its own; pass `
 2. **Query & explore** with `semantic-model-consumption` and `fabriciq` (natural-language analysis over the migrated model).
 3. **Repair stubs** — work the migration report's stub list, optionally with the validation-gated LLM pass.
 4. **(v2) Rebuild reports** — once measures are trusted, regenerate Tableau worksheets/dashboards as Power BI report pages (roadmap).
+
+## Related skills
+
+- [`tableau-datasource-profiler`](../tableau-datasource-profiler/SKILL.md) — run FIRST to inventory
+  fields and assess migration readiness (calculated-field count, unsupported custom SQL, RLS/user
+  references) before rebuilding the datasource here.
+- [`tableau-mcp-landing-zone`](../tableau-mcp-landing-zone/SKILL.md) — after migrating, stand up the
+  official Tableau MCP server so business users can natural-language-query Tableau from Copilot /
+  Copilot Studio.

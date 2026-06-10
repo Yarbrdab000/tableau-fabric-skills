@@ -20,6 +20,21 @@ potential contribution to `microsoft/skills-for-fabric`).
   [`skills/tableau-migration/scripts/calc_to_dax.py`](skills/tableau-migration/scripts/calc_to_dax.py)
   is an independent recursive-descent parser/emitter with a different architecture.
 
+## Conventions & packaging model (structure modeled, no content copied)
+
+### microsoft/skills-for-fabric
+- **Project:** https://github.com/microsoft/skills-for-fabric
+- **License:** MIT
+- **How it was used:** Adopted as the *convention and packaging model* for this collection so that
+  it stays shaped for an eventual upstream contribution. We model its **structure and formats** only
+  — the `skills/<name>/SKILL.md` + `resources/` layout, the `SKILL.md` frontmatter shape (a `name`
+  plus a `description` that ends with an enumerated "Use when the user wants to: (1)(2)(3)" and a
+  quoted `Triggers:` list), and the marketplace/plugin fractal packaging. Conventions, formats, and
+  methods of this kind are not protected by copyright.
+- **What was NOT used:** No skill descriptions, workflow/selector tables, resource prose, or other
+  expressive content were copied or adapted; all such content in this repository is original. If any
+  file is ever copied verbatim in the future, its MIT copyright and license notice will be retained.
+
 ## Deployed / referenced third-party artifacts (not vendored)
 
 ### Official Tableau MCP server image — `ghcr.io/tableau/tableau-mcp`

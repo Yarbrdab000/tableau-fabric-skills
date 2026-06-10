@@ -66,6 +66,11 @@ What we refuse is copying *expression* or mirroring a protected *arrangement*.
   mechanically achievable. We used its **factual mapping space** and **general method**, and wrote
   our own parser/emitter, our own taxonomy, our own tests, and our own module structure. No file,
   function, regex, lookup table, comment, or test fixture from it appears in this repository.
+- **`microsoft/skills-for-fabric`** (MIT) — modeled for **packaging conventions and format only**
+  (repo/skill layout, `SKILL.md` frontmatter shape, `resources/` layout, marketplace/plugin
+  structure) so this collection stays shaped for an eventual upstream contribution. All prose and
+  content in those containers is our own; no skill descriptions, workflow/selector tables, or
+  resource text were copied. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 ## Per-area provenance
 

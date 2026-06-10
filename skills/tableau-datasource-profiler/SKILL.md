@@ -9,9 +9,16 @@ description: >-
   Service. Also includes a **natural-language query** tool (`query_datasource.py`)
   that executes structured VizQL Data Service queries (aggregations, filters,
   sorting, top-N) so an agent can answer business questions from the data. Use
-  this when a user wants to understand, inventory, audit, query, or assess the
-  migration readiness of a Tableau datasource, or before landing it in
-  Microsoft Fabric / Power BI. Read-only; never modifies Tableau.
+  when the user wants to: (1) inventory or document a Tableau datasource's fields,
+  types, calculated-field formulas, and lineage, (2) assess Tableau to Microsoft
+  Fabric / Power BI migration readiness (calculated fields needing DAX, unsupported
+  custom SQL, RLS/user references), or (3) profile data quality (cardinality, null
+  rates, value/date ranges) or answer natural-language questions about the data
+  before landing it in Fabric. Read-only; never modifies Tableau.
+  Triggers: "profile tableau datasource", "tableau datasource fields",
+  "tableau migration readiness", "assess tableau datasource",
+  "inventory tableau calculated fields", "query tableau datasource",
+  "tableau data quality", "audit tableau datasource".
 ---
 
 # Tableau Datasource Profiler
@@ -146,3 +153,11 @@ Flags: `--query-json` or `--query-file` (required), `--row-limit` (default 100, 
   `TABLEAU_JWT_USERNAME` set to a Site Admin (Connected App Direct Trust impersonation).
 - Surface the migration signals (calculated-field count, `containsUnsupportedCustomSql`,
   `hasUserReference`) when the user's intent is migration to Fabric / Power BI.
+
+## Related skills
+
+- [`tableau-migration`](../tableau-migration/SKILL.md) — the natural next step: once a datasource
+  is profiled and judged migration-ready, rebuild it as a Fabric / Power BI semantic model (typed
+  TMDL, calc->DAX, connection->M).
+- [`tableau-mcp-landing-zone`](../tableau-mcp-landing-zone/SKILL.md) — stand up the official Tableau
+  MCP server so business users can natural-language-query the same datasource from Copilot.
