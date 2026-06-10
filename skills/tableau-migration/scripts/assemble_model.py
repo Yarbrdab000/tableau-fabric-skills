@@ -504,6 +504,70 @@ def relationship_confidence_manifest(descriptor, relationships=None):
     return {"created": created, "skipped": skipped, "summary": summary}
 
 
+# A calc lands in exactly one coverage bucket. ``translated`` (deterministic safe subset) and
+# ``assisted_approved`` (a human-approved assisted suggestion) emit LIVE DAX; ``assisted_suggested``
+# (an idiom was recognized but not yet approved) and ``stub`` are still inert ``= 0`` placeholders.
+# Original mapping over our own ``_measures_part`` status strings -- no third-party source.
+_COVERAGE_BUCKET = {
+    "translated": "translated",
+    "assisted-approved": "assisted_approved",
+    "assisted-suggested": "assisted_suggested",
+    "stub": "stub",
+}
+_LIVE_BUCKETS = ("translated", "assisted_approved")
+
+
+def _coverage_pct(n, total):
+    """Percentage (one decimal) of ``n`` over ``total``; ``None`` when there are no calcs at all."""
+    return round(100.0 * n / total, 1) if total else None
+
+
+def calc_coverage_artifact(measure_report):
+    """Summarize calc->DAX translation coverage as a first-class, machine-readable artifact.
+
+    An **additive** migration-report output (parallel to the existing ``measures`` rows, which are
+    left untouched): instead of only the per-measure detail, this rolls the same rows up into an
+    auditable coverage picture a consumer can act on programmatically rather than scraping stdout.
+
+    Each calc is placed in one bucket -- ``translated`` / ``assisted_approved`` (LIVE DAX) or
+    ``assisted_suggested`` / ``stub`` (still an inert ``= 0``) -- preserving its original Tableau
+    formula and translator ``reason``. ``summary`` carries the per-bucket counts plus ``live`` /
+    ``inert`` totals and two honest coverage percentages: ``deterministic_coverage_pct`` (the
+    safe-subset translator alone) and ``live_coverage_pct`` (including human-approved assists).
+    Percentages are ``None`` when a model has no calculated fields (coverage is undefined, never a
+    misleading 0% or 100%). Pure/offline; reads only the already-computed report rows.
+    """
+    buckets = {"translated": 0, "assisted_approved": 0, "assisted_suggested": 0, "stub": 0}
+    measures = []
+    for row in measure_report or []:
+        status = row.get("status")
+        bucket = _COVERAGE_BUCKET.get(status, "stub")
+        buckets[bucket] += 1
+        measures.append({
+            "measure": row.get("measure"),
+            "status": status,
+            "bucket": bucket,
+            "live": bucket in _LIVE_BUCKETS,
+            "reason": row.get("reason"),
+            "has_suggestion": bool(row.get("assisted_suggestion") or row.get("assisted_pattern")),
+            "tableau_formula": row.get("tableau_formula"),
+        })
+    total = len(measures)
+    live = buckets["translated"] + buckets["assisted_approved"]
+    summary = {
+        "total": total,
+        "translated": buckets["translated"],
+        "assisted_approved": buckets["assisted_approved"],
+        "assisted_suggested": buckets["assisted_suggested"],
+        "stub": buckets["stub"],
+        "live": live,
+        "inert": total - live,
+        "deterministic_coverage_pct": _coverage_pct(buckets["translated"], total),
+        "live_coverage_pct": _coverage_pct(live, total),
+    }
+    return {"summary": summary, "measures": measures}
+
+
 def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=None,
                           hierarchies=None, display_folders=None, rls_roles=None,
                           date_table=True, mark_as_date=True, flatfile_path=None,
@@ -608,6 +672,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
         "tables": [t for t in table_names if t != "_Measures"],
         "skipped_tables": skipped,
         "measures": measure_report,
+        "calc_coverage": calc_coverage_artifact(measure_report),
         "assisted_suggestions": assisted_suggestions,
         "relationships": relationships or [],
         "relationship_confidence": relationship_confidence_manifest(descriptor, relationships or []),

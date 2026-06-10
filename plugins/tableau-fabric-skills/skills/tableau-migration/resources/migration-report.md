@@ -59,6 +59,22 @@ One row per calc:
 Pull `status` from the translator (`reason`) and the reconciliation result (verified / mismatch /
 not-evaluated). Every stub keeps its `TableauFormula` annotation in the model.
 
+#### Calc coverage (`calc_coverage`)
+
+Alongside the per-measure `measures` rows, the report carries a machine-readable `calc_coverage`
+artifact so coverage can be consumed programmatically (gate a pipeline, drive a dashboard) instead of
+scraped from stdout. It is additive — the `measures` rows are unchanged.
+
+- **`measures[]`** — one row per calc with its `bucket`, a `live` flag, the translator `reason`, a
+  `has_suggestion` flag, and the original `tableau_formula`.
+- **buckets** — `translated` (deterministic safe subset) and `assisted_approved` (a human-approved
+  assisted suggestion) emit **live** DAX; `assisted_suggested` (an idiom was recognized but not yet
+  approved) and `stub` remain inert `= 0` placeholders.
+- **`summary`** — per-bucket counts plus `live` / `inert` totals and two honest percentages:
+  `deterministic_coverage_pct` (the safe-subset translator alone) and `live_coverage_pct` (including
+  approved assists). Both are `null` when the model has no calculated fields — coverage is undefined,
+  never a misleading 0% or 100%.
+
 ### 4. Connection
 
 - Connector, server/database, mode (Import / DirectQuery), and whether a native query was preserved.

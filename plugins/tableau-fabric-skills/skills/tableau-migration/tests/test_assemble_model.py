@@ -6,6 +6,7 @@ import pytest
 
 from assemble_model import (
     assemble_import_model,
+    calc_coverage_artifact,
     fabric_definition_payload,
     migrate_tds_to_semantic_model,
     relationship_confidence_manifest,
@@ -228,4 +229,65 @@ def test_relationship_confidence_is_additive_not_destructive():
     graded = {(c["from_table"], c["from_col"], c["to_table"], c["to_col"])
               for c in report["relationship_confidence"]["created"]}
     assert reported == graded
+
+
+# -- Calc-coverage artifact (additive report output) --------------------------
+def test_calc_coverage_counts_translated_and_stubbed():
+    # Two single-field aggregates translate; the IF/THEN string calc stays an inert stub.
+    calcs = [
+        {"name": "Profit Ratio", "formula": "SUM([Sales])/SUM([Quantity])"},
+        {"name": "Avg Sale", "formula": "AVG([Sales])"},
+        {"name": "Profit Bucket", "formula": 'IF [Sales]>0 THEN "Y" ELSE "N" END'},
+    ]
+    out = migrate_tds_to_semantic_model(LIVE_SQLSERVER, model_name="Superstore", calcs=calcs)
+    cov = out["report"]["calc_coverage"]
+    s = cov["summary"]
+    assert s["total"] == 3
+    assert s["translated"] == 2
+    assert s["stub"] == 1
+    assert s["live"] == 2 and s["inert"] == 1
+    assert s["deterministic_coverage_pct"] == pytest.approx(66.7)
+    assert s["live_coverage_pct"] == pytest.approx(66.7)
+
+    by = {m["measure"]: m for m in cov["measures"]}
+    assert by["Profit Ratio"]["live"] is True and by["Profit Ratio"]["bucket"] == "translated"
+    assert by["Profit Bucket"]["live"] is False and by["Profit Bucket"]["bucket"] == "stub"
+    # every formula is carried for an auditable report
+    assert by["Profit Bucket"]["tableau_formula"] == 'IF [Sales]>0 THEN "Y" ELSE "N" END'
+
+
+def test_calc_coverage_is_additive_and_undefined_without_calcs():
+    # No calcs -> measures empty; coverage is undefined (None, not a misleading 0/100), and the
+    # artifact sits alongside the still-present measures key.
+    out = migrate_tds_to_semantic_model(LIVE_SQLSERVER, model_name="Superstore")
+    report = out["report"]
+    assert "measures" in report and "calc_coverage" in report
+    s = report["calc_coverage"]["summary"]
+    assert s["total"] == 0
+    assert s["deterministic_coverage_pct"] is None
+    assert s["live_coverage_pct"] is None
+
+
+def test_calc_coverage_buckets_assisted_states():
+    # Direct unit test over synthetic report rows covering all four buckets, incl. the human-approved
+    # assist (live) vs the still-inert suggestion.
+    rows = [
+        {"measure": "a", "status": "translated", "reason": "ok", "tableau_formula": "SUM([X])"},
+        {"measure": "b", "status": "assisted-approved", "reason": "fallback",
+         "tableau_formula": "...", "assisted_pattern": "argmax"},
+        {"measure": "c", "status": "assisted-suggested", "reason": "fallback",
+         "tableau_formula": "...", "assisted_suggestion": {"pattern": "argmax"}},
+        {"measure": "d", "status": "stub", "reason": "unsupported", "tableau_formula": "..."},
+    ]
+    cov = calc_coverage_artifact(rows)
+    s = cov["summary"]
+    assert (s["translated"], s["assisted_approved"], s["assisted_suggested"], s["stub"]) == (1, 1, 1, 1)
+    assert s["live"] == 2 and s["inert"] == 2
+    assert s["live_coverage_pct"] == pytest.approx(50.0)
+    assert s["deterministic_coverage_pct"] == pytest.approx(25.0)
+
+    by = {m["measure"]: m for m in cov["measures"]}
+    assert by["b"]["live"] is True and by["b"]["has_suggestion"] is True
+    assert by["c"]["live"] is False and by["c"]["has_suggestion"] is True
+    assert by["d"]["has_suggestion"] is False
 
