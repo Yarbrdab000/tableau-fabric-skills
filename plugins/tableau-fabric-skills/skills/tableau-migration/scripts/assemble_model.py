@@ -390,6 +390,120 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
     return date_name, part, rels, report
 
 
+# A single-column equality whose join key reads as an identifier (by name) is the strongest kind
+# of relationship; a coarse non-ID key (a string/boolean dimension) gets flagged for many-to-many
+# risk. Token form catches `Order_Key` / `Cust_ID`; the suffix form catches `CustomerID` /
+# `OrderKey`. Original heuristic -- no third-party source.
+_ID_KEY_RE = re.compile(
+    r"(?i)(?:^|[\s_])(?:id|key|code|guid|uuid|pk|fk|sk)(?:$|[\s_])|(?:id|key|code)$")
+
+_CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
+
+
+def _looks_like_id_key(col_name):
+    """True when a column name reads as an identifier/foreign-key (not a descriptive dimension)."""
+    return bool(col_name) and bool(_ID_KEY_RE.search(str(col_name)))
+
+
+def _key_confidence(col_name, tmdl_type):
+    """Grade ONE join-key column from its name + declared/landed type. Returns ``(grade, reason)``.
+
+    An ID-like name or an integer column is a ``high``-confidence key; a string/boolean column is
+    a ``low``-confidence dimension key (potential many-to-many); a non-ID numeric/date column lands
+    in the ``medium`` middle. Deterministic and original.
+    """
+    tt = (tmdl_type or "").lower()
+    if _looks_like_id_key(col_name):
+        return "high", "name reads as an identifier/foreign key"
+    if tt == "int64":
+        return "high", "integer key (likely a surrogate/natural key)"
+    if tt == "string":
+        return "low", "coarse string-dimension key (not ID-like) -- potential many-to-many"
+    if tt == "boolean":
+        return "low", "boolean key -- very low cardinality, potential many-to-many"
+    if tt in ("double", "decimal"):
+        return "medium", "numeric non-ID key"
+    if tt == "datetime":
+        return "medium", "date/datetime key -- joins at the timestamp grain"
+    return "medium", "non-ID key of unestablished type"
+
+
+def relationship_confidence_manifest(descriptor, relationships=None):
+    """Explain, per relationship, WHY it was (or was not) created -- with a confidence grade.
+
+    An **additive** migration-report artifact (the emitted model is unchanged). Every CREATED
+    relationship is an AUTHORED single-column equality lifted from Tableau's object-graph
+    ``<relationships>``; for each one this records:
+
+    * the OWN connector of each endpoint table (``from_connector`` / ``to_connector``) and a
+      ``cross_source`` flag, so a heterogeneous federation (e.g. Azure SQL + Snowflake +
+      Databricks in one composite model) is reported per table rather than at the datasource level;
+    * a deterministic ``confidence`` grade -- an ID/integer key scores ``high``; a coarse
+      string/boolean dimension key scores ``low`` with an explicit many-to-many ``risks`` note --
+      taken as the WEAKER of the two endpoint keys (a relationship is only as strong as its softer
+      side);
+    * a human-readable ``basis`` naming both keys' reasons.
+
+    SKIPPED candidates carry the resolver's reason verbatim (composite/calculated key, unresolved
+    endpoint, ambiguous orientation) from ``descriptor['relationship_warnings']``, so a reviewer
+    sees what was dropped and why. Returns ``{"created", "skipped", "summary"}``. Pure/offline;
+    reads only the non-secret descriptor.
+    """
+    if relationships is None:
+        relationships = descriptor.get("relationships") or []
+    conn_by_table, cols_by_table = {}, {}
+    for r in descriptor.get("relations") or []:
+        if r.get("kind") not in ("table", "custom_sql"):
+            continue
+        disp = _table_display(r)
+        if not disp:
+            continue
+        conn_by_table[disp.lower()] = (r.get("connection") or {}).get("connection_class")
+        cols_by_table[disp.lower()] = {
+            (c.get("model_name") or "").lower(): c.get("tmdl_type")
+            for c in (r.get("columns") or []) if c.get("model_name")
+        }
+
+    created = []
+    for rel in relationships:
+        ft, fc = rel.get("from_table"), rel.get("from_col")
+        tt, tc = rel.get("to_table"), rel.get("to_col")
+        f_type = cols_by_table.get((ft or "").lower(), {}).get((fc or "").lower())
+        t_type = cols_by_table.get((tt or "").lower(), {}).get((tc or "").lower())
+        f_conf, f_reason = _key_confidence(fc, f_type)
+        t_conf, t_reason = _key_confidence(tc, t_type)
+        weaker = f_conf if _CONFIDENCE_RANK[f_conf] <= _CONFIDENCE_RANK[t_conf] else t_conf
+        risks = []
+        for col, conf, reason in ((fc, f_conf, f_reason), (tc, t_conf, t_reason)):
+            if conf != "low":
+                continue
+            note = f"{col}: {reason}"
+            if note not in risks:
+                risks.append(note)
+        from_conn = conn_by_table.get((ft or "").lower())
+        to_conn = conn_by_table.get((tt or "").lower())
+        created.append({
+            "from_table": ft, "from_col": fc, "from_connector": from_conn,
+            "to_table": tt, "to_col": tc, "to_connector": to_conn,
+            "cross_source": bool(from_conn and to_conn and from_conn != to_conn),
+            "origin": "authored",
+            "confidence": weaker,
+            "basis": ("explicit Tableau object-graph relationship (single-column equality); "
+                      f"from-key {fc!r} {f_reason}; to-key {tc!r} {t_reason}"),
+            "risks": risks,
+        })
+
+    skipped = [{"reason": w} for w in (descriptor.get("relationship_warnings") or [])]
+    summary = {
+        "created": len(created),
+        "skipped": len(skipped),
+        "high": sum(1 for c in created if c["confidence"] == "high"),
+        "medium": sum(1 for c in created if c["confidence"] == "medium"),
+        "low": sum(1 for c in created if c["confidence"] == "low"),
+    }
+    return {"created": created, "skipped": skipped, "summary": summary}
+
+
 def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=None,
                           hierarchies=None, display_folders=None, rls_roles=None,
                           date_table=True, mark_as_date=True, flatfile_path=None,
@@ -496,6 +610,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
         "measures": measure_report,
         "assisted_suggestions": assisted_suggestions,
         "relationships": relationships or [],
+        "relationship_confidence": relationship_confidence_manifest(descriptor, relationships or []),
         "date_table": date_report,
         "roles": [r["name"] for r in rls_roles or []],
     }
@@ -928,6 +1043,7 @@ def _fallback_result(descriptor, decision, *, model_name, calcs, write_to):
         "storage_decision": decision,
         "fallback": True,
         "tables": [],
+        "relationship_confidence": relationship_confidence_manifest(descriptor),
     }
     if decision.get("fallback") == FALLBACK_LAND_TO_DELTA:
         report["landing_plan"] = directlake_landing_plan(

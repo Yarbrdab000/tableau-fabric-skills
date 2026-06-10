@@ -8,9 +8,17 @@ from assemble_model import (
     assemble_import_model,
     fabric_definition_payload,
     migrate_tds_to_semantic_model,
+    relationship_confidence_manifest,
     write_model_folder,
 )
-from test_connection_to_m import EXCEL_COLLECTION, LIVE_SQLSERVER, JOIN_TREE, FEDERATED_STAR
+from connection_to_m import parse_tds
+from test_connection_to_m import (
+    EXCEL_COLLECTION,
+    LIVE_SQLSERVER,
+    JOIN_TREE,
+    FEDERATED_STAR,
+    FEDERATED_REL_EDGECASE,
+)
 
 
 def _decode(part):
@@ -142,3 +150,82 @@ def test_write_model_folder(tmp_path):
     assert any(p.endswith("model.tmdl") for p in written)
     assert (tmp_path / "Superstore.SemanticModel" / "definition" / "tables" / "Orders.tmdl").exists()
     assert (tmp_path / "Superstore.SemanticModel" / ".platform").exists()
+
+
+# -- Relationship-confidence manifest (additive report artifact) --------------
+def _by_key(created):
+    return {(c["from_table"], c["from_col"], c["to_table"], c["to_col"]): c for c in created}
+
+
+def test_relationship_confidence_grades_id_high_and_dimension_low():
+    # The authored object-graph joins are graded: an ID-like key (Order_Key) is high confidence;
+    # a coarse string-dimension key (REGION) is low and must be flagged for many-to-many risk.
+    out = migrate_tds_to_semantic_model(FEDERATED_STAR, model_name="Star")
+    manifest = out["report"]["relationship_confidence"]
+    created = _by_key(manifest["created"])
+
+    id_rel = created[("SALE", "Order_Key", "RMA", "Order_Key")]
+    assert id_rel["confidence"] == "high"
+    assert id_rel["risks"] == []
+    assert id_rel["origin"] == "authored"
+
+    dim_rel = created[("SALE", "REGION", "REP", "REGION")]
+    assert dim_rel["confidence"] == "low"
+    assert any("many-to-many" in r for r in dim_rel["risks"])
+
+    assert manifest["summary"]["high"] >= 1 and manifest["summary"]["low"] >= 1
+    assert manifest["summary"]["created"] == len(manifest["created"])
+
+
+def test_relationship_confidence_carries_per_table_connector_and_cross_source():
+    # A heterogeneous federation must report EACH endpoint's own connector, not one datasource-
+    # level class, and flag a cross-source join. Synthetic descriptor (original, no fixture).
+    descriptor = {
+        "datasource_name": "Federated",
+        "relations": [
+            {"kind": "table", "name": "Orders",
+             "connection": {"connection_class": "azure_sqldb"},
+             "columns": [{"model_name": "Order_ID", "tmdl_type": "int64"}]},
+            {"kind": "table", "name": "RETURNS",
+             "connection": {"connection_class": "snowflake"},
+             "columns": [{"model_name": "ORDER_ID", "tmdl_type": "int64"}]},
+        ],
+        "relationships": [
+            {"from_table": "Orders", "from_col": "Order_ID",
+             "to_table": "RETURNS", "to_col": "ORDER_ID"},
+        ],
+        "relationship_warnings": [],
+    }
+    manifest = relationship_confidence_manifest(descriptor)
+    rel = manifest["created"][0]
+    assert rel["from_connector"] == "azure_sqldb"
+    assert rel["to_connector"] == "snowflake"
+    assert rel["cross_source"] is True
+    assert rel["confidence"] == "high"  # integer + ID-like name
+
+
+def test_relationship_confidence_lists_skipped_reasons():
+    # Candidates the resolver dropped (ghost column, composite AND, ambiguous orientation) surface
+    # verbatim as skip reasons so a reviewer sees what was NOT wired and why.
+    descriptor = parse_tds(FEDERATED_REL_EDGECASE)
+    manifest = relationship_confidence_manifest(descriptor)
+    assert manifest["summary"]["skipped"] >= 1
+    assert manifest["summary"]["skipped"] == len(descriptor["relationship_warnings"])
+    assert all(isinstance(s["reason"], str) and s["reason"] for s in manifest["skipped"])
+
+
+def test_relationship_confidence_is_additive_not_destructive():
+    # The manifest is purely additive: every pre-existing report key is still present alongside it.
+    out = migrate_tds_to_semantic_model(FEDERATED_STAR, model_name="Star")
+    report = out["report"]
+    for key in ("model_name", "storage_decision", "tables", "measures",
+                "assisted_suggestions", "relationships", "date_table", "roles"):
+        assert key in report
+    assert "relationship_confidence" in report
+    # the created entries match the reported relationships one-for-one
+    reported = {(r["from_table"], r["from_col"], r["to_table"], r["to_col"])
+                for r in report["relationships"]}
+    graded = {(c["from_table"], c["from_col"], c["to_table"], c["to_col"])
+              for c in report["relationship_confidence"]["created"]}
+    assert reported == graded
+

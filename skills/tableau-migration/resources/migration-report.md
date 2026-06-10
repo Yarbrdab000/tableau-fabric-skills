@@ -25,6 +25,28 @@ what was approximated, and what they must finish. Emit this in the orchestrator'
 | Columns | n | typed from source schema |
 | Relationships | n | inferred from hidden join keys, oriented by real cardinality |
 
+#### Relationship confidence (`relationship_confidence`)
+
+The report carries a machine-readable `relationship_confidence` manifest that explains, per relationship,
+**why it was created** and **how much to trust it** — so a reviewer can sanity-check the join graph instead
+of taking it on faith. It is additive: it sits alongside the existing `relationships` list and grades the
+same edges one-for-one.
+
+- **`created[]`** — one entry per authored single-column equality lifted from Tableau's object-graph
+  `<relationships>`. Each records both endpoints' **own** connector (`from_connector` / `to_connector`) and a
+  `cross_source` flag, so a heterogeneous federation (e.g. Azure SQL + Snowflake + Databricks in one
+  composite model) is reported per table, never collapsed to a single datasource-level class.
+- **`confidence`** — `high` / `medium` / `low`, taken as the **weaker** of the two endpoint keys (an edge is
+  only as strong as its softer side). An ID-like name or an integer key grades `high`; a numeric/date key is
+  `medium`; a coarse string/boolean dimension key grades `low` and gets an explicit many-to-many note in
+  `risks[]`. Example: `Orders.Order_ID = RETURNS.ORDER_ID` → `high`; `Orders.Region = people.Region` → `low`
+  with a "potential many-to-many" risk a reviewer should confirm.
+- **`skipped[]`** — candidates the resolver dropped (composite/calculated key, unresolved endpoint, ambiguous
+  orientation), each with the reason verbatim, so nothing is silently discarded.
+- **`summary`** — counts of created/skipped edges and the high/medium/low confidence breakdown.
+
+Surface the `low`-confidence and `skipped` rows in the customer report as relationships to review.
+
 ### 3. Calculated fields
 
 One row per calc:
