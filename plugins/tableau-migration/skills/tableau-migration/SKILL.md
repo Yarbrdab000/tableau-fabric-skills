@@ -5,15 +5,18 @@ description: >
   Recreates the data model as TMDL (typed columns, inferred relationships), translates the
   safe subset of Tableau calculated fields into working DAX measures (preserving every
   original formula as an annotation), and auto-selects a storage mode per datasource —
-  extract -> Import, live connection -> DirectQuery, or fall back to land-to-Delta + DirectLake —
-  so the rebuilt model can point directly at the original upstream source with the least
-  manual remapping. Use when the user wants to:
+  extract -> Import, live connection -> DirectQuery. By default each table is rebuilt bound
+  directly to its own source (even a federated, multi-connection datasource — Power BI relates
+  the tables in the model layer), with land-to-Delta + DirectLake offered as an explicit option
+  only for shapes that genuinely can't be rebuilt directly. Accepts a `.tds`/`.tdsx` datasource
+  or a `.twb`/`.twbx` workbook (pick one of several embedded datasources). Use when the user wants to:
   (1) migrate Tableau datasources / published data sources to Power BI semantic models,
   (2) convert Tableau calculated fields to DAX,
   (3) repoint a migrated model at its original SQL Server / Snowflake / Postgres source.
   Triggers: "migrate from tableau", "tableau to fabric", "tableau to power bi",
-  "tableau datasource to semantic model", "convert tableau calculation to dax",
-  "tableau calculated field to dax", "rebuild tableau datasource in fabric".
+  "tableau datasource to semantic model", "tableau workbook to power bi",
+  "convert tableau calculation to dax", "tableau calculated field to dax",
+  "rebuild tableau datasource in fabric".
 ---
 
 > **Updating this skill — only when the user asks**
@@ -48,6 +51,8 @@ model-object enrichment (hierarchies / display folders / RLS). See
 > - **(B) Live published datasource** — the user names a datasource published on Tableau Server / Cloud (a *name*, not a file path). Pull it down first with the **`tableau-datasource-profiler`** skill (or the Tableau **Download Data Source** REST API + Metadata API) using a PAT or Connected-App JWT; that yields the `.tds` this skill consumes, plus field/lineage metadata and reconciliation values.
 >
 > If the user just says "migrate my Tableau datasource" without specifying, **ask which route** (file path vs. published-datasource name + Tableau connection) rather than guessing. Once you hold the `.tds`, continue to the Migration Phases below.
+>
+> **Workbooks may embed several datasources.** A `.twb`/`.twbx` can contain more than one datasource (worksheet reference stubs and the `Parameters` pseudo-datasource are ignored). Call `list_workbook_datasources(source)` (or `workbook_datasources(xml)`) to enumerate the real ones; if there's exactly one, it's used automatically, otherwise pass `datasource="<name>"` to `migrate_datasource` to pick. Selecting an ambiguous workbook without a `datasource=` raises `AmbiguousDatasourceError` listing the choices.
 
 ## Prerequisite Knowledge
 
@@ -101,13 +106,13 @@ The pure-Python cores are offline, deterministic, and stdlib-only (no Spark / pa
 
 | Script | Purpose |
 |---|---|
-| [`scripts/fetch_tds.py`](scripts/fetch_tds.py) | **Tableau-side download** (stdlib-only): REST sign-in (PAT **or** Connected-App JWT), find a published datasource by name, download it, and extract the inner `.tds` from a `.tdsx`. CLI **and** importable (`sign_in`, `resolve_datasource_luid`, `download_datasource`, `inner_tds_from_zip`). Use this instead of hand-writing Tableau REST. |
+| [`scripts/fetch_tds.py`](scripts/fetch_tds.py) | **Tableau-side download** (stdlib-only): REST sign-in (PAT **or** Connected-App JWT), find a published datasource by name, download it, and extract the inner `.tds` from a `.tdsx` (`inner_tds_from_zip`) **or** the inner `.tds`/`.twb` from any Tableau archive incl. `.twbx` (`inner_doc_from_zip`). CLI **and** importable (`sign_in`, `resolve_datasource_luid`, `download_datasource`). Use this instead of hand-writing Tableau REST. |
 | `calc_to_dax.py` | Deterministic, typed Tableau calc → DAX translator. Recursive-descent parser: single-field aggregations + arithmetic, `IF`/`ELSEIF`/`IIF` conditionals, comparison + `AND`/`OR`/`NOT`, and `ZN`/`IFNULL`/`ISNULL`; `None` on fallback. Plus `suggest_assisted_dax` — opt-in idiom suggestions (e.g. argmax-over-a-dimension) emitted for human approval, never silently live. |
 | [`scripts/tmdl_generate.py`](scripts/tmdl_generate.py) | TMDL generators: typed columns, tables, measures, relationship inference, model files. |
 | [`scripts/field_resolver.py`](scripts/field_resolver.py) | Unambiguous caption → column resolver for the DirectLake (landed-Delta) path. |
 | [`scripts/storage_mode.py`](scripts/storage_mode.py) | Per-datasource storage-mode auto-selection (pure policy). |
-| [`scripts/connection_to_m.py`](scripts/connection_to_m.py) | Parse Tableau `.tds` → descriptor; **`extract_calcs`** (calculated fields → `calcs=`); emit M partitions + bind details (`connection_details_for_bind`); M-path field resolver. |
-| [`scripts/assemble_model.py`](scripts/assemble_model.py) | Tier-1 orchestrator: `.tds` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`), base64 deploy payload. **One-call `migrate_datasource(.tdsx/.tds/text)` → `{parts, report, bind}`** (auto-extracts calcs); `write_model_folder` / **`write_local_pbip`** for local output. |
+| [`scripts/connection_to_m.py`](scripts/connection_to_m.py) | Parse Tableau `.tds`/`.twb` → descriptor (`parse_tds(text, select=None)`); **`extract_calcs`** (calculated fields → `calcs=`); **`workbook_datasources`** (list selectable datasources, skipping `Parameters` + worksheet stubs); emit M partitions + bind details (`connection_details_for_bind`); M-path field resolver. |
+| [`scripts/assemble_model.py`](scripts/assemble_model.py) | Tier-1 orchestrator: `.tds`/`.twb` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`), base64 deploy payload. **One-call `migrate_datasource(.tdsx/.tds/.twbx/.twb/text, datasource=None)` → `{parts, report, bind}`** (auto-extracts calcs; `datasource=` selects from a multi-datasource workbook; a genuine fallback returns `parts={}` + `report["landing_plan"]` via `directlake_landing_plan`); `list_workbook_datasources`, `write_model_folder` / **`write_local_pbip`** for local output. |
 | [`scripts/deploy_to_fabric.py`](scripts/deploy_to_fabric.py) | Self-contained Fabric REST deploy (stdlib-only urllib): createOrUpdate / updateDefinition of the SemanticModel, 202 LRO polling, optional refresh + gateway bind. Importable `acquire_token` (handles `az` on Windows) + `refresh_dataset` for post-deploy ops. Lets the skill finish **in Fabric** without depending on a peer skill. |
 
 For exact signatures and a copy-paste **download → migrate → deploy** snippet, see [public-api.md](resources/public-api.md).
@@ -167,13 +172,20 @@ This skill rebuilds Tableau artifacts via REST APIs — no Tableau or Fabric UI 
 
 ```text
 Tableau datasource
-├── join/union tree, multi-connection, or no column metadata → FALL BACK: land-to-Delta + DirectLake
+├── single relation that is a cross-engine join/union tree, OR a multi-connection table that
+│     can't be routed to a specific upstream, OR no column metadata → FALL BACK: land-to-Delta + DirectLake
 ├── unknown/unmapped connector class                         → FALL BACK: land-to-Delta + DirectLake
 ├── flat file (Excel/CSV)                                    → Import (set file path)
 ├── extract enabled                                          → Import (snapshot); offer live DirectQuery if source supported
 └── live relational (SQL Server/Azure SQL DB/Postgres/MySQL/Redshift) → DirectQuery (M fully emitted)
+    ├── multiple named connections (each table → its own source) → DirectQuery rebuild + model relationships (DEFAULT, not a fallback)
     └── Oracle / Teradata / Snowflake / BigQuery            → DirectQuery mode; verified per-connector M in progress (flagged scaffold until then)
 ```
+
+> **Default-direct policy.** Each table is rebuilt against its own source — **including** a federated
+> datasource with several named connections, because Power BI relates the tables in the model layer.
+> Land-to-Delta + DirectLake is an explicit **option**, auto-suggested only for the genuinely-undoable
+> shapes above; when it triggers, `migrate_datasource` returns a `report["landing_plan"]` to act on.
 
 See [storage-mode-selection.md](resources/storage-mode-selection.md) for the full policy and `scripts/storage_mode.py` for the executable version.
 
@@ -184,7 +196,7 @@ See [storage-mode-selection.md](resources/storage-mode-selection.md) for the ful
 ### MUST DO
 - **Type every column from the source schema** (landed Delta for DirectLake, `.tds` `<metadata-records>` for Import/DirectQuery). Never deploy a model with inferred/guessed types — fall back instead.
 - **Preserve every original Tableau formula** as a `TableauFormula` annotation on its measure, translated or not. This is the audit/repair safety net.
-- **Fall back to land-to-Delta + DirectLake** for any datasource shape that cannot be rebuilt directly: join/union relation trees, multiple named connections, unmapped connectors, or missing column metadata.
+- **Default to a direct per-table rebuild** — each table binds to its own source, and Power BI relates multi-source tables in the model layer (so a federated, multi-connection datasource rebuilds direct, not via a lakehouse). Land-to-Delta + DirectLake is the explicit **option**, used only when a shape genuinely can't be rebuilt directly: a cross-engine join/union relation tree, a multi-connection table that can't be routed to a specific upstream, an unmapped connector, or missing column metadata. On that path `migrate_datasource` returns `report["landing_plan"]`.
 - **Run Play 3 (land data as Delta) before generating a DirectLake model** — DirectLake binds to OneLake Delta, so the tables must exist first.
 - **Deploy with the bundled `scripts/deploy_to_fabric.py`** (self-contained Fabric REST) so the migration finishes in Fabric without a peer-skill dependency; **or delegate deploy / bind / refresh / best-practice analysis** to `semantic-model-authoring` when that skill is available. Either way, do not hand-roll the `createItem` request inline.
 - **Validate translated measures** by reconciling `ExecuteQuery` results against Tableau VDS values before declaring parity (see [validation-reconciliation.md](resources/validation-reconciliation.md)).
@@ -334,7 +346,7 @@ Full guide in [migration-gotchas.md](resources/migration-gotchas.md).
 See [validation-reconciliation.md](resources/validation-reconciliation.md). The migration is validated by:
 
 1. **Structural** — model deploys and refreshes (DirectLake frames / Import loads / DirectQuery connects) without error.
-2. **Translation self-tests** — `pytest` runs the 636 offline assertions (translator subset + fallbacks + TMDL render + storage-mode policy + `.tds` parsing + deploy payload builders).
+2. **Translation self-tests** — `pytest` runs 717 offline tests (translator subset + fallbacks + TMDL render + storage-mode policy + `.tds`/`.twb` parsing + workbook-datasource selection + landing-plan fallback + deploy payload builders).
 3. **Value reconciliation (highest value)** — run each translated measure via `semantic-model-consumption` (`ExecuteQuery`) and compare to the Tableau VDS value pulled by the profiler. A measure is "verified" only when the numbers match.
 
 ---

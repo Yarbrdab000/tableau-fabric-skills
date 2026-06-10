@@ -1207,6 +1207,26 @@ def test_object_graph_relationships_parsed_with_model_names():
     assert "Order_Key" in sale_cols and "Order Key" not in sale_cols
 
 
+def test_object_graph_wrapped_tag_is_tolerated():
+    # Tableau Desktop's logical model can wrap the object graph in a feature-flagged tag
+    # (<_.fcp.ObjectModelEncapsulateLegacy.true...object-graph>) instead of a plain <object-graph>.
+    # The parser must match it by local-name suffix so relationship extraction still works on real
+    # federated files -- otherwise the joins silently vanish (relationships == []).
+    wrapped = FEDERATED_STAR.replace(
+        "<object-graph>",
+        "<_.fcp.ObjectModelEncapsulateLegacy.true...object-graph>").replace(
+        "</object-graph>",
+        "</_.fcp.ObjectModelEncapsulateLegacy.true...object-graph>")
+    d = parse_tds(wrapped)
+    pairs = {(r["from_table"], r["from_col"], r["to_table"], r["to_col"])
+             for r in d["relationships"]}
+    assert pairs == {
+        ("SALE", "REGION", "REP", "REGION"),
+        ("SALE", "Order_Key", "RMA", "Order_Key"),
+    }
+    assert d["relationship_warnings"] == []
+
+
 def test_object_graph_relationships_do_not_flip_source_to_fallback():
     # A fuzzy/unused relationship must never demote an otherwise-supported datasource: relationship
     # warnings are tracked separately from unsupported_reasons, so the star still rebuilds 1:1.
@@ -1251,13 +1271,14 @@ def test_multi_connection_exposes_connections_map_secret_free():
     assert all("svc_loader" not in repr(facts) for facts in conns.values())
 
 
-def test_multi_connection_gated_to_fallback_by_storage_mode():
-    # The per-relation routing below is groundwork: a >1 named-connection source is still sent to
-    # the land-to-Delta fallback by the advisor, so the routed bodies are never the deployed
-    # artifact on their own. Pin that contract so the routing test isn't read as "deployable".
+def test_multi_connection_rebuilds_direct_by_default():
+    # Default-direct policy: a >1 named-connection source whose every table routes to its own named
+    # connection rebuilds in place (each relation binds to its own connector) rather than being
+    # forced to the land-to-Delta fallback. The lakehouse path is an explicit option, not the default.
     from storage_mode import select_storage_mode
     decision = select_storage_mode(parse_tds(MULTI_CONN))
-    assert decision["fully_supported"] is False
+    assert decision["fully_supported"] is True
+    assert decision["fallback"] is None
 
 
 def test_multi_connection_routes_each_relation_to_its_own_connector():

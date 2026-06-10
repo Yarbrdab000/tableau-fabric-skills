@@ -10,17 +10,22 @@ parsing and M emission; it may *call* this to decide a mode, but never the rever
 
 Decision policy (first match wins):
 
-1. Structurally unsupported shape (join/union relation tree, >1 named connection, no
-   resolvable columns) -> no direct mode; fall back to land-to-Delta + DirectLake.
+1. Structurally unsafe shape -> no direct mode; fall back to land-to-Delta + DirectLake. This is
+   NOT triggered by multiple connections per se: a federated source whose tables each resolve to
+   their own connection is rebuilt directly (multi-source model + model relationships). It is
+   only a ``join``/``union`` relation tree (one logical table spans relations), a multi-connection
+   table that can't be routed to a specific upstream, or no resolvable columns.
 2. Unknown / unmapped connector class -> fall back.
 3. Flat file (Excel/CSV) -> Import.
 4. Extract enabled -> Import (preserve Tableau snapshot semantics); if the underlying live
    connector is supported, also report ``direct_upstream_available`` so the caller can offer
    live DirectQuery as an explicit alternative.
-5. Live relational -> DirectQuery (live-to-live).
+5. Live relational -> DirectQuery (live-to-live), including a multi-connection federation, where
+   each table binds to its OWN upstream and the joins become model relationships.
 
 DirectLake is never auto-selected here; it is only reached via the explicit fallback path
-(the existing Play 3/4 land-to-Delta pipeline), per the friction-minimizing design.
+(the existing Play 3/4 land-to-Delta pipeline), offered as an OPTION for the unsafe shapes above
+rather than as the default for any multi-source datasource.
 
 Credentials and on-prem gateway setup are ALWAYS left to the user (security boundary) and
 surfaced as ``manual_followups``.
@@ -191,14 +196,36 @@ def _has_custom_sql(descriptor):
 
 
 def _structurally_unsupported_reason(descriptor):
-    """Return a reason string if the datasource shape can't be rebuilt directly, else None."""
+    """Return a reason string if the datasource shape can't be rebuilt directly, else None.
+
+    DEFAULT IS DIRECT. A datasource with MULTIPLE named connections is still rebuilt directly --
+    each table binds to its OWN upstream (a multi-source model) and Tableau's join keys are
+    re-created as model *relationships*. Power BI relates such tables in the model layer, so a
+    federation of independent tables needs no land-to-Delta step. Direct rebuild is unsafe only
+    when:
+
+    * a table can't be routed to a SPECIFIC connection (so we can't tell which upstream a table
+      in a multi-connection source comes from), or
+    * one logical table spans several relations as a ``join``/``union`` (a row-level join that no
+      single direct query against one source can reproduce), or
+    * the shape is unknown / has no typable columns.
+
+    Only those fall back to land-to-Delta + DirectLake (offered as an explicit option, not the
+    default). A single named connection is always fine.
+    """
     reasons = list(descriptor.get("unsupported_reasons", []))
+    relations = descriptor.get("relations", [])
+    table_like = [r for r in relations if r.get("kind") in ("table", "custom_sql")]
     if descriptor.get("named_connection_count", 0) > 1:
-        reasons.append("multiple named connections in one datasource")
-    kinds = {r.get("kind") for r in descriptor.get("relations", [])}
+        unrouted = [r for r in table_like if not r.get("connection")]
+        if unrouted:
+            names = ", ".join(repr(r.get("name")) for r in unrouted)
+            reasons.append(
+                f"multiple named connections but {len(unrouted)} table(s) don't resolve to a "
+                f"specific connection ({names}); can't bind them to a single upstream")
+    kinds = {r.get("kind") for r in relations}
     if kinds & {"join", "union", "unknown"}:
         reasons.append("join/union relation tree (one logical table spans multiple relations)")
-    table_like = [r for r in descriptor.get("relations", []) if r.get("kind") in ("table", "custom_sql")]
     if not table_like:
         reasons.append("no table or custom-SQL relations found")
     elif all(not r.get("columns") for r in table_like):

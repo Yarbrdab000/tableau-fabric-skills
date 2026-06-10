@@ -8,8 +8,11 @@ have no Tableau peer — this fills that gap).
 It packages a proven Tableau → Fabric toolkit into an agent-loadable skill. **v1 scope is the semantic-model
 path**: rebuild a Tableau published data source as a Power BI semantic model (typed TMDL, inferred
 relationships), translate the safe subset of Tableau calculated fields into working DAX (preserving every
-original formula), and auto-select a storage mode per datasource so the rebuilt model can point directly at
-its original upstream source (or falls back to land-to-Delta + DirectLake when a direct rebuild is not safe).
+original formula), and auto-select a storage mode per datasource. By default every table is rebuilt bound
+directly to its own upstream source — including a federated, multi-connection datasource, since Power BI
+relates the tables in the model layer — with land-to-Delta + DirectLake offered as an explicit option only
+when a direct rebuild genuinely isn't safe. Accepts a `.tds`/`.tdsx` datasource or a `.twb`/`.twbx` workbook
+(selecting one of several embedded datasources).
 Worksheet / dashboard → Power BI report translation is **roadmap (v2)**.
 
 ## Install

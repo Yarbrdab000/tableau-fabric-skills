@@ -26,6 +26,11 @@ fname, raw, _ = download_datasource(server, ver, site_id, token, luid)   # inclu
 tds_text      = inner_tds_from_zip(raw) if is_zip(raw) else raw.decode("utf-8-sig")
 ```
 
+> **Packaged workbooks (`.twbx`) and bare workbooks (`.twb`)** are also accepted: use
+> `inner_doc_from_zip(raw)` instead of `inner_tds_from_zip(raw)` to pull the inner `.tds` **or** `.twb`
+> out of any Tableau archive (a `.tds` is preferred when both are present). `migrate_datasource`
+> (below) does this for you when handed a path/bytes, so you rarely call it directly.
+
 CLI equivalent: `py scripts\fetch_tds.py --server ... --site ... --datasource-name "..." --auth pat`.
 Credentials come from `--pat-name/--pat-secret` or env vars; the script never logs the secret.
 (The companion **tableau-datasource-profiler** skill can pull field-level stats first if you want to
@@ -41,8 +46,9 @@ size or scope the migration.)
 from assemble_model import migrate_datasource
 
 out = migrate_datasource(
-    tds_text,                 # a .tdsx/.tds PATH, raw bytes, or .tds XML text — all accepted
+    tds_text,                 # .tdsx/.tds/.twbx/.twb PATH, raw bytes, or .tds/.twb XML text
     model_name="Snowflake-Superstore",
+    datasource=None,          # pick a datasource by caption/name from a multi-datasource workbook
     write_to=r"C:\out",       # optional: also persist to disk
     as_pbip=True,             # optional: write an openable .pbip (else a .SemanticModel folder)
 )
@@ -50,6 +56,17 @@ out = migrate_datasource(
 #        "pbip": r"C:\out\Snowflake-Superstore.pbip"}      # or "model_dir" when as_pbip=False
 ```
 
+- **Workbook inputs.** A `.twbx`/`.twb` is accepted directly. When the workbook has **more than one**
+  real datasource (the `Parameters` pseudo-datasource and per-worksheet reference stubs are always
+  skipped), pass `datasource="<caption or name>"` to choose one; with several present and none chosen
+  the call raises `AmbiguousDatasourceError` listing the options. Enumerate them first with
+  `list_workbook_datasources(source)` → `[{"label", "caption", "name", "connection_class",
+  "named_connection_count", "table_count"}]` and pass a `label` back as `datasource=`.
+- **Default is a direct rebuild** — each table bound to its own source, **including** a multi-connection
+  federation (the join keys become model relationships). Only a genuinely-undoable shape routes to the
+  lakehouse **option**: the call then returns `parts={}` with `report["fallback"]=True` and a
+  `report["landing_plan"]` (see §2.4) instead of raising, and writes `<model_name>.landing_plan.json`
+  when `write_to` is given.
 - **Calculated fields are auto-extracted** (`extract_calcs`); pass `calcs=[...]` to override, or
   `calcs=[]` to emit no measures. The deterministic translator turns the safe subset into DAX and
   leaves everything else an inert `= 0` stub with the original formula preserved as a
@@ -66,7 +83,9 @@ out = migrate_datasource(
 
 | Function | Use |
 |---|---|
-| `migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relationships=None, date_range=None, approved_calc_dax=None, ...)` | Parse + assemble from `.tds` **text** (no download/unzip, no `bind`). |
+| `migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relationships=None, select=None, date_range=None, approved_calc_dax=None, ...)` | Parse + assemble from `.tds`/`.twb` **text** (no download/unzip, no `bind`). `select=` picks a datasource from a multi-datasource workbook. **Raises** on a genuine fallback. |
+| `list_workbook_datasources(source)` / `workbook_datasources(xml_text)` | Enumerate the real datasources in a `.tdsx`/`.twbx`/`.tds`/`.twb` (Parameters + worksheet stubs excluded) so a user can choose one. |
+| `directlake_landing_plan(descriptor, *, calcs=None, target_lakehouse=..., datasource_name=None)` | The credential-free land-to-Delta + DirectLake plan (see §2.4); the explicit lakehouse option. |
 | `assemble_import_model(descriptor, *, model_name, ...)` | Assemble from an already-parsed descriptor (Import/DirectQuery). |
 | `assemble_directlake_model(...)` | The landed-Delta / DirectLake fallback assembler. |
 | `fabric_definition_payload(parts)` | `parts` → base64 Fabric `updateDefinition` body. |
@@ -83,6 +102,33 @@ pending  = out["report"]["assisted_suggestions"]          # [{measure, pattern, 
 approved = {s["measure"]: s["dax"] for s in pending}        # approve all / by pattern / a subset
 final    = migrate_datasource(tds_text, model_name="...", approved_calc_dax=approved)
 ```
+
+### 2.4 Fallback landing plan (the explicit lakehouse option)
+
+When a datasource can't be rebuilt directly (a cross-engine `join`/`union`, a multi-connection table
+that can't be routed upstream, unfoldable custom SQL, an unknown connector, or no typable columns),
+`migrate_datasource` returns `parts={}` with a credential-free **landing plan** instead of raising:
+
+```python
+out = migrate_datasource(tds_text, model_name="Federated3Way")
+if out["report"]["fallback"]:
+    plan = out["report"]["landing_plan"]
+    # plan = {
+    #   "target_lakehouse": "h1_ultrastore",
+    #   "tables": [{ "source_table", "delta_table": "<datasource>_<table>", "connection_class",
+    #                "server","database","schema","warehouse","http_path",
+    #                "columns": [{"name","source_column","type"}], "bind_target": {...} }, ...],
+    #   "relationships": [{from_table, from_col, to_table, to_col}, ...],   # rebuilt as model rels
+    #   "native_cutover": [{"connection_class", "guidance"}],  # UC shortcut / CDC mirror per engine
+    #   "landing_mechanism": "VDS snapshot pull on the Tableau PAT ...",
+    #   "calc_inventory": [{"name","formula","role"}],         # calcs to re-author as DAX
+    # }
+```
+
+You can also build it directly from any descriptor as the deliberate lakehouse alternative:
+`directlake_landing_plan(parse_tds(tds_text), calcs=extract_calcs(tds_text))`. Column `type`s are
+Tableau-derived hints — **reconcile them against the landed Delta schema**. Execution (landing the
+Delta, building the DirectLake model) stays bridge-side; this plan emits no credentials.
 
 ---
 

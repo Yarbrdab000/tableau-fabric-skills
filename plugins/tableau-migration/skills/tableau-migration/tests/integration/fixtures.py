@@ -196,8 +196,10 @@ EXECUTIVE_TWB = _workbook(_WS_SALES_BY_CATEGORY)
 # (b) 3-way cross-DB federated datasource (azure_sqldb + snowflake + databricks)
 # =============================================================================
 # ONE <datasource> whose <relation type='collection'> gathers one table per named connection class,
-# with the join keys carried as <relationships> <expression op='='> operand pairs.  Includes a
-# case-mismatched key ([Order_ID] vs [ORDER_ID]) and a renamed key ([Region (people)]).
+# with the join keys carried in a sibling <object-graph> as <relationship> <expression op='='>
+# operand pairs whose end-points reference the objects by object-id (the real Tableau logical-model
+# shape).  Includes a case-mismatched key ([Order_ID] vs [ORDER_ID]) and a renamed key
+# ([Region (people)]).
 CROSSDB_TDS = """<?xml version='1.0' encoding='utf-8' ?>
 <datasource formatted-name='CrossDB Federated' inline='true' version='18.1'>
   <connection class='federated'>
@@ -220,24 +222,6 @@ CROSSDB_TDS = """<?xml version='1.0' encoding='utf-8' ?>
       <relation connection='snowflake.sf' name='Customers' table='[ANALYTICS].[CUSTOMERS]' type='table' />
       <relation connection='databricks.db' name='People' table='[main].[people]' type='table' />
     </relation>
-    <relationships>
-      <relationship>
-        <expression op='='>
-          <expression op='[Order_ID]' />
-          <expression op='[ORDER_ID]' />
-        </expression>
-        <first-end-point alias='Orders' />
-        <second-end-point alias='Customers' />
-      </relationship>
-      <relationship>
-        <expression op='='>
-          <expression op='[Region (people)]' />
-          <expression op='[Region]' />
-        </expression>
-        <first-end-point alias='Customers' />
-        <second-end-point alias='People' />
-      </relationship>
-    </relationships>
     <metadata-records>
       <metadata-record class='column'>
         <remote-name>Order_ID</remote-name><local-name>[Order_ID]</local-name>
@@ -265,6 +249,43 @@ CROSSDB_TDS = """<?xml version='1.0' encoding='utf-8' ?>
       </metadata-record>
     </metadata-records>
   </connection>
+  <object-graph>
+    <objects>
+      <object caption='Orders' id='Orders_obj'>
+        <properties context=''>
+          <relation connection='azuresql.az' name='Orders' table='[dbo].[Orders]' type='table' />
+        </properties>
+      </object>
+      <object caption='Customers' id='Customers_obj'>
+        <properties context=''>
+          <relation connection='snowflake.sf' name='Customers' table='[ANALYTICS].[CUSTOMERS]' type='table' />
+        </properties>
+      </object>
+      <object caption='People' id='People_obj'>
+        <properties context=''>
+          <relation connection='databricks.db' name='People' table='[main].[people]' type='table' />
+        </properties>
+      </object>
+    </objects>
+    <relationships>
+      <relationship>
+        <expression op='='>
+          <expression op='[Order_ID]' />
+          <expression op='[ORDER_ID]' />
+        </expression>
+        <first-end-point object-id='Orders_obj' />
+        <second-end-point object-id='Customers_obj' />
+      </relationship>
+      <relationship>
+        <expression op='='>
+          <expression op='[Region (people)]' />
+          <expression op='[Region]' />
+        </expression>
+        <first-end-point object-id='Customers_obj' />
+        <second-end-point object-id='People_obj' />
+      </relationship>
+    </relationships>
+  </object-graph>
 </datasource>"""
 
 # Authored expectation for the cross-DB datasource: the three per-side classes and the two join-key

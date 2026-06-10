@@ -64,6 +64,17 @@ def _children_local(elem, name):
     return [c for c in list(elem) if _local(c.tag) == name]
 
 
+def _findall_object_graph(elem):
+    """All ``object-graph`` elements, tolerant of Tableau's wrapped tag name.
+
+    Tableau Desktop's logical model can emit the object graph under a feature-flagged tag such as
+    ``_.fcp.ObjectModelEncapsulateLegacy.true...object-graph`` instead of a plain ``object-graph``.
+    Match on the local name's suffix so both spellings resolve; the nested ``<objects>`` /
+    ``<relationships>`` children are always plain, so only this outermost tag needs the tolerance.
+    """
+    return [c for c in elem.iter() if _local(c.tag).endswith("object-graph")]
+
+
 _BRACKET_THREE = re.compile(
     r"^\[(?P<catalog>[^\[\]]+)\]\.\[(?P<schema>[^\[\]]+)\]\.\[(?P<item>[^\[\]]+)\]$")
 _BRACKET_PAIR = re.compile(r"^\[(?P<schema>[^\[\]]+)\]\.\[(?P<item>[^\[\]]+)\]$")
@@ -479,7 +490,7 @@ def _object_table_map(datasource, relations):
             if name:
                 disp.setdefault(name.lower(), name)
     out = {}
-    for og in _findall_local(datasource, "object-graph"):
+    for og in _findall_object_graph(datasource):
         for obj in _findall_local(og, "object"):
             oid = obj.get("id")
             if not oid:
@@ -562,7 +573,7 @@ def _extract_relationships(datasource, relations):
     oid_to_table = _object_table_map(datasource, relations)
     cols_index = _columns_index(relations)
     out, warnings, seen = [], [], set()
-    for og in _findall_local(datasource, "object-graph"):
+    for og in _findall_object_graph(datasource):
         for rship in _findall_local(og, "relationship"):
             fep = _findall_local(rship, "first-end-point")
             sep = _findall_local(rship, "second-end-point")
@@ -617,18 +628,146 @@ def _extract_relationships(datasource, relations):
     return out, warnings
 
 
-def parse_tds(xml_text):
-    """Parse Tableau ``.tds`` XML into a normalized connection descriptor (dict).
+class AmbiguousDatasourceError(ValueError):
+    """Raised when a workbook exposes more than one real datasource and none was selected.
+
+    The message lists the available datasource labels so a caller (or agent) can re-invoke with an
+    explicit ``select=`` (``parse_tds``/``extract_calcs``) or ``datasource=`` (``migrate_datasource``)
+    choice. A single-datasource ``.tds`` never triggers this.
+    """
+
+
+def _is_substantive_datasource(ds):
+    """True if a ``<datasource>`` is a real definition (not a worksheet-level reference stub).
+
+    A ``.twb`` repeats each datasource as a lightweight ``<datasource name='...' />`` reference inside
+    every worksheet/dashboard that uses it. Those stubs carry no ``<connection>`` and no ``<column>``
+    -- only the top-level definition under ``<datasources>`` does. We treat a datasource as
+    substantive when it has a direct ``<connection>`` child OR any ``<column>`` children, which keeps
+    the genuine definitions (including the ``Parameters`` pseudo-datasource, filtered separately) and
+    drops the empty reference stubs that would otherwise show up as duplicate, column-less entries.
+    """
+    children = list(ds)
+    if any(_local(c.tag) == "connection" for c in children):
+        return True
+    return any(_local(c.tag) == "column" for c in children)
+
+
+def _is_parameters_datasource(ds):
+    """True for Tableau's ``Parameters`` pseudo-datasource (never a migration target).
+
+    Tableau emits parameters in a fixed datasource named exactly ``Parameters`` that carries no
+    ``<connection>`` and only ``<column param-domain-type=...>`` entries. Matched primarily by that
+    reserved name, with a structural fallback (no connection child + only parameter columns) so an
+    oddly-named export is still recognized and skipped.
+    """
+    if (ds.get("name") or "") == "Parameters":
+        return True
+    cols = _children_local(ds, "column")
+    if not cols:
+        return False
+    has_conn_child = any(_local(c.tag) == "connection" for c in list(ds))
+    all_params = all((c.get("param-domain-type") or "").strip() for c in cols)
+    return (not has_conn_child) and all_params
+
+
+def _datasource_label(ds):
+    """The human-facing label for a datasource: caption, else formatted-name, else internal name."""
+    return ds.get("caption") or ds.get("formatted-name") or ds.get("name") or ""
+
+
+def _real_datasources(root):
+    """The selectable (non-Parameters) ``<datasource>`` elements of a workbook/datasource document.
+
+    A document whose root IS a ``<datasource>`` (an exported ``.tds``) yields just that element. A
+    workbook (``.twb``) yields every embedded datasource that is a real definition -- skipping the
+    ``Parameters`` pseudo-datasource and the empty per-worksheet reference stubs -- de-duplicated by
+    internal ``name`` (which is unique per workbook) so a datasource used on many sheets is returned
+    once, in document order.
+    """
+    if _local(root.tag) == "datasource":
+        return [root]
+    out, seen = [], set()
+    for ds in _findall_local(root, "datasource"):
+        if _is_parameters_datasource(ds) or not _is_substantive_datasource(ds):
+            continue
+        key = ds.get("name") or id(ds)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ds)
+    return out
+
+
+def _choose_datasource(root, select=None):
+    """Select one ``<datasource>`` from a parsed document, skipping the ``Parameters`` pseudo-source.
+
+    ``select`` (a caption / formatted-name / internal name, case-insensitive) picks a specific
+    datasource and raises ``AmbiguousDatasourceError`` if it matches none. With no ``select`` the
+    first real datasource is returned -- so a single-datasource workbook is unambiguous -- and the
+    caller (``migrate_datasource`` / ``list_workbook_datasources``) is responsible for prompting on
+    a genuine multi-datasource ambiguity.
+    """
+    real = _real_datasources(root)
+    if not real:
+        # No real datasource (only Parameters, or an unexpected shape): fall back to the raw root.
+        all_ds = [] if _local(root.tag) == "datasource" else _findall_local(root, "datasource")
+        return root if _local(root.tag) == "datasource" else (all_ds or [root])[0]
+    if select is not None:
+        want = str(select).strip().lower()
+        for ds in real:
+            labels = {(ds.get("caption") or "").lower(),
+                      (ds.get("formatted-name") or "").lower(),
+                      (ds.get("name") or "").lower()}
+            if want in {lbl for lbl in labels if lbl}:
+                return ds
+        avail = ", ".join(repr(_datasource_label(ds)) for ds in real)
+        raise AmbiguousDatasourceError(
+            f"no datasource named {select!r} in this workbook; available: {avail}")
+    return real[0]
+
+
+def workbook_datasources(xml_text):
+    """List the selectable datasources in a ``.tds``/``.twb`` document (Parameters excluded).
+
+    Returns ``[{"name", "caption", "label", "connection_class", "named_connection_count",
+    "table_count"}]`` -- the lightweight inventory an agent shows so a user can pick which datasource
+    to migrate from a multi-datasource workbook. ``label`` is the value to pass back as ``select=``.
+    """
+    root = ET.fromstring(xml_text)
+    out = []
+    for ds in _real_datasources(root):
+        cls, _server, _db, _wh, _hp, _auth, nconns = _live_connection(ds)
+        cols_by_parent = _columns_by_parent(ds)
+        nc_map = _named_connection_map(ds)
+        relations = _extract_relations(ds, cols_by_parent, nc_map)
+        tables = [r for r in relations if r.get("kind") in ("table", "custom_sql")]
+        out.append({
+            "name": ds.get("name"),
+            "caption": ds.get("caption"),
+            "label": _datasource_label(ds),
+            "connection_class": cls,
+            "named_connection_count": nconns,
+            "table_count": len(tables),
+        })
+    return out
+
+
+def parse_tds(xml_text, select=None):
+    """Parse Tableau ``.tds``/``.twb`` XML into a normalized connection descriptor (dict).
 
     The descriptor is JSON-serializable (suitable for a migration report) and contains NO
     credentials. ``unsupported_reasons`` collects shape problems found during parsing so the
     storage-mode policy can fall back cleanly. Additive context keys: ``connections`` (named-
     connection id -> non-secret routing facts), ``relationships`` (inferred table->table joins from
     the object graph), and ``relationship_warnings`` (relationships that could not be resolved).
+
+    For a workbook (``.twb``) with several embedded datasources the ``Parameters`` pseudo-datasource
+    is always skipped and the first real datasource is used; pass ``select=`` (caption / name) to
+    target a specific one (raises ``AmbiguousDatasourceError`` if it matches none).
     """
     root = ET.fromstring(xml_text)
-    datasource = root if _local(root.tag) == "datasource" else (
-        _findall_local(root, "datasource") or [root])[0]
+    datasource = _choose_datasource(root, select)
 
     cls, server, dbname, warehouse, http_path, auth_method, nconns = _live_connection(datasource)
     cols_by_parent = _columns_by_parent(datasource)
@@ -672,8 +811,8 @@ def parse_tds(xml_text):
     }
 
 
-def extract_calcs(xml_text):
-    """Pull Tableau calculated fields from a ``.tds`` as ``[{"name", "formula", "role"}]``.
+def extract_calcs(xml_text, select=None):
+    """Pull Tableau calculated fields from a ``.tds``/``.twb`` as ``[{"name", "formula", "role"}]``.
 
     This is the calc list the assembler's ``calcs=`` argument expects, so a caller can go straight
     from a downloaded ``.tds`` to a model *with measures* without hand-parsing the XML::
@@ -695,10 +834,12 @@ def extract_calcs(xml_text):
     as ``internal_name`` when it differs from ``name``, so cross-calc references resolve downstream.
     Formula text comes back already XML-unescaped (``&gt;`` -> ``>`` etc.), ready for the translator.
     Names are de-duplicated case-insensitively, keeping the first occurrence.
+
+    ``select`` chooses a datasource by caption/name in a multi-datasource workbook (Parameters is
+    always skipped); without it the first real datasource is used.
     """
     root = ET.fromstring(xml_text)
-    datasource = root if _local(root.tag) == "datasource" else (
-        _findall_local(root, "datasource") or [root])[0]
+    datasource = _choose_datasource(root, select)
     out = []
     seen = set()
     for col in _children_local(datasource, "column"):

@@ -16,7 +16,36 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
 sys.path.insert(0, HERE)
 
 import assemble_model as A  # noqa: E402
-from test_connection_to_m import LIVE_SQLSERVER  # noqa: E402
+from test_connection_to_m import LIVE_SQLSERVER, MULTI_CONN  # noqa: E402
+
+# An unknown/unmapped connector (saphana) with a real table + columns and a calc: a GENUINE fallback
+# that still has substance, so the emitted landing plan carries per-table targets and a calc list.
+SAPHANA_FALLBACK = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Hana DS' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='h' name='saphana.1'>
+        <connection authentication='Username Password' class='saphana' dbname='HDB'
+                    schema='SALES' server='hana.corp' username='svc' />
+      </named-connection>
+    </named-connections>
+    <relation connection='saphana.1' name='Orders' table='[SALES].[Orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Order ID</remote-name><local-name>[Order ID]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+  <column caption='Total' datatype='real' name='[Calculation_1]' role='measure' type='quantitative'>
+    <calculation class='tableau' formula='SUM([Sales])' />
+  </column>
+</datasource>"""
+
 
 # LIVE_SQLSERVER assembles cleanly; inject one translatable measure calc so auto-extraction is
 # observable as a real DAX measure (the <column> sits at datasource level, after </connection>).
@@ -94,3 +123,50 @@ def test_migrate_datasource_from_tdsx_path(tmp_path):
     p.write_bytes(buf.getvalue())
     out = A.migrate_datasource(str(p), model_name="Superstore")
     assert "SUM('Orders'[Sales])" in _all_text(out["parts"])
+
+
+# == default-direct policy: genuine fallback returns a landing plan, never crashes ============
+
+def test_migrate_datasource_fallback_returns_landing_plan_not_model():
+    out = A.migrate_datasource(SAPHANA_FALLBACK, model_name="Hana")
+    assert out["parts"] == {}                       # no semantic model emitted
+    assert out["report"]["fallback"] is True
+    plan = out["report"]["landing_plan"]
+    assert plan["target_lakehouse"] == "h1_ultrastore"
+    t = {row["source_table"]: row for row in plan["tables"]}["Orders"]
+    assert t["delta_table"] == "hana_ds_orders"     # slugified {datasource}_{table} (Play 3 naming)
+    assert t["connection_class"] == "saphana"
+    assert {c["name"] for c in t["columns"]} == {"Order_ID", "Sales"}          # cleaned model names
+    assert {c["source_column"] for c in t["columns"]} == {"Order ID", "Sales"}  # raw source names
+    assert "error" not in out["bind"]
+
+
+def test_fallback_landing_plan_carries_cutover_mechanism_and_calcs():
+    plan = A.migrate_datasource(SAPHANA_FALLBACK, model_name="Hana")["report"]["landing_plan"]
+    assert "VizQL Data Service" in plan["landing_mechanism"]      # snapshot pull on the Tableau PAT
+    assert [n["connection_class"] for n in plan["native_cutover"]] == ["saphana"]
+    assert plan["calc_inventory"] == [{"name": "Total", "formula": "SUM([Sales])", "role": "measure"}]
+
+
+def test_migrate_datasource_fallback_writes_landing_plan_json(tmp_path):
+    dest = str(tmp_path / "out")
+    out = A.migrate_datasource(SAPHANA_FALLBACK, model_name="Hana", write_to=dest)
+    assert "model_dir" not in out                    # nothing to assemble
+    path = out["landing_plan_path"]
+    assert os.path.basename(path) == "Hana.landing_plan.json"
+    on_disk = json.loads(open(path, encoding="utf-8").read())
+    assert on_disk["tables"][0]["delta_table"] == "hana_ds_orders"
+
+
+def test_directlake_landing_plan_routes_each_table_to_its_own_engine():
+    # Standalone helper (the explicit lakehouse OPTION): a multi-connection descriptor lands each
+    # table under its own source engine, even though the default policy would rebuild it in place.
+    desc = A.parse_tds(MULTI_CONN)
+    plan = A.directlake_landing_plan(desc, target_lakehouse="lh_demo")
+    assert plan["target_lakehouse"] == "lh_demo"
+    by_table = {row["source_table"]: row for row in plan["tables"]}
+    assert by_table["SALE"]["connection_class"] == "snowflake"
+    assert by_table["DimDate"]["connection_class"] == "sqlserver"
+    assert by_table["SALE"]["delta_table"] == "blend_sale"
+    assert {n["connection_class"] for n in plan["native_cutover"]} == {"snowflake", "sqlserver"}
+

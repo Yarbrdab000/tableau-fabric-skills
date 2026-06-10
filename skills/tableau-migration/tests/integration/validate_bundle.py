@@ -848,6 +848,25 @@ def _norm_col(s):
     return re.sub(r"[^0-9A-Za-z]+", "_", s or "").strip("_").casefold()
 
 
+_REL_CAPTION_SUFFIX = re.compile(r"^(?P<base>.+?)\s*\([^()]*\)$")
+
+
+def _col_match_candidates(col):
+    """Normalized forms a join-key operand may take among EMITTED model columns.
+
+    A Tableau relationship operand can carry a disambiguating rename caption -- e.g. ``Region
+    (people)`` -- while the emitted Power BI column keeps the source (remote) name ``Region``. So,
+    mirroring the producer's ``_resolve_rel_column``, try the verbatim normalized name AND, when the
+    operand ends in a parenthetical caption, the base name with that caption stripped.
+    """
+    base = _strip_brackets(col)
+    cands = [_norm_col(base)]
+    m = _REL_CAPTION_SUFFIX.match(base or "")
+    if m:
+        cands.append(_norm_col(m.group("base")))
+    return [c for c in cands if c]
+
+
 def _verify_crossdb_relationships(model_dir, join_keys):
     """Return ``(n_relationships, [issue, ...])`` for an emitted cross-DB model.
 
@@ -875,12 +894,12 @@ def _verify_crossdb_relationships(model_dir, join_keys):
     rel_norm = _norm_col(rel_text)
     for a, b in join_keys:
         for col in (a, b):
-            n = _norm_col(_strip_brackets(col))
-            if not n:
+            cands = _col_match_candidates(col)
+            if not cands:
                 continue
-            if n not in model_cols:
+            if not any(n in model_cols for n in cands):
                 issues.append(f"join column [{col}] has no matching emitted model column")
-            elif n not in rel_norm:
+            elif not any(n in rel_norm for n in cands):
                 issues.append(f"join column [{col}] is not referenced in relationships.tmdl")
     return n_rel, issues
 

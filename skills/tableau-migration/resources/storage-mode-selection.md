@@ -18,7 +18,7 @@ fields that drive the decision:
 |---|---|
 | `connection_class` | Tableau connector class (`sqlserver`, `snowflake`, `excel-direct`, …) |
 | `is_extract` | Whether a `.hyper` extract is enabled |
-| `named_connection_count` | >1 ⇒ federated multi-connection (unsupported for direct rebuild) |
+| `named_connection_count` | >1 ⇒ federated multi-connection; still rebuilt **directly** when every table routes to its own connection (only a table that can't be routed to a specific upstream falls back) |
 | `relations[].kind` | `table` / `custom_sql` / `join` / `union` / `unknown` |
 | `relations[].columns` | Resolvable, typed columns (empty ⇒ cannot type the model) |
 | `unsupported_reasons` | Shape problems already found during parsing |
@@ -27,16 +27,24 @@ fields that drive the decision:
 
 ## Decision policy (first match wins)
 
+> **Default is a direct rebuild.** Multiple named connections do **not** force the fallback: a
+> federated source whose tables each resolve to their own connection is rebuilt directly as a
+> multi-source model, and Tableau's join keys become model **relationships** (Power BI relates the
+> tables in the model layer). The land-to-Delta + DirectLake path is an explicit **option** reserved
+> for shapes a direct query genuinely can't reproduce.
+
 ```text
 1. Structurally unsupported  → mode = None, fallback = land-to-delta-directlake
-     - >1 named connection (federated multi-source)
      - a join / union relation tree (one logical table spans multiple relations)
+     - a multi-connection table that can't be routed to a specific upstream connection
      - an 'unknown' relation (unparseable table reference)
      - no table/custom-SQL relation, or none with resolvable columns
+     NOTE: >1 named connection on its own is NOT unsupported — each table binds to its own source.
 2. Unknown / unmapped connector class → mode = None, fallback = land-to-delta-directlake
 3. Flat file (Excel / CSV)   → Import   (set the file path on the M partition)
 4. Extract enabled           → Import   (snapshot); offer live DirectQuery if the source is supported
-5. Live relational           → DirectQuery (live-to-live)
+5. Live relational           → DirectQuery (live-to-live), INCLUDING a multi-connection federation
+                               (each table binds to its own upstream; joins become relationships)
 ```
 
 > A `collection` relation (a container of **independent** sheets/tables, e.g. multi-sheet Excel) is NOT a
@@ -151,9 +159,15 @@ else:
 - **Custom SQL → native query (preserved).** The Tableau custom SQL becomes a `Value.NativeQuery(...,
   [EnableFolding=true])` partition so it can fold to the source instead of being re-expressed. Folding is
   requested, not guaranteed — verify it folds before refresh.
-- **Fallback → land-to-Delta + DirectLake.** Join/union trees, multi-connection datasources, missing
-  column metadata, and unmapped connectors are landed as Delta first (Play 2/3) and bound via DirectLake
-  (Play 4) — the proven path that does not depend on guessing the upstream shape.
+- **Fallback → land-to-Delta + DirectLake (the explicit lakehouse option).** Reserved for the shapes
+  a direct query can't reproduce: a single cross-engine `join`/`union` relation tree, a multi-connection
+  table that can't be routed to a specific upstream, missing column metadata, and unmapped connectors.
+  These are landed as Delta first (Play 2/3) and bound via DirectLake (Play 4). A **multi-connection
+  federation is NOT a fallback** — it rebuilds directly with model relationships. When `migrate_datasource`
+  does hit a genuine fallback it returns `parts={}` with a `report["landing_plan"]`
+  (`directlake_landing_plan`): the per-table `{datasource}_{table}` Delta names, credential-free bind
+  targets, inferred relationships, a VDS snapshot landing mechanism, and per-connector native
+  shortcut/mirror cutover guidance — see [public-api.md](public-api.md).
 
 ## Friction the skill removes vs. what stays manual
 

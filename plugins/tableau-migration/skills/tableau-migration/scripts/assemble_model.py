@@ -34,6 +34,8 @@ try:  # package or scripts-on-path
         emit_table_tmdl_m,
         extract_calcs,
         parse_tds,
+        workbook_datasources,
+        AmbiguousDatasourceError,
     )
     from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from .calc_to_dax import translate_tableau_calc_to_dax, suggest_assisted_dax
@@ -46,6 +48,8 @@ except ImportError:
         emit_table_tmdl_m,
         extract_calcs,
         parse_tds,
+        workbook_datasources,
+        AmbiguousDatasourceError,
     )
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from calc_to_dax import translate_tableau_calc_to_dax, suggest_assisted_dax
@@ -405,6 +409,11 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
     Import partition. The path parsed from a ``.tds`` is relative to the workbook and not
     portable; a deploying caller passes the ABSOLUTE path of the data file it has staged so the
     emitted ``File.Contents(...)`` resolves. Ignored for non-flat-file datasources.
+
+    Table **relationships** are auto-wired: when ``relationships is None`` the joins ``parse_tds``
+    inferred from the ``.tds`` ``<object-graph><relationships>`` (already resolved to emitted model
+    columns, on ``descriptor["relationships"]``) are emitted as TMDL. Pass an explicit list --
+    including ``[]`` -- to take full control and skip the auto-wiring (so ``[]`` emits none).
     """
     if flatfile_path is not None:
         descriptor = {**descriptor, "flatfile_path": flatfile_path}
@@ -454,7 +463,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
     if expr.strip():
         parts["definition/expressions.tmdl"] = expr
 
-    all_rels = list(relationships or [])
+    all_rels = list(relationships if relationships is not None
+                    else (descriptor.get("relationships") or []))
     date_report = {"generated": False, "reason": "date_table disabled"}
     if date_table:
         date_name, date_part, date_rels, date_report = _build_date_dimension(
@@ -643,8 +653,8 @@ def write_local_pbip(parts, dest_dir, *, model_name, report_name=None, report_pa
 def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relationships=None,
                                   hierarchies=None, display_folders=None, rls_roles=None,
                                   date_table=True, mark_as_date=True, flatfile_path=None,
-                                  approved_calc_dax=None, date_range=None):
-    """One-call convenience: parse ``.tds`` text and assemble the Import/DirectQuery model.
+                                  approved_calc_dax=None, date_range=None, select=None):
+    """One-call convenience: parse ``.tds``/``.twb`` text and assemble the Import/DirectQuery model.
 
     Model objects (hierarchies, display folders, RLS roles) are AUTO-DERIVED from the
     ``.tds`` and resolved against the rebuilt model, then emitted as TMDL. A caller can
@@ -657,17 +667,20 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relations
     emitted as TMDL when ``relationships`` is ``None``. Pass an explicit list (including ``[]``)
     to take full control and skip the auto-wiring -- so ``[]`` deliberately emits no relationships.
 
+    ``select`` chooses which datasource to rebuild from a multi-datasource workbook (caption / name,
+    case-insensitive); the ``Parameters`` pseudo-datasource is always skipped.
+
     ``approved_calc_dax`` (``{calc_name: dax}``, case-insensitive) flips human-approved assisted
     suggestions into real measures (see ``_measures_part``). On a first pass omit it: the report's
     ``assisted_suggestions`` lists every idiom match for review; re-run with the approved subset to
     emit them. A cross-calc reference lookup is built from the FULL ``.tds`` (captions + internal
     ``Calculation_*`` names) so an argmax calc that points at a separate "max" calc resolves.
     """
-    descriptor = parse_tds(tds_text)
+    descriptor = parse_tds(tds_text, select)
     if relationships is None:
         relationships = descriptor.get("relationships") or []
     try:
-        calc_lookup = _calc_lookup_from(extract_calcs(tds_text))
+        calc_lookup = _calc_lookup_from(extract_calcs(tds_text, select))
     except Exception:
         calc_lookup = _calc_lookup_from(calcs)
     enrichment_report = None
@@ -696,11 +709,12 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relations
 
 
 def _read_tds_source(source):
-    """Return ``.tds`` XML text from a ``.tdsx``/``.tds`` filesystem path, raw bytes, or XML text.
+    """Return Tableau document XML from a ``.tdsx``/``.tds``/``.twbx``/``.twb`` path, bytes, or XML.
 
-    A ``.tdsx`` is a zip whose inner ``.tds`` is extracted; a ``.tds`` file is read as UTF-8 (BOM
-    tolerant). A string that is already XML (or contains newlines, so it can't be a path) is
-    returned as-is, so callers can pass a path **or** the text they already have.
+    A ``.tdsx``/``.twbx`` is a zip whose inner ``.tds``/``.twb`` is extracted; a ``.tds``/``.twb``
+    file is read as UTF-8 (BOM tolerant). A string that is already XML (or contains newlines, so it
+    can't be a path) is returned as-is, so callers can pass a path **or** the text they already have.
+    For a workbook document the datasource is selected downstream by ``parse_tds``/``extract_calcs``.
     """
     import os
     try:
@@ -709,41 +723,184 @@ def _read_tds_source(source):
         import fetch_tds as F
     if isinstance(source, (bytes, bytearray)):
         raw = bytes(source)
-        return F.inner_tds_from_zip(raw) if F.is_zip(raw) else raw.decode("utf-8-sig")
+        return F.inner_doc_from_zip(raw) if F.is_zip(raw) else raw.decode("utf-8-sig")
     if isinstance(source, str) and "\n" not in source and "<" not in source and os.path.isfile(source):
         with open(source, "rb") as fh:
             raw = fh.read()
-        return F.inner_tds_from_zip(raw) if F.is_zip(raw) else raw.decode("utf-8-sig")
-    return source  # already .tds XML text
+        return F.inner_doc_from_zip(raw) if F.is_zip(raw) else raw.decode("utf-8-sig")
+    return source  # already .tds/.twb XML text
 
 
-def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False,
+# Native (no-copy / CDC) cutover guidance per source connector -- advisory ONLY; the offline skill
+# never executes it. Keyed by Tableau connection class, with a scheduled-copy fallback note.
+_NATIVE_CUTOVER = {
+    "databricks": "Databricks Unity Catalog table -> Fabric OneLake shortcut (live, zero-copy).",
+    "snowflake": ("Snowflake -> Fabric mirroring (CDC replica) or a OneLake shortcut to an external "
+                  "Delta location; keeps the lakehouse in sync without a manual copy."),
+    "azure_sqldb": "Azure SQL Database -> Fabric mirroring (near-real-time CDC).",
+    "sqlserver": "SQL Server -> Fabric mirroring where supported, else a scheduled pipeline copy.",
+    "synapse": "Azure Synapse -> Fabric mirroring / shortcut to the underlying ADLS Delta.",
+    "azuresynapse": "Azure Synapse -> Fabric mirroring / shortcut to the underlying ADLS Delta.",
+}
+_NATIVE_CUTOVER_DEFAULT = ("No native shortcut/mirror for this connector -- land via a scheduled "
+                           "pipeline or the VDS snapshot pull below.")
+
+
+def _landing_bind_target(facts):
+    """A credential-free Fabric bind target for one source connection's facts dict."""
+    return connection_details_for_bind({
+        "connection_class": facts.get("connection_class"),
+        "server": facts.get("server"),
+        "database": facts.get("database"),
+        "auth_method": facts.get("auth_method"),
+    })
+
+
+def directlake_landing_plan(descriptor, *, calcs=None, target_lakehouse="h1_ultrastore",
+                            datasource_name=None, decision=None):
+    """Credential-free plan to land a *fallback* datasource as Delta + rebuild it as DirectLake.
+
+    This is the explicit lakehouse OPTION for the shapes the default-direct rebuild can't do safely
+    (a single cross-engine ``join``/``union`` relation, unfoldable custom SQL, an unknown connector,
+    a table with no resolvable columns, or a multi-connection table that can't be routed upstream).
+    It emits NO credentials and runs NO network calls -- it is a structured hand-off an executor
+    (the bridge's Play 2/3) acts on. Returns a JSON-serializable dict:
+
+    * ``tables`` -- per source table: the slugified ``{datasource}_{table}`` Delta name (matching
+      Play 3), its source connection facts (class / server / database / schema / warehouse /
+      http_path), a credential-free ``bind_target``, and its column inventory (name + type). Types
+      here are the Tableau-derived hints; they MUST be reconciled against the LANDED Delta schema.
+    * ``relationships`` -- the inferred table->table joins (rebuilt as model relationships, not a
+      pre-joined table).
+    * ``native_cutover`` -- per distinct connector, the no-copy shortcut / CDC-mirror option so a
+      user can choose a live cutover instead of a snapshot copy.
+    * ``landing_mechanism`` -- how a snapshot lands (VDS pull on the Tableau PAT).
+    * ``calc_inventory`` -- the calculated fields (when ``calcs`` is supplied) to re-author as DAX.
+
+    ``decision`` overrides the storage-mode decision used for ``fallback``/``reason`` (the caller
+    already computed it); otherwise it is recomputed from ``descriptor``.
+    """
+    ds_name = datasource_name or descriptor.get("datasource_name") or "datasource"
+    decision = decision or select_storage_mode(descriptor)
+    multi = (descriptor.get("named_connection_count") or 1) > 1
+
+    tables_out, classes = [], []
+    for rel in descriptor.get("relations", []):
+        if rel.get("kind") not in ("table", "custom_sql"):
+            continue
+        facts = rel.get("connection") if (multi and rel.get("connection")) else descriptor
+        cls = facts.get("connection_class") or descriptor.get("connection_class")
+        if cls and cls not in classes:
+            classes.append(cls)
+        display = _table_display(rel)
+        cols = [{"name": c.get("model_name") or c.get("remote_name"),
+                 "source_column": c.get("remote_name"),
+                 "type": c.get("tmdl_type")} for c in (rel.get("columns") or [])]
+        tables_out.append({
+            "source_table": display,
+            "delta_table": T.make_delta_table_name(ds_name, display),
+            "connection_class": cls,
+            "server": facts.get("server"),
+            "database": facts.get("database") or rel.get("catalog"),
+            "schema": rel.get("schema") or facts.get("schema"),
+            "warehouse": facts.get("warehouse"),
+            "http_path": facts.get("http_path"),
+            "columns": cols,
+            "bind_target": _landing_bind_target(facts),
+        })
+
+    native = [{"connection_class": c, "guidance": _NATIVE_CUTOVER.get(c, _NATIVE_CUTOVER_DEFAULT)}
+              for c in classes]
+    calc_inventory = None
+    if calcs:
+        calc_inventory = [{"name": c.get("name"), "formula": c.get("formula"),
+                           "role": c.get("role")} for c in calcs]
+
+    return {
+        "target_lakehouse": target_lakehouse,
+        "datasource": ds_name,
+        "fallback": decision.get("fallback"),
+        "reason": decision.get("rationale"),
+        "landing_mechanism": (
+            "Snapshot pull via Tableau VizQL Data Service (VDS): one query per table on the same "
+            "Tableau PAT (NOT the source credentials); each result is written as a typed Delta "
+            "table; column types are reconciled from the LANDED Delta schema, not Tableau metadata."),
+        "tables": tables_out,
+        "relationships": descriptor.get("relationships") or [],
+        "native_cutover": native,
+        "calc_inventory": calc_inventory,
+    }
+
+
+def list_workbook_datasources(source):
+    """List the selectable datasources in a ``.tds``/``.tdsx``/``.twb``/``.twbx`` (Parameters excluded).
+
+    ``source`` is the same flexible input ``migrate_datasource`` accepts (path / bytes / XML text).
+    Returns the lightweight inventory from ``workbook_datasources`` -- ``[{"name", "caption",
+    "label", "connection_class", "named_connection_count", "table_count"}]`` -- so an agent can show
+    the choices and pass a chosen ``label`` back as ``migrate_datasource(datasource=...)``.
+    """
+    return workbook_datasources(_read_tds_source(source))
+
+
+def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, datasource=None,
                        calcs=None, approved_calc_dax=None, date_range=None, **kwargs):
     """**One call** from a downloaded datasource to everything needed to land it in Fabric.
 
-    ``source`` may be a path to a ``.tdsx`` or ``.tds``, raw bytes, or ``.tds`` XML text. Calculated
-    fields are **auto-extracted** (pass ``calcs`` to override, or ``calcs=[]`` to emit no measures).
-    Returns ``{"parts", "report", "bind"}`` -- ``bind`` is the credential-free connection target from
-    ``connection_details_for_bind`` -- plus, when ``write_to`` is given, the path it persisted to:
+    ``source`` may be a path to a ``.tdsx``/``.tds``/``.twbx``/``.twb``, raw bytes, or XML text.
+    Calculated fields are **auto-extracted** (pass ``calcs`` to override, or ``calcs=[]`` to emit no
+    measures). Returns ``{"parts", "report", "bind"}`` -- ``bind`` is the credential-free connection
+    target from ``connection_details_for_bind`` -- plus, when ``write_to`` is given, the persisted path:
 
     * ``as_pbip=False`` (default) writes ``<model_name>.SemanticModel/`` and adds ``"model_dir"``.
     * ``as_pbip=True`` writes an openable ``.pbip`` project and adds ``"pbip"``.
+
+    When ``source`` is a workbook with more than one real datasource, pass ``datasource=`` (caption
+    or name) to choose which to migrate; with several present and none chosen this raises
+    ``AmbiguousDatasourceError`` listing the options (call ``list_workbook_datasources`` to enumerate
+    them). The ``Parameters`` pseudo-datasource is always skipped.
+
+    **Default-direct policy.** A datasource is rebuilt in place -- each table bound to its own source
+    -- whenever that is safe, INCLUDING a multi-connection federation (Power BI relates the tables in
+    the model layer). Only a genuinely-undoable shape (a cross-engine ``join``/``union`` relation,
+    unfoldable custom SQL, an unknown connector, or a table with no resolvable columns) routes to the
+    lakehouse OPTION: this call then returns ``parts={}`` with ``report["fallback"]=True`` and a
+    ``report["landing_plan"]`` (see ``directlake_landing_plan``) instead of raising -- and, when
+    ``write_to`` is given, writes ``<model_name>.landing_plan.json`` (``"landing_plan_path"``).
 
     Extra keyword args (``relationships``, ``hierarchies``, ``mark_as_date``, ``flatfile_path`` ...)
     pass straight through to ``migrate_tds_to_semantic_model``. Deploy stays a separate, explicit
     step (``deploy_to_fabric.py``) -- this function never touches the network or credentials.
     """
     tds_text = _read_tds_source(source)
+    if datasource is None:
+        try:
+            available = workbook_datasources(tds_text)
+        except Exception:
+            available = []
+        if len(available) > 1:
+            labels = ", ".join(repr(d["label"]) for d in available)
+            raise AmbiguousDatasourceError(
+                f"workbook has {len(available)} datasources; pass datasource=<caption|name> to "
+                f"choose one. Available: {labels}")
     if calcs is None:
         try:
-            calcs = extract_calcs(tds_text)
+            calcs = extract_calcs(tds_text, datasource)
         except Exception:
             calcs = None
+
+    descriptor = parse_tds(tds_text, datasource)
+    decision = select_storage_mode(descriptor)
+    if decision.get("mode") is None:
+        # Genuinely-undoable shape: return the lakehouse hand-off (no parts) rather than raising.
+        return _fallback_result(descriptor, decision, model_name=model_name, calcs=calcs,
+                                write_to=write_to)
+
     result = migrate_tds_to_semantic_model(
-        tds_text, model_name=model_name, calcs=calcs,
+        tds_text, model_name=model_name, calcs=calcs, select=datasource,
         approved_calc_dax=approved_calc_dax, date_range=date_range, **kwargs)
     try:
-        result["bind"] = connection_details_for_bind(parse_tds(tds_text))
+        result["bind"] = connection_details_for_bind(descriptor)
     except Exception as exc:  # never fail the migration over the (advisory) bind target
         result["bind"] = {"error": str(exc)}
     if write_to:
@@ -754,4 +911,39 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False,
             model_dir = os.path.join(write_to, f"{model_name}.SemanticModel")
             write_model_folder(result["parts"], model_dir)
             result["model_dir"] = model_dir
+    return result
+
+
+def _fallback_result(descriptor, decision, *, model_name, calcs, write_to):
+    """Build the ``migrate_datasource`` result for a datasource routed to the lakehouse fallback.
+
+    Returns ``parts={}`` (no semantic model is emitted) with a ``report`` carrying the storage
+    decision and -- for the land-to-Delta fallback -- a ``landing_plan``. SSAS/XMLA fallbacks carry
+    the decision (whose ``manual_followups`` already point at the semantic-model path) but no landing
+    plan, since they are not a Delta-landing case. When ``write_to`` is given and a landing plan was
+    produced, it is also written next to where the model folder would have gone.
+    """
+    report = {
+        "model_name": model_name,
+        "storage_decision": decision,
+        "fallback": True,
+        "tables": [],
+    }
+    if decision.get("fallback") == FALLBACK_LAND_TO_DELTA:
+        report["landing_plan"] = directlake_landing_plan(
+            descriptor, calcs=calcs, datasource_name=descriptor.get("datasource_name"),
+            decision=decision)
+    result = {"parts": {}, "report": report}
+    try:
+        result["bind"] = connection_details_for_bind(descriptor)
+    except Exception as exc:
+        result["bind"] = {"error": str(exc)}
+    if write_to and report.get("landing_plan"):
+        import os
+        import json
+        os.makedirs(write_to, exist_ok=True)
+        lp_path = os.path.join(write_to, f"{model_name}.landing_plan.json")
+        with open(lp_path, "w", encoding="utf-8") as fh:
+            json.dump(report["landing_plan"], fh, indent=2)
+        result["landing_plan_path"] = lp_path
     return result

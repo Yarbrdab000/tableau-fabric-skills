@@ -146,6 +146,25 @@ def inner_tds_from_zip(data):
         return zf.read(tds_names[0]).decode("utf-8-sig")
 
 
+def inner_doc_from_zip(data):
+    """Extract the inner ``.tds`` **or** ``.twb`` XML text from a Tableau archive (zip).
+
+    Handles both packaged shapes: a ``.tdsx`` (packaged datasource, inner ``.tds``) and a ``.twbx``
+    (packaged workbook, inner ``.twb``). A ``.tds`` is preferred when both are present (a packaged
+    datasource is the more specific artifact); otherwise the top-level ``.twb`` is returned. Raises
+    if the archive contains neither. The caller's ``parse_tds`` then selects the datasource from a
+    workbook document (see ``connection_to_m`` datasource selection).
+    """
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        names = zf.namelist()
+        for ext in (".tds", ".twb"):
+            matches = [n for n in names if n.lower().endswith(ext)]
+            if matches:
+                matches.sort(key=lambda n: (n.count("/"), len(n)))
+                return zf.read(matches[0]).decode("utf-8-sig")
+        raise ValueError("no .tds or .twb entry inside the archive")
+
+
 def derive_filename(content_disposition, fallback_name, is_archive):
     """Best-effort download filename: honor Content-Disposition, else ``<name>.<ext>``."""
     cd = content_disposition or ""

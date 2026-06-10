@@ -187,7 +187,9 @@ def test_estate_datasource_accounting(estate):
     assert len(migrated) + len(fallback) == len(ds) == 4
     for d in migrated:
         assert d["name"] in ctx.models, f"{d['name']} reported migrated but no semantic model emitted"
-    assert sorted(d["name"] for d in fallback) == ["CrossDB"]  # the cross-DB federation is the lone fallback
+    # Under the default-direct policy the 3-engine cross-DB datasource rebuilds in place (each table
+    # bound to its own source), so nothing is routed to the land-to-Delta fallback.
+    assert sorted(d["name"] for d in fallback) == []
 
 
 # =============================================================================
