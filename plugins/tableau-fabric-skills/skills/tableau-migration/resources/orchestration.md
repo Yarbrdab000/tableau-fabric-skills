@@ -204,7 +204,7 @@ configuration surface is already in place, and the pipeline downstream does not 
 LiveTableauSource(
     server_url="https://<pod>.online.tableau.com",
     site="<site-content-url>",
-    key_vault_name="Migration-skill-Kv",   # vault NAME, not a secret
+    key_vault_name="<your-key-vault-name>",   # vault NAME, not a secret
     pat_secret_name="<secret-holding-the-PAT>",
     pat_name="<tableau-PAT-token-name>",
     datasource_names=["Superstore"],       # discover BY NAME, not LUID/GUID
