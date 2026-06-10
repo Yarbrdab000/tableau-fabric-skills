@@ -4,6 +4,10 @@ Connects the deployed landing zone to a Copilot Studio agent so business users c
 natural-language questions about Tableau datasources. Tools are discovered automatically over
 MCP — you do **not** define each action by hand.
 
+> **Consuming from a code client instead?** GitHub Copilot CLI, VS Code, Claude, Cursor, or raw curl
+> wire to the same endpoint a different way — see [`mcp-clients.md`](mcp-clients.md). This doc is the
+> **Copilot Studio / Teams / Microsoft 365 Copilot** path.
+
 You need two values from the deploy step:
 
 | Value | Where it came from |
@@ -23,8 +27,8 @@ Uses [`assets/copilot-studio/mcp-connector.swagger.yaml`](../assets/copilot-stud
 1. Open that swagger file.
 2. Edit one line — set `host:` to **your** Container App FQDN (the `mcpEndpoint` **without**
    `https://` and **without** the trailing `/mcp`). E.g. for
-   `https://tableau-mcp.graysea-5a3f72c8.westus3.azurecontainerapps.io/mcp`, host is
-   `tableau-mcp.graysea-5a3f72c8.westus3.azurecontainerapps.io`.
+   `https://tableau-mcp.<your-env>.westus3.azurecontainerapps.io/mcp`, host is
+   `tableau-mcp.<your-env>.westus3.azurecontainerapps.io`.
 3. Go to **Power Apps** (<https://make.powerapps.com>) → pick the **same environment** your agent
    uses → **More → Discover all → Custom connectors** (or via a Solution).
 4. **New custom connector → Import an OpenAPI file** → upload the edited swagger → name it
@@ -57,6 +61,51 @@ In the agent's **Test** pane:
 - "What were the top 3 regions by total sales?" → `query-datasource` (expect West / East / Central)
 
 The agent should call the tools and answer from **live Tableau data**.
+
+## Publish to Microsoft 365 Copilot
+
+This is the **live-test path**: once the agent answers correctly in the Test pane, publish it so people
+can use it from **Microsoft 365 Copilot** (Copilot Chat). The flow is maker → publish → channel →
+admin approval → end users. UI labels in Copilot Studio and the admin centers **shift frequently** —
+treat the bold names below as a guide and **confirm against the linked Microsoft docs for your tenant**.
+
+1. **Publish the agent.** Copilot Studio → your agent → **Publish**. You must publish at least once
+   before the agent can be added to any channel.
+2. **Add the "Teams and Microsoft 365 Copilot" channel.** Open the agent's **Channels** →
+   **Teams and Microsoft 365 Copilot** → in the configuration panel, under **Turn on Microsoft 365**,
+   confirm **"Make agent available in Microsoft 365 Copilot"** is selected → **Add channel**. If you
+   leave that option off, the agent is added to **Teams only**, not Microsoft 365 Copilot.
+3. **Install for yourself first — self-serve, no admin needed (enough for your live test).** In the same panel select
+   **See agent in Teams** — with the Microsoft 365 option on, this installs to **both** Teams and
+   Microsoft 365 Copilot. In Microsoft 365 Copilot, type **`@`**, pick your agent, and ask a question.
+4. **Submit for organization-wide use (requires a Teams/M365 admin — NOT self-serve).** To reach other users, open the channel panel →
+   **Availability options** → **Show to everyone in my org** → review the requirements →
+   **Submit for admin approval**. Remove the agent from **Show to my teammates and shared users** first,
+   or it can appear in two places. Submitting routes the agent to your tenant admin; if the agent is
+   also published to Microsoft 365, the same submission covers the **Microsoft 365 Agent Store**.
+5. **Admin approves and deploys.** A tenant admin (Teams / Microsoft 365 admin role) approves and
+   manages the agent. Approved agents are featured in **Built for your org** (Teams app store) /
+   **Built by your org** (Microsoft 365 Agent Store). Admins enable, assign, block, or remove agents
+   from the **Microsoft 365 admin center** under **agent management** (historically **Integrated Apps**;
+   some tenants now surface a dedicated **Agents** area), and approve the app listing from the
+   **Teams admin center → Manage apps**. The exact surface is tenant-dependent — **confirm for your
+   tenant**.
+6. **Licensing.** Each end user who interacts with the agent in Microsoft 365 Copilot needs a
+   **Microsoft 365 Copilot license**. (Agent management is enabled by default in Copilot-licensed
+   tenants.)
+7. **Where it shows up.** Users find the agent in **Microsoft 365 Copilot (Copilot Chat) → Agents**, or
+   by typing **`@`** and selecting it, then asking in natural language (e.g.
+   *"@Tableau MCP what were the top 3 regions by total sales?"*).
+
+**Identity caveat (same as the code clients):** the agent authenticates to the MCP endpoint with the
+single **`x-api-key`** (a `service_account`-scoped key), so **every** Microsoft 365 Copilot user
+querying through this agent shares that **one** Tableau service-account identity — it is **not**
+per-user. For per-user row-level security, deploy `identityMode=passthrough` + Easy Auth and turn on
+the agent's **end-user authentication** so each signed-in Entra identity flows to Tableau; see
+[identity-modes.md](identity-modes.md).
+
+**Docs (confirm current UI):** [Connect an agent to Teams and Microsoft 365 Copilot](https://learn.microsoft.com/en-us/microsoft-copilot-studio/publication-add-bot-to-microsoft-teams)
+· [Manage agents in the Microsoft 365 admin center](https://learn.microsoft.com/en-us/microsoft-365/admin/manage/manage-copilot-agents-integrated-apps)
 
 ## Troubleshooting
 

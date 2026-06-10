@@ -127,7 +127,7 @@ committed file, the model, or chat history.**
 | Deploy to Azure (button or CLI), get the MCP endpoint | **Deploy the landing zone** | [deploy-azure.md](resources/deploy-azure.md) |
 | Choose / configure `service_account` vs per-user-RLS `passthrough`, map Entra UPN → Tableau user | **Configure identity** | [identity-modes.md](resources/identity-modes.md) |
 | Register the endpoint in Copilot Studio and test NL queries | **Wire into Copilot Studio** | [copilot-studio-wiring.md](resources/copilot-studio-wiring.md) |
-| Wire the endpoint into a code-running Copilot (Copilot CLI / Claude Code / Cursor) | **Wire into code Copilots** | [mcp-clients.md](resources/mcp-clients.md) |
+| Consume the deployed endpoint from a client — M365 Copilot, Copilot CLI, VS Code, Claude Code/Desktop, Cursor, or curl (**ask the user which**) | **Consume the endpoint** | [mcp-clients.md](resources/mcp-clients.md) |
 | Run the real stack locally for evaluation; run sidecar tests | **Local dev / evaluate** | [local-dev.md](resources/local-dev.md) |
 | Harden with Entra Easy Auth, rotate the API key, curate tools, troubleshoot | **Secure & operate** | [security-operations.md](resources/security-operations.md) |
 
@@ -204,6 +204,18 @@ Deploy **outputs** to capture: `mcpEndpoint` (register in Copilot), `healthUrl` 
   `curl -s localhost:9000/healthz`.
 - **Azure smoke:** open `healthUrl` from the deployment outputs (expect `{"status":"ok"}`); then a
   Copilot test prompt that calls `list-datasources` / `query-datasource`.
+
+## After deploy — consume the endpoint
+
+Standing up the endpoint is only half the job; a user still has to consume it from a client. Once
+`mcpEndpoint` is live and verified, **ask the user where they want to consume it** — Microsoft 365
+Copilot, a Copilot Studio agent (Teams), GitHub Copilot CLI, VS Code Copilot, Claude Code, Claude
+Desktop, Cursor, or a generic MCP client / curl — and then follow the matching section in
+[mcp-clients.md](resources/mcp-clients.md) (Copilot Studio has its own deep-dive in
+[copilot-studio-wiring.md](resources/copilot-studio-wiring.md)). **Do not guess** the client; route
+to the one the user names. M365 Copilot additionally needs the agent published to the *Teams and
+Microsoft 365 Copilot* channel and (for org-wide use) admin approval — that leg is covered in
+[mcp-clients.md](resources/mcp-clients.md).
 
 ## Related skills
 
