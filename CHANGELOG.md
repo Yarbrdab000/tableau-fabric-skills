@@ -12,6 +12,16 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.3.0] - 2026-06-10
+
+A minor, additive release on the collection's own track (independent of any upstream
+versioning). The four packaging manifests move 0.2.0 -> 0.3.0; per-skill stamps move
+`tableau-migration` 1.1.0 -> 1.2.0 and both `tableau-datasource-profiler` and
+`tableau-mcp-landing-zone` 1.0.0 -> 1.0.1. The deprecated `tableau-migration` plugin alias is
+retained.
+
 ### Added
 - **tableau-migration:** additive `relationship_confidence` report artifact — per-relationship
   endpoint connectors, `cross_source` flag, weaker-of-two confidence (ID-key equality scores

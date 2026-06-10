@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft-07/schema",
   "name": "tableau-fabric-skills",
   "description": "All three Tableau -> Microsoft Fabric / Power BI agent skills: profile & NL-query a Tableau datasource, stand up the official Tableau MCP server on Azure for Copilot, and rebuild Tableau datasources as Fabric / Power BI semantic models (calc -> DAX).",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "MIT",
   "repository": "https://github.com/Yarbrdab000/tableau-fabric-skills",
   "keywords": ["tableau","fabric","microsoft-fabric","power-bi","semantic-model","tmdl","dax","mcp","copilot-studio","migration"],
