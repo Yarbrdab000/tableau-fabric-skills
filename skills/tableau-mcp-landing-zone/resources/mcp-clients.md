@@ -8,6 +8,57 @@ discovered automatically over MCP; you never declare each tool by hand.
 > **Route, don't guess.** There is no single right client. Ask which one the user wants, jump to
 > that section, and only configure that client.
 
+## End-to-end test (cold start) — start here
+
+New here and just want to prove a freshly deployed endpoint works, with no prior context? Follow
+this. (Per-client setup detail lives in the sections further down.)
+
+**0. What you need (two values).**
+
+- **Endpoint** — your `mcpEndpoint`: the HTTPS URL ending in `/mcp`. If you didn't capture it at
+  deploy time, read it back from Azure (use *your* app + resource-group names):
+
+  ```powershell
+  $fqdn = az containerapp show -n <container-app> -g <resource-group> --query properties.configuration.ingress.fqdn -o tsv
+  "https://$fqdn/mcp"
+  ```
+
+- **Key** — the sidecar api key. Pull it from Key Vault straight into an env var; never paste or
+  print the literal value:
+
+  ```powershell
+  $env:SIDECAR_API_KEY = az keyvault secret show --vault-name <your-vault> --name <sidecar-key-secret> --query value -o tsv
+  ```
+
+**Path A — fast smoke (~1 min, no agent to build).** Proves transport + auth + `initialize` +
+`tools/list` are healthy.
+
+- Easiest: run the bundled probe `verify_deployment.py` (in `scripts/`) — it reads the key from
+  `$env:SIDECAR_API_KEY` and sends a real `initialize` + `tools/list`:
+  `py -3.11 scripts/verify_deployment.py --base-url https://<your-host>/mcp`.
+- Or add the server to **[GitHub Copilot CLI](#3-github-copilot-cli-this-client)** and ask
+  *"list my Tableau data sources."* A clean tool response means you're live.
+
+**Path B — real end-user experience (the M365-like path).** A person prompts an agent and gets a
+formatted answer from live Tableau data.
+
+- Build a **personal Copilot Studio agent**, add the endpoint as an MCP tool, and use its **Test
+  panel** — no admin approval or publish needed. Walkthrough:
+  [copilot-studio-wiring.md](copilot-studio-wiring.md); the M365 routing + a cheap→rich validation
+  ladder are in [§1 Microsoft 365 Copilot](#1-microsoft-365-copilot-do-first).
+
+**Golden prompt + what PASS looks like.** Ask the agent (or the CLI):
+
+> *"Which Tableau data sources can you see, and what are the top 3 regions by sales in one of them?"*
+
+PASS = the agent calls the MCP tools (`list-datasources` → `query-datasource`) and answers from
+**live Tableau data**, not a guess — i.e. agent → MCP → data → formatted answer. (The endpoint
+exposes Tableau *query* tools; rebuilding a datasource into a Power BI semantic model is the
+separate `tableau-migration` skill, not this endpoint.)
+
+**Cold-start caveat.** The Container App scales to zero when idle, so the **first** call after a
+quiet period can take ~15s or briefly fail — just retry once.
+
 ## Shared facts (every client inherits these)
 
 | Fact | Value |
