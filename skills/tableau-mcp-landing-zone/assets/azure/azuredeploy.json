@@ -25,9 +25,9 @@
     },
     "tableauMcpImage": {
       "type": "string",
-      "defaultValue": "ghcr.io/tableau/tableau-mcp:2.4.3",
+      "defaultValue": "ghcr.io/tableau/tableau-mcp:2.7.4",
       "metadata": {
-        "description": "OFFICIAL Tableau MCP image. Pin by digest for production (ghcr.io/tableau/tableau-mcp@sha256:...)."
+        "description": "OFFICIAL Tableau MCP image (readable tag, overridable). For maximum reproducibility pin by digest: ghcr.io/tableau/tableau-mcp:2.7.4@sha256:10a043fea52c6152ab1d86222540aa1bc2ba021411dc772bc3f48a3c36b54de1 . The /tableau-mcp path and ENABLE_MCP_SITE_SETTINGS=false default are coupled to the 2.7.x line."
       }
     },
     "sidecarImage": {

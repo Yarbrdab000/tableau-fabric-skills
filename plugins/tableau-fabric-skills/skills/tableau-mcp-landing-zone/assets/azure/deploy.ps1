@@ -32,7 +32,10 @@ param(
   [Parameter(Mandatory = $true)][string]$ResourceGroup,
   [string]$Location = "eastus",
   [string]$ContainerAppName = "tableau-mcp",
-  [string]$TableauMcpImage = "ghcr.io/tableau/tableau-mcp:2.4.3",
+  # Readable tag default. Hardening opt-in: pin by digest so a retag can't change the deploy:
+  #   ghcr.io/tableau/tableau-mcp:2.7.4@sha256:10a043fea52c6152ab1d86222540aa1bc2ba021411dc772bc3f48a3c36b54de1
+  # Version-coupled: the upstream path (/tableau-mcp) + ENABLE_MCP_SITE_SETTINGS default track this tag.
+  [string]$TableauMcpImage = "ghcr.io/tableau/tableau-mcp:2.7.4",
   [string]$SidecarImage = "ghcr.io/yarbrdab000/tableau-fabric-ai-bridge-sidecar:latest",
   [Parameter(Mandatory = $true)][string]$TableauServer,
   [string]$TableauSite = "",

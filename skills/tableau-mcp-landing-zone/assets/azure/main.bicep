@@ -23,8 +23,12 @@ param location string = resourceGroup().location
 @description('Name for the Container App (also used as the public subdomain).')
 param containerAppName string = 'tableau-mcp'
 
-@description('OFFICIAL Tableau MCP image. Pin by digest for production (ghcr.io/tableau/tableau-mcp@sha256:...).')
-param tableauMcpImage string = 'ghcr.io/tableau/tableau-mcp:2.4.3'
+@description('OFFICIAL Tableau MCP image. Readable tag default; overridable. For maximum reproducibility, pin by digest (see the hardening opt-in below / deploy-azure.md).')
+// Hardening opt-in — pin by digest so a retag can never change what you deploy:
+//   ghcr.io/tableau/tableau-mcp:2.7.4@sha256:10a043fea52c6152ab1d86222540aa1bc2ba021411dc772bc3f48a3c36b54de1
+// Version-coupled: the UPSTREAM_MCP_URL path (/tableau-mcp) and the ENABLE_MCP_SITE_SETTINGS=false
+// default below track this 2.7.x tag — re-verify both if you bump the image.
+param tableauMcpImage string = 'ghcr.io/tableau/tableau-mcp:2.7.4'
 
 @description('Our auth sidecar image (built + published by .github/workflows/build-sidecar-image.yml).')
 param sidecarImage string = 'ghcr.io/yarbrdab000/tableau-fabric-ai-bridge-sidecar:latest'
