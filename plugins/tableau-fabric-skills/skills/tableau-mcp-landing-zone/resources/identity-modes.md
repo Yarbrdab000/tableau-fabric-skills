@@ -45,16 +45,16 @@ names come straight from the official server's `getRequiredApiScopesForTool` map
 |---|---|---|
 | **NL data queries — default** | `datasource` (`list-datasources`, `get-datasource-metadata`, `query-datasource`) | `tableau:content:read` **+** `tableau:viz_data_service:read` |
 | **Content search — default** | `content-exploration` (`search-content`) | `tableau:content:read` |
-| **Workbooks / projects** | `workbook`, `project` | `tableau:content:read` |
-| **Views — data & image/PDF export** | `view` (`get-view-data`, `get-view-image`, custom-view variants) | `tableau:content:read` **+** `tableau:views:download` |
-| **Pulse — metrics & insights** | `pulse` (list metric definitions / metrics / subscriptions, generate insight bundle & brief) | `tableau:insight_definitions_metrics:read`, `tableau:insight_metrics:read`, `tableau:metric_subscriptions:read`, `tableau:insights:read`, `tableau:insight_brief:create` |
+| **Workbooks (default) / projects** | `workbook`, `project` | `tableau:content:read` |
+| **Views (default) — data & image/PDF export** | `view` (`get-view-data`, `get-view-image`, custom-view variants) | `tableau:content:read` **+** `tableau:views:download` |
+| **Pulse (default) — metrics & insights** | `pulse` (list metric definitions / metrics / subscriptions, generate insight bundle & brief) | `tableau:insight_definitions_metrics:read`, `tableau:insight_metrics:read`, `tableau:metric_subscriptions:read`, `tableau:insights:read`, `tableau:insight_brief:create` |
 
-**Minimum for the default deploy** (`includeTools=datasource,content-exploration`):
-`tableau:content:read` + `tableau:viz_data_service:read`. Those two are all most users ever need.
+**Scopes for the default deploy** (`includeTools=datasource,content-exploration,workbook,view,pulse`):
+`tableau:content:read` + `tableau:viz_data_service:read` cover data queries + content search + workbooks. The default also enables **views** + **Pulse** — grant `tableau:views:download` and the five Pulse scopes (above) to make those work; until then they 401 and the server stays healthy. Want the lean footprint? Deploy with `-IncludeTools 'datasource,content-exploration'`.
 
 > **Pulse needs a *family* of scopes, not just one.** Granting only `tableau:insights:read` covers
 > the *generate insight bundle* tool, but the Pulse **list** tools still 401 — grant all five Pulse
-> scopes above and deploy with `-IncludeTools '...,pulse'`.
+> scopes above. Pulse is in the default set, so without them (or a Pulse-enabled site) those tools 401 gracefully — trim `includeTools` to drop them.
 
 > **`tableau:datasources:download` is *not* an MCP tool scope.** No landing-zone tool downloads a
 > datasource, so the MCP server never needs it. You only need it for the sibling

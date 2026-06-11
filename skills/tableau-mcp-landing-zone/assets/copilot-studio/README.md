@@ -85,10 +85,10 @@ The agent should call the tools and answer from live Tableau data.
 - **401 from the server:** the API key is wrong or not being sent in `x-api-key`.
 - **Cold start:** the Container App scales to zero; the first request after idle can take
   a few seconds while a replica spins up. Subsequent calls are fast.
-- **Recommended tool curation:** the landing zone ships `INCLUDE_TOOLS=datasource,content-exploration`
-  and `MAX_RESULT_LIMITS=query-datasource:100`, trimming the official server's ~20 tools to the
-  high-signal NL-query set with a sane row cap. Widen it by editing those parameters at deploy
-  time (e.g. add the `pulse` or `view` group). Fewer, well-described tools = more reliable
+- **Tool curation:** the landing zone ships `INCLUDE_TOOLS=datasource,content-exploration,workbook,view,pulse`
+  and `MAX_RESULT_LIMITS=query-datasource:100` — the full NL-analytics set (data, content, workbooks, views, Pulse) with the
+  default row cap. Trim those parameters at deploy
+  time (e.g. drop `pulse`). Fewer, well-described tools = more reliable
   orchestration on weaker models.
 - **Access model:** in the default `service_account` mode the server queries Tableau as the
   single configured account (`serviceAccountUsername`) — all agent users see what that account

@@ -76,9 +76,9 @@
     },
     "includeTools": {
       "type": "string",
-      "defaultValue": "datasource,content-exploration",
+      "defaultValue": "datasource,content-exploration,workbook,view,pulse",
       "metadata": {
-        "description": "Official server INCLUDE_TOOLS — comma-separated tool or group names to expose. Default trims ~20 tools to the high-signal NL-query set. Empty = all tools."
+        "description": "Official server INCLUDE_TOOLS — comma-separated tool or group names to expose. Default exposes the full NL-analytics set (data queries, content search, workbooks, views, Pulse). Empty = all ~20 tools."
       }
     },
     "maxResultLimits": {

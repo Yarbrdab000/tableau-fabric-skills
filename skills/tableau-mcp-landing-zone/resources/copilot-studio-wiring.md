@@ -122,10 +122,10 @@ the agent's **end-user authentication** so each signed-in Entra identity flows t
 
 ## Notes
 
-- **Tool curation:** the landing zone ships `includeTools=datasource,content-exploration` and
-  `maxResultLimits=query-datasource:100`, trimming the official server's ~20 tools to the
-  high-signal NL-query set with a sane row cap. Widen by editing those parameters at deploy time
-  (e.g. add the `pulse` or `view` group). Fewer, well-described tools orchestrate more reliably.
+- **Tool curation:** the landing zone ships `includeTools=datasource,content-exploration,workbook,view,pulse` and
+  `maxResultLimits=query-datasource:100` — the full NL-analytics set (data, content, workbooks, views, Pulse) with the
+  default row cap. Trim those parameters at deploy time
+  (e.g. drop `pulse`). Fewer, well-described tools orchestrate more reliably on weaker models.
 - **Access model:** `service_account` → all agent users see what that one account sees (scope it
   least-privilege). For per-user RLS use `passthrough` + Easy Auth — see
   [identity-modes.md](identity-modes.md).

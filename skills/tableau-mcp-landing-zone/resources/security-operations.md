@@ -58,11 +58,11 @@ a commit** — a secret that entered a transcript is compromised even if later d
 
 ## Curate tools
 
-The landing zone ships `includeTools=datasource,content-exploration` and
-`maxResultLimits=query-datasource:100` — trimming the official server's ~20 tools to the
-high-signal NL-query set with a sane row cap. Adjust at deploy time:
+The landing zone ships `includeTools=datasource,content-exploration,workbook,view,pulse` and
+`maxResultLimits=query-datasource:100` — the official server's full NL-analytics set (data, content, workbooks, views, Pulse), with the
+default row cap. Adjust at deploy time:
 
-- Add a group (e.g. `pulse`, `view`) by extending `includeTools`.
+- Slim the set (e.g. drop `pulse` or `view`), or add the remaining groups (`project`, `token-management`), by editing `includeTools`.
 - Raise/lower row caps via `maxResultLimits`.
 - Fewer, well-described tools orchestrate more reliably on weaker models.
 

@@ -35,7 +35,7 @@ auth sidecar, wire it into Microsoft Copilot, and operate it — so a business u
 
 **We wrap, not fork.** The official image (`ghcr.io/tableau/tableau-mcp`) runs unmodified, so the
 deployment inherits Tableau's ongoing updates and its full supported tool set (datasources, VizQL
-Data Service queries, workbooks, views, Pulse, content search — ~20 tools, curated down by default).
+Data Service queries, workbooks, views, Pulse, content search — ~20 tools; the default exposes the full NL-analytics set, trimmable per deploy).
 
 ## Architecture
 
@@ -84,8 +84,8 @@ developers who want to modify the sidecar.
 Before deploying, confirm the user has (ask if unknown — do not assume):
 
 1. **A Tableau Connected App (Direct Trust)** on their Tableau Cloud/Server site, **Enabled**,
-   with scopes `tableau:content:read` + `tableau:viz_data_service:read` (plus the Pulse insight
-   scopes only if exposing Pulse — see *Scopes by capability* in [identity-modes.md](resources/identity-modes.md)). This yields **Client ID**, **Secret ID**, **Secret Value** (shown once),
+   with scopes `tableau:content:read` + `tableau:viz_data_service:read` (plus `tableau:views:download` and the Pulse insight
+   scopes for the default view + Pulse tools — see *Scopes by capability* in [identity-modes.md](resources/identity-modes.md)). This yields **Client ID**, **Secret ID**, **Secret Value** (shown once),
    and the **site content URL** (slug). See [identity-modes.md](resources/identity-modes.md).
 2. **An Azure subscription** + permission to create a resource group / Container Apps.
 3. **A target identity mode** — `service_account` (default, simplest) or `passthrough` (per-user
@@ -152,7 +152,7 @@ and the **Sidecar Api Key**, item 9) are different: they follow the *Secret inta
 | 3 | **Connected App Client ID** | Tableau → **Settings → Connected Apps → New Connected App → Direct Trust**; create it, set **Enabled**. Shown on the app. | `a1b2c3d4-…` |
 | 4 | **Connected App Secret ID** | On the same app, **Generate New Secret** → copy the Secret ID. | `e5f6…` |
 | 5 | **Connected App Secret Value** | Copied from the same **Generate New Secret** step — **shown once**. *(secret)* | 🔴 **never paste in chat** — store in Key Vault / env var (see *Secret intake*) |
-| 6 | **Scopes enabled** | Minimum on the Connected App: `tableau:content:read` + `tableau:viz_data_service:read`. Add scopes only for extra tools — Pulse, view image/PDF export, or `.tdsx` download for the sibling skills — per the *Scopes by capability* table in [identity-modes.md](resources/identity-modes.md). | — |
+| 6 | **Scopes enabled** | Base on the Connected App: `tableau:content:read` + `tableau:viz_data_service:read` (covers data queries, content search, workbooks). The default set also enables **views** + **Pulse** — grant `tableau:views:download` and the 5 Pulse scopes for those (until then they 401; server stays healthy), or trim `includeTools`. `.tdsx` download for the sibling skills needs `tableau:datasources:download`. See the *Scopes by capability* table in [identity-modes.md](resources/identity-modes.md). | — |
 | 7 | **Service account username** (`serviceAccountUsername`) | A **least-privilege** Tableau user the agent acts as (in `service_account` mode every Copilot user queries as this user). Not a Site Admin in prod. | `svc-mcp@acme.com` |
 | 8 | **Identity mode** (`identityMode`) | `service_account` (default) or `passthrough` (per-user RLS). See [identity-modes.md](resources/identity-modes.md). | `service_account` |
 | 9 | **Sidecar Api Key** (`sidecarApiKey`) | **Invent** a long random string (e.g. a GUID). You'll paste it into Copilot Studio later. PowerShell: `(New-Guid).Guid`. *(secret)* | 🔴 **never paste in chat** — store in Key Vault / env var (see *Secret intake*) |
@@ -196,7 +196,7 @@ Full list is in [`assets/azure/main.bicep`](assets/azure/main.bicep).
 | `upnMappingMode` (+ `upnDomainFrom`/`upnDomainTo`) | Entra UPN → Tableau username (`direct` / `transform` / `explicit`). |
 | `enableEasyAuth` (+ `entraClientId`, `entraTenantId`) | Microsoft Entra "Easy Auth" front door. |
 | `useKeyVault` | Store secrets in Key Vault via managed identity instead of plain Container App secrets. |
-| `includeTools` / `maxResultLimits` | Tool curation (default `datasource,content-exploration` + `query-datasource:100`). |
+| `includeTools` / `maxResultLimits` | Tool curation (default `datasource,content-exploration,workbook,view,pulse` + `query-datasource:100`; trim `includeTools` to slim the set). |
 | `tableauMcpImage` / `sidecarImage` | Pinned image references (pin the official image by **digest** for production). |
 
 Deploy **outputs** to capture: `mcpEndpoint` (register in Copilot), `healthUrl` (smoke check →
@@ -224,7 +224,7 @@ Deploy **outputs** to capture: `mcpEndpoint` (register in Copilot), `healthUrl` 
   `passthrough` once RLS is defined on the datasources and users exist on the Tableau site.
 - **Least-privilege Tableau identities** — a least-privilege service account, and in passthrough,
   impersonated users that are **not** Site Admins (admins bypass RLS).
-- **Curate tools** (`includeTools` / `maxResultLimits`) — fewer, well-described tools orchestrate
+- **Right-size the tool set** (`includeTools` / `maxResultLimits`) — the default ships the full NL-analytics suite; trimming to fewer, well-described tools (and their scopes) orchestrates
   more reliably on weaker models.
 - **Key Vault (`useKeyVault=true`) + Entra Easy Auth** for production hardening.
 

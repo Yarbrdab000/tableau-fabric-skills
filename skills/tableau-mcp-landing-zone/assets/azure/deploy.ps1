@@ -56,7 +56,7 @@ param(
   [switch]$UseKeyVault,
   # Tool curation forwarded to the official server (defaults match main.bicep). Add 'pulse' to expose
   # Pulse tools (also requires the Pulse insight scope family on the Connected App -- see resources/identity-modes.md).
-  [string]$IncludeTools = "datasource,content-exploration",
+  [string]$IncludeTools = "datasource,content-exploration,workbook,view,pulse",
   [string]$MaxResultLimits = "query-datasource:100",
   [int]$MinReplicas = 0,
   [int]$MaxReplicas = 2
@@ -141,9 +141,9 @@ Write-Host "  $($result.healthUrl.value)"
 # Tool-curation visibility: make the enabled set + Pulse gating obvious instead of a mystery.
 Write-Host ""
 Write-Host "Curated tools (INCLUDE_TOOLS = '$IncludeTools'):" -ForegroundColor Cyan
-Write-Host "  Default groups expose the NL-query set: list-datasources, get-datasource-metadata, query-datasource, search-content."
+Write-Host "  Default set is the full NL-analytics suite: data queries (list-datasources, get-datasource-metadata, query-datasource), content search, workbooks, views, and Pulse insights."
 Write-Host "  Row caps (MAX_RESULT_LIMITS = '$MaxResultLimits')."
-Write-Host "  Pulse is OFF unless 'pulse' is included. To enable: grant the Connected App the Pulse insight scopes (tableau:insight_definitions_metrics:read, tableau:insight_metrics:read, tableau:metric_subscriptions:read, tableau:insights:read, tableau:insight_brief:create) and redeploy with -IncludeTools '$IncludeTools,pulse'."
+Write-Host "  Pulse, workbooks, and views are ON by default. Content/workbooks need only tableau:content:read; views also need tableau:views:download; Pulse needs the 5 insight scopes (tableau:insight_definitions_metrics:read, tableau:insight_metrics:read, tableau:metric_subscriptions:read, tableau:insights:read, tableau:insight_brief:create). Tools whose scopes are not granted return 401 at call time, but the server stays healthy. Trim -IncludeTools to slim the set."
 
 # Emit a ready-to-import Copilot Studio connector with host pre-filled (removes the manual host edit).
 $fqdn = (($result.mcpEndpoint.value) -replace '^https://', '') -replace '/mcp/?$', ''

@@ -234,7 +234,7 @@ def gate_mcp(report, root, args):
 
 # ----------------------------------------------------------------------------- tool curation
 def _print_tool_curation(report):
-    """Make the enabled tool set + Pulse gating visible (the deploy curates ~20 tools down)."""
+    """Make the enabled tool set + Pulse gating visible (the default ships the NL-analytics set)."""
     if not report.tools:
         return
     print("-" * 60)
@@ -242,8 +242,9 @@ def _print_tool_curation(report):
     if any("pulse" in t.lower() for t in report.tools):
         print("Pulse: ENABLED (insights tools present).")
     else:
-        print("Pulse: OFF. To enable, grant the Connected App 'tableau:insights:read' and "
-              "redeploy with INCLUDE_TOOLS including 'pulse'.")
+        print("Pulse: OFF (trimmed from this deploy; it is in the default set). To re-enable, add 'pulse' to "
+              "INCLUDE_TOOLS and grant the 5 Pulse insight scopes (insight_definitions_metrics, insight_metrics, "
+              "metric_subscriptions, insights, insight_brief).")
 
 
 # ----------------------------------------------------------------------------- main

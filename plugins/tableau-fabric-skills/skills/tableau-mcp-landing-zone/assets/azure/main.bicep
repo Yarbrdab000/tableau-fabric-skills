@@ -57,8 +57,8 @@ param connectedAppSecretValue string
 @description('Tableau username the SERVICE ACCOUNT acts as. Required by the official server at startup; also the identity used in service_account mode. A Site Admin bypasses RLS.')
 param serviceAccountUsername string
 
-@description('Official server INCLUDE_TOOLS — comma-separated tool or group names to expose. Default trims ~20 tools to the high-signal NL-query set. Empty = all tools.')
-param includeTools string = 'datasource,content-exploration'
+@description('Official server INCLUDE_TOOLS — comma-separated tool or group names to expose. Default exposes the full NL-analytics set (data queries, content search, workbooks, views, Pulse). Empty = all ~20 tools.')
+param includeTools string = 'datasource,content-exploration,workbook,view,pulse'
 
 @description('Official server MAX_RESULT_LIMITS — per-tool row caps (e.g. "query-datasource:100") to prevent payload blowups. Empty = server defaults.')
 param maxResultLimits string = 'query-datasource:100'
