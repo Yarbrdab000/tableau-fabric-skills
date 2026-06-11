@@ -117,10 +117,12 @@ class TableCalcUsage:
     window_to: Optional[int] = None     # relative window end (WindowTotal), e.g. 0
     window_options: Optional[str] = None  # e.g. "IncludeCurrent"
     rank_options: Optional[str] = None  # e.g. "Unique,Descending"
-    ordering_type: str = "Table"        # Table / Pane / Cell / Rows / Columns / Field
+    # Table / Pane / Cell / Rows / Columns / ColumnInPane / PaneCol / CellInPane / Field
+    ordering_type: str = "Table"
     ordering_fields: List[str] = field(default_factory=list)  # underlying field ids
     sort_field: Optional[str] = None    # underlying field id of an explicit sort
     sort_direction: Optional[str] = None  # "ASC" / "DESC"
+    secondary: bool = False             # a stacked "secondary calculation" is present (-> Tier 1)
     shelf: Optional[str] = None         # "rows" | "cols" | None (where the calc pill sits)
     rows: List[Pill] = field(default_factory=list)
     cols: List[Pill] = field(default_factory=list)
@@ -198,6 +200,34 @@ def _resolve_field_id(token: Optional[str], instances: dict) -> Optional[str]:
     return pill.column if pill else inst
 
 
+def _detect_secondary(ci, tc) -> bool:
+    """True iff a stacked "Add Secondary Calculation" is present on this pill.
+
+    A secondary calc adds a *second* addressing pass on top of the primary table calc
+    (e.g. a moving average, then a percent-difference of it). Tier 0 only synthesizes the
+    primary pass, so any secondary must hand off rather than emit faithful-looking DAX that
+    silently drops the second pass.
+
+    VERIFIED encoding (real "secondary calc example.twbx" — Running Total, then Percent of
+    Total): the pill carries **two** ``<table-calc>`` children. The primary pass has an
+    ``aggregation`` attribute and a ``level-break``; the secondary pass has a ``level-address``
+    and no ``aggregation``. The robust, version-agnostic signal is simply ">1 ``<table-calc>``
+    on the pill"; the ``secondary`` / ``compute-using`` attr/child checks below are extra
+    defensive nets for other encodings. Over-detecting only causes more (safe) handoffs.
+    """
+    if len(_children_local(ci, "table-calc")) > 1:
+        return True
+    for attr in tc.attrib:
+        al = _local(attr).lower()
+        if "secondary" in al or al == "compute-using":
+            return True
+    for child in tc:
+        cl = _local(child.tag).lower()
+        if "secondary" in cl or cl == "compute-using":
+            return True
+    return False
+
+
 def extract_table_calc_usages(xml_text: str) -> List[TableCalcUsage]:
     """Parse a ``.twb`` XML string into one :class:`TableCalcUsage` per table-calc usage.
 
@@ -271,6 +301,7 @@ def extract_table_calc_usages(xml_text: str) -> List[TableCalcUsage]:
                     ordering_fields=ordering_fields,
                     sort_field=sort_field,
                     sort_direction=sort_direction,
+                    secondary=_detect_secondary(ci, tc),
                     shelf=("rows" if iid in rows_inst
                            else "cols" if iid in cols_inst else None),
                     rows=rows,

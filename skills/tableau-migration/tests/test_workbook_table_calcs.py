@@ -267,3 +267,62 @@ def test_dataclass_to_dict_shapes():
     d = u.to_dict()
     assert d["rows"] == [] and d["cols"] == []
     assert d["ordering_type"] == "Table"  # default scope
+    assert d["secondary"] is False        # no stacked secondary calc by default
+
+
+def test_single_table_calc_is_not_flagged_secondary(usages):
+    # every usage in the fixture carries exactly one <table-calc> -> no secondary pass.
+    assert all(u.secondary is False for u in usages)
+
+
+# A stacked "Add Secondary Calculation" leaves a second <table-calc> on the same pill. Kept in
+# its own minimal XML so the shared FIXTURE counts above are undisturbed. This mirrors the
+# VERIFIED encoding from a real "secondary calc example.twbx" (Running Total of Profit, then a
+# secondary Percent of Total): the primary pass carries `level-break` + `aggregation`, the
+# secondary pass carries `level-address` and no `aggregation`; both are `ordering-type='Field'`
+# with their own `<order>` lists, and the primary keeps the `<sort>`.
+SECONDARY_FIXTURE = """<?xml version='1.0' encoding='utf-8'?>
+<workbook>
+  <worksheets>
+    <worksheet name='Stacked'>
+      <table>
+        <view>
+          <datasource-dependencies datasource='ds0'>
+            <column aggregation='Sum' datatype='real' name='[Profit]' role='measure' type='quantitative' caption='Profit' />
+            <column datatype='string' name='[Category]' role='dimension' type='nominal' />
+            <column datatype='string' name='[Sub-Category]' role='dimension' type='nominal' />
+            <column datatype='string' name='[Segment]' role='dimension' type='nominal' />
+            <column-instance column='[Profit]' derivation='Sum' name='[pcto:cum:sum:Profit:qk:6]' pivot='key' type='quantitative'>
+              <table-calc aggregation='Sum' level-break='[ds0].[Sub-Category]' ordering-type='Field' type='CumTotal'>
+                <order field='[ds0].[none:Segment:nk]' />
+                <order field='[ds0].[Sub-Category]' />
+                <order field='[ds0].[Category]' />
+                <sort direction='ASC' using='[ds0].[sum:Sales:qk]' />
+              </table-calc>
+              <table-calc level-address='[ds0].[none:Segment:nk]' ordering-type='Field' type='PctTotal'>
+                <order field='[ds0].[none:Segment:nk]' />
+                <order field='[ds0].[Category]' />
+                <order field='[ds0].[Sub-Category]' />
+              </table-calc>
+            </column-instance>
+            <column-instance column='[Category]' derivation='None' name='[none:Category:nk]' pivot='key' type='nominal' />
+            <column-instance column='[Sub-Category]' derivation='None' name='[none:Sub-Category:nk]' pivot='key' type='nominal' />
+            <column-instance column='[Segment]' derivation='None' name='[none:Segment:nk]' pivot='key' type='nominal' />
+          </datasource-dependencies>
+        </view>
+        <rows>([ds0].[none:Category:nk] / ([ds0].[none:Sub-Category:nk] / [ds0].[none:Segment:nk]))</rows>
+        <cols>[ds0].[pcto:cum:sum:Profit:qk:6]</cols>
+      </table>
+    </worksheet>
+  </worksheets>
+</workbook>
+"""
+
+
+def test_stacked_secondary_calc_is_detected():
+    [u] = extract_table_calc_usages(SECONDARY_FIXTURE)
+    assert u.secondary is True
+    # the primary pass is still read normally (the consumer uses .secondary to hand off).
+    assert u.calc_type == "CumTotal"
+    assert u.ordering_type == "Field"
+    assert u.to_dict()["secondary"] is True
