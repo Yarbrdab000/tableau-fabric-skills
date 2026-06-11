@@ -38,7 +38,13 @@ try:  # package or scripts-on-path
         AmbiguousDatasourceError,
     )
     from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
-    from .calc_to_dax import translate_tableau_calc_to_dax, suggest_assisted_dax
+    from .calc_to_dax import (
+        translate_tableau_calc_to_dax,
+        translate_tableau_calc_to_column_dax,
+        suggest_assisted_dax,
+        field_references,
+        date_attribute_binding,
+    )
     from . import tmdl_generate as T
 except ImportError:
     from connection_to_m import (
@@ -52,7 +58,13 @@ except ImportError:
         AmbiguousDatasourceError,
     )
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
-    from calc_to_dax import translate_tableau_calc_to_dax, suggest_assisted_dax
+    from calc_to_dax import (
+        translate_tableau_calc_to_dax,
+        translate_tableau_calc_to_column_dax,
+        suggest_assisted_dax,
+        field_references,
+        date_attribute_binding,
+    )
     import tmdl_generate as T
 
 
@@ -568,7 +580,230 @@ def calc_coverage_artifact(measure_report):
     return {"summary": summary, "measures": measures}
 
 
-def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=None,
+def _related_date_dax(date_table, column):
+    """A calculated-column DAX ref that pulls a calendar attribute from the shared Date
+    dimension across the (active) relationship: ``RELATED('Date'[Year])``. The table name is
+    always single-quoted (escaping any embedded quote) so a de-duplicated name like
+    ``'Date Dimension'`` stays valid."""
+    return f"RELATED('{date_table.replace(chr(39), chr(39) * 2)}'[{column}])"
+
+
+def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
+                       date_table=None, active_date_cols=None):
+    """Translate row-level (dimension) ``dim_calcs`` via column mode and group the rendered
+    calculated-column TMDL by target table, plus a per-column report.
+
+    ``dim_calcs`` is an iterable of ``{"name", "formula"}`` -- the dimension-role calcs surfaced
+    by ``migrate_estate.extract_calculations(..., include_dimensions=True)``. Each is run through
+    ``translate_tableau_calc_to_column_dax`` (ROW context), so a bare ``[field]`` resolves and the
+    row-level string/date/cast functions are available.
+
+    Binding follows that translator's contract: a single resolved ``{T}`` is the home table; a
+    constant (no field refs) and any honest ``= BLANK()`` stub default to ``anchor_table`` so a
+    dimension calc is NEVER silently dropped (today's behavior) and always carries its preserved
+    ``TableauFormula`` for audit/repair. Aggregations / LODs / multi-table terms fall back to the
+    inert stub here -- the measure entry point owns those. Returns ``(by_table, report)`` where
+    ``by_table`` is ``{table_display: concatenated_tmdl}``.
+
+    **Date-dimension binding (optional).** When ``date_table`` (the generated calendar's name)
+    and ``active_date_cols`` (the set of ``(table, column)`` carrying the ACTIVE date
+    relationship) are supplied, a calc that is exactly a calendar attribute of a single date
+    field -- ``YEAR([Order Date])``, ``DATEPART('month', [Order Date])``, etc. (see
+    ``date_attribute_binding``) -- is emitted as ``= RELATED('Date'[<attr>])`` *when that date
+    field is the active date*, so the attribute is sourced once from the shared Date table rather
+    than recomputed inline. A role-playing (inactive) date can't use ``RELATED`` safely (it would
+    silently follow the active relationship), so it keeps the faithful inline translation. The
+    bound column is tagged ``TranslatedBy = deterministic (date dimension)`` and its report row
+    carries the additive ``date_bound`` / ``date_table`` / ``date_attribute`` keys.
+    """
+    by_table = {}
+    report = []
+    active_date_cols = active_date_cols or set()
+    for calc in dim_calcs or []:
+        name, formula = calc["name"], calc.get("formula", "")
+        bound_attr = None
+        if date_table and active_date_cols:
+            match = date_attribute_binding(formula)
+            if match:
+                field_caption, date_column = match
+                resolved = resolve(field_caption)
+                if resolved and (resolved[0], resolved[1]) in active_date_cols:
+                    bound_attr = (resolved[0], date_column)
+        if bound_attr is not None:
+            target, date_column = bound_attr
+            dax = _related_date_dax(date_table, date_column)
+            by_table[target] = by_table.get(target, "") + T.generate_calc_column_tmdl(
+                name, formula, dax, translated_by="deterministic (date dimension)")
+            report.append({
+                "column": name, "table": target, "status": "translated",
+                "reason": "ok", "dax": dax, "tableau_formula": formula,
+                "date_bound": True, "date_table": date_table, "date_attribute": date_column,
+            })
+            continue
+        dax, reason, tables_used = translate_tableau_calc_to_column_dax(formula, resolve)
+        if dax and len(tables_used) == 1:
+            target = next(iter(tables_used))
+        elif len(tables_used) == 1:          # untranslatable but single known home
+            target = next(iter(tables_used))
+        else:                                # constant DAX, or stub with no/ambiguous home
+            target = anchor_table
+        by_table[target] = by_table.get(target, "") + T.generate_calc_column_tmdl(name, formula, dax)
+        report.append({
+            "column": name,
+            "table": target,
+            "status": "translated" if dax else "stub",
+            "reason": reason,
+            "dax": dax,
+            "tableau_formula": formula,
+            "date_bound": False,
+            "date_table": None,
+            "date_attribute": None,
+        })
+    return by_table, report
+
+
+def calc_column_coverage_artifact(calc_column_report):
+    """Additive coverage rollup for dimension calc COLUMNS, the column-mode peer of
+    ``calc_coverage_artifact`` (measures). Each row is bucketed ``translated`` (a LIVE DAX
+    calculated column) or ``stub`` (an inert ``= BLANK()`` that preserves the Tableau formula),
+    with the same honest ``deterministic_coverage_pct`` (``None`` when the model has no dimension
+    calcs, never a misleading 0/100). Pure; reads only the already-computed report rows."""
+    buckets = {"translated": 0, "stub": 0}
+    columns = []
+    for row in calc_column_report or []:
+        bucket = "translated" if row.get("status") == "translated" else "stub"
+        buckets[bucket] += 1
+        columns.append({
+            "column": row.get("column"),
+            "table": row.get("table"),
+            "status": row.get("status"),
+            "bucket": bucket,
+            "live": bucket == "translated",
+            "reason": row.get("reason"),
+            "tableau_formula": row.get("tableau_formula"),
+        })
+    total = len(columns)
+    live = buckets["translated"]
+    summary = {
+        "total": total,
+        "translated": live,
+        "stub": buckets["stub"],
+        "live": live,
+        "inert": total - live,
+        "deterministic_coverage_pct": _coverage_pct(live, total),
+    }
+    return {"summary": summary, "columns": columns}
+
+
+# Tier-0 -> Tier-1 handoff. ``translated``/``assisted-approved`` are LIVE faithful DAX;
+# ``assisted-suggested``/``stub`` still need human review and are the second-compiler candidates.
+_HANDOFF_REVIEW = ("assisted-suggested", "stub")
+
+
+def _handoff_fields(formula, resolve, calc_lookup):
+    """Resolve each distinct field reference in ``formula`` to ``{caption, kind, ...}`` for a
+    Tier-1 request. ``kind`` is ``field`` (resolved to ``table``/``column``/``type``), ``calc``
+    (a reference to another calculated field, resolvable via ``calc_lookup``), ``parameter`` (a
+    ``[Parameters].[X]`` swap/what-if), or ``unresolved``. Pure; never raises."""
+    lookup = {(k or "").lower(): v for k, v in (calc_lookup or {}).items()}
+    out = []
+    for fr in field_references(formula):
+        if fr["qualified"]:
+            kind = "parameter" if (fr["parts"] and fr["parts"][0].lower() == "parameters") \
+                else "unresolved"
+            out.append({"caption": fr["caption"], "kind": kind})
+            continue
+        bare = fr["parts"][0]
+        try:
+            resolved = resolve(bare) if resolve else None
+        except Exception:
+            resolved = None
+        if resolved:
+            out.append({"caption": bare, "kind": "field",
+                        "table": resolved[0], "column": resolved[1], "type": resolved[2]})
+        elif bare.lower() in lookup:
+            out.append({"caption": bare, "kind": "calc",
+                        "references_formula": lookup[bare.lower()]})
+        else:
+            out.append({"caption": bare, "kind": "unresolved"})
+    return out
+
+
+def translation_handoff_artifact(measure_report, calc_column_report, resolve, *, calc_lookup=None):
+    """Additive Tier-0 -> Tier-1 handoff manifest -- the deterministic engine's honest report of
+    what it could and could NOT faithfully translate, plus a STRUCTURED request for each calc that
+    fell back, so a second compiler can propose (and the oracle later verify) a faithful DAX.
+
+    By design the deterministic tier owns only the provably-1:1 safe subset; the hard, varied tail
+    (argmax/INCLUDE-EXCLUDE/nested LODs, regex, etc.) is handed off rather than force-fit into
+    fragile bespoke DAX. This manifest is the interface for that handoff and the data behind the
+    failover check-in the agent presents: *"N of M calcs translated faithfully; these X need
+    review -- re-pass with the assisted (second) compiler?"* It is PURE -- it reads the
+    already-computed per-calc report rows + the field resolver and emits **no DAX and no model
+    objects** (so it can never bloat the model or introduce a fragile translation).
+
+    Returns ``{"summary", "needs_review", "requests"}``:
+      * ``summary`` -- counts: ``total`` / ``live`` (faithfully translated, deterministic or
+        approved) / ``needs_review`` (stub or pending suggestion), with the per-status breakdown and
+        an honest ``coverage_pct`` (``None`` when there are no calcs).
+      * ``needs_review`` -- a concise ``[{name, role, fallback_reason, has_suggestion}]`` list for
+        the check-in prompt.
+      * ``requests`` -- one structured record per needs-review calc: ``{name, role, target_table,
+        formula, fields[], fallback_reason, has_suggestion[, suggestion]}``. ``fields`` are the
+        resolved field references (table/column/type), cross-calc references, and parameters --
+        everything the second compiler needs to propose a translation at the right grain.
+    """
+    buckets = {"translated": 0, "assisted_approved": 0, "assisted_suggested": 0, "stub": 0}
+    requests = []
+    needs_review = []
+
+    def _consume(rows, role, target_of):
+        for row in rows or []:
+            status = row.get("status") or "stub"
+            name = row.get("measure") or row.get("column")
+            formula = row.get("tableau_formula")
+            bucket = status.replace("-", "_")
+            if bucket in buckets:
+                buckets[bucket] += 1
+            if status in _HANDOFF_REVIEW:
+                has_suggestion = status == "assisted-suggested"
+                req = {
+                    "name": name,
+                    "role": role,
+                    "target_table": target_of(row),
+                    "formula": formula,
+                    "fields": _handoff_fields(formula, resolve, calc_lookup),
+                    "fallback_reason": row.get("reason"),
+                    "has_suggestion": has_suggestion,
+                }
+                sugg = row.get("assisted_suggestion")
+                if sugg:
+                    req["suggestion"] = sugg
+                requests.append(req)
+                needs_review.append({"name": name, "role": role,
+                                     "fallback_reason": row.get("reason"),
+                                     "has_suggestion": has_suggestion})
+
+    _consume(measure_report, "measure", lambda r: "_Measures")
+    _consume(calc_column_report, "dimension", lambda r: r.get("table"))
+
+    total = sum(buckets.values())
+    live = buckets["translated"] + buckets["assisted_approved"]
+    summary = {
+        "total": total,
+        "live": live,
+        "needs_review": buckets["assisted_suggested"] + buckets["stub"],
+        "translated": buckets["translated"],
+        "assisted_approved": buckets["assisted_approved"],
+        "assisted_suggested": buckets["assisted_suggested"],
+        "stub": buckets["stub"],
+        "coverage_pct": _coverage_pct(live, total),
+    }
+    return {"summary": summary, "needs_review": needs_review, "requests": requests}
+
+
+def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
+                          relationships=None,
                           hierarchies=None, display_folders=None, rls_roles=None,
                           date_table=True, mark_as_date=True, flatfile_path=None,
                           calc_lookup=None, approved_calc_dax=None, date_range=None):
@@ -576,6 +811,12 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
     storage-mode policy says this datasource must use the land-to-Delta fallback instead.
+
+    ``calcs`` are the MEASURE-role calculated fields (rendered into ``_Measures``); ``dim_calcs``
+    are the DIMENSION/row-level calculated fields, translated via column mode into DAX calculated
+    columns on their resolved home table (see ``_calc_columns_part``). Both default to ``None``;
+    with no ``dim_calcs`` the table parts are byte-for-byte unchanged and the additive
+    ``calc_columns`` / ``calc_column_coverage`` report keys are simply empty.
 
     The optional ``hierarchies`` / ``display_folders`` / ``rls_roles`` arguments carry
     RESOLVED model objects (see ``tmdl_generate.resolve_model_objects``):
@@ -625,6 +866,41 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
 
     resolve = build_m_field_resolver(descriptor)
 
+    # Build the shared Date dimension FIRST: its active-relationship map lets a date-attribute
+    # dimension calc (e.g. YEAR([Order Date])) bind to a Date-table column via RELATED instead of
+    # recomputing it inline (see _calc_columns_part). It is emitted before _Measures so the final
+    # table order stays [data tables..., Date, _Measures] exactly as before.
+    all_rels = list(relationships if relationships is not None
+                    else (descriptor.get("relationships") or []))
+    date_report = {"generated": False, "reason": "date_table disabled"}
+    date_name = None
+    active_date_cols = set()
+    if date_table:
+        date_name, date_part, date_rels, date_report = _build_date_dimension(
+            tables, table_names, all_rels, mark_as_date=mark_as_date, mode=mode,
+            date_range=date_range)
+        if date_part is not None:
+            parts[f"definition/tables/{date_name}.tmdl"] = date_part
+            table_names.append(date_name)
+            all_rels = all_rels + date_rels
+            active_date_cols = {(r["from_table"], r["from_col"])
+                                for r in date_rels if r.get("is_active")}
+        else:
+            date_name = None
+
+    # Row-level (dimension) calcs become DAX calculated columns via column mode, injected onto
+    # their resolved home table (constants / honest stubs default to the first data table). This
+    # is additive: with no dim_calcs the table parts are byte-for-byte unchanged. A date-attribute
+    # calc over the ACTIVE date binds to the Date dimension instead (RELATED). Measures are handled
+    # separately below; a calc is only ever sent through one mode (no cross-mode retry).
+    calc_columns_by_table, calc_column_report = _calc_columns_part(
+        dim_calcs, resolve, anchor_table=table_names[0],
+        date_table=date_name, active_date_cols=active_date_cols)
+    for disp, block in calc_columns_by_table.items():
+        path = f"definition/tables/{disp}.tmdl"
+        if path in parts:
+            parts[path] = T.enrich_table_tmdl(parts[path], calc_columns=block)
+
     # Tableau parameters are NOT translated: a calc that references `[Parameters].[X]` (a field
     # swap, value/what-if, or filter parameter) has no deterministic Power BI equivalent, so it
     # flows through normal translation and lands as a preserved `= 0` stub -- its original Tableau
@@ -640,18 +916,6 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
     expr = emit_connection_parameters(descriptor)
     if expr.strip():
         parts["definition/expressions.tmdl"] = expr
-
-    all_rels = list(relationships if relationships is not None
-                    else (descriptor.get("relationships") or []))
-    date_report = {"generated": False, "reason": "date_table disabled"}
-    if date_table:
-        date_name, date_part, date_rels, date_report = _build_date_dimension(
-            tables, table_names, all_rels, mark_as_date=mark_as_date, mode=mode,
-            date_range=date_range)
-        if date_part is not None:
-            parts[f"definition/tables/{date_name}.tmdl"] = date_part
-            table_names.insert(table_names.index("_Measures"), date_name)
-            all_rels = all_rels + date_rels
 
     rels_tmdl = T.generate_relationships_tmdl(all_rels)
     if rels_tmdl:
@@ -673,7 +937,12 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, relationships=N
         "skipped_tables": skipped,
         "measures": measure_report,
         "calc_coverage": calc_coverage_artifact(measure_report),
+        "calc_columns": calc_column_report,
+        "calc_column_coverage": calc_column_coverage_artifact(calc_column_report),
         "assisted_suggestions": assisted_suggestions,
+        "translation_handoff": translation_handoff_artifact(
+            measure_report, calc_column_report, resolve,
+            calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs)),
         "relationships": relationships or [],
         "relationship_confidence": relationship_confidence_manifest(descriptor, relationships or []),
         "date_table": date_report,
@@ -830,11 +1099,16 @@ def write_local_pbip(parts, dest_dir, *, model_name, report_name=None, report_pa
     return pbip_path
 
 
-def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relationships=None,
+def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs=None,
+                                  relationships=None,
                                   hierarchies=None, display_folders=None, rls_roles=None,
                                   date_table=True, mark_as_date=True, flatfile_path=None,
                                   approved_calc_dax=None, date_range=None, select=None):
     """One-call convenience: parse ``.tds``/``.twb`` text and assemble the Import/DirectQuery model.
+
+    ``calcs`` are the MEASURE-role calculated fields and ``dim_calcs`` the DIMENSION/row-level ones
+    (translated via column mode into DAX calculated columns); both pass straight through to
+    ``assemble_import_model`` and default to ``None`` so existing callers are byte-for-byte unchanged.
 
     Model objects (hierarchies, display folders, RLS roles) are AUTO-DERIVED from the
     ``.tds`` and resolved against the rebuilt model, then emitted as TMDL. A caller can
@@ -877,7 +1151,7 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, relations
         rls_roles = resolved["roles"]
         enrichment_report = resolved["report"]
     result = assemble_import_model(descriptor, model_name=model_name,
-                                   calcs=calcs, relationships=relationships,
+                                   calcs=calcs, dim_calcs=dim_calcs, relationships=relationships,
                                    hierarchies=hierarchies, display_folders=display_folders,
                                    rls_roles=rls_roles, date_table=date_table,
                                    mark_as_date=mark_as_date, flatfile_path=flatfile_path,
@@ -1023,14 +1297,34 @@ def list_workbook_datasources(source):
     return workbook_datasources(_read_tds_source(source))
 
 
+def _split_calcs_by_role(calcs):
+    """Partition an ``extract_calcs`` list into ``(measure_calcs, dim_calcs)`` by Tableau role.
+
+    Dimension-role calcs are routed to column mode (DAX calculated columns); everything else
+    (measure-role and roleless calcs) stays on the measure path. Roleless calcs default to the
+    measure path -- the historical, safe behavior. Returns two new lists; the input is unchanged.
+    """
+    measure_calcs, dim_calcs = [], []
+    for c in calcs or []:
+        if (c.get("role") or "").strip().lower() == "dimension":
+            dim_calcs.append(c)
+        else:
+            measure_calcs.append(c)
+    return measure_calcs, dim_calcs
+
+
 def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, datasource=None,
-                       calcs=None, approved_calc_dax=None, date_range=None, **kwargs):
+                       calcs=None, dim_calcs=None, approved_calc_dax=None, date_range=None,
+                       **kwargs):
     """**One call** from a downloaded datasource to everything needed to land it in Fabric.
 
     ``source`` may be a path to a ``.tdsx``/``.tds``/``.twbx``/``.twb``, raw bytes, or XML text.
     Calculated fields are **auto-extracted** (pass ``calcs`` to override, or ``calcs=[]`` to emit no
-    measures). Returns ``{"parts", "report", "bind"}`` -- ``bind`` is the credential-free connection
-    target from ``connection_details_for_bind`` -- plus, when ``write_to`` is given, the persisted path:
+    measures). When auto-extracted, calcs are routed by Tableau role: measure-role calcs become
+    measures and dimension-role calcs become DAX calculated columns (``dim_calcs``); pass either
+    explicitly to take control. Returns ``{"parts", "report", "bind"}`` -- ``bind`` is the
+    credential-free connection target from ``connection_details_for_bind`` -- plus, when ``write_to``
+    is given, the persisted path:
 
     * ``as_pbip=False`` (default) writes ``<model_name>.SemanticModel/`` and adds ``"model_dir"``.
     * ``as_pbip=True`` writes an openable ``.pbip`` project and adds ``"pbip"``.
@@ -1063,6 +1357,7 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
             raise AmbiguousDatasourceError(
                 f"workbook has {len(available)} datasources; pass datasource=<caption|name> to "
                 f"choose one. Available: {labels}")
+    auto_extracted = calcs is None
     if calcs is None:
         try:
             calcs = extract_calcs(tds_text, datasource)
@@ -1073,11 +1368,21 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
     decision = select_storage_mode(descriptor)
     if decision.get("mode") is None:
         # Genuinely-undoable shape: return the lakehouse hand-off (no parts) rather than raising.
+        # Pass the FULL (un-split) calc list so the landing plan's inventory stays complete.
         return _fallback_result(descriptor, decision, model_name=model_name, calcs=calcs,
                                 write_to=write_to)
 
+    # Strict role->mode routing for the import/DirectQuery path: when calcs were auto-extracted,
+    # split off dimension-role calcs to become DAX calculated COLUMNS (column mode) instead of
+    # being mis-routed through the measure path. An explicit ``calcs=`` keeps full caller control
+    # (no auto-split); pass ``dim_calcs=`` to drive calculated columns directly.
+    if auto_extracted and calcs:
+        calcs, extracted_dims = _split_calcs_by_role(calcs)
+        if dim_calcs is None:
+            dim_calcs = extracted_dims
+
     result = migrate_tds_to_semantic_model(
-        tds_text, model_name=model_name, calcs=calcs, select=datasource,
+        tds_text, model_name=model_name, calcs=calcs, dim_calcs=dim_calcs, select=datasource,
         approved_calc_dax=approved_calc_dax, date_range=date_range, **kwargs)
     try:
         result["bind"] = connection_details_for_bind(descriptor)

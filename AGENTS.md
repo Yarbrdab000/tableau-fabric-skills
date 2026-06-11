@@ -77,11 +77,17 @@ This collection attests (in [`CLEANROOM.md`](CLEANROOM.md)) that its code — es
 calc-to-DAX translator and the connector mapping — is original work. Two external references are
 governed by **opposite** rules:
 
-- **`cyphou/Tableau-To-PowerBI` is reference-only — copy nothing**, regardless of its MIT
-  license (we deliberately decline the copy permission to keep the attestation intact). You may
-  learn *which* Tableau constructs and connectors have Power BI equivalents (facts), but never
-  copy its source, functions, regexes, lookup/mapping tables, fixtures, or arrangement. Run the
-  CLEANROOM integrator similarity review before committing any translator or connector change.
+- **`cyphou/Tableau-To-PowerBI` is reference-only — copy no expression**, regardless of its MIT
+  license (we deliberately decline the copy permission to keep the attestation intact). Consistent
+  with [`CLEANROOM.md`](CLEANROOM.md) and the idea/expression dichotomy (17 U.S.C. § 102(b)), you
+  may study its **unprotectable facts and general method** — *which* Tableau constructs/connectors
+  have Power BI equivalents **and the conceptual approach** to a given translation — then
+  **independently author our own** faithful, type-checked, tested version. Treat every mapping as a
+  hypothesis to validate against DAX semantics + our tests, and note provenance in a comment where
+  a specific idiom was informed by it. Never copy its source, functions, regexes, lookup/mapping
+  tables, comments, fixtures, or arrangement — no paste, transliteration, or structure/naming
+  mirroring. Run the CLEANROOM integrator similarity review before committing any translator or
+  connector change.
 - **`microsoft/skills-for-fabric` is the packaging/convention model:** mirror its **structure
   and formats** (frontmatter shape, `resources/` layout, manifest/marketplace layout, these
   convention files), but author your own prose. Retain the MIT notice on any file ever copied

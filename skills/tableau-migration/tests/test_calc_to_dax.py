@@ -16,6 +16,7 @@ from calc_to_dax import (
     translate_tableau_calc_to_dax,
     translate_tableau_calc_to_column_dax,
     validate_dax,
+    date_attribute_binding,
 )
 
 # Shared resolver: caption -> (table_display_name, clean_col, tmdl_type).
@@ -112,6 +113,12 @@ TRANSLATIONS = [
      "CALCULATE(SUM('Orders'[Sales]), ALLEXCEPT('Orders', 'Orders'[Region], 'Orders'[Order_Date]))"),
     ("SUM([Sales]) - {FIXED [Region] : SUM([Sales])}",
      "SUM('Orders'[Sales]) - CALCULATE(SUM('Orders'[Sales]), ALLEXCEPT('Orders', 'Orders'[Region]))"),
+    # --- table-scoped LOD (no dimensions): {AGG} == {FIXED : AGG} == "fixed to nothing" ---
+    # The inner aggregate is evaluated across the whole table (whatever the aggregate is, not a
+    # sum), ignoring filter context -> CALCULATE(AGG, ALL('T')).
+    ("{FIXED : SUM([Sales])}", "CALCULATE(SUM('Orders'[Sales]), ALL('Orders'))"),
+    ("{SUM([Sales])}", "CALCULATE(SUM('Orders'[Sales]), ALL('Orders'))"),
+    ("{MAX([Order Date])}", "CALCULATE(MAX('Orders'[Order_Date]), ALL('Orders'))"),
     # --- FIXED LOD: re-aggregated (outer agg over the LOD grain) -> AGGX + SUMMARIZE ---
     ("SUM({FIXED [Region] : SUM([Sales])})",
      "SUMX(SUMMARIZE('Orders', 'Orders'[Region]), CALCULATE(SUM('Orders'[Sales])))"),
@@ -246,8 +253,8 @@ FALLBACKS = [
     # --- FIXED LOD forms that must fall back (not deterministically translatable) ---
     "{INCLUDE [Region] : SUM([Sales])}",          # INCLUDE depends on the view's dimensions
     "{EXCLUDE [Region] : SUM([Sales])}",          # EXCLUDE depends on the view's dimensions
-    "{FIXED : SUM([Sales])}",                     # zero-dimension LOD
     "{FIXED [Region] : [Sales]}",                 # bare row-level inner (not aggregated)
+    "SUM({SUM([Sales])})",                        # re-aggregating a table-scoped LOD has no grain
     "COUNTD({FIXED [Region] : SUM([Sales])})",    # COUNTD cannot re-aggregate an LOD
     "{FIXED [Region], [People Count] : SUM([Sales])}",            # cross-table LOD dimensions
     "AVG({FIXED [Region], [Order Date] : MAX({FIXED [Region] : SUM([Sales])})})",  # nested non-superset
@@ -404,6 +411,11 @@ COLUMN_TRANSLATIONS = [
     ('ENDSWITH([Region], "t")', "EXACT(RIGHT('Orders'[Region], LEN(\"t\")), \"t\")"),
     ('FIND([Region], "a")', "FIND(\"a\", 'Orders'[Region], 1, 0)"),                    # default start 1
     ('FIND([Region], "a", 2)', "FIND(\"a\", 'Orders'[Region], 2, 0)"),
+    ("PROPER([Region])", "PROPER('Orders'[Region])"),                                  # title-case
+    ("ASCII([Region])", "UNICODE('Orders'[Region])"),                                  # code of first char
+    ("CHAR(65)", "UNICHAR(65)"),                                                        # code point -> char
+    ("SPACE(LEN([Region]))", "REPT(\" \", LEN('Orders'[Region]))"),                    # n spaces
+    ("LOG2([Quantity])", "LOG('Orders'[Quantity], 2)"),                                # base-2 log
     # string '+' concatenation propagates null (unlike a bare DAX '&')
     ('[Region] + "!"',
      "IF(ISBLANK('Orders'[Region]) || ISBLANK(\"!\"), BLANK(), 'Orders'[Region] & \"!\")"),
@@ -427,6 +439,9 @@ COLUMN_TRANSLATIONS = [
      "DATE(YEAR('Orders'[Order_Date]), MONTH('Orders'[Order_Date]), DAY('Orders'[Order_Date]))"),  # strips time
     ("MAKEDATE(2024, 1, 15)", "DATE(2024, 1, 15)"),                       # exact, culture-independent
     ("MAKEDATE(YEAR([Order Date]), 1, 1)", "DATE(YEAR('Orders'[Order_Date]), 1, 1)"),  # composes with parts
+    ("QUARTER([Order Date])", "QUARTER('Orders'[Order_Date])"),                          # 1-4
+    ("ISOWEEK([Order Date])", "WEEKNUM('Orders'[Order_Date], 21)"),                      # ISO-8601 week
+    ("ISOWEEKDAY([Order Date])", "WEEKDAY('Orders'[Order_Date], 2)"),                    # Mon=1..Sun=7
     # --- simple CASE on a string dimension: case-SENSITIVE, so EXACT chain (not SWITCH) ---
     ('CASE [Region] WHEN "East" THEN 1 WHEN "West" THEN 2 ELSE 0 END',
      "IF(EXACT('Orders'[Region], \"East\"), 1, IF(EXACT('Orders'[Region], \"West\"), 2, 0))"),
@@ -498,10 +513,34 @@ def test_every_emitted_column_dax_passes_the_guardrail():
 def test_row_level_functions_are_rejected_in_measure_context():
     # The two entry points are distinct: row-level fields/functions translate as a column
     # but must STILL fall back as a measure (the measure-context invariant is preserved).
+    # Each form below references a BARE row-level field, which is invalid in a measure.
     for formula in ("UPPER([Region])", "LEFT([Region], 3)", '[Region] + "!"',
-                    "YEAR([Order Date])", "MAKEDATE(2024, 1, 15)"):
+                    "YEAR([Order Date])", "MAKEDATE(YEAR([Order Date]), 1, 1)"):
         assert _tx(formula) is None
         assert _col(formula) is not None
+
+
+def test_scalar_functions_over_non_row_operands_translate_in_measure_context():
+    # Scalar date/string/cast functions are valid in a measure as long as every leaf operand is
+    # itself measure-valid (an aggregate, a literal, a parameter, or an LOD) rather than a bare
+    # row-level field. They are no longer gated to column mode.
+    assert _tx("MAKEDATE(2024, 1, 15)") == "DATE(2024, 1, 15)"
+    assert _tx("TODAY()") == "TODAY()"
+    assert _tx("YEAR(MAX([Order Date]))") == "YEAR(MAX('Orders'[Order_Date]))"
+    assert _tx("DATETRUNC('month', MAX([Order Date]))") == \
+        "DATE(YEAR(MAX('Orders'[Order_Date])), MONTH(MAX('Orders'[Order_Date])), 1)"
+    assert _tx("DATEADD('month', 1, MAX([Order Date]))") == \
+        "(EDATE(MAX('Orders'[Order_Date]), 1) + MOD(MAX('Orders'[Order_Date]), 1))"
+    # A table-scoped LOD is measure-valid too, so DATEDIFF over one translates end-to-end.
+    assert _tx("DATEDIFF('day', {MAX([Order Date])}, TODAY())") == \
+        "DATEDIFF(CALCULATE(MAX('Orders'[Order_Date]), ALL('Orders')), TODAY(), DAY)"
+    # Phase B breadth functions are measure-valid over aggregate/constant operands.
+    assert _tx("QUARTER(MAX([Order Date]))") == "QUARTER(MAX('Orders'[Order_Date]))"
+    assert _tx("ISOWEEK(MAX([Order Date]))") == "WEEKNUM(MAX('Orders'[Order_Date]), 21)"
+    assert _tx("ISOWEEKDAY(MAX([Order Date]))") == "WEEKDAY(MAX('Orders'[Order_Date]), 2)"
+    assert _tx("LOG2(SUM([Sales]))") == "LOG(SUM('Orders'[Sales]), 2)"
+    assert _tx("SPACE(3)") == 'REPT(" ", 3)'
+    assert _tx("CHAR(65)") == "UNICHAR(65)"
 
 
 def test_aggregations_are_rejected_in_column_context():
@@ -523,6 +562,52 @@ def test_column_with_no_field_has_empty_tables_used():
     assert dax == "TODAY()"
     assert reason == "ok"
     assert tables == set()  # no field refs -> bindable anywhere
+
+
+# ---------------------------------------------------------------------------
+# date_attribute_binding: the read-only recognizer for "calendar attribute of a single date
+# field" calcs that the orchestrator can bind to the generated Date dimension. Strict by design.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("formula,expected", [
+    # numeric extractors -- Tableau returns the NUMBER, so MONTH/QUARTER map to the numeric
+    # helper columns ([Month No]/[Quarter No]), never the display text ([Month]/[Quarter]).
+    ("YEAR([Order Date])", ("Order Date", "Year")),
+    ("QUARTER([Order Date])", ("Order Date", "Quarter No")),
+    ("MONTH([Order Date])", ("Order Date", "Month No")),
+    ("DAY([Order Date])", ("Order Date", "Day")),
+    ("ISOWEEK([Order Date])", ("Order Date", "Week of Year")),
+    ("ISOWEEKDAY([Order Date])", ("Order Date", "Weekday No")),
+    ("ISOYEAR([Order Date])", ("Order Date", "ISO Year")),
+    # DATEPART numeric parts + DATENAME('weekday') (the full day name).
+    ("DATEPART('year', [Order Date])", ("Order Date", "Year")),
+    ("DATEPART('quarter', [Order Date])", ("Order Date", "Quarter No")),
+    ("DATEPART('month', [Order Date])", ("Order Date", "Month No")),
+    ("DATEPART('day', [Order Date])", ("Order Date", "Day")),
+    ("DATENAME('weekday', [Order Date])", ("Order Date", "Day Name")),
+])
+def test_date_attribute_binding_recognizes_single_field_attributes(formula, expected):
+    assert date_attribute_binding(formula) == expected
+
+
+@pytest.mark.parametrize("formula", [
+    "YEAR([Order Date]) + 1",                 # not a bare attribute -- compound expression
+    "YEAR(DATEADD('year', 1, [Order Date]))",  # nested -- the argument is not a bare field
+    "DATEPART('weekday', [Order Date])",      # start-of-week dependent -> not a faithful bind
+    "DATEPART('week', [Order Date])",         # start-of-week dependent
+    "DATEPART('weekday', [Order Date], 'monday')",  # explicit start-of-week arg
+    "DATENAME('month', [Order Date])",        # full month name != the abbreviated [Month] column
+    "YEAR([Parameters].[Anchor])",            # qualified/parameter field, not a table date column
+    "MONTH('2024-01-15')",                    # not a field reference
+    "WEEK([Order Date])",                      # not in the binding map
+    "DATETRUNC('month', [Order Date])",       # truncation, not an attribute
+])
+def test_date_attribute_binding_rejects_non_attribute_shapes(formula):
+    assert date_attribute_binding(formula) is None
+
+
+def test_date_attribute_binding_is_tolerant_of_garbage():
+    assert date_attribute_binding("YEAR([unterminated") is None
+    assert date_attribute_binding("") is None
 
 
 # ---------------------------------------------------------------------------

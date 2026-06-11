@@ -7,6 +7,8 @@ quoting, and relationship inference / cardinality direction.
 import pytest
 
 from tmdl_generate import (
+    enrich_table_tmdl,
+    generate_calc_column_tmdl,
     generate_measure_tmdl,
     generate_relationships_tmdl,
     infer_relationships,
@@ -135,3 +137,82 @@ def test_generate_relationships_tmdl_emits_columns():
 
 def test_generate_relationships_tmdl_none_when_empty():
     assert generate_relationships_tmdl([]) is None
+
+
+# -- calculated-column rendering contract (column-mode / dimension calcs) ------
+def test_translated_calc_column_carries_dax_and_annotations():
+    c = generate_calc_column_tmdl(
+        "Category Label",
+        '[Category] + " (cat)"',
+        "'Orders'[Category] & \" (cat)\"",
+        tmdl_type="string",
+    )
+    assert "column 'Category Label' = 'Orders'[Category] & \" (cat)\"" in c
+    assert "dataType: string" in c
+    assert 'annotation TableauFormula = [Category] + " (cat)"' in c
+    assert "annotation TranslatedBy = deterministic" in c
+    assert "summarizeBy: none" in c
+
+
+def test_stub_calc_column_is_inert_blank_and_preserves_formula():
+    # an untranslated dimension calc stays a type-neutral BLANK() stub (never `= 0`),
+    # but always preserves the original formula and never claims it was translated.
+    c = generate_calc_column_tmdl("Weird", "SPLIT([x], '-', 2)", None)
+    assert "= BLANK()" in c
+    assert "annotation TableauFormula = SPLIT([x], '-', 2)" in c
+    assert "annotation TranslatedBy" not in c
+
+
+def test_stub_calc_column_can_carry_review_only_suggestion():
+    c = generate_calc_column_tmdl(
+        "Weird", "SPLIT([x], '-', 2)", None,
+        suggestion={"dax": "PATHITEM(...)", "pattern": "SPLIT"},
+    )
+    assert "= BLANK()" in c
+    assert "annotation TranslationSuggestion = PATHITEM(...)" in c
+    assert "annotation TranslationSuggestionPattern = SPLIT" in c
+    assert "annotation TranslatedBy" not in c   # a suggestion is not a live translation
+
+
+def test_assisted_calc_column_name_with_bang_prefix_is_quoted():
+    # the assisted compiler names fields with a leading '!'; TMDL must quote such names
+    # and DAX references to them are quoted the same way.
+    assert q("!Lowest selling city") == "'!Lowest selling city'"
+    c = generate_calc_column_tmdl(
+        "!Lowest selling city", "...", "'Orders'[City]",
+        translated_by="assisted-unverified",
+    )
+    assert "column '!Lowest selling city' = 'Orders'[City]" in c
+    assert "annotation TranslatedBy = assisted-unverified" in c
+
+
+# -- enrich_table_tmdl: calc-column injection ---------------------------------
+_SAMPLE_TABLE = (
+    "table Orders\n"
+    "\tlineageTag: abc\n"
+    "\n\tcolumn Sales\n\t\tdataType: double\n\n"
+    "\tpartition orders = entity\n"
+    "\t\tmode: directLake\n"
+)
+
+
+def test_enrich_table_injects_calc_column_before_partition():
+    calc = generate_calc_column_tmdl("Category Label", '[Category]+" x"', "'Orders'[Category]")
+    out = enrich_table_tmdl(_SAMPLE_TABLE, calc_columns=calc)
+    assert "column 'Category Label' =" in out
+    # injected after the existing data columns but before the partition declaration.
+    assert out.index("column 'Category Label'") < out.index("\tpartition orders")
+    assert out.index("column Sales") < out.index("column 'Category Label'")
+
+
+def test_enrich_table_unchanged_without_calc_columns():
+    assert enrich_table_tmdl(_SAMPLE_TABLE) == _SAMPLE_TABLE
+    assert enrich_table_tmdl(_SAMPLE_TABLE, calc_columns="") == _SAMPLE_TABLE
+
+
+def test_inject_calc_columns_appends_when_no_partition():
+    base = "table T\n\tcolumn A\n"
+    calc = generate_calc_column_tmdl("C", "[A]", "'T'[A]")
+    out = enrich_table_tmdl(base, calc_columns=calc)
+    assert out.startswith(base)
+    assert "column C =" in out

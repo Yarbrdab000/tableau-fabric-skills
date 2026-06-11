@@ -33,8 +33,12 @@ Translates a SAFE subset of Tableau calculated fields into working DAX measures:
     with SUM->SUMX, AVG->AVERAGEX, MIN->MINX, MAX->MAXX, MEDIAN->MEDIANX, COUNT->COUNTAX.
     Nested FIXED LODs translate only when each inner FIXED's dimension set is a SUPERSET of
     the enclosing FIXED's dimensions (otherwise the context-transition emit could silently
-    compute the wrong number, so it falls back). INCLUDE/EXCLUDE, zero-dimension (grand-total)
-    LODs, COUNTD over an LOD, and a bare LOD not wrapped in an outer aggregation all fall back.
+    compute the wrong number, so it falls back).
+  * Table-scoped LODs with no dimensions -- {AGG(...)}, equivalently {FIXED : AGG(...)} -- which
+    evaluate the inner aggregate across the ENTIRE source table (whatever the aggregate is: MAX,
+    MIN, AVG, SUM, ...), ignoring filter/row context. Emitted as CALCULATE(inner, ALL('T')).
+    INCLUDE/EXCLUDE LODs, COUNTD over an LOD, re-aggregating a table-scoped LOD, and a dimensioned
+    bare LOD not wrapped in an outer aggregation all fall back.
 
 MEASURE-CONTEXT INVARIANT: the default entry point (translate_tableau_calc_to_dax) emits a
 DAX *measure*, so every leaf operand must be an aggregation or a literal. A bare row-level field
@@ -136,7 +140,7 @@ _MATH_1 = {
 }
 _MATH_1_SIG = {"CEILING": "1", "FLOOR": "1"}
 _MATH_2 = {"POWER": "POWER", "DIV": "QUOTIENT", "MOD": "MOD"}
-_SCALAR_MATH = _MATH_1 | set(_MATH_1_SIG) | set(_MATH_2) | {"ROUND", "LOG", "SQUARE", "PI"}
+_SCALAR_MATH = _MATH_1 | set(_MATH_1_SIG) | set(_MATH_2) | {"ROUND", "LOG", "LOG2", "SQUARE", "PI"}
 
 # ---------------------------------------------------------------------------
 # Row-level (calculated-COLUMN) context. The functions below are NOT valid in a
@@ -157,13 +161,20 @@ _DTYPE_BY_TMDL = {
 _STRING_FNS = {
     "LEN", "UPPER", "LOWER", "LEFT", "RIGHT", "MID",
     "REPLACE", "CONTAINS", "STARTSWITH", "ENDSWITH", "FIND",
+    "SPACE", "PROPER", "ASCII", "CHAR",
 }
 _DATE_FNS = {
-    "YEAR", "MONTH", "DAY", "TODAY", "NOW",
+    "YEAR", "MONTH", "DAY", "TODAY", "NOW", "QUARTER",
     "DATEPART", "DATEADD", "DATEDIFF", "DATETRUNC", "DATE", "MAKEDATE",
+    "ISOWEEK", "ISOWEEKDAY",
 }
 _CAST_FNS = {"INT", "FLOAT"}
-_COLUMN_ONLY_FNS = _STRING_FNS | _DATE_FNS | _CAST_FNS
+# Scalar ROW-LEVEL functions (string / date / numeric-cast). Available in BOTH measure and column
+# mode: in a measure the argument must itself be measure-valid (an aggregate, an LOD result, a
+# constant, or a parameter) -- a bare row-level [field] argument still raises via the row-field
+# guard, so a genuine row-level use in a measure correctly falls back. This lets scalar-date/-string
+# MEASURES translate, e.g. DATEADD('day', 7, MAX([Order Date])), YEAR(MAX([Order Date])), TODAY().
+_ROW_LEVEL_FNS = _STRING_FNS | _DATE_FNS | _CAST_FNS
 # DATEPART(part, d) -> scalar DAX extractor. 'week'/'weekday' omitted on purpose:
 # their result depends on the workbook's start-of-week, so they fall back.
 _DATEPART_FN = {
@@ -586,7 +597,7 @@ class _Parser:
                 return self._isnull()
             if u in _SCALAR_MATH:
                 return self._scalar_fn(u)
-            if self.mode == "column" and u in _COLUMN_ONLY_FNS:
+            if u in _ROW_LEVEL_FNS:
                 return self._row_fn(u)
             raise _CalcError(f"unsupported function {v}")
         if k == "field":
@@ -678,6 +689,10 @@ class _Parser:
                 return (f"LOG({x[0]}, {base[0]})", "number")
             self._expect_op(")")
             return (f"LOG({x[0]})", "number")
+        if name == "LOG2":
+            # Tableau LOG2(x) is the base-2 logarithm -> DAX LOG(x, 2).
+            self._expect_op(")")
+            return (f"LOG({x[0]}, 2)", "number")
         # Two-operand numeric functions: POWER(x, n) and DIV(a, b) -> QUOTIENT(a, b).
         self._expect_op(",")
         second = self._expect_number(self._expr())
@@ -938,6 +953,17 @@ class _Parser:
     def _string_fn(self, name):
         self._next()  # function name
         self._expect_op("(")
+        if name == "SPACE":
+            # Tableau SPACE(n) = n spaces -> DAX REPT(" ", n) (its operand is numeric, not text).
+            n = self._expect_number(self._expr())
+            self._expect_op(")")
+            return ('REPT(" ", ' + n[0] + ")", "text")
+        if name == "CHAR":
+            # Tableau CHAR(n) returns the character for code point n -> DAX UNICHAR(n) (matches
+            # over the ASCII range Tableau's CHAR covers; operand is numeric).
+            n = self._expect_number(self._expr())
+            self._expect_op(")")
+            return (f"UNICHAR({n[0]})", "text")
         s = self._expect_text(self._expr())
         if name == "LEN":
             self._expect_op(")")
@@ -945,6 +971,15 @@ class _Parser:
         if name in ("UPPER", "LOWER"):
             self._expect_op(")")
             return (f"{name}({s[0]})", "text")
+        if name == "PROPER":
+            # Title-case each word; DAX PROPER matches Tableau PROPER exactly.
+            self._expect_op(")")
+            return (f"PROPER({s[0]})", "text")
+        if name == "ASCII":
+            # Tableau ASCII(s) = code of the first character -> DAX UNICODE(s) (identical over the
+            # ASCII range; UNICODE returns the code point of the first char).
+            self._expect_op(")")
+            return (f"UNICODE({s[0]})", "number")
         if name in ("LEFT", "RIGHT"):
             self._expect_op(",")
             n = self._expect_number(self._expr())
@@ -1019,10 +1054,23 @@ class _Parser:
         if name in ("TODAY", "NOW"):
             self._expect_op(")")
             return (f"{name}()", "date")
-        if name in ("YEAR", "MONTH", "DAY"):
+        if name in ("YEAR", "MONTH", "DAY", "QUARTER"):
             d = self._expect_date(self._expr())
             self._expect_op(")")
             return (f"{name}({d[0]})", "number")
+        if name == "ISOWEEK":
+            # ISO-8601 week number -> DAX WEEKNUM(d, 21) (return-type 21 = ISO, Monday-start).
+            d = self._expect_date(self._expr())
+            self._expect_op(")")
+            return (f"WEEKNUM({d[0]}, 21)", "number")
+        if name == "ISOWEEKDAY":
+            # ISO weekday (Monday=1 .. Sunday=7) -> DAX WEEKDAY(d, 2).
+            d = self._expect_date(self._expr())
+            self._expect_op(")")
+            return (f"WEEKDAY({d[0]}, 2)", "number")
+        # MAKETIME / MAKEDATETIME deliberately fall back: DAX TIME uses a different epoch date than
+        # Tableau's, and MAKEDATETIME's argument forms vary across Tableau versions -- neither is
+        # provably faithful here, so they route to the Tier-1 handoff instead of emitting risky DAX.
         if name == "DATE":
             # Tableau DATE(x) casts to a date and strips any time-of-day component.
             x = self._expect_date(self._expr())
@@ -1114,55 +1162,79 @@ class _Parser:
         raise _CalcError(f"unsupported DATETRUNC part {part!r}")
 
     def _lod_core(self):
-        # Parse a {FIXED d1, d2, ... : inner} body. Returns (table, [clean_cols], inner_node).
-        # Only FIXED is datasource-level and deterministically translatable. INCLUDE/EXCLUDE
-        # depend on the view's dimensionality (a worksheet artifact, not in the .tds) -> fall back.
-        # Enforces the nested-superset rule: a nested FIXED must fix at least every dimension of
-        # the LOD enclosing it; otherwise the emitted context transition could compute a value
-        # Tableau never would, so we fall back instead of emitting a confidently-wrong measure.
+        # Parse a FIXED LOD body. Returns (table, [clean_cols], inner_node). Accepted shapes:
+        #   {FIXED d1, d2, ... : inner}  -- dimensioned (>=1 [field] dimension)
+        #   {FIXED : inner}              -- table-scoped (explicit empty dimension list)
+        #   {inner}                      -- table-scoped shorthand: no keyword == "FIXED to nothing"
+        # A table-scoped LOD (no dimensions) evaluates the inner aggregate across the ENTIRE
+        # table -- whatever that aggregate is (MAX, MIN, AVG, SUM, ...), not necessarily a sum --
+        # ignoring filter/row context, so it emits
+        # CALCULATE(inner, ALL('T')) instead of ALLEXCEPT. Only FIXED is datasource-level and
+        # deterministically translatable; INCLUDE/EXCLUDE depend on the view's dimensionality (a
+        # worksheet artifact, not in the .tds) -> fall back. Enforces the nested-superset rule: a
+        # nested FIXED must fix at least every dimension of the LOD enclosing it; otherwise the
+        # emitted context transition could compute a value Tableau never would, so we fall back.
         self._expect_op("{")
-        if not self._is_kw("FIXED"):
+        if self._is_kw("INCLUDE") or self._is_kw("EXCLUDE"):
             raise _CalcError("only FIXED LOD is translated (INCLUDE/EXCLUDE fall back)")
-        self._next()  # FIXED
         cols = []
         table = None
-        while True:
-            k, v = self._peek()
-            if k == "qfield":
-                self._qualified_ref(v)  # specific "(unmodeled)" reason instead of the generic one
-            if k != "field":
-                raise _CalcError("FIXED LOD requires at least one [dimension]")
-            self._next()
-            resolved = self.resolver(v)
-            if resolved is None:
-                raise _CalcError(f"unresolved/ambiguous LOD dimension [{v}]")
-            t, c, _ty = resolved
-            if table is None:
-                table = t
-            elif t != table:
-                raise _CalcError("cross-table FIXED LOD dimensions not supported")
-            self.tables_used.add(t)
-            cols.append(c)
-            if self._peek() == ("op", ","):
-                self._next()
-                continue
-            break
-        self._expect_op(":")
+        if self._is_kw("FIXED"):
+            self._next()  # FIXED
+            if self._peek() != ("op", ":"):  # {FIXED : inner} is the explicit table-scoped form
+                while True:
+                    k, v = self._peek()
+                    if k == "qfield":
+                        self._qualified_ref(v)  # specific "(unmodeled)" reason instead of the generic one
+                    if k != "field":
+                        raise _CalcError("FIXED LOD requires at least one [dimension]")
+                    self._next()
+                    resolved = self.resolver(v)
+                    if resolved is None:
+                        raise _CalcError(f"unresolved/ambiguous LOD dimension [{v}]")
+                    t, c, _ty = resolved
+                    if table is None:
+                        table = t
+                    elif t != table:
+                        raise _CalcError("cross-table FIXED LOD dimensions not supported")
+                    self.tables_used.add(t)
+                    cols.append(c)
+                    if self._peek() == ("op", ","):
+                        self._next()
+                        continue
+                    break
+            self._expect_op(":")
+        # else: {inner} shorthand -- no FIXED/INCLUDE/EXCLUDE keyword == fixed to nothing (table-scoped)
         dim_set = frozenset(cols)
         if self._lod_dim_stack and not (dim_set >= self._lod_dim_stack[-1]):
             raise _CalcError("nested FIXED LOD does not fix a superset of the enclosing LOD")
+        before = frozenset(self.tables_used)
         self._lod_dim_stack.append(dim_set)
         inner = self._expr()
         self._lod_dim_stack.pop()
         self._expect_op("}")
+        if table is None:
+            # table-scoped LOD (no dimensions): derive the single source table from the inner
+            # aggregate's field references. A constant or cross-table inner has no single table
+            # to scope ALL() over, so it falls back.
+            new_tables = self.tables_used - before
+            if len(new_tables) == 1:
+                table = next(iter(new_tables))
+            elif len(self.tables_used) == 1:
+                table = next(iter(self.tables_used))
+            else:
+                raise _CalcError("table-scoped LOD must reference exactly one table")
         return table, cols, inner
 
     def _lod_cols_dax(self, table, cols):
         return ", ".join(_dax_table(table) + _dax_col(c) for c in cols)
 
     def _fixed_lod_bare(self):
-        # {FIXED d : AGG(...)}  ->  CALCULATE(AGG(...), ALLEXCEPT('T', 'T'[d], ...))
+        # {FIXED d : AGG(...)}        -> CALCULATE(AGG(...), ALLEXCEPT('T', 'T'[d], ...))
+        # {AGG(...)} / {FIXED : AGG(...)} (table-scoped, no dims) -> CALCULATE(AGG(...), ALL('T'))
         table, cols, inner = self._lod_core()
+        if not cols:
+            return (f"CALCULATE({inner[0]}, ALL({_dax_table(table)}))", inner[1])
         cols_dax = self._lod_cols_dax(table, cols)
         return (f"CALCULATE({inner[0]}, ALLEXCEPT({_dax_table(table)}, {cols_dax}))", inner[1])
 
@@ -1171,6 +1243,11 @@ class _Parser:
         if outer_agg not in _AGG_X:
             raise _CalcError(f"{outer_agg} cannot re-aggregate a FIXED LOD")
         table, cols, inner = self._lod_core()
+        if not cols:
+            # A table-scoped LOD is already a single value evaluated over the whole table;
+            # re-aggregating it has no SUMMARIZE grain to iterate, so fall back rather than emit
+            # a degenerate window.
+            raise _CalcError("re-aggregating a table-scoped LOD is not supported")
         if outer_agg in ("SUM", "AVG", "MEDIAN") and inner[1] != "number":
             raise _CalcError(f"{outer_agg} over an LOD requires a numeric inner expression")
         if outer_agg in ("MIN", "MAX") and inner[1] not in ("number", "date"):
@@ -1208,6 +1285,104 @@ def validate_dax(text):
     if in_str:
         return "unbalanced string quotes"
     return ""
+
+
+def field_references(formula):
+    """Distinct field references in a Tableau ``formula``, in first-appearance order.
+
+    Each entry is ``{"caption", "qualified", "parts"}``: a bare ``[X]`` is an unqualified caption
+    (``qualified=False``, ``parts=["X"]``); a dotted ``[A].[B]`` chain -- Tableau's shape for
+    parameters (``[Parameters].[X]``), datasource-qualified fields, and blend fields -- keeps its
+    ``parts`` (``qualified=True``) and a display ``caption`` like ``[A].[B]``. This is a read-only
+    helper for the Tier-0 -> Tier-1 handoff (so a second compiler/oracle gets the resolved field
+    list for a calc the deterministic translator could not faithfully render); it emits no DAX.
+    Tolerant: a formula that cannot be tokenized yields ``[]``.
+    """
+    try:
+        toks = _tokenize(formula or "")
+    except _CalcError:
+        return []
+    seen, out = set(), []
+    for kind, val in toks:
+        if kind == "field":
+            key = ("f", val)
+            if key not in seen:
+                seen.add(key)
+                out.append({"caption": val, "qualified": False, "parts": [val]})
+        elif kind == "qfield":
+            key = ("q", tuple(val))
+            if key not in seen:
+                seen.add(key)
+                out.append({"caption": ".".join(f"[{p}]" for p in val),
+                            "qualified": True, "parts": list(val)})
+    return out
+
+
+# Tableau date-attribute functions whose value is a calendar attribute of a single date field,
+# and the matching column on the engine's generated Date dimension (see
+# ``tmdl_generate.generate_date_table_tmdl``). Tableau's numeric extractors return the NUMBER, so
+# MONTH/QUARTER bind to the hidden numeric helper ([Month No]/[Quarter No]), never the display
+# text column ([Month]="Jan" / [Quarter]="Q1"). ISOWEEK is the ISO week-of-year (WEEKNUM ...,21);
+# ISOWEEKDAY is the ISO weekday Mon=1..Sun=7 (WEEKDAY ...,2 = [Weekday No]); ISOYEAR is the ISO
+# week-numbering year ([ISO Year]).
+_DATE_ATTR_COLUMN = {
+    "YEAR": "Year",
+    "QUARTER": "Quarter No",
+    "MONTH": "Month No",
+    "DAY": "Day",
+    "ISOWEEK": "Week of Year",
+    "ISOWEEKDAY": "Weekday No",
+    "ISOYEAR": "ISO Year",
+}
+# DATEPART('<part>', d) numeric parts that map to the same Date-dimension columns. The
+# start-of-week-dependent parts ('week'/'weekday') are deliberately excluded -- their value
+# depends on a culture/first-day-of-week setting, so they are not a faithful 1:1 bind.
+_DATEPART_ATTR_COLUMN = {
+    "year": "Year",
+    "quarter": "Quarter No",
+    "month": "Month No",
+    "day": "Day",
+}
+
+
+def date_attribute_binding(formula):
+    """If ``formula`` is EXACTLY a calendar attribute of a single bare date field, return
+    ``(field_caption, date_column)``; otherwise ``None``.
+
+    Recognized shapes (and nothing more complex)::
+
+        YEAR([f]) QUARTER([f]) MONTH([f]) DAY([f]) ISOWEEK([f]) ISOWEEKDAY([f]) ISOYEAR([f])
+        DATEPART('year'|'quarter'|'month'|'day', [f])
+        DATENAME('weekday', [f])
+
+    ``date_column`` is the matching column on the generated Date dimension. This is a read-only
+    recognizer the orchestrator uses to OPTIONALLY bind such a calc to the shared Date table via
+    ``RELATED('Date'[<date_column>])`` -- but only when ``[f]`` is the ACTIVE date relationship
+    (a role-playing date can't use RELATED safely). It is intentionally strict: a qualified /
+    parameter field, any extra argument (e.g. a start-of-week argument), or anything beyond the
+    bare single-field shapes returns ``None`` so only the unambiguous, culture-independent
+    attributes ever bind. Emits no DAX; a formula that cannot be tokenized yields ``None``.
+    """
+    try:
+        toks = _tokenize(formula or "")
+    except _CalcError:
+        return None
+    # FN ( [field] )
+    if (len(toks) == 4 and toks[0][0] == "id" and toks[1] == ("op", "(")
+            and toks[2][0] == "field" and toks[3] == ("op", ")")):
+        col = _DATE_ATTR_COLUMN.get(toks[0][1].upper())
+        return (toks[2][1], col) if col else None
+    # FN ( 'part' , [field] )
+    if (len(toks) == 6 and toks[0][0] == "id" and toks[1] == ("op", "(")
+            and toks[2][0] == "str" and toks[3] == ("op", ",")
+            and toks[4][0] == "field" and toks[5] == ("op", ")")):
+        fn, part = toks[0][1].upper(), toks[2][1].strip().lower()
+        if fn == "DATEPART":
+            col = _DATEPART_ATTR_COLUMN.get(part)
+            return (toks[4][1], col) if col else None
+        if fn == "DATENAME" and part == "weekday":
+            return (toks[4][1], "Day Name")
+    return None
 
 
 def translate_tableau_calc_to_dax(formula, resolver, param_resolver=None):

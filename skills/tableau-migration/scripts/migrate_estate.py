@@ -332,7 +332,7 @@ def _strip_brackets(name):
 _VIZ_ENTRY_POINTS = ("migrate_workbook", "migrate_twb_to_pbir", "build_pbir", "build_report")
 
 
-def extract_calculations(xml_text):
+def extract_calculations(xml_text, *, include_dimensions=False):
     """Pull measure calculated fields out of ``.tds`` / ``.twb`` XML.
 
     Returns ``(calcs, skipped)`` where ``calcs`` is a list of ``{"name", "formula"}`` ready to
@@ -343,13 +343,21 @@ def extract_calculations(xml_text):
     Only *measure*-role calcs become DAX measures; bins (``class='categorical-bin'``), empty
     formulas, caption-less fields, non-measure (dimension) calcs, and duplicate names are skipped
     and reported. Parsing is namespace-agnostic and tolerant of a leading BOM.
+
+    ``include_dimensions`` (opt-in, default off) changes nothing about the measure path: when set,
+    dimension-role calcs are no longer dropped into ``skipped`` but collected into a third returned
+    list and the return shape becomes ``(calcs, skipped, dim_calcs)`` -- each dim entry is
+    ``{"name", "formula", "role"}``, destined for ``translate_tableau_calc_to_column_dax`` as a DAX
+    calculated column. The default (``include_dimensions=False``) return shape and contents are
+    byte-for-byte unchanged.
     """
     calcs = []
     skipped = []
+    dim_calcs = []
     try:
         root = ET.fromstring((xml_text or "").lstrip("\ufeff"))
     except ET.ParseError:
-        return calcs, skipped
+        return (calcs, skipped, dim_calcs) if include_dimensions else (calcs, skipped)
 
     seen = set()
     for col in (e for e in root.iter() if _local(e.tag) == "column"):
@@ -374,7 +382,14 @@ def extract_calculations(xml_text):
             skipped.append({"name": "", "reason": "calculated field without a caption/name"})
             continue
         if role != "measure":
-            skipped.append({"name": caption, "reason": f"non-measure calculated field (role={role})"})
+            if not include_dimensions:
+                skipped.append({"name": caption, "reason": f"non-measure calculated field (role={role})"})
+                continue
+            if caption in seen:
+                skipped.append({"name": caption, "reason": "duplicate calculated-field name"})
+                continue
+            seen.add(caption)
+            dim_calcs.append({"name": caption, "formula": formula, "role": role})
             continue
         if caption in seen:
             skipped.append({"name": caption, "reason": "duplicate calculated-field name"})
@@ -382,7 +397,7 @@ def extract_calculations(xml_text):
         seen.add(caption)
         calcs.append({"name": caption, "formula": formula})
 
-    return calcs, skipped
+    return (calcs, skipped, dim_calcs) if include_dimensions else (calcs, skipped)
 
 
 # -- orchestration helpers -----------------------------------------------------
@@ -466,9 +481,9 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders):
         return detail
 
     connector = descriptor.get("connection_class") or None
-    calcs, skipped_calcs = extract_calculations(text)
+    calcs, skipped_calcs, dim_calcs = extract_calculations(text, include_dimensions=True)
     decision = select_storage_mode(descriptor)
-    detail.update(connector=connector, skipped_calcs=skipped_calcs)
+    detail.update(connector=connector, skipped_calcs=skipped_calcs, dim_calcs=dim_calcs)
 
     if decision.get("mode") is None:
         detail.update(status="fallback", storage_mode=None, storage_decision=decision,
@@ -494,7 +509,7 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders):
         return detail
 
     try:
-        out = assemble_import_model(descriptor, model_name=name, calcs=calcs)
+        out = assemble_import_model(descriptor, model_name=name, calcs=calcs, dim_calcs=dim_calcs)
     except ValueError as exc:  # storage policy / no-columns -> documented land-to-Delta fallback
         detail.update(status="fallback", storage_mode=None, storage_decision=decision,
                       reason=str(exc),
@@ -521,6 +536,9 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders):
     measures = report.get("measures", [])
     translated = sum(1 for m in measures if m.get("status") == "translated")
     stubbed = sum(1 for m in measures if m.get("status") == "stub")
+    calc_columns = report.get("calc_columns", [])
+    cc_translated = sum(1 for c in calc_columns if c.get("status") == "translated")
+    cc_stubbed = sum(1 for c in calc_columns if c.get("status") == "stub")
     fully = bool(decision.get("fully_supported"))
 
     detail.update(
@@ -537,6 +555,9 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders):
         measures=measures,
         measures_translated=translated,
         measures_stubbed=stubbed,
+        calc_columns=calc_columns,
+        calc_columns_translated=cc_translated,
+        calc_columns_stubbed=cc_stubbed,
         manual_followups=decision.get("manual_followups", []),
     )
     return detail
@@ -643,6 +664,7 @@ def _summarize(ds_details, wb_details, viz_available):
     connectors = set()
     migrated = partial = fallback = error = 0
     tables = columns = measures_total = measures_translated = measures_stubbed = 0
+    calc_columns_total = calc_columns_translated = calc_columns_stubbed = 0
 
     for d in ds_details:
         if d.get("connector"):
@@ -660,6 +682,9 @@ def _summarize(ds_details, wb_details, viz_available):
             measures_total += len(d.get("measures", []))
             measures_translated += d.get("measures_translated", 0)
             measures_stubbed += d.get("measures_stubbed", 0)
+            calc_columns_total += len(d.get("calc_columns", []))
+            calc_columns_translated += d.get("calc_columns_translated", 0)
+            calc_columns_stubbed += d.get("calc_columns_stubbed", 0)
         elif status == "fallback":
             fallback += 1
             modes["fallback"] += 1
@@ -681,6 +706,9 @@ def _summarize(ds_details, wb_details, viz_available):
         "measures_total": measures_total,
         "measures_translated": measures_translated,
         "measures_stubbed": measures_stubbed,
+        "calc_columns_total": calc_columns_total,
+        "calc_columns_translated": calc_columns_translated,
+        "calc_columns_stubbed": calc_columns_stubbed,
         "workbooks_total": len(wb_details),
         "workbooks_viz_built": wb_built,
         "workbooks_viz_warned": wb_warned,
@@ -709,6 +737,9 @@ def _render_summary_md(report):
         f"- **Tables:** {s['tables_translated']} | **Columns:** {s['columns_translated']}",
         f"- **Measures:** {s['measures_total']} total -> "
         f"{s['measures_translated']} translated, {s['measures_stubbed']} stubbed",
+        f"- **Calc columns:** {s.get('calc_columns_total', 0)} total -> "
+        f"{s.get('calc_columns_translated', 0)} translated, "
+        f"{s.get('calc_columns_stubbed', 0)} stubbed",
         f"- **Storage modes:** Import {s['storage_modes']['Import']}, "
         f"DirectQuery {s['storage_modes']['DirectQuery']}, "
         f"fallback {s['storage_modes']['fallback']}",

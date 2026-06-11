@@ -58,6 +58,19 @@ TDS_WITH_CALC = LIVE_SQLSERVER.replace(
 )
 
 
+# A dimension-role calc must route to a DAX calculated COLUMN (column mode), not a measure.
+TDS_WITH_DIM_CALC = LIVE_SQLSERVER.replace(
+    "</datasource>",
+    "  <column caption='Total Sales' datatype='real' name='[Calculation_1]' role='measure' "
+    "type='quantitative'>\n"
+    "    <calculation class='tableau' formula='SUM([Sales])' />\n"
+    "  </column>\n"
+    "  <column caption='Upper Order' datatype='string' name='[Calculation_2]' role='dimension'>\n"
+    "    <calculation class='tableau' formula='UPPER([Order ID])' />\n"
+    "  </column>\n</datasource>",
+)
+
+
 def _all_text(parts):
     return "\n".join(parts.values())
 
@@ -73,6 +86,34 @@ def test_migrate_datasource_auto_extracts_calcs_from_text():
 def test_migrate_datasource_calcs_empty_emits_no_measures():
     out = A.migrate_datasource(TDS_WITH_CALC, model_name="Superstore", calcs=[])
     assert "Total Sales" not in _all_text(out["parts"])
+
+
+def test_migrate_datasource_routes_dimension_calc_to_calc_column():
+    # Auto-extraction splits by role: the measure calc stays a measure, while the dimension calc
+    # becomes a DAX calculated column on its home table -- not a (mis-routed) measure stub.
+    out = A.migrate_datasource(TDS_WITH_DIM_CALC, model_name="Superstore")
+    report = out["report"]
+
+    cols = {c["column"]: c for c in report["calc_columns"]}
+    assert cols["Upper Order"]["table"] == "Orders"
+    assert cols["Upper Order"]["status"] == "translated"
+    assert "UPPER('Orders'[Order_ID])" in cols["Upper Order"]["dax"]
+
+    # The dimension calc is rendered as a column on Orders, and is NOT in the measures list.
+    orders_tmdl = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "column 'Upper Order'" in orders_tmdl
+    measure_names = {m["measure"] for m in report["measures"]}
+    assert "Upper Order" not in measure_names
+    assert "Total Sales" in measure_names  # the measure-role calc still routes to a measure
+
+
+def test_migrate_datasource_explicit_calcs_disables_role_split():
+    # An explicit calcs= keeps full caller control: no auto-split, no calc columns invented.
+    out = A.migrate_datasource(
+        TDS_WITH_DIM_CALC, model_name="Superstore",
+        calcs=[{"name": "Total Sales", "formula": "SUM([Sales])"}])
+    assert out["report"]["calc_columns"] == []
+    assert {m["measure"] for m in out["report"]["measures"]} == {"Total Sales"}
 
 
 def test_migrate_datasource_writes_model_folder(tmp_path):

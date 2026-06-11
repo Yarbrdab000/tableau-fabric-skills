@@ -147,6 +147,50 @@ def generate_measure_tmdl(field_name, formula, dax=None, *, suggestion=None,
     out += "\t\tannotation SummarizationSetBy = Automatic\n"
     return out
 
+def generate_calc_column_tmdl(field_name, formula, dax=None, *, tmdl_type=None,
+                              summarize="none", is_hidden=False, suggestion=None,
+                              translated_by="deterministic"):
+    """One calculated column for a row-level (dimension) calc -- the column-mode peer of
+    ``generate_measure_tmdl``. The block is meant to be spliced onto an existing data table
+    (via ``enrich_table_tmdl(..., calc_columns=...)``), so its DAX must resolve in that table's
+    row context.
+
+    Same annotation contract as the measure renderer: the original Tableau formula is ALWAYS
+    preserved as a ``TableauFormula`` annotation, whether or not a DAX translation was produced.
+    When ``dax`` is provided the column carries that expression and a ``TranslatedBy`` tag;
+    otherwise it stays an inert ``= BLANK()`` stub (type-neutral, unlike a measure's ``= 0``)
+    so an untranslated dimension calc never silently emits wrong values.
+
+    ``translated_by`` tags provenance of a translated column (default ``deterministic``; the
+    orchestrator passes an assisted tag when a human-approved suggestion is flipped live).
+
+    ``suggestion`` is an OPTIONAL assisted-translation suggestion dict (``{"pattern", "dax"}``)
+    attached ONLY to a stub: the column stays inert ``= BLANK()`` but carries
+    ``TranslationSuggestion`` + ``TranslationSuggestionPattern`` annotations for human review.
+    The suggestion is NEVER the live expression until approved.
+
+    ``tmdl_type`` optionally pins the column ``dataType`` (e.g. ``string``/``int64``); when
+    omitted the engine infers it from the expression (matching the Date table's calc columns)."""
+    expr = dax if dax else "BLANK()"
+    out = f"\n\tcolumn {q(field_name)} = {expr}\n"
+    if is_hidden:
+        out += "\t\tisHidden\n"
+    if tmdl_type:
+        out += f"\t\tdataType: {tmdl_type}\n"
+        fmt = _format_string(tmdl_type, summarize)
+        if fmt:
+            out += f"\t\tformatString: {fmt}\n"
+    out += f"\t\tlineageTag: {uuid.uuid4()}\n"
+    out += f"\t\tsummarizeBy: {summarize}\n"
+    out += tmdl_annotation_value("TableauFormula", formula)
+    if dax:
+        out += tmdl_annotation_value("TranslatedBy", translated_by)
+    elif suggestion:
+        out += tmdl_annotation_value("TranslationSuggestion", suggestion.get("dax", ""))
+        out += tmdl_annotation_value("TranslationSuggestionPattern", suggestion.get("pattern", ""))
+    out += "\t\tannotation SummarizationSetBy = Automatic\n"
+    return out
+
 def generate_measures_table_tmdl(measures_tmdl):
     # Canonical measures-holder: a single-row calculated table with one hidden column.
     # The calculated partition (NOT a DirectLake entity) is what made the prior model
@@ -205,10 +249,11 @@ def generate_date_table_tmdl(table_name="Date", *, mark_as_date=True,
     """Render a calculated calendar Date dimension as TMDL.
 
     A CALENDARAUTO() calculated table (full contiguous years) with derived Year / Quarter /
-    Month / Week-of-month / Day calculated columns, an ISO Week-of-Year column, and a single
-    drill ``hierarchy`` Year->Quarter->Month->Week->Day. When ``mark_as_date`` is True the
-    table is marked as a Power BI date table (table ``dataCategory: Time`` + an ``isKey`` date
-    column), enabling time intelligence.
+    Month / Week-of-month / Day calculated columns, an ISO Week-of-Year column, ISO attributes
+    (Weekday No, Day Name, ISO Year), and a single drill ``hierarchy``
+    Year->Quarter->Month->Week->Day. When ``mark_as_date`` is True the table is marked as a
+    Power BI date table (table ``dataCategory: Time`` + an ``isKey`` date column), enabling time
+    intelligence.
 
     ``table_name`` is referenced verbatim (single-quoted) inside the derived-column DAX, so a
     de-duplicated name (e.g. ``"Date Dimension"``) stays self-consistent.
@@ -239,6 +284,12 @@ def generate_date_table_tmdl(table_name="Date", *, mark_as_date=True,
         fmt=_DATE_INT_FMT)
     cols += _date_calc_column("Week of Year", f"WEEKNUM({d}, 21)", fmt=_DATE_INT_FMT)
     cols += _date_calc_column("Day", f"DAY({d})", fmt=_DATE_INT_FMT)
+    # ISO weekday (Mon=1..Sun=7) doubles as the Day Name sort key; ISO Year is the year of the
+    # Thursday in the date's ISO week (d + 4 - ISO weekday). These back the Tableau date-attribute
+    # calcs ISOWEEKDAY / DATENAME('weekday') / ISOYEAR when they bind to the date dimension.
+    cols += _date_calc_column("Weekday No", f"WEEKDAY({d}, 2)", hidden=True, fmt=_DATE_INT_FMT)
+    cols += _date_calc_column("Day Name", f'FORMAT({d}, "dddd")', sort_by="Weekday No")
+    cols += _date_calc_column("ISO Year", f"YEAR({d} + 4 - WEEKDAY({d}, 2))", fmt=_DATE_INT_FMT)
 
     hier = generate_hierarchy_tmdl(hierarchy_name, [
         ("Year", "Year"), ("Quarter", "Quarter"), ("Month", "Month"),
@@ -915,14 +966,32 @@ def _inject_hierarchies(table_tmdl, hierarchies):
     return table_tmdl[:line_start] + block + table_tmdl[line_start:]
 
 
-def enrich_table_tmdl(table_tmdl, *, display_folders=None, hierarchies=None):
+def _inject_calc_columns(table_tmdl, calc_columns):
+    """Splice pre-rendered calculated-column block(s) into an existing ``table`` TMDL string,
+    just before its first ``partition`` declaration (where regular columns live). ``calc_columns``
+    is a single rendered block or an iterable of them (see ``generate_calc_column_tmdl``)."""
+    block = calc_columns if isinstance(calc_columns, str) else "".join(calc_columns)
+    if not block:
+        return table_tmdl
+    idx = table_tmdl.find("\tpartition ")
+    if idx == -1:
+        return table_tmdl + block
+    line_start = table_tmdl.rfind("\n", 0, idx) + 1
+    return table_tmdl[:line_start] + block + table_tmdl[line_start:]
+
+
+def enrich_table_tmdl(table_tmdl, *, display_folders=None, hierarchies=None, calc_columns=None):
     """Enrich an already-rendered ``table`` TMDL string with model objects.
 
-    ``display_folders`` is ``{member_name: folder}`` for columns/measures in this table;
-    ``hierarchies`` is a list of ``{"name", "levels": [(level_name, column)]}``. Both are
-    optional -- with neither supplied the string is returned unchanged, so callers can
-    enrich unconditionally without altering un-enriched output.
+    ``calc_columns`` is a rendered calc-column block (or iterable of them) to splice onto the
+    table; ``display_folders`` is ``{member_name: folder}`` for columns/measures in this table;
+    ``hierarchies`` is a list of ``{"name", "levels": [(level_name, column)]}``. All are
+    optional -- with none supplied the string is returned unchanged, so callers can enrich
+    unconditionally without altering un-enriched output. Calc columns are injected first so a
+    display folder may also land on a calc column.
     """
+    if calc_columns:
+        table_tmdl = _inject_calc_columns(table_tmdl, calc_columns)
     if display_folders:
         table_tmdl = _inject_display_folders(table_tmdl, display_folders)
     if hierarchies:

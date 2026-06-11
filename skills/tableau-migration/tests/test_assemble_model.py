@@ -79,6 +79,69 @@ def test_assemble_measure_report_translates_and_stubs():
     assert "TranslatedBy" in measures              # only the translated one
 
 
+# -- dimension calcs -> DAX calculated columns (column-mode wiring) ------------
+def _dim_calc_model():
+    measure_calcs = [{"name": "Profit Ratio", "formula": "SUM([Sales])/SUM([Quantity])"}]
+    dim_calcs = [
+        {"name": "Sales Flag", "formula": 'IF [Sales]>0 THEN "Y" ELSE "N" END'},
+        {"name": "Order Code", "formula": "UPPER([Order ID])"},
+        {"name": "Avg Sale Col", "formula": "AVG([Sales])"},   # aggregation: not column-legal
+    ]
+    return assemble_import_model(
+        parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+        calcs=measure_calcs, dim_calcs=dim_calcs)
+
+
+def test_dimension_calc_becomes_calculated_column_on_home_table():
+    out = _dim_calc_model()
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    # the SAME formula that only STUBS as a measure translates as a row-level calc column.
+    assert 'column \'Sales Flag\' = IF(\'Orders\'[Sales] > 0, "Y", "N")' in orders
+    assert 'annotation TableauFormula = IF [Sales]>0 THEN "Y" ELSE "N" END' in orders
+    assert "annotation TranslatedBy = deterministic" in orders
+    assert "column 'Order Code' = UPPER('Orders'[Order_ID])" in orders
+
+
+def test_untranslatable_dimension_calc_is_inert_blank_stub():
+    out = _dim_calc_model()
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    # an aggregation is not valid in a row-level column -> honest inert BLANK() stub on the table.
+    assert "column 'Avg Sale Col' = BLANK()" in orders
+    rows = {r["column"]: r for r in out["report"]["calc_columns"]}
+    assert rows["Avg Sale Col"]["status"] == "stub"
+    assert rows["Avg Sale Col"]["dax"] is None
+    assert rows["Avg Sale Col"]["table"] == "Orders"
+
+
+def test_calc_column_report_and_coverage_artifact():
+    out = _dim_calc_model()
+    rows = {r["column"]: r for r in out["report"]["calc_columns"]}
+    assert rows["Sales Flag"]["status"] == "translated"
+    assert rows["Sales Flag"]["table"] == "Orders"
+    assert rows["Order Code"]["status"] == "translated"
+    cov = out["report"]["calc_column_coverage"]["summary"]
+    assert cov["total"] == 3
+    assert cov["translated"] == 2
+    assert cov["stub"] == 1
+    assert cov["deterministic_coverage_pct"] == 66.7
+
+
+def test_dim_calcs_do_not_disturb_measures_or_default_shape():
+    out = _dim_calc_model()
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    assert "measure 'Profit Ratio' = DIVIDE(SUM('Orders'[Sales]), SUM('Orders'[Quantity]))" in measures
+    assert "Sales Flag" not in measures      # a dimension calc never leaks into _Measures
+
+    # with no dim_calcs the report keys are present-but-empty and no calc column is emitted.
+    base = assemble_import_model(
+        parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+        calcs=[{"name": "Profit Ratio", "formula": "SUM([Sales])/SUM([Quantity])"}])
+    assert base["report"]["calc_columns"] == []
+    assert base["report"]["calc_column_coverage"]["summary"]["total"] == 0
+    assert base["report"]["calc_column_coverage"]["summary"]["deterministic_coverage_pct"] is None
+    assert "column 'Sales Flag'" not in base["parts"]["definition/tables/Orders.tmdl"]
+
+
 def test_assemble_excel_collection_multi_table():
     out = migrate_tds_to_semantic_model(EXCEL_COLLECTION, model_name="Superstore")
     parts = out["parts"]

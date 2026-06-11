@@ -219,6 +219,35 @@ def test_extract_calculations_keeps_measures_and_reports_skips():
     assert "Amount Bin" in skipped_reasons  # categorical-bin / no formula
 
 
+def test_extract_calculations_default_shape_unchanged_without_opt_in():
+    # The opt-in must not perturb the default: same 2-tuple, same contents.
+    assert extract_calculations(WIDGET_SALES_TDS) == extract_calculations(
+        WIDGET_SALES_TDS, include_dimensions=False)[:2]
+    calcs, skipped = extract_calculations(WIDGET_SALES_TDS)
+    assert [c["name"] for c in calcs] == ["Total Amount", "Avg Price", "Running Amount"]
+    assert any(s["name"] == "Category Label" for s in skipped)
+
+
+def test_extract_calculations_include_dimensions_surfaces_dim_calcs():
+    calcs, skipped, dim_calcs = extract_calculations(WIDGET_SALES_TDS, include_dimensions=True)
+
+    # Measure path is byte-for-byte identical to the default.
+    assert [c["name"] for c in calcs] == ["Total Amount", "Avg Price", "Running Amount"]
+
+    # The dimension calc is now surfaced (not dropped into skipped) with role + formula.
+    assert [d["name"] for d in dim_calcs] == ["Category Label"]
+    assert dim_calcs[0]["formula"] == '[Category] + " (cat)"'
+    assert dim_calcs[0]["role"] == "dimension"
+    assert not any(s["name"] == "Category Label" for s in skipped)
+
+    # A dimension-role *bin* is still skipped (caught before the role gate), never a calc column.
+    assert any(s["name"] == "Amount Bin" for s in skipped)
+    assert "Amount Bin" not in {d["name"] for d in dim_calcs}
+
+    # Malformed XML still never raises -> empty 3-tuple under the opt-in.
+    assert extract_calculations("<broken", include_dimensions=True) == ([], [], [])
+
+
 def test_extract_calculations_dedupes_and_tolerates_bom_and_garbage():
     dup = ("\ufeff<datasource>"
            "<column caption='M' role='measure'><calculation formula='SUM([X])'/></column>"
@@ -274,6 +303,9 @@ def test_migrate_estate_local_full(fixtures_dir, tmp_path):
     assert s["measures_total"] == 3
     assert s["measures_translated"] == 2   # Total Amount, Avg Price
     assert s["measures_stubbed"] == 1      # Running Amount (table calc)
+    assert s["calc_columns_total"] == 1          # Category Label (dimension calc -> calc column)
+    assert s["calc_columns_translated"] == 1
+    assert s["calc_columns_stubbed"] == 0
     assert s["storage_modes"] == {"Import": 0, "DirectQuery": 1, "fallback": 1}
     assert s["connectors_seen"] == ["saphana", "sqlserver"]
     assert s["workbooks_total"] == 1
@@ -323,10 +355,20 @@ def test_migrated_detail_carries_skipped_calcs_and_measures(fixtures_dir, tmp_pa
     assert detail["table_count"] == 1
     assert detail["column_count"] == 3
     skipped = {s["name"] for s in detail["skipped_calcs"]}
-    assert {"Category Label", "Amount Bin"} <= skipped
+    # The categorical-bin (no formula) is still skipped, but the dimension calc is no longer
+    # dropped: column mode now routes it to a DAX calculated column on its home table.
+    assert "Amount Bin" in skipped
+    assert "Category Label" not in skipped
     by_status = {m["measure"]: m["status"] for m in detail["measures"]}
     assert by_status["Total Amount"] == "translated"
     assert by_status["Running Amount"] == "stub"
+
+    # Dimension calc -> calculated column on the Sales table (the column-mode wiring, A4).
+    calc_cols = {c["column"]: c for c in detail["calc_columns"]}
+    assert calc_cols["Category Label"]["table"] == "Sales"
+    assert calc_cols["Category Label"]["status"] == "translated"
+    assert detail["calc_columns_translated"] == 1
+    assert detail["calc_columns_stubbed"] == 0
 
 
 # -- in-memory fake (the offline double for a live source) --------------------

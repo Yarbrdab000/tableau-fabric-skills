@@ -73,6 +73,13 @@ def test_date_table_tmdl_structure():
     assert "column 'Week of Year' = WEEKNUM('Date'[Date], 21)" in tmdl
     assert "column Day = DAY('Date'[Date])" in tmdl
 
+    # ISO attributes that back ISOWEEKDAY / DATENAME('weekday') / ISOYEAR date-attribute calcs.
+    assert "column 'Weekday No' = WEEKDAY('Date'[Date], 2)" in tmdl
+    assert "column 'Day Name' = FORMAT('Date'[Date], \"dddd\")" in tmdl
+    assert "column 'ISO Year' = YEAR('Date'[Date] + 4 - WEEKDAY('Date'[Date], 2))" in tmdl
+    # Day Name orders by the (hidden) ISO weekday number, not alphabetically.
+    assert "sortByColumn: 'Weekday No'" in tmdl
+
     # Month/Quarter sort by their numeric helper so they don't order alphabetically
     assert "sortByColumn: 'Quarter No'" in tmdl
     assert "sortByColumn: 'Month No'" in tmdl
@@ -259,3 +266,77 @@ def test_migrate_no_date_table_when_no_date_columns():
     out = migrate_tds_to_semantic_model(LIVE_SQLSERVER, model_name="Superstore")
     assert "definition/tables/Date.tmdl" not in out["parts"]
     assert out["report"]["date_table"]["generated"] is False
+
+
+# =============================================================================
+# Date-attribute calc routing: bind to the auto-generated Date dimension only
+# when the calc's date field carries the ACTIVE relationship (Option 1).
+# =============================================================================
+def _calc_row(report, column):
+    rows = [r for r in report["calc_columns"] if r["column"] == column]
+    assert len(rows) == 1, f"expected exactly one calc-column row for {column!r}"
+    return rows[0]
+
+
+def test_date_attribute_calc_over_active_date_binds_to_dimension():
+    # YEAR([Order Date]) -- Order Date is the ACTIVE relationship -> RELATED follows it correctly,
+    # so the calc binds to the Date dimension's [Year] attribute instead of an inline YEAR(...).
+    dim_calcs = [{"name": "Order Year", "formula": "YEAR([Order Date])"}]
+    out = migrate_tds_to_semantic_model(DATES_SQLSERVER, model_name="Sales", dim_calcs=dim_calcs)
+
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "column 'Order Year' = RELATED('Date'[Year])" in orders
+    # the original formula is preserved and provenance marks the date-dimension route
+    assert "annotation TableauFormula = YEAR([Order Date])" in orders
+    assert "annotation TranslatedBy = deterministic (date dimension)" in orders
+
+    row = _calc_row(out["report"], "Order Year")
+    assert row["status"] == "translated"
+    assert row["table"] == "Orders"
+    assert row["date_bound"] is True
+    assert row["date_table"] == "Date"
+    assert row["date_attribute"] == "Year"
+    assert row["dax"] == "RELATED('Date'[Year])"
+
+
+def test_date_attribute_calc_over_role_playing_date_stays_inline():
+    # MONTH([Ship Date]) -- Ship Date is the INACTIVE (role-playing) relationship. RELATED would
+    # silently follow the ACTIVE (Order Date) relationship and return the wrong month, so the calc
+    # must keep a faithful inline MONTH(...) over the physical column instead of binding.
+    dim_calcs = [{"name": "Ship Month", "formula": "MONTH([Ship Date])"}]
+    out = migrate_tds_to_semantic_model(DATES_SQLSERVER, model_name="Sales", dim_calcs=dim_calcs)
+
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "column 'Ship Month' = MONTH('Orders'[Ship_Date])" in orders
+    assert "RELATED('Date'" not in orders.split("column 'Ship Month'")[1].split("column ")[0]
+    assert "annotation TranslatedBy = deterministic" in orders
+
+    row = _calc_row(out["report"], "Ship Month")
+    assert row["status"] == "translated"
+    assert row["date_bound"] is False
+    assert row["date_attribute"] is None
+    assert row["dax"] == "MONTH('Orders'[Ship_Date])"
+
+
+def test_iso_date_attribute_calc_binds_and_adds_coverage():
+    # ISOYEAR / DATENAME('weekday') have no faithful inline DAX (they honest-stub on their own), but
+    # over the ACTIVE date they bind faithfully to the Date dimension's ISO attributes -- the date
+    # routing strictly ADDS coverage here.
+    dim_calcs = [
+        {"name": "Order ISO Year", "formula": "ISOYEAR([Order Date])"},
+        {"name": "Order Weekday", "formula": "DATENAME('weekday', [Order Date])"},
+        {"name": "Order Quarter", "formula": "QUARTER([Order Date])"},
+    ]
+    out = migrate_tds_to_semantic_model(DATES_SQLSERVER, model_name="Sales", dim_calcs=dim_calcs)
+
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "column 'Order ISO Year' = RELATED('Date'[ISO Year])" in orders
+    assert "column 'Order Weekday' = RELATED('Date'[Day Name])" in orders
+    # MONTH/QUARTER return a NUMBER in Tableau -> bind the numeric helper, never the display text.
+    assert "column 'Order Quarter' = RELATED('Date'[Quarter No])" in orders
+
+    assert _calc_row(out["report"], "Order ISO Year")["date_attribute"] == "ISO Year"
+    assert _calc_row(out["report"], "Order Weekday")["date_attribute"] == "Day Name"
+    assert _calc_row(out["report"], "Order Quarter")["date_attribute"] == "Quarter No"
+    assert all(_calc_row(out["report"], c)["date_bound"] is True
+               for c in ("Order ISO Year", "Order Weekday", "Order Quarter"))
