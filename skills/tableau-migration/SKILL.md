@@ -74,6 +74,7 @@ This skill is **self-contained** — the bundled scripts cover the full migratio
 | Semantic Model Rebuild (TMDL, types, relationships) | [semantic-model-rebuild.md](resources/semantic-model-rebuild.md) |
 | Calculated Field → DAX | [calc-to-dax.md](resources/calc-to-dax.md) |
 | Second Compiler (Tier-1 assisted translation) | [second-compiler.md](resources/second-compiler.md) |
+| Tier-1 Charter (Tier-0 vs Tier-1 boundary) | [tier1-charter.md](resources/tier1-charter.md) |
 | Connection → M Partition & Binding | [connection-binding.md](resources/connection-binding.md) |
 | Validation & Reconciliation (ExecuteQuery vs VDS) | [validation-reconciliation.md](resources/validation-reconciliation.md) |
 | Migration Gotchas | [migration-gotchas.md](resources/migration-gotchas.md) |
@@ -94,6 +95,7 @@ This skill is **self-contained** — the bundled scripts cover the full migratio
 | Generating the TMDL model (types, columns, relationships) | [semantic-model-rebuild.md](resources/semantic-model-rebuild.md) | ~180 |
 | Translating calculated fields | [calc-to-dax.md](resources/calc-to-dax.md) | ~200 |
 | A calc fell back / handling the Tier-1 handoff | [second-compiler.md](resources/second-compiler.md) | ~200 |
+| Why a construct is Tier-0 vs Tier-1 (the boundary) | [tier1-charter.md](resources/tier1-charter.md) | ~190 |
 | Emitting M partitions / binding the connection | [connection-binding.md](resources/connection-binding.md) | ~170 |
 | Validating the migrated model | [validation-reconciliation.md](resources/validation-reconciliation.md) | ~140 |
 | Troubleshooting failures | [migration-gotchas.md](resources/migration-gotchas.md) | ~120 |

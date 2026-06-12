@@ -15,7 +15,9 @@ off** to a second compiler.
 This doc is the agent's operating contract. The deterministic *router* that categorizes each
 fallback lives in [`scripts/translation_router.py`](../scripts/translation_router.py); the handoff
 manifest is built by `translation_handoff_artifact` in
-[`scripts/assemble_model.py`](../scripts/assemble_model.py).
+[`scripts/assemble_model.py`](../scripts/assemble_model.py). For *why* a given construct is Tier 0 vs
+Tier 1 (the Axis-A/Axis-B boundary behind every category), see the
+[Tier-1 charter](tier1-charter.md).
 
 ---
 
