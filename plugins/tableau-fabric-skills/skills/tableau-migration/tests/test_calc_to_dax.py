@@ -645,6 +645,62 @@ TABLE_CALC_TRANSLATIONS = [
      "CALCULATE(SUM('Orders'[Sales])))"),
     ("LOOKUP(SUM([Sales]), -1)", (), _ORDER,
      "CALCULATE(SUM('Orders'[Sales]), OFFSET(-(1), ORDERBY('Orders'[Order_Date], ASC)))"),
+    # --- positional (no-arg) calcs derived purely from the addressing ---
+    ("SIZE()", _PART, _ORDER,
+     "COUNTROWS(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC), "
+     "PARTITIONBY('Orders'[Region])))"),
+    ("FIRST()", _PART, _ORDER,
+     "1 - ROWNUMBER(ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region]))"),
+    ("LAST()", _PART, _ORDER,
+     "COUNTROWS(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC), "
+     "PARTITIONBY('Orders'[Region]))) - "
+     "ROWNUMBER(ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region]))"),
+    # --- RUNNING_COUNT / WINDOW_COUNT (any inner type; COUNTX counts marks) ---
+    ("RUNNING_COUNT(SUM([Sales]))", _PART, _ORDER,
+     "COUNTX(WINDOW(1, ABS, 0, REL, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("WINDOW_COUNT(SUM([Sales]))", _PART, _ORDER,
+     "COUNTX(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    # --- WINDOW_* statistical aggregates over the whole partition ---
+    ("WINDOW_MEDIAN(SUM([Sales]))", _PART, _ORDER,
+     "MEDIANX(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("WINDOW_STDEV(SUM([Sales]))", _PART, _ORDER,
+     "STDEVX.S(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("WINDOW_STDEVP(SUM([Sales]))", _PART, _ORDER,
+     "STDEVX.P(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("WINDOW_VAR(SUM([Sales]))", _PART, _ORDER,
+     "VARX.S(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("WINDOW_VARP(SUM([Sales]))", _PART, _ORDER,
+     "VARX.P(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    # --- moving windows: integer-literal (start, end) bounds map to a relative WINDOW frame ---
+    ("WINDOW_AVG(SUM([Sales]), -2, 0)", _PART, _ORDER,
+     "AVERAGEX(WINDOW(-2, REL, 0, REL, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),                              # trailing-3 mean
+    ("WINDOW_SUM(SUM([Sales]), -1, 1)", (), _ORDER,
+     "SUMX(WINDOW(-1, REL, 1, REL, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales])))"),                             # centred 3-row window
+    ("WINDOW_MIN(SUM([Sales]), -2, 0)", _PART, _ORDER,
+     "MINX(WINDOW(-2, REL, 0, REL, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("WINDOW_MAX(SUM([Sales]), 0, 2)", (), _ORDER,
+     "MAXX(WINDOW(0, REL, 2, REL, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales])))"),                             # leading window
+    ("WINDOW_COUNT(SUM([Sales]), -2, 0)", _PART, _ORDER,
+     "COUNTX(WINDOW(-2, REL, 0, REL, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    # --- WINDOW_PERCENTILE(<agg>, k): k-th percentile over the whole partition (PERCENTILEX.INC) ---
+    ("WINDOW_PERCENTILE(SUM([Sales]), 0.75)", _PART, _ORDER,
+     "PERCENTILEX.INC(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC), "
+     "PARTITIONBY('Orders'[Region])), CALCULATE(SUM('Orders'[Sales])), 0.75)"),
+    ("WINDOW_PERCENTILE(SUM([Sales]), 0.5)", (), _ORDER,
+     "PERCENTILEX.INC(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales])), 0.5)"),
 ]
 
 
@@ -668,6 +724,14 @@ TABLE_CALC_FALLBACKS = [
     ("RUNNING_AVG(MIN([Order Date]))", _ORDER),   # AVG of a date inner is invalid
     ("INDEX(SUM([Sales]))", _ORDER),              # INDEX takes no argument
     ("LOOKUP(SUM([Sales]))", _ORDER),             # LOOKUP missing its offset
+    ("WINDOW_AVG(SUM([Sales]), -2)", _ORDER),     # moving window needs BOTH bounds
+    ("WINDOW_SUM(SUM([Sales]), -2.5, 0)", _ORDER),  # non-integer moving bound
+    ("WINDOW_AVG(SUM([Sales]), FIRST(), 0)", _ORDER),  # FIRST()/LAST() bounds not supported
+    ("WINDOW_MEDIAN(SUM([Sales]), -2, 0)", _ORDER),  # moving STDEV/VAR/MEDIAN not certified
+    ("RUNNING_SUM(SUM([Sales]), -2, 0)", _ORDER),  # RUNNING_* takes no bounds
+    ("WINDOW_PERCENTILE(SUM([Sales]))", _ORDER),   # WINDOW_PERCENTILE needs its k argument
+    ("WINDOW_PERCENTILE(SUM([Sales]), 0.5, -2, 0)", _ORDER),  # moving percentile not certified
+    ("WINDOW_PERCENTILE(MIN([Order Date]), 0.5)", _ORDER),  # non-numeric inner
 ]
 
 

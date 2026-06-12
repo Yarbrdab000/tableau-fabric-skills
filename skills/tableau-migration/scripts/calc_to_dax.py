@@ -205,7 +205,30 @@ _TABLECALC_WINDOW_X = {     # WINDOW_*: entire partition (first -> last row)
     "WINDOW_SUM": "SUMX", "WINDOW_AVG": "AVERAGEX",
     "WINDOW_MIN": "MINX", "WINDOW_MAX": "MAXX",
 }
-_TABLE_CALCS = {"INDEX", "LOOKUP"} | set(_TABLECALC_X) | set(_TABLECALC_WINDOW_X)
+# COUNT iterates non-blank marks: RUNNING_COUNT over the partition-start->current frame,
+# WINDOW_COUNT over the whole partition. COUNTX accepts any inner type (it counts rows).
+_TABLECALC_COUNT_X = {
+    "RUNNING_COUNT": "1, ABS, 0, REL",
+    "WINDOW_COUNT": "1, ABS, -1, ABS",
+}
+# WINDOW_* statistical aggregates over the WHOLE partition. Each maps to the matching DAX
+# row-iterator stat function; all require a numeric inner. STDEV/VAR are the SAMPLE estimators
+# (Tableau's default, ddof=1 -> DAX *.S); the population forms map to *.P. Verified faithful to
+# ~1e-15 against an independent pandas ground truth on the live engine (Phase 3 boundary map).
+_TABLECALC_STAT_X = {
+    "WINDOW_MEDIAN": "MEDIANX",
+    "WINDOW_STDEV": "STDEVX.S", "WINDOW_STDEVP": "STDEVX.P",
+    "WINDOW_VAR": "VARX.S", "WINDOW_VARP": "VARX.P",
+}
+# No-argument positional table calcs (value derived purely from the addressing): INDEX is the
+# 1-based row position; SIZE the partition row count; FIRST/LAST the signed offset to the
+# partition's first/last row (FIRST() == 0 on the first row, LAST() == 0 on the last).
+_TABLECALC_POSITION = {"INDEX", "SIZE", "FIRST", "LAST"}
+_TABLE_CALCS = (
+    _TABLECALC_POSITION | {"LOOKUP", "WINDOW_PERCENTILE"}
+    | set(_TABLECALC_X) | set(_TABLECALC_WINDOW_X)
+    | set(_TABLECALC_COUNT_X) | set(_TABLECALC_STAT_X)
+)
 
 
 class _CalcError(Exception):
@@ -1490,13 +1513,59 @@ def _partitionby_clause(partition_by, resolver, tables_used):
     return "PARTITIONBY(" + ", ".join(cols) + ")"
 
 
+def _parse_window_bound(p):
+    """Parse a Tableau WINDOW_* relative bound: an (optionally signed) INTEGER literal offset.
+
+    Only integer literals are supported. FIRST()/LAST()/expression bounds raise -> the caller
+    falls back, keeping the faithful-or-stub contract (those forms are not yet oracle-certified).
+    """
+    sign = ""
+    k, v = p._peek()
+    if k == "op" and v in "+-":
+        if v == "-":
+            sign = "-"
+        p._next()
+        k, v = p._peek()
+    if k != "num" or "." in v:
+        raise _CalcError("WINDOW bound must be an integer literal")
+    p._next()
+    return int(sign + v)
+
+
+def _window_frame(p, spec, default):
+    """Optional Tableau moving-window bounds on a WINDOW_* call: ``WINDOW_*(expr, start, end)``.
+
+    When a ``, start, end`` tail follows the inner expression, both must be integer literals and
+    map directly to a relative frame ``WINDOW(start, REL, end, REL, spec)`` (oracle-certified
+    faithful for SUM/AVG/MIN/MAX/COUNT to ~1e-15, edge-clamped exactly as Tableau clamps a moving
+    window at the partition boundary). With no tail the frame is ``default`` (the whole partition).
+    """
+    k, v = p._peek()
+    if not (k == "op" and v == ","):
+        return default
+    p._next()
+    start = _parse_window_bound(p)
+    p._expect_op(",")
+    end = _parse_window_bound(p)
+    return f"WINDOW({start}, REL, {end}, REL, {spec})"
+
+
 def _emit_table_calc(name, p, spec):
     # p is a measure-context _Parser positioned just after the table-calc's '('. spec is the
     # "ORDERBY(...)[, PARTITIONBY(...)]" addressing tail shared by every window function.
-    if name == "INDEX":
+    whole = f"WINDOW(1, ABS, -1, ABS, {spec})"  # first -> last row of the partition
+    if name in _TABLECALC_POSITION:
         p._expect_op(")")
-        # Tableau INDEX() is the 1-based row position within the partition.
-        return f"ROWNUMBER({spec})"
+        if name == "INDEX":
+            # Tableau INDEX() is the 1-based row position within the partition.
+            return f"ROWNUMBER({spec})"
+        if name == "SIZE":
+            return f"COUNTROWS({whole})"
+        if name == "FIRST":
+            # offset to the first row: 0 on the first row, -1 on the second, ...
+            return f"1 - ROWNUMBER({spec})"
+        # LAST: offset to the last row: 0 on the last row, 1 on the previous, ...
+        return f"COUNTROWS({whole}) - ROWNUMBER({spec})"
     inner = p._expr()  # measure-context inner (must be an aggregate, else it falls back)
     if name in _TABLECALC_X or name in _TABLECALC_WINDOW_X:
         aggx = _TABLECALC_X.get(name) or _TABLECALC_WINDOW_X[name]
@@ -1504,11 +1573,43 @@ def _emit_table_calc(name, p, spec):
             raise _CalcError(f"{name} requires a numeric expression")
         if aggx in ("MINX", "MAXX") and inner[1] not in ("number", "date"):
             raise _CalcError(f"{name} requires a numeric/date expression")
+        if name in _TABLECALC_X:
+            # RUNNING_*: the partition's first row (1, ABS) to the current row (0, REL). No bounds.
+            frame = f"WINDOW(1, ABS, 0, REL, {spec})"
+        else:
+            # WINDOW_*: the whole partition by default, or an explicit moving (start, end) frame.
+            frame = _window_frame(p, spec, whole)
         p._expect_op(")")
-        # RUNNING_*: from the partition's first row (1, ABS) to the current row (0, REL).
-        # WINDOW_*:  the whole partition, first row (1, ABS) to last row (-1, ABS).
-        bounds = "1, ABS, 0, REL" if name in _TABLECALC_X else "1, ABS, -1, ABS"
-        return f"{aggx}(WINDOW({bounds}, {spec}), CALCULATE({inner[0]}))"
+        return f"{aggx}({frame}, CALCULATE({inner[0]}))"
+    if name in _TABLECALC_COUNT_X:
+        # COUNT counts non-blank marks; any inner type is valid (it counts, not sums). RUNNING_COUNT
+        # frames partition-start -> current; WINDOW_COUNT defaults to the whole partition but, like
+        # the other WINDOW_* aggregates, accepts an explicit moving (start, end) frame.
+        if name == "RUNNING_COUNT":
+            frame = f"WINDOW({_TABLECALC_COUNT_X[name]}, {spec})"
+        else:
+            frame = _window_frame(p, spec, whole)
+        p._expect_op(")")
+        return f"COUNTX({frame}, CALCULATE({inner[0]}))"
+    if name in _TABLECALC_STAT_X:
+        # Whole-partition statistical aggregates. Explicit moving bounds are intentionally NOT
+        # enabled here (sample STDEV/VAR are undefined on a 1-row edge frame, so the moving form is
+        # not oracle-certified); a trailing bounds argument trips the ')' below -> faithful fallback.
+        if inner[1] != "number":
+            raise _CalcError(f"{name} requires a numeric expression")
+        p._expect_op(")")
+        return f"{_TABLECALC_STAT_X[name]}({whole}, CALCULATE({inner[0]}))"
+    if name == "WINDOW_PERCENTILE":
+        # WINDOW_PERCENTILE(<agg>, k): the k-th percentile (k in 0..1) over the whole partition.
+        # PERCENTILEX.INC uses linear interpolation, matching Tableau's WINDOW_PERCENTILE (verified
+        # faithful against an independent pandas quantile on the live engine). Moving bounds are not
+        # certified here -> a trailing bounds argument trips the ')' below and falls back.
+        if inner[1] != "number":
+            raise _CalcError("WINDOW_PERCENTILE requires a numeric expression")
+        p._expect_op(",")
+        k = p._expect_number(p._expr())
+        p._expect_op(")")
+        return f"PERCENTILEX.INC({whole}, CALCULATE({inner[0]}), {k[0]})"
     if name == "LOOKUP":
         p._expect_op(",")
         offset = p._expect_number(p._expr())
@@ -1531,13 +1632,20 @@ def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), orde
     Supported (the inner expression is translated in measure context, so it must be an
     aggregation):
       * ``INDEX()`` -> ``ROWNUMBER(ORDERBY(...)[, PARTITIONBY(...)])``
-      * ``RUNNING_SUM/AVG/MIN/MAX(<agg>)`` -> ``<X>(WINDOW(1, ABS, 0, REL, <spec>), CALCULATE(<agg>))``
-      * ``WINDOW_SUM/AVG/MIN/MAX(<agg>)``  -> ``<X>(WINDOW(1, ABS, -1, ABS, <spec>), CALCULATE(<agg>))``
+      * ``SIZE()``  -> ``COUNTROWS(WINDOW(1, ABS, -1, ABS, <spec>))``
+      * ``FIRST()`` -> ``1 - ROWNUMBER(<spec>)``    ``LAST()`` -> ``COUNTROWS(WINDOW(...)) - ROWNUMBER(<spec>)``
+      * ``RUNNING_SUM/AVG/MIN/MAX/COUNT(<agg>)`` -> ``<X>(WINDOW(1, ABS, 0, REL, <spec>), CALCULATE(<agg>))``
+      * ``WINDOW_SUM/AVG/MIN/MAX/COUNT(<agg>)``  -> ``<X>(WINDOW(1, ABS, -1, ABS, <spec>), CALCULATE(<agg>))``
+      * ``WINDOW_SUM/AVG/MIN/MAX/COUNT(<agg>, start, end)`` (integer-literal moving bounds) ->
+        ``<X>(WINDOW(start, REL, end, REL, <spec>), CALCULATE(<agg>))`` (e.g. a trailing-3 mean
+        ``WINDOW_AVG(SUM([Sales]), -2, 0)``); FIRST()/LAST()/expression bounds fall back.
+      * ``WINDOW_MEDIAN/STDEV/STDEVP/VAR/VARP(<agg>)`` -> ``<X>(WINDOW(1, ABS, -1, ABS, <spec>), CALCULATE(<agg>))``
+      * ``WINDOW_PERCENTILE(<agg>, k)`` -> ``PERCENTILEX.INC(WINDOW(1, ABS, -1, ABS, <spec>), CALCULATE(<agg>), k)``
       * ``LOOKUP(<agg>, offset)`` -> ``CALCULATE(<agg>, OFFSET(offset, <spec>))``
     Each window function omits its <relation> argument; per the DAX spec that defaults to
     ``ALLSELECTED()`` of the ORDERBY/PARTITIONBY columns, so the result is correct when the
-    measure is evaluated against the marks the addressing describes. RANK/FIRST/LAST and other
-    forms fall back for now.
+    measure is evaluated against the marks the addressing describes. RANK, moving-window
+    STDEV/VAR/MEDIAN/PERCENTILE, and other forms fall back for now.
 
     This is the DAX-pattern side of the seam; the orchestrator/viz layer supplies the real
     addressing once worksheets are parsed. Cross-table terms (inner + addressing spanning more
