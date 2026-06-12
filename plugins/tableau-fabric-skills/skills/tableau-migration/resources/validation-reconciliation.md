@@ -65,6 +65,46 @@ EVALUATE ROW("Profit Ratio", [Profit Ratio])
 
 ---
 
+## The deterministic core — `scripts/translation_reconcile.py`
+
+The comparison logic above is implemented as a pure, dependency-free, never-raises module so it can be
+unit-tested with no network. **Backends are injected, not embedded:** you pass a
+`fabric_oracle(dax_query) -> result` callable (the real one wraps `semantic-model-consumption`'s
+`ExecuteQuery` / Power BI `executeQueries`) and the Tableau ground truth (`tableau_value=` or a
+`tableau_oracle()` callable wrapping VizQL Data Service). Nothing runs automatically — the orchestrator
+or agent calls it explicitly in the Final phase.
+
+```python
+from translation_reconcile import reconcile, reconcile_all
+
+rec = reconcile("Profit Ratio",
+                "DIVIDE(SUM('Orders'[Profit]), SUM('Orders'[Sales]))",
+                fabric_oracle=run_dax,            # query -> result
+                tableau_value=0.12564,            # VizQL ground truth at this grain
+                grain_filters=None)               # e.g. ["'Orders'[Region] = \"West\""]
+# rec["state"] in {"verified", "mismatch", "not-evaluated"}
+```
+
+What the module guarantees, matching the policy above:
+
+- It runs `translation_router.check_candidate_dax` **first** and refuses to send a candidate that
+  fails the syntactic gate to the backend (`not-evaluated`, never a malformed query).
+- It builds the `EVALUATE ROW("value", …)` probe, wrapping the expression in `CALCULATE(…, <filters>)`
+  when `grain_filters` fix the grain so both sides share one filter context.
+- It reads the scalar out of a bare value, a `{"value": …}`/`{"rows": […]}` shape, **or** the real
+  `executeQueries` envelope, then applies the tolerances (exact for `kind` in
+  count/countd/integer; relative epsilon otherwise; the `blank_equals_zero` policy, recorded in
+  `detail`).
+- A missing oracle, an oracle that throws, an unreadable result, or no ground truth all become a
+  `not-evaluated` record with a reason — it never raises.
+
+`reconcile_request(request, dax, …)` is the convenience that takes a `translation_handoff` request
+(pulls `name`, infers an exact/float `kind` from the formula, and marks a `dax_language_gap` record
+`approximation=True` — the category for which an oracle match is *mandatory* before landing).
+`reconcile_all(items, …)` reconciles a batch and returns `{"records", "summary"}` for the report.
+
+---
+
 ## Optional: validation-gated LLM fallback
 
 For measures that currently fall back to a `= 0` stub, an agent — grounded by the preserved `TableauFormula`

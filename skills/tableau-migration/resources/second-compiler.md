@@ -152,7 +152,12 @@ A candidate is **not** acceptable just because it parses.
 - **When data is landed**, run the **reconciliation oracle** ([`validation-reconciliation.md`](validation-reconciliation.md)):
   evaluate the candidate against the live Power BI model and compare to the Tableau value (VizQL Data
   Service) **at a fixed grain** within tolerance. Accept only on match; otherwise keep the honest
-  stub and mark it review-needed. This is the non-circular proof of faithfulness.
+  stub and mark it review-needed. This is the non-circular proof of faithfulness. The deterministic
+  core of this compare is [`scripts/translation_reconcile.py`](../scripts/translation_reconcile.py)
+  (`reconcile` / `reconcile_request` / `reconcile_all`): it gates the candidate, builds the
+  `EVALUATE ROW(…)` probe, and applies the tolerance policy, taking the Fabric and Tableau backends
+  as **injected** `fabric_oracle` / `tableau_value` hooks (nothing runs silently). It returns a
+  `verified` / `mismatch` / `not-evaluated` record per candidate.
 - For a `dax_language_gap` approximation, the oracle match is **mandatory** before proposing — an
   unverifiable approximation stays a stub. (The syntactic gate emits a warning reminder for this
   category when you thread the request through as `request=`.)
