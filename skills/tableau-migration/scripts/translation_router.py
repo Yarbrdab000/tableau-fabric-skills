@@ -79,10 +79,15 @@ CATEGORIES = (
 _GUIDANCE = {
     MODEL_OBJECT_PARAMETER: (
         "This calc is driven by a Tableau parameter, which is a Power BI MODEL OBJECT rather than a "
-        "single expression. Identify the usage: a measure swap maps to a calculation group; a "
-        "dimension swap maps to field parameters; a what-if value maps to a numeric-range parameter "
-        "(GENERATESERIES + SELECTEDVALUE). Create the object, then rebind the calc to its selected "
-        "value. Verify against the oracle when data is landed."
+        "single expression. Identify the usage: a dimension swap maps to field parameters; a what-if "
+        "value maps to a numeric-range parameter (GENERATESERIES + a [<Param> Value] SELECTEDVALUE "
+        "measure); a measure swap also maps to field parameters today (a calculation group is the "
+        "richer alternative). Do NOT hand-author the model object: reuse the tested deterministic "
+        "emitters in parameters.py -- detect_field_swap() classifies a swap, emit_field_parameters() "
+        "builds a field-parameter table per swap, and emit_value_parameters() builds the what-if "
+        "table + value measure and returns a param_resolver that inlines the selection. Parse the "
+        "parameter definitions from the .twb/.tds with parse_parameters() first. Rebind the calc to "
+        "the selected value; oracle-verify at a fixed selection when data is landed."
     ),
     MISSING_ADDRESSING_INTENT: (
         "This is a table calculation whose partition/order/scope (Tableau 'Compute Using') is not "

@@ -106,7 +106,7 @@ guidance string ships in the request as `category_guidance`.
 
 | Category | What it means | Intent you must supply | Target DAX shape |
 |---|---|---|---|
-| `model_object_parameter` | The calc is driven by a Tableau **parameter** — a Power BI *model object*, not an expression. | Which **swap type**: measure swap, dimension swap, or what-if. | Measure swap → **calculation group**; dimension swap → **field parameters**; what-if → **numeric-range parameter** (`GENERATESERIES` + `SELECTEDVALUE`). Rebind the calc to the selected value. |
+| `model_object_parameter` | The calc is driven by a Tableau **parameter** — a Power BI *model object*, not an expression. | Which **swap type**: measure swap, dimension swap, or what-if. | **Reuse the deterministic emitters in `parameters.py`** — don't hand-author. `detect_field_swap` classifies a swap; `emit_field_parameters` builds a field-parameter table (measure *and* dimension swaps); `emit_value_parameters` builds the what-if table + `[<Param> Value]` measure and returns a `param_resolver`. A calc group is the richer measure-swap alternative. Rebind the calc to the selected value. |
 | `missing_addressing_intent` | A **table calc** whose partition/order/scope (Tableau "Compute Using") is not in the `.tds`. | The **addressing** — partition + order — ideally recovered from worksheet context (`.twb`). | cumulative → running total / time-intelligence; prior/offset → `OFFSET`; rank → `RANKX` over the partition; size/row-number → `COUNTROWS`/`RANKX` over `ALLSELECTED`. |
 | `missing_outer_aggregation` | An **LOD** whose result depends on the visual's dimensionality (INCLUDE/EXCLUDE, bare LOD, non-superset nested LOD). | The intended **grain** and outer aggregation. | INCLUDE → `CALCULATE` over an added group; EXCLUDE → `CALCULATE(…, REMOVEFILTERS(dims))`; bare LOD → an explicit outer aggregate. |
 | `dax_language_gap` | **No faithful native DAX form exists** (regex, arbitrary `DATEPARSE`, general `SPLIT`, `FINDNTH`, case-sensitive ordered text, exotic date part). | Whether the *real* usage is narrow enough to approximate safely. | An **approximation** only (e.g. `PATH`/`SUBSTITUTE` for a fixed delimiter, a known date format) — **flagged approximate** and oracle-verified, else keep the stub. |
@@ -216,11 +216,15 @@ fields           = [ {caption:"Sales", kind:"field", …},
 ```
 
 1. **Intent:** the parameter is a single numeric value the user sweeps → **what-if**.
-2. **Model object:** a numeric-range parameter table —
-   `'Growth Rate' = GENERATESERIES(-0.5, 0.5, 0.01)` with a `Growth Rate Value` measure
-   `SELECTEDVALUE('Growth Rate'[Growth Rate], 0)`.
-3. **Candidate:** `!Sales (growth) = SUMX('Orders', 'Orders'[Sales]) * (1 + [Growth Rate Value])`
-   (or the measure form, whichever is the lean faithful shape).
+2. **Model object (deterministic — don't hand-author):** parse the parameter from the `.twb`/`.tds`
+   with `parse_parameters`, then call `emit_value_parameters(params, calcs=[…])`. It emits the
+   disconnected `Growth Rate Parameter` table (`GENERATESERIES(min, max, step)` from the parameter's
+   own range) + a `Growth Rate Value` = `SELECTEDVALUE(...)` measure, and returns a `param_resolver`
+   that inlines `[Parameters].[Growth Rate]` as `[Growth Rate Value]`.
+3. **Candidate:** feed that `param_resolver` to the calc translator (`translate_tableau_calc_to_dax(
+   formula, resolve, param_resolver=…)`) — Tier 0 then translates the host calc deterministically to
+   `SUMX('Orders', 'Orders'[Sales]) * (1 + [Growth Rate Value])`. You author bespoke DAX only if the
+   usage falls outside the emitter's grammar.
 4. **Validate:** `check_candidate_dax` ✓ (balanced, not a stub, no leftover Tableau idioms); oracle
    at a fixed Growth Rate value vs Tableau with the same parameter ✓.
 5. **Cost line:** "adds 1 disconnected parameter table + 1 measure; value follows the slicer." →
