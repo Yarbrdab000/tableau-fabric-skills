@@ -73,6 +73,7 @@ This skill is **self-contained** — the bundled scripts cover the full migratio
 | Storage-Mode Selection (extract/live/custom-SQL) | [storage-mode-selection.md](resources/storage-mode-selection.md) |
 | Semantic Model Rebuild (TMDL, types, relationships) | [semantic-model-rebuild.md](resources/semantic-model-rebuild.md) |
 | Calculated Field → DAX | [calc-to-dax.md](resources/calc-to-dax.md) |
+| Second Compiler (Tier-1 assisted translation) | [second-compiler.md](resources/second-compiler.md) |
 | Connection → M Partition & Binding | [connection-binding.md](resources/connection-binding.md) |
 | Validation & Reconciliation (ExecuteQuery vs VDS) | [validation-reconciliation.md](resources/validation-reconciliation.md) |
 | Migration Gotchas | [migration-gotchas.md](resources/migration-gotchas.md) |
@@ -92,6 +93,7 @@ This skill is **self-contained** — the bundled scripts cover the full migratio
 | Deciding storage mode for a datasource | [storage-mode-selection.md](resources/storage-mode-selection.md) | ~150 |
 | Generating the TMDL model (types, columns, relationships) | [semantic-model-rebuild.md](resources/semantic-model-rebuild.md) | ~180 |
 | Translating calculated fields | [calc-to-dax.md](resources/calc-to-dax.md) | ~200 |
+| A calc fell back / handling the Tier-1 handoff | [second-compiler.md](resources/second-compiler.md) | ~200 |
 | Emitting M partitions / binding the connection | [connection-binding.md](resources/connection-binding.md) | ~170 |
 | Validating the migrated model | [validation-reconciliation.md](resources/validation-reconciliation.md) | ~140 |
 | Troubleshooting failures | [migration-gotchas.md](resources/migration-gotchas.md) | ~120 |
@@ -108,6 +110,7 @@ The pure-Python cores are offline, deterministic, and stdlib-only (no Spark / pa
 |---|---|
 | [`scripts/fetch_tds.py`](scripts/fetch_tds.py) | **Tableau-side download** (stdlib-only): REST sign-in (PAT **or** Connected-App JWT), find a published datasource by name, download it, and extract the inner `.tds` from a `.tdsx` (`inner_tds_from_zip`) **or** the inner `.tds`/`.twb` from any Tableau archive incl. `.twbx` (`inner_doc_from_zip`). CLI **and** importable (`sign_in`, `resolve_datasource_luid`, `download_datasource`). Use this instead of hand-writing Tableau REST. |
 | `calc_to_dax.py` | Deterministic, typed Tableau calc → DAX translator. Recursive-descent parser: single-field aggregations + arithmetic, `IF`/`ELSEIF`/`IIF` conditionals, comparison + `AND`/`OR`/`NOT`, and `ZN`/`IFNULL`/`ISNULL`; `None` on fallback. Plus `suggest_assisted_dax` — opt-in idiom suggestions (e.g. argmax-over-a-dimension) emitted for human approval, never silently live. |
+| [`scripts/translation_router.py`](scripts/translation_router.py) | **Tier-0 → Tier-1 support layer** (pure, dependency-free). `classify_fallback(reason, role, fields)` — the **router** — maps the deterministic engine's honest `fallback_reason` to a stable charter category (`model_object_parameter` / `missing_addressing_intent` / `missing_outer_aggregation` / `dax_language_gap` / `type_or_shape_mismatch` / `unresolved_reference` / `unsupported_other`) + agent guidance; drives `translation_handoff` (the second-compiler input). `check_candidate_dax(dax, request)` — the **syntactic gate** — vets a second-compiler candidate (balanced parens/brackets/quotes, not an inert stub, no leftover `{FIXED}`/`[Parameters]` idioms) before approval. See [second-compiler.md](resources/second-compiler.md). |
 | [`scripts/tmdl_generate.py`](scripts/tmdl_generate.py) | TMDL generators: typed columns, tables, measures, relationship inference, model files. |
 | [`scripts/field_resolver.py`](scripts/field_resolver.py) | Unambiguous caption → column resolver for the DirectLake (landed-Delta) path. |
 | [`scripts/storage_mode.py`](scripts/storage_mode.py) | Per-datasource storage-mode auto-selection (pure policy). |

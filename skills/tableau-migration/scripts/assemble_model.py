@@ -45,6 +45,7 @@ try:  # package or scripts-on-path
         field_references,
         date_attribute_binding,
     )
+    from .translation_router import classify_fallback
     from . import tmdl_generate as T
 except ImportError:
     from connection_to_m import (
@@ -65,6 +66,7 @@ except ImportError:
         field_references,
         date_attribute_binding,
     )
+    from translation_router import classify_fallback
     import tmdl_generate as T
 
 
@@ -744,16 +746,21 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
 
     Returns ``{"summary", "needs_review", "requests"}``:
       * ``summary`` -- counts: ``total`` / ``live`` (faithfully translated, deterministic or
-        approved) / ``needs_review`` (stub or pending suggestion), with the per-status breakdown and
-        an honest ``coverage_pct`` (``None`` when there are no calcs).
-      * ``needs_review`` -- a concise ``[{name, role, fallback_reason, has_suggestion}]`` list for
-        the check-in prompt.
+        approved) / ``needs_review`` (stub or pending suggestion), with the per-status breakdown, an
+        honest ``coverage_pct`` (``None`` when there are no calcs), and a ``categories`` map giving
+        the Tier-1 router category counts across the needs-review calcs.
+      * ``needs_review`` -- a concise ``[{name, role, fallback_reason, category, has_suggestion}]``
+        list for the check-in prompt.
       * ``requests`` -- one structured record per needs-review calc: ``{name, role, target_table,
-        formula, fields[], fallback_reason, has_suggestion[, suggestion]}``. ``fields`` are the
-        resolved field references (table/column/type), cross-calc references, and parameters --
-        everything the second compiler needs to propose a translation at the right grain.
+        formula, fields[], fallback_reason, category, category_guidance, has_suggestion[,
+        suggestion]}``. ``fields`` are the resolved field references (table/column/type), cross-calc
+        references, and parameters; ``category``/``category_guidance`` are the deterministic router's
+        stable Tier-1 classification (see ``translation_router.classify_fallback``) telling the second
+        compiler what intent to supply and which DAX shape to aim for -- everything it needs to
+        propose a translation at the right grain.
     """
     buckets = {"translated": 0, "assisted_approved": 0, "assisted_suggested": 0, "stub": 0}
+    category_counts = {}
     requests = []
     needs_review = []
 
@@ -767,14 +774,20 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
                 buckets[bucket] += 1
             if status in _HANDOFF_REVIEW:
                 has_suggestion = status == "assisted-suggested"
+                resolved_fields = _handoff_fields(formula, resolve, calc_lookup)
+                routed = classify_fallback(row.get("reason"), role=role,
+                                           fields=resolved_fields, has_suggestion=has_suggestion)
+                category_counts[routed["category"]] = category_counts.get(routed["category"], 0) + 1
                 req = {
                     "name": name,
                     "role": role,
                     "target_table": target_of(row),
                     "formula": formula,
-                    "fields": _handoff_fields(formula, resolve, calc_lookup),
+                    "fields": resolved_fields,
                     "fallback_reason": row.get("reason"),
                     "has_suggestion": has_suggestion,
+                    "category": routed["category"],
+                    "category_guidance": routed["guidance"],
                 }
                 sugg = row.get("assisted_suggestion")
                 if sugg:
@@ -782,6 +795,7 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
                 requests.append(req)
                 needs_review.append({"name": name, "role": role,
                                      "fallback_reason": row.get("reason"),
+                                     "category": routed["category"],
                                      "has_suggestion": has_suggestion})
 
     _consume(measure_report, "measure", lambda r: "_Measures")
@@ -798,6 +812,7 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
         "assisted_suggested": buckets["assisted_suggested"],
         "stub": buckets["stub"],
         "coverage_pct": _coverage_pct(live, total),
+        "categories": category_counts,
     }
     return {"summary": summary, "needs_review": needs_review, "requests": requests}
 
