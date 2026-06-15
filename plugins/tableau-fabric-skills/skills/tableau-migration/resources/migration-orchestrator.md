@@ -39,8 +39,8 @@ Final    Validate ............... reconcile ExecuteQuery vs VDS ; emit the migra
 
 **Why this order:** the Phase 2 storage-mode decision determines how columns are typed (Phase 3) and how
 the connection is wired (Phase 5). Calc → DAX (Phase 4) and relationship inference are storage-mode
-agnostic. The DirectLake fallback additionally requires the data to be landed as Delta first (the bridge
-toolkit's Play 2/3) before a model can bind.
+agnostic. The DirectLake fallback additionally requires the data to be landed as Delta first
+before a model can bind.
 
 ---
 
@@ -78,7 +78,7 @@ Branch on `decision["mode"]`:
 - `"Import"` / `"DirectQuery"` → continue to Phase 3 with that mode.
 - `None` (with `decision["fallback"] == "land-to-delta-directlake"`) → this datasource shape is not safe
   to rebuild directly (join/union tree, multi-connection, unmapped connector, or no column metadata).
-  Route it to the **land-to-Delta + DirectLake** path (bridge Play 2/3/4) instead.
+  Route it to the **land-to-Delta + DirectLake** path instead.
 
 Record `decision["rationale"]` and `decision["manual_followups"]` for the migration report. Full policy in
 `storage-mode-selection.md`.

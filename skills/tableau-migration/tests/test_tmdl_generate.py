@@ -1,4 +1,4 @@
-"""TMDL generator tests (ported from the Play 4 notebook render checks + type map).
+"""TMDL generator tests (render checks + type map).
 
 Covers the measure renderer's annotation contract (the audit/repair safety net),
 the Spark->TMDL type mapping that drives DirectLake column typing, identifier

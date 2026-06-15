@@ -1,7 +1,7 @@
 """Unambiguous field resolver for DAX measure translation.
 
-Extracted from the Tableau-Fabric-AI-Bridge Play 4 notebook main loop (cell 4). The
-notebook built this resolver inline over pandas DataFrames; this is the same logic
+Extracted from the Tableau-Fabric-AI-Bridge project's main resolution loop. The
+original built this resolver inline over pandas DataFrames; this is the same logic
 expressed over plain dict records so it can run with no pandas / Spark dependency.
 
 A resolver maps a Tableau field caption -> ``(table_display_name, clean_col, tmdl_type)``

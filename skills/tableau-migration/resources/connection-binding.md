@@ -255,4 +255,4 @@ This is the one place a human should sanity-check the emitted M.
 
 If `select_storage_mode` returned `None` (join/union tree, multi-connection, unmapped connector, or no
 column metadata), there is no direct upstream to bind — route the datasource to the land-to-Delta + DirectLake
-fallback (bridge Play 2/3/4) instead. See [storage-mode-selection.md](storage-mode-selection.md).
+fallback instead. See [storage-mode-selection.md](storage-mode-selection.md).

@@ -1,6 +1,6 @@
 """TMDL generators for Tableau -> Fabric semantic models.
 
-Ported verbatim from the Tableau-Fabric-AI-Bridge Play 4 notebook (cell 3 / cell 3c).
+Ported from the Tableau-Fabric-AI-Bridge project's TMDL-generation logic.
 The logic is unchanged; only the module-level imports were added so the generators
 run as a standalone, offline-testable module.
 
@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 
 # -- TYPE MAPPING --------------------------------------------------------------
 # Types are driven by the ACTUAL Delta schema (authoritative), NOT Tableau metadata.
-# This is the core Play 4 fix: a DirectLake column's dataType must match the physical
+# This is the core DirectLake fix: a DirectLake column's dataType must match the physical
 # Parquet/Delta column, or the model fails to bind (the prior dateTime-over-varchar bug).
 def spark_type_to_tmdl(t):
     """Map a Spark/Delta simpleString type to a TMDL column dataType (or None to skip)."""
@@ -51,7 +51,7 @@ def slugify(s):
     return s.strip('_')
 
 def make_delta_table_name(datasource_name, table_name):
-    """Match the naming convention used by Play 3."""
+    """Match the land-to-Delta naming convention."""
     return f"{slugify(datasource_name)}_{slugify(table_name)}"
 
 def clean_col(name):
@@ -119,7 +119,7 @@ def tmdl_annotation_value(name, value, indent="\t\t"):
     return f"{indent}annotation {name} = {v}\n"
 
 def generate_measure_tmdl(field_name, formula, dax=None, *, suggestion=None,
-                          translated_by="Play4 deterministic translator"):
+                          translated_by="deterministic"):
     """One measure for the _Measures table. When `dax` is provided the measure carries
     the translated DAX expression; otherwise it stays an inert `= 0` stub. EITHER WAY
     the original Tableau formula is ALWAYS preserved as a TableauFormula annotation --

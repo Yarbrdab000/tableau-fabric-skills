@@ -175,7 +175,7 @@ def test_migrate_datasource_fallback_returns_landing_plan_not_model():
     plan = out["report"]["landing_plan"]
     assert plan["target_lakehouse"] == "h1_ultrastore"
     t = {row["source_table"]: row for row in plan["tables"]}["Orders"]
-    assert t["delta_table"] == "hana_ds_orders"     # slugified {datasource}_{table} (Play 3 naming)
+    assert t["delta_table"] == "hana_ds_orders"     # slugified {datasource}_{table} (land-to-Delta naming)
     assert t["connection_class"] == "saphana"
     assert {c["name"] for c in t["columns"]} == {"Order_ID", "Sales"}          # cleaned model names
     assert {c["source_column"] for c in t["columns"]} == {"Order ID", "Sales"}  # raw source names

@@ -24,7 +24,7 @@ Decision policy (first match wins):
    each table binds to its OWN upstream and the joins become model relationships.
 
 DirectLake is never auto-selected here; it is only reached via the explicit fallback path
-(the existing Play 3/4 land-to-Delta pipeline), offered as an OPTION for the unsafe shapes above
+(the existing land-to-Delta + DirectLake pipeline), offered as an OPTION for the unsafe shapes above
 rather than as the default for any multi-source datasource.
 
 Credentials and on-prem gateway setup are ALWAYS left to the user (security boundary) and

@@ -16,8 +16,8 @@ each part into the Fabric ``createOrUpdate`` payload (see ``fabric_definition_pa
 Storage paths:
 * **Import / DirectQuery** (direct-to-upstream): tables use ``= m`` partitions from
   ``connection_to_m.emit_table_tmdl_m``; connection parameters become named expressions.
-* **DirectLake fallback** (``mode is None``): the caller should land data as Delta first
-  (bridge Play 2/3); ``assemble_directlake_model`` then reuses the proven Play 4 generators.
+* **DirectLake fallback** (``mode is None``): the caller should land data as Delta first;
+  ``assemble_directlake_model`` then reuses the proven import-model generators.
 
 Credentials are never embedded. Anything outside the safe subset stays an inert ``= 0`` stub
 with its original formula preserved as a ``TableauFormula`` annotation.
@@ -119,7 +119,7 @@ def _expression_names(descriptor):
 def _generate_model_tmdl_import(table_names, expression_names, role_names=None):
     """A minimal valid ``model.tmdl`` for an Import / DirectQuery model.
 
-    Mirrors the proven Play 4 model header but drops the DirectLake-specific tooling
+    Mirrors the proven model header but drops the DirectLake-specific tooling
     annotation. Tables are declared with ``ref table`` (declaration order); named
     expressions (connection parameters) are listed in ``PBI_QueryOrder`` when present.
     Security ``role`` objects (each in its own file) are referenced with ``ref role``.
@@ -973,9 +973,9 @@ def assemble_directlake_model(*, model_name, tables, measures_tmdl, expression_n
     """Assemble a DirectLake model from ALREADY-LANDED Delta tables (the fallback path).
 
     ``tables`` is a list of ``(display_name, delta_table_name, columns_tmdl)`` tuples (the
-    caller types ``columns_tmdl`` from the landed Delta schema, e.g. via Play 3 output).
-    This reuses the proven Play 4 generators verbatim, so the produced model matches the
-    bridge's deployable DirectLake output.
+    caller types ``columns_tmdl`` from the landed Delta schema, e.g. from the land-to-Delta output).
+    This reuses the proven import-model generators verbatim, so the produced model matches the
+    deployable DirectLake output.
 
     The optional ``hierarchies`` / ``display_folders`` / ``rls_roles`` arguments carry the
     same RESOLVED model objects as ``assemble_import_model`` (keyed by the caller's display
@@ -1233,10 +1233,10 @@ def directlake_landing_plan(descriptor, *, calcs=None, target_lakehouse="h1_ultr
     (a single cross-engine ``join``/``union`` relation, unfoldable custom SQL, an unknown connector,
     a table with no resolvable columns, or a multi-connection table that can't be routed upstream).
     It emits NO credentials and runs NO network calls -- it is a structured hand-off an executor
-    (the bridge's Play 2/3) acts on. Returns a JSON-serializable dict:
+    (a land-to-Delta executor) acts on. Returns a JSON-serializable dict:
 
     * ``tables`` -- per source table: the slugified ``{datasource}_{table}`` Delta name (matching
-      Play 3), its source connection facts (class / server / database / schema / warehouse /
+      the land-to-Delta naming), its source connection facts (class / server / database / schema / warehouse /
       http_path), a credential-free ``bind_target``, and its column inventory (name + type). Types
       here are the Tableau-derived hints; they MUST be reconciled against the LANDED Delta schema.
     * ``relationships`` -- the inferred table->table joins (rebuilt as model relationships, not a

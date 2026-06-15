@@ -1,6 +1,6 @@
 """Deterministic Tableau calculated-field -> DAX measure translator (no LLM).
 
-Originated from the Tableau-Fabric-AI-Bridge Play 4 notebook (cell 3b) as an
+Originated in the Tableau-Fabric-AI-Bridge project as an
 aggregation+arithmetic-only safe subset, then extended in-place into a typed
 recursive-descent parser that also covers conditional and null-handling logic.
 

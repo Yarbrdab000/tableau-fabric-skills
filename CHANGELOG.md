@@ -12,6 +12,38 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+- **tableau-migration:** row-level / dimension calc translation is now wired into the
+  orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
+  columns** end-to-end; previously the translator's column mode existed but was never called, so
+  those calcs were dropped before translation was attempted.
+- **tableau-migration:** table-calculation → DAX translator for the subset whose addressing
+  (Compute Using) is recoverable from a `.twb`/`.twbx` — `WINDOW_*`/`RUNNING_*` families plus
+  `RANK`/`RANK_DENSE`, `INDEX`, `LOOKUP`, `FIRST`/`LAST`/`SIZE` — fed by a workbook addressing
+  extractor and consumer. `RANK`/`RANK_DENSE` are certified against a live Fabric model
+  (0/616 mismatches; Skip-vs-Dense tie semantics confirmed on-engine). A datasource-only
+  migration still preserves table calcs as stubs.
+- **tableau-migration:** Tier-1 "second compiler" for calcs the deterministic Tier-0 compiler
+  punts on — a deterministic router (`translation_router.py`) classifying each stub into a stable
+  fallback taxonomy, a candidate-DAX validation gate (`check_candidate_dax`), a structured
+  translation-handoff manifest, parameter model-object emitters (`parameters.py`: field
+  parameters + what-if value parameters from `[Parameters].[X]`-driven `CASE`/`IF` swaps),
+  `approved_calc_dax` landing, and a reconciliation value-oracle (`translation_reconcile.py`).
+  Boundary documented in `resources/tier1-charter.md`. All report additions are additive.
+
+### Changed
+- **tableau-migration:** the `TranslatedBy` provenance annotation on deterministically-translated
+  measures now reads `deterministic`, matching the calculated-column path (previously an internal
+  project codename leaked into emitted TMDL). No report keys were renamed or removed.
+- **tableau-migration:** refreshed `resources/feature-parity.md` Calculations section to reflect
+  the translator's actual behavior — `FIXED` and table-scoped LOD, row-level calculated columns,
+  scalar date/string functions as columns, and `CASE`/`WHEN` → DAX `SWITCH` all translate;
+  `INCLUDE`/`EXCLUDE` LOD and regex remain stubs; parameter-driven `CASE`/`IF` swaps map to field
+  parameters via the second-compiler path.
+- **tableau-migration:** internal terminology cleanup across code comments, docstrings, and
+  resource docs (removed internal play-numbering; the Tableau-Fabric-AI-Bridge attribution is
+  retained).
+
 ### Fixed
 - **tableau-mcp-landing-zone:** corrected the default `tableauMcpImage` pin. The previous
   default `:2.4.3` returns `MANIFEST_UNKNOWN` on GHCR (published stable tags jump 2.2.4 ->

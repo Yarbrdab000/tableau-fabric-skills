@@ -1,6 +1,6 @@
 """Calc -> DAX translator tests.
 
-Started from the Play 4 notebook self-test cell (aggregation + arithmetic safe
+Started from the original self-test cell (aggregation + arithmetic safe
 subset) and extended to cover the conditional/null-handling grammar: IF/ELSEIF/ELSE,
 IIF, comparisons, AND/OR/NOT, ZN/IFNULL/ISNULL, string literals, scalar math over
 aggregated operands (ABS/ROUND/CEILING/FLOOR/POWER/SQUARE/SQRT/SIGN/EXP/LOG/LN/DIV/PI

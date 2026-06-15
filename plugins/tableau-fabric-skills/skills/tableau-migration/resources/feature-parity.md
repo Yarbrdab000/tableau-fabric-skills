@@ -26,20 +26,28 @@ before a migration and to populate the "Not migrated" section of the report.
 
 ## Calculations
 
+The deterministic translator emits DAX only where the mapping is **provably faithful**; everything
+else stays an inert `= 0` stub with the original formula preserved as a `TableauFormula` annotation.
+Coverage of the in-scope function catalog is currently ~74% and growing.
+
 | Tableau construct | v1 status |
 |---|---|
-| `SUM/AVG/MIN/MAX/MEDIAN/COUNT/COUNTD` + arithmetic | ✅ Translated to DAX measures |
-| `IF/ELSEIF/ELSE/END`, `IIF` (3-arg) | ✅ |
-| Comparisons, `AND`/`OR`/`NOT` | ✅ |
+| `SUM/AVG/MIN/MAX/MEDIAN/COUNT/COUNTD/STDEV/VAR/PERCENTILE` + arithmetic | ✅ Translated to DAX measures |
+| `IF/ELSEIF/ELSE/END`, `IIF` (3-arg), comparisons, `AND`/`OR`/`NOT`, `IN` | ✅ |
 | `ZN` / `IFNULL` / `ISNULL`, string literals | ✅ |
-| LOD `{FIXED/INCLUDE/EXCLUDE}` | ❌ Stub (formula preserved) |
-| Table calcs `WINDOW_*`/`RUNNING_*`/`RANK`/`LOOKUP`/`INDEX` | ❌ Stub |
-| `CASE`/`WHEN`, scalar date/string/regex functions | ❌ Stub |
-| Row-level calculated fields | ❌ Stub (measure context only) |
+| Scalar math & trig (`ABS`/`ROUND`/`CEILING`/`FLOOR`/`POWER`/`SQRT`/`LOG`/`LN`/`EXP`/`SIN`/`COS`/`TAN`…) | ✅ Over aggregated or row-level operands |
+| Scalar date/string fns (`YEAR`/`QUARTER`/`MONTH`/`DATEADD`/`DATETRUNC`/`DATEDIFF`/`LEFT`/`RIGHT`/`MID`/`UPPER`/`LOWER`/`PROPER`/`ASCII`/`CHAR`/`ISOWEEK`…) | ✅ As calculated columns (row level), or over aggregated operands in a measure; date attributes can bind to the generated Date table |
+| Row-level calculated fields (dimension-role) | ✅ Translated as DAX **calculated columns** |
+| LOD `{FIXED …}` and table-scoped `{AGG(…)}` | ✅ Translated (`CALCULATE(…, ALLEXCEPT/ALL)`) |
+| LOD `{INCLUDE …}` / `{EXCLUDE …}` | ❌ Stub (viz-filter-context dependent) |
+| Table calcs `WINDOW_*`/`RUNNING_*`/`RANK`/`INDEX`/`LOOKUP`/`SIZE`/`FIRST`/`LAST` | 🟡 The translator handles the subset whose addressing (Compute Using) is recoverable from a `.twb`/`.twbx`; a datasource-only migration preserves them as stubs |
+| `CASE`/`WHEN` (value mapping) | ✅ Translated to DAX `SWITCH` — searched `CASE WHEN c THEN r …` → `SWITCH(TRUE(), c, r, …)`, simple `CASE x WHEN v …` → `SWITCH(x, v, r, …)` (a 2-way collapses to `IF(EXACT(…))`, preserving Tableau's case-sensitive match). A *simple*-form `CASE` with a bare **row-level** comparand only stubs in *measure* mode — it translates as a calculated **column** |
+| `[Parameters].[X]`-driven `CASE`/`IF` field/measure swap | 🟡 Deterministic field-parameter + what-if-parameter emitters exist (`parameters.py`: `detect_field_swap` → `emit_field_parameters`/`emit_value_parameters`) and are exercised via the parameters / second-compiler path. The default datasource auto-run leaves the calc as a stub and routes it to the `model_object_parameter` handoff. Measure swap currently emits a **field parameter** (a calculation group is the documented richer alternative, not yet built) |
+| Regex (`REGEXP_*`), arbitrary-format `DATEPARSE` | ❌ Stub (no faithful DAX equivalent) |
 | Cross-table calcs | ❌ Stub (filter context not guaranteed) |
 
-Every stub is an inert `= 0` with the original formula kept as a `TableauFormula` annotation. See
-[calc-to-dax.md](calc-to-dax.md).
+Every stub is an inert `= 0` with the original formula kept as a `TableauFormula` annotation, ready for
+a human — or the assisted second compiler — to finish. See [calc-to-dax.md](calc-to-dax.md).
 
 ---
 
@@ -68,11 +76,11 @@ it should enumerate any present and list them as manual follow-ups so the custom
 
 ## Worksheets & dashboards (roadmap — v2)
 
-Worksheet / dashboard → Power BI **report (PBIR)** is **not** in v1. The viz grammar (marks, shelves,
-filters, chart types) lives in the workbook `.twb`/`.twbx` XML — not the Metadata API — and needs a new
-parser plus a Tableau-viz → PBIR mapper. The output half is already proven (the bridge toolkit's Play 5
-PBIR generator), and v1 rebuilds the measures those visuals will bind to, so v2 starts from a wireframe-level
-report bound to v1's model.
+Worksheet / dashboard → Power BI **report (PBIR)** is **not** part of the v1 datasource-migration flow.
+The viz grammar (marks, shelves, filters, chart types) lives in the workbook `.twb`/`.twbx` XML — not the
+Metadata API — and needs a dedicated parser plus a Tableau-viz → PBIR mapper. The output half (PBIR
+generation) is prototyped in `scripts/twb_to_pbir.py`, and v1 rebuilds the measures those visuals will
+bind to, so v2 starts from a wireframe-level report bound to v1's model.
 
 ---
 

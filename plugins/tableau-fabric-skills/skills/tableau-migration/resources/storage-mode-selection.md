@@ -141,7 +141,7 @@ from storage_mode import select_storage_mode
 descriptor = parse_tds(open("datasource.tds", encoding="utf-8-sig").read())
 decision = select_storage_mode(descriptor)
 if decision["mode"] is None:
-    route_to_land_to_delta(descriptor)            # bridge Play 2/3/4
+    route_to_land_to_delta(descriptor)            # land-to-Delta + DirectLake
 else:
     rebuild_direct(descriptor, decision["mode"])  # Phases 3–5
 ```
@@ -162,7 +162,7 @@ else:
 - **Fallback → land-to-Delta + DirectLake (the explicit lakehouse option).** Reserved for the shapes
   a direct query can't reproduce: a single cross-engine `join`/`union` relation tree, a multi-connection
   table that can't be routed to a specific upstream, missing column metadata, and unmapped connectors.
-  These are landed as Delta first (Play 2/3) and bound via DirectLake (Play 4). A **multi-connection
+  These are landed as Delta first and bound via DirectLake. A **multi-connection
   federation is NOT a fallback** — it rebuilds directly with model relationships. When `migrate_datasource`
   does hit a genuine fallback it returns `parts={}` with a `report["landing_plan"]`
   (`directlake_landing_plan`): the per-table `{datasource}_{table}` Delta names, credential-free bind
