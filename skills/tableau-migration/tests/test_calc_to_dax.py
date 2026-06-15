@@ -701,6 +701,20 @@ TABLE_CALC_TRANSLATIONS = [
     ("WINDOW_PERCENTILE(SUM([Sales]), 0.5)", (), _ORDER,
      "PERCENTILEX.INC(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC)), "
      "CALCULATE(SUM('Orders'[Sales])), 0.5)"),
+    # --- RANK / RANK_DENSE: competition (Skip) vs dense (Dense) ranking within the partition.
+    # The rank value is independent of the addressing SORT, so the emit consumes the raw
+    # partition/addressing COLUMNS (ALLSELECTED marks + per-partition FILTER), not the window spec.
+    ("RANK(SUM([Sales]))", _PART, _ORDER,
+     "RANKX(FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
+     "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])), CALCULATE(SUM('Orders'[Sales])), , DESC, Skip)"),
+    ("RANK_DENSE(SUM([Sales]))", _PART, _ORDER,
+     "RANKX(FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
+     "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])), CALCULATE(SUM('Orders'[Sales])), , DESC, Dense)"),
+    ("RANK(SUM([Sales]), 'asc')", _PART, _ORDER,
+     "RANKX(FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
+     "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])), CALCULATE(SUM('Orders'[Sales])), , ASC, Skip)"),
+    ("RANK(AVG([Sales]))", (), _ORDER,                                # no partition -> no FILTER
+     "RANKX(ALLSELECTED('Orders'[Order_Date]), CALCULATE(AVERAGE('Orders'[Sales])), , DESC, Skip)"),
 ]
 
 
@@ -716,7 +730,11 @@ def test_table_calc_translates(formula, partition_by, order_by, expected):
 TABLE_CALC_FALLBACKS = [
     # (formula, order_by) -- everything here must return None
     ("RUNNING_SUM(SUM([Sales]))", ()),            # no order spec
-    ("RANK(SUM([Sales]))", _ORDER),               # RANK not in the supported seam
+    ("RANK(SUM([Sales]))", ()),                   # RANK needs an addressing (order-by) dimension
+    ("RANK(SUM([Sales]), 'sideways')", _ORDER),   # invalid rank direction
+    ("RANK(MAX([Region]))", _ORDER),              # non-numeric (string) inner cannot be ranked
+    ("RANK()", _ORDER),                           # RANK needs an inner aggregate
+    ("RANK_DENSE(SUM([Sales]), 1)", _ORDER),      # direction must be a string literal
     ("PREVIOUS_VALUE(SUM([Sales]))", _ORDER),     # unsupported table calc
     ("SUM([Sales])", _ORDER),                     # not a table calc
     ("RUNNING_SUM([Sales])", _ORDER),             # bare row-level inner (not an aggregate)

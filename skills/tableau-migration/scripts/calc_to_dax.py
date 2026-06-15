@@ -224,8 +224,17 @@ _TABLECALC_STAT_X = {
 # 1-based row position; SIZE the partition row count; FIRST/LAST the signed offset to the
 # partition's first/last row (FIRST() == 0 on the first row, LAST() == 0 on the last).
 _TABLECALC_POSITION = {"INDEX", "SIZE", "FIRST", "LAST"}
+# RANK family: rank each mark's measure value WITHIN its partition. RANK is competition ranking
+# (ties share a rank, the next rank skips: 1,2,2,4) -> RANKX(..., Skip); RANK_DENSE is dense
+# ranking (no gap after ties: 1,2,2,3) -> RANKX(..., Dense). Default direction is DESC (highest
+# value -> rank 1); an optional 'asc'/'desc' second argument overrides it. Unlike the WINDOW/
+# RUNNING family the rank value is independent of the addressing SORT, so RANK consumes the raw
+# partition/addressing COLUMNS (to enumerate marks + restrict to the current partition) rather
+# than the ORDERBY/PARTITIONBY window spec. Both tie modes + directions were oracle-certified
+# faithful (0 mismatches) against an independent pandas ranking on the live engine.
+_TABLECALC_RANK = {"RANK", "RANK_DENSE"}
 _TABLE_CALCS = (
-    _TABLECALC_POSITION | {"LOOKUP", "WINDOW_PERCENTILE"}
+    _TABLECALC_POSITION | _TABLECALC_RANK | {"LOOKUP", "WINDOW_PERCENTILE"}
     | set(_TABLECALC_X) | set(_TABLECALC_WINDOW_X)
     | set(_TABLECALC_COUNT_X) | set(_TABLECALC_STAT_X)
 )
@@ -1499,6 +1508,55 @@ def _orderby_clause(order_by, resolver, tables_used):
     return "ORDERBY(" + ", ".join(parts) + ")"
 
 
+def _order_captions(order_by):
+    # The bare field captions from an order_by spec (each item is a caption or a
+    # (caption, "ASC"|"DESC") pair); the sort DIRECTION is dropped -- callers that need the raw
+    # addressing columns (RANK) don't depend on it.
+    return [item[0] if isinstance(item, (tuple, list)) else item for item in order_by]
+
+
+def _resolve_refs(captions, resolver, tables_used):
+    # Resolve a list of field captions to raw ``'Table'[Column]`` DAX references (recording each
+    # home table in ``tables_used``); raises on any unresolved/ambiguous caption.
+    refs = []
+    for cap in captions:
+        resolved = resolver(cap)
+        if resolved is None:
+            raise _CalcError(f"unresolved/ambiguous field [{cap}]")
+        table, col, _ty = resolved
+        tables_used.add(table)
+        refs.append(f"{_dax_table(table)}{_dax_col(col)}")
+    return refs
+
+
+def _emit_rank(name, p, mark_refs, part_refs):
+    # name in _TABLECALC_RANK; p is a measure-context _Parser positioned just after the RANK '('.
+    # mark_refs enumerate the marks (partition + addressing columns); part_refs are the partition
+    # subset. Ranks the current mark's aggregate among all marks in its partition.
+    inner = p._expr()  # measure-context inner; must be a numeric (rankable) aggregate
+    if inner[1] != "number":
+        raise _CalcError(f"{name} requires a numeric expression")
+    direction = "DESC"  # Tableau RANK defaults to descending: the highest value is rank 1
+    k, v = p._peek()
+    if k == "op" and v == ",":
+        p._next()
+        dk, dv = p._peek()
+        if dk != "str" or str(dv).lower() not in ("asc", "desc"):
+            raise _CalcError(f"{name} direction must be 'asc' or 'desc'")
+        direction = str(dv).upper()
+        p._next()
+    p._expect_op(")")
+    ties = "Skip" if name == "RANK" else "Dense"  # competition vs dense ranking
+    marks = "ALLSELECTED(" + ", ".join(mark_refs) + ")"
+    if part_refs:
+        # Restrict ranking to the current partition: each partition column pinned to its mark value.
+        pred = " && ".join(f"{c} = SELECTEDVALUE({c})" for c in part_refs)
+        relation = f"FILTER({marks}, {pred})"
+    else:
+        relation = marks
+    return f"RANKX({relation}, CALCULATE({inner[0]}), , {direction}, {ties})"
+
+
 def _partitionby_clause(partition_by, resolver, tables_used):
     cols = []
     for cap in partition_by:
@@ -1642,10 +1700,14 @@ def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), orde
       * ``WINDOW_MEDIAN/STDEV/STDEVP/VAR/VARP(<agg>)`` -> ``<X>(WINDOW(1, ABS, -1, ABS, <spec>), CALCULATE(<agg>))``
       * ``WINDOW_PERCENTILE(<agg>, k)`` -> ``PERCENTILEX.INC(WINDOW(1, ABS, -1, ABS, <spec>), CALCULATE(<agg>), k)``
       * ``LOOKUP(<agg>, offset)`` -> ``CALCULATE(<agg>, OFFSET(offset, <spec>))``
+      * ``RANK(<agg>[, 'asc'|'desc'])`` / ``RANK_DENSE(<agg>[, 'asc'|'desc'])`` ->
+        ``RANKX(FILTER(ALLSELECTED(<mark cols>), <partition col> = SELECTEDVALUE(<partition col>)),
+        CALCULATE(<agg>), , <DESC|ASC>, <Skip|Dense>)`` -- competition vs dense ranking of each
+        mark's value within its partition (the FILTER is dropped when there is no partition).
     Each window function omits its <relation> argument; per the DAX spec that defaults to
     ``ALLSELECTED()`` of the ORDERBY/PARTITIONBY columns, so the result is correct when the
-    measure is evaluated against the marks the addressing describes. RANK, moving-window
-    STDEV/VAR/MEDIAN/PERCENTILE, and other forms fall back for now.
+    measure is evaluated against the marks the addressing describes. Moving-window
+    STDEV/VAR/MEDIAN/PERCENTILE, RANK_MODIFIED/UNIQUE/PERCENTILE, and other forms fall back for now.
 
     This is the DAX-pattern side of the seam; the orchestrator/viz layer supplies the real
     addressing once worksheets are parsed. Cross-table terms (inner + addressing spanning more
@@ -1662,14 +1724,24 @@ def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), orde
         name = toks[0][1].upper()
         if name not in _TABLE_CALCS:
             return None, f"unsupported table calculation {toks[0][1]}", tables_used
-        order_clause = _orderby_clause(order_by, resolver, tables_used)
-        if order_clause is None:
-            return None, "table calc requires an explicit order-by spec", tables_used
-        part_clause = _partitionby_clause(partition_by, resolver, tables_used)
-        spec = order_clause if part_clause is None else f"{order_clause}, {part_clause}"
         p = _Parser(toks, resolver, tables_used, mode="measure")
         p.pos = 2  # consume the table-calc name and '('
-        dax = _emit_table_calc(name, p, spec)
+        if name in _TABLECALC_RANK:
+            # RANK needs the raw addressing/partition COLUMNS (to enumerate marks + restrict to the
+            # current partition), not the ORDERBY/PARTITIONBY window spec -- the rank value is
+            # independent of the addressing sort. order_by still supplies the addressing dimension(s).
+            part_refs = _resolve_refs(partition_by, resolver, tables_used)
+            addr_refs = _resolve_refs(_order_captions(order_by), resolver, tables_used)
+            if not addr_refs:
+                return None, "table calc requires an explicit order-by spec", tables_used
+            dax = _emit_rank(name, p, part_refs + addr_refs, part_refs)
+        else:
+            order_clause = _orderby_clause(order_by, resolver, tables_used)
+            if order_clause is None:
+                return None, "table calc requires an explicit order-by spec", tables_used
+            part_clause = _partitionby_clause(partition_by, resolver, tables_used)
+            spec = order_clause if part_clause is None else f"{order_clause}, {part_clause}"
+            dax = _emit_table_calc(name, p, spec)
         if p.pos != len(toks):
             raise _CalcError("unexpected trailing tokens after table calculation")
         if len(tables_used) > 1:
