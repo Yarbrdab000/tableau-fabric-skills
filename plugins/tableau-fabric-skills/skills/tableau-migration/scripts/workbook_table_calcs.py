@@ -245,7 +245,12 @@ def extract_table_calc_usages(xml_text: str) -> List[TableCalcUsage]:
         table = _first(ws, "table")
         if table is None:
             continue
-        view = _first(table, "view") or table
+        # An empty ``<view>`` element is falsy (ElementTree elements with no children test
+        # False, which also raises a DeprecationWarning), so ``_first(...) or table`` would
+        # silently fall through to the parent ``table`` when a present-but-empty ``<view>``
+        # exists. Test ``is None`` explicitly so a real (even empty) view is always used.
+        v = _first(table, "view")
+        view = table if v is None else v
 
         formulas = _calc_formulas(view)
         captions = _captions(view)

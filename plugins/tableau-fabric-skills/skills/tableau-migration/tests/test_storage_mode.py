@@ -73,8 +73,8 @@ def test_postgres_is_directquery_fully_supported():
 
 def test_snowflake_is_directquery_fully_supported():
     # Snowflake.Databases(server, warehouse) + database/schema/table navigation is auto-emitted,
-    # so Snowflake is a fully-supported DirectQuery rebuild (navigation doc-informed; live
-    # reconciliation pending -- no live Snowflake instance in the validation environment).
+    # so Snowflake is a fully-supported DirectQuery rebuild (navigation doc-informed, and the
+    # emitted M has been reconciled against a live Snowflake instance end-to-end).
     d = select_storage_mode(_desc(connection_class="snowflake"))
     assert d["mode"] == "DirectQuery"
     assert d["connector"] == "Snowflake.Databases"

@@ -76,12 +76,14 @@ SQL_SERVER_TDS_FAMILY = (
 #    is correct rather than default-reliant.
 #  * Snowflake connector: connection inputs are Server + Warehouse; navigation is
 #    database -> schema -> table. (Snowflake.Databases has no M function reference page, so its
-#    navigation selectors are doc-informed; live reconciliation is pending -- see docs.)
+#    navigation selectors are doc-informed, but the emitted M has been reconciled against a live
+#    Snowflake instance and resolves end-to-end.)
 #  * Databricks.Catalogs(host, httpPath, [options]) (official MS doc): navigation is
 #    catalog -> schema -> table, and the catalog hop is keyed Kind="Database" -- byte-identical
 #    to Snowflake's [Name, Kind] navigation, so it reuses "database_schema_table". The HTTP path
-#    is a connection parameter (#"HttpPath") that is not stored portably in the .tds; live
-#    reconciliation is pending (no live Databricks instance).
+#    is a connection parameter (#"HttpPath") that is not stored portably in the .tds (the user
+#    supplies it at bind time); the emitted M has been reconciled against a live Databricks
+#    instance and resolves end-to-end.
 DIRECT_CONNECTORS = {
     # Microsoft SQL Server TDS family -> Sql.Database(server, database) + flat [Schema, Item].
     **{cls: ("Sql.Database", "server_database", "schema_item") for cls in SQL_SERVER_TDS_FAMILY},

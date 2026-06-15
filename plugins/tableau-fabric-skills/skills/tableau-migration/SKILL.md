@@ -22,7 +22,7 @@ description: >
 > **Updating this skill — only when the user asks**
 > There is **no** mandatory per-session update check. When the user asks to *check for updates / update / upgrade / refresh the `tableau-migration` skill* (or "update yourself"), follow [`resources/self-update.md`](resources/self-update.md). It is a **version-aware reinstaller**, not a guess:
 > - **Source of truth:** repo `https://github.com/Yarbrdab000/tableau-fabric-skills`, skill subpath `skills/tableau-migration`, version stamp `skills/tableau-migration/VERSION`. **Install target** (Copilot user scope) `~/.copilot/skills/tableau-migration` — or the folder this `SKILL.md` was loaded from.
-> - **Compare, then act:** read installed `VERSION` → read remote `VERSION` → only reinstall if remote is newer (or the user forces). Install is an **explicit wholesale overwrite** (`scripts/` + `resources/` + `SKILL.md` + `VERSION`), then a **fail-loud verification** (assert `migrate_datasource` / `extract_calcs` / `fetch_tds` exist + run `pytest`; on failure, restore the backup and stop). Finish by reporting the delta (`1.2.0 → 1.4.0`).
+> - **Compare, then act:** read installed `VERSION` → read remote `VERSION` → only reinstall if remote is newer (or the user forces). Install is an **explicit wholesale overwrite** (`scripts/` + `resources/` + `SKILL.md` + `VERSION`), then a **fail-loud verification** (assert `migrate_datasource` / `extract_calcs` / `fetch_tds` exist + run `pytest`; on failure, restore the backup and stop). Finish by reporting the delta (e.g. `1.2.1 → 1.3.0`).
 > - **Mid-session caveat:** skills load at session start, so the update is not live until a **new** session.
 
 > **CRITICAL NOTES**
@@ -122,7 +122,7 @@ The pure-Python cores are offline, deterministic, and stdlib-only (no Spark / pa
 
 For exact signatures and a copy-paste **download → migrate → deploy** snippet, see [public-api.md](resources/public-api.md).
 
-Run the test suite with `pytest` from `skills/tableau-migration/` (700+ offline assertions).
+Run the test suite with `pytest` from `skills/tableau-migration/` (900+ offline assertions).
 
 ---
 
@@ -184,7 +184,8 @@ Tableau datasource
 ├── extract enabled                                          → Import (snapshot); offer live DirectQuery if source supported
 └── live relational (SQL Server/Azure SQL DB/Postgres/MySQL/Redshift) → DirectQuery (M fully emitted)
     ├── multiple named connections (each table → its own source) → DirectQuery rebuild + model relationships (DEFAULT, not a fallback)
-    └── Oracle / Teradata / Snowflake / BigQuery            → DirectQuery mode; verified per-connector M in progress (flagged scaffold until then)
+    ├── Oracle / Snowflake / Databricks                       → DirectQuery mode; deploy-ready per-connector M emitted
+    └── Teradata / BigQuery                                   → DirectQuery mode; flagged scaffold until a live navigator verifies the M
 ```
 
 > **Default-direct policy.** Each table is rebuilt against its own source — **including** a federated
@@ -320,7 +321,7 @@ Full matrix in [feature-parity.md](resources/feature-parity.md). Headline parity
 | Datasource → semantic model (tables, typed columns) | ✅ High parity (types from source schema). |
 | Relationship inference (hidden join keys) | ✅ Inferred from real landed cardinality (DirectLake path). |
 | Calculated field → DAX | ⚠️ **Safe subset only** — aggregations + arithmetic, `IF`/`ELSEIF`/`IIF`, comparisons + boolean logic, and null handling (`ZN`/`IFNULL`/`ISNULL`); LOD expressions, table calcs, and row-level/date/string functions are preserved stubs. |
-| Storage mode / upstream connection | ✅ Auto-selected; `Sql.Database` family (SQL Server/Azure SQL DB/Postgres/MySQL/Redshift) fully emitted; Oracle/Teradata/Snowflake/BigQuery scaffolded (verified per-connector M in progress). |
+| Storage mode / upstream connection | ✅ Auto-selected; `Sql.Database` family (SQL Server/Azure SQL DB/Postgres/MySQL/Redshift) plus Oracle, Snowflake, and Databricks emit deploy-ready per-connector M; Teradata/BigQuery are flagged scaffolds (live-navigator M not yet verified). |
 | LOD expressions (FIXED/INCLUDE/EXCLUDE), table calcs (WINDOW_*/RUNNING_*) | ❌ Not translated — preserved as stubs for manual/LLM completion. |
 | Worksheet / dashboard → Power BI report | ❌ **Roadmap (v2)** — not in v1. |
 | Row-level security (wired user filters) | ⚠️ Translatable `USERNAME()` filters → TMDL `role`; group/compound logic fails closed (`FALSE()` + manual-review). |
@@ -339,7 +340,7 @@ Full guide in [migration-gotchas.md](resources/migration-gotchas.md).
 | G1 | `TYPE_FROM_TABLEAU_METADATA` | Column typed from Tableau role/name instead of the physical schema → DirectLake bind fails | Yes | Type from landed Delta / `.tds` metadata; if absent, fall back. |
 | G2 | `CALC_FALLBACK_STUB` | Calculated field outside the safe subset emitted as `= 0` | No | Expected — original formula preserved; repair manually or via gated LLM. |
 | G3 | `JOIN_TREE_UNSUPPORTED` | Federated join/union tree treated as one logical table | Yes | Fall back to land-to-Delta + DirectLake; do not split into tables. |
-| G4 | `CONNECTOR_NOT_EMITTED` | Oracle/Teradata/Snowflake/BigQuery signature/navigation differs from `Sql.Database` | Partial | Emit verified per-connector M when available, else a flagged scaffold; never a guessed 2-arg call. |
+| G4 | `CONNECTOR_NOT_EMITTED` | Teradata/BigQuery navigation not yet verified against a live navigator (Oracle/Snowflake/Databricks emit deploy-ready M) | Partial | Emit deploy-ready M where verified, else a flagged scaffold; never a guessed 2-arg call. |
 | G5 | `NATIVE_QUERY_NO_FOLD` | Custom SQL native query won't fold in DirectQuery | Partial | Keep `[EnableFolding=true]`; if it still fails, switch that table to Import. |
 | G6 | `CREDENTIALS_MANUAL` | Bind succeeds but refresh fails (no credentials) | Yes | User configures credentials on the connection; bind links IDs only. |
 | G7 | `GATEWAY_REQUIRED` | DirectQuery to an on-premises source needs a data gateway | Yes | User sets up / selects a gateway for the connection. |
@@ -351,7 +352,7 @@ Full guide in [migration-gotchas.md](resources/migration-gotchas.md).
 See [validation-reconciliation.md](resources/validation-reconciliation.md). The migration is validated by:
 
 1. **Structural** — model deploys and refreshes (DirectLake frames / Import loads / DirectQuery connects) without error.
-2. **Translation self-tests** — `pytest` runs 717 offline tests (translator subset + fallbacks + TMDL render + storage-mode policy + `.tds`/`.twb` parsing + workbook-datasource selection + landing-plan fallback + deploy payload builders).
+2. **Translation self-tests** — `pytest` runs 900+ offline tests (translator subset + fallbacks + TMDL render + storage-mode policy + `.tds`/`.twb` parsing + workbook-datasource selection + landing-plan fallback + deploy payload builders).
 3. **Value reconciliation (highest value)** — run each translated measure via `semantic-model-consumption` (`ExecuteQuery`) and compare to the Tableau VDS value pulled by the profiler. A measure is "verified" only when the numbers match.
 
 ---

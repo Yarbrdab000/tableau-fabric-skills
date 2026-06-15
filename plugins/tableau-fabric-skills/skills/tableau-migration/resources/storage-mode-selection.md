@@ -82,10 +82,14 @@ fields that drive the decision:
 > (`Databricks.Catalogs(host, httpPath, [options])` then catalog→schema→table `[Name, Kind]` navigation)
 > are **Fully supported** — each emitted from its own verified signature, never a guessed call. Oracle,
 > Databricks, and the `(server, database)` family are doc-verified; Snowflake is doc-informed (no M
-> function reference page exists). Oracle, Snowflake, and Databricks have **no live instance** in the
-> validation environment (Azure SQL only), so **live reconciliation is pending**; for Databricks the HTTP
-> path value and Unity Catalog name aren't carried portably in the `.tds`, so they are surfaced as a manual
-> follow-up rather than guessed. `teradata` (`Teradata.Database`) has a documented server-only signature,
+> function reference page exists). The `(server, database)` family is **live-verified end-to-end**
+> against a real **Azure SQL Database** (all Microsoft TDS-protocol variants — SQL Server, Azure SQL
+> DB, Managed Instance, Synapse, Fabric SQL endpoint — share that shape, and a data gateway for an
+> on-prem source is a networking step, not a conversion gap), and **Snowflake** and **Databricks**
+> have each been reconciled against a **live instance**; all resolve end-to-end. **Oracle** has no
+> live instance available, so its live reconciliation is still **pending** (the emitted M is
+> doc-verified). For Databricks the HTTP path value and Unity Catalog name aren't carried portably in
+> the `.tds`, so they are surfaced as a manual follow-up rather than guessed. `teradata` (`Teradata.Database`) has a documented server-only signature,
 > but with **no live navigator** to confirm the emitted body binds it is held at the scaffold tier rather
 > than shipped as deploy-ready M; `bigquery` (`GoogleBigQuery.Database`) has no M function reference page,
 > so its project/dataset/table navigation and billing-project/project identifiers (it has no server) aren't

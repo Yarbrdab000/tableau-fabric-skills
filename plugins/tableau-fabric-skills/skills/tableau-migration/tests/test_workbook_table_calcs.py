@@ -13,6 +13,7 @@ workbook is committed). It exercises every branch:
 * a plain worksheet with no table calc (must yield nothing).
 """
 import json
+import warnings
 import zipfile
 
 import pytest
@@ -326,3 +327,40 @@ def test_stacked_secondary_calc_is_detected():
     assert u.calc_type == "CumTotal"
     assert u.ordering_type == "Field"
     assert u.to_dict()["secondary"] is True
+
+
+# A worksheet whose ``<table>`` holds a present-but-EMPTY ``<view>`` -- plus a stray
+# table-calc instance placed OUTSIDE the view (a direct child of ``<table>``). An empty
+# ElementTree element is falsy, so the former ``view = _first(table, "view") or table``
+# fell through to the parent ``table`` and would (a) raise a DeprecationWarning on the
+# truthiness test and (b) wrongly scan the stray out-of-view instance as a real usage.
+# The fix selects the empty view, so extraction yields nothing and never warns.
+EMPTY_VIEW_FIXTURE = """<?xml version='1.0' encoding='utf-8'?>
+<workbook>
+  <worksheets>
+    <worksheet name='EmptyView'>
+      <table>
+        <view></view>
+        <datasource-dependencies datasource='ds0'>
+          <column aggregation='Sum' caption='Sales' datatype='real' name='[Sales]' role='measure' type='quantitative' />
+          <column-instance column='[Sales]' derivation='Sum' name='[cum:sum:Sales:qk]' pivot='key' type='quantitative'>
+            <table-calc aggregation='Sum' ordering-type='Pane' type='CumTotal' />
+          </column-instance>
+        </datasource-dependencies>
+        <rows>[ds0].[cum:sum:Sales:qk]</rows>
+        <cols>[ds0].[none:Category:nk]</cols>
+      </table>
+    </worksheet>
+  </worksheets>
+</workbook>
+"""
+
+
+def test_empty_view_uses_view_not_parent_table_and_does_not_warn():
+    # Escalate warnings to errors so the old falsy-element DeprecationWarning would fail here.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        usages = extract_table_calc_usages(EMPTY_VIEW_FIXTURE)
+    # The view is empty, so nothing is addressable; the stray out-of-view instance must NOT
+    # be picked up (the buggy ``or table`` fallback would have surfaced it).
+    assert usages == []

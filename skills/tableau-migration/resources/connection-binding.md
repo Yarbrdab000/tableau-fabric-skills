@@ -174,10 +174,15 @@ follow-up.
 > confirm the emitted body actually binds it is held as a **flagged scaffold** (recognized + named,
 > never a guessed call) until a real instance reconciles it. The `azure_sql_dw` and
 > `microsoft_fabric_sql_endpoint` class strings are web-verified (a wrong class string only causes a
-> safe fallback; the TDS→`Sql.Database` mapping is the verified fact). Oracle, Snowflake, and
-> Databricks have **no live instance** in the validation environment (Azure SQL only) — **live
-> reconciliation pending**; for Databricks the `#"HttpPath"` value and catalog name are not stored
-> portably in the `.tds` and are surfaced as a manual follow-up.
+> safe fallback; the TDS→`Sql.Database` mapping is the verified fact). The `Sql.Database` family is
+> **live-verified end-to-end** against a real **Azure SQL Database** (the Superstore validation
+> datasource), and every Microsoft TDS-protocol variant (SQL Server, Azure SQL DB, Managed Instance,
+> Synapse, Fabric SQL endpoint) binds through that same shared shape — so all are deploy-ready; a data
+> gateway, where an on-prem source needs one, is a networking step, not a conversion gap. **Snowflake**
+> and **Databricks** have each likewise been reconciled against a **live instance** and resolve
+> end-to-end. **Oracle** is the one tier with no live instance available, so its live reconciliation
+> is still **pending** (the emitted M is doc-verified). For Databricks the `#"HttpPath"` value and
+> catalog name are not stored portably in the `.tds` and are surfaced as a manual follow-up.
 
 **Scaffold** connectors `bigquery` and `teradata` map to the right M function *name*
 (`GoogleBigQuery.Database`, `Teradata.Database`) but are emitted as a clearly-flagged `// TODO` that
