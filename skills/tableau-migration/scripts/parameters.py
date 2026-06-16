@@ -795,3 +795,34 @@ def extract_field_swap_calcs(xml):
             seen.add(name)
             out.append({"name": name, "formula": formula, "role": role})
     return out
+
+
+def field_locator_from_resolver(resolve, *, measure_names=None):
+    """Adapt a model field resolver into the ``field_locator`` ``emit_field_parameters`` expects.
+
+    ``resolve(caption) -> (table, clean_col, tmdl_type) | None`` is the orchestrator's M field
+    resolver (``connection_to_m.build_m_field_resolver``). The returned
+    ``locate(field) -> (table, column, is_measure) | None`` binds a bare swap-branch field to its
+    landed home so a ``NAMEOF`` target can be emitted:
+
+    * a field whose name matches a known model **measure** (``measure_names``) resolves to that
+      measure (model-global, ``is_measure=True``), preserving an explicit aggregation; otherwise
+    * it binds to its base **column** (``is_measure=False``). Dropping a base column into a visual
+      aggregates it by its ``summarizeBy`` (typically ``SUM``), matching Tableau's drop-and-aggregate
+      for a bare measure-swap field. ``emit_field_parameter`` already warns about non-additive cases.
+
+    A field that does not resolve returns ``None`` (the branch is dropped fail-closed).
+    """
+    by_name = {(m or "").strip().lower(): m for m in (measure_names or [])}
+
+    def locate(field):
+        key = (field or "").strip().lower()
+        actual = by_name.get(key)
+        if actual is not None:
+            return (None, actual, True)
+        hit = resolve(field) if resolve else None
+        if not hit:
+            return None
+        return (hit[0], hit[1], False)
+
+    return locate

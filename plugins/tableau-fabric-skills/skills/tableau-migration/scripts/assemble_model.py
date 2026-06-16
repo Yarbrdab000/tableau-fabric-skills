@@ -47,6 +47,12 @@ try:  # package or scripts-on-path
     )
     from .translation_router import classify_fallback
     from . import tmdl_generate as T
+    from .parameters import (
+        parse_parameters,
+        emit_field_parameters,
+        emit_value_parameters,
+        field_locator_from_resolver,
+    )
 except ImportError:
     from connection_to_m import (
         build_m_field_resolver,
@@ -68,6 +74,12 @@ except ImportError:
     )
     from translation_router import classify_fallback
     import tmdl_generate as T
+    from parameters import (
+        parse_parameters,
+        emit_field_parameters,
+        emit_value_parameters,
+        field_locator_from_resolver,
+    )
 
 
 def _table_display(rel):
@@ -591,7 +603,7 @@ def _related_date_dax(date_table, column):
 
 
 def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
-                       date_table=None, active_date_cols=None):
+                       date_table=None, active_date_cols=None, consumed=None):
     """Translate row-level (dimension) ``dim_calcs`` via column mode and group the rendered
     calculated-column TMDL by target table, plus a per-column report.
 
@@ -599,6 +611,13 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
     by ``migrate_estate.extract_calculations(..., include_dimensions=True)``. Each is run through
     ``translate_tableau_calc_to_column_dax`` (ROW context), so a bare ``[field]`` resolves and the
     row-level string/date/cast functions are available.
+
+    Calcs whose name is in ``consumed`` (case-insensitive) are skipped -- a dimension-swap calc has
+    already become a field-parameter table and must NOT also be emitted as a calculated column.
+    Note ``param_resolver`` is deliberately NOT threaded here: a value/what-if ``[Parameters].[X]``
+    reads the slicer FILTER context via ``SELECTEDVALUE``, which a calculated COLUMN (row context,
+    refresh-time) cannot see -- it would freeze at the default. Row-level param references therefore
+    correctly stay inert stubs (the faithful Power BI answer is a slicer, not a frozen column).
 
     Binding follows that translator's contract: a single resolved ``{T}`` is the home table; a
     constant (no field refs) and any honest ``= BLANK()`` stub default to ``anchor_table`` so a
@@ -620,9 +639,12 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
     """
     by_table = {}
     report = []
+    consumed_lower = {(c or "").lower() for c in (consumed or set())}
     active_date_cols = active_date_cols or set()
     for calc in dim_calcs or []:
         name, formula = calc["name"], calc.get("formula", "")
+        if name.lower() in consumed_lower:
+            continue
         bound_attr = None
         if date_table and active_date_cols:
             match = date_attribute_binding(formula)
@@ -821,7 +843,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                           relationships=None,
                           hierarchies=None, display_folders=None, rls_roles=None,
                           date_table=True, mark_as_date=True, flatfile_path=None,
-                          calc_lookup=None, approved_calc_dax=None, date_range=None):
+                          calc_lookup=None, approved_calc_dax=None, date_range=None,
+                          parameters=None):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -848,6 +871,15 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     inferred from the ``.tds`` ``<object-graph><relationships>`` (already resolved to emitted model
     columns, on ``descriptor["relationships"]``) are emitted as TMDL. Pass an explicit list --
     including ``[]`` -- to take full control and skip the auto-wiring (so ``[]`` emits none).
+
+    ``parameters`` (from ``parse_parameters``) wires Tableau parameter behaviour into native Power
+    BI objects: a **field-swap** calc (``CASE [Parameters].[X] WHEN .. THEN [FieldA] ..``) becomes a
+    **field-parameter** table (the calc is *consumed* -- not also emitted as a measure/column); a
+    **value/what-if** parameter referenced as a scalar (``[Sales] * [Parameters].[Rate]``) becomes a
+    disconnected what-if table + ``SELECTEDVALUE`` measure that the calc translator inlines. It
+    defaults to ``None``; with no parameters and no detectable swaps the output (and the report) is
+    byte-for-byte identical, and the additive ``field_parameters`` / ``value_parameters`` report keys
+    are simply empty.
     """
     if flatfile_path is not None:
         descriptor = {**descriptor, "flatfile_path": flatfile_path}
@@ -903,30 +935,78 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         else:
             date_name = None
 
+    # ----- Parameter wiring (field swaps -> field parameters; value params -> what-if tables) -----
+    # Build the swap/param model objects BEFORE translating calcs so a consumed swap is excluded
+    # from measure/column emission and a value-param reference can be inlined by the translator.
+    # Every name is reserved up front (data + Date tables and their columns, field-param tables,
+    # measure-calc + dim-calc names) so emitted objects never collide. With no parameters and no
+    # detectable swaps this whole block is inert: consumed is empty and param_resolver is None, so
+    # the calc/measure output below is byte-for-byte identical to the no-parameter path.
+    all_calcs = list(calcs or []) + list(dim_calcs or [])
+    measure_names = [c.get("name") for c in (calcs or []) if c.get("name")]
+    field_locator = field_locator_from_resolver(resolve, measure_names=measure_names)
+    label_aliases_by_controller = {}
+    for p in (parameters or []):
+        aliases = p.get("aliases") or {}
+        if not aliases:
+            continue
+        for key in (p.get("caption"), p.get("internal_name")):
+            if not key:
+                continue
+            label_aliases_by_controller[key.strip().lower()] = aliases
+            label_aliases_by_controller[key.strip("[]").strip().lower()] = aliases
+
+    fp = emit_field_parameters(
+        all_calcs, field_locator=field_locator,
+        used_names={n.lower() for n in table_names} | {"_measures"},
+        label_aliases_by_controller=label_aliases_by_controller)
+    consumed = fp["consumed"]
+    consumed_lower = {c.lower() for c in consumed}
+
+    reserved = {n.lower() for n in table_names} | {"_measures"}
+    reserved |= {t.lower() for t in fp["table_names"]}
+    for rel in tables:
+        for col in rel.get("columns") or []:
+            mn = (col.get("model_name") or "").lower()
+            if mn:
+                reserved.add(mn)
+    for c in all_calcs:
+        nm = (c.get("name") or "").lower()
+        if nm:
+            reserved.add(nm)
+    non_consumed = [c for c in all_calcs if (c.get("name") or "").lower() not in consumed_lower]
+    vp = emit_value_parameters(parameters or [], calcs=non_consumed, reserved_names=reserved)
+    param_resolver = vp["param_resolver"] if vp["table_names"] else None
+
     # Row-level (dimension) calcs become DAX calculated columns via column mode, injected onto
     # their resolved home table (constants / honest stubs default to the first data table). This
     # is additive: with no dim_calcs the table parts are byte-for-byte unchanged. A date-attribute
-    # calc over the ACTIVE date binds to the Date dimension instead (RELATED). Measures are handled
-    # separately below; a calc is only ever sent through one mode (no cross-mode retry).
+    # calc over the ACTIVE date binds to the Date dimension instead (RELATED). A dimension-swap calc
+    # already consumed as a field parameter is skipped here. Measures are handled separately below;
+    # a calc is only ever sent through one mode (no cross-mode retry).
     calc_columns_by_table, calc_column_report = _calc_columns_part(
         dim_calcs, resolve, anchor_table=table_names[0],
-        date_table=date_name, active_date_cols=active_date_cols)
+        date_table=date_name, active_date_cols=active_date_cols, consumed=consumed)
     for disp, block in calc_columns_by_table.items():
         path = f"definition/tables/{disp}.tmdl"
         if path in parts:
             parts[path] = T.enrich_table_tmdl(parts[path], calc_columns=block)
 
-    # Tableau parameters are NOT translated: a calc that references `[Parameters].[X]` (a field
-    # swap, value/what-if, or filter parameter) has no deterministic Power BI equivalent, so it
-    # flows through normal translation and lands as a preserved `= 0` stub -- its original Tableau
-    # formula is kept verbatim as the `TableauFormula` annotation. Rebuild parameter behaviour in
-    # Power BI Desktop with native field parameters, which are trivial to author there.
+    # Measure-role calcs become DAX measures. A measure-swap consumed as a field parameter is
+    # skipped (consumed); a value/what-if `[Parameters].[X]` scalar reference is inlined via
+    # param_resolver. A row-level `[Parameters].[X]` (filter parameter) has no faithful measure form
+    # and lands as a preserved `= 0` stub keeping its original Tableau formula as TableauFormula.
     measures_table, measure_report, assisted_suggestions = _measures_part(
-        calcs, resolve,
+        calcs, resolve, consumed=consumed, param_resolver=param_resolver,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
         approved_calc_dax=approved_calc_dax)
     parts["definition/tables/_Measures.tmdl"] = measures_table
     table_names.append("_Measures")
+
+    # Inject the field-parameter + what-if tables as additive, disconnected scaffolding -- placed
+    # just before _Measures in the model table list, never wired into relationships.tmdl.
+    _inject_field_param_tables(parts, table_names, fp["parts"], fp["table_names"])
+    _inject_field_param_tables(parts, table_names, vp["parts"], vp["table_names"])
 
     expr = emit_connection_parameters(descriptor)
     if expr.strip():
@@ -962,6 +1042,18 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         "relationship_confidence": relationship_confidence_manifest(descriptor, relationships or []),
         "date_table": date_report,
         "roles": [r["name"] for r in rls_roles or []],
+        "field_parameters": {
+            "tables": fp["table_names"],
+            "consumed": sorted(consumed),
+            "warnings": fp["warnings"],
+            "count": len(fp["table_names"]),
+        },
+        "value_parameters": {
+            "tables": vp["table_names"],
+            "measures": vp["measure_names"],
+            "warnings": vp["warnings"],
+            "count": len(vp["table_names"]),
+        },
     }
     return {"parts": parts, "report": report}
 
@@ -1118,7 +1210,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                   relationships=None,
                                   hierarchies=None, display_folders=None, rls_roles=None,
                                   date_table=True, mark_as_date=True, flatfile_path=None,
-                                  approved_calc_dax=None, date_range=None, select=None):
+                                  approved_calc_dax=None, date_range=None, select=None,
+                                  parameters=None):
     """One-call convenience: parse ``.tds``/``.twb`` text and assemble the Import/DirectQuery model.
 
     ``calcs`` are the MEASURE-role calculated fields and ``dim_calcs`` the DIMENSION/row-level ones
@@ -1139,6 +1232,12 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
     ``select`` chooses which datasource to rebuild from a multi-datasource workbook (caption / name,
     case-insensitive); the ``Parameters`` pseudo-datasource is always skipped.
 
+    ``parameters`` are the Tableau parameter descriptors. They default to ``None``, in which case
+    they are AUTO-PARSED from ``tds_text`` (``parse_parameters``), so a field-swap calc becomes a
+    field-parameter table and a value/what-if scalar reference becomes a what-if table + measure
+    (see ``assemble_import_model``). Pass an explicit list (including ``[]``) to override; ``[]``
+    disables parameter wiring entirely (swap/param calcs fall back to stubs).
+
     ``approved_calc_dax`` (``{calc_name: dax}``, case-insensitive) flips human-approved assisted
     suggestions into real measures (see ``_measures_part``). On a first pass omit it: the report's
     ``assisted_suggestions`` lists every idiom match for review; re-run with the approved subset to
@@ -1148,6 +1247,11 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
     descriptor = parse_tds(tds_text, select)
     if relationships is None:
         relationships = descriptor.get("relationships") or []
+    if parameters is None:
+        try:
+            parameters = parse_parameters(tds_text)
+        except Exception:
+            parameters = []
     try:
         calc_lookup = _calc_lookup_from(extract_calcs(tds_text, select))
     except Exception:
@@ -1171,7 +1275,7 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                    rls_roles=rls_roles, date_table=date_table,
                                    mark_as_date=mark_as_date, flatfile_path=flatfile_path,
                                    calc_lookup=calc_lookup, approved_calc_dax=approved_calc_dax,
-                                   date_range=date_range)
+                                   date_range=date_range, parameters=parameters)
     if enrichment_report is not None:
         result["report"]["model_objects"] = enrichment_report
     return result

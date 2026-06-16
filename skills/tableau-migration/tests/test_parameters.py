@@ -9,7 +9,11 @@ NAMEOF + label/de-dup rules), and end-to-end assembly (consumed, additive, never
 import pytest
 
 import parameters as P
-from assemble_model import assemble_import_model, assemble_directlake_model
+from assemble_model import (
+    assemble_import_model,
+    assemble_directlake_model,
+    migrate_datasource,
+)
 from connection_to_m import parse_tds
 from test_connection_to_m import LIVE_SQLSERVER
 
@@ -250,8 +254,8 @@ def test_extract_field_swap_calcs_includes_dimension_role():
     assert swaps[0]["role"] == "dimension"
 
 
-# -- end-to-end assembly: parameter calcs are NOT translated, they become preserved stubs ----
-def test_assemble_import_model_stubs_parameter_calc():
+# -- end-to-end assembly: a swap calc now becomes a field parameter (consumed, not a stub) ----
+def test_assemble_import_model_wires_swap_calc_to_field_parameter():
     calcs = [
         {"name": "Profit Ratio", "formula": "SUM([Sales])/SUM([Quantity])"},
         {"name": "Metric", "formula": "CASE [Parameters].[m] WHEN 1 THEN [Sales] WHEN 2 THEN [Quantity] END"},
@@ -259,24 +263,43 @@ def test_assemble_import_model_stubs_parameter_calc():
     out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore", calcs=calcs)
     parts, report = out["parts"], out["report"]
 
-    # the parameter-driven swap calc is NOT a field-parameter table anymore
-    assert "definition/tables/Metric.tmdl" not in parts
+    # the parameter-driven swap calc is now wired as a field-parameter table
+    assert "definition/tables/Metric.tmdl" in parts
+    assert "ParameterMetadata" in parts["definition/tables/Metric.tmdl"]
 
-    # it lands in _Measures as an inert `= 0` stub with its Tableau formula preserved verbatim
+    # it is CONSUMED -- it must NOT also appear as a measure (no inert `= 0` stub for it)
     measures = parts["definition/tables/_Measures.tmdl"]
-    assert "measure Metric = 0" in measures
-    assert "CASE [Parameters].[m] WHEN 1 THEN [Sales] WHEN 2 THEN [Quantity] END" in measures
+    assert "measure Metric" not in measures
+    assert "Metric" not in {r["measure"] for r in report["measures"]}
 
     # the still-translatable calc remains a real translated measure
     assert "Profit Ratio" in measures
     assert "DIVIDE(" in measures
 
-    # the report records Metric as a stub and exposes no parameter keys
+    # the additive report keys record the consumed swap; it is registered before _Measures,
+    # never wired into relationships
+    assert "Metric" in report["field_parameters"]["consumed"]
+    assert "Metric" in report["field_parameters"]["tables"]
+    model = parts["definition/model.tmdl"]
+    assert "ref table 'Metric'" in model or "ref table Metric" in model
+    assert "Metric" not in (parts.get("definition/relationships.tmdl") or "")
+
+
+def test_assemble_import_model_unresolvable_swap_stays_stub():
+    # a swap whose branch fields don't resolve to model columns is NOT converted; the calc falls
+    # through normal translation and lands as a preserved `= 0` stub (faithful-or-stub).
+    calcs = [
+        {"name": "Metric", "formula": "CASE [Parameters].[m] WHEN 1 THEN [Nope1] WHEN 2 THEN [Nope2] END"},
+    ]
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore", calcs=calcs)
+    parts, report = out["parts"], out["report"]
+    assert "definition/tables/Metric.tmdl" not in parts
+    measures = parts["definition/tables/_Measures.tmdl"]
+    assert "measure Metric = 0" in measures
+    assert "CASE [Parameters].[m] WHEN 1 THEN [Nope1] WHEN 2 THEN [Nope2] END" in measures
+    assert report["field_parameters"]["consumed"] == []
     statuses = {r["measure"]: r["status"] for r in report["measures"]}
     assert statuses["Metric"] == "stub"
-    assert statuses["Profit Ratio"] == "translated"
-    assert "field_parameters" not in report
-    assert "value_parameters" not in report
 
 
 def test_assemble_directlake_model_injects_field_parameters():
@@ -425,3 +448,124 @@ def test_value_params_merge_into_directlake_model():
     model = parts["definition/model.tmdl"]
     assert "ref table 'Sales Multiplier'" in model
     assert "Sales Multiplier" not in parts.get("definition/relationships.tmdl", "")
+
+
+# -- orchestrator wiring: assemble_import_model wires swaps + value params end-to-end ---------
+def test_assemble_import_model_full_parameter_wiring():
+    descriptor = parse_tds(LIVE_SQLSERVER)
+    params = [
+        {"caption": "Measure Picker", "internal_name": "[mp]", "datatype": "string",
+         "domain": "list", "default": "1", "format": None, "range": None,
+         "members": ["1", "2"], "aliases": {"1": "Total Sales", "2": "Units"}},
+        {"caption": "Dim Selector", "internal_name": "[ds]", "datatype": "string",
+         "domain": "list", "default": "1", "format": None, "range": None,
+         "members": ["1", "2"], "aliases": {"1": "By Order", "2": "By Sales"}},
+        _num_param(caption="Sales Multiplier", internal="[sm]", default="1.0",
+                   mn="0.0", mx="2.0", step="0.1", fmt=None),
+    ]
+    calcs = [
+        {"name": "Boost", "formula": "SUM([Sales]) * [Parameters].[Sales Multiplier]"},
+        {"name": "Measure Swap",
+         "formula": "CASE [Parameters].[Measure Picker] WHEN 1 THEN [Sales] WHEN 2 THEN [Quantity] END"},
+    ]
+    dim_calcs = [
+        {"name": "Dim Swap", "role": "dimension",
+         "formula": "CASE [Parameters].[Dim Selector] WHEN 1 THEN [Order ID] WHEN 2 THEN [Sales] END"},
+        {"name": "Seg Flag", "role": "dimension",
+         "formula": "[Parameters].[Sales Multiplier] > 1"},
+    ]
+    out = assemble_import_model(descriptor, model_name="Superstore",
+                               calcs=calcs, dim_calcs=dim_calcs, parameters=params)
+    parts, report = out["parts"], out["report"]
+
+    # measure swap -> field-parameter table with aliased labels + NAMEOF column targets
+    ms = parts["definition/tables/Measure Swap.tmdl"]
+    assert '("Total Sales", NAMEOF(\'Orders\'[Sales]), 0)' in ms
+    assert '("Units", NAMEOF(\'Orders\'[Quantity]), 1)' in ms
+
+    # dimension swap -> its own field-parameter table with aliased labels
+    ds = parts["definition/tables/Dim Swap.tmdl"]
+    assert '"By Order"' in ds and '"By Sales"' in ds
+
+    # both swaps are CONSUMED: not also emitted as a measure
+    measures = parts["definition/tables/_Measures.tmdl"]
+    assert "measure Measure Swap" not in measures
+    assert sorted(report["field_parameters"]["consumed"]) == ["Dim Swap", "Measure Swap"]
+
+    # what-if value param -> disconnected table + measure; Boost inlines the value measure
+    assert "definition/tables/Sales Multiplier.tmdl" in parts
+    assert report["value_parameters"]["tables"] == ["Sales Multiplier"]
+    assert report["value_parameters"]["measures"] == ["Sales Multiplier Value"]
+    assert "SUM('Orders'[Sales]) * [Sales Multiplier Value]" in measures
+
+    # a row-level parameter reference (Seg Flag) correctly stays an inert stub -- a calculated
+    # column has no filter context for SELECTEDVALUE -- and is NOT consumed as a field parameter
+    col_status = {r["column"]: r["status"] for r in report["calc_columns"]}
+    assert col_status["Seg Flag"] == "stub"
+    assert "Seg Flag" not in report["field_parameters"]["consumed"]
+
+    # every parameter table is disconnected (never wired into relationships)
+    rels = parts.get("definition/relationships.tmdl", "")
+    for nm in ("Measure Swap", "Dim Swap", "Sales Multiplier"):
+        assert nm not in rels
+
+
+def test_assemble_import_model_no_parameters_is_unchanged():
+    # The wiring is inert without parameters/swaps: no extra tables are added beyond the data
+    # tables + _Measures, the additive report keys are present but empty, and normal calcs still
+    # translate. (A full byte compare isn't meaningful -- each table carries a random lineageTag.)
+    descriptor = parse_tds(LIVE_SQLSERVER)
+    calcs = [{"name": "Profit Ratio", "formula": "SUM([Sales])/SUM([Quantity])"}]
+    out = assemble_import_model(descriptor, model_name="S", calcs=calcs, parameters=[])
+    parts, report = out["parts"], out["report"]
+    table_parts = {p for p in parts if p.startswith("definition/tables/")}
+    assert table_parts == {"definition/tables/Orders.tmdl", "definition/tables/_Measures.tmdl"}
+    assert report["field_parameters"]["count"] == 0
+    assert report["value_parameters"]["count"] == 0
+    assert report["field_parameters"]["consumed"] == []
+    statuses = {r["measure"]: r["status"] for r in report["measures"]}
+    assert statuses["Profit Ratio"] == "translated"
+
+
+def test_migrate_datasource_auto_parses_and_wires_parameters():
+    # End-to-end through the auto-extracting one-call entry: a workbook carrying a Parameters
+    # pseudo-datasource + a measure-swap calc auto-wires the swap to a field parameter (no explicit
+    # calcs= or parameters= needed).
+    xml = """<?xml version='1.0' encoding='utf-8'?>
+    <workbook>
+      <datasource name='Parameters'>
+        <column name='[mp]' caption='Measure Picker' datatype='integer'
+                param-domain-type='list' value='1'>
+          <members><member value='1'/><member value='2'/></members>
+          <aliases><alias key='1' value='Total Sales'/><alias key='2' value='Units'/></aliases>
+        </column>
+      </datasource>
+      <datasource formatted-name='Superstore' inline='true' version='18.1'>
+        <connection class='federated'>
+          <named-connections>
+            <named-connection caption='myserver' name='sqlserver.0a1b2c'>
+              <connection authentication='sqlserver' class='sqlserver' dbname='Superstore'
+                          server='myserver.database.windows.net' username='svc'/>
+            </named-connection>
+          </named-connections>
+          <relation connection='sqlserver.0a1b2c' name='Orders' table='[dbo].[Orders]' type='table'/>
+          <metadata-records>
+            <metadata-record class='column'><remote-name>Sales</remote-name>
+              <local-name>[Sales]</local-name><parent-name>[Orders]</parent-name>
+              <local-type>real</local-type></metadata-record>
+            <metadata-record class='column'><remote-name>Quantity</remote-name>
+              <local-name>[Quantity]</local-name><parent-name>[Orders]</parent-name>
+              <local-type>integer</local-type></metadata-record>
+          </metadata-records>
+        </connection>
+        <column caption='Measure Swap' name='[Calculation_1]' role='measure'>
+          <calculation class='tableau'
+            formula='CASE [Parameters].[Measure Picker] WHEN 1 THEN [Sales] WHEN 2 THEN [Quantity] END'/>
+        </column>
+      </datasource>
+    </workbook>"""
+    out = migrate_datasource(xml, model_name="Superstore", datasource="Superstore")
+    parts, report = out["parts"], out["report"]
+    assert "definition/tables/Measure Swap.tmdl" in parts
+    assert "Measure Swap" in report["field_parameters"]["consumed"]
+    assert "Total Sales" in parts["definition/tables/Measure Swap.tmdl"]
