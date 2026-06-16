@@ -154,15 +154,51 @@ def test_emit_field_parameter_markers():
     assert t.count("isHidden") == 2
 
 
+def test_emit_field_parameter_exposes_structured_entries_for_report_side():
+    # the report-side fieldParameters expansion needs the resolved candidate fields, not just TMDL
+    sw = P.detect_field_swap(
+        'case [Parameters].[p] when "Segment" then [Segment] when "Region" then [Region] END',
+        role="dimension")
+    res = P.emit_field_parameter("Dim calc 1", sw, field_locator=_loc, used_names=set())
+    assert res["role"] == "dimension"
+    assert res["display_col"] == "Dim calc 1"  # display column is named after the table
+    assert res["entries"] == [
+        {"label": "Segment", "table": "Orders", "column": "Segment", "is_measure": False, "order": 0},
+        {"label": "Region", "table": "Orders", "column": "Region", "is_measure": False, "order": 1},
+    ]
+
+
+def test_emit_measure_swap_entries_flag_is_measure():
+    sw = P.detect_field_swap(
+        'case [Parameters].[m] when 1 then [Sales] when 2 then [Profit] END', role="measure")
+    res = P.emit_field_parameter("Measure Calc", sw, field_locator=_loc, used_names=set())
+    # a measure swap over raw columns synthesizes aggregating measures and points the entries at them
+    assert all(e["is_measure"] is True for e in res["entries"])
+    assert [(e["label"], e["table"], e["column"], e["order"]) for e in res["entries"]] == [
+        ("Sales", "_Measures", "Total Sales", 0), ("Profit", "_Measures", "Total Profit", 1)]
+    # the synthesized SUM measures are returned for emission into _Measures
+    assert [(m["name"], m["dax"]) for m in res["measures"]] == [
+        ("Total Sales", "SUM('Orders'[Sales])"), ("Total Profit", "SUM('Orders'[Profit])")]
+
+
+def test_emit_field_parameter_failed_swap_has_empty_entries():
+    sw = {"controller": "p", "role": "dimension", "form": "case",
+          "branches": [{"label": "A", "field": "Segment"}, {"label": "B", "field": "DoesNotExist"}]}
+    res = P.emit_field_parameter("Calc", sw, field_locator=_loc, used_names=set())
+    assert res["ok"] is False
+    assert res["entries"] == [] and res["display_col"] is None
+
+
 def test_emit_measure_swap_labels_and_warning():
     sw = P.detect_field_swap(
         'case [Parameters].[m] when 1 then [Sales] when 2 then [Profit] END', role="measure")
     res = P.emit_field_parameter("Measure Calc", sw, field_locator=_loc, used_names=set())
     assert res["ok"] is True
-    # numeric selectors fall back to the field's own display name
-    assert '("Sales", NAMEOF(\'Orders\'[Sales]), 0)' in res["tmdl"]
-    assert '("Profit", NAMEOF(\'Orders\'[Profit]), 1)' in res["tmdl"]
-    assert any("default column aggregation" in w for w in res["warnings"])
+    # numeric selectors fall back to the field's own display name; the NAMEOF target is the
+    # synthesized aggregating measure (so the swap aggregates instead of grouping by a raw column)
+    assert '("Sales", NAMEOF([Total Sales]), 0)' in res["tmdl"]
+    assert '("Profit", NAMEOF([Total Profit]), 1)' in res["tmdl"]
+    assert any("synthesized" in w and "SUM" in w for w in res["warnings"])
 
 
 def test_emit_measure_swap_uses_aliases_when_given():
@@ -170,8 +206,8 @@ def test_emit_measure_swap_uses_aliases_when_given():
         'case [Parameters].[m] when 1 then [Sales] when 2 then [Profit] END', role="measure")
     res = P.emit_field_parameter("Measure Calc", sw, field_locator=_loc, used_names=set(),
                                  label_aliases={"1": "Revenue", "2": "Margin"})
-    assert '("Revenue", NAMEOF(\'Orders\'[Sales]), 0)' in res["tmdl"]
-    assert '("Margin", NAMEOF(\'Orders\'[Profit]), 1)' in res["tmdl"]
+    assert '("Revenue", NAMEOF([Total Sales]), 0)' in res["tmdl"]
+    assert '("Margin", NAMEOF([Total Profit]), 1)' in res["tmdl"]
 
 
 def test_emit_deduplicates_duplicate_labels():
@@ -218,6 +254,25 @@ def test_emit_field_parameters_consumes_and_warns_on_dependency():
     assert set(out["table_names"]) == {"Dim calc 1", "Measure Calc"}
     # the downstream calc that references a consumed swap is flagged (it will stub)
     assert any("Value calc" in w and "field parameter" in w for w in out["warnings"])
+
+
+def test_emit_field_parameters_returns_report_specs_in_detection_order():
+    # the report side consumes ``specs`` to render the self-service table's slots
+    calcs = [
+        {"name": "Dim calc 1", "role": "dimension",
+         "formula": 'case [Parameters].[p] when "A" then [Segment] when "B" then [Region] END'},
+        {"name": "Measure Calc", "role": "measure",
+         "formula": 'case [Parameters].[m] when 1 then [Sales] when 2 then [Profit] END'},
+    ]
+    out = P.emit_field_parameters(calcs, field_locator=_loc, existing_tables=["Orders", "_Measures"])
+    specs = out["specs"]
+    assert [s["calc_name"] for s in specs] == ["Dim calc 1", "Measure Calc"]  # detection order
+    dim = specs[0]
+    assert dim["table_name"] == "Dim calc 1" and dim["display_col"] == "Dim calc 1"
+    assert dim["role"] == "dimension"
+    assert [(e["label"], e["column"]) for e in dim["entries"]] == [
+        ("A", "Segment"), ("B", "Region")]
+
 
 
 def test_emit_field_parameters_deduplicates_part_filenames():
@@ -478,10 +533,10 @@ def test_assemble_import_model_full_parameter_wiring():
                                calcs=calcs, dim_calcs=dim_calcs, parameters=params)
     parts, report = out["parts"], out["report"]
 
-    # measure swap -> field-parameter table with aliased labels + NAMEOF column targets
+    # measure swap -> field-parameter table; NAMEOF targets are synthesized aggregating measures
     ms = parts["definition/tables/Measure Swap.tmdl"]
-    assert '("Total Sales", NAMEOF(\'Orders\'[Sales]), 0)' in ms
-    assert '("Units", NAMEOF(\'Orders\'[Quantity]), 1)' in ms
+    assert '("Total Sales", NAMEOF([Total Sales]), 0)' in ms
+    assert '("Units", NAMEOF([Total Quantity]), 1)' in ms
 
     # dimension swap -> its own field-parameter table with aliased labels
     ds = parts["definition/tables/Dim Swap.tmdl"]
@@ -491,6 +546,11 @@ def test_assemble_import_model_full_parameter_wiring():
     measures = parts["definition/tables/_Measures.tmdl"]
     assert "measure Measure Swap" not in measures
     assert sorted(report["field_parameters"]["consumed"]) == ["Dim Swap", "Measure Swap"]
+
+    # the synthesized SUM measures backing the measure swap land in _Measures and are reported
+    assert "SUM('Orders'[Sales])" in measures
+    assert "SUM('Orders'[Quantity])" in measures
+    assert report["field_parameters"]["measures"] == ["Total Sales", "Total Quantity"]
 
     # what-if value param -> disconnected table + measure; Boost inlines the value measure
     assert "definition/tables/Sales Multiplier.tmdl" in parts

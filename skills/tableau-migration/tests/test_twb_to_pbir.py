@@ -14,9 +14,14 @@ from twb_to_pbir import (
     MEASURES_TABLE,
     PAGE_HEIGHT,
     PAGE_WIDTH,
+    SCHEMA_VISUAL_FP,
+    build_field_parameter_page,
     emit_pbir,
+    field_parameter_slicer,
+    field_parameter_table_visual,
     migrate_twb_to_pbir,
     parse_twb,
+    report_json_part_fp,
 )
 
 # -- shared datasource (the workbook embeds the full relation + metadata tree) --
@@ -736,3 +741,94 @@ def test_cli_dry_run_prints_manifest_to_stdout(monkeypatch, capsys):
     pbir = json.loads(emit_pbir(parse_twb(_workbook(ws)), dataset_name="Superstore")
                       ["definition.pbir"])
     assert pbir["datasetReference"]["byPath"]["path"] == "../Superstore.SemanticModel"
+
+
+# -- field-parameter (swap) self-service report --------------------------------
+def _fp_specs():
+    """Two swap specs (one dimension, one measure) -> a 2-slot self-service table."""
+    return [
+        {"table_name": "Dim Swap Calc", "display_col": "Dim Swap Calc", "role": "dimension",
+         "entries": [
+             {"label": "Region", "table": "Orders.csv", "column": "Region",
+              "is_measure": False, "order": 0},
+             {"label": "Category", "table": "Orders.csv", "column": "Category",
+              "is_measure": False, "order": 1}]},
+        {"table_name": "Measure Swap", "display_col": "Measure Swap", "role": "measure",
+         "entries": [
+             {"label": "sales", "table": MEASURES_TABLE, "column": "Total Sales",
+              "is_measure": True, "order": 0},
+             {"label": "profit", "table": MEASURES_TABLE, "column": "Total Profit",
+              "is_measure": True, "order": 1}]},
+    ]
+
+
+def test_field_parameter_table_visual_expands_each_slot():
+    specs = _fp_specs()
+    vis = field_parameter_table_visual("t", specs, {"x": 0, "y": 0, "width": 100, "height": 100})
+    # the swap visual pins the field-parameter schema (the expansion only renders there)
+    assert vis["$schema"] == SCHEMA_VISUAL_FP
+    well = vis["visual"]["query"]["queryState"]["Values"]
+    # one seed projection + one fieldParameters entry per slot, indices sequential, length 1
+    assert len(well["projections"]) == len(specs)
+    assert [fp["index"] for fp in well["fieldParameters"]] == [0, 1]
+    assert all(fp["length"] == 1 for fp in well["fieldParameters"])
+    # each fieldParameters entry binds its slot to the parameter's display column
+    binds = [(fp["parameterExpr"]["Column"]["Expression"]["SourceRef"]["Entity"],
+              fp["parameterExpr"]["Column"]["Property"]) for fp in well["fieldParameters"]]
+    assert binds == [("Dim Swap Calc", "Dim Swap Calc"), ("Measure Swap", "Measure Swap")]
+    # the dimension seed is a Column ref; the measure seed is a Measure ref
+    assert well["projections"][0]["field"]["Column"]["Expression"]["SourceRef"]["Entity"] == "Orders.csv"
+    assert well["projections"][1]["field"]["Measure"]["Expression"]["SourceRef"]["Entity"] == MEASURES_TABLE
+    # the seed carries the option label (what Desktop writes), queryRef the concrete field
+    assert well["projections"][0]["nativeQueryRef"] == "Region"
+    assert well["projections"][1]["queryRef"] == f"{MEASURES_TABLE}.Total Sales"
+
+
+def test_field_parameter_table_visual_skips_specs_with_no_entries():
+    specs = _fp_specs() + [{"table_name": "Empty", "display_col": "Empty", "entries": []}]
+    well = field_parameter_table_visual("t", specs, {})["visual"]["query"]["queryState"]["Values"]
+    assert len(well["projections"]) == 2  # the entry-less spec contributes no slot
+
+
+def test_field_parameter_slicer_binds_display_column():
+    sl = field_parameter_slicer("s", _fp_specs()[0], {"x": 0, "y": 0})
+    assert sl["$schema"] == SCHEMA_VISUAL_FP
+    assert sl["visual"]["visualType"] == "listSlicer"
+    proj = sl["visual"]["query"]["queryState"]["Values"]["projections"][0]
+    assert proj["queryRef"] == "Dim Swap Calc.Dim Swap Calc"
+    assert proj["nativeQueryRef"] == "Dim Swap Calc"
+    assert proj["active"] is True
+    assert proj["field"]["Column"]["Expression"]["SourceRef"]["Entity"] == "Dim Swap Calc"
+
+
+def test_build_field_parameter_page_writes_table_and_one_slicer_per_spec():
+    parts = {}
+    page = build_field_parameter_page(parts, _fp_specs(), page_name="pageSS",
+                                      display_name="Self-Service Table")
+    assert page == "pageSS"
+    assert "definition/pages/pageSS/page.json" in parts
+    visuals = [json.loads(v) for k, v in parts.items() if k.endswith("visual.json")]
+    types = sorted(v["visual"]["visualType"] for v in visuals)
+    # one tableEx + one listSlicer per spec (2)
+    assert types == ["listSlicer", "listSlicer", "tableEx"]
+    table = next(v for v in visuals if v["visual"]["visualType"] == "tableEx")
+    assert "fieldParameters" in table["visual"]["query"]["queryState"]["Values"]
+    # every emitted part is valid JSON and uses the field-parameter page/visual schemas
+    page_json = json.loads(parts["definition/pages/pageSS/page.json"])
+    assert page_json["$schema"].endswith("page/2.1.0/schema.json")
+    assert all(v["$schema"] == SCHEMA_VISUAL_FP for v in visuals)
+
+
+def test_build_field_parameter_page_no_specs_returns_none():
+    parts = {}
+    assert build_field_parameter_page(parts, []) is None
+    assert build_field_parameter_page(parts, [{"table_name": "X", "display_col": "X",
+                                               "entries": []}]) is None
+    assert parts == {}
+
+
+def test_report_json_part_fp_has_base_theme_and_newer_schema():
+    rep = report_json_part_fp()
+    # baseTheme is still required (NRE-on-open regression), schema is the swap-report version
+    assert rep["themeCollection"]["baseTheme"]["name"]
+    assert rep["$schema"].endswith("report/3.3.0/schema.json")

@@ -572,14 +572,57 @@ def _field_param_table_tmdl(table_name, entries):
     )
 
 
-def emit_field_parameter(display_name, swap, *, field_locator, used_names, label_aliases=None):
+class MeasureSynthesizer:
+    """Allocates aggregating measures for measure-swap candidates that resolve to raw columns.
+
+    A field parameter can only ``NAMEOF`` a column or a measure, and a ``NAMEOF``'d *raw column* is
+    consumed as a GROUP-BY (row-level detail) in the visual -- never aggregated -- so a measure-role
+    swap pointed at a base column explodes the table to row grain instead of collapsing to the
+    selected dimension. This allocates one default-``SUM`` measure per distinct ``(table, column)``
+    (named ``Total <column>``) so every measure-swap option aggregates; identical candidates shared
+    across several swaps reuse one measure. Collected ``definitions`` are emitted into ``_Measures``.
+    """
+
+    def __init__(self, measures_table="_Measures", *, reserved_names=None, agg="SUM"):
+        self.measures_table = measures_table
+        self.agg = agg
+        self._used = reserved_names if reserved_names is not None else set()
+        self._cache = {}
+        self.definitions = []
+
+    def aggregate(self, table, column):
+        """Return ``(measures_table, measure_name)`` for an aggregating measure over
+        ``table[column]`` -- creating and recording it on first request, reusing it after."""
+        key = ((table or "").lower(), (column or "").lower())
+        name = self._cache.get(key)
+        if name is None:
+            name = _uniquify(f"Total {column}", self._used)
+            self._cache[key] = name
+            self.definitions.append({
+                "name": name,
+                "dax": f"{self.agg}({dax_ref(table, column)})",
+                "agg": self.agg,
+                "source_table": table,
+                "source_column": column,
+                "tableau_formula": f"{self.agg}([{column}])",
+            })
+        return (self.measures_table, name)
+
+
+def emit_field_parameter(display_name, swap, *, field_locator, used_names, label_aliases=None,
+                         measure_synth=None):
     """Build a Power BI field-parameter table for one Tableau swap calc.
 
     ``field_locator(field) -> (table, column, is_measure) | None`` resolves a bare Tableau field
     ref to its landed model home. Branches whose field does not resolve are dropped (fail-closed);
     if fewer than 2 survive the swap is NOT converted (``ok=False``) and the caller leaves the calc
-    for normal translation (which stubs it). Display labels are de-duplicated. Returns a dict:
-    ``{ok, table_name, part_filename, tmdl, warnings}``.
+    for normal translation (which stubs it). Display labels are de-duplicated.
+
+    For a MEASURE-role swap, a candidate that resolves to a raw column is aggregated through a
+    synthesized default-``SUM`` measure (via ``measure_synth``) so the swap collapses the visual to
+    the selected grain instead of listing row-level values. Returns a dict
+    ``{ok, table_name, part_filename, tmdl, role, display_col, entries, measures, warnings}`` where
+    ``measures`` are the aggregating measures this swap created (to emit into ``_Measures``).
     """
     warnings = []
     branches = swap.get("branches") or []
@@ -588,7 +631,9 @@ def emit_field_parameter(display_name, swap, *, field_locator, used_names, label
 
     table_name = _uniquify(display_name, used_names)
     norm_aliases = {_canon_num_key(k): v for k, v in label_aliases.items()}
-    entries, used_labels = [], set()
+
+    # phase 1 -- resolve each branch field to its model home (drop unresolved, fail-closed)
+    resolved, used_labels = [], set()
     for br in branches:
         field = br.get("field")
         loc = field_locator(field) if field_locator else None
@@ -598,7 +643,6 @@ def emit_field_parameter(display_name, swap, *, field_locator, used_names, label
                 f"column; branch dropped")
             continue
         table, col, is_measure = loc
-        ref = dax_ref(table, col, measure=bool(is_measure))
         raw = br.get("label")
         if br.get("is_else") or raw is None:
             label = col
@@ -609,23 +653,45 @@ def emit_field_parameter(display_name, swap, *, field_locator, used_names, label
         else:
             label = raw
         label = _uniquify_label(label, used_labels, display_name, warnings)
-        entries.append((label, ref, len(entries)))
+        resolved.append((label, table, col, bool(is_measure)))
 
-    if len(entries) < 2:
+    if len(resolved) < 2:
         used_names.discard(table_name.lower())
         warnings.append(
             f"field-swap '{display_name}': fewer than 2 branches resolved; not converted to a "
             f"field parameter (left for normal translation)")
         return {"ok": False, "table_name": None, "part_filename": None, "tmdl": None,
+                "role": role, "display_col": None, "entries": [], "measures": [],
                 "warnings": warnings}
+
+    # phase 2 -- build the NAMEOF refs; for a measure swap, point each raw-column candidate at a
+    # synthesized aggregating measure (only now that the swap is confirmed convertible).
+    synth = measure_synth if measure_synth is not None else MeasureSynthesizer()
+    before = len(synth.definitions)
+    entries, struct_entries = [], []
+    for order_i, (label, table, col, is_measure) in enumerate(resolved):
+        if role == "measure" and not is_measure:
+            e_table, e_col = synth.aggregate(table, col)
+            e_is_measure = True
+        else:
+            e_table, e_col, e_is_measure = table, col, is_measure
+        entries.append((label, dax_ref(e_table, e_col, measure=e_is_measure), order_i))
+        struct_entries.append({"label": label, "table": e_table, "column": e_col,
+                               "is_measure": e_is_measure, "order": order_i})
+    measures_created = synth.definitions[before:]
 
     if role == "measure":
         warnings.append(
-            f"field-swap '{display_name}': measure swap uses each field's default column "
-            f"aggregation (typically SUM); verify non-additive measures (AVG/COUNTD/ratios)")
+            f"field-swap '{display_name}': measure swap aggregates each field with a synthesized "
+            f"SUM measure; verify non-additive measures (AVG/COUNTD/ratios)")
 
+    # ``display_col`` == ``table_name``: the canonical field-parameter table names its visible
+    # display column after the table itself (see ``_field_param_table_tmdl``); the report-side
+    # ``fieldParameters`` expansion binds each slot to '<table_name>'[<table_name>].
     return {"ok": True, "table_name": table_name,
             "part_filename": _safe_filename(table_name),
+            "role": role, "display_col": table_name, "entries": struct_entries,
+            "measures": measures_created,
             "tmdl": _field_param_table_tmdl(table_name, entries), "warnings": warnings}
 
 
@@ -665,11 +731,21 @@ def emit_field_parameters(calcs, *, field_locator, used_names=None, existing_tab
                 f"calc '{name}' references field-swap calc(s) {sorted(hit)} which become report-only "
                 f"field parameters; '{name}' cannot reference them as a scalar and will stub (=0)")
 
-    parts, table_names, consumed, used_files = [], [], set(), set()
+    # synthesized aggregating measures share one allocator across all swaps so a candidate offered by
+    # several measure swaps (e.g. Sales) reuses one ``Total Sales`` measure. Reserve against model
+    # table names and the non-swap calc names (which become their own measures) to avoid clashes.
+    synth_reserved = set(used)
+    for c in (calcs or []):
+        nm = (c.get("name") or c.get("caption") or "").strip().lower()
+        if nm and nm not in swap_names_lower:
+            synth_reserved.add(nm)
+    synth = MeasureSynthesizer(reserved_names=synth_reserved)
+
+    parts, table_names, consumed, used_files, specs = [], [], set(), set(), []
     for name, sw in swaps:
         aliases = label_aliases_by_controller.get((sw.get("controller") or "").lower(), {})
         res = emit_field_parameter(name, sw, field_locator=field_locator, used_names=used,
-                                   label_aliases=aliases)
+                                   label_aliases=aliases, measure_synth=synth)
         warnings.extend(res.get("warnings") or [])
         if not res.get("ok"):
             continue
@@ -682,7 +758,13 @@ def emit_field_parameters(calcs, *, field_locator, used_names=None, existing_tab
         parts.append((final, res["tmdl"]))
         table_names.append(res["table_name"])
         consumed.add(name)
-    return {"parts": parts, "table_names": table_names, "consumed": consumed, "warnings": warnings}
+        # report-side spec: lets a visual EXPAND this parameter (seed projection + fieldParameters
+        # block). Kept in detection order so the self-service table's slot order is stable.
+        specs.append({"calc_name": name, "table_name": res["table_name"],
+                      "display_col": res["display_col"], "role": res.get("role"),
+                      "entries": res.get("entries") or []})
+    return {"parts": parts, "table_names": table_names, "consumed": consumed,
+            "specs": specs, "measures": synth.definitions, "warnings": warnings}
 
 
 # =============================================================================

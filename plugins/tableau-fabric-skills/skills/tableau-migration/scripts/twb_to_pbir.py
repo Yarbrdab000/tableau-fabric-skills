@@ -53,6 +53,18 @@ SCHEMA_VISUAL = f"{_S}/definition/visualContainer/1.0.0/schema.json"
 SCHEMA_PLATFORM = ("https://developer.microsoft.com/json-schemas/fabric/"
                    "gitIntegration/platformProperties/2.0.0/schema.json")
 
+# Field-parameter (swap) report schema set. A visual that CONSUMES a field parameter must encode it
+# as an *expansion* -- a seed projection per slot plus a sibling ``fieldParameters`` array binding
+# each slot index to the parameter's display column. Omitting that block makes Power BI render the
+# parameter option *labels* as static text instead of swapping the field. The expansion is only
+# honored at the newer schema versions a current Power BI Desktop stamps for such a report (verified
+# against a Desktop-authored oracle), so the self-service swap report pins them explicitly rather
+# than reusing the thin-shell 1.0.0 set above.
+SCHEMA_REPORT_FP = f"{_S}/definition/report/3.3.0/schema.json"
+SCHEMA_PAGES_FP = f"{_S}/definition/pagesMetadata/1.1.0/schema.json"
+SCHEMA_PAGE_FP = f"{_S}/definition/page/2.1.0/schema.json"
+SCHEMA_VISUAL_FP = f"{_S}/definition/visualContainer/2.10.0/schema.json"
+
 MEASURES_TABLE = "_Measures"
 PAGE_WIDTH = 1280
 PAGE_HEIGHT = 720
@@ -1039,6 +1051,152 @@ def _dumps(obj):
     return json.dumps(obj, indent=2)
 
 
+def report_json_part():
+    """The ``definition/report.json`` content shared by the full viz seam (``emit_pbir``) and the
+    thin ``.pbip`` shell (``assemble_model.build_thin_report_parts``).
+
+    The ``themeCollection.baseTheme`` is **required**: current Power BI Desktop's enhanced-report
+    loader dereferences the report theme inside ``GetEnhancedReportDocument``, so a ``report.json``
+    with no ``baseTheme`` throws a ``NullReferenceException`` when the report opens (the semantic
+    model still loads, but the authoring canvas/Visualizations pane never initializes). Keeping a
+    single builder prevents the two emit paths from drifting on this again.
+    """
+    return {
+        "$schema": SCHEMA_REPORT,
+        "layoutOptimization": "None",
+        "themeCollection": {"baseTheme": {
+            "name": "CY24SU10",
+            "reportVersionAtImport": "5.61",
+            "type": "SharedResources"}},
+    }
+
+
+# -- Field-parameter (swap) self-service report --------------------------------
+def report_json_part_fp():
+    """``report.json`` for the field-parameter (swap) self-service report.
+
+    Mirrors what a current Power BI Desktop stamps for a report whose visuals consume field
+    parameters: the richer ``report/3.3.0`` theme block (``reportVersionAtImport`` is an object, and
+    a ``SharedResources`` resource package + ``settings`` accompany it). The ``baseTheme`` is still
+    REQUIRED -- a ``report.json`` without it throws ``NullReferenceException`` on open (see
+    ``report_json_part``). ``CY24SU10`` is a built-in shared theme, so no local theme file is needed.
+    """
+    return {
+        "$schema": SCHEMA_REPORT_FP,
+        "themeCollection": {"baseTheme": {
+            "name": "CY24SU10",
+            "reportVersionAtImport": {"visual": "1.8.97", "report": "2.0.97", "page": "1.3.97"},
+            "type": "SharedResources"}},
+        "resourcePackages": [{
+            "name": "SharedResources", "type": "SharedResources",
+            "items": [{"name": "CY24SU10", "path": "BaseThemes/CY24SU10.json",
+                       "type": "BaseTheme"}]}],
+        "settings": {"useEnhancedTooltips": False},
+    }
+
+
+def _fp_seed_projection(entry):
+    """One seed projection for a field-parameter slot -- the parameter's first candidate field.
+
+    The field parameter overrides this at runtime per the slicer selection, so the seed only
+    supplies a valid default; ``nativeQueryRef``/``displayName`` carry the parameter's option label
+    (matching what Desktop writes), while ``queryRef`` points at the concrete seed field.
+    """
+    table, col, label = entry["table"], entry["column"], entry["label"]
+    if entry.get("is_measure"):
+        field = {"Measure": {"Expression": {"SourceRef": {"Entity": table}}, "Property": col}}
+    else:
+        field = {"Column": {"Expression": {"SourceRef": {"Entity": table}}, "Property": col}}
+    return {"field": field, "queryRef": f"{table}.{col}",
+            "nativeQueryRef": label, "displayName": label}
+
+
+def field_parameter_table_visual(name, specs, position, *, visual_type=VT_TABLE):
+    """A ``tableEx``/``pivotTable`` whose Values well EXPANDS a list of field parameters.
+
+    ``specs`` is an ordered list of ``emit_field_parameters`` spec dicts
+    (``{table_name, display_col, entries:[{label, table, column, is_measure, order}, ...]}``). Each
+    spec contributes ONE seed projection (its first candidate) and ONE ``fieldParameters`` entry
+    binding that slot's projection index to the parameter's display column (``length`` 1). Slot
+    order follows ``specs`` order, so a 3-dim + 3-measure self-service table reproduces the customer
+    layout 1:1. Specs with no resolved entries are skipped.
+    """
+    projections, field_params = [], []
+    for spec in specs or []:
+        entries = spec.get("entries") or []
+        if not entries:
+            continue
+        idx = len(projections)
+        projections.append(_fp_seed_projection(entries[0]))
+        field_params.append({
+            "parameterExpr": {"Column": {
+                "Expression": {"SourceRef": {"Entity": spec["table_name"]}},
+                "Property": spec["display_col"]}},
+            "index": idx, "length": 1})
+    state = {"Values": {"projections": projections, "fieldParameters": field_params}}
+    return {
+        "$schema": SCHEMA_VISUAL_FP,
+        "name": name,
+        "position": position,
+        "visual": {"visualType": _VT_TO_PBIR[visual_type], "query": {"queryState": state}},
+    }
+
+
+def field_parameter_slicer(name, spec, position):
+    """A ``listSlicer`` bound to one field parameter's display column (a slot's field picker)."""
+    table, col = spec["table_name"], spec["display_col"]
+    state = {"Values": {"projections": [{
+        "field": {"Column": {"Expression": {"SourceRef": {"Entity": table}}, "Property": col}},
+        "queryRef": f"{table}.{col}", "nativeQueryRef": col, "active": True}]}}
+    return {
+        "$schema": SCHEMA_VISUAL_FP,
+        "name": name,
+        "position": position,
+        "visual": {"visualType": "listSlicer", "query": {"queryState": state}},
+    }
+
+
+def build_field_parameter_page(parts, specs, *, page_name="pageSelfService",
+                               display_name="Self-Service Table", visual_type=VT_TABLE):
+    """Write one self-service page into ``parts``: a field-parameter-driven table across the top and
+    a row of field-picker slicers beneath (one ``listSlicer`` per parameter).
+
+    ``specs`` are ``emit_field_parameters`` specs (dim + measure swaps, in slot order). Returns the
+    ``page_name`` written, or ``None`` when there are no usable specs (caller falls back to the thin
+    shell). Page/visual ``$schema`` values use the field-parameter set so the expansion renders.
+    """
+    usable = [s for s in (specs or []) if (s.get("entries") or [])]
+    if not usable:
+        return None
+    base = f"definition/pages/{page_name}"
+    parts[f"{base}/page.json"] = _dumps({
+        "$schema": SCHEMA_PAGE_FP, "name": page_name, "displayName": display_name,
+        "displayOption": "FitToPage", "height": PAGE_HEIGHT, "width": PAGE_WIDTH})
+
+    visuals = []
+    table_h = round(PAGE_HEIGHT * 0.55, 2)
+    tname = _sanitize(f"fptable-{page_name}")
+    visuals.append((tname, field_parameter_table_visual(
+        tname, usable, _position(8, 12, PAGE_WIDTH - 16, table_h, tab=0),
+        visual_type=visual_type)))
+
+    n = len(usable)
+    gap = 12
+    slot_w = (PAGE_WIDTH - 16 - gap * (n - 1)) / n if n else 200.0
+    slot_w = max(120.0, slot_w)
+    sy = table_h + 28
+    sh = max(80.0, PAGE_HEIGHT - sy - 12)
+    for i, spec in enumerate(usable):
+        sx = 8 + i * (slot_w + gap)
+        sname = _sanitize(f"fpslicer-{page_name}-{i}-{spec['table_name']}")
+        visuals.append((sname, field_parameter_slicer(
+            sname, spec, _position(sx, sy, slot_w, sh, z=1, tab=i + 1))))
+
+    for vname, vjson in visuals:
+        parts[f"{base}/visuals/{vname}/visual.json"] = _dumps(vjson)
+    return page_name
+
+
 def _filter_slicer_fields(ws_list):
     """Collect distinct filtered fields across worksheets (one slicer each)."""
     seen, out = set(), []
@@ -1073,14 +1231,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     })
     parts["definition/version.json"] = _dumps({
         "$schema": SCHEMA_VERSION, "version": "2.0.0"})
-    parts["definition/report.json"] = _dumps({
-        "$schema": SCHEMA_REPORT,
-        "layoutOptimization": "None",
-        "themeCollection": {"baseTheme": {
-            "name": "CY24SU10",
-            "reportVersionAtImport": "5.61",
-            "type": "SharedResources"}},
-    })
+    parts["definition/report.json"] = _dumps(report_json_part())
     parts[".platform"] = _dumps({
         "$schema": SCHEMA_PLATFORM,
         "metadata": {"type": "Report", "displayName": report_name},

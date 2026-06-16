@@ -172,7 +172,7 @@ def _calc_lookup_from(calcs):
 
 
 def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
-                   calc_lookup=None, approved_calc_dax=None):
+                   calc_lookup=None, approved_calc_dax=None, synth_measures=None):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
     ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
@@ -200,6 +200,12 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     measures_tmdl = ""
     report = []
     suggestions = []
+    # Aggregating measures synthesized for measure-swap field parameters (a NAMEOF'd raw column is
+    # grouped-by, not aggregated, so each measure-swap candidate needs a real SUM measure to point at).
+    for sm in (synth_measures or []):
+        measures_tmdl += T.generate_measure_tmdl(
+            sm["name"], sm.get("tableau_formula", ""), sm["dax"],
+            translated_by="deterministic (measure-swap aggregation)")
     for calc in calcs or []:
         name, formula = calc["name"], calc.get("formula", "")
         if name.lower() in consumed_lower:
@@ -965,6 +971,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
 
     reserved = {n.lower() for n in table_names} | {"_measures"}
     reserved |= {t.lower() for t in fp["table_names"]}
+    reserved |= {(m.get("name") or "").lower() for m in (fp.get("measures") or [])}
     for rel in tables:
         for col in rel.get("columns") or []:
             mn = (col.get("model_name") or "").lower()
@@ -999,7 +1006,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     measures_table, measure_report, assisted_suggestions = _measures_part(
         calcs, resolve, consumed=consumed, param_resolver=param_resolver,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
-        approved_calc_dax=approved_calc_dax)
+        approved_calc_dax=approved_calc_dax, synth_measures=fp.get("measures"))
     parts["definition/tables/_Measures.tmdl"] = measures_table
     table_names.append("_Measures")
 
@@ -1047,6 +1054,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
             "consumed": sorted(consumed),
             "warnings": fp["warnings"],
             "count": len(fp["table_names"]),
+            "specs": fp.get("specs") or [],
+            "measures": [m["name"] for m in (fp.get("measures") or [])],
         },
         "value_parameters": {
             "tables": vp["table_names"],
@@ -1156,10 +1165,7 @@ def build_thin_report_parts(model_name, *, report_name=None, page_display="Overv
         "datasetReference": {"byPath": {"path": f"../{model_name}.SemanticModel"}},
     })
     parts["definition/version.json"] = R._dumps({"$schema": R.SCHEMA_VERSION, "version": "2.0.0"})
-    parts["definition/report.json"] = R._dumps({
-        "$schema": R.SCHEMA_REPORT,
-        "layoutOptimization": "None",
-    })
+    parts["definition/report.json"] = R._dumps(R.report_json_part())
     parts[".platform"] = R._dumps({
         "$schema": R.SCHEMA_PLATFORM,
         "metadata": {"type": "Report", "displayName": report_name},
@@ -1171,28 +1177,75 @@ def build_thin_report_parts(model_name, *, report_name=None, page_display="Overv
     return parts
 
 
+def build_swap_report_parts(model_name, specs, *, report_name=None,
+                            page_display="Self-Service Table"):
+    """Build a PBIR report whose single page is a **field-parameter-driven self-service table**:
+    dynamic dimension columns + dynamic measure columns (one ``fieldParameters`` slot per Tableau
+    swap parameter) plus a field-picker ``listSlicer`` per parameter.
+
+    ``specs`` come from ``emit_field_parameters`` (surfaced as
+    ``report["field_parameters"]["specs"]``). With no usable specs this returns the thin one-page
+    shell, so non-swap models are unaffected. Schema versions match what a current Power BI Desktop
+    stamps for a field-parameter report (see ``twb_to_pbir.SCHEMA_*_FP``) -- the expansion only
+    renders at those versions; the thin shell's 1.0.0 set stays as-is.
+    """
+    try:
+        from . import twb_to_pbir as R
+    except ImportError:
+        import twb_to_pbir as R
+    usable = [s for s in (specs or []) if (s.get("entries") or [])]
+    if not usable:
+        return build_thin_report_parts(model_name, report_name=report_name)
+    report_name = report_name or model_name
+    parts = {}
+    parts["definition.pbir"] = R._dumps({
+        "$schema": R.SCHEMA_DEFINITION_PROPERTIES,
+        "version": "4.0",
+        "datasetReference": {"byPath": {"path": f"../{model_name}.SemanticModel"}},
+    })
+    parts["definition/version.json"] = R._dumps({"$schema": R.SCHEMA_VERSION, "version": "2.0.0"})
+    parts["definition/report.json"] = R._dumps(R.report_json_part_fp())
+    parts[".platform"] = R._dumps({
+        "$schema": R.SCHEMA_PLATFORM,
+        "metadata": {"type": "Report", "displayName": report_name},
+        "config": {"version": "2.0", "logicalId": "00000000-0000-0000-0000-000000000000"},
+    })
+    page_name = R.build_field_parameter_page(parts, usable, display_name=page_display)
+    parts["definition/pages/pages.json"] = R._dumps({
+        "$schema": R.SCHEMA_PAGES_FP, "pageOrder": [page_name], "activePageName": page_name})
+    return parts
+
+
 # The .pbip pointer's $schema — Power BI Desktop rejects the project if this is wrong.
 PBIP_PROPERTIES_SCHEMA = ("https://developer.microsoft.com/json-schemas/fabric/"
                           "pbip/pbipProperties/1.0.0/schema.json")
 
 
-def write_local_pbip(parts, dest_dir, *, model_name, report_name=None, report_parts=None):
+def write_local_pbip(parts, dest_dir, *, model_name, report_name=None, report_parts=None,
+                     swap_specs=None):
     """Write an **openable** Power BI project (``.pbip``) under ``dest_dir``:
 
     - ``<model_name>.SemanticModel/`` — the TMDL model (from ``parts``)
     - ``<report_name>.Report/``       — a report bound *by path* to that model (thin one-page
-      shell by default; pass ``report_parts`` to supply a real rebuilt report)
+      shell by default; pass ``report_parts`` to supply a real rebuilt report, or ``swap_specs`` to
+      auto-emit a field-parameter self-service page)
     - ``<model_name>.pbip``           — the project pointer (correct ``pbipProperties/1.0.0`` schema)
 
     Double-click the ``.pbip`` to open it in Power BI Desktop. The semantic model is fully
-    functional on its own; the thin report exists only so the project opens. Returns the .pbip path.
+    functional on its own. When the model has field-parameter (swap) tables, pass their
+    ``swap_specs`` (``report["field_parameters"]["specs"]``) and the report becomes a working
+    self-service table (dynamic dimension + measure columns) instead of an empty shell; an explicit
+    ``report_parts`` always wins. Returns the .pbip path.
     """
     import json
     import os
     report_name = report_name or model_name
     write_model_folder(parts, os.path.join(dest_dir, f"{model_name}.SemanticModel"))
     if report_parts is None:
-        report_parts = build_thin_report_parts(model_name, report_name=report_name)
+        if swap_specs:
+            report_parts = build_swap_report_parts(model_name, swap_specs, report_name=report_name)
+        else:
+            report_parts = build_thin_report_parts(model_name, report_name=report_name)
     write_model_folder(report_parts, os.path.join(dest_dir, f"{report_name}.Report"))
     os.makedirs(dest_dir, exist_ok=True)
     pbip_path = os.path.join(dest_dir, f"{model_name}.pbip")
@@ -1510,7 +1563,9 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
     if write_to:
         import os
         if as_pbip:
-            result["pbip"] = write_local_pbip(result["parts"], write_to, model_name=model_name)
+            swap_specs = ((result.get("report") or {}).get("field_parameters") or {}).get("specs")
+            result["pbip"] = write_local_pbip(result["parts"], write_to, model_name=model_name,
+                                              swap_specs=swap_specs)
         else:
             model_dir = os.path.join(write_to, f"{model_name}.SemanticModel")
             write_model_folder(result["parts"], model_dir)
