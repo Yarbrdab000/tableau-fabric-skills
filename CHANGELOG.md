@@ -30,6 +30,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   parameters + what-if value parameters from `[Parameters].[X]`-driven `CASE`/`IF` swaps),
   `approved_calc_dax` landing, and a reconciliation value-oracle (`translation_reconcile.py`).
   Boundary documented in `resources/tier1-charter.md`. All report additions are additive.
+- **Packaging / install:** self-verifying installers (`install.ps1` / `install.sh`) that register
+  the plugin and **prove** it loaded (`copilot plugin list`), plus canonical `INSTALL.md` and
+  `UNINSTALL.md` (recommended plugin path, surface matrix, verification, and the demoted manual
+  folder-copy with a no-auto-scan warning).
+- **Drift guards:** `tests/test_mirror_parity.py` now covers all three skills (parametrized), and a
+  new `tests/test_manifest_sync.py` asserts the paired `marketplace.json` / `plugin.json` manifests
+  are byte-identical, parse, and resolve their `source` + skill paths.
+- **tableau-migration:** the skill now leads with a **gated runbook** (GATE RULES, Phase 0A
+  Decision Menu D1–D5, credentials form, Confirmation Ledger, and a 3-step
+  fetch → migrate → deploy sequence with `--help`-verified flags and per-step checkpoints), plus a
+  committed `migration.vars.example.ps1` template (git-ignored `migration.vars.local.ps1` for real
+  values).
+- **All skills:** an `AUTH MODEL` banner at the top of each `SKILL.md` to stop cross-skill auth
+  bleed (migration = PAT default / JWT opt-in; profiler = PAT or Connected-App JWT; landing-zone =
+  Connected App via the sidecar).
 
 ### Changed
 - **tableau-migration:** the `TranslatedBy` provenance annotation on deterministically-translated
@@ -43,6 +58,17 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 - **tableau-migration:** internal terminology cleanup across code comments, docstrings, and
   resource docs (removed internal play-numbering; the Tableau-Fabric-AI-Bridge attribution is
   retained).
+- **README / install docs:** the plugin marketplace path is now Option 1 ("Recommended — works on
+  current GitHub Copilot CLI"); the folder-copy method is demoted with an explicit warning that
+  current GitHub Copilot does **not** auto-scan `~/.copilot/skills/`. Added a surface matrix and
+  replaced "ask the agent what skills it has" with a real `/plugin list` + `/skills list` check.
+- **Agent convention files:** `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, and `.windsurfrules` gained
+  a short "Install / consume (for agents)" block with the two install commands and a link to
+  `INSTALL.md`.
+- **tableau-datasource-profiler:** `SKILL.md` now references its bundled scripts by skill-relative
+  paths (`requirements.txt`, `scripts/...`) instead of hardcoded `.github/skills/...` paths.
+- **tableau-migration:** `resources/self-update.md` wording standardized so the loaded-folder is the
+  canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
 - **tableau-mcp-landing-zone:** corrected the default `tableauMcpImage` pin. The previous

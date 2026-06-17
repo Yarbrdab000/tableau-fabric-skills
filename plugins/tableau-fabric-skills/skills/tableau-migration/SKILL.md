@@ -19,9 +19,165 @@ description: >
   "rebuild tableau datasource in fabric".
 ---
 
+> **AUTH MODEL — tableau-migration**
+> **PAT (default, recommended).** Connected App (Direct Trust) **JWT only if the user explicitly
+> selects D5=B.** Never silently switch auth modes or downgrade. The bundled scripts default to
+> `--auth pat`; JWT requires the Connected App client/secret to be supplied on purpose.
+
+---
+
+## ▶ RUN CONTRACT — read before doing anything
+
+This skill is a **gated, deterministic runbook**, not a freeform task. Follow the gates in order;
+do not improvise flags or infer answers. The detailed reference body begins after the
+"Run contract ends" marker further down.
+
+### GATE RULES (non-negotiable)
+
+1. **First turn = the Decision Menu, verbatim.** On invocation your FIRST message MUST be the
+   Phase 0A Decision Menu below — issue **no** tool call, shell command, or file read in that turn.
+2. **No defaults inferred, no question skipped.** Every decision (D1–D5) and every credential comes
+   from the user. A blank or ambiguous answer = **STOP and ASK**, never guess.
+3. **Do not run STEP 1 until the Confirmation Ledger (Phase 0C) is filled and the user replies
+   `GO`.** No early script execution.
+
+### Phase 0A — Decision Menu (present verbatim; defaults marked)
+
+```
+Before I migrate anything, confirm these 5 choices (e.g. reply "D1=A, D2=all, D3=A, D4=C, D5=A"):
+
+D1 — SOURCE
+   A) Live pull from Tableau Server/Cloud   (needs Tableau creds)
+   B) Local exported .tds files I already have
+
+D2 — SCOPE
+   all)      migrate every datasource found
+   <names>)  a subset — list the datasource names
+
+D3 — OUTPUTS  (forces both-vs-one)
+   A) Fabric + local bundle   (deploy AND keep the TMDL on disk)
+   B) Fabric only             (deploy, don't keep local)
+   C) Local only              (build the bundle, do NOT deploy)
+
+D4 — CONFLICTS (a model of the same name already exists in the workspace)
+   A) overwrite      B) skip      C) stop and ask   [default C]
+
+D5 — AUTH  (forces the auth choice)
+   A) PAT                       (default, recommended)
+   B) Connected App JWT (Direct Trust)
+```
+
+### Phase 0B — Credentials form (simple 2-file pattern)
+
+Collect the values below, then write them into a **git-ignored** local vars file — never paste the
+PAT/Connected-App secret into chat; it lives in Key Vault.
+
+| Variable | Meaning |
+|---|---|
+| `SITE_URL` | Tableau host, e.g. `10ay.online.tableau.com` (no `https://`) |
+| `SITE_NAME` | site contentUrl (URL slug; empty string for Default) |
+| `PAT_NAME` | Personal Access Token name (D5=A) |
+| `KV_NAME` | Azure Key Vault holding the secret value |
+| `SECRET_NAME` | the Key Vault secret whose value is the PAT (or Connected-App) secret |
+| `FABRIC_WORKSPACE` | target Fabric workspace name or GUID (only if D3 ≠ C) |
+
+If **D5=B**, also collect the Connected App `CLIENT_ID`, `SECRET_ID`, and impersonation
+`JWT_USERNAME` (the secret value still comes from Key Vault) instead of `PAT_NAME`.
+
+Set up the local vars file (mirrors the repo's `.env.example` → `.env` convention):
+
+```powershell
+Copy-Item .\migration.vars.example.ps1 .\migration.vars.local.ps1   # once
+# fill migration.vars.local.ps1 with the real values (it is git-ignored), then:
+. .\migration.vars.local.ps1
+```
+
+`migration.vars.example.ps1` is committed with **placeholders**; `migration.vars.local.ps1` holds
+the **real** values and is git-ignored — never commit or mirror it.
+
+### Phase 0C — Confirmation Ledger (the run gate)
+
+Echo the resolved choices + resources back, then wait for `GO`:
+
+```
+LEDGER — confirm, then reply GO
+  source     : <D1 A live / B local>   from <SITE_URL/SITE_NAME  or  .\tds>
+  scope      : <all | name1, name2, ...>
+  outputs    : <D3 A both / B Fabric only / C local only>
+  conflicts  : <D4 overwrite | skip | stop>
+  auth       : <D5 PAT | Connected App JWT>   (secret from KV <KV_NAME>/<SECRET_NAME>)
+  fabric ws  : <FABRIC_WORKSPACE>             (omit if D3=C)
+```
+
+Run nothing until the user replies `GO`.
+
+### The 3-step runbook (literal flags — do not alter)
+
+> Flags below are exactly what the bundled scripts accept (`--help`-verified). `fetch_tds.py`
+> downloads **one datasource per call** (there is no `--all`) and writes with `--out`;
+> `migrate_estate.py` takes `-i/-o` and emits `<out>/semantic_models/<Name>.SemanticModel` +
+> `report.json` + `summary.md`; `deploy_to_fabric.py` deploys **one** `--model-dir` per call.
+
+PowerShell (Windows lead). Dot-source the vars first: `. .\migration.vars.local.ps1`.
+
+**STEP 1 — assemble `.\tds` (one `.tds` per datasource)**
+
+- **D1=B (local):** drop the exported `.tds` files into `.\tds`, then go to STEP 2.
+- **D1=A (live):** pull the secret from Key Vault, then loop `fetch_tds.py` per datasource name:
+
+```powershell
+$env:TABLEAU_PAT_VALUE = az keyvault secret show --vault-name $KV_NAME --name $SECRET_NAME --query value -o tsv
+New-Item -ItemType Directory -Force -Path .\tds | Out-Null
+foreach ($ds in @("<Datasource A>","<Datasource B>")) {   # D2 scope
+  py -3.11 scripts\fetch_tds.py --server $SITE_URL --site $SITE_NAME `
+    --datasource-name $ds --auth pat --pat-name $PAT_NAME --out .\tds
+}
+```
+
+D5=B (JWT): replace `--auth pat --pat-name $PAT_NAME` with
+`--auth jwt --client-id $CA_CLIENT_ID --secret-id $CA_SECRET_ID --secret-value $env:TABLEAU_PAT_VALUE --jwt-username $JWT_USERNAME`.
+
+**Checkpoint 1:** `.\tds` holds one `.tds` per requested datasource. Fewer than expected → STOP.
+
+**STEP 2 — build the Fabric bundle**
+
+```powershell
+py -3.11 scripts\migrate_estate.py -i .\tds -o .\out
+```
+
+**Checkpoint 2:** `.\out\semantic_models` has one `*.SemanticModel` per datasource and
+`.\out\report.json` shows `summary.datasources_migrated > 0`. Empty / `0` → STOP and read
+`.\out\summary.md`.
+
+**STEP 3 — deploy (skip entirely if D3=C / local only)**
+
+Deploy each model folder (one `--model-dir` per call):
+
+```powershell
+Get-ChildItem .\out\semantic_models -Directory | ForEach-Object {
+  py -3.11 scripts\deploy_to_fabric.py --model-dir $_.FullName --workspace $FABRIC_WORKSPACE --use-az
+}
+```
+
+D4 handling: overwrite redeploys same-named models; skip → exclude existing names from the loop;
+stop → halt on the first conflict and ask. If a model binds an on-prem source, add
+`--gateway-id <id>`.
+
+**Checkpoint 3:** each deploy completes its LRO without error. Any failure → STOP, do not continue.
+If D3=B (Fabric only), remove `.\out` after a clean deploy; if D3=A, keep it.
+
+bash equivalent: same flags with `python3.11` instead of `py -3.11`; export the same variables in
+your shell (or a local, git-ignored file you `source`) and read the secret with
+`az keyvault secret show --vault-name "$KV_NAME" --name "$SECRET_NAME" --query value -o tsv` into
+`TABLEAU_PAT_VALUE`.
+
+<!-- ===== Run contract ends; detailed reference body below ===== -->
+
+---
+
 > **Updating this skill — only when the user asks**
 > There is **no** mandatory per-session update check. When the user asks to *check for updates / update / upgrade / refresh the `tableau-migration` skill* (or "update yourself"), follow [`resources/self-update.md`](resources/self-update.md). It is a **version-aware reinstaller**, not a guess:
-> - **Source of truth:** repo `https://github.com/Yarbrdab000/tableau-fabric-skills`, skill subpath `skills/tableau-migration`, version stamp `skills/tableau-migration/VERSION`. **Install target** (Copilot user scope) `~/.copilot/skills/tableau-migration` — or the folder this `SKILL.md` was loaded from.
+> - **Source of truth:** repo `https://github.com/Yarbrdab000/tableau-fabric-skills`, skill subpath `skills/tableau-migration`, version stamp `skills/tableau-migration/VERSION`. **Install target:** the folder this `SKILL.md` was loaded from (canonical); `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 > - **Compare, then act:** read installed `VERSION` → read remote `VERSION` → only reinstall if remote is newer (or the user forces). Install is an **explicit wholesale overwrite** (`scripts/` + `resources/` + `SKILL.md` + `VERSION`), then a **fail-loud verification** (assert `migrate_datasource` / `extract_calcs` / `fetch_tds` exist + run `pytest`; on failure, restore the backup and stop). Finish by reporting the delta (e.g. `1.2.1 → 1.3.0`).
 > - **Mid-session caveat:** skills load at session start, so the update is not live until a **new** session.
 

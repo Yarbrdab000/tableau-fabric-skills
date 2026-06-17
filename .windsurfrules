@@ -3,6 +3,19 @@
 Rules for Windsurf / Cascade working in this repository. The complete agent guide is `AGENTS.md`;
 the non-negotiable rules are repeated here.
 
+## Install / consume (for agents)
+
+To make these skills actually load in a client, register the **plugin** -- do NOT copy folders
+into `~/.copilot/skills/` (current GitHub Copilot CLI does not auto-scan it):
+
+```
+/plugin marketplace add Yarbrdab000/tableau-fabric-skills
+/plugin install tableau-fabric-skills@tableau-collection
+```
+
+Start a new session, then verify with `/plugin list` and `/skills list`. Full details /
+uninstall: `INSTALL.md` / `UNINSTALL.md`.
+
 ## Project
 
 `tableau-fabric-skills` — a standalone collection of three Tableau -> Microsoft Fabric / Power BI

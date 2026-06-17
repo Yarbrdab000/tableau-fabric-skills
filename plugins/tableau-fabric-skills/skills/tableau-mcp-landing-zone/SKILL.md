@@ -18,6 +18,11 @@ description: >
   "tableau row level security copilot", "tableau mcp passthrough", "tableau mcp landing zone".
 ---
 
+> **AUTH MODEL — tableau-mcp-landing-zone**
+> Tableau **Connected App (Direct Trust)** at the auth sidecar, with an `x-api-key` front door for
+> callers. Entra → Tableau **passthrough** is the secure default; `service_account` is an explicit
+> fallback only — **never auto-downgrade** from a failed passthrough.
+
 > **CRITICAL — credentials & identity are a security boundary.**
 > This skill emits **deployment parameters and configuration only**. It never stores or commits
 > a Tableau Connected App secret or `sidecarApiKey`. The user creates the Connected App, supplies

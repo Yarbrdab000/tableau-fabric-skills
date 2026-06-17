@@ -1,11 +1,11 @@
 """Guards the canonical <-> plugin mirror against silent drift.
 
-The skill ships twice: the canonical tree at ``skills/tableau-migration`` and a
-byte-identical mirror at ``plugins/tableau-fabric-skills/skills/tableau-migration``
+Each skill ships twice: the canonical tree at ``skills/<name>`` and a
+byte-identical mirror at ``plugins/tableau-fabric-skills/skills/<name>``
 (the plugin/marketplace install path, a packaging convention mirrored from
 ``microsoft/skills-for-fabric``). The mirror is regenerated with ``robocopy /MIR``;
-this test turns that manual ritual into a guarded artifact -- if the two trees ever
-diverge, the suite fails instead of shipping inconsistent copies.
+this test turns that manual ritual into a guarded artifact -- if any of the three
+skill trees ever diverge, the suite fails instead of shipping inconsistent copies.
 
 It runs from either tree: it walks up to the repository root (the directory that
 contains BOTH ``skills`` and ``plugins``) and compares the two skill subtrees. When
@@ -22,10 +22,19 @@ import pytest
 _EXCLUDE_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 _EXCLUDE_SUFFIXES = (".pyc", ".pyo")
 
-_CANONICAL_REL = os.path.join("skills", "tableau-migration")
-_MIRROR_REL = os.path.join(
-    "plugins", "tableau-fabric-skills", "skills", "tableau-migration"
+_SKILL_NAMES = (
+    "tableau-datasource-profiler",
+    "tableau-mcp-landing-zone",
+    "tableau-migration",
 )
+
+
+def _canonical_rel(skill):
+    return os.path.join("skills", skill)
+
+
+def _mirror_rel(skill):
+    return os.path.join("plugins", "tableau-fabric-skills", "skills", skill)
 
 
 def _find_repo_root():
@@ -64,15 +73,16 @@ def _snapshot(root):
     return out
 
 
-def test_plugin_mirror_is_byte_identical_to_canonical():
+@pytest.mark.parametrize("skill", _SKILL_NAMES)
+def test_plugin_mirror_is_byte_identical_to_canonical(skill):
     root = _find_repo_root()
     if root is None:
         pytest.skip("repo root with both skills/ and plugins/ not found")
 
-    canonical_dir = os.path.join(root, _CANONICAL_REL)
-    mirror_dir = os.path.join(root, _MIRROR_REL)
+    canonical_dir = os.path.join(root, _canonical_rel(skill))
+    mirror_dir = os.path.join(root, _mirror_rel(skill))
     if not os.path.isdir(mirror_dir):
-        pytest.skip("plugin mirror tree not present")
+        pytest.skip("plugin mirror tree not present for %s" % skill)
 
     canonical = _snapshot(canonical_dir)
     mirror = _snapshot(mirror_dir)
@@ -83,6 +93,6 @@ def test_plugin_mirror_is_byte_identical_to_canonical():
         f for f in (set(canonical) & set(mirror)) if canonical[f] != mirror[f]
     )
 
-    assert not missing, f"files present in canonical but missing from mirror: {missing}"
-    assert not extra, f"files present in mirror but not in canonical: {extra}"
-    assert not differing, f"files whose bytes differ between trees: {differing}"
+    assert not missing, f"{skill}: present in canonical but missing from mirror: {missing}"
+    assert not extra, f"{skill}: present in mirror but not in canonical: {extra}"
+    assert not differing, f"{skill}: files whose bytes differ between trees: {differing}"

@@ -16,13 +16,16 @@ the previous copy rather than leaving a half-synced skill.
 | Skill subpath in repo | `skills/tableau-migration` |
 | Version stamp (in repo) | `skills/tableau-migration/VERSION` (a single semver line, e.g. `1.0.0`) |
 | Version stamp (raw URL) | `https://raw.githubusercontent.com/Yarbrdab000/tableau-fabric-skills/main/skills/tableau-migration/VERSION` |
-| **Default install target** (GitHub Copilot CLI, user scope) | `~/.copilot/skills/tableau-migration` → on Windows `"$HOME\.copilot\skills\tableau-migration"` |
+| **Manual fallback target** (older / non-plugin clients, user scope) | `~/.copilot/skills/tableau-migration` → on Windows `"$HOME\.copilot\skills\tableau-migration"` |
 | Installed version stamp | `<INSTALL_DIR>/VERSION` |
 
-`<INSTALL_DIR>` is the folder the **currently running `SKILL.md` was loaded from** — you already know
-that absolute path. The default above is the Copilot user-scope location; a project-scoped install is
-instead `<repo>/.github/skills/tableau-migration` or `<repo>/.agents/skills/tableau-migration`. Use the
-real loaded path; only fall back to the default if you cannot determine it, and confirm with the user.
+`<INSTALL_DIR>` is the folder the **currently running `SKILL.md` was loaded from** — that absolute
+path is canonical, and you already know it. With the recommended **plugin** install the skill loads
+from the plugin's copy, **not** from `~/.copilot/skills/`; the path in the table is a
+**manual-only fallback** for older clients. A project-scoped install is instead
+`<repo>/.github/skills/tableau-migration` or `<repo>/.agents/skills/tableau-migration`. Always use
+the real loaded path; only fall back to the table path if you cannot determine it, and confirm with
+the user.
 
 ## Trigger phrase → steps
 

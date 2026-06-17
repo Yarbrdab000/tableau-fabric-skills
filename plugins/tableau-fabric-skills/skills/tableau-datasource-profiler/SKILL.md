@@ -21,6 +21,11 @@ description: >-
   "tableau data quality", "audit tableau datasource".
 ---
 
+> **AUTH MODEL — tableau-datasource-profiler**
+> **PAT (default)** *or* **Connected App (Direct Trust) JWT** (`--auth jwt`) when you need
+> Site-Admin impersonation that bypasses RLS for complete value stats. **Read-only** — never
+> modifies Tableau.
+
 # Tableau Datasource Profiler
 
 Profiles a single published Tableau datasource using Tableau's REST APIs directly
@@ -58,7 +63,7 @@ Two API paths:
 ## Setup
 
 ```bash
-pip install -r .github/skills/tableau-datasource-profiler/requirements.txt
+pip install -r requirements.txt
 ```
 
 Set credentials as environment variables (PAT must belong to a **Site Administrator** for a
@@ -94,15 +99,15 @@ live-tested against a real Tableau Cloud connected app (sign-in + Metadata API +
 
 ```bash
 # Schema profile (cheap, default) as Markdown
-python .github/skills/tableau-datasource-profiler/scripts/profile_datasource.py \
+python scripts/profile_datasource.py \
   --datasource-name "Superstore"
 
 # Full profile with value stats, as JSON to a file
-python .github/skills/tableau-datasource-profiler/scripts/profile_datasource.py \
+python scripts/profile_datasource.py \
   --datasource-luid abc-123-luid --with-stats --format json --out profile.json
 
 # See exactly what requests would be sent, without calling Tableau
-python .github/skills/tableau-datasource-profiler/scripts/profile_datasource.py \
+python scripts/profile_datasource.py \
   --datasource-name "Superstore" --with-stats --dry-run
 ```
 
@@ -119,12 +124,12 @@ query object (an array of `fields` plus optional `filters`); the tool runs it an
 
 ```bash
 # "Sales and profit by region, highest first"
-python .github/skills/tableau-datasource-profiler/scripts/query_datasource.py \
+python scripts/query_datasource.py \
   --datasource-name "Superstore" --query-json \
   '{"fields":[{"fieldCaption":"Region"},{"fieldCaption":"Sales","function":"SUM","sortDirection":"DESC","sortPriority":1},{"fieldCaption":"Profit","function":"SUM"}]}'
 
 # "Top 5 states by sales" (TOP filter), as JSON
-python .github/skills/tableau-datasource-profiler/scripts/query_datasource.py \
+python scripts/query_datasource.py \
   --datasource-name "Superstore" --query-file q.json --format json
 ```
 

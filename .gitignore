@@ -13,6 +13,9 @@
 *credential*
 !**/security-governance.md
 
+# Local, prefilled migration variables (real values) — only the committed *.example.ps1 is a template
+migration.vars.local.ps1
+
 # Temp / scratch harnesses
 _*.py
 !__init__.py

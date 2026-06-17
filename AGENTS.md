@@ -5,6 +5,20 @@ working in this repository. Human contributors should read it too. The tool-spec
 (`CLAUDE.md`, `.cursorrules`, `.windsurfrules`) repeat the critical rules and point here; this
 file is the source of truth.
 
+## Install / consume (for agents)
+
+To make these skills actually load in a client, register the **plugin** — do **not** copy folders
+into `~/.copilot/skills/` (current GitHub Copilot CLI does not auto-scan it, so it no-ops
+silently):
+
+```
+/plugin marketplace add Yarbrdab000/tableau-fabric-skills
+/plugin install tableau-fabric-skills@tableau-collection
+```
+
+Start a new session, then verify with `/plugin list` (expect `tableau-fabric-skills`) and
+`/skills list`. Full details / uninstall: [`INSTALL.md`](INSTALL.md) / [`UNINSTALL.md`](UNINSTALL.md).
+
 ## What this repository is
 
 `tableau-fabric-skills` is a standalone collection of three install-and-go agent skills that

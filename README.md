@@ -22,67 +22,55 @@ over MCP, **migrate** into Fabric.
 
 ## Install
 
-No build step — a "skill" is just a folder the agent reads, so installing one means
-putting that folder where your agent looks. Pick the easiest option that works for you.
+Skills load when you register them as a **plugin** — current GitHub Copilot CLI loads skills from
+built-in directories and installed plugins, **not** from a personal `~/.copilot/skills/` folder.
+Full install / verify / uninstall details live in [`INSTALL.md`](INSTALL.md) /
+[`UNINSTALL.md`](UNINSTALL.md).
 
-### Option 1 — Ask your Copilot to install it (easiest, no terminal)
+### Option 1 — Recommended (works on current GitHub Copilot CLI)
 
-Open **GitHub Copilot CLI** (or Claude Code / Cursor) and paste this, changing nothing:
-
-> Install the agent skills from https://github.com/Yarbrdab000/tableau-fabric-skills .
-> Clone it to a temp folder, copy every subfolder of its `skills/` directory into my
-> personal skills folder (`~/.copilot/skills/` for Copilot CLI, `~/.claude/skills/` for
-> Claude Code), delete the temp clone, then list what you installed.
-
-The agent does the download and copy for you. **Restart the agent** when it finishes and
-the skills are live. (That is the whole thing — the options below are the same actions by hand.)
-
-### Option 2 — Copy the folders yourself
-
-You are copying a **folder**. The repo has a `skills/` folder with three subfolders; copy
-the one(s) you want into the folder your agent scans for skills.
-
-**Windows (PowerShell)** — installs all three, available in every chat:
+Self-verifying installer — registers the plugin and **proves it loaded** (exits non-zero if not):
 
 ```powershell
 git clone https://github.com/Yarbrdab000/tableau-fabric-skills.git
-Copy-Item .\tableau-fabric-skills\skills\* "$env:USERPROFILE\.copilot\skills\" -Recurse -Force
+cd tableau-fabric-skills
+./install.ps1     # macOS / Linux: ./install.sh
 ```
 
-**macOS / Linux (bash):**
+Or run the two commands yourself in a Copilot CLI session:
 
-```bash
-git clone https://github.com/Yarbrdab000/tableau-fabric-skills.git
-mkdir -p ~/.copilot/skills
-cp -R tableau-fabric-skills/skills/* ~/.copilot/skills/
-```
-
-When it finishes you should have, for example, `~/.copilot/skills/tableau-migration/SKILL.md`.
-**Restart your agent.** Done. (To install just one skill, copy that single subfolder instead of `*`.)
-
-Destinations by agent and scope:
-
-| Agent | Personal (every chat, any repo) | Project (one repo only) |
-|---|---|---|
-| GitHub Copilot CLI / VS Code | `~/.copilot/skills/` | `<your-repo>/.github/skills/` |
-| Claude Code | `~/.claude/skills/` | `<your-repo>/.claude/skills/` |
-
-> `~` means your home folder. On Windows that is `C:\Users\<you>`, so the personal path is
-> `C:\Users\<you>\.copilot\skills\`.
-
-### Option 3 — Plugin marketplace (newer clients only)
-
-```
+```text
 /plugin marketplace add Yarbrdab000/tableau-fabric-skills
 /plugin install tableau-fabric-skills@tableau-collection
 ```
 
-Installs all three. If `/plugin` is not recognized your client is too old — use Option 1 or 2.
+`tableau-fabric-skills` is the plugin, `tableau-collection` the marketplace — installing it
+installs all three skills. **Start a new session**; skills load at session start.
 
-### Check it worked
+### Verify it loaded
 
-Ask your agent **"what skills do you have?"** — or just **"profile my Tableau datasource."**
-If it knows about the Tableau-to-Fabric skills, you are set.
+```text
+/plugin list     → expect "tableau-fabric-skills"
+/skills list     → expect tableau-datasource-profiler, tableau-mcp-landing-zone, tableau-migration
+```
+
+Don't rely on asking the agent "what skills do you have?" — that can't fail loudly.
+
+### Where each surface loads skills from
+
+| Surface | Loads skills from | Notes |
+|---|---|---|
+| Terminal GitHub Copilot CLI | built-in + installed **plugins**; repo `.github/skills/` in-repo | Skills load at session start — restart after installing. |
+| Desktop app — general chat | built-in + **plugin** skills | May expose only built-in/plugin skills. |
+| VS Code Copilot | installed **plugins** (+ repo-scoped config) | Restart the session/window to load. |
+
+### Option 2 — Manual folder copy (older clients only)
+
+> ⚠️ **Current GitHub Copilot does not auto-scan `~/.copilot/skills/`.** Copying the skill
+> folders there produces no error and the skills never load. Use Option 1 unless your client is
+> too old to support `/plugin`. The folder-copy commands and per-agent destinations are in
+> [`INSTALL.md`](INSTALL.md#manual-folder-copy-older-clients-only); uninstall is in
+> [`UNINSTALL.md`](UNINSTALL.md).
 
 ## Layout
 
