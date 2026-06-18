@@ -7,9 +7,10 @@ these prove the WHOLE emitted bundle hangs together and faithfully mirrors the s
 Two targets describe behavior that is broken on ``main`` today and are handled with an *imperative*
 ``pytest.xfail`` gated on the validator's machine TAG for the known issue:
 
-* target 3 -- the ``definition.pbir`` ``byPath`` open-blocker (report references
-  ``../<name>.SemanticModel`` but models live under ``semantic_models/``), plus the absence of a
-  ``*.pbip`` project manifest (Power BI Desktop opens a ``.pbip``);
+* target 3 -- the ``definition.pbir`` ``byPath`` open-blocker for the ``reports/`` viz tree (report
+  references ``../<name>.SemanticModel`` but models live under ``semantic_models/``). The former
+  absence of a ``*.pbip`` project manifest is now FIXED -- the orchestrator emits an openable
+  ``.pbip`` per datasource (``pbip=True`` default), asserted by ``test_target_3_pbip_manifest_emitted``;
 * target 6 -- a cross-DB federated datasource collapses to the land-to-Delta fallback instead of
   emitting per-side source descriptors + join-key model relationships.
 
@@ -96,16 +97,17 @@ def test_target_3_pins_exact_paths(estate):
     assert "../../semantic_models/Superstore.SemanticModel" in blob  # the corrected byPath
 
 
-def test_target_3_pbip_manifest_known_blocker(estate):
-    """No *.pbip project manifest is emitted -> Power BI Desktop has nothing to open. KNOWN blocker."""
-    _ctx, results = estate
+def test_target_3_pbip_manifest_emitted(estate):
+    """The orchestrator now emits an openable ``*.pbip`` per datasource (``pbip=True`` default), so
+    Power BI Desktop has a project to open -- resolving the former ``no-pbip`` blocker. The separate
+    ``reports/`` byPath-layout-mismatch remains tracked by
+    ``test_target_3_model_presence_and_reference_integrity``.
+    """
+    ctx, results = estate
     r = results["3"]
-    if r.status == FAIL and "no-pbip" in r.tags:
-        pytest.xfail(
-            "KNOWN blocker: the orchestrator emits semantic_models/ + reports/ + report.json but no "
-            "*.pbip project manifest; Power BI Desktop opens a .pbip, so the bundle is not openable "
-            "as a project as-is.")
-    assert r.status == PASS, _diag(r)
+    pbip_tags = {"no-pbip", "pbip-invalid", "pbip-no-artifact", "pbip-dangling-artifact"}
+    assert not (pbip_tags & r.tags), _diag(r)
+    assert vb._find_pbip(ctx.output_dir), "expected at least one openable .pbip manifest in the bundle"
 
 
 # =============================================================================

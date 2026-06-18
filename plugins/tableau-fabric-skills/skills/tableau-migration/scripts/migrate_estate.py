@@ -50,12 +50,12 @@ from datetime import datetime, timezone
 try:  # works whether imported as a package or run with scripts/ on sys.path
     from .connection_to_m import parse_tds
     from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
-    from .assemble_model import assemble_import_model, write_model_folder
+    from .assemble_model import assemble_import_model, write_model_folder, write_local_pbip
     from .parameters import parse_parameters
 except ImportError:
     from connection_to_m import parse_tds
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
-    from assemble_model import assemble_import_model, write_model_folder
+    from assemble_model import assemble_import_model, write_model_folder, write_local_pbip
     from parameters import parse_parameters
 
 
@@ -470,7 +470,7 @@ def _resolve_viz_stage(injected):
     return None
 
 
-def _migrate_one_datasource(source, ds_id, sm_dir, used_folders):
+def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None):
     """Drive the full per-datasource pipeline. Returns a report detail dict (never raises)."""
     name = source.asset_name(ds_id)
     detail = {"name": name, "source_id": str(ds_id)}
@@ -531,7 +531,8 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders):
                       error=f"{type(exc).__name__}: {exc}")
         return detail
 
-    folder = _safe_folder(name, used_folders) + ".SemanticModel"
+    safe_base = _safe_folder(name, used_folders)
+    folder = safe_base + ".SemanticModel"
     dest = os.path.join(sm_dir, folder)
     try:
         if os.path.isdir(dest):
@@ -543,6 +544,24 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders):
 
     report = out["report"]
     decision = report.get("storage_decision", decision)  # canonical decision from the assembler
+
+    # Additive local deliverable: an openable Power BI project (.pbip) per datasource so users can
+    # double-click straight into Power BI Desktop. The semantic_models/ folder written above stays
+    # the canonical output (byte-identical); this is a self-contained copy under pbip/<name>/ and
+    # never alters it. A pbip write failure is non-fatal -- the model already landed, so the
+    # datasource stays "migrated" and only pbip_folder is left None.
+    pbip_folder = None
+    if pbip_dir is not None:
+        ds_pbip_dir = os.path.join(pbip_dir, safe_base)
+        try:
+            if os.path.isdir(ds_pbip_dir):
+                shutil.rmtree(ds_pbip_dir)
+            write_local_pbip(out["parts"], ds_pbip_dir, model_name=safe_base,
+                             swap_specs=(report.get("field_parameters") or {}).get("specs") or None)
+            pbip_folder = f"pbip/{safe_base}/{safe_base}.pbip"
+        except OSError:
+            pbip_folder = None
+
     eligible = _eligible_tables(descriptor)
     measures = report.get("measures", [])
     translated = sum(1 for m in measures if m.get("status") == "translated")
@@ -559,6 +578,8 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders):
         storage_decision=decision,
         m_connector=decision.get("connector"),
         output_folder=f"semantic_models/{folder}",
+        pbip_folder=pbip_folder,
+        translation_handoff=report.get("translation_handoff"),
         tables=report.get("tables", []),
         skipped_tables=report.get("skipped_tables", []),
         table_count=len(report.get("tables", [])),
@@ -616,12 +637,13 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders):
     return detail
 
 
-def migrate_estate(source, output_dir, *, viz_stage=None):
+def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True):
     """Run the whole estate migration and write the output bundle. Returns the report dict.
 
     ``source`` is any :class:`TableauSource`. ``output_dir`` receives::
 
         <output_dir>/semantic_models/<Name>.SemanticModel/...   one per migrated datasource
+        <output_dir>/pbip/<Name>/<Name>.pbip                    openable Power BI project (default)
         <output_dir>/reports/<Name>.Report/...                  only if a viz stage emits parts
         <output_dir>/report.json                                rich, machine-readable result
         <output_dir>/summary.md                                 human-readable summary
@@ -630,15 +652,20 @@ def migrate_estate(source, output_dir, *, viz_stage=None):
     viz rebuild; when omitted the orchestrator auto-detects Stream B's ``twb_to_pbir`` if present
     and otherwise records each workbook as ``warned``. The run is resilient: a single bad asset is
     isolated as an ``error`` detail rather than aborting the bundle.
+
+    ``pbip`` (default ``True``) additionally writes an openable ``.pbip`` Power BI project per
+    migrated datasource under ``pbip/<Name>/`` so it can be opened/tested in Power BI Desktop; the
+    canonical ``semantic_models/`` output is unchanged. Set ``pbip=False`` to skip it.
     """
     sm_dir = os.path.join(output_dir, "semantic_models")
     reports_dir = os.path.join(output_dir, "reports")
+    pbip_dir = os.path.join(output_dir, "pbip") if pbip else None
     os.makedirs(output_dir, exist_ok=True)
 
     viz = _resolve_viz_stage(viz_stage)
     used_folders = set()
 
-    ds_details = [_migrate_one_datasource(source, ds_id, sm_dir, used_folders)
+    ds_details = [_migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir)
                   for ds_id in source.list_datasources()]
     wb_details = [_migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders)
                   for wb_id in source.list_workbooks()]
@@ -676,6 +703,7 @@ def _summarize(ds_details, wb_details, viz_available):
     migrated = partial = fallback = error = 0
     tables = columns = measures_total = measures_translated = measures_stubbed = 0
     calc_columns_total = calc_columns_translated = calc_columns_stubbed = 0
+    needs_review_total = 0
 
     for d in ds_details:
         if d.get("connector"):
@@ -696,6 +724,7 @@ def _summarize(ds_details, wb_details, viz_available):
             calc_columns_total += len(d.get("calc_columns", []))
             calc_columns_translated += d.get("calc_columns_translated", 0)
             calc_columns_stubbed += d.get("calc_columns_stubbed", 0)
+            needs_review_total += len((d.get("translation_handoff") or {}).get("needs_review") or [])
         elif status == "fallback":
             fallback += 1
             modes["fallback"] += 1
@@ -720,6 +749,7 @@ def _summarize(ds_details, wb_details, viz_available):
         "calc_columns_total": calc_columns_total,
         "calc_columns_translated": calc_columns_translated,
         "calc_columns_stubbed": calc_columns_stubbed,
+        "needs_review_total": needs_review_total,
         "workbooks_total": len(wb_details),
         "workbooks_viz_built": wb_built,
         "workbooks_viz_warned": wb_warned,
@@ -773,6 +803,39 @@ def _render_summary_md(report):
             f"| {d.get('output_folder') or '-'} |"
         )
 
+    if any(d.get("pbip_folder") for d in report["datasources"]):
+        lines += [
+            "",
+            "> **Open locally:** each migrated datasource also has an openable Power BI project at "
+            "`pbip/<Name>/<Name>.pbip` — double-click to explore and test it in Power BI Desktop.",
+        ]
+
+    review = [
+        dict(r, datasource=d["name"])
+        for d in report["datasources"]
+        for r in ((d.get("translation_handoff") or {}).get("needs_review") or [])
+    ]
+    if review:
+        lines += [
+            "",
+            "## Next step — assisted (second-compiler) translation",
+            "",
+            f"{len(review)} calculation(s) fell back to inert stubs (the original Tableau formula is "
+            "preserved). To translate them, run each through the **second compiler**: author a "
+            "candidate DAX, validate it with `check_candidate_dax`, then land the approved set via "
+            "`approved_calc_dax` and redeploy. See "
+            "[second-compiler.md](resources/second-compiler.md).",
+            "",
+            "| Datasource | Calculation | Role | Category | Fallback reason | Suggestion ready |",
+            "|---|---|---|---|---|---|",
+        ]
+        for r in review:
+            lines.append(
+                f"| {r.get('datasource')} | {r.get('name')} | {r.get('role') or '-'} "
+                f"| {r.get('category') or '-'} | {r.get('fallback_reason') or '-'} "
+                f"| {'yes' if r.get('has_suggestion') else 'no'} |"
+            )
+
     if report["fallbacks"]:
         lines += ["", "## Fallbacks (route to land-to-Delta + DirectLake)", ""]
         for f in report["fallbacks"]:
@@ -807,11 +870,13 @@ def main(argv=None):
     parser.add_argument("-i", "--input", required=True,
                         help="folder of exported Tableau .tds / .twb files")
     parser.add_argument("-o", "--output", required=True,
-                        help="output bundle folder (semantic models + report.json + summary.md)")
+                        help="output bundle folder (semantic models + pbip + report.json + summary.md)")
+    parser.add_argument("--no-pbip", action="store_true",
+                        help="skip the openable .pbip projects (emit only semantic_models/ folders)")
     args = parser.parse_args(argv)
 
     source = LocalFilesSource(args.input)
-    report = migrate_estate(source, args.output)
+    report = migrate_estate(source, args.output, pbip=not args.no_pbip)
     s = report["summary"]
     print(
         f"Datasources: {s['datasources_migrated']}/{s['datasources_total']} migrated "
@@ -820,6 +885,11 @@ def main(argv=None):
         f"Workbooks: {s['workbooks_viz_built']}/{s['workbooks_total']} viz built"
     )
     print(f"Bundle written to: {os.path.abspath(args.output)}")
+    if not args.no_pbip:
+        print("Openable projects: pbip/<Name>/<Name>.pbip (double-click in Power BI Desktop)")
+    if s.get("needs_review_total"):
+        print(f"Next step: {s['needs_review_total']} calculation(s) stubbed -> see summary.md "
+              f"('Next step') to run them through the second compiler.")
     return 0
 
 

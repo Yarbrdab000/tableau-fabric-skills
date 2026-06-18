@@ -439,6 +439,72 @@ def test_migrate_estate_translates_parameter_swap_measure(tmp_path):
     assert detail["measures_translated"] >= 1
 
 
+# -- default openable .pbip + end-of-run second-compiler check-in -------------
+def test_migrate_estate_emits_openable_pbip_by_default(fixtures_dir, tmp_path):
+    # Each migrated datasource additionally gets an openable Power BI project under pbip/<Name>/ so
+    # users can double-click straight into Power BI Desktop. The canonical semantic_models/ tree is
+    # unaffected -- the .pbip is purely additive.
+    out = str(tmp_path / "bundle")
+    report = migrate_estate(LocalFilesSource(fixtures_dir), out)
+
+    pbip = tmp_path / "bundle" / "pbip" / "widget_sales"
+    assert (pbip / "widget_sales.pbip").is_file()
+    assert (pbip / "widget_sales.SemanticModel" / "definition" / "model.tmdl").is_file()
+    assert (pbip / "widget_sales.Report" / "definition.pbir").is_file()
+    # canonical semantic_models/ output still emitted alongside (additive, not a replacement)
+    assert (tmp_path / "bundle" / "semantic_models" / "widget_sales.SemanticModel").is_dir()
+
+    detail = next(d for d in report["datasources"] if d["name"] == "widget_sales")
+    assert detail["pbip_folder"] == "pbip/widget_sales/widget_sales.pbip"
+    summary_md = (tmp_path / "bundle" / "summary.md").read_text(encoding="utf-8")
+    assert "pbip/<Name>/<Name>.pbip" in summary_md  # the "Open locally" note
+
+
+def test_migrate_estate_no_pbip_suppresses_pbip_tree(fixtures_dir, tmp_path):
+    out = str(tmp_path / "bundle")
+    report = migrate_estate(LocalFilesSource(fixtures_dir), out, pbip=False)
+
+    assert not (tmp_path / "bundle" / "pbip").exists()
+    # opting out of pbip never touches the canonical semantic-model output
+    assert (tmp_path / "bundle" / "semantic_models" / "widget_sales.SemanticModel").is_dir()
+    detail = next(d for d in report["datasources"] if d["name"] == "widget_sales")
+    assert detail["pbip_folder"] is None
+
+
+def test_migrate_estate_summary_offers_second_compiler_when_stubs_exist(fixtures_dir, tmp_path):
+    # The estate threads each datasource's translation_handoff into the report, and summary.md grows
+    # a "Next step" section naming every stubbed calc + the second-compiler recipe -- the durable,
+    # testable half of the end-of-run check-in.
+    out = str(tmp_path / "bundle")
+    report = migrate_estate(LocalFilesSource(fixtures_dir), out)
+
+    assert report["summary"]["needs_review_total"] >= 1
+    detail = next(d for d in report["datasources"] if d["name"] == "widget_sales")
+    handoff = detail["translation_handoff"]
+    assert handoff is not None
+    assert any(r.get("name") == "Running Amount" for r in handoff.get("needs_review", []))
+
+    summary_md = (tmp_path / "bundle" / "summary.md").read_text(encoding="utf-8")
+    assert "## Next step" in summary_md
+    assert "Running Amount" in summary_md          # the stubbed calc is named
+    assert "check_candidate_dax" in summary_md      # the recipe references the gate
+    assert "approved_calc_dax" in summary_md
+    assert "second-compiler.md" in summary_md
+
+
+def test_migrate_estate_summary_omits_next_step_when_no_stubs(tmp_path):
+    # A datasource whose calcs all translate has nothing to offer -> no "Next step" section, even
+    # though the openable pbip is still emitted (pbip is independent of the stub check-in).
+    src = InMemoryTableauSource(datasources={"Orders DS": LIVE_TDS})
+    out = str(tmp_path / "b")
+    report = migrate_estate(src, out)
+
+    assert report["summary"]["needs_review_total"] == 0
+    summary_md = (tmp_path / "b" / "summary.md").read_text(encoding="utf-8")
+    assert "## Next step" not in summary_md
+    assert (tmp_path / "b" / "pbip" / "Orders DS" / "Orders DS.pbip").is_file()
+
+
 def test_malformed_asset_is_isolated_as_error(tmp_path):
     src = InMemoryTableauSource(
         datasources={"Good DS": LIVE_TDS, "Bad DS": MALFORMED_TDS},
@@ -724,6 +790,17 @@ def test_cli_main_runs_offline(fixtures_dir, tmp_path, capsys):
     rc = me.main(["-i", fixtures_dir, "-o", out])
     assert rc == 0
     assert os.path.isfile(os.path.join(out, "report.json"))
+    assert os.path.isdir(os.path.join(out, "pbip"))  # pbip projects emitted by default
     printed = capsys.readouterr().out
     assert "Datasources:" in printed
     assert "Bundle written to:" in printed
+    assert "Openable projects:" in printed  # pbip hint surfaced
+    assert "Next step:" in printed          # stubbed-calc check-in surfaced (widget_sales stubs one)
+
+
+def test_cli_main_no_pbip_flag_suppresses_projects(fixtures_dir, tmp_path, capsys):
+    out = str(tmp_path / "b")
+    rc = me.main(["-i", fixtures_dir, "-o", out, "--no-pbip"])
+    assert rc == 0
+    assert not os.path.isdir(os.path.join(out, "pbip"))
+    assert "Openable projects:" not in capsys.readouterr().out

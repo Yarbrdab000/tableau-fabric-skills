@@ -54,6 +54,30 @@ full categorized handoff.
 
 ---
 
+## When to start — the end-of-run check-in
+
+**Don't wait to be asked.** The moment a migration run finishes, inspect the report:
+`report["summary"]["needs_review_total"]` (estate path) or each datasource's
+`report["translation_handoff"]["summary"]["needs_review"]` (direct path). When it is `> 0`, the run
+left one or more calculations as inert stubs — so **proactively offer the second-compiler pass** as
+part of reporting the result, rather than silently handing back a model with `= 0` stubs.
+
+The check-in is short and concrete: state how many calcs translated vs. stubbed, **name each stubbed
+calc** (and the one-line reason from its handoff entry), and ask whether to run them through the
+second compiler now. The estate orchestrator also writes this list into `summary.md` under a
+**Next step — assisted (second-compiler) translation** heading, so the offer is durable even when the
+run was unattended.
+
+> _Phrasing template:_ "This migration translated N of M calculations. K fell back to stubs (original
+> formulas preserved): `<Calc A>`, `<Calc B>`, … Want me to run these through the second compiler now
+> (author candidate DAX → `check_candidate_dax` → land via `approved_calc_dax`)?"
+
+If the user declines, leave the stubs inert (the `TableauFormula` annotation is preserved for later).
+If they accept, work the loop below. Either way the **faithful-or-stub** invariant holds — a declined
+or unfinished calc stays a stub, never a guess.
+
+---
+
 ## The handoff request — what Tier 0 hands you
 
 `report["translation_handoff"]` is purely additive and always present:

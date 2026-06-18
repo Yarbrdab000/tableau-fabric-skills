@@ -104,6 +104,23 @@ Calculated columns, sets/groups/bins, what-if parameters, calc groups, field par
 
 ---
 
+## Estate run: the output bundle
+
+The one-button estate orchestrator (`scripts/migrate_estate.py`) writes a self-describing bundle:
+
+- `semantic_models/<Name>.SemanticModel/` — the canonical TMDL model per datasource (the deliverable).
+- `pbip/<Name>/<Name>.pbip` — an **openable Power BI project** per datasource (emitted by default;
+  `--no-pbip` / `pbip=False` to skip), so each datasource opens directly in Power BI Desktop.
+- `report.json` + `summary.md` — the machine- and human-readable audit report.
+
+When any calculation fell back to a stub, `summary["needs_review_total"] > 0` and `summary.md` carries
+a **Next step — assisted (second-compiler) translation** section naming each stubbed calc (datasource ·
+name · role · category · reason · whether a suggestion is ready). Treat that as the cue to **offer the
+second-compiler pass** to the user (see [second-compiler.md](second-compiler.md)); don't hand back a
+model with silent `= 0` stubs.
+
+---
+
 ## Format
 
 Plain Markdown is fine. Keep raw `.tds`/`.twb` contents and any credentials **out** of the report (see

@@ -13,6 +13,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** estate/local runs now emit an **openable Power BI project (`.pbip`)** per
+  migrated datasource by default (`pbip/<Name>/<Name>.pbip` via `assemble_model.write_local_pbip`),
+  alongside the canonical `semantic_models/<Name>.SemanticModel/`, so each datasource opens directly
+  in Power BI Desktop to explore and test. `migrate_estate.py` gains `--no-pbip` to suppress. Skill
+  `VERSION` `1.2.1` → `1.3.0`.
+- **tableau-migration:** end-of-run **second-compiler check-in** — when a run leaves stubbed
+  calculations (`report["summary"]["needs_review_total"] > 0`, also surfaced in `summary.md`'s new
+  **Next step** section and the per-datasource `translation_handoff`), the skill now offers to run the
+  stubs through the second compiler instead of silently stopping. SKILL.md,
+  `resources/second-compiler.md`, and `resources/migration-report.md` document the check-in.
+- **docs:** [`INSTALL.md`](INSTALL.md) gains an **Updating** section (plugin and manual-folder update
+  paths, the `tableau-migration` version-gated runbook, and the not-live-until-a-new-session caveat);
+  [`UNINSTALL.md`](UNINSTALL.md) gains a **Clean up what removal leaves behind** section for the side
+  effects a folder/plugin delete doesn't remove (the MCP landing zone's Azure resources, MCP client
+  config and Copilot Studio connector, the local Docker stack, and downloaded Tableau artifacts /
+  self-update backups).
 - **tableau-fabric-datasource-comparison (new skill):** read-only estate comparison that inventories
   every published Tableau datasource and every Fabric / Power BI semantic model in a tenant and ranks
   each datasource from "already in Fabric" to "needs rebuild". Scores a weighted blend of four signals

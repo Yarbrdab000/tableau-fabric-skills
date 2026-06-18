@@ -64,6 +64,50 @@ plugin installs all three skills.
 If `tableau-fabric-skills` is not in `/plugin list`, the install didn't take — re-run the
 installer or the two commands above.
 
+## Updating to a newer version
+
+Each skill is versioned (`skills/<name>/VERSION`); the collection shares one version across the four
+packaging manifests. To move to a newer release:
+
+**Plugin install (recommended).** Refresh the marketplace, then re-install the plugin:
+
+```text
+/plugin marketplace update tableau-collection
+/plugin install tableau-fabric-skills@tableau-collection
+```
+
+…or from your terminal:
+
+```bash
+copilot plugin marketplace update tableau-collection
+copilot plugin install tableau-fabric-skills@tableau-collection
+```
+
+The exact verb varies by client — confirm with `/plugin help`. If an update won't take, remove and
+re-add: `/plugin uninstall tableau-fabric-skills` → `/plugin marketplace remove tableau-collection`,
+then the two install commands from the top of this file.
+
+**Manual folder install (older clients).** Re-clone and overwrite the installed folders — a wholesale
+replace, so files removed upstream don't linger:
+
+```powershell
+git clone https://github.com/Yarbrdab000/tableau-fabric-skills.git
+Copy-Item .\tableau-fabric-skills\skills\* "$env:USERPROFILE\.copilot\skills\" -Recurse -Force
+```
+
+```bash
+git clone https://github.com/Yarbrdab000/tableau-fabric-skills.git
+cp -R tableau-fabric-skills/skills/* ~/.copilot/skills/    # or ~/.claude/skills/
+```
+
+> **`tableau-migration` has a deeper, version-gated update runbook** —
+> [`skills/tableau-migration/resources/self-update.md`](skills/tableau-migration/resources/self-update.md)
+> compares installed vs. remote `VERSION`, backs up before overwriting, verifies (file/symbol checks +
+> `pytest`), and rolls back on failure.
+
+**Not live until a new session.** Skills load at session start, so after any update start a new
+session, then re-check with `/plugin list` and `/skills list` (and the `VERSION` stamps).
+
 ## Where each surface loads skills from
 
 | Surface | Loads skills from | Notes |

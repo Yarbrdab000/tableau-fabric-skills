@@ -561,13 +561,20 @@ The `.pbir` **`datasetReference.byPath`** is the report→model link. The `.Repo
 report rebuild ships (v2) — the dataset is fully functional on its own; pass `report_parts=` (e.g. from
 `twb_to_pbir`) to supply a real rebuilt report. See [semantic-model-rebuild.md](resources/semantic-model-rebuild.md).
 
+> **Estate / local runs emit `.pbip` by default.** The one-button estate orchestrator
+> (`scripts/migrate_estate.py`) writes an openable `pbip/<Name>/<Name>.pbip` for **every** migrated
+> datasource — alongside (never replacing) the canonical `semantic_models/<Name>.SemanticModel/` — so a
+> user can double-click straight into Power BI Desktop to explore and test each datasource. Pass
+> `pbip=False` (CLI `--no-pbip`) to emit only the `semantic_models/` folders.
+
 ---
 
 ## Post-Migration: What's Next
 
 1. **Deploy** with the bundled `scripts/deploy_to_fabric.py` (self-contained Fabric REST), or **deploy & manage** with `semantic-model-authoring` when available (best-practice analysis, refresh, edits).
 2. **Query & explore** with `semantic-model-consumption` and `fabriciq` (natural-language analysis over the migrated model).
-3. **Repair stubs** — work the migration report's stub list, optionally with the validation-gated LLM pass.
+3. **Offer the second compiler for any stubbed calc (end-of-run check-in).** When a run finishes with stubbed calculations (`report["summary"]["needs_review_total"] > 0`, also surfaced in `summary.md`'s **Next step** section and the per-datasource `report["datasources"][n]["translation_handoff"]`), **don't silently stop at the stubs** — proactively present a short check-in: list each stubbed calculation (name · role · why it stubbed) and **ask whether to run them through the second compiler now**. If yes, run the Tier-1 loop — author the leanest *faithful* candidate DAX → `check_candidate_dax` (the syntactic gate) → land the approved set via `approved_calc_dax` → redeploy — per [second-compiler.md](resources/second-compiler.md). If no, leave the inert stubs (the original `TableauFormula` is preserved for later). The **faithful-or-stub** charter still binds: never land a guessed or semantically-altered measure silently.
+   > _Phrasing template:_ "This migration translated N of M calculations. K fell back to stubs (the original formulas are preserved): `<Calc A>`, `<Calc B>`, … Would you like me to run these through the second compiler now (author candidate DAX → validate → land)?"
 4. **(v2) Rebuild reports** — once measures are trusted, regenerate Tableau worksheets/dashboards as Power BI report pages (roadmap).
 
 ## Related skills
