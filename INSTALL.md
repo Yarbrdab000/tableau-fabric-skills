@@ -25,6 +25,13 @@ cd tableau-fabric-skills
 ./install.sh
 ```
 
+> **Running inside the GitHub Copilot desktop app?** The `copilot` CLI isn't on your `PATH` there —
+> the app bundles it at `%LOCALAPPDATA%\github-copilot-sdk\cli\<version>\copilot.exe` (Windows) or
+> the equivalent under `~/.local/share/github-copilot-sdk` / `~/Library/Application Support/github-copilot-sdk`
+> (Linux / macOS). The installer now **auto-discovers** that bundled binary (newest version first)
+> and only errors out if no `copilot` exists anywhere — so "not on PATH" no longer blocks the
+> install.
+
 ## Manual — the same two commands
 
 If you'd rather run the commands yourself, in a Copilot CLI session enter:

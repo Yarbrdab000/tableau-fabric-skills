@@ -37,6 +37,11 @@ cd tableau-fabric-skills
 ./install.ps1     # macOS / Linux: ./install.sh
 ```
 
+> Inside the **Copilot desktop app** the `copilot` CLI isn't on `PATH` — it's bundled at
+> `%LOCALAPPDATA%\github-copilot-sdk\cli\<version>\copilot.exe` (Windows) or the
+> `github-copilot-sdk` dir under `~/.local/share` / `~/Library/Application Support` (Linux / macOS).
+> The installer auto-discovers that bundled binary, so "not on PATH" doesn't block it.
+
 Or run the two commands yourself in a Copilot CLI session:
 
 ```text
