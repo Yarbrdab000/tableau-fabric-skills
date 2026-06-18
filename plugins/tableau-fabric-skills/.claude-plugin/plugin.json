@@ -1,15 +1,16 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema",
   "name": "tableau-fabric-skills",
-  "description": "All three Tableau -> Microsoft Fabric / Power BI agent skills: profile & NL-query a Tableau datasource, stand up the official Tableau MCP server on Azure for Copilot, and rebuild Tableau datasources as Fabric / Power BI semantic models (calc -> DAX).",
-  "version": "0.3.0",
+  "description": "All four Tableau -> Microsoft Fabric / Power BI agent skills: profile & NL-query a Tableau datasource, stand up the official Tableau MCP server on Azure for Copilot, compare a whole Tableau estate against a Fabric tenant to see what already exists vs. needs rebuilding, and rebuild Tableau datasources as Fabric / Power BI semantic models (calc -> DAX).",
+  "version": "0.4.0",
   "license": "MIT",
   "repository": "https://github.com/Yarbrdab000/tableau-fabric-skills",
-  "keywords": ["tableau","fabric","microsoft-fabric","power-bi","semantic-model","tmdl","dax","mcp","copilot-studio","migration"],
+  "keywords": ["tableau","fabric","microsoft-fabric","power-bi","semantic-model","tmdl","dax","mcp","copilot-studio","migration","comparison"],
   "skills": [
     "./skills/tableau-datasource-profiler",
     "./skills/tableau-mcp-landing-zone",
-    "./skills/tableau-migration"
+    "./skills/tableau-migration",
+    "./skills/tableau-fabric-datasource-comparison"
   ],
   "agents": [],
   "mcpServers": {}

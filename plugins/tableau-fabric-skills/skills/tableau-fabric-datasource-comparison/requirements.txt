@@ -1,0 +1,3 @@
+# tableau-fabric-datasource-comparison has no third-party dependencies.
+# It is standard-library only (urllib, json, zipfile, xml-via-regex, hmac/hashlib for JWT).
+# The Fabric bearer token is supplied via --token / FABRIC_TOKEN or minted with the Azure CLI (--use-az).
