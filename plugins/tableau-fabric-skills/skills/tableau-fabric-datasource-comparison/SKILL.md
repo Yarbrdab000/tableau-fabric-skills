@@ -50,8 +50,9 @@ Use it when the user asks to:
 compare_estate.py (CLI orchestrator)
   ├── tableau_inventory.py  → [{name, project, luid, fields[], sources[]}]
   ├── fabric_inventory.py   → [{name, workspace, id, tables[], columns[], sources[]}]
-  └── compare.py (pure)     → best Fabric match + tier + 4 signals per datasource; estate rollup
-        → report (Markdown or JSON), ranked most-comparable first
+  ├── compare.py (pure)     → best Fabric match + tier + 4 signals per datasource; estate rollup
+  └── adjudicate.py (pure)  → LLM-optional "second matcher": routes the uncertain tail to an agent
+        → report (Markdown or JSON), ranked most-comparable first, plus an adjudication queue
 ```
 
 1. **Tableau inventory** — sign in, list every published datasource (REST), and for each pull its
@@ -82,6 +83,23 @@ Warehouse that mirrors the primary source while Tableau connects to that source 
 and database never line up and only the table names survive the move. When the physical source is
 **obscured on either side** (no resolvable table at all), the `source` signal is dropped and its weight
 is redistributed across name/column/type, so a genuine schema-level overlap is never buried.
+
+## LLM-optional adjudication (the "second matcher")
+
+The four signals are a **structural** matcher — strong on overlap it can measure, blind to **semantic**
+equivalence. Two assets can be the same dataset with **renamed columns** (a lakehouse that snake-cases
+or re-friendlies the source), a **renamed asset**, or — the inverse risk — a coincidental overlap of
+**generic column names** (`Date`/`Region`/`Sales`) that describe different data. The costly mistake for
+a migration plan is a **false rebuild**: telling a customer to recreate something Fabric already covers
+under different labels.
+
+So, mirroring the `tableau-migration` skill's *second compiler*, every run emits an additive
+**adjudication queue** (`report["adjudication"]`) that routes the not-confidently-matched datasources to
+an agent acting as a second matcher, with the typed Tableau columns and the top candidates' columns/
+sources attached for a semantic judgement. The deterministic verdict stays authoritative; the agent's
+verdict (`match` / `partial` / `no-match` + confidence + rationale) is **advisory** and folded in only
+on an explicit `--apply-adjudication` pass — it never rewrites the deterministic tier/score, and a
+default run adds zero agent verdicts. Full contract: `resources/llm-adjudication.md`.
 
 ## Usage
 
@@ -117,6 +135,9 @@ Each inventory script also runs standalone (`tableau_inventory.py`, `fabric_inve
 - `--workspaces` — comma-separated Fabric workspace names/ids (default: all visible).
 - `--tds-fallback {auto,never}` — download+parse a datasource's `.tds` when the Metadata API is empty
   (default `auto`).
+- `--save-adjudication PATH` — write the agent adjudication queue (the review handoff) as JSON.
+- `--apply-adjudication PATH` — fold an agent-verdicts JSON back in as advisory annotations (the
+  deterministic tier/score are never changed); see `resources/llm-adjudication.md`.
 - `--weights`, `--top-n`, `--format {md,json}`, `--out`, `--max-models`,
   `--save-tableau-inventory`, `--save-fabric-inventory`.
 
@@ -126,7 +147,13 @@ A Markdown (or JSON) report — see `resources/report-schema.md`:
 - **Estate rollup**: counts of already-in-Fabric / partial / needs-rebuild, plus a by-tier breakdown.
 - **Ranked matches**: every Tableau datasource, its best Fabric match (model + workspace), tier, score,
   and the four signal sub-scores; `src = n/a` flags an obscured-source match.
+- **Agent adjudication queue**: the not-confidently-matched datasources, each with *why* it was flagged
+  (renamed columns, obscured source, near tie, …) for an LLM-optional semantic review.
 - **Recommended actions**: grouped by tier, pointing the rebuild set at the `tableau-migration` skill.
+
+After an `--apply-adjudication` pass the report also shows an **After semantic review** rollup
+(deterministic vs. agent-adjudicated counts, with the delta) — advisory, the deterministic verdict is
+unchanged.
 
 ## Caveats
 

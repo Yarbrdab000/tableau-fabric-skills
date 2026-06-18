@@ -7,8 +7,13 @@ new keys/artifacts may be added, but existing keys are never renamed or removed.
 ## Top level
 
 ```json
-{ "summary": { ... }, "matches": [ ... ] }
+{ "summary": { ... }, "matches": [ ... ], "adjudication": { ... } }
 ```
+
+`adjudication` is **additive and always present** — the LLM-optional review queue (see
+[`llm-adjudication.md`](llm-adjudication.md)). After `--apply-adjudication`, two more additive keys
+appear: each reviewed `matches[]` gains an `agent_review`, and a top-level `adjudicated_summary` is
+added. The deterministic `summary` / `tier` / `score` / `bucket` are never modified.
 
 ## `summary`
 
@@ -83,3 +88,33 @@ new keys/artifacts may be added, but existing keys are never renamed or removed.
 - Treat **`already_exists`** as a reuse/verify list — confirm the candidate before retiring the Tableau
   datasource.
 - **`partial`** needs human reconciliation (added/renamed columns, source drift) before reuse.
+
+## `adjudication` (LLM-optional review queue)
+
+The deterministic verdict is authoritative, but a structural matcher is blind to **semantic**
+equivalence (renamed columns, a renamed asset, a lakehouse mirror, or a coincidental overlap of
+generic column names). `adjudication` is the additive handoff that routes the uncertain tail to an
+agent acting as a "second matcher" — full contract in [`llm-adjudication.md`](llm-adjudication.md).
+
+| Key | Type | Meaning |
+|---|---|---|
+| `summary.total_reviewed` | int | datasources flagged for agent review |
+| `summary.auto_confident` | int | datasources the deterministic matcher is confident about (no review) |
+| `summary.categories` | object | count per uncertainty category |
+| `needs_review[]` | array | concise `{tableau_name, tier, score, category, deterministic_bucket}` list |
+| `requests[]` | array | one structured record per reviewed datasource (below) |
+
+Each `requests[]` record carries `category`, a `category_guidance` string, a `deterministic` block
+(the Tier-0 verdict), the Tableau side's typed `tableau_columns` + `tableau_sources`, and the top-K
+Fabric `candidates` — **each enriched** with its own `columns`, `tables`, and `sources` — so the
+agent can adjudicate without re-pulling either inventory. Categories: `near_tie`,
+`renamed_columns_suspected`, `obscured_source`, `borderline_band`, `likely_rebuild`.
+
+### After `--apply-adjudication` (advisory, additive)
+
+- Each reviewed `matches[]` gains `agent_review`: `{verdict, fabric_id, confidence, rationale,
+  adjudicated_bucket}` where `verdict` is `match` / `partial` / `no-match`.
+- A top-level `adjudicated_summary` is added: `{reviews_applied, already_exist, partial, rebuild,
+  delta:{…}}` — the rollup **after** semantic review, with the delta versus the deterministic count.
+- The deterministic `summary` and each row's `tier` / `score` / `bucket` are **unchanged**; the two
+  rollups sit side by side.

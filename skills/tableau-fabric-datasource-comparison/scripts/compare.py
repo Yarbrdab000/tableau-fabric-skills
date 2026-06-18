@@ -431,7 +431,21 @@ def compare_inventories(
         "weights": dict(weights),
         "bands": [list(b) for b in bands],
     }
-    return {"summary": summary, "matches": matches}
+    result = {"summary": summary, "matches": matches}
+
+    # Tier-1 handoff: classify the not-confidently-matched datasources into an additive
+    # adjudication packet for the LLM-optional "second matcher" (resources/llm-adjudication.md).
+    # Imported lazily so the deterministic core has no import-time dependency on the router.
+    try:  # pragma: no cover - trivial wiring
+        try:
+            from . import adjudicate as _adjudicate
+        except ImportError:
+            import adjudicate as _adjudicate
+        result["adjudication"] = _adjudicate.build_adjudication(matches, tableau or [], fabric)
+    except Exception:  # never let the optional tier break the deterministic verdict
+        pass
+
+    return result
 
 
 # --------------------------------------------------------------------------------------
@@ -503,4 +517,81 @@ def render_markdown(result: Dict[str, Any]) -> str:
         for n in names:
             lines.append(f"- {n}")
         lines.append("")
+    _render_adjudication(result, lines)
     return "\n".join(lines).rstrip() + "\n"
+
+
+# Friendly one-line labels for each uncertainty category in the adjudication queue.
+_CATEGORY_LABEL = {
+    "near_tie": "Near tie -- two close candidates",
+    "renamed_columns_suspected": "Renamed columns / asset suspected",
+    "obscured_source": "Obscured source -- confirm match",
+    "borderline_band": "Borderline band -- likely under-scored",
+    "likely_rebuild": "Likely rebuild -- final sanity check",
+}
+
+
+def _render_adjudication(result: Dict[str, Any], lines: List[str]) -> None:
+    """Append the agent adjudication queue and (if applied) the post-review rollup. Additive."""
+    adj = result.get("adjudication") or {}
+    requests = adj.get("requests") or []
+    if requests:
+        lines.append("## Agent adjudication queue (LLM-optional review)")
+        lines.append("")
+        lines.append(
+            f"The deterministic matcher is confident about "
+            f"{adj.get('summary', {}).get('auto_confident', 0)} datasource(s). The "
+            f"{len(requests)} below sit in a band where a **semantic** judgement can catch a match "
+            "(or false match) that structure alone misses -- renamed columns, a renamed asset, a "
+            "lakehouse mirror, or coincidental generic column names. Hand these to an agent per "
+            "`resources/llm-adjudication.md`; the deterministic verdict stands until then."
+        )
+        lines.append("")
+        lines.append("| Tableau datasource | Det. tier | Det. score | Why flagged | Top candidate |")
+        lines.append("|---|---|---:|---|---|")
+        for r in requests:
+            det = r.get("deterministic", {})
+            cands = r.get("candidates") or []
+            top = cands[0]["fabric_name"] if cands else "_(none)_"
+            why = _CATEGORY_LABEL.get(r.get("category"), r.get("category") or "")
+            score = det.get("score")
+            score_s = f"{score:.2f}" if isinstance(score, (int, float)) else ""
+            lines.append(
+                f"| {r.get('tableau_name')} | {det.get('tier')} | {score_s} | {why} | {top} |"
+            )
+        lines.append("")
+
+    # Post-apply rollup: present only after apply_adjudication() folded agent verdicts in.
+    adj_summary = result.get("adjudicated_summary")
+    reviewed = [m for m in result.get("matches", []) if m.get("agent_review")]
+    if adj_summary and reviewed:
+        s = result["summary"]
+        lines.append("## After semantic review (agent-adjudicated)")
+        lines.append("")
+        lines.append("| Outcome | Deterministic | After review | Delta |")
+        lines.append("|---|---:|---:|---:|")
+        for key, label in (
+            ("already_exist", "Already in Fabric"),
+            ("partial", "Partial overlap"),
+            ("rebuild", "Needs rebuild"),
+        ):
+            d = adj_summary.get("delta", {}).get(key, 0)
+            delta = f"+{d}" if d > 0 else str(d)
+            lines.append(
+                f"| {label} | {s.get(key, 0)} | {adj_summary.get(key, 0)} | {delta} |"
+            )
+        lines.append("")
+        lines.append(
+            "_Advisory only -- the deterministic tier/score above are unchanged; these are the "
+            "agent's semantic verdicts._"
+        )
+        lines.append("")
+        for m in reviewed:
+            ar = m["agent_review"]
+            conf = f" ({ar.get('confidence')})" if ar.get("confidence") else ""
+            rationale = ar.get("rationale") or ""
+            lines.append(
+                f"- **{m.get('tableau_name')}** -> {ar.get('verdict')}{conf}"
+                + (f" -- {rationale}" if rationale else "")
+            )
+        lines.append("")

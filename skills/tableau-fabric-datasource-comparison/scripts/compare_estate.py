@@ -33,10 +33,12 @@ from typing import Any, Dict, List, Optional
 
 try:  # package or flat-script execution
     from . import compare as compare_mod
+    from . import adjudicate as adjudicate_mod
     from . import fabric_inventory as fab
     from . import tableau_inventory as tab
 except ImportError:  # pragma: no cover - exercised via flat script execution
     import compare as compare_mod
+    import adjudicate as adjudicate_mod
     import fabric_inventory as fab
     import tableau_inventory as tab
 
@@ -128,6 +130,12 @@ def main(argv=None) -> int:
     ap.add_argument("--out", help="write the report here (else stdout)")
     ap.add_argument("--save-tableau-inventory", help="also write the gathered Tableau inventory JSON here")
     ap.add_argument("--save-fabric-inventory", help="also write the gathered Fabric inventory JSON here")
+    ap.add_argument("--save-adjudication",
+                    help="write the agent adjudication handoff packet (the review queue) here as JSON")
+    ap.add_argument("--apply-adjudication",
+                    help="load an agent-verdicts JSON ({reviews:[{tableau_name|tableau_luid, verdict, "
+                         "confidence?, rationale?}]}) and fold the verdicts in as advisory annotations "
+                         "(the deterministic tier/score are never changed)")
     args = ap.parse_args(argv)
 
     def log(msg):
@@ -149,6 +157,17 @@ def main(argv=None) -> int:
         tableau, fabric, weights=_parse_weights(args.weights), top_n=args.top_n,
     )
 
+    if args.save_adjudication:
+        with open(args.save_adjudication, "w", encoding="utf-8") as fh:
+            json.dump(result.get("adjudication", {}), fh, indent=2)
+        log(f"saved adjudication queue -> {args.save_adjudication}")
+
+    if args.apply_adjudication:
+        log(f"Applying agent verdicts from {args.apply_adjudication} (advisory; deterministic verdict unchanged)")
+        with open(args.apply_adjudication, encoding="utf-8-sig") as fh:
+            decisions = json.load(fh)
+        result = adjudicate_mod.apply_adjudication(result, decisions)
+
     if args.format == "json":
         rendered = json.dumps(result, indent=2)
     else:
@@ -164,6 +183,14 @@ def main(argv=None) -> int:
     s = result["summary"]
     log(f"Done: {s['tableau_total']} datasource(s) vs {s['fabric_total']} model(s) -- "
         f"already-exist={s['already_exist']}, partial={s['partial']}, rebuild={s['rebuild']}")
+    adj = result.get("adjudication", {}).get("summary", {})
+    if adj.get("total_reviewed"):
+        log(f"Adjudication queue: {adj['total_reviewed']} datasource(s) flagged for agent review "
+            f"({adj.get('auto_confident', 0)} auto-confident) -- categories {adj.get('categories', {})}")
+    adj_sum = result.get("adjudicated_summary")
+    if adj_sum:
+        log(f"After review: already-exist={adj_sum['already_exist']}, partial={adj_sum['partial']}, "
+            f"rebuild={adj_sum['rebuild']} (reviews applied={adj_sum['reviews_applied']})")
     return 0
 
 

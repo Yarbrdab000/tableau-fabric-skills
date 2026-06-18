@@ -35,6 +35,13 @@ When Tableau Catalog has not indexed a datasource, the Tableau inventory downloa
 `.tds` (without its extract) and parses columns + relation tables directly, so cloud-connected
 datasources still produce a full schema.
 
+Because a structural matcher is blind to **semantic** equivalence (renamed columns, a renamed asset, a
+coincidental overlap of generic column names), every run also emits an **LLM-optional adjudication
+queue** — modelled on the `tableau-migration` skill's *second compiler*. It routes the
+not-confidently-matched datasources to an agent for a semantic verdict; the deterministic verdict stays
+authoritative and the agent's call is folded in only on an explicit `--apply-adjudication` pass. See
+[`resources/llm-adjudication.md`](resources/llm-adjudication.md).
+
 ## Layout
 
 ```
@@ -42,12 +49,14 @@ tableau-fabric-datasource-comparison/
   SKILL.md
   scripts/
     compare.py            # pure, offline scoring engine (the core IP)
+    adjudicate.py         # pure LLM-optional "second matcher" router + advisory apply path
     tableau_inventory.py  # Tableau REST + Metadata API + .tds fallback
     fabric_inventory.py   # Fabric REST + getDefinition / TMDL / M parsing
     compare_estate.py     # CLI orchestrator (live or cached, md/json)
   tests/                  # offline pytest suite (no network)
   resources/
     comparison-methodology.md
+    llm-adjudication.md
     fabric-introspection.md
     tableau-inventory.md
     report-schema.md
