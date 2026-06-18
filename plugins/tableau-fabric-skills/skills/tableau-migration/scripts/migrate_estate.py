@@ -51,10 +51,12 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .connection_to_m import parse_tds
     from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from .assemble_model import assemble_import_model, write_model_folder
+    from .parameters import parse_parameters
 except ImportError:
     from connection_to_m import parse_tds
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from assemble_model import assemble_import_model, write_model_folder
+    from parameters import parse_parameters
 
 
 # -- source adapters -----------------------------------------------------------
@@ -482,6 +484,14 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders):
 
     connector = descriptor.get("connection_class") or None
     calcs, skipped_calcs, dim_calcs = extract_calculations(text, include_dimensions=True)
+    # Thread Tableau parameters into the assembler so parameter-driven swap calcs (e.g. a measure
+    # swap over aggregations -> SWITCH over a what-if value table) translate here exactly as they do
+    # on the direct migrate_datasource path. Sources without parameters yield [], keeping the default
+    # semantic-model output byte-identical.
+    try:
+        parameters = parse_parameters(text)
+    except Exception:
+        parameters = []
     decision = select_storage_mode(descriptor)
     detail.update(connector=connector, skipped_calcs=skipped_calcs, dim_calcs=dim_calcs)
 
@@ -509,7 +519,8 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders):
         return detail
 
     try:
-        out = assemble_import_model(descriptor, model_name=name, calcs=calcs, dim_calcs=dim_calcs)
+        out = assemble_import_model(descriptor, model_name=name, calcs=calcs, dim_calcs=dim_calcs,
+                                    parameters=parameters)
     except ValueError as exc:  # storage policy / no-columns -> documented land-to-Delta fallback
         detail.update(status="fallback", storage_mode=None, storage_decision=decision,
                       reason=str(exc),

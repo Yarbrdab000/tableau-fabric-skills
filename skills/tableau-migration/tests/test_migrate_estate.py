@@ -130,6 +130,41 @@ LIVE_TDS = """<?xml version='1.0' encoding='utf-8' ?>
 UNKNOWN_CONNECTOR_TDS = INVENTORY_FEED_TDS
 MALFORMED_TDS = "<datasource><connection class='federated'>  <oops "
 
+# A measure-role swap over AGGREGATIONS driven by a Tableau parameter. Translating it needs the
+# what-if "value parameter" table synthesized from the datasource's <column param-domain-type=..>,
+# so the estate path must thread the parsed parameters into the assembler exactly like the direct
+# migrate_datasource path does -- otherwise the swap measure stubs "parameter ... (unmodeled)".
+MEASURE_SWAP_TDS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Swap DS' inline='true' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='warehouse' name='sqlserver.aa11'>
+        <connection authentication='sqlserver' class='sqlserver' dbname='WidgetDW'
+                    server='widgetdw.database.windows.net' username='svc_widget' />
+      </named-connection>
+    </named-connections>
+    <relation connection='sqlserver.aa11' name='Orders' table='[dbo].[Orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>real</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Profit</remote-name><local-name>[Profit]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+  <column caption='Measure Swap' datatype='integer' name='[Param Swap]' param-domain-type='list'
+          role='measure' type='quantitative' value='1'>
+    <members><member value='1' /><member value='2' /></members>
+  </column>
+  <column caption='Swap Measure' datatype='real' name='[Calculation_900]' role='measure'>
+    <calculation class='tableau'
+       formula='case [Parameters].[Param Swap] when 1 then AVG([Sales]) when 2 then AVG([Profit]) end' />
+  </column>
+</datasource>"""
+
 EXCEL_TDS = """<?xml version='1.0' encoding='utf-8' ?>
 <datasource formatted-name='Sheet DS' version='18.1'>
   <connection class='excel-direct' filename='Book.xlsx'>
@@ -384,6 +419,24 @@ def test_in_memory_source_drives_orchestrator(tmp_path):
     assert report["source"] == {"kind": "InMemoryTableauSource"}
     assert (tmp_path / "b" / "semantic_models" / "Orders DS.SemanticModel" /
             "definition" / "tables" / "Orders.tmdl").is_file()
+
+
+def test_migrate_estate_translates_parameter_swap_measure(tmp_path):
+    # Regression guard for the estate-vs-direct wiring gap: a measure swap over aggregations
+    # references a Tableau parameter, which only resolves once the assembler is handed the parsed
+    # parameters (to synthesize the what-if value table + SWITCH). The estate orchestrator must
+    # thread them, so this measure translates here exactly as it does via direct migrate_datasource.
+    src = InMemoryTableauSource(datasources={"Swap DS": MEASURE_SWAP_TDS})
+    report = migrate_estate(src, str(tmp_path / "b"))
+
+    detail = next(d for d in report["datasources"] if d["name"] == "Swap DS")
+    by_measure = {m["measure"]: m for m in detail["measures"]}
+    swap = by_measure["Swap Measure"]
+    assert swap["status"] == "translated", swap.get("reason")
+    assert "SWITCH(" in swap["dax"]
+    assert "AVERAGE('Orders'[Sales])" in swap["dax"]
+    assert "AVERAGE('Orders'[Profit])" in swap["dax"]
+    assert detail["measures_translated"] >= 1
 
 
 def test_malformed_asset_is_isolated_as_error(tmp_path):
