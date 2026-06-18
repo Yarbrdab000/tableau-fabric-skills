@@ -96,3 +96,18 @@ The best score per datasource is banded high-to-low:
 - Re-scoring is free once inventories are cached to JSON — iterate on `--weights` without re-pulling.
 - The bands are deliberately conservative: a `Strong` is "very likely the same data", not a guarantee.
   Treat the report as a ranked worklist a human confirms, not an automated decision.
+
+## Beyond the deterministic tier — the LLM-optional second matcher
+
+This engine is a **structural** matcher: it is strong on overlap it can *measure* but blind to
+**semantic** equivalence. Two assets can be the same dataset with **renamed columns** (a lakehouse
+that snake-cases or re-friendlies the source), a **renamed asset**, or — the inverse risk — a
+coincidental overlap of **generic column names** (`Date` / `Region` / `Sales`) that look identical
+but describe different data. The dangerous outcome for a migration plan is a **false rebuild**:
+telling a customer to recreate something a Fabric model already covers under different labels.
+
+So, mirroring the `tableau-migration` skill's *second compiler*, every comparison emits an additive
+**adjudication** packet (`report["adjudication"]`) that routes the not-confidently-matched tail to an
+agent acting as a "second matcher". The deterministic verdict stays authoritative; the agent's
+verdict is **advisory** and folded in only on an explicit `--apply-adjudication` pass. Full contract,
+category taxonomy, and the output record: [`llm-adjudication.md`](llm-adjudication.md).

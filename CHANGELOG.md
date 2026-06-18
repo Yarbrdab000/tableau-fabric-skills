@@ -27,6 +27,15 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   see still produce a full schema. Standard-library only; offline-testable scoring core; never modifies
   Tableau or Fabric. Registered additively in all four packaging manifests (collection `0.3.0` →
   `0.4.0`).
+  - **LLM-optional adjudication ("second matcher"):** every comparison now emits an additive
+    `report["adjudication"]` queue (`scripts/adjudicate.py`) that routes the not-confidently-matched
+    datasources — renamed columns, a renamed asset, an obscured/lakehouse source, a near tie, or a
+    coincidental overlap of generic column names — to an agent for a **semantic** verdict, modelled on
+    the `tableau-migration` skill's *second compiler*. The deterministic verdict stays authoritative;
+    `--apply-adjudication` folds the agent's `match` / `partial` / `no-match` calls back in as advisory
+    `agent_review` annotations and an `adjudicated_summary` rollup **without** changing any
+    deterministic tier/score. Adds `--save-adjudication` / `--apply-adjudication` and
+    `resources/llm-adjudication.md`; skill `VERSION` `1.0.0` → `1.1.0`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.
