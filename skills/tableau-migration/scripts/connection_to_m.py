@@ -355,6 +355,24 @@ def _is_combination_relation(rel):
     return bool(_children_local(rel, "relation"))
 
 
+def _is_extract_cache_relation(entry):
+    """True for a Tableau *extract-cache* table relation -- a ``[Extract].[...]`` twin.
+
+    When a datasource has a stored extract, Tableau Server materializes each live/logical relation
+    a second time in its reserved ``Extract`` namespace (``table='[Extract].[orders (...)_HASH]'``)
+    as the ``.hyper`` cache. That twin is **never an independent upstream**: it is a local cache of
+    a live relation. When the live relation is present the twin is a pure duplicate, and in a
+    DirectLake rebuild it would bind to a non-existent Delta entity (the mangled ``..._HASH`` name).
+    Identified conservatively by Tableau's reserved ``Extract`` catalog/schema token.
+    """
+    if entry.get("kind") not in ("table", "custom_sql"):
+        return False
+    return "extract" in (
+        (entry.get("catalog") or "").lower(),
+        (entry.get("schema") or "").lower(),
+    )
+
+
 def _extract_relations(datasource, cols_by_parent, nc_map=None):
     """Walk ``<relation>`` elements into a flat, de-duplicated descriptor list.
 
@@ -369,11 +387,18 @@ def _extract_relations(datasource, cols_by_parent, nc_map=None):
     * duplicate physical/logical copies of the same table (same ``item``) are de-duplicated,
       preferring the copy that actually resolves column metadata, while preserving a resolved
       per-relation ``connection`` from whichever copy carried it.
+    * an extract ``.tds`` pulled from Tableau Server also carries a parallel ``[Extract].[...]``
+      cache layer; those cache twins are dropped in favour of the live/logical relation (see
+      ``_is_extract_cache_relation``), but ONLY when a live table relation survives to represent
+      them -- an extract-ONLY datasource keeps its ``[Extract]`` tables, since they are all it has.
     """
     nc_map = nc_map or {}
     parent_map = _build_parent_map(datasource)
-    relations = []
-    table_index = {}  # dedupe key -> index into `relations`
+
+    # First pass: classify every candidate relation (skipping benign collection containers and the
+    # leaves consumed by a join/union tree) so the extract-twin decision can be made with
+    # whole-datasource knowledge before any table is emitted.
+    candidates = []
     for rel in _findall_local(datasource, "relation"):
         if (rel.get("type") or "").lower() == "collection":
             continue  # benign container; its child tables are emitted independently
@@ -387,8 +412,20 @@ def _extract_relations(datasource, cols_by_parent, nc_map=None):
             anc = _nearest_relation_ancestor(anc, parent_map)
         if consumed:
             continue
-        entry = _classify_relation(rel, cols_by_parent, nc_map)
+        candidates.append(_classify_relation(rel, cols_by_parent, nc_map))
+
+    # Only drop ``[Extract]`` cache twins when at least one live (non-extract) table remains to
+    # carry the data; an extract-only source must keep them.
+    has_live_table = any(
+        e["kind"] in ("table", "custom_sql") and not _is_extract_cache_relation(e)
+        for e in candidates)
+
+    relations = []
+    table_index = {}  # dedupe key -> index into `relations`
+    for entry in candidates:
         if entry["kind"] in ("table", "custom_sql"):
+            if has_live_table and _is_extract_cache_relation(entry):
+                continue  # prefer the live/logical relation over its extract-cache twin
             # De-dup on the fully-qualified path so the physical + logical copies of ONE table
             # collapse, but two genuinely different tables that merely share a leaf name (different
             # catalog/schema) stay distinct.
