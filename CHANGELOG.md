@@ -36,6 +36,17 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     `agent_review` annotations and an `adjudicated_summary` rollup **without** changing any
     deterministic tier/score. Adds `--save-adjudication` / `--apply-adjudication` and
     `resources/llm-adjudication.md`; skill `VERSION` `1.0.0` → `1.1.0`.
+  - **Migration-priority signal:** the comparison now also ranks *which* rebuilds matter by
+    **downstream impact** (`scripts/priority.py`). Each datasource's usage — attached workbooks plus
+    the sheets/dashboards built on it — is gathered from the Tableau **Metadata API** as the trusted
+    primary source, with a thin REST workbook-connection fallback for the not-yet-indexed tail
+    (`--usage {auto,metadata,rest,off}`). Usage bands (`High/Medium/Low/Unused/Unknown`) fuse with the
+    verdict into an actionable `migration_priority` (`already_exists` → *Reuse*; otherwise `P1
+    migrate-first` … `P4 retire candidate`), so a datasource with **0–1 attached workbook is
+    deprioritized** even if it needs a full rebuild. Adds `matches[].usage` / `.priority` /
+    `.migration_priority`, `summary.by_priority` / `by_migration_priority` / `usage_thresholds`, a
+    Markdown "Migration priority" section, and `resources/migration-priority.md`; all additive. Skill
+    `VERSION` `1.1.0` → `1.2.0`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.

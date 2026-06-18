@@ -80,7 +80,7 @@ def _gather_tableau(args, log) -> List[Dict[str, Any]]:
         tab._sign_in(client, args)
         try:
             return tab.gather_tableau_inventory(
-                client, tds_fallback=args.tds_fallback, on_progress=log)
+                client, tds_fallback=args.tds_fallback, usage=args.usage, on_progress=log)
         finally:
             client.sign_out()
     raise SystemExit("Provide --tableau-inventory-json or --tableau-live.")
@@ -113,6 +113,10 @@ def main(argv=None) -> int:
     ap.add_argument("--tds-fallback", choices=["auto", "never"], default="auto",
                     help="download+parse a datasource's .tds when the Metadata API returns no fields "
                          "(auto, default) or skip it (never)")
+    ap.add_argument("--usage", choices=["auto", "metadata", "rest", "off"], default="auto",
+                    help="gather downstream impact (attached workbooks/sheets/dashboards) to rank "
+                         "migration priority: auto (Metadata API primary + REST tail, default), "
+                         "metadata only, rest only, or off")
 
     # Fabric side
     ap.add_argument("--fabric-live", action="store_true", help="pull Fabric inventory live")
@@ -183,6 +187,10 @@ def main(argv=None) -> int:
     s = result["summary"]
     log(f"Done: {s['tableau_total']} datasource(s) vs {s['fabric_total']} model(s) -- "
         f"already-exist={s['already_exist']}, partial={s['partial']}, rebuild={s['rebuild']}")
+    by_mig = s.get("by_migration_priority")
+    if by_mig and any((m.get("usage") or {}).get("workbook_count") is not None for m in result.get("matches", [])):
+        ranked = ", ".join(f"{p}={c}" for p, c in by_mig.items() if c)
+        log(f"Migration priority: {ranked}")
     adj = result.get("adjudication", {}).get("summary", {})
     if adj.get("total_reviewed"):
         log(f"Adjudication queue: {adj['total_reviewed']} datasource(s) flagged for agent review "

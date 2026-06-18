@@ -11,7 +11,12 @@ directly. Always signs out.
 The result is the JSON shape ``compare.py`` consumes:
 
     {"name", "project", "luid", "fields": [{"name","dataType","role"}],
-     "sources": [{"connectionType","database","schema","table"}]}
+     "sources": [{"connectionType","database","schema","table"}],
+     "usage": {"workbook_count","sheet_count","dashboard_count","source"}}
+
+``usage`` is the downstream-impact signal that drives migration priority (how many workbooks /
+sheets / dashboards depend on the datasource). The Metadata API is the trusted primary source; a
+REST workbook-connection count fills the tail for datasources Catalog has not indexed yet.
 
 Auth (PAT default; Connected App Direct-Trust JWT optional via ``--auth jwt``):
 
@@ -105,6 +110,23 @@ query inv($luid: String!, $first: Int!, $after: String) {
         ... on DataField { dataType role }
       }
     }
+  }
+}
+"""
+
+# Downstream-impact query for the migration-priority signal. The Metadata API is the trusted primary
+# source for "how many workbooks (and sheets / dashboards) depend on this datasource"; in a real
+# migration effort the assets that matter are catalogued. Paged across the whole site in one query.
+DOWNSTREAM_GRAPHQL = """
+query down($first: Int!, $after: String) {
+  publishedDatasourcesConnection(first: $first, after: $after) {
+    nodes {
+      luid
+      downstreamWorkbooks { luid }
+      downstreamSheets { id }
+      downstreamDashboards { id }
+    }
+    pageInfo { hasNextPage endCursor }
   }
 }
 """
@@ -259,6 +281,78 @@ class TableauClient:
         except urllib.error.HTTPError as exc:
             raise TableauError(f"Download datasource content failed ({exc.code}).")
         return extract_tds_text(content)
+
+    # -- downstream usage (migration-priority signal) ---------------------------------
+    def downstream_usage_metadata(self, page_size: int = 100) -> Dict[str, Dict[str, Any]]:
+        """Trusted primary: per-datasource downstream workbook / sheet / dashboard counts (Catalog).
+
+        Returns ``{luid: {workbook_count, sheet_count, dashboard_count, source: "metadata"}}`` for
+        every datasource Tableau Catalog has indexed. Datasources not yet crawled are simply absent
+        (the caller fills those via the REST fallback). Raises ``TableauError`` if the Metadata API
+        itself is unavailable.
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+        after: Optional[str] = None
+        while True:
+            data = self.metadata_query(DOWNSTREAM_GRAPHQL, {"first": page_size, "after": after})
+            conn = data.get("publishedDatasourcesConnection") or {}
+            for n in conn.get("nodes") or []:
+                luid = n.get("luid")
+                if not luid:
+                    continue
+                out[luid] = {
+                    "workbook_count": len(n.get("downstreamWorkbooks") or []),
+                    "sheet_count": len(n.get("downstreamSheets") or []),
+                    "dashboard_count": len(n.get("downstreamDashboards") or []),
+                    "source": "metadata",
+                }
+            page_info = conn.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            after = page_info.get("endCursor")
+        return out
+
+    def downstream_usage_rest(self, luids, page_size: int = 100) -> Dict[str, int]:
+        """Catalog-independent fallback: count attached workbooks per published datasource via REST.
+
+        Enumerates the site's workbooks and, for each, its connections; a connection whose
+        ``datasource.id`` is one of ``luids`` is a workbook built on that **published** datasource
+        (Tableau returns the published datasource's luid there; embedded connections carry a
+        different id and are ignored). Works regardless of Catalog indexing state. Returns
+        ``{luid: workbook_count}``.
+        """
+        targets = {l for l in (luids or []) if l}
+        counts: Dict[str, int] = {l: 0 for l in targets}
+        if not targets:
+            return counts
+        page = 1
+        while True:
+            qs = urllib.parse.urlencode({"pageSize": str(page_size), "pageNumber": str(page)})
+            status, body = self._request(
+                "GET", f"{self._rest_base}/sites/{self.site_id}/workbooks?{qs}", self._auth_headers())
+            if status != 200:
+                raise TableauError(f"List workbooks failed ({status}): {str(body)[:300]}")
+            body = body or {}
+            rows = (body.get("workbooks") or {}).get("workbook") or []
+            for wb in rows:
+                wid = wb.get("id")
+                if not wid:
+                    continue
+                cstatus, cbody = self._request(
+                    "GET", f"{self._rest_base}/sites/{self.site_id}/workbooks/{wid}/connections",
+                    self._auth_headers())
+                conns = ((cbody or {}).get("connections") or {}).get("connection") or []
+                seen = set()
+                for cn in conns:
+                    did = (cn.get("datasource") or {}).get("id")
+                    if did in targets and did not in seen:
+                        counts[did] += 1
+                        seen.add(did)
+            total = int((body.get("pagination") or {}).get("totalAvailable", len(rows)) or len(rows))
+            if page * page_size >= total or not rows:
+                break
+            page += 1
+        return counts
 
 
 # ======================================================================================
@@ -429,7 +523,7 @@ def shape_from_tds(name, project, luid, tds_text: str) -> Dict[str, Any]:
 
 
 def gather_tableau_inventory(
-    client: TableauClient, *, tds_fallback: str = "auto", on_progress=None
+    client: TableauClient, *, tds_fallback: str = "auto", usage: str = "auto", on_progress=None
 ) -> List[Dict[str, Any]]:
     catalog = client.list_datasources()
     out: List[Dict[str, Any]] = []
@@ -467,7 +561,59 @@ def gather_tableau_inventory(
         if on_progress:
             on_progress(f"  - {shaped['name']}: {len(shaped['fields'])} field(s), "
                         f"{len(shaped['sources'])} source(s)  [{source_path}]")
+
+    if usage != "off":
+        _gather_usage(client, out, mode=usage, on_progress=on_progress)
     return out
+
+
+def _gather_usage(client: TableauClient, rows, *, mode: str, on_progress=None) -> None:
+    """Populate each row's ``usage`` block (downstream impact) for the migration-priority signal.
+
+    The Metadata API is the **trusted primary** source (workbooks + sheets + dashboards); the REST
+    workbook-connection count is a thin fallback used only for datasources Catalog has not indexed
+    yet (``auto``), or exclusively (``rest``).
+    """
+    luids = [r.get("luid") for r in rows if r.get("luid")]
+    meta_usage: Dict[str, Dict[str, Any]] = {}
+    if mode in ("auto", "metadata"):
+        try:
+            meta_usage = client.downstream_usage_metadata()
+        except Exception as exc:  # noqa: BLE001 - never fatal; fall through to REST in auto
+            if on_progress:
+                on_progress(f"  ! downstream metadata unavailable: {exc}")
+
+    missing = [l for l in luids if l not in meta_usage]
+    rest_usage: Dict[str, int] = {}
+    if mode == "rest" or (mode == "auto" and missing):
+        targets = luids if mode == "rest" else missing
+        try:
+            rest_usage = client.downstream_usage_rest(targets)
+        except Exception as exc:  # noqa: BLE001 - best-effort fallback, never fatal
+            if on_progress:
+                on_progress(f"  ! downstream REST fallback failed: {exc}")
+
+    for r in rows:
+        luid = r.get("luid")
+        u: Optional[Dict[str, Any]] = None
+        if mode == "rest":
+            if luid in rest_usage:
+                u = {"workbook_count": rest_usage[luid], "sheet_count": None,
+                     "dashboard_count": None, "source": "rest"}
+        else:  # auto / metadata: trust the catalogued count, fall back to REST only for the tail
+            if luid in meta_usage:
+                u = meta_usage[luid]
+            elif luid in rest_usage:
+                u = {"workbook_count": rest_usage[luid], "sheet_count": None,
+                     "dashboard_count": None, "source": "rest"}
+        if u is None:
+            u = {"workbook_count": None, "sheet_count": None,
+                 "dashboard_count": None, "source": "none"}
+        r["usage"] = u
+        if on_progress:
+            on_progress(f"    usage {r.get('name')}: {u.get('workbook_count')} workbook(s), "
+                        f"{u.get('sheet_count')} sheet(s), {u.get('dashboard_count')} dashboard(s) "
+                        f"[{u.get('source')}]")
 
 
 # ======================================================================================
@@ -501,6 +647,10 @@ def main(argv=None) -> int:
     ap.add_argument("--tds-fallback", choices=["auto", "never"], default="auto",
                     help="when the Metadata API returns no fields, download and parse the .tds "
                          "(auto, default) or skip it (never)")
+    ap.add_argument("--usage", choices=["auto", "metadata", "rest", "off"], default="auto",
+                    help="gather downstream impact (attached workbooks/sheets/dashboards) for the "
+                         "migration-priority signal: auto (Metadata API primary + REST for the "
+                         "not-yet-indexed tail, default), metadata only, rest only, or off")
     ap.add_argument("--out", help="write inventory JSON to this path (else stdout)")
     ap.add_argument("--dry-run", action="store_true", help="print what would be called, no network")
     args = ap.parse_args(argv)
@@ -510,6 +660,8 @@ def main(argv=None) -> int:
         print(f"  POST {os.environ.get('TABLEAU_SERVER', '<server>')}/api/{args.rest_version}/auth/signin")
         print(f"  GET  .../sites/<site-id>/datasources            (list, paged)")
         print(f"  POST .../api/metadata/graphql                   (fields + upstream tables, per datasource)")
+        print(f"  POST .../api/metadata/graphql                   (downstream workbooks/sheets/dashboards -- usage)")
+        print(f"  GET  .../sites/<site-id>/workbooks + /<id>/connections  (usage REST fallback)")
         print(f"  GET  .../sites/<site-id>/datasources/<id>/content?includeExtract=False  (.tds fallback)")
         print(f"  POST .../auth/signout")
         return 0
@@ -518,7 +670,7 @@ def main(argv=None) -> int:
     _sign_in(client, args)
     try:
         inventory = gather_tableau_inventory(
-            client, tds_fallback=args.tds_fallback,
+            client, tds_fallback=args.tds_fallback, usage=args.usage,
             on_progress=lambda m: print(m, file=sys.stderr))
     finally:
         client.sign_out()
