@@ -126,6 +126,75 @@ EXTRACT_OVER_SQLSERVER = """<?xml version='1.0' encoding='utf-8' ?>
   </extract>
 </datasource>"""
 
+# A modern object-model extract .tds as Tableau Server materializes it: the live/logical relations
+# AND a parallel `[Extract].[...]_HASH` cache layer (plus an <object-graph> that pairs each live
+# relation with its cache twin). Authored fixture (own catalog/schema/table names) -- structurally
+# faithful to the shape but not a reproduction of any real customer .tds. The cache twins must be
+# dropped in favour of the live relations (else a DirectLake rebuild binds to a non-existent entity).
+EXTRACT_OBJECT_MODEL = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='SalesExtract' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='dbx' name='databricks.abc'>
+        <connection class='databricks' dbname='salesdb' server='adb-x.azuredatabricks.net' />
+      </named-connection>
+    </named-connections>
+    <relation type='collection'>
+      <relation connection='databricks.abc' name='sales' table='[salesdb].[core].[sales]' type='table' />
+      <relation connection='databricks.abc' name='people' table='[salesdb].[core].[people]' type='table' />
+    </relation>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Amount</remote-name><local-name>[Amount]</local-name>
+        <parent-name>[sales]</parent-name><local-type>real</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Region</remote-name><local-name>[Region]</local-name>
+        <parent-name>[people]</parent-name><local-type>string</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+  <extract enabled='true'>
+    <connection class='hyper' dbname='Data/extract.hyper'>
+      <relation type='collection'>
+        <relation name='sales (salesdb.core.sales)_AB12' table='[Extract].[sales (salesdb.core.sales)_AB12]' type='table' />
+        <relation name='people (salesdb.core.people)_CD34' table='[Extract].[people (salesdb.core.people)_CD34]' type='table' />
+      </relation>
+    </connection>
+  </extract>
+  <object-graph>
+    <objects>
+      <object caption='sales' id='sales (salesdb.core.sales)_AB12'>
+        <properties>
+          <relation connection='databricks.abc' name='sales' table='[salesdb].[core].[sales]' type='table' />
+          <relation name='sales (salesdb.core.sales)_AB12' table='[Extract].[sales (salesdb.core.sales)_AB12]' type='table' />
+        </properties>
+      </object>
+      <object caption='people' id='people (salesdb.core.people)_CD34'>
+        <properties>
+          <relation connection='databricks.abc' name='people' table='[salesdb].[core].[people]' type='table' />
+          <relation name='people (salesdb.core.people)_CD34' table='[Extract].[people (salesdb.core.people)_CD34]' type='table' />
+        </properties>
+      </object>
+    </objects>
+  </object-graph>
+</datasource>"""
+
+# A legacy extract-ONLY .tds: the only relations live in the `[Extract]` namespace, with no live
+# upstream relation to replace them. These MUST be kept -- they are the only tables the source has.
+EXTRACT_ONLY = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='ExtractOnly' version='18.1'>
+  <connection class='hyper' dbname='Data/extract.hyper'>
+    <relation name='sales_AB12' table='[Extract].[sales_AB12]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Amount</remote-name><local-name>[Amount]</local-name>
+        <parent-name>[sales_AB12]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
 CUSTOM_SQL = """<?xml version='1.0' encoding='utf-8' ?>
 <datasource formatted-name='CustomSQL' version='18.1'>
   <connection class='federated'>
@@ -802,6 +871,32 @@ def test_parse_extract_flag_and_does_not_inflate_connection_count():
     # the hyper connection inside <extract> must NOT be counted as a second named connection.
     assert d["named_connection_count"] == 1
     assert d["connection_class"] == "sqlserver"
+
+
+def test_parse_extract_object_model_drops_cache_twins():
+    # The modern Server-materialized extract carries each live relation PLUS a `[Extract].[...]_HASH`
+    # cache twin. parse_tds must keep only the live/logical relations (the twins would bind to a
+    # non-existent Delta entity in a DirectLake rebuild).
+    d = parse_tds(EXTRACT_OBJECT_MODEL)
+    assert d["is_extract"] is True
+    assert d["connection_class"] == "databricks"
+    tables = [r for r in d["relations"] if r["kind"] == "table"]
+    assert [r["name"] for r in tables] == ["sales", "people"]
+    # no `[Extract]` cache twin survives, in either the collection layer or the object-graph.
+    assert not any("Extract" in (r.get("raw_table") or "") for r in tables)
+    by_name = {r["name"]: r for r in tables}
+    # the surviving live relations keep their resolved columns + their live upstream coordinates.
+    assert {c["remote_name"] for c in by_name["sales"]["columns"]} == {"Amount"}
+    assert by_name["sales"]["catalog"] == "salesdb" and by_name["sales"]["schema"] == "core"
+    assert d["unsupported_reasons"] == []
+
+
+def test_parse_extract_only_keeps_extract_tables():
+    # With NO live relation to replace them, the `[Extract]` tables are all the source has -> keep.
+    d = parse_tds(EXTRACT_ONLY)
+    tables = [r for r in d["relations"] if r["kind"] == "table"]
+    assert [r["name"] for r in tables] == ["sales_AB12"]
+    assert {c["remote_name"] for c in tables[0]["columns"]} == {"Amount"}
 
 
 def test_parse_custom_sql_relation():
