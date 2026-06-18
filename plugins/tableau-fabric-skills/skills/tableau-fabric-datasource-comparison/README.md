@@ -1,0 +1,73 @@
+# tableau-fabric-datasource-comparison
+
+Read-only **estate comparison** for a Tableau → Microsoft Fabric / Power BI migration. It inventories
+every published Tableau datasource and every Fabric semantic model, then ranks each datasource from
+**"already in Fabric"** to **"needs rebuild"** so a migration team can size the work: how many
+datasources already exist versus how many must be recreated.
+
+See [`SKILL.md`](SKILL.md) for the full agent-facing contract and
+[`resources/`](resources/) for the methodology, introspection notes, and report schema.
+
+## Quick start
+
+```powershell
+$env:TABLEAU_SERVER    = "https://your-pod.online.tableau.com"
+$env:TABLEAU_SITE      = "your-site-content-url"   # "" for the Default site
+$env:TABLEAU_PAT_NAME  = "your-pat-name"
+$env:TABLEAU_PAT_VALUE = "your-pat-secret"
+
+py -3.11 scripts/compare_estate.py --tableau-live --fabric-live --use-az --format md --out report.md
+```
+
+`--use-az` mints the Fabric token with the Azure CLI; alternatively pass `--token` or set
+`FABRIC_TOKEN`. Use `--workspaces "A,B"` to scope Fabric, and `--save-tableau-inventory` /
+`--save-fabric-inventory` to cache both sides so you can re-score offline with `--weights`.
+
+## What it compares
+
+For every Tableau datasource it scores the best-matching Fabric semantic model on four signals —
+**name**, **column overlap**, **type compatibility**, and **physical source** — and assigns a tier
+(`Exact / Strong / Partial / Weak / None`). The source signal is connector-agnostic enough to survive a
+**Lakehouse intermediary** (Fabric reads a mirror; Tableau connects directly) and falls back gracefully
+when the upstream source is **obscured** (composite / DirectQuery models, referenced datasources).
+
+When Tableau Catalog has not indexed a datasource, the Tableau inventory downloads that datasource's
+`.tds` (without its extract) and parses columns + relation tables directly, so cloud-connected
+datasources still produce a full schema.
+
+## Layout
+
+```
+tableau-fabric-datasource-comparison/
+  SKILL.md
+  scripts/
+    compare.py            # pure, offline scoring engine (the core IP)
+    tableau_inventory.py  # Tableau REST + Metadata API + .tds fallback
+    fabric_inventory.py   # Fabric REST + getDefinition / TMDL / M parsing
+    compare_estate.py     # CLI orchestrator (live or cached, md/json)
+  tests/                  # offline pytest suite (no network)
+  resources/
+    comparison-methodology.md
+    fabric-introspection.md
+    tableau-inventory.md
+    report-schema.md
+```
+
+## Requirements
+
+Python **3.11+**, **standard library only** — no third-party packages. The Fabric token can be supplied
+directly or minted via the Azure CLI (`--use-az`).
+
+## Tests
+
+```powershell
+cd skills/tableau-fabric-datasource-comparison
+py -3.11 -m pytest tests -q
+```
+
+The suite is fully offline and fixture-driven; it needs no live Tableau or Fabric access.
+
+## Safety
+
+Read-only on both clouds — the Tableau client always signs out and Fabric uses only read endpoints.
+Never commit a downloaded `.tds`/`.tdsx`, a PAT, or a Fabric bearer token.

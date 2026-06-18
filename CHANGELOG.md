@@ -13,7 +13,20 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration:** row-level / dimension calc translation is now wired into the
+- **tableau-fabric-datasource-comparison (new skill):** read-only estate comparison that inventories
+  every published Tableau datasource and every Fabric / Power BI semantic model in a tenant and ranks
+  each datasource from "already in Fabric" to "needs rebuild". Scores a weighted blend of four signals
+  (name, column overlap, type compatibility, physical source) into tiers (`Exact / Strong / Partial /
+  Weak / None`) and an estate rollup. The physical-source signal takes the best of strict
+  `(connector, database, table)`, loose `(connector, table)`, and a connector-agnostic **table-name**
+  tier, so it survives a **lakehouse intermediary** (Fabric reads a mirror; Tableau connects directly)
+  and falls back gracefully when the upstream source is **obscured** (composite/DirectQuery models,
+  referenced datasources) by dropping the source signal and redistributing its weight. The Tableau
+  inventory adds a **Catalog-independent `.tds` fallback** (downloads the descriptor without its
+  extract and parses columns + relation tables) so cloud-connected datasources the Metadata API can't
+  see still produce a full schema. Standard-library only; offline-testable scoring core; never modifies
+  Tableau or Fabric. Registered additively in all four packaging manifests (collection `0.3.0` →
+  `0.4.0`).
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.

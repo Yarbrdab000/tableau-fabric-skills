@@ -16,9 +16,10 @@ Copilots — **GitHub Copilot CLI**, VS Code Copilot, Claude Code, Cursor.
 | **[`tableau-datasource-profiler`](skills/tableau-datasource-profiler/)** | Read-only profile of a published Tableau datasource (fields, types, calc formulas, lineage, migration signals) and natural-language querying via the VizQL Data Service. | You want to inventory, audit, or query a datasource — or validate a Connected App — before migrating. |
 | **[`tableau-mcp-landing-zone`](skills/tableau-mcp-landing-zone/)** | Deploy the **official** Tableau MCP server behind a Microsoft auth sidecar to Azure and wire it into Copilot Studio, so business users ask natural-language questions about Tableau data. Optional Entra to Tableau per-user RLS. | You want live, governed natural-language access to Tableau from Microsoft Copilot. |
 | **[`tableau-migration`](skills/tableau-migration/)** | Rebuild Tableau datasources as Power BI semantic models: typed TMDL, inferred relationships, deterministic calc to DAX (every formula preserved), storage-mode auto-selection, self-contained Fabric REST deploy. | You want to migrate a datasource into a Fabric / Power BI semantic model. |
+| **[`tableau-fabric-datasource-comparison`](skills/tableau-fabric-datasource-comparison/)** | Read-only estate comparison: inventory every Tableau datasource and every Fabric semantic model, then rank each datasource from "already in Fabric" to "needs rebuild" on name + column + type + physical-source overlap (with a table-name fallback for lakehouse/obscured sources). | You want to size a migration — what already exists in Fabric vs. what you must recreate. |
 
-They share one Tableau Connected App and compose naturally: **profile** to validate, **serve** live
-over MCP, **migrate** into Fabric.
+They share one Tableau Connected App and compose naturally: **compare** to scope the estate, **profile**
+to validate, **serve** live over MCP, **migrate** into Fabric.
 
 ## Install
 
@@ -50,13 +51,13 @@ Or run the two commands yourself in a Copilot CLI session:
 ```
 
 `tableau-fabric-skills` is the plugin, `tableau-collection` the marketplace — installing it
-installs all three skills. **Start a new session**; skills load at session start.
+installs all four skills. **Start a new session**; skills load at session start.
 
 ### Verify it loaded
 
 ```text
 /plugin list     → expect "tableau-fabric-skills"
-/skills list     → expect tableau-datasource-profiler, tableau-mcp-landing-zone, tableau-migration
+/skills list     → expect tableau-datasource-profiler, tableau-mcp-landing-zone, tableau-migration, tableau-fabric-datasource-comparison
 ```
 
 Don't rely on asking the agent "what skills do you have?" — that can't fail loudly.
@@ -84,6 +85,7 @@ skills/                              # canonical skills (source of truth)
   tableau-datasource-profiler/
   tableau-mcp-landing-zone/          # includes a vendored assets/ deploy bundle
   tableau-migration/
+  tableau-fabric-datasource-comparison/
 plugins/
   tableau-fabric-skills/             # self-contained bundle plugin (mirrors skills/)
 .claude-plugin/marketplace.json      # marketplace manifest (+ .github/plugin/marketplace.json)
@@ -91,9 +93,10 @@ plugins/
 
 ## Requirements
 
-Python **3.11+**. `tableau-migration` is standard-library only; `tableau-datasource-profiler` needs
-`requests` (`pip install -r skills/tableau-datasource-profiler/requirements.txt`);
-`tableau-mcp-landing-zone` deploys with the Azure CLI / Docker.
+Python **3.11+**. `tableau-migration` and `tableau-fabric-datasource-comparison` are standard-library
+only; `tableau-datasource-profiler` needs `requests`
+(`pip install -r skills/tableau-datasource-profiler/requirements.txt`); `tableau-mcp-landing-zone`
+deploys with the Azure CLI / Docker.
 
 ## Provenance & license
 
