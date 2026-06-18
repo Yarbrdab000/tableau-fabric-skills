@@ -1,18 +1,14 @@
 ---
 name: tableau-mcp-landing-zone
-description: >
-  Deploy the OFFICIAL Tableau MCP server (`ghcr.io/tableau/tableau-mcp`) behind a Microsoft
-  auth sidecar so business users can ask natural-language questions about their Tableau data
-  from Copilot Studio / M365 Copilot / Azure AI Foundry. The skill drives Play 1's landing
-  zone: a one-click "Deploy to Azure" (Container Apps, HTTPS, scale-to-zero) or a `deploy.ps1`
-  CLI path, an `x-api-key` front door for Copilot Studio custom connectors, and an optional
-  Entra -> Tableau identity passthrough so Tableau row-level security applies per signed-in
-  M365 user. It wraps the official image unmodified (the sidecar is the complete auth boundary)
-  and includes a local docker-compose harness for evaluation. Use when the user wants to:
-  (1) deploy / stand up the Tableau MCP server on Azure,
-  (2) connect Tableau to Microsoft Copilot Studio (natural-language querying of Tableau),
-  (3) enable per-user row-level security (Entra -> Tableau passthrough) for an MCP agent,
-  (4) run the Tableau MCP locally for evaluation, or operate / harden / troubleshoot it.
+description: >-
+  Deploy the official Tableau MCP server (ghcr.io/tableau/tableau-mcp) behind a
+  Microsoft auth sidecar so business users can ask natural-language questions about
+  Tableau data from Copilot Studio / M365 Copilot / Azure AI Foundry. Provides a
+  one-click Deploy to Azure (Container Apps, HTTPS, scale-to-zero) or a deploy.ps1
+  path, an x-api-key front door for Copilot Studio connectors, optional
+  Entra-to-Tableau identity passthrough for per-user row-level security, and a local
+  docker-compose harness. Use to deploy the Tableau MCP server on Azure, connect
+  Tableau to Copilot Studio, enable per-user RLS, or run it locally for evaluation.
   Triggers: "deploy tableau mcp", "tableau mcp on azure", "tableau mcp server",
   "natural language tableau in copilot", "connect tableau to copilot studio",
   "tableau row level security copilot", "tableau mcp passthrough", "tableau mcp landing zone".

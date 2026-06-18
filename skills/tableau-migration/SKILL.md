@@ -1,18 +1,14 @@
 ---
 name: tableau-migration
-description: >
+description: >-
   Rebuild Tableau datasources as Microsoft Fabric / Power BI semantic models.
-  Recreates the data model as TMDL (typed columns, inferred relationships), translates the
-  safe subset of Tableau calculated fields into working DAX measures (preserving every
-  original formula as an annotation), and auto-selects a storage mode per datasource —
-  extract -> Import, live connection -> DirectQuery. By default each table is rebuilt bound
-  directly to its own source (even a federated, multi-connection datasource — Power BI relates
-  the tables in the model layer), with land-to-Delta + DirectLake offered as an explicit option
-  only for shapes that genuinely can't be rebuilt directly. Accepts a `.tds`/`.tdsx` datasource
-  or a `.twb`/`.twbx` workbook (pick one of several embedded datasources). Use when the user wants to:
-  (1) migrate Tableau datasources / published data sources to Power BI semantic models,
-  (2) convert Tableau calculated fields to DAX,
-  (3) repoint a migrated model at its original SQL Server / Snowflake / Postgres source.
+  Recreates the data model as TMDL (typed columns, inferred relationships),
+  translates the safe subset of Tableau calculated fields into working DAX measures
+  (preserving each original formula as an annotation), and auto-selects a storage
+  mode per datasource (extract to Import, live connection to DirectQuery). Accepts a
+  .tds/.tdsx datasource or a .twb/.twbx workbook. Use to migrate Tableau datasources
+  to Power BI semantic models, convert Tableau calculated fields to DAX, or repoint a
+  migrated model at its original SQL Server / Snowflake / Postgres source.
   Triggers: "migrate from tableau", "tableau to fabric", "tableau to power bi",
   "tableau datasource to semantic model", "tableau workbook to power bi",
   "convert tableau calculation to dax", "tableau calculated field to dax",

@@ -71,6 +71,13 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
+- **All three skills:** trimmed every `SKILL.md` `description` to fit GitHub Copilot's 1024-char
+  frontmatter cap (they were 1369 / 1331 / 1333 chars). Over-limit descriptions are dropped
+  silently — the plugin installs and `plugin list` shows it, but the skills never register in a
+  session, so the agent fell back to reading the repo and improvising instead of running the
+  skill. Verified the trimmed skills now load via the plugin path. Added
+  `tests/test_skill_frontmatter.py` to assert `name` <= 60 and `description` <= 1024 for every
+  SKILL.md (canonical and mirrored) so this can't regress.
 - **tableau-mcp-landing-zone:** corrected the default `tableauMcpImage` pin. The previous
   default `:2.4.3` returns `MANIFEST_UNKNOWN` on GHCR (published stable tags jump 2.2.4 ->
   2.7.4), so a fresh deploy could not pull the image. Now defaults to the readable tag

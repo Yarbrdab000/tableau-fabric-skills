@@ -1,20 +1,15 @@
 ---
 name: tableau-datasource-profiler
 description: >-
-  Profile a published Tableau datasource. Returns a field-level report — data
-  types, roles, hidden flags, folders, calculated-field formulas, lineage, and
-  datasource-level migration signals (unsupported custom SQL, calculated-field
-  count, RLS/user references). Optionally adds value-level statistics
-  (cardinality, null rates, numeric ranges, date ranges) via the VizQL Data
-  Service. Also includes a **natural-language query** tool (`query_datasource.py`)
-  that executes structured VizQL Data Service queries (aggregations, filters,
-  sorting, top-N) so an agent can answer business questions from the data. Use
-  when the user wants to: (1) inventory or document a Tableau datasource's fields,
-  types, calculated-field formulas, and lineage, (2) assess Tableau to Microsoft
-  Fabric / Power BI migration readiness (calculated fields needing DAX, unsupported
-  custom SQL, RLS/user references), or (3) profile data quality (cardinality, null
-  rates, value/date ranges) or answer natural-language questions about the data
-  before landing it in Fabric. Read-only; never modifies Tableau.
+  Read-only profiling and Tableau-to-Microsoft Fabric / Power BI migration-readiness
+  assessment of a published Tableau datasource. Returns a field-level report (data
+  types, roles, hidden flags, folders, calculated-field formulas, lineage) plus
+  datasource migration signals (unsupported custom SQL, calculated-field count,
+  RLS/user references), optional value-level stats (cardinality, null rates,
+  numeric/date ranges) via the VizQL Data Service, and a natural-language query tool.
+  Never modifies Tableau. Use to inventory or document a Tableau datasource's fields,
+  types, formulas, and lineage; assess migration readiness; or profile data quality
+  before landing it in Fabric.
   Triggers: "profile tableau datasource", "tableau datasource fields",
   "tableau migration readiness", "assess tableau datasource",
   "inventory tableau calculated fields", "query tableau datasource",
