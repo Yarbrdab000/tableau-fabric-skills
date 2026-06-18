@@ -42,6 +42,12 @@ not-confidently-matched datasources to an agent for a semantic verdict; the dete
 authoritative and the agent's call is folded in only on an explicit `--apply-adjudication` pass. See
 [`resources/llm-adjudication.md`](resources/llm-adjudication.md).
 
+A separate **migration-priority** signal then ranks *which* rebuilds matter: each datasource's
+downstream usage (attached workbooks + sheets/dashboards, from the Tableau Metadata API with a REST
+fallback) fuses with its verdict into `P1 migrate-first … P4 retire candidate` / `Reuse`, so a
+datasource with **0–1 attached workbook is deprioritized** even if it needs a full rebuild. See
+[`resources/migration-priority.md`](resources/migration-priority.md).
+
 ## Layout
 
 ```
@@ -50,6 +56,7 @@ tableau-fabric-datasource-comparison/
   scripts/
     compare.py            # pure, offline scoring engine (the core IP)
     adjudicate.py         # pure LLM-optional "second matcher" router + advisory apply path
+    priority.py           # pure migration-priority signal (downstream-usage ranking)
     tableau_inventory.py  # Tableau REST + Metadata API + .tds fallback
     fabric_inventory.py   # Fabric REST + getDefinition / TMDL / M parsing
     compare_estate.py     # CLI orchestrator (live or cached, md/json)
@@ -57,6 +64,7 @@ tableau-fabric-datasource-comparison/
   resources/
     comparison-methodology.md
     llm-adjudication.md
+    migration-priority.md
     fabric-introspection.md
     tableau-inventory.md
     report-schema.md

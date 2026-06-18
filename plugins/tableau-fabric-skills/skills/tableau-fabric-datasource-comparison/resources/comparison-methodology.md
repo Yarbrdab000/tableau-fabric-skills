@@ -88,6 +88,15 @@ The best score per datasource is banded high-to-low:
 - **partial** → a related model exists; reconcile added/renamed columns or source drift before reuse.
 - **rebuild** → no real equivalent; hand to the `tableau-migration` skill.
 
+### Ranking the rollup by downstream impact
+
+The rollup says *how much* to rebuild; the **migration-priority** signal orders *what to rebuild
+first*. Each datasource's downstream usage (attached workbooks + sheets/dashboards, gathered from the
+Tableau Metadata API with a REST fallback) bands it `High/Medium/Low/Unused/Unknown`, then fuses with
+the bucket: `already_exists` → *Reuse*; otherwise `High→P1` … `Unused→P4 (retire candidate)`, so a
+datasource with **0–1 attached workbook is deprioritized** even when it needs a full rebuild. This is
+additive — see [`migration-priority.md`](migration-priority.md).
+
 ## Tuning notes
 
 - Fabric models commonly add measures and calculated columns, which **inflates the column count** and

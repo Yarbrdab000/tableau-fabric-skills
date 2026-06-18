@@ -27,6 +27,9 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
 | `rebuild` | int | datasources in the `rebuild` bucket (Weak+None) |
 | `weights` | object | the signal weights used (`name/column/type/source`) |
 | `bands` | array | the `[label, min_score]` band table used |
+| `by_priority` | object | count per usage label: `{High, Medium, Low, Unused, Unknown}` (additive — see [`migration-priority.md`](migration-priority.md)) |
+| `by_migration_priority` | object | count per fused action: `{P1…, P2…, P3…, P4…, Reuse…, Unprioritized}` |
+| `usage_thresholds` | object | the workbook-count thresholds used (`{high, medium}`) |
 
 ## `matches[]` (sorted most-comparable first)
 
@@ -39,6 +42,9 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
 | `score` | float | best score `0..1` |
 | `bucket` | string | `already_exists` / `partial` / `rebuild` |
 | `source_compared` | bool | `false` when the physical source was obscured on either side (then the source sub-score is `n/a`) |
+| `usage` | object \| null | downstream impact: `{workbook_count, sheet_count, dashboard_count, source}` (additive — `source` is `metadata`/`rest`/`none`; counts are `null` when not gathered) |
+| `priority` | string | usage label `High / Medium / Low / Unused / Unknown` (additive) |
+| `migration_priority` | string | fused action `P1 - migrate first` … `P4 - retire candidate` / `Reuse (already in Fabric)` / `Unprioritized` (additive) |
 | `best_match` | object \| null | the winning Fabric candidate (null when nothing scored above 0) |
 | `candidates` | array | up to `--top-n` candidates (incl. the best), each a candidate object |
 
@@ -88,6 +94,24 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
 - Treat **`already_exists`** as a reuse/verify list — confirm the candidate before retiring the Tableau
   datasource.
 - **`partial`** needs human reconciliation (added/renamed columns, source drift) before reuse.
+- Order the rebuild work by **`matches[].migration_priority`** — see below.
+
+## Migration priority (downstream-impact ranking)
+
+The comparison answers *"does it already exist in Fabric?"*; the migration-priority signal answers
+*"which rebuilds matter, and in what order?"*. Each datasource's downstream **usage** (attached
+workbooks plus the sheets/dashboards built on it) is gathered by `tableau_inventory.py` — the Tableau
+**Metadata API** is the trusted primary source, with a thin REST workbook-connection fallback for any
+datasource Catalog has not indexed yet (`--usage {auto,metadata,rest,off}`). Full method in
+[`migration-priority.md`](migration-priority.md).
+
+- `usage` rides along on each `matches[]` row; `priority` bands it (`High ≥ usage_thresholds.high`
+  workbooks, `Medium ≥ usage_thresholds.medium`, `Low = 1`, `Unused = 0`, `Unknown` = not gathered).
+- `migration_priority` fuses bucket + usage: `already_exists` → `Reuse (already in Fabric)`; otherwise
+  `High→P1`, `Medium→P2`, `Low→P3 (deprioritize)`, `Unused→P4 (retire candidate)`, `Unknown→Unprioritized`.
+  A datasource with **0–1 attached workbook** is deprioritized even if it needs a full rebuild.
+- These keys are **always present** (annotation runs unconditionally); when usage was not gathered
+  everything is `Unknown` / `Unprioritized` and the Markdown priority section is omitted.
 
 ## `adjudication` (LLM-optional review queue)
 

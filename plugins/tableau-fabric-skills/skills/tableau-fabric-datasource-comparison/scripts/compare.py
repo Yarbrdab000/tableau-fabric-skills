@@ -409,6 +409,7 @@ def compare_inventories(
             "score": best_score,
             "bucket": rollup_bucket(tier),
             "source_compared": bool(best and best.get("source_compared")),
+            "usage": ds.get("usage"),
             "best_match": best if (best and best_score > 0) else None,
             "candidates": scored[:top_n],
         })
@@ -443,6 +444,19 @@ def compare_inventories(
             import adjudicate as _adjudicate
         result["adjudication"] = _adjudicate.build_adjudication(matches, tableau or [], fabric)
     except Exception:  # never let the optional tier break the deterministic verdict
+        pass
+
+    # Migration-priority signal: fuse each match's downstream usage (attached workbooks/sheets/
+    # dashboards, gathered by tableau_inventory) with its comparison verdict so the report can rank
+    # *which* rebuilds matter. Additive (adds matches[].priority / .migration_priority and the
+    # summary rollups); lazily imported and never allowed to break the deterministic verdict.
+    try:  # pragma: no cover - trivial wiring
+        try:
+            from . import priority as _priority
+        except ImportError:
+            import priority as _priority
+        _priority.annotate(result)
+    except Exception:
         pass
 
     return result
@@ -482,6 +496,7 @@ def render_markdown(result: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("By tier: " + ", ".join(f"{t}={s['by_tier'].get(t, 0)}" for t in TIER_ORDER))
     lines.append("")
+    _render_priority_rollup(result, lines)
     lines.append("## Ranked matches (most comparable first)")
     lines.append("")
     lines.append("| Tableau datasource | Project | Best Fabric match | Workspace | Tier | Score | name/col/type/src |")
@@ -517,8 +532,85 @@ def render_markdown(result: Dict[str, Any]) -> str:
         for n in names:
             lines.append(f"- {n}")
         lines.append("")
+    _render_priority_worklist(result, lines)
     _render_adjudication(result, lines)
     return "\n".join(lines).rstrip() + "\n"
+
+
+# Migration-priority rendering. Both helpers are guarded -- when usage was not gathered
+# (``--usage off`` or a tenant with no Catalog) everything is Unknown/Unprioritized and the
+# sections degrade quietly so the deterministic report is unchanged.
+_MIGRATION_PRIORITY_ORDER = [
+    "P1 - migrate first",
+    "P2 - migrate",
+    "P3 - deprioritize",
+    "P4 - retire candidate",
+    "Reuse (already in Fabric)",
+    "Unprioritized",
+]
+_USAGE_ORDER = ["High", "Medium", "Low", "Unused", "Unknown"]
+
+
+def _has_usage(result: Dict[str, Any]) -> bool:
+    return any(
+        (m.get("usage") or {}).get("workbook_count") is not None
+        for m in result.get("matches", [])
+    )
+
+
+def _render_priority_rollup(result: Dict[str, Any], lines: List[str]) -> None:
+    s = result.get("summary", {})
+    by_mig = s.get("by_migration_priority")
+    if not by_mig or not _has_usage(result):
+        return
+    shown = [(p, by_mig.get(p, 0)) for p in _MIGRATION_PRIORITY_ORDER if by_mig.get(p, 0)]
+    if not shown:
+        return
+    lines.append("By migration priority: " + ", ".join(f"{p}={c}" for p, c in shown))
+    lines.append("")
+
+
+def _render_priority_worklist(result: Dict[str, Any], lines: List[str]) -> None:
+    """Rank the rebuild/partial datasources by downstream impact -- what to migrate, and in what order."""
+    if not _has_usage(result):
+        return
+    work = [
+        m for m in result.get("matches", [])
+        if m.get("bucket") in ("rebuild", "partial")
+    ]
+    if not work:
+        return
+    order = {p: i for i, p in enumerate(_MIGRATION_PRIORITY_ORDER)}
+    work.sort(key=lambda m: (order.get(m.get("migration_priority"), 99), -(m.get("score") or 0.0)))
+    th = result.get("summary", {}).get("usage_thresholds", {})
+    lines.append("## Migration priority (what to rebuild first)")
+    lines.append("")
+    lines.append(
+        "Ranks the datasources that need work by **downstream impact** -- how many workbooks "
+        "(and the sheets / dashboards built on them) depend on each. Busy datasources rebuild "
+        "first; a datasource with **0-1 attached workbook** is a deprioritize / retire candidate "
+        "even if it needs a full rebuild."
+    )
+    if th:
+        lines.append("")
+        lines.append(
+            f"_Usage bands: High >= {th.get('high')} workbooks, Medium >= {th.get('medium')}, "
+            "Low = 1, Unused = 0, Unknown = not catalogued._"
+        )
+    lines.append("")
+    lines.append("| Priority | Tableau datasource | Outcome | Workbooks | Usage | Score |")
+    lines.append("|---|---|---|---:|---|---:|")
+    bucket_label = {"rebuild": "Needs rebuild", "partial": "Partial overlap"}
+    for m in work:
+        usage = m.get("usage") or {}
+        wc = usage.get("workbook_count")
+        wc_s = "?" if wc is None else str(wc)
+        lines.append(
+            f"| {m.get('migration_priority', '')} | {m.get('tableau_name')} | "
+            f"{bucket_label.get(m.get('bucket'), m.get('bucket'))} | {wc_s} | "
+            f"{m.get('priority', '')} | {m.get('score', 0.0):.2f} |"
+        )
+    lines.append("")
 
 
 # Friendly one-line labels for each uncertainty category in the adjudication queue.

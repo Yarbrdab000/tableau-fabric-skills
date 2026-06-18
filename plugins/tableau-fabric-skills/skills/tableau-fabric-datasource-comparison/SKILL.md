@@ -51,7 +51,8 @@ compare_estate.py (CLI orchestrator)
   ├── tableau_inventory.py  → [{name, project, luid, fields[], sources[]}]
   ├── fabric_inventory.py   → [{name, workspace, id, tables[], columns[], sources[]}]
   ├── compare.py (pure)     → best Fabric match + tier + 4 signals per datasource; estate rollup
-  └── adjudicate.py (pure)  → LLM-optional "second matcher": routes the uncertain tail to an agent
+  ├── adjudicate.py (pure)  → LLM-optional "second matcher": routes the uncertain tail to an agent
+  └── priority.py (pure)    → ranks the rebuild set by downstream usage (attached workbooks)
         → report (Markdown or JSON), ranked most-comparable first, plus an adjudication queue
 ```
 
@@ -101,6 +102,23 @@ verdict (`match` / `partial` / `no-match` + confidence + rationale) is **advisor
 on an explicit `--apply-adjudication` pass — it never rewrites the deterministic tier/score, and a
 default run adds zero agent verdicts. Full contract: `resources/llm-adjudication.md`.
 
+## Migration priority (what to rebuild first)
+
+"Does it already exist in Fabric?" and "how much does it matter?" are different questions. The skill
+adds a second axis — **downstream impact** — so the rebuild set is ranked, not just counted. For each
+datasource it gathers `usage` (attached workbooks, plus the sheets / dashboards built on them) and
+fuses that with the comparison verdict into a `migration_priority`:
+
+- `already_exists` → **Reuse (already in Fabric)** (never needs migrating, whatever its usage).
+- otherwise ordered by usage: **P1 migrate-first** (≥5 workbooks) → **P2** → **P3 deprioritize** (1) →
+  **P4 retire candidate** (0). A datasource with **0–1 attached workbook is deprioritized** even if it
+  needs a full rebuild; `Unknown` usage stays `Unprioritized`.
+
+Usage gathering trusts the Tableau **Metadata API** as the primary source (in a real migration effort
+the assets that matter are catalogued) and uses a thin REST workbook-connection count only for the
+not-yet-indexed tail. `--usage {auto,metadata,rest,off}` selects the strategy. Full method:
+`resources/migration-priority.md`.
+
 ## Usage
 
 ```powershell
@@ -135,6 +153,9 @@ Each inventory script also runs standalone (`tableau_inventory.py`, `fabric_inve
 - `--workspaces` — comma-separated Fabric workspace names/ids (default: all visible).
 - `--tds-fallback {auto,never}` — download+parse a datasource's `.tds` when the Metadata API is empty
   (default `auto`).
+- `--usage {auto,metadata,rest,off}` — gather downstream impact (attached workbooks/sheets/dashboards)
+  to rank migration priority: `auto` (Metadata API primary + REST tail, default), `metadata` only,
+  `rest` only, or `off`. See `resources/migration-priority.md`.
 - `--save-adjudication PATH` — write the agent adjudication queue (the review handoff) as JSON.
 - `--apply-adjudication PATH` — fold an agent-verdicts JSON back in as advisory annotations (the
   deterministic tier/score are never changed); see `resources/llm-adjudication.md`.
@@ -149,6 +170,8 @@ A Markdown (or JSON) report — see `resources/report-schema.md`:
   and the four signal sub-scores; `src = n/a` flags an obscured-source match.
 - **Agent adjudication queue**: the not-confidently-matched datasources, each with *why* it was flagged
   (renamed columns, obscured source, near tie, …) for an LLM-optional semantic review.
+- **Migration priority**: the rebuild/partial set ranked P1 → P4 by downstream usage, plus a
+  by-migration-priority rollup (omitted when usage was not gathered).
 - **Recommended actions**: grouped by tier, pointing the rebuild set at the `tableau-migration` skill.
 
 After an `--apply-adjudication` pass the report also shows an **After semantic review** rollup
