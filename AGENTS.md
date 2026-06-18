@@ -71,7 +71,7 @@ not mirrored.
   ```
   cd skills\tableau-migration; py -3.11 -m pytest tests -q
   ```
-  Keep it green. The current baseline is **939 passed / 1 skipped / 2 xfailed**.
+  Keep it green. The current baseline is **950 passed / 1 skipped / 2 xfailed**.
 - Keep report-schema changes **additive** — add new keys or artifacts; do not rename or remove
   existing report keys. Add tests; never delete passing tests to make a change pass.
 - Before committing, confirm packaging is valid: every `SKILL.md` frontmatter parses, the four
