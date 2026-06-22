@@ -1010,6 +1010,23 @@ def _render_verification(result: Dict[str, Any], lines: List[str]) -> None:
         f"({v.get('probes_run', 0)} probe(s) run)."
     )
     lines.append("")
+    no_data = v.get("fabric_no_data") or 0
+    unreadable = v.get("fabric_unreadable") or 0
+    if no_data or unreadable:
+        total = no_data + unreadable
+        parts = []
+        if no_data:
+            parts.append(f"{no_data} hold no rows (not yet refreshed)")
+        if unreadable:
+            parts.append(f"{unreadable} could not be queried (unrefreshed, capacity paused, or "
+                         "source connection not configured)")
+        lines.append(
+            f"> **{total} model(s) could not be verified because Fabric returned no data** -- "
+            + "; ".join(parts) + ". This is a data-state condition, **not a mismatch**: the "
+            "schema/lineage match still stands. Resolve the model(s) in Fabric (refresh / repoint "
+            "the source / resume the capacity), then re-run `--verify` to confirm the data agrees."
+        )
+        lines.append("")
     rows = [m for m in result.get("matches", []) if m.get("verification")]
     if rows:
         lines.append("| Tableau datasource | Fabric match | Verdict | Detail |")

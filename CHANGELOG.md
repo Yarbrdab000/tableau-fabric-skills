@@ -123,6 +123,20 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     live Tableau and degrades gracefully (cached inventory, missing token, 404/429/401/403/paused
     capacity → *skipped*/*inconclusive*). New `resources/empirical-verification.md`; comparison suite
     `123` → `171` tests. Skill `VERSION` `1.4.1` → `1.5.0`; collection `0.6.1` → `0.7.0`.
+  - **Empirical verification — actionable "Fabric returned no data" detection (live-dry-test
+    hardening):** when an `--verify` match comes back `inconclusive` purely because the Fabric model
+    returned nothing while Tableau returned real values, the verdict now says **why**, and never reads
+    it as a mismatch. A new `match.verification.reason_code` distinguishes `fabric_no_data` (model held
+    no rows / explicit *"needs to be recalculated or refreshed"* — refresh it) from `fabric_unreadable`
+    (every probe errored, e.g. a DirectQuery source not configured or a paused capacity — resolve it),
+    each with a fix-it `verification_note`; rolled up as `summary.verification.fabric_no_data` /
+    `fabric_unreadable` and a plain-language callout in the report. Gated on *Fabric returned nothing
+    for any probe **and** Tableau returned data*, so a per-column quirk is never mislabelled. The 400
+    `executeQueries` error detail is now surfaced (`extract_executequeries_error`) instead of a generic
+    code. All **additive** — no key renamed/removed; deterministic tier/score/bucket unchanged.
+    Verified end-to-end against the live 10ay Tableau + Fabric F2 mirror estate (6/6 already-exist;
+    all 6 models correctly reported as refresh/connection-pending, not mismatches). Comparison suite
+    `171` → `178` tests. Skill `VERSION` `1.5.0` → `1.5.1`; collection `0.7.0` → `0.7.1`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.

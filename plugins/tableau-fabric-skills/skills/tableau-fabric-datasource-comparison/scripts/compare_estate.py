@@ -147,7 +147,8 @@ def _make_fabric_probe(pbi_token):
         if status in (401, 403):
             return (None, "executeQueries unauthorized (%d)" % status)
         if status != 200:
-            return (None, "executeQueries failed (%d)" % status)
+            detail = verify_mod.extract_executequeries_error(payload)
+            return (None, detail or ("executeQueries failed (%d)" % status))
         return verify_mod.parse_executequeries_scalar(payload)
     return probe
 

@@ -368,11 +368,129 @@ def test_verify_match_all_errors_inconclusive():
     assert v["verdict"] == "inconclusive"
 
 
+def test_verify_match_fabric_all_errored_is_unreadable():
+    # Tableau returns real values; every Fabric probe errors with a generic DAX failure
+    # (e.g. a DirectQuery model whose source connection isn't configured) -> fabric_unreadable.
+    t = make_tableau_probe({
+        ("MIN", "Order Date", False): "2021-01-01",
+        ("MAX", "Order Date", False): "2026-12-31",
+        ("SUM", "Sales", True): 1000,
+        ("SUM", "Sales", False): 1000,
+    })
+    f = make_fabric_probe({}, errors={
+        ("MIN", "OrderDate", False): "Failed to execute the DAX query.",
+        ("MAX", "OrderDate", False): "Failed to execute the DAX query.",
+        ("SUM", "Sales", True): "Failed to execute the DAX query.",
+        ("SUM", "Sales", False): "Failed to execute the DAX query.",
+    })
+    v = verify_match("t-1", "w-1", "m-1", _windowed_plan(), t, f)
+    assert v["verdict"] == "inconclusive"
+    assert v["reason_code"] == "fabric_unreadable"
+    assert "could not be queried" in v["notes"][0].lower()
+    assert "re-run --verify" in verification_note(v).lower()
+
+
 def test_verify_match_empty_plan_inconclusive():
     v = verify_match("t-1", "w-1", "m-1", {"window_candidates": [], "equality_probes": []},
                      always_error(), always_error())
     assert v["verdict"] == "inconclusive"
     assert v["probes_run"] == 0
+
+
+# ======================================================================================
+# Fabric "no data / not refreshed" detection (live dry-test hardening)
+# ======================================================================================
+def _null_fabric_probe():
+    """Fabric returned 200 + null for every aggregate (an unrefreshed/empty model)."""
+    def probe(workspace_id, dataset_id, table, column, function, window=None):
+        return (None, None)
+    return probe
+
+
+def test_is_no_data_error_recognizes_as_refresh_phrase():
+    assert verify.is_no_data_error(
+        "The expression referenced column 'Orders'[Sales] which does not hold any data "
+        "because it needs to be recalculated or refreshed.")
+    assert verify.is_no_data_error("Table has not been processed")
+    assert not verify.is_no_data_error("executeQueries unauthorized (401)")
+    assert not verify.is_no_data_error(None)
+    assert not verify.is_no_data_error("")
+
+
+def test_extract_executequeries_error_digs_nested_detail():
+    payload = {"error": {"code": "DatasetExecuteQueriesError", "pbi.error": {
+        "code": "DatasetExecuteQueriesError", "details": [
+            {"code": "DetailsMessage", "detail": {"type": 1, "value": "needs to be refreshed"}}]}}}
+    assert verify.extract_executequeries_error(payload) == "needs to be refreshed"
+    # message fallback
+    assert verify.extract_executequeries_error({"error": {"message": "boom"}}) == "boom"
+    # code fallback
+    assert verify.extract_executequeries_error({"error": {"code": "X"}}) == "X"
+    # junk-safe
+    assert verify.extract_executequeries_error({}) is None
+    assert verify.extract_executequeries_error(None) is None
+    assert verify.extract_executequeries_error("not-a-dict") is None
+
+
+def test_verify_match_null_fabric_is_no_data_not_mismatch():
+    # Tableau returns real values; Fabric returns null everywhere (unrefreshed mirror model).
+    t = make_tableau_probe({
+        ("MIN", "Order Date", False): "2021-01-01",
+        ("MAX", "Order Date", False): "2026-12-31",
+        ("SUM", "Sales", True): 1000,
+        ("SUM", "Sales", False): 1000,
+    })
+    v = verify_match("t-1", "w-1", "m-1", _windowed_plan(), t, _null_fabric_probe())
+    assert v["verdict"] == "inconclusive"          # cannot verify against an empty model
+    assert v["reason_code"] == "fabric_no_data"    # ...but we say *why*, actionably
+    assert "refresh" in v["notes"][0].lower()
+    assert "refresh" in verification_note(v).lower()
+
+
+def test_verify_match_fabric_as_refresh_error_is_no_data():
+    msg = ("The expression referenced column 'Orders'[Sales] which does not hold any data "
+           "because it needs to be recalculated or refreshed.")
+    t = make_tableau_probe({
+        ("MIN", "Order Date", False): "2021-01-01",
+        ("MAX", "Order Date", False): "2026-12-31",
+        ("SUM", "Sales", True): 1000,
+        ("SUM", "Sales", False): 1000,
+    })
+    f = make_fabric_probe({}, errors={
+        ("MIN", "OrderDate", False): msg, ("MAX", "OrderDate", False): msg,
+        ("SUM", "Sales", True): msg, ("SUM", "Sales", False): msg,
+    })
+    v = verify_match("t-1", "w-1", "m-1", _windowed_plan(), t, f)
+    assert v["verdict"] == "inconclusive"
+    assert v["reason_code"] == "fabric_no_data"
+
+
+def test_verify_match_tableau_down_is_not_flagged_as_fabric_no_data():
+    # If Tableau also returns nothing (VDS down), we must NOT blame Fabric for "no data".
+    v = verify_match("t-1", "w-1", "m-1", _windowed_plan(), always_error(), _null_fabric_probe())
+    assert v["verdict"] == "inconclusive"
+    assert v.get("reason_code") is None
+
+
+def test_verify_estate_rolls_up_fabric_no_data():
+    tableau = [{"name": "Superstore", "project": "S", "luid": "t-1", "fields": [
+        {"name": "Order Date", "dataType": "DATE"}, {"name": "Sales", "dataType": "REAL"}]}]
+    fabric = [{"name": "Superstore", "workspace": "WS", "workspaceId": "w-1", "id": "m-1",
+               "tables": ["Orders"], "columns": [
+                   {"name": "Order Date", "dataType": "datetime", "table": "Orders"},
+                   {"name": "Sales", "dataType": "double", "table": "Orders"}]}]
+    result = compare.compare_inventories(tableau, fabric)
+
+    def t(luid, field, vds_func, window=None):
+        vals = {("MIN", "Order Date"): "2021-01-01", ("MAX", "Order Date"): "2026-12-31",
+                ("SUM", "Sales"): 1000, ("COUNTD", "Sales"): 50, ("COUNTD", "Order Date"): 365}
+        return (vals.get((vds_func, field)), None)
+    out = verify_estate(result, tableau, fabric, t, _null_fabric_probe())
+    assert out["summary"]["verification"]["fabric_no_data"] >= 1
+    assert "fabric_unreadable" in out["summary"]["verification"]
+    flagged = [m for m in out["matches"] if (m.get("verification") or {}).get("reason_code") == "fabric_no_data"]
+    assert flagged
+    assert "refresh" in (flagged[0]["verification_note"]).lower()
 
 
 # ======================================================================================

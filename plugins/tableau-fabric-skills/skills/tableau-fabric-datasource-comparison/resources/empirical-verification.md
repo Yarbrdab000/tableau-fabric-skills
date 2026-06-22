@@ -81,6 +81,26 @@ is not used as a hard signal — per-column agreement carries the verdict.
   each capped at `--verify-max-cols` shared columns and a per-pair probe budget; numeric agreement uses
   a relative tolerance (`--verify-rtol`, default `0.01`) to absorb extract drift and float inexactness.
 
+## When Fabric can't return data (unrefreshed / paused / unconfigured source)
+
+A freshly-created Fabric mirror model often has a readable **schema** (so the deterministic match
+still lands) but **no queryable data** — it was never refreshed, its capacity is paused, or a
+DirectQuery model's source connection isn't configured. Empirical verification detects this precisely
+instead of reporting a vague *inconclusive*, and crucially **never reads it as a `mismatch`**:
+
+- **`fabric_no_data`** — the Fabric model returned `200`+`null` for its aggregates, or an explicit
+  Analysis Services *"…does not hold any data because it needs to be recalculated or refreshed"* error,
+  while Tableau returned real values. The model holds no rows → **refresh it, then re-run `--verify`**.
+- **`fabric_unreadable`** — **every** Fabric probe errored (e.g. a generic *"Failed to execute the DAX
+  query."* from a DirectQuery model whose source isn't reachable) while Tableau returned real values.
+  → **resolve the model (repoint/credential the source, resume the capacity), then re-run `--verify`**.
+
+Both are gated on *Fabric returned nothing for any probe **and** Tableau returned data for at least
+one* — so a per-column mapping quirk (where some probes succeed) is never mislabelled as a model-wide
+data problem. They surface as `match.verification.reason_code`, a rolled-up
+`summary.verification.fabric_no_data` / `fabric_unreadable` count, and a plain-language callout in the
+report's *Empirical verification* section.
+
 ## Guarantees
 
 - **Read-only and aggregate-only.** Every probe is a single scalar aggregate (`EVALUATE ROW("v", …)`
@@ -88,5 +108,8 @@ is not used as a hard signal — per-column agreement carries the verdict.
   platform.
 - **Advisory and additive.** Verification never overrides the deterministic verdict; a `mismatch` is a
   flag for human review, not a re-bucketing. Report keys are added, never renamed or removed.
+- **A data-state condition is never a mismatch.** An unrefreshed / paused / unconfigured Fabric model
+  is reported as `fabric_no_data` / `fabric_unreadable` with a fix-it action — the schema/lineage match
+  it earned is left intact.
 - **Offline-testable.** The verdict logic is pure and takes the two probes as injected callables, so
   the whole windowed-overlap model is unit-tested with no network (`tests/test_verify.py`).

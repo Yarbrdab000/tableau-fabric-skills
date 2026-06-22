@@ -403,6 +403,56 @@ def parse_executequeries_scalar(payload: Any) -> Tuple[Any, Optional[str]]:
     return (next(iter(row.values())), None)
 
 
+# Phrases Analysis Services / Power BI emit when a model's tables hold no rows because the
+# semantic model has never been processed/refreshed (a very common state for freshly-created
+# Fabric mirror models). Detecting this lets us turn a vague "inconclusive" into an actionable
+# "refresh the model, then re-verify" instead of looking like a failure or a false mismatch.
+_NO_DATA_PHRASES = (
+    "needs to be recalculated or refreshed",
+    "does not hold any data",
+    "has not been processed",
+    "needs to be refreshed",
+    "no data because",
+    "column which does not hold any data",
+)
+
+
+def is_no_data_error(message: Any) -> bool:
+    """True when an error string indicates a Fabric model holds no rows (not yet refreshed)."""
+    if not message:
+        return False
+    low = str(message).lower()
+    return any(phrase in low for phrase in _NO_DATA_PHRASES)
+
+
+def extract_executequeries_error(payload: Any) -> Optional[str]:
+    """Pull the most useful human-readable message out of an ``executeQueries`` error envelope.
+
+    Power BI nests the actionable detail under ``error.pbi.error.details[].detail.value``; fall
+    back to ``error.message`` then ``error.code``. Pure -- safe on any malformed shape.
+    """
+    if not isinstance(payload, dict):
+        return None
+    err = payload.get("error")
+    if not isinstance(err, dict):
+        return str(err)[:200] if err else None
+    pbi = err.get("pbi.error") or err.get("pbiError")
+    if isinstance(pbi, dict):
+        details = pbi.get("details")
+        if isinstance(details, list):
+            for d in details:
+                detail = d.get("detail") if isinstance(d, dict) else None
+                if isinstance(detail, dict):
+                    val = detail.get("value")
+                    if val:
+                        return str(val)[:240]
+    if err.get("message"):
+        return str(err["message"])[:240]
+    if err.get("code"):
+        return str(err["code"])[:240]
+    return None
+
+
 # ======================================================================================
 # Equality comparison (within a window) + verdict
 # ======================================================================================
@@ -524,6 +574,7 @@ def verify_match(
         if relationship == "disjoint":
             return {
                 "verdict": "mismatch", "method": "windowed", "relationship": "disjoint",
+                "reason_code": None,
                 "window_column": cand["column"], "range": range_detail,
                 "probes_run": 4, "probes_agreed": 0, "probes_disagreed": 0,
                 "probes_inconclusive": 0, "agreement": None, "probes": [],
@@ -537,6 +588,13 @@ def verify_match(
     results: List[Dict[str, Any]] = []
     notes: List[str] = []
     agreed = disagreed = inconclusive = 0
+    # Track whether Fabric could return any data at all. When Tableau returns real values but
+    # *every* Fabric probe is null/errored, the model can't be verified -- and we say why:
+    #   fabric_no_data  -> 200+null or an explicit "needs refresh" error (an unrefreshed model);
+    #   fabric_err      -> the model errored on every probe (paused capacity / DirectQuery source
+    #                      not configured / not yet processed) -- surfaced as ``fabric_unreadable``.
+    fabric_no_data = fabric_real = fabric_err = tableau_real = 0
+    first_fabric_err: Optional[str] = None
     method = "windowed" if window is not None else "containment"
 
     for probe in equality_probes:
@@ -551,6 +609,18 @@ def verify_match(
             "column": probe["column"], "function": fn,
             "tableau": tval, "fabric": fval, "windowed": window is not None,
         }
+        if fval is not None and not ferr:
+            fabric_real += 1
+        if tval is not None and not terr:
+            tableau_real += 1
+        if ferr:
+            fabric_err += 1
+            if first_fabric_err is None:
+                first_fabric_err = str(ferr)
+            if is_no_data_error(ferr):
+                fabric_no_data += 1
+        elif fval is None and tval is not None and not terr:
+            fabric_no_data += 1
         if terr or ferr:
             rec["outcome"] = "inconclusive"
             inconclusive += 1
@@ -600,10 +670,45 @@ def verify_match(
     else:
         verdict, relationship = _containment_verdict(results)
 
+    # Fold in window-establishment evidence, then classify an inconclusive verdict that is purely
+    # "Fabric returned nothing while Tableau returned data" into an actionable reason.
+    if range_detail:
+        rerr = range_detail.get("error")
+        frange = range_detail.get("fabric_range") or []
+        trange = range_detail.get("tableau_range") or []
+        tableau_in_range = any(x is not None for x in trange)
+        if rerr:
+            fabric_err += 1
+            if first_fabric_err is None:
+                first_fabric_err = str(rerr)
+            if is_no_data_error(rerr):
+                fabric_no_data += 1
+        elif frange and all(x is None for x in frange) and tableau_in_range:
+            fabric_no_data += 1
+        if tableau_in_range:
+            tableau_real += 1
+    reason_code = None
+    if verdict == "inconclusive" and fabric_real == 0 and tableau_real >= 1:
+        if fabric_no_data >= 1:
+            reason_code = "fabric_no_data"
+            notes = [
+                "Fabric model returned no data -- the semantic model holds no rows (it has not been "
+                "refreshed/processed). Refresh it in Fabric, then re-run --verify."
+            ] + notes
+        elif fabric_err >= 1:
+            reason_code = "fabric_unreadable"
+            hint = (" (e.g. %s)" % first_fabric_err[:90]) if first_fabric_err else ""
+            notes = [
+                "Fabric model could not be queried -- every probe failed%s while Tableau returned "
+                "data. The model may be unrefreshed, its capacity paused, or its source connection "
+                "not configured. Resolve it, then re-run --verify." % hint
+            ] + notes
+
     return {
         "verdict": verdict,
         "method": method,
         "relationship": relationship,
+        "reason_code": reason_code,
         "window_column": (window or {}).get("column") if window else (
             range_detail.get("column") if range_detail else None),
         "range": range_detail,
@@ -646,6 +751,12 @@ def verification_note(v: Dict[str, Any]) -> str:
     verdict = v.get("verdict")
     rel = v.get("relationship")
     rel_txt = _REL_PHRASE.get(rel, "")
+    if v.get("reason_code") == "fabric_no_data":
+        return ("inconclusive -- Fabric model holds no data (not yet refreshed); refresh the "
+                "semantic model in Fabric, then re-run --verify")
+    if v.get("reason_code") == "fabric_unreadable":
+        return ("inconclusive -- Fabric model could not be queried (unrefreshed, capacity paused, "
+                "or source connection not configured); resolve it, then re-run --verify")
     if verdict == "verified":
         base = "empirically verified (%d/%d overlap probe[s] agree" % (
             v.get("probes_agreed", 0), v.get("probes_agreed", 0) + v.get("probes_disagreed", 0))
@@ -698,7 +809,7 @@ def verify_estate(
     eligible.sort(key=lambda m: m.get("score") or 0.0, reverse=True)
 
     counts = {"verified": 0, "compatible": 0, "mismatch": 0, "inconclusive": 0}
-    attempted = probes_run = 0
+    attempted = probes_run = fabric_no_data = fabric_unreadable = 0
     for m in eligible[: max(0, top_n)]:
         best = m.get("best_match") or {}
         ds = tab_idx.get(m.get("tableau_luid")) or tab_idx.get(m.get("tableau_name"))
@@ -728,6 +839,10 @@ def verify_estate(
         m["verification"] = v
         m["verification_note"] = verification_note(v)
         probes_run += v.get("probes_run", 0)
+        if v.get("reason_code") == "fabric_no_data":
+            fabric_no_data += 1
+        elif v.get("reason_code") == "fabric_unreadable":
+            fabric_unreadable += 1
         counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
 
     result.setdefault("summary", {})["verification"] = {
@@ -737,6 +852,8 @@ def verify_estate(
         "compatible": counts["compatible"],
         "mismatch": counts["mismatch"],
         "inconclusive": counts["inconclusive"],
+        "fabric_no_data": fabric_no_data,
+        "fabric_unreadable": fabric_unreadable,
         "probes_run": probes_run,
         "top_n": top_n,
         "max_cols": max_cols,

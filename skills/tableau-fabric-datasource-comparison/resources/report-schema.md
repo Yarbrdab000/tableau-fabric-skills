@@ -194,18 +194,26 @@ deterministic tier / score / bucket are never changed. Full model in
 | `summary.verification.compatible` | int | no shared window column, but raw totals consistent with one-side-superset |
 | `summary.verification.mismatch` | int | overlap disagreed, or ranges were disjoint (advisory flag) |
 | `summary.verification.inconclusive` | int | nothing comparable ran |
+| `summary.verification.fabric_no_data` | int | matches where Fabric returned **no rows** (model not yet refreshed) while Tableau had data — actionable, **not** a mismatch |
+| `summary.verification.fabric_unreadable` | int | matches where **every** Fabric probe errored (capacity paused / DirectQuery source not configured) while Tableau had data — actionable, **not** a mismatch |
 | `summary.verification.probes_run` | int | total aggregate probes issued across both sides |
 | `summary.verification.top_n` / `max_cols` / `rtol` | scalar | the run's bounds/tolerance |
 
 Each verified `matches[]` row gains:
 
-- `verification` — `{verdict, method, relationship, window_column, range, probes_run, probes_agreed,
-  probes_disagreed, probes_inconclusive, agreement, probes:[…], notes:[…]}`. `verdict` is
-  `verified` / `compatible` / `mismatch` / `inconclusive`; `method` is `windowed` or `containment`;
+- `verification` — `{verdict, method, relationship, reason_code, window_column, range, probes_run,
+  probes_agreed, probes_disagreed, probes_inconclusive, agreement, probes:[…], notes:[…]}`. `verdict`
+  is `verified` / `compatible` / `mismatch` / `inconclusive`; `method` is `windowed` or `containment`;
   `relationship` is `equal` / `subset` / `superset` / `partial` / `disjoint`; each `probes[]` entry is
-  `{column, function, tableau, fabric, windowed, outcome}`.
+  `{column, function, tableau, fabric, windowed, outcome}`. `reason_code` is `null` for a normal
+  verdict, or — when an `inconclusive` is purely because the Fabric model returned nothing while
+  Tableau returned data — `fabric_no_data` (Fabric held no rows / not refreshed) or `fabric_unreadable`
+  (every Fabric probe errored: paused capacity / source connection not configured). Both are
+  **data-state conditions, never a mismatch** — the schema/lineage match still stands.
 - `verification_note` — a one-line human summary (e.g. *"empirically verified (2/2 overlap probes
-  agree; Fabric is a superset)"* or *"VERIFY MISMATCH — SUM(sales) on overlap: …"*).
+  agree; Fabric is a superset)"*, *"VERIFY MISMATCH — SUM(sales) on overlap: …"*, or *"inconclusive —
+  Fabric model holds no data (not yet refreshed); refresh the semantic model in Fabric, then re-run
+  --verify"*).
 
 Clear `rebuild` matches are skipped (nothing to verify); the deterministic verdict is authoritative.
 
