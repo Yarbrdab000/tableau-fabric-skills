@@ -12,11 +12,18 @@ The result is the JSON shape ``compare.py`` consumes:
 
     {"name", "project", "luid", "fields": [{"name","dataType","role"}],
      "sources": [{"connectionType","database","schema","table"}],
-     "usage": {"workbook_count","sheet_count","dashboard_count","source"}}
+     "usage": {"workbook_count","sheet_count","dashboard_count","source",
+               "view_count","certified","has_quality_warning",
+               "extract_last_refresh","extract_last_update","updated_at",
+               "connected_assets": {"workbooks":[{"name","luid"}], "dashboards":[{"name"}]}}}
 
 ``usage`` is the downstream-impact signal that drives migration priority (how many workbooks /
 sheets / dashboards depend on the datasource). The Metadata API is the trusted primary source; a
-REST workbook-connection count fills the tail for datasources Catalog has not indexed yet.
+REST workbook-connection count fills the tail for datasources Catalog has not indexed yet. The
+``view_count`` / ``certified`` / ``extract_last_refresh`` / ``connected_assets`` keys are an
+**additive, best-effort** telemetry layer (real usage, certification, refresh recency, and the
+*names* of the dependent assets) used by the artifact-importance signal; any of them may be ``null``
+when Catalog / view statistics are unavailable.
 
 Auth (PAT default; Connected App Direct-Trust JWT optional via ``--auth jwt``):
 
@@ -131,6 +138,33 @@ query down($first: Int!, $after: String) {
 }
 """
 
+# Connected-assets + telemetry enrichment (additive, best-effort). Kept SEPARATE from the proven
+# count query above so that if any of these richer fields are rejected by a given Metadata API
+# version, only the enrichment is lost -- the downstream counts (and the whole comparison) are
+# unaffected. Surfaces the *names* of the dependent workbooks / dashboards (so the deliverable can
+# say which assets break if a datasource is retired), the datasource's certification + active data
+# quality warning, and the extract refresh timestamps the user cares about ("last refreshed").
+DATASOURCE_DETAIL_GRAPHQL = """
+query detail($first: Int!, $after: String) {
+  publishedDatasourcesConnection(first: $first, after: $after) {
+    nodes {
+      luid
+      isCertified
+      hasActiveWarning
+      extractLastRefreshTime
+      extractLastUpdateTime
+      downstreamWorkbooks { luid name }
+      downstreamDashboards { name }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+# Cap on how many connected-asset names we retain per datasource (keeps the report/JSON bounded on
+# heavily-shared datasources; the full count still comes from the count query).
+CONNECTED_ASSET_CAP = 25
+
 
 class TableauClient:
     def __init__(self, server: str, site_content_url: str, rest_version: str) -> None:
@@ -220,6 +254,10 @@ class TableauClient:
                     "luid": d.get("id", ""),
                     "name": d.get("name", ""),
                     "project": (d.get("project") or {}).get("name", ""),
+                    # Lightweight usage telemetry available straight from the REST listing (additive).
+                    "updated_at": d.get("updatedAt"),
+                    "certified": (str(d.get("isCertified")).lower() == "true")
+                    if d.get("isCertified") is not None else None,
                 })
             total = int(body.get("pagination", {}).get("totalAvailable", len(out)) or len(out))
             if page * page_size >= total or not rows:
@@ -374,6 +412,84 @@ class TableauClient:
                 break
             page += 1
         return counts
+
+    def datasource_details_metadata(self, page_size: int = 100) -> Dict[str, Dict[str, Any]]:
+        """Best-effort connected-assets + telemetry per datasource (Catalog/Metadata API).
+
+        Returns ``{luid: {certified, has_quality_warning, extract_last_refresh, extract_last_update,
+        connected_workbooks:[{luid,name}], connected_dashboards:[{name}]}}`` for every datasource
+        Catalog has indexed. Bounded to :data:`CONNECTED_ASSET_CAP` asset names each. Raises
+        ``TableauError`` if the Metadata API is unavailable so the caller can degrade gracefully.
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+        after: Optional[str] = None
+        while True:
+            data = self.metadata_query(DATASOURCE_DETAIL_GRAPHQL, {"first": page_size, "after": after})
+            conn = data.get("publishedDatasourcesConnection") or {}
+            for n in conn.get("nodes") or []:
+                luid = n.get("luid")
+                if not luid:
+                    continue
+                wbs = []
+                for w in (n.get("downstreamWorkbooks") or [])[:CONNECTED_ASSET_CAP]:
+                    nm = w.get("name")
+                    if nm:
+                        wbs.append({"luid": w.get("luid"), "name": nm})
+                dbs = []
+                for d in (n.get("downstreamDashboards") or [])[:CONNECTED_ASSET_CAP]:
+                    nm = d.get("name")
+                    if nm:
+                        dbs.append({"name": nm})
+                out[luid] = {
+                    "certified": bool(n.get("isCertified")) if n.get("isCertified") is not None else None,
+                    "has_quality_warning": bool(n.get("hasActiveWarning"))
+                    if n.get("hasActiveWarning") is not None else None,
+                    "extract_last_refresh": n.get("extractLastRefreshTime"),
+                    "extract_last_update": n.get("extractLastUpdateTime"),
+                    "connected_workbooks": wbs,
+                    "connected_dashboards": dbs,
+                }
+            page_info = conn.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            after = page_info.get("endCursor")
+        return out
+
+    def view_counts_rest(self, page_size: int = 1000) -> Dict[str, int]:
+        """Best-effort per-**workbook** total view count via REST view usage statistics.
+
+        Enumerates the site's views with ``includeUsageStatistics=true`` and sums each view's
+        ``usage.totalViewCount`` up to its parent workbook. Returns ``{workbook_luid: total_views}``.
+        The caller maps these onto a datasource by summing across its downstream workbooks. Raises
+        ``TableauError`` only if the views endpoint itself fails (the caller degrades gracefully).
+        """
+        per_workbook: Dict[str, int] = {}
+        page = 1
+        while True:
+            qs = urllib.parse.urlencode({
+                "pageSize": str(page_size), "pageNumber": str(page),
+                "includeUsageStatistics": "true",
+            })
+            status, body = self._request(
+                "GET", f"{self._rest_base}/sites/{self.site_id}/views?{qs}", self._auth_headers())
+            if status != 200:
+                raise TableauError(f"List views failed ({status}): {str(body)[:300]}")
+            body = body or {}
+            rows = (body.get("views") or {}).get("view") or []
+            for v in rows:
+                wid = (v.get("workbook") or {}).get("id")
+                if not wid:
+                    continue
+                try:
+                    cnt = int((v.get("usage") or {}).get("totalViewCount") or 0)
+                except (TypeError, ValueError):
+                    cnt = 0
+                per_workbook[wid] = per_workbook.get(wid, 0) + cnt
+            total = int((body.get("pagination") or {}).get("totalAvailable", len(rows)) or len(rows))
+            if page * page_size >= total or not rows:
+                break
+            page += 1
+        return per_workbook
 
 
 # ======================================================================================
@@ -672,17 +788,26 @@ def gather_tableau_inventory(
                         f"{len(shaped['sources'])} source(s)  [{source_path}]")
 
     if usage != "off":
-        _gather_usage(client, out, mode=usage, on_progress=on_progress)
+        meta_by_luid = {m.get("luid"): m for m in catalog if m.get("luid")}
+        _gather_usage(client, out, mode=usage, meta_by_luid=meta_by_luid, on_progress=on_progress)
     return out
 
 
-def _gather_usage(client: TableauClient, rows, *, mode: str, on_progress=None) -> None:
+def _gather_usage(client: TableauClient, rows, *, mode: str, meta_by_luid=None, on_progress=None) -> None:
     """Populate each row's ``usage`` block (downstream impact) for the migration-priority signal.
 
     The Metadata API is the **trusted primary** source (workbooks + sheets + dashboards); the REST
     workbook-connection count is a thin fallback used only for datasources Catalog has not indexed
     yet (``auto``), or exclusively (``rest``).
+
+    On top of the impact *counts*, this also attaches a best-effort **connected-assets + telemetry**
+    layer (additive): the names of the dependent workbooks / dashboards, the datasource's
+    certification + active data-quality-warning flags, its extract refresh timestamps, the last-
+    modified time, and a total **view count** summed across its downstream workbooks. Every part of
+    that enrichment is isolated in its own ``try`` so a failure degrades to ``null`` telemetry and
+    never disturbs the counts or the comparison.
     """
+    meta_by_luid = meta_by_luid or {}
     luids = [r.get("luid") for r in rows if r.get("luid")]
     meta_usage: Dict[str, Dict[str, Any]] = {}
     if mode in ("auto", "metadata"):
@@ -702,6 +827,22 @@ def _gather_usage(client: TableauClient, rows, *, mode: str, on_progress=None) -
             if on_progress:
                 on_progress(f"  ! downstream REST fallback failed: {exc}")
 
+    # Best-effort connected-assets + telemetry enrichment (never fatal).
+    details: Dict[str, Dict[str, Any]] = {}
+    if mode in ("auto", "metadata"):
+        try:
+            details = client.datasource_details_metadata()
+        except Exception as exc:  # noqa: BLE001
+            if on_progress:
+                on_progress(f"  ! connected-assets enrichment unavailable: {exc}")
+    view_by_workbook: Dict[str, int] = {}
+    if mode != "rest":  # views endpoint is the same REST surface; skip in pure-rest count-only runs
+        try:
+            view_by_workbook = client.view_counts_rest()
+        except Exception as exc:  # noqa: BLE001
+            if on_progress:
+                on_progress(f"  ! view-count telemetry unavailable: {exc}")
+
     for r in rows:
         luid = r.get("luid")
         u: Optional[Dict[str, Any]] = None
@@ -718,11 +859,56 @@ def _gather_usage(client: TableauClient, rows, *, mode: str, on_progress=None) -
         if u is None:
             u = {"workbook_count": None, "sheet_count": None,
                  "dashboard_count": None, "source": "none"}
+        _attach_telemetry(u, r, details.get(luid), meta_by_luid.get(luid), view_by_workbook)
         r["usage"] = u
         if on_progress:
             on_progress(f"    usage {r.get('name')}: {u.get('workbook_count')} workbook(s), "
-                        f"{u.get('sheet_count')} sheet(s), {u.get('dashboard_count')} dashboard(s) "
-                        f"[{u.get('source')}]")
+                        f"{u.get('sheet_count')} sheet(s), {u.get('dashboard_count')} dashboard(s), "
+                        f"{u.get('view_count')} view(s) [{u.get('source')}]")
+
+
+def _attach_telemetry(u: Dict[str, Any], row, detail, meta, view_by_workbook) -> None:
+    """Fold the connected-assets + telemetry layer into a usage block ``u`` (additive, in place).
+
+    Pure shaping over already-fetched data -- no network. ``detail`` is the Metadata-API enrichment
+    for this datasource (or ``None``), ``meta`` the REST listing meta (``updated_at`` / ``certified``),
+    ``view_by_workbook`` the per-workbook view-count map. Missing inputs simply leave ``null`` values.
+    """
+    meta = meta or {}
+    detail = detail or {}
+    workbooks = detail.get("connected_workbooks") or []
+    dashboards = detail.get("connected_dashboards") or []
+
+    # Total views = sum across this datasource's downstream workbooks (when both are known).
+    view_count = None
+    if workbooks and view_by_workbook:
+        total = 0
+        seen = False
+        for w in workbooks:
+            wl = w.get("luid")
+            if wl in view_by_workbook:
+                total += view_by_workbook[wl]
+                seen = True
+        view_count = total if seen else None
+
+    # certification: Metadata API first, REST listing as fallback.
+    certified = detail.get("certified")
+    if certified is None:
+        certified = meta.get("certified")
+
+    u["view_count"] = view_count
+    u["certified"] = certified
+    u["has_quality_warning"] = detail.get("has_quality_warning")
+    u["extract_last_refresh"] = detail.get("extract_last_refresh")
+    u["extract_last_update"] = detail.get("extract_last_update")
+    u["updated_at"] = meta.get("updated_at")
+    if workbooks or dashboards:
+        u["connected_assets"] = {
+            "workbooks": [{"name": w.get("name"), "luid": w.get("luid")} for w in workbooks],
+            "dashboards": [{"name": d.get("name")} for d in dashboards],
+        }
+    else:
+        u["connected_assets"] = None
 
 
 # ======================================================================================

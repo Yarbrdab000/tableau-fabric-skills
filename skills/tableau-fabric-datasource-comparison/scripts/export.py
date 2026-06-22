@@ -41,6 +41,9 @@ _DETAIL_COLUMNS: List[Tuple[str, str]] = [
     ("Source compared", "_source_compared"),
     ("Shared columns", "_shared_columns"),
     ("Usage (workbooks)", "_usage_workbooks"),
+    ("Views", "_views"),
+    ("Certified", "_certified"),
+    ("Importance", "_importance"),
     ("Priority", "priority"),
     ("Migration priority", "migration_priority"),
     ("Logic parity", "_logic_status"),
@@ -68,6 +71,7 @@ def _detail_cell(match: Dict[str, Any], key: str) -> Any:
     ver = match.get("verification") or {}
     usage = match.get("usage") or {}
     conf = match.get("confidence") or {}
+    imp = match.get("importance") or {}
     if key == "_verdict":
         return _BUCKET_LABEL.get(match.get("bucket"), match.get("bucket") or "")
     if key == "_score":
@@ -85,6 +89,12 @@ def _detail_cell(match: Dict[str, Any], key: str) -> Any:
     if key == "_usage_workbooks":
         v = usage.get("workbook_count")
         return v if isinstance(v, int) else None
+    if key == "_views":
+        v = usage.get("view_count")
+        return v if isinstance(v, int) else None
+    if key == "_certified":
+        v = usage.get("certified")
+        return bool(v) if isinstance(v, bool) else None
     if key == "_logic_status":
         return lp.get("status") or ""
     if key == "_calc_count":
@@ -97,6 +107,8 @@ def _detail_cell(match: Dict[str, Any], key: str) -> Any:
         return ver.get("verdict") or ""
     if key == "_confidence":
         return conf.get("level") or ""
+    if key == "_importance":
+        return imp.get("level") or ""
     return None
 
 
@@ -122,6 +134,7 @@ def build_summary_rows(result: Dict[str, Any]) -> Tuple[List[List[Any]], List[in
     coverage = s.get("fabric_coverage", {}) or {}
     logic = s.get("logic_parity", {}) or {}
     conf = s.get("confidence", {}) or {}
+    imp = s.get("importance", {}) or {}
 
     rows: List[List[Any]] = []
     bold: List[int] = []
@@ -152,6 +165,12 @@ def build_summary_rows(result: Dict[str, Any]) -> Tuple[List[List[Any]], List[in
     if conf:
         pair("High-confidence verdicts", conf.get("high", 0))
         pair("Low-confidence (review)", conf.get("low_confidence_review", 0))
+    if imp:
+        pair("Critical-importance datasources", imp.get("critical", 0))
+        pair("High-importance datasources", imp.get("high", 0))
+        if imp.get("total_views") is not None:
+            pair("Total views (estate)", imp.get("total_views"))
+        pair("Certified datasources", imp.get("certified_datasources", 0))
 
     by_tier = s.get("by_tier") or {}
     if by_tier:
@@ -194,6 +213,37 @@ def build_coverage_rows(result: Dict[str, Any]) -> List[List[Any]]:
             rows.append([str(item), ""])
     if len(rows) == 1:
         rows.append(["(every Fabric model maps back to a Tableau datasource)", ""])
+    return rows
+
+
+def build_connected_assets_rows(result: Dict[str, Any]) -> List[List[Any]]:
+    """Return ``[header, *rows]`` of the downstream assets each datasource feeds (artifact importance).
+
+    One row per **connected asset** (workbook or dashboard) so a migration lead can see exactly which
+    artifacts break if a datasource is retired or moved, ordered by the datasource's importance. Only
+    datasources whose telemetry produced connected assets contribute rows."""
+    header = ["Datasource", "Importance", "Views", "Asset type", "Asset name", "Last refreshed"]
+    rows: List[List[Any]] = [header]
+    matches = sorted(
+        result.get("matches", []) or [],
+        key=lambda m: (m.get("importance") or {}).get("score") or 0.0, reverse=True,
+    )
+    for m in matches:
+        usage = m.get("usage") or {}
+        ca = usage.get("connected_assets") or {}
+        imp = (m.get("importance") or {}).get("level") or ""
+        views = usage.get("view_count")
+        views = views if isinstance(views, int) else None
+        refreshed = str(usage.get("extract_last_refresh") or "")[:10]
+        name = m.get("tableau_name")
+        for w in ca.get("workbooks", []) or []:
+            if w.get("name"):
+                rows.append([name, imp, views, "Workbook", w.get("name"), refreshed])
+        for d in ca.get("dashboards", []) or []:
+            if d.get("name"):
+                rows.append([name, imp, views, "Dashboard", d.get("name"), refreshed])
+    if len(rows) == 1:
+        rows.append(["(no connected-asset telemetry was gathered)", "", None, "", "", ""])
     return rows
 
 
@@ -399,6 +449,12 @@ def to_xlsx_bytes(result: Dict[str, Any]) -> bytes:
         (_sanitize_sheet_name("Datasources"), _sheet_xml(detail_rows)),
         (_sanitize_sheet_name("Fabric coverage"), _sheet_xml(coverage_rows)),
     ]
+
+    connected_rows = build_connected_assets_rows(result)
+    if len(connected_rows) > 1 and connected_rows[1][3]:
+        sheets.append(
+            (_sanitize_sheet_name("Connected assets"), _sheet_xml(connected_rows))
+        )
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:

@@ -52,7 +52,9 @@ compare_estate.py (CLI orchestrator)
   ├── fabric_inventory.py   → [{name, workspace, id, tables[], columns[], sources[]}]
   ├── compare.py (pure)     → best Fabric match + tier + 4 signals per datasource; estate rollup
   ├── adjudicate.py (pure)  → LLM-optional "second matcher": routes the uncertain tail to an agent
-  └── priority.py (pure)    → ranks the rebuild set by downstream usage (attached workbooks)
+  ├── priority.py (pure)    → ranks the rebuild set by downstream usage (attached workbooks)
+  ├── importance.py (pure)  → artifact importance from reach + views + certification (value/blast radius)
+  └── confidence.py (pure)  → fuses the signals into a per-verdict High/Medium/Low trust rating
         → report (Markdown or JSON), ranked most-comparable first, plus an adjudication queue
 ```
 
@@ -204,6 +206,24 @@ the export adds a `Confidence` column. Deterministic, additive, read-only — re
 `--verify` so the data check folds in, and it never changes a tier/score/bucket. See
 [`resources/report-schema.md`](resources/report-schema.md#verdict-confidence).
 
+## Artifact importance & connected assets — what to protect first
+
+Knowing a datasource *already exists* in Fabric is half the story; a migration team also needs to know
+*how much it matters and what depends on it*. A new `scripts/importance.py` fuses three independent
+value signals gathered during inventory — **reach** (dependent workbooks + dashboards), **consumption**
+(total **view count**), and **endorsement** (**certified**) — into a `Critical` / `High` / `Moderate` /
+`Low` rating per datasource (`Unknown` only when there is no usage evidence at all; weights renormalise
+over whichever signals are present so a missing one never drags the score down). This is distinct from
+migration **priority** (rebuild order from workbook count): importance is business value / blast radius.
+Each match gains `importance.{level, score, drivers[]}`, the rollup gains `summary.importance`, and the
+inventory enriches each `usage` block with the underlying telemetry — `view_count`, `certified`,
+`has_quality_warning`, the extract refresh timestamps, and `connected_assets` (the **names** of the
+dependent workbooks / dashboards). The report adds an **Artifact importance & connected assets** section
+that spotlights the highest-value datasources with their real views, dependent assets and last refresh;
+the export adds `Importance` / `Views` / `Certified` columns and a **Connected assets** sheet. All
+best-effort, deterministic, additive and read-only — it never changes a tier/score/bucket/priority. See
+[`resources/report-schema.md`](resources/report-schema.md#artifact-importance--connected-assets).
+
 ## Usage
 
 ```powershell
@@ -282,6 +302,9 @@ A Markdown (or JSON) report — see `resources/report-schema.md`:
 - **Verdict confidence**: a headline (*N of M verdicts are high-confidence*) plus, when any verdict is
   uncertain, a **Lowest-confidence verdicts (review these first)** table that names *why* each is
   shaky (near tie, single signal, contested model, borderline score, empirical mismatch).
+- **Artifact importance & connected assets** (when usage telemetry was gathered): a headline of the
+  Critical/High-importance datasources and total views, plus a top table with each high-value
+  datasource's views, dependent workbooks/dashboards (by name) and last refresh.
 - **Recommended actions**: grouped by tier, pointing the rebuild set at the `tableau-migration` skill.
 
 After an `--apply-adjudication` pass the report also shows an **After semantic review** rollup
@@ -294,11 +317,12 @@ For sharing the result outside the terminal, the same report renders to two anal
 artifacts (standard-library only — no `openpyxl`/`pandas`):
 
 - **CSV** — one rectangular table, one row per Tableau datasource, ready to pivot in Excel / Sheets.
-- **XLSX** — a three-sheet workbook: **Summary** (the estate-sizing headline — how many datasources
-  already exist in Fabric vs. need rebuilding, with percentages, distinct-model counts, and the
-  logic-parity review count), **Datasources** (the full per-datasource detail, score as a real number
-  so it sorts), and **Fabric coverage** (models nothing in Tableau maps to). Both are byte-stable and
-  read-only over the report. Column reference: `resources/report-schema.md`.
+- **XLSX** — a three-/four-sheet workbook: **Summary** (the estate-sizing headline — how many datasources
+  already exist in Fabric vs. need rebuilding, with percentages, distinct-model counts, the
+  logic-parity review count, and importance metrics), **Datasources** (the full per-datasource detail,
+  score as a real number so it sorts), **Fabric coverage** (models nothing in Tableau maps to), and —
+  when connected-asset telemetry was gathered — **Connected assets** (one row per dependent workbook /
+  dashboard). All byte-stable and read-only over the report. Column reference: `resources/report-schema.md`.
 
 ## Caveats
 

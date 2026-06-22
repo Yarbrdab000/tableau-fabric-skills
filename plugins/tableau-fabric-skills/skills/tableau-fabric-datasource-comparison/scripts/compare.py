@@ -736,6 +736,18 @@ def compare_inventories(
     except Exception:
         pass
 
+    # Artifact importance: fuse the connected-assets + telemetry layer (reach, views, certification)
+    # into a per-datasource importance level + rollup so the deliverable can spotlight the assets a
+    # migration must not get wrong. Additive; never alters tier/score/bucket/priority.
+    try:  # pragma: no cover - trivial wiring
+        try:
+            from . import importance as _importance
+        except ImportError:
+            import importance as _importance
+        _importance.annotate(result)
+    except Exception:
+        pass
+
     # Confidence synthesis: fuse the independent corroborators (score level, runner-up margin,
     # signal agreement, reciprocity) into one explainable confidence per verdict + a rollup. Additive
     # and idempotent -- re-run after --verify so the data check folds in. Never alters tier/score.
@@ -1058,8 +1070,79 @@ def render_markdown(result: Dict[str, Any]) -> str:
             lines.append(f"- {n}" + (f" -- _{why}_" if why else ""))
         lines.append("")
     _render_priority_worklist(result, lines)
+    _render_importance(result, lines)
     _render_adjudication(result, lines)
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_importance(result: Dict[str, Any], lines: List[str]) -> None:
+    """Artifact importance + connected assets (additive). Spotlights the highest-value datasources --
+    the ones a migration must not get wrong -- with their real usage and the assets that depend on
+    them. Rendered only when telemetry produced at least one non-Unknown importance level."""
+    summary = result.get("summary") or {}
+    imp = summary.get("importance") or {}
+    by_level = imp.get("by_level") or {}
+    rated = sum(v for k, v in by_level.items() if k != "Unknown")
+    if rated <= 0:
+        return
+    matches = result.get("matches") or []
+    ranked = sorted(
+        [m for m in matches if (m.get("importance") or {}).get("level") not in (None, "Unknown")],
+        key=lambda m: (m.get("importance") or {}).get("score") or 0.0, reverse=True,
+    )
+    lines.append("## Artifact importance & connected assets")
+    lines.append("")
+    headline = (
+        f"**{imp.get('critical', 0)} Critical** and **{imp.get('high', 0)} High** importance "
+        f"datasource(s)."
+    )
+    extra = []
+    if imp.get("total_views") is not None:
+        extra.append(f"{imp['total_views']} total view(s) across the estate")
+    if imp.get("certified_datasources"):
+        extra.append(f"{imp['certified_datasources']} certified")
+    if imp.get("datasources_with_quality_warning"):
+        extra.append(f"{imp['datasources_with_quality_warning']} with an active data-quality warning")
+    if extra:
+        headline += " " + "; ".join(extra) + "."
+    lines.append(headline)
+    lines.append("")
+    lines.append(
+        "Importance fuses **reach** (dependent workbooks + dashboards), **consumption** (views) and "
+        "**endorsement** (certified). It ranks which assets carry the most business value so the "
+        "migration protects them first — independent of whether they already exist in Fabric."
+    )
+    lines.append("")
+    lines.append("| Datasource | Verdict | Importance | Views | Workbooks | Dashboards | Last refreshed | Top connected assets |")
+    lines.append("|---|---|---|---:|---:|---:|---|---|")
+    for m in ranked[:15]:
+        u = m.get("usage") or {}
+        ci = m.get("importance") or {}
+        ca = u.get("connected_assets") or {}
+        names = [w.get("name") for w in (ca.get("workbooks") or []) if w.get("name")][:3]
+        names += [d.get("name") for d in (ca.get("dashboards") or []) if d.get("name")][:2]
+        assets = ", ".join(_cell(n) for n in names) if names else ""
+        refreshed = str(u.get("extract_last_refresh") or "")[:10]
+        lines.append(
+            f"| {_cell(m['tableau_name'])} | {m['tier']} | {ci.get('level', '')} | "
+            f"{_num_cell(u.get('view_count'))} | {_num_cell(u.get('workbook_count'))} | "
+            f"{_num_cell(u.get('dashboard_count'))} | {refreshed} | {assets} |"
+        )
+    lines.append("")
+    lines.append(
+        "_Views / certification / refresh times are best-effort telemetry from the Tableau Metadata "
+        "API + view statistics; blanks mean that signal was unavailable for the datasource._"
+    )
+    lines.append("")
+
+
+def _num_cell(v: Any) -> str:
+    """Render a numeric usage value for a table cell; blank when unknown."""
+    if isinstance(v, bool) or v is None:
+        return ""
+    if isinstance(v, (int, float)):
+        return str(int(v))
+    return ""
 
 
 def _render_confidence_rollup(result: Dict[str, Any], lines: List[str]) -> None:

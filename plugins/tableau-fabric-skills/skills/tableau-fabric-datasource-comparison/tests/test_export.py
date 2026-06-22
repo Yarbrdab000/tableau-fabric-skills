@@ -266,3 +266,106 @@ def test_xml_escape_handles_specials_and_strips_control_chars():
 def test_sanitize_sheet_name_truncates_and_strips_illegal():
     assert export._sanitize_sheet_name("a/b:c*d?e[f]") == "a_b_c_d_e_f_"
     assert len(export._sanitize_sheet_name("x" * 50)) == 31
+
+
+# --------------------------------------------------------------------------------------
+# Importance + connected assets (Phase 2)
+# --------------------------------------------------------------------------------------
+def _telemetry_result():
+    """A result whose first match carries importance + connected-asset telemetry."""
+    return _result(
+        matches=[
+            {
+                "tableau_name": "Sales Orders", "project": "Sales",
+                "tier": "Exact", "score": 0.95, "bucket": "already_exists",
+                "source_compared": True, "priority": "High",
+                "migration_priority": "Reuse (already in Fabric)",
+                "usage": {
+                    "workbook_count": 9, "dashboard_count": 4, "view_count": 1800,
+                    "certified": True, "has_quality_warning": False,
+                    "extract_last_refresh": "2026-06-20T03:00:00Z",
+                    "connected_assets": {
+                        "workbooks": [{"name": "Exec KPIs", "luid": "w1"},
+                                      {"name": "Pipeline", "luid": "w2"}],
+                        "dashboards": [{"name": "Daily Sales"}],
+                    },
+                },
+                "best_match": {"fabric_name": "Sales Orders", "workspace": "WS"},
+                "importance": {"level": "Critical", "score": 0.88, "drivers": ["certified"]},
+                "reason": "exact name -- Exact.",
+            },
+            {
+                "tableau_name": "Tiny DS", "project": "Misc",
+                "tier": "None", "score": 0.0, "bucket": "rebuild",
+                "source_compared": False, "priority": "Low",
+                "migration_priority": "P3",
+                "usage": {"workbook_count": 0, "dashboard_count": 0, "view_count": 2,
+                          "certified": False, "connected_assets": None},
+                "best_match": None,
+                "importance": {"level": "Low", "score": 0.01, "drivers": []},
+                "reason": "no comparable model -- None.",
+            },
+        ],
+        summary={"importance": {
+            "by_level": {"Critical": 1, "High": 0, "Moderate": 0, "Low": 1, "Unknown": 0},
+            "critical": 1, "high": 0, "total_views": 1802,
+            "certified_datasources": 1, "datasources_with_quality_warning": 0,
+        }},
+    )
+
+
+def test_detail_rows_have_importance_views_and_certified():
+    rows = export.build_detail_rows(_telemetry_result())
+    header = rows[0]
+    assert "Importance" in header and "Views" in header and "Certified" in header
+    first = dict(zip(header, rows[1]))
+    assert first["Importance"] == "Critical"
+    assert first["Views"] == 1800
+    assert first["Certified"] is True
+
+
+def test_summary_includes_importance_metrics_when_present():
+    rows, _ = export.build_summary_rows(_telemetry_result())
+    flat = {r[0]: r[1] for r in rows if r[0]}
+    assert flat["Critical-importance datasources"] == 1
+    assert flat["Total views (estate)"] == 1802
+    assert flat["Certified datasources"] == 1
+    # absent when no importance rollup
+    rows2, _ = export.build_summary_rows(_result())
+    assert "Critical-importance datasources" not in {r[0] for r in rows2}
+
+
+def test_connected_assets_rows_one_row_per_asset():
+    rows = export.build_connected_assets_rows(_telemetry_result())
+    assert rows[0] == ["Datasource", "Importance", "Views", "Asset type",
+                       "Asset name", "Last refreshed"]
+    body = rows[1:]
+    names = {r[4] for r in body}
+    assert {"Exec KPIs", "Pipeline", "Daily Sales"} <= names
+    types = {r[3] for r in body}
+    assert types == {"Workbook", "Dashboard"}
+    # the importance-ordered datasource shows its refresh date truncated to a day
+    assert body[0][5] == "2026-06-20"
+
+
+def test_connected_assets_rows_placeholder_when_no_telemetry():
+    rows = export.build_connected_assets_rows(_result())
+    assert len(rows) == 2
+    assert "no connected-asset telemetry" in rows[1][0]
+
+
+def test_xlsx_adds_connected_assets_sheet_only_with_telemetry():
+    with_tel = export.to_xlsx_bytes(_telemetry_result())
+    wb = zipfile.ZipFile(io.BytesIO(with_tel)).read("xl/workbook.xml").decode("utf-8")
+    assert 'name="Connected assets"' in wb
+    # four declared sheets -> sheet4.xml present and well-formed
+    zf = zipfile.ZipFile(io.BytesIO(with_tel))
+    assert "xl/worksheets/sheet4.xml" in zf.namelist()
+    for name in zf.namelist():
+        if name.endswith(".xml") or name.endswith(".rels"):
+            minidom.parseString(zf.read(name))
+
+    without = zipfile.ZipFile(io.BytesIO(export.to_xlsx_bytes(_result())))
+    wb2 = without.read("xl/workbook.xml").decode("utf-8")
+    assert 'name="Connected assets"' not in wb2
+    assert "xl/worksheets/sheet4.xml" not in without.namelist()

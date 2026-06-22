@@ -206,6 +206,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     changes a `tier` / `score` / `bucket`; re-synthesised after `--verify` so the data check folds in.
     Comparison suite `240` → `267` tests. Skill `VERSION` `1.5.5` → `1.5.6`; collection `0.7.5` →
     `0.7.6`.
+  - **Artifact importance & connected assets — value/blast-radius + usage telemetry:** a new
+    `scripts/importance.py` fuses three independent value signals gathered during inventory — **reach**
+    (dependent workbooks + dashboards), **consumption** (total **view count**), and **endorsement**
+    (**certified**) — into a `Critical` / `High` / `Moderate` / `Low` rating per datasource (`Unknown`
+    only when there is no usage evidence; weights renormalise over present signals). Distinct from
+    migration **priority** (rebuild order): importance is *how much it matters and what breaks if it
+    moves*. The Tableau inventory now best-effort-enriches each `usage` block with `view_count` (summed
+    from per-workbook REST view statistics), `certified`, `has_quality_warning`, the extract refresh
+    timestamps, `updated_at`, and `connected_assets` (the **names** of dependent workbooks / dashboards)
+    via a **separate** Metadata-API query kept isolated from the proven downstream-count query, so a
+    rejected field only loses enrichment. Each match gains `importance.{level, score, drivers[]}`; the
+    rollup adds `summary.importance.{by_level, critical, high, total_views, certified_datasources,
+    datasources_with_quality_warning}`. The Markdown report gains an **Artifact importance & connected
+    assets** section (highest-value datasources with their views, dependent assets and last refresh);
+    the CSV/XLSX export gains `Importance` / `Views` / `Certified` columns, importance Summary metrics,
+    and a fourth **Connected assets** sheet (one row per dependent asset, when telemetry was gathered).
+    **Deterministic, additive and read-only** — never changes a `tier` / `score` / `bucket` /
+    `priority`. Comparison suite `267` → `304` tests. Skill `VERSION` `1.5.6` → `1.5.7`; collection
+    `0.7.6` → `0.7.7`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.

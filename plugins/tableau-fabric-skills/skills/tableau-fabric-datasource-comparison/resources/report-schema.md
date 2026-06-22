@@ -36,6 +36,7 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
 | `fabric_coverage` | object | reverse (Fabric→Tableau) coverage: `{fabric_total, matched_models, unmatched_models, unmatched_model_names:[{fabric_name, workspace}]}` (additive) |
 | `logic_parity` | object | business-logic-parity rollup (additive): `{none, likely, partial, unverified, review_needed}` — counts of matched datasources by [logic-parity](#logic-parity-calculated-fields--measures) status, plus `review_needed` = matches that look already-in-Fabric/partial **but whose calculated fields are not confirmed as measures** |
 | `confidence` | object | verdict-confidence rollup (additive): `{high, medium, low, high_confidence_already_exists, low_confidence_review}` — how trustworthy each **verdict** is once the independent signals are fused. `low_confidence_review` counts `already_exists`/`partial` verdicts that landed **Low** (a human should look). See [confidence](#verdict-confidence) |
+| `importance` | object | artifact-importance rollup (additive): `{by_level, critical, high, total_views, certified_datasources, datasources_with_quality_warning}` — how much each datasource **matters** to the business (reach + consumption + endorsement), so a migration protects the highest-value assets first. `total_views` is `null` when no view telemetry was gathered. See [artifact importance](#artifact-importance--connected-assets) |
 
 ## `matches[]` (sorted most-comparable first)
 
@@ -48,7 +49,7 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
 | `score` | float | best score `0..1` |
 | `bucket` | string | `already_exists` / `partial` / `rebuild` |
 | `source_compared` | bool | `false` when the physical source was obscured on either side (then the source sub-score is `n/a`) |
-| `usage` | object \| null | downstream impact: `{workbook_count, sheet_count, dashboard_count, source}` (additive — `source` is `metadata`/`rest`/`none`; counts are `null` when not gathered) |
+| `usage` | object \| null | downstream impact + telemetry: `{workbook_count, sheet_count, dashboard_count, source, view_count, certified, has_quality_warning, extract_last_refresh, extract_last_update, updated_at, connected_assets}` (additive — `source` is `metadata`/`rest`/`none`; the telemetry keys are best-effort and `null` when not gathered; `connected_assets` is `{workbooks:[{name, luid}], dashboards:[{name}]}` or `null`) |
 | `priority` | string | usage label `High / Medium / Low / Unused / Unknown` (additive) |
 | `migration_priority` | string | fused action `P1 - migrate first` … `P4 - retire candidate` / `Reuse (already in Fabric)` / `Unprioritized` (additive) |
 | `contested` | bool | this match's best Fabric model is also another datasource's best match (additive — counting correctness) |
@@ -60,6 +61,7 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
 | `candidates` | array | up to `--top-n` candidates (incl. the best), each a candidate object |
 | `logic_parity` | object \| null | business-logic-parity for this match (additive; `null` when there is no Fabric candidate): `{status, tableau_calc_count, fabric_measure_count, matched, unmatched[]}` where `status` is `none` / `likely` / `partial` / `unverified`. Name-level only — see [logic-parity](#logic-parity-calculated-fields--measures) |
 | `confidence` | object | verdict confidence for this match (additive): `{level, drivers[], cautions[], margin, corroborating_signals, reciprocal_best}` where `level` is `High` / `Medium` / `Low`. Read-only over the verdict — never changes `tier`/`score`/`bucket`. See [confidence](#verdict-confidence) |
+| `importance` | object | artifact importance for this match (additive): `{level, score, drivers[]}` where `level` is `Critical` / `High` / `Moderate` / `Low` / `Unknown` (`Unknown` only when there was no usage evidence at all). Read-only — never changes `tier`/`score`/`bucket`/`priority`. See [artifact importance](#artifact-importance--connected-assets) |
 
 ### candidate object (`best_match` and each `candidates[]`)
 
@@ -306,6 +308,9 @@ three-sheet workbook (`Summary`, `Datasources`, `Fabric coverage`). The CSV and 
 | `Source compared` | `matches[].source_compared` | `Yes` / `No` |
 | `Shared columns` | `matches[].best_match.shared_column_count` | |
 | `Usage (workbooks)` | `matches[].usage.workbook_count` | blank when usage not gathered |
+| `Views` | `matches[].usage.view_count` | blank when view telemetry not gathered |
+| `Certified` | `matches[].usage.certified` | `Yes` / `No`, blank when unknown |
+| `Importance` | `matches[].importance.level` | `Critical … Low` / blank (Unknown) |
 | `Priority` | `matches[].priority` | |
 | `Migration priority` | `matches[].migration_priority` | |
 | `Logic parity` | `matches[].logic_parity.status` | `none / likely / partial / unverified` |
@@ -320,6 +325,38 @@ model totals, already-in-Fabric / partial / needs-rebuild counts **with percenta
 `distinct_fabric_matched`, the one-to-one assignment counts, net-new Fabric models, the logic-parity
 `review_needed` count, and the `by_tier` / `by_migration_priority` / verification breakdowns (each
 rendered only when present). The **`Fabric coverage`** sheet lists
-`summary.fabric_coverage.unmatched_model_names` (`Fabric model`, `Workspace`).
+`summary.fabric_coverage.unmatched_model_names` (`Fabric model`, `Workspace`). A fourth
+**`Connected assets`** sheet is appended **only when connected-asset telemetry was gathered** — one
+row per dependent workbook / dashboard (`Datasource`, `Importance`, `Views`, `Asset type`,
+`Asset name`, `Last refreshed`), ordered by the datasource's importance.
+
+## Artifact importance & connected assets
+
+The comparison answers *"does this datasource already exist in Fabric?"*. **Importance** answers the
+orthogonal deliverable question *"how much does it matter, and what depends on it?"* so a migration
+team protects the highest-value assets first — independent of the verdict. It is **pure, additive and
+read-only**: it reads each match's `usage` block and never changes a `tier` / `score` / `bucket` /
+`priority`.
+
+Each match gains `importance` `{level, score, drivers[]}` blending three independent signals (weights
+renormalised over whichever are present, so a missing signal never silently drags the score down):
+
+- **reach** — dependent workbooks + dashboards (the blast radius if the datasource is retired/moved);
+- **consumption** — total **view count** across those workbooks (observed usage, not just existence);
+- **endorsement** — whether the datasource is **certified**.
+
+`level` bands the `0..1` score into `Critical` / `High` / `Moderate` / `Low`, or `Unknown` **only**
+when there was no usage evidence at all (it is never guessed). `drivers[]` explains, in plain
+language, what makes it important (e.g. *"20 connected workbook(s)"*, *"4.0k view(s)"*, *"certified"*,
+*"active data-quality warning"*, *"last refreshed 2026-06-20"*).
+
+The telemetry these signals consume rides on `usage`: `view_count` (summed from the per-workbook
+Tableau view statistics), `certified`, `has_quality_warning`, `extract_last_refresh` /
+`extract_last_update`, `updated_at`, and `connected_assets` (the *names* of the dependent workbooks /
+dashboards, bounded per datasource). All are best-effort — any that the Metadata API / REST view
+statistics do not return are simply `null`. The `summary.importance` rollup
+(`{by_level, critical, high, total_views, certified_datasources, datasources_with_quality_warning}`)
+feeds the report's **Artifact importance & connected assets** section (rendered only when at least one
+datasource scored a non-`Unknown` level) and the export's importance metrics + `Connected assets` sheet.
 
 

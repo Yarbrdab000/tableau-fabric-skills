@@ -214,6 +214,28 @@ that came back `Low` and deserve a human pass. Each match carries `drivers[]` (w
 `cautions[]` (why it is not). See [`report-schema.md`](report-schema.md#verdict-confidence) for the
 exact keys.
 
+## Artifact importance — what to protect first
+
+Tiers, priority and confidence all reason about *the match*. **Importance** reasons about *the
+datasource itself*: how much business value it carries and how big the blast radius is if a migration
+gets it wrong. It is a separate, deterministic, read-only layer (it never changes
+tier/score/bucket/priority) that fuses three independent value signals attached during inventory:
+
+- **reach** — dependent workbooks + dashboards (`workbook_count + 2·dashboard_count`, saturating);
+- **consumption** — total **view count** across those workbooks (observed usage, saturating);
+- **endorsement** — whether the datasource is **certified**.
+
+The signals blend to a `0..1` score (weights renormalised over whichever are present, so a missing
+signal never silently drags the result toward zero) that bands into `Critical` / `High` / `Moderate` /
+`Low`, or `Unknown` **only** when there was no usage evidence at all — it is never guessed. This is
+deliberately distinct from migration **priority**: priority answers *"in what order do we rebuild?"*
+from attached-workbook count alone, while importance answers *"how much does this matter, and what
+breaks if we move it?"* across reach + consumption + endorsement. The report's **Artifact importance &
+connected assets** section spotlights the top datasources with their real views, the named workbooks /
+dashboards that depend on them, and the last refresh — so the highest-value assets are migrated and
+verified first. See [`report-schema.md`](report-schema.md#artifact-importance--connected-assets) for
+the exact keys.
+
 ## Tuning notes
 
 - Fabric models commonly add measures and calculated columns, which **inflates the column count** and
