@@ -184,6 +184,36 @@ explicitly **name-level only** — it does *not* compare a Tableau formula again
 match from hiding a pile of unmigrated calculations, so *"already exists"* is never read as *"safe to
 retire."*
 
+## Verdict confidence — how much to trust each line
+
+Tiers and scores rank *how good* a match is. They do not, on their own, tell a migration lead *which
+lines they can act on without a second look*. **Confidence** is a separate, deterministic, read-only
+layer (it never changes tier/score/bucket) that fuses the independent evidence already computed into a
+single `High` / `Medium` / `Low` judgement — and it does so for **both** verdict directions: a `High`
+on *already-in-Fabric* means *confidently reuse*; a `High` on *needs-rebuild* means *confidently
+rebuild* (nothing in Fabric is close).
+
+The evidence is treated as **independent corroborators**, so agreement compounds and a verdict resting
+on a single signal is explicitly distrusted:
+
+- **score level** — the absolute band the match lands in;
+- **margin over the runner-up** — a decisive lead vs. a near-tie between two Fabric models;
+- **signal corroboration** — how many of name / column overlap / physical source *independently*
+  support the match (one signal is weak even when it scores high);
+- **reciprocity** — a *mutual best* match on a **contested** model (the model's strongest suitor is
+  this datasource). Trivial reciprocity on an uncontested model is ignored so it can't inflate a clean
+  1:1 estate;
+- **empirical verification** — when `--verify` ran, `verified` / `compatible` lifts to `High`; a
+  `mismatch` caps at `Low` no matter how clean the structure looked.
+
+For a **rebuild** verdict the logic inverts: *no candidate at all* (or a score at/below the Weak floor)
+is `High` confidence — we are sure nothing fits — while a score sitting just **below** the partial
+threshold is `Low` (borderline: it might be a real partial we are wrongly rejecting). The headline
+action number is `summary.confidence.low_confidence_review` — the already-in-Fabric/partial verdicts
+that came back `Low` and deserve a human pass. Each match carries `drivers[]` (why it is trusted) and
+`cautions[]` (why it is not). See [`report-schema.md`](report-schema.md#verdict-confidence) for the
+exact keys.
+
 ## Tuning notes
 
 - Fabric models commonly add measures and calculated columns, which **inflates the column count** and

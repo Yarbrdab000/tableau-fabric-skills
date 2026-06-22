@@ -37,6 +37,8 @@ def _result(matches=None, summary=None):
                            "shared_column_count": 18},
             "logic_parity": {"status": "partial", "tableau_calc_count": 3, "matched": 2},
             "verification": {"verdict": "verified"},
+            "confidence": {"level": "High", "drivers": [], "cautions": [], "margin": 0.2,
+                           "corroborating_signals": 3, "reciprocal_best": True},
             "reason": "exact name -- Exact.",
         },
         {
@@ -76,6 +78,7 @@ def test_detail_row_friendly_verdict_and_rounded_score():
     assert first["Calc fields"] == 3
     assert first["Calcs matched as measures"] == 2
     assert first["Verification"] == "verified"
+    assert first["Confidence"] == "High"
 
 
 def test_detail_row_handles_no_match_and_null_logic_parity():
@@ -149,6 +152,18 @@ def test_summary_percentages_safe_when_zero_datasources():
     rows, _ = export.build_summary_rows({"summary": {"tableau_total": 0}})
     flat = {r[0]: r[1] for r in rows if r[0]}
     assert flat["Already in Fabric %"] == "0%"
+
+
+def test_summary_includes_confidence_metrics_when_present():
+    rows, _ = export.build_summary_rows(_result(summary={
+        "confidence": {"high": 4, "medium": 1, "low": 2,
+                       "high_confidence_already_exists": 3, "low_confidence_review": 2}}))
+    flat = {r[0]: r[1] for r in rows if r[0]}
+    assert flat["High-confidence verdicts"] == 4
+    assert flat["Low-confidence (review)"] == 2
+
+    rows2, _ = export.build_summary_rows(_result())
+    assert "High-confidence verdicts" not in {r[0] for r in rows2}
 
 
 def test_summary_includes_verification_block_only_when_enabled():

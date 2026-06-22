@@ -736,6 +736,18 @@ def compare_inventories(
     except Exception:
         pass
 
+    # Confidence synthesis: fuse the independent corroborators (score level, runner-up margin,
+    # signal agreement, reciprocity) into one explainable confidence per verdict + a rollup. Additive
+    # and idempotent -- re-run after --verify so the data check folds in. Never alters tier/score.
+    try:  # pragma: no cover - trivial wiring
+        try:
+            from . import confidence as _confidence
+        except ImportError:
+            import confidence as _confidence
+        _confidence.annotate_confidence(result)
+    except Exception:
+        pass
+
     return result
 
 
@@ -1001,6 +1013,7 @@ def render_markdown(result: Dict[str, Any]) -> str:
     lines.append("By tier: " + ", ".join(f"{t}={s['by_tier'].get(t, 0)}" for t in TIER_ORDER))
     lines.append("")
     _render_counting_rollup(result, lines)
+    _render_confidence_rollup(result, lines)
     _render_priority_rollup(result, lines)
     lines.append("## Ranked matches (most comparable first)")
     lines.append("")
@@ -1028,6 +1041,7 @@ def render_markdown(result: Dict[str, Any]) -> str:
     _render_coverage(result, lines)
     _render_verification(result, lines)
     _render_logic_parity(result, lines)
+    _render_confidence_detail(result, lines)
     lines.append("## Recommended actions")
     lines.append("")
     reasons = {m["tableau_name"]: m.get("reason") for m in result["matches"]}
@@ -1046,6 +1060,70 @@ def render_markdown(result: Dict[str, Any]) -> str:
     _render_priority_worklist(result, lines)
     _render_adjudication(result, lines)
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_confidence_rollup(result: Dict[str, Any], lines: List[str]) -> None:
+    """Confidence headline (additive). One-line read on how trustworthy the verdicts are, placed near
+    the top so a stakeholder sees it without scrolling. Rendered only when confidence was synthesised."""
+    summary = result.get("summary") or {}
+    conf = summary.get("confidence") or {}
+    if not conf:
+        return
+    high = conf.get("high", 0)
+    medium = conf.get("medium", 0)
+    low = conf.get("low", 0)
+    total = high + medium + low
+    if total <= 0:
+        return
+    review = conf.get("low_confidence_review", 0)
+    lines.append("## Verdict confidence")
+    lines.append("")
+    lines.append(
+        f"**{high} of {total} verdict(s) are high-confidence** "
+        f"(medium {medium}, low {low}). High-confidence means independent signals -- name, columns, "
+        "physical source, mutual-best agreement and (when run) the empirical data check -- corroborate "
+        "the same conclusion."
+    )
+    if review > 0:
+        lines.append("")
+        lines.append(
+            f"> **{review} verdict(s) are low-confidence and warrant a human look** before you act on "
+            "them -- see _Lowest-confidence verdicts_ below."
+        )
+    lines.append("")
+
+
+def _render_confidence_detail(result: Dict[str, Any], lines: List[str]) -> None:
+    """Actionable low-confidence callout (additive). Lists the verdicts the customer should eyeball,
+    with the drivers that support them and the cautions that weaken them. Rendered only when there is
+    at least one low-confidence verdict."""
+    matches = result.get("matches") or []
+    flagged = [(m, m.get("confidence") or {}) for m in matches
+               if (m.get("confidence") or {}).get("level") == "Low"]
+    if not flagged:
+        return
+    # Weakest margin first -- the closest calls are the ones a reviewer should open first.
+    flagged.sort(key=lambda mc: mc[1].get("margin") or 0.0)
+    lines.append("## Lowest-confidence verdicts (review these first)")
+    lines.append("")
+    lines.append(
+        "These verdicts rest on weaker or conflicting evidence -- a near-tie between Fabric models, a "
+        "single supporting signal, a contested model, a borderline score, or an empirical mismatch. The "
+        "deterministic verdict still stands; this is where a human reviewer adds the most value."
+    )
+    lines.append("")
+    lines.append("| Tableau datasource | Verdict | Best Fabric match | Why it's uncertain |")
+    lines.append("|---|---|---|---|")
+    for m, conf in flagged:
+        best = m.get("best_match")
+        fab = best.get("fabric_name") if best else "_(none)_"
+        cautions = conf.get("cautions") or []
+        drivers = conf.get("drivers") or []
+        why = "; ".join(cautions) if cautions else ("; ".join(drivers) if drivers else "limited evidence")
+        lines.append(
+            f"| {_cell(m['tableau_name'])} | {m['tier']} | {_cell(fab)} | {_cell(why)} |"
+        )
+    lines.append("")
 
 
 def _render_logic_parity(result: Dict[str, Any], lines: List[str]) -> None:

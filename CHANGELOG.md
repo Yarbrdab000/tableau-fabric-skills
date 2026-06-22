@@ -191,6 +191,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     nothing in Tableau maps to). Both are **read-only over the report and purely additive** — they never
     alter a report key; the Markdown / JSON output is unchanged. Comparison suite `218` → `240` tests.
     Skill `VERSION` `1.5.4` → `1.5.5`; collection `0.7.4` → `0.7.5`.
+  - **Verdict confidence — a decision-grade trust layer:** a new `scripts/confidence.py` fuses the
+    independent evidence the engine already computes (score band, margin over the runner-up, how many
+    of name / column / physical-source signals *independently* agree, mutual-best **reciprocity** on a
+    contested model, and — when `--verify` ran — the empirical data check) into one `High` / `Medium` /
+    `Low` confidence **per verdict**. It is symmetric: `High` means *confidently reuse* on an
+    already-in-Fabric verdict and *confidently rebuild* on a needs-rebuild verdict (a borderline score
+    just under the partial threshold is flagged `Low` instead). Each match gains
+    `confidence.{level, drivers[], cautions[], margin, corroborating_signals, reciprocal_best}`; the
+    rollup adds `summary.confidence.{high, medium, low, high_confidence_already_exists,
+    low_confidence_review}`. The Markdown report gains a **Verdict confidence** headline near the top
+    and a **Lowest-confidence verdicts (review these first)** table; the CSV/XLSX export gains a
+    `Confidence` column and two Summary metrics. **Deterministic, additive and read-only** — never
+    changes a `tier` / `score` / `bucket`; re-synthesised after `--verify` so the data check folds in.
+    Comparison suite `240` → `267` tests. Skill `VERSION` `1.5.5` → `1.5.6`; collection `0.7.5` →
+    `0.7.6`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.

@@ -35,6 +35,7 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
 | `assignment` | object | greedy **one-to-one** estate sizing (each model claimed once): `{by_tier, already_exist, partial, rebuild}` (additive) |
 | `fabric_coverage` | object | reverse (Fabric→Tableau) coverage: `{fabric_total, matched_models, unmatched_models, unmatched_model_names:[{fabric_name, workspace}]}` (additive) |
 | `logic_parity` | object | business-logic-parity rollup (additive): `{none, likely, partial, unverified, review_needed}` — counts of matched datasources by [logic-parity](#logic-parity-calculated-fields--measures) status, plus `review_needed` = matches that look already-in-Fabric/partial **but whose calculated fields are not confirmed as measures** |
+| `confidence` | object | verdict-confidence rollup (additive): `{high, medium, low, high_confidence_already_exists, low_confidence_review}` — how trustworthy each **verdict** is once the independent signals are fused. `low_confidence_review` counts `already_exists`/`partial` verdicts that landed **Low** (a human should look). See [confidence](#verdict-confidence) |
 
 ## `matches[]` (sorted most-comparable first)
 
@@ -58,6 +59,7 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
 | `best_match` | object \| null | the winning Fabric candidate (null when nothing scored above 0) |
 | `candidates` | array | up to `--top-n` candidates (incl. the best), each a candidate object |
 | `logic_parity` | object \| null | business-logic-parity for this match (additive; `null` when there is no Fabric candidate): `{status, tableau_calc_count, fabric_measure_count, matched, unmatched[]}` where `status` is `none` / `likely` / `partial` / `unverified`. Name-level only — see [logic-parity](#logic-parity-calculated-fields--measures) |
+| `confidence` | object | verdict confidence for this match (additive): `{level, drivers[], cautions[], margin, corroborating_signals, reciprocal_best}` where `level` is `High` / `Medium` / `Low`. Read-only over the verdict — never changes `tier`/`score`/`bucket`. See [confidence](#verdict-confidence) |
 
 ### candidate object (`best_match` and each `candidates[]`)
 
@@ -247,6 +249,39 @@ datasource carries calculated fields; otherwise the report is byte-for-byte unch
 > or a `<calculation>` child in the `.tds` fallback); the Fabric side carries model-level `measures`
 > (names) parsed from TMDL.
 
+## Verdict confidence
+
+Tier and score answer *"what is the best match?"*. **Confidence** answers a different, decision-grade
+question — *"how much should the customer trust this line in the migration plan?"* — and it does so
+for **both** sides of the verdict: a `High` on an `already_exists` verdict means *confidently reuse*;
+a `High` on a `rebuild` verdict means *confidently rebuild* (nothing in Fabric comes close). It is
+**deterministic, additive and read-only**: it never changes a `tier` / `score` / `bucket`.
+
+Confidence fuses the independent evidence the engine already computed — each an *independent*
+corroborator, so agreement compounds:
+
+- **score level** — how strong the absolute match is (the band it lands in);
+- **margin over the runner-up** — decisive win vs. a coin-flip near-tie;
+- **signal corroboration** — how many of name / column / physical source *independently* support it
+  (a verdict resting on a single signal is weaker than three signals agreeing);
+- **reciprocity** — a *mutual best* match on a **contested** model (the model's strongest suitor is
+  this very datasource). Trivial reciprocity on an uncontested model does not count;
+- **empirical verification** — when `--verify` ran, a `verified` / `compatible` lifts confidence; a
+  `mismatch` caps it at `Low` regardless of structure.
+
+| `level` | `already_exists` / `partial` | `rebuild` |
+|---|---|---|
+| `High` | empirically verified, or ≥2 independent signals agree with no near-tie/contested model | no comparable model at all, or score at/below the Weak floor |
+| `Medium` | one signal supports it (or a clean partial) | a clear non-match in the mid-range |
+| `Low` | rests on a single signal / near-tie / contested model / empirical mismatch | **borderline** — score sits just below the partial threshold (might be a real partial) |
+
+`matches[].confidence` carries `{level, drivers[], cautions[], margin, corroborating_signals,
+reciprocal_best}`; `drivers[]` are the human-readable reasons it is trusted, `cautions[]` the reasons
+it is not. `summary.confidence.low_confidence_review` is the headline action item — `already_exists` /
+`partial` verdicts that landed `Low`. The Markdown report renders a **Verdict confidence** headline
+near the top and, when any verdict is `Low`, a **Lowest-confidence verdicts (review these first)**
+table; both are omitted when confidence was not synthesised.
+
 ## Executive export (`--export-csv` / `--export-xlsx`)
 
 These flags render the **same** finished report (whatever layers ran — verification, adjudication,
@@ -277,6 +312,7 @@ three-sheet workbook (`Summary`, `Datasources`, `Fabric coverage`). The CSV and 
 | `Calc fields` | `matches[].logic_parity.tableau_calc_count` | |
 | `Calcs matched as measures` | `matches[].logic_parity.matched` | |
 | `Verification` | `matches[].verification.verdict` | present only after `--verify` |
+| `Confidence` | `matches[].confidence.level` | `High` / `Medium` / `Low` — trust in the verdict |
 | `Reason` | `matches[].reason` | one-line deterministic explanation |
 
 The XLSX **`Summary`** sheet is the estate-sizing headline (a `Metric` / `Value` list): datasource and

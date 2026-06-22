@@ -187,6 +187,23 @@ It deliberately **does not compare formulas** — proving a Tableau calc equals 
 and renders a **Business-logic parity** section only when at least one matched datasource has calculated
 fields. Purely additive — it never changes the deterministic tier/score/bucket.
 
+## Verdict confidence — which lines to trust
+
+Tiers rank *how good* a match is; **confidence** answers the decision-grade question *"which verdicts
+can I act on without a second look?"* A new `scripts/confidence.py` fuses the independent evidence the
+engine already produced — the score band, the **margin** over the runner-up, how many of name / column
+/ physical-source signals *independently* agree, mutual-best **reciprocity** on a contested model, and
+(when `--verify` ran) the empirical data check — into one `High` / `Medium` / `Low` rating **per
+verdict**. It is symmetric: `High` means *confidently reuse* on an already-in-Fabric verdict and
+*confidently rebuild* on a needs-rebuild one, while a score sitting just below the partial threshold is
+flagged `Low` (borderline — it might be a real partial). Each match gains
+`confidence.{level, drivers[], cautions[], …}` and the rollup gains `summary.confidence` (including
+`low_confidence_review` — the already-exists/partial verdicts that came back `Low` and want a human
+pass). The report adds a **Verdict confidence** headline and a **Lowest-confidence verdicts** table;
+the export adds a `Confidence` column. Deterministic, additive, read-only — re-synthesised after
+`--verify` so the data check folds in, and it never changes a tier/score/bucket. See
+[`resources/report-schema.md`](resources/report-schema.md#verdict-confidence).
+
 ## Usage
 
 ```powershell
@@ -262,6 +279,9 @@ A Markdown (or JSON) report — see `resources/report-schema.md`:
   by-migration-priority rollup (omitted when usage was not gathered).
 - **Empirical verification** (only with `--verify`): a `verified / compatible / mismatch / inconclusive`
   rollup and a per-pair table, each row noting whether the data agreed on the shared overlap window.
+- **Verdict confidence**: a headline (*N of M verdicts are high-confidence*) plus, when any verdict is
+  uncertain, a **Lowest-confidence verdicts (review these first)** table that names *why* each is
+  shaky (near tie, single signal, contested model, borderline score, empirical mismatch).
 - **Recommended actions**: grouped by tier, pointing the rebuild set at the `tableau-migration` skill.
 
 After an `--apply-adjudication` pass the report also shows an **After semantic review** rollup

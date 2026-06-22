@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional
 try:  # package or flat-script execution
     from . import compare as compare_mod
     from . import adjudicate as adjudicate_mod
+    from . import confidence as confidence_mod
     from . import export as export_mod
     from . import fabric_inventory as fab
     from . import tableau_inventory as tab
@@ -41,6 +42,7 @@ try:  # package or flat-script execution
 except ImportError:  # pragma: no cover - exercised via flat script execution
     import compare as compare_mod
     import adjudicate as adjudicate_mod
+    import confidence as confidence_mod
     import export as export_mod
     import fabric_inventory as fab
     import tableau_inventory as tab
@@ -281,6 +283,12 @@ def main(argv=None) -> int:
 
         if args.verify:
             _run_verification(args, result, tableau, fabric, tableau_client, log)
+            # Re-synthesise confidence so the empirical verification verdicts fold into each
+            # match's confidence level (idempotent; never changes tier/score/bucket).
+            try:
+                confidence_mod.annotate_confidence(result)
+            except Exception:  # pragma: no cover - never let it break the report
+                pass
 
         if args.format == "json":
             rendered = json.dumps(result, indent=2)

@@ -47,6 +47,7 @@ _DETAIL_COLUMNS: List[Tuple[str, str]] = [
     ("Calc fields", "_calc_count"),
     ("Calcs matched as measures", "_calc_matched"),
     ("Verification", "_verify_verdict"),
+    ("Confidence", "_confidence"),
     ("Reason", "reason"),
 ]
 
@@ -66,6 +67,7 @@ def _detail_cell(match: Dict[str, Any], key: str) -> Any:
     lp = match.get("logic_parity") or {}
     ver = match.get("verification") or {}
     usage = match.get("usage") or {}
+    conf = match.get("confidence") or {}
     if key == "_verdict":
         return _BUCKET_LABEL.get(match.get("bucket"), match.get("bucket") or "")
     if key == "_score":
@@ -93,6 +95,8 @@ def _detail_cell(match: Dict[str, Any], key: str) -> Any:
         return v if isinstance(v, int) else None
     if key == "_verify_verdict":
         return ver.get("verdict") or ""
+    if key == "_confidence":
+        return conf.get("level") or ""
     return None
 
 
@@ -117,6 +121,7 @@ def build_summary_rows(result: Dict[str, Any]) -> Tuple[List[List[Any]], List[in
     assignment = s.get("assignment", {}) or {}
     coverage = s.get("fabric_coverage", {}) or {}
     logic = s.get("logic_parity", {}) or {}
+    conf = s.get("confidence", {}) or {}
 
     rows: List[List[Any]] = []
     bold: List[int] = []
@@ -144,6 +149,9 @@ def build_summary_rows(result: Dict[str, Any]) -> Tuple[List[List[Any]], List[in
         pair("Net-new Fabric models (unmatched)", coverage.get("unmatched_models", 0))
     if logic:
         pair("Logic-parity review needed", logic.get("review_needed", 0))
+    if conf:
+        pair("High-confidence verdicts", conf.get("high", 0))
+        pair("Low-confidence (review)", conf.get("low_confidence_review", 0))
 
     by_tier = s.get("by_tier") or {}
     if by_tier:
