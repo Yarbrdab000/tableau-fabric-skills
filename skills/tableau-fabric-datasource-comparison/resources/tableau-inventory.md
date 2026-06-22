@@ -42,6 +42,10 @@ XML descriptor. The response is either a bare `.tds` or a `.tdsx` ZIP containing
   inside each `<named-connection>`.
 - **tables** — from `<relation type='table' table='[dbo].[Orders]'>` (schema + table split from the
   bracketed name).
+- **custom SQL** — from `<relation type='text'>SELECT … FROM …</relation>`: the embedded SQL's
+  `FROM` / `JOIN` tables are mined (schema-qualified, quoting/brackets stripped, de-duplicated) so a
+  custom-SQL datasource yields a real physical-source signal instead of an empty one. Each extracted
+  table inherits the relation's connector + database.
 - **columns + types** — from `<metadata-record class='column'>` using `<remote-name>` (the **source**
   column name, so it lines up with Fabric columns that mirror the source) and `<local-type>`
   (upper-cased to match the Metadata API's casing).

@@ -375,6 +375,32 @@ def _split_schema_table(table_attr: str) -> Tuple[str, str]:
     return "", (table_attr or "").strip()
 
 
+# Custom-SQL (``<relation type='text'>``) FROM/JOIN table extraction. Best-effort: pulls the table
+# references out of an embedded SQL string so a custom-SQL datasource still yields a physical source
+# signal instead of an empty one. Mirrors the Fabric native-query extractor conceptually.
+_SQL_FROM_RE = re.compile(r'(?:\bfrom|\bjoin)\s+([A-Za-z0-9_.\[\]"`]+)', re.IGNORECASE)
+
+
+def _tables_from_sql(sql: str) -> List[Tuple[str, str]]:
+    """Extract ``(schema, table)`` pairs from FROM/JOIN clauses of an embedded SQL string."""
+    out: List[Tuple[str, str]] = []
+    seen = set()
+    for raw in _SQL_FROM_RE.findall(sql or ""):
+        parts = [p.strip(' "[]`') for p in raw.split(".") if p.strip(' "[]`')]
+        if not parts:
+            continue
+        schema = parts[-2] if len(parts) >= 2 else ""
+        table = parts[-1]
+        if not table:
+            continue
+        key = (schema.lower(), table.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((schema, table))
+    return out
+
+
 def extract_tds_text(content: bytes) -> Optional[str]:
     """Return the ``.tds`` XML text from raw downloaded bytes (a bare ``.tds`` or a ``.tdsx`` ZIP)."""
     if not content:
@@ -443,6 +469,29 @@ def parse_tds(xml_text: str) -> Dict[str, List[Dict[str, Any]]]:
         if key not in seen_src:
             seen_src.add(key)
             sources.append(src)
+
+    # Custom SQL: ``<relation type='text'>SELECT ... FROM ...</relation>`` (a relation *with a body*,
+    # so it is matched separately from the self-closing table relations above). Mine the embedded SQL
+    # for its FROM/JOIN tables so a custom-SQL datasource still produces a physical-source signal.
+    # ``type='text'`` is required in the opening tag so a wrapping ``<relation type='join'>`` (which
+    # nests several text relations) is never the leftmost match and cannot swallow an inner text
+    # relation -- otherwise the joined custom-SQL tables would be silently dropped.
+    for m in re.finditer(
+        r"<relation\b([^>]*?\btype=['\"]text['\"][^>]*?)>(.*?)</relation>", xml_text, re.DOTALL
+    ):
+        a = _attrs(m.group(1))
+        cinfo = conns.get(a.get("connection", ""), default_conn)
+        for schema, table in _tables_from_sql(m.group(2)):
+            src = {
+                "connectionType": cinfo.get("connector", ""),
+                "database": cinfo.get("database", ""),
+                "schema": schema,
+                "table": table,
+            }
+            key = (src["connectionType"], src["database"], src["schema"], src["table"])
+            if key not in seen_src:
+                seen_src.add(key)
+                sources.append(src)
 
     # Columns (use the source column name so it lines up with Fabric columns that mirror the source).
     fields: List[Dict[str, Any]] = []

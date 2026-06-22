@@ -94,3 +94,68 @@ def test_shape_from_tds_matches_inventory_shape():
     assert row["fields"] and row["sources"]
     assert set(row["fields"][0]) >= {"name", "dataType", "role"}
     assert set(row["sources"][0]) >= {"connectionType", "database", "schema", "table"}
+
+
+# --------------------------------------------------------------------------------------
+# Custom SQL (`<relation type='text'>`): mine FROM/JOIN tables out of the embedded SQL
+# --------------------------------------------------------------------------------------
+CUSTOM_SQL_TDS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='federated.xyz' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection name='nc1'>
+        <connection class='sqlserver' server='srv' dbname='Sales' />
+      </named-connection>
+    </named-connections>
+    <relation name='Custom SQL Query' type='text' connection='nc1'>
+SELECT o.id, c.name
+FROM dbo.Orders o
+JOIN [dbo].[Customers] c ON c.id = o.cid
+LEFT JOIN analytics.Regions r ON r.code = c.region
+    </relation>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>id</remote-name><local-type>integer</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>
+"""
+
+
+def test_custom_sql_extracts_from_and_join_tables():
+    sources = tab.parse_tds(CUSTOM_SQL_TDS)["sources"]
+    pairs = {(s["schema"], s["table"]) for s in sources}
+    assert ("dbo", "Orders") in pairs
+    assert ("dbo", "Customers") in pairs
+    assert ("analytics", "Regions") in pairs
+    assert all(s["connectionType"] == "sqlserver" and s["database"] == "Sales" for s in sources)
+
+
+def test_tables_from_sql_handles_quoting_and_dedupes():
+    sql = 'select * from "public"."orders" o join public.orders o2 on 1=1 cross join Customers'
+    pairs = tab._tables_from_sql(sql)
+    # bracket/quote stripped, case-insensitive dedupe of the repeated orders, bare table kept
+    assert ("public", "orders") in pairs
+    assert ("", "Customers") in pairs
+    assert sum(1 for _, t in pairs if t.lower() == "orders") == 1
+
+
+def test_custom_sql_text_relations_nested_in_a_join_are_not_dropped():
+    # Tableau wraps joined custom SQL in a <relation type='join'> with several inner text relations.
+    # A lazy outer match starting at the join tag would swallow the first inner text relation, so the
+    # parser must require type='text' to match each inner relation independently.
+    tds = """<datasource>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection name='c1'><connection class='sqlserver' server='s' dbname='DB' /></named-connection>
+    </named-connections>
+    <relation type='join'>
+      <relation connection='c1' name='Q1' type='text'>SELECT * FROM dbo.Orders</relation>
+      <relation connection='c1' name='Q2' type='text'>SELECT * FROM dbo.Customers</relation>
+    </relation>
+  </connection>
+</datasource>"""
+    pairs = {(s["schema"], s["table"]) for s in tab.parse_tds(tds)["sources"]}
+    assert ("dbo", "Orders") in pairs
+    assert ("dbo", "Customers") in pairs

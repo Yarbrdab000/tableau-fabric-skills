@@ -63,6 +63,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     `.migration_priority`, `summary.by_priority` / `by_migration_priority` / `usage_thresholds`, a
     Markdown "Migration priority" section, and `resources/migration-priority.md`; all additive. Skill
     `VERSION` `1.1.0` → `1.2.0`.
+  - **Robustness & reliability pass (counting correctness, precision, source coverage):** all additive.
+    (1) *Counting correctness* — the comparison now detects when several Tableau datasources claim the
+    **same** Fabric model (`matches[].contested` / `contested_with`, `summary.contested_models`),
+    reports `summary.distinct_fabric_matched` (distinct models behind the "already exists" bucket), adds
+    a greedy **one-to-one** `summary.assignment` rollup (`assigned_match` / `assigned_tier`) so the
+    estate can be sized without double-counting a shared model, and adds reverse `summary.fabric_coverage`
+    (Fabric models no Tableau datasource maps to). (2) *Precision* — the column signal **down-weights
+    ubiquitous generic names** (curated stoplist blended with an estate IDF penalty, gated to estates of
+    ≥ 8 assets) so a coincidental generic overlap can't manufacture a match; a capped **fuzzy name**
+    fallback (`difflib`) rescues near-miss spellings without ever outranking a true exact match; and each
+    match carries a deterministic one-line `reason`. (3) *Source coverage* — Fabric M parsing gains
+    **Lakehouse / Warehouse / Dataflow / Excel / CSV** connectors and `[Id=…]` / `[entity=…]` table
+    navigation plus native-SQL `Value.NativeQuery` FROM/JOIN extraction, and the Tableau `.tds` parser
+    now mines **custom SQL** (`<relation type='text'>`) FROM/JOIN tables — both directly strengthening
+    the source signal across a lakehouse intermediary. Identical-asset scores are unchanged (every exact
+    match still scores `1.0`). Comparison suite `65` → `82` tests. Skill `VERSION` `1.2.0` → `1.3.0`;
+    collection `0.4.0` → `0.5.0`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.

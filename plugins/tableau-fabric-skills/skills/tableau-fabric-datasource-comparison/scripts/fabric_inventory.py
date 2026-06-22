@@ -322,11 +322,26 @@ _DB_FUNCS = {
     "oracle.database": "oracle",
     "mysql.database": "mysql",
     "databricks.catalogs": "databricks",
+    # Fabric-native and file connectors. These rarely take ("server","db") positional args, so the
+    # arg regex below simply leaves server/database blank for them and the table is resolved from the
+    # navigation step ([Id=...] for Lakehouse/Warehouse, [Item=]/[Name=] for Excel/Dataflows).
+    "lakehouse.contents": "lakehouse",
+    "fabric.warehouse": "warehouse",
+    "datawarehouse.contents": "warehouse",
+    "powerplatform.dataflows": "dataflow",
+    "dataflows.contents": "dataflow",
+    "excel.workbook": "excel",
+    "csv.document": "csv",
 }
 _SCHEMA_ITEM_RE = re.compile(r'\[\s*Schema\s*=\s*"([^"]*)"\s*,\s*Item\s*=\s*"([^"]*)"\s*\]')
 _ITEM_ONLY_RE = re.compile(r'Item\s*=\s*"([^"]*)"')
 _NAME_NAV_RE = re.compile(r'\[\s*Name\s*=\s*"([^"]*)"\s*\]')
-_NATIVE_FROM_RE = re.compile(r'(?:from|join)\s+["\[]?([A-Za-z0-9_.]+)', re.IGNORECASE)
+# Lakehouse / Warehouse navigation: ``{[Id="Orders", ItemKind="Table"]}``. Case-sensitive ``Id`` so
+# it does not also catch the ``[workspaceId=...]`` / ``[lakehouseId=...]`` hops above the table.
+_ID_NAV_RE = re.compile(r'\[\s*Id\s*=\s*"([^"]*)"')
+# Dataflow entity navigation: ``{[entity="SalesFact", version=""]}``.
+_ENTITY_NAV_RE = re.compile(r'entity\s*=\s*"([^"]*)"', re.IGNORECASE)
+_NATIVE_FROM_RE = re.compile(r'(?:from|join)\s+["\[]?([A-Za-z0-9_."\[\]]+)', re.IGNORECASE)
 
 
 def parse_m_sources(m_text: str) -> List[Dict[str, Any]]:
@@ -389,6 +404,26 @@ def parse_m_sources(m_text: str) -> List[Dict[str, Any]]:
             })
         return _dedupe_sources(sources)
 
+    # Lakehouse / Warehouse table navigation: ``{[Id="Orders", ItemKind="Table"]}``.
+    id_navs = _ID_NAV_RE.findall(m_text)
+    if id_navs:
+        for tbl in id_navs:
+            sources.append({
+                "connectionType": connector, "server": server,
+                "database": database, "schema": "", "table": tbl,
+            })
+        return _dedupe_sources(sources)
+
+    # Dataflow entity navigation: ``{[entity="SalesFact"]}``.
+    entities = _ENTITY_NAV_RE.findall(m_text)
+    if entities:
+        for ent in entities:
+            sources.append({
+                "connectionType": connector, "server": server,
+                "database": database, "schema": "", "table": ent,
+            })
+        return _dedupe_sources(sources)
+
     if connector == "snowflake":
         names = _NAME_NAV_RE.findall(m_text)
         # Snowflake nav is DB -> SCHEMA -> TABLE; the deepest Name is the table.
@@ -404,12 +439,16 @@ def parse_m_sources(m_text: str) -> List[Dict[str, Any]]:
 
     native = _NATIVE_FROM_RE.findall(m_text)
     if native:
-        for tbl in native:
+        for raw in native:
+            schema, table = _split_qualified(raw)
+            if not table:
+                continue
             sources.append({
                 "connectionType": connector, "server": server,
-                "database": database, "schema": "", "table": tbl.split(".")[-1],
+                "database": database, "schema": schema, "table": table,
             })
-        return _dedupe_sources(sources)
+        if sources:
+            return _dedupe_sources(sources)
 
     if connector != "other" or server or database:
         sources.append({
@@ -417,6 +456,21 @@ def parse_m_sources(m_text: str) -> List[Dict[str, Any]]:
             "database": database, "schema": "", "table": "",
         })
     return _dedupe_sources(sources)
+
+
+def _split_qualified(raw: str) -> Tuple[str, str]:
+    """Split a (possibly quoted/bracketed) ``schema.table`` reference into ``(schema, table)``.
+
+    Strips SQL identifier quoting (``"`` ``[`` ``]`` `` ` ``) and keeps the last two dotted parts so
+    ``dbo.Orders`` -> ``("dbo", "Orders")`` and a bare ``Orders`` -> ``("", "Orders")``.
+    """
+    cleaned = raw.strip().strip('"').strip()
+    parts = [p.strip(' "[]`') for p in cleaned.split(".") if p.strip(' "[]`')]
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return "", parts[0]
+    return parts[-2], parts[-1]
 
 
 def _dedupe_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

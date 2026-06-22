@@ -109,6 +109,63 @@ def test_parse_m_sources_unknown_shape_is_graceful():
 
 
 # --------------------------------------------------------------------------------------
+# M source mining: Fabric-native + file connectors (Lakehouse / Warehouse / Dataflow / Excel / native)
+# --------------------------------------------------------------------------------------
+def test_parse_m_sources_lakehouse_id_nav():
+    m = ('let Source = Lakehouse.Contents(null), '
+         'ws = Source{[workspaceId="w1"]}[Data], '
+         'lh = ws{[lakehouseId="l1"]}[Data], '
+         't = lh{[Id="Orders", ItemKind="Table"]}[Data] in t')
+    srcs = fab.parse_m_sources(m)
+    assert srcs == [{
+        "connectionType": "lakehouse", "server": "",
+        "database": "", "schema": "", "table": "Orders",
+    }]
+
+
+def test_parse_m_sources_warehouse_schema_item():
+    m = 'let S = Fabric.Warehouse(null){[Id="dw1"]}[Data]{[Schema="dbo",Item="Customers"]}[Data] in S'
+    srcs = fab.parse_m_sources(m)
+    assert srcs == [{
+        "connectionType": "warehouse", "server": "",
+        "database": "", "schema": "dbo", "table": "Customers",
+    }]
+
+
+def test_parse_m_sources_dataflow_entity_nav():
+    m = ('let S = PowerPlatform.Dataflows(null){[workspaceId="w"]}[Data]'
+         '{[dataflowId="d"]}[Data]{[entity="SalesFact"]}[Data] in S')
+    srcs = fab.parse_m_sources(m)
+    assert srcs == [{
+        "connectionType": "dataflow", "server": "",
+        "database": "", "schema": "", "table": "SalesFact",
+    }]
+
+
+def test_parse_m_sources_excel_item_nav():
+    m = 'let S = Excel.Workbook(File.Contents("C:\\book.xlsx"), true){[Item="Sheet1",Kind="Sheet"]}[Data] in S'
+    srcs = fab.parse_m_sources(m)
+    assert srcs[0]["connectionType"] == "excel"
+    assert srcs[0]["table"] == "Sheet1"
+
+
+def test_parse_m_sources_native_query_from_join_keeps_schema():
+    m = ('let S = Value.NativeQuery(Sql.Database("srv","db"), '
+         '"select * from dbo.FactSales f join dim.Customer c on c.id=f.cid") in S')
+    srcs = fab.parse_m_sources(m)
+    pairs = {(s["schema"], s["table"]) for s in srcs}
+    assert ("dbo", "FactSales") in pairs
+    assert ("dim", "Customer") in pairs
+    assert all(s["connectionType"] == "sqlserver" for s in srcs)
+
+
+def test_parse_m_sources_csv_is_graceful():
+    m = 'let S = Csv.Document(File.Contents("C:\\data.csv"),[Delimiter=","]) in S'
+    srcs = fab.parse_m_sources(m)
+    assert srcs and srcs[0]["connectionType"] == "csv"
+
+
+# --------------------------------------------------------------------------------------
 # Aggregation + payload decode
 # --------------------------------------------------------------------------------------
 def test_model_inventory_from_parts_aggregates_tables():

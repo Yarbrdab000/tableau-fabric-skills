@@ -30,6 +30,10 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
 | `by_priority` | object | count per usage label: `{High, Medium, Low, Unused, Unknown}` (additive — see [`migration-priority.md`](migration-priority.md)) |
 | `by_migration_priority` | object | count per fused action: `{P1…, P2…, P3…, P4…, Reuse…, Unprioritized}` |
 | `usage_thresholds` | object | the workbook-count thresholds used (`{high, medium}`) |
+| `distinct_fabric_matched` | int | count of **distinct** Fabric models backing the `already_exists` bucket (additive — counting correctness) |
+| `contested_models` | array | Fabric models claimed as best by more than one Tableau datasource: `[{fabric_name, workspace, claimed_by[]}]` (additive) |
+| `assignment` | object | greedy **one-to-one** estate sizing (each model claimed once): `{by_tier, already_exist, partial, rebuild}` (additive) |
+| `fabric_coverage` | object | reverse (Fabric→Tableau) coverage: `{fabric_total, matched_models, unmatched_models, unmatched_model_names:[{fabric_name, workspace}]}` (additive) |
 
 ## `matches[]` (sorted most-comparable first)
 
@@ -45,6 +49,11 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
 | `usage` | object \| null | downstream impact: `{workbook_count, sheet_count, dashboard_count, source}` (additive — `source` is `metadata`/`rest`/`none`; counts are `null` when not gathered) |
 | `priority` | string | usage label `High / Medium / Low / Unused / Unknown` (additive) |
 | `migration_priority` | string | fused action `P1 - migrate first` … `P4 - retire candidate` / `Reuse (already in Fabric)` / `Unprioritized` (additive) |
+| `contested` | bool | this match's best Fabric model is also another datasource's best match (additive — counting correctness) |
+| `contested_with` | array | the other Tableau datasource names that also picked this model (additive) |
+| `assigned_match` | object \| null | the candidate this datasource holds under the one-to-one assignment (a candidate object, or `null` if it lost every contested model) (additive) |
+| `assigned_tier` | string | the tier of `assigned_match` (`Exact … None`) (additive) |
+| `reason` | string | deterministic one-line explanation of the verdict (name/column/source drivers + contested flag) (additive) |
 | `best_match` | object \| null | the winning Fabric candidate (null when nothing scored above 0) |
 | `candidates` | array | up to `--top-n` candidates (incl. the best), each a candidate object |
 
@@ -69,6 +78,12 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
     "tableau_total": 6, "fabric_total": 6,
     "by_tier": {"Exact": 1, "Strong": 5, "Partial": 0, "Weak": 0, "None": 0},
     "already_exist": 6, "partial": 0, "rebuild": 0,
+    "distinct_fabric_matched": 6,
+    "contested_models": [],
+    "assignment": {"by_tier": {"Exact": 1, "Strong": 5, "Partial": 0, "Weak": 0, "None": 0},
+                   "already_exist": 6, "partial": 0, "rebuild": 0},
+    "fabric_coverage": {"fabric_total": 6, "matched_models": 6, "unmatched_models": 0,
+                        "unmatched_model_names": []},
     "weights": {"name": 0.2, "column": 0.35, "type": 0.15, "source": 0.3},
     "bands": [["Exact", 0.85], ["Strong", 0.65], ["Partial", 0.4], ["Weak", 0.15], ["None", 0.0]]
   },
@@ -76,6 +91,8 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
     {
       "tableau_name": "Azure SQL - Superstore", "project": "default", "tableau_luid": "....",
       "tier": "Strong", "score": 0.83, "bucket": "already_exists", "source_compared": true,
+      "contested": false, "contested_with": [], "assigned_tier": "Strong",
+      "reason": "exact name; 64% weighted column overlap; shared physical source -- Strong.",
       "best_match": {
         "fabric_name": "Azure SQL - Superstore", "workspace": "Github-Testing-Workspace",
         "workspace_id": "....", "fabric_id": "....", "score": 0.83,
@@ -95,6 +112,22 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
   datasource.
 - **`partial`** needs human reconciliation (added/renamed columns, source drift) before reuse.
 - Order the rebuild work by **`matches[].migration_priority`** — see below.
+
+## Counting correctness (distinct / one-to-one / reverse coverage)
+
+The greedy per-datasource verdict (`tier` / `bucket`) lets several datasources claim the same model,
+which can over-count a naive estate total. These additive keys make the count trustworthy without
+changing the per-datasource verdict — full method in
+[`comparison-methodology.md`](comparison-methodology.md):
+
+- `summary.distinct_fabric_matched` vs `summary.already_exist` — distinct models vs datasource count.
+  When they differ, models are shared; `summary.contested_models` (and per-match `contested` /
+  `contested_with`) names which.
+- `summary.assignment` — the **one-to-one** estate sizing (each model claimed once). Use this for a
+  "how many must we still build" total that does not double-count a shared model; `assigned_match` /
+  `assigned_tier` show each datasource's assigned model.
+- `summary.fabric_coverage.unmatched_model_names` — Fabric models nothing in Tableau maps to (net-new
+  in Fabric), so the estate view is bidirectional.
 
 ## Migration priority (downstream-impact ranking)
 

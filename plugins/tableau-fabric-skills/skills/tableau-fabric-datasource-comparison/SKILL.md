@@ -85,6 +85,22 @@ and database never line up and only the table names survive the move. When the p
 **obscured on either side** (no resolvable table at all), the `source` signal is dropped and its weight
 is redistributed across name/column/type, so a genuine schema-level overlap is never buried.
 
+## Counting correctness & precision
+
+The deterministic matcher is hardened so the **estate count** is trustworthy, not just the
+per-datasource verdict (all additive — see `resources/comparison-methodology.md`):
+
+- **Distinct, not double-counted.** Several Tableau datasources can each pick the *same* Fabric model
+  as their best match. The report flags `contested` models, reports `distinct_fabric_matched` (how
+  many distinct models actually back the "already exists" bucket), and adds a **one-to-one
+  `assignment`** rollup (each model claimed once) so "already exists" can't quietly over-count.
+- **Reverse coverage.** `fabric_coverage` lists Fabric models that *no* Tableau datasource maps to —
+  net-new assets already built in Fabric — so the estate view is bidirectional.
+- **Precision guards.** Ubiquitous generic columns (`id`/`date`/`region`/`name`) are **down-weighted**
+  (curated stoplist + an estate IDF penalty) so a coincidental generic overlap can't manufacture a
+  match, while a capped **fuzzy name** fallback rescues near-miss spellings (`SalesOrders` ≈ `Sales
+  Order`) without ever outranking a true exact match. Every match carries a one-line `reason`.
+
 ## LLM-optional adjudication (the "second matcher")
 
 The four signals are a **structural** matcher — strong on overlap it can measure, blind to **semantic**
@@ -168,6 +184,8 @@ A Markdown (or JSON) report — see `resources/report-schema.md`:
 - **Estate rollup**: counts of already-in-Fabric / partial / needs-rebuild, plus a by-tier breakdown.
 - **Ranked matches**: every Tableau datasource, its best Fabric match (model + workspace), tier, score,
   and the four signal sub-scores; `src = n/a` flags an obscured-source match.
+- **Counting correctness**: a distinct-model rollup, the contested models (one model claimed by several
+  datasources), the one-to-one assignment view, and the Fabric models with no Tableau counterpart.
 - **Agent adjudication queue**: the not-confidently-matched datasources, each with *why* it was flagged
   (renamed columns, obscured source, near tie, …) for an LLM-optional semantic review.
 - **Migration priority**: the rebuild/partial set ranked P1 → P4 by downstream usage, plus a
@@ -186,7 +204,8 @@ unchanged.
 - **Heuristic, not authoritative.** Scores rank likely overlap; a human verifies before reuse. Tune
   weights/bands per estate (`resources/comparison-methodology.md`).
 - **Connector coverage** centers on the connectors the migration skill handles (SQL Server / Azure SQL,
-  Snowflake, Postgres, Databricks, BigQuery, Redshift) and degrades gracefully to a schema-only signal
-  for others.
+  Snowflake, Postgres, Databricks, BigQuery, Redshift) plus Fabric-native sources (Lakehouse, Warehouse,
+  Dataflow) and Excel/CSV, and resolves tables from native-SQL `Value.NativeQuery` and Tableau custom
+  SQL; it degrades gracefully to a schema-only signal for anything else.
 - **Never commit** a downloaded `.tds`/`.tdsx`, a PAT, or a Fabric token. The scripts write only
   inventory/report JSON you choose with `--save-*` / `--out`.

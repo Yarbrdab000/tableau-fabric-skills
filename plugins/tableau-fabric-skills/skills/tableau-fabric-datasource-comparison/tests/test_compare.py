@@ -269,3 +269,112 @@ def test_azure_sqldb_connector_folds_to_sqlserver():
     # the .tds connection class for Azure SQL is `azure_sqldb`; it must canonicalise to sqlserver so
     # strict/loose source keys line up with a Fabric model built on Sql.Database.
     assert compare.canonical_connector("azure_sqldb") == "sqlserver"
+
+
+# --------------------------------------------------------------------------------------
+# Counting correctness: collisions, one-to-one assignment, reverse coverage
+# --------------------------------------------------------------------------------------
+def _exact_pair(name_ds, name_fab, cols):
+    src = [{"connectionType": "sqlserver", "database": "S", "table": "Orders"}]
+    ds = _ds(name_ds, [{"name": c, "dataType": "STRING"} for c in cols], src)
+    model = _model(name_fab, [{"name": c, "dataType": "string"} for c in cols], src)
+    return ds, model
+
+
+def test_collision_detection_and_distinct_count():
+    cols = ["netbookings", "territory", "fiscalperiod", "productline"]
+    dsA, fab = _exact_pair("Regional Sales", "Regional Sales", cols)
+    dsB = _ds("Regional Sales Reporting",
+              [{"name": c, "dataType": "STRING"} for c in cols],
+              [{"connectionType": "sqlserver", "database": "S", "table": "Orders"}])
+    hr = _model("HR Headcount", [{"name": "employees", "dataType": "int64"}],
+                [{"connectionType": "sqlserver", "database": "HR", "table": "people"}])
+    result = compare.compare_inventories([dsA, dsB], [fab, hr])
+    s = result["summary"]
+    # both datasources independently claim the single Sales model -> greedy over-counts to 2 ...
+    assert s["already_exist"] == 2
+    # ... but only ONE distinct Fabric model actually backs that bucket
+    assert s["distinct_fabric_matched"] == 1
+    sales = [m for m in result["matches"]
+             if m["best_match"] and m["best_match"]["fabric_name"] == "Regional Sales"]
+    assert len(sales) == 2
+    assert all(m["contested"] for m in sales)
+    assert {m["tableau_name"] for m in sales} == {"Regional Sales", "Regional Sales Reporting"}
+    assert s["contested_models"][0]["fabric_name"] == "Regional Sales"
+    assert len(s["contested_models"][0]["claimed_by"]) == 2
+
+
+def test_one_to_one_assignment_drops_duplicate():
+    cols = ["netbookings", "territory", "fiscalperiod", "productline"]
+    dsA, fab = _exact_pair("Regional Sales", "Regional Sales", cols)
+    dsB = _ds("Regional Sales Reporting",
+              [{"name": c, "dataType": "STRING"} for c in cols],
+              [{"connectionType": "sqlserver", "database": "S", "table": "Orders"}])
+    result = compare.compare_inventories([dsA, dsB], [fab])
+    a = result["summary"]["assignment"]
+    # only one Fabric model exists; the 1:1 view credits exactly one already_exist, the other rebuild
+    assert a["already_exist"] == 1
+    assert a["rebuild"] == 1
+
+
+def test_fabric_coverage_flags_net_new_models():
+    dsA, fab = _exact_pair("Regional Sales", "Regional Sales",
+                           ["netbookings", "territory", "fiscalperiod"])
+    netnew = _model("Marketing Spend", [{"name": "spend", "dataType": "double"}],
+                    [{"connectionType": "sqlserver", "database": "Mktg", "table": "spend"}])
+    result = compare.compare_inventories([dsA], [fab, netnew])
+    cov = result["summary"]["fabric_coverage"]
+    assert cov["matched_models"] == 1
+    assert cov["unmatched_models"] == 1
+    assert cov["unmatched_model_names"][0]["fabric_name"] == "Marketing Spend"
+    assert "Marketing Spend" in compare.render_markdown(result)
+
+
+# --------------------------------------------------------------------------------------
+# Precision: fuzzy name fallback, generic-column down-weighting, per-match reason
+# --------------------------------------------------------------------------------------
+def test_name_similarity_exact_fuzzy_and_unrelated():
+    assert compare.name_similarity("Sales", "Sales") == 1.0
+    # spacing / pluralisation variant -> rescued by the capped fuzzy tail
+    assert 0.6 <= compare.name_similarity("SalesOrders", "Sales Order") < 1.0
+    # unrelated names -> the fuzzy floor rejects coincidental character overlap
+    assert compare.name_similarity("Customer Churn", "Finance GL") == 0.0
+
+
+def test_fuzzy_name_never_outranks_exact():
+    assert compare.name_similarity("SalesOrders", "Sales Order") < compare.name_similarity("Sales", "Sales")
+
+
+def test_generic_only_overlap_is_suppressed_on_a_large_estate():
+    def ds(n, cols):
+        return _ds(n, [{"name": c, "dataType": "STRING"} for c in cols], [])
+
+    def fm(n, cols):
+        return _model(n, [{"name": c, "dataType": "string"} for c in cols], [])
+
+    filler_t = [ds(f"t{i}", ["id", "date", "region", "name", f"u{i}"]) for i in range(8)]
+    filler_f = [fm(f"f{i}", ["id", "date", "region", "name", f"v{i}"]) for i in range(8)]
+    # Alpha and Beta share ONLY ubiquitous generic columns; their distinctive columns differ
+    tab = [ds("Alpha", ["id", "date", "region", "name", "netbookings", "churnflag"])] + filler_t
+    fab = [fm("Beta", ["id", "date", "region", "name", "glaccount", "postingperiod"])] + filler_f
+    result = compare.compare_inventories(tab, fab)
+    alpha = [m for m in result["matches"] if m["tableau_name"] == "Alpha"][0]
+    # plain Jaccard would be 4/8 = 0.5 (Partial+); down-weighting pulls it well below
+    assert alpha["best_match"]["signals"]["column"] < 0.2
+
+
+def test_each_match_carries_a_reason_string():
+    tableau = [_ds("Superstore", [{"name": "Sales", "dataType": "REAL"}],
+                   [{"connectionType": "sqlserver", "database": "S", "table": "Orders"}])]
+    fabric = [_model("Superstore", [{"name": "Sales", "dataType": "double"}],
+                     [{"connectionType": "sqlserver", "database": "S", "table": "Orders"}])]
+    result = compare.compare_inventories(tableau, fabric)
+    m = result["matches"][0]
+    assert m["reason"]
+    assert "exact name" in m["reason"].lower()
+    assert m["reason"] in compare.render_markdown(result)  # surfaced in the report
+
+
+def test_reason_for_rebuild_when_no_match():
+    result = compare.compare_inventories([_ds("Lonely", [], [])], [])
+    assert "rebuild" in result["matches"][0]["reason"].lower()

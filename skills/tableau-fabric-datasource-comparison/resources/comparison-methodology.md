@@ -11,8 +11,8 @@ normalised to `0..1`:
 
 | Signal | Default weight | Definition |
 |---|---:|---|
-| `name`   | 0.20 | Jaccard over **name tokens** (lower-cased, split on non-alphanumerics, common stopwords like `datasource`/`data`/`source` dropped). An exact normalised-name match short-circuits to `1.0`. |
-| `column` | 0.35 | Jaccard over **normalised field/column names** (so `Row_ID`, `Row ID`, and `[Row ID]` all collapse to `rowid`). |
+| `name`   | 0.20 | Jaccard over **name tokens** (lower-cased, split on non-alphanumerics, common stopwords like `datasource`/`data`/`source` dropped). An exact normalised-name match short-circuits to `1.0`; a capped fuzzy fallback rescues near-miss spellings (see *Precision refinements*). |
+| `column` | 0.35 | **Weighted** Jaccard over **normalised field/column names** (so `Row_ID`, `Row ID`, and `[Row ID]` all collapse to `rowid`); ubiquitous generic names are down-weighted (see *Precision refinements*). |
 | `type`   | 0.15 | Of the columns that overlap by name, the share whose Tableau type is **compatible** with the Fabric (TMDL) type. |
 | `source` | 0.30 | Overlap of the **underlying physical source** — see the three-tier scheme below. |
 
@@ -96,6 +96,49 @@ Tableau Metadata API with a REST fallback) bands it `High/Medium/Low/Unused/Unkn
 the bucket: `already_exists` → *Reuse*; otherwise `High→P1` … `Unused→P4 (retire candidate)`, so a
 datasource with **0–1 attached workbook is deprioritized** even when it needs a full rebuild. This is
 additive — see [`migration-priority.md`](migration-priority.md).
+
+## Counting correctness — distinct, one-to-one, and reverse coverage
+
+The headline tiers above score **each Tableau datasource independently against its best Fabric
+model** (a greedy verdict). That is the right per-datasource answer, but a naive estate *count* of
+it can mislead, so the report adds three additive correctness signals — none of which change the
+greedy per-datasource verdict:
+
+- **Collision detection.** Several Tableau datasources can each pick the **same** Fabric model as
+  their best match (e.g. `Sales East` and `Sales West` both map to one `Sales` model). Every match
+  carries `contested` / `contested_with`, and `summary.contested_models` lists each shared model and
+  who claimed it. `summary.distinct_fabric_matched` reports the count of **distinct** Fabric models
+  backing the `already_exists` bucket — so "12 already exist" cannot quietly mean "12 datasources all
+  point at the same 3 models".
+- **One-to-one assignment.** A greedy **stable assignment** (sort all (datasource, model, score)
+  descending; each Fabric model can be claimed once) gives a non-double-counted estate sizing. Each
+  match carries `assigned_match` / `assigned_tier`; `summary.assignment` rolls these up. When two
+  datasources contest one model, the lower-scoring one drops to its next-best free model (often
+  `rebuild`) — the realistic "you still have to rebuild one of them" answer.
+- **Reverse coverage.** `summary.fabric_coverage` reports the Fabric models that **no** Tableau
+  datasource maps to (`unmatched_model_names`) — net-new assets already built in Fabric — so the
+  estate view is bidirectional, not just Tableau→Fabric.
+
+## Precision refinements
+
+Two refinements harden the `name` and `column` signals against the classic false-positive — a
+coincidental overlap of generic columns or a near-miss name — without disturbing distinctive matches
+(identical assets still score `1.0`, so every exact-match guarantee above is preserved):
+
+- **Generic-column down-weighting.** The column Jaccard is **weighted**: ubiquitous column names
+  (`id`, `date`, `name`, `region`, `amount`, …) contribute a fraction of a distinctive name's weight,
+  via a curated stoplist blended with an estate **document-frequency (IDF)** penalty — a column that
+  appears in nearly every asset carries little information. The IDF half only engages once the estate
+  is large enough to be informative (≥ 8 assets); below that the stoplist alone applies. Two assets
+  that share *only* `id`/`date`/`region`/`name` no longer look like a match; two that also share
+  `net_bookings`/`fiscal_period` still do.
+- **Fuzzy name fallback.** When token-set name overlap is low, a capped character-level similarity
+  (`difflib`) rescues abbreviations / spacing / pluralisation (`SalesOrders` ≈ `Sales Order`). It
+  only contributes above a similarity floor (so unrelated names stay at `0`) and is capped below
+  `1.0` (so it can never outrank a true exact-name match).
+- **Per-match `reason`.** Every match carries a deterministic one-line `reason` (exact name; weighted
+  column overlap %; shared vs obscured source; contested) that renders next to each recommendation,
+  so the ranked worklist explains *why*.
 
 ## Tuning notes
 
