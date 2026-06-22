@@ -137,6 +137,17 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     Verified end-to-end against the live 10ay Tableau + Fabric F2 mirror estate (6/6 already-exist;
     all 6 models correctly reported as refresh/connection-pending, not mismatches). Comparison suite
     `171` → `178` tests. Skill `VERSION` `1.5.0` → `1.5.1`; collection `0.7.0` → `0.7.1`.
+  - **Empirical verification — offline transport-seam tests (reliability hardening):** the thin
+    live-only transports and the probe closures that turn raw HTTP into `(value, error)` are now
+    exercised offline. New `tests/test_transport.py` mocks each network seam (`fabric_inventory._http`
+    / `_request` / `acquire_powerbi_token`'s `subprocess.run`, `TableauClient._request`,
+    `fab.execute_dax`) and **replays the exact response envelopes observed live** — Fabric
+    `executeQueries` 200+scalar, 200+`null` (Import model never refreshed), 400 *"...needs to be
+    recalculated or refreshed"*, the generic 400 *"Failed to execute the DAX query."* (DirectQuery
+    source not configured), 429/401; Tableau VDS 200 / 404 (feature off) / 429 / error — so the
+    `(value, error)` mapping and the `reason_code` triggers (`fabric_no_data` vs `fabric_unreadable`)
+    are regression-locked without a live tenant. Tests only — no behavior or schema change. Comparison
+    suite `178` → `203` tests. Skill `VERSION` `1.5.1` → `1.5.2`; collection `0.7.1` → `0.7.2`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.

@@ -2,7 +2,7 @@
   "name": "tableau-collection",
   "metadata": {
     "description": "Tableau -> Microsoft Fabric / Power BI agent skills: live MCP landing zone, datasource profiling / NL-query, estate comparison, and semantic-model migration. For code-executing Copilots (GitHub Copilot CLI, Claude Code, Cursor).",
-    "version": "0.7.1"
+    "version": "0.7.2"
   },
   "owner": {
     "name": "Yarbrdab000",
@@ -13,7 +13,7 @@
       "name": "tableau-fabric-skills",
       "source": "./plugins/tableau-fabric-skills",
       "description": "All four Tableau -> Microsoft Fabric / Power BI agent skills: profile & NL-query a Tableau datasource, stand up the official Tableau MCP server on Azure for Copilot, compare a whole Tableau estate against a Fabric tenant to see what already exists vs. needs rebuilding, and rebuild Tableau datasources as Fabric / Power BI semantic models (calc -> DAX).",
-      "version": "0.7.1",
+      "version": "0.7.2",
       "skills": [
         "./skills/tableau-datasource-profiler",
         "./skills/tableau-mcp-landing-zone",
@@ -30,7 +30,7 @@
       "name": "tableau-migration",
       "source": "./plugins/tableau-fabric-skills",
       "description": "[DEPRECATED ALIAS of tableau-fabric-skills@tableau-collection -- pre-0.2.0 users only; new installs should use tableau-fabric-skills.] Rebuild Tableau datasources as Microsoft Fabric / Power BI semantic models: typed TMDL, inferred relationships, deterministic calc -> DAX (preserving every original formula), storage-mode auto-selection, and a self-contained Fabric REST deploy.",
-      "version": "0.7.1",
+      "version": "0.7.2",
       "skills": [
         "./skills/tableau-migration"
       ],
