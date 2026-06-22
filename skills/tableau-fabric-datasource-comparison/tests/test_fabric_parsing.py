@@ -190,3 +190,70 @@ def test_decode_definition_parts_base64():
     parts = fab.decode_definition_parts(body)
     assert list(parts) == ["definition/tables/Orders.tmdl"]  # non-TMDL part dropped
     assert "table Orders" in parts["definition/tables/Orders.tmdl"]
+
+
+# --------------------------------------------------------------------------------------
+# Durability: malformed / hostile TMDL, M, and payloads degrade gracefully
+# --------------------------------------------------------------------------------------
+def test_parse_tmdl_tolerates_crlf_tabs_and_blank_lines():
+    crlf = (
+        "table Orders\r\n"
+        "\r\n"
+        "\tcolumn Sales\r\n"
+        "\t\tdataType: double\r\n"
+        "\r\n"
+        "\tcolumn 'Region Name'\r\n"
+        "\t\tdataType: string\r\n"
+    )
+    tables = fab.parse_tmdl_tables(crlf)
+    assert [t["name"] for t in tables] == ["Orders"]
+    cols = {c["name"]: c["dataType"] for c in tables[0]["columns"]}
+    assert cols == {"Sales": "double", "Region Name": "string"}
+
+
+def test_parse_tmdl_empty_and_whitespace_only_is_graceful():
+    assert fab.parse_tmdl_tables("") == []
+    assert fab.parse_tmdl_tables("   \n\t\n   \r\n") == []
+
+
+def test_parse_tmdl_table_without_columns_or_source():
+    tables = fab.parse_tmdl_tables("table LonelyTable\n")
+    assert tables == [{"name": "LonelyTable", "columns": [], "sources": []}]
+
+
+def test_parse_m_sources_truncated_expression_is_graceful():
+    # An M expression cut off mid-call must not raise; we still recover the connector.
+    srcs = fab.parse_m_sources('let S = Sql.Database("srv",')
+    assert isinstance(srcs, list) and srcs
+    assert srcs[0]["connectionType"] == "sqlserver"
+    assert srcs[0]["table"] == ""  # no table resolvable from the truncated text
+
+
+def test_parse_m_sources_empty_and_none_are_graceful():
+    assert fab.parse_m_sources("") == []
+    assert fab.parse_m_sources(None) == []
+
+
+def test_parse_m_sources_long_noisy_input_still_finds_the_source():
+    noise = "// " + ("x" * 50000) + "\n"
+    m = noise + 'let S = Sql.Database("srv","db"){[Schema="dbo",Item="Orders"]}[Data] in S'
+    srcs = fab.parse_m_sources(m)
+    assert {(s["schema"], s["table"]) for s in srcs} == {("dbo", "Orders")}
+
+
+def test_decode_definition_parts_skips_bad_payload_and_non_tmdl():
+    good = base64.b64encode(b"table T\n\tcolumn C\n\t\tdataType: int64\n").decode("ascii")
+    body = {"definition": {"parts": [
+        {"path": "definition/tables/Good.tmdl", "payload": good, "payloadType": "InlineBase64"},
+        # valid base64 but not valid UTF-8 -> decode raises -> part is skipped, not fatal.
+        {"path": "definition/tables/Bad.tmdl", "payload": "//4=", "payloadType": "InlineBase64"},
+        {"path": "definition/model.bim", "payload": "whatever", "payloadType": "InlineBase64"},
+    ]}}
+    parts = fab.decode_definition_parts(body)
+    assert list(parts) == ["definition/tables/Good.tmdl"]
+
+
+def test_decode_definition_parts_handles_missing_definition_key():
+    assert fab.decode_definition_parts({}) == {}
+    assert fab.decode_definition_parts({"definition": None}) == {}
+    assert fab.decode_definition_parts(None) == {}

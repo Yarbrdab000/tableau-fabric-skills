@@ -818,6 +818,18 @@ def _action_for(tier: str) -> str:
     return _RECOMMENDED_ACTION.get(tier, "")
 
 
+def _cell(value: Any) -> str:
+    """Render a value safe for a Markdown table cell.
+
+    A datasource / model / workspace name is attacker-influenced free text that can contain a
+    pipe or a newline; dropped verbatim into a ``| ... |`` row it would silently break the table
+    (extra columns / a split row). Neutralise those so the report stays well-formed -- names
+    without special characters are returned unchanged, so existing output is untouched.
+    """
+    s = "" if value is None else str(value)
+    return s.replace("\\", "\\\\").replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+
 def _render_counting_rollup(result: Dict[str, Any], lines: List[str]) -> None:
     """One-line counting-correctness rollup: distinct matched models + the 1:1 assignment view."""
     s = result.get("summary", {})
@@ -931,7 +943,7 @@ def render_markdown(result: Dict[str, Any]) -> str:
         src = "n/a" if sig.get("source") is None else f"{sig['source']:.2f}"
         sig_str = f"{sig['name']:.2f}/{sig['column']:.2f}/{sig['type']:.2f}/{src}"
         lines.append(
-            f"| {m['tableau_name']} | {m.get('project') or ''} | {fab} | {ws} | "
+            f"| {_cell(m['tableau_name'])} | {_cell(m.get('project') or '')} | {_cell(fab)} | {_cell(ws)} | "
             f"{m['tier']} | {m['score']:.2f} | {sig_str} |"
         )
     lines.append("")

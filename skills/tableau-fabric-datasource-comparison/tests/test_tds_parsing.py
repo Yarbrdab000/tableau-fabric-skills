@@ -200,3 +200,65 @@ def test_shape_sources_prefers_explicit_fields_over_full_name():
     assert src["database"] == "RealDB"
     assert src["schema"] == "dbo"
     assert src["table"] == "Orders"
+
+
+# --------------------------------------------------------------------------------------
+# Durability: corrupt archives, malformed XML, and pathological fullName degrade gracefully
+# --------------------------------------------------------------------------------------
+def _zip_bytes(members):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def test_extract_tds_text_corrupt_zip_returns_none():
+    # Looks like a ZIP (PK magic) but the central directory is junk -> None, not an exception.
+    assert tab.extract_tds_text(b"PK\x03\x04" + b"\x00" * 48) is None
+
+
+def test_extract_tds_text_zip_without_tds_returns_none():
+    assert tab.extract_tds_text(_zip_bytes({"readme.txt": "no descriptor here"})) is None
+
+
+def test_extract_tds_text_picks_tds_among_multiple_members():
+    content = _zip_bytes({
+        "Data/extract.hyper": b"\x00\x01binary-extract",
+        "mydatasource.tds": SAMPLE_TDS,
+        "notes.txt": "ignore me",
+    })
+    text = tab.extract_tds_text(content)
+    assert text is not None and "<datasource" in text
+    assert any(s["table"] == "Orders" for s in tab.parse_tds(text)["sources"])
+
+
+def test_parse_tds_malformed_xml_is_graceful():
+    out = tab.parse_tds("<datasource><<not-xml <relation table='[dbo].[X]' </datasource")
+    assert set(out) == {"fields", "sources"}
+    assert isinstance(out["fields"], list) and isinstance(out["sources"], list)
+
+
+def test_parse_tds_none_and_empty_are_graceful():
+    for bad in (None, "", "   ", "<datasource/>"):
+        out = tab.parse_tds(bad)
+        assert out == {"fields": [], "sources": []}
+
+
+def test_parse_full_name_pathological_inputs_never_throw():
+    assert tab._parse_full_name("...") == ("", "", "")
+    assert tab._parse_full_name("[].[]") == ("", "", "")
+    assert tab._parse_full_name("a..b") == ("", "a", "b")
+    assert tab._parse_full_name("Orders.") == ("", "", "Orders")
+    assert tab._parse_full_name("   ") == ("", "", "")
+
+
+def test_shape_sources_skips_blank_table_and_dedupes():
+    upstream = [
+        {"name": "", "fullName": ""},  # no resolvable table -> dropped
+        {"name": "Orders", "schema": "dbo", "database": {"name": "DB"}, "connectionType": "sqlserver"},
+        {"name": "Orders", "schema": "dbo", "database": {"name": "DB"}, "connectionType": "sqlserver"},
+    ]
+    out = tab._shape_sources(upstream)
+    assert len(out) == 1
+    assert out[0]["table"] == "Orders"

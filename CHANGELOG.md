@@ -94,6 +94,18 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     `fullName`** when the Metadata API leaves them empty (common for cloud connectors), so the strict
     `(connector, database, table)` tier fires instead of dropping to the looser table-only signal.
     Comparison suite `82` → `90` tests. Skill `VERSION` `1.3.0` → `1.4.0`; collection `0.5.0` → `0.6.0`.
+  - **Durability test pass (resilience contract):** locked the comparison engine's graceful-degradation
+    behaviour against hostile / malformed / edge-case input with **+33 tests** (comparison suite `90` →
+    `123`): None-valued fields and sources, empty and tableau-only estates, malformed records, Unicode /
+    emoji / non-Latin names, determinism and input-order independence, a 120×120 estate, duplicate names
+    on both sides, and partial signal dicts; plus parser-resilience for CRLF/tab/blank-line and truncated
+    TMDL/M, very-long M input, bad-base64 / missing-`definition` payloads, corrupt and `.tds`-less ZIP
+    archives, malformed `.tds` XML, pathological `fullName`, and out-of-range / non-numeric usage counts.
+    Two small **additive** hardenings surfaced by the tests: Markdown table cells now neutralise `|` /
+    newlines in attacker-influenced names so a hostile name can't break the ranked-matches table, and the
+    adjudication apply path drops non-`dict` decision entries (`None` / strings / ints) instead of
+    raising. No report key renamed or removed; identical-asset scores unchanged. Skill `VERSION` `1.4.0`
+    → `1.4.1`; collection `0.6.0` → `0.6.1`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.

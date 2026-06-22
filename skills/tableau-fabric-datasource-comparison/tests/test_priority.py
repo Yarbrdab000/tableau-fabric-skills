@@ -175,6 +175,32 @@ def test_render_markdown_hides_priority_section_without_usage():
 
 
 # --------------------------------------------------------------------------------------
+# Durability: hostile / out-of-range usage counts and missing priority fields
+# --------------------------------------------------------------------------------------
+def test_usage_priority_negative_count_is_safe():
+    # A negative count is nonsensical but must not throw or land outside the defined labels.
+    assert priority.usage_priority(_usage(-5)) == "Unused"
+
+
+def test_usage_priority_float_and_huge_counts():
+    assert priority.usage_priority(_usage(3.0)) == "Medium"   # int(3.0) -> 3
+    assert priority.usage_priority(_usage(10_000_000)) == "High"
+    assert priority.usage_priority(_usage("7")) == "High"      # numeric string coerces
+
+
+def test_rebuild_worklist_tolerates_missing_priority_fields():
+    # Matches that never went through annotate() lack migration_priority/score -- sort must not raise.
+    result = {"matches": [
+        {"tableau_name": "A", "bucket": "rebuild"},
+        {"tableau_name": "B", "bucket": "partial", "score": 0.5,
+         "migration_priority": "P1 - migrate first"},
+        {"tableau_name": "C", "bucket": "already_exists"},
+    ]}
+    work = priority.rebuild_worklist(result)
+    assert [m["tableau_name"] for m in work] == ["B", "A"]  # already_exists excluded; B ranks first
+
+
+# --------------------------------------------------------------------------------------
 # Metadata downstream-usage parsing (the trusted primary source)
 # --------------------------------------------------------------------------------------
 def test_downstream_usage_metadata_parses_counts(monkeypatch):
