@@ -326,6 +326,37 @@ def _is_helper_table(token: str) -> bool:
     return "swap" in token
 
 
+# Source/lineage table names too generic to anchor a *containment* match on their own: custom-SQL
+# aliases, spreadsheet defaults, scratch/staging tables. A coverage match resting solely on these
+# gets no superset boost (it falls back to plain Jaccard), so a lone generic table shared with a
+# large consolidated model can never, by itself, manufacture an "already exists" verdict.
+_GENERIC_TABLE_TOKENS = frozenset(
+    {
+        "data", "table", "table1", "sheet", "sheet1", "export", "extract", "query",
+        "customsql", "dataset", "output", "results", "result", "temp", "tmp",
+        "staging", "stage", "raw", "import", "source", "main", "default",
+    }
+)
+
+
+def table_coverage(tab_tables: set, fab_tables: set) -> Tuple[float, list, bool]:
+    """Containment of a Tableau datasource's source tables within a Fabric model's tables.
+
+    Returns ``(coverage, shared_tables, distinctive)`` where ``coverage = |tab ∩ fab| / |tab|`` --
+    the fraction of the *datasource's* upstream tables present in the model. Unlike Jaccard this is
+    **not** diluted when one consolidated Fabric model unions many sources (the dominant migration
+    pattern): a datasource whose every upstream table lives in the model scores full coverage even
+    though the model is a strict superset. ``distinctive`` is False when the shared tables are only
+    generic names, so the caller can withhold the superset boost in that case.
+    """
+    if not tab_tables:
+        return 0.0, [], False
+    inter = tab_tables & fab_tables
+    coverage = len(inter) / len(tab_tables)
+    distinctive = any(t not in _GENERIC_TABLE_TOKENS for t in inter)
+    return coverage, sorted(inter), distinctive
+
+
 def _table_name_set(
     sources: Sequence[Dict[str, Any]], tables: Optional[Sequence[Any]] = None
 ) -> set:
@@ -403,13 +434,22 @@ def score_pair(
     tab_tables = _table_name_set(tableau_ds.get("sources", []))
     fab_tables = _table_name_set(fabric_model.get("sources", []), fabric_model.get("tables", []))
     source_comparable = bool(tab_tables) and bool(fab_tables)
+    coverage = 0.0
+    shared_tables: List[str] = []
     if source_comparable:
         strict_score = jaccard(tab_strict, fab_strict)
         loose_score = jaccard(tab_loose, fab_loose)
         # Table-only overlap is the durable cross-platform signal; weight it just under a loose match.
         table_score = jaccard(tab_tables, fab_tables)
+        # Containment: a model that *covers* all of the datasource's upstream tables is a real match
+        # even when it is a strict superset (one consolidated model serving many datasources) -- plain
+        # Jaccard would bury that as a partial. The superset boost applies only when a distinctive
+        # (non-generic) table is shared; otherwise we fall back to Jaccard so a lone generic table
+        # cannot carry it. ``cover_term >= table_score`` always, so existing scores never drop.
+        coverage, shared_tables, distinctive = table_coverage(tab_tables, fab_tables)
+        cover_term = coverage if distinctive else table_score
         source_score: Optional[float] = max(
-            strict_score, 0.85 * loose_score, 0.7 * table_score
+            strict_score, 0.85 * loose_score, 0.7 * cover_term
         )
     else:
         source_score = None
@@ -430,6 +470,8 @@ def score_pair(
         "signals": signals,
         "score": round(score, 4),
         "source_compared": source_comparable,
+        "source_coverage": round(coverage, 4) if source_comparable else None,
+        "shared_tables": shared_tables,
         "shared_columns": sorted(shared),
         "shared_column_count": len(shared),
     }
@@ -468,6 +510,7 @@ def reason_for(match: Dict[str, Any]) -> str:
         return "No Fabric model overlaps on name, columns, or source -- rebuild."
     sig = best.get("signals", {}) or {}
     name, col, src = sig.get("name") or 0.0, sig.get("column") or 0.0, sig.get("source")
+    shared_tbls = best.get("shared_tables") or []
     parts: List[str] = []
     if name >= 0.999:
         parts.append("exact name")
@@ -480,7 +523,12 @@ def reason_for(match: Dict[str, Any]) -> str:
     if src is None:
         parts.append("source obscured (name/columns only)")
     elif src >= 0.5:
-        parts.append("shared physical source")
+        if shared_tbls:
+            shown = ", ".join(shared_tbls[:3])
+            extra = f" +{len(shared_tbls) - 3} more" if len(shared_tbls) > 3 else ""
+            parts.append(f"shared source tables ({shown}{extra})")
+        else:
+            parts.append("shared physical source")
     elif src > 0:
         parts.append("partial source overlap")
     if not parts:
@@ -540,6 +588,8 @@ def compare_inventories(
                 "score": result["score"],
                 "signals": result["signals"],
                 "source_compared": result["source_compared"],
+                "source_coverage": result["source_coverage"],
+                "shared_tables": result["shared_tables"],
                 "shared_column_count": result["shared_column_count"],
             })
         scored.sort(key=lambda c: c["score"], reverse=True)

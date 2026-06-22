@@ -33,15 +33,34 @@ Physical-source overlap is the hardest signal because the same data is reached v
 platform. We compute three candidate scores and take the **maximum**:
 
 1. **Strict** — Jaccard over `(connector, database, table)` keys. Both sides agree on the catalog *and*
-   the table. Full credit.
+   the table. Full credit. When the Metadata API populates only a table's `fullName` (common for cloud
+   connectors), the missing `database` is recovered from it so this tier still fires instead of dropping
+   to a looser one.
 2. **Loose** — Jaccard over `(connector, table)` keys, weighted `× 0.85`. Same connector and table,
    different database name (dev vs prod, a renamed catalog).
-3. **Table-name** — Jaccard over **bare table names only**, weighted `× 0.70`. Connector- and
-   database-agnostic; this is the tier that survives a platform move.
+3. **Table-name containment** — over **bare table names only**, weighted `× 0.70`. Connector- and
+   database-agnostic; this is the tier that survives a platform move. Rather than a symmetric Jaccard it
+   uses **containment** — `coverage = |tab ∩ fab| / |tab|`, anchored on the *Tableau* side — so a
+   datasource whose every upstream table is present still scores full credit even when the Fabric model
+   is a strict **superset** (see below). The superset boost only applies when a *distinctive*
+   (non-generic) table is shared; an overlap of only generic names (`data`, `staging`, `export`, …)
+   falls back to plain Jaccard so a lone generic table cannot carry a match. `coverage ≥ Jaccard`
+   always, so this never lowers a previously-computed score.
 
 Connector strings are folded to canonical tokens first (`azure_sqldb`, `Microsoft SQL Server`, `mssql`
 → `sqlserver`; `postgresql` → `postgres`; `spark` → `databricks`; …) so SQL Server on the Tableau side
 lines up with `Sql.Database` on the Fabric side.
+
+### Why containment beats Jaccard — the consolidated model
+
+The dominant real migration pattern is **many Tableau datasources → one broad Fabric model**: a single
+semantic model unions a dozen source tables, and each Tableau datasource uses a handful of them. A
+symmetric Jaccard punishes this (a datasource using 2 of the model's 12 tables scores `2/12 ≈ 0.17`)
+and would mislabel a fully-covered datasource as "needs rebuild". Containment asks the migration
+question directly — *are all of this datasource's source tables already present in the model?* — so a
+2-of-2 overlap inside a 12-table model reads as full coverage. Each match also reports the actual
+`shared_tables` (and `source_coverage`), and the report's rationale names them, so the verdict is
+auditable rather than a bare number.
 
 ### Why the table-name tier exists — the lakehouse intermediary
 

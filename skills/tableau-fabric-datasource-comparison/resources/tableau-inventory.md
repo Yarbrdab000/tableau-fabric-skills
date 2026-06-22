@@ -22,7 +22,11 @@ For each datasource the GraphQL Metadata API returns:
 
 - **fields** — `name`, `dataType`, `role`, `isHidden` (hidden fields are dropped by default), paged via
   `fieldsConnection(first:, after:)` (the `first:` argument is **required** — the API 400s without it).
-- **upstreamTables** — `connectionType`, `database { name }`, `schema`, `name` → the physical source.
+- **upstreamTables** — `connectionType`, `database { name }`, `schema`, `name`, `fullName` → the physical
+  source. When `database`/`schema` come back empty but `fullName` is populated (common for cloud
+  connectors), they are recovered by parsing `fullName` (`[db].[schema].[table]` or dotted), so the
+  strict `(connector, database, table)` source tier fires instead of dropping to the looser table-only
+  signal.
 
 ### 2. `.tds` fallback (Catalog-independent)
 

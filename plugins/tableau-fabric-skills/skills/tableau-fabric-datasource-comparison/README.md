@@ -28,8 +28,10 @@ py -3.11 scripts/compare_estate.py --tableau-live --fabric-live --use-az --forma
 For every Tableau datasource it scores the best-matching Fabric semantic model on four signals —
 **name**, **column overlap**, **type compatibility**, and **physical source** — and assigns a tier
 (`Exact / Strong / Partial / Weak / None`). The source signal is connector-agnostic enough to survive a
-**Lakehouse intermediary** (Fabric reads a mirror; Tableau connects directly) and falls back gracefully
-when the upstream source is **obscured** (composite / DirectQuery models, referenced datasources).
+**Lakehouse intermediary** (Fabric reads a mirror; Tableau connects directly), uses table-name
+**containment** so a broad **consolidated** Fabric model that covers a datasource's tables matches at
+full strength, and falls back gracefully when the upstream source is **obscured** (composite /
+DirectQuery models, referenced datasources).
 
 When Tableau Catalog has not indexed a datasource, the Tableau inventory downloads that datasource's
 `.tds` (without its extract) and parses columns + relation tables — including **custom SQL**

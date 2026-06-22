@@ -81,9 +81,14 @@ The `source` signal takes the **best of three tiers**: a strict `(connector, dat
 looser `(connector, table)` match, and a **connector-agnostic table-name** match. The table-name tier
 is what catches the **lakehouse-intermediary** case — when a Fabric model reads from a Lakehouse/
 Warehouse that mirrors the primary source while Tableau connects to that source directly, the connector
-and database never line up and only the table names survive the move. When the physical source is
-**obscured on either side** (no resolvable table at all), the `source` signal is dropped and its weight
-is redistributed across name/column/type, so a genuine schema-level overlap is never buried.
+and database never line up and only the table names survive the move. That tier scores **containment**
+(`coverage = |tableau ∩ fabric| / |tableau|`), not symmetric Jaccard, so the common **consolidated
+model** — one broad Fabric model unioning many sources, each datasource using a few — is matched at full
+strength instead of being diluted to a partial; the matched `shared_tables` and `source_coverage` are
+reported so the verdict is auditable. (A generic-only table overlap gets no superset boost.) When the
+physical source is **obscured on either side** (no resolvable table at all), the `source` signal is
+dropped and its weight is redistributed across name/column/type, so a genuine schema-level overlap is
+never buried.
 
 ## Counting correctness & precision
 

@@ -80,6 +80,20 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     the source signal across a lakehouse intermediary. Identical-asset scores are unchanged (every exact
     match still scores `1.0`). Comparison suite `65` → `82` tests. Skill `VERSION` `1.2.0` → `1.3.0`;
     collection `0.4.0` → `0.5.0`.
+  - **Lineage-graph source matching (containment + table-name provenance):** all additive. The
+    connector-agnostic table-name tier now scores **containment** — `coverage = |tableau ∩ fabric| /
+    |tableau|`, anchored on the Tableau side — instead of a symmetric Jaccard, so a **consolidated**
+    Fabric model that *covers* all of a datasource's upstream tables matches at full strength even when
+    it is a strict superset (the dominant many-datasources→one-model migration pattern), where Jaccard
+    would have diluted it to a partial. The superset boost only applies when a **distinctive**
+    (non-generic) table is shared — a lone generic name (`data`/`staging`/`export`/…) falls back to
+    plain Jaccard — and `coverage ≥ Jaccard` always, so no previously-computed score drops (identical
+    assets still score `1.0`). Each candidate now exposes the matched `shared_tables` and
+    `source_coverage`, and the per-match `reason` **names the shared source tables**, making the source
+    verdict auditable. The Tableau inventory also **backfills `database`/`schema` from a table's
+    `fullName`** when the Metadata API leaves them empty (common for cloud connectors), so the strict
+    `(connector, database, table)` tier fires instead of dropping to the looser table-only signal.
+    Comparison suite `82` → `90` tests. Skill `VERSION` `1.3.0` → `1.4.0`; collection `0.5.0` → `0.6.0`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.

@@ -68,6 +68,8 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
 | `score` | float | this candidate's score `0..1` |
 | `signals` | object | `{name, column, type, source}` sub-scores; `source` is `null` when not comparable |
 | `source_compared` | bool | whether the source signal was measured for this candidate |
+| `source_coverage` | float \| null | containment of the datasource's upstream tables in this model: `|tab ∩ fab| / |tab|`; `null` when the source was not comparable (additive) |
+| `shared_tables` | array | normalised names of the upstream source tables shared by both sides (drives the source rationale; `[]` when none/obscured) (additive) |
 | `shared_column_count` | int | number of columns that overlap by normalised name |
 
 ## Example
@@ -97,7 +99,8 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
         "fabric_name": "Azure SQL - Superstore", "workspace": "Github-Testing-Workspace",
         "workspace_id": "....", "fabric_id": "....", "score": 0.83,
         "signals": {"name": 1.0, "column": 0.64, "type": 1.0, "source": 0.85},
-        "source_compared": true, "shared_column_count": 18
+        "source_compared": true, "source_coverage": 1.0, "shared_tables": ["orders", "returns"],
+        "shared_column_count": 18
       },
       "candidates": [ "..." ]
     }

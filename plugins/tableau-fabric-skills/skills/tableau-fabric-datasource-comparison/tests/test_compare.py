@@ -265,6 +265,88 @@ def test_helper_tables_excluded_from_table_name_signal():
     assert compare._table_name_set([], names) == {"orders"}
 
 
+# --------------------------------------------------------------------------------------
+# Lineage-graph: containment/coverage (a consolidated model that *covers* a datasource's
+# upstream tables is a real match, not a Jaccard-diluted partial) + shared-table explainability
+# --------------------------------------------------------------------------------------
+def test_table_coverage_anchors_on_the_tableau_side():
+    # 2 of the datasource's 2 tables live in a 5-table consolidated model -> full coverage,
+    # even though Jaccard would read 2/5 = 0.4.
+    cover, shared, distinctive = compare.table_coverage(
+        {"factsales", "dimcustomer"},
+        {"factsales", "dimcustomer", "dimdate", "dimproduct", "dimgeography"},
+    )
+    assert cover == 1.0
+    assert shared == ["dimcustomer", "factsales"]
+    assert distinctive is True
+
+
+def test_table_coverage_generic_only_overlap_is_not_distinctive():
+    # a lone generic table shared with a big model must not earn the superset boost
+    cover, shared, distinctive = compare.table_coverage({"data"}, {"data", "factsales", "dimdate"})
+    assert cover == 1.0
+    assert distinctive is False
+
+
+def test_consolidated_model_covering_all_tables_scores_strong_not_partial():
+    # THE migration pattern: one Fabric model unions many sources; a Tableau datasource whose every
+    # upstream table is present should read as "already exists", not a diluted partial.
+    ds = _ds(
+        "Regional Sales",
+        [{"name": "Sales", "dataType": "REAL"}, {"name": "Territory", "dataType": "STRING"}],
+        [
+            {"connectionType": "snowflake", "database": "ANALYTICS", "schema": "SALES", "table": "FactSales"},
+            {"connectionType": "snowflake", "database": "ANALYTICS", "schema": "SALES", "table": "DimTerritory"},
+        ],
+    )
+    big = _model(
+        "Enterprise Mart",
+        [{"name": "Sales", "dataType": "double"}, {"name": "Territory", "dataType": "string"}],
+        [
+            {"connectionType": "lakehouse", "database": "Gold", "schema": "dbo", "table": "FactSales"},
+            {"connectionType": "lakehouse", "database": "Gold", "schema": "dbo", "table": "DimTerritory"},
+            {"connectionType": "lakehouse", "database": "Gold", "schema": "dbo", "table": "DimDate"},
+            {"connectionType": "lakehouse", "database": "Gold", "schema": "dbo", "table": "DimProduct"},
+            {"connectionType": "lakehouse", "database": "Gold", "schema": "dbo", "table": "FactInventory"},
+        ],
+    )
+    res = compare.score_pair(ds, big)
+    # coverage = 2/2 = 1.0 -> 0.7 source (vs the old Jaccard 2/5=0.4 -> 0.28)
+    assert res["signals"]["source"] == round(0.7, 4)
+    assert res["source_coverage"] == 1.0
+    assert res["shared_tables"] == ["dimterritory", "factsales"]
+    assert compare.band_for(res["score"]) in ("Strong", "Exact")
+
+
+def test_score_pair_exposes_source_coverage_and_shared_tables():
+    ds = _ds("X", [], [{"connectionType": "sqlserver", "database": "P", "table": "Orders"}])
+    model = _model("X", [], [{"connectionType": "sqlserver", "database": "P", "table": "Orders"}])
+    res = compare.score_pair(ds, model)
+    assert res["source_coverage"] == 1.0
+    assert res["shared_tables"] == ["orders"]
+    # obscured source -> coverage is None, not 0.0, so the signal is dropped rather than penalised
+    obscured = _model("X", [], [{"connectionType": "databricks", "database": "", "table": ""}])
+    res2 = compare.score_pair(ds, obscured)
+    assert res2["source_coverage"] is None
+    assert res2["shared_tables"] == []
+
+
+def test_reason_for_names_the_shared_source_tables():
+    ds = _ds(
+        "Regional Sales",
+        [{"name": "Sales", "dataType": "REAL"}],
+        [{"connectionType": "snowflake", "database": "A", "table": "FactSales"}],
+    )
+    model = _model(
+        "Regional Sales",
+        [{"name": "Sales", "dataType": "double"}],
+        [{"connectionType": "lakehouse", "database": "G", "table": "FactSales"}],
+    )
+    result = compare.compare_inventories([ds], [model])
+    reason = result["matches"][0]["reason"]
+    assert "factsales" in reason
+
+
 def test_azure_sqldb_connector_folds_to_sqlserver():
     # the .tds connection class for Azure SQL is `azure_sqldb`; it must canonicalise to sqlserver so
     # strict/loose source keys line up with a Fabric model built on Sql.Database.

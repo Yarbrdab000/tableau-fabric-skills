@@ -375,6 +375,26 @@ def _split_schema_table(table_attr: str) -> Tuple[str, str]:
     return "", (table_attr or "").strip()
 
 
+def _parse_full_name(full: str) -> Tuple[str, str, str]:
+    """Split a Metadata API ``fullName`` into ``(database, schema, table)`` (blanks for missing parts).
+
+    Handles bracketed and dotted forms -- ``[Sales].[dbo].[Orders]``, ``Sales.dbo.Orders``,
+    ``analytics.public.fact_sales``, bare ``Orders``. The Metadata API sometimes populates only
+    ``fullName`` (common for cloud connectors) while leaving the discrete ``database`` empty;
+    recovering it lets the strict source tier fire instead of dropping to the looser table signal.
+    """
+    if not full:
+        return "", "", ""
+    toks = [(a or b).strip() for a, b in re.findall(r"\[([^\]]+)\]|([^.\[\]]+)", full)]
+    toks = [t for t in toks if t]
+    if not toks:
+        return "", "", ""
+    table = toks[-1]
+    schema = toks[-2] if len(toks) >= 2 else ""
+    database = toks[-3] if len(toks) >= 3 else ""
+    return database, schema, table
+
+
 # Custom-SQL (``<relation type='text'>``) FROM/JOIN table extraction. Best-effort: pulls the table
 # references out of an embedded SQL string so a custom-SQL datasource still yields a physical source
 # signal instead of an empty one. Mirrors the Fabric native-query extractor conceptually.
@@ -519,11 +539,12 @@ def _shape_sources(upstream_tables: List[Dict[str, Any]]) -> List[Dict[str, Any]
     for t in upstream_tables or []:
         db = t.get("database") or {}
         connector = t.get("connectionType") or db.get("connectionType") or ""
+        fq_db, fq_schema, fq_table = _parse_full_name(t.get("fullName") or "")
         src = {
             "connectionType": connector,
-            "database": db.get("name") or "",
-            "schema": t.get("schema") or "",
-            "table": t.get("name") or "",
+            "database": db.get("name") or fq_db or "",
+            "schema": t.get("schema") or fq_schema or "",
+            "table": t.get("name") or fq_table or "",
         }
         key = (src["connectionType"], src["database"], src["schema"], src["table"])
         if key in seen or not src["table"]:

@@ -159,3 +159,44 @@ def test_custom_sql_text_relations_nested_in_a_join_are_not_dropped():
     pairs = {(s["schema"], s["table"]) for s in tab.parse_tds(tds)["sources"]}
     assert ("dbo", "Orders") in pairs
     assert ("dbo", "Customers") in pairs
+
+
+# --------------------------------------------------------------------------------------
+# fullName backfill: recover database/schema/table when the Metadata API populates only fullName
+# --------------------------------------------------------------------------------------
+def test_parse_full_name_bracketed_dotted_and_bare():
+    assert tab._parse_full_name("[Sales].[dbo].[Orders]") == ("Sales", "dbo", "Orders")
+    assert tab._parse_full_name("analytics.public.fact_sales") == ("analytics", "public", "fact_sales")
+    assert tab._parse_full_name("[dbo].[Orders]") == ("", "dbo", "Orders")
+    assert tab._parse_full_name("Orders") == ("", "", "Orders")
+    assert tab._parse_full_name("") == ("", "", "")
+
+
+def test_shape_sources_backfills_database_from_full_name():
+    # Metadata API left database empty but populated fullName -- the strict source tier needs database.
+    upstream = [{
+        "name": "Orders",
+        "schema": "",
+        "fullName": "[ANALYTICS].[SALES].[Orders]",
+        "connectionType": "snowflake",
+        "database": {"name": "", "connectionType": "snowflake"},
+    }]
+    src = tab._shape_sources(upstream)[0]
+    assert src["database"] == "ANALYTICS"
+    assert src["schema"] == "SALES"
+    assert src["table"] == "Orders"
+
+
+def test_shape_sources_prefers_explicit_fields_over_full_name():
+    # explicit database/schema/table win; fullName only backfills what is missing.
+    upstream = [{
+        "name": "Orders",
+        "schema": "dbo",
+        "fullName": "[WRONG].[bad].[Nope]",
+        "connectionType": "sqlserver",
+        "database": {"name": "RealDB"},
+    }]
+    src = tab._shape_sources(upstream)[0]
+    assert src["database"] == "RealDB"
+    assert src["schema"] == "dbo"
+    assert src["table"] == "Orders"
