@@ -106,6 +106,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     adjudication apply path drops non-`dict` decision entries (`None` / strings / ints) instead of
     raising. No report key renamed or removed; identical-asset scores unchanged. Skill `VERSION` `1.4.0`
     → `1.4.1`; collection `0.6.0` → `0.6.1`.
+  - **Empirical verification (`--verify`, Tier-2, opt-in/advisory):** promotes a match from "looks the
+    same (schema/lineage)" to "the **data** agrees" by running read-only **aggregate** probes on both
+    sides (Tableau **VizQL Data Service** + Fabric **`executeQueries`** DAX) and checking they line up.
+    Built around **windowed-overlap agreement** so it is not fooled by volume: it `MIN`/`MAX`es a shared
+    date/numeric key to find each side's range and their **common overlap window**, then compares
+    `SUM`/`DISTINCTCOUNT` **only inside that overlap** — so a Fabric model with extra history (e.g.
+    2019–2026 vs Tableau 2021–2026) **verifies** instead of looking like a mismatch. Verdicts:
+    `verified` / `compatible` (one-side-superset, no window column) / `mismatch` (overlap disagrees or
+    ranges disjoint) / `inconclusive`. Adds `match.verification` + `match.verification_note` and a
+    `summary.verification` rollup, plus a new "Empirical verification" report section — all **additive**;
+    the deterministic tier/score/bucket are never changed (a `mismatch` is advisory). New CLI flags
+    `--verify`, `--verify-top-n` (10), `--verify-max-cols` (4), `--verify-rtol` (0.01), and
+    `--powerbi-token` / `POWERBI_TOKEN` (a **distinct** Power BI audience from the Fabric token; or
+    `--use-az` mints it). Read-only and aggregate-only — no row-level data leaves either platform; needs
+    live Tableau and degrades gracefully (cached inventory, missing token, 404/429/401/403/paused
+    capacity → *skipped*/*inconclusive*). New `resources/empirical-verification.md`; comparison suite
+    `123` → `171` tests. Skill `VERSION` `1.4.1` → `1.5.0`; collection `0.6.1` → `0.7.0`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.

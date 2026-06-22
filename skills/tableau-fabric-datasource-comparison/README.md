@@ -76,6 +76,7 @@ tableau-fabric-datasource-comparison/
     comparison-methodology.md
     llm-adjudication.md
     migration-priority.md
+    empirical-verification.md
     fabric-introspection.md
     tableau-inventory.md
     report-schema.md

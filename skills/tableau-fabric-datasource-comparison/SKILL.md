@@ -140,6 +140,37 @@ the assets that matter are catalogued) and uses a thin REST workbook-connection 
 not-yet-indexed tail. `--usage {auto,metadata,rest,off}` selects the strategy. Full method:
 `resources/migration-priority.md`.
 
+## Empirical verification (`--verify`) — does the *data* agree?
+
+Everything above reasons from **metadata** (names, columns, types, lineage). That is strong, but it
+can't tell a same-shape / different-data pair apart from a true match. `--verify` adds an opt-in,
+advisory **Tier-2** layer that *probes the values*: for the most-comparable confident/partial matches
+it runs a handful of **read-only aggregate** queries on **both** sides (Tableau **VizQL Data Service**
++ Fabric **`executeQueries`** DAX) and checks the answers line up — promoting a match from "looks the
+same" to "the data agrees," and catching false positives a human would otherwise have to chase.
+
+The catch it is built around: **you cannot compare unbounded totals as equality.** A Fabric model
+holding 2019–2026 and a Tableau datasource holding 2021–2026 are the **same** source — Fabric simply
+carries more history — yet `SUM(Sales)` / `COUNT` / `DISTINCTCOUNT` legitimately differ. So instead of
+naive equality, `--verify` uses **windowed-overlap agreement**:
+
+1. **Establish each side's range** — `MIN`/`MAX` a shared **date** (preferred) or **numeric** key
+   column, then compute the common **overlap window** and classify the relationship (*equal / subset /
+   superset / partial / disjoint*).
+2. **Compare only inside the overlap** — windowed `SUM` / `DISTINCTCOUNT` on both sides. On the shared
+   slice the same dataset agrees within tolerance regardless of how much extra history either side
+   carries. `MIN`/`MAX` only *establish* the window; they are never pass/fail checks.
+3. **Superset is a PASS, not a mismatch** — `verified` (the overlap agrees, whatever the nesting),
+   `compatible` (no shared time/key column to window on, but the raw totals are consistent with one
+   side being a superset), `mismatch` (the overlap genuinely disagrees, or the ranges are disjoint),
+   `inconclusive` (nothing comparable ran). A `mismatch` is **advisory** — it flags a pair for a human
+   and never changes the deterministic tier/score.
+
+Verification needs **live Tableau** (VDS) and a **second token** for Power BI `executeQueries`
+(audience `https://analysis.windows.net/powerbi/api`, distinct from the Fabric API token) — pass
+`--powerbi-token`, set `POWERBI_TOKEN`, or let `--use-az` mint it. Every probe is a single scalar
+aggregate; **no row-level data** leaves either platform. Full model: `resources/empirical-verification.md`.
+
 ## Usage
 
 ```powershell
@@ -180,6 +211,11 @@ Each inventory script also runs standalone (`tableau_inventory.py`, `fabric_inve
 - `--save-adjudication PATH` — write the agent adjudication queue (the review handoff) as JSON.
 - `--apply-adjudication PATH` — fold an agent-verdicts JSON back in as advisory annotations (the
   deterministic tier/score are never changed); see `resources/llm-adjudication.md`.
+- `--verify` — empirically verify the top matches (read-only aggregate probes on both sides, compared
+  on their overlapping data window); requires `--tableau-live` and a Power BI token. Tune with
+  `--verify-top-n` (default 10), `--verify-max-cols` (default 4), `--verify-rtol` (default 0.01).
+- `--powerbi-token` / `POWERBI_TOKEN` — Power BI token for `executeQueries` (else `--use-az` mints it);
+  a distinct audience from the Fabric token. See `resources/empirical-verification.md`.
 - `--weights`, `--top-n`, `--format {md,json}`, `--out`, `--max-models`,
   `--save-tableau-inventory`, `--save-fabric-inventory`.
 
@@ -195,6 +231,8 @@ A Markdown (or JSON) report — see `resources/report-schema.md`:
   (renamed columns, obscured source, near tie, …) for an LLM-optional semantic review.
 - **Migration priority**: the rebuild/partial set ranked P1 → P4 by downstream usage, plus a
   by-migration-priority rollup (omitted when usage was not gathered).
+- **Empirical verification** (only with `--verify`): a `verified / compatible / mismatch / inconclusive`
+  rollup and a per-pair table, each row noting whether the data agreed on the shared overlap window.
 - **Recommended actions**: grouped by tier, pointing the rebuild set at the `tableau-migration` skill.
 
 After an `--apply-adjudication` pass the report also shows an **After semantic review** rollup
@@ -207,7 +245,9 @@ unchanged.
   scanner backs off on 429 and supports `--max-models`. Cache inventories to JSON so scoring re-runs
   need no network.
 - **Heuristic, not authoritative.** Scores rank likely overlap; a human verifies before reuse. Tune
-  weights/bands per estate (`resources/comparison-methodology.md`).
+  weights/bands per estate (`resources/comparison-methodology.md`). `--verify` raises confidence by
+  checking the data agrees, but it is still **advisory** and aggregate-only — a `mismatch` flags a pair
+  for review, it does not change the deterministic verdict.
 - **Connector coverage** centers on the connectors the migration skill handles (SQL Server / Azure SQL,
   Snowflake, Postgres, Databricks, BigQuery, Redshift) plus Fabric-native sources (Lakehouse, Warehouse,
   Dataflow) and Excel/CSV, and resolves tables from native-SQL `Value.NativeQuery` and Tableau custom

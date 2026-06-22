@@ -955,6 +955,7 @@ def render_markdown(result: Dict[str, Any]) -> str:
     lines.append("")
     _render_contested(result, lines)
     _render_coverage(result, lines)
+    _render_verification(result, lines)
     lines.append("## Recommended actions")
     lines.append("")
     reasons = {m["tableau_name"]: m.get("reason") for m in result["matches"]}
@@ -973,6 +974,63 @@ def render_markdown(result: Dict[str, Any]) -> str:
     _render_priority_worklist(result, lines)
     _render_adjudication(result, lines)
     return "\n".join(lines).rstrip() + "\n"
+
+
+# Empirical-verification rendering (Tier-2, additive). Present only when --verify ran; otherwise
+# every line below is skipped and the deterministic report is byte-for-byte unchanged.
+_VERIFICATION_VERDICT_LABEL = {
+    "verified": "Verified",
+    "compatible": "Compatible",
+    "mismatch": "MISMATCH",
+    "inconclusive": "Inconclusive",
+}
+
+
+def _render_verification(result: Dict[str, Any], lines: List[str]) -> None:
+    v = (result.get("summary") or {}).get("verification")
+    if not v:
+        return
+    lines.append("## Empirical verification")
+    lines.append("")
+    if not v.get("enabled"):
+        reason = v.get("reason") or "not run"
+        lines.append(f"_Requested but skipped: {_cell(str(reason))}._")
+        lines.append("")
+        return
+    lines.append(
+        "Read-only aggregate probes were run on **both** sides over each pair's shared columns and "
+        "compared on their **overlapping data window**, so a Fabric superset (more history) still "
+        "verifies rather than looking like a mismatch."
+    )
+    lines.append("")
+    lines.append(
+        f"Attempted {v.get('attempted', 0)} -- "
+        f"verified={v.get('verified', 0)}, compatible={v.get('compatible', 0)}, "
+        f"mismatch={v.get('mismatch', 0)}, inconclusive={v.get('inconclusive', 0)} "
+        f"({v.get('probes_run', 0)} probe(s) run)."
+    )
+    lines.append("")
+    rows = [m for m in result.get("matches", []) if m.get("verification")]
+    if rows:
+        lines.append("| Tableau datasource | Fabric match | Verdict | Detail |")
+        lines.append("|---|---|---|---|")
+        for m in rows:
+            mv = m.get("verification") or {}
+            best = m.get("best_match") or {}
+            verdict = _VERIFICATION_VERDICT_LABEL.get(mv.get("verdict"), mv.get("verdict") or "?")
+            note = m.get("verification_note") or ""
+            lines.append(
+                f"| {_cell(m.get('tableau_name') or '')} | {_cell(best.get('fabric_name') or '')} | "
+                f"{verdict} | {_cell(note)} |"
+            )
+        lines.append("")
+    if v.get("mismatch"):
+        lines.append(
+            "> A **MISMATCH** means the data disagreed on the shared window (or the ranges were "
+            "disjoint). It is advisory -- the deterministic tier is unchanged -- but it flags a "
+            "pair a human should confirm before reusing the Fabric model."
+        )
+        lines.append("")
 
 
 # Migration-priority rendering. Both helpers are guarded -- when usage was not gathered

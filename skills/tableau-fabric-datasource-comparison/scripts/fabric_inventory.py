@@ -41,6 +41,11 @@ except ImportError:  # pragma: no cover - exercised via flat script execution
 FABRIC_BASE = "https://api.fabric.microsoft.com"
 FABRIC_RESOURCE = "https://api.fabric.microsoft.com"
 
+# Power BI REST is a *distinct* audience from the Fabric API and needs its own token; it serves the
+# read-only ``executeQueries`` (DAX) endpoint used by the optional empirical-verification layer.
+POWERBI_BASE = "https://api.powerbi.com"
+POWERBI_RESOURCE = "https://analysis.windows.net/powerbi/api"
+
 _GUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -96,6 +101,49 @@ def _http(
         except ValueError:
             parsed = raw
         return exc.code, dict(exc.headers), parsed
+
+
+def acquire_powerbi_token(explicit: Optional[str] = None, use_az: bool = False) -> str:
+    """Resolve a Power BI bearer token (a *distinct* audience from the Fabric token).
+
+    Used only by the optional empirical-verification layer for the read-only ``executeQueries``
+    (DAX) endpoint. Resolution order: ``--powerbi-token`` > ``POWERBI_TOKEN`` > (optional) Azure CLI.
+    """
+    if explicit:
+        return explicit
+    if os.environ.get("POWERBI_TOKEN"):
+        return os.environ["POWERBI_TOKEN"]
+    if use_az:
+        out = subprocess.run(
+            ["az", "account", "get-access-token", "--resource", POWERBI_RESOURCE,
+             "--query", "accessToken", "-o", "tsv"],
+            capture_output=True, text=True, shell=(os.name == "nt"),
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+        raise RuntimeError(f"az Power BI token acquisition failed: {out.stderr.strip()}")
+    raise RuntimeError(
+        "no Power BI token; pass --powerbi-token, set POWERBI_TOKEN, or use --use-az"
+    )
+
+
+def execute_dax(
+    pbi_token: str,
+    workspace_id: str,
+    dataset_id: str,
+    dax: str,
+    base_url: str = POWERBI_BASE,
+    timeout: int = 120,
+) -> Tuple[int, Any]:
+    """Run one read-only DAX query via Power BI ``executeQueries``. Returns ``(status, payload)``.
+
+    Aggregate-only by construction (the caller passes a single ``EVALUATE ROW(...)`` scalar query);
+    no row-level data is requested. The caller degrades any non-200 to an *inconclusive* probe.
+    """
+    url = f"{base_url}/v1.0/myorg/groups/{workspace_id}/datasets/{dataset_id}/executeQueries"
+    body = {"queries": [{"query": dax}], "serializerSettings": {"includeNulls": True}}
+    status, _headers, payload = _http("POST", url, pbi_token, body, timeout=timeout)
+    return status, payload
 
 
 def _paged_get(url: str, token: str, timeout: int = 120) -> List[dict]:

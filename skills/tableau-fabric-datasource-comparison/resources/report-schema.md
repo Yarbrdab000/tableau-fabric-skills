@@ -178,3 +178,34 @@ agent can adjudicate without re-pulling either inventory. Categories: `near_tie`
   delta:{…}}` — the rollup **after** semantic review, with the delta versus the deterministic count.
 - The deterministic `summary` and each row's `tier` / `score` / `bucket` are **unchanged**; the two
   rollups sit side by side.
+
+## `verification` (empirical `--verify`, opt-in/advisory)
+
+When `--verify` runs, the top confident/partial matches are probed on both sides and checked on their
+**overlapping data window** (so a Fabric superset still verifies). All keys are **additive**; the
+deterministic tier / score / bucket are never changed. Full model in
+[`empirical-verification.md`](empirical-verification.md).
+
+| Key | Type | Meaning |
+|---|---|---|
+| `summary.verification.enabled` | bool | `true` when probes ran; `false` + `reason` when skipped (e.g. cached Tableau, no Power BI token) |
+| `summary.verification.attempted` | int | matches verification was attempted on |
+| `summary.verification.verified` | int | overlap probes agreed (relationship may be equal/subset/superset) |
+| `summary.verification.compatible` | int | no shared window column, but raw totals consistent with one-side-superset |
+| `summary.verification.mismatch` | int | overlap disagreed, or ranges were disjoint (advisory flag) |
+| `summary.verification.inconclusive` | int | nothing comparable ran |
+| `summary.verification.probes_run` | int | total aggregate probes issued across both sides |
+| `summary.verification.top_n` / `max_cols` / `rtol` | scalar | the run's bounds/tolerance |
+
+Each verified `matches[]` row gains:
+
+- `verification` — `{verdict, method, relationship, window_column, range, probes_run, probes_agreed,
+  probes_disagreed, probes_inconclusive, agreement, probes:[…], notes:[…]}`. `verdict` is
+  `verified` / `compatible` / `mismatch` / `inconclusive`; `method` is `windowed` or `containment`;
+  `relationship` is `equal` / `subset` / `superset` / `partial` / `disjoint`; each `probes[]` entry is
+  `{column, function, tableau, fabric, windowed, outcome}`.
+- `verification_note` — a one-line human summary (e.g. *"empirically verified (2/2 overlap probes
+  agree; Fabric is a superset)"* or *"VERIFY MISMATCH — SUM(sales) on overlap: …"*).
+
+Clear `rebuild` matches are skipped (nothing to verify); the deterministic verdict is authoritative.
+

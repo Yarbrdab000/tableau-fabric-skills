@@ -238,6 +238,27 @@ class TableauClient:
             raise TableauError(f"Metadata API errors: {json.dumps(payload['errors'])[:500]}")
         return (payload or {}).get("data", {}) or {}
 
+    # -- vizql data service (empirical verification) ----------------------------------
+    def vds_query(self, luid: str, query: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        """Run one read-only VizQL Data Service aggregate query against a published datasource.
+
+        Returns the ``data`` array (one row per clean aggregate), ``None`` when VDS is disabled /
+        unavailable (HTTP 404, i.e. Tableau < 2025.1 or the feature off), and raises on a rate limit
+        (429) or other error so the caller can degrade the probe to *inconclusive*.
+        """
+        url = f"{self.server}/api/v1/vizql-data-service/query-datasource"
+        body = {"datasource": {"datasourceLuid": luid}, "query": query}
+        status, payload = self._request("POST", url, self._auth_headers(), body)
+        if status == 404:
+            return None
+        if status == 429:
+            raise TableauError("VizQL Data Service rate limit hit (429).")
+        if status != 200:
+            raise TableauError(f"VDS query failed ({status}): {str(payload)[:300]}")
+        if isinstance(payload, dict) and payload.get("error"):
+            raise TableauError(f"VDS query error: {str(payload['error'])[:300]}")
+        return (payload or {}).get("data", []) if isinstance(payload, dict) else []
+
     def datasource_detail(self, luid: str, page_size: int = 500) -> Optional[Dict[str, Any]]:
         """Fields + upstream physical tables for one datasource (fields paged)."""
         after: Optional[str] = None
