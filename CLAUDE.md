@@ -29,7 +29,7 @@ Canonical sources live in `skills/<name>/`; byte-identical mirror copies live in
   no heredocs (write a temp file). Use `py -3.11` (a bare `py` lacks pytest). Read BOM files as
   `utf-8-sig`; write JSON manifests as UTF-8 without a BOM.
 - **Tests:** `cd skills\tableau-migration; py -3.11 -m pytest tests -q` must stay green
-  (baseline 950 passed / 1 skipped / 2 xfailed). Report-schema changes are **additive only** —
+  (baseline 956 passed / 1 skipped / 1 xfailed). Report-schema changes are **additive only** —
   never rename or remove existing keys.
 - **Fractal mirror:** after editing any `skills/<name>/` file, re-mirror it into
   `plugins/tableau-fabric-skills/skills/<name>/` with `robocopy /MIR` (excluding `__pycache__`,
