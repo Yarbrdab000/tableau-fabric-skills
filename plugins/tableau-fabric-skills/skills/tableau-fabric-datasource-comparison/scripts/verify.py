@@ -138,6 +138,7 @@ def _index_fields(fields: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, str]]
             "name": f.get("name") or "",
             "dataType": f.get("dataType") or f.get("type") or "",
             "table": f.get("table") or "",
+            "role": str(f.get("role") or "").strip().lower(),
         }
     return out
 
@@ -183,7 +184,13 @@ def plan_probes(
             "kind": kind,
         }
         cols_used += 1
-        if kind in ("date", "numeric"):
+        # A window axis must be a stable *dimension*. Never range on an additive **measure**
+        # (e.g. ``Sales``): filtering a measure by its own MIN/MAX overlap is self-referential and
+        # would flag a pure Fabric superset (same data, just more rows) as a false ``mismatch``.
+        # Dates and numeric dimensions (year / key / id) stay valid axes; when only measures are
+        # shared we fall back to the conservative containment verdict instead of a bogus window.
+        is_measure = tcol.get("role") == "measure"
+        if kind == "date" or (kind == "numeric" and not is_measure):
             window_candidates.append(ref)
         # Equality signal: SUM only makes sense for a numeric measure; distinct count for anything.
         if kind == "numeric":

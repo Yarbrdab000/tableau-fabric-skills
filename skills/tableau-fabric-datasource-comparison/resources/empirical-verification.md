@@ -20,9 +20,9 @@ are **not invariant** under subset/superset, so they cannot be compared as equal
 
 ## What we do instead: windowed-overlap agreement
 
-1. **Establish each side's range.** `MIN` / `MAX` a shared **date** (preferred) or **numeric** key
-   column on both sides. From the four bounds, compute the **common overlap window** and classify the
-   relationship:
+1. **Establish each side's range.** `MIN` / `MAX` a shared **date** (preferred) or **numeric**
+   *dimension* (year / key / id) on both sides. From the four bounds, compute the **common overlap
+   window** and classify the relationship:
 
    | Relationship | Meaning |
    |---|---|
@@ -31,6 +31,14 @@ are **not invariant** under subset/superset, so they cannot be compared as equal
    | `superset` | Tableau's range contains Fabric's |
    | `partial`  | the ranges overlap but neither contains the other |
    | `disjoint` | the ranges do **not** overlap at all |
+
+   A window axis must be a stable **dimension**. An additive **measure** (e.g. `Sales`) is never used
+   as an axis: ranging a measure by its own `MIN`/`MAX` and then filtering its `SUM` to that overlap is
+   self-referential and would flag a pure Fabric superset (same data, just more rows) as a false
+   `mismatch`. The Tableau Metadata-API `role` drives this — `role == "measure"` columns are excluded
+   from window candidacy (but still compared as `SUM` equality probes *inside* whatever window a
+   dimension establishes). When the only shared numeric columns are measures, no window is established
+   and we drop to the conservative **containment** read below instead of a bogus window.
 
 2. **Compare equality probes only inside the overlap.** Windowed `SUM` (numeric measures) and
    `DISTINCTCOUNT` (any shared column) on both sides, filtered to the overlap window. On that shared

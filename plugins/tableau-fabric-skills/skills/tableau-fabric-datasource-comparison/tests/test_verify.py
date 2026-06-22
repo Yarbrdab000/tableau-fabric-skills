@@ -150,6 +150,58 @@ def test_plan_probes_caps_at_max_cols_distinctive_first():
     assert "id" not in used  # generic token deprioritised, distinctive column kept
 
 
+def test_plan_probes_excludes_numeric_measure_from_window():
+    # A numeric *measure* must never be a window axis (self-referential filtering); a numeric
+    # *dimension* (e.g. a year key) is a valid fallback axis. Both still get equality probes.
+    ds = _ds([
+        {"name": "Sales", "dataType": "REAL", "role": "measure"},
+        {"name": "Fiscal Year", "dataType": "INTEGER", "role": "dimension"},
+    ])
+    model = _model([
+        {"name": "Sales", "dataType": "double", "table": "Orders"},
+        {"name": "Fiscal Year", "dataType": "int64", "table": "Orders"},
+    ])
+    plan = plan_probes(ds, model)
+    win_cols = {c["column"] for c in plan["window_candidates"]}
+    assert win_cols == {"fiscalyear"}                  # measure excluded, dimension kept
+    funcs = {(p["column"], p["function"]) for p in plan["equality_probes"]}
+    assert ("sales", FUNC_SUM) in funcs                 # measure still summed within the window
+
+
+def test_plan_probes_measure_only_yields_no_window():
+    # When every shared numeric column is a measure, establish no window -> safe containment mode
+    # rather than a bogus self-referential window that could flag a Fabric superset as a mismatch.
+    ds = _ds([
+        {"name": "Sales", "dataType": "REAL", "role": "measure"},
+        {"name": "Profit", "dataType": "REAL", "role": "measure"},
+    ])
+    model = _model([
+        {"name": "Sales", "dataType": "double", "table": "Orders"},
+        {"name": "Profit", "dataType": "double", "table": "Orders"},
+    ])
+    plan = plan_probes(ds, model)
+    assert plan["window_candidates"] == []
+    assert {(p["column"], p["function"]) for p in plan["equality_probes"]} >= {
+        ("sales", FUNC_SUM), ("profit", FUNC_SUM)}
+
+
+def test_measure_only_superset_is_compatible_not_false_mismatch():
+    # End-to-end of the user's scenario: same datasource, Fabric just has more rows, and the only
+    # shared numeric column is the measure SUM(Sales). With measures barred as window axes we drop
+    # to containment, where a one-directional volume difference reads "compatible" -- never a
+    # mismatch. (Had Sales been used as a window axis, the windowed sums could falsely disagree.)
+    ds = _ds([{"name": "Sales", "dataType": "REAL", "role": "measure"}])
+    model = _model([{"name": "Sales", "dataType": "double", "table": "Orders"}])
+    plan = plan_probes(ds, model)
+    assert plan["window_candidates"] == []
+    t = make_tableau_probe({("SUM", "Sales", False): 1000})
+    f = make_fabric_probe({("SUM", "Sales", False): 1500})  # Fabric superset
+    v = verify_match("t-1", "w-1", "m-1", plan, t, f)
+    assert v["verdict"] == "compatible"
+    assert v["method"] == "containment"
+    assert v["probes_disagreed"] == 0
+
+
 # ======================================================================================
 # request builders + envelope parsers
 # ======================================================================================

@@ -148,6 +148,19 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     `(value, error)` mapping and the `reason_code` triggers (`fabric_no_data` vs `fabric_unreadable`)
     are regression-locked without a live tenant. Tests only — no behavior or schema change. Comparison
     suite `178` → `203` tests. Skill `VERSION` `1.5.1` → `1.5.2`; collection `0.7.1` → `0.7.2`.
+  - **Empirical verification — measures are never used as a window axis (false-mismatch fix):** an
+    additive **measure** (e.g. `Sales`) is no longer eligible as the `MIN`/`MAX` overlap-window axis.
+    Ranging a measure by its own bounds and then filtering its `SUM` to that overlap is
+    self-referential and could flag a pure Fabric superset (the *same* datasource, just more rows) as a
+    false `mismatch` — exactly the "same data, more history" trap windowing exists to avoid. Window
+    candidacy is now gated on the Tableau Metadata-API `role`: `role == "measure"` columns are excluded
+    as axes (dates and numeric *dimensions* — year / key / id — remain valid axes), while measures are
+    still compared as `SUM` equality probes *inside* whatever window a dimension establishes. When only
+    measures are shared, no window is built and verification drops to the conservative **containment**
+    read (which never emits a `mismatch` from magnitude alone) instead of a bogus self-referential
+    window. All **additive** — no key renamed/removed; deterministic tier/score/bucket unchanged.
+    Comparison suite `203` → `206` tests. Skill `VERSION` `1.5.2` → `1.5.3`; collection `0.7.2` →
+    `0.7.3`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.
