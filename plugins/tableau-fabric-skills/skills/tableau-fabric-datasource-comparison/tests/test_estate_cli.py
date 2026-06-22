@@ -37,6 +37,48 @@ def test_estate_cli_cached_json_writes_json_report(tmp_path):
     assert result["matches"][0]["tier"] == "Exact"
 
 
+def test_estate_cli_writes_executive_csv_and_xlsx(tmp_path):
+    import csv as _csv
+    import io as _io
+    import zipfile
+
+    tableau = [{
+        "name": "Superstore", "project": "Samples", "luid": "t-1",
+        "fields": [{"name": "Sales", "dataType": "REAL"}, {"name": "Region", "dataType": "STRING"}],
+        "sources": [{"connectionType": "sqlserver", "database": "SalesDB", "table": "Orders"}],
+    }]
+    fabric = [{
+        "name": "Superstore", "workspace": "WS", "workspaceId": "w-1", "id": "m-1",
+        "tables": ["Orders"],
+        "columns": [{"name": "Sales", "dataType": "double"}, {"name": "Region", "dataType": "string"}],
+        "sources": [{"connectionType": "sqlserver", "database": "SalesDB", "table": "Orders"}],
+    }]
+    t_json = _write(tmp_path, "tableau.json", tableau)
+    f_json = _write(tmp_path, "fabric.json", fabric)
+    out = tmp_path / "result.json"
+    csv_path = tmp_path / "estate.csv"
+    xlsx_path = tmp_path / "estate.xlsx"
+
+    rc = compare_estate.main([
+        "--tableau-inventory-json", t_json,
+        "--fabric-inventory-json", f_json,
+        "--format", "json", "--out", str(out),
+        "--export-csv", str(csv_path),
+        "--export-xlsx", str(xlsx_path),
+    ])
+    assert rc == 0
+
+    rows = list(_csv.reader(_io.StringIO(csv_path.read_text(encoding="utf-8-sig"))))
+    assert rows[0][0] == "Tableau datasource"
+    assert any(r and r[0] == "Superstore" for r in rows[1:])
+
+    raw = xlsx_path.read_bytes()
+    assert raw[:2] == b"PK"
+    zf = zipfile.ZipFile(_io.BytesIO(raw))
+    assert zf.testzip() is None
+    assert "xl/worksheets/sheet1.xml" in zf.namelist()
+
+
 def test_parse_weights_merges_overrides():
     w = compare_estate._parse_weights("name=0.5,source=0.1")
     assert w["name"] == 0.5

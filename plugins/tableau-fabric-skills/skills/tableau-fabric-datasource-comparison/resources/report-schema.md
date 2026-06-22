@@ -247,4 +247,43 @@ datasource carries calculated fields; otherwise the report is byte-for-byte unch
 > or a `<calculation>` child in the `.tds` fallback); the Fabric side carries model-level `measures`
 > (names) parsed from TMDL.
 
+## Executive export (`--export-csv` / `--export-xlsx`)
+
+These flags render the **same** finished report (whatever layers ran — verification, adjudication,
+logic-parity) into share-ready artifacts. They are **read-only over the report and purely additive** —
+they never alter any key above. Standard-library only (the `.xlsx` is hand-assembled OOXML; no
+`openpyxl` / `pandas`).
+
+**CSV** (`--export-csv`) — one rectangular table, one row per Tableau datasource (the analyst pivot
+source), written UTF-8 **with BOM** so Excel auto-detects the encoding. **XLSX** (`--export-xlsx`) — a
+three-sheet workbook (`Summary`, `Datasources`, `Fabric coverage`). The CSV and the workbook's
+`Datasources` sheet share these columns, in this order:
+
+| Column | Source key | Notes |
+|---|---|---|
+| `Tableau datasource` | `matches[].tableau_name` | |
+| `Project` | `matches[].project` | |
+| `Verdict` | `matches[].bucket` | friendly label: `Already in Fabric` / `Partial overlap` / `Needs rebuild` |
+| `Tier` | `matches[].tier` | `Exact … None` |
+| `Score` | `matches[].score` | numeric (sorts as a real number in Excel) |
+| `Best Fabric match` | `matches[].best_match.fabric_name` | blank when nothing scored |
+| `Fabric workspace` | `matches[].best_match.workspace` | |
+| `Source compared` | `matches[].source_compared` | `Yes` / `No` |
+| `Shared columns` | `matches[].best_match.shared_column_count` | |
+| `Usage (workbooks)` | `matches[].usage.workbook_count` | blank when usage not gathered |
+| `Priority` | `matches[].priority` | |
+| `Migration priority` | `matches[].migration_priority` | |
+| `Logic parity` | `matches[].logic_parity.status` | `none / likely / partial / unverified` |
+| `Calc fields` | `matches[].logic_parity.tableau_calc_count` | |
+| `Calcs matched as measures` | `matches[].logic_parity.matched` | |
+| `Verification` | `matches[].verification.verdict` | present only after `--verify` |
+| `Reason` | `matches[].reason` | one-line deterministic explanation |
+
+The XLSX **`Summary`** sheet is the estate-sizing headline (a `Metric` / `Value` list): datasource and
+model totals, already-in-Fabric / partial / needs-rebuild counts **with percentages**,
+`distinct_fabric_matched`, the one-to-one assignment counts, net-new Fabric models, the logic-parity
+`review_needed` count, and the `by_tier` / `by_migration_priority` / verification breakdowns (each
+rendered only when present). The **`Fabric coverage`** sheet lists
+`summary.fabric_coverage.unmatched_model_names` (`Fabric model`, `Workspace`).
+
 

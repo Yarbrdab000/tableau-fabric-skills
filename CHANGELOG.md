@@ -177,6 +177,20 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     datasource has calculated fields; otherwise output is byte-for-byte unchanged. All **additive** — no
     key renamed/removed; deterministic tier/score/bucket unchanged. Comparison suite `206` → `218` tests.
     Skill `VERSION` `1.5.3` → `1.5.4`; collection `0.7.3` → `0.7.4`.
+  - **Executive CSV / XLSX export (`--export-csv` / `--export-xlsx`) — share the result outside the
+    terminal:** the finished report (whatever layers ran — verification, adjudication, logic-parity) now
+    renders to two share-ready artifacts via a new `scripts/export.py` (**standard-library only** — the
+    `.xlsx` is hand-assembled OOXML / SpreadsheetML, no `openpyxl` / `pandas` dependency). `--export-csv`
+    writes one rectangular table — one row per Tableau datasource (verdict / tier / score / best Fabric
+    match + workspace / usage / priority / logic parity / reason), the analyst pivot source, UTF-8 with a
+    BOM so Excel opens it cleanly. `--export-xlsx` writes a three-sheet workbook: a **Summary** estate-
+    sizing headline (already-in-Fabric vs. needs-rebuild counts **with percentages**, distinct models,
+    one-to-one assignment, net-new models, the logic-parity review count, and the by-tier /
+    by-migration-priority / verification breakdowns), a **Datasources** detail sheet (the same per-
+    datasource rows with `Score` as a real number so it sorts), and a **Fabric coverage** sheet (models
+    nothing in Tableau maps to). Both are **read-only over the report and purely additive** — they never
+    alter a report key; the Markdown / JSON output is unchanged. Comparison suite `218` → `240` tests.
+    Skill `VERSION` `1.5.4` → `1.5.5`; collection `0.7.4` → `0.7.5`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.

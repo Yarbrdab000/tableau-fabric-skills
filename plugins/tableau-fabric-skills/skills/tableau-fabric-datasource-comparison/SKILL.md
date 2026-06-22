@@ -208,6 +208,11 @@ py -3.11 scripts/compare_estate.py --tableau-live --fabric-live --use-az `
 py -3.11 scripts/compare_estate.py `
     --tableau-inventory-json tableau.json --fabric-inventory-json fabric.json `
     --weights "name=0.15,column=0.40,type=0.15,source=0.30" --format json --out report.json
+
+# Hand an exec team a workbook: the Markdown report plus a sizing .xlsx and an analyst CSV:
+py -3.11 scripts/compare_estate.py `
+    --tableau-inventory-json tableau.json --fabric-inventory-json fabric.json `
+    --out report.md --export-xlsx estate.xlsx --export-csv estate.csv
 ```
 
 Each inventory script also runs standalone (`tableau_inventory.py`, `fabric_inventory.py`) and supports
@@ -234,6 +239,14 @@ Each inventory script also runs standalone (`tableau_inventory.py`, `fabric_inve
   a distinct audience from the Fabric token. See `resources/empirical-verification.md`.
 - `--weights`, `--top-n`, `--format {md,json}`, `--out`, `--max-models`,
   `--save-tableau-inventory`, `--save-fabric-inventory`.
+- `--export-csv PATH` — also write an executive **CSV**: one row per Tableau datasource (verdict, tier,
+  score, best Fabric match + workspace, usage, priority, logic parity, reason) — the analyst pivot
+  source. UTF-8 with a BOM so Excel opens it cleanly.
+- `--export-xlsx PATH` — also write an executive **`.xlsx`** workbook: a *Summary* sizing headline
+  (already-in-Fabric vs. needs-rebuild, %, distinct models, logic-parity review count), a *Datasources*
+  detail sheet (the same per-datasource rows, sortable), and a *Fabric coverage* sheet (net-new models).
+  Hand-assembled OOXML — **no `openpyxl`/`pandas` dependency**. Composes with everything (`--verify`,
+  adjudication) since it just reads the finished report.
 
 ## Output
 
@@ -254,6 +267,18 @@ A Markdown (or JSON) report — see `resources/report-schema.md`:
 After an `--apply-adjudication` pass the report also shows an **After semantic review** rollup
 (deterministic vs. agent-adjudicated counts, with the delta) — advisory, the deterministic verdict is
 unchanged.
+
+### Executive export (`--export-csv` / `--export-xlsx`)
+
+For sharing the result outside the terminal, the same report renders to two analyst-/exec-friendly
+artifacts (standard-library only — no `openpyxl`/`pandas`):
+
+- **CSV** — one rectangular table, one row per Tableau datasource, ready to pivot in Excel / Sheets.
+- **XLSX** — a three-sheet workbook: **Summary** (the estate-sizing headline — how many datasources
+  already exist in Fabric vs. need rebuilding, with percentages, distinct-model counts, and the
+  logic-parity review count), **Datasources** (the full per-datasource detail, score as a real number
+  so it sorts), and **Fabric coverage** (models nothing in Tableau maps to). Both are byte-stable and
+  read-only over the report. Column reference: `resources/report-schema.md`.
 
 ## Caveats
 

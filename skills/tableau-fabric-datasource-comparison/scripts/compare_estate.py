@@ -34,12 +34,14 @@ from typing import Any, Dict, List, Optional
 try:  # package or flat-script execution
     from . import compare as compare_mod
     from . import adjudicate as adjudicate_mod
+    from . import export as export_mod
     from . import fabric_inventory as fab
     from . import tableau_inventory as tab
     from . import verify as verify_mod
 except ImportError:  # pragma: no cover - exercised via flat script execution
     import compare as compare_mod
     import adjudicate as adjudicate_mod
+    import export as export_mod
     import fabric_inventory as fab
     import tableau_inventory as tab
     import verify as verify_mod
@@ -217,6 +219,12 @@ def main(argv=None) -> int:
     ap.add_argument("--save-fabric-inventory", help="also write the gathered Fabric inventory JSON here")
     ap.add_argument("--save-adjudication",
                     help="write the agent adjudication handoff packet (the review queue) here as JSON")
+    ap.add_argument("--export-csv",
+                    help="also write an executive CSV (one row per Tableau datasource: verdict, tier, "
+                         "best Fabric match, priority, logic parity, reason) -- the analyst pivot source")
+    ap.add_argument("--export-xlsx",
+                    help="also write an executive .xlsx workbook (Summary sizing headline + per-datasource "
+                         "detail + Fabric coverage); standard-library only, no openpyxl needed")
     ap.add_argument("--apply-adjudication",
                     help="load an agent-verdicts JSON ({reviews:[{tableau_name|tableau_luid, verdict, "
                          "confidence?, rationale?}]}) and fold the verdicts in as advisory annotations "
@@ -285,6 +293,13 @@ def main(argv=None) -> int:
             log(f"wrote report -> {args.out}")
         else:
             print(rendered)
+
+        if args.export_csv:
+            export_mod.write_csv(result, args.export_csv)
+            log(f"wrote executive CSV -> {args.export_csv}")
+        if args.export_xlsx:
+            export_mod.write_xlsx(result, args.export_xlsx)
+            log(f"wrote executive workbook -> {args.export_xlsx}")
 
         s = result["summary"]
         log(f"Done: {s['tableau_total']} datasource(s) vs {s['fabric_total']} model(s) -- "
