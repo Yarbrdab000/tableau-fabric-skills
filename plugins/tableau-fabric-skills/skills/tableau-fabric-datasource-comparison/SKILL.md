@@ -171,6 +171,22 @@ Verification needs **live Tableau** (VDS) and a **second token** for Power BI `e
 `--powerbi-token`, set `POWERBI_TOKEN`, or let `--use-az` mint it. Every probe is a single scalar
 aggregate; **no row-level data** leaves either platform. Full model: `resources/empirical-verification.md`.
 
+## Business-logic parity (calculated fields → measures)
+
+The four signals match on **columns, types and physical sources** — they are blind to whether a
+datasource's **calculated fields** were ever re-expressed as Fabric **measures**. Two datasources
+with identical columns but different business logic both score "already exists," so a clean structural
+match can still hide a pile of unmigrated calculations. To stop *"already exists"* being mistaken for
+*"safe to retire,"* every match carries a conservative, **name-level** `logic_parity` signal: it lines
+up the Tableau datasource's calculated-field **names** against the Fabric model's measure **names** and
+reports `none` (no calcs), `likely` (all calc names have a measure), `partial` (some do), or
+`unverified` (calcs exist but no measures line up — the logic almost certainly still needs rebuilding).
+It deliberately **does not compare formulas** — proving a Tableau calc equals a DAX measure is the
+`tableau-migration` translator's job; this only flags *where to look*. The report rolls the risky rows
+(already-exists / partial matches that are `partial` or `unverified`) into `summary.logic_parity.review_needed`
+and renders a **Business-logic parity** section only when at least one matched datasource has calculated
+fields. Purely additive — it never changes the deterministic tier/score/bucket.
+
 ## Usage
 
 ```powershell

@@ -328,7 +328,7 @@ def parse_tmdl_tables(text: str) -> List[Dict[str, Any]]:
         kw = m.group(1).lower() if m else ""
 
         if kw == "table":
-            cur_table = {"name": _unquote_tmdl_name(m.group(2)), "columns": [], "sources": []}
+            cur_table = {"name": _unquote_tmdl_name(m.group(2)), "columns": [], "measures": [], "sources": []}
             tables.append(cur_table)
             cur_col = None
             continue
@@ -339,7 +339,13 @@ def parse_tmdl_tables(text: str) -> List[Dict[str, Any]]:
             continue
 
         if kw == "measure":
-            cur_col = None  # measures are not physical columns; skip type capture
+            # Measures are not physical columns (no type capture), but their *names* are a
+            # business-logic signal: a structural column match says nothing about whether the
+            # datasource's calculations were re-expressed as DAX. Capture the name so the
+            # comparison can flag logic parity.
+            if cur_table is not None:
+                cur_table.setdefault("measures", []).append(_unquote_tmdl_name(m.group(2)))
+            cur_col = None
             continue
 
         dt = _DATATYPE_RE.match(line)
@@ -533,9 +539,10 @@ def _dedupe_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def model_inventory_from_parts(parts: Dict[str, str]) -> Dict[str, Any]:
-    """Aggregate decoded TMDL parts into ``{tables, columns, sources}`` for one model."""
+    """Aggregate decoded TMDL parts into ``{tables, columns, measures, sources}`` for one model."""
     tables: List[str] = []
     columns: List[Dict[str, Any]] = []
+    measures: List[str] = []
     sources: List[Dict[str, Any]] = []
     for _path, text in (parts or {}).items():
         for tbl in parse_tmdl_tables(text):
@@ -544,11 +551,15 @@ def model_inventory_from_parts(parts: Dict[str, str]) -> Dict[str, Any]:
                 tables.append(tname)
             for col in tbl.get("columns", []):
                 columns.append({"table": tname, "name": col["name"], "dataType": col.get("dataType", "")})
+            for mname in tbl.get("measures", []):
+                if mname:
+                    measures.append(mname)
             for src in tbl.get("sources", []):
                 sources.append(src)
     return {
         "tables": sorted(set(tables)),
         "columns": columns,
+        "measures": sorted(set(measures)),
         "sources": _dedupe_sources(sources),
     }
 
@@ -595,6 +606,7 @@ def gather_fabric_inventory(
                 "id": mid,
                 "tables": [],
                 "columns": [],
+                "measures": [],
                 "sources": [],
             }
             try:

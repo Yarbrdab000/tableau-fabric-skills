@@ -159,6 +159,31 @@ coincidental overlap of generic columns or a near-miss name — without disturbi
   column overlap %; shared vs obscured source; contested) that renders next to each recommendation,
   so the ranked worklist explains *why*.
 
+## Business-logic parity — calculated fields vs. measures
+
+The four signals above match on **structure** (columns, types, physical source). They are silent on
+one thing that decides whether an "already exists" verdict is actually *safe to act on*: did the
+datasource's **calculated fields** make it across as Fabric **measures**? Two datasources can share
+every column yet encode completely different business logic, and both will score "already exists."
+
+`logic_parity` adds a deliberately conservative, **name-level** check on top of the deterministic
+verdict (it never changes tier/score/bucket):
+
+- The Tableau side flags each field as calculated — `fields[].is_calculated` from the Metadata API's
+  `__typename == "CalculatedField"`, or a `<calculation>` child element in the `.tds` fallback.
+- The Fabric side carries the model's **measure names**, parsed from TMDL (`measure 'Name' = …`).
+- For a match, the calc names are lined up against the measure names by the same normalized token used
+  everywhere else, yielding a status: `none` (no calcs — nothing to verify), `likely` (every calc name
+  has a measure), `partial` (some do), or `unverified` (calcs exist but none line up — the logic almost
+  certainly still needs to be rebuilt).
+
+The rollup `summary.logic_parity.review_needed` is the headline risk number: matches that look
+already-in-Fabric or partial **but** whose calculations are not confirmed as measures. This is
+explicitly **name-level only** — it does *not* compare a Tableau formula against a DAX expression
+(that is the `tableau-migration` translator's job). Its single purpose is to stop a clean structural
+match from hiding a pile of unmigrated calculations, so *"already exists"* is never read as *"safe to
+retire."*
+
 ## Tuning notes
 
 - Fabric models commonly add measures and calculated columns, which **inflates the column count** and

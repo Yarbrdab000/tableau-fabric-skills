@@ -34,6 +34,7 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
 | `contested_models` | array | Fabric models claimed as best by more than one Tableau datasource: `[{fabric_name, workspace, claimed_by[]}]` (additive) |
 | `assignment` | object | greedy **one-to-one** estate sizing (each model claimed once): `{by_tier, already_exist, partial, rebuild}` (additive) |
 | `fabric_coverage` | object | reverse (Fabric→Tableau) coverage: `{fabric_total, matched_models, unmatched_models, unmatched_model_names:[{fabric_name, workspace}]}` (additive) |
+| `logic_parity` | object | business-logic-parity rollup (additive): `{none, likely, partial, unverified, review_needed}` — counts of matched datasources by [logic-parity](#logic-parity-calculated-fields--measures) status, plus `review_needed` = matches that look already-in-Fabric/partial **but whose calculated fields are not confirmed as measures** |
 
 ## `matches[]` (sorted most-comparable first)
 
@@ -56,6 +57,7 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
 | `reason` | string | deterministic one-line explanation of the verdict (name/column/source drivers + contested flag) (additive) |
 | `best_match` | object \| null | the winning Fabric candidate (null when nothing scored above 0) |
 | `candidates` | array | up to `--top-n` candidates (incl. the best), each a candidate object |
+| `logic_parity` | object \| null | business-logic-parity for this match (additive; `null` when there is no Fabric candidate): `{status, tableau_calc_count, fabric_measure_count, matched, unmatched[]}` where `status` is `none` / `likely` / `partial` / `unverified`. Name-level only — see [logic-parity](#logic-parity-calculated-fields--measures) |
 
 ### candidate object (`best_match` and each `candidates[]`)
 
@@ -216,4 +218,33 @@ Each verified `matches[]` row gains:
   --verify"*).
 
 Clear `rebuild` matches are skipped (nothing to verify); the deterministic verdict is authoritative.
+
+## Logic parity (calculated fields → measures)
+
+Structural matching compares **columns, types and physical sources** — it says nothing about whether
+a datasource's **calculated fields** were re-expressed as Fabric **measures**. `logic_parity` is a
+deliberately conservative, **name-level** signal (Tableau calc names vs model measure names) that
+flags the dangerous case where the columns line up yet the business logic almost certainly did not
+come across, so a structural *"already exists"* is never mistaken for *"safe to retire"*. It does
+**not** compare formulas — proving a Tableau calc equals a DAX measure is the `tableau-migration`
+translator's job. All keys are **additive**; the deterministic tier / score / bucket are unchanged.
+
+`matches[].logic_parity.status` (and the `summary.logic_parity` rollup):
+
+| Status | Meaning |
+|---|---|
+| `none` | the datasource has no calculated fields — nothing to verify |
+| `likely` | every calc name has a same-named measure — logic probably carried over |
+| `partial` | some calc names line up, some do not |
+| `unverified` | calcs exist but the model exposes no measures, or none line up by name — the calculations likely still need to be rebuilt |
+
+`summary.logic_parity.review_needed` is the headline risk: matches in the `already_exists` / `partial`
+bucket whose status is `partial` or `unverified`. The Markdown report renders a **Business-logic
+parity** section (with this callout and a per-datasource table) only when at least one matched
+datasource carries calculated fields; otherwise the report is byte-for-byte unchanged.
+
+> Inputs: the Tableau side flags `fields[].is_calculated` (Metadata-API `__typename == "CalculatedField"`,
+> or a `<calculation>` child in the `.tds` fallback); the Fabric side carries model-level `measures`
+> (names) parsed from TMDL.
+
 

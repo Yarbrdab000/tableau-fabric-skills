@@ -539,6 +539,52 @@ def reason_for(match: Dict[str, Any]) -> str:
     return "; ".join(parts) + f" -- {match.get('tier')}."
 
 
+def logic_parity(
+    tableau_fields: Sequence[Dict[str, Any]], fabric_measures: Sequence[str]
+) -> Dict[str, Any]:
+    """Compare a datasource's *calculated fields* against a model's *measures*, by name.
+
+    Structural matching (columns / types / source) says nothing about whether the datasource's
+    business **logic** was re-expressed in the Fabric model. This is a deliberately conservative,
+    name-level signal -- it never claims expression equivalence (proving a Tableau calc equals a DAX
+    measure is the migration translator's job). It exists to flag the dangerous case where the
+    columns line up yet the calculations almost certainly did not come across, so a structural
+    "already exists" is never mistaken for "safe to retire".
+
+    Status:
+      * ``none``       -- the datasource has no calculated fields; nothing to verify.
+      * ``likely``     -- every calc name has a same-named measure (logic probably carried over).
+      * ``partial``    -- some calc names line up, some do not.
+      * ``unverified`` -- calcs exist but the model exposes no measures, or none line up by name --
+                          the calculations almost certainly still need to be rebuilt.
+    """
+    calc_names: List[str] = []
+    for f in tableau_fields or []:
+        if isinstance(f, dict) and f.get("is_calculated"):
+            tok = normalize_token(f.get("name"))
+            if tok:
+                calc_names.append(tok)
+    calc_names = list(dict.fromkeys(calc_names))  # de-dupe, keep order
+    measure_tokens = {t for t in (normalize_token(m) for m in (fabric_measures or [])) if t}
+
+    calc_count = len(calc_names)
+    measure_count = len(measure_tokens)
+    if calc_count == 0:
+        return {"status": "none", "tableau_calc_count": 0,
+                "fabric_measure_count": measure_count, "matched": 0, "unmatched": []}
+    matched = [c for c in calc_names if c in measure_tokens]
+    unmatched = [c for c in calc_names if c not in measure_tokens]
+    if measure_count == 0 or not matched:
+        status = "unverified"
+    elif not unmatched:
+        status = "likely"
+    else:
+        status = "partial"
+    return {"status": status, "tableau_calc_count": calc_count,
+            "fabric_measure_count": measure_count, "matched": len(matched),
+            "unmatched": unmatched[:20]}
+
+
 # --------------------------------------------------------------------------------------
 # Estate-level comparison
 # --------------------------------------------------------------------------------------
@@ -597,6 +643,17 @@ def compare_inventories(
         best = scored[0] if scored else None
         best_score = best["score"] if best else 0.0
         tier = band_for(best_score, bands) if best else "None"
+        # Logic-parity: only meaningful when a real candidate exists (a rebuild's calcs are moot --
+        # the whole datasource is being recreated anyway). Re-find the winning model to read its
+        # measures; structural matching above never carried them.
+        parity = None
+        if best and best_score > 0:
+            best_fm = next(
+                (fm for fm in fabric
+                 if fm.get("id") == best.get("fabric_id") and fm.get("name") == best.get("fabric_name")),
+                None,
+            )
+            parity = logic_parity(ds.get("fields") or [], (best_fm or {}).get("measures") or [])
         matches.append({
             "tableau_name": ds.get("name"),
             "project": ds.get("project"),
@@ -608,6 +665,7 @@ def compare_inventories(
             "usage": ds.get("usage"),
             "best_match": best if (best and best_score > 0) else None,
             "candidates": scored[:top_n],
+            "logic_parity": parity,
         })
 
     matches.sort(key=lambda m: m["score"], reverse=True)
@@ -618,6 +676,18 @@ def compare_inventories(
         by_tier[m["tier"]] = by_tier.get(m["tier"], 0) + 1
         buckets[m["bucket"]] += 1
 
+    # Business-logic-parity rollup (additive). ``review_needed`` is the headline risk: matches that
+    # look already-in-Fabric / partial but whose calculated fields are not confirmed as measures.
+    logic = {"none": 0, "likely": 0, "partial": 0, "unverified": 0, "review_needed": 0}
+    for m in matches:
+        lp = m.get("logic_parity")
+        if not lp:
+            continue
+        st = lp.get("status", "none")
+        logic[st] = logic.get(st, 0) + 1
+        if m.get("bucket") in ("already_exists", "partial") and st in ("unverified", "partial"):
+            logic["review_needed"] += 1
+
     summary = {
         "tableau_total": len(matches),
         "fabric_total": len(fabric),
@@ -625,6 +695,7 @@ def compare_inventories(
         "already_exist": buckets["already_exists"],
         "partial": buckets["partial"],
         "rebuild": buckets["rebuild"],
+        "logic_parity": logic,
         "weights": dict(weights),
         "bands": [list(b) for b in bands],
     }
@@ -956,6 +1027,7 @@ def render_markdown(result: Dict[str, Any]) -> str:
     _render_contested(result, lines)
     _render_coverage(result, lines)
     _render_verification(result, lines)
+    _render_logic_parity(result, lines)
     lines.append("## Recommended actions")
     lines.append("")
     reasons = {m["tableau_name"]: m.get("reason") for m in result["matches"]}
@@ -974,6 +1046,53 @@ def render_markdown(result: Dict[str, Any]) -> str:
     _render_priority_worklist(result, lines)
     _render_adjudication(result, lines)
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_logic_parity(result: Dict[str, Any], lines: List[str]) -> None:
+    """Business-logic-parity section (additive). Rendered only when at least one matched datasource
+    carries calculated fields; otherwise the report is unchanged."""
+    summary = result.get("summary") or {}
+    lp = summary.get("logic_parity") or {}
+    with_calcs = lp.get("likely", 0) + lp.get("partial", 0) + lp.get("unverified", 0)
+    if with_calcs <= 0:
+        return
+    lines.append("## Business-logic parity (calculated fields -> measures)")
+    lines.append("")
+    lines.append(
+        "Structural matching compares columns, types and sources -- it does **not** prove the "
+        "datasource's *calculated fields* were re-expressed as DAX measures. This name-level check "
+        "flags where they likely were not, so a structural match is not mistaken for true "
+        "equivalence. (It does not compare formulas -- that is the migration translator's job.)")
+    lines.append("")
+    review = lp.get("review_needed", 0)
+    if review:
+        lines.append(
+            f"> **{review} match(es)** look already-in-Fabric or partial **but their business logic "
+            f"is unverified** -- confirm the calculated fields exist as measures before retiring the "
+            f"Tableau datasource.")
+        lines.append("")
+    lines.append("| Logic parity | Count | Meaning |")
+    lines.append("|---|---:|---|")
+    lines.append(
+        f"| Likely carried over | {lp.get('likely', 0)} | every calc has a same-named measure |")
+    lines.append(
+        f"| Partial | {lp.get('partial', 0)} | some calcs line up, some do not |")
+    lines.append(
+        f"| Unverified | {lp.get('unverified', 0)} | calcs present but no matching measures -- likely rebuild |")
+    lines.append("")
+    rows = [
+        (m, m.get("logic_parity") or {})
+        for m in result.get("matches", [])
+        if (m.get("logic_parity") or {}).get("status") in ("partial", "unverified")
+    ]
+    if rows:
+        lines.append("| Tableau datasource | Calc fields | Matched as measures | Parity |")
+        lines.append("|---|---:|---:|---|")
+        for m, d in rows[:30]:
+            n = d.get("tableau_calc_count", 0)
+            lines.append(
+                f"| {_cell(m['tableau_name'])} | {n} | {d.get('matched', 0)}/{n} | {d.get('status')} |")
+        lines.append("")
 
 
 # Empirical-verification rendering (Tier-2, additive). Present only when --verify ran; otherwise

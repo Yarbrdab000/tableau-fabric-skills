@@ -70,6 +70,27 @@ table Metrics
     assert cols == ["Amount"]  # the measure is not a physical column
 
 
+def test_parse_tmdl_captures_measure_names():
+    tmdl = """\
+table Metrics
+\tcolumn Amount
+\t\tdataType: double
+
+\tmeasure 'Total Sales' = SUM(Metrics[Amount])
+\t\tformatString: 0.00
+\tmeasure Margin = DIVIDE([Profit], [Sales])
+"""
+    tables = fab.parse_tmdl_tables(tmdl)
+    assert tables[0]["measures"] == ["Total Sales", "Margin"]
+
+
+def test_model_inventory_rolls_up_measures_across_tables():
+    a = "table Orders\n\tcolumn Sales\n\t\tdataType: double\n\tmeasure 'Profit Ratio' = DIVIDE([P],[S])\n"
+    b = "table Returns\n\tcolumn Qty\n\t\tdataType: int64\n\tmeasure 'Return Rate' = [R]/[O]\n"
+    inv = fab.model_inventory_from_parts({"a.tmdl": a, "b.tmdl": b})
+    assert inv["measures"] == ["Profit Ratio", "Return Rate"]
+
+
 # --------------------------------------------------------------------------------------
 # M source mining across connectors
 # --------------------------------------------------------------------------------------
@@ -218,7 +239,7 @@ def test_parse_tmdl_empty_and_whitespace_only_is_graceful():
 
 def test_parse_tmdl_table_without_columns_or_source():
     tables = fab.parse_tmdl_tables("table LonelyTable\n")
-    assert tables == [{"name": "LonelyTable", "columns": [], "sources": []}]
+    assert tables == [{"name": "LonelyTable", "columns": [], "measures": [], "sources": []}]
 
 
 def test_parse_m_sources_truncated_expression_is_graceful():

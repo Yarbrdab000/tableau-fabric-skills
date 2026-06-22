@@ -460,3 +460,89 @@ def test_each_match_carries_a_reason_string():
 def test_reason_for_rebuild_when_no_match():
     result = compare.compare_inventories([_ds("Lonely", [], [])], [])
     assert "rebuild" in result["matches"][0]["reason"].lower()
+
+
+# --------------------------------------------------------------------------------------
+# Business-logic parity (calculated fields -> measures)
+# --------------------------------------------------------------------------------------
+def _calc(name):
+    return {"name": name, "dataType": "REAL", "role": "measure", "is_calculated": True}
+
+
+def _col(name, dt="REAL"):
+    return {"name": name, "dataType": dt, "is_calculated": False}
+
+
+def test_logic_parity_none_when_no_calculated_fields():
+    p = compare.logic_parity([_col("Sales"), _col("Region", "STRING")], ["Profit Ratio"])
+    assert p["status"] == "none"
+    assert p["tableau_calc_count"] == 0
+
+
+def test_logic_parity_likely_when_every_calc_has_a_measure():
+    p = compare.logic_parity([_col("Sales"), _calc("Profit Ratio")], ["Profit Ratio", "Avg Order"])
+    assert p["status"] == "likely"
+    assert p["tableau_calc_count"] == 1 and p["matched"] == 1
+    assert p["unmatched"] == []
+
+
+def test_logic_parity_partial_when_some_calcs_unmatched():
+    p = compare.logic_parity([_calc("Profit Ratio"), _calc("Discount Rule")], ["Profit Ratio"])
+    assert p["status"] == "partial"
+    assert p["matched"] == 1
+    assert p["unmatched"] == ["discountrule"]
+
+
+def test_logic_parity_unverified_when_model_has_no_measures():
+    p = compare.logic_parity([_calc("Profit Ratio")], [])
+    assert p["status"] == "unverified"
+    assert p["matched"] == 0
+
+
+def test_logic_parity_unverified_when_no_names_line_up():
+    p = compare.logic_parity([_calc("Profit Ratio")], ["Total Sales", "Margin"])
+    assert p["status"] == "unverified"
+
+
+def test_compare_attaches_logic_parity_and_review_rollup():
+    # Structurally a clean Superstore match, but one of two Tableau calcs has no Fabric measure ->
+    # the match is still already_exists, yet logic parity flags it for review.
+    ds = _ds("Superstore",
+             [_col("Sales", "REAL"), _col("Region", "STRING"),
+              _calc("Profit Ratio"), _calc("Discount Rule")],
+             [{"connectionType": "sqlserver", "database": "S", "table": "Orders"}])
+    model = {"name": "Superstore",
+             "columns": [{"name": "Sales", "dataType": "double"}, {"name": "Region", "dataType": "string"}],
+             "measures": ["Profit Ratio"],
+             "sources": [{"connectionType": "sqlserver", "database": "S", "table": "Orders"}]}
+    result = compare.compare_inventories([ds], [model])
+    m = result["matches"][0]
+    assert m["bucket"] == "already_exists"            # structural verdict unchanged
+    assert m["logic_parity"]["status"] == "partial"
+    assert result["summary"]["logic_parity"]["partial"] == 1
+    assert result["summary"]["logic_parity"]["review_needed"] == 1
+
+
+def test_compare_logic_parity_none_for_rebuild_without_match():
+    # No Fabric candidate -> logic parity is moot (the datasource is being rebuilt anyway).
+    result = compare.compare_inventories([_ds("Lonely", [_calc("Some Calc")], [])], [])
+    assert result["matches"][0]["logic_parity"] is None
+
+
+def test_render_markdown_includes_logic_parity_callout_when_unverified():
+    ds = _ds("Superstore", [_col("Sales"), _calc("Profit Ratio")],
+             [{"connectionType": "sqlserver", "database": "S", "table": "Orders"}])
+    model = {"name": "Superstore", "columns": [{"name": "Sales", "dataType": "double"}],
+             "measures": [], "sources": [{"connectionType": "sqlserver", "database": "S", "table": "Orders"}]}
+    md = compare.render_markdown(compare.compare_inventories([ds], [model]))
+    assert "## Business-logic parity" in md
+    assert "business logic is unverified" in md
+
+
+def test_render_markdown_omits_logic_parity_when_no_calcs():
+    ds = _ds("Superstore", [_col("Sales")],
+             [{"connectionType": "sqlserver", "database": "S", "table": "Orders"}])
+    model = {"name": "Superstore", "columns": [{"name": "Sales", "dataType": "double"}],
+             "measures": [], "sources": [{"connectionType": "sqlserver", "database": "S", "table": "Orders"}]}
+    md = compare.render_markdown(compare.compare_inventories([ds], [model]))
+    assert "## Business-logic parity" not in md

@@ -65,6 +65,21 @@ def test_parse_tds_tolerates_empty_and_garbage():
     assert tab.parse_tds("<not-a-tds/>") == {"fields": [], "sources": []}
 
 
+def test_parse_tds_flags_calculated_fields():
+    tds = (
+        "<datasource>"
+        "<column caption='Profit Ratio' datatype='real' name='[Calculation_1]' role='measure'>"
+        "<calculation class='tableau' formula='SUM([Profit])/SUM([Sales])' />"
+        "</column>"
+        "<column caption='Plain Bin' datatype='integer' name='[Bin]' role='dimension' />"
+        "</datasource>"
+    )
+    fields = {f["name"]: f for f in tab.parse_tds(tds)["fields"]}
+    assert "Profit Ratio" in fields and fields["Profit Ratio"]["is_calculated"] is True
+    # a non-calculated <column> with no <calculation> child is not flagged / not captured here
+    assert "Plain Bin" not in fields
+
+
 def test_split_schema_table_handles_bracketed_and_bare():
     assert tab._split_schema_table("[dbo].[Orders]") == ("dbo", "Orders")
     assert tab._split_schema_table("[Orders]") == ("", "Orders")

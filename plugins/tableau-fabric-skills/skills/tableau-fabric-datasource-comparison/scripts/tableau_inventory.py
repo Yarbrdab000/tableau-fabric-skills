@@ -551,6 +551,23 @@ def parse_tds(xml_text: str) -> Dict[str, List[Dict[str, Any]]]:
             "name": name,
             "dataType": (lt.group(1).strip().upper() if lt and lt.group(1) else ""),
             "role": "",
+            "is_calculated": False,
+        })
+
+    # Calculated fields: ``<column caption='...'><calculation .../></column>``. These carry
+    # business logic (not a physical column) -- capture the caption so logic-parity can line them up
+    # against Fabric measures. Best-effort; the Metadata API is the primary, richer source.
+    for cm in re.finditer(r"<column\b([^>]*?)>\s*<calculation\b", xml_text, re.DOTALL):
+        a = _attrs(cm.group(1))
+        cname = (a.get("caption") or a.get("name") or "").strip().strip("[]")
+        if not cname or cname in seen_field:
+            continue
+        seen_field.add(cname)
+        fields.append({
+            "name": cname,
+            "dataType": (a.get("datatype") or "").upper(),
+            "role": a.get("role") or "",
+            "is_calculated": True,
         })
 
     return {"fields": fields, "sources": sources}
@@ -587,6 +604,7 @@ def _shape_fields(nodes: List[Dict[str, Any]], include_hidden: bool = False) -> 
             "name": name,
             "dataType": n.get("dataType") or "",
             "role": n.get("role") or "",
+            "is_calculated": n.get("__typename") == "CalculatedField",
         })
     return out
 

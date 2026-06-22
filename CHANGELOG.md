@@ -161,6 +161,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     window. All **additive** — no key renamed/removed; deterministic tier/score/bucket unchanged.
     Comparison suite `203` → `206` tests. Skill `VERSION` `1.5.2` → `1.5.3`; collection `0.7.2` →
     `0.7.3`.
+  - **Business-logic parity (calculated fields → measures) — closes the "structurally identical ≠
+    logically equivalent" gap:** the four structural signals (name / column / type / source) say nothing
+    about whether a datasource's **calculated fields** were re-expressed as Fabric **measures**, so two
+    datasources with identical columns but different logic both scored "already exists." Each match now
+    carries an additive, **name-level** `logic_parity` (`{status, tableau_calc_count, fabric_measure_count,
+    matched, unmatched[]}`, `status ∈ none / likely / partial / unverified`) comparing Tableau calc names
+    against model measure names, plus a `summary.logic_parity` rollup whose `review_needed` counts
+    already-exists / partial matches whose calculations are **not** confirmed as measures — so an
+    "already exists" verdict is never mistaken for "safe to retire." It deliberately does **not** compare
+    formulas (that is the `tableau-migration` translator's job); it only flags where logic likely still
+    needs rebuilding. Inputs: Tableau `fields[].is_calculated` (Metadata-API `__typename ==
+    "CalculatedField"`, or a `<calculation>` child in the `.tds` fallback) and model-level `measures`
+    parsed from TMDL. The Markdown report renders a **Business-logic parity** section only when a matched
+    datasource has calculated fields; otherwise output is byte-for-byte unchanged. All **additive** — no
+    key renamed/removed; deterministic tier/score/bucket unchanged. Comparison suite `206` → `218` tests.
+    Skill `VERSION` `1.5.3` → `1.5.4`; collection `0.7.3` → `0.7.4`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.
