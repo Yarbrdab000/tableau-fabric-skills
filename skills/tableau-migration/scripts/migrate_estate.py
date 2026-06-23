@@ -50,12 +50,14 @@ from datetime import datetime, timezone
 try:  # works whether imported as a package or run with scripts/ on sys.path
     from .connection_to_m import parse_tds
     from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
-    from .assemble_model import assemble_import_model, write_model_folder, write_local_pbip
+    from .assemble_model import (assemble_import_model, write_model_folder, write_local_pbip,
+                                 migrate_datasource)
     from .parameters import parse_parameters
 except ImportError:
     from connection_to_m import parse_tds
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
-    from assemble_model import assemble_import_model, write_model_folder, write_local_pbip
+    from assemble_model import (assemble_import_model, write_model_folder, write_local_pbip,
+                                migrate_datasource)
     from parameters import parse_parameters
 
 
@@ -637,7 +639,312 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders):
     return detail
 
 
-def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True):
+# -- rebind plan ingest / routing (opt-in; byte-identical no-op when absent) ---
+# The comparison skill writes ``rebind-plan.json`` to the estate output root; this orchestrator
+# INGESTS it -- the JSON file is the ONLY coupling (nothing is shelled or invoked). The plan is
+# consumed read-only; resolved bindings are written to a SEPARATE ``compile-report.json`` (this
+# module is its only writer) so the comparison-owned plan is never mutated.
+REBIND_PLAN_SCHEMA = "1.0"
+
+# Per-report bind seam. The dashboard-migration stage owns the actual bind function; this module
+# only calls it. Until that function is available the router DEFERS every routed entry (records it
+# in compile-report.json with a reason) rather than guessing -- keeping the run safe and green.
+_BIND_ENTRY_POINTS = ("bind_report_to_model", "rebind_report", "bind_report")
+
+# Route each entry by ``binding_status`` FIRST (the tagged-union discriminant). ``needs_attention``
+# and ``landed_to_delta`` are DEFER keys (the report is left unbound) -- neither is an action.
+# ``landed_to_delta`` is a write-back state the calc-compiler sets when a model's storage falls back.
+_BINDING_STATUS_ROUTES = {
+    "existing_fabric": "byConnection",
+    "built_local": "byPath",
+    "landed_to_delta": "defer",
+    "needs_attention": "defer",
+}
+# Actions whose freshly built byPath model carries a date table the calc-compiler resolves; the
+# orchestrator echoes it onto the write-back record. existing-Fabric / published bindings get their
+# date table from a separate Fabric-inventory pass, so they are NOT echoed here.
+_DATE_ECHO_ACTIONS = ("rebind_to_rebuilt", "consolidate_new_model")
+
+
+def _rebind_norm(name):
+    """Case-insensitive, whitespace-trimmed key for matching a plan selector to an asset name."""
+    return (name or "").strip().lower()
+
+
+def _load_rebind_plan(rebind_plan):
+    """Load a rebind plan from a path or accept an already-parsed mapping.
+
+    Returns ``(plan, errors)`` and never raises into the estate run: a ``None`` input yields
+    ``(None, [])`` (the byte-identical no-op path) and an unreadable / malformed file yields
+    ``(None, [reason])`` so the caller can record it and keep going. Files are read as ``utf-8-sig``
+    so a Tableau-style UTF-8 BOM is consumed transparently.
+    """
+    if rebind_plan is None:
+        return None, []
+    if isinstance(rebind_plan, dict):
+        return rebind_plan, []
+    try:
+        with open(rebind_plan, encoding="utf-8-sig") as fh:
+            return json.load(fh), []
+    except (OSError, ValueError) as exc:
+        return None, [f"rebind plan unreadable: {type(exc).__name__}: {exc}"]
+
+
+def _plan_entries(plan):
+    """Return the plan's flat list of entry dicts from the canonical ``plan["plan"]`` array
+    (``schema_version "1.0"``); a bare top-level list is tolerated defensively.
+
+    Each entry is self-describing: ``source_ref`` is the per-workbook ``source_id`` join key (a
+    STRING -- never assume it equals ``workbook_luid``), and ``workbook_luid`` / ``model_id`` /
+    ``label`` are top-level entry siblings.
+    """
+    entries = plan if isinstance(plan, list) else plan.get("plan")
+    if isinstance(entries, list):
+        return [e for e in entries if isinstance(e, dict)]
+    return []
+
+
+def _validate_rebind_plan(plan):
+    """Validate the plan envelope. Returns structured error strings (additive: unknown keys are
+    tolerated; only ``schema_version`` and the basic shape are enforced)."""
+    if not isinstance(plan, dict):
+        return ["rebind plan is not a JSON object"]
+    version = plan.get("schema_version")
+    if version != REBIND_PLAN_SCHEMA:
+        return [f"unsupported rebind plan schema_version {version!r} "
+                f"(expected {REBIND_PLAN_SCHEMA!r})"]
+    return []
+
+
+def _plan_selector(entry):
+    """The migrate_datasource selector for an entry: its per-entry ``label`` sibling (the
+    caption-preferred display name = ``caption`` | ``formatted-name`` | raw ``name``). A single
+    ``label`` is functionally sufficient -- the migration side matches it case-insensitively
+    against each datasource's ``{caption, formatted-name, name}`` set."""
+    return entry.get("label")
+
+
+def _bind_adapter(cand):
+    """Adapt a dashboard bind callable to a keyword call, forwarding only the kwargs it accepts.
+
+    Mirrors ``_viz_adapter``: the dashboard owns the bind function's exact signature, so inspect it
+    and pass through only recognized keyword names (or everything when it accepts ``**kwargs``).
+    """
+    try:
+        sig = inspect.signature(cand)
+    except (TypeError, ValueError):
+        return lambda **kw: cand(**kw)
+    accepts_all = any(p.kind is p.VAR_KEYWORD for p in sig.parameters.values())
+    names = set(sig.parameters)
+
+    def _call(**kw):
+        if not accepts_all:
+            kw = {k: v for k, v in kw.items() if k in names}
+        return cand(**kw)
+    return _call
+
+
+def _resolve_bind_stage(injected):
+    """Resolve the per-report bind seam without ever hard-depending on it.
+
+    An injected callable wins. Otherwise the first recognized entry point exposed by this module
+    (where the dashboard-migration stage's bind function lands) is bound. Returns a keyword-callable
+    or ``None`` -- and ``None`` makes the router DEFER every routed entry rather than guess.
+    """
+    if injected is not None:
+        return _bind_adapter(injected)
+    for fn in _BIND_ENTRY_POINTS:
+        cand = globals().get(fn)
+        if callable(cand):
+            return _bind_adapter(cand)
+    return None
+
+
+def _migrated_index(ds_details):
+    """Map normalized datasource display name -> its migrated report detail, for model reuse."""
+    index = {}
+    for d in ds_details:
+        if d.get("status") in ("migrated", "migrated_with_followups"):
+            index.setdefault(_rebind_norm(d.get("name")), d)
+    return index
+
+
+def _asset_index(source):
+    """Map normalized asset display name -> ``(kind, asset_id)`` for source resolution by selector."""
+    index = {}
+    for ds_id in source.list_datasources():
+        index.setdefault(_rebind_norm(source.asset_name(ds_id)), ("datasource", ds_id))
+    for wb_id in source.list_workbooks():
+        index.setdefault(_rebind_norm(source.asset_name(wb_id)), ("workbook", wb_id))
+    return index
+
+
+def _model_name_from_folder(output_folder):
+    """``semantic_models/Foo.SemanticModel`` -> bare ``Foo``."""
+    base = os.path.basename(output_folder or "")
+    suffix = ".SemanticModel"
+    return base[:-len(suffix)] if base.endswith(suffix) else base
+
+
+def _resolve_plan_model(entry, route, source, sm_dir, used_folders, migrated_index, asset_index):
+    """Resolve the model an entry binds to. Returns ``(model_info, error)``.
+
+    ``model_info`` is ``{"resolved_model_name", "model_path"}`` -- ``model_path`` is root-relative
+    and ``None`` on a storage fallback or an existing-Fabric identity. ``byConnection`` entries bind
+    to an existing Fabric model and need no local build. ``byPath`` entries reuse a model the estate
+    datasource pass already wrote when the selector matches one, otherwise resolve it through
+    ``migrate_datasource(datasource=<caption-preferred selector>)``.
+    """
+    if route == "byConnection":
+        target = entry.get("binding_target") or {}
+        return {"resolved_model_name": target.get("dataset_name"), "model_path": None}, None
+
+    selector = _plan_selector(entry)
+    if not selector:
+        return None, "entry has no label selector"
+
+    reused = migrated_index.get(_rebind_norm(selector))
+    if reused is not None:
+        of = reused.get("output_folder")
+        return {"resolved_model_name": _model_name_from_folder(of),
+                "model_path": of or None}, None
+
+    asset = asset_index.get(_rebind_norm(selector))
+    if asset is None:
+        return None, f"no source asset resolves selector {selector!r}"
+    kind, asset_id = asset
+    try:
+        text = (source.read_workbook(asset_id) if kind == "workbook"
+                else source.read_datasource(asset_id))
+    except Exception as exc:  # unreadable asset -> defer with a reason, never abort
+        return None, f"source {selector!r} unreadable: {type(exc).__name__}: {exc}"
+
+    safe_base = _safe_folder(selector, used_folders)
+    try:
+        result = migrate_datasource(text, model_name=safe_base, datasource=selector,
+                                    write_to=sm_dir)
+    except Exception as exc:
+        return None, f"migrate_datasource failed for {selector!r}: {type(exc).__name__}: {exc}"
+    if (result.get("report") or {}).get("fallback") or not result.get("model_dir"):
+        return {"resolved_model_name": safe_base, "model_path": None}, None
+    return {"resolved_model_name": safe_base,
+            "model_path": f"semantic_models/{safe_base}.SemanticModel"}, None
+
+
+def _orchestrate_rebind(source, plan, output_dir, used_folders, ds_details, bind_stage,
+                        load_errors):
+    """Route every plan entry and assemble the ``compile-report`` payload. Never raises -- a bad
+    entry or a bind failure is isolated as a ``deferred`` / ``errors`` record, never an abort."""
+    errors = list(load_errors) + _validate_rebind_plan(plan)
+    by_binding_status, by_action = {}, {}
+    models, workbooks, deferred = {}, [], []
+
+    sm_dir = os.path.join(output_dir, "semantic_models")
+    migrated_index = _migrated_index(ds_details)
+    asset_index = _asset_index(source)
+    registry = plan.get("models") if isinstance(plan, dict) else None
+    registry = registry if isinstance(registry, dict) else {}
+
+    for entry in _plan_entries(plan):
+        source_id = entry.get("source_ref")          # the per-workbook source_id join key (string)
+        workbook_luid = entry.get("workbook_luid")   # native workbook key (top-level sibling)
+        status = entry.get("binding_status")
+        action = entry.get("action")
+        by_binding_status[status] = by_binding_status.get(status, 0) + 1
+        if action:
+            by_action[action] = by_action.get(action, 0) + 1
+
+        route = _BINDING_STATUS_ROUTES.get(status, "defer")
+        if route == "defer":
+            if status == "needs_attention":
+                reason = "needs_attention -> deferred (left unbound)"
+            elif status == "landed_to_delta":
+                reason = "landed_to_delta -> deferred (storage fell back; report left unbound)"
+            else:
+                reason = f"unrecognized binding_status {status!r} -> deferred"
+            deferred.append({"source_id": source_id, "workbook_luid": workbook_luid,
+                             "reason": reason})
+            continue
+        if bind_stage is None:
+            deferred.append({"source_id": source_id, "workbook_luid": workbook_luid,
+                             "reason": "per-report bind seam unavailable -> deferred"})
+            continue
+
+        model_info, err = _resolve_plan_model(entry, route, source, sm_dir, used_folders,
+                                               migrated_index, asset_index)
+        if err is not None:
+            deferred.append({"source_id": source_id, "workbook_luid": workbook_luid,
+                             "reason": err})
+            continue
+
+        model_id = entry.get("model_id")
+        if model_id is not None:
+            record_model = {
+                "model_id": model_id,
+                "resolved_model_name": model_info.get("resolved_model_name"),
+                "model_path": model_info.get("model_path"),
+            }
+            seed = registry.get(model_id)
+            if isinstance(seed, dict) and seed.get("origin") is not None:
+                record_model["origin"] = seed.get("origin")
+            models.setdefault(model_id, record_model)
+
+        try:
+            bind_result = bind_stage(
+                entry=entry, binding=route, binding_target=entry.get("binding_target"),
+                model_id=model_id, model_path=model_info.get("model_path"),
+                resolved_model_name=model_info.get("resolved_model_name"),
+                used_folders=used_folders, source=source, output_dir=output_dir,
+            ) or {}
+        except Exception as exc:
+            errors.append(f"bind failed for source_id {source_id!r}: {type(exc).__name__}: {exc}")
+            deferred.append({"source_id": source_id, "workbook_luid": workbook_luid,
+                             "reason": "bind raised -> deferred"})
+            continue
+
+        if isinstance(bind_result, str):
+            bind_result = {"resolved_report_folder": bind_result}
+        record = {
+            "workbook_luid": workbook_luid,
+            "source_id": source_id,
+            "resolved_report_folder": bind_result.get("resolved_report_folder"),
+            "bound_model_id": model_id,
+        }
+        # Echo date_table only onto a freshly built byPath model (rebuilt / consolidated), which the
+        # calc-compiler resolves; byConnection / published bindings get theirs from a Fabric pass.
+        if route == "byPath" and action in _DATE_ECHO_ACTIONS:
+            record["date_table"] = bind_result.get("date_table", entry.get("date_table"))
+        workbooks.append(record)
+
+    return {
+        "tool": "migrate_estate.rebind",
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "schema_version": REBIND_PLAN_SCHEMA,
+        "models": sorted(models.values(), key=lambda m: str(m.get("model_id"))),
+        "workbooks": workbooks,
+        "resolved_report_folders": {
+            "by_workbook_luid": {w["workbook_luid"]: w["resolved_report_folder"]
+                                 for w in workbooks if w.get("workbook_luid") is not None},
+            "by_source_id": {w["source_id"]: w["resolved_report_folder"]
+                             for w in workbooks if w.get("source_id") is not None},
+        },
+        "routing": {"by_binding_status": by_binding_status, "by_action": by_action},
+        "deferred": deferred,
+        "errors": errors,
+    }
+
+
+def _write_compile_report(output_dir, compile_report):
+    """Write the single ``compile-report.json`` (BOM-free, deterministic). This module is its only
+    writer; the comparison-owned ``rebind-plan.json`` is never mutated."""
+    path = os.path.join(output_dir, "compile-report.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(compile_report, fh, indent=2, sort_keys=True)
+    return path
+
+
+def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan=None,
+                   rebind_bind_stage=None):
     """Run the whole estate migration and write the output bundle. Returns the report dict.
 
     ``source`` is any :class:`TableauSource`. ``output_dir`` receives::
@@ -656,6 +963,14 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True):
     ``pbip`` (default ``True``) additionally writes an openable ``.pbip`` Power BI project per
     migrated datasource under ``pbip/<Name>/`` so it can be opened/tested in Power BI Desktop; the
     canonical ``semantic_models/`` output is unchanged. Set ``pbip=False`` to skip it.
+
+    ``rebind_plan`` (optional, opt-in) is a ``rebind-plan.json`` path or already-parsed mapping
+    written by the comparison skill. When given, the orchestrator additionally INGESTS it, routes
+    each entry by ``binding_status``, resolves/binds each routed report through the dashboard bind
+    seam (``rebind_bind_stage`` wins; otherwise auto-detected, and every routed entry DEFERS until
+    it lands), and writes a single ``compile-report.json``. When omitted the run is a byte-identical
+    no-op -- no plan is read and no ``compile-report.json`` is written. The JSON file is the only
+    coupling; the comparison-owned plan is never mutated.
     """
     sm_dir = os.path.join(output_dir, "semantic_models")
     reports_dir = os.path.join(output_dir, "reports")
@@ -693,6 +1008,17 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True):
         json.dump(report, fh, indent=2, sort_keys=True)
     with open(os.path.join(output_dir, "summary.md"), "w", encoding="utf-8") as fh:
         fh.write(_render_summary_md(report))
+
+    # Opt-in rebind routing. Runs strictly AFTER the canonical report.json / summary.md are written
+    # so those artifacts stay byte-identical to a no-plan run; the resolved bindings land only in
+    # the separate compile-report.json (this module is its only writer).
+    if rebind_plan is not None:
+        plan, load_errors = _load_rebind_plan(rebind_plan)
+        bind_stage = _resolve_bind_stage(rebind_bind_stage)
+        compile_report = _orchestrate_rebind(
+            source, plan if isinstance(plan, dict) else {}, output_dir, used_folders,
+            ds_details, bind_stage, load_errors)
+        _write_compile_report(output_dir, compile_report)
     return report
 
 
