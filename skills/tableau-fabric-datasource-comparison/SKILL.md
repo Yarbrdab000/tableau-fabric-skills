@@ -66,7 +66,10 @@ compare_estate.py (CLI orchestrator)
    its extract** — and parsing columns + relation tables directly. Always signs out.
 2. **Fabric inventory** — acquire a token, page all visible workspaces (or `--workspaces`), list the
    semantic models, and `getDefinition` each one to parse its TMDL tables / columns / types and the
-   partition `source` (M expression → connector + database + table).
+   partition `source` (M expression → connector + database + table). Each model additionally carries an
+   **additive** `relationships[]` graph and a detected `date_table` (its marked or inferred date
+   dimension — `null` when none); see `resources/report-schema.md`. These are producer-only signals (no
+   consumer is wired) and leave the existing `tables`/`columns`/`measures`/`sources` keys unchanged.
 3. **Compare** — pure, offline scoring (see `resources/comparison-methodology.md`). Each datasource
    gets its best-matching model, a tier (`Exact / Strong / Partial / Weak / None`), and an estate
    rollup of `already_exists / partial / rebuild`.

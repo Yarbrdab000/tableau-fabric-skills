@@ -365,6 +365,234 @@ def parse_tmdl_tables(text: str) -> List[Dict[str, Any]]:
     return tables
 
 
+# -- TMDL relationships + date-table detection ------------------------------------------
+# These power an *additive* `date_table` / `relationships` enrichment on each model's
+# inventory: relationships live in `definition/relationships.tmdl` and the marked / inferred
+# date dimension is detected from them plus per-column type / key signals. Original work;
+# the TMDL constructs read here (`relationship` blocks, `dataCategory: Time`, `isKey`,
+# `'Table'[Column]` / `Table.Column` column refs) are public Power BI / Tabular facts.
+_REL_KW_RE = re.compile(r"^relationship\b", re.IGNORECASE)
+_REL_PROP_RE = re.compile(r"^(fromColumn|toColumn|isActive)\s*:\s*(.+?)\s*$", re.IGNORECASE)
+_ISKEY_RE = re.compile(r"^isKey\b", re.IGNORECASE)
+_DATACATEGORY_RE = re.compile(r"^dataCategory\s*:\s*(\S+)", re.IGNORECASE)
+_DATE_TYPES = {"datetime", "date"}
+
+
+def _split_table_column(ref: str) -> Tuple[str, str]:
+    """Split a TMDL column reference into ``(table, column)``.
+
+    Handles both ``'Table'[Column]`` / ``Table[Column]`` bracket forms and the
+    ``Table.Column`` / ``'Table Name'.'Col Name'`` dotted form (respecting single-quote
+    quoting so a dot inside a quoted name is not treated as the separator).
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return "", ""
+    if "[" in ref and ref.endswith("]"):
+        lb = ref.rfind("[")
+        return _unquote_tmdl_name(ref[:lb]), _unquote_tmdl_name(ref[lb + 1:-1])
+    in_quote = False
+    for i, ch in enumerate(ref):
+        if ch == "'":
+            in_quote = not in_quote
+        elif ch == "." and not in_quote:
+            return _unquote_tmdl_name(ref[:i]), _unquote_tmdl_name(ref[i + 1:])
+    return _unquote_tmdl_name(ref), ""
+
+
+def parse_tmdl_relationships(text: str) -> List[Dict[str, Any]]:
+    """Parse TMDL ``relationship`` blocks into
+    ``[{fromTable, fromColumn, toTable, toColumn, isActive}]``.
+
+    ``isActive`` defaults to ``True`` and is only ``False`` when the block carries
+    ``isActive: false``. Tolerant: blocks missing a resolvable ``fromTable``/``toTable`` are
+    skipped, and unrecognised lines are ignored.
+    """
+    rels: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = None
+
+    def _flush():
+        nonlocal cur
+        if cur is not None:
+            ft, fc = cur.get("from", ("", ""))
+            tt, tc = cur.get("to", ("", ""))
+            if ft and tt:
+                rels.append({
+                    "fromTable": ft, "fromColumn": fc,
+                    "toTable": tt, "toColumn": tc,
+                    "isActive": cur.get("isActive", True),
+                })
+        cur = None
+
+    for raw in (text or "").splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if _REL_KW_RE.match(stripped):
+            _flush()
+            cur = {"isActive": True}
+            continue
+        if cur is None:
+            continue
+        m = _REL_PROP_RE.match(stripped)
+        if not m:
+            continue
+        key, val = m.group(1).lower(), m.group(2).strip()
+        if key == "fromcolumn":
+            cur["from"] = _split_table_column(val)
+        elif key == "tocolumn":
+            cur["to"] = _split_table_column(val)
+        elif key == "isactive":
+            cur["isActive"] = val.lower() not in ("false", "0", "no")
+    _flush()
+    return rels
+
+
+def _parse_table_date_meta(text: str) -> List[Dict[str, Any]]:
+    """Parse just the signals date-table detection needs from a TMDL part:
+    ``[{name, dataCategory, columns:[{name, dataType, isKey}]}]``.
+
+    Kept separate from :func:`parse_tmdl_tables` so that function's output shape stays
+    byte-identical. Tolerant — unrecognised lines are ignored.
+    """
+    out: List[Dict[str, Any]] = []
+    cur_t: Optional[Dict[str, Any]] = None
+    cur_c: Optional[Dict[str, Any]] = None
+    for raw in (text or "").splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        m = _NAME_AFTER_KW.match(stripped)
+        kw = m.group(1).lower() if m else ""
+        if kw == "table":
+            cur_t = {"name": _unquote_tmdl_name(m.group(2)), "dataCategory": "", "columns": []}
+            out.append(cur_t)
+            cur_c = None
+            continue
+        if kw == "column" and cur_t is not None:
+            cur_c = {"name": _unquote_tmdl_name(m.group(2)), "dataType": "", "isKey": False}
+            cur_t["columns"].append(cur_c)
+            continue
+        if kw in ("measure", "partition"):
+            cur_c = None
+            continue
+        if cur_t is not None and cur_c is None:
+            dc = _DATACATEGORY_RE.match(stripped)
+            if dc:
+                cur_t["dataCategory"] = dc.group(1).strip()
+                continue
+        dt = _DATATYPE_RE.match(raw)
+        if dt and cur_c is not None:
+            cur_c["dataType"] = dt.group(1).strip()
+            continue
+        if _ISKEY_RE.match(stripped) and cur_c is not None:
+            cur_c["isKey"] = True
+            continue
+    return out
+
+
+def _is_date_type(data_type: str) -> bool:
+    return (data_type or "").strip().lower() in _DATE_TYPES
+
+
+def _merge_table_meta(metas: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Fold per-part table metadata into ``name -> {dataCategory, columns: ordered dict}``."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    for t in metas:
+        name = t.get("name") or ""
+        if not name:
+            continue
+        e = merged.setdefault(name, {"dataCategory": "", "columns": {}})
+        if t.get("dataCategory"):
+            e["dataCategory"] = t["dataCategory"]
+        for c in t.get("columns", []):
+            ce = e["columns"].setdefault(c["name"], {"dataType": "", "isKey": False})
+            if c.get("dataType"):
+                ce["dataType"] = c["dataType"]
+            if c.get("isKey"):
+                ce["isKey"] = True
+    return merged
+
+
+def _pick_date_key(entry: Dict[str, Any]) -> Optional[str]:
+    """Choose a date-key column for a date-dimension table: a key dateTime column, else the
+    first dateTime column, else any key column (verbatim name)."""
+    cols = entry["columns"]
+    date_cols = [n for n, c in cols.items() if _is_date_type(c["dataType"])]
+    for n in date_cols:
+        if cols[n]["isKey"]:
+            return n
+    if date_cols:
+        return date_cols[0]
+    for n, c in cols.items():
+        if c["isKey"]:
+            return n
+    return None
+
+
+def detect_date_table(
+    relationships: List[Dict[str, Any]],
+    table_metas: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Detect a model's marked / inferred date dimension and emit the frozen ``date_table``
+    contract, or ``None`` when no date dimension is found.
+
+    Detection order:
+      1. **marked** — a table whose ``dataCategory`` is ``Time`` (what "Mark as date table"
+         sets), with its date key column resolved verbatim; ``marked = True``.
+      2. **inferred** — fallback heuristic: the table on the ``toTable`` side of relationships
+         whose ``toColumn`` is a dateTime-typed key column (most-referenced wins); ``marked = False``.
+    """
+    merged = _merge_table_meta(table_metas)
+
+    date_tbl: Optional[str] = None
+    key_col: Optional[str] = None
+    marked = False
+
+    for name, entry in merged.items():
+        if (entry["dataCategory"] or "").strip().lower() == "time":
+            kc = _pick_date_key(entry)
+            if kc:
+                date_tbl, key_col, marked = name, kc, True
+                break
+
+    if date_tbl is None:
+        candidates: Dict[Tuple[str, str], int] = {}
+        for r in relationships:
+            tt, tc = r.get("toTable", ""), r.get("toColumn", "")
+            entry = merged.get(tt)
+            if not entry:
+                continue
+            cmeta = entry["columns"].get(tc)
+            if cmeta and _is_date_type(cmeta["dataType"]):
+                candidates[(tt, tc)] = candidates.get((tt, tc), 0) + 1
+        if candidates:
+            (date_tbl, key_col), _ = max(candidates.items(), key=lambda kv: kv[1])
+            marked = False
+
+    if date_tbl is None or key_col is None:
+        return None
+
+    active_keys: List[Dict[str, str]] = []
+    inactive_keys: List[Dict[str, str]] = []
+    for r in relationships:
+        if r.get("toTable") != date_tbl:
+            continue
+        fact = {"table": r.get("fromTable", ""), "column": r.get("fromColumn", "")}
+        (active_keys if r.get("isActive", True) else inactive_keys).append(fact)
+
+    grain_columns = [n for n in merged.get(date_tbl, {}).get("columns", {}) if n != key_col]
+
+    return {
+        "table": date_tbl,
+        "key_column": key_col,
+        "active_keys": active_keys,
+        "inactive_keys": inactive_keys,
+        "grain_columns": grain_columns,
+        "marked": marked,
+    }
+
+
 # -- M (Power Query) source mining ------------------------------------------------------
 _DB_FUNCS = {
     "sql.database": "sqlserver",
@@ -539,11 +767,19 @@ def _dedupe_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def model_inventory_from_parts(parts: Dict[str, str]) -> Dict[str, Any]:
-    """Aggregate decoded TMDL parts into ``{tables, columns, measures, sources}`` for one model."""
+    """Aggregate decoded TMDL parts into
+    ``{tables, columns, measures, sources, relationships, date_table}`` for one model.
+
+    ``relationships`` and ``date_table`` are *additive* — the original
+    ``tables``/``columns``/``measures``/``sources`` keys are unchanged in shape. ``date_table``
+    is ``None`` when no date dimension is detected (see :func:`detect_date_table`).
+    """
     tables: List[str] = []
     columns: List[Dict[str, Any]] = []
     measures: List[str] = []
     sources: List[Dict[str, Any]] = []
+    relationships: List[Dict[str, Any]] = []
+    table_metas: List[Dict[str, Any]] = []
     for _path, text in (parts or {}).items():
         for tbl in parse_tmdl_tables(text):
             tname = tbl.get("name") or ""
@@ -556,11 +792,15 @@ def model_inventory_from_parts(parts: Dict[str, str]) -> Dict[str, Any]:
                     measures.append(mname)
             for src in tbl.get("sources", []):
                 sources.append(src)
+        relationships.extend(parse_tmdl_relationships(text))
+        table_metas.extend(_parse_table_date_meta(text))
     return {
         "tables": sorted(set(tables)),
         "columns": columns,
         "measures": sorted(set(measures)),
         "sources": _dedupe_sources(sources),
+        "relationships": relationships,
+        "date_table": detect_date_table(relationships, table_metas),
     }
 
 
@@ -608,6 +848,8 @@ def gather_fabric_inventory(
                 "columns": [],
                 "measures": [],
                 "sources": [],
+                "relationships": [],
+                "date_table": None,
             }
             try:
                 parts = get_model_definition(ws_id, mid, token, base_url)

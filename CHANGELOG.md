@@ -13,6 +13,15 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-fabric-datasource-comparison:** the Fabric semantic-model inventory
+  (`fabric_inventory.py`) now additively carries parsed **`relationships`**
+  (`[{fromTable, fromColumn, toTable, toColumn, isActive}]`, both `'Table'[Column]` and `Table.Column`
+  ref forms, `isActive` default-true) and a detected **`date_table`** object describing each model's
+  marked or inferred date dimension (`{table, key_column, active_keys[], inactive_keys[],
+  grain_columns[], marked}`; `null` when none). A date table is detected as **marked** via table-level
+  `dataCategory: Time`, else **inferred** from relationships whose `toColumn` is a dateTime-typed key
+  column. Producer-only (no consumer wired); the existing `tables`/`columns`/`measures`/`sources` keys
+  are unchanged. `resources/report-schema.md` documents the new keys. Skill `VERSION` `1.7.0` → `1.8.0`; collection `0.9.0` → `0.10.0`.
 - **tableau-migration:** estate/local runs now emit an **openable Power BI project (`.pbip`)** per
   migrated datasource by default (`pbip/<Name>/<Name>.pbip` via `assemble_model.write_local_pbip`),
   alongside the canonical `semantic_models/<Name>.SemanticModel/`, so each datasource opens directly

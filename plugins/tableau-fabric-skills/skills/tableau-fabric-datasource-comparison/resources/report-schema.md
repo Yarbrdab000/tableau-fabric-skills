@@ -408,4 +408,33 @@ detail** section before *Recommended actions*; both are omitted when `count` is 
 `--export-xlsx` workbook gains a **Borderline** sheet whenever `count > 0`. Tune the fence width with
 `--review-band` (default `0.08`).
 
+## Fabric model inventory — `relationships` + `date_table` (additive)
 
+Each Fabric semantic model in the raw inventory (`fabric_inventory.py` →
+`model_inventory_from_parts`) carries, alongside the unchanged `tables` / `columns` / `measures` /
+`sources` keys, two **additive** keys parsed from the model's TMDL. They describe the model's
+relationship graph and its marked / inferred date dimension so a later step (e.g. a published-model
+rebind) can surface date-axis information. Producer-only — nothing in the comparison verdict consumes
+them, and they never alter an existing key.
+
+- `relationships` — `[{fromTable, fromColumn, toTable, toColumn, isActive}]` parsed from
+  `definition/relationships.tmdl`. Both column-reference forms are handled (`'Table'[Column]` and
+  `Table.Column`); `isActive` defaults to `true` and is `false` only when the block carries
+  `isActive: false`. Malformed blocks are skipped. `[]` when the model declares no relationships.
+- `date_table` — `null` when no date dimension is detected, else an object with **exactly** these
+  keys:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `table` | string | the date-dimension table name, verbatim from the model (not forced to `Date`) |
+| `key_column` | string | the dimension's date key column name, verbatim |
+| `active_keys` | array | fact-side `{table, column}` of **active** relationships into the date dim (`[]` = a date dim exists but no active fact relationship — distinct from `null`) |
+| `inactive_keys` | array | fact-side `{table, column}` of **inactive** (`isActive: false`) relationships into the date dim |
+| `grain_columns` | array | the dimension's non-key column names, verbatim, in TMDL order |
+| `marked` | bool | `true` iff the model **marks** it as a date table (table-level `dataCategory: Time`); `false` when inferred via the relationship heuristic |
+
+Detection prefers a **marked** date table (a table whose `dataCategory` is `Time`, with its date key
+resolved from a key dateTime column). When none is marked it falls back to the **inferred** heuristic:
+the table on the `toTable` side of relationships whose `toColumn` is a dateTime-typed key column
+(most-referenced wins). Consumers read every value verbatim and must never assume the table is named
+`Date`.
