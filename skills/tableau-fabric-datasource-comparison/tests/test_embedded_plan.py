@@ -9,14 +9,13 @@ import embedded_plan as ep
 SUPER_FIELDS = ["OrderId", "NetSales", "GrossProfit", "ShipRegion", "ProductCategory"]
 
 
-def _embedded(sid, ds, fields, tables, objects=None, luid=None, caption=None, name=None, label=None):
-    cap = ds if caption is None else caption
+def _embedded(sid, ds, fields, tables, objects=None, luid=None, caption=None, name=None):
     return {
         "workbook_luid": sid if luid is None else luid, "workbook_name": f"WB {sid}", "project": "P",
         "source_id": sid, "datasource_name": ds, "datasource_id": ds,
-        "caption": cap,
+        "caption": ds if caption is None else caption,
         "name": "" if name is None else name,
-        "label": (cap or ds) if label is None else label,
+        "label": (ds if caption is None else caption) or ds,
         "fields": [{"name": f, "dataType": "STRING", "role": "", "is_calculated": False}
                    for f in fields],
         "sources": [{"connectionType": "sqlserver", "database": "DB", "schema": "dbo", "table": t}
@@ -142,34 +141,42 @@ def test_bindings_reserve_optional_date_table_slot():
 
 
 def test_plan_entry_carries_migrate_datasource_label_selector():
-    # `label` is a SEPARATE per-entry field (source_ref stays the source_id STRING). It is the
-    # caption-preferred selector migrate_datasource(datasource=...) accepts; with a caption it IS the
-    # caption, falling back to the internal name when caption-less.
+    # The per-source identity is the frozen-1.0 OBJECT source_ref = {workbook_luid, source_id, label,
+    # caption, name}. `label` is the caption-preferred selector migrate_datasource(datasource=...)
+    # accepts; with a caption it IS the caption, falling back to the internal name when caption-less.
     rows = [
         _embedded("w1", "Superstore Sales", SUPER_FIELDS, ["Orders"]),  # datasource_name = caption
     ]
     plan = _plan(rows)
     e = plan["plan"][0]
-    assert e["source_ref"] == "w1"          # source_ref is the source_id STRING (frozen)
-    assert e["label"] == "Superstore Sales"
-    assert e["label"] == e["datasource_name"]
-    # No-caption case: label is derived from the RAW (un-debracketed) <datasource name=...> so it
-    # matches migration's case-insensitive {caption, formatted-name, name} set (raw-name hardening).
+    sref = e["source_ref"]
+    assert isinstance(sref, dict)
+    assert set(sref) == {"workbook_luid", "source_id", "label", "caption", "name"}
+    assert sref["source_id"] == "w1"
+    assert sref["workbook_luid"] == "w1"
+    assert sref["label"] == "Superstore Sales"
+    assert sref["label"] == e["datasource_name"]
+    # Falls back to datasource_id when the display name is empty (still a valid selector: the
+    # internal name is in migrate_datasource's case-insensitive {caption, formatted-name, name} set).
     rows2 = [{"workbook_luid": "w2", "workbook_name": "WB", "project": "P", "source_id": "w2",
               "datasource_name": "", "datasource_id": "federated.abc",
-              "caption": "", "name": "federated.abc", "label": "federated.abc",
+              "caption": "", "name": "federated.abc",
               "fields": [{"name": "X1", "dataType": "STRING"}], "sources": [{"table": "T"}],
               "objects": []}]
     e2 = _plan(rows2)["plan"][0]
-    assert e2["label"] == "federated.abc"
+    assert e2["source_ref"]["label"] == "federated.abc"
+    # The RAW (un-debracketed) internal name is preserved for migration's raw-name match.
+    assert e2["source_ref"]["name"] == "federated.abc"
 
 
-def test_label_prefers_inventory_hardened_value():
-    # When the inventory supplies a hardened `label` (caption|formatted-name|raw name) it is used
-    # verbatim -- e.g. a bracketed raw name with no caption stays bracketed for migration's raw match.
+def test_source_ref_caption_and_raw_name_carried_distinctly():
+    # caption (display) and name (raw internal) are distinct identity fields; label = caption here.
     rows = [_embedded("w1", "Sales", SUPER_FIELDS, ["Orders"],
-                      caption="", name="[federated.9zz]", label="[federated.9zz]")]
-    assert _plan(rows)["plan"][0]["label"] == "[federated.9zz]"
+                      caption="Sales", name="[federated.9zz]")]
+    sref = _plan(rows)["plan"][0]["source_ref"]
+    assert sref["caption"] == "Sales"
+    assert sref["name"] == "[federated.9zz]"  # raw, NOT debracketed
+    assert sref["label"] == "Sales"
 
 
 def test_plan_entry_carries_drift_fingerprint():
@@ -210,7 +217,8 @@ def test_source_map_carries_luid_and_source_id_distinctly():
     plan = _plan(rows)
     sm = {m["source_id"]: m["workbook_luid"] for m in plan["source_map"]}
     assert sm == {"dash.twb": ""}
-    assert plan["plan"][0]["source_ref"] == "dash.twb"
+    assert plan["plan"][0]["source_ref"]["source_id"] == "dash.twb"
+    assert plan["plan"][0]["source_ref"]["workbook_luid"] == ""
     assert plan["plan"][0]["workbook_luid"] == ""
 
 
@@ -284,16 +292,14 @@ def test_gate1_accepts_bindings_list_form():
 
 
 def test_gate1_joins_on_source_id_when_luid_empty():
-    # Local-files style: workbook_luid is empty, so the Gate-1 feedback must join on source_ref
-    # (= the source_id STRING).
+    # Local-files style: workbook_luid is empty, so the Gate-1 feedback must join on source_ref.source_id.
     objs = [{"name": "Profit Ratio", "kind": "calc"}]
     rows = [_embedded("dash.twb", "Superstore", SUPER_FIELDS, ["Orders"], objects=objs, luid="")]
     published = [_published("Superstore", SUPER_FIELDS, ["Orders"], luid="pub-5")]
     plan = _plan(rows, published=published)
     assert plan["plan"][0]["action"] == "rebind_to_published"
-    assert plan["plan"][0]["source_ref"] == "dash.twb"
-    # Feedback keyed by the source_id (source_ref string) via the bindings list.
-    report = {"bindings": [{"source_ref": "dash.twb",
+    # Feedback keyed by the source_id (object-form source_ref), object-form bindings list.
+    report = {"bindings": [{"source_ref": {"source_id": "dash.twb"},
                             "dropped": [{"name": "Profit Ratio"}]}]}
     ep.apply_view_dependency_feedback(plan, report)
     assert plan["plan"][0]["action"] == "convert_embedded"
