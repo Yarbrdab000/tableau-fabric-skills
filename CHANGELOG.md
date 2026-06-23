@@ -13,6 +13,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** the estate orchestrator (`scripts/migrate_estate.py`) gains an additive,
+  **opt-in `rebind_plan=` parameter** that ingests a comparison-emitted `rebind-plan.json`
+  (`schema_version "1.0"`) and writes a single `compile-report.json`. When the parameter is absent the
+  run is a **byte-identical no-op** (no `compile-report.json`; `report.json` unchanged). When a plan is
+  supplied the router consumes the frozen string-form contract (entries under `plan["plan"]`,
+  `source_ref` the bare `source_id` join-key string, `label`/`workbook_luid`/`model_id` top-level
+  siblings), routes each entry by `binding_status` **first** (`existing_fabric` → byConnection,
+  `built_local` → byPath, `landed_to_delta`/`needs_attention` → deferred/unbound), resolves each routed
+  source via `migrate_datasource(datasource=label)` reusing the model the estate pass already built,
+  and calls the dashboard per-report bind seam through a pluggable/auto-detected callable (passing the
+  shared `used_folders` accumulator). The bind seam stays **deferred** until the dashboard stage lands
+  its bind function, so routed entries are recorded as deferred rather than guessed — keeping the run
+  safe, green, and disjoint from the dashboard's binder functions. The JSON file is the only coupling
+  (nothing is shelled); the comparison-owned plan is never mutated. Additive; the migration suite stays
+  green. Skill `VERSION` `1.4.0` → `1.5.0`.
 - **tableau-fabric-datasource-comparison:** the Fabric semantic-model inventory
   (`fabric_inventory.py`) now additively carries parsed **`relationships`**
   (`[{fromTable, fromColumn, toTable, toColumn, isActive}]`, both `'Table'[Column]` and `Table.Column`
