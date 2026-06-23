@@ -51,12 +51,26 @@ def test_lod_reasons_route_to_outer_aggregation():
 
 def test_regex_and_no_native_functions_route_to_language_gap():
     for fn in ("REGEXP_MATCH", "REGEXP_EXTRACT", "REGEXP_EXTRACT_NTH", "REGEXP_REPLACE",
-               "DATEPARSE", "ISDATE", "SPLIT", "FINDNTH"):
+               "DATEPARSE", "ISDATE", "SPLIT", "FINDNTH",
+               # no faithful native DAX target -- deliberately fail-closed in the compiler
+               "TRIM", "LTRIM", "RTRIM", "WEEK", "ISOQUARTER",
+               "MAKETIME", "MAKEDATETIME", "HEXBINX", "HEXBINY", "STR"):
         assert _cat("unsupported function " + fn) == R.DAX_LANGUAGE_GAP, fn
     assert _cat("ordered text comparison is case-sensitive in Tableau; no faithful DAX form") \
         == R.DAX_LANGUAGE_GAP
     assert _cat("unsupported DATEPART part 'iso-week'") == R.DAX_LANGUAGE_GAP
     assert _cat("unsupported DATEADD part 'fortnight'") == R.DAX_LANGUAGE_GAP
+
+
+def test_unsupported_table_calculation_prefix_is_classified():
+    # the table-calc path reports "unsupported table calculation <NAME>" (vs "unsupported function
+    # <NAME>" in measure/column mode); both prefixes must classify the same way.
+    # RANK_UNIQUE's tie-break follows Tableau's internal addressing order -> a hard DAX gap.
+    assert _cat("unsupported table calculation RANK_UNIQUE") == R.DAX_LANGUAGE_GAP
+    assert _cat("unsupported function RANK_UNIQUE") == R.DAX_LANGUAGE_GAP
+    # PREVIOUS_VALUE is recoverable once addressing is supplied -> addressing intent (both prefixes).
+    assert _cat("unsupported table calculation PREVIOUS_VALUE") == R.MISSING_ADDRESSING_INTENT
+    assert _cat("unsupported table calculation TOTAL") == R.MISSING_ADDRESSING_INTENT
 
 
 def test_parameter_reason_and_structural_signal_route_to_model_object():
@@ -76,6 +90,9 @@ def test_type_and_shape_reasons_route_to_type_mismatch():
         "booleans support only = and <> comparison",
         "aggregation SUM not valid in a row-level column calc",
         "PERCENTILE not valid in a row-level column calc",
+        # the mirror case: a row-level expression with no aggregation used as a measure
+        # (e.g. IF [Region]="east" THEN [Sales] END) -- wrap in an aggregation or emit as a column
+        "bare row-level field [..] not valid in a measure",
         "expected a numeric expression",
         "unterminated field reference",
         "unsupported character ']'",

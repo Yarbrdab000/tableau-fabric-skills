@@ -80,6 +80,39 @@ def test_argmax_via_referenced_calc():
     assert s is not None and s["dax"] == _EXPECTED_DAX
 
 
+def test_argmax_both_sides_referenced_calcs():
+    # The full "Highest Selling City By State Sales" shape: BOTH the per-state max and the
+    # per-city detail are separate named calcs, so the final IF references each by name.
+    formula = "IF [Max City Sales] = [City Sales] THEN [City] END"
+    lookup = {"max city sales": _MAX, "city sales": _DETAIL}
+    s = suggest_assisted_dax(formula, _resolver, calc_lookup=lookup)
+    assert s is not None and s["dax"] == _EXPECTED_DAX
+    # equality written the other way round resolves identically
+    flipped = "IF [City Sales] = [Max City Sales] THEN [City] END"
+    assert suggest_assisted_dax(flipped, _resolver, calc_lookup=lookup)["dax"] == _EXPECTED_DAX
+
+
+def test_argmax_detail_referenced_max_inline():
+    # Mixed: detail is a named calc, the per-state max is written inline.
+    formula = f"IF {_MAX} = [City Sales] THEN [City] END"
+    lookup = {"city sales": _DETAIL}
+    s = suggest_assisted_dax(formula, _resolver, calc_lookup=lookup)
+    assert s is not None and s["dax"] == _EXPECTED_DAX
+
+
+def test_argmax_detail_ref_without_lookup_abstains():
+    # the detail side is a bare reference but no lookup is supplied -> cannot resolve, abstain
+    formula = f"IF {_MAX} = [City Sales] THEN [City] END"
+    assert suggest_assisted_dax(formula, _resolver) is None
+
+
+def test_argmax_detail_ref_to_non_lod_abstains():
+    # the referenced "detail" calc is not a FIXED LOD (a plain aggregate) -> abstain, never force-fit
+    formula = f"IF {_MAX} = [City Sales] THEN [City] END"
+    lookup = {"city sales": "SUM([Sales])"}
+    assert suggest_assisted_dax(formula, _resolver, calc_lookup=lookup) is None
+
+
 def test_argmax_ref_without_lookup_abstains():
     formula = f"IF [Calculation_99] = {_DETAIL} THEN [City] END"
     assert suggest_assisted_dax(formula, _resolver) is None
