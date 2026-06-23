@@ -236,6 +236,34 @@ dashboards that depend on them, and the last refresh — so the highest-value as
 verified first. See [`report-schema.md`](report-schema.md#artifact-importance--connected-assets) for
 the exact keys.
 
+## Borderline decision review — the on-the-fence datasources
+
+Tiers, confidence and importance all answer *how good / how trusted / how valuable* a match is. The
+final, decision-grade question a migration lead asks is narrower: *"the engine says reuse this Fabric
+model, but it's close — what exactly is different?"* Most datasources bucket cleanly into reuse,
+reconcile, or rebuild; a minority sit on the **reuse-vs-rebuild fence**, where an automatic verdict is
+precisely where a human wants evidence, not a coin-flip. The borderline layer isolates that set and
+attaches a **side-by-side field diff** so the call rests on the actual differences.
+
+It is deterministic, additive and read-only (it never changes tier/score/bucket), and it is
+deliberately **inclusive** — a match is flagged when *any* independent trigger fires (it sits in the
+`partial` bucket; its score is within `--review-band` of the reuse or rebuild cutoff; the confidence
+layer rated it `Low`; or its calculated fields are not yet confirmed as measures). Surfacing one extra
+datasource for a human to glance at is far cheaper than silently skipping a real one, so the selection
+errs toward review. A clean rebuild with no Fabric candidate is never borderline — there is nothing to
+adjudicate.
+
+For each flagged datasource the diff recovers the column-level delta (shared columns, Tableau-only,
+Fabric-only, and type mismatches) and the physical-source delta (shared vs. unique upstream tables,
+plus the source coverage), and echoes the logic-parity caveat. An advisory `recommendation_hint`
+(`lean_reuse` / `lean_rebuild` / `reuse_with_logic_review`) summarises which way the evidence leans
+**without** overriding the verdict — the human makes the call. The report prints a **Borderline review**
+headline (*"N datasources are on the fence — here's exactly how each differs"*) and the per-datasource
+diffs; the `--export-xlsx` workbook adds a **Borderline** sheet. Widen or tighten the fence with
+`--review-band` (default `0.08`) and bound the printed detail with `--review-top-n`. See
+[`report-schema.md`](report-schema.md#borderline-decision-review-the-reuse-vs-rebuild-fence) for the
+exact keys.
+
 ## Tuning notes
 
 - Fabric models commonly add measures and calculated columns, which **inflates the column count** and

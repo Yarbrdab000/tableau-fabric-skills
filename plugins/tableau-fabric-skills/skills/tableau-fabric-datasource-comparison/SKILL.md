@@ -54,7 +54,8 @@ compare_estate.py (CLI orchestrator)
   ├── adjudicate.py (pure)  → LLM-optional "second matcher": routes the uncertain tail to an agent
   ├── priority.py (pure)    → ranks the rebuild set by downstream usage (attached workbooks)
   ├── importance.py (pure)  → artifact importance from reach + views + certification (value/blast radius)
-  └── confidence.py (pure)  → fuses the signals into a per-verdict High/Medium/Low trust rating
+  ├── confidence.py (pure)  → fuses the signals into a per-verdict High/Medium/Low trust rating
+  └── borderline.py (pure)  → diffs the on-the-fence reuse-vs-rebuild datasources (shared/only columns, types, source)
         → report (Markdown or JSON), ranked most-comparable first, plus an adjudication queue
 ```
 
@@ -224,6 +225,25 @@ the export adds `Importance` / `Views` / `Certified` columns and a **Connected a
 best-effort, deterministic, additive and read-only — it never changes a tier/score/bucket/priority. See
 [`resources/report-schema.md`](resources/report-schema.md#artifact-importance--connected-assets).
 
+## Borderline decision review — the reuse-vs-rebuild fence
+
+Most datasources bucket cleanly into *reuse*, *reconcile*, or *rebuild*. A minority sit on the
+**fence** between reusing a Fabric model and rebuilding it — close enough that an automatic verdict is
+exactly where a migration lead wants **evidence, not a coin-flip**. A new `scripts/borderline.py`
+isolates that on-the-fence set and attaches a **side-by-side field diff**: shared vs. Tableau-only vs.
+Fabric-only columns, type mismatches, shared/unique upstream tables and source coverage, plus the
+logic-parity caveat. Selection is deliberately inclusive — a match is flagged when *any* trigger fires
+(it's a `partial`; its score is within `--review-band` of the reuse or rebuild cutoff; confidence rated
+it `Low`; or its calcs aren't confirmed as measures) because surfacing one extra datasource to glance
+at beats silently skipping a real one. A clean rebuild with no Fabric candidate is never borderline.
+Each flagged match gains `match.borderline` (the diff + an advisory `recommendation_hint` that *never*
+overrides the verdict) and the rollup gains `summary.borderline`. The report prints a **Borderline
+review** headline (*"N datasources are on the fence — here's exactly how each differs"*) and the
+per-datasource diffs; the `--export-xlsx` workbook adds a **Borderline** sheet. Tune the fence with
+`--review-band` (default `0.08`) and the printed detail with `--review-top-n`. Deterministic, additive,
+read-only — it never changes a tier/score/bucket. See
+[`resources/report-schema.md`](resources/report-schema.md#borderline-decision-review-the-reuse-vs-rebuild-fence).
+
 ## Usage
 
 ```powershell
@@ -274,6 +294,10 @@ Each inventory script also runs standalone (`tableau_inventory.py`, `fabric_inve
   `--verify-top-n` (default 10), `--verify-max-cols` (default 4), `--verify-rtol` (default 0.01).
 - `--powerbi-token` / `POWERBI_TOKEN` — Power BI token for `executeQueries` (else `--use-az` mints it);
   a distinct audience from the Fabric token. See `resources/empirical-verification.md`.
+- `--review-band FLOAT` — half-width of the reuse-vs-rebuild **fence** for the borderline diff layer
+  (default `0.08`); widen to surface more on-the-fence datasources for review, narrow to surface fewer.
+- `--review-top-n INT` — cap how many full borderline diffs the Markdown report prints (default `25`).
+  See `resources/report-schema.md#borderline-decision-review-the-reuse-vs-rebuild-fence`.
 - `--weights`, `--top-n`, `--format {md,json}`, `--out`, `--max-models`,
   `--save-tableau-inventory`, `--save-fabric-inventory`.
 - `--export-csv PATH` — also write an executive **CSV**: one row per Tableau datasource (verdict, tier,
@@ -305,6 +329,10 @@ A Markdown (or JSON) report — see `resources/report-schema.md`:
 - **Artifact importance & connected assets** (when usage telemetry was gathered): a headline of the
   Critical/High-importance datasources and total views, plus a top table with each high-value
   datasource's views, dependent workbooks/dashboards (by name) and last refresh.
+- **Borderline review** (when any datasource is on the reuse-vs-rebuild fence): a headline of how many
+  are borderline, plus a per-datasource **diff** — shared / Tableau-only / Fabric-only columns, type
+  mismatches, shared/unique source tables, and an advisory lean — so the customer decides reuse vs.
+  rebuild from the actual differences.
 - **Recommended actions**: grouped by tier, pointing the rebuild set at the `tableau-migration` skill.
 
 After an `--apply-adjudication` pass the report also shows an **After semantic review** rollup
@@ -317,12 +345,14 @@ For sharing the result outside the terminal, the same report renders to two anal
 artifacts (standard-library only — no `openpyxl`/`pandas`):
 
 - **CSV** — one rectangular table, one row per Tableau datasource, ready to pivot in Excel / Sheets.
-- **XLSX** — a three-/four-sheet workbook: **Summary** (the estate-sizing headline — how many datasources
+- **XLSX** — a multi-sheet workbook: **Summary** (the estate-sizing headline — how many datasources
   already exist in Fabric vs. need rebuilding, with percentages, distinct-model counts, the
   logic-parity review count, and importance metrics), **Datasources** (the full per-datasource detail,
-  score as a real number so it sorts), **Fabric coverage** (models nothing in Tableau maps to), and —
-  when connected-asset telemetry was gathered — **Connected assets** (one row per dependent workbook /
-  dashboard). All byte-stable and read-only over the report. Column reference: `resources/report-schema.md`.
+  score as a real number so it sorts), **Fabric coverage** (models nothing in Tableau maps to),
+  **Connected assets** (one row per dependent workbook / dashboard — when telemetry was gathered), and
+  **Borderline** (one row per on-the-fence datasource with its column/source diff counts — when any
+  datasource is borderline). All byte-stable and read-only over the report. Column reference:
+  `resources/report-schema.md`.
 
 ## Caveats
 

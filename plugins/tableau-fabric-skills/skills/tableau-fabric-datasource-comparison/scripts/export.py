@@ -247,6 +247,70 @@ def build_connected_assets_rows(result: Dict[str, Any]) -> List[List[Any]]:
     return rows
 
 
+def _borderline_lean(code: Optional[str]) -> str:
+    return {
+        "lean_reuse": "lean reuse",
+        "lean_rebuild": "lean rebuild",
+        "reuse_with_logic_review": "reuse, review calculations",
+    }.get(code or "", code or "")
+
+
+def _borderline_reason(code: str) -> str:
+    return {
+        "partial_tier": "partial tier",
+        "near_reuse_boundary": "near reuse boundary",
+        "near_rebuild_boundary": "near rebuild boundary",
+        "low_confidence": "low confidence",
+        "logic_unverified": "business logic unverified",
+    }.get(code, code)
+
+
+def build_borderline_rows(result: Dict[str, Any]) -> List[List[Any]]:
+    """Return ``[header, *rows]`` -- one row per on-the-fence datasource with its reuse-vs-rebuild diff.
+
+    The detail behind each borderline verdict: how many columns are shared / Tableau-only / Fabric-only,
+    type mismatches, source coverage and the business-logic caveat, so a migration lead can adjudicate
+    reuse-vs-rebuild in a spreadsheet. Only datasources the engine flagged as borderline contribute."""
+    header = [
+        "Datasource", "Project", "Score", "Tier", "Lean", "Reasons", "Best Fabric match",
+        "Workspace", "Shared cols", "Tableau-only cols", "Fabric-only cols", "Type mismatches",
+        "Source coverage", "Logic parity",
+    ]
+    rows: List[List[Any]] = [header]
+    matches = sorted(
+        (m for m in (result.get("matches", []) or []) if m.get("borderline")),
+        key=lambda m: m.get("score") or 0.0, reverse=True,
+    )
+    for m in matches:
+        b = m.get("borderline") or {}
+        cols = b.get("columns") or {}
+        src = b.get("source") or {}
+        lp = b.get("logic_parity") or {}
+        cov = src.get("coverage")
+        cov_cell = None if cov is None else round(float(cov), 4)
+        reasons = ", ".join(_borderline_reason(r) for r in (b.get("reasons") or []))
+        rows.append([
+            m.get("tableau_name") or "",
+            m.get("project") or "",
+            round(float(m.get("score") or 0.0), 4),
+            m.get("tier") or "",
+            _borderline_lean(b.get("recommendation_hint")),
+            reasons,
+            b.get("best_match") or "",
+            b.get("workspace") or "",
+            cols.get("shared_count", 0),
+            cols.get("tableau_only_count", 0),
+            cols.get("fabric_only_count", 0),
+            cols.get("type_mismatch_count", 0),
+            cov_cell,
+            lp.get("status") or "",
+        ])
+    if len(rows) == 1:
+        rows.append(["(no datasources are on the fence)", "", None, "", "", "", "", "",
+                     None, None, None, None, None, ""])
+    return rows
+
+
 # --------------------------------------------------------------------------------------
 # CSV
 # --------------------------------------------------------------------------------------
@@ -439,7 +503,11 @@ def _sanitize_sheet_name(name: str) -> str:
 
 
 def to_xlsx_bytes(result: Dict[str, Any]) -> bytes:
-    """Assemble the executive workbook (Summary + Datasources + Fabric coverage) as ``.xlsx`` bytes."""
+    """Assemble the executive workbook as ``.xlsx`` bytes.
+
+    Always: Summary + Datasources + Fabric coverage. Optionally appends a **Connected assets** sheet
+    (when telemetry produced any) and a **Borderline** sheet (when the engine flagged on-the-fence
+    datasources) -- both additive, so an estate without that signal keeps the original three sheets."""
     summary_rows, summary_bold = build_summary_rows(result)
     detail_rows = build_detail_rows(result)
     coverage_rows = build_coverage_rows(result)
@@ -454,6 +522,12 @@ def to_xlsx_bytes(result: Dict[str, Any]) -> bytes:
     if len(connected_rows) > 1 and connected_rows[1][3]:
         sheets.append(
             (_sanitize_sheet_name("Connected assets"), _sheet_xml(connected_rows))
+        )
+
+    # Borderline decisions sheet -- only when the engine flagged at least one on-the-fence datasource.
+    if ((result.get("summary") or {}).get("borderline") or {}).get("count"):
+        sheets.append(
+            (_sanitize_sheet_name("Borderline"), _sheet_xml(build_borderline_rows(result)))
         )
 
     buf = io.BytesIO()

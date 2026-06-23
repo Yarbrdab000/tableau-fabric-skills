@@ -39,6 +39,7 @@ try:  # package or flat-script execution
     from . import fabric_inventory as fab
     from . import tableau_inventory as tab
     from . import verify as verify_mod
+    from . import borderline as borderline_mod
 except ImportError:  # pragma: no cover - exercised via flat script execution
     import compare as compare_mod
     import adjudicate as adjudicate_mod
@@ -47,6 +48,7 @@ except ImportError:  # pragma: no cover - exercised via flat script execution
     import fabric_inventory as fab
     import tableau_inventory as tab
     import verify as verify_mod
+    import borderline as borderline_mod
 
 
 def _load_json(path: str) -> List[Dict[str, Any]]:
@@ -215,6 +217,12 @@ def main(argv=None) -> int:
     # Scoring / output
     ap.add_argument("--weights", help="override signal weights, e.g. 'name=0.2,column=0.35,type=0.15,source=0.3'")
     ap.add_argument("--top-n", type=int, default=3, help="runner-up candidates to keep per datasource")
+    ap.add_argument("--review-band", type=float, default=0.08,
+                    help="half-width of the on-the-fence review band around each bucket boundary "
+                         "(default 0.08; larger surfaces more datasources for reuse-vs-rebuild review)")
+    ap.add_argument("--review-top-n", type=int, default=25,
+                    help="max on-the-fence datasources to detail in the Markdown report (the JSON and "
+                         "export carry the full set; default 25)")
     ap.add_argument("--format", choices=["md", "json"], default="md")
     ap.add_argument("--out", help="write the report here (else stdout)")
     ap.add_argument("--save-tableau-inventory", help="also write the gathered Tableau inventory JSON here")
@@ -268,7 +276,11 @@ def main(argv=None) -> int:
 
         result = compare_mod.compare_inventories(
             tableau, fabric, weights=_parse_weights(args.weights), top_n=args.top_n,
+            review_band=args.review_band,
         )
+        # Carry the report-detail cap for the on-the-fence section (JSON/export keep the full set).
+        if isinstance(result.get("summary"), dict) and result["summary"].get("borderline"):
+            result["summary"]["borderline"]["render_limit"] = args.review_top_n
 
         if args.save_adjudication:
             with open(args.save_adjudication, "w", encoding="utf-8") as fh:
@@ -287,6 +299,11 @@ def main(argv=None) -> int:
             # match's confidence level (idempotent; never changes tier/score/bucket).
             try:
                 confidence_mod.annotate_confidence(result)
+                # Re-run the borderline review too: a --verify mismatch can drop a verdict to
+                # low-confidence, which is itself an on-the-fence trigger.
+                borderline_mod.annotate(result, tableau, fabric, band=args.review_band)
+                if result["summary"].get("borderline"):
+                    result["summary"]["borderline"]["render_limit"] = args.review_top_n
             except Exception:  # pragma: no cover - never let it break the report
                 pass
 

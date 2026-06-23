@@ -595,6 +595,7 @@ def compare_inventories(
     weights: Optional[Dict[str, float]] = None,
     bands: Optional[List[Tuple[str, float]]] = None,
     top_n: int = 3,
+    review_band: float = 0.08,
 ) -> Dict[str, Any]:
     """Compare every Tableau datasource against every Fabric model.
 
@@ -757,6 +758,22 @@ def compare_inventories(
         except ImportError:
             import confidence as _confidence
         _confidence.annotate_confidence(result)
+    except Exception:
+        pass
+
+    # Borderline decision review: for the on-the-fence verdicts (Partial tier, score within
+    # ``review_band`` of a bucket boundary, low-confidence, or structurally-matched-but-logic-
+    # unverified) attach an exact structural diff -- Tableau-only / Fabric-only columns, type
+    # mismatches, the source-table gap -- so a migration lead can adjudicate reuse-vs-rebuild from
+    # evidence rather than a single score. Runs last so it can read the confidence level; needs both
+    # inventories for the column/table lists the matches don't retain. Additive; never alters
+    # tier/score/bucket.
+    try:  # pragma: no cover - trivial wiring
+        try:
+            from . import borderline as _borderline
+        except ImportError:
+            import borderline as _borderline
+        _borderline.annotate(result, tableau or [], fabric, band=review_band)
     except Exception:
         pass
 
@@ -1026,6 +1043,7 @@ def render_markdown(result: Dict[str, Any]) -> str:
     lines.append("")
     _render_counting_rollup(result, lines)
     _render_confidence_rollup(result, lines)
+    _render_borderline_rollup(result, lines)
     _render_priority_rollup(result, lines)
     lines.append("## Ranked matches (most comparable first)")
     lines.append("")
@@ -1054,6 +1072,7 @@ def render_markdown(result: Dict[str, Any]) -> str:
     _render_verification(result, lines)
     _render_logic_parity(result, lines)
     _render_confidence_detail(result, lines)
+    _render_borderline_detail(result, lines)
     lines.append("## Recommended actions")
     lines.append("")
     reasons = {m["tableau_name"]: m.get("reason") for m in result["matches"]}
@@ -1143,6 +1162,156 @@ def _num_cell(v: Any) -> str:
     if isinstance(v, (int, float)):
         return str(int(v))
     return ""
+
+
+# Default cap on how many on-the-fence datasources get a full diff block in the Markdown report; the
+# rest are summarised in the rollup, and the JSON / export carry the complete set. Overridable via the
+# ``summary.borderline.render_limit`` key (the CLI ``--review-top-n`` flag sets it).
+_BORDERLINE_DETAIL_CAP = 25
+
+_HINT_LABEL = {
+    "lean_reuse": "lean reuse",
+    "lean_rebuild": "lean rebuild",
+    "reuse_with_logic_review": "reuse, but review the calculations",
+}
+_REASON_LABEL = {
+    "partial_tier": "partial tier",
+    "near_reuse_boundary": "near the reuse boundary",
+    "near_rebuild_boundary": "near the rebuild boundary",
+    "low_confidence": "low confidence",
+    "logic_unverified": "business logic unverified",
+}
+
+
+def _render_borderline_rollup(result: Dict[str, Any], lines: List[str]) -> None:
+    """On-the-fence headline (additive). Names the count of borderline datasources near the top so a
+    stakeholder sees -- without scrolling -- how many reuse-vs-rebuild calls still need a human. The
+    per-datasource difference detail follows lower in the report. Rendered only when there is >=1."""
+    summary = result.get("summary") or {}
+    bl = summary.get("borderline") or {}
+    count = bl.get("count", 0)
+    if not count:
+        return
+    hints = bl.get("hints") or {}
+    lines.append("## On-the-fence datasources")
+    lines.append("")
+    lines.append(
+        f"**{count} datasource(s) are borderline** -- not clearly already in Fabric, and not clearly "
+        "a rebuild. For these the reuse-vs-rebuild call is a judgment, so each is detailed below with "
+        "exactly how its best Fabric candidate differs (missing columns, extra columns, type "
+        "mismatches, source-table gap)."
+    )
+    if hints:
+        leans = ", ".join(
+            f"{_HINT_LABEL.get(h, h)} {n}" for h, n in sorted(hints.items())
+        )
+        lines.append("")
+        lines.append(f"Advisory lean (never overrides the verdict): {leans}.")
+    lines.append("")
+
+
+def _render_borderline_detail(result: Dict[str, Any], lines: List[str]) -> None:
+    """Per-datasource difference detail for the on-the-fence set (additive). For each borderline
+    datasource: the column breakdown (shared / Tableau-only / Fabric-only / type mismatches), the
+    source-table gap, the business-logic caveat, and the advisory reuse-vs-rebuild lean."""
+    summary = result.get("summary") or {}
+    bl = summary.get("borderline") or {}
+    if not bl.get("count"):
+        return
+    items = [m for m in (result.get("matches") or []) if m.get("borderline")]
+    if not items:
+        return
+    limit = bl.get("render_limit")
+    cap = _BORDERLINE_DETAIL_CAP if not isinstance(limit, int) or limit <= 0 else limit
+
+    lines.append("## Borderline decision detail")
+    lines.append("")
+    lines.append(
+        "Each on-the-fence datasource and exactly how its best Fabric candidate differs, so you can "
+        "decide reuse vs rebuild from evidence. The lean is advisory and never overrides the verdict."
+    )
+    lines.append("")
+    for m in items[:cap]:
+        b = m.get("borderline") or {}
+        cols = b.get("columns") or {}
+        src = b.get("source") or {}
+        hint = _HINT_LABEL.get(b.get("recommendation_hint"), b.get("recommendation_hint") or "")
+        lines.append(
+            f"### {_cell(m.get('tableau_name'))}  (score {float(m.get('score') or 0.0):.2f}, "
+            f"{m.get('tier')} -> {hint})"
+        )
+        lines.append("")
+        why = ", ".join(_REASON_LABEL.get(r, r) for r in (b.get("reasons") or []))
+        best = b.get("best_match")
+        if best:
+            ws = b.get("workspace") or ""
+            where = f" in _{_cell(ws)}_" if ws else ""
+            lines.append(f"Best Fabric candidate: **{_cell(best)}**{where}. Flagged: {why}.")
+        else:
+            lines.append(f"No Fabric candidate clears the bar. Flagged: {why}.")
+        lines.append("")
+        lines.append("| Columns | Count | Examples |")
+        lines.append("|---|---:|---|")
+        lines.append(
+            f"| Shared | {cols.get('shared_count', 0)} | {_examples(cols.get('shared'))} |"
+        )
+        lines.append(
+            f"| In Tableau only (missing from Fabric) | {cols.get('tableau_only_count', 0)} | "
+            f"{_examples(cols.get('tableau_only'))} |"
+        )
+        lines.append(
+            f"| In Fabric only (extra) | {cols.get('fabric_only_count', 0)} | "
+            f"{_examples(cols.get('fabric_only'))} |"
+        )
+        tm = cols.get("type_mismatches") or []
+        tm_examples = ", ".join(
+            f"{_cell(r.get('column'))} (Tableau {_cell(r.get('tableau_type') or '?')} "
+            f"vs Fabric {_cell(r.get('fabric_type') or '?')})"
+            for r in tm[:3]
+        )
+        lines.append(
+            f"| Type mismatches | {cols.get('type_mismatch_count', 0)} | {tm_examples} |"
+        )
+        lines.append("")
+        if src.get("compared"):
+            cov = src.get("coverage")
+            cov_str = "n/a" if cov is None else f"{int(round(cov * 100))}%"
+            parts = [f"coverage {cov_str}"]
+            if src.get("shared_tables"):
+                parts.append("shared: " + _examples(src.get("shared_tables")))
+            if src.get("tableau_only_tables"):
+                parts.append("in Tableau only: " + _examples(src.get("tableau_only_tables")))
+            if src.get("fabric_only_tables"):
+                parts.append("in Fabric only: " + _examples(src.get("fabric_only_tables")))
+            lines.append("Source tables: " + "; ".join(parts) + ".")
+            lines.append("")
+        lp = b.get("logic_parity") or {}
+        if lp.get("status") in ("unverified", "partial"):
+            unmatched = lp.get("unmatched") or []
+            ex = (" (" + _examples(unmatched) + ")") if unmatched else ""
+            lines.append(
+                f"Business logic: {lp.get('tableau_calc_count', 0)} calculated field(s), "
+                f"{lp.get('matched', 0)} confirmed as Fabric measures{ex} -- 'already exists' is "
+                "not 'safe to retire'."
+            )
+            lines.append("")
+    remaining = len(items) - cap
+    if remaining > 0:
+        lines.append(
+            f"_...and {remaining} more borderline datasource(s) -- see the JSON output or the "
+            "Borderline export sheet for the full set._"
+        )
+        lines.append("")
+
+
+def _examples(names: Optional[Sequence[Any]], limit: int = 6) -> str:
+    """Render up to ``limit`` example names for a cell, comma-joined and table-safe."""
+    if not names:
+        return ""
+    shown = [_cell(n) for n in list(names)[:limit]]
+    suffix = ", ..." if len(names) > limit else ""
+    return ", ".join(shown) + suffix
+
 
 
 def _render_confidence_rollup(result: Dict[str, Any], lines: List[str]) -> None:
