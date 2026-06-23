@@ -29,16 +29,16 @@ Two gates from the contract are honoured here:
 
 Pure and offline; reuses the scoring already done upstream.
 
-Each per-workbook plan entry carries its per-source identity as the frozen-1.0 OBJECT
-``source_ref = {workbook_luid, source_id, label, caption, name}``. ``label`` is the datasource's
-caption-preferred display name (caption | formatted-name | raw internal name) -- the exact
-case-insensitive selector the migration skill's ``migrate_datasource(datasource=label)`` /
-``list_workbook_datasources`` accept to pick this embedded datasource out of its workbook -- and
-``name`` is the RAW (un-debracketed) internal name the migration side matches against. A bare
-``source_id`` cannot drive ``migrate_datasource`` (a workbook can hold several embedded datasources),
-so the identity is surfaced explicitly. Entries also carry an optional ``drift`` fingerprint
-(``{table_count, column_count, calc_count}``) the orchestrator re-checks at resolve time. Additive to
-``1.0`` (schema_version unchanged).
+Each per-workbook plan entry carries a ``label`` -- a SEPARATE per-entry field (NOT folded into
+``source_ref``, which stays the ``source_id`` string). ``label`` is the datasource's caption-preferred
+display name (``caption`` | ``formatted-name`` | raw internal ``name``, mirroring the migration skill's
+``_datasource_label``) -- the exact case-insensitive selector ``migrate_datasource(datasource=label)``
+/ ``list_workbook_datasources`` accept to pick this embedded datasource out of its workbook. It is
+unsafe to re-derive from ``source_ref`` (a workbook can hold several embedded datasources), so the
+emitter surfaces it explicitly. In the no-caption case ``label`` is derived from the RAW
+(un-debracketed) ``<datasource name=...>`` so it exactly matches the migration side's raw ``name``
+compare. Entries also carry an optional ``drift`` fingerprint (``{table_count, column_count,
+calc_count}``) the orchestrator re-checks at resolve time. Both additive to ``1.0``.
 """
 
 from __future__ import annotations
@@ -145,22 +145,6 @@ def _row_label(row: Dict[str, Any]) -> str:
             or row.get("datasource_id") or "")
 
 
-def _source_ref(row: Dict[str, Any]) -> Dict[str, str]:
-    """The per-source identity OBJECT (frozen 1.0): ``{workbook_luid, source_id, label, caption, name}``.
-
-    ``label`` is the migrate_datasource selector; ``name`` is the RAW (un-debracketed) internal name
-    the migration side matches against. ``caption`` / ``name`` may be empty for Metadata-API rows
-    (Catalog exposes only the display name -> carried as ``caption`` / ``label``).
-    """
-    return {
-        "workbook_luid": row.get("workbook_luid", "") or "",
-        "source_id": row.get("source_id", "") or "",
-        "label": _row_label(row),
-        "caption": row.get("caption", "") or "",
-        "name": row.get("name", "") or "",
-    }
-
-
 def _drift(row: Dict[str, Any]) -> Dict[str, int]:
     """The optional drift fingerprint: ``{table_count, column_count, calc_count}``.
 
@@ -174,14 +158,6 @@ def _drift(row: Dict[str, Any]) -> Dict[str, int]:
         "column_count": len(row.get("fields") or []),
         "calc_count": len(row.get("objects") or []),
     }
-
-
-def _sref_id(entry: Dict[str, Any]) -> str:
-    """Read a plan entry's source_id from its ``source_ref`` (object form; tolerant of a legacy string)."""
-    sr = entry.get("source_ref")
-    if isinstance(sr, dict):
-        return sr.get("source_id", "") or ""
-    return sr or ""
 
 
 def _decide_cluster(rep_fab, rep_pub, cluster, strong_cut):
@@ -264,9 +240,10 @@ def build_rebind_plan(
             plan.append({
                 "workbook_luid": row.get("workbook_luid", ""),
                 "workbook_name": row.get("workbook_name", ""),
-                "source_ref": _source_ref(row),
+                "source_ref": row.get("source_id", ""),
                 "datasource_id": row.get("datasource_id", ""),
                 "datasource_name": row.get("datasource_name", ""),
+                "label": _row_label(row),
                 "drift": _drift(row),
                 "cluster_id": cluster["cluster_id"],
                 "action": action,
@@ -360,7 +337,7 @@ def _summarize(plan, cluster_result, models, strong_cut):
         by_action[e["action"]] = by_action.get(e["action"], 0) + 1
         by_binding[e["binding_status"]] = by_binding.get(e["binding_status"], 0) + 1
 
-    workbooks = {e["workbook_luid"] or _sref_id(e) for e in plan}
+    workbooks = {e["workbook_luid"] or e["source_ref"] for e in plan}
     consolidated_models = sorted(
         {e["model_id"] for e in plan if e["action"] == "consolidate_new_model"})
     rebind_published = by_action["rebind_to_published"]
@@ -414,7 +391,7 @@ def apply_view_dependency_feedback(plan: Dict[str, Any], report: Dict[str, Any])
     for e in plan.get("plan", []):
         if not str(e.get("action", "")).startswith("rebind"):
             continue
-        dropped = feedback.get(e.get("workbook_luid") or "") or feedback.get(_sref_id(e) or "")
+        dropped = feedback.get(e.get("workbook_luid") or "") or feedback.get(e.get("source_ref") or "")
         if not dropped:
             continue
         present = {_norm_obj(o.get("name")) for o in (e.get("objects") or [])}
@@ -461,10 +438,7 @@ def _index_feedback(report: Dict[str, Any]) -> Dict[str, List[str]]:
 
     if isinstance(report.get("bindings"), list):
         for b in report["bindings"]:
-            sref = b.get("source_ref")
-            if isinstance(sref, dict):  # tolerate the object-form source_ref
-                sref = sref.get("source_id")
-            key = b.get("workbook_luid") or sref or b.get("source_id")
+            key = b.get("workbook_luid") or b.get("source_ref") or b.get("source_id")
             if key is not None:
                 collect(key, b)
     else:
@@ -528,7 +502,7 @@ def render_markdown(plan: Dict[str, Any]) -> str:
     out.append("|---|---|---|---|---|---|")
     for e in plan.get("plan", []):
         out.append("| %s | %s | %s | %s | %s | %s |" % (
-            e.get("workbook_name") or e.get("workbook_luid") or _sref_id(e),
+            e.get("workbook_name") or e.get("workbook_luid") or e.get("source_ref"),
             e.get("datasource_name"), e.get("cluster_id"),
             _ACTION_LABEL.get(e.get("action"), e.get("action")),
             e.get("binding_status"), e.get("model_id")))
@@ -544,9 +518,9 @@ def plan_clusters(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
 _CSV_COLUMNS = [
     ("Workbook", "workbook_name"),
     ("Workbook LUID", "workbook_luid"),
-    ("Source ref", "_source_ref"),
+    ("Source ref", "source_ref"),
     ("Datasource", "datasource_name"),
-    ("Label", "_label"),
+    ("Label", "label"),
     ("Cluster", "cluster_id"),
     ("Action", "action"),
     ("Model id", "model_id"),
@@ -562,13 +536,6 @@ _CSV_COLUMNS = [
 def _csv_cell(entry: Dict[str, Any], key: str) -> Any:
     if not key.startswith("_"):
         return entry.get(key)
-    if key == "_source_ref":
-        return _sref_id(entry)
-    if key == "_label":
-        sr = entry.get("source_ref") or {}
-        if isinstance(sr, dict):
-            return sr.get("label") or sr.get("source_id") or ""
-        return sr or ""
     ev = entry.get("evidence") or {}
     fab = ev.get("fabric") or {}
     pub = ev.get("published") or {}

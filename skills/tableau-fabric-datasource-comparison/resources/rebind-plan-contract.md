@@ -72,9 +72,10 @@ entries that share its `workbook_luid`). The **required** contract keys:
 | Key | Type | Meaning |
 |---|---|---|
 | `workbook_luid` | string | the native workbook key (empty for local-file runs) |
-| `source_ref` | object | the per-source identity `{workbook_luid, source_id, label, caption, name}` — see below |
+| `source_ref` | string | = the `source_id` the feed step recorded (see `source_map`) |
 | `action` | string | one of the four actions below |
 | `model_id` | string | the logical model this workbook binds to (resolves via `models`) |
+| `label` | string | the migrate_datasource selector — see below |
 | `binding_status` | string | drives the consumer — see below; consumers key off this **first** |
 | `binding_target` | object | a **tagged union** by `binding_status` (below) |
 | `evidence` | object | the overlap evidence behind the decision (`fabric` / `published` / `cluster`) |
@@ -84,27 +85,30 @@ Additive context also carried: `workbook_name`, `datasource_id`, `datasource_nam
 `objects` (the embedded datasource's **workbook-local object list** — calcs / sets / groups / bins /
 LODs — which is what Gate 1 tests presence against), and an optional `drift` fingerprint (below).
 
-### `source_ref` — the per-source identity object
+### `source_ref` + `label` — the per-source identity
 
-`source_ref` is the **object** `{workbook_luid, source_id, label, caption, name}` (a single workbook
-can hold several embedded datasources, so the identity is per-**datasource**, not per-workbook). Its
-fields:
+`source_ref` is the **`source_id` string** (the id the feed step recorded — a filename/index for
+local-file runs, the workbook luid for live). It is the stable per-**workbook** join key consumers use
+(see `source_map`); never assume `source_ref == workbook_luid`.
 
-| Field | Meaning |
-|---|---|
-| `workbook_luid` | the owning workbook's native key (empty for local-file runs) |
-| `source_id` | the id the feed step recorded — filename/index for local-files, luid for live (see `source_map`); the stable **join key** consumers use |
-| `label` | the datasource's **caption-preferred** display name = `caption` \| `formatted-name` \| raw internal `name` — the case-insensitive selector the migration skill's `migrate_datasource(datasource=label)` / `list_workbook_datasources` accept to pick this embedded datasource out of its workbook |
-| `caption` | the raw `<datasource caption=…>` display name (may be empty) |
-| `name` | the **RAW** (un-debracketed) `<datasource name=…>` internal name — the migration side matches `ds.get("name")` raw, so it is carried un-modified |
+`label` is a **separate per-entry field** (NOT folded into `source_ref`): the datasource's
+**caption-preferred** display name = `caption` | `formatted-name` | raw internal `name` (mirroring the
+migration skill's `_datasource_label`). It is the exact case-insensitive selector
+`migrate_datasource(datasource=label)` / `list_workbook_datasources` accept to pick this embedded
+datasource out of its workbook. A single workbook can hold several embedded datasources, so `label`
+lives on the per-**datasource** entry — it is unsafe to re-derive from `source_ref`, so the emitter
+surfaces it explicitly. The migration skill matches `datasource=` case-insensitively against each
+embedded `<datasource>`'s `{caption, formatted-name, name}` set, so the emitted `label` always selects
+correctly; a single `label` is functionally sufficient (caption / raw-name need not be carried
+separately).
 
-The migration skill matches `datasource=` case-insensitively against each embedded `<datasource>`'s
-`{caption, formatted-name, name}` set, so the emitted `label` always selects correctly. A bare
-`source_id` cannot drive `migrate_datasource` — hence the object form. **Metadata-API caveat:** when
-rows come from the Tableau Metadata API (Catalog), only the datasource's display name is exposed — it
-is carried as both `caption` and `label`, with `name` / `formatted_name` left empty. This is
-acceptable because the migration match set includes the caption; it is the documented limitation of
-the Catalog path.
+**Raw-name hardening:** in the no-caption case `label` is derived from the **RAW** (un-debracketed)
+`<datasource name=…>` attribute, so it matches the migration side's raw `ds.get("name")` compare
+exactly (datasource-level `name` attributes are essentially never bracketed, so this is
+belt-and-suspenders). **Metadata-API caveat:** when rows come from the Tableau Metadata API (Catalog),
+only the datasource's display name is exposed — it becomes the `label` (the raw internal name /
+formatted-name are not available). This is acceptable because the migration match set includes the
+caption.
 
 ### `drift` — the optional structural fingerprint (additive)
 
@@ -113,19 +117,14 @@ signature the orchestrator re-extracts at resolve time and **WARNs** on mismatch
 gracefully when it is absent. `calc_count` counts the workbook-local objects (calcs / sets / groups /
 bins / LODs). Additive to `1.0`.
 
-A concrete `plan[]` entry (object-form `source_ref` + `drift`):
+A concrete `plan[]` entry (string `source_ref` + `label` sibling + `drift`):
 
 ```json
 {
   "workbook_luid": "wb-3f2a",
   "workbook_name": "Regional Sales",
-  "source_ref": {
-    "workbook_luid": "wb-3f2a",
-    "source_id": "wb-3f2a",
-    "label": "Superstore",
-    "caption": "Superstore",
-    "name": "federated.0abc"
-  },
+  "source_ref": "wb-3f2a",
+  "label": "Superstore",
   "drift": { "table_count": 1, "column_count": 24, "calc_count": 3 },
   "action": "rebind_to_published",
   "model_id": "mdl-published-superstore",
@@ -198,10 +197,8 @@ the same stub under `convert_embedded`, so it is **not** a downgrade trigger. A 
 entry's `action`, `model_id` (to `mdl-embedded-<cluster_id>`), `binding_status` (`built_local`), and
 `binding_target`, appends a Gate-1 caveat, and bumps `summary.gate1_downgrades`.
 
-The report may be supplied either as `{ key: {dropped:[...]} }` (keyed by `workbook_luid` or the
-entry's `source_ref.source_id`) or as `{ "bindings": [ {workbook_luid|source_ref, dropped:[...]} ] }`.
-Bindings may carry `source_ref` as the identity object (the `source_id` is read out of it) or as a
-bare `source_id` string — both are tolerated.
+The report may be supplied either as `{ key: {dropped:[...]} }` (keyed by `workbook_luid` or
+`source_ref`) or as `{ "bindings": [ {workbook_luid|source_ref, dropped:[...]} ] }`.
 
 ### Gate 2 — existing-Fabric reuse is excluded from the rebuild set
 
@@ -215,7 +212,7 @@ registry entry has `origin: "existing_fabric"` and a `connection` block; the cal
 |---|---|
 | `schema_version` | `"1.0"` |
 | `embedded_total` | number of embedded datasources planned |
-| `workbook_total` | distinct workbooks (by `workbook_luid` or `source_ref.source_id`) |
+| `workbook_total` | distinct workbooks (by `workbook_luid` or `source_ref`) |
 | `cluster_total` / `duplicate_group_count` | clusters, and how many are multi-member duplicate groups |
 | `model_total` / `consolidated_model_total` | distinct models referenced, and how many are new consolidated models |
 | `by_action` | count per action |
