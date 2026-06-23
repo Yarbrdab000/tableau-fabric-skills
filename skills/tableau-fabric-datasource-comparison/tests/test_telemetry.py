@@ -109,6 +109,39 @@ def test_datasource_details_metadata_parses_and_caps(monkeypatch):
     assert d["connected_workbooks"][0] == {"luid": "w0", "name": "WB0"}
 
 
+def test_datasource_details_metadata_dedupes_repeated_assets(monkeypatch):
+    # The Metadata API returns a downstream workbook/dashboard once per sheet path -> dupes.
+    c = _client()
+    node = {
+        "luid": "d1", "isCertified": None, "hasActiveWarning": None,
+        "downstreamWorkbooks": [
+            {"luid": "w1", "name": "Exec"}, {"luid": "w1", "name": "Exec"},
+            {"luid": "w2", "name": "Ops"},
+        ],
+        "downstreamDashboards": [{"name": "Dashboard 1"}, {"name": "Dashboard 1"},
+                                 {"name": "Daily"}],
+    }
+    payload = {"publishedDatasourcesConnection": {
+        "nodes": [node], "pageInfo": {"hasNextPage": False, "endCursor": None}}}
+    monkeypatch.setattr(c, "metadata_query", lambda q, v: payload)
+    d = c.datasource_details_metadata()["d1"]
+    assert [w["luid"] for w in d["connected_workbooks"]] == ["w1", "w2"]   # deduped by luid
+    assert [x["name"] for x in d["connected_dashboards"]] == ["Dashboard 1", "Daily"]  # deduped by name
+
+
+def test_datasource_details_metadata_cap_counts_distinct(monkeypatch):
+    # With the cap applied after dedupe, N copies of one workbook count as one toward the cap.
+    c = _client()
+    dupes = [{"luid": "w1", "name": "Only"}] * (tab.CONNECTED_ASSET_CAP + 10)
+    node = {"luid": "d1", "isCertified": None, "hasActiveWarning": None,
+            "downstreamWorkbooks": dupes, "downstreamDashboards": []}
+    payload = {"publishedDatasourcesConnection": {
+        "nodes": [node], "pageInfo": {"hasNextPage": False, "endCursor": None}}}
+    monkeypatch.setattr(c, "metadata_query", lambda q, v: payload)
+    d = c.datasource_details_metadata()["d1"]
+    assert len(d["connected_workbooks"]) == 1
+
+
 def test_datasource_details_metadata_pages(monkeypatch):
     c = _client()
     pages = [

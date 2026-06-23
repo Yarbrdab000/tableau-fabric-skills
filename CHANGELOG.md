@@ -222,8 +222,12 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     assets** section (highest-value datasources with their views, dependent assets and last refresh);
     the CSV/XLSX export gains `Importance` / `Views` / `Certified` columns, importance Summary metrics,
     and a fourth **Connected assets** sheet (one row per dependent asset, when telemetry was gathered).
-    **Deterministic, additive and read-only** — never changes a `tier` / `score` / `bucket` /
-    `priority`. Comparison suite `267` → `304` tests. Skill `VERSION` `1.5.6` → `1.5.7`; collection
+    Connected-asset names are **deduped** (the Metadata API returns an asset once per sheet path) so the
+    deliverable never shows the same workbook/dashboard twice. **Deterministic, additive and
+    read-only** — never changes a `tier` / `score` / `bucket` / `priority`. **Live-verified** end-to-end
+    against a real Tableau Cloud site (the richer Metadata-API query and the view-statistics REST
+    endpoint both resolve; importance section + connected-assets export render with real data).
+    Comparison suite `267` → `306` tests. Skill `VERSION` `1.5.6` → `1.5.7`; collection
     `0.7.6` → `0.7.7`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so

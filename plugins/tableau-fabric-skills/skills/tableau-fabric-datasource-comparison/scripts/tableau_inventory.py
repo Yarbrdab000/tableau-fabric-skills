@@ -430,16 +430,33 @@ class TableauClient:
                 luid = n.get("luid")
                 if not luid:
                     continue
+                # Dedupe before capping: the Metadata API returns a downstream workbook/dashboard once
+                # per sheet path, so the same asset can repeat. Key workbooks by luid (name fallback)
+                # and dashboards by name, preserving first-seen order, so the cap bounds *distinct*
+                # assets and the deliverable never shows "Dashboard 1, Dashboard 1".
                 wbs = []
-                for w in (n.get("downstreamWorkbooks") or [])[:CONNECTED_ASSET_CAP]:
+                seen_wb = set()
+                for w in n.get("downstreamWorkbooks") or []:
                     nm = w.get("name")
-                    if nm:
-                        wbs.append({"luid": w.get("luid"), "name": nm})
+                    if not nm:
+                        continue
+                    key = w.get("luid") or ("name:" + nm)
+                    if key in seen_wb:
+                        continue
+                    seen_wb.add(key)
+                    wbs.append({"luid": w.get("luid"), "name": nm})
+                    if len(wbs) >= CONNECTED_ASSET_CAP:
+                        break
                 dbs = []
-                for d in (n.get("downstreamDashboards") or [])[:CONNECTED_ASSET_CAP]:
+                seen_db = set()
+                for d in n.get("downstreamDashboards") or []:
                     nm = d.get("name")
-                    if nm:
-                        dbs.append({"name": nm})
+                    if not nm or nm in seen_db:
+                        continue
+                    seen_db.add(nm)
+                    dbs.append({"name": nm})
+                    if len(dbs) >= CONNECTED_ASSET_CAP:
+                        break
                 out[luid] = {
                     "certified": bool(n.get("isCertified")) if n.get("isCertified") is not None else None,
                     "has_quality_warning": bool(n.get("hasActiveWarning"))
