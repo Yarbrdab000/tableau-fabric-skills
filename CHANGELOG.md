@@ -262,11 +262,11 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   `built_local` → `byPath`; `needs_attention` → unbound), plus overlap `evidence`, `caveats`, the
   `source_id ↔ workbook_luid` map (never assumes they are equal), an optional `date_table` slot
   reserved on every bound target (safe-default `null`; enriched later by the Fabric-inventory pass or
-  the calc-compiler write-back), a per-source identity object `source_ref = {workbook_luid, source_id,
-  label, caption, name}` whose `label` is the caption-preferred selector the migration skill's
-  `migrate_datasource(datasource=label)` accepts to pick an embedded datasource out of its workbook
-  (with a `name` carried RAW for the migration match set), an optional per-entry `drift` fingerprint
-  `{table_count, column_count, calc_count}`, and a Markdown rollup + analyst CSV.
+  the calc-compiler write-back), a per-entry `label` sibling — the caption-preferred selector the
+  migration skill's `migrate_datasource(datasource=label)` accepts to pick an embedded datasource out
+  of its workbook (derived from the RAW `<datasource name>` in the no-caption case to mirror
+  migration's raw match), with `source_ref` kept as the `source_id` string — an optional per-entry
+  `drift` fingerprint `{table_count, column_count, calc_count}`, and a Markdown rollup + analyst CSV.
   Two locked gates: `apply_view_dependency_feedback` downgrades a rebind to `convert_embedded` **only**
   when a dropped reference names an object the embedded datasource *actually contains*
   (presence-in-source), and existing-Fabric bindings are excluded from the rebuild set. Additive CLI
