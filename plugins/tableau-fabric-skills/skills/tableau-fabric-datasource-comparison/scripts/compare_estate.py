@@ -36,17 +36,21 @@ try:  # package or flat-script execution
     from . import adjudicate as adjudicate_mod
     from . import confidence as confidence_mod
     from . import export as export_mod
+    from . import embedded_plan as embedded_plan_mod
     from . import fabric_inventory as fab
     from . import tableau_inventory as tab
     from . import verify as verify_mod
+    from . import borderline as borderline_mod
 except ImportError:  # pragma: no cover - exercised via flat script execution
     import compare as compare_mod
     import adjudicate as adjudicate_mod
     import confidence as confidence_mod
     import export as export_mod
+    import embedded_plan as embedded_plan_mod
     import fabric_inventory as fab
     import tableau_inventory as tab
     import verify as verify_mod
+    import borderline as borderline_mod
 
 
 def _load_json(path: str) -> List[Dict[str, Any]]:
@@ -186,6 +190,50 @@ def _run_verification(args, result, tableau, fabric, tableau_client, log):
             v.get("inconclusive", 0), v.get("probes_run", 0)))
 
 
+def _emit_rebind_plan(args, fabric, tableau, log) -> None:
+    """Emit the embedded-datasource rebind plan (Phase 3; additive, opt-in).
+
+    Loads the cached embedded inventory, scores/clusters it against the already-gathered Fabric and
+    published-Tableau estates, optionally folds in a view-dependency report (Gate 1), and writes the
+    requested artifacts. Never touches the main comparison ``result``.
+    """
+    log(f"Loading embedded inventory from {args.embedded_inventory_json}")
+    embedded_rows = _load_json(args.embedded_inventory_json)
+    plan = embedded_plan_mod.generate_plan(
+        embedded_rows, fabric=fabric, published=tableau,
+        threshold=args.rebind_cluster_threshold, strong_cut=args.rebind_strong_cut,
+        weights=_parse_weights(args.weights),
+    )
+    if args.view_dependency_report:
+        log(f"Applying view-dependency feedback from {args.view_dependency_report} (Gate 1)")
+        with open(args.view_dependency_report, encoding="utf-8-sig") as fh:
+            vdr = json.load(fh)
+        embedded_plan_mod.apply_view_dependency_feedback(plan, vdr)
+
+    wrote_any = False
+    if args.rebind_plan_out:
+        with open(args.rebind_plan_out, "w", encoding="utf-8") as fh:
+            json.dump(plan, fh, indent=2)
+        log(f"wrote rebind plan -> {args.rebind_plan_out}")
+        wrote_any = True
+    if args.rebind_plan_md:
+        with open(args.rebind_plan_md, "w", encoding="utf-8") as fh:
+            fh.write(embedded_plan_mod.render_markdown(plan))
+        log(f"wrote rebind plan (Markdown) -> {args.rebind_plan_md}")
+        wrote_any = True
+    if args.rebind_plan_csv:
+        embedded_plan_mod.write_export_csv(plan, args.rebind_plan_csv)
+        log(f"wrote rebind plan (CSV) -> {args.rebind_plan_csv}")
+        wrote_any = True
+    # No explicit out target: print the JSON to stdout, but only when the main report went to a file
+    # (so the two never collide on stdout).
+    if not wrote_any and args.out:
+        print(json.dumps(plan, indent=2))
+    elif not wrote_any:
+        log("rebind plan computed -- pass --rebind-plan-out/-md/-csv to persist it")
+    log("Rebind plan: " + plan["summary"]["headline"])
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Compare Tableau datasources to Fabric semantic models.")
 
@@ -215,6 +263,12 @@ def main(argv=None) -> int:
     # Scoring / output
     ap.add_argument("--weights", help="override signal weights, e.g. 'name=0.2,column=0.35,type=0.15,source=0.3'")
     ap.add_argument("--top-n", type=int, default=3, help="runner-up candidates to keep per datasource")
+    ap.add_argument("--review-band", type=float, default=0.08,
+                    help="half-width of the on-the-fence review band around each bucket boundary "
+                         "(default 0.08; larger surfaces more datasources for reuse-vs-rebuild review)")
+    ap.add_argument("--review-top-n", type=int, default=25,
+                    help="max on-the-fence datasources to detail in the Markdown report (the JSON and "
+                         "export carry the full set; default 25)")
     ap.add_argument("--format", choices=["md", "json"], default="md")
     ap.add_argument("--out", help="write the report here (else stdout)")
     ap.add_argument("--save-tableau-inventory", help="also write the gathered Tableau inventory JSON here")
@@ -247,6 +301,28 @@ def main(argv=None) -> int:
     ap.add_argument("--powerbi-token",
                     help="Power BI token for executeQueries (else POWERBI_TOKEN / --use-az); a "
                          "distinct audience from the Fabric token")
+
+    # Embedded-datasource rebind plan (Phase 3, additive, opt-in). Scores in-workbook embedded
+    # datasources against the Fabric models AND the published Tableau datasources, clusters the
+    # near-duplicates, and emits a rebind-plan.json (frozen schema_version "1.0") plus optional
+    # Markdown / CSV. Reuses the Fabric + Tableau inventories already gathered above.
+    ap.add_argument("--embedded-inventory-json",
+                    help="load a cached embedded-datasource inventory JSON (from embedded_inventory.py) "
+                         "and emit a rebind plan against the gathered Fabric + published-Tableau estates")
+    ap.add_argument("--rebind-plan-out", help="write the rebind-plan.json here")
+    ap.add_argument("--rebind-plan-md", help="also write the rebind-plan Markdown rollup here")
+    ap.add_argument("--rebind-plan-csv", help="also write the rebind-plan executive CSV here")
+    ap.add_argument("--rebind-strong-cut", type=float, default=embedded_plan_mod.DEFAULT_STRONG_CUT,
+                    help="score at/above which an embedded datasource is treated as already having an "
+                         "equivalent (rebind/reuse) instead of a rebuild (default 0.65 = Strong band)")
+    ap.add_argument("--rebind-cluster-threshold", type=float,
+                    default=embedded_plan_mod.cluster_mod.DEFAULT_CLUSTER_THRESHOLD,
+                    help="structural-similarity threshold for collapsing near-duplicate embedded "
+                         "datasources into one consolidation group (default 0.80)")
+    ap.add_argument("--view-dependency-report",
+                    help="fold a dashboard view_dependency_report JSON into the plan (Gate 1): a "
+                         "rebind is downgraded to convert_embedded only when a dropped reference names "
+                         "an object the embedded datasource actually contains")
     args = ap.parse_args(argv)
 
     def log(msg):
@@ -268,7 +344,11 @@ def main(argv=None) -> int:
 
         result = compare_mod.compare_inventories(
             tableau, fabric, weights=_parse_weights(args.weights), top_n=args.top_n,
+            review_band=args.review_band,
         )
+        # Carry the report-detail cap for the on-the-fence section (JSON/export keep the full set).
+        if isinstance(result.get("summary"), dict) and result["summary"].get("borderline"):
+            result["summary"]["borderline"]["render_limit"] = args.review_top_n
 
         if args.save_adjudication:
             with open(args.save_adjudication, "w", encoding="utf-8") as fh:
@@ -287,6 +367,11 @@ def main(argv=None) -> int:
             # match's confidence level (idempotent; never changes tier/score/bucket).
             try:
                 confidence_mod.annotate_confidence(result)
+                # Re-run the borderline review too: a --verify mismatch can drop a verdict to
+                # low-confidence, which is itself an on-the-fence trigger.
+                borderline_mod.annotate(result, tableau, fabric, band=args.review_band)
+                if result["summary"].get("borderline"):
+                    result["summary"]["borderline"]["render_limit"] = args.review_top_n
             except Exception:  # pragma: no cover - never let it break the report
                 pass
 
@@ -308,6 +393,9 @@ def main(argv=None) -> int:
         if args.export_xlsx:
             export_mod.write_xlsx(result, args.export_xlsx)
             log(f"wrote executive workbook -> {args.export_xlsx}")
+
+        if args.embedded_inventory_json:
+            _emit_rebind_plan(args, fabric, tableau, log)
 
         s = result["summary"]
         log(f"Done: {s['tableau_total']} datasource(s) vs {s['fabric_total']} model(s) -- "

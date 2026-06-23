@@ -54,7 +54,8 @@ compare_estate.py (CLI orchestrator)
   ├── adjudicate.py (pure)  → LLM-optional "second matcher": routes the uncertain tail to an agent
   ├── priority.py (pure)    → ranks the rebuild set by downstream usage (attached workbooks)
   ├── importance.py (pure)  → artifact importance from reach + views + certification (value/blast radius)
-  └── confidence.py (pure)  → fuses the signals into a per-verdict High/Medium/Low trust rating
+  ├── confidence.py (pure)  → fuses the signals into a per-verdict High/Medium/Low trust rating
+  └── borderline.py (pure)  → diffs the on-the-fence reuse-vs-rebuild datasources (shared/only columns, types, source)
         → report (Markdown or JSON), ranked most-comparable first, plus an adjudication queue
 ```
 
@@ -227,6 +228,56 @@ the export adds `Importance` / `Views` / `Certified` columns and a **Connected a
 best-effort, deterministic, additive and read-only — it never changes a tier/score/bucket/priority. See
 [`resources/report-schema.md`](resources/report-schema.md#artifact-importance--connected-assets).
 
+## Borderline decision review — the reuse-vs-rebuild fence
+
+Most datasources bucket cleanly into *reuse*, *reconcile*, or *rebuild*. A minority sit on the
+**fence** between reusing a Fabric model and rebuilding it — close enough that an automatic verdict is
+exactly where a migration lead wants **evidence, not a coin-flip**. A new `scripts/borderline.py`
+isolates that on-the-fence set and attaches a **side-by-side field diff**: shared vs. Tableau-only vs.
+Fabric-only columns, type mismatches, shared/unique upstream tables and source coverage, plus the
+logic-parity caveat. Selection is deliberately inclusive — a match is flagged when *any* trigger fires
+(it's a `partial`; its score is within `--review-band` of the reuse or rebuild cutoff; confidence rated
+it `Low`; or its calcs aren't confirmed as measures) because surfacing one extra datasource to glance
+at beats silently skipping a real one. A clean rebuild with no Fabric candidate is never borderline.
+Each flagged match gains `match.borderline` (the diff + an advisory `recommendation_hint` that *never*
+overrides the verdict) and the rollup gains `summary.borderline`. The report prints a **Borderline
+review** headline (*"N datasources are on the fence — here's exactly how each differs"*) and the
+per-datasource diffs; the `--export-xlsx` workbook adds a **Borderline** sheet. Tune the fence with
+`--review-band` (default `0.08`) and the printed detail with `--review-top-n`. Deterministic, additive,
+read-only — it never changes a tier/score/bucket. See
+[`resources/report-schema.md`](resources/report-schema.md#borderline-decision-review-the-reuse-vs-rebuild-fence).
+
+## Embedded-datasource rebind plan — workbooks, not just published datasources
+
+Everything above inventories **published** datasources. But a real estate also has hundreds-to-
+thousands of **workbooks** whose datasource is **embedded** in the `.twb` (never published) — those
+are migration assets too, and the same one is routinely copied into dozens of workbooks. The embedded
+engine enumerates them, collapses the near-duplicates, scores each against the estate, and emits a
+**`rebind-plan.json`** that says, per workbook, whether to **rebind** it to something that already
+exists or **rebuild** its model:
+
+```
+embedded_inventory.py → embedded datasources (+ each one's workbook-local calcs/sets/groups/bins/LODs)
+                        keyed by workbook_luid; Metadata API + a .twb/parse_tds fallback
+embedded_cluster.py   → fingerprint + cluster near-duplicates (14 copies of "Superstore" → one asset)
+embedded_score.py     → score each embedded ds vs Fabric models AND published datasources (reuses score_pair)
+embedded_plan.py      → assign an action + binding target per workbook → rebind-plan.json (+ Markdown + CSV)
+```
+
+Each workbook gets one of four **actions** — `rebind_to_published` (its embedded copy overlaps a
+published datasource), `consolidate_new_model` (it leads a duplicate group → build **one** shared
+model), `rebind_to_rebuilt` (a duplicate member rebinding to that shared model, or to an existing
+Fabric model), or `convert_embedded` (a unique embedded ds with no home) — plus a `binding_target`
+tagged by `binding_status` (`existing_fabric` → bind live `byConnection`, **excluded from the rebuild
+set**; `built_local` → bind `byPath`; `needs_attention` → unbound). The plan reuses the comparison
+engine's scoring wholesale and is a **frozen cross-skill contract** (`schema_version "1.0"`) consumed
+by the migration/calc-compiler skill (which builds the models and writes back their resolved
+identity) and the dashboard skill (which binds the reports). It honours two gates: a dashboard
+`view_dependency_report` downgrades a rebind to `convert_embedded` **only** when a dropped reference
+names an object the embedded datasource *actually contains* (presence-in-source, not drop volume),
+and existing-Fabric bindings are excluded from the rebuild set. Deterministic, offline, additive.
+Full reference: [`resources/rebind-plan-contract.md`](resources/rebind-plan-contract.md).
+
 ## Usage
 
 ```powershell
@@ -253,6 +304,14 @@ py -3.11 scripts/compare_estate.py `
 py -3.11 scripts/compare_estate.py `
     --tableau-inventory-json tableau.json --fabric-inventory-json fabric.json `
     --out report.md --export-xlsx estate.xlsx --export-csv estate.csv
+
+# Embedded-datasource rebind plan: inventory the workbooks first, then plan them against the estate:
+py -3.11 scripts/embedded_inventory.py --out embedded.json    # (live; --dry-run to preview)
+py -3.11 scripts/compare_estate.py `
+    --tableau-inventory-json tableau.json --fabric-inventory-json fabric.json `
+    --embedded-inventory-json embedded.json `
+    --rebind-plan-out rebind-plan.json --rebind-plan-md rebind-plan.md --rebind-plan-csv rebind-plan.csv `
+    --out report.md
 ```
 
 Each inventory script also runs standalone (`tableau_inventory.py`, `fabric_inventory.py`) and supports
@@ -277,6 +336,10 @@ Each inventory script also runs standalone (`tableau_inventory.py`, `fabric_inve
   `--verify-top-n` (default 10), `--verify-max-cols` (default 4), `--verify-rtol` (default 0.01).
 - `--powerbi-token` / `POWERBI_TOKEN` — Power BI token for `executeQueries` (else `--use-az` mints it);
   a distinct audience from the Fabric token. See `resources/empirical-verification.md`.
+- `--review-band FLOAT` — half-width of the reuse-vs-rebuild **fence** for the borderline diff layer
+  (default `0.08`); widen to surface more on-the-fence datasources for review, narrow to surface fewer.
+- `--review-top-n INT` — cap how many full borderline diffs the Markdown report prints (default `25`).
+  See `resources/report-schema.md#borderline-decision-review-the-reuse-vs-rebuild-fence`.
 - `--weights`, `--top-n`, `--format {md,json}`, `--out`, `--max-models`,
   `--save-tableau-inventory`, `--save-fabric-inventory`.
 - `--export-csv PATH` — also write an executive **CSV**: one row per Tableau datasource (verdict, tier,
@@ -287,6 +350,14 @@ Each inventory script also runs standalone (`tableau_inventory.py`, `fabric_inve
   detail sheet (the same per-datasource rows, sortable), and a *Fabric coverage* sheet (net-new models).
   Hand-assembled OOXML — **no `openpyxl`/`pandas` dependency**. Composes with everything (`--verify`,
   adjudication) since it just reads the finished report.
+- `--embedded-inventory-json PATH` — load a cached **embedded**-datasource inventory (from
+  `scripts/embedded_inventory.py`) and emit a **rebind plan** for the workbooks against the gathered
+  Fabric + published-Tableau estates. Pair with `--rebind-plan-out PATH` (the `rebind-plan.json`),
+  `--rebind-plan-md PATH` (Markdown rollup), `--rebind-plan-csv PATH` (analyst CSV). Tune with
+  `--rebind-strong-cut` (default `0.65` — the score above which an embedded ds counts as already having
+  an equivalent) and `--rebind-cluster-threshold` (default `0.80` — how aggressively near-duplicates
+  collapse). `--view-dependency-report PATH` folds a dashboard feedback report back in (Gate 1). See
+  [`resources/rebind-plan-contract.md`](resources/rebind-plan-contract.md).
 
 ## Output
 
@@ -308,7 +379,18 @@ A Markdown (or JSON) report — see `resources/report-schema.md`:
 - **Artifact importance & connected assets** (when usage telemetry was gathered): a headline of the
   Critical/High-importance datasources and total views, plus a top table with each high-value
   datasource's views, dependent workbooks/dashboards (by name) and last refresh.
+- **Borderline review** (when any datasource is on the reuse-vs-rebuild fence): a headline of how many
+  are borderline, plus a per-datasource **diff** — shared / Tableau-only / Fabric-only columns, type
+  mismatches, shared/unique source tables, and an advisory lean — so the customer decides reuse vs.
+  rebuild from the actual differences.
 - **Recommended actions**: grouped by tier, pointing the rebuild set at the `tableau-migration` skill.
+
+When `--embedded-inventory-json` is supplied the run also writes a **rebind plan** for the workbooks
+(`--rebind-plan-out` / `-md` / `-csv`): a headline weighting rollup (*"of N embedded datasources
+across W workbooks: M rebind to a published datasource, R already exist in Fabric, K cluster into J
+new consolidated models, C convert in place"*), per-workbook action + binding-target rows, and the
+duplicate-group clusters — the `rebind-plan.json` handed to the migration and dashboard skills
+(`resources/rebind-plan-contract.md`).
 
 After an `--apply-adjudication` pass the report also shows an **After semantic review** rollup
 (deterministic vs. agent-adjudicated counts, with the delta) — advisory, the deterministic verdict is
@@ -320,12 +402,14 @@ For sharing the result outside the terminal, the same report renders to two anal
 artifacts (standard-library only — no `openpyxl`/`pandas`):
 
 - **CSV** — one rectangular table, one row per Tableau datasource, ready to pivot in Excel / Sheets.
-- **XLSX** — a three-/four-sheet workbook: **Summary** (the estate-sizing headline — how many datasources
+- **XLSX** — a multi-sheet workbook: **Summary** (the estate-sizing headline — how many datasources
   already exist in Fabric vs. need rebuilding, with percentages, distinct-model counts, the
   logic-parity review count, and importance metrics), **Datasources** (the full per-datasource detail,
-  score as a real number so it sorts), **Fabric coverage** (models nothing in Tableau maps to), and —
-  when connected-asset telemetry was gathered — **Connected assets** (one row per dependent workbook /
-  dashboard). All byte-stable and read-only over the report. Column reference: `resources/report-schema.md`.
+  score as a real number so it sorts), **Fabric coverage** (models nothing in Tableau maps to),
+  **Connected assets** (one row per dependent workbook / dashboard — when telemetry was gathered), and
+  **Borderline** (one row per on-the-fence datasource with its column/source diff counts — when any
+  datasource is borderline). All byte-stable and read-only over the report. Column reference:
+  `resources/report-schema.md`.
 
 ## Caveats
 

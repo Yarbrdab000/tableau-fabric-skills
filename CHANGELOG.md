@@ -21,7 +21,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   grain_columns[], marked}`; `null` when none). A date table is detected as **marked** via table-level
   `dataCategory: Time`, else **inferred** from relationships whose `toColumn` is a dateTime-typed key
   column. Producer-only (no consumer wired); the existing `tables`/`columns`/`measures`/`sources` keys
-  are unchanged. `resources/report-schema.md` documents the new keys. Skill `VERSION` `1.5.7` → `1.6.0`.
+  are unchanged. `resources/report-schema.md` documents the new keys. Skill `VERSION` `1.7.0` → `1.8.0`; collection `0.9.0` → `0.10.0`.
 - **tableau-migration:** estate/local runs now emit an **openable Power BI project (`.pbip`)** per
   migrated datasource by default (`pbip/<Name>/<Name>.pbip` via `assemble_model.write_local_pbip`),
   alongside the canonical `semantic_models/<Name>.SemanticModel/`, so each datasource opens directly
@@ -238,6 +238,54 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     endpoint both resolve; importance section + connected-assets export render with real data).
     Comparison suite `267` → `306` tests. Skill `VERSION` `1.5.6` → `1.5.7`; collection
     `0.7.6` → `0.7.7`.
+- **tableau-fabric-datasource-comparison:** new **borderline decision-review** layer
+  (`scripts/borderline.py`) for the datasources sitting on the **reuse-vs-rebuild fence** — where the
+  structural evidence is genuinely close, so the customer can decide from a diff instead of trusting an
+  automatic verdict. Selection is deliberately inclusive (flagged when **any** trigger fires: the
+  `partial` bucket, score within `--review-band` of the reuse/rebuild cutoff, a `Low`-confidence
+  verdict, or calcs not yet confirmed as measures); a clean rebuild with no Fabric candidate is never
+  borderline. Each flagged match gains `match.borderline` — the field-level diff (shared / Tableau-only
+  / Fabric-only columns, type mismatches, shared/unique upstream tables, source coverage, logic-parity
+  caveat) plus an advisory `recommendation_hint` (`lean_reuse` / `lean_rebuild` /
+  `reuse_with_logic_review`) — and the rollup gains `summary.borderline.{count, band, strong_cut,
+  partial_cut, by_origin_bucket, reasons, hints, names}`. The Markdown report adds a **Borderline
+  review** headline + per-datasource diff section; the `--export-xlsx` workbook adds a **Borderline**
+  sheet (when `count > 0`). New CLI flags `--review-band` (default `0.08`, fence half-width) and
+  `--review-top-n` (default `25`, printed-diff cap). The `recommendation_hint` **never** overrides the
+  verdict. **Deterministic, additive and read-only** — never changes a `tier` / `score` / `bucket`.
+  Comparison suite `306` → `327` tests (+21). Skill `VERSION` `1.5.7` → `1.6.0`; collection
+  `0.7.7` → `0.8.0`.
+- **tableau-fabric-datasource-comparison:** new **embedded-datasource rebind/consolidation engine**
+  — the skill now plans the **workbooks** with embedded (in-`.twb`, never-published) datasources, not
+  only the published datasources. Four new pure, offline scripts: `embedded_inventory.py` enumerates
+  every embedded datasource (+ its **workbook-local object list** — calcs / sets / groups / bins /
+  LODs — keyed by `workbook_luid`) via the Metadata API with a `.twb`/`parse_tds` download fallback
+  and a local-files mode; `embedded_cluster.py` fingerprints + clusters near-duplicates so the same
+  datasource copied into dozens of workbooks collapses to **one** asset; `embedded_score.py` scores
+  each embedded ds against the Fabric models **and** the published Tableau datasources by **reusing
+  `compare.score_pair` / `compare.band_for`** (no scoring reinvented); `embedded_plan.py` emits a
+  **`rebind-plan.json`** (frozen cross-skill `schema_version "1.0"`) assigning every workbook an
+  `action` (`rebind_to_published` / `consolidate_new_model` / `rebind_to_rebuilt` / `convert_embedded`),
+  a logical `model_id`, and a `binding_target` tagged by `binding_status` (`existing_fabric` →
+  `byConnection` identity straight from the comparison, **excluded from the rebuild set**;
+  `built_local` → `byPath`; `needs_attention` → unbound), plus overlap `evidence`, `caveats`, the
+  `source_id ↔ workbook_luid` map (never assumes they are equal), an optional `date_table` slot
+  reserved on every bound target (safe-default `null`; enriched later by the Fabric-inventory pass or
+  the calc-compiler write-back), a per-entry `label` sibling — the caption-preferred selector the
+  migration skill's `migrate_datasource(datasource=label)` accepts to pick an embedded datasource out
+  of its workbook (derived from the RAW `<datasource name>` in the no-caption case to mirror
+  migration's raw match), with `source_ref` kept as the `source_id` string — an optional per-entry
+  `drift` fingerprint `{table_count, column_count, calc_count}`, and a Markdown rollup + analyst CSV.
+  Two locked gates: `apply_view_dependency_feedback` downgrades a rebind to `convert_embedded` **only**
+  when a dropped reference names an object the embedded datasource *actually contains*
+  (presence-in-source), and existing-Fabric bindings are excluded from the rebuild set. Additive CLI
+  on `compare_estate.py`: `--embedded-inventory-json`, `--rebind-plan-out` / `-md` / `-csv`,
+  `--rebind-strong-cut` (default `0.65`), `--rebind-cluster-threshold` (default `0.80`),
+  `--view-dependency-report` (existing flags untouched). New
+  `resources/rebind-plan-contract.md` documents the contract. **Deterministic, additive and
+  read-only** — never changes a `tier` / `score` / `bucket`; the migration guard suite is untouched
+  (`956` passed / `1` skipped / `1` xfailed). Comparison suite `327` → `383` tests (+56). Skill
+  `VERSION` `1.6.0` → `1.7.0`; collection `0.8.0` → `0.9.0`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.

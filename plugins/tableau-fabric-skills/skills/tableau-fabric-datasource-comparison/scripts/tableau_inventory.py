@@ -341,6 +341,54 @@ class TableauClient:
             raise TableauError(f"Download datasource content failed ({exc.code}).")
         return extract_tds_text(content)
 
+    # -- workbooks (embedded-datasource enumeration) ----------------------------------
+    def list_workbooks(self, page_size: int = 100) -> List[Dict[str, Any]]:
+        """List every workbook on the site (REST): ``[{luid, name, project}]``.
+
+        Used by the embedded-datasource inventory to drive the ``.twb`` fallback for workbooks
+        Tableau Catalog has not indexed (so the Metadata API returns no embedded datasources).
+        """
+        out: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            qs = urllib.parse.urlencode({"pageSize": str(page_size), "pageNumber": str(page)})
+            url = f"{self._rest_base}/sites/{self.site_id}/workbooks?{qs}"
+            status, body = self._request("GET", url, self._auth_headers())
+            if status != 200:
+                raise TableauError(f"List workbooks failed ({status}): {str(body)[:500]}")
+            body = body or {}
+            rows = body.get("workbooks", {}).get("workbook", []) or []
+            for w in rows:
+                out.append({
+                    "luid": w.get("id", ""),
+                    "name": w.get("name", ""),
+                    "project": (w.get("project") or {}).get("name", ""),
+                })
+            total = int(body.get("pagination", {}).get("totalAvailable", len(out)) or len(out))
+            if page * page_size >= total or not rows:
+                break
+            page += 1
+        return out
+
+    def download_workbook_twb(self, luid: str, timeout: int = 180) -> Optional[str]:
+        """Download a workbook's ``.twb`` (XML) without its extract, for Catalog-independent parsing.
+
+        ``GET /sites/{site}/workbooks/{luid}/content?includeExtract=False`` returns either a raw
+        ``.twb`` or a ``.twbx`` ZIP (when the workbook bundles an extract); we ask Tableau to omit
+        the (potentially huge) ``.hyper`` extract and pull only the XML descriptor.
+        """
+        if not self.token:
+            raise TableauError("Not signed in.")
+        qs = urllib.parse.urlencode({"includeExtract": "False"})
+        url = f"{self._rest_base}/sites/{self.site_id}/workbooks/{luid}/content?{qs}"
+        req = urllib.request.Request(url, headers={"X-Tableau-Auth": self.token}, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                content = resp.read()
+        except urllib.error.HTTPError as exc:
+            raise TableauError(f"Download workbook content failed ({exc.code}).")
+        return extract_twb_text(content)
+
     # -- downstream usage (migration-priority signal) ---------------------------------
     def downstream_usage_metadata(self, page_size: int = 100) -> Dict[str, Dict[str, Any]]:
         """Trusted primary: per-datasource downstream workbook / sheet / dashboard counts (Catalog).
@@ -583,6 +631,28 @@ def extract_tds_text(content: bytes) -> Optional[str]:
         try:
             with zipfile.ZipFile(io.BytesIO(content)) as zf:
                 names = [n for n in zf.namelist() if n.lower().endswith(".tds")]
+                if not names:
+                    return None
+                with zf.open(names[0]) as fh:
+                    return fh.read().decode("utf-8", errors="replace")
+        except zipfile.BadZipFile:
+            return None
+    return content.decode("utf-8", errors="replace")
+
+
+def extract_twb_text(content: bytes) -> Optional[str]:
+    """Return the ``.twb`` XML text from raw downloaded bytes (a bare ``.twb`` or a ``.twbx`` ZIP).
+
+    Mirrors :func:`extract_tds_text` for workbooks: a ``.twbx`` is a ZIP that bundles the ``.twb``
+    descriptor (plus the ``.hyper`` extract, image assets, etc.); we pull only the XML descriptor so
+    the embedded-datasource inventory can parse it without ever touching the (large) extract.
+    """
+    if not content:
+        return None
+    if content[:2] == b"PK":  # ZIP (.twbx)
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                names = [n for n in zf.namelist() if n.lower().endswith(".twb")]
                 if not names:
                     return None
                 with zf.open(names[0]) as fh:
