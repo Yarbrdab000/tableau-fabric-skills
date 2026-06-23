@@ -93,6 +93,67 @@ def test_load_json_accepts_value_wrapper(tmp_path):
     assert compare_estate._load_json(str(p)) == [{"name": "A"}]
 
 
+def test_estate_cli_emits_rebind_plan(tmp_path):
+    import csv as _csv
+    import io as _io
+
+    tableau = [{
+        "name": "Superstore", "project": "Samples", "luid": "t-1",
+        "fields": [{"name": "OrderId", "dataType": "STRING"}, {"name": "NetSales", "dataType": "REAL"}],
+        "sources": [{"connectionType": "sqlserver", "database": "SalesDB", "table": "Orders"}],
+    }]
+    fabric = [{
+        "name": "HR Headcount", "workspace": "WS", "workspaceId": "w-1", "id": "m-1",
+        "tables": ["Employees"],
+        "columns": [{"name": "EmployeeKeyId", "dataType": "string"}],
+        "sources": [{"connectionType": "sqlserver", "database": "HRDB", "table": "Employees"}],
+    }]
+    # Two workbooks embed a near-identical copy of the published Superstore -> rebind_to_published.
+    embedded = [
+        {"workbook_luid": "wb-1", "workbook_name": "Sales A", "project": "P",
+         "source_id": "wb-1", "datasource_name": "Superstore (copy)", "datasource_id": "e-1",
+         "fields": [{"name": "OrderId", "dataType": "STRING"}, {"name": "NetSales", "dataType": "REAL"}],
+         "sources": [{"connectionType": "sqlserver", "database": "SalesDB", "schema": "dbo", "table": "Orders"}],
+         "objects": [], "has_extract": None, "source_path": "metadata"},
+        {"workbook_luid": "wb-2", "workbook_name": "Sales B", "project": "P",
+         "source_id": "wb-2", "datasource_name": "Superstore (copy)", "datasource_id": "e-2",
+         "fields": [{"name": "OrderId", "dataType": "STRING"}, {"name": "NetSales", "dataType": "REAL"}],
+         "sources": [{"connectionType": "sqlserver", "database": "SalesDB", "schema": "dbo", "table": "Orders"}],
+         "objects": [], "has_extract": None, "source_path": "metadata"},
+    ]
+    t_json = _write(tmp_path, "tableau.json", tableau)
+    f_json = _write(tmp_path, "fabric.json", fabric)
+    e_json = _write(tmp_path, "embedded.json", embedded)
+    out = tmp_path / "result.json"
+    plan_out = tmp_path / "rebind-plan.json"
+    plan_md = tmp_path / "rebind-plan.md"
+    plan_csv = tmp_path / "rebind-plan.csv"
+
+    rc = compare_estate.main([
+        "--tableau-inventory-json", t_json,
+        "--fabric-inventory-json", f_json,
+        "--embedded-inventory-json", e_json,
+        "--rebind-plan-out", str(plan_out),
+        "--rebind-plan-md", str(plan_md),
+        "--rebind-plan-csv", str(plan_csv),
+        "--format", "json", "--out", str(out),
+    ])
+    assert rc == 0
+    plan = json.loads(plan_out.read_text(encoding="utf-8"))
+    assert plan["schema_version"] == "1.0"
+    assert plan["summary"]["embedded_total"] == 2
+    actions = {e["action"] for e in plan["plan"]}
+    assert actions == {"rebind_to_published"}
+    # The luid <-> source_id linkage is carried explicitly.
+    assert {m["source_id"] for m in plan["source_map"]} == {"wb-1", "wb-2"}
+
+    assert "# Embedded-datasource rebind plan" in plan_md.read_text(encoding="utf-8")
+    csv_rows = list(_csv.reader(_io.StringIO(plan_csv.read_text(encoding="utf-8"))))
+    assert csv_rows[0][0] == "Workbook"
+    assert len(csv_rows) == 3  # header + 2 entries
+
+
+
 def test_verify_with_cached_tableau_degrades_to_skip(tmp_path):
     # --verify needs a live Tableau client (VDS); a cached inventory cannot be probed.
     tableau = [{"name": "Superstore", "project": "S", "luid": "t-1",
