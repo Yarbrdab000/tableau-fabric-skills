@@ -275,7 +275,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   `--view-dependency-report` (existing flags untouched). New
   `resources/rebind-plan-contract.md` documents the contract. **Deterministic, additive and
   read-only** — never changes a `tier` / `score` / `bucket`; the migration guard suite is untouched
-  (  `956` passed / `1` skipped / `1` xfailed). Comparison suite `327` → `383` tests (+56). Skill
+  (`956` passed / `1` skipped / `1` xfailed). Comparison suite `327` → `383` tests (+56). Skill
   `VERSION` `1.6.0` → `1.7.0`; collection `0.8.0` → `0.9.0`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
