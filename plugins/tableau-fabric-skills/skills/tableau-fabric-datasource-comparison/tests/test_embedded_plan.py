@@ -120,6 +120,36 @@ def test_needs_attention_for_empty_datasource():
     assert e["binding_target"]["kind"] == "unbound"
 
 
+def test_bindings_reserve_optional_date_table_slot():
+    # Contract 1.0 optional `date_table` (safe-default null) is reserved on every bound target:
+    # byConnection (existing_fabric, enriched later from the Fabric inventory) and byPath
+    # (rebuilt / consolidated, written back by the calc-compiler). The unbound target omits it.
+    rows = [
+        _embedded("w1", "Superstore", SUPER_FIELDS, ["Orders"]),          # byConnection
+        _embedded("w2", "OneOff", ["Weird1", "Weird2", "Weird3"], ["WeirdTbl"]),  # byPath
+        _embedded("w3", "Empty", [], []),                                 # unbound
+    ]
+    fabric = [_fabric("Superstore", SUPER_FIELDS, ["Orders"], fid="ds-77", wsid="ws-9")]
+    plan = _plan(rows, fabric=fabric)
+    by_kind = {e["binding_target"]["kind"]: e["binding_target"] for e in plan["plan"]}
+    assert by_kind["byConnection"]["date_table"] is None
+    assert by_kind["byPath"]["date_table"] is None
+    assert "date_table" not in by_kind["unbound"]
+
+
+def test_gate1_downgrade_preserves_date_table_slot():
+    objs = [{"name": "Profit Ratio", "kind": "calc"}]
+    rows = [_embedded("w1", "Superstore", SUPER_FIELDS, ["Orders"], objects=objs)]
+    published = [_published("Superstore", SUPER_FIELDS, ["Orders"], luid="pub-5")]
+    plan = _plan(rows, published=published)
+    report = {"w1": {"dropped": [{"name": "Profit Ratio"}]}}
+    ep.apply_view_dependency_feedback(plan, report)
+    e = plan["plan"][0]
+    assert e["action"] == "convert_embedded"
+    assert e["binding_target"]["kind"] == "byPath"
+    assert e["binding_target"]["date_table"] is None
+
+
 def test_source_map_carries_luid_and_source_id_distinctly():
     # Local-files style: source_id is the filename, workbook_luid is empty -> source_id != luid.
     rows = [_embedded("dash.twb", "DS", ["A1", "B1"], ["T1"], luid="")]

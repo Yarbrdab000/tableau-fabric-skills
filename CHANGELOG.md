@@ -260,7 +260,9 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   a logical `model_id`, and a `binding_target` tagged by `binding_status` (`existing_fabric` →
   `byConnection` identity straight from the comparison, **excluded from the rebuild set**;
   `built_local` → `byPath`; `needs_attention` → unbound), plus overlap `evidence`, `caveats`, the
-  `source_id ↔ workbook_luid` map (never assumes they are equal), and a Markdown rollup + analyst CSV.
+  `source_id ↔ workbook_luid` map (never assumes they are equal), an optional `date_table` slot
+  reserved on every bound target (safe-default `null`; enriched later by the Fabric-inventory pass or
+  the calc-compiler write-back), and a Markdown rollup + analyst CSV.
   Two locked gates: `apply_view_dependency_feedback` downgrades a rebind to `convert_embedded` **only**
   when a dropped reference names an object the embedded datasource *actually contains*
   (presence-in-source), and existing-Fabric bindings are excluded from the rebuild set. Additive CLI
@@ -269,7 +271,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   `--view-dependency-report` (existing flags untouched). New
   `resources/rebind-plan-contract.md` documents the contract. **Deterministic, additive and
   read-only** — never changes a `tier` / `score` / `bucket`; the migration guard suite is untouched
-  (`956` passed / `1` skipped / `1` xfailed). Comparison suite `327` → `375` tests (+48). Skill
+  (  `956` passed / `1` skipped / `1` xfailed). Comparison suite `327` → `377` tests (+50). Skill
   `VERSION` `1.6.0` → `1.7.0`; collection `0.8.0` → `0.9.0`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so

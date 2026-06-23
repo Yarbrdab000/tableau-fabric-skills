@@ -84,6 +84,7 @@ def _byconnection(best: Dict[str, Any]) -> Dict[str, Any]:
         "workspace_id": best.get("workspace_id"),
         "semantic_model_id": best.get("fabric_id"),
         "dataset_name": best.get("fabric_name"),
+        "date_table": None,   # optional contract slot; enriched later by the Fabric-inventory owner
     }
 
 
@@ -256,6 +257,11 @@ def _assign_member(kind, model_id, binding_status, target_seed, is_rep, cluster,
     target = dict(target_seed)
     if target.get("kind") == "byPath":
         target["model_id"] = model_id
+    # Reserve the optional contract slot on every real (bound) target; absent == null. For
+    # rebind_to_published / existing_fabric it is enriched later from the Fabric inventory, and for
+    # rebuilt / consolidated models the calc-compiler writes it back -- the emitter only reserves it.
+    if target.get("kind") in ("byPath", "byConnection"):
+        target.setdefault("date_table", None)
 
     # An empty datasource cannot be bound to anything -- flag for a human.
     if not (row.get("fields") or row.get("sources")):
@@ -358,7 +364,8 @@ def apply_view_dependency_feedback(plan: Dict[str, Any], report: Dict[str, Any])
         cid = e.get("cluster_id") or "x"
         e["model_id"] = _cluster_model_id(cid, False)
         e["binding_status"] = "built_local"
-        e["binding_target"] = {"kind": "byPath", "model_id": e["model_id"], "model_path": None}
+        e["binding_target"] = {"kind": "byPath", "model_id": e["model_id"],
+                               "model_path": None, "date_table": None}
         e.setdefault("caveats", []).append(
             "Gate 1: downgraded to convert_embedded -- dropped object(s) present in the embedded "
             "source: %s" % ", ".join(hits))

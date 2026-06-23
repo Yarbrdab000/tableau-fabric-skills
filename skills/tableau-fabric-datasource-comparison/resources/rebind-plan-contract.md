@@ -97,14 +97,29 @@ LODs — which is what Gate 1 tests presence against).
 
 | `binding_status` | `binding_target` | Consumer behaviour |
 |---|---|---|
-| `existing_fabric` | `{ "kind": "byConnection", "workspace_id", "semantic_model_id", "dataset_name" }` | dashboard binds **byConnection**; **excluded from the rebuild set** (Gate 2) |
-| `built_local` | `{ "kind": "byPath", "model_id", "model_path": null }` | dashboard binds **byPath** using `relpath(model_path, report_dir)` — off `model_path` (written back), **not** the name |
-| `landed_to_delta` | `{ "kind": "byPath", "model_id", "model_path": null }` | set on **write-back** when the calc-compiler's `model_path` is `null` (storage fell back); report is left **unbound** |
+| `existing_fabric` | `{ "kind": "byConnection", "workspace_id", "semantic_model_id", "dataset_name", "date_table": null }` | dashboard binds **byConnection**; **excluded from the rebuild set** (Gate 2) |
+| `built_local` | `{ "kind": "byPath", "model_id", "model_path": null, "date_table": null }` | dashboard binds **byPath** using `relpath(model_path, report_dir)` — off `model_path` (written back), **not** the name |
+| `landed_to_delta` | `{ "kind": "byPath", "model_id", "model_path": null, "date_table": null }` | set on **write-back** when the calc-compiler's `model_path` is `null` (storage fell back); report is left **unbound** |
 | `needs_attention` | `{ "kind": "unbound", "reason": "..." }` | unbound; a human must look (e.g. an embedded ds with no fields or sources) |
 
 The `existing_fabric` identity (`workspace_id` / `semantic_model_id` / `dataset_name`) is supplied
 **straight from the comparison** `best_match.{workspace_id, fabric_id, fabric_name}` — those reports
 bind live and are **never** part of the calc-compiler build set.
+
+#### Optional `date_table` (additive; safe-default `null`)
+
+Every **bound** target (`byConnection` / `byPath`) reserves an optional `date_table` slot; the
+emitter always writes it as `null` and the `unbound` target omits it. **Absent == `null`** — consumers
+**must degrade gracefully when it is missing**. Shape when populated:
+
+```json
+"date_table": { "table": "Date", "active_keys": ["OrderDate"], "key_column": "Date", "grain_columns": ["Year","Quarter","Month"] }
+```
+
+(`grain_columns` is optional.) The emitter **does not compute** it — it only reserves the slot:
+for `rebind_to_published` / `existing_fabric` bindings it is enriched **later** from a Fabric-inventory
+pass, and for rebuilt / consolidated models the **calc-compiler writes it back** alongside
+`model_path`. This field is additive to `schema_version "1.0"` and does not change any existing key.
 
 ### `evidence`
 
