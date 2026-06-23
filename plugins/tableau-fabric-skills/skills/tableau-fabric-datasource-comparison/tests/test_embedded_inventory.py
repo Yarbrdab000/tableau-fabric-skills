@@ -190,6 +190,16 @@ def test_twb_object_list_classification():
     assert "FIXED" in lod["formula"]
 
 
+def test_twb_carries_distinct_identity_for_label_selector():
+    # caption / raw name / formatted-name captured distinctly; label = caption|formatted-name|name.
+    rows = emb.embedded_datasources_from_twb(SAMPLE_TWB, source_id="wb-9")
+    row = rows[0]
+    assert row["caption"] == "Superstore"
+    assert row["name"] == "federated.0abc"        # RAW <datasource> name -- NOT debracketed
+    assert row["formatted_name"] == ""
+    assert row["label"] == "Superstore"            # caption preferred
+
+
 def test_twb_parameters_datasource_skipped():
     rows = emb.embedded_datasources_from_twb(SAMPLE_TWB, source_id="x")
     assert all(r["datasource_name"] != "Parameters" for r in rows)
@@ -212,6 +222,12 @@ def test_metadata_shaping():
     assert row["datasource_id"] == "ds-1"
     assert row["has_extract"] is True
     assert row["source_path"] == "metadata"
+    # Catalog exposes only the display name -> carried as caption + label; raw name / formatted-name
+    # are not available (documented Metadata-API caption-only caveat).
+    assert row["caption"] == "Superstore (embedded)"
+    assert row["label"] == "Superstore (embedded)"
+    assert row["name"] == ""
+    assert row["formatted_name"] == ""
 
     field_names = {f["name"] for f in row["fields"]}
     assert "Hidden Field" not in field_names          # hidden fields dropped

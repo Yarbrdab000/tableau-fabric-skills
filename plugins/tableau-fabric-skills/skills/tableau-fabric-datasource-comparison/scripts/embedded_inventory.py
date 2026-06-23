@@ -181,13 +181,23 @@ def shape_embedded_from_metadata(workbook_node: Dict[str, Any]) -> List[Dict[str
     rows: List[Dict[str, Any]] = []
     for ds in workbook_node.get("embeddedDatasources") or []:
         fields = ds.get("fields") or []
+        # The Metadata API (Catalog) exposes only the embedded datasource's display name -- which is
+        # typically the caption -- not its raw internal name or formatted-name. So the only reliable
+        # migrate_datasource selector for a Catalog-sourced row is the caption (carried as ``label``);
+        # ``name`` / ``formatted_name`` stay empty. Acceptable because migration's match set includes
+        # the caption (documented Metadata-API caption-only caveat in resources/rebind-plan-contract.md).
+        display_name = ds.get("name") or ""
         rows.append({
             "workbook_luid": luid,
             "workbook_name": wb_name,
             "project": project,
             "source_id": luid,
-            "datasource_name": ds.get("name") or "",
+            "datasource_name": display_name,
             "datasource_id": ds.get("id") or "",
+            "caption": display_name,
+            "name": "",
+            "formatted_name": "",
+            "label": display_name,
             "fields": _shape_fields_meta(fields),
             "sources": tab._shape_sources(ds.get("upstreamTables") or []),
             "objects": _objects_meta(fields),
@@ -340,14 +350,25 @@ def embedded_datasources_from_twb(
         if not (parsed["fields"] or parsed["sources"] or objects):
             continue
         internal = _debracket(attrs.get("name", ""))
-        ds_name = (attrs.get("caption") or internal).strip()
+        # Capture the per-datasource identity DISTINCTLY for the migrate_datasource(datasource=label)
+        # selector. ``name`` is the RAW <datasource> name attribute -- NOT debracketed -- because the
+        # migration side matches ds.get("name") raw; debracketing it would miss the no-caption case.
+        raw_name = attrs.get("name", "") or ""
+        caption = attrs.get("caption") or ""
+        formatted_name = attrs.get("formatted-name") or ""
+        ds_name = (caption or internal).strip()
+        label = caption or formatted_name or raw_name
         rows.append({
             "workbook_luid": workbook_luid,
             "workbook_name": workbook_name,
             "project": project,
             "source_id": source_id,
             "datasource_name": ds_name,
-            "datasource_id": internal or (attrs.get("formatted-name") or f"datasource{idx}"),
+            "datasource_id": internal or (formatted_name or f"datasource{idx}"),
+            "caption": caption,
+            "name": raw_name,
+            "formatted_name": formatted_name,
+            "label": label,
             "fields": parsed["fields"],
             "sources": parsed["sources"],
             "objects": objects,
