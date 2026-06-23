@@ -244,6 +244,37 @@ per-datasource diffs; the `--export-xlsx` workbook adds a **Borderline** sheet. 
 read-only — it never changes a tier/score/bucket. See
 [`resources/report-schema.md`](resources/report-schema.md#borderline-decision-review-the-reuse-vs-rebuild-fence).
 
+## Embedded-datasource rebind plan — workbooks, not just published datasources
+
+Everything above inventories **published** datasources. But a real estate also has hundreds-to-
+thousands of **workbooks** whose datasource is **embedded** in the `.twb` (never published) — those
+are migration assets too, and the same one is routinely copied into dozens of workbooks. The embedded
+engine enumerates them, collapses the near-duplicates, scores each against the estate, and emits a
+**`rebind-plan.json`** that says, per workbook, whether to **rebind** it to something that already
+exists or **rebuild** its model:
+
+```
+embedded_inventory.py → embedded datasources (+ each one's workbook-local calcs/sets/groups/bins/LODs)
+                        keyed by workbook_luid; Metadata API + a .twb/parse_tds fallback
+embedded_cluster.py   → fingerprint + cluster near-duplicates (14 copies of "Superstore" → one asset)
+embedded_score.py     → score each embedded ds vs Fabric models AND published datasources (reuses score_pair)
+embedded_plan.py      → assign an action + binding target per workbook → rebind-plan.json (+ Markdown + CSV)
+```
+
+Each workbook gets one of four **actions** — `rebind_to_published` (its embedded copy overlaps a
+published datasource), `consolidate_new_model` (it leads a duplicate group → build **one** shared
+model), `rebind_to_rebuilt` (a duplicate member rebinding to that shared model, or to an existing
+Fabric model), or `convert_embedded` (a unique embedded ds with no home) — plus a `binding_target`
+tagged by `binding_status` (`existing_fabric` → bind live `byConnection`, **excluded from the rebuild
+set**; `built_local` → bind `byPath`; `needs_attention` → unbound). The plan reuses the comparison
+engine's scoring wholesale and is a **frozen cross-skill contract** (`schema_version "1.0"`) consumed
+by the migration/calc-compiler skill (which builds the models and writes back their resolved
+identity) and the dashboard skill (which binds the reports). It honours two gates: a dashboard
+`view_dependency_report` downgrades a rebind to `convert_embedded` **only** when a dropped reference
+names an object the embedded datasource *actually contains* (presence-in-source, not drop volume),
+and existing-Fabric bindings are excluded from the rebuild set. Deterministic, offline, additive.
+Full reference: [`resources/rebind-plan-contract.md`](resources/rebind-plan-contract.md).
+
 ## Usage
 
 ```powershell
@@ -270,6 +301,14 @@ py -3.11 scripts/compare_estate.py `
 py -3.11 scripts/compare_estate.py `
     --tableau-inventory-json tableau.json --fabric-inventory-json fabric.json `
     --out report.md --export-xlsx estate.xlsx --export-csv estate.csv
+
+# Embedded-datasource rebind plan: inventory the workbooks first, then plan them against the estate:
+py -3.11 scripts/embedded_inventory.py --out embedded.json    # (live; --dry-run to preview)
+py -3.11 scripts/compare_estate.py `
+    --tableau-inventory-json tableau.json --fabric-inventory-json fabric.json `
+    --embedded-inventory-json embedded.json `
+    --rebind-plan-out rebind-plan.json --rebind-plan-md rebind-plan.md --rebind-plan-csv rebind-plan.csv `
+    --out report.md
 ```
 
 Each inventory script also runs standalone (`tableau_inventory.py`, `fabric_inventory.py`) and supports
@@ -308,6 +347,14 @@ Each inventory script also runs standalone (`tableau_inventory.py`, `fabric_inve
   detail sheet (the same per-datasource rows, sortable), and a *Fabric coverage* sheet (net-new models).
   Hand-assembled OOXML — **no `openpyxl`/`pandas` dependency**. Composes with everything (`--verify`,
   adjudication) since it just reads the finished report.
+- `--embedded-inventory-json PATH` — load a cached **embedded**-datasource inventory (from
+  `scripts/embedded_inventory.py`) and emit a **rebind plan** for the workbooks against the gathered
+  Fabric + published-Tableau estates. Pair with `--rebind-plan-out PATH` (the `rebind-plan.json`),
+  `--rebind-plan-md PATH` (Markdown rollup), `--rebind-plan-csv PATH` (analyst CSV). Tune with
+  `--rebind-strong-cut` (default `0.65` — the score above which an embedded ds counts as already having
+  an equivalent) and `--rebind-cluster-threshold` (default `0.80` — how aggressively near-duplicates
+  collapse). `--view-dependency-report PATH` folds a dashboard feedback report back in (Gate 1). See
+  [`resources/rebind-plan-contract.md`](resources/rebind-plan-contract.md).
 
 ## Output
 
@@ -334,6 +381,13 @@ A Markdown (or JSON) report — see `resources/report-schema.md`:
   mismatches, shared/unique source tables, and an advisory lean — so the customer decides reuse vs.
   rebuild from the actual differences.
 - **Recommended actions**: grouped by tier, pointing the rebuild set at the `tableau-migration` skill.
+
+When `--embedded-inventory-json` is supplied the run also writes a **rebind plan** for the workbooks
+(`--rebind-plan-out` / `-md` / `-csv`): a headline weighting rollup (*"of N embedded datasources
+across W workbooks: M rebind to a published datasource, R already exist in Fabric, K cluster into J
+new consolidated models, C convert in place"*), per-workbook action + binding-target rows, and the
+duplicate-group clusters — the `rebind-plan.json` handed to the migration and dashboard skills
+(`resources/rebind-plan-contract.md`).
 
 After an `--apply-adjudication` pass the report also shows an **After semantic review** rollup
 (deterministic vs. agent-adjudicated counts, with the delta) — advisory, the deterministic verdict is

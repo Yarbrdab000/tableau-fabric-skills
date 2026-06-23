@@ -246,6 +246,31 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   verdict. **Deterministic, additive and read-only** — never changes a `tier` / `score` / `bucket`.
   Comparison suite `306` → `327` tests (+21). Skill `VERSION` `1.5.7` → `1.6.0`; collection
   `0.7.7` → `0.8.0`.
+- **tableau-fabric-datasource-comparison:** new **embedded-datasource rebind/consolidation engine**
+  — the skill now plans the **workbooks** with embedded (in-`.twb`, never-published) datasources, not
+  only the published datasources. Four new pure, offline scripts: `embedded_inventory.py` enumerates
+  every embedded datasource (+ its **workbook-local object list** — calcs / sets / groups / bins /
+  LODs — keyed by `workbook_luid`) via the Metadata API with a `.twb`/`parse_tds` download fallback
+  and a local-files mode; `embedded_cluster.py` fingerprints + clusters near-duplicates so the same
+  datasource copied into dozens of workbooks collapses to **one** asset; `embedded_score.py` scores
+  each embedded ds against the Fabric models **and** the published Tableau datasources by **reusing
+  `compare.score_pair` / `compare.band_for`** (no scoring reinvented); `embedded_plan.py` emits a
+  **`rebind-plan.json`** (frozen cross-skill `schema_version "1.0"`) assigning every workbook an
+  `action` (`rebind_to_published` / `consolidate_new_model` / `rebind_to_rebuilt` / `convert_embedded`),
+  a logical `model_id`, and a `binding_target` tagged by `binding_status` (`existing_fabric` →
+  `byConnection` identity straight from the comparison, **excluded from the rebuild set**;
+  `built_local` → `byPath`; `needs_attention` → unbound), plus overlap `evidence`, `caveats`, the
+  `source_id ↔ workbook_luid` map (never assumes they are equal), and a Markdown rollup + analyst CSV.
+  Two locked gates: `apply_view_dependency_feedback` downgrades a rebind to `convert_embedded` **only**
+  when a dropped reference names an object the embedded datasource *actually contains*
+  (presence-in-source), and existing-Fabric bindings are excluded from the rebuild set. Additive CLI
+  on `compare_estate.py`: `--embedded-inventory-json`, `--rebind-plan-out` / `-md` / `-csv`,
+  `--rebind-strong-cut` (default `0.65`), `--rebind-cluster-threshold` (default `0.80`),
+  `--view-dependency-report` (existing flags untouched). New
+  `resources/rebind-plan-contract.md` documents the contract. **Deterministic, additive and
+  read-only** — never changes a `tier` / `score` / `bucket`; the migration guard suite is untouched
+  (`956` passed / `1` skipped / `1` xfailed). Comparison suite `327` → `375` tests (+48). Skill
+  `VERSION` `1.6.0` → `1.7.0`; collection `0.8.0` → `0.9.0`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.
