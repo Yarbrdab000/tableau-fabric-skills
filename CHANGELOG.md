@@ -229,6 +229,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     endpoint both resolve; importance section + connected-assets export render with real data).
     Comparison suite `267` → `306` tests. Skill `VERSION` `1.5.6` → `1.5.7`; collection
     `0.7.6` → `0.7.7`.
+- **tableau-fabric-datasource-comparison:** new **borderline decision-review** layer
+  (`scripts/borderline.py`) for the datasources sitting on the **reuse-vs-rebuild fence** — where the
+  structural evidence is genuinely close, so the customer can decide from a diff instead of trusting an
+  automatic verdict. Selection is deliberately inclusive (flagged when **any** trigger fires: the
+  `partial` bucket, score within `--review-band` of the reuse/rebuild cutoff, a `Low`-confidence
+  verdict, or calcs not yet confirmed as measures); a clean rebuild with no Fabric candidate is never
+  borderline. Each flagged match gains `match.borderline` — the field-level diff (shared / Tableau-only
+  / Fabric-only columns, type mismatches, shared/unique upstream tables, source coverage, logic-parity
+  caveat) plus an advisory `recommendation_hint` (`lean_reuse` / `lean_rebuild` /
+  `reuse_with_logic_review`) — and the rollup gains `summary.borderline.{count, band, strong_cut,
+  partial_cut, by_origin_bucket, reasons, hints, names}`. The Markdown report adds a **Borderline
+  review** headline + per-datasource diff section; the `--export-xlsx` workbook adds a **Borderline**
+  sheet (when `count > 0`). New CLI flags `--review-band` (default `0.08`, fence half-width) and
+  `--review-top-n` (default `25`, printed-diff cap). The `recommendation_hint` **never** overrides the
+  verdict. **Deterministic, additive and read-only** — never changes a `tier` / `score` / `bucket`.
+  Comparison suite `306` → `327` tests (+21). Skill `VERSION` `1.5.7` → `1.6.0`; collection
+  `0.7.7` → `0.8.0`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.

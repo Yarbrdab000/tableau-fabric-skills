@@ -37,6 +37,7 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
 | `logic_parity` | object | business-logic-parity rollup (additive): `{none, likely, partial, unverified, review_needed}` — counts of matched datasources by [logic-parity](#logic-parity-calculated-fields--measures) status, plus `review_needed` = matches that look already-in-Fabric/partial **but whose calculated fields are not confirmed as measures** |
 | `confidence` | object | verdict-confidence rollup (additive): `{high, medium, low, high_confidence_already_exists, low_confidence_review}` — how trustworthy each **verdict** is once the independent signals are fused. `low_confidence_review` counts `already_exists`/`partial` verdicts that landed **Low** (a human should look). See [confidence](#verdict-confidence) |
 | `importance` | object | artifact-importance rollup (additive): `{by_level, critical, high, total_views, certified_datasources, datasources_with_quality_warning}` — how much each datasource **matters** to the business (reach + consumption + endorsement), so a migration protects the highest-value assets first. `total_views` is `null` when no view telemetry was gathered. See [artifact importance](#artifact-importance--connected-assets) |
+| `borderline` | object | borderline-review rollup (additive): `{count, band, strong_cut, partial_cut, by_origin_bucket, reasons, hints, names}` — the datasources sitting on the **reuse-vs-rebuild fence**, where the structural evidence is genuinely close, so a migration lead can adjudicate from a side-by-side diff rather than trust an automatic verdict. `count` is `0` when none qualify. See [borderline review](#borderline-decision-review-the-reuse-vs-rebuild-fence) |
 
 ## `matches[]` (sorted most-comparable first)
 
@@ -62,6 +63,7 @@ added. The deterministic `summary` / `tier` / `score` / `bucket` are never modif
 | `logic_parity` | object \| null | business-logic-parity for this match (additive; `null` when there is no Fabric candidate): `{status, tableau_calc_count, fabric_measure_count, matched, unmatched[]}` where `status` is `none` / `likely` / `partial` / `unverified`. Name-level only — see [logic-parity](#logic-parity-calculated-fields--measures) |
 | `confidence` | object | verdict confidence for this match (additive): `{level, drivers[], cautions[], margin, corroborating_signals, reciprocal_best}` where `level` is `High` / `Medium` / `Low`. Read-only over the verdict — never changes `tier`/`score`/`bucket`. See [confidence](#verdict-confidence) |
 | `importance` | object | artifact importance for this match (additive): `{level, score, drivers[]}` where `level` is `Critical` / `High` / `Moderate` / `Low` / `Unknown` (`Unknown` only when there was no usage evidence at all). Read-only — never changes `tier`/`score`/`bucket`/`priority`. See [artifact importance](#artifact-importance--connected-assets) |
+| `borderline` | object | present **only** on the on-the-fence matches (additive): `{is_borderline, band, reasons[], score, tier, bucket, best_match, workspace, recommendation_hint, columns{…}, source{…}, logic_parity}` — the field-level diff between the Tableau datasource and its best Fabric candidate (shared / Tableau-only / Fabric-only columns, type mismatches, shared/unique source tables, source coverage). Advisory and read-only — `recommendation_hint` (`lean_reuse` / `lean_rebuild` / `reuse_with_logic_review`) **never** overrides `tier`/`score`/`bucket`. See [borderline review](#borderline-decision-review-the-reuse-vs-rebuild-fence) |
 
 ### candidate object (`best_match` and each `candidates[]`)
 
@@ -328,7 +330,11 @@ rendered only when present). The **`Fabric coverage`** sheet lists
 `summary.fabric_coverage.unmatched_model_names` (`Fabric model`, `Workspace`). A fourth
 **`Connected assets`** sheet is appended **only when connected-asset telemetry was gathered** — one
 row per dependent workbook / dashboard (`Datasource`, `Importance`, `Views`, `Asset type`,
-`Asset name`, `Last refreshed`), ordered by the datasource's importance.
+`Asset name`, `Last refreshed`), ordered by the datasource's importance. A **`Borderline`** sheet
+follows whenever `summary.borderline.count > 0` — one row per on-the-fence datasource (name, project,
+score, tier, advisory lean, reasons, best Fabric match + workspace, shared / Tableau-only /
+Fabric-only / type-mismatch column counts, source coverage, logic parity). See
+[borderline review](#borderline-decision-review-the-reuse-vs-rebuild-fence).
 
 ## Artifact importance & connected assets
 
@@ -358,5 +364,48 @@ statistics do not return are simply `null`. The `summary.importance` rollup
 (`{by_level, critical, high, total_views, certified_datasources, datasources_with_quality_warning}`)
 feeds the report's **Artifact importance & connected assets** section (rendered only when at least one
 datasource scored a non-`Unknown` level) and the export's importance metrics + `Connected assets` sheet.
+
+## Borderline decision review (the reuse-vs-rebuild fence)
+
+The headline buckets a datasource as `already_exists`, `partial`, or `rebuild`. Most land cleanly, but
+a minority sit **on the fence** — the structural evidence for *reuse the Fabric model* vs. *rebuild it*
+is genuinely close, and an automatic verdict is exactly where a migration lead wants **evidence**, not
+a coin-flip. The borderline layer selects that on-the-fence set and attaches a **field-level diff** so
+the call can be made from the actual differences. It is **deterministic, additive and read-only** — it
+never changes a `tier` / `score` / `bucket`, and a clear rebuild with no Fabric candidate is **never**
+borderline.
+
+A match is borderline when **any** of these independent triggers fire (the union is intentionally
+inclusive — surfacing one extra datasource for review is cheaper than silently skipping a real one):
+
+- `partial_tier` — the verdict is the `partial` bucket (a partial is on the fence by definition);
+- `near_reuse_boundary` — the score sits within `--review-band` of the `already_exists` (Strong) cutoff,
+  with a real `best_match`;
+- `near_rebuild_boundary` — the score sits within `--review-band` of the `rebuild` (Partial) cutoff;
+- `low_confidence` — an `already_exists` / `rebuild` verdict the confidence layer rated `Low`;
+- `logic_unverified` — an `already_exists` / `partial` whose calculated fields are not confirmed as
+  measures (logic parity `unverified` / `partial`).
+
+Each borderline match carries `match.borderline`:
+
+| Key | Meaning |
+|---|---|
+| `is_borderline` | always `true` on the matches that carry the block |
+| `band` | the `--review-band` used |
+| `reasons[]` | which triggers fired (the codes above) |
+| `score` / `tier` / `bucket` | the (unchanged) deterministic verdict, echoed for convenience |
+| `best_match` / `workspace` | the Fabric candidate being diffed |
+| `recommendation_hint` | advisory lean — `lean_reuse` / `lean_rebuild` / `reuse_with_logic_review` (never overrides the verdict) |
+| `columns` | `{shared_count, tableau_total, fabric_total, tableau_only_count, fabric_only_count, type_mismatch_count, shared[], tableau_only[], fabric_only[], type_mismatches[]}` — the column-level diff (name lists capped) |
+| `source` | `{compared, coverage, shared_tables[], tableau_only_tables[], fabric_only_tables[]}` — the physical-source diff |
+| `logic_parity` | the match's logic-parity block, echoed so the reviewer sees the calc caveat in context |
+
+The `summary.borderline` rollup carries `{count, band, strong_cut, partial_cut, by_origin_bucket,
+reasons, hints, names}` (`reasons` / `hints` are code→count maps; `names` is a score-sorted, capped
+list). The CLI adds `render_limit` (`--review-top-n`) to bound how many full diffs the Markdown report
+prints. The report renders a **Borderline review** headline near the top and a per-datasource **diff
+detail** section before *Recommended actions*; both are omitted when `count` is `0`. The
+`--export-xlsx` workbook gains a **Borderline** sheet whenever `count > 0`. Tune the fence width with
+`--review-band` (default `0.08`).
 
 
