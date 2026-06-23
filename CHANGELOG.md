@@ -22,6 +22,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   `dataCategory: Time`, else **inferred** from relationships whose `toColumn` is a dateTime-typed key
   column. Producer-only (no consumer wired); the existing `tables`/`columns`/`measures`/`sources` keys
   are unchanged. `resources/report-schema.md` documents the new keys. Skill `VERSION` `1.7.0` → `1.8.0`; collection `0.9.0` → `0.10.0`.
+- **tableau-migration:** the deterministic calc→DAX compiler (`scripts/calc_to_dax.py`) gains
+  faithful, type-checked translations for more Tableau functions — `ATAN2`, `DATENAME` (all date
+  parts, not just weekday), `ISOYEAR`, `DATETIME`, `ATTR`, `GROUP_CONCAT`, and the table
+  calculations `RANK_MODIFIED`, `RANK_PERCENTILE`, and `TOTAL` — each with a probe/test and the
+  original formula preserved as a `TableauFormula` annotation. The tie-aware
+  **argmax-over-a-dimension** suggestion now also recognizes the real workbook shape where the
+  per-partition max and the per-member detail are **separate named calcs** (e.g. "Highest Selling
+  City By State Sales"), in addition to the inline and single-reference forms. Functions with **no
+  provably-faithful DAX target** stay deliberately *fail-closed* (regex `REGEXP_*`; one-sided /
+  internal-whitespace `TRIM`/`LTRIM`/`RTRIM`; start-of-week- or ISO-dependent `WEEK`/`ISOQUARTER`;
+  `MAKETIME`/`MAKEDATETIME`; `HEXBINX`/`HEXBINY`; culture-sensitive `STR`; addressing-order
+  `RANK_UNIQUE`; …), and the translation router (`scripts/translation_router.py`) now routes each
+  to **honest, actionable guidance** — a DAX-language-gap note that explains *why* no faithful form
+  exists, and (for a bare row-level expression used where a measure is required, e.g.
+  `IF [Region]="east" THEN [Sales] END`) a missing-aggregation hint pointing to the `SUM(...)` /
+  calculated-column fix — instead of an over-optimistic catch-all. Additive only; the migration
+  suite stays green. Skill `VERSION` `1.3.0` → `1.4.0`.
 - **tableau-migration:** estate/local runs now emit an **openable Power BI project (`.pbip`)** per
   migrated datasource by default (`pbip/<Name>/<Name>.pbip` via `assemble_model.write_local_pbip`),
   alongside the canonical `semantic_models/<Name>.SemanticModel/`, so each datasource opens directly

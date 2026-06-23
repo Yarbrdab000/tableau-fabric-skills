@@ -105,18 +105,27 @@ _GUIDANCE = {
         "aggregate. Choose the leanest faithful shape and oracle-verify it before proposing."
     ),
     DAX_LANGUAGE_GAP: (
-        "No faithful native DAX form exists for this construct (e.g. regex, arbitrary-format "
-        "DATEPARSE, general SPLIT, FINDNTH, case-sensitive ordered text comparison). Any candidate is "
-        "an APPROXIMATION -- author it only if the real usage is narrow enough to be safe (e.g. a "
-        "fixed delimiter via PATH/SUBSTITUTE, a known date format), mark it approximate with a clear "
-        "caveat, and oracle-verify. If it cannot be made faithful, keep the honest stub."
+        "No faithful native DAX form exists for this construct: regex (no DAX engine); "
+        "arbitrary-format DATEPARSE/ISDATE; general SPLIT / nth-occurrence FINDNTH; TRIM/LTRIM/RTRIM "
+        "(DAX TRIM collapses INTERNAL whitespace and has no one-sided form); start-of-week- or "
+        "ISO-dependent WEEK/ISOQUARTER; MAKETIME/MAKEDATETIME (DAX time epoch differs); HEXBINX/HEXBINY "
+        "grid snap; culture-sensitive STR number formatting; RANK_UNIQUE (tie-break follows Tableau's "
+        "internal addressing/row order); case-sensitive ordered text comparison. Any candidate is an "
+        "APPROXIMATION -- author it only if the real usage is narrow enough to be safe (e.g. a fixed "
+        "delimiter via PATH/SUBSTITUTE, a known date format), mark it approximate with a clear caveat, "
+        "and oracle-verify. If it cannot be made faithful, keep the honest stub."
     ),
     TYPE_OR_SHAPE_MISMATCH: (
         "The deterministic engine refused on a typing/parse/shape mismatch (inconsistent IF/CASE "
-        "branch types, incomparable operands, the 4-arg IIF unknown branch, or an aggregate used "
-        "inside a row-level column calc). This is often resolvable: supply an explicit cast, align the "
-        "branch types, or re-route an aggregating calc to a measure instead of a calculated column, "
-        "then re-translate and validate."
+        "branch types, incomparable operands, the 4-arg IIF unknown branch, an aggregate used "
+        "inside a row-level column calc, or a bare row-level field used where a measure -- which "
+        "needs an aggregation -- is required). This is often resolvable: supply an explicit cast, "
+        "align the branch types, re-route an aggregating calc to a measure instead of a calculated "
+        "column, or -- for a row-level expression with no aggregation (e.g. "
+        "IF [Region]=\"east\" THEN [Sales] END) -- either wrap it in the intended aggregation (SUM/"
+        "MIN/...) to make a measure, exactly as the SUM(...) West-Sales form already translates, or "
+        "emit it as a calculated column (the row-level translator handles it directly). Then "
+        "re-translate and validate."
     ),
     UNRESOLVED_REFERENCE: (
         "A referenced field, dimension, or calc could not be bound (unresolved/ambiguous name, terms "
@@ -134,33 +143,49 @@ _GUIDANCE = {
 
 # Tableau table-calc functions: in measure/column mode the deterministic engine reports these as
 # "unsupported function <NAME>" because they are addressing expressions, not measure-valid calls.
+# RANK_UNIQUE is deliberately NOT here: its tie-break follows Tableau's internal addressing/row
+# order, which has no faithful DAX equivalent, so it is a DAX-language gap (below), not a
+# recoverable-addressing case.
 _TABLE_CALC_FUNCS = frozenset({
     "WINDOW_SUM", "WINDOW_AVG", "WINDOW_MIN", "WINDOW_MAX", "WINDOW_COUNT", "WINDOW_MEDIAN",
     "WINDOW_STDEV", "WINDOW_STDEVP", "WINDOW_VAR", "WINDOW_VARP", "WINDOW_PERCENTILE",
     "WINDOW_CORR", "WINDOW_COVAR", "WINDOW_COVARP",
     "RUNNING_SUM", "RUNNING_AVG", "RUNNING_MIN", "RUNNING_MAX", "RUNNING_COUNT",
-    "RANK", "RANK_DENSE", "RANK_MODIFIED", "RANK_PERCENTILE", "RANK_UNIQUE",
+    "RANK", "RANK_DENSE", "RANK_MODIFIED", "RANK_PERCENTILE",
     "INDEX", "SIZE", "FIRST", "LAST", "LOOKUP", "PREVIOUS_VALUE", "TOTAL",
 })
 
-# Functions with no faithful native DAX target (regex has no DAX engine; the rest are
-# format/locale-dependent or need an unbounded split).
+# Functions with no faithful native DAX target. The engine fails these closed on purpose; the
+# router labels them so the report says WHY rather than implying a closed form might exist.
 _DAX_GAP_FUNCS = frozenset({
+    # DAX has no regex engine.
     "REGEXP_MATCH", "REGEXP_EXTRACT", "REGEXP_EXTRACT_NTH", "REGEXP_REPLACE",
+    # Format/locale-dependent parsing, or an unbounded split / nth-occurrence search.
     "DATEPARSE", "ISDATE", "SPLIT", "FINDNTH",
+    # Trims that diverge from DAX: DAX TRIM also collapses INTERNAL whitespace runs, and there is no
+    # native leading-only / trailing-only trim.
+    "TRIM", "LTRIM", "RTRIM",
+    # Start-of-week- / ISO-quarter-dependent date parts (DATEPART('week') is excluded for the same
+    # reason), and constructors whose DAX time epoch differs from Tableau's.
+    "WEEK", "ISOQUARTER", "MAKETIME", "MAKEDATETIME",
+    # Exotic hex-bin grid snap; culture-sensitive number->string formatting; a rank whose tie-break
+    # follows Tableau's internal addressing/row order (no deterministic DAX equivalent).
+    "HEXBINX", "HEXBINY", "STR", "RANK_UNIQUE",
 })
 
-_UNSUPPORTED_FN_PREFIX = "unsupported function "
+_UNSUPPORTED_FN_PREFIXES = ("unsupported function ", "unsupported table calculation ")
 
 
 def _unsupported_function_name(reason_lower, reason):
-    """If ``reason`` is ``unsupported function <NAME>`` return the bare uppercased NAME, else None."""
-    if not reason_lower.startswith(_UNSUPPORTED_FN_PREFIX):
-        return None
-    name = reason[len(_UNSUPPORTED_FN_PREFIX):].strip()
-    # the engine emits a single bare token here; guard against stray trailing text
-    name = name.split()[0] if name else ""
-    return name.upper().strip("[]") or None
+    """If ``reason`` is ``unsupported function <NAME>`` / ``unsupported table calculation <NAME>``
+    return the bare uppercased NAME, else None."""
+    for prefix in _UNSUPPORTED_FN_PREFIXES:
+        if reason_lower.startswith(prefix):
+            name = reason[len(prefix):].strip()
+            # the engine emits a single bare token here; guard against stray trailing text
+            name = name.split()[0] if name else ""
+            return name.upper().strip("[]") or None
+    return None
 
 
 def classify_fallback(reason, *, role=None, fields=None, has_suggestion=False):
@@ -225,6 +250,7 @@ def classify_fallback(reason, *, role=None, fields=None, has_suggestion=False):
             or "incomparable types" in rl
             or "case-sensitive" in rl
             or "not valid in a row-level column calc" in rl
+            or "not valid in a measure" in rl
             or "4-arg iif" in rl
             or "booleans support only" in rl
             or "in requires a non-boolean" in rl

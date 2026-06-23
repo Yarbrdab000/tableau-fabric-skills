@@ -208,6 +208,22 @@ TRANSLATIONS = [
     # uses EXACT for Tableau's case-sensitive string equality.
     ("COUNTD(IF [Region] = \"East\" THEN [Quantity] END)",
      "COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK('Orders'[Quantity]), FILTER('Orders', EXACT('Orders'[Region], \"East\"))), 0)"),
+    # --- ATAN2 / ATTR / GROUP_CONCAT (measure-context breadth additions) ---
+    # ATAN2(y, x): y is the FIRST argument. DAX has no ATAN2, so the quadrant is rebuilt with SWITCH,
+    # which evaluates only the matched branch -> ATAN(y / x) never runs in the x = 0 cases.
+    ("ATAN2(SUM([Profit]), SUM([Sales]))",
+     "SWITCH(TRUE(), "
+     "SUM('Orders'[Sales]) > 0, ATAN(SUM('Orders'[Profit]) / SUM('Orders'[Sales])), "
+     "AND(SUM('Orders'[Sales]) < 0, SUM('Orders'[Profit]) >= 0), ATAN(SUM('Orders'[Profit]) / SUM('Orders'[Sales])) + PI(), "
+     "AND(SUM('Orders'[Sales]) < 0, SUM('Orders'[Profit]) < 0), ATAN(SUM('Orders'[Profit]) / SUM('Orders'[Sales])) - PI(), "
+     "AND(SUM('Orders'[Sales]) = 0, SUM('Orders'[Profit]) > 0), PI() / 2, "
+     "AND(SUM('Orders'[Sales]) = 0, SUM('Orders'[Profit]) < 0), -PI() / 2, "
+     "0)"),
+    # ATTR([field]): the value when unique within the partition, else the "*" sentinel.
+    ("ATTR([Region])", "IF(HASONEVALUE('Orders'[Region]), VALUES('Orders'[Region]), \"*\")"),
+    # GROUP_CONCAT([field][, sep]): dup-inclusive concat over the base table; default separator ",".
+    ("GROUP_CONCAT([Region])", "CONCATENATEX('Orders', 'Orders'[Region], \",\")"),
+    ("GROUP_CONCAT([Region], \"; \")", "CONCATENATEX('Orders', 'Orders'[Region], \"; \")"),
 ]
 
 # Each of these MUST fall back (translator returns None).
@@ -264,6 +280,7 @@ FALLBACKS = [
     "ABS(MIN([Order Date]))",                     # date operand (MIN on dateTime -> date)
     "SQRT(SUM([Sales]), 2)",                      # wrong arity (1-arg fn given 2)
     "POWER(SUM([Sales]))",                        # wrong arity (POWER needs 2)
+    "ATAN2(SUM([Sales]))",                        # wrong arity (ATAN2 needs 2)
     "DIV(SUM([Sales]))",                          # wrong arity (DIV needs 2)
     "SQUARE(SUM([Sales]), 2)",                    # wrong arity (SQUARE takes 1)
     "ROUND(SUM([Sales]), 2, 3)",                  # wrong arity (ROUND takes 1 or 2)
@@ -442,6 +459,14 @@ COLUMN_TRANSLATIONS = [
     ("QUARTER([Order Date])", "QUARTER('Orders'[Order_Date])"),                          # 1-4
     ("ISOWEEK([Order Date])", "WEEKNUM('Orders'[Order_Date], 21)"),                      # ISO-8601 week
     ("ISOWEEKDAY([Order Date])", "WEEKDAY('Orders'[Order_Date], 2)"),                    # Mon=1..Sun=7
+    ("ISOYEAR([Order Date])",
+     "YEAR('Orders'[Order_Date] + 4 - WEEKDAY('Orders'[Order_Date], 2))"),               # ISO week-numbering year
+    # DATENAME('part', d) -> FORMAT(d, token) for the finite-domain name parts only (full month/day
+    # name, 4-digit year): each renders the exact value Tableau does under the same locale.
+    ('DATENAME("month", [Order Date])', "FORMAT('Orders'[Order_Date], \"mmmm\")"),       # full month name
+    ('DATENAME("weekday", [Order Date])', "FORMAT('Orders'[Order_Date], \"dddd\")"),     # full day name
+    ('DATENAME("year", [Order Date])', "FORMAT('Orders'[Order_Date], \"yyyy\")"),        # 4-digit year text
+    ("DATETIME([Order Date])", "'Orders'[Order_Date]"),                                  # a date is already a DAX datetime -> identity
     # --- simple CASE on a string dimension: case-SENSITIVE, so EXACT chain (not SWITCH) ---
     ('CASE [Region] WHEN "East" THEN 1 WHEN "West" THEN 2 ELSE 0 END',
      "IF(EXACT('Orders'[Region], \"East\"), 1, IF(EXACT('Orders'[Region], \"West\"), 2, 0))"),
@@ -458,6 +483,8 @@ COLUMN_FALLBACKS = [
     # measure-only constructs are invalid in a row-level column
     "SUM([Sales])",                               # aggregation
     "PERCENTILE([Sales], 0.5)",                   # aggregation
+    "ATTR([Region])",                             # ATTR is an aggregation (HASONEVALUE/VALUES) -> measure-only
+    "GROUP_CONCAT([Region])",                     # GROUP_CONCAT aggregates the whole partition -> measure-only
     "{FIXED [Region] : SUM([Sales])}",            # LOD
     # functions whose DAX equivalent is not faithful -> deferred to fallback
     "TRIM([Region])",                             # DAX TRIM also collapses internal spaces
@@ -466,6 +493,10 @@ COLUMN_FALLBACKS = [
     'SPLIT([Region], ",", 1)',                    # no general DAX equivalent
     "STR([Sales])",                               # culture-sensitive formatting
     'DATE("2020-01-01")',                         # DATE(text) is culture-sensitive parsing
+    'DATENAME("day", [Order Date])',              # single-char FORMAT token is ambiguous -> not mapped
+    'DATENAME("quarter", [Order Date])',          # no faithful quarter-NAME FORMAT token
+    'DATENAME("month", [Order Date], "monday")',  # explicit start_of_week argument -> falls back
+    'DATETIME("2020-01-01")',                     # DATETIME(text) is culture-sensitive parsing
     'DATEPART("week", [Order Date])',             # start-of-week dependent
     'DATEPART("weekday", [Order Date])',
     'DATEDIFF("week", [Order Date], TODAY())',
@@ -715,6 +746,35 @@ TABLE_CALC_TRANSLATIONS = [
      "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])), CALCULATE(SUM('Orders'[Sales])), , ASC, Skip)"),
     ("RANK(AVG([Sales]))", (), _ORDER,                                # no partition -> no FILTER
      "RANKX(ALLSELECTED('Orders'[Order_Date]), CALCULATE(AVERAGE('Orders'[Sales])), , DESC, Skip)"),
+    # --- RANK_MODIFIED / RANK_PERCENTILE: modified-competition rank (ties take the HIGHEST ordinal)
+    # and its percentile normalisation, counted over the SAME per-partition relation as RANK. DAX has
+    # no modified RANKX mode, so they count marks on the better-or-equal side of the current mark.
+    ("RANK_MODIFIED(SUM([Sales]))", _PART, _ORDER,                    # default DESC -> count >=
+     "VAR _rel = FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
+     "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])) VAR _cur = CALCULATE(SUM('Orders'[Sales])) "
+     "VAR _rank = COUNTROWS(FILTER(_rel, CALCULATE(SUM('Orders'[Sales])) >= _cur)) RETURN _rank"),
+    ("RANK_MODIFIED(SUM([Sales]), 'asc')", _PART, _ORDER,             # asc -> count <=
+     "VAR _rel = FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
+     "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])) VAR _cur = CALCULATE(SUM('Orders'[Sales])) "
+     "VAR _rank = COUNTROWS(FILTER(_rel, CALCULATE(SUM('Orders'[Sales])) <= _cur)) RETURN _rank"),
+    ("RANK_PERCENTILE(SUM([Sales]))", _PART, _ORDER,                  # percentile defaults to ASC
+     "VAR _rel = FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
+     "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])) VAR _cur = CALCULATE(SUM('Orders'[Sales])) "
+     "VAR _rank = COUNTROWS(FILTER(_rel, CALCULATE(SUM('Orders'[Sales])) <= _cur)) "
+     "RETURN DIVIDE(_rank - 1, COUNTROWS(_rel) - 1, 0)"),
+    ("RANK_PERCENTILE(SUM([Sales]), 'desc')", (), _ORDER,            # no partition -> bare ALLSELECTED
+     "VAR _rel = ALLSELECTED('Orders'[Order_Date]) VAR _cur = CALCULATE(SUM('Orders'[Sales])) "
+     "VAR _rank = COUNTROWS(FILTER(_rel, CALCULATE(SUM('Orders'[Sales])) >= _cur)) "
+     "RETURN DIVIDE(_rank - 1, COUNTROWS(_rel) - 1, 0)"),
+    # --- TOTAL: re-aggregate the inner across the whole partition (CALCULATE over that relation).
+    ("TOTAL(SUM([Sales]))", _PART, _ORDER,
+     "CALCULATE(SUM('Orders'[Sales]), FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
+     "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])))"),
+    ("TOTAL(AVG([Sales]))", (), _ORDER,                              # no partition -> bare ALLSELECTED
+     "CALCULATE(AVERAGE('Orders'[Sales]), ALLSELECTED('Orders'[Order_Date]))"),
+    ("TOTAL(MIN([Order Date]))", _PART, _ORDER,                      # date inner is allowed for TOTAL
+     "CALCULATE(MIN('Orders'[Order_Date]), FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
+     "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])))"),
 ]
 
 
@@ -735,6 +795,11 @@ TABLE_CALC_FALLBACKS = [
     ("RANK(MAX([Region]))", _ORDER),              # non-numeric (string) inner cannot be ranked
     ("RANK()", _ORDER),                           # RANK needs an inner aggregate
     ("RANK_DENSE(SUM([Sales]), 1)", _ORDER),      # direction must be a string literal
+    ("RANK_UNIQUE(SUM([Sales]))", _ORDER),        # tie-break uses Tableau addressing order -> no faithful DAX
+    ("RANK_MODIFIED(MAX([Region]))", _ORDER),     # non-numeric (string) inner cannot be ranked
+    ("RANK_PERCENTILE(SUM([Sales]), 'sideways')", _ORDER),  # invalid rank direction
+    ("TOTAL(SUM([Sales]), 'asc')", _ORDER),       # TOTAL takes no direction argument
+    ("TOTAL([Sales])", _ORDER),                   # bare row-level inner (not an aggregate)
     ("PREVIOUS_VALUE(SUM([Sales]))", _ORDER),     # unsupported table calc
     ("SUM([Sales])", _ORDER),                     # not a table calc
     ("RUNNING_SUM([Sales])", _ORDER),             # bare row-level inner (not an aggregate)
@@ -840,7 +905,6 @@ OUT_OF_ENGINE = [
     'ISMEMBEROF("Analysts")',                     # security-group membership
     "MAKEPOINT([Profit], [Sales])",               # spatial constructors
     "HEXBINX([Sales], [Profit])",
-    'DATENAME("month", [Order Date])',            # localized part NAME (culture-sensitive)
     "MAKETIME(10, 30, 0)",                        # DAX TIME uses a different epoch date
     "MAKEDATETIME(2024, 1, 1)",                   # ambiguous arg forms across versions
 ]

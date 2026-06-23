@@ -140,7 +140,7 @@ _MATH_1 = {
 }
 _MATH_1_SIG = {"CEILING": "1", "FLOOR": "1"}
 _MATH_2 = {"POWER": "POWER", "DIV": "QUOTIENT", "MOD": "MOD"}
-_SCALAR_MATH = _MATH_1 | set(_MATH_1_SIG) | set(_MATH_2) | {"ROUND", "LOG", "LOG2", "SQUARE", "PI"}
+_SCALAR_MATH = _MATH_1 | set(_MATH_1_SIG) | set(_MATH_2) | {"ROUND", "LOG", "LOG2", "SQUARE", "PI", "ATAN2"}
 
 # ---------------------------------------------------------------------------
 # Row-level (calculated-COLUMN) context. The functions below are NOT valid in a
@@ -166,7 +166,7 @@ _STRING_FNS = {
 _DATE_FNS = {
     "YEAR", "MONTH", "DAY", "TODAY", "NOW", "QUARTER",
     "DATEPART", "DATEADD", "DATEDIFF", "DATETRUNC", "DATE", "MAKEDATE",
-    "ISOWEEK", "ISOWEEKDAY",
+    "ISOWEEK", "ISOWEEKDAY", "ISOYEAR", "DATENAME", "DATETIME",
 }
 _CAST_FNS = {"INT", "FLOAT"}
 # Scalar ROW-LEVEL functions (string / date / numeric-cast). Available in BOTH measure and column
@@ -186,6 +186,12 @@ _DATEDIFF_UNITS = {
     "day": "DAY", "month": "MONTH", "year": "YEAR", "quarter": "QUARTER",
     "hour": "HOUR", "minute": "MINUTE", "second": "SECOND",
 }
+# DATENAME('part', d) -> the part rendered as TEXT via DAX FORMAT. Only parts whose *name* is
+# independent of the workbook start-of-week are mapped: a month/weekday NAME (and the 4-digit year)
+# is culture-dependent but NOT start-of-week-dependent, unlike the numeric DATEPART('week'/'weekday')
+# that is deliberately excluded above. 'quarter'/'day'/time parts (ambiguous single-char FORMAT
+# tokens) and an explicit start_of_week argument fall back to the Tier-1 handoff.
+_DATENAME_FORMAT = {"year": "yyyy", "month": "mmmm", "weekday": "dddd"}
 
 # ---------------------------------------------------------------------------
 # Table calculations (translate_tableau_table_calc_to_dax). These depend on the
@@ -233,8 +239,19 @@ _TABLECALC_POSITION = {"INDEX", "SIZE", "FIRST", "LAST"}
 # than the ORDERBY/PARTITIONBY window spec. Both tie modes + directions were oracle-certified
 # faithful (0 mismatches) against an independent pandas ranking on the live engine.
 _TABLECALC_RANK = {"RANK", "RANK_DENSE"}
+# RANK_MODIFIED / RANK_PERCENTILE: modified-competition ranking (ties share the HIGHEST ordinal --
+# Tableau ranks the set (6,9,9,14) as (4,3,3,1) descending) and its percentile normalisation
+# (rank - 1) / (N - 1). DAX RANKX has no modified mode, so these emit a count of the marks on the
+# "better-or-equal" side of the current mark over the SAME oracle-certified relation RANK uses
+# (faithful by construction from Tableau's documented definitions). RANK_UNIQUE is deliberately
+# EXCLUDED: it breaks ties by Tableau's internal addressing/row order ((6,9,9,14) -> (4,2,3,1)),
+# which has no faithful DAX equivalent, so it stays fail-closed.
+_TABLECALC_MODRANK = {"RANK_MODIFIED", "RANK_PERCENTILE"}
+# TOTAL re-aggregates the inner expression across the whole partition (Tableau's "compute total"):
+# CALCULATE(<inner>, <partition relation>) -- the standard percent-of-total denominator pattern.
+_TABLECALC_RANKLIKE = _TABLECALC_RANK | _TABLECALC_MODRANK | {"TOTAL"}
 _TABLE_CALCS = (
-    _TABLECALC_POSITION | _TABLECALC_RANK | {"LOOKUP", "WINDOW_PERCENTILE"}
+    _TABLECALC_POSITION | _TABLECALC_RANKLIKE | {"LOOKUP", "WINDOW_PERCENTILE"}
     | set(_TABLECALC_X) | set(_TABLECALC_WINDOW_X)
     | set(_TABLECALC_COUNT_X) | set(_TABLECALC_STAT_X)
 )
@@ -619,6 +636,14 @@ class _Parser:
                 if self.mode == "column":
                     raise _CalcError("PERCENTILE not valid in a row-level column calc")
                 return self._percentile()
+            if u == "ATTR":
+                if self.mode == "column":
+                    raise _CalcError("ATTR not valid in a row-level column calc")
+                return self._attr()
+            if u == "GROUP_CONCAT":
+                if self.mode == "column":
+                    raise _CalcError("GROUP_CONCAT not valid in a row-level column calc")
+                return self._group_concat()
             if u == "IIF":
                 return self._iif()
             if u == "ZN":
@@ -725,6 +750,27 @@ class _Parser:
             # Tableau LOG2(x) is the base-2 logarithm -> DAX LOG(x, 2).
             self._expect_op(")")
             return (f"LOG({x[0]}, 2)", "number")
+        if name == "ATAN2":
+            # Tableau ATAN2(y, x) (y is the FIRST argument) -> the quadrant-correct angle in
+            # (-pi, pi]. DAX has ATAN but no ATAN2, so the quadrant is reconstructed explicitly.
+            # SWITCH evaluates only the matched result expression, so ATAN(y / x) is never computed
+            # in the x = 0 branches -- no division by zero. (x here is the already-parsed first
+            # operand y; the second operand is x.)
+            self._expect_op(",")
+            second = self._expect_number(self._expr())
+            self._expect_op(")")
+            y, xx = x[0], second[0]
+            atan = f"ATAN({y} / {xx})"
+            return (
+                "SWITCH(TRUE(), "
+                f"{xx} > 0, {atan}, "
+                f"AND({xx} < 0, {y} >= 0), {atan} + PI(), "
+                f"AND({xx} < 0, {y} < 0), {atan} - PI(), "
+                f"AND({xx} = 0, {y} > 0), PI() / 2, "
+                f"AND({xx} = 0, {y} < 0), -PI() / 2, "
+                "0)",
+                "number",
+            )
         # Two-operand numeric functions: POWER(x, n) and DIV(a, b) -> QUOTIENT(a, b).
         self._expect_op(",")
         second = self._expect_number(self._expr())
@@ -941,6 +987,57 @@ class _Parser:
         self.tables_used.add(table)
         return (f"PERCENTILE.INC({_dax_table(table)}{_dax_col(col)}, {n[0]})", "number")
 
+    def _attr(self):
+        # ATTR([field]) -> IF(HASONEVALUE('T'[col]), VALUES('T'[col]), "*"). Tableau ATTR returns
+        # the field's value when it is unique within the partition, otherwise the literal "*"
+        # sentinel -- exactly the HASONEVALUE/VALUES idiom. Only a single bare [field] is supported;
+        # an expression or qualified/parameter reference falls back.
+        self._next()  # ATTR
+        self._expect_op("(")
+        k, v = self._peek()
+        if k == "qfield":
+            self._qualified_ref(v)  # specific "(unmodeled)" reason instead of the generic one
+        if k != "field":
+            raise _CalcError("ATTR supports only a single bare [field]")
+        self._next()
+        self._expect_op(")")
+        resolved = self.resolver(v)
+        if resolved is None:
+            raise _CalcError(f"unresolved/ambiguous field [{v}]")
+        table, col, tmdl_type = resolved
+        self.tables_used.add(table)
+        ref = f"{_dax_table(table)}{_dax_col(col)}"
+        dtype = _DTYPE_BY_TMDL.get(tmdl_type, "text")
+        return (f'IF(HASONEVALUE({ref}), VALUES({ref}), "*")', dtype)
+
+    def _group_concat(self):
+        # GROUP_CONCAT([field][, sep]) -> CONCATENATEX('T', 'T'[col], sep). Tableau's GROUP_CONCAT
+        # (an "Additional" pass-through to the source's GROUP_CONCAT/STRING_AGG) concatenates EVERY
+        # value in the partition -- duplicates INCLUDED -- comma-joined by default, in an order that
+        # is unspecified in BOTH engines. CONCATENATEX over the base table reproduces that exact
+        # contract (dup-inclusive, order not guaranteed). Only a single bare [field] first argument
+        # is supported; an optional second argument overrides the separator.
+        self._next()  # GROUP_CONCAT
+        self._expect_op("(")
+        k, v = self._peek()
+        if k == "qfield":
+            self._qualified_ref(v)  # specific "(unmodeled)" reason instead of the generic one
+        if k != "field":
+            raise _CalcError("GROUP_CONCAT supports only a single bare [field]")
+        self._next()
+        sep = _dax_string(",")
+        if self._peek() == ("op", ","):
+            self._next()
+            sep = self._expect_text(self._expr())[0]
+        self._expect_op(")")
+        resolved = self.resolver(v)
+        if resolved is None:
+            raise _CalcError(f"unresolved/ambiguous field [{v}]")
+        table, col, _tmdl_type = resolved
+        self.tables_used.add(table)
+        ref = f"{_dax_table(table)}{_dax_col(col)}"
+        return (f"CONCATENATEX({_dax_table(table)}, {ref}, {sep})", "text")
+
     # ----- Row-level (calculated-column) constructs; reachable only in mode="column" -----
 
     def _row_field(self):
@@ -1153,6 +1250,32 @@ class _Parser:
             d = self._expect_date(self._expr())
             self._expect_op(")")
             return (self._datetrunc_emit(part, d[0]), "date")
+        if name == "DATENAME":
+            # DATENAME('part', d[, start_of_week]) -> FORMAT(d, <token>) for the name-valued parts.
+            part = self._part_literal()
+            self._expect_op(",")
+            d = self._expect_date(self._expr())
+            if self._peek() == ("op", ","):
+                # An explicit start_of_week argument cannot be honored faithfully -> fall back.
+                raise _CalcError("DATENAME with a start_of_week argument is not supported")
+            self._expect_op(")")
+            fmt = _DATENAME_FORMAT.get(part)
+            if fmt is None:
+                raise _CalcError(f"unsupported DATENAME part {part!r}")
+            return (f'FORMAT({d[0]}, "{fmt}")', "text")
+        if name == "ISOYEAR":
+            # ISO-8601 week-numbering year: the calendar year of the Thursday of d's ISO week,
+            # YEAR(d + 4 - ISOWEEKDAY(d)) with ISOWEEKDAY = WEEKDAY(d, 2) (Mon=1 .. Sun=7).
+            d = self._expect_date(self._expr())
+            self._expect_op(")")
+            return (f"YEAR({d[0]} + 4 - WEEKDAY({d[0]}, 2))", "number")
+        if name == "DATETIME":
+            # Tableau DATETIME(expr) casts to datetime. A date/datetime argument is already a DAX
+            # dateTime, so the cast is the identity; a string/number argument (a locale-dependent
+            # parse) has no faithful form and falls back via _expect_date.
+            d = self._expect_date(self._expr())
+            self._expect_op(")")
+            return (d[0], "date")
         raise _CalcError(f"unsupported date function {name}")
 
     @staticmethod
@@ -1530,31 +1653,54 @@ def _resolve_refs(captions, resolver, tables_used):
 
 
 def _emit_rank(name, p, mark_refs, part_refs):
-    # name in _TABLECALC_RANK; p is a measure-context _Parser positioned just after the RANK '('.
+    # name in _TABLECALC_RANKLIKE; p is a measure-context _Parser positioned just after the '('.
     # mark_refs enumerate the marks (partition + addressing columns); part_refs are the partition
-    # subset. Ranks the current mark's aggregate among all marks in its partition.
-    inner = p._expr()  # measure-context inner; must be a numeric (rankable) aggregate
-    if inner[1] != "number":
+    # subset. Computes the current mark's rank (or partition total) among all marks in its partition.
+    inner = p._expr()  # measure-context inner; an aggregate (a bare row-level field falls back)
+    is_total = name == "TOTAL"
+    if not is_total and inner[1] != "number":
+        # The RANK family ranks a numeric measure; TOTAL re-aggregates any supported inner
+        # aggregate, including a date one (e.g. TOTAL(MIN([Order Date]))).
         raise _CalcError(f"{name} requires a numeric expression")
-    direction = "DESC"  # Tableau RANK defaults to descending: the highest value is rank 1
-    k, v = p._peek()
-    if k == "op" and v == ",":
-        p._next()
-        dk, dv = p._peek()
-        if dk != "str" or str(dv).lower() not in ("asc", "desc"):
-            raise _CalcError(f"{name} direction must be 'asc' or 'desc'")
-        direction = str(dv).upper()
-        p._next()
+    # RANK/RANK_DENSE/RANK_MODIFIED default DESC (highest value -> rank 1); RANK_PERCENTILE defaults
+    # ASC (lowest value -> 0.0). TOTAL takes no direction argument.
+    direction = "ASC" if name == "RANK_PERCENTILE" else "DESC"
+    if not is_total:
+        k, v = p._peek()
+        if k == "op" and v == ",":
+            p._next()
+            dk, dv = p._peek()
+            if dk != "str" or str(dv).lower() not in ("asc", "desc"):
+                raise _CalcError(f"{name} direction must be 'asc' or 'desc'")
+            direction = str(dv).upper()
+            p._next()
     p._expect_op(")")
-    ties = "Skip" if name == "RANK" else "Dense"  # competition vs dense ranking
     marks = "ALLSELECTED(" + ", ".join(mark_refs) + ")"
     if part_refs:
-        # Restrict ranking to the current partition: each partition column pinned to its mark value.
+        # Restrict to the current partition: each partition column pinned to its mark value.
         pred = " && ".join(f"{c} = SELECTEDVALUE({c})" for c in part_refs)
         relation = f"FILTER({marks}, {pred})"
     else:
         relation = marks
-    return f"RANKX({relation}, CALCULATE({inner[0]}), , {direction}, {ties})"
+    if name in _TABLECALC_RANK:
+        ties = "Skip" if name == "RANK" else "Dense"  # competition vs dense ranking
+        return f"RANKX({relation}, CALCULATE({inner[0]}), , {direction}, {ties})"
+    if is_total:
+        # Recompute the inner aggregate over every addressing mark in the current partition.
+        return f"CALCULATE({inner[0]}, {relation})"
+    # RANK_MODIFIED / RANK_PERCENTILE: modified-competition rank by counting marks on the
+    # "better-or-equal" side of the current mark (DESC counts values >= the current value, ASC
+    # counts values <=), so tied marks all take the HIGHEST ordinal. RANK_PERCENTILE normalises
+    # that to (rank - 1) / (N - 1) -- 0.0 for the lowest mark, 1.0 for the highest, 0.0 if N == 1.
+    op = ">=" if direction == "DESC" else "<="
+    prefix = (
+        f"VAR _rel = {relation} "
+        f"VAR _cur = CALCULATE({inner[0]}) "
+        f"VAR _rank = COUNTROWS(FILTER(_rel, CALCULATE({inner[0]}) {op} _cur)) "
+    )
+    if name == "RANK_MODIFIED":
+        return prefix + "RETURN _rank"
+    return prefix + "RETURN DIVIDE(_rank - 1, COUNTROWS(_rel) - 1, 0)"
 
 
 def _partitionby_clause(partition_by, resolver, tables_used):
@@ -1704,10 +1850,14 @@ def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), orde
         ``RANKX(FILTER(ALLSELECTED(<mark cols>), <partition col> = SELECTEDVALUE(<partition col>)),
         CALCULATE(<agg>), , <DESC|ASC>, <Skip|Dense>)`` -- competition vs dense ranking of each
         mark's value within its partition (the FILTER is dropped when there is no partition).
+      * ``RANK_MODIFIED/RANK_PERCENTILE(<agg>[, 'asc'|'desc'])`` -> a count of the marks on the
+        better-or-equal side of the current mark over that same relation (modified-competition
+        rank; percentile normalises it to ``(rank - 1) / (N - 1)``).
+      * ``TOTAL(<agg>)`` -> ``CALCULATE(<agg>, <partition relation>)`` (re-aggregate over the partition).
     Each window function omits its <relation> argument; per the DAX spec that defaults to
     ``ALLSELECTED()`` of the ORDERBY/PARTITIONBY columns, so the result is correct when the
     measure is evaluated against the marks the addressing describes. Moving-window
-    STDEV/VAR/MEDIAN/PERCENTILE, RANK_MODIFIED/UNIQUE/PERCENTILE, and other forms fall back for now.
+    STDEV/VAR/MEDIAN/PERCENTILE and RANK_UNIQUE (addressing-order tiebreak) fall back for now.
 
     This is the DAX-pattern side of the seam; the orchestrator/viz layer supplies the real
     addressing once worksheets are parsed. Cross-table terms (inner + addressing spanning more
@@ -1726,10 +1876,10 @@ def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), orde
             return None, f"unsupported table calculation {toks[0][1]}", tables_used
         p = _Parser(toks, resolver, tables_used, mode="measure")
         p.pos = 2  # consume the table-calc name and '('
-        if name in _TABLECALC_RANK:
-            # RANK needs the raw addressing/partition COLUMNS (to enumerate marks + restrict to the
-            # current partition), not the ORDERBY/PARTITIONBY window spec -- the rank value is
-            # independent of the addressing sort. order_by still supplies the addressing dimension(s).
+        if name in _TABLECALC_RANKLIKE:
+            # The RANK family + TOTAL need the raw addressing/partition COLUMNS (to enumerate marks
+            # + restrict to the current partition), not the ORDERBY/PARTITIONBY window spec -- their
+            # value is independent of the addressing sort. order_by supplies the addressing dim(s).
             part_refs = _resolve_refs(partition_by, resolver, tables_used)
             addr_refs = _resolve_refs(_order_captions(order_by), resolver, tables_used)
             if not addr_refs:
@@ -1906,6 +2056,31 @@ def _parse_max_of_fixed(toks):
     return p_dims, q_dims, agg[0], agg[1]
 
 
+def _resolve_detail_lod(toks, calc_lookup):
+    """Return a detail FIXED LOD ``(dims, inner)`` with a SIMPLE-agg inner, accepting either an
+    inline ``{FIXED dims : AGG([f])}`` or a bare reference to a calc that is one (the real
+    "Highest Selling City By State Sales" shape names BOTH the per-partition max and the per-member
+    detail as separate calcs). Narrowly gated: the reference must resolve, via ``calc_lookup``, to a
+    FIXED LOD whose inner is a simple aggregation. Returns ``None`` otherwise."""
+    fl = _parse_fixed_lod(toks)
+    if fl is None:
+        ref = _parse_simple_field(toks)
+        if ref is None or not calc_lookup:
+            return None
+        ref_formula = calc_lookup.get(ref.lower())
+        if not ref_formula:
+            return None
+        try:
+            fl = _parse_fixed_lod(_tokenize(ref_formula))
+        except _CalcError:
+            return None
+        if fl is None:
+            return None
+    if _parse_simple_agg(fl[1]) is None:
+        return None
+    return fl
+
+
 def _detect_argmax_dimension(formula, resolver, calc_lookup):
     """Detect Tableau's argmax-over-a-dimension idiom and emit faithful, tie-aware DAX.
 
@@ -1941,11 +2116,11 @@ def _detect_argmax_dimension(formula, resolver, calc_lookup):
     left, right = eq
     # Identify which side is the detail FIXED LOD B = {FIXED dims : AGG([f])} (a SIMPLE-agg
     # inner) and which is A (the per-partition max). Try both orders -- the equality may be
-    # written either way round.
+    # written either way round -- and resolve a bare calc reference on the detail side too.
     b = a_side = None
     for cand_b, cand_a in ((left, right), (right, left)):
-        fl = _parse_fixed_lod(cand_b)
-        if fl and _parse_simple_agg(fl[1]) is not None:
+        fl = _resolve_detail_lod(cand_b, calc_lookup)
+        if fl is not None:
             b, a_side = fl, cand_a
             break
     if b is None:
