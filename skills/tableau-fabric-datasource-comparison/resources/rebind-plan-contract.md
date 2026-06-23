@@ -75,6 +75,7 @@ entries that share its `workbook_luid`). The **required** contract keys:
 | `source_ref` | string | = the `source_id` the feed step recorded (see `source_map`) |
 | `action` | string | one of the four actions below |
 | `model_id` | string | the logical model this workbook binds to (resolves via `models`) |
+| `label` | string | the datasource's **caption-preferred** display name (else its internal name) — the case-insensitive selector the migration skill's `migrate_datasource(datasource=label)` / `list_workbook_datasources` accept to pick this embedded datasource out of its workbook |
 | `binding_status` | string | drives the consumer — see below; consumers key off this **first** |
 | `binding_target` | object | a **tagged union** by `binding_status` (below) |
 | `evidence` | object | the overlap evidence behind the decision (`fabric` / `published` / `cluster`) |
@@ -83,6 +84,13 @@ entries that share its `workbook_luid`). The **required** contract keys:
 Additive context also carried: `workbook_name`, `datasource_id`, `datasource_name`, `cluster_id`, and
 `objects` (the embedded datasource's **workbook-local object list** — calcs / sets / groups / bins /
 LODs — which is what Gate 1 tests presence against).
+
+`label` is on the **per-entry** (per-datasource) unit, **not** on `source_map`: `source_ref` /
+`source_id` is per-**workbook** and a single workbook can hold several embedded datasources, each with
+its own selector. It is unsafe to re-derive the selector from `source_ref`, so the emitter surfaces it
+explicitly. The migration skill matches `datasource=` case-insensitively against the datasource's
+`{caption, formatted-name, name}`, so the emitted `label` (caption when present, else the internal
+name) always selects correctly. Additive to `1.0`.
 
 ### `action` (the migration verb)
 

@@ -28,6 +28,12 @@ Two gates from the contract are honoured here:
     from the comparison and is excluded from the rebuild set.
 
 Pure and offline; reuses the scoring already done upstream.
+
+Each per-workbook plan entry also carries a ``label`` -- the datasource's caption-preferred display
+name (else its internal name) -- the exact case-insensitive selector the migration skill's
+``migrate_datasource(datasource=label)`` / ``list_workbook_datasources`` accept to pick this embedded
+datasource out of its workbook. It is unsafe to re-derive from ``source_ref`` (a workbook can hold
+several embedded datasources), so the emitter surfaces it explicitly. Additive to ``1.0``.
 """
 
 from __future__ import annotations
@@ -206,6 +212,7 @@ def build_rebind_plan(
                 "source_ref": row.get("source_id", ""),
                 "datasource_id": row.get("datasource_id", ""),
                 "datasource_name": row.get("datasource_name", ""),
+                "label": row.get("datasource_name") or row.get("datasource_id", ""),
                 "cluster_id": cluster["cluster_id"],
                 "action": action,
                 "model_id": model_id,
@@ -481,6 +488,7 @@ _CSV_COLUMNS = [
     ("Workbook LUID", "workbook_luid"),
     ("Source ref", "source_ref"),
     ("Datasource", "datasource_name"),
+    ("Label", "label"),
     ("Cluster", "cluster_id"),
     ("Action", "action"),
     ("Model id", "model_id"),

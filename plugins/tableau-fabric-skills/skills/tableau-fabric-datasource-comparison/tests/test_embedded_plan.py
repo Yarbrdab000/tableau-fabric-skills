@@ -137,6 +137,36 @@ def test_bindings_reserve_optional_date_table_slot():
     assert "date_table" not in by_kind["unbound"]
 
 
+def test_plan_entry_carries_migrate_datasource_label_selector():
+    # Each entry carries `label` -- the caption-preferred selector migrate_datasource(datasource=...)
+    # accepts. With a caption it IS the caption; falling back to the internal name when caption-less.
+    rows = [
+        _embedded("w1", "Superstore Sales", SUPER_FIELDS, ["Orders"]),  # datasource_name = caption
+    ]
+    plan = _plan(rows)
+    e = plan["plan"][0]
+    assert e["label"] == "Superstore Sales"
+    assert e["label"] == e["datasource_name"]
+    # Falls back to datasource_id when the display name is empty (still a valid selector: the
+    # internal name is in migrate_datasource's case-insensitive {caption, formatted-name, name} set).
+    rows2 = [{"workbook_luid": "w2", "workbook_name": "WB", "project": "P", "source_id": "w2",
+              "datasource_name": "", "datasource_id": "federated.abc",
+              "fields": [{"name": "X1", "dataType": "STRING"}], "sources": [{"table": "T"}],
+              "objects": []}]
+    e2 = _plan(rows2)["plan"][0]
+    assert e2["label"] == "federated.abc"
+
+
+def test_export_csv_includes_label_column():
+    rows = [_embedded("w1", "Superstore Sales", SUPER_FIELDS, ["Orders"])]
+    plan = _plan(rows)
+    rows_out = ep.build_export_rows(plan)
+    header = rows_out[0]
+    assert header[0] == "Workbook"
+    assert "Label" in header
+    assert rows_out[1][header.index("Label")] == "Superstore Sales"
+
+
 def test_gate1_downgrade_preserves_date_table_slot():
     objs = [{"name": "Profit Ratio", "kind": "calc"}]
     rows = [_embedded("w1", "Superstore", SUPER_FIELDS, ["Orders"], objects=objs)]
