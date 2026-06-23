@@ -63,6 +63,172 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     `.migration_priority`, `summary.by_priority` / `by_migration_priority` / `usage_thresholds`, a
     Markdown "Migration priority" section, and `resources/migration-priority.md`; all additive. Skill
     `VERSION` `1.1.0` → `1.2.0`.
+  - **Robustness & reliability pass (counting correctness, precision, source coverage):** all additive.
+    (1) *Counting correctness* — the comparison now detects when several Tableau datasources claim the
+    **same** Fabric model (`matches[].contested` / `contested_with`, `summary.contested_models`),
+    reports `summary.distinct_fabric_matched` (distinct models behind the "already exists" bucket), adds
+    a greedy **one-to-one** `summary.assignment` rollup (`assigned_match` / `assigned_tier`) so the
+    estate can be sized without double-counting a shared model, and adds reverse `summary.fabric_coverage`
+    (Fabric models no Tableau datasource maps to). (2) *Precision* — the column signal **down-weights
+    ubiquitous generic names** (curated stoplist blended with an estate IDF penalty, gated to estates of
+    ≥ 8 assets) so a coincidental generic overlap can't manufacture a match; a capped **fuzzy name**
+    fallback (`difflib`) rescues near-miss spellings without ever outranking a true exact match; and each
+    match carries a deterministic one-line `reason`. (3) *Source coverage* — Fabric M parsing gains
+    **Lakehouse / Warehouse / Dataflow / Excel / CSV** connectors and `[Id=…]` / `[entity=…]` table
+    navigation plus native-SQL `Value.NativeQuery` FROM/JOIN extraction, and the Tableau `.tds` parser
+    now mines **custom SQL** (`<relation type='text'>`) FROM/JOIN tables — both directly strengthening
+    the source signal across a lakehouse intermediary. Identical-asset scores are unchanged (every exact
+    match still scores `1.0`). Comparison suite `65` → `82` tests. Skill `VERSION` `1.2.0` → `1.3.0`;
+    collection `0.4.0` → `0.5.0`.
+  - **Lineage-graph source matching (containment + table-name provenance):** all additive. The
+    connector-agnostic table-name tier now scores **containment** — `coverage = |tableau ∩ fabric| /
+    |tableau|`, anchored on the Tableau side — instead of a symmetric Jaccard, so a **consolidated**
+    Fabric model that *covers* all of a datasource's upstream tables matches at full strength even when
+    it is a strict superset (the dominant many-datasources→one-model migration pattern), where Jaccard
+    would have diluted it to a partial. The superset boost only applies when a **distinctive**
+    (non-generic) table is shared — a lone generic name (`data`/`staging`/`export`/…) falls back to
+    plain Jaccard — and `coverage ≥ Jaccard` always, so no previously-computed score drops (identical
+    assets still score `1.0`). Each candidate now exposes the matched `shared_tables` and
+    `source_coverage`, and the per-match `reason` **names the shared source tables**, making the source
+    verdict auditable. The Tableau inventory also **backfills `database`/`schema` from a table's
+    `fullName`** when the Metadata API leaves them empty (common for cloud connectors), so the strict
+    `(connector, database, table)` tier fires instead of dropping to the looser table-only signal.
+    Comparison suite `82` → `90` tests. Skill `VERSION` `1.3.0` → `1.4.0`; collection `0.5.0` → `0.6.0`.
+  - **Durability test pass (resilience contract):** locked the comparison engine's graceful-degradation
+    behaviour against hostile / malformed / edge-case input with **+33 tests** (comparison suite `90` →
+    `123`): None-valued fields and sources, empty and tableau-only estates, malformed records, Unicode /
+    emoji / non-Latin names, determinism and input-order independence, a 120×120 estate, duplicate names
+    on both sides, and partial signal dicts; plus parser-resilience for CRLF/tab/blank-line and truncated
+    TMDL/M, very-long M input, bad-base64 / missing-`definition` payloads, corrupt and `.tds`-less ZIP
+    archives, malformed `.tds` XML, pathological `fullName`, and out-of-range / non-numeric usage counts.
+    Two small **additive** hardenings surfaced by the tests: Markdown table cells now neutralise `|` /
+    newlines in attacker-influenced names so a hostile name can't break the ranked-matches table, and the
+    adjudication apply path drops non-`dict` decision entries (`None` / strings / ints) instead of
+    raising. No report key renamed or removed; identical-asset scores unchanged. Skill `VERSION` `1.4.0`
+    → `1.4.1`; collection `0.6.0` → `0.6.1`.
+  - **Empirical verification (`--verify`, Tier-2, opt-in/advisory):** promotes a match from "looks the
+    same (schema/lineage)" to "the **data** agrees" by running read-only **aggregate** probes on both
+    sides (Tableau **VizQL Data Service** + Fabric **`executeQueries`** DAX) and checking they line up.
+    Built around **windowed-overlap agreement** so it is not fooled by volume: it `MIN`/`MAX`es a shared
+    date/numeric key to find each side's range and their **common overlap window**, then compares
+    `SUM`/`DISTINCTCOUNT` **only inside that overlap** — so a Fabric model with extra history (e.g.
+    2019–2026 vs Tableau 2021–2026) **verifies** instead of looking like a mismatch. Verdicts:
+    `verified` / `compatible` (one-side-superset, no window column) / `mismatch` (overlap disagrees or
+    ranges disjoint) / `inconclusive`. Adds `match.verification` + `match.verification_note` and a
+    `summary.verification` rollup, plus a new "Empirical verification" report section — all **additive**;
+    the deterministic tier/score/bucket are never changed (a `mismatch` is advisory). New CLI flags
+    `--verify`, `--verify-top-n` (10), `--verify-max-cols` (4), `--verify-rtol` (0.01), and
+    `--powerbi-token` / `POWERBI_TOKEN` (a **distinct** Power BI audience from the Fabric token; or
+    `--use-az` mints it). Read-only and aggregate-only — no row-level data leaves either platform; needs
+    live Tableau and degrades gracefully (cached inventory, missing token, 404/429/401/403/paused
+    capacity → *skipped*/*inconclusive*). New `resources/empirical-verification.md`; comparison suite
+    `123` → `171` tests. Skill `VERSION` `1.4.1` → `1.5.0`; collection `0.6.1` → `0.7.0`.
+  - **Empirical verification — actionable "Fabric returned no data" detection (live-dry-test
+    hardening):** when an `--verify` match comes back `inconclusive` purely because the Fabric model
+    returned nothing while Tableau returned real values, the verdict now says **why**, and never reads
+    it as a mismatch. A new `match.verification.reason_code` distinguishes `fabric_no_data` (model held
+    no rows / explicit *"needs to be recalculated or refreshed"* — refresh it) from `fabric_unreadable`
+    (every probe errored, e.g. a DirectQuery source not configured or a paused capacity — resolve it),
+    each with a fix-it `verification_note`; rolled up as `summary.verification.fabric_no_data` /
+    `fabric_unreadable` and a plain-language callout in the report. Gated on *Fabric returned nothing
+    for any probe **and** Tableau returned data*, so a per-column quirk is never mislabelled. The 400
+    `executeQueries` error detail is now surfaced (`extract_executequeries_error`) instead of a generic
+    code. All **additive** — no key renamed/removed; deterministic tier/score/bucket unchanged.
+    Verified end-to-end against the live 10ay Tableau + Fabric F2 mirror estate (6/6 already-exist;
+    all 6 models correctly reported as refresh/connection-pending, not mismatches). Comparison suite
+    `171` → `178` tests. Skill `VERSION` `1.5.0` → `1.5.1`; collection `0.7.0` → `0.7.1`.
+  - **Empirical verification — offline transport-seam tests (reliability hardening):** the thin
+    live-only transports and the probe closures that turn raw HTTP into `(value, error)` are now
+    exercised offline. New `tests/test_transport.py` mocks each network seam (`fabric_inventory._http`
+    / `_request` / `acquire_powerbi_token`'s `subprocess.run`, `TableauClient._request`,
+    `fab.execute_dax`) and **replays the exact response envelopes observed live** — Fabric
+    `executeQueries` 200+scalar, 200+`null` (Import model never refreshed), 400 *"...needs to be
+    recalculated or refreshed"*, the generic 400 *"Failed to execute the DAX query."* (DirectQuery
+    source not configured), 429/401; Tableau VDS 200 / 404 (feature off) / 429 / error — so the
+    `(value, error)` mapping and the `reason_code` triggers (`fabric_no_data` vs `fabric_unreadable`)
+    are regression-locked without a live tenant. Tests only — no behavior or schema change. Comparison
+    suite `178` → `203` tests. Skill `VERSION` `1.5.1` → `1.5.2`; collection `0.7.1` → `0.7.2`.
+  - **Empirical verification — measures are never used as a window axis (false-mismatch fix):** an
+    additive **measure** (e.g. `Sales`) is no longer eligible as the `MIN`/`MAX` overlap-window axis.
+    Ranging a measure by its own bounds and then filtering its `SUM` to that overlap is
+    self-referential and could flag a pure Fabric superset (the *same* datasource, just more rows) as a
+    false `mismatch` — exactly the "same data, more history" trap windowing exists to avoid. Window
+    candidacy is now gated on the Tableau Metadata-API `role`: `role == "measure"` columns are excluded
+    as axes (dates and numeric *dimensions* — year / key / id — remain valid axes), while measures are
+    still compared as `SUM` equality probes *inside* whatever window a dimension establishes. When only
+    measures are shared, no window is built and verification drops to the conservative **containment**
+    read (which never emits a `mismatch` from magnitude alone) instead of a bogus self-referential
+    window. All **additive** — no key renamed/removed; deterministic tier/score/bucket unchanged.
+    Comparison suite `203` → `206` tests. Skill `VERSION` `1.5.2` → `1.5.3`; collection `0.7.2` →
+    `0.7.3`.
+  - **Business-logic parity (calculated fields → measures) — closes the "structurally identical ≠
+    logically equivalent" gap:** the four structural signals (name / column / type / source) say nothing
+    about whether a datasource's **calculated fields** were re-expressed as Fabric **measures**, so two
+    datasources with identical columns but different logic both scored "already exists." Each match now
+    carries an additive, **name-level** `logic_parity` (`{status, tableau_calc_count, fabric_measure_count,
+    matched, unmatched[]}`, `status ∈ none / likely / partial / unverified`) comparing Tableau calc names
+    against model measure names, plus a `summary.logic_parity` rollup whose `review_needed` counts
+    already-exists / partial matches whose calculations are **not** confirmed as measures — so an
+    "already exists" verdict is never mistaken for "safe to retire." It deliberately does **not** compare
+    formulas (that is the `tableau-migration` translator's job); it only flags where logic likely still
+    needs rebuilding. Inputs: Tableau `fields[].is_calculated` (Metadata-API `__typename ==
+    "CalculatedField"`, or a `<calculation>` child in the `.tds` fallback) and model-level `measures`
+    parsed from TMDL. The Markdown report renders a **Business-logic parity** section only when a matched
+    datasource has calculated fields; otherwise output is byte-for-byte unchanged. All **additive** — no
+    key renamed/removed; deterministic tier/score/bucket unchanged. Comparison suite `206` → `218` tests.
+    Skill `VERSION` `1.5.3` → `1.5.4`; collection `0.7.3` → `0.7.4`.
+  - **Executive CSV / XLSX export (`--export-csv` / `--export-xlsx`) — share the result outside the
+    terminal:** the finished report (whatever layers ran — verification, adjudication, logic-parity) now
+    renders to two share-ready artifacts via a new `scripts/export.py` (**standard-library only** — the
+    `.xlsx` is hand-assembled OOXML / SpreadsheetML, no `openpyxl` / `pandas` dependency). `--export-csv`
+    writes one rectangular table — one row per Tableau datasource (verdict / tier / score / best Fabric
+    match + workspace / usage / priority / logic parity / reason), the analyst pivot source, UTF-8 with a
+    BOM so Excel opens it cleanly. `--export-xlsx` writes a three-sheet workbook: a **Summary** estate-
+    sizing headline (already-in-Fabric vs. needs-rebuild counts **with percentages**, distinct models,
+    one-to-one assignment, net-new models, the logic-parity review count, and the by-tier /
+    by-migration-priority / verification breakdowns), a **Datasources** detail sheet (the same per-
+    datasource rows with `Score` as a real number so it sorts), and a **Fabric coverage** sheet (models
+    nothing in Tableau maps to). Both are **read-only over the report and purely additive** — they never
+    alter a report key; the Markdown / JSON output is unchanged. Comparison suite `218` → `240` tests.
+    Skill `VERSION` `1.5.4` → `1.5.5`; collection `0.7.4` → `0.7.5`.
+  - **Verdict confidence — a decision-grade trust layer:** a new `scripts/confidence.py` fuses the
+    independent evidence the engine already computes (score band, margin over the runner-up, how many
+    of name / column / physical-source signals *independently* agree, mutual-best **reciprocity** on a
+    contested model, and — when `--verify` ran — the empirical data check) into one `High` / `Medium` /
+    `Low` confidence **per verdict**. It is symmetric: `High` means *confidently reuse* on an
+    already-in-Fabric verdict and *confidently rebuild* on a needs-rebuild verdict (a borderline score
+    just under the partial threshold is flagged `Low` instead). Each match gains
+    `confidence.{level, drivers[], cautions[], margin, corroborating_signals, reciprocal_best}`; the
+    rollup adds `summary.confidence.{high, medium, low, high_confidence_already_exists,
+    low_confidence_review}`. The Markdown report gains a **Verdict confidence** headline near the top
+    and a **Lowest-confidence verdicts (review these first)** table; the CSV/XLSX export gains a
+    `Confidence` column and two Summary metrics. **Deterministic, additive and read-only** — never
+    changes a `tier` / `score` / `bucket`; re-synthesised after `--verify` so the data check folds in.
+    Comparison suite `240` → `267` tests. Skill `VERSION` `1.5.5` → `1.5.6`; collection `0.7.5` →
+    `0.7.6`.
+  - **Artifact importance & connected assets — value/blast-radius + usage telemetry:** a new
+    `scripts/importance.py` fuses three independent value signals gathered during inventory — **reach**
+    (dependent workbooks + dashboards), **consumption** (total **view count**), and **endorsement**
+    (**certified**) — into a `Critical` / `High` / `Moderate` / `Low` rating per datasource (`Unknown`
+    only when there is no usage evidence; weights renormalise over present signals). Distinct from
+    migration **priority** (rebuild order): importance is *how much it matters and what breaks if it
+    moves*. The Tableau inventory now best-effort-enriches each `usage` block with `view_count` (summed
+    from per-workbook REST view statistics), `certified`, `has_quality_warning`, the extract refresh
+    timestamps, `updated_at`, and `connected_assets` (the **names** of dependent workbooks / dashboards)
+    via a **separate** Metadata-API query kept isolated from the proven downstream-count query, so a
+    rejected field only loses enrichment. Each match gains `importance.{level, score, drivers[]}`; the
+    rollup adds `summary.importance.{by_level, critical, high, total_views, certified_datasources,
+    datasources_with_quality_warning}`. The Markdown report gains an **Artifact importance & connected
+    assets** section (highest-value datasources with their views, dependent assets and last refresh);
+    the CSV/XLSX export gains `Importance` / `Views` / `Certified` columns, importance Summary metrics,
+    and a fourth **Connected assets** sheet (one row per dependent asset, when telemetry was gathered).
+    Connected-asset names are **deduped** (the Metadata API returns an asset once per sheet path) so the
+    deliverable never shows the same workbook/dashboard twice. **Deterministic, additive and
+    read-only** — never changes a `tier` / `score` / `bucket` / `priority`. **Live-verified** end-to-end
+    against a real Tableau Cloud site (the richer Metadata-API query and the view-statistics REST
+    endpoint both resolve; importance section + connected-assets export render with real data).
+    Comparison suite `267` → `306` tests. Skill `VERSION` `1.5.6` → `1.5.7`; collection
+    `0.7.6` → `0.7.7`.
   orchestrator. Dimension-role and row-level calculated fields translate to DAX **calculated
   columns** end-to-end; previously the translator's column mode existed but was never called, so
   those calcs were dropped before translation was attempted.

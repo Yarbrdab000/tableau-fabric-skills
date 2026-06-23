@@ -121,6 +121,48 @@ def test_apply_adjudication_rolls_up_and_reports_delta():
     assert out["summary"]["already_exist"] == 0
 
 
+# --------------------------------------------------------------------------------------
+# Durability: hostile decision payloads and candidate-less matches degrade gracefully
+# --------------------------------------------------------------------------------------
+def test_apply_adjudication_ignores_unknown_ids_and_bad_types():
+    src = [{"connectionType": "sqlserver", "database": "S", "table": "Orders"}]
+    cols = [{"name": "Sales", "dataType": "REAL"}, {"name": "Region", "dataType": "STRING"}]
+    fcols = [{"name": "Sales", "dataType": "double"}, {"name": "Region", "dataType": "string"}]
+    result = compare.compare_inventories(
+        [_ds("Superstore", cols, src, luid="t1")], [_model("Superstore", fcols, src, mid="m1")]
+    )
+    det_tiers = [m["tier"] for m in result["matches"]]
+    # a list peppered with None / strings / ints / an unknown id alongside one valid review.
+    out = adjudicate.apply_adjudication(result, [
+        None, "garbage", 123, ["nested"],
+        {"tableau_name": "DoesNotExist", "verdict": "match"},
+        {"tableau_luid": "t1", "verdict": "no-match"},
+    ])
+    assert [m["tier"] for m in out["matches"]] == det_tiers  # deterministic verdict untouched
+    assert out["adjudicated_summary"]["reviews_applied"] == 1  # only the valid, matching review applied
+
+
+def test_apply_adjudication_with_entirely_garbage_decisions_is_passthrough():
+    result = compare.compare_inventories(
+        [_ds("X", [{"name": "a", "dataType": "REAL"}], [])], []
+    )
+    for junk in (None, "nope", 7, [None, "x", 3], {"reviews": [None, "x"]}):
+        out = adjudicate.apply_adjudication(result, junk)
+        assert out["adjudicated_summary"]["reviews_applied"] == 0
+
+
+def test_build_adjudication_tolerates_matches_without_candidates():
+    # A match with no candidates / no best_match (e.g. a hand-assembled or partial record).
+    matches = [{
+        "tableau_name": "Lonely", "tier": "Partial", "score": 0.5,
+        "bucket": "partial", "best_match": None, "candidates": [],
+    }]
+    adj = adjudicate.build_adjudication(matches, [], [])
+    assert set(adj) == {"summary", "needs_review", "requests"}
+    assert adj["summary"]["total_reviewed"] == len(adj["requests"])
+    assert adj["requests"][0]["candidates"] == []
+
+
 def test_apply_adjudication_accepts_verdict_synonyms_and_keyed_dict():
     result = _partial_result()
     out = adjudicate.apply_adjudication(result, {"Superstore": {"verdict": "no-match"}})

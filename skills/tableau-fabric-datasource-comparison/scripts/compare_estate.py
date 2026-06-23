@@ -34,13 +34,19 @@ from typing import Any, Dict, List, Optional
 try:  # package or flat-script execution
     from . import compare as compare_mod
     from . import adjudicate as adjudicate_mod
+    from . import confidence as confidence_mod
+    from . import export as export_mod
     from . import fabric_inventory as fab
     from . import tableau_inventory as tab
+    from . import verify as verify_mod
 except ImportError:  # pragma: no cover - exercised via flat script execution
     import compare as compare_mod
     import adjudicate as adjudicate_mod
+    import confidence as confidence_mod
+    import export as export_mod
     import fabric_inventory as fab
     import tableau_inventory as tab
+    import verify as verify_mod
 
 
 def _load_json(path: str) -> List[Dict[str, Any]]:
@@ -70,19 +76,26 @@ def _parse_weights(spec: Optional[str]) -> Dict[str, float]:
     return weights
 
 
-def _gather_tableau(args, log) -> List[Dict[str, Any]]:
+def _gather_tableau(args, log, keep_client: bool = False):
+    """Return ``(inventory, live_client_or_None)``. When ``keep_client`` the signed-in client is
+    handed back (for ``--verify`` VDS probes) and the caller is responsible for signing out."""
     if args.tableau_inventory_json:
         log(f"Loading Tableau inventory from {args.tableau_inventory_json}")
-        return _load_json(args.tableau_inventory_json)
+        return _load_json(args.tableau_inventory_json), None
     if args.tableau_live:
         log("Gathering Tableau inventory (live)...")
         client = tab._client_from_env(args)
         tab._sign_in(client, args)
         try:
-            return tab.gather_tableau_inventory(
+            inv = tab.gather_tableau_inventory(
                 client, tds_fallback=args.tds_fallback, usage=args.usage, on_progress=log)
-        finally:
+        except Exception:
             client.sign_out()
+            raise
+        if keep_client:
+            return inv, client
+        client.sign_out()
+        return inv, None
     raise SystemExit("Provide --tableau-inventory-json or --tableau-live.")
 
 
@@ -99,6 +112,78 @@ def _gather_fabric(args, log) -> List[Dict[str, Any]]:
             max_models=args.max_models, on_progress=log,
         )
     raise SystemExit("Provide --fabric-inventory-json or --fabric-live.")
+
+
+# ---------------------------------------------------------------------------------------
+# Empirical verification (--verify): live probe closures + orchestration.
+# Pure verdict logic lives in verify.py; here we inject the two HTTP transports.
+# ---------------------------------------------------------------------------------------
+def _make_tableau_probe(client):
+    """Closure: build a VDS aggregate query, run it, parse the scalar -> (value, error)."""
+    def probe(luid, field_caption, vds_func, window=None):
+        try:
+            query = verify_mod.build_vds_query(field_caption, vds_func, window)
+        except Exception as exc:  # pragma: no cover - defensive
+            return (None, "vds-build: %s" % str(exc)[:120])
+        try:
+            rows = client.vds_query(luid, query)
+        except Exception as exc:
+            return (None, str(exc)[:160])
+        return verify_mod.parse_vds_scalar(rows)
+    return probe
+
+
+def _make_fabric_probe(pbi_token):
+    """Closure: build a windowed DAX scalar, run executeQueries, parse it -> (value, error)."""
+    def probe(workspace_id, dataset_id, table, column, function, window=None):
+        if not workspace_id or not dataset_id:
+            return (None, "missing workspace/dataset id")
+        try:
+            dax = verify_mod.build_dax(function, table, column, window)
+        except Exception as exc:
+            return (None, "dax-build: %s" % str(exc)[:120])
+        try:
+            status, payload = fab.execute_dax(pbi_token, workspace_id, dataset_id, dax)
+        except Exception as exc:
+            return (None, str(exc)[:160])
+        if status == 429:
+            return (None, "executeQueries rate limit (429)")
+        if status in (401, 403):
+            return (None, "executeQueries unauthorized (%d)" % status)
+        if status != 200:
+            detail = verify_mod.extract_executequeries_error(payload)
+            return (None, detail or ("executeQueries failed (%d)" % status))
+        return verify_mod.parse_executequeries_scalar(payload)
+    return probe
+
+
+def _run_verification(args, result, tableau, fabric, tableau_client, log):
+    """Attach an empirical-verification rollup to ``result`` (additive; never alters tier/score)."""
+    if tableau_client is None:
+        note = ("verification skipped: --verify needs live Tableau (VizQL Data Service); a cached "
+                "--tableau-inventory-json cannot be probed")
+        log(note)
+        result.setdefault("summary", {})["verification"] = {"enabled": False, "reason": note}
+        return
+    try:
+        pbi_token = fab.acquire_powerbi_token(args.powerbi_token, args.use_az)
+    except Exception as exc:
+        note = "verification skipped: no Power BI token (%s)" % str(exc)[:160]
+        log(note)
+        result.setdefault("summary", {})["verification"] = {"enabled": False, "reason": note}
+        return
+    log("Empirical verification: probing up to %d match(es)..." % args.verify_top_n)
+    verify_mod.verify_estate(
+        result, tableau, fabric,
+        _make_tableau_probe(tableau_client), _make_fabric_probe(pbi_token),
+        top_n=args.verify_top_n, max_cols=args.verify_max_cols, rtol=args.verify_rtol,
+        on_progress=log,
+    )
+    v = result.get("summary", {}).get("verification", {})
+    if v.get("enabled"):
+        log("Verification: verified=%d compatible=%d mismatch=%d inconclusive=%d (probes=%d)" % (
+            v.get("verified", 0), v.get("compatible", 0), v.get("mismatch", 0),
+            v.get("inconclusive", 0), v.get("probes_run", 0)))
 
 
 def main(argv=None) -> int:
@@ -136,70 +221,116 @@ def main(argv=None) -> int:
     ap.add_argument("--save-fabric-inventory", help="also write the gathered Fabric inventory JSON here")
     ap.add_argument("--save-adjudication",
                     help="write the agent adjudication handoff packet (the review queue) here as JSON")
+    ap.add_argument("--export-csv",
+                    help="also write an executive CSV (one row per Tableau datasource: verdict, tier, "
+                         "best Fabric match, priority, logic parity, reason) -- the analyst pivot source")
+    ap.add_argument("--export-xlsx",
+                    help="also write an executive .xlsx workbook (Summary sizing headline + per-datasource "
+                         "detail + Fabric coverage); standard-library only, no openpyxl needed")
     ap.add_argument("--apply-adjudication",
                     help="load an agent-verdicts JSON ({reviews:[{tableau_name|tableau_luid, verdict, "
                          "confidence?, rationale?}]}) and fold the verdicts in as advisory annotations "
                          "(the deterministic tier/score are never changed)")
+
+    # Empirical verification (Tier-2, opt-in, advisory). Probes both clouds and checks the data lines
+    # up on the overlapping window; never changes the deterministic tier/score. Needs live both sides.
+    ap.add_argument("--verify", action="store_true",
+                    help="empirically verify the top matches: run read-only aggregate probes on both "
+                         "sides (Tableau VDS + Fabric executeQueries) and check they agree on the "
+                         "shared overlap window (requires --tableau-live and a Power BI token)")
+    ap.add_argument("--verify-top-n", type=int, default=verify_mod.DEFAULT_TOP_N,
+                    help="how many of the most-comparable confident/partial matches to verify")
+    ap.add_argument("--verify-max-cols", type=int, default=verify_mod.DEFAULT_MAX_COLS,
+                    help="max shared columns probed per matched pair")
+    ap.add_argument("--verify-rtol", type=float, default=verify_mod.DEFAULT_RTOL,
+                    help="relative tolerance when comparing two aggregate values (default 0.01)")
+    ap.add_argument("--powerbi-token",
+                    help="Power BI token for executeQueries (else POWERBI_TOKEN / --use-az); a "
+                         "distinct audience from the Fabric token")
     args = ap.parse_args(argv)
 
     def log(msg):
         print(msg, file=sys.stderr)
 
-    tableau = _gather_tableau(args, log)
-    fabric = _gather_fabric(args, log)
+    want_verify = bool(args.verify) and args.tableau_live and not args.tableau_inventory_json
+    tableau, tableau_client = _gather_tableau(args, log, keep_client=want_verify)
+    try:
+        fabric = _gather_fabric(args, log)
 
-    if args.save_tableau_inventory:
-        with open(args.save_tableau_inventory, "w", encoding="utf-8") as fh:
-            json.dump(tableau, fh, indent=2)
-        log(f"saved Tableau inventory -> {args.save_tableau_inventory}")
-    if args.save_fabric_inventory:
-        with open(args.save_fabric_inventory, "w", encoding="utf-8") as fh:
-            json.dump(fabric, fh, indent=2)
-        log(f"saved Fabric inventory -> {args.save_fabric_inventory}")
+        if args.save_tableau_inventory:
+            with open(args.save_tableau_inventory, "w", encoding="utf-8") as fh:
+                json.dump(tableau, fh, indent=2)
+            log(f"saved Tableau inventory -> {args.save_tableau_inventory}")
+        if args.save_fabric_inventory:
+            with open(args.save_fabric_inventory, "w", encoding="utf-8") as fh:
+                json.dump(fabric, fh, indent=2)
+            log(f"saved Fabric inventory -> {args.save_fabric_inventory}")
 
-    result = compare_mod.compare_inventories(
-        tableau, fabric, weights=_parse_weights(args.weights), top_n=args.top_n,
-    )
+        result = compare_mod.compare_inventories(
+            tableau, fabric, weights=_parse_weights(args.weights), top_n=args.top_n,
+        )
 
-    if args.save_adjudication:
-        with open(args.save_adjudication, "w", encoding="utf-8") as fh:
-            json.dump(result.get("adjudication", {}), fh, indent=2)
-        log(f"saved adjudication queue -> {args.save_adjudication}")
+        if args.save_adjudication:
+            with open(args.save_adjudication, "w", encoding="utf-8") as fh:
+                json.dump(result.get("adjudication", {}), fh, indent=2)
+            log(f"saved adjudication queue -> {args.save_adjudication}")
 
-    if args.apply_adjudication:
-        log(f"Applying agent verdicts from {args.apply_adjudication} (advisory; deterministic verdict unchanged)")
-        with open(args.apply_adjudication, encoding="utf-8-sig") as fh:
-            decisions = json.load(fh)
-        result = adjudicate_mod.apply_adjudication(result, decisions)
+        if args.apply_adjudication:
+            log(f"Applying agent verdicts from {args.apply_adjudication} (advisory; deterministic verdict unchanged)")
+            with open(args.apply_adjudication, encoding="utf-8-sig") as fh:
+                decisions = json.load(fh)
+            result = adjudicate_mod.apply_adjudication(result, decisions)
 
-    if args.format == "json":
-        rendered = json.dumps(result, indent=2)
-    else:
-        rendered = compare_mod.render_markdown(result)
+        if args.verify:
+            _run_verification(args, result, tableau, fabric, tableau_client, log)
+            # Re-synthesise confidence so the empirical verification verdicts fold into each
+            # match's confidence level (idempotent; never changes tier/score/bucket).
+            try:
+                confidence_mod.annotate_confidence(result)
+            except Exception:  # pragma: no cover - never let it break the report
+                pass
 
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as fh:
-            fh.write(rendered)
-        log(f"wrote report -> {args.out}")
-    else:
-        print(rendered)
+        if args.format == "json":
+            rendered = json.dumps(result, indent=2)
+        else:
+            rendered = compare_mod.render_markdown(result)
 
-    s = result["summary"]
-    log(f"Done: {s['tableau_total']} datasource(s) vs {s['fabric_total']} model(s) -- "
-        f"already-exist={s['already_exist']}, partial={s['partial']}, rebuild={s['rebuild']}")
-    by_mig = s.get("by_migration_priority")
-    if by_mig and any((m.get("usage") or {}).get("workbook_count") is not None for m in result.get("matches", [])):
-        ranked = ", ".join(f"{p}={c}" for p, c in by_mig.items() if c)
-        log(f"Migration priority: {ranked}")
-    adj = result.get("adjudication", {}).get("summary", {})
-    if adj.get("total_reviewed"):
-        log(f"Adjudication queue: {adj['total_reviewed']} datasource(s) flagged for agent review "
-            f"({adj.get('auto_confident', 0)} auto-confident) -- categories {adj.get('categories', {})}")
-    adj_sum = result.get("adjudicated_summary")
-    if adj_sum:
-        log(f"After review: already-exist={adj_sum['already_exist']}, partial={adj_sum['partial']}, "
-            f"rebuild={adj_sum['rebuild']} (reviews applied={adj_sum['reviews_applied']})")
-    return 0
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as fh:
+                fh.write(rendered)
+            log(f"wrote report -> {args.out}")
+        else:
+            print(rendered)
+
+        if args.export_csv:
+            export_mod.write_csv(result, args.export_csv)
+            log(f"wrote executive CSV -> {args.export_csv}")
+        if args.export_xlsx:
+            export_mod.write_xlsx(result, args.export_xlsx)
+            log(f"wrote executive workbook -> {args.export_xlsx}")
+
+        s = result["summary"]
+        log(f"Done: {s['tableau_total']} datasource(s) vs {s['fabric_total']} model(s) -- "
+            f"already-exist={s['already_exist']}, partial={s['partial']}, rebuild={s['rebuild']}")
+        by_mig = s.get("by_migration_priority")
+        if by_mig and any((m.get("usage") or {}).get("workbook_count") is not None for m in result.get("matches", [])):
+            ranked = ", ".join(f"{p}={c}" for p, c in by_mig.items() if c)
+            log(f"Migration priority: {ranked}")
+        adj = result.get("adjudication", {}).get("summary", {})
+        if adj.get("total_reviewed"):
+            log(f"Adjudication queue: {adj['total_reviewed']} datasource(s) flagged for agent review "
+                f"({adj.get('auto_confident', 0)} auto-confident) -- categories {adj.get('categories', {})}")
+        adj_sum = result.get("adjudicated_summary")
+        if adj_sum:
+            log(f"After review: already-exist={adj_sum['already_exist']}, partial={adj_sum['partial']}, "
+                f"rebuild={adj_sum['rebuild']} (reviews applied={adj_sum['reviews_applied']})")
+        return 0
+    finally:
+        if tableau_client is not None:
+            try:
+                tableau_client.sign_out()
+            except Exception:  # pragma: no cover - best-effort sign-out
+                pass
 
 
 if __name__ == "__main__":

@@ -41,6 +41,11 @@ except ImportError:  # pragma: no cover - exercised via flat script execution
 FABRIC_BASE = "https://api.fabric.microsoft.com"
 FABRIC_RESOURCE = "https://api.fabric.microsoft.com"
 
+# Power BI REST is a *distinct* audience from the Fabric API and needs its own token; it serves the
+# read-only ``executeQueries`` (DAX) endpoint used by the optional empirical-verification layer.
+POWERBI_BASE = "https://api.powerbi.com"
+POWERBI_RESOURCE = "https://analysis.windows.net/powerbi/api"
+
 _GUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -96,6 +101,49 @@ def _http(
         except ValueError:
             parsed = raw
         return exc.code, dict(exc.headers), parsed
+
+
+def acquire_powerbi_token(explicit: Optional[str] = None, use_az: bool = False) -> str:
+    """Resolve a Power BI bearer token (a *distinct* audience from the Fabric token).
+
+    Used only by the optional empirical-verification layer for the read-only ``executeQueries``
+    (DAX) endpoint. Resolution order: ``--powerbi-token`` > ``POWERBI_TOKEN`` > (optional) Azure CLI.
+    """
+    if explicit:
+        return explicit
+    if os.environ.get("POWERBI_TOKEN"):
+        return os.environ["POWERBI_TOKEN"]
+    if use_az:
+        out = subprocess.run(
+            ["az", "account", "get-access-token", "--resource", POWERBI_RESOURCE,
+             "--query", "accessToken", "-o", "tsv"],
+            capture_output=True, text=True, shell=(os.name == "nt"),
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+        raise RuntimeError(f"az Power BI token acquisition failed: {out.stderr.strip()}")
+    raise RuntimeError(
+        "no Power BI token; pass --powerbi-token, set POWERBI_TOKEN, or use --use-az"
+    )
+
+
+def execute_dax(
+    pbi_token: str,
+    workspace_id: str,
+    dataset_id: str,
+    dax: str,
+    base_url: str = POWERBI_BASE,
+    timeout: int = 120,
+) -> Tuple[int, Any]:
+    """Run one read-only DAX query via Power BI ``executeQueries``. Returns ``(status, payload)``.
+
+    Aggregate-only by construction (the caller passes a single ``EVALUATE ROW(...)`` scalar query);
+    no row-level data is requested. The caller degrades any non-200 to an *inconclusive* probe.
+    """
+    url = f"{base_url}/v1.0/myorg/groups/{workspace_id}/datasets/{dataset_id}/executeQueries"
+    body = {"queries": [{"query": dax}], "serializerSettings": {"includeNulls": True}}
+    status, _headers, payload = _http("POST", url, pbi_token, body, timeout=timeout)
+    return status, payload
 
 
 def _paged_get(url: str, token: str, timeout: int = 120) -> List[dict]:
@@ -280,7 +328,7 @@ def parse_tmdl_tables(text: str) -> List[Dict[str, Any]]:
         kw = m.group(1).lower() if m else ""
 
         if kw == "table":
-            cur_table = {"name": _unquote_tmdl_name(m.group(2)), "columns": [], "sources": []}
+            cur_table = {"name": _unquote_tmdl_name(m.group(2)), "columns": [], "measures": [], "sources": []}
             tables.append(cur_table)
             cur_col = None
             continue
@@ -291,7 +339,13 @@ def parse_tmdl_tables(text: str) -> List[Dict[str, Any]]:
             continue
 
         if kw == "measure":
-            cur_col = None  # measures are not physical columns; skip type capture
+            # Measures are not physical columns (no type capture), but their *names* are a
+            # business-logic signal: a structural column match says nothing about whether the
+            # datasource's calculations were re-expressed as DAX. Capture the name so the
+            # comparison can flag logic parity.
+            if cur_table is not None:
+                cur_table.setdefault("measures", []).append(_unquote_tmdl_name(m.group(2)))
+            cur_col = None
             continue
 
         dt = _DATATYPE_RE.match(line)
@@ -322,11 +376,26 @@ _DB_FUNCS = {
     "oracle.database": "oracle",
     "mysql.database": "mysql",
     "databricks.catalogs": "databricks",
+    # Fabric-native and file connectors. These rarely take ("server","db") positional args, so the
+    # arg regex below simply leaves server/database blank for them and the table is resolved from the
+    # navigation step ([Id=...] for Lakehouse/Warehouse, [Item=]/[Name=] for Excel/Dataflows).
+    "lakehouse.contents": "lakehouse",
+    "fabric.warehouse": "warehouse",
+    "datawarehouse.contents": "warehouse",
+    "powerplatform.dataflows": "dataflow",
+    "dataflows.contents": "dataflow",
+    "excel.workbook": "excel",
+    "csv.document": "csv",
 }
 _SCHEMA_ITEM_RE = re.compile(r'\[\s*Schema\s*=\s*"([^"]*)"\s*,\s*Item\s*=\s*"([^"]*)"\s*\]')
 _ITEM_ONLY_RE = re.compile(r'Item\s*=\s*"([^"]*)"')
 _NAME_NAV_RE = re.compile(r'\[\s*Name\s*=\s*"([^"]*)"\s*\]')
-_NATIVE_FROM_RE = re.compile(r'(?:from|join)\s+["\[]?([A-Za-z0-9_.]+)', re.IGNORECASE)
+# Lakehouse / Warehouse navigation: ``{[Id="Orders", ItemKind="Table"]}``. Case-sensitive ``Id`` so
+# it does not also catch the ``[workspaceId=...]`` / ``[lakehouseId=...]`` hops above the table.
+_ID_NAV_RE = re.compile(r'\[\s*Id\s*=\s*"([^"]*)"')
+# Dataflow entity navigation: ``{[entity="SalesFact", version=""]}``.
+_ENTITY_NAV_RE = re.compile(r'entity\s*=\s*"([^"]*)"', re.IGNORECASE)
+_NATIVE_FROM_RE = re.compile(r'(?:from|join)\s+["\[]?([A-Za-z0-9_."\[\]]+)', re.IGNORECASE)
 
 
 def parse_m_sources(m_text: str) -> List[Dict[str, Any]]:
@@ -389,6 +458,26 @@ def parse_m_sources(m_text: str) -> List[Dict[str, Any]]:
             })
         return _dedupe_sources(sources)
 
+    # Lakehouse / Warehouse table navigation: ``{[Id="Orders", ItemKind="Table"]}``.
+    id_navs = _ID_NAV_RE.findall(m_text)
+    if id_navs:
+        for tbl in id_navs:
+            sources.append({
+                "connectionType": connector, "server": server,
+                "database": database, "schema": "", "table": tbl,
+            })
+        return _dedupe_sources(sources)
+
+    # Dataflow entity navigation: ``{[entity="SalesFact"]}``.
+    entities = _ENTITY_NAV_RE.findall(m_text)
+    if entities:
+        for ent in entities:
+            sources.append({
+                "connectionType": connector, "server": server,
+                "database": database, "schema": "", "table": ent,
+            })
+        return _dedupe_sources(sources)
+
     if connector == "snowflake":
         names = _NAME_NAV_RE.findall(m_text)
         # Snowflake nav is DB -> SCHEMA -> TABLE; the deepest Name is the table.
@@ -404,12 +493,16 @@ def parse_m_sources(m_text: str) -> List[Dict[str, Any]]:
 
     native = _NATIVE_FROM_RE.findall(m_text)
     if native:
-        for tbl in native:
+        for raw in native:
+            schema, table = _split_qualified(raw)
+            if not table:
+                continue
             sources.append({
                 "connectionType": connector, "server": server,
-                "database": database, "schema": "", "table": tbl.split(".")[-1],
+                "database": database, "schema": schema, "table": table,
             })
-        return _dedupe_sources(sources)
+        if sources:
+            return _dedupe_sources(sources)
 
     if connector != "other" or server or database:
         sources.append({
@@ -417,6 +510,21 @@ def parse_m_sources(m_text: str) -> List[Dict[str, Any]]:
             "database": database, "schema": "", "table": "",
         })
     return _dedupe_sources(sources)
+
+
+def _split_qualified(raw: str) -> Tuple[str, str]:
+    """Split a (possibly quoted/bracketed) ``schema.table`` reference into ``(schema, table)``.
+
+    Strips SQL identifier quoting (``"`` ``[`` ``]`` `` ` ``) and keeps the last two dotted parts so
+    ``dbo.Orders`` -> ``("dbo", "Orders")`` and a bare ``Orders`` -> ``("", "Orders")``.
+    """
+    cleaned = raw.strip().strip('"').strip()
+    parts = [p.strip(' "[]`') for p in cleaned.split(".") if p.strip(' "[]`')]
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return "", parts[0]
+    return parts[-2], parts[-1]
 
 
 def _dedupe_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -431,9 +539,10 @@ def _dedupe_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def model_inventory_from_parts(parts: Dict[str, str]) -> Dict[str, Any]:
-    """Aggregate decoded TMDL parts into ``{tables, columns, sources}`` for one model."""
+    """Aggregate decoded TMDL parts into ``{tables, columns, measures, sources}`` for one model."""
     tables: List[str] = []
     columns: List[Dict[str, Any]] = []
+    measures: List[str] = []
     sources: List[Dict[str, Any]] = []
     for _path, text in (parts or {}).items():
         for tbl in parse_tmdl_tables(text):
@@ -442,11 +551,15 @@ def model_inventory_from_parts(parts: Dict[str, str]) -> Dict[str, Any]:
                 tables.append(tname)
             for col in tbl.get("columns", []):
                 columns.append({"table": tname, "name": col["name"], "dataType": col.get("dataType", "")})
+            for mname in tbl.get("measures", []):
+                if mname:
+                    measures.append(mname)
             for src in tbl.get("sources", []):
                 sources.append(src)
     return {
         "tables": sorted(set(tables)),
         "columns": columns,
+        "measures": sorted(set(measures)),
         "sources": _dedupe_sources(sources),
     }
 
@@ -493,6 +606,7 @@ def gather_fabric_inventory(
                 "id": mid,
                 "tables": [],
                 "columns": [],
+                "measures": [],
                 "sources": [],
             }
             try:

@@ -52,11 +52,32 @@ connector functions and pulls `(connector, server, database, schema, table)` fro
 | `GoogleBigQuery.Database` | `bigquery` |
 | `Databricks.Catalogs` / `Databricks.Query` | `databricks` |
 | `Oracle.Database`, `MySQL.Database`, … | `oracle`, `mysql`, … |
+| `Lakehouse.Contents` | `lakehouse` |
+| `Fabric.Warehouse` / `DataWarehouse.Contents` | `warehouse` |
+| `PowerPlatform.Dataflows` / `Dataflows.Contents` | `dataflow` |
+| `Excel.Workbook` | `excel` |
+| `Csv.Document` | `csv` |
 
 Connector names are folded with the **same** `canonical_connector()` used on the Tableau side (imported
 locally from `compare.py`), so the two clouds' source keys line up. Table names also come from
 `Item="…"` / `Name="…"` navigation steps and from the schema/table pair in `{[Schema="dbo"],[Item="Orders"]}`
 record access.
+
+### Fabric-native and native-query shapes
+
+Beyond classic database connectors, `parse_m_sources` also resolves the table from the Fabric-native and
+file navigation idioms, and from native SQL:
+
+- **Lakehouse / Warehouse** — `{[Id="Orders", ItemKind="Table"]}` navigation yields `table = Orders`
+  (the `[workspaceId=…]` / `[lakehouseId=…]` hops above it are ignored). A Warehouse that exposes
+  `{[Schema="dbo",Item="Customers"]}` resolves schema + table directly. This matters for the central
+  lakehouse-intermediary case: a Lakehouse-backed model now contributes a connector **and** a real
+  table name, not just its TMDL table names.
+- **Dataflow** — `{[entity="SalesFact"]}` yields `table = SalesFact`.
+- **Excel** — `{[Item="Sheet1", Kind="Sheet"]}` yields the sheet/table name.
+- **Native SQL** — `Value.NativeQuery(Sql.Database(…), "select … from dbo.FactSales join dim.Customer …")`
+  has its `FROM` / `JOIN` tables mined (schema-qualified, quoting/brackets stripped) so a native-query
+  partition still resolves concrete tables.
 
 ### When the source is obscured
 

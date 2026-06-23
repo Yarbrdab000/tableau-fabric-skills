@@ -28,12 +28,23 @@ py -3.11 scripts/compare_estate.py --tableau-live --fabric-live --use-az --forma
 For every Tableau datasource it scores the best-matching Fabric semantic model on four signals —
 **name**, **column overlap**, **type compatibility**, and **physical source** — and assigns a tier
 (`Exact / Strong / Partial / Weak / None`). The source signal is connector-agnostic enough to survive a
-**Lakehouse intermediary** (Fabric reads a mirror; Tableau connects directly) and falls back gracefully
-when the upstream source is **obscured** (composite / DirectQuery models, referenced datasources).
+**Lakehouse intermediary** (Fabric reads a mirror; Tableau connects directly), uses table-name
+**containment** so a broad **consolidated** Fabric model that covers a datasource's tables matches at
+full strength, and falls back gracefully when the upstream source is **obscured** (composite /
+DirectQuery models, referenced datasources).
 
 When Tableau Catalog has not indexed a datasource, the Tableau inventory downloads that datasource's
-`.tds` (without its extract) and parses columns + relation tables directly, so cloud-connected
-datasources still produce a full schema.
+`.tds` (without its extract) and parses columns + relation tables — including **custom SQL**
+(`<relation type='text'>`) FROM/JOIN tables — directly, so cloud-connected datasources still produce a
+full schema. On the Fabric side the M parser resolves **Lakehouse / Warehouse / Dataflow / Excel / CSV**
+sources and native-SQL queries, not just classic database connectors.
+
+The estate *count* is hardened too: when several datasources claim the **same** Fabric model the report
+flags `contested` models, reports the **distinct** models behind "already exists", adds a non-double-
+counted **one-to-one assignment** rollup, and lists Fabric models nothing maps to (net-new). Precision
+guards down-weight ubiquitous **generic columns** and add a capped **fuzzy name** fallback so neither a
+coincidental generic overlap nor a near-miss spelling distorts the verdict; each match carries a one-line
+`reason`. See [`resources/comparison-methodology.md`](resources/comparison-methodology.md).
 
 Because a structural matcher is blind to **semantic** equivalence (renamed columns, a renamed asset, a
 coincidental overlap of generic column names), every run also emits an **LLM-optional adjudication
@@ -65,6 +76,7 @@ tableau-fabric-datasource-comparison/
     comparison-methodology.md
     llm-adjudication.md
     migration-priority.md
+    empirical-verification.md
     fabric-introspection.md
     tableau-inventory.md
     report-schema.md

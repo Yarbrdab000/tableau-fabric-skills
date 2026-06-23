@@ -22,7 +22,11 @@ For each datasource the GraphQL Metadata API returns:
 
 - **fields** — `name`, `dataType`, `role`, `isHidden` (hidden fields are dropped by default), paged via
   `fieldsConnection(first:, after:)` (the `first:` argument is **required** — the API 400s without it).
-- **upstreamTables** — `connectionType`, `database { name }`, `schema`, `name` → the physical source.
+- **upstreamTables** — `connectionType`, `database { name }`, `schema`, `name`, `fullName` → the physical
+  source. When `database`/`schema` come back empty but `fullName` is populated (common for cloud
+  connectors), they are recovered by parsing `fullName` (`[db].[schema].[table]` or dotted), so the
+  strict `(connector, database, table)` source tier fires instead of dropping to the looser table-only
+  signal.
 
 ### 2. `.tds` fallback (Catalog-independent)
 
@@ -42,6 +46,10 @@ XML descriptor. The response is either a bare `.tds` or a `.tdsx` ZIP containing
   inside each `<named-connection>`.
 - **tables** — from `<relation type='table' table='[dbo].[Orders]'>` (schema + table split from the
   bracketed name).
+- **custom SQL** — from `<relation type='text'>SELECT … FROM …</relation>`: the embedded SQL's
+  `FROM` / `JOIN` tables are mined (schema-qualified, quoting/brackets stripped, de-duplicated) so a
+  custom-SQL datasource yields a real physical-source signal instead of an empty one. Each extracted
+  table inherits the relation's connector + database.
 - **columns + types** — from `<metadata-record class='column'>` using `<remote-name>` (the **source**
   column name, so it lines up with Fabric columns that mirror the source) and `<local-type>`
   (upper-cased to match the Metadata API's casing).
@@ -63,6 +71,36 @@ download just leaves that datasource with whatever the Metadata API returned.
 
 `azure_sqldb` and other connection-class names are folded to canonical connectors (`sqlserver`, …) on
 the comparison side, so they line up with the Fabric M connectors.
+
+## Usage telemetry & connected assets (best-effort enrichment)
+
+When usage gathering runs (`--usage {auto,metadata,rest}`), each record also picks up a `usage` block
+that goes beyond the downstream counts used for migration priority. This powers the
+[artifact-importance](comparison-methodology.md#artifact-importance--what-to-protect-first) signal and
+the deliverable's "what depends on this datasource" view. It is gathered from two seams, **each in its
+own best-effort try/except** so a rejected field or a slow endpoint only loses the enrichment — the
+counts and the comparison itself are never affected:
+
+- a **separate** Metadata-API query (`datasource_details_metadata`, kept distinct from the proven
+  downstream-count query) for `certified` (`isCertified`), `has_quality_warning` (`hasActiveWarning`),
+  the extract refresh timestamps (`extractLastRefreshTime` / `extractLastUpdateTime`), and the **names**
+  of the dependent workbooks / dashboards (bounded to `CONNECTED_ASSET_CAP` each);
+- REST **view usage statistics** (`view_counts_rest`, `/views?includeUsageStatistics=true`) summed
+  per workbook, then rolled up to a datasource by summing across its dependent workbooks → `view_count`.
+
+The REST datasource listing additionally supplies `updated_at` and a `certified` fallback. Every one of
+these keys is `null` when its source was unavailable, so the enrichment degrades gracefully on older
+servers or tenants without Catalog. The full `usage` shape:
+
+```json
+{
+  "workbook_count": 12, "sheet_count": 30, "dashboard_count": 4, "source": "metadata",
+  "view_count": 1820, "certified": true, "has_quality_warning": false,
+  "extract_last_refresh": "2026-06-20T03:00:00Z", "extract_last_update": "2026-06-19T03:00:00Z",
+  "updated_at": "2026-06-01T00:00:00Z",
+  "connected_assets": {"workbooks": [{"name": "Exec KPIs", "luid": "..."}], "dashboards": [{"name": "Daily Sales"}]}
+}
+```
 
 ## Safety / cost
 

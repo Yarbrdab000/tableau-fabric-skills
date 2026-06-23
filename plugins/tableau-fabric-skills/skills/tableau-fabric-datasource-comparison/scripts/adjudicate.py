@@ -290,12 +290,16 @@ def build_adjudication(
 # The advisory apply path
 # --------------------------------------------------------------------------------------
 def _normalize_decisions(decisions: Any) -> List[Dict[str, Any]]:
-    """Accept several shapes and return a flat list of review records."""
+    """Accept several shapes and return a flat list of review records.
+
+    Tolerant of hostile input: non-dict entries (``None``, a bare string, a stray list) are dropped
+    rather than carried through, so the apply path below can safely ``.get`` every record.
+    """
     if decisions is None:
         return []
     if isinstance(decisions, dict):
         if "reviews" in decisions and isinstance(decisions["reviews"], list):
-            return list(decisions["reviews"])
+            return [r for r in decisions["reviews"] if isinstance(r, dict)]
         # dict keyed by tableau_name / luid -> review
         out = []
         for key, val in decisions.items():
@@ -305,7 +309,7 @@ def _normalize_decisions(decisions: Any) -> List[Dict[str, Any]]:
                 out.append(rec)
         return out
     if isinstance(decisions, list):
-        return list(decisions)
+        return [r for r in decisions if isinstance(r, dict)]
     return []
 
 
