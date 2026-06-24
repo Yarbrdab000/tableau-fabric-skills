@@ -213,7 +213,9 @@ class LiveTableauSource(TableauSource):
 
     def __init__(self, server_url=None, site=None, *, key_vault_name=None, pat_secret_name=None,
                  pat_name=None, datasource_names=None, workbook_names=None,
-                 fabric_workspace=None, api_version="3.21"):
+                 fabric_workspace=None, api_version="3.21", pat_value=None,
+                 pat_env_var="TABLEAU_PAT", env_file=None, keyring_service=None,
+                 allow_prompt=False):
         # Configuration only -- constructing this object performs NO network I/O and holds NO
         # secret material: just the *names* used to fetch a PAT and locate assets at run time.
         # Each value falls back to an environment variable so nothing site-specific is hardcoded.
@@ -228,6 +230,19 @@ class LiveTableauSource(TableauSource):
         self.workbook_names = (list(workbook_names) if workbook_names is not None
                                else _csv_env(os.environ.get("TABLEAU_WORKBOOK_NAMES")))
         self.api_version = api_version
+        # Key-Vault-free credential layers for local / POC runs (see scripts/credential_resolver.py
+        # and _resolve_pat). These are *pointers* (an env-var name, a .env path, a keyring service)
+        # plus an optional in-memory value -- never a secret persisted on the instance. pat_value is
+        # explicit-only (no env fallback); the rest fall back to a pointer env var so a POC needs no
+        # code change. allow_prompt gates the interactive last resort.
+        self.pat_value = pat_value
+        self.pat_env_var = pat_env_var or os.environ.get("TABLEAU_MIGRATION_PAT_ENV_VAR")
+        self.env_file = env_file or os.environ.get("TABLEAU_MIGRATION_ENV_FILE")
+        self.keyring_service = keyring_service or os.environ.get("TABLEAU_MIGRATION_KEYRING_SERVICE")
+        self.allow_prompt = allow_prompt
+        # Value-free trace of which credential layer last answered (set by _resolve_pat); never a
+        # token value. None until a PAT is resolved.
+        self._pat_source = None
         # Populated by the real list_* implementation (catalog id -> display name) so asset_name
         # can report human names; empty until the network seam is built.
         self._name_by_id = {}
@@ -268,9 +283,40 @@ class LiveTableauSource(TableauSource):
         )
 
     def _resolve_pat(self):
-        """SEAM: fetch the PAT *secret* from Azure Key Vault at run time.
+        """Resolve the Tableau PAT *secret* at run time, Key-Vault-free first.
 
-        Implement with the Azure CLI already on the box::
+        Delegates to the layered resolver in :mod:`credential_resolver`, which tries, in order: an
+        explicit ``pat_value``, the ``pat_env_var`` environment variable, that same key in an
+        ``env_file`` ``.env``, an OS-keyring secret under ``keyring_service`` (only if the optional
+        ``keyring`` package is installed), then -- when ``allow_prompt`` is set and a console is
+        attached -- an interactive ``getpass`` prompt. This lets a local / POC run authenticate with
+        no Azure Key Vault. The resolved token is returned to the caller only; it is never logged,
+        persisted, or stored on the instance (only the value-free ``_pat_source`` layer label is
+        kept). When no local layer is configured/available, falls back to the enterprise Key Vault
+        seam :meth:`_resolve_pat_from_key_vault`.
+        """
+        from credential_resolver import resolve_secret, CredentialNotFound
+        try:
+            resolved = resolve_secret(
+                "Tableau personal access token secret",
+                explicit=self.pat_value,
+                env_var=self.pat_env_var,
+                env_file=self.env_file,
+                keyring_service=self.keyring_service,
+                keyring_username=self.pat_name,
+                allow_prompt=self.allow_prompt,
+                prompt_text="Tableau personal access token secret: ",
+            )
+        except CredentialNotFound:
+            return self._resolve_pat_from_key_vault()
+        self._pat_source = resolved.source
+        return resolved.value
+
+    def _resolve_pat_from_key_vault(self):
+        """SEAM: fetch the PAT *secret* from Azure Key Vault at run time (enterprise alternative).
+
+        Used only when no local credential layer (see :meth:`_resolve_pat`) is configured or yields a
+        value. Implement with the Azure CLI already on the box::
 
             az keyvault secret show --vault-name <self.key_vault_name> \\
                 --name <self.pat_secret_name> --query value -o tsv

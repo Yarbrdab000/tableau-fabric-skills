@@ -91,6 +91,17 @@ Copy-Item .\migration.vars.example.ps1 .\migration.vars.local.ps1   # once
 `migration.vars.example.ps1` is committed with **placeholders**; `migration.vars.local.ps1` holds
 the **real** values and is git-ignored — never commit or mirror it.
 
+> **No Azure Key Vault? (local / POC runs.)** Key Vault is the default for the live pull, but it is
+> **not required**. `LiveTableauSource` resolves the PAT secret through a layered, Key-Vault-free
+> resolver (`scripts/credential_resolver.py`) that tries, in order: an explicit value, the
+> **`TABLEAU_PAT`** environment variable, that same key in a git-ignored `.env` file, an OS-keyring
+> secret (Windows Credential Manager / macOS Keychain / Secret Service via the optional
+> `pip install keyring`), then — only if `allow_prompt=True` and a console is attached — an
+> interactive `getpass` prompt. So a POC can authenticate with just `set TABLEAU_PAT=<secret>` (or a
+> `.env`), and falls back to the Key Vault path only when no local layer is configured. The secret is
+> returned to the caller only — never logged, persisted, or written to the report; only a value-free
+> layer label (`_pat_source`) is retained.
+
 ### Phase 0C — Confirmation Ledger (the run gate)
 
 Echo the resolved choices + resources back, then wait for `GO`:

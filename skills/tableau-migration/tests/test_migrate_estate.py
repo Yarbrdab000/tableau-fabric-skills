@@ -1297,6 +1297,8 @@ _LIVE_ENV_VARS = (
     "TABLEAU_SERVER_URL", "TABLEAU_SITE", "TABLEAU_MIGRATION_KEYVAULT",
     "TABLEAU_MIGRATION_PAT_SECRET", "TABLEAU_MIGRATION_PAT_NAME",
     "FABRIC_WORKSPACE", "TABLEAU_DATASOURCE_NAMES", "TABLEAU_WORKBOOK_NAMES",
+    "TABLEAU_PAT", "TABLEAU_MIGRATION_PAT_ENV_VAR", "TABLEAU_MIGRATION_ENV_FILE",
+    "TABLEAU_MIGRATION_KEYRING_SERVICE",
 )
 
 
@@ -1335,6 +1337,38 @@ def test_live_source_is_a_seam_with_no_network(clean_live_env):
         live._resolve_pat()
     with pytest.raises(NotImplementedError):
         live._signin("token-secret")
+
+
+def test_resolve_pat_uses_explicit_value_without_key_vault(clean_live_env):
+    # A POC with no Azure Key Vault: an explicit PAT value resolves and is NOT stored on describe().
+    live = LiveTableauSource(server_url="https://t.example.com", site="s", pat_value="poc-token")
+    assert live._resolve_pat() == "poc-token"
+    assert live._pat_source == "argument"        # value-free trace of which layer answered
+    assert "poc-token" not in json.dumps(live.describe())
+
+
+def test_resolve_pat_reads_env_var(clean_live_env):
+    clean_live_env.setenv("TABLEAU_PAT", "env-token")
+    live = LiveTableauSource(server_url="https://t.example.com", site="s")
+    assert live._resolve_pat() == "env-token"
+    assert live._pat_source == "env:TABLEAU_PAT"
+
+
+def test_resolve_pat_reads_dotenv_file(clean_live_env, tmp_path):
+    env_path = tmp_path / "poc.env"
+    env_path.write_text("# poc creds\nTABLEAU_PAT = 'file-token'\n", encoding="utf-8")
+    live = LiveTableauSource(server_url="https://t.example.com", site="s",
+                             env_file=str(env_path))
+    assert live._resolve_pat() == "file-token"
+    assert live._pat_source.startswith("dotenv:")
+
+
+def test_resolve_pat_falls_back_to_key_vault_seam_when_nothing_local(clean_live_env):
+    # No local layer configured but a Key Vault is named -> the enterprise seam (NotImplemented).
+    live = LiveTableauSource(server_url="https://t.example.com", site="s",
+                             key_vault_name="vault-x", pat_secret_name="pat-secret")
+    with pytest.raises(NotImplementedError):
+        live._resolve_pat()
 
 
 def test_live_source_describe_exposes_config_without_secrets(clean_live_env):

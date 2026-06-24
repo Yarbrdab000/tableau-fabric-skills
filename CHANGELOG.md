@@ -13,6 +13,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** a **layered, Key-Vault-free credential resolver**
+  (`scripts/credential_resolver.py`) so a local / POC migration can authenticate to Tableau with no
+  Azure Key Vault. `resolve_secret(...)` resolves a secret (e.g. a Tableau PAT's secret value) from
+  the first configured-and-available layer, in order: an explicit value → a process environment
+  variable → the same key in a git-ignored `.env` file → an OS-keyring secret (Windows Credential
+  Manager / macOS Keychain / Secret Service via the optional `keyring` package, imported lazily) →
+  an interactive `getpass` prompt (opt-in and TTY-guarded, so unattended runs never hang). The
+  resolved value is returned to the caller only — never logged, persisted, or written to the report;
+  the returned `ResolvedSecret` redacts its value in `repr`, and `CredentialNotFound` lists only the
+  layers tried. `migrate_estate.LiveTableauSource` gains additive keyword-only params (`pat_value`,
+  `pat_env_var` defaulting to `TABLEAU_PAT`, `env_file`, `keyring_service`, `allow_prompt`, each with
+  a pointer env-var fallback) and its `_resolve_pat` now delegates to the resolver, falling back to
+  the enterprise Azure Key Vault seam (`_resolve_pat_from_key_vault`) only when no local layer is
+  configured. `describe()` is unchanged (no secret-bearing keys). Additive; the migration suite stays
+  green. Skill `VERSION` `1.7.0` → `1.8.0`.
 - **tableau-migration:** an additive, **opt-in local-data POC path** so a Tableau extract whose
   source connector has no live Power BI equivalent (S3 / MinIO, generic ODBC, Web Data Connector)
   can still be turned into a **clickable local Power BI Import model backed by real data** — no

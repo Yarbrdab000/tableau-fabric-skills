@@ -12,6 +12,10 @@
 *secret*
 *credential*
 !**/security-governance.md
+# Skill SOURCE files that legitimately carry "credential" in the name (no secrets — the resolver
+# code + its tests). Specific filenames only, so the broad *credential* guard above still applies.
+!**/credential_resolver.py
+!**/test_credential_resolver.py
 
 # Local, prefilled migration variables (real values) — only the committed *.example.ps1 is a template
 migration.vars.local.ps1
