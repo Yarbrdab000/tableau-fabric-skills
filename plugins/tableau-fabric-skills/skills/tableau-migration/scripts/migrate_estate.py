@@ -51,13 +51,13 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .connection_to_m import parse_tds
     from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from .assemble_model import (assemble_import_model, write_model_folder, write_local_pbip,
-                                 migrate_datasource)
+                                 migrate_datasource, list_workbook_datasources)
     from .parameters import parse_parameters
 except ImportError:
     from connection_to_m import parse_tds
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from assemble_model import (assemble_import_model, write_model_folder, write_local_pbip,
-                                migrate_datasource)
+                                migrate_datasource, list_workbook_datasources)
     from parameters import parse_parameters
 
 
@@ -408,9 +408,14 @@ def extract_calculations(xml_text, *, include_dimensions=False):
 _INVALID_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
+def _fs_safe(name, default="model"):
+    """A filesystem-safe base for a name (no estate-wide de-duplication)."""
+    return _INVALID_FS.sub("_", name or "").strip().rstrip(".") or default
+
+
 def _safe_folder(name, used):
     """A filesystem-safe, de-duplicated folder base for a model/report name."""
-    base = _INVALID_FS.sub("_", name or "").strip().rstrip(".") or "datasource"
+    base = _fs_safe(name, "datasource")
     candidate = base
     i = 2
     while candidate.lower() in used:
@@ -442,9 +447,13 @@ def _viz_adapter(cand):
     except (TypeError, ValueError):
         params = set()
     name_kwargs = {"report_name", "dataset_name"} & params
-    def _call(twb_text, name):
+    supports_date = "date_binding" in params
+    def _call(twb_text, name, date_binding=None):
         if name_kwargs:
-            return cand(twb_text, **{k: name for k in name_kwargs})
+            kwargs = {k: name for k in name_kwargs}
+            if supports_date and date_binding is not None:
+                kwargs["date_binding"] = date_binding
+            return cand(twb_text, **kwargs)
         return cand(twb_text, name)
     return _call
 
@@ -597,8 +606,425 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None):
     return detail
 
 
-def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders):
-    """Run the optional viz stage for one workbook. Returns a report detail dict (never raises)."""
+def _rank_primary_datasource(inventory, ir):
+    """Pick the primary embedded datasource (most worksheet usage) and the rest.
+
+    ``inventory`` is a non-empty ``list_workbook_datasources`` list. When the workbook has a single
+    real datasource it is the primary. With several, rank by how many worksheets in the viz IR bind
+    to each (by caption or internal name), falling back to inventory order for ties / when no IR is
+    available. Returns ``(primary, secondaries)``.
+    """
+    if len(inventory) == 1:
+        return inventory[0], []
+    counts = {}
+    worksheets = (ir or {}).get("worksheets", []) if isinstance(ir, dict) else []
+    for ws in worksheets:
+        for key in (ws.get("datasource"), ws.get("datasource_name")):
+            k = (key or "").strip().lower()
+            if k:
+                counts[k] = counts.get(k, 0) + 1
+
+    def _score(d):
+        keys = [(d.get("caption") or "").strip().lower(),
+                (d.get("label") or "").strip().lower(),
+                (d.get("name") or "").strip().lower()]
+        return max((counts.get(k, 0) for k in keys if k), default=0)
+
+    order = {id(d): i for i, d in enumerate(inventory)}
+    ranked = sorted(inventory, key=lambda d: (-_score(d), order[id(d)]))
+    primary = ranked[0]
+    return primary, [d for d in inventory if d is not primary]
+
+
+def _rebind_report_byPath(parts, model_folder_name):
+    """Return a copy of viz report ``parts`` whose ``definition.pbir`` is bound to a sibling model.
+
+    The viz stage bakes byPath ``../<dataset_name>.SemanticModel`` (the dataset name defaults to the
+    workbook name). A self-contained workbook ``.pbip`` embeds the workbook's OWN datasource as a
+    sibling model, so the report must instead point at ``../<model_folder_name>.SemanticModel``.
+    Only the byPath target is rewritten; everything else in ``parts`` is untouched. Returns ``None``
+    when there is no ``definition.pbir`` to rebind (the report cannot be opened as a project).
+    """
+    if not isinstance(parts, dict) or "definition.pbir" not in parts:
+        return None
+    out = dict(parts)
+    try:
+        doc = json.loads(out["definition.pbir"])
+    except (ValueError, TypeError):
+        return None
+    target = f"../{model_folder_name}.SemanticModel"
+    ref = doc.get("datasetReference")
+    if isinstance(ref, dict) and isinstance(ref.get("byPath"), dict):
+        ref["byPath"]["path"] = target
+    else:
+        doc["datasetReference"] = {"byPath": {"path": target}}
+    out["definition.pbir"] = json.dumps(doc, indent=2)
+    return out
+
+
+def _viz_fidelity(result):
+    """Per-worksheet rebuild fidelity from a viz result: ``[{worksheet, visual_type, status, reason}]``.
+
+    ``status`` is ``"rebuilt"`` for a worksheet emitted cleanly and ``"warned"`` for one the viz
+    stage flagged (or an unsupported visual type). Dashboard-scope or unmatched warnings are kept as
+    their own ``warned`` rows so nothing is dropped. Reasons reuse the engine's
+    ``"manual attention required: "`` prefix.
+    """
+    ir = result.get("ir") if isinstance(result, dict) else None
+    warnings = (result.get("warnings") if isinstance(result, dict) else None) or []
+    worksheets = (ir or {}).get("worksheets", []) if isinstance(ir, dict) else []
+    ws_names = {w.get("name") for w in worksheets}
+
+    warned_ws, extra = {}, []
+    for w in warnings:
+        if w.get("scope") == "worksheet" and w.get("name") in ws_names:
+            warned_ws.setdefault(w.get("name"), w.get("reason"))
+        else:
+            extra.append(w)
+
+    fidelity = []
+    for ws in worksheets:
+        nm, vt = ws.get("name"), ws.get("visual_type")
+        if nm in warned_ws:
+            fidelity.append({"worksheet": nm, "visual_type": vt,
+                             "status": "warned", "reason": warned_ws[nm]})
+        elif vt in (None, "unsupported"):
+            fidelity.append({"worksheet": nm, "visual_type": vt, "status": "warned",
+                             "reason": "manual attention required: unsupported visual type"})
+        else:
+            fidelity.append({"worksheet": nm, "visual_type": vt,
+                             "status": "rebuilt", "reason": ws.get("fidelity_note")})
+    for w in extra:
+        fidelity.append({"worksheet": w.get("name"), "visual_type": w.get("scope"),
+                         "status": "warned", "reason": w.get("reason")})
+    return fidelity
+
+
+_PBIP_WARN = "manual attention required: "
+
+
+def _model_object_names(model_parts):
+    """Collect every measure name and column name emitted by the model (lower-cased).
+
+    Used to cross-check that the viz layer's field references resolve to a real model object.
+    Names are gathered across *all* TMDL parts (measures live in ``_Measures``; columns in their
+    table parts), so the check is robust to whether a table is in its own file or in ``model.tmdl``.
+    """
+    measures, columns = set(), set()
+    for path, content in (model_parts or {}).items():
+        if not (isinstance(content, str) and path.endswith(".tmdl")):
+            continue
+        for q, b in re.findall(r"(?m)^\s*measure\s+(?:'([^']+)'|([^\s=]+))", content):
+            measures.add((q or b).lower())
+        for q, b in re.findall(r"(?m)^\s*column\s+(?:'([^']+)'|([^\s=]+))", content):
+            columns.add((q or b).lower())
+    return measures, columns
+
+
+def _ref_name_kind(field):
+    """Return ``(property_name, "measure"|"column"|None)`` for a PBIR projection field node."""
+    node = field if isinstance(field, dict) else {}
+    if "Aggregation" in node:
+        node = (node["Aggregation"] or {}).get("Expression", {}) or {}
+    if "Measure" in node:
+        return (node["Measure"] or {}).get("Property"), "measure"
+    if "Column" in node:
+        return (node["Column"] or {}).get("Property"), "column"
+    return None, None
+
+
+def _crosscheck_report_refs(report_parts, model_parts):
+    """Drop viz projections that reference a model object the migration did not emit.
+
+    ``twb_to_pbir._resolve_field`` binds a calculated-field reference optimistically to
+    ``_Measures[<caption>]`` without validating it against the emitted model (the field index
+    only knows physical columns). So a calc that the model rebuilt as a *column* (a dimension-role
+    calc), stubbed, or dropped leaves a **dangling** ``_Measures[X]`` reference -- a "missing field"
+    in Power BI. At this seam both halves are in hand, so we deterministically verify every
+    projection against the real model: a measure ref must name an emitted measure, a column ref an
+    emitted column. Unresolved projections are dropped (warn-never-wrong: drop rather than mis-bind);
+    a visual that loses every projection is emptied to a placeholder zone so it never renders broken.
+    Field-parameter visuals are skipped (a separately validated construct). Returns
+    ``(report_parts, drops)`` where ``drops`` is ``[{"visual", "dropped": [...], "emptied": bool}]``.
+    """
+    measures, columns = _model_object_names(model_parts)
+    drops = []
+    if not (measures or columns):
+        return report_parts, drops  # no model object inventory -> do not risk false drops
+    for path, content in list((report_parts or {}).items()):
+        if not (isinstance(content, str) and path.endswith("visual.json")):
+            continue
+        try:
+            j = json.loads(content)
+        except (ValueError, TypeError):
+            continue
+        vis = j.get("visual") or {}
+        qs = ((vis.get("query") or {}).get("queryState")) or {}
+        if not qs or any(isinstance(s, dict) and s.get("fieldParameters") for s in qs.values()):
+            continue
+        dropped = []
+        for role, spec in list(qs.items()):
+            if not isinstance(spec, dict):
+                continue
+            kept = []
+            for p in spec.get("projections", []):
+                name, kind = _ref_name_kind((p or {}).get("field") or {})
+                low = name.lower() if isinstance(name, str) else None
+                ok = (low in measures if kind == "measure"
+                      else low in columns if kind == "column"
+                      else True)  # unknown ref shape -> keep (conservative)
+                (kept if ok else dropped).append(p if ok else f"{role}:{kind or '?'} {name!r}")
+            spec["projections"] = kept
+            if not kept:
+                del qs[role]
+        if dropped:
+            emptied = not qs
+            if emptied:
+                vis.pop("query", None)
+            report_parts[path] = json.dumps(j, indent=2)
+            drops.append({"visual": j.get("name"), "dropped": dropped, "emptied": emptied})
+    return report_parts, drops
+
+
+def _date_binding_from_model(res_report):
+    """Derive the report binder's ``date_binding`` from the model build's date-table report.
+
+    Purely a CONSUMER of facts the datasource-migration build already produced (it never re-detects
+    dates): the marked Date table name and which fact date column the calendar relates to ACTIVELY
+    (``assemble_model._select_primary_date`` refuses to guess when ambiguous, so ``active`` is empty
+    then). Returns ``None`` when there is no usable marked Date table or no active date -- the report
+    then keeps binding date axes to the source column (warn-never-wrong). ``grain_columns`` is left
+    to the binder's standard calendar-column default, so the contract stays minimal.
+    """
+    dr = (res_report or {}).get("date_table") or {}
+    if not (dr.get("generated") and dr.get("mark_as_date") and dr.get("table")):
+        return None
+    active = [r.get("column") for r in (dr.get("relationships") or [])
+              if r.get("active") and r.get("column")]
+    if not active:
+        return None
+    return {"date_table": dr["table"], "active_keys": active, "key_column": "Date"}
+
+
+def _ds_calc_columns(ds_el):
+    """Calculated fields defined directly on a datasource element.
+
+    Returns ``[{"name", "formula", "role", "_internal"}]`` for every ``<column>`` child carrying a
+    ``<calculation class='tableau'>`` with a formula (parameters and non-formula bins/groups skipped).
+    ``name`` is the user-facing caption (de-bracketed internal name as fallback); ``_internal`` is the
+    lowercased ``Calculation_*`` id that worksheet ``<datasource-dependencies>`` reference by.
+    """
+    out, seen = [], set()
+    for col in (c for c in list(ds_el) if _local(c.tag) == "column"):
+        if col.get("param-domain-type") is not None:
+            continue
+        calc_el = next((c for c in list(col) if _local(c.tag) == "calculation"), None)
+        if calc_el is None or (calc_el.get("class") or "tableau").strip().lower() != "tableau":
+            continue
+        formula = calc_el.get("formula")
+        if not formula or not formula.strip():
+            continue
+        internal = _strip_brackets((col.get("name") or "").strip())
+        name = (col.get("caption") or "").strip() or internal
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        out.append({"name": name, "formula": formula,
+                    "role": (col.get("role") or "").strip().lower() or None,
+                    "_internal": internal.lower()})
+    return out
+
+
+def _view_referenced_calc_ids(root):
+    """Lowercased internal-ids and captions of calc fields referenced by ANY worksheet.
+
+    Reads each ``<worksheet>``'s ``<datasource-dependencies>`` columns that carry a calculation, so a
+    calc the user defined but never put on a shelf is not counted as a binding dependency.
+    """
+    refs = set()
+    for ws in (e for e in root.iter() if _local(e.tag) == "worksheet"):
+        for dep in (d for d in ws.iter() if _local(d.tag) == "datasource-dependencies"):
+            for col in (c for c in list(dep) if _local(c.tag) == "column"):
+                if next((c for c in list(col) if _local(c.tag) == "calculation"), None) is None:
+                    continue
+                cid = _strip_brackets((col.get("name") or "").strip()).lower()
+                cap = (col.get("caption") or "").strip().lower()
+                if cid:
+                    refs.add(cid)
+                if cap:
+                    refs.add(cap)
+    return refs
+
+
+def _workbook_binding_signal(twb_text, ir):
+    """Additive per-workbook binding decision record (records a SIGNAL; changes no routing today).
+
+    Reports whether the workbook's primary datasource is a PUBLISHED Tableau datasource
+    (``connection_class == 'sqlproxy'`` -- the federated proxy a published datasource connects
+    through) or an EMBEDDED one, plus the view-referenced workbook-local calculated fields whose
+    absence would break a rebind to a published/shared model (the *would-break-if-rebound* set). This
+    is exactly the consumer-side input the estate-comparison + datasource-migration skills need to
+    decide rebind-to-published vs rebuild-embedded; the dashboard migration itself still always
+    rebuilds + binds the embedded model (the rebind ROUTING lands once the cross-skill catalog
+    contract is frozen). Returns ``None`` when there is no real datasource to characterise.
+    """
+    try:
+        inventory = list_workbook_datasources(twb_text)
+    except Exception:
+        return None
+    if not inventory:
+        return None
+    primary, secondaries = _rank_primary_datasource(inventory, ir)
+    is_published = (primary.get("connection_class") or "").strip().lower() == "sqlproxy"
+    label = primary.get("label") or primary.get("caption") or primary.get("name")
+
+    view_local_calcs = []
+    try:
+        root = ET.fromstring((twb_text or "").lstrip("\ufeff"))
+        primary_name = (primary.get("name") or "").strip()
+        ds_el = next((d for d in root.iter() if _local(d.tag) == "datasource"
+                      and (d.get("name") or "").strip() == primary_name), None)
+        if ds_el is not None:
+            referenced = _view_referenced_calc_ids(root)
+            for c in _ds_calc_columns(ds_el):
+                if c["_internal"] in referenced or c["name"].lower() in referenced:
+                    view_local_calcs.append({"name": c["name"], "formula": c["formula"],
+                                             "role": c["role"]})
+    except ET.ParseError:
+        view_local_calcs = []
+
+    if is_published and view_local_calcs:
+        recommendation = "review_rebind"
+        note = (f"published datasource {label!r}; {len(view_local_calcs)} view-referenced "
+                "workbook-local calc(s) must be satisfied by the bound model -- rebind to the "
+                "migrated published model only if it carries them, else rebuild the embedded model")
+    elif is_published:
+        recommendation = "candidate_rebind_to_published"
+        note = (f"published datasource {label!r} with no view-local calc dependencies -- candidate "
+                "to rebind to the migrated published model (pending estate catalog match)")
+    else:
+        recommendation = "rebuild_embedded"
+        note = (f"embedded datasource {label!r} -- rebuild the model from the workbook so it carries "
+                "its calculated fields")
+
+    return {
+        "kind": "published" if is_published else "embedded",
+        "connection_class": primary.get("connection_class"),
+        "primary_datasource": label,
+        "published_ds_name": label if is_published else None,
+        "secondary_datasources": [s.get("label") for s in secondaries],
+        "view_local_calcs": view_local_calcs,
+        "recommendation": recommendation,
+        "note": note,
+    }
+
+
+def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None):
+    """Build an openable, self-contained workbook ``.pbip`` and record it on ``detail`` (never raises).
+
+    Rebuilds the workbook's OWN primary embedded datasource into a semantic model (reusing the
+    datasource pipeline, so calculated fields are auto-extracted and role-split) and binds the
+    rebuilt report to it *by path* as a sibling, yielding ``pbip/<WB>/{<DS>.SemanticModel,
+    <WB>.Report, <WB>.pbip}``. Purely additive: it never alters the bare ``reports/`` write. Sets
+    ``pbip_status``/``pbip_folder``/``bound_model``/``bound_datasource``/``model_translation_handoff``
+    and appends honest ``pbip_warnings`` for every case it cannot faithfully bind (no embedded
+    datasource, lakehouse fallback, secondary datasources, write failure).
+    """
+    detail.update(pbip_status="skipped", pbip_folder=None, bound_model=None,
+                  bound_datasource=None, model_translation_handoff=None)
+    detail.setdefault("pbip_ref_drops", [])
+    warns = detail.setdefault("pbip_warnings", [])
+
+    report_parts = _rebind_report_byPath(result.get("parts") if isinstance(result, dict) else None,
+                                         "__placeholder__")
+    if report_parts is None:
+        warns.append(_PBIP_WARN + "viz stage produced no PBIR report definition -- "
+                     "cannot assemble an openable workbook project")
+        return
+
+    try:
+        inventory = list_workbook_datasources(twb_text)
+    except Exception:
+        inventory = []
+    if not inventory:
+        warns.append(_PBIP_WARN + "no embedded datasource found to rebuild -- "
+                     "workbook report not bound to a local model")
+        return
+
+    primary, secondaries = _rank_primary_datasource(inventory, result.get("ir"))
+    label = primary.get("label") or primary.get("caption") or primary.get("name")
+    model_safe = _fs_safe(primary.get("caption") or primary.get("name") or label, "Model")
+    detail["bound_datasource"] = label
+    for sec in secondaries:
+        warns.append(_PBIP_WARN + f"secondary datasource {sec.get('label')!r} not bound -- "
+                     f"a single PBIR report binds one model; bound the primary {label!r}")
+
+    try:
+        res = migrate_datasource(twb_text, model_name=model_safe, datasource=label)
+    except Exception as exc:
+        warns.append(_PBIP_WARN + f"could not rebuild embedded datasource {label!r} "
+                     f"({type(exc).__name__}: {exc}) -- workbook .pbip skipped")
+        return
+
+    res_report = res.get("report") or {}
+    if res_report.get("fallback"):
+        rationale = (res_report.get("storage_decision") or {}).get("rationale") or "undoable shape"
+        warns.append(_PBIP_WARN + f"embedded datasource {label!r} routes to the lakehouse fallback "
+                     f"({rationale}) -- workbook .pbip skipped (model lands separately)")
+        return
+
+    report_parts = _rebind_report_byPath(result["parts"], model_safe)
+    # Date-table rebind: now that the real model is in hand, re-run the viz stage with the model's
+    # date facts so date axis pills on the ACTIVE business date bind to the shared marked Date table
+    # (Date[Year], ...) -- routing time intelligence through the calendar instead of the fact's raw
+    # date column. Consumes the model build's facts; never recomputes them. Best-effort + additive:
+    # any failure (or a model with no usable Date table) silently keeps the source-column binding.
+    date_binding = _date_binding_from_model(res_report)
+    if date_binding and viz is not None:
+        try:
+            rebuilt = viz(twb_text, detail.get("name") or safe_base, date_binding=date_binding)
+            if isinstance(rebuilt, dict) and rebuilt.get("parts"):
+                report_parts = _rebind_report_byPath(rebuilt["parts"], model_safe)
+                detail["date_rebind"] = {"date_table": date_binding["date_table"],
+                                         "active_keys": date_binding["active_keys"]}
+        except Exception as exc:
+            warns.append(_PBIP_WARN + f"date-table rebind skipped ({type(exc).__name__}: {exc}) -- "
+                         f"report date axes bind to the source date column")
+    # M1.3 ref cross-check: now that the real model is in hand, drop any viz projection that
+    # references a measure/column the model did not emit (an optimistic `_Measures[caption]` bind
+    # that dangles), so the whole viz layer is warn-never-wrong on field references -- not just MV.
+    report_parts, ref_drops = _crosscheck_report_refs(report_parts, res.get("parts"))
+    if ref_drops:
+        detail["pbip_ref_drops"] = ref_drops
+        for d in ref_drops:
+            tail = " (visual emptied)" if d["emptied"] else ""
+            warns.append(_PBIP_WARN + f"visual {d['visual']!r} dropped {len(d['dropped'])} "
+                         f"reference(s) the model did not emit: {', '.join(d['dropped'])}{tail}")
+    dest = os.path.join(pbip_dir, safe_base)
+    try:
+        if os.path.isdir(dest):
+            shutil.rmtree(dest)
+        write_local_pbip(res["parts"], dest, model_name=model_safe, report_name=safe_base,
+                         report_parts=report_parts, project_name=safe_base)
+    except OSError as exc:
+        warns.append(_PBIP_WARN + f"workbook .pbip write failed ({exc})")
+        return
+
+    detail.update(pbip_status="built",
+                  pbip_folder=f"pbip/{safe_base}/{safe_base}.pbip",
+                  bound_model=model_safe,
+                  model_translation_handoff=res_report.get("translation_handoff"))
+
+
+def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir=None):
+    """Run the optional viz stage for one workbook. Returns a report detail dict (never raises).
+
+    Beyond the back-compatible bare ``reports/<Name>.Report`` write, when ``pbip_dir`` is given the
+    workbook's rebuilt dashboard is additionally bundled into an openable, self-contained ``.pbip``
+    project (model rebuilt from the workbook's own embedded datasource + report bound to it by path)
+    so it can be opened in Power BI Desktop. A ``viz_fidelity`` list reports per-worksheet rebuild
+    status; ``pbip_*`` keys report the project binding. Both additions are additive.
+    """
     name = source.asset_name(wb_id)
     detail = {"name": name, "source_id": str(wb_id)}
 
@@ -621,8 +1047,10 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders):
 
     parts = result.get("parts") if isinstance(result, dict) else None
     output_folder = None
+    safe_base = None
     if parts:
-        folder = _safe_folder(name, used_folders) + ".Report"
+        safe_base = _safe_folder(name, used_folders)
+        folder = safe_base + ".Report"
         dest = os.path.join(reports_dir, folder)
         try:
             if os.path.isdir(dest):
@@ -633,9 +1061,21 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders):
             detail.update(viz_status="error", note=f"viz write failed: {exc}")
             return detail
 
+    viz_warns = result.get("warnings") if isinstance(result, dict) else None
+    rc_unbound = sum(1 for w in (viz_warns or [])
+                     if "implicit row count" in (w.get("reason") or ""))
     detail.update(viz_status="built",
                   note=result.get("note") if isinstance(result, dict) else None,
-                  output_folder=output_folder)
+                  output_folder=output_folder,
+                  viz_fidelity=_viz_fidelity(result),
+                  viz_implicit_row_count=rc_unbound)
+
+    signal = _workbook_binding_signal(text, result.get("ir") if isinstance(result, dict) else None)
+    if signal is not None:
+        detail["binding_signal"] = signal
+
+    if parts and pbip_dir is not None:
+        _attach_workbook_pbip(detail, text, result, safe_base, pbip_dir, viz=viz)
     return detail
 
 
@@ -982,7 +1422,7 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
 
     ds_details = [_migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir)
                   for ds_id in source.list_datasources()]
-    wb_details = [_migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders)
+    wb_details = [_migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir)
                   for wb_id in source.list_workbooks()]
 
     summary = _summarize(ds_details, wb_details, viz is not None)
@@ -1060,6 +1500,22 @@ def _summarize(ds_details, wb_details, viz_available):
     wb_built = sum(1 for w in wb_details if w.get("viz_status") == "built")
     wb_warned = sum(1 for w in wb_details if w.get("viz_status") == "warned")
     wb_error = sum(1 for w in wb_details if w.get("viz_status") == "error")
+    wb_pbip_built = sum(1 for w in wb_details if w.get("pbip_status") == "built")
+    visuals_rebuilt = sum(1 for w in wb_details for f in (w.get("viz_fidelity") or [])
+                          if f.get("status") == "rebuilt")
+    visuals_warned = sum(1 for w in wb_details for f in (w.get("viz_fidelity") or [])
+                         if f.get("status") == "warned")
+    sigs = [w.get("binding_signal") for w in wb_details if w.get("binding_signal")]
+    workbooks_published_ds = sum(1 for sig in sigs if sig.get("kind") == "published")
+    workbooks_embedded_ds = sum(1 for sig in sigs if sig.get("kind") == "embedded")
+    workbooks_rebind_candidate = sum(1 for sig in sigs
+                                     if sig.get("recommendation") == "candidate_rebind_to_published")
+    # Implicit row counts (object-id COUNT(*) / legacy [Number of Records]) left unbound because the
+    # model build did not supply a COUNTROWS measure target. Surfaces the cross-layer gap as an
+    # estate roll-up so the volume is explicit (these are warned, never silently dropped/mis-bound).
+    implicit_row_count_unbound = sum(w.get("viz_implicit_row_count", 0) for w in wb_details)
+    workbooks_implicit_row_count = sum(1 for w in wb_details
+                                       if w.get("viz_implicit_row_count", 0) > 0)
 
     return {
         "datasources_total": len(ds_details),
@@ -1080,6 +1536,14 @@ def _summarize(ds_details, wb_details, viz_available):
         "workbooks_viz_built": wb_built,
         "workbooks_viz_warned": wb_warned,
         "workbooks_viz_error": wb_error,
+        "workbooks_pbip_built": wb_pbip_built,
+        "visuals_rebuilt": visuals_rebuilt,
+        "visuals_warned": visuals_warned,
+        "workbooks_published_ds": workbooks_published_ds,
+        "workbooks_embedded_ds": workbooks_embedded_ds,
+        "workbooks_rebind_candidate": workbooks_rebind_candidate,
+        "implicit_row_count_unbound": implicit_row_count_unbound,
+        "workbooks_implicit_row_count": workbooks_implicit_row_count,
         "connectors_seen": sorted(connectors),
         "storage_modes": modes,
         "viz_stage_available": viz_available,
@@ -1168,9 +1632,34 @@ def _render_summary_md(report):
             lines.append(f"- **{f['datasource']}** ({f['fallback_path']}): {f['reason']}")
 
     if report["workbooks"]:
-        lines += ["", "## Workbooks", "", "| Workbook | Viz | Note |", "|---|---|---|"]
+        lines += ["", "## Workbooks", "",
+                  "| Workbook | Viz | Visuals (rebuilt/warned) | Project (.pbip) | Bound model | Note |",
+                  "|---|---|---|---|---|---|"]
         for w in report["workbooks"]:
-            lines.append(f"| {w['name']} | {w.get('viz_status', '')} | {w.get('note') or ''} |")
+            fid = w.get("viz_fidelity") or []
+            rebuilt = sum(1 for f in fid if f.get("status") == "rebuilt")
+            warned = sum(1 for f in fid if f.get("status") == "warned")
+            lines.append(
+                f"| {w['name']} | {w.get('viz_status', '')} | {rebuilt}/{warned} "
+                f"| {w.get('pbip_folder') or '-'} | {w.get('bound_model') or '-'} "
+                f"| {w.get('note') or ''} |")
+        if any(w.get("pbip_folder") for w in report["workbooks"]):
+            lines += [
+                "",
+                "> **Open locally:** each rebuilt workbook with a bound model has a self-contained, "
+                "openable Power BI project at `pbip/<Workbook>/<Workbook>.pbip` (report + a model "
+                "rebuilt from the workbook's own embedded datasource) — double-click to open it in "
+                "Power BI Desktop. The `semantic_models/` folders remain the canonical deploy target.",
+            ]
+        if s.get("implicit_row_count_unbound", 0):
+            lines += [
+                "",
+                f"> **Implicit row counts:** {s['implicit_row_count_unbound']} implicit count "
+                f"measure(s) across {s['workbooks_implicit_row_count']} workbook(s) "
+                "(Tableau's `COUNT(*)` / legacy `Number of Records`) are flagged for manual "
+                "attention — add a `COUNTROWS` measure to the fact table and bind it. These are "
+                "warned, never emitted as a dangling reference.",
+            ]
 
     lines += [
         "",

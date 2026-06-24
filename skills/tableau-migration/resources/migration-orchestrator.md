@@ -4,8 +4,11 @@ End-to-end order of operations for migrating one Tableau **published data source
 Fabric / Power BI **semantic model**. Read this when the user asks for a full migration; load the
 per-phase resource docs on demand as you reach each phase.
 
-> **Scope reminder (v1):** semantic model only — data model, typed columns, relationships, calculated
-> field → DAX, and the upstream connection. Worksheet / dashboard → Power BI report is **roadmap (v2)**.
+> **Scope reminder:** this orchestrator covers the semantic-model path — data model, typed columns,
+> relationships, calculated field → DAX, and the upstream connection. Worksheet / dashboard → Power BI
+> report is **supported as a preview** (Tier-1 structure, bound into an openable `.pbip`) via the estate
+> orchestrator and `twb_to_pbir`; visual formatting is a later pass. See
+> [viz-rebuild.md](viz-rebuild.md) and [feature-parity.md](feature-parity.md).
 
 ---
 

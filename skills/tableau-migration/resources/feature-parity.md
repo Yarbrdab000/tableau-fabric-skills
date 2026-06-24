@@ -5,7 +5,8 @@ before a migration and to populate the "Not migrated" section of the report.
 
 > **Migration shape:** unlike the source-code migration peers (`synapse-`/`databricks-`/`hdinsight-migration`,
 > which rewrite notebook code), Tableau migration is **artifact reconstruction**: datasource → semantic
-> model, calc → DAX, (v2) viz → report. Fidelity is high for the model and partial-by-design for calcs.
+> model, calc → DAX, viz → report (preview — Tier-1 structure). Fidelity is high for the model and
+> partial-by-design for calcs and report structure.
 
 ---
 
@@ -74,13 +75,26 @@ it should enumerate any present and list them as manual follow-ups so the custom
 
 ---
 
-## Worksheets & dashboards (roadmap — v2)
+## Worksheets & dashboards (supported — preview, Tier-1 structure)
 
-Worksheet / dashboard → Power BI **report (PBIR)** is **not** part of the v1 datasource-migration flow.
-The viz grammar (marks, shelves, filters, chart types) lives in the workbook `.twb`/`.twbx` XML — not the
-Metadata API — and needs a dedicated parser plus a Tableau-viz → PBIR mapper. The output half (PBIR
-generation) is prototyped in `scripts/twb_to_pbir.py`, and v1 rebuilds the measures those visuals will
-bind to, so v2 starts from a wireframe-level report bound to v1's model.
+Worksheet / dashboard → Power BI **report (PBIR)** ships as a **preview** that rebuilds Tier-1
+*structure* — the right chart type, **exact** field bindings to the migrated model, position/layout,
+filters/parameters → slicers, and default cross-filter — into an **openable, model-bound** `.pbip`.
+The viz grammar (marks, shelves, filters, chart types) lives in the workbook `.twb`/`.twbx` XML (not
+the Metadata API); `scripts/twb_to_pbir.py` parses it into a normalized IR and emits PBIR parts, and
+`scripts/migrate_estate.py` binds each rebuilt report to a model rebuilt from the workbook's own
+embedded datasource (`pbip/<Workbook>/<Workbook>.pbip`). See [viz-rebuild.md](viz-rebuild.md).
+
+| Tableau viz | Power BI target | status |
+|---|---|---|
+| Bar / column, line, area, text table, matrix, pie, scatter, filled + symbol map, card / multi-row card | PBIR `clusteredColumnChart` / `clusteredBarChart` / `lineChart` / `areaChart` / `tableEx` / `pivotTable` / `pieChart` / `scatterChart` / `filledMap` / `map` / `card` / `multiRowCard` | ✅ Rebuilt (structure + exact bindings) |
+| Worksheet / dashboard filters, what-if / field parameters | `slicer` | ✅ Surfaced as slicers (review scope after import) |
+| Dashboard layout (zones) | Report page layout | ✅ Zones scaled into the page |
+| Visual **formatting** — specific colors, fonts, title/label styling, legends, conditional-format palettes, theme JSON, tooltips | — | ❌ Deferred to a later (Tier-2) pass |
+| Ambiguous chart-type adjudication, custom-geometry / density maps, KPI target/trend, table-calc-dependent layouts | — | ⚠️ Reported as a structured `warning`, never rebuilt wrong |
+
+Everything the rebuild can't do faithfully is emitted as a structured warning (`viz_fidelity` /
+`pbip_warnings`) rather than a wrong visual.
 
 ---
 
@@ -89,4 +103,6 @@ bind to, so v2 starts from a wireframe-level report bound to v1's model.
 - The **data model** migrates with high fidelity.
 - **Calculations** migrate for a safe, type-checked subset; the rest are preserved-formula stubs a human
   finishes — and [reconciliation](validation-reconciliation.md) proves the translated ones equal Tableau.
-- **Dashboards** are roadmap. Never claim full parity.
+- **Dashboards** rebuild at Tier-1 *structure* (chart type, exact bindings, layout, slicers) as a
+  preview, into an openable model-bound `.pbip`; visual *formatting* (colors, fonts, legends) is a
+  later pass. Never claim full parity.
