@@ -56,11 +56,14 @@ fixtures, no disk, no network); the live open/deploy is a separate manual pass.
 
 | Tableau mark + shelf layout                         | IR `visual_type` | PBIR `visualType`      | Data roles            |
 | --------------------------------------------------- | ---------------- | ---------------------- | --------------------- |
-| Bar, dimension on **columns**, measure on **rows**  | `column`         | `clusteredColumnChart` | Category / Y / Series |
-| Bar, dimension on **rows**, measure on **columns**  | `bar`            | `clusteredBarChart`    | Category / Y / Series |
-| Line (needs ≥1 measure)                             | `line`           | `lineChart`            | Category / Y / Series |
+| Bar, dimension on **columns**, measure on **rows**  | `column`         | `clusteredColumnChart` (`stackedColumnChart` with a colour-legend dim) | Category / Y / Series |
+| Bar, dimension on **rows**, measure on **columns**  | `bar`            | `clusteredBarChart` (`stackedBarChart` with a colour-legend dim) | Category / Y / Series |
+| Line (needs ≥1 measure)                             | `line`           | `lineChart`            | Category / Y / Series / Small multiples |
+| Area (needs ≥1 measure)                             | `area`           | `areaChart`            | Category / Y / Series / Small multiples |
+| Dual-axis combo: a column-family measure + a line-family measure on one shelf | `combo` | `lineClusteredColumnComboChart` | Category / Y (columns) / Y2 (lines) / Series |
 | Text, dimensions on **one** axis                    | `table`          | `tableEx`              | Values                |
 | Text, dimensions on **both** axes                   | `matrix`         | `pivotTable`           | Rows / Columns / Values |
+| Square (highlight table), dimensions on **both** axes + measure on colour/label | `matrix` | `pivotTable` | Rows / Columns / Values |
 | Pie, legend dimension + angle measure               | `pie`            | `pieChart`             | Category / Y          |
 | Circle/square/shape/point, measure on **both** axes + a disaggregating dimension | `scatter` | `scatterChart` | X / Y / Category / Series / Size |
 | Geo-role dimension on **detail** + measure (area/`Map`/`Automatic`+spatial signal) | `filled_map` | `filledMap` | Location / Color |
@@ -73,6 +76,76 @@ fixtures, no disk, no network); the live open/deploy is a separate manual pass.
 matrix; two measures + a dimension → scatter). A `color` encoding on a dimension populates the
 **Series** role; a `detail`/level-of-detail dimension disaggregates a scatter (**Category**); a
 measure on the `label`/`text` or `size` encoding with empty shelves drives a **card**.
+
+A colour-legend **dimension** on a bar/column mark renders as a **stacked** chart
+(`stackedColumnChart`/`stackedBarChart`) rather than a clustered one, because Tableau stacks marks
+by default when a discrete colour pill is present. Bars without a colour-legend dimension keep the
+clustered variant. (If a workbook explicitly turned off *Stack marks*, review the subtype after
+import — that non-default setting is not read from the shelves.)
+
+A Tableau **dual axis** that overlays two measures with **different mark families** — a
+bar/column measure and a line/area measure — rebuilds as a **combo** chart
+(`lineClusteredColumnComboChart`): the column-family measure(s) bind to `Y` (primary axis) and the
+line-family measure(s) to `Y2` (secondary axis), against the shared category. Each measure's mark
+is read from its own dual-axis pane (`y-axis-name` names the measure; `y-index` marks the secondary
+axis). This is deliberately conservative — a dual axis whose two measures share the **same** mark
+(e.g. bar + bar) stays an ordinary multi-measure clustered/line chart, and an *area* measure is
+treated as line-family (consistent with the area→line default). Only a genuine column + line split
+emits the combo, so it never mis-fires on same-mark layouts.
+
+A Tableau **highlight table** — the `Square` mark with dimensions on both axes and the measure on
+the **colour** (saturation) encoding — rebuilds as a **matrix** (`pivotTable`): the row/column
+dimensions map to `Rows`/`Columns` and the colour measure becomes a `Values` field (a single-axis
+highlight table degrades to a `tableEx`). The colour saturation itself is Tier-2 styling, so the
+matrix shows the numbers without the heat shading. `Square` marks with **no** axis dimensions
+(treemap / packed-bubble / heatmap layouts) are deferred to a warning rather than guessed.
+
+### Sort order
+
+Tableau records an axis sort as `<computed-sort column='[dim]' direction='ASC|DESC' using='[measure]' />`
+on the worksheet view. When the sort-by `using` measure is **already bound** in the rebuilt visual,
+the engine emits a Power BI `visual.query.sortDefinition` (a sibling of `queryState`) — an ordered
+`sort` array of `{field, direction}` with direction `Ascending`/`Descending`, where `field` reuses
+the exact same expression as the bound projection (so the sort can never become a dangling
+reference). If the `using` measure is **not** bound anywhere in the visual, the sort is dropped
+rather than guessed (warn-never-wrong: the visual still renders in faithful default order). A
+`<manual-sort>` (an explicit, frozen list of members) has no faithful Power BI sort expression and
+is likewise left to the model's default order.
+
+### Worksheet titles (structural text only)
+
+Tableau authors an explicit worksheet title at `worksheet/layout-options/title/formatted-text/run`
+(one or more `<run>` segments). When a worksheet carries a non-empty **static** title — including a
+title that simply repeats the sheet name — the engine concatenates the run text and emits it as the
+Power BI visual's `visualContainerObjects.title` (a single-quoted semantic-query string literal with
+`show: true`), and suppresses Power BI's auto field-name subtitle (`subTitle.show: false`) so the
+rebuilt visual shows exactly the author's caption and nothing more. This is Tier-1 **text** only —
+the per-run styling (bold, font size/colour/name, alignment) is deliberately *not* reproduced; title
+formatting is a Tier-2 concern. A **dynamic** title (one that embeds a field or parameter reference,
+authored as an escaped `<…>` token between runs) has no faithful static-text equivalent, so it is
+deferred with a `… dynamic title …` warning and the rebuilt visual keeps its default title rather
+than rendering a broken literal (warn-never-wrong). An unsupported worksheet emits no visual, so its
+title is simply dropped (there is nothing to title); slicers built from filters/parameters are not
+titled.
+
+### Axis titles (structural axis labels)
+
+Tableau records an author-overridden axis title at
+`worksheet/table/style/style-rule[@element='axis']/format[@attr='title']`, where `scope` is `rows`
+or `cols` (which shelf's axis) and `value` is the title text — an **empty** `value` meaning the
+author hid that axis title. (Quick-filter caption rules live under
+`style-rule[@element='quick-filter']` and carry no `scope`, so they are excluded.) For the cartesian
+chart types that have a category-vs-value axis pair (`column`, `bar`, `line`, `area`), the engine
+reproduces the override on the rebuilt visual's data-plane `visual.objects`: a custom caption →
+`categoryAxis`/`valueAxis` `titleText` (a single-quoted semantic-query string literal) with
+`showAxisTitle: true`; a blanked title → `showAxisTitle: false` only. The whole-axis `show` toggle is
+never touched (hiding the *title* must not hide the axis labels/gridlines). The scope is mapped to a
+Power BI axis **by the role of the field(s) on that shelf** — a shelf holding only the dimension
+drives `categoryAxis`, a shelf holding only the measure drives `valueAxis` — so the mapping is
+orientation-independent (it is correct whether the dimension sits on rows for a bar or on cols for a
+column/line/area). A shelf with a mixed or empty role is skipped, and non-cartesian visuals
+(matrix/pie/scatter/maps) ignore axis titles entirely (warn-never-wrong: never guess which axis a
+title belongs to). Title font/colour/size styling is a Tier-2 concern and is not reproduced.
 
 ### Scatter / card / pie role mapping
 
@@ -87,6 +160,21 @@ measure on the `label`/`text` or `size` encoding with empty shelves drives a **c
   target/trend metadata.
 - **Pie** (`pieChart`): the legend dimension (axis dim or `color`) → `Category`, the angle/size
   measure → `Y`.
+- **Dot / strip plot** (`Circle` / `Shape` / `Point` mark): when the layout is exactly one
+  category axis vs one measure axis (a strip plot), it routes to a `column`/`bar` — the field
+  binding is identical and only the dot glyph differs (Tier-2 styling, cf. an `Area` mark, whose
+  fill over a `lineChart` shape is the deferred Tier-2 part of its dedicated `areaChart`). The
+  guard is strict: with a second axis dimension (a complex circle crosstab) or no axes at all
+  (packed bubble), nothing is guessed — the worksheet stays unsupported and warns. (Two measures
+  on the axes + a dimension still route to `scatter` as above.)
+- **Single-dimension text list** (`Automatic` / `Text` mark): a lone *categorical* field carried
+  only on the marks card (`label`, `colour`, or `detail`) with **no measure anywhere and no axis
+  pills** is Tableau's text rendering of that field's distinct values, so it routes to a
+  one-column `tableEx` listing that field. The same field dropped on both `colour` and `label`
+  is deduped to a single column. A **geographic** dimension is excluded (that is a map, deferred
+  to map routing) so a location field is never flattened into a plain list; a measure anywhere
+  (`colour`/`detail`/`size`/`label` value, or an axis measure) likewise disqualifies it (that is a
+  packed-bubble / KPI / chart layout, handled by those rules instead).
 
 ### Geographic maps (basics: filled + symbol)
 
@@ -111,6 +199,38 @@ The generated `Latitude`/`Longitude`/`Geometry` helper fields are dropped quietl
 as the spatial signal); the geo dimension binds like any column — `Location` = entity
 `<relation>` / property `clean_col(<remote-name>)`.
 
+### Measure Values / Measure Names (N measures in one well)
+
+Tableau's `Measure Values` shelf packs several measures into a single value well and uses the
+companion `Measure Names` pill to label/series/split them. Power BI has **no** `Measure Names`
+field — dropping the member measures into one value well *auto-produces* the series, column
+headers, or card rows. So the rebuild **expands** `[Measure Values]` to its ordered member
+measures (each exact-bound through the normal field resolver) and treats `[Measure Names]` as
+**implicit**: it is never bound (binding it would be a dangling reference to a column that does
+not exist). When a worksheet uses the Measure Values shelf, a `fidelity_note` records the
+expansion and the worksheet does **not** emit a false "no model binding" warning for the handled
+pseudo-fields.
+
+The ordered member list comes from the worksheet's categorical filter on `[:Measure Names]`
+(its `member` entries are in document = shelf order); a `<manual-sort>` dictionary is the
+fallback when no such filter is present. Routing by mark + where the (implicit) `Measure Names`
+pill sits:
+
+| Tableau pattern                                                        | Result                                  |
+| ---------------------------------------------------------------------- | --------------------------------------- |
+| `Measure Names` on **Color** (bar/line/automatic)                      | measures as the **Series** (`column`/`bar`/`line`) |
+| Measures as columns in a text **crosstab** (names on rows/cols, values on text) | `matrix` (native measures-as-columns) |
+| Multiple measures with **no** dimension                                | `card` / `multiRowCard`                 |
+| **Path-mark hack** (Line mark + `Measure Names` on **Path**, usually padded by a dummy `0` constant member) | reduced to a faithful `bar`/`column` of the real measure(s); the numeric-literal spacer is dropped |
+
+Two sub-cases are deliberately **deferred** (warn, never a wrong visual):
+
+- **`Measure Names` on Rows/Columns against a chart mark** splits the chart into one pane per
+  measure — that is *small multiples* (trellis), handled by a later pass — so it degrades to a
+  warning rather than being silently flattened into one chart.
+- **Parameter-driven swap members** (a `CASE`/`IF` over `[Parameters]`) are a field-parameter
+  pattern; a faithful field-parameter rebuild is deferred and the worksheet warns.
+
 ## Binding contract (matches the v1 model exactly)
 
 The `.twb` embeds the full datasource (`<relation>` + `<metadata-records>`), so bindings are
@@ -126,6 +246,23 @@ Fields are matched by their internal id (e.g. `[Sales]`), so a workbook-side cap
 still binds to the right model column. Callers can override binding precisely with a
 `field_map` `{caption: {"entity", "property", "binding"}}`, or pin every column to one table
 with `model_table=`.
+
+### Tableau internal / auto-generated pseudo-fields (silenced)
+
+Tableau injects helper fields the author never created and that have **no user model binding**.
+They surface as worksheet shelf / filter refs, so they must be recognised and dropped *silently*
+— warning on them is false noise, not a real coverage gap. Two authoritative signals are used
+(not fragile caption matching):
+
+- **`__tableau_internal_object_id__`** — Tableau's object-model row-count internal (a reserved
+  double-underscore namespace, never a user field); matched anywhere in the field id.
+- **`user:auto-column` declarations** — dashboard filter/set **action** groups
+  (`user:auto-column='sheet_link'`), viz-in-tooltip and forecast helpers. Their ids are collected
+  from the datasource once (language-independent) and dropped on resolve.
+
+The silencing is **targeted**: a genuine (non-internal) field that cannot be resolved still emits
+the `could not resolve field '<id>' (skipped)` warning, so the noise fix never masks a real
+missing binding.
 
 ### Field expressions (semantic query)
 
@@ -154,6 +291,29 @@ definition/pages/<page>/visuals/<v>/visual.json   (visualContainer 1.0.0)
 - Object names are sanitized to word-chars/hyphen with a short hash suffix for uniqueness, and
   each visual's `queryRef`s are de-duplicated.
 
+## Openable workbook project (estate orchestrator)
+
+On its own, `emit_pbir` writes only an **unbound** `.Report` folder. The estate orchestrator
+(`scripts/migrate_estate.py`) wraps these parts into a **self-contained, openable** `.pbip` per
+workbook:
+
+1. It enumerates the workbook's embedded datasources (`list_workbook_datasources`) and picks the
+   **primary** (the one the most worksheets bind to), rebuilding it into a semantic model with the
+   same datasource pipeline used for published `.tds` files — so calculated fields are auto-extracted
+   and role-split exactly as on the direct path (not silently dropped).
+2. It rewrites the report's `definition.pbir` `datasetReference.byPath` to point at that model as a
+   **sibling** (`../<Datasource>.SemanticModel`) and writes `pbip/<Workbook>/` containing the model,
+   the rebuilt `<Workbook>.Report`, and the `<Workbook>.pbip` pointer (named after the workbook via
+   `write_local_pbip(project_name=...)`) — double-click to open in Power BI Desktop, no external
+   model needed.
+
+Because the report binds to a model rebuilt from the workbook's **own** embedded datasource, every
+`Entity`/`Property` in the wireframe resolves to a real table/column in the bundled model. Per-visual
+status is reported as `viz_fidelity` (`rebuilt` / `warned`); anything that can't be bound faithfully
+(a datasource that routes to the lakehouse fallback, secondary datasources a single PBIR report can't
+bind, a missing `definition.pbir`) is recorded in `pbip_warnings` and the `.pbip` is skipped rather
+than mis-bound. See [migration-report.md](migration-report.md) for the exact report keys.
+
 ## Unsupported handling (→ `warnings`, never a wrong visual)
 
 Every warning is `{"scope": "worksheet"|"dashboard", "name": <name>, "reason": "manual attention required: ..."}`.
@@ -167,17 +327,41 @@ Cases that degrade to a warning instead of a visual/binding:
   `BUFFER` constructed geometry, density/heatmap layers, and dual-axis (layered) maps. The real
   Superstore "Sale Map" (a `Multipolygon` mark) defers this way rather than being rebuilt wrong.
 - **KPI target/trend**: a single measure with no dimension becomes a `card`/`multiRowCard`; the
-  richer PBIR `kpi` visual (with `Indicator`/`TrendAxis`/`TargetValue` roles) is deferred
-  because the workbook carries no target or trend metadata to bind those roles.
+  richer PBIR `kpi` visual (with `Indicator`/`TrendAxis`/`TargetValue` roles) is deferred to a
+  Tier-2 analytics pass. When the worksheet carries an explicit **reference / target / trend line**
+  (a Tableau `<reference-line>`/`<trend-line>` annotation — e.g. a sales goal, an average band, a
+  fitted trend), it is now **detected and disclosed**: the faithful value/visual still emits, and a
+  `… deferred (Tier-2 analytics): <target> …` warning names the dropped overlay (phrased as a
+  *KPI target/goal* on a card, a *reference/target/trend line* on a chart). The annotation
+  descriptors are also recorded on the worksheet IR (`reference_lines`) for a future analytics pass.
+  Drawing the overlay itself (the line/band on the canvas) stays Tier-2.
 - **Table calculations** and other window/running derivations (e.g. `WindowSum`) → field skipped.
 - **Aggregation/type mismatch**: `Sum`/`Avg`/`Median` on a non-numeric column, or `Min`/`Max`
   on a non-numeric/non-date column → field skipped.
 - **Date parts** (`Year`, `Month`, `Quarter`, …) → approximated as a plain date column; the
   date grain is *not* applied (flagged so it can be set manually).
 - **Calculated field on an axis** (a measure where a category is required) → skipped.
+- **Empty worksheet**: a structurally bare sheet (no resolved fields and no raw pills on any
+  shelf or encoding — a blank/text/image placeholder a dashboard uses for spacing or a title) is
+  classified precisely as `empty worksheet (no fields ...) -> nothing to rebuild`, distinct from
+  an *unsupported mark*. This keeps intentional blanks out of the unsupported-coverage count; a
+  sheet whose pills merely fail to resolve still keeps its generic "not supported" + resolve
+  warnings (it is a real gap, never silently called "empty").
 - **Caption fallback**: when a field has no embedded metadata record, it is bound by caption as
   a best effort and flagged to verify against the model's table/column names.
-- **Tableau pseudo-fields** (`Measure Names`, `Measure Values`, `Number of Records`) → skipped.
+- **Tableau pseudo-fields** (`Measure Names`, `Measure Values`) → skipped
+  when standalone. **Exception:** a worksheet built on the `Measure Values` shelf is *expanded*
+  to its N member measures (see "Measure Values / Measure Names" above), so those worksheets are
+  rebuilt — not skipped — and `Measure Names` is bound implicitly (never as a column).
+- **Implicit row counts** (Tableau's silent `COUNT(*)` over `[__tableau_internal_object_id__]`, and
+  the legacy `[Number of Records]` field) → recognised, **warned, never dropped or dangling**. Neither
+  has a real model column, so the binder names the **fact table** the count belongs to (resolved from
+  the object-id column caption, falling back to the relation name) and emits a `… implicit row count …
+  add a COUNTROWS measure …` warning. A *bare* `[__tableau_internal_object_id__]` artifact with no
+  `COUNT` instance (e.g. an internal filter pill) is **not** a row count and stays silently dropped.
+  Full recovery is a cross-layer follow-up: a model-side `COUNTROWS` measure on that fact table, after
+  which the binder exact-binds the count instead of warning. The estate report rolls the unbound count
+  up under `viz_implicit_row_count` / `implicit_row_count_unbound` / `workbooks_implicit_row_count`.
 
 ### Filters → slicers (wireframe placeholders)
 
@@ -186,6 +370,82 @@ migration: categorical → list slicer, date / relative-date → date slicer, nu
 range slicer. These are **placeholders** — Tableau's filter *scope* (worksheet / dashboard /
 context / data-source) and actions do not map 1:1 to Power BI slicer interactions, so slicer
 wiring should be reviewed after import.
+
+#### Applied selections → slicer `filterConfig`
+
+When a worksheet filter narrows a field to specific members (or a numeric range), that
+selection is carried onto the rebuilt slicer's top-level `filterConfig` so the report opens on
+the **same filtered view** as the original. The emitted JSON uses the verified PBIR shapes
+(categorical `In` / inverted `Not … In` with `isInvertedSelectionMode`; numeric `Advanced`
+`Comparison` with `>=` / `<=` bounds). Warn-never-wrong governs *which* selections emit — a
+wrong pre-filter would show wrong data, so only faithfully-bindable, JSON-verified shapes are
+written:
+
+| Tableau filter                                  | Emitted                                      |
+| ----------------------------------------------- | -------------------------------------------- |
+| categorical keep-list on a **string** dimension | `Categorical` `In` (members as literals)     |
+| categorical exclude on a **string** dimension   | `Categorical` `Not … In` + inverted flag     |
+| numeric range (min/max) on a numeric column     | `Advanced` `And` of `>=` / `<=` comparisons  |
+| date-part categorical (e.g. month `'4'`)        | *deferred* → slicer shows all + fidelity note |
+| `%null%`-sentinel-only selection                | *deferred* → slicer shows all + fidelity note |
+| fixed date range (datetime-literal shape)       | *deferred* → slicer shows all + fidelity note |
+
+Deferred cases leave the slicer at its faithful "show all" default and record a structured
+`filter`-scope warning rather than risk a possibly-wrong pre-filter.
+
+### Cross-visual interactions (default cross-filter / cross-highlight)
+
+Power BI cross-highlights / cross-filters every visual on a page **by default**, and in PBIR that
+default is **implicit** — you only write a page-level `visualInteractions` override (an array of
+`{source, target, type}` with `type` ∈ `Default` / `DataFilter` / `HighlightFilter` / `NoFilter`)
+when you want to *change* a specific source→target pair, and a report-level
+`settings.defaultFilterActionIsDataFilter` flag only when you want every visual to filter rather
+than highlight. The rebuilt report deliberately emits **neither**: every dashboard / worksheet page
+is written with no `visualInteractions` and no `defaultFilterActionIsDataFilter`, so all visuals
+(charts and slicers) cross-interact out of the box — a slicer filters its page, a mark selection
+cross-highlights the rest. Tuning specific interactions (filter-vs-highlight, disabling a pair, or
+wiring a Tableau filter/highlight *action* 1:1) is a Tier-2 concern and is left to the default.
+
+### Per-visual candidate record (Tier-2 image-oracle seam)
+
+The deterministic engine commits to exactly one visual type per worksheet. Alongside the PBIR it
+also returns an **additive** decision record per emitted main visual on
+`migrate_twb_to_pbir(...)["candidate_records"]` (also on `ir["candidate_records"]`) for a later,
+agent-driven **image-oracle** pass. Each record carries `page` (the sanitized PBIR page id),
+`page_display` (the dashboard / worksheet caption — the key the offline thumbnail is matched on),
+`visual` (the PBIR visual name), `worksheet`, the chosen `visual_type`, a ranked `candidates` list
+(chosen first — the *only* types the oracle is allowed to switch to), a `confidence` (`high` where
+the shelf layout is decisive; `medium` for a heuristic / hack reroute or a genuine visual look-alike
+an image can disambiguate), a `hack` flag for non-standard compositions (`dual-axis pie/donut`,
+`running-total Gantt`, `bump/rank`, `dual-axis combo`), the read-only `fields` truth
+(`{role: [queryRef]}` — the oracle must **never** rebind fields, which are exact-bound to the
+model), and the faithful `position` (incl. `z` / `tabOrder` for overlap / z-order analysis). It is
+purely additive: **nothing** about the record is written into the PBIR definition, so the rebuilt
+report is byte-for-byte unchanged whether or not the oracle runs.
+
+### Image-oracle harness + applier (Tier-2, opt-in)
+
+`scripts/image_oracle.py` turns those candidate records into an agent-driven vision pass and applies
+its answers — without ever touching field bindings. It is **opt-in**: the Tier-1 PBIR stands on its
+own; the oracle only ever *refines a chart type* (and, optionally, a position) the engine already
+emitted. The full numbered runbook (with the bold do-NOTs) is in
+[`resources/image-oracle.md`](image-oracle.md). In brief:
+
+- **`build_oracle_bundle(candidate_records, twb_xml=, image_dir=, images_out=)`** assembles a
+  JSON-serialisable *adjudication bundle*: per main visual, the candidate list + an **offline-first**
+  image reference (caller-provided file → embedded `.twb`/`.twbx` `<thumbnail>` PNG → none), the
+  read-only field truth, and a pre-filled answer template. Embedded thumbnails are keyed by the
+  dashboard/worksheet *display* name (matched via `page_display`), so a dashboard composition (e.g. a
+  donut with a KPI floating in its hole) gets the rendered page as its picture. No image ⇒ the visual
+  is reported `present: false` and the deterministic pick simply stands.
+- **`agent_prompt(bundle)`** renders the driving-agent instruction (no API key, no tool call): the
+  hard invariants, then each reviewable visual with its image path and the closed set of types it may
+  choose from.
+- **`apply_adjudications(parts, candidate_records, adjudications)`** deterministically re-binds a
+  visual's `visualType` **only** to a type already in its candidate list (and optionally adopts a
+  corrected position), returning a new parts dict plus an `{applied, kept, rejected}` report. A
+  non-candidate type, an unknown visual, or anything that would alter the query/fields is **rejected,
+  never applied** — the query/`queryState` is asserted byte-identical across every type switch.
 
 ## Tests
 

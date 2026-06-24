@@ -86,10 +86,13 @@ scraped from stdout. It is additive — the `measures` rows are unchanged.
 - Mismatches (with both values + the filter context used).
 - Could-not-evaluate (and why).
 
-### 6. Not migrated (by design — v1)
+### 6. Not migrated (by design)
 
 Calculated columns, sets/groups/bins, what-if parameters, calc groups, field parameters, perspectives, and
-**worksheets/dashboards** (roadmap v2). (Hierarchies, display folders, and RLS roles **are** rebuilt — see
+the **visual formatting** of rebuilt worksheets/dashboards (specific colors, fonts, legends, conditional
+formats — a later pass). Worksheet/dashboard **structure** *is* rebuilt at Tier-1 — see
+[§ Workbook rebuild](#workbook-rebuild-reportworkbooksn) below and [viz-rebuild.md](viz-rebuild.md).
+(Hierarchies, display folders, and RLS roles **are** rebuilt — see
 [model-enrichment.md](model-enrichment.md).) See [feature-parity.md](feature-parity.md).
 
 ---
@@ -111,7 +114,69 @@ The one-button estate orchestrator (`scripts/migrate_estate.py`) writes a self-d
 - `semantic_models/<Name>.SemanticModel/` — the canonical TMDL model per datasource (the deliverable).
 - `pbip/<Name>/<Name>.pbip` — an **openable Power BI project** per datasource (emitted by default;
   `--no-pbip` / `pbip=False` to skip), so each datasource opens directly in Power BI Desktop.
+- `pbip/<Workbook>/<Workbook>.pbip` — an **openable, self-contained workbook project** per workbook with
+  a rebuildable embedded datasource: the Tier-1 rebuilt report bound *by path* to a sibling model rebuilt
+  from the workbook's own embedded datasource.
+- `reports/<Name>.Report/` — the bare (unbound) rebuilt report parts, kept for back-compatibility.
 - `report.json` + `summary.md` — the machine- and human-readable audit report.
+
+### Workbook rebuild (`report["workbooks"][n]`)
+
+Each workbook detail carries the bare report rebuild plus — when its embedded datasource can be rebuilt —
+an openable, self-contained `.pbip`. The keys are **additive** (existing `name`, `source_id`, `viz_status`,
+`note`, `output_folder` are unchanged):
+
+- **`viz_fidelity[]`** — one row per rebuilt worksheet: `{worksheet, visual_type, status, reason}` with
+  `status ∈ {"rebuilt", "warned"}`. A `warned` row (unsupported visual, no usable bindings) keeps the
+  engine's `"manual attention required: …"` reason; `rebuilt` rows have `reason: null`.
+- **`pbip_status`** — `"built"` when an openable workbook project was written, `"skipped"` when it could
+  not be bound faithfully (the key is absent when `pbip=False`).
+- **`pbip_folder`** — `pbip/<Workbook>/<Workbook>.pbip` when built, else `null`.
+- **`bound_model`** / **`bound_datasource`** — the sibling model folder name and the embedded datasource
+  label the report was bound to.
+- **`model_translation_handoff`** — the embedded model's calc translation hand-off (stubbed calcs to
+  review), surfaced so the workbook model is reported as honestly as a standalone datasource.
+- **`pbip_warnings[]`** — every reason a faithful binding was declined (a lakehouse-fallback datasource,
+  secondary datasources a single PBIR report can't bind, a missing PBIR definition), each prefixed
+  `"manual attention required: "`. Nothing is mis-bound silently.
+- **`pbip_ref_drops[]`** — the seam's field-reference cross-check: one row per visual that referenced a
+  measure/column the rebuilt model did not emit (an optimistic `_Measures[caption]` bind that dangles),
+  as `{visual, dropped:[...], emptied}`. The offending projections are removed (warn-never-wrong: dropped
+  rather than mis-bound) and a visual that loses every projection is `emptied` to a placeholder zone;
+  each drop also adds a matching `pbip_warnings` line. Empty (`[]`) when every reference resolves.
+- **`date_rebind`** — present only when the report's date axes were rebound to the model's marked **Date**
+  table (time intelligence runs through the calendar instead of the fact's raw date column):
+  `{date_table, active_keys:[…]}`. The binder consumes the model build's date facts and rebinds ONLY the
+  single ACTIVE business date; a secondary/inactive date stays on its fact column (+ warns) and a
+  continuous-TRUNC trend is deferred — so the key is absent when there is no usable marked Date table.
+- **`binding_signal`** — an additive, **routing-neutral** decision record about which model the report
+  *should* bind to (the dashboard migration still always rebuilds + binds the embedded model today;
+  this is the consumer-side signal the estate-comparison + datasource-migration skills need to decide
+  rebind-vs-rebuild). Shape: `{kind: "published"|"embedded", connection_class, primary_datasource,
+  published_ds_name, secondary_datasources:[…], view_local_calcs:[{name, formula, role}], recommendation,
+  note}`. `kind` is `published` when the primary datasource is a Tableau **published** datasource
+  (`connection_class == "sqlproxy"`), else `embedded`. `view_local_calcs` is the *would-break-if-rebound*
+  set: workbook-local calculated fields actually referenced by a worksheet, which a published/shared model
+  may not carry. `recommendation ∈ {"rebuild_embedded", "candidate_rebind_to_published", "review_rebind"}`
+  — `review_rebind` when a published datasource has view-local calc dependencies (rebind only if the
+  bound model satisfies them, else rebuild the embedded model).
+- **`viz_implicit_row_count`** — count of **implicit row-count** measures the rebuilt report could not
+  bind. Tableau silently provides a row count two ways: an object-id `COUNT(*)` (`COUNT` over
+  `[__tableau_internal_object_id__]`) and the legacy `[Number of Records]` field. Neither has a column in
+  the rebuilt model, so the binder recognises the count, names its **fact table** (resolved from the
+  object-id column caption), and emits a `"manual attention required: … implicit row count … add a
+  COUNTROWS measure …"` warning instead of a dangling reference. Full recovery needs a model-side
+  `COUNTROWS` measure on that fact table (a cross-layer follow-up); until then the count is reported,
+  never mis-bound. `0` when the workbook has no implicit counts.
+
+The `summary` block adds `workbooks_pbip_built`, `visuals_rebuilt`, `visuals_warned`, the binding-signal
+roll-ups `workbooks_published_ds`, `workbooks_embedded_ds`, and `workbooks_rebind_candidate`, plus the
+implicit-row-count roll-ups `implicit_row_count_unbound` (total across the estate) and
+`workbooks_implicit_row_count` (workbooks affected) — all additive.
+
+> **Two model copies by design.** A workbook's `pbip/<Workbook>/` embeds its own rebuilt model so the
+> project is self-contained and openable offline; the canonical `semantic_models/<Name>.SemanticModel/`
+> stays the single deploy target. This duplication is intentional, not drift.
 
 When any calculation fell back to a stub, `summary["needs_review_total"] > 0` and `summary.md` carries
 a **Next step — assisted (second-compiler) translation** section naming each stubbed calc (datasource ·

@@ -634,6 +634,664 @@ def test_viz_stage_failure_isolated_as_error(tmp_path):
     assert "viz exploded" in wb["note"]
 
 
+# -- openable workbook .pbip (rebuilt embedded model + bound report) -----------
+# A structurally faithful workbook: an embedded SQL Server datasource (so it rebuilds as an Import
+# model) plus a worksheet + dashboard that bind to its columns. Driven through the REAL twb_to_pbir
+# viz stage (none injected), so these exercise the full workbook -> openable .pbip round-trip.
+SUPERSTORE_DASHBOARD_TWB = """<?xml version='1.0' encoding='utf-8' ?>
+<workbook source-build='2023.1' version='18.1'>
+  <datasources>
+    <datasource caption='Superstore' inline='true' name='federated.abc' version='18.1'>
+      <connection class='federated'>
+        <named-connections>
+          <named-connection caption='warehouse' name='sqlserver.aa11'>
+            <connection class='sqlserver' dbname='Superstore'
+                        server='superstore.database.windows.net' username='svc' />
+          </named-connection>
+        </named-connections>
+        <relation connection='sqlserver.aa11' name='Orders' table='[dbo].[Orders]' type='table' />
+        <metadata-records>
+          <metadata-record class='column'>
+            <remote-name>Category</remote-name><local-name>[Category]</local-name>
+            <parent-name>[Orders]</parent-name><local-type>string</local-type>
+          </metadata-record>
+          <metadata-record class='column'>
+            <remote-name>Sales Amount</remote-name><local-name>[Sales]</local-name>
+            <parent-name>[Orders]</parent-name><local-type>real</local-type>
+          </metadata-record>
+          <metadata-record class='column'>
+            <remote-name>Order Date</remote-name><local-name>[Order Date]</local-name>
+            <parent-name>[Orders]</parent-name><local-type>datetime</local-type>
+          </metadata-record>
+        </metadata-records>
+      </connection>
+    </datasource>
+  </datasources>
+  <worksheets>
+    <worksheet name='Sales by Category'>
+      <table>
+        <view>
+          <datasources>
+            <datasource caption='Superstore' name='federated.abc' />
+          </datasources>
+          <datasource-dependencies datasource='federated.abc'>
+            <column caption='Category' datatype='string' name='[Category]' role='dimension' type='nominal' />
+            <column caption='Sales' datatype='real' name='[Sales]' role='measure' type='quantitative' />
+            <column-instance column='[Category]' derivation='None' name='[none:Category:nk]' pivot='key' type='nominal' />
+            <column-instance column='[Sales]' derivation='Sum' name='[sum:Sales:qk]' pivot='key' type='quantitative' />
+          </datasource-dependencies>
+        </view>
+        <panes><pane><mark class='Bar' /></pane></panes>
+        <rows>[federated.abc].[sum:Sales:qk]</rows>
+        <cols>[federated.abc].[none:Category:nk]</cols>
+      </table>
+    </worksheet>
+  </worksheets>
+  <dashboards>
+    <dashboard name='Overview'>
+      <size maxwidth='1200' maxheight='800' />
+      <zones>
+        <zone name='Sales by Category' x='0' y='0' w='100000' h='100000' />
+      </zones>
+    </dashboard>
+  </dashboards>
+</workbook>"""
+
+
+def _viz_ds(caption, ds_name, conn_name, conn_class, table):
+    """An embedded ``<datasource>`` block (single table, two columns) for a workbook fixture."""
+    return f"""
+    <datasource caption='{caption}' inline='true' name='{ds_name}' version='18.1'>
+      <connection class='federated'>
+        <named-connections>
+          <named-connection caption='c' name='{conn_name}'>
+            <connection class='{conn_class}' dbname='DB' server='srv.example.com' username='svc' />
+          </named-connection>
+        </named-connections>
+        <relation connection='{conn_name}' name='{table}' table='[dbo].[{table}]' type='table' />
+        <metadata-records>
+          <metadata-record class='column'>
+            <remote-name>Category</remote-name><local-name>[Category]</local-name>
+            <parent-name>[{table}]</parent-name><local-type>string</local-type>
+          </metadata-record>
+          <metadata-record class='column'>
+            <remote-name>Amount</remote-name><local-name>[Amount]</local-name>
+            <parent-name>[{table}]</parent-name><local-type>real</local-type>
+          </metadata-record>
+        </metadata-records>
+      </connection>
+    </datasource>"""
+
+
+def _viz_ws(ws_name, ds_name, caption):
+    """A worksheet that binds ``Amount`` (sum) by ``Category`` from the named embedded datasource."""
+    return f"""
+    <worksheet name='{ws_name}'>
+      <table>
+        <view>
+          <datasources><datasource caption='{caption}' name='{ds_name}' /></datasources>
+          <datasource-dependencies datasource='{ds_name}'>
+            <column caption='Category' datatype='string' name='[Category]' role='dimension' type='nominal' />
+            <column caption='Amount' datatype='real' name='[Amount]' role='measure' type='quantitative' />
+            <column-instance column='[Category]' derivation='None' name='[none:Category:nk]' pivot='key' type='nominal' />
+            <column-instance column='[Amount]' derivation='Sum' name='[sum:Amount:qk]' pivot='key' type='quantitative' />
+          </datasource-dependencies>
+        </view>
+        <panes><pane><mark class='Bar' /></pane></panes>
+        <rows>[{ds_name}].[sum:Amount:qk]</rows>
+        <cols>[{ds_name}].[none:Category:nk]</cols>
+      </table>
+    </worksheet>"""
+
+
+def _viz_wb(ds_blocks, ws_blocks):
+    return ("<?xml version='1.0' encoding='utf-8' ?>\n"
+            "<workbook source-build='2023.1' version='18.1'>"
+            + "<datasources>" + ds_blocks + "</datasources>"
+            + "<worksheets>" + ws_blocks + "</worksheets>"
+            + "</workbook>")
+
+
+# Embedded SAP HANA datasource -> select_storage_mode routes it to the land-to-Delta fallback, so
+# the bound .pbip cannot be assembled (the model lands separately) and must be skipped with a warning.
+SAPHANA_WORKBOOK_TWB = _viz_wb(
+    _viz_ds("Hana Source", "federated.hana", "saphana.bb22", "saphana", "Stock"),
+    _viz_ws("Stock by Category", "federated.hana", "Hana Source"))
+
+# Two embedded SQL Server datasources: a single PBIR report binds one model, so the primary is bound
+# and each remaining datasource is reported as a warning (never mis-bound silently).
+MULTI_SOURCE_TWB = _viz_wb(
+    _viz_ds("Sales Source", "federated.s1", "sqlserver.s1", "sqlserver", "Sales")
+    + _viz_ds("Inventory Source", "federated.s2", "sqlserver.s2", "sqlserver", "Inventory"),
+    _viz_ws("Sales by Category", "federated.s1", "Sales Source")
+    + _viz_ws("Inventory by Category", "federated.s2", "Inventory Source"))
+
+
+# A workbook whose embedded datasource carries a calculated MEASURE (Profit Ratio) that a worksheet
+# puts on a shelf. The estate migration must auto-extract + translate that calc into the emitted model
+# AND the rebuilt visual must bind to it -- the regression guard for using migrate_datasource (which
+# extracts calcs) over the calc-less migrate_tds_to_semantic_model convenience entry point.
+CALC_MEASURE_WORKBOOK_TWB = """<?xml version='1.0' encoding='utf-8' ?>
+<workbook source-build='2023.1' version='18.1'>
+  <datasources>
+    <datasource caption='Sales' inline='true' name='federated.calc' version='18.1'>
+      <connection class='federated'>
+        <named-connections>
+          <named-connection caption='warehouse' name='sqlserver.aa11'>
+            <connection class='sqlserver' dbname='Superstore'
+                        server='superstore.database.windows.net' username='svc' />
+          </named-connection>
+        </named-connections>
+        <relation connection='sqlserver.aa11' name='Orders' table='[dbo].[Orders]' type='table' />
+        <metadata-records>
+          <metadata-record class='column'>
+            <remote-name>Category</remote-name><local-name>[Category]</local-name>
+            <parent-name>[Orders]</parent-name><local-type>string</local-type>
+          </metadata-record>
+          <metadata-record class='column'>
+            <remote-name>Sales Amount</remote-name><local-name>[Sales]</local-name>
+            <parent-name>[Orders]</parent-name><local-type>real</local-type>
+          </metadata-record>
+          <metadata-record class='column'>
+            <remote-name>Profit Amount</remote-name><local-name>[Profit]</local-name>
+            <parent-name>[Orders]</parent-name><local-type>real</local-type>
+          </metadata-record>
+        </metadata-records>
+      </connection>
+      <column caption='Profit Ratio' datatype='real' name='[Calculation_1]'
+              role='measure' type='quantitative'>
+        <calculation class='tableau' formula='SUM([Profit])/SUM([Sales])' />
+      </column>
+    </datasource>
+  </datasources>
+  <worksheets>
+    <worksheet name='Ratio by Category'>
+      <table>
+        <view>
+          <datasources><datasource caption='Sales' name='federated.calc' /></datasources>
+          <datasource-dependencies datasource='federated.calc'>
+            <column caption='Category' datatype='string' name='[Category]' role='dimension' type='nominal' />
+            <column caption='Profit Ratio' datatype='real' name='[Calculation_1]' role='measure' type='quantitative'>
+              <calculation class='tableau' formula='SUM([Profit])/SUM([Sales])' />
+            </column>
+            <column-instance column='[Category]' derivation='None' name='[none:Category:nk]' pivot='key' type='nominal' />
+            <column-instance column='[Calculation_1]' derivation='None' name='[none:Calculation_1:qk]' pivot='key' type='quantitative' />
+          </datasource-dependencies>
+        </view>
+        <panes><pane><mark class='Bar' /></pane></panes>
+        <rows>[federated.calc].[none:Calculation_1:qk]</rows>
+        <cols>[federated.calc].[none:Category:nk]</cols>
+      </table>
+    </worksheet>
+  </worksheets>
+</workbook>"""
+
+
+def test_workbook_pbip_embeds_calculated_measure_and_binds_it(tmp_path):
+    # An "openable" pbip whose model silently dropped every calc would open to broken/empty charts.
+    # This asserts the whole chain: calc auto-extraction -> DAX translation in the emitted model ->
+    # the rebuilt visual binding to that measure.
+    src = InMemoryTableauSource(workbooks={"Calc WB": CALC_MEASURE_WORKBOOK_TWB})
+    report = migrate_estate(src, str(tmp_path / "b"))
+    wb = report["workbooks"][0]
+    assert wb["pbip_status"] == "built"
+
+    fid = next(f for f in wb["viz_fidelity"] if f["worksheet"] == "Ratio by Category")
+    assert fid["status"] == "rebuilt"
+
+    # 1) the calculated measure survives into the emitted embedded model as real (non-stub) DAX.
+    measures_tmdl = (tmp_path / "b" / "pbip" / "Calc WB" / "Sales.SemanticModel"
+                     / "definition" / "tables" / "_Measures.tmdl").read_text(encoding="utf-8")
+    assert "measure 'Profit Ratio'" in measures_tmdl
+    assert "DIVIDE(" in measures_tmdl                  # SUM([Profit])/SUM([Sales]) -> DIVIDE(...), not = 0
+
+    # 2) the rebuilt visual references that measure -- so the chart is not empty in Desktop.
+    report_dir = tmp_path / "b" / "pbip" / "Calc WB" / "Calc WB.Report"
+    blob = ""
+    for p in report_dir.rglob("*"):
+        if p.is_file():
+            try:
+                blob += p.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                pass
+    assert "Profit Ratio" in blob
+
+
+def test_workbook_pbip_is_openable_and_bound_bypath(tmp_path):
+    src = InMemoryTableauSource(workbooks={"Exec Dashboard": SUPERSTORE_DASHBOARD_TWB})
+    report = migrate_estate(src, str(tmp_path / "b"))
+    wb = report["workbooks"][0]
+
+    assert wb["viz_status"] == "built"
+    assert wb["pbip_status"] == "built"
+    assert wb["pbip_warnings"] == []
+    assert wb["pbip_ref_drops"] == []          # happy path: every viz ref resolves -> nothing dropped
+    assert wb["bound_model"] == "Superstore"
+    assert wb["bound_datasource"] == "Superstore"
+    assert wb["pbip_folder"] == "pbip/Exec Dashboard/Exec Dashboard.pbip"
+
+    root = tmp_path / "b" / "pbip" / "Exec Dashboard"
+    assert (root / "Exec Dashboard.pbip").is_file()
+    report_dir = root / "Exec Dashboard.Report"
+    assert (report_dir / ".platform").is_file()
+    pbir = report_dir / "definition.pbir"
+    assert pbir.is_file()
+
+    # the workbook's own datasource is embedded as a sibling model and the report binds to it by a
+    # relative path that actually resolves inside the bundle (an openable, self-contained project).
+    model_dir = root / "Superstore.SemanticModel"
+    assert (model_dir / "definition" / "model.tmdl").is_file()
+    ref = json.loads(pbir.read_text(encoding="utf-8"))["datasetReference"]["byPath"]["path"]
+    assert ref == "../Superstore.SemanticModel"
+    assert (report_dir / ref).resolve() == model_dir.resolve()
+
+    s = report["summary"]
+    assert s["workbooks_pbip_built"] == 1
+    assert s["visuals_rebuilt"] >= 1
+
+
+# A workbook whose only date column (Order Date) becomes the model's ACTIVE calendar date. The
+# rebuilt report's date axis must rebind to the shared marked Date table, not the Orders fact's raw
+# date column, so time intelligence runs through the calendar.
+DATE_AXIS_WORKBOOK_TWB = """<?xml version='1.0' encoding='utf-8' ?>
+<workbook source-build='2023.1' version='18.1'>
+  <datasources>
+    <datasource caption='Superstore' inline='true' name='federated.abc' version='18.1'>
+      <connection class='federated'>
+        <named-connections>
+          <named-connection caption='warehouse' name='sqlserver.aa11'>
+            <connection class='sqlserver' dbname='Superstore'
+                        server='superstore.database.windows.net' username='svc' />
+          </named-connection>
+        </named-connections>
+        <relation connection='sqlserver.aa11' name='Orders' table='[dbo].[Orders]' type='table' />
+        <metadata-records>
+          <metadata-record class='column'>
+            <remote-name>Sales Amount</remote-name><local-name>[Sales]</local-name>
+            <parent-name>[Orders]</parent-name><local-type>real</local-type>
+          </metadata-record>
+          <metadata-record class='column'>
+            <remote-name>Order Date</remote-name><local-name>[Order Date]</local-name>
+            <parent-name>[Orders]</parent-name><local-type>datetime</local-type>
+          </metadata-record>
+        </metadata-records>
+      </connection>
+    </datasource>
+  </datasources>
+  <worksheets>
+    <worksheet name='Sales Trend'>
+      <table>
+        <view>
+          <datasources>
+            <datasource caption='Superstore' name='federated.abc' />
+          </datasources>
+          <datasource-dependencies datasource='federated.abc'>
+            <column caption='Sales' datatype='real' name='[Sales]' role='measure' type='quantitative' />
+            <column caption='Order Date' datatype='datetime' name='[Order Date]' role='dimension' type='ordinal' />
+            <column-instance column='[Sales]' derivation='Sum' name='[sum:Sales:qk]' pivot='key' type='quantitative' />
+            <column-instance column='[Order Date]' derivation='Month' name='[mn:Order Date:ok]' pivot='key' type='ordinal' />
+          </datasource-dependencies>
+        </view>
+        <panes><pane><mark class='Line' /></pane></panes>
+        <rows>[federated.abc].[sum:Sales:qk]</rows>
+        <cols>[federated.abc].[mn:Order Date:ok]</cols>
+      </table>
+    </worksheet>
+  </worksheets>
+</workbook>"""
+
+
+def test_workbook_pbip_rebinds_date_axis_to_model_date_table(tmp_path):
+    src = InMemoryTableauSource(workbooks={"Trend WB": DATE_AXIS_WORKBOOK_TWB})
+    report = migrate_estate(src, str(tmp_path / "b"))
+    wb = report["workbooks"][0]
+    assert wb["pbip_status"] == "built"
+    assert wb["pbip_ref_drops"] == []          # the rebound Date[Month] resolves -> nothing dropped
+    # the consumer recorded which calendar + active date it rebound (from the model build's facts)
+    assert wb["date_rebind"]["date_table"] == "Date"
+    assert any("order" in k.lower() and "date" in k.lower()
+               for k in wb["date_rebind"]["active_keys"])
+
+    # the rebuilt visual projects the date axis from the marked Date table, not the Orders fact table
+    report_dir = tmp_path / "b" / "pbip" / "Trend WB" / "Trend WB.Report"
+    visual = next(json.loads(p.read_text(encoding="utf-8"))
+                  for p in report_dir.rglob("visual.json"))
+    cat = visual["visual"]["query"]["queryState"]["Category"]["projections"][0]["field"]["Column"]
+    assert cat["Expression"]["SourceRef"]["Entity"] == "Date"
+    assert cat["Property"] == "Month"
+    # and the marked Date table really is in the bound model (so the ref can't dangle)
+    model_dir = tmp_path / "b" / "pbip" / "Trend WB" / "Superstore.SemanticModel" / "definition"
+    model_blob = "".join(p.read_text(encoding="utf-8") for p in model_dir.rglob("*.tmdl"))
+    assert "dataCategory: Time" in model_blob
+
+
+# -- binding signal (published vs embedded datasource; would-break-if-rebound calcs) -----------
+# A PUBLISHED Tableau datasource (connection_class 'sqlproxy') with TWO workbook-local calcs: one
+# referenced by the worksheet (Profit Margin -> a would-break-if-rebound dependency) and one defined
+# but never placed on a shelf (Unused Calc -> must be filtered out of the dependency set).
+PUBLISHED_DS_WORKBOOK_TWB = """<?xml version='1.0' encoding='utf-8' ?>
+<workbook source-build='2023.1' version='18.1'>
+  <datasources>
+    <datasource caption='Superstore (Published)' name='sqlproxy.18xyz' version='18.1'>
+      <connection class='sqlproxy' dbname='Superstore' directory='Superstore'
+                  server='https://tableau.example.com'>
+        <relation name='sqlproxy' table='[sqlproxy]' type='table' />
+      </connection>
+      <column caption='Profit Margin' datatype='real' name='[Calculation_123]' role='measure'
+              type='quantitative'>
+        <calculation class='tableau' formula='SUM([Profit]) / SUM([Sales])' />
+      </column>
+      <column caption='Unused Calc' datatype='real' name='[Calculation_999]' role='measure'
+              type='quantitative'>
+        <calculation class='tableau' formula='SUM([Discount])' />
+      </column>
+    </datasource>
+  </datasources>
+  <worksheets>
+    <worksheet name='Margin by Region'>
+      <table>
+        <view>
+          <datasources>
+            <datasource caption='Superstore (Published)' name='sqlproxy.18xyz' />
+          </datasources>
+          <datasource-dependencies datasource='sqlproxy.18xyz'>
+            <column caption='Region' datatype='string' name='[Region]' role='dimension' type='nominal' />
+            <column caption='Profit Margin' datatype='real' name='[Calculation_123]' role='measure' type='quantitative'>
+              <calculation class='tableau' formula='SUM([Profit]) / SUM([Sales])' />
+            </column>
+            <column-instance column='[Region]' derivation='None' name='[none:Region:nk]' pivot='key' type='nominal' />
+            <column-instance column='[Calculation_123]' derivation='Sum' name='[sum:Calculation_123:qk]' pivot='key' type='quantitative' />
+          </datasource-dependencies>
+        </view>
+        <panes><pane><mark class='Bar' /></pane></panes>
+        <rows>[sqlproxy.18xyz].[sum:Calculation_123:qk]</rows>
+        <cols>[sqlproxy.18xyz].[none:Region:nk]</cols>
+      </table>
+    </worksheet>
+  </worksheets>
+</workbook>"""
+
+
+# Same published datasource but the worksheet references ONLY base columns -- no workbook-local calc
+# dependency, so the report is a clean candidate to rebind to the migrated published model.
+PUBLISHED_DS_NO_LOCAL_CALC_TWB = """<?xml version='1.0' encoding='utf-8' ?>
+<workbook source-build='2023.1' version='18.1'>
+  <datasources>
+    <datasource caption='Superstore (Published)' name='sqlproxy.18xyz' version='18.1'>
+      <connection class='sqlproxy' dbname='Superstore' directory='Superstore'
+                  server='https://tableau.example.com'>
+        <relation name='sqlproxy' table='[sqlproxy]' type='table' />
+      </connection>
+    </datasource>
+  </datasources>
+  <worksheets>
+    <worksheet name='Sales by Region'>
+      <table>
+        <view>
+          <datasources>
+            <datasource caption='Superstore (Published)' name='sqlproxy.18xyz' />
+          </datasources>
+          <datasource-dependencies datasource='sqlproxy.18xyz'>
+            <column caption='Region' datatype='string' name='[Region]' role='dimension' type='nominal' />
+            <column caption='Sales' datatype='real' name='[Sales]' role='measure' type='quantitative' />
+            <column-instance column='[Region]' derivation='None' name='[none:Region:nk]' pivot='key' type='nominal' />
+            <column-instance column='[Sales]' derivation='Sum' name='[sum:Sales:qk]' pivot='key' type='quantitative' />
+          </datasource-dependencies>
+        </view>
+        <panes><pane><mark class='Bar' /></pane></panes>
+        <rows>[sqlproxy.18xyz].[sum:Sales:qk]</rows>
+        <cols>[sqlproxy.18xyz].[none:Region:nk]</cols>
+      </table>
+    </worksheet>
+  </worksheets>
+</workbook>"""
+
+
+def test_binding_signal_published_with_view_local_calc():
+    sig = me._workbook_binding_signal(PUBLISHED_DS_WORKBOOK_TWB, None)
+    assert sig["kind"] == "published"
+    assert sig["connection_class"] == "sqlproxy"
+    assert sig["published_ds_name"] == "Superstore (Published)"
+    # only the SHELF-referenced calc is a binding dependency; the unused calc is filtered out
+    names = [c["name"] for c in sig["view_local_calcs"]]
+    assert names == ["Profit Margin"]
+    assert sig["view_local_calcs"][0]["formula"] == "SUM([Profit]) / SUM([Sales])"
+    assert sig["recommendation"] == "review_rebind"
+
+
+def test_binding_signal_published_without_local_calc_is_rebind_candidate():
+    sig = me._workbook_binding_signal(PUBLISHED_DS_NO_LOCAL_CALC_TWB, None)
+    assert sig["kind"] == "published"
+    assert sig["view_local_calcs"] == []
+    assert sig["recommendation"] == "candidate_rebind_to_published"
+
+
+def test_binding_signal_embedded_datasource_recommends_rebuild():
+    sig = me._workbook_binding_signal(SUPERSTORE_DASHBOARD_TWB, None)
+    assert sig["kind"] == "embedded"
+    assert sig["connection_class"] == "sqlserver"
+    assert sig["published_ds_name"] is None
+    assert sig["recommendation"] == "rebuild_embedded"
+
+
+def test_binding_signal_surfaced_in_estate_report_and_summary(tmp_path):
+    src = InMemoryTableauSource(workbooks={
+        "Published WB": PUBLISHED_DS_WORKBOOK_TWB,
+        "Embedded WB": SUPERSTORE_DASHBOARD_TWB,
+    })
+    report = migrate_estate(src, str(tmp_path / "b"))
+    by_name = {w["name"]: w for w in report["workbooks"]}
+
+    pub = by_name["Published WB"]["binding_signal"]
+    assert pub["kind"] == "published"
+    assert [c["name"] for c in pub["view_local_calcs"]] == ["Profit Margin"]
+
+    emb = by_name["Embedded WB"]["binding_signal"]
+    assert emb["kind"] == "embedded"
+
+    s = report["summary"]
+    assert s["workbooks_published_ds"] == 1
+    assert s["workbooks_embedded_ds"] == 1
+    # the published workbook has a view-local calc -> review_rebind, not a clean rebind candidate
+    assert s["workbooks_rebind_candidate"] == 0
+
+
+def test_estate_summary_rolls_up_unbound_implicit_row_counts(tmp_path):
+    # An object-id COUNT(*) with no model-side COUNTROWS target (the cross-layer gap) is warned,
+    # never silently dropped or dangling -- and the estate summary rolls up the volume additively.
+    oid = "__tableau_internal_object_id__"
+    hexv = "ECFCA1FB690A41FE803BC071773BA862"
+    ws = f"""
+    <worksheet name='Row Count'>
+      <table>
+        <view>
+          <datasources><datasource caption='Sales DS' name='federated.s1' /></datasources>
+          <datasource-dependencies datasource='federated.s1'>
+            <column caption='Category' datatype='string' name='[Category]' role='dimension' type='nominal' />
+            <column caption='Sales' datatype='integer' name='[{oid}].[Sales_{hexv}]' role='measure' type='quantitative' />
+            <column-instance column='[Category]' derivation='None' name='[none:Category:nk]' pivot='key' type='nominal' />
+            <column-instance column='[{oid}].[Sales_{hexv}]' derivation='Count' name='[cnt:Sales_{hexv}:qk]' pivot='key' type='quantitative' />
+          </datasource-dependencies>
+        </view>
+        <panes><pane><mark class='Bar' /></pane></panes>
+        <rows>[federated.s1].[{oid}].[cnt:Sales_{hexv}:qk]</rows>
+        <cols>[federated.s1].[none:Category:nk]</cols>
+      </table>
+    </worksheet>"""
+    twb = _viz_wb(_viz_ds("Sales DS", "federated.s1", "sqlserver.s1", "sqlserver", "Sales"), ws)
+    src = InMemoryTableauSource(workbooks={"Counts WB": twb})
+    report = migrate_estate(src, str(tmp_path / "b"))
+    wb = report["workbooks"][0]
+    assert wb["viz_implicit_row_count"] == 1
+    s = report["summary"]
+    assert s["implicit_row_count_unbound"] == 1
+    assert s["workbooks_implicit_row_count"] == 1
+    assert any("implicit row count" in (f.get("reason") or "")
+               for f in (wb["viz_fidelity"] or []))
+    # never a dangling object-id projection in the rebuilt report.
+    assert oid not in json.dumps(report)
+
+
+def test_workbook_pbip_bypath_resolves_for_caption_with_spaces_and_punctuation(tmp_path):
+    # byPath footgun guard: the rewritten ../<model>.SemanticModel must resolve to the SAME folder
+    # write_local_pbip actually creates -- even when the datasource caption has spaces/hyphens/periods
+    # that get sanitized. A string-equality check would pass over a dangling path; this resolves it to
+    # a real sibling dir. Both sides derive from one model_safe token, so they can never diverge.
+    twb = _viz_wb(
+        _viz_ds("Sample - Superstore (FY.2024)", "federated.s1", "sqlserver.s1", "sqlserver", "Sales"),
+        _viz_ws("Sales by Category", "federated.s1", "Sample - Superstore (FY.2024)"))
+    src = InMemoryTableauSource(workbooks={"Q1 Review": twb})
+    report = migrate_estate(src, str(tmp_path / "b"))
+    wb = report["workbooks"][0]
+    assert wb["pbip_status"] == "built"
+
+    root = tmp_path / "b" / "pbip" / "Q1 Review"
+    report_dir = root / "Q1 Review.Report"
+    model_dir = root / f"{wb['bound_model']}.SemanticModel"
+    assert model_dir.is_dir()                                    # the model folder was actually written
+    ref = json.loads((report_dir / "definition.pbir").read_text(
+        encoding="utf-8"))["datasetReference"]["byPath"]["path"]
+    resolved = (report_dir / ref).resolve()
+    assert resolved == model_dir.resolve()                       # byPath points at that real sibling dir
+    assert resolved.is_dir()
+
+
+def test_workbook_pbip_filename_follows_workbook_not_model(tmp_path):
+    # the project pointer is named after the workbook while the embedded model keeps its own name,
+    # proving the additive write_local_pbip(project_name=...) kwarg is wired through.
+    src = InMemoryTableauSource(workbooks={"Exec Dashboard": SUPERSTORE_DASHBOARD_TWB})
+    migrate_estate(src, str(tmp_path / "b"))
+    root = tmp_path / "b" / "pbip" / "Exec Dashboard"
+    assert (root / "Exec Dashboard.pbip").is_file()
+    assert not (root / "Superstore.pbip").exists()
+    pbip = json.loads((root / "Exec Dashboard.pbip").read_text(encoding="utf-8"))
+    assert pbip["artifacts"][0]["report"]["path"] == "Exec Dashboard.Report"
+
+
+def test_workbook_viz_fidelity_section_shape(tmp_path):
+    src = InMemoryTableauSource(workbooks={"Exec Dashboard": SUPERSTORE_DASHBOARD_TWB})
+    report = migrate_estate(src, str(tmp_path / "b"))
+    fid = report["workbooks"][0]["viz_fidelity"]
+    assert isinstance(fid, list) and fid
+    entry = next(f for f in fid if f["worksheet"] == "Sales by Category")
+    assert entry["visual_type"] == "column"
+    assert entry["status"] == "rebuilt"
+    assert entry["reason"] is None
+    for f in fid:
+        assert set(f) == {"worksheet", "visual_type", "status", "reason"}
+        assert f["status"] in {"rebuilt", "warned"}
+
+
+def test_workbook_pbip_skipped_on_fallback_datasource(tmp_path):
+    src = InMemoryTableauSource(workbooks={"Hana WB": SAPHANA_WORKBOOK_TWB})
+    report = migrate_estate(src, str(tmp_path / "b"))
+    wb = report["workbooks"][0]
+    # the bare reports/ rebuild still happens; only the bound, openable .pbip is skipped
+    assert wb["viz_status"] == "built"
+    assert wb["pbip_status"] == "skipped"
+    assert wb["pbip_folder"] is None
+    assert any("lakehouse fallback" in w for w in wb["pbip_warnings"])
+    assert all(w.startswith("manual attention required: ") for w in wb["pbip_warnings"])
+    assert not (tmp_path / "b" / "pbip" / "Hana WB").exists()
+    assert report["summary"]["workbooks_pbip_built"] == 0
+
+
+def test_workbook_pbip_warns_on_secondary_datasource(tmp_path):
+    src = InMemoryTableauSource(workbooks={"Multi WB": MULTI_SOURCE_TWB})
+    report = migrate_estate(src, str(tmp_path / "b"))
+    wb = report["workbooks"][0]
+    assert wb["pbip_status"] == "built"          # the primary still binds
+    assert wb["bound_model"]                       # a primary datasource was chosen
+    secondary = [w for w in wb["pbip_warnings"] if "secondary datasource" in w]
+    assert len(secondary) == 1
+    assert (tmp_path / "b" / "pbip" / "Multi WB" / "Multi WB.pbip").is_file()
+
+
+def test_workbook_pbip_skipped_without_pbir_definition(tmp_path):
+    # a viz stage that yields report parts but no PBIR project file cannot be opened -> honest skip,
+    # and the new pbip keys never disturb the existing bare reports/ write.
+    def viz(text, name):
+        return {"parts": {"definition/report.json": "{}"}}
+
+    src = InMemoryTableauSource(workbooks={"Exec": SUPERSTORE_DASHBOARD_TWB})
+    report = migrate_estate(src, str(tmp_path / "b"), viz_stage=viz)
+    wb = report["workbooks"][0]
+    assert wb["viz_status"] == "built"
+    assert wb["output_folder"] == "reports/Exec.Report"
+    assert wb["pbip_status"] == "skipped"
+    assert any("no PBIR report definition" in w for w in wb["pbip_warnings"])
+
+
+def test_crosscheck_drops_dangling_refs_and_empties_orphan_visual():
+    # M1.3: a measure/column reference the model did not emit (the optimistic `_Measures[caption]`
+    # bind) is dropped at the seam; a visual that loses all refs is emptied to a placeholder zone.
+    model_parts = {
+        "definition/tables/_Measures.tmdl":
+            "table _Measures\n\tmeasure 'Total Sales' = SUM(Orders[Sales_Amount])\n",
+        "definition/tables/Orders.tmdl":
+            "table Orders\n\tcolumn Sales_Amount\n\t\tdataType: double\n",
+    }
+
+    def meas(prop):
+        return {"field": {"Measure": {"Expression": {"SourceRef": {"Entity": "_Measures"}},
+                                      "Property": prop}}, "queryRef": f"_Measures.{prop}"}
+
+    def col(prop):
+        return {"field": {"Aggregation": {"Function": 0, "Expression": {"Column": {
+            "Expression": {"SourceRef": {"Entity": "Orders"}}, "Property": prop}}}},
+            "queryRef": f"Sum(Orders.{prop})"}
+
+    def visual(name, vtype, state):
+        return json.dumps({"name": name,
+                           "visual": {"visualType": vtype, "query": {"queryState": state}}})
+
+    report_parts = {
+        # a card mixing two real refs with a dangling `_Measures[Param Swap]`
+        "definition/pages/p/visuals/a/visual.json": visual(
+            "a", "multiRowCard",
+            {"Values": {"projections": [meas("Total Sales"), col("Sales_Amount"), meas("Param Swap")]}}),
+        # a card whose ONLY ref is dangling -> must be emptied
+        "definition/pages/p/visuals/b/visual.json": visual(
+            "b", "card", {"Values": {"projections": [meas("Ghost")]}}),
+        # a field-parameter visual is a separately validated construct -> left untouched
+        "definition/pages/p/visuals/fp/visual.json": visual(
+            "fp", "tableEx",
+            {"Values": {"projections": [col("Nonexistent")], "fieldParameters": [{"index": 0}]}}),
+    }
+    new_parts, drops = me._crosscheck_report_refs(report_parts, model_parts)
+
+    a = json.loads(new_parts["definition/pages/p/visuals/a/visual.json"])
+    kept = [p["queryRef"] for p in a["visual"]["query"]["queryState"]["Values"]["projections"]]
+    assert kept == ["_Measures.Total Sales", "Sum(Orders.Sales_Amount)"]   # dangling one removed
+    b = json.loads(new_parts["definition/pages/p/visuals/b/visual.json"])
+    assert "query" not in b["visual"]                                       # orphan visual emptied
+    fp = json.loads(new_parts["definition/pages/p/visuals/fp/visual.json"])
+    assert fp["visual"]["query"]["queryState"]["Values"]["projections"]     # FP visual untouched
+
+    by = {d["visual"]: d for d in drops}
+    assert set(by) == {"a", "b"}
+    assert by["a"]["emptied"] is False and by["b"]["emptied"] is True
+
+
+def test_crosscheck_no_model_inventory_is_a_noop():
+    # defensive: with no parseable model objects, never risk a false drop -> parts returned as-is
+    parts = {"definition/pages/p/visuals/a/visual.json": json.dumps(
+        {"name": "a", "visual": {"visualType": "card", "query": {"queryState": {
+            "Values": {"projections": [{"field": {"Measure": {"Expression": {
+                "SourceRef": {"Entity": "_Measures"}}, "Property": "X"}}}]}}}}})}
+    out, drops = me._crosscheck_report_refs(dict(parts), {})
+    assert drops == [] and out == parts
+
+
+def test_workbook_pbip_disabled_when_pbip_false(tmp_path):
+    src = InMemoryTableauSource(workbooks={"Exec Dashboard": SUPERSTORE_DASHBOARD_TWB})
+    report = migrate_estate(src, str(tmp_path / "b"), pbip=False)
+    wb = report["workbooks"][0]
+    assert wb["viz_status"] == "built"
+    assert "pbip_status" not in wb            # no pbip attempted at all
+    assert not (tmp_path / "b" / "pbip").exists()
+
+
 # -- LiveTableauSource seam ---------------------------------------------------
 _LIVE_ENV_VARS = (
     "TABLEAU_SERVER_URL", "TABLEAU_SITE", "TABLEAU_MIGRATION_KEYVAULT",

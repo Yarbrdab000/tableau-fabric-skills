@@ -190,9 +190,12 @@ This skill packages a proven Tableau → Fabric toolkit as a reusable migration 
 is estate-wide rebuild** — point at a Tableau deployment and rebuild its datasources, calculated fields,
 and workbooks as equivalent Fabric / Power BI assets, with **executed reconciliation** verifying the
 numbers actually match. **Available today:** the semantic-model path — rebuild the datasource (data model
-+ relationships), translate calculated fields to DAX, and wire the connection. **Actively landing:**
-workbook / worksheet → Power BI (PBIR) report rebuild, single-entry estate orchestration, and
-model-object enrichment (hierarchies / display folders / RLS). See
++ relationships), translate calculated fields to DAX, and wire the connection — **plus single-entry
+estate orchestration** and a **preview of workbook / worksheet → Power BI (PBIR) report rebuild**:
+Tier-1 *structure* (chart type, exact field bindings, position/layout, filters/parameters → slicers,
+default cross-filter, structural titles/axis names) rebuilt into an openable, model-bound `.pbip`.
+**Actively landing:** model-object enrichment (hierarchies / display folders / RLS) and visual
+*formatting* (specific colors, fonts, legends, conditional formats — deferred to a later pass). See
 [§ Feature Parity](#feature-parity-reference) for current vs. in-progress coverage.
 
 ## Inputs — Locate the Datasource FIRST
@@ -323,7 +326,7 @@ This skill rebuilds Tableau artifacts via REST APIs — no Tableau or Fabric UI 
 | **Custom SQL** in a connection | **`Value.NativeQuery`** partition | Native query preserved with `[EnableFolding=true]`. |
 | **Calculated field** (safe subset) | **DAX measure** | Aggregations (`SUM/AVG/MIN/MAX/MEDIAN/COUNT/COUNTD`) + arithmetic, `IF`/`ELSEIF`/`IIF`, comparisons + `AND`/`OR`/`NOT`, `ZN`/`IFNULL`/`ISNULL`; everything else → preserved-formula stub. |
 | **Hidden join keys** (`<Base> (<Table>)`) | **Model relationship** | Direction inferred from real landed cardinality. |
-| **Worksheet / Dashboard** | **Power BI report (PBIR)** | **Roadmap (v2)** — not migrated by v1. |
+| **Worksheet / Dashboard** | **Power BI report (PBIR)** | ✅ **Supported (preview)** — Tier-1 *structure* rebuilt (chart type, exact field bindings, position/layout, filters/parameters → slicers) into an openable, model-bound `.pbip`; visual *formatting* (colors, fonts, legends) is deferred to a later pass. |
 
 ### Decision Tree: Which storage mode?
 
@@ -475,11 +478,11 @@ Full matrix in [feature-parity.md](resources/feature-parity.md). Headline parity
 | Calculated field → DAX | ⚠️ **Safe subset only** — aggregations + arithmetic, `IF`/`ELSEIF`/`IIF`, comparisons + boolean logic, and null handling (`ZN`/`IFNULL`/`ISNULL`); LOD expressions, table calcs, and row-level/date/string functions are preserved stubs. |
 | Storage mode / upstream connection | ✅ Auto-selected; `Sql.Database` family (SQL Server/Azure SQL DB/Postgres/MySQL/Redshift) plus Oracle, Snowflake, and Databricks emit deploy-ready per-connector M; Teradata/BigQuery are flagged scaffolds (live-navigator M not yet verified). |
 | LOD expressions (FIXED/INCLUDE/EXCLUDE), table calcs (WINDOW_*/RUNNING_*) | ❌ Not translated — preserved as stubs for manual/LLM completion. |
-| Worksheet / dashboard → Power BI report | ❌ **Roadmap (v2)** — not in v1. |
+| Worksheet / dashboard → Power BI report (PBIR) | ⚠️ **Supported (preview)** — Tier-1 *structure* (chart type, exact field bindings, position/layout, filters/parameters → slicers, default cross-filter, structural titles/axis names) rebuilt into an openable, model-bound `.pbip`; visual *formatting* (colors, fonts, legends, conditional formats) is not yet applied (deferred to a later pass). |
 | Row-level security (wired user filters) | ⚠️ Translatable `USERNAME()` filters → TMDL `role`; group/compound logic fails closed (`FALSE()` + manual-review). |
 | Parameters, sets, groups | ❌ Not migrated in v1 — flagged in the report. |
 
-> **Key gaps**: calc coverage is a deterministic safe subset (not full); dashboards are deferred to v2; parameters/sets/groups are **not rebuilt** (the agent flags any present from the Tableau metadata). RLS is partially automated — wired `USERNAME()` filters become roles, while group/compound logic fails closed for deliberate review. The preserved `TableauFormula` annotations make every translated/stubbed measure auditable and repairable.
+> **Key gaps**: calc coverage is a deterministic safe subset (not full); dashboard/worksheet rebuild is preview-level (Tier-1 *structure* only — chart type, exact field bindings, layout, slicers — with visual *formatting* such as colors/fonts/legends deferred to a later pass); parameters/sets/groups are **not rebuilt** as model objects (parameter-driven slicers are, however, surfaced on the rebuilt report). RLS is partially automated — wired `USERNAME()` filters become roles, while group/compound logic fails closed for deliberate review. The preserved `TableauFormula` annotations make every translated/stubbed measure auditable and repairable.
 
 ---
 
@@ -557,15 +560,26 @@ It writes the proven layout with the **exact** schemas baked in (the part agents
 <Name>.Report/               # thin one-page shell; definition.pbir datasetReference.byPath = ../<Name>.SemanticModel
 ```
 
-The `.pbir` **`datasetReference.byPath`** is the report→model link. The `.Report` is a thin shell until
-report rebuild ships (v2) — the dataset is fully functional on its own; pass `report_parts=` (e.g. from
-`twb_to_pbir`) to supply a real rebuilt report. See [semantic-model-rebuild.md](resources/semantic-model-rebuild.md).
+The `.pbir` **`datasetReference.byPath`** is the report→model link. The default `.Report` is a thin
+shell — the dataset is fully functional on its own — but the estate orchestrator now passes
+`report_parts=` (from `twb_to_pbir`) to supply a **real rebuilt report** per workbook (see the note
+below), and `project_name=` to name the project after the source asset. See
+[semantic-model-rebuild.md](resources/semantic-model-rebuild.md).
 
 > **Estate / local runs emit `.pbip` by default.** The one-button estate orchestrator
 > (`scripts/migrate_estate.py`) writes an openable `pbip/<Name>/<Name>.pbip` for **every** migrated
 > datasource — alongside (never replacing) the canonical `semantic_models/<Name>.SemanticModel/` — so a
 > user can double-click straight into Power BI Desktop to explore and test each datasource. Pass
 > `pbip=False` (CLI `--no-pbip`) to emit only the `semantic_models/` folders.
+
+> **Workbooks emit an openable, model-bound `.pbip` too.** For every workbook with a rebuildable
+> embedded datasource, the estate also writes a self-contained `pbip/<Workbook>/<Workbook>.pbip` — the
+> Tier-1 rebuilt report (`twb_to_pbir`) bound *by path* to a sibling model rebuilt from the workbook's
+> **own embedded datasource** — so the dashboard opens directly in Power BI Desktop. The per-workbook
+> `viz_fidelity` list reports each visual as `rebuilt` or `warned`; anything that can't be faithfully
+> bound (a lakehouse-fallback datasource, secondary datasources a single PBIR report can't bind) is
+> recorded in `pbip_warnings` rather than mis-bound. The `semantic_models/` folders remain the
+> canonical deploy target; the workbook `pbip/` is a self-contained local-open copy (by design).
 
 ---
 
@@ -575,7 +589,8 @@ report rebuild ships (v2) — the dataset is fully functional on its own; pass `
 2. **Query & explore** with `semantic-model-consumption` and `fabriciq` (natural-language analysis over the migrated model).
 3. **Offer the second compiler for any stubbed calc (end-of-run check-in).** When a run finishes with stubbed calculations (`report["summary"]["needs_review_total"] > 0`, also surfaced in `summary.md`'s **Next step** section and the per-datasource `report["datasources"][n]["translation_handoff"]`), **don't silently stop at the stubs** — proactively present a short check-in: list each stubbed calculation (name · role · why it stubbed) and **ask whether to run them through the second compiler now**. If yes, run the Tier-1 loop — author the leanest *faithful* candidate DAX → `check_candidate_dax` (the syntactic gate) → land the approved set via `approved_calc_dax` → redeploy — per [second-compiler.md](resources/second-compiler.md). If no, leave the inert stubs (the original `TableauFormula` is preserved for later). The **faithful-or-stub** charter still binds: never land a guessed or semantically-altered measure silently.
    > _Phrasing template:_ "This migration translated N of M calculations. K fell back to stubs (the original formulas are preserved): `<Calc A>`, `<Calc B>`, … Would you like me to run these through the second compiler now (author candidate DAX → validate → land)?"
-4. **(v2) Rebuild reports** — once measures are trusted, regenerate Tableau worksheets/dashboards as Power BI report pages (roadmap).
+4. **Open the rebuilt reports (preview)** — each workbook with a rebuildable embedded datasource already ships as an openable `pbip/<Workbook>/<Workbook>.pbip` (Tier-1 *structure* — chart type, exact field bindings, layout, slicers — bound to the model). Open it in Power BI Desktop to review the rebuilt pages; check the per-workbook `viz_fidelity` for any `warned` visuals and apply visual *formatting* (colors, fonts, legends) by hand for now — that styling layer is a later pass.
+5. **(Optional) Run the image oracle to settle ambiguous chart types** — for a workbook with non-standard / "hacky" views (a dual-axis pie that renders as a donut, a running-total Gantt that reads as a waterfall, an INDEX()/RANK() bump, a donut with a KPI floating in its hole), an opt-in **agent-driven vision pass** can confirm or correct each visual's *chart type* against the original Tableau rendering — **without ever touching field bindings**. It consumes the additive per-visual `candidate_records` `twb_to_pbir` already emits, resolves an offline-first image (caller-provided file → embedded `.twb`/`.twbx` thumbnail → none), and re-binds a visual's type **only** to a type in its candidate list. Follow the numbered runbook in [image-oracle.md](resources/image-oracle.md). Sheet swaps and field bindings stay deterministic; the Tier-1 report stands on its own if you skip this.
 
 ## Related skills
 

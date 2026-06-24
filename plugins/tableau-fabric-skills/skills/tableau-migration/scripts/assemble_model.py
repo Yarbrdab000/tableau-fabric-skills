@@ -1222,24 +1222,28 @@ PBIP_PROPERTIES_SCHEMA = ("https://developer.microsoft.com/json-schemas/fabric/"
 
 
 def write_local_pbip(parts, dest_dir, *, model_name, report_name=None, report_parts=None,
-                     swap_specs=None):
+                     swap_specs=None, project_name=None):
     """Write an **openable** Power BI project (``.pbip``) under ``dest_dir``:
 
     - ``<model_name>.SemanticModel/`` — the TMDL model (from ``parts``)
     - ``<report_name>.Report/``       — a report bound *by path* to that model (thin one-page
       shell by default; pass ``report_parts`` to supply a real rebuilt report, or ``swap_specs`` to
       auto-emit a field-parameter self-service page)
-    - ``<model_name>.pbip``           — the project pointer (correct ``pbipProperties/1.0.0`` schema)
+    - ``<project_name>.pbip``         — the project pointer (correct ``pbipProperties/1.0.0`` schema)
 
     Double-click the ``.pbip`` to open it in Power BI Desktop. The semantic model is fully
     functional on its own. When the model has field-parameter (swap) tables, pass their
     ``swap_specs`` (``report["field_parameters"]["specs"]``) and the report becomes a working
     self-service table (dynamic dimension + measure columns) instead of an empty shell; an explicit
-    ``report_parts`` always wins. Returns the .pbip path.
+    ``report_parts`` always wins. ``project_name`` names the ``.pbip`` pointer file only and
+    defaults to ``model_name`` (so existing callers are unchanged); pass it to name the project
+    after the source asset -- e.g. a rebuilt workbook whose embedded model differs from the workbook
+    name. Returns the .pbip path.
     """
     import json
     import os
     report_name = report_name or model_name
+    project_name = project_name or model_name
     write_model_folder(parts, os.path.join(dest_dir, f"{model_name}.SemanticModel"))
     if report_parts is None:
         if swap_specs:
@@ -1248,7 +1252,7 @@ def write_local_pbip(parts, dest_dir, *, model_name, report_name=None, report_pa
             report_parts = build_thin_report_parts(model_name, report_name=report_name)
     write_model_folder(report_parts, os.path.join(dest_dir, f"{report_name}.Report"))
     os.makedirs(dest_dir, exist_ok=True)
-    pbip_path = os.path.join(dest_dir, f"{model_name}.pbip")
+    pbip_path = os.path.join(dest_dir, f"{project_name}.pbip")
     with open(pbip_path, "w", encoding="utf-8") as fh:
         json.dump({
             "$schema": PBIP_PROPERTIES_SCHEMA,

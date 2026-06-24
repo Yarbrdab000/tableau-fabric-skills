@@ -13,6 +13,15 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** Tier-1 Tableau **dashboard → Power BI** migration — workbook worksheets
+  and dashboards are rebuilt as Power BI report pages in the PBIR/`.pbip` format
+  (`scripts/twb_to_pbir.py`), wired into the estate driver (`scripts/migrate_estate.py`) so a
+  migrated datasource's report is assembled and bound by-path alongside its semantic model. Adds a
+  Tier-2 **image-oracle** verification harness (`scripts/image_oracle.py`, runbook
+  `resources/image-oracle.md`) that checks rebuilt-report fidelity, plus viz-engine robustness
+  (implicit row-count rollup, structural worksheet titles, additional chart-type mappings) and a
+  `list_workbook_datasources` helper / additive `project_name=` argument on
+  `write_local_pbip`. Additive; the migration suite stays green. Skill `VERSION` `1.5.0` → `1.6.0`.
 - **tableau-migration:** the estate orchestrator (`scripts/migrate_estate.py`) gains an additive,
   **opt-in `rebind_plan=` parameter** that ingests a comparison-emitted `rebind-plan.json`
   (`schema_version "1.0"`) and writes a single `compile-report.json`. When the parameter is absent the

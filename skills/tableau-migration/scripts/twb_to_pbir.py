@@ -19,8 +19,9 @@ wrong/over-confident visual is never emitted silently.
 
 Scope (small, correct slice; everything else -> ``warnings[]``):
 
-* marks -> visual types: ``Bar`` -> clustered column/bar, ``Line`` -> line, ``Text`` ->
-  table (``tableEx``) or matrix (``pivotTable``). Anything else is ``unsupported``.
+* marks -> visual types: ``Bar`` -> clustered column/bar, ``Line`` -> line, ``Area`` -> area
+  (``areaChart``), ``Text`` -> table (``tableEx``) or matrix (``pivotTable``). Anything else is
+  ``unsupported``.
 * categorical / date filters -> a slicer visual (a wireframe placeholder; Tableau filter
   scope is not identical to a Power BI slicer -- see ``resources/viz-rebuild.md``).
 
@@ -75,26 +76,58 @@ PAGE_HEIGHT = 720
 VT_COLUMN = "column"      # clusteredColumnChart (vertical bars: dim on x / cols)
 VT_BAR = "bar"            # clusteredBarChart   (horizontal bars: dim on y / rows)
 VT_LINE = "line"          # lineChart
+VT_AREA = "area"          # areaChart (native area chart; stacked-vs-overlap fill is a Tier-2 property)
 VT_TABLE = "table"        # tableEx
 VT_MATRIX = "matrix"      # pivotTable
 VT_SCATTER = "scatter"    # scatterChart (X/Y measures disaggregated by a dimension)
 VT_CARD = "card"          # card (1 measure) / multiRowCard (>=2 measures), no dimension
 VT_PIE = "pie"            # pieChart (angle measure + legend dimension)
-VT_FILLED_MAP = "filled_map"  # filledMap (choropleth: geo Location + measure Color)
+VT_FILLED_MAP = "filled_map"  # shapeMap (choropleth: geo Category + measure Value/color saturation)
 VT_MAP = "map"            # map (symbol/bubble: geo Location + measure Size/Color)
+VT_COMBO = "combo"        # lineClusteredColumnComboChart (column measure(s) on Y + line measure(s) on Y2)
+VT_WATERFALL = "waterfall"  # waterfallChart (running-total Gantt hack: dimension Category + base measure Y)
+VT_DONUT = "donut"          # donutChart (dual-axis pie/donut hack: legend Category + angle measure Y)
+VT_RIBBON = "ribbon"        # ribbonChart (bump/rank hack: ordinal Category + legend Series + base measure Y)
 VT_UNSUPPORTED = "unsupported"
 
 _VT_TO_PBIR = {
     VT_COLUMN: "clusteredColumnChart",
     VT_BAR: "clusteredBarChart",
     VT_LINE: "lineChart",
+    VT_AREA: "areaChart",
     VT_TABLE: "tableEx",
     VT_MATRIX: "pivotTable",
     VT_SCATTER: "scatterChart",
     VT_PIE: "pieChart",
-    VT_FILLED_MAP: "filledMap",
+    # Choropleths default to Power BI's Shape map (clean offline polygon fill + measure-driven
+    # colour saturation), not the Bing-backed Filled map. NB: shapeMap is gated behind the
+    # "Shape map visual" preview feature in Power BI Desktop.
+    VT_FILLED_MAP: "shapeMap",
     VT_MAP: "map",
+    # Dual-axis / combo: a column-family measure share an axis with a line-family measure. Power
+    # BI's combo chart puts the column measure(s) on Y (primary axis) and the line measure(s) on
+    # Y2 (secondary axis). Role keys (Category/Series/Y/Y2) verified against real Microsoft PBIR
+    # visual.json files and the original ComboChart capabilities definition.
+    VT_COMBO: "lineClusteredColumnComboChart",
+    # Running-total Gantt waterfall hack -> native waterfallChart. Roles Category (required) +
+    # Y (required) + optional Breakdown verified against a real Microsoft PBIR waterfall
+    # visual.json (jaho5/pbip_reference) and the visualContainer 1.5.0 / semanticQuery schemas.
+    VT_WATERFALL: "waterfallChart",
+    # Dual-axis pie/donut hack -> native donutChart. Shares the pieChart capability family
+    # (legend Category + value Y); same role keys as the verified pieChart emit.
+    VT_DONUT: "donutChart",
+    # Manual-rank bump hack -> native ribbonChart. Power BI recomputes the rank from the base
+    # measure, so the INDEX()/RANK() table-calc rank axis is dropped; roles Category (ordinal
+    # axis) + Series (legend) + Y (base measure) verified against real Microsoft PBIR ribbonChart
+    # visual.json files (microsoft/fabric-toolbox) + the visualContainer 1.5.0 schema.
+    VT_RIBBON: "ribbonChart",
 }
+
+# Mark classes that, when two measures on one shelf carry DIFFERENT mark families, signal a
+# dual-axis combo: a bar/column-family measure overlaid with a line/area-family measure. (Area is
+# treated as line-family, consistent with the area->line default elsewhere in this module.)
+_COLUMN_FAMILY_MARKS = {"bar", "gantt"}
+_LINE_FAMILY_MARKS = {"line", "area"}
 
 # Mark classes for geometry-backed / custom-spatial maps we deliberately defer (basics only:
 # filled + symbol map). These degrade to a structured warning rather than a guessed visual.
@@ -114,9 +147,77 @@ _DATE_PARTS = {
     "Second", "ISO-Year", "ISO-Quarter", "ISO-Week", "ISO-Weekday",
     "MonthYear", "DayOfYear",
 }
-# Tableau internal pseudo-fields that have no model binding.
+
+# Tableau discrete date PART -> column name on the model's shared Date dimension. The datasource
+# migration build (assemble_model._build_date_dimension + tmdl_generate.generate_date_table_tmdl)
+# already emits a marked Date table carrying these exact columns, so a date pill on the active
+# business date rebinds to that calendar -- routing time intelligence through it -- instead of
+# degrading to the fact's raw date column. This consumer never recomputes those facts; the model
+# owns them and passes them in via ``date_binding``. Sub-day parts (Hour/Minute/Second), composite
+# parts (MonthYear/DayOfYear) and ISO-Quarter/ISO-Weekday have no dedicated calendar column and are
+# deliberately omitted -- they stay on the source column + warn (warn-never-wrong).
+_DEFAULT_DATE_GRAIN_COLUMNS = {
+    "Year": "Year", "Quarter": "Quarter", "Month": "Month", "Day": "Day",
+    "Week": "Week of Year", "Weekday": "Day Name",
+    "ISO-Year": "ISO Year", "ISO-Week": "Week of Year",
+}
+
+
+def _norm_date_col(name):
+    """Normalize a column name for active-date matching (case/space/underscore-insensitive)."""
+    return re.sub(r"\s+", " ", (name or "").strip().lower().replace("_", " ").replace("-", " "))
+
+
+def _rebind_date_axis(field, deriv, date_binding):
+    """Redirect a date axis pill to the model's shared Date table, or ``None`` to leave it as-is.
+
+    Fires ONLY for the single ACTIVE business date the model build selected, so a secondary or
+    inactive date (e.g. Ship Date, or any date when the primary is ambiguous) is never bound to the
+    calendar and therefore can't silently display the active date's values -- the exact "break a lot
+    of stuff" risk. A discrete date PART rebinds to its calendar column (Year -> Date[Year]); a plain
+    exact/continuous date rebinds to the marked key column (Date[Date]); a continuous TRUNC grain and
+    any part with no calendar column return ``None`` (deferred -- the caller keeps the source column +
+    warns). Returns ``(entity, property)`` to rebind, else ``None``.
+    """
+    if not date_binding or field.get("role") == "measure":
+        return None
+    table = date_binding.get("date_table")
+    if not table:
+        return None
+    active = {_norm_date_col(c) for c in (date_binding.get("active_keys") or ())}
+    if _norm_date_col(field.get("property")) not in active:
+        return None
+    if deriv in _DATE_PARTS:
+        grains = date_binding.get("grain_columns") or _DEFAULT_DATE_GRAIN_COLUMNS
+        col = grains.get(deriv)
+        return (table, col) if col else None
+    if deriv in ("None", "", None):  # plain/continuous exact date -> the marked calendar key
+        return (table, date_binding.get("key_column") or "Date")
+    return None  # continuous TRUNC -> deferred (display-grain shape is a later pass)
+
+
+# Tableau internal pseudo-fields that have no model binding. ``Number of Records`` is handled by
+# the implicit row-count recognizer below (it maps to a COUNTROWS measure, not a silent drop), so
+# it is deliberately NOT listed here.
 _SPECIAL_FIELDS = {":Measure Names", "Measure Names", "Measure Values",
-                   ":Measure Values", "Number of Records", "Multiple Values"}
+                   ":Measure Values", "Multiple Values"}
+
+# -- Implicit row-count recognition --------------------------------------------
+# Tableau expresses "count the rows of a table" two ways, neither of which names a real model
+# column: (1) an aggregation over the object-model row identity ``__tableau_internal_object_id__``
+# (a ``Count`` column-instance whose ``column`` ref encodes the table), and (2) the legacy
+# auto-generated ``Number of Records`` field (the constant ``1`` summed). Both mean COUNTROWS of a
+# table -- so the faithful Power BI target is a COUNTROWS measure, NOT a column projection. Left
+# unrecognised, (1) is silently dropped (empty visual) and (2) emits a dangling ``SUM('T'[Number
+# of Records])`` against a column the model never had. The model-side COUNTROWS measure is owned by
+# the datasource-migration build; this layer RECOGNISES the implicit count, binds it when the caller
+# supplies a ``row_count_binding`` target, and otherwise emits a precise warn-never-wrong warning
+# (never a guessed or dangling ref). COUNT(*) == row count and the object-id ref encoding the table
+# are unprotectable Tableau<->Power BI interoperability facts, verified directly against our own
+# corpus XML; the recognizer/binder are authored here against our own IR.
+_NUMBER_OF_RECORDS = "Number of Records"
+_COUNT_DERIVS = {"Count", "CountD", "Cnt", "CntD"}
+_OID_HASH_RE = re.compile(r"_[0-9A-Fa-f]{32}$")
 
 _GEO_ROLE_RE = re.compile(r"\[([^\]]+)\]")
 
@@ -160,6 +261,21 @@ def _findall_local(elem, name):
 
 def _children_local(elem, name):
     return [c for c in list(elem) if _local(c.tag) == name]
+
+
+def _attr_local(elem, name):
+    """Read an attribute by local name, ignoring any XML namespace prefix.
+
+    Tableau namespaces some group-filter attributes (e.g. ``user:op`` parses to
+    ``{http://www.tableausoftware.com/xml/user}op``), so a plain ``elem.get("op")`` misses them.
+    """
+    v = elem.get(name)
+    if v is not None:
+        return v
+    for k, val in elem.attrib.items():
+        if _local(k) == name:
+            return val
+    return None
 
 
 def _first(elem, name):
@@ -208,13 +324,15 @@ def _sanitize(text):
 def _build_field_index(root):
     """Index the workbook's embedded datasources -> exact model binding per field.
 
-    Returns ``(index, ds_caption_by_name)`` where ``index[(ds_name, field_id)]`` is
-    ``{"entity": <relation name>, "property": clean_col(remote), "datatype": <bucket>}``.
+    Returns ``(index, ds_caption_by_name, internal_fields)`` where ``index[(ds_name, field_id)]``
+    is ``{"entity": <relation name>, "property": clean_col(remote), "datatype": <bucket>}`` and
+    ``internal_fields`` is a set of ``(ds_name, field_id)`` for Tableau auto-generated pseudo-fields.
     ``field_id`` is the field's internal id (the metadata ``local-name`` / column ``name``
     without brackets), so the binding survives a workbook-side rename of the caption.
     """
     index = {}
     ds_caption = {}
+    internal = set()
     holders = _children_local(root, "datasources")
     datasources = []
     for h in holders:
@@ -253,7 +371,16 @@ def _build_field_index(root):
                 "property": clean_col(remote),
                 "datatype": tableau_type_to_simple(_txt("local-type")),
             }
-    return index, ds_caption
+        # Tableau auto-generates helper fields the user never created: dashboard filter/set
+        # *action* groups (``user:auto-column='sheet_link'``), viz-in-tooltip and forecast
+        # helpers. They carry no user model binding, so record their ids (authoritatively, via
+        # the ``user:auto-column`` marker -- language independent) to drop them silently later.
+        for el in ds.iter():
+            if _attr_local(el, "auto-column"):
+                nm = _strip_brackets((el.get("name") or "").strip())
+                if nm:
+                    internal.add((dsn, nm))
+    return index, ds_caption, internal
 
 
 # -- worksheet parsing ---------------------------------------------------------
@@ -267,11 +394,13 @@ def _parse_dependencies(view):
             cid = _strip_brackets(c.get("name") or "")
             if not cid:
                 continue
+            calc_el = _first(c, "calculation")
             base_cols[(dsn, cid)] = {
                 "caption": c.get("caption") or cid,
                 "role": (c.get("role") or "").lower(),
                 "datatype": (c.get("datatype") or "").lower(),
-                "is_calc": bool(_children_local(c, "calculation")),
+                "is_calc": calc_el is not None,
+                "formula": calc_el.get("formula") if calc_el is not None else None,
                 "geo_role": c.get("semantic-role") or "",
             }
         for ci in _children_local(dep, "column-instance"):
@@ -285,17 +414,161 @@ def _parse_dependencies(view):
     return base_cols, instances
 
 
+_INTERNAL_OBJECT_ID = "__tableau_internal_object_id__"
+
+
+def _is_internal_field(ds, field_id, base_id, internal_fields):
+    """True if a pill references a Tableau internal / auto-generated pseudo-field.
+
+    These carry no user-facing model binding and must be dropped *silently* (never warned):
+    warning on them is false noise, not a real coverage gap. Two authoritative signals:
+
+    * ``__tableau_internal_object_id__`` -- Tableau's object-model row-count internal (a reserved
+      double-underscore namespace, never a user field), matched anywhere in the id.
+    * ``user:auto-column`` declarations -- dashboard filter/set *action* groups (``sheet_link``),
+      viz-in-tooltip and forecast helpers. Their ids are collected from the datasource by
+      :func:`_build_field_index` into ``internal_fields`` keyed by ``(ds, field_id)``.
+    """
+    if _INTERNAL_OBJECT_ID in (field_id or "") or _INTERNAL_OBJECT_ID in (base_id or ""):
+        return True
+    if internal_fields and (
+            (ds, field_id) in internal_fields or (ds, base_id) in internal_fields):
+        return True
+    return False
+
+
+def _oid_table(ds, inst_column, base_cols):
+    """Resolve the table name a ``__tableau_internal_object_id__`` count refers to.
+
+    The count instance's ``column`` ref encodes the table as ``...].[<relation>_<hex32>]``. Prefer
+    the object-id column's ``caption`` (the user-facing table name, e.g. a Union's friendly name)
+    when the worksheet's dependencies carry it; otherwise strip the trailing ``_<hex32>`` from the
+    relation id. Returns the table name (or ``None``).
+    """
+    cap = (base_cols.get((ds, inst_column)) or {}).get("caption")
+    if cap and _INTERNAL_OBJECT_ID not in cap:
+        return cap
+    tail = (inst_column or "").split("].[")[-1].rstrip("]")
+    m = _OID_HASH_RE.search(tail)
+    table = tail[:m.start()] if m else tail
+    return table or None
+
+
+def _row_count_tables(ds, instances, base_cols):
+    """Distinct table names this worksheet implicitly counts via ``__tableau_internal_object_id__``.
+
+    A genuine implicit COUNT pill leaves a ``Count`` column-instance on the object-id in the
+    worksheet's dependencies. A bare ``[__tableau_internal_object_id__]`` filter/detail artifact
+    (no count instance) yields an empty list, so it stays on the silent-drop path -- never warned.
+    """
+    out = []
+    for (dsn, _iid), inst in (instances or {}).items():
+        if dsn != ds:
+            continue
+        col = inst.get("column") or ""
+        if _INTERNAL_OBJECT_ID in col and inst.get("derivation") in _COUNT_DERIVS:
+            table = _oid_table(ds, col, base_cols)
+            if table and table not in out:
+                out.append(table)
+    return out
+
+
+def _classify_row_count(ds, field_id, base_id, deriv, base_cols, instances):
+    """Classify a pill as an implicit row count, or ``None``.
+
+    Returns ``{"kind": "object_id"|"numrec", "table": <name|None>, "candidates": [<name>...]}``.
+    ``object_id`` is recognised only when the worksheet actually carries a count-of-object-id
+    instance (so a bare object-id artifact is left to the silent-drop path). For ``object_id`` a
+    single distinct table is named; multiple distinct tables are left ambiguous (``table=None``,
+    ``candidates`` populated) so the binder never guesses which fact to count.
+    """
+    cap = (base_cols.get((ds, base_id)) or {}).get("caption") or ""
+    if base_id == _NUMBER_OF_RECORDS or field_id == _NUMBER_OF_RECORDS or cap == _NUMBER_OF_RECORDS:
+        return {"kind": "numrec", "table": None, "candidates": []}
+    if _INTERNAL_OBJECT_ID in (base_id or "") or _INTERNAL_OBJECT_ID in (field_id or ""):
+        tables = _row_count_tables(ds, instances, base_cols)
+        if not tables:
+            return None
+        return {"kind": "object_id",
+                "table": tables[0] if len(tables) == 1 else None,
+                "candidates": tables}
+    return None
+
+
+def _row_count_measure_target(rc, row_count_binding):
+    """Resolve the ``(entity, measure)`` to bind an implicit row count to, or ``None``.
+
+    ``row_count_binding`` is this layer's own (consumer-owned) shape:
+    ``{"measures": {<table name>: {"entity": ..., "measure": ...}}, "default": {"entity": ...,
+    "measure": ...}}``. An ``object_id`` count binds only when its specific table has a measure
+    (never via ``default`` -- it names a fact, so binding requires that fact's COUNTROWS measure); a
+    ``numrec`` count (the legacy single-fact row count) binds via ``default``.
+    """
+    if not row_count_binding:
+        return None
+    measures = row_count_binding.get("measures") or {}
+    if rc["kind"] == "object_id" and rc.get("table") in measures:
+        m = measures[rc["table"]] or {}
+        if m.get("entity") and m.get("measure"):
+            return (m["entity"], m["measure"])
+    if rc["kind"] == "numrec":
+        d = row_count_binding.get("default") or {}
+        if d.get("entity") and d.get("measure"):
+            return (d["entity"], d["measure"])
+    return None
+
+
+def _bind_or_warn_row_count(rc, ds, worksheet, base_id, field_id, deriv,
+                            warnings, warn_special, row_count_binding):
+    """Bind an implicit row count to a COUNTROWS measure, or warn (warn-never-wrong).
+
+    Returns a measure-bound IR field when ``row_count_binding`` supplies a faithful target,
+    otherwise ``None`` -- emitting a precise warning (gated on ``warn_special`` so the Measure
+    Values path stays silent). The warning always names the implicit row count and the COUNTROWS
+    measure the model build needs to supply, so the gap is explicit and never a dangling/guessed
+    binding.
+    """
+    target = _row_count_measure_target(rc, row_count_binding)
+    if target is not None:
+        entity, measure = target
+        return {
+            "caption": measure, "field_id": base_id, "instance": field_id,
+            "role": "measure", "datatype": "integer", "is_calc": False,
+            "derivation": deriv, "aggregation": None,
+            "entity": entity, "property": measure,
+            "binding": "measure", "kind": "value",
+            "geo_area": None, "formula": None,
+        }
+    if warn_special:
+        if rc["kind"] == "object_id" and rc.get("table"):
+            reason = (f"implicit row count COUNT('{rc['table']}') has no model binding -- needs a "
+                      f"row-count (COUNTROWS) measure on table '{rc['table']}' (left unbound)")
+        elif rc["kind"] == "object_id":
+            cands = ", ".join(rc.get("candidates") or []) or "unknown"
+            reason = (f"implicit row count COUNT(*) is ambiguous across tables ({cands}) -- needs a "
+                      f"row-count (COUNTROWS) measure (left unbound)")
+        else:
+            reason = ("implicit row count [Number of Records] has no model binding -- needs a "
+                      "row-count (COUNTROWS) measure (left unbound)")
+        warnings.append(_warn("worksheet", worksheet, reason))
+    return None
+
+
 def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
-                   worksheet, warnings):
+                   worksheet, warnings, warn_special=True, internal_fields=None,
+                   date_binding=None, row_count_binding=None):
     """Resolve one shelf/encoding pill into an IR field dict (or ``None`` if it must be dropped).
 
     Records a structured warning whenever a token cannot be bound to a model field, or is
     bound through a non-authoritative fallback, so the wireframe never claims a binding it
-    cannot stand behind.
+    cannot stand behind. ``warn_special`` is set ``False`` by the Measure Values/Names path,
+    which handles the ``Multiple Values`` / ``:Measure Names`` pseudo-fields itself, so dropping
+    them here must stay silent rather than emit a false "no model binding" warning.
     """
     if not field_id or field_id in _SPECIAL_FIELDS or field_id.startswith(":"):
-        warnings.append(_warn("worksheet", worksheet,
-                              f"field '{field_id}' has no model binding (skipped)"))
+        if warn_special:
+            warnings.append(_warn("worksheet", worksheet,
+                                  f"field '{field_id}' has no model binding (skipped)"))
         return None
 
     # Tableau auto-generated helpers (Latitude/Longitude/Geometry "(generated)") carry no model
@@ -308,6 +581,18 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
         base_id, deriv = inst["column"], inst["derivation"]
     else:
         base_id, deriv = field_id, "None"
+
+    # Implicit row count (object-id COUNT(*) / legacy [Number of Records]) -> a COUNTROWS measure.
+    # Runs BEFORE the internal-field silent drop (object-id) and the base-column resolve (which
+    # would otherwise emit a dangling SUM([Number of Records])), so an implicit count is either
+    # faithfully bound or precisely warned -- never silently lost or mis-bound.
+    rc = _classify_row_count(ds, field_id, base_id, deriv, base_cols, instances)
+    if rc is not None:
+        return _bind_or_warn_row_count(rc, ds, worksheet, base_id, field_id, deriv,
+                                       warnings, warn_special, row_count_binding)
+
+    if _is_internal_field(ds, field_id, base_id, internal_fields):
+        return None
 
     base = base_cols.get((ds, base_id))
     if base is None:
@@ -342,6 +627,7 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
         "entity": entity, "property": prop,
         "binding": None, "kind": None,
         "geo_area": _geo_area(base.get("geo_role", "")) if role != "measure" else None,
+        "formula": base.get("formula"),
     }
 
     # measure calc: only valid in a value role; an axis role is flagged + dropped later.
@@ -367,7 +653,19 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
         field["kind"] = "value"
         return field
 
-    if deriv in _DATE_PARTS or deriv.startswith("Trunc"):
+    # Date-table rebind (consumes the model build's date facts; never recomputes them). When the
+    # pill is the active business date, redirect it to the shared marked Date dimension so time
+    # intelligence runs through the calendar rather than the fact's raw date column. Secondary /
+    # inactive dates, unmapped grains and continuous TRUNCs fall through to the degrade-and-warn
+    # path below -- they are never silently rebound to the wrong date.
+    rebind = _rebind_date_axis(field, deriv, date_binding)
+    if rebind is not None:
+        field["entity"], field["property"] = rebind
+        field["binding"] = "column"
+        field["kind"] = "category"
+        return field
+
+    if deriv in _DATE_PARTS or deriv.startswith("Trunc") or deriv.endswith("-Trunc"):
         warnings.append(_warn(
             "worksheet", worksheet,
             f"date part '{deriv}' on '{caption}' approximated as a plain date column "
@@ -389,34 +687,41 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
 
 
 def _resolve_shelf(text, ds_default, base_cols, instances, index, ds_caption,
-                   worksheet, warnings):
+                   worksheet, warnings, warn_special=True, internal_fields=None,
+                   date_binding=None, row_count_binding=None):
     fields = []
     for tok in _TOKEN_RE.findall(text or ""):
         ds, fid = _split_token(tok)
         f = _resolve_field(ds or ds_default, fid, base_cols, instances, index,
-                           ds_caption, worksheet, warnings)
+                           ds_caption, worksheet, warnings, warn_special=warn_special,
+                           internal_fields=internal_fields, date_binding=date_binding,
+                           row_count_binding=row_count_binding)
         if f:
             fields.append(f)
     return fields
 
 
 def _parse_encodings(pane, ds_default, base_cols, instances, index, ds_caption,
-                     worksheet, warnings):
-    enc = {"color": None, "size": None, "label": None, "detail": None}
+                     worksheet, warnings, warn_special=True, internal_fields=None,
+                     date_binding=None, row_count_binding=None):
+    enc = {"color": None, "size": None, "label": None, "detail": None, "angle": None}
     if pane is None:
         return enc
     holder = _first(pane, "encodings")
     if holder is None:
         return enc
     mapping = {"color": "color", "size": "size", "text": "label",
-               "label": "label", "lod": "detail", "level-of-detail": "detail"}
+               "label": "label", "lod": "detail", "level-of-detail": "detail",
+               "wedge-size": "angle"}
     for child in list(holder):
         role = mapping.get(_local(child.tag))
         if not role:
             continue
         ds, fid = _split_token_attr(child.get("column"))
         f = _resolve_field(ds or ds_default, fid, base_cols, instances, index,
-                           ds_caption, worksheet, warnings)
+                           ds_caption, worksheet, warnings, warn_special=warn_special,
+                           internal_fields=internal_fields, date_binding=date_binding,
+                           row_count_binding=row_count_binding)
         if f and enc[role] is None:
             enc[role] = f
     return enc
@@ -441,6 +746,82 @@ def _split_token_attr(value):
         return None, None
     m = _TOKEN_RE.search(value)
     return _split_token(m.group(0)) if m else (None, None)
+
+
+_BRACKET_TOKEN_RE = re.compile(r"\[([^\]]+)\]")
+
+
+def _pane_mark_map(table):
+    """Index a worksheet's per-axis marks for dual-axis / combo detection.
+
+    A dual-axis worksheet serialises one ``<pane>`` per measure axis. Each non-primary pane
+    carries ``y-axis-name`` (the measure field ref, whose last bracketed token is the column
+    instance, e.g. ``sum:Sales:qk``) and its own ``<mark class>``; a secondary axis additionally
+    carries ``y-index`` >= 1. Returns ``(mark_by_instance, primary_mark, has_secondary_axis)``
+    where ``mark_by_instance`` maps a measure instance token to that axis's mark class.
+    """
+    mark_by_instance = {}
+    primary_mark = None
+    has_secondary_axis = False
+    panes_el = _first(table, "panes")
+    if panes_el is None:
+        return mark_by_instance, primary_mark, has_secondary_axis
+    for pane in _children_local(panes_el, "pane"):
+        mk_el = _first(pane, "mark")
+        mk = mk_el.get("class") if mk_el is not None else None
+        y_index = _attr_local(pane, "y-index")
+        if y_index not in (None, "", "0"):
+            has_secondary_axis = True
+        y_axis = _attr_local(pane, "y-axis-name")
+        if y_axis:
+            toks = _BRACKET_TOKEN_RE.findall(y_axis)
+            if toks:
+                mark_by_instance[toks[-1]] = mk
+        elif primary_mark is None and mk:
+            primary_mark = mk
+    return mark_by_instance, primary_mark, has_secondary_axis
+
+
+def _mark_family(mark):
+    m = (mark or "").strip().lower()
+    if m in _COLUMN_FAMILY_MARKS:
+        return "column"
+    if m in _LINE_FAMILY_MARKS:
+        return "line"
+    return None
+
+
+def _detect_combo(meas_rows, meas_cols, has_category, mark_by_instance, primary_mark):
+    """Classify a dual-axis combo: measures on one shelf that split into a column-family group
+    and a line-family group, against a shared category dimension.
+
+    Returns ``(column_measures, line_measures)`` only when BOTH groups are non-empty (a genuine
+    combo); otherwise ``(None, None)`` so the caller keeps the ordinary single-mark visual. This
+    is deliberately conservative -- same-mark multi-measure shelves and unresolvable measures
+    never trigger a combo (warn-never-wrong).
+    """
+    if not has_category:
+        return None, None
+    column_meas, line_meas = [], []
+    for f in list(meas_rows) + list(meas_cols):
+        fam = _mark_family(mark_by_instance.get(f.get("instance"), primary_mark))
+        if fam == "column":
+            column_meas.append(f)
+        elif fam == "line":
+            line_meas.append(f)
+    if column_meas and line_meas:
+        return column_meas, line_meas
+    return None, None
+
+
+_RUNNING_TOTAL_RE = re.compile(r"\.\[cum:")
+
+# Manual-rank table-calc functions that signal a bump/rank chart: the rank/position is computed
+# in the view (the INDEX/RANK family) and plotted on an axis. Power BI's ribbonChart recomputes
+# the rank from the base measure, so these table-calc artifacts are dropped (like the waterfall's
+# running total) and the base measure + legend + ordinal axis bind directly.
+_RANK_TABLECALC_RE = re.compile(
+    r"\b(INDEX|RANK|RANK_DENSE|RANK_MODIFIED|RANK_PERCENTILE|RANK_UNIQUE)\s*\(", re.I)
 
 
 def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
@@ -481,12 +862,30 @@ def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
             return VT_FILLED_MAP
         # geo on Detail but no confirming spatial signal -> fall through to chart heuristics
 
+    # Location-only map: a geo-role dimension on Detail with NO measure anywhere and no axis
+    # pills is Tableau's default rendering of that geography (auto-generated lat/lon, uniform
+    # fill) -- there is no other faithful reading (no measure for a chart, and a geographic field
+    # is a map, not a text list). The faithful rebuild is a shapeMap carrying just the Location
+    # (Category); the colour-saturation Value is simply absent. Custom-geometry marks still defer.
+    if geo_detail and not map_meas and not axis_dim and not axis_meas:
+        if m not in _DEFER_MAP_MARKS:
+            return VT_FILLED_MAP
+
     # measure(s) with no dimension anywhere -> a single-value card / multi-row card tile
     if has_meas and not has_dim:
         return VT_CARD
 
     if m == "line":
         return VT_LINE if has_meas else VT_UNSUPPORTED
+
+    if m == "area":
+        # Power BI has a native ``areaChart`` -- an area chart is its own chart type (a filled line),
+        # not merely a styled line -- so an ``area`` mark binds to areaChart with the SAME axes and
+        # encodings a line would use (Category/Y/Series/SmallMultiples), getting the chart TYPE right
+        # (Tier-1). Stacked-vs-overlapping area is a fill property deferred to a later styling pass.
+        # Without a measure on an axis (the value sits only on an encoding) the layout is ambiguous
+        # and stays unsupported -> warn, rather than guess (warn-never-wrong).
+        return VT_AREA if has_meas else VT_UNSUPPORTED
 
     if m == "pie":
         # an angle measure split by a legend dimension -> pie
@@ -496,6 +895,27 @@ def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
         # a measure on each axis, disaggregated by a dimension -> scatter
         if meas_rows and meas_cols and has_dim:
             return VT_SCATTER
+        # Highlight table: a Square mark with dimensions on both axes (a coloured crosstab), the
+        # measure carried on the colour/label encoding -> a matrix; the colour saturation itself
+        # is Tier-2 styling. A single-axis highlight table degrades to a table. Square marks with
+        # NO axis dimensions (treemap / packed-bubble / heatmap layouts) stay unsupported -> warn
+        # rather than guess a visual we cannot place faithfully.
+        if m == "square":
+            if dims_rows and dims_cols:
+                return VT_MATRIX
+            if (dims_rows or dims_cols) and has_meas:
+                return VT_TABLE
+            return VT_UNSUPPORTED
+        # Circle / Shape / Point dot (strip) plot: one category axis vs one measure axis carries
+        # the SAME field binding as a column/bar -- the dot glyph itself is Tier-2 styling (cf.
+        # area -> line). Restricted to exactly one axis dimension + one axis measure on opposite
+        # axes so nothing on a second axis is silently dropped; packed-bubble / no-axis /
+        # multi-axis circle layouts stay unsupported (ambiguous -> warn).
+        if len(dims_rows) + len(dims_cols) == 1 and len(meas_rows) + len(meas_cols) == 1:
+            if dims_cols and meas_rows:
+                return VT_COLUMN
+            if dims_rows and meas_cols:
+                return VT_BAR
         return VT_UNSUPPORTED
 
     if m in ("bar", "automatic", ""):
@@ -528,18 +948,107 @@ def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
     return VT_UNSUPPORTED
 
 
+def _strip_member_literal(raw):
+    """Return a categorical filter member's inner value. Tableau serialises it as a quoted string
+    literal (e.g. ``"South"``) or a bare token (``true`` / ``5``); strip the surrounding quotes."""
+    s = (raw or "").strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return s[1:-1]
+    return s
+
+
+def _filter_member_literals(group):
+    """Collect the literal member values from a group's direct ``function='member'`` children."""
+    out = []
+    for gf in _children_local(group, "groupfilter"):
+        if gf.get("function") == "member" and gf.get("member") is not None:
+            out.append(_strip_member_literal(gf.get("member")))
+    return out
+
+
+def _parse_filter_selection(filt):
+    """Extract a categorical filter's applied member selection.
+
+    Returns ``{"mode": "include"|"exclude", "values": [str, ...]}`` for a cleanly enumerated
+    selection, else ``None`` (an "all members" filter, or a structure we cannot read faithfully).
+    Mirrors the three real Tableau serialisations: a single ``function='member'`` child, a
+    ``function='union' op='manual'`` keep-list (include), or a ``function='except'`` wrapper
+    (exclude). A non-narrowing or ambiguous filter returns ``None`` so the slicer stays at its
+    faithful default (warn-never-wrong: never invent a selection that could hide real data wrong).
+    """
+    children = _children_local(filt, "groupfilter")
+    if not children:
+        return None
+    members = []
+    for child in children:
+        fn = child.get("function")
+        op = _attr_local(child, "op")
+        if fn == "except":
+            ex = _filter_member_literals(child)
+            return {"mode": "exclude", "values": _dedupe_str(ex)} if ex else None
+        if fn == "member" and child.get("member") is not None:
+            members.append(_strip_member_literal(child.get("member")))
+        elif fn == "union" and op == "manual":
+            members.extend(_filter_member_literals(child))
+    members = _dedupe_str([m for m in members if m != ""])
+    return {"mode": "include", "values": members} if members else None
+
+
+def _parse_filter_range(filt):
+    """Extract a quantitative/date range filter's bounds: ``{"min": str|None, "max": str|None}``
+    (or ``None`` when neither bound is present). Tableau wraps date literals in ``#...#``."""
+    def _val(el):
+        if el is None or el.text is None:
+            return None
+        t = el.text.strip()
+        if len(t) >= 2 and t[0] == "#" and t[-1] == "#":
+            t = t[1:-1]
+        return t or None
+    lo, hi = _val(_first(filt, "min")), _val(_first(filt, "max"))
+    return {"min": lo, "max": hi} if (lo is not None or hi is not None) else None
+
+
+def _dedupe_str(values):
+    seen, out = set(), []
+    for v in values:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
 def _parse_filters(ws, ds_default, base_cols, instances, index, ds_caption,
-                   worksheet, warnings):
+                   worksheet, warnings, warn_special=True, internal_fields=None):
+    """Returns ``(filters, swap_controls)``. ``swap_controls`` carries any parameter-driven
+    sheet-swap visibility controls detected on this worksheet (a categorical filter pinned to a
+    pure parameter-passthrough calc). Recognising them structurally keeps them from being
+    mis-warned as unmappable measure filters and lets :func:`parse_twb` group swap partners."""
     filters = []
+    swap_controls = []
     for filt in _findall_local(ws, "filter"):
         cls = (filt.get("class") or "").lower()
         ds, fid = _split_token_attr(filt.get("column"))
         if fid is None:
             continue
         f = _resolve_field(ds or ds_default, fid, base_cols, instances, index,
-                           ds_caption, worksheet, warnings)
+                           ds_caption, worksheet, warnings, warn_special=warn_special,
+                           internal_fields=internal_fields)
         if f is None:
             continue
+        # Parameter-driven sheet swap: a categorical filter pinned to a pure passthrough control
+        # calc ([Parameters].[id]) gates this whole worksheet's visibility -- it is not a data
+        # filter, so record it as a swap control (parse_twb groups partners) and do NOT warn.
+        if cls == "categorical":
+            ctrl_formula = (base_cols.get((ds or ds_default, f["field_id"])) or {}).get("formula")
+            pid = _param_control_ref(ctrl_formula)
+            if pid:
+                sel = _parse_filter_selection(filt)
+                swap_controls.append({
+                    "param_id": pid,
+                    "calc_caption": f["caption"],
+                    "members": list(sel["values"]) if sel and sel.get("mode") == "include" else [],
+                })
+                continue
         # A slicer binds a raw column; an aggregate (SUM(Sales)) or calculated-measure
         # filter has no faithful slicer mapping -> warn instead of emitting a wrong slicer.
         if f["binding"] == "aggregation" or f["is_calc"]:
@@ -562,11 +1071,424 @@ def _parse_filters(ws, ds_default, base_cols, instances, index, ds_caption,
         f["filter_kind"] = kind
         f["binding"] = "column"
         f["aggregation"] = None
+        f["selection"] = _parse_filter_selection(filt) if cls == "categorical" else None
+        f["range"] = _parse_filter_range(filt) if cls == "quantitative" else None
         filters.append(f)
-    return filters
+    return filters, swap_controls
 
 
-def _parse_worksheet(ws, index, ds_caption, warnings):
+def _parse_sort(view, ds_default, base_cols, instances, index, ds_caption, worksheet, warnings,
+                internal_fields=None):
+    """Parse a worksheet ``<computed-sort>`` (sort a dimension by a measure) into an IR directive.
+
+    Tableau serialises an axis sort as ``<computed-sort column='[dim]' direction='ASC|DESC'
+    using='[measure]' />``. Returns ``{"field": <resolved sort-by measure>, "direction":
+    "Ascending"|"Descending"}`` for the first computed-sort whose ``using`` measure resolves, else
+    ``None``. ``<manual-sort>`` (an explicit, frozen member order) has no faithful Power BI sort
+    expression, so it is deliberately ignored here (the default model order is used instead).
+    """
+    for cs in _findall_local(view, "computed-sort"):
+        using = _attr_local(cs, "using")
+        if not using:
+            continue
+        uds, ufid = _split_token_attr(using)
+        if ufid is None:
+            continue
+        by = _resolve_field(uds or ds_default, ufid, base_cols, instances, index,
+                            ds_caption, worksheet, warnings, warn_special=False,
+                            internal_fields=internal_fields)
+        if not by or by["kind"] != "value":
+            continue
+        direction = (_attr_local(cs, "direction") or "ASC").strip().upper()
+        return {"field": by,
+                "direction": "Descending" if direction == "DESC" else "Ascending"}
+    return None
+
+
+# -- Measure Values / Measure Names expansion (M1.0) ---------------------------
+# Power BI has no "Measure Names" field: several measures dropped in one value well auto-produce
+# the series / legend / column headers. So [Measure Values] expands to its ordered member
+# measures (all exact-bound in the value well) and [Measure Names] is implicit -- never bound
+# (binding it as a category/series would be a dangling reference). The authoritative member
+# order is the worksheet's categorical filter on [:Measure Names] (its function="member" list,
+# in document = shelf order, verified against real workbooks); the <manual-sort> dictionary is
+# only a fallback because it retains stale, since-removed members. These are unprotectable
+# Tableau<->Power BI behaviour facts, authored independently against our own IR + emitter.
+_NUM_LITERAL_RE = re.compile(r"^[-+]?\d+(\.\d*)?$")
+_PARAM_SWAP_RE = re.compile(r"(?is)\b(?:case|if)\b.*?\[Parameters\]\.")
+_MV_VALUE_TOKENS = ("[Multiple Values]", ":Measure Values]")
+# real chart marks for which Measure Names on an axis means small-multiples-by-measure (M1.2).
+_MV_CHART_MARKS = {"bar", "line", "area", "circle", "square", "shape", "point", "pie", "gantt"}
+
+
+def _is_dummy_constant(formula):
+    """True when a calculated field is just a numeric literal (a path-hack spacer like ``0``)."""
+    return bool(formula) and bool(_NUM_LITERAL_RE.match(formula.strip()))
+
+
+def _is_param_swap(formula):
+    """True for a parameter-driven CASE/IF swap calc (a field-parameter pattern: deferred to M1.3)."""
+    return bool(formula) and bool(_PARAM_SWAP_RE.search(formula))
+
+
+_PARAM_CONTROL_RE = re.compile(r"^\s*\[Parameters\]\.\[([^\]]+)\]\s*$")
+
+
+def _param_control_ref(formula):
+    """Return the parameter id for a *pure passthrough* control calc, else ``None``.
+
+    A parameter-driven sheet swap is wired with a calc whose entire body is a single parameter
+    reference (``[Parameters].[Parameter 001...]``). Because that calc is constant across every
+    row (it equals the parameter's current value), a worksheet categorical filter pinned to one of
+    its members shows the sheet wholesale at that parameter value and hides it otherwise -- i.e. it
+    is a visibility control, not a data filter. Detection is deliberately narrow: only an exact
+    passthrough qualifies, so a real comparison such as ``[Sales] > [p]`` keeps its ordinary
+    (warned) filter handling. The id matches the bracket-stripped column ``name`` indexed by
+    :func:`_parse_parameters`. Distinct from :func:`_is_param_swap` (a CASE/IF *field*-parameter).
+    """
+    if not formula:
+        return None
+    m = _PARAM_CONTROL_RE.match(formula)
+    return m.group(1).strip() if m else None
+
+
+def _uses_measure_values(rows_text, cols_text, pane):
+    """True when the worksheet places the Measure Values shelf (the ``[Multiple Values]`` pill)."""
+    blob = (rows_text or "") + " " + (cols_text or "")
+    holder = _first(pane, "encodings") if pane is not None else None
+    if holder is not None:
+        blob += " " + " ".join((c.get("column") or "") for c in list(holder))
+    return any(tok in blob for tok in _MV_VALUE_TOKENS)
+
+
+def _mv_shelf_locations(rows_text, cols_text, pane):
+    """Where the Measure Names pill and the Measure Values placeholder sit (shelf / encoding role)."""
+    locs = {"names": None, "values": None}
+
+    def mark(where, col):
+        if not col:
+            return
+        if ":Measure Names]" in col and locs["names"] is None:
+            locs["names"] = where
+        if ("[Multiple Values]" in col or ":Measure Values]" in col) and locs["values"] is None:
+            locs["values"] = where
+
+    mark("rows", rows_text)
+    mark("cols", cols_text)
+    holder = _first(pane, "encodings") if pane is not None else None
+    if holder is not None:
+        for child in list(holder):
+            mark(_local(child.tag), child.get("column"))
+    return locs
+
+
+def _measure_value_member_ids(view, ds_default):
+    """Ordered ``(ds, instance_id)`` Measure Values members, plus an enumeration status.
+
+    Returns ``(members, status)`` where ``status`` is one of:
+
+    - ``"ok"``      -- an authoritative keep-list (a ``<groupfilter function="union" op="manual">``
+      whose ``function="member"`` children are the *included* measures, in document = shelf
+      order) or, when no such filter is present, the ``<manual-sort>`` dictionary fallback.
+    - ``"exclude"`` -- the Measure Names filter is an Exclude / non-manual structure
+      (``except`` / ``level-members``), where the listed members are the *excluded* set; the
+      displayed set cannot be derived from the workbook alone, so the caller must warn + defer
+      rather than show the wrong measures.
+    - ``"none"``    -- no member source was found.
+
+    The ``<manual-sort>`` dictionary is only a fallback because it keeps stale members that were
+    since removed from the shelf.
+    """
+    def members_of(group):
+        out = []
+        for gf in _findall_local(group, "groupfilter"):
+            if gf.get("function") == "member" and gf.get("member"):
+                ds, fid = _split_token_attr(gf.get("member"))
+                if fid:
+                    out.append((ds or ds_default, fid))
+        return out
+
+    for filt in _findall_local(view, "filter"):
+        col = filt.get("column") or ""
+        if (filt.get("class") or "").lower() != "categorical" \
+                or not col.endswith(":Measure Names]"):
+            continue
+        # the inclusion authority is a *direct* union+manual keep-list; any other top-level group
+        # (except / level-members / non-manual union) is an Exclude action whose member list is
+        # the removed set -- reading it as the keep-list would surface exactly the wrong measures.
+        manual, nonmanual = None, False
+        for child in _children_local(filt, "groupfilter"):
+            fn = child.get("function")
+            op = _attr_local(child, "op")
+            if fn == "union" and op == "manual":
+                manual = child
+            elif fn in ("except", "level-members") or (fn == "union" and op != "manual"):
+                nonmanual = True
+        if manual is not None:
+            mem = members_of(manual)
+            if mem:
+                return mem, "ok"
+        if nonmanual:
+            return [], "exclude"
+    for ms in _findall_local(view, "manual-sort"):
+        if (ms.get("column") or "").endswith(":Measure Names]"):
+            members = []
+            for b in _findall_local(ms, "bucket"):
+                ds, fid = _split_token_attr(b.text or "")
+                if fid:
+                    members.append((ds or ds_default, fid))
+            if members:
+                return members, "ok"
+    return [], "none"
+
+
+def _resolve_measure_values(view, ds_default, base_cols, instances, index, ds_caption,
+                            worksheet, warnings, internal_fields=None):
+    """Resolve the ordered Measure Values members to value fields.
+
+    Drops numeric-literal dummy spacers (the path-hack constant). Returns
+    ``(members, dummy_count, has_param_swap, status)`` where ``status`` is the enumeration
+    status from :func:`_measure_value_member_ids`.
+    """
+    member_ids, status = _measure_value_member_ids(view, ds_default)
+    members, dummy_count, has_param_swap = [], 0, False
+    for ds, fid in member_ids:
+        inst = instances.get((ds, fid))
+        base_id = inst["column"] if inst else fid
+        formula = (base_cols.get((ds, base_id)) or {}).get("formula")
+        if _is_dummy_constant(formula):
+            dummy_count += 1
+            continue
+        if _is_param_swap(formula):
+            has_param_swap = True
+        f = _resolve_field(ds, fid, base_cols, instances, index, ds_caption,
+                           worksheet, warnings, internal_fields=internal_fields)
+        if f and f["kind"] == "value":
+            members.append(f)
+    return members, dummy_count, has_param_swap, status
+
+
+def _route_measure_values(mark, locs, members, dummy_count, has_param_swap, status,
+                          dims_rows, dims_cols, worksheet, warnings):
+    """Route a Measure Values worksheet to a native visual.
+
+    Returns ``(visual_type, inject_shelf, note)`` where ``inject_shelf`` is the IR shelf the
+    member measures join as value fields. An unclassifiable or deliberately deferred case
+    returns ``VT_UNSUPPORTED`` and appends one specific structured warning (so a handled case
+    never carries a generic false "no model binding" warning).
+    """
+    m = (mark or "").strip().lower()
+    names_at, values_at = locs["names"], locs["values"]
+    values_on_text = values_at in ("text", "label")
+
+    # An Exclude / non-manual Measure Names filter lists the REMOVED measures, so the displayed
+    # set cannot be derived from the workbook alone -> warn + defer rather than show the wrong set.
+    if status == "exclude":
+        warnings.append(_warn(
+            "worksheet", worksheet,
+            "Measure Names uses an Exclude (non-manual) filter; the displayed measure set "
+            "cannot be derived faithfully from the workbook (skipped)"))
+        return VT_UNSUPPORTED, None, None
+
+    if not members:
+        warnings.append(_warn(
+            "worksheet", worksheet,
+            "Measure Values shelf could not be enumerated to member measures "
+            "(no member list found; skipped)"))
+        return VT_UNSUPPORTED, None, None
+
+    if has_param_swap:
+        warnings.append(_warn(
+            "worksheet", worksheet,
+            "Measure Values members are parameter-driven swap calculations; a faithful "
+            "field-parameter rebuild is deferred (skipped)"))
+        return VT_UNSUPPORTED, None, None
+
+    # Path-mark "bar hack": a Line mark with Measure Names on Path (often padded by a dummy
+    # constant member) fakes vertical bars. Tier-1 stays MARK-FAITHFUL -- drop the literal
+    # spacer(s) and exact-bind the real measure(s) but KEEP the line mark. Re-reading the line as
+    # a bar is chart-type adjudication (intent inference), which the two-tier split assigns to the
+    # styling/Tier-2 pass, so the note surfaces it instead of silently changing the chart type.
+    if m == "line" and names_at == "path":
+        dummy_bit = (f"; dropped {dummy_count} dummy constant member"
+                     + ("s" if dummy_count != 1 else "")) if dummy_count else ""
+        if dims_rows or dims_cols:
+            shelf = "cols" if dims_rows else "rows"
+            note = (f"detected Tableau path-mark hack (Line mark + Measure Names on Path)"
+                    f"{dummy_bit}; kept the line mark and bound {len(members)} real measure(s) "
+                    f"(line->bar reinterpretation deferred to a styling pass)")
+            return VT_LINE, shelf, note
+        note = (f"detected Tableau path-mark hack (Line mark + Measure Names on Path){dummy_bit}; "
+                f"no dimension to plot a line, bound {len(members)} measure(s) as a card")
+        return VT_CARD, "cols", note
+
+    # Measure Names on Rows/Columns against a real chart mark splits the chart into one pane per
+    # measure (small multiples) -> deferred to the trellis pass rather than silently flattened.
+    if names_at in ("rows", "cols") and m in _MV_CHART_MARKS and not values_on_text:
+        warnings.append(_warn(
+            "worksheet", worksheet,
+            "Measure Names on rows/columns splits this chart into one pane per measure "
+            "(small multiples); deferred (skipped)"))
+        return VT_UNSUPPORTED, None, None
+
+    # Measure Names on Color -> the member measures become the series/legend automatically.
+    if names_at == "color" and not values_on_text:
+        if m == "line":
+            vt, shelf = VT_LINE, "rows"
+        elif dims_cols and not dims_rows:
+            vt, shelf = VT_COLUMN, "rows"
+        elif dims_rows:
+            vt, shelf = VT_BAR, "cols"
+        else:
+            vt, shelf = VT_CARD, "cols"
+        note = (f"Measure Values -> {len(members)} measures as series; "
+                "Measure Names legend is implicit")
+        return vt, shelf, note
+
+    # Default: a text table / crosstab (measures as columns) or, with no dimension, a bare
+    # multi-measure card. Power BI renders measures-as-columns natively in a matrix.
+    vt = VT_MATRIX if (dims_rows or dims_cols) else VT_CARD
+    note = f"Measure Values -> {len(members)} measures; Measure Names implicit"
+    return vt, "cols", note
+
+
+# -- worksheet title (structural text only; per-run styling is Tier-2) ----------
+_TITLE_DYNAMIC_RE = re.compile(r"<[^<>]+>")
+
+
+def _parse_worksheet_title(ws):
+    """Extract a worksheet's structural caption from ``<layout-options><title>``.
+
+    Returns ``(text, is_dynamic)``. ``text`` is the concatenation of the title's ``<run>`` text
+    -- the STRUCTURAL content only; per-run font / colour / size attributes are deliberately
+    ignored (that is Tier-2 styling). ``is_dynamic`` is ``True`` when the title embeds a Tableau
+    dynamic token (a field / parameter / sheet reference, authored as an escaped ``&lt;...&gt;``
+    run that unescapes to ``<...>``), which cannot be reproduced as a static Power BI title --
+    the caller defers it (warn) rather than emit a broken literal. ``(None, False)`` when there
+    is no explicit, non-empty title.
+    """
+    layout = _first(ws, "layout-options")
+    if layout is None:
+        return None, False
+    title = _first(layout, "title")
+    if title is None:
+        return None, False
+    ft = _first(title, "formatted-text")
+    runs = _findall_local(ft, "run") if ft is not None else []
+    text = "".join((r.text or "") for r in runs).strip()
+    if not text:
+        return None, False
+    return text, bool(_TITLE_DYNAMIC_RE.search(text))
+
+
+# Cartesian visual types that carry an explicit category/value axis pair whose titles can be
+# faithfully reproduced. Pie/scatter/matrix/etc. either lack a category-vs-value axis split or
+# put measures on both axes, so an axis-title override there is deferred (warn-never-wrong).
+_AXIS_TITLE_TYPES = (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA)
+
+
+def _parse_axis_titles(table, dims_rows, dims_cols, meas_rows, meas_cols):
+    """Extract author-overridden axis-title captions from a worksheet's ``<style>`` axis rules.
+
+    Tableau stores an axis-title override as
+    ``table/style/style-rule[@element='axis']/format[@attr='title'][@scope]`` -- ``scope`` is
+    ``rows`` or ``cols`` (which shelf's axis), and ``value`` is the title text, an EMPTY string
+    meaning the author HID that axis title. Quick-filter caption rules live under
+    ``style-rule[@element='quick-filter']`` and carry no ``scope``, so they are excluded here.
+
+    The scope is mapped to a Power BI axis STRUCTURALLY by the role of the field(s) on that shelf:
+    a shelf holding only the category dimension drives ``categoryAxis``; a shelf holding only the
+    measure drives ``valueAxis``. This is orientation-independent -- it works whether the dimension
+    sits on rows (a bar) or on cols (a column / line / area). A shelf with a mixed or empty role is
+    skipped (never guess which axis a title belongs to).
+
+    Returns a dict optionally containing ``categoryAxis`` / ``valueAxis`` keys, each
+    ``{"text": <str|None>, "hide": <bool>}`` (``hide=True`` <=> the author blanked the title).
+    """
+    if table is None:
+        return {}
+    style = _first(table, "style")
+    if style is None:
+        return {}
+
+    def _role(dims, meas):
+        if dims and not meas:
+            return "categoryAxis"
+        if meas and not dims:
+            return "valueAxis"
+        return None
+
+    scope_axis = {
+        "cols": _role(dims_cols, meas_cols),
+        "rows": _role(dims_rows, meas_rows),
+    }
+    out = {}
+    for rule in _children_local(style, "style-rule"):
+        if (rule.get("element") or "").lower() != "axis":
+            continue
+        for fmt in _children_local(rule, "format"):
+            if (fmt.get("attr") or "") != "title":
+                continue
+            scope = fmt.get("scope")
+            if scope not in ("rows", "cols"):
+                continue
+            axis = scope_axis.get(scope)
+            if axis is None or axis in out:
+                continue
+            value = fmt.get("value")
+            if value is None:
+                continue
+            text = value.strip()
+            out[axis] = {"text": text or None, "hide": not text}
+    return out
+
+
+# Tableau analytic-annotation elements live at ``table/panes/pane/<element>``: a reference /
+# target / distribution line overlays a computed constant, average, percentile band, or an
+# explicit goal on the mark, and a trend line overlays a fitted model. Power BI expresses these as
+# visual-level analytics (or a richer KPI visual for a single-value target) -- a Tier-2 analytics /
+# formatting concern Tier-1 cannot redraw faithfully. They are recorded (additive, for a later
+# analytics pass) and surfaced as a warning; the underlying visual is unaffected. A reference line
+# on a single-value card is exactly a KPI target/goal, so the warning calls that case out.
+_REFERENCE_LINE_TAGS = ("reference-line", "reference-distribution", "reference-band")
+_REF_INSTANCE_RE = re.compile(r"^[a-z]+:(.+):[a-z]{2}$")
+
+
+def _annotation_label(el):
+    """Human-readable name for a reference annotation: its custom label (auto ``<Value>`` tokens
+    stripped), else ``<formula> of <target field>`` derived from the ``value-column`` instance."""
+    label = (el.get("label") or "").strip()
+    if label and (el.get("label-type") or "").lower() == "custom":
+        cleaned = re.sub(r"\s*<[^>]*>", "", label).strip()
+        if cleaned:
+            return cleaned
+    formula = (el.get("formula") or "").strip()
+    target = _parse_item(el.get("value-column") or "") or ""
+    m = _REF_INSTANCE_RE.match(target)
+    if m:
+        target = m.group(1)
+    if formula and target:
+        return "{0} of {1}".format(formula, target)
+    return target or formula or "reference line"
+
+
+def _parse_reference_lines(all_panes):
+    """Collect reference / target / distribution and trend line annotations across a worksheet's
+    panes into additive descriptor dicts ``{"kind", "label", "formula"}``."""
+    refs = []
+    for pn in all_panes:
+        for tag in _REFERENCE_LINE_TAGS:
+            for el in _children_local(pn, tag):
+                refs.append({"kind": "reference_line",
+                             "label": _annotation_label(el),
+                             "formula": (el.get("formula") or "").strip() or None})
+        for el in _findall_local(pn, "trend-line"):
+            refs.append({"kind": "trend_line", "label": "trend line", "formula": None})
+    return refs
+
+
+def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date_binding=None,
+                     row_count_binding=None):
     name = ws.get("name")
     table = _first(ws, "table")
     if table is None:
@@ -582,7 +1504,20 @@ def _parse_worksheet(ws, index, ds_caption, warnings):
     base_cols, instances = _parse_dependencies(view)
 
     panes = _first(table, "panes")
-    pane = _first(panes, "pane") if panes is not None else None
+    all_panes = _findall_local(panes, "pane") if panes is not None else []
+    pane = all_panes[0] if all_panes else None
+    # Dual-axis pie/donut hack: the meaningful mark can live in a NON-primary pane (e.g. a Pie
+    # pane hidden behind MIN(0) spacer axes that fake a donut ring). When a Pie pane is present,
+    # drive the worksheet off it so its legend (colour) + angle (wedge-size) encodings are read
+    # instead of the empty spacer pane. A genuine single-pane pie is unaffected (same pane).
+    pie_pane = next(
+        (p for p in all_panes
+         if _first(p, "mark") is not None
+         and (_first(p, "mark").get("class") or "").lower() == "pie"),
+        None)
+    donut_hack = pie_pane is not None and len(all_panes) > 1
+    if pie_pane is not None:
+        pane = pie_pane
     mark_el = _first(pane, "mark") if pane is not None else None
     mark = mark_el.get("class") if mark_el is not None else "Automatic"
 
@@ -590,53 +1525,210 @@ def _parse_worksheet(ws, index, ds_caption, warnings):
     cols_el = _first(table, "cols")
     rows_text = (rows_el.text if rows_el is not None else "") or ""
     cols_text = (cols_el.text if cols_el is not None else "") or ""
-    rows = _resolve_shelf(rows_text, ds_default,
-                          base_cols, instances, index, ds_caption, name, warnings)
-    cols = _resolve_shelf(cols_text, ds_default,
-                          base_cols, instances, index, ds_caption, name, warnings)
+    uses_mv = _uses_measure_values(rows_text, cols_text, pane)
+    warn_special = not uses_mv
+    rows = _resolve_shelf(rows_text, ds_default, base_cols, instances, index,
+                          ds_caption, name, warnings, warn_special=warn_special,
+                          internal_fields=internal_fields, date_binding=date_binding,
+                          row_count_binding=row_count_binding)
+    cols = _resolve_shelf(cols_text, ds_default, base_cols, instances, index,
+                          ds_caption, name, warnings, warn_special=warn_special,
+                          internal_fields=internal_fields, date_binding=date_binding,
+                          row_count_binding=row_count_binding)
     encodings = _parse_encodings(pane, ds_default, base_cols, instances, index,
-                                 ds_caption, name, warnings)
-    filters = _parse_filters(view, ds_default, base_cols, instances, index,
-                             ds_caption, name, warnings)
+                                 ds_caption, name, warnings, warn_special=warn_special,
+                                 internal_fields=internal_fields, date_binding=date_binding,
+                                 row_count_binding=row_count_binding)
+    filters, swap_controls = _parse_filters(view, ds_default, base_cols, instances, index,
+                                            ds_caption, name, warnings, warn_special=warn_special,
+                                            internal_fields=internal_fields)
+    sort = _parse_sort(view, ds_default, base_cols, instances, index,
+                       ds_caption, name, warnings, internal_fields=internal_fields)
 
     dims_rows = [f for f in rows if f["kind"] == "category"]
     dims_cols = [f for f in cols if f["kind"] == "category"]
     meas_rows = [f for f in rows if f["kind"] == "value"]
     meas_cols = [f for f in cols if f["kind"] == "value"]
-    # marks-card encodings also carry fields: color/detail can be the disaggregating
-    # dimension (scatter) and label/size can be the measure of a bare card / KPI tile.
-    enc_dims = [f for f in (encodings["color"], encodings["detail"])
-                if f and f["kind"] == "category"]
-    enc_meas = [f for f in (encodings["size"], encodings["label"])
-                if f and f["kind"] == "value"]
-    # geographic map signals: a geo-role dimension on Detail is the Location; a measure on any
-    # shelf/encoding feeds Color/Size; generated lat/lon on the axes or a geometry encoding is
-    # the extra spatial confirmation that disambiguates an ambiguous mark from a normal chart.
-    detail = encodings["detail"]
-    color = encodings["color"]
-    geo_detail = bool(detail and detail["kind"] == "category" and detail.get("geo_area"))
-    map_meas = bool(meas_rows or meas_cols
-                    or (color and color["kind"] == "value")
-                    or (encodings["size"] and encodings["size"]["kind"] == "value")
-                    or (encodings["label"] and encodings["label"]["kind"] == "value"))
-    shelf_text = (rows_text + " " + cols_text).lower()
-    has_latlon_axes = ("latitude (generated)" in shelf_text
-                       and "longitude (generated)" in shelf_text)
-    map_signal = has_latlon_axes or _has_geometry(pane)
-    visual_type = _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
-                               enc_dims, enc_meas, geo_detail=geo_detail,
-                               map_meas=map_meas, map_signal=map_signal)
 
+    fidelity_note = None
+    combo_split = None
+    if uses_mv:
+        # Measure Values/Names (M1.0): expand [Measure Values] to its ordered member measures in
+        # the value well and route by mark + where the (implicit) Measure Names pill sits. The
+        # member value fields join the IR shelves so the existing emitter binds them unchanged.
+        locs = _mv_shelf_locations(rows_text, cols_text, pane)
+        members, dummy_count, has_param_swap, mv_status = _resolve_measure_values(
+            view, ds_default, base_cols, instances, index, ds_caption, name, warnings,
+            internal_fields=internal_fields)
+        visual_type, inject_shelf, fidelity_note = _route_measure_values(
+            mark, locs, members, dummy_count, has_param_swap, mv_status,
+            dims_rows, dims_cols, name, warnings)
+        if visual_type != VT_UNSUPPORTED:
+            if inject_shelf == "rows":
+                rows = rows + members
+            else:
+                cols = cols + members
+    else:
+        # marks-card encodings also carry fields: color/detail can be the disaggregating
+        # dimension (scatter) and label/size can be the measure of a bare card / KPI tile.
+        enc_dims = [f for f in (encodings["color"], encodings["detail"])
+                    if f and f["kind"] == "category"]
+        enc_meas = [f for f in (encodings["size"], encodings["label"], encodings["angle"])
+                    if f and f["kind"] == "value"]
+        # geographic map signals: a geo-role dimension on Detail is the Location; a measure on
+        # any shelf/encoding feeds Color/Size; generated lat/lon on the axes or a geometry
+        # encoding is the extra spatial confirmation that separates a map from a normal chart.
+        detail = encodings["detail"]
+        color = encodings["color"]
+        geo_detail = bool(detail and detail["kind"] == "category" and detail.get("geo_area"))
+        map_meas = bool(meas_rows or meas_cols
+                        or (color and color["kind"] == "value")
+                        or (encodings["size"] and encodings["size"]["kind"] == "value")
+                        or (encodings["label"] and encodings["label"]["kind"] == "value"))
+        shelf_text = (rows_text + " " + cols_text).lower()
+        has_latlon_axes = ("latitude (generated)" in shelf_text
+                           and "longitude (generated)" in shelf_text)
+        map_signal = has_latlon_axes or _has_geometry(pane)
+        visual_type = _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
+                                   enc_dims, enc_meas, geo_detail=geo_detail,
+                                   map_meas=map_meas, map_signal=map_signal)
+
+        # Dual-axis combo: when a chart layout's measures split into a column-family group and a
+        # line-family group (each measure's mark read from its own dual-axis pane), re-route to a
+        # combo chart so the column measure(s) land on Y and the line measure(s) on Y2. Same-mark
+        # multi-measure shelves keep their ordinary single-mark visual (no false combos).
+        if visual_type in (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA):
+            mark_by_instance, primary_mark, _ = _pane_mark_map(table)
+            column_meas, line_meas = _detect_combo(
+                meas_rows, meas_cols, bool(dims_rows or dims_cols),
+                mark_by_instance, primary_mark)
+            if column_meas and line_meas:
+                visual_type = VT_COMBO
+                combo_split = {"Y": column_meas, "Y2": line_meas}
+                fidelity_note = (
+                    "dual-axis combo: column measure(s) on the primary axis + line measure(s) "
+                    "on the secondary axis -> lineClusteredColumnComboChart")
+
+        # Bump / rank chart hack: a manual rank built from an INDEX()/RANK() table calc plotted on
+        # an axis (often a doubled dual-axis spacer), with the real ranked measure on a marks-card
+        # encoding and a legend dimension colouring the ranked members. Power BI's native
+        # ribbonChart recomputes the rank from the base measure, so the table-calc rank axis is
+        # dropped (like the waterfall's running total) and Category (the ordinal/time axis) +
+        # Series (the legend) + Y (the base measure) bind to real model fields. Gated on the rank
+        # table-calc signal so ordinary column/bar/line charts never misfire.
+        if visual_type in (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA) and combo_split is None:
+            axis_rank_calc = any(
+                f["is_calc"] and _RANK_TABLECALC_RE.search(f.get("formula") or "")
+                for f in (meas_rows + meas_cols))
+            ribbon_meas = next(
+                (f for f in (encodings["detail"], encodings["size"], encodings["label"])
+                 if f and f["kind"] == "value" and not f["is_calc"]), None)
+            ribbon_legend = bool(color and color["kind"] == "category"
+                                 and not color["is_calc"])
+            if (axis_rank_calc and ribbon_meas is not None and ribbon_legend
+                    and (dims_rows or dims_cols)):
+                visual_type = VT_RIBBON
+                fidelity_note = (
+                    "manual rank (INDEX/RANK table calc) bump chart -> native ribbonChart "
+                    "(Power BI recomputes the rank from the base measure; the table-calc rank "
+                    "axis dropped)")
+
+        # Dual-axis pie/donut hack: a Pie mark stacked behind MIN(0) spacer axes (to fake a
+        # donut ring with a hollow centre) routes to a native donutChart. The real slices are the
+        # Pie pane's colour (legend -> Category) + wedge-size (angle -> Y); the spacer axes are
+        # dropped by the dedicated donut emit. A plain single-pane pie stays a pieChart.
+        if visual_type == VT_PIE and donut_hack:
+            visual_type = VT_DONUT
+            fidelity_note = (
+                "dual-axis pie/donut hack -> native donutChart "
+                "(legend + angle read from the Pie pane; MIN(0) spacer axes dropped)")
+
+        # Running-total Gantt waterfall hack: a GanttBar mark whose value axis is a running-total
+        # quick table calc (`cum:`) renders as a floating waterfall. Power BI's native
+        # waterfallChart recomputes the running total, so Category = the dimension axis and
+        # Y = the base measure (the running-total pill already resolves to its base aggregation);
+        # the per-step gantt size delta + sentiment colour are dropped. Gated on the running-total
+        # signal so ordinary Gantt timelines (project schedules) stay unsupported -> warn.
+        if visual_type == VT_UNSUPPORTED and (mark or "").strip().lower() in ("ganttbar", "gantt"):
+            running_total = bool(_RUNNING_TOTAL_RE.search(rows_text)
+                                 or _RUNNING_TOTAL_RE.search(cols_text))
+            if running_total and (dims_rows or dims_cols) and (meas_rows or meas_cols):
+                visual_type = VT_WATERFALL
+                fidelity_note = (
+                    "running-total Gantt hack -> native waterfallChart "
+                    "(Power BI recomputes the running total; per-step gantt size dropped)")
+
+        # Single-dimension "text list" display: a lone categorical field carried only on the
+        # marks card (label / colour / detail) with no measure anywhere and no axis pills is
+        # Tableau's Automatic text rendering of that field -> a faithful one-column table that
+        # lists its distinct values. Geographic dimensions are excluded (those are maps, deferred
+        # to map routing) so a location field is never flattened into a plain list.
+        if visual_type == VT_UNSUPPORTED and not (dims_rows or dims_cols) and not geo_detail:
+            display_dims = [f for f in (encodings["label"], encodings["color"],
+                                        encodings["detail"])
+                            if f and f["kind"] == "category"]
+            has_any_measure = bool(
+                meas_rows or meas_cols or enc_meas
+                or (color and color["kind"] == "value")
+                or (detail and detail["kind"] == "value"))
+            if display_dims and not has_any_measure:
+                visual_type = VT_TABLE
+
+        if visual_type == VT_UNSUPPORTED:
+            raw_present = bool(_TOKEN_RE.search(rows_text or "")
+                               or _TOKEN_RE.search(cols_text or ""))
+            enc_holder = _first(pane, "encodings") if pane is not None else None
+            enc_present = enc_holder is not None and len(list(enc_holder)) > 0
+            is_empty = (not rows and not cols and not any(encodings.values())
+                        and not raw_present and not enc_present)
+            if is_empty:
+                # A structurally bare worksheet (a blank/text/image placeholder a dashboard uses
+                # for spacing or a title) is not an unsupported *visual* -- there is simply nothing
+                # to rebuild. Classifying it precisely keeps it out of the "unsupported mark" count.
+                warnings.append(_warn(
+                    "worksheet", name,
+                    "empty worksheet (no fields on any shelf or encoding) -> nothing to rebuild"))
+            elif (mark or "").strip().lower() in _DEFER_MAP_MARKS or (geo_detail and map_meas):
+                warnings.append(_warn(
+                    "worksheet", name,
+                    f"spatial/custom-geometry map (mark '{mark}') deferred "
+                    f"(basics only: filled + symbol map) -> no visual emitted"))
+            else:
+                warnings.append(_warn(
+                    "worksheet", name,
+                    f"mark class '{mark}' / shelf layout not supported -> no visual emitted"))
+
+    title_text, title_dynamic = _parse_worksheet_title(ws)
     if visual_type == VT_UNSUPPORTED:
-        if (mark or "").strip().lower() in _DEFER_MAP_MARKS or (geo_detail and map_meas):
+        title_text = None
+    elif title_dynamic:
+        warnings.append(_warn(
+            "worksheet", name,
+            "dynamic title (embeds a field/parameter reference) not reproduced as static text; "
+            "the rebuilt visual keeps its default title"))
+        title_text = None
+
+    axis_titles = {}
+    if visual_type in _AXIS_TITLE_TYPES:
+        axis_titles = _parse_axis_titles(table, dims_rows, dims_cols, meas_rows, meas_cols)
+
+    # Reference / target / trend line annotations (KPI goals, average/percentile bands, trend
+    # fits) are a Tier-2 analytics concern: record them (additive) and disclose them so the
+    # rebuilt visual is never silently missing an author's target overlay. Gated on an emitted
+    # visual -- an unsupported worksheet is already wholly deferred, so no extra warning is added.
+    reference_lines = []
+    if visual_type != VT_UNSUPPORTED:
+        reference_lines = _parse_reference_lines(all_panes)
+        if reference_lines:
+            is_card = visual_type == VT_CARD
+            labels = ", ".join(dict.fromkeys(r["label"] for r in reference_lines))
             warnings.append(_warn(
                 "worksheet", name,
-                f"spatial/custom-geometry map (mark '{mark}') deferred "
-                f"(basics only: filled + symbol map) -> no visual emitted"))
-        else:
-            warnings.append(_warn(
-                "worksheet", name,
-                f"mark class '{mark}' / shelf layout not supported -> no visual emitted"))
+                "{0}(s) deferred (Tier-2 analytics): {1} -> the rebuilt {2} shows the value "
+                "without the target/trend overlay".format(
+                    "KPI target/goal" if is_card else "reference/target/trend line",
+                    labels,
+                    "card" if is_card else "visual")))
 
     return {
         "name": name,
@@ -644,10 +1736,17 @@ def _parse_worksheet(ws, index, ds_caption, warnings):
         "datasource_name": ds_default,
         "mark_class": mark,
         "visual_type": visual_type,
+        "title": title_text,
+        "axis_titles": axis_titles,
+        "reference_lines": reference_lines,
         "rows": rows,
         "cols": cols,
         "encodings": encodings,
         "filters": filters,
+        "swap_controls": swap_controls,
+        "fidelity_note": fidelity_note,
+        "combo_split": combo_split,
+        "sort": sort,
     }
 
 
@@ -670,9 +1769,18 @@ def _parse_dashboard(db, worksheet_names, warnings):
         except ValueError:
             pass
 
+    # A dashboard's <devicelayouts> hold alternate (phone/tablet) arrangements of the SAME
+    # worksheet zones. Their zones must be excluded or every worksheet is emitted twice and the
+    # canvas extent is corrupted by phone-scale coordinates; only the primary layout is faithful.
+    device_zones = set()
+    for holder in _findall_local(db, "devicelayouts"):
+        device_zones.update(_findall_local(holder, "zone"))
+
     zones = []
     ext_w = ext_h = 0.0
     for zone in _findall_local(db, "zone"):
+        if zone in device_zones:
+            continue
         x, y = _zone_num(zone, "x"), _zone_num(zone, "y")
         w, h = _zone_num(zone, "w"), _zone_num(zone, "h")
         if None not in (x, y, w, h) and w > 0 and h > 0:
@@ -700,7 +1808,102 @@ def _warn(scope, name, reason):
             "reason": "manual attention required: " + reason}
 
 
-def parse_twb(xml_text):
+def _parse_parameters(root):
+    """Index workbook parameters: ``{param_id: {"caption", "datatype", "members":[{value, alias}]}}``.
+
+    A Tableau parameter lives as a column in the reserved ``Parameters`` datasource; its id is the
+    bracket-stripped column ``name`` (e.g. ``Parameter 0013965827592222``), which is exactly what a
+    ``[Parameters].[<id>]`` reference resolves to. Member values serialise as quoted literals
+    (``"1"``) with a display ``alias`` (``line``) -- carried inline on ``<member>`` and/or in an
+    ``<aliases><alias key value>`` map -- so both forms are read and the literal stripped to match a
+    filter's selected member.
+    """
+    params = {}
+    datasources = []
+    for h in _children_local(root, "datasources"):
+        datasources.extend(_children_local(h, "datasource"))
+    for ds in datasources:
+        if (ds.get("name") or "") != "Parameters":
+            continue
+        for col in _findall_local(ds, "column"):
+            pid = _strip_brackets((col.get("name") or "").strip())
+            if not pid:
+                continue
+            alias_map = {}
+            for al in _findall_local(col, "alias"):
+                key = _strip_member_literal(al.get("key"))
+                if key:
+                    alias_map[key] = al.get("value")
+            members, seen = [], set()
+            for m in _findall_local(col, "member"):
+                val = _strip_member_literal(m.get("value"))
+                if val in seen:
+                    continue
+                seen.add(val)
+                members.append({"value": val, "alias": m.get("alias") or alias_map.get(val)})
+            for key, disp in alias_map.items():
+                if key not in seen:
+                    seen.add(key)
+                    members.append({"value": key, "alias": disp})
+            params[pid] = {
+                "caption": col.get("caption") or pid,
+                "datatype": (col.get("datatype") or "").lower(),
+                "members": members,
+            }
+    return params
+
+
+def _detect_sheet_swaps(worksheets, dashboards, params, warnings):
+    """Group worksheets that toggle within one dashboard zone via a shared swap parameter.
+
+    A *sheet swap* is the very common Tableau idiom where two (or more) worksheets are stacked in
+    the same dashboard zone and a parameter chooses which one shows, each sheet carrying a
+    visibility control filter (see :func:`_param_control_ref`) pinned to a distinct parameter
+    member. Power BI has no native parameter-driven sheet swap, so every worksheet is still rebuilt
+    as its own visual; this records the grouping (additive ``sheet_swaps`` IR) and emits ONE precise
+    note per group so the swap can be reproduced with a bookmark / field parameter (a Tier-2
+    interaction step). Sheet swaps show only one state in a single rendered frame, so they are
+    recognised here, deterministically, rather than left to any image-based review.
+    """
+    by_param = {}
+    for w in worksheets:
+        for sc in (w.get("swap_controls") or []):
+            by_param.setdefault(sc["param_id"], []).append((w["name"], sc))
+    swaps = []
+    for pid, entries in by_param.items():
+        if len({n for n, _ in entries}) < 2:
+            continue  # a lone gated sheet is a visibility toggle, not a swap pair
+        pinfo = params.get(pid, {})
+        caption = pinfo.get("caption", pid)
+        alias_by_value = {m["value"]: m.get("alias") for m in pinfo.get("members", [])}
+        assignments = []
+        for wname, sc in entries:
+            shown_for = [{"value": v, "alias": alias_by_value.get(v)}
+                         for v in (sc.get("members") or [])]
+            assignments.append({"worksheet": wname, "shown_for": shown_for})
+        names = {n for n, _ in entries}
+        host = None
+        for db in dashboards:
+            if len(names & {z["worksheet"] for z in db["zones"]}) >= 2:
+                host = db["name"]
+                break
+        swaps.append({"param_id": pid, "param_caption": caption,
+                      "dashboard": host, "assignments": assignments})
+        labels = "; ".join(
+            "'{0}' shown when '{1}' = {2}".format(
+                a["worksheet"], caption,
+                "/".join((s["alias"] or s["value"]) for s in a["shown_for"]) or "(a member)")
+            for a in assignments)
+        warnings.append(_warn(
+            "dashboard" if host else "workbook", host or caption,
+            "parameter-driven sheet swap on '{0}': {1}. Each worksheet is rebuilt as its own "
+            "visual; reproduce the dynamic swap with a Power BI bookmark or a field parameter "
+            "driving visual visibility (dynamic visibility is a Tier-2 interaction step).".format(
+                caption, labels)))
+    return swaps
+
+
+def parse_twb(xml_text, *, date_binding=None, row_count_binding=None):
     """Parse a Tableau ``.twb`` (workbook XML) into the normalized viz IR.
 
     Accepts ``str`` or ``bytes``; ``.twb`` files carry a UTF-8 BOM, so callers reading from
@@ -714,7 +1917,7 @@ def parse_twb(xml_text):
         xml_text = xml_text.lstrip("\ufeff")
     root = ET.fromstring(xml_text)
 
-    index, ds_caption = _build_field_index(root)
+    index, ds_caption, internal_fields = _build_field_index(root)
     warnings = []
 
     ws_holder = _children_local(root, "worksheets")
@@ -723,7 +1926,9 @@ def parse_twb(xml_text):
         ws_elems.extend(_children_local(h, "worksheet"))
     worksheets = []
     for ws in ws_elems:
-        parsed = _parse_worksheet(ws, index, ds_caption, warnings)
+        parsed = _parse_worksheet(ws, index, ds_caption, warnings,
+                                  internal_fields=internal_fields, date_binding=date_binding,
+                                  row_count_binding=row_count_binding)
         if parsed:
             worksheets.append(parsed)
     worksheet_names = {w["name"] for w in worksheets}
@@ -744,7 +1949,11 @@ def parse_twb(xml_text):
                     f"worksheet '{z['worksheet']}' is unsupported -> zone left empty"))
         dashboards.append(parsed)
 
-    return {"worksheets": worksheets, "dashboards": dashboards, "warnings": warnings}
+    params = _parse_parameters(root)
+    sheet_swaps = _detect_sheet_swaps(worksheets, dashboards, params, warnings)
+
+    return {"worksheets": worksheets, "dashboards": dashboards,
+            "sheet_swaps": sheet_swaps, "warnings": warnings}
 
 
 # -- PBIR field expression emission --------------------------------------------
@@ -813,6 +2022,7 @@ def _build_query_state(ws, model_table, field_map, warnings):
     label = ws["encodings"]["label"]
     size = ws["encodings"]["size"]
     detail = ws["encodings"]["detail"]
+    angle = ws["encodings"].get("angle")
 
     def categories(fs):
         return [f for f in fs if f["kind"] == "category"]
@@ -834,7 +2044,86 @@ def _build_query_state(ws, model_table, field_map, warnings):
         return kept
 
     state = {}
-    if vt in (VT_COLUMN, VT_BAR, VT_LINE):
+    if vt == VT_COMBO:
+        # Dual-axis combo: the shared dimension(s) form the Category axis; the column-family
+        # measures go to Y (primary axis) and the line-family measures to Y2 (secondary axis),
+        # per the split classified at parse time. A colour dimension is the column Series/legend.
+        split = ws.get("combo_split") or {}
+        cat = drop_calc_axis(_dedupe(categories(rows) + categories(cols)))
+        y_meas = _dedupe(split.get("Y", []))
+        y2_meas = _dedupe(split.get("Y2", []))
+        series = [color] if (color and color["kind"] == "category"
+                             and not color["is_calc"]) else []
+        cat = [f for f in cat if f not in series]
+        if cat:
+            state["Category"] = {"projections": _role_projections(
+                cat, model_table, field_map, used_refs)}
+        if y_meas:
+            state["Y"] = {"projections": _role_projections(
+                y_meas, model_table, field_map, used_refs)}
+        if y2_meas:
+            state["Y2"] = {"projections": _role_projections(
+                y2_meas, model_table, field_map, used_refs)}
+        if series:
+            state["Series"] = {"projections": _role_projections(
+                series, model_table, field_map, used_refs)}
+    elif vt == VT_WATERFALL:
+        # Running-total Gantt waterfall hack -> native waterfallChart. Category = the dimension
+        # axis, Y = the base measure (Power BI recomputes the cumulative; the running-total pill
+        # already resolved to its base aggregation). A colour DIMENSION maps to the waterfall's
+        # Breakdown role (segments each bar); the per-step gantt size delta is dropped.
+        cat = drop_calc_axis(_dedupe(categories(rows) + categories(cols)))
+        val = _dedupe(values(rows) + values(cols))
+        breakdown = [color] if (color and color["kind"] == "category"
+                                and not color["is_calc"]) else []
+        cat = [f for f in cat if f not in breakdown]
+        if cat:
+            state["Category"] = {"projections": _role_projections(
+                cat, model_table, field_map, used_refs)}
+        if val:
+            state["Y"] = {"projections": _role_projections(
+                val, model_table, field_map, used_refs)}
+        if breakdown:
+            state["Breakdown"] = {"projections": _role_projections(
+                breakdown, model_table, field_map, used_refs)}
+    elif vt == VT_DONUT:
+        # Dual-axis pie/donut hack -> native donutChart. The real slices live on the Pie pane's
+        # colour (legend -> Category) + wedge-size (angle -> Y); the MIN(0) spacer axes that fake
+        # the donut ring are ignored. Same Category/Y role shape as pieChart.
+        legend = drop_calc_axis(_dedupe(
+            [color] if color and color["kind"] == "category" else []))
+        vals = _dedupe(
+            ([angle] if angle and angle["kind"] == "value" else [])
+            + ([size] if size and size["kind"] == "value" else [])
+            + ([label] if label and label["kind"] == "value" else []))
+        if legend:
+            state["Category"] = {"projections": _role_projections(
+                legend, model_table, field_map, used_refs)}
+        if vals:
+            state["Y"] = {"projections": _role_projections(
+                vals[:1], model_table, field_map, used_refs)}
+    elif vt == VT_RIBBON:
+        # Bump / rank hack -> native ribbonChart. Category = the ordinal/time axis dimension,
+        # Series = the legend dimension (the ranked members), Y = the base measure (Power BI
+        # recomputes the rank from it). The INDEX()/RANK() table-calc rank/spacer axis pills are
+        # dropped (they are value-role calc artifacts, never categories, so they never reach a
+        # role). Role keys Category/Series/Y verified against real Microsoft PBIR ribbonChart files.
+        series = [color] if (color and color["kind"] == "category"
+                             and not color["is_calc"]) else []
+        cat = drop_calc_axis(_dedupe(categories(rows) + categories(cols)))
+        cat = [f for f in cat if f not in series]
+        ribbon_val = next((f for f in (detail, size, label)
+                           if f and f["kind"] == "value" and not f["is_calc"]), None)
+        if cat:
+            state["Category"] = {"projections": _role_projections(
+                cat, model_table, field_map, used_refs)}
+        if ribbon_val is not None:
+            state["Y"] = {"projections": _role_projections(
+                [ribbon_val], model_table, field_map, used_refs)}
+        if series:
+            state["Series"] = {"projections": _role_projections(
+                series, model_table, field_map, used_refs)}
+    elif vt in (VT_COLUMN, VT_BAR):
         cat = drop_calc_axis(_dedupe(categories(rows) + categories(cols)))
         val = _dedupe(values(rows) + values(cols))
         series = [color] if (color and color["kind"] == "category"
@@ -849,10 +2138,47 @@ def _build_query_state(ws, model_table, field_map, warnings):
         if series:
             state["Series"] = {"projections": _role_projections(
                 series, model_table, field_map, used_refs)}
+    elif vt in (VT_LINE, VT_AREA):
+        # A line/area chart's x-axis is the continuous shelf: Tableau puts the date/continuous
+        # dimension on Columns. A discrete dimension on the OTHER shelf (Rows) panes the line
+        # per member -- a small multiple (trellis). That maps to Power BI's native Small
+        # multiples well (one pane per member), which is faithful to the Tableau layout; a
+        # colour-encoding dimension is the legend/Series. Keeping the date on Category prevents
+        # the discrete dimension from displacing the date off the x-axis.
+        col_cats = drop_calc_axis(_dedupe(categories(cols)))
+        row_cats = drop_calc_axis(_dedupe(categories(rows)))
+        val = _dedupe(values(rows) + values(cols))
+        color_series = [color] if (color and color["kind"] == "category"
+                                   and not color["is_calc"]) else []
+        if col_cats:
+            cat = col_cats
+            small = row_cats          # rows paning dimension -> small multiples (trellis)
+            series = color_series     # colour legend -> series
+        else:
+            cat = row_cats
+            small = []
+            series = color_series
+        small = [f for f in small if f not in cat]
+        series = [f for f in series if f not in cat and f not in small]
+        if cat:
+            state["Category"] = {"projections": _role_projections(
+                cat, model_table, field_map, used_refs)}
+        if val:
+            state["Y"] = {"projections": _role_projections(
+                val, model_table, field_map, used_refs)}
+        if series:
+            state["Series"] = {"projections": _role_projections(
+                series, model_table, field_map, used_refs)}
+        if small:
+            state["SmallMultiples"] = {"projections": _role_projections(
+                small, model_table, field_map, used_refs)}
     elif vt == VT_MATRIX:
         row_dims = drop_calc_axis(_dedupe(categories(rows)))
         col_dims = drop_calc_axis(_dedupe(categories(cols)))
+        # a highlight table carries its measure on the colour (saturation) encoding; in a Tier-1
+        # matrix that measure is the displayed Values (the colour styling itself is deferred).
         vals = _dedupe(values(rows) + values(cols)
+                       + ([color] if color and color["kind"] == "value" else [])
                        + ([label] if label and label["kind"] == "value" else []))
         if row_dims:
             state["Rows"] = {"projections": _role_projections(
@@ -868,6 +2194,12 @@ def _build_query_state(ws, model_table, field_map, warnings):
             categories(rows) + categories(cols))) + _dedupe(
             values(rows) + values(cols)
             + ([label] if label and label["kind"] == "value" else []))
+        if not ordered:
+            # Encoding-only display (Automatic/text mark with the field(s) on label / colour /
+            # detail and no axis pills): list whatever single dimension was placed on the marks
+            # card as a one-column table. Calculated pills are dropped (no faithful model binding).
+            ordered = _dedupe([f for f in (label, color, detail)
+                               if f and f["kind"] == "category" and not f["is_calc"]])
         if ordered:
             state["Values"] = {"projections": _role_projections(
                 ordered, model_table, field_map, used_refs)}
@@ -907,7 +2239,8 @@ def _build_query_state(ws, model_table, field_map, warnings):
             + ([color] if color and color["kind"] == "category" else [])))
         vals = _dedupe(values(rows) + values(cols)
                        + ([label] if label and label["kind"] == "value" else [])
-                       + ([size] if size and size["kind"] == "value" else []))
+                       + ([size] if size and size["kind"] == "value" else [])
+                       + ([angle] if angle and angle["kind"] == "value" else []))
         if legend:
             state["Category"] = {"projections": _role_projections(
                 legend, model_table, field_map, used_refs)}
@@ -922,8 +2255,9 @@ def _build_query_state(ws, model_table, field_map, warnings):
             state["Values"] = {"projections": _role_projections(
                 vals, model_table, field_map, used_refs)}
     elif vt == VT_FILLED_MAP:
-        # choropleth: the geo-role dimension on Detail is the Location, a single measure
-        # (prefer the color saturation encoding, else any available) drives Color.
+        # Shape map (choropleth): the geo-role dimension on Detail is the Category (location),
+        # a single measure (prefer the colour saturation encoding, else any available) drives
+        # the Value role (Power BI's shapeMap names its colour-saturation well "Value").
         loc = drop_calc_axis(_dedupe(
             [detail] if detail and detail["kind"] == "category" else []))
         meas = _dedupe(
@@ -932,10 +2266,10 @@ def _build_query_state(ws, model_table, field_map, warnings):
             + ([size] if size and size["kind"] == "value" else [])
             + ([label] if label and label["kind"] == "value" else []))
         if loc:
-            state["Location"] = {"projections": _role_projections(
+            state["Category"] = {"projections": _role_projections(
                 loc, model_table, field_map, used_refs)}
         if meas:
-            state["Color"] = {"projections": _role_projections(
+            state["Value"] = {"projections": _role_projections(
                 meas[:1], model_table, field_map, used_refs)}
     elif vt == VT_MAP:
         # symbol / bubble map: geo Location, a measure on Size (prefer the size encoding),
@@ -967,14 +2301,18 @@ def _query_state_complete(vt, state):
     Guards against a visual whose fields were all dropped by aggregation/type/calc guards
     (e.g. a line chart left with a measure but no category) being emitted as an empty shell.
     """
-    if vt in (VT_COLUMN, VT_BAR, VT_LINE, VT_PIE):
+    if vt in (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA, VT_PIE, VT_WATERFALL, VT_DONUT, VT_RIBBON):
         return "Category" in state and "Y" in state
+    if vt == VT_COMBO:
+        return "Category" in state and "Y" in state and "Y2" in state
     if vt == VT_SCATTER:
         return "X" in state and "Y" in state
     if vt == VT_CARD:
         return "Values" in state
     if vt == VT_FILLED_MAP:
-        return "Location" in state and "Color" in state
+        # A choropleth needs a Location (Category); the colour-saturation Value is optional --
+        # a geo dimension on Detail with no measure is a valid location-only map (uniform fill).
+        return "Category" in state
     if vt == VT_MAP:
         return "Location" in state and ("Size" in state or "Color" in state)
     if vt == VT_MATRIX:
@@ -989,28 +2327,325 @@ def _pbir_vtype(vt, state):
     if vt == VT_CARD:
         n = len(state.get("Values", {}).get("projections", []))
         return "multiRowCard" if n > 1 else "card"
+    # A colour DIMENSION on a bar/column mark stacks its segments within each bar by default in
+    # Tableau ("Stack marks" is on by default). Power BI's clustered* charts render the same
+    # legend side-by-side, so when a Series (legend) dimension is present the faithful default is
+    # the stacked* variant -- preserving the Tableau layout rather than silently re-rendering a
+    # stacked chart as grouped. (Default-stacking behaviour fact-checked against Tableau docs.)
+    if vt in (VT_COLUMN, VT_BAR) and state.get("Series", {}).get("projections"):
+        return "stackedColumnChart" if vt == VT_COLUMN else "stackedBarChart"
     return _VT_TO_PBIR[vt]
 
 
+# -- Tier-2 image-oracle seam: per-visual candidate record -------------------------------------
+# The deterministic Tier-1 engine commits to exactly ONE visual type per worksheet. For the later,
+# agent-driven image-oracle pass, each emitted MAIN visual additionally records the small set of
+# Tier-1 types the oracle is ALLOWED to switch to, a confidence in the deterministic pick, the
+# read-only field truth (the oracle must NEVER rebind fields -- those are exact-bound to the model),
+# the faithful position/z-order, and a hack flag for non-standard compositions. This is an ADDITIVE
+# IR artifact (``ir["candidate_records"]``); it does not change the emitted PBIR parts at all.
+def _orientation_flip(pbir_type):
+    flips = {
+        "clusteredColumnChart": "clusteredBarChart",
+        "clusteredBarChart": "clusteredColumnChart",
+        "stackedColumnChart": "stackedBarChart",
+        "stackedBarChart": "stackedColumnChart",
+    }
+    return flips.get(pbir_type)
+
+
+# vt -> (extra candidate PBIR types beyond chosen+orientation-flip, confidence, hack flag).
+# "medium" marks a heuristic / hack reroute or a genuine visual look-alike an image can
+# disambiguate; "high" marks a pick the shelf layout makes unambiguous. The applier may only ever
+# switch a visual to a type that appears in its candidate list.
+_CANDIDATE_ALTS = {
+    VT_DONUT: (["pieChart"], "medium", "dual-axis pie/donut"),
+    VT_PIE: (["donutChart"], "medium", None),
+    VT_WATERFALL: (["clusteredColumnChart"], "medium", "running-total Gantt"),
+    VT_RIBBON: (["clusteredColumnChart", "lineChart"], "medium", "bump/rank"),
+    VT_COMBO: (["clusteredColumnChart", "lineChart"], "medium", "dual-axis combo"),
+    VT_AREA: (["lineChart"], "medium", None),
+    VT_LINE: (["areaChart"], "high", None),
+    VT_FILLED_MAP: (["map"], "medium", None),
+    VT_MAP: (["shapeMap"], "medium", None),
+    VT_TABLE: (["pivotTable"], "medium", None),
+    VT_MATRIX: (["tableEx"], "medium", None),
+}
+
+
+def _candidate_plan(vt, chosen_pbir):
+    """(ranked candidate PBIR types [chosen first], confidence, hack flag) for a visual."""
+    candidates = [chosen_pbir]
+    flip = _orientation_flip(chosen_pbir)
+    if flip:
+        candidates.append(flip)
+    extra, confidence, hack = _CANDIDATE_ALTS.get(vt, ([], "high", None))
+    for c in extra:
+        if c not in candidates:
+            candidates.append(c)
+    return candidates, confidence, hack
+
+
+def _visual_field_summary(query_state):
+    """``{role: [queryRef, ...]}`` of the EXACT-bound fields -- the oracle's read-only truth."""
+    out = {}
+    for role, role_obj in (query_state or {}).items():
+        if isinstance(role_obj, dict):
+            refs = [p.get("queryRef") for p in role_obj.get("projections", [])
+                    if p.get("queryRef")]
+            if refs:
+                out[role] = refs
+    return out
+
+
+def _candidate_record(page_name, vname, ws, vtype, state, position, page_display=None):
+    candidates, confidence, hack = _candidate_plan(ws["visual_type"], vtype)
+    return {
+        "page": page_name,
+        "page_display": page_display or page_name,
+        "visual": vname,
+        "worksheet": ws["name"],
+        "visual_type": vtype,
+        "candidates": candidates,
+        "confidence": confidence,
+        "hack": hack,
+        "fields": _visual_field_summary(state),
+        "position": position,
+    }
+
+
 # -- PBIR JSON part assembly ---------------------------------------------------
-def _visual_json(name, vtype, position, query_state):
+def _sort_definition(ws, state, model_table, field_map):
+    """Build a PBIR ``sortDefinition`` from a worksheet's ``<computed-sort>``.
+
+    Power BI puts the sort on ``visual.query.sortDefinition`` (a sibling of ``queryState``) as an
+    ordered ``sort`` array of ``{field, direction}`` (direction ``"Ascending"``/``"Descending"``),
+    where ``field`` reuses the exact same expression shape as a projection. To stay
+    warn-never-wrong we emit a sort ONLY when the sort-by field is already bound as a projection in
+    this visual -- sorting by an unbound field would be a dangling reference. Returns ``None`` when
+    there is no computed-sort or the sort-by field is not bound here.
+    """
+    sort = ws.get("sort")
+    if not sort:
+        return None
+    expr, _, _ = _field_expression(sort["field"], model_table, field_map)
+    bound = [p["field"]
+             for role in state.values() if isinstance(role, dict)
+             for p in role.get("projections", [])]
+    if expr not in bound:
+        return None
+    return {"sort": [{"field": expr, "direction": sort["direction"]}],
+            "isDefaultSort": False}
+
+
+def _axis_objects(axis_titles):
+    """Build the data-plane ``visual.objects`` categoryAxis/valueAxis entries for author-overridden
+    axis titles. Each axis object is ``[{"properties": {...}}]`` (no ``selector`` needed for a
+    global override). A blanked title (``hide``) emits ``showAxisTitle:false``; a custom caption
+    emits ``titleText`` (single-quoted semantic-query literal) + ``showAxisTitle:true``. Shape
+    verified against multiple real MS PBIR visual.json files + the PBIR enumerations reference.
+    """
+    objects = {}
+    for axis in ("categoryAxis", "valueAxis"):
+        spec = axis_titles.get(axis)
+        if not spec:
+            continue
+        props = {}
+        if spec.get("hide"):
+            props["showAxisTitle"] = {"expr": {"Literal": {"Value": "false"}}}
+        elif spec.get("text"):
+            props["titleText"] = {
+                "expr": {"Literal": {"Value": _semantic_string_literal(spec["text"])}}}
+            props["showAxisTitle"] = {"expr": {"Literal": {"Value": "true"}}}
+        if props:
+            objects[axis] = [{"properties": props}]
+    return objects
+
+
+def _visual_json(name, vtype, position, query_state, sort_definition=None,
+                 filter_config=None, title=None, axis_titles=None):
     visual = {"visualType": vtype}
     if query_state:
         visual["query"] = {"queryState": query_state}
+        if sort_definition:
+            visual["query"]["sortDefinition"] = sort_definition
     visual["drillFilterOtherVisuals"] = True
-    return {
+    # Author-overridden axis-title captions (Tier-1 structural labels): the data-plane
+    # ``visual.objects.categoryAxis`` / ``valueAxis`` entries. Shape verified against multiple real
+    # MS PBIR visual.json files + the PBIR enumerations reference (``titleText`` = single-quoted
+    # semantic-query literal; ``showAxisTitle`` = quoted boolean). Only the TITLE is touched -- the
+    # whole-axis ``show`` toggle is deliberately left alone (a different property).
+    if axis_titles:
+        axis_objects = _axis_objects(axis_titles)
+        if axis_objects:
+            visual["objects"] = axis_objects
+    # Structural title text (Tier-1): the worksheet's authored caption -> the visual's container
+    # title. Shape verified against the official PBIR visualContainer schema + real reports: a
+    # single-quoted semantic-query string literal under visualContainerObjects.title; the
+    # auto-generated field-name subtitle is suppressed so only the author's title shows. Font /
+    # colour / size styling is deliberately omitted (Tier-2).
+    if title:
+        visual["visualContainerObjects"] = {
+            "title": [{"properties": {
+                "show": {"expr": {"Literal": {"Value": "true"}}},
+                "text": {"expr": {"Literal": {"Value": _semantic_string_literal(title)}}},
+            }}],
+            "subTitle": [{"properties": {
+                "show": {"expr": {"Literal": {"Value": "false"}}},
+            }}],
+        }
+    out = {
         "$schema": SCHEMA_VISUAL,
         "name": name,
         "position": position,
         "visual": visual,
     }
+    # ``filterConfig`` is a TOP-LEVEL key on visual.json (sibling of ``visual``) -- verified
+    # against real PBIR slicer files. On a slicer it carries the slicer's pre-selected members.
+    if filter_config:
+        out["filterConfig"] = filter_config
+    return out
 
 
-def _slicer_json(name, field, position, model_table, field_map):
+# -- applied filter selection -> slicer filterConfig ---------------------------
+# When a Tableau worksheet filter narrows a field to specific members or a numeric range, carry
+# that selection onto the rebuilt slicer so the report opens on the SAME filtered view. The PBIR
+# JSON shapes below are verified against real Microsoft/community PBIR reports + the published
+# semanticQuery schema (categorical ``In`` / ``Not`` ``In`` with ``isInvertedSelectionMode``;
+# numeric ``Advanced`` ``Comparison``). Warn-never-wrong governs WHICH selections we emit (see
+# ``_slicer_filter_config``): a wrong pre-filter would show wrong data, so anything we cannot bind
+# faithfully (date-part members, the ``%null%`` sentinel, fixed date ranges) is left at "show all".
+_FILTER_SOURCE_ALIAS = "f"
+
+
+def _semantic_string_literal(value):
+    """A Power BI semantic-query string literal: embedded single quotes, inner apostrophe doubled
+    (``O'Brien`` -> ``'O''Brien'``)."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _semantic_numeric_literal(value):
+    """A semantic-query numeric literal (``24`` -> ``24L``, ``2.4`` -> ``2.4D``), or ``None`` when
+    the token is not a clean number."""
+    s = (value or "").strip()
+    try:
+        int(s)
+        return s + "L"
+    except (TypeError, ValueError):
+        pass
+    try:
+        float(s)
+        return s + "D"
+    except (TypeError, ValueError):
+        return None
+
+
+def _filter_column_ref(entity, prop, *, source=None):
+    src = {"Source": source} if source else {"Entity": entity}
+    return {"Column": {"Expression": {"SourceRef": src}, "Property": prop}}
+
+
+def _filter_container(entity, prop, condition, name, *, ftype, inverted=False):
+    """One ``filterConfig.filters[]`` container (verified shape: ``name``/``field``/``type``/
+    ``filter`` with ``Version:2``, a ``From[]`` source alias, and a single ``Where[].Condition``)."""
+    container = {
+        "name": name,
+        "field": _filter_column_ref(entity, prop),
+        "type": ftype,
+        "filter": {
+            "Version": 2,
+            "From": [{"Name": _FILTER_SOURCE_ALIAS, "Entity": entity, "Type": 0}],
+            "Where": [{"Condition": condition}],
+        },
+        "howCreated": "User",
+    }
+    if inverted:
+        inverted_flag = {"expr": {"Literal": {"Value": "true"}}}
+        container["objects"] = {
+            "general": [{"properties": {"isInvertedSelectionMode": inverted_flag}}]}
+    return container
+
+
+def _categorical_condition(entity, prop, values, *, exclude):
+    col = _filter_column_ref(entity, prop, source=_FILTER_SOURCE_ALIAS)
+    in_expr = {"In": {
+        "Expressions": [col],
+        "Values": [[{"Literal": {"Value": _semantic_string_literal(v)}}] for v in values],
+    }}
+    return {"Not": {"Expression": in_expr}} if exclude else in_expr
+
+
+def _range_condition(entity, prop, lo, hi):
+    col = _filter_column_ref(entity, prop, source=_FILTER_SOURCE_ALIAS)
+
+    def _cmp(kind, lit):
+        # ComparisonKind 2 = GreaterThanOrEqual, 4 = LessThanOrEqual (inclusive bounds).
+        return {"Comparison": {"ComparisonKind": kind, "Left": col,
+                               "Right": {"Literal": {"Value": lit}}}}
+    if lo is not None and hi is not None:
+        return {"And": {"Left": _cmp(2, lo), "Right": _cmp(4, hi)}}
+    return _cmp(2, lo) if lo is not None else _cmp(4, hi)
+
+
+def _slicer_filter_config(field, model_table, field_map, name, warnings):
+    """Build a slicer ``filterConfig`` from an applied Tableau filter selection/range, else ``None``.
+
+    Warn-never-wrong: emit a pre-selection ONLY for shapes that bind faithfully AND whose PBIR JSON
+    is verified against real reports -- a categorical include/exclude on a STRING dimension, or a
+    numeric range. Date-part categoricals (e.g. month ``'4'`` / year ``'2026'``), the ``%null%``
+    sentinel, and fixed date ranges fall through to the slicer's faithful "show all" default with a
+    fidelity note (never a possibly-wrong pre-filter).
+    """
+    entity, prop, binding = _apply_override(field, model_table, field_map)
+    if binding != "column":
+        return None
+    dt = (field.get("datatype") or "").lower()
+    cap = field.get("caption") or prop
+    sel, rng = field.get("selection"), field.get("range")
+    if sel:
+        if dt not in ("string", "boolean"):
+            warnings.append(_warn(
+                "filter", cap,
+                "applied categorical selection left at default (date-part / numeric member "
+                "values are not faithfully bindable to the raw column)"))
+            return None
+        values = [v for v in sel["values"] if v != "%null%"]
+        if not values:
+            warnings.append(_warn(
+                "filter", cap,
+                "applied selection reduced to null/sentinel members only; left at default"))
+            return None
+        cond = _categorical_condition(entity, prop, values,
+                                      exclude=(sel["mode"] == "exclude"))
+        return {"filters": [_filter_container(
+            entity, prop, cond, name, ftype="Categorical",
+            inverted=(sel["mode"] == "exclude"))]}
+    if rng:
+        if dt in _NUMERIC_TYPES:
+            lo = (_semantic_numeric_literal(rng.get("min"))
+                  if rng.get("min") is not None else None)
+            hi = (_semantic_numeric_literal(rng.get("max"))
+                  if rng.get("max") is not None else None)
+            if lo is None and hi is None:
+                return None
+            cond = _range_condition(entity, prop, lo, hi)
+            return {"filters": [_filter_container(
+                entity, prop, cond, name, ftype="Advanced")]}
+        warnings.append(_warn(
+            "filter", cap,
+            "applied date range left at default (date range filter shape deferred "
+            "to a later pass)"))
+        return None
+    return None
+
+
+def _slicer_json(name, field, position, model_table, field_map, *, warnings=None):
     expr, qref, nref = _field_expression(field, model_table, field_map)
     state = {"Values": {"projections": [
         {"field": expr, "queryRef": qref, "nativeQueryRef": nref}]}}
-    return _visual_json(name, "slicer", position, state)
+    fc = _slicer_filter_config(field, model_table, field_map, name + "-sel",
+                               warnings if warnings is not None else [])
+    return _visual_json(name, "slicer", position, state, filter_config=fc)
 
 
 def _position(x, y, w, h, z=0, tab=0):
@@ -1223,6 +2858,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     parts = {}
     ws_by_name = {w["name"]: w for w in ir["worksheets"]}
     warnings = []
+    records = []
 
     parts["definition.pbir"] = _dumps({
         "$schema": SCHEMA_DEFINITION_PROPERTIES,
@@ -1264,10 +2900,15 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             page_ws.append(ws)
             x, y, w, h = _scale_zone(zone, ref_w, ref_h)
             vname = _sanitize(f"v-{page_name}-{i}-{ws['name']}")
+            vtype = _pbir_vtype(ws["visual_type"], state)
+            pos = _position(x, y, w, h, tab=i)
             visuals.append(_visual_json(
-                vname, _pbir_vtype(ws["visual_type"], state),
-                _position(x, y, w, h, tab=i), state))
-        visuals += _emit_slicers(page_ws, page_name, model_table, field_map)
+                vname, vtype, pos, state,
+                _sort_definition(ws, state, model_table, field_map),
+                title=ws.get("title"), axis_titles=ws.get("axis_titles")))
+            records.append(_candidate_record(page_name, vname, ws, vtype, state, pos,
+                                             page_display=db["name"] or page_name))
+        visuals += _emit_slicers(page_ws, page_name, model_table, field_map, warnings)
         if not visuals:
             warnings.append(_warn("dashboard", db["name"],
                                   "no supported visuals on this dashboard"))
@@ -1285,10 +2926,16 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 "worksheet", ws["name"],
                 f"{ws['visual_type']} visual has no usable field bindings (skipped)"))
             continue
+        vname = _sanitize("v-" + ws["name"])
+        vtype = _pbir_vtype(ws["visual_type"], state)
+        pos = _position(40, 40, 880, 620)
         main = _visual_json(
-            _sanitize("v-" + ws["name"]), _pbir_vtype(ws["visual_type"], state),
-            _position(40, 40, 880, 620), state)
-        visuals = [main] + _emit_slicers([ws], page_name, model_table, field_map)
+            vname, vtype, pos, state,
+            _sort_definition(ws, state, model_table, field_map),
+            title=ws.get("title"), axis_titles=ws.get("axis_titles"))
+        records.append(_candidate_record(page_name, vname, ws, vtype, state, pos,
+                                         page_display=ws["name"]))
+        visuals = [main] + _emit_slicers([ws], page_name, model_table, field_map, warnings)
         _emit_page(parts, page_name, ws["name"], visuals)
         page_order.append(page_name)
 
@@ -1299,10 +2946,11 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     })
 
     ir.setdefault("warnings", []).extend(warnings)
+    ir["candidate_records"] = records
     return parts
 
 
-def _emit_slicers(ws_list, page_name, model_table, field_map):
+def _emit_slicers(ws_list, page_name, model_table, field_map, warnings=None):
     visuals = []
     fields = _filter_slicer_fields(ws_list)
     for i, f in enumerate(fields):
@@ -1312,22 +2960,37 @@ def _emit_slicers(ws_list, page_name, model_table, field_map):
         vname = _sanitize(f"slicer-{page_name}-{i}-{f['property']}")
         visuals.append(_slicer_json(
             vname, f, _position(PAGE_WIDTH - 220, y, 200, 100, z=1, tab=100 + i),
-            model_table, field_map))
+            model_table, field_map, warnings=warnings))
     return visuals
 
 
 def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
-                        model_table=None, field_map=None):
+                        model_table=None, field_map=None, date_binding=None,
+                        row_count_binding=None):
     """One-call convenience: parse ``.twb`` text and emit the PBIR parts.
 
     Returns ``{"ir": ..., "parts": ..., "warnings": ...}``. ``parts`` is the
     ``{relative_path: text}`` PBIR definition; write it to a ``<report_name>.Report`` folder
     or base64-encode each part for the Fabric report *Update Definition* API.
+
+    ``date_binding`` (optional) carries the model build's date facts -- ``date_table`` (the marked
+    calendar table name), ``active_keys`` (the fact date column(s) the calendar relates to ACTIVELY,
+    any spelling), ``grain_columns`` (Tableau date-part -> calendar column; defaults to the standard
+    calendar columns) and ``key_column`` (the calendar key, default ``"Date"``). When given, a date
+    axis pill on the active business date is rebound to the shared Date table so time intelligence
+    runs through the calendar; without it the standalone path is unchanged.
+
+    ``row_count_binding`` (optional) carries the model build's row-count (COUNTROWS) measures --
+    ``{"measures": {<table name>: {"entity": ..., "measure": ...}}, "default": {"entity": ...,
+    "measure": ...}}``. When given, an implicit row count (object-id ``COUNT(*)`` or legacy
+    ``[Number of Records]``) binds to the matching COUNTROWS measure; without it the count is left
+    unbound with a precise warning (warn-never-wrong), never a dangling/guessed binding.
     """
-    ir = parse_twb(xml_text)
+    ir = parse_twb(xml_text, date_binding=date_binding, row_count_binding=row_count_binding)
     parts = emit_pbir(ir, dataset_name=dataset_name, report_name=report_name,
                       model_table=model_table, field_map=field_map)
-    return {"ir": ir, "parts": parts, "warnings": ir["warnings"]}
+    return {"ir": ir, "parts": parts, "warnings": ir["warnings"],
+            "candidate_records": ir.get("candidate_records", [])}
 
 
 # -- command-line entry point --------------------------------------------------
