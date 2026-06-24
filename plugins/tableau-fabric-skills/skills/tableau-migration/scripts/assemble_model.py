@@ -1067,6 +1067,102 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     return {"parts": parts, "report": report}
 
 
+# -- local-POC CSV import path ------------------------------------------------
+# Connector class used to retag a descriptor so select_storage_mode routes it down the proven
+# flat-file Import branch (Csv.Document), instead of the land-to-Delta + DirectLake fallback that
+# would require a Fabric lakehouse this skill never writes to.
+_LOCAL_CSV_CLASS = "csv"
+
+
+def _normalize_match_key(name):
+    """Lowercased, bracket/quote/schema-stripped key for matching a relation to a CSV name."""
+    raw = str(name or "")
+    for ch in '"[]':
+        raw = raw.replace(ch, "")
+    raw = raw.rsplit(".", 1)[-1]  # drop a schema qualifier (e.g. "Extract".Foo -> Foo)
+    return raw.strip().lower()
+
+
+def _match_csv_path(relation, csv_index, *, single_default=None):
+    """Resolve the local CSV path for one relation from a ``{normalized_name: path}`` index.
+
+    Tries the relation's display name then its ``item`` by normalized key. ``single_default`` is
+    used when the model has exactly one table and exactly one CSV (the dominant single-fact-table
+    extract case), so a name mismatch between the ``.tds`` table and the ``.hyper`` table still
+    binds. Returns ``None`` on a miss.
+    """
+    for cand in (_table_display(relation), relation.get("item")):
+        key = _normalize_match_key(cand)
+        if key in csv_index:
+            return csv_index[key]
+    return single_default
+
+
+def assemble_local_import_model(descriptor, *, model_name, table_csv_paths, calcs=None,
+                                dim_calcs=None, **kwargs):
+    """Assemble a LOCAL Import semantic model whose tables read from on-disk CSV files.
+
+    This is the proof-of-concept landing path: instead of land-to-Delta + DirectLake (which needs a
+    Fabric lakehouse this skill never writes to), each table's data is supplied as a local CSV --
+    extracted from the datasource's ``.hyper`` by ``hyper_reader`` or brought by the user. The parsed
+    descriptor is retagged as a flat-file CSV source and handed to the proven ``assemble_import_model``
+    generator, so typed columns, calc->DAX measures, the Date dimension, relationships and parameters
+    are all reused unchanged. Each emitted table points its ``Csv.Document`` partition at its matched
+    local CSV (a real, typed, deploy-ready Import body).
+
+    ``table_csv_paths`` maps a (schema-insensitive) table name to an absolute CSV path. A table with
+    no matching CSV is still emitted (as a clearly-flagged path scaffold) and recorded under the
+    additive ``report["local_import"]`` key, so nothing is silently dropped. Returns the same
+    ``{"parts", "report"}`` shape as ``assemble_import_model`` plus that key.
+    """
+    csv_index = {_normalize_match_key(k): v for k, v in (table_csv_paths or {}).items()}
+    csv_values = list((table_csv_paths or {}).values())
+
+    table_rels = [r for r in descriptor.get("relations", [])
+                  if r.get("kind") in ("table", "custom_sql")]
+    # When there is exactly one table and exactly one CSV, bind them directly even if the names
+    # differ (a single-fact-table extract whose .hyper table is named differently from the .tds).
+    single_default = csv_values[0] if (len(table_rels) == 1 and len(csv_values) == 1) else None
+
+    surviving, matched, unmatched, new_relations = [], [], [], []
+    for rel in table_rels:
+        disp = _table_display(rel)
+        surviving.append(disp)
+        csv_path = _match_csv_path(rel, csv_index, single_default=single_default)
+        rel2 = {**rel, "connection": None}  # one CSV connection -> no per-table routing
+        if csv_path:
+            rel2["flatfile_path"] = csv_path
+            matched.append({"table": disp, "csv_path": csv_path})
+        else:
+            unmatched.append(disp)
+        new_relations.append(rel2)
+
+    surviving_set = set(surviving)
+    filt_rels = [r for r in (descriptor.get("relationships") or [])
+                 if r.get("from_table") in surviving_set and r.get("to_table") in surviving_set]
+
+    local_desc = {
+        **descriptor,
+        "connection_class": _LOCAL_CSV_CLASS,
+        "named_connection_count": 1,
+        "relations": new_relations,
+        "relationships": filt_rels,
+        "flatfile_path": None, "flatfile_filename": None, "flatfile_directory": None,
+    }
+
+    kwargs.setdefault("relationships", filt_rels)
+    result = assemble_import_model(local_desc, model_name=model_name, calcs=calcs,
+                                   dim_calcs=dim_calcs, **kwargs)
+    result["report"]["local_import"] = {
+        "data_source": "local-csv",
+        "matched": matched,
+        "unmatched_tables": unmatched,
+        "table_count": len(surviving),
+        "matched_count": len(matched),
+    }
+    return result
+
+
 def assemble_directlake_model(*, model_name, tables, measures_tmdl, expression_name,
                               directlake_url, relationships_tmdl=None,
                               hierarchies=None, display_folders=None, rls_roles=None,
@@ -1489,9 +1585,60 @@ def _split_calcs_by_role(calcs):
     return measure_calcs, dim_calcs
 
 
+def _extract_local_csv(source, model_name, write_to):
+    """Auto-extract ``source``'s embedded ``.hyper`` to one local CSV per table.
+
+    Lazily imports the optional ``hyper_reader`` (which itself lazily imports ``tableauhyperapi``),
+    so the core stays stdlib-only. CSVs land in ``<write_to>/<model_name>.Data`` when ``write_to`` is
+    given, else a temp dir. Returns ``{table_name: csv_path}``.
+    """
+    import os
+    import tempfile
+    try:
+        from . import hyper_reader as _hr
+    except ImportError:
+        import hyper_reader as _hr
+    if not (isinstance(source, (str, os.PathLike)) and os.path.exists(os.fspath(source))):
+        raise ValueError(
+            "local_data=True (or a .hyper/.tdsx/.twbx path) requires `source` to be a path to a "
+            "file with an embedded extract; pass an explicit {table: csv} dict or a CSV directory "
+            "for in-memory / live sources.")
+    out_dir = (os.path.join(write_to, f"{model_name}.Data") if write_to
+               else tempfile.mkdtemp(prefix="tableau_poc_data_"))
+    mapping = _hr.extract_to_csv(source, out_dir)
+    return {name: info["csv_path"] for name, info in mapping.items()}
+
+
+def _resolve_local_csv_paths(local_data, *, source, model_name, write_to):
+    """Resolve the ``local_data`` opt-in to a ``{table_name: csv_path}`` mapping.
+
+    ``local_data`` may be a dict (used as-is), a directory of ``*.csv`` (keyed by file stem), a
+    single ``.csv`` path, a ``.hyper`` / ``.tdsx`` / ``.twbx`` path (auto-extracted), or ``True`` to
+    auto-extract the ``source`` argument's embedded ``.hyper``.
+    """
+    import os
+    if isinstance(local_data, dict):
+        return dict(local_data)
+    if local_data is True:
+        return _extract_local_csv(source, model_name, write_to)
+    if isinstance(local_data, (str, os.PathLike)):
+        path = os.fspath(local_data)
+        low = path.lower()
+        if os.path.isdir(path):
+            return {os.path.splitext(f)[0]: os.path.abspath(os.path.join(path, f))
+                    for f in sorted(os.listdir(path)) if f.lower().endswith(".csv")}
+        if low.endswith(".csv"):
+            return {os.path.splitext(os.path.basename(path))[0]: os.path.abspath(path)}
+        if low.endswith((".hyper", ".tdsx", ".twbx")):
+            return _extract_local_csv(path, model_name, write_to)
+    raise ValueError(
+        "local_data must be a {table: csv} dict, a directory of CSVs, a .csv path, a "
+        ".hyper/.tdsx/.twbx path, or True to auto-extract the source's embedded .hyper")
+
+
 def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, datasource=None,
                        calcs=None, dim_calcs=None, approved_calc_dax=None, date_range=None,
-                       **kwargs):
+                       local_data=None, **kwargs):
     """**One call** from a downloaded datasource to everything needed to land it in Fabric.
 
     ``source`` may be a path to a ``.tdsx``/``.tds``/``.twbx``/``.twb``, raw bytes, or XML text.
@@ -1518,6 +1665,18 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
     ``report["landing_plan"]`` (see ``directlake_landing_plan``) instead of raising -- and, when
     ``write_to`` is given, writes ``<model_name>.landing_plan.json`` (``"landing_plan_path"``).
 
+    **Local-POC opt-in (``local_data=``).** For a laptop demo with NO Fabric and NO cloud
+    credentials, pass ``local_data`` to build an Import model backed by LOCAL CSV files instead. This
+    bypasses the land-to-Delta fallback entirely (no lakehouse this skill never writes to), so even an
+    unmapped connector (S3 / generic ODBC-JDBC / Web Data Connector) yields a clickable model. Accepts:
+
+    * a ``{table_name: csv_path}`` dict;
+    * a directory of ``*.csv`` (keyed by file stem) or a single ``.csv`` path;
+    * a ``.hyper`` / ``.tdsx`` / ``.twbx`` path, or ``True`` to auto-extract ``source``'s embedded
+      ``.hyper`` to CSV (requires the optional ``tableauhyperapi``; CSVs land in
+      ``<write_to>/<model_name>.Data`` or a temp dir). The data-binding outcome is recorded under the
+      additive ``report["local_import"]`` key.
+
     Extra keyword args (``relationships``, ``hierarchies``, ``mark_as_date``, ``flatfile_path`` ...)
     pass straight through to ``migrate_tds_to_semantic_model``. Deploy stays a separate, explicit
     step (``deploy_to_fabric.py``) -- this function never touches the network or credentials.
@@ -1542,24 +1701,38 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
 
     descriptor = parse_tds(tds_text, datasource)
     decision = select_storage_mode(descriptor)
-    if decision.get("mode") is None:
+
+    # Strict role->mode routing: when calcs were auto-extracted, split off dimension-role calcs to
+    # become DAX calculated COLUMNS (column mode) instead of being mis-routed through the measure
+    # path. An explicit ``calcs=`` keeps full caller control; pass ``dim_calcs=`` to drive columns.
+    def _split_auto_calcs():
+        nonlocal calcs, dim_calcs
+        if auto_extracted and calcs:
+            measures, extracted_dims = _split_calcs_by_role(calcs)
+            calcs = measures
+            if dim_calcs is None:
+                dim_calcs = extracted_dims
+
+    if local_data is not None:
+        # Local-POC path: a CSV-backed Import model regardless of connector; never land-to-Delta.
+        _split_auto_calcs()
+        table_csv_paths = _resolve_local_csv_paths(
+            local_data, source=source, model_name=model_name, write_to=write_to)
+        result = assemble_local_import_model(
+            descriptor, model_name=model_name, calcs=calcs, dim_calcs=dim_calcs,
+            table_csv_paths=table_csv_paths, approved_calc_dax=approved_calc_dax,
+            date_range=date_range, **kwargs)
+    elif decision.get("mode") is None:
         # Genuinely-undoable shape: return the lakehouse hand-off (no parts) rather than raising.
         # Pass the FULL (un-split) calc list so the landing plan's inventory stays complete.
         return _fallback_result(descriptor, decision, model_name=model_name, calcs=calcs,
                                 write_to=write_to)
+    else:
+        _split_auto_calcs()
+        result = migrate_tds_to_semantic_model(
+            tds_text, model_name=model_name, calcs=calcs, dim_calcs=dim_calcs, select=datasource,
+            approved_calc_dax=approved_calc_dax, date_range=date_range, **kwargs)
 
-    # Strict role->mode routing for the import/DirectQuery path: when calcs were auto-extracted,
-    # split off dimension-role calcs to become DAX calculated COLUMNS (column mode) instead of
-    # being mis-routed through the measure path. An explicit ``calcs=`` keeps full caller control
-    # (no auto-split); pass ``dim_calcs=`` to drive calculated columns directly.
-    if auto_extracted and calcs:
-        calcs, extracted_dims = _split_calcs_by_role(calcs)
-        if dim_calcs is None:
-            dim_calcs = extracted_dims
-
-    result = migrate_tds_to_semantic_model(
-        tds_text, model_name=model_name, calcs=calcs, dim_calcs=dim_calcs, select=datasource,
-        approved_calc_dax=approved_calc_dax, date_range=date_range, **kwargs)
     try:
         result["bind"] = connection_details_for_bind(descriptor)
     except Exception as exc:  # never fail the migration over the (advisory) bind target

@@ -348,6 +348,20 @@ Tableau datasource
 > Land-to-Delta + DirectLake is an explicit **option**, auto-suggested only for the genuinely-undoable
 > shapes above; when it triggers, `migrate_datasource` returns a `report["landing_plan"]` to act on.
 
+> **Local-data POC (opt-in, no Fabric).** For a laptop demo — or a customer whose source connector
+> has no live Power BI equivalent (S3 / MinIO, generic ODBC, Web Data Connector) and so would
+> otherwise only get a `landing_plan` — pass `migrate_datasource(..., local_data=...)` to build a
+> **clickable local Import model backed by real data in local CSV files**, with no Fabric workspace,
+> lakehouse, or Azure Key Vault. `local_data` accepts a `{table: csv_path}` map, a directory of
+> `*.csv`, a single `.csv`, a `.hyper`/`.tdsx`/`.twbx` file, or `True` (auto-extract the source's own
+> `.hyper`). It reuses the proven `Csv.Document` Import generator (typed columns, calc→DAX, Date
+> dimension, relationships, parameters) and reports under the additive `report["local_import"]` key.
+> Auto-extracting a `.hyper` needs the optional `tableauhyperapi` wheel (`pip install tableauhyperapi`);
+> bringing your own CSVs needs no extra dependency. **Limitation:** column types/renames line up only
+> when the CSV headers match the `.tds` `<metadata-records>` remote names — otherwise the data still
+> loads (headers promoted) but those columns stay untyped. When `local_data` is omitted the run is a
+> byte-identical no-op.
+
 See [storage-mode-selection.md](resources/storage-mode-selection.md) for the full policy and `scripts/storage_mode.py` for the executable version.
 
 ---

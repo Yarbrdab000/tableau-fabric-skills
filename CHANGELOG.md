@@ -13,6 +13,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** an additive, **opt-in local-data POC path** so a Tableau extract whose
+  source connector has no live Power BI equivalent (S3 / MinIO, generic ODBC, Web Data Connector)
+  can still be turned into a **clickable local Power BI Import model backed by real data** — no
+  Microsoft Fabric, no lakehouse, no Azure Key Vault. `migrate_datasource(...)` gains a `local_data=`
+  parameter accepting a `{table: csv}` map, a directory of `*.csv`, a single `.csv`, a
+  `.hyper`/`.tdsx`/`.twbx` file, or `True` (auto-extract the source's own `.hyper`). When supplied it
+  routes the datasource down the proven `Csv.Document` flat-file Import generator
+  (`assemble_local_import_model` in `scripts/assemble_model.py`), reusing typed columns, calc→DAX
+  measures, the Date dimension, relationships and parameters unchanged, and each table's partition
+  points at its matched local CSV. A new optional `scripts/hyper_reader.py` (lazy `tableauhyperapi`,
+  stdlib-only at import) writes one CSV per extract table for the auto-extract case; bring-your-own
+  CSVs need no extra dependency. Adds the additive `report["local_import"]` key
+  (`{data_source, matched, unmatched_tables, table_count, matched_count}`). When `local_data` is
+  absent the run is a **byte-identical no-op** — the existing land-to-Delta fallback is unchanged.
+  Additive; the migration suite stays green. Skill `VERSION` `1.6.0` → `1.7.0`.
 - **tableau-migration:** Tier-1 Tableau **dashboard → Power BI** migration — workbook worksheets
   and dashboards are rebuilt as Power BI report pages in the PBIR/`.pbip` format
   (`scripts/twb_to_pbir.py`), wired into the estate driver (`scripts/migrate_estate.py`) so a

@@ -1012,8 +1012,13 @@ def emit_flatfile_source(relation, conn, cls):
     model column names (``clean_col``) so they match each column's ``sourceColumn`` in the TMDL.
     Returns ``None`` (caller falls back to a scaffold) when the file path or columns are unknown,
     so a flat file we can't fully resolve is never emitted as a silently-empty partition.
+
+    A per-RELATION ``flatfile_path`` (set by the local-POC import path, where each table maps to its
+    OWN local CSV extracted from the ``.hyper``) takes precedence over the datasource-level path, so
+    a multi-table extract can point each partition at a different CSV. Absent that key the behavior
+    is unchanged (the datasource-level path is used).
     """
-    path = _flatfile_path_for(conn)
+    path = relation.get("flatfile_path") or _flatfile_path_for(conn)
     cols = relation.get("columns") or []
     connector = FLAT_FILE_CLASSES.get((cls or "").lower())
     if not path or not cols or connector is None:
