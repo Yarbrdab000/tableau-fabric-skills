@@ -138,3 +138,222 @@ def test_cli_acquisition_requires_out(monkeypatch):
     monkeypatch.setattr(tds, "sign_in", lambda *a, **k: ("tok", "SITE"))
     with pytest.raises(SystemExit):
         fr.main(["--server", "srv", "--site", "S", "--pat-name", "N"])
+
+
+# ---- local-exclusive path #3: consume already-exported PNGs (no Tableau on this box) ------------
+import zipfile  # noqa: E402  (stdlib; used only by the .twbx tests below)
+
+
+def test_norm_match_key_collapses_spacing_and_punctuation():
+    assert fr.norm_match_key("Sheet 1") == "sheet1"
+    assert fr.norm_match_key("sheet_1") == "sheet1"
+    assert fr.norm_match_key("Sheet1.png") == "sheet1png"  # caller strips ext before normalizing
+    assert fr.norm_match_key("Region / Map!") == "regionmap"
+
+
+def test_list_local_pngs_recursive_and_guarded(tmp_path):
+    (tmp_path / "a.png").write_bytes(b"x")
+    sub = tmp_path / "nested"
+    sub.mkdir()
+    (sub / "b.png").write_bytes(b"x")
+    (tmp_path / "c.txt").write_bytes(b"x")  # non-png ignored
+    pngs = fr.list_local_pngs(str(tmp_path))
+    assert [os.path.basename(p) for p in pngs] == ["a.png", "b.png"]
+    # Missing folder degrades to [] (never raises).
+    assert fr.list_local_pngs(str(tmp_path / "does-not-exist")) == []
+
+
+def test_load_exported_references_folder_match(tmp_path):
+    # Tableau Desktop's Worksheet>Export>Image defaults the file name to the view name.
+    (tmp_path / "Sheet 1.png").write_bytes(b"x")
+    (tmp_path / "region_map.png").write_bytes(b"x")
+    (tmp_path / "Leftover.png").write_bytes(b"x")
+    out = fr.load_exported_references(str(tmp_path), ["Sheet 1", "Region Map", "Missing"])
+    assert out["available"] is True
+    assert os.path.basename(out["found"]["Sheet 1"]) == "Sheet 1.png"
+    assert os.path.basename(out["found"]["Region Map"]) == "region_map.png"
+    assert out["missing"] == ["Missing"]
+    assert [os.path.basename(p) for p in out["unmatched"]] == ["Leftover.png"]
+
+
+def test_load_exported_references_single_png(tmp_path):
+    p = tmp_path / "Dashboard 1.png"
+    p.write_bytes(b"x")
+    out = fr.load_exported_references(str(p), ["Dashboard 1"])
+    assert out["found"]["Dashboard 1"] == str(p.resolve()) or out["found"]["Dashboard 1"] == os.path.abspath(str(p))
+
+
+def test_load_exported_references_no_names_offers_by_stem(tmp_path):
+    (tmp_path / "Sheet 1.png").write_bytes(b"x")
+    out = fr.load_exported_references(str(tmp_path))
+    assert out["available"] is True
+    assert "sheet1" in out["by_stem"]
+    assert out["found"] == {} and out["missing"] == []
+
+
+def test_load_exported_references_empty_is_unavailable(tmp_path):
+    out = fr.load_exported_references(str(tmp_path), ["Sheet 1"])
+    assert out["available"] is False
+    assert out["missing"] == ["Sheet 1"]
+    assert "no PNG names matched" in out["reason"]
+
+
+def _make_twbx(path, members):
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+
+
+def test_extract_twbx_images_pulls_image_objects(tmp_path):
+    twbx = tmp_path / "wb.twbx"
+    _make_twbx(twbx, {
+        "wb.twb": b"<workbook/>",
+        "Image/logo.png": b"\x89PNG-logo",
+        "Image/banner.jpg": b"JFIF-banner",
+        "Data/extract.hyper": b"not-an-image",
+    })
+    out = tmp_path / "extracted"
+    rec = fr.extract_twbx_images(str(twbx), str(out))
+    assert rec["available"] is True
+    assert rec["images"] == ["Image/banner.jpg", "Image/logo.png"]
+    assert os.path.isfile(os.path.join(str(out), "logo.png"))
+    assert open(os.path.join(str(out), "logo.png"), "rb").read() == b"\x89PNG-logo"
+
+
+def test_extract_twbx_images_list_only_without_out(tmp_path):
+    twbx = tmp_path / "wb.twbx"
+    _make_twbx(twbx, {"Image/logo.png": b"x"})
+    rec = fr.extract_twbx_images(str(twbx))  # no output_dir -> report members, extract nothing
+    assert rec["available"] is True
+    assert rec["images"] == ["Image/logo.png"]
+    assert rec["extracted"] == {}
+
+
+def test_extract_twbx_images_decollides_duplicate_basenames(tmp_path):
+    twbx = tmp_path / "wb.twbx"
+    _make_twbx(twbx, {"Image/logo.png": b"a", "Images/logo.png": b"b"})
+    out = tmp_path / "x"
+    rec = fr.extract_twbx_images(str(twbx), str(out))
+    names = sorted(os.path.basename(p) for p in rec["extracted"].values())
+    assert names == ["logo.png", "logo_1.png"]  # second collision is renamed, not overwritten
+
+
+def test_extract_twbx_images_plain_twb_is_unavailable(tmp_path):
+    twb = tmp_path / "wb.twb"
+    twb.write_bytes(b"<workbook/>")  # not a zip
+    rec = fr.extract_twbx_images(str(twb))
+    assert rec["available"] is False
+    assert "not a packaged workbook" in rec["reason"]
+
+
+def test_extract_twbx_images_missing_file_is_unavailable(tmp_path):
+    rec = fr.extract_twbx_images(str(tmp_path / "nope.twbx"))
+    assert rec["available"] is False and "file not found" in rec["reason"]
+
+
+def test_extract_twbx_images_no_image_folder(tmp_path):
+    twbx = tmp_path / "wb.twbx"
+    _make_twbx(twbx, {"wb.twb": b"<workbook/>", "Data/x.hyper": b"y"})
+    rec = fr.extract_twbx_images(str(twbx), str(tmp_path / "o"))
+    assert rec["available"] is False
+    assert "no Image/ assets" in rec["reason"]
+
+
+def test_cli_from_twbx_extracts(tmp_path, capsys):
+    twbx = tmp_path / "wb.twbx"
+    _make_twbx(twbx, {"Image/logo.png": b"x"})
+    rc = fr.main(["--from-twbx", str(twbx), "--out", str(tmp_path / "o")])
+    assert rc == 0
+    assert "extracted 1 image object(s)" in capsys.readouterr().out
+
+
+def test_cli_from_export_maps_to_worksheets(tmp_path, capsys):
+    (tmp_path / "Sheet 1.png").write_bytes(b"x")
+    rc = fr.main(["--from-export", str(tmp_path), "--worksheets", "Sheet 1,Sheet 2"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "matched 1, missing 1" in out
+    assert "no PNG for worksheet: Sheet 2" in out
+
+
+# ---- adversarial hardening: the advisory loaders must NEVER raise (fuzz-discovered) ------------
+@pytest.mark.parametrize("bad", [123, 4.5, None, "", "   ", b"", object()])
+def test_load_exported_references_bad_source_degrades(bad):
+    out = fr.load_exported_references(bad, ["Sheet 1"])
+    assert out["available"] is False
+    assert out["missing"] == ["Sheet 1"]
+    assert set(out) >= {"available", "found", "missing", "unmatched", "by_stem", "reason"}
+
+
+def test_load_exported_references_non_iterable_names_is_safe(tmp_path):
+    (tmp_path / "Sheet 1.png").write_bytes(b"x")
+    # A non-iterable worksheet_names (an int) must not raise; it degrades to "no names".
+    out = fr.load_exported_references(str(tmp_path), 123)
+    assert "sheet1" in out["by_stem"]
+
+
+def test_load_exported_references_blank_source_does_not_scan_cwd(tmp_path, monkeypatch):
+    # Regression: abspath("") used to resolve to CWD and silently scan it. A blank source must
+    # yield an empty result instead of leaking whatever PNGs happen to be in the working dir.
+    (tmp_path / "stray.png").write_bytes(b"x")
+    monkeypatch.chdir(tmp_path)
+    out = fr.load_exported_references("", None)
+    assert out["available"] is False and out["by_stem"] == {}
+
+
+@pytest.mark.parametrize("bad", [123, None, "", object()])
+def test_list_local_pngs_bad_input_is_empty(bad):
+    assert fr.list_local_pngs(bad) == []
+
+
+@pytest.mark.parametrize("bad", [123, 4.5, None, "", object()])
+def test_extract_twbx_images_bad_source_degrades(bad):
+    rec = fr.extract_twbx_images(bad)
+    assert rec["available"] is False
+    assert set(rec) >= {"available", "images", "extracted", "reason"}
+
+
+def test_extract_twbx_images_bad_output_dir_degrades(tmp_path):
+    twbx = tmp_path / "wb.twbx"
+    _make_twbx(twbx, {"Image/logo.png": b"x"})
+    # An int output_dir is unusable -> coerced to None -> graceful list-only (no crash, no write).
+    rec = fr.extract_twbx_images(str(twbx), 123)
+    assert rec["available"] is True
+    assert rec["extracted"] == {}
+    assert rec["images"] == ["Image/logo.png"]
+
+
+def test_extract_twbx_images_output_dir_is_a_file(tmp_path):
+    twbx = tmp_path / "wb.twbx"
+    _make_twbx(twbx, {"Image/logo.png": b"x"})
+    clash = tmp_path / "out_is_file"
+    clash.write_bytes(b"x")  # output_dir path already exists as a FILE
+    rec = fr.extract_twbx_images(str(twbx), str(clash))
+    assert rec["available"] is False  # makedirs over a file -> guarded, not a crash
+
+
+def test_extract_twbx_images_zip_slip_is_contained(tmp_path):
+    # Malicious traversal member names must extract by BASENAME only, never escaping --out.
+    twbx = tmp_path / "evil.twbx"
+    with zipfile.ZipFile(twbx, "w") as zf:
+        zf.writestr("Image/../../../evil.png", b"pwn")
+        zf.writestr("Image/..\\..\\evil2.png", b"pwn2")
+        zf.writestr("Image/ok.png", b"ok")
+    out = tmp_path / "safe_out"
+    rec = fr.extract_twbx_images(str(twbx), str(out))
+    assert rec["available"] is True
+    for p in rec["extracted"].values():
+        assert os.path.realpath(p).startswith(os.path.realpath(str(out)) + os.sep)
+    # Nothing was written above the out dir.
+    assert not (tmp_path / "evil.png").exists()
+    assert not (tmp_path.parent / "evil.png").exists()
+
+
+def test_extract_twbx_images_corrupt_zip_degrades(tmp_path):
+    good = tmp_path / "g.twbx"
+    _make_twbx(good, {"Image/a.png": b"a"})
+    raw = good.read_bytes()
+    corrupt = tmp_path / "c.twbx"
+    corrupt.write_bytes(raw[: len(raw) // 2])  # truncated central directory
+    rec = fr.extract_twbx_images(str(corrupt))
+    assert rec["available"] is False

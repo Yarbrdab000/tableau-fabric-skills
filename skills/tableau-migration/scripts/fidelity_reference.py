@@ -4,16 +4,25 @@ The image tier (``fidelity_oracle.image_tier``) compares a *reference* PNG again
 PNG. This module's job is to **produce the reference PNGs** for a Tableau workbook's worksheets and
 to make the absence of a reference an explicit, actionable instruction rather than a silent gap.
 
-Two acquisition paths, tiered:
+Three acquisition paths, tiered:
 
 1. **Live / published** -- pull a server-rendered ``.../views/{id}/image?resolution=high`` PNG over
    the Tableau REST API. The server renders the view **as the authenticated user**, so row-level
    security is applied -- which is exactly why this is preferred over the (RLS-stripped, often
    absent) embedded workbook thumbnail.
-2. **Local-exclusive** -- when there is no server (offline, air-gapped, or RLS that can't be
+2. **Local-exclusive (drop)** -- when there is no server (offline, air-gapped, or RLS that can't be
    reproduced headlessly), the user drops a screenshot per worksheet into a known folder under a
    fixed naming convention. :func:`resolve_local_references` detects what is present, what is
    missing, and emits a precise "drop a PNG here named X" instruction for each gap.
+3. **Local-exclusive (consume already-exported PNGs)** -- this machine often has *no* Tableau at
+   all, so we cannot auto-render the source. But Tableau Desktop (on whatever box the author uses)
+   exports a faithful per-view PNG via ``Worksheet > Export > Image``, default-named after the view;
+   and a packaged ``.twbx`` is just a zip whose ``Image/`` folder holds the author-placed image
+   *objects* (logos/backgrounds) -- extractable with stdlib ``zipfile`` and **no** Tableau at all.
+   :func:`load_exported_references` maps an existing folder of PNGs (or a single PNG) to worksheet
+   names by a tolerant filename match, and :func:`extract_twbx_images` pulls a ``.twbx``'s embedded
+   image objects. Both feed the oracle's image tier as the *reference* half (the candidate half is
+   the local Power BI render from ``fidelity_oracle``'s host bridge).
 
 Design constraints (deliberate):
 
@@ -32,6 +41,7 @@ import argparse
 import os
 import re
 import sys
+import zipfile
 
 # --- guarded reuse of the skill's existing Tableau REST plumbing (no edits to that file) ----------
 try:  # normal path: scripts/ is on sys.path (CLI cwd, conftest, or oracle import)
@@ -249,6 +259,182 @@ def build_acquisition_plan(worksheet_names, reference_dir):
 
 
 # =====================================================================================
+# Local-exclusive path (consume already-exported PNGs): folder match + .twbx Image/ extract
+# =====================================================================================
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp")
+# An image *object* in a packaged workbook lives under an ``Image/`` (sometimes ``Images/``) member
+# path; match it at the archive root or after any folder separator, case-insensitively.
+_TWBX_IMAGE_MEMBER_RE = re.compile(r"(^|/)images?/", re.IGNORECASE)
+
+
+def norm_match_key(name):
+    """Collapse a name/filename stem to a tolerant match key: lowercase, alphanumerics only.
+
+    So ``"Sheet 1"``, ``"sheet_1"`` and ``"Sheet1.png"`` all reduce to ``"sheet1"`` -- letting an
+    exported PNG resolve to its worksheet regardless of how spaces/punctuation were rendered in the
+    file name. Deliberately more aggressive than :func:`safe_filename` (which keeps a readable form).
+    """
+    return re.sub(r"[^0-9a-z]+", "", str(name).lower())
+
+
+def _as_path(value):
+    """Coerce a path-like to a non-empty string path, or ``None`` for anything unusable.
+
+    The advisory loaders accept arbitrary caller input and must *never* raise; an ``int``, ``None``,
+    or a blank/whitespace string therefore degrades to ``None`` (the caller then returns an
+    ``available: False`` record) rather than blowing up inside ``os.path`` -- and a blank string is
+    explicitly *not* treated as the current directory (no surprise CWD scan).
+    """
+    if not isinstance(value, (str, os.PathLike)):
+        return None
+    try:
+        text = os.fspath(value)
+    except TypeError:  # pragma: no cover - exotic PathLike
+        return None
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    return text if text.strip() else None
+
+
+def list_local_pngs(folder):
+    """Every ``*.png`` under ``folder`` (recursive), as sorted absolute paths.
+
+    Guarded: returns ``[]`` when ``folder`` is unusable (non-path, blank), missing, or unreadable;
+    never raises.
+    """
+    folder = _as_path(folder)
+    if not folder:
+        return []
+    folder = os.path.abspath(folder)
+    if not os.path.isdir(folder):
+        return []
+    out = []
+    try:
+        for root, _dirs, files in os.walk(folder):
+            for fn in files:
+                if fn.lower().endswith(".png"):
+                    out.append(os.path.join(root, fn))
+    except OSError:  # pragma: no cover - unreadable tree
+        return []
+    return sorted(out)
+
+
+def load_exported_references(source, worksheet_names=None):
+    """Map already-exported PNGs to Tableau view names by a tolerant filename match.
+
+    ``source`` may be a directory of PNGs or a single ``.png`` file. Tableau Desktop's
+    ``Worksheet > Export > Image`` defaults the file name to the view name, so a PNG named
+    ``Sheet 1.png`` resolves to worksheet ``Sheet 1`` even though no Tableau is installed on *this*
+    machine -- the export happens once (anywhere) and the oracle just reads the files.
+
+    Returns::
+
+        {"available": bool,
+         "found": {worksheet: png_path},     # only when worksheet_names given
+         "missing": [worksheet, ...],        # requested names with no matching PNG
+         "unmatched": [png_path, ...],       # PNGs that matched no requested name
+         "by_stem": {match_key: png_path},   # every PNG keyed by its tolerant stem
+         "reason": str|None}
+
+    When ``worksheet_names`` is ``None`` every PNG is simply offered via ``by_stem`` so the caller
+    can pair by name later. Never raises; first PNG wins on a key collision.
+    """
+    names = None
+    if worksheet_names is not None:
+        try:
+            names = list(worksheet_names)
+        except TypeError:  # a non-iterable (e.g. an int) is treated as "no names requested"
+            names = []
+    src = _as_path(source)
+    if not src:
+        return {"available": False, "found": {}, "missing": list(names or []),
+                "unmatched": [], "by_stem": {}, "reason": "no usable source path"}
+    src = os.path.abspath(src)
+    if os.path.isfile(src) and src.lower().endswith(".png"):
+        pngs = [src]
+    else:
+        pngs = list_local_pngs(src)
+    by_stem = {}
+    for p in pngs:
+        stem = norm_match_key(os.path.splitext(os.path.basename(p))[0])
+        if stem and stem not in by_stem:
+            by_stem[stem] = p
+    if not names:
+        return {"available": bool(by_stem), "found": {}, "missing": list(names or []),
+                "unmatched": [], "by_stem": by_stem,
+                "reason": None if by_stem else "no PNGs found under %s" % src}
+    found, missing, used = {}, [], set()
+    for ws in names:
+        key = norm_match_key(ws)
+        path = by_stem.get(key)
+        if path:
+            found[ws] = path
+            used.add(key)
+        else:
+            missing.append(ws)
+    unmatched = sorted(p for k, p in by_stem.items() if k not in used)
+    return {"available": bool(found), "found": found, "missing": missing,
+            "unmatched": unmatched, "by_stem": by_stem,
+            "reason": None if found else "no PNG names matched the given worksheets"}
+
+
+def extract_twbx_images(twbx_path, output_dir=None):
+    """Extract embedded image *objects* from a packaged ``.twbx`` (a zip) -- no Tableau required.
+
+    A ``.twbx`` is a zip archive; image objects an author placed on dashboards live under an
+    ``Image/`` folder. These are **not** rendered chart pixels -- they are the author-supplied
+    assets (logos, background images) -- but they ARE part of dashboard fidelity (a logo in a zone
+    should reappear in the rebuild). stdlib ``zipfile`` only; fully guarded -- a missing/corrupt/
+    non-zip file, or a plain ``.twb`` (which carries no package), degrades to
+    ``{"available": False, ...}`` rather than raising.
+
+    Returns ``{"available", "images": [member, ...], "extracted": {member: out_path}, "reason"}``.
+    When ``output_dir`` is given each image is written there (basenames de-collided); otherwise only
+    the in-archive member names are reported and ``extracted`` is empty.
+    """
+    twbx_path = _as_path(twbx_path)
+    if not twbx_path:
+        return {"available": False, "reason": "no usable .twbx path",
+                "images": [], "extracted": {}}
+    twbx_path = os.path.abspath(twbx_path)
+    if not os.path.isfile(twbx_path):
+        return {"available": False, "reason": "file not found: %s" % twbx_path,
+                "images": [], "extracted": {}}
+    if not zipfile.is_zipfile(twbx_path):
+        return {"available": False, "images": [], "extracted": {},
+                "reason": "not a packaged workbook (a .twbx is a zip; a plain .twb has no "
+                          "embedded image objects)"}
+    out = _as_path(output_dir)
+    try:
+        with zipfile.ZipFile(twbx_path) as zf:
+            members = [n for n in zf.namelist()
+                       if not n.endswith("/")
+                       and _TWBX_IMAGE_MEMBER_RE.search(n)
+                       and n.lower().endswith(_IMAGE_EXTS)]
+            extracted = {}
+            if out and members:
+                out = os.path.abspath(out)
+                os.makedirs(out, exist_ok=True)
+                seen = {}
+                for name in members:
+                    base = os.path.basename(name)
+                    n = seen.get(base.lower(), 0)
+                    seen[base.lower()] = n + 1
+                    if n:
+                        stem, ext = os.path.splitext(base)
+                        base = "%s_%d%s" % (stem, n, ext)
+                    target = os.path.join(out, base)
+                    with zf.open(name) as fh, open(target, "wb") as dst:
+                        dst.write(fh.read())
+                    extracted[name] = target
+    except (OSError, zipfile.BadZipFile, RuntimeError, TypeError) as exc:  # corrupt/encrypted/bad out
+        return {"available": False, "images": [], "extracted": {},
+                "reason": "could not read .twbx: %s" % str(exc)[:160]}
+    return {"available": bool(members), "images": sorted(members), "extracted": extracted,
+            "reason": None if members else "no Image/ assets in this .twbx (none were placed)"}
+
+
+# =====================================================================================
 # CLI
 # =====================================================================================
 def main(argv=None):
@@ -272,10 +458,45 @@ def main(argv=None):
     ap.add_argument("--list", action="store_true", help="List published views and exit.")
     ap.add_argument("--check-local", action="store_true",
                     help="Only report which reference PNGs are present/missing under --out.")
+    ap.add_argument("--from-twbx", default=None,
+                    help="Extract embedded image objects from a packaged .twbx (a zip) into --out. "
+                         "No Tableau or server needed.")
+    ap.add_argument("--from-export", default=None,
+                    help="Map already-exported PNGs (a folder or a single .png) to worksheet names "
+                         "by tolerant filename match. No Tableau or server needed; pair with "
+                         "--worksheets to check coverage.")
     args = ap.parse_args(argv)
 
     worksheets = ([w.strip() for w in args.worksheets.split(",") if w.strip()]
                   if args.worksheets else None)
+
+    if args.from_twbx:
+        rec = extract_twbx_images(args.from_twbx, args.out)
+        if not rec["available"]:
+            print("unavailable: %s" % rec["reason"])
+            return 1
+        if args.out:
+            print("extracted %d image object(s) -> %s"
+                  % (len(rec["extracted"]), os.path.abspath(args.out)))
+        else:
+            print("found %d image object(s) in archive (pass --out to extract):"
+                  % len(rec["images"]))
+            for m in rec["images"]:
+                print("  - %s" % m)
+        return 0
+
+    if args.from_export:
+        rec = load_exported_references(args.from_export, worksheets)
+        if worksheets:
+            print("matched %d, missing %d, unmatched-png %d"
+                  % (len(rec["found"]), len(rec["missing"]), len(rec["unmatched"])))
+            for ws in rec["missing"]:
+                print("  no PNG for worksheet: %s" % ws)
+        else:
+            print("found %d PNG(s); pass --worksheets to map them to views:" % len(rec["by_stem"]))
+            for stem, p in sorted(rec["by_stem"].items()):
+                print("  %s\t%s" % (stem, p))
+        return 0
 
     if args.check_local:
         if not worksheets:

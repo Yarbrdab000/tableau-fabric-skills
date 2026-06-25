@@ -2425,6 +2425,38 @@ def _load_field_aliases(path):
     return {}
 
 
+def _resolve_reference_png(source, name=None):
+    """Resolve a single Tableau *reference* PNG from a local source, for the image tier.
+
+    ``source`` may be a folder of exported PNGs, a single ``.png``, or a packaged ``.twbx`` (whose
+    embedded ``Image/`` objects are extracted to a temp dir first). When ``name`` is given the PNG
+    whose (tolerant) stem matches it is returned; with no name a lone PNG is used. Lazy-imports
+    :mod:`fidelity_reference` and is fully guarded -- any problem yields ``None`` (the optional image
+    tier then simply reports ``available: False``), so wiring it in never breaks an offline run.
+    """
+    if not source:
+        return None
+    try:
+        import fidelity_reference as fref
+    except Exception:  # noqa: BLE001 - reference module/CWD issue must not break the oracle
+        return None
+    try:
+        src = str(source)
+        search = src
+        if src.lower().endswith(".twbx"):
+            rec = fref.extract_twbx_images(src, tempfile.mkdtemp(prefix="fo_twbx_img_"))
+            if not rec.get("available") or not rec.get("extracted"):
+                return None
+            search = os.path.dirname(next(iter(rec["extracted"].values())))
+        loaded = fref.load_exported_references(search, [name] if name else None)
+        if name:
+            return loaded.get("found", {}).get(name)
+        by_stem = loaded.get("by_stem") or {}
+        return next(iter(by_stem.values())) if len(by_stem) == 1 else None
+    except Exception:  # noqa: BLE001 - advisory resolver never raises
+        return None
+
+
 def run_oracle(twb_path, report_dir, engine_report_path=None,
                dax_options=None, image_options=None, candidate_records_path=None,
                field_aliases=None, validate=False):
@@ -2467,6 +2499,12 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
         render_pbip = opts.pop("render_pbip", None)
         render_page_id = opts.pop("render_page_id", None)
         render_opts = dict(opts.pop("render_options", None) or {})
+        ref_source = opts.pop("reference_source", None)
+        ref_name = opts.pop("reference_name", None)
+        if ref_source and not opts.get("reference_png"):
+            ref_png = _resolve_reference_png(ref_source, ref_name)
+            if ref_png:
+                opts["reference_png"] = ref_png
         render_record = None
         if render_pbip and not opts.get("candidate_png"):
             render_record = render_pbi_report(
@@ -2678,6 +2716,13 @@ def main(argv=None):
                     help="Optional JSON file of {measure: expected_value} for value comparison.")
     # Optional Tier-3 (image, needs numpy + Pillow):
     ap.add_argument("--image-ref", default=None, help="Tableau reference PNG for the image tier.")
+    ap.add_argument("--image-ref-source", default=None,
+                    help="Resolve the Tableau reference PNG from a local source instead of "
+                         "--image-ref: a folder of exported PNGs, a single .png, or a .twbx whose "
+                         "embedded Image/ objects are extracted. Pair with --image-ref-name.")
+    ap.add_argument("--image-ref-name", default=None,
+                    help="Worksheet/view name to pick from --image-ref-source (tolerant filename "
+                         "match); omit when the source holds a single PNG.")
     ap.add_argument("--image-cand", default=None, help="Power BI render PNG for the image tier.")
     ap.add_argument("--image-threshold", type=float, default=DEFAULT_ACCEPTANCE_SSIM,
                     help="Advisory SSIM acceptance floor a faithful rebuild should clear "
@@ -2706,10 +2751,13 @@ def main(argv=None):
             expected = _read_json(args.expected)
         dax_options = {"port": args.dax_port, "expected": expected}
     image_options = None
-    if args.image_ref or args.image_cand or args.image_render:
+    if args.image_ref or args.image_ref_source or args.image_cand or args.image_render:
         image_options = {"reference_png": args.image_ref, "candidate_png": args.image_cand,
                          "acceptance_threshold": args.image_threshold,
                          "auto_regions": args.image_auto_regions}
+        if args.image_ref_source:
+            image_options["reference_source"] = args.image_ref_source
+            image_options["reference_name"] = args.image_ref_name
         if args.image_render:
             image_options["render_pbip"] = args.image_render
             image_options["render_page_id"] = args.image_render_page

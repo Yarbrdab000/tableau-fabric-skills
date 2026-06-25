@@ -1470,3 +1470,66 @@ def test_run_oracle_render_unavailable_marks_image(tmp_path, monkeypatch):
     assert result["image"]["available"] is False
     assert "render bridge unavailable" in result["image"]["reason"]
     assert "render unavailable" in fo.render_markdown(result)
+
+
+# --- Tableau reference-PNG resolution from a local source (image-tier reference half) ------------
+def test_resolve_reference_png_folder_and_name(tmp_path):
+    (tmp_path / "Sheet 1.png").write_bytes(b"x")
+    (tmp_path / "Other.png").write_bytes(b"x")
+    p = fo._resolve_reference_png(str(tmp_path), "Sheet 1")
+    assert p is not None and os.path.basename(p) == "Sheet 1.png"
+
+
+def test_resolve_reference_png_single_png_no_name(tmp_path):
+    only = tmp_path / "Dashboard 1.png"
+    only.write_bytes(b"x")
+    # A lone PNG resolves even without a name.
+    assert fo._resolve_reference_png(str(only)) == os.path.abspath(str(only))
+
+
+def test_resolve_reference_png_from_twbx(tmp_path):
+    import zipfile
+    twbx = tmp_path / "wb.twbx"
+    with zipfile.ZipFile(twbx, "w") as zf:
+        zf.writestr("Image/Region Map.png", b"\x89PNG")
+    p = fo._resolve_reference_png(str(twbx), "Region Map")
+    assert p is not None and os.path.basename(p) == "Region Map.png"
+    assert open(p, "rb").read() == b"\x89PNG"
+
+
+def test_resolve_reference_png_name_miss_returns_none(tmp_path):
+    (tmp_path / "Sheet 1.png").write_bytes(b"x")
+    assert fo._resolve_reference_png(str(tmp_path), "Nope") is None
+
+
+def test_resolve_reference_png_empty_source_is_none():
+    assert fo._resolve_reference_png(None) is None
+    assert fo._resolve_reference_png("") is None
+    # A non-str/path source must degrade to None, never raise (fuzz-discovered contract).
+    assert fo._resolve_reference_png(123, "x") is None
+    assert fo._resolve_reference_png(object()) is None
+
+
+def test_run_oracle_image_reference_source_resolves(tmp_path, monkeypatch):
+    report_dir = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    twb = tmp_path / "wb.twb"
+    twb.write_text(TWB_XML, encoding="utf-8")
+    refs = tmp_path / "refs"
+    refs.mkdir()
+    (refs / "Sheet 1.png").write_bytes(b"x")
+    captured = {}
+
+    def fake_image_tier(**kw):
+        captured.update(kw)
+        return {"tier": "image", "available": True, "ssim": 0.9}
+
+    monkeypatch.setattr(fo, "image_tier", fake_image_tier)
+    fo.run_oracle(str(twb), report_dir,
+                  image_options={"reference_source": str(refs), "reference_name": "Sheet 1",
+                                 "candidate_png": str(tmp_path / "cand.png")})
+    # The Tableau reference was resolved from the local folder and passed through to the tier;
+    # the bespoke reference_source/reference_name keys are consumed, not leaked into image_tier.
+    assert os.path.basename(captured["reference_png"]) == "Sheet 1.png"
+    assert "reference_source" not in captured and "reference_name" not in captured
+
+

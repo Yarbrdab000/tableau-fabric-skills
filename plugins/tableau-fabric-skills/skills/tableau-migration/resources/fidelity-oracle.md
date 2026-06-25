@@ -335,6 +335,32 @@ and is stdlib‑only.
 - **Local‑exclusive (offline / unreproducible RLS):** drop a screenshot per worksheet into a known
   folder; `resolve_local_references` / `build_acquisition_plan` report exactly which files are
   present, which are missing, and the precise name to save each missing one as.
+- **Local‑exclusive (consume already‑exported PNGs):** this box often has **no Tableau at all**, so
+  the source can't be auto‑rendered here. But Tableau Desktop (on whatever machine the author uses)
+  exports a faithful per‑view PNG via **`Worksheet > Export > Image`**, default‑named after the
+  view; and a packaged **`.twbx` is just a zip** whose `Image/` folder holds the author‑placed image
+  *objects* (logos/backgrounds), extractable with stdlib `zipfile` and **no Tableau at all**.
+  `load_exported_references` maps an existing folder of PNGs (or a single PNG) to worksheet names by
+  a tolerant filename match; `extract_twbx_images` pulls a `.twbx`'s embedded image objects. Both
+  feed the image tier as the *reference* half — the *candidate* half is the local Power BI render
+  from the host bridge above. (Tip from Tableau's export UI: a **Fixed‑Size** dashboard layout
+  yields predictable, repeatable pixel dimensions, which helps SSIM alignment.)
+  > The `.twbx` `Image/` folder holds image *objects*, **not** rendered chart pixels — useful to
+  > confirm a logo/background reappears in the rebuilt zone. For chart pixels use the live pull or a
+  > manual `Worksheet > Export > Image`.
+
+```powershell
+# consume already-exported PNGs (no Tableau/server here): map them to worksheet names
+py -3.11 scripts\fidelity_reference.py --from-export "<png_dir>" `
+  --worksheets "Sheet 1,Sheet 2,Sheet 3"
+
+# pull embedded image objects out of a packaged .twbx (stdlib zip; no Tableau needed)
+py -3.11 scripts\fidelity_reference.py --from-twbx "<workbook>.twbx" --out "<asset_dir>"
+
+# resolve the reference straight from a local source during a scoring run:
+py -3.11 scripts\fidelity_oracle.py "<src>.twb" "<out>\...\.Report" `
+  --image-render "<out>\...pbip" --image-ref-source "<png_dir_or_.twbx>" --image-ref-name "Sheet 1"
+```
 
 ```powershell
 # see what's present/missing locally (no network) — emits "drop a PNG named X" guidance
