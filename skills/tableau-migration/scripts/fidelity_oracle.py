@@ -718,16 +718,21 @@ def _worksheet_record(ws, caption_index):
     family, asserted = _infer_twb_family(
         mark, dims, measures, has_geometry, uses_measure_values or bool(members))
 
+    # Worksheet filters feed the advisory slicer cross-check only (never the per-visual score, so
+    # this cannot move calibration). Capture EVERY filter with a resolvable field -- categorical
+    # (discrete), quantitative (numeric/date RANGE), and relative-date quick filters alike --
+    # tagging each with its Tableau filter class, so an emitted slicer can be cross-checked against
+    # a range/relative-date source filter, not only a categorical one.
     filters = []
     for fl in _iter_local(view, "filter"):
-        if (fl.get("class") or "").lower() != "categorical":
-            continue
+        fclass = (fl.get("class") or "").lower() or None
         col = fl.get("column") or ""
         m = _PILL_RE.search(col)
-        if m:
-            fld = _parse_pill(m.group("inner"), caption_index)
-            if fld is not None:
-                filters.append(fld)
+        if not m:
+            continue
+        fld = _parse_pill(m.group("inner"), caption_index)
+        if fld is not None:
+            filters.append(dict(fld, filter_class=fclass))
 
     return {
         "name": name,
@@ -1192,20 +1197,28 @@ def regions_from_layout(twb, pbir):
 def _score_slicer(visual, dash_ws, page_display):
     fields = visual["filter_fields"] or visual["fields"]
     field_norms = {f["norm"] for f in fields if f.get("norm")}
-    source_filter_norms = set()
+    # Map each source-filter field to its Tableau filter class so a matched slicer can report
+    # whether it cross-checks a categorical, quantitative (range), or relative-date filter.
+    source_filter_classes = {}
     for ws in dash_ws:
         for f in ws["filters"]:
-            source_filter_norms.add(f["norm"])
-    matched = sorted(field_norms & source_filter_norms)
+            source_filter_classes.setdefault(f["norm"], f.get("filter_class"))
+    matched = sorted(field_norms & set(source_filter_classes))
+    matched_filter_classes = sorted({source_filter_classes[n] for n in matched
+                                     if source_filter_classes.get(n)})
+    if matched:
+        cls_phrase = "/".join(matched_filter_classes) if matched_filter_classes else "categorical"
+        note = "slicer field corresponds to a Tableau %s filter" % cls_phrase
+    else:
+        note = "slicer has no matching Tableau filter on this dashboard"
     return {
         "page": page_display,
         "visual": visual["name"],
         "fields": sorted(field_norms),
         "matches_source_filter": bool(matched),
         "matched": matched,
-        "note": ("slicer field corresponds to a Tableau categorical filter"
-                 if matched else
-                 "slicer has no matching Tableau categorical filter on this dashboard"),
+        "matched_filter_classes": matched_filter_classes,
+        "note": note,
     }
 
 

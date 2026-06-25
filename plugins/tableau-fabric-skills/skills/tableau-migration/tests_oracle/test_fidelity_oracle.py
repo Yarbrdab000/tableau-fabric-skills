@@ -652,6 +652,43 @@ def test_slicer_matches_source_filter(tmp_path):
     assert result["slicers"] and result["slicers"][0]["matches_source_filter"] is True
 
 
+def test_worksheet_captures_non_categorical_filters():
+    # Range (quantitative) and relative-date quick filters must also be captured for the slicer
+    # cross-check -- each tagged with its Tableau filter class, not only categorical ones.
+    xml = TWB_XML.replace(
+        "<filter class='categorical' column='[fed.0abc].[none:Category:nk]'/>",
+        "<filter class='categorical' column='[fed.0abc].[none:Category:nk]'/>"
+        "<filter class='quantitative' column='[fed.0abc].[sum:Sales:qk]'/>"
+        "<filter class='relative-date' column='[fed.0abc].[tmn:Order Date:qk]'/>",
+    )
+    ws = fo.read_twb_views(xml)["worksheets"]["Bars"]
+    by_norm = {f["norm"]: f.get("filter_class") for f in ws["filters"]}
+    assert by_norm.get("category") == "categorical"
+    assert by_norm.get("sales") == "quantitative"
+    assert by_norm.get("orderdate") == "relative-date"
+
+
+def test_slicer_matches_non_categorical_filter(tmp_path):
+    # A slicer emitted for a RANGE (quantitative) source filter must cross-check as a match and
+    # report the matched filter class -- proving non-categorical filters are now verifiable.
+    xml = TWB_XML.replace(
+        "<filter class='categorical' column='[fed.0abc].[none:Category:nk]'/>",
+        "<filter class='quantitative' column='[fed.0abc].[sum:Sales:qk]'/>",
+    )
+    slicer = _visual_json(
+        "v-slicer", "slicer",
+        {"x": 0.0, "y": 0.0, "width": 100.0, "height": 100.0, "z": 1},
+        {"Values": {"projections": [_projection(_agg_field("fed.0abc", "Sales"), "Sales")]}},
+        filter_config={"filters": [{"field": _agg_field("fed.0abc", "Sales")}]})
+    report = _write_pbir(str(tmp_path), "Dash", _faithful_visuals() + [slicer])
+    twb = fo.read_twb_views(xml)
+    pbir = fo.read_pbir_report(report)
+    result = fo.score_report(twb, pbir)
+    s = result["slicers"][0]
+    assert s["matches_source_filter"] is True
+    assert s["matched_filter_classes"] == ["quantitative"]
+
+
 def test_run_oracle_and_markdown(tmp_path):
     report = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
     twb_path = tmp_path / "wb.twb"
