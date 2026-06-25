@@ -3816,6 +3816,117 @@ def test_legend_standalone_worksheet_unaffected():
     assert _lg_fact(res["candidate_records"], "Sales by Region") is None
 
 
+# -- title font styling (Tier-2) ----------------------------------------------
+# A worksheet title's per-run font attributes -> the visual container title's font. Only the two
+# unambiguous, schema-grounded properties are emitted (fontSize as a "Nd" literal, fontColor as a
+# solid single-quoted hex literal), and ONLY when every text-bearing run agrees (Power BI applies
+# one font to the whole title). Disagreeing / partial runs, plus bold / family / alignment, are
+# deferred (recorded on the additive ``title_style`` fact, never emitted) -- warn-never-wrong.
+def _titled_ws(title):
+    return _workbook(_worksheet("Sales by Category", "Bar",
+                                rows="[federated.abc].[sum:Sales:qk]",
+                                cols="[federated.abc].[none:Category:nk]",
+                                deps_extra=_INST, title=title))
+
+
+def _title_props(res):
+    return _only_visual(res)["visual"]["visualContainerObjects"]["title"][0]["properties"]
+
+
+def _title_fact(res, ws_name):
+    for rec in res["candidate_records"]:
+        if rec["worksheet"] == ws_name:
+            return rec.get("title_style")
+    return None
+
+
+def test_title_style_uniform_fontsize_emits_literal():
+    res = migrate_twb_to_pbir(_titled_ws("<run fontsize='15'>Quarterly Sales</run>"))
+    assert res["ir"]["worksheets"][0]["title_style"] == {"font_size": "15D"}
+    props = _title_props(res)
+    assert props["fontSize"]["expr"]["Literal"]["Value"] == "15D"
+    assert "fontColor" not in props
+    assert _title_fact(res, "Sales by Category") == {"font_size": "15D"}
+    assert res["warnings"] == []
+
+
+def test_title_style_uniform_fontcolor_emits_solid_literal():
+    res = migrate_twb_to_pbir(_titled_ws("<run fontcolor='#d3872a'>Quarterly Sales</run>"))
+    assert res["ir"]["worksheets"][0]["title_style"] == {"font_color": "#d3872a"}
+    props = _title_props(res)
+    color = props["fontColor"]["solid"]["color"]["expr"]["Literal"]["Value"]
+    assert color == "'#d3872a'"
+    assert "fontSize" not in props
+
+
+def test_title_style_size_and_color_both_emit():
+    res = migrate_twb_to_pbir(
+        _titled_ws("<run fontcolor='#1f77b4' fontsize='18'>Quarterly Sales</run>"))
+    props = _title_props(res)
+    assert props["fontSize"]["expr"]["Literal"]["Value"] == "18D"
+    assert props["fontColor"]["solid"]["color"]["expr"]["Literal"]["Value"] == "'#1f77b4'"
+
+
+def test_title_style_multi_run_agree_emits_once():
+    res = migrate_twb_to_pbir(
+        _titled_ws("<run fontsize='13'>Sales </run><run fontsize='13'>by Region</run>"))
+    assert _title_props(res)["fontSize"]["expr"]["Literal"]["Value"] == "13D"
+
+
+def test_title_style_disagreeing_runs_defer_property():
+    # runs disagree on size -> defer fontSize (no font emitted), keep the structural title text.
+    res = migrate_twb_to_pbir(
+        _titled_ws("<run fontsize='15'>Big</run><run fontsize='9'>small</run>"))
+    props = _title_props(res)
+    assert "fontSize" not in props
+    assert props["text"]["expr"]["Literal"]["Value"] == "'Bigsmall'"
+    assert res["ir"]["worksheets"][0]["title_style"] == {"deferred": ["fontsize"]}
+    assert _title_fact(res, "Sales by Category") == {"deferred": ["fontsize"]}
+
+
+def test_title_style_bold_and_family_are_deferred_not_emitted():
+    res = migrate_twb_to_pbir(
+        _titled_ws("<run bold='true' fontname='Tableau Bold' fontsize='14'>Sales</run>"))
+    props = _title_props(res)
+    assert props["fontSize"]["expr"]["Literal"]["Value"] == "14D"
+    assert set(props) == {"show", "text", "fontSize"}  # no bold / fontFamily property
+    assert res["ir"]["worksheets"][0]["title_style"]["deferred"] == ["bold", "fontname"]
+
+
+def test_title_style_non_hex_color_is_deferred():
+    res = migrate_twb_to_pbir(_titled_ws("<run fontcolor='#11223344'>Sales</run>"))
+    assert "fontColor" not in _title_props(res)
+    assert res["ir"]["worksheets"][0]["title_style"] == {"deferred": ["fontcolor"]}
+
+
+def test_title_without_styling_emits_no_font_and_no_fact():
+    res = migrate_twb_to_pbir(_titled_ws("<run>Plain Title</run>"))
+    props = _title_props(res)
+    assert set(props) == {"show", "text"}
+    assert res["ir"]["worksheets"][0]["title_style"] is None
+    assert _title_fact(res, "Sales by Category") is None
+
+
+def test_title_style_dynamic_title_has_no_style():
+    # a dynamic title is deferred entirely (no static text) -> no title_style computed.
+    ws = _worksheet("Dyn", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST,
+                    title="<run fontsize='15'>Sales for </run><run>&lt;Region&gt;</run>")
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["title"] is None
+    assert ir["worksheets"][0]["title_style"] is None
+
+
+def test_title_style_standalone_path_emits_font():
+    # the standalone (non-dashboard) worksheet page carries the same title font styling.
+    res = migrate_twb_to_pbir(_titled_ws("<run fontsize='20'>Big Title</run>"))
+    vj = _only_visual(res)
+    props = vj["visual"]["visualContainerObjects"]["title"][0]["properties"]
+    assert props["fontSize"]["expr"]["Literal"]["Value"] == "20D"
+
+
 # -- cross-layer measure binding (model<->viz contract consumer) ---------------
 # The datasource-migration (model) build hands back a token-keyed calc->measure manifest; the
 # dashboard (viz) build rebinds the matching workbook-local / quick-table-calc pills to those real

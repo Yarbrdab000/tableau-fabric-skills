@@ -1502,6 +1502,86 @@ def _parse_worksheet_title(ws):
     return text, bool(_TITLE_DYNAMIC_RE.search(text))
 
 
+# Per-run font attributes that Tableau records on a title's ``<run>`` but which Tier-1 title
+# styling deliberately does NOT reproduce: bold / italic / underline / font family (Tableau's
+# internal 'Tableau Bold' etc. have no Power BI equivalent) and paragraph alignment (the
+# container-title alignment enum is unconfirmed). They are recorded as ``deferred`` for a future
+# Tier-2 pass but never emitted (warn-never-wrong).
+_TITLE_STYLE_DEFER_ATTRS = ("bold", "italic", "underline", "fontname", "fontalignment")
+_HEX6_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _font_size_points(value):
+    """A Tableau ``fontsize`` (points) -> a Power BI font-size literal (``'15'`` -> ``'15D'``).
+
+    Power BI font sizes are doubles in points -- the same unit Tableau uses -- so the value passes
+    through unchanged with a ``D`` suffix. Returns ``None`` for a non-positive / non-numeric size.
+    """
+    s = (value or "").strip()
+    try:
+        n = float(s)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    return "{0}D".format(int(n) if n == int(n) else n)
+
+
+def _parse_title_style(ws):
+    """Uniform font styling for a worksheet's static title -> a Tier-2 title-style dict.
+
+    Reads the per-run font attributes on the title's ``<run>`` elements (the styling that
+    ``_parse_worksheet_title`` discards) and keeps ONLY the two unambiguous, schema-grounded
+    properties a Power BI container title can reproduce faithfully: ``font_size`` (points) and
+    ``font_color`` (``#rrggbb``). Power BI applies ONE font to the whole title, so a property is
+    emitted only when EVERY text-bearing run declares the SAME value; a title whose runs disagree
+    -- or only partially declare a property -- cannot be reproduced faithfully, so that property
+    is deferred (warn-never-wrong). Bold / italic / underline / font family / alignment are always
+    deferred. Returns the style dict (with an additive ``deferred`` list of property names seen but
+    not emitted), or ``None`` when the title carries no font styling at all.
+    """
+    layout = _first(ws, "layout-options")
+    title = _first(layout, "title") if layout is not None else None
+    ft = _first(title, "formatted-text") if title is not None else None
+    if ft is None:
+        return None
+    runs = _findall_local(ft, "run")
+    text_runs = [r for r in runs if (r.text or "").strip()]
+    if not text_runs:
+        return None
+
+    def _uniform(attr):
+        vals = [r.get(attr) for r in text_runs]
+        if all(v is not None for v in vals) and len(set(vals)) == 1:
+            return vals[0]
+        return None
+
+    style = {}
+    deferred = []
+
+    size_lit = _font_size_points(_uniform("fontsize"))
+    if size_lit is not None:
+        style["font_size"] = size_lit
+    elif any(r.get("fontsize") for r in text_runs):
+        deferred.append("fontsize")
+
+    color = _uniform("fontcolor")
+    if color is not None and _HEX6_RE.match(color):
+        style["font_color"] = color
+    elif any(r.get("fontcolor") for r in text_runs):
+        deferred.append("fontcolor")
+
+    for attr in _TITLE_STYLE_DEFER_ATTRS:
+        if any(r.get(attr) for r in text_runs):
+            deferred.append(attr)
+
+    if not style and not deferred:
+        return None
+    if deferred:
+        style["deferred"] = deferred
+    return style
+
+
 # Cartesian visual types that carry an explicit category/value axis pair whose titles can be
 # faithfully reproduced. Pie/scatter/matrix/etc. either lack a category-vs-value axis split or
 # put measures on both axes, so an axis-title override there is deferred (warn-never-wrong).
@@ -2010,6 +2090,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
             "the rebuilt visual keeps its default title"))
         title_text = None
 
+    title_style = _parse_title_style(ws) if title_text else None
+
     axis_titles = {}
     if visual_type in _AXIS_TITLE_TYPES:
         axis_titles = _parse_axis_titles(table, dims_rows, dims_cols, meas_rows, meas_cols)
@@ -2058,6 +2140,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "mark_class": mark,
         "visual_type": visual_type,
         "title": title_text,
+        "title_style": title_style,
         "axis_titles": axis_titles,
         "color_gradient": color_gradient,
         "mark_colors": mark_colors,
@@ -3323,7 +3406,8 @@ def _legend_objects(ws, ws_zone, legend_zones, vtype):
 
 
 def _visual_json(name, vtype, position, query_state, sort_definition=None,
-                 filter_config=None, title=None, axis_titles=None, value_objects=None,
+                 filter_config=None, title=None, title_style=None, axis_titles=None,
+                 value_objects=None,
                  data_point_objects=None, label_objects=None, legend_objects=None):
     visual = {"visualType": vtype}
     if query_state:
@@ -3366,14 +3450,17 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     # Structural title text (Tier-1): the worksheet's authored caption -> the visual's container
     # title. Shape verified against the official PBIR visualContainer schema + real reports: a
     # single-quoted semantic-query string literal under visualContainerObjects.title; the
-    # auto-generated field-name subtitle is suppressed so only the author's title shows. Font /
-    # colour / size styling is deliberately omitted (Tier-2).
+    # auto-generated field-name subtitle is suppressed so only the author's title shows. Tier-2
+    # title font styling (uniform font size / colour across the title's runs) is merged in when
+    # present; all other run styling is deferred (see ``_parse_title_style`` / ``_title_style_props``).
     if title:
+        title_props = {
+            "show": {"expr": {"Literal": {"Value": "true"}}},
+            "text": {"expr": {"Literal": {"Value": _semantic_string_literal(title)}}},
+        }
+        title_props.update(_title_style_props(title_style))
         visual["visualContainerObjects"] = {
-            "title": [{"properties": {
-                "show": {"expr": {"Literal": {"Value": "true"}}},
-                "text": {"expr": {"Literal": {"Value": _semantic_string_literal(title)}}},
-            }}],
+            "title": [{"properties": title_props}],
             "subTitle": [{"properties": {
                 "show": {"expr": {"Literal": {"Value": "false"}}},
             }}],
@@ -3406,6 +3493,27 @@ def _semantic_string_literal(value):
     """A Power BI semantic-query string literal: embedded single quotes, inner apostrophe doubled
     (``O'Brien`` -> ``'O''Brien'``)."""
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _title_style_props(title_style):
+    """Uniform title font styling -> ``visualContainerObjects.title`` property entries.
+
+    Emits only the two unambiguous, schema-grounded container-title font properties -- ``fontSize``
+    (a numeric ``"Nd"`` literal) and ``fontColor`` (a solid single-quoted hex literal) -- both
+    verified against the Microsoft PBIR visual-title reference. Any ``deferred`` styling recorded on
+    the style dict (bold / family / alignment / non-uniform size or colour) is intentionally NOT
+    emitted (warn-never-wrong)."""
+    props = {}
+    if not title_style:
+        return props
+    size = title_style.get("font_size")
+    if size:
+        props["fontSize"] = {"expr": {"Literal": {"Value": size}}}
+    color = title_style.get("font_color")
+    if color:
+        props["fontColor"] = {"solid": {"color": {"expr": {"Literal": {
+            "Value": _semantic_string_literal(color)}}}}}
+    return props
 
 
 def _semantic_numeric_literal(value):
@@ -3844,7 +3952,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 vname, vtype, pos, state,
                 _sort_definition(ws, state, model_table, field_map),
                 filter_config=flag_fc,
-                title=ws.get("title"), axis_titles=ws.get("axis_titles"),
+                title=ws.get("title"), title_style=ws.get("title_style"),
+                axis_titles=ws.get("axis_titles"),
                 value_objects=value_objects, data_point_objects=data_point_objects,
                 label_objects=label_objects, legend_objects=legend_objects))
             rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
@@ -3858,6 +3967,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 rec["data_labels"] = dl_fact
             if lg_fact:
                 rec["legend"] = lg_fact
+            if ws.get("title_style"):
+                rec["title_style"] = ws["title_style"]
             if flag_fc:
                 rec["flag_filters"] = [c["field"]["Measure"]["Property"]
                                        for c in flag_fc["filters"]]
@@ -3895,7 +4006,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             vname, vtype, pos, state,
             _sort_definition(ws, state, model_table, field_map),
             filter_config=flag_fc,
-            title=ws.get("title"), axis_titles=ws.get("axis_titles"),
+            title=ws.get("title"), title_style=ws.get("title_style"),
+            axis_titles=ws.get("axis_titles"),
             value_objects=value_objects, data_point_objects=data_point_objects,
             label_objects=label_objects)
         rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
@@ -3907,6 +4019,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             rec["mark_colors"] = mc_fact
         if dl_fact:
             rec["data_labels"] = dl_fact
+        if ws.get("title_style"):
+            rec["title_style"] = ws["title_style"]
         if flag_fc:
             rec["flag_filters"] = [c["field"]["Measure"]["Property"]
                                    for c in flag_fc["filters"]]

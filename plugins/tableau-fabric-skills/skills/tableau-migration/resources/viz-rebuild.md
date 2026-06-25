@@ -330,6 +330,32 @@ for it** means the author did not show that legend on the dashboard, so `show: f
 recorded on the candidate record's additive `legend` fact. Only show/position is set; legend
 title, font, and swatch styling stay Tier-2.
 
+### Title font styling (uniform size + colour)
+
+A worksheet's static title (the structural text captured per [Worksheet titles](#worksheet-titles-structural-text-only))
+may carry per-run font styling on its `<run>` elements (`fontsize`, `fontcolor`, `bold`, `fontname`,
+`fontalignment`, …). `_parse_title_style` reads those attributes and contributes the **font** of the
+visual's container title — emitted into the same `visualContainerObjects.title` properties block that
+already carries `show`/`text`. Only the two unambiguous, schema-grounded container-title properties are
+reproduced: `fontSize` (a numeric `"Nd"` literal — points pass through unchanged, the same unit Tableau
+uses) and `fontColor` (a solid single-quoted `#rrggbb` literal). Shapes verified against the Microsoft
+PBIR visual-title reference (`visualContainerObjects.title` with `fontSize`/`fontColor`).
+
+**Warn-never-wrong.** Power BI applies **one** font to the whole title, but a Tableau title is rich
+text (multiple independently-styled runs). A font property is therefore emitted **only when every
+text-bearing run declares the same value**; a title whose runs disagree — or where some runs omit the
+property (so an inherited default would apply) — defers that property and keeps the structural title
+text. A `fontcolor` that is not a clean 6-hex `#rrggbb` (e.g. an 8-hex alpha colour) is deferred.
+`bold` / `italic` / `underline`, font **family** (Tableau's internal `Tableau Bold` / `Tableau Book`
+have no Power BI equivalent), and paragraph **alignment** (an unconfirmed container-title enum) are
+**always** deferred. Every deferred property is recorded on the additive `title_style` candidate-record
+fact (`{font_size?, font_color?, deferred: [...]}`) for a future Tier-2 pass — never emitted. A dynamic
+title is already deferred wholesale (no static text), so it carries no `title_style`.
+
+**Axis-label font styling** has **zero** signal across the corpus (every axis-label format is the
+Tableau default), so it is not built — an axis font override, if one ever appears, is simply left at
+the model/theme default (warn-never-wrong).
+
 ## Binding contract (matches the v1 model exactly)
 
 The `.twb` embeds the full datasource (`<relation>` + `<metadata-records>`), so bindings are
