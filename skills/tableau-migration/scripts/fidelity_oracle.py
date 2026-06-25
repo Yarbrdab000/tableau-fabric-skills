@@ -153,6 +153,15 @@ _AGG_DERIVATIONS = {
     "stdev", "stdevp", "var", "varp", "attr", "usr", "user",
 }
 
+# Tableau date-truncation derivation tokens (TRUNC to a unit). On an axis these render as a
+# CONTINUOUS (green) date; paired with the quantitative typekey (``:qk``) and an Automatic mark
+# they are Tableau's canonical line-chart trigger. The SAME tokens with an ordinal typekey
+# (``tdy:Order Date:ok``) are a discrete date instead -- e.g. a highlight-table axis -- so the
+# typekey, not the derivation alone, decides continuity.
+_DATE_TRUNC_DERIVS = frozenset({
+    "tyr", "tqr", "tmn", "twk", "tdy", "thr", "tmi", "tse",
+})
+
 # Tableau pseudo-fields with no underlying model column. They are placeholders for the
 # Measure Values / Measure Names mechanism; the real members come from the worksheet's
 # ``<datasource-dependencies>`` aggregated column-instances.
@@ -471,12 +480,14 @@ def _parse_pill(inner, caption_index):
 
     deriv = None
     name = raw
+    typekey = None
     # ``deriv:Name:typekey`` -- split on the FIRST and LAST colon (names can contain neither here,
     # but guard by taking head/tail around the middle).
     parts = raw.split(":")
     if len(parts) >= 3:
         deriv = parts[0].strip().lower()
         name = ":".join(parts[1:-1]).strip()
+        typekey = parts[-1].strip().lower()
     elif len(parts) == 2 and parts[0] == "":
         # leading-colon special already handled above; any other ``:X`` -> treat X as name
         name = parts[1].strip()
@@ -496,6 +507,8 @@ def _parse_pill(inner, caption_index):
         "property": caption,
         "deriv": deriv,
         "is_measure": is_measure,
+        # ``qk`` = quantitative/continuous (green pill); ``ok``/``nk`` = ordinal/nominal (discrete).
+        "continuous": typekey == "qk",
         "norm": norm,
     }
 
@@ -533,6 +546,15 @@ def _measure_value_members(view, caption_index):
     return members
 
 
+def _is_continuous_date_dim(field):
+    """True when a pill is a continuous (green) date axis: a date-truncation derivation rendered as
+    quantitative (``tdy:Order Date:qk``). Under an Automatic mark Tableau draws such an axis as a
+    line; a discrete date part (``...:ok``/``:nk``) or any non-date field is not one."""
+    if not isinstance(field, dict) or field.get("is_measure"):
+        return False
+    return bool(field.get("continuous")) and (field.get("deriv") or "") in _DATE_TRUNC_DERIVS
+
+
 def _infer_twb_family(mark, dims, measures, has_geometry, uses_measure_values):
     """Second-opinion chart-family classifier for a Tableau worksheet.
 
@@ -556,6 +578,10 @@ def _infer_twb_family(mark, dims, measures, has_geometry, uses_measure_values):
             return FAM_CARD, True
         return fam, True
     # Automatic: infer from shelf shape (Tableau's own default heuristic, applied conservatively).
+    # A continuous (green) date axis under an Automatic mark is Tableau's default line chart -- the
+    # implicit measure (e.g. COUNT) or an explicit one is drawn as a line over the continuous date.
+    if any(_is_continuous_date_dim(d) for d in dims) and (measures or len(dims) == 1):
+        return FAM_LINE, True
     if uses_measure_values and not dims:
         return FAM_CARD, True
     if not dims and measures:

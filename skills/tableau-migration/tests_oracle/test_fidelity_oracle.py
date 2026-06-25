@@ -276,6 +276,53 @@ def test_type_score_square_highlight_table_matches_pivot_table():
     assert score == pytest.approx(1.0) and note == "type-match"
 
 
+def test_parse_pill_captures_continuous_flag():
+    # ``qk`` (quantitative) = continuous green pill; ``ok``/``nk`` = discrete blue pill. The same
+    # date-truncation derivation (``tdy``) appears in both forms, so the typekey is what decides.
+    assert fo._parse_pill("tdy:Order Date:qk", {})["continuous"] is True
+    assert fo._parse_pill("tdy:Order Date:ok", {})["continuous"] is False
+    assert fo._parse_pill("none:Segment:nk", {})["continuous"] is False
+
+
+def test_infer_family_continuous_date_automatic_is_line():
+    # Automatic mark over a continuous (green) date axis is Tableau's default line chart (the real
+    # Comcast "Line chart" anchor: tdy:Order Date:qk). It must assert FAM_LINE, not an unasserted bar.
+    date_dim = {"norm": "orderdate", "deriv": "tdy", "is_measure": False, "continuous": True}
+    fam, asserted = fo._infer_twb_family(
+        "Automatic", [date_dim], [{"norm": "stdev"}], False, False)
+    assert fam == fo.FAM_LINE and asserted is True
+    # A lone continuous-date dimension (implicit COUNT drawn as a line) still reads as a line.
+    fam2, asserted2 = fo._infer_twb_family("Automatic", [date_dim], [], False, False)
+    assert fam2 == fo.FAM_LINE and asserted2 is True
+
+
+def test_infer_family_discrete_date_automatic_is_not_line():
+    # A discrete (ordinal) date axis under an Automatic mark is NOT a line -- it falls back to the
+    # conservative unasserted bar (the Comcast "Segment % Dod" date is tdy:...:ok = discrete).
+    disc_date = {"norm": "orderdate", "deriv": "tdy", "is_measure": False, "continuous": False}
+    fam, asserted = fo._infer_twb_family(
+        "Automatic", [disc_date], [{"norm": "pct"}], False, False)
+    assert fam == fo.FAM_BAR and asserted is False
+
+
+def test_infer_family_text_mark_continuous_date_stays_table():
+    # An explicit Text mark wins over the continuous date: Comcast "Line chart (2)/(3)" carry a
+    # continuous date (tdy:...:qk) but a Text mark, so they are tables -- NOT lines.
+    date_dim = {"norm": "orderdate", "deriv": "tdy", "is_measure": False, "continuous": True}
+    fam, asserted = fo._infer_twb_family(
+        "Text", [{"norm": "ent"}, date_dim], [{"norm": "cnt"}], False, False)
+    assert fam == fo.FAM_TABLE and asserted is True
+
+
+def test_type_score_line_anchor_matches_line_chart():
+    # The genuine-line worksheet (asserted FAM_LINE) vs an emitted lineChart is a clean type-match,
+    # lifting the faithful-end anchor sheet off the 0.85 unasserted credit.
+    line_ws = {"family": fo.FAM_LINE, "family_asserted": True}
+    line_v = {"family": fo.FAM_LINE}
+    score, note = fo._type_score(line_ws, line_v)
+    assert score == pytest.approx(1.0) and note == "type-match"
+
+
 # --------------------------------------------------------------------------- scoring primitives
 def test_jaccard_and_bands():
     assert fo._jaccard(set(), set()) == 1.0

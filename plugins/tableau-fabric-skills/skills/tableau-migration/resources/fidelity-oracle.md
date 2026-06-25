@@ -55,6 +55,16 @@ non‑slicer visuals by `0.7·field‑overlap + 0.3·position`. Worksheets on no
 field‑only best match. Slicers are scored separately as **filter fidelity** (does a slicer field
 correspond to a Tableau categorical filter on that dashboard?).
 
+The **chart‑family classifier** reads the worksheet's mark + shelf pills independently of the engine.
+An explicit mark wins (`Text`→table/card, `Square`+dimensions→highlight‑table→matrix, `Bar`→bar,
+geometry→map). Under an `Automatic` mark it applies Tableau's own defaults *conservatively*: a
+**continuous (green) date axis** — a date‑truncation pill rendered quantitatively (`tdy:Order Date:qk`)
+— is asserted as a **line**, while ambiguous dim+measure shapes stay an *unasserted* bar that earns
+partial credit rather than punishing a plausible rebuild. The continuous/discrete distinction comes
+from the pill **typekey** (`qk` continuous vs `ok`/`nk` discrete), so the *same* `tdy` derivation is a
+line on a continuous axis but a matrix/table axis when discrete (the real Comcast `Line chart` vs
+`Segment % Dod`).
+
 **Aggregate** = mean per‑visual score × coverage (the fraction of source worksheets that found a
 peer). An unmatched worksheet drags the aggregate down — a faithful rebuild leaves none behind.
 
