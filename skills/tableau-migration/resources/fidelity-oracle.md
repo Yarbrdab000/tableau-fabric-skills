@@ -68,6 +68,28 @@ line on a continuous axis but a matrix/table axis when discrete (the real Comcas
 **Aggregate** = mean per‑visual score × coverage (the fraction of source worksheets that found a
 peer). An unmatched worksheet drags the aggregate down — a faithful rebuild leaves none behind.
 
+### Minute placement — layout fidelity from geometry alone (render‑free)
+
+The `position` **score** above is an IoU inside a tolerance band, so it deliberately rounds small
+offsets to a full match. Layout is fundamentally a **zone** problem, not a pixel problem, so to make
+positioning *minute* each dashboard‑paired visual also carries an additive **`placement`** block —
+**no Power BI render is ever required**. The Tableau dashboard zone (normalized to the dashboard
+extent) is projected onto the PBI page canvas in pixels, the authoritative placement target, and
+diffed **edge‑by‑edge** against the emitted PBIR visual's own canvas px:
+
+- `tableau_zone_px` / `pbir_px` — the zone target vs the emitted rect, on the canvas.
+- `delta_px` — signed `left / top / right / bottom / width / height / center` offsets.
+- `max_edge_px` — worst single‑edge drift; `pixel_exact` (≤ 2 px) and `within_tolerance`
+  (≤ 1 % of the canvas — the bar a hand‑built faithful copy hits by eye) flags.
+
+Because the deterministic engine derives placement from the *same* Tableau zones, a faithful rebuild
+lands **pixel‑exact**: on both calibration cases every visual reports `max_edge_px ≈ 0.00` / IoU
+`1.000` (SIMPLE `Sheet 1–4`, COMCAST `Line chart`/`Segment % Dod`/`Line chart (2)`/`(3)`). This is
+the layout proof — established purely from the `.twb` zone geometry and the PBIR spec, with the PBI
+side **always the spec, never a screenshot**. (Pixel rasterization of a `.pbip` requires Power BI
+Desktop or the Service and would only ever speak to *styling* — colors/marks as drawn — which is the
+image tier's advisory concern, not layout.)
+
 ### Advisory bands
 
 | Band | Aggregate | Read it as |

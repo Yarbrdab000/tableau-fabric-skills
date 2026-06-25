@@ -588,6 +588,44 @@ def test_iou_identical_and_disjoint():
     assert fo._iou(a, b) == pytest.approx(0.0)
 
 
+def test_placement_delta_reports_minute_pixel_drift():
+    # The Tableau zone projected onto the canvas vs the emitted px, diffed edge-by-edge -- render free.
+    zone = {"nposition": {"x": 0.0, "y": 0.0, "w": 0.5, "h": 1.0}}
+    # Emitted 10 px right and 4 px narrower on a 1280x720 canvas.
+    visual = {"position": {"x": 10.0, "y": 0.0, "w": 636.0, "h": 720.0},
+              "nposition": {"x": 10 / 1280, "y": 0.0, "w": 636 / 1280, "h": 1.0}}
+    pl = fo._placement_delta(zone, visual, 1280.0, 720.0)
+    assert pl["tableau_zone_px"] == {"x": 0.0, "y": 0.0, "w": 640.0, "h": 720.0}
+    assert pl["delta_px"]["left"] == pytest.approx(10.0)
+    assert pl["delta_px"]["right"] == pytest.approx(6.0)     # (10+636)-(0+640)
+    assert pl["delta_px"]["width"] == pytest.approx(-4.0)
+    assert pl["max_edge_px"] == pytest.approx(10.0)
+    assert pl["pixel_exact"] is False
+    assert pl["within_tolerance"] is True                    # 10 <= 0.01*1280
+
+
+def test_placement_delta_guards_missing_geometry():
+    # No zone, no position, or no canvas -> graceful None (never raises).
+    assert fo._placement_delta(None, {"position": {"x": 0, "y": 0, "w": 1, "h": 1}}, 1280, 720) is None
+    assert fo._placement_delta({"nposition": {"x": 0, "y": 0, "w": 1, "h": 1}}, {}, 1280, 720) is None
+    assert fo._placement_delta({"nposition": {"x": 0, "y": 0, "w": 1, "h": 1}},
+                               {"position": {"x": 0, "y": 0, "w": 1, "h": 1}}, 0, 0) is None
+
+
+def test_score_pair_attaches_pixel_exact_placement(tmp_path):
+    # An engine that derives placement from the source zones lands pixel-exact -- no render needed.
+    report = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    twb = fo.read_twb_views(TWB_XML)
+    pbir = fo.read_pbir_report(report)
+    result = fo.score_report(twb, pbir)
+    by_ws = {r["worksheet"]: r for r in result["visuals"]}
+    for ws in ("Bars", "Trend"):
+        pl = by_ws[ws]["placement"]
+        assert pl["pixel_exact"] is True
+        assert pl["max_edge_px"] == pytest.approx(0.0)
+        assert pl["iou"] == pytest.approx(1.0)
+
+
 def test_type_score_related_partial():
     area_ws = {"family": fo.FAM_AREA, "family_asserted": True}
     line_v = {"family": fo.FAM_LINE}

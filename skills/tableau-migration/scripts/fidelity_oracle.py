@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import xml.etree.ElementTree as ET
@@ -68,6 +69,18 @@ TYPE_UNASSERTED_CREDIT = 0.85
 # below it the credit tapers linearly to zero. Cross-engine layout rounding lives well inside this.
 POSITION_FULL_IOU = 0.80
 POSITION_ZERO_IOU = 0.20
+
+# Minute placement check: the Tableau dashboard zone, projected onto the PBI canvas, is compared
+# edge-by-edge against the emitted visual's own canvas px. A worst-edge offset at/under this many
+# target-canvas pixels is treated as a pixel-exact placement. This is a DIAGNOSTIC (it surfaces the
+# exact per-zone drift the IoU band rounds away); it does not change the position score, so it never
+# moves calibration. Layout fidelity is proven from geometry alone -- never from a PBI render.
+PLACEMENT_EXACT_PX = 2.0
+# A softer, human-calibrated bar: a hand-built faithful copy places zones by eye to within roughly a
+# percent of the canvas and reads as "decent" zoning, so a worst-edge offset within this fraction of
+# the canvas is reported as an acceptable placement (an engine deriving placement from the source
+# zones should sit comfortably under it).
+PLACEMENT_ACCEPTABLE_FRAC = 0.01
 
 # Advisory band thresholds on the aggregate 0..1 score. Named bands, never pass/fail.
 BANDS = (
@@ -896,7 +909,51 @@ def _position_score(zone, pbir_visual):
     return (iou - POSITION_ZERO_IOU) / (POSITION_FULL_IOU - POSITION_ZERO_IOU)
 
 
-def _score_pair(twb_ws, pbir_visual, zone):
+def _placement_delta(zone, pbir_visual, canvas_w, canvas_h):
+    """Minute, render-free placement check.
+
+    Project the Tableau dashboard zone (normalized to the dashboard extent) onto the PBI canvas in
+    pixels, then diff it edge-by-edge against the emitted visual's own canvas px. The result is how
+    far -- to the pixel -- the engine placed each visual from the zone it must occupy. This proves
+    layout fidelity from geometry alone: the PBI side is the spec, never a render. It is purely
+    additive diagnostics and does not feed the position score (so it cannot move calibration).
+    """
+    z = zone.get("nposition") if zone else None
+    p = pbir_visual.get("position")
+    if not z or not p:
+        return None
+    if None in (p.get("x"), p.get("y"), p.get("w"), p.get("h")) or not canvas_w or not canvas_h:
+        return None
+    # The Tableau zone projected onto the PBI canvas (px) is the authoritative placement target.
+    tz = {"x": z["x"] * canvas_w, "y": z["y"] * canvas_h,
+          "w": z["w"] * canvas_w, "h": z["h"] * canvas_h}
+    d_left = p["x"] - tz["x"]
+    d_top = p["y"] - tz["y"]
+    d_right = (p["x"] + p["w"]) - (tz["x"] + tz["w"])
+    d_bottom = (p["y"] + p["h"]) - (tz["y"] + tz["h"])
+    d_w = p["w"] - tz["w"]
+    d_h = p["h"] - tz["h"]
+    d_center = math.hypot((p["x"] + p["w"] / 2.0) - (tz["x"] + tz["w"] / 2.0),
+                          (p["y"] + p["h"] / 2.0) - (tz["y"] + tz["h"] / 2.0))
+    max_edge = max(abs(d_left), abs(d_top), abs(d_right), abs(d_bottom))
+    accept_px = PLACEMENT_ACCEPTABLE_FRAC * max(canvas_w, canvas_h)
+    iou = _iou(z, pbir_visual.get("nposition")) if pbir_visual.get("nposition") else None
+    r2 = lambda v: round(v, 2)
+    return {
+        "canvas": {"w": canvas_w, "h": canvas_h},
+        "tableau_zone_px": {k: r2(tz[k]) for k in ("x", "y", "w", "h")},
+        "pbir_px": {"x": r2(p["x"]), "y": r2(p["y"]), "w": r2(p["w"]), "h": r2(p["h"])},
+        "delta_px": {"left": r2(d_left), "top": r2(d_top), "right": r2(d_right),
+                     "bottom": r2(d_bottom), "width": r2(d_w), "height": r2(d_h),
+                     "center": r2(d_center)},
+        "max_edge_px": r2(max_edge),
+        "iou": round(iou, 4) if iou is not None else None,
+        "pixel_exact": max_edge <= PLACEMENT_EXACT_PX,
+        "within_tolerance": max_edge <= accept_px,
+    }
+
+
+def _score_pair(twb_ws, pbir_visual, zone, canvas_w=None, canvas_h=None):
     type_s, type_note = _type_score(twb_ws, pbir_visual)
     src_fields = _field_norms(twb_ws["fields"])
     tgt_fields = _field_norms(pbir_visual["fields"])
@@ -922,7 +979,7 @@ def _score_pair(twb_ws, pbir_visual, zone):
     if (type_s >= _REMODEL_TYPE_MIN and field_s < _REMODEL_FIELDS_MAX
             and (pos_val is None or pos_val >= _REMODEL_POSITION_MIN)):
         diagnosis = _REMODEL_DIAGNOSIS
-    return {
+    result = {
         "worksheet": twb_ws["name"],
         "visual": pbir_visual["name"],
         "visual_type": pbir_visual["visual_type"],
@@ -937,6 +994,10 @@ def _score_pair(twb_ws, pbir_visual, zone):
         "fields_missing": missing,   # in Tableau source, absent from rebuilt visual
         "fields_extra": extra,       # in rebuilt visual, absent from Tableau source
     }
+    placement = _placement_delta(zone, pbir_visual, canvas_w, canvas_h)
+    if placement is not None:
+        result["placement"] = placement
+    return result
 
 
 def _pair_score(twb_ws, pbir_visual, zone):
@@ -1081,7 +1142,7 @@ def score_report(twb, pbir, engine_report=None, field_aliases=None):
             ws = ws_by_name[wsn]
             v = vidx[vn]
             zone = zone_by_ws.get(wsn)
-            res = _score_pair(ws, v, zone)
+            res = _score_pair(ws, v, zone, page.get("width"), page.get("height"))
             res["page"] = page["display"]
             res["dashboard"] = dash["name"]
             res["engine_intent"] = engine_intent.get(wsn)
@@ -1908,6 +1969,26 @@ def render_markdown(report):
             type_cell,
             ", ".join(r["fields_missing"]) or "-",
             ", ".join(r["fields_extra"]) or "-"))
+    placed = [r for r in report["visuals"] if r.get("placement")]
+    if placed:
+        lines.append("")
+        lines.append("## Placement (zone fidelity, target-canvas px)")
+        lines.append("_Render-free: the Tableau dashboard zone is projected onto the PBI canvas and "
+                     "diffed edge-by-edge against the emitted visual's px — no Power BI render._")
+        lines.append("")
+        lines.append("| Worksheet | Worst edge px | Center px | IoU | Placement |")
+        lines.append("|---|---|---|---|---|")
+        for r in placed:
+            pl = r["placement"]
+            if pl.get("pixel_exact"):
+                verdict = "pixel-exact"
+            elif pl.get("within_tolerance"):
+                verdict = "acceptable"
+            else:
+                verdict = "drifted"
+            lines.append("| %s | %s | %s | %s | %s |" % (
+                r["worksheet"], pl["max_edge_px"], pl["delta_px"]["center"],
+                "-" if pl["iou"] is None else ("%.3f" % pl["iou"]), verdict))
     if report["slicers"]:
         lines.append("")
         lines.append("## Slicers / filters")
