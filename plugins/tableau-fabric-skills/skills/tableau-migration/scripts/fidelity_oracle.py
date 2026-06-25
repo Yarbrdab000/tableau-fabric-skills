@@ -639,30 +639,35 @@ def _worksheet_record(ws, caption_index):
     encoding_fields = []
     has_geometry = False
     if panes is not None:
-        pane = _first_child(panes, "pane")
-        if pane is not None:
+        # Iterate EVERY pane, not just the first: a dual-axis worksheet emits one <pane> per axis,
+        # each with its own <encodings>, so a first-pane-only read silently drops the secondary
+        # axis's color/size/detail bindings. (This matches _has_measure_values_encoding, which
+        # already scans all panes.) The mark class is taken from the first pane as the family-
+        # inference representative; encodings repeated across panes dedup downstream.
+        for pane_index, pane in enumerate(_children(panes, "pane")):
             mark_el = _first_child(pane, "mark")
-            if mark_el is not None and mark_el.get("class"):
+            if pane_index == 0 and mark_el is not None and mark_el.get("class"):
                 mark = mark_el.get("class")
             enc = _first_child(pane, "encodings")
-            if enc is not None:
-                for e in enc:
-                    if _local(e.tag) == "geometry":
-                        has_geometry = True
+            if enc is None:
+                continue
+            for e in enc:
+                if _local(e.tag) == "geometry":
+                    has_geometry = True
+                    continue
+                col = e.get("column")
+                channel = _local(e.tag)
+                for m in _PILL_RE.finditer(col or ""):
+                    fld = _parse_pill(m.group("inner"), caption_index)
+                    if fld is None:
                         continue
-                    col = e.get("column")
-                    channel = _local(e.tag)
-                    for m in _PILL_RE.finditer(col or ""):
-                        fld = _parse_pill(m.group("inner"), caption_index)
-                        if fld is None:
-                            continue
-                        # A MEASURE on the LOD/detail channel backs a reference-line distribution
-                        # band (e.g. a WINDOW_STDEV computation), not a visible mark encoding the
-                        # rebuild must reproduce -- exclude it so a faithful rebuild is not charged
-                        # for omitting decoration. Genuine detail DIMENSIONS on <lod> are kept.
-                        if channel == "lod" and fld.get("is_measure"):
-                            continue
-                        encoding_fields.append(dict(fld, channel=channel))
+                    # A MEASURE on the LOD/detail channel backs a reference-line distribution
+                    # band (e.g. a WINDOW_STDEV computation), not a visible mark encoding the
+                    # rebuild must reproduce -- exclude it so a faithful rebuild is not charged
+                    # for omitting decoration. Genuine detail DIMENSIONS on <lod> are kept.
+                    if channel == "lod" and fld.get("is_measure"):
+                        continue
+                    encoding_fields.append(dict(fld, channel=channel))
 
     shelf_text = (rows_text + " " + cols_text).lower()
     uses_measure_values = (":measure names" in shelf_text

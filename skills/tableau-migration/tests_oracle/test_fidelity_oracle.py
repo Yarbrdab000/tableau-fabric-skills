@@ -280,6 +280,39 @@ def test_lod_measure_encoding_excluded_dimension_kept():
     assert "stddev" not in {f["norm"] for f in ws["measures"]}
 
 
+def test_dual_axis_secondary_pane_encodings_collected():
+    # A dual-axis worksheet emits one <pane> per axis, each with its own <encodings>. The parser
+    # must read EVERY pane, not just the first, or the secondary axis's color/size/detail bindings
+    # are silently dropped. The mark is taken from the first pane for family inference.
+    xml = (
+        "<?xml version='1.0' encoding='utf-8'?>"
+        "<workbook><datasources>"
+        "<datasource name='fed.0abc' caption='Sample'>"
+        "<column name='[Sales]' caption='Sales' datatype='real' role='measure'/>"
+        "<column name='[Profit]' caption='Profit' datatype='real' role='measure'/>"
+        "<column name='[Region]' caption='Region' datatype='string' role='dimension'/>"
+        "<column name='[Segment]' caption='Segment' datatype='string' role='dimension'/>"
+        "</datasource></datasources><worksheets>"
+        "<worksheet name='Dual'><table>"
+        "<view><datasources><datasource name='fed.0abc' caption='Sample'/></datasources></view>"
+        "<panes>"
+        "<pane><mark class='Line'/><encodings>"
+        "<color column='[fed.0abc].[none:Region:nk]'/></encodings></pane>"
+        "<pane><mark class='Bar'/><encodings>"
+        "<color column='[fed.0abc].[none:Segment:nk]'/></encodings></pane>"
+        "</panes>"
+        "<rows>([fed.0abc].[sum:Sales:qk] + [fed.0abc].[sum:Profit:qk])</rows>"
+        "<cols>[fed.0abc].[none:Region:nk]</cols>"
+        "</table></worksheet></worksheets></workbook>"
+    )
+    ws = fo.read_twb_views(xml)["worksheets"]["Dual"]
+    norms = {f["norm"] for f in ws["fields"]}
+    assert "segment" in norms              # secondary-pane color must NOT be dropped
+    assert "region" in norms
+    assert "sales" in norms and "profit" in norms
+    assert ws["mark"] == "Line"            # mark taken from the FIRST pane
+
+
 def test_infer_family_card_when_no_dims():
     fam, asserted = fo._infer_twb_family("Automatic", [], [{"norm": "sales"}], False, False)
     assert fam == fo.FAM_CARD and asserted is True
