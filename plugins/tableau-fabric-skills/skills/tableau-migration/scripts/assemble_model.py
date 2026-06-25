@@ -1209,7 +1209,8 @@ def _related_date_dax(date_table, column):
 
 
 def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
-                       date_table=None, active_date_cols=None, consumed=None):
+                       date_table=None, active_date_cols=None, consumed=None,
+                       approved_calc_dax=None):
     """Translate row-level (dimension) ``dim_calcs`` via column mode and group the rendered
     calculated-column TMDL by target table, plus a per-column report.
 
@@ -1232,6 +1233,14 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
     inert stub here -- the measure entry point owns those. Returns ``(by_table, report)`` where
     ``by_table`` is ``{table_display: concatenated_tmdl}``.
 
+    ASSISTED TRANSLATION (opt-in): ``approved_calc_dax`` (``{calc_name: dax}``, case-insensitive) is
+    the column-mode peer of the measures' approved landing. It is consulted ONLY when the
+    deterministic tier produced no DAX (a stub), so a faithful Tier-0 calculated column is never
+    overridden. A match flips the inert stub into a LIVE calculated column tagged
+    ``TranslatedBy = assisted translation (human-approved)`` with status ``assisted-approved``; the
+    original Tableau formula is preserved as ``TableauFormula``. With no approval the behavior is
+    byte-for-byte unchanged.
+
     **Date-dimension binding (optional).** When ``date_table`` (the generated calendar's name)
     and ``active_date_cols`` (the set of ``(table, column)`` carrying the ACTIVE date
     relationship) are supplied, a calc that is exactly a calendar attribute of a single date
@@ -1246,6 +1255,7 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
     by_table = {}
     report = []
     consumed_lower = {(c or "").lower() for c in (consumed or set())}
+    approved_lower = {(k or "").lower(): v for k, v in (approved_calc_dax or {}).items()}
     active_date_cols = active_date_cols or set()
     for calc in dim_calcs or []:
         name, formula = calc["name"], calc.get("formula", "")
@@ -1277,6 +1287,27 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
             target = next(iter(tables_used))
         else:                                # constant DAX, or stub with no/ambiguous home
             target = anchor_table
+        # Deterministic fallback -> a human-approved assisted translation (the column-mode peer of
+        # the measures' approved_calc_dax landing). Consulted ONLY when Tier 0 produced no DAX, so a
+        # faithful deterministic column is never overridden; the approved expression lands LIVE.
+        approved = approved_lower.get(name.lower()) if not dax else None
+        if approved:
+            approved_expr = " ".join(approved.split())  # collapse to one valid DAX line
+            by_table[target] = by_table.get(target, "") + T.generate_calc_column_tmdl(
+                name, formula, approved_expr,
+                translated_by="assisted translation (human-approved)")
+            report.append({
+                "column": name,
+                "table": target,
+                "status": "assisted-approved",
+                "reason": reason,
+                "dax": approved_expr,
+                "tableau_formula": formula,
+                "date_bound": False,
+                "date_table": None,
+                "date_attribute": None,
+            })
+            continue
         by_table[target] = by_table.get(target, "") + T.generate_calc_column_tmdl(name, formula, dax)
         report.append({
             "column": name,
@@ -1294,33 +1325,44 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
 
 def calc_column_coverage_artifact(calc_column_report):
     """Additive coverage rollup for dimension calc COLUMNS, the column-mode peer of
-    ``calc_coverage_artifact`` (measures). Each row is bucketed ``translated`` (a LIVE DAX
-    calculated column) or ``stub`` (an inert ``= BLANK()`` that preserves the Tableau formula),
-    with the same honest ``deterministic_coverage_pct`` (``None`` when the model has no dimension
-    calcs, never a misleading 0/100). Pure; reads only the already-computed report rows."""
-    buckets = {"translated": 0, "stub": 0}
+    ``calc_coverage_artifact`` (measures). Each row is bucketed ``translated`` (a LIVE deterministic
+    DAX calculated column), ``assisted_approved`` (a LIVE human-approved assisted translation), or
+    ``stub`` (an inert ``= BLANK()`` that preserves the Tableau formula). ``deterministic_coverage_pct``
+    counts only the deterministic subset; the additive ``live_coverage_pct`` also credits approved
+    assists (both ``None`` when the model has no dimension calcs, never a misleading 0/100). Pure;
+    reads only the already-computed report rows."""
+    buckets = {"translated": 0, "assisted_approved": 0, "stub": 0}
     columns = []
     for row in calc_column_report or []:
-        bucket = "translated" if row.get("status") == "translated" else "stub"
+        status = row.get("status")
+        if status == "translated":
+            bucket = "translated"
+        elif status == "assisted-approved":
+            bucket = "assisted_approved"
+        else:
+            bucket = "stub"
         buckets[bucket] += 1
         columns.append({
             "column": row.get("column"),
             "table": row.get("table"),
-            "status": row.get("status"),
+            "status": status,
             "bucket": bucket,
-            "live": bucket == "translated",
+            "live": bucket in ("translated", "assisted_approved"),
             "reason": row.get("reason"),
             "tableau_formula": row.get("tableau_formula"),
         })
     total = len(columns)
-    live = buckets["translated"]
+    deterministic = buckets["translated"]
+    live = buckets["translated"] + buckets["assisted_approved"]
     summary = {
         "total": total,
-        "translated": live,
+        "translated": deterministic,
+        "assisted_approved": buckets["assisted_approved"],
         "stub": buckets["stub"],
         "live": live,
         "inert": total - live,
-        "deterministic_coverage_pct": _coverage_pct(live, total),
+        "deterministic_coverage_pct": _coverage_pct(deterministic, total),
+        "live_coverage_pct": _coverage_pct(live, total),
     }
     return {"summary": summary, "columns": columns}
 
@@ -1607,6 +1649,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     calc_columns_by_table, calc_column_report = _calc_columns_part(
         dim_calcs, resolve, anchor_table=table_names[0],
         date_table=date_name, active_date_cols=active_date_cols,
+        approved_calc_dax=approved_calc_dax,
         consumed=(set(consumed) | flag_source_names) if flag_source_names else consumed)
     for disp, block in calc_columns_by_table.items():
         path = f"definition/tables/{disp}.tmdl"

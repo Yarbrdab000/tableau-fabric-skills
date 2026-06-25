@@ -446,6 +446,92 @@ def test_calc_column_report_and_coverage_artifact():
     assert cov["deterministic_coverage_pct"] == 66.7
 
 
+# -- assisted (human-approved) landing for a STUBBED dimension calc: the column-mode peer of the
+#    measures' approved_calc_dax path -- i.e. the second-compiler loop for a dimension-role calc.
+#    Exercises the real Comcast pilot needs_review calc "Highest Selling City By State (name)".
+_PILOT_NAME_FORMULA = (
+    "IF \n{fixed [State/Province]:Max(\n{fixed [State/Province],[City]: SUM([Sales])}\n)}\n"
+    "= \n{fixed [State/Province],[City]: SUM([Sales])}\nthen [State/Province]\nEND")
+_PILOT_NAME_DAX = (
+    "IF ( CALCULATE ( SUM ( 'Orders'[Sales] ), "
+    "ALLEXCEPT ( 'Orders', 'Orders'[State_Province], 'Orders'[City] ) ) "
+    "= MAXX ( CALCULATETABLE ( ADDCOLUMNS ( "
+    "SUMMARIZE ( 'Orders', 'Orders'[State_Province], 'Orders'[City] ), "
+    "\"@cs\", CALCULATE ( SUM ( 'Orders'[Sales] ) ) ), "
+    "ALLEXCEPT ( 'Orders', 'Orders'[State_Province] ) ), [@cs] ), "
+    "'Orders'[State_Province] )")
+
+
+def test_approved_dim_calc_lands_as_assisted_approved_calc_column():
+    # The deterministic tier STUBS a nested-FIXED-LOD dimension calc; a human-approved assisted DAX
+    # flips it into a LIVE calculated column on its home table.
+    dim_calcs = [{"name": "Highest Selling City By State (name)", "formula": _PILOT_NAME_FORMULA}]
+    out = assemble_import_model(
+        parse_tds(LIVE_SQLSERVER), model_name="Superstore", dim_calcs=dim_calcs,
+        approved_calc_dax={"Highest Selling City By State (name)": _PILOT_NAME_DAX})
+    row = {r["column"]: r for r in out["report"]["calc_columns"]}[
+        "Highest Selling City By State (name)"]
+    assert row["status"] == "assisted-approved"
+    assert row["dax"] == _PILOT_NAME_DAX
+    assert row["table"] == "Orders"
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert _PILOT_NAME_DAX in orders
+    assert "annotation TranslatedBy = assisted translation (human-approved)" in orders
+    # original Tableau formula preserved for audit/repair
+    assert "annotation TableauFormula = IF" in orders
+    # coverage credits the approved column as LIVE without inflating the deterministic count
+    cov = out["report"]["calc_column_coverage"]["summary"]
+    assert cov["translated"] == 0
+    assert cov["assisted_approved"] == 1
+    assert cov["live"] == 1
+    assert cov["inert"] == 0
+    assert cov["deterministic_coverage_pct"] == 0.0
+    assert cov["live_coverage_pct"] == 100.0
+
+
+def test_approved_dim_calc_never_overrides_a_deterministic_translation():
+    # An approval for a calc Tier 0 ALREADY translates faithfully is ignored -- deterministic wins.
+    dim_calcs = [{"name": "Order Code", "formula": "UPPER([Order ID])"}]
+    out = assemble_import_model(
+        parse_tds(LIVE_SQLSERVER), model_name="Superstore", dim_calcs=dim_calcs,
+        approved_calc_dax={"Order Code": '"OVERRIDE"'})
+    row = {r["column"]: r for r in out["report"]["calc_columns"]}["Order Code"]
+    assert row["status"] == "translated"
+    assert row["dax"] == "UPPER('Orders'[Order_ID])"
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "OVERRIDE" not in orders
+    assert "annotation TranslatedBy = deterministic" in orders
+
+
+def test_handoff_artifact_counts_approved_dim_calc_as_live_not_needs_review():
+    # The Tier-0 -> Tier-1 handoff must see an approved dimension calc as LIVE, not needs_review.
+    dim_calcs = [{"name": "Avg Sale Col", "formula": "AVG([Sales])"}]
+    out = assemble_import_model(
+        parse_tds(LIVE_SQLSERVER), model_name="Superstore", dim_calcs=dim_calcs,
+        approved_calc_dax={"Avg Sale Col": "AVERAGE ( 'Orders'[Sales] )"})
+    th = out["report"]["translation_handoff"]
+    assert th["summary"]["assisted_approved"] >= 1
+    assert all(r["name"] != "Avg Sale Col" for r in th["needs_review"])
+
+
+def test_no_approval_leaves_dim_calc_stub_byte_identical():
+    # Without an approval the stubbed dimension calc is unchanged (the additive channel is inert).
+    # lineageTag UUIDs are regenerated per run, so normalize them before comparing structure.
+    import re as _re
+    norm = lambda t: _re.sub(r"lineageTag: [0-9a-f-]+", "lineageTag: <id>", t)
+    base = _dim_calc_model()["parts"]["definition/tables/Orders.tmdl"]
+    same = assemble_import_model(
+        parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+        calcs=[{"name": "Profit Ratio", "formula": "SUM([Sales])/SUM([Quantity])"}],
+        dim_calcs=[
+            {"name": "Sales Flag", "formula": 'IF [Sales]>0 THEN "Y" ELSE "N" END'},
+            {"name": "Order Code", "formula": "UPPER([Order ID])"},
+            {"name": "Avg Sale Col", "formula": "AVG([Sales])"},
+        ],
+        approved_calc_dax={})["parts"]["definition/tables/Orders.tmdl"]
+    assert norm(base) == norm(same)
+
+
 def test_dim_calcs_do_not_disturb_measures_or_default_shape():
     out = _dim_calc_model()
     measures = out["parts"]["definition/tables/_Measures.tmdl"]

@@ -1773,6 +1773,136 @@ def test_row_count_binding_from_model_none_when_absent_or_empty():
         {"row_count_measures": {"Orders": {"entity": "_Measures"}}}) is None
 
 
+# -- second-compiler landing through the estate command (--approved-dax) -------
+# The estate orchestrator threads an opt-in ``approved_calc_dax`` ({calc_name: dax}) mapping into
+# every model build so a Tier-0 stub whose name matches lands as a LIVE, audit-stamped measure --
+# the documented, no-improvisation way to redeploy the assisted (second-compiler) tier in bulk.
+# ``Running Amount`` (RUNNING_SUM(...)) is the WIDGET_SALES_TDS measure that stubs on the
+# datasource path, so it is the natural subject.
+_APPROVED_RUNNING_AMOUNT_DAX = ("CALCULATE ( SUM ( 'Sales'[Amount] ), "
+                                "FILTER ( ALLSELECTED ( 'Sales' ), TRUE () ) )")
+
+
+def _read_measures_tmdl(bundle_root, ds_folder="widget_sales.SemanticModel"):
+    path = os.path.join(bundle_root, "semantic_models", ds_folder,
+                        "definition", "tables", "_Measures.tmdl")
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_load_approved_dax_returns_none_for_falsy_path():
+    assert me._load_approved_dax(None) is None
+    assert me._load_approved_dax("") is None
+
+
+def test_load_approved_dax_reads_mapping_and_tolerates_bom(tmp_path):
+    p = tmp_path / "approved.json"
+    # written WITH a BOM (utf-8-sig) -- hand-authored on Windows is the common case
+    p.write_text(json.dumps({"Running Amount": _APPROVED_RUNNING_AMOUNT_DAX}), encoding="utf-8-sig")
+    assert me._load_approved_dax(str(p)) == {"Running Amount": _APPROVED_RUNNING_AMOUNT_DAX}
+
+
+def test_load_approved_dax_empty_object_is_none(tmp_path):
+    p = tmp_path / "approved.json"
+    p.write_text("{}", encoding="utf-8")
+    assert me._load_approved_dax(str(p)) is None
+
+
+def test_load_approved_dax_missing_file_raises(tmp_path):
+    with pytest.raises(ValueError, match="not found"):
+        me._load_approved_dax(str(tmp_path / "nope.json"))
+
+
+def test_load_approved_dax_non_object_raises(tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(["Running Amount", "dax"]), encoding="utf-8")
+    with pytest.raises(ValueError, match="calc name -> DAX"):
+        me._load_approved_dax(str(p))
+
+
+def test_load_approved_dax_non_string_value_raises(tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps({"Running Amount": 5}), encoding="utf-8")
+    with pytest.raises(ValueError, match="calc name -> DAX"):
+        me._load_approved_dax(str(p))
+
+
+def test_load_approved_dax_unreadable_json_raises(tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text("{ not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="not readable JSON"):
+        me._load_approved_dax(str(p))
+
+
+def test_migrate_estate_approved_dax_lands_stub_as_assisted_approved(fixtures_dir, tmp_path):
+    out = str(tmp_path / "bundle")
+    report = migrate_estate(LocalFilesSource(fixtures_dir), out,
+                            approved_calc_dax={"Running Amount": _APPROVED_RUNNING_AMOUNT_DAX})
+
+    detail = next(d for d in report["datasources"] if d["name"] == "widget_sales")
+    by_row = {m["measure"]: m for m in detail["measures"]}
+    # the formerly-stubbed table calc is now a live, human-approved measure
+    assert by_row["Running Amount"]["status"] == "assisted-approved"
+    assert by_row["Running Amount"]["dax"] == _APPROVED_RUNNING_AMOUNT_DAX
+    # the deterministically-translated measures are untouched
+    assert by_row["Total Amount"]["status"] == "translated"
+    # it is no longer counted as needing review
+    handoff = detail.get("translation_handoff") or {}
+    assert not any(r.get("name") == "Running Amount" for r in handoff.get("needs_review", []))
+
+    # the approved DAX + its provenance annotation actually land in the emitted TMDL
+    tmdl = _read_measures_tmdl(out)
+    assert _APPROVED_RUNNING_AMOUNT_DAX in tmdl
+    assert "assisted translation (human-approved)" in tmdl
+
+
+def test_migrate_estate_approved_dax_non_matching_name_leaves_stub(fixtures_dir, tmp_path):
+    # An approval whose name does not match any stub is inert -- the calc stays a stub, never
+    # mis-bound to an unrelated measure.
+    out = str(tmp_path / "bundle")
+    report = migrate_estate(LocalFilesSource(fixtures_dir), out,
+                            approved_calc_dax={"Some Other Calc": "SUM ( 'Sales'[Amount] )"})
+    detail = next(d for d in report["datasources"] if d["name"] == "widget_sales")
+    by_status = {m["measure"]: m["status"] for m in detail["measures"]}
+    assert by_status["Running Amount"] == "stub"
+
+
+def test_migrate_estate_approved_dax_none_is_a_noop(fixtures_dir, tmp_path):
+    # The default (None) and an empty mapping both leave the run byte-identical to no approval:
+    # Running Amount stays a stub exactly as before the flag existed.
+    for idx, approved in enumerate((None, {})):
+        out = str(tmp_path / f"bundle_{idx}")
+        report = migrate_estate(LocalFilesSource(fixtures_dir), out, approved_calc_dax=approved)
+        detail = next(d for d in report["datasources"] if d["name"] == "widget_sales")
+        by_status = {m["measure"]: m["status"] for m in detail["measures"]}
+        assert by_status["Running Amount"] == "stub"
+
+
+def test_main_approved_dax_flag_lands_via_cli(fixtures_dir, tmp_path):
+    # End-to-end through the documented CLI: --approved-dax <file.json> lands the approved measure.
+    out = str(tmp_path / "bundle")
+    approved_json = tmp_path / "approved.json"
+    approved_json.write_text(json.dumps({"Running Amount": _APPROVED_RUNNING_AMOUNT_DAX}),
+                             encoding="utf-8")
+
+    rc = me.main(["-i", fixtures_dir, "-o", out, "--approved-dax", str(approved_json)])
+    assert rc == 0
+
+    on_disk = json.load(open(os.path.join(out, "report.json"), encoding="utf-8"))
+    detail = next(d for d in on_disk["datasources"] if d["name"] == "widget_sales")
+    by_status = {m["measure"]: m["status"] for m in detail["measures"]}
+    assert by_status["Running Amount"] == "assisted-approved"
+    assert _APPROVED_RUNNING_AMOUNT_DAX in _read_measures_tmdl(out)
+
+
+def test_main_approved_dax_missing_file_errors(fixtures_dir, tmp_path):
+    # A bad --approved-dax path fails fast (argparse error -> SystemExit) so a typo never silently
+    # drops an approval.
+    out = str(tmp_path / "bundle")
+    with pytest.raises(SystemExit):
+        me.main(["-i", fixtures_dir, "-o", out, "--approved-dax", str(tmp_path / "missing.json")])
+
+
 def test_viz_adapter_forwards_row_count_binding_only_when_supported():
     # The adapter passes row_count_binding to a viz fn that declares it, and silently omits it for an
     # older entry point that does not -- additive against viz fns predating the row-count seam.

@@ -579,7 +579,8 @@ def _resolve_viz_stage(injected):
     return None
 
 
-def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, ds_catalog=None):
+def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, ds_catalog=None,
+                            approved_calc_dax=None):
     """Drive the full per-datasource pipeline. Returns a report detail dict (never raises).
 
     When ``ds_catalog`` is given, a successfully migrated datasource records its source text +
@@ -634,7 +635,7 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
 
     try:
         out = assemble_import_model(descriptor, model_name=name, calcs=calcs, dim_calcs=dim_calcs,
-                                    parameters=parameters)
+                                    parameters=parameters, approved_calc_dax=approved_calc_dax)
     except ValueError as exc:  # storage policy / no-columns -> documented land-to-Delta fallback
         detail.update(status="fallback", storage_mode=None, storage_decision=decision,
                       reason=str(exc),
@@ -1362,7 +1363,7 @@ def _norm_ds(name):
     return re.sub(r"[^a-z0-9]", "", (name or "").lower())
 
 
-def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog):
+def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog, approved_calc_dax=None):
     """Rebuild a published-datasource workbook's model from the matching ALREADY-MIGRATED published
     datasource (its real schema) instead of the workbook's own unusable ``sqlproxy`` proxy stub --
     carrying the workbook's own calculated fields so its view-local measures translate against that
@@ -1404,7 +1405,8 @@ def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog):
         res = migrate_datasource(match["text"], model_name=model_safe,
                                  calcs=wb_calcs, dim_calcs=wb_dim_calcs,
                                  parameters=wb_params,
-                                 table_calc_usages=wb_table_calc_usages)
+                                 table_calc_usages=wb_table_calc_usages,
+                                 approved_calc_dax=approved_calc_dax)
     except Exception:
         return None
     if (res.get("report") or {}).get("fallback"):
@@ -1445,7 +1447,8 @@ def _field_map_from_model(res_report):
     return fact_table, field_map
 
 
-def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None, ds_catalog=None):
+def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None, ds_catalog=None,
+                          approved_calc_dax=None):
     """Build an openable, self-contained workbook ``.pbip`` and record it on ``detail`` (never raises).
 
     Rebuilds the workbook's OWN primary embedded datasource into a semantic model (reusing the
@@ -1486,7 +1489,8 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
                      f"a single PBIR report binds one model; bound the primary {label!r}")
 
     try:
-        res = migrate_datasource(twb_text, model_name=model_safe, datasource=label)
+        res = migrate_datasource(twb_text, model_name=model_safe, datasource=label,
+                                 approved_calc_dax=approved_calc_dax)
     except Exception as exc:
         warns.append(_PBIP_WARN + f"could not rebuild embedded datasource {label!r} "
                      f"({type(exc).__name__}: {exc}) -- workbook .pbip skipped")
@@ -1500,7 +1504,8 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
         # carrying the workbook's own calculated fields so its view-local measures translate -- and
         # bind the report to it. Never guesses (a real datasource-name match is required); any
         # failure keeps the honest skip below (warn-never-wrong).
-        recovered = _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog)
+        recovered = _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog,
+                                                  approved_calc_dax=approved_calc_dax)
         if recovered is not None:
             res = recovered
             res_report = res.get("report") or {}
@@ -1616,7 +1621,7 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
 
 
 def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir=None,
-                          ds_catalog=None):
+                          ds_catalog=None, approved_calc_dax=None):
     """Run the optional viz stage for one workbook. Returns a report detail dict (never raises).
 
     Beyond the back-compatible bare ``reports/<Name>.Report`` write, when ``pbip_dir`` is given the
@@ -1676,7 +1681,7 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_di
 
     if parts and pbip_dir is not None:
         _attach_workbook_pbip(detail, text, result, safe_base, pbip_dir, viz=viz,
-                              ds_catalog=ds_catalog)
+                              ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax)
     return detail
 
 
@@ -1985,7 +1990,7 @@ def _write_compile_report(output_dir, compile_report):
 
 
 def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan=None,
-                   rebind_bind_stage=None):
+                   rebind_bind_stage=None, approved_calc_dax=None):
     """Run the whole estate migration and write the output bundle. Returns the report dict.
 
     ``source`` is any :class:`TableauSource`. ``output_dir`` receives::
@@ -2005,6 +2010,15 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
     migrated datasource under ``pbip/<Name>/`` so it can be opened/tested in Power BI Desktop; the
     canonical ``semantic_models/`` output is unchanged. Set ``pbip=False`` to skip it.
 
+    ``approved_calc_dax`` (optional, opt-in) is a ``{calc_name: dax}`` mapping of human-approved
+    second-compiler (assisted-translation) results. It is threaded into every model build in the
+    run -- the datasource pass, the workbook's embedded-datasource rebuild, and the
+    published-datasource catalog-match rebuild -- so a Tier-0 stub whose name matches
+    (case-insensitive) lands as a LIVE, audit-stamped measure / calc column instead of an inert
+    ``= 0`` / ``BLANK()`` stub. This is the documented way to redeploy the fallback tier through the
+    estate command (the ``--approved-dax`` CLI flag loads the mapping from a JSON file); when
+    omitted the run is byte-identical.
+
     ``rebind_plan`` (optional, opt-in) is a ``rebind-plan.json`` path or already-parsed mapping
     written by the comparison skill. When given, the orchestrator additionally INGESTS it, routes
     each entry by ``binding_status``, resolves/binds each routed report through the dashboard bind
@@ -2023,10 +2037,12 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
 
     ds_catalog = {}
     ds_details = [_migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir,
-                                          ds_catalog=ds_catalog)
+                                          ds_catalog=ds_catalog,
+                                          approved_calc_dax=approved_calc_dax)
                   for ds_id in source.list_datasources()]
     wb_details = [_migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir,
-                                        ds_catalog=ds_catalog)
+                                        ds_catalog=ds_catalog,
+                                        approved_calc_dax=approved_calc_dax)
                   for wb_id in source.list_workbooks()]
 
     summary = _summarize(ds_details, wb_details, viz is not None)
@@ -2280,6 +2296,30 @@ def _render_summary_md(report):
 
 
 # -- CLI -----------------------------------------------------------------------
+def _load_approved_dax(path):
+    """Load a ``{calc_name: dax}`` mapping of human-approved assisted translations from a JSON file.
+
+    Returns ``None`` when ``path`` is falsy (the run is then byte-identical to a no-approval run).
+    Raises ``ValueError`` when the file is missing, unreadable, not JSON, or not a flat object of
+    string -> string -- a fail-fast so a typo never silently drops an approval. Tolerates a UTF-8
+    BOM (the file is often hand-authored on Windows).
+    """
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        raise ValueError(f"--approved-dax file not found: {path}")
+    except (OSError, ValueError) as exc:  # ValueError covers json.JSONDecodeError
+        raise ValueError(f"--approved-dax file is not readable JSON ({path}): {exc}")
+    if not isinstance(data, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+        raise ValueError(
+            f"--approved-dax JSON must be an object mapping calc name -> DAX string ({path})")
+    return data or None
+
+
 def main(argv=None):
     """One-command estate migration over a local folder of ``.tds`` / ``.twb`` files (offline)."""
     parser = argparse.ArgumentParser(
@@ -2292,10 +2332,20 @@ def main(argv=None):
                         help="output bundle folder (semantic models + pbip + report.json + summary.md)")
     parser.add_argument("--no-pbip", action="store_true",
                         help="skip the openable .pbip projects (emit only semantic_models/ folders)")
+    parser.add_argument("--approved-dax", metavar="JSON",
+                        help="path to a {calc_name: dax} JSON file of human-approved second-compiler "
+                             "(assisted-translation) results; each name-matching stub lands as a "
+                             "live, audit-stamped measure/calc column instead of an inert stub")
     args = parser.parse_args(argv)
 
+    try:
+        approved_calc_dax = _load_approved_dax(args.approved_dax)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     source = LocalFilesSource(args.input)
-    report = migrate_estate(source, args.output, pbip=not args.no_pbip)
+    report = migrate_estate(source, args.output, pbip=not args.no_pbip,
+                            approved_calc_dax=approved_calc_dax)
     s = report["summary"]
     print(
         f"Datasources: {s['datasources_migrated']}/{s['datasources_total']} migrated "
@@ -2308,7 +2358,8 @@ def main(argv=None):
         print("Openable projects: pbip/<Name>/<Name>.pbip (double-click in Power BI Desktop)")
     if s.get("needs_review_total"):
         print(f"Next step: {s['needs_review_total']} calculation(s) stubbed -> see summary.md "
-              f"('Next step') to run them through the second compiler.")
+              f"('Next step') to run them through the second compiler, then re-run with "
+              f"--approved-dax <file.json> to land the approved results.")
     return 0
 
 
