@@ -322,7 +322,8 @@ def _pbir_read_visual(path):
             if fld is None:
                 continue
             fld = dict(fld, role=role_key,
-                       display=proj.get("nativeQueryRef") or proj.get("queryRef"))
+                       display=proj.get("nativeQueryRef") or proj.get("queryRef"),
+                       query_ref=proj.get("queryRef"))
             bucket.append(fld)
             fields.append(fld)
         if bucket:
@@ -930,19 +931,101 @@ def _greedy_pair(worksheets, visuals, zone_by_ws):
     return pairs
 
 
-def score_report(twb, pbir, engine_report=None):
+def aliases_from_candidate_records(records):
+    """Merge each candidate record's ``field_aliases`` ({emitted queryRef -> Tableau caption})
+    into one ``{ref: caption}`` map.
+
+    ``field_aliases`` is the engine's additive bridge across a faithful star-schema rename -- the
+    emitted Power BI ref (e.g. ``Date.Date``, ``_Measures.count orders``) back to the Tableau source
+    caption it was rebound from (``Order Date``). Tolerates records (or whole builds) that predate
+    the producer and so carry no ``field_aliases`` key -- then the merged map is empty and aliasing
+    is a no-op, preserving the un-aliased score exactly.
+    """
+    merged = {}
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        fa = rec.get("field_aliases")
+        if isinstance(fa, dict):
+            for ref, caption in fa.items():
+                if ref and caption:
+                    merged.setdefault(str(ref), str(caption))
+    return merged
+
+
+def _alias_lookup(field_aliases):
+    """Index an alias map by normalized emitted ref -> caption (so ``Date.Date`` matches a
+    reconstructed ``entity.property`` regardless of dotting/spacing/case)."""
+    out = {}
+    for ref, caption in (field_aliases or {}).items():
+        key = _norm(ref)
+        if key and caption:
+            out.setdefault(key, caption)
+    return out
+
+
+def _aliased_norm(field, lookup):
+    """Resolve a PBIR field's emitted ref back to its Tableau source-caption norm, or ``None``.
+
+    Tries the strongest keys first (the full ``queryRef`` / ``entity.property``) before the bare
+    property, so a short native ref never spuriously matches a full-ref alias key.
+    """
+    candidates = (
+        field.get("query_ref"),
+        "%s.%s" % (field.get("entity") or "", field.get("property") or ""),
+        field.get("display"),
+        field.get("property"),
+    )
+    for key in candidates:
+        if key:
+            caption = lookup.get(_norm(key))
+            if caption:
+                return _norm(caption)
+    return None
+
+
+def _apply_field_aliases(pbir, field_aliases):
+    """Rewrite each PBIR field's match-norm to its Tableau source caption when an alias resolves.
+
+    Lets the structural tier see THROUGH a faithful star-schema rename (emitted ``Date.Date`` ->
+    source ``Order Date``) so a renamed-but-faithful binding is not scored as a field mismatch. The
+    original emitted norm is preserved as ``norm_emitted``. Returns the count of fields remapped;
+    a no-op (returns 0) when no usable alias map is supplied, so the un-aliased score is unchanged.
+    """
+    lookup = _alias_lookup(field_aliases)
+    if not lookup:
+        return 0
+    remapped = 0
+    for page in pbir.get("pages", []):
+        for v in page.get("visuals", []):
+            for f in v.get("fields", []):
+                resolved = _aliased_norm(f, lookup)
+                if resolved and resolved != f.get("norm"):
+                    f.setdefault("norm_emitted", f.get("norm"))
+                    f["norm"] = resolved
+                    remapped += 1
+    return remapped
+
+
+def score_report(twb, pbir, engine_report=None, field_aliases=None):
     """Score a parsed Tableau workbook against a parsed PBIR report. Both come from the readers above.
 
     Pairs each Tableau dashboard to the PBIR page sharing its display name, greedily matches that
     dashboard's worksheets to the page's non-slicer visuals by content + position, and grades each
     pair. Worksheets not placed on any dashboard fall back to a best-effort field-only match against
     any remaining visual. Returns an advisory report dict (never a pass/fail).
+
+    ``field_aliases`` (optional ``{emitted queryRef -> Tableau caption}``, e.g. from
+    ``aliases_from_candidate_records``) lets the field/role components see through a faithful
+    star-schema rename before name overlap is computed. Omitting it leaves scoring exactly as-is.
     """
+    alias_resolved = _apply_field_aliases(pbir, field_aliases) if field_aliases else 0
     ws_by_name = twb["worksheets"]
     visual_pages = {p["display"]: p for p in pbir["pages"]}
     visual_pages_by_name = {p["name"]: p for p in pbir["pages"]}
 
     engine_intent = _engine_intent_index(engine_report)
+
 
     visual_results = []
     slicer_results = []
@@ -1017,7 +1100,8 @@ def score_report(twb, pbir, engine_report=None):
                                   "visual_type": v["visual_type"]})
 
     return _assemble_report(twb, pbir, visual_results, slicer_results,
-                            unmatched_worksheets, extra_visuals, engine_report)
+                            unmatched_worksheets, extra_visuals, engine_report,
+                            alias_resolved=alias_resolved)
 
 
 def _page_for_dashboard(dash, pbir):
@@ -1109,7 +1193,8 @@ def _engine_intent_index(engine_report):
 
 
 def _assemble_report(twb, pbir, visual_results, slicer_results,
-                     unmatched_worksheets, extra_visuals, engine_report):
+                     unmatched_worksheets, extra_visuals, engine_report,
+                     alias_resolved=0):
     scores = [r["score"] for r in visual_results]
     mean = sum(scores) / len(scores) if scores else None
     worst = min(scores) if scores else None
@@ -1142,6 +1227,12 @@ def _assemble_report(twb, pbir, visual_results, slicer_results,
             "Date dimension or a renamed measure). A low structural score there reflects naming, "
             "not infidelity; corroborate with the DAX-value and image tiers, which compare "
             "numbers/pixels and are immune to renaming.".format(len(remodel_suspected)))
+    if alias_resolved:
+        notes.append(
+            "{} emitted field ref(s) were resolved back to their Tableau source caption via the "
+            "engine field-alias map before name overlap, so a faithful star-schema rename "
+            "(e.g. Date.Date -> Order Date) scores as a match rather than a mismatch.".format(
+                alias_resolved))
 
     return {
         "kind": ORACLE_KIND,
@@ -1159,6 +1250,7 @@ def _assemble_report(twb, pbir, visual_results, slicer_results,
             "extra_visuals": len(extra_visuals),
             "slicers": len(slicer_results),
             "remodel_rename_suspected": len(remodel_suspected),
+            "fields_alias_resolved": alias_resolved,
         },
         "visuals": sorted(visual_results, key=lambda r: r["score"]),
         "slicers": slicer_results,
@@ -1679,23 +1771,46 @@ def _combined_fidelity(report):
     }
 
 
+def _load_field_aliases(path):
+    """Load an alias source JSON into a ``{ref: caption}`` map. Accepts a candidate_records list, a
+    dict wrapping ``candidate_records`` (e.g. a ``migrate_twb_to_pbir`` result), or an already-flat
+    ``{ref: caption}`` map. Returns ``{}`` on any problem -- the advisory tier never raises."""
+    data = _read_json(path)
+    if isinstance(data, list):
+        return aliases_from_candidate_records(data)
+    if isinstance(data, dict):
+        if isinstance(data.get("candidate_records"), list):
+            return aliases_from_candidate_records(data["candidate_records"])
+        return {str(k): str(v) for k, v in data.items()
+                if k and isinstance(v, str) and v}
+    return {}
+
+
 def run_oracle(twb_path, report_dir, engine_report_path=None,
-               dax_options=None, image_options=None):
+               dax_options=None, image_options=None, candidate_records_path=None,
+               field_aliases=None):
     """Read both sides and score them. Returns the advisory report dict.
 
     The structural tier always runs. The optional value/image tiers run only when their options are
     supplied, and each attaches its own ``{available, ...}`` record without ever failing the run.
+
+    ``field_aliases`` (or a ``candidate_records_path`` JSON to derive it from) lets the field/role
+    components see through a faithful star-schema rename; both are optional and default to off.
     """
     twb = read_twb_views(twb_path)
     pbir = read_pbir_report(report_dir)
     engine_report = None
     if engine_report_path and os.path.isfile(engine_report_path):
         engine_report = _read_json(engine_report_path)
-    report = score_report(twb, pbir, engine_report=engine_report)
+    if field_aliases is None and candidate_records_path and os.path.isfile(candidate_records_path):
+        field_aliases = _load_field_aliases(candidate_records_path)
+    report = score_report(twb, pbir, engine_report=engine_report, field_aliases=field_aliases)
     report["inputs"] = {
         "twb": os.path.abspath(twb_path),
         "report_dir": os.path.abspath(report_dir),
         "engine_report": os.path.abspath(engine_report_path) if engine_report_path else None,
+        "candidate_records": (os.path.abspath(candidate_records_path)
+                              if candidate_records_path else None),
     }
     if dax_options is not None:
         report["dax_value"] = dax_value_tier(report_dir=report_dir, **dax_options)
@@ -1734,6 +1849,10 @@ def render_markdown(report):
             "- **Remodel/rename suspected:** %d visual(s) match on type+position but not field "
             "names — likely a faithful field remodel; confirm via the value/image tiers." %
             s["remodel_rename_suspected"])
+    if s.get("fields_alias_resolved"):
+        lines.append(
+            "- **Aliases resolved:** %d emitted field ref(s) mapped back to their Tableau caption "
+            "(star-schema rename seen through)." % s["fields_alias_resolved"])
     lines.append("")
     lines.append("| Worksheet | Visual type | Score | Band | Type | Missing | Extra |")
     lines.append("|---|---|---|---|---|---|---|")
@@ -1800,6 +1919,10 @@ def main(argv=None):
                     help="Path to the emitted *.Report folder (or a parent containing one).")
     ap.add_argument("--engine-report", default=None,
                     help="Optional path to the engine's report.json for intent enrichment.")
+    ap.add_argument("--candidate-records", default=None,
+                    help="Optional JSON (a migrate_twb_to_pbir candidate_records list/result, or a "
+                         "flat {emitted ref: Tableau caption} map) used to resolve faithful "
+                         "star-schema field renames before name overlap.")
     ap.add_argument("--format", choices=("json", "md"), default="json")
     ap.add_argument("--out", default=None, help="Write output here instead of stdout.")
     # Optional Tier-2 (DAX-value, needs local Power BI Desktop):
@@ -1833,7 +1956,8 @@ def main(argv=None):
                          "auto_regions": args.image_auto_regions}
 
     report = run_oracle(args.twb, args.report_dir, args.engine_report,
-                        dax_options=dax_options, image_options=image_options)
+                        dax_options=dax_options, image_options=image_options,
+                        candidate_records_path=args.candidate_records)
     text = (render_markdown(report) if args.format == "md"
             else json.dumps(report, indent=2, ensure_ascii=False))
     if args.out:

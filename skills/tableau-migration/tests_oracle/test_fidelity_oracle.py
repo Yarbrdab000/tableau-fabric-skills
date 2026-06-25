@@ -390,6 +390,78 @@ def test_assemble_report_no_remodel_note_when_clean():
     assert not any("remodel" in n.lower() for n in rep["notes"])
 
 
+# ------------------------------------------ field-alias resolution (see through a faithful rename)
+def test_aliases_from_candidate_records_merges_and_tolerates_missing():
+    recs = [
+        {"worksheet": "Line chart", "field_aliases": {"Date.Date": "Order Date"}},
+        {"worksheet": "X", "field_aliases": {"_Measures.count orders": "Orders"}},
+        {"worksheet": "Y"},        # a record predating the producer -> no field_aliases key
+        "not-a-dict",
+    ]
+    merged = fo.aliases_from_candidate_records(recs)
+    assert merged == {"Date.Date": "Order Date", "_Measures.count orders": "Orders"}
+    assert fo.aliases_from_candidate_records([]) == {}
+    assert fo.aliases_from_candidate_records(None) == {}
+
+
+def test_aliased_norm_prefers_full_ref_not_bare_property():
+    lookup = fo._alias_lookup({"Date.Date": "Order Date"})
+    fld = {"entity": "Date", "property": "Date", "display": "Date", "query_ref": "Date.Date"}
+    assert fo._aliased_norm(fld, lookup) == "orderdate"
+    # A bare property that is not itself a full-ref alias key must NOT match.
+    assert fo._aliased_norm({"property": "Date"}, lookup) is None
+
+
+def test_apply_field_aliases_remaps_norm_preserves_emitted_and_counts():
+    pbir = {"pages": [{"visuals": [{"fields": [
+        {"entity": "Date", "property": "Date", "norm": "date"},
+        {"entity": "Sales", "property": "Sales", "norm": "sales"},
+    ]}]}]}
+    n = fo._apply_field_aliases(pbir, {"Date.Date": "Order Date"})
+    assert n == 1
+    f0 = pbir["pages"][0]["visuals"][0]["fields"][0]
+    assert f0["norm"] == "orderdate" and f0["norm_emitted"] == "date"
+    # Untouched field keeps its norm; empty/None alias maps are a no-op.
+    assert pbir["pages"][0]["visuals"][0]["fields"][1]["norm"] == "sales"
+    assert fo._apply_field_aliases(pbir, {}) == 0
+    assert fo._apply_field_aliases(pbir, None) == 0
+
+
+def test_score_report_field_aliases_resolve_rename(tmp_path):
+    # Emit the Trend date as a renamed star-schema rebind (Date.Date); without aliases it reads as a
+    # field mismatch, with aliases it resolves back to the Tableau 'Order Date' and scores higher.
+    trend = _visual_json(
+        "v-trend", "areaChart",
+        {"x": 640.0, "y": 0.0, "width": 640.0, "height": 720.0, "z": 0},
+        {"Category": {"projections": [_projection(_col_field("Date", "Date"), "Date")]},
+         "Y": {"projections": [_projection(_agg_field("fed.0abc", "Sales"), "Sum of Sales")]}})
+    bars = _faithful_visuals()[0]
+    report_dir = _write_pbir(str(tmp_path), "Dash", [bars, trend])
+    twb = fo.read_twb_views(TWB_XML)
+
+    base = fo.score_report(twb, fo.read_pbir_report(report_dir))
+    aliased = fo.score_report(twb, fo.read_pbir_report(report_dir),
+                              field_aliases={"Date.Date": "Order Date"})
+    base_trend = next(r for r in base["visuals"] if r["worksheet"] == "Trend")
+    al_trend = next(r for r in aliased["visuals"] if r["worksheet"] == "Trend")
+    assert al_trend["components"]["fields"] > base_trend["components"]["fields"]
+    assert al_trend["score"] >= base_trend["score"]
+    assert aliased["summary"]["fields_alias_resolved"] >= 1
+    assert base["summary"]["fields_alias_resolved"] == 0
+
+
+def test_load_field_aliases_accepts_list_wrapped_flat_and_garbage(tmp_path):
+    (tmp_path / "recs.json").write_text(
+        json.dumps([{"field_aliases": {"Date.Date": "Order Date"}}]), encoding="utf-8")
+    assert fo._load_field_aliases(str(tmp_path / "recs.json")) == {"Date.Date": "Order Date"}
+    (tmp_path / "wrap.json").write_text(
+        json.dumps({"candidate_records": [{"field_aliases": {"A.B": "Cap"}}]}), encoding="utf-8")
+    assert fo._load_field_aliases(str(tmp_path / "wrap.json")) == {"A.B": "Cap"}
+    (tmp_path / "flat.json").write_text(json.dumps({"X.Y": "Zee"}), encoding="utf-8")
+    assert fo._load_field_aliases(str(tmp_path / "flat.json")) == {"X.Y": "Zee"}
+    assert fo._load_field_aliases(str(tmp_path / "missing.json")) == {}
+
+
 # --------------------------------------------------------------------------- scoring primitives
 def test_jaccard_and_bands():
     assert fo._jaccard(set(), set()) == 1.0
