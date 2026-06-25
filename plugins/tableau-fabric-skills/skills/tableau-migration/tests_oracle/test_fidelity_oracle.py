@@ -249,6 +249,37 @@ def test_object_id_and_generated_fields_excluded():
     assert not any("generated" in n for n in norms)
 
 
+def test_lod_measure_encoding_excluded_dimension_kept():
+    # A MEASURE on the <lod> channel backs a reference-line distribution band (e.g. a WINDOW_STDEV
+    # decoration), not a visible mark encoding -- it must be excluded so a faithful rebuild is not
+    # charged for omitting it. A genuine detail DIMENSION on <lod> is a real binding and is kept.
+    xml = (
+        "<?xml version='1.0' encoding='utf-8'?>"
+        "<workbook><datasources>"
+        "<datasource name='fed.0abc' caption='Sample'>"
+        "<column name='[Sales]' caption='Sales' datatype='real' role='measure'/>"
+        "<column name='[Std Dev]' caption='Std Dev' datatype='real' role='measure'/>"
+        "<column name='[Region]' caption='Region' datatype='string' role='dimension'/>"
+        "<column name='[Order Date]' caption='Order Date' datatype='date' role='dimension'/>"
+        "</datasource></datasources><worksheets>"
+        "<worksheet name='Line'><table>"
+        "<view><datasources><datasource name='fed.0abc' caption='Sample'/></datasources></view>"
+        "<panes><pane><mark class='Line'/><encodings>"
+        "<lod column='[fed.0abc].[sum:Std Dev:qk]'/>"   # measure on lod -> excluded
+        "<lod column='[fed.0abc].[none:Region:nk]'/>"   # dimension on lod -> kept
+        "</encodings></pane></panes>"
+        "<rows>[fed.0abc].[sum:Sales:qk]</rows>"
+        "<cols>[fed.0abc].[tmn:Order Date:qk]</cols>"
+        "</table></worksheet></worksheets></workbook>"
+    )
+    ws = fo.read_twb_views(xml)["worksheets"]["Line"]
+    norms = {f["norm"] for f in ws["fields"]}
+    assert "stddev" not in norms          # lod MEASURE excluded (reference-line decoration)
+    assert "region" in norms              # lod DIMENSION kept (genuine detail)
+    assert "sales" in norms and "orderdate" in norms
+    assert "stddev" not in {f["norm"] for f in ws["measures"]}
+
+
 def test_infer_family_card_when_no_dims():
     fam, asserted = fo._infer_twb_family("Automatic", [], [{"norm": "sales"}], False, False)
     assert fam == fo.FAM_CARD and asserted is True

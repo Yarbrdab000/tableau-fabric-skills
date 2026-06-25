@@ -651,10 +651,18 @@ def _worksheet_record(ws, caption_index):
                         has_geometry = True
                         continue
                     col = e.get("column")
+                    channel = _local(e.tag)
                     for m in _PILL_RE.finditer(col or ""):
                         fld = _parse_pill(m.group("inner"), caption_index)
-                        if fld is not None:
-                            encoding_fields.append(dict(fld, channel=_local(e.tag)))
+                        if fld is None:
+                            continue
+                        # A MEASURE on the LOD/detail channel backs a reference-line distribution
+                        # band (e.g. a WINDOW_STDEV computation), not a visible mark encoding the
+                        # rebuild must reproduce -- exclude it so a faithful rebuild is not charged
+                        # for omitting decoration. Genuine detail DIMENSIONS on <lod> are kept.
+                        if channel == "lod" and fld.get("is_measure"):
+                            continue
+                        encoding_fields.append(dict(fld, channel=channel))
 
     shelf_text = (rows_text + " " + cols_text).lower()
     uses_measure_values = (":measure names" in shelf_text
