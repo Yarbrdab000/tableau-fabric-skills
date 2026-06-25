@@ -205,6 +205,50 @@ def test_read_pbir_report_accepts_parent_dir(tmp_path):
     assert parsed["report_name"] == os.path.basename(report)
 
 
+def test_pbir_extract_field_tolerates_malformed_aggregation():
+    # "Aggregation" present but NOT a dict (a malformed visual.json) must not raise; the field is
+    # still recognized as a measure and its aggregation function is simply absent.
+    fld = fo._pbir_extract_field({"Aggregation": "notadict", "Property": "Sales"})
+    assert fld is not None and fld["is_measure"] is True and fld["norm"] == "sales"
+    assert fld["agg"] is None
+
+
+def test_pbir_read_visual_tolerates_wrong_types(tmp_path):
+    # A structurally valid JSON whose position/queryState/filterConfig carry the WRONG types must
+    # not raise -- the reader coerces each and returns a (possibly empty) record.
+    blob = {
+        "name": "v-bad",
+        "position": [],                                              # not a dict
+        "visual": {"visualType": "barChart", "query": {"queryState": [1, 2, 3]}},  # list, not dict
+        "filterConfig": "nope",                                     # not a dict
+    }
+    vdir = tmp_path / "v-bad"
+    vdir.mkdir()
+    (vdir / "visual.json").write_text(json.dumps(blob), encoding="utf-8")
+    rec = fo._pbir_read_visual(str(vdir / "visual.json"))
+    assert rec is not None
+    assert rec["visual_type"] == "barChart"
+    assert rec["fields"] == [] and rec["filter_fields"] == []
+    assert rec["position"]["x"] is None                            # malformed position coerced, no crash
+
+
+def test_read_pbir_report_isolates_malformed_visual(tmp_path):
+    # One visual whose projections are the wrong type must neither crash the run nor drop the good
+    # visuals -- the advisory reader isolates the bad one and keeps scoring the rest.
+    bad = {
+        "name": "v-bad",
+        "position": {"x": 0, "y": 0, "width": 10, "height": 10, "z": 0},
+        "visual": {"visualType": "barChart",
+                   "query": {"queryState": {"Y": {"projections": "notalist"}}}},
+    }
+    report = _write_pbir(str(tmp_path), "Dash", _faithful_visuals() + [bad])
+    parsed = fo.read_pbir_report(report)                            # must not raise
+    names = {v["name"] for v in parsed["pages"][0]["visuals"]}
+    assert "v-bars" in names and "v-trend" in names                # good visuals preserved
+    bad_rec = next(v for v in parsed["pages"][0]["visuals"] if v["name"] == "v-bad")
+    assert bad_rec["fields"] == []                                 # bad projections coerced to empty
+
+
 # --------------------------------------------------------------------------- TWB reader
 def test_read_twb_worksheets_and_families():
     twb = fo.read_twb_views(TWB_XML)

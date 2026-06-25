@@ -232,6 +232,17 @@ def _first_child(elem, name):
 # =====================================================================================
 # PBIR reader -- emitted Power BI report on disk
 # =====================================================================================
+def _as_dict(value):
+    """Coerce to a dict for safe ``.get``/``.items`` access; a non-dict (list/str/None from a
+    malformed visual.json) becomes ``{}`` so the advisory reader never raises on bad input."""
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value):
+    """Coerce to a list for safe iteration; a non-list becomes ``[]`` (see ``_as_dict``)."""
+    return value if isinstance(value, list) else []
+
+
 def _pbir_extract_field(node):
     """Pull a normalized field descriptor out of a PBIR projection ``field`` expression.
 
@@ -251,7 +262,7 @@ def _pbir_extract_field(node):
     elif "Aggregation" in node:
         kind = "aggregation"
         is_measure = True
-        agg = node["Aggregation"].get("Function")
+        agg = _as_dict(node.get("Aggregation")).get("Function")
 
     prop = _find_key(node, "Property")
     entity = _find_key(node, "Entity")
@@ -302,9 +313,9 @@ def _pbir_read_visual(path):
     data = _read_json(path)
     if not isinstance(data, dict):
         return None
-    visual = data.get("visual", {}) or {}
+    visual = _as_dict(data.get("visual"))
     vtype = visual.get("visualType")
-    pos = data.get("position", {}) or {}
+    pos = _as_dict(data.get("position"))
     position = {
         "x": _f(pos.get("x")), "y": _f(pos.get("y")),
         "w": _f(pos.get("width")), "h": _f(pos.get("height")),
@@ -313,11 +324,13 @@ def _pbir_read_visual(path):
 
     roles = {}
     fields = []
-    qstate = (((visual.get("query") or {}).get("queryState")) or {})
+    qstate = _as_dict(_as_dict(visual.get("query")).get("queryState"))
     for role_key, role_block in qstate.items():
-        projections = (role_block or {}).get("projections", []) or []
+        projections = _as_list(_as_dict(role_block).get("projections"))
         bucket = []
         for proj in projections:
+            if not isinstance(proj, dict):
+                continue
             fld = _pbir_extract_field(proj.get("field"))
             if fld is None:
                 continue
@@ -331,7 +344,9 @@ def _pbir_read_visual(path):
 
     # Slicer selection fields come from a sibling filterConfig, not the query projections.
     filt_fields = []
-    for filt in ((data.get("filterConfig") or {}).get("filters") or []):
+    for filt in _as_list(_as_dict(data.get("filterConfig")).get("filters")):
+        if not isinstance(filt, dict):
+            continue
         fld = _pbir_extract_field(filt.get("field"))
         if fld is not None:
             filt_fields.append(fld)
@@ -395,7 +410,9 @@ def read_pbir_report(report_dir):
                     if os.path.isfile(vjson):
                         try:
                             rec = _pbir_read_visual(vjson)
-                        except (ValueError, OSError) as exc:
+                        except (ValueError, OSError, AttributeError, TypeError, KeyError, IndexError) as exc:
+                            # Advisory tool: one malformed visual.json must never crash the whole
+                            # run -- isolate it to a warning and keep scoring the rest.
                             warnings.append("unreadable visual %s: %s" % (vname, exc))
                             continue
                         if rec is None:
