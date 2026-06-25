@@ -113,7 +113,18 @@ no‑ops cleanly on builds whose records predate the producer. The report adds a
 `summary.fields_alias_resolved` count, an advisory note, and a markdown line; the original emitted
 name is preserved per field as `norm_emitted`. Measured on the real Comcast rebuild, resolving just
 `Date.Date → Order Date` lifts the aggregate **0.40 → 0.55** (every visual improves); the residual
-is then source‑side (reference‑line decoration calcs, a dropped implicit `COUNT`), not the rename.
+is then source‑side (a dropped implicit `COUNT`), not the rename.
+
+### Source‑side fidelity: reference‑line decoration calcs are not worksheet fields
+
+A measure placed on a worksheet's `<lod>`/detail mark channel typically backs a **reference‑line
+distribution band** (e.g. a `WINDOW_STDEV` computation feeding a `±1σ` band), not a visible mark
+encoding the rebuild must reproduce. The structural tier excludes these `<lod>`‑channel **measures**
+from the worksheet's field set so a faithful rebuild is **not** charged for omitting decoration;
+genuine detail **dimensions** on `<lod>` are kept (a measure on detail is virtually always a
+reference‑band support field, never a disaggregation). On the faithful anchor sheet `Line chart`
+this drops the two false `Standard of Deviation` "missing" fields, lifting the sheet's aliased field
+overlap **0.25 → 1.00** and role agreement **0.50 → 1.00**.
 
 ---
 
