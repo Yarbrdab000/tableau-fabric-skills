@@ -90,6 +90,24 @@ side **always the spec, never a screenshot**. (Pixel rasterization of a `.pbip` 
 Desktop or the Service and would only ever speak to *styling* — colors/marks as drawn — which is the
 image tier's advisory concern, not layout.)
 
+The per‑visual deltas roll up to a dashboard‑level **`summary.placement`** verdict so layout fidelity
+reads at a glance: `evaluated`, `pixel_exact` / `within_tolerance` / `drifted` counts, the
+`worst_max_edge_px` and which `worst_worksheet` drifted most, and a `verdict`
+(`pixel-exact` → `acceptable` → `drifted`). On both calibration cases the verdict is **`pixel-exact`,
+4/4** with a worst edge of `≤ 0.01 px`.
+
+### Non‑worksheet dashboard objects (placement targets, expected extras)
+
+A Tableau dashboard places more than worksheets: **titles, text boxes, legends (color/size/shape),
+parameter controls and filter cards** all occupy zones. The oracle captures every such typed,
+non‑container zone as a `dashboard_objects` entry — excluding the structural `layout-basic` /
+`layout-flow` containers, which hold a region but draw nothing. Each object is projected onto the page
+canvas as a **`target_px`** rect: the render‑free placement target the rebuild should hit for that
+title/legend/param control. A legend carries its owning `worksheet`; a parameter control carries its
+`param` binding (so an emitted param‑control slicer can be cross‑checked against the control it stands
+in for). These are **expected extras** — surfaced for completeness and as engine placement targets,
+but **never scored and never counted against coverage** (coverage is over source worksheets only).
+
 ### Advisory bands
 
 | Band | Aggregate | Read it as |

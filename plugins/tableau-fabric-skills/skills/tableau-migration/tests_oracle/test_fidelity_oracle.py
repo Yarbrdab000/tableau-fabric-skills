@@ -727,6 +727,88 @@ def test_slicer_matches_non_categorical_filter(tmp_path):
     assert s["matched_filter_classes"] == ["quantitative"]
 
 
+# ------------------------------ placement rollup + non-worksheet dashboard object accounting (render-free)
+def _twb_with_objects():
+    """TWB_XML with non-worksheet object zones added to the dashboard (title/text/legend/param)."""
+    return TWB_XML.replace(
+        "<zone name='Trend' x='50000' y='0' w='50000' h='100000'/>",
+        "<zone name='Trend' x='50000' y='0' w='50000' h='100000'/>"
+        "<zone id='40' x='0' y='0' w='100000' h='6000' type-v2='title'/>"
+        "<zone id='41' x='0' y='6000' w='30000' h='4000' type-v2='text'/>"
+        "<zone id='42' name='Bars' x='80000' y='10000' w='20000' h='20000' type-v2='color'/>"
+        "<zone id='43' x='90000' y='0' w='10000' h='6000' type-v2='paramctrl' "
+        "param='[Parameters].[P0]'/>")
+
+
+def test_dashboard_record_captures_non_worksheet_objects():
+    db = fo.read_twb_views(_twb_with_objects())["dashboards"][0]
+    # The worksheet zone list is unchanged; containers + objects never leak into it.
+    assert sorted(z["worksheet"] for z in db["zones"]) == ["Bars", "Trend"]
+    assert [o["kind"] for o in db["objects"]] == ["title", "text", "color", "paramctrl"]
+    # A legend (color) carries its owning worksheet; a param control carries its binding.
+    color = next(o for o in db["objects"] if o["kind"] == "color")
+    assert color["worksheet"] == "Bars"
+    pc = next(o for o in db["objects"] if o["kind"] == "paramctrl")
+    assert pc["param"] == "[Parameters].[P0]"
+    # Structural containers (layout-basic / layout-flow) are NOT objects.
+    assert not any((o["kind"] or "").startswith("layout") for o in db["objects"])
+    # Each object is normalized to the dashboard extent (title spans the full width).
+    assert db["objects"][0]["nposition"]["w"] == pytest.approx(1.0)
+
+
+def test_object_target_projects_zone_to_canvas_px():
+    obj = {"kind": "title", "worksheet": None, "param": None,
+           "nposition": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 0.05}}
+    rec = fo._object_target(obj, "Dash", "Dash", 1280.0, 720.0)
+    assert rec["target_px"] == {"x": 0.0, "y": 0.0, "w": 1280.0, "h": 36.0}
+    # No canvas -> no target_px, but the record (kind/nposition) still returns.
+    rec2 = fo._object_target(obj, "Dash", "Dash", None, None)
+    assert "target_px" not in rec2 and rec2["kind"] == "title"
+
+
+def test_score_report_surfaces_dashboard_objects(tmp_path):
+    report = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    pbir = fo.read_pbir_report(report)
+    result = fo.score_report(fo.read_twb_views(_twb_with_objects()), pbir)
+    assert result["summary"]["dashboard_objects"] == 4
+    detail = result["dashboard_objects_detail"]
+    assert {o["kind"] for o in detail} == {"title", "text", "color", "paramctrl"}
+    assert all("target_px" in o for o in detail)        # projected onto the 1280x720 page canvas
+    # Objects are expected extras: they never move coverage or the aggregate.
+    plain = fo.score_report(fo.read_twb_views(TWB_XML), fo.read_pbir_report(report))
+    assert result["summary"]["coverage"] == plain["summary"]["coverage"]
+    assert result["summary"]["aggregate_score"] == plain["summary"]["aggregate_score"]
+    md = fo.render_markdown(result)
+    assert "Non-worksheet dashboard objects" in md and "paramctrl" in md
+
+
+def test_placement_rollup_pixel_exact_on_faithful(tmp_path):
+    report = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    result = fo.score_report(fo.read_twb_views(TWB_XML), fo.read_pbir_report(report))
+    pr = result["summary"]["placement"]
+    assert pr["verdict"] == "pixel-exact"
+    assert pr["evaluated"] == 2 and pr["pixel_exact"] == 2 and pr["drifted"] == 0
+    assert pr["worst_max_edge_px"] == pytest.approx(0.0)
+    assert "Layout (placement)" in fo.render_markdown(result)
+
+
+def test_placement_rollup_verdicts_and_empty():
+    # Synthetic per-visual placements exercise the acceptable + drifted verdicts and worst-zone pick.
+    exact = {"worksheet": "A",
+             "placement": {"pixel_exact": True, "within_tolerance": True, "max_edge_px": 1.0}}
+    accept = {"worksheet": "B",
+              "placement": {"pixel_exact": False, "within_tolerance": True, "max_edge_px": 9.0}}
+    drift = {"worksheet": "C",
+             "placement": {"pixel_exact": False, "within_tolerance": False, "max_edge_px": 40.0}}
+    assert fo._placement_rollup([exact, accept])["verdict"] == "acceptable"
+    roll = fo._placement_rollup([exact, accept, drift])
+    assert roll["verdict"] == "drifted"
+    assert roll["drifted"] == 1 and roll["within_tolerance"] == 2
+    assert roll["worst_worksheet"] == "C" and roll["worst_max_edge_px"] == 40.0
+    # No placements (e.g. a non-dashboard worksheet match) -> None.
+    assert fo._placement_rollup([{"worksheet": "Z"}]) is None
+
+
 def test_run_oracle_and_markdown(tmp_path):
     report = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
     twb_path = tmp_path / "wb.twb"

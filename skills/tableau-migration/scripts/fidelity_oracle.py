@@ -82,6 +82,13 @@ PLACEMENT_EXACT_PX = 2.0
 # zones should sit comfortably under it).
 PLACEMENT_ACCEPTABLE_FRAC = 0.01
 
+# A Tableau dashboard zone tree nests its worksheet/object zones inside structural CONTAINERS
+# (basic/flow layouts). Those containers are scaffolding, not placed objects -- they hold a region
+# but draw nothing -- so they are excluded from non-worksheet object accounting. Everything else
+# carrying a ``type-v2`` (title, text, image, legend/color/size/shape, paramctrl, filter,
+# dashboard-object, ...) is a real placed object the rebuild must also position.
+_CONTAINER_ZONE_TYPES = frozenset({"layout-basic", "layout-flow", "layout"})
+
 # Advisory band thresholds on the aggregate 0..1 score. Named bands, never pass/fail.
 BANDS = (
     (0.95, "faithful"),       # indistinguishable within cross-engine noise
@@ -777,23 +784,37 @@ def _dashboard_record(db, worksheet_names):
             device_zones.add(z)
 
     zones = []
+    objects = []
+    seen_object_ids = set()
     ext_w = ext_h = 0.0
     for zone in _iter_local(db, "zone"):
         if zone in device_zones:
             continue
         x, y = _zone_f(zone, "x"), _zone_f(zone, "y")
         w, h = _zone_f(zone, "w"), _zone_f(zone, "h")
-        if None not in (x, y, w, h) and w > 0 and h > 0:
+        valid_rect = None not in (x, y, w, h) and w > 0 and h > 0
+        if valid_rect:
             ext_w = max(ext_w, x + w)
             ext_h = max(ext_h, y + h)
         zname = zone.get("name")
-        if not zname or zname not in worksheet_names:
+        ztype = (zone.get("type-v2") or zone.get("type") or "").lower()
+        # A worksheet zone is a named, *untyped* zone whose name resolves to a real worksheet.
+        if zname and zname in worksheet_names and not ztype:
+            if valid_rect:
+                zones.append({"worksheet": zname, "x": x, "y": y, "w": w, "h": h})
             continue
-        if zone.get("type-v2") or zone.get("type"):
-            continue
-        if None in (x, y, w, h) or w <= 0 or h <= 0:
-            continue
-        zones.append({"worksheet": zname, "x": x, "y": y, "w": w, "h": h})
+        # A non-worksheet object zone is any typed, NON-container zone (title, text, image,
+        # legend/color, paramctrl, filter, ...). These are real placed objects -- captured as
+        # additive "expected extras" so the reviewer sees the full layout and the engine has a
+        # placement target for them. They never feed the score and never affect coverage.
+        if ztype and ztype not in _CONTAINER_ZONE_TYPES and valid_rect:
+            oid = zone.get("id")
+            if oid is not None and oid in seen_object_ids:
+                continue
+            if oid is not None:
+                seen_object_ids.add(oid)
+            objects.append({"kind": ztype, "id": oid, "worksheet": zname or None,
+                            "param": zone.get("param"), "x": x, "y": y, "w": w, "h": h})
 
     for z in zones:
         if ext_w and ext_h:
@@ -801,7 +822,14 @@ def _dashboard_record(db, worksheet_names):
                               "w": z["w"] / ext_w, "h": z["h"] / ext_h}
         else:
             z["nposition"] = None
-    return {"name": name, "extent": {"w": ext_w or None, "h": ext_h or None}, "zones": zones}
+    for o in objects:
+        if ext_w and ext_h:
+            o["nposition"] = {"x": o["x"] / ext_w, "y": o["y"] / ext_h,
+                              "w": o["w"] / ext_w, "h": o["h"] / ext_h}
+        else:
+            o["nposition"] = None
+    return {"name": name, "extent": {"w": ext_w or None, "h": ext_h or None},
+            "zones": zones, "objects": objects}
 
 
 def read_twb_views(twb_path_or_text):
@@ -1125,6 +1153,7 @@ def score_report(twb, pbir, engine_report=None, field_aliases=None):
 
     visual_results = []
     slicer_results = []
+    dashboard_objects = []
     matched_visuals = set()
     placed_worksheets = set()
 
@@ -1155,6 +1184,13 @@ def score_report(twb, pbir, engine_report=None, field_aliases=None):
                 continue
             slicer_results.append(_score_slicer(v, dash_ws, page["display"]))
             matched_visuals.add((page["name"], v["name"]))
+        # Non-worksheet dashboard objects (title/text/legend/paramctrl/filter/...) -> advisory
+        # placement targets, projected onto this page's canvas px. Expected extras: never scored,
+        # never counted against coverage.
+        for obj in dash.get("objects", []):
+            dashboard_objects.append(
+                _object_target(obj, dash["name"], page["display"],
+                               page.get("width"), page.get("height")))
 
     # Worksheets not on any dashboard: best-effort field-only match against leftover visuals.
     leftover_visuals = [
@@ -1197,7 +1233,8 @@ def score_report(twb, pbir, engine_report=None, field_aliases=None):
 
     return _assemble_report(twb, pbir, visual_results, slicer_results,
                             unmatched_worksheets, extra_visuals, engine_report,
-                            alias_resolved=alias_resolved)
+                            alias_resolved=alias_resolved,
+                            dashboard_objects=dashboard_objects)
 
 
 def _page_for_dashboard(dash, pbir):
@@ -1296,9 +1333,71 @@ def _engine_intent_index(engine_report):
     return index
 
 
+def _object_target(obj, dashboard, page_display, canvas_w, canvas_h):
+    """Project one non-worksheet dashboard object's zone onto the PBI page canvas (px).
+
+    Returns the object's kind, any worksheet association (a legend belongs to a worksheet) and
+    parameter binding, plus its ``target_px`` -- where, to the pixel, the rebuild should place it.
+    This is the render-free placement target for titles/legends/filter cards/param controls, the
+    same zone->px projection the worksheet placement check uses. Purely advisory.
+    """
+    npos = obj.get("nposition")
+    rec = {
+        "kind": obj.get("kind"),
+        "worksheet": obj.get("worksheet"),
+        "param": obj.get("param"),
+        "dashboard": dashboard,
+        "page": page_display,
+        "nposition": npos,
+    }
+    if npos and canvas_w and canvas_h:
+        rec["target_px"] = {"x": round(npos["x"] * canvas_w, 2),
+                            "y": round(npos["y"] * canvas_h, 2),
+                            "w": round(npos["w"] * canvas_w, 2),
+                            "h": round(npos["h"] * canvas_h, 2)}
+    return rec
+
+
+def _placement_rollup(visual_results):
+    """Aggregate the per-visual minute placement deltas into one dashboard-level layout verdict.
+
+    Counts how many paired visuals the engine placed pixel-exact vs merely within the acceptable
+    band vs drifted, and reports the worst/mean worst-edge offset and which worksheet drifted most.
+    Render-free and purely additive -- it summarizes the existing ``placement`` diagnostics and does
+    not touch the score. ``None`` when no visual carried a placement delta (no canvas/zone).
+    """
+    placements = [(r["worksheet"], r["placement"]) for r in visual_results if r.get("placement")]
+    if not placements:
+        return None
+    n = len(placements)
+    exact = sum(1 for _w, p in placements if p.get("pixel_exact"))
+    within = sum(1 for _w, p in placements if p.get("within_tolerance"))
+    edges = [(w, p.get("max_edge_px")) for w, p in placements if p.get("max_edge_px") is not None]
+    worst_edge = max((e for _w, e in edges), default=None)
+    mean_edge = round(sum(e for _w, e in edges) / len(edges), 2) if edges else None
+    worst_ws = max(edges, key=lambda we: we[1])[0] if edges else None
+    if exact == n:
+        verdict = "pixel-exact"
+    elif within == n:
+        verdict = "acceptable"
+    else:
+        verdict = "drifted"
+    return {
+        "evaluated": n,
+        "pixel_exact": exact,
+        "within_tolerance": within,
+        "drifted": n - within,
+        "worst_max_edge_px": worst_edge,
+        "mean_max_edge_px": mean_edge,
+        "worst_worksheet": worst_ws,
+        "verdict": verdict,
+    }
+
+
 def _assemble_report(twb, pbir, visual_results, slicer_results,
                      unmatched_worksheets, extra_visuals, engine_report,
-                     alias_resolved=0):
+                     alias_resolved=0, dashboard_objects=None):
+    dashboard_objects = dashboard_objects or []
     scores = [r["score"] for r in visual_results]
     mean = sum(scores) / len(scores) if scores else None
     worst = min(scores) if scores else None
@@ -1317,6 +1416,7 @@ def _assemble_report(twb, pbir, visual_results, slicer_results,
 
     remodel_suspected = [r for r in visual_results
                          if r.get("diagnosis") == _REMODEL_DIAGNOSIS]
+    placement = _placement_rollup(visual_results)
 
     notes = [
         "ADVISORY structural fidelity only -- not a pass/fail and not a pixel comparison.",
@@ -1337,6 +1437,12 @@ def _assemble_report(twb, pbir, visual_results, slicer_results,
             "engine field-alias map before name overlap, so a faithful star-schema rename "
             "(e.g. Date.Date -> Order Date) scores as a match rather than a mismatch.".format(
                 alias_resolved))
+    if dashboard_objects:
+        notes.append(
+            "{} non-worksheet dashboard object(s) (title/text/legend/param control/filter) were "
+            "captured as advisory placement targets (their 'target_px' on the page canvas). They are "
+            "expected extras: never scored and never counted against coverage.".format(
+                len(dashboard_objects)))
 
     return {
         "kind": ORACLE_KIND,
@@ -1355,10 +1461,13 @@ def _assemble_report(twb, pbir, visual_results, slicer_results,
             "slicers": len(slicer_results),
             "remodel_rename_suspected": len(remodel_suspected),
             "fields_alias_resolved": alias_resolved,
+            "placement": placement,
+            "dashboard_objects": len(dashboard_objects),
         },
         "visuals": sorted(visual_results, key=lambda r: r["score"]),
         "slicers": slicer_results,
         "extra_visuals_detail": extra_visuals,
+        "dashboard_objects_detail": dashboard_objects,
         "notes": notes,
     }
 
@@ -1946,6 +2055,18 @@ def render_markdown(report):
         s["mean_visual_score"], s["worst_visual_score"]))
     lines.append("- **Coverage:** %s (%d/%d worksheets matched)" % (
         s["coverage"], s["matched_visuals"], s["source_worksheets"]))
+    pr = s.get("placement")
+    if pr:
+        lines.append(
+            "- **Layout (placement):** %s — %d/%d visuals pixel-exact, worst edge %s px%s" % (
+                pr["verdict"], pr["pixel_exact"], pr["evaluated"],
+                pr["worst_max_edge_px"],
+                "" if pr["verdict"] == "pixel-exact" or not pr.get("worst_worksheet")
+                else " (`%s`)" % pr["worst_worksheet"]))
+    if s.get("dashboard_objects"):
+        lines.append(
+            "- **Dashboard objects:** %d non-worksheet object(s) captured as placement targets "
+            "(expected extras; not scored)." % s["dashboard_objects"])
     if s["unmatched_worksheets"]:
         lines.append("- **Unmatched worksheets:** %s" % ", ".join(s["unmatched_worksheets"]))
     if s.get("remodel_rename_suspected"):
@@ -1989,6 +2110,23 @@ def render_markdown(report):
             lines.append("| %s | %s | %s | %s | %s |" % (
                 r["worksheet"], pl["max_edge_px"], pl["delta_px"]["center"],
                 "-" if pl["iou"] is None else ("%.3f" % pl["iou"]), verdict))
+    objs = report.get("dashboard_objects_detail") or []
+    if objs:
+        lines.append("")
+        lines.append("## Non-worksheet dashboard objects (expected extras)")
+        lines.append("_Advisory placement targets only — titles, text, legends, parameter controls "
+                     "and filter cards. Never scored and never counted against coverage; their "
+                     "`target_px` is where the rebuild should place them on the page canvas._")
+        lines.append("")
+        lines.append("| Kind | Worksheet | Target px (x, y, w, h) | Param |")
+        lines.append("|---|---|---|---|")
+        for o in objs:
+            tp = o.get("target_px")
+            box = ("%s, %s, %s, %s" % (tp["x"], tp["y"], tp["w"], tp["h"])) if tp else "-"
+            param = o.get("param")
+            param_cell = ("`%s`" % param) if param else "-"
+            lines.append("| %s | %s | %s | %s |" % (
+                o.get("kind") or "?", o.get("worksheet") or "-", box, param_cell))
     if report["slicers"]:
         lines.append("")
         lines.append("## Slicers / filters")
