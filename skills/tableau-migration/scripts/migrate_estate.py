@@ -53,12 +53,18 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .assemble_model import (assemble_import_model, write_model_folder, write_local_pbip,
                                  migrate_datasource, list_workbook_datasources)
     from .parameters import parse_parameters
+    from .workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
+    from .workbook_calc_usage import workbook_calc_usage
+    from . import fetch_tds as F
 except ImportError:
     from connection_to_m import parse_tds
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from assemble_model import (assemble_import_model, write_model_folder, write_local_pbip,
                                 migrate_datasource, list_workbook_datasources)
     from parameters import parse_parameters
+    from workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
+    from workbook_calc_usage import workbook_calc_usage
+    import fetch_tds as F
 
 
 # -- source adapters -----------------------------------------------------------
@@ -96,11 +102,15 @@ class TableauSource(ABC):
 
 
 class LocalFilesSource(TableauSource):
-    """Enumerate a folder of exported ``.tds`` / ``.twb`` files and hand their text to the pipeline.
+    """Enumerate a folder of exported Tableau files and hand their XML text to the pipeline.
 
-    Files are discovered recursively (case-insensitive extension) and read with
-    ``encoding="utf-8-sig"`` so Tableau's UTF-8 BOM is consumed transparently. Ids are absolute
-    file paths; the display name is the file stem.
+    Both the bare exports (``.tds`` datasource, ``.twb`` workbook) and the packaged exports
+    (``.tdsx`` / ``.twbx`` -- zip archives) are discovered recursively (case-insensitive) so a local
+    UPLOAD works exactly like a live PULL. A packaged file's inner document is extracted in memory
+    (never written to disk); a bare file is read with ``encoding="utf-8-sig"`` so Tableau's UTF-8 BOM
+    is consumed transparently. When both a packaged and an unpacked copy of the same asset coexist in
+    a folder, the asset is processed ONCE (the unpacked copy wins). Ids are absolute file paths; the
+    display name is the file stem.
     """
 
     def __init__(self, root):
@@ -115,21 +125,36 @@ class LocalFilesSource(TableauSource):
                     found.append(os.path.join(dirpath, fn))
         return sorted(found)
 
-    def _read(self, path):
-        with open(path, "r", encoding="utf-8-sig") as fh:
-            return fh.read()
+    @staticmethod
+    def _dedup_by_stem(paths):
+        # A packaged export (.tdsx/.twbx) and its unpacked twin (.tds/.twb) describe ONE asset; emit it
+        # once (prefer the unpacked copy -- already text, and the copy a user is most likely editing)
+        # so the output bundle has no duplicate datasource / name collision.
+        chosen = {}
+        for p in paths:
+            stem, ext = os.path.splitext(os.path.basename(p))
+            key = (os.path.dirname(p), stem.lower())
+            packaged = ext.lower() in (".tdsx", ".twbx")
+            if key not in chosen or (chosen[key][1] and not packaged):
+                chosen[key] = (p, packaged)
+        return sorted(p for p, _packaged in chosen.values())
 
     def list_datasources(self):
-        return self._discover(".tds")
+        # Packaged ``.tdsx`` is a common local export shape, so discover it alongside the bare ``.tds``.
+        return self._dedup_by_stem(self._discover(".tds") + self._discover(".tdsx"))
 
     def read_datasource(self, ds_id):
-        return self._read(ds_id)
+        with open(ds_id, "rb") as fh:
+            data = fh.read()
+        return F.inner_tds_from_zip(data) if F.is_zip(data) else data.decode("utf-8-sig")
 
     def list_workbooks(self):
-        return self._discover(".twb")
+        # Packaged ``.twbx`` is a common local export shape, so discover it alongside the bare ``.twb``.
+        return self._dedup_by_stem(self._discover(".twb") + self._discover(".twbx"))
 
     def read_workbook(self, wb_id):
-        return self._read(wb_id)
+        # ``load_workbook_xml`` transparently handles both a bare ``.twb`` and a packaged ``.twbx``.
+        return load_workbook_xml(wb_id)
 
     def asset_name(self, asset_id):
         return os.path.splitext(os.path.basename(asset_id))[0]
@@ -385,9 +410,13 @@ _VIZ_ENTRY_POINTS = ("migrate_workbook", "migrate_twb_to_pbir", "build_pbir", "b
 def extract_calculations(xml_text, *, include_dimensions=False):
     """Pull measure calculated fields out of ``.tds`` / ``.twb`` XML.
 
-    Returns ``(calcs, skipped)`` where ``calcs`` is a list of ``{"name", "formula"}`` ready to
-    hand to ``assemble_import_model(calcs=...)`` and ``skipped`` records every calculated field
-    deliberately left out, with a reason -- so nothing disappears silently.
+    Returns ``(calcs, skipped)`` where ``calcs`` is a list of ``{"name", "formula", "internal_name"?}``
+    ready to hand to ``assemble_import_model(calcs=...)`` and ``skipped`` records every calculated
+    field deliberately left out, with a reason -- so nothing disappears silently. ``internal_name`` is
+    the field's Tableau internal name (e.g. ``Calculation_0014172369248279``), included only when it
+    differs from the caption -- an additive cross-layer join key so a translated measure can be bound
+    back to its workbook usage. This matches ``connection_to_m.extract_calcs``'s convention so both
+    calc extractors stamp the same key the model build reads for source identity / calc_bindings.
 
     Calculated fields live as ``<column caption=.. role=..><calculation class=.. formula=../></column>``.
     Only *measure*-role calcs become DAX measures; bins (``class='categorical-bin'``), empty
@@ -414,7 +443,8 @@ def extract_calculations(xml_text, *, include_dimensions=False):
         calc_el = next((c for c in list(col) if _local(c.tag) == "calculation"), None)
         if calc_el is None:
             continue
-        caption = col.get("caption") or _strip_brackets(col.get("name") or "") or ""
+        internal_name = _strip_brackets(col.get("name") or "") or None
+        caption = col.get("caption") or internal_name or ""
         cls = (calc_el.get("class") or "tableau").lower()
         formula = calc_el.get("formula") or ""
         role = (col.get("role") or "measure").lower()
@@ -439,13 +469,19 @@ def extract_calculations(xml_text, *, include_dimensions=False):
                 skipped.append({"name": caption, "reason": "duplicate calculated-field name"})
                 continue
             seen.add(caption)
-            dim_calcs.append({"name": caption, "formula": formula, "role": role})
+            dim_entry = {"name": caption, "formula": formula, "role": role}
+            if internal_name and internal_name.lower() != caption.lower():
+                dim_entry["internal_name"] = internal_name
+            dim_calcs.append(dim_entry)
             continue
         if caption in seen:
             skipped.append({"name": caption, "reason": "duplicate calculated-field name"})
             continue
         seen.add(caption)
-        calcs.append({"name": caption, "formula": formula})
+        entry = {"name": caption, "formula": formula}
+        if internal_name and internal_name.lower() != caption.lower():
+            entry["internal_name"] = internal_name
+        calcs.append(entry)
 
     return (calcs, skipped, dim_calcs) if include_dimensions else (calcs, skipped)
 
@@ -494,11 +530,27 @@ def _viz_adapter(cand):
         params = set()
     name_kwargs = {"report_name", "dataset_name"} & params
     supports_date = "date_binding" in params
-    def _call(twb_text, name, date_binding=None):
+    supports_rowcount = "row_count_binding" in params
+    supports_measure = "measure_binding" in params
+    supports_param = "param_binding" in params
+    supports_model_table = "model_table" in params
+    supports_field_map = "field_map" in params
+    def _call(twb_text, name, date_binding=None, measure_binding=None, row_count_binding=None,
+              param_binding=None, model_table=None, field_map=None):
         if name_kwargs:
             kwargs = {k: name for k in name_kwargs}
             if supports_date and date_binding is not None:
                 kwargs["date_binding"] = date_binding
+            if supports_rowcount and row_count_binding is not None:
+                kwargs["row_count_binding"] = row_count_binding
+            if supports_measure and measure_binding is not None:
+                kwargs["measure_binding"] = measure_binding
+            if supports_param and param_binding is not None:
+                kwargs["param_binding"] = param_binding
+            if supports_model_table and model_table is not None:
+                kwargs["model_table"] = model_table
+            if supports_field_map and field_map is not None:
+                kwargs["field_map"] = field_map
             return cand(twb_text, **kwargs)
         return cand(twb_text, name)
     return _call
@@ -527,8 +579,14 @@ def _resolve_viz_stage(injected):
     return None
 
 
-def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None):
-    """Drive the full per-datasource pipeline. Returns a report detail dict (never raises)."""
+def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, ds_catalog=None,
+                            approved_calc_dax=None):
+    """Drive the full per-datasource pipeline. Returns a report detail dict (never raises).
+
+    When ``ds_catalog`` is given, a successfully migrated datasource records its source text +
+    folder name under a connector-agnostic key, so a workbook that connects to it as a PUBLISHED
+    datasource can later rebuild its model from this real schema (see ``_attach_workbook_pbip``).
+    """
     name = source.asset_name(ds_id)
     detail = {"name": name, "source_id": str(ds_id)}
 
@@ -577,7 +635,7 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None):
 
     try:
         out = assemble_import_model(descriptor, model_name=name, calcs=calcs, dim_calcs=dim_calcs,
-                                    parameters=parameters)
+                                    parameters=parameters, approved_calc_dax=approved_calc_dax)
     except ValueError as exc:  # storage policy / no-columns -> documented land-to-Delta fallback
         detail.update(status="fallback", storage_mode=None, storage_decision=decision,
                       reason=str(exc),
@@ -649,6 +707,8 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None):
         calc_columns_stubbed=cc_stubbed,
         manual_followups=decision.get("manual_followups", []),
     )
+    if ds_catalog is not None:
+        ds_catalog[_norm_ds(name)] = {"name": name, "text": text, "safe_base": safe_base}
     return detail
 
 
@@ -852,6 +912,337 @@ def _date_binding_from_model(res_report):
     return {"date_table": dr["table"], "active_keys": active, "key_column": "Date"}
 
 
+def _measure_binding_from_model(res_report):
+    """Derive the report binder's ``measure_binding`` from the model build's calc->measure facts.
+
+    Pure CONSUMER of the datasource-migration report (it never re-translates a calc): it shapes the
+    model build's own calc->measure identity into the ``{"measures": {key: entry}}`` map that
+    ``twb_to_pbir._lookup_measure_binding`` reads, so a workbook-local calc / quick-table-calc pill
+    the model emitted as a named ``_Measures`` measure rebinds to that real measure -- deterministic
+    and token-keyed (the locked model<->viz contract). Each ``entry`` carries ``model_table`` +
+    ``measure_name`` + ``status``; the consumer binds ONLY a translated / assisted-approved entry and
+    degrades-and-warns on anything else.
+
+    Two sources, in priority:
+      1. ``report["calc_bindings"]`` -- the model build's consolidated index keyed by BOTH the calc
+         instance token (``pcdf:usr:Calculation_*:qk``) and the bare calc id / caption. Passed
+         through verbatim so the join token is byte-identical to what the model stamped (never
+         re-derived here).
+      2. otherwise, per-measure ``source`` tags on ``report["measures"]`` rows (a pre-``calc_bindings``
+         shape): only rows that carry an explicit ``calc_instance_token`` / ``calc_id`` /
+         ``field_caption`` are keyed, so plain ``<column>`` calcs keep their existing caption-based
+         ``_Measures`` binding untouched.
+
+    Returns ``None`` when the model produced no token-identified calc measure, so the report keeps its
+    standing field resolution (warn-never-wrong; byte-unchanged until a real binding exists).
+    """
+    rr = res_report or {}
+    index = rr.get("calc_bindings")
+    if isinstance(index, dict):
+        entries = {k: v for k, v in index.items() if k and isinstance(v, dict)}
+        if entries:
+            return {"measures": entries}
+    entries = {}
+    for row in rr.get("measures") or []:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("measure")
+        src = row.get("source")
+        if not name or not isinstance(src, dict):
+            continue
+        entry = {"model_table": src.get("model_table") or "_Measures",
+                 "measure_name": name, "status": row.get("status")}
+        for key in (src.get("calc_instance_token"), src.get("calc_id"), src.get("field_caption")):
+            if key:
+                entries.setdefault(key, entry)
+    return {"measures": entries} if entries else None
+
+
+def _row_count_binding_from_model(res_report):
+    """Derive the report binder's ``row_count_binding`` from the model build's COUNTROWS facts.
+
+    Pure CONSUMER of the datasource-migration report (it never re-derives a count). A dashboard's
+    implicit object-id ``COUNT(*)`` pill (e.g. the pilot's ``COUNT(Orders)`` line value) carries NO
+    calc token, so it must bind by FACT TABLE rather than by a calc id -- a channel distinct from
+    ``measure_binding``. Once the model build lowers an object-id count to a ``COUNTROWS('<fact>')``
+    measure (the g1 lowering) and surfaces it, this shapes that fact into the binder's
+    ``row_count_binding`` (the ``twb_to_pbir._row_count_measure_target`` contract):
+    ``{"measures": {<table>: {"entity", "measure"}}, "default": {"entity", "measure"}}``. An
+    ``object_id`` count binds ONLY on its own table (never via ``default`` -- it names a specific
+    fact); the legacy single-fact ``numrec`` count binds via ``default``.
+
+    Two sources, in priority (both additive; passed through, never re-derived):
+      1. ``report["row_count_binding"]`` -- already in the consumer shape; normalised + passed
+         through verbatim so the table->measure identity is byte-identical to what the model emitted.
+      2. ``report["row_count_measures"]`` -- a convenience ``{<table>: {entity, measure}}`` (or
+         ``{<table>: "<measure name>"}``) map plus an optional ``"default"``; normalised to the
+         shape above (a bare name defaults to the ``_Measures`` table).
+      3. ``report["model_manifest"]["row_count"]`` -- the same fact-table -> COUNTROWS-measure
+         mapping when the model build surfaces it nested inside its additive ``model_manifest``
+         (either the nested ``{"measures": {...}, "default": {...}}`` shape or a flat
+         ``{<table>: target}`` map). A scalar / non-mapping value here (e.g. a diagnostic row total)
+         is ignored -- only real table->measure targets bind, so this is safe regardless of shape.
+
+    Returns ``None`` when the model exposed no row-count measure, so the report keeps its precise
+    "implicit row count ... left unbound" warning (warn-never-wrong; byte-unchanged until a real
+    measure exists -- on a model with no such fact this is a no-op).
+    """
+    rr = res_report or {}
+
+    def _target(m):
+        if isinstance(m, str):
+            return {"entity": "_Measures", "measure": m} if m else None
+        if not isinstance(m, dict):
+            return None
+        entity = m.get("entity") or m.get("model_table") or "_Measures"
+        measure = m.get("measure") or m.get("measure_name")
+        return {"entity": entity, "measure": measure} if measure else None
+
+    def _shape(measures_map, default_val):
+        measures = {}
+        for table, m in (measures_map or {}).items():
+            if table == "default":
+                continue
+            tv = _target(m)
+            if table and tv:
+                measures[table] = tv
+        out = {}
+        if measures:
+            out["measures"] = measures
+        dflt = _target(default_val)
+        if dflt:
+            out["default"] = dflt
+        return out or None
+
+    def _from_obj(obj):
+        # Accept either the nested consumer shape ({"measures": {...}, "default": {...}}) or a flat
+        # convenience map ({<table>: target, "default": target}). A non-dict (or a dict carrying no
+        # bindable target) yields None, so an absent/scalar source is a clean no-op.
+        if not isinstance(obj, dict) or not obj:
+            return None
+        if isinstance(obj.get("measures"), dict):
+            return _shape(obj.get("measures"), obj.get("default"))
+        return _shape(obj, obj.get("default"))
+
+    for src in (rr.get("row_count_binding"),
+                rr.get("row_count_measures"),
+                (rr.get("model_manifest") or {}).get("row_count")):
+        shaped = _from_obj(src)
+        if shaped:
+            return shaped
+    return None
+
+
+def _filter_param_target_field(formula, param_inner):
+    """Return the SINGLE Tableau field caption a parameter is equated against in the standard
+    "parameter-as-filter" idiom, or ``None`` for any other shape.
+
+    Tableau's canonical "use a parameter as a filter" calc compares ONE dimension column to the
+    parameter, optionally with an ``OR [Parameters].[P] = "All"`` escape that shows everything::
+
+        IF [Region] = [Parameters].[P] OR [Parameters].[P] = "All" THEN TRUE END
+        IF [Parameters].[P] = [Sub-Category] OR [Parameters].[P] = "All" THEN TRUE END
+
+    ``param_inner`` is the (bracket-less) parameter name the formula references. Only a clean,
+    single-column equality binds: 0 or >1 distinct compared columns returns ``None`` (the caller then
+    leaves the parameter as an unresolved slicer -- warn-never-wrong). The ``"All"`` escape compares
+    the parameter to a STRING literal, never a field, so it never contributes a target. The negative
+    lookbehind keeps the parameter's own ``[Parameters].[P]`` tail bracket from being read as a field.
+    """
+    f = formula or ""
+    pi = re.escape(param_inner or "")
+    if not pi:
+        return None
+    pat_field_eq_param = re.compile(
+        r"(?<!\]\.)\[(?!Parameters?\])([^\]]+)\]\s*=\s*\[Parameters?\]\.\[" + pi + r"\]",
+        re.IGNORECASE)
+    pat_param_eq_field = re.compile(
+        r"\[Parameters?\]\.\[" + pi + r"\]\s*=\s*\[(?!Parameters?\])([^\]]+)\]",
+        re.IGNORECASE)
+    fields = set()
+    for m in pat_field_eq_param.finditer(f):
+        fields.add(m.group(1).strip())
+    for m in pat_param_eq_field.finditer(f):
+        fields.add(m.group(1).strip())
+    fields = {x for x in fields if x and x.lower() != "parameters"}
+    return next(iter(fields)) if len(fields) == 1 else None
+
+
+def _param_slicers_from_workbook(twb_text, res_report):
+    """Direct single-select slicers for workbook parameters used as a plain column-equality filter.
+
+    The model build classifies every parameter and (for a genuine what-if / field-swap param) emits a
+    model object, but a parameter used purely as ``[Col] = [Parameters].[P]`` (optionally with an
+    ``OR [Parameters].[P] = "All"`` escape) is most faithfully rebuilt as an ORDINARY single-select
+    slicer on that real column -- no disconnected what-if table, no flag measure. This resolves those
+    targets from the workbook's OWN filter calcs against the model's authoritative naming map, so a
+    slicer only ever lands on a column the model actually emitted.
+
+    Returns ``{<param internal_name>: {"table", "column", "single_select", "caption"}}`` (possibly
+    empty), keyed the same way :func:`_param_binding_from_model` keys its slicers so the two merge
+    cleanly. Never raises -- any parse problem yields no slicers and the precise "not rebuilt as a
+    slicer yet" warning then stands.
+    """
+    try:
+        params = parse_parameters(twb_text)
+    except Exception:
+        params = []
+    if not params:
+        return {}
+    try:
+        calcs, _skipped, dim_calcs = extract_calculations(twb_text, include_dimensions=True)
+    except Exception:
+        calcs, dim_calcs = [], []
+    formulas = [(c.get("formula") or "") for c in (list(calcs or []) + list(dim_calcs or []))
+                if isinstance(c, dict)]
+    if not formulas:
+        return {}
+    naming = ((res_report or {}).get("model_manifest") or {}).get("naming") or {}
+    col_idx = {}
+    for ref, info in naming.items():
+        if isinstance(info, dict) and info.get("kind") == "column":
+            key = (ref or "").strip().lower()
+            if key:
+                col_idx.setdefault(key, info)
+    if not col_idx:
+        return {}
+    out = {}
+    for p in params:
+        pid = p.get("internal_name")
+        if not pid:
+            continue
+        keys = {(p.get("caption") or "").strip().strip("[]").strip().lower(),
+                (pid or "").strip().strip("[]").strip().lower()}
+        keys.discard("")
+        for formula in formulas:
+            refs = {m.strip().lower()
+                    for m in re.findall(r"\[Parameters?\]\.\[([^\]]+)\]", formula)}
+            hit = next((k for k in keys if k in refs), None)
+            if not hit:
+                continue
+            field = _filter_param_target_field(formula, hit)
+            if not field:
+                continue
+            info = col_idx.get(field.strip().lower())
+            if info and info.get("model_table") and info.get("model_name"):
+                out[pid] = {"table": info["model_table"], "column": info["model_name"],
+                            "single_select": True, "caption": p.get("caption") or pid}
+                break
+    return out
+
+
+def _scope_flag_visuals(twb_text, res_report):
+    """Attach the worksheet names a flag measure scopes to its ``filter_bindings`` entry.
+
+    A date-window / measure flag is applied as a visual-level ``flag = 1`` filter, but only on the
+    worksheets that actually placed the source Tableau filter calc -- not the whole page. The model
+    build records each flag's source ``calc_id`` in ``report["filter_bindings"]``; this maps that
+    calc_id to the worksheets that reference it (via :func:`workbook_calc_usage`, whose calc keys are
+    the same unbracketed internal name) and writes those names into the binding's ``visuals`` list,
+    so the viz layer can scope the filter to exactly those visuals. Additive + best-effort: a parse
+    failure or an unreferenced calc leaves ``visuals`` absent (the consumer then falls back to its
+    own known scope). Mutates ``res_report["filter_bindings"]`` in place; never raises.
+    """
+    fb = (res_report or {}).get("filter_bindings")
+    if not isinstance(fb, dict) or not fb:
+        return
+    try:
+        calc_usage = (workbook_calc_usage(twb_text) or {}).get("calcs") or {}
+    except Exception:
+        return
+    for spec in fb.values():
+        if not isinstance(spec, dict):
+            continue
+        cid = spec.get("calc_id")
+        entry = calc_usage.get(cid) if cid else None
+        if isinstance(entry, dict) and entry.get("worksheets"):
+            spec["visuals"] = list(entry["worksheets"])
+
+
+def _param_binding_from_model(res_report):
+    """Derive the report binder's ``param_binding`` from the model build's parameter / filter facts.
+
+    Pure CONSUMER of the datasource-migration report (it never re-derives a parameter). A Tableau
+    dashboard parameter control, and a parameter-driven measure/calc filter, have no faithful Tier-1
+    rebuild until the model build identifies what the parameter targets -- a real dimension column (a
+    plain slicer), a disconnected picker table (a value-picker slicer), or a flag MEASURE that
+    encodes a relative-date / measure window (applied as a visual-level ``flag = 1`` filter). This
+    shapes those model facts into the ``twb_to_pbir`` consumer contract so the viz layer can emit
+    faithful slicers + flag filters instead of the standing "not rebuilt as a slicer yet" /
+    "aggregate-measure filter not mapped" warnings (warn-never-wrong: nothing is emitted unless the
+    model confirmed the target, and a flag binds only for a translated / assisted-approved measure).
+
+    Returns ``{"slicers": {<param id>: {"table", "column", "single_select", "caption"}},
+    "flags": {<tableau filter token>: {"entity", "measure", "status", "value"}}}`` or ``None`` when
+    the model exposed nothing bindable (so the report keeps its precise warnings, byte-unchanged).
+
+    Sources (all additive; passed through, never re-derived), in priority:
+      1. ``report["param_binding"]`` -- already in the consumer shape; normalised + passed through.
+      2. ``report["model_manifest"]["parameters"]`` -- a list of ``{name, internal_name, kind,
+         model_object, target_column?, picker?}`` records. A ``kind="filter"`` param with a resolved
+         ``target_column`` becomes a plain slicer on that real column; a ``kind="value"`` param with
+         a ``picker`` (a disconnected ``{table, column}`` picker table) becomes a value-picker
+         slicer. ``model_object``/missing targets bind nothing (degrade-and-warn in viz).
+      3. ``report["filter_bindings"]`` (or the same key nested in ``model_manifest``) -- a token-keyed
+         ``{<tableau filter token>: {model_table, measure_name, status, predicate}}`` map for the
+         flag measures (e.g. a relative-date "Date Window Flag"); bound iff ``status`` is
+         ``translated`` / ``assisted-approved``.
+    """
+    rr = res_report or {}
+    _BIND_OK = ("translated", "assisted-approved")
+
+    def _field(spec, *, single):
+        if not isinstance(spec, dict):
+            return None
+        table = spec.get("table") or spec.get("entity") or spec.get("model_table")
+        column = spec.get("column") or spec.get("property")
+        if not table or not column:
+            return None
+        return {"table": table, "column": column, "single_select": single}
+
+    direct = rr.get("param_binding")
+    if isinstance(direct, dict) and (direct.get("slicers") or direct.get("flags")):
+        return {"slicers": dict(direct.get("slicers") or {}),
+                "flags": dict(direct.get("flags") or {})}
+
+    manifest = rr.get("model_manifest") or {}
+    slicers, flags = {}, {}
+
+    for p in (manifest.get("parameters") or []):
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("internal_name") or p.get("param_id") or p.get("id")
+        caption = p.get("name") or p.get("caption")
+        # A value-picker (disconnected picker table) wins over a plain target column when both are
+        # present; both yield a single-select slicer (a Tableau parameter is a single-value control).
+        field = _field(p.get("picker"), single=True) \
+            or _field(p.get("target_column") or p.get("target"), single=True)
+        if pid and field:
+            field["caption"] = caption
+            slicers[pid] = field
+
+    fb = rr.get("filter_bindings") or manifest.get("filter_bindings") or {}
+    for token, spec in (fb.items() if isinstance(fb, dict) else []):
+        if not isinstance(spec, dict):
+            continue
+        measure = spec.get("measure_name") or spec.get("measure")
+        status = (spec.get("status") or "").lower()
+        if not measure or status not in _BIND_OK:
+            continue
+        pred = spec.get("predicate") if isinstance(spec.get("predicate"), dict) else {}
+        flags[token] = {
+            "entity": spec.get("model_table") or spec.get("entity") or "_Measures",
+            "measure": measure,
+            "status": status,
+            "value": pred.get("value", 1),
+            "visuals": list(spec.get("visuals") or []),
+        }
+
+    if not slicers and not flags:
+        return None
+    return {"slicers": slicers, "flags": flags}
+
+
 def _ds_calc_columns(ds_el):
     """Calculated fields defined directly on a datasource element.
 
@@ -965,7 +1356,99 @@ def _workbook_binding_signal(twb_text, ir):
     }
 
 
-def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None):
+def _norm_ds(name):
+    """Connector-agnostic match key: lowercased with all non-alphanumerics removed, so a workbook's
+    published-datasource name ('Superstore - Extract') matches the migrated datasource it became
+    ('Superstore-Extract.tds' -> 'Superstore_Extract')."""
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog, approved_calc_dax=None):
+    """Rebuild a published-datasource workbook's model from the matching ALREADY-MIGRATED published
+    datasource (its real schema) instead of the workbook's own unusable ``sqlproxy`` proxy stub --
+    carrying the workbook's own calculated fields so its view-local measures translate against that
+    schema. Returns a ``migrate_datasource`` result bound to the real schema, or ``None`` when there
+    is no faithful name match (the caller then keeps the honest skip). Never raises.
+    """
+    if not ds_catalog:
+        return None
+    sig = detail.get("binding_signal") or {}
+    if sig.get("kind") != "published":
+        return None
+    match = ds_catalog.get(_norm_ds(sig.get("published_ds_name")))
+    if not match:
+        return None
+    try:
+        wb_calcs, _skipped, wb_dim_calcs = extract_calculations(twb_text, include_dimensions=True)
+    except Exception:
+        wb_calcs, wb_dim_calcs = None, None
+    # Table-calc addressing (partition / order) lives in the WORKBOOK's worksheet shelves, never in
+    # the published ``.tds`` schema we rebuild from -- so extract the usages from ``twb_text`` and
+    # thread them through. Without this, positional measures (WINDOW_STDEV, percent-difference, LAST)
+    # would re-extract from the schema-only ``.tds``, find no worksheets, and stub to ``= 0``. This
+    # is what brings the live/published path to parity with a local ``.twbx`` whose embedded model
+    # already carries its own worksheets.
+    try:
+        wb_table_calc_usages = extract_table_calc_usages(twb_text)
+    except Exception:
+        wb_table_calc_usages = None
+    # Parameters also live only in the WORKBOOK, never in the published ``.tds`` schema. Without
+    # threading them through, a parameter-driven measure (e.g. a Date Selection band that becomes a
+    # keep-flag MEASURE) would never reach the model build on the published path, so the flag + its
+    # ``filter_bindings`` would silently never fire. Guarded: a parse hiccup degrades to None (the
+    # model build then simply has no parameters, exactly as before).
+    try:
+        wb_params = parse_parameters(twb_text)
+    except Exception:
+        wb_params = None
+    try:
+        res = migrate_datasource(match["text"], model_name=model_safe,
+                                 calcs=wb_calcs, dim_calcs=wb_dim_calcs,
+                                 parameters=wb_params,
+                                 table_calc_usages=wb_table_calc_usages,
+                                 approved_calc_dax=approved_calc_dax)
+    except Exception:
+        return None
+    if (res.get("report") or {}).get("fallback"):
+        return None
+    detail["bound_via"] = f"published_catalog_match:{match.get('name')}"
+    return res
+
+
+def _field_map_from_model(res_report):
+    """Build ``(model_table, field_map)`` for the viz re-run from the model build's authoritative
+    naming map, so a published-datasource workbook's column pills bind to the REAL migrated tables
+    (``Orders``/``Date``) instead of the workbook's own unusable ``sqlproxy`` proxy entity.
+
+    ``field_map`` keys VERBATIM on each column's Tableau field caption / remote name (the same
+    ``model_manifest['naming']`` join convention the model->viz contract guarantees never dangles)
+    and carries only ``{entity, property}`` -- never ``binding`` -- so an aggregation pill
+    (``SUM([Sales])``) keeps its aggregation while its entity is corrected to the fact table.
+    ``model_table`` is the fact table (the one owning the most columns) and acts as the fallback for
+    any column pill not present in the map. Measures are intentionally EXCLUDED here -- the
+    token-keyed ``measure_binding`` already rebinds them onto ``_Measures``. Returns ``(None, None)``
+    when no naming map is available (the re-run then keeps its standing field bindings).
+    """
+    manifest = (res_report or {}).get("model_manifest") or {}
+    naming = manifest.get("naming") or {}
+    field_map, counts = {}, {}
+    for ref, info in naming.items():
+        if (info or {}).get("kind") != "column":
+            continue
+        model_table = info.get("model_table")
+        model_name = info.get("model_name")
+        if not ref or not model_table or not model_name:
+            continue
+        field_map[ref] = {"entity": model_table, "property": model_name}
+        counts[model_table] = counts.get(model_table, 0) + 1
+    if not field_map:
+        return None, None
+    fact_table = max(counts, key=counts.get)
+    return fact_table, field_map
+
+
+def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None, ds_catalog=None,
+                          approved_calc_dax=None):
     """Build an openable, self-contained workbook ``.pbip`` and record it on ``detail`` (never raises).
 
     Rebuilds the workbook's OWN primary embedded datasource into a semantic model (reusing the
@@ -1006,7 +1489,8 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
                      f"a single PBIR report binds one model; bound the primary {label!r}")
 
     try:
-        res = migrate_datasource(twb_text, model_name=model_safe, datasource=label)
+        res = migrate_datasource(twb_text, model_name=model_safe, datasource=label,
+                                 approved_calc_dax=approved_calc_dax)
     except Exception as exc:
         warns.append(_PBIP_WARN + f"could not rebuild embedded datasource {label!r} "
                      f"({type(exc).__name__}: {exc}) -- workbook .pbip skipped")
@@ -1014,28 +1498,102 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
 
     res_report = res.get("report") or {}
     if res_report.get("fallback"):
-        rationale = (res_report.get("storage_decision") or {}).get("rationale") or "undoable shape"
-        warns.append(_PBIP_WARN + f"embedded datasource {label!r} routes to the lakehouse fallback "
-                     f"({rationale}) -- workbook .pbip skipped (model lands separately)")
-        return
+        # Published-datasource workbook: its own embedded copy is a sqlproxy proxy stub with no
+        # usable schema, so rebuilding it lands in the lakehouse fallback. When the estate already
+        # built the matching published datasource, rebuild the model from THAT real schema --
+        # carrying the workbook's own calculated fields so its view-local measures translate -- and
+        # bind the report to it. Never guesses (a real datasource-name match is required); any
+        # failure keeps the honest skip below (warn-never-wrong).
+        recovered = _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog,
+                                                  approved_calc_dax=approved_calc_dax)
+        if recovered is not None:
+            res = recovered
+            res_report = res.get("report") or {}
+        if res_report.get("fallback"):
+            rationale = (res_report.get("storage_decision") or {}).get("rationale") or "undoable shape"
+            warns.append(_PBIP_WARN + f"embedded datasource {label!r} routes to the lakehouse fallback "
+                         f"({rationale}) -- workbook .pbip skipped (model lands separately)")
+            return
 
     report_parts = _rebind_report_byPath(result["parts"], model_safe)
-    # Date-table rebind: now that the real model is in hand, re-run the viz stage with the model's
-    # date facts so date axis pills on the ACTIVE business date bind to the shared marked Date table
-    # (Date[Year], ...) -- routing time intelligence through the calendar instead of the fact's raw
-    # date column. Consumes the model build's facts; never recomputes them. Best-effort + additive:
-    # any failure (or a model with no usable Date table) silently keeps the source-column binding.
+    # Model-fact rebind: now that the real model is in hand, re-run the viz stage ONCE with the
+    # model build's facts so the report binds to what the model actually emitted (the contract is
+    # model build -> facts -> single-pass viz). Two consumed facts, both additive + best-effort:
+    #  * date_binding -- date axis pills on the ACTIVE business date bind to the shared marked Date
+    #    table (Date[Year], ...), routing time intelligence through the calendar instead of the
+    #    fact's raw date column.
+    #  * measure_binding -- workbook-local calc / quick-table-calc pills the model translated into
+    #    named ``_Measures`` measures rebind to those real, token-keyed measures (warn-never-wrong:
+    #    only translated/assisted-approved entries bind; anything else degrades-and-warns in viz).
+    #  * row_count_binding -- implicit object-id COUNT(*) pills (which carry no calc token) rebind to
+    #    the model's per-fact COUNTROWS measure by table name, so a dashboard's row-count value (e.g.
+    #    the pilot's COUNT(Orders) line) lands on the real measure instead of being left unbound.
+    #  * param_binding -- dashboard parameter controls + parameter-driven measure/calc filters rebind
+    #    to faithful slicers (a real dimension column, or the model's disconnected picker table) and a
+    #    visual-level flag = 1 filter (a model-owned relative-date / window flag MEASURE), clearing the
+    #    "not rebuilt as a slicer yet" / "aggregate-measure filter not mapped" warnings. Warn-never-
+    #    wrong: a slicer needs a model-confirmed target column/picker, a flag binds only when the
+    #    measure is translated/assisted-approved; anything unconfirmed keeps its standing warning.
+    # Either failure (or a model with no usable Date table / no calc measures / no row-count measure)
+    # silently keeps the standing source-column / deferred binding.
     date_binding = _date_binding_from_model(res_report)
-    if date_binding and viz is not None:
+    measure_binding = _measure_binding_from_model(res_report)
+    row_count_binding = _row_count_binding_from_model(res_report)
+    # Scope each flag measure's visual-level filter to the worksheets that placed the source calc
+    # (additive enrichment of report["filter_bindings"]; no-op when there are no flags).
+    _scope_flag_visuals(twb_text, res_report)
+    param_binding = _param_binding_from_model(res_report)
+    # A parameter used purely as a single-column equality filter ([Col] = [Parameters].[P]) is most
+    # faithfully a plain slicer on that real column -- not a disconnected what-if table. Resolve those
+    # directly from the workbook's filter calcs and merge them in (these workbook-confirmed column
+    # slicers take precedence over any value/field model object for the same parameter).
+    wb_slicers = _param_slicers_from_workbook(twb_text, res_report)
+    if wb_slicers:
+        if not isinstance(param_binding, dict):
+            param_binding = {"slicers": {}, "flags": {}}
+        merged = dict(param_binding.get("slicers") or {})
+        merged.update(wb_slicers)
+        param_binding["slicers"] = merged
+        param_binding.setdefault("flags", {})
+    field_model_table, field_map = _field_map_from_model(res_report)
+    if (date_binding or measure_binding or row_count_binding or param_binding
+            or field_map) and viz is not None:
         try:
-            rebuilt = viz(twb_text, detail.get("name") or safe_base, date_binding=date_binding)
+            rebuilt = viz(twb_text, detail.get("name") or safe_base,
+                          date_binding=date_binding, measure_binding=measure_binding,
+                          row_count_binding=row_count_binding, param_binding=param_binding,
+                          model_table=field_model_table, field_map=field_map)
             if isinstance(rebuilt, dict) and rebuilt.get("parts"):
                 report_parts = _rebind_report_byPath(rebuilt["parts"], model_safe)
-                detail["date_rebind"] = {"date_table": date_binding["date_table"],
-                                         "active_keys": date_binding["active_keys"]}
+                if date_binding:
+                    detail["date_rebind"] = {"date_table": date_binding["date_table"],
+                                             "active_keys": date_binding["active_keys"]}
+                if measure_binding:
+                    detail["measure_rebind"] = {
+                        "count": len((measure_binding.get("measures") or {}))}
+                if row_count_binding:
+                    detail["row_count_rebind"] = {
+                        "count": len((row_count_binding.get("measures") or {}))
+                        + (1 if row_count_binding.get("default") else 0)}
+                if param_binding:
+                    detail["param_rebind"] = {
+                        "slicers": len((param_binding.get("slicers") or {})),
+                        "flags": len((param_binding.get("flags") or {}))}
+                if field_map:
+                    detail["field_rebind"] = {
+                        "count": len(field_map), "model_table": field_model_table}
+                # The rebound report -- not the pre-rebind first pass -- is what lands in the
+                # openable .pbip, so refresh the per-worksheet fidelity + implicit-row-count tally
+                # from it. Now-bound row counts / measures / params clear their warnings here, so the
+                # reported fidelity matches the project the user actually opens (warn-never-wrong: any
+                # warning the rebound run still emits is carried, never masked).
+                detail["viz_fidelity"] = _viz_fidelity(rebuilt)
+                detail["viz_implicit_row_count"] = sum(
+                    1 for w in (rebuilt.get("warnings") or [])
+                    if "implicit row count" in (w.get("reason") or ""))
         except Exception as exc:
-            warns.append(_PBIP_WARN + f"date-table rebind skipped ({type(exc).__name__}: {exc}) -- "
-                         f"report date axes bind to the source date column")
+            warns.append(_PBIP_WARN + f"model-fact rebind skipped ({type(exc).__name__}: {exc}) -- "
+                         f"report binds to the standing source/deferred fields")
     # M1.3 ref cross-check: now that the real model is in hand, drop any viz projection that
     # references a measure/column the model did not emit (an optimistic `_Measures[caption]` bind
     # that dangles), so the whole viz layer is warn-never-wrong on field references -- not just MV.
@@ -1062,7 +1620,8 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
                   model_translation_handoff=res_report.get("translation_handoff"))
 
 
-def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir=None):
+def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir=None,
+                          ds_catalog=None, approved_calc_dax=None):
     """Run the optional viz stage for one workbook. Returns a report detail dict (never raises).
 
     Beyond the back-compatible bare ``reports/<Name>.Report`` write, when ``pbip_dir`` is given the
@@ -1121,7 +1680,8 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_di
         detail["binding_signal"] = signal
 
     if parts and pbip_dir is not None:
-        _attach_workbook_pbip(detail, text, result, safe_base, pbip_dir, viz=viz)
+        _attach_workbook_pbip(detail, text, result, safe_base, pbip_dir, viz=viz,
+                              ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax)
     return detail
 
 
@@ -1430,7 +1990,7 @@ def _write_compile_report(output_dir, compile_report):
 
 
 def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan=None,
-                   rebind_bind_stage=None):
+                   rebind_bind_stage=None, approved_calc_dax=None):
     """Run the whole estate migration and write the output bundle. Returns the report dict.
 
     ``source`` is any :class:`TableauSource`. ``output_dir`` receives::
@@ -1450,6 +2010,15 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
     migrated datasource under ``pbip/<Name>/`` so it can be opened/tested in Power BI Desktop; the
     canonical ``semantic_models/`` output is unchanged. Set ``pbip=False`` to skip it.
 
+    ``approved_calc_dax`` (optional, opt-in) is a ``{calc_name: dax}`` mapping of human-approved
+    second-compiler (assisted-translation) results. It is threaded into every model build in the
+    run -- the datasource pass, the workbook's embedded-datasource rebuild, and the
+    published-datasource catalog-match rebuild -- so a Tier-0 stub whose name matches
+    (case-insensitive) lands as a LIVE, audit-stamped measure / calc column instead of an inert
+    ``= 0`` / ``BLANK()`` stub. This is the documented way to redeploy the fallback tier through the
+    estate command (the ``--approved-dax`` CLI flag loads the mapping from a JSON file); when
+    omitted the run is byte-identical.
+
     ``rebind_plan`` (optional, opt-in) is a ``rebind-plan.json`` path or already-parsed mapping
     written by the comparison skill. When given, the orchestrator additionally INGESTS it, routes
     each entry by ``binding_status``, resolves/binds each routed report through the dashboard bind
@@ -1466,9 +2035,14 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
     viz = _resolve_viz_stage(viz_stage)
     used_folders = set()
 
-    ds_details = [_migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir)
+    ds_catalog = {}
+    ds_details = [_migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir,
+                                          ds_catalog=ds_catalog,
+                                          approved_calc_dax=approved_calc_dax)
                   for ds_id in source.list_datasources()]
-    wb_details = [_migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir)
+    wb_details = [_migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir,
+                                        ds_catalog=ds_catalog,
+                                        approved_calc_dax=approved_calc_dax)
                   for wb_id in source.list_workbooks()]
 
     summary = _summarize(ds_details, wb_details, viz is not None)
@@ -1722,6 +2296,30 @@ def _render_summary_md(report):
 
 
 # -- CLI -----------------------------------------------------------------------
+def _load_approved_dax(path):
+    """Load a ``{calc_name: dax}`` mapping of human-approved assisted translations from a JSON file.
+
+    Returns ``None`` when ``path`` is falsy (the run is then byte-identical to a no-approval run).
+    Raises ``ValueError`` when the file is missing, unreadable, not JSON, or not a flat object of
+    string -> string -- a fail-fast so a typo never silently drops an approval. Tolerates a UTF-8
+    BOM (the file is often hand-authored on Windows).
+    """
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        raise ValueError(f"--approved-dax file not found: {path}")
+    except (OSError, ValueError) as exc:  # ValueError covers json.JSONDecodeError
+        raise ValueError(f"--approved-dax file is not readable JSON ({path}): {exc}")
+    if not isinstance(data, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+        raise ValueError(
+            f"--approved-dax JSON must be an object mapping calc name -> DAX string ({path})")
+    return data or None
+
+
 def main(argv=None):
     """One-command estate migration over a local folder of ``.tds`` / ``.twb`` files (offline)."""
     parser = argparse.ArgumentParser(
@@ -1734,10 +2332,20 @@ def main(argv=None):
                         help="output bundle folder (semantic models + pbip + report.json + summary.md)")
     parser.add_argument("--no-pbip", action="store_true",
                         help="skip the openable .pbip projects (emit only semantic_models/ folders)")
+    parser.add_argument("--approved-dax", metavar="JSON",
+                        help="path to a {calc_name: dax} JSON file of human-approved second-compiler "
+                             "(assisted-translation) results; each name-matching stub lands as a "
+                             "live, audit-stamped measure/calc column instead of an inert stub")
     args = parser.parse_args(argv)
 
+    try:
+        approved_calc_dax = _load_approved_dax(args.approved_dax)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     source = LocalFilesSource(args.input)
-    report = migrate_estate(source, args.output, pbip=not args.no_pbip)
+    report = migrate_estate(source, args.output, pbip=not args.no_pbip,
+                            approved_calc_dax=approved_calc_dax)
     s = report["summary"]
     print(
         f"Datasources: {s['datasources_migrated']}/{s['datasources_total']} migrated "
@@ -1750,7 +2358,8 @@ def main(argv=None):
         print("Openable projects: pbip/<Name>/<Name>.pbip (double-click in Power BI Desktop)")
     if s.get("needs_review_total"):
         print(f"Next step: {s['needs_review_total']} calculation(s) stubbed -> see summary.md "
-              f"('Next step') to run them through the second compiler.")
+              f"('Next step') to run them through the second compiler, then re-run with "
+              f"--approved-dax <file.json> to land the approved results.")
     return 0
 
 

@@ -228,7 +228,8 @@ def _uniquify(name, used_lower):
 
 
 def _value_table_tmdl(table_name, *, display_col, source_col, tmdl_type, fmt, source_expr,
-                      measure_name, default_literal, measure_fmt):
+                      measure_name, default_literal, measure_fmt, label_col=None,
+                      label_source=None):
     """One disconnected what-if table: a value column, a SELECTEDVALUE measure, a calculated
     partition (GENERATESERIES / DATATABLE), modelled on the existing _Measures/Date tables.
 
@@ -236,18 +237,28 @@ def _value_table_tmdl(table_name, *, display_col, source_col, tmdl_type, fmt, so
     it binds to (``source_col``): GENERATESERIES always names its column ``Value`` while the model
     column is named after the parameter, so ``sourceColumn`` must point at the physical name or the
     table will not load. The SELECTEDVALUE measure reads the column by its display (model) name.
+
+    When ``label_col`` is given (a discrete LIST param whose members carry display aliases) a second
+    string column bound to ``label_source`` is emitted so a slicer can show the friendly labels while
+    the value measure still reads the underlying value column.
     """
-    col = [f"\tcolumn {q(display_col)}", f"\t\tdataType: {tmdl_type}"]
-    if fmt:
-        col.append(f"\t\tformatString: {fmt}")
-    col += [
-        f"\t\tlineageTag: {uuid.uuid4()}",
-        "\t\tsummarizeBy: none",
-        f"\t\tsourceColumn: [{source_col}]",
-        "",
-        "\t\tannotation SummarizationSetBy = Automatic",
-    ]
-    col_block = "\n" + "\n".join(col) + "\n"
+    def _column_block(name, col_type, col_fmt, src):
+        lines = [f"\tcolumn {q(name)}", f"\t\tdataType: {col_type}"]
+        if col_fmt:
+            lines.append(f"\t\tformatString: {col_fmt}")
+        lines += [
+            f"\t\tlineageTag: {uuid.uuid4()}",
+            "\t\tsummarizeBy: none",
+            f"\t\tsourceColumn: [{src}]",
+            "",
+            "\t\tannotation SummarizationSetBy = Automatic",
+        ]
+        return "\n".join(lines)
+
+    blocks = [_column_block(display_col, tmdl_type, fmt, source_col)]
+    if label_col:
+        blocks.append(_column_block(label_col, "string", None, label_source))
+    col_block = "\n" + "\n\n".join(blocks) + "\n"
 
     col_ref = dax_ref(table_name, display_col)
     measure = [f"\n\tmeasure {q(measure_name)} = SELECTEDVALUE({col_ref}, {default_literal})"]
@@ -288,13 +299,63 @@ def _on_grid(value, minv, maxv, step):
     return abs(lo + k * st - v) <= 1e-9
 
 
+def _emit_numeric_list_value_param(param, table_name, value_col, measure_name, tmdl_type, dtype):
+    """A discrete numeric (integer/real) LIST parameter -> a DATATABLE of its EXACT members, never
+    a GENERATESERIES range (a range would offer every step in between, which is wrong for a picker
+    of named choices). When the members carry display aliases (e.g. ``15.`` -> "Current Orders") a
+    second string ``<value_col> Label`` column is emitted so a slicer shows the friendly names while
+    the value measure still reads the underlying number. Returns the value-param 4-tuple
+    ``(tmdl, dtype, warnings, picker_column)`` where ``picker_column`` is the Label column when
+    aliases are present, else the value column itself."""
+    members = param.get("members") or []
+    aliases = {_canon_num_key(k): v for k, v in (param.get("aliases") or {}).items()}
+    nfmt = _dec if tmdl_type == "double" else _num
+    dax_type = "DOUBLE" if tmdl_type == "double" else "INTEGER"
+    fmt = _format_string(param, tmdl_type)
+
+    default_raw = param.get("default")
+    try:
+        default_literal = nfmt(default_raw)
+    except (TypeError, ValueError):
+        default_literal = nfmt(members[0])
+
+    labels = [aliases.get(_canon_num_key(m)) for m in members]
+    if any(lbl is not None for lbl in labels):
+        rows = ", ".join(
+            "{" + nfmt(m) + ", " + _dax_string(lbl if lbl is not None else _num(m)) + "}"
+            for m, lbl in zip(members, labels))
+        source = f'DATATABLE("Value", {dax_type}, "Label", STRING, {{{rows}}})'
+        label_col = value_col + " Label"
+        tmdl = _value_table_tmdl(
+            table_name, display_col=value_col, source_col="Value", tmdl_type=tmdl_type,
+            fmt=fmt, source_expr=source, measure_name=measure_name,
+            default_literal=default_literal, measure_fmt=fmt,
+            label_col=label_col, label_source="Label")
+        return tmdl, dtype, [], label_col
+
+    rows = ", ".join("{" + nfmt(m) + "}" for m in members)
+    source = f'DATATABLE("Value", {dax_type}, {{{rows}}})'
+    tmdl = _value_table_tmdl(
+        table_name, display_col=value_col, source_col="Value", tmdl_type=tmdl_type,
+        fmt=fmt, source_expr=source, measure_name=measure_name,
+        default_literal=default_literal, measure_fmt=fmt)
+    return tmdl, dtype, [], value_col
+
+
 def _emit_one_value_param(param, table_name, column_name, measure_name):
-    """Build the TMDL for one value param. Returns ``(tmdl_text, dtype, warnings)`` or
-    ``(None, None, [])`` if the param can't be represented as a value control."""
+    """Build the TMDL for one value param. Returns ``(tmdl_text, dtype, warnings, picker_column)``
+    or ``(None, None, [], None)`` if the param can't be represented as a value control.
+    ``picker_column`` is the table column a slicer should bind to (the friendly Label column for an
+    aliased numeric list, else the value column)."""
     datatype = param.get("datatype", "string")
     tmdl_type, dtype = _TYPE_MAP.get(datatype, ("string", "text"))
 
     if datatype in ("integer", "real"):
+        # A discrete LIST parameter enumerates explicit members -> a DATATABLE of exactly those
+        # values. Only a true 'range' parameter (a slider) keeps the GENERATESERIES path below.
+        if param.get("domain") == "list" and (param.get("members") or []):
+            return _emit_numeric_list_value_param(
+                param, table_name, column_name, measure_name, tmdl_type, dtype)
         minv, maxv, step, default, warnings = _synth_range(param)
         # A double series stays decimal-typed so the UNION below can't coerce/truncate the default.
         nfmt = _dec if tmdl_type == "double" else _num
@@ -309,12 +370,12 @@ def _emit_one_value_param(param, table_name, column_name, measure_name):
             table_name, display_col=column_name, source_col="Value", tmdl_type=tmdl_type,
             fmt=fmt, source_expr=series, measure_name=measure_name,
             default_literal=default_literal, measure_fmt=fmt)
-        return tmdl, dtype, warnings
+        return tmdl, dtype, warnings, column_name
 
     if datatype == "string":
         members = param.get("members") or []
         if not members:
-            return None, None, []
+            return None, None, [], None
         rows = ", ".join("{" + _dax_string(m) + "}" for m in members)
         # DATATABLE names its column "Value"; the model column carries the param's display name.
         source = f'DATATABLE("Value", STRING, {{{rows}}})'
@@ -323,9 +384,9 @@ def _emit_one_value_param(param, table_name, column_name, measure_name):
             table_name, display_col=column_name, source_col="Value", tmdl_type="string",
             fmt=None, source_expr=source, measure_name=measure_name,
             default_literal=default_literal, measure_fmt=None)
-        return tmdl, dtype, []
+        return tmdl, dtype, [], column_name
 
-    return None, None, []
+    return None, None, [], None
 
 
 # =============================================================================
@@ -762,6 +823,7 @@ def emit_field_parameters(calcs, *, field_locator, used_names=None, existing_tab
         # block). Kept in detection order so the self-service table's slot order is stable.
         specs.append({"calc_name": name, "table_name": res["table_name"],
                       "display_col": res["display_col"], "role": res.get("role"),
+                      "controller": sw.get("controller"),
                       "entries": res.get("entries") or []})
     return {"parts": parts, "table_names": table_names, "consumed": consumed,
             "specs": specs, "measures": synth.definitions, "warnings": warnings}
@@ -795,11 +857,15 @@ def emit_value_parameters(params, *, calcs, reserved_names=None):
     ``calcs`` formula references via ``[Parameters].[X]``.
 
     Returns ``{parts:[(filename, tmdl)], table_names:[...], measure_names:[...], param_resolver,
-    warnings:[...]}``. ``param_resolver(name)`` maps a parameter reference (by caption or
-    bracket-less internal name) to its value measure ``[<Param> Value]`` so the calc translator can
-    inline the selection; it deliberately registers NO table in ``tables_used`` so the host
-    expression stays single-table (e.g. ``SUM('Orders'[Sales]) * [Sales Multiplier Value]`` does not
-    trip the cross-table fallback). ``reserved_names`` is a shared lowercased set of every existing
+    consumed_params:[...], warnings:[...]}``. ``param_resolver(name)`` maps a parameter reference
+    (by caption or bracket-less internal name) to its value measure ``[<Param> Value]`` so the calc
+    translator can inline the selection; it deliberately registers NO table in ``tables_used`` so the
+    host expression stays single-table (e.g. ``SUM('Orders'[Sales]) * [Sales Multiplier Value]`` does
+    not trip the cross-table fallback). ``consumed_params`` lists the SOURCE parameters that became
+    what-if tables (``{caption, internal_name, table, measure, picker_column}``) so the model manifest
+    can tag them kind="value" (model-owned); ``picker_column`` is the table column a slicer should bind
+    to (the friendly Label column for an aliased numeric list, else the value column).
+    ``reserved_names`` is a shared lowercased set of every existing
     table/column/measure name so emitted names never collide; the caller seeds it with the data
     table + its columns + the translated measure names BEFORE calling this.
 
@@ -811,7 +877,7 @@ def emit_value_parameters(params, *, calcs, reserved_names=None):
     wanted = referenced_parameters(params, calcs)
 
     parts, table_names, measure_names, warnings = [], [], [], []
-    resolver_map, used_files = {}, set()
+    resolver_map, used_files, consumed_params = {}, set(), []
     for p in wanted:
         caption = p.get("caption") or p.get("internal_name") or "Parameter"
         datatype = p.get("datatype", "string")
@@ -819,7 +885,8 @@ def emit_value_parameters(params, *, calcs, reserved_names=None):
         measure_name = _uniquify_reserved(caption + " Value", reserved)
         table_name = _uniquify_reserved(caption, reserved, prefer_suffix=" Parameter")
         column_name = table_name
-        tmdl, _dtype, warn = _emit_one_value_param(p, table_name, column_name, measure_name)
+        tmdl, _dtype, warn, picker_column = _emit_one_value_param(
+            p, table_name, column_name, measure_name)
         if tmdl is None:
             reserved.discard(measure_name.lower())
             reserved.discard(table_name.lower())
@@ -837,6 +904,12 @@ def emit_value_parameters(params, *, calcs, reserved_names=None):
         parts.append((final, tmdl))
         table_names.append(table_name)
         measure_names.append(measure_name)
+        # Record the SOURCE parameter that this what-if table consumed, so the model manifest can
+        # tag it kind="value" (model-owned) and the report/viz layer never re-emits it as a slicer.
+        consumed_params.append({"caption": p.get("caption"),
+                                "internal_name": p.get("internal_name"),
+                                "table": table_name, "measure": measure_name,
+                                "picker_column": picker_column})
         ref = dax_ref(None, measure_name, measure=True)
         for k in _param_keys(p):
             resolver_map[k] = ref
@@ -845,7 +918,8 @@ def emit_value_parameters(params, *, calcs, reserved_names=None):
         return resolver_map.get((name or "").strip().lower())
 
     return {"parts": parts, "table_names": table_names, "measure_names": measure_names,
-            "param_resolver": param_resolver, "warnings": warnings}
+            "param_resolver": param_resolver, "consumed_params": consumed_params,
+            "warnings": warnings}
 
 
 def extract_field_swap_calcs(xml):

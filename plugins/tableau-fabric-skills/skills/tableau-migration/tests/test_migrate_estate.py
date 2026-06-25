@@ -7,8 +7,10 @@ read path is exercised without committing any artifact files. The orchestrator i
 both real adapters and an injected viz stage, asserting on the emitted folder structure, the
 machine-readable ``report.json``, fallback handling, the viz seam, and the no-credentials guarantee.
 """
+import io
 import json
 import os
+import zipfile
 
 import pytest
 
@@ -254,6 +256,20 @@ def test_extract_calculations_keeps_measures_and_reports_skips():
     assert "Amount Bin" in skipped_reasons  # categorical-bin / no formula
 
 
+def test_extract_calculations_captures_internal_token_for_binding():
+    # The Tableau internal field name (name='[Calculation_xxxx]') is captured as `internal_name` --
+    # the deterministic cross-layer join key the viz/report layer binds on (set only when it differs
+    # from the caption, matching connection_to_m.extract_calcs). Additive; caption unchanged.
+    calcs, _ = extract_calculations(WIDGET_SALES_TDS)
+    by_name = {c["name"]: c for c in calcs}
+    assert by_name["Total Amount"]["internal_name"] == "Calculation_001"
+    assert by_name["Avg Price"]["internal_name"] == "Calculation_002"
+    # dimension calcs carry it too (for the calc-column binding path)
+    _, _, dim_calcs = extract_calculations(WIDGET_SALES_TDS, include_dimensions=True)
+    assert dim_calcs[0]["name"] == "Category Label"
+    assert dim_calcs[0]["internal_name"] == "Calculation_004"
+
+
 def test_extract_calculations_default_shape_unchanged_without_opt_in():
     # The opt-in must not perturb the default: same 2-tuple, same contents.
     assert extract_calculations(WIDGET_SALES_TDS) == extract_calculations(
@@ -320,6 +336,50 @@ def test_local_files_source_enumeration_and_naming(fixtures_dir):
     # reads through the BOM transparently (utf-8-sig)
     assert src.read_datasource(ds[-1]).startswith("<?xml")
     assert src.describe() == {"kind": "LocalFilesSource", "root": fixtures_dir}
+
+
+def _packaged_zip_bytes(arcname, text):
+    """Pack one BOM-encoded member into an in-memory zip -- a ``.tdsx``/``.twbx`` IS a zip."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(arcname, text.encode("utf-8-sig"))
+    return buf.getvalue()
+
+
+def test_local_files_source_discovers_packaged_tdsx_and_twbx(tmp_path):
+    # A local UPLOAD commonly hands us the PACKAGED exports (.tdsx/.twbx = zip archives); they must
+    # work exactly like the bare .tds/.twb a live pull lands (local==live parity). The inner document
+    # is extracted from the zip in memory and never written to disk.
+    root = tmp_path / "packaged"
+    root.mkdir()
+    (root / "widget_sales.tdsx").write_bytes(
+        _packaged_zip_bytes("widget_sales.tds", WIDGET_SALES_TDS))
+    (root / "widget_dashboard.twbx").write_bytes(
+        _packaged_zip_bytes("Dashboard/widget_dashboard.twb", WIDGET_DASHBOARD_TWB))
+
+    src = LocalFilesSource(str(root))
+    ds = src.list_datasources()
+    wb = src.list_workbooks()
+
+    assert [src.asset_name(p) for p in ds] == ["widget_sales"]
+    assert [src.asset_name(p) for p in wb] == ["widget_dashboard"]
+    assert src.read_datasource(ds[0]).startswith("<?xml")
+    assert "Widget Sales" in src.read_datasource(ds[0])
+    assert "<workbook" in src.read_workbook(wb[0])
+
+
+def test_local_files_source_dedups_packaged_and_unpacked_twin(tmp_path):
+    # When a packaged export and its unpacked twin coexist, the asset is enumerated ONCE (the
+    # unpacked .tds/.twb wins) so the output bundle has no duplicate datasource / name collision.
+    root = tmp_path / "mixed"
+    root.mkdir()
+    with open(root / "widget_sales.tds", "w", encoding="utf-8-sig") as fh:
+        fh.write(WIDGET_SALES_TDS)
+    (root / "widget_sales.tdsx").write_bytes(
+        _packaged_zip_bytes("widget_sales.tds", WIDGET_SALES_TDS))
+
+    ds = LocalFilesSource(str(root)).list_datasources()
+    assert [os.path.basename(p) for p in ds] == ["widget_sales.tds"]
 
 
 # -- full estate run over file-backed fixtures --------------------------------
@@ -1132,6 +1192,59 @@ def test_estate_summary_rolls_up_unbound_implicit_row_counts(tmp_path):
     assert oid not in json.dumps(report)
 
 
+def test_attach_workbook_pbip_refreshes_fidelity_from_rebound_run(tmp_path, monkeypatch):
+    # The reported viz_fidelity / viz_implicit_row_count must describe the REBOUND report that
+    # actually lands in the openable .pbip -- not the pre-rebind first pass. Here the model build
+    # supplies a COUNTROWS row-count binding, so the bound re-run clears the "implicit row count"
+    # warning; the detail keys (seeded with the stale pre-rebind values, as _migrate_one_workbook
+    # does) must be refreshed to the bound state instead of reporting the now-fixed gap.
+    pbir = json.dumps({"version": "1.0",
+                       "datasetReference": {"byPath": {"path": "../WB.SemanticModel"}}})
+    unbound_warn = {"scope": "worksheet", "name": "Row Count",
+                    "reason": ("manual attention required: implicit row count COUNT('Orders') has "
+                               "no model binding -- needs a row-count (COUNTROWS) measure on table "
+                               "'Orders' (left unbound)")}
+    pre = {"parts": {"definition.pbir": pbir},
+           "ir": {"worksheets": [{"name": "Row Count", "visual_type": "bar"}]},
+           "warnings": [unbound_warn]}
+    detail = {"name": "Counts WB",
+              "viz_fidelity": me._viz_fidelity(pre),
+              "viz_implicit_row_count": 1}
+    # sanity: the seeded pre-rebind state reports the unbound row count.
+    assert detail["viz_implicit_row_count"] == 1
+    assert any("implicit row count" in (f.get("reason") or "") for f in detail["viz_fidelity"])
+
+    res_report = {"row_count_binding": {
+        "measures": {"Orders": {"entity": "_Measures", "measure": "count orders"}}}}
+    monkeypatch.setattr(me, "list_workbook_datasources",
+                        lambda twb: [{"label": "Orders DS", "caption": "Orders DS",
+                                      "name": "federated.s1"}])
+    monkeypatch.setattr(me, "migrate_datasource",
+                        lambda twb, **kw: {"parts": {"definition/model.tmdl": "x"},
+                                           "report": res_report})
+    monkeypatch.setattr(me, "_param_slicers_from_workbook", lambda twb, rep: {})
+    monkeypatch.setattr(me, "_crosscheck_report_refs", lambda parts, model_parts: (parts, []))
+    monkeypatch.setattr(me, "write_local_pbip", lambda *a, **kw: None)
+
+    def bound_viz(xml, name, date_binding=None, measure_binding=None, row_count_binding=None,
+                  param_binding=None, model_table=None, field_map=None):
+        # the row count is bound now -> the rebound report carries no implicit-row-count warning.
+        assert row_count_binding  # the model-derived binding reached the single re-run
+        return {"parts": {"definition.pbir": pbir},
+                "ir": {"worksheets": [{"name": "Row Count", "visual_type": "bar"}]},
+                "warnings": []}
+
+    me._attach_workbook_pbip(detail, "<workbook/>", pre, "Counts WB",
+                             str(tmp_path / "pbip"), viz=bound_viz)
+
+    assert detail["pbip_status"] == "built"
+    assert detail["row_count_rebind"]["count"] == 1
+    # refreshed to the rebound truth: the implicit-row-count warning is gone in both tallies.
+    assert detail["viz_implicit_row_count"] == 0
+    assert not any("implicit row count" in (f.get("reason") or "")
+                   for f in detail["viz_fidelity"])
+
+
 def test_workbook_pbip_bypath_resolves_for_caption_with_spaces_and_punctuation(tmp_path):
     # byPath footgun guard: the rewritten ../<model>.SemanticModel must resolve to the SAME folder
     # write_local_pbip actually creates -- even when the datasource caption has spaces/hyphens/periods
@@ -1496,3 +1609,567 @@ def test_cli_main_no_pbip_flag_suppresses_projects(fixtures_dir, tmp_path, capsy
     assert rc == 0
     assert not os.path.isdir(os.path.join(out, "pbip"))
     assert "Openable projects:" not in capsys.readouterr().out
+
+
+# -- measure_binding producer (model build's calc->measure facts -> viz consumer map) ----------
+# `_measure_binding_from_model` is a pure CONSUMER of the datasource-migration report: it shapes the
+# model build's calc->measure identity into the {"measures": {key: entry}} map twb_to_pbir reads.
+def test_measure_binding_from_model_passes_through_calc_bindings_index():
+    # The model build's consolidated `calc_bindings` index (token + caption keyed) is forwarded
+    # verbatim so the join token stays byte-identical to what the model stamped.
+    res_report = {"calc_bindings": {
+        "pcdf:usr:Calculation_0014172369735704:qk": {
+            "model_table": "_Measures", "measure_name": "Percent Difference (DoD)",
+            "status": "translated"},
+        "count orders": {"model_table": "_Measures", "measure_name": "count orders",
+                         "status": "translated"},
+    }}
+    mb = me._measure_binding_from_model(res_report)
+    inner = mb["measures"]
+    assert inner["pcdf:usr:Calculation_0014172369735704:qk"]["measure_name"] == "Percent Difference (DoD)"
+    assert inner["count orders"]["status"] == "translated"
+
+
+def test_measure_binding_from_model_derives_from_source_tokens_when_no_index():
+    # Pre-`calc_bindings` shape: only rows carrying an explicit source token/id/caption are keyed,
+    # under EACH present key (instance token, bare calc id, field caption) -> same entry.
+    res_report = {"measures": [
+        {"measure": "Standard of Deviation", "status": "translated",
+         "source": {"calc_instance_token": "usr:Calculation_0014172373577763:qk",
+                    "calc_id": "Calculation_0014172373577763",
+                    "field_caption": "Standard of Deviation", "model_table": "_Measures"}},
+    ]}
+    inner = me._measure_binding_from_model(res_report)["measures"]
+    for key in ("usr:Calculation_0014172373577763:qk", "Calculation_0014172373577763",
+                "Standard of Deviation"):
+        assert inner[key]["measure_name"] == "Standard of Deviation"
+        assert inner[key]["model_table"] == "_Measures"
+        assert inner[key]["status"] == "translated"
+
+
+def test_measure_binding_from_model_ignores_rows_without_source():
+    # A plain <column> calc row (no `source` tag, no `calc_bindings`) is NOT keyed -- it keeps its
+    # existing caption-based _Measures binding in the viz layer, so behaviour is byte-unchanged.
+    res_report = {"measures": [
+        {"measure": "Revenue Sum", "status": "translated", "tableau_formula": "SUM([Revenue])"},
+    ]}
+    assert me._measure_binding_from_model(res_report) is None
+
+
+def test_measure_binding_from_model_none_when_no_measures():
+    assert me._measure_binding_from_model({}) is None
+    assert me._measure_binding_from_model(None) is None
+    assert me._measure_binding_from_model({"calc_bindings": {}}) is None
+
+
+def test_viz_adapter_forwards_measure_binding_only_when_supported():
+    # The adapter passes measure_binding through to a viz fn that declares it, and silently omits it
+    # for one that does not -- so the seam stays additive against older viz entry points.
+    seen = {}
+
+    def viz_with(text, *, report_name, dataset_name, date_binding=None, measure_binding=None):
+        seen["with"] = {"date": date_binding, "measure": measure_binding}
+        return {"parts": {}}
+
+    def viz_without(text, *, report_name, dataset_name, date_binding=None):
+        seen["without"] = {"date": date_binding}
+        return {"parts": {}}
+
+    mb = {"measures": {"Calculation_1": {"model_table": "_Measures",
+                                         "measure_name": "X", "status": "translated"}}}
+    me._viz_adapter(viz_with)("<twb/>", "WB", date_binding=None, measure_binding=mb)
+    me._viz_adapter(viz_without)("<twb/>", "WB", date_binding=None, measure_binding=mb)
+    assert seen["with"]["measure"] == mb
+    assert "without" in seen  # called without raising despite no measure_binding param
+
+
+# `_row_count_binding_from_model` is a pure CONSUMER too: it shapes the model build's per-fact
+# COUNTROWS measures into the {"measures": {<table>: {entity, measure}}, "default": {...}} map the
+# viz layer's implicit-row-count path reads, so an object-id COUNT(*) pill binds by FACT TABLE.
+def test_row_count_binding_from_model_passes_through_consumer_shape():
+    # An explicit consumer-shape `row_count_binding` is normalised + forwarded so the table->measure
+    # identity is byte-identical to what the model emitted.
+    res_report = {"row_count_binding": {
+        "measures": {"Orders": {"entity": "_Measures", "measure": "count orders"}},
+        "default": {"entity": "_Measures", "measure": "Number of Records"},
+    }}
+    rcb = me._row_count_binding_from_model(res_report)
+    assert rcb["measures"]["Orders"] == {"entity": "_Measures", "measure": "count orders"}
+    assert rcb["default"] == {"entity": "_Measures", "measure": "Number of Records"}
+
+
+def test_row_count_binding_from_model_normalizes_convenience_map():
+    # A convenience `row_count_measures` map: dict targets pass through; a bare measure NAME defaults
+    # to the _Measures table; a model_table/measure_name aliasing is accepted.
+    res_report = {"row_count_measures": {
+        "Orders": {"entity": "_Measures", "measure": "count orders"},
+        "Returns": "Returns Row Count",
+        "Shipments": {"model_table": "Fact", "measure_name": "Shipment Count"},
+    }}
+    rcb = me._row_count_binding_from_model(res_report)
+    m = rcb["measures"]
+    assert m["Orders"] == {"entity": "_Measures", "measure": "count orders"}
+    assert m["Returns"] == {"entity": "_Measures", "measure": "Returns Row Count"}
+    assert m["Shipments"] == {"entity": "Fact", "measure": "Shipment Count"}
+    assert "default" not in rcb
+
+
+def test_row_count_binding_from_model_carries_numrec_default():
+    # The legacy single-fact (numrec) row count binds via `default`, not a named table.
+    res_report = {"row_count_measures": {"default": {"entity": "_Measures", "measure": "Rows"}}}
+    rcb = me._row_count_binding_from_model(res_report)
+    assert rcb == {"default": {"entity": "_Measures", "measure": "Rows"}}
+
+
+def test_row_count_binding_from_model_reads_model_manifest_row_count():
+    # The fact-table -> COUNTROWS map nested inside the model build's additive `model_manifest`
+    # (the likely emit site) is read too -- both the nested consumer shape and a flat convenience
+    # map -- so the seam lights up wherever the model surfaces the target.
+    nested = {"model_manifest": {"row_count": {
+        "measures": {"Orders": {"entity": "_Measures", "measure": "count orders"}}}}}
+    flat = {"model_manifest": {"row_count": {
+        "Orders": {"entity": "_Measures", "measure": "count orders"}}}}
+    for rep in (nested, flat):
+        rcb = me._row_count_binding_from_model(rep)
+        assert rcb["measures"]["Orders"] == {"entity": "_Measures", "measure": "count orders"}
+
+
+def test_row_count_binding_from_model_reads_model_manifest_verbatim_shape():
+    # Pins the model build's REAL `model_manifest.row_count` shape (verified against the live
+    # model emit): `measures` values are BARE measure-name STRINGS (entity is always `_Measures`,
+    # since every measure lives there) and `default` carries `{table, measure}` (the single-fact
+    # fallback -- `table` is informational, the bind is `measure` @ `_Measures`). The normalizer
+    # lifts both to the consumer's `{entity, measure}` target shape, so the seam binds with no
+    # extra/duplicated top-level key on the model side (single source of truth).
+    rep = {"model_manifest": {"row_count": {
+        "measures": {"Orders": "count orders"},
+        "default": {"table": "Orders", "measure": "count orders"}}}}
+    rcb = me._row_count_binding_from_model(rep)
+    assert rcb["measures"]["Orders"] == {"entity": "_Measures", "measure": "count orders"}
+    assert rcb["default"] == {"entity": "_Measures", "measure": "count orders"}
+
+
+def test_row_count_binding_from_model_top_level_wins_over_manifest():
+    # An explicit top-level `row_count_binding` takes priority over the manifest copy.
+    rep = {"row_count_binding": {"measures": {"Orders": {"entity": "_Measures", "measure": "A"}}},
+           "model_manifest": {"row_count": {"Orders": {"entity": "_Measures", "measure": "B"}}}}
+    assert me._row_count_binding_from_model(rep)["measures"]["Orders"]["measure"] == "A"
+
+
+def test_row_count_binding_from_model_ignores_scalar_manifest_row_count():
+    # `model_manifest["row_count"]` may instead be a diagnostic row TOTAL (a scalar) or a non-target
+    # map -- never bind to that; only real table->measure targets count.
+    assert me._row_count_binding_from_model({"model_manifest": {"row_count": 9994}}) is None
+    assert me._row_count_binding_from_model(
+        {"model_manifest": {"row_count": {"Orders": 9994}}}) is None
+
+
+def test_row_count_binding_from_model_none_when_absent_or_empty():
+    assert me._row_count_binding_from_model({}) is None
+    assert me._row_count_binding_from_model(None) is None
+    assert me._row_count_binding_from_model({"row_count_measures": {}}) is None
+    # a malformed entry (no measure) yields no binding rather than a dangling target
+    assert me._row_count_binding_from_model(
+        {"row_count_measures": {"Orders": {"entity": "_Measures"}}}) is None
+
+
+# -- second-compiler landing through the estate command (--approved-dax) -------
+# The estate orchestrator threads an opt-in ``approved_calc_dax`` ({calc_name: dax}) mapping into
+# every model build so a Tier-0 stub whose name matches lands as a LIVE, audit-stamped measure --
+# the documented, no-improvisation way to redeploy the assisted (second-compiler) tier in bulk.
+# ``Running Amount`` (RUNNING_SUM(...)) is the WIDGET_SALES_TDS measure that stubs on the
+# datasource path, so it is the natural subject.
+_APPROVED_RUNNING_AMOUNT_DAX = ("CALCULATE ( SUM ( 'Sales'[Amount] ), "
+                                "FILTER ( ALLSELECTED ( 'Sales' ), TRUE () ) )")
+
+
+def _read_measures_tmdl(bundle_root, ds_folder="widget_sales.SemanticModel"):
+    path = os.path.join(bundle_root, "semantic_models", ds_folder,
+                        "definition", "tables", "_Measures.tmdl")
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_load_approved_dax_returns_none_for_falsy_path():
+    assert me._load_approved_dax(None) is None
+    assert me._load_approved_dax("") is None
+
+
+def test_load_approved_dax_reads_mapping_and_tolerates_bom(tmp_path):
+    p = tmp_path / "approved.json"
+    # written WITH a BOM (utf-8-sig) -- hand-authored on Windows is the common case
+    p.write_text(json.dumps({"Running Amount": _APPROVED_RUNNING_AMOUNT_DAX}), encoding="utf-8-sig")
+    assert me._load_approved_dax(str(p)) == {"Running Amount": _APPROVED_RUNNING_AMOUNT_DAX}
+
+
+def test_load_approved_dax_empty_object_is_none(tmp_path):
+    p = tmp_path / "approved.json"
+    p.write_text("{}", encoding="utf-8")
+    assert me._load_approved_dax(str(p)) is None
+
+
+def test_load_approved_dax_missing_file_raises(tmp_path):
+    with pytest.raises(ValueError, match="not found"):
+        me._load_approved_dax(str(tmp_path / "nope.json"))
+
+
+def test_load_approved_dax_non_object_raises(tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(["Running Amount", "dax"]), encoding="utf-8")
+    with pytest.raises(ValueError, match="calc name -> DAX"):
+        me._load_approved_dax(str(p))
+
+
+def test_load_approved_dax_non_string_value_raises(tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps({"Running Amount": 5}), encoding="utf-8")
+    with pytest.raises(ValueError, match="calc name -> DAX"):
+        me._load_approved_dax(str(p))
+
+
+def test_load_approved_dax_unreadable_json_raises(tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text("{ not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="not readable JSON"):
+        me._load_approved_dax(str(p))
+
+
+def test_migrate_estate_approved_dax_lands_stub_as_assisted_approved(fixtures_dir, tmp_path):
+    out = str(tmp_path / "bundle")
+    report = migrate_estate(LocalFilesSource(fixtures_dir), out,
+                            approved_calc_dax={"Running Amount": _APPROVED_RUNNING_AMOUNT_DAX})
+
+    detail = next(d for d in report["datasources"] if d["name"] == "widget_sales")
+    by_row = {m["measure"]: m for m in detail["measures"]}
+    # the formerly-stubbed table calc is now a live, human-approved measure
+    assert by_row["Running Amount"]["status"] == "assisted-approved"
+    assert by_row["Running Amount"]["dax"] == _APPROVED_RUNNING_AMOUNT_DAX
+    # the deterministically-translated measures are untouched
+    assert by_row["Total Amount"]["status"] == "translated"
+    # it is no longer counted as needing review
+    handoff = detail.get("translation_handoff") or {}
+    assert not any(r.get("name") == "Running Amount" for r in handoff.get("needs_review", []))
+
+    # the approved DAX + its provenance annotation actually land in the emitted TMDL
+    tmdl = _read_measures_tmdl(out)
+    assert _APPROVED_RUNNING_AMOUNT_DAX in tmdl
+    assert "assisted translation (human-approved)" in tmdl
+
+
+def test_migrate_estate_approved_dax_non_matching_name_leaves_stub(fixtures_dir, tmp_path):
+    # An approval whose name does not match any stub is inert -- the calc stays a stub, never
+    # mis-bound to an unrelated measure.
+    out = str(tmp_path / "bundle")
+    report = migrate_estate(LocalFilesSource(fixtures_dir), out,
+                            approved_calc_dax={"Some Other Calc": "SUM ( 'Sales'[Amount] )"})
+    detail = next(d for d in report["datasources"] if d["name"] == "widget_sales")
+    by_status = {m["measure"]: m["status"] for m in detail["measures"]}
+    assert by_status["Running Amount"] == "stub"
+
+
+def test_migrate_estate_approved_dax_none_is_a_noop(fixtures_dir, tmp_path):
+    # The default (None) and an empty mapping both leave the run byte-identical to no approval:
+    # Running Amount stays a stub exactly as before the flag existed.
+    for idx, approved in enumerate((None, {})):
+        out = str(tmp_path / f"bundle_{idx}")
+        report = migrate_estate(LocalFilesSource(fixtures_dir), out, approved_calc_dax=approved)
+        detail = next(d for d in report["datasources"] if d["name"] == "widget_sales")
+        by_status = {m["measure"]: m["status"] for m in detail["measures"]}
+        assert by_status["Running Amount"] == "stub"
+
+
+def test_main_approved_dax_flag_lands_via_cli(fixtures_dir, tmp_path):
+    # End-to-end through the documented CLI: --approved-dax <file.json> lands the approved measure.
+    out = str(tmp_path / "bundle")
+    approved_json = tmp_path / "approved.json"
+    approved_json.write_text(json.dumps({"Running Amount": _APPROVED_RUNNING_AMOUNT_DAX}),
+                             encoding="utf-8")
+
+    rc = me.main(["-i", fixtures_dir, "-o", out, "--approved-dax", str(approved_json)])
+    assert rc == 0
+
+    on_disk = json.load(open(os.path.join(out, "report.json"), encoding="utf-8"))
+    detail = next(d for d in on_disk["datasources"] if d["name"] == "widget_sales")
+    by_status = {m["measure"]: m["status"] for m in detail["measures"]}
+    assert by_status["Running Amount"] == "assisted-approved"
+    assert _APPROVED_RUNNING_AMOUNT_DAX in _read_measures_tmdl(out)
+
+
+def test_main_approved_dax_missing_file_errors(fixtures_dir, tmp_path):
+    # A bad --approved-dax path fails fast (argparse error -> SystemExit) so a typo never silently
+    # drops an approval.
+    out = str(tmp_path / "bundle")
+    with pytest.raises(SystemExit):
+        me.main(["-i", fixtures_dir, "-o", out, "--approved-dax", str(tmp_path / "missing.json")])
+
+
+def test_viz_adapter_forwards_row_count_binding_only_when_supported():
+    # The adapter passes row_count_binding to a viz fn that declares it, and silently omits it for an
+    # older entry point that does not -- additive against viz fns predating the row-count seam.
+    seen = {}
+
+    def viz_with(text, *, report_name, dataset_name, date_binding=None,
+                 measure_binding=None, row_count_binding=None):
+        seen["with"] = {"row_count": row_count_binding}
+        return {"parts": {}}
+
+    def viz_without(text, *, report_name, dataset_name, date_binding=None, measure_binding=None):
+        seen["without"] = True
+        return {"parts": {}}
+
+    rcb = {"measures": {"Orders": {"entity": "_Measures", "measure": "count orders"}}}
+    me._viz_adapter(viz_with)("<twb/>", "WB", row_count_binding=rcb)
+    me._viz_adapter(viz_without)("<twb/>", "WB", row_count_binding=rcb)
+    assert seen["with"]["row_count"] == rcb
+    assert seen.get("without") is True  # called without raising despite no row_count_binding param
+
+
+def test_field_map_from_model_builds_entity_property_from_naming_columns():
+    # _field_map_from_model turns the model build's authoritative `model_manifest.naming` map into a
+    # caption-keyed field_map carrying ONLY {entity, property} (never `binding`, so an aggregation
+    # pill keeps its aggregation) for column-kind refs, and picks the fact table (most columns) as
+    # model_table -- so a published-DS workbook's column pills bind to Orders/People, not `sqlproxy`.
+    res_report = {"model_manifest": {"naming": {
+        "Sales": {"model_table": "Orders", "model_name": "Sales", "kind": "column"},
+        "Order Date": {"model_table": "Orders", "model_name": "Order_Date", "kind": "column"},
+        "Segment": {"model_table": "Orders", "model_name": "Segment", "kind": "column"},
+        "Regional Manager": {"model_table": "People", "model_name": "Regional_Manager",
+                             "kind": "column"},
+        "Profit Ratio": {"model_table": "_Measures", "model_name": "Profit Ratio",
+                         "kind": "measure"},
+        "Choose Metric": {"model_table": "Measure Swap calc 1",
+                          "model_name": "Measure Swap calc 1", "kind": "parameter"},
+    }}}
+    model_table, field_map = me._field_map_from_model(res_report)
+    # fact table = the one owning the most columns (Orders: 3 vs People: 1)
+    assert model_table == "Orders"
+    # columns are mapped with {entity, property} and NO binding override (aggregations survive)
+    assert field_map["Sales"] == {"entity": "Orders", "property": "Sales"}
+    assert field_map["Order Date"] == {"entity": "Orders", "property": "Order_Date"}
+    assert field_map["Regional Manager"] == {"entity": "People", "property": "Regional_Manager"}
+    assert "binding" not in field_map["Sales"]
+    # measures + parameters are excluded -- measure_binding / field-parameter paths own those
+    assert "Profit Ratio" not in field_map
+    assert "Choose Metric" not in field_map
+
+
+def test_field_map_from_model_skips_incomplete_entries():
+    # A naming entry missing model_table or model_name is skipped rather than emitting a dangling
+    # {entity:None}/{property:None} override.
+    res_report = {"model_manifest": {"naming": {
+        "Good": {"model_table": "Orders", "model_name": "Good", "kind": "column"},
+        "NoTable": {"model_table": None, "model_name": "X", "kind": "column"},
+        "NoName": {"model_table": "Orders", "model_name": None, "kind": "column"},
+    }}}
+    model_table, field_map = me._field_map_from_model(res_report)
+    assert model_table == "Orders"
+    assert field_map == {"Good": {"entity": "Orders", "property": "Good"}}
+
+
+def test_field_map_from_model_none_when_no_columns():
+    # No usable column naming -> (None, None) so the viz re-run keeps its standing field bindings
+    # (warn-never-wrong; byte-unchanged until a real map exists).
+    assert me._field_map_from_model(None) == (None, None)
+    assert me._field_map_from_model({}) == (None, None)
+    assert me._field_map_from_model({"model_manifest": {"naming": {}}}) == (None, None)
+    only_measure = {"model_manifest": {"naming": {
+        "M": {"model_table": "_Measures", "model_name": "M", "kind": "measure"}}}}
+    assert me._field_map_from_model(only_measure) == (None, None)
+
+
+def test_viz_adapter_forwards_model_table_and_field_map_only_when_supported():
+    # The adapter passes model_table + field_map to a viz fn that declares them (the published-DS
+    # column rebind seam), and silently omits them for an older entry point that does not.
+    seen = {}
+
+    def viz_with(text, *, report_name, dataset_name, model_table=None, field_map=None):
+        seen["with"] = {"model_table": model_table, "field_map": field_map}
+        return {"parts": {}}
+
+    def viz_without(text, *, report_name, dataset_name):
+        seen["without"] = True
+        return {"parts": {}}
+
+    fm = {"Sales": {"entity": "Orders", "property": "Sales"}}
+    me._viz_adapter(viz_with)("<twb/>", "WB", model_table="Orders", field_map=fm)
+    me._viz_adapter(viz_without)("<twb/>", "WB", model_table="Orders", field_map=fm)
+    assert seen["with"] == {"model_table": "Orders", "field_map": fm}
+    assert seen.get("without") is True  # called without raising despite no model_table/field_map
+
+
+# -- parameter-as-filter -> direct single-select slicer resolution ------------------------------
+# A parameter used purely as a single-column equality filter ([Col] = [Parameters].[P]) is most
+# faithfully a plain slicer on that real column -- never a disconnected what-if table. These cover
+# the orchestrator-side resolver that turns such a parameter into a `param_binding.slicers` entry
+# keyed by the parameter's internal name (the same key the report binder consumes).
+
+def test_filter_param_target_field_single_column_equality_both_orientations():
+    # The canonical "use a parameter as a filter" idiom resolves to the ONE compared column, in
+    # either orientation, and the `OR [Parameters].[P] = "All"` show-everything escape (a string
+    # literal, never a field) does not contribute a spurious target.
+    f1 = '[Region] = [Parameters].[Parameter 1] OR [Parameters].[Parameter 1] = "All"'
+    f2 = '[Parameters].[P] = [Sub-Category]'
+    assert me._filter_param_target_field(f1, "Parameter 1") == "Region"
+    assert me._filter_param_target_field(f2, "P") == "Sub-Category"
+    # the match is case-insensitive on the parameter's inner name
+    assert me._filter_param_target_field(f1, "parameter 1") == "Region"
+
+
+def test_filter_param_target_field_rejects_zero_or_multiple_columns():
+    # Zero compared columns (pure "All" escape), more than one distinct column, or an empty inner
+    # name all fail closed -> None, so the parameter stays an unresolved slicer (warn-never-wrong)
+    # rather than binding to a guessed column.
+    assert me._filter_param_target_field('[Parameters].[P] = "All"', "P") is None
+    two = '[A] = [Parameters].[P] OR [B] = [Parameters].[P]'
+    assert me._filter_param_target_field(two, "P") is None
+    assert me._filter_param_target_field('[Region] = [Parameters].[P]', "") is None
+    # the parameter's own [Parameters].[P] tail bracket is never read back as a target field
+    assert me._filter_param_target_field('[Parameters].[P] = "All"', "P") is None
+
+
+_PARAM_SLICER_TWB = """<?xml version='1.0'?>
+<workbook><datasources><datasource name='ds'>
+ <column caption='Region Parameter' name='[Parameter 1]' datatype='string' role='measure'
+         type='nominal' param-domain-type='list' value='&quot;Central&quot;'>
+   <calculation class='tableau' formula='&quot;Central&quot;' /></column>
+ <column caption='Region Filter' name='[Calculation_900]' datatype='boolean' role='dimension'
+         type='ordinal'>
+   <calculation class='tableau'
+     formula='[Region] = [Parameters].[Parameter 1] OR [Parameters].[Parameter 1] = &quot;All&quot;' />
+ </column>
+</datasource></datasources></workbook>"""
+
+
+def test_param_slicers_from_workbook_resolves_direct_column_slicer():
+    # End to end: a list parameter whose filter calc targets [Region] becomes a single-select slicer
+    # on the model's real Orders[Region] column, keyed by the parameter's bracketed internal name so
+    # it merges cleanly with `_param_binding_from_model` output.
+    rr = {"model_manifest": {"naming": {
+        "Region": {"model_table": "Orders", "model_name": "Region", "kind": "column"}}}}
+    out = me._param_slicers_from_workbook(_PARAM_SLICER_TWB, rr)
+    assert out == {"[Parameter 1]": {"table": "Orders", "column": "Region",
+                                     "single_select": True, "caption": "Region Parameter"}}
+
+
+def test_param_slicers_from_workbook_fail_closed_paths():
+    # No usable column naming, a target the model never emitted, or no parameters at all -> {} so the
+    # report keeps its precise "not rebuilt as a slicer yet" warning instead of a dangling slicer.
+    assert me._param_slicers_from_workbook(_PARAM_SLICER_TWB, {"model_manifest": {"naming": {}}}) == {}
+    # naming has columns but not the targeted one
+    other = {"model_manifest": {"naming": {
+        "Segment": {"model_table": "Orders", "model_name": "Segment", "kind": "column"}}}}
+    assert me._param_slicers_from_workbook(_PARAM_SLICER_TWB, other) == {}
+    # a workbook with no parameters yields nothing
+    assert me._param_slicers_from_workbook("<workbook><datasources/></workbook>", other) == {}
+
+
+def test_param_slicers_from_workbook_ignores_measure_naming_targets():
+    # The resolved field must be a column-kind naming entry; a same-named measure/parameter entry is
+    # not a valid slicer target (a slicer binds a column, never a measure).
+    rr = {"model_manifest": {"naming": {
+        "Region": {"model_table": "_Measures", "model_name": "Region", "kind": "measure"}}}}
+    assert me._param_slicers_from_workbook(_PARAM_SLICER_TWB, rr) == {}
+
+
+def test_param_binding_from_model_emits_value_picker_slicer():
+    # A kind="value" what-if param exposing a disconnected picker table becomes a single-select
+    # value-picker slicer on the picker's friendly column, so a scalar parameter the model consumed
+    # still gets an operable control (the model owns the picker; the viz just places it).
+    rr = {"model_manifest": {"parameters": [
+        {"name": "Date Selection", "internal_name": "[Parameter 0014172370878491]",
+         "kind": "value", "model_object": "Date Selection",
+         "picker": {"table": "Date Selection", "column": "Date Selection Label"}}]}}
+    pb = me._param_binding_from_model(rr)
+    assert pb["slicers"]["[Parameter 0014172370878491]"] == {
+        "table": "Date Selection", "column": "Date Selection Label",
+        "single_select": True, "caption": "Date Selection"}
+    assert pb["flags"] == {}
+
+
+def test_param_binding_from_model_flag_carries_visuals():
+    # A translated date-window keep-flag measure binds as a visual-level ``flag = 1`` filter, and the
+    # binding carries the scoped worksheet names (set upstream by _scope_flag_visuals) so the viz
+    # layer applies the filter to exactly those visuals instead of the whole page.
+    rr = {"filter_bindings": {"Date Filter": {
+        "model_table": "_Measures", "measure_name": "Date Filter", "status": "translated",
+        "predicate": {"op": "==", "value": 1}, "value": 1, "calc_id": "Calculation_900",
+        "visuals": ["Line chart", "Line chart (2)", "Line chart (3)", "Segment % Dod"]}}}
+    pb = me._param_binding_from_model(rr)
+    assert pb["flags"]["Date Filter"] == {
+        "entity": "_Measures", "measure": "Date Filter", "status": "translated", "value": 1,
+        "visuals": ["Line chart", "Line chart (2)", "Line chart (3)", "Segment % Dod"]}
+
+
+def test_param_binding_from_model_flag_visuals_default_empty():
+    # A flag binding with no scoped visuals (the calc was never matched to a worksheet) still binds,
+    # with an empty visuals list -- the consumer then falls back to its own known scope.
+    rr = {"filter_bindings": {"Date Filter": {
+        "model_table": "_Measures", "measure_name": "Date Filter", "status": "translated",
+        "predicate": {"op": "==", "value": 1}}}}
+    pb = me._param_binding_from_model(rr)
+    assert pb["flags"]["Date Filter"]["visuals"] == []
+
+
+def test_scope_flag_visuals_attaches_worksheets(monkeypatch):
+    # The flag's source calc_id is mapped, via workbook_calc_usage, to the worksheets that placed the
+    # source Tableau filter calc; those names are written into the binding's ``visuals`` list.
+    rr = {"filter_bindings": {"Date Filter": {
+        "model_table": "_Measures", "measure_name": "Date Filter", "status": "translated",
+        "predicate": {"op": "==", "value": 1}, "value": 1,
+        "calc_id": "Calculation_0014172371238940", "param_internal": "[Parameter 1]"}}}
+    monkeypatch.setattr(me, "workbook_calc_usage", lambda _x: {"calcs": {
+        "Calculation_0014172371238940": {"worksheets": [
+            "Line chart", "Line chart (2)", "Line chart (3)", "Segment % Dod"]}}})
+    me._scope_flag_visuals("<workbook/>", rr)
+    assert rr["filter_bindings"]["Date Filter"]["visuals"] == [
+        "Line chart", "Line chart (2)", "Line chart (3)", "Segment % Dod"]
+
+
+def test_scope_flag_visuals_fail_closed(monkeypatch):
+    # No filter_bindings -> no-op without even consulting the workbook. An unreferenced calc, or a
+    # workbook_calc_usage parse error, leaves ``visuals`` absent (never raises) so the consumer keeps
+    # its own scope.
+    sentinel = {"called": False}
+    monkeypatch.setattr(me, "workbook_calc_usage",
+                        lambda _x: sentinel.__setitem__("called", True) or {"calcs": {}})
+    me._scope_flag_visuals("<workbook/>", {})
+    me._scope_flag_visuals("<workbook/>", {"filter_bindings": {}})
+    assert sentinel["called"] is False  # short-circuited before parsing
+    # calc_id not present in usage -> visuals not set
+    rr = {"filter_bindings": {"X": {"measure_name": "X", "status": "translated",
+                                    "calc_id": "Calculation_NOPE"}}}
+    me._scope_flag_visuals("<workbook/>", rr)
+    assert "visuals" not in rr["filter_bindings"]["X"]
+
+    # a parse error inside workbook_calc_usage is swallowed
+    def _boom(_x):
+        raise ValueError("bad xml")
+    monkeypatch.setattr(me, "workbook_calc_usage", _boom)
+    rr2 = {"filter_bindings": {"X": {"calc_id": "C", "measure_name": "X", "status": "translated"}}}
+    me._scope_flag_visuals("<workbook/>", rr2)
+    assert "visuals" not in rr2["filter_bindings"]["X"]
+
+
+def test_rebuild_from_published_match_threads_parameters(monkeypatch):
+    # The published-DS rebuild must thread the WORKBOOK's parameters into the model build -- without
+    # it a parameter-driven flag measure (a Date Selection band) never reaches assemble on the
+    # published path, so the flag + its filter_bindings would silently never fire.
+    captured = {}
+
+    def _fake_migrate(text, **kw):
+        captured.update(kw)
+        return {"report": {"fallback": False}}
+
+    monkeypatch.setattr(me, "migrate_datasource", _fake_migrate)
+    twb = ("<workbook><datasources><datasource name='ds'>"
+           "<column caption='Date Selection' name='[Parameter 1]' datatype='real' role='measure'"
+           " param-domain-type='list' value='15.'>"
+           "<calculation class='tableau' formula='15.' /></column>"
+           "</datasource></datasources></workbook>")
+    detail = {"binding_signal": {"kind": "published", "published_ds_name": "Sales DS"}}
+    catalog = {me._norm_ds("Sales DS"): {"text": "<datasource/>", "name": "Sales DS"}}
+    res = me._rebuild_from_published_match(detail, twb, "Model", catalog)
+    assert res is not None
+    params = captured.get("parameters")
+    assert isinstance(params, list)
+    assert any(p.get("caption") == "Date Selection" for p in params)

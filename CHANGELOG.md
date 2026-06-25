@@ -13,6 +13,71 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** the human-approved **assisted-translation landing now covers dimension
+  calc COLUMNS** — the column-mode peer of the measures' `approved_calc_dax` channel — exposed on
+  the estate CLI as **`--approved-dax <file.json>`**. A `{calc_name: dax}` approval flips an inert
+  calculated-column stub into a live, byte-validated calculated column
+  (`TranslatedBy = assisted translation (human-approved)`, status `assisted-approved`), consulted
+  **only** when the deterministic tier produced no DAX so a faithful Tier-0 column is never
+  overridden; the original Tableau formula is preserved as `TableauFormula`. `approved_calc_dax` is
+  threaded end-to-end through `migrate_estate` (`_migrate_one_datasource`,
+  `_rebuild_from_published_match`, `_attach_workbook_pbip`), and the dimension-calc coverage rollup
+  gains an additive `assisted_approved` bucket + `live_coverage_pct` (existing keys preserved). With
+  no approval supplied the run is byte-for-byte unchanged; the migration suite stays green.
+- **tableau-migration:** **a local `.twbx` / `.tdsx` upload is now discovered and read** by the
+  file-backed estate source, so the "just upload the packaged workbook / datasource" path behaves like a
+  live pull instead of silently finding nothing. `migrate_estate.LocalFilesSource` previously matched only
+  the *bare* `.tds` / `.twb` extensions (an exact `splitext` compare) and read every file as UTF-8 text, so
+  a packaged export — which is a **zip** — was skipped entirely (a `.twbx`-only folder reported `0/0`
+  everything). It now also discovers `.tdsx` / `.twbx`, extracts the inner document **in memory** via the
+  tested `fetch_tds` / `workbook_table_calcs` zip helpers (never written to disk), and de-duplicates a
+  packaged export against its unpacked twin (preferring the unpacked copy) so a mixed folder yields no
+  duplicate datasource. Additive; existing bare-file behavior is unchanged. (Local==live parity, discovery
+  half; published / `sqlproxy` schema recovery is tracked separately.)
+- **tableau-migration:** **table-calc measures now translate on the live / published-datasource path,
+  reaching parity with a local `.twbx` upload.** When a workbook connects to a published Tableau Cloud
+  datasource (`sqlproxy`), `migrate_estate._rebuild_from_published_match` rebuilds the model from the
+  matched, already-migrated published `.tds` — which is **schema only and carries no worksheets**, so the
+  table-calc *addressing* (partition / order, recovered from the worksheet shelves) was previously lost and
+  positional measures (`WINDOW_STDEV`, percent-difference-from-prior, `LAST`) stubbed to `= 0`. The rebuild
+  now extracts `table_calc_usages` from the **workbook** (`twb_text`) and threads them through a new additive
+  `table_calc_usages=` override on `assemble_model.migrate_tds_to_semantic_model` (default `None` keeps the
+  prior auto-extraction from the source text; `[]` disables it; a list overrides it). With the addressing in
+  hand the existing addressed-measure path emits faithful DAX (`STDEVX.S(WINDOW(…ORDERBY…))`,
+  `DIVIDE(… - CALCULATE(…, OFFSET(-1, ORDERBY…)), ABS(…))`, `COUNTROWS(WINDOW(…PARTITIONBY…)) - ROWNUMBER(…)`)
+  and cross-calc references (`2 * [Standard of Deviation]`, `Difference coloring`) resolve against them. A
+  local `.twbx` whose embedded model already carries its own worksheets was unaffected (it self-extracts);
+  this brings the credential-based live path to the same fidelity. Genuinely un-addressable shapes
+  (nested-`FIXED` LOD argmax, parameter-case filters) still fail closed. Additive; the migration suite stays
+  green. Skill `VERSION` `1.9.0` → `1.10.0`.
+- **tableau-migration:** the rebuilt **report page now binds its columns to the migrated model**
+  instead of the workbook's embedded placeholder entity. When `_attach_workbook_pbip` recovers a
+  model from a matched published datasource, a new `_field_map_from_model` helper derives a
+  `field_map` from the report's `model_manifest.naming` (column entries → `{entity, property}`, the
+  fact table that owns the most columns) and threads it — alongside the fact `model_table` — into the
+  single `twb_to_pbir` re-run, so report columns resolve to the real model tables rather than the
+  source's phantom `sqlproxy` / caption entity. Aggregation pills keep their aggregation (the
+  `field_map` entries carry no `binding`), and a date axis already rebound to the model's `Date`
+  table stays authoritative via a `date_rebound` guard in `_apply_override`. The report records a
+  `field_rebind` detail (rebound count + model table). Additive; the migration suite stays green.
+- **tableau-migration:** the deterministic **calc→DAX compiler v2** — broader faithful function
+  coverage across the String / Date / Aggregate / Type-Conversion families and deeper **row-level and
+  table-calculation** translation (running-total and ordered `WINDOW_*` windows, percent-difference,
+  positional offsets), each preserving the original Tableau formula as a `TableauFormula` annotation
+  and **failing closed** (an honest, routable fallback reason) when no faithful DAX target exists. The
+  model build now also stamps deterministic **model-facts on the migration report** — a
+  `model_manifest` (typed model summary + parameter classification into value / field / filter) and
+  `row_count` measure facts — so the report-page build can bind slicers, visual filters and measures
+  to the rebuilt semantic model **by calc id**. Additive; the migration suite stays green. Skill
+  `VERSION` `1.8.0` → `1.9.0`.
+- **tableau-migration:** the **Tableau dashboard → Power BI report-page (PBIR) viz consumer** now
+  binds those model-facts. `migrate_estate._attach_workbook_pbip` derives date / measure / row-count /
+  parameter bindings from the freshly rebuilt model and threads them as keyword arguments into the
+  single `twb_to_pbir` re-run, so a migrated report page points its visuals at the real measures and
+  columns instead of placeholders. A new read-only, stdlib-only `scripts/workbook_calc_usage.py`
+  classifies every workbook-local calc's **intent** (measure / native conditional-formatting / filter
+  / row-level column) and where the dashboard uses it, joined back to the model half by the calc's
+  bare internal id — the deterministic model↔viz contract. Additive; suite green.
 - **tableau-migration:** a **layered, Key-Vault-free credential resolver**
   (`scripts/credential_resolver.py`) so a local / POC migration can authenticate to Tableau with no
   Azure Key Vault. `resolve_secret(...)` resolves a secret (e.g. a Tableau PAT's secret value) from
@@ -414,6 +479,16 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
+- **tableau-migration:** the TMDL serializer now emits an **openable** model when a measure or
+  calculated column carries a **multi-line** DAX expression. A deterministic multi-line body (e.g.
+  the Date Filter keep-flag's `VAR … RETURN … SWITCH(…)`) was written inline after `measure 'X' = `,
+  dropping its continuation lines to **column 0** — invalid TMDL that left the model `BLOCKED`
+  (unparseable by TOM / Power BI Desktop). `tmdl_generate` now renders a multi-line expression as an
+  indented block (the declaration ends at `=` on its own line, body lines one level deeper than the
+  property level); single-line DAX is byte-for-byte unchanged. A second defect is fixed alongside
+  it: an **empty-value annotation** (`annotation TableauFormula = ` with no value, e.g. a synthesized
+  measure-swap `SUM`) is now **elided** rather than emitted as unparseable TMDL. Adds 4 openability
+  regression tests; the migration suite stays green.
 - **All three skills:** trimmed every `SKILL.md` `description` to fit GitHub Copilot's 1024-char
   frontmatter cap (they were 1369 / 1331 / 1333 chars). Over-limit descriptions are dropped
   silently — the plugin installs and `plugin list` shows it, but the skills never register in a

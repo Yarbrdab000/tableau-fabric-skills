@@ -267,6 +267,8 @@ def test_emit_field_parameters_returns_report_specs_in_detection_order():
     out = P.emit_field_parameters(calcs, field_locator=_loc, existing_tables=["Orders", "_Measures"])
     specs = out["specs"]
     assert [s["calc_name"] for s in specs] == ["Dim calc 1", "Measure Calc"]  # detection order
+    # each spec records its controlling parameter (the model manifest tags that param kind="field")
+    assert [s["controller"] for s in specs] == ["p", "m"]
     dim = specs[0]
     assert dim["table_name"] == "Dim calc 1" and dim["display_col"] == "Dim calc 1"
     assert dim["role"] == "dimension"
@@ -458,6 +460,80 @@ def test_emit_value_parameter_only_referenced_params():
         [_num_param(caption="Unused", internal="[Parameter 9]")],
         calcs=[{"name": "m", "role": "measure", "formula": "SUM([Sales])"}], reserved_names=set())
     assert res["parts"] == [] and res["table_names"] == []
+
+
+def test_emit_value_parameter_reports_consumed_source_params():
+    # Additive: the emitter records WHICH source parameters became what-if tables so the model
+    # manifest can tag them kind="value" (model-owned) rather than a dashboard slicer.
+    calc = {"name": "Adj Sales", "role": "measure",
+            "formula": "SUM([Sales]) * [Parameters].[Sales Multiplier]"}
+    res = P.emit_value_parameters([_num_param()], calcs=[calc],
+                                  reserved_names={"orders", "sales"})
+    assert res["consumed_params"] == [
+        {"caption": "Sales Multiplier", "internal_name": "[Parameter 7]",
+         "table": "Sales Multiplier", "measure": "Sales Multiplier Value",
+         "picker_column": "Sales Multiplier"}]
+    # a param that is NOT representable as a value control is not reported consumed
+    res2 = P.emit_value_parameters(
+        [_num_param(caption="Unused", internal="[Parameter 9]")],
+        calcs=[{"name": "m", "role": "measure", "formula": "SUM([Sales])"}], reserved_names=set())
+    assert res2["consumed_params"] == []
+
+
+def _numlist_param(caption="Date Selection", internal="[Parameter 0014172370878491]",
+                   members=("15.", "30.", "41."), default="15.", aliases="__default__"):
+    # Mirrors the real Comcast "Date Selection": a real-typed LIST param whose integer-ish members
+    # (Tableau serializes the keys with a trailing dot) carry friendly display aliases.
+    if aliases == "__default__":
+        aliases = {"15.": "Current Orders", "30.": "Previous Orders", "41.": "All Orders"}
+    return {"caption": caption, "internal_name": internal, "datatype": "real", "domain": "list",
+            "default": default, "format": None, "range": None, "members": list(members),
+            "aliases": aliases}
+
+
+def test_emit_value_parameter_numeric_list_aliases_datatable_with_labels():
+    # A discrete numeric LIST param (Tableau's aliased {15,30,41} "Date Selection") must become a
+    # DATATABLE of EXACTLY its members -- never a GENERATESERIES range -- with a friendly Label
+    # column a slicer can show, while the value measure still reads the underlying number.
+    calc = {"name": "Date Filter", "role": "measure",
+            "formula": "CASE [Parameters].[Date Selection] WHEN 15 THEN 1 END"}
+    res = P.emit_value_parameters([_numlist_param()], calcs=[calc], reserved_names=set())
+    assert res["table_names"] == ["Date Selection"]
+    _fn, tmdl = res["parts"][0]
+    assert "GENERATESERIES" not in tmdl                       # NOT a contiguous range
+    assert 'DATATABLE("Value", DOUBLE, "Label", STRING' in tmdl
+    for v in ("15.0", "30.0", "41.0"):
+        assert v in tmdl
+    for lbl in ("Current Orders", "Previous Orders", "All Orders"):
+        assert ('"' + lbl + '"') in tmdl
+    # two real columns: the typed value + the friendly label (slicer shows the label)
+    assert "column 'Date Selection'" in tmdl
+    assert "column 'Date Selection Label'" in tmdl
+    assert "sourceColumn: [Value]" in tmdl and "sourceColumn: [Label]" in tmdl
+    # the value measure reads the VALUE column (not the label), defaulting to the Tableau default
+    assert "SELECTEDVALUE('Date Selection'[Date Selection], 15.0)" in tmdl
+    # the model manifest learns the slicer should bind to the friendly Label column
+    assert res["consumed_params"] == [
+        {"caption": "Date Selection", "internal_name": "[Parameter 0014172370878491]",
+         "table": "Date Selection", "measure": "Date Selection Value",
+         "picker_column": "Date Selection Label"}]
+
+
+def test_emit_value_parameter_numeric_list_without_aliases_single_column():
+    # Same discrete-members rule, but with no aliases -> a single value column; the slicer binds to
+    # it directly (no Label column synthesized).
+    p = _numlist_param(caption="Threshold", internal="[Parameter T]",
+                       members=("10", "20", "30"), default="20", aliases={})
+    p["datatype"] = "integer"
+    calc = {"name": "Gate", "role": "measure",
+            "formula": "IF [Sales] > [Parameters].[Threshold] THEN 1 END"}
+    res = P.emit_value_parameters([p], calcs=[calc], reserved_names=set())
+    _fn, tmdl = res["parts"][0]
+    assert "GENERATESERIES" not in tmdl
+    assert 'DATATABLE("Value", INTEGER, {{10}, {20}, {30}})' in tmdl
+    assert "column 'Threshold Label'" not in tmdl             # no aliases -> no second column
+    assert "SELECTEDVALUE('Threshold'[Threshold], 20)" in tmdl
+    assert res["consumed_params"][0]["picker_column"] == "Threshold"
 
 
 def _sales_resolver(field):

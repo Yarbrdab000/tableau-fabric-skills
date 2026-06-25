@@ -15,6 +15,12 @@ from twb_to_pbir import (
     PAGE_HEIGHT,
     PAGE_WIDTH,
     SCHEMA_VISUAL_FP,
+    _drop_resolved_flag_warnings,
+    _flag_filter_container,
+    _norm_param_key,
+    _reconcile_caption_fallback,
+    _resolve_parameter_controls,
+    _resolve_visual_flags,
     build_field_parameter_page,
     emit_pbir,
     field_parameter_slicer,
@@ -198,6 +204,49 @@ def test_line_chart_truncated_date_stays_on_x_axis_region_to_series():
     # the Rows paning dimension lands on Small multiples (Tableau trellis), not the x-axis
     assert state["SmallMultiples"]["projections"][0]["field"]["Column"]["Property"] == "Region"
     assert "Series" not in state
+
+
+# -- IR: Automatic mark + continuous date -> line (Tableau's default chart type) ----
+# An Automatic mark over a CONTINUOUS (green) date axis is Tableau's default LINE chart; a discrete
+# date PART (blue) stays bars, and an explicit bar mark always stays bars. Only the chart TYPE
+# changes -- the field bindings are identical to a line over the same shelves.
+def test_automatic_mark_with_continuous_date_axis_is_a_line_not_column():
+    tmonth = ("<column-instance column='[Order Date]' derivation='Month-Trunc' "
+              "name='[tmn:Order Date:qk]' pivot='key' type='quantitative' />")
+    ws = _worksheet("Sales Trend", "Automatic",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[tmn:Order Date:qk]",
+                    deps_extra=_INST + tmonth)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["visual_type"] == "line"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "lineChart"
+    state = _query_state(vis)
+    assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "Order_Date"
+    assert (state["Y"]["projections"][0]["field"]["Aggregation"]["Expression"]
+            ["Column"]["Property"]) == "Sales_Amount"
+
+
+def test_automatic_mark_with_discrete_date_part_stays_column():
+    # a DISCRETE date PART (derivation 'Month', the `mn:` pill in _INST) is Tableau's default BARS,
+    # not a line -- only a continuous (-Trunc) date routes to a line.
+    ws = _worksheet("Sales by Month", "Automatic",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[mn:Order Date:ok]",
+                    deps_extra=_INST)
+    assert parse_twb(_workbook(ws))["worksheets"][0]["visual_type"] == "column"
+
+
+def test_explicit_bar_mark_with_continuous_date_stays_column():
+    # the continuous-date -> line default applies ONLY to the Automatic mark; an explicit Bar mark
+    # means the author chose bars, so it stays a column chart even over a continuous date.
+    tmonth = ("<column-instance column='[Order Date]' derivation='Month-Trunc' "
+              "name='[tmn:Order Date:qk]' pivot='key' type='quantitative' />")
+    ws = _worksheet("Bars over time", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[tmn:Order Date:qk]",
+                    deps_extra=_INST + tmonth)
+    assert parse_twb(_workbook(ws))["worksheets"][0]["visual_type"] == "column"
 
 
 # -- IR + emit: dual-axis combo ------------------------------------------------
@@ -853,6 +902,30 @@ def test_object_id_row_count_binds_when_target_supplied():
     assert _count_warns(ir) == []
 
 
+def test_pilot_line_chart_object_id_count_over_continuous_date_is_a_line():
+    # The Comcast pilot "Line chart" shape: an Automatic mark plotting the implicit object-id COUNT
+    # (rows) over a CONTINUOUS truncated date (cols). With a row_count_binding the COUNT binds to a
+    # model measure AND the continuous date makes it a LINE (not a column) -- the chart type Tableau
+    # actually renders. Ties the row-count binding and the continuous-date routing together.
+    tday = ("<column-instance column='[Order Date]' derivation='Day-Trunc' "
+            "name='[tdy:Order Date:qk]' pivot='key' type='quantitative' />")
+    ws = _worksheet("Line chart", "Automatic",
+                    rows=_OID_COUNT_PILL,
+                    cols="[federated.abc].[tdy:Order Date:qk]",
+                    deps_extra=_INST + _COL_OID_ORDERS + _CI_CNT_ORDERS + tday)
+    rcb = {"measures": {"Orders": {"entity": "_Measures", "measure": "count orders"}}}
+    ir = parse_twb(_workbook(ws), row_count_binding=rcb)
+    assert ir["worksheets"][0]["visual_type"] == "line"
+    assert _count_warns(ir) == []
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "lineChart"
+    state = _query_state(vis)
+    assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "Order_Date"
+    ymeas = state["Y"]["projections"][0]["field"]
+    assert ymeas["Measure"]["Property"] == "count orders"
+    assert ymeas["Measure"]["Expression"]["SourceRef"]["Entity"] == "_Measures"
+
+
 def test_object_id_row_count_ambiguous_multi_table_warns_generic():
     # two distinct count instances in the worksheet's dependencies -> the binder cannot know which
     # fact to count, so it defers with a generic warning listing the candidates (never guesses).
@@ -924,6 +997,52 @@ def test_caption_fallback_when_no_datasource_metadata_warns():
     assert w["cols"][0]["entity"] == "federated.abc"
     assert w["cols"][0]["property"] == "Category"
     assert any("caption fallback" in x["reason"] for x in ir["warnings"])
+
+
+def test_reconcile_caption_fallback_drops_model_confirmed_keeps_unverified():
+    # the model build's field_map confirms 'Sales' but not 'Widget'
+    covered = {"scope": "worksheet", "name": "S1",
+               "reason": "manual attention required: field 'Sales' bound by caption fallback "
+                         "(no datasource metadata); verify it matches model table/column names",
+               "caption_fallback": "Sales"}
+    uncovered = {"scope": "worksheet", "name": "S2",
+                 "reason": "manual attention required: field 'Widget' bound by caption fallback "
+                           "(no datasource metadata); verify it matches model table/column names",
+                 "caption_fallback": "Widget"}
+    other = {"scope": "worksheet", "name": "S3",
+             "reason": "manual attention required: something unrelated"}
+    out = _reconcile_caption_fallback([covered, uncovered, other],
+                                      {"Sales": {"entity": "Orders", "property": "Sales"}})
+    reasons = [w["reason"] for w in out]
+    # the model-confirmed caption's advisory is dropped (it is no longer true)
+    assert not any("'Sales' bound by caption fallback" in r for r in reasons)
+    # the unverified caption's advisory is kept (genuinely unconfirmed)
+    assert any("'Widget' bound by caption fallback" in r for r in reasons)
+    # an unrelated warning is untouched
+    assert any("something unrelated" in r for r in reasons)
+    # the internal marker never leaks into the surfaced warnings
+    assert all("caption_fallback" not in w for w in out)
+
+
+def test_caption_fallback_warning_cleared_when_field_map_confirms_binding():
+    # workbook WITHOUT a <datasources> metadata tree -> Sales + Category fall back to caption
+    wb = ("<?xml version='1.0' encoding='utf-8' ?>\n<workbook><worksheets>"
+          + _worksheet("Bare", "Bar",
+                       rows="[federated.abc].[sum:Sales:qk]",
+                       cols="[federated.abc].[none:Category:nk]",
+                       deps_extra=_INST)
+          + "</worksheets></workbook>")
+    # the model build's metadata-confirmed naming (field_map) covers Sales but not Category
+    fm = {"Sales": {"entity": "Orders", "property": "Sales", "binding": "aggregation"}}
+    res = migrate_twb_to_pbir(wb, dataset_name="Superstore", field_map=fm)
+    reasons = [w["reason"] for w in res["warnings"]]
+    # Sales is model-confirmed -> its stale caption-fallback advisory is gone
+    assert not any("'Sales' bound by caption fallback" in r for r in reasons)
+    # Category is NOT in field_map -> its caption-fallback advisory persists (warn-never-wrong)
+    assert any("'Category' bound by caption fallback" in r for r in reasons)
+    # the emitted Sales projection is bound to the model table the field_map named
+    blob = "\n".join(res["parts"].values())
+    assert '"Entity": "Orders"' in blob and '"Property": "Sales"' in blob
 
 
 # -- PBIR report structure -----------------------------------------------------
@@ -1130,6 +1249,63 @@ def test_candidate_records_are_additive_and_do_not_alter_pbir_parts():
     assert "candidate_records" not in blob
     assert not any("candidate" in path.lower() for path in res["parts"])
     assert res["ir"]["candidate_records"] == res["candidate_records"]
+
+
+def test_candidate_record_field_aliases_map_emitted_ref_to_source_tableau_caption():
+    # star-schema-remodel rename guard: per emitted ref the oracle reads in ``fields``, carry the
+    # SOURCE Tableau caption so a NAME-based structural compare can see through the remodel
+    # (Tableau ``Sales`` lands as the emitted ``Sum(Orders.Sales_Amount)``; ``Category`` as the
+    # table-qualified ``Orders.Category``).
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    res = migrate_twb_to_pbir(_workbook(ws))
+    r = res["candidate_records"][0]
+    aliases = r["field_aliases"]
+    assert aliases["Sum(Orders.Sales_Amount)"] == "Sales"
+    assert aliases["Orders.Category"] == "Category"
+    # keyed EXACTLY by the refs the oracle reads in ``fields`` (1:1 alignment, no stray keys)
+    refs = {ref for role in r["fields"].values() for ref in role}
+    assert set(aliases) <= refs
+
+
+def test_field_aliases_never_written_into_emitted_pbir_parts():
+    # the alias sidecar lives only on the candidate record, never in the emitted PBIR definition
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    res = migrate_twb_to_pbir(_workbook(ws))
+    assert res["candidate_records"][0].get("field_aliases")  # present on the record
+    blob = "\n".join(res["parts"].values())
+    assert "field_aliases" not in blob
+
+
+def test_field_alias_map_unit_maps_ref_to_caption_and_tolerates_no_model_table():
+    # the helper maps every bound field's emitted ref -> its Tableau caption; with no model_table /
+    # field_map it falls back to the field's own entity but still records the caption alias.
+    from twb_to_pbir import _field_alias_map
+    ws = {"name": "W",
+          "rows": [{"caption": "Sales", "entity": "Q", "property": "Sales_Amount",
+                    "binding": "aggregation", "aggregation": "Sum"}],
+          "cols": [{"caption": "Order Date", "entity": "Q", "property": "Order_Date",
+                    "binding": "column"}],
+          "encodings": {"color": {"caption": "Segment", "entity": "Q", "property": "Segment",
+                                  "binding": "column"}}}
+    amap = _field_alias_map(ws, "Orders", None)
+    assert amap["Sum(Orders.Sales_Amount)"] == "Sales"
+    assert amap["Orders.Order_Date"] == "Order Date"
+    assert amap["Orders.Segment"] == "Segment"
+
+
+def test_field_alias_map_maps_star_schema_date_rebind_back_to_source_caption():
+    # the headline COMCAST remodel: a continuous-date axis rebound to the marked Date dimension
+    # emits ``Date.Date`` but the Tableau source is ``Order Date`` -- the alias resolves that exact
+    # field-NAME divergence so a name-based structural compare reads the visual as faithful.
+    from twb_to_pbir import _field_alias_map
+    ws = {"name": "Line chart", "rows": [],
+          "cols": [{"caption": "Order Date", "entity": "Date", "property": "Date",
+                    "binding": "column", "date_rebound": True}],
+          "encodings": {}}
+    assert _field_alias_map(ws, "Orders", None) == {"Date.Date": "Order Date"}
 
 
 def test_parse_accepts_utf8_bom_bytes():
@@ -1573,16 +1749,35 @@ def test_secondary_date_is_never_rebound():
     assert any("date part" in x["reason"].lower() for x in ir["warnings"])
 
 
-def test_continuous_trunc_on_active_date_is_deferred():
+def test_continuous_day_or_coarser_trunc_on_active_date_rebinds_to_calendar_key():
+    # A continuous month truncation (green `tmn:` pill) on the ACTIVE business date binds to the
+    # marked calendar KEY column Date[Date]: the day-grain Date table relates to the fact date and
+    # Power BI's continuous date axis carries the monthly display grain. This matches a Desktop-
+    # authored rebuild whose line-chart date axis is Date[Date] (never the fact's raw date column).
     tmonth = ("<column-instance column='[Order Date]' derivation='Month-Trunc' "
               "name='[tmn:Order Date:qk]' pivot='key' type='quantitative' />")
     ws = _worksheet("Monthly Trend", "Line",
                     rows="[federated.abc].[sum:Sales:qk]",
                     cols="[federated.abc].[tmn:Order Date:qk]",
                     deps_extra=_INST + tmonth)
+    ir = parse_twb(_workbook(ws), date_binding=_DATE_BINDING)
+    col = ir["worksheets"][0]["cols"][0]
+    assert (col["entity"], col["property"]) == ("Date", "Date")
+    # rebound to the calendar -> the "grain not applied" degrade warning is gone
+    assert not any("grain not applied" in x["reason"].lower() for x in ir["warnings"])
+
+
+def test_subday_trunc_on_active_date_is_deferred():
+    # An HOUR truncation can't be represented by the day-grain calendar, so it stays on the fact
+    # column + warns (warn-never-wrong) -- never silently rebound to a day-grain key that would
+    # drop the time component.
+    thour = ("<column-instance column='[Order Date]' derivation='Hour-Trunc' "
+             "name='[thr:Order Date:qk]' pivot='key' type='quantitative' />")
+    ws = _worksheet("Hourly Trend", "Line",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[thr:Order Date:qk]",
+                    deps_extra=_INST + thour)
     col = parse_twb(_workbook(ws), date_binding=_DATE_BINDING)["worksheets"][0]["cols"][0]
-    # a continuous TRUNC's display grain is a later pass -> it stays on the fact column (binding to
-    # the calendar key alone would lose the monthly grain), never silently rebound.
     assert (col["entity"], col["property"]) == ("Orders", "Order_Date")
 
 
@@ -1812,6 +2007,338 @@ def test_lone_param_gated_sheet_is_not_a_swap_group():
     # ... but the control is still recognised (not mis-warned) and recorded for a later rebuild.
     assert not any("aggregate/measure filter" in x["reason"] for x in ir["warnings"])
     assert ir["worksheets"][0]["swap_controls"][0]["param_id"] == "Parameter 1"
+
+
+# -- dashboard parameter controls (hamburger filters): structural capture + honest warning ----
+def _paramctrl_zone(pid, x=78833, y=9500):
+    return (f"<zone h='9333' w='16000' x='{x}' y='{y}' type-v2='paramctrl' "
+            f"param='[Parameters].[{pid}]' id='9' />")
+
+
+def test_parameter_control_zone_captured_with_caption_and_warned():
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Dash'><zones>"
+            "<zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='60000' x='0' y='0' name='Sales by Category' id='2' />"
+            + _paramctrl_zone("Parameter 1") +
+            "</zone></zones></dashboard>")
+    ir = parse_twb(_workbook_with_params(ws, dash))
+
+    pcs = ir["parameter_controls"]
+    assert len(pcs) == 1
+    rec = pcs[0]
+    assert rec["caption"] == "view swap"          # resolved from the Parameters datasource
+    assert rec["param_id"] == "Parameter 1"
+    assert rec["datatype"] == "string"
+    assert rec["dashboard"] == "Dash"
+    assert rec["position"]["x"] == 78833 and rec["position"]["w"] == 16000
+    # one honest per-control warning, warn-never-wrong (never silently dropped) ...
+    pc_warns = [w for w in ir["warnings"] if "parameter control 'view swap'" in w["reason"]]
+    assert len(pc_warns) == 1
+    assert pc_warns[0]["scope"] == "dashboard"
+    # ... and the control is NOT rebuilt as a slicer yet (no target column identified) while the
+    # real worksheet visual still emits, and the paramctrl zone is not mistaken for a worksheet zone.
+    parts = _visual_parts(emit_pbir(ir))
+    assert [v for v in parts.values() if v["visual"]["visualType"] == "slicer"] == []
+    mains = [v for v in parts.values() if v["visual"]["visualType"] != "slicer"]
+    assert len(mains) == 1
+
+
+def test_parameter_control_in_device_layout_not_double_counted():
+    # The pilot's paramctrl zones appear once in the primary layout AND again in the phone
+    # devicelayout; the control must be captured + warned exactly once (no phone-scale duplicate).
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    primary = ("<zone h='100000' w='100000' x='0' y='0'>"
+               "<zone h='90000' w='60000' x='0' y='0' name='Sales by Category' id='2' />"
+               + _paramctrl_zone("Parameter 1") + "</zone>")
+    dash = ("<dashboard name='Dash'>"
+            "<zones>" + primary + "</zones>"
+            "<devicelayouts><devicelayout name='Phone'>"
+            "<zones>" + primary + "</zones>"
+            "</devicelayout></devicelayouts></dashboard>")
+    ir = parse_twb(_workbook_with_params(ws, dash))
+    assert len(ir["parameter_controls"]) == 1
+    assert sum("parameter control" in w["reason"] for w in ir["warnings"]) == 1
+
+
+def test_parameter_control_unknown_param_falls_back_to_id():
+    # An unresolved parameter id is never dropped: caption falls back to the id, datatype is None.
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Dash'><zones>"
+            "<zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='60000' x='0' y='0' name='Sales by Category' id='2' />"
+            + _paramctrl_zone("Parameter 9999 Missing") +
+            "</zone></zones></dashboard>")
+    ir = parse_twb(_workbook_with_params(ws, dash))
+    pcs = ir["parameter_controls"]
+    assert len(pcs) == 1
+    assert pcs[0]["caption"] == "Parameter 9999 Missing"
+    assert pcs[0]["datatype"] is None
+    assert any("parameter control 'Parameter 9999 Missing'" in w["reason"]
+               for w in ir["warnings"])
+
+
+def test_norm_param_key_strips_brackets_space_and_casefolds():
+    # The model build keys param_binding slicers WITH brackets ([Parameter 001...]); a dashboard
+    # paramctrl zone yields the bracket-stripped id. Normalization must bridge the two forms.
+    assert _norm_param_key("[Parameter 0014172372426784]") == "parameter 0014172372426784"
+    assert _norm_param_key("Parameter 0014172372426784") == "parameter 0014172372426784"
+    assert _norm_param_key("  [ParaM 1] ") == "param 1"
+    assert _norm_param_key(None) == ""
+
+
+def test_parameter_control_resolved_by_param_binding_emits_slicer_and_clears_warning():
+    # When the model build identifies the parameter's target column (param_binding["slicers"]), the
+    # dashboard parameter control is rebuilt as a single-select slicer at its OWN zone and its
+    # "not rebuilt as a slicer yet" warning is cleared -- even though the model keys the slicer WITH
+    # brackets ([Parameter 1]) while the control id is bracket-stripped (Parameter 1).
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Dash'><zones>"
+            "<zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='60000' x='0' y='0' name='Sales by Category' id='2' />"
+            + _paramctrl_zone("Parameter 1") +
+            "</zone></zones></dashboard>")
+    pb = {"slicers": {"[Parameter 1]": {"table": "Orders", "column": "Segment",
+                                        "single_select": True, "caption": "view swap"}},
+          "flags": {}}
+    ir = parse_twb(_workbook_with_params(ws, dash), param_binding=pb)
+
+    rec = ir["parameter_controls"][0]
+    assert rec["resolved"] == {"table": "Orders", "column": "Segment",
+                               "single_select": True, "caption": "view swap"}
+    # the standing per-control warning is cleared for a resolved control (no longer "not rebuilt")
+    assert not [w for w in ir["warnings"] if "parameter control 'view swap'" in w["reason"]]
+
+    parts = _visual_parts(emit_pbir(ir))
+    slicers = [v for v in parts.values() if v["visual"]["visualType"] == "slicer"]
+    assert len(slicers) == 1
+    proj = slicers[0]["visual"]["query"]["queryState"]["Values"]["projections"][0]
+    assert proj["queryRef"] == "Orders.Segment"
+
+
+def test_parameter_control_not_in_binding_still_warns_and_emits_no_slicer():
+    # A control the model did NOT resolve keeps its honest warning and is not rebuilt (warn-never-wrong):
+    # an unrelated slicer binding must never bind a different control.
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Dash'><zones>"
+            "<zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='60000' x='0' y='0' name='Sales by Category' id='2' />"
+            + _paramctrl_zone("Parameter 1") +
+            "</zone></zones></dashboard>")
+    pb = {"slicers": {"[Parameter 9999]": {"table": "Orders", "column": "Region",
+                                           "single_select": True}}, "flags": {}}
+    ir = parse_twb(_workbook_with_params(ws, dash), param_binding=pb)
+
+    assert "resolved" not in ir["parameter_controls"][0]
+    assert [w for w in ir["warnings"] if "parameter control 'view swap'" in w["reason"]]
+    parts = _visual_parts(emit_pbir(ir))
+    assert [v for v in parts.values() if v["visual"]["visualType"] == "slicer"] == []
+
+
+def test_migrate_twb_to_pbir_accepts_param_binding_and_places_slicer_in_dashboard_zone():
+    # End-to-end through the one-call entry: a resolved control's slicer lands on the dashboard page
+    # scaled into the page frame (so it sits where the Tableau control was, not off-canvas).
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Dash'><zones>"
+            "<zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='60000' x='0' y='0' name='Sales by Category' id='2' />"
+            + _paramctrl_zone("Parameter 1", x=80000, y=10000) +
+            "</zone></zones></dashboard>")
+    pb = {"slicers": {"[Parameter 1]": {"table": "Orders", "column": "Segment",
+                                        "single_select": True, "caption": "view swap"}}}
+    res = migrate_twb_to_pbir(_workbook_with_params(ws, dash), param_binding=pb)
+    slicer_parts = [k for k in res["parts"] if "/paramslicer-" in k]
+    assert len(slicer_parts) == 1
+    v = json.loads(res["parts"][slicer_parts[0]])
+    assert v["visual"]["visualType"] == "slicer"
+    # placed within the page frame (x scaled from the ~0.8 fractional zone position)
+    pos = v["position"]
+    assert 0 <= pos["x"] <= PAGE_WIDTH and 0 <= pos["y"] <= PAGE_HEIGHT
+    assert pos["x"] > PAGE_WIDTH / 2  # the control was on the right (x=80000 of 100000)
+
+
+# -- model keep-flag -> visual-level measure filter (param_binding["flags"]) ---
+# A translated parameter-driven keep calc (e.g. a relative-date window selector) comes back from the
+# model build as a measure in ``param_binding["flags"][<token>] = {entity, measure, value, visuals}``;
+# each scoped worksheet's rebuilt visual then carries a visual-level ``[measure] == value`` measure
+# filter so it opens on the SAME windowed rows, and the now-obsolete parse-time "aggregate/measure
+# filter on '<token>'" warning is dropped for that worksheet. Warn-never-wrong governs the edges: a
+# non-numeric value, an empty/absent scope, or a worksheet the workbook lacks leaves the filter
+# UNAPPLIED with a warning -- never applied to a guessed set of visuals.
+_DATE_FILTER_CALC = (
+    "<column caption='Date Filter' datatype='boolean' name='[DateFilterCalc]' "
+    "role='measure' type='quantitative'>"
+    "<calculation class='tableau' formula='IF LAST()&lt;=15 THEN 1 END' />"
+    "</column>"
+    "<column-instance column='[DateFilterCalc]' derivation='None' "
+    "name='[none:DateFilterCalc:qk]' pivot='key' type='quantitative' />")
+_DATE_FILTER_FILT = ("<filter class='quantitative' "
+                     "column='[federated.abc].[none:DateFilterCalc:qk]' />")
+
+
+def _flag_pb(visuals, *, measure="Date Filter", entity="_Measures", value=1, token="Date Filter"):
+    return {"flags": {token: {"entity": entity, "measure": measure,
+                              "status": "translated", "value": value, "visuals": visuals}}}
+
+
+def _flagged_line_worksheet(name="Line chart"):
+    # a faithful line chart that ALSO carries an aggregate/measure filter on a "Date Filter" calc --
+    # so the bare parse warns "aggregate/measure filter on 'Date Filter'" and a flag can supersede it.
+    return _worksheet(name, "Line",
+                      rows="[federated.abc].[sum:Sales:qk]",
+                      cols="[federated.abc].[mn:Order Date:ok]",
+                      deps_extra=_INST + _DATE_FILTER_CALC, filters=_DATE_FILTER_FILT)
+
+
+def _measure_filter_containers(parts):
+    out = []
+    for v in _visual_parts(parts).values():
+        for cont in (v.get("filterConfig") or {}).get("filters", []):
+            if "Measure" in cont.get("field", {}):
+                out.append(cont)
+    return out
+
+
+def test_flag_filter_container_is_advanced_measure_equals_filter():
+    cont = _flag_filter_container("_Measures", "Date Filter", "1L", "flag-x")
+    # the top-level field references the measure by its home Entity ...
+    assert cont["field"]["Measure"]["Property"] == "Date Filter"
+    assert cont["field"]["Measure"]["Expression"]["SourceRef"] == {"Entity": "_Measures"}
+    assert cont["type"] == "Advanced"
+    assert cont["howCreated"] == "User"
+    assert cont["filter"]["From"][0] == {"Name": "f", "Entity": "_Measures", "Type": 0}
+    cmp_ = cont["filter"]["Where"][0]["Condition"]["Comparison"]
+    assert cmp_["ComparisonKind"] == 0  # Equal
+    # ... but the Where comparison reaches it through the From SOURCE alias, never the Entity (an
+    # Entity inside Where is a silent filter failure)
+    assert cmp_["Left"]["Measure"]["Expression"]["SourceRef"] == {"Source": "f"}
+    assert cmp_["Left"]["Measure"]["Property"] == "Date Filter"
+    assert cmp_["Right"]["Literal"]["Value"] == "1L"
+
+
+def test_resolve_visual_flags_maps_each_scoped_worksheet():
+    warnings = []
+    by_ws = _resolve_visual_flags(_flag_pb(["A", "B"]), {"A": {}, "B": {}}, warnings)
+    assert set(by_ws) == {"A", "B"}
+    assert len(by_ws["A"]) == 1 and len(by_ws["B"]) == 1
+    assert by_ws["A"][0]["field"]["Measure"]["Property"] == "Date Filter"
+    lit = by_ws["A"][0]["filter"]["Where"][0]["Condition"]["Comparison"]["Right"]["Literal"]["Value"]
+    assert lit == "1L"
+    assert warnings == []
+
+
+def test_resolve_visual_flags_decimal_value_emits_double_literal():
+    by_ws = _resolve_visual_flags(_flag_pb(["A"], value=1.5), {"A": {}}, [])
+    lit = by_ws["A"][0]["filter"]["Where"][0]["Condition"]["Comparison"]["Right"]["Literal"]["Value"]
+    assert lit == "1.5D"
+
+
+def test_resolve_visual_flags_non_numeric_value_warns_and_skips():
+    warnings = []
+    by_ws = _resolve_visual_flags(_flag_pb(["A"], value="abc"), {"A": {}}, warnings)
+    assert by_ws == {}
+    assert any("non-numeric keep-value" in w["reason"] for w in warnings)
+
+
+def test_resolve_visual_flags_empty_visuals_warns_and_skips():
+    warnings = []
+    by_ws = _resolve_visual_flags(_flag_pb([]), {"A": {}}, warnings)
+    assert by_ws == {}
+    assert any("no worksheet scope" in w["reason"] for w in warnings)
+
+
+def test_resolve_visual_flags_unknown_worksheet_warns_and_skips():
+    warnings = []
+    by_ws = _resolve_visual_flags(_flag_pb(["Ghost"]), {"A": {}}, warnings)
+    assert by_ws == {}
+    assert any("not in the workbook" in w["reason"] for w in warnings)
+
+
+def test_drop_resolved_flag_warnings_prunes_only_matching_worksheet_token():
+    warnings = [
+        {"scope": "worksheet", "name": "Line chart",
+         "reason": "manual attention required: aggregate/measure filter on 'Date Filter' (...)"},
+        {"scope": "worksheet", "name": "Other",
+         "reason": "manual attention required: aggregate/measure filter on 'Date Filter' (...)"},
+        {"scope": "worksheet", "name": "Line chart",
+         "reason": "manual attention required: date part 'Month' on 'Order Date' (...)"},
+    ]
+    _drop_resolved_flag_warnings(warnings, [("Line chart", "Date Filter")])
+    assert len(warnings) == 2  # only the (Line chart, Date Filter) aggregate warning is removed
+    tags = {(w["name"], "aggregate" in w["reason"], "date part" in w["reason"]) for w in warnings}
+    assert ("Other", True, False) in tags          # a different worksheet is untouched
+    assert ("Line chart", False, True) in tags      # an unrelated warning on the same ws survives
+
+
+def test_param_binding_flag_applies_measure_filter_to_scoped_visual():
+    ws = _flagged_line_worksheet("Line chart")
+    ir = parse_twb(_workbook(ws), param_binding=_flag_pb(["Line chart"]))
+    assert len(ir["visual_flags"]["Line chart"]) == 1
+
+    conts = _measure_filter_containers(emit_pbir(ir))
+    assert len(conts) == 1
+    cont = conts[0]
+    assert cont["type"] == "Advanced"
+    assert cont["field"]["Measure"]["Property"] == "Date Filter"
+    cmp_ = cont["filter"]["Where"][0]["Condition"]["Comparison"]
+    assert cmp_["ComparisonKind"] == 0
+    assert cmp_["Left"]["Measure"]["Expression"]["SourceRef"] == {"Source": "f"}
+    assert cmp_["Right"]["Literal"]["Value"] == "1L"
+
+
+def test_param_binding_flag_clears_aggregate_measure_filter_warning():
+    ws = _flagged_line_worksheet("Line chart")
+    # without the flag the worksheet keeps its honest "not mapped to a slicer" warning ...
+    bare = parse_twb(_workbook(ws))
+    assert any("aggregate/measure filter on 'Date Filter'" in w["reason"] for w in bare["warnings"])
+    # ... and the model keep-flag supersedes it (the visual filters on the measure instead)
+    ir = parse_twb(_workbook(ws), param_binding=_flag_pb(["Line chart"]))
+    assert not any("aggregate/measure filter on 'Date Filter'" in w["reason"]
+                   for w in ir["warnings"])
+
+
+def test_param_binding_flag_scoped_to_absent_worksheet_applies_nothing():
+    ws = _flagged_line_worksheet("Line chart")
+    ir = parse_twb(_workbook(ws), param_binding=_flag_pb(["Ghost sheet"]))
+    assert ir["visual_flags"] == {}
+    assert any("not in the workbook" in w["reason"] for w in ir["warnings"])
+    # warn-never-wrong: the real visual gets NO measure filter (the scope is never guessed) ...
+    assert _measure_filter_containers(emit_pbir(ir)) == []
+    # ... and the worksheet keeps its own honest aggregate-filter warning
+    assert any("aggregate/measure filter on 'Date Filter'" in w["reason"] for w in ir["warnings"])
+
+
+def test_no_flags_leaves_visuals_and_records_untouched():
+    ws = _worksheet("Plain", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    res = migrate_twb_to_pbir(_workbook(ws))
+    assert res["ir"]["visual_flags"] == {}
+    assert _measure_filter_containers(res["parts"]) == []
+    assert all("flag_filters" not in r for r in res["candidate_records"])
+
+
+def test_migrate_twb_to_pbir_flag_filter_lands_on_part_and_candidate_record():
+    ws = _flagged_line_worksheet("Line chart")
+    res = migrate_twb_to_pbir(_workbook(ws), param_binding=_flag_pb(["Line chart"]))
+    # the emitted visual part carries the measure filter ...
+    conts = _measure_filter_containers(res["parts"])
+    assert len(conts) == 1
+    assert conts[0]["field"]["Measure"]["Property"] == "Date Filter"
+    # ... and the candidate record names the applied keep-flag measure (additive fact)
+    rec = [r for r in res["candidate_records"] if r["worksheet"] == "Line chart"][0]
+    assert rec["flag_filters"] == ["Date Filter"]
 
 
 # -- multi-datasource: each field binds to its own relation --------------------
@@ -2713,3 +3240,613 @@ def test_property_invariants_hold_across_a_wide_worksheet_sweep():
             for entry in sd["sort"]:
                 assert entry["field"] in bound, f"dangling sort in {name}"
                 assert entry["direction"] in ("Ascending", "Descending")
+
+
+# -- table / matrix background colour scale (conditional formatting) -----------
+# A continuous colour scale on a highlight table / matrix becomes a PBIR ``visual.objects.values``
+# ``backColor`` FillRule gradient. WARN-NEVER-WRONG: the fill emits only when the colour driver is
+# a clean model measure projected in the visual and NOT a quick table calc; otherwise the visual
+# emits with no fill, a warning, and the raw palette preserved on the candidate record.
+def _mark_color_style(field_token, palette_type, colors, center=None, enc_type="interpolated"):
+    center_attr = f" center='{center}'" if center is not None else ""
+    color_xml = "".join(f"<color>{c}</color>" for c in colors)
+    return (f"<style><style-rule element='mark'>"
+            f"<encoding attr='color'{center_attr} type='{enc_type}' field='{field_token}'>"
+            f"<color-palette type='{palette_type}'>{color_xml}</color-palette>"
+            f"</encoding></style-rule></style>")
+
+
+def _heat_ws(name, *, color_field, encodings, style, deps_extra=_INST):
+    # Square mark + dims on both axes -> a highlight-table matrix; the colour scale rides the
+    # worksheet <style>. ``encodings`` carries the marks-card colour/text pills.
+    return _worksheet(name, "Square",
+                      rows="[federated.abc].[none:Category:nk]",
+                      cols="[federated.abc].[none:Region:nk]",
+                      deps_extra=deps_extra, encodings=encodings, style=style)
+
+
+def _values_objects(visual_json):
+    return visual_json["visual"].get("objects", {}).get("values")
+
+
+def _fill_rule(values_objects):
+    return (values_objects[0]["properties"]["backColor"]["solid"]["color"]
+            ["expr"]["FillRule"])
+
+
+def _cf_fact(records, worksheet):
+    rec = next(r for r in records if r["worksheet"] == worksheet)
+    return rec.get("conditional_format")
+
+
+def test_color_gradient_palette_parsed_into_ir():
+    # The mark colour encoding's interpolated palette is parsed (additive ``color_gradient`` IR
+    # key) preserving the centre, the author colour order, and the table-calc flag.
+    style = _mark_color_style("[federated.abc].[sum:Sales:qk]", "ordered-diverging",
+                              ["#f28e2b", "#d9d9d9", "#e6e6e6"], center="0.0",
+                              enc_type="custom-interpolated")
+    enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    ir = parse_twb(_workbook(_heat_ws("Heat", color_field="sum:Sales:qk",
+                                      encodings=enc, style=style)))
+    cg = ir["worksheets"][0]["color_gradient"]
+    assert cg is not None
+    assert cg["palette_type"] == "ordered-diverging"
+    assert cg["center"] == 0.0
+    assert cg["colors"] == ["#f28e2b", "#d9d9d9", "#e6e6e6"]   # first -> min, last -> max
+    assert cg["is_table_calc"] is False
+
+
+def test_highlight_table_sequential_scale_emits_backcolor_lineargradient2():
+    style = _mark_color_style("[federated.abc].[sum:Sales:qk]", "ordered-sequential",
+                              ["#f7fbff", "#08306b"])
+    enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    parts = emit_pbir(parse_twb(_workbook(
+        _heat_ws("Heat", color_field="sum:Sales:qk", encodings=enc, style=style))))
+    vj = list(_visual_parts(parts).values())[0]
+    vo = _values_objects(vj)
+    assert vo, "expected a conditional-format values object"
+    fr = _fill_rule(vo)
+    # Input mirrors the colour-driver projection (SUM of Sales); gradient is a 2-stop linear scale
+    assert fr["Input"]["Aggregation"]["Expression"]["Column"]["Property"] == "Sales_Amount"
+    grad = fr["FillRule"]["linearGradient2"]
+    assert grad["min"]["color"]["Literal"]["Value"] == "'#f7fbff'"
+    assert grad["max"]["color"]["Literal"]["Value"] == "'#08306b'"
+    assert grad["nullColoringStrategy"]["strategy"]["Literal"]["Value"] == "'asZero'"
+    # the selector targets a real Values projection by queryRef (self-colour)
+    qs = _query_state(vj)
+    metadata = vo[0]["selector"]["metadata"]
+    assert metadata in {p["queryRef"] for p in qs["Values"]["projections"]}
+    assert vo[0]["selector"]["data"][0]["dataViewWildcard"]["matchingOption"] == 1
+
+
+def test_diverging_scale_with_center_emits_lineargradient3_mid_pinned():
+    style = _mark_color_style("[federated.abc].[sum:Profit:qk]", "ordered-diverging",
+                              ["#f28e2b", "#d9d9d9", "#e6e6e6"], center="0.0",
+                              enc_type="custom-interpolated")
+    enc = "<encodings><color column='[federated.abc].[sum:Profit:qk]' /></encodings>"
+    parts = emit_pbir(parse_twb(_workbook(
+        _heat_ws("Heat", color_field="sum:Profit:qk", encodings=enc, style=style))))
+    fr = _fill_rule(_values_objects(list(_visual_parts(parts).values())[0]))
+    grad = fr["FillRule"]["linearGradient3"]
+    assert grad["min"]["color"]["Literal"]["Value"] == "'#f28e2b'"
+    assert grad["mid"]["color"]["Literal"]["Value"] == "'#d9d9d9'"
+    assert grad["mid"]["value"]["Literal"]["Value"] == "0.0D"    # centre pinned as a double literal
+    assert grad["max"]["color"]["Literal"]["Value"] == "'#e6e6e6'"
+    assert "value" not in grad["min"] and "value" not in grad["max"]  # auto min/max
+
+
+def test_color_by_different_measure_targets_displayed_value():
+    # Tableau "colour by a different field": text shows SUM(Sales), colour driven by SUM(Profit).
+    # The FillRule Input is Profit; the selector targets the displayed Sales column. The colour
+    # driver is surfaced on the matrix TOOLTIPS (faithful to Tableau's colour-card tooltip), not as
+    # a visible Values column -- so Sales is the only displayed value and Profit rides the tooltip.
+    style = _mark_color_style("[federated.abc].[sum:Profit:qk]", "ordered-sequential",
+                              ["#ffffff", "#1f77b4"])
+    enc = ("<encodings><color column='[federated.abc].[sum:Profit:qk]' />"
+           "<text column='[federated.abc].[sum:Sales:qk]' /></encodings>")
+    parts = emit_pbir(parse_twb(_workbook(
+        _heat_ws("Heat", color_field="sum:Profit:qk", encodings=enc, style=style))))
+    vj = list(_visual_parts(parts).values())[0]
+    vo = _values_objects(vj)
+    fr = _fill_rule(vo)
+    assert fr["Input"]["Aggregation"]["Expression"]["Column"]["Property"] == "Profit"
+    assert vo[0]["selector"]["metadata"] == "Sum(Orders.Sales_Amount)"
+    qs = _query_state(vj)
+    val_refs = {p["queryRef"] for p in qs["Values"]["projections"]}
+    tip_refs = {p["queryRef"] for p in qs["Tooltips"]["projections"]}
+    assert val_refs == {"Sum(Orders.Sales_Amount)"}       # only the displayed value is a column
+    assert tip_refs == {"Sum(Orders.Profit)"}             # the colour driver rides the tooltip
+
+
+def test_table_calc_colour_driver_defers_with_palette_preserved():
+    # A quick-table-calc colour driver (e.g. "Percent Difference From" -> pcdf:) has no equivalent
+    # model measure yet, so colouring by the mis-resolved base would be wrong: defer + warn + keep
+    # the raw palette on the candidate record (no fill emitted).
+    calc_col = ("<column caption='DoD %' datatype='real' name='[Calculation_1]' role='measure' "
+                "type='quantitative'><calculation class='tableau' formula='[Sales]' /></column>")
+    calc_inst = ("<column-instance column='[Calculation_1]' derivation='User' "
+                 "name='[pcdf:Calculation_1:qk]' pivot='key' type='quantitative' />")
+    style = _mark_color_style("[federated.abc].[pcdf:Calculation_1:qk]", "ordered-diverging",
+                              ["#f28e2b", "#d9d9d9", "#e6e6e6"], center="0.0",
+                              enc_type="custom-interpolated")
+    enc = ("<encodings><color column='[federated.abc].[pcdf:Calculation_1:qk]' />"
+           "<text column='[federated.abc].[sum:Sales:qk]' /></encodings>")
+    res = migrate_twb_to_pbir(_workbook(
+        _heat_ws("Heat", color_field="pcdf:Calculation_1:qk", encodings=enc, style=style,
+                 deps_extra=_INST + calc_col + calc_inst)))
+    # no fill emitted on the visual
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _values_objects(vj) is None
+    # candidate record keeps the palette + a deferred status
+    fact = _cf_fact(res["candidate_records"], "Heat")
+    assert fact["status"] == "deferred"
+    assert "quick table calc" in fact["reason"]
+    assert fact["colors"] == ["#f28e2b", "#d9d9d9", "#e6e6e6"]
+    assert fact["center"] == 0.0
+    assert any("background colour scale deferred" in w["reason"] for w in res["warnings"])
+
+
+def test_emitted_conditional_format_fact_recorded_on_candidate_record():
+    style = _mark_color_style("[federated.abc].[sum:Sales:qk]", "ordered-sequential",
+                              ["#f7fbff", "#08306b"])
+    enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    res = migrate_twb_to_pbir(_workbook(
+        _heat_ws("Heat", color_field="sum:Sales:qk", encodings=enc, style=style)))
+    fact = _cf_fact(res["candidate_records"], "Heat")
+    assert fact["status"] == "emitted"
+    assert fact["bound_measure"] == "Sum(Orders.Sales_Amount)"
+    assert fact["target"] == "Sum(Orders.Sales_Amount)"
+
+
+def test_matrix_without_colour_gradient_emits_no_conditional_format():
+    # Additivity: a plain highlight-table matrix (no <style> colour scale) carries neither a
+    # values object nor a conditional_format fact -- the report is byte-unchanged from before.
+    enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    res = migrate_twb_to_pbir(_workbook(
+        _heat_ws("Heat", color_field="sum:Sales:qk", encodings=enc, style="")))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _values_objects(vj) is None
+    assert _cf_fact(res["candidate_records"], "Heat") is None
+
+
+def test_categorical_colour_legend_is_not_a_gradient():
+    # A discrete (categorical) colour legend is Tier-2 legend styling, not a cell heat scale:
+    # no color_gradient is parsed and no fill is emitted.
+    style = ("<style><style-rule element='mark'><encoding attr='color' type='palette' "
+             "field='[federated.abc].[none:Region:nk]'>"
+             "<color-palette type='regular'><color>#111111</color><color>#222222</color>"
+             "</color-palette></encoding></style-rule></style>")
+    enc = ("<encodings><color column='[federated.abc].[none:Region:nk]' />"
+           "<text column='[federated.abc].[sum:Sales:qk]' /></encodings>")
+    ir = parse_twb(_workbook(_heat_ws("Heat", color_field="none:Region:nk",
+                                      encodings=enc, style=style)))
+    assert ir["worksheets"][0]["color_gradient"] is None
+
+
+# -- categorical mark colours (explicit author member -> hex palette) ----------
+# An explicit per-member colour map (``<map to='#hex'><bucket>"Member"</bucket></map>``) is
+# unambiguous author intent. On the discrete categorical charts (column / bar / pie / donut) it
+# becomes a PBIR ``visual.objects.dataPoint`` per-member ``fill`` targeted by a ``scopeId`` data
+# selector. WARN-NEVER-WRONG: a palette on an unsupported visual type, or whose coloured dimension
+# is not projected, defers (no dataPoint, a warning, the raw palette kept on the candidate record).
+def _palette_style(field_token, members):
+    # members: list of (member_value, hex); a string bucket is wrapped in literal double quotes.
+    maps = "".join(
+        "<map to='{0}'><bucket>&quot;{1}&quot;</bucket></map>".format(hexv, val)
+        for val, hexv in members)
+    return ("<style><style-rule element='mark'>"
+            "<encoding attr='color' type='palette' field='{0}'>{1}</encoding>"
+            "</style-rule></style>".format(field_token, maps))
+
+
+def _data_point_objects(visual_json):
+    return visual_json["visual"].get("objects", {}).get("dataPoint")
+
+
+def _mc_fact(records, worksheet):
+    rec = next(r for r in records if r["worksheet"] == worksheet)
+    return rec.get("mark_colors")
+
+
+_REGION_PALETTE = [("Central", "#4e79a7"), ("West", "#76b7b2"), ("South", "#e15759")]
+
+
+def _stacked_palette_ws(name="Stacked"):
+    enc = "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings>"
+    return _worksheet(name, "Bar",
+                      rows="[federated.abc].[sum:Sales:qk]",
+                      cols="[federated.abc].[none:Category:nk]",
+                      deps_extra=_INST, encodings=enc,
+                      style=_palette_style("[federated.abc].[none:Region:nk]", _REGION_PALETTE))
+
+
+def test_categorical_palette_parsed_into_ir():
+    ir = parse_twb(_workbook(_stacked_palette_ws()))
+    mc = ir["worksheets"][0]["mark_colors"]
+    assert mc is not None
+    # author order is preserved; each member carries its explicit hex
+    assert [(m["value"], m["color"]) for m in mc["members"]] == _REGION_PALETTE
+    assert "Region" in mc["field_token"]
+
+
+def test_categorical_palette_emits_datapoint_fills_with_scope_selectors():
+    parts = emit_pbir(parse_twb(_workbook(_stacked_palette_ws())))
+    vj = list(_visual_parts(parts).values())[0]
+    assert vj["visual"]["visualType"] == "stackedColumnChart"
+    dp = _data_point_objects(vj)
+    assert dp and len(dp) == len(_REGION_PALETTE)
+    series_field = _query_state(vj)["Series"]["projections"][0]["field"]
+    for entry, (member, hexv) in zip(dp, _REGION_PALETTE):
+        fill = entry["properties"]["fill"]["solid"]["color"]["expr"]["Literal"]["Value"]
+        assert fill == "'{0}'".format(hexv)
+        comp = entry["selector"]["data"][0]["scopeId"]["Comparison"]
+        assert comp["ComparisonKind"] == 0                 # Equal
+        assert comp["Left"] == series_field                # reuse the projected column expr
+        assert comp["Right"]["Literal"]["Value"] == "'{0}'".format(member)
+
+
+def test_categorical_palette_fact_recorded_emitted():
+    res = migrate_twb_to_pbir(_workbook(_stacked_palette_ws()))
+    fact = _mc_fact(res["candidate_records"], "Stacked")
+    assert fact["status"] == "emitted"
+    assert fact["kind"] == "categorical_palette"
+    assert [(m["value"], m["color"]) for m in fact["members"]] == _REGION_PALETTE
+
+
+def test_categorical_palette_on_line_defers_with_palette_preserved():
+    # Line / area charts colour a continuous series; an explicit dataPoint override can drop the
+    # line, so the palette defers (theme colours kept) with the raw palette preserved on the record.
+    enc = "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings>"
+    ws = _worksheet("Trend", "Line",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[mn:Order Date:ok]",
+                    deps_extra=_INST, encodings=enc,
+                    style=_palette_style("[federated.abc].[none:Region:nk]", _REGION_PALETTE))
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert vj["visual"]["visualType"] == "lineChart"
+    assert _data_point_objects(vj) is None
+    fact = _mc_fact(res["candidate_records"], "Trend")
+    assert fact["status"] == "deferred"
+    assert [(m["value"], m["color"]) for m in fact["members"]] == _REGION_PALETTE
+    assert any("categorical mark colours deferred" in w["reason"] for w in res["warnings"])
+
+
+def test_categorical_palette_unprojected_dimension_defers():
+    # The style palette names Region, but no colour pill is on the marks card, so Region is not a
+    # projection -> the per-member selector could not resolve -> defer (no dataPoint).
+    ws = _worksheet("Plain Cols", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST,
+                    style=_palette_style("[federated.abc].[none:Region:nk]", _REGION_PALETTE))
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _data_point_objects(vj) is None
+    fact = _mc_fact(res["candidate_records"], "Plain Cols")
+    assert fact["status"] == "deferred"
+    assert "not bound" in fact["reason"]
+
+
+def test_chart_without_palette_emits_no_datapoint():
+    # Additivity: a stacked column with a colour legend but NO explicit palette carries neither a
+    # dataPoint object nor a mark_colors fact -- the report is byte-unchanged from before.
+    enc = "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings>"
+    ws = _worksheet("Stacked", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, encodings=enc)
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _data_point_objects(vj) is None
+    assert _mc_fact(res["candidate_records"], "Stacked") is None
+
+
+def test_single_default_mark_color_is_not_emitted():
+    # A bare single ``mark-color`` is Tableau's default fill (written even when the author chose
+    # nothing); it is deliberately NOT turned into a defaultColor -- only an explicit member map is.
+    style = ("<style><style-rule element='mark'><format attr='mark-color' value='#b4b4b4' />"
+             "</style-rule></style>")
+    enc = "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings>"
+    ws = _worksheet("Stacked", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, encodings=enc, style=style)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["mark_colors"] is None
+    vj = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert _data_point_objects(vj) is None
+
+
+# -- data labels (Tableau "Show Mark Labels" toggle) ---------------------------
+# Tableau writes the mark-label show/hide as ``<format attr='mark-labels-show' value='..'/>`` in a
+# ``<style-rule element='mark'>`` (at the worksheet ``table/style`` and/or per ``pane``). It maps to
+# the PBIR data-plane ``visual.objects.labels`` ``show`` toggle, applied uniformly (no selector).
+# WARN-NEVER-WRONG: show=true is emitted whenever the toggle is unambiguously ON; show=false is
+# emitted ONLY for pie/donut (whose Power BI default is ON); other types default OFF so an OFF toggle
+# is a no-op; a dual-axis worksheet whose panes disagree defers (keeps the default) with a warning;
+# a table/matrix/card already displays its values so no label object is produced.
+def _label_style(show):
+    return ("<style><style-rule element='mark'>"
+            "<format attr='mark-labels-show' value='{0}' />"
+            "</style-rule></style>".format("true" if show else "false"))
+
+
+def _labels_objects(visual_json):
+    return visual_json["visual"].get("objects", {}).get("labels")
+
+
+def _dl_fact(records, worksheet):
+    rec = next(r for r in records if r["worksheet"] == worksheet)
+    return rec.get("data_labels")
+
+
+def test_data_labels_pane_toggle_parsed_into_ir():
+    ws = _worksheet("Cols", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, pane_extra=_label_style(True))
+    dl = parse_twb(_workbook(ws))["worksheets"][0]["data_labels"]
+    assert dl == {"show": True, "uniform": True, "raw_values": [True]}
+
+
+def test_data_labels_table_style_toggle_parsed_into_ir():
+    # the worksheet-level table/style toggle is read too (not only the per-pane one)
+    ws = _worksheet("Cols", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, style=_label_style(True))
+    dl = parse_twb(_workbook(ws))["worksheets"][0]["data_labels"]
+    assert dl["show"] is True and dl["uniform"] is True
+
+
+def test_data_labels_show_emits_labels_object_and_fact():
+    ws = _worksheet("Cols", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, pane_extra=_label_style(True))
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _labels_objects(vj) == [
+        {"properties": {"show": {"expr": {"Literal": {"Value": "true"}}}}}]
+    fact = _dl_fact(res["candidate_records"], "Cols")
+    assert fact["kind"] == "data_labels"
+    assert fact["status"] == "emitted" and fact["show"] is True
+
+
+def test_data_labels_off_on_cartesian_is_noop():
+    # Power BI defaults data labels OFF on column/bar/line/area, so an OFF Tableau toggle needs no
+    # object -- the record still discloses the (default_off) fact, additively.
+    ws = _worksheet("Cols", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, pane_extra=_label_style(False))
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _labels_objects(vj) is None
+    fact = _dl_fact(res["candidate_records"], "Cols")
+    assert fact["status"] == "default_off" and fact["show"] is False
+
+
+def test_data_labels_off_on_pie_emits_show_false():
+    # Pie/donut default labels ON in Power BI, so an OFF Tableau toggle must be emitted as show=false
+    # to faithfully hide them.
+    ws = _worksheet("Share", "Pie",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, pane_extra=_label_style(False))
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert vj["visual"]["visualType"] == "pieChart"
+    assert _labels_objects(vj) == [
+        {"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}]
+    assert _dl_fact(res["candidate_records"], "Share")["status"] == "emitted"
+
+
+def test_data_labels_disagreeing_panes_defer_with_warning():
+    # table/style says ON, the pane says OFF -> the toggle is ambiguous (a dual-axis per-series
+    # difference) -> no global toggle is guessed; the visual keeps its default + a warning discloses.
+    ws = _worksheet("Cols", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, style=_label_style(True),
+                    pane_extra=_label_style(False))
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _labels_objects(vj) is None
+    fact = _dl_fact(res["candidate_records"], "Cols")
+    assert fact["status"] == "deferred"
+    assert any("data labels deferred" in w["reason"] for w in res["warnings"])
+
+
+def test_data_labels_absent_emits_nothing():
+    # Additivity: a chart with no mark-labels-show toggle carries neither a labels object nor a fact.
+    ws = _worksheet("Cols", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST)
+    res = migrate_twb_to_pbir(_workbook(ws))
+    assert parse_twb(_workbook(ws))["worksheets"][0]["data_labels"] is None
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _labels_objects(vj) is None
+    assert _dl_fact(res["candidate_records"], "Cols") is None
+
+
+def test_data_labels_on_card_not_applicable():
+    # A card already displays its value, so a label toggle on a card emits no labels object and no
+    # fact (the label types exclude card / table / matrix / map).
+    ws = _worksheet("KPI", "Text",
+                    rows="[federated.abc].[sum:Sales:qk]", cols="",
+                    deps_extra=_INST, pane_extra=_label_style(True))
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _labels_objects(vj) is None
+    assert _dl_fact(res["candidate_records"], "KPI") is None
+
+
+# -- cross-layer measure binding (model<->viz contract consumer) ---------------
+# The datasource-migration (model) build hands back a token-keyed calc->measure manifest; the
+# dashboard (viz) build rebinds the matching workbook-local / quick-table-calc pills to those real
+# ``_Measures`` measures. Binding is DETERMINISTIC (token-keyed) and only for translated /
+# assisted-approved measures (warn-never-wrong). Default (no binding) -> byte-unchanged.
+def _pcdf_heat_workbook():
+    # The Comcast pilot heat grid: a percent-difference quick-table-calc (``pcdf:``) drives the cell
+    # colour; the displayed value is SUM(Sales). Without a measure binding this DEFERS (no model
+    # measure for the table calc); with one it lights up.
+    calc_col = ("<column caption='Percent Difference' datatype='real' name='[Calculation_1]' "
+                "role='measure' type='quantitative'>"
+                "<calculation class='tableau' formula='[Sales]' /></column>")
+    calc_inst = ("<column-instance column='[Calculation_1]' derivation='User' "
+                 "name='[pcdf:Calculation_1:qk]' pivot='key' type='quantitative' />")
+    style = _mark_color_style("[federated.abc].[pcdf:Calculation_1:qk]", "ordered-diverging",
+                              ["#f28e2b", "#d9d9d9", "#e6e6e6"], center="0.0",
+                              enc_type="custom-interpolated")
+    enc = ("<encodings><color column='[federated.abc].[pcdf:Calculation_1:qk]' />"
+           "<text column='[federated.abc].[sum:Sales:qk]' /></encodings>")
+    return _workbook(_heat_ws("Heat", color_field="pcdf:Calculation_1:qk", encodings=enc,
+                              style=style, deps_extra=_INST + calc_col + calc_inst))
+
+
+def test_measure_binding_lights_up_heat_grid_via_pcdf_instance_token():
+    # The model build translated the pcdf table calc into a named _Measures measure and reports it
+    # under the pill INSTANCE token. The colour driver now binds: Sales is the only displayed value,
+    # the Percent Difference measure rides the Tooltips, and the backColor FillRule references it.
+    mb = {"pcdf:Calculation_1:qk": {"entity": "_Measures",
+                                    "measure": "Percent Difference", "status": "translated"}}
+    res = migrate_twb_to_pbir(_pcdf_heat_workbook(), measure_binding=mb)
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    qs = _query_state(vj)
+    val_refs = {p["queryRef"] for p in qs["Values"]["projections"]}
+    tip_refs = {p["queryRef"] for p in qs["Tooltips"]["projections"]}
+    assert val_refs == {"Sum(Orders.Sales_Amount)"}            # displayed value only
+    assert tip_refs == {"_Measures.Percent Difference"}        # colour driver on the tooltip
+    # the conditional-format fill lights up against the contracted measure
+    fr = _fill_rule(_values_objects(vj))
+    assert fr["Input"]["Measure"]["Property"] == "Percent Difference"
+    fact = _cf_fact(res["candidate_records"], "Heat")
+    assert fact["status"] == "emitted"
+    assert fact["bound_measure"] == "_Measures.Percent Difference"
+    assert fact["target"] == "Sum(Orders.Sales_Amount)"
+    # no dangling Calculation_1 / pcdf reference leaks anywhere in the report
+    blob = "".join(res["parts"].values())
+    assert "Calculation_1" not in blob and "pcdf:" not in blob
+
+
+def test_measure_binding_keyed_by_bare_calc_id_and_wrapper_form():
+    # Join priority allows the bare Calculation_* id (not just the instance token); the wrapper
+    # ``{"measures": {...}}`` shape is accepted too (mirrors row_count_binding).
+    mb = {"measures": {"Calculation_1": {"model_table": "_Measures",
+                                         "measure_name": "Percent Difference",
+                                         "status": "assisted-approved"}}}
+    res = migrate_twb_to_pbir(_pcdf_heat_workbook(), measure_binding=mb)
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    tip_refs = {p["queryRef"] for p in _query_state(vj)["Tooltips"]["projections"]}
+    assert tip_refs == {"_Measures.Percent Difference"}
+    assert _cf_fact(res["candidate_records"], "Heat")["status"] == "emitted"
+
+
+def test_measure_binding_non_bindable_status_still_defers():
+    # A measure the model only SUGGESTED (or stubbed / handed off) is NOT bound -- warn-never-wrong.
+    for status in ("assisted-suggested", "stub", "handoff"):
+        mb = {"pcdf:Calculation_1:qk": {"entity": "_Measures",
+                                        "measure": "Percent Difference", "status": status}}
+        res = migrate_twb_to_pbir(_pcdf_heat_workbook(), measure_binding=mb)
+        vj = list(_visual_parts(res["parts"]).values())[0]
+        assert _values_objects(vj) is None, f"{status} should not emit a fill"
+        fact = _cf_fact(res["candidate_records"], "Heat")
+        assert fact["status"] == "deferred"
+        assert "quick table calc" in fact["reason"]
+
+
+def test_measure_binding_default_none_is_byte_unchanged():
+    # Additivity: omitting the binding == passing None == passing an empty map -> the prior deferred
+    # output, byte-for-byte.
+    wb = _pcdf_heat_workbook()
+    base = migrate_twb_to_pbir(wb)["parts"]
+    assert migrate_twb_to_pbir(wb, measure_binding=None)["parts"] == base
+    assert migrate_twb_to_pbir(wb, measure_binding={})["parts"] == base
+    assert migrate_twb_to_pbir(wb, measure_binding={"measures": {}})["parts"] == base
+    # and a binding for an UNRELATED token leaves this workbook untouched
+    other = {"some:Other:qk": {"entity": "_Measures", "measure": "Nope", "status": "translated"}}
+    assert migrate_twb_to_pbir(wb, measure_binding=other)["parts"] == base
+
+
+def _pcdf_pilot_heat_workbook():
+    # The Comcast pilot's heat-grid colour pill carries the FULL extractor instance token -- INCLUDING
+    # the ``usr:`` addressing segment AND the ``:qk`` suffix (pcdf:usr:Calculation_*:qk). The model
+    # build stamps ``calc_instance_token`` = the extractor's ``TableCalcUsage.instance`` VERBATIM, so
+    # the join must be byte-identical on that token; the bare calc id alone resolves to the BASE value
+    # ([count orders]+100), a DIFFERENT measure, so it must NOT be what lights the colour.
+    cid = "Calculation_0014172369735704"
+    tok = "pcdf:usr:Calculation_0014172369735704:qk"
+    calc_col = (f"<column caption='[count orders] + 100' datatype='integer' name='[{cid}]' "
+                "role='measure' type='quantitative'>"
+                "<calculation class='tableau' formula='[Calculation_0014172369248279] + 100' />"
+                "</column>")
+    calc_inst = (f"<column-instance column='[{cid}]' derivation='User' "
+                 f"name='[{tok}]' pivot='key' type='quantitative' />")
+    style = _mark_color_style(f"[federated.abc].[{tok}]", "ordered-diverging",
+                              ["#f28e2b", "#d9d9d9", "#e6e6e6"], center="0.0",
+                              enc_type="custom-interpolated")
+    enc = (f"<encodings><color column='[federated.abc].[{tok}]' />"
+           "<text column='[federated.abc].[sum:Sales:qk]' /></encodings>")
+    return _workbook(_heat_ws("Heat", color_field=tok, encodings=enc,
+                              style=style, deps_extra=_INST + calc_col + calc_inst))
+
+
+def test_measure_binding_binds_pilot_pcdf_usr_instance_token_verbatim():
+    # THE PILOT LINCHPIN regression guard: bind on the extractor's verbatim instance token (with the
+    # ``usr:`` segment). The heat grid lights against the contracted measure and the token never leaks.
+    tok = "pcdf:usr:Calculation_0014172369735704:qk"
+    mb = {tok: {"entity": "_Measures", "measure": "Percent Difference (DoD)", "status": "translated"}}
+    res = migrate_twb_to_pbir(_pcdf_pilot_heat_workbook(), measure_binding=mb)
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    fr = _fill_rule(_values_objects(vj))
+    assert fr["Input"]["Measure"]["Property"] == "Percent Difference (DoD)"
+    fact = _cf_fact(res["candidate_records"], "Heat")
+    assert fact["status"] == "emitted"
+    assert fact["bound_measure"] == "_Measures.Percent Difference (DoD)"
+    blob = "".join(res["parts"].values())
+    assert tok not in blob and "Calculation_0014172369735704" not in blob
+
+
+def test_measure_binding_same_base_pcdf_and_plain_pills_disambiguate():
+    # Pilot integration lock (verified live against the real .twb): on the heat grid two pills share
+    # the SAME base calc (Calculation_0014172369735704). The COLOUR pill is the pcdf quick-table-calc
+    # instance and the LABEL pill is the plain pill. The token-first join must resolve them to
+    # DIFFERENT measures -- the pcdf instance -> the %-difference measure, the plain pill (no pcdf
+    # entry) falling through to the bare calc id -> the untransformed base -- so the grid is coloured
+    # by the %-diff and the label shows the base, never mis-coloured by the base value.
+    cid = "Calculation_0014172369735704"
+    pcdf = "pcdf:usr:Calculation_0014172369735704:qk"
+    plain = "usr:Calculation_0014172369735704:qk"
+    calc_col = (f"<column caption='[count orders] + 100' datatype='integer' name='[{cid}]' "
+                "role='measure' type='quantitative'>"
+                "<calculation class='tableau' formula='[Calculation_0014172369248279] + 100' />"
+                "</column>")
+    insts = (f"<column-instance column='[{cid}]' derivation='User' name='[{pcdf}]' "
+             "pivot='key' type='quantitative' />"
+             f"<column-instance column='[{cid}]' derivation='User' name='[{plain}]' "
+             "pivot='key' type='quantitative' />")
+    enc = (f"<encodings><color column='[federated.abc].[{pcdf}]' />"
+           f"<text column='[federated.abc].[{plain}]' /></encodings>")
+    ws = _worksheet("Seg", "Square",
+                    rows="[federated.abc].[none:Segment:nk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST + calc_col + insts, encodings=enc)
+    # the model build's calc_bindings handback: the pcdf instance + the bare base id (NOT the plain
+    # instance token), exactly as the model stamps them.
+    mb = {"measures": {
+        pcdf: {"model_table": "_Measures", "status": "translated",
+               "measure_name": "[count orders] + 100 (percent difference from a prior row)"},
+        cid: {"model_table": "_Measures", "status": "translated",
+              "measure_name": "[count orders] + 100"},
+    }}
+    enc_ir = parse_twb(_workbook(ws), measure_binding=mb)["worksheets"][0]["encodings"]
+    assert enc_ir["color"]["measure_rebound"] is True
+    assert enc_ir["color"]["entity"] == "_Measures"
+    assert enc_ir["color"]["property"] == "[count orders] + 100 (percent difference from a prior row)"
+    # plain pill: its own instance token is absent from the binding, so it resolves on the bare calc
+    # id to the BASE measure -- a different measure than the colour, no mis-colour.
+    assert enc_ir["label"]["measure_rebound"] is True
+    assert enc_ir["label"]["property"] == "[count orders] + 100"

@@ -224,6 +224,26 @@ TRANSLATIONS = [
     # GROUP_CONCAT([field][, sep]): dup-inclusive concat over the base table; default separator ",".
     ("GROUP_CONCAT([Region])", "CONCATENATEX('Orders', 'Orders'[Region], \",\")"),
     ("GROUP_CONCAT([Region], \"; \")", "CONCATENATEX('Orders', 'Orders'[Region], \"; \")"),
+    # --- CORR / COVAR / COVARP (two-argument statistical aggregates, no native DAX) ---
+    # Synthesized from the SUMX covariance/correlation identities over the pair's shared base table,
+    # dropping rows where either side is BLANK; DIVIDE returns BLANK on the degenerate frames.
+    ("CORR([Sales], [Profit])",
+     "(VAR _t = FILTER('Orders', NOT ISBLANK('Orders'[Sales]) && NOT ISBLANK('Orders'[Profit])) "
+     "VAR _mx = AVERAGEX(_t, 'Orders'[Sales]) VAR _my = AVERAGEX(_t, 'Orders'[Profit]) "
+     "VAR _sxy = SUMX(_t, ('Orders'[Sales] - _mx) * ('Orders'[Profit] - _my)) "
+     "VAR _sxx = SUMX(_t, ('Orders'[Sales] - _mx) * ('Orders'[Sales] - _mx)) "
+     "VAR _syy = SUMX(_t, ('Orders'[Profit] - _my) * ('Orders'[Profit] - _my)) "
+     "RETURN DIVIDE(_sxy, SQRT(_sxx * _syy)))"),
+    ("COVAR([Sales], [Profit])",
+     "(VAR _t = FILTER('Orders', NOT ISBLANK('Orders'[Sales]) && NOT ISBLANK('Orders'[Profit])) "
+     "VAR _mx = AVERAGEX(_t, 'Orders'[Sales]) VAR _my = AVERAGEX(_t, 'Orders'[Profit]) "
+     "VAR _sxy = SUMX(_t, ('Orders'[Sales] - _mx) * ('Orders'[Profit] - _my)) "
+     "VAR _n = COUNTROWS(_t) RETURN DIVIDE(_sxy, _n - 1))"),
+    ("COVARP([Sales], [Profit])",
+     "(VAR _t = FILTER('Orders', NOT ISBLANK('Orders'[Sales]) && NOT ISBLANK('Orders'[Profit])) "
+     "VAR _mx = AVERAGEX(_t, 'Orders'[Sales]) VAR _my = AVERAGEX(_t, 'Orders'[Profit]) "
+     "VAR _sxy = SUMX(_t, ('Orders'[Sales] - _mx) * ('Orders'[Profit] - _my)) "
+     "VAR _n = COUNTROWS(_t) RETURN DIVIDE(_sxy, _n))"),
 ]
 
 # Each of these MUST fall back (translator returns None).
@@ -243,6 +263,8 @@ FALLBACKS = [
     "IF SUM([Sales]) > SUM([People Count]) THEN 1 ELSE 0 END",
     "SUM([Sales] - [People Count])",              # cross-table expression aggregate
     'SUM(IF [Region] = "East" THEN [Sales] ELSE [People Count] END)',  # cross-table conditional agg
+    "CORR([Sales], [People Count])",              # cross-table statistical aggregate (Orders + People)
+    "COVAR([Sales], [People Count])",             # cross-table statistical aggregate
     # expression / conditional aggregation forms that must still fall back
     "STDEV([Sales]*[Quantity])",                  # stats iterator (STDEVX) not yet supported
     'SUM(IF [Region] = "East" THEN [Region] END)',   # SUM over a text expression
@@ -256,6 +278,9 @@ FALLBACKS = [
     "VAR([Order Date])",                          # VAR on dateTime
     "PERCENTILE([Region], 0.5)",                  # PERCENTILE on string
     "PERCENTILE([Sales])",                        # PERCENTILE missing the fraction arg
+    "CORR([Sales], [Region])",                    # CORR with a non-numeric operand
+    "COVARP([Region], [Profit])",                 # COVARP with a non-numeric operand
+    "CORR([Sales])",                              # CORR missing the second operand
     "MOD(SUM([Quantity]))",                       # MOD needs 2 operands
     # type-soundness failures in the conditional grammar
     'IF SUM([Sales]) > 0 THEN SUM([Profit]) ELSE "n/a" END',   # mixed number/text branches
@@ -457,6 +482,7 @@ COLUMN_TRANSLATIONS = [
     ("MAKEDATE(2024, 1, 15)", "DATE(2024, 1, 15)"),                       # exact, culture-independent
     ("MAKEDATE(YEAR([Order Date]), 1, 1)", "DATE(YEAR('Orders'[Order_Date]), 1, 1)"),  # composes with parts
     ("QUARTER([Order Date])", "QUARTER('Orders'[Order_Date])"),                          # 1-4
+    ("WEEK([Order Date])", "WEEKNUM('Orders'[Order_Date], 1)"),                          # week-of-year, Sunday-start default
     ("ISOWEEK([Order Date])", "WEEKNUM('Orders'[Order_Date], 21)"),                      # ISO-8601 week
     ("ISOWEEKDAY([Order Date])", "WEEKDAY('Orders'[Order_Date], 2)"),                    # Mon=1..Sun=7
     ("ISOYEAR([Order Date])",
@@ -485,6 +511,9 @@ COLUMN_FALLBACKS = [
     "PERCENTILE([Sales], 0.5)",                   # aggregation
     "ATTR([Region])",                             # ATTR is an aggregation (HASONEVALUE/VALUES) -> measure-only
     "GROUP_CONCAT([Region])",                     # GROUP_CONCAT aggregates the whole partition -> measure-only
+    "CORR([Sales], [Profit])",                    # two-arg statistical aggregate -> measure-only
+    "COVAR([Sales], [Profit])",                   # measure-only
+    "COVARP([Sales], [Profit])",                  # measure-only
     "{FIXED [Region] : SUM([Sales])}",            # LOD
     # functions whose DAX equivalent is not faithful -> deferred to fallback
     "TRIM([Region])",                             # DAX TRIM also collapses internal spaces
@@ -829,6 +858,192 @@ def test_table_calc_cross_table_falls_back():
         "RUNNING_SUM(SUM([People Count]))", _resolver, (), _ORDER)
     assert dax is None
     assert "cross-table" in reason
+
+
+# --- ADD #1: trusted ORDERBY-only date-axis redirect (marked-calendar key) --------------------
+# A positional table calc orders by the worksheet's continuous-date axis, but the rebuilt visual
+# groups that axis on the marked-calendar key Date[Date]. An ``order_resolver`` redirects ONLY the
+# ORDERBY (never the inner aggregate or the partition) to Date[Date]; because the Date dimension
+# relates to the fact, the redirected addressing column is a related addressing dimension (NOT a
+# cross-table aggregate term), so it is exempt from the single-table guard and the measure stays
+# translated -- giving "previous mark = previous data-date" exactly as the visual renders.
+from calc_to_dax import translate_percent_diff_to_dax  # noqa: E402
+
+
+def _date_axis_order_resolver(caption):
+    # Redirect the active business-date axis caption to the marked-calendar key, carrying the FACT
+    # it resolves to as the 4th element (the required_fact the redirect depends on); None otherwise,
+    # so every non-date caption flows through the normal resolver unchanged.
+    if caption == "Order Date":
+        return ("Date", "Date", "dateTime", "Orders")
+    return None
+
+
+def test_table_calc_orderby_redirects_to_marked_calendar_key():
+    # WINDOW_STDEV(SUM([Sales])) over a date axis: ORDERBY walks Date[Date] (the visual axis) while
+    # the inner aggregate + partition stay on the fact -> the related Date dimension is not counted
+    # against the single-table guard, so it stays translated (reason == "ok").
+    dax, reason, _ = translate_tableau_table_calc_to_dax(
+        "WINDOW_STDEV(SUM([Sales]))", _resolver, _PART, _ORDER,
+        order_resolver=_date_axis_order_resolver)
+    assert reason == "ok"
+    assert dax == ("STDEVX.S(WINDOW(1, ABS, -1, ABS, ORDERBY('Date'[Date], ASC), "
+                   "PARTITIONBY('Orders'[Region])), CALCULATE(SUM('Orders'[Sales])))")
+
+
+def test_table_calc_orderby_redirect_default_is_byte_identical():
+    # With no order_resolver (and with an explicit None) the ORDERBY resolves to the fact date
+    # column exactly as before -- the redirect is purely additive.
+    base = translate_tableau_table_calc_to_dax(
+        "WINDOW_STDEV(SUM([Sales]))", _resolver, _PART, _ORDER)[0]
+    explicit_none = translate_tableau_table_calc_to_dax(
+        "WINDOW_STDEV(SUM([Sales]))", _resolver, _PART, _ORDER, order_resolver=None)[0]
+    assert base == explicit_none
+    assert "ORDERBY('Orders'[Order_Date], ASC)" in base
+
+
+def test_lookup_orderby_redirects_to_marked_calendar_key():
+    # LOOKUP(-1) (previous mark) orders by Date[Date] under the redirect; OFFSET walks the axis.
+    dax = translate_tableau_table_calc_to_dax(
+        "LOOKUP(SUM([Sales]), -1)", _resolver, (), _ORDER,
+        order_resolver=_date_axis_order_resolver)[0]
+    assert dax == "CALCULATE(SUM('Orders'[Sales]), OFFSET(-(1), ORDERBY('Date'[Date], ASC)))"
+
+
+def test_table_calc_redirect_does_not_mask_real_cross_table():
+    # The redirect only exempts the addressing date dimension; a genuinely cross-table INNER (a
+    # People aggregate with Orders addressing) must still fall back.
+    dax, reason, _ = translate_tableau_table_calc_to_dax(
+        "RUNNING_SUM(SUM([People Count]))", _resolver, (), _ORDER,
+        order_resolver=_date_axis_order_resolver)
+    assert dax is None
+    assert "cross-table" in reason
+
+
+def test_percent_diff_orderby_redirects_to_marked_calendar_key():
+    # The percent-difference-from-prior seam honors the same redirect: ORDERBY Date[Date],
+    # PARTITIONBY the fact dim, inner aggregate on the fact -> stays single-table (reason == "ok").
+    dax, reason, _ = translate_percent_diff_to_dax(
+        "SUM([Sales])", _resolver, partition_by=_PART, order_by=_ORDER,
+        order_resolver=_date_axis_order_resolver)
+    assert reason == "ok"
+    assert "OFFSET(-1, ORDERBY('Date'[Date], ASC), PARTITIONBY('Orders'[Region]))" in dax
+    assert "Order_Date" not in dax  # the fact date column is fully replaced by the calendar key
+
+
+# --- g2: cross-calc references (a calc that references another calc by name) -------------------
+from calc_to_dax import translate_tableau_calc_to_dax_typed  # noqa: E402
+
+
+def test_cross_calc_reference_translates_with_measure_refs():
+    # [count orders] names another measure -> a DAX measure reference, so [count orders] + 100
+    # becomes a faithful measure expression instead of falling back.
+    refs = {"count orders": ("count orders", "number")}
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        "[count orders] + 100", _resolver, measure_refs=refs)
+    assert dax == "[count orders] + 100"
+    assert reason == "ok"
+
+
+def test_cross_calc_reference_without_map_falls_back():
+    # Default (no measure_refs) -> identical prior behavior: a bare field in a measure stubs.
+    dax, _reason, _ = translate_tableau_calc_to_dax("[count orders] + 100", _resolver)
+    assert dax is None
+
+
+def test_cross_calc_reference_keyed_by_internal_token():
+    # Tableau formulas often reference a calc by its internal Calculation_xxxx token; the map is
+    # keyed by that too, and resolves to the emitted measure's caption.
+    refs = {"calculation_0014172369248279": ("count orders", "number")}
+    dax, _reason, _ = translate_tableau_calc_to_dax(
+        "[Calculation_0014172369248279] + 100", _resolver, measure_refs=refs)
+    assert dax == "[count orders] + 100"
+
+
+def test_cross_calc_reference_text_measure_in_arithmetic_fails_closed():
+    # A text measure carried with its real dtype must NOT silently translate in a numeric context;
+    # the enclosing arithmetic stays fail-closed (the dtype propagates to the number guard).
+    refs = {"label": ("label", "text")}
+    dax, _reason, _ = translate_tableau_calc_to_dax(
+        "[label] + 100", _resolver, measure_refs=refs)
+    assert dax is None
+
+
+def test_cross_calc_reference_propagates_referenced_dtype():
+    # A numeric measure ref participates correctly in further arithmetic.
+    refs = {"base": ("base", "number")}
+    dax, _reason, _ = translate_tableau_calc_to_dax(
+        "([base] + 100) * 2", _resolver, measure_refs=refs)
+    assert dax == "([base] + 100) * 2"
+
+
+def test_typed_translation_returns_result_dtype():
+    # The typed entry point exposes the result dtype (used by _measures_part to chain references).
+    dax, reason, _tables, dtype = translate_tableau_calc_to_dax_typed("SUM([Sales])", _resolver)
+    assert dax == "SUM('Orders'[Sales])"
+    assert reason == "ok"
+    assert dtype == "number"
+
+
+# --- g1: object-model row identity COUNT -> COUNTROWS -------------------------
+_OID = "[__tableau_internal_object_id__].[Orders_ECFCA1FB690A41FE803BC071773BA862]"
+
+
+def test_object_id_count_to_countrows():
+    # COUNT over Tableau's internal row identity is COUNT(*) -> COUNTROWS('<table>').
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        f"COUNT({_OID})", _resolver, known_tables={"Orders"})
+    assert dax == "COUNTROWS('Orders')"
+    assert reason == "ok"
+    assert tables == {"Orders"}
+
+
+def test_object_id_count_zn_wraps_to_coalesce():
+    # The pilot's `count orders` = ZN(COUNT(<object-id>)) -> COALESCE(COUNTROWS('Orders'), 0).
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        f"ZN(COUNT({_OID}))", _resolver, known_tables={"Orders"})
+    assert dax == "COALESCE(COUNTROWS('Orders'), 0)"
+    assert reason == "ok"
+
+
+def test_object_id_countd_to_countrows():
+    # The object id is a per-row identity, so a distinct count is also the row count.
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        f"COUNTD({_OID})", _resolver, known_tables={"Orders"})
+    assert dax == "COUNTROWS('Orders')"
+    assert reason == "ok"
+
+
+def test_object_id_count_case_insensitive_known_table():
+    # The hash-stripped relation matches a known table case-insensitively (canonical case wins).
+    dax, _reason, tables = translate_tableau_calc_to_dax(
+        f"COUNT({_OID})", _resolver, known_tables={"orders"})
+    assert dax == "COUNTROWS('orders')"
+    assert tables == {"orders"}
+
+
+def test_object_id_count_unknown_table_falls_back():
+    # Not among the model's tables -> fall back; never emit COUNTROWS of a non-existent table.
+    f = "COUNT([__tableau_internal_object_id__].[Ghost_ECFCA1FB690A41FE803BC071773BA862])"
+    dax, _reason, _ = translate_tableau_calc_to_dax(f, _resolver, known_tables={"Orders"})
+    assert dax is None
+
+
+def test_object_id_count_no_known_tables_trusts_hash_strip():
+    # With no table list supplied, trust the hash-stripped relation token (the authoritative source
+    # relation name), mirroring the viz-side resolution.
+    dax, reason, _ = translate_tableau_calc_to_dax(f"COUNT({_OID})", _resolver)
+    assert dax == "COUNTROWS('Orders')"
+    assert reason == "ok"
+
+
+def test_object_id_count_addend_combines_with_scalar():
+    # alt #2 `COUNT([Orders]) + 100` over the object id -> COUNTROWS('Orders') + 100.
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        f"COUNT({_OID}) + 100", _resolver, known_tables={"Orders"})
+    assert dax == "COUNTROWS('Orders') + 100"
+    assert reason == "ok"
+
 
 
 def test_table_calc_unresolved_order_field_falls_back():
