@@ -547,6 +547,90 @@ def test_score_value_results():
     assert fo._score_value_results([], []) is None
 
 
+def test_normalize_expected_flat_and_rich():
+    flat = fo._normalize_expected({"Sales": 100.0})
+    assert flat == [{"label": "Sales", "measure": "Sales", "expected": 100.0, "filter": None}]
+    rich = fo._normalize_expected({
+        "Sales (US map)": {"measure": "Sales", "expected": 2026.0,
+                            "filter": "'Orders'[Country] = \"United States\""},
+        "Sales (all)": {"value": 2326.0},  # measure defaults to label, 'value' aliases 'expected'
+    })
+    by_label = {c["label"]: c for c in rich}
+    assert by_label["Sales (US map)"]["measure"] == "Sales"
+    assert "United States" in by_label["Sales (US map)"]["filter"]
+    assert by_label["Sales (all)"]["measure"] == "Sales (all)"
+    assert by_label["Sales (all)"]["expected"] == 2326.0
+    assert by_label["Sales (all)"]["filter"] is None
+
+
+class _FakeReader:
+    def __init__(self, rows):
+        self._rows, self._i = rows, -1
+
+    def Read(self):
+        self._i += 1
+        return self._i < len(self._rows)
+
+    def GetValue(self, i):
+        return self._rows[self._i][i]
+
+    def Close(self):
+        pass
+
+
+class _FakeCmd:
+    def __init__(self, sink):
+        self._sink, self.CommandText = sink, None
+
+    def ExecuteReader(self):
+        self._sink["query"] = self.CommandText
+        return _FakeReader([[123.0]])
+
+
+class _FakeConn:
+    def __init__(self):
+        self.sink = {}
+
+    def CreateCommand(self):
+        return _FakeCmd(self.sink)
+
+    def Close(self):
+        pass
+
+
+def test_evaluate_measure_wraps_filter_in_calculate():
+    conn = _FakeConn()
+    plain = fo._evaluate_measure(conn, "Sales")
+    assert conn.sink["query"] == 'EVALUATE ROW("v", [Sales])'
+    assert plain["ok"] is True and plain["value"] == 123.0
+    filtered = fo._evaluate_measure(conn, "Sales", "'Orders'[Country] = \"United States\"")
+    assert "CALCULATE([Sales]" in conn.sink["query"]
+    assert "United States" in conn.sink["query"]
+    assert filtered["ok"] is True and filtered["value"] == 123.0
+
+
+def test_image_tier_regions_breakdown(tmp_path):
+    np = pytest.importorskip("numpy")
+    Image = pytest.importorskip("PIL.Image")
+    # A tall image whose top half differs from the bottom between ref and candidate.
+    top = np.tile(np.linspace(0, 255, 60).astype("uint8"), (60, 1))
+    ref = np.vstack([top, top])
+    cand = np.vstack([top, 255 - top])  # bottom half inverted in the candidate
+    p1, p2 = tmp_path / "r.png", tmp_path / "c.png"
+    Image.fromarray(ref).save(str(p1))
+    Image.fromarray(cand).save(str(p2))
+    regions = [
+        {"name": "top", "ref": (0.0, 0.0, 1.0, 0.5)},
+        {"name": "bottom", "ref": (0.0, 0.5, 1.0, 1.0)},
+    ]
+    out = fo.image_tier(str(p1), str(p2), regions=regions)
+    assert out["available"] is True
+    zones = {z["name"]: z for z in out["regions"]}
+    assert zones["top"]["ssim"] > zones["bottom"]["ssim"]  # top matches, bottom diverges
+    assert out["regions_mean_ssim"] == pytest.approx(
+        round((zones["top"]["ssim"] + zones["bottom"]["ssim"]) / 2, 4))
+
+
 def test_dax_value_tier_unavailable_degrades(tmp_path):
     # No workspace roots + no explicit port -> a structured unavailable record, never a raise
     # (ADOMD/pythonnet missing on CI, or no live instance on a host both land here).

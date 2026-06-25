@@ -1175,10 +1175,19 @@ def _adomd_rows(conn, query, columns):
     return rows
 
 
-def _evaluate_measure(conn, measure_name):
-    """Evaluate one model measure to a scalar via ``EVALUATE ROW``; capture errors, never raise."""
+def _evaluate_measure(conn, measure_name, filter_expr=None):
+    """Evaluate one model measure to a scalar via ``EVALUATE ROW``; capture errors, never raise.
+
+    ``filter_expr`` (optional, caller-supplied DAX) wraps the measure in ``CALCULATE`` so the value
+    is evaluated under a specific *view* filter context -- e.g. ``'Orders'[Country] = "United
+    States"`` to reproduce a worksheet that is US-filtered while others are not. This is what lets
+    the tier catch a per-view filter-scope mismatch that a model-level total would hide.
+    """
     safe = str(measure_name).replace("]", "]]")
-    dax = 'EVALUATE ROW("v", [%s])' % safe
+    if filter_expr:
+        dax = 'EVALUATE ROW("v", CALCULATE([%s], %s))' % (safe, filter_expr)
+    else:
+        dax = 'EVALUATE ROW("v", [%s])' % safe
     try:
         rows = _adomd_rows(conn, dax, ["v"])
         return {"measure": measure_name, "ok": True,
@@ -1186,6 +1195,33 @@ def _evaluate_measure(conn, measure_name):
     except Exception as exc:  # noqa: BLE001 -- a failed evaluation is itself a fidelity signal
         return {"measure": measure_name, "ok": False, "value": None,
                 "error": str(exc).strip()[:200]}
+
+
+def _normalize_expected(expected):
+    """Normalize an ``expected`` map into a list of value checks.
+
+    Supports two shapes (mixable in one map):
+
+    * **flat** ``{measure_name: expected_value}`` -- a model-level check (no filter context).
+    * **rich** ``{label: {"measure": name, "expected": value, "filter": dax}}`` -- a per-view check
+      whose ``filter`` (caller-supplied DAX) reproduces that view's filter context. ``measure``
+      defaults to ``label``; ``value`` is accepted as an alias for ``expected``.
+
+    The rich form is what models "Sales on the US-only map vs Sales on the Canada-inclusive KPIs":
+    the same measure, two checks, two filter contexts, two expected values.
+    """
+    checks = []
+    for key, val in (expected or {}).items():
+        if isinstance(val, dict):
+            checks.append({
+                "label": val.get("label") or key,
+                "measure": val.get("measure") or key,
+                "expected": val.get("expected", val.get("value")),
+                "filter": val.get("filter"),
+            })
+        else:
+            checks.append({"label": key, "measure": key, "expected": val, "filter": None})
+    return checks
 
 
 def _compare_value(name, expected, actual, tolerance=DEFAULT_VALUE_TOLERANCE):
@@ -1287,15 +1323,21 @@ def dax_value_tier(report_dir=None, host="localhost", port=None, expected=None,
                 model_measures.append(m)
         target = list(measures) if measures else model_measures
         results = [_evaluate_measure(conn, m) for m in target]
+        comparisons = []
+        if expected:
+            for chk in _normalize_expected(expected):
+                ev = _evaluate_measure(conn, chk["measure"], chk.get("filter"))
+                actual = ev["value"] if ev["ok"] else None
+                cmp = _compare_value(chk["label"], chk["expected"], actual, tolerance)
+                if chk["measure"] != chk["label"]:
+                    cmp["measure_name"] = chk["measure"]
+                if chk.get("filter"):
+                    cmp["filter"] = chk["filter"]
+                if not ev["ok"]:
+                    cmp["note"] = "evaluation error: %s" % ((ev["error"] or "")[:160])
+                comparisons.append(cmp)
     finally:
         conn.Close()
-
-    comparisons = []
-    if expected:
-        by_name = {r["measure"]: r for r in results}
-        for name, exp in expected.items():
-            actual = by_name.get(name, {}).get("value") if by_name.get(name, {}).get("ok") else None
-            comparisons.append(_compare_value(name, exp, actual, tolerance))
 
     value_score = _score_value_results(results, comparisons)
     n = len(results)
@@ -1318,6 +1360,8 @@ def dax_value_tier(report_dir=None, host="localhost", port=None, expected=None,
             "a relative-tolerance band, not equality.",
             "value_score = fraction of expected values that agree within tolerance, or (without "
             "expected values) the fraction of measures that evaluate without error.",
+            "expected values may carry a per-view 'filter' (DAX) so a measure is checked under that "
+            "view's filter context -- e.g. a US-only map vs Canada-inclusive KPIs on the same model.",
         ],
     }
 
@@ -1379,7 +1423,45 @@ def _load_gray(np, Image, path, shape=None):
     return np.asarray(im)
 
 
-def image_tier(reference_png=None, candidate_png=None, acceptance_threshold=None):
+def _crop_fractional(pil_im, box):
+    """Crop a PIL image by a fractional ``(x0, y0, x1, y1)`` box (each in ``[0, 1]``)."""
+    w, h = pil_im.size
+    x0, y0, x1, y1 = box
+    x0 = min(max(x0, 0.0), 1.0)
+    y0 = min(max(y0, 0.0), 1.0)
+    x1 = min(max(x1, 0.0), 1.0)
+    y1 = min(max(y1, 0.0), 1.0)
+    px0, py0 = int(x0 * w), int(y0 * h)
+    px1, py1 = max(px0 + 1, int(x1 * w)), max(py0 + 1, int(y1 * h))
+    return pil_im.crop((px0, py0, px1, py1))
+
+
+def _score_regions(np, Image, reference_png, candidate_png, regions, threshold):
+    """Per-zone SSIM for a list of fractional crop regions.
+
+    Each region is ``{"name", "ref": (x0,y0,x1,y1)[, "cand": (x0,y0,x1,y1)]}`` with fractional
+    boxes; ``cand`` defaults to ``ref``. This localizes *where* two composite renders (e.g. a
+    multi-worksheet dashboard) agree or diverge, rather than collapsing everything into one number.
+    """
+    ref_pil = Image.open(reference_png).convert("L")
+    cand_pil = Image.open(candidate_png).convert("L")
+    out = []
+    for reg in regions or []:
+        rbox = reg.get("ref") or reg.get("box")
+        if not rbox:
+            continue
+        cbox = reg.get("cand") or rbox
+        rc = _crop_fractional(ref_pil, rbox)
+        cc = _crop_fractional(cand_pil, cbox).resize(rc.size)
+        a = np.asarray(rc, dtype="float64")
+        b = np.asarray(cc, dtype="float64")
+        s = _ssim(np, a, b)
+        out.append({"name": reg.get("name") or "region", "ssim": round(s, 4),
+                    "band": _image_band(s), "meets_target": bool(s >= threshold)})
+    return out
+
+
+def image_tier(reference_png=None, candidate_png=None, acceptance_threshold=None, regions=None):
     """Optional Tier-3: tolerance-banded perceptual (SSIM) similarity of a Tableau reference PNG and
     a Power BI render PNG.
 
@@ -1389,6 +1471,10 @@ def image_tier(reference_png=None, candidate_png=None, acceptance_threshold=None
 
     ``acceptance_threshold`` is the advisory SSIM floor a faithful rebuild is expected to clear
     (default :data:`DEFAULT_ACCEPTANCE_SSIM`); the result reports ``meets_target`` against it.
+
+    ``regions`` (optional) is a list of fractional crop boxes (see :func:`_score_regions`); when
+    given, a per-zone SSIM breakdown + ``regions_mean_ssim`` is attached, which localizes divergence
+    in a composite render far better than a single whole-image number.
     """
     threshold = DEFAULT_ACCEPTANCE_SSIM if acceptance_threshold is None else float(acceptance_threshold)
     if not reference_png or not candidate_png:
@@ -1406,7 +1492,7 @@ def image_tier(reference_png=None, candidate_png=None, acceptance_threshold=None
     ref = _load_gray(np, Image, reference_png)
     cand = _load_gray(np, Image, candidate_png, shape=ref.shape)
     score = _ssim(np, ref, cand)
-    return {
+    result = {
         "tier": "image",
         "available": True,
         "ssim": round(score, 4),
@@ -1422,6 +1508,13 @@ def image_tier(reference_png=None, candidate_png=None, acceptance_threshold=None
             "rebuild is expected to clear it." % threshold,
         ],
     }
+    if regions:
+        zone_scores = _score_regions(np, Image, reference_png, candidate_png, regions, threshold)
+        if zone_scores:
+            result["regions"] = zone_scores
+            result["regions_mean_ssim"] = round(
+                sum(z["ssim"] for z in zone_scores) / len(zone_scores), 4)
+    return result
 
 
 # =====================================================================================
@@ -1505,6 +1598,14 @@ def render_markdown(report):
                 verdict = "MEETS target" if img.get("meets_target") else "BELOW target"
                 lines.append("- **Acceptance floor:** %s -> %s" %
                              (img.get("acceptance_threshold"), verdict))
+            if img.get("regions"):
+                lines.append("- **Per-zone SSIM:**")
+                for z in img["regions"]:
+                    flag = "meets" if z.get("meets_target") else "below"
+                    lines.append("  - %s: %s (%s, %s target)" %
+                                 (z.get("name"), z.get("ssim"), z.get("band"), flag))
+                if img.get("regions_mean_ssim") is not None:
+                    lines.append("  - _zone mean:_ %s" % img.get("regions_mean_ssim"))
     lines.append("")
     for note in report["notes"]:
         lines.append("> %s" % note)

@@ -138,12 +138,21 @@ packages are absent — importing the module never fails offline.
   workspace port (asks for an explicit `--dax-port` when several instances are live), filters
   internal/hidden measures, and — given an `--expected` `{measure: value}` map — reports the
   fraction of measures within tolerance (else the fraction that evaluate without error; an
-  *erroring* measure is itself a fidelity defect the structural tier cannot see).
+  *erroring* measure is itself a fidelity defect the structural tier cannot see). An expected entry
+  may also be **per‑view**: `{label: {measure, expected, filter}}`, where `filter` is caller‑DAX
+  that reproduces a worksheet's filter context (e.g. `'Orders'[Country] = "United States"`). This
+  is what catches a **filter‑scope mismatch** — a Tableau dashboard whose *map* is US‑only while its
+  KPIs/bars include Canada, rebuilt with the filter applied too broadly, shows a few‑percent value
+  drift the model‑level total would hide.
 - **Tier 3 — image** (`image_tier`): tolerance‑banded *perceptual* similarity of a Tableau
   reference PNG and a PBI render PNG (SSIM via optional numpy/Pillow). Cross‑engine literal
   pixel‑equality is impossible, so this tier reports a similarity **band**, never pass/fail.
   It also compares SSIM against an advisory **acceptance floor** (`--image-threshold`, default
   `0.80`) and emits a `meets_target` verdict — a faithful rebuild is expected to clear it.
+  Passing `regions` (fractional crop boxes per zone) adds a **per‑zone SSIM breakdown** +
+  `regions_mean_ssim`, which localizes *where* a composite render diverges instead of collapsing it
+  into one number (on a real pilot pair: map `0.77`, KPI `0.68`, but sorted/grouped bars `0.48` and
+  an area→line time‑series `0.48`).
 
 ```powershell
 # optional tiers — DAX-value (needs a live Power BI Desktop) and image (needs numpy + Pillow)
