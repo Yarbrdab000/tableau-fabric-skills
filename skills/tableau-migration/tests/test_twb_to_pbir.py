@@ -3423,6 +3423,141 @@ def test_categorical_colour_legend_is_not_a_gradient():
     assert ir["worksheets"][0]["color_gradient"] is None
 
 
+# -- categorical mark colours (explicit author member -> hex palette) ----------
+# An explicit per-member colour map (``<map to='#hex'><bucket>"Member"</bucket></map>``) is
+# unambiguous author intent. On the discrete categorical charts (column / bar / pie / donut) it
+# becomes a PBIR ``visual.objects.dataPoint`` per-member ``fill`` targeted by a ``scopeId`` data
+# selector. WARN-NEVER-WRONG: a palette on an unsupported visual type, or whose coloured dimension
+# is not projected, defers (no dataPoint, a warning, the raw palette kept on the candidate record).
+def _palette_style(field_token, members):
+    # members: list of (member_value, hex); a string bucket is wrapped in literal double quotes.
+    maps = "".join(
+        "<map to='{0}'><bucket>&quot;{1}&quot;</bucket></map>".format(hexv, val)
+        for val, hexv in members)
+    return ("<style><style-rule element='mark'>"
+            "<encoding attr='color' type='palette' field='{0}'>{1}</encoding>"
+            "</style-rule></style>".format(field_token, maps))
+
+
+def _data_point_objects(visual_json):
+    return visual_json["visual"].get("objects", {}).get("dataPoint")
+
+
+def _mc_fact(records, worksheet):
+    rec = next(r for r in records if r["worksheet"] == worksheet)
+    return rec.get("mark_colors")
+
+
+_REGION_PALETTE = [("Central", "#4e79a7"), ("West", "#76b7b2"), ("South", "#e15759")]
+
+
+def _stacked_palette_ws(name="Stacked"):
+    enc = "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings>"
+    return _worksheet(name, "Bar",
+                      rows="[federated.abc].[sum:Sales:qk]",
+                      cols="[federated.abc].[none:Category:nk]",
+                      deps_extra=_INST, encodings=enc,
+                      style=_palette_style("[federated.abc].[none:Region:nk]", _REGION_PALETTE))
+
+
+def test_categorical_palette_parsed_into_ir():
+    ir = parse_twb(_workbook(_stacked_palette_ws()))
+    mc = ir["worksheets"][0]["mark_colors"]
+    assert mc is not None
+    # author order is preserved; each member carries its explicit hex
+    assert [(m["value"], m["color"]) for m in mc["members"]] == _REGION_PALETTE
+    assert "Region" in mc["field_token"]
+
+
+def test_categorical_palette_emits_datapoint_fills_with_scope_selectors():
+    parts = emit_pbir(parse_twb(_workbook(_stacked_palette_ws())))
+    vj = list(_visual_parts(parts).values())[0]
+    assert vj["visual"]["visualType"] == "stackedColumnChart"
+    dp = _data_point_objects(vj)
+    assert dp and len(dp) == len(_REGION_PALETTE)
+    series_field = _query_state(vj)["Series"]["projections"][0]["field"]
+    for entry, (member, hexv) in zip(dp, _REGION_PALETTE):
+        fill = entry["properties"]["fill"]["solid"]["color"]["expr"]["Literal"]["Value"]
+        assert fill == "'{0}'".format(hexv)
+        comp = entry["selector"]["data"][0]["scopeId"]["Comparison"]
+        assert comp["ComparisonKind"] == 0                 # Equal
+        assert comp["Left"] == series_field                # reuse the projected column expr
+        assert comp["Right"]["Literal"]["Value"] == "'{0}'".format(member)
+
+
+def test_categorical_palette_fact_recorded_emitted():
+    res = migrate_twb_to_pbir(_workbook(_stacked_palette_ws()))
+    fact = _mc_fact(res["candidate_records"], "Stacked")
+    assert fact["status"] == "emitted"
+    assert fact["kind"] == "categorical_palette"
+    assert [(m["value"], m["color"]) for m in fact["members"]] == _REGION_PALETTE
+
+
+def test_categorical_palette_on_line_defers_with_palette_preserved():
+    # Line / area charts colour a continuous series; an explicit dataPoint override can drop the
+    # line, so the palette defers (theme colours kept) with the raw palette preserved on the record.
+    enc = "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings>"
+    ws = _worksheet("Trend", "Line",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[mn:Order Date:ok]",
+                    deps_extra=_INST, encodings=enc,
+                    style=_palette_style("[federated.abc].[none:Region:nk]", _REGION_PALETTE))
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert vj["visual"]["visualType"] == "lineChart"
+    assert _data_point_objects(vj) is None
+    fact = _mc_fact(res["candidate_records"], "Trend")
+    assert fact["status"] == "deferred"
+    assert [(m["value"], m["color"]) for m in fact["members"]] == _REGION_PALETTE
+    assert any("categorical mark colours deferred" in w["reason"] for w in res["warnings"])
+
+
+def test_categorical_palette_unprojected_dimension_defers():
+    # The style palette names Region, but no colour pill is on the marks card, so Region is not a
+    # projection -> the per-member selector could not resolve -> defer (no dataPoint).
+    ws = _worksheet("Plain Cols", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST,
+                    style=_palette_style("[federated.abc].[none:Region:nk]", _REGION_PALETTE))
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _data_point_objects(vj) is None
+    fact = _mc_fact(res["candidate_records"], "Plain Cols")
+    assert fact["status"] == "deferred"
+    assert "not bound" in fact["reason"]
+
+
+def test_chart_without_palette_emits_no_datapoint():
+    # Additivity: a stacked column with a colour legend but NO explicit palette carries neither a
+    # dataPoint object nor a mark_colors fact -- the report is byte-unchanged from before.
+    enc = "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings>"
+    ws = _worksheet("Stacked", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, encodings=enc)
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _data_point_objects(vj) is None
+    assert _mc_fact(res["candidate_records"], "Stacked") is None
+
+
+def test_single_default_mark_color_is_not_emitted():
+    # A bare single ``mark-color`` is Tableau's default fill (written even when the author chose
+    # nothing); it is deliberately NOT turned into a defaultColor -- only an explicit member map is.
+    style = ("<style><style-rule element='mark'><format attr='mark-color' value='#b4b4b4' />"
+             "</style-rule></style>")
+    enc = "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings>"
+    ws = _worksheet("Stacked", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, encodings=enc, style=style)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["mark_colors"] is None
+    vj = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert _data_point_objects(vj) is None
+
+
 # -- cross-layer measure binding (model<->viz contract consumer) ---------------
 # The datasource-migration (model) build hands back a token-keyed calc->measure manifest; the
 # dashboard (viz) build rebinds the matching workbook-local / quick-table-calc pills to those real

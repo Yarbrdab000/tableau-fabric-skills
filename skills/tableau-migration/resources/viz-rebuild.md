@@ -258,8 +258,29 @@ the rebuild emits the visual **without** a fill, raises a `background colour sca
 warning, and preserves the raw palette (colours + centre) on the candidate record's
 `conditional_format` fact (`status: "deferred"`) for a later binding pass. This is intentional:
 colouring by a mis-resolved base field would be confidently wrong. Only the background colour
-scale is handled here — discrete colour legends, font colour, data bars, icons, and palette
-styling remain Tier-2.
+scale is handled here — font colour, data bars, icons, and gradient palette styling remain Tier-2.
+
+### Categorical mark colours (explicit author member → hex palette)
+
+When the author has explicitly assigned a colour to each member of a colour-legend **dimension**
+(the mark colour encoding carries `<map to="#hex"><bucket>"Member"</bucket></map>` entries rather
+than a continuous `<color-palette>`), that map is reproduced as per-member data colours on
+`visual.objects.dataPoint`. Each entry is a `fill` (a single-quoted hex literal) targeted by a
+**scope-identity selector** — `selector.data[0].scopeId.Comparison` with `ComparisonKind: 0`
+(Equal), `Left` = the coloured column's exact projected expression, and `Right` = the member value
+literal. Tableau author order is preserved, and unmapped members keep their Power BI theme colour.
+A bare single `mark-color` (Tableau writes one even when the author chose nothing) is **not**
+reproduced — only an explicit member map is treated as author intent.
+
+**Warn-never-wrong.** Per-member fills are emitted **only** on the discrete categorical chart types
+where they render safely (`column`, `bar`, `pie`, `donut`) **and** when the coloured dimension is
+actually projected in that visual (so the selector's column resolves). On any other visual type
+(notably `line` / `area`, where an explicit `dataPoint` override can drop the series) or when the
+coloured dimension is not bound, the visual emits with **theme** colours, a
+`categorical mark colours deferred …` warning names the reason, and the raw palette is preserved on
+the candidate record's `mark_colors` fact (`status: "deferred"`) for a later pass. The per-member
+scope-identity selector shape is grounded in the Power BI report formatting reference (the
+convention/grounding model); the mapping is original work (see *Clean-room methodology*).
 
 ## Binding contract (matches the v1 model exactly)
 
