@@ -77,6 +77,13 @@ BANDS = (
     (0.0, "divergent"),       # materially different -- likely a real rebuild gap
 )
 
+# Combined cross-tier fidelity: an advisory headline that fuses the tiers that actually ran.
+# Structural leads (least engine-coupled, always available); value and image add the two things
+# structural is blind to (computed numbers; mark-type/layout). Weights are renormalized over only
+# the tiers present, so the headline is comparable whether one tier ran or all three -- while a
+# separate ``confidence`` flag records how much evidence backs it.
+COMBINED_WEIGHTS = {"structural": 0.5, "value": 0.3, "image": 0.2}
+
 
 # -- chart-type families -------------------------------------------------------
 # A small, coarse family enum. Bar and column collapse into one family (orientation is a sub-detail
@@ -1566,6 +1573,49 @@ def image_tier(reference_png=None, candidate_png=None, acceptance_threshold=None
 # =====================================================================================
 # Top-level convenience + CLI
 # =====================================================================================
+def _combined_fidelity(report):
+    """Fuse the tiers that actually ran into one advisory headline + a confidence flag.
+
+    Pulls the structural aggregate, the DAX-value ``value_score``, and the image SSIM (preferring
+    the per-zone ``regions_mean_ssim`` when present) -- using only those that are available -- then
+    blends them with :data:`COMBINED_WEIGHTS` renormalized over the contributing tiers. ``confidence``
+    is ``high``/``medium``/``low`` for 3/2/1 tiers. Advisory only: this is a headline for triage, not
+    a gate, and it does not assume the tiers agree (that divergence is itself the useful signal).
+    Returns ``None`` when not even the structural score is available.
+    """
+    tiers = {}
+    struct = (report.get("summary") or {}).get("aggregate_score")
+    if struct is not None:
+        tiers["structural"] = float(struct)
+    dax = report.get("dax_value")
+    if dax and dax.get("available") and dax.get("value_score") is not None:
+        tiers["value"] = float(dax["value_score"])
+    img = report.get("image")
+    if img and img.get("available"):
+        iscore = img.get("regions_mean_ssim")
+        if iscore is None:
+            iscore = img.get("ssim")
+        if iscore is not None:
+            tiers["image"] = float(iscore)
+    if not tiers:
+        return None
+    wsum = sum(COMBINED_WEIGHTS[k] for k in tiers)
+    combined = sum(COMBINED_WEIGHTS[k] * v for k, v in tiers.items()) / wsum if wsum else None
+    confidence = {3: "high", 2: "medium", 1: "low"}.get(len(tiers), "low")
+    return {
+        "combined_score": round(combined, 4) if combined is not None else None,
+        "band": _band(combined) if combined is not None else None,
+        "confidence": confidence,
+        "contributing_tiers": sorted(tiers),
+        "tier_scores": {k: round(v, 4) for k, v in tiers.items()},
+        "weights": {k: COMBINED_WEIGHTS[k] for k in tiers},
+        "advisory": True,
+        "note": ("Advisory headline fusing the tiers that ran (weights renormalized over those "
+                 "present); confidence reflects how many tiers backed it, not their mutual "
+                 "agreement -- a low image score pulling the headline down IS the signal."),
+    }
+
+
 def run_oracle(twb_path, report_dir, engine_report_path=None,
                dax_options=None, image_options=None):
     """Read both sides and score them. Returns the advisory report dict.
@@ -1593,6 +1643,9 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
             if derived:
                 opts["regions"] = derived
         report["image"] = image_tier(**opts)
+    combined = _combined_fidelity(report)
+    if combined is not None:
+        report["combined_fidelity"] = combined
     return report
 
 
@@ -1600,6 +1653,11 @@ def render_markdown(report):
     """Render the advisory report as a compact Markdown summary."""
     s = report["summary"]
     lines = ["# Fidelity Oracle (advisory, structural)", ""]
+    cf = report.get("combined_fidelity")
+    if cf is not None:
+        lines.append("- **Combined fidelity:** %s (%s) — confidence %s [%s]" % (
+            cf["combined_score"], cf["band"], cf["confidence"],
+            ", ".join(cf["contributing_tiers"])))
     lines.append("- **Aggregate:** %s (%s)" % (
         s["aggregate_score"], s["aggregate_band"]))
     lines.append("- **Mean / worst visual:** %s / %s" % (

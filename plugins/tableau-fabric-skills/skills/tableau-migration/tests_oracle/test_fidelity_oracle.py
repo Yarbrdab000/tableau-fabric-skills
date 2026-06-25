@@ -785,3 +785,53 @@ def test_run_oracle_auto_regions_injects_image_regions(tmp_path):
     assert zones["Bars"]["ssim"] > zones["Trend"]["ssim"]
 
 
+def test_combined_fidelity_structural_only_low_confidence():
+    report = {"summary": {"aggregate_score": 0.868}}
+    cf = fo._combined_fidelity(report)
+    assert cf["combined_score"] == pytest.approx(0.868)
+    assert cf["confidence"] == "low"
+    assert cf["contributing_tiers"] == ["structural"]
+
+
+def test_combined_fidelity_fuses_all_three_tiers():
+    report = {
+        "summary": {"aggregate_score": 0.9},
+        "dax_value": {"available": True, "value_score": 0.8},
+        "image": {"available": True, "ssim": 0.6},
+    }
+    cf = fo._combined_fidelity(report)
+    # 0.9*0.5 + 0.8*0.3 + 0.6*0.2 over a full weight sum of 1.0
+    assert cf["combined_score"] == pytest.approx(0.81)
+    assert cf["confidence"] == "high"
+    assert cf["contributing_tiers"] == ["image", "structural", "value"]
+
+
+def test_combined_fidelity_prefers_regions_mean_and_renormalizes():
+    # Two tiers (structural + image) -> weights renormalized over 0.5 + 0.2; regions_mean wins.
+    report = {
+        "summary": {"aggregate_score": 0.9},
+        "image": {"available": True, "ssim": 0.99, "regions_mean_ssim": 0.6},
+    }
+    cf = fo._combined_fidelity(report)
+    assert cf["tier_scores"]["image"] == pytest.approx(0.6)  # regions_mean preferred over ssim
+    assert cf["combined_score"] == pytest.approx(round((0.9 * 0.5 + 0.6 * 0.2) / 0.7, 4))
+    assert cf["confidence"] == "medium"
+
+
+def test_combined_fidelity_none_without_structural():
+    assert fo._combined_fidelity({"summary": {"aggregate_score": None}}) is None
+    assert fo._combined_fidelity({}) is None
+
+
+def test_run_oracle_attaches_combined_fidelity(tmp_path):
+    report = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    twb_path = tmp_path / "wb.twb"
+    twb_path.write_text(TWB_XML, encoding="utf-8")
+    result = fo.run_oracle(str(twb_path), report)
+    cf = result["combined_fidelity"]
+    # Structural-only run: combined == aggregate, confidence low, headline rendered in markdown.
+    assert cf["combined_score"] == pytest.approx(result["summary"]["aggregate_score"])
+    assert cf["confidence"] == "low"
+    assert "Combined fidelity" in fo.render_markdown(result)
+
+

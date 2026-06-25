@@ -158,6 +158,17 @@ packages are absent — importing the module never fails offline.
   *candidate* crop, so each render is cropped by *its own* layout and the per‑zone SSIM is keyed by
   worksheet name with no manual tuning.
 
+### Combined cross‑tier fidelity (advisory headline)
+
+When more than one tier runs, the report also carries a `combined_fidelity` block: a single advisory
+headline that fuses the **structural** aggregate (weight `0.5`), the DAX **value** score (`0.3`), and
+the **image** SSIM (`0.2`, preferring the per‑zone `regions_mean_ssim` when present). Weights are
+**renormalized over only the tiers that actually ran**, so the headline is comparable whether one
+tier or all three contributed — while a separate **`confidence`** flag (`high`/`medium`/`low` for
+`3`/`2`/`1` tiers) records how much evidence backs it. It is explicitly a triage number, *not* a
+gate: a low image score pulling the headline beneath a high structural score is the useful signal,
+not an error.
+
 ```powershell
 # optional tiers — DAX-value (needs a live Power BI Desktop) and image (needs numpy + Pillow)
 py -3.11 scripts\fidelity_oracle.py `
