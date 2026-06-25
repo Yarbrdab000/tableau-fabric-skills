@@ -301,6 +301,35 @@ visual keeps its default label visibility, a `data labels deferred …` warning 
 raw values are preserved on the candidate record's `data_labels` fact (`status: "deferred"`). Only
 show/hide is set; label detail (culling, which value, placement) stays Tier-2.
 
+### Legend (show/hide + position)
+
+Whether a worksheet's colour legend is **shown on a dashboard** is a dashboard-scoped fact: Tableau
+writes a `<zone type='color' name='<worksheet>'>` (with `x/y/w/h` in the dashboard's 0–100000
+coordinate space) only when the author placed that colour legend on the dashboard. A worksheet's own
+`<cards>` always carry a `<card type='color'>` when colour is used, but that card is *not* the
+placement signal — only the dashboard `<zone>` is. `_parse_dashboard` captures those colour zones
+additively (`legend_zones`); the standalone (non-dashboard) page path is untouched, because a
+worksheet rendered on its own always shows its legend, which is also Power BI's default.
+
+The legend show/position is reproduced on the PBIR data-plane `visual.objects.legend` — `show` (a
+quoted-string boolean) and `position` (a single-quoted enum: `'Right'`/`'Left'`/`'Top'`/`'Bottom'`),
+applied uniformly (the formatting reference lists `legend` as a visual-wide object — no selector).
+
+**Warn-never-wrong.** A legend object is considered **only** for cartesian/part-to-whole types that
+carry a categorical colour **series** (`column`/`bar`/`line`/`area`/`pie`/`donut`/`scatter`/`combo`/
+`ribbon` with a `category` colour encoding); a continuous colour ramp, or a matrix / table / card /
+map, produces no legend object (its colour legend is a Tier-2 gradient concern). Within that set:
+(1) a **present** colour zone whose geometry clears exactly one side of its worksheet zone (5%
+tolerance) emits `show: true` + that `position` (`status: "emitted"`); (2) a **present** zone whose
+geometry is ambiguous (overlap / corner — zero or two-plus sides qualify) emits **no** object and a
+`legend position deferred` note (`status: "position_deferred"`), leaving Power BI's default position
+rather than guessing; (3) a categorical-colour worksheet **placed on a dashboard with no colour zone
+for it** means the author did not show that legend on the dashboard, so `show: false` is emitted
+(`status: "hidden"`) to match what the dashboard renders. Side geometry is read from the **raw**
+(pre-scale) zone coordinates so the worksheet and its legend share one space. Each decision is
+recorded on the candidate record's additive `legend` fact. Only show/position is set; legend
+title, font, and swatch styling stay Tier-2.
+
 ## Binding contract (matches the v1 model exactly)
 
 The `.twb` embeds the full datasource (`<relation>` + `<metadata-records>`), so bindings are

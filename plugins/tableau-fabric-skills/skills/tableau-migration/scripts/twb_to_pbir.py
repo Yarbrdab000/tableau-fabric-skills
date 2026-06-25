@@ -2102,6 +2102,7 @@ def _parse_dashboard(db, worksheet_names, warnings):
 
     zones = []
     param_controls = []
+    legend_zones = []
     seen_params = set()
     ext_w = ext_h = 0.0
     for zone in _findall_local(db, "zone"):
@@ -2129,6 +2130,12 @@ def _parse_dashboard(db, worksheet_names, warnings):
         zname = zone.get("name")
         if not zname or zname not in worksheet_names:
             continue
+        # A colour-legend decoration zone (``type='color'``) names the worksheet whose colour Series
+        # it legends; capture its geometry so the report can faithfully reproduce legend show/position
+        # (a present zone = the legend is shown at that side; an absent one = the author hid it).
+        if ztype == "color" and None not in (x, y, w, h) and w > 0 and h > 0:
+            legend_zones.append({"worksheet": zname, "x": x, "y": y, "w": w, "h": h})
+            continue
         # worksheet zones carry no decoration type (legends/filters/titles do)
         if ztype:
             continue
@@ -2138,7 +2145,7 @@ def _parse_dashboard(db, worksheet_names, warnings):
 
     return {"name": name, "size": size,
             "extent": {"w": ext_w or None, "h": ext_h or None}, "zones": zones,
-            "param_controls": param_controls}
+            "param_controls": param_controls, "legend_zones": legend_zones}
 
 
 def _warn(scope, name, reason):
@@ -3243,9 +3250,81 @@ def _data_labels(ws, vtype, warnings):
     return None, fact
 
 
+# Legend (Tableau dashboard colour-legend zone) -> the PBIR data-plane ``visual.objects.legend``
+# ``show`` / ``position`` properties, applied uniformly (the Power BI formatting reference lists
+# ``legend`` as a visual-wide object with no selector). The signal is dashboard-scoped: Tableau
+# writes a ``<zone type='color' name='<worksheet>'>`` for each SHOWN colour-Series legend, so a
+# present zone reproduces the legend's side (Right/Left/Top/Bottom) and an absent one (for a
+# worksheet that DOES carry a categorical colour Series) means the author hid the legend. Legend
+# styling (font / title text / marker rendering) is a deeper Tier-2 concern.
+_LEGEND_TYPES = (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA, VT_PIE, VT_DONUT, VT_SCATTER,
+                 VT_COMBO, VT_RIBBON)
+
+
+def _has_color_series(ws):
+    """A worksheet carries a categorical colour Series (the thing a legend legends) when its colour
+    encoding is a dimension (``kind == "category"``)."""
+    color = ws["encodings"].get("color")
+    return color is not None and color.get("kind") == "category"
+
+
+def _legend_side(ws_zone, lz):
+    """Return ``'Right'``/``'Left'``/``'Bottom'``/``'Top'`` when the legend zone ``lz`` sits clearly
+    on exactly ONE side of its worksheet's zone ``ws_zone`` (same Tableau coordinate space), else
+    ``None`` (the legend overlaps the chart or straddles a corner -- too ambiguous to map to a single
+    Power BI position enum, so the position is deferred to Power BI's default)."""
+    wx, wy, ww, wh = ws_zone["x"], ws_zone["y"], ws_zone["w"], ws_zone["h"]
+    lx, ly, lw, lh = lz["x"], lz["y"], lz["w"], lz["h"]
+    htol, vtol = ww * 0.05, wh * 0.05
+    sides = []
+    if lx >= wx + ww - htol:
+        sides.append("Right")
+    if lx + lw <= wx + htol:
+        sides.append("Left")
+    if ly >= wy + wh - vtol:
+        sides.append("Bottom")
+    if ly + lh <= wy + vtol:
+        sides.append("Top")
+    return sides[0] if len(sides) == 1 else None
+
+
+def _legend_objects(ws, ws_zone, legend_zones, vtype):
+    """Tableau dashboard colour legend -> (legend_objects, fact).
+
+    ``legend_objects`` is the ``visual.objects.legend`` entry list (``show`` + optional ``position``,
+    applied uniformly -- no selector) or ``None``; ``fact`` is an additive candidate-record
+    descriptor, or ``None`` when the worksheet has no categorical colour Series or the visual type has
+    no legend concept (table / matrix / card / map).
+
+    WARN-NEVER-WRONG: a ``position`` is emitted ONLY when a present colour zone sits unambiguously on
+    one side of the chart (:func:`_legend_side`); an overlapping/corner zone keeps Power BI's default
+    legend position (``status`` ``position_deferred``). ``show:false`` is emitted only when a
+    worksheet that genuinely carries a categorical colour Series has NO colour zone on this dashboard
+    -- i.e. the author hid the legend; a worksheet with no colour Series produces no legend in either
+    tool and is left alone.
+    """
+    if vtype not in _LEGEND_TYPES or not _has_color_series(ws):
+        return None, None
+    lz = next((z for z in (legend_zones or []) if z["worksheet"] == ws["name"]), None)
+    fact = {"kind": "legend"}
+    if lz is None:
+        fact["status"] = "hidden"
+        return [{"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}], fact
+    side = _legend_side(ws_zone, lz)
+    if side is None:
+        fact["status"] = "position_deferred"
+        return None, fact
+    fact["status"] = "emitted"
+    fact["position"] = side
+    return [{"properties": {
+        "show": {"expr": {"Literal": {"Value": "true"}}},
+        "position": {"expr": {"Literal": {"Value": _semantic_string_literal(side)}}},
+    }}], fact
+
+
 def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  filter_config=None, title=None, axis_titles=None, value_objects=None,
-                 data_point_objects=None, label_objects=None):
+                 data_point_objects=None, label_objects=None, legend_objects=None):
     visual = {"visualType": vtype}
     if query_state:
         visual["query"] = {"queryState": query_state}
@@ -3278,6 +3357,12 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     # visual-wide object; only show/hide is set here (label detail styling is Tier-2).
     if label_objects:
         visual.setdefault("objects", {})["labels"] = label_objects
+    # Legend (Tableau dashboard colour-legend zone): the data-plane ``visual.objects.legend``
+    # ``show`` / ``position`` toggle, applied uniformly (no selector). Per the Power BI formatting
+    # reference, ``legend`` is a visual-wide object; only show/position are set here (legend title /
+    # font / marker styling is Tier-2).
+    if legend_objects:
+        visual.setdefault("objects", {})["legend"] = legend_objects
     # Structural title text (Tier-1): the worksheet's authored caption -> the visual's container
     # title. Shape verified against the official PBIR visualContainer schema + real reports: a
     # single-quoted semantic-query string literal under visualContainerObjects.title; the
@@ -3752,6 +3837,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             data_point_objects, mc_fact = _data_point_colors(
                 ws, state, ws["visual_type"], model_table, field_map, warnings)
             label_objects, dl_fact = _data_labels(ws, ws["visual_type"], warnings)
+            legend_objects, lg_fact = _legend_objects(
+                ws, zone, db.get("legend_zones"), ws["visual_type"])
             flag_fc = _flag_filter_config_for(ir, ws["name"])
             visuals.append(_visual_json(
                 vname, vtype, pos, state,
@@ -3759,7 +3846,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 filter_config=flag_fc,
                 title=ws.get("title"), axis_titles=ws.get("axis_titles"),
                 value_objects=value_objects, data_point_objects=data_point_objects,
-                label_objects=label_objects))
+                label_objects=label_objects, legend_objects=legend_objects))
             rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                     page_display=db["name"] or page_name,
                                     model_table=model_table, field_map=field_map)
@@ -3767,6 +3854,10 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 rec["conditional_format"] = cf_fact
             if mc_fact:
                 rec["mark_colors"] = mc_fact
+            if dl_fact:
+                rec["data_labels"] = dl_fact
+            if lg_fact:
+                rec["legend"] = lg_fact
             if flag_fc:
                 rec["flag_filters"] = [c["field"]["Measure"]["Property"]
                                        for c in flag_fc["filters"]]

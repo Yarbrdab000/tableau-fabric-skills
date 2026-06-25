@@ -3684,6 +3684,138 @@ def test_data_labels_on_card_not_applicable():
     assert _dl_fact(res["candidate_records"], "KPI") is None
 
 
+# -- legend (Tableau dashboard colour-legend zone) -----------------------------
+# Tableau writes a SHOWN colour-Series legend as a dashboard ``<zone type='color' name='<ws>'>``;
+# its geometry vs the worksheet's own zone reproduces the legend side, and a worksheet that carries a
+# categorical colour Series but has NO colour zone means the author hid the legend. Maps to the PBIR
+# data-plane ``visual.objects.legend`` ``show`` / ``position`` (applied uniformly, no selector).
+# WARN-NEVER-WRONG: a ``position`` is emitted only when the zone sits clearly on one side; an
+# overlapping zone keeps Power BI's default position; ``show:false`` only when a real colour Series
+# has no zone; the standalone (non-dashboard) emit path is untouched (PBI's default legend matches
+# Tableau's default).
+def _legend_series_ws(name="Sales by Region"):
+    enc = "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings>"
+    return _worksheet(name, "Bar",
+                      rows="[federated.abc].[sum:Sales:qk]",
+                      cols="[federated.abc].[none:Category:nk]",
+                      deps_extra=_INST, encodings=enc)
+
+
+def _color_zone(ws_name, x, y, w, h):
+    return ("<zone type='color' name='{0}' param='[federated.abc].[none:Region:nk]' "
+            "x='{1}' y='{2}' w='{3}' h='{4}' id='9' />".format(ws_name, x, y, w, h))
+
+
+def _legend_dash(ws_name, color_zone="", ws_geom=(0, 0, 80000, 100000)):
+    wx, wy, ww, wh = ws_geom
+    inner = ("<zone h='100000' w='100000' x='0' y='0'>"
+             "<zone h='{0}' w='{1}' x='{2}' y='{3}' name='{4}' id='2' />".format(wh, ww, wx, wy, ws_name)
+             + color_zone + "</zone>")
+    return "<dashboard name='D'><zones>" + inner + "</zones></dashboard>"
+
+
+def _legend_objects_of(visual_json):
+    return visual_json["visual"].get("objects", {}).get("legend")
+
+
+def _dash_main_visual(parts):
+    mains = [v for v in _visual_parts(parts).values()
+             if v["visual"]["visualType"] != "slicer"]
+    assert len(mains) == 1
+    return mains[0]
+
+
+def _lg_fact(records, worksheet):
+    rec = next(r for r in records if r["worksheet"] == worksheet)
+    return rec.get("legend")
+
+
+def test_legend_color_zone_parsed_into_dashboard_ir():
+    cz = _color_zone("Sales by Region", 85000, 0, 15000, 100000)
+    ir = parse_twb(_workbook(_legend_series_ws(), _legend_dash("Sales by Region", cz)))
+    lz = ir["dashboards"][0]["legend_zones"]
+    assert len(lz) == 1
+    assert lz[0]["worksheet"] == "Sales by Region"
+    assert (lz[0]["x"], lz[0]["w"]) == (85000.0, 15000.0)
+
+
+def test_legend_right_zone_emits_position_right():
+    cz = _color_zone("Sales by Region", 85000, 0, 15000, 100000)
+    res = migrate_twb_to_pbir(_workbook(_legend_series_ws(), _legend_dash("Sales by Region", cz)))
+    vj = _dash_main_visual(res["parts"])
+    assert _legend_objects_of(vj) == [{"properties": {
+        "show": {"expr": {"Literal": {"Value": "true"}}},
+        "position": {"expr": {"Literal": {"Value": "'Right'"}}}}}]
+    fact = _lg_fact(res["candidate_records"], "Sales by Region")
+    assert fact == {"kind": "legend", "status": "emitted", "position": "Right"}
+
+
+def test_legend_bottom_zone_emits_position_bottom():
+    cz = _color_zone("Sales by Region", 0, 85000, 100000, 15000)
+    res = migrate_twb_to_pbir(_workbook(
+        _legend_series_ws(), _legend_dash("Sales by Region", cz, ws_geom=(0, 0, 100000, 80000))))
+    vj = _dash_main_visual(res["parts"])
+    pos = _legend_objects_of(vj)[0]["properties"]["position"]["expr"]["Literal"]["Value"]
+    assert pos == "'Bottom'"
+    assert _lg_fact(res["candidate_records"], "Sales by Region")["position"] == "Bottom"
+
+
+def test_legend_overlapping_zone_defers_position():
+    # A colour zone that overlaps the chart (no clear side) keeps Power BI's default legend position:
+    # no position is guessed, but the (position_deferred) fact still discloses the legend.
+    cz = _color_zone("Sales by Region", 20000, 40000, 20000, 15000)
+    res = migrate_twb_to_pbir(_workbook(
+        _legend_series_ws(), _legend_dash("Sales by Region", cz, ws_geom=(0, 0, 100000, 100000))))
+    vj = _dash_main_visual(res["parts"])
+    assert _legend_objects_of(vj) is None
+    assert _lg_fact(res["candidate_records"], "Sales by Region")["status"] == "position_deferred"
+
+
+def test_legend_absent_zone_hides_legend():
+    # A worksheet with a categorical colour Series but NO colour zone on the dashboard = the author
+    # hid the legend -> emit show=false to faithfully suppress Power BI's default legend.
+    res = migrate_twb_to_pbir(_workbook(_legend_series_ws(), _legend_dash("Sales by Region")))
+    vj = _dash_main_visual(res["parts"])
+    assert _legend_objects_of(vj) == [
+        {"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}]
+    assert _lg_fact(res["candidate_records"], "Sales by Region")["status"] == "hidden"
+
+
+def test_legend_no_color_series_emits_nothing():
+    # Additivity: a chart with no colour Series has no legend in either tool -> no legend object and
+    # no fact, even on a dashboard.
+    ws = _worksheet("Plain", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    res = migrate_twb_to_pbir(_workbook(ws, _legend_dash("Plain")))
+    vj = _dash_main_visual(res["parts"])
+    assert _legend_objects_of(vj) is None
+    assert _lg_fact(res["candidate_records"], "Plain") is None
+
+
+def test_legend_matrix_type_ignored():
+    # A highlight-table matrix has no cartesian legend object; even with a categorical colour Series
+    # and a colour zone, no legend object/fact is produced (the legend types exclude matrix/table).
+    enc = ("<encodings><color column='[federated.abc].[none:Region:nk]' />"
+           "<text column='[federated.abc].[sum:Sales:qk]' /></encodings>")
+    ws = _heat_ws("Grid", color_field="none:Region:nk", encodings=enc, style="")
+    cz = _color_zone("Grid", 85000, 0, 15000, 100000)
+    res = migrate_twb_to_pbir(_workbook(ws, _legend_dash("Grid", cz)))
+    vj = _dash_main_visual(res["parts"])
+    assert vj["visual"]["visualType"] == "pivotTable"
+    assert _legend_objects_of(vj) is None
+    assert _lg_fact(res["candidate_records"], "Grid") is None
+
+
+def test_legend_standalone_worksheet_unaffected():
+    # The legend signal is dashboard-scoped; a standalone worksheet page (no dashboard) is byte-
+    # unchanged -- Power BI's default legend already matches Tableau's default for a colour Series.
+    res = migrate_twb_to_pbir(_workbook(_legend_series_ws()))
+    vj = _dash_main_visual(res["parts"])
+    assert _legend_objects_of(vj) is None
+    assert _lg_fact(res["candidate_records"], "Sales by Region") is None
+
+
 # -- cross-layer measure binding (model<->viz contract consumer) ---------------
 # The datasource-migration (model) build hands back a token-keyed calc->measure manifest; the
 # dashboard (viz) build rebinds the matching workbook-local / quick-table-calc pills to those real
