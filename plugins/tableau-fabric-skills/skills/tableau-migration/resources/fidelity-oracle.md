@@ -92,6 +92,29 @@ report `summary` exposes a `remodel_rename_suspected` count, and an advisory not
 are immune to renaming, so they are the authority when a remodel is suspected. A low *structural*
 score there reflects naming, not infidelity.
 
+### Resolving the rename: the engine field‑alias map
+
+The remodel flag above *explains* a low field score; the **field‑alias map** lets the structural
+tier **see through** it. The engine emits an additive `field_aliases` map on each candidate record —
+`{emitted queryRef → Tableau source caption}` (e.g. `Date.Date → Order Date`,
+`_Measures.count orders → ` the rebound source measure) — built with the same expression the
+projections use, so it keys 1:1 with the refs the oracle reads. Supply it and the oracle rewrites
+each emitted ref back to its Tableau caption **before** name overlap, so a faithful rename scores as
+a match instead of a miss.
+
+```
+# explicit map, a migrate_twb_to_pbir candidate_records list/result, or a flat {ref: caption} JSON
+py -3.11 scripts/fidelity_oracle.py source.twb out\Report --candidate-records candidate_records.json
+```
+
+In‑process, pass `field_aliases={...}` (or `aliases_from_candidate_records(records)`) to
+`score_report` / `run_oracle`. It is **optional and off by default**, never re‑runs the engine, and
+no‑ops cleanly on builds whose records predate the producer. The report adds a
+`summary.fields_alias_resolved` count, an advisory note, and a markdown line; the original emitted
+name is preserved per field as `norm_emitted`. Measured on the real Comcast rebuild, resolving just
+`Date.Date → Order Date` lifts the aggregate **0.40 → 0.55** (every visual improves); the residual
+is then source‑side (reference‑line decoration calcs, a dropped implicit `COUNT`), not the rename.
+
 ---
 
 ## Calibration — the cross‑engine noise floor
