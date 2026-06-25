@@ -13,6 +13,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **table-calc measures now translate on the live / published-datasource path,
+  reaching parity with a local `.twbx` upload.** When a workbook connects to a published Tableau Cloud
+  datasource (`sqlproxy`), `migrate_estate._rebuild_from_published_match` rebuilds the model from the
+  matched, already-migrated published `.tds` — which is **schema only and carries no worksheets**, so the
+  table-calc *addressing* (partition / order, recovered from the worksheet shelves) was previously lost and
+  positional measures (`WINDOW_STDEV`, percent-difference-from-prior, `LAST`) stubbed to `= 0`. The rebuild
+  now extracts `table_calc_usages` from the **workbook** (`twb_text`) and threads them through a new additive
+  `table_calc_usages=` override on `assemble_model.migrate_tds_to_semantic_model` (default `None` keeps the
+  prior auto-extraction from the source text; `[]` disables it; a list overrides it). With the addressing in
+  hand the existing addressed-measure path emits faithful DAX (`STDEVX.S(WINDOW(…ORDERBY…))`,
+  `DIVIDE(… - CALCULATE(…, OFFSET(-1, ORDERBY…)), ABS(…))`, `COUNTROWS(WINDOW(…PARTITIONBY…)) - ROWNUMBER(…)`)
+  and cross-calc references (`2 * [Standard of Deviation]`, `Difference coloring`) resolve against them. A
+  local `.twbx` whose embedded model already carries its own worksheets was unaffected (it self-extracts);
+  this brings the credential-based live path to the same fidelity. Genuinely un-addressable shapes
+  (nested-`FIXED` LOD argmax, parameter-case filters) still fail closed. Additive; the migration suite stays
+  green. Skill `VERSION` `1.9.0` → `1.10.0`.
 - **tableau-migration:** the rebuilt **report page now binds its columns to the migrated model**
   instead of the workbook's embedded placeholder entity. When `_attach_workbook_pbip` recovers a
   model from a matched published datasource, a new `_field_map_from_model` helper derives a

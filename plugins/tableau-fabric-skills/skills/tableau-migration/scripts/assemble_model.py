@@ -1895,7 +1895,7 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                   hierarchies=None, display_folders=None, rls_roles=None,
                                   date_table=True, mark_as_date=True, flatfile_path=None,
                                   approved_calc_dax=None, date_range=None, select=None,
-                                  parameters=None):
+                                  parameters=None, table_calc_usages=None):
     """One-call convenience: parse ``.tds``/``.twb`` text and assemble the Import/DirectQuery model.
 
     ``calcs`` are the MEASURE-role calculated fields and ``dim_calcs`` the DIMENSION/row-level ones
@@ -1957,10 +1957,17 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
     # the document text so the model build can emit them as faithful measures. A bare ``.tds`` has no
     # worksheets, so this is ``[]`` there and the build is byte-for-byte unchanged; only a ``.twb``
     # workbook yields usages. Guarded -- a parse hiccup must never break the model build.
-    try:
-        table_calc_usages = extract_table_calc_usages(tds_text)
-    except Exception:
-        table_calc_usages = []
+    #
+    # A caller may pass ``table_calc_usages`` explicitly to OVERRIDE this auto-extraction. That is
+    # how the estate's published-datasource rebuild reaches local==live parity: the model schema
+    # comes from the published ``.tds`` (which has no worksheets), but the table-calc addressing
+    # lives in the WORKBOOK, so the orchestrator extracts the usages from the ``.twb`` and threads
+    # them here. ``None`` keeps the auto-extraction; ``[]`` deliberately disables table calcs.
+    if table_calc_usages is None:
+        try:
+            table_calc_usages = extract_table_calc_usages(tds_text)
+        except Exception:
+            table_calc_usages = []
     result = assemble_import_model(descriptor, model_name=model_name,
                                    calcs=calcs, dim_calcs=dim_calcs, relationships=relationships,
                                    hierarchies=hierarchies, display_folders=display_folders,

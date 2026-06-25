@@ -220,6 +220,34 @@ def test_table_calc_field_usage_lands_as_addressed_measure():
     assert b["Standard of Deviation"] == target
 
 
+def test_migrate_tds_threads_table_calc_usages_override():
+    # The estate's published-datasource rebuild builds the model from the published .tds (schema only,
+    # NO worksheets) while the table-calc addressing lives in the WORKBOOK. ``migrate_tds_to_semantic_model``
+    # must therefore honor an explicit ``table_calc_usages=`` override instead of re-extracting from its
+    # (worksheet-less) source text. This is the seam that brings the live/published path to parity with a
+    # local .twbx whose embedded model already carries its own worksheets. Without the override, the SoD
+    # measure could only stub; with it, the addressed STDEVX.S measure lands.
+    out = migrate_tds_to_semantic_model(LIVE_SQLSERVER, model_name="Superstore",
+                                        calcs=[], table_calc_usages=[_sod_usage()])
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    assert "measure 'Standard of Deviation' =" in measures
+    assert "STDEVX.S" in measures
+    assert "COUNTROWS('Orders')" in measures
+    row = {r["measure"]: r for r in out["report"]["measures"]}["Standard of Deviation"]
+    assert row["status"] == "translated"
+    assert row["source"]["kind"] == "table_calc"
+
+
+def test_migrate_tds_empty_table_calc_usages_disables_extraction():
+    # ``None`` (default) auto-extracts from the source text; ``[]`` is an explicit override that DISABLES
+    # table calcs. A bare .tds has no worksheets either way, but asserting the explicit-empty path proves
+    # the override is honored as a tri-state (None=auto / []=off / list=use), not silently re-extracted.
+    out = migrate_tds_to_semantic_model(LIVE_SQLSERVER, model_name="Superstore",
+                                        calcs=[], table_calc_usages=[])
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    assert "measure 'Standard of Deviation' =" not in measures
+
+
 def test_table_calc_measure_supersedes_plain_stub_and_seeds_cross_calc():
     # The SAME calc appears BOTH as a plain measure-role calc (which only STUBS in measure mode --
     # WINDOW_STDEV has no faithful addressing-less form) AND as an addressed table-calc usage. The

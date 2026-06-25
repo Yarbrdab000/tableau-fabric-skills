@@ -53,12 +53,14 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .assemble_model import (assemble_import_model, write_model_folder, write_local_pbip,
                                  migrate_datasource, list_workbook_datasources)
     from .parameters import parse_parameters
+    from .workbook_table_calcs import extract_table_calc_usages
 except ImportError:
     from connection_to_m import parse_tds
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from assemble_model import (assemble_import_model, write_model_folder, write_local_pbip,
                                 migrate_datasource, list_workbook_datasources)
     from parameters import parse_parameters
+    from workbook_table_calcs import extract_table_calc_usages
 
 
 # -- source adapters -----------------------------------------------------------
@@ -1229,9 +1231,20 @@ def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog):
         wb_calcs, _skipped, wb_dim_calcs = extract_calculations(twb_text, include_dimensions=True)
     except Exception:
         wb_calcs, wb_dim_calcs = None, None
+    # Table-calc addressing (partition / order) lives in the WORKBOOK's worksheet shelves, never in
+    # the published ``.tds`` schema we rebuild from -- so extract the usages from ``twb_text`` and
+    # thread them through. Without this, positional measures (WINDOW_STDEV, percent-difference, LAST)
+    # would re-extract from the schema-only ``.tds``, find no worksheets, and stub to ``= 0``. This
+    # is what brings the live/published path to parity with a local ``.twbx`` whose embedded model
+    # already carries its own worksheets.
+    try:
+        wb_table_calc_usages = extract_table_calc_usages(twb_text)
+    except Exception:
+        wb_table_calc_usages = None
     try:
         res = migrate_datasource(match["text"], model_name=model_safe,
-                                 calcs=wb_calcs, dim_calcs=wb_dim_calcs)
+                                 calcs=wb_calcs, dim_calcs=wb_dim_calcs,
+                                 table_calc_usages=wb_table_calc_usages)
     except Exception:
         return None
     if (res.get("report") or {}).get("fallback"):
