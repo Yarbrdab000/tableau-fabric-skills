@@ -1621,6 +1621,24 @@ def _evaluate_measure(conn, measure_name, filter_expr=None):
                 "error": str(exc).strip()[:200]}
 
 
+def _evaluate_query(conn, dax):
+    """Evaluate a caller-supplied scalar DAX query and return its single value; capture errors.
+
+    This is the calc-*column* (or arbitrary-expression) sibling of :func:`_evaluate_measure`. A
+    Tableau calculated *column* is not a model measure, so ``EVALUATE ROW("v", [m])`` can't reach
+    it; its fidelity is checked by its own scalar DAX instead -- e.g. a distinct *non-blank* count
+    of the column's values across the table. The query must return a single row whose first column
+    is the scalar of interest (its name is irrelevant -- the reader maps column 0). A failed
+    evaluation is itself a fidelity signal, so errors are captured rather than raised.
+    """
+    try:
+        rows = _adomd_rows(conn, dax, ["v"])
+        return {"query": dax, "ok": True,
+                "value": rows[0]["v"] if rows else None, "error": None}
+    except Exception as exc:  # noqa: BLE001 -- a failed evaluation is itself a fidelity signal
+        return {"query": dax, "ok": False, "value": None, "error": str(exc).strip()[:200]}
+
+
 def _normalize_expected(expected):
     """Normalize an ``expected`` map into a list of value checks.
 
@@ -1629,7 +1647,10 @@ def _normalize_expected(expected):
     * **flat** ``{measure_name: expected_value}`` -- a model-level check (no filter context).
     * **rich** ``{label: {"measure": name, "expected": value, "filter": dax}}`` -- a per-view check
       whose ``filter`` (caller-supplied DAX) reproduces that view's filter context. ``measure``
-      defaults to ``label``; ``value`` is accepted as an alias for ``expected``.
+      defaults to ``label``; ``value`` is accepted as an alias for ``expected``. A rich entry may
+      instead carry ``"query": <scalar DAX>`` to check a calc *column* (or any non-measure scalar)
+      by its own ``EVALUATE``; when ``query`` is present it takes precedence over ``measure``/
+      ``filter``.
 
     The rich form is what models "Sales on the US-only map vs Sales on the Canada-inclusive KPIs":
     the same measure, two checks, two filter contexts, two expected values.
@@ -1642,9 +1663,11 @@ def _normalize_expected(expected):
                 "measure": val.get("measure") or key,
                 "expected": val.get("expected", val.get("value")),
                 "filter": val.get("filter"),
+                "query": val.get("query"),
             })
         else:
-            checks.append({"label": key, "measure": key, "expected": val, "filter": None})
+            checks.append({"label": key, "measure": key, "expected": val,
+                           "filter": None, "query": None})
     return checks
 
 
@@ -1750,13 +1773,18 @@ def dax_value_tier(report_dir=None, host="localhost", port=None, expected=None,
         comparisons = []
         if expected:
             for chk in _normalize_expected(expected):
-                ev = _evaluate_measure(conn, chk["measure"], chk.get("filter"))
+                if chk.get("query"):
+                    ev = _evaluate_query(conn, chk["query"])
+                else:
+                    ev = _evaluate_measure(conn, chk["measure"], chk.get("filter"))
                 actual = ev["value"] if ev["ok"] else None
                 cmp = _compare_value(chk["label"], chk["expected"], actual, tolerance)
-                if chk["measure"] != chk["label"]:
+                if not chk.get("query") and chk["measure"] != chk["label"]:
                     cmp["measure_name"] = chk["measure"]
                 if chk.get("filter"):
                     cmp["filter"] = chk["filter"]
+                if chk.get("query"):
+                    cmp["query"] = chk["query"]
                 if not ev["ok"]:
                     cmp["note"] = "evaluation error: %s" % ((ev["error"] or "")[:160])
                 comparisons.append(cmp)
@@ -1786,6 +1814,8 @@ def dax_value_tier(report_dir=None, host="localhost", port=None, expected=None,
             "expected values) the fraction of measures that evaluate without error.",
             "expected values may carry a per-view 'filter' (DAX) so a measure is checked under that "
             "view's filter context -- e.g. a US-only map vs Canada-inclusive KPIs on the same model.",
+            "an expected entry may instead carry 'query' (scalar DAX) to check a calc COLUMN or any "
+            "non-measure scalar by its own EVALUATE -- e.g. a distinct non-blank count of a column.",
         ],
     }
 
@@ -2365,8 +2395,548 @@ def render_pbi_report(pbip_path, output_dir=None, scale=DEFAULT_SCREENSHOT_SCALE
 
 
 # =====================================================================================
+# Gate 0: openability (does the emitted semantic model actually deserialize?)
+# =====================================================================================
+# The structural tier grades whether the rebuild bound the right fields onto the right chart types --
+# but a report can score well and still be DEAD ON ARRIVAL if its semantic model does not parse. This
+# gate runs the authoritative TMDL deserializer (the Tabular Object Model's ``TmdlSerializer``) over
+# the emitted ``*.SemanticModel/definition`` folder: the SAME grammar Power BI Desktop loads on open
+# and the SAME grammar Microsoft Fabric ingests when a PBIP is published (Git integration / a
+# deployment pipeline). A structural/syntactic defect that fails this offline parse fails BOTH targets
+# identically, so this is a cheap pre-flight that predicts a clean open/deploy with no Desktop, no
+# Fabric capacity, no credentials, and no round-trip.
+#
+# Lazy + guarded exactly like the DAX tier: pythonnet + the TOM assemblies are imported only when the
+# gate runs, and any absence degrades to ``{available: False, reason}`` -- importing this module never
+# needs .NET. What it validates is the model DEFINITION (syntax/structure: the class of defect that
+# bites today -- e.g. a multi-line measure body emitted at column 0, or an empty-valued annotation);
+# data binding / refresh / credential validity is target-specific and belongs to the value tier.
+TABULAR_EDITOR_DLLS = (
+    "Microsoft.AnalysisServices.Core.dll",
+    "Microsoft.AnalysisServices.dll",
+    "Microsoft.AnalysisServices.Tabular.Json.dll",
+    "Microsoft.AnalysisServices.Tabular.dll",
+)
+
+
+def _tabular_editor_dirs():
+    """Candidate folders that ship the TOM (AMO/Tabular) assemblies, in search order.
+
+    A ``TABULAR_EDITOR_DIR`` env override wins; then the common Tabular Editor 2/3 install paths.
+    Tabular Editor is the most reliable local carrier of a loadable, file-based
+    ``Microsoft.AnalysisServices.Tabular.dll`` (the GAC copy is awkward to bind via pythonnet)."""
+    dirs = []
+    env = os.environ.get("TABULAR_EDITOR_DIR")
+    if env:
+        dirs.append(env)
+    pf86 = os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"
+    pf = os.environ.get("ProgramFiles") or r"C:\Program Files"
+    dirs.append(os.path.join(pf86, "Tabular Editor"))
+    dirs.append(os.path.join(pf, "Tabular Editor 3"))
+    dirs.append(os.path.join(pf86, "Tabular Editor 3"))
+    return [d for d in dirs if d]
+
+
+def _load_tmdl_serializer(tabular_editor_dir=None):
+    """Lazy-load the TOM ``TmdlSerializer`` type via pythonnet + the Tabular Editor assemblies.
+
+    Raises (never returns ``None``) when pythonnet or the assemblies are absent, so the caller can
+    map any failure to ``{available: False, reason}`` -- mirrors :func:`_load_adomd`."""
+    from pythonnet import load as _pythonnet_load
+    _pythonnet_load("netfx")
+    import clr  # noqa: F401  -- registers the .NET runtime hook for the Assembly import below
+    from System.Reflection import Assembly
+
+    search = [tabular_editor_dir] if tabular_editor_dir else _tabular_editor_dirs()
+    chosen = None
+    for d in search:
+        if d and os.path.isfile(os.path.join(d, TABULAR_EDITOR_DLLS[-1])):
+            chosen = d
+            break
+    if chosen is None:
+        raise RuntimeError(
+            "TOM assemblies not found (looked in: %s); set TABULAR_EDITOR_DIR or install Tabular "
+            "Editor" % ", ".join(d for d in search if d))
+    for dll in TABULAR_EDITOR_DLLS:
+        path = os.path.join(chosen, dll)
+        if os.path.isfile(path):
+            Assembly.LoadFrom(path)
+    from Microsoft.AnalysisServices.Tabular import TmdlSerializer
+    return TmdlSerializer
+
+
+def _resolve_model_definition(report_dir=None, model_dir=None):
+    """Locate the ``*.SemanticModel/definition`` folder TMDL is deserialized from.
+
+    ``model_dir`` may be the ``definition`` folder itself, the ``.SemanticModel`` folder, or a parent
+    holding one; ``report_dir`` is the ``.Report`` folder (or any parent of the project) whose sibling
+    ``*.SemanticModel`` is then found. Returns the absolute ``definition`` path, or ``None``."""
+    def _defn_under(root):
+        if not root or not os.path.isdir(root):
+            return None
+        base = os.path.basename(os.path.normpath(root))
+        if base.lower() == "definition":
+            return os.path.abspath(root)
+        if root.lower().endswith(".semanticmodel"):
+            direct = os.path.join(root, "definition")
+            if os.path.isdir(direct):
+                return os.path.abspath(direct)
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            return None
+        for name in entries:
+            if name.lower().endswith(".semanticmodel"):
+                cand = os.path.join(root, name, "definition")
+                if os.path.isdir(cand):
+                    return os.path.abspath(cand)
+        return None
+
+    for start in (model_dir, report_dir):
+        if not start:
+            continue
+        hit = _defn_under(start)
+        if hit:
+            return hit
+        hit = _defn_under(os.path.dirname(os.path.normpath(start)))
+        if hit:
+            return hit
+    return None
+
+
+def _tom_model_stats(db):
+    """Table / measure / relationship counts from a deserialized TOM database (best-effort)."""
+    model = getattr(db, "Model", None)
+    tables = list(getattr(model, "Tables", []) or [])
+    measures = 0
+    for t in tables:
+        try:
+            measures += int(t.Measures.Count)
+        except Exception:  # noqa: BLE001 -- tolerate a fake/odd shape
+            try:
+                measures += len(list(t.Measures))
+            except Exception:  # noqa: BLE001
+                pass
+    rels = None
+    try:
+        rels = int(model.Relationships.Count)
+    except Exception:  # noqa: BLE001
+        try:
+            rels = len(list(model.Relationships))
+        except Exception:  # noqa: BLE001
+            rels = None
+    return {"tables": len(tables), "measures": measures, "relationships": rels}
+
+
+_TMDL_ERR_LINE_RE = re.compile(r"line(?:\s+number)?\s*[-:]?\s*(\d+)", re.IGNORECASE)
+_TMDL_ERR_DOC_RE = re.compile(r"Document\s*[-:]?\s*'([^']+)'", re.IGNORECASE)
+_TMDL_ERR_FILE_RE = re.compile(r"([^\s'\"]+\.tmdl)(?![.\w])", re.IGNORECASE)
+
+
+def _parse_tmdl_error_location(message):
+    """Best-effort ``(file, line)`` from a TOM deserialize exception string (either may be ``None``).
+
+    Handles the real TOM ``TmdlSerializer`` shape -- ``Document - './tables/_Measures'`` +
+    ``Line Number - 107`` -- as well as a terser ``'_Measures.tmdl' at line 5``. The ``Document``
+    capture is preferred so the file is taken from the error payload, never from a dotted stack-trace
+    type (e.g. ``...Tabular.Tmdl.TmdlParser``), and the ``.tmdl`` fallback is anchored so it cannot
+    latch onto such a type."""
+    if not message:
+        return None, None
+    dm = _TMDL_ERR_DOC_RE.search(message)
+    if dm:
+        file_ = dm.group(1).strip()
+        if file_.startswith("./"):
+            file_ = file_[2:]
+    else:
+        fm = _TMDL_ERR_FILE_RE.search(message)
+        file_ = fm.group(1) if fm else None
+    lm = _TMDL_ERR_LINE_RE.search(message)
+    return file_, (int(lm.group(1)) if lm else None)
+
+
+def openability_tier(report_dir=None, model_dir=None, tabular_editor_dir=None):
+    """Gate 0: does the emitted semantic model deserialize under the authoritative TMDL parser?
+
+    Runs the TOM ``TmdlSerializer.DeserializeDatabaseFromFolder`` over the emitted
+    ``*.SemanticModel/definition`` -- the same grammar Power BI Desktop loads and Microsoft Fabric
+    ingests on publish, so a structural defect that fails here fails BOTH. Returns one of:
+
+    * ``{available: True, openable: True, tables, measures, relationships}`` -- OPENS;
+    * ``{available: True, openable: False, error, error_file, error_line}`` -- BLOCKED (a concrete,
+      fix-before-ship defect, not a fidelity judgment);
+    * ``{available: False, reason}`` -- the check could not run (no model folder, or pythonnet/TOM
+      assemblies absent). Lazy + guarded: importing this module never needs .NET."""
+    defn = _resolve_model_definition(report_dir, model_dir)
+    if not defn:
+        return {"tier": "openability", "available": False,
+                "reason": "no *.SemanticModel/definition folder found near %s"
+                          % (model_dir or report_dir)}
+    try:
+        serializer = _load_tmdl_serializer(tabular_editor_dir)
+    except Exception as exc:  # noqa: BLE001 -- absent deps must degrade, never raise
+        return {"tier": "openability", "available": False, "definition": defn,
+                "reason": "TOM/pythonnet not available: %s" % str(exc).strip()[:200]}
+    try:
+        db = serializer.DeserializeDatabaseFromFolder(defn)
+    except Exception as exc:  # noqa: BLE001 -- a parse failure IS the BLOCKED signal, not an error
+        msg = str(exc).strip().replace(chr(10), " ").replace(chr(13), " ")
+        file_, line_ = _parse_tmdl_error_location(msg)
+        return {
+            "tier": "openability", "available": True, "openable": False,
+            "definition": defn, "verdict": "blocked",
+            "error": msg[:400], "error_file": file_, "error_line": line_, "advisory": True,
+            "notes": [
+                "BLOCKED: the semantic model does not deserialize under the authoritative TMDL "
+                "parser -- it will NOT open in Power BI Desktop and will NOT deploy to Fabric. This "
+                "is a concrete, fix-before-ship defect, not a fidelity judgment.",
+                "Same TMDL grammar both targets consume, so this offline parse predicts both a "
+                "Desktop open and a Fabric publish without Desktop, capacity, or credentials.",
+            ],
+        }
+    stats = _tom_model_stats(db)
+    return {
+        "tier": "openability", "available": True, "openable": True,
+        "definition": defn, "verdict": "opens",
+        "tables": stats["tables"], "measures": stats["measures"],
+        "relationships": stats["relationships"], "advisory": True,
+        "notes": [
+            "OPENS: the model deserializes under the authoritative TMDL parser -- a faithful "
+            "pre-flight for both a Desktop open and a Fabric publish (same grammar).",
+            "This gate validates the model DEFINITION (syntax/structure) only; data binding / "
+            "refresh / credential validity is target-specific and belongs to the value tier.",
+        ],
+    }
+
+
+# =====================================================================================
+# Optional advisory tier: LLM-assist adjudication (a deterministic harness; the agent IS the model)
+# =====================================================================================
+# This mirrors the skill's two established agent-assisted tiers -- the second compiler
+# (``second-compiler.md`` / ``translation_router`` / ``translation_handoff_artifact``) and the image
+# oracle (``image_oracle.build_oracle_bundle`` / ``agent_prompt`` / ``apply_adjudications``). Like
+# both, it is a DETERMINISTIC PRODUCER, not an API client: it packages the oracle's own evidence into
+# an additive *adjudication-request bundle* + a driving-agent prompt, the agent running the skill
+# answers in strict JSON, and a constrained applier folds that answer back. There is NO network, key,
+# or model call here -- the agent is the judgment model. The hard invariant (confirmed against the
+# exemplars): the advisory answer can never flip a deterministic verdict or move a score -- a BLOCKED
+# openability gate stays BLOCKED (recorded as ``gate_locked``), and nothing is renamed or rebound.
+LLM_BUNDLE_VERSION = 1
+LLM_BUNDLE_KIND = "tableau-fabric-fidelity-adjudication-request"
+
+# The hard invariants the adjudication pass must honour, surfaced verbatim in the bundle + prompt so
+# the constraints travel WITH the request (the same discipline image_oracle.ORACLE_RULES uses).
+FIDELITY_ORACLE_RULES = (
+    "You are ADVISORY. You may add color, adjudicate a borderline divergence as faithful-or-not, "
+    "diagnose a blocker, and suggest a concrete fix -- but you can NEVER flip a deterministic verdict "
+    "or move a score. A BLOCKED openability gate stays BLOCKED regardless of your opinion: the model "
+    "literally does not parse.",
+    "Judge FAITHFULNESS, not preference. A divergence is faithful when it preserves the same data, "
+    "encoding, and answer (e.g. area->line, a star-schema field rename, an implicit-aggregate measure "
+    "name). Flag only divergences that change what the user SEES or the NUMBERS.",
+    "Ground every judgment in the evidence provided (types, fields, values, positions, errors). Do "
+    "not invent fields, values, or visuals that are not in the bundle.",
+    "Never propose RENAMING a model field/measure or rebinding anything as a 'fix' -- naming and "
+    "provenance are deterministic concerns. Target fixes at the actual artifact (a measure body, an "
+    "annotation, a visual ref).",
+    "No tool call, no API, no network: you (the agent running this skill) ARE the judgment model. "
+    "Read the evidence and answer in STRICT JSON only.",
+)
+
+
+def _fidelity_image_refs(report):
+    """Collect on-disk PNG paths for a VISUAL adjudication: the Power BI first-pass render(s) (from
+    the ``powerbi-desktop`` render bridge) plus any Tableau reference image the image tier compared
+    against. The agent running this skill is vision-capable (same premise as ``image_oracle``), so
+    handing it the actual render lets it say concretely 'this part is off' -- grounded, not guessed.
+    Returns ``[{role, path, page_id?}]``; empty when nothing was rendered/resolved."""
+    refs = []
+    seen = set()
+
+    def _add(role, path, page_id=None):
+        if not path or not isinstance(path, str):
+            return
+        ap = os.path.abspath(path)
+        key = os.path.normcase(ap)
+        if key in seen or not os.path.isfile(ap):
+            return
+        seen.add(key)
+        rec = {"role": role, "path": ap}
+        if page_id:
+            rec["page_id"] = page_id
+        refs.append(rec)
+
+    inputs = report.get("image_inputs") or {}
+    _add("tableau-reference", inputs.get("reference_png"))
+    _add("powerbi-render", inputs.get("candidate_png"))
+    ren = report.get("pbi_render") or {}
+    if ren.get("available"):
+        for p in ren.get("pages", []) or []:
+            _add("powerbi-render", p.get("png"), page_id=p.get("page_id"))
+    return refs
+
+
+def _fidelity_items(report):
+    """The per-item adjudication evidence: blockers (openability, measure-eval errors), per-visual
+    diffs, and unmatched worksheets -- each with a pre-filled ``answer`` template the agent edits.
+    When a Power BI render exists, a VISION item is prepended so the agent looks at the actual
+    first-pass image and adjudicates what is visually off."""
+    items = []
+    image_refs = _fidelity_image_refs(report)
+    if image_refs:
+        items.append({
+            "id": "visual-diff:render", "kind": "vision",
+            "subject": "Power BI first-pass render vs Tableau",
+            "evidence": {"image_refs": image_refs,
+                         "image_ssim": (report.get("image") or {}).get("ssim"),
+                         "image_band": (report.get("image") or {}).get("band")},
+            "priority": "high",
+            "question": "VIEW the referenced PNG(s) -- the Power BI first-pass render (and the "
+                        "Tableau reference if present). List the concrete visual divergences you can "
+                        "SEE (wrong chart type, missing/extra mark, mis-sorted or mis-colored series, "
+                        "a dropped filter, mis-placed legend/title/zone), each tied to where on the "
+                        "page it is. Judge whether each is a faithful difference or a real defect.",
+            "answer": {"id": "visual-diff:render", "judgment": "",
+                       "divergences": [{"where": "", "what": "", "faithful": True}]},
+        })
+    openrec = report.get("openability")
+    if openrec and openrec.get("available") and openrec.get("openable") is False:
+        items.append({
+            "id": "blocker:openability", "kind": "blocker",
+            "subject": "semantic model does not deserialize",
+            "evidence": {"error": openrec.get("error"), "error_file": openrec.get("error_file"),
+                         "error_line": openrec.get("error_line")},
+            "priority": "high",
+            "question": "Diagnose why the model fails to deserialize and give the minimal fix. This "
+                        "is a deterministic BLOCK -- your answer is advisory triage; it does not "
+                        "unblock anything.",
+            "answer": {"id": "blocker:openability", "judgment": "blocker", "diagnosis": "",
+                       "suggested_fix": ""},
+        })
+    dax = report.get("dax_value")
+    if dax and dax.get("available"):
+        for r in dax.get("results", []) or []:
+            if not r.get("ok"):
+                mid = "blocker:measure:%s" % r.get("measure")
+                items.append({
+                    "id": mid, "kind": "blocker",
+                    "subject": "measure %r fails to evaluate" % r.get("measure"),
+                    "evidence": {"measure": r.get("measure"), "error": r.get("error")},
+                    "priority": "high",
+                    "question": "Diagnose the evaluation error and give the minimal fix.",
+                    "answer": {"id": mid, "judgment": "blocker", "diagnosis": "", "suggested_fix": ""},
+                })
+    for v in report.get("visuals", []) or []:
+        diag = v.get("diagnosis")
+        needs = (v.get("band") in ("review", "divergent")) or bool(v.get("fields_missing")) \
+            or bool(v.get("fields_extra")) or diag == _REMODEL_DIAGNOSIS
+        vid = "visual:%s" % v.get("worksheet")
+        items.append({
+            "id": vid, "kind": "visual", "subject": v.get("worksheet"),
+            "evidence": {"visual_type": v.get("visual_type"), "type_note": v.get("type_note"),
+                         "score": v.get("score"), "band": v.get("band"),
+                         "fields_missing": v.get("fields_missing"),
+                         "fields_extra": v.get("fields_extra"), "diagnosis": diag},
+            "priority": "high" if needs else "low",
+            "question": "Is this rebuilt visual a FAITHFUL match of the Tableau worksheet, or a real "
+                        "divergence? Judge faithful / divergent / unsure with a short rationale.",
+            "answer": {"id": vid, "judgment": "", "rationale": ""},
+        })
+    for ws in (report.get("summary") or {}).get("unmatched_worksheets", []) or []:
+        uid = "unmatched:%s" % ws
+        items.append({
+            "id": uid, "kind": "unmatched", "subject": ws,
+            "evidence": {"worksheet": ws}, "priority": "high",
+            "question": "This Tableau worksheet has no paired Power BI visual. Is it genuinely "
+                        "missing from the rebuild, or paired under a different name/page?",
+            "answer": {"id": uid, "judgment": "", "rationale": ""},
+        })
+    return items
+
+
+def build_fidelity_bundle(report, *, max_items=200):
+    """Deterministic adjudication-request bundle from the oracle report (mirror of
+    :func:`image_oracle.build_oracle_bundle`). Additive, JSON-serialisable, and it NEVER mutates the
+    report -- it packages the deterministic evidence (blockers, per-visual diffs, unmatched
+    worksheets) + the hard rules + a per-item answer template for the agent-as-judgment pass."""
+    items = _fidelity_items(report)[:max_items]
+    cf = report.get("combined_fidelity") or {}
+    summary = report.get("summary") or {}
+    openrec = report.get("openability") or {}
+    image_refs = _fidelity_image_refs(report)
+    high = sum(1 for it in items if it.get("priority") == "high")
+    return {
+        "version": LLM_BUNDLE_VERSION,
+        "kind": LLM_BUNDLE_KIND,
+        "rules": list(FIDELITY_ORACLE_RULES),
+        "deterministic": {
+            "verdict": cf.get("verdict"),
+            "combined_score": cf.get("combined_score"),
+            "openable": openrec.get("openable") if openrec.get("available") else None,
+            "aggregate_score": summary.get("aggregate_score"),
+            "gate_locked": cf.get("verdict") == "blocked",
+        },
+        "summary": {
+            "items": len(items),
+            "to_review": high,
+            "blockers": sum(1 for it in items if it.get("kind") == "blocker"),
+            "image_refs": len(image_refs),
+        },
+        "image_refs": image_refs,
+        "items": items,
+        "answer_schema": {
+            "verdict": "faithful-candidate | opens-but-broken | blocked | needs-human",
+            "confidence": "0.0-1.0",
+            "per_item": "array of the per-item answer objects above (key back by id)",
+            "summary": "one-paragraph plain-language adjudication",
+        },
+    }
+
+
+def fidelity_agent_prompt(bundle):
+    """Render the driving-agent instruction for a fidelity bundle (no API key, no tool call).
+
+    States the hard invariants, echoes the authoritative deterministic verdict (which the agent may
+    NOT change), lists each item to adjudicate with its evidence, and asks for strict JSON answers."""
+    lines = [
+        "You are the Tableau -> Power BI FIDELITY oracle's advisory adjudicator. The deterministic "
+        "gates have already scored this rebuild; your job is the judgment the math cannot do: decide "
+        "whether borderline divergences are FAITHFUL or real, diagnose any blockers, and suggest "
+        "concrete fixes. You are advisory -- you cannot change a verdict or a score.",
+        "",
+        "Hard rules:",
+    ]
+    for i, rule in enumerate(bundle.get("rules", []), 1):
+        lines.append("  %d. %s" % (i, rule))
+    det = bundle.get("deterministic", {})
+    lines.append("")
+    lines.append("Deterministic verdict (authoritative, do NOT change): %s  "
+                 "(combined_score=%s, openable=%s, gate_locked=%s)" % (
+                     det.get("verdict"), det.get("combined_score"),
+                     det.get("openable"), det.get("gate_locked")))
+    image_refs = bundle.get("image_refs") or []
+    if image_refs:
+        lines.append("")
+        lines.append("Rendered images to VIEW (you are vision-capable -- open each path and LOOK; "
+                     "the Power BI render is the first-pass rebuild, the Tableau reference is ground "
+                     "truth where present):")
+        for ref in image_refs:
+            tag = ref.get("page_id")
+            lines.append("  - [%s] %s%s" % (
+                ref.get("role"), ref.get("path"), (" (page %s)" % tag) if tag else ""))
+    items = bundle.get("items", [])
+    review = [it for it in items if it.get("priority") == "high"] or items
+    if not review:
+        lines.append("")
+        lines.append("No items to adjudicate -- the rebuild is clean on the deterministic evidence.")
+        return "\n".join(lines)
+    lines.append("")
+    lines.append("Items to adjudicate (%d):" % len(review))
+    for it in review:
+        lines.append("")
+        lines.append("- id=%r kind=%s subject=%r priority=%s" % (
+            it.get("id"), it.get("kind"), it.get("subject"), it.get("priority")))
+        lines.append("    evidence: %s" % json.dumps(it.get("evidence"), ensure_ascii=False))
+        lines.append("    question: %s" % it.get("question"))
+    schema = bundle.get("answer_schema", {})
+    lines.append("")
+    lines.append(
+        "Respond with STRICT JSON only: {\"verdict\": <one of: %s>, \"confidence\": <0..1>, "
+        "\"summary\": <one paragraph>, \"per_item\": [ <one answer object per item, keyed by its "
+        "id, using each item's 'answer' template shape> ]}. Send nothing anywhere -- you ARE the "
+        "judgment model." % schema.get("verdict"))
+    return "\n".join(lines)
+
+
+def apply_fidelity_adjudication(report, answers):
+    """Fold the agent's JSON adjudication into an ADVISORY ``llm-assist`` record (mirror of
+    :func:`image_oracle.apply_adjudications`).
+
+    It never flips a deterministic verdict, never moves a score, and never renames/rebinds anything:
+    a BLOCKED gate stays BLOCKED (recorded as ``gate_locked``; the advisory ``effective_verdict`` can
+    never upgrade past it). The input ``report`` is not mutated; ``answers`` may be a dict or a JSON
+    string. Returns ``{available: False, reason}`` when the answer is not a parseable object."""
+    parsed = _parse_json_loose(answers) if isinstance(answers, str) else answers
+    cf = report.get("combined_fidelity") or {}
+    det_verdict = cf.get("verdict")
+    gate_locked = det_verdict == "blocked"
+    if not isinstance(parsed, dict):
+        return {"tier": "llm-assist", "available": False,
+                "reason": "no parseable agent adjudication (expected a JSON object)",
+                "deterministic_verdict": det_verdict, "gate_locked": gate_locked}
+    per_item = parsed.get("per_item")
+    if not isinstance(per_item, list):
+        per_item = []
+    llm_verdict = parsed.get("verdict")
+    # The advisory verdict can never UPGRADE past a deterministic block (warn-never-wrong analog).
+    effective = det_verdict if gate_locked else (det_verdict or llm_verdict)
+    notes = ["ADVISORY: agent adjudication adds judgment / diagnosis / fix suggestions; it never "
+             "changes a deterministic verdict or score."]
+    if gate_locked and llm_verdict and llm_verdict != "blocked":
+        notes.append(
+            "gate_locked: the deterministic openability gate is BLOCKED, so the model does not open "
+            "regardless of the agent's %r opinion -- the verdict stays blocked." % llm_verdict)
+    return {
+        "tier": "llm-assist", "available": True, "advisory": True,
+        "deterministic_verdict": det_verdict,
+        "effective_verdict": effective,
+        "llm_verdict": llm_verdict,
+        "gate_locked": gate_locked,
+        "confidence": parsed.get("confidence"),
+        "summary": parsed.get("summary"),
+        "adjudications": per_item,
+        "notes": notes,
+    }
+
+
+def llm_assist_tier(report, *, answers=None, max_items=200):
+    """Optional advisory LLM-assist tier: a deterministic harness, NOT an API client.
+
+    Builds the adjudication-request bundle + the driving-agent prompt from the oracle report. With
+    the agent's ``answers`` (a JSON string/dict) it folds them into an advisory record via
+    :func:`apply_fidelity_adjudication`; without them it returns ``{available: False, ...}`` carrying
+    the ``bundle`` + ``prompt`` so the agent running the skill can read, judge, and re-invoke. No
+    network, no key -- the agent IS the judgment model (mirror of the image oracle)."""
+    bundle = build_fidelity_bundle(report, max_items=max_items)
+    prompt = fidelity_agent_prompt(bundle)
+    if answers is None:
+        return {"tier": "llm-assist", "available": False,
+                "reason": "no agent adjudication provided; read 'prompt', judge the items, then "
+                          "re-invoke with answers (the agent is the judgment model -- nothing is "
+                          "sent anywhere)",
+                "bundle": bundle, "prompt": prompt}
+    record = apply_fidelity_adjudication(report, answers)
+    record["bundle"] = bundle
+    record["prompt"] = prompt
+    return record
+
+
+# =====================================================================================
 # Top-level convenience + CLI
 # =====================================================================================
+# Gate 0 (openability) dominates the combined headline: a model that does not deserialize cannot be
+# faithful no matter how the structural/value/image tiers score. The uncapped number is preserved as
+# ``raw_combined_score`` for diagnostics.
+_BLOCKED_COMBINED_SCORE = 0.0
+_FAITHFUL_CANDIDATE_MIN = 0.85
+
+
+def _fidelity_verdict(report, combined_score, openable):
+    """Three-band advisory headline: ``blocked`` -> ``opens-but-broken`` -> ``opens-needs-review``
+    -> ``faithful-candidate``. Openability dominates; a value-tier eval error means it opens but is
+    broken; otherwise a strong combined score reads as a faithful candidate."""
+    if openable is False:
+        return "blocked"
+    dax = report.get("dax_value")
+    if dax and dax.get("available") and dax.get("measures_errored"):
+        return "opens-but-broken"
+    if combined_score is not None and combined_score >= _FAITHFUL_CANDIDATE_MIN:
+        return "faithful-candidate"
+    if openable is True or combined_score is not None:
+        return "opens-needs-review"
+    return None
+
+
 def _combined_fidelity(report):
     """Fuse the tiers that actually ran into one advisory headline + a confidence flag.
 
@@ -2391,23 +2961,35 @@ def _combined_fidelity(report):
             iscore = img.get("ssim")
         if iscore is not None:
             tiers["image"] = float(iscore)
-    if not tiers:
+    openrec = report.get("openability")
+    openable = openrec.get("openable") if (openrec and openrec.get("available")) else None
+    if not tiers and openable is None:
         return None
     wsum = sum(COMBINED_WEIGHTS[k] for k in tiers)
     combined = sum(COMBINED_WEIGHTS[k] * v for k, v in tiers.items()) / wsum if wsum else None
     confidence = {3: "high", 2: "medium", 1: "low"}.get(len(tiers), "low")
-    return {
+    result = {
         "combined_score": round(combined, 4) if combined is not None else None,
         "band": _band(combined) if combined is not None else None,
         "confidence": confidence,
         "contributing_tiers": sorted(tiers),
         "tier_scores": {k: round(v, 4) for k, v in tiers.items()},
         "weights": {k: COMBINED_WEIGHTS[k] for k in tiers},
+        "openable": openable,
         "advisory": True,
         "note": ("Advisory headline fusing the tiers that ran (weights renormalized over those "
                  "present); confidence reflects how many tiers backed it, not their mutual "
                  "agreement -- a low image score pulling the headline down IS the signal."),
     }
+    # Gate 0 dominates: a model that does not deserialize cannot be faithful at any structural score.
+    if openable is False:
+        result["raw_combined_score"] = result["combined_score"]
+        result["raw_band"] = result["band"]
+        result["combined_score"] = _BLOCKED_COMBINED_SCORE
+        result["band"] = _band(_BLOCKED_COMBINED_SCORE)
+        result["blocked"] = True
+    result["verdict"] = _fidelity_verdict(report, result["combined_score"], openable)
+    return result
 
 
 def _load_field_aliases(path):
@@ -2459,7 +3041,8 @@ def _resolve_reference_png(source, name=None):
 
 def run_oracle(twb_path, report_dir, engine_report_path=None,
                dax_options=None, image_options=None, candidate_records_path=None,
-               field_aliases=None, validate=False):
+               field_aliases=None, validate=False, openability_options=None,
+               llm_options=None):
     """Read both sides and score them. Returns the advisory report dict.
 
     The structural tier always runs. The optional value/image tiers run only when their options are
@@ -2472,6 +3055,17 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
     pre-gate over ``report_dir`` and attaches an ADDITIVE ``pbir_validation`` record + a compact
     ``summary.pbir_valid`` flag -- it never feeds the structural aggregate, so calibration is
     unchanged whether or not it runs.
+
+    ``openability_options`` (optional; pass ``{}`` to enable with defaults) runs Gate 0 -- the TOM
+    ``TmdlSerializer`` openability pre-flight over the emitted ``*.SemanticModel/definition`` -- and
+    attaches it as ``openability``. It runs BEFORE the combined headline so a non-deserializing model
+    dominates the verdict (``blocked``). Lazy + guarded: absent pythonnet/TOM degrades to
+    ``{available: False, reason}``.
+
+    ``llm_options`` (optional; pass ``{}`` to enable) builds the advisory LLM-assist adjudication
+    bundle + agent prompt AFTER the combined headline is attached; pass ``{"answers": <json/dict>}``
+    to fold the agent's adjudication back. No network/key -- the agent running this skill is the
+    judgment model.
 
     ``image_options`` may carry ``render_pbip`` (a .pbip path): when set and no ``candidate_png`` is
     given, the Power BI candidate render is captured locally via the ``powerbi-desktop`` bridge and
@@ -2525,13 +3119,21 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
             report["image"] = image_tier(**opts)
         if render_record is not None:
             report["pbi_render"] = render_record
+        # Stash the resolved PNG paths so the LLM-assist tier can hand the actual render to the
+        # vision-capable agent (the image tier echoes only scores, not the paths it compared).
+        report["image_inputs"] = {"reference_png": opts.get("reference_png"),
+                                  "candidate_png": opts.get("candidate_png")}
     if validate:
         vrec = validate_pbir(report_dir)
         report["pbir_validation"] = vrec
         report["summary"]["pbir_valid"] = vrec.get("valid") if vrec.get("available") else None
+    if openability_options is not None:
+        report["openability"] = openability_tier(report_dir=report_dir, **openability_options)
     combined = _combined_fidelity(report)
     if combined is not None:
         report["combined_fidelity"] = combined
+    if llm_options is not None:
+        report["llm_assist"] = llm_assist_tier(report, **llm_options)
     return report
 
 
@@ -2541,9 +3143,16 @@ def render_markdown(report):
     lines = ["# Fidelity Oracle (advisory, structural)", ""]
     cf = report.get("combined_fidelity")
     if cf is not None:
-        lines.append("- **Combined fidelity:** %s (%s) — confidence %s [%s]" % (
+        headline = "- **Combined fidelity:** %s (%s) — confidence %s [%s]" % (
             cf["combined_score"], cf["band"], cf["confidence"],
-            ", ".join(cf["contributing_tiers"])))
+            ", ".join(cf["contributing_tiers"]))
+        if cf.get("verdict"):
+            headline += " — verdict **%s**" % cf["verdict"]
+        lines.append(headline)
+        if cf.get("blocked"):
+            lines.append("- ⛔ **BLOCKED (Gate 0):** the semantic model does not deserialize; "
+                         "combined score forced to 0.0 (raw was %s). Fix before any fidelity claim." %
+                         cf.get("raw_combined_score"))
     lines.append("- **Aggregate:** %s (%s)" % (
         s["aggregate_score"], s["aggregate_band"]))
     lines.append("- **Mean / worst visual:** %s / %s" % (
@@ -2687,6 +3296,45 @@ def render_markdown(report):
                     loc = ("%s %s" % (loc, d["json_path"])).strip()
                 lines.append("  - ERROR %s%s" % (d.get("message", ""),
                                                  (" (%s)" % loc) if loc else ""))
+    openrec = report.get("openability")
+    if openrec is not None:
+        lines.append("")
+        lines.append("## Openability gate (Gate 0, TOM TmdlSerializer)")
+        if not openrec.get("available"):
+            lines.append("- _unavailable_: %s" % openrec.get("reason"))
+        elif openrec.get("openable"):
+            lines.append("- ✅ **OPENS** — %s table(s), %s measure(s), %s relationship(s) "
+                         "deserialize cleanly." % (
+                             openrec.get("tables"), openrec.get("measures"),
+                             openrec.get("relationships")))
+            lines.append("- _Same TMDL grammar Power BI Desktop loads and Microsoft Fabric ingests; "
+                         "a faithful pre-flight for both, offline._")
+        else:
+            loc = openrec.get("error_file") or "?"
+            if openrec.get("error_line") is not None:
+                loc = "%s line %s" % (loc, openrec.get("error_line"))
+            lines.append("- ⛔ **BLOCKED** — model does not deserialize (%s)" % loc)
+            lines.append("  - %s" % openrec.get("error"))
+    llm = report.get("llm_assist")
+    if llm is not None:
+        lines.append("")
+        lines.append("## LLM-assist (advisory adjudication — the agent IS the judgment model)")
+        if not llm.get("available"):
+            lines.append("- _awaiting agent_: %s" % llm.get("reason"))
+            b = llm.get("bundle") or {}
+            bs = b.get("summary") or {}
+            lines.append("- Bundle ready: %s item(s), %s to review, %s blocker(s), %s image(s) to "
+                         "view. Read `prompt`, judge, re-invoke with answers." % (
+                             bs.get("items"), bs.get("to_review"), bs.get("blockers"),
+                             bs.get("image_refs")))
+        else:
+            lines.append("- **Effective verdict:** %s (deterministic: %s; agent: %s; gate_locked: "
+                         "%s)" % (llm.get("effective_verdict"), llm.get("deterministic_verdict"),
+                                  llm.get("llm_verdict"), llm.get("gate_locked")))
+            if llm.get("summary"):
+                lines.append("- %s" % llm.get("summary"))
+            for note in llm.get("notes", []):
+                lines.append("  - _%s_" % note)
     lines.append("")
     for note in report["notes"]:
         lines.append("> %s" % note)
@@ -2742,6 +3390,22 @@ def main(argv=None):
     ap.add_argument("--validate", action="store_true",
                     help="Run the first-party PBIR validation pre-gate (powerbi-report-author "
                          "validate); ADDITIVE -- it never changes the structural aggregate.")
+    ap.add_argument("--openability", action="store_true",
+                    help="Run Gate 0: the TOM TmdlSerializer openability pre-flight over the emitted "
+                         "*.SemanticModel/definition. A non-deserializing model dominates the verdict "
+                         "(blocked). Lazy + guarded: degrades to {available: False} without TOM.")
+    ap.add_argument("--tabular-editor-dir", default=None,
+                    help="Directory holding the TOM assemblies (e.g. a Tabular Editor install) for "
+                         "Gate 0. Implies --openability. Auto-discovered when omitted.")
+    ap.add_argument("--model-dir", default=None,
+                    help="Override the semantic-model folder Gate 0 inspects (defaults to the "
+                         "*.SemanticModel/definition resolved from report_dir).")
+    ap.add_argument("--llm", action="store_true",
+                    help="Build the advisory LLM-assist adjudication bundle + agent prompt (no "
+                         "network/key -- the agent running this skill is the judgment model).")
+    ap.add_argument("--llm-answers", default=None,
+                    help="Path to a JSON file of the agent's adjudication answers to fold back into "
+                         "the LLM-assist record. Implies --llm.")
     args = ap.parse_args(argv)
 
     dax_options = None
@@ -2763,10 +3427,25 @@ def main(argv=None):
             image_options["render_page_id"] = args.image_render_page
             image_options["render_options"] = {"scale": args.image_render_scale}
 
+    openability_options = None
+    if args.openability or args.tabular_editor_dir or args.model_dir:
+        openability_options = {}
+        if args.tabular_editor_dir:
+            openability_options["tabular_editor_dir"] = args.tabular_editor_dir
+        if args.model_dir:
+            openability_options["model_dir"] = args.model_dir
+    llm_options = None
+    if args.llm or args.llm_answers:
+        llm_options = {}
+        if args.llm_answers and os.path.isfile(args.llm_answers):
+            llm_options["answers"] = _read_json(args.llm_answers)
+
     report = run_oracle(args.twb, args.report_dir, args.engine_report,
                         dax_options=dax_options, image_options=image_options,
                         candidate_records_path=args.candidate_records,
-                        validate=args.validate)
+                        validate=args.validate,
+                        openability_options=openability_options,
+                        llm_options=llm_options)
     text = (render_markdown(report) if args.format == "md"
             else json.dumps(report, indent=2, ensure_ascii=False))
     if args.out:

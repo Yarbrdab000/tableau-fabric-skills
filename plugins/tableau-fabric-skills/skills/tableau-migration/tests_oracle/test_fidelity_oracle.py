@@ -1020,7 +1020,8 @@ def test_score_value_results():
 
 def test_normalize_expected_flat_and_rich():
     flat = fo._normalize_expected({"Sales": 100.0})
-    assert flat == [{"label": "Sales", "measure": "Sales", "expected": 100.0, "filter": None}]
+    assert flat == [{"label": "Sales", "measure": "Sales", "expected": 100.0,
+                     "filter": None, "query": None}]
     rich = fo._normalize_expected({
         "Sales (US map)": {"measure": "Sales", "expected": 2026.0,
                             "filter": "'Orders'[Country] = \"United States\""},
@@ -1078,6 +1079,79 @@ def test_evaluate_measure_wraps_filter_in_calculate():
     assert "CALCULATE([Sales]" in conn.sink["query"]
     assert "United States" in conn.sink["query"]
     assert filtered["ok"] is True and filtered["value"] == 123.0
+
+
+def test_normalize_expected_query_form():
+    checks = fo._normalize_expected({
+        "winners": {"query": "EVALUATE ROW(\"n\", 59)", "expected": 59},
+        "Sales": 100.0,  # flat entries still carry a (None) query key
+    })
+    by_label = {c["label"]: c for c in checks}
+    assert by_label["winners"]["query"] == "EVALUATE ROW(\"n\", 59)"
+    assert by_label["winners"]["expected"] == 59
+    assert by_label["Sales"]["query"] is None
+
+
+def test_evaluate_query_runs_scalar_and_captures_error():
+    conn = _FakeConn()
+    ok = fo._evaluate_query(conn, "EVALUATE ROW(\"v\", COUNTROWS('Orders'))")
+    assert conn.sink["query"] == "EVALUATE ROW(\"v\", COUNTROWS('Orders'))"
+    assert ok["ok"] is True and ok["value"] == 123.0 and ok["query"]
+
+    class _Boom:
+        def CreateCommand(self):
+            raise RuntimeError("syntax error near FOO")
+
+    bad = fo._evaluate_query(_Boom(), "EVALUATE FOO")
+    assert bad["ok"] is False and bad["value"] is None
+    assert "syntax error" in bad["error"]
+
+
+def test_dax_value_tier_dispatches_query_vs_measure(monkeypatch):
+    # A query-shaped expected entry must be evaluated by its own scalar DAX (calc-column path),
+    # while a plain entry goes through the measure path -- both compared under the same tolerance.
+    captured = []
+
+    class _Conn:
+        def Open(self):
+            pass
+
+        def Close(self):
+            pass
+
+    def _fake_rows(conn, query, columns):
+        captured.append(query)
+        if "DBSCHEMA_CATALOGS" in query:
+            return [{"CATALOG_NAME": "Model"}]
+        if "MDSCHEMA_MEASURES" in query:
+            return [{"MEASUREGROUP_NAME": "Orders", "MEASURE_NAME": "C1",
+                     "MEASURE_IS_VISIBLE": True}]
+        if "COUNTROWS('winners')" in query:
+            return [{"v": 59.0}]
+        if "[C1]" in query:
+            return [{"v": 1221139.3614}]
+        return [{"v": 0.0}]
+
+    # _load_adomd returns the connection *constructor*; the tier calls it as AdomdConnection(ds).
+    monkeypatch.setattr(fo, "_load_adomd", lambda: (lambda ds: _Conn()))
+    monkeypatch.setattr(fo, "_adomd_rows", _fake_rows)
+
+    out = fo.dax_value_tier(
+        port=12345,
+        measures=["C1"],
+        expected={
+            "C1 grand total": {"measure": "C1", "expected": 1221139.3614},
+            "winners distinct": {"query": "EVALUATE ROW(\"v\", COUNTROWS('winners'))",
+                                 "expected": 59},
+        },
+    )
+    assert out["available"] is True
+    cmp_by = {c["measure"]: c for c in out["comparisons"]}
+    assert cmp_by["C1 grand total"]["within_tolerance"] is True
+    win = cmp_by["winners distinct"]
+    assert win["within_tolerance"] is True and win.get("query")
+    # the query-shaped check ran its own scalar DAX, not a measure evaluation
+    assert any("COUNTROWS('winners')" in q for q in captured)
 
 
 def test_image_tier_regions_breakdown(tmp_path):
@@ -1531,5 +1605,322 @@ def test_run_oracle_image_reference_source_resolves(tmp_path, monkeypatch):
     # the bespoke reference_source/reference_name keys are consumed, not leaked into image_tier.
     assert os.path.basename(captured["reference_png"]) == "Sheet 1.png"
     assert "reference_source" not in captured and "reference_name" not in captured
+
+
+# =================================================================================================
+# Gate 0: openability (TOM TmdlSerializer pre-flight) -- all TOM access is monkeypatched, so the
+# suite never needs pythonnet/.NET; these exercise the harness, parsing, and degrade-paths only.
+# =================================================================================================
+class _FakeCount:
+    def __init__(self, n):
+        self.Count = n
+
+
+class _FakeTable:
+    def __init__(self, measures):
+        self.Measures = _FakeCount(measures)
+
+
+class _FakeModel:
+    def __init__(self, tables, rels):
+        self.Tables = [_FakeTable(m) for m in tables]
+        self.Relationships = _FakeCount(rels)
+
+
+class _FakeDb:
+    def __init__(self, tables=(2, 1), rels=1):
+        self.Model = _FakeModel(list(tables), rels)
+
+
+def _make_model_dir(base, name="Sample"):
+    """Create a minimal ``<name>.SemanticModel/definition`` folder (a single model.tmdl)."""
+    defn = os.path.join(base, "%s.SemanticModel" % name, "definition")
+    os.makedirs(defn)
+    with open(os.path.join(defn, "model.tmdl"), "w", encoding="utf-8") as fh:
+        fh.write("model Model\n")
+    return base
+
+
+def test_resolve_model_definition_from_report_parent(tmp_path):
+    base = _make_model_dir(str(tmp_path))
+    report_dir = os.path.join(base, "Sample.Report")
+    os.makedirs(report_dir)
+    defn = fo._resolve_model_definition(report_dir, None)
+    assert defn is not None and defn.lower().endswith("definition")
+    # model_dir pointing straight at the .SemanticModel resolves too; absent -> None.
+    assert fo._resolve_model_definition(None, os.path.join(base, "Sample.SemanticModel")) == defn
+    # An isolated tree whose parent also holds no model resolves to None (the walk-up is one level).
+    iso = tmp_path / "isolated"
+    iso.mkdir()
+    assert fo._resolve_model_definition(str(iso / "deep"), None) is None
+
+
+def test_parse_tmdl_error_location():
+    f, ln = fo._parse_tmdl_error_location("Error in '_Measures.tmdl' at line 5: bad token")
+    assert f == "_Measures.tmdl" and ln == 5
+    assert fo._parse_tmdl_error_location("no location here") == (None, None)
+    assert fo._parse_tmdl_error_location(None) == (None, None)
+
+
+def test_parse_tmdl_error_location_real_tom_shape():
+    # The actual TOM TmdlSerializer message: a 'Document - ...' payload + 'Line Number - N', followed
+    # by a dotted stack-trace type. The Document wins (not the stack-trace '...Tabular.Tmdl' type),
+    # and 'Line Number - 107' parses where a bare 'line N' regex would miss it.
+    msg = ("TMDL Format Error: Parsing error type - UnsupportedObjectType  Detailed error - "
+           "Unsupported object type - VAR is not a supported property in the current context!  "
+           "Document - './tables/_Measures'  Line Number - 107  Line - 'VAR d = SELECTEDVALUE("
+           "'Date'[Date])'     at Microsoft.AnalysisServices.Tabular.Tmdl.TmdlParser.ObjectContext")
+    f, ln = fo._parse_tmdl_error_location(msg)
+    assert f == "tables/_Measures"   # from the Document payload, NOT the stack-trace type
+    assert ln == 107
+
+
+def test_tom_model_stats_counts():
+    stats = fo._tom_model_stats(_FakeDb(tables=(2, 1, 0), rels=3))
+    assert stats == {"tables": 3, "measures": 3, "relationships": 3}
+
+
+def test_openability_tier_unavailable_no_model(tmp_path):
+    rec = fo.openability_tier(report_dir=str(tmp_path))
+    assert rec["available"] is False and "no *.SemanticModel" in rec["reason"]
+
+
+def test_openability_tier_unavailable_no_tom(tmp_path, monkeypatch):
+    base = _make_model_dir(str(tmp_path))
+    monkeypatch.setattr(fo, "_load_tmdl_serializer",
+                        lambda d=None: (_ for _ in ()).throw(RuntimeError("TOM assemblies not found")))
+    rec = fo.openability_tier(report_dir=base)
+    assert rec["available"] is False and "TOM/pythonnet not available" in rec["reason"]
+    assert rec["definition"].lower().endswith("definition")
+
+
+def test_openability_tier_opens(tmp_path, monkeypatch):
+    base = _make_model_dir(str(tmp_path))
+
+    class _Serializer:
+        @staticmethod
+        def DeserializeDatabaseFromFolder(path):
+            assert os.path.isdir(path)
+            return _FakeDb(tables=(2, 1), rels=1)
+
+    monkeypatch.setattr(fo, "_load_tmdl_serializer", lambda d=None: _Serializer)
+    rec = fo.openability_tier(report_dir=base)
+    assert rec["available"] is True and rec["openable"] is True
+    assert rec["verdict"] == "opens"
+    assert rec["tables"] == 2 and rec["measures"] == 3 and rec["relationships"] == 1
+    assert rec["advisory"] is True
+
+
+def test_openability_tier_blocked_parses_location(tmp_path, monkeypatch):
+    base = _make_model_dir(str(tmp_path))
+
+    class _Serializer:
+        @staticmethod
+        def DeserializeDatabaseFromFolder(path):
+            raise Exception("Failed in '_Measures.tmdl' at line 12: unexpected continuation")
+
+    monkeypatch.setattr(fo, "_load_tmdl_serializer", lambda d=None: _Serializer)
+    rec = fo.openability_tier(report_dir=base)
+    assert rec["available"] is True and rec["openable"] is False
+    assert rec["verdict"] == "blocked"
+    assert rec["error_file"] == "_Measures.tmdl" and rec["error_line"] == 12
+    assert "_Measures.tmdl" in rec["error"]
+
+
+# ------------------------------------------------------- Gate 0 dominates the combined headline ----
+def test_combined_fidelity_openability_blocks_and_keeps_raw():
+    report = {"summary": {"aggregate_score": 0.9},
+              "openability": {"available": True, "openable": False, "verdict": "blocked"}}
+    cf = fo._combined_fidelity(report)
+    assert cf["blocked"] is True
+    assert cf["combined_score"] == fo._BLOCKED_COMBINED_SCORE == 0.0
+    assert cf["raw_combined_score"] == pytest.approx(0.9)  # uncapped structural preserved
+    assert cf["verdict"] == "blocked"
+    assert cf["openable"] is False
+
+
+def test_combined_fidelity_openable_true_reads_faithful():
+    report = {"summary": {"aggregate_score": 0.9},
+              "openability": {"available": True, "openable": True}}
+    cf = fo._combined_fidelity(report)
+    assert "blocked" not in cf
+    assert cf["openable"] is True
+    assert cf["verdict"] == "faithful-candidate"
+
+
+def test_combined_fidelity_verdict_additive_without_openability():
+    # No openability tier at all: verdict is still emitted, openable is None, nothing is blocked.
+    high = fo._combined_fidelity({"summary": {"aggregate_score": 0.9}})
+    assert high["openable"] is None and "blocked" not in high
+    assert high["verdict"] == "faithful-candidate"
+    assert high["combined_score"] == pytest.approx(0.9)
+    mid = fo._combined_fidelity({"summary": {"aggregate_score": 0.7}})
+    assert mid["verdict"] == "opens-needs-review"
+
+
+def test_combined_fidelity_opens_but_broken_on_measure_error():
+    report = {"summary": {"aggregate_score": 0.9},
+              "dax_value": {"available": True, "value_score": 0.9, "measures_errored": 1},
+              "openability": {"available": True, "openable": True}}
+    cf = fo._combined_fidelity(report)
+    assert cf["verdict"] == "opens-but-broken"
+
+
+def test_combined_fidelity_openability_only_blocked():
+    # Openability is the ONLY tier and it failed: still a blocked verdict, score forced to 0.0.
+    cf = fo._combined_fidelity({"openability": {"available": True, "openable": False}})
+    assert cf is not None
+    assert cf["contributing_tiers"] == []
+    assert cf["blocked"] is True and cf["combined_score"] == 0.0
+    assert cf["verdict"] == "blocked"
+
+
+# =================================================================================================
+# LLM-assist adjudication harness (a deterministic producer; the agent IS the judgment model).
+# =================================================================================================
+def _blocked_report():
+    report = {"summary": {"aggregate_score": 0.9, "unmatched_worksheets": []},
+              "visuals": [{"worksheet": "Bars", "visual_type": "barChart", "score": 0.6,
+                           "band": "review", "fields_missing": ["Profit"], "fields_extra": [],
+                           "type_note": None, "diagnosis": None}],
+              "openability": {"available": True, "openable": False, "verdict": "blocked",
+                              "error": "Failed in '_Measures.tmdl' at line 12",
+                              "error_file": "_Measures.tmdl", "error_line": 12}}
+    report["combined_fidelity"] = fo._combined_fidelity(report)
+    return report
+
+
+def test_build_fidelity_bundle_shape():
+    report = _blocked_report()
+    bundle = fo.build_fidelity_bundle(report)
+    assert bundle["version"] == fo.LLM_BUNDLE_VERSION
+    assert bundle["kind"] == fo.LLM_BUNDLE_KIND
+    assert bundle["rules"] == list(fo.FIDELITY_ORACLE_RULES)
+    assert bundle["deterministic"]["verdict"] == "blocked"
+    assert bundle["deterministic"]["gate_locked"] is True
+    assert bundle["deterministic"]["openable"] is False
+    ids = {it["id"] for it in bundle["items"]}
+    assert "blocker:openability" in ids and "visual:Bars" in ids
+    assert bundle["summary"]["blockers"] >= 1
+    # serialisable + never mutates the report
+    json.dumps(bundle)
+    assert "llm_assist" not in report
+
+
+def test_build_fidelity_bundle_vision_item(tmp_path):
+    png = tmp_path / "render.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n")
+    report = {"summary": {"aggregate_score": 0.9}, "visuals": [],
+              "image": {"available": True, "ssim": 0.7, "band": "advisory"},
+              "pbi_render": {"available": True, "pages": [{"page_id": "P1", "png": str(png)}]}}
+    report["combined_fidelity"] = fo._combined_fidelity(report)
+    bundle = fo.build_fidelity_bundle(report)
+    assert bundle["summary"]["image_refs"] == 1
+    assert len(bundle["image_refs"]) == 1
+    vis = [it for it in bundle["items"] if it["id"] == "visual-diff:render"]
+    assert vis and vis[0]["kind"] == "vision"
+    assert vis[0]["evidence"]["image_refs"][0]["role"] == "powerbi-render"
+
+
+def test_fidelity_image_refs_dedups_and_skips_missing(tmp_path):
+    png = tmp_path / "a.png"
+    png.write_bytes(b"x")
+    report = {"image_inputs": {"reference_png": None, "candidate_png": str(png)},
+              "pbi_render": {"available": True,
+                             "pages": [{"page_id": "P1", "png": str(png)},          # dup of candidate
+                                       {"page_id": "P2", "png": str(tmp_path / "missing.png")}]}}
+    refs = fo._fidelity_image_refs(report)
+    assert len(refs) == 1 and os.path.basename(refs[0]["path"]) == "a.png"
+
+
+def test_fidelity_agent_prompt_lists_rules_items_images(tmp_path):
+    png = tmp_path / "r.png"
+    png.write_bytes(b"\x89PNG")
+    report = {"summary": {"aggregate_score": 0.9}, "visuals": [],
+              "pbi_render": {"available": True, "pages": [{"page_id": "P1", "png": str(png)}]}}
+    report["combined_fidelity"] = fo._combined_fidelity(report)
+    prompt = fo.fidelity_agent_prompt(fo.build_fidelity_bundle(report))
+    assert "Hard rules:" in prompt
+    assert "Deterministic verdict (authoritative" in prompt
+    assert "Rendered images to VIEW" in prompt and str(png) in prompt
+    assert "STRICT JSON" in prompt
+
+
+def test_apply_fidelity_adjudication_cannot_unblock():
+    report = _blocked_report()
+    answers = {"verdict": "faithful-candidate", "confidence": 0.95, "summary": "looks ok to me",
+               "per_item": [{"id": "blocker:openability", "judgment": "blocker"}]}
+    rec = fo.apply_fidelity_adjudication(report, answers)
+    assert rec["available"] is True
+    assert rec["deterministic_verdict"] == "blocked"
+    assert rec["effective_verdict"] == "blocked"          # advisory cannot upgrade past the block
+    assert rec["gate_locked"] is True
+    assert rec["llm_verdict"] == "faithful-candidate"
+    assert any("gate_locked" in n for n in rec["notes"])
+
+
+def test_apply_fidelity_adjudication_accepts_json_string():
+    report = {"combined_fidelity": {"verdict": "faithful-candidate"}}
+    rec = fo.apply_fidelity_adjudication(
+        report, '{"verdict": "faithful-candidate", "confidence": 0.8, "per_item": []}')
+    assert rec["available"] is True and rec["gate_locked"] is False
+    assert rec["effective_verdict"] == "faithful-candidate"
+
+
+def test_apply_fidelity_adjudication_garbage_unavailable():
+    report = {"combined_fidelity": {"verdict": "opens-needs-review"}}
+    rec = fo.apply_fidelity_adjudication(report, "not json at all")
+    assert rec["available"] is False and "no parseable" in rec["reason"]
+    assert rec["deterministic_verdict"] == "opens-needs-review"
+
+
+def test_llm_assist_tier_without_answers_carries_bundle_and_prompt():
+    report = _blocked_report()
+    rec = fo.llm_assist_tier(report)
+    assert rec["available"] is False
+    assert "bundle" in rec and "prompt" in rec
+    assert rec["bundle"]["kind"] == fo.LLM_BUNDLE_KIND
+
+
+def test_llm_assist_tier_with_answers_folds_back():
+    report = _blocked_report()
+    rec = fo.llm_assist_tier(report, answers={"verdict": "blocked", "confidence": 0.9,
+                                              "summary": "model does not parse", "per_item": []})
+    assert rec["available"] is True
+    assert rec["effective_verdict"] == "blocked"
+    assert "bundle" in rec and "prompt" in rec
+
+
+# ----------------------------------------------------------------- run_oracle wires the new tiers --
+def test_run_oracle_openability_wired_blocks(tmp_path, monkeypatch):
+    report_dir = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    twb = tmp_path / "wb.twb"
+    twb.write_text(TWB_XML, encoding="utf-8")
+    monkeypatch.setattr(
+        fo, "openability_tier",
+        lambda **kw: {"tier": "openability", "available": True, "openable": False,
+                      "verdict": "blocked", "error": "boom", "error_file": "_Measures.tmdl",
+                      "error_line": 12, "advisory": True})
+    result = fo.run_oracle(str(twb), report_dir, openability_options={})
+    assert result["openability"]["openable"] is False
+    cf = result["combined_fidelity"]
+    assert cf["blocked"] is True and cf["verdict"] == "blocked"
+    assert cf["combined_score"] == 0.0 and "raw_combined_score" in cf
+    assert "⛔" in fo.render_markdown(result)
+
+
+def test_run_oracle_llm_wired_without_and_with_answers(tmp_path):
+    report_dir = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    twb = tmp_path / "wb.twb"
+    twb.write_text(TWB_XML, encoding="utf-8")
+    no_answers = fo.run_oracle(str(twb), report_dir, llm_options={})
+    assert no_answers["llm_assist"]["available"] is False
+    assert "bundle" in no_answers["llm_assist"] and "prompt" in no_answers["llm_assist"]
+    with_answers = fo.run_oracle(
+        str(twb), report_dir,
+        llm_options={"answers": {"verdict": "faithful-candidate", "confidence": 0.8,
+                                 "summary": "clean", "per_item": []}})
+    assert with_answers["llm_assist"]["available"] is True
+    assert "LLM-assist" in fo.render_markdown(with_answers)
 
 
