@@ -114,9 +114,34 @@ def tmdl_annotation_value(name, value, indent="\t\t"):
     brackets and braces are fine unquoted). Internal line breaks / whitespace runs
     are collapsed to single spaces so the value always stays on one physical line --
     guaranteed-valid TMDL. Translated measures are single-line and round-trip
-    byte-for-byte; only multi-line fallback formulas (inert stubs) are normalized."""
+    byte-for-byte; only multi-line fallback formulas (inert stubs) are normalized.
+
+    An EMPTY value renders nothing (the annotation is elided): TMDL has no valid
+    empty-value annotation form -- `annotation Name = ` with no value fails to parse
+    and would block the whole model from opening. Eliding loses nothing, since there
+    is no formula text to preserve in that case."""
     v = " ".join((value or "").split())
+    if not v:
+        return ""
     return f"{indent}annotation {name} = {v}\n"
+
+def _tmdl_assignment(decl, expr, body_indent="\t\t\t"):
+    """Render a TMDL ``<decl> = <expr>`` assignment for a measure or calculated column.
+
+    A SINGLE-LINE expression stays inline (``<decl> = <expr>``) and round-trips
+    byte-for-byte -- the deterministic translator and the collapsed approved channel
+    both emit single-line DAX, so their output is unchanged.
+
+    A MULTI-LINE expression (e.g. a deterministic ``VAR ... RETURN ...`` body) is emitted
+    as a BLOCK: ``<decl> =`` alone on its line (no trailing space), then every body line
+    indented one level DEEPER (3 tabs) than the 2-tab measure/column property level. TMDL
+    reads the whole indented block as the expression and ends it at the first shallower
+    (property) line. Without this, continuation lines land at column 0 and the model fails
+    to open (TOM BLOCKED)."""
+    if "\n" not in expr:
+        return f"{decl} = {expr}\n"
+    body = "".join(f"{body_indent}{line}\n" for line in expr.split("\n"))
+    return f"{decl} =\n{body}"
 
 def generate_measure_tmdl(field_name, formula, dax=None, *, suggestion=None,
                           translated_by="deterministic"):
@@ -135,8 +160,8 @@ def generate_measure_tmdl(field_name, formula, dax=None, *, suggestion=None,
     and approve it. The suggestion is NEVER the live expression until approved."""
     expr = dax if dax else "0"
     out = (
-        f"\n\tmeasure {q(field_name)} = {expr}\n"
-        f"\t\tlineageTag: {uuid.uuid4()}\n"
+        _tmdl_assignment(f"\n\tmeasure {q(field_name)}", expr)
+        + f"\t\tlineageTag: {uuid.uuid4()}\n"
     )
     out += tmdl_annotation_value("TableauFormula", formula)
     if dax:
@@ -172,7 +197,7 @@ def generate_calc_column_tmdl(field_name, formula, dax=None, *, tmdl_type=None,
     ``tmdl_type`` optionally pins the column ``dataType`` (e.g. ``string``/``int64``); when
     omitted the engine infers it from the expression (matching the Date table's calc columns)."""
     expr = dax if dax else "BLANK()"
-    out = f"\n\tcolumn {q(field_name)} = {expr}\n"
+    out = _tmdl_assignment(f"\n\tcolumn {q(field_name)}", expr)
     if is_hidden:
         out += "\t\tisHidden\n"
     if tmdl_type:

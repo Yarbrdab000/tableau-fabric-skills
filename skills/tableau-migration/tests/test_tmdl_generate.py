@@ -38,6 +38,53 @@ def test_stub_measure_is_inert_and_preserves_formula_on_one_line():
     assert "annotation TranslatedBy" not in m
 
 
+# -- multi-line / empty-value openability (TMDL must parse / TOM must open) ----
+def test_single_line_measure_dax_stays_inline_byte_for_byte():
+    # the common path (deterministic single-line DAX + the collapsed approved channel)
+    # keeps the inline `= <expr>` form -- no newline injected after `=`.
+    m = generate_measure_tmdl("Total Sales", "SUM([Sales])", "SUM('Orders'[Sales])")
+    assert "\n\tmeasure 'Total Sales' = SUM('Orders'[Sales])\n" in m
+    assert "'Total Sales' =\n" not in m   # never the block form for single-line DAX
+
+
+def test_multiline_measure_dax_emits_indented_block_never_column_zero():
+    # a deterministic multi-line measure (e.g. the Date Filter keep-flag's VAR/RETURN/SWITCH)
+    # must be emitted as an indented block: `= ` then body lines one level DEEPER than the
+    # 2-tab property level. Continuation lines at column 0 are invalid TMDL -> TOM BLOCKED.
+    dax = "VAR anchor = 1\nRETURN\n    SWITCH(TRUE(), anchor>0, 1, 0)"
+    m = generate_measure_tmdl("Date Filter", "IF [x] THEN 1 END", dax)
+    # declaration closes at `=` with NO trailing space (a trailing-space `= ` reads as a stub)
+    assert "\n\tmeasure 'Date Filter' =\n" in m
+    for line in ("VAR anchor = 1", "RETURN", "    SWITCH(TRUE(), anchor>0, 1, 0)"):
+        assert f"\t\t\t{line}\n" in m        # body indented at the 3-tab block level
+        assert f"\n{line}\n" not in m         # ...and NEVER flush-left at column 0
+    # properties resume at the 2-tab level and close the expression block
+    assert "\t\tlineageTag:" in m
+    assert "annotation TableauFormula = IF [x] THEN 1 END" in m
+    assert "annotation TranslatedBy = deterministic" in m
+
+
+def test_empty_formula_measure_elides_tableau_formula_annotation():
+    # a synthesized measure with no Tableau formula (e.g. a measure-swap SUM) must NOT emit
+    # `annotation TableauFormula = ` with an empty value -- that is invalid TMDL and blocks
+    # the whole model from opening. The annotation is elided; a real formula is still kept.
+    m = generate_measure_tmdl("count orders", "", "COUNTROWS('Orders')")
+    assert "= COUNTROWS('Orders')" in m
+    assert "annotation TableauFormula" not in m
+    m2 = generate_measure_tmdl("Profit", "SUM([Profit])", "SUM('Orders'[Profit])")
+    assert "annotation TableauFormula = SUM([Profit])" in m2
+
+
+def test_multiline_calc_column_dax_emits_indented_block():
+    # the column-mode renderer applies the same block treatment as the measure renderer.
+    dax = "VAR a = 1\nRETURN\n    a + 1"
+    c = generate_calc_column_tmdl("Banded", "IF [x] THEN 1 END", dax, tmdl_type="int64")
+    assert "\n\tcolumn Banded =\n" in c
+    assert "\t\t\tVAR a = 1\n" in c
+    assert "\t\t\tRETURN\n" in c
+    assert "\n\t\tdataType: int64" in c   # property resumes at the 2-tab level after the block
+
+
 # -- type mapping --------------------------------------------------------------
 @pytest.mark.parametrize("spark,expected", [
     ("string", "string"),
