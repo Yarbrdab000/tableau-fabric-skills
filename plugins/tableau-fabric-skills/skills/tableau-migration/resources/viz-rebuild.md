@@ -437,7 +437,7 @@ model, so it is supplied to the rebuild through the optional `param_binding` con
 ```
 param_binding = {
   "slicers": { "<parameter internal_name>": {"table", "column", "single_select"?, "caption"?} },
-  "flags":   { "<tableau filter token>":    {"entity", "measure", "status", "value"} }
+  "flags":   { "<tableau filter token>":    {"entity", "measure", "value", "visuals", "status"?} }
 }
 ```
 
@@ -449,10 +449,21 @@ it is **rebuilt as a categorical slicer** on `table[column]`, placed at the cont
 standing warning is dropped. `single_select` is **recorded** for a later (Tier-2) selection-mode
 pass but no single-select object is emitted yet (no verified PBIR shape — warn-never-wrong defers
 the toggle rather than risk an unfaithful visual). A value-picker (disconnected picker-table)
-parameter arrives in the same `{table, column}` slicer shape and rebuilds identically. The
-`flags` map (parameter-driven measure / relative-date filters applied as a visual-level
-`flag == value` filter) is a separate, later consumer pass — those worksheet-level filter
-warnings stand until it lands.
+parameter arrives in the same `{table, column}` slicer shape and rebuilds identically.
+
+The `flags` map carries a **model keep-flag** — a parameter-driven keep calc (e.g. a relative-date
+window selector that returns a keep-value to KEEP a mark and is `BLANK` otherwise) that the model
+build translated into a measure. Each entry is keyed by the calc token and names its home `entity`,
+the model `measure`, the keep `value`, and the `visuals` it scopes (the Tableau worksheet names the
+calc filtered, sourced from the workbook's calc usage). Every named worksheet's rebuilt visual then
+gets a **visual-level measure filter** `[measure] == value` — a top-level `filterConfig` `Advanced`
+filter whose `field` is a `Measure` ref (bound by `Entity`) and whose `Where` comparison
+(`ComparisonKind` 0 = Equal) reaches the measure through the `From` source alias — so the visual
+opens on the same windowed rows, and the now-obsolete `aggregate/measure filter on '<token>'`
+worksheet warning is dropped for it. The applied measure is recorded on the candidate record's
+additive `flag_filters` fact. Warn-never-wrong governs the edges: a flag with a non-numeric value,
+an empty/absent `visuals` scope, or a scope naming a worksheet the workbook lacks is left
+**unapplied** with an honest warning — a filter is never applied to a guessed set of visuals.
 
 Until the model identifies a target (no `param_binding`, or an entry missing its column), each
 control emits one honest `dashboard`-scope warning (surfaced as a `warned` fidelity row) and

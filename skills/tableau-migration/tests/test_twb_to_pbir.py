@@ -15,9 +15,12 @@ from twb_to_pbir import (
     PAGE_HEIGHT,
     PAGE_WIDTH,
     SCHEMA_VISUAL_FP,
+    _drop_resolved_flag_warnings,
+    _flag_filter_container,
     _norm_param_key,
     _reconcile_caption_fallback,
     _resolve_parameter_controls,
+    _resolve_visual_flags,
     build_field_parameter_page,
     emit_pbir,
     field_parameter_slicer,
@@ -2164,6 +2167,178 @@ def test_migrate_twb_to_pbir_accepts_param_binding_and_places_slicer_in_dashboar
     pos = v["position"]
     assert 0 <= pos["x"] <= PAGE_WIDTH and 0 <= pos["y"] <= PAGE_HEIGHT
     assert pos["x"] > PAGE_WIDTH / 2  # the control was on the right (x=80000 of 100000)
+
+
+# -- model keep-flag -> visual-level measure filter (param_binding["flags"]) ---
+# A translated parameter-driven keep calc (e.g. a relative-date window selector) comes back from the
+# model build as a measure in ``param_binding["flags"][<token>] = {entity, measure, value, visuals}``;
+# each scoped worksheet's rebuilt visual then carries a visual-level ``[measure] == value`` measure
+# filter so it opens on the SAME windowed rows, and the now-obsolete parse-time "aggregate/measure
+# filter on '<token>'" warning is dropped for that worksheet. Warn-never-wrong governs the edges: a
+# non-numeric value, an empty/absent scope, or a worksheet the workbook lacks leaves the filter
+# UNAPPLIED with a warning -- never applied to a guessed set of visuals.
+_DATE_FILTER_CALC = (
+    "<column caption='Date Filter' datatype='boolean' name='[DateFilterCalc]' "
+    "role='measure' type='quantitative'>"
+    "<calculation class='tableau' formula='IF LAST()&lt;=15 THEN 1 END' />"
+    "</column>"
+    "<column-instance column='[DateFilterCalc]' derivation='None' "
+    "name='[none:DateFilterCalc:qk]' pivot='key' type='quantitative' />")
+_DATE_FILTER_FILT = ("<filter class='quantitative' "
+                     "column='[federated.abc].[none:DateFilterCalc:qk]' />")
+
+
+def _flag_pb(visuals, *, measure="Date Filter", entity="_Measures", value=1, token="Date Filter"):
+    return {"flags": {token: {"entity": entity, "measure": measure,
+                              "status": "translated", "value": value, "visuals": visuals}}}
+
+
+def _flagged_line_worksheet(name="Line chart"):
+    # a faithful line chart that ALSO carries an aggregate/measure filter on a "Date Filter" calc --
+    # so the bare parse warns "aggregate/measure filter on 'Date Filter'" and a flag can supersede it.
+    return _worksheet(name, "Line",
+                      rows="[federated.abc].[sum:Sales:qk]",
+                      cols="[federated.abc].[mn:Order Date:ok]",
+                      deps_extra=_INST + _DATE_FILTER_CALC, filters=_DATE_FILTER_FILT)
+
+
+def _measure_filter_containers(parts):
+    out = []
+    for v in _visual_parts(parts).values():
+        for cont in (v.get("filterConfig") or {}).get("filters", []):
+            if "Measure" in cont.get("field", {}):
+                out.append(cont)
+    return out
+
+
+def test_flag_filter_container_is_advanced_measure_equals_filter():
+    cont = _flag_filter_container("_Measures", "Date Filter", "1L", "flag-x")
+    # the top-level field references the measure by its home Entity ...
+    assert cont["field"]["Measure"]["Property"] == "Date Filter"
+    assert cont["field"]["Measure"]["Expression"]["SourceRef"] == {"Entity": "_Measures"}
+    assert cont["type"] == "Advanced"
+    assert cont["howCreated"] == "User"
+    assert cont["filter"]["From"][0] == {"Name": "f", "Entity": "_Measures", "Type": 0}
+    cmp_ = cont["filter"]["Where"][0]["Condition"]["Comparison"]
+    assert cmp_["ComparisonKind"] == 0  # Equal
+    # ... but the Where comparison reaches it through the From SOURCE alias, never the Entity (an
+    # Entity inside Where is a silent filter failure)
+    assert cmp_["Left"]["Measure"]["Expression"]["SourceRef"] == {"Source": "f"}
+    assert cmp_["Left"]["Measure"]["Property"] == "Date Filter"
+    assert cmp_["Right"]["Literal"]["Value"] == "1L"
+
+
+def test_resolve_visual_flags_maps_each_scoped_worksheet():
+    warnings = []
+    by_ws = _resolve_visual_flags(_flag_pb(["A", "B"]), {"A": {}, "B": {}}, warnings)
+    assert set(by_ws) == {"A", "B"}
+    assert len(by_ws["A"]) == 1 and len(by_ws["B"]) == 1
+    assert by_ws["A"][0]["field"]["Measure"]["Property"] == "Date Filter"
+    lit = by_ws["A"][0]["filter"]["Where"][0]["Condition"]["Comparison"]["Right"]["Literal"]["Value"]
+    assert lit == "1L"
+    assert warnings == []
+
+
+def test_resolve_visual_flags_decimal_value_emits_double_literal():
+    by_ws = _resolve_visual_flags(_flag_pb(["A"], value=1.5), {"A": {}}, [])
+    lit = by_ws["A"][0]["filter"]["Where"][0]["Condition"]["Comparison"]["Right"]["Literal"]["Value"]
+    assert lit == "1.5D"
+
+
+def test_resolve_visual_flags_non_numeric_value_warns_and_skips():
+    warnings = []
+    by_ws = _resolve_visual_flags(_flag_pb(["A"], value="abc"), {"A": {}}, warnings)
+    assert by_ws == {}
+    assert any("non-numeric keep-value" in w["reason"] for w in warnings)
+
+
+def test_resolve_visual_flags_empty_visuals_warns_and_skips():
+    warnings = []
+    by_ws = _resolve_visual_flags(_flag_pb([]), {"A": {}}, warnings)
+    assert by_ws == {}
+    assert any("no worksheet scope" in w["reason"] for w in warnings)
+
+
+def test_resolve_visual_flags_unknown_worksheet_warns_and_skips():
+    warnings = []
+    by_ws = _resolve_visual_flags(_flag_pb(["Ghost"]), {"A": {}}, warnings)
+    assert by_ws == {}
+    assert any("not in the workbook" in w["reason"] for w in warnings)
+
+
+def test_drop_resolved_flag_warnings_prunes_only_matching_worksheet_token():
+    warnings = [
+        {"scope": "worksheet", "name": "Line chart",
+         "reason": "manual attention required: aggregate/measure filter on 'Date Filter' (...)"},
+        {"scope": "worksheet", "name": "Other",
+         "reason": "manual attention required: aggregate/measure filter on 'Date Filter' (...)"},
+        {"scope": "worksheet", "name": "Line chart",
+         "reason": "manual attention required: date part 'Month' on 'Order Date' (...)"},
+    ]
+    _drop_resolved_flag_warnings(warnings, [("Line chart", "Date Filter")])
+    assert len(warnings) == 2  # only the (Line chart, Date Filter) aggregate warning is removed
+    tags = {(w["name"], "aggregate" in w["reason"], "date part" in w["reason"]) for w in warnings}
+    assert ("Other", True, False) in tags          # a different worksheet is untouched
+    assert ("Line chart", False, True) in tags      # an unrelated warning on the same ws survives
+
+
+def test_param_binding_flag_applies_measure_filter_to_scoped_visual():
+    ws = _flagged_line_worksheet("Line chart")
+    ir = parse_twb(_workbook(ws), param_binding=_flag_pb(["Line chart"]))
+    assert len(ir["visual_flags"]["Line chart"]) == 1
+
+    conts = _measure_filter_containers(emit_pbir(ir))
+    assert len(conts) == 1
+    cont = conts[0]
+    assert cont["type"] == "Advanced"
+    assert cont["field"]["Measure"]["Property"] == "Date Filter"
+    cmp_ = cont["filter"]["Where"][0]["Condition"]["Comparison"]
+    assert cmp_["ComparisonKind"] == 0
+    assert cmp_["Left"]["Measure"]["Expression"]["SourceRef"] == {"Source": "f"}
+    assert cmp_["Right"]["Literal"]["Value"] == "1L"
+
+
+def test_param_binding_flag_clears_aggregate_measure_filter_warning():
+    ws = _flagged_line_worksheet("Line chart")
+    # without the flag the worksheet keeps its honest "not mapped to a slicer" warning ...
+    bare = parse_twb(_workbook(ws))
+    assert any("aggregate/measure filter on 'Date Filter'" in w["reason"] for w in bare["warnings"])
+    # ... and the model keep-flag supersedes it (the visual filters on the measure instead)
+    ir = parse_twb(_workbook(ws), param_binding=_flag_pb(["Line chart"]))
+    assert not any("aggregate/measure filter on 'Date Filter'" in w["reason"]
+                   for w in ir["warnings"])
+
+
+def test_param_binding_flag_scoped_to_absent_worksheet_applies_nothing():
+    ws = _flagged_line_worksheet("Line chart")
+    ir = parse_twb(_workbook(ws), param_binding=_flag_pb(["Ghost sheet"]))
+    assert ir["visual_flags"] == {}
+    assert any("not in the workbook" in w["reason"] for w in ir["warnings"])
+    # warn-never-wrong: the real visual gets NO measure filter (the scope is never guessed) ...
+    assert _measure_filter_containers(emit_pbir(ir)) == []
+    # ... and the worksheet keeps its own honest aggregate-filter warning
+    assert any("aggregate/measure filter on 'Date Filter'" in w["reason"] for w in ir["warnings"])
+
+
+def test_no_flags_leaves_visuals_and_records_untouched():
+    ws = _worksheet("Plain", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    res = migrate_twb_to_pbir(_workbook(ws))
+    assert res["ir"]["visual_flags"] == {}
+    assert _measure_filter_containers(res["parts"]) == []
+    assert all("flag_filters" not in r for r in res["candidate_records"])
+
+
+def test_migrate_twb_to_pbir_flag_filter_lands_on_part_and_candidate_record():
+    ws = _flagged_line_worksheet("Line chart")
+    res = migrate_twb_to_pbir(_workbook(ws), param_binding=_flag_pb(["Line chart"]))
+    # the emitted visual part carries the measure filter ...
+    conts = _measure_filter_containers(res["parts"])
+    assert len(conts) == 1
+    assert conts[0]["field"]["Measure"]["Property"] == "Date Filter"
+    # ... and the candidate record names the applied keep-flag measure (additive fact)
+    rec = [r for r in res["candidate_records"] if r["worksheet"] == "Line chart"][0]
+    assert rec["flag_filters"] == ["Date Filter"]
 
 
 # -- multi-datasource: each field binds to its own relation --------------------

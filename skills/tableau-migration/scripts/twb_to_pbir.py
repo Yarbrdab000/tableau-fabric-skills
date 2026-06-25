@@ -2097,6 +2097,84 @@ def _resolve_parameter_controls(dashboards, params, warnings, param_binding=None
     return records
 
 
+def _resolve_visual_flags(param_binding, ws_by_name, warnings):
+    """Resolve ``param_binding["flags"]`` into per-worksheet visual-level keep-filters.
+
+    The model build translates a Tableau keep-flag calc (a CASE/IF over a parameter that returns a
+    keep-value to KEEP a mark and is BLANK otherwise -- e.g. a relative-date window selector) into a
+    model measure and hands it back as ``flags[<token>] = {"entity", "measure", "value", "visuals"}``:
+    ``token`` is the calc caption, ``measure`` the emitted model measure, ``entity`` its home table
+    (default ``_Measures``), ``value`` the keep-value, and ``visuals`` the Tableau worksheet names the
+    calc filters (sourced from the workbook's calc usage). Each named worksheet's rebuilt visual then
+    carries a visual-level measure filter ``[measure] == value`` (built by :func:`_flag_filter_container`)
+    so it opens on the SAME windowed rows, and the now-obsolete parse-time "aggregate/measure filter on
+    '<token>'" warning is dropped for that worksheet. Presence in ``flags`` means the model approved the
+    translation -- an advisory ``status``/``entity`` stamp is not gated on (``entity`` is still read as
+    the measure's home table).
+
+    Warn-never-wrong governs the edges: a flag with a non-numeric keep-value, an empty/absent
+    ``visuals`` scope, or a scope naming a worksheet the workbook lacks is left UNAPPLIED with an
+    honest warning -- a visual filter is never applied to a guessed set of visuals. Returns
+    ``{worksheet_name: [filter_container, ...]}`` (empty when there are no resolvable flags).
+    """
+    by_ws = {}
+    resolved = []
+    for token, spec in ((param_binding or {}).get("flags") or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        measure = spec.get("measure")
+        if not measure:
+            continue
+        entity = spec.get("entity") or "_Measures"
+        literal = _semantic_numeric_literal(str(spec.get("value", 1)))
+        visuals = spec.get("visuals") or []
+        if literal is None:
+            warnings.append(_warn(
+                "filter", measure,
+                f"model keep-flag '{measure}' has a non-numeric keep-value -> left unapplied"))
+            continue
+        if not visuals:
+            warnings.append(_warn(
+                "filter", measure,
+                f"model keep-flag '{measure}' carries no worksheet scope -> left unapplied "
+                f"(a visual filter is not emitted rather than guess the scope)"))
+            continue
+        for ws_name in visuals:
+            if ws_name not in ws_by_name:
+                warnings.append(_warn(
+                    "filter", measure,
+                    f"model keep-flag '{measure}' scoped to worksheet '{ws_name}', which is not in "
+                    f"the workbook -> skipped for that worksheet"))
+                continue
+            name = _sanitize(f"flag-{ws_name}-{token}")
+            by_ws.setdefault(ws_name, []).append(
+                _flag_filter_container(entity, measure, literal, name))
+            resolved.append((ws_name, token))
+    if resolved:
+        _drop_resolved_flag_warnings(warnings, resolved)
+    return by_ws
+
+
+def _drop_resolved_flag_warnings(warnings, resolved):
+    """Drop the now-obsolete parse-time "aggregate/measure filter on '<token>'" warnings for the
+    ``(worksheet, token)`` pairs a model keep-flag rebuilt. Mutates ``warnings`` in place; every other
+    warning is preserved (this only ever REMOVES an advisory the model superseded)."""
+    obsolete = set(resolved)
+    kept = []
+    for w in warnings:
+        drop = False
+        if isinstance(w, dict) and w.get("scope") == "worksheet":
+            reason = w.get("reason") or ""
+            for ws_name, token in obsolete:
+                if (w.get("name") == ws_name
+                        and f"aggregate/measure filter on '{token}'" in reason):
+                    drop = True
+                    break
+        if not drop:
+            kept.append(w)
+    warnings[:] = kept
+
+
 def _parse_parameters(root):
     """Index workbook parameters: ``{param_id: {"caption", "datatype", "members":[{value, alias}]}}``.
 
@@ -2243,10 +2321,11 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
     params = _parse_parameters(root)
     parameter_controls = _resolve_parameter_controls(dashboards, params, warnings, param_binding)
     sheet_swaps = _detect_sheet_swaps(worksheets, dashboards, params, warnings)
+    visual_flags = _resolve_visual_flags(param_binding, ws_by_name, warnings)
 
     return {"worksheets": worksheets, "dashboards": dashboards,
             "sheet_swaps": sheet_swaps, "parameter_controls": parameter_controls,
-            "warnings": warnings}
+            "visual_flags": visual_flags, "warnings": warnings}
 
 
 # -- PBIR field expression emission --------------------------------------------
@@ -3069,6 +3148,52 @@ def _range_condition(entity, prop, lo, hi):
     return _cmp(2, lo) if lo is not None else _cmp(4, hi)
 
 
+# -- measure keep-flag -> visual-level filter ----------------------------------
+# A Tableau keep-flag calc (a CASE/IF over a parameter that returns a keep-value to KEEP a mark and
+# is BLANK otherwise) is translated by the model build into a measure and handed back via
+# ``param_binding["flags"]``. Each scoped worksheet's rebuilt visual then carries a visual-level
+# measure filter ``[measure] == <keep-value>`` so it opens on the SAME windowed rows. A measure
+# filter is always an ``Advanced`` filter; its top-level ``field`` is a Measure ref bound by
+# ``Entity`` (the measure's home table), while the inner ``Where`` comparison references the measure
+# through the ``From`` source alias (``Source``) -- using ``Entity`` inside ``Where`` is a silent
+# filter failure. Shape verified against the published semantic-query schema + real PBIR reports
+# (``ComparisonKind`` 0 = Equal). Mirrors ``_filter_container`` but with a ``Measure`` (not
+# ``Column``) reference.
+def _filter_measure_ref(entity, prop, *, source=None):
+    src = {"Source": source} if source else {"Entity": entity}
+    return {"Measure": {"Expression": {"SourceRef": src}, "Property": prop}}
+
+
+def _flag_filter_container(entity, measure, literal, name):
+    """One visual-level measure keep-filter container (``[measure] == literal``, Equal)."""
+    condition = {"Comparison": {
+        "ComparisonKind": 0,  # Equal
+        "Left": _filter_measure_ref(entity, measure, source=_FILTER_SOURCE_ALIAS),
+        "Right": {"Literal": {"Value": literal}}}}
+    return {
+        "name": name,
+        "field": _filter_measure_ref(entity, measure),
+        "type": "Advanced",
+        "filter": {
+            "Version": 2,
+            "From": [{"Name": _FILTER_SOURCE_ALIAS, "Entity": entity, "Type": 0}],
+            "Where": [{"Condition": condition}],
+        },
+        "howCreated": "User",
+    }
+
+
+def _flag_filter_config_for(ir, ws_name):
+    """The visual-level ``filterConfig`` for a worksheet's resolved model keep-flags, else ``None``.
+
+    Reads the additive ``ir["visual_flags"]`` map (built at parse time by ``_resolve_visual_flags``).
+    Returns ``{"filters": [container, ...]}`` so the rebuilt visual opens windowed, or ``None`` when
+    no flag is scoped to this worksheet (the visual then carries no ``filterConfig`` -- byte-for-byte
+    the prior behaviour)."""
+    containers = (ir.get("visual_flags") or {}).get(ws_name)
+    return {"filters": list(containers)} if containers else None
+
+
 def _slicer_filter_config(field, model_table, field_map, name, warnings):
     """Build a slicer ``filterConfig`` from an applied Tableau filter selection/range, else ``None``.
 
@@ -3386,9 +3511,11 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             pos = _position(x, y, w, h, tab=i)
             value_objects, cf_fact = _conditional_format(
                 ws, state, model_table, field_map, warnings)
+            flag_fc = _flag_filter_config_for(ir, ws["name"])
             visuals.append(_visual_json(
                 vname, vtype, pos, state,
                 _sort_definition(ws, state, model_table, field_map),
+                filter_config=flag_fc,
                 title=ws.get("title"), axis_titles=ws.get("axis_titles"),
                 value_objects=value_objects))
             rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
@@ -3396,6 +3523,9 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                                     model_table=model_table, field_map=field_map)
             if cf_fact:
                 rec["conditional_format"] = cf_fact
+            if flag_fc:
+                rec["flag_filters"] = [c["field"]["Measure"]["Property"]
+                                       for c in flag_fc["filters"]]
             records.append(rec)
         visuals += _emit_slicers(page_ws, page_name, model_table, field_map, warnings)
         visuals += _emit_param_control_slicers(
@@ -3422,9 +3552,11 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         pos = _position(40, 40, 880, 620)
         value_objects, cf_fact = _conditional_format(
             ws, state, model_table, field_map, warnings)
+        flag_fc = _flag_filter_config_for(ir, ws["name"])
         main = _visual_json(
             vname, vtype, pos, state,
             _sort_definition(ws, state, model_table, field_map),
+            filter_config=flag_fc,
             title=ws.get("title"), axis_titles=ws.get("axis_titles"),
             value_objects=value_objects)
         rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
@@ -3432,6 +3564,9 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                                 model_table=model_table, field_map=field_map)
         if cf_fact:
             rec["conditional_format"] = cf_fact
+        if flag_fc:
+            rec["flag_filters"] = [c["field"]["Measure"]["Property"]
+                                   for c in flag_fc["filters"]]
         records.append(rec)
         visuals = [main] + _emit_slicers([ws], page_name, model_table, field_map, warnings)
         _emit_page(parts, page_name, ws["name"], visuals)
@@ -3548,11 +3683,16 @@ def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
     driver, etc. references the real measure. Without it, those pills degrade-and-warn unchanged.
 
     ``param_binding`` (optional) carries the model build's resolved parameter targets --
-    ``{"slicers": {<param id>: {"table", "column", "single_select", "caption"}}, "flags": {...}}``.
+    ``{"slicers": {<param id>: {"table", "column", "single_select", "caption"}},
+    "flags": {<token>: {"entity", "measure", "value", "visuals"}}}``.
     When given, a dashboard parameter control whose target column the model identified is rebuilt as a
     single-select slicer at the control's own dashboard zone (the standing "not rebuilt as a slicer
     yet" warning is then cleared for that control). Controls the model did not resolve keep their
     warning; without the binding every control degrades-and-warns unchanged (warn-never-wrong).
+    ``flags`` carries model keep-flag measures (a translated parameter-driven keep calc): each named
+    worksheet's rebuilt visual gets a visual-level ``[measure] == value`` filter so it opens windowed,
+    and the obsolete "aggregate/measure filter on '<token>'" warning is cleared for it; a flag with no
+    worksheet scope, an unknown worksheet, or a non-numeric value is left unapplied and warned.
     """
     ir = parse_twb(xml_text, date_binding=date_binding, row_count_binding=row_count_binding,
                    measure_binding=measure_binding, param_binding=param_binding)
