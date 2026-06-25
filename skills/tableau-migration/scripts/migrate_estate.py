@@ -505,11 +505,21 @@ def _viz_adapter(cand):
         params = set()
     name_kwargs = {"report_name", "dataset_name"} & params
     supports_date = "date_binding" in params
-    def _call(twb_text, name, date_binding=None):
+    supports_rowcount = "row_count_binding" in params
+    supports_measure = "measure_binding" in params
+    supports_param = "param_binding" in params
+    def _call(twb_text, name, date_binding=None, measure_binding=None, row_count_binding=None,
+              param_binding=None):
         if name_kwargs:
             kwargs = {k: name for k in name_kwargs}
             if supports_date and date_binding is not None:
                 kwargs["date_binding"] = date_binding
+            if supports_rowcount and row_count_binding is not None:
+                kwargs["row_count_binding"] = row_count_binding
+            if supports_measure and measure_binding is not None:
+                kwargs["measure_binding"] = measure_binding
+            if supports_param and param_binding is not None:
+                kwargs["param_binding"] = param_binding
             return cand(twb_text, **kwargs)
         return cand(twb_text, name)
     return _call
@@ -863,6 +873,210 @@ def _date_binding_from_model(res_report):
     return {"date_table": dr["table"], "active_keys": active, "key_column": "Date"}
 
 
+def _measure_binding_from_model(res_report):
+    """Derive the report binder's ``measure_binding`` from the model build's calc->measure facts.
+
+    Pure CONSUMER of the datasource-migration report (it never re-translates a calc): it shapes the
+    model build's own calc->measure identity into the ``{"measures": {key: entry}}`` map that
+    ``twb_to_pbir._lookup_measure_binding`` reads, so a workbook-local calc / quick-table-calc pill
+    the model emitted as a named ``_Measures`` measure rebinds to that real measure -- deterministic
+    and token-keyed (the locked model<->viz contract). Each ``entry`` carries ``model_table`` +
+    ``measure_name`` + ``status``; the consumer binds ONLY a translated / assisted-approved entry and
+    degrades-and-warns on anything else.
+
+    Two sources, in priority:
+      1. ``report["calc_bindings"]`` -- the model build's consolidated index keyed by BOTH the calc
+         instance token (``pcdf:usr:Calculation_*:qk``) and the bare calc id / caption. Passed
+         through verbatim so the join token is byte-identical to what the model stamped (never
+         re-derived here).
+      2. otherwise, per-measure ``source`` tags on ``report["measures"]`` rows (a pre-``calc_bindings``
+         shape): only rows that carry an explicit ``calc_instance_token`` / ``calc_id`` /
+         ``field_caption`` are keyed, so plain ``<column>`` calcs keep their existing caption-based
+         ``_Measures`` binding untouched.
+
+    Returns ``None`` when the model produced no token-identified calc measure, so the report keeps its
+    standing field resolution (warn-never-wrong; byte-unchanged until a real binding exists).
+    """
+    rr = res_report or {}
+    index = rr.get("calc_bindings")
+    if isinstance(index, dict):
+        entries = {k: v for k, v in index.items() if k and isinstance(v, dict)}
+        if entries:
+            return {"measures": entries}
+    entries = {}
+    for row in rr.get("measures") or []:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("measure")
+        src = row.get("source")
+        if not name or not isinstance(src, dict):
+            continue
+        entry = {"model_table": src.get("model_table") or "_Measures",
+                 "measure_name": name, "status": row.get("status")}
+        for key in (src.get("calc_instance_token"), src.get("calc_id"), src.get("field_caption")):
+            if key:
+                entries.setdefault(key, entry)
+    return {"measures": entries} if entries else None
+
+
+def _row_count_binding_from_model(res_report):
+    """Derive the report binder's ``row_count_binding`` from the model build's COUNTROWS facts.
+
+    Pure CONSUMER of the datasource-migration report (it never re-derives a count). A dashboard's
+    implicit object-id ``COUNT(*)`` pill (e.g. the pilot's ``COUNT(Orders)`` line value) carries NO
+    calc token, so it must bind by FACT TABLE rather than by a calc id -- a channel distinct from
+    ``measure_binding``. Once the model build lowers an object-id count to a ``COUNTROWS('<fact>')``
+    measure (the g1 lowering) and surfaces it, this shapes that fact into the binder's
+    ``row_count_binding`` (the ``twb_to_pbir._row_count_measure_target`` contract):
+    ``{"measures": {<table>: {"entity", "measure"}}, "default": {"entity", "measure"}}``. An
+    ``object_id`` count binds ONLY on its own table (never via ``default`` -- it names a specific
+    fact); the legacy single-fact ``numrec`` count binds via ``default``.
+
+    Two sources, in priority (both additive; passed through, never re-derived):
+      1. ``report["row_count_binding"]`` -- already in the consumer shape; normalised + passed
+         through verbatim so the table->measure identity is byte-identical to what the model emitted.
+      2. ``report["row_count_measures"]`` -- a convenience ``{<table>: {entity, measure}}`` (or
+         ``{<table>: "<measure name>"}``) map plus an optional ``"default"``; normalised to the
+         shape above (a bare name defaults to the ``_Measures`` table).
+      3. ``report["model_manifest"]["row_count"]`` -- the same fact-table -> COUNTROWS-measure
+         mapping when the model build surfaces it nested inside its additive ``model_manifest``
+         (either the nested ``{"measures": {...}, "default": {...}}`` shape or a flat
+         ``{<table>: target}`` map). A scalar / non-mapping value here (e.g. a diagnostic row total)
+         is ignored -- only real table->measure targets bind, so this is safe regardless of shape.
+
+    Returns ``None`` when the model exposed no row-count measure, so the report keeps its precise
+    "implicit row count ... left unbound" warning (warn-never-wrong; byte-unchanged until a real
+    measure exists -- on a model with no such fact this is a no-op).
+    """
+    rr = res_report or {}
+
+    def _target(m):
+        if isinstance(m, str):
+            return {"entity": "_Measures", "measure": m} if m else None
+        if not isinstance(m, dict):
+            return None
+        entity = m.get("entity") or m.get("model_table") or "_Measures"
+        measure = m.get("measure") or m.get("measure_name")
+        return {"entity": entity, "measure": measure} if measure else None
+
+    def _shape(measures_map, default_val):
+        measures = {}
+        for table, m in (measures_map or {}).items():
+            if table == "default":
+                continue
+            tv = _target(m)
+            if table and tv:
+                measures[table] = tv
+        out = {}
+        if measures:
+            out["measures"] = measures
+        dflt = _target(default_val)
+        if dflt:
+            out["default"] = dflt
+        return out or None
+
+    def _from_obj(obj):
+        # Accept either the nested consumer shape ({"measures": {...}, "default": {...}}) or a flat
+        # convenience map ({<table>: target, "default": target}). A non-dict (or a dict carrying no
+        # bindable target) yields None, so an absent/scalar source is a clean no-op.
+        if not isinstance(obj, dict) or not obj:
+            return None
+        if isinstance(obj.get("measures"), dict):
+            return _shape(obj.get("measures"), obj.get("default"))
+        return _shape(obj, obj.get("default"))
+
+    for src in (rr.get("row_count_binding"),
+                rr.get("row_count_measures"),
+                (rr.get("model_manifest") or {}).get("row_count")):
+        shaped = _from_obj(src)
+        if shaped:
+            return shaped
+    return None
+
+
+def _param_binding_from_model(res_report):
+    """Derive the report binder's ``param_binding`` from the model build's parameter / filter facts.
+
+    Pure CONSUMER of the datasource-migration report (it never re-derives a parameter). A Tableau
+    dashboard parameter control, and a parameter-driven measure/calc filter, have no faithful Tier-1
+    rebuild until the model build identifies what the parameter targets -- a real dimension column (a
+    plain slicer), a disconnected picker table (a value-picker slicer), or a flag MEASURE that
+    encodes a relative-date / measure window (applied as a visual-level ``flag = 1`` filter). This
+    shapes those model facts into the ``twb_to_pbir`` consumer contract so the viz layer can emit
+    faithful slicers + flag filters instead of the standing "not rebuilt as a slicer yet" /
+    "aggregate-measure filter not mapped" warnings (warn-never-wrong: nothing is emitted unless the
+    model confirmed the target, and a flag binds only for a translated / assisted-approved measure).
+
+    Returns ``{"slicers": {<param id>: {"table", "column", "single_select", "caption"}},
+    "flags": {<tableau filter token>: {"entity", "measure", "status", "value"}}}`` or ``None`` when
+    the model exposed nothing bindable (so the report keeps its precise warnings, byte-unchanged).
+
+    Sources (all additive; passed through, never re-derived), in priority:
+      1. ``report["param_binding"]`` -- already in the consumer shape; normalised + passed through.
+      2. ``report["model_manifest"]["parameters"]`` -- a list of ``{name, internal_name, kind,
+         model_object, target_column?, picker?}`` records. A ``kind="filter"`` param with a resolved
+         ``target_column`` becomes a plain slicer on that real column; a ``kind="value"`` param with
+         a ``picker`` (a disconnected ``{table, column}`` picker table) becomes a value-picker
+         slicer. ``model_object``/missing targets bind nothing (degrade-and-warn in viz).
+      3. ``report["filter_bindings"]`` (or the same key nested in ``model_manifest``) -- a token-keyed
+         ``{<tableau filter token>: {model_table, measure_name, status, predicate}}`` map for the
+         flag measures (e.g. a relative-date "Date Window Flag"); bound iff ``status`` is
+         ``translated`` / ``assisted-approved``.
+    """
+    rr = res_report or {}
+    _BIND_OK = ("translated", "assisted-approved")
+
+    def _field(spec, *, single):
+        if not isinstance(spec, dict):
+            return None
+        table = spec.get("table") or spec.get("entity") or spec.get("model_table")
+        column = spec.get("column") or spec.get("property")
+        if not table or not column:
+            return None
+        return {"table": table, "column": column, "single_select": single}
+
+    direct = rr.get("param_binding")
+    if isinstance(direct, dict) and (direct.get("slicers") or direct.get("flags")):
+        return {"slicers": dict(direct.get("slicers") or {}),
+                "flags": dict(direct.get("flags") or {})}
+
+    manifest = rr.get("model_manifest") or {}
+    slicers, flags = {}, {}
+
+    for p in (manifest.get("parameters") or []):
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("internal_name") or p.get("param_id") or p.get("id")
+        caption = p.get("name") or p.get("caption")
+        # A value-picker (disconnected picker table) wins over a plain target column when both are
+        # present; both yield a single-select slicer (a Tableau parameter is a single-value control).
+        field = _field(p.get("picker"), single=True) \
+            or _field(p.get("target_column") or p.get("target"), single=True)
+        if pid and field:
+            field["caption"] = caption
+            slicers[pid] = field
+
+    fb = rr.get("filter_bindings") or manifest.get("filter_bindings") or {}
+    for token, spec in (fb.items() if isinstance(fb, dict) else []):
+        if not isinstance(spec, dict):
+            continue
+        measure = spec.get("measure_name") or spec.get("measure")
+        status = (spec.get("status") or "").lower()
+        if not measure or status not in _BIND_OK:
+            continue
+        pred = spec.get("predicate") if isinstance(spec.get("predicate"), dict) else {}
+        flags[token] = {
+            "entity": spec.get("model_table") or spec.get("entity") or "_Measures",
+            "measure": measure,
+            "status": status,
+            "value": pred.get("value", 1),
+        }
+
+    if not slicers and not flags:
+        return None
+    return {"slicers": slicers, "flags": flags}
+
+
 def _ds_calc_columns(ds_el):
     """Calculated fields defined directly on a datasource element.
 
@@ -1031,22 +1245,54 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
         return
 
     report_parts = _rebind_report_byPath(result["parts"], model_safe)
-    # Date-table rebind: now that the real model is in hand, re-run the viz stage with the model's
-    # date facts so date axis pills on the ACTIVE business date bind to the shared marked Date table
-    # (Date[Year], ...) -- routing time intelligence through the calendar instead of the fact's raw
-    # date column. Consumes the model build's facts; never recomputes them. Best-effort + additive:
-    # any failure (or a model with no usable Date table) silently keeps the source-column binding.
+    # Model-fact rebind: now that the real model is in hand, re-run the viz stage ONCE with the
+    # model build's facts so the report binds to what the model actually emitted (the contract is
+    # model build -> facts -> single-pass viz). Two consumed facts, both additive + best-effort:
+    #  * date_binding -- date axis pills on the ACTIVE business date bind to the shared marked Date
+    #    table (Date[Year], ...), routing time intelligence through the calendar instead of the
+    #    fact's raw date column.
+    #  * measure_binding -- workbook-local calc / quick-table-calc pills the model translated into
+    #    named ``_Measures`` measures rebind to those real, token-keyed measures (warn-never-wrong:
+    #    only translated/assisted-approved entries bind; anything else degrades-and-warns in viz).
+    #  * row_count_binding -- implicit object-id COUNT(*) pills (which carry no calc token) rebind to
+    #    the model's per-fact COUNTROWS measure by table name, so a dashboard's row-count value (e.g.
+    #    the pilot's COUNT(Orders) line) lands on the real measure instead of being left unbound.
+    #  * param_binding -- dashboard parameter controls + parameter-driven measure/calc filters rebind
+    #    to faithful slicers (a real dimension column, or the model's disconnected picker table) and a
+    #    visual-level flag = 1 filter (a model-owned relative-date / window flag MEASURE), clearing the
+    #    "not rebuilt as a slicer yet" / "aggregate-measure filter not mapped" warnings. Warn-never-
+    #    wrong: a slicer needs a model-confirmed target column/picker, a flag binds only when the
+    #    measure is translated/assisted-approved; anything unconfirmed keeps its standing warning.
+    # Either failure (or a model with no usable Date table / no calc measures / no row-count measure)
+    # silently keeps the standing source-column / deferred binding.
     date_binding = _date_binding_from_model(res_report)
-    if date_binding and viz is not None:
+    measure_binding = _measure_binding_from_model(res_report)
+    row_count_binding = _row_count_binding_from_model(res_report)
+    param_binding = _param_binding_from_model(res_report)
+    if (date_binding or measure_binding or row_count_binding or param_binding) and viz is not None:
         try:
-            rebuilt = viz(twb_text, detail.get("name") or safe_base, date_binding=date_binding)
+            rebuilt = viz(twb_text, detail.get("name") or safe_base,
+                          date_binding=date_binding, measure_binding=measure_binding,
+                          row_count_binding=row_count_binding, param_binding=param_binding)
             if isinstance(rebuilt, dict) and rebuilt.get("parts"):
                 report_parts = _rebind_report_byPath(rebuilt["parts"], model_safe)
-                detail["date_rebind"] = {"date_table": date_binding["date_table"],
-                                         "active_keys": date_binding["active_keys"]}
+                if date_binding:
+                    detail["date_rebind"] = {"date_table": date_binding["date_table"],
+                                             "active_keys": date_binding["active_keys"]}
+                if measure_binding:
+                    detail["measure_rebind"] = {
+                        "count": len((measure_binding.get("measures") or {}))}
+                if row_count_binding:
+                    detail["row_count_rebind"] = {
+                        "count": len((row_count_binding.get("measures") or {}))
+                        + (1 if row_count_binding.get("default") else 0)}
+                if param_binding:
+                    detail["param_rebind"] = {
+                        "slicers": len((param_binding.get("slicers") or {})),
+                        "flags": len((param_binding.get("flags") or {}))}
         except Exception as exc:
-            warns.append(_PBIP_WARN + f"date-table rebind skipped ({type(exc).__name__}: {exc}) -- "
-                         f"report date axes bind to the source date column")
+            warns.append(_PBIP_WARN + f"model-fact rebind skipped ({type(exc).__name__}: {exc}) -- "
+                         f"report binds to the standing source/deferred fields")
     # M1.3 ref cross-check: now that the real model is in hand, drop any viz projection that
     # references a measure/column the model did not emit (an optimistic `_Measures[caption]` bind
     # that dangles), so the whole viz layer is warn-never-wrong on field references -- not just MV.

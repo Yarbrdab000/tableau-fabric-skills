@@ -554,9 +554,69 @@ def _bind_or_warn_row_count(rc, ds, worksheet, base_id, field_id, deriv,
     return None
 
 
+# -- cross-layer measure binding (consumer of the model build's calc->measure manifest) --------
+# The locked model<->viz contract: the datasource-migration (model) build translates each
+# workbook calc / quick-table-calc into a named ``_Measures`` measure and hands back a token-keyed
+# manifest; the dashboard (viz) build rebinds the matching pills to those real measures so a
+# visual references the measure instead of a dangling caption/formula. Binding is DETERMINISTIC
+# (token-keyed, never a fuzzy name match) and only for measures the model actually produced.
+_MEASURE_BIND_OK = frozenset({"translated", "assisted-approved"})
+
+
+def _measure_binding_entries(measure_binding):
+    """Normalise the consumer-owned ``measure_binding`` into a flat ``{key: entry}`` map.
+
+    Accepts a flat ``{key: entry}`` dict or a ``{"measures": {key: entry}}`` wrapper (mirroring
+    ``row_count_binding``). Each entry carries ``entity``/``model_table`` + ``measure``/
+    ``measure_name`` + an optional ``status``.
+    """
+    if not isinstance(measure_binding, dict) or not measure_binding:
+        return {}
+    inner = measure_binding.get("measures")
+    return inner if isinstance(inner, dict) else measure_binding
+
+
+def _measure_binding_candidate_keys(field_id, base_id, caption, worksheet):
+    """Candidate lookup keys in deterministic join priority (token first, never fuzzy):
+    pill instance token > bare calc id > ``worksheet|caption`` > caption. Mirrors the locked
+    contract so a translated calc binds by its stable token even when captions collide."""
+    keys = []
+    for k in (field_id, base_id,
+              (f"{worksheet}|{caption}" if worksheet and caption else None),
+              caption):
+        if k and k not in keys:
+            keys.append(k)
+    return keys
+
+
+def _lookup_measure_binding(measure_binding, field_id, base_id, caption, worksheet):
+    """Resolve a calc pill to its translated ``(entity, measure)`` model measure, or ``None``.
+
+    Binds ONLY when a candidate key hits an entry whose ``status`` is bindable (translated /
+    assisted-approved -- a missing status is treated as translated, since the model build only
+    emits an entry for a measure it produced); any other status (assisted-suggested / stub /
+    handoff) or a miss returns ``None`` so the caller degrades-and-warns. Default (no binding
+    supplied) -> ``None`` -> byte-unchanged.
+    """
+    entries = _measure_binding_entries(measure_binding)
+    if not entries:
+        return None
+    for key in _measure_binding_candidate_keys(field_id, base_id, caption, worksheet):
+        entry = entries.get(key)
+        if not isinstance(entry, dict):
+            continue
+        if (entry.get("status") or "translated") not in _MEASURE_BIND_OK:
+            continue
+        measure = entry.get("measure") or entry.get("measure_name")
+        entity = entry.get("entity") or entry.get("model_table") or MEASURES_TABLE
+        if measure:
+            return (entity, measure)
+    return None
+
+
 def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
                    worksheet, warnings, warn_special=True, internal_fields=None,
-                   date_binding=None, row_count_binding=None):
+                   date_binding=None, row_count_binding=None, measure_binding=None):
     """Resolve one shelf/encoding pill into an IR field dict (or ``None`` if it must be dropped).
 
     Records a structured warning whenever a token cannot be bound to a model field, or is
@@ -581,6 +641,31 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
         base_id, deriv = inst["column"], inst["derivation"]
     else:
         base_id, deriv = field_id, "None"
+
+    # Cross-layer measure binding (consumer of the model build's calc->measure manifest, the locked
+    # model<->viz contract). A workbook-local calc or quick-table-calc pill that the model build
+    # translated into a named ``_Measures`` measure is rebound here to that measure -- exact,
+    # deterministic, token-keyed. Runs BEFORE the base-column resolve so a table-calc instance whose
+    # base is not itself a model column (e.g. a ``pcdf`` percent-difference pill) still binds by its
+    # token. Only a translated / assisted-approved entry binds (warn-never-wrong); a miss falls
+    # through to the existing resolve/degrade path. Default (no binding supplied) -> byte-unchanged.
+    if measure_binding:
+        _mb_base = base_cols.get((ds, base_id)) or {}
+        mb = _lookup_measure_binding(measure_binding, field_id, base_id,
+                                     _mb_base.get("caption"), worksheet)
+        if mb is not None:
+            m_entity, m_measure = mb
+            return {
+                "caption": _mb_base.get("caption") or m_measure,
+                "field_id": base_id, "instance": field_id,
+                "role": "measure",
+                "datatype": tableau_type_to_simple(_mb_base.get("datatype")) or "integer",
+                "is_calc": True, "derivation": deriv, "aggregation": None,
+                "entity": m_entity, "property": m_measure,
+                "binding": "measure", "kind": "value",
+                "geo_area": None, "formula": _mb_base.get("formula"),
+                "measure_rebound": True,
+            }
 
     # Implicit row count (object-id COUNT(*) / legacy [Number of Records]) -> a COUNTROWS measure.
     # Runs BEFORE the internal-field silent drop (object-id) and the base-column resolve (which
@@ -688,14 +773,14 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
 
 def _resolve_shelf(text, ds_default, base_cols, instances, index, ds_caption,
                    worksheet, warnings, warn_special=True, internal_fields=None,
-                   date_binding=None, row_count_binding=None):
+                   date_binding=None, row_count_binding=None, measure_binding=None):
     fields = []
     for tok in _TOKEN_RE.findall(text or ""):
         ds, fid = _split_token(tok)
         f = _resolve_field(ds or ds_default, fid, base_cols, instances, index,
                            ds_caption, worksheet, warnings, warn_special=warn_special,
                            internal_fields=internal_fields, date_binding=date_binding,
-                           row_count_binding=row_count_binding)
+                           row_count_binding=row_count_binding, measure_binding=measure_binding)
         if f:
             fields.append(f)
     return fields
@@ -703,7 +788,7 @@ def _resolve_shelf(text, ds_default, base_cols, instances, index, ds_caption,
 
 def _parse_encodings(pane, ds_default, base_cols, instances, index, ds_caption,
                      worksheet, warnings, warn_special=True, internal_fields=None,
-                     date_binding=None, row_count_binding=None):
+                     date_binding=None, row_count_binding=None, measure_binding=None):
     enc = {"color": None, "size": None, "label": None, "detail": None, "angle": None}
     if pane is None:
         return enc
@@ -721,7 +806,7 @@ def _parse_encodings(pane, ds_default, base_cols, instances, index, ds_caption,
         f = _resolve_field(ds or ds_default, fid, base_cols, instances, index,
                            ds_caption, worksheet, warnings, warn_special=warn_special,
                            internal_fields=internal_fields, date_binding=date_binding,
-                           row_count_binding=row_count_binding)
+                           row_count_binding=row_count_binding, measure_binding=measure_binding)
         if f and enc[role] is None:
             enc[role] = f
     return enc
@@ -824,6 +909,18 @@ _RANK_TABLECALC_RE = re.compile(
     r"\b(INDEX|RANK|RANK_DENSE|RANK_MODIFIED|RANK_PERCENTILE|RANK_UNIQUE)\s*\(", re.I)
 
 
+def _has_continuous_date(fields):
+    """True when an axis carries a CONTINUOUS (green) Tableau date pill.
+
+    A continuous date is a date *truncation* -- Tableau serialises it with a ``*-Trunc`` derivation
+    (e.g. ``Day-Trunc`` / ``Month-Trunc``, pill prefixes ``tdy:`` / ``tmn:``). Truncation is a
+    date-only operation, so the ``-Trunc`` suffix unambiguously marks a continuous date axis; a
+    discrete date PART (Year / Month, derivation in ``_DATE_PARTS``) is NOT continuous. Under an
+    Automatic mark Tableau renders a continuous date + a measure as a LINE (a discrete date -> bars).
+    """
+    return any(str(f.get("derivation") or "").endswith("-Trunc") for f in fields)
+
+
 def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
                  enc_dims=(), enc_meas=(), geo_detail=False, map_meas=False,
                  map_signal=False):
@@ -919,6 +1016,15 @@ def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
         return VT_UNSUPPORTED
 
     if m in ("bar", "automatic", ""):
+        # An Automatic mark over a CONTINUOUS (green) date axis is Tableau's default LINE chart: a
+        # continuous date + a measure renders as a line (a discrete date PART -> bars). An explicit
+        # ``bar`` mark always stays bars. The field bindings are identical to a line over the same
+        # shelves -- only the chart TYPE differs -- so this is squarely Tier-1 "right chart type".
+        # Dual-axis / combo splitting still runs downstream on the VT_LINE result, so a
+        # column+line combo over a date is unaffected.
+        if m in ("automatic", "") and axis_meas and (
+                _has_continuous_date(dims_cols) or _has_continuous_date(dims_rows)):
+            return VT_LINE
         # vertical bars: category on cols (x), measure on rows (y)
         if dims_cols and meas_rows and not meas_cols:
             return VT_COLUMN
@@ -1443,6 +1549,92 @@ def _parse_axis_titles(table, dims_rows, dims_cols, meas_rows, meas_cols):
     return out
 
 
+# A pill instance token can wrap the underlying field in a Tableau quick table calc -- e.g.
+# "Percent Difference From" -> ``pcdf:``, running total -> ``cum:``, the window aggregates ->
+# ``w*:``, INDEX/RANK -> ``index:`` / ``rank:``. Such a pill computes a DERIVED quantity that is
+# NOT a plain model measure, so a background colour scale driven by one must DEFER (warn) until the
+# model build lands an equivalent measure -- colouring by the mis-resolved BASE measure (the table
+# calc's input, which is what ``_resolve_field`` recovers) would be confidently wrong. A plain
+# aggregation or a clean calc measure carries no such leading code, so this gate stays off for the
+# common heat-table case. The codes below are the unambiguous table-calc prefixes only; short
+# words that could collide with a real field id (``size``/``first``/``last``/``total``) are left out.
+_TABLE_CALC_CODES = frozenset({
+    "cum", "rsum", "pcdf", "pdiff", "diff", "pcto", "rdiff",
+    "wsum", "wavg", "wmin", "wmax", "wstdev", "wstdevp", "wvar", "wvarp",
+    "wmedian", "wcount", "wcountd", "wcorr", "wcov",
+    "movsum", "movavg", "movmin", "movmax", "movstdev", "movvar",
+    "index", "rank", "rank_dense", "rank_modified", "rank_percentile", "rank_unique",
+})
+
+
+def _instance_is_table_calc(instance):
+    """True when a pill instance token's leading code is a known quick table-calc op."""
+    seg = (instance or "").split(":", 1)[0]
+    return seg in _TABLE_CALC_CODES
+
+
+# A continuous (heat) colour scale lives at
+# ``worksheet/table/style/style-rule[@element='mark']/encoding[@attr='color']`` with an inner
+# ``<color-palette>`` and either an interpolated encoding ``type`` (``custom-interpolated`` /
+# ``interpolated``) or an ordered palette ``type`` (sequential / diverging). The ``center`` attr
+# (when present) is the diverging mid-point; the ordered ``<color>`` children run min -> max in
+# author order. A DISCRETE (categorical) colour legend is NOT a gradient -- that is a Tier-2 legend
+# styling concern, not a cell heat scale -- and is ignored here.
+_GRADIENT_PALETTE_TYPES = ("ordered-diverging", "ordered-sequential")
+
+
+def _parse_color_gradient(table):
+    """Extract a continuous background colour-scale spec from a worksheet's mark colour encoding.
+
+    Returns ``{"field_token", "center", "palette_type", "colors", "interpolated",
+    "is_table_calc"}`` when the colour encoding carries a continuous (interpolated / ordered)
+    palette of at least two stops, else ``None``. ``colors`` preserves the Tableau author order
+    (first -> min, last -> max); the direction is never guessed.
+    """
+    if table is None:
+        return None
+    style = _first(table, "style")
+    if style is None:
+        return None
+    for rule in _children_local(style, "style-rule"):
+        if (rule.get("element") or "").lower() != "mark":
+            continue
+        for enc in _children_local(rule, "encoding"):
+            if (enc.get("attr") or "") != "color":
+                continue
+            palette = _first(enc, "color-palette")
+            if palette is None:
+                continue
+            enc_type = (enc.get("type") or "").lower()
+            pal_type = (palette.get("type") or "").lower()
+            interpolated = "interpolated" in enc_type
+            if not interpolated and pal_type not in _GRADIENT_PALETTE_TYPES:
+                continue
+            colors = [(c.text or "").strip()
+                      for c in _children_local(palette, "color")
+                      if (c.text or "").strip()]
+            if len(colors) < 2:
+                continue
+            center = None
+            raw_center = enc.get("center")
+            if raw_center is not None:
+                try:
+                    center = float(raw_center)
+                except (TypeError, ValueError):
+                    center = None
+            _, fid = _split_token_attr(enc.get("field"))
+            return {
+                "field_token": enc.get("field") or "",
+                "center": center,
+                "palette_type": (pal_type or ("ordered-diverging" if center is not None
+                                              else "ordered-sequential")),
+                "colors": colors,
+                "interpolated": interpolated,
+                "is_table_calc": _instance_is_table_calc(fid),
+            }
+    return None
+
+
 # Tableau analytic-annotation elements live at ``table/panes/pane/<element>``: a reference /
 # target / distribution line overlays a computed constant, average, percentile band, or an
 # explicit goal on the mark, and a trend line overlays a fitted model. Power BI expresses these as
@@ -1488,7 +1680,7 @@ def _parse_reference_lines(all_panes):
 
 
 def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date_binding=None,
-                     row_count_binding=None):
+                     row_count_binding=None, measure_binding=None):
     name = ws.get("name")
     table = _first(ws, "table")
     if table is None:
@@ -1530,15 +1722,15 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     rows = _resolve_shelf(rows_text, ds_default, base_cols, instances, index,
                           ds_caption, name, warnings, warn_special=warn_special,
                           internal_fields=internal_fields, date_binding=date_binding,
-                          row_count_binding=row_count_binding)
+                          row_count_binding=row_count_binding, measure_binding=measure_binding)
     cols = _resolve_shelf(cols_text, ds_default, base_cols, instances, index,
                           ds_caption, name, warnings, warn_special=warn_special,
                           internal_fields=internal_fields, date_binding=date_binding,
-                          row_count_binding=row_count_binding)
+                          row_count_binding=row_count_binding, measure_binding=measure_binding)
     encodings = _parse_encodings(pane, ds_default, base_cols, instances, index,
                                  ds_caption, name, warnings, warn_special=warn_special,
                                  internal_fields=internal_fields, date_binding=date_binding,
-                                 row_count_binding=row_count_binding)
+                                 row_count_binding=row_count_binding, measure_binding=measure_binding)
     filters, swap_controls = _parse_filters(view, ds_default, base_cols, instances, index,
                                             ds_caption, name, warnings, warn_special=warn_special,
                                             internal_fields=internal_fields)
@@ -1712,6 +1904,14 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     if visual_type in _AXIS_TITLE_TYPES:
         axis_titles = _parse_axis_titles(table, dims_rows, dims_cols, meas_rows, meas_cols)
 
+    # Continuous background colour scale (heat / gradient cells) on a table or matrix. Parsed here
+    # (additive IR key) and turned into a PBIR backColor FillRule at emit time -- faithful-or-warn,
+    # so a colour driver the model cannot yet bind (a quick table calc) defers rather than colours
+    # by the wrong measure. Only the table/matrix family carries a cell heat scale.
+    color_gradient = None
+    if visual_type in (VT_MATRIX, VT_TABLE):
+        color_gradient = _parse_color_gradient(table)
+
     # Reference / target / trend line annotations (KPI goals, average/percentile bands, trend
     # fits) are a Tier-2 analytics concern: record them (additive) and disclose them so the
     # rebuilt visual is never silently missing an author's target overlay. Gated on an emitted
@@ -1738,6 +1938,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "visual_type": visual_type,
         "title": title_text,
         "axis_titles": axis_titles,
+        "color_gradient": color_gradient,
         "reference_lines": reference_lines,
         "rows": rows,
         "cols": cols,
@@ -1777,6 +1978,8 @@ def _parse_dashboard(db, worksheet_names, warnings):
         device_zones.update(_findall_local(holder, "zone"))
 
     zones = []
+    param_controls = []
+    seen_params = set()
     ext_w = ext_h = 0.0
     for zone in _findall_local(db, "zone"):
         if zone in device_zones:
@@ -1789,23 +1992,66 @@ def _parse_dashboard(db, worksheet_names, warnings):
             # (which is pixels and a different unit system).
             ext_w = max(ext_w, x + w)
             ext_h = max(ext_h, y + h)
+        ztype = zone.get("type-v2") or zone.get("type")
+        # A parameter-control ("hamburger") zone hosts a Tableau parameter on the dashboard.
+        # Capture it structurally so the fidelity report is honest about it: Tier-1 rebuilds it
+        # as a slicer only once the model identifies the parameter's target column/measure, so
+        # here we record the parameter id + faithful geometry and never silently drop it.
+        if ztype == "paramctrl":
+            pid = _param_control_ref(zone.get("param") or "")
+            if pid and pid not in seen_params and None not in (x, y, w, h):
+                seen_params.add(pid)
+                param_controls.append({"param_id": pid, "x": x, "y": y, "w": w, "h": h})
+            continue
         zname = zone.get("name")
         if not zname or zname not in worksheet_names:
             continue
         # worksheet zones carry no decoration type (legends/filters/titles do)
-        if (zone.get("type-v2") or zone.get("type")):
+        if ztype:
             continue
         if None in (x, y, w, h) or w <= 0 or h <= 0:
             continue
         zones.append({"worksheet": zname, "x": x, "y": y, "w": w, "h": h})
 
     return {"name": name, "size": size,
-            "extent": {"w": ext_w or None, "h": ext_h or None}, "zones": zones}
+            "extent": {"w": ext_w or None, "h": ext_h or None}, "zones": zones,
+            "param_controls": param_controls}
 
 
 def _warn(scope, name, reason):
     return {"scope": scope, "name": name,
             "reason": "manual attention required: " + reason}
+
+
+def _resolve_parameter_controls(dashboards, params, warnings):
+    """Resolve each dashboard's captured parameter-control zones to a fidelity record + warning.
+
+    A dashboard parameter control (the "hamburger" on the canvas) hosts a Tableau parameter; Tier-1
+    rebuilds it as a slicer only once the migrated model identifies the parameter's target column or
+    measure (its kind + bound object). Until that binding is available this records the control
+    additively (``ir["parameter_controls"]``) and emits one honest per-control warning so the report
+    never silently loses it (warn-never-wrong). The parameter caption/datatype come from
+    :func:`_parse_parameters`; the id is the bracket-stripped ``[Parameters].[<id>]`` reference.
+    """
+    records = []
+    for db in dashboards:
+        for pc in db.get("param_controls", []):
+            pid = pc["param_id"]
+            meta = params.get(pid) or {}
+            caption = meta.get("caption") or pid
+            records.append({
+                "param_id": pid,
+                "caption": caption,
+                "datatype": meta.get("datatype") or None,
+                "dashboard": db.get("name"),
+                "position": {"x": pc.get("x"), "y": pc.get("y"),
+                             "w": pc.get("w"), "h": pc.get("h")},
+            })
+            warnings.append(_warn(
+                "dashboard", db.get("name"),
+                f"parameter control '{caption}' not rebuilt as a slicer yet -> emit once the "
+                f"migrated model identifies the parameter's target column/measure"))
+    return records
 
 
 def _parse_parameters(root):
@@ -1903,7 +2149,7 @@ def _detect_sheet_swaps(worksheets, dashboards, params, warnings):
     return swaps
 
 
-def parse_twb(xml_text, *, date_binding=None, row_count_binding=None):
+def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_binding=None):
     """Parse a Tableau ``.twb`` (workbook XML) into the normalized viz IR.
 
     Accepts ``str`` or ``bytes``; ``.twb`` files carry a UTF-8 BOM, so callers reading from
@@ -1928,7 +2174,8 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None):
     for ws in ws_elems:
         parsed = _parse_worksheet(ws, index, ds_caption, warnings,
                                   internal_fields=internal_fields, date_binding=date_binding,
-                                  row_count_binding=row_count_binding)
+                                  row_count_binding=row_count_binding,
+                                  measure_binding=measure_binding)
         if parsed:
             worksheets.append(parsed)
     worksheet_names = {w["name"] for w in worksheets}
@@ -1950,10 +2197,12 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None):
         dashboards.append(parsed)
 
     params = _parse_parameters(root)
+    parameter_controls = _resolve_parameter_controls(dashboards, params, warnings)
     sheet_swaps = _detect_sheet_swaps(worksheets, dashboards, params, warnings)
 
     return {"worksheets": worksheets, "dashboards": dashboards,
-            "sheet_swaps": sheet_swaps, "warnings": warnings}
+            "sheet_swaps": sheet_swaps, "parameter_controls": parameter_controls,
+            "warnings": warnings}
 
 
 # -- PBIR field expression emission --------------------------------------------
@@ -2180,6 +2429,20 @@ def _build_query_state(ws, model_table, field_map, warnings):
         vals = _dedupe(values(rows) + values(cols)
                        + ([color] if color and color["kind"] == "value" else [])
                        + ([label] if label and label["kind"] == "value" else []))
+        # Heat-grid colour DRIVER -> tooltip, not a visible column. When a continuous colour scale
+        # colours a DISTINCT displayed value (Tableau "colour by a different field"), the colour
+        # measure is not shown as its own matrix column: it is surfaced on the TOOLTIP (faithful to
+        # Tableau's default colour-card tooltip) and referenced by the background-gradient FillRule.
+        # Only fires when there is another displayed value AND a gradient is present, so the classic
+        # highlight table (colour == the shown measure) is unchanged.
+        tooltip_meas = []
+        if ws.get("color_gradient") and color and color["kind"] == "value":
+            ck = (color["entity"], color["property"], color["binding"], color["aggregation"])
+            others = [f for f in vals
+                      if (f["entity"], f["property"], f["binding"], f["aggregation"]) != ck]
+            if others:
+                vals = others
+                tooltip_meas = [color]
         if row_dims:
             state["Rows"] = {"projections": _role_projections(
                 row_dims, model_table, field_map, used_refs)}
@@ -2189,6 +2452,9 @@ def _build_query_state(ws, model_table, field_map, warnings):
         if vals:
             state["Values"] = {"projections": _role_projections(
                 vals, model_table, field_map, used_refs)}
+        if tooltip_meas:
+            state["Tooltips"] = {"projections": _role_projections(
+                tooltip_meas, model_table, field_map, used_refs)}
     elif vt == VT_TABLE:
         ordered = drop_calc_axis(_dedupe(
             categories(rows) + categories(cols))) + _dedupe(
@@ -2462,8 +2728,122 @@ def _axis_objects(axis_titles):
     return objects
 
 
+def _gradient_color_stops(cg):
+    """Map a Tableau continuous palette to a PBIR ``linearGradient2`` / ``linearGradient3``.
+
+    A diverging palette (a ``center`` value, >= 3 stops) becomes ``linearGradient3``: ``min`` =
+    first colour, ``mid`` = the neutral middle colour pinned at the centre value, ``max`` = last
+    colour. A sequential palette becomes ``linearGradient2`` (``min`` / ``max``). Tableau's author
+    order (first -> min, last -> max) is preserved exactly. Colours are single-quoted semantic-query
+    literals; the centre is a double literal. ``nullColoringStrategy`` defaults to ``asZero`` (the
+    Power BI default), matching real formatted PBIR. Shape verified against a real MS-community
+    ``tableEx`` gradient (min/mid/max with per-stop optional ``value``).
+    """
+    colors = cg["colors"]
+
+    def _stop(hexv, value=None):
+        stop = {"color": {"Literal": {"Value": _semantic_string_literal(hexv)}}}
+        if value is not None:
+            lit = _semantic_numeric_literal(str(value))
+            if lit is not None:
+                stop["value"] = {"Literal": {"Value": lit}}
+        return stop
+
+    nulls = {"strategy": {"Literal": {"Value": "'asZero'"}}}
+    if cg.get("center") is not None and len(colors) >= 3:
+        return {"linearGradient3": {
+            "min": _stop(colors[0]),
+            "mid": _stop(colors[len(colors) // 2], value=cg["center"]),
+            "max": _stop(colors[-1]),
+            "nullColoringStrategy": nulls}}
+    return {"linearGradient2": {
+        "min": _stop(colors[0]),
+        "max": _stop(colors[-1]),
+        "nullColoringStrategy": nulls}}
+
+
+def _conditional_format(ws, state, model_table, field_map, warnings):
+    """Table / matrix BACKGROUND colour scale (heat cells) -> (value_objects, fact).
+
+    ``value_objects`` is the ``visual.objects.values`` entry list (a ``backColor`` FillRule
+    gradient bound to the colour-driver measure) or ``None``; ``fact`` is an additive descriptor of
+    the conditional format (``status`` ``emitted`` / ``deferred`` plus the raw palette) for the
+    candidate record, or ``None`` when the worksheet has no continuous colour scale.
+
+    WARN-NEVER-WRONG: the fill is emitted ONLY when the colour driver resolves to a clean model
+    measure that is actually projected in THIS visual AND is not a quick table calc (whose derived
+    quantity the model does not yet carry). Otherwise the visual emits with NO fill, a structured
+    warning names the deferral, and the raw Tableau palette is preserved in ``fact`` so a later
+    binding pass can light it up once the model build lands an equivalent measure. The FillRule's
+    ``Input`` and the ``selector.metadata`` reuse the EXACT expression / queryRef already assigned
+    to the visual's projections, so the fill never references something the query does not.
+    """
+    cg = ws.get("color_gradient")
+    if not cg:
+        return None, None
+    color = ws["encodings"].get("color")
+    fact = {
+        "kind": "background_color_scale",
+        "palette_type": cg["palette_type"],
+        "center": cg["center"],
+        "colors": cg["colors"],
+    }
+
+    values = (state.get("Values") or {}).get("projections", [])
+    tooltips = (state.get("Tooltips") or {}).get("projections", [])
+
+    def _match(field):
+        if not field:
+            return None
+        expr, _, _ = _field_expression(field, model_table, field_map)
+        # The colour driver may be surfaced on the matrix Tooltips (heat-grid "colour by a different
+        # field") rather than as a visible Values column -- search both so the FillRule binds to the
+        # exact projected queryRef wherever it lives.
+        for p in values + tooltips:
+            if p["field"] == expr:
+                return p
+        return None
+
+    driver_proj = _match(color)
+    # A quick table calc normally defers (the model carries no equivalent measure). But when the
+    # colour pill was REBOUND to a real model measure via the model<->viz contract
+    # (``measure_rebound``), it IS a bindable measure now -- so the table-calc gate is lifted and the
+    # gradient lights up against the contracted measure.
+    is_table_calc_defer = cg["is_table_calc"] and not (color or {}).get("measure_rebound")
+    if (color is None or color["kind"] != "value"
+            or color["binding"] not in ("aggregation", "measure")
+            or is_table_calc_defer or driver_proj is None):
+        reason = ("colour driver is a quick table calc -- no equivalent model measure yet"
+                  if is_table_calc_defer
+                  else "colour driver is not bound to a model measure in this visual")
+        warnings.append(_warn(
+            "worksheet", ws["name"],
+            "background colour scale deferred ({0}); the visual is emitted without "
+            "conditional formatting".format(reason)))
+        fact["status"] = "deferred"
+        fact["reason"] = reason
+        return None, fact
+
+    # Colour the displayed cell value: a distinct text/label measure when present (Tableau's "color
+    # by a different field" pattern), else self-colour the driver measure itself.
+    target_proj = _match(ws["encodings"].get("label")) or driver_proj
+    value_objects = [{
+        "properties": {
+            "backColor": {"solid": {"color": {"expr": {"FillRule": {
+                "Input": driver_proj["field"],
+                "FillRule": _gradient_color_stops(cg)}}}}}},
+        "selector": {
+            "data": [{"dataViewWildcard": {"matchingOption": 1}}],
+            "metadata": target_proj["queryRef"]},
+    }]
+    fact["status"] = "emitted"
+    fact["bound_measure"] = driver_proj["queryRef"]
+    fact["target"] = target_proj["queryRef"]
+    return value_objects, fact
+
+
 def _visual_json(name, vtype, position, query_state, sort_definition=None,
-                 filter_config=None, title=None, axis_titles=None):
+                 filter_config=None, title=None, axis_titles=None, value_objects=None):
     visual = {"visualType": vtype}
     if query_state:
         visual["query"] = {"queryState": query_state}
@@ -2479,6 +2859,12 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
         axis_objects = _axis_objects(axis_titles)
         if axis_objects:
             visual["objects"] = axis_objects
+    # Background colour scale (Tier-2, lifted for tables/matrices): the data-plane
+    # ``visual.objects.values`` entry carrying a ``backColor`` FillRule gradient. Shape verified
+    # against a real MS-community formatted ``tableEx`` (``FillRule.Input`` measure +
+    # ``linearGradient3`` min/mid/max; ``selector`` = dataViewWildcard + metadata queryRef).
+    if value_objects:
+        visual.setdefault("objects", {})["values"] = value_objects
     # Structural title text (Tier-1): the worksheet's authored caption -> the visual's container
     # title. Shape verified against the official PBIR visualContainer schema + real reports: a
     # single-quoted semantic-query string literal under visualContainerObjects.title; the
@@ -2902,12 +3288,18 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             vname = _sanitize(f"v-{page_name}-{i}-{ws['name']}")
             vtype = _pbir_vtype(ws["visual_type"], state)
             pos = _position(x, y, w, h, tab=i)
+            value_objects, cf_fact = _conditional_format(
+                ws, state, model_table, field_map, warnings)
             visuals.append(_visual_json(
                 vname, vtype, pos, state,
                 _sort_definition(ws, state, model_table, field_map),
-                title=ws.get("title"), axis_titles=ws.get("axis_titles")))
-            records.append(_candidate_record(page_name, vname, ws, vtype, state, pos,
-                                             page_display=db["name"] or page_name))
+                title=ws.get("title"), axis_titles=ws.get("axis_titles"),
+                value_objects=value_objects))
+            rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
+                                    page_display=db["name"] or page_name)
+            if cf_fact:
+                rec["conditional_format"] = cf_fact
+            records.append(rec)
         visuals += _emit_slicers(page_ws, page_name, model_table, field_map, warnings)
         if not visuals:
             warnings.append(_warn("dashboard", db["name"],
@@ -2929,12 +3321,18 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         vname = _sanitize("v-" + ws["name"])
         vtype = _pbir_vtype(ws["visual_type"], state)
         pos = _position(40, 40, 880, 620)
+        value_objects, cf_fact = _conditional_format(
+            ws, state, model_table, field_map, warnings)
         main = _visual_json(
             vname, vtype, pos, state,
             _sort_definition(ws, state, model_table, field_map),
-            title=ws.get("title"), axis_titles=ws.get("axis_titles"))
-        records.append(_candidate_record(page_name, vname, ws, vtype, state, pos,
-                                         page_display=ws["name"]))
+            title=ws.get("title"), axis_titles=ws.get("axis_titles"),
+            value_objects=value_objects)
+        rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
+                                page_display=ws["name"])
+        if cf_fact:
+            rec["conditional_format"] = cf_fact
+        records.append(rec)
         visuals = [main] + _emit_slicers([ws], page_name, model_table, field_map, warnings)
         _emit_page(parts, page_name, ws["name"], visuals)
         page_order.append(page_name)
@@ -2966,7 +3364,7 @@ def _emit_slicers(ws_list, page_name, model_table, field_map, warnings=None):
 
 def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
                         model_table=None, field_map=None, date_binding=None,
-                        row_count_binding=None):
+                        row_count_binding=None, measure_binding=None):
     """One-call convenience: parse ``.twb`` text and emit the PBIR parts.
 
     Returns ``{"ir": ..., "parts": ..., "warnings": ...}``. ``parts`` is the
@@ -2985,8 +3383,17 @@ def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
     "measure": ...}}``. When given, an implicit row count (object-id ``COUNT(*)`` or legacy
     ``[Number of Records]``) binds to the matching COUNTROWS measure; without it the count is left
     unbound with a precise warning (warn-never-wrong), never a dangling/guessed binding.
+
+    ``measure_binding`` (optional) carries the model build's calc->measure manifest (the locked
+    model<->viz contract) -- a token-keyed ``{<calc token>: {"entity": "_Measures", "measure":
+    <name>, "status": <translated|assisted-approved|...>}}`` map (a ``{"measures": {...}}`` wrapper
+    is also accepted). When given, each workbook-local calc / quick-table-calc pill the model build
+    translated is rebound to its named measure (deterministic, token-keyed; binds only for
+    translated / assisted-approved measures) -- so a calc-driven value, a background colour-scale
+    driver, etc. references the real measure. Without it, those pills degrade-and-warn unchanged.
     """
-    ir = parse_twb(xml_text, date_binding=date_binding, row_count_binding=row_count_binding)
+    ir = parse_twb(xml_text, date_binding=date_binding, row_count_binding=row_count_binding,
+                   measure_binding=measure_binding)
     parts = emit_pbir(ir, dataset_name=dataset_name, report_name=report_name,
                       model_table=model_table, field_map=field_map)
     return {"ir": ir, "parts": parts, "warnings": ir["warnings"],
