@@ -1502,6 +1502,106 @@ def _parse_worksheet_title(ws):
     return text, bool(_TITLE_DYNAMIC_RE.search(text))
 
 
+# Per-run font attributes on a title's ``<run>`` that Tier-2 title styling reproduces only when it
+# can do so faithfully. ``bold`` and ``fontname`` (font family) are emitted when uniform (family
+# only for a REAL font -- Tableau's internal 'Tableau Bold' / 'Tableau Semibold' etc. have no Power
+# BI equivalent, so they defer); ``italic`` / ``underline`` (unconfirmed container-title props) and
+# ``fontalignment`` (unconfirmed alignment enum -> a wrong guess would mis-align the title) are
+# ALWAYS deferred. Deferred attributes are recorded for a future pass, never emitted.
+_TITLE_ALWAYS_DEFER_ATTRS = ("italic", "underline", "fontalignment")
+_TITLE_INTERNAL_FONT_RE = re.compile(r"^Tableau\b", re.IGNORECASE)
+_HEX6_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _font_size_points(value):
+    """A Tableau ``fontsize`` (points) -> a Power BI font-size literal (``'15'`` -> ``'15D'``).
+
+    Power BI font sizes are doubles in points -- the same unit Tableau uses -- so the value passes
+    through unchanged with a ``D`` suffix. Returns ``None`` for a non-positive / non-numeric size.
+    """
+    s = (value or "").strip()
+    try:
+        n = float(s)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    return "{0}D".format(int(n) if n == int(n) else n)
+
+
+def _parse_title_style(ws):
+    """Uniform font styling for a worksheet's static title -> a Tier-2 title-style dict.
+
+    Reads the per-run font attributes on the title's ``<run>`` elements (the styling that
+    ``_parse_worksheet_title`` discards) and keeps the schema-grounded container-title font
+    properties that can be reproduced faithfully: ``font_size`` (points), ``font_color``
+    (``#rrggbb``), ``bold`` (weight), and ``font_family`` (a real, non-Tableau-internal font).
+    Power BI applies ONE font to the whole title, so a property is emitted only when EVERY
+    text-bearing run agrees; a title whose runs disagree -- or only partially declare a property --
+    cannot be reproduced faithfully, so that property is deferred (warn-never-wrong). Italic /
+    underline / alignment and Tableau-internal font families are always deferred. Returns the style
+    dict (with an additive ``deferred`` list of property names seen but not emitted), or ``None``
+    when the title carries no font styling at all.
+    """
+    layout = _first(ws, "layout-options")
+    title = _first(layout, "title") if layout is not None else None
+    ft = _first(title, "formatted-text") if title is not None else None
+    if ft is None:
+        return None
+    runs = _findall_local(ft, "run")
+    text_runs = [r for r in runs if (r.text or "").strip()]
+    if not text_runs:
+        return None
+
+    def _uniform(attr):
+        vals = [r.get(attr) for r in text_runs]
+        if all(v is not None for v in vals) and len(set(vals)) == 1:
+            return vals[0]
+        return None
+
+    style = {}
+    deferred = []
+
+    size_lit = _font_size_points(_uniform("fontsize"))
+    if size_lit is not None:
+        style["font_size"] = size_lit
+    elif any(r.get("fontsize") for r in text_runs):
+        deferred.append("fontsize")
+
+    color = _uniform("fontcolor")
+    if color is not None and _HEX6_RE.match(color):
+        style["font_color"] = color
+    elif any(r.get("fontcolor") for r in text_runs):
+        deferred.append("fontcolor")
+
+    # Bold weight: emit only when EVERY text-bearing run is bold; a title with mixed weight cannot
+    # be reproduced by Power BI's single-font title, so defer.
+    bold_runs = [r for r in text_runs if r.get("bold") == "true"]
+    if bold_runs:
+        if len(bold_runs) == len(text_runs):
+            style["bold"] = True
+        else:
+            deferred.append("bold")
+
+    # Font family: emit only a uniform, real font; Tableau's internal font families ('Tableau Bold'
+    # etc.) have no Power BI equivalent, so defer them rather than emit an unresolvable face.
+    family = _uniform("fontname")
+    if family is not None and not _TITLE_INTERNAL_FONT_RE.match(family.strip()):
+        style["font_family"] = family.strip()
+    elif any(r.get("fontname") for r in text_runs):
+        deferred.append("fontname")
+
+    for attr in _TITLE_ALWAYS_DEFER_ATTRS:
+        if any(r.get(attr) for r in text_runs):
+            deferred.append(attr)
+
+    if not style and not deferred:
+        return None
+    if deferred:
+        style["deferred"] = deferred
+    return style
+
+
 # Cartesian visual types that carry an explicit category/value axis pair whose titles can be
 # faithfully reproduced. Pie/scatter/matrix/etc. either lack a category-vs-value axis split or
 # put measures on both axes, so an axis-title override there is deferred (warn-never-wrong).
@@ -2010,6 +2110,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
             "the rebuilt visual keeps its default title"))
         title_text = None
 
+    title_style = _parse_title_style(ws) if title_text else None
+
     axis_titles = {}
     if visual_type in _AXIS_TITLE_TYPES:
         axis_titles = _parse_axis_titles(table, dims_rows, dims_cols, meas_rows, meas_cols)
@@ -2058,6 +2160,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "mark_class": mark,
         "visual_type": visual_type,
         "title": title_text,
+        "title_style": title_style,
         "axis_titles": axis_titles,
         "color_gradient": color_gradient,
         "mark_colors": mark_colors,
@@ -2102,6 +2205,7 @@ def _parse_dashboard(db, worksheet_names, warnings):
 
     zones = []
     param_controls = []
+    legend_zones = []
     seen_params = set()
     ext_w = ext_h = 0.0
     for zone in _findall_local(db, "zone"):
@@ -2129,6 +2233,12 @@ def _parse_dashboard(db, worksheet_names, warnings):
         zname = zone.get("name")
         if not zname or zname not in worksheet_names:
             continue
+        # A colour-legend decoration zone (``type='color'``) names the worksheet whose colour Series
+        # it legends; capture its geometry so the report can faithfully reproduce legend show/position
+        # (a present zone = the legend is shown at that side; an absent one = the author hid it).
+        if ztype == "color" and None not in (x, y, w, h) and w > 0 and h > 0:
+            legend_zones.append({"worksheet": zname, "x": x, "y": y, "w": w, "h": h})
+            continue
         # worksheet zones carry no decoration type (legends/filters/titles do)
         if ztype:
             continue
@@ -2138,7 +2248,7 @@ def _parse_dashboard(db, worksheet_names, warnings):
 
     return {"name": name, "size": size,
             "extent": {"w": ext_w or None, "h": ext_h or None}, "zones": zones,
-            "param_controls": param_controls}
+            "param_controls": param_controls, "legend_zones": legend_zones}
 
 
 def _warn(scope, name, reason):
@@ -3243,9 +3353,82 @@ def _data_labels(ws, vtype, warnings):
     return None, fact
 
 
+# Legend (Tableau dashboard colour-legend zone) -> the PBIR data-plane ``visual.objects.legend``
+# ``show`` / ``position`` properties, applied uniformly (the Power BI formatting reference lists
+# ``legend`` as a visual-wide object with no selector). The signal is dashboard-scoped: Tableau
+# writes a ``<zone type='color' name='<worksheet>'>`` for each SHOWN colour-Series legend, so a
+# present zone reproduces the legend's side (Right/Left/Top/Bottom) and an absent one (for a
+# worksheet that DOES carry a categorical colour Series) means the author hid the legend. Legend
+# styling (font / title text / marker rendering) is a deeper Tier-2 concern.
+_LEGEND_TYPES = (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA, VT_PIE, VT_DONUT, VT_SCATTER,
+                 VT_COMBO, VT_RIBBON)
+
+
+def _has_color_series(ws):
+    """A worksheet carries a categorical colour Series (the thing a legend legends) when its colour
+    encoding is a dimension (``kind == "category"``)."""
+    color = ws["encodings"].get("color")
+    return color is not None and color.get("kind") == "category"
+
+
+def _legend_side(ws_zone, lz):
+    """Return ``'Right'``/``'Left'``/``'Bottom'``/``'Top'`` when the legend zone ``lz`` sits clearly
+    on exactly ONE side of its worksheet's zone ``ws_zone`` (same Tableau coordinate space), else
+    ``None`` (the legend overlaps the chart or straddles a corner -- too ambiguous to map to a single
+    Power BI position enum, so the position is deferred to Power BI's default)."""
+    wx, wy, ww, wh = ws_zone["x"], ws_zone["y"], ws_zone["w"], ws_zone["h"]
+    lx, ly, lw, lh = lz["x"], lz["y"], lz["w"], lz["h"]
+    htol, vtol = ww * 0.05, wh * 0.05
+    sides = []
+    if lx >= wx + ww - htol:
+        sides.append("Right")
+    if lx + lw <= wx + htol:
+        sides.append("Left")
+    if ly >= wy + wh - vtol:
+        sides.append("Bottom")
+    if ly + lh <= wy + vtol:
+        sides.append("Top")
+    return sides[0] if len(sides) == 1 else None
+
+
+def _legend_objects(ws, ws_zone, legend_zones, vtype):
+    """Tableau dashboard colour legend -> (legend_objects, fact).
+
+    ``legend_objects`` is the ``visual.objects.legend`` entry list (``show`` + optional ``position``,
+    applied uniformly -- no selector) or ``None``; ``fact`` is an additive candidate-record
+    descriptor, or ``None`` when the worksheet has no categorical colour Series or the visual type has
+    no legend concept (table / matrix / card / map).
+
+    WARN-NEVER-WRONG: a ``position`` is emitted ONLY when a present colour zone sits unambiguously on
+    one side of the chart (:func:`_legend_side`); an overlapping/corner zone keeps Power BI's default
+    legend position (``status`` ``position_deferred``). ``show:false`` is emitted only when a
+    worksheet that genuinely carries a categorical colour Series has NO colour zone on this dashboard
+    -- i.e. the author hid the legend; a worksheet with no colour Series produces no legend in either
+    tool and is left alone.
+    """
+    if vtype not in _LEGEND_TYPES or not _has_color_series(ws):
+        return None, None
+    lz = next((z for z in (legend_zones or []) if z["worksheet"] == ws["name"]), None)
+    fact = {"kind": "legend"}
+    if lz is None:
+        fact["status"] = "hidden"
+        return [{"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}], fact
+    side = _legend_side(ws_zone, lz)
+    if side is None:
+        fact["status"] = "position_deferred"
+        return None, fact
+    fact["status"] = "emitted"
+    fact["position"] = side
+    return [{"properties": {
+        "show": {"expr": {"Literal": {"Value": "true"}}},
+        "position": {"expr": {"Literal": {"Value": _semantic_string_literal(side)}}},
+    }}], fact
+
+
 def _visual_json(name, vtype, position, query_state, sort_definition=None,
-                 filter_config=None, title=None, axis_titles=None, value_objects=None,
-                 data_point_objects=None, label_objects=None):
+                 filter_config=None, title=None, title_style=None, axis_titles=None,
+                 value_objects=None,
+                 data_point_objects=None, label_objects=None, legend_objects=None):
     visual = {"visualType": vtype}
     if query_state:
         visual["query"] = {"queryState": query_state}
@@ -3278,17 +3461,26 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     # visual-wide object; only show/hide is set here (label detail styling is Tier-2).
     if label_objects:
         visual.setdefault("objects", {})["labels"] = label_objects
+    # Legend (Tableau dashboard colour-legend zone): the data-plane ``visual.objects.legend``
+    # ``show`` / ``position`` toggle, applied uniformly (no selector). Per the Power BI formatting
+    # reference, ``legend`` is a visual-wide object; only show/position are set here (legend title /
+    # font / marker styling is Tier-2).
+    if legend_objects:
+        visual.setdefault("objects", {})["legend"] = legend_objects
     # Structural title text (Tier-1): the worksheet's authored caption -> the visual's container
     # title. Shape verified against the official PBIR visualContainer schema + real reports: a
     # single-quoted semantic-query string literal under visualContainerObjects.title; the
-    # auto-generated field-name subtitle is suppressed so only the author's title shows. Font /
-    # colour / size styling is deliberately omitted (Tier-2).
+    # auto-generated field-name subtitle is suppressed so only the author's title shows. Tier-2
+    # title font styling (uniform font size / colour across the title's runs) is merged in when
+    # present; all other run styling is deferred (see ``_parse_title_style`` / ``_title_style_props``).
     if title:
+        title_props = {
+            "show": {"expr": {"Literal": {"Value": "true"}}},
+            "text": {"expr": {"Literal": {"Value": _semantic_string_literal(title)}}},
+        }
+        title_props.update(_title_style_props(title_style))
         visual["visualContainerObjects"] = {
-            "title": [{"properties": {
-                "show": {"expr": {"Literal": {"Value": "true"}}},
-                "text": {"expr": {"Literal": {"Value": _semantic_string_literal(title)}}},
-            }}],
+            "title": [{"properties": title_props}],
             "subTitle": [{"properties": {
                 "show": {"expr": {"Literal": {"Value": "false"}}},
             }}],
@@ -3321,6 +3513,33 @@ def _semantic_string_literal(value):
     """A Power BI semantic-query string literal: embedded single quotes, inner apostrophe doubled
     (``O'Brien`` -> ``'O''Brien'``)."""
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _title_style_props(title_style):
+    """Uniform title font styling -> ``visualContainerObjects.title`` property entries.
+
+    Emits the schema-grounded container-title font properties -- ``fontSize`` (a numeric ``"Nd"``
+    literal), ``fontColor`` (a solid single-quoted hex literal), ``bold`` (a quoted-boolean weight),
+    and ``fontFamily`` (a single-quoted real font face) -- all verified against the Microsoft PBIR
+    visual-title reference. Any ``deferred`` styling recorded on the style dict (italic / underline /
+    alignment / Tableau-internal family / non-uniform values) is intentionally NOT emitted
+    (warn-never-wrong)."""
+    props = {}
+    if not title_style:
+        return props
+    size = title_style.get("font_size")
+    if size:
+        props["fontSize"] = {"expr": {"Literal": {"Value": size}}}
+    color = title_style.get("font_color")
+    if color:
+        props["fontColor"] = {"solid": {"color": {"expr": {"Literal": {
+            "Value": _semantic_string_literal(color)}}}}}
+    if title_style.get("bold"):
+        props["bold"] = {"expr": {"Literal": {"Value": "true"}}}
+    family = title_style.get("font_family")
+    if family:
+        props["fontFamily"] = {"expr": {"Literal": {"Value": _semantic_string_literal(family)}}}
+    return props
 
 
 def _semantic_numeric_literal(value):
@@ -3752,14 +3971,17 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             data_point_objects, mc_fact = _data_point_colors(
                 ws, state, ws["visual_type"], model_table, field_map, warnings)
             label_objects, dl_fact = _data_labels(ws, ws["visual_type"], warnings)
+            legend_objects, lg_fact = _legend_objects(
+                ws, zone, db.get("legend_zones"), ws["visual_type"])
             flag_fc = _flag_filter_config_for(ir, ws["name"])
             visuals.append(_visual_json(
                 vname, vtype, pos, state,
                 _sort_definition(ws, state, model_table, field_map),
                 filter_config=flag_fc,
-                title=ws.get("title"), axis_titles=ws.get("axis_titles"),
+                title=ws.get("title"), title_style=ws.get("title_style"),
+                axis_titles=ws.get("axis_titles"),
                 value_objects=value_objects, data_point_objects=data_point_objects,
-                label_objects=label_objects))
+                label_objects=label_objects, legend_objects=legend_objects))
             rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                     page_display=db["name"] or page_name,
                                     model_table=model_table, field_map=field_map)
@@ -3767,6 +3989,12 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 rec["conditional_format"] = cf_fact
             if mc_fact:
                 rec["mark_colors"] = mc_fact
+            if dl_fact:
+                rec["data_labels"] = dl_fact
+            if lg_fact:
+                rec["legend"] = lg_fact
+            if ws.get("title_style"):
+                rec["title_style"] = ws["title_style"]
             if flag_fc:
                 rec["flag_filters"] = [c["field"]["Measure"]["Property"]
                                        for c in flag_fc["filters"]]
@@ -3804,7 +4032,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             vname, vtype, pos, state,
             _sort_definition(ws, state, model_table, field_map),
             filter_config=flag_fc,
-            title=ws.get("title"), axis_titles=ws.get("axis_titles"),
+            title=ws.get("title"), title_style=ws.get("title_style"),
+            axis_titles=ws.get("axis_titles"),
             value_objects=value_objects, data_point_objects=data_point_objects,
             label_objects=label_objects)
         rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
@@ -3816,6 +4045,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             rec["mark_colors"] = mc_fact
         if dl_fact:
             rec["data_labels"] = dl_fact
+        if ws.get("title_style"):
+            rec["title_style"] = ws["title_style"]
         if flag_fc:
             rec["flag_filters"] = [c["field"]["Measure"]["Property"]
                                    for c in flag_fc["filters"]]

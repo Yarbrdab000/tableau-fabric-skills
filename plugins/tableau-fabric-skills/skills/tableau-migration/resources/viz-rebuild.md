@@ -301,6 +301,66 @@ visual keeps its default label visibility, a `data labels deferred …` warning 
 raw values are preserved on the candidate record's `data_labels` fact (`status: "deferred"`). Only
 show/hide is set; label detail (culling, which value, placement) stays Tier-2.
 
+### Legend (show/hide + position)
+
+Whether a worksheet's colour legend is **shown on a dashboard** is a dashboard-scoped fact: Tableau
+writes a `<zone type='color' name='<worksheet>'>` (with `x/y/w/h` in the dashboard's 0–100000
+coordinate space) only when the author placed that colour legend on the dashboard. A worksheet's own
+`<cards>` always carry a `<card type='color'>` when colour is used, but that card is *not* the
+placement signal — only the dashboard `<zone>` is. `_parse_dashboard` captures those colour zones
+additively (`legend_zones`); the standalone (non-dashboard) page path is untouched, because a
+worksheet rendered on its own always shows its legend, which is also Power BI's default.
+
+The legend show/position is reproduced on the PBIR data-plane `visual.objects.legend` — `show` (a
+quoted-string boolean) and `position` (a single-quoted enum: `'Right'`/`'Left'`/`'Top'`/`'Bottom'`),
+applied uniformly (the formatting reference lists `legend` as a visual-wide object — no selector).
+
+**Warn-never-wrong.** A legend object is considered **only** for cartesian/part-to-whole types that
+carry a categorical colour **series** (`column`/`bar`/`line`/`area`/`pie`/`donut`/`scatter`/`combo`/
+`ribbon` with a `category` colour encoding); a continuous colour ramp, or a matrix / table / card /
+map, produces no legend object (its colour legend is a Tier-2 gradient concern). Within that set:
+(1) a **present** colour zone whose geometry clears exactly one side of its worksheet zone (5%
+tolerance) emits `show: true` + that `position` (`status: "emitted"`); (2) a **present** zone whose
+geometry is ambiguous (overlap / corner — zero or two-plus sides qualify) emits **no** object and a
+`legend position deferred` note (`status: "position_deferred"`), leaving Power BI's default position
+rather than guessing; (3) a categorical-colour worksheet **placed on a dashboard with no colour zone
+for it** means the author did not show that legend on the dashboard, so `show: false` is emitted
+(`status: "hidden"`) to match what the dashboard renders. Side geometry is read from the **raw**
+(pre-scale) zone coordinates so the worksheet and its legend share one space. Each decision is
+recorded on the candidate record's additive `legend` fact. Only show/position is set; legend
+title, font, and swatch styling stay Tier-2.
+
+### Title font styling (uniform size / colour / weight / family)
+
+A worksheet's static title (the structural text captured per [Worksheet titles](#worksheet-titles-structural-text-only))
+may carry per-run font styling on its `<run>` elements (`fontsize`, `fontcolor`, `bold`, `fontname`,
+`fontalignment`, …). `_parse_title_style` reads those attributes and contributes the **font** of the
+visual's container title — emitted into the same `visualContainerObjects.title` properties block that
+already carries `show`/`text`. The schema-grounded container-title font properties reproduced are
+`fontSize` (a numeric `"Nd"` literal — points pass through unchanged, the same unit Tableau uses),
+`fontColor` (a solid single-quoted `#rrggbb` literal), `bold` (a quoted-boolean weight), and
+`fontFamily` (a single-quoted real font face). Shapes verified against the Microsoft PBIR visual-title
+reference (`visualContainerObjects.title` with `fontSize`/`fontColor`/`bold`/`fontFamily`).
+
+**Warn-never-wrong.** Power BI applies **one** font to the whole title, but a Tableau title is rich
+text (multiple independently-styled runs). A font property is therefore emitted **only when every
+text-bearing run agrees**; a title whose runs disagree — or where some runs omit the property (so an
+inherited default would apply) — defers that property and keeps the structural title text. Specifically:
+a `fontcolor` that is not a clean 6-hex `#rrggbb` (e.g. an 8-hex alpha colour) is deferred; `bold` is
+emitted only when **every** text run is bold (mixed weight defers); `fontFamily` is emitted only for a
+uniform **real** font — Tableau's internal `Tableau Bold` / `Tableau Semibold` / `Tableau Book` faces
+have no Power BI equivalent, so they defer rather than emit an unresolvable face. `italic` / `underline`
+(unconfirmed container-title props) and paragraph **alignment** (an unconfirmed alignment enum — a wrong
+guess would visibly mis-align the title) are **always** deferred. Every deferred property is recorded on
+the additive `title_style` candidate-record fact (`{font_size?, font_color?, bold?, font_family?,
+deferred: [...]}`) for a future Tier-2 pass — never emitted. A dynamic title is already deferred
+wholesale (no static text), so it carries no `title_style`.
+
+**Axis-label font styling** has **zero** signal across the corpus (the only axis format Tableau writes is
+`tick-color`, a tick-mark/chrome colour — mostly transparent — not a label/title font), so it is not
+built. An axis label/title font override, if one ever appears, is simply left at the model/theme default
+(warn-never-wrong).
+
 ## Binding contract (matches the v1 model exactly)
 
 The `.twb` embeds the full datasource (`<relation>` + `<metadata-records>`), so bindings are
