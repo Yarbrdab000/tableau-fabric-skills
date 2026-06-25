@@ -1640,16 +1640,35 @@ def test_secondary_date_is_never_rebound():
     assert any("date part" in x["reason"].lower() for x in ir["warnings"])
 
 
-def test_continuous_trunc_on_active_date_is_deferred():
+def test_continuous_day_or_coarser_trunc_on_active_date_rebinds_to_calendar_key():
+    # A continuous month truncation (green `tmn:` pill) on the ACTIVE business date binds to the
+    # marked calendar KEY column Date[Date]: the day-grain Date table relates to the fact date and
+    # Power BI's continuous date axis carries the monthly display grain. This matches a Desktop-
+    # authored rebuild whose line-chart date axis is Date[Date] (never the fact's raw date column).
     tmonth = ("<column-instance column='[Order Date]' derivation='Month-Trunc' "
               "name='[tmn:Order Date:qk]' pivot='key' type='quantitative' />")
     ws = _worksheet("Monthly Trend", "Line",
                     rows="[federated.abc].[sum:Sales:qk]",
                     cols="[federated.abc].[tmn:Order Date:qk]",
                     deps_extra=_INST + tmonth)
+    ir = parse_twb(_workbook(ws), date_binding=_DATE_BINDING)
+    col = ir["worksheets"][0]["cols"][0]
+    assert (col["entity"], col["property"]) == ("Date", "Date")
+    # rebound to the calendar -> the "grain not applied" degrade warning is gone
+    assert not any("grain not applied" in x["reason"].lower() for x in ir["warnings"])
+
+
+def test_subday_trunc_on_active_date_is_deferred():
+    # An HOUR truncation can't be represented by the day-grain calendar, so it stays on the fact
+    # column + warns (warn-never-wrong) -- never silently rebound to a day-grain key that would
+    # drop the time component.
+    thour = ("<column-instance column='[Order Date]' derivation='Hour-Trunc' "
+             "name='[thr:Order Date:qk]' pivot='key' type='quantitative' />")
+    ws = _worksheet("Hourly Trend", "Line",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[thr:Order Date:qk]",
+                    deps_extra=_INST + thour)
     col = parse_twb(_workbook(ws), date_binding=_DATE_BINDING)["worksheets"][0]["cols"][0]
-    # a continuous TRUNC's display grain is a later pass -> it stays on the fact column (binding to
-    # the calendar key alone would lose the monthly grain), never silently rebound.
     assert (col["entity"], col["property"]) == ("Orders", "Order_Date")
 
 

@@ -175,9 +175,13 @@ def _rebind_date_axis(field, deriv, date_binding):
     inactive date (e.g. Ship Date, or any date when the primary is ambiguous) is never bound to the
     calendar and therefore can't silently display the active date's values -- the exact "break a lot
     of stuff" risk. A discrete date PART rebinds to its calendar column (Year -> Date[Year]); a plain
-    exact/continuous date rebinds to the marked key column (Date[Date]); a continuous TRUNC grain and
-    any part with no calendar column return ``None`` (deferred -- the caller keeps the source column +
-    warns). Returns ``(entity, property)`` to rebind, else ``None``.
+    exact/continuous date OR a day-or-coarser continuous truncation (Day/Week/Month/Quarter/Year-Trunc,
+    the green ``t*:`` pills) rebinds to the marked key column (Date[Date]) -- the day-grain Date table
+    relates to the fact date and Power BI's continuous date axis carries the display grain (this is what
+    a Desktop-authored rebuild does: its line-chart date axis is Date[Date]). A SUB-DAY truncation
+    (Hour/Minute/Second-Trunc) can't be represented by a day-grain calendar, and any part with no
+    calendar column, return ``None`` (deferred -- the caller keeps the source column + warns). Returns
+    ``(entity, property)`` to rebind, else ``None``.
     """
     if not date_binding or field.get("role") == "measure":
         return None
@@ -193,7 +197,15 @@ def _rebind_date_axis(field, deriv, date_binding):
         return (table, col) if col else None
     if deriv in ("None", "", None):  # plain/continuous exact date -> the marked calendar key
         return (table, date_binding.get("key_column") or "Date")
-    return None  # continuous TRUNC -> deferred (display-grain shape is a later pass)
+    # A continuous DAY-or-coarser truncation (Day/Week/Month/Quarter/Year-Trunc, the green `t*:`
+    # pills) on the active business date also binds to the marked calendar KEY column: the day-grain
+    # Date table relates to the fact date and Power BI's continuous date axis carries the display
+    # grain -- matching a Desktop-authored rebuild whose line-chart date axis is Date[Date]. A
+    # SUB-DAY truncation (Hour/Minute/Second-Trunc) can't be represented by a day-grain calendar, so
+    # it stays deferred (caller keeps the source column + warns; warn-never-wrong).
+    if re.match(r"(?:Year|Quarter|Month|Week|Day)-Trunc$", str(deriv or "")):
+        return (table, date_binding.get("key_column") or "Date")
+    return None  # sub-day TRUNC / unmapped grain -> deferred (display-grain shape is a later pass)
 
 
 # Tableau internal pseudo-fields that have no model binding. ``Number of Records`` is handled by
