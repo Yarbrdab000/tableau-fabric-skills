@@ -10,14 +10,17 @@ else becomes a **structured handoff** carrying every recovered fact plus an infe
 label, for the agent-as-second-compiler (Tier 1) to resolve against real usage.
 
 Why so conservative? A running total / moving window / rank's *value* depends on the
-addressing **direction** (Tableau's "across" vs "down"), and the scope-relative ``ordering-type``
-tokens (``Table`` / ``Pane`` / ``Cell`` / ``Rows`` / ``Columns`` and the compound
-``ColumnInPane`` / ``PaneCol`` / ``CellInPane``) do **not** encode that direction in a way this
-code can pin from the workbook alone. Emitting DAX for those would be a guess masquerading as a
-translation -- exactly what the faithful-or-stub contract forbids. So only the **explicit
-``Field`` scope** (Tableau "Specific Dimensions"), where the addressing dimensions and sort are
-stated outright, takes the deterministic path here; the scope-relative majority is handed off with
-its facts intact. Two further always-handoff cases: a **secondary (stacked) calculation** (only the
+addressing **direction** (Tableau's "across" vs "down"), and most scope-relative ``ordering-type``
+tokens (``Table`` / ``Pane`` / ``Cell`` / ``Columns`` and the compound ``ColumnInPane`` /
+``PaneCol`` / ``CellInPane``) do **not** encode that direction in a way this code can pin from the
+workbook alone. Emitting DAX for those would be a guess masquerading as a translation -- exactly
+what the faithful-or-stub contract forbids. So the deterministic path is taken only for addressing
+this code can pin: the **explicit ``Field`` scope** (Tableau "Specific Dimensions"), where the
+dimensions and sort are stated outright, and the **``Rows`` pane scope**, whose across/down
+direction *is* recoverable from the shelves (VERIFIED against real Tableau output: the calc restarts
+at each Rows-shelf row -- partition = the Rows dims -- and runs across the Cols-shelf dims -- order =
+the Cols dims). The remaining scope-relative tokens are handed off with their facts intact. Two
+further always-handoff cases:  a **secondary (stacked) calculation** (only the
 primary pass is synthesized in Tier 0) and an **order-sensitive** Field calc addressed by **more
 than one dimension** (the slowest->fastest order among them is not recoverable from the workbook).
 
@@ -26,10 +29,14 @@ Stdlib-only, offline, deterministic. The ``usage`` argument is duck-typed (any o
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from calc_to_dax import translate_tableau_table_calc_to_dax
+from calc_to_dax import (
+    translate_tableau_table_calc_to_dax,
+    translate_percent_diff_to_dax,
+)
 
 
 # -- intent classification -----------------------------------------------------
@@ -43,6 +50,8 @@ _QTC_INTENT = {
     "RunningTotal": "running total (cumulative)",
     "Difference": "difference from a prior row",
     "PercentDifference": "percent difference from a prior row",
+    "PctDiff": "percent difference from a prior row",
+    "PercentDifferenceFrom": "percent difference from a prior row",
     "PercentOfTotal": "percent-of-scope ratio",
     "Movingcalculation": "moving window",
 }
@@ -67,6 +76,15 @@ _WINDOW_FN = {"Sum": "WINDOW_SUM", "Avg": "WINDOW_AVG",
               "Min": "WINDOW_MIN", "Max": "WINDOW_MAX"}
 _AGG_FN = {"Sum": "SUM", "Avg": "AVG", "Min": "MIN", "Max": "MAX"}
 
+# QTC ``calc_type`` values that encode "percent difference from the previous row" -- a COMPOSITE
+# ``(X - LOOKUP(X,-1)) / ABS(LOOKUP(X,-1))`` the single-head window seam cannot parse, so it routes
+# to the dedicated :func:`calc_to_dax.translate_percent_diff_to_dax` emitter. Tableau writes the
+# type as ``PctDiff`` in the .twb; the older/internal spelling ``PercentDifference`` is accepted too.
+_PCT_DIFF_TYPES = {"PctDiff", "PercentDifference", "PercentDifferenceFrom"}
+# A short human label for the derived measure name so the percent-difference measure reads distinctly
+# from the untransformed base measure it is computed over (the two are bound by DIFFERENT tokens).
+_PCT_DIFF_LABEL = "% Difference"
+
 # Leading table-calc functions whose value is INDEPENDENT of the addressing order: a window
 # aggregate over the entire partition (no relative bounds). For these the order spec only frames
 # the partition, so any order yields the same result and multiple addressing dims stay faithful.
@@ -79,6 +97,23 @@ _AGG_DERIVATIONS = {
     "Sum", "Avg", "Min", "Max", "Count", "Cntd", "Median", "Attr",
     "Stdev", "StdevP", "Var", "VarP", "Measure",
 }
+
+# Tableau writes a calculated field's shelf reference as its INTERNAL token -- the auto-generated
+# ``Calculation_<digits>`` / legacy ``Calculation<n>`` form -- whereas a physical field appears by its
+# caption. A calc pill can carry derivation ``None`` (a calc is not an aggregation), so derivation
+# alone does NOT distinguish it from a plain dimension; this pattern (plus a known-calc set) does.
+_CALC_TOKEN_RE = re.compile(r"^Calculation_?\d+$")
+
+
+def _is_calc_token(column, calc_tokens=()):
+    """True iff ``column`` names a calculated field rather than a physical dimension -- it is in the
+    known-calc set ``calc_tokens`` OR matches Tableau's internal ``Calculation_<digits>`` token. Used
+    to keep a calc pill out of an INHERITED partition/order (a calc is not a faithful physical axis)."""
+    if not column:
+        return False
+    if column in calc_tokens:
+        return True
+    return bool(_CALC_TOKEN_RE.match(column))
 
 
 def _intent_for(usage) -> str:
@@ -255,12 +290,253 @@ def _field_scope_addressing(usage, order_sensitive: bool):
     return order_by, tuple(partition), None
 
 
+def _scope_relative_rows_addressing(usage, order_sensitive):
+    """Recover ``(order_by, partition_by, None)`` for the scope-relative ``Rows`` pane scope from
+    the worksheet shelves, or ``(None, None, reason)``.
+
+    VERIFIED against real Tableau output (a day-grain DoD heat grid and an unpartitioned line
+    chart): under the ``Rows`` scope the calc **restarts at each Rows-shelf row** (so the Rows-shelf
+    dimensions are the **partition**) and **runs across the Cols-shelf dimensions** (so the Cols
+    dimensions are the **order**, the "across" axis). This is the one scope-relative token whose
+    across/down direction is pinned -- every other token (``Pane`` / ``Columns`` / ``Cell`` /
+    ``Table`` / the compound ones) still hands off, because its direction is not recoverable from
+    the workbook alone.
+
+    Gates (fail-closed): a partition (Rows) pill must be a **plain** dimension -- an aggregate or a
+    date-grain partition is not faithfully expressible through the window seam. The order (Cols)
+    axis must carry at least one dimension and no aggregate; a **date-grain** order pill IS allowed
+    (it is the natural chronological order). An order-sensitive calc addressed across more than one
+    Cols dimension hands off (their slowest->fastest order is ambiguous), mirroring the Field-scope
+    rule.
+    """
+    partition = []
+    for pill in usage.rows:
+        if pill.derivation in _AGG_DERIVATIONS or pill.derivation == "User":
+            return None, None, ("Rows-shelf partition carries an aggregate/calc pill "
+                                f"[{pill.column}]/{pill.derivation} (not a plain dimension)")
+        if pill.derivation != "None":
+            return None, None, (f"partition includes a date-grain dimension "
+                                f"[{pill.column}]/{pill.derivation} (needs date-table modeling)")
+        if pill.column not in partition:
+            partition.append(pill.column)
+
+    order_dims = []
+    for pill in usage.cols:
+        if pill.derivation in _AGG_DERIVATIONS or pill.derivation == "User":
+            return None, None, ("order (Cols) axis carries an aggregate/calc pill "
+                                f"[{pill.column}]/{pill.derivation}, not a dimension to order across")
+        if pill.column not in order_dims:
+            order_dims.append(pill.column)
+    if not order_dims:
+        return None, None, ("scope-relative 'Rows' addressing with no Cols dimension to order "
+                            "across: the across direction is not recoverable")
+    if order_sensitive and len(order_dims) > 1:
+        return None, None, ("order-sensitive 'Rows' table calc addressed across multiple Cols "
+                            f"dimensions {order_dims}: their slowest->fastest order is ambiguous")
+    order_by = tuple((c, "ASC") for c in order_dims)
+    return order_by, tuple(partition), None
+
+
 # -- public API ----------------------------------------------------------------
-def translate_table_calc_usage(usage, resolver) -> TableCalcTranslation:
+def _addressing_for(usage, order_sensitive):
+    """Recover ``(order_by, partition_by, reason)`` for a usage from its addressing scope.
+
+    The explicit ``Field`` scope ("Specific Dimensions") is recovered from the stated ordering
+    fields; the ``Rows`` pane scope is recovered from the worksheet shelves (VERIFIED: partition =
+    the Rows-shelf dims, order = across the Cols-shelf dims). Every other scope-relative token stays
+    a handoff -- its across/down direction is not recoverable from the workbook encoding here.
+    """
+    if usage.ordering_type == "Field":
+        return _field_scope_addressing(usage, order_sensitive)
+    if usage.ordering_type == "Rows":
+        return _scope_relative_rows_addressing(usage, order_sensitive)
+    return (None, None,
+            f"scope-relative addressing {usage.ordering_type!r}: the across/down direction that "
+            "fixes the partition is not recoverable from the workbook encoding")
+
+
+def _inline_calc_formula(key, base_formula_lookup, seen):
+    """Resolve a calc id/caption to its formula, recursively inlining nested calc references so the
+    result is a self-contained aggregate expression. Returns ``None`` when ``key`` is not a known
+    calc. Cycle-guarded (a reference chain that loops fails closed -> ``None``); a bracketed
+    reference that is NOT itself a known calc (a raw field, or the ``__tableau_internal_object_id__``
+    token) is left verbatim so the downstream measure parser resolves it normally.
+    """
+    k = (key or "").strip().lower()
+    formula = base_formula_lookup.get(k)
+    if formula is None:
+        return None
+    if k in seen:
+        return None
+    seen = seen | {k}
+
+    def _sub(m):
+        inner = _inline_calc_formula(m.group(1), base_formula_lookup, seen)
+        return f"({inner})" if inner is not None else m.group(0)
+
+    return re.sub(r"\[([^\[\]]+)\]", _sub, formula)
+
+
+def _pct_diff_base_formula(usage, base_formula_lookup):
+    """Return ``(base_formula, None)`` -- the pure Tableau aggregate a percent-difference QTC is
+    computed over -- or ``(None, reason)`` when the base cannot be recovered as a single aggregate.
+
+    Two shapes are faithful: (a) the QTC sits over a NAMED calc (the pilot's ``[count orders] + 100``)
+    whose formula is inlined (recursively) to a self-contained aggregate; (b) the QTC sits directly
+    over an aggregated pill (``pcdf`` of ``SUM([Sales])``), rebuilt as ``{AGG}([{col}])``. Anything
+    else (an unknown base, or a non-aggregated pill) hands off honestly.
+    """
+    col = (usage.column or "").strip()
+    if col.startswith("[") and col.endswith("]"):
+        col = col[1:-1]
+    if base_formula_lookup:
+        inlined = _inline_calc_formula(col, base_formula_lookup, set())
+        if inlined is not None:
+            return inlined, None
+    agg = getattr(usage, "aggregation", None)
+    if agg in _AGG_FN:
+        return f"{_AGG_FN[agg]}([{col}])", None
+    return None, (f"percent-difference base [{col}] is neither a known calc nor a directly "
+                  f"aggregated pill (aggregation={agg!r})")
+
+
+_WS_RE = re.compile(r"\s+")
+
+
+def extract_percent_diff_base(formula):
+    """If ``formula`` is EXACTLY a percent-difference-from-the-previous-row composite
+    ``(X - LOOKUP(X, -1)) / ABS(LOOKUP(X, -1))``, return the inner aggregate ``X`` (whitespace
+    collapsed); otherwise return ``None``.
+
+    This recognizes the hand-written form a user authors as a NAMED calc field (the pilot's
+    ``Percent Difference``) -- distinct from the quick-table-calc ``PctDiff`` pill, which carries a
+    ``calc_type`` and is handled by :func:`_pct_diff_base_formula`. The three ``X`` occurrences must
+    be byte-identical after whitespace collapse, so a structurally different composite (a percent
+    difference over a DIFFERENT base in the numerator vs denominator, say) never matches -- the
+    detector is fail-closed by construction. ``X`` itself is validated as a numeric aggregate later,
+    by :func:`calc_to_dax.translate_percent_diff_to_dax`.
+    """
+    if not formula:
+        return None
+    s = _WS_RE.sub("", formula)
+    if not (s.startswith("(") and s.endswith(")")):
+        return None
+    # Find the top-level ``-LOOKUP(`` (at paren depth 1) that separates X from the first LOOKUP.
+    depth = 0
+    cut = -1
+    for i, ch in enumerate(s):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "-" and depth == 1 and s[i + 1:i + 8] == "LOOKUP(":
+            cut = i
+            break
+    if cut < 1:
+        return None
+    x = s[1:cut]
+    if not x:
+        return None
+    expected = "({x}-LOOKUP({x},-1))/ABS(LOOKUP({x},-1))".format(x=x)
+    return x if s == expected else None
+
+
+def inherited_addressing(usage, calc_tokens=()):
+    """Recover ``(order_by, partition_by, reason)`` to LEND to an UNPLACED calc from a PLACED
+    consumer ``usage`` whose formula references it.
+
+    An unplaced table calc (one that is never dropped on a shelf -- e.g. a percent-difference measure
+    used only inside a Grey/Red colour rule and a tooltip) has no addressing of its own. When a
+    PLACED consumer references it, the consumer's worksheet supplies a faithful default window: the
+    order runs across the consumer's plain/date **Cols** axis (the natural "across" direction) and the
+    partition is the consumer's plain **Rows** dimensions only. Unlike the strict scope-relative
+    recovery, a non-plain Rows pill is **excluded** from the inherited partition rather than rejected
+    -- the unplaced calc inherits only the clean categorical context, never a window the seam cannot
+    express. A CALC pill (``calc_tokens`` / a ``Calculation_*`` token) is excluded from BOTH axes: a
+    calculated field is not a faithful physical partition or order column (on a line chart its Rows
+    pill is the plotted measure, not a categorical partition -> the percent difference is unpartitioned).
+    Fail-closed (``reason``) when, after exclusions, the consumer carries no plain/date Cols axis to
+    order across.
+    """
+    order_dims = []
+    for pill in usage.cols:
+        if pill.derivation in _AGG_DERIVATIONS or pill.derivation == "User":
+            continue
+        if _is_calc_token(pill.column, calc_tokens):
+            continue
+        if pill.column not in order_dims:
+            order_dims.append(pill.column)
+    if not order_dims:
+        return None, None, ("consumer worksheet carries no plain Cols dimension to order across: "
+                            "the prior-row direction is not recoverable")
+    partition = []
+    for pill in usage.rows:
+        if pill.derivation != "None":
+            continue
+        if _is_calc_token(pill.column, calc_tokens):
+            continue
+        if pill.column not in partition:
+            partition.append(pill.column)
+    order_by = tuple((c, "ASC") for c in order_dims)
+    return order_by, tuple(partition), None
+
+
+def _inline_refs_in_expr(expr, base_formula_lookup):
+    """Inline every ``[calc]`` reference inside an arbitrary expression to a self-contained aggregate.
+    A bracketed token that is NOT a known calc (a raw field, or the ``__tableau_internal_object_id__``
+    token) is left verbatim so the downstream measure parser resolves it normally.
+    """
+    if not base_formula_lookup:
+        return expr
+
+    def _sub(m):
+        inner = _inline_calc_formula(m.group(1), base_formula_lookup, set())
+        return f"({inner})" if inner is not None else m.group(0)
+
+    return re.sub(r"\[([^\[\]]+)\]", _sub, expr)
+
+
+def translate_unplaced_percent_diff(calc_formula, consumer_usage, resolver,
+                                    known_tables=None, base_formula_lookup=None, calc_tokens=()):
+    """Force-translate an UNPLACED percent-difference measure calc by inheriting addressing from a
+    PLACED consumer usage that references it.
+
+    A percent-difference measure authored as a named calc but never dropped on a shelf (the pilot's
+    ``Percent Difference``, used only inside a Grey/Red colour rule and a tooltip) has no addressing
+    of its own, so the plain measure path can only stub it (``LOOKUP`` needs a window). When a placed
+    consumer references it, that consumer's worksheet lends a faithful window via
+    :func:`inherited_addressing` (``calc_tokens`` keeps the consumer's calc pills out of that window).
+    Returns ``(dax, reason, order_by, partition_by)``: ``dax`` is ``None`` (with ``reason``) --
+    fail-closed -- when the formula is not an exact percent-difference composite, the consumer carries
+    no orderable axis, or the inlined base aggregate does not translate; the recovered
+    ``order_by``/``partition_by`` are returned for provenance either way.
+    """
+    base = extract_percent_diff_base(calc_formula)
+    if base is None:
+        return (None,
+                "not a (X - LOOKUP(X,-1)) / ABS(LOOKUP(X,-1)) percent-difference composite",
+                (), ())
+    base = _inline_refs_in_expr(base, base_formula_lookup or {})
+    order_by, partition_by, reason = inherited_addressing(consumer_usage, calc_tokens=calc_tokens)
+    if reason is not None:
+        return None, reason, (), ()
+    dax, seam_reason, _tables = translate_percent_diff_to_dax(
+        base, resolver, partition_by=partition_by, order_by=order_by, known_tables=known_tables)
+    if dax is None:
+        return None, f"percent-difference seam fallback: {seam_reason}", order_by, partition_by
+    return dax, None, order_by, partition_by
+
+
+def translate_table_calc_usage(usage, resolver, known_tables=None,
+                               base_formula_lookup=None) -> TableCalcTranslation:
     """Map one :class:`TableCalcUsage` to faithful DAX or a structured Tier-1 handoff.
 
     ``resolver(caption) -> (table, column, type) | None`` is the same field resolver the rest of
-    the translator uses.
+    the translator uses. ``known_tables`` (an optional set of model table names) is threaded to the
+    window seam so an object-id aggregate inside the formula (e.g. ``COUNT([__tableau_internal…]))``)
+    resolves to ``COUNTROWS('<Table>')`` only when ``<Table>`` is a real model table.
+    ``base_formula_lookup`` (``{calc-id/caption(lower) -> formula}``) lets a percent-difference quick
+    table calc inline the formula of the NAMED calc it is computed over (e.g. ``[count orders]+100``).
     """
     intent = _intent_for(usage)
 
@@ -271,7 +547,27 @@ def translate_table_calc_usage(usage, resolver) -> TableCalcTranslation:
             "secondary (stacked) table calculation: only the primary pass is synthesized in "
             "Tier 0, so the second addressing pass would be silently dropped")
 
-    # 1) the table-calc formula (synthesized for a QTC; given for a user calc field).
+    # 1) percent-difference-from-prior QTC: a COMPOSITE the single-head window seam cannot parse,
+    #    routed to its own faithful emitter. Its base may be a named calc (inlined) or an aggregated
+    #    pill; addressing is order-sensitive (it looks back one row), recovered like any other QTC.
+    if usage.kind == "quick" and (getattr(usage, "calc_type", "") or "") in _PCT_DIFF_TYPES:
+        base, base_reason = _pct_diff_base_formula(usage, base_formula_lookup or {})
+        if base is None:
+            return _handoff(usage, intent, base_reason)
+        order_by, partition_by, reason = _addressing_for(usage, order_sensitive=True)
+        if reason is not None:
+            return _handoff(usage, intent, reason)
+        dax, seam_reason, _tables = translate_percent_diff_to_dax(
+            base, resolver, partition_by=partition_by, order_by=order_by,
+            known_tables=known_tables)
+        if dax is None:
+            return _handoff(usage, intent, f"percent-difference seam fallback: {seam_reason}")
+        return TableCalcTranslation(
+            worksheet=usage.worksheet, field=usage.caption, intent=intent,
+            status="translated", dax=dax, partition_by=partition_by, order_by=order_by,
+            translated_by="deterministic (workbook addressing)")
+
+    # 2) the table-calc formula (synthesized for a QTC; given for a user calc field).
     if usage.kind == "quick":
         formula, reason = _synthesize_formula(usage)
         if formula is None:
@@ -281,20 +577,17 @@ def translate_table_calc_usage(usage, resolver) -> TableCalcTranslation:
         if not formula:
             return _handoff(usage, intent, "user calc field carries no formula")
 
-    # 2) addressing -- only the explicit Field scope is deterministically recoverable here.
-    if usage.ordering_type != "Field":
-        return _handoff(
-            usage, intent,
-            f"scope-relative addressing {usage.ordering_type!r}: the across/down direction that "
-            "fixes the partition is not recoverable from the workbook encoding")
-    order_by, partition_by, reason = _field_scope_addressing(
-        usage, _is_order_sensitive(formula))
+    # 3) addressing -- recovered from the explicit Field scope or the Rows-shelf layout (never
+    #    hard-coded); every other scope-relative token hands off.
+    order_sensitive = _is_order_sensitive(formula)
+    order_by, partition_by, reason = _addressing_for(usage, order_sensitive)
     if reason is not None:
         return _handoff(usage, intent, reason)
 
-    # 3) hand the synthesized formula + explicit addressing to the trusted window seam.
+    # 4) hand the synthesized formula + explicit addressing to the trusted window seam.
     dax, seam_reason, _tables = translate_tableau_table_calc_to_dax(
-        formula, resolver, partition_by=partition_by, order_by=order_by)
+        formula, resolver, partition_by=partition_by, order_by=order_by,
+        known_tables=known_tables)
     if dax is None:
         return _handoff(usage, intent, f"window seam fallback: {seam_reason}")
     return TableCalcTranslation(
@@ -303,6 +596,8 @@ def translate_table_calc_usage(usage, resolver) -> TableCalcTranslation:
         translated_by="deterministic (workbook addressing)")
 
 
-def translate_table_calc_usages(usages, resolver) -> List[TableCalcTranslation]:
+def translate_table_calc_usages(usages, resolver, known_tables=None,
+                                base_formula_lookup=None) -> List[TableCalcTranslation]:
     """Batch :func:`translate_table_calc_usage` over an iterable of usages."""
-    return [translate_table_calc_usage(u, resolver) for u in usages]
+    return [translate_table_calc_usage(u, resolver, known_tables=known_tables,
+                                       base_formula_lookup=base_formula_lookup) for u in usages]

@@ -254,6 +254,20 @@ def test_extract_calculations_keeps_measures_and_reports_skips():
     assert "Amount Bin" in skipped_reasons  # categorical-bin / no formula
 
 
+def test_extract_calculations_captures_internal_token_for_binding():
+    # The Tableau internal field name (name='[Calculation_xxxx]') is captured as `internal_name` --
+    # the deterministic cross-layer join key the viz/report layer binds on (set only when it differs
+    # from the caption, matching connection_to_m.extract_calcs). Additive; caption unchanged.
+    calcs, _ = extract_calculations(WIDGET_SALES_TDS)
+    by_name = {c["name"]: c for c in calcs}
+    assert by_name["Total Amount"]["internal_name"] == "Calculation_001"
+    assert by_name["Avg Price"]["internal_name"] == "Calculation_002"
+    # dimension calcs carry it too (for the calc-column binding path)
+    _, _, dim_calcs = extract_calculations(WIDGET_SALES_TDS, include_dimensions=True)
+    assert dim_calcs[0]["name"] == "Category Label"
+    assert dim_calcs[0]["internal_name"] == "Calculation_004"
+
+
 def test_extract_calculations_default_shape_unchanged_without_opt_in():
     # The opt-in must not perturb the default: same 2-tuple, same contents.
     assert extract_calculations(WIDGET_SALES_TDS) == extract_calculations(

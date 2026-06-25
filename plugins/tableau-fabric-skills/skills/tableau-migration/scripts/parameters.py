@@ -762,6 +762,7 @@ def emit_field_parameters(calcs, *, field_locator, used_names=None, existing_tab
         # block). Kept in detection order so the self-service table's slot order is stable.
         specs.append({"calc_name": name, "table_name": res["table_name"],
                       "display_col": res["display_col"], "role": res.get("role"),
+                      "controller": sw.get("controller"),
                       "entries": res.get("entries") or []})
     return {"parts": parts, "table_names": table_names, "consumed": consumed,
             "specs": specs, "measures": synth.definitions, "warnings": warnings}
@@ -795,11 +796,13 @@ def emit_value_parameters(params, *, calcs, reserved_names=None):
     ``calcs`` formula references via ``[Parameters].[X]``.
 
     Returns ``{parts:[(filename, tmdl)], table_names:[...], measure_names:[...], param_resolver,
-    warnings:[...]}``. ``param_resolver(name)`` maps a parameter reference (by caption or
-    bracket-less internal name) to its value measure ``[<Param> Value]`` so the calc translator can
-    inline the selection; it deliberately registers NO table in ``tables_used`` so the host
-    expression stays single-table (e.g. ``SUM('Orders'[Sales]) * [Sales Multiplier Value]`` does not
-    trip the cross-table fallback). ``reserved_names`` is a shared lowercased set of every existing
+    consumed_params:[...], warnings:[...]}``. ``param_resolver(name)`` maps a parameter reference
+    (by caption or bracket-less internal name) to its value measure ``[<Param> Value]`` so the calc
+    translator can inline the selection; it deliberately registers NO table in ``tables_used`` so the
+    host expression stays single-table (e.g. ``SUM('Orders'[Sales]) * [Sales Multiplier Value]`` does
+    not trip the cross-table fallback). ``consumed_params`` lists the SOURCE parameters that became
+    what-if tables (``{caption, internal_name, table, measure}``) so the model manifest can tag them
+    kind="value" (model-owned). ``reserved_names`` is a shared lowercased set of every existing
     table/column/measure name so emitted names never collide; the caller seeds it with the data
     table + its columns + the translated measure names BEFORE calling this.
 
@@ -811,7 +814,7 @@ def emit_value_parameters(params, *, calcs, reserved_names=None):
     wanted = referenced_parameters(params, calcs)
 
     parts, table_names, measure_names, warnings = [], [], [], []
-    resolver_map, used_files = {}, set()
+    resolver_map, used_files, consumed_params = {}, set(), []
     for p in wanted:
         caption = p.get("caption") or p.get("internal_name") or "Parameter"
         datatype = p.get("datatype", "string")
@@ -837,6 +840,11 @@ def emit_value_parameters(params, *, calcs, reserved_names=None):
         parts.append((final, tmdl))
         table_names.append(table_name)
         measure_names.append(measure_name)
+        # Record the SOURCE parameter that this what-if table consumed, so the model manifest can
+        # tag it kind="value" (model-owned) and the report/viz layer never re-emits it as a slicer.
+        consumed_params.append({"caption": p.get("caption"),
+                                "internal_name": p.get("internal_name"),
+                                "table": table_name, "measure": measure_name})
         ref = dax_ref(None, measure_name, measure=True)
         for k in _param_keys(p):
             resolver_map[k] = ref
@@ -845,7 +853,8 @@ def emit_value_parameters(params, *, calcs, reserved_names=None):
         return resolver_map.get((name or "").strip().lower())
 
     return {"parts": parts, "table_names": table_names, "measure_names": measure_names,
-            "param_resolver": param_resolver, "warnings": warnings}
+            "param_resolver": param_resolver, "consumed_params": consumed_params,
+            "warnings": warnings}
 
 
 def extract_field_swap_calcs(xml):

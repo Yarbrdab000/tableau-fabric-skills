@@ -831,6 +831,121 @@ def test_table_calc_cross_table_falls_back():
     assert "cross-table" in reason
 
 
+# --- g2: cross-calc references (a calc that references another calc by name) -------------------
+from calc_to_dax import translate_tableau_calc_to_dax_typed  # noqa: E402
+
+
+def test_cross_calc_reference_translates_with_measure_refs():
+    # [count orders] names another measure -> a DAX measure reference, so [count orders] + 100
+    # becomes a faithful measure expression instead of falling back.
+    refs = {"count orders": ("count orders", "number")}
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        "[count orders] + 100", _resolver, measure_refs=refs)
+    assert dax == "[count orders] + 100"
+    assert reason == "ok"
+
+
+def test_cross_calc_reference_without_map_falls_back():
+    # Default (no measure_refs) -> identical prior behavior: a bare field in a measure stubs.
+    dax, _reason, _ = translate_tableau_calc_to_dax("[count orders] + 100", _resolver)
+    assert dax is None
+
+
+def test_cross_calc_reference_keyed_by_internal_token():
+    # Tableau formulas often reference a calc by its internal Calculation_xxxx token; the map is
+    # keyed by that too, and resolves to the emitted measure's caption.
+    refs = {"calculation_0014172369248279": ("count orders", "number")}
+    dax, _reason, _ = translate_tableau_calc_to_dax(
+        "[Calculation_0014172369248279] + 100", _resolver, measure_refs=refs)
+    assert dax == "[count orders] + 100"
+
+
+def test_cross_calc_reference_text_measure_in_arithmetic_fails_closed():
+    # A text measure carried with its real dtype must NOT silently translate in a numeric context;
+    # the enclosing arithmetic stays fail-closed (the dtype propagates to the number guard).
+    refs = {"label": ("label", "text")}
+    dax, _reason, _ = translate_tableau_calc_to_dax(
+        "[label] + 100", _resolver, measure_refs=refs)
+    assert dax is None
+
+
+def test_cross_calc_reference_propagates_referenced_dtype():
+    # A numeric measure ref participates correctly in further arithmetic.
+    refs = {"base": ("base", "number")}
+    dax, _reason, _ = translate_tableau_calc_to_dax(
+        "([base] + 100) * 2", _resolver, measure_refs=refs)
+    assert dax == "([base] + 100) * 2"
+
+
+def test_typed_translation_returns_result_dtype():
+    # The typed entry point exposes the result dtype (used by _measures_part to chain references).
+    dax, reason, _tables, dtype = translate_tableau_calc_to_dax_typed("SUM([Sales])", _resolver)
+    assert dax == "SUM('Orders'[Sales])"
+    assert reason == "ok"
+    assert dtype == "number"
+
+
+# --- g1: object-model row identity COUNT -> COUNTROWS -------------------------
+_OID = "[__tableau_internal_object_id__].[Orders_ECFCA1FB690A41FE803BC071773BA862]"
+
+
+def test_object_id_count_to_countrows():
+    # COUNT over Tableau's internal row identity is COUNT(*) -> COUNTROWS('<table>').
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        f"COUNT({_OID})", _resolver, known_tables={"Orders"})
+    assert dax == "COUNTROWS('Orders')"
+    assert reason == "ok"
+    assert tables == {"Orders"}
+
+
+def test_object_id_count_zn_wraps_to_coalesce():
+    # The pilot's `count orders` = ZN(COUNT(<object-id>)) -> COALESCE(COUNTROWS('Orders'), 0).
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        f"ZN(COUNT({_OID}))", _resolver, known_tables={"Orders"})
+    assert dax == "COALESCE(COUNTROWS('Orders'), 0)"
+    assert reason == "ok"
+
+
+def test_object_id_countd_to_countrows():
+    # The object id is a per-row identity, so a distinct count is also the row count.
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        f"COUNTD({_OID})", _resolver, known_tables={"Orders"})
+    assert dax == "COUNTROWS('Orders')"
+    assert reason == "ok"
+
+
+def test_object_id_count_case_insensitive_known_table():
+    # The hash-stripped relation matches a known table case-insensitively (canonical case wins).
+    dax, _reason, tables = translate_tableau_calc_to_dax(
+        f"COUNT({_OID})", _resolver, known_tables={"orders"})
+    assert dax == "COUNTROWS('orders')"
+    assert tables == {"orders"}
+
+
+def test_object_id_count_unknown_table_falls_back():
+    # Not among the model's tables -> fall back; never emit COUNTROWS of a non-existent table.
+    f = "COUNT([__tableau_internal_object_id__].[Ghost_ECFCA1FB690A41FE803BC071773BA862])"
+    dax, _reason, _ = translate_tableau_calc_to_dax(f, _resolver, known_tables={"Orders"})
+    assert dax is None
+
+
+def test_object_id_count_no_known_tables_trusts_hash_strip():
+    # With no table list supplied, trust the hash-stripped relation token (the authoritative source
+    # relation name), mirroring the viz-side resolution.
+    dax, reason, _ = translate_tableau_calc_to_dax(f"COUNT({_OID})", _resolver)
+    assert dax == "COUNTROWS('Orders')"
+    assert reason == "ok"
+
+
+def test_object_id_count_addend_combines_with_scalar():
+    # alt #2 `COUNT([Orders]) + 100` over the object id -> COUNTROWS('Orders') + 100.
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        f"COUNT({_OID}) + 100", _resolver, known_tables={"Orders"})
+    assert dax == "COUNTROWS('Orders') + 100"
+    assert reason == "ok"
+
+
+
 def test_table_calc_unresolved_order_field_falls_back():
     dax, reason, _ = translate_tableau_table_calc_to_dax("INDEX()", _resolver, (), ["Nope"])
     assert dax is None

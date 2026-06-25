@@ -267,6 +267,8 @@ def test_emit_field_parameters_returns_report_specs_in_detection_order():
     out = P.emit_field_parameters(calcs, field_locator=_loc, existing_tables=["Orders", "_Measures"])
     specs = out["specs"]
     assert [s["calc_name"] for s in specs] == ["Dim calc 1", "Measure Calc"]  # detection order
+    # each spec records its controlling parameter (the model manifest tags that param kind="field")
+    assert [s["controller"] for s in specs] == ["p", "m"]
     dim = specs[0]
     assert dim["table_name"] == "Dim calc 1" and dim["display_col"] == "Dim calc 1"
     assert dim["role"] == "dimension"
@@ -458,6 +460,23 @@ def test_emit_value_parameter_only_referenced_params():
         [_num_param(caption="Unused", internal="[Parameter 9]")],
         calcs=[{"name": "m", "role": "measure", "formula": "SUM([Sales])"}], reserved_names=set())
     assert res["parts"] == [] and res["table_names"] == []
+
+
+def test_emit_value_parameter_reports_consumed_source_params():
+    # Additive: the emitter records WHICH source parameters became what-if tables so the model
+    # manifest can tag them kind="value" (model-owned) rather than a dashboard slicer.
+    calc = {"name": "Adj Sales", "role": "measure",
+            "formula": "SUM([Sales]) * [Parameters].[Sales Multiplier]"}
+    res = P.emit_value_parameters([_num_param()], calcs=[calc],
+                                  reserved_names={"orders", "sales"})
+    assert res["consumed_params"] == [
+        {"caption": "Sales Multiplier", "internal_name": "[Parameter 7]",
+         "table": "Sales Multiplier", "measure": "Sales Multiplier Value"}]
+    # a param that is NOT representable as a value control is not reported consumed
+    res2 = P.emit_value_parameters(
+        [_num_param(caption="Unused", internal="[Parameter 9]")],
+        calcs=[{"name": "m", "role": "measure", "formula": "SUM([Sales])"}], reserved_names=set())
+    assert res2["consumed_params"] == []
 
 
 def _sales_resolver(field):

@@ -385,9 +385,13 @@ _VIZ_ENTRY_POINTS = ("migrate_workbook", "migrate_twb_to_pbir", "build_pbir", "b
 def extract_calculations(xml_text, *, include_dimensions=False):
     """Pull measure calculated fields out of ``.tds`` / ``.twb`` XML.
 
-    Returns ``(calcs, skipped)`` where ``calcs`` is a list of ``{"name", "formula"}`` ready to
-    hand to ``assemble_import_model(calcs=...)`` and ``skipped`` records every calculated field
-    deliberately left out, with a reason -- so nothing disappears silently.
+    Returns ``(calcs, skipped)`` where ``calcs`` is a list of ``{"name", "formula", "internal_name"?}``
+    ready to hand to ``assemble_import_model(calcs=...)`` and ``skipped`` records every calculated
+    field deliberately left out, with a reason -- so nothing disappears silently. ``internal_name`` is
+    the field's Tableau internal name (e.g. ``Calculation_0014172369248279``), included only when it
+    differs from the caption -- an additive cross-layer join key so a translated measure can be bound
+    back to its workbook usage. This matches ``connection_to_m.extract_calcs``'s convention so both
+    calc extractors stamp the same key the model build reads for source identity / calc_bindings.
 
     Calculated fields live as ``<column caption=.. role=..><calculation class=.. formula=../></column>``.
     Only *measure*-role calcs become DAX measures; bins (``class='categorical-bin'``), empty
@@ -414,7 +418,8 @@ def extract_calculations(xml_text, *, include_dimensions=False):
         calc_el = next((c for c in list(col) if _local(c.tag) == "calculation"), None)
         if calc_el is None:
             continue
-        caption = col.get("caption") or _strip_brackets(col.get("name") or "") or ""
+        internal_name = _strip_brackets(col.get("name") or "") or None
+        caption = col.get("caption") or internal_name or ""
         cls = (calc_el.get("class") or "tableau").lower()
         formula = calc_el.get("formula") or ""
         role = (col.get("role") or "measure").lower()
@@ -439,13 +444,19 @@ def extract_calculations(xml_text, *, include_dimensions=False):
                 skipped.append({"name": caption, "reason": "duplicate calculated-field name"})
                 continue
             seen.add(caption)
-            dim_calcs.append({"name": caption, "formula": formula, "role": role})
+            dim_entry = {"name": caption, "formula": formula, "role": role}
+            if internal_name and internal_name.lower() != caption.lower():
+                dim_entry["internal_name"] = internal_name
+            dim_calcs.append(dim_entry)
             continue
         if caption in seen:
             skipped.append({"name": caption, "reason": "duplicate calculated-field name"})
             continue
         seen.add(caption)
-        calcs.append({"name": caption, "formula": formula})
+        entry = {"name": caption, "formula": formula}
+        if internal_name and internal_name.lower() != caption.lower():
+            entry["internal_name"] = internal_name
+        calcs.append(entry)
 
     return (calcs, skipped, dim_calcs) if include_dimensions else (calcs, skipped)
 

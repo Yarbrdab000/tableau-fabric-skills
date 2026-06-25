@@ -112,6 +112,30 @@ _AGG_MAP = {
 # Aggregations that require a NUMERIC column (emit DAX that errors on text/date otherwise).
 _NUMERIC_ONLY_AGGS = {"SUM", "AVG", "MEDIAN", "STDEV", "STDEVP", "VAR", "VARP"}
 
+# -- Object-model row identity (implicit row count) ---------------------------
+# A COUNT/COUNTD over Tableau's internal row identity
+# ``[__tableau_internal_object_id__].[<relation>_<hex32>]`` means "count the rows of <relation>"
+# (COUNT(*)); the faithful DAX target is ``COUNTROWS('<table>')`` -- the object id names no real
+# model column, so a column aggregate would dangle. The marker name and the trailing 32-hex
+# relation suffix are unprotectable Tableau<->Power BI interoperability facts (verified against our
+# own corpus XML); the recognizer/emitter here are authored independently against this parser's IR.
+_INTERNAL_OBJECT_ID = "__tableau_internal_object_id__"
+_OID_HASH_RE = re.compile(r"_[0-9A-Fa-f]{32}$")
+_OID_COUNT_AGGS = {"COUNT", "COUNTD"}
+
+
+def _is_object_id_ref(parts):
+    return any(_INTERNAL_OBJECT_ID in (p or "") for p in (parts or ()))
+
+
+def _oid_relation_tail(parts):
+    # The table-encoding relation is the qualifier part that is NOT the object-id marker (the
+    # marker may lead or trail); fall back to the last part.
+    for p in (parts or ()):
+        if _INTERNAL_OBJECT_ID not in (p or ""):
+            return p or ""
+    return (parts[-1] if parts else "") or ""
+
 # Outer aggregation -> DAX iterator used to RE-AGGREGATE a FIXED LOD over its own grain:
 # SUMMARIZE materializes the LOD grain, CALCULATE re-enters row context for the inner measure.
 # COUNT -> COUNTAX (counts non-blank scalars of any type, parity with Tableau COUNT). COUNTD is
@@ -377,13 +401,22 @@ def _tokenize(formula):
 # matching X-iterator, e.g. SUM(IF c THEN v END) -> SUMX('T', IF(c, v))). A row-level field
 # at measure top level is therefore a parse error (-> fallback).
 class _Parser:
-    def __init__(self, toks, resolver, tables_used, mode="measure", param_resolver=None):
+    def __init__(self, toks, resolver, tables_used, mode="measure", param_resolver=None,
+                 measure_refs=None, known_tables=None):
         self.toks = toks
         self.pos = 0
         self.resolver = resolver
         self.tables_used = tables_used
         self.mode = mode          # "measure" (default) or "column" (row-level)
         self.param_resolver = param_resolver
+        # measure_refs: {normalized-key -> (measure_name, dtype)} for cross-calc references.
+        # A bare ``[X]`` in a MEASURE that names another already-translated measure becomes a
+        # DAX measure reference ``[X]`` of the referenced measure's real dtype (so downstream
+        # type checks stay fail-closed). Empty -> the prior "bare field not valid" fallback.
+        self.measure_refs = measure_refs or {}
+        # known_tables: the model's table display names, enabling object-id COUNT -> COUNTROWS('T')
+        # with validation. Empty -> trust the hash-stripped relation token.
+        self.known_tables = set(known_tables) if known_tables else set()
         self._lod_dim_stack = []
 
     def _peek(self):
@@ -660,6 +693,15 @@ class _Parser:
         if k == "field":
             if self.mode == "column":
                 return self._row_field()
+            ref = self.measure_refs.get((v or "").strip().lower())
+            if ref is not None:
+                self._next()  # consume the field token
+                # Cross-calc reference: another calc became a named measure -> reference it by
+                # name (DAX measures are referenced bare, no table qualifier). Carry the
+                # referenced measure's real dtype so the enclosing expression's type checks
+                # stay fail-closed (e.g. a text measure used in arithmetic still raises).
+                ref_name, ref_dtype = ref
+                return (f"[{ref_name.replace(']', ']]')}]", ref_dtype)
             raise _CalcError("bare row-level field [..] not valid in a measure")
         if k == "qfield":
             self._next()
@@ -850,6 +892,20 @@ class _Parser:
             args.append(else_node[0])
         return (f"SWITCH({', '.join(args)})", rtype)
 
+    def _oid_table(self, parts):
+        # Resolve the model table an object-id COUNT refers to: strip the trailing _<hex32> from
+        # the relation id; when the caller supplied the model's table names require an exact or
+        # case-insensitive match (else None -> caller falls back). With no table list, trust the
+        # hash-stripped relation token (the authoritative Tableau source-relation name).
+        tail = _oid_relation_tail(parts)
+        m = _OID_HASH_RE.search(tail)
+        table = (tail[:m.start()] if m else tail) or None
+        if table is None or not self.known_tables:
+            return table
+        if table in self.known_tables:
+            return table
+        return {t.lower(): t for t in self.known_tables}.get(table.lower())
+
     def _agg(self):
         name = self._next()[1].upper()
         if name not in _AGG_MAP:
@@ -861,6 +917,18 @@ class _Parser:
             return node
         k, v = self._peek()
         if k == "qfield":
+            # Object-model row count: COUNT/COUNTD over the internal row identity
+            # [__tableau_internal_object_id__].[<relation>_<hex32>] is Tableau's COUNT(*) of
+            # <relation> -> COUNTROWS('<table>'). Emit only when the hash-stripped relation
+            # resolves to a known model table; otherwise fall through to the "(unmodeled)" raise.
+            if (name in _OID_COUNT_AGGS and _is_object_id_ref(v)
+                    and self._peek_at(1) == ("op", ")")):
+                table = self._oid_table(v)
+                if table is not None:
+                    self._next()            # consume the object-id qfield
+                    self._expect_op(")")
+                    self.tables_used.add(table)
+                    return (f"COUNTROWS({_dax_table(table)})", "number")
             self._qualified_ref(v)  # specific "(unmodeled)" reason instead of the generic one
         # Fast path: AGG([field]) over a single bare field -> the scalar aggregate AGG('T'[Col]).
         if k == "field" and self._peek_at(1) == ("op", ")"):
@@ -1540,7 +1608,8 @@ def date_attribute_binding(formula):
     return None
 
 
-def translate_tableau_calc_to_dax(formula, resolver, param_resolver=None):
+def translate_tableau_calc_to_dax(formula, resolver, param_resolver=None, measure_refs=None,
+                                  known_tables=None):
     """Translate a SAFE-subset Tableau calc to DAX. Returns (dax|None, reason, tables_used).
 
     dax is None on any unsupported construct -> caller keeps the inert `= 0` stub.
@@ -1548,29 +1617,53 @@ def translate_tableau_calc_to_dax(formula, resolver, param_resolver=None):
     param_resolver(name) -> "[Measure]" | None: turns a value/what-if ``[Parameters].[X]`` into
     its SELECTEDVALUE measure reference (measure-translation path only; omit it for calculated
     columns, where a slicer selection cannot be read and the calc should stub).
+    measure_refs({normalized-name: (measure_name, dtype)}) | None: lets a bare ``[X]`` that names
+    another *already-translated* measure resolve to a DAX measure reference instead of falling back
+    (cross-calc references such as ``[count orders] + 100``). Default None -> identical prior output.
+    known_tables(iterable of table display names) | None: enables object-model row-count
+    translation -- ``COUNT``/``COUNTD`` over ``[__tableau_internal_object_id__].[<relation>_<hex32>]``
+    emits ``COUNTROWS('<table>')`` when the hash-stripped relation matches one of these tables (or,
+    when omitted, trusts the relation token). Default None -> still emits for a clean relation id.
+    """
+    dax, reason, tables_used, _dtype = translate_tableau_calc_to_dax_typed(
+        formula, resolver, param_resolver=param_resolver, measure_refs=measure_refs,
+        known_tables=known_tables)
+    return dax, reason, tables_used
+
+
+def translate_tableau_calc_to_dax_typed(formula, resolver, param_resolver=None, measure_refs=None,
+                                        known_tables=None):
+    """Like ``translate_tableau_calc_to_dax`` but also returns the result dtype as a 4th item.
+
+    Returns ``(dax|None, reason, tables_used, dtype|None)``. The extra ``dtype`` ("number" /
+    "text" / "date" / "bool") lets callers that chain cross-calc references (``_measures_part``)
+    record a translated measure's type so a later calc referencing it stays type-checked and
+    fail-closed. The 3-item ``translate_tableau_calc_to_dax`` wraps this and drops ``dtype``.
     """
     tables_used = set()
     f = (formula or "").strip()
     if not f:
-        return None, "empty formula", tables_used
+        return None, "empty formula", tables_used, None
     try:
         toks = _tokenize(f)
         if not toks:
-            return None, "empty formula", tables_used
-        dax, _dtype = _Parser(toks, resolver, tables_used, param_resolver=param_resolver).parse()
+            return None, "empty formula", tables_used, None
+        dax, dtype = _Parser(
+            toks, resolver, tables_used, param_resolver=param_resolver,
+            measure_refs=measure_refs, known_tables=known_tables).parse()
         # Single-table only: terms spanning >1 table fall back (a relationship path
         # does not guarantee the DAX filter context reproduces Tableau's result).
         if len(tables_used) > 1:
-            return None, "cross-table terms (fields span multiple tables)", tables_used
+            return None, "cross-table terms (fields span multiple tables)", tables_used, None
         leak = validate_dax(dax)
         if leak:
-            return None, f"emit guardrail: {leak}", tables_used
-        return dax, "ok", tables_used
+            return None, f"emit guardrail: {leak}", tables_used, None
+        return dax, "ok", tables_used, dtype
     except _CalcError as e:
-        return None, str(e), tables_used
+        return None, str(e), tables_used, None
 
 
-def translate_tableau_calc_to_column_dax(formula, resolver):
+def translate_tableau_calc_to_column_dax(formula, resolver, known_tables=None):
     """Translate a ROW-LEVEL Tableau calc to a DAX *calculated-column* expression.
 
     Companion to translate_tableau_calc_to_dax with the SAME public shape --
@@ -1596,7 +1689,8 @@ def translate_tableau_calc_to_column_dax(formula, resolver):
         toks = _tokenize(f)
         if not toks:
             return None, "empty formula", tables_used
-        dax, _dtype = _Parser(toks, resolver, tables_used, mode="column").parse()
+        dax, _dtype = _Parser(toks, resolver, tables_used, mode="column",
+                              known_tables=known_tables).parse()
         if len(tables_used) > 1:
             return None, "cross-table terms (fields span multiple tables)", tables_used
         leak = validate_dax(dax)
@@ -1824,7 +1918,8 @@ def _emit_table_calc(name, p, spec):
     raise _CalcError(f"unsupported table calculation {name}")
 
 
-def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), order_by=()):
+def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), order_by=(),
+                                        known_tables=None):
     """Translate a Tableau TABLE CALCULATION to a modern-DAX window-function measure.
 
     Same (dax|None, reason, tables_used) shape as the other entry points, plus the explicit
@@ -1874,7 +1969,7 @@ def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), orde
         name = toks[0][1].upper()
         if name not in _TABLE_CALCS:
             return None, f"unsupported table calculation {toks[0][1]}", tables_used
-        p = _Parser(toks, resolver, tables_used, mode="measure")
+        p = _Parser(toks, resolver, tables_used, mode="measure", known_tables=known_tables)
         p.pos = 2  # consume the table-calc name and '('
         if name in _TABLECALC_RANKLIKE:
             # The RANK family + TOTAL need the raw addressing/partition COLUMNS (to enumerate marks
@@ -1896,6 +1991,55 @@ def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), orde
             raise _CalcError("unexpected trailing tokens after table calculation")
         if len(tables_used) > 1:
             return None, "cross-table terms (fields span multiple tables)", tables_used
+        leak = validate_dax(dax)
+        if leak:
+            return None, f"emit guardrail: {leak}", tables_used
+        return dax, "ok", tables_used
+    except _CalcError as e:
+        return None, str(e), tables_used
+
+
+def translate_percent_diff_to_dax(base_formula, resolver, partition_by=(), order_by=(),
+                                  known_tables=None):
+    """Translate a *percent-difference-from-the-previous-row* quick table calc to faithful DAX.
+
+    Tableau's percent-difference-from-prior over a base aggregate ``X`` is
+    ``(X - LOOKUP(X, -1)) / ABS(LOOKUP(X, -1))``. The prior-row value reuses the very same OFFSET
+    picker as :func:`translate_tableau_table_calc_to_dax`'s ``LOOKUP`` handler, so the result is::
+
+        DIVIDE((X) - CALCULATE(X, OFFSET(-1, <spec>)), ABS(CALCULATE(X, OFFSET(-1, <spec>))))
+
+    where ``<spec>`` is the ``ORDERBY(...)[, PARTITIONBY(...)]`` addressing. On the FIRST row of each
+    partition ``OFFSET(-1, ...)`` yields blank, so ``prev`` is BLANK and ``DIVIDE`` returns BLANK --
+    matching Tableau's null first row (no prior to compare against). Division by a zero prior is
+    likewise BLANK via ``DIVIDE``.
+
+    ``base_formula`` is the Tableau aggregate the calc is computed over -- a directly aggregated pill
+    (``SUM([Sales])``) or an already-inlined calc base (``ZN(COUNT(<object-id>)) + 100``). It is
+    translated in measure context and must be a single numeric aggregate spanning one table. Same
+    ``(dax|None, reason, tables_used)`` shape as the other entry points; an order spec is REQUIRED.
+    """
+    tables_used = set()
+    f = (base_formula or "").strip()
+    if not f:
+        return None, "empty base formula", tables_used
+    try:
+        toks = _tokenize(f)
+        p = _Parser(toks, resolver, tables_used, mode="measure", known_tables=known_tables)
+        inner = p._expr()
+        if p.pos != len(toks):
+            raise _CalcError("unexpected trailing tokens after percent-difference base aggregate")
+        if inner[1] != "number":
+            return None, "percent difference requires a numeric base aggregate", tables_used
+        order_clause = _orderby_clause(order_by, resolver, tables_used)
+        if order_clause is None:
+            return None, "percent difference requires an explicit order-by spec", tables_used
+        part_clause = _partitionby_clause(partition_by, resolver, tables_used)
+        spec = order_clause if part_clause is None else f"{order_clause}, {part_clause}"
+        if len(tables_used) > 1:
+            return None, "cross-table terms (fields span multiple tables)", tables_used
+        prev = f"CALCULATE({inner[0]}, OFFSET(-1, {spec}))"
+        dax = f"DIVIDE(({inner[0]}) - {prev}, ABS({prev}))"
         leak = validate_dax(dax)
         if leak:
             return None, f"emit guardrail: {leak}", tables_used

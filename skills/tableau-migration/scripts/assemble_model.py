@@ -40,6 +40,7 @@ try:  # package or scripts-on-path
     from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from .calc_to_dax import (
         translate_tableau_calc_to_dax,
+        translate_tableau_calc_to_dax_typed,
         translate_tableau_calc_to_column_dax,
         suggest_assisted_dax,
         field_references,
@@ -53,6 +54,12 @@ try:  # package or scripts-on-path
         emit_value_parameters,
         field_locator_from_resolver,
     )
+    from .table_calc_to_dax import (
+        translate_table_calc_usage,
+        translate_unplaced_percent_diff,
+        extract_percent_diff_base,
+    )
+    from .workbook_table_calcs import extract_table_calc_usages
 except ImportError:
     from connection_to_m import (
         build_m_field_resolver,
@@ -67,6 +74,7 @@ except ImportError:
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from calc_to_dax import (
         translate_tableau_calc_to_dax,
+        translate_tableau_calc_to_dax_typed,
         translate_tableau_calc_to_column_dax,
         suggest_assisted_dax,
         field_references,
@@ -80,6 +88,12 @@ except ImportError:
         emit_value_parameters,
         field_locator_from_resolver,
     )
+    from table_calc_to_dax import (
+        translate_table_calc_usage,
+        translate_unplaced_percent_diff,
+        extract_percent_diff_base,
+    )
+    from workbook_table_calcs import extract_table_calc_usages
 
 
 def _table_display(rel):
@@ -171,8 +185,196 @@ def _calc_lookup_from(calcs):
     return lookup
 
 
+def _table_calc_measures(usages, resolve, known_tables, consumed_lower, base_formula_lookup=None):
+    """Translate workbook table-calc *usages* into named ``_Measures`` measure rows.
+
+    A table calc carries the addressing (Compute-Using partition + order) the plain measure path
+    cannot recover from the ``.tds`` alone, so a translated ``kind="field"`` usage is the FAITHFUL
+    form of that calc and SUPERSEDES the addressing-less measure stub the same calc would otherwise
+    produce; a ``kind="quick"`` quick table calc is an ADDITIONAL derived measure with no plain-calc
+    twin. Returns ``(rows, superseded)`` -- ``rows`` are emit-ready measure dicts carrying the
+    cross-layer ``source`` identity, and ``superseded`` is the set of lowercased calc identities
+    (bare ``Calculation_*`` token AND caption) whose plain measure must be skipped so it is not
+    emitted twice. With no usages this returns ``([], set())`` and the caller is byte-for-byte
+    unchanged.
+
+    A field calc is deduped by its bare token (one measure per named calc); a quick table calc is
+    deduped by its full INSTANCE token (one base may carry several distinct QTCs). A quick table
+    calc never claims the bare token (its base measure owns that key) and is named with an intent
+    suffix so it never collides with the untransformed base measure it transforms. ``base_formula_lookup``
+    (``{calc-id/caption(lower) -> formula}``) lets a percent-difference QTC inline its named base.
+    """
+    rows, superseded, seen = [], set(), set()
+    for usage in usages or []:
+        caption = (getattr(usage, "caption", "") or "").strip()
+        bare = (getattr(usage, "column", "") or "").strip()
+        if bare.startswith("[") and bare.endswith("]"):
+            bare = bare[1:-1]  # canonical bare ``Calculation_*`` token (strip a pill's brackets)
+        kind = getattr(usage, "kind", None)
+        instance = (getattr(usage, "instance", "") or "").strip()
+        # Dedup key: a named field calc is one measure per calc (bare token); a quick table calc is
+        # one measure per INSTANCE (a base may carry several distinct quick table calcs).
+        key = instance.lower() if kind == "quick" and instance else (bare or caption).lower()
+        if not key or key in seen:
+            continue
+        if kind != "quick" and caption.lower() in consumed_lower:
+            continue
+        t = translate_table_calc_usage(usage, resolve, known_tables=known_tables,
+                                       base_formula_lookup=base_formula_lookup)
+        if t.status != "translated":
+            continue
+        seen.add(key)
+        base_name = caption or bare
+        if kind == "quick":
+            # A derived measure: distinct NAME (intent-suffixed) so it never collides with the base
+            # measure it transforms, and NO claim on the bare token -- the dashboard binds a quick
+            # table calc by its full instance token; the bare token stays the base measure's key.
+            name = f"{base_name} ({t.intent})"
+            calc_id = None
+            base_calc_id = bare or None
+        else:
+            name = base_name
+            calc_id = bare or None
+            base_calc_id = None
+        source = {
+            "kind": "table_calc",
+            "model_table": "_Measures",
+            "field_caption": name,
+            # Full instance token VERBATIM (e.g. ``usr:Calculation_xxxx:qk`` /
+            # ``pcdf:usr:Calculation_xxxx:qk``) -- the dashboard binder's PRIMARY join key for a
+            # quick table calc; ``calc_id`` is the bare token a named-calc pill joins on.
+            "calc_instance_token": instance or None,
+            "calc_id": calc_id,
+            "worksheet": getattr(usage, "worksheet", None),
+            "intent": t.intent,
+            "partition_by": list(t.partition_by or ()),
+            "order_by": [list(o) for o in (t.order_by or ())],
+        }
+        if base_calc_id:
+            # Provenance only (the base's own measure owns the bare-token binding): which untransformed
+            # measure this quick table calc derives from.
+            source["base_calc_id"] = base_calc_id
+        rows.append({
+            "measure": name,
+            "status": "translated",
+            "reason": None,
+            "dax": t.dax,
+            "tableau_formula": (getattr(usage, "formula", "") or "").strip(),
+            "translated_by": t.translated_by,
+            "source": source,
+        })
+        # Only a named field calc has a plain-measure twin to supersede; a QTC is purely derived.
+        if kind == "field":
+            superseded.add(key)
+            if caption:
+                superseded.add(caption.lower())
+    return rows, superseded
+
+
+def _referencing_usage(usages, name, internal_name):
+    """The first PLACED table-calc usage whose formula references the calc identified by ``name`` or
+    ``internal_name`` (as a ``[bracketed]`` token), or ``None``.
+
+    Deterministic (scans usages in document order): an UNPLACED calc inherits its window from the
+    worksheet of the consumer that references it (a Grey/Red colour rule, a tooltip), so this finds
+    that donor. A reference may be written with either the calc's caption or its internal
+    ``Calculation_*`` token, so both forms are matched.
+    """
+    keys = [k for k in (str(internal_name or "").strip(), (name or "").strip()) if k]
+    if not keys:
+        return None
+    for usage in usages:
+        formula = getattr(usage, "formula", "") or ""
+        if not formula:
+            continue
+        for key in keys:
+            if f"[{key}]" in formula:
+                return usage
+    return None
+
+
+def _forced_percent_diff_measures(calcs, usages, resolve, known_tables, consumed_lower,
+                                  superseded, base_formula_lookup=None):
+    """Force-translate UNPLACED percent-difference measure calcs into named ``_Measures`` rows.
+
+    A percent-difference measure authored as a named calc but never dropped on a shelf (the pilot's
+    ``Percent Difference`` -- referenced only inside a Grey/Red colour rule and a tooltip) has no
+    addressing of its own, so the plain measure path stubs it (``LOOKUP`` needs a window). When a
+    PLACED consumer references it, its worksheet lends a faithful window (order across the consumer's
+    Cols axis, partition over the consumer's plain Rows dims) and the composite translates through the
+    percent-difference seam. Returns ``(rows, forced)`` mirroring :func:`_table_calc_measures`:
+    ``rows`` are emit-ready measure dicts carrying the cross-layer ``source`` identity, and ``forced``
+    is the set of lowercased calc identities (name AND ``Calculation_*`` token) whose plain measure
+    must be skipped so it is not emitted twice. Fail-closed: a calc that is not an exact composite,
+    has no referencing consumer, or whose inherited window does not translate is left untouched (it
+    flows through the plain path and stubs as before). With no usages this returns ``([], set())`` and
+    the caller is byte-for-byte unchanged.
+    """
+    rows, forced = [], set()
+    usage_list = list(usages or [])
+    if not usage_list:
+        return rows, forced
+    # Known calc identities (caption + internal token) so an inherited window never partitions/orders
+    # by a calculated field pill (a calc is not a faithful physical axis).
+    calc_tokens = set()
+    for c in calcs or []:
+        for k in (c.get("name"), c.get("internal_name")):
+            k = str(k or "").strip()
+            if k:
+                calc_tokens.add(k)
+    for calc in calcs or []:
+        name = (calc.get("name") or "").strip()
+        formula = calc.get("formula") or ""
+        tid = str(calc.get("internal_name") or "").strip()
+        nlow, tlow = name.lower(), tid.lower()
+        if not name or nlow in consumed_lower:
+            continue
+        if nlow in superseded or (tlow and tlow in superseded):
+            continue  # already emitted as an addressed table-calc measure.
+        if extract_percent_diff_base(formula) is None:
+            continue  # not a percent-difference composite -- leave it to the plain path.
+        consumer = _referencing_usage(usage_list, name, tid)
+        if consumer is None:
+            continue  # no placed consumer to lend a window -> stays a (faithful) stub.
+        dax, _reason, order_by, partition_by = translate_unplaced_percent_diff(
+            formula, consumer, resolve, known_tables=known_tables,
+            base_formula_lookup=base_formula_lookup, calc_tokens=calc_tokens)
+        if dax is None:
+            continue  # inherited window did not translate -> fail-closed to the plain stub.
+        ws = getattr(consumer, "worksheet", None)
+        source = {
+            "kind": "calc_column",
+            "model_table": "_Measures",
+            "field_caption": name,
+            # An unplaced named calc joins on its bare ``Calculation_*`` token (it has no QTC instance
+            # token); index it under both the instance-token and calc_id slots so either join hits.
+            "calc_instance_token": tid or None,
+            "calc_id": tid or None,
+            "worksheet": ws,
+            "intent": "measure",
+            "partition_by": list(partition_by or ()),
+            "order_by": [list(o) for o in (order_by or ())],
+            "addressing_inherited_from": ws,
+        }
+        rows.append({
+            "measure": name,
+            "status": "translated",
+            "reason": None,
+            "dax": dax,
+            "tableau_formula": formula,
+            "translated_by": (f"deterministic (force-translated; addressing inherited from "
+                              f"{ws!r})"),
+            "source": source,
+        })
+        forced.add(nlow)
+        if tlow:
+            forced.add(tlow)
+    return rows, forced
+
+
 def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
-                   calc_lookup=None, approved_calc_dax=None, synth_measures=None):
+                   calc_lookup=None, approved_calc_dax=None, synth_measures=None,
+                   known_tables=None, table_calc_usages=None):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
     ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
@@ -200,6 +402,74 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     measures_tmdl = ""
     report = []
     suggestions = []
+    # Cross-calc references (g2): a calc may reference another calc by name -- e.g.
+    # ``[count orders] + 100`` -- which becomes a DAX measure reference once the referent is itself
+    # a translated measure. Pre-pass to a FIXPOINT building a {key -> (measure_name, dtype)} map of
+    # every translatable calc, keyed by BOTH its caption and its internal ``Calculation_xxxx`` token
+    # (Tableau formulas may use either form). Fail-closed: a calc that only stubs never enters the
+    # map, so anything referencing it still stubs rather than emitting a phantom. Independent calcs
+    # are unaffected (the map only adds an acceptance path for an otherwise-failing bare reference),
+    # so output is byte-identical when no calc references another.
+    measure_refs = {}
+    # Workbook table calcs translate FIRST: they carry the addressing the plain measure path lacks,
+    # so a translated field calc both (a) seeds ``measure_refs`` -- under its caption AND its bare
+    # ``Calculation_*`` token -- so a cross-calc like ``2 * [Standard of Deviation]`` resolves, and
+    # (b) SUPERSEDES the same calc's addressing-less plain stub (skipped below) so it is not emitted
+    # twice. With no usages this is inert and the output is byte-for-byte unchanged.
+    # A percent-difference quick table calc is computed over a NAMED base calc (the pilot's
+    # ``[count orders] + 100``); to emit a self-contained aggregate the translator inlines that
+    # base's formula, so seed a {calc-id/caption(lower) -> formula} lookup from the calcs here.
+    base_formula_lookup = {}
+    for c in (calcs or []):
+        formula = c.get("formula") or ""
+        if not formula:
+            continue
+        nm = (c.get("name") or "").strip().lower()
+        if nm:
+            base_formula_lookup[nm] = formula
+        tid = str(c.get("internal_name") or "").strip().lower()
+        if tid:
+            base_formula_lookup[tid] = formula
+    tablecalc_rows, superseded = _table_calc_measures(
+        table_calc_usages, resolve, known_tables, consumed_lower,
+        base_formula_lookup=base_formula_lookup)
+    # Force-translate UNPLACED percent-difference calcs (referenced only inside a colour rule /
+    # tooltip) by inheriting a window from their placed consumer. These are emitted alongside the
+    # addressed table-calc measures and likewise SUPERSEDE their addressing-less plain stub. Inert
+    # (``[]``/empty) when no such calc exists, so the plain path is byte-for-byte unchanged.
+    forced_rows, forced = _forced_percent_diff_measures(
+        calcs, table_calc_usages, resolve, known_tables, consumed_lower, superseded,
+        base_formula_lookup=base_formula_lookup)
+    tablecalc_rows = tablecalc_rows + forced_rows
+    superseded = superseded | forced
+    for r in tablecalc_rows:
+        entry = (r["measure"], "number")
+        measure_refs[r["measure"].strip().lower()] = entry
+        cid = (r["source"].get("calc_id") or "").strip().lower()
+        if cid:
+            measure_refs[cid] = entry
+    pending = [c for c in (calcs or [])
+               if (c.get("name") or "").lower() not in consumed_lower
+               and not _superseded_by_table_calc(c, superseded)]
+    changed = True
+    while changed and pending:
+        changed = False
+        still = []
+        for calc in pending:
+            cname = calc["name"]
+            cdax, _r, _t, cdtype = translate_tableau_calc_to_dax_typed(
+                calc.get("formula", ""), resolve, param_resolver=param_resolver,
+                measure_refs=measure_refs, known_tables=known_tables)
+            if cdax:
+                entry = (cname, cdtype or "number")
+                measure_refs[cname.strip().lower()] = entry
+                tid = calc.get("internal_name")
+                if tid:
+                    measure_refs[str(tid).strip().lower()] = entry
+                changed = True
+            else:
+                still.append(calc)
+        pending = still
     # Aggregating measures synthesized for measure-swap field parameters (a NAMEOF'd raw column is
     # grouped-by, not aggregated, so each measure-swap candidate needs a real SUM measure to point at).
     for sm in (synth_measures or []):
@@ -210,13 +480,27 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         name, formula = calc["name"], calc.get("formula", "")
         if name.lower() in consumed_lower:
             continue
-        dax, reason, _ = translate_tableau_calc_to_dax(formula, resolve, param_resolver=param_resolver)
+        if _superseded_by_table_calc(calc, superseded):
+            continue  # the addressed table-calc form (emitted below) is the faithful one.
+        dax, reason, _ = translate_tableau_calc_to_dax(
+            formula, resolve, param_resolver=param_resolver, measure_refs=measure_refs,
+            known_tables=known_tables)
         row = {
             "measure": name,
             "status": "translated" if dax else "stub",
             "reason": reason,
             "dax": dax,
             "tableau_formula": formula,
+            # Cross-layer source identity (additive): lets the viz/report layer deterministically
+            # bind a worksheet field-instance / calc token to this emitted measure. The status above
+            # tells the binder whether to bind now (translated / assisted-approved) or degrade.
+            "source": {
+                "kind": "calc_column",
+                "model_table": "_Measures",
+                "field_caption": name,
+                "calc_instance_token": calc.get("internal_name"),
+                "intent": "measure",
+            },
         }
         if dax:
             measures_tmdl += T.generate_measure_tmdl(name, formula, dax)
@@ -243,7 +527,248 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         else:
             measures_tmdl += T.generate_measure_tmdl(name, formula, None)
         report.append(row)
+    # Emit the translated workbook table calcs (addressing-bearing) after the plain measures. Each
+    # preserves its original Tableau formula as ``TableauFormula`` and is tagged with the addressing
+    # provenance; its ``source`` carries the full instance token + bare calc id the binder joins on.
+    for r in tablecalc_rows:
+        measures_tmdl += T.generate_measure_tmdl(
+            r["measure"], r["tableau_formula"], r["dax"],
+            translated_by=r.get("translated_by") or "deterministic (workbook addressing)")
+        report.append(r)
     return T.generate_measures_table_tmdl(measures_tmdl), report, suggestions
+
+
+def _superseded_by_table_calc(calc, superseded):
+    """True if ``calc``'s plain measure is replaced by an addressed table-calc measure.
+
+    Matched on either the calc's lowercased name/caption or its internal ``Calculation_*`` token --
+    whichever the table-calc usage recorded -- so the plain stub is skipped exactly once.
+    """
+    if not superseded:
+        return False
+    name = (calc.get("name") or "").strip().lower()
+    tid = str(calc.get("internal_name") or "").strip().lower()
+    return name in superseded or (bool(tid) and tid in superseded)
+
+
+def _calc_bindings_index(measure_report):
+    """Build the additive viz-binding index from the emitted measure rows.
+
+    Returns ``{key -> {"model_table", "measure_name", "status"}}`` keyed by BOTH the measure's
+    caption AND its internal Tableau ``Calculation_*`` token (when present), so the dashboard/report
+    layer can deterministically join a worksheet field-instance / calc token to the measure that
+    actually landed. The binder uses ``status`` to decide bind-now (``translated`` /
+    ``assisted-approved``) vs degrade-and-warn, and joins by token first, then caption -- this is
+    the cross-layer "measure manifest" the viz side consumes (mirrors how date facts flow back).
+
+    Derived straight from ``measure_report`` so it stays in lockstep with ``_Measures`` and
+    transparently grows to cover table-calc measures once they are emitted as rows with a
+    ``source`` of their own. Keys are verbatim (the viz side reads them as-is).
+    """
+    bindings = {}
+    for row in measure_report or []:
+        src = row.get("source") or {}
+        caption = row.get("measure")
+        entry = {
+            "model_table": src.get("model_table", "_Measures"),
+            "measure_name": caption,
+            "status": row.get("status"),
+        }
+        if caption:
+            bindings.setdefault(caption, entry)
+        token = src.get("calc_instance_token")
+        if token:
+            bindings[token] = entry
+        # A table-calc measure also carries the BARE ``Calculation_*`` token under ``calc_id`` --
+        # the key a named-calc pill joins on (its instance token is the QTC-style primary key). Index
+        # it too so both join priorities resolve to this measure.
+        calc_id = src.get("calc_id")
+        if calc_id and calc_id != token:
+            bindings.setdefault(calc_id, entry)
+    return bindings
+
+
+def _norm_param_keys(param):
+    """Lowercased lookup keys a worksheet pill / swap formula may use for this parameter:
+    its caption and its bracket-less internal name. Mirrors ``parameters._param_keys`` but kept
+    local so the manifest builder does not reach into that module's private helper."""
+    keys = set()
+    for raw in (param.get("caption"), param.get("internal_name")):
+        v = (raw or "").strip().strip("[]").strip().lower()
+        if v:
+            keys.add(v)
+    return keys
+
+
+def _classify_parameters(parameters, fp, vp):
+    """Tag every Tableau parameter with the model object that consumed it (if any).
+
+    Returns ``[{name, internal_name, kind, model_object}]`` where ``kind`` is:
+
+    * ``"value"``  -- a scalar/what-if parameter the model turned into a disconnected what-if table
+      (``model_object`` = that table); the report/viz layer must NOT re-emit it as a slicer.
+    * ``"field"``  -- a dimension/measure SWAP controller the model turned into a field-parameter
+      table (``model_object`` = that table); likewise model-owned.
+    * ``"filter"`` -- a plain filter parameter the model did NOT consume (``model_object`` = None);
+      the report/viz layer owns it as an ordinary slicer.
+
+    Classification is deterministic and driven by the two emitters' own consumed-source signals
+    (``vp["consumed_params"]`` and each ``fp["specs"][*]["controller"]``), never by guessing.
+    """
+    value_tbl = {}     # param key -> what-if table name
+    for cp in (vp.get("consumed_params") or []):
+        for k in _norm_param_keys(cp):
+            value_tbl[k] = cp.get("table")
+    field_tbl = {}     # controller key -> field-parameter table name
+    for spec in (fp.get("specs") or []):
+        ctrl = (spec.get("controller") or "").strip().strip("[]").strip().lower()
+        if ctrl:
+            field_tbl.setdefault(ctrl, spec.get("table_name"))
+
+    out = []
+    for p in (parameters or []):
+        keys = _norm_param_keys(p)
+        name = p.get("caption") or p.get("internal_name") or ""
+        kind, model_object = "filter", None
+        vhit = next((value_tbl[k] for k in keys if k in value_tbl), None)
+        fhit = next((field_tbl[k] for k in keys if k in field_tbl), None)
+        if vhit is not None:
+            kind, model_object = "value", vhit
+        elif fhit is not None:
+            kind, model_object = "field", fhit
+        out.append({"name": name, "internal_name": p.get("internal_name"),
+                    "kind": kind, "model_object": model_object})
+    return out
+
+
+_COUNTROWS_RE = re.compile(
+    r"^COUNTROWS\('([^']+)'\)$"
+    r"|^COALESCE\(\s*COUNTROWS\('([^']+)'\)\s*,\s*0\s*\)$")
+
+
+def _row_count_targets(measure_report):
+    """Map each data table to a measure whose DAX is *provably* its whole-table row count --
+    bare ``COUNTROWS('T')`` or ``COALESCE(COUNTROWS('T'), 0)`` (the ZN(COUNT(<object-id>)) form).
+    Returns the viz-consumer shape ``{"measures": {table: measure}, "default": {table, measure}|None}``
+    so a Tableau implicit "Number of Records" pill can bind a faithful count; empty when none exists.
+    Only an exact whole-table count qualifies -- a COUNT over a specific column is NOT a row count."""
+    measures = {}
+    for row in measure_report or []:
+        if row.get("status") not in ("translated", "assisted-approved"):
+            continue
+        dax = " ".join((row.get("dax") or "").split())
+        m = _COUNTROWS_RE.match(dax)
+        if m:
+            table = m.group(1) or m.group(2)
+            measures.setdefault(table, row.get("measure"))
+    default = None
+    if len(measures) == 1:
+        tbl, meas = next(iter(measures.items()))
+        default = {"table": tbl, "measure": meas}
+    return {"measures": measures, "default": default}
+
+
+def build_model_manifest(*, table_names, relations, measure_report, calc_column_report,
+                         dim_calcs, date_report, parameters, fp, vp):
+    """Assemble the additive ``report["model_manifest"]`` -- one cohesive, deterministic view of
+    every emitted model object the report/viz layer binds against. Seven sections:
+
+    1. ``tables``      -- emitted data + Date table names (``_Measures`` excluded).
+    2. ``columns``     -- every base + calculated column ``{model_table, model_name, tableau_field,
+       source_column?, type?, calculated}``.
+    3. ``measures``    -- every measure ``{model_table, model_name, status, source}`` (the viz layer
+       reads this section / ``calc_bindings`` for measure joins).
+    4. ``date``        -- compact date-dimension fact ``{generated, table?}``.
+    5. ``row_count``   -- faithful whole-table COUNTROWS targets for implicit "Number of Records".
+    6. ``parameters``  -- every Tableau parameter tagged ``{name, internal_name, kind, model_object}``
+       (``kind`` in value/field/filter) so the viz layer slices only the plain FILTER params.
+    7. ``naming``      -- the authoritative ``{source_ref -> {model_table, model_name, kind}}`` join
+       map. ``source_ref`` is VERBATIM (same convention as ``calc_bindings``): a column's Tableau
+       field caption (and its physical/remote name), a calc's bare ``Calculation_*`` token AND its
+       caption (and full instance token for a table calc), a parameter's caption/internal name. The
+       viz layer binds columns/measures/param-tables ONLY through this map -- it never reconstructs a
+       model name -- so a renamed/de-duplicated object can never dangle.
+
+    Pure: reads only already-computed build outputs. Additive -- existing report keys are untouched.
+    """
+    data_tables = [t for t in table_names if t != "_Measures"]
+    naming = {}
+
+    def _name(ref, model_table, model_name, kind):
+        if ref and model_name:
+            naming.setdefault(ref, {"model_table": model_table,
+                                    "model_name": model_name, "kind": kind})
+
+    columns = []
+    for rel in relations or []:
+        disp = _table_display(rel)
+        for c in rel.get("columns") or []:
+            model_name = c.get("model_name") or c.get("remote_name")
+            caption = c.get("local_name") or c.get("remote_name")
+            remote = c.get("remote_name")
+            columns.append({"model_table": disp, "model_name": model_name,
+                            "tableau_field": caption, "source_column": remote,
+                            "type": c.get("tmdl_type"), "calculated": False})
+            _name(caption, disp, model_name, "column")
+            if remote and remote != caption:
+                _name(remote, disp, model_name, "column")
+
+    # Row-level dimension calcs land as calculated columns; key them by caption AND bare token.
+    token_by_calc = {}
+    for dc in (dim_calcs or []):
+        nm = (dc.get("name") or "").strip()
+        if nm:
+            token_by_calc[nm.lower()] = dc.get("internal_name")
+    for row in calc_column_report or []:
+        nm, tbl = row.get("column"), row.get("table")
+        columns.append({"model_table": tbl, "model_name": nm, "tableau_field": nm,
+                        "source_column": None, "type": None, "calculated": True,
+                        "status": row.get("status")})
+        _name(nm, tbl, nm, "column")
+        tok = token_by_calc.get((nm or "").strip().lower())
+        if tok:
+            _name(str(tok), tbl, nm, "column")
+
+    measures = []
+    for row in measure_report or []:
+        src = row.get("source") or {}
+        nm = row.get("measure")
+        mtbl = src.get("model_table", "_Measures")
+        measures.append({"model_table": mtbl, "model_name": nm,
+                         "status": row.get("status"), "source": src})
+        _name(nm, mtbl, nm, "measure")
+        for tok in (src.get("calc_instance_token"), src.get("calc_id")):
+            if tok:
+                _name(str(tok), mtbl, nm, "measure")
+
+    # Parameter tables (value/field) are bound by parameter caption/internal name.
+    param_rows = _classify_parameters(parameters, fp, vp)
+    for pr in param_rows:
+        if pr["kind"] in ("value", "field") and pr.get("model_object"):
+            for ref in (pr.get("name"), pr.get("internal_name")):
+                if ref:
+                    _name(str(ref).strip().strip("[]").strip(),
+                          pr["model_object"], pr["model_object"], "parameter")
+    # A field-parameter table is also reachable by the swap calc's own name / table name (a pill may
+    # carry either the controlling parameter OR the swap field), so key those too.
+    for spec in (fp.get("specs") or []):
+        tbl = spec.get("table_name")
+        if tbl:
+            _name(tbl, tbl, tbl, "parameter")
+            _name(spec.get("calc_name"), tbl, tbl, "parameter")
+
+    date_section = {"generated": bool(date_report.get("generated")),
+                    "table": date_report.get("table")}
+
+    return {
+        "tables": data_tables,
+        "columns": columns,
+        "measures": measures,
+        "date": date_section,
+        "row_count": _row_count_targets(measure_report),
+        "parameters": param_rows,
+        "naming": naming,
+    }
 
 
 def _safe_role_filename(name, used):
@@ -850,7 +1375,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                           hierarchies=None, display_folders=None, rls_roles=None,
                           date_table=True, mark_as_date=True, flatfile_path=None,
                           calc_lookup=None, approved_calc_dax=None, date_range=None,
-                          parameters=None):
+                          parameters=None, table_calc_usages=None):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -1006,7 +1531,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     measures_table, measure_report, assisted_suggestions = _measures_part(
         calcs, resolve, consumed=consumed, param_resolver=param_resolver,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
-        approved_calc_dax=approved_calc_dax, synth_measures=fp.get("measures"))
+        approved_calc_dax=approved_calc_dax, synth_measures=fp.get("measures"),
+        known_tables=set(table_names), table_calc_usages=table_calc_usages)
     parts["definition/tables/_Measures.tmdl"] = measures_table
     table_names.append("_Measures")
 
@@ -1038,6 +1564,11 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         "tables": [t for t in table_names if t != "_Measures"],
         "skipped_tables": skipped,
         "measures": measure_report,
+        "calc_bindings": _calc_bindings_index(measure_report),
+        "model_manifest": build_model_manifest(
+            table_names=table_names, relations=tables, measure_report=measure_report,
+            calc_column_report=calc_column_report, dim_calcs=dim_calcs,
+            date_report=date_report, parameters=parameters or [], fp=fp, vp=vp),
         "calc_coverage": calc_coverage_artifact(measure_report),
         "calc_columns": calc_column_report,
         "calc_column_coverage": calc_column_coverage_artifact(calc_column_report),
@@ -1422,13 +1953,22 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
         display_folders = resolved["display_folders"]
         rls_roles = resolved["roles"]
         enrichment_report = resolved["report"]
+    # Workbook table calcs (quick table calcs + addressing-bearing field calcs) are recovered from
+    # the document text so the model build can emit them as faithful measures. A bare ``.tds`` has no
+    # worksheets, so this is ``[]`` there and the build is byte-for-byte unchanged; only a ``.twb``
+    # workbook yields usages. Guarded -- a parse hiccup must never break the model build.
+    try:
+        table_calc_usages = extract_table_calc_usages(tds_text)
+    except Exception:
+        table_calc_usages = []
     result = assemble_import_model(descriptor, model_name=model_name,
                                    calcs=calcs, dim_calcs=dim_calcs, relationships=relationships,
                                    hierarchies=hierarchies, display_folders=display_folders,
                                    rls_roles=rls_roles, date_table=date_table,
                                    mark_as_date=mark_as_date, flatfile_path=flatfile_path,
                                    calc_lookup=calc_lookup, approved_calc_dax=approved_calc_dax,
-                                   date_range=date_range, parameters=parameters)
+                                   date_range=date_range, parameters=parameters,
+                                   table_calc_usages=table_calc_usages)
     if enrichment_report is not None:
         result["report"]["model_objects"] = enrichment_report
     return result
