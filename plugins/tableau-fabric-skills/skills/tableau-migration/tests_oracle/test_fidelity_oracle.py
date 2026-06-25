@@ -256,6 +256,26 @@ def test_infer_family_card_when_no_dims():
     assert fam2 == fo.FAM_BAR and asserted2 is False  # plausible, not asserted
 
 
+def test_infer_family_square_is_highlight_table_matrix():
+    # A Tableau Square mark with axis dimensions is a highlight table -> Power BI matrix (the real
+    # Comcast "Segment % Dod" case): it must NOT misinfer as an unasserted bar.
+    fam, asserted = fo._infer_twb_family(
+        "Square", [{"norm": "segment"}], [{"norm": "pct"}], False, False)
+    assert fam == fo.FAM_MATRIX and asserted is True
+    # Square without dimensions (treemap/density) stays unasserted rather than guessing a matrix.
+    fam2, asserted2 = fo._infer_twb_family("Square", [], [{"norm": "pct"}], False, False)
+    assert fam2 == fo.FAM_UNKNOWN and asserted2 is False
+
+
+def test_type_score_square_highlight_table_matches_pivot_table():
+    # The highlight-table worksheet (matrix) vs an emitted pivotTable (matrix) is a clean match,
+    # not a misleading "bar?/matrix" unasserted partial.
+    ht_ws = {"family": fo.FAM_MATRIX, "family_asserted": True}
+    pivot_v = {"family": fo.FAM_MATRIX}
+    score, note = fo._type_score(ht_ws, pivot_v)
+    assert score == pytest.approx(1.0) and note == "type-match"
+
+
 # --------------------------------------------------------------------------- scoring primitives
 def test_jaccard_and_bands():
     assert fo._jaccard(set(), set()) == 1.0

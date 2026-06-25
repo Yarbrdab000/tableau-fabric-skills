@@ -150,9 +150,10 @@ def fetch_view_image(server, site_id, token, view_id, rest_version=None,
     """Return the server-rendered PNG **bytes** for one view (RLS applied as the authed user)."""
     tds = _require_tds()
     url = view_image_url(server, site_id, view_id, rest_version, resolution)
-    # Binary endpoint: go through raw _http and override the JSON Accept default with image/png.
+    # Binary endpoint: go through raw _http and override the JSON Accept default. Tableau Online's
+    # gateway 406s on a bare ``Accept: image/png`` (verified live), so advertise PNG-with-fallback.
     status, _headers, body = tds._http(
-        "GET", url, headers={"X-Tableau-Auth": token, "Accept": "image/png"}, timeout=180)
+        "GET", url, headers={"X-Tableau-Auth": token, "Accept": "image/png, */*"}, timeout=180)
     if status != 200:
         snippet = body[:200] if isinstance(body, (bytes, bytearray)) else str(body)[:200]
         raise RuntimeError("view-image GET failed (%s) for view %s: %r" % (status, view_id, snippet))
@@ -263,7 +264,9 @@ def main(argv=None):
     ap.add_argument("--workbook-id", default=None, help="Scope view enumeration to one workbook id.")
     ap.add_argument("--worksheets", default=None,
                     help="Comma-separated worksheet names (default: all published views).")
-    ap.add_argument("--out", required=True, help="Output folder for reference PNGs (data-bearing).")
+    ap.add_argument("--out", default=None,
+                    help="Output folder for reference PNGs (data-bearing). "
+                         "Required for acquisition; not needed for --list.")
     ap.add_argument("--resolution", default=DEFAULT_RESOLUTION)
     ap.add_argument("--rest-version", default=None)
     ap.add_argument("--list", action="store_true", help="List published views and exit.")
@@ -277,6 +280,8 @@ def main(argv=None):
     if args.check_local:
         if not worksheets:
             ap.error("--check-local needs --worksheets to know what to look for.")
+        if not args.out:
+            ap.error("--check-local needs --out (the reference folder to inspect).")
         plan = build_acquisition_plan(worksheets, args.out)
         print(plan["instructions"])
         return 0
@@ -295,6 +300,8 @@ def main(argv=None):
             tds.sign_out(args.server, _rest_version(args.rest_version), token)
         return 0
 
+    if not args.out:
+        ap.error("--out is required for acquisition (the folder to write reference PNGs into).")
     manifest = acquire_reference_images(
         args.server, args.site, args.out, worksheet_names=worksheets,
         pat_name=args.pat_name, pat_secret=pat_secret, jwt=args.jwt,

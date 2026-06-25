@@ -78,7 +78,9 @@ def test_fetch_view_image_sends_png_accept_and_returns_bytes(monkeypatch):
     out = fr.fetch_view_image("srv", "SITE", "tok", "V1", "3.24", resolution="high")
     assert out == b"\x89PNG-bytes"
     assert "/views/V1/image?resolution=high" in captured["url"]
-    assert captured["headers"]["Accept"] == "image/png"
+    # Tableau Online 406s on a bare ``Accept: image/png`` (verified live); must advertise fallback.
+    assert captured["headers"]["Accept"] == "image/png, */*"
+    assert "*/*" in captured["headers"]["Accept"]
     assert captured["headers"]["X-Tableau-Auth"] == "tok"
 
 
@@ -118,3 +120,21 @@ def test_acquire_reference_images_unavailable_without_tds(monkeypatch, tmp_path)
     monkeypatch.setattr(fr, "_tds", None)
     out = fr.acquire_reference_images("srv", "", str(tmp_path))
     assert out["available"] is False and "reason" in out
+
+
+def test_cli_list_does_not_require_out(monkeypatch, capsys):
+    # --list enumerates views and exits; it must NOT demand --out (a real usability fix found live).
+    monkeypatch.setattr(tds, "sign_in", lambda *a, **k: ("tok", "SITE"))
+    monkeypatch.setattr(tds, "sign_out", lambda *a, **k: None)
+    monkeypatch.setattr(fr, "list_views",
+                        lambda *a, **k: [{"id": "V1", "name": "Sheet 1", "contentUrl": "c"}])
+    rc = fr.main(["--list", "--server", "srv", "--site", "S", "--pat-name", "N"])
+    assert rc == 0
+    assert "V1\tSheet 1" in capsys.readouterr().out
+
+
+def test_cli_acquisition_requires_out(monkeypatch):
+    # The acquisition path (no --list/--check-local) still needs --out to know where to write.
+    monkeypatch.setattr(tds, "sign_in", lambda *a, **k: ("tok", "SITE"))
+    with pytest.raises(SystemExit):
+        fr.main(["--server", "srv", "--site", "S", "--pat-name", "N"])

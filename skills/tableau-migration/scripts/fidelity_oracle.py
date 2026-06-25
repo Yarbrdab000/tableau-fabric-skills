@@ -543,6 +543,10 @@ def _infer_twb_family(mark, dims, measures, has_geometry, uses_measure_values):
     mlow = (mark or "").lower()
     if has_geometry:
         return FAM_MAP, True
+    # A Square mark with axis dimensions is a highlight table -> Power BI matrix (the Comcast
+    # "Segment % Dod" case); a Square mark without dimensions is a treemap/density we don't assert.
+    if mlow == "square":
+        return (FAM_MATRIX, True) if dims else (FAM_UNKNOWN, False)
     if mlow in _MARK_FAMILY and mlow != "automatic":
         fam = _MARK_FAMILY[mlow]
         # A Text mark with no dimensions is a card, not a table.
