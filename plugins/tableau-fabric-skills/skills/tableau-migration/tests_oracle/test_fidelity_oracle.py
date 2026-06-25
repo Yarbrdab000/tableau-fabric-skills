@@ -323,6 +323,73 @@ def test_type_score_line_anchor_matches_line_chart():
     assert score == pytest.approx(1.0) and note == "type-match"
 
 
+# ------------------------------------------------------ remodel/rename advisory diagnosis
+def test_score_pair_flags_remodel_rename():
+    # Strong type-match + low field-NAME overlap = the faithful star-schema remodel signature
+    # (Tableau "Order Date"/implicit COUNT -> a "Date" dimension + a "count orders" measure).
+    twb_ws = {
+        "name": "Line chart", "family": fo.FAM_LINE, "family_asserted": True,
+        "fields": [{"norm": "orderdate"}, {"norm": "countorders"}],
+        "dims": [{"norm": "orderdate"}], "measures": [{"norm": "countorders"}],
+    }
+    pbir_visual = {
+        "name": "v1", "visual_type": "lineChart", "family": fo.FAM_LINE,
+        "fields": [{"norm": "date", "is_measure": False},
+                   {"norm": "countordersmeasure", "is_measure": True}],
+    }
+    r = fo._score_pair(twb_ws, pbir_visual, None)
+    assert r["components"]["type"] == pytest.approx(1.0)
+    assert r["components"]["fields"] == pytest.approx(0.0)
+    assert r["diagnosis"] == fo._REMODEL_DIAGNOSIS
+
+
+def test_score_pair_no_remodel_flag_when_fields_match():
+    # Faithful AND same field names -> nothing to diagnose; the flag stays off.
+    twb_ws = {
+        "name": "Bars", "family": fo.FAM_BAR, "family_asserted": True,
+        "fields": [{"norm": "category"}, {"norm": "sales"}],
+        "dims": [{"norm": "category"}], "measures": [{"norm": "sales"}],
+    }
+    pbir_visual = {
+        "name": "v2", "visual_type": "barChart", "family": fo.FAM_BAR,
+        "fields": [{"norm": "category", "is_measure": False},
+                   {"norm": "sales", "is_measure": True}],
+    }
+    r = fo._score_pair(twb_ws, pbir_visual, None)
+    assert r["diagnosis"] is None
+
+
+def test_score_pair_no_remodel_flag_on_type_mismatch():
+    # A genuine type divergence must NOT be excused as a rename, even with zero field overlap.
+    twb_ws = {
+        "name": "Bars", "family": fo.FAM_BAR, "family_asserted": True,
+        "fields": [{"norm": "category"}], "dims": [{"norm": "category"}], "measures": [],
+    }
+    pbir_visual = {
+        "name": "v3", "visual_type": "pieChart", "family": fo.FAM_PIE,
+        "fields": [{"norm": "segment", "is_measure": False}],
+    }
+    r = fo._score_pair(twb_ws, pbir_visual, None)
+    assert r["components"]["type"] == pytest.approx(0.0)
+    assert r["diagnosis"] is None
+
+
+def test_assemble_report_counts_remodel_suspected():
+    twb = {"worksheets": [{"name": "A"}]}
+    vis = [{"worksheet": "A", "score": 0.45, "diagnosis": fo._REMODEL_DIAGNOSIS}]
+    rep = fo._assemble_report(twb, {}, vis, [], [], [], None)
+    assert rep["summary"]["remodel_rename_suspected"] == 1
+    assert any("remodel" in n.lower() for n in rep["notes"])
+
+
+def test_assemble_report_no_remodel_note_when_clean():
+    twb = {"worksheets": [{"name": "A"}]}
+    vis = [{"worksheet": "A", "score": 0.95, "diagnosis": None}]
+    rep = fo._assemble_report(twb, {}, vis, [], [], [], None)
+    assert rep["summary"]["remodel_rename_suspected"] == 0
+    assert not any("remodel" in n.lower() for n in rep["notes"])
+
+
 # --------------------------------------------------------------------------- scoring primitives
 def test_jaccard_and_bands():
     assert fo._jaccard(set(), set()) == 1.0

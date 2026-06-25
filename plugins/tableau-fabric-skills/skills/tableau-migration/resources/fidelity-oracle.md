@@ -77,6 +77,21 @@ peer). An unmatched worksheet drags the aggregate down — a faithful rebuild le
 | `review` | ≥ 0.60 | A human should eyeball it. |
 | `divergent` | < 0.60 | Materially different — likely a real rebuild gap. |
 
+### Remodel/rename advisory (don't misread a faithful star‑schema rebuild)
+
+A genuinely faithful rebuild can score *low* on the name‑based field/role components when the engine
+**remodels** the data — e.g. promoting Tableau's `Order Date` column into a star‑schema `Date`
+dimension, or naming an implicit `COUNT(Orders)` as a `count orders` measure. The chart type and
+on‑dashboard position still match perfectly; only the field *names* diverge, so Jaccard field
+overlap craters even though nothing is wrong.
+
+The oracle flags this signature per visual: when **type ≥ 0.95**, **position ≥ 0.85 (or absent)**,
+and **field overlap < 0.50**, the visual carries `"diagnosis": "remodel-rename-suspected"`, the
+report `summary` exposes a `remodel_rename_suspected` count, and an advisory note is appended.
+**Read it as "confirm via the DAX‑value and image tiers"** — those compare numbers and pixels and
+are immune to renaming, so they are the authority when a remodel is suspected. A low *structural*
+score there reflects naming, not infidelity.
+
 ---
 
 ## Calibration — the cross‑engine noise floor

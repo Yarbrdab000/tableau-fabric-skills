@@ -84,6 +84,18 @@ BANDS = (
 # separate ``confidence`` flag records how much evidence backs it.
 COMBINED_WEIGHTS = {"structural": 0.5, "value": 0.3, "image": 0.2}
 
+# A visual whose chart TYPE (and position, when placed) agree strongly while its field-NAME overlap
+# is low is the signature of a faithful rebuild that REMODELED/renamed fields -- e.g. promoting a
+# Tableau column to a star-schema dimension (``Order Date`` -> a ``Date`` table) or naming an
+# implicit aggregate (``COUNT(Orders)`` -> a ``count orders`` measure). That is good Power BI
+# modeling, not an infidelity, but it craters the name-based field/role components. We flag it
+# advisorily so a low structural score is not misread as a divergent rebuild -- the DAX-value and
+# image tiers (which compare numbers/pixels, immune to renaming) are the authority in that case.
+_REMODEL_TYPE_MIN = 0.95
+_REMODEL_POSITION_MIN = 0.85
+_REMODEL_FIELDS_MAX = 0.50
+_REMODEL_DIAGNOSIS = "remodel-rename-suspected"
+
 
 # -- chart-type families -------------------------------------------------------
 # A small, coarse family enum. Bar and column collapse into one family (orientation is a sub-detail
@@ -867,6 +879,13 @@ def _score_pair(twb_ws, pbir_visual, zone):
     missing = sorted(src_fields - tgt_fields)
     extra = sorted(tgt_fields - src_fields)
     matched = sorted(src_fields & tgt_fields)
+    # Advisory diagnosis: strong type/position agreement with low field-name overlap is the
+    # signature of a faithful field remodel/rename, not a divergent rebuild (see constants above).
+    pos_val = parts.get("position")
+    diagnosis = None
+    if (type_s >= _REMODEL_TYPE_MIN and field_s < _REMODEL_FIELDS_MAX
+            and (pos_val is None or pos_val >= _REMODEL_POSITION_MIN)):
+        diagnosis = _REMODEL_DIAGNOSIS
     return {
         "worksheet": twb_ws["name"],
         "visual": pbir_visual["name"],
@@ -877,6 +896,7 @@ def _score_pair(twb_ws, pbir_visual, zone):
         "score": round(overall, 4),
         "band": _band(overall),
         "type_note": type_note,
+        "diagnosis": diagnosis,
         "fields_matched": matched,
         "fields_missing": missing,   # in Tableau source, absent from rebuilt visual
         "fields_extra": extra,       # in rebuilt visual, absent from Tableau source
@@ -1106,6 +1126,23 @@ def _assemble_report(twb, pbir, visual_results, slicer_results,
     if mean is not None:
         aggregate = round(mean * coverage, 4)
 
+    remodel_suspected = [r for r in visual_results
+                         if r.get("diagnosis") == _REMODEL_DIAGNOSIS]
+
+    notes = [
+        "ADVISORY structural fidelity only -- not a pass/fail and not a pixel comparison.",
+        "Scores are tolerance-banded agreement, not exactness; review bands below 'faithful'.",
+        "'fields_missing' = on the Tableau source but absent from the rebuilt visual; "
+        "'fields_extra' = on the rebuilt visual but not on the source.",
+    ]
+    if remodel_suspected:
+        notes.append(
+            "{} visual(s) show strong chart-type/position agreement but low field-NAME overlap -- "
+            "the signature of a faithful rebuild that remodeled/renamed fields (e.g. a star-schema "
+            "Date dimension or a renamed measure). A low structural score there reflects naming, "
+            "not infidelity; corroborate with the DAX-value and image tiers, which compare "
+            "numbers/pixels and are immune to renaming.".format(len(remodel_suspected)))
+
     return {
         "kind": ORACLE_KIND,
         "version": ORACLE_VERSION,
@@ -1121,16 +1158,12 @@ def _assemble_report(twb, pbir, visual_results, slicer_results,
             "unmatched_worksheets": unmatched_worksheets,
             "extra_visuals": len(extra_visuals),
             "slicers": len(slicer_results),
+            "remodel_rename_suspected": len(remodel_suspected),
         },
         "visuals": sorted(visual_results, key=lambda r: r["score"]),
         "slicers": slicer_results,
         "extra_visuals_detail": extra_visuals,
-        "notes": [
-            "ADVISORY structural fidelity only -- not a pass/fail and not a pixel comparison.",
-            "Scores are tolerance-banded agreement, not exactness; review bands below 'faithful'.",
-            "'fields_missing' = on the Tableau source but absent from the rebuilt visual; "
-            "'fields_extra' = on the rebuilt visual but not on the source.",
-        ],
+        "notes": notes,
     }
 
 
@@ -1696,13 +1729,21 @@ def render_markdown(report):
         s["coverage"], s["matched_visuals"], s["source_worksheets"]))
     if s["unmatched_worksheets"]:
         lines.append("- **Unmatched worksheets:** %s" % ", ".join(s["unmatched_worksheets"]))
+    if s.get("remodel_rename_suspected"):
+        lines.append(
+            "- **Remodel/rename suspected:** %d visual(s) match on type+position but not field "
+            "names — likely a faithful field remodel; confirm via the value/image tiers." %
+            s["remodel_rename_suspected"])
     lines.append("")
     lines.append("| Worksheet | Visual type | Score | Band | Type | Missing | Extra |")
     lines.append("|---|---|---|---|---|---|---|")
     for r in report["visuals"]:
+        type_cell = r["type_note"]
+        if r.get("diagnosis") == _REMODEL_DIAGNOSIS:
+            type_cell += " · remodel/rename?"
         lines.append("| %s | %s | %.3f | %s | %s | %s | %s |" % (
             r["worksheet"], r["visual_type"], r["score"], r["band"],
-            r["type_note"],
+            type_cell,
             ", ".join(r["fields_missing"]) or "-",
             ", ".join(r["fields_extra"]) or "-"))
     if report["slicers"]:
