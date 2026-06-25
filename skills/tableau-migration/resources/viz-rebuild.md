@@ -258,8 +258,48 @@ the rebuild emits the visual **without** a fill, raises a `background colour sca
 warning, and preserves the raw palette (colours + centre) on the candidate record's
 `conditional_format` fact (`status: "deferred"`) for a later binding pass. This is intentional:
 colouring by a mis-resolved base field would be confidently wrong. Only the background colour
-scale is handled here — discrete colour legends, font colour, data bars, icons, and palette
-styling remain Tier-2.
+scale is handled here — font colour, data bars, icons, and gradient palette styling remain Tier-2.
+
+### Categorical mark colours (explicit author member → hex palette)
+
+When the author has explicitly assigned a colour to each member of a colour-legend **dimension**
+(the mark colour encoding carries `<map to="#hex"><bucket>"Member"</bucket></map>` entries rather
+than a continuous `<color-palette>`), that map is reproduced as per-member data colours on
+`visual.objects.dataPoint`. Each entry is a `fill` (a single-quoted hex literal) targeted by a
+**scope-identity selector** — `selector.data[0].scopeId.Comparison` with `ComparisonKind: 0`
+(Equal), `Left` = the coloured column's exact projected expression, and `Right` = the member value
+literal. Tableau author order is preserved, and unmapped members keep their Power BI theme colour.
+A bare single `mark-color` (Tableau writes one even when the author chose nothing) is **not**
+reproduced — only an explicit member map is treated as author intent.
+
+**Warn-never-wrong.** Per-member fills are emitted **only** on the discrete categorical chart types
+where they render safely (`column`, `bar`, `pie`, `donut`) **and** when the coloured dimension is
+actually projected in that visual (so the selector's column resolves). On any other visual type
+(notably `line` / `area`, where an explicit `dataPoint` override can drop the series) or when the
+coloured dimension is not bound, the visual emits with **theme** colours, a
+`categorical mark colours deferred …` warning names the reason, and the raw palette is preserved on
+the candidate record's `mark_colors` fact (`status: "deferred"`) for a later pass. The per-member
+scope-identity selector shape is grounded in the Power BI report formatting reference (the
+convention/grounding model); the mapping is original work (see *Clean-room methodology*).
+
+### Data labels (Tableau "Show Mark Labels")
+
+Tableau records the mark-label show/hide toggle as `<format attr="mark-labels-show" value="true|false"/>`
+inside a `<style-rule element="mark">` — at the worksheet `table/style` level and/or per `pane` (a
+dual-axis worksheet carries one per pane). That toggle is reproduced on the PBIR data-plane
+`visual.objects.labels` `show` property, applied uniformly (the formatting reference lists `labels`
+as a visual-wide object — no selector).
+
+**Warn-never-wrong.** `show: true` is emitted whenever the toggle is unambiguously ON (every captured
+pane agrees) — the high-value case that restores the numbers a Tableau view displayed. `show: false`
+is emitted **only** for the `pie` / `donut` family, whose Power BI default is *on*, so that an
+author who hid labels stays faithful; every other supported chart type already defaults labels *off*,
+so an OFF toggle is a no-op (the fact is still recorded, `status: "default_off"`). A table / matrix /
+card / map already displays its values, so no label object is produced there. When a dual-axis
+worksheet's panes **disagree** (a per-series label difference), no global toggle is guessed — the
+visual keeps its default label visibility, a `data labels deferred …` warning discloses it, and the
+raw values are preserved on the candidate record's `data_labels` fact (`status: "deferred"`). Only
+show/hide is set; label detail (culling, which value, placement) stays Tier-2.
 
 ## Binding contract (matches the v1 model exactly)
 

@@ -1650,6 +1650,101 @@ def _parse_color_gradient(table):
     return None
 
 
+# A DISCRETE (categorical) colour legend assigns an explicit hex per dimension MEMBER at the same
+# ``worksheet/table/style/style-rule[@element='mark']/encoding[@attr='color']`` location as the
+# continuous heat scale, but with ``<map to='#hex'><bucket>"Member"</bucket></map>`` children
+# instead of a ``<color-palette>``. An explicit member->colour map is UNAMBIGUOUS author intent --
+# unlike a bare single ``mark-color`` default, which Tableau also writes when the author chose
+# nothing -- so it is the high-confidence categorical-palette signal we carry to Power BI.
+def _bucket_member(text):
+    """The member value carried by a ``<bucket>`` element: a string member is wrapped in literal
+    double quotes (``"Central"``) which are stripped; anything else is returned trimmed."""
+    s = (text or "").strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return s[1:-1]
+    return s
+
+
+def _parse_mark_colors(table):
+    """Extract an explicit categorical colour palette (member -> hex) from a worksheet's mark
+    colour encoding.
+
+    Returns ``{"field_token", "members": [{"value", "color"}]}`` when the colour encoding carries a
+    discrete ``<map to='#hex'><bucket>...</bucket></map>`` palette of at least one member, else
+    ``None``. A continuous ``<color-palette>`` gradient (handled by ``_parse_color_gradient``) and a
+    bare single ``mark-color`` default are both ignored here -- only an explicit per-member map is an
+    unambiguous author colour assignment. Tableau author order is preserved.
+    """
+    if table is None:
+        return None
+    style = _first(table, "style")
+    if style is None:
+        return None
+    for rule in _children_local(style, "style-rule"):
+        if (rule.get("element") or "").lower() != "mark":
+            continue
+        for enc in _children_local(rule, "encoding"):
+            if (enc.get("attr") or "") != "color":
+                continue
+            if _first(enc, "color-palette") is not None:
+                continue  # continuous gradient -> _parse_color_gradient
+            members = []
+            for mp in _children_local(enc, "map"):
+                hexv = (mp.get("to") or "").strip()
+                bucket = _first(mp, "bucket")
+                if not hexv or bucket is None:
+                    continue
+                value = _bucket_member(bucket.text)
+                if value == "":
+                    continue
+                members.append({"value": value, "color": hexv})
+            if members:
+                return {"field_token": enc.get("field") or "", "members": members}
+    return None
+
+
+# Tableau's "Show Mark Labels" toggle is written as ``<format attr='mark-labels-show' value='..'/>``
+# inside a ``<style-rule element='mark'>`` -- at the worksheet ``table/style`` level and/or each
+# ``table/panes/pane/style`` (a dual-axis worksheet carries one per pane, which can disagree). It is
+# the data-label show/hide signal Power BI expresses as ``visual.objects.labels`` ``show``.
+def _data_label_show_values(style):
+    """Boolean values of every ``mark-labels-show`` format under a ``<style>`` (mark style-rules)."""
+    out = []
+    if style is None:
+        return out
+    for rule in _children_local(style, "style-rule"):
+        if (rule.get("element") or "").lower() != "mark":
+            continue
+        for fmt in _children_local(rule, "format"):
+            if (fmt.get("attr") or "") == "mark-labels-show":
+                v = (fmt.get("value") or "").strip().lower()
+                if v in ("true", "false"):
+                    out.append(v == "true")
+    return out
+
+
+def _parse_data_labels(table, all_panes):
+    """Extract the worksheet's data-label (Show Mark Labels) toggle.
+
+    Returns ``{"show": bool|None, "uniform": bool, "raw_values": [bool, ...]}`` when at least one
+    ``mark-labels-show`` toggle is present (worksheet-level and/or per-pane), else ``None``.
+    ``uniform`` is True when every captured pane agrees; a dual-axis worksheet whose panes disagree
+    yields ``uniform=False`` / ``show=None`` so the emitter defers rather than guessing one global
+    toggle. Tableau author order is preserved in ``raw_values``.
+    """
+    if table is None:
+        return None
+    values = list(_data_label_show_values(_first(table, "style")))
+    for pane in all_panes or []:
+        values.extend(_data_label_show_values(_first(pane, "style")))
+    if not values:
+        return None
+    uniform = len(set(values)) == 1
+    return {"show": values[0] if uniform else None,
+            "uniform": uniform,
+            "raw_values": values}
+
+
 # Tableau analytic-annotation elements live at ``table/panes/pane/<element>``: a reference /
 # target / distribution line overlays a computed constant, average, percentile band, or an
 # explicit goal on the mark, and a trend line overlays a fitted model. Power BI expresses these as
@@ -1927,6 +2022,17 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     if visual_type in (VT_MATRIX, VT_TABLE):
         color_gradient = _parse_color_gradient(table)
 
+    # Explicit categorical mark-colour palette (author member -> hex). Parsed here (additive IR key)
+    # and turned into PBIR dataPoint per-member fills at emit time -- faithful-or-warn, so a palette
+    # on a visual type that cannot carry a per-member fill, or whose coloured dimension is not bound,
+    # defers rather than colouring the wrong mark.
+    mark_colors = _parse_mark_colors(table)
+
+    # Data labels (Tableau "Show Mark Labels"): the worksheet's mark-labels-show toggle. Parsed here
+    # (additive IR key) and turned into a PBIR ``visual.objects.labels`` show/hide at emit time --
+    # faithful-or-warn, so a dual-axis worksheet whose panes disagree defers rather than guessing.
+    data_labels = _parse_data_labels(table, all_panes)
+
     # Reference / target / trend line annotations (KPI goals, average/percentile bands, trend
     # fits) are a Tier-2 analytics concern: record them (additive) and disclose them so the
     # rebuilt visual is never silently missing an author's target overlay. Gated on an emitted
@@ -1954,6 +2060,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "title": title_text,
         "axis_titles": axis_titles,
         "color_gradient": color_gradient,
+        "mark_colors": mark_colors,
+        "data_labels": data_labels,
         "reference_lines": reference_lines,
         "rows": rows,
         "cols": cols,
@@ -3017,8 +3125,127 @@ def _conditional_format(ws, state, model_table, field_map, warnings):
     return value_objects, fact
 
 
+# A per-member dataPoint fill (a ``scopeId`` data selector) is safe on the discrete categorical
+# charts where a colour dimension drives separate bars / slices. Line / area charts colour a
+# continuous series and an explicit dataPoint override there can drop the line (per the Power BI
+# formatting reference), so they defer; tables / matrices carry the backColor heat scale instead.
+_DATAPOINT_COLOR_TYPES = (VT_COLUMN, VT_BAR, VT_PIE, VT_DONUT)
+
+
+def _data_point_colors(ws, state, vtype, model_table, field_map, warnings):
+    """Explicit categorical mark-colour palette (member -> hex) -> (data_point_objects, fact).
+
+    ``data_point_objects`` is the ``visual.objects.dataPoint`` entry list (one ``fill`` per author-
+    coloured dimension member, each targeted by a ``scopeId`` data selector) or ``None``; ``fact`` is
+    an additive descriptor (``status`` ``emitted`` / ``deferred`` plus the raw palette) for the
+    candidate record, or ``None`` when the worksheet carries no explicit categorical palette.
+
+    WARN-NEVER-WRONG: colours are emitted ONLY when (a) the visual is one of the discrete
+    categorical chart types where a per-member fill is safe and (b) the coloured dimension is
+    actually projected in THIS visual (so the selector's column resolves). Otherwise the visual
+    emits with theme colours, a structured warning names the deferral, and the raw palette is
+    preserved in ``fact``. The selector's ``Left`` reuses the EXACT column expression already
+    assigned to the visual's projection, so a colour never references a field the query omits. Shape
+    verified against the Power BI formatting reference (per-category scope-identity selector:
+    ComparisonKind 0 Equal, Left = the coloured column, Right = the member literal).
+    """
+    mc = ws.get("mark_colors")
+    if not mc:
+        return None, None
+    fact = {"kind": "categorical_palette",
+            "field_token": mc["field_token"],
+            "members": mc["members"]}
+
+    color = ws["encodings"].get("color")
+    left = None
+    if color is not None and color["kind"] == "category":
+        expr, _, _ = _field_expression(color, model_table, field_map)
+        projected = any(
+            p["field"] == expr
+            for role in state.values()
+            for p in role.get("projections", []))
+        if projected and "Column" in expr:
+            left = expr
+
+    if vtype not in _DATAPOINT_COLOR_TYPES or left is None:
+        reason = ("the {0} visual type does not carry a per-member mark colour".format(vtype)
+                  if vtype not in _DATAPOINT_COLOR_TYPES
+                  else "the coloured dimension is not bound in this visual")
+        warnings.append(_warn(
+            "worksheet", ws["name"],
+            "categorical mark colours deferred ({0}); the visual is emitted with theme "
+            "colours".format(reason)))
+        fact["status"] = "deferred"
+        fact["reason"] = reason
+        return None, fact
+
+    data_point_objects = []
+    for m in mc["members"]:
+        data_point_objects.append({
+            "properties": {"fill": {"solid": {"color": {"expr": {
+                "Literal": {"Value": _semantic_string_literal(m["color"])}}}}}},
+            "selector": {"data": [{"scopeId": {"Comparison": {
+                "ComparisonKind": 0,
+                "Left": left,
+                "Right": {"Literal": {"Value": _semantic_string_literal(m["value"])}}}}}]},
+        })
+    fact["status"] = "emitted"
+    return data_point_objects, fact
+
+
+# Data labels (Tableau "Show Mark Labels") -> the PBIR data-plane ``visual.objects.labels`` ``show``
+# property, applied uniformly (the Power BI formatting reference lists ``labels`` as a visual-wide
+# object). The high-value, always-faithful case is turning labels ON to match a Tableau view that
+# displayed its numbers; OFF is emitted only for the pie/donut family, whose Power BI default is ON
+# (so hiding them matches Tableau). Every other supported chart type defaults OFF in Power BI, so an
+# OFF Tableau toggle is a no-op. Label DETAIL (culling / which value / placement) is a deeper Tier-2
+# concern -- recorded on the candidate-record fact but not acted on here.
+_DATA_LABEL_TYPES = (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA, VT_PIE, VT_DONUT, VT_SCATTER,
+                     VT_COMBO, VT_WATERFALL, VT_RIBBON)
+_LABELS_DEFAULT_ON_TYPES = (VT_PIE, VT_DONUT)
+
+
+def _data_labels(ws, vtype, warnings):
+    """Tableau "Show Mark Labels" toggle -> (label_objects, fact).
+
+    ``label_objects`` is the ``visual.objects.labels`` entry list (a single ``show`` property,
+    applied uniformly -- no selector) or ``None``; ``fact`` is an additive candidate-record
+    descriptor, or ``None`` when the worksheet carries no mark-label toggle or the visual type has no
+    data-label concept (a table / matrix / card / map already displays its values).
+
+    WARN-NEVER-WRONG: a global ``show`` is emitted only when the toggle is unambiguous (every
+    captured pane agrees). When a dual-axis worksheet's panes disagree (per-series label
+    visibility), no global toggle is guessed -- the visual keeps its default label visibility and a
+    structured warning discloses the deferral. Labels-OFF is emitted only for the pie/donut family
+    (Power BI default ON); every other supported type already defaults OFF, so an OFF toggle is a
+    no-op (``status`` ``default_off``).
+    """
+    dl = ws.get("data_labels")
+    if not dl or vtype not in _DATA_LABEL_TYPES:
+        return None, None
+    fact = {"kind": "data_labels", "raw_values": dl.get("raw_values")}
+    if not dl.get("uniform"):
+        warnings.append(_warn(
+            "worksheet", ws["name"],
+            "data labels deferred (mark-label visibility differs across the dual-axis panes); "
+            "the visual keeps its default label visibility"))
+        fact["status"] = "deferred"
+        return None, fact
+    show = bool(dl.get("show"))
+    fact["show"] = show
+    if show:
+        fact["status"] = "emitted"
+        return [{"properties": {"show": {"expr": {"Literal": {"Value": "true"}}}}}], fact
+    if vtype in _LABELS_DEFAULT_ON_TYPES:
+        fact["status"] = "emitted"
+        return [{"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}], fact
+    fact["status"] = "default_off"
+    return None, fact
+
+
 def _visual_json(name, vtype, position, query_state, sort_definition=None,
-                 filter_config=None, title=None, axis_titles=None, value_objects=None):
+                 filter_config=None, title=None, axis_titles=None, value_objects=None,
+                 data_point_objects=None, label_objects=None):
     visual = {"visualType": vtype}
     if query_state:
         visual["query"] = {"queryState": query_state}
@@ -3040,6 +3267,17 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     # ``linearGradient3`` min/mid/max; ``selector`` = dataViewWildcard + metadata queryRef).
     if value_objects:
         visual.setdefault("objects", {})["values"] = value_objects
+    # Explicit categorical mark colours (author member -> hex palette): the data-plane
+    # ``visual.objects.dataPoint`` entries, each a ``fill`` targeted by a ``scopeId`` data selector
+    # (ComparisonKind 0 Equal, Left = the coloured column, Right = the member literal). Shape
+    # verified against the Power BI formatting reference's per-category scope-identity selector.
+    if data_point_objects:
+        visual.setdefault("objects", {})["dataPoint"] = data_point_objects
+    # Data labels (Tableau "Show Mark Labels"): the data-plane ``visual.objects.labels`` ``show``
+    # toggle, applied uniformly (no selector). Per the Power BI formatting reference, ``labels`` is a
+    # visual-wide object; only show/hide is set here (label detail styling is Tier-2).
+    if label_objects:
+        visual.setdefault("objects", {})["labels"] = label_objects
     # Structural title text (Tier-1): the worksheet's authored caption -> the visual's container
     # title. Shape verified against the official PBIR visualContainer schema + real reports: a
     # single-quoted semantic-query string literal under visualContainerObjects.title; the
@@ -3511,18 +3749,24 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             pos = _position(x, y, w, h, tab=i)
             value_objects, cf_fact = _conditional_format(
                 ws, state, model_table, field_map, warnings)
+            data_point_objects, mc_fact = _data_point_colors(
+                ws, state, ws["visual_type"], model_table, field_map, warnings)
+            label_objects, dl_fact = _data_labels(ws, ws["visual_type"], warnings)
             flag_fc = _flag_filter_config_for(ir, ws["name"])
             visuals.append(_visual_json(
                 vname, vtype, pos, state,
                 _sort_definition(ws, state, model_table, field_map),
                 filter_config=flag_fc,
                 title=ws.get("title"), axis_titles=ws.get("axis_titles"),
-                value_objects=value_objects))
+                value_objects=value_objects, data_point_objects=data_point_objects,
+                label_objects=label_objects))
             rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                     page_display=db["name"] or page_name,
                                     model_table=model_table, field_map=field_map)
             if cf_fact:
                 rec["conditional_format"] = cf_fact
+            if mc_fact:
+                rec["mark_colors"] = mc_fact
             if flag_fc:
                 rec["flag_filters"] = [c["field"]["Measure"]["Property"]
                                        for c in flag_fc["filters"]]
@@ -3552,18 +3796,26 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         pos = _position(40, 40, 880, 620)
         value_objects, cf_fact = _conditional_format(
             ws, state, model_table, field_map, warnings)
+        data_point_objects, mc_fact = _data_point_colors(
+            ws, state, ws["visual_type"], model_table, field_map, warnings)
+        label_objects, dl_fact = _data_labels(ws, ws["visual_type"], warnings)
         flag_fc = _flag_filter_config_for(ir, ws["name"])
         main = _visual_json(
             vname, vtype, pos, state,
             _sort_definition(ws, state, model_table, field_map),
             filter_config=flag_fc,
             title=ws.get("title"), axis_titles=ws.get("axis_titles"),
-            value_objects=value_objects)
+            value_objects=value_objects, data_point_objects=data_point_objects,
+            label_objects=label_objects)
         rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                 page_display=ws["name"],
                                 model_table=model_table, field_map=field_map)
         if cf_fact:
             rec["conditional_format"] = cf_fact
+        if mc_fact:
+            rec["mark_colors"] = mc_fact
+        if dl_fact:
+            rec["data_labels"] = dl_fact
         if flag_fc:
             rec["flag_filters"] = [c["field"]["Measure"]["Property"]
                                    for c in flag_fc["filters"]]
