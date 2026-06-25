@@ -282,6 +282,25 @@ the candidate record's `mark_colors` fact (`status: "deferred"`) for a later pas
 scope-identity selector shape is grounded in the Power BI report formatting reference (the
 convention/grounding model); the mapping is original work (see *Clean-room methodology*).
 
+### Data labels (Tableau "Show Mark Labels")
+
+Tableau records the mark-label show/hide toggle as `<format attr="mark-labels-show" value="true|false"/>`
+inside a `<style-rule element="mark">` — at the worksheet `table/style` level and/or per `pane` (a
+dual-axis worksheet carries one per pane). That toggle is reproduced on the PBIR data-plane
+`visual.objects.labels` `show` property, applied uniformly (the formatting reference lists `labels`
+as a visual-wide object — no selector).
+
+**Warn-never-wrong.** `show: true` is emitted whenever the toggle is unambiguously ON (every captured
+pane agrees) — the high-value case that restores the numbers a Tableau view displayed. `show: false`
+is emitted **only** for the `pie` / `donut` family, whose Power BI default is *on*, so that an
+author who hid labels stays faithful; every other supported chart type already defaults labels *off*,
+so an OFF toggle is a no-op (the fact is still recorded, `status: "default_off"`). A table / matrix /
+card / map already displays its values, so no label object is produced there. When a dual-axis
+worksheet's panes **disagree** (a per-series label difference), no global toggle is guessed — the
+visual keeps its default label visibility, a `data labels deferred …` warning discloses it, and the
+raw values are preserved on the candidate record's `data_labels` fact (`status: "deferred"`). Only
+show/hide is set; label detail (culling, which value, placement) stays Tier-2.
+
 ## Binding contract (matches the v1 model exactly)
 
 The `.twb` embeds the full datasource (`<relation>` + `<metadata-records>`), so bindings are

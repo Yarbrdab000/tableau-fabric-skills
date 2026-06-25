@@ -3558,6 +3558,132 @@ def test_single_default_mark_color_is_not_emitted():
     assert _data_point_objects(vj) is None
 
 
+# -- data labels (Tableau "Show Mark Labels" toggle) ---------------------------
+# Tableau writes the mark-label show/hide as ``<format attr='mark-labels-show' value='..'/>`` in a
+# ``<style-rule element='mark'>`` (at the worksheet ``table/style`` and/or per ``pane``). It maps to
+# the PBIR data-plane ``visual.objects.labels`` ``show`` toggle, applied uniformly (no selector).
+# WARN-NEVER-WRONG: show=true is emitted whenever the toggle is unambiguously ON; show=false is
+# emitted ONLY for pie/donut (whose Power BI default is ON); other types default OFF so an OFF toggle
+# is a no-op; a dual-axis worksheet whose panes disagree defers (keeps the default) with a warning;
+# a table/matrix/card already displays its values so no label object is produced.
+def _label_style(show):
+    return ("<style><style-rule element='mark'>"
+            "<format attr='mark-labels-show' value='{0}' />"
+            "</style-rule></style>".format("true" if show else "false"))
+
+
+def _labels_objects(visual_json):
+    return visual_json["visual"].get("objects", {}).get("labels")
+
+
+def _dl_fact(records, worksheet):
+    rec = next(r for r in records if r["worksheet"] == worksheet)
+    return rec.get("data_labels")
+
+
+def test_data_labels_pane_toggle_parsed_into_ir():
+    ws = _worksheet("Cols", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, pane_extra=_label_style(True))
+    dl = parse_twb(_workbook(ws))["worksheets"][0]["data_labels"]
+    assert dl == {"show": True, "uniform": True, "raw_values": [True]}
+
+
+def test_data_labels_table_style_toggle_parsed_into_ir():
+    # the worksheet-level table/style toggle is read too (not only the per-pane one)
+    ws = _worksheet("Cols", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, style=_label_style(True))
+    dl = parse_twb(_workbook(ws))["worksheets"][0]["data_labels"]
+    assert dl["show"] is True and dl["uniform"] is True
+
+
+def test_data_labels_show_emits_labels_object_and_fact():
+    ws = _worksheet("Cols", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, pane_extra=_label_style(True))
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _labels_objects(vj) == [
+        {"properties": {"show": {"expr": {"Literal": {"Value": "true"}}}}}]
+    fact = _dl_fact(res["candidate_records"], "Cols")
+    assert fact["kind"] == "data_labels"
+    assert fact["status"] == "emitted" and fact["show"] is True
+
+
+def test_data_labels_off_on_cartesian_is_noop():
+    # Power BI defaults data labels OFF on column/bar/line/area, so an OFF Tableau toggle needs no
+    # object -- the record still discloses the (default_off) fact, additively.
+    ws = _worksheet("Cols", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, pane_extra=_label_style(False))
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _labels_objects(vj) is None
+    fact = _dl_fact(res["candidate_records"], "Cols")
+    assert fact["status"] == "default_off" and fact["show"] is False
+
+
+def test_data_labels_off_on_pie_emits_show_false():
+    # Pie/donut default labels ON in Power BI, so an OFF Tableau toggle must be emitted as show=false
+    # to faithfully hide them.
+    ws = _worksheet("Share", "Pie",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, pane_extra=_label_style(False))
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert vj["visual"]["visualType"] == "pieChart"
+    assert _labels_objects(vj) == [
+        {"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}]
+    assert _dl_fact(res["candidate_records"], "Share")["status"] == "emitted"
+
+
+def test_data_labels_disagreeing_panes_defer_with_warning():
+    # table/style says ON, the pane says OFF -> the toggle is ambiguous (a dual-axis per-series
+    # difference) -> no global toggle is guessed; the visual keeps its default + a warning discloses.
+    ws = _worksheet("Cols", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, style=_label_style(True),
+                    pane_extra=_label_style(False))
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _labels_objects(vj) is None
+    fact = _dl_fact(res["candidate_records"], "Cols")
+    assert fact["status"] == "deferred"
+    assert any("data labels deferred" in w["reason"] for w in res["warnings"])
+
+
+def test_data_labels_absent_emits_nothing():
+    # Additivity: a chart with no mark-labels-show toggle carries neither a labels object nor a fact.
+    ws = _worksheet("Cols", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST)
+    res = migrate_twb_to_pbir(_workbook(ws))
+    assert parse_twb(_workbook(ws))["worksheets"][0]["data_labels"] is None
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _labels_objects(vj) is None
+    assert _dl_fact(res["candidate_records"], "Cols") is None
+
+
+def test_data_labels_on_card_not_applicable():
+    # A card already displays its value, so a label toggle on a card emits no labels object and no
+    # fact (the label types exclude card / table / matrix / map).
+    ws = _worksheet("KPI", "Text",
+                    rows="[federated.abc].[sum:Sales:qk]", cols="",
+                    deps_extra=_INST, pane_extra=_label_style(True))
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _labels_objects(vj) is None
+    assert _dl_fact(res["candidate_records"], "KPI") is None
+
+
 # -- cross-layer measure binding (model<->viz contract consumer) ---------------
 # The datasource-migration (model) build hands back a token-keyed calc->measure manifest; the
 # dashboard (viz) build rebinds the matching workbook-local / quick-table-calc pills to those real
