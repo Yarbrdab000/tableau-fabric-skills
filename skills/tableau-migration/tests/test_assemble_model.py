@@ -519,9 +519,33 @@ def test_model_manifest_classifies_parameters_value_field_filter():
     assert kinds["Dim Selector"]["model_object"] == "Dim Swap"
     assert kinds["Sales Multiplier"]["kind"] == "value"
     assert kinds["Sales Multiplier"]["model_object"] == "Sales Multiplier"
+    # a what-if value param also exposes its model-owned picker (a range param picks its value col)
+    assert kinds["Sales Multiplier"]["picker"] == {"table": "Sales Multiplier",
+                                                   "column": "Sales Multiplier"}
     # the plain filter param is model-unowned -> the viz layer slices it
     assert kinds["Region Filter"]["kind"] == "filter"
     assert kinds["Region Filter"]["model_object"] is None
+    assert "picker" not in kinds["Region Filter"]          # a model-unowned param has no picker
+
+
+def test_model_manifest_value_param_carries_label_picker():
+    # A numeric LIST what-if param (Tableau's aliased {15,30,41} "Date Selection") lands a value
+    # table AND an additive picker pointing at its friendly Label column, so the viz layer can slice
+    # the model's own picker (showing Current/Previous/All Orders) instead of re-deriving a slicer.
+    params = [
+        {"caption": "Date Selection", "internal_name": "[Parameter 0014172370878491]",
+         "datatype": "real", "domain": "list", "default": "15.", "format": None, "range": None,
+         "members": ["15.", "30.", "41."],
+         "aliases": {"15.": "Current Orders", "30.": "Previous Orders", "41.": "All Orders"}},
+    ]
+    calcs = [{"name": "Date Filter", "role": "measure",
+              "formula": "CASE [Parameters].[Date Selection] WHEN 15 THEN 1 END"}]
+    mf = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                               calcs=calcs, parameters=params)["report"]["model_manifest"]
+    ds = next(p for p in mf["parameters"] if p["name"] == "Date Selection")
+    assert ds["kind"] == "value"
+    assert ds["model_object"] == "Date Selection"
+    assert ds["picker"] == {"table": "Date Selection", "column": "Date Selection Label"}
 
 
 def test_model_manifest_naming_map_binds_columns_measures_params():
@@ -566,6 +590,102 @@ def test_model_manifest_present_and_inert_without_parameters():
     assert mf["parameters"] == []
     assert mf["tables"] == ["Orders"]
     assert mf["naming"]["Sales"]["model_name"] == "Sales"
+
+
+# -- Stage 4: parameter-driven date-window keep-flag measure ----------------------------------
+_DATE_BAND_SQLSERVER = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Superstore' inline='true' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='myserver' name='sqlserver.0a1b2c'>
+        <connection authentication='sqlserver' class='sqlserver' dbname='Superstore'
+                    server='myserver.database.windows.net' username='svc' />
+      </named-connection>
+    </named-connections>
+    <relation connection='sqlserver.0a1b2c' name='Orders' table='[dbo].[Orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Order Date</remote-name><local-name>[Order Date]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>datetime</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>real</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Quantity</remote-name><local-name>[Quantity]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>integer</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+
+def _date_band_model():
+    """A faithful Comcast-shape date band: an aliased numeric LIST param (Date Selection) +
+    a band-case "Date Filter" calc whose inner ref resolves to a LAST() calc. The descriptor
+    carries an Order Date column so the shared Date dimension (the anchor) actually generates."""
+    params = [
+        {"caption": "Date Selection", "internal_name": "[Parameter 0014172370878491]",
+         "datatype": "real", "domain": "list", "default": "15.", "format": None, "range": None,
+         "members": ["15.", "30.", "41."],
+         "aliases": {"15.": "Current Orders", "30.": "Previous Orders", "41.": "All Orders"}},
+    ]
+    calcs = [
+        {"name": "Date Filter", "role": "measure",
+         "formula": ("case [Parameters].[Parameter 0014172370878491] "
+                     "when 15 then [Calculation_0014172370616346] <= 15 "
+                     "when 30 then [Calculation_0014172370616346] <= 30 "
+                     "and [Calculation_0014172370616346] >= 15 "
+                     "when 41 then [Calculation_0014172370616346] <= 41 END"),
+         "internal_name": "Calculation_0014172371238940"},
+        {"name": "last", "formula": "LAST()",
+         "internal_name": "Calculation_0014172370616346"},
+    ]
+    return assemble_import_model(parse_tds(_DATE_BAND_SQLSERVER), model_name="Superstore",
+                                 calcs=calcs, parameters=params)
+
+
+def test_date_band_emits_keep_flag_measure_and_filter_binding():
+    out = _date_band_model()
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    # the synthesized SWITCH keep-flag measure lands, anchored on the fact max date.
+    assert "measure 'Date Filter' =" in measures
+    assert "VAR anchor = CALCULATE(MAX('Orders'[Order_Date]), ALL('Orders'))" in measures
+    assert "VAR sel = SELECTEDVALUE('Date Selection'[Date Selection], 15)" in measures
+    assert "sel = 15, IF(d > anchor - 15, 1)" in measures
+    assert "sel = 30, IF(d > anchor - 30 && d <= anchor - 15, 1)" in measures
+    assert "sel = 41, 1" in measures
+    # the original Tableau formula is preserved as an annotation.
+    assert "annotation TableauFormula = case [Parameters].[Parameter 0014172370878491]" in measures
+
+    fb = out["report"]["filter_bindings"]
+    assert "Date Filter" in fb
+    assert fb["Date Filter"]["measure_name"] == "Date Filter"
+    assert fb["Date Filter"]["model_table"] == "_Measures"
+    assert fb["Date Filter"]["value"] == 1
+    assert fb["Date Filter"]["calc_id"] == "Calculation_0014172371238940"
+    assert fb["Date Filter"]["param_internal"] == "Parameter 0014172370878491"
+
+
+def test_date_band_supersedes_plain_stub_and_reports_translated():
+    out = _date_band_model()
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    # the band calc must NOT also land as an inert stub measure (only the SWITCH form).
+    assert "measure 'Date Filter' = \n" not in measures
+    assert "measure 'Date Filter' = BLANK()" not in measures
+    rows = {r["measure"]: r for r in out["report"]["measures"]}
+    assert rows["Date Filter"]["status"] == "translated"
+    assert rows["Date Filter"]["source"]["model_table"] == "_Measures"
+    assert rows["Date Filter"]["source"]["calc_instance_token"] == "Calculation_0014172371238940"
+
+
+def test_no_date_band_means_no_filter_bindings_key():
+    # Byte-identical no-flag path: a model with no date-band param omits filter_bindings entirely.
+    out = assemble_import_model(
+        parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+        calcs=[{"name": "Profit Ratio", "formula": "SUM([Sales])/SUM([Quantity])"}])
+    assert "filter_bindings" not in out["report"]
 
 
 # -- ADD #1: date-axis ORDERBY redirect builder ------------------------------------------------

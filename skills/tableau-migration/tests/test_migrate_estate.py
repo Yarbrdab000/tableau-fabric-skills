@@ -1939,3 +1939,107 @@ def test_param_slicers_from_workbook_ignores_measure_naming_targets():
     rr = {"model_manifest": {"naming": {
         "Region": {"model_table": "_Measures", "model_name": "Region", "kind": "measure"}}}}
     assert me._param_slicers_from_workbook(_PARAM_SLICER_TWB, rr) == {}
+
+
+def test_param_binding_from_model_emits_value_picker_slicer():
+    # A kind="value" what-if param exposing a disconnected picker table becomes a single-select
+    # value-picker slicer on the picker's friendly column, so a scalar parameter the model consumed
+    # still gets an operable control (the model owns the picker; the viz just places it).
+    rr = {"model_manifest": {"parameters": [
+        {"name": "Date Selection", "internal_name": "[Parameter 0014172370878491]",
+         "kind": "value", "model_object": "Date Selection",
+         "picker": {"table": "Date Selection", "column": "Date Selection Label"}}]}}
+    pb = me._param_binding_from_model(rr)
+    assert pb["slicers"]["[Parameter 0014172370878491]"] == {
+        "table": "Date Selection", "column": "Date Selection Label",
+        "single_select": True, "caption": "Date Selection"}
+    assert pb["flags"] == {}
+
+
+def test_param_binding_from_model_flag_carries_visuals():
+    # A translated date-window keep-flag measure binds as a visual-level ``flag = 1`` filter, and the
+    # binding carries the scoped worksheet names (set upstream by _scope_flag_visuals) so the viz
+    # layer applies the filter to exactly those visuals instead of the whole page.
+    rr = {"filter_bindings": {"Date Filter": {
+        "model_table": "_Measures", "measure_name": "Date Filter", "status": "translated",
+        "predicate": {"op": "==", "value": 1}, "value": 1, "calc_id": "Calculation_900",
+        "visuals": ["Line chart", "Line chart (2)", "Line chart (3)", "Segment % Dod"]}}}
+    pb = me._param_binding_from_model(rr)
+    assert pb["flags"]["Date Filter"] == {
+        "entity": "_Measures", "measure": "Date Filter", "status": "translated", "value": 1,
+        "visuals": ["Line chart", "Line chart (2)", "Line chart (3)", "Segment % Dod"]}
+
+
+def test_param_binding_from_model_flag_visuals_default_empty():
+    # A flag binding with no scoped visuals (the calc was never matched to a worksheet) still binds,
+    # with an empty visuals list -- the consumer then falls back to its own known scope.
+    rr = {"filter_bindings": {"Date Filter": {
+        "model_table": "_Measures", "measure_name": "Date Filter", "status": "translated",
+        "predicate": {"op": "==", "value": 1}}}}
+    pb = me._param_binding_from_model(rr)
+    assert pb["flags"]["Date Filter"]["visuals"] == []
+
+
+def test_scope_flag_visuals_attaches_worksheets(monkeypatch):
+    # The flag's source calc_id is mapped, via workbook_calc_usage, to the worksheets that placed the
+    # source Tableau filter calc; those names are written into the binding's ``visuals`` list.
+    rr = {"filter_bindings": {"Date Filter": {
+        "model_table": "_Measures", "measure_name": "Date Filter", "status": "translated",
+        "predicate": {"op": "==", "value": 1}, "value": 1,
+        "calc_id": "Calculation_0014172371238940", "param_internal": "[Parameter 1]"}}}
+    monkeypatch.setattr(me, "workbook_calc_usage", lambda _x: {"calcs": {
+        "Calculation_0014172371238940": {"worksheets": [
+            "Line chart", "Line chart (2)", "Line chart (3)", "Segment % Dod"]}}})
+    me._scope_flag_visuals("<workbook/>", rr)
+    assert rr["filter_bindings"]["Date Filter"]["visuals"] == [
+        "Line chart", "Line chart (2)", "Line chart (3)", "Segment % Dod"]
+
+
+def test_scope_flag_visuals_fail_closed(monkeypatch):
+    # No filter_bindings -> no-op without even consulting the workbook. An unreferenced calc, or a
+    # workbook_calc_usage parse error, leaves ``visuals`` absent (never raises) so the consumer keeps
+    # its own scope.
+    sentinel = {"called": False}
+    monkeypatch.setattr(me, "workbook_calc_usage",
+                        lambda _x: sentinel.__setitem__("called", True) or {"calcs": {}})
+    me._scope_flag_visuals("<workbook/>", {})
+    me._scope_flag_visuals("<workbook/>", {"filter_bindings": {}})
+    assert sentinel["called"] is False  # short-circuited before parsing
+    # calc_id not present in usage -> visuals not set
+    rr = {"filter_bindings": {"X": {"measure_name": "X", "status": "translated",
+                                    "calc_id": "Calculation_NOPE"}}}
+    me._scope_flag_visuals("<workbook/>", rr)
+    assert "visuals" not in rr["filter_bindings"]["X"]
+
+    # a parse error inside workbook_calc_usage is swallowed
+    def _boom(_x):
+        raise ValueError("bad xml")
+    monkeypatch.setattr(me, "workbook_calc_usage", _boom)
+    rr2 = {"filter_bindings": {"X": {"calc_id": "C", "measure_name": "X", "status": "translated"}}}
+    me._scope_flag_visuals("<workbook/>", rr2)
+    assert "visuals" not in rr2["filter_bindings"]["X"]
+
+
+def test_rebuild_from_published_match_threads_parameters(monkeypatch):
+    # The published-DS rebuild must thread the WORKBOOK's parameters into the model build -- without
+    # it a parameter-driven flag measure (a Date Selection band) never reaches assemble on the
+    # published path, so the flag + its filter_bindings would silently never fire.
+    captured = {}
+
+    def _fake_migrate(text, **kw):
+        captured.update(kw)
+        return {"report": {"fallback": False}}
+
+    monkeypatch.setattr(me, "migrate_datasource", _fake_migrate)
+    twb = ("<workbook><datasources><datasource name='ds'>"
+           "<column caption='Date Selection' name='[Parameter 1]' datatype='real' role='measure'"
+           " param-domain-type='list' value='15.'>"
+           "<calculation class='tableau' formula='15.' /></column>"
+           "</datasource></datasources></workbook>")
+    detail = {"binding_signal": {"kind": "published", "published_ds_name": "Sales DS"}}
+    catalog = {me._norm_ds("Sales DS"): {"text": "<datasource/>", "name": "Sales DS"}}
+    res = me._rebuild_from_published_match(detail, twb, "Model", catalog)
+    assert res is not None
+    params = captured.get("parameters")
+    assert isinstance(params, list)
+    assert any(p.get("caption") == "Date Selection" for p in params)

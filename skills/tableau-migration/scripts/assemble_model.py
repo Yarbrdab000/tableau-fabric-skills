@@ -60,6 +60,7 @@ try:  # package or scripts-on-path
         extract_percent_diff_base,
     )
     from .workbook_table_calcs import extract_table_calc_usages
+    from .date_window_flag import build_date_window_flags
 except ImportError:
     from connection_to_m import (
         build_m_field_resolver,
@@ -94,6 +95,7 @@ except ImportError:
         extract_percent_diff_base,
     )
     from workbook_table_calcs import extract_table_calc_usages
+    from date_window_flag import build_date_window_flags
 
 
 def _table_display(rel):
@@ -420,7 +422,8 @@ def _forced_percent_diff_measures(calcs, usages, resolve, known_tables, consumed
 
 def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    calc_lookup=None, approved_calc_dax=None, synth_measures=None,
-                   known_tables=None, table_calc_usages=None, order_resolver=None):
+                   known_tables=None, table_calc_usages=None, order_resolver=None,
+                   flag_measures=None):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
     ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
@@ -445,6 +448,13 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     """
     consumed_lower = {(c or "").lower() for c in (consumed or set())}
     approved_lower = {(k or "").lower(): v for k, v in (approved_calc_dax or {}).items()}
+    # Source calcs whose stub is SUPERSEDED by a synthesized date-window flag measure (emitted
+    # at the end). Keyed by both the calc caption and its internal id, case-insensitive.
+    flag_source_lower = set()
+    for _fm in (flag_measures or []):
+        for _k in (_fm.get("source_calc_name"), _fm.get("source_calc_id")):
+            if _k:
+                flag_source_lower.add(str(_k).strip().lower())
     measures_tmdl = ""
     report = []
     suggestions = []
@@ -526,6 +536,9 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         name, formula = calc["name"], calc.get("formula", "")
         if name.lower() in consumed_lower:
             continue
+        if (name or "").strip().lower() in flag_source_lower or \
+                str(calc.get("internal_name") or "").strip().lower() in flag_source_lower:
+            continue  # superseded by a synthesized date-window flag measure (emitted below).
         if _superseded_by_table_calc(calc, superseded):
             continue  # the addressed table-calc form (emitted below) is the faithful one.
         dax, reason, _ = translate_tableau_calc_to_dax(
@@ -581,6 +594,13 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             r["measure"], r["tableau_formula"], r["dax"],
             translated_by=r.get("translated_by") or "deterministic (workbook addressing)")
         report.append(r)
+    # Emit the synthesized parameter-driven date-window keep-flag measures last. Each supersedes
+    # its source calc's plain stub (skipped above) and preserves the original Tableau formula.
+    for fm in (flag_measures or []):
+        measures_tmdl += T.generate_measure_tmdl(
+            fm["measure"], fm.get("tableau_formula", ""), fm["dax"],
+            translated_by=fm.get("translated_by") or "deterministic (parameter-driven date window)")
+        report.append(fm["report_row"])
     return T.generate_measures_table_tmdl(measures_tmdl), report, suggestions
 
 
@@ -652,7 +672,9 @@ def _classify_parameters(parameters, fp, vp):
     Returns ``[{name, internal_name, kind, model_object}]`` where ``kind`` is:
 
     * ``"value"``  -- a scalar/what-if parameter the model turned into a disconnected what-if table
-      (``model_object`` = that table); the report/viz layer must NOT re-emit it as a slicer.
+      (``model_object`` = that table); the model also owns its picker, exposed as an additive
+      ``picker`` ``{table, column}`` so the viz layer slices the model's own picker column (the
+      friendly Label column for an aliased list) rather than re-deriving a field slicer.
     * ``"field"``  -- a dimension/measure SWAP controller the model turned into a field-parameter
       table (``model_object`` = that table); likewise model-owned.
     * ``"filter"`` -- a plain filter parameter the model did NOT consume (``model_object`` = None);
@@ -661,10 +683,10 @@ def _classify_parameters(parameters, fp, vp):
     Classification is deterministic and driven by the two emitters' own consumed-source signals
     (``vp["consumed_params"]`` and each ``fp["specs"][*]["controller"]``), never by guessing.
     """
-    value_tbl = {}     # param key -> what-if table name
+    value_tbl = {}     # param key -> (what-if table name, picker column a slicer binds to)
     for cp in (vp.get("consumed_params") or []):
         for k in _norm_param_keys(cp):
-            value_tbl[k] = cp.get("table")
+            value_tbl[k] = (cp.get("table"), cp.get("picker_column") or cp.get("table"))
     field_tbl = {}     # controller key -> field-parameter table name
     for spec in (fp.get("specs") or []):
         ctrl = (spec.get("controller") or "").strip().strip("[]").strip().lower()
@@ -675,15 +697,22 @@ def _classify_parameters(parameters, fp, vp):
     for p in (parameters or []):
         keys = _norm_param_keys(p)
         name = p.get("caption") or p.get("internal_name") or ""
-        kind, model_object = "filter", None
+        kind, model_object, picker = "filter", None, None
         vhit = next((value_tbl[k] for k in keys if k in value_tbl), None)
         fhit = next((field_tbl[k] for k in keys if k in field_tbl), None)
         if vhit is not None:
-            kind, model_object = "value", vhit
+            table, picker_col = vhit
+            kind, model_object = "value", table
+            # A what-if value param needs a control: expose the disconnected picker table column a
+            # slicer binds to (the friendly Label column for an aliased list, else the value column).
+            picker = {"table": table, "column": picker_col}
         elif fhit is not None:
             kind, model_object = "field", fhit
-        out.append({"name": name, "internal_name": p.get("internal_name"),
-                    "kind": kind, "model_object": model_object})
+        rec = {"name": name, "internal_name": p.get("internal_name"),
+               "kind": kind, "model_object": model_object}
+        if picker:
+            rec["picker"] = picker
+        out.append(rec)
     return out
 
 
@@ -1556,6 +1585,19 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     vp = emit_value_parameters(parameters or [], calcs=non_consumed, reserved_names=reserved)
     param_resolver = vp["param_resolver"] if vp["table_names"] else None
 
+    # Parameter-driven positional date-band -> a faithful keep-flag measure (1 keep / BLANK drop)
+    # + a filter_bindings manifest entry the report layer applies as a visual-level "== 1" filter.
+    # Recognized over the FULL calc set (the band case + its inner LAST() calc may be split across
+    # the measure/dimension lists); fail-closed, so with no such pattern this is inert.
+    flag_measures, filter_bindings = build_date_window_flags(
+        all_calcs, parameters or [], vp.get("consumed_params") or [],
+        date_name=date_name, active_date_cols=active_date_cols, reserved_names=reserved)
+    flag_source_names = set()
+    for _fm in flag_measures:
+        for _k in (_fm.get("source_calc_name"), _fm.get("source_calc_id")):
+            if _k:
+                flag_source_names.add(_k)
+
     # Row-level (dimension) calcs become DAX calculated columns via column mode, injected onto
     # their resolved home table (constants / honest stubs default to the first data table). This
     # is additive: with no dim_calcs the table parts are byte-for-byte unchanged. A date-attribute
@@ -1564,7 +1606,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     # a calc is only ever sent through one mode (no cross-mode retry).
     calc_columns_by_table, calc_column_report = _calc_columns_part(
         dim_calcs, resolve, anchor_table=table_names[0],
-        date_table=date_name, active_date_cols=active_date_cols, consumed=consumed)
+        date_table=date_name, active_date_cols=active_date_cols,
+        consumed=(set(consumed) | flag_source_names) if flag_source_names else consumed)
     for disp, block in calc_columns_by_table.items():
         path = f"definition/tables/{disp}.tmdl"
         if path in parts:
@@ -1579,7 +1622,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
         approved_calc_dax=approved_calc_dax, synth_measures=fp.get("measures"),
         known_tables=set(table_names), table_calc_usages=table_calc_usages,
-        order_resolver=_date_axis_order_resolver(resolve, date_name, active_date_cols))
+        order_resolver=_date_axis_order_resolver(resolve, date_name, active_date_cols),
+        flag_measures=flag_measures)
     parts["definition/tables/_Measures.tmdl"] = measures_table
     table_names.append("_Measures")
 
@@ -1642,6 +1686,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
             "count": len(vp["table_names"]),
         },
     }
+    if filter_bindings:
+        report["filter_bindings"] = filter_bindings
     return {"parts": parts, "report": report}
 
 

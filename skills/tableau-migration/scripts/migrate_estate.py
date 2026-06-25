@@ -54,6 +54,7 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
                                  migrate_datasource, list_workbook_datasources)
     from .parameters import parse_parameters
     from .workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
+    from .workbook_calc_usage import workbook_calc_usage
     from . import fetch_tds as F
 except ImportError:
     from connection_to_m import parse_tds
@@ -62,6 +63,7 @@ except ImportError:
                                 migrate_datasource, list_workbook_datasources)
     from parameters import parse_parameters
     from workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
+    from workbook_calc_usage import workbook_calc_usage
     import fetch_tds as F
 
 
@@ -1128,6 +1130,34 @@ def _param_slicers_from_workbook(twb_text, res_report):
     return out
 
 
+def _scope_flag_visuals(twb_text, res_report):
+    """Attach the worksheet names a flag measure scopes to its ``filter_bindings`` entry.
+
+    A date-window / measure flag is applied as a visual-level ``flag = 1`` filter, but only on the
+    worksheets that actually placed the source Tableau filter calc -- not the whole page. The model
+    build records each flag's source ``calc_id`` in ``report["filter_bindings"]``; this maps that
+    calc_id to the worksheets that reference it (via :func:`workbook_calc_usage`, whose calc keys are
+    the same unbracketed internal name) and writes those names into the binding's ``visuals`` list,
+    so the viz layer can scope the filter to exactly those visuals. Additive + best-effort: a parse
+    failure or an unreferenced calc leaves ``visuals`` absent (the consumer then falls back to its
+    own known scope). Mutates ``res_report["filter_bindings"]`` in place; never raises.
+    """
+    fb = (res_report or {}).get("filter_bindings")
+    if not isinstance(fb, dict) or not fb:
+        return
+    try:
+        calc_usage = (workbook_calc_usage(twb_text) or {}).get("calcs") or {}
+    except Exception:
+        return
+    for spec in fb.values():
+        if not isinstance(spec, dict):
+            continue
+        cid = spec.get("calc_id")
+        entry = calc_usage.get(cid) if cid else None
+        if isinstance(entry, dict) and entry.get("worksheets"):
+            spec["visuals"] = list(entry["worksheets"])
+
+
 def _param_binding_from_model(res_report):
     """Derive the report binder's ``param_binding`` from the model build's parameter / filter facts.
 
@@ -1204,6 +1234,7 @@ def _param_binding_from_model(res_report):
             "measure": measure,
             "status": status,
             "value": pred.get("value", 1),
+            "visuals": list(spec.get("visuals") or []),
         }
 
     if not slicers and not flags:
@@ -1360,9 +1391,19 @@ def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog):
         wb_table_calc_usages = extract_table_calc_usages(twb_text)
     except Exception:
         wb_table_calc_usages = None
+    # Parameters also live only in the WORKBOOK, never in the published ``.tds`` schema. Without
+    # threading them through, a parameter-driven measure (e.g. a Date Selection band that becomes a
+    # keep-flag MEASURE) would never reach the model build on the published path, so the flag + its
+    # ``filter_bindings`` would silently never fire. Guarded: a parse hiccup degrades to None (the
+    # model build then simply has no parameters, exactly as before).
+    try:
+        wb_params = parse_parameters(twb_text)
+    except Exception:
+        wb_params = None
     try:
         res = migrate_datasource(match["text"], model_name=model_safe,
                                  calcs=wb_calcs, dim_calcs=wb_dim_calcs,
+                                 parameters=wb_params,
                                  table_calc_usages=wb_table_calc_usages)
     except Exception:
         return None
@@ -1493,6 +1534,9 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
     date_binding = _date_binding_from_model(res_report)
     measure_binding = _measure_binding_from_model(res_report)
     row_count_binding = _row_count_binding_from_model(res_report)
+    # Scope each flag measure's visual-level filter to the worksheets that placed the source calc
+    # (additive enrichment of report["filter_bindings"]; no-op when there are no flags).
+    _scope_flag_visuals(twb_text, res_report)
     param_binding = _param_binding_from_model(res_report)
     # A parameter used purely as a single-column equality filter ([Col] = [Parameters].[P]) is most
     # faithfully a plain slicer on that real column -- not a disconnected what-if table. Resolve those
