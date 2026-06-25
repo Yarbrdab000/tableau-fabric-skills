@@ -1192,6 +1192,59 @@ def test_estate_summary_rolls_up_unbound_implicit_row_counts(tmp_path):
     assert oid not in json.dumps(report)
 
 
+def test_attach_workbook_pbip_refreshes_fidelity_from_rebound_run(tmp_path, monkeypatch):
+    # The reported viz_fidelity / viz_implicit_row_count must describe the REBOUND report that
+    # actually lands in the openable .pbip -- not the pre-rebind first pass. Here the model build
+    # supplies a COUNTROWS row-count binding, so the bound re-run clears the "implicit row count"
+    # warning; the detail keys (seeded with the stale pre-rebind values, as _migrate_one_workbook
+    # does) must be refreshed to the bound state instead of reporting the now-fixed gap.
+    pbir = json.dumps({"version": "1.0",
+                       "datasetReference": {"byPath": {"path": "../WB.SemanticModel"}}})
+    unbound_warn = {"scope": "worksheet", "name": "Row Count",
+                    "reason": ("manual attention required: implicit row count COUNT('Orders') has "
+                               "no model binding -- needs a row-count (COUNTROWS) measure on table "
+                               "'Orders' (left unbound)")}
+    pre = {"parts": {"definition.pbir": pbir},
+           "ir": {"worksheets": [{"name": "Row Count", "visual_type": "bar"}]},
+           "warnings": [unbound_warn]}
+    detail = {"name": "Counts WB",
+              "viz_fidelity": me._viz_fidelity(pre),
+              "viz_implicit_row_count": 1}
+    # sanity: the seeded pre-rebind state reports the unbound row count.
+    assert detail["viz_implicit_row_count"] == 1
+    assert any("implicit row count" in (f.get("reason") or "") for f in detail["viz_fidelity"])
+
+    res_report = {"row_count_binding": {
+        "measures": {"Orders": {"entity": "_Measures", "measure": "count orders"}}}}
+    monkeypatch.setattr(me, "list_workbook_datasources",
+                        lambda twb: [{"label": "Orders DS", "caption": "Orders DS",
+                                      "name": "federated.s1"}])
+    monkeypatch.setattr(me, "migrate_datasource",
+                        lambda twb, **kw: {"parts": {"definition/model.tmdl": "x"},
+                                           "report": res_report})
+    monkeypatch.setattr(me, "_param_slicers_from_workbook", lambda twb, rep: {})
+    monkeypatch.setattr(me, "_crosscheck_report_refs", lambda parts, model_parts: (parts, []))
+    monkeypatch.setattr(me, "write_local_pbip", lambda *a, **kw: None)
+
+    def bound_viz(xml, name, date_binding=None, measure_binding=None, row_count_binding=None,
+                  param_binding=None, model_table=None, field_map=None):
+        # the row count is bound now -> the rebound report carries no implicit-row-count warning.
+        assert row_count_binding  # the model-derived binding reached the single re-run
+        return {"parts": {"definition.pbir": pbir},
+                "ir": {"worksheets": [{"name": "Row Count", "visual_type": "bar"}]},
+                "warnings": []}
+
+    me._attach_workbook_pbip(detail, "<workbook/>", pre, "Counts WB",
+                             str(tmp_path / "pbip"), viz=bound_viz)
+
+    assert detail["pbip_status"] == "built"
+    assert detail["row_count_rebind"]["count"] == 1
+    # refreshed to the rebound truth: the implicit-row-count warning is gone in both tallies.
+    assert detail["viz_implicit_row_count"] == 0
+    assert not any("implicit row count" in (f.get("reason") or "")
+                   for f in detail["viz_fidelity"])
+
+
 def test_workbook_pbip_bypath_resolves_for_caption_with_spaces_and_punctuation(tmp_path):
     # byPath footgun guard: the rewritten ../<model>.SemanticModel must resolve to the SAME folder
     # write_local_pbip actually creates -- even when the datasource caption has spaces/hyphens/periods
@@ -1812,3 +1865,77 @@ def test_viz_adapter_forwards_model_table_and_field_map_only_when_supported():
     me._viz_adapter(viz_without)("<twb/>", "WB", model_table="Orders", field_map=fm)
     assert seen["with"] == {"model_table": "Orders", "field_map": fm}
     assert seen.get("without") is True  # called without raising despite no model_table/field_map
+
+
+# -- parameter-as-filter -> direct single-select slicer resolution ------------------------------
+# A parameter used purely as a single-column equality filter ([Col] = [Parameters].[P]) is most
+# faithfully a plain slicer on that real column -- never a disconnected what-if table. These cover
+# the orchestrator-side resolver that turns such a parameter into a `param_binding.slicers` entry
+# keyed by the parameter's internal name (the same key the report binder consumes).
+
+def test_filter_param_target_field_single_column_equality_both_orientations():
+    # The canonical "use a parameter as a filter" idiom resolves to the ONE compared column, in
+    # either orientation, and the `OR [Parameters].[P] = "All"` show-everything escape (a string
+    # literal, never a field) does not contribute a spurious target.
+    f1 = '[Region] = [Parameters].[Parameter 1] OR [Parameters].[Parameter 1] = "All"'
+    f2 = '[Parameters].[P] = [Sub-Category]'
+    assert me._filter_param_target_field(f1, "Parameter 1") == "Region"
+    assert me._filter_param_target_field(f2, "P") == "Sub-Category"
+    # the match is case-insensitive on the parameter's inner name
+    assert me._filter_param_target_field(f1, "parameter 1") == "Region"
+
+
+def test_filter_param_target_field_rejects_zero_or_multiple_columns():
+    # Zero compared columns (pure "All" escape), more than one distinct column, or an empty inner
+    # name all fail closed -> None, so the parameter stays an unresolved slicer (warn-never-wrong)
+    # rather than binding to a guessed column.
+    assert me._filter_param_target_field('[Parameters].[P] = "All"', "P") is None
+    two = '[A] = [Parameters].[P] OR [B] = [Parameters].[P]'
+    assert me._filter_param_target_field(two, "P") is None
+    assert me._filter_param_target_field('[Region] = [Parameters].[P]', "") is None
+    # the parameter's own [Parameters].[P] tail bracket is never read back as a target field
+    assert me._filter_param_target_field('[Parameters].[P] = "All"', "P") is None
+
+
+_PARAM_SLICER_TWB = """<?xml version='1.0'?>
+<workbook><datasources><datasource name='ds'>
+ <column caption='Region Parameter' name='[Parameter 1]' datatype='string' role='measure'
+         type='nominal' param-domain-type='list' value='&quot;Central&quot;'>
+   <calculation class='tableau' formula='&quot;Central&quot;' /></column>
+ <column caption='Region Filter' name='[Calculation_900]' datatype='boolean' role='dimension'
+         type='ordinal'>
+   <calculation class='tableau'
+     formula='[Region] = [Parameters].[Parameter 1] OR [Parameters].[Parameter 1] = &quot;All&quot;' />
+ </column>
+</datasource></datasources></workbook>"""
+
+
+def test_param_slicers_from_workbook_resolves_direct_column_slicer():
+    # End to end: a list parameter whose filter calc targets [Region] becomes a single-select slicer
+    # on the model's real Orders[Region] column, keyed by the parameter's bracketed internal name so
+    # it merges cleanly with `_param_binding_from_model` output.
+    rr = {"model_manifest": {"naming": {
+        "Region": {"model_table": "Orders", "model_name": "Region", "kind": "column"}}}}
+    out = me._param_slicers_from_workbook(_PARAM_SLICER_TWB, rr)
+    assert out == {"[Parameter 1]": {"table": "Orders", "column": "Region",
+                                     "single_select": True, "caption": "Region Parameter"}}
+
+
+def test_param_slicers_from_workbook_fail_closed_paths():
+    # No usable column naming, a target the model never emitted, or no parameters at all -> {} so the
+    # report keeps its precise "not rebuilt as a slicer yet" warning instead of a dangling slicer.
+    assert me._param_slicers_from_workbook(_PARAM_SLICER_TWB, {"model_manifest": {"naming": {}}}) == {}
+    # naming has columns but not the targeted one
+    other = {"model_manifest": {"naming": {
+        "Segment": {"model_table": "Orders", "model_name": "Segment", "kind": "column"}}}}
+    assert me._param_slicers_from_workbook(_PARAM_SLICER_TWB, other) == {}
+    # a workbook with no parameters yields nothing
+    assert me._param_slicers_from_workbook("<workbook><datasources/></workbook>", other) == {}
+
+
+def test_param_slicers_from_workbook_ignores_measure_naming_targets():
+    # The resolved field must be a column-kind naming entry; a same-named measure/parameter entry is
+    # not a valid slicer target (a slicer binds a column, never a measure).
+    rr = {"model_manifest": {"naming": {
+        "Region": {"model_table": "_Measures", "model_name": "Region", "kind": "measure"}}}}
+    assert me._param_slicers_from_workbook(_PARAM_SLICER_TWB, rr) == {}

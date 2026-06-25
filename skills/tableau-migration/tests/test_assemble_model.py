@@ -11,6 +11,7 @@ from assemble_model import (
     migrate_tds_to_semantic_model,
     relationship_confidence_manifest,
     write_model_folder,
+    _date_axis_order_resolver,
 )
 from connection_to_m import parse_tds
 from workbook_table_calcs import TableCalcUsage, Pill
@@ -565,6 +566,34 @@ def test_model_manifest_present_and_inert_without_parameters():
     assert mf["parameters"] == []
     assert mf["tables"] == ["Orders"]
     assert mf["naming"]["Sales"]["model_name"] == "Sales"
+
+
+# -- ADD #1: date-axis ORDERBY redirect builder ------------------------------------------------
+def _date_axis_resolve(caption):
+    # A tiny caption resolver: the fact date column + a non-date field.
+    return {
+        "Order Date": ("Orders", "Order_Date", "dateTime"),
+        "Region": ("Orders", "Region", "string"),
+    }.get(caption)
+
+
+def test_date_axis_order_resolver_redirects_active_date_col_to_calendar_key():
+    # The active date column's caption redirects to the marked-calendar key Date[Date], carrying
+    # the source fact (Orders) as the 4th element so the compiler can guard unrelated aggregates.
+    redirect = _date_axis_order_resolver(
+        _date_axis_resolve, "Date", {("Orders", "Order_Date")})
+    assert redirect("Order Date") == ("Date", "Date", "dateTime", "Orders")
+    # a non-date caption is never redirected -> the normal resolver handles it.
+    assert redirect("Region") is None
+    # an unknown caption resolves to nothing -> no redirect.
+    assert redirect("Nope") is None
+
+
+def test_date_axis_order_resolver_is_none_without_date_dimension():
+    # No date table or no active date column -> no redirect at all (byte-identical legacy path).
+    assert _date_axis_order_resolver(_date_axis_resolve, "", {("Orders", "Order_Date")}) is None
+    assert _date_axis_order_resolver(_date_axis_resolve, "Date", set()) is None
+    assert _date_axis_order_resolver(_date_axis_resolve, "Date", None) is None
 
 
 def test_assemble_excel_collection_multi_table():

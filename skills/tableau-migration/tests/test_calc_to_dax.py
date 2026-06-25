@@ -831,6 +831,77 @@ def test_table_calc_cross_table_falls_back():
     assert "cross-table" in reason
 
 
+# --- ADD #1: trusted ORDERBY-only date-axis redirect (marked-calendar key) --------------------
+# A positional table calc orders by the worksheet's continuous-date axis, but the rebuilt visual
+# groups that axis on the marked-calendar key Date[Date]. An ``order_resolver`` redirects ONLY the
+# ORDERBY (never the inner aggregate or the partition) to Date[Date]; because the Date dimension
+# relates to the fact, the redirected addressing column is a related addressing dimension (NOT a
+# cross-table aggregate term), so it is exempt from the single-table guard and the measure stays
+# translated -- giving "previous mark = previous data-date" exactly as the visual renders.
+from calc_to_dax import translate_percent_diff_to_dax  # noqa: E402
+
+
+def _date_axis_order_resolver(caption):
+    # Redirect the active business-date axis caption to the marked-calendar key, carrying the FACT
+    # it resolves to as the 4th element (the required_fact the redirect depends on); None otherwise,
+    # so every non-date caption flows through the normal resolver unchanged.
+    if caption == "Order Date":
+        return ("Date", "Date", "dateTime", "Orders")
+    return None
+
+
+def test_table_calc_orderby_redirects_to_marked_calendar_key():
+    # WINDOW_STDEV(SUM([Sales])) over a date axis: ORDERBY walks Date[Date] (the visual axis) while
+    # the inner aggregate + partition stay on the fact -> the related Date dimension is not counted
+    # against the single-table guard, so it stays translated (reason == "ok").
+    dax, reason, _ = translate_tableau_table_calc_to_dax(
+        "WINDOW_STDEV(SUM([Sales]))", _resolver, _PART, _ORDER,
+        order_resolver=_date_axis_order_resolver)
+    assert reason == "ok"
+    assert dax == ("STDEVX.S(WINDOW(1, ABS, -1, ABS, ORDERBY('Date'[Date], ASC), "
+                   "PARTITIONBY('Orders'[Region])), CALCULATE(SUM('Orders'[Sales])))")
+
+
+def test_table_calc_orderby_redirect_default_is_byte_identical():
+    # With no order_resolver (and with an explicit None) the ORDERBY resolves to the fact date
+    # column exactly as before -- the redirect is purely additive.
+    base = translate_tableau_table_calc_to_dax(
+        "WINDOW_STDEV(SUM([Sales]))", _resolver, _PART, _ORDER)[0]
+    explicit_none = translate_tableau_table_calc_to_dax(
+        "WINDOW_STDEV(SUM([Sales]))", _resolver, _PART, _ORDER, order_resolver=None)[0]
+    assert base == explicit_none
+    assert "ORDERBY('Orders'[Order_Date], ASC)" in base
+
+
+def test_lookup_orderby_redirects_to_marked_calendar_key():
+    # LOOKUP(-1) (previous mark) orders by Date[Date] under the redirect; OFFSET walks the axis.
+    dax = translate_tableau_table_calc_to_dax(
+        "LOOKUP(SUM([Sales]), -1)", _resolver, (), _ORDER,
+        order_resolver=_date_axis_order_resolver)[0]
+    assert dax == "CALCULATE(SUM('Orders'[Sales]), OFFSET(-(1), ORDERBY('Date'[Date], ASC)))"
+
+
+def test_table_calc_redirect_does_not_mask_real_cross_table():
+    # The redirect only exempts the addressing date dimension; a genuinely cross-table INNER (a
+    # People aggregate with Orders addressing) must still fall back.
+    dax, reason, _ = translate_tableau_table_calc_to_dax(
+        "RUNNING_SUM(SUM([People Count]))", _resolver, (), _ORDER,
+        order_resolver=_date_axis_order_resolver)
+    assert dax is None
+    assert "cross-table" in reason
+
+
+def test_percent_diff_orderby_redirects_to_marked_calendar_key():
+    # The percent-difference-from-prior seam honors the same redirect: ORDERBY Date[Date],
+    # PARTITIONBY the fact dim, inner aggregate on the fact -> stays single-table (reason == "ok").
+    dax, reason, _ = translate_percent_diff_to_dax(
+        "SUM([Sales])", _resolver, partition_by=_PART, order_by=_ORDER,
+        order_resolver=_date_axis_order_resolver)
+    assert reason == "ok"
+    assert "OFFSET(-1, ORDERBY('Date'[Date], ASC), PARTITIONBY('Orders'[Region]))" in dax
+    assert "Order_Date" not in dax  # the fact date column is fully replaced by the calendar key
+
+
 # --- g2: cross-calc references (a calc that references another calc by name) -------------------
 from calc_to_dax import translate_tableau_calc_to_dax_typed  # noqa: E402
 

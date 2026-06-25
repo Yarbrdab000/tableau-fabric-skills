@@ -1030,6 +1030,104 @@ def _row_count_binding_from_model(res_report):
     return None
 
 
+def _filter_param_target_field(formula, param_inner):
+    """Return the SINGLE Tableau field caption a parameter is equated against in the standard
+    "parameter-as-filter" idiom, or ``None`` for any other shape.
+
+    Tableau's canonical "use a parameter as a filter" calc compares ONE dimension column to the
+    parameter, optionally with an ``OR [Parameters].[P] = "All"`` escape that shows everything::
+
+        IF [Region] = [Parameters].[P] OR [Parameters].[P] = "All" THEN TRUE END
+        IF [Parameters].[P] = [Sub-Category] OR [Parameters].[P] = "All" THEN TRUE END
+
+    ``param_inner`` is the (bracket-less) parameter name the formula references. Only a clean,
+    single-column equality binds: 0 or >1 distinct compared columns returns ``None`` (the caller then
+    leaves the parameter as an unresolved slicer -- warn-never-wrong). The ``"All"`` escape compares
+    the parameter to a STRING literal, never a field, so it never contributes a target. The negative
+    lookbehind keeps the parameter's own ``[Parameters].[P]`` tail bracket from being read as a field.
+    """
+    f = formula or ""
+    pi = re.escape(param_inner or "")
+    if not pi:
+        return None
+    pat_field_eq_param = re.compile(
+        r"(?<!\]\.)\[(?!Parameters?\])([^\]]+)\]\s*=\s*\[Parameters?\]\.\[" + pi + r"\]",
+        re.IGNORECASE)
+    pat_param_eq_field = re.compile(
+        r"\[Parameters?\]\.\[" + pi + r"\]\s*=\s*\[(?!Parameters?\])([^\]]+)\]",
+        re.IGNORECASE)
+    fields = set()
+    for m in pat_field_eq_param.finditer(f):
+        fields.add(m.group(1).strip())
+    for m in pat_param_eq_field.finditer(f):
+        fields.add(m.group(1).strip())
+    fields = {x for x in fields if x and x.lower() != "parameters"}
+    return next(iter(fields)) if len(fields) == 1 else None
+
+
+def _param_slicers_from_workbook(twb_text, res_report):
+    """Direct single-select slicers for workbook parameters used as a plain column-equality filter.
+
+    The model build classifies every parameter and (for a genuine what-if / field-swap param) emits a
+    model object, but a parameter used purely as ``[Col] = [Parameters].[P]`` (optionally with an
+    ``OR [Parameters].[P] = "All"`` escape) is most faithfully rebuilt as an ORDINARY single-select
+    slicer on that real column -- no disconnected what-if table, no flag measure. This resolves those
+    targets from the workbook's OWN filter calcs against the model's authoritative naming map, so a
+    slicer only ever lands on a column the model actually emitted.
+
+    Returns ``{<param internal_name>: {"table", "column", "single_select", "caption"}}`` (possibly
+    empty), keyed the same way :func:`_param_binding_from_model` keys its slicers so the two merge
+    cleanly. Never raises -- any parse problem yields no slicers and the precise "not rebuilt as a
+    slicer yet" warning then stands.
+    """
+    try:
+        params = parse_parameters(twb_text)
+    except Exception:
+        params = []
+    if not params:
+        return {}
+    try:
+        calcs, _skipped, dim_calcs = extract_calculations(twb_text, include_dimensions=True)
+    except Exception:
+        calcs, dim_calcs = [], []
+    formulas = [(c.get("formula") or "") for c in (list(calcs or []) + list(dim_calcs or []))
+                if isinstance(c, dict)]
+    if not formulas:
+        return {}
+    naming = ((res_report or {}).get("model_manifest") or {}).get("naming") or {}
+    col_idx = {}
+    for ref, info in naming.items():
+        if isinstance(info, dict) and info.get("kind") == "column":
+            key = (ref or "").strip().lower()
+            if key:
+                col_idx.setdefault(key, info)
+    if not col_idx:
+        return {}
+    out = {}
+    for p in params:
+        pid = p.get("internal_name")
+        if not pid:
+            continue
+        keys = {(p.get("caption") or "").strip().strip("[]").strip().lower(),
+                (pid or "").strip().strip("[]").strip().lower()}
+        keys.discard("")
+        for formula in formulas:
+            refs = {m.strip().lower()
+                    for m in re.findall(r"\[Parameters?\]\.\[([^\]]+)\]", formula)}
+            hit = next((k for k in keys if k in refs), None)
+            if not hit:
+                continue
+            field = _filter_param_target_field(formula, hit)
+            if not field:
+                continue
+            info = col_idx.get(field.strip().lower())
+            if info and info.get("model_table") and info.get("model_name"):
+                out[pid] = {"table": info["model_table"], "column": info["model_name"],
+                            "single_select": True, "caption": p.get("caption") or pid}
+                break
+    return out
+
+
 def _param_binding_from_model(res_report):
     """Derive the report binder's ``param_binding`` from the model build's parameter / filter facts.
 
@@ -1396,6 +1494,18 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
     measure_binding = _measure_binding_from_model(res_report)
     row_count_binding = _row_count_binding_from_model(res_report)
     param_binding = _param_binding_from_model(res_report)
+    # A parameter used purely as a single-column equality filter ([Col] = [Parameters].[P]) is most
+    # faithfully a plain slicer on that real column -- not a disconnected what-if table. Resolve those
+    # directly from the workbook's filter calcs and merge them in (these workbook-confirmed column
+    # slicers take precedence over any value/field model object for the same parameter).
+    wb_slicers = _param_slicers_from_workbook(twb_text, res_report)
+    if wb_slicers:
+        if not isinstance(param_binding, dict):
+            param_binding = {"slicers": {}, "flags": {}}
+        merged = dict(param_binding.get("slicers") or {})
+        merged.update(wb_slicers)
+        param_binding["slicers"] = merged
+        param_binding.setdefault("flags", {})
     field_model_table, field_map = _field_map_from_model(res_report)
     if (date_binding or measure_binding or row_count_binding or param_binding
             or field_map) and viz is not None:
@@ -1423,6 +1533,15 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
                 if field_map:
                     detail["field_rebind"] = {
                         "count": len(field_map), "model_table": field_model_table}
+                # The rebound report -- not the pre-rebind first pass -- is what lands in the
+                # openable .pbip, so refresh the per-worksheet fidelity + implicit-row-count tally
+                # from it. Now-bound row counts / measures / params clear their warnings here, so the
+                # reported fidelity matches the project the user actually opens (warn-never-wrong: any
+                # warning the rebound run still emits is carried, never masked).
+                detail["viz_fidelity"] = _viz_fidelity(rebuilt)
+                detail["viz_implicit_row_count"] = sum(
+                    1 for w in (rebuilt.get("warnings") or [])
+                    if "implicit row count" in (w.get("reason") or ""))
         except Exception as exc:
             warns.append(_PBIP_WARN + f"model-fact rebind skipped ({type(exc).__name__}: {exc}) -- "
                          f"report binds to the standing source/deferred fields")

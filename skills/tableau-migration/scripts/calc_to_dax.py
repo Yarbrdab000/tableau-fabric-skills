@@ -1701,10 +1701,35 @@ def translate_tableau_calc_to_column_dax(formula, resolver, known_tables=None):
         return None, str(e), tables_used
 
 
-def _orderby_clause(order_by, resolver, tables_used):
+def _addressing_fact_guard(tables_used, required_facts):
+    # When a TRUSTED order_resolver redirected the ORDERBY to a related Date dimension (collecting
+    # the fact its relationship requires into ``required_facts``), the redirect is faithful ONLY if
+    # every aggregate/partition table is that fact -- otherwise sorting an aggregate of an UNRELATED
+    # table by the calendar key would not propagate through any relationship and the window would be
+    # wrong. Returns a fallback reason when the aggregate strays outside the required fact(s); ""
+    # (falsy) when there was no redirect or the aggregate lives on the fact (the common case).
+    if not required_facts:
+        return ""
+    if any(t not in required_facts for t in tables_used):
+        return ("cross-table terms (the date-axis addressing dimension is unrelated to the "
+                "aggregate's table)")
+    return ""
+
+
+def _orderby_clause(order_by, resolver, tables_used, order_resolver=None, required_facts=None):
     # order_by items are a caption or a (caption, "ASC"|"DESC") pair. An explicit order is
     # REQUIRED for every table calc (the window functions omit <relation>, so DAX requires an
     # ORDERBY). Returns None when no order is supplied -> the caller falls back.
+    #
+    # ``order_resolver`` (optional) is a TRUSTED addressing redirect consulted before the normal
+    # resolver: when it resolves a caption (e.g. a continuous-date axis pill -> the marked-calendar
+    # key ``Date[Date]`` on a RELATED Date dimension), that column is emitted but its home table is
+    # deliberately NOT recorded in ``tables_used`` -- it is a related addressing dimension, not a
+    # cross-table aggregate term, so it must not trip the single-table guard. A redirect MAY carry a
+    # 4th tuple element, the FACT table its date relationship requires the aggregate to live on;
+    # that fact is collected into ``required_facts`` so the caller can fail-closed when the inner
+    # aggregate is on an UNRELATED table (ordering it by the calendar would not propagate). Defaults
+    # to None, in which case every caption flows through ``resolver`` exactly as before (byte-identical).
     parts = []
     for item in order_by:
         if isinstance(item, (tuple, list)):
@@ -1714,11 +1739,17 @@ def _orderby_clause(order_by, resolver, tables_used):
             cap, direction = item, "ASC"
         if direction not in ("ASC", "DESC"):
             raise _CalcError(f"invalid sort direction {direction!r}")
-        resolved = resolver(cap)
-        if resolved is None:
-            raise _CalcError(f"unresolved/ambiguous order-by field [{cap}]")
-        table, col, _ty = resolved
-        tables_used.add(table)
+        redirected = order_resolver(cap) if order_resolver else None
+        if redirected is not None:
+            table, col = redirected[0], redirected[1]  # trusted redirect: do NOT add to tables_used
+            if required_facts is not None and len(redirected) > 3 and redirected[3]:
+                required_facts.add(redirected[3])
+        else:
+            resolved = resolver(cap)
+            if resolved is None:
+                raise _CalcError(f"unresolved/ambiguous order-by field [{cap}]")
+            table, col, _ty = resolved
+            tables_used.add(table)
         parts.append(f"{_dax_table(table)}{_dax_col(col)}, {direction}")
     if not parts:
         return None
@@ -1732,16 +1763,26 @@ def _order_captions(order_by):
     return [item[0] if isinstance(item, (tuple, list)) else item for item in order_by]
 
 
-def _resolve_refs(captions, resolver, tables_used):
+def _resolve_refs(captions, resolver, tables_used, order_resolver=None, required_facts=None):
     # Resolve a list of field captions to raw ``'Table'[Column]`` DAX references (recording each
-    # home table in ``tables_used``); raises on any unresolved/ambiguous caption.
+    # home table in ``tables_used``); raises on any unresolved/ambiguous caption. ``order_resolver``
+    # (optional) is the same TRUSTED addressing redirect as in ``_orderby_clause``: a redirected
+    # column is emitted but its table is NOT recorded in ``tables_used`` (a related addressing
+    # dimension, not a cross-table term), and its required FACT (4th tuple element) is collected into
+    # ``required_facts``. Defaults to None -> byte-identical resolver-only behavior.
     refs = []
     for cap in captions:
-        resolved = resolver(cap)
-        if resolved is None:
-            raise _CalcError(f"unresolved/ambiguous field [{cap}]")
-        table, col, _ty = resolved
-        tables_used.add(table)
+        redirected = order_resolver(cap) if order_resolver else None
+        if redirected is not None:
+            table, col = redirected[0], redirected[1]  # trusted redirect: do NOT add to tables_used
+            if required_facts is not None and len(redirected) > 3 and redirected[3]:
+                required_facts.add(redirected[3])
+        else:
+            resolved = resolver(cap)
+            if resolved is None:
+                raise _CalcError(f"unresolved/ambiguous field [{cap}]")
+            table, col, _ty = resolved
+            tables_used.add(table)
         refs.append(f"{_dax_table(table)}{_dax_col(col)}")
     return refs
 
@@ -1919,7 +1960,7 @@ def _emit_table_calc(name, p, spec):
 
 
 def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), order_by=(),
-                                        known_tables=None):
+                                        known_tables=None, order_resolver=None):
     """Translate a Tableau TABLE CALCULATION to a modern-DAX window-function measure.
 
     Same (dax|None, reason, tables_used) shape as the other entry points, plus the explicit
@@ -1959,6 +2000,7 @@ def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), orde
     than one table) fall back, consistent with the measure path.
     """
     tables_used = set()
+    required_facts = set()
     f = (formula or "").strip()
     if not f:
         return None, "empty formula", tables_used
@@ -1976,12 +2018,15 @@ def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), orde
             # + restrict to the current partition), not the ORDERBY/PARTITIONBY window spec -- their
             # value is independent of the addressing sort. order_by supplies the addressing dim(s).
             part_refs = _resolve_refs(partition_by, resolver, tables_used)
-            addr_refs = _resolve_refs(_order_captions(order_by), resolver, tables_used)
+            addr_refs = _resolve_refs(_order_captions(order_by), resolver, tables_used,
+                                      order_resolver=order_resolver, required_facts=required_facts)
             if not addr_refs:
                 return None, "table calc requires an explicit order-by spec", tables_used
             dax = _emit_rank(name, p, part_refs + addr_refs, part_refs)
         else:
-            order_clause = _orderby_clause(order_by, resolver, tables_used)
+            order_clause = _orderby_clause(order_by, resolver, tables_used,
+                                           order_resolver=order_resolver,
+                                           required_facts=required_facts)
             if order_clause is None:
                 return None, "table calc requires an explicit order-by spec", tables_used
             part_clause = _partitionby_clause(partition_by, resolver, tables_used)
@@ -1991,6 +2036,9 @@ def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), orde
             raise _CalcError("unexpected trailing tokens after table calculation")
         if len(tables_used) > 1:
             return None, "cross-table terms (fields span multiple tables)", tables_used
+        guard = _addressing_fact_guard(tables_used, required_facts)
+        if guard:
+            return None, guard, tables_used
         leak = validate_dax(dax)
         if leak:
             return None, f"emit guardrail: {leak}", tables_used
@@ -2000,7 +2048,7 @@ def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), orde
 
 
 def translate_percent_diff_to_dax(base_formula, resolver, partition_by=(), order_by=(),
-                                  known_tables=None):
+                                  known_tables=None, order_resolver=None):
     """Translate a *percent-difference-from-the-previous-row* quick table calc to faithful DAX.
 
     Tableau's percent-difference-from-prior over a base aggregate ``X`` is
@@ -2020,6 +2068,7 @@ def translate_percent_diff_to_dax(base_formula, resolver, partition_by=(), order
     ``(dax|None, reason, tables_used)`` shape as the other entry points; an order spec is REQUIRED.
     """
     tables_used = set()
+    required_facts = set()
     f = (base_formula or "").strip()
     if not f:
         return None, "empty base formula", tables_used
@@ -2031,13 +2080,17 @@ def translate_percent_diff_to_dax(base_formula, resolver, partition_by=(), order
             raise _CalcError("unexpected trailing tokens after percent-difference base aggregate")
         if inner[1] != "number":
             return None, "percent difference requires a numeric base aggregate", tables_used
-        order_clause = _orderby_clause(order_by, resolver, tables_used)
+        order_clause = _orderby_clause(order_by, resolver, tables_used,
+                                       order_resolver=order_resolver, required_facts=required_facts)
         if order_clause is None:
             return None, "percent difference requires an explicit order-by spec", tables_used
         part_clause = _partitionby_clause(partition_by, resolver, tables_used)
         spec = order_clause if part_clause is None else f"{order_clause}, {part_clause}"
         if len(tables_used) > 1:
             return None, "cross-table terms (fields span multiple tables)", tables_used
+        guard = _addressing_fact_guard(tables_used, required_facts)
+        if guard:
+            return None, guard, tables_used
         prev = f"CALCULATE({inner[0]}, OFFSET(-1, {spec}))"
         dax = f"DIVIDE(({inner[0]}) - {prev}, ABS({prev}))"
         leak = validate_dax(dax)

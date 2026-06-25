@@ -15,6 +15,9 @@ from twb_to_pbir import (
     PAGE_HEIGHT,
     PAGE_WIDTH,
     SCHEMA_VISUAL_FP,
+    _norm_param_key,
+    _reconcile_caption_fallback,
+    _resolve_parameter_controls,
     build_field_parameter_page,
     emit_pbir,
     field_parameter_slicer,
@@ -993,6 +996,52 @@ def test_caption_fallback_when_no_datasource_metadata_warns():
     assert any("caption fallback" in x["reason"] for x in ir["warnings"])
 
 
+def test_reconcile_caption_fallback_drops_model_confirmed_keeps_unverified():
+    # the model build's field_map confirms 'Sales' but not 'Widget'
+    covered = {"scope": "worksheet", "name": "S1",
+               "reason": "manual attention required: field 'Sales' bound by caption fallback "
+                         "(no datasource metadata); verify it matches model table/column names",
+               "caption_fallback": "Sales"}
+    uncovered = {"scope": "worksheet", "name": "S2",
+                 "reason": "manual attention required: field 'Widget' bound by caption fallback "
+                           "(no datasource metadata); verify it matches model table/column names",
+                 "caption_fallback": "Widget"}
+    other = {"scope": "worksheet", "name": "S3",
+             "reason": "manual attention required: something unrelated"}
+    out = _reconcile_caption_fallback([covered, uncovered, other],
+                                      {"Sales": {"entity": "Orders", "property": "Sales"}})
+    reasons = [w["reason"] for w in out]
+    # the model-confirmed caption's advisory is dropped (it is no longer true)
+    assert not any("'Sales' bound by caption fallback" in r for r in reasons)
+    # the unverified caption's advisory is kept (genuinely unconfirmed)
+    assert any("'Widget' bound by caption fallback" in r for r in reasons)
+    # an unrelated warning is untouched
+    assert any("something unrelated" in r for r in reasons)
+    # the internal marker never leaks into the surfaced warnings
+    assert all("caption_fallback" not in w for w in out)
+
+
+def test_caption_fallback_warning_cleared_when_field_map_confirms_binding():
+    # workbook WITHOUT a <datasources> metadata tree -> Sales + Category fall back to caption
+    wb = ("<?xml version='1.0' encoding='utf-8' ?>\n<workbook><worksheets>"
+          + _worksheet("Bare", "Bar",
+                       rows="[federated.abc].[sum:Sales:qk]",
+                       cols="[federated.abc].[none:Category:nk]",
+                       deps_extra=_INST)
+          + "</worksheets></workbook>")
+    # the model build's metadata-confirmed naming (field_map) covers Sales but not Category
+    fm = {"Sales": {"entity": "Orders", "property": "Sales", "binding": "aggregation"}}
+    res = migrate_twb_to_pbir(wb, dataset_name="Superstore", field_map=fm)
+    reasons = [w["reason"] for w in res["warnings"]]
+    # Sales is model-confirmed -> its stale caption-fallback advisory is gone
+    assert not any("'Sales' bound by caption fallback" in r for r in reasons)
+    # Category is NOT in field_map -> its caption-fallback advisory persists (warn-never-wrong)
+    assert any("'Category' bound by caption fallback" in r for r in reasons)
+    # the emitted Sales projection is bound to the model table the field_map named
+    blob = "\n".join(res["parts"].values())
+    assert '"Entity": "Orders"' in blob and '"Property": "Sales"' in blob
+
+
 # -- PBIR report structure -----------------------------------------------------
 def test_emitted_pbir_has_required_report_scaffold():
     ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
@@ -1197,6 +1246,63 @@ def test_candidate_records_are_additive_and_do_not_alter_pbir_parts():
     assert "candidate_records" not in blob
     assert not any("candidate" in path.lower() for path in res["parts"])
     assert res["ir"]["candidate_records"] == res["candidate_records"]
+
+
+def test_candidate_record_field_aliases_map_emitted_ref_to_source_tableau_caption():
+    # star-schema-remodel rename guard: per emitted ref the oracle reads in ``fields``, carry the
+    # SOURCE Tableau caption so a NAME-based structural compare can see through the remodel
+    # (Tableau ``Sales`` lands as the emitted ``Sum(Orders.Sales_Amount)``; ``Category`` as the
+    # table-qualified ``Orders.Category``).
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    res = migrate_twb_to_pbir(_workbook(ws))
+    r = res["candidate_records"][0]
+    aliases = r["field_aliases"]
+    assert aliases["Sum(Orders.Sales_Amount)"] == "Sales"
+    assert aliases["Orders.Category"] == "Category"
+    # keyed EXACTLY by the refs the oracle reads in ``fields`` (1:1 alignment, no stray keys)
+    refs = {ref for role in r["fields"].values() for ref in role}
+    assert set(aliases) <= refs
+
+
+def test_field_aliases_never_written_into_emitted_pbir_parts():
+    # the alias sidecar lives only on the candidate record, never in the emitted PBIR definition
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    res = migrate_twb_to_pbir(_workbook(ws))
+    assert res["candidate_records"][0].get("field_aliases")  # present on the record
+    blob = "\n".join(res["parts"].values())
+    assert "field_aliases" not in blob
+
+
+def test_field_alias_map_unit_maps_ref_to_caption_and_tolerates_no_model_table():
+    # the helper maps every bound field's emitted ref -> its Tableau caption; with no model_table /
+    # field_map it falls back to the field's own entity but still records the caption alias.
+    from twb_to_pbir import _field_alias_map
+    ws = {"name": "W",
+          "rows": [{"caption": "Sales", "entity": "Q", "property": "Sales_Amount",
+                    "binding": "aggregation", "aggregation": "Sum"}],
+          "cols": [{"caption": "Order Date", "entity": "Q", "property": "Order_Date",
+                    "binding": "column"}],
+          "encodings": {"color": {"caption": "Segment", "entity": "Q", "property": "Segment",
+                                  "binding": "column"}}}
+    amap = _field_alias_map(ws, "Orders", None)
+    assert amap["Sum(Orders.Sales_Amount)"] == "Sales"
+    assert amap["Orders.Order_Date"] == "Order Date"
+    assert amap["Orders.Segment"] == "Segment"
+
+
+def test_field_alias_map_maps_star_schema_date_rebind_back_to_source_caption():
+    # the headline COMCAST remodel: a continuous-date axis rebound to the marked Date dimension
+    # emits ``Date.Date`` but the Tableau source is ``Order Date`` -- the alias resolves that exact
+    # field-NAME divergence so a name-based structural compare reads the visual as faithful.
+    from twb_to_pbir import _field_alias_map
+    ws = {"name": "Line chart", "rows": [],
+          "cols": [{"caption": "Order Date", "entity": "Date", "property": "Date",
+                    "binding": "column", "date_rebound": True}],
+          "encodings": {}}
+    assert _field_alias_map(ws, "Orders", None) == {"Date.Date": "Order Date"}
 
 
 def test_parse_accepts_utf8_bom_bytes():
@@ -1973,6 +2079,91 @@ def test_parameter_control_unknown_param_falls_back_to_id():
     assert pcs[0]["datatype"] is None
     assert any("parameter control 'Parameter 9999 Missing'" in w["reason"]
                for w in ir["warnings"])
+
+
+def test_norm_param_key_strips_brackets_space_and_casefolds():
+    # The model build keys param_binding slicers WITH brackets ([Parameter 001...]); a dashboard
+    # paramctrl zone yields the bracket-stripped id. Normalization must bridge the two forms.
+    assert _norm_param_key("[Parameter 0014172372426784]") == "parameter 0014172372426784"
+    assert _norm_param_key("Parameter 0014172372426784") == "parameter 0014172372426784"
+    assert _norm_param_key("  [ParaM 1] ") == "param 1"
+    assert _norm_param_key(None) == ""
+
+
+def test_parameter_control_resolved_by_param_binding_emits_slicer_and_clears_warning():
+    # When the model build identifies the parameter's target column (param_binding["slicers"]), the
+    # dashboard parameter control is rebuilt as a single-select slicer at its OWN zone and its
+    # "not rebuilt as a slicer yet" warning is cleared -- even though the model keys the slicer WITH
+    # brackets ([Parameter 1]) while the control id is bracket-stripped (Parameter 1).
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Dash'><zones>"
+            "<zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='60000' x='0' y='0' name='Sales by Category' id='2' />"
+            + _paramctrl_zone("Parameter 1") +
+            "</zone></zones></dashboard>")
+    pb = {"slicers": {"[Parameter 1]": {"table": "Orders", "column": "Segment",
+                                        "single_select": True, "caption": "view swap"}},
+          "flags": {}}
+    ir = parse_twb(_workbook_with_params(ws, dash), param_binding=pb)
+
+    rec = ir["parameter_controls"][0]
+    assert rec["resolved"] == {"table": "Orders", "column": "Segment",
+                               "single_select": True, "caption": "view swap"}
+    # the standing per-control warning is cleared for a resolved control (no longer "not rebuilt")
+    assert not [w for w in ir["warnings"] if "parameter control 'view swap'" in w["reason"]]
+
+    parts = _visual_parts(emit_pbir(ir))
+    slicers = [v for v in parts.values() if v["visual"]["visualType"] == "slicer"]
+    assert len(slicers) == 1
+    proj = slicers[0]["visual"]["query"]["queryState"]["Values"]["projections"][0]
+    assert proj["queryRef"] == "Orders.Segment"
+
+
+def test_parameter_control_not_in_binding_still_warns_and_emits_no_slicer():
+    # A control the model did NOT resolve keeps its honest warning and is not rebuilt (warn-never-wrong):
+    # an unrelated slicer binding must never bind a different control.
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Dash'><zones>"
+            "<zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='60000' x='0' y='0' name='Sales by Category' id='2' />"
+            + _paramctrl_zone("Parameter 1") +
+            "</zone></zones></dashboard>")
+    pb = {"slicers": {"[Parameter 9999]": {"table": "Orders", "column": "Region",
+                                           "single_select": True}}, "flags": {}}
+    ir = parse_twb(_workbook_with_params(ws, dash), param_binding=pb)
+
+    assert "resolved" not in ir["parameter_controls"][0]
+    assert [w for w in ir["warnings"] if "parameter control 'view swap'" in w["reason"]]
+    parts = _visual_parts(emit_pbir(ir))
+    assert [v for v in parts.values() if v["visual"]["visualType"] == "slicer"] == []
+
+
+def test_migrate_twb_to_pbir_accepts_param_binding_and_places_slicer_in_dashboard_zone():
+    # End-to-end through the one-call entry: a resolved control's slicer lands on the dashboard page
+    # scaled into the page frame (so it sits where the Tableau control was, not off-canvas).
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Dash'><zones>"
+            "<zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='60000' x='0' y='0' name='Sales by Category' id='2' />"
+            + _paramctrl_zone("Parameter 1", x=80000, y=10000) +
+            "</zone></zones></dashboard>")
+    pb = {"slicers": {"[Parameter 1]": {"table": "Orders", "column": "Segment",
+                                        "single_select": True, "caption": "view swap"}}}
+    res = migrate_twb_to_pbir(_workbook_with_params(ws, dash), param_binding=pb)
+    slicer_parts = [k for k in res["parts"] if "/paramslicer-" in k]
+    assert len(slicer_parts) == 1
+    v = json.loads(res["parts"][slicer_parts[0]])
+    assert v["visual"]["visualType"] == "slicer"
+    # placed within the page frame (x scaled from the ~0.8 fractional zone position)
+    pos = v["position"]
+    assert 0 <= pos["x"] <= PAGE_WIDTH and 0 <= pos["y"] <= PAGE_HEIGHT
+    assert pos["x"] > PAGE_WIDTH / 2  # the control was on the right (x=80000 of 100000)
 
 
 # -- multi-datasource: each field binds to its own relation --------------------

@@ -185,7 +185,51 @@ def _calc_lookup_from(calcs):
     return lookup
 
 
-def _table_calc_measures(usages, resolve, known_tables, consumed_lower, base_formula_lookup=None):
+def _date_axis_order_resolver(resolve, date_table, active_date_cols, date_key="Date"):
+    """Build a TRUSTED ORDERBY-only addressing redirect for positional table-calc measures.
+
+    A positional table calc (LOOKUP/OFFSET/WINDOW/percent-difference) orders by the worksheet's
+    continuous-date axis pill, whose caption resolves through ``resolve`` to the FACT date column
+    (e.g. ``Orders[Order_Date]``). The rebuilt visual, however, groups that axis on the marked
+    calendar KEY of the generated Date dimension (``Date[Date]`` -- see ``twb_to_pbir`` date
+    binding), so the faithful ORDERBY walks the SAME marks as the visual only when it sorts on
+    ``Date[Date]`` (previous-MARK = previous data-date on a data-dates-only categorical axis).
+
+    Returns a ``resolver(caption) -> (date_table, date_key, type, source_fact) | None`` that
+    redirects EXACTLY the captions resolving to an ACTIVE fact date column -- the ``(table, column)``
+    pairs in ``active_date_cols`` (the ``is_active`` side of the Date relationships) -- and returns
+    None for every other caption so the normal resolver handles it unchanged. The 4th tuple element
+    is the FACT table the caption originally resolved to (e.g. ``Orders``): the calc compiler collects
+    it as the ``required_facts`` the redirect depends on, so it can fail-closed when the inner
+    aggregate is on an UNRELATED table (whose order would not propagate through the Date relationship).
+    Returns ``None`` (no redirect) when there is no Date dimension or no active date column, making the
+    no-date-dimension path byte-for-byte identical. The redirect is ORDERBY-only: the inner aggregate
+    and the partition still resolve to the fact table, and because the Date dimension relates to the
+    fact, the window's date order propagates to the aggregate through that relationship -- valid DAX
+    whose addressing dimension is deliberately exempt from the single-table guard.
+    """
+    if not date_table or not active_date_cols:
+        return None
+    active = {((t or "").strip().lower(), (c or "").strip().lower())
+              for (t, c) in active_date_cols}
+    if not active:
+        return None
+
+    def _order_resolver(caption):
+        resolved = resolve(caption)
+        if not resolved:
+            return None
+        table, col = resolved[0], resolved[1]
+        ty = resolved[2] if len(resolved) > 2 else "dateTime"
+        if ((table or "").strip().lower(), (col or "").strip().lower()) in active:
+            return (date_table, date_key, ty, table)
+        return None
+
+    return _order_resolver
+
+
+def _table_calc_measures(usages, resolve, known_tables, consumed_lower, base_formula_lookup=None,
+                         order_resolver=None):
     """Translate workbook table-calc *usages* into named ``_Measures`` measure rows.
 
     A table calc carries the addressing (Compute-Using partition + order) the plain measure path
@@ -220,7 +264,8 @@ def _table_calc_measures(usages, resolve, known_tables, consumed_lower, base_for
         if kind != "quick" and caption.lower() in consumed_lower:
             continue
         t = translate_table_calc_usage(usage, resolve, known_tables=known_tables,
-                                       base_formula_lookup=base_formula_lookup)
+                                       base_formula_lookup=base_formula_lookup,
+                                       order_resolver=order_resolver)
         if t.status != "translated":
             continue
         seen.add(key)
@@ -294,7 +339,7 @@ def _referencing_usage(usages, name, internal_name):
 
 
 def _forced_percent_diff_measures(calcs, usages, resolve, known_tables, consumed_lower,
-                                  superseded, base_formula_lookup=None):
+                                  superseded, base_formula_lookup=None, order_resolver=None):
     """Force-translate UNPLACED percent-difference measure calcs into named ``_Measures`` rows.
 
     A percent-difference measure authored as a named calc but never dropped on a shelf (the pilot's
@@ -338,7 +383,8 @@ def _forced_percent_diff_measures(calcs, usages, resolve, known_tables, consumed
             continue  # no placed consumer to lend a window -> stays a (faithful) stub.
         dax, _reason, order_by, partition_by = translate_unplaced_percent_diff(
             formula, consumer, resolve, known_tables=known_tables,
-            base_formula_lookup=base_formula_lookup, calc_tokens=calc_tokens)
+            base_formula_lookup=base_formula_lookup, calc_tokens=calc_tokens,
+            order_resolver=order_resolver)
         if dax is None:
             continue  # inherited window did not translate -> fail-closed to the plain stub.
         ws = getattr(consumer, "worksheet", None)
@@ -374,7 +420,7 @@ def _forced_percent_diff_measures(calcs, usages, resolve, known_tables, consumed
 
 def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    calc_lookup=None, approved_calc_dax=None, synth_measures=None,
-                   known_tables=None, table_calc_usages=None):
+                   known_tables=None, table_calc_usages=None, order_resolver=None):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
     ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
@@ -432,14 +478,14 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             base_formula_lookup[tid] = formula
     tablecalc_rows, superseded = _table_calc_measures(
         table_calc_usages, resolve, known_tables, consumed_lower,
-        base_formula_lookup=base_formula_lookup)
+        base_formula_lookup=base_formula_lookup, order_resolver=order_resolver)
     # Force-translate UNPLACED percent-difference calcs (referenced only inside a colour rule /
     # tooltip) by inheriting a window from their placed consumer. These are emitted alongside the
     # addressed table-calc measures and likewise SUPERSEDE their addressing-less plain stub. Inert
     # (``[]``/empty) when no such calc exists, so the plain path is byte-for-byte unchanged.
     forced_rows, forced = _forced_percent_diff_measures(
         calcs, table_calc_usages, resolve, known_tables, consumed_lower, superseded,
-        base_formula_lookup=base_formula_lookup)
+        base_formula_lookup=base_formula_lookup, order_resolver=order_resolver)
     tablecalc_rows = tablecalc_rows + forced_rows
     superseded = superseded | forced
     for r in tablecalc_rows:
@@ -1532,7 +1578,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         calcs, resolve, consumed=consumed, param_resolver=param_resolver,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
         approved_calc_dax=approved_calc_dax, synth_measures=fp.get("measures"),
-        known_tables=set(table_names), table_calc_usages=table_calc_usages)
+        known_tables=set(table_names), table_calc_usages=table_calc_usages,
+        order_resolver=_date_axis_order_resolver(resolve, date_name, active_date_cols))
     parts["definition/tables/_Measures.tmdl"] = measures_table
     table_names.append("_Measures")
 

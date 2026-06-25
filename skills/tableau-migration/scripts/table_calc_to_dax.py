@@ -497,7 +497,8 @@ def _inline_refs_in_expr(expr, base_formula_lookup):
 
 
 def translate_unplaced_percent_diff(calc_formula, consumer_usage, resolver,
-                                    known_tables=None, base_formula_lookup=None, calc_tokens=()):
+                                    known_tables=None, base_formula_lookup=None, calc_tokens=(),
+                                    order_resolver=None):
     """Force-translate an UNPLACED percent-difference measure calc by inheriting addressing from a
     PLACED consumer usage that references it.
 
@@ -521,14 +522,15 @@ def translate_unplaced_percent_diff(calc_formula, consumer_usage, resolver,
     if reason is not None:
         return None, reason, (), ()
     dax, seam_reason, _tables = translate_percent_diff_to_dax(
-        base, resolver, partition_by=partition_by, order_by=order_by, known_tables=known_tables)
+        base, resolver, partition_by=partition_by, order_by=order_by, known_tables=known_tables,
+        order_resolver=order_resolver)
     if dax is None:
         return None, f"percent-difference seam fallback: {seam_reason}", order_by, partition_by
     return dax, None, order_by, partition_by
 
 
 def translate_table_calc_usage(usage, resolver, known_tables=None,
-                               base_formula_lookup=None) -> TableCalcTranslation:
+                               base_formula_lookup=None, order_resolver=None) -> TableCalcTranslation:
     """Map one :class:`TableCalcUsage` to faithful DAX or a structured Tier-1 handoff.
 
     ``resolver(caption) -> (table, column, type) | None`` is the same field resolver the rest of
@@ -537,6 +539,10 @@ def translate_table_calc_usage(usage, resolver, known_tables=None,
     resolves to ``COUNTROWS('<Table>')`` only when ``<Table>`` is a real model table.
     ``base_formula_lookup`` (``{calc-id/caption(lower) -> formula}``) lets a percent-difference quick
     table calc inline the formula of the NAMED calc it is computed over (e.g. ``[count orders]+100``).
+    ``order_resolver`` (optional) is a TRUSTED ORDERBY-only addressing redirect (e.g. a continuous
+    date axis -> the marked-calendar key ``Date[Date]`` on a related Date dimension); it only
+    affects the addressing sort, never the inner aggregate or partition, and defaults to None for
+    byte-identical output.
     """
     intent = _intent_for(usage)
 
@@ -559,7 +565,7 @@ def translate_table_calc_usage(usage, resolver, known_tables=None,
             return _handoff(usage, intent, reason)
         dax, seam_reason, _tables = translate_percent_diff_to_dax(
             base, resolver, partition_by=partition_by, order_by=order_by,
-            known_tables=known_tables)
+            known_tables=known_tables, order_resolver=order_resolver)
         if dax is None:
             return _handoff(usage, intent, f"percent-difference seam fallback: {seam_reason}")
         return TableCalcTranslation(
@@ -587,7 +593,7 @@ def translate_table_calc_usage(usage, resolver, known_tables=None,
     # 4) hand the synthesized formula + explicit addressing to the trusted window seam.
     dax, seam_reason, _tables = translate_tableau_table_calc_to_dax(
         formula, resolver, partition_by=partition_by, order_by=order_by,
-        known_tables=known_tables)
+        known_tables=known_tables, order_resolver=order_resolver)
     if dax is None:
         return _handoff(usage, intent, f"window seam fallback: {seam_reason}")
     return TableCalcTranslation(
@@ -597,7 +603,8 @@ def translate_table_calc_usage(usage, resolver, known_tables=None,
 
 
 def translate_table_calc_usages(usages, resolver, known_tables=None,
-                                base_formula_lookup=None) -> List[TableCalcTranslation]:
+                                base_formula_lookup=None, order_resolver=None) -> List[TableCalcTranslation]:
     """Batch :func:`translate_table_calc_usage` over an iterable of usages."""
     return [translate_table_calc_usage(u, resolver, known_tables=known_tables,
-                                       base_formula_lookup=base_formula_lookup) for u in usages]
+                                       base_formula_lookup=base_formula_lookup,
+                                       order_resolver=order_resolver) for u in usages]

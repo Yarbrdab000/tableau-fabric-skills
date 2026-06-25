@@ -712,10 +712,12 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
         entity, prop = MEASURES_TABLE, caption
     else:
         entity, prop = ds_caption.get(ds, ds), clean_col(caption)
-        warnings.append(_warn(
+        _wcf = _warn(
             "worksheet", worksheet,
             f"field '{caption}' bound by caption fallback (no datasource metadata); "
-            f"verify it matches model table/column names"))
+            f"verify it matches model table/column names")
+        _wcf["caption_fallback"] = caption
+        warnings.append(_wcf)
 
     field = {
         "caption": caption, "field_id": base_id, "instance": field_id,
@@ -2036,30 +2038,58 @@ def _warn(scope, name, reason):
             "reason": "manual attention required: " + reason}
 
 
-def _resolve_parameter_controls(dashboards, params, warnings):
-    """Resolve each dashboard's captured parameter-control zones to a fidelity record + warning.
+def _norm_param_key(key):
+    """Normalize a parameter id so the model<->viz seam joins regardless of bracket spelling.
+
+    The model build keys ``param_binding["slicers"]`` by a parameter's internal name *with* brackets
+    (``[Parameter 0014172372426784]``); a dashboard parameter-control zone yields the bracket-stripped
+    id (``Parameter 0014172372426784``). Strip brackets + surrounding space and casefold so the two
+    forms match.
+    """
+    return (key or "").strip().strip("[]").strip().lower()
+
+
+def _resolve_parameter_controls(dashboards, params, warnings, param_binding=None):
+    """Resolve each dashboard's captured parameter-control zones to a fidelity record (+ slicer/warn).
 
     A dashboard parameter control (the "hamburger" on the canvas) hosts a Tableau parameter; Tier-1
-    rebuilds it as a slicer only once the migrated model identifies the parameter's target column or
-    measure (its kind + bound object). Until that binding is available this records the control
-    additively (``ir["parameter_controls"]``) and emits one honest per-control warning so the report
-    never silently loses it (warn-never-wrong). The parameter caption/datatype come from
+    rebuilds it as a slicer once the migrated model identifies the parameter's target column (passed
+    in ``param_binding["slicers"]``, keyed by parameter id, bracket-insensitive). When the model
+    resolved the target, the control's record carries a ``resolved`` ``{table, column, single_select,
+    caption}`` binding and :func:`emit_pbir` emits a real single-select slicer at the control's
+    dashboard zone -- no warning. Until that binding is available the control is still recorded
+    additively (``ir["parameter_controls"]``) with one honest per-control warning so the report never
+    silently loses it (warn-never-wrong). The parameter caption/datatype come from
     :func:`_parse_parameters`; the id is the bracket-stripped ``[Parameters].[<id>]`` reference.
     """
+    slicers = {}
+    for k, v in ((param_binding or {}).get("slicers") or {}).items():
+        if isinstance(v, dict) and v.get("table") and v.get("column"):
+            slicers[_norm_param_key(k)] = v
     records = []
     for db in dashboards:
         for pc in db.get("param_controls", []):
             pid = pc["param_id"]
             meta = params.get(pid) or {}
             caption = meta.get("caption") or pid
-            records.append({
+            rec = {
                 "param_id": pid,
                 "caption": caption,
                 "datatype": meta.get("datatype") or None,
                 "dashboard": db.get("name"),
                 "position": {"x": pc.get("x"), "y": pc.get("y"),
                              "w": pc.get("w"), "h": pc.get("h")},
-            })
+            }
+            bound = slicers.get(_norm_param_key(pid))
+            if bound:
+                rec["resolved"] = {
+                    "table": bound["table"], "column": bound["column"],
+                    "single_select": bool(bound.get("single_select", True)),
+                    "caption": bound.get("caption") or caption,
+                }
+                records.append(rec)
+                continue
+            records.append(rec)
             warnings.append(_warn(
                 "dashboard", db.get("name"),
                 f"parameter control '{caption}' not rebuilt as a slicer yet -> emit once the "
@@ -2162,7 +2192,8 @@ def _detect_sheet_swaps(worksheets, dashboards, params, warnings):
     return swaps
 
 
-def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_binding=None):
+def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_binding=None,
+              param_binding=None):
     """Parse a Tableau ``.twb`` (workbook XML) into the normalized viz IR.
 
     Accepts ``str`` or ``bytes``; ``.twb`` files carry a UTF-8 BOM, so callers reading from
@@ -2210,7 +2241,7 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
         dashboards.append(parsed)
 
     params = _parse_parameters(root)
-    parameter_controls = _resolve_parameter_controls(dashboards, params, warnings)
+    parameter_controls = _resolve_parameter_controls(dashboards, params, warnings, param_binding)
     sheet_swaps = _detect_sheet_swaps(worksheets, dashboards, params, warnings)
 
     return {"worksheets": worksheets, "dashboards": dashboards,
@@ -2684,9 +2715,40 @@ def _visual_field_summary(query_state):
     return out
 
 
-def _candidate_record(page_name, vname, ws, vtype, state, position, page_display=None):
+def _field_alias_map(ws, model_table, field_map):
+    """``{emitted_queryRef: source_tableau_caption}`` for every field the worksheet binds.
+
+    A star-schema remodel RENAMES the source as it lands (``Order Date`` -> ``Date.Date``, an
+    implicit ``COUNT(Orders)`` -> ``_Measures.count orders``), so a NAME-based structural compare
+    UNDER-reports a pixel-faithful visual -- the visual is right, only the field labels differ. This
+    additive map (carried on the candidate record, never written into the emitted PBIR) lets a
+    rename-aware verifier align its Tableau-side field names to our emitted refs. Built with the SAME
+    ``_field_expression`` the projections use, so the refs match what ``_visual_field_summary``
+    reports; purely read-only (never mutates ``ws`` or the query state)."""
+    out = {}
+    fields = list(ws.get("rows") or []) + list(ws.get("cols") or [])
+    enc = ws.get("encodings") or {}
+    for key in ("color", "size", "label", "detail", "angle"):
+        f = enc.get(key)
+        if isinstance(f, dict):
+            fields.append(f)
+    for f in fields:
+        if not isinstance(f, dict) or not f.get("caption"):
+            continue
+        try:
+            _, qref, _ = _field_expression(f, model_table, field_map)
+        except Exception:
+            continue
+        if qref and qref not in out:
+            out[qref] = f["caption"]
+    return out
+
+
+def _candidate_record(page_name, vname, ws, vtype, state, position, page_display=None,
+                      model_table=None, field_map=None):
     candidates, confidence, hack = _candidate_plan(ws["visual_type"], vtype)
-    return {
+    fields = _visual_field_summary(state)
+    rec = {
         "page": page_name,
         "page_display": page_display or page_name,
         "visual": vname,
@@ -2695,9 +2757,23 @@ def _candidate_record(page_name, vname, ws, vtype, state, position, page_display
         "candidates": candidates,
         "confidence": confidence,
         "hack": hack,
-        "fields": _visual_field_summary(state),
+        "fields": fields,
         "position": position,
     }
+    # Rename-alias sidecar: map each emitted ref the oracle reads in ``fields`` back to its source
+    # Tableau caption, so a name-based compare can see through a star-schema remodel. Keyed by the
+    # EXACT ref (dedup suffix " 2" tolerated on lookup). Additive; only present when it carries info.
+    aliases = _field_alias_map(ws, model_table, field_map)
+    if aliases:
+        aligned = {}
+        for refs in fields.values():
+            for ref in refs:
+                cap = aliases.get(ref) or aliases.get(re.sub(r" \d+$", "", ref))
+                if cap:
+                    aligned[ref] = cap
+        if aligned:
+            rec["field_aliases"] = aligned
+    return rec
 
 
 # -- PBIR JSON part assembly ---------------------------------------------------
@@ -3316,11 +3392,14 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 title=ws.get("title"), axis_titles=ws.get("axis_titles"),
                 value_objects=value_objects))
             rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
-                                    page_display=db["name"] or page_name)
+                                    page_display=db["name"] or page_name,
+                                    model_table=model_table, field_map=field_map)
             if cf_fact:
                 rec["conditional_format"] = cf_fact
             records.append(rec)
         visuals += _emit_slicers(page_ws, page_name, model_table, field_map, warnings)
+        visuals += _emit_param_control_slicers(
+            ir.get("parameter_controls", []), db["name"], page_name, ref_w, ref_h, warnings)
         if not visuals:
             warnings.append(_warn("dashboard", db["name"],
                                   "no supported visuals on this dashboard"))
@@ -3349,7 +3428,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             title=ws.get("title"), axis_titles=ws.get("axis_titles"),
             value_objects=value_objects)
         rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
-                                page_display=ws["name"])
+                                page_display=ws["name"],
+                                model_table=model_table, field_map=field_map)
         if cf_fact:
             rec["conditional_format"] = cf_fact
         records.append(rec)
@@ -3364,8 +3444,32 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     })
 
     ir.setdefault("warnings", []).extend(warnings)
+    ir["warnings"] = _reconcile_caption_fallback(ir["warnings"], field_map)
     ir["candidate_records"] = records
     return parts
+
+
+def _reconcile_caption_fallback(warnings, field_map):
+    """Drop caption-fallback warnings the model build's ``field_map`` actually rebinds.
+
+    A parse-time caption-fallback warning (the workbook's embedded datasource carried no
+    ``<metadata-record class='column'>`` for the field, so ``_resolve_field`` fell back to the
+    datasource caption + ``clean_col(caption)``) is OBSOLETE once ``field_map`` -- the model
+    build's metadata-confirmed naming -- contains that caption: ``_apply_override`` then binds the
+    projection to the real model table/column, so the "verify it matches model table/column names"
+    advisory no longer applies (the model already confirmed it). Captions NOT in ``field_map`` keep
+    their warning (genuinely unverified). The internal ``caption_fallback`` marker is always
+    stripped so it never surfaces in the report. Warn-never-wrong: this only ever REMOVES a
+    now-false advisory the model superseded, never masks a real one.
+    """
+    confirmed = set(field_map or ())
+    kept = []
+    for w in warnings:
+        cap = w.pop("caption_fallback", None) if isinstance(w, dict) else None
+        if cap is not None and cap in confirmed:
+            continue
+        kept.append(w)
+    return kept
 
 
 def _emit_slicers(ws_list, page_name, model_table, field_map, warnings=None):
@@ -3382,9 +3486,40 @@ def _emit_slicers(ws_list, page_name, model_table, field_map, warnings=None):
     return visuals
 
 
+def _emit_param_control_slicers(controls, db_name, page_name, ref_w, ref_h, warnings):
+    """Emit a single-select slicer for each model-resolved dashboard parameter control.
+
+    A parameter control whose target column the model build resolved (``rec["resolved"]`` attached by
+    :func:`_resolve_parameter_controls`) is rebuilt as an ordinary single-select slicer placed at the
+    control's own dashboard zone (scaled with the same frame as the worksheet zones). The binding is
+    already the authoritative model ``table[column]`` -- emitted directly (``model_table`` / ``field_map``
+    are not re-applied) so it never double-resolves. Unresolved controls keep their warning (emitted in
+    :func:`_resolve_parameter_controls`) and are skipped here, so this only ever ADDS a faithful slicer.
+    """
+    visuals = []
+    for i, pc in enumerate(controls):
+        if pc.get("dashboard") != db_name:
+            continue
+        res = pc.get("resolved")
+        if not res:
+            continue
+        pos = pc.get("position") or {}
+        if None in (pos.get("x"), pos.get("y"), pos.get("w"), pos.get("h")):
+            continue
+        x, y, w, h = _scale_zone(pos, ref_w, ref_h)
+        field = {"entity": res["table"], "property": res["column"], "binding": "column",
+                 "caption": res.get("caption") or res["column"], "aggregation": None,
+                 "selection": None, "range": None, "datatype": None}
+        vname = _sanitize(f"paramslicer-{page_name}-{i}-{res['column']}")
+        visuals.append(_slicer_json(
+            vname, field, _position(x, y, w, h, z=1, tab=200 + i),
+            None, None, warnings=warnings))
+    return visuals
+
+
 def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
                         model_table=None, field_map=None, date_binding=None,
-                        row_count_binding=None, measure_binding=None):
+                        row_count_binding=None, measure_binding=None, param_binding=None):
     """One-call convenience: parse ``.twb`` text and emit the PBIR parts.
 
     Returns ``{"ir": ..., "parts": ..., "warnings": ...}``. ``parts`` is the
@@ -3411,9 +3546,16 @@ def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
     translated is rebound to its named measure (deterministic, token-keyed; binds only for
     translated / assisted-approved measures) -- so a calc-driven value, a background colour-scale
     driver, etc. references the real measure. Without it, those pills degrade-and-warn unchanged.
+
+    ``param_binding`` (optional) carries the model build's resolved parameter targets --
+    ``{"slicers": {<param id>: {"table", "column", "single_select", "caption"}}, "flags": {...}}``.
+    When given, a dashboard parameter control whose target column the model identified is rebuilt as a
+    single-select slicer at the control's own dashboard zone (the standing "not rebuilt as a slicer
+    yet" warning is then cleared for that control). Controls the model did not resolve keep their
+    warning; without the binding every control degrades-and-warns unchanged (warn-never-wrong).
     """
     ir = parse_twb(xml_text, date_binding=date_binding, row_count_binding=row_count_binding,
-                   measure_binding=measure_binding)
+                   measure_binding=measure_binding, param_binding=param_binding)
     parts = emit_pbir(ir, dataset_name=dataset_name, report_name=report_name,
                       model_table=model_table, field_map=field_map)
     return {"ir": ir, "parts": parts, "warnings": ir["warnings"],
