@@ -78,12 +78,62 @@ def _format_string(tmdl_type, summarize):
         return "#,0.00"
     return None
 
-def generate_column_tmdl(col_name, tmdl_type, summarize, is_hidden):
-    """One column. col_name is the ACTUAL Delta column name (sourceColumn must match)."""
+# -- Tableau default-format decode --------------------------------------------
+# An author's explicit per-field number format is persisted by Tableau as a
+# ``default-format`` code on the logical ``<column>`` element, e.g.
+# ``default-format='c"$"#,##0;("$"#,##0)'``. These are Excel/.NET custom-format strings
+# carrying a 1-char type prefix. We decode them to a Power BI ``formatString`` so an
+# author's currency / percent / precision survives instead of degrading to the generic
+# type-derived format. Grounded in a corpus decode table (11 distinct codes / 461
+# occurrences across 29 .twb). An unrecognized code returns ``None`` so the caller keeps
+# its type-derived floor -- the format is additive and never regresses.
+_DEFAULT_FORMAT_PREFIXES = ("c", "n", "p", "*")
+_UPPER_LCID_PERCENT_RE = re.compile(r"^C\d+%$")
+
+def tableau_default_format_to_pbi(code):
+    """Decode a Tableau ``<column @default-format>`` code to a Power BI ``formatString``.
+
+    Returns the formatString, or ``None`` when the code is empty/whitespace or
+    unrecognized (the caller then keeps its type-derived format so a field never
+    regresses).
+
+    * A lowercase type prefix -- ``c`` (currency) / ``n`` (number) / ``p`` (percent) --
+      or the ``*`` zero-pad prefix is stripped and the remainder is passed through
+      verbatim: the remainder is already a valid .NET custom-format string (Excel
+      grammar: ``;`` splits positive;negative sections, ``"..."`` is a literal, a comma
+      before a suffix scales by 1000, ``#,##0`` is grouped). Verbatim pass-through
+      preserves the distinction between a quoted-literal percent glyph (the ``n...``
+      codes, value NOT scaled) and the percent operator (the ``p...`` codes, value
+      scaled x100) without any special-casing.
+    * The uppercase type+LCID percent form ``C<lcid>%`` (e.g. ``C1033%``, 1033 = en-US)
+      decodes to ``0%`` (locale percent). Any OTHER uppercase ``C...`` shape returns
+      ``None`` (fall back to the floor) rather than guessing a currency symbol.
+    """
+    if not code:
+        return None
+    code = code.strip()
+    if not code:
+        return None
+    if code[0] in _DEFAULT_FORMAT_PREFIXES:
+        return code[1:] or None
+    if _UPPER_LCID_PERCENT_RE.match(code):
+        return "0%"
+    return None
+
+def generate_column_tmdl(col_name, tmdl_type, summarize, is_hidden, format_string=None):
+    """One column. col_name is the ACTUAL Delta column name (sourceColumn must match).
+
+    ``format_string`` is an OPTIONAL explicit Power BI formatString (e.g. decoded from a
+    Tableau ``<column @default-format>`` code via ``tableau_default_format_to_pbi``). When
+    truthy it takes precedence over the generic type-derived format so an author's
+    currency / percent / precision survives; when None the column keeps the type-derived
+    floor, so the emitted TMDL is byte-for-byte unchanged from before this parameter
+    existed (additive, never a regression).
+    """
     lines = [f"\tcolumn {q(col_name)}", f"\t\tdataType: {tmdl_type}"]
     if is_hidden:
         lines.append("\t\tisHidden")
-    fmt = _format_string(tmdl_type, summarize)
+    fmt = format_string or _format_string(tmdl_type, summarize)
     if fmt:
         lines.append(f"\t\tformatString: {fmt}")
     lines.append(f"\t\tlineageTag: {uuid.uuid4()}")

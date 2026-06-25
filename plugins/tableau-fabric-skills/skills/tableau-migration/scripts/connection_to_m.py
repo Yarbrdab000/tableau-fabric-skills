@@ -24,12 +24,12 @@ import re
 import xml.etree.ElementTree as ET
 
 try:  # works whether imported as a package or run with scripts/ on sys.path
-    from .tmdl_generate import clean_col, generate_column_tmdl, q
+    from .tmdl_generate import clean_col, generate_column_tmdl, q, tableau_default_format_to_pbi
     from .storage_mode import (
         ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
         PARTIAL_LIVE_CONNECTORS, connector_spec)
 except ImportError:
-    from tmdl_generate import clean_col, generate_column_tmdl, q
+    from tmdl_generate import clean_col, generate_column_tmdl, q, tableau_default_format_to_pbi
     from storage_mode import (
         ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
         PARTIAL_LIVE_CONNECTORS, connector_spec)
@@ -241,13 +241,53 @@ def _named_connection_map(datasource):
     return out
 
 
+def _default_formats_by_physical(datasource):
+    """Map ``(table, model_col) -> Power BI formatString`` from ``<column @default-format>``.
+
+    Tableau persists an author's explicit per-field number format as a ``default-format``
+    code on the logical ``<column>`` element (e.g. ``default-format='c"$"#,##0;("$"#,##0)'``).
+    Each such ``<column name='[lid]'>`` is joined to its physical ``(table, column)`` through
+    the ``<cols><map key='[lid]' value='[TABLE].[COL]'>`` logical->physical mapping, the code
+    is decoded to a Power BI ``formatString``, and the result is keyed by
+    ``(table, clean_col(physical))`` -- the SAME identity the ``<metadata-record>`` column
+    descriptors carry -- so the M-path column emitter can apply it. A column whose code is
+    undecodable, or whose logical id is unmapped / ambiguously mapped, is omitted so the
+    caller keeps its type-derived floor (never a guess, never a regression).
+    """
+    lid_to_phys = {}
+    for cols in _findall_local(datasource, "cols"):
+        for m in _children_local(cols, "map"):
+            key = _strip_brackets((m.get("key") or "").strip())
+            _cat, table, col = _parse_table_name((m.get("value") or "").strip())
+            if key and table and col:
+                lid_to_phys.setdefault(key, set()).add((table, col))
+    out = {}
+    for col in _children_local(datasource, "column"):
+        code = col.get("default-format")
+        if not code:
+            continue
+        fmt = tableau_default_format_to_pbi(code)
+        if not fmt:
+            continue
+        lid = _strip_brackets((col.get("name") or "").strip())
+        phys = lid_to_phys.get(lid)
+        if not phys or len(phys) != 1:
+            continue  # unmapped / ambiguously mapped -> never guess
+        table, physical_col = next(iter(phys))
+        out[(table, clean_col(physical_col))] = fmt
+    return out
+
+
 def _columns_by_parent(datasource):
     """Map relation item-name -> [ {remote_name, model_name, tmdl_type, local_name} ].
 
     Built from ``<metadata-record class='column'>`` entries, grouped by ``<parent-name>``.
-    Columns whose Tableau type is unsupported are dropped (None tmdl_type).
+    Columns whose Tableau type is unsupported are dropped (None tmdl_type). A column that
+    carries an author's explicit ``default-format`` (joined via ``_default_formats_by_physical``)
+    additionally gets a ``format_string`` key; the key is simply absent otherwise.
     """
     out = {}
+    fmt_by_physical = _default_formats_by_physical(datasource)
     for rec in _findall_local(datasource, "metadata-record"):
         if (rec.get("class") or "").lower() != "column":
             continue
@@ -260,12 +300,17 @@ def _columns_by_parent(datasource):
         tmdl_type = tableau_type_to_tmdl(_txt("local-type"))
         if not parent or not remote or tmdl_type is None:
             continue
-        out.setdefault(parent, []).append({
+        model_name = clean_col(remote)
+        col = {
             "remote_name": remote,
-            "model_name": clean_col(remote),
+            "model_name": model_name,
             "tmdl_type": tmdl_type,
             "local_name": _strip_brackets(local) if local else remote,
-        })
+        }
+        fmt = fmt_by_physical.get((parent, model_name))
+        if fmt:
+            col["format_string"] = fmt
+        out.setdefault(parent, []).append(col)
     return out
 
 
@@ -1222,7 +1267,8 @@ def emit_table_tmdl_m(relation, descriptor, mode):
     for c in cols:
         summarize = "sum" if c["tmdl_type"] in ("int64", "double", "decimal") else "none"
         # In the M path the model column name == its sourceColumn (the remote source name).
-        columns_tmdl += generate_column_tmdl(c["model_name"], c["tmdl_type"], summarize, False)
+        columns_tmdl += generate_column_tmdl(
+            c["model_name"], c["tmdl_type"], summarize, False, c.get("format_string"))
 
     partition_name = relation.get("item") or clean_col(table_display)
     source_body = emit_m_partition_source(relation, descriptor, mode)

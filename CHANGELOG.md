@@ -13,8 +13,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration:** the human-approved **assisted-translation landing now covers dimension
-  calc COLUMNS** — the column-mode peer of the measures' `approved_calc_dax` channel — exposed on
+- **tableau-migration:** **an author's explicit per-field number format now survives to the Power BI
+  `formatString`.** Tableau persists a column's explicit currency / percent / precision as a
+  `default-format` code on the logical `<column>` element (e.g. `c"$"#,##0;("$"#,##0)`); previously
+  these were dropped and every numeric/date column fell back to the generic type-derived format. A new
+  decoder (`tableau_default_format_to_pbi` in `tmdl_generate.py`) maps the code's one-char type prefix
+  (`c` currency / `n` number / `p` percent / `*` zero-pad, plus the uppercase `C<lcid>%` percent form)
+  to an Excel/.NET-grammar `formatString`, joined to its physical `(table, column)` through the `<cols>`
+  logical→physical map (`_default_formats_by_physical` in `connection_to_m.py`) and applied by
+  `generate_column_tmdl` via a new optional `format_string` parameter. An unrecognized / unmapped /
+  ambiguously-mapped code is omitted so the column keeps its type-derived floor — additive and never a
+  regression; with no decodable code the emitted TMDL is byte-for-byte unchanged. Grounded in a 29-`.twb`
+  corpus decode table (11 distinct codes / 461 occurrences); decode logic is original (CLEANROOM pass).
+- **tableau-migration:** **a pure-Python TMDL well-formedness linter** (`scripts/tmdl_lint.py`)
+  plus pytest coverage (`tests/test_tmdl_lint.py`) that guards the serializer's *openability*
+  invariants in-suite. It flags the three failure modes that make a generated `.tmdl` fail to open
+  in Power BI / TOM — empty-value annotations, column-0 / sibling-level orphan lines outside the
+  top-level keyword allowlist, and a multi-line object body (`measure` / `column` /
+  `calculationItem` / `expression`) that is not indented deeper than its opener's property level
+  (while correctly accepting a `source` partition value-block — an M `let`/`in` or calculated-table
+  expression — at the standard one-level-deeper indent, the form TOM opens) — over both raw TMDL
+  text and the real generator output. Purely a developer/CI safety net for serializer regressions;
+  no runtime, report-schema, or generated-output behavior changes. — the column-mode peer of the measures' `approved_calc_dax` channel — exposed on
   the estate CLI as **`--approved-dax <file.json>`**. A `{calc_name: dax}` approval flips an inert
   calculated-column stub into a live, byte-validated calculated column
   (`TranslatedBy = assisted translation (human-approved)`, status `assisted-approved`), consulted
