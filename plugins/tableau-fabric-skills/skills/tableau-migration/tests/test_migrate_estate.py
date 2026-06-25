@@ -1462,3 +1462,186 @@ def test_cli_main_no_pbip_flag_suppresses_projects(fixtures_dir, tmp_path, capsy
     assert rc == 0
     assert not os.path.isdir(os.path.join(out, "pbip"))
     assert "Openable projects:" not in capsys.readouterr().out
+
+
+# -- measure_binding producer (model build's calc->measure facts -> viz consumer map) ----------
+# `_measure_binding_from_model` is a pure CONSUMER of the datasource-migration report: it shapes the
+# model build's calc->measure identity into the {"measures": {key: entry}} map twb_to_pbir reads.
+def test_measure_binding_from_model_passes_through_calc_bindings_index():
+    # The model build's consolidated `calc_bindings` index (token + caption keyed) is forwarded
+    # verbatim so the join token stays byte-identical to what the model stamped.
+    res_report = {"calc_bindings": {
+        "pcdf:usr:Calculation_0014172369735704:qk": {
+            "model_table": "_Measures", "measure_name": "Percent Difference (DoD)",
+            "status": "translated"},
+        "count orders": {"model_table": "_Measures", "measure_name": "count orders",
+                         "status": "translated"},
+    }}
+    mb = me._measure_binding_from_model(res_report)
+    inner = mb["measures"]
+    assert inner["pcdf:usr:Calculation_0014172369735704:qk"]["measure_name"] == "Percent Difference (DoD)"
+    assert inner["count orders"]["status"] == "translated"
+
+
+def test_measure_binding_from_model_derives_from_source_tokens_when_no_index():
+    # Pre-`calc_bindings` shape: only rows carrying an explicit source token/id/caption are keyed,
+    # under EACH present key (instance token, bare calc id, field caption) -> same entry.
+    res_report = {"measures": [
+        {"measure": "Standard of Deviation", "status": "translated",
+         "source": {"calc_instance_token": "usr:Calculation_0014172373577763:qk",
+                    "calc_id": "Calculation_0014172373577763",
+                    "field_caption": "Standard of Deviation", "model_table": "_Measures"}},
+    ]}
+    inner = me._measure_binding_from_model(res_report)["measures"]
+    for key in ("usr:Calculation_0014172373577763:qk", "Calculation_0014172373577763",
+                "Standard of Deviation"):
+        assert inner[key]["measure_name"] == "Standard of Deviation"
+        assert inner[key]["model_table"] == "_Measures"
+        assert inner[key]["status"] == "translated"
+
+
+def test_measure_binding_from_model_ignores_rows_without_source():
+    # A plain <column> calc row (no `source` tag, no `calc_bindings`) is NOT keyed -- it keeps its
+    # existing caption-based _Measures binding in the viz layer, so behaviour is byte-unchanged.
+    res_report = {"measures": [
+        {"measure": "Revenue Sum", "status": "translated", "tableau_formula": "SUM([Revenue])"},
+    ]}
+    assert me._measure_binding_from_model(res_report) is None
+
+
+def test_measure_binding_from_model_none_when_no_measures():
+    assert me._measure_binding_from_model({}) is None
+    assert me._measure_binding_from_model(None) is None
+    assert me._measure_binding_from_model({"calc_bindings": {}}) is None
+
+
+def test_viz_adapter_forwards_measure_binding_only_when_supported():
+    # The adapter passes measure_binding through to a viz fn that declares it, and silently omits it
+    # for one that does not -- so the seam stays additive against older viz entry points.
+    seen = {}
+
+    def viz_with(text, *, report_name, dataset_name, date_binding=None, measure_binding=None):
+        seen["with"] = {"date": date_binding, "measure": measure_binding}
+        return {"parts": {}}
+
+    def viz_without(text, *, report_name, dataset_name, date_binding=None):
+        seen["without"] = {"date": date_binding}
+        return {"parts": {}}
+
+    mb = {"measures": {"Calculation_1": {"model_table": "_Measures",
+                                         "measure_name": "X", "status": "translated"}}}
+    me._viz_adapter(viz_with)("<twb/>", "WB", date_binding=None, measure_binding=mb)
+    me._viz_adapter(viz_without)("<twb/>", "WB", date_binding=None, measure_binding=mb)
+    assert seen["with"]["measure"] == mb
+    assert "without" in seen  # called without raising despite no measure_binding param
+
+
+# `_row_count_binding_from_model` is a pure CONSUMER too: it shapes the model build's per-fact
+# COUNTROWS measures into the {"measures": {<table>: {entity, measure}}, "default": {...}} map the
+# viz layer's implicit-row-count path reads, so an object-id COUNT(*) pill binds by FACT TABLE.
+def test_row_count_binding_from_model_passes_through_consumer_shape():
+    # An explicit consumer-shape `row_count_binding` is normalised + forwarded so the table->measure
+    # identity is byte-identical to what the model emitted.
+    res_report = {"row_count_binding": {
+        "measures": {"Orders": {"entity": "_Measures", "measure": "count orders"}},
+        "default": {"entity": "_Measures", "measure": "Number of Records"},
+    }}
+    rcb = me._row_count_binding_from_model(res_report)
+    assert rcb["measures"]["Orders"] == {"entity": "_Measures", "measure": "count orders"}
+    assert rcb["default"] == {"entity": "_Measures", "measure": "Number of Records"}
+
+
+def test_row_count_binding_from_model_normalizes_convenience_map():
+    # A convenience `row_count_measures` map: dict targets pass through; a bare measure NAME defaults
+    # to the _Measures table; a model_table/measure_name aliasing is accepted.
+    res_report = {"row_count_measures": {
+        "Orders": {"entity": "_Measures", "measure": "count orders"},
+        "Returns": "Returns Row Count",
+        "Shipments": {"model_table": "Fact", "measure_name": "Shipment Count"},
+    }}
+    rcb = me._row_count_binding_from_model(res_report)
+    m = rcb["measures"]
+    assert m["Orders"] == {"entity": "_Measures", "measure": "count orders"}
+    assert m["Returns"] == {"entity": "_Measures", "measure": "Returns Row Count"}
+    assert m["Shipments"] == {"entity": "Fact", "measure": "Shipment Count"}
+    assert "default" not in rcb
+
+
+def test_row_count_binding_from_model_carries_numrec_default():
+    # The legacy single-fact (numrec) row count binds via `default`, not a named table.
+    res_report = {"row_count_measures": {"default": {"entity": "_Measures", "measure": "Rows"}}}
+    rcb = me._row_count_binding_from_model(res_report)
+    assert rcb == {"default": {"entity": "_Measures", "measure": "Rows"}}
+
+
+def test_row_count_binding_from_model_reads_model_manifest_row_count():
+    # The fact-table -> COUNTROWS map nested inside the model build's additive `model_manifest`
+    # (the likely emit site) is read too -- both the nested consumer shape and a flat convenience
+    # map -- so the seam lights up wherever the model surfaces the target.
+    nested = {"model_manifest": {"row_count": {
+        "measures": {"Orders": {"entity": "_Measures", "measure": "count orders"}}}}}
+    flat = {"model_manifest": {"row_count": {
+        "Orders": {"entity": "_Measures", "measure": "count orders"}}}}
+    for rep in (nested, flat):
+        rcb = me._row_count_binding_from_model(rep)
+        assert rcb["measures"]["Orders"] == {"entity": "_Measures", "measure": "count orders"}
+
+
+def test_row_count_binding_from_model_reads_model_manifest_verbatim_shape():
+    # Pins the model build's REAL `model_manifest.row_count` shape (verified against the live
+    # model emit): `measures` values are BARE measure-name STRINGS (entity is always `_Measures`,
+    # since every measure lives there) and `default` carries `{table, measure}` (the single-fact
+    # fallback -- `table` is informational, the bind is `measure` @ `_Measures`). The normalizer
+    # lifts both to the consumer's `{entity, measure}` target shape, so the seam binds with no
+    # extra/duplicated top-level key on the model side (single source of truth).
+    rep = {"model_manifest": {"row_count": {
+        "measures": {"Orders": "count orders"},
+        "default": {"table": "Orders", "measure": "count orders"}}}}
+    rcb = me._row_count_binding_from_model(rep)
+    assert rcb["measures"]["Orders"] == {"entity": "_Measures", "measure": "count orders"}
+    assert rcb["default"] == {"entity": "_Measures", "measure": "count orders"}
+
+
+def test_row_count_binding_from_model_top_level_wins_over_manifest():
+    # An explicit top-level `row_count_binding` takes priority over the manifest copy.
+    rep = {"row_count_binding": {"measures": {"Orders": {"entity": "_Measures", "measure": "A"}}},
+           "model_manifest": {"row_count": {"Orders": {"entity": "_Measures", "measure": "B"}}}}
+    assert me._row_count_binding_from_model(rep)["measures"]["Orders"]["measure"] == "A"
+
+
+def test_row_count_binding_from_model_ignores_scalar_manifest_row_count():
+    # `model_manifest["row_count"]` may instead be a diagnostic row TOTAL (a scalar) or a non-target
+    # map -- never bind to that; only real table->measure targets count.
+    assert me._row_count_binding_from_model({"model_manifest": {"row_count": 9994}}) is None
+    assert me._row_count_binding_from_model(
+        {"model_manifest": {"row_count": {"Orders": 9994}}}) is None
+
+
+def test_row_count_binding_from_model_none_when_absent_or_empty():
+    assert me._row_count_binding_from_model({}) is None
+    assert me._row_count_binding_from_model(None) is None
+    assert me._row_count_binding_from_model({"row_count_measures": {}}) is None
+    # a malformed entry (no measure) yields no binding rather than a dangling target
+    assert me._row_count_binding_from_model(
+        {"row_count_measures": {"Orders": {"entity": "_Measures"}}}) is None
+
+
+def test_viz_adapter_forwards_row_count_binding_only_when_supported():
+    # The adapter passes row_count_binding to a viz fn that declares it, and silently omits it for an
+    # older entry point that does not -- additive against viz fns predating the row-count seam.
+    seen = {}
+
+    def viz_with(text, *, report_name, dataset_name, date_binding=None,
+                 measure_binding=None, row_count_binding=None):
+        seen["with"] = {"row_count": row_count_binding}
+        return {"parts": {}}
+
+    def viz_without(text, *, report_name, dataset_name, date_binding=None, measure_binding=None):
+        seen["without"] = True
+        return {"parts": {}}
+
+    rcb = {"measures": {"Orders": {"entity": "_Measures", "measure": "count orders"}}}
+    me._viz_adapter(viz_with)("<twb/>", "WB", row_count_binding=rcb)
+    me._viz_adapter(viz_without)("<twb/>", "WB", row_count_binding=rcb)
+    assert seen["with"]["row_count"] == rcb
+    assert seen.get("without") is True  # called without raising despite no row_count_binding param

@@ -77,6 +77,14 @@ matrix; two measures + a dimension → scatter). A `color` encoding on a dimensi
 **Series** role; a `detail`/level-of-detail dimension disaggregates a scatter (**Category**); a
 measure on the `label`/`text` or `size` encoding with empty shelves drives a **card**.
 
+An `Automatic` mark over a **continuous (green) date** axis is Tableau's default **line** chart, so
+a continuous date + a measure rebuilds as a `lineChart` rather than a column chart. A continuous
+date is a date *truncation* (serialised with a `*-Trunc` derivation, e.g. `Day-Trunc` / `Month-Trunc`,
+pill prefixes `tdy:` / `tmn:`); a **discrete** date PART (`Year` / `Month`, the `yr:` / `mn:` pills)
+is not continuous and keeps the column/bar default. The field bindings are identical to a line over
+the same shelves — only the chart *type* changes. This applies only to the `Automatic` mark: an
+explicit `Bar` mark means the author chose bars and stays a column chart even over a continuous date.
+
 A colour-legend **dimension** on a bar/column mark renders as a **stacked** chart
 (`stackedColumnChart`/`stackedBarChart`) rather than a clustered one, because Tableau stacks marks
 by default when a discrete colour pill is present. Bars without a colour-legend dimension keep the
@@ -230,6 +238,28 @@ Two sub-cases are deliberately **deferred** (warn, never a wrong visual):
   warning rather than being silently flattened into one chart.
 - **Parameter-driven swap members** (a `CASE`/`IF` over `[Parameters]`) are a field-parameter
   pattern; a faithful field-parameter rebuild is deferred and the worksheet warns.
+
+### Table/matrix background colour scale (conditional formatting)
+
+A continuous colour scale on a highlight table / matrix (the mark colour encoding's
+`color-palette` with `type="ordered-sequential"` or `"ordered-diverging"`) becomes a Power BI
+**cell background FillRule gradient** on `visual.objects.values[0].backColor`. A sequential scale
+emits a two-stop `linearGradient2` (min/max); a diverging scale with a centre emits a three-stop
+`linearGradient3` whose `mid.value` pins the centre (e.g. `0.0D`). Colours are single-quoted
+literals, nulls colour `asZero`, and the `selector.metadata` targets the **displayed** value
+column — so "colour the cells by a *different* measure than the one shown" is preserved (the
+gradient `Input` is the colour driver, the selector targets the shown column).
+
+**Warn-never-wrong.** The fill is emitted **only** when the colour driver is a clean value-kind
+model measure that is already projected in the visual (matched by exact field expression so the
+gradient reuses the visual's own `queryRef`). If the driver is a **quick table calc** (running
+total, percent-difference, moving average, rank, …) or otherwise has no faithful model measure,
+the rebuild emits the visual **without** a fill, raises a `background colour scale deferred …`
+warning, and preserves the raw palette (colours + centre) on the candidate record's
+`conditional_format` fact (`status: "deferred"`) for a later binding pass. This is intentional:
+colouring by a mis-resolved base field would be confidently wrong. Only the background colour
+scale is handled here — discrete colour legends, font colour, data bars, icons, and palette
+styling remain Tier-2.
 
 ## Binding contract (matches the v1 model exactly)
 
@@ -392,6 +422,19 @@ written:
 
 Deferred cases leave the slicer at its faithful "show all" default and record a structured
 `filter`-scope warning rather than risk a possibly-wrong pre-filter.
+
+#### Dashboard parameter controls (`paramctrl` zones)
+
+A dashboard can host a Tableau **parameter** as an on-canvas control (the "hamburger" picker;
+`<zone type-v2='paramctrl' param='[Parameters].[…]'>`). These are captured structurally rather
+than silently dropped: `parse_twb` resolves each control to the parameter's caption + datatype
+and records it on the additive `ir["parameter_controls"]`
+(`{param_id, caption, datatype, dashboard, position}`), de-duplicated across the primary and
+phone/tablet `<devicelayouts>` so a control is counted once. A faithful slicer needs the
+parameter's *target* (its kind, and which model column or measure it drives) — that binding is
+owned by the migrated model, so until it is available each control emits one honest
+`dashboard`-scope warning (surfaced as a `warned` fidelity row) and **no** slicer is written.
+Warn-never-wrong: the control is never reconstructed as a slicer against a guessed target.
 
 ### Cross-visual interactions (default cross-filter / cross-highlight)
 
