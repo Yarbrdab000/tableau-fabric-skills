@@ -503,3 +503,153 @@ def test_non_dashboard_visual_not_double_matched(tmp_path):
     assert ("Bars" in matched) ^ ("BarsTwin" in matched)
     assert {"Bars", "BarsTwin"} & set(result["summary"]["unmatched_worksheets"])
 
+
+# --------------------------------------------------------------------------- optional Tier-2 (DAX-value)
+def test_discover_pbi_instances_reads_port_files(tmp_path):
+    ws = tmp_path / "AnalysisServicesWorkspace_x" / "Data"
+    ws.mkdir(parents=True)
+    # Power BI writes the port file as UTF-16; a stray file must be ignored.
+    (ws / "msmdsrv.port.txt").write_bytes("57777".encode("utf-16-le"))
+    (ws / "other.txt").write_text("9999", encoding="utf-8")
+    found = fo.discover_pbi_instances(workspace_roots=[str(tmp_path)])
+    assert [i["port"] for i in found] == [57777]
+    assert found[0]["host"] == "localhost"
+
+
+def test_discover_pbi_instances_dedups_by_port(tmp_path):
+    for sub in ("a", "b"):
+        d = tmp_path / sub / "Data"
+        d.mkdir(parents=True)
+        (d / "msmdsrv.port.txt").write_bytes("60000".encode("utf-16-le"))
+    found = fo.discover_pbi_instances(workspace_roots=[str(tmp_path)])
+    assert [i["port"] for i in found] == [60000]
+
+
+def test_discover_pbi_instances_missing_root_is_empty(tmp_path):
+    assert fo.discover_pbi_instances(workspace_roots=[str(tmp_path / "nope")]) == []
+    assert fo.discover_pbi_instances(workspace_roots=[]) == []
+
+
+def test_compare_value_tolerance_bands():
+    assert fo._compare_value("m", 100.0, 100.4, tolerance=0.01)["within_tolerance"] is True
+    miss = fo._compare_value("m", 100.0, 105.0, tolerance=0.01)
+    assert miss["within_tolerance"] is False and miss["rel_diff"] == pytest.approx(0.05)
+    assert fo._compare_value("m", None, 5)["within_tolerance"] is False
+    assert fo._compare_value("m", "Yes", "Yes")["within_tolerance"] is True
+    assert fo._compare_value("m", "Yes", "No")["within_tolerance"] is False
+
+
+def test_score_value_results():
+    res = [{"ok": True}, {"ok": True}, {"ok": False}]
+    assert fo._score_value_results(res, []) == pytest.approx(round(2 / 3, 4))
+    comps = [{"within_tolerance": True}, {"within_tolerance": False}]
+    assert fo._score_value_results(res, comps) == 0.5
+    assert fo._score_value_results([], []) is None
+
+
+def test_dax_value_tier_unavailable_degrades(tmp_path):
+    # No workspace roots + no explicit port -> a structured unavailable record, never a raise
+    # (ADOMD/pythonnet missing on CI, or no live instance on a host both land here).
+    out = fo.dax_value_tier(port=None, workspace_roots=[str(tmp_path / "none")])
+    assert out["tier"] == "dax-value" and out["available"] is False and "reason" in out
+
+
+def test_dax_value_tier_live_if_available():
+    # Offline-safe: skips unless a real Power BI Desktop model is reachable on this host.
+    try:
+        AdomdConnection = fo._load_adomd()
+    except Exception:  # noqa: BLE001
+        pytest.skip("ADOMD.NET / pythonnet not available")
+    live_port = None
+    for inst in fo.discover_pbi_instances():
+        try:
+            c = AdomdConnection("Data Source=localhost:%d" % inst["port"])
+            c.Open()
+            c.Close()
+            live_port = inst["port"]
+            break
+        except Exception:  # noqa: BLE001
+            continue
+    if live_port is None:
+        pytest.skip("no live Power BI Desktop Analysis Services instance")
+    res = fo.dax_value_tier(port=live_port)
+    assert res["available"] is True
+    assert res["instance"]["port"] == live_port
+    assert res["value_score"] is None or 0.0 <= res["value_score"] <= 1.0
+    # Every reported measure carries an ok flag and (on success) a value or (on failure) an error.
+    for r in res["results"]:
+        assert "ok" in r and ("value" in r or "error" in r)
+
+
+# --------------------------------------------------------------------------- optional Tier-3 (image)
+def test_image_band_thresholds():
+    assert fo._image_band(0.99) == "near-identical"
+    assert fo._image_band(0.9) == "strong"
+    assert fo._image_band(0.7) == "moderate"
+    assert fo._image_band(0.1) == "divergent"
+
+
+def test_image_tier_requires_two_paths():
+    out = fo.image_tier(None, None)
+    assert out["available"] is False and "reason" in out
+
+
+def test_ssim_identical_and_inverted():
+    np = pytest.importorskip("numpy")
+    a = np.tile(np.linspace(0, 255, 64), (64, 1))
+    assert fo._ssim(np, a, a.copy()) == pytest.approx(1.0, abs=1e-6)
+    assert fo._ssim(np, a, 255.0 - a) < 0.9
+
+
+def test_image_tier_ssim_when_deps_present(tmp_path):
+    np = pytest.importorskip("numpy")
+    Image = pytest.importorskip("PIL.Image")
+    arr = np.tile(np.linspace(0, 255, 80).astype("uint8"), (80, 1))
+    p1, p2 = tmp_path / "a.png", tmp_path / "b.png"
+    Image.fromarray(arr).save(str(p1))
+    Image.fromarray(arr).save(str(p2))
+    out = fo.image_tier(str(p1), str(p2))
+    assert out["available"] is True
+    assert out["ssim"] == pytest.approx(1.0, abs=1e-6)
+    assert out["band"] == "near-identical"
+    # A very different candidate scores materially lower and is resized to the reference shape.
+    p3 = tmp_path / "c.png"
+    Image.fromarray((255 - arr)).resize((40, 120)).save(str(p3))
+    out2 = fo.image_tier(str(p1), str(p3))
+    assert out2["available"] is True and out2["ssim"] < out["ssim"]
+    assert out2["reference_shape"] == [80, 80]
+
+
+def test_image_tier_meets_target_threshold(tmp_path):
+    np = pytest.importorskip("numpy")
+    Image = pytest.importorskip("PIL.Image")
+    arr = np.tile(np.linspace(0, 255, 80).astype("uint8"), (80, 1))
+    p1, p2 = tmp_path / "a.png", tmp_path / "b.png"
+    Image.fromarray(arr).save(str(p1))
+    Image.fromarray(arr).save(str(p2))
+    # Identical images clear the default 0.80 acceptance floor.
+    out = fo.image_tier(str(p1), str(p2))
+    assert out["acceptance_threshold"] == pytest.approx(fo.DEFAULT_ACCEPTANCE_SSIM)
+    assert out["meets_target"] is True
+    # An impossibly high custom floor is reported as below target without erroring.
+    strict = fo.image_tier(str(p1), str(p2), acceptance_threshold=1.01)
+    assert strict["acceptance_threshold"] == pytest.approx(1.01)
+    assert strict["meets_target"] is False
+
+
+def test_run_oracle_attaches_optional_tiers(tmp_path):
+    # run_oracle wires the optional tiers in without ever failing the structural run.
+    report = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    twb_path = tmp_path / "wb.twb"
+    twb_path.write_text(TWB_XML, encoding="utf-8")
+    result = fo.run_oracle(str(twb_path), report,
+                           dax_options={"port": None, "workspace_roots": [str(tmp_path / "no")]},
+                           image_options={"reference_png": None, "candidate_png": None})
+    assert result["dax_value"]["available"] is False
+    assert result["image"]["available"] is False
+    # Structural tier still produced its summary regardless of the optional tiers.
+    assert result["summary"]["aggregate_score"] is not None
+    md = fo.render_markdown(result)
+    assert "DAX-value tier" in md and "Image tier" in md
+
+

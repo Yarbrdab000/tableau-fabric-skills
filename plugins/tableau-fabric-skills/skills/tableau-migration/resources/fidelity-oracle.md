@@ -87,6 +87,17 @@ faithful envelope for a clean workbook; investigate any visual that bands below 
 > output is intentionally **more** faithful than it, so divergence *from* it is **expected**, not an
 > error — the calibration numbers above bear that out.
 
+### Image tier — cross‑engine SSIM floor
+
+The image tier is calibrated separately, on a **real** Tableau‑vs‑Power‑BI render pair. A hand‑built
+rebuild that diverged on mark type (area→line), bar sort, basemap style, and a dropped filter scored
+**SSIM ≈ 0.64–0.65** (`divergent`) — and the aspect‑ratio distortion accounted for only ~0.01 of
+that, so the rest is genuine visual divergence. Crucially that **0.65 sits below the same rebuild's
+structural `0.868`**: the image tier *sees* the mark‑type and layout drift the structural tier
+smooths over. A genuinely faithful rebuild is therefore expected to clear the advisory **acceptance
+floor of `0.80`** (`--image-threshold`, surfaced as `meets_target`); the `0.64–0.65` figure anchors
+the **divergent** end, not "good."
+
 ---
 
 ## How to run
@@ -123,10 +134,58 @@ packages are absent — importing the module never fails offline.
 
 - **Tier 2 — DAX value oracle** (`dax_value_tier`): compares live model **measure values** by
   querying the rendered model through a local Analysis Services (`msmdsrv`) instance via ADOMD.
-  Requires a running Power BI Desktop; returns `unavailable` otherwise.
+  Requires a running Power BI Desktop; returns `unavailable` otherwise. Auto-discovers the
+  workspace port (asks for an explicit `--dax-port` when several instances are live), filters
+  internal/hidden measures, and — given an `--expected` `{measure: value}` map — reports the
+  fraction of measures within tolerance (else the fraction that evaluate without error; an
+  *erroring* measure is itself a fidelity defect the structural tier cannot see).
 - **Tier 3 — image** (`image_tier`): tolerance‑banded *perceptual* similarity of a Tableau
   reference PNG and a PBI render PNG (SSIM via optional numpy/Pillow). Cross‑engine literal
   pixel‑equality is impossible, so this tier reports a similarity **band**, never pass/fail.
+  It also compares SSIM against an advisory **acceptance floor** (`--image-threshold`, default
+  `0.80`) and emits a `meets_target` verdict — a faithful rebuild is expected to clear it.
+
+```powershell
+# optional tiers — DAX-value (needs a live Power BI Desktop) and image (needs numpy + Pillow)
+py -3.11 scripts\fidelity_oracle.py `
+  "<path>\workbook.twb" "<out>\reports\<Workbook>.Report" `
+  --dax --dax-port 57006 `                 # omit --dax-port to auto-discover when only one is live
+  --expected "<path>\expected_values.json" `  # optional {measure: value} map
+  --image-ref  "<ref>\tableau_view.png" `   # server-rendered Tableau view (RLS applied)
+  --image-cand "<out>\powerbi_render.png" ` # Power BI export/screenshot
+  --image-threshold 0.80 `
+  --format md
+```
+
+### Acquiring the Tableau reference images (`fidelity_reference.py`)
+
+The image tier needs a *reference* PNG per worksheet. The optional, network‑only
+`scripts/fidelity_reference.py` produces them and makes a missing reference an explicit instruction
+rather than a silent gap. It **reuses the skill's Tableau auth by importing `fetch_tds`** (no edits)
+and is stdlib‑only.
+
+- **Live / published (preferred):** pulls a server‑rendered
+  `.../views/{id}/image?resolution=high` PNG. The server renders **as the authenticated user**, so
+  **RLS is applied** — which is why this beats the (RLS‑stripped, usually absent) embedded
+  thumbnail.
+- **Local‑exclusive (offline / unreproducible RLS):** drop a screenshot per worksheet into a known
+  folder; `resolve_local_references` / `build_acquisition_plan` report exactly which files are
+  present, which are missing, and the precise name to save each missing one as.
+
+```powershell
+# see what's present/missing locally (no network) — emits "drop a PNG named X" guidance
+py -3.11 scripts\fidelity_reference.py --check-local `
+  --worksheets "Sheet 1,Sheet 2,Sheet 3" --out "<ref_dir>"
+
+# live pull (RLS applied); PAT secret comes from an env var and is never logged or committed
+$env:TABLEAU_PAT_VALUE = "<secret>"
+py -3.11 scripts\fidelity_reference.py `
+  --server 10ay.online.tableau.com --site <site-content-url> `
+  --pat-name <token-name> --worksheets "Sheet 1,Sheet 2,Sheet 3" --out "<ref_dir>"
+```
+
+> Server‑rendered images are **data‑bearing**: they are written only to `--out` and must **never**
+> be committed. The PAT secret is read from an env var only — never pass it on the command line.
 
 ---
 

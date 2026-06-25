@@ -1052,46 +1052,388 @@ def _assemble_report(twb, pbir, visual_results, slicer_results,
 
 
 # =====================================================================================
-# Optional tiers (lazy, guarded) -- never required for the structural tier above
+# Optional Tier-2: DAX-value oracle (live model measure values via local Analysis Services)
 # =====================================================================================
-def dax_value_tier(*_args, **_kwargs):
-    """Optional Tier-2 stub: compare live model measure values via a local Analysis Services host.
+# Cross-engine value agreement is tolerance-banded: Tableau and Power BI can round or aggregate
+# slightly differently, so a small relative difference is not a defect. A measure that *errors*,
+# however, is a concrete fidelity defect the structural tier cannot see -- so evaluability itself
+# is a first-class signal here.
+DEFAULT_VALUE_TOLERANCE = 0.005  # 0.5% relative tolerance for "values agree"
 
-    Requires a running Power BI Desktop (an ``msmdsrv`` instance) and the ADOMD client, both of
-    which are absent offline. The dependency is imported lazily so this module always imports; when
-    unavailable the tier returns a structured ``unavailable`` record instead of raising. The full
-    discovery/query implementation lands behind this guard.
+# Where Power BI Desktop drops its local Analysis Services workspace port files. The Store build
+# uses the profile path; the classic installer uses LOCALAPPDATA. Each running model writes a
+# ``msmdsrv.port.txt`` (UTF-16) under ``<workspace>\Data``; closed instances leave stale files, so
+# discovery is verified by actually connecting.
+def _pbi_workspace_roots():
+    roots = []
+    home = os.path.expanduser("~")
+    if home:
+        roots.append(os.path.join(home, "Microsoft", "Power BI Desktop Store App",
+                                  "AnalysisServicesWorkspaces"))
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        roots.append(os.path.join(local, "Microsoft", "Power BI Desktop",
+                                  "AnalysisServicesWorkspaces"))
+    return roots
+
+
+def discover_pbi_instances(workspace_roots=None):
+    """Find local Power BI Desktop Analysis Services ports from on-disk workspace port files.
+
+    Pure file I/O: returns ``[{host, port, workspace}]`` for every ``msmdsrv.port.txt`` found
+    (de-duplicated by port). Stale entries from closed instances may be present; callers verify
+    liveness by connecting. Never raises -- an unreadable/odd file is skipped.
     """
-    try:  # pragma: no cover - optional, host-dependent
-        from pyadomd import Pyadomd  # noqa: F401  (lazy: optional ADOMD client)
+    roots = workspace_roots if workspace_roots is not None else _pbi_workspace_roots()
+    found, seen = [], set()
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        for dirpath, _dirs, files in os.walk(root):
+            for fn in files:
+                if fn.lower() != "msmdsrv.port.txt":
+                    continue
+                path = os.path.join(dirpath, fn)
+                try:
+                    with open(path, "rb") as fh:
+                        raw = fh.read()
+                except OSError:
+                    continue
+                digits = re.sub(rb"[^0-9]", b"", raw).decode("ascii", "ignore")
+                if not digits:
+                    continue
+                port = int(digits)
+                if port in seen:
+                    continue
+                seen.add(port)
+                found.append({"host": "localhost", "port": port, "workspace": dirpath})
+    return found
+
+
+def _adomd_dll_path():
+    """Locate the highest-versioned ADOMD.NET client DLL, or ``None`` if it is not installed."""
+    candidates = []
+    for env in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env)
+        if not base:
+            continue
+        root = os.path.join(base, "Microsoft.NET", "ADOMD.NET")
+        if not os.path.isdir(root):
+            continue
+        for ver in sorted(os.listdir(root), reverse=True):
+            dll = os.path.join(root, ver, "Microsoft.AnalysisServices.AdomdClient.dll")
+            if os.path.isfile(dll):
+                candidates.append(dll)
+    return candidates[0] if candidates else None
+
+
+def _load_adomd():
+    """Lazily load the ADOMD.NET client via pythonnet. Returns the ``AdomdConnection`` type.
+
+    Raises on any missing piece (pythonnet absent, DLL not installed); the caller turns that into
+    a structured ``unavailable`` record so importing this module never requires the optional stack.
+    """
+    import clr  # pythonnet -- optional, host-only
+    dll = _adomd_dll_path()
+    if dll is None:
+        raise RuntimeError("ADOMD.NET client DLL not found")
+    import sys as _sys
+    dll_dir = os.path.dirname(dll)
+    if dll_dir not in _sys.path:
+        _sys.path.append(dll_dir)
+    try:
+        clr.AddReference("Microsoft.AnalysisServices.AdomdClient")
+    except Exception:  # noqa: BLE001 -- fall back to an explicit file load
+        import System
+        System.Reflection.Assembly.LoadFile(dll)
+    from Microsoft.AnalysisServices.AdomdClient import AdomdConnection
+    return AdomdConnection
+
+
+def _net_to_py(val):
+    """Coerce an ADOMD .NET scalar into a plain Python value (``DBNull`` -> ``None``)."""
+    if val is None or type(val).__name__ == "DBNull":
+        return None
+    if isinstance(val, bool):
+        return val
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return str(val)
+
+
+def _adomd_rows(conn, query, columns):
+    cmd = conn.CreateCommand()
+    cmd.CommandText = query
+    reader = cmd.ExecuteReader()
+    rows = []
+    try:
+        while reader.Read():
+            rows.append({col: _net_to_py(reader.GetValue(i)) for i, col in enumerate(columns)})
+    finally:
+        reader.Close()
+    return rows
+
+
+def _evaluate_measure(conn, measure_name):
+    """Evaluate one model measure to a scalar via ``EVALUATE ROW``; capture errors, never raise."""
+    safe = str(measure_name).replace("]", "]]")
+    dax = 'EVALUATE ROW("v", [%s])' % safe
+    try:
+        rows = _adomd_rows(conn, dax, ["v"])
+        return {"measure": measure_name, "ok": True,
+                "value": rows[0]["v"] if rows else None, "error": None}
+    except Exception as exc:  # noqa: BLE001 -- a failed evaluation is itself a fidelity signal
+        return {"measure": measure_name, "ok": False, "value": None,
+                "error": str(exc).strip()[:200]}
+
+
+def _compare_value(name, expected, actual, tolerance=DEFAULT_VALUE_TOLERANCE):
+    """Tolerance-banded comparison of an expected vs live measure value (advisory, never exact)."""
+    rec = {"measure": name, "expected": expected, "actual": actual,
+           "abs_diff": None, "rel_diff": None, "within_tolerance": False, "note": ""}
+    if actual is None or expected is None:
+        rec["note"] = "missing value"
+        return rec
+    try:
+        e, a = float(expected), float(actual)
+    except (TypeError, ValueError):
+        rec["within_tolerance"] = str(expected) == str(actual)
+        rec["note"] = "string comparison"
+        return rec
+    abs_diff = abs(a - e)
+    rel = abs_diff / max(abs(e), 1e-12)
+    rec["abs_diff"] = abs_diff
+    rec["rel_diff"] = rel
+    rec["within_tolerance"] = rel <= tolerance or abs_diff <= 1e-9
+    rec["note"] = "within tolerance" if rec["within_tolerance"] else "exceeds tolerance"
+    return rec
+
+
+def _score_value_results(results, comparisons):
+    """Advisory value score: when expected values are supplied, the fraction that agree within
+    tolerance; otherwise the fraction of measures that simply evaluate without error."""
+    if comparisons:
+        n = len(comparisons)
+        return round(sum(1 for c in comparisons if c["within_tolerance"]) / n, 4) if n else None
+    n = len(results)
+    return round(sum(1 for r in results if r["ok"]) / n, 4) if n else None
+
+
+def dax_value_tier(report_dir=None, host="localhost", port=None, expected=None,
+                   measures=None, tolerance=DEFAULT_VALUE_TOLERANCE, workspace_roots=None):
+    """Optional Tier-2: evaluate a live Power BI model's measures and (optionally) compare them to
+    expected Tableau values, via a local Analysis Services instance.
+
+    Lazy + guarded: if pythonnet/ADOMD or a live Desktop instance is absent, returns a structured
+    ``{available: False, reason}`` record rather than raising. With ``port`` omitted it auto-selects
+    when exactly one live instance is found, else reports the candidates. Every measure is evaluated
+    (an error is a concrete fidelity defect); ``expected`` adds tolerance-banded value comparison.
+    ``report_dir`` is accepted for symmetry/future model matching and is not required.
+    """
+    try:
+        AdomdConnection = _load_adomd()
     except Exception as exc:  # noqa: BLE001
         return {"tier": "dax-value", "available": False,
-                "reason": "ADOMD/pyadomd not available: %s" % exc}
-    return {"tier": "dax-value", "available": False,
-            "reason": "local Analysis Services discovery not yet implemented"}
+                "reason": "ADOMD.NET/pythonnet not available: %s" % str(exc).strip()[:160]}
+
+    def _connect(p):
+        conn = AdomdConnection("Data Source=%s:%d" % (host, p))
+        conn.Open()
+        return conn
+
+    chosen = port
+    if chosen is None:
+        discovered = discover_pbi_instances(workspace_roots)
+        live = []
+        for inst in discovered:
+            try:
+                c = _connect(inst["port"]); c.Close(); live.append(inst)
+            except Exception:  # noqa: BLE001 -- stale/closed instance
+                continue
+        if len(live) == 1:
+            chosen = live[0]["port"]
+        elif not live:
+            return {"tier": "dax-value", "available": False,
+                    "reason": "no live Power BI Desktop Analysis Services instance found",
+                    "discovered_ports": [i["port"] for i in discovered]}
+        else:
+            return {"tier": "dax-value", "available": False,
+                    "reason": "multiple live instances found; pass an explicit port",
+                    "live_ports": [i["port"] for i in live]}
+
+    try:
+        conn = _connect(chosen)
+    except Exception as exc:  # noqa: BLE001
+        return {"tier": "dax-value", "available": False,
+                "reason": "connect failed on port %s: %s" % (chosen, str(exc).strip()[:160])}
+    try:
+        cats = _adomd_rows(conn, "SELECT [CATALOG_NAME] FROM $SYSTEM.DBSCHEMA_CATALOGS",
+                           ["CATALOG_NAME"])
+        catalog = cats[0]["CATALOG_NAME"] if cats else None
+        model_measures, seen = [], set()
+        for r in _adomd_rows(
+                conn,
+                "SELECT [MEASUREGROUP_NAME], [MEASURE_NAME], [MEASURE_IS_VISIBLE] "
+                "FROM $SYSTEM.MDSCHEMA_MEASURES",
+                ["MEASUREGROUP_NAME", "MEASURE_NAME", "MEASURE_IS_VISIBLE"]):
+            m = r["MEASURE_NAME"]
+            # Skip Analysis Services internal/system measures (e.g. ``__Default measure``) and any
+            # explicitly hidden measure -- neither is an author-facing fidelity signal.
+            if not m or str(m).startswith("__") or r["MEASURE_IS_VISIBLE"] in (False, 0, 0.0):
+                continue
+            if m not in seen:
+                seen.add(m)
+                model_measures.append(m)
+        target = list(measures) if measures else model_measures
+        results = [_evaluate_measure(conn, m) for m in target]
+    finally:
+        conn.Close()
+
+    comparisons = []
+    if expected:
+        by_name = {r["measure"]: r for r in results}
+        for name, exp in expected.items():
+            actual = by_name.get(name, {}).get("value") if by_name.get(name, {}).get("ok") else None
+            comparisons.append(_compare_value(name, exp, actual, tolerance))
+
+    value_score = _score_value_results(results, comparisons)
+    n = len(results)
+    n_ok = sum(1 for r in results if r["ok"])
+    return {
+        "tier": "dax-value",
+        "available": True,
+        "instance": {"host": host, "port": chosen, "catalog": catalog},
+        "measures_total": n,
+        "measures_evaluated": n_ok,
+        "measures_errored": n - n_ok,
+        "results": results,
+        "comparisons": comparisons,
+        "value_score": value_score,
+        "band": _band(value_score) if value_score is not None else None,
+        "tolerance": tolerance,
+        "report_dir": os.path.abspath(report_dir) if report_dir else None,
+        "notes": [
+            "ADVISORY: a measure that errors is a concrete fidelity defect; value comparisons use "
+            "a relative-tolerance band, not equality.",
+            "value_score = fraction of expected values that agree within tolerance, or (without "
+            "expected values) the fraction of measures that evaluate without error.",
+        ],
+    }
 
 
-def image_tier(*_args, **_kwargs):
-    """Optional Tier-3 stub: tolerance-banded perceptual similarity of two rendered PNGs.
+# =====================================================================================
+# Optional Tier-3: image oracle (tolerance-banded perceptual similarity of two PNGs)
+# =====================================================================================
+# Bands for cross-engine perceptual similarity. Literal pixel-equality across two rendering engines
+# is impossible, so this is explicitly a BAND, never pass/fail.
+IMAGE_BANDS = ((0.95, "near-identical"), (0.85, "strong"), (0.65, "moderate"), (0.0, "divergent"))
 
-    Cross-engine literal pixel-equality is impossible, so this tier reports a similarity *band*,
-    never pass/fail. numpy/Pillow are imported lazily; absent them the tier reports ``unavailable``.
+# Advisory acceptance floor for a faithful cross-engine rebuild. Calibrated against a real
+# Tableau-vs-Power-BI pair: a hand-built rebuild that diverged on mark type (area->line), sort,
+# basemap, and a dropped filter scored ~0.64-0.65, so a genuinely faithful rebuild should clear
+# this. Configurable per run; still advisory (a target, not a hard pass/fail gate).
+DEFAULT_ACCEPTANCE_SSIM = 0.80
+
+
+def _image_band(score):
+    for threshold, label in IMAGE_BANDS:
+        if score >= threshold:
+            return label
+    return IMAGE_BANDS[-1][1]
+
+
+def _box_mean(np, img, k):
+    """Mean over each ``k x k`` window via an integral image (numpy-only, no scipy)."""
+    ii = np.cumsum(np.cumsum(img, axis=0), axis=1)
+    ii = np.pad(ii, ((1, 0), (1, 0)), mode="constant")
+    total = ii[k:, k:] - ii[:-k, k:] - ii[k:, :-k] + ii[:-k, :-k]
+    return total / float(k * k)
+
+
+def _ssim(np, a, b, k=7):
+    """Windowed structural similarity (SSIM) mean over ``k x k`` windows. Inputs are 2-D grayscale
+    arrays of identical shape; returns a scalar in roughly ``[-1, 1]`` (1.0 == identical)."""
+    a = a.astype("float64")
+    b = b.astype("float64")
+    k = min(k, a.shape[0], a.shape[1])
+    if k < 1:
+        return 0.0
+    mu_a = _box_mean(np, a, k)
+    mu_b = _box_mean(np, b, k)
+    va = _box_mean(np, a * a, k) - mu_a ** 2
+    vb = _box_mean(np, b * b, k) - mu_b ** 2
+    cov = _box_mean(np, a * b, k) - mu_a * mu_b
+    L = 255.0
+    c1 = (0.01 * L) ** 2
+    c2 = (0.03 * L) ** 2
+    smap = ((2 * mu_a * mu_b + c1) * (2 * cov + c2)) / \
+           ((mu_a ** 2 + mu_b ** 2 + c1) * (va + vb + c2))
+    return float(smap.mean())
+
+
+def _load_gray(np, Image, path, shape=None):
+    im = Image.open(path).convert("L")
+    if shape is not None:
+        im = im.resize((shape[1], shape[0]))  # PIL size is (width, height)
+    return np.asarray(im)
+
+
+def image_tier(reference_png=None, candidate_png=None, acceptance_threshold=None):
+    """Optional Tier-3: tolerance-banded perceptual (SSIM) similarity of a Tableau reference PNG and
+    a Power BI render PNG.
+
+    Lazy + guarded (numpy + Pillow): returns ``{available: False, reason}`` when the deps or the
+    files are missing. The candidate is resized to the reference's shape before comparison. The
+    result is a similarity *band*, framed explicitly as advisory -- never a pixel-equality pass/fail.
+
+    ``acceptance_threshold`` is the advisory SSIM floor a faithful rebuild is expected to clear
+    (default :data:`DEFAULT_ACCEPTANCE_SSIM`); the result reports ``meets_target`` against it.
     """
-    try:  # pragma: no cover - optional dependency
-        import numpy  # noqa: F401
-        from PIL import Image  # noqa: F401
+    threshold = DEFAULT_ACCEPTANCE_SSIM if acceptance_threshold is None else float(acceptance_threshold)
+    if not reference_png or not candidate_png:
+        return {"tier": "image", "available": False,
+                "reason": "two PNG paths required (reference_png, candidate_png)"}
+    try:
+        import numpy as np
+        from PIL import Image
     except Exception as exc:  # noqa: BLE001
         return {"tier": "image", "available": False,
-                "reason": "numpy/Pillow not available: %s" % exc}
-    return {"tier": "image", "available": False,
-            "reason": "render capture not yet implemented"}
+                "reason": "numpy/Pillow not available: %s" % str(exc).strip()[:160]}
+    for p in (reference_png, candidate_png):
+        if not os.path.isfile(p):
+            return {"tier": "image", "available": False, "reason": "file not found: %s" % p}
+    ref = _load_gray(np, Image, reference_png)
+    cand = _load_gray(np, Image, candidate_png, shape=ref.shape)
+    score = _ssim(np, ref, cand)
+    return {
+        "tier": "image",
+        "available": True,
+        "ssim": round(score, 4),
+        "band": _image_band(score),
+        "acceptance_threshold": round(threshold, 4),
+        "meets_target": bool(score >= threshold),
+        "reference_shape": [int(ref.shape[0]), int(ref.shape[1])],
+        "notes": [
+            "ADVISORY: cross-engine pixel-equality is impossible; this is a tolerance BAND of "
+            "perceptual (SSIM) similarity, not pass/fail.",
+            "The candidate render is resized to the reference's pixel shape before comparison.",
+            "meets_target compares SSIM against the advisory acceptance floor (%.2f); a faithful "
+            "rebuild is expected to clear it." % threshold,
+        ],
+    }
 
 
 # =====================================================================================
 # Top-level convenience + CLI
 # =====================================================================================
-def run_oracle(twb_path, report_dir, engine_report_path=None):
-    """Read both sides and score them. Returns the advisory report dict."""
+def run_oracle(twb_path, report_dir, engine_report_path=None,
+               dax_options=None, image_options=None):
+    """Read both sides and score them. Returns the advisory report dict.
+
+    The structural tier always runs. The optional value/image tiers run only when their options are
+    supplied, and each attaches its own ``{available, ...}`` record without ever failing the run.
+    """
     twb = read_twb_views(twb_path)
     pbir = read_pbir_report(report_dir)
     engine_report = None
@@ -1103,6 +1445,10 @@ def run_oracle(twb_path, report_dir, engine_report_path=None):
         "report_dir": os.path.abspath(report_dir),
         "engine_report": os.path.abspath(engine_report_path) if engine_report_path else None,
     }
+    if dax_options is not None:
+        report["dax_value"] = dax_value_tier(report_dir=report_dir, **dax_options)
+    if image_options is not None:
+        report["image"] = image_tier(**image_options)
     return report
 
 
@@ -1132,6 +1478,33 @@ def render_markdown(report):
         lines.append("## Slicers / filters")
         for sl in report["slicers"]:
             lines.append("- `%s`: %s" % (", ".join(sl["fields"]) or "?", sl["note"]))
+    dax = report.get("dax_value")
+    if dax is not None:
+        lines.append("")
+        lines.append("## DAX-value tier (advisory)")
+        if not dax.get("available"):
+            lines.append("- _unavailable_: %s" % dax.get("reason"))
+        else:
+            lines.append("- **Value score:** %s (%s) on port %s" % (
+                dax.get("value_score"), dax.get("band"), dax["instance"]["port"]))
+            lines.append("- **Measures:** %d evaluated, %d errored (of %d)" % (
+                dax.get("measures_evaluated", 0), dax.get("measures_errored", 0),
+                dax.get("measures_total", 0)))
+            for r in dax.get("results", []):
+                if not r["ok"]:
+                    lines.append("  - ERROR `%s`: %s" % (r["measure"], r["error"]))
+    img = report.get("image")
+    if img is not None:
+        lines.append("")
+        lines.append("## Image tier (advisory)")
+        if not img.get("available"):
+            lines.append("- _unavailable_: %s" % img.get("reason"))
+        else:
+            lines.append("- **SSIM:** %s (%s)" % (img.get("ssim"), img.get("band")))
+            if img.get("acceptance_threshold") is not None:
+                verdict = "MEETS target" if img.get("meets_target") else "BELOW target"
+                lines.append("- **Acceptance floor:** %s -> %s" %
+                             (img.get("acceptance_threshold"), verdict))
     lines.append("")
     for note in report["notes"]:
         lines.append("> %s" % note)
@@ -1148,9 +1521,34 @@ def main(argv=None):
                     help="Optional path to the engine's report.json for intent enrichment.")
     ap.add_argument("--format", choices=("json", "md"), default="json")
     ap.add_argument("--out", default=None, help="Write output here instead of stdout.")
+    # Optional Tier-2 (DAX-value, needs local Power BI Desktop):
+    ap.add_argument("--dax", action="store_true",
+                    help="Run the optional DAX-value tier against a live Power BI Desktop instance.")
+    ap.add_argument("--dax-port", type=int, default=None,
+                    help="Explicit Analysis Services port (else auto-discovered when only one is live).")
+    ap.add_argument("--expected", default=None,
+                    help="Optional JSON file of {measure: expected_value} for value comparison.")
+    # Optional Tier-3 (image, needs numpy + Pillow):
+    ap.add_argument("--image-ref", default=None, help="Tableau reference PNG for the image tier.")
+    ap.add_argument("--image-cand", default=None, help="Power BI render PNG for the image tier.")
+    ap.add_argument("--image-threshold", type=float, default=DEFAULT_ACCEPTANCE_SSIM,
+                    help="Advisory SSIM acceptance floor a faithful rebuild should clear "
+                         "(default %(default)s).")
     args = ap.parse_args(argv)
 
-    report = run_oracle(args.twb, args.report_dir, args.engine_report)
+    dax_options = None
+    if args.dax or args.dax_port is not None:
+        expected = None
+        if args.expected and os.path.isfile(args.expected):
+            expected = _read_json(args.expected)
+        dax_options = {"port": args.dax_port, "expected": expected}
+    image_options = None
+    if args.image_ref or args.image_cand:
+        image_options = {"reference_png": args.image_ref, "candidate_png": args.image_cand,
+                         "acceptance_threshold": args.image_threshold}
+
+    report = run_oracle(args.twb, args.report_dir, args.engine_report,
+                        dax_options=dax_options, image_options=image_options)
     text = (render_markdown(report) if args.format == "md"
             else json.dumps(report, indent=2, ensure_ascii=False))
     if args.out:
