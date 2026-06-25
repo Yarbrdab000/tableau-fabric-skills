@@ -1020,7 +1020,8 @@ def test_score_value_results():
 
 def test_normalize_expected_flat_and_rich():
     flat = fo._normalize_expected({"Sales": 100.0})
-    assert flat == [{"label": "Sales", "measure": "Sales", "expected": 100.0, "filter": None}]
+    assert flat == [{"label": "Sales", "measure": "Sales", "expected": 100.0,
+                     "filter": None, "query": None}]
     rich = fo._normalize_expected({
         "Sales (US map)": {"measure": "Sales", "expected": 2026.0,
                             "filter": "'Orders'[Country] = \"United States\""},
@@ -1078,6 +1079,79 @@ def test_evaluate_measure_wraps_filter_in_calculate():
     assert "CALCULATE([Sales]" in conn.sink["query"]
     assert "United States" in conn.sink["query"]
     assert filtered["ok"] is True and filtered["value"] == 123.0
+
+
+def test_normalize_expected_query_form():
+    checks = fo._normalize_expected({
+        "winners": {"query": "EVALUATE ROW(\"n\", 59)", "expected": 59},
+        "Sales": 100.0,  # flat entries still carry a (None) query key
+    })
+    by_label = {c["label"]: c for c in checks}
+    assert by_label["winners"]["query"] == "EVALUATE ROW(\"n\", 59)"
+    assert by_label["winners"]["expected"] == 59
+    assert by_label["Sales"]["query"] is None
+
+
+def test_evaluate_query_runs_scalar_and_captures_error():
+    conn = _FakeConn()
+    ok = fo._evaluate_query(conn, "EVALUATE ROW(\"v\", COUNTROWS('Orders'))")
+    assert conn.sink["query"] == "EVALUATE ROW(\"v\", COUNTROWS('Orders'))"
+    assert ok["ok"] is True and ok["value"] == 123.0 and ok["query"]
+
+    class _Boom:
+        def CreateCommand(self):
+            raise RuntimeError("syntax error near FOO")
+
+    bad = fo._evaluate_query(_Boom(), "EVALUATE FOO")
+    assert bad["ok"] is False and bad["value"] is None
+    assert "syntax error" in bad["error"]
+
+
+def test_dax_value_tier_dispatches_query_vs_measure(monkeypatch):
+    # A query-shaped expected entry must be evaluated by its own scalar DAX (calc-column path),
+    # while a plain entry goes through the measure path -- both compared under the same tolerance.
+    captured = []
+
+    class _Conn:
+        def Open(self):
+            pass
+
+        def Close(self):
+            pass
+
+    def _fake_rows(conn, query, columns):
+        captured.append(query)
+        if "DBSCHEMA_CATALOGS" in query:
+            return [{"CATALOG_NAME": "Model"}]
+        if "MDSCHEMA_MEASURES" in query:
+            return [{"MEASUREGROUP_NAME": "Orders", "MEASURE_NAME": "C1",
+                     "MEASURE_IS_VISIBLE": True}]
+        if "COUNTROWS('winners')" in query:
+            return [{"v": 59.0}]
+        if "[C1]" in query:
+            return [{"v": 1221139.3614}]
+        return [{"v": 0.0}]
+
+    # _load_adomd returns the connection *constructor*; the tier calls it as AdomdConnection(ds).
+    monkeypatch.setattr(fo, "_load_adomd", lambda: (lambda ds: _Conn()))
+    monkeypatch.setattr(fo, "_adomd_rows", _fake_rows)
+
+    out = fo.dax_value_tier(
+        port=12345,
+        measures=["C1"],
+        expected={
+            "C1 grand total": {"measure": "C1", "expected": 1221139.3614},
+            "winners distinct": {"query": "EVALUATE ROW(\"v\", COUNTROWS('winners'))",
+                                 "expected": 59},
+        },
+    )
+    assert out["available"] is True
+    cmp_by = {c["measure"]: c for c in out["comparisons"]}
+    assert cmp_by["C1 grand total"]["within_tolerance"] is True
+    win = cmp_by["winners distinct"]
+    assert win["within_tolerance"] is True and win.get("query")
+    # the query-shaped check ran its own scalar DAX, not a measure evaluation
+    assert any("COUNTROWS('winners')" in q for q in captured)
 
 
 def test_image_tier_regions_breakdown(tmp_path):

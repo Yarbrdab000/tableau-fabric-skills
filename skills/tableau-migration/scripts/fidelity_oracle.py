@@ -1621,6 +1621,24 @@ def _evaluate_measure(conn, measure_name, filter_expr=None):
                 "error": str(exc).strip()[:200]}
 
 
+def _evaluate_query(conn, dax):
+    """Evaluate a caller-supplied scalar DAX query and return its single value; capture errors.
+
+    This is the calc-*column* (or arbitrary-expression) sibling of :func:`_evaluate_measure`. A
+    Tableau calculated *column* is not a model measure, so ``EVALUATE ROW("v", [m])`` can't reach
+    it; its fidelity is checked by its own scalar DAX instead -- e.g. a distinct *non-blank* count
+    of the column's values across the table. The query must return a single row whose first column
+    is the scalar of interest (its name is irrelevant -- the reader maps column 0). A failed
+    evaluation is itself a fidelity signal, so errors are captured rather than raised.
+    """
+    try:
+        rows = _adomd_rows(conn, dax, ["v"])
+        return {"query": dax, "ok": True,
+                "value": rows[0]["v"] if rows else None, "error": None}
+    except Exception as exc:  # noqa: BLE001 -- a failed evaluation is itself a fidelity signal
+        return {"query": dax, "ok": False, "value": None, "error": str(exc).strip()[:200]}
+
+
 def _normalize_expected(expected):
     """Normalize an ``expected`` map into a list of value checks.
 
@@ -1629,7 +1647,10 @@ def _normalize_expected(expected):
     * **flat** ``{measure_name: expected_value}`` -- a model-level check (no filter context).
     * **rich** ``{label: {"measure": name, "expected": value, "filter": dax}}`` -- a per-view check
       whose ``filter`` (caller-supplied DAX) reproduces that view's filter context. ``measure``
-      defaults to ``label``; ``value`` is accepted as an alias for ``expected``.
+      defaults to ``label``; ``value`` is accepted as an alias for ``expected``. A rich entry may
+      instead carry ``"query": <scalar DAX>`` to check a calc *column* (or any non-measure scalar)
+      by its own ``EVALUATE``; when ``query`` is present it takes precedence over ``measure``/
+      ``filter``.
 
     The rich form is what models "Sales on the US-only map vs Sales on the Canada-inclusive KPIs":
     the same measure, two checks, two filter contexts, two expected values.
@@ -1642,9 +1663,11 @@ def _normalize_expected(expected):
                 "measure": val.get("measure") or key,
                 "expected": val.get("expected", val.get("value")),
                 "filter": val.get("filter"),
+                "query": val.get("query"),
             })
         else:
-            checks.append({"label": key, "measure": key, "expected": val, "filter": None})
+            checks.append({"label": key, "measure": key, "expected": val,
+                           "filter": None, "query": None})
     return checks
 
 
@@ -1750,13 +1773,18 @@ def dax_value_tier(report_dir=None, host="localhost", port=None, expected=None,
         comparisons = []
         if expected:
             for chk in _normalize_expected(expected):
-                ev = _evaluate_measure(conn, chk["measure"], chk.get("filter"))
+                if chk.get("query"):
+                    ev = _evaluate_query(conn, chk["query"])
+                else:
+                    ev = _evaluate_measure(conn, chk["measure"], chk.get("filter"))
                 actual = ev["value"] if ev["ok"] else None
                 cmp = _compare_value(chk["label"], chk["expected"], actual, tolerance)
-                if chk["measure"] != chk["label"]:
+                if not chk.get("query") and chk["measure"] != chk["label"]:
                     cmp["measure_name"] = chk["measure"]
                 if chk.get("filter"):
                     cmp["filter"] = chk["filter"]
+                if chk.get("query"):
+                    cmp["query"] = chk["query"]
                 if not ev["ok"]:
                     cmp["note"] = "evaluation error: %s" % ((ev["error"] or "")[:160])
                 comparisons.append(cmp)
@@ -1786,6 +1814,8 @@ def dax_value_tier(report_dir=None, host="localhost", port=None, expected=None,
             "expected values) the fraction of measures that evaluate without error.",
             "expected values may carry a per-view 'filter' (DAX) so a measure is checked under that "
             "view's filter context -- e.g. a US-only map vs Canada-inclusive KPIs on the same model.",
+            "an expected entry may instead carry 'query' (scalar DAX) to check a calc COLUMN or any "
+            "non-measure scalar by its own EVALUATE -- e.g. a distinct non-blank count of a column.",
         ],
     }
 
