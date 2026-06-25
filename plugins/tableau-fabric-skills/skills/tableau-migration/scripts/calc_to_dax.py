@@ -112,6 +112,10 @@ _AGG_MAP = {
 # Aggregations that require a NUMERIC column (emit DAX that errors on text/date otherwise).
 _NUMERIC_ONLY_AGGS = {"SUM", "AVG", "MEDIAN", "STDEV", "STDEVP", "VAR", "VARP"}
 
+# CORR / COVAR / COVARP are two-argument statistical aggregates with no native DAX function; they
+# are synthesized from the standard SUMX covariance/correlation identities (see _corr_covar).
+_CORR_COVAR_FNS = {"CORR", "COVAR", "COVARP"}
+
 # -- Object-model row identity (implicit row count) ---------------------------
 # A COUNT/COUNTD over Tableau's internal row identity
 # ``[__tableau_internal_object_id__].[<relation>_<hex32>]`` means "count the rows of <relation>"
@@ -188,7 +192,7 @@ _STRING_FNS = {
     "SPACE", "PROPER", "ASCII", "CHAR",
 }
 _DATE_FNS = {
-    "YEAR", "MONTH", "DAY", "TODAY", "NOW", "QUARTER",
+    "YEAR", "MONTH", "DAY", "TODAY", "NOW", "QUARTER", "WEEK",
     "DATEPART", "DATEADD", "DATEDIFF", "DATETRUNC", "DATE", "MAKEDATE",
     "ISOWEEK", "ISOWEEKDAY", "ISOYEAR", "DATENAME", "DATETIME",
 }
@@ -677,6 +681,10 @@ class _Parser:
                 if self.mode == "column":
                     raise _CalcError("GROUP_CONCAT not valid in a row-level column calc")
                 return self._group_concat()
+            if u in _CORR_COVAR_FNS:
+                if self.mode == "column":
+                    raise _CalcError(f"{u} not valid in a row-level column calc")
+                return self._corr_covar(u)
             if u == "IIF":
                 return self._iif()
             if u == "ZN":
@@ -1106,6 +1114,62 @@ class _Parser:
         ref = f"{_dax_table(table)}{_dax_col(col)}"
         return (f"CONCATENATEX({_dax_table(table)}, {ref}, {sep})", "text")
 
+    def _corr_covar(self, name):
+        # CORR / COVAR / COVARP ([x], [y]) -> the standard SUMX covariance/correlation identities
+        # over the two columns' shared base table, excluding rows where EITHER value is BLANK
+        # (Tableau drops a pair when either side is NULL); the means are taken over the same
+        # surviving pairs. With s = SUMX(_t, (x - mean_x) * (y - mean_y)) and n = COUNTROWS(_t):
+        #   COVARP = s / n            (population covariance)
+        #   COVAR  = s / (n - 1)      (sample covariance)
+        #   CORR   = s / SQRT(SUMX(_t,(x-mean_x)^2) * SUMX(_t,(y-mean_y)^2))   (Pearson r)
+        # DIVIDE makes the degenerate frames (n<=1 sample, zero-variance r) return BLANK, matching
+        # Tableau's NULL there. Only two bare NUMERIC [field] arguments on the SAME model table are
+        # supported; an expression / qualified ref / parameter / cross-table pair falls back.
+        self._next()  # CORR / COVAR / COVARP
+        self._expect_op("(")
+        cols = []
+        for i in range(2):
+            if i:
+                self._expect_op(",")
+            k, v = self._peek()
+            if k == "qfield":
+                self._qualified_ref(v)  # specific "(unmodeled)" reason instead of the generic one
+            if k != "field":
+                raise _CalcError(f"{name} supports only two bare [field] arguments")
+            self._next()
+            resolved = self.resolver(v)
+            if resolved is None:
+                raise _CalcError(f"unresolved/ambiguous field [{v}]")
+            t, c, tmdl_type = resolved
+            if tmdl_type not in _NUMERIC_TYPES:
+                raise _CalcError(f"{name} requires numeric fields, got {tmdl_type} for [{v}]")
+            cols.append((t, c))
+        self._expect_op(")")
+        (tx, cx), (ty, cy) = cols
+        if tx != ty:
+            raise _CalcError(f"{name} requires both fields on the same table")
+        self.tables_used.add(tx)
+        tbl = _dax_table(tx)
+        xd = f"{tbl}{_dax_col(cx)}"
+        yd = f"{tbl}{_dax_col(cy)}"
+        prefix = (
+            f"VAR _t = FILTER({tbl}, NOT ISBLANK({xd}) && NOT ISBLANK({yd})) "
+            f"VAR _mx = AVERAGEX(_t, {xd}) "
+            f"VAR _my = AVERAGEX(_t, {yd}) "
+            f"VAR _sxy = SUMX(_t, ({xd} - _mx) * ({yd} - _my)) "
+        )
+        if name == "CORR":
+            body = (
+                f"VAR _sxx = SUMX(_t, ({xd} - _mx) * ({xd} - _mx)) "
+                f"VAR _syy = SUMX(_t, ({yd} - _my) * ({yd} - _my)) "
+                f"RETURN DIVIDE(_sxy, SQRT(_sxx * _syy))"
+            )
+        elif name == "COVAR":
+            body = "VAR _n = COUNTROWS(_t) RETURN DIVIDE(_sxy, _n - 1)"
+        else:  # COVARP
+            body = "VAR _n = COUNTROWS(_t) RETURN DIVIDE(_sxy, _n)"
+        return (f"({prefix}{body})", "number")
+
     # ----- Row-level (calculated-column) constructs; reachable only in mode="column" -----
 
     def _row_field(self):
@@ -1255,6 +1319,13 @@ class _Parser:
             d = self._expect_date(self._expr())
             self._expect_op(")")
             return (f"{name}({d[0]})", "number")
+        if name == "WEEK":
+            # Tableau WEEK(date) = week-of-year using the datasource's week-start (default Sunday)
+            # -> DAX WEEKNUM(d, 1) (return-type 1 = week begins Sunday, week 1 contains Jan 1): the
+            # faithful default mapping (mirrors ISOWEEK -> WEEKNUM(d, 21) for the Monday/ISO case).
+            d = self._expect_date(self._expr())
+            self._expect_op(")")
+            return (f"WEEKNUM({d[0]}, 1)", "number")
         if name == "ISOWEEK":
             # ISO-8601 week number -> DAX WEEKNUM(d, 21) (return-type 21 = ISO, Monday-start).
             d = self._expect_date(self._expr())

@@ -224,6 +224,26 @@ TRANSLATIONS = [
     # GROUP_CONCAT([field][, sep]): dup-inclusive concat over the base table; default separator ",".
     ("GROUP_CONCAT([Region])", "CONCATENATEX('Orders', 'Orders'[Region], \",\")"),
     ("GROUP_CONCAT([Region], \"; \")", "CONCATENATEX('Orders', 'Orders'[Region], \"; \")"),
+    # --- CORR / COVAR / COVARP (two-argument statistical aggregates, no native DAX) ---
+    # Synthesized from the SUMX covariance/correlation identities over the pair's shared base table,
+    # dropping rows where either side is BLANK; DIVIDE returns BLANK on the degenerate frames.
+    ("CORR([Sales], [Profit])",
+     "(VAR _t = FILTER('Orders', NOT ISBLANK('Orders'[Sales]) && NOT ISBLANK('Orders'[Profit])) "
+     "VAR _mx = AVERAGEX(_t, 'Orders'[Sales]) VAR _my = AVERAGEX(_t, 'Orders'[Profit]) "
+     "VAR _sxy = SUMX(_t, ('Orders'[Sales] - _mx) * ('Orders'[Profit] - _my)) "
+     "VAR _sxx = SUMX(_t, ('Orders'[Sales] - _mx) * ('Orders'[Sales] - _mx)) "
+     "VAR _syy = SUMX(_t, ('Orders'[Profit] - _my) * ('Orders'[Profit] - _my)) "
+     "RETURN DIVIDE(_sxy, SQRT(_sxx * _syy)))"),
+    ("COVAR([Sales], [Profit])",
+     "(VAR _t = FILTER('Orders', NOT ISBLANK('Orders'[Sales]) && NOT ISBLANK('Orders'[Profit])) "
+     "VAR _mx = AVERAGEX(_t, 'Orders'[Sales]) VAR _my = AVERAGEX(_t, 'Orders'[Profit]) "
+     "VAR _sxy = SUMX(_t, ('Orders'[Sales] - _mx) * ('Orders'[Profit] - _my)) "
+     "VAR _n = COUNTROWS(_t) RETURN DIVIDE(_sxy, _n - 1))"),
+    ("COVARP([Sales], [Profit])",
+     "(VAR _t = FILTER('Orders', NOT ISBLANK('Orders'[Sales]) && NOT ISBLANK('Orders'[Profit])) "
+     "VAR _mx = AVERAGEX(_t, 'Orders'[Sales]) VAR _my = AVERAGEX(_t, 'Orders'[Profit]) "
+     "VAR _sxy = SUMX(_t, ('Orders'[Sales] - _mx) * ('Orders'[Profit] - _my)) "
+     "VAR _n = COUNTROWS(_t) RETURN DIVIDE(_sxy, _n))"),
 ]
 
 # Each of these MUST fall back (translator returns None).
@@ -243,6 +263,8 @@ FALLBACKS = [
     "IF SUM([Sales]) > SUM([People Count]) THEN 1 ELSE 0 END",
     "SUM([Sales] - [People Count])",              # cross-table expression aggregate
     'SUM(IF [Region] = "East" THEN [Sales] ELSE [People Count] END)',  # cross-table conditional agg
+    "CORR([Sales], [People Count])",              # cross-table statistical aggregate (Orders + People)
+    "COVAR([Sales], [People Count])",             # cross-table statistical aggregate
     # expression / conditional aggregation forms that must still fall back
     "STDEV([Sales]*[Quantity])",                  # stats iterator (STDEVX) not yet supported
     'SUM(IF [Region] = "East" THEN [Region] END)',   # SUM over a text expression
@@ -256,6 +278,9 @@ FALLBACKS = [
     "VAR([Order Date])",                          # VAR on dateTime
     "PERCENTILE([Region], 0.5)",                  # PERCENTILE on string
     "PERCENTILE([Sales])",                        # PERCENTILE missing the fraction arg
+    "CORR([Sales], [Region])",                    # CORR with a non-numeric operand
+    "COVARP([Region], [Profit])",                 # COVARP with a non-numeric operand
+    "CORR([Sales])",                              # CORR missing the second operand
     "MOD(SUM([Quantity]))",                       # MOD needs 2 operands
     # type-soundness failures in the conditional grammar
     'IF SUM([Sales]) > 0 THEN SUM([Profit]) ELSE "n/a" END',   # mixed number/text branches
@@ -457,6 +482,7 @@ COLUMN_TRANSLATIONS = [
     ("MAKEDATE(2024, 1, 15)", "DATE(2024, 1, 15)"),                       # exact, culture-independent
     ("MAKEDATE(YEAR([Order Date]), 1, 1)", "DATE(YEAR('Orders'[Order_Date]), 1, 1)"),  # composes with parts
     ("QUARTER([Order Date])", "QUARTER('Orders'[Order_Date])"),                          # 1-4
+    ("WEEK([Order Date])", "WEEKNUM('Orders'[Order_Date], 1)"),                          # week-of-year, Sunday-start default
     ("ISOWEEK([Order Date])", "WEEKNUM('Orders'[Order_Date], 21)"),                      # ISO-8601 week
     ("ISOWEEKDAY([Order Date])", "WEEKDAY('Orders'[Order_Date], 2)"),                    # Mon=1..Sun=7
     ("ISOYEAR([Order Date])",
@@ -485,6 +511,9 @@ COLUMN_FALLBACKS = [
     "PERCENTILE([Sales], 0.5)",                   # aggregation
     "ATTR([Region])",                             # ATTR is an aggregation (HASONEVALUE/VALUES) -> measure-only
     "GROUP_CONCAT([Region])",                     # GROUP_CONCAT aggregates the whole partition -> measure-only
+    "CORR([Sales], [Profit])",                    # two-arg statistical aggregate -> measure-only
+    "COVAR([Sales], [Profit])",                   # measure-only
+    "COVARP([Sales], [Profit])",                  # measure-only
     "{FIXED [Region] : SUM([Sales])}",            # LOD
     # functions whose DAX equivalent is not faithful -> deferred to fallback
     "TRIM([Region])",                             # DAX TRIM also collapses internal spaces
