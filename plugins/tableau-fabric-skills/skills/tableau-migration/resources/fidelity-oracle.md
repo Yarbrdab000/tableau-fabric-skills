@@ -152,7 +152,11 @@ packages are absent — importing the module never fails offline.
   Passing `regions` (fractional crop boxes per zone) adds a **per‑zone SSIM breakdown** +
   `regions_mean_ssim`, which localizes *where* a composite render diverges instead of collapsing it
   into one number (on a real pilot pair: map `0.77`, KPI `0.68`, but sorted/grouped bars `0.48` and
-  an area→line time‑series `0.48`).
+  an area→line time‑series `0.48`). Rather than hand‑estimating those crop boxes, pass
+  `--image-auto-regions`: the **structural tier feeds the image tier** — each worksheet's Tableau
+  dashboard zone becomes the *reference* crop and its paired PBIR visual position becomes the
+  *candidate* crop, so each render is cropped by *its own* layout and the per‑zone SSIM is keyed by
+  worksheet name with no manual tuning.
 
 ```powershell
 # optional tiers — DAX-value (needs a live Power BI Desktop) and image (needs numpy + Pillow)
@@ -160,9 +164,10 @@ py -3.11 scripts\fidelity_oracle.py `
   "<path>\workbook.twb" "<out>\reports\<Workbook>.Report" `
   --dax --dax-port 57006 `                 # omit --dax-port to auto-discover when only one is live
   --expected "<path>\expected_values.json" `  # optional {measure: value} map
-  --image-ref  "<ref>\tableau_view.png" `   # server-rendered Tableau view (RLS applied)
-  --image-cand "<out>\powerbi_render.png" ` # Power BI export/screenshot
+  --image-ref  "<ref>\tableau_dashboard.png" ` # server-rendered Tableau view (RLS applied)
+  --image-cand "<out>\powerbi_render.png" `    # Power BI export/screenshot
   --image-threshold 0.80 `
+  --image-auto-regions `                   # derive per-worksheet crops from the dashboard layout
   --format md
 ```
 

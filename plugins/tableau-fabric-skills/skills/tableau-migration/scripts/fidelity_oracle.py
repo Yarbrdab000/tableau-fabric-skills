@@ -972,6 +972,52 @@ def _page_for_dashboard(dash, pbir):
     return multi[0] if len(multi) == 1 else None
 
 
+def _nbox(npos):
+    """Convert a normalized ``{x, y, w, h}`` position into a fractional ``(x0, y0, x1, y1)`` crop box."""
+    if not npos:
+        return None
+    x, y, w, h = npos.get("x"), npos.get("y"), npos.get("w"), npos.get("h")
+    if None in (x, y, w, h):
+        return None
+    return (float(x), float(y), float(x) + float(w), float(y) + float(h))
+
+
+def regions_from_layout(twb, pbir):
+    """Derive per-worksheet image crop regions from the structural dashboard pairing.
+
+    For each Tableau dashboard worksheet that pairs to a PBIR visual, emit a region whose ``ref``
+    box is the worksheet's normalized dashboard-zone rect and whose ``cand`` box is the paired
+    visual's normalized PBIR position. The image tier then crops *each engine's* render by its OWN
+    layout and SSIM-compares the same logical zone -- no hand-estimated crop fractions. This is the
+    structural tier feeding the image tier: it localizes which worksheet (mark-type/sort/layout)
+    diverges, exactly where a single whole-dashboard SSIM number is blind.
+    """
+    regions = []
+    visual_pages = {p["display"]: p for p in pbir["pages"]}
+    ws_by_name = twb["worksheets"]
+    for dash in twb["dashboards"]:
+        page = visual_pages.get(dash["name"]) or _page_for_dashboard(dash, pbir)
+        if page is None:
+            continue
+        zone_by_ws = {z["worksheet"]: z for z in dash["zones"]}
+        dash_ws = [ws_by_name[z["worksheet"]] for z in dash["zones"]
+                   if z["worksheet"] in ws_by_name]
+        non_slicers = [v for v in page["visuals"] if not v["is_slicer"]]
+        pairs = _greedy_pair(dash_ws, non_slicers, zone_by_ws)
+        vidx = {v["name"]: v for v in page["visuals"]}
+        for wsn, vn, _sim in pairs:
+            zone = zone_by_ws.get(wsn)
+            rbox = _nbox(zone.get("nposition") if zone else None)
+            if rbox is None:
+                continue
+            region = {"name": wsn, "ref": rbox}
+            cbox = _nbox(vidx[vn].get("nposition"))
+            if cbox is not None:
+                region["cand"] = cbox
+            regions.append(region)
+    return regions
+
+
 def _score_slicer(visual, dash_ws, page_display):
     fields = visual["filter_fields"] or visual["fields"]
     field_norms = {f["norm"] for f in fields if f.get("norm")}
@@ -1541,7 +1587,12 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
     if dax_options is not None:
         report["dax_value"] = dax_value_tier(report_dir=report_dir, **dax_options)
     if image_options is not None:
-        report["image"] = image_tier(**image_options)
+        opts = dict(image_options)
+        if opts.pop("auto_regions", False) and not opts.get("regions"):
+            derived = regions_from_layout(twb, pbir)
+            if derived:
+                opts["regions"] = derived
+        report["image"] = image_tier(**opts)
     return report
 
 
@@ -1635,6 +1686,9 @@ def main(argv=None):
     ap.add_argument("--image-threshold", type=float, default=DEFAULT_ACCEPTANCE_SSIM,
                     help="Advisory SSIM acceptance floor a faithful rebuild should clear "
                          "(default %(default)s).")
+    ap.add_argument("--image-auto-regions", action="store_true",
+                    help="Derive per-worksheet image crop regions from the dashboard layout "
+                         "(crops each render by its own zone positions; no hand-tuned boxes).")
     args = ap.parse_args(argv)
 
     dax_options = None
@@ -1646,7 +1700,8 @@ def main(argv=None):
     image_options = None
     if args.image_ref or args.image_cand:
         image_options = {"reference_png": args.image_ref, "candidate_png": args.image_cand,
-                         "acceptance_threshold": args.image_threshold}
+                         "acceptance_threshold": args.image_threshold,
+                         "auto_regions": args.image_auto_regions}
 
     report = run_oracle(args.twb, args.report_dir, args.engine_report,
                         dax_options=dax_options, image_options=image_options)

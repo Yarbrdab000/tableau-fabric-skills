@@ -737,3 +737,51 @@ def test_run_oracle_attaches_optional_tiers(tmp_path):
     assert "DAX-value tier" in md and "Image tier" in md
 
 
+def test_nbox_converts_normalized_position():
+    assert fo._nbox({"x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0}) == (0.5, 0.0, 1.0, 1.0)
+    assert fo._nbox(None) is None
+    assert fo._nbox({"x": 0.0, "y": 0.0, "w": 0.5}) is None  # missing 'h'
+
+
+def test_regions_from_layout_pairs_zones(tmp_path):
+    # The structural pairing drives the per-zone image crop boxes: each worksheet's Tableau zone
+    # (ref) and its paired PBIR visual position (cand), with no hand-tuned fractions.
+    report = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    twb = fo.read_twb_views(TWB_XML)
+    pbir = fo.read_pbir_report(report)
+    regions = fo.regions_from_layout(twb, pbir)
+    by_name = {r["name"]: r for r in regions}
+    assert set(by_name) == {"Bars", "Trend"}
+    # Bars occupies the left half on both sides; Trend the right half.
+    assert by_name["Bars"]["ref"][0] == pytest.approx(0.0)
+    assert by_name["Bars"]["ref"][2] == pytest.approx(0.5)
+    assert by_name["Bars"]["cand"][2] == pytest.approx(0.5)
+    assert by_name["Trend"]["ref"][0] == pytest.approx(0.5)
+    assert by_name["Trend"]["cand"][0] == pytest.approx(0.5)
+
+
+def test_run_oracle_auto_regions_injects_image_regions(tmp_path):
+    np = pytest.importorskip("numpy")
+    Image = pytest.importorskip("PIL.Image")
+    report = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    twb_path = tmp_path / "wb.twb"
+    twb_path.write_text(TWB_XML, encoding="utf-8")
+    # Left half (Bars zone) identical; right half (Trend zone) diverges between ref and candidate.
+    half = np.tile(np.linspace(0, 255, 64).astype("uint8"), (64, 1))
+    ref = np.hstack([half, half])
+    cand = np.hstack([half, 255 - half])
+    p1, p2 = tmp_path / "ref.png", tmp_path / "cand.png"
+    Image.fromarray(ref).save(str(p1))
+    Image.fromarray(cand).save(str(p2))
+    result = fo.run_oracle(
+        str(twb_path), report,
+        image_options={"reference_png": str(p1), "candidate_png": str(p2),
+                       "auto_regions": True})
+    img = result["image"]
+    assert img["available"] is True
+    zones = {z["name"]: z for z in img["regions"]}
+    assert set(zones) == {"Bars", "Trend"}
+    # Auto-derived crops localize the divergence to the Trend (right-half) zone.
+    assert zones["Bars"]["ssim"] > zones["Trend"]["ssim"]
+
+
