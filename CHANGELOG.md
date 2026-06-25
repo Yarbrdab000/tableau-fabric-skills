@@ -13,6 +13,17 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** the human-approved **assisted-translation landing now covers dimension
+  calc COLUMNS** — the column-mode peer of the measures' `approved_calc_dax` channel — exposed on
+  the estate CLI as **`--approved-dax <file.json>`**. A `{calc_name: dax}` approval flips an inert
+  calculated-column stub into a live, byte-validated calculated column
+  (`TranslatedBy = assisted translation (human-approved)`, status `assisted-approved`), consulted
+  **only** when the deterministic tier produced no DAX so a faithful Tier-0 column is never
+  overridden; the original Tableau formula is preserved as `TableauFormula`. `approved_calc_dax` is
+  threaded end-to-end through `migrate_estate` (`_migrate_one_datasource`,
+  `_rebuild_from_published_match`, `_attach_workbook_pbip`), and the dimension-calc coverage rollup
+  gains an additive `assisted_approved` bucket + `live_coverage_pct` (existing keys preserved). With
+  no approval supplied the run is byte-for-byte unchanged; the migration suite stays green.
 - **tableau-migration:** **a local `.twbx` / `.tdsx` upload is now discovered and read** by the
   file-backed estate source, so the "just upload the packaged workbook / datasource" path behaves like a
   live pull instead of silently finding nothing. `migrate_estate.LocalFilesSource` previously matched only
@@ -468,6 +479,16 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
+- **tableau-migration:** the TMDL serializer now emits an **openable** model when a measure or
+  calculated column carries a **multi-line** DAX expression. A deterministic multi-line body (e.g.
+  the Date Filter keep-flag's `VAR … RETURN … SWITCH(…)`) was written inline after `measure 'X' = `,
+  dropping its continuation lines to **column 0** — invalid TMDL that left the model `BLOCKED`
+  (unparseable by TOM / Power BI Desktop). `tmdl_generate` now renders a multi-line expression as an
+  indented block (the declaration ends at `=` on its own line, body lines one level deeper than the
+  property level); single-line DAX is byte-for-byte unchanged. A second defect is fixed alongside
+  it: an **empty-value annotation** (`annotation TableauFormula = ` with no value, e.g. a synthesized
+  measure-swap `SUM`) is now **elided** rather than emitted as unparseable TMDL. Adds 4 openability
+  regression tests; the migration suite stays green.
 - **All three skills:** trimmed every `SKILL.md` `description` to fit GitHub Copilot's 1024-char
   frontmatter cap (they were 1369 / 1331 / 1333 chars). Over-limit descriptions are dropped
   silently — the plugin installs and `plugin list` shows it, but the skills never register in a
