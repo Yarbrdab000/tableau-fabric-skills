@@ -13,8 +13,14 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration:** the human-approved **assisted-translation landing now covers dimension
-  calc COLUMNS** — the column-mode peer of the measures' `approved_calc_dax` channel — exposed on
+- **tableau-migration:** **a pure-Python TMDL well-formedness linter** (`scripts/tmdl_lint.py`)
+  plus pytest coverage (`tests/test_tmdl_lint.py`) that guards the serializer's *openability*
+  invariants in-suite. It flags the three failure modes that make a generated `.tmdl` fail to open
+  in Power BI / TOM — empty-value annotations, column-0 / sibling-level orphan lines outside the
+  top-level keyword allowlist, and a multi-line `measure` / `column` / `expression` body that is not
+  indented deeper than its opener's property level — over both raw TMDL text and the real generator
+  output. Purely a developer/CI safety net for serializer regressions; no runtime, report-schema, or
+  generated-output behavior changes. — the column-mode peer of the measures' `approved_calc_dax` channel — exposed on
   the estate CLI as **`--approved-dax <file.json>`**. A `{calc_name: dax}` approval flips an inert
   calculated-column stub into a live, byte-validated calculated column
   (`TranslatedBy = assisted translation (human-approved)`, status `assisted-approved`), consulted
