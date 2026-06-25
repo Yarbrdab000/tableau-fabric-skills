@@ -1502,12 +1502,14 @@ def _parse_worksheet_title(ws):
     return text, bool(_TITLE_DYNAMIC_RE.search(text))
 
 
-# Per-run font attributes that Tableau records on a title's ``<run>`` but which Tier-1 title
-# styling deliberately does NOT reproduce: bold / italic / underline / font family (Tableau's
-# internal 'Tableau Bold' etc. have no Power BI equivalent) and paragraph alignment (the
-# container-title alignment enum is unconfirmed). They are recorded as ``deferred`` for a future
-# Tier-2 pass but never emitted (warn-never-wrong).
-_TITLE_STYLE_DEFER_ATTRS = ("bold", "italic", "underline", "fontname", "fontalignment")
+# Per-run font attributes on a title's ``<run>`` that Tier-2 title styling reproduces only when it
+# can do so faithfully. ``bold`` and ``fontname`` (font family) are emitted when uniform (family
+# only for a REAL font -- Tableau's internal 'Tableau Bold' / 'Tableau Semibold' etc. have no Power
+# BI equivalent, so they defer); ``italic`` / ``underline`` (unconfirmed container-title props) and
+# ``fontalignment`` (unconfirmed alignment enum -> a wrong guess would mis-align the title) are
+# ALWAYS deferred. Deferred attributes are recorded for a future pass, never emitted.
+_TITLE_ALWAYS_DEFER_ATTRS = ("italic", "underline", "fontalignment")
+_TITLE_INTERNAL_FONT_RE = re.compile(r"^Tableau\b", re.IGNORECASE)
 _HEX6_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
@@ -1531,14 +1533,15 @@ def _parse_title_style(ws):
     """Uniform font styling for a worksheet's static title -> a Tier-2 title-style dict.
 
     Reads the per-run font attributes on the title's ``<run>`` elements (the styling that
-    ``_parse_worksheet_title`` discards) and keeps ONLY the two unambiguous, schema-grounded
-    properties a Power BI container title can reproduce faithfully: ``font_size`` (points) and
-    ``font_color`` (``#rrggbb``). Power BI applies ONE font to the whole title, so a property is
-    emitted only when EVERY text-bearing run declares the SAME value; a title whose runs disagree
-    -- or only partially declare a property -- cannot be reproduced faithfully, so that property
-    is deferred (warn-never-wrong). Bold / italic / underline / font family / alignment are always
-    deferred. Returns the style dict (with an additive ``deferred`` list of property names seen but
-    not emitted), or ``None`` when the title carries no font styling at all.
+    ``_parse_worksheet_title`` discards) and keeps the schema-grounded container-title font
+    properties that can be reproduced faithfully: ``font_size`` (points), ``font_color``
+    (``#rrggbb``), ``bold`` (weight), and ``font_family`` (a real, non-Tableau-internal font).
+    Power BI applies ONE font to the whole title, so a property is emitted only when EVERY
+    text-bearing run agrees; a title whose runs disagree -- or only partially declare a property --
+    cannot be reproduced faithfully, so that property is deferred (warn-never-wrong). Italic /
+    underline / alignment and Tableau-internal font families are always deferred. Returns the style
+    dict (with an additive ``deferred`` list of property names seen but not emitted), or ``None``
+    when the title carries no font styling at all.
     """
     layout = _first(ws, "layout-options")
     title = _first(layout, "title") if layout is not None else None
@@ -1571,7 +1574,24 @@ def _parse_title_style(ws):
     elif any(r.get("fontcolor") for r in text_runs):
         deferred.append("fontcolor")
 
-    for attr in _TITLE_STYLE_DEFER_ATTRS:
+    # Bold weight: emit only when EVERY text-bearing run is bold; a title with mixed weight cannot
+    # be reproduced by Power BI's single-font title, so defer.
+    bold_runs = [r for r in text_runs if r.get("bold") == "true"]
+    if bold_runs:
+        if len(bold_runs) == len(text_runs):
+            style["bold"] = True
+        else:
+            deferred.append("bold")
+
+    # Font family: emit only a uniform, real font; Tableau's internal font families ('Tableau Bold'
+    # etc.) have no Power BI equivalent, so defer them rather than emit an unresolvable face.
+    family = _uniform("fontname")
+    if family is not None and not _TITLE_INTERNAL_FONT_RE.match(family.strip()):
+        style["font_family"] = family.strip()
+    elif any(r.get("fontname") for r in text_runs):
+        deferred.append("fontname")
+
+    for attr in _TITLE_ALWAYS_DEFER_ATTRS:
         if any(r.get(attr) for r in text_runs):
             deferred.append(attr)
 
@@ -3498,11 +3518,12 @@ def _semantic_string_literal(value):
 def _title_style_props(title_style):
     """Uniform title font styling -> ``visualContainerObjects.title`` property entries.
 
-    Emits only the two unambiguous, schema-grounded container-title font properties -- ``fontSize``
-    (a numeric ``"Nd"`` literal) and ``fontColor`` (a solid single-quoted hex literal) -- both
-    verified against the Microsoft PBIR visual-title reference. Any ``deferred`` styling recorded on
-    the style dict (bold / family / alignment / non-uniform size or colour) is intentionally NOT
-    emitted (warn-never-wrong)."""
+    Emits the schema-grounded container-title font properties -- ``fontSize`` (a numeric ``"Nd"``
+    literal), ``fontColor`` (a solid single-quoted hex literal), ``bold`` (a quoted-boolean weight),
+    and ``fontFamily`` (a single-quoted real font face) -- all verified against the Microsoft PBIR
+    visual-title reference. Any ``deferred`` styling recorded on the style dict (italic / underline /
+    alignment / Tableau-internal family / non-uniform values) is intentionally NOT emitted
+    (warn-never-wrong)."""
     props = {}
     if not title_style:
         return props
@@ -3513,6 +3534,11 @@ def _title_style_props(title_style):
     if color:
         props["fontColor"] = {"solid": {"color": {"expr": {"Literal": {
             "Value": _semantic_string_literal(color)}}}}}
+    if title_style.get("bold"):
+        props["bold"] = {"expr": {"Literal": {"Value": "true"}}}
+    family = title_style.get("font_family")
+    if family:
+        props["fontFamily"] = {"expr": {"Literal": {"Value": _semantic_string_literal(family)}}}
     return props
 
 

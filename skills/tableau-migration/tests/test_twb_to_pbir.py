@@ -3884,13 +3884,39 @@ def test_title_style_disagreeing_runs_defer_property():
     assert _title_fact(res, "Sales by Category") == {"deferred": ["fontsize"]}
 
 
-def test_title_style_bold_and_family_are_deferred_not_emitted():
-    res = migrate_twb_to_pbir(
-        _titled_ws("<run bold='true' fontname='Tableau Bold' fontsize='14'>Sales</run>"))
+def test_title_style_uniform_bold_emits_weight():
+    # every text run is bold -> the container title carries bold=true.
+    res = migrate_twb_to_pbir(_titled_ws("<run bold='true' fontsize='14'>Sales</run>"))
+    props = _title_props(res)
+    assert props["bold"]["expr"]["Literal"]["Value"] == "true"
+    assert props["fontSize"]["expr"]["Literal"]["Value"] == "14D"
+    assert res["ir"]["worksheets"][0]["title_style"]["bold"] is True
+
+
+def test_title_style_mixed_bold_is_deferred():
+    # one run bold, one not -> mixed weight defers (Power BI applies one font to the whole title).
+    res = migrate_twb_to_pbir(_titled_ws("<run bold='true'>Big</run><run>plain</run>"))
+    assert "bold" not in _title_props(res)
+    assert res["ir"]["worksheets"][0]["title_style"] == {"deferred": ["bold"]}
+
+
+def test_title_style_real_font_family_emits():
+    # a real (non-Tableau-internal) uniform font family -> fontFamily literal.
+    res = migrate_twb_to_pbir(_titled_ws("<run fontname='Georgia' fontsize='12'>Sales</run>"))
+    props = _title_props(res)
+    assert props["fontFamily"]["expr"]["Literal"]["Value"] == "'Georgia'"
+    assert res["ir"]["worksheets"][0]["title_style"]["font_family"] == "Georgia"
+
+
+def test_title_style_internal_font_and_alignment_deferred_bold_emitted():
+    # Tableau-internal family ('Tableau Bold') + alignment defer; an explicit uniform bold emits.
+    res = migrate_twb_to_pbir(_titled_ws(
+        "<run bold='true' fontname='Tableau Bold' fontalignment='1' fontsize='14'>Sales</run>"))
     props = _title_props(res)
     assert props["fontSize"]["expr"]["Literal"]["Value"] == "14D"
-    assert set(props) == {"show", "text", "fontSize"}  # no bold / fontFamily property
-    assert res["ir"]["worksheets"][0]["title_style"]["deferred"] == ["bold", "fontname"]
+    assert props["bold"]["expr"]["Literal"]["Value"] == "true"
+    assert "fontFamily" not in props  # Tableau-internal font has no Power BI equivalent
+    assert set(res["ir"]["worksheets"][0]["title_style"]["deferred"]) == {"fontname", "fontalignment"}
 
 
 def test_title_style_non_hex_color_is_deferred():
