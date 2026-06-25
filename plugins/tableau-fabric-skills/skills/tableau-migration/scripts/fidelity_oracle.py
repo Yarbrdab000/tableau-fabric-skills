@@ -43,6 +43,9 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import xml.etree.ElementTree as ET
 
 ORACLE_VERSION = 2
@@ -1939,6 +1942,429 @@ def image_tier(reference_png=None, candidate_png=None, acceptance_threshold=None
 
 
 # =====================================================================================
+# Optional Tier-3 host bridge: local Power BI Desktop render + first-party PBIR validation
+# =====================================================================================
+# Two deterministic, first-party Microsoft CLIs un-park the parts of the oracle that need a real
+# Power BI *render* (or an authoritative schema check) rather than just the emitted JSON -- and they
+# run locally/offline, so the oracle stays a standalone advisory tool:
+#
+#   * ``@microsoft/powerbi-desktop-bridge-cli`` (``powerbi-desktop``) drives a running Power BI
+#     Desktop over its secure local bridge: ``open`` a .pbip, read ``status`` (the running instances
+#     + their PIDs/report dirs), and capture a per-PAGE ``screenshot``/``screenshot-all``. That page
+#     PNG is the Power BI half the image tier was missing; cropping it by the per-visual PBIR px this
+#     module already computes (see :func:`regions_from_layout`) yields a per-zone SSIM with no
+#     hand-tuned crop boxes.
+#   * ``@microsoft/powerbi-report-authoring-cli`` (``powerbi-report-author``) ``validate``s a
+#     .pbip/.Report directory against the first-party PBIR schema -- an independent structural
+#     pre-gate that catches schema drift a hand-rolled parser cannot self-detect.
+#
+# Both are wrapped exactly like the DAX/image tiers: located on PATH, run in a child process with a
+# timeout, parsed defensively (CLI JSON shapes are tolerated, not assumed), and degraded to
+# ``{available: False, reason}`` when absent or erroring. They are ADVISORY add-ons -- never invoked
+# at import, never able to raise, and never fed into the structural aggregate -- so they cannot move
+# calibration or break the engine gate.
+DESKTOP_BRIDGE_CMD = "powerbi-desktop"
+DESKTOP_BRIDGE_PKG = "@microsoft/powerbi-desktop-bridge-cli"
+REPORT_AUTHOR_CMD = "powerbi-report-author"
+REPORT_AUTHOR_PKG = "@microsoft/powerbi-report-authoring-cli"
+DEFAULT_CLI_TIMEOUT = 180        # seconds; a reload/render on a large model can be slow
+DEFAULT_SCREENSHOT_SCALE = 2     # the bridge's own default: readable without huge PNGs
+_MAX_DIAGNOSTICS = 50            # cap stored validation diagnostics so a report stays compact
+
+
+def _locate_cli(cmd, explicit=None):
+    """Resolve a Node CLI executable: an explicit path/name, else ``cmd`` on PATH, else its Windows
+    shim (``npm`` global bins are ``.cmd`` on Windows). Returns the resolved path or None -- never
+    raises, so a missing CLI is just an ``unavailable`` tier."""
+    if explicit:
+        if os.path.isfile(explicit):
+            return explicit
+        return shutil.which(explicit) or None
+    found = shutil.which(cmd)
+    if found:
+        return found
+    for ext in (".cmd", ".exe", ".bat"):
+        found = shutil.which(cmd + ext)
+        if found:
+            return found
+    return None
+
+
+def _run_cli(exe, args, timeout=DEFAULT_CLI_TIMEOUT, cwd=None):
+    """Run ``exe`` with ``args`` in a child process, capturing output. Never raises: returns
+    ``{ran, rc, stdout, stderr}`` on completion, or ``{ran: False, reason}`` when the process could
+    not start or timed out. This is the single choke point the host-bridge tiers go through, so a
+    missing/slow CLI degrades gracefully instead of crashing the advisory run."""
+    try:
+        proc = subprocess.run([exe] + [str(a) for a in args], capture_output=True,
+                              text=True, timeout=timeout, cwd=cwd)
+    except subprocess.TimeoutExpired:
+        return {"ran": False, "reason": "timed out after %ss" % timeout}
+    except (OSError, ValueError) as exc:  # noqa: BLE001
+        return {"ran": False, "reason": str(exc).strip()[:160]}
+    return {"ran": True, "rc": proc.returncode,
+            "stdout": proc.stdout or "", "stderr": proc.stderr or ""}
+
+
+def _parse_json_loose(text):
+    """Best-effort JSON parse of CLI output: try the whole string, then the widest ``{...}`` or
+    ``[...]`` slice (CLIs sometimes prefix a log line before the JSON payload). Returns the parsed
+    object or None -- strict parsing alone is too brittle for an advisory wrapper."""
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        pass
+    for op, cl in (("{", "}"), ("[", "]")):
+        i, j = text.find(op), text.rfind(cl)
+        if 0 <= i < j:
+            try:
+                return json.loads(text[i:j + 1])
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+def _safe_unlink(path):
+    if path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _safe_name(text):
+    """Filesystem-safe slug for a page id used as a screenshot filename."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(text)) or "page"
+
+
+# -- first-party PBIR validation (powerbi-report-author validate) --------------------------------
+def _collect_diagnostics(payload):
+    """Pull a flat, normalized diagnostics list out of whatever shape the validator emits.
+
+    Tolerant by design: accepts a top-level list, a ``{diagnostics|issues|...: [...]}`` dict, nested
+    ``results[].diagnostics``, or split ``{errors: [...], warnings: [...]}`` -- normalizing each
+    entry to ``{severity, message, file, json_path}``. Unknown shapes yield ``[]`` rather than
+    raising. (Field names per the CLI's documented diagnostics: severity + file path + JSON path.)
+    """
+    out = []
+
+    def _norm_one(item, default_sev=None):
+        if isinstance(item, str):
+            return {"severity": default_sev or "error", "message": item[:300],
+                    "file": None, "json_path": None}
+        if not isinstance(item, dict):
+            return None
+        raw_sev = (item.get("severity") or item.get("level") or item.get("type")
+                   or default_sev or "error")
+        sev = str(raw_sev).strip().lower()
+        if sev in ("err", "fatal", "critical"):
+            sev = "error"
+        elif sev == "warn":
+            sev = "warning"
+        elif sev not in ("error", "warning", "info"):
+            sev = default_sev or "error"
+        msg = (item.get("message") or item.get("text") or item.get("description")
+               or item.get("rule") or item.get("code") or "")
+        f = item.get("file") or item.get("filePath") or item.get("fileName")
+        jp = (item.get("jsonPath") or item.get("json_path") or item.get("path")
+              or item.get("pointer"))
+        return {"severity": sev, "message": str(msg)[:300],
+                "file": str(f) if f else None, "json_path": str(jp) if jp else None}
+
+    if isinstance(payload, list):
+        for it in payload:
+            n = _norm_one(it)
+            if n:
+                out.append(n)
+        return out
+    if isinstance(payload, dict):
+        for key in ("diagnostics", "issues", "problems", "messages", "results"):
+            seq = payload.get(key)
+            if not isinstance(seq, list):
+                continue
+            for it in seq:
+                if isinstance(it, dict) and isinstance(it.get("diagnostics"), list):
+                    for d in it["diagnostics"]:
+                        n = _norm_one(d)
+                        if n:
+                            out.append(n)
+                else:
+                    n = _norm_one(it)
+                    if n:
+                        out.append(n)
+        for key, sev in (("errors", "error"), ("warnings", "warning")):
+            seq = payload.get(key)
+            if isinstance(seq, list):
+                for it in seq:
+                    n = _norm_one(it, default_sev=sev)
+                    if n:
+                        out.append(n)
+    return out
+
+
+def _shape_validation(payload, res):
+    """Normalize the parsed validator output (+ raw run result) into the advisory record."""
+    rc = res.get("rc")
+    diags = _collect_diagnostics(payload)
+    errors = [d for d in diags if d["severity"] == "error"]
+    warnings = [d for d in diags if d["severity"] == "warning"]
+    valid = None
+    if isinstance(payload, dict):
+        for key in ("valid", "isValid", "success", "passed", "ok"):
+            if isinstance(payload.get(key), bool):
+                valid = payload[key]
+                break
+    if valid is None:
+        if errors:
+            valid = False
+        elif rc is not None:
+            valid = (rc == 0)
+    record = {
+        "tier": "pbir_validation",
+        "available": True,
+        "valid": valid,
+        "error_count": len(errors),
+        "warning_count": len(warnings),
+        "diagnostics": diags[:_MAX_DIAGNOSTICS],
+        "diagnostics_truncated": len(diags) > _MAX_DIAGNOSTICS,
+        "exit_code": rc,
+        "advisory": True,
+        "notes": [
+            "ADDITIVE first-party PBIR schema validation (powerbi-report-author): an independent "
+            "structural pre-gate, never folded into the fidelity aggregate and never a verdict on "
+            "the rebuild's faithfulness.",
+            "A validation ERROR is a concrete, fix-before-ship defect (malformed PBIR); warnings "
+            "(e.g. an unknown visual type) usually mean a typo unless a custom visual is intended.",
+        ],
+    }
+    if not diags and payload is None:
+        record["notes"].append(
+            "CLI produced no parseable diagnostics; validity was inferred from the exit code.")
+    return record
+
+
+def validate_pbir(report_path, cli=None, timeout=DEFAULT_CLI_TIMEOUT):
+    """Optional first-party PBIR validation pre-gate via ``powerbi-report-author validate``.
+
+    Runs Microsoft's own report-authoring CLI over a ``.pbip`` or ``.Report`` directory and returns
+    ``{available, valid, error_count, warning_count, diagnostics, ...}``. ADDITIVE: it confirms the
+    emitted PBIR is well-formed against the authoritative schema and surfaces drift this module's
+    hand-rolled reader cannot self-detect. It is NOT blended into the structural aggregate -- a
+    separate boolean/diagnostics signal beside type/position/fields -- so it never moves calibration.
+    Lazy + guarded: ``{available: False, reason}`` when the CLI is absent or the run fails, exactly
+    like the DAX/image tiers."""
+    exe = _locate_cli(REPORT_AUTHOR_CMD, explicit=cli)
+    if not exe:
+        return {"tier": "pbir_validation", "available": False,
+                "reason": "%s CLI not found on PATH (npm i -g %s)" % (
+                    REPORT_AUTHOR_CMD, REPORT_AUTHOR_PKG)}
+    if not report_path or not os.path.exists(report_path):
+        return {"tier": "pbir_validation", "available": False,
+                "reason": "path not found: %s" % report_path}
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(suffix=".json", prefix="pbir_validate_")
+        os.close(fd)
+    except OSError:
+        tmp = None
+    args = ["validate", report_path]
+    if tmp:
+        args += ["--out", tmp]
+    res = _run_cli(exe, args, timeout=timeout)
+    if not res.get("ran"):
+        _safe_unlink(tmp)
+        return {"tier": "pbir_validation", "available": False,
+                "reason": "validate did not run: %s" % res.get("reason")}
+    payload = None
+    if tmp and os.path.isfile(tmp):
+        try:
+            with open(tmp, "r", encoding="utf-8-sig") as fh:
+                payload = _parse_json_loose(fh.read())
+        except OSError:
+            payload = None
+    _safe_unlink(tmp)
+    if payload is None:
+        payload = _parse_json_loose(res.get("stdout"))
+    return _shape_validation(payload, res)
+
+
+# -- local Power BI Desktop render bridge (powerbi-desktop) ---------------------------------------
+def _shape_instances(payload):
+    """Normalize ``powerbi-desktop status`` output to ``[{pid, bridge_status, current_file,
+    report_dir}]``. Tolerates a top-level ``instances`` list or a bare list; skips odd entries."""
+    raw = []
+    if isinstance(payload, dict):
+        for key in ("instances", "desktops", "processes"):
+            if isinstance(payload.get(key), list):
+                raw = payload[key]
+                break
+    elif isinstance(payload, list):
+        raw = payload
+    out = []
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        pid = it.get("pid") or it.get("processId") or it.get("PID")
+        try:
+            pid = int(pid) if pid is not None else None
+        except (TypeError, ValueError):
+            pid = None
+        out.append({
+            "pid": pid,
+            "bridge_status": it.get("bridgeStatus") or it.get("status"),
+            "current_file": (it.get("currentFilePath") or it.get("currentFile")
+                             or it.get("filePath")),
+            "report_dir": it.get("reportDir") or it.get("reportDirectory"),
+        })
+    return out
+
+
+def discover_bridge_instances(cli=None, timeout=DEFAULT_CLI_TIMEOUT):
+    """Read the running Power BI Desktop bridge instances via ``powerbi-desktop status``.
+
+    Returns ``{available, status, instances, reason}`` -- each instance carries ``pid``,
+    ``bridge_status``, ``current_file`` and ``report_dir`` when the CLI exposes them. Pure discovery
+    (safe to run concurrently); guarded so a missing CLI or a stopped Desktop degrades to
+    ``available: False`` rather than raising."""
+    exe = _locate_cli(DESKTOP_BRIDGE_CMD, explicit=cli)
+    if not exe:
+        return {"available": False, "instances": [],
+                "reason": "%s CLI not found on PATH (npm i -g %s)" % (
+                    DESKTOP_BRIDGE_CMD, DESKTOP_BRIDGE_PKG)}
+    res = _run_cli(exe, ["status"], timeout=timeout)
+    if not res.get("ran"):
+        return {"available": False, "instances": [],
+                "reason": "status did not run: %s" % res.get("reason")}
+    payload = _parse_json_loose(res.get("stdout"))
+    instances = _shape_instances(payload)
+    status = payload.get("status") if isinstance(payload, dict) else None
+    return {"available": True, "status": status, "instances": instances,
+            "reason": (None if instances
+                       else "no bridge instances reported (Desktop not connected?)")}
+
+
+def _select_bridge_pid(instances, pbip_path=None, pid=None):
+    """Choose the bridge PID to drive. An explicit ``pid`` wins; else match an instance whose
+    ``report_dir``/``current_file`` resolves to ``pbip_path``; else the sole instance. Returns
+    ``(pid, reason)`` -- reason is set only when no unambiguous choice exists."""
+    live = [i for i in instances if i.get("pid")]
+    if pid is not None:
+        return pid, None  # trust an explicit caller even if status did not enumerate it
+    if pbip_path:
+        targets = set()
+        for cand in (pbip_path, _resolve_report_dir(pbip_path), os.path.dirname(pbip_path)):
+            if cand:
+                targets.add(os.path.normcase(os.path.abspath(cand)))
+        for i in live:
+            for cand in (i.get("current_file"), i.get("report_dir")):
+                if cand and os.path.normcase(os.path.abspath(cand)) in targets:
+                    return i["pid"], None
+    if len(live) == 1:
+        return live[0]["pid"], None
+    if not live:
+        return None, "no running bridge instance"
+    return None, "multiple bridge instances; pass an explicit pid"
+
+
+def _collect_pngs(output_dir):
+    """List PNGs in a screenshot output dir as ``[{page_id, png}]`` (page id = filename stem)."""
+    out = []
+    try:
+        names = sorted(os.listdir(output_dir))
+    except OSError:
+        return out
+    for fn in names:
+        if fn.lower().endswith(".png"):
+            out.append({"page_id": os.path.splitext(fn)[0],
+                        "png": os.path.join(output_dir, fn)})
+    return out
+
+
+def _pick_render_page(pages, page_id=None):
+    """Pick the rendered page PNG to use as the image-tier candidate (a named id, else the first)."""
+    if not pages:
+        return None
+    if page_id:
+        want = _safe_name(page_id)
+        for p in pages:
+            if p.get("page_id") in (page_id, want):
+                return p
+    return pages[0]
+
+
+def render_pbi_report(pbip_path, output_dir=None, scale=DEFAULT_SCREENSHOT_SCALE,
+                      page_ids=None, pid=None, cli=None, timeout=DEFAULT_CLI_TIMEOUT,
+                      open_first=True):
+    """Render a .pbip's pages to PNGs via the Power BI Desktop bridge -- the Power BI half of the
+    image tier, captured locally and deterministically.
+
+    Drives ``powerbi-desktop``: optionally ``open`` the .pbip, read ``status`` to choose the PID
+    (explicit ``pid`` > a report-dir match > the sole instance), then ``screenshot-all`` (or one
+    ``screenshot`` per id in ``page_ids``) into ``output_dir``. Captures run SERIALLY per PID (the
+    bridge cancels parallel reload/screenshot). Returns ``{available, pid, output_dir, pages:
+    [{page_id, png}], scale, reason}``; guarded end-to-end so an absent CLI, an unenabled bridge, or
+    a stopped Desktop degrades to ``available: False``.
+
+    NOTE: screenshots are per PAGE -- the bridge supplies no per-visual capture, and none is needed:
+    a per-zone breakdown comes from cropping each page PNG by the per-visual PBIR px this module
+    already derives (:func:`regions_from_layout`)."""
+    exe = _locate_cli(DESKTOP_BRIDGE_CMD, explicit=cli)
+    if not exe:
+        return {"available": False, "pages": [],
+                "reason": "%s CLI not found on PATH (npm i -g %s)" % (
+                    DESKTOP_BRIDGE_CMD, DESKTOP_BRIDGE_PKG)}
+    if not pbip_path or not os.path.exists(pbip_path):
+        return {"available": False, "pages": [], "reason": "pbip path not found: %s" % pbip_path}
+    if open_first:
+        _run_cli(exe, ["open", pbip_path], timeout=timeout)  # best effort; status is authoritative
+    disc = discover_bridge_instances(cli=exe, timeout=timeout)
+    if not disc.get("available") or not disc.get("instances"):
+        return {"available": False, "pages": [],
+                "reason": disc.get("reason") or "no bridge instances"}
+    sel, reason = _select_bridge_pid(disc["instances"], pbip_path=pbip_path, pid=pid)
+    if sel is None:
+        return {"available": False, "pages": [], "reason": reason,
+                "instances": disc["instances"]}
+    if output_dir:
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as exc:
+            return {"available": False, "pages": [],
+                    "reason": "cannot create output dir: %s" % exc}
+    else:
+        try:
+            output_dir = tempfile.mkdtemp(prefix="pbi_render_")
+        except OSError as exc:
+            return {"available": False, "pages": [], "reason": "no output dir: %s" % exc}
+    scale_args = ["--scale", str(int(scale))] if scale else []
+    captured_reason = None
+    if page_ids:
+        for pidx in page_ids:
+            out_png = os.path.join(output_dir, "%s.png" % _safe_name(pidx))
+            r = _run_cli(exe, ["screenshot", str(pidx), "--pid", str(sel),
+                               "--output", out_png] + scale_args, timeout=timeout)
+            if not r.get("ran") and captured_reason is None:
+                captured_reason = r.get("reason")
+    else:
+        r = _run_cli(exe, ["screenshot-all", "--pid", str(sel),
+                           "--output-dir", output_dir] + scale_args, timeout=timeout)
+        if not r.get("ran"):
+            captured_reason = r.get("reason")
+    pages = _collect_pngs(output_dir)
+    return {
+        "available": bool(pages),
+        "pid": sel,
+        "output_dir": output_dir,
+        "pages": pages,
+        "scale": int(scale) if scale else None,
+        "advisory": True,
+        "reason": None if pages else (captured_reason or "no PNGs were produced"),
+    }
+
+
+# =====================================================================================
 # Top-level convenience + CLI
 # =====================================================================================
 def _combined_fidelity(report):
@@ -2001,7 +2427,7 @@ def _load_field_aliases(path):
 
 def run_oracle(twb_path, report_dir, engine_report_path=None,
                dax_options=None, image_options=None, candidate_records_path=None,
-               field_aliases=None):
+               field_aliases=None, validate=False):
     """Read both sides and score them. Returns the advisory report dict.
 
     The structural tier always runs. The optional value/image tiers run only when their options are
@@ -2009,6 +2435,15 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
 
     ``field_aliases`` (or a ``candidate_records_path`` JSON to derive it from) lets the field/role
     components see through a faithful star-schema rename; both are optional and default to off.
+
+    ``validate`` (optional, default off) runs the first-party ``powerbi-report-author validate``
+    pre-gate over ``report_dir`` and attaches an ADDITIVE ``pbir_validation`` record + a compact
+    ``summary.pbir_valid`` flag -- it never feeds the structural aggregate, so calibration is
+    unchanged whether or not it runs.
+
+    ``image_options`` may carry ``render_pbip`` (a .pbip path): when set and no ``candidate_png`` is
+    given, the Power BI candidate render is captured locally via the ``powerbi-desktop`` bridge and
+    used as the image-tier candidate; the raw render record is attached as ``pbi_render``.
     """
     twb = read_twb_views(twb_path)
     pbir = read_pbir_report(report_dir)
@@ -2029,11 +2464,33 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
         report["dax_value"] = dax_value_tier(report_dir=report_dir, **dax_options)
     if image_options is not None:
         opts = dict(image_options)
+        render_pbip = opts.pop("render_pbip", None)
+        render_page_id = opts.pop("render_page_id", None)
+        render_opts = dict(opts.pop("render_options", None) or {})
+        render_record = None
+        if render_pbip and not opts.get("candidate_png"):
+            render_record = render_pbi_report(
+                render_pbip, page_ids=[render_page_id] if render_page_id else None, **render_opts)
+            if render_record.get("available"):
+                chosen = _pick_render_page(render_record.get("pages"), render_page_id)
+                if chosen:
+                    opts["candidate_png"] = chosen["png"]
         if opts.pop("auto_regions", False) and not opts.get("regions"):
             derived = regions_from_layout(twb, pbir)
             if derived:
                 opts["regions"] = derived
-        report["image"] = image_tier(**opts)
+        if render_record is not None and not render_record.get("available") \
+                and not opts.get("candidate_png"):
+            report["image"] = {"tier": "image", "available": False,
+                               "reason": "render bridge unavailable: %s" % render_record.get("reason")}
+        else:
+            report["image"] = image_tier(**opts)
+        if render_record is not None:
+            report["pbi_render"] = render_record
+    if validate:
+        vrec = validate_pbir(report_dir)
+        report["pbir_validation"] = vrec
+        report["summary"]["pbir_valid"] = vrec.get("valid") if vrec.get("available") else None
     combined = _combined_fidelity(report)
     if combined is not None:
         report["combined_fidelity"] = combined
@@ -2055,6 +2512,8 @@ def render_markdown(report):
         s["mean_visual_score"], s["worst_visual_score"]))
     lines.append("- **Coverage:** %s (%d/%d worksheets matched)" % (
         s["coverage"], s["matched_visuals"], s["source_worksheets"]))
+    if s.get("pbir_valid") is not None:
+        lines.append("- **PBIR schema valid:** %s (first-party validator)" % s["pbir_valid"])
     pr = s.get("placement")
     if pr:
         lines.append(
@@ -2167,6 +2626,29 @@ def render_markdown(report):
                                  (z.get("name"), z.get("ssim"), z.get("band"), flag))
                 if img.get("regions_mean_ssim") is not None:
                     lines.append("  - _zone mean:_ %s" % img.get("regions_mean_ssim"))
+    ren = report.get("pbi_render")
+    if ren is not None and not ren.get("available"):
+        lines.append("")
+        lines.append("## Power BI render (bridge)")
+        lines.append("- _render unavailable_: %s" % ren.get("reason"))
+    val = report.get("pbir_validation")
+    if val is not None:
+        lines.append("")
+        lines.append("## PBIR validation (first-party, advisory pre-gate)")
+        if not val.get("available"):
+            lines.append("- _unavailable_: %s" % val.get("reason"))
+        else:
+            verdict = {True: "valid", False: "INVALID", None: "unknown"}.get(val.get("valid"))
+            lines.append("- **Schema:** %s — %d error(s), %d warning(s)" % (
+                verdict, val.get("error_count", 0), val.get("warning_count", 0)))
+            for d in val.get("diagnostics", []):
+                if d.get("severity") != "error":
+                    continue
+                loc = d.get("file") or ""
+                if d.get("json_path"):
+                    loc = ("%s %s" % (loc, d["json_path"])).strip()
+                lines.append("  - ERROR %s%s" % (d.get("message", ""),
+                                                 (" (%s)" % loc) if loc else ""))
     lines.append("")
     for note in report["notes"]:
         lines.append("> %s" % note)
@@ -2203,6 +2685,18 @@ def main(argv=None):
     ap.add_argument("--image-auto-regions", action="store_true",
                     help="Derive per-worksheet image crop regions from the dashboard layout "
                          "(crops each render by its own zone positions; no hand-tuned boxes).")
+    ap.add_argument("--image-render", default=None,
+                    help="Capture the Power BI candidate PNG locally from this .pbip via the "
+                         "powerbi-desktop bridge instead of passing --image-cand.")
+    ap.add_argument("--image-render-page", default=None,
+                    help="PBIR page id to render (e.g. ReportSection...); default renders all and "
+                         "uses the first.")
+    ap.add_argument("--image-render-scale", type=int, default=DEFAULT_SCREENSHOT_SCALE,
+                    help="Screenshot scale for the bridge render (default %(default)s).")
+    # Optional first-party PBIR validation pre-gate (needs powerbi-report-author):
+    ap.add_argument("--validate", action="store_true",
+                    help="Run the first-party PBIR validation pre-gate (powerbi-report-author "
+                         "validate); ADDITIVE -- it never changes the structural aggregate.")
     args = ap.parse_args(argv)
 
     dax_options = None
@@ -2212,14 +2706,19 @@ def main(argv=None):
             expected = _read_json(args.expected)
         dax_options = {"port": args.dax_port, "expected": expected}
     image_options = None
-    if args.image_ref or args.image_cand:
+    if args.image_ref or args.image_cand or args.image_render:
         image_options = {"reference_png": args.image_ref, "candidate_png": args.image_cand,
                          "acceptance_threshold": args.image_threshold,
                          "auto_regions": args.image_auto_regions}
+        if args.image_render:
+            image_options["render_pbip"] = args.image_render
+            image_options["render_page_id"] = args.image_render_page
+            image_options["render_options"] = {"scale": args.image_render_scale}
 
     report = run_oracle(args.twb, args.report_dir, args.engine_report,
                         dax_options=dax_options, image_options=image_options,
-                        candidate_records_path=args.candidate_records)
+                        candidate_records_path=args.candidate_records,
+                        validate=args.validate)
     text = (render_markdown(report) if args.format == "md"
             else json.dumps(report, indent=2, ensure_ascii=False))
     if args.out:

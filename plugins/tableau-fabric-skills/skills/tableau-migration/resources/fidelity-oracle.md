@@ -257,6 +257,46 @@ packages are absent — importing the module never fails offline.
   *candidate* crop, so each render is cropped by *its own* layout and the per‑zone SSIM is keyed by
   worksheet name with no manual tuning.
 
+### Local Power BI render + first‑party PBIR validation (deterministic host bridge)
+
+Two first‑party Microsoft CLIs un‑park the parts of the oracle that need a real Power BI **render**
+or an authoritative **schema check** — both run locally/offline, so the oracle stays standalone.
+Each is wrapped exactly like the tiers above: located on `PATH`, run in a child process with a
+timeout, parsed defensively, and degraded to `available: false` when absent. **Neither feeds the
+structural aggregate**, so the calibration floor (`0.897` / `0.408`) is identical whether or not
+they run. Install both with
+`npm i -g @microsoft/powerbi-desktop-bridge-cli @microsoft/powerbi-report-authoring-cli`.
+
+- **PB‑side render** (`render_pbi_report`, `--image-render <…\Workbook.pbip>`) drives the
+  `@microsoft/powerbi-desktop-bridge-cli` (`powerbi-desktop`): `open` the `.pbip`, read `status` to
+  pick the Desktop **PID** (an explicit `pid`, else a report‑dir match, else the sole instance), then
+  `screenshot-all` the pages into a temp dir. The captured page PNG becomes the image tier's
+  **candidate** — so the SSIM tier no longer waits on a hand‑exported PNG. Screenshots are per
+  **page**; the per‑zone breakdown still comes from `--image-auto-regions` cropping that page by each
+  visual's own PBIR px (the same rects the render‑free placement diagnostic already computes).
+  Requires Power BI Desktop with **Preview features → "Enable external tool access to Power BI
+  Desktop through secure local APIs"** enabled; reload/screenshot run serially per PID. (The Tableau
+  **reference** half is still acquired separately — see below.)
+- **PBIR validation pre‑gate** (`validate_pbir`, `--validate`) runs the
+  `@microsoft/powerbi-report-authoring-cli` (`powerbi-report-author validate`) over the emitted
+  `.Report` — first‑party confirmation the PBIR is well‑formed against the authoritative schema,
+  catching drift a hand‑rolled reader cannot self‑detect. It is **additive**: a separate
+  `pbir_validation` block (`valid` + error/warning **diagnostics** with file + JSON paths) plus a
+  compact `summary.pbir_valid` flag, never a 0–1 score blended into the aggregate. A validation
+  **error** is a concrete fix‑before‑ship defect; warnings (e.g. an unknown visual type) are usually
+  a typo unless a custom visual is intended.
+
+```powershell
+# render the PB candidate locally instead of --image-cand, and run the validation pre-gate
+py -3.11 scripts\fidelity_oracle.py `
+  "<path>\workbook.twb" "<out>\reports\<Workbook>.Report" `
+  --image-ref     "<ref>\tableau_dashboard.png" `  # Tableau reference (see below)
+  --image-render  "<out>\reports\<Workbook>.pbip" ` # capture the PB render via the Desktop bridge
+  --image-auto-regions `
+  --validate `                                     # first-party PBIR schema pre-gate (additive)
+  --format md
+```
+
 ### Combined cross‑tier fidelity (advisory headline)
 
 When more than one tier runs, the report also carries a `combined_fidelity` block: a single advisory

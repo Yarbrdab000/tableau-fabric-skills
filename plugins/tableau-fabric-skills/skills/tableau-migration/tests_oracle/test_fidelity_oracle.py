@@ -1306,3 +1306,167 @@ def test_run_oracle_attaches_combined_fidelity(tmp_path):
     assert "Combined fidelity" in fo.render_markdown(result)
 
 
+# ---------------------------------------------- host-bridge: CLI plumbing + PBIR validation + render
+def test_locate_and_run_cli_guard_when_missing():
+    # A bogus command resolves to nothing, and running a non-exe never raises.
+    assert fo._locate_cli("totally_bogus_cli_xyz") is None
+    res = fo._run_cli("totally_bogus_cli_xyz", ["status"], timeout=5)
+    assert res["ran"] is False and "reason" in res
+
+
+def test_parse_json_loose_tolerates_prefix_and_garbage():
+    assert fo._parse_json_loose('log noise\n{"a": 1}') == {"a": 1}
+    assert fo._parse_json_loose('[{"x": 2}]') == [{"x": 2}]
+    assert fo._parse_json_loose("not json at all") is None
+    assert fo._parse_json_loose("") is None
+
+
+def test_collect_diagnostics_tolerant_shapes():
+    # split errors/warnings
+    d1 = fo._collect_diagnostics({"errors": [{"message": "bad", "file": "v.json", "jsonPath": "$.a"}],
+                                  "warnings": ["heads up"]})
+    assert [x["severity"] for x in d1] == ["error", "warning"]
+    assert d1[0]["file"] == "v.json" and d1[0]["json_path"] == "$.a"
+    # a flat diagnostics list with an explicit severity/level
+    d2 = fo._collect_diagnostics({"diagnostics": [{"level": "warn", "text": "x"}]})
+    assert d2[0]["severity"] == "warning"
+    # nested results[].diagnostics
+    d3 = fo._collect_diagnostics({"results": [{"diagnostics": [{"severity": "fatal", "message": "boom"}]}]})
+    assert d3[0]["severity"] == "error"
+    # a bare top-level list of strings
+    assert fo._collect_diagnostics(["oops"])[0]["severity"] == "error"
+    # an unknown shape never raises
+    assert fo._collect_diagnostics(42) == []
+
+
+def test_validate_pbir_unavailable_when_cli_missing(tmp_path):
+    report = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    rec = fo.validate_pbir(report, cli="totally_bogus_cli_xyz")
+    assert rec["available"] is False and "not found" in rec["reason"]
+
+
+def test_validate_pbir_valid_via_monkeypatch(tmp_path, monkeypatch):
+    report = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    monkeypatch.setattr(fo, "_locate_cli", lambda cmd, explicit=None: "fake-cli")
+    monkeypatch.setattr(fo, "_run_cli",
+                        lambda exe, args, **kw: {"ran": True, "rc": 0,
+                                                 "stdout": json.dumps({"valid": True, "diagnostics": []})})
+    rec = fo.validate_pbir(report)
+    assert rec["available"] is True and rec["valid"] is True
+    assert rec["error_count"] == 0 and rec["exit_code"] == 0
+
+
+def test_validate_pbir_invalid_collects_errors(tmp_path, monkeypatch):
+    report = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    monkeypatch.setattr(fo, "_locate_cli", lambda cmd, explicit=None: "fake-cli")
+    payload = {"errors": [{"severity": "error", "message": "bad node",
+                           "file": "visual.json", "jsonPath": "$.visual"}],
+               "warnings": [{"message": "odd type"}]}
+    monkeypatch.setattr(fo, "_run_cli",
+                        lambda exe, args, **kw: {"ran": True, "rc": 1, "stdout": json.dumps(payload)})
+    rec = fo.validate_pbir(report)
+    assert rec["available"] is True and rec["valid"] is False
+    assert rec["error_count"] == 1 and rec["warning_count"] == 1
+    assert rec["diagnostics"][0]["file"] == "visual.json"
+
+
+def test_shape_instances_and_select_pid():
+    inst = fo._shape_instances({"instances": [
+        {"pid": "11", "bridgeStatus": "connected", "currentFilePath": r"C:\a\Sales.pbip",
+         "reportDir": r"C:\a\Sales.Report"}]})
+    assert inst[0]["pid"] == 11 and inst[0]["bridge_status"] == "connected"
+    # match by report dir
+    pid, reason = fo._select_bridge_pid(inst, pbip_path=r"C:\a\Sales.pbip")
+    assert pid == 11 and reason is None
+    # sole instance wins even without a path match
+    assert fo._select_bridge_pid(inst)[0] == 11
+    # ambiguous -> no pick, with a reason
+    two = [{"pid": 1}, {"pid": 2}]
+    assert fo._select_bridge_pid(two) == (None, "multiple bridge instances; pass an explicit pid")
+    # none running
+    assert fo._select_bridge_pid([])[0] is None
+
+
+def test_discover_and_render_unavailable_when_cli_missing(tmp_path):
+    assert fo.discover_bridge_instances(cli="totally_bogus_cli_xyz")["available"] is False
+    pbip = tmp_path / "r.pbip"
+    pbip.write_text("x", encoding="utf-8")
+    assert fo.render_pbi_report(str(pbip), cli="totally_bogus_cli_xyz")["available"] is False
+
+
+def test_render_pbi_report_captures_pages(tmp_path, monkeypatch):
+    pbip = tmp_path / "r.pbip"
+    pbip.write_text("x", encoding="utf-8")
+    out_dir = tmp_path / "shots"
+    monkeypatch.setattr(fo, "_locate_cli", lambda cmd, explicit=None: "fake-bridge")
+
+    def fake_run(exe, args, **kw):
+        args = list(args)
+        if args and args[0] == "status":
+            return {"ran": True, "rc": 0, "stdout": json.dumps(
+                {"instances": [{"pid": 7, "bridgeStatus": "connected",
+                                "currentFilePath": str(pbip)}]})}
+        if args and args[0] == "screenshot-all":
+            d = args[args.index("--output-dir") + 1]
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "ReportSection1.png"), "wb") as fh:
+                fh.write(b"\x89PNG\r\n\x1a\n")
+            return {"ran": True, "rc": 0, "stdout": ""}
+        return {"ran": True, "rc": 0, "stdout": ""}
+
+    monkeypatch.setattr(fo, "_run_cli", fake_run)
+    rec = fo.render_pbi_report(str(pbip), output_dir=str(out_dir))
+    assert rec["available"] is True and rec["pid"] == 7
+    assert rec["pages"][0]["page_id"] == "ReportSection1"
+    assert os.path.isfile(rec["pages"][0]["png"])
+
+
+def test_run_oracle_validate_is_additive(tmp_path, monkeypatch):
+    report_dir = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    twb = tmp_path / "wb.twb"
+    twb.write_text(TWB_XML, encoding="utf-8")
+    base = fo.run_oracle(str(twb), report_dir)
+    monkeypatch.setattr(fo, "validate_pbir",
+                        lambda path, **kw: {"tier": "pbir_validation", "available": True,
+                                            "valid": True, "error_count": 0, "warning_count": 1,
+                                            "diagnostics": [], "advisory": True, "notes": []})
+    withval = fo.run_oracle(str(twb), report_dir, validate=True)
+    # The validation pre-gate is purely additive -- the structural aggregate is byte-for-byte equal.
+    assert withval["summary"]["aggregate_score"] == base["summary"]["aggregate_score"]
+    assert withval["pbir_validation"]["valid"] is True
+    assert withval["summary"]["pbir_valid"] is True
+    md = fo.render_markdown(withval)
+    assert "PBIR validation" in md and "PBIR schema valid" in md
+
+
+def test_run_oracle_render_wires_candidate(tmp_path, monkeypatch):
+    report_dir = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    twb = tmp_path / "wb.twb"
+    twb.write_text(TWB_XML, encoding="utf-8")
+    png = tmp_path / "p.png"
+    captured = {}
+    monkeypatch.setattr(fo, "render_pbi_report",
+                        lambda pbip, **kw: {"available": True, "pid": 9,
+                                            "pages": [{"page_id": "P1", "png": str(png)}]})
+    monkeypatch.setattr(fo, "image_tier",
+                        lambda **opts: captured.update(opts) or {"tier": "image", "available": True,
+                                                                 "ssim": 0.9})
+    result = fo.run_oracle(str(twb), report_dir,
+                           image_options={"reference_png": str(tmp_path / "ref.png"),
+                                          "render_pbip": str(tmp_path / "x.pbip")})
+    assert captured["candidate_png"] == str(png)
+    assert result["pbi_render"]["available"] is True and result["image"]["available"] is True
+
+
+def test_run_oracle_render_unavailable_marks_image(tmp_path, monkeypatch):
+    report_dir = _write_pbir(str(tmp_path), "Dash", _faithful_visuals())
+    twb = tmp_path / "wb.twb"
+    twb.write_text(TWB_XML, encoding="utf-8")
+    monkeypatch.setattr(fo, "render_pbi_report",
+                        lambda pbip, **kw: {"available": False, "pages": [], "reason": "no bridge"})
+    result = fo.run_oracle(str(twb), report_dir,
+                           image_options={"reference_png": str(tmp_path / "ref.png"),
+                                          "render_pbip": str(tmp_path / "x.pbip")})
+    assert result["image"]["available"] is False
+    assert "render bridge unavailable" in result["image"]["reason"]
+    assert "render unavailable" in fo.render_markdown(result)
