@@ -13,6 +13,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** the deterministic **calc→DAX compiler v2** — broader faithful function
+  coverage across the String / Date / Aggregate / Type-Conversion families and deeper **row-level and
+  table-calculation** translation (running-total and ordered `WINDOW_*` windows, percent-difference,
+  positional offsets), each preserving the original Tableau formula as a `TableauFormula` annotation
+  and **failing closed** (an honest, routable fallback reason) when no faithful DAX target exists. The
+  model build now also stamps deterministic **model-facts on the migration report** — a
+  `model_manifest` (typed model summary + parameter classification into value / field / filter) and
+  `row_count` measure facts — so the report-page build can bind slicers, visual filters and measures
+  to the rebuilt semantic model **by calc id**. Additive; the migration suite stays green. Skill
+  `VERSION` `1.8.0` → `1.9.0`.
+- **tableau-migration:** the **Tableau dashboard → Power BI report-page (PBIR) viz consumer** now
+  binds those model-facts. `migrate_estate._attach_workbook_pbip` derives date / measure / row-count /
+  parameter bindings from the freshly rebuilt model and threads them as keyword arguments into the
+  single `twb_to_pbir` re-run, so a migrated report page points its visuals at the real measures and
+  columns instead of placeholders. A new read-only, stdlib-only `scripts/workbook_calc_usage.py`
+  classifies every workbook-local calc's **intent** (measure / native conditional-formatting / filter
+  / row-level column) and where the dashboard uses it, joined back to the model half by the calc's
+  bare internal id — the deterministic model↔viz contract. Additive; suite green.
 - **tableau-migration:** a **layered, Key-Vault-free credential resolver**
   (`scripts/credential_resolver.py`) so a local / POC migration can authenticate to Tableau with no
   Azure Key Vault. `resolve_secret(...)` resolves a secret (e.g. a Tableau PAT's secret value) from
