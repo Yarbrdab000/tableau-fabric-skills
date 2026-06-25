@@ -13,6 +13,16 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** the rebuilt **report page now binds its columns to the migrated model**
+  instead of the workbook's embedded placeholder entity. When `_attach_workbook_pbip` recovers a
+  model from a matched published datasource, a new `_field_map_from_model` helper derives a
+  `field_map` from the report's `model_manifest.naming` (column entries → `{entity, property}`, the
+  fact table that owns the most columns) and threads it — alongside the fact `model_table` — into the
+  single `twb_to_pbir` re-run, so report columns resolve to the real model tables rather than the
+  source's phantom `sqlproxy` / caption entity. Aggregation pills keep their aggregation (the
+  `field_map` entries carry no `binding`), and a date axis already rebound to the model's `Date`
+  table stays authoritative via a `date_rebound` guard in `_apply_override`. The report records a
+  `field_rebind` detail (rebound count + model table). Additive; the migration suite stays green.
 - **tableau-migration:** the deterministic **calc→DAX compiler v2** — broader faithful function
   coverage across the String / Date / Aggregate / Type-Conversion families and deeper **row-level and
   table-calculation** translation (running-total and ordered `WINDOW_*` windows, percent-difference,

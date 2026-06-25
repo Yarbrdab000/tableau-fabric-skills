@@ -229,11 +229,18 @@ def test_missing_dependency_raises_friendly(tmp_path):
 # -- real round-trip (only when the optional dependency is installed) ----------
 @pytest.mark.skipif(not _hyperapi_installed(),
                     reason="tableauhyperapi not installed (optional POC dependency)")
-def test_real_hyper_round_trip(tmp_path):
+def test_real_hyper_round_trip(tmp_path, monkeypatch):
     import tableauhyperapi as hapi
+    # hyperd writes a ``hyperd.log`` into the process CWD; run from tmp_path so the real
+    # HyperProcess (here and in hyper_to_csv) never pollutes the source tree (mirror parity).
+    monkeypatch.chdir(tmp_path)
     hyper_path = tmp_path / "demo.hyper"
     table = hapi.TableName("Extract", "Snapshot")
-    with hapi.HyperProcess(telemetry=hapi.Telemetry.DO_NOT_SEND_USAGE_DATA) as process:
+    # The Telemetry enum member was renamed across tableauhyperapi releases
+    # (DO_NOT_SEND_USAGE_DATA -> DO_NOT_SEND_USAGE_DATA_TO_TABLEAU); accept either.
+    telemetry = (getattr(hapi.Telemetry, "DO_NOT_SEND_USAGE_DATA_TO_TABLEAU", None)
+                 or getattr(hapi.Telemetry, "DO_NOT_SEND_USAGE_DATA"))
+    with hapi.HyperProcess(telemetry=telemetry) as process:
         with hapi.Connection(endpoint=process.endpoint, database=str(hyper_path),
                              create_mode=hapi.CreateMode.CREATE_AND_REPLACE) as conn:
             conn.catalog.create_schema("Extract")

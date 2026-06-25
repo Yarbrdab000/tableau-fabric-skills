@@ -508,8 +508,10 @@ def _viz_adapter(cand):
     supports_rowcount = "row_count_binding" in params
     supports_measure = "measure_binding" in params
     supports_param = "param_binding" in params
+    supports_model_table = "model_table" in params
+    supports_field_map = "field_map" in params
     def _call(twb_text, name, date_binding=None, measure_binding=None, row_count_binding=None,
-              param_binding=None):
+              param_binding=None, model_table=None, field_map=None):
         if name_kwargs:
             kwargs = {k: name for k in name_kwargs}
             if supports_date and date_binding is not None:
@@ -520,6 +522,10 @@ def _viz_adapter(cand):
                 kwargs["measure_binding"] = measure_binding
             if supports_param and param_binding is not None:
                 kwargs["param_binding"] = param_binding
+            if supports_model_table and model_table is not None:
+                kwargs["model_table"] = model_table
+            if supports_field_map and field_map is not None:
+                kwargs["field_map"] = field_map
             return cand(twb_text, **kwargs)
         return cand(twb_text, name)
     return _call
@@ -548,8 +554,13 @@ def _resolve_viz_stage(injected):
     return None
 
 
-def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None):
-    """Drive the full per-datasource pipeline. Returns a report detail dict (never raises)."""
+def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, ds_catalog=None):
+    """Drive the full per-datasource pipeline. Returns a report detail dict (never raises).
+
+    When ``ds_catalog`` is given, a successfully migrated datasource records its source text +
+    folder name under a connector-agnostic key, so a workbook that connects to it as a PUBLISHED
+    datasource can later rebuild its model from this real schema (see ``_attach_workbook_pbip``).
+    """
     name = source.asset_name(ds_id)
     detail = {"name": name, "source_id": str(ds_id)}
 
@@ -670,6 +681,8 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None):
         calc_columns_stubbed=cc_stubbed,
         manual_followups=decision.get("manual_followups", []),
     )
+    if ds_catalog is not None:
+        ds_catalog[_norm_ds(name)] = {"name": name, "text": text, "safe_base": safe_base}
     return detail
 
 
@@ -1190,7 +1203,76 @@ def _workbook_binding_signal(twb_text, ir):
     }
 
 
-def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None):
+def _norm_ds(name):
+    """Connector-agnostic match key: lowercased with all non-alphanumerics removed, so a workbook's
+    published-datasource name ('Superstore - Extract') matches the migrated datasource it became
+    ('Superstore-Extract.tds' -> 'Superstore_Extract')."""
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog):
+    """Rebuild a published-datasource workbook's model from the matching ALREADY-MIGRATED published
+    datasource (its real schema) instead of the workbook's own unusable ``sqlproxy`` proxy stub --
+    carrying the workbook's own calculated fields so its view-local measures translate against that
+    schema. Returns a ``migrate_datasource`` result bound to the real schema, or ``None`` when there
+    is no faithful name match (the caller then keeps the honest skip). Never raises.
+    """
+    if not ds_catalog:
+        return None
+    sig = detail.get("binding_signal") or {}
+    if sig.get("kind") != "published":
+        return None
+    match = ds_catalog.get(_norm_ds(sig.get("published_ds_name")))
+    if not match:
+        return None
+    try:
+        wb_calcs, _skipped, wb_dim_calcs = extract_calculations(twb_text, include_dimensions=True)
+    except Exception:
+        wb_calcs, wb_dim_calcs = None, None
+    try:
+        res = migrate_datasource(match["text"], model_name=model_safe,
+                                 calcs=wb_calcs, dim_calcs=wb_dim_calcs)
+    except Exception:
+        return None
+    if (res.get("report") or {}).get("fallback"):
+        return None
+    detail["bound_via"] = f"published_catalog_match:{match.get('name')}"
+    return res
+
+
+def _field_map_from_model(res_report):
+    """Build ``(model_table, field_map)`` for the viz re-run from the model build's authoritative
+    naming map, so a published-datasource workbook's column pills bind to the REAL migrated tables
+    (``Orders``/``Date``) instead of the workbook's own unusable ``sqlproxy`` proxy entity.
+
+    ``field_map`` keys VERBATIM on each column's Tableau field caption / remote name (the same
+    ``model_manifest['naming']`` join convention the model->viz contract guarantees never dangles)
+    and carries only ``{entity, property}`` -- never ``binding`` -- so an aggregation pill
+    (``SUM([Sales])``) keeps its aggregation while its entity is corrected to the fact table.
+    ``model_table`` is the fact table (the one owning the most columns) and acts as the fallback for
+    any column pill not present in the map. Measures are intentionally EXCLUDED here -- the
+    token-keyed ``measure_binding`` already rebinds them onto ``_Measures``. Returns ``(None, None)``
+    when no naming map is available (the re-run then keeps its standing field bindings).
+    """
+    manifest = (res_report or {}).get("model_manifest") or {}
+    naming = manifest.get("naming") or {}
+    field_map, counts = {}, {}
+    for ref, info in naming.items():
+        if (info or {}).get("kind") != "column":
+            continue
+        model_table = info.get("model_table")
+        model_name = info.get("model_name")
+        if not ref or not model_table or not model_name:
+            continue
+        field_map[ref] = {"entity": model_table, "property": model_name}
+        counts[model_table] = counts.get(model_table, 0) + 1
+    if not field_map:
+        return None, None
+    fact_table = max(counts, key=counts.get)
+    return fact_table, field_map
+
+
+def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None, ds_catalog=None):
     """Build an openable, self-contained workbook ``.pbip`` and record it on ``detail`` (never raises).
 
     Rebuilds the workbook's OWN primary embedded datasource into a semantic model (reusing the
@@ -1239,10 +1321,21 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
 
     res_report = res.get("report") or {}
     if res_report.get("fallback"):
-        rationale = (res_report.get("storage_decision") or {}).get("rationale") or "undoable shape"
-        warns.append(_PBIP_WARN + f"embedded datasource {label!r} routes to the lakehouse fallback "
-                     f"({rationale}) -- workbook .pbip skipped (model lands separately)")
-        return
+        # Published-datasource workbook: its own embedded copy is a sqlproxy proxy stub with no
+        # usable schema, so rebuilding it lands in the lakehouse fallback. When the estate already
+        # built the matching published datasource, rebuild the model from THAT real schema --
+        # carrying the workbook's own calculated fields so its view-local measures translate -- and
+        # bind the report to it. Never guesses (a real datasource-name match is required); any
+        # failure keeps the honest skip below (warn-never-wrong).
+        recovered = _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog)
+        if recovered is not None:
+            res = recovered
+            res_report = res.get("report") or {}
+        if res_report.get("fallback"):
+            rationale = (res_report.get("storage_decision") or {}).get("rationale") or "undoable shape"
+            warns.append(_PBIP_WARN + f"embedded datasource {label!r} routes to the lakehouse fallback "
+                         f"({rationale}) -- workbook .pbip skipped (model lands separately)")
+            return
 
     report_parts = _rebind_report_byPath(result["parts"], model_safe)
     # Model-fact rebind: now that the real model is in hand, re-run the viz stage ONCE with the
@@ -1269,11 +1362,14 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
     measure_binding = _measure_binding_from_model(res_report)
     row_count_binding = _row_count_binding_from_model(res_report)
     param_binding = _param_binding_from_model(res_report)
-    if (date_binding or measure_binding or row_count_binding or param_binding) and viz is not None:
+    field_model_table, field_map = _field_map_from_model(res_report)
+    if (date_binding or measure_binding or row_count_binding or param_binding
+            or field_map) and viz is not None:
         try:
             rebuilt = viz(twb_text, detail.get("name") or safe_base,
                           date_binding=date_binding, measure_binding=measure_binding,
-                          row_count_binding=row_count_binding, param_binding=param_binding)
+                          row_count_binding=row_count_binding, param_binding=param_binding,
+                          model_table=field_model_table, field_map=field_map)
             if isinstance(rebuilt, dict) and rebuilt.get("parts"):
                 report_parts = _rebind_report_byPath(rebuilt["parts"], model_safe)
                 if date_binding:
@@ -1290,6 +1386,9 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
                     detail["param_rebind"] = {
                         "slicers": len((param_binding.get("slicers") or {})),
                         "flags": len((param_binding.get("flags") or {}))}
+                if field_map:
+                    detail["field_rebind"] = {
+                        "count": len(field_map), "model_table": field_model_table}
         except Exception as exc:
             warns.append(_PBIP_WARN + f"model-fact rebind skipped ({type(exc).__name__}: {exc}) -- "
                          f"report binds to the standing source/deferred fields")
@@ -1319,7 +1418,8 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
                   model_translation_handoff=res_report.get("translation_handoff"))
 
 
-def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir=None):
+def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir=None,
+                          ds_catalog=None):
     """Run the optional viz stage for one workbook. Returns a report detail dict (never raises).
 
     Beyond the back-compatible bare ``reports/<Name>.Report`` write, when ``pbip_dir`` is given the
@@ -1378,7 +1478,8 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_di
         detail["binding_signal"] = signal
 
     if parts and pbip_dir is not None:
-        _attach_workbook_pbip(detail, text, result, safe_base, pbip_dir, viz=viz)
+        _attach_workbook_pbip(detail, text, result, safe_base, pbip_dir, viz=viz,
+                              ds_catalog=ds_catalog)
     return detail
 
 
@@ -1723,9 +1824,12 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
     viz = _resolve_viz_stage(viz_stage)
     used_folders = set()
 
-    ds_details = [_migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir)
+    ds_catalog = {}
+    ds_details = [_migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir,
+                                          ds_catalog=ds_catalog)
                   for ds_id in source.list_datasources()]
-    wb_details = [_migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir)
+    wb_details = [_migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir,
+                                        ds_catalog=ds_catalog)
                   for wb_id in source.list_workbooks()]
 
     summary = _summarize(ds_details, wb_details, viz is not None)

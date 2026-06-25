@@ -155,7 +155,10 @@ def hyper_to_csv(hyper_path, out_dir, *, hapi=None, row_limit=None):
     hapi = hapi or _import_hyperapi()
     os.makedirs(out_dir, exist_ok=True)
     results = {}
-    telemetry = hapi.Telemetry.DO_NOT_SEND_USAGE_DATA
+    # The Telemetry enum member was renamed across tableauhyperapi releases
+    # (DO_NOT_SEND_USAGE_DATA -> DO_NOT_SEND_USAGE_DATA_TO_TABLEAU); accept either.
+    telemetry = (getattr(hapi.Telemetry, "DO_NOT_SEND_USAGE_DATA_TO_TABLEAU", None)
+                 or getattr(hapi.Telemetry, "DO_NOT_SEND_USAGE_DATA"))
     with hapi.HyperProcess(telemetry=telemetry) as process:
         with hapi.Connection(endpoint=process.endpoint, database=str(hyper_path)) as connection:
             catalog = connection.catalog

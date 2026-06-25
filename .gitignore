@@ -25,6 +25,9 @@ _*.py
 !__init__.py
 *.tmp
 
+# tableauhyperapi process log (written into CWD when the real hyper round-trip runs)
+hyperd.log
+
 # Python
 __pycache__/
 *.py[cod]

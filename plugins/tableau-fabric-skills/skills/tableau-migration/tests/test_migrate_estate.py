@@ -1693,3 +1693,76 @@ def test_viz_adapter_forwards_row_count_binding_only_when_supported():
     me._viz_adapter(viz_without)("<twb/>", "WB", row_count_binding=rcb)
     assert seen["with"]["row_count"] == rcb
     assert seen.get("without") is True  # called without raising despite no row_count_binding param
+
+
+def test_field_map_from_model_builds_entity_property_from_naming_columns():
+    # _field_map_from_model turns the model build's authoritative `model_manifest.naming` map into a
+    # caption-keyed field_map carrying ONLY {entity, property} (never `binding`, so an aggregation
+    # pill keeps its aggregation) for column-kind refs, and picks the fact table (most columns) as
+    # model_table -- so a published-DS workbook's column pills bind to Orders/People, not `sqlproxy`.
+    res_report = {"model_manifest": {"naming": {
+        "Sales": {"model_table": "Orders", "model_name": "Sales", "kind": "column"},
+        "Order Date": {"model_table": "Orders", "model_name": "Order_Date", "kind": "column"},
+        "Segment": {"model_table": "Orders", "model_name": "Segment", "kind": "column"},
+        "Regional Manager": {"model_table": "People", "model_name": "Regional_Manager",
+                             "kind": "column"},
+        "Profit Ratio": {"model_table": "_Measures", "model_name": "Profit Ratio",
+                         "kind": "measure"},
+        "Choose Metric": {"model_table": "Measure Swap calc 1",
+                          "model_name": "Measure Swap calc 1", "kind": "parameter"},
+    }}}
+    model_table, field_map = me._field_map_from_model(res_report)
+    # fact table = the one owning the most columns (Orders: 3 vs People: 1)
+    assert model_table == "Orders"
+    # columns are mapped with {entity, property} and NO binding override (aggregations survive)
+    assert field_map["Sales"] == {"entity": "Orders", "property": "Sales"}
+    assert field_map["Order Date"] == {"entity": "Orders", "property": "Order_Date"}
+    assert field_map["Regional Manager"] == {"entity": "People", "property": "Regional_Manager"}
+    assert "binding" not in field_map["Sales"]
+    # measures + parameters are excluded -- measure_binding / field-parameter paths own those
+    assert "Profit Ratio" not in field_map
+    assert "Choose Metric" not in field_map
+
+
+def test_field_map_from_model_skips_incomplete_entries():
+    # A naming entry missing model_table or model_name is skipped rather than emitting a dangling
+    # {entity:None}/{property:None} override.
+    res_report = {"model_manifest": {"naming": {
+        "Good": {"model_table": "Orders", "model_name": "Good", "kind": "column"},
+        "NoTable": {"model_table": None, "model_name": "X", "kind": "column"},
+        "NoName": {"model_table": "Orders", "model_name": None, "kind": "column"},
+    }}}
+    model_table, field_map = me._field_map_from_model(res_report)
+    assert model_table == "Orders"
+    assert field_map == {"Good": {"entity": "Orders", "property": "Good"}}
+
+
+def test_field_map_from_model_none_when_no_columns():
+    # No usable column naming -> (None, None) so the viz re-run keeps its standing field bindings
+    # (warn-never-wrong; byte-unchanged until a real map exists).
+    assert me._field_map_from_model(None) == (None, None)
+    assert me._field_map_from_model({}) == (None, None)
+    assert me._field_map_from_model({"model_manifest": {"naming": {}}}) == (None, None)
+    only_measure = {"model_manifest": {"naming": {
+        "M": {"model_table": "_Measures", "model_name": "M", "kind": "measure"}}}}
+    assert me._field_map_from_model(only_measure) == (None, None)
+
+
+def test_viz_adapter_forwards_model_table_and_field_map_only_when_supported():
+    # The adapter passes model_table + field_map to a viz fn that declares them (the published-DS
+    # column rebind seam), and silently omits them for an older entry point that does not.
+    seen = {}
+
+    def viz_with(text, *, report_name, dataset_name, model_table=None, field_map=None):
+        seen["with"] = {"model_table": model_table, "field_map": field_map}
+        return {"parts": {}}
+
+    def viz_without(text, *, report_name, dataset_name):
+        seen["without"] = True
+        return {"parts": {}}
+
+    fm = {"Sales": {"entity": "Orders", "property": "Sales"}}
+    me._viz_adapter(viz_with)("<twb/>", "WB", model_table="Orders", field_map=fm)
+    me._viz_adapter(viz_without)("<twb/>", "WB", model_table="Orders", field_map=fm)
+    assert seen["with"] == {"model_table": "Orders", "field_map": fm}
+    assert seen.get("without") is True  # called without raising despite no model_table/field_map

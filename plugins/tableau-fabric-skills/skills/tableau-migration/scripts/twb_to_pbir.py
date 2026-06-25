@@ -748,6 +748,7 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
         field["entity"], field["property"] = rebind
         field["binding"] = "column"
         field["kind"] = "category"
+        field["date_rebound"] = True
         return field
 
     if deriv in _DATE_PARTS or deriv.startswith("Trunc") or deriv.endswith("-Trunc"):
@@ -2207,8 +2208,15 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
 
 # -- PBIR field expression emission --------------------------------------------
 def _apply_override(field, model_table, field_map):
-    """Return (entity, property, binding) after applying caller overrides."""
+    """Return (entity, property, binding) after applying caller overrides.
+
+    A field already rebound to the marked Date dimension by ``_rebind_date_axis`` is AUTHORITATIVE:
+    neither ``field_map`` nor the ``model_table`` fallback may pull the active date axis back onto the
+    fact's raw date column, so the model build's date facts win over the published-DS column rebind.
+    """
     entity, prop, binding = field["entity"], field["property"], field["binding"]
+    if field.get("date_rebound"):
+        return entity, prop, binding
     if field_map and field["caption"] in field_map:
         ov = field_map[field["caption"]]
         entity = ov.get("entity", entity)
