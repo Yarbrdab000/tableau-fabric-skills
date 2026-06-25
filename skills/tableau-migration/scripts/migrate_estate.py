@@ -53,14 +53,16 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .assemble_model import (assemble_import_model, write_model_folder, write_local_pbip,
                                  migrate_datasource, list_workbook_datasources)
     from .parameters import parse_parameters
-    from .workbook_table_calcs import extract_table_calc_usages
+    from .workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
+    from . import fetch_tds as F
 except ImportError:
     from connection_to_m import parse_tds
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from assemble_model import (assemble_import_model, write_model_folder, write_local_pbip,
                                 migrate_datasource, list_workbook_datasources)
     from parameters import parse_parameters
-    from workbook_table_calcs import extract_table_calc_usages
+    from workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
+    import fetch_tds as F
 
 
 # -- source adapters -----------------------------------------------------------
@@ -98,11 +100,15 @@ class TableauSource(ABC):
 
 
 class LocalFilesSource(TableauSource):
-    """Enumerate a folder of exported ``.tds`` / ``.twb`` files and hand their text to the pipeline.
+    """Enumerate a folder of exported Tableau files and hand their XML text to the pipeline.
 
-    Files are discovered recursively (case-insensitive extension) and read with
-    ``encoding="utf-8-sig"`` so Tableau's UTF-8 BOM is consumed transparently. Ids are absolute
-    file paths; the display name is the file stem.
+    Both the bare exports (``.tds`` datasource, ``.twb`` workbook) and the packaged exports
+    (``.tdsx`` / ``.twbx`` -- zip archives) are discovered recursively (case-insensitive) so a local
+    UPLOAD works exactly like a live PULL. A packaged file's inner document is extracted in memory
+    (never written to disk); a bare file is read with ``encoding="utf-8-sig"`` so Tableau's UTF-8 BOM
+    is consumed transparently. When both a packaged and an unpacked copy of the same asset coexist in
+    a folder, the asset is processed ONCE (the unpacked copy wins). Ids are absolute file paths; the
+    display name is the file stem.
     """
 
     def __init__(self, root):
@@ -117,21 +123,36 @@ class LocalFilesSource(TableauSource):
                     found.append(os.path.join(dirpath, fn))
         return sorted(found)
 
-    def _read(self, path):
-        with open(path, "r", encoding="utf-8-sig") as fh:
-            return fh.read()
+    @staticmethod
+    def _dedup_by_stem(paths):
+        # A packaged export (.tdsx/.twbx) and its unpacked twin (.tds/.twb) describe ONE asset; emit it
+        # once (prefer the unpacked copy -- already text, and the copy a user is most likely editing)
+        # so the output bundle has no duplicate datasource / name collision.
+        chosen = {}
+        for p in paths:
+            stem, ext = os.path.splitext(os.path.basename(p))
+            key = (os.path.dirname(p), stem.lower())
+            packaged = ext.lower() in (".tdsx", ".twbx")
+            if key not in chosen or (chosen[key][1] and not packaged):
+                chosen[key] = (p, packaged)
+        return sorted(p for p, _packaged in chosen.values())
 
     def list_datasources(self):
-        return self._discover(".tds")
+        # Packaged ``.tdsx`` is a common local export shape, so discover it alongside the bare ``.tds``.
+        return self._dedup_by_stem(self._discover(".tds") + self._discover(".tdsx"))
 
     def read_datasource(self, ds_id):
-        return self._read(ds_id)
+        with open(ds_id, "rb") as fh:
+            data = fh.read()
+        return F.inner_tds_from_zip(data) if F.is_zip(data) else data.decode("utf-8-sig")
 
     def list_workbooks(self):
-        return self._discover(".twb")
+        # Packaged ``.twbx`` is a common local export shape, so discover it alongside the bare ``.twb``.
+        return self._dedup_by_stem(self._discover(".twb") + self._discover(".twbx"))
 
     def read_workbook(self, wb_id):
-        return self._read(wb_id)
+        # ``load_workbook_xml`` transparently handles both a bare ``.twb`` and a packaged ``.twbx``.
+        return load_workbook_xml(wb_id)
 
     def asset_name(self, asset_id):
         return os.path.splitext(os.path.basename(asset_id))[0]

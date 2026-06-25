@@ -7,8 +7,10 @@ read path is exercised without committing any artifact files. The orchestrator i
 both real adapters and an injected viz stage, asserting on the emitted folder structure, the
 machine-readable ``report.json``, fallback handling, the viz seam, and the no-credentials guarantee.
 """
+import io
 import json
 import os
+import zipfile
 
 import pytest
 
@@ -334,6 +336,50 @@ def test_local_files_source_enumeration_and_naming(fixtures_dir):
     # reads through the BOM transparently (utf-8-sig)
     assert src.read_datasource(ds[-1]).startswith("<?xml")
     assert src.describe() == {"kind": "LocalFilesSource", "root": fixtures_dir}
+
+
+def _packaged_zip_bytes(arcname, text):
+    """Pack one BOM-encoded member into an in-memory zip -- a ``.tdsx``/``.twbx`` IS a zip."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(arcname, text.encode("utf-8-sig"))
+    return buf.getvalue()
+
+
+def test_local_files_source_discovers_packaged_tdsx_and_twbx(tmp_path):
+    # A local UPLOAD commonly hands us the PACKAGED exports (.tdsx/.twbx = zip archives); they must
+    # work exactly like the bare .tds/.twb a live pull lands (local==live parity). The inner document
+    # is extracted from the zip in memory and never written to disk.
+    root = tmp_path / "packaged"
+    root.mkdir()
+    (root / "widget_sales.tdsx").write_bytes(
+        _packaged_zip_bytes("widget_sales.tds", WIDGET_SALES_TDS))
+    (root / "widget_dashboard.twbx").write_bytes(
+        _packaged_zip_bytes("Dashboard/widget_dashboard.twb", WIDGET_DASHBOARD_TWB))
+
+    src = LocalFilesSource(str(root))
+    ds = src.list_datasources()
+    wb = src.list_workbooks()
+
+    assert [src.asset_name(p) for p in ds] == ["widget_sales"]
+    assert [src.asset_name(p) for p in wb] == ["widget_dashboard"]
+    assert src.read_datasource(ds[0]).startswith("<?xml")
+    assert "Widget Sales" in src.read_datasource(ds[0])
+    assert "<workbook" in src.read_workbook(wb[0])
+
+
+def test_local_files_source_dedups_packaged_and_unpacked_twin(tmp_path):
+    # When a packaged export and its unpacked twin coexist, the asset is enumerated ONCE (the
+    # unpacked .tds/.twb wins) so the output bundle has no duplicate datasource / name collision.
+    root = tmp_path / "mixed"
+    root.mkdir()
+    with open(root / "widget_sales.tds", "w", encoding="utf-8-sig") as fh:
+        fh.write(WIDGET_SALES_TDS)
+    (root / "widget_sales.tdsx").write_bytes(
+        _packaged_zip_bytes("widget_sales.tds", WIDGET_SALES_TDS))
+
+    ds = LocalFilesSource(str(root)).list_datasources()
+    assert [os.path.basename(p) for p in ds] == ["widget_sales.tds"]
 
 
 # -- full estate run over file-backed fixtures --------------------------------

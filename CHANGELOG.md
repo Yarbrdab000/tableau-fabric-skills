@@ -13,6 +13,16 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **a local `.twbx` / `.tdsx` upload is now discovered and read** by the
+  file-backed estate source, so the "just upload the packaged workbook / datasource" path behaves like a
+  live pull instead of silently finding nothing. `migrate_estate.LocalFilesSource` previously matched only
+  the *bare* `.tds` / `.twb` extensions (an exact `splitext` compare) and read every file as UTF-8 text, so
+  a packaged export — which is a **zip** — was skipped entirely (a `.twbx`-only folder reported `0/0`
+  everything). It now also discovers `.tdsx` / `.twbx`, extracts the inner document **in memory** via the
+  tested `fetch_tds` / `workbook_table_calcs` zip helpers (never written to disk), and de-duplicates a
+  packaged export against its unpacked twin (preferring the unpacked copy) so a mixed folder yields no
+  duplicate datasource. Additive; existing bare-file behavior is unchanged. (Local==live parity, discovery
+  half; published / `sqlproxy` schema recovery is tracked separately.)
 - **tableau-migration:** **table-calc measures now translate on the live / published-datasource path,
   reaching parity with a local `.twbx` upload.** When a workbook connects to a published Tableau Cloud
   datasource (`sqlproxy`), `migrate_estate._rebuild_from_published_match` rebuilds the model from the
