@@ -431,10 +431,33 @@ than silently dropped: `parse_twb` resolves each control to the parameter's capt
 and records it on the additive `ir["parameter_controls"]`
 (`{param_id, caption, datatype, dashboard, position}`), de-duplicated across the primary and
 phone/tablet `<devicelayouts>` so a control is counted once. A faithful slicer needs the
-parameter's *target* (its kind, and which model column or measure it drives) — that binding is
-owned by the migrated model, so until it is available each control emits one honest
-`dashboard`-scope warning (surfaced as a `warned` fidelity row) and **no** slicer is written.
-Warn-never-wrong: the control is never reconstructed as a slicer against a guessed target.
+parameter's *target* (which model column it drives) — that binding is owned by the migrated
+model, so it is supplied to the rebuild through the optional `param_binding` consumer contract:
+
+```
+param_binding = {
+  "slicers": { "<parameter internal_name>": {"table", "column", "single_select"?, "caption"?} },
+  "flags":   { "<tableau filter token>":    {"entity", "measure", "status", "value"} }
+}
+```
+
+When a control's parameter appears in `param_binding["slicers"]` (matched bracket-tolerantly, so
+the orchestrator's bracketed `[Parameter …]` keys resolve against the bracket-stripped control id),
+it is **rebuilt as a categorical slicer** on `table[column]`, placed at the control's captured
+(dashboard-scaled) position; the rebuild is recorded on the additive `ir["parameter_slicers"]`
+(`{param_id, caption, dashboard, page, visual, kind, target, single_select}`) and the control's
+standing warning is dropped. `single_select` is **recorded** for a later (Tier-2) selection-mode
+pass but no single-select object is emitted yet (no verified PBIR shape — warn-never-wrong defers
+the toggle rather than risk an unfaithful visual). A value-picker (disconnected picker-table)
+parameter arrives in the same `{table, column}` slicer shape and rebuilds identically. The
+`flags` map (parameter-driven measure / relative-date filters applied as a visual-level
+`flag == value` filter) is a separate, later consumer pass — those worksheet-level filter
+warnings stand until it lands.
+
+Until the model identifies a target (no `param_binding`, or an entry missing its column), each
+control emits one honest `dashboard`-scope warning (surfaced as a `warned` fidelity row) and
+**no** slicer is written. Warn-never-wrong: the control is never reconstructed as a slicer
+against a guessed target.
 
 ### Cross-visual interactions (default cross-filter / cross-highlight)
 
