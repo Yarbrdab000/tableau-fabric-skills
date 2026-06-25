@@ -106,6 +106,37 @@ def test_orphaned_column_zero_continuation_is_flagged():
     assert any("column-0" in p for p in problems)
 
 
+def test_partition_source_value_block_at_opener_plus_one_lints_clean():
+    # ``source =`` is a PROPERTY-level assignment (a property of ``partition``): its M
+    # ``let``/``in`` value block sits one tab deeper than ``source`` (opener+1) -- the standard
+    # TMDL form TOM opens. It must NOT be flagged like an object-declaration body (opener+2).
+    text = (
+        "table Orders\n"
+        "\tpartition 'Orders' = m\n"
+        "\t\tmode: import\n"
+        "\t\tsource =\n"
+        "\t\t\tlet\n"
+        '\t\t\t\tSource = Excel.Workbook(File.Contents("x.xlsx"), null, true)\n'
+        "\t\t\tin\n"
+        "\t\t\t\tSource\n"
+    )
+    assert lint_tmdl_text(text) == []
+
+
+def test_source_value_block_not_deeper_than_source_is_flagged():
+    # A ``source`` value block that is NOT deeper than the ``source`` line itself (here dropped
+    # to the same 2-tab property level) is a genuine openability defect -- still flagged.
+    text = (
+        "table Orders\n"
+        "\tpartition 'Orders' = m\n"
+        "\t\tmode: import\n"
+        "\t\tsource =\n"
+        "\t\tlet\n"
+    )
+    problems = lint_tmdl_text(text)
+    assert any("not indented deeper" in p for p in problems)
+
+
 # -- regression: the exact defect the serializer fix addressed -----------------
 def test_old_inline_multiline_measure_bug_is_caught():
     # Reproduce the PRE-FIX emission: a multi-line DAX body rendered INLINE after
@@ -181,3 +212,17 @@ def test_generated_database_and_relationships_lint_clean():
          "to_table": "People", "to_col": "Region"},
     ])
     assert lint_tmdl_text(rels) == []
+
+
+def test_emitted_m_partition_lints_clean():
+    # The REAL serializer output for an ``= m`` partition (``source =`` followed by a
+    # ``let``/``in`` block at opener+1) must lint clean: it is openable TMDL (the fidelity
+    # oracle's TOM Gate 0 opens it), so the linter must not raise a false ``source``
+    # continuation defect on every import / live-connection model.
+    from connection_to_m import emit_table_tmdl_m, parse_tds
+    from test_connection_to_m import LIVE_SQLSERVER
+
+    d = parse_tds(LIVE_SQLSERVER)
+    tmdl = emit_table_tmdl_m(d["relations"][0], d, "DirectQuery")
+    assert "source =" in tmdl and "let" in tmdl  # exercises the partition opener path
+    assert lint_tmdl_text(tmdl) == []

@@ -96,6 +96,15 @@ def lint_tmdl_text(text):
 
         if _STRUCT_OPENER_RE.match(line):
             opener_indent = _indent_depth(line)
+            keyword = line.lstrip("\t").split(None, 1)[0]
+            # ``source`` is itself a property-level assignment (a property of a ``partition``):
+            # its value block -- an M ``let``/``in`` partition body, or a calculated-table
+            # expression -- sits exactly one level deeper than the ``source`` line, which is
+            # the standard form TOM opens. Every other opener
+            # (``measure`` / ``column`` / ``calculationItem`` / ``expression``) is an object
+            # declaration whose sibling PROPERTIES sit at opener+1, so its multi-line body must
+            # be deeper still (>= opener+2) or it would be read as a sibling property.
+            max_sibling_indent = opener_indent if keyword == "source" else opener_indent + 1
             j = i + 1
             while j < n and not lines[j].strip():
                 j += 1
@@ -105,7 +114,7 @@ def lint_tmdl_text(text):
                         i + 1, line.strip()
                     )
                 )
-            elif _indent_depth(lines[j]) <= opener_indent + 1:
+            elif _indent_depth(lines[j]) <= max_sibling_indent:
                 violations.append(
                     "line {0}: multi-line body is not indented deeper than the property "
                     "level of its opener at line {1} (column-0 / sibling-level "

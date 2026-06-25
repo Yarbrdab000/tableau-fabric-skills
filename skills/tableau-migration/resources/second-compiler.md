@@ -123,6 +123,16 @@ another calculated field, with its `references_formula`), `parameter` (`[Paramet
 `unresolved`. That resolution is everything you need to translate at the right grain — you do not
 have to re-parse the formula to discover its inputs.
 
+> **Write every column reference in your DAX as `'<fields[].table>'[<fields[].column>]` — the
+> resolved *model* identifiers, never the Tableau `caption`.** The engine lands your approved DAX
+> **verbatim** against the generated model, whose column names are **sanitized** (a Tableau field
+> such as `State/Province` becomes the model column `State_Province`; spaces, `/`, `,`, parentheses,
+> etc. all collapse to `_`). Authoring against the caption — `'Orders'[State/Province]` — yields a
+> model that *deserializes* (Gate 0 green) but **errors at query/refresh time** with
+> *"Column 'State/Province' in table 'Orders' cannot be found."* Authoring against the resolved
+> `column` — `'Orders'[State_Province]` — binds correctly. `fields[].caption` is for *reading* the
+> original formula; `fields[].table` / `fields[].column` are what you *emit*.
+
 ---
 
 ## The category taxonomy — your routing map
