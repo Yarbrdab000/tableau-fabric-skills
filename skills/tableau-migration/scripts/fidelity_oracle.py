@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import ntpath
 import os
 import re
 import shutil
@@ -3196,6 +3197,218 @@ def _parse_tmdl_relationships(definition_dir):
     return rels
 
 
+# =====================================================================================
+# Gate: data-load openability (stdlib-only, ALWAYS-ON) -- the false-1.0 sentinel
+# =====================================================================================
+# The TOM openability_tier above proves the model DEFINITION deserializes, but it needs
+# pythonnet/.NET; offline it degrades to {available: False} and checks NOTHING -- which is exactly
+# how a structurally-perfect .pbip that loads ZERO data scored a (false) 1.0. Power BI rejects a
+# RELATIVE File.Contents path ("The supplied file path must be a valid absolute path"), so the .pbip
+# opens but every visual renders empty. This gate is a separate, stdlib-only, deterministic, offline
+# pre-flight that statically reads the emitted partition M and FORCES every score to 0 when the data
+# source cannot load -- the guardrail that would have caught the false 1.0. It checks only what it can
+# prove from a string literal; a parameterized/database/non-File.Contents source is left untouched so
+# a genuinely-loadable model is never false-zeroed (the honest-negative bar).
+_DATA_FILE_FUNCS = ("File.Contents", "Folder.Contents")
+_DATALOAD_BLOCKED_SCORE = 0.0
+
+
+def _is_loadable_data_path(path):
+    """True iff ``path`` is an absolute Windows drive path (``C:\\...``) or a UNC path
+    (``\\\\server\\share\\...``) -- the only forms Power BI accepts for ``File.Contents``. A relative
+    path (``Data/Datasources/x.xlsx``), a driveless-rooted path (``/x.xlsx``), or an empty string is
+    NOT loadable. Uses ``ntpath`` explicitly so the verdict is deterministic on any host OS -- the
+    target engine is always Windows Power BI."""
+    if not path:
+        return False
+    drive, _rest = ntpath.splitdrive(path.strip())
+    return bool(drive)
+
+
+def _m_first_string_arg(expression, open_paren_idx):
+    """Return the first M string-literal argument of a call whose ``(`` is at ``open_paren_idx``.
+
+    Skips leading whitespace; if the first argument is NOT a string literal (a parameter or a nested
+    expression) returns ``None`` -- undeterminable, so the caller never trips on it. Handles the M
+    ``""`` in-string escape. Returns ``None`` on an unterminated literal."""
+    i = open_paren_idx + 1
+    n = len(expression)
+    while i < n and expression[i] in " \t\r\n":
+        i += 1
+    if i >= n or expression[i] != '"':
+        return None
+    i += 1
+    out = []
+    while i < n:
+        ch = expression[i]
+        if ch == '"':
+            if i + 1 < n and expression[i + 1] == '"':  # "" -> escaped quote, stay in string
+                out.append('"')
+                i += 2
+                continue
+            return "".join(out)
+        out.append(ch)
+        i += 1
+    return None
+
+
+def _scan_data_file_paths(expression):
+    """Return ``[(func, path), ...]`` for each ``File.Contents``/``Folder.Contents`` call in ``expression``
+    whose first argument is a string literal.
+
+    A single-pass state machine that steps OVER M string literals and ``//`` / ``/* */`` comments, so a
+    function name quoted inside a string or a comment is never matched, and the matched token must sit
+    on an identifier boundary (so ``MyFile.Contents`` does not match). A call whose first arg is not a
+    literal is skipped (undeterminable). Stdlib-only; never raises."""
+    if not expression:
+        return []
+    s = expression
+    n = len(s)
+    i = 0
+    found = []
+    while i < n:
+        ch = s[i]
+        if ch == '"':  # step over a string literal (handles "" escape)
+            i += 1
+            while i < n:
+                if s[i] == '"':
+                    if i + 1 < n and s[i + 1] == '"':
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == '/' and i + 1 < n and s[i + 1] == '/':  # line comment
+            i += 2
+            while i < n and s[i] not in "\r\n":
+                i += 1
+            continue
+        if ch == '/' and i + 1 < n and s[i + 1] == '*':  # block comment
+            i += 2
+            while i < n and not (s[i] == '*' and i + 1 < n and s[i + 1] == '/'):
+                i += 1
+            i += 2
+            continue
+        matched = None
+        for func in _DATA_FILE_FUNCS:
+            if s.startswith(func, i):
+                prev_ok = (i == 0) or not (s[i - 1].isalnum() or s[i - 1] in "._")
+                if prev_ok:
+                    matched = func
+                    break
+        if matched:
+            j = i + len(matched)
+            while j < n and s[j] in " \t\r\n":
+                j += 1
+            if j < n and s[j] == "(":
+                path = _m_first_string_arg(s, j)
+                if path is not None:
+                    found.append((matched, path))
+                i = j + 1
+                continue
+        i += 1
+    return found
+
+
+def _check_dataload_openability(definition_dir, model_dir=None):
+    """Gate 0b (stdlib, always-on): can the emitted model's data source actually LOAD?
+
+    Statically scans every ``definition/tables/*.tmdl`` partition M for ``File.Contents`` /
+    ``Folder.Contents`` string-literal paths and classifies each as loadable (absolute/UNC) or not
+    (relative/driveless). Returns one of:
+
+    * ``{available: True, loadable: False, broken_paths, checked_paths}`` -- a non-loadable path: the
+      gate TRIPS and forces every score to 0 (the model opens but loads zero data);
+    * ``{available: True, loadable: True, checked_paths}`` -- every checked path is absolute: healthy;
+    * ``{available: True, loadable: None, checked: 0}`` -- no static file path to check
+      (database / parameterized / extract-only): NOT applicable, never trips;
+    * ``{available: False, reason}`` -- no model definition folder found.
+
+    Deterministic + offline (``ntpath``): the verdict is identical on any host OS. No TOM, no Desktop."""
+    if model_dir and not definition_dir:
+        definition_dir = _resolve_model_definition(model_dir=model_dir)
+    if not definition_dir:
+        return {"tier": "dataload_openability", "available": False,
+                "reason": "no *.SemanticModel/definition folder found"}
+    tables_dir = os.path.join(definition_dir, "tables")
+    if not os.path.isdir(tables_dir):
+        tables_dir = definition_dir
+    try:
+        names = sorted(os.listdir(tables_dir))
+    except OSError as exc:
+        return {"tier": "dataload_openability", "available": False,
+                "reason": "cannot list %s: %s" % (tables_dir, exc)}
+    checked = []
+    broken = []
+    for fname in names:
+        if not fname.lower().endswith(".tmdl"):
+            continue
+        try:
+            with open(os.path.join(tables_dir, fname), "r", encoding="utf-8-sig") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        for func, path in _scan_data_file_paths(text):
+            rec = {"table_file": fname, "function": func, "path": path,
+                   "loadable": _is_loadable_data_path(path)}
+            checked.append(rec)
+            if not rec["loadable"]:
+                bad = dict(rec)
+                bad["reason"] = (
+                    "non-absolute (relative/driveless) data path -- Power BI requires an absolute "
+                    "path; the model opens but loads ZERO data and every visual renders empty")
+                broken.append(bad)
+    if not checked:
+        return {"tier": "dataload_openability", "available": True, "loadable": None,
+                "checked": 0, "definition": definition_dir, "advisory": True,
+                "note": ("no static File.Contents/Folder.Contents path to check "
+                         "(database / parameterized / extract-only source) -- gate not applicable")}
+    if broken:
+        return {"tier": "dataload_openability", "available": True, "loadable": False,
+                "verdict": "data-load-blocked", "definition": definition_dir,
+                "broken_paths": broken, "checked_paths": checked, "advisory": True,
+                "notes": [
+                    "DATA-LOAD BLOCKED: an emitted File.Contents/Folder.Contents path is not "
+                    "absolute. Power BI rejects a relative data path, so the .pbip OPENS but loads "
+                    "zero data -- every visual renders empty. Forcing all fidelity scores to 0.",
+                    "Deterministic offline static check (no Desktop, no TOM): the path is read from "
+                    "the emitted partition M; absoluteness is decided by ntpath so it is host-OS "
+                    "independent. Fix the emitter to lift the data file to an absolute on-disk path.",
+                ]}
+    return {"tier": "dataload_openability", "available": True, "loadable": True,
+            "verdict": "data-load-ok", "definition": definition_dir,
+            "checked_paths": checked, "advisory": True,
+            "notes": ["data-load OK: every emitted File.Contents/Folder.Contents path is absolute "
+                      "(loadable). This gate checks path loadability only, not the file's existence "
+                      "or contents -- those are environment-specific and belong to the value tier."]}
+
+
+def _apply_dataload_gate(report):
+    """If the data-load openability gate tripped, FORCE the structural aggregate and the per-visual
+    objective score to 0 -- a model that loads no data has zero fidelity no matter how its JSON
+    scores. The pre-gate numbers are preserved as ``raw_*`` and a ``dataload_blocked`` flag is
+    stamped on each touched record. A strict no-op when the gate did not trip (``loadable`` True or
+    None) or no gate record is present, so a healthy/absolute-path model is never false-zeroed.
+    Returns ``True`` iff it tripped. (Combined-headline dominance lives in ``_combined_fidelity``.)"""
+    rec = report.get("dataload_openability")
+    if not (rec and rec.get("available") and rec.get("loadable") is False):
+        return False
+    summary = report.get("summary")
+    if isinstance(summary, dict):
+        summary.setdefault("raw_aggregate_score", summary.get("aggregate_score"))
+        summary.setdefault("raw_aggregate_band", summary.get("aggregate_band"))
+        summary["aggregate_score"] = _DATALOAD_BLOCKED_SCORE
+        summary["aggregate_band"] = _band(_DATALOAD_BLOCKED_SCORE)
+        summary["dataload_blocked"] = True
+    pv = report.get("per_visual")
+    if isinstance(pv, dict) and "objective_score" in pv:
+        pv.setdefault("raw_objective_score", pv.get("objective_score"))
+        pv["objective_score"] = _DATALOAD_BLOCKED_SCORE
+        pv["dataload_blocked"] = True
+    return True
+
+
 def _parse_tmdl_table_lines(lines, model):
     """Stateful single pass over one TMDL file's lines, folding tables into ``model``."""
     cur = None            # current table record
@@ -3919,7 +4132,10 @@ def _combined_fidelity(report):
             tiers["image"] = float(iscore)
     openrec = report.get("openability")
     openable = openrec.get("openable") if (openrec and openrec.get("available")) else None
-    if not tiers and openable is None:
+    dataload = report.get("dataload_openability")
+    dataload_blocked = bool(dataload and dataload.get("available")
+                            and dataload.get("loadable") is False)
+    if not tiers and openable is None and not dataload_blocked:
         return None
     wsum = sum(COMBINED_WEIGHTS[k] for k in tiers)
     combined = sum(COMBINED_WEIGHTS[k] * v for k, v in tiers.items()) / wsum if wsum else None
@@ -3937,14 +4153,18 @@ def _combined_fidelity(report):
                  "present); confidence reflects how many tiers backed it, not their mutual "
                  "agreement -- a low image score pulling the headline down IS the signal."),
     }
-    # Gate 0 dominates: a model that does not deserialize cannot be faithful at any structural score.
-    if openable is False:
+    # Gate 0 dominates: a model that does not deserialize (TOM) OR cannot load its data (stdlib
+    # data-load gate) cannot be faithful at any structural score. Either forces the headline to 0.
+    if openable is False or dataload_blocked:
         result["raw_combined_score"] = result["combined_score"]
         result["raw_band"] = result["band"]
         result["combined_score"] = _BLOCKED_COMBINED_SCORE
         result["band"] = _band(_BLOCKED_COMBINED_SCORE)
         result["blocked"] = True
-    result["verdict"] = _fidelity_verdict(report, result["combined_score"], openable)
+        if dataload_blocked:
+            result["dataload_blocked"] = True
+    effective_openable = False if dataload_blocked else openable
+    result["verdict"] = _fidelity_verdict(report, result["combined_score"], effective_openable)
     return result
 
 
@@ -4046,6 +4266,10 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
     relationships = _parse_tmdl_relationships(_defn_dir) if _defn_dir else []
     report = score_report(twb, pbir, engine_report=engine_report, field_aliases=field_aliases,
                           relationships=relationships)
+    # Gate 0b (stdlib, always-on): does the emitted data source actually load? A relative
+    # File.Contents path opens but loads ZERO data -- the false-1.0 sentinel. Attached unconditionally
+    # so the gate is visible even when the optional tiers do not run; the forced-0 is applied below.
+    report["dataload_openability"] = _check_dataload_openability(_defn_dir)
     report["inputs"] = {
         "twb": os.path.abspath(twb_path),
         "report_dir": os.path.abspath(report_dir),
@@ -4102,6 +4326,9 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
         report["metadata"] = metadata_tier(report_dir=report_dir, **opts)
     if per_visual_options is not None:
         report["per_visual"] = per_visual_fidelity(report, **per_visual_options)
+    # Force structural + per-visual to 0 if the data-load gate tripped (raw_* preserved). Runs after
+    # per_visual so its objective is zeroed too; _combined_fidelity then forces the headline to 0.
+    _apply_dataload_gate(report)
     combined = _combined_fidelity(report)
     if combined is not None:
         report["combined_fidelity"] = combined
