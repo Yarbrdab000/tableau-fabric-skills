@@ -13,6 +13,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **the assisted (second-compiler) idiom registry now recognizes the
+  argmin-over-a-dimension twin** of the existing argmax idiom ("the member of dimension C with the
+  *least* AGG([f]) per partition", e.g. the lowest-selling city in each state). The detector
+  (`_detect_argmax_dimension` in `calc_to_dax.py`) and its LOD parser (`_parse_max_of_fixed`) now
+  accept the `{FIXED P : MIN(...)}` selector and emit the same faithful, tie-aware
+  `CALCULATETABLE`/`ADDCOLUMNS`/`SUMMARIZE` shape with `MINX` instead of `MAXX` (pattern
+  `argmin-dimension`); the argmax branch is byte-for-byte unchanged. Suggestions remain
+  approval-gated — never silently emitted. Original parameterization of our own argmax emitter
+  (CLEANROOM pass).
+- **tableau-migration:** **a golden-loop regression harness for the assisted tier**
+  (`tests/test_assisted_golden_loop.py`) that drives a corpus of known-good translations through the
+  whole Tier-1 loop end-to-end — `suggest_assisted_dax` → `check_candidate_dax` (syntactic gate) →
+  `reconcile` (numeric oracle) — seeded with the argmax/argmin idioms and the canonical
+  human-approved C1/C2 sidecar pair (C1 "Highest Selling City By State Sales" = 1,221,139.3614
+  reconciled against ground truth; C2 gate-locked). Proves non-vacuity (a wrong oracle value
+  MISMATCHes; a corrupt/inert candidate fails the gate without touching the backend) and adds a
+  forcing-function test so every newly-registered idiom detector must carry a golden corpus row.
+  Test-only; no engine or report-schema change.
 - **tableau-migration:** **an author's explicit per-field number format now survives to the Power BI
   `formatString`.** Tableau persists a column's explicit currency / percent / precision as a
   `default-format` code on the logical `<column>` element (e.g. `c"$"#,##0;("$"#,##0)`); previously

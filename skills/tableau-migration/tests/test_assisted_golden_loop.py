@@ -51,6 +51,9 @@ def _resolver(caption):
 _ARGMAX_DETAIL = "{FIXED [State], [City] : SUM([Sales])}"
 _ARGMAX_MAX = "{FIXED [State] : MAX({FIXED [State], [City] : SUM([Sales])})}"
 _ARGMAX_INLINE = f"IF {_ARGMAX_MAX} = {_ARGMAX_DETAIL} THEN [City] END"
+# The argmin twin (MIN selector) -- same structural idiom, MINX/__min emit.
+_ARGMIN_MIN = "{FIXED [State] : MIN({FIXED [State], [City] : SUM([Sales])})}"
+_ARGMIN_INLINE = f"IF {_ARGMIN_MIN} = {_ARGMAX_DETAIL} THEN [City] END"
 
 
 # --------------------------------------------------------------------------- canonical sidecar DAX
@@ -91,6 +94,16 @@ _CORPUS = [
         "calc_lookup": None,
         "truth": "New York City",
         "wrong": "Los Angeles",
+        "value_kind": None,            # text -> exact compare
+    },
+    {
+        "name": "argmin: city with the least sales per state",
+        "kind": "detect",
+        "pattern": "argmin-dimension",
+        "formula": _ARGMIN_INLINE,
+        "calc_lookup": None,
+        "truth": "Burlington",
+        "wrong": "New York City",
         "value_kind": None,            # text -> exact compare
     },
     {
@@ -196,13 +209,12 @@ def test_approved_sidecar_canonical_pairs_pass_gate_and_reconcile():
 
 # --------------------------------------------------------------------------- registry sync guard
 def test_corpus_covers_every_registered_detector():
-    # Forcing function: each detector in the registry must be represented by a corpus row it matches,
-    # so a newly-added idiom cannot ship without a golden detect -> gate -> reconcile entry.
-    covered = set()
-    for entry in _DETECT:
-        s = suggest_assisted_dax(entry["formula"], _resolver, calc_lookup=entry.get("calc_lookup"))
-        assert s is not None, entry["name"]
-        covered.add(s["pattern"])
-    assert len(covered) == len(_ASSISTED_DETECTORS), (
-        "every assisted detector needs a corpus row: %d detectors, %d covered patterns %r"
-        % (len(_ASSISTED_DETECTORS), len(covered), sorted(covered)))
+    # Forcing function: every detector in the registry must fire on at least one corpus formula, so a
+    # newly-registered idiom cannot ship without a golden detect -> gate -> reconcile entry.
+    for detector in _ASSISTED_DETECTORS:
+        fired = any(
+            detector(e["formula"], _resolver, e.get("calc_lookup")) is not None for e in _DETECT)
+        assert fired, "detector %s has no golden corpus entry" % detector.__name__
+    # The argmax/argmin family is one detector emitting two patterns -- lock that both are exercised.
+    patterns = {e["pattern"] for e in _DETECT}
+    assert {"argmax-dimension", "argmin-dimension"} <= patterns, sorted(patterns)
