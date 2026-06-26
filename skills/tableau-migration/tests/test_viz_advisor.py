@@ -10,14 +10,18 @@ import json
 import pytest
 
 from viz_advisor import (
+    ADVICE_SIDECAR_KIND,
     ADVISOR_BUNDLE_KIND,
     ADVISOR_RULES,
     PBIR_VISUAL_TYPES,
     VizAdvisorError,
     advice_prompt,
+    advise_for_candidate_record,
     apply_advice,
     build_advice_bundle,
+    build_report_advice,
     classify_fields,
+    fields_from_candidate_record,
     normalize_field,
     recommend_visuals,
     refine_with_feedback,
@@ -338,3 +342,84 @@ def test_refine_does_not_mutate_input():
     before = json.dumps(cands, sort_keys=True)
     refine_with_feedback(cands, {"pieChart": "up"})
     assert json.dumps(cands, sort_keys=True) == before
+
+
+# -- pipeline bridge: advice from candidate records ----------------------------
+
+def _record(visual_type, fields, **kw):
+    rec = {"page": "p1", "visual": "v1", "worksheet": "Sheet", "visual_type": visual_type,
+           "fields": fields}
+    rec.update(kw)
+    return rec
+
+
+def test_fields_from_record_infers_role_from_slot():
+    fields, reason = fields_from_candidate_record(
+        _record("clusteredColumnChart", {"Category": ["Orders.Segment"], "Y": ["Orders.Sales"]}))
+    assert reason is None
+    by = {f["name"]: f["role"] for f in fields}
+    assert by == {"Segment": "dimension", "Sales": "measure"}
+
+
+def test_fields_from_record_uses_field_types_for_data_type():
+    fields, _ = fields_from_candidate_record(
+        _record("clusteredColumnChart", {"Category": ["Orders.Order Date"], "Y": ["Orders.Sales"]}),
+        field_types={"Orders.Order Date": "date"})
+    dt = {f["name"]: f["data_type"] for f in fields}
+    assert dt["Order Date"] == "date"
+
+
+def test_fields_from_record_rejects_unknown_slot():
+    fields, reason = fields_from_candidate_record(
+        _record("clusteredColumnChart", {"Tooltips": ["Orders.Sales"]}))
+    assert fields is None
+    assert "no unambiguous field role" in reason
+
+
+def test_fields_from_record_rejects_empty():
+    fields, reason = fields_from_candidate_record(_record("card", {}))
+    assert fields is None
+    assert "no bound fields" in reason
+
+
+def test_advise_for_record_offers_alternatives_and_drops_current():
+    e = advise_for_candidate_record(
+        _record("clusteredColumnChart", {"Category": ["Orders.Segment"], "Y": ["Orders.Sales"]}))
+    assert e["advisable"]
+    types = [s["visual_type"] for s in e["suggestions"]]
+    assert "clusteredColumnChart" not in types       # the current type is never re-suggested
+    assert e["top_alternative"] == types[0]
+
+
+def test_advise_for_record_table_is_not_advisable():
+    e = advise_for_candidate_record(
+        _record("tableEx", {"Values": ["Orders.Sales", "Orders.Segment"]}))
+    assert e["advisable"] is False
+    assert "detail table" in e["reason"]
+    assert "suggestions" not in e
+
+
+def test_advise_for_record_temporal_prefers_line():
+    e = advise_for_candidate_record(
+        _record("clusteredColumnChart", {"Category": ["Orders.Order Date"], "Y": ["Orders.Sales"]}),
+        field_types={"Orders.Order Date": "date"})
+    assert e["top_alternative"] == "lineChart"
+
+
+def test_build_report_advice_shape_and_counts():
+    records = [
+        _record("clusteredColumnChart", {"Category": ["Orders.Segment"], "Y": ["Orders.Sales"]}),
+        _record("tableEx", {"Values": ["Orders.Sales"]}),
+    ]
+    body = build_report_advice(records)
+    assert body["kind"] == ADVICE_SIDECAR_KIND
+    assert body["rules"] == list(ADVISOR_RULES)
+    assert body["summary"]["visuals"] == 2
+    assert body["summary"]["advisable"] == 1
+    assert body["summary"]["with_alternative"] == 1
+
+
+def test_build_report_advice_empty_is_well_formed():
+    body = build_report_advice([])
+    assert body["advice"] == []
+    assert body["summary"] == {"visuals": 0, "advisable": 0, "with_alternative": 0}

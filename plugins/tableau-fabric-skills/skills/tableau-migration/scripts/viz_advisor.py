@@ -443,3 +443,116 @@ def refine_with_feedback(candidates, feedback):
     for i, s in enumerate(out, 1):
         s["rank"] = i
     return out
+
+
+# -- pipeline integration: advice from the deterministic viz candidate records -------------------
+# The viz engine emits a read-only candidate record per main visual (twb_to_pbir
+# ``ir["candidate_records"]``: ``{visual_type, fields: {slot: [queryRef]}, ...}``). This bridge turns
+# that field truth into advisor input so an estate run can emit an OPT-IN ``viz-advice.json`` sidecar
+# of ranked ALTERNATIVE charts per already-rebuilt visual. It is the advisor's pipeline seam --
+# purely additive (nothing is written into the PBIR), and it never proposes a rebinding: it only
+# re-ranks chart TYPES over a visual's EXISTING fields, gated to faithful, role-compatible options.
+ADVICE_SIDECAR_KIND = "tableau-to-powerbi-viz-advice"
+
+
+def _slot_role(slot):
+    """``"measure"`` / ``"dimension"`` for a known PBIR slot, else ``None`` (an ambiguous well)."""
+    if slot in _MEASURE_SLOTS:
+        return "measure"
+    if slot in _DIMENSION_SLOTS:
+        return "dimension"
+    return None
+
+
+def _ref_field_name(query_ref):
+    """``"Orders.Sales" -> "Sales"``; tolerate a measure ref that is already bare."""
+    if not isinstance(query_ref, str):
+        return ""
+    return query_ref.rsplit(".", 1)[-1].strip()
+
+
+def fields_from_candidate_record(record, *, field_types=None):
+    """``(fields, reason)`` -- advisor field specs from a candidate record's slot -> queryRef map.
+
+    Role is inferred from the slot (a measure slot vs a dimension slot); ``field_types`` (a
+    ``{queryRef: data_type}`` map) refines temporal / geo detection when the model types are known.
+    Returns ``(None, reason)`` when a bound slot is role-ambiguous or no field is bound -- the
+    advisor must never re-role a field it cannot place (warn-never-wrong).
+    """
+    fields_map = (record or {}).get("fields") or {}
+    types = field_types or {}
+    specs, seen = [], set()
+    for slot, refs in fields_map.items():
+        role = _slot_role(slot)
+        if role is None:
+            return None, f"slot {slot!r} has no unambiguous field role"
+        for ref in refs or []:
+            name = _ref_field_name(ref)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            specs.append({"name": name, "role": role, "data_type": types.get(ref)})
+    if not specs:
+        return None, "no bound fields to advise on"
+    return specs, None
+
+
+def advise_for_candidate_record(record, *, intent=None, field_types=None, max_alternatives=4):
+    """One advice entry for a rebuilt visual: ranked ALTERNATIVE chart types for its same fields.
+
+    Never proposes a rebinding -- it re-ranks chart types over the visual's existing field truth and
+    drops the type already chosen. ``advisable`` is ``False`` (with a ``reason``, no suggestions)
+    whenever the field roles cannot be reliably recovered -- e.g. the universal detail table mixes
+    measure and dimension fields in one ``Values`` well, so a re-rank would be guesswork.
+    """
+    record = record or {}
+    current = record.get("visual_type")
+    entry = {
+        "page": record.get("page"),
+        "visual": record.get("visual"),
+        "worksheet": record.get("worksheet"),
+        "current_type": current,
+    }
+    if current == "tableEx":
+        entry.update(advisable=False,
+                     reason="a detail table mixes measure and dimension fields in one well; "
+                            "field roles cannot be reliably recovered for a re-rank")
+        return entry
+    fields, reason = fields_from_candidate_record(record, field_types=field_types)
+    if fields is None:
+        entry.update(advisable=False, reason=reason)
+        return entry
+    try:
+        ranked = recommend_visuals(fields, intent=intent, max_suggestions=max_alternatives + 2)
+    except VizAdvisorError as exc:
+        entry.update(advisable=False, reason=str(exc))
+        return entry
+    alternatives = [r for r in ranked if r["visual_type"] != current][:max_alternatives]
+    entry.update(advisable=True, fields=fields,
+                 top_alternative=alternatives[0]["visual_type"] if alternatives else None,
+                 suggestions=alternatives)
+    return entry
+
+
+def build_report_advice(candidate_records, *, intent=None, field_types=None):
+    """The opt-in ``viz-advice.json`` artifact: per-visual ranked chart alternatives (additive).
+
+    Consumes the viz engine's read-only candidate records and returns a JSON-serializable sidecar
+    body. It is purely advisory -- nothing here is written into the PBIR definition, so the rebuilt
+    report is byte-for-byte identical whether or not the advice is produced.
+    """
+    advice = [advise_for_candidate_record(r, intent=intent, field_types=field_types)
+              for r in (candidate_records or [])]
+    advisable = [a for a in advice if a.get("advisable")]
+    return {
+        "version": ADVISOR_VERSION,
+        "kind": ADVICE_SIDECAR_KIND,
+        "intent": intent,
+        "rules": list(ADVISOR_RULES),
+        "summary": {
+            "visuals": len(advice),
+            "advisable": len(advisable),
+            "with_alternative": sum(1 for a in advisable if a.get("top_alternative")),
+        },
+        "advice": advice,
+    }

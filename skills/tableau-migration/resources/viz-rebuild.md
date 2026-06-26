@@ -659,6 +659,17 @@ It holds the same **warn-never-wrong** contract in three layers:
   choice otherwise, and returns an `{applied, kept, rejected}` audit report — a suggestion is never
   silently emitted. `refine_with_feedback` is the multi-turn hook (per-type up/down re-rank, clamped).
 
+**Pipeline hook (opt-in).** The advisor plugs into the estate run as an additive sidecar: pass
+`--viz-advice` (or `migrate_estate(..., viz_advice=True)`) and each workbook gains a
+`reports/<Name>.viz-advice.json` written *beside* (never inside) its `.Report` folder. It is built
+from the viz stage's read-only `candidate_records` via `build_report_advice` — for every rebuilt
+visual it lists ranked **alternative** chart types for that visual's *existing* fields (role inferred
+from the PBIR slot; a `field_types` map refines temporal/geo when the model types are known). It never
+proposes a rebinding, and a visual whose field roles cannot be reliably recovered (e.g. the universal
+detail table's mixed `Values` well) is reported `advisable: false` with a reason and no suggestion.
+The hook writes nothing into the PBIR definition and `report.json` only gains a per-workbook
+`viz_advice` key, so a run **without** the flag is byte-identical.
+
 ## Tests
 
 `tests/test_twb_to_pbir.py` is fully offline (inline `.twb` XML string fixtures, no disk, no
