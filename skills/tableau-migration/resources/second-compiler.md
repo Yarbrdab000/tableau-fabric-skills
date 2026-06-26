@@ -194,6 +194,23 @@ A candidate is **not** acceptable just because it parses.
   `EVALUATE ROW(…)` probe, and applies the tolerance policy, taking the Fabric and Tableau backends
   as **injected** `fabric_oracle` / `tableau_value` hooks (nothing runs silently). It returns a
   `verified` / `mismatch` / `not-evaluated` record per candidate.
+- **When you author more than one candidate**, rank them by the oracle rather than by eye:
+  `translation_reconcile.rank_candidates(name, [dax1, dax2, …], fabric_oracle=…, tableau_value=…)`
+  reconciles each (gate → numeric oracle) and returns them **best-first**, each with a `confidence`
+  (`high` = verified against the Tableau value · `medium` = passed the gate but not yet reconciled ·
+  `low` = proven wrong or malformed) and a one-line `reason`, plus `best` (the top non-`low`
+  candidate, or `None` when every candidate is low — author a better one). Each candidate may be a
+  raw DAX **string** or a suggestion dict carrying it under `dax` (the `suggest_assisted_dax` shape),
+  so you can rank the idiom-registry suggestions directly; `best` is always the resolved DAX string,
+  ready to hand to `approved_calc_dax`. Each ranked entry also carries an auditable `signals`
+  breakdown (`{gate, oracle, category}`) behind its grade, and a `requires_oracle` flag: for a
+  `dax_language_gap` approximation the oracle match is **mandatory**, so such a candidate is **never**
+  returned as `best` until it is VERIFIED (it stays listed at its medium grade for you to reconcile or
+  revise) — the same faithful-or-stub rule the gate enforces, applied to selection. This is the
+  optional acceleration tier's **selection** step: it ranks by **semantic equivalence, not string
+  similarity**, and — like everything in Tier 1 — lands nothing; the chosen candidate still flows
+  through `approved_calc_dax` and the human gate. Its `confidence` is the **semantic** signal that
+  feeds the §output-contract `confidence` field above.
 - For a `dax_language_gap` approximation, the oracle match is **mandatory** before proposing — an
   unverifiable approximation stays a stub. (The syntactic gate emits a warning reminder for this
   category when you thread the request through as `request=`.)

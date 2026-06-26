@@ -66,6 +66,17 @@ SCHEMA_PAGES_FP = f"{_S}/definition/pagesMetadata/1.1.0/schema.json"
 SCHEMA_PAGE_FP = f"{_S}/definition/page/2.1.0/schema.json"
 SCHEMA_VISUAL_FP = f"{_S}/definition/visualContainer/2.10.0/schema.json"
 
+# Small-multiples (trellis) visual schema + formatting. The original 1.0.0 visualContainer schema
+# predates the small-multiples feature, so Power BI Desktop silently DROPS a small-multiples query
+# role on a 1.0.0 visual (the chart renders as a single aggregated panel). A cartesian visual that
+# panes by a dimension binds the single-name ``SmallMultiple`` query role AND carries a
+# ``smallMultiple`` formatting card (layoutMode / maxItemsPerRow / showEmptyItems) so Desktop lays
+# the panes out -- without that card the role binds but no trellis renders. Such a visual is stamped
+# at the newer trellis-capable schema; the bump is gated to ONLY the visuals that emit a
+# SmallMultiple role, so the already-verified non-trellis gates (KPI / bar / map) keep their proven
+# 1.0.0 stamp.
+SCHEMA_VISUAL_SM = f"{_S}/definition/visualContainer/2.7.0/schema.json"
+
 MEASURES_TABLE = "_Measures"
 PAGE_WIDTH = 1280
 PAGE_HEIGHT = 720
@@ -82,8 +93,9 @@ VT_MATRIX = "matrix"      # pivotTable
 VT_SCATTER = "scatter"    # scatterChart (X/Y measures disaggregated by a dimension)
 VT_CARD = "card"          # card (1 measure) / multiRowCard (>=2 measures), no dimension
 VT_PIE = "pie"            # pieChart (angle measure + legend dimension)
-VT_FILLED_MAP = "filled_map"  # shapeMap (choropleth: geo Category + measure Value/color saturation)
+VT_FILLED_MAP = "filled_map"  # filledMap (Bing choropleth: geo Category + saturation measure on the Gradient/Color-saturation well)
 VT_MAP = "map"            # map (symbol/bubble: geo Location + measure Size/Color)
+VT_SHAPE_MAP = "shape_map"  # shapeMap (built-in-topology choropleth: geo Category + measure on the "Value" well)
 VT_COMBO = "combo"        # lineClusteredColumnComboChart (column measure(s) on Y + line measure(s) on Y2)
 VT_WATERFALL = "waterfall"  # waterfallChart (running-total Gantt hack: dimension Category + base measure Y)
 VT_DONUT = "donut"          # donutChart (dual-axis pie/donut hack: legend Category + angle measure Y)
@@ -99,11 +111,17 @@ _VT_TO_PBIR = {
     VT_MATRIX: "pivotTable",
     VT_SCATTER: "scatterChart",
     VT_PIE: "pieChart",
-    # Choropleths default to Power BI's Shape map (clean offline polygon fill + measure-driven
-    # colour saturation), not the Bing-backed Filled map. NB: shapeMap is gated behind the
-    # "Shape map visual" preview feature in Power BI Desktop.
-    VT_FILLED_MAP: "shapeMap",
+    # A Tableau filled map shaded by a MEASURE migrates to shapeMap -- a built-in-topology choropleth
+    # that geocodes the Location dimension and shades each area by the measure on the "Value" well.
+    # The "shared" usa.states.topo map (PackageType 2) is a Power-BI-provided resource, so a US-state
+    # choropleth renders OFFLINE with no bundled TopoJSON (the "Value" role name + the shape object
+    # are verified against a real Desktop-authored shapeMap visual.json). Microsoft deprecates the
+    # legacy Bing filledMap; it is retained only for location-only / categorical-legend maps (a
+    # measure-less geo Detail) -- shapes shapeMap cannot express -- and stays an image-oracle
+    # candidate the assisted tier may restore.
+    VT_FILLED_MAP: "filledMap",
     VT_MAP: "map",
+    VT_SHAPE_MAP: "shapeMap",
     # Dual-axis / combo: a column-family measure share an axis with a line-family measure. Power
     # BI's combo chart puts the column measure(s) on Y (primary axis) and the line measure(s) on
     # Y2 (secondary axis). Role keys (Category/Series/Y/Y2) verified against real Microsoft PBIR
@@ -162,6 +180,23 @@ _DEFAULT_DATE_GRAIN_COLUMNS = {
     "ISO-Year": "ISO Year", "ISO-Week": "Week of Year",
 }
 
+# The model build's marked Date table also carries a single drill hierarchy named "Calendar"
+# (Year -> Quarter -> Month -> Week -> Day) -- see tmdl_generate.generate_date_table_tmdl. A
+# CONTINUOUS Tableau date truncation (a green ``t*:`` pill, e.g. DATETRUNC('month')) is a
+# display-grain axis, so the faithful Power BI placement is that calendar hierarchy drilled to the
+# truncation grain -- NOT the flat day-grain key column (which renders an undrillable continuous
+# axis the user must then rewire by hand). The level path is Year-rooted; the Month case is verified
+# against a Desktop-authored areaChart whose date axis is exactly Year + Month (Quarter is omitted).
+# This layer only references the hierarchy the model already owns; it never builds it.
+_DEFAULT_DATE_HIERARCHY = "Calendar"
+_DATE_TRUNC_HIERARCHY_LEVELS = {
+    "Year": ("Year",),
+    "Quarter": ("Year", "Quarter"),
+    "Month": ("Year", "Month"),
+    "Week": ("Year", "Month", "Week"),
+    "Day": ("Year", "Month", "Day"),
+}
+
 
 def _norm_date_col(name):
     """Normalize a column name for active-date matching (case/space/underscore-insensitive)."""
@@ -175,13 +210,14 @@ def _rebind_date_axis(field, deriv, date_binding):
     inactive date (e.g. Ship Date, or any date when the primary is ambiguous) is never bound to the
     calendar and therefore can't silently display the active date's values -- the exact "break a lot
     of stuff" risk. A discrete date PART rebinds to its calendar column (Year -> Date[Year]); a plain
-    exact/continuous date OR a day-or-coarser continuous truncation (Day/Week/Month/Quarter/Year-Trunc,
-    the green ``t*:`` pills) rebinds to the marked key column (Date[Date]) -- the day-grain Date table
-    relates to the fact date and Power BI's continuous date axis carries the display grain (this is what
-    a Desktop-authored rebuild does: its line-chart date axis is Date[Date]). A SUB-DAY truncation
-    (Hour/Minute/Second-Trunc) can't be represented by a day-grain calendar, and any part with no
-    calendar column, return ``None`` (deferred -- the caller keeps the source column + warns). Returns
-    ``(entity, property)`` to rebind, else ``None``.
+    exact/continuous date rebinds to the marked key column (Date[Date]); a day-or-coarser CONTINUOUS
+    truncation (Day/Week/Month/Quarter/Year-Trunc, the green ``t*:`` pills) rebinds to the marked Date
+    table's Calendar drill hierarchy, drilled to the truncation grain (Month-Trunc -> Year + Month) --
+    this is what a Desktop-authored rebuild does (its area/line date axis carries the Calendar levels,
+    not a flat date column). A SUB-DAY truncation (Hour/Minute/Second-Trunc) can't be represented by a
+    day-grain calendar, and any part with no calendar column, return ``None`` (deferred -- the caller
+    keeps the source column + warns). Returns a rebind dict -- ``{"entity","property"}`` for a column
+    or ``{"entity","hierarchy","levels"}`` for the drill hierarchy -- else ``None``.
     """
     if not date_binding or field.get("role") == "measure":
         return None
@@ -194,17 +230,23 @@ def _rebind_date_axis(field, deriv, date_binding):
     if deriv in _DATE_PARTS:
         grains = date_binding.get("grain_columns") or _DEFAULT_DATE_GRAIN_COLUMNS
         col = grains.get(deriv)
-        return (table, col) if col else None
+        return {"entity": table, "property": col} if col else None
     if deriv in ("None", "", None):  # plain/continuous exact date -> the marked calendar key
-        return (table, date_binding.get("key_column") or "Date")
+        return {"entity": table, "property": date_binding.get("key_column") or "Date"}
     # A continuous DAY-or-coarser truncation (Day/Week/Month/Quarter/Year-Trunc, the green `t*:`
-    # pills) on the active business date also binds to the marked calendar KEY column: the day-grain
-    # Date table relates to the fact date and Power BI's continuous date axis carries the display
-    # grain -- matching a Desktop-authored rebuild whose line-chart date axis is Date[Date]. A
-    # SUB-DAY truncation (Hour/Minute/Second-Trunc) can't be represented by a day-grain calendar, so
-    # it stays deferred (caller keeps the source column + warns; warn-never-wrong).
-    if re.match(r"(?:Year|Quarter|Month|Week|Day)-Trunc$", str(deriv or "")):
-        return (table, date_binding.get("key_column") or "Date")
+    # pills) on the active business date is a display-grain axis -> the marked Date table's Calendar
+    # drill hierarchy, drilled to the truncation grain (Month-Trunc -> Year + Month). This is what a
+    # Desktop-authored rebuild does: its area/line date axis carries the Calendar levels, not a flat
+    # date column. A SUB-DAY truncation (Hour/Minute/Second-Trunc) has no day-grain calendar level,
+    # so it stays deferred (caller keeps the source column + warns; warn-never-wrong).
+    m = re.match(r"(Year|Quarter|Month|Week|Day)-Trunc$", str(deriv or ""))
+    if m:
+        levels = _DATE_TRUNC_HIERARCHY_LEVELS.get(m.group(1))
+        if levels:
+            return {"entity": table,
+                    "hierarchy": date_binding.get("date_hierarchy") or _DEFAULT_DATE_HIERARCHY,
+                    "levels": list(levels)}
+        return {"entity": table, "property": date_binding.get("key_column") or "Date"}
     return None  # sub-day TRUNC / unmapped grain -> deferred (display-grain shape is a later pass)
 
 
@@ -251,6 +293,27 @@ def _geo_area(semantic_role):
     if area.lower() in ("latitude", "longitude"):
         return None
     return area
+
+
+# Coarse -> fine geographic granularity. When several geo levels sit on Detail (e.g. Country AND
+# State, as Tableau serialises a drill hierarchy), the map is rendered at the FINEST level present:
+# each state is its own filled mark and the coarser level is only its drill-up parent. The faithful
+# Power BI Location is therefore the finest geo dimension, not the first/coarsest one. Keys are the
+# area token _geo_area() yields from the Tableau semantic-role (e.g. "[State].[Name]" -> "State"),
+# lower-cased; higher rank = finer.
+_GEO_GRANULARITY = {
+    "country": 1, "country/region": 1, "region": 1,
+    "area code": 2,
+    "state": 3, "state/province": 3, "province": 3,
+    "county": 4, "cbsa": 4, "msa": 4, "congressional district": 4,
+    "city": 5,
+    "zip code": 6, "zipcode": 6, "postal code": 6, "postcode": 6,
+}
+
+
+def _geo_rank(area):
+    """Granularity rank for a geographic area name (higher = finer); 0 if unknown."""
+    return _GEO_GRANULARITY.get((area or "").strip().lower(), 0)
 
 
 def tableau_type_to_simple(local_type):
@@ -759,7 +822,11 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
     # path below -- they are never silently rebound to the wrong date.
     rebind = _rebind_date_axis(field, deriv, date_binding)
     if rebind is not None:
-        field["entity"], field["property"] = rebind
+        field["entity"] = rebind["entity"]
+        if "hierarchy" in rebind:
+            field["hierarchy"] = {"name": rebind["hierarchy"], "levels": rebind["levels"]}
+        else:
+            field["property"] = rebind["property"]
         field["binding"] = "column"
         field["kind"] = "category"
         field["date_rebound"] = True
@@ -804,7 +871,8 @@ def _resolve_shelf(text, ds_default, base_cols, instances, index, ds_caption,
 def _parse_encodings(pane, ds_default, base_cols, instances, index, ds_caption,
                      worksheet, warnings, warn_special=True, internal_fields=None,
                      date_binding=None, row_count_binding=None, measure_binding=None):
-    enc = {"color": None, "size": None, "label": None, "detail": None, "angle": None}
+    enc = {"color": None, "size": None, "label": None, "detail": None, "angle": None,
+           "geo_levels": []}
     if pane is None:
         return enc
     holder = _first(pane, "encodings")
@@ -822,8 +890,13 @@ def _parse_encodings(pane, ds_default, base_cols, instances, index, ds_caption,
                            ds_caption, worksheet, warnings, warn_special=warn_special,
                            internal_fields=internal_fields, date_binding=date_binding,
                            row_count_binding=row_count_binding, measure_binding=measure_binding)
-        if f and enc[role] is None:
-            enc[role] = f
+        if f:
+            if enc[role] is None:
+                enc[role] = f
+            # Retain ALL geo-role Detail pills (not just the first) so a multi-level map binds its
+            # Location to the FINEST geography present, not whichever level Tableau serialised first.
+            if role == "detail" and f.get("geo_area"):
+                enc["geo_levels"].append(f)
     return enc
 
 
@@ -966,19 +1039,23 @@ def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
     if geo_detail and map_meas:
         if m in _DEFER_MAP_MARKS:
             return VT_UNSUPPORTED
+        # A geo Location + a measure is a choropleth shaded by that measure -> shapeMap (the faithful
+        # successor to a Tableau filled map; Microsoft deprecates the legacy Bing filledMap). An
+        # explicit filled/map mark is self-signaling; an automatic mark needs a spatial signal
+        # (generated lat/lon) so an ordinary chart with a geo dimension is not hijacked into a map.
         if m in ("map", "filled", "filledmap"):
-            return VT_FILLED_MAP
+            return VT_SHAPE_MAP
         if m in ("circle", "square", "shape", "point") and map_signal:
             return VT_MAP
         if m in ("automatic", "") and map_signal:
-            return VT_FILLED_MAP
+            return VT_SHAPE_MAP
         # geo on Detail but no confirming spatial signal -> fall through to chart heuristics
 
     # Location-only map: a geo-role dimension on Detail with NO measure anywhere and no axis
     # pills is Tableau's default rendering of that geography (auto-generated lat/lon, uniform
     # fill) -- there is no other faithful reading (no measure for a chart, and a geographic field
-    # is a map, not a text list). The faithful rebuild is a shapeMap carrying just the Location
-    # (Category); the colour-saturation Value is simply absent. Custom-geometry marks still defer.
+    # is a map, not a text list). The faithful rebuild is a filledMap carrying just the Location
+    # (Category); the colour-saturation measure is simply absent. Custom-geometry marks still defer.
     if geo_detail and not map_meas and not axis_dim and not axis_meas:
         if m not in _DEFER_MAP_MARKS:
             return VT_FILLED_MAP
@@ -1192,6 +1269,11 @@ def _parse_filters(ws, ds_default, base_cols, instances, index, ds_caption,
         f["filter_kind"] = kind
         f["binding"] = "column"
         f["aggregation"] = None
+        # The raw ``[datasource].[field-instance]`` token (pre-resolution) lets the slicer gate match
+        # this filter against the dashboard filter cards the author actually exposed -- the same token
+        # a dashboard ``<zone type-v2='filter' param='...'>`` carries -- so an applied-but-unshown
+        # filter never fabricates a control.
+        f["filter_token"] = (ds, fid)
         f["selection"] = _parse_filter_selection(filt) if cls == "categorical" else None
         f["range"] = _parse_filter_range(filt) if cls == "quantitative" else None
         filters.append(f)
@@ -1466,9 +1548,23 @@ def _route_measure_values(mark, locs, members, dummy_count, has_param_swap, stat
                 "Measure Names legend is implicit")
         return vt, shelf, note
 
-    # Default: a text table / crosstab (measures as columns) or, with no dimension, a bare
-    # multi-measure card. Power BI renders measures-as-columns natively in a matrix.
-    vt = VT_MATRIX if (dims_rows or dims_cols) else VT_CARD
+    # Default: the member measures as a table / matrix / card band. WITH a real dimension Power BI
+    # renders measures-as-columns natively in a matrix (pivotTable). With NO dimension the faithful
+    # rebuild splits on the shelf ORIENTATION of the Measure Names / Measure Values placeholders:
+    #   * VERTICAL -- Measure Values (or Measure Names) on ROWS is a Tableau "measure table": the
+    #     measure names listed down the side with their values beside them -> a faithful tableEx text
+    #     table (one measure per row).
+    #   * HORIZONTAL -- Measure Names on Columns with the values shown as Text marks (a measure-names
+    #     BAN band: each measure is its own labelled big number across a strip) -> a multiRowCard
+    #     (VT_CARD), Power BI's native row of labelled big numbers, NOT a single-column text table.
+    # Either way the implicit Measure Names pill stays unbound -- Power BI's labels ARE the measure
+    # names; the member measures fill the value well.
+    if dims_rows or dims_cols:
+        vt = VT_MATRIX
+    elif names_at == "rows" or values_at == "rows":
+        vt = VT_TABLE
+    else:
+        vt = VT_CARD
     note = f"Measure Values -> {len(members)} measures; Measure Names implicit"
     return vt, "cols", note
 
@@ -1803,6 +1899,112 @@ def _parse_mark_colors(table):
     return None
 
 
+def _measure_name_from_member(member):
+    """The measure name carried by a Measure-Names palette ``<bucket>`` member token.
+
+    A member is a (quote-stripped) field instance token like ``[ds].[sum:Profit:qk]`` (an aggregated
+    measure) or ``[ds].[Calc_1:qk]``; the inner ``[...]`` segment is ``agg:Name:type`` (3 parts) or
+    ``Name:type`` (2 parts). Returns the bare measure name (``Profit``) or ``None``.
+    """
+    groups = re.findall(r"\[([^\]]+)\]", member or "")
+    if not groups:
+        return None
+    parts = groups[-1].split(":")
+    if len(parts) >= 3:
+        return parts[1] or None
+    if len(parts) == 2:
+        return parts[0] or None
+    return groups[-1] or None
+
+
+def _parse_measure_color_palette(root):
+    """Datasource-level "Measure Names" colour palette (measure name -> hex) for the whole workbook.
+
+    Tableau stores the colour a user assigns to each measure of a [Measure Names] colour encoding
+    ONCE, on the ``<datasource><style>`` (not per worksheet), so every sheet that colours by Measure
+    Names shares it. Returns ``{measure_name_lower: "#rrggbb"}`` (author order collapsed to a map),
+    or ``{}`` when no datasource declares such a palette. Only an explicit per-member ``<map>`` is
+    read -- a continuous gradient (``<color-palette>``) is ignored. Tableau author order is preserved
+    via ``setdefault`` so the first declared colour for a measure wins.
+    """
+    holders = _children_local(root, "datasources")
+    datasources = []
+    for h in holders:
+        datasources.extend(_children_local(h, "datasource"))
+    if not datasources and _local(root.tag) == "datasource":
+        datasources = [root]
+    palette = {}
+    for ds in datasources:
+        style = _first(ds, "style")
+        if style is None:
+            continue
+        for rule in _children_local(style, "style-rule"):
+            if (rule.get("element") or "").lower() != "mark":
+                continue
+            for enc in _children_local(rule, "encoding"):
+                if (enc.get("attr") or "") != "color":
+                    continue
+                if "Measure Names" not in (enc.get("field") or ""):
+                    continue
+                if _first(enc, "color-palette") is not None:
+                    continue
+                for mp in _children_local(enc, "map"):
+                    hexv = (mp.get("to") or "").strip()
+                    bucket = _first(mp, "bucket")
+                    if not hexv or bucket is None:
+                        continue
+                    name = _measure_name_from_member(_bucket_member(bucket.text))
+                    if name:
+                        palette.setdefault(name.lower(), hexv)
+    return palette
+
+
+def _pane_colors_by_measure_names(all_panes):
+    """True when any pane carries a ``<color column='...:Measure Names]'/>`` encoding -- i.e. the
+    worksheet colours its marks by measure identity (the member measures become the colour series)."""
+    for p in all_panes or []:
+        encs = _first(p, "encodings")
+        if encs is None:
+            continue
+        for c in _children_local(encs, "color"):
+            if (c.get("column") or "").endswith(":Measure Names]"):
+                return True
+    return False
+
+
+def _parse_card_label_colors(all_panes):
+    """Tableau card ``customized-label`` run colours -> ``{category_color, value_color, value_size}``.
+
+    A KPI / card worksheet whose author recoloured the label text writes a ``<customized-label>``
+    ``<formatted-text>`` whose ``<run>`` for the ``[:Measure Names]`` token carries the CATEGORY
+    label colour and whose ``<run>`` for the value token carries the VALUE (data label) colour /
+    size. Returns the colour dict (only the keys actually present), or ``None`` when no card label is
+    recoloured. ``#rrggbb`` only (other colour notations are ignored); the value size passes through
+    ``_font_size_points``.
+    """
+    for p in all_panes or []:
+        cl = _first(p, "customized-label")
+        ft = _first(cl, "formatted-text") if cl is not None else None
+        if ft is None:
+            continue
+        out = {}
+        for run in _findall_local(ft, "run"):
+            color = (run.get("fontcolor") or "").strip()
+            if not _HEX6_RE.match(color):
+                continue
+            text = run.text or ""
+            if ":Measure Names" in text:
+                out.setdefault("category_color", color)
+            elif "<" in text and ">" in text:  # a bound value-field run (the big number)
+                out.setdefault("value_color", color)
+                size = _font_size_points(run.get("fontsize"))
+                if size and "value_size" not in out:
+                    out["value_size"] = size
+        if out:
+            return out
+    return None
+
+
 # Tableau's "Show Mark Labels" toggle is written as ``<format attr='mark-labels-show' value='..'/>``
 # inside a ``<style-rule element='mark'>`` -- at the worksheet ``table/style`` level and/or each
 # ``table/panes/pane/style`` (a dual-axis worksheet carries one per pane, which can disagree). It is
@@ -1890,7 +2092,7 @@ def _parse_reference_lines(all_panes):
 
 
 def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date_binding=None,
-                     row_count_binding=None, measure_binding=None):
+                     row_count_binding=None, measure_binding=None, measure_palette=None):
     name = ws.get("name")
     table = _first(ws, "table")
     if table is None:
@@ -1946,6 +2148,20 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                                             internal_fields=internal_fields)
     sort = _parse_sort(view, ds_default, base_cols, instances, index,
                        ds_caption, name, warnings, internal_fields=internal_fields)
+
+    # Series colours: when a worksheet colours its marks by measure identity -- either by Measure
+    # Names (the member measures become the colour series) or directly by a measure value -- the
+    # rebuilt cartesian visual's per-measure series follow the workbook's datasource-level
+    # Measure-Names palette (the author's declared Sales/Profit colour convention). A worksheet
+    # coloured by a DIMENSION keeps its own categorical palette (handled by ``_data_point_colors``),
+    # so it is excluded here. The KPI / card label colours come from the worksheet's customized-label
+    # runs.
+    _color_enc = encodings.get("color")
+    _colors_by_measure = (_pane_colors_by_measure_names(all_panes)
+                          or (_color_enc is not None and _color_enc.get("kind") == "value"))
+    measure_colors = (dict(measure_palette)
+                      if (measure_palette and _colors_by_measure) else None)
+    card_label_colors = _parse_card_label_colors(all_panes)
 
     dims_rows = [f for f in rows if f["kind"] == "category"]
     dims_cols = [f for f in cols if f["kind"] == "category"]
@@ -2164,6 +2380,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "axis_titles": axis_titles,
         "color_gradient": color_gradient,
         "mark_colors": mark_colors,
+        "measure_colors": measure_colors,
+        "card_label_colors": card_label_colors,
         "data_labels": data_labels,
         "reference_lines": reference_lines,
         "rows": rows,
@@ -2206,6 +2424,7 @@ def _parse_dashboard(db, worksheet_names, warnings):
     zones = []
     param_controls = []
     legend_zones = []
+    filter_field_tokens = set()
     seen_params = set()
     ext_w = ext_h = 0.0
     for zone in _findall_local(db, "zone"):
@@ -2220,6 +2439,19 @@ def _parse_dashboard(db, worksheet_names, warnings):
             ext_w = max(ext_w, x + w)
             ext_h = max(ext_h, y + h)
         ztype = zone.get("type-v2") or zone.get("type")
+        # A dashboard FILTER card -- the filter the author actually exposed on the dashboard surface
+        # (possibly nested inside a collapsible layout container; the zone walk recurses) -- is what
+        # faithfully becomes a page slicer. Capture its field token so slicer emit only surfaces a
+        # control the dashboard really had, never an applied-but-unshown scope filter (e.g. a
+        # single-member include used only to narrow one sheet). ``param`` carries the same
+        # ``[datasource].[field-instance]`` token the worksheet ``<filter column>`` does, so the two
+        # match on the raw split; an unrecognised param shape simply captures nothing (fail-closed,
+        # miss-over-wrong).
+        if ztype == "filter":
+            ftok = _split_token_attr(zone.get("param"))
+            if ftok[1] is not None:
+                filter_field_tokens.add(ftok)
+            continue
         # A parameter-control ("hamburger") zone hosts a Tableau parameter on the dashboard.
         # Capture it structurally so the fidelity report is honest about it: Tier-1 rebuilds it
         # as a slicer only once the model identifies the parameter's target column/measure, so
@@ -2248,7 +2480,8 @@ def _parse_dashboard(db, worksheet_names, warnings):
 
     return {"name": name, "size": size,
             "extent": {"w": ext_w or None, "h": ext_h or None}, "zones": zones,
-            "param_controls": param_controls, "legend_zones": legend_zones}
+            "param_controls": param_controls, "legend_zones": legend_zones,
+            "filter_field_tokens": sorted(filter_field_tokens)}
 
 
 def _warn(scope, name, reason):
@@ -2505,6 +2738,7 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
 
     index, ds_caption, internal_fields = _build_field_index(root)
     warnings = []
+    measure_palette = _parse_measure_color_palette(root)
 
     ws_holder = _children_local(root, "worksheets")
     ws_elems = []
@@ -2515,7 +2749,8 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
         parsed = _parse_worksheet(ws, index, ds_caption, warnings,
                                   internal_fields=internal_fields, date_binding=date_binding,
                                   row_count_binding=row_count_binding,
-                                  measure_binding=measure_binding)
+                                  measure_binding=measure_binding,
+                                  measure_palette=measure_palette)
         if parsed:
             worksheets.append(parsed)
     worksheet_names = {w["name"] for w in worksheets}
@@ -2594,8 +2829,37 @@ def _projection(field, model_table, field_map, used_refs):
     return {"field": expr, "queryRef": qref, "nativeQueryRef": nref}
 
 
+def _hierarchy_level_projections(field, used_refs):
+    """Expand a date field rebound to the model's drill hierarchy into one PBIR HierarchyLevel
+    projection per level (Year + Month for a Month truncation). Mirrors a Desktop-authored date
+    axis, which carries each level as an active HierarchyLevel field rather than a single flat date
+    column. The hierarchy is owned by the model build; this only references it."""
+    entity = field["entity"]
+    hname = field["hierarchy"]["name"]
+    out = []
+    for level in field["hierarchy"]["levels"]:
+        expr = {"HierarchyLevel": {"Expression": {"Hierarchy": {
+            "Expression": {"SourceRef": {"Entity": entity}},
+            "Hierarchy": hname}}, "Level": level}}
+        qref = base_qref = f"{entity}.{hname}.{level}"
+        i = 1
+        while qref in used_refs:
+            i += 1
+            qref = f"{base_qref} {i}"
+        used_refs.add(qref)
+        out.append({"field": expr, "queryRef": qref,
+                    "nativeQueryRef": f"{hname} {level}", "active": True})
+    return out
+
+
 def _role_projections(fields, model_table, field_map, used_refs):
-    return [_projection(f, model_table, field_map, used_refs) for f in fields]
+    out = []
+    for f in fields:
+        if f.get("hierarchy"):
+            out.extend(_hierarchy_level_projections(f, used_refs))
+        else:
+            out.append(_projection(f, model_table, field_map, used_refs))
+    return out
 
 
 def _dedupe(fields):
@@ -2620,6 +2884,14 @@ def _build_query_state(ws, model_table, field_map, warnings):
     size = ws["encodings"]["size"]
     detail = ws["encodings"]["detail"]
     angle = ws["encodings"].get("angle")
+    geo_levels = [g for g in (ws["encodings"].get("geo_levels") or [])
+                  if g.get("kind") == "category"]
+
+    def finest_geo(fallback):
+        """The faithful map Location is the finest geo level present (e.g. State over Country)."""
+        if geo_levels:
+            return [max(geo_levels, key=lambda g: _geo_rank(g.get("geo_area")))]
+        return [fallback] if fallback and fallback["kind"] == "category" else []
 
     def categories(fs):
         return [f for f in fs if f["kind"] == "category"]
@@ -2767,7 +3039,7 @@ def _build_query_state(ws, model_table, field_map, warnings):
             state["Series"] = {"projections": _role_projections(
                 series, model_table, field_map, used_refs)}
         if small:
-            state["SmallMultiples"] = {"projections": _role_projections(
+            state["SmallMultiple"] = {"projections": _role_projections(
                 small, model_table, field_map, used_refs)}
     elif vt == VT_MATRIX:
         row_dims = drop_calc_axis(_dedupe(categories(rows)))
@@ -2868,12 +3140,16 @@ def _build_query_state(ws, model_table, field_map, warnings):
         if vals:
             state["Values"] = {"projections": _role_projections(
                 vals, model_table, field_map, used_refs)}
-    elif vt == VT_FILLED_MAP:
-        # Shape map (choropleth): the geo-role dimension on Detail is the Category (location),
-        # a single measure (prefer the colour saturation encoding, else any available) drives
-        # the Value role (Power BI's shapeMap names its colour-saturation well "Value").
-        loc = drop_calc_axis(_dedupe(
-            [detail] if detail and detail["kind"] == "category" else []))
+    elif vt == VT_SHAPE_MAP:
+        # Shape map (built-in-topology choropleth): the geo-role dimension on Detail is the Category
+        # (Location), bound at the FINEST geo level present (State over its parent Country). A single
+        # measure (prefer the colour-saturation encoding, else any available) binds the "Value" role
+        # -- the shapeMap "Color saturation" well -- so each region shades by the measure with Power
+        # BI's default ramp. The role name "Value" and the Category+Value shape are verified against a
+        # real Desktop-authored shapeMap visual.json (a US-state choropleth shaded by Sum(Profit)); it
+        # is NOT "Gradient"/"Color" (those are filledMap/Bing-map wells). A categorical colour cannot
+        # drive a shapeMap legend, so such measure-less maps stay on filledMap (see _route_visual).
+        loc = drop_calc_axis(_dedupe(finest_geo(detail)))
         meas = _dedupe(
             ([color] if color and color["kind"] == "value" else [])
             + values(rows) + values(cols)
@@ -2885,11 +3161,44 @@ def _build_query_state(ws, model_table, field_map, warnings):
         if meas:
             state["Value"] = {"projections": _role_projections(
                 meas[:1], model_table, field_map, used_refs)}
+    elif vt == VT_FILLED_MAP:
+        # Filled map (Bing choropleth): the geo-role dimension on Detail is the Category (Location),
+        # bound at the FINEST geo level present (State over its parent Country). A single measure
+        # (prefer the colour-saturation encoding, else any available) binds the "Gradient" role --
+        # the PBIR role behind the filledMap "Color saturation" well -- so the choropleth actually
+        # shades by the measure with Power BI's default saturation ramp, mirroring Tableau dropping a
+        # measure on the Color shelf. (Matching Tableau's exact palette/stops is a Tier-2 styling
+        # pass; the structural well binding is faithful on its own.)
+        loc = drop_calc_axis(_dedupe(finest_geo(detail)))
+        meas = _dedupe(
+            ([color] if color and color["kind"] == "value" else [])
+            + values(rows) + values(cols)
+            + ([size] if size and size["kind"] == "value" else [])
+            + ([label] if label and label["kind"] == "value" else []))
+        if loc:
+            state["Category"] = {"projections": _role_projections(
+                loc, model_table, field_map, used_refs)}
+        if meas:
+            state["Gradient"] = {"projections": _role_projections(
+                meas[:1], model_table, field_map, used_refs)}
+        # a categorical (dimension) colour on the Color shelf is the map LEGEND -> the "Series"
+        # role (a valid filledMap role on a real visual.json); each area is shaded by its legend
+        # member. Mutually exclusive with Gradient by construction: Tableau's single Color shelf
+        # holds either a measure (Gradient saturation) or a dimension (Series legend), never both.
+        color_series = ([color] if (color and color["kind"] == "category"
+                                    and not color["is_calc"]) else [])
+        color_series = [f for f in color_series if f not in loc]
+        if color_series:
+            state["Series"] = {"projections": _role_projections(
+                color_series, model_table, field_map, used_refs)}
     elif vt == VT_MAP:
-        # symbol / bubble map: geo Location, a measure on Size (prefer the size encoding),
-        # and a distinct color measure on Color when present.
-        loc = drop_calc_axis(_dedupe(
-            [detail] if detail and detail["kind"] == "category" else []))
+        # symbol / bubble map: the geo dimension binds the Category role (the map's "Location" well
+        # -- role NAME is "Category", displayName "Location"; there is NO role literally named
+        # "Location", verified against a real classic "map" visual.json). A measure goes on Size
+        # (prefer the size encoding); a distinct colour measure binds the "Gradient" well -- the
+        # PBIR role behind the Bing map "Color saturation", the SAME role the filled map uses; the
+        # classic map has no "Color" role, so geo->Category and colour->Gradient bind correctly.
+        loc = drop_calc_axis(_dedupe(finest_geo(detail)))
         size_pref = _dedupe(
             ([size] if size and size["kind"] == "value" else [])
             + values(rows) + values(cols)
@@ -2898,14 +3207,23 @@ def _build_query_state(ws, model_table, field_map, warnings):
         color_meas = [color] if (color and color["kind"] == "value") else []
         color_sel = [f for f in color_meas if f not in size_sel][:1]
         if loc:
-            state["Location"] = {"projections": _role_projections(
+            state["Category"] = {"projections": _role_projections(
                 loc, model_table, field_map, used_refs)}
         if size_sel:
             state["Size"] = {"projections": _role_projections(
                 size_sel, model_table, field_map, used_refs)}
         if color_sel:
-            state["Color"] = {"projections": _role_projections(
+            state["Gradient"] = {"projections": _role_projections(
                 color_sel, model_table, field_map, used_refs)}
+        # a categorical (dimension) colour binds the map LEGEND -> the "Series" role (verified on a
+        # real classic "map" visual.json, e.g. Series=Continent); bubbles are coloured by legend
+        # member. Disjoint from Gradient (above): Gradient takes colour only when it is a measure.
+        color_series = ([color] if (color and color["kind"] == "category"
+                                    and not color["is_calc"]) else [])
+        color_series = [f for f in color_series if f not in loc]
+        if color_series:
+            state["Series"] = {"projections": _role_projections(
+                color_series, model_table, field_map, used_refs)}
     return state
 
 
@@ -2927,8 +3245,13 @@ def _query_state_complete(vt, state):
         # A choropleth needs a Location (Category); the colour-saturation Value is optional --
         # a geo dimension on Detail with no measure is a valid location-only map (uniform fill).
         return "Category" in state
+    if vt == VT_SHAPE_MAP:
+        # Same as the filled map: a Location (Category) is essential; the "Value" colour-saturation
+        # measure is optional (a geo Detail whose measure was dropped is still a location-only map).
+        return "Category" in state
     if vt == VT_MAP:
-        return "Location" in state and ("Size" in state or "Color" in state)
+        return "Category" in state and (
+            "Size" in state or "Gradient" in state or "Series" in state)
     if vt == VT_MATRIX:
         return "Values" in state and ("Rows" in state or "Columns" in state)
     if vt == VT_TABLE:
@@ -2980,8 +3303,9 @@ _CANDIDATE_ALTS = {
     VT_COMBO: (["clusteredColumnChart", "lineChart"], "medium", "dual-axis combo"),
     VT_AREA: (["lineChart"], "medium", None),
     VT_LINE: (["areaChart"], "high", None),
-    VT_FILLED_MAP: (["map"], "medium", None),
-    VT_MAP: (["shapeMap"], "medium", None),
+    VT_FILLED_MAP: (["map", "shapeMap"], "medium", None),
+    VT_MAP: (["filledMap", "shapeMap"], "medium", None),
+    VT_SHAPE_MAP: (["filledMap", "map"], "medium", None),
     VT_TABLE: (["pivotTable"], "medium", None),
     VT_MATRIX: (["tableEx"], "medium", None),
 }
@@ -3303,6 +3627,116 @@ def _data_point_colors(ws, state, vtype, model_table, field_map, warnings):
     return data_point_objects, fact
 
 
+# Series colours by Measure Names: when a chart colours its marks by measure identity, EACH member
+# measure renders in its own colour (Sales orange / Profit blue), shared from the workbook's
+# datasource-level palette. The faithful PBIR home is a per-measure ``dataPoint`` fill targeted by a
+# ``metadata`` selector (the measure's queryRef) -- the same shape Power BI authors for a measure
+# series (verified against the area/line measure-series fills in the Desktop-authored oracle), NOT
+# the categorical ``scopeId`` data selector (which targets a dimension member, not a measure).
+_MEASURE_SERIES_COLOR_TYPES = (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA, VT_COMBO)
+
+
+def _measure_name_from_queryref(queryref):
+    """The bare measure / column name carried by an emitted projection ``queryRef``.
+
+    ``Sum(Orders.Profit)`` -> ``Profit``; a non-aggregated ``Orders.Region`` -> ``Region``; a
+    hierarchy level (``Date.Calendar.Year``) -> ``Calendar.Year`` (never a palette measure, so it
+    simply will not match). Returns ``None`` when nothing resolves.
+    """
+    m = re.match(r"^[A-Za-z0-9_]+\(([^.()]+)\.(.+)\)$", queryref or "")
+    if m:
+        return m.group(2)
+    m = re.match(r"^([^.()]+)\.(.+)$", queryref or "")
+    if m:
+        return m.group(2)
+    return None
+
+
+def _measure_series_colors(ws, state, vtype, warnings):
+    """Measure-Names series palette -> (data_point_objects, fact).
+
+    When the worksheet colours its marks by Measure Names, each member measure projected in THIS
+    visual gets a ``dataPoint`` fill targeted by a ``metadata`` selector (its queryRef). Returns the
+    object list (or ``None``) plus an additive candidate-record ``fact``.
+
+    WARN-NEVER-WRONG: emitted only for the cartesian chart types that carry a per-measure series
+    fill, and only for measures whose name matches the palette (case-insensitive); anything else
+    defers to theme colours with a structured warning and the raw palette preserved in ``fact``.
+    """
+    palette = ws.get("measure_colors")
+    if not palette:
+        return None, None
+    if vtype not in _MEASURE_SERIES_COLOR_TYPES:
+        # Maps / cards / tables carry their measure colour elsewhere (or not at all) -- not a
+        # per-measure series fill. Silently skip (no fact, no warning) rather than feign a deferral.
+        return None, None
+    fact = {"kind": "measure_series_palette", "palette": dict(palette)}
+
+    objects = []
+    seen = set()
+    for role in state.values():
+        for p in role.get("projections", []):
+            qref = p.get("queryRef") or ""
+            if qref in seen:
+                continue
+            name = _measure_name_from_queryref(qref)
+            hexv = palette.get(name.lower()) if name else None
+            if not hexv:
+                continue
+            seen.add(qref)
+            objects.append({
+                "properties": {"fill": {"solid": {"color": {"expr": {
+                    "Literal": {"Value": _semantic_string_literal(hexv)}}}}}},
+                "selector": {"metadata": qref},
+            })
+    if not objects:
+        reason = "no coloured measure is bound in this visual"
+        warnings.append(_warn(
+            "worksheet", ws["name"],
+            "measure series colours deferred ({0}); the visual is emitted with theme "
+            "colours".format(reason)))
+        fact["status"] = "deferred"
+        fact["reason"] = reason
+        return None, fact
+    fact["status"] = "emitted"
+    fact["count"] = len(objects)
+    return objects, fact
+
+
+# KPI / card label colours: a recoloured Tableau card writes the category-label colour and the
+# value (big-number) colour / size on its customized-label runs. The faithful PBIR home is the card
+# formatting objects ``categoryLabels`` (the label) and ``dataLabels`` (the value) -- each a
+# ``color`` property (and an optional value ``fontSize``), verified against the Power BI card /
+# multiRowCard formatting reference. Bold is deliberately NOT emitted (the card label weight
+# property is unconfirmed -> warn-never-wrong).
+_CARD_LABEL_COLOR_TYPES = ("card", "multiRowCard")
+
+
+def _card_label_objects(ws, vtype):
+    """Card label colours -> ``{categoryLabels, dataLabels}`` objects entry, or ``None``.
+
+    ``vtype`` is the EMITTED Power BI visual type; colours are applied only to the card family.
+    """
+    if vtype not in _CARD_LABEL_COLOR_TYPES:
+        return None
+    cc = ws.get("card_label_colors")
+    if not cc:
+        return None
+    out = {}
+    if cc.get("category_color"):
+        out["categoryLabels"] = [{"properties": {"color": {"solid": {"color": {"expr": {
+            "Literal": {"Value": _semantic_string_literal(cc["category_color"])}}}}}}}]
+    value_props = {}
+    if cc.get("value_color"):
+        value_props["color"] = {"solid": {"color": {"expr": {
+            "Literal": {"Value": _semantic_string_literal(cc["value_color"])}}}}}
+    if cc.get("value_size"):
+        value_props["fontSize"] = {"expr": {"Literal": {"Value": cc["value_size"]}}}
+    if value_props:
+        out["dataLabels"] = [{"properties": value_props}]
+    return out or None
+
+
 # Data labels (Tableau "Show Mark Labels") -> the PBIR data-plane ``visual.objects.labels`` ``show``
 # property, applied uniformly (the Power BI formatting reference lists ``labels`` as a visual-wide
 # object). The high-value, always-faithful case is turning labels ON to match a Tableau view that
@@ -3425,10 +3859,106 @@ def _legend_objects(ws, ws_zone, legend_zones, vtype):
     }}], fact
 
 
+_SHAPE_MAP_USA_STATES = "usa.states.topo"
+
+# Tableau "Orange-Blue Diverging" choropleth palette (the Superstore Profit-by-state map): the most
+# negative values are orange, the most positive blue, with white at the break-even centre. Power BI
+# does NOT default a diverging gradient's centre to 0 -- left unpinned it auto-centres on the DATA
+# midpoint, so a mostly-positive measure paints break-even states orange (verified in Desktop). We
+# therefore PIN the centre stop's value to 0 (``_SHAPE_MAP_DIVERGING_CENTRE``) so white lands exactly
+# on break-even the way Tableau renders it, while the min/max stops stay value-less = auto data
+# low/high. Endpoints approximate Tableau's documented Orange-Blue Diverging ramp.
+_SHAPE_MAP_DIVERGING_MIN = "#FEA043"    # orange -> most-negative (loss); value-less = auto data low
+_SHAPE_MAP_DIVERGING_MID = "#FFFFFF"    # white  -> pinned at 0 / break-even
+_SHAPE_MAP_DIVERGING_MAX = "#4A88C2"    # blue   -> most-positive (high profit); value-less = auto data high
+_SHAPE_MAP_DIVERGING_CENTRE = "0D"      # PBIR double-literal 0 -> the pinned centre value (break-even)
+
+
+def _shape_map_objects(ws):
+    """The ``objects.shape`` built-in-map block for a state-grain shapeMap, else ``None``.
+
+    A US-state choropleth needs no bundled TopoJSON: Power BI ships ``usa.states.topo`` as a SHARED
+    resource (PackageType 2), so a shapeMap bound to a state Category renders OFFLINE. This block
+    pins that built-in map + the albersUsa projection. The exact nesting (``map.geoJson``
+    type/name/content + sibling ``projectionEnum``) is verified byte-for-byte against real
+    Desktop-authored shapeMap ``visual.json`` files (US-state choropleths shaded by a measure).
+    Emitted only when the finest geo level present is state-grain (the built-in map IS US states);
+    coarser/finer or non-US geographies return ``None`` (shapeMap then defaults, which the assisted
+    intent tier may refine for non-US data).
+    """
+    geo_levels = [g for g in (ws["encodings"].get("geo_levels") or [])
+                  if g.get("kind") == "category"]
+    if geo_levels:
+        finest = max(geo_levels, key=lambda g: _geo_rank(g.get("geo_area")))
+    else:
+        finest = ws["encodings"].get("detail")
+    area = finest.get("geo_area") if finest else None
+    if _geo_rank(area) != _GEO_GRANULARITY["state"]:
+        return None
+    return [{
+        "properties": {
+            "map": {
+                "geoJson": {
+                    "type": {"expr": {"Literal": {"Value": "'shared'"}}},
+                    "name": {"expr": {"Literal": {
+                        "Value": _semantic_string_literal(_SHAPE_MAP_USA_STATES)}}},
+                    "content": {"expr": {"ResourcePackageItem": {
+                        "PackageName": "SharedResources",
+                        "PackageType": 2,
+                        "ItemName": _SHAPE_MAP_USA_STATES,
+                    }}},
+                },
+            },
+            "projectionEnum": {"expr": {"Literal": {"Value": "'albersUsa'"}}},
+        },
+    }]
+
+
+def _shape_map_datapoint_objects():
+    """The default ``objects.dataPoint`` colour-saturation gradient for a measure shapeMap.
+
+    A shapeMap with a measure on the Value well does NOT auto-render its gradient on first open:
+    Power BI Desktop shows a flat default fill until the field is nudged off-and-on, which forces
+    it to write this block. Emitting it up front makes the choropleth shade immediately, with no
+    manual nudge. We emit a DIVERGING ``linearGradient3`` -- orange (most-negative / loss) -> white
+    (0, break-even) -> blue (most-positive / high profit) -- matching Tableau's "Orange-Blue
+    Diverging" map palette. Power BI does NOT default the centre to 0: left unpinned the gradient
+    auto-centres on the DATA midpoint, painting break-even states orange on a mostly-positive
+    measure. We therefore pin the ``mid`` stop's ``value`` to 0 (``_SHAPE_MAP_DIVERGING_CENTRE``) so
+    white lands on break-even; ``min``/``max`` stay value-less = auto data low/high.
+    ``nullColoringStrategy`` ``'asZero'`` and ``showAllDataPoints`` are Desktop's own defaults.
+    Structure verified byte-for-byte against a real Desktop-authored ``filledMap``/shapeMap
+    ``visual.json`` whose ``linearGradient3`` stops carry both a ``color`` and a value-anchor
+    (``value.expr.Literal.Value`` = e.g. ``"0D"``); explicit hex colour literals are valid here.
+    """
+    return [{
+        "properties": {
+            "fillRule": {
+                "linearGradient3": {
+                    "min": {"color": {"expr": {"Literal": {
+                        "Value": _semantic_string_literal(_SHAPE_MAP_DIVERGING_MIN)}}}},
+                    "mid": {
+                        "color": {"expr": {"Literal": {
+                            "Value": _semantic_string_literal(_SHAPE_MAP_DIVERGING_MID)}}},
+                        "value": {"expr": {"Literal": {
+                            "Value": _SHAPE_MAP_DIVERGING_CENTRE}}},
+                    },
+                    "max": {"color": {"expr": {"Literal": {
+                        "Value": _semantic_string_literal(_SHAPE_MAP_DIVERGING_MAX)}}}},
+                    "nullColoringStrategy": {
+                        "strategy": {"expr": {"Literal": {"Value": "'asZero'"}}}},
+                },
+            },
+            "showAllDataPoints": {"expr": {"Literal": {"Value": "true"}}},
+        },
+    }]
+
+
 def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  filter_config=None, title=None, title_style=None, axis_titles=None,
                  value_objects=None,
-                 data_point_objects=None, label_objects=None, legend_objects=None):
+                 data_point_objects=None, label_objects=None, legend_objects=None,
+                 shape_objects=None, card_label_objects=None):
     visual = {"visualType": vtype}
     if query_state:
         visual["query"] = {"queryState": query_state}
@@ -3454,6 +3984,8 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     # ``visual.objects.dataPoint`` entries, each a ``fill`` targeted by a ``scopeId`` data selector
     # (ComparisonKind 0 Equal, Left = the coloured column, Right = the member literal). Shape
     # verified against the Power BI formatting reference's per-category scope-identity selector.
+    # A measure shapeMap reuses this same channel to carry its default saturation gradient (the
+    # diverging ``linearGradient3`` block from ``_shape_map_datapoint_objects``) so it renders on open.
     if data_point_objects:
         visual.setdefault("objects", {})["dataPoint"] = data_point_objects
     # Data labels (Tableau "Show Mark Labels"): the data-plane ``visual.objects.labels`` ``show``
@@ -3467,6 +3999,33 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     # font / marker styling is Tier-2).
     if legend_objects:
         visual.setdefault("objects", {})["legend"] = legend_objects
+    # Shape map built-in topology (Tier-1 structural): the data-plane ``visual.objects.shape`` entry
+    # pinning the Power-BI-provided ``usa.states.topo`` shared map + albersUsa projection, so a
+    # state-grain choropleth renders offline. Shape verified against real Desktop-authored shapeMap
+    # visual.json files (see ``_shape_map_objects``).
+    if shape_objects:
+        visual.setdefault("objects", {})["shape"] = shape_objects
+    # KPI / card label colours (Tier-2): the data-plane ``visual.objects.categoryLabels`` (label) and
+    # ``dataLabels`` (value) entries, each a ``color`` (and optional value ``fontSize``). Shape
+    # verified against the Power BI card / multiRowCard formatting reference; emitted only for the
+    # card family (see ``_card_label_objects``).
+    if card_label_objects:
+        for _ck, _cv in card_label_objects.items():
+            visual.setdefault("objects", {})[_ck] = _cv
+    # Small multiples (trellis): the data-plane ``visual.objects.smallMultiple`` formatting card.
+    # A ``SmallMultiple`` query role (a Rows paning dimension -> one pane per member) BINDS the
+    # field, but Desktop needs this card to actually lay the panes out -- without it the role is
+    # present yet no trellis renders. ``layoutMode`` 'flow' auto-wraps panes; ``maxItemsPerRow``
+    # caps the grid width; ``showEmptyItems`` hides empty panes. The single-name role and this card
+    # key are unprotectable PBIR-schema interop facts (authored here against our own IR).
+    if query_state and "SmallMultiple" in query_state:
+        visual.setdefault("objects", {})["smallMultiple"] = [{
+            "properties": {
+                "layoutMode": {"expr": {"Literal": {"Value": "'flow'"}}},
+                "maxItemsPerRow": {"expr": {"Literal": {"Value": "3L"}}},
+                "showEmptyItems": {"expr": {"Literal": {"Value": "false"}}},
+            }
+        }]
     # Structural title text (Tier-1): the worksheet's authored caption -> the visual's container
     # title. Shape verified against the official PBIR visualContainer schema + real reports: a
     # single-quoted semantic-query string literal under visualContainerObjects.title; the
@@ -3485,8 +4044,14 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
                 "show": {"expr": {"Literal": {"Value": "false"}}},
             }}],
         }
+    # Small-multiples visuals need a newer schema (see SCHEMA_VISUAL_SM): Desktop drops a
+    # SmallMultiple role on the legacy 1.0.0 stamp. The bump is gated to exactly those visuals so the
+    # verified non-trellis gates keep their proven 1.0.0 stamp.
+    schema = SCHEMA_VISUAL
+    if query_state and "SmallMultiple" in query_state:
+        schema = SCHEMA_VISUAL_SM
     out = {
-        "$schema": SCHEMA_VISUAL,
+        "$schema": schema,
         "name": name,
         "position": position,
         "visual": visual,
@@ -3896,11 +4461,24 @@ def build_field_parameter_page(parts, specs, *, page_name="pageSelfService",
     return page_name
 
 
-def _filter_slicer_fields(ws_list):
-    """Collect distinct filtered fields across worksheets (one slicer each)."""
+def _filter_slicer_fields(ws_list, shown_tokens=None):
+    """Collect distinct filtered fields across worksheets (one slicer each).
+
+    ``shown_tokens`` is the set of ``(datasource, field-instance)`` tokens the author exposed as
+    filter cards on the dashboard surface (from :func:`_parse_dashboard`'s ``filter_field_tokens``).
+    When provided, ONLY those filters become slicers -- an applied-but-unshown filter (e.g. a
+    single-member scope include that merely narrows one sheet's data) no longer fabricates a slicer
+    the dashboard never had. ``None`` keeps every filtered field, used for the standalone
+    worksheet-page surface (the worksheet itself is the shown surface there)."""
     seen, out = set(), []
     for ws in ws_list:
         for f in ws.get("filters", []):
+            if shown_tokens is not None:
+                ft = f.get("filter_token")
+                # ``filter_token`` is a (ds, field) tuple in memory but becomes a [ds, field] list
+                # across a JSON round-trip of the IR; normalize both sides to a tuple to match.
+                if ft is None or tuple(ft) not in shown_tokens:
+                    continue
             key = (f["entity"], f["property"])
             if key in seen:
                 continue
@@ -3970,10 +4548,22 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 ws, state, model_table, field_map, warnings)
             data_point_objects, mc_fact = _data_point_colors(
                 ws, state, ws["visual_type"], model_table, field_map, warnings)
+            ms_objects, ms_fact = _measure_series_colors(
+                ws, state, ws["visual_type"], warnings)
+            if ms_objects and not data_point_objects:
+                data_point_objects = ms_objects
+            card_label_objects = _card_label_objects(ws, vtype)
             label_objects, dl_fact = _data_labels(ws, ws["visual_type"], warnings)
             legend_objects, lg_fact = _legend_objects(
                 ws, zone, db.get("legend_zones"), ws["visual_type"])
             flag_fc = _flag_filter_config_for(ir, ws["name"])
+            shape_objects = (_shape_map_objects(ws)
+                             if ws["visual_type"] == VT_SHAPE_MAP else None)
+            # A measure shapeMap needs its colour-saturation gradient written explicitly or
+            # Desktop renders a flat fill until the Value field is nudged off-and-on. Route it
+            # through the ``dataPoint`` channel (a measure choropleth has no categorical colours).
+            if ws["visual_type"] == VT_SHAPE_MAP and not data_point_objects:
+                data_point_objects = _shape_map_datapoint_objects()
             visuals.append(_visual_json(
                 vname, vtype, pos, state,
                 _sort_definition(ws, state, model_table, field_map),
@@ -3981,7 +4571,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 title=ws.get("title"), title_style=ws.get("title_style"),
                 axis_titles=ws.get("axis_titles"),
                 value_objects=value_objects, data_point_objects=data_point_objects,
-                label_objects=label_objects, legend_objects=legend_objects))
+                label_objects=label_objects, legend_objects=legend_objects,
+                shape_objects=shape_objects, card_label_objects=card_label_objects))
             rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                     page_display=db["name"] or page_name,
                                     model_table=model_table, field_map=field_map)
@@ -3989,6 +4580,10 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 rec["conditional_format"] = cf_fact
             if mc_fact:
                 rec["mark_colors"] = mc_fact
+            if ms_fact:
+                rec["measure_colors"] = ms_fact
+            if card_label_objects:
+                rec["card_label_colors"] = ws.get("card_label_colors")
             if dl_fact:
                 rec["data_labels"] = dl_fact
             if lg_fact:
@@ -3999,7 +4594,9 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 rec["flag_filters"] = [c["field"]["Measure"]["Property"]
                                        for c in flag_fc["filters"]]
             records.append(rec)
-        visuals += _emit_slicers(page_ws, page_name, model_table, field_map, warnings)
+        visuals += _emit_slicers(
+            page_ws, page_name, model_table, field_map, warnings,
+            shown_tokens={tuple(t) for t in (db.get("filter_field_tokens") or ())})
         visuals += _emit_param_control_slicers(
             ir.get("parameter_controls", []), db["name"], page_name, ref_w, ref_h, warnings)
         if not visuals:
@@ -4026,8 +4623,17 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             ws, state, model_table, field_map, warnings)
         data_point_objects, mc_fact = _data_point_colors(
             ws, state, ws["visual_type"], model_table, field_map, warnings)
+        ms_objects, ms_fact = _measure_series_colors(
+            ws, state, ws["visual_type"], warnings)
+        if ms_objects and not data_point_objects:
+            data_point_objects = ms_objects
+        card_label_objects = _card_label_objects(ws, vtype)
         label_objects, dl_fact = _data_labels(ws, ws["visual_type"], warnings)
         flag_fc = _flag_filter_config_for(ir, ws["name"])
+        shape_objects = (_shape_map_objects(ws)
+                         if ws["visual_type"] == VT_SHAPE_MAP else None)
+        if ws["visual_type"] == VT_SHAPE_MAP and not data_point_objects:
+            data_point_objects = _shape_map_datapoint_objects()
         main = _visual_json(
             vname, vtype, pos, state,
             _sort_definition(ws, state, model_table, field_map),
@@ -4035,7 +4641,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             title=ws.get("title"), title_style=ws.get("title_style"),
             axis_titles=ws.get("axis_titles"),
             value_objects=value_objects, data_point_objects=data_point_objects,
-            label_objects=label_objects)
+            label_objects=label_objects, shape_objects=shape_objects,
+            card_label_objects=card_label_objects)
         rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                 page_display=ws["name"],
                                 model_table=model_table, field_map=field_map)
@@ -4043,6 +4650,10 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             rec["conditional_format"] = cf_fact
         if mc_fact:
             rec["mark_colors"] = mc_fact
+        if ms_fact:
+            rec["measure_colors"] = ms_fact
+        if card_label_objects:
+            rec["card_label_colors"] = ws.get("card_label_colors")
         if dl_fact:
             rec["data_labels"] = dl_fact
         if ws.get("title_style"):
@@ -4090,9 +4701,9 @@ def _reconcile_caption_fallback(warnings, field_map):
     return kept
 
 
-def _emit_slicers(ws_list, page_name, model_table, field_map, warnings=None):
+def _emit_slicers(ws_list, page_name, model_table, field_map, warnings=None, shown_tokens=None):
     visuals = []
-    fields = _filter_slicer_fields(ws_list)
+    fields = _filter_slicer_fields(ws_list, shown_tokens)
     for i, f in enumerate(fields):
         y = 40 + i * 120
         if y > PAGE_HEIGHT - 120:

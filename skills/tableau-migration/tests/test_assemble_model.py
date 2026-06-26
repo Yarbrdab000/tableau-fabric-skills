@@ -491,6 +491,65 @@ def test_approved_dim_calc_lands_as_assisted_approved_calc_column():
     assert cov["live_coverage_pct"] == 100.0
 
 
+# -- AUTO-DETECT (no human approval) of the argmax/argmin idiom on a MEASURE, end-to-end through the
+#    real assemble_model resolver. LIVE_SQLSERVER lacks State + City, so the detector (which resolves
+#    its fields against the model) could not fire there; this minimal model carries them. This is the
+#    peer of the approved-DAX test above: it locks the real suggest_assisted_dax wiring (the path an
+#    actual workbook hits) and proves the argmin idiom lands end-to-end, not just in unit tests.
+_ARGMAX_MODEL_TDS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Superstore' inline='true' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='myserver' name='sqlserver.0a1b2c'>
+        <connection authentication='sqlserver' class='sqlserver' dbname='Superstore'
+                    server='myserver.database.windows.net' username='svc' />
+      </named-connection>
+    </named-connections>
+    <relation connection='sqlserver.0a1b2c' name='Orders' table='[dbo].[Orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>State</remote-name><local-name>[State]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>City</remote-name><local-name>[City]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+_ARGMAX_DETAIL_LOD = "{FIXED [State], [City] : SUM([Sales])}"
+_ARGMAX_MEASURE_FORMULA = (
+    "IF {FIXED [State] : MAX(%s)} = %s THEN [City] END" % (_ARGMAX_DETAIL_LOD, _ARGMAX_DETAIL_LOD))
+_ARGMIN_MEASURE_FORMULA = (
+    "IF {FIXED [State] : MIN(%s)} = %s THEN [City] END" % (_ARGMAX_DETAIL_LOD, _ARGMAX_DETAIL_LOD))
+
+
+def test_argmax_and_argmin_measures_auto_suggest_through_assemble_model():
+    # The deterministic tier STUBS a nested-FIXED-LOD argmax/argmin measure; assemble_model must then
+    # consult the idiom registry and surface an `assisted-suggested` row + an `assisted_suggestions`
+    # review entry carrying the detected pattern -- the real auto-detect wiring an actual workbook hits.
+    calcs = [
+        {"name": "Top City", "formula": _ARGMAX_MEASURE_FORMULA, "internal_name": "Calc_argmax"},
+        {"name": "Bottom City", "formula": _ARGMIN_MEASURE_FORMULA, "internal_name": "Calc_argmin"},
+    ]
+    out = assemble_import_model(parse_tds(_ARGMAX_MODEL_TDS), model_name="Superstore", calcs=calcs)
+    rows = {r["measure"]: r for r in out["report"]["measures"]}
+    assert rows["Top City"]["status"] == "assisted-suggested"
+    assert rows["Top City"]["assisted_suggestion"]["pattern"] == "argmax-dimension"
+    assert rows["Bottom City"]["status"] == "assisted-suggested"
+    assert rows["Bottom City"]["assisted_suggestion"]["pattern"] == "argmin-dimension"
+    # both surface in the review list the orchestrator reads, each carrying its detected pattern
+    sugg = {s["measure"]: s["pattern"] for s in out["report"]["assisted_suggestions"]}
+    assert sugg["Top City"] == "argmax-dimension"
+    assert sugg["Bottom City"] == "argmin-dimension"
+
+
 def test_approved_dim_calc_never_overrides_a_deterministic_translation():
     # An approval for a calc Tier 0 ALREADY translates faithfully is ignored -- deterministic wins.
     dim_calcs = [{"name": "Order Code", "formula": "UPPER([Order ID])"}]
@@ -802,6 +861,30 @@ def test_date_axis_order_resolver_is_none_without_date_dimension():
     assert _date_axis_order_resolver(_date_axis_resolve, "", {("Orders", "Order_Date")}) is None
     assert _date_axis_order_resolver(_date_axis_resolve, "Date", set()) is None
     assert _date_axis_order_resolver(_date_axis_resolve, "Date", None) is None
+
+
+def test_positional_measure_orderby_is_single_table_not_cross_table_redirect():
+    # REGRESSION (live-proven on Fabric, error 0x413A0003): a positional table-calc measure addressed
+    # across the continuous DATE axis must emit an OFFSET/WINDOW whose ORDERBY and PARTITIONBY come
+    # from a SINGLE table. ADD #1 redirected the ORDERBY to the calendar key Date[Date] while the inner
+    # aggregate + partition stayed on the fact (Orders) -> a cross-table window with no <relation>,
+    # which the live engine rejects ("all OrderBy and PartitionBy columns must be from the same
+    # table"). The model build must order by the fact's OWN date column (Orders[Order_Date]) instead.
+    # _DATE_BAND_SQLSERVER carries an Order Date column, so the Date dimension IS generated and the
+    # (now-disabled) redirect path is genuinely reachable -- making this a non-vacuous guard.
+    sod = _sod_usage(cols=[Pill("none:Order Date:nk", "Order Date", "None")])
+    out = assemble_import_model(parse_tds(_DATE_BAND_SQLSERVER), model_name="Superstore",
+                                calcs=[], table_calc_usages=[sod])
+    assert "definition/tables/Date.tmdl" in out["parts"]   # the redirect's target dimension exists
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    assert "measure 'Standard of Deviation' =" in measures
+    # the positional window orders by the FACT date column -- single-table, valid DAX ...
+    assert "ORDERBY('Orders'[Order_Date], ASC)" in measures
+    # ... and NEVER on the calendar key (the cross-table form the live engine rejects).
+    assert "ORDERBY('Date'[Date]" not in measures
+    row = {r["measure"]: r for r in out["report"]["measures"]}["Standard of Deviation"]
+    assert row["status"] == "translated"
+    assert row["source"]["order_by"] == [["Order Date", "ASC"]]
 
 
 def test_assemble_excel_collection_multi_table():

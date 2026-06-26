@@ -191,4 +191,7 @@ def test_migrate_excel_full_data_and_date_table():
     assert "definition/tables/Date.tmdl" in parts
     rels = parts["definition/relationships.tmdl"]
     assert "fromColumn: Orders.Order_Date" in rels
-    assert "joinOnDateBehavior: datePartOnly" in rels
+    assert "toColumn: Date.Date" in rels
+    # Plain exact dateTime join -- no joinOnDateBehavior. The Date table is a calculated CALENDARAUTO
+    # table and Power BI Desktop drops a datePartOnly relationship that involves a calculated table.
+    assert "joinOnDateBehavior" not in rels

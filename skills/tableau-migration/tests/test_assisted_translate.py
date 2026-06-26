@@ -52,6 +52,12 @@ _EXPECTED_DAX = (
     '    CONCATENATEX(FILTER(__detail, [@value] = __max), \'Orders\'[City], ", ")'
 )
 
+# The argmin twin -- "the city with the LEAST sales in each state" -- is byte-identical to argmax
+# except MAXX/__max -> MINX/__min, so derive its expectation to keep the two structurally locked.
+_EXPECTED_ARGMIN_DAX = _EXPECTED_DAX.replace("__max", "__min").replace("MAXX", "MINX")
+_MIN = "{FIXED [State] : MIN({FIXED [State], [City] : SUM([Sales])})}"
+_ARGMIN_INLINE = f"IF {_MIN} = {_DETAIL} THEN [City] END"
+
 
 # --------------------------------------------------------------------------- detector
 def test_argmax_inline_detected_with_exact_dax():
@@ -61,6 +67,33 @@ def test_argmax_inline_detected_with_exact_dax():
     assert s["requires_approval"] is True
     assert s["dax"] == _EXPECTED_DAX
     assert any("Ties" in c for c in s["caveats"])
+
+
+def test_argmin_inline_detected_with_exact_dax():
+    # The same structural idiom with MIN -> argmin: MINX/__min, otherwise byte-identical to argmax.
+    s = suggest_assisted_dax(_ARGMIN_INLINE, _resolver)
+    assert s is not None
+    assert s["pattern"] == "argmin-dimension"
+    assert s["requires_approval"] is True
+    assert s["dax"] == _EXPECTED_ARGMIN_DAX
+    assert "MINX(__detail, [@value])" in s["dax"] and "MAXX" not in s["dax"]
+    assert any("minimum" in c for c in s["caveats"])
+    assert any("BOTTOMN" in c for c in s["caveats"])
+
+
+def test_argmin_via_referenced_calc():
+    # The MIN selector named as a separate calc, mirroring the argmax referenced-calc shape.
+    formula = f"IF [Calculation_77] = {_DETAIL} THEN [City] END"
+    s = suggest_assisted_dax(formula, _resolver, calc_lookup={"calculation_77": _MIN})
+    assert s is not None and s["dax"] == _EXPECTED_ARGMIN_DAX
+
+
+def test_argmax_unchanged_after_argmin_generalization():
+    # Regression guard: the argmax branch stays byte-identical (MAXX/__max) after generalizing.
+    s = suggest_assisted_dax(_ARGMAX_INLINE, _resolver)
+    assert s["pattern"] == "argmax-dimension"
+    assert s["dax"] == _EXPECTED_DAX
+    assert "MAXX(__detail, [@value])" in s["dax"] and "MINX" not in s["dax"]
 
 
 def test_argmax_detected_when_max_is_on_the_left_or_right():

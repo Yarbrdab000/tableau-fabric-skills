@@ -44,7 +44,9 @@ calc_count}``) the orchestrator re-checks at resolve time. Both additive to ``1.
 from __future__ import annotations
 
 import csv
+import json
 import re
+from json import JSONDecodeError
 from typing import Any, Dict, List, Optional, Sequence
 
 try:  # package or flat-script execution
@@ -63,8 +65,254 @@ DEFAULT_STRONG_CUT = 0.65
 # The frozen action vocabulary and binding-status vocabulary (documented in the contract).
 ACTIONS = ("convert_embedded", "rebind_to_published", "rebind_to_rebuilt", "consolidate_new_model")
 BINDING_STATUSES = ("built_local", "existing_fabric", "landed_to_delta", "needs_attention")
+MODEL_ORIGINS = ("existing_fabric", "published", "consolidated_new_model", "embedded_convert")
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+_TOP_LEVEL_REQUIRED = ("schema_version", "summary", "source_map", "clusters", "models", "plan")
+_PLAN_REQUIRED = (
+    "workbook_luid", "source_ref", "action", "model_id", "label",
+    "binding_status", "binding_target", "evidence", "caveats",
+)
+
+
+class RebindPlanSchemaError(ValueError):
+    """Raised when a rebind-plan payload is malformed or contract-incompatible."""
+
+
+def _fail(path: str, message: str) -> None:
+    raise RebindPlanSchemaError(f"{path}: {message}")
+
+
+def _expect(condition: bool, path: str, message: str) -> None:
+    if not condition:
+        _fail(path, message)
+
+
+def _expect_dict(value: Any, path: str) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        _fail(path, "expected object")
+    return value
+
+
+def _expect_list(value: Any, path: str) -> List[Any]:
+    if not isinstance(value, list):
+        _fail(path, "expected array")
+    return value
+
+
+def _expect_str(value: Any, path: str, *, allow_empty: bool = True) -> str:
+    if not isinstance(value, str):
+        _fail(path, "expected string")
+    if not allow_empty and not value.strip():
+        _fail(path, "expected non-empty string")
+    return value
+
+
+def _expect_optional_str(value: Any, path: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        _fail(path, "expected string or null")
+    return value
+
+
+def _expect_number(value: Any, path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _fail(path, "expected number")
+    return float(value)
+
+
+def _expect_nonneg_int(value: Any, path: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        _fail(path, "expected non-negative integer")
+    if value < 0:
+        _fail(path, "expected non-negative integer")
+    return value
+
+
+def _validate_date_table(value: Any, path: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        _fail(path, "expected object or null")
+
+
+def _validate_binding_target(entry: Dict[str, Any], models: Dict[str, Any], path: str) -> None:
+    status = _expect_str(entry.get("binding_status"), f"{path}.binding_status", allow_empty=False)
+    _expect(status in BINDING_STATUSES, f"{path}.binding_status",
+            "must be one of %s" % ", ".join(BINDING_STATUSES))
+
+    target = _expect_dict(entry.get("binding_target"), f"{path}.binding_target")
+    kind = _expect_str(target.get("kind"), f"{path}.binding_target.kind", allow_empty=False)
+
+    if status == "existing_fabric":
+        _expect(kind == "byConnection", f"{path}.binding_target.kind",
+                "must be 'byConnection' when binding_status is existing_fabric")
+        _expect_str(target.get("workspace_id"), f"{path}.binding_target.workspace_id", allow_empty=False)
+        _expect_str(target.get("semantic_model_id"), f"{path}.binding_target.semantic_model_id", allow_empty=False)
+        _expect_str(target.get("dataset_name"), f"{path}.binding_target.dataset_name", allow_empty=False)
+        _validate_date_table(target.get("date_table"), f"{path}.binding_target.date_table")
+        return
+
+    if status in ("built_local", "landed_to_delta"):
+        _expect(kind == "byPath", f"{path}.binding_target.kind",
+                "must be 'byPath' when binding_status is %s" % status)
+        tid = _expect_str(target.get("model_id"), f"{path}.binding_target.model_id", allow_empty=False)
+        mid = _expect_str(entry.get("model_id"), f"{path}.model_id", allow_empty=False)
+        _expect(tid == mid, f"{path}.binding_target.model_id", "must equal plan entry model_id")
+        _expect_optional_str(target.get("model_path"), f"{path}.binding_target.model_path")
+        _validate_date_table(target.get("date_table"), f"{path}.binding_target.date_table")
+        _expect(mid in models, f"{path}.model_id", "must reference a key in models")
+        return
+
+    # needs_attention
+    _expect(kind == "unbound", f"{path}.binding_target.kind",
+            "must be 'unbound' when binding_status is needs_attention")
+    _expect_str(target.get("reason"), f"{path}.binding_target.reason", allow_empty=False)
+    _expect("date_table" not in target, f"{path}.binding_target.date_table",
+            "must be absent for unbound targets")
+
+
+def _validate_evidence(value: Any, path: str) -> None:
+    ev = _expect_dict(value, path)
+    cluster = _expect_dict(ev.get("cluster"), f"{path}.cluster")
+    _expect_str(cluster.get("cluster_id"), f"{path}.cluster.cluster_id", allow_empty=False)
+    _expect_nonneg_int(cluster.get("size"), f"{path}.cluster.size")
+    _expect(isinstance(cluster.get("is_duplicate_group"), bool), f"{path}.cluster.is_duplicate_group",
+            "expected boolean")
+    for axis in ("fabric", "published"):
+        block = ev.get(axis)
+        if block is None:
+            continue
+        b = _expect_dict(block, f"{path}.{axis}")
+        _expect_str(b.get("tier"), f"{path}.{axis}.tier", allow_empty=False)
+        _expect_number(b.get("score"), f"{path}.{axis}.score")
+
+
+def validate_rebind_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate a rebind-plan payload against the frozen schema_version ``1.0`` contract.
+
+    Raises :class:`RebindPlanSchemaError` on malformed/missing/wrong-type inputs.
+    """
+    root = _expect_dict(plan, "root")
+    for k in _TOP_LEVEL_REQUIRED:
+        _expect(k in root, f"root.{k}", "missing required field")
+
+    schema_version = _expect_str(root.get("schema_version"), "schema_version", allow_empty=False)
+    _expect(schema_version == SCHEMA_VERSION, "schema_version",
+            "expected %r" % SCHEMA_VERSION)
+
+    summary = _expect_dict(root.get("summary"), "summary")
+    _expect_str(summary.get("schema_version"), "summary.schema_version", allow_empty=False)
+    _expect(summary.get("schema_version") == SCHEMA_VERSION, "summary.schema_version",
+            "expected %r" % SCHEMA_VERSION)
+    _expect_nonneg_int(summary.get("embedded_total"), "summary.embedded_total")
+    _expect_nonneg_int(summary.get("workbook_total"), "summary.workbook_total")
+    _expect_nonneg_int(summary.get("cluster_total"), "summary.cluster_total")
+    _expect_nonneg_int(summary.get("duplicate_group_count"), "summary.duplicate_group_count")
+    _expect_nonneg_int(summary.get("model_total"), "summary.model_total")
+    _expect_nonneg_int(summary.get("consolidated_model_total"), "summary.consolidated_model_total")
+    _expect_nonneg_int(summary.get("rebind_to_published"), "summary.rebind_to_published")
+    _expect_nonneg_int(summary.get("existing_fabric_reuse"), "summary.existing_fabric_reuse")
+    _expect_nonneg_int(summary.get("consolidated_members"), "summary.consolidated_members")
+    _expect_nonneg_int(summary.get("convert_in_place"), "summary.convert_in_place")
+    _expect_number(summary.get("strong_cut"), "summary.strong_cut")
+    _expect_str(summary.get("headline"), "summary.headline")
+
+    by_action = _expect_dict(summary.get("by_action"), "summary.by_action")
+    by_binding = _expect_dict(summary.get("by_binding_status"), "summary.by_binding_status")
+    for action in ACTIONS:
+        _expect_nonneg_int(by_action.get(action), f"summary.by_action.{action}")
+    for status in BINDING_STATUSES:
+        _expect_nonneg_int(by_binding.get(status), f"summary.by_binding_status.{status}")
+
+    source_map = _expect_list(root.get("source_map"), "source_map")
+    source_ids: set[str] = set()
+    for i, item in enumerate(source_map):
+        m = _expect_dict(item, f"source_map[{i}]")
+        sid = _expect_str(m.get("source_id"), f"source_map[{i}].source_id", allow_empty=False)
+        _expect_str(m.get("workbook_luid"), f"source_map[{i}].workbook_luid")
+        source_ids.add(sid)
+
+    _expect_list(root.get("clusters"), "clusters")
+
+    models = _expect_dict(root.get("models"), "models")
+    for model_id, payload in models.items():
+        _expect_str(model_id, f"models[{model_id!r}].key", allow_empty=False)
+        m = _expect_dict(payload, f"models[{model_id}]")
+        mid = _expect_str(m.get("model_id"), f"models[{model_id}].model_id", allow_empty=False)
+        _expect(mid == model_id, f"models[{model_id}].model_id", "must equal models key")
+        origin = _expect_str(m.get("origin"), f"models[{model_id}].origin", allow_empty=False)
+        _expect(origin in MODEL_ORIGINS, f"models[{model_id}].origin",
+                "must be one of %s" % ", ".join(MODEL_ORIGINS))
+        _expect_optional_str(m.get("resolved_model_name"), f"models[{model_id}].resolved_model_name")
+        _expect_optional_str(m.get("model_path"), f"models[{model_id}].model_path")
+        if origin == "existing_fabric":
+            conn = _expect_dict(m.get("connection"), f"models[{model_id}].connection")
+            _expect(conn.get("kind") == "byConnection", f"models[{model_id}].connection.kind",
+                    "must be 'byConnection'")
+            _expect_str(conn.get("workspace_id"), f"models[{model_id}].connection.workspace_id", allow_empty=False)
+            _expect_str(conn.get("semantic_model_id"),
+                        f"models[{model_id}].connection.semantic_model_id", allow_empty=False)
+            _expect_str(conn.get("dataset_name"), f"models[{model_id}].connection.dataset_name", allow_empty=False)
+            _validate_date_table(conn.get("date_table"), f"models[{model_id}].connection.date_table")
+
+    entries = _expect_list(root.get("plan"), "plan")
+    _expect(len(entries) == summary["embedded_total"], "summary.embedded_total",
+            "must equal number of plan entries")
+    _expect(sum(by_action[a] for a in ACTIONS) == len(entries), "summary.by_action",
+            "counts must sum to number of plan entries")
+    _expect(sum(by_binding[b] for b in BINDING_STATUSES) == len(entries), "summary.by_binding_status",
+            "counts must sum to number of plan entries")
+
+    for i, raw in enumerate(entries):
+        path = f"plan[{i}]"
+        entry = _expect_dict(raw, path)
+        for k in _PLAN_REQUIRED:
+            _expect(k in entry, f"{path}.{k}", "missing required field")
+        _expect_str(entry.get("workbook_luid"), f"{path}.workbook_luid")
+        source_ref = _expect_str(entry.get("source_ref"), f"{path}.source_ref")
+        if source_ids:
+            _expect(source_ref in source_ids, f"{path}.source_ref",
+                    "must exist in source_map.source_id")
+        action = _expect_str(entry.get("action"), f"{path}.action", allow_empty=False)
+        _expect(action in ACTIONS, f"{path}.action",
+                "must be one of %s" % ", ".join(ACTIONS))
+        _expect_str(entry.get("model_id"), f"{path}.model_id", allow_empty=False)
+        _expect_str(entry.get("label"), f"{path}.label")
+        _validate_binding_target(entry, models, path)
+        _validate_evidence(entry.get("evidence"), f"{path}.evidence")
+
+        caveats = _expect_list(entry.get("caveats"), f"{path}.caveats")
+        for j, caveat in enumerate(caveats):
+            _expect_str(caveat, f"{path}.caveats[{j}]")
+
+        if "drift" in entry:
+            drift = _expect_dict(entry.get("drift"), f"{path}.drift")
+            for key in ("table_count", "column_count", "calc_count"):
+                _expect_nonneg_int(drift.get(key), f"{path}.drift.{key}")
+        if "objects" in entry:
+            objs = _expect_list(entry.get("objects"), f"{path}.objects")
+            for j, obj in enumerate(objs):
+                o = _expect_dict(obj, f"{path}.objects[{j}]")
+                if "name" in o:
+                    _expect_str(o.get("name"), f"{path}.objects[{j}].name")
+                if "kind" in o:
+                    _expect_str(o.get("kind"), f"{path}.objects[{j}].kind")
+    return plan
+
+
+def load_rebind_plan(path: str) -> Dict[str, Any]:
+    """Load and validate a rebind-plan JSON file (fail-loud on malformed/invalid input)."""
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            payload = json.load(fh)
+    except JSONDecodeError as exc:
+        raise RebindPlanSchemaError(
+            f"{path}: malformed JSON ({exc.msg} at line {exc.lineno}, column {exc.colno})"
+        ) from exc
+    return validate_rebind_plan(payload)
 
 
 def _slug(value: Optional[str]) -> str:
@@ -256,7 +504,7 @@ def build_rebind_plan(
             })
 
     summary = _summarize(plan, cluster_result, models, strong_cut)
-    return {
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "summary": summary,
         "source_map": [{"source_id": sid, "workbook_luid": luid}
@@ -265,6 +513,7 @@ def build_rebind_plan(
         "models": models,
         "plan": plan,
     }
+    return validate_rebind_plan(payload)
 
 
 def generate_plan(
@@ -386,6 +635,7 @@ def apply_view_dependency_feedback(plan: Dict[str, Any], report: Dict[str, Any])
     that is merely untranslatable in the *published* model (absent from the embedded source) yields the
     same stub under convert, so it is NOT a downgrade trigger.
     """
+    validate_rebind_plan(plan)
     feedback = _index_feedback(report)
     downgraded = 0
     for e in plan.get("plan", []):
@@ -419,7 +669,7 @@ def apply_view_dependency_feedback(plan: Dict[str, Any], report: Dict[str, Any])
                 "duplicate_group_count": plan["summary"].get("duplicate_group_count", 0)}},
             plan["models"], plan["summary"].get("strong_cut", DEFAULT_STRONG_CUT))
         plan["summary"]["gate1_downgrades"] = downgraded
-    return plan
+    return validate_rebind_plan(plan)
 
 
 def _norm_obj(name: Optional[str]) -> str:
@@ -428,16 +678,25 @@ def _norm_obj(name: Optional[str]) -> str:
 
 def _index_feedback(report: Dict[str, Any]) -> Dict[str, List[str]]:
     """Normalise a view-dependency report into ``{key: [dropped ref names]}``."""
+    if not isinstance(report, dict):
+        raise RebindPlanSchemaError("view_dependency_report: expected object")
     out: Dict[str, List[str]] = {}
 
     def collect(key, payload):
+        if not isinstance(payload, dict):
+            raise RebindPlanSchemaError("view_dependency_report[%r]: expected object" % key)
         dropped = []
-        for d in (payload.get("dropped") or []):
+        raw = payload.get("dropped") or []
+        if not isinstance(raw, list):
+            raise RebindPlanSchemaError("view_dependency_report[%r].dropped: expected array" % key)
+        for d in raw:
             dropped.append(d.get("name") if isinstance(d, dict) else d)
         out[str(key)] = [d for d in dropped if d]
 
     if isinstance(report.get("bindings"), list):
         for b in report["bindings"]:
+            if not isinstance(b, dict):
+                raise RebindPlanSchemaError("view_dependency_report.bindings[]: expected object")
             key = b.get("workbook_luid") or b.get("source_ref") or b.get("source_id")
             if key is not None:
                 collect(key, b)
@@ -460,6 +719,7 @@ _ACTION_LABEL = {
 
 
 def render_markdown(plan: Dict[str, Any]) -> str:
+    validate_rebind_plan(plan)
     s = plan.get("summary", {}) or {}
     out: List[str] = []
     out.append("# Embedded-datasource rebind plan")
@@ -554,6 +814,7 @@ def _csv_cell(entry: Dict[str, Any], key: str) -> Any:
 
 def build_export_rows(plan: Dict[str, Any]) -> List[List[Any]]:
     """``[header, *rows]`` -- one row per plan entry, the analyst pivot source."""
+    validate_rebind_plan(plan)
     rows: List[List[Any]] = [[h for h, _ in _CSV_COLUMNS]]
     for e in plan.get("plan", []):
         rows.append([_csv_cell(e, key) for _, key in _CSV_COLUMNS])

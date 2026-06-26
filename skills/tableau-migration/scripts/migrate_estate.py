@@ -48,7 +48,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 
 try:  # works whether imported as a package or run with scripts/ on sys.path
-    from .connection_to_m import parse_tds
+    from .connection_to_m import parse_tds, extract_bundled_flatfile
     from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from .assemble_model import (assemble_import_model, write_model_folder, write_local_pbip,
                                  migrate_datasource, list_workbook_datasources)
@@ -57,7 +57,7 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .workbook_calc_usage import workbook_calc_usage
     from . import fetch_tds as F
 except ImportError:
-    from connection_to_m import parse_tds
+    from connection_to_m import parse_tds, extract_bundled_flatfile
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from assemble_model import (assemble_import_model, write_model_folder, write_local_pbip,
                                 migrate_datasource, list_workbook_datasources)
@@ -633,9 +633,25 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
                       error="; ".join(problems) + "; cannot emit a clean model")
         return detail
 
+    # Flat-file Import (Excel/CSV bundled inside a .tdsx/.twbx): extract the embedded data file to an
+    # ABSOLUTE path so the emitted M's File.Contents loads in Power BI Desktop. A relative path opens
+    # but loads NO data ("The supplied file path must be a valid absolute path"). A live DB source
+    # (Snowflake/Databricks/SQL Server/...) carries no flatfile_filename -> no-op; its connection
+    # string is left exactly as-is.
+    flatfile_path = None
+    if descriptor.get("flatfile_filename"):
+        data_dir = os.path.join(os.path.dirname(os.path.abspath(sm_dir)), "data",
+                                re.sub(r"[^\w.-]+", "_", name) or "ds")
+        try:
+            flatfile_path = extract_bundled_flatfile(ds_id, descriptor, data_dir)
+        except Exception:
+            flatfile_path = None
+    detail["flatfile_landed"] = flatfile_path
+
     try:
         out = assemble_import_model(descriptor, model_name=name, calcs=calcs, dim_calcs=dim_calcs,
-                                    parameters=parameters, approved_calc_dax=approved_calc_dax)
+                                    parameters=parameters, approved_calc_dax=approved_calc_dax,
+                                    flatfile_path=flatfile_path)
     except ValueError as exc:  # storage policy / no-columns -> documented land-to-Delta fallback
         detail.update(status="fallback", storage_mode=None, storage_decision=decision,
                       reason=str(exc),
@@ -710,7 +726,8 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
         manual_followups=decision.get("manual_followups", []),
     )
     if ds_catalog is not None:
-        ds_catalog[_norm_ds(name)] = {"name": name, "text": text, "safe_base": safe_base}
+        ds_catalog[_norm_ds(name)] = {"name": name, "text": text, "safe_base": safe_base,
+                                      "flatfile_path": flatfile_path}
     return detail
 
 
@@ -1408,7 +1425,8 @@ def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog, appr
                                  calcs=wb_calcs, dim_calcs=wb_dim_calcs,
                                  parameters=wb_params,
                                  table_calc_usages=wb_table_calc_usages,
-                                 approved_calc_dax=approved_calc_dax)
+                                 approved_calc_dax=approved_calc_dax,
+                                 flatfile_path=match.get("flatfile_path"))
     except Exception:
         return None
     if (res.get("report") or {}).get("fallback"):
@@ -1450,7 +1468,7 @@ def _field_map_from_model(res_report):
 
 
 def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None, ds_catalog=None,
-                          approved_calc_dax=None):
+                          approved_calc_dax=None, wb_id=None):
     """Build an openable, self-contained workbook ``.pbip`` and record it on ``detail`` (never raises).
 
     Rebuilds the workbook's OWN primary embedded datasource into a semantic model (reusing the
@@ -1490,9 +1508,29 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
         warns.append(_PBIP_WARN + f"secondary datasource {sec.get('label')!r} not bound -- "
                      f"a single PBIR report binds one model; bound the primary {label!r}")
 
+    # Flat-file Import (Excel/CSV bundled inside the .twbx): extract the embedded data to an ABSOLUTE
+    # path under the bundle's data/ dir so the workbook .pbip opens AND loads. ``wb_id`` is the packaged
+    # workbook (the .twbx path for a local source); a live DB embedded source has no flatfile_filename,
+    # so this is a no-op there. ``migrate_datasource`` does the extraction (fail-closed).
+    _ff_dest = None
+    if wb_id is not None and pbip_dir:
+        _ff_dest = os.path.join(os.path.dirname(os.path.abspath(pbip_dir)), "data", model_safe)
+    # Reuse a sibling datasource's already-extracted flat-file data. A .twbx usually does NOT bundle
+    # its extract -- the data lives in the published/sibling .tdsx that the estate migrated separately
+    # (datasources are migrated before workbooks). When that datasource already landed its Excel/CSV at
+    # an absolute path, bind the workbook's model to the SAME file (one shared copy) so the workbook
+    # .pbip loads, instead of leaving the relative path Power BI Desktop cannot open. When there is no
+    # sibling match, migrate_datasource still tries to extract data bundled in the .twbx itself.
+    ff_path = None
+    if ds_catalog:
+        cat = ds_catalog.get(_norm_ds(primary.get("caption") or primary.get("name") or label))
+        if cat:
+            ff_path = cat.get("flatfile_path")
     try:
         res = migrate_datasource(twb_text, model_name=model_safe, datasource=label,
-                                 approved_calc_dax=approved_calc_dax)
+                                 approved_calc_dax=approved_calc_dax,
+                                 packaged_source=wb_id, flatfile_dest_dir=_ff_dest,
+                                 flatfile_path=ff_path)
     except Exception as exc:
         warns.append(_PBIP_WARN + f"could not rebuild embedded datasource {label!r} "
                      f"({type(exc).__name__}: {exc}) -- workbook .pbip skipped")
@@ -1622,8 +1660,34 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
                   model_translation_handoff=res_report.get("translation_handoff"))
 
 
+def _attach_viz_advice(detail, result, safe_base, reports_dir):
+    """Write the opt-in ``<Name>.viz-advice.json`` sidecar (ranked chart alternatives per visual).
+
+    Additive + best-effort: derived from the viz stage's read-only candidate records via the Tier-2
+    viz advisor (``viz_advisor.build_report_advice``), written as a SIBLING of the ``.Report`` folder
+    (never inside the PBIR definition) so the rebuilt report stays byte-identical. Records a
+    ``viz_advice`` summary on ``detail``; never raises (the advisor is fully optional).
+    """
+    try:
+        from viz_advisor import build_report_advice
+    except Exception as exc:  # pragma: no cover - advisor is an optional sibling module
+        detail["viz_advice"] = {"status": "unavailable", "note": f"{type(exc).__name__}: {exc}"}
+        return
+    records = result.get("candidate_records") if isinstance(result, dict) else None
+    advice = build_report_advice(records or [])
+    rel = f"reports/{safe_base}.viz-advice.json"
+    try:
+        with open(os.path.join(reports_dir, safe_base + ".viz-advice.json"),
+                  "w", encoding="utf-8") as fh:
+            json.dump(advice, fh, indent=2, sort_keys=True)
+    except OSError as exc:
+        detail["viz_advice"] = {"status": "error", "note": str(exc)}
+        return
+    detail["viz_advice"] = {"status": "written", "path": rel, "summary": advice["summary"]}
+
+
 def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir=None,
-                          ds_catalog=None, approved_calc_dax=None):
+                          ds_catalog=None, approved_calc_dax=None, viz_advice=False):
     """Run the optional viz stage for one workbook. Returns a report detail dict (never raises).
 
     Beyond the back-compatible bare ``reports/<Name>.Report`` write, when ``pbip_dir`` is given the
@@ -1681,9 +1745,12 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_di
     if signal is not None:
         detail["binding_signal"] = signal
 
+    if viz_advice and parts and safe_base is not None:
+        _attach_viz_advice(detail, result, safe_base, reports_dir)
+
     if parts and pbip_dir is not None:
         _attach_workbook_pbip(detail, text, result, safe_base, pbip_dir, viz=viz,
-                              ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax)
+                              ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax, wb_id=wb_id)
     return detail
 
 
@@ -1992,7 +2059,7 @@ def _write_compile_report(output_dir, compile_report):
 
 
 def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan=None,
-                   rebind_bind_stage=None, approved_calc_dax=None):
+                   rebind_bind_stage=None, approved_calc_dax=None, viz_advice=False):
     """Run the whole estate migration and write the output bundle. Returns the report dict.
 
     ``source`` is any :class:`TableauSource`. ``output_dir`` receives::
@@ -2028,6 +2095,12 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
     it lands), and writes a single ``compile-report.json``. When omitted the run is a byte-identical
     no-op -- no plan is read and no ``compile-report.json`` is written. The JSON file is the only
     coupling; the comparison-owned plan is never mutated.
+
+    ``viz_advice`` (optional, opt-in) turns on the Tier-2 viz advisor: per workbook, a
+    ``reports/<Name>.viz-advice.json`` sidecar is written next to the rebuilt report with ranked
+    ALTERNATIVE chart types for each visual's existing fields (deterministic; no model/LLM call). It
+    is purely additive -- nothing is written into the PBIR definition and ``report.json`` only gains a
+    ``viz_advice`` key per workbook -- so when omitted the run is byte-identical.
     """
     sm_dir = os.path.join(output_dir, "semantic_models")
     reports_dir = os.path.join(output_dir, "reports")
@@ -2044,7 +2117,8 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
                   for ds_id in source.list_datasources()]
     wb_details = [_migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir,
                                         ds_catalog=ds_catalog,
-                                        approved_calc_dax=approved_calc_dax)
+                                        approved_calc_dax=approved_calc_dax,
+                                        viz_advice=viz_advice)
                   for wb_id in source.list_workbooks()]
 
     summary = _summarize(ds_details, wb_details, viz is not None)
@@ -2365,6 +2439,10 @@ def main(argv=None):
                         help="path to a {calc_name: dax} JSON file of human-approved second-compiler "
                              "(assisted-translation) results; each name-matching stub lands as a "
                              "live, audit-stamped measure/calc column instead of an inert stub")
+    parser.add_argument("--viz-advice", action="store_true",
+                        help="also write a reports/<Name>.viz-advice.json sidecar per workbook with "
+                             "ranked alternative chart types per visual (Tier-2 viz advisor; "
+                             "deterministic, additive, never alters the rebuilt PBIR)")
     args = parser.parse_args(argv)
 
     try:
@@ -2374,7 +2452,7 @@ def main(argv=None):
 
     source = LocalFilesSource(args.input)
     report = migrate_estate(source, args.output, pbip=not args.no_pbip,
-                            approved_calc_dax=approved_calc_dax)
+                            approved_calc_dax=approved_calc_dax, viz_advice=args.viz_advice)
     s = report["summary"]
     print(
         f"Datasources: {s['datasources_migrated']}/{s['datasources_total']} migrated "
