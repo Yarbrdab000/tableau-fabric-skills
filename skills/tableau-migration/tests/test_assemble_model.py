@@ -21,6 +21,8 @@ from test_connection_to_m import (
     JOIN_TREE,
     FEDERATED_STAR,
     FEDERATED_REL_EDGECASE,
+    DATABRICKS_CUSTOM_SQL,
+    SNOWFLAKE_CUSTOM_SQL,
 )
 
 
@@ -874,6 +876,39 @@ def test_write_model_folder(tmp_path):
     assert any(p.endswith("model.tmdl") for p in written)
     assert (tmp_path / "Superstore.SemanticModel" / "definition" / "tables" / "Orders.tmdl").exists()
     assert (tmp_path / "Superstore.SemanticModel" / ".platform").exists()
+
+
+# -- custom-SQL native query: end-to-end model + fail-loud report keys --------
+def test_databricks_custom_sql_emits_real_partition_no_review():
+    out = migrate_tds_to_semantic_model(DATABRICKS_CUSTOM_SQL, model_name="DbxSQL")
+    part = out["parts"]["definition/tables/Custom SQL Query.tmdl"]
+    assert 'Catalog = Source{[Name="tableau_migration_databricks", Kind="Database"]}[Data]' in part
+    assert "Value.NativeQuery(Catalog, " in part
+    assert '{"Order ID", "Order_ID"}' in part
+    # a real, deploy-ready partition is NOT flagged for review (additive report keys present)
+    report = out["report"]
+    assert report["partitions_stubbed"] == 0
+    assert report["partitions_needs_review"] == []
+
+
+def test_snowflake_custom_sql_is_flagged_needs_review():
+    out = migrate_tds_to_semantic_model(SNOWFLAKE_CUSTOM_SQL, model_name="SnowSQL")
+    report = out["report"]
+    # fail LOUD at build time: the unverified-connector scaffold is counted and listed, with the
+    # original SQL preserved for manual completion -- not silently passed to deploy.
+    assert report["partitions_stubbed"] == 1
+    entries = report["partitions_needs_review"]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["table"] == "Custom SQL Query"
+    assert entry["kind"] == "m_partition"
+    assert "isn't verified" in entry["reason"]
+    assert entry["sql"] == 'SELECT "ORDER ID", SALES FROM ORDERS'
+    # and the emitted partition is a DEPLOY-valid scaffold (empty typed table, single let..in)
+    part = out["parts"]["definition/tables/Custom SQL Query.tmdl"]
+    assert "Source = #table(type table [], {})" in part
+    assert "Source = null" not in part
+
 
 
 # -- Relationship-confidence manifest (additive report artifact) --------------

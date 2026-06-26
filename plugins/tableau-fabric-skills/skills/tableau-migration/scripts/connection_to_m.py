@@ -27,12 +27,12 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .tmdl_generate import clean_col, generate_column_tmdl, q, tableau_default_format_to_pbi
     from .storage_mode import (
         ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
-        PARTIAL_LIVE_CONNECTORS, connector_spec)
+        NATIVE_QUERY_CATALOG_DRILL, PARTIAL_LIVE_CONNECTORS, connector_spec)
 except ImportError:
     from tmdl_generate import clean_col, generate_column_tmdl, q, tableau_default_format_to_pbi
     from storage_mode import (
         ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
-        PARTIAL_LIVE_CONNECTORS, connector_spec)
+        NATIVE_QUERY_CATALOG_DRILL, PARTIAL_LIVE_CONNECTORS, connector_spec)
 
 
 # -- type mapping --------------------------------------------------------------
@@ -968,8 +968,10 @@ def emit_connection_parameters(descriptor):
     argument (the ``(server, database)`` family); a server-only connector (Oracle) reaches its
     database through the server string, while Snowflake and Databricks reach it by navigation, so
     no unused ``#"Database"`` parameter is carried for them. ``Warehouse`` is emitted for
-    Snowflake; ``HttpPath`` for Databricks (its value is best-effort -- the .tds does not carry
-    the SQL-warehouse HTTP path portably, so it may be empty and require manual completion).
+    Snowflake; ``HttpPath`` for Databricks (read from whichever driver/connector attribute carries
+    it -- see ``_HTTP_PATH_ATTRS``; a real ``.tds`` typically does carry the SQL-warehouse HTTP
+    path, but it may be absent on some exports, in which case the parameter is emitted empty and
+    requires manual completion).
     """
     spec = connector_spec(descriptor.get("connection_class"))
     connect_style = spec[1] if spec else None
@@ -1006,14 +1008,23 @@ def _m_mode_keyword(mode):
 def _scaffold_source(cls, intended, detail):
     """Return a clearly-flagged, valid-but-incomplete partition source.
 
-    Used for any connector/relation we will not auto-emit: it names the intended connector as a
-    hint but never emits a guessed upstream call, so the structure is valid TMDL that obviously
-    needs manual completion (never silently wrong).
+    Used for any connector/relation we will not auto-emit. It must be DEPLOY-valid TMDL, not
+    merely structurally present: the body is a SINGLE ``let ... in`` expression (the ``// TODO``
+    note lives INSIDE the block, so it is one expression with one child, never a bare comment
+    sibling that the TMDL parser rejects with ``UnknownKeyword: 'let' is not a supported child
+    object``). The ``Source`` is an empty typed table, so even refreshing an un-completed scaffold
+    yields an empty table rather than a null-conversion error -- strictly better than the prior
+    ``Source = null`` while still obviously a stub that names its intended connector as a hint.
     """
     hint = f" using {intended}" if intended else ""
-    return ("\t\t\t// TODO: complete the M partition for connector class "
-            f"'{cls or 'unknown'}'{hint} ({detail})\n"
-            '\t\t\tlet Source = null in Source')
+    return (
+        "let\n"
+        f"\t\t\t\t// TODO: complete the M partition for connector class "
+        f"'{cls or 'unknown'}'{hint} ({detail})\n"
+        "\t\t\t\tSource = #table(type table [], {})\n"
+        "\t\t\tin\n"
+        "\t\t\t\tSource"
+    )
 
 
 # Flat-file column types: a TMDL dataType -> the Power Query ascription used in
@@ -1106,6 +1117,27 @@ def emit_flatfile_source(relation, conn, cls):
     return f"let\n\t\t\t\t{body}\n\t\t\tin\n\t\t\t\t{prev}"
 
 
+def _native_query_rename_pairs(relation):
+    """Build ``Table.RenameColumns`` pairs that map each native-query output column (the true
+    remote name, e.g. ``Order ID`` / ``Country/Region``) to its model name (``sourceColumn`` =
+    ``clean_col`` of the remote, e.g. ``Order_ID`` / ``Country_Region``).
+
+    This is the SAME remote->model rename the flat-file path already emits (see
+    ``emit_flatfile_source``): a native query returns the raw source headers, so without it the
+    underscored model columns wouldn't bind. Pairs where the remote name already equals the model
+    name are skipped, so a query whose columns need no aliasing yields NO rename step and the
+    emitted M is byte-identical to the pre-rename form (the no-op guarantee).
+    """
+    pairs = []
+    for c in (relation.get("columns") or []):
+        remote = c.get("remote_name")
+        model = c.get("model_name")
+        if remote and model and remote != model:
+            pairs.append(
+                f'{{"{escape_m_string(remote)}", "{escape_m_string(model)}"}}')
+    return pairs
+
+
 def _connect_expr(connector, connect_style):
     """Build the right-hand side of ``Source = ...`` for a fully-supported connector.
 
@@ -1151,16 +1183,45 @@ def emit_m_partition_source(relation, descriptor, mode):
     Deploy-ready, doc-verified M is emitted for the connectors in ``DIRECT_CONNECTORS`` (each
     with its own connect signature + navigation); any other connector returns a clearly-commented
     scaffold so the structure is valid TMDL but obviously needs manual completion (never silently
-    wrong). Custom SQL is emitted deploy-ready only for the ``(server, database)`` family, where
-    ``Value.NativeQuery`` folds against the database handle. For a multi-connection federated source
-    each relation is bound against its OWN connection (see ``_effective_connection``).
+    wrong). Custom SQL is emitted deploy-ready for the ``(server, database)`` family (where
+    ``Value.NativeQuery`` folds against the database handle) and for connectors in
+    ``NATIVE_QUERY_CATALOG_DRILL`` (where it folds against a drilled ``Kind="Database"`` handle);
+    everything else scaffolds. For a multi-connection federated source each relation is bound
+    against its OWN connection (see ``_effective_connection``).
+
+    Thin wrapper over ``_emit_m_partition_review`` returning only the M body. Callers that also
+    need to know whether the body is a needs-manual-completion scaffold use
+    ``m_partition_review_reason`` (same inputs), so this function's return value and output stay
+    byte-for-byte unchanged.
     """
+    return _emit_m_partition_review(relation, descriptor, mode)[0]
+
+
+def m_partition_review_reason(relation, descriptor, mode):
+    """Return the human-readable reason this relation's partition is a needs-manual-completion
+    scaffold, or ``None`` when a real, deploy-ready partition was emitted.
+
+    Lets the model assembler fail LOUD at build time -- counting stubbed partitions and listing
+    them in ``needs_review`` -- instead of a scaffold silently passing the build and only failing
+    at deploy. Pure function of the same inputs as ``emit_m_partition_source``.
+    """
+    return _emit_m_partition_review(relation, descriptor, mode)[1]
+
+
+def _scaffold_review(cls, intended, detail):
+    """``(scaffold_source, reason)`` pair so each scaffold site reports why it stubbed."""
+    return _scaffold_source(cls, intended, detail), detail
+
+
+def _emit_m_partition_review(relation, descriptor, mode):
+    """Core of ``emit_m_partition_source``: return ``(source, stub_reason)`` where ``stub_reason``
+    is ``None`` for a real, deploy-ready partition and a short explanation for a scaffold."""
     conn = _effective_connection(relation, descriptor)
     cls = (conn.get("connection_class") or "").lower()
     if cls in ANALYSIS_SERVICES_CLASSES:
         # SSAS / MSOLAP is already a tabular/multidimensional model -- never emit a naive M
         # partition for it; flag it for the separate model-migration path.
-        return _scaffold_source(
+        return _scaffold_review(
             cls, None,
             "Microsoft Analysis Services is already a tabular/multidimensional semantic model; "
             "migrate the model directly (XMLA endpoint / semantic-model import), not as an M partition")
@@ -1169,7 +1230,7 @@ def emit_m_partition_source(relation, descriptor, mode):
         if cls in FLAT_FILE_CLASSES:
             flat = emit_flatfile_source(relation, conn, cls)
             if flat is not None:
-                return flat
+                return flat, None
         intended = PARTIAL_LIVE_CONNECTORS.get(cls) or FLAT_FILE_CLASSES.get(cls)
         if cls in PARTIAL_LIVE_CONNECTORS:
             detail = "recognized connector, but its navigation/identifiers aren't verified offline; complete manually"
@@ -1177,24 +1238,50 @@ def emit_m_partition_source(relation, descriptor, mode):
             detail = f"flat-file source; set the file path (and sheet/range) for the {intended} partition"
         else:
             detail = "connector class not mapped for direct M; route to land-to-Delta + DirectLake"
-        return _scaffold_source(cls, intended, detail)
+        return _scaffold_review(cls, intended, detail)
 
     connector, connect_style, nav_style = spec
 
     if relation["kind"] == "custom_sql":
-        if connect_style != "server_database":
-            return _scaffold_source(
-                cls, connector,
-                "custom SQL native query for this connector isn't auto-emitted; complete it manually")
         sql = escape_m_string(relation.get("sql", ""))
+        if connect_style == "server_database":
+            # SQL Server family: Value.NativeQuery folds against the database handle directly.
+            steps = [f'Source = {connector}(#"Server", #"Database")']
+            nq_target = "Source"
+        elif nav_style == "database_schema_table" and cls in NATIVE_QUERY_CATALOG_DRILL:
+            # Databricks (live-verified): the connector's ROOT collection rejects native queries
+            # ("Native queries aren't supported by this value"), so we MUST drill to a
+            # Kind="Database" handle first and fold the native query against THAT handle -- never
+            # against the Catalogs() root. The catalog comes from the relation's three-part name
+            # when present, else the connection's database; without it we can't drill, so scaffold.
+            database = relation.get("catalog") or conn.get("database")
+            if not database:
+                return _scaffold_review(
+                    cls, connector,
+                    "custom SQL needs the catalog/database for the native-query drill; "
+                    "not resolvable from this .tds")
+            steps = [
+                f'Source = {_connect_expr(connector, connect_style)}',
+                f'Catalog = Source{{[Name="{escape_m_string(database)}", Kind="Database"]}}[Data]',
+            ]
+            nq_target = "Catalog"
+        else:
+            return _scaffold_review(
+                cls, connector,
+                "custom SQL native query for this connector isn't verified; complete it manually")
         # EnableFolding lets DirectQuery push the native query down to the source.
-        return (
-            "let\n"
-            f'\t\t\t\tSource = {connector}(#"Server", #"Database"),\n'
-            f'\t\t\t\tResult = Value.NativeQuery(Source, "{sql}", null, [EnableFolding=true])\n'
-            "\t\t\tin\n"
-            "\t\t\t\tResult"
-        )
+        steps.append(
+            f'Result = Value.NativeQuery({nq_target}, "{sql}", null, [EnableFolding=true])')
+        prev = "Result"
+        # Align native-query output (raw remote headers) to each column's sourceColumn. No-ops
+        # (emits no step) when every remote name already equals its model name.
+        rename_pairs = _native_query_rename_pairs(relation)
+        if rename_pairs:
+            steps.append(f"Renamed = Table.RenameColumns({prev}, "
+                         f"{{{', '.join(rename_pairs)}}}, MissingField.Ignore)")
+            prev = "Renamed"
+        body = ",\n\t\t\t\t".join(steps)
+        return f"let\n\t\t\t\t{body}\n\t\t\tin\n\t\t\t\t{prev}", None
 
     source = _connect_expr(connector, connect_style)
 
@@ -1208,7 +1295,7 @@ def emit_m_partition_source(relation, descriptor, mode):
         schema = relation.get("schema")
         item = relation["item"]
         if not database or not schema:
-            return _scaffold_source(
+            return _scaffold_review(
                 cls, connector,
                 f"{connector} navigation needs the database/catalog + schema names; "
                 "not resolvable from this .tds")
@@ -1221,7 +1308,7 @@ def emit_m_partition_source(relation, descriptor, mode):
             f'\t\t\t\tData = Schema{{[Name="{it}", Kind="Table"]}}[Data]\n'
             "\t\t\tin\n"
             "\t\t\t\tData"
-        )
+        ), None
 
     if nav_style != "schema_item":
         raise ValueError(f"unhandled nav_style {nav_style!r} for connector {connector!r}")
@@ -1235,7 +1322,7 @@ def emit_m_partition_source(relation, descriptor, mode):
     catalog = relation.get("catalog")
     database = conn.get("database")
     if catalog and (not database or catalog.lower() != database.lower()):
-        return _scaffold_source(
+        return _scaffold_review(
             cls, connector,
             f"table is qualified to catalog '{catalog}' but the connection database is "
             f"'{database or '(none)'}'; cross-database references aren't auto-emitted for the "
@@ -1249,7 +1336,7 @@ def emit_m_partition_source(relation, descriptor, mode):
         f"\t\t\t\tData = {nav}\n"
         "\t\t\tin\n"
         "\t\t\t\tData"
-    )
+    ), None
 
 
 def emit_table_tmdl_m(relation, descriptor, mode):

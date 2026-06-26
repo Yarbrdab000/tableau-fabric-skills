@@ -32,6 +32,7 @@ try:  # package or scripts-on-path
         connection_details_for_bind,
         emit_connection_parameters,
         emit_table_tmdl_m,
+        m_partition_review_reason,
         extract_calcs,
         parse_tds,
         workbook_datasources,
@@ -67,6 +68,7 @@ except ImportError:
         connection_details_for_bind,
         emit_connection_parameters,
         emit_table_tmdl_m,
+        m_partition_review_reason,
         extract_calcs,
         parse_tds,
         workbook_datasources,
@@ -1544,6 +1546,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     parts = {}
     table_names = []
     skipped = []
+    stubbed_partitions = []
     for rel in tables:
         tmdl = emit_table_tmdl_m(rel, descriptor, mode)
         if tmdl is None:
@@ -1552,6 +1555,16 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         disp = _table_display(rel)
         table_names.append(disp)
         parts[f"definition/tables/{disp}.tmdl"] = tmdl
+        # Fail LOUD: a partition that emitted a needs-manual-completion scaffold (e.g. an
+        # unverified-connector custom SQL) is recorded here so it surfaces in the report instead
+        # of silently passing the build and only failing at deploy. The original SQL is carried so
+        # a reviewer can complete the M by hand.
+        stub_reason = m_partition_review_reason(rel, descriptor, mode)
+        if stub_reason:
+            entry = {"table": disp, "kind": "m_partition", "reason": stub_reason}
+            if rel.get("kind") == "custom_sql" and rel.get("sql"):
+                entry["sql"] = rel["sql"]
+            stubbed_partitions.append(entry)
 
     if not table_names:
         raise ValueError(
@@ -1697,6 +1710,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         "storage_decision": decision,
         "tables": [t for t in table_names if t != "_Measures"],
         "skipped_tables": skipped,
+        "partitions_needs_review": stubbed_partitions,
+        "partitions_stubbed": len(stubbed_partitions),
         "measures": measure_report,
         "calc_bindings": _calc_bindings_index(measure_report),
         "model_manifest": build_model_manifest(
