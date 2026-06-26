@@ -22,6 +22,8 @@ from test_connection_to_m import (
     FEDERATED_STAR,
     FEDERATED_REL_EDGECASE,
     DATABRICKS_CUSTOM_SQL,
+    DATABRICKS_CUSTOM_SQL_DOUBLED,
+    DATABRICKS_CUSTOM_SQL_PARAM,
     SNOWFLAKE_CUSTOM_SQL,
 )
 
@@ -908,6 +910,37 @@ def test_snowflake_custom_sql_is_flagged_needs_review():
     part = out["parts"]["definition/tables/Custom SQL Query.tmdl"]
     assert "Source = #table(type table [], {})" in part
     assert "Source = null" not in part
+
+
+def test_databricks_doubled_custom_sql_emits_clean_partition_and_report():
+    # Tableau's on-disk bracket doubling is reversed at the parse boundary, so neither the emitted
+    # M partition nor the SQL surfaced in the report carries '<<'/'>>'. No parameter -> no review.
+    out = migrate_tds_to_semantic_model(DATABRICKS_CUSTOM_SQL_DOUBLED, model_name="DbxSQL")
+    part = out["parts"]["definition/tables/Custom SQL Query.tmdl"]
+    assert "<<" not in part and ">>" not in part
+    assert "WHERE o.Profit < 0" in part
+    assert "Value.NativeQuery(Catalog, " in part
+    report = out["report"]
+    assert report["partitions_stubbed"] == 0
+    assert report["partitions_needs_review"] == []
+
+
+def test_databricks_custom_sql_parameter_is_flagged_needs_review():
+    # A recovered <Parameters.[Threshold]> token can't be translated yet: the partition still emits
+    # a real native query, but the datasource is flagged needs_review (additively) with the
+    # de-escaped SQL preserved -- not silently shipped to fail at refresh.
+    out = migrate_tds_to_semantic_model(DATABRICKS_CUSTOM_SQL_PARAM, model_name="DbxSQL")
+    report = out["report"]
+    assert report["partitions_stubbed"] == 1
+    entry = report["partitions_needs_review"][0]
+    assert entry["table"] == "Custom SQL Query"
+    assert entry["kind"] == "m_partition"
+    assert "<Parameters.[Threshold]>" in entry["reason"]
+    assert "<Parameters.[Threshold]>" in entry["sql"]      # de-escaped SQL carried for the reviewer
+    # the emitted partition is still a real native query (deploy-valid), not a scaffold
+    part = out["parts"]["definition/tables/Custom SQL Query.tmdl"]
+    assert "Value.NativeQuery(Catalog, " in part
+    assert "#table(type table [], {})" not in part
 
 
 

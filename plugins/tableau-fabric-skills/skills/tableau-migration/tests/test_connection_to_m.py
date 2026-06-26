@@ -4,6 +4,7 @@ import pytest
 from connection_to_m import (
     build_m_field_resolver,
     connection_details_for_bind,
+    custom_sql_parameter_refs,
     emit_connection_parameters,
     emit_m_partition_source,
     emit_table_tmdl_m,
@@ -11,6 +12,7 @@ from connection_to_m import (
     parse_tds,
     tableau_type_to_tmdl,
 )
+from connection_to_m import _deescape_custom_sql
 
 # -- fixtures (trimmed but structurally faithful .tds documents) ---------------
 LIVE_SQLSERVER = """<?xml version='1.0' encoding='utf-8' ?>
@@ -353,6 +355,73 @@ DATABRICKS_CUSTOM_SQL = """<?xml version='1.0' encoding='utf-8' ?>
       </metadata-record>
       <metadata-record class='column'>
         <remote-name>Country/Region</remote-name><local-name>[Country/Region]</local-name>
+        <parent-name>[Custom SQL Query]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Custom SQL Query]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+# Databricks custom SQL exactly as Tableau SERIALIZES it: every '<'/'>' in the query text is
+# doubled on save (a blind global substitution that also hits comments + string literals) and
+# halved back on read. Stored in a CDATA block (Tableau wraps the relation in CDATA whenever the
+# text contains angle brackets). The extractor must reverse the doubling so the emitted query is
+# the single-operator form the source can actually run.
+DATABRICKS_CUSTOM_SQL_DOUBLED = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='DbxSQL' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='dbx' name='databricks.a'>
+        <connection class='databricks' dbname='tableau_migration_databricks'
+                    server='adb-123.azuredatabricks.net'
+                    http-path='/sql/1.0/warehouses/240f0d0d01d9e8dd' />
+      </named-connection>
+    </named-connections>
+    <relation connection='databricks.a' name='Custom SQL Query' type='text'><![CDATA[SELECT o.`Order ID`, o.Sales, o.Profit
+FROM orders o
+-- keep rows where Profit << 0 or Sales >> 1000
+WHERE o.Profit << 0
+   OR o.Sales >> 1000
+   OR o.Quantity <<>> 1]]></relation>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Order ID</remote-name><local-name>[Order ID]</local-name>
+        <parent-name>[Custom SQL Query]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Custom SQL Query]</parent-name><local-type>real</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Profit</remote-name><local-name>[Profit]</local-name>
+        <parent-name>[Custom SQL Query]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+# Databricks custom SQL carrying a Tableau parameter reference. After de-escaping the brackets,
+# the <Parameters.[Threshold]> token survives -- it cannot yet be translated to a Power Query
+# parameter, so the partition is still emitted but must be flagged needs_review.
+DATABRICKS_CUSTOM_SQL_PARAM = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='DbxSQL' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='dbx' name='databricks.a'>
+        <connection class='databricks' dbname='tableau_migration_databricks'
+                    server='adb-123.azuredatabricks.net'
+                    http-path='/sql/1.0/warehouses/240f0d0d01d9e8dd' />
+      </named-connection>
+    </named-connections>
+    <relation connection='databricks.a' name='Custom SQL Query' type='text'><![CDATA[SELECT o.`Order ID`, o.Sales
+FROM orders o
+WHERE o.Sales >> <<Parameters.[Threshold]>>]]></relation>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Order ID</remote-name><local-name>[Order ID]</local-name>
         <parent-name>[Custom SQL Query]</parent-name><local-type>string</local-type>
       </metadata-record>
       <metadata-record class='column'>
@@ -1305,6 +1374,98 @@ def test_emit_sqlserver_custom_sql_golden_m_unchanged():
     assert body == expected
     assert "Table.RenameColumns" not in body               # no mismatched names -> no rename step
     assert m_partition_review_reason(d["relations"][0], d, "DirectQuery") is None
+
+
+# -- Custom SQL angle-bracket de-escape (Tableau doubles '<'/'>' on serialize) ---------
+def test_deescape_custom_sql_operator_matrix():
+    # The verified ground truth from controlled Databricks Superstore diagnostic saves: every
+    # source operator is stored with its angle brackets doubled and must halve back exactly.
+    assert _deescape_custom_sql("o.Profit << 0") == "o.Profit < 0"
+    assert _deescape_custom_sql("o.Profit >> 1000") == "o.Profit > 1000"
+    assert _deescape_custom_sql("o.Sales <<= 10") == "o.Sales <= 10"
+    assert _deescape_custom_sql("o.Sales >>= 5000") == "o.Sales >= 5000"
+    assert _deescape_custom_sql("o.Quantity <<>> 1") == "o.Quantity <> 1"
+
+
+def test_deescape_custom_sql_hits_comments_and_string_literals():
+    # The doubling is a blind global replace, so comments and string literals are affected too;
+    # halving them back is correct (it restores the literal/comment the author actually wrote).
+    assert _deescape_custom_sql("-- comment with << and >>") == "-- comment with < and >"
+    assert _deescape_custom_sql("LIKE '%<<%'") == "LIKE '%<%'"
+
+
+def test_deescape_custom_sql_reversible_for_genuine_multibracket():
+    # A genuine source '<<tag>>' is stored '<<<<tag>>>>' and round-trips under a single halve;
+    # a genuine Spark bitwise shift 'flags >> 2' is stored 'flags >>>> 2' and recovers exactly.
+    assert _deescape_custom_sql("'<<<<tag>>>>'") == "'<<tag>>'"
+    assert _deescape_custom_sql("flags >>>> 2") == "flags >> 2"
+
+
+def test_deescape_custom_sql_is_not_idempotent():
+    # Documents the single-call discipline: the parse boundary is the ONLY place this runs. A
+    # second application would wrongly collapse a recovered genuine double.
+    once = _deescape_custom_sql("flags >>>> 2")
+    assert once == "flags >> 2"
+    assert _deescape_custom_sql(once) == "flags > 2"        # the hazard a double-call would cause
+
+
+def test_deescape_custom_sql_preserves_parameter_tokens():
+    # A Tableau parameter reference is masked before the halve and restored to canonical single
+    # brackets, regardless of how its own delimiters were stored, and even when a doubled operator
+    # sits adjacent to it.
+    assert (_deescape_custom_sql("WHERE Region = <<Parameters.[Region]>>")
+            == "WHERE Region = <Parameters.[Region]>")
+    assert (_deescape_custom_sql("WHERE Sales << <<Parameters.[T]>>")
+            == "WHERE Sales < <Parameters.[T]>")
+    assert custom_sql_parameter_refs("a <Parameters.[X]> and <Parameters.[X]>") == ["<Parameters.[X]>"]
+
+
+def test_parse_tds_deescapes_custom_sql_at_the_boundary():
+    # End-to-end: the descriptor's sql is already de-escaped, so NO downstream stage ever sees a
+    # doubled operator. This is the actual reported bug (operators arrived doubled into the model).
+    d = parse_tds(DATABRICKS_CUSTOM_SQL_DOUBLED)
+    rel = d["relations"][0]
+    assert rel["kind"] == "custom_sql"
+    assert "<<" not in rel["sql"] and ">>" not in rel["sql"]
+    assert "WHERE o.Profit < 0" in rel["sql"]
+    assert "OR o.Sales > 1000" in rel["sql"]
+    assert "OR o.Quantity <> 1" in rel["sql"]
+
+
+def test_emit_databricks_doubled_custom_sql_emits_clean_native_query():
+    # The emitted Databricks native query must carry the single-operator form and stay deploy-ready
+    # (catalog drill + folding), with no review flag (no parameters here).
+    d = parse_tds(DATABRICKS_CUSTOM_SQL_DOUBLED)
+    rel = d["relations"][0]
+    body = emit_m_partition_source(rel, d, "DirectQuery")
+    assert "<<" not in body and ">>" not in body
+    assert "Value.NativeQuery(Catalog, " in body
+    assert "[EnableFolding=true]" in body
+    assert m_partition_review_reason(rel, d, "DirectQuery") is None
+
+
+def test_emit_databricks_custom_sql_flags_surviving_parameter():
+    # A recovered <Parameters.[Name]> token can't be translated yet, so the partition is still
+    # emitted (deploy-valid) but flagged needs_review with the token named.
+    d = parse_tds(DATABRICKS_CUSTOM_SQL_PARAM)
+    rel = d["relations"][0]
+    assert "<Parameters.[Threshold]>" in rel["sql"]
+    body = emit_m_partition_source(rel, d, "DirectQuery")
+    assert "TODO" not in body                                # real query is emitted, not a scaffold
+    assert "Value.NativeQuery(Catalog, " in body
+    reason = m_partition_review_reason(rel, d, "DirectQuery")
+    assert reason and "<Parameters.[Threshold]>" in reason
+    assert "parameter" in reason.lower()
+
+
+def test_deescape_is_noop_on_already_correct_sql():
+    # SQL with no doubled brackets (the common case for non-Databricks / equality-join custom SQL)
+    # must pass through byte-for-byte: the existing SQL Server golden query is unchanged, and an
+    # already-single-operator query is untouched.
+    d = parse_tds(CUSTOM_SQL)
+    assert _deescape_custom_sql(d["relations"][0]["sql"]) == d["relations"][0]["sql"]
+    assert _deescape_custom_sql("SELECT * FROM t WHERE a = 1 AND b <> 2") == \
+        "SELECT * FROM t WHERE a = 1 AND b <> 2"
 
 
 # -- federated three-part-name collections (Tableau 2023+ object model) ---------
