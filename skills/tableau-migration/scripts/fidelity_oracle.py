@@ -608,6 +608,12 @@ def _is_continuous_date_dim(field):
     return bool(field.get("continuous")) and (field.get("deriv") or "") in _DATE_TRUNC_DERIVS
 
 
+def _distinct_measure_count(measures):
+    """Count distinct measures on a worksheet by normalized name (a Measure Names/Values layout
+    lists each measure once); used to tell a single-value card from a multi-measure table."""
+    return len({(m.get("norm") or "") for m in (measures or []) if isinstance(m, dict)})
+
+
 def _infer_twb_family(mark, dims, measures, has_geometry, uses_measure_values):
     """Second-opinion chart-family classifier for a Tableau worksheet.
 
@@ -624,10 +630,12 @@ def _infer_twb_family(mark, dims, measures, has_geometry, uses_measure_values):
         return (FAM_MATRIX, True) if dims else (FAM_UNKNOWN, False)
     if mlow in _MARK_FAMILY and mlow != "automatic":
         fam = _MARK_FAMILY[mlow]
-        # A Text mark with no dimensions is a card, not a table.
-        if fam == FAM_TABLE and not dims and not uses_measure_values:
-            return FAM_CARD, True
-        if fam == FAM_TABLE and uses_measure_values and not dims:
+        # A dimensionless Text mark is a card -- UNLESS it lays out Measure Names + multiple Measure
+        # Values, which is a measures TABLE (its faithful rebuild is a Power BI table/tableEx, not a
+        # multiRowCard); a single dimensionless value stays a card.
+        if fam == FAM_TABLE and not dims:
+            if uses_measure_values and _distinct_measure_count(measures) >= 2:
+                return FAM_TABLE, True
             return FAM_CARD, True
         return fam, True
     # Automatic: infer from shelf shape (Tableau's own default heuristic, applied conservatively).
@@ -636,6 +644,9 @@ def _infer_twb_family(mark, dims, measures, has_geometry, uses_measure_values):
     if any(_is_continuous_date_dim(d) for d in dims) and (measures or len(dims) == 1):
         return FAM_LINE, True
     if uses_measure_values and not dims:
+        # Measure Names + multiple Measure Values is a measures TABLE; a single value is a card.
+        if _distinct_measure_count(measures) >= 2:
+            return FAM_TABLE, True
         return FAM_CARD, True
     if not dims and measures:
         return FAM_CARD, True
@@ -893,6 +904,106 @@ def _field_norms(fields):
     return {f["norm"] for f in fields if f.get("norm")}
 
 
+# Standard geographic drill hierarchy (coarse -> fine), by normalized field name. A filled/choropleth
+# map geocodes its finest level *within* its ancestors, and Tableau auto-adds the whole hierarchy to
+# the Marks "Detail" (lod) card -- so a coarser geo ancestor sitting only on detail is implied by the
+# geocoding of the finer level, not an independent visual encoding the rebuild must reproduce. This is
+# the general geographic-role principle; "region" alone is excluded because Tableau's Superstore
+# "Region" (Central/East/West/South) is a categorical group, not a geocoded map level.
+_GEO_LEVEL_RANK = {
+    "country": 0, "countryregion": 0, "nation": 0,
+    "state": 1, "stateprovince": 1, "province": 1,
+    "county": 2,
+    "city": 3,
+    "postalcode": 4, "zipcode": 4, "zippostalcode": 4,
+}
+
+# Marks channels that merely carry a geocoding-implied geo ancestor (vs an independent encoding such
+# as color/size/label/path or a rows/cols axis, which would make a coarser level a real binding).
+_GEO_IMPLIED_CHANNELS = frozenset({"lod", "detail"})
+
+
+def _geo_rank(norm):
+    """Return a field's geographic-drill rank (smaller = coarser), or None if it is not a geo level."""
+    return _GEO_LEVEL_RANK.get(norm)
+
+
+def _suppressed_geo_ancestors(twb_ws, pbir_visual):
+    """Source geo dims that a faithful map rebuild does NOT need to project independently.
+
+    For a geographic map worksheet, if the rebuilt visual binds a source geo level (e.g.
+    State/Province), any *coarser* same-hierarchy ancestor (e.g. Country/Region) that the Tableau
+    sheet carries only on the Marks detail/lod card is satisfied by geocoding the finer level -- so
+    it must not be charged as a "missing" field. Map-gated (``has_geometry``), detail-only, and tied
+    to a finest level that is itself a bound source geo dim, so it cannot mask a genuine grain
+    mismatch or touch any non-map visual.
+    """
+    if not twb_ws.get("has_geometry"):
+        return set()
+    tgt = _field_norms(pbir_visual.get("fields") or [])
+    # Finest source geo level that the rebuild actually bound (rank; larger = finer).
+    bound_src_ranks = [r for f in twb_ws.get("dims") or []
+                       for r in (_geo_rank(f.get("norm")),)
+                       if r is not None and f.get("norm") in tgt]
+    if not bound_src_ranks:
+        return set()
+    finest_bound = max(bound_src_ranks)
+    suppressed = set()
+    for f in twb_ws.get("dims") or []:
+        norm = f.get("norm")
+        rank = _geo_rank(norm)
+        if rank is None or rank >= finest_bound or norm in tgt:
+            continue
+        if (f.get("channel") or "").lower() in _GEO_IMPLIED_CHANNELS:
+            suppressed.add(norm)
+    return suppressed
+
+
+def _date_implied_sources(twb_ws, pbir_visual, relationships):
+    """Source date axes a faithful rebuild satisfies via an ACTIVE model date relationship.
+
+    When a Tableau worksheet carries a continuous date-truncation axis (e.g. ``Order Date``) that the
+    rebuilt visual does NOT bind by name, but the visual instead binds a related ``Date`` dimension
+    table, credit the source date field as reproduced IFF an **ACTIVE** relationship runs from that
+    exact source date column to the Date table the visual binds. This is the documented Power BI star
+    pattern -- the engine rebinds the continuous order-date axis onto a proper ``Date`` dimension
+    whose ACTIVE relationship (``Orders.Order_Date -> Date.Date``) makes it display identical values
+    to Tableau's "Order Date" axis.
+
+    Honesty gate (mirrors the geo-implied principle, but on live directional relationship evidence):
+    an axis backed only by an **INACTIVE** relationship (e.g. a secondary ``Ship_Date`` role-playing
+    rel ``isActive: false``) or by an UNRELATED date table is NOT credited -- the source date field
+    correctly stays a missing binding, so a real grain/field gap is never masked. Returns ``set()``
+    whenever no relationships are supplied, so the default (relationship-blind) scoring is unchanged.
+    """
+    if not relationships:
+        return set()
+    fields = pbir_visual.get("fields") or []
+    tgt = _field_norms(fields)
+    # Tables the rebuilt visual binds as a (non-measure) dimension axis, by normalized entity name.
+    bound_dim_entities = {
+        _norm(f.get("entity")) for f in fields
+        if not f.get("is_measure") and f.get("entity")
+    }
+    if not bound_dim_entities:
+        return set()
+    active_rels = [r for r in relationships
+                   if r.get("active") and r.get("from_norm") and r.get("to_table_norm")]
+    if not active_rels:
+        return set()
+    credited = set()
+    for f in twb_ws.get("dims") or []:
+        norm = f.get("norm")
+        # Only a source DATE-truncation axis the rebuild did not bind by name is a candidate.
+        if not norm or norm in tgt or (f.get("deriv") or "") not in _DATE_TRUNC_DERIVS:
+            continue
+        for r in active_rels:
+            if r["from_norm"] == norm and r["to_table_norm"] in bound_dim_entities:
+                credited.add(norm)
+                break
+    return credited
+
+
 def _type_score(twb_ws, pbir_visual):
     src = twb_ws["family"]
     tgt = pbir_visual["family"]
@@ -984,12 +1095,28 @@ def _placement_delta(zone, pbir_visual, canvas_w, canvas_h):
     }
 
 
-def _score_pair(twb_ws, pbir_visual, zone, canvas_w=None, canvas_h=None):
+def _score_pair(twb_ws, pbir_visual, zone, canvas_w=None, canvas_h=None, relationships=None):
     type_s, type_note = _type_score(twb_ws, pbir_visual)
-    src_fields = _field_norms(twb_ws["fields"])
+    # On a geographic map, a coarser geo ancestor carried only on Marks detail is implied by
+    # geocoding the finer bound level (see _suppressed_geo_ancestors) -- drop it from the scored
+    # source set so a faithful map is not charged for "omitting" Country/Region above State/Province.
+    geo_implied = _suppressed_geo_ancestors(twb_ws, pbir_visual)
+    # A continuous date axis the rebuild rebinds onto a related Date dimension is reproduced when an
+    # ACTIVE model relationship runs from the source date column to that Date table (see
+    # _date_implied_sources) -- drop it from the scored source set so a faithful star-schema date
+    # rebind is not charged as a "missing" Order Date. Inactive/unrelated rels are NOT credited.
+    date_implied = _date_implied_sources(twb_ws, pbir_visual, relationships)
+    suppressed = geo_implied | date_implied
+    if suppressed:
+        scored_ws = dict(twb_ws)
+        scored_ws["fields"] = [f for f in twb_ws["fields"] if f.get("norm") not in suppressed]
+        scored_ws["dims"] = [f for f in twb_ws["dims"] if f.get("norm") not in suppressed]
+    else:
+        scored_ws = twb_ws
+    src_fields = _field_norms(scored_ws["fields"])
     tgt_fields = _field_norms(pbir_visual["fields"])
     field_s = _jaccard(src_fields, tgt_fields)
-    roles_s = _roles_score(twb_ws, pbir_visual)
+    roles_s = _roles_score(scored_ws, pbir_visual)
     pos_s = _position_score(zone, pbir_visual)
 
     weights = {"type": W_TYPE, "fields": W_FIELDS, "roles": W_ROLES}
@@ -1025,6 +1152,12 @@ def _score_pair(twb_ws, pbir_visual, zone, canvas_w=None, canvas_h=None):
         "fields_missing": missing,   # in Tableau source, absent from rebuilt visual
         "fields_extra": extra,       # in rebuilt visual, absent from Tableau source
     }
+    if geo_implied:
+        # Coarser geo ancestors satisfied by geocoding the finer bound level (not counted missing).
+        result["geo_implied"] = sorted(geo_implied)
+    if date_implied:
+        # Source date axes reproduced via an ACTIVE model relationship onto a related Date dimension.
+        result["date_implied"] = sorted(date_implied)
     placement = _placement_delta(zone, pbir_visual, canvas_w, canvas_h)
     if placement is not None:
         result["placement"] = placement
@@ -1134,7 +1267,7 @@ def _apply_field_aliases(pbir, field_aliases):
     return remapped
 
 
-def score_report(twb, pbir, engine_report=None, field_aliases=None):
+def score_report(twb, pbir, engine_report=None, field_aliases=None, relationships=None):
     """Score a parsed Tableau workbook against a parsed PBIR report. Both come from the readers above.
 
     Pairs each Tableau dashboard to the PBIR page sharing its display name, greedily matches that
@@ -1145,6 +1278,11 @@ def score_report(twb, pbir, engine_report=None, field_aliases=None):
     ``field_aliases`` (optional ``{emitted queryRef -> Tableau caption}``, e.g. from
     ``aliases_from_candidate_records``) lets the field/role components see through a faithful
     star-schema rename before name overlap is computed. Omitting it leaves scoring exactly as-is.
+
+    ``relationships`` (optional, from ``_parse_tmdl_relationships``) supplies the emitted model's
+    ACTIVE/inactive relationship edges so a continuous date axis rebound onto a related ``Date``
+    dimension can be credited as reproducing its source date field (see ``_date_implied_sources``).
+    Omitting it (the default) leaves scoring relationship-blind and therefore exactly as-is.
     """
     alias_resolved = _apply_field_aliases(pbir, field_aliases) if field_aliases else 0
     ws_by_name = twb["worksheets"]
@@ -1174,7 +1312,8 @@ def score_report(twb, pbir, engine_report=None, field_aliases=None):
             ws = ws_by_name[wsn]
             v = vidx[vn]
             zone = zone_by_ws.get(wsn)
-            res = _score_pair(ws, v, zone, page.get("width"), page.get("height"))
+            res = _score_pair(ws, v, zone, page.get("width"), page.get("height"),
+                              relationships=relationships)
             res["page"] = page["display"]
             res["dashboard"] = dash["name"]
             res["engine_intent"] = engine_intent.get(wsn)
@@ -1212,7 +1351,7 @@ def score_report(twb, pbir, engine_report=None, field_aliases=None):
                 best = (sim, p, v)
         if best and best[0] > 0.0:
             _sim, p, v = best
-            res = _score_pair(ws, v, None)
+            res = _score_pair(ws, v, None, relationships=relationships)
             res["page"] = p["display"]
             res["dashboard"] = None
             res["engine_intent"] = engine_intent.get(wsn)
@@ -2975,6 +3114,88 @@ def _parse_tmdl_model(definition_dir):
     return model
 
 
+def _split_tmdl_colref(ref):
+    """Split a TMDL column reference into ``(table, column)``.
+
+    Handles bare ``Orders.Order_Date`` as well as single-quoted object names on either side
+    (``'Date Dim'.Date`` / ``Orders.'Order Date'``), including a dotted name inside the quotes.
+    Returns ``(None, None)`` for an empty/garbage reference.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return None, None
+    if ref.startswith("'"):
+        end = ref.find("'", 1)
+        if end == -1:
+            return _tmdl_unquote(ref), None
+        table = ref[1:end].replace("''", "'")
+        rest = ref[end + 1:].lstrip()
+        if rest.startswith("."):
+            rest = rest[1:].strip()
+        return table, (_tmdl_unquote(rest) if rest else None)
+    if "." in ref:
+        table, col = ref.split(".", 1)
+        return _tmdl_unquote(table), _tmdl_unquote(col)
+    return _tmdl_unquote(ref), None
+
+
+def _parse_tmdl_relationships(definition_dir):
+    """Parse ``definition/relationships.tmdl`` into a list of normalized relationship records.
+
+    Each record is ``{from_table, from_col, from_norm, to_table, to_table_norm, to_col, to_norm,
+    active, date_behavior}``. ``active`` defaults to ``True`` -- a TMDL relationship is active unless
+    it declares ``isActive: false`` -- which is exactly the directional/active evidence the date-axis
+    credit (see ``_date_implied_sources``) gates on. Stdlib-only, own line reader; never raises -- a
+    missing or unreadable file yields ``[]`` so scoring degrades to relationship-blind.
+    """
+    if not definition_dir:
+        return []
+    path = os.path.join(definition_dir, "relationships.tmdl")
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            lines = fh.read().replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    except OSError:
+        return []
+    rels = []
+    cur = None
+
+    def _flush(rec):
+        if rec and rec.get("from_col") and rec.get("to_col"):
+            rels.append(rec)
+
+    for raw in lines:
+        content = raw.strip()
+        if not content:
+            continue
+        if content.startswith("relationship "):
+            _flush(cur)
+            cur = {"active": True, "date_behavior": None,
+                   "from_table": None, "from_col": None, "from_norm": None,
+                   "to_table": None, "to_table_norm": None, "to_col": None, "to_norm": None}
+            continue
+        if cur is None or ":" not in content:
+            continue
+        key, val = content.split(":", 1)
+        key = key.strip().lower()
+        val = val.strip()
+        if key == "isactive":
+            cur["active"] = val.lower() not in ("false", "0", "no")
+        elif key == "joinondatebehavior":
+            cur["date_behavior"] = val or None
+        elif key == "fromcolumn":
+            t, c = _split_tmdl_colref(val)
+            cur["from_table"], cur["from_col"], cur["from_norm"] = t, c, (_norm(c) if c else None)
+        elif key == "tocolumn":
+            t, c = _split_tmdl_colref(val)
+            cur["to_table"], cur["to_col"] = t, c
+            cur["to_table_norm"] = _norm(t) if t else None
+            cur["to_norm"] = _norm(c) if c else None
+    _flush(cur)
+    return rels
+
+
 def _parse_tmdl_table_lines(lines, model):
     """Stateful single pass over one TMDL file's lines, folding tables into ``model``."""
     cur = None            # current table record
@@ -3818,7 +4039,13 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
         engine_report = _read_json(engine_report_path)
     if field_aliases is None and candidate_records_path and os.path.isfile(candidate_records_path):
         field_aliases = _load_field_aliases(candidate_records_path)
-    report = score_report(twb, pbir, engine_report=engine_report, field_aliases=field_aliases)
+    # Resolve the emitted model's relationships (ACTIVE/inactive edges) so a faithful star-schema
+    # date rebind onto a related Date dimension can be credited (see _date_implied_sources). Absent a
+    # *.SemanticModel near report_dir this is [], leaving scoring relationship-blind (unchanged).
+    _defn_dir = _resolve_model_definition(report_dir=report_dir)
+    relationships = _parse_tmdl_relationships(_defn_dir) if _defn_dir else []
+    report = score_report(twb, pbir, engine_report=engine_report, field_aliases=field_aliases,
+                          relationships=relationships)
     report["inputs"] = {
         "twb": os.path.abspath(twb_path),
         "report_dir": os.path.abspath(report_dir),

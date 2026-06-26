@@ -2234,3 +2234,47 @@ def test_rebuild_from_published_match_threads_parameters(monkeypatch):
     params = captured.get("parameters")
     assert isinstance(params, list)
     assert any(p.get("caption") == "Date Selection" for p in params)
+
+
+def test_rebuild_from_published_match_threads_flatfile_path(monkeypatch):
+    # A .twbx connected to a published EXTRACT backed by a flat file bundles no data itself -- the
+    # Excel lives in the sibling .tdsx the estate already migrated. That datasource's catalog entry
+    # carries the ABSOLUTE path of the extracted Excel; the workbook rebuild MUST reuse it, or the
+    # workbook .pbip emits a relative File.Contents path that Power BI Desktop opens with NO data.
+    # This is the regression lock for "a flat-file workbook must open AND load."
+    captured = {}
+
+    def _fake_migrate(text, **kw):
+        captured.update(kw)
+        return {"report": {"fallback": False}}
+
+    monkeypatch.setattr(me, "migrate_datasource", _fake_migrate)
+    twb = ("<workbook><datasources><datasource name='ds' caption='Superstore - Extract'>"
+           "</datasource></datasources></workbook>")
+    detail = {"binding_signal": {"kind": "published", "published_ds_name": "Superstore - Extract"}}
+    abs_xlsx = r"C:\out\data\Superstore_-_Extract\Sample - Superstore.xlsx"
+    catalog = {me._norm_ds("Superstore - Extract"):
+               {"text": "<datasource/>", "name": "Superstore - Extract", "flatfile_path": abs_xlsx}}
+
+    res = me._rebuild_from_published_match(detail, twb, "Model", catalog)
+    assert res is not None
+    assert captured.get("flatfile_path") == abs_xlsx     # reuses the sibling's extracted Excel
+
+
+def test_rebuild_from_published_match_flatfile_path_none_when_catalog_lacks_it(monkeypatch):
+    # A published live-DB match (no bundled flat file) has no flatfile_path in its catalog entry ->
+    # the rebuild threads None and the connection-string path is left exactly as before (untouched).
+    captured = {}
+
+    def _fake_migrate(text, **kw):
+        captured.update(kw)
+        return {"report": {"fallback": False}}
+
+    monkeypatch.setattr(me, "migrate_datasource", _fake_migrate)
+    twb = "<workbook><datasources><datasource name='ds' caption='Sales DS'/></datasources></workbook>"
+    detail = {"binding_signal": {"kind": "published", "published_ds_name": "Sales DS"}}
+    catalog = {me._norm_ds("Sales DS"): {"text": "<datasource/>", "name": "Sales DS"}}
+
+    res = me._rebuild_from_published_match(detail, twb, "Model", catalog)
+    assert res is not None
+    assert captured.get("flatfile_path") is None

@@ -120,7 +120,41 @@ def tableau_default_format_to_pbi(code):
         return "0%"
     return None
 
-def generate_column_tmdl(col_name, tmdl_type, summarize, is_hidden, format_string=None):
+# Power BI geographic data categories keyed by the Tableau geo-role area token (the first bracketed
+# token of a column's ``semantic-role``, e.g. ``[State].[Name]`` -> ``state``). Only areas with a
+# faithful Power BI data category are listed; any other geo area (Area Code, CBSA, Congressional
+# District, ...) maps to None so the column simply carries NO dataCategory rather than a guessed one.
+# Setting the category lets Power BI's map visuals geocode the column unambiguously (e.g. a filledMap
+# of states renders reliably instead of mis-resolving "Washington" the city vs the state).
+_GEO_ROLE_DATA_CATEGORY = {
+    "country": "Country", "country/region": "Country",
+    "state": "StateOrProvince", "state/province": "StateOrProvince", "province": "StateOrProvince",
+    "county": "County",
+    "city": "City",
+    "zipcode": "PostalCode", "zip code": "PostalCode",
+    "postalcode": "PostalCode", "postal code": "PostalCode", "postcode": "PostalCode",
+}
+_GEO_ROLE_TOKEN_RE = re.compile(r"\[([^\]]+)\]")
+
+
+def tableau_geo_role_to_data_category(semantic_role):
+    """Map a Tableau geographic ``semantic-role`` to a Power BI column ``dataCategory``, or None.
+
+    Tableau tags a geographic column with ``semantic-role='[State].[Name]'`` /
+    ``[Country].[ISO3166_2]`` / ``[City].[Name]`` etc.; the area is the first bracketed token. Only
+    areas with a faithful Power BI data category are mapped (Country / StateOrProvince / County /
+    City / PostalCode); the generated Latitude/Longitude point roles and any unmapped area return
+    None, so the column keeps no dataCategory rather than a guessed one (never a regression).
+    """
+    if not semantic_role:
+        return None
+    m = _GEO_ROLE_TOKEN_RE.match(semantic_role.strip())
+    if not m:
+        return None
+    return _GEO_ROLE_DATA_CATEGORY.get(m.group(1).strip().lower())
+
+def generate_column_tmdl(col_name, tmdl_type, summarize, is_hidden, format_string=None,
+                         data_category=None):
     """One column. col_name is the ACTUAL Delta column name (sourceColumn must match).
 
     ``format_string`` is an OPTIONAL explicit Power BI formatString (e.g. decoded from a
@@ -129,6 +163,11 @@ def generate_column_tmdl(col_name, tmdl_type, summarize, is_hidden, format_strin
     currency / percent / precision survives; when None the column keeps the type-derived
     floor, so the emitted TMDL is byte-for-byte unchanged from before this parameter
     existed (additive, never a regression).
+
+    ``data_category`` is an OPTIONAL Power BI geographic ``dataCategory`` (e.g. ``StateOrProvince``,
+    decoded from a Tableau geo ``semantic-role`` via ``tableau_geo_role_to_data_category``). When
+    truthy a ``dataCategory:`` line is emitted so map visuals geocode the column unambiguously; when
+    None the line is absent and the TMDL is byte-for-byte unchanged (additive, never a regression).
     """
     lines = [f"\tcolumn {q(col_name)}", f"\t\tdataType: {tmdl_type}"]
     if is_hidden:
@@ -140,6 +179,8 @@ def generate_column_tmdl(col_name, tmdl_type, summarize, is_hidden, format_strin
     lines.append(f"\t\tsourceLineageTag: {col_name}")
     lines.append(f"\t\tsummarizeBy: {summarize}")
     lines.append(f"\t\tsourceColumn: {col_name}")
+    if data_category:
+        lines.append(f"\t\tdataCategory: {data_category}")
     lines.append("")
     lines.append("\t\tannotation SummarizationSetBy = Automatic")
     return "\n" + "\n".join(lines) + "\n"

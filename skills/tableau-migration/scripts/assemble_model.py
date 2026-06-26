@@ -32,6 +32,7 @@ try:  # package or scripts-on-path
         connection_details_for_bind,
         emit_connection_parameters,
         emit_table_tmdl_m,
+        extract_bundled_flatfile,
         extract_calcs,
         parse_tds,
         workbook_datasources,
@@ -67,6 +68,7 @@ except ImportError:
         connection_details_for_bind,
         emit_connection_parameters,
         emit_table_tmdl_m,
+        extract_bundled_flatfile,
         extract_calcs,
         parse_tds,
         workbook_datasources,
@@ -938,13 +940,15 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
     doesn't introduce ambiguous snowflake paths. For each eligible table the primary date column
     gets an ACTIVE relationship and any others are inactive (role-playing, via USERELATIONSHIP).
 
-    For an **Import** model the date relationships carry ``joinOnDateBehavior: datePartOnly`` so a
-    timestamp's time component can't silently drop rows against the midnight calendar key. For a
-    **DirectQuery** (``mode == 'DirectQuery'``) model that behavior is ILLEGAL -- Power BI rejects a
-    DirectQuery table that participates in a datePartOnly (datetime-to-date) relationship ("...must
-    have its query mode set to Import") -- so the relationships are emitted as plain dateTime joins
-    instead (both endpoints are already dateTime; a source DATE lands at midnight and matches the
-    midnight calendar key exactly). A report warning flags the exact-join caveat.
+    Every date relationship is a plain exact ``dateTime``-to-``dateTime`` join with NO
+    ``joinOnDateBehavior``. The generated Date table is a CALCULATED table (CALENDARAUTO/CALENDAR),
+    and Power BI Desktop silently DROPS a ``datePartOnly`` relationship that involves a calculated
+    table when the ``.pbip`` is opened -- the relationship disappears and any time series collapses to
+    a single aggregated value (the "flat line"). Because both endpoints are ``dateTime`` an exact join
+    is valid, and a source DATE (stored at midnight) matches the midnight calendar key exactly. On a
+    **DirectQuery** (``mode == 'DirectQuery'``) model ``datePartOnly`` is independently ILLEGAL --
+    Power BI rejects a DirectQuery table in a datePartOnly (datetime-to-date) relationship ("...must
+    have its query mode set to Import") -- and a report warning flags the exact-join caveat there.
 
     The calendar source also differs by mode: Import uses ``CALENDARAUTO()`` (the model holds the
     data, so its date-column scan works at refresh); DirectQuery uses a self-contained fixed-range
@@ -995,10 +999,12 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
                 "to_table": date_name, "to_col": "Date",
                 "is_active": active,
             }
-            # datePartOnly (a datetime-to-date join) is illegal on a DirectQuery table; relate on the
-            # full dateTime there instead (see this function's docstring).
-            if not is_directquery:
-                rel["join_on_date_behavior"] = "datePartOnly"
+            # No joinOnDateBehavior -- every date relationship is a plain exact dateTime join. The
+            # generated Date table is a CALCULATED table (CALENDARAUTO/CALENDAR), and Power BI Desktop
+            # silently DROPS a datePartOnly relationship that involves a calculated table on .pbip open
+            # (the relationship vanishes and the time series flattens). Both endpoints are dateTime so
+            # an exact join is valid; a source DATE at midnight matches the midnight calendar key
+            # exactly. (datePartOnly is independently illegal on a DirectQuery table.)
             rels.append(rel)
             details.append({"table": disp, "column": col, "active": active})
 
@@ -2339,7 +2345,7 @@ def _resolve_local_csv_paths(local_data, *, source, model_name, write_to):
 
 def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, datasource=None,
                        calcs=None, dim_calcs=None, approved_calc_dax=None, date_range=None,
-                       local_data=None, **kwargs):
+                       local_data=None, packaged_source=None, flatfile_dest_dir=None, **kwargs):
     """**One call** from a downloaded datasource to everything needed to land it in Fabric.
 
     ``source`` may be a path to a ``.tdsx``/``.tds``/``.twbx``/``.twb``, raw bytes, or XML text.
@@ -2430,6 +2436,20 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
                                 write_to=write_to)
     else:
         _split_auto_calcs()
+        # Flat-file Import (Excel/CSV bundled inside a .tdsx/.twbx): lift the embedded data file out
+        # to an ABSOLUTE path so the emitted M's File.Contents loads in Power BI Desktop -- a relative
+        # path opens but loads nothing. ``packaged_source`` is the original zip when ``source`` is XML
+        # text (the workbook path passes the .twbx); ``flatfile_dest_dir`` lets that caller choose
+        # where the data lands (else it lands beside the written model). Only fires when the caller
+        # didn't already pass flatfile_path. A live DB source carries no flatfile_filename -> no-op,
+        # so Snowflake/Databricks/SQL Server connection strings are left untouched.
+        import os as _os
+        _ff_dest = flatfile_dest_dir or (
+            _os.path.join(write_to, f"{model_name}.Data") if write_to else None)
+        if _ff_dest and not kwargs.get("flatfile_path") and descriptor.get("flatfile_filename"):
+            _ff = extract_bundled_flatfile(packaged_source or source, descriptor, _ff_dest)
+            if _ff:
+                kwargs["flatfile_path"] = _ff
         result = migrate_tds_to_semantic_model(
             tds_text, model_name=model_name, calcs=calcs, dim_calcs=dim_calcs, select=datasource,
             approved_calc_dax=approved_calc_dax, date_range=date_range, **kwargs)
