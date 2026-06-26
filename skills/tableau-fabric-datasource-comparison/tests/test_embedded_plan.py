@@ -1,9 +1,11 @@
 """Tests for ``embedded_plan.py`` -- the rebind-plan emitter (schema_version "1.0")."""
 import csv
+import json
 
 import embedded_cluster as ec
 import embedded_score as es
 import embedded_plan as ep
+import pytest
 
 
 SUPER_FIELDS = ["OrderId", "NetSales", "GrossProfit", "ShipRegion", "ProductCategory"]
@@ -240,6 +242,65 @@ def test_generate_plan_matches_manual_chain():
     manual = ep.build_rebind_plan(rows, clusters, scored)
     auto = ep.generate_plan(rows, fabric=fabric)
     assert auto["plan"] == manual["plan"]
+
+
+# ----- schema validation / fail-loud parsing ----------------------------------------------
+def test_validate_rebind_plan_accepts_generated_payload():
+    rows = [_embedded("w1", "Superstore", SUPER_FIELDS, ["Orders"])]
+    plan = _plan(rows)
+    assert ep.validate_rebind_plan(plan) is plan
+
+
+def test_validate_rebind_plan_rejects_missing_required_field():
+    rows = [_embedded("w1", "Superstore", SUPER_FIELDS, ["Orders"])]
+    plan = _plan(rows)
+    del plan["plan"][0]["binding_target"]
+    with pytest.raises(ep.RebindPlanSchemaError, match=r"plan\[0\]\.binding_target"):
+        ep.validate_rebind_plan(plan)
+
+
+def test_validate_rebind_plan_rejects_wrong_type():
+    rows = [_embedded("w1", "Superstore", SUPER_FIELDS, ["Orders"])]
+    plan = _plan(rows)
+    plan["plan"][0]["caveats"] = "not-a-list"
+    with pytest.raises(ep.RebindPlanSchemaError, match=r"plan\[0\]\.caveats"):
+        ep.validate_rebind_plan(plan)
+
+
+def test_validate_rebind_plan_rejects_binding_status_kind_mismatch():
+    rows = [_embedded("w1", "Superstore", SUPER_FIELDS, ["Orders"])]
+    fabric = [_fabric("Superstore", SUPER_FIELDS, ["Orders"], fid="m-1", wsid="w-1")]
+    plan = _plan(rows, fabric=fabric)
+    plan["plan"][0]["binding_target"]["kind"] = "byPath"  # should be byConnection
+    with pytest.raises(ep.RebindPlanSchemaError, match=r"binding_target\.kind"):
+        ep.validate_rebind_plan(plan)
+
+
+def test_validate_rebind_plan_rejects_bad_drift_shape():
+    rows = [_embedded("w1", "Superstore", SUPER_FIELDS, ["Orders"])]
+    plan = _plan(rows)
+    plan["plan"][0]["drift"]["column_count"] = "44"
+    with pytest.raises(ep.RebindPlanSchemaError, match=r"drift\.column_count"):
+        ep.validate_rebind_plan(plan)
+
+
+def test_load_rebind_plan_fail_loud_on_malformed_json(tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text("{bad json", encoding="utf-8")
+    with pytest.raises(ep.RebindPlanSchemaError, match=r"malformed JSON"):
+        ep.load_rebind_plan(str(p))
+
+
+def test_load_rebind_plan_fail_loud_on_bad_schema(tmp_path):
+    p = tmp_path / "bad-schema.json"
+    p.write_text(json.dumps({"schema_version": "1.0"}), encoding="utf-8")
+    with pytest.raises(ep.RebindPlanSchemaError, match=r"root\.summary"):
+        ep.load_rebind_plan(str(p))
+
+
+def test_apply_view_dependency_feedback_fail_loud_on_bad_plan():
+    with pytest.raises(ep.RebindPlanSchemaError, match=r"root\.schema_version"):
+        ep.apply_view_dependency_feedback({}, {"bindings": []})
 
 
 # ----- Gate 1: view-dependency feedback ------------------------------------------------
