@@ -2610,6 +2610,438 @@ def openability_tier(report_dir=None, model_dir=None, tabular_editor_dir=None):
 
 
 # =====================================================================================
+# Deterministic advisory tier: metadata / binding fidelity (emitted TMDL vs Tableau source)
+# =====================================================================================
+# Stdlib-only and offline -- no Power BI Desktop, no Analysis Services, no credentials. It re-reads
+# the emitted ``*.SemanticModel`` TMDL with its OWN line reader (never the engine's emitter) and the
+# Tableau ``.twb``/``.tds`` column schema with ElementTree, then cross-references three things:
+#   * DATATYPE DRIFT  -- an emitted physical column's ``dataType`` vs the mapped Tableau source type.
+#   * BINDING RESOLUTION -- every ``'Table'[Column]`` / ``[Column]`` reference inside a measure body,
+#     a calculated-column body, or a calculated-table partition ``source`` resolves to a real model
+#     column or measure. This is the static catch for the whole UNRESOLVABLE-REF defect class: a
+#     sanitized-name mismatch (``[State/Province]`` vs ``[State_Province]``), or a window function
+#     (OFFSET / WINDOW / INDEX) whose ORDERBY/relation points at a column that is not in the model
+#     ("cross-table" defect) -- both surface here as an unresolved binding BEFORE any live fire.
+#   * COVERAGE -- Tableau source columns absent from the model (dropped), and physical model columns
+#     with no Tableau source (added).
+# Advisory and tolerance-banded like every other tier; it does NOT feed the combined headline, so it
+# can never move calibration -- it is a separate, fail-loud pre-fire fidelity gate.
+
+# A Tableau scalar datatype maps to the TMDL ``dataType`` the engine should land. The COMPATIBLE sets
+# keep faithful cross-engine widenings (a Tableau ``date`` landing as ``dateTime``; an ``integer``
+# measure summarized as ``double``) from reading as drift -- only a genuine family change is flagged.
+_TABLEAU_TO_TMDL_DTYPE = {
+    "integer": "int64",
+    "real": "double",
+    "string": "string",
+    "boolean": "boolean",
+    "date": "dateTime",
+    "datetime": "dateTime",
+}
+_DTYPE_COMPATIBLE = {
+    "int64": {"int64", "double", "decimal"},
+    "double": {"double", "decimal", "int64"},
+    "decimal": {"decimal", "double", "int64"},
+    "dateTime": {"dateTime", "date"},
+    "date": {"date", "dateTime"},
+    "string": {"string"},
+    "boolean": {"boolean"},
+}
+# A column reference: ``'Quoted Table'[Col]``, ``Table[Col]``, or a bare ``[Col]`` (measure / context
+# column). DAX string literals use double quotes, so a bracket pair is always an identifier ref.
+_DAX_REF_RE = re.compile(r"(?:'(?P<tq>[^']+)'|(?P<tb>[A-Za-z_]\w*))?\s*\[(?P<col>[^\]]+)\]")
+# Window/navigation functions whose arguments routinely reach ACROSS tables -- an unresolved ref here
+# is exactly the recent cross-table defect class, so it is tagged for fail-loud emphasis.
+_DAX_WINDOW_FUNCS = ("OFFSET", "WINDOW", "INDEX", "RANK", "ROWNUMBER", "MOVINGAVERAGE", "RUNNINGSUM")
+
+
+def _tmdl_unquote(token):
+    """Strip TMDL single-quote object quoting (``'Dim Swap Calc 1'`` -> ``Dim Swap Calc 1``)."""
+    token = (token or "").strip()
+    if len(token) >= 2 and token.startswith("'") and token.endswith("'"):
+        return token[1:-1].replace("''", "'")
+    return token
+
+
+def _extract_dax_refs(expression):
+    """Yield ``(table_or_None, column)`` for each column/measure reference in a DAX string."""
+    for m in _DAX_REF_RE.finditer(expression or ""):
+        table = m.group("tq") or m.group("tb")
+        yield (table, m.group("col"))
+
+
+def _parse_tmdl_model(definition_dir):
+    """Parse ``definition/tables/*.tmdl`` into a light model with its own stdlib line reader.
+
+    Returns ``{"definition", "tables": {name: {...}}}`` where each table carries ``physical_columns``
+    (``{name, data_type, source_column}``), ``calc_columns`` / ``measures`` (``{name, expression}``),
+    and ``partition_sources`` (calculated-partition ``source`` bodies). The expression-bearing
+    objects feed binding resolution; the physical columns feed datatype/coverage. Never raises on a
+    malformed file -- a file that cannot be read is skipped."""
+    tables_dir = os.path.join(definition_dir, "tables")
+    if not os.path.isdir(tables_dir):
+        tables_dir = definition_dir
+    model = {"definition": os.path.abspath(definition_dir), "tables": {}}
+    try:
+        names = sorted(os.listdir(tables_dir))
+    except OSError:
+        return model
+    for fname in names:
+        if not fname.lower().endswith(".tmdl"):
+            continue
+        try:
+            with open(os.path.join(tables_dir, fname), "r", encoding="utf-8-sig") as fh:
+                lines = fh.read().replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        except OSError:
+            continue
+        _parse_tmdl_table_lines(lines, model)
+    return model
+
+
+def _parse_tmdl_table_lines(lines, model):
+    """Stateful single pass over one TMDL file's lines, folding tables into ``model``."""
+    cur = None            # current table record
+    obj = None            # ("physcol", dict) | ("partition", dict) | None -- the open child
+    capturing = False     # inside a calculated-partition ``source`` block
+    for raw in lines:
+        indent = len(raw) - len(raw.lstrip("\t"))
+        content = raw.strip()
+        if not content:
+            continue
+        if indent == 0 and content.startswith("table "):
+            name = _tmdl_unquote(content[len("table "):])
+            cur = {"name": name, "physical_columns": [], "calc_columns": [],
+                   "measures": [], "partition_sources": []}
+            model["tables"][name] = cur
+            obj, capturing = None, False
+            continue
+        if cur is None:
+            continue
+        if indent == 1:
+            obj, capturing = None, False
+            if content.startswith("column "):
+                rest = content[len("column "):]
+                if _looks_like_assignment(rest):
+                    name, expr = rest.split("=", 1)
+                    cur["calc_columns"].append(
+                        {"name": _tmdl_unquote(name), "expression": expr.strip()})
+                else:
+                    col = {"name": _tmdl_unquote(rest), "data_type": None, "source_column": None}
+                    cur["physical_columns"].append(col)
+                    obj = ("physcol", col)
+            elif content.startswith("measure "):
+                rest = content[len("measure "):]
+                if _looks_like_assignment(rest):
+                    name, expr = rest.split("=", 1)
+                    cur["measures"].append(
+                        {"name": _tmdl_unquote(name), "expression": expr.strip()})
+            elif content.startswith("partition ") and "calculated" in content:
+                part = {"name": content, "expression": ""}
+                cur["partition_sources"].append(part)
+                obj = ("partition", part)
+        elif indent >= 2 and obj is not None:
+            kind, rec = obj
+            if kind == "physcol":
+                if content.startswith("dataType:"):
+                    rec["data_type"] = content.split(":", 1)[1].strip()
+                elif content.startswith("sourceColumn:"):
+                    rec["source_column"] = content.split(":", 1)[1].strip()
+            elif kind == "partition":
+                if content.startswith("source"):
+                    capturing = True
+                    after = content[len("source"):].lstrip()
+                    if after.startswith("="):
+                        after = after[1:].strip()
+                    if after:
+                        rec["expression"] += after + " "
+                elif capturing:
+                    rec["expression"] += content + " "
+
+
+def _looks_like_assignment(rest):
+    """True when a ``column``/``measure`` header line carries an ``= <expr>`` body (not just a name
+    that happens to contain ``=`` inside quotes)."""
+    head = rest.split("=", 1)[0]
+    if "=" not in rest:
+        return False
+    # A quoted name with no closing quote before ``=`` means the ``=`` is inside the name.
+    return head.count("'") % 2 == 0
+
+
+def _map_tableau_dtype(dt):
+    return _TABLEAU_TO_TMDL_DTYPE.get((dt or "").strip().lower())
+
+
+_DERIVED_SRC_RE = re.compile(r"\(copy\)|\(group\)|\(bin\)|^Calculation_\d", re.IGNORECASE)
+_TRAILING_PAREN_RE = re.compile(r"\s*\([^()]*\)\s*$")
+
+
+def _is_derived_source_name(name):
+    """True for a Tableau-DERIVED source field name (a group, a copy, a bin, or an internal
+    ``Calculation_<hash>``) -- these are not dropped physical columns, so they are not coverage gaps."""
+    return bool(_DERIVED_SRC_RE.search(name or ""))
+
+
+def _strip_trailing_paren(name):
+    """Drop a single trailing ``(Qualifier)`` from a field name (``Region (People)`` -> ``Region``),
+    so a blend/secondary-source reference matches its base physical column."""
+    return _TRAILING_PAREN_RE.sub("", name or "").strip()
+
+
+def _parse_tableau_schema(twb_path):
+    """Source-column schema from the Tableau ``.twb`` (and any sibling ``.tds``).
+
+    Returns ``{norm_name: {"name", "datatype", "role", "calculated"}}`` keyed by the normalized
+    field name, unioning ``<column>`` elements (caption/datatype/role, a ``<calculation>`` child marks
+    a calc) with ``<metadata-record class='column'>`` physical records (``remote-name``/``local-type``)
+    so a column the workbook only references physically is still seen. Best-effort: a parse failure
+    returns ``{}`` so the tier degrades to "no source schema" rather than raising."""
+    paths = []
+    if twb_path and os.path.isfile(twb_path):
+        paths.append(twb_path)
+        sib_dir = os.path.dirname(os.path.abspath(twb_path))
+        try:
+            for n in sorted(os.listdir(sib_dir)):
+                if n.lower().endswith(".tds") and os.path.join(sib_dir, n) not in paths:
+                    paths.append(os.path.join(sib_dir, n))
+        except OSError:
+            pass
+    schema = {}
+    for path in paths:
+        try:
+            root = ET.parse(path).getroot()
+        except (ET.ParseError, OSError):
+            continue
+        for col in _iter_local(root, "column"):
+            name = _strip_brackets(col.get("caption") or col.get("name") or "")
+            if not name:
+                continue
+            dt = (col.get("datatype") or "").strip().lower()
+            if dt in ("", "table"):
+                continue
+            calc = _first_child(col, "calculation") is not None
+            key = _norm(name)
+            if key and (key not in schema or not schema[key].get("datatype")):
+                schema[key] = {"name": name, "datatype": dt,
+                               "role": (col.get("role") or "").strip().lower(), "calculated": calc}
+        for rec in _iter_local(root, "metadata-record"):
+            if (rec.get("class") or "") != "column":
+                continue
+            rn = _first_child(rec, "remote-name")
+            lt = _first_child(rec, "local-type")
+            if rn is None or not (rn.text or "").strip():
+                continue
+            name = _strip_brackets((rn.text or "").strip())
+            key = _norm(name)
+            dt = ((lt.text or "").strip().lower() if lt is not None else "")
+            if key and key not in schema:
+                schema[key] = {"name": name, "datatype": dt, "role": "", "calculated": False}
+    return schema
+
+
+def metadata_tier(report_dir=None, model_dir=None, twb_path=None):
+    """Deterministic metadata / binding fidelity of an emitted semantic model vs its Tableau source.
+
+    Walks every emitted table -- physical columns (datatype + coverage vs the Tableau schema) and
+    every expression-bearing object (measures, calculated columns, calculated-partition sources) --
+    resolving each column/measure reference against the parsed model. Returns an advisory record:
+
+    * ``tables`` -- per table: physical/expression counts, datatype drift, extra (unmatched) physical
+      columns, and a 0..1 ``confidence`` (clean physical matches / physical columns).
+    * ``datatype_drift`` / ``missing_source_columns`` / ``extra_model_columns`` -- flat roll-ups.
+    * ``unresolved_bindings`` -- every reference that does NOT resolve (the fail-loud catch), each
+      tagged with its owner object, the offending ref, a reason, and a ``window_function`` flag.
+    * ``scores`` -- ``metadata`` (mean table confidence), ``binding`` (resolved objects / total),
+      and an ``overall`` mean, each with a band.
+
+    Offline + stdlib only. Never raises: a missing model/twb degrades to ``{available: False}``."""
+    defn = _resolve_model_definition(report_dir, model_dir)
+    if not defn:
+        return {"tier": "metadata", "available": False,
+                "reason": "no *.SemanticModel/definition folder found near %s"
+                          % (model_dir or report_dir)}
+    try:
+        model = _parse_tmdl_model(defn)
+    except Exception as exc:  # noqa: BLE001 -- a parse fault degrades, never raises
+        return {"tier": "metadata", "available": False, "definition": defn,
+                "reason": "TMDL parse failed: %s" % str(exc).strip()[:200]}
+    schema = _parse_tableau_schema(twb_path) if twb_path else {}
+
+    # Two resolution namespaces, deliberately different:
+    #   * NORMALIZED (``_norm``) -- cross-engine COVERAGE/datatype matching, where ``Order Date`` and
+    #     ``Order_Date`` are the same source column (cosmetic rename is faithful).
+    #   * EXACT (case-insensitive literal) -- BINDING resolution, where DAX is literal: ``[State/
+    #     Province]`` and ``[State_Province]`` are DIFFERENT identifiers. Using ``_norm`` here would
+    #     hide the sanitized-name defect (the engine lands DAX verbatim; AS resolves it literally).
+    col_norms_by_table = {}
+    exact_cols_by_table = {}
+    exact_table_lookup = {}
+    exact_measures = set()
+    for tname, t in model["tables"].items():
+        exact_table_lookup[tname.lower()] = tname
+        norms = set()
+        exact = set()
+        for c in t["physical_columns"]:
+            norms.add(_norm(c["name"]))
+            exact.add(c["name"].lower())
+        for c in t["calc_columns"]:
+            norms.add(_norm(c["name"]))
+            exact.add(c["name"].lower())
+        col_norms_by_table[tname] = norms
+        exact_cols_by_table[tname] = exact
+        for mrec in t["measures"]:
+            exact_measures.add(mrec["name"].lower())
+
+    def _resolve(home_table, ref_table, ref_col):
+        ecol = (ref_col or "").strip().lower()
+        if ref_table:
+            real = exact_table_lookup.get(ref_table.strip().lower())
+            if real is None:
+                return (False, "unknown table '%s'" % ref_table)
+            if ecol in exact_cols_by_table.get(real, set()) or ecol in exact_measures:
+                return (True, None)
+            return (False, "column '%s' not found in table '%s'" % (ref_col, ref_table))
+        # bare [Col]: a measure, or a column reachable in the home-table row context
+        if ecol in exact_measures or ecol in exact_cols_by_table.get(home_table, set()):
+            return (True, None)
+        for exact in exact_cols_by_table.values():
+            if ecol in exact:
+                return (True, None)
+        return (False, "unresolved bare reference '[%s]'" % ref_col)
+
+    unresolved = []
+    total_objs = 0
+    resolved_objs = 0
+
+    def _scan(home_table, kind, obj_name, expression):
+        nonlocal total_objs, resolved_objs
+        total_objs += 1
+        up = (expression or "").upper()
+        is_window = any(fn in up for fn in _DAX_WINDOW_FUNCS)
+        obj_ok = True
+        for ref_table, ref_col in _extract_dax_refs(expression):
+            ok, reason = _resolve(home_table, ref_table, ref_col)
+            if not ok:
+                obj_ok = False
+                ref_txt = ("'%s'[%s]" % (ref_table, ref_col)) if ref_table else "[%s]" % ref_col
+                unresolved.append({
+                    "table": home_table, "object": obj_name, "kind": kind,
+                    "ref": ref_txt, "reason": reason, "window_function": is_window})
+        if obj_ok:
+            resolved_objs += 1
+
+    tables_out = []
+    datatype_drift = []
+    extra_model_columns = []
+    model_col_norms = set()
+    for tname, t in model["tables"].items():
+        for c in t["physical_columns"]:
+            src = c.get("source_column") or ""
+            if src and not src.startswith("["):
+                model_col_norms.add(_norm(c["name"]))
+                model_col_norms.add(_norm(_strip_brackets(src)))
+    for tname, t in model["tables"].items():
+        drift_here = []
+        extra_here = []
+        clean = 0
+        physical = t["physical_columns"]
+        for c in physical:
+            # calc-table tuple columns bind to a synthetic [ValueN]; only real source columns
+            # (an unbracketed sourceColumn) are checked against the Tableau schema.
+            src = c.get("source_column") or ""
+            is_real_source = bool(src) and not src.startswith("[")
+            if not is_real_source:
+                continue
+            match = schema.get(_norm(c["name"])) or schema.get(_norm(_strip_brackets(src)))
+            if match is None:
+                extra_here.append(c["name"])
+                continue
+            expected = _map_tableau_dtype(match["datatype"])
+            emitted = c.get("data_type")
+            if expected and emitted and emitted not in _DTYPE_COMPATIBLE.get(expected, {expected}):
+                drift_here.append({"table": tname, "column": c["name"],
+                                   "emitted_type": emitted, "tableau_type": match["datatype"],
+                                   "expected_type": expected})
+            else:
+                clean += 1
+        for mrec in t["measures"]:
+            _scan(tname, "measure", mrec["name"], mrec["expression"])
+        for crec in t["calc_columns"]:
+            _scan(tname, "calc_column", crec["name"], crec["expression"])
+        for prec in t["partition_sources"]:
+            _scan(tname, "partition_source", tname, prec["expression"])
+        real_physical = [c for c in physical
+                         if (c.get("source_column") or "") and not (c["source_column"]).startswith("[")]
+        n_real = len(real_physical)
+        confidence = round(clean / n_real, 4) if n_real else None
+        datatype_drift.extend(drift_here)
+        extra_model_columns.extend({"table": tname, "column": x} for x in extra_here)
+        tables_out.append({
+            "table": tname,
+            "physical_columns": len(physical),
+            "source_backed_columns": n_real,
+            "calc_columns": len(t["calc_columns"]),
+            "measures": len(t["measures"]),
+            "datatype_drift": drift_here,
+            "extra_columns": extra_here,
+            "confidence": confidence,
+        })
+
+    # A Tableau source field is "missing" only when it is a genuine, non-derived physical field with
+    # no matching model column. Tableau-derived fields (groups, copies, internal ``Calculation_*``)
+    # and blend references (a trailing ``(Other Source)`` suffix) are not dropped physical columns --
+    # match them by their base name so they do not read as false gaps.
+    missing = []
+    for k, v in sorted(schema.items()):
+        if v.get("calculated"):
+            continue
+        name = v["name"]
+        if _is_derived_source_name(name):
+            continue
+        base = _strip_trailing_paren(name)
+        if k in model_col_norms or _norm(base) in model_col_norms:
+            continue
+        missing.append({"name": name, "datatype": v["datatype"]})
+
+    confidences = [t["confidence"] for t in tables_out if t["confidence"] is not None]
+    meta_score = round(sum(confidences) / len(confidences), 4) if confidences else None
+    binding_score = round(resolved_objs / total_objs, 4) if total_objs else None
+    parts = [s for s in (meta_score, binding_score) if s is not None]
+    overall = round(sum(parts) / len(parts), 4) if parts else None
+
+    notes = [
+        "ADVISORY metadata/binding tier: deterministic, offline, stdlib-only -- it re-reads the "
+        "emitted TMDL and the Tableau schema with independent readers and does NOT feed the combined "
+        "headline (so it can never move calibration).",
+        "BINDING is the fail-loud catch: an unresolved ref is a query/refresh-time break the "
+        "openability gate cannot see (a model can deserialize yet reference a column that is not in "
+        "it) -- e.g. a sanitized-name mismatch or a window-function ORDERBY pointing across tables.",
+    ]
+    if not schema:
+        notes.append("No Tableau source schema parsed (no twb_path or unreadable): datatype/coverage "
+                     "checks are skipped; binding resolution still ran against the model alone.")
+
+    return {
+        "tier": "metadata", "available": True, "advisory": True,
+        "definition": defn,
+        "source_schema_columns": len(schema),
+        "tables": tables_out,
+        "datatype_drift": datatype_drift,
+        "missing_source_columns": missing,
+        "extra_model_columns": extra_model_columns,
+        "unresolved_bindings": unresolved,
+        "objects_total": total_objs,
+        "objects_resolved": resolved_objs,
+        "scores": {
+            "metadata": meta_score, "metadata_band": _band(meta_score) if meta_score is not None else None,
+            "binding": binding_score, "binding_band": _band(binding_score) if binding_score is not None else None,
+            "overall": overall, "overall_band": _band(overall) if overall is not None else None,
+        },
+        "notes": notes,
+    }
+
+
+# =====================================================================================
 # Optional advisory tier: LLM-assist adjudication (a deterministic harness; the agent IS the model)
 # =====================================================================================
 # This mirrors the skill's two established agent-assisted tiers -- the second compiler
@@ -3042,7 +3474,7 @@ def _resolve_reference_png(source, name=None):
 def run_oracle(twb_path, report_dir, engine_report_path=None,
                dax_options=None, image_options=None, candidate_records_path=None,
                field_aliases=None, validate=False, openability_options=None,
-               llm_options=None):
+               llm_options=None, metadata_options=None):
     """Read both sides and score them. Returns the advisory report dict.
 
     The structural tier always runs. The optional value/image tiers run only when their options are
@@ -3129,6 +3561,10 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
         report["summary"]["pbir_valid"] = vrec.get("valid") if vrec.get("available") else None
     if openability_options is not None:
         report["openability"] = openability_tier(report_dir=report_dir, **openability_options)
+    if metadata_options is not None:
+        opts = dict(metadata_options)
+        opts.setdefault("twb_path", twb_path)
+        report["metadata"] = metadata_tier(report_dir=report_dir, **opts)
     combined = _combined_fidelity(report)
     if combined is not None:
         report["combined_fidelity"] = combined
@@ -3315,6 +3751,35 @@ def render_markdown(report):
                 loc = "%s line %s" % (loc, openrec.get("error_line"))
             lines.append("- ⛔ **BLOCKED** — model does not deserialize (%s)" % loc)
             lines.append("  - %s" % openrec.get("error"))
+    meta = report.get("metadata")
+    if meta is not None:
+        lines.append("")
+        lines.append("## Metadata / binding fidelity (advisory, deterministic)")
+        if not meta.get("available"):
+            lines.append("- _unavailable_: %s" % meta.get("reason"))
+        else:
+            sc = meta.get("scores") or {}
+            lines.append("- **Scores:** metadata %s (%s) · binding %s (%s) · overall %s (%s)" % (
+                sc.get("metadata"), sc.get("metadata_band"), sc.get("binding"),
+                sc.get("binding_band"), sc.get("overall"), sc.get("overall_band")))
+            lines.append("- **Bindings:** %d/%d expression objects fully resolve; %d unresolved "
+                         "reference(s)." % (
+                             meta.get("objects_resolved", 0), meta.get("objects_total", 0),
+                             len(meta.get("unresolved_bindings", []))))
+            lines.append("- **Coverage:** %d datatype drift · %d missing source column(s) · %d extra "
+                         "model column(s)." % (
+                             len(meta.get("datatype_drift", [])),
+                             len(meta.get("missing_source_columns", [])),
+                             len(meta.get("extra_model_columns", []))))
+            for u in meta.get("unresolved_bindings", []):
+                wf = " [window-fn]" if u.get("window_function") else ""
+                lines.append("  - ⛔ UNRESOLVED `%s` in %s `%s` (%s) — %s%s" % (
+                    u.get("ref"), u.get("table"), u.get("object"), u.get("kind"),
+                    u.get("reason"), wf))
+            for d in meta.get("datatype_drift", []):
+                lines.append("  - ⚠ DRIFT %s[%s]: emitted `%s` vs Tableau `%s` (expected `%s`)" % (
+                    d.get("table"), d.get("column"), d.get("emitted_type"),
+                    d.get("tableau_type"), d.get("expected_type")))
     llm = report.get("llm_assist")
     if llm is not None:
         lines.append("")
@@ -3400,6 +3865,11 @@ def main(argv=None):
     ap.add_argument("--model-dir", default=None,
                     help="Override the semantic-model folder Gate 0 inspects (defaults to the "
                          "*.SemanticModel/definition resolved from report_dir).")
+    ap.add_argument("--metadata", action="store_true",
+                    help="Run the deterministic metadata/binding fidelity tier: emitted TMDL columns/"
+                         "measures vs the Tableau source schema (datatype drift, coverage) plus static "
+                         "binding resolution of every DAX column/measure reference. ADDITIVE -- it "
+                         "never feeds the combined headline. Offline, stdlib-only.")
     ap.add_argument("--llm", action="store_true",
                     help="Build the advisory LLM-assist adjudication bundle + agent prompt (no "
                          "network/key -- the agent running this skill is the judgment model).")
@@ -3440,12 +3910,19 @@ def main(argv=None):
         if args.llm_answers and os.path.isfile(args.llm_answers):
             llm_options["answers"] = _read_json(args.llm_answers)
 
+    metadata_options = None
+    if args.metadata:
+        metadata_options = {}
+        if args.model_dir:
+            metadata_options["model_dir"] = args.model_dir
+
     report = run_oracle(args.twb, args.report_dir, args.engine_report,
                         dax_options=dax_options, image_options=image_options,
                         candidate_records_path=args.candidate_records,
                         validate=args.validate,
                         openability_options=openability_options,
-                        llm_options=llm_options)
+                        llm_options=llm_options,
+                        metadata_options=metadata_options)
     text = (render_markdown(report) if args.format == "md"
             else json.dumps(report, indent=2, ensure_ascii=False))
     if args.out:
