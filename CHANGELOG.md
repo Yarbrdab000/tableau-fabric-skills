@@ -13,6 +13,16 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **a candidate-ranking step for the assisted (second-compiler) tier**
+  (`translation_reconcile.rank_candidates`) — the optional acceleration tier's *selection* helper.
+  Given the N candidate DAX translations the agent (the documented second compiler) authors for one
+  fallback, it reconciles each through the gate + numeric oracle and returns them **best-first**, each
+  with a `confidence` (`high` = verified against the Tableau ground truth · `medium` = passed the gate
+  but not yet reconciled · `low` = proven wrong or malformed) and a one-line `reason`, plus `best`
+  (the top non-`low` candidate, or `None` when every candidate is low). It ranks by **semantic
+  equivalence, not string similarity**, embeds **no LLM API** (the agent proposes; this scores), and
+  lands nothing — the chosen candidate still flows through `approved_calc_dax` and the human gate.
+  Documented in `resources/second-compiler.md`.
 - **tableau-migration:** **the assisted (second-compiler) idiom registry now recognizes the
   argmin-over-a-dimension twin** of the existing argmax idiom ("the member of dimension C with the
   *least* AGG([f]) per partition", e.g. the lowest-selling city in each state). The detector

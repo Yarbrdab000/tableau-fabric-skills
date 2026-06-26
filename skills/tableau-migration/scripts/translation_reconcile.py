@@ -375,3 +375,92 @@ def reconcile_all(items, *, fabric_oracle=None, tableau_oracle=None, **kw):
         records.append(reconcile(item.get("name"), dax, fabric_oracle=fabric_oracle,
                                  tableau_value=tv, tableau_oracle=tableau_oracle, **per))
     return {"records": records, "summary": summarize(records)}
+
+
+# --------------------------------------------------------------------------- candidate ranking
+# Confidence labels for a ranked candidate. The vocabulary matches the ``confidence`` field a
+# ``suggest_assisted_dax`` suggestion already carries, so the agent/orchestrator sees one scale.
+RANK_HIGH = "high"      # empirically VERIFIED: evaluates to the Tableau ground truth within tolerance
+RANK_MEDIUM = "medium"  # well-formed (passed the gate) but not empirically reconciled (no oracle/truth)
+RANK_LOW = "low"        # proven wrong (mismatch) OR malformed (failed the syntactic gate)
+
+# Sort tiers (lower == better). VERIFIED first; then gate-passed-but-unevaluated; then the rejected
+# bucket (a proven-wrong mismatch or a malformed gate failure) last -- a human approves neither.
+_TIER_VERIFIED = 0
+_TIER_UNEVALUATED = 1
+_TIER_REJECTED = 2
+
+
+def _candidate_confidence(record):
+    """Map one reconcile ``record`` to ``(tier, confidence, reason)`` for ranking. Pure; never raises.
+
+    This is the SEMANTIC-equivalence score -- it reads the oracle verdict, not the candidate string.
+    A VERIFIED candidate is high; a candidate that merely passed the syntactic gate but could not be
+    reconciled (no oracle / no ground truth / an oracle error) is medium (plausible, still unproven);
+    a candidate the oracle proved wrong (mismatch) or that the gate rejected (malformed) is low.
+    """
+    rec = record or {}
+    state = rec.get("state", NOT_EVALUATED)
+    gate = rec.get("gate") or {}
+    if state == VERIFIED:
+        return _TIER_VERIFIED, RANK_HIGH, "verified against the Tableau ground truth within tolerance"
+    if state == MISMATCH:
+        return _TIER_REJECTED, RANK_LOW, rec.get("detail") or "evaluated but disagreed with Tableau"
+    # NOT_EVALUATED: a FAILED gate (malformed) is rejected; an otherwise-unevaluated candidate
+    # (clean gate, just no oracle/truth) stays plausible-but-unproven.
+    if gate and not gate.get("ok", True):
+        issues = "; ".join(gate.get("issues") or []) or "failed the syntactic gate"
+        return _TIER_REJECTED, RANK_LOW, "rejected by the syntactic gate: " + issues
+    return _TIER_UNEVALUATED, RANK_MEDIUM, rec.get("detail") or "well-formed but not reconciled"
+
+
+def rank_candidates(name, candidates, *, fabric_oracle=None, tableau_value=_UNSET,
+                    tableau_oracle=None, kind=None, request=None, **reconcile_kw):
+    """Rank N agent-authored candidate DAX strings for ONE translation by SEMANTIC equivalence.
+
+    The second compiler (the agent running this skill) proposes one or more candidate DAX
+    translations for a calc the deterministic tier fell back on; this ranks them **best-first** by
+    the empirical oracle, not by string matching. Each candidate is vetted with :func:`reconcile`
+    (syntactic gate -> numeric oracle vs. the Tableau ground truth) and scored:
+
+      * :data:`RANK_HIGH`   -- VERIFIED: evaluates to the Tableau value within tolerance.
+      * :data:`RANK_MEDIUM` -- passed the gate but not empirically reconciled (no oracle/ground truth).
+      * :data:`RANK_LOW`    -- proven wrong (mismatch) or malformed (failed the gate).
+
+    Order: VERIFIED, then gate-passed-unevaluated, then the rejected bucket; ties keep the agent's
+    submission order (stable). This is the optional acceleration tier's selection step -- it never
+    lands anything; the chosen candidate still flows through the normal human-approval gate.
+
+    ``request`` (an optional handoff dict) is echoed back and its ``category`` annotated on each
+    record. ``tableau_value`` / ``tableau_oracle`` / ``fabric_oracle`` / ``kind`` and any extra
+    ``reconcile_kw`` (e.g. ``grain_filters``, ``value_name``, ``rel_tol``) pass through to
+    :func:`reconcile`. Returns (never raises)::
+
+        {
+          "name", "request",
+          "ranked": [ {"candidate_dax", "rank", "confidence", "reason", "record"}, ... ],  # best-first
+          "best": <top candidate_dax, or None when every candidate is low-confidence>,
+          "summary": {... summarize() ...},
+        }
+    """
+    scored = []
+    for idx, dax in enumerate(list(candidates or [])):
+        rec = reconcile(name, dax, fabric_oracle=fabric_oracle, tableau_value=tableau_value,
+                        tableau_oracle=tableau_oracle, kind=kind, **reconcile_kw)
+        if request is not None:
+            rec.setdefault("category", (request or {}).get("category"))
+        tier, confidence, reason = _candidate_confidence(rec)
+        scored.append((tier, idx, dax, rec, confidence, reason))
+    scored.sort(key=lambda s: (s[0], s[1]))  # tier asc, then stable submission order
+    ranked = [
+        {"candidate_dax": dax, "rank": i, "confidence": conf, "reason": reason, "record": rec}
+        for i, (_tier, _idx, dax, rec, conf, reason) in enumerate(scored, start=1)
+    ]
+    best = next((r["candidate_dax"] for r in ranked if r["confidence"] != RANK_LOW), None)
+    return {
+        "name": name,
+        "request": request,
+        "ranked": ranked,
+        "best": best,
+        "summary": summarize([r["record"] for r in ranked]),
+    }
