@@ -624,6 +624,41 @@ emitted. The full numbered runbook (with the bold do-NOTs) is in
   non-candidate type, an unknown visual, or anything that would alter the query/fields is **rejected,
   never applied** — the query/`queryState` is asserted byte-identical across every type switch.
 
+### Viz advisor — recommend visuals from data semantics (Tier-2, opt-in)
+
+`scripts/viz_advisor.py` is the *forward* peer of the image oracle. Where the oracle **corrects** the
+type of a worksheet the Tier-1 engine already rebuilt, the advisor **proposes** visuals from data
+semantics alone — given a set of model fields (a measure / calc selection), it ranks candidate charts
+for laying out a new report. It is the recommender analogue of the calc compiler's Tier-2
+assisted-translation loop (deterministic floor → out-of-band suggestion → gated landing), and it is
+**opt-in and additive**: it writes nothing into the PBIR and the main bind path is unchanged.
+
+It holds the same **warn-never-wrong** contract in three layers:
+
+- **Deterministic floor.** `recommend_visuals(fields, intent=, max_suggestions=6)` encodes known-good
+  viz facts (which data shape suits which chart) as an authored rule table and returns a ranked list of
+  `{visual_type, encodings, confidence, reasoning, rank}`. It **never** calls a model. Each field is a
+  `{name, role, data_type, semantic_role?, cardinality?}` dict; `normalize_field` derives `temporal`
+  (date/time types) or `geo` (place-name cues) when not given, and raises on a name-less / role-less
+  field (the advisor never guesses a field's identity). The rule table covers: a lone measure → `card`
+  (several → `multiRowCard`); a geo dimension + measure → `shapeMap` / `map`; a temporal dimension +
+  measure → `lineChart` / `areaChart`; one categorical dimension + measure → `clusteredColumnChart` /
+  `clusteredBarChart` (+ `pieChart` only when low-cardinality); one dimension + several measures →
+  grouped columns / combo; two dimensions + measure → `pivotTable` / `stackedColumnChart`; two measures
+  → `scatterChart`; and a universal `tableEx` fallback so the result is never empty. Every recommended
+  type is in the closed `PBIR_VISUAL_TYPES` vocabulary (mirrors `twb_to_pbir`'s `_VT_TO_PBIR`).
+- **Out-of-band assist (never auto-lands).** `build_advice_bundle` / `advice_prompt` hand the
+  read-only field truth, the deterministic candidate set (`top_pick` = `candidates[0]`), the hard rules,
+  and a pre-filled answer template to the **separate** agent / vision pass to re-rank or refine by user
+  intent. No API key, no embedded tool call; deterministic tests inject the agent's answer.
+- **Gated landing.** `validate_suggestion(suggestion, fields, candidates)` accepts an answer **only**
+  when its chart type is in the deterministic candidate set *and* every encoded field exists in the
+  provided set on a role-compatible slot (a measure on a value/size/angle/X-Y slot; a dimension on a
+  category/legend/axis/location slot). `apply_advice(candidates, answer, fields)` keeps the
+  deterministic top pick on a null / out-of-range / failing-validation answer, lands a valid non-top
+  choice otherwise, and returns an `{applied, kept, rejected}` audit report — a suggestion is never
+  silently emitted. `refine_with_feedback` is the multi-turn hook (per-type up/down re-rank, clamped).
+
 ## Tests
 
 `tests/test_twb_to_pbir.py` is fully offline (inline `.twb` XML string fixtures, no disk, no
@@ -631,3 +666,9 @@ network). It asserts the normalized IR (entity/property/aggregation per visual),
 PBIR JSON structure (report scaffold, page-per-dashboard, orphan-worksheet page, role
 projections, field expressions, unique queryRefs, zone scaling within page bounds) and that
 unsupported marks/derivations/filters produce warnings rather than visuals.
+
+`tests/test_image_oracle.py` and `tests/test_viz_advisor.py` are likewise fully offline (no model /
+LLM call): the latter pins the advisor's deterministic ranking per rule-table branch, the bundle /
+prompt shape, the `validate_suggestion` gate (reject a non-candidate type, an unknown field, or a
+role-incompatible slot), `apply_advice` (keep the top pick on a null / out-of-range / invalid answer;
+land a valid choice), and `refine_with_feedback` re-ranking.
