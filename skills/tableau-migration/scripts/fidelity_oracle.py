@@ -2670,6 +2670,114 @@ def _extract_dax_refs(expression):
         yield (table, m.group("col"))
 
 
+# The navigation clauses inside a window function whose column argument fixes the SORT and the GROUP
+# the window walks over. The semantic rule (matched to the engine's own positional-measure fix): a
+# window's ORDERBY column must live in the SAME table the window partitions / aggregates -- a
+# resolvable-but-cross-table ORDERBY (e.g. ``ORDERBY('Date'[Date])`` over an ``'Orders'`` aggregate)
+# is invalid at query time even though every column reference exists, so pure binding resolution
+# cannot see it. This is the deterministic, offline catch for that class.
+_ORDERBY_CLAUSE_RE = re.compile(r"ORDERBY\s*\(", re.IGNORECASE)
+_PARTITIONBY_CLAUSE_RE = re.compile(r"PARTITIONBY\s*\(", re.IGNORECASE)
+# A single-quoted token in DAX is ALWAYS a table identifier (string literals use double quotes), so
+# this captures table-only references like ``COUNTROWS('Orders')`` / ``ALLEXCEPT('Orders', ...)`` that
+# carry no bracketed column and are therefore invisible to ``_extract_dax_refs``.
+_DAX_TABLE_TOKEN_RE = re.compile(r"'([^']+)'")
+
+
+def _balanced_paren_arg(expression, open_idx):
+    """Return the substring inside the parentheses whose ``(`` is at ``open_idx`` (balanced)."""
+    depth = 0
+    for i in range(open_idx, len(expression)):
+        ch = expression[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return expression[open_idx + 1:i]
+    return expression[open_idx + 1:]
+
+
+def _clause_tables(expression, clause_re):
+    """Set of explicitly-qualified table names referenced inside every ``clause_re`` invocation."""
+    tables = set()
+    for m in clause_re.finditer(expression or ""):
+        arg = _balanced_paren_arg(expression, m.end() - 1)
+        for tbl, _col in _extract_dax_refs(arg):
+            if tbl:
+                tables.add(tbl.strip())
+    return tables
+
+
+def _strip_clause(expression, clause_re):
+    """Remove every balanced ``clause_re(...)`` invocation, leaving the surrounding body intact."""
+    out = expression or ""
+    while True:
+        m = clause_re.search(out)
+        if not m:
+            return out
+        open_idx = m.end() - 1
+        depth = 0
+        close = None
+        for i in range(open_idx, len(out)):
+            if out[i] == "(":
+                depth += 1
+            elif out[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    close = i
+                    break
+        if close is None:
+            return out[:m.start()]
+        out = out[:m.start()] + out[close + 1:]
+
+
+def _all_table_tokens(text):
+    """Every table identifier in ``text``: quoted ``'Table'`` tokens plus the table of any
+    ``Table[Col]`` / ``'Table'[Col]`` bracketed reference. Catches table-only refs (``COUNTROWS(
+    'Orders')``) that carry no column."""
+    tables = {t.strip() for t in _DAX_TABLE_TOKEN_RE.findall(text or "")}
+    for tbl, _col in _extract_dax_refs(text or ""):
+        if tbl:
+            tables.add(tbl.strip())
+    return tables
+
+
+def _window_cross_table_findings(home_table, kind, obj_name, expression):
+    """Flag a window-function ORDERBY whose table is not the table the window groups/aggregates.
+
+    Conservative + deterministic: explicit-table refs only (a bare ``[Col]`` ORDERBY never flags),
+    and a finding is raised only when there is a contradicting anchor table (a PARTITIONBY column or
+    a non-ORDERBY body reference on a DIFFERENT table). A same-table ORDERBY -- the corrected form --
+    never flags. Returns a possibly-empty list; never raises."""
+    if not expression:
+        return []
+    if not any(fn in expression.upper() for fn in _DAX_WINDOW_FUNCS):
+        return []
+    order_tables = _clause_tables(expression, _ORDERBY_CLAUSE_RE)
+    if not order_tables:
+        return []
+    part_tables = _clause_tables(expression, _PARTITIONBY_CLAUSE_RE)
+    body = _strip_clause(expression, _ORDERBY_CLAUSE_RE)
+    body_tables = _all_table_tokens(body)
+    anchor = part_tables | body_tables
+    if not anchor:
+        return []
+    findings = []
+    for ot in sorted(order_tables):
+        if ot not in anchor:
+            findings.append({
+                "table": home_table, "object": obj_name, "kind": kind,
+                "orderby_table": ot, "anchor_tables": sorted(anchor),
+                "partition_tables": sorted(part_tables),
+                "reason": ("window-function ORDERBY references table '%s' but the window "
+                           "partitions/aggregates over %s -- a cross-table ORDERBY is invalid at "
+                           "query/refresh time even though every column resolves"
+                           % (ot, sorted(anchor))),
+            })
+    return findings
+
+
 def _parse_tmdl_model(definition_dir):
     """Parse ``definition/tables/*.tmdl`` into a light model with its own stdlib line reader.
 
@@ -2910,14 +3018,20 @@ def metadata_tier(report_dir=None, model_dir=None, twb_path=None):
         return (False, "unresolved bare reference '[%s]'" % ref_col)
 
     unresolved = []
+    cross_table_windows = []
+    window_objects = 0
     total_objs = 0
     resolved_objs = 0
 
     def _scan(home_table, kind, obj_name, expression):
-        nonlocal total_objs, resolved_objs
+        nonlocal total_objs, resolved_objs, window_objects
         total_objs += 1
         up = (expression or "").upper()
         is_window = any(fn in up for fn in _DAX_WINDOW_FUNCS)
+        if is_window:
+            window_objects += 1
+            cross_table_windows.extend(
+                _window_cross_table_findings(home_table, kind, obj_name, expression))
         obj_ok = True
         for ref_table, ref_col in _extract_dax_refs(expression):
             ok, reason = _resolve(home_table, ref_table, ref_col)
@@ -3008,6 +3122,13 @@ def metadata_tier(report_dir=None, model_dir=None, twb_path=None):
     binding_score = round(resolved_objs / total_objs, 4) if total_objs else None
     parts = [s for s in (meta_score, binding_score) if s is not None]
     overall = round(sum(parts) / len(parts), 4) if parts else None
+    # window_consistency is a SEPARATE, additive signal -- it never feeds ``overall`` (so the
+    # established calibration is untouched) and it never re-counts a cross-table window as an
+    # "unresolved binding" (those refs DO resolve). It is the deterministic catch for the
+    # resolvable-but-cross-table ORDERBY class that pure binding resolution is blind to.
+    flagged_window_objs = len({(f["table"], f["object"]) for f in cross_table_windows})
+    window_consistency = (round(1 - flagged_window_objs / window_objects, 4)
+                          if window_objects else None)
 
     notes = [
         "ADVISORY metadata/binding tier: deterministic, offline, stdlib-only -- it re-reads the "
@@ -3016,6 +3137,10 @@ def metadata_tier(report_dir=None, model_dir=None, twb_path=None):
         "BINDING is the fail-loud catch: an unresolved ref is a query/refresh-time break the "
         "openability gate cannot see (a model can deserialize yet reference a column that is not in "
         "it) -- e.g. a sanitized-name mismatch or a window-function ORDERBY pointing across tables.",
+        "WINDOW CONSISTENCY is a distinct fail-loud catch: a window function (OFFSET/WINDOW/INDEX/"
+        "ROWNUMBER/...) whose ORDERBY column lives in a DIFFERENT table than the partition/aggregate "
+        "is invalid at query time even though every column resolves -- pure binding resolution is "
+        "blind to it, so it is reported separately and never moves the binding score.",
     ]
     if not schema:
         notes.append("No Tableau source schema parsed (no twb_path or unreadable): datatype/coverage "
@@ -3030,12 +3155,16 @@ def metadata_tier(report_dir=None, model_dir=None, twb_path=None):
         "missing_source_columns": missing,
         "extra_model_columns": extra_model_columns,
         "unresolved_bindings": unresolved,
+        "cross_table_windows": cross_table_windows,
+        "window_objects_total": window_objects,
         "objects_total": total_objs,
         "objects_resolved": resolved_objs,
         "scores": {
             "metadata": meta_score, "metadata_band": _band(meta_score) if meta_score is not None else None,
             "binding": binding_score, "binding_band": _band(binding_score) if binding_score is not None else None,
             "overall": overall, "overall_band": _band(overall) if overall is not None else None,
+            "window_consistency": window_consistency,
+            "window_consistency_band": _band(window_consistency) if window_consistency is not None else None,
         },
         "notes": notes,
     }
@@ -3780,6 +3909,17 @@ def render_markdown(report):
                 lines.append("  - ⚠ DRIFT %s[%s]: emitted `%s` vs Tableau `%s` (expected `%s`)" % (
                     d.get("table"), d.get("column"), d.get("emitted_type"),
                     d.get("tableau_type"), d.get("expected_type")))
+            ctw = meta.get("cross_table_windows", [])
+            if sc.get("window_consistency") is not None:
+                lines.append("- **Window consistency:** %s (%s) — %d window object(s), %d "
+                             "cross-table ORDERBY finding(s)." % (
+                                 sc.get("window_consistency"), sc.get("window_consistency_band"),
+                                 meta.get("window_objects_total", 0), len(ctw)))
+            for f in ctw:
+                lines.append("  - ⛔ CROSS-TABLE WINDOW in %s `%s` (%s): ORDERBY uses `%s` but the "
+                             "window aggregates/partitions over %s — %s" % (
+                                 f.get("table"), f.get("object"), f.get("kind"),
+                                 f.get("orderby_table"), f.get("anchor_tables"), f.get("reason")))
     llm = report.get("llm_assist")
     if llm is not None:
         lines.append("")

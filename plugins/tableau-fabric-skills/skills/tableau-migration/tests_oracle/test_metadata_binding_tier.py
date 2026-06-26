@@ -308,6 +308,119 @@ def test_metadata_tier_resolves_calculated_partition_cross_table_refs(tmp_path):
     assert part and part[0]["ref"] == "'Orders'[Regn]"
 
 
+# ================================================= TIER 3: RESOLVABLE-but-CROSS-TABLE window ORDERBY
+# The harder, real OFFSET/WINDOW defect class: every column reference RESOLVES (so pure binding
+# resolution is blind to it), yet a window navigation's ORDERBY column lives in a DIFFERENT table than
+# the partition/aggregate the window walks. DAX requires the ORDERBY (and PARTITIONBY) columns to come
+# from the same table expression being windowed; a cross-table ORDERBY errors at query/refresh time
+# even though the model opens (Gate 0) and every ref binds. These are the cases the recent
+# positional-measure fix (ORDERBY redirected from the related date dim back to the fact's own date
+# column) was about; the binding tier alone would have passed them, so they get their own signal.
+#
+# Model inventory (``_orders_model``): Orders[Sales, City, State_Province, Order_Date, Region] is the
+# fact; Calendar[Date] is the related date DIM. A window aggregating Orders but ordering by
+# 'Calendar'[Date] is the cross-table defect; ordering by 'Orders'[Order_Date] is the faithful form.
+_CROSS_WINDOW_CASES = [
+    pytest.param(
+        "STDEVX.S(WINDOW(1, ABS, -1, ABS, ORDERBY('Calendar'[Date], ASC)), "
+        "CALCULATE(COUNTROWS('Orders')))",
+        True, id="window_orderby_dim_aggregate_fact_no_partition",
+        # (a) WINDOW over COUNTROWS('Orders') but ORDERBY('Calendar'[Date]); (b) every ref resolves,
+        # so binding stays clean; (c) the ORDERBY must sit on the windowed table (Orders), not the
+        # related dim; (d) locally: window_consistency drops and the finding names Calendar vs Orders.
+    ),
+    pytest.param(
+        "DIVIDE(COUNTROWS('Orders') - CALCULATE(COUNTROWS('Orders'), "
+        "OFFSET(-1, ORDERBY('Calendar'[Date], ASC))), 1)",
+        True, id="offset_orderby_dim_aggregate_fact_no_partition",
+        # OFFSET prior-row over an Orders aggregate ordered by the dim date -> cross-table.
+    ),
+    pytest.param(
+        "COUNTROWS(WINDOW(1, ABS, -1, ABS, ORDERBY('Calendar'[Date], ASC), "
+        "PARTITIONBY('Orders'[Region])))",
+        True, id="window_orderby_dim_partition_fact",
+        # ORDERBY('Calendar'[Date]) but PARTITIONBY('Orders'[Region]) -> order/partition table
+        # mismatch, the clearest cross-table signal.
+    ),
+    pytest.param(
+        "STDEVX.S(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC)), "
+        "CALCULATE(COUNTROWS('Orders')))",
+        False, id="window_orderby_same_table_is_clean",
+        # POSITIVE CONTROL (the corrected form): ORDERBY on the fact's own Order_Date -> no finding.
+    ),
+    pytest.param(
+        "COUNTROWS(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC), "
+        "PARTITIONBY('Orders'[Region])))",
+        False, id="window_order_and_partition_same_table_clean",
+        # POSITIVE CONTROL: ORDERBY + PARTITIONBY both on Orders -> faithful, no finding.
+    ),
+    pytest.param(
+        "INDEX(1, ORDERBY([Total Sales]))",
+        False, id="bare_orderby_ref_not_flagged",
+        # CONSERVATIVE: a bare [..] ORDERBY carries no table -> undecidable -> never flagged (no
+        # false alarm), even though a fact aggregate is nowhere in sight.
+    ),
+]
+
+
+@pytest.mark.parametrize("dax, flagged", _CROSS_WINDOW_CASES)
+def test_metadata_tier_cross_table_window_cases(tmp_path, dax, flagged):
+    model_dir = _orders_model(tmp_path, measures=[("Probe", dax)])
+    res = fo.metadata_tier(model_dir=model_dir)
+    hits = [f for f in res["cross_table_windows"] if f["object"] == "Probe"]
+    if flagged:
+        assert hits, "expected a cross-table window finding for: %s" % dax
+        # the defect resolves -- it must NOT also appear as an unresolved binding
+        assert [u for u in res["unresolved_bindings"] if u["object"] == "Probe"] == []
+    else:
+        assert hits == [], "expected NO cross-table window finding for: %s (got %r)" % (dax, hits)
+
+
+def test_cross_table_window_does_not_move_binding_or_overall(tmp_path):
+    # The separation invariant: a resolvable-but-cross-table window is reported on its OWN channel and
+    # must never perturb binding / overall (so the established calibration is untouched).
+    clean = _orders_model(tmp_path / "clean", measures=[
+        ("Pos", "STDEVX.S(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC)), "
+                "CALCULATE(COUNTROWS('Orders')))")])
+    cross = _orders_model(tmp_path / "cross", measures=[
+        ("Pos", "STDEVX.S(WINDOW(1, ABS, -1, ABS, ORDERBY('Calendar'[Date], ASC)), "
+                "CALCULATE(COUNTROWS('Orders')))")])
+    rc = fo.metadata_tier(model_dir=clean)
+    rx = fo.metadata_tier(model_dir=cross)
+    # identical binding inventory -> identical binding + overall, regardless of the window finding
+    assert rc["scores"]["binding"] == rx["scores"]["binding"] == 1.0
+    assert rc["scores"]["overall"] == rx["scores"]["overall"]
+    assert rc["unresolved_bindings"] == rx["unresolved_bindings"] == []
+    # but the window-consistency signal DOES separate them
+    assert rc["scores"]["window_consistency"] == 1.0
+    assert rx["scores"]["window_consistency"] == 0.0
+    assert len(rx["cross_table_windows"]) == 1
+    f = rx["cross_table_windows"][0]
+    assert f["orderby_table"] == "Calendar" and f["anchor_tables"] == ["Orders"]
+
+
+def test_cross_table_window_finding_shape_and_window_count(tmp_path):
+    model_dir = _orders_model(tmp_path, measures=[
+        ("Plain", "SUM('Orders'[Sales])"),
+        ("Cross", "COUNTROWS(WINDOW(1, ABS, -1, ABS, ORDERBY('Calendar'[Date], ASC), "
+                  "PARTITIONBY('Orders'[Region])))")])
+    res = fo.metadata_tier(model_dir=model_dir)
+    assert res["window_objects_total"] == 1  # only the WINDOW measure counts as a window object
+    f = [x for x in res["cross_table_windows"] if x["object"] == "Cross"][0]
+    assert set(f) >= {"table", "object", "kind", "orderby_table", "anchor_tables",
+                      "partition_tables", "reason"}
+    assert f["partition_tables"] == ["Orders"]
+    assert "cross-table ORDERBY" in f["reason"]
+
+
+def test_window_cross_table_helper_handles_garbage(tmp_path):
+    # The detector must never raise on empty / non-window / unbalanced input.
+    assert fo._window_cross_table_findings("T", "measure", "x", "") == []
+    assert fo._window_cross_table_findings("T", "measure", "x", "SUM('Orders'[Sales])") == []
+    assert fo._window_cross_table_findings("T", "measure", "x",
+                                           "OFFSET(-1, ORDERBY('Calendar'[Date]") == []
+
+
 def test_metadata_tier_runs_through_run_oracle(tmp_path):
     # End-to-end: run_oracle attaches an additive ``metadata`` record and never raises.
     model_dir = _orders_model(tmp_path, measures=[("Total Sales", "SUM('Orders'[Sales])")])
@@ -318,3 +431,4 @@ def test_metadata_tier_runs_through_run_oracle(tmp_path):
     assert "metadata" in report
     assert report["metadata"]["available"] is True
     assert report["metadata"]["scores"]["binding"] == 1.0
+    assert "cross_table_windows" in report["metadata"]
