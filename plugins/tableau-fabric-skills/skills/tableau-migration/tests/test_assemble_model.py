@@ -802,6 +802,30 @@ def test_date_axis_order_resolver_is_none_without_date_dimension():
     assert _date_axis_order_resolver(_date_axis_resolve, "Date", None) is None
 
 
+def test_positional_measure_orderby_is_single_table_not_cross_table_redirect():
+    # REGRESSION (live-proven on Fabric, error 0x413A0003): a positional table-calc measure addressed
+    # across the continuous DATE axis must emit an OFFSET/WINDOW whose ORDERBY and PARTITIONBY come
+    # from a SINGLE table. ADD #1 redirected the ORDERBY to the calendar key Date[Date] while the inner
+    # aggregate + partition stayed on the fact (Orders) -> a cross-table window with no <relation>,
+    # which the live engine rejects ("all OrderBy and PartitionBy columns must be from the same
+    # table"). The model build must order by the fact's OWN date column (Orders[Order_Date]) instead.
+    # _DATE_BAND_SQLSERVER carries an Order Date column, so the Date dimension IS generated and the
+    # (now-disabled) redirect path is genuinely reachable -- making this a non-vacuous guard.
+    sod = _sod_usage(cols=[Pill("none:Order Date:nk", "Order Date", "None")])
+    out = assemble_import_model(parse_tds(_DATE_BAND_SQLSERVER), model_name="Superstore",
+                                calcs=[], table_calc_usages=[sod])
+    assert "definition/tables/Date.tmdl" in out["parts"]   # the redirect's target dimension exists
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    assert "measure 'Standard of Deviation' =" in measures
+    # the positional window orders by the FACT date column -- single-table, valid DAX ...
+    assert "ORDERBY('Orders'[Order_Date], ASC)" in measures
+    # ... and NEVER on the calendar key (the cross-table form the live engine rejects).
+    assert "ORDERBY('Date'[Date]" not in measures
+    row = {r["measure"]: r for r in out["report"]["measures"]}["Standard of Deviation"]
+    assert row["status"] == "translated"
+    assert row["source"]["order_by"] == [["Order Date", "ASC"]]
+
+
 def test_assemble_excel_collection_multi_table():
     out = migrate_tds_to_semantic_model(EXCEL_COLLECTION, model_name="Superstore")
     parts = out["parts"]

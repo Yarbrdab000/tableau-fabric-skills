@@ -860,13 +860,17 @@ def test_table_calc_cross_table_falls_back():
     assert "cross-table" in reason
 
 
-# --- ADD #1: trusted ORDERBY-only date-axis redirect (marked-calendar key) --------------------
-# A positional table calc orders by the worksheet's continuous-date axis, but the rebuilt visual
-# groups that axis on the marked-calendar key Date[Date]. An ``order_resolver`` redirects ONLY the
-# ORDERBY (never the inner aggregate or the partition) to Date[Date]; because the Date dimension
-# relates to the fact, the redirected addressing column is a related addressing dimension (NOT a
-# cross-table aggregate term), so it is exempt from the single-table guard and the measure stays
-# translated -- giving "previous mark = previous data-date" exactly as the visual renders.
+# --- ADD #1: ORDERBY-only date-axis redirect plumbing (marked-calendar key) -------------------
+# A positional table calc orders by the worksheet's continuous-date axis. An ``order_resolver``
+# redirects ONLY the ORDERBY (never the inner aggregate or the partition) to the calendar key
+# Date[Date]. These tests exercise that calc_to_dax plumbing MECHANICALLY: given a redirecting
+# resolver, the emitted OFFSET/WINDOW sorts on Date[Date].
+#
+# NOTE -- the redirect is DISABLED in the model build (assemble_model passes order_resolver=None):
+# Date[Date] order + a fact partition is a CROSS-TABLE OFFSET/WINDOW with no <relation>, which the
+# live Fabric engine rejects (0x413A0003: "all OrderBy and PartitionBy columns must be from the
+# same table"). Production therefore orders by the fact's own date column. This plumbing + these
+# tests are retained for a future relation-supplying re-enable; they do NOT assert shipped DAX.
 from calc_to_dax import translate_percent_diff_to_dax  # noqa: E402
 
 

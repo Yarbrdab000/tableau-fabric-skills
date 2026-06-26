@@ -205,10 +205,19 @@ def _date_axis_order_resolver(resolve, date_table, active_date_cols, date_key="D
     it as the ``required_facts`` the redirect depends on, so it can fail-closed when the inner
     aggregate is on an UNRELATED table (whose order would not propagate through the Date relationship).
     Returns ``None`` (no redirect) when there is no Date dimension or no active date column, making the
-    no-date-dimension path byte-for-byte identical. The redirect is ORDERBY-only: the inner aggregate
-    and the partition still resolve to the fact table, and because the Date dimension relates to the
-    fact, the window's date order propagates to the aggregate through that relationship -- valid DAX
-    whose addressing dimension is deliberately exempt from the single-table guard.
+    no-date-dimension path byte-for-byte identical.
+
+    DISABLED (not wired into the model build): the redirect is ORDERBY-only -- the inner aggregate and
+    the partition stay on the fact -- on the assumption that the Date->fact relationship would propagate
+    the date order to the aggregate. That assumption is FALSE for OFFSET/WINDOW. Microsoft's spec
+    requires, when the ``relation`` argument is omitted, that every ``orderBy``/``partitionBy`` column
+    come from a SINGLE table; ordering on ``Date[Date]`` while partitioning on ``Orders`` is cross-table
+    and the live Fabric engine rejects it (``0x413A0003``: "OFFSET's Relation parameter is omitted. In
+    this case, all OrderBy and PartitionBy columns must be from the same table."). The sole call site
+    therefore passes ``order_resolver=None`` so the ORDERBY resolves to the fact's own date column (same
+    table as the partition -> valid single-table DAX). This builder is retained for a future
+    relation-supplying implementation (emit an explicit ``<relation>`` spanning the calendar key + the
+    partition) that would make calendar-key ordering valid; until then it must NOT be re-wired.
     """
     if not date_table or not active_date_cols:
         return None
@@ -1665,7 +1674,16 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
         approved_calc_dax=approved_calc_dax, synth_measures=fp.get("measures"),
         known_tables=set(table_names), table_calc_usages=table_calc_usages,
-        order_resolver=_date_axis_order_resolver(resolve, date_name, active_date_cols),
+        # ADD #1's date-axis ORDERBY redirect is DISABLED. It rewrote a positional table-calc's
+        # ORDERBY to the calendar key Date[Date] while the partition + inner aggregate stayed on the
+        # fact (Orders), producing an OFFSET/WINDOW whose orderBy and partitionBy span two tables with
+        # no <relation>. Microsoft's OFFSET/WINDOW spec requires every orderBy/partitionBy column to
+        # come from ONE table when relation is omitted, and the live Fabric engine rejects the
+        # cross-table form (0x413A0003: "OFFSET's Relation parameter is omitted ... all OrderBy and
+        # PartitionBy columns must be from the same table"). Passing None resolves the ORDERBY to the
+        # fact's own date column (Orders[Order_Date]) -- same table as the partition -> valid DAX. The
+        # _date_axis_order_resolver builder is retained for a future relation-supplying re-enable.
+        order_resolver=None,
         flag_measures=flag_measures)
     parts["definition/tables/_Measures.tmdl"] = measures_table
     table_names.append("_Measures")
