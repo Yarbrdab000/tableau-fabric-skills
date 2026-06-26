@@ -13,6 +13,7 @@ HERE = os.path.dirname(__file__)
 sys.path.insert(0, HERE)
 
 import translation_reconcile as RC  # noqa: E402
+import translation_router as R  # noqa: E402
 
 
 def _wrap(v):
@@ -220,5 +221,28 @@ def test_each_ranked_entry_carries_an_auditable_signal_breakdown():
         assert sig["category"] == "type_or_shape_mismatch"
     top = out["ranked"][0]
     assert top["signals"]["oracle"] == RC.VERIFIED and top["signals"]["gate"] == "pass"
+
+
+def test_real_router_dax_language_gap_classification_enforces_mandatory_oracle():
+    # Integration: drive the REAL router classification (not a hand-built category) for a CONFIRMED
+    # real gap -- REGEXP_MATCH, which DAX cannot express natively -- and prove rank_candidates honours
+    # the mandatory-oracle rule on it. Closes the unit->integration seam: the router category the
+    # production handoff actually stamps must engage the (d) enforcement.
+    routed = R.classify_fallback("unsupported function REGEXP_MATCH")
+    assert routed["category"] == RC.DAX_LANGUAGE_GAP          # the real router agrees it is a gap
+    req = {"name": "Is Promo SKU", "category": routed["category"]}
+
+    # An agent's plausible-but-unverified approximation must NOT be auto-selected.
+    unverified = RC.rank_candidates("Is Promo SKU", ["SEARCH(\"PROMO\",'Orders'[SKU],1,0)>0"],
+                                    request=req)
+    assert unverified["ranked"][0]["requires_oracle"] is True
+    assert unverified["best"] is None
+
+    # Once the oracle CONFIRMS it against Tableau truth, the mandatory bar is met and it is selectable.
+    verified = RC.rank_candidates("Is Promo SKU", ["SEARCH(\"GOOD\",'Orders'[SKU],1,0)>0"],
+                                  request=req, fabric_oracle=_oracle_by_marker({"GOOD": True}),
+                                  tableau_value=True)
+    assert verified["ranked"][0]["requires_oracle"] is False
+    assert verified["best"] == "SEARCH(\"GOOD\",'Orders'[SKU],1,0)>0"
 
 
