@@ -360,6 +360,21 @@ _CROSS_WINDOW_CASES = [
         # CONSERVATIVE: a bare [..] ORDERBY carries no table -> undecidable -> never flagged (no
         # false alarm), even though a fact aggregate is nowhere in sight.
     ),
+    pytest.param(
+        "OFFSET(-1, ORDERBY('Orders'[Order_Date] ASC, 'Calendar'[Date] DESC), "
+        "PARTITIONBY('Orders'[Region]))",
+        True, id="multi_key_orderby_one_cross_table",
+        # GOLDEN: a two-key ORDERBY whose first key is the fact's own date (fine) but whose second
+        # reaches into the related dim -> the cross-table key is flagged. Every column resolves, so
+        # binding stays clean; the sort-direction keywords must not perturb table extraction.
+    ),
+    pytest.param(
+        "COUNTROWS(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date] DESC), "
+        "PARTITIONBY('Orders'[Region])))",
+        False, id="orderby_desc_same_table_clean",
+        # GOLDEN (positive control): a DESC keyword on a single-table ORDERBY + same-table
+        # PARTITIONBY -> faithful, no finding.
+    ),
 ]
 
 
@@ -419,6 +434,57 @@ def test_window_cross_table_helper_handles_garbage(tmp_path):
     assert fo._window_cross_table_findings("T", "measure", "x", "SUM('Orders'[Sales])") == []
     assert fo._window_cross_table_findings("T", "measure", "x",
                                            "OFFSET(-1, ORDERBY('Calendar'[Date]") == []
+
+
+def test_window_detector_masks_string_literals(tmp_path):
+    # A DAX string literal can quote anything -- a fake ORDERBY clause, brackets, a single quote.
+    # The detector masks string literals first, so a clause buried in a string is never parsed as a
+    # real navigation argument (no false alarm), while a genuine cross-table window is still caught.
+    fake = ('VAR lbl = "see ORDERBY(' + "'Calendar'[Date]" + ')" '
+            "RETURN OFFSET(-1, ORDERBY('Orders'[Order_Date]), PARTITIONBY('Orders'[Region]))")
+    assert fo._window_cross_table_findings("Orders", "measure", "m", fake) == []
+    # a benign string literal does NOT suppress a real cross-table finding
+    real = ('VAR note = "prior-row pct" '
+            "RETURN OFFSET(-1, ORDERBY('Calendar'[Date]), PARTITIONBY('Orders'[Region]))")
+    hits = fo._window_cross_table_findings("Orders", "measure", "m", real)
+    assert [f["orderby_table"] for f in hits] == ["Calendar"]
+    # a nested window function with an inner cross-table ORDERBY is still flagged
+    nested = ("COUNTROWS(WINDOW(1, ABS, -1, ABS, OFFSET(-1, ORDERBY('Calendar'[Date])), "
+              "PARTITIONBY('Orders'[Region])))")
+    nhits = fo._window_cross_table_findings("Orders", "measure", "m", nested)
+    assert [f["orderby_table"] for f in nhits] == ["Calendar"]
+
+
+def test_mask_dax_string_literals_unit():
+    m = fo._mask_dax_string_literals
+    # identity when there is no string literal; empty / None are safe
+    assert m("SUM('Orders'[Sales])") == "SUM('Orders'[Sales])"
+    assert m("") == "" and m(None) == ""
+    # length is preserved exactly (downstream balanced-paren index math depends on it)
+    s = "A & " + '"x ORDERBY(' + "'D'[d]" + ')"' + " & B"
+    assert len(m(s)) == len(s)
+    # the masked text carries no parseable clause or bracket reference from inside the string
+    assert "ORDERBY" not in m(s).upper() and "[" not in m(s)
+    # an escaped inner quote ("") keeps the parser inside the string; surrounding code is preserved
+    masked = m('X="a""b"Y')
+    assert masked.startswith("X=") and masked.endswith("Y")
+    assert "a" not in masked and "b" not in masked and len(masked) == len('X="a""b"Y')
+
+
+def test_binding_resolver_ignores_refs_inside_string_literals(tmp_path):
+    # The binding resolver must not be fooled by a column/table reference quoted INSIDE a DAX string
+    # literal -- e.g. an error-message or label string that contains "'Orders'[NoSuchCol]". Such a
+    # phantom would otherwise resolve to nothing and raise a FALSE unresolved-binding finding,
+    # wrongly lowering the binding / overall score of an otherwise-faithful model.
+    dax = "VAR x = \"missing 'Orders'[NoSuchCol] here\" RETURN SUM('Orders'[Sales])"
+    # the gap is real: a raw scan sees the phantom ref; the masked scan does not
+    assert ("Orders", "NoSuchCol") in set(fo._extract_dax_refs(dax))
+    assert ("Orders", "NoSuchCol") not in set(fo._extract_dax_refs(fo._mask_dax_string_literals(dax)))
+    res = fo.metadata_tier(model_dir=_orders_model(tmp_path, measures=[("Label", dax)]))
+    assert res["scores"]["binding"] == 1.0
+    assert [u for u in res["unresolved_bindings"] if u["object"] == "Label"] == []
+    # the in-string token must not inflate the window-object count either
+    assert res["window_objects_total"] == 0
 
 
 def test_metadata_tier_runs_through_run_oracle(tmp_path):

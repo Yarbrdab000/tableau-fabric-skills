@@ -2743,22 +2743,57 @@ def _all_table_tokens(text):
     return tables
 
 
+def _mask_dax_string_literals(expression):
+    """Blank out DAX string literals (double-quoted; ``""`` is an escaped inner quote) with
+    same-length spaces so any ``ORDERBY(`` / ``PARTITIONBY(`` / bracket / single-quote that appears
+    INSIDE a string can never be mis-parsed as a real navigation clause or table/column reference.
+    Length is preserved exactly so the balanced-paren index math downstream stays valid. Returns the
+    input unchanged when it carries no string literal."""
+    if not expression or '"' not in expression:
+        return expression or ""
+    out = []
+    in_str = False
+    i = 0
+    n = len(expression)
+    while i < n:
+        ch = expression[i]
+        if in_str:
+            if ch == '"':
+                if i + 1 < n and expression[i + 1] == '"':  # "" -> escaped quote, stay in string
+                    out.append("  ")
+                    i += 2
+                    continue
+                out.append(" ")
+                in_str = False
+            else:
+                out.append(" ")
+        elif ch == '"':
+            out.append(" ")
+            in_str = True
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _window_cross_table_findings(home_table, kind, obj_name, expression):
     """Flag a window-function ORDERBY whose table is not the table the window groups/aggregates.
 
     Conservative + deterministic: explicit-table refs only (a bare ``[Col]`` ORDERBY never flags),
     and a finding is raised only when there is a contradicting anchor table (a PARTITIONBY column or
     a non-ORDERBY body reference on a DIFFERENT table). A same-table ORDERBY -- the corrected form --
-    never flags. Returns a possibly-empty list; never raises."""
+    never flags. String literals are masked first so a clause/ref quoted inside a DAX string cannot
+    raise a false alarm. Returns a possibly-empty list; never raises."""
     if not expression:
         return []
-    if not any(fn in expression.upper() for fn in _DAX_WINDOW_FUNCS):
+    scan = _mask_dax_string_literals(expression)
+    if not any(fn in scan.upper() for fn in _DAX_WINDOW_FUNCS):
         return []
-    order_tables = _clause_tables(expression, _ORDERBY_CLAUSE_RE)
+    order_tables = _clause_tables(scan, _ORDERBY_CLAUSE_RE)
     if not order_tables:
         return []
-    part_tables = _clause_tables(expression, _PARTITIONBY_CLAUSE_RE)
-    body = _strip_clause(expression, _ORDERBY_CLAUSE_RE)
+    part_tables = _clause_tables(scan, _PARTITIONBY_CLAUSE_RE)
+    body = _strip_clause(scan, _ORDERBY_CLAUSE_RE)
     body_tables = _all_table_tokens(body)
     anchor = part_tables | body_tables
     if not anchor:
@@ -3026,14 +3061,19 @@ def metadata_tier(report_dir=None, model_dir=None, twb_path=None):
     def _scan(home_table, kind, obj_name, expression):
         nonlocal total_objs, resolved_objs, window_objects
         total_objs += 1
-        up = (expression or "").upper()
+        # Mask DAX string literals before any raw-DAX scan so a bracket / single-quote / window-name
+        # quoted INSIDE a string can never be mis-read as a real reference (a false unresolved
+        # binding) or a phantom window object. Outside string literals the text is byte-identical, so
+        # resolution of every genuine reference -- and thus the established calibration -- is unchanged.
+        scan = _mask_dax_string_literals(expression)
+        up = scan.upper()
         is_window = any(fn in up for fn in _DAX_WINDOW_FUNCS)
         if is_window:
             window_objects += 1
             cross_table_windows.extend(
                 _window_cross_table_findings(home_table, kind, obj_name, expression))
         obj_ok = True
-        for ref_table, ref_col in _extract_dax_refs(expression):
+        for ref_table, ref_col in _extract_dax_refs(scan):
             ok, reason = _resolve(home_table, ref_table, ref_col)
             if not ok:
                 obj_ok = False
