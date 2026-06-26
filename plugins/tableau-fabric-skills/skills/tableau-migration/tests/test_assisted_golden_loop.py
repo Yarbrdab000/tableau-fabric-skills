@@ -194,6 +194,27 @@ def test_corrupt_or_inert_candidate_fails_gate_without_hitting_oracle():
     assert hits["n"] == 0, "the backend oracle must never be hit with a candidate that fails the gate"
 
 
+def test_raw_tableau_formula_is_refused_by_the_gate():
+    # The second compiler's worst failure mode is pasting the UN-TRANSLATED Tableau formula (carrying
+    # its ``{FIXED ...}`` idiom) as if it were DAX. The gate must refuse it -- with a leftover-idiom
+    # issue -- BEFORE any backend call, using the real corpus formulas (faithful, not synthetic).
+    hits = {"n": 0}
+
+    def counting_oracle(q):
+        hits["n"] += 1
+        return _wrap(1.0)
+
+    for entry in _DETECT:
+        raw = entry["formula"]
+        verdict = R.check_candidate_dax(raw)
+        assert verdict["ok"] is False, entry["name"]
+        assert any("leftover Tableau idiom" in i for i in verdict["issues"]), entry["name"]
+        rec = RC.reconcile(entry["name"], raw, fabric_oracle=counting_oracle, tableau_value=1.0)
+        assert rec["state"] == RC.NOT_EVALUATED, entry["name"]
+        assert rec["gate"]["ok"] is False, entry["name"]
+    assert hits["n"] == 0, "un-translated Tableau must never reach the backend oracle"
+
+
 # --------------------------------------------------------------------------- canonical sidecar lock
 def test_approved_sidecar_canonical_pairs_pass_gate_and_reconcile():
     for entry in _SIDECAR:
