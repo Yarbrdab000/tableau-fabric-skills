@@ -860,13 +860,17 @@ def test_table_calc_cross_table_falls_back():
     assert "cross-table" in reason
 
 
-# --- ADD #1: trusted ORDERBY-only date-axis redirect (marked-calendar key) --------------------
-# A positional table calc orders by the worksheet's continuous-date axis, but the rebuilt visual
-# groups that axis on the marked-calendar key Date[Date]. An ``order_resolver`` redirects ONLY the
-# ORDERBY (never the inner aggregate or the partition) to Date[Date]; because the Date dimension
-# relates to the fact, the redirected addressing column is a related addressing dimension (NOT a
-# cross-table aggregate term), so it is exempt from the single-table guard and the measure stays
-# translated -- giving "previous mark = previous data-date" exactly as the visual renders.
+# --- ADD #1: ORDERBY-only date-axis redirect plumbing (marked-calendar key) -------------------
+# A positional table calc orders by the worksheet's continuous-date axis. An ``order_resolver``
+# redirects ONLY the ORDERBY (never the inner aggregate or the partition) to the calendar key
+# Date[Date]. These tests exercise that calc_to_dax plumbing MECHANICALLY: given a redirecting
+# resolver, the emitted OFFSET/WINDOW sorts on Date[Date].
+#
+# NOTE -- the redirect is DISABLED in the model build (assemble_model passes order_resolver=None):
+# Date[Date] order + a fact partition is a CROSS-TABLE OFFSET/WINDOW with no <relation>, which the
+# live Fabric engine rejects (0x413A0003: "all OrderBy and PartitionBy columns must be from the
+# same table"). Production therefore orders by the fact's own date column. This plumbing + these
+# tests are retained for a future relation-supplying re-enable; they do NOT assert shipped DAX.
 from calc_to_dax import translate_percent_diff_to_dax  # noqa: E402
 
 
@@ -931,7 +935,27 @@ def test_percent_diff_orderby_redirects_to_marked_calendar_key():
     assert "Order_Date" not in dax  # the fact date column is fully replaced by the calendar key
 
 
-# --- g2: cross-calc references (a calc that references another calc by name) -------------------
+# PRODUCTION-PATH regression (order_resolver=None, the model build's setting): every positional
+# OFFSET/WINDOW shape must order by the FACT's own date column -- single-table, valid DAX -- and
+# NEVER on the cross-table calendar key Date[Date] (the live engine rejects that with 0x413A0003).
+# The assemble_model peer guard (test_positional_measure_orderby_is_single_table_not_cross_table_
+# redirect) proves it for the SoD WINDOW measure; these prove it for the OTHER positional shapes the
+# completeness argument covers -- percent-difference and LOOKUP/OFFSET -- at the emitter. Non-vacuous:
+# each FAILS if the cross-table redirect is ever re-enabled by default.
+def test_percent_diff_production_path_orderby_is_single_table_fact_date():
+    dax, reason, _ = translate_percent_diff_to_dax(
+        "SUM([Sales])", _resolver, partition_by=_PART, order_by=_ORDER, order_resolver=None)
+    assert reason == "ok"
+    assert "OFFSET(-1, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region]))" in dax
+    assert "ORDERBY('Date'[Date]" not in dax   # never the cross-table calendar key
+
+
+def test_lookup_offset_production_path_orderby_is_single_table_fact_date():
+    dax, reason, _ = translate_tableau_table_calc_to_dax(
+        "LOOKUP(SUM([Sales]), -1)", _resolver, (), _ORDER, order_resolver=None)
+    assert reason == "ok"
+    assert dax == "CALCULATE(SUM('Orders'[Sales]), OFFSET(-(1), ORDERBY('Orders'[Order_Date], ASC)))"
+    assert "ORDERBY('Date'[Date]" not in dax
 from calc_to_dax import translate_tableau_calc_to_dax_typed  # noqa: E402
 
 

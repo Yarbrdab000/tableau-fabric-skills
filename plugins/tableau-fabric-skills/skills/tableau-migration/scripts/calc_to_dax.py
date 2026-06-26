@@ -2305,15 +2305,20 @@ def _parse_fixed_lod(toks):
 
 
 def _parse_max_of_fixed(toks):
-    """``{FIXED P : MAX({FIXED Q : AGG([f])})}`` -> ``(P, Q, AGG, f)``; else ``None``."""
+    """``{FIXED P : MAX|MIN({FIXED Q : AGG([f])})}`` -> ``(P, Q, AGG, f, extreme)``; else ``None``.
+
+    ``extreme`` is ``"MAX"`` (argmax) or ``"MIN"`` (argmin) -- the per-partition selector the detail
+    member's aggregate must equal. The two read identically ("the member with the most / least
+    AGG([f]) per P") and differ only in the windowing function the emitter picks (MAXX vs MINX)."""
     outer = _parse_fixed_lod(toks)
     if outer is None:
         return None
     p_dims, inner = outer
     inner = _strip_outer_parens(inner)
-    if (len(inner) < 4 or inner[0][0] != "id" or inner[0][1].upper() != "MAX"
+    if (len(inner) < 4 or inner[0][0] != "id" or inner[0][1].upper() not in ("MAX", "MIN")
             or inner[1] != ("op", "(") or inner[-1] != ("op", ")")):
         return None
+    extreme = inner[0][1].upper()
     fl = _parse_fixed_lod(inner[2:-1])
     if fl is None:
         return None
@@ -2321,7 +2326,7 @@ def _parse_max_of_fixed(toks):
     agg = _parse_simple_agg(agg_inner)
     if agg is None:
         return None
-    return p_dims, q_dims, agg[0], agg[1]
+    return p_dims, q_dims, agg[0], agg[1], extreme
 
 
 def _resolve_detail_lod(toks, calc_lookup):
@@ -2350,12 +2355,12 @@ def _resolve_detail_lod(toks, calc_lookup):
 
 
 def _detect_argmax_dimension(formula, resolver, calc_lookup):
-    """Detect Tableau's argmax-over-a-dimension idiom and emit faithful, tie-aware DAX.
+    """Detect Tableau's argmax / argmin-over-a-dimension idiom and emit faithful, tie-aware DAX.
 
     Shape:  ``IF <A> = {FIXED P, C : AGG([f])} THEN [C] END``  where ``<A>`` -- inline or
-    via another calc -- is ``{FIXED P : MAX({FIXED P, C : AGG([f])})}``. Reads as "the member
-    of dimension C whose AGG([f]) equals the per-P maximum" (e.g. the city with the most
-    sales in each state). Returns a suggestion dict or ``None``.
+    via another calc -- is ``{FIXED P : MAX({FIXED P, C : AGG([f])})}`` (or ``MIN`` for argmin).
+    Reads as "the member of dimension C whose AGG([f]) equals the per-P maximum/minimum" (e.g. the
+    city with the most -- or least -- sales in each state). Returns a suggestion dict or ``None``.
     """
     try:
         toks = _tokenize(formula)
@@ -2410,7 +2415,7 @@ def _detect_argmax_dimension(formula, resolver, calc_lookup):
             return None
         if a is None:
             return None
-    p_dims, q_dims, a_aggname, a_field = a
+    p_dims, q_dims, a_aggname, a_field, extreme = a
 
     # ---- structural validation on RESOLVED (table, col) identities --------
     def rid(cap):
@@ -2457,6 +2462,12 @@ def _detect_argmax_dimension(formula, resolver, calc_lookup):
     summarize_cols = ", ".join(tdax + _dax_col(col) for col in p_cols + [c_col])
     allexcept_cols = ", ".join(tdax + _dax_col(col) for col in p_cols)
     detail_measure = f"{agg_dax}({tdax}{_dax_col(field_col)})"
+    # argmax -> MAXX/__max; argmin -> MINX/__min. Detail table + tie handling are identical.
+    is_min = extreme == "MIN"
+    ext_fn, ext_var = ("MINX", "__min") if is_min else ("MAXX", "__max")
+    word = "minimum" if is_min else "maximum"
+    arg_word = "argmin" if is_min else "argmax"
+    tie_fn = "BOTTOMN" if is_min else "TOPN"
     dax = (
         "VAR __detail =\n"
         "    CALCULATETABLE(\n"
@@ -2466,21 +2477,21 @@ def _detect_argmax_dimension(formula, resolver, calc_lookup):
         "        ),\n"
         f"        ALLEXCEPT({tdax}, {allexcept_cols})\n"
         "    )\n"
-        "VAR __max = MAXX(__detail, [@value])\n"
+        f"VAR {ext_var} = {ext_fn}(__detail, [@value])\n"
         "RETURN\n"
-        f'    CONCATENATEX(FILTER(__detail, [@value] = __max), {tdax}{_dax_col(c_col)}, ", ")'
+        f'    CONCATENATEX(FILTER(__detail, [@value] = {ext_var}), {tdax}{_dax_col(c_col)}, ", ")'
     )
     caveats = [
         "Emitted as a MEASURE (text), not the row-level dimension Tableau modeled -- "
-        "the faithful Power BI shape for an argmax.",
-        f"Ties: every {c_col} sharing the maximum is returned, comma-joined. Confirm this "
-        "matches your intended tie handling (a single-value form uses TOPN/SELECTEDVALUE).",
+        f"the faithful Power BI shape for an {arg_word}.",
+        f"Ties: every {c_col} sharing the {word} is returned, comma-joined. Confirm this "
+        f"matches your intended tie handling (a single-value form uses {tie_fn}/SELECTEDVALUE).",
         f"FIXED semantics mapped via ALLEXCEPT({table}, {', '.join(p_cols)}): respects current "
         f"filter context on the partition but ignores filters on {c_col}. Matches Tableau FIXED "
         "at totals/context filters; can differ under a viz dimension filter.",
     ]
     return {
-        "pattern": "argmax-dimension",
+        "pattern": "argmin-dimension" if is_min else "argmax-dimension",
         "dax": dax,
         "confidence": "medium",
         "requires_approval": True,

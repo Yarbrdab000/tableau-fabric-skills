@@ -13,6 +13,40 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **a candidate-ranking step for the assisted (second-compiler) tier**
+  (`translation_reconcile.rank_candidates`) — the optional acceleration tier's *selection* helper.
+  Given the N candidate DAX translations the agent (the documented second compiler) authors for one
+  fallback, it reconciles each through the gate + numeric oracle and returns them **best-first**, each
+  with a `confidence` (`high` = verified against the Tableau ground truth · `medium` = passed the gate
+  but not yet reconciled · `low` = proven wrong or malformed) and a one-line `reason`, plus `best`
+  (the top non-`low` candidate, or `None` when every candidate is low). It ranks by **semantic
+  equivalence, not string similarity**, embeds **no LLM API** (the agent proposes; this scores), and
+  lands nothing — the chosen candidate still flows through `approved_calc_dax` and the human gate.
+  Each ranked entry carries an auditable `signals` breakdown (`{gate, oracle, category}`) and a
+  `requires_oracle` flag that enforces the playbook's mandatory-oracle rule — an unverified
+  `dax_language_gap` approximation is **never** returned as `best` until the oracle VERIFIES it.
+  Accepts each candidate as a raw DAX string or a `suggest_assisted_dax` suggestion dict, and
+  degrades gracefully — zero candidates, a `None` list, or a malformed candidate carrying no DAX
+  resolve to a gate-rejected empty string, so `best` is always a landable DAX **string** or `None`,
+  never a stray dict. Documented in `resources/second-compiler.md`.
+- **tableau-migration:** **the assisted (second-compiler) idiom registry now recognizes the
+  argmin-over-a-dimension twin** of the existing argmax idiom ("the member of dimension C with the
+  *least* AGG([f]) per partition", e.g. the lowest-selling city in each state). The detector
+  (`_detect_argmax_dimension` in `calc_to_dax.py`) and its LOD parser (`_parse_max_of_fixed`) now
+  accept the `{FIXED P : MIN(...)}` selector and emit the same faithful, tie-aware
+  `CALCULATETABLE`/`ADDCOLUMNS`/`SUMMARIZE` shape with `MINX` instead of `MAXX` (pattern
+  `argmin-dimension`); the argmax branch is byte-for-byte unchanged. Suggestions remain
+  approval-gated — never silently emitted. Original parameterization of our own argmax emitter
+  (CLEANROOM pass).
+- **tableau-migration:** **a golden-loop regression harness for the assisted tier**
+  (`tests/test_assisted_golden_loop.py`) that drives a corpus of known-good translations through the
+  whole Tier-1 loop end-to-end — `suggest_assisted_dax` → `check_candidate_dax` (syntactic gate) →
+  `reconcile` (numeric oracle) — seeded with the argmax/argmin idioms and the canonical
+  human-approved C1/C2 sidecar pair (C1 "Highest Selling City By State Sales" = 1,221,139.3614
+  reconciled against ground truth; C2 gate-locked). Proves non-vacuity (a wrong oracle value
+  MISMATCHes; a corrupt/inert candidate fails the gate without touching the backend) and adds a
+  forcing-function test so every newly-registered idiom detector must carry a golden corpus row.
+  Test-only; no engine or report-schema change.
 - **tableau-migration:** **an author's explicit per-field number format now survives to the Power BI
   `formatString`.** Tableau persists a column's explicit currency / percent / precision as a
   `default-format` code on the logical `<column>` element (e.g. `c"$"#,##0;("$"#,##0)`); previously
