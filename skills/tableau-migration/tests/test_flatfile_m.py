@@ -164,8 +164,9 @@ def test_excel_without_path_falls_back_to_scaffold():
     assert d["flatfile_path"] is None
     rel = [r for r in d["relations"] if r["kind"] == "table"][0]
     tmdl = C.emit_table_tmdl_m(rel, d, "Import")
-    # never a silently-empty real partition: clearly-flagged scaffold instead
-    assert "let Source = null in Source" in tmdl
+    # never a silently-empty real partition: clearly-flagged DEPLOY-valid scaffold instead
+    assert "Source = #table(type table [], {})" in tmdl
+    assert "Source = null" not in tmdl
     assert "excel-direct" in tmdl
 
 

@@ -45,6 +45,18 @@ migration step errors or produces something unexpected.
 | Refresh fails on credentials | Credentials are a manual boundary | **Stop** and have the user configure the connection; never enter credentials for them |
 | DirectQuery to on-prem fails | No gateway | User selects/sets up an on-prem data gateway |
 | A custom-SQL table is slow / materializes | The native query didn't fold | Review the `Value.NativeQuery(..., [EnableFolding=true])`; fix the SQL so it folds |
+| Databricks/Snowflake custom SQL: "Native queries aren't supported by this value" | The native query was folded against the connector's **root collection** (`Databricks.Catalogs(...)`), which doesn't expose that capability | Drill to a `Kind="Database"` handle first (`Catalog = Source{[Name=<catalog>, Kind="Database"]}[Data]`) and run `Value.NativeQuery` against **that** handle — this is what the migrator now auto-emits for Databricks |
+| Custom-SQL columns load blank / "column not found" on refresh | A native query returns the **raw source headers** (`Order ID`, `Country/Region`) but the model binds underscored `sourceColumn`s (`Order_ID`) | The migrator appends `Table.RenameColumns(..., MissingField.Ignore)` remote→model so the output names match; complete the same rename by hand on any still-scaffolded partition |
+| First open of a custom-SQL model shows a Run/Cancel "approve this native query" prompt | A deliberate Power BI **native-query security gate**, not a failure | Click Run once (Desktop) or set the dataset's native-query/data-source security setting (Service). It can't be suppressed at the M level — expect it for any `Value.NativeQuery` |
+
+---
+
+## Editing the output (`.pbip` reload semantics)
+
+| Symptom | Cause | Response |
+|---|---|---|
+| Edited a `.tmdl`/`.m` file but Power BI Desktop still runs the old (broken) query | Desktop compiles the `.pbip` **once at open** and does **not** watch the files for changes; the live session keeps the compiled in-memory model | **Close and reopen** the `.pbip` to force a fresh read from disk (Tabular Editor, which writes into the live model, is the exception) |
+| A Fabric (Service) redeploy worked but the local Desktop copy didn't change | The published model and the local `.pbip` are **separate artifacts** that drift | Reload the `.pbip` after any out-of-band edit/redeploy; don't assume one reflects the other |
 
 ---
 

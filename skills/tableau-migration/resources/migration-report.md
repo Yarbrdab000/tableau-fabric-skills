@@ -184,6 +184,16 @@ name · role · category · reason · whether a suggestion is ready). Treat that
 second-compiler pass** to the user (see [second-compiler.md](second-compiler.md)); don't hand back a
 model with silent `= 0` stubs.
 
+Likewise, when a table partition's upstream query couldn't be auto-emitted (e.g. custom SQL on a
+connector whose native query isn't yet verified), the build emits a **deploy-valid but incomplete
+scaffold** (an empty typed table) rather than failing or guessing. Those partitions are surfaced
+additively so the gap is visible at build time, not at deploy: per datasource,
+`partitions_stubbed` (count) and `partitions_needs_review` (a list of `{table, kind, reason, sql}`,
+preserving the original SQL); estate-wide, `summary["partitions_stubbed_total"]`; and a **Next step —
+manual M partition completion** section in `summary.md`. Auto-emitted custom SQL — the SQL Server
+family and the catalog-drill `Value.NativeQuery` for verified connectors (Databricks) — reports
+`partitions_stubbed: 0`.
+
 ---
 
 ## Format
