@@ -445,20 +445,24 @@ def _requires_oracle(record):
 
 
 def _candidate_dax(candidate):
-    """Extract the DAX text from one ranking candidate.
+    """Extract the DAX text from one ranking candidate, always as a **string**.
 
     Accepts a raw DAX **string**, or a mapping carrying it under ``dax`` (the
     :func:`calc_to_dax.suggest_assisted_dax` suggestion shape an agent collects idiom candidates
-    from) or ``candidate_dax`` (the :func:`reconcile_all` item shape). A non-string, non-mapping is
-    returned unchanged so the syntactic gate can reject it. Pure.
+    from) or ``candidate_dax`` (the :func:`reconcile_all` item shape). Anything we cannot resolve to
+    DAX text -- a non-string / non-mapping, or a mapping with no recognized DAX key -- becomes the
+    empty string: a TYPE-correct non-candidate the syntactic gate rejects ("candidate DAX is empty"),
+    so a malformed candidate can never be graded plausible nor leak through as a non-string ``best``.
+    Pure.
     """
     if isinstance(candidate, str):
         return candidate
     if isinstance(candidate, dict):
         for key in ("dax", "candidate_dax"):
-            if candidate.get(key) is not None:
-                return candidate[key]
-    return candidate
+            value = candidate.get(key)
+            if isinstance(value, str):
+                return value
+    return ""
 
 
 def rank_candidates(name, candidates, *, fabric_oracle=None, tableau_value=_UNSET,

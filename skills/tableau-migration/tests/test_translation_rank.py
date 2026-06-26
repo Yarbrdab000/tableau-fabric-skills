@@ -246,3 +246,43 @@ def test_real_router_dax_language_gap_classification_enforces_mandatory_oracle()
     assert verified["best"] == "SEARCH(\"GOOD\",'Orders'[SKU],1,0)>0"
 
 
+# --------------------------------------------------------------------------- graceful degradation
+# rank_candidates is the optional acceleration tier and documents "never raises" + "best is always a
+# landable DAX string or None". These pin that contract against the degenerate inputs an agent can
+# realistically hand it: zero candidates, a None list, and malformed candidates with no DAX payload.
+def test_empty_candidate_list_returns_no_best_without_raising():
+    out = RC.rank_candidates("m", [])
+    assert out["ranked"] == []
+    assert out["best"] is None
+    assert out["summary"]["total"] == 0
+
+
+def test_none_candidates_argument_is_handled_gracefully():
+    out = RC.rank_candidates("m", None)
+    assert out["ranked"] == []
+    assert out["best"] is None
+
+
+def test_malformed_candidate_dict_without_dax_is_rejected_never_best():
+    # REGRESSION: a suggestion dict carrying NO dax/candidate_dax key must not masquerade as a
+    # translation. It resolves to the empty string (a type-correct non-candidate), is rejected by the
+    # gate, graded low, and is NEVER returned as best -- guarding the "best is a landable string"
+    # contract (the bug returned the raw dict as best at a plausible medium grade).
+    out = RC.rank_candidates("m", [{"pattern": "argmax-dimension", "confidence": "high"}])
+    entry = out["ranked"][0]
+    assert isinstance(entry["candidate_dax"], str)        # never the raw dict
+    assert entry["candidate_dax"] == ""
+    assert entry["confidence"] == RC.RANK_LOW
+    assert entry["signals"]["gate"] == "fail"
+    assert out["best"] is None
+
+
+def test_none_candidate_in_list_is_gate_rejected_never_best():
+    # A None among the candidates is a type-correct empty non-candidate: gate-rejected, low, not best.
+    out = RC.rank_candidates("m", [None, "SUM('Orders'[GOOD])"],
+                             fabric_oracle=_oracle_by_marker({"GOOD": 5.0}), tableau_value=5.0)
+    by_dax = {r["candidate_dax"]: r for r in out["ranked"]}
+    assert by_dax[""]["confidence"] == RC.RANK_LOW        # the None became "" and was rejected
+    assert out["best"] == "SUM('Orders'[GOOD])"           # the real candidate still wins
+
+

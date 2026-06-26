@@ -25,8 +25,10 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   Each ranked entry carries an auditable `signals` breakdown (`{gate, oracle, category}`) and a
   `requires_oracle` flag that enforces the playbook's mandatory-oracle rule — an unverified
   `dax_language_gap` approximation is **never** returned as `best` until the oracle VERIFIES it.
-  Accepts each candidate as a raw DAX string or a `suggest_assisted_dax` suggestion dict.
-  Documented in `resources/second-compiler.md`.
+  Accepts each candidate as a raw DAX string or a `suggest_assisted_dax` suggestion dict, and
+  degrades gracefully — zero candidates, a `None` list, or a malformed candidate carrying no DAX
+  resolve to a gate-rejected empty string, so `best` is always a landable DAX **string** or `None`,
+  never a stray dict. Documented in `resources/second-compiler.md`.
 - **tableau-migration:** **the assisted (second-compiler) idiom registry now recognizes the
   argmin-over-a-dimension twin** of the existing argmax idiom ("the member of dimension C with the
   *least* AGG([f]) per partition", e.g. the lowest-selling city in each state). The detector
