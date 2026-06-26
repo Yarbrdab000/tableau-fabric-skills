@@ -60,6 +60,36 @@ def test_normalize_field_explicit_semantic_role_wins():
     assert nf["semantic_role"] == "geo"
 
 
+# Regression: geo detection matches whole word tokens, not raw substrings. A substring test wrongly
+# flagged these common non-geographic dimensions as geographic ("city" in Ethnicity/Capacity, "lat"
+# in Relationship/Inflation/Translation, "state" in Real Estate, "geo" in Geometry) and would route
+# them to a confident, wrong map -- a warn-never-wrong violation.
+@pytest.mark.parametrize("name", [
+    "Ethnicity", "Capacity", "Relationship", "Inflation", "Translation",
+    "Plate", "Real Estate", "Statement", "Geometry", "Allocation", "Velocity",
+])
+def test_geo_substring_in_nongeo_name_is_not_geographic(name):
+    assert normalize_field(_f(name, "dimension", "string"))["semantic_role"] is None
+
+
+@pytest.mark.parametrize("name", [
+    "Country", "State/Province", "Postal Code", "City", "Region", "County",
+    "Latitude", "Longitude", "Zip", "Geo", "Geography",
+    "CustomerCity", "ship_city", "Cities", "Countries", "ZIPCode", "Region2024",
+])
+def test_real_geo_names_classify_as_geo(name):
+    assert normalize_field(_f(name, "dimension", "string"))["semantic_role"] == "geo"
+
+
+def test_nongeo_dimension_is_not_routed_to_a_map():
+    # Ethnicity embeds "city" but is not geographic; the advisor must not propose a map for it.
+    recs = recommend_visuals([_f("Ethnicity", "dimension", "string"),
+                              _f("Population", "measure", "integer")])
+    types = _types(recs)
+    assert "shapeMap" not in types and "map" not in types
+    assert recs[0]["visual_type"] == "clusteredColumnChart"
+
+
 def test_normalize_field_missing_name_raises():
     with pytest.raises(VizAdvisorError):
         normalize_field({"role": "measure"})

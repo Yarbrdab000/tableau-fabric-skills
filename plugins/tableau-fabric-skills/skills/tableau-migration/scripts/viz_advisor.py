@@ -32,6 +32,7 @@ role semantics. No third-party translator source was consulted.
 from __future__ import annotations
 
 import json
+import re
 
 ADVISOR_VERSION = 1
 ADVISOR_BUNDLE_KIND = "tableau-to-powerbi-viz-advice-request"
@@ -108,15 +109,32 @@ def normalize_field(field):
             "semantic_role": semantic, "cardinality": card}
 
 
-# Geographic name cues (lower-case substring match). These are unprotectable facts about which
+# Geographic name cues, matched as WHOLE word tokens (never raw substrings). A raw-substring test
+# mis-flagged common NON-geographic dimensions -- "Ethnicity"/"Capacity" embed "city", "Relationship"/
+# "Inflation"/"Translation" embed "lat", "Real Estate" embeds "state", "Geometry" embeds "geo" --
+# which would route them to a confident (and wrong) map, breaking the warn-never-wrong contract.
+# Tokenizing the name on separators AND camelCase/letter-digit boundaries and matching whole tokens
+# keeps a real place field geographic ("State/Province", "Postal Code", "CustomerCity", "Cities")
+# while a field that merely embeds a cue is left alone. These are unprotectable facts about which
 # field names denote a place; authored here, not copied.
-_GEO_TOKENS = ("country", "state", "province", "city", "region", "county", "postal", "zip",
-               "latitude", "longitude", "lat", "lng", "geo")
+_GEO_TOKENS = frozenset({
+    "country", "countries", "state", "states", "province", "provinces",
+    "city", "cities", "region", "regions", "county", "counties",
+    "postal", "postcode", "zip", "zipcode",
+    "lat", "latitude", "lng", "longitude", "geo", "geography",
+})
+
+_WORD_TOKEN_RE = re.compile(r"[A-Za-z]+|[0-9]+")
+
+
+def _name_tokens(name):
+    """Lower-case word tokens of ``name``, split on separators and camelCase / letter-digit seams."""
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name or "")
+    return [t.lower() for t in _WORD_TOKEN_RE.findall(spaced)]
 
 
 def _looks_geographic(name):
-    low = name.lower()
-    return any(tok in low for tok in _GEO_TOKENS)
+    return any(tok in _GEO_TOKENS for tok in _name_tokens(name))
 
 
 def _is_low_cardinality(field):

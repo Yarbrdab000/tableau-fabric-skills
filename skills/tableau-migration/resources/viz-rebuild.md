@@ -639,7 +639,10 @@ It holds the same **warn-never-wrong** contract in three layers:
   viz facts (which data shape suits which chart) as an authored rule table and returns a ranked list of
   `{visual_type, encodings, confidence, reasoning, rank}`. It **never** calls a model. Each field is a
   `{name, role, data_type, semantic_role?, cardinality?}` dict; `normalize_field` derives `temporal`
-  (date/time types) or `geo` (place-name cues) when not given, and raises on a name-less / role-less
+  (date/time types) or `geo` (place-name cues, matched as **whole word tokens** — split on separators
+  and camelCase — so `Country`/`Postal Code`/`CustomerCity` read as geographic while a field that
+  merely embeds a cue, e.g. `Ethnicity`/`Relationship`/`Real Estate`, does not) when not given, and
+  raises on a name-less / role-less
   field (the advisor never guesses a field's identity). The rule table covers: a lone measure → `card`
   (several → `multiRowCard`); a geo dimension + measure → `shapeMap` / `map`; a temporal dimension +
   measure → `lineChart` / `areaChart`; one categorical dimension + measure → `clusteredColumnChart` /
