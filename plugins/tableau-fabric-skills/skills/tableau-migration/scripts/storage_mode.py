@@ -95,6 +95,21 @@ DIRECT_CONNECTORS = {
     "databricks":   ("Databricks.Catalogs",     "server_httppath",  "database_schema_table"),
 }
 
+# Connectors whose custom-SQL native query is auto-emitted via the catalog drill --
+# Source{[Name=<catalog>, Kind="Database"]}[Data] -> Value.NativeQuery(<handle>, sql) -- because
+# that exact shape has been reconciled against a LIVE instance. The drilled [Data] handle exposes
+# the native-query capability; the connector's root collection (e.g. Databricks.Catalogs(...))
+# does NOT, so a native query against the root is rejected ("Native queries aren't supported by
+# this value"). Membership here therefore means "the DRILLED form is verified", never the root.
+#
+#   * databricks -- live-verified 2026-06 (Databricks.Catalogs -> Kind="Database" drill).
+#
+# Snowflake shares the database_schema_table nav shape but is deliberately NOT included: its
+# drilled-handle native-query capability, mandatory compute warehouse, and uppercase identifier
+# folding are unverified against live, so it stays scaffolded (same charter as PARTIAL_LIVE_CONNECTORS).
+# Promotion is a one-line addition here once a connector's drilled native query is confirmed live.
+NATIVE_QUERY_CATALOG_DRILL = {"databricks"}
+
 # Recognized live connectors that are deliberately NOT auto-emitted yet: their navigation
 # selector or required identifiers cannot be verified offline, so emitting a call body would be
 # a guess. We pick a mode but mark it not fully supported and emit a clearly-flagged scaffold

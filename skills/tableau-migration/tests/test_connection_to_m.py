@@ -8,6 +8,7 @@ from connection_to_m import (
     emit_m_partition_source,
     emit_table_tmdl_m,
     extract_bundled_flatfile,
+    m_partition_review_reason,
     parse_tds,
     tableau_type_to_tmdl,
 )
@@ -328,6 +329,61 @@ DATABRICKS = """<?xml version='1.0' encoding='utf-8' ?>
       <metadata-record class='column'>
         <remote-name>amount</remote-name><local-name>[amount]</local-name>
         <parent-name>[orders]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+# Databricks custom SQL (native query): the real-world gap -- a `type='text'` relation with an
+# embedded SQL string, true source column names carrying spaces/slashes, on a Unity-catalog host.
+DATABRICKS_CUSTOM_SQL = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='DbxSQL' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='dbx' name='databricks.a'>
+        <connection class='databricks' dbname='tableau_migration_databricks'
+                    server='adb-123.azuredatabricks.net'
+                    http-path='/sql/1.0/warehouses/240f0d0d01d9e8dd' />
+      </named-connection>
+    </named-connections>
+    <relation connection='databricks.a' name='Custom SQL Query' type='text'>SELECT o.`Order ID`, o.`Country/Region`, o.Sales FROM orders o</relation>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Order ID</remote-name><local-name>[Order ID]</local-name>
+        <parent-name>[Custom SQL Query]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Country/Region</remote-name><local-name>[Country/Region]</local-name>
+        <parent-name>[Custom SQL Query]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Custom SQL Query]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+# Snowflake custom SQL: shares the database_schema_table nav shape with Databricks, but is NOT in
+# the live-verified NATIVE_QUERY_CATALOG_DRILL allow-list, so it must stay a flagged scaffold.
+SNOWFLAKE_CUSTOM_SQL = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='SnowSQL' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='acct' name='snowflake.a'>
+        <connection class='snowflake' dbname='ANALYTICS' server='acct.snowflakecomputing.com'
+                    warehouse='COMPUTE_WH' />
+      </named-connection>
+    </named-connections>
+    <relation connection='snowflake.a' name='Custom SQL Query' type='text'>SELECT "ORDER ID", SALES FROM ORDERS</relation>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>ORDER ID</remote-name><local-name>[ORDER ID]</local-name>
+        <parent-name>[Custom SQL Query]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>SALES</remote-name><local-name>[SALES]</local-name>
+        <parent-name>[Custom SQL Query]</parent-name><local-type>real</local-type>
       </metadata-record>
     </metadata-records>
   </connection>
@@ -1071,7 +1127,17 @@ def test_emit_teradata_parsed_is_scaffold_pending_live_navigator():
     assert "'teradata'" in body
     assert "Teradata.Database" in body                 # names the intended connector as a hint
     assert 'Source = Teradata.Database(#"Server"' not in body   # but never a guessed call body
-    assert "let Source = null in Source" in body
+    # The scaffold must be DEPLOY-valid TMDL: a single `let ... in` expression (comment inside the
+    # block), with an inert empty typed table as the source rather than the old `Source = null`.
+    assert body.startswith("let\n")
+    assert body.rstrip().endswith("Source")
+    assert "Source = #table(type table [], {})" in body
+    assert "Source = null" not in body
+    # one expression: the body starts with `let` and the // TODO comment lives INSIDE the block
+    # (after the `let` line), never as a bare sibling that the TMDL parser rejects.
+    lines = body.split("\n")
+    assert lines[0] == "let"
+    assert lines[1].lstrip().startswith("// TODO")
 
 
 def test_emit_fabric_sql_endpoint_is_deploy_ready_sql_database():
@@ -1173,13 +1239,73 @@ def test_emit_databricks_scaffolds_when_catalog_missing():
 
 
 def test_emit_databricks_custom_sql_is_scaffold():
-    # Native SQL folding for Databricks isn't auto-emitted (only the (server, database) family is),
-    # so a custom-SQL relation is a named scaffold, never a guessed Value.NativeQuery.
+    # Even for an allow-listed connector, a custom-SQL relation with NO resolvable catalog (no
+    # relation catalog and no connection database) can't be drilled, so it is a named scaffold --
+    # never a guessed Value.NativeQuery against the Catalogs() root.
     rel = {"kind": "custom_sql", "name": "Q", "item": "Q", "sql": "SELECT 1", "columns": []}
     body = emit_m_partition_source(rel, {"connection_class": "databricks"}, "DirectQuery")
     assert "TODO" in body
     assert "Databricks.Catalogs" in body
     assert "Value.NativeQuery" not in body
+
+
+def test_emit_databricks_custom_sql_drills_catalog_then_native_query():
+    # Live-verified path: drill Databricks.Catalogs -> Kind="Database" handle, then fold the native
+    # query against THAT drilled handle (never the Catalogs() root, which rejects native queries).
+    d = parse_tds(DATABRICKS_CUSTOM_SQL)
+    assert d["connection_class"] == "databricks"
+    rel = d["relations"][0]
+    assert rel["kind"] == "custom_sql"
+    body = emit_m_partition_source(rel, d, "DirectQuery")
+    assert "TODO" not in body
+    assert 'Source = Databricks.Catalogs(#"Server", #"HttpPath")' in body
+    # the catalog drill, then NativeQuery against the drilled Catalog handle
+    assert 'Catalog = Source{[Name="tableau_migration_databricks", Kind="Database"]}[Data]' in body
+    assert "Value.NativeQuery(Catalog, " in body
+    assert "Value.NativeQuery(Source" not in body          # never against the root collection
+    assert "[EnableFolding=true]" in body
+    # native query returns the RAW source headers -> rename to each column's underscored sourceColumn
+    assert "Table.RenameColumns(Result, " in body
+    assert '{"Order ID", "Order_ID"}' in body
+    assert '{"Country/Region", "Country_Region"}' in body
+    assert '"Sales", "Sales"' not in body                  # a clean name is NOT renamed (no-op)
+    assert "MissingField.Ignore" in body
+    # build-time fail-loud: a real drilled partition is NOT flagged as needing review
+    assert m_partition_review_reason(rel, d, "DirectQuery") is None
+
+
+def test_emit_snowflake_custom_sql_still_scaffolds():
+    # Snowflake shares the nav shape but is deliberately NOT in NATIVE_QUERY_CATALOG_DRILL, so its
+    # custom SQL stays a flagged scaffold (and is reported needs_review), never auto-emitted.
+    d = parse_tds(SNOWFLAKE_CUSTOM_SQL)
+    assert d["connection_class"] == "snowflake"
+    rel = d["relations"][0]
+    assert rel["kind"] == "custom_sql"
+    body = emit_m_partition_source(rel, d, "DirectQuery")
+    assert "TODO" in body
+    assert "Value.NativeQuery" not in body
+    assert "Snowflake.Databases" in body                   # names the intended connector as a hint
+    reason = m_partition_review_reason(rel, d, "DirectQuery")
+    assert reason and "isn't verified" in reason
+
+
+def test_emit_sqlserver_custom_sql_golden_m_unchanged():
+    # Watch-item #1: the SQL Server family is the only EXISTING working custom-SQL path that the
+    # refactor touches. Its columns (Region, Sales) need no rename, so NO rename step is emitted and
+    # the body is byte-for-byte the historical form (the no-op guarantee).
+    d = parse_tds(CUSTOM_SQL)
+    body = emit_m_partition_source(d["relations"][0], d, "DirectQuery")
+    expected = (
+        "let\n"
+        '\t\t\t\tSource = Sql.Database(#"Server", #"Database"),\n'
+        '\t\t\t\tResult = Value.NativeQuery(Source, "SELECT ""Region"", SUM(Sales) AS Sales '
+        'FROM Orders GROUP BY ""Region""", null, [EnableFolding=true])\n'
+        "\t\t\tin\n"
+        "\t\t\t\tResult"
+    )
+    assert body == expected
+    assert "Table.RenameColumns" not in body               # no mismatched names -> no rename step
+    assert m_partition_review_reason(d["relations"][0], d, "DirectQuery") is None
 
 
 # -- federated three-part-name collections (Tableau 2023+ object model) ---------
