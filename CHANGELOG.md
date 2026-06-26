@@ -22,6 +22,10 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   (the top non-`low` candidate, or `None` when every candidate is low). It ranks by **semantic
   equivalence, not string similarity**, embeds **no LLM API** (the agent proposes; this scores), and
   lands nothing — the chosen candidate still flows through `approved_calc_dax` and the human gate.
+  Each ranked entry carries an auditable `signals` breakdown (`{gate, oracle, category}`) and a
+  `requires_oracle` flag that enforces the playbook's mandatory-oracle rule — an unverified
+  `dax_language_gap` approximation is **never** returned as `best` until the oracle VERIFIES it.
+  Accepts each candidate as a raw DAX string or a `suggest_assisted_dax` suggestion dict.
   Documented in `resources/second-compiler.md`.
 - **tableau-migration:** **the assisted (second-compiler) idiom registry now recognizes the
   argmin-over-a-dimension twin** of the existing argmax idiom ("the member of dimension C with the

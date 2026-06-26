@@ -414,6 +414,36 @@ def _candidate_confidence(record):
     return _TIER_UNEVALUATED, RANK_MEDIUM, rec.get("detail") or "well-formed but not reconciled"
 
 
+def _confidence_signals(record):
+    """Decompose a reconcile ``record`` into the AUDITABLE signals behind its confidence grade.
+
+    Returns ``{"gate", "oracle", "category"}`` -- the syntactic-gate verdict (``"pass"``/``"fail"``),
+    the numeric-oracle verdict (the reconcile ``state``: verified / mismatch / not-evaluated), and the
+    router ``category`` (present when the candidate was ranked for a classified handoff request, else
+    ``None``). This is the machine-readable form of the one-line ``reason`` -- it lets a consumer see
+    WHY a candidate earned its grade and apply category-specific acceptance rules. Pure; never raises.
+    """
+    rec = record or {}
+    gate = rec.get("gate") or {}
+    return {
+        "gate": "pass" if gate.get("ok", True) else "fail",
+        "oracle": rec.get("state", NOT_EVALUATED),
+        "category": rec.get("category"),
+    }
+
+
+def _requires_oracle(record):
+    """True when a candidate is an approximation the playbook accepts ONLY once empirically verified.
+
+    A ``dax_language_gap`` calc has no faithful native DAX form, so ``second-compiler.md`` makes the
+    oracle match **mandatory** before it may be proposed ("an unverifiable approximation stays a
+    stub"). Ranking must therefore NOT auto-select such a candidate as ``best`` until the oracle
+    confirms it -- even though it passed the syntactic gate. Other categories carry no such bar. Pure.
+    """
+    rec = record or {}
+    return rec.get("category") == DAX_LANGUAGE_GAP and rec.get("state", NOT_EVALUATED) != VERIFIED
+
+
 def _candidate_dax(candidate):
     """Extract the DAX text from one ranking candidate.
 
@@ -460,10 +490,16 @@ def rank_candidates(name, candidates, *, fabric_oracle=None, tableau_value=_UNSE
 
         {
           "name", "request",
-          "ranked": [ {"candidate_dax", "rank", "confidence", "reason", "record"}, ... ],  # best-first
-          "best": <top candidate_dax, or None when every candidate is low-confidence>,
+          "ranked": [ {"candidate_dax", "rank", "confidence", "reason",
+                       "signals", "requires_oracle", "record"}, ... ],  # best-first
+          "best": <top candidate_dax, or None when none is acceptable>,
           "summary": {... summarize() ...},
         }
+
+    ``signals`` is the auditable ``{gate, oracle, category}`` breakdown behind the grade.
+    ``requires_oracle`` is ``True`` for an unverified ``dax_language_gap`` approximation -- the
+    playbook makes its oracle match MANDATORY, so such a candidate is **never** chosen as ``best``
+    until VERIFIED (it is still listed, with its medium grade, for the agent to reconcile or revise).
     """
     scored = []
     for idx, candidate in enumerate(list(candidates or [])):
@@ -475,11 +511,19 @@ def rank_candidates(name, candidates, *, fabric_oracle=None, tableau_value=_UNSE
         tier, confidence, reason = _candidate_confidence(rec)
         scored.append((tier, idx, dax, rec, confidence, reason))
     scored.sort(key=lambda s: (s[0], s[1]))  # tier asc, then stable submission order
-    ranked = [
-        {"candidate_dax": dax, "rank": i, "confidence": conf, "reason": reason, "record": rec}
-        for i, (_tier, _idx, dax, rec, conf, reason) in enumerate(scored, start=1)
-    ]
-    best = next((r["candidate_dax"] for r in ranked if r["confidence"] != RANK_LOW), None)
+    ranked = []
+    for i, (_tier, _idx, dax, rec, conf, reason) in enumerate(scored, start=1):
+        requires_oracle = _requires_oracle(rec)
+        if requires_oracle:
+            reason = ("unverified dax_language_gap approximation -- a mandatory oracle match is "
+                      "required before it may be proposed; " + reason)
+        ranked.append({
+            "candidate_dax": dax, "rank": i, "confidence": conf, "reason": reason,
+            "signals": _confidence_signals(rec), "requires_oracle": requires_oracle, "record": rec,
+        })
+    # best = the top candidate that is neither low-confidence nor an unverified mandatory-oracle gap.
+    best = next((r["candidate_dax"] for r in ranked
+                 if r["confidence"] != RANK_LOW and not r["requires_oracle"]), None)
     return {
         "name": name,
         "request": request,

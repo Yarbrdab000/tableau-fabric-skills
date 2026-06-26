@@ -174,3 +174,51 @@ def test_mixed_string_and_dict_candidates_rank_together():
     assert out["ranked"][1]["candidate_dax"] == "SUM('Orders'[BAD])"
     assert out["ranked"][1]["confidence"] == RC.RANK_LOW
 
+
+# --------------------------------------------------------------------------- category-aware acceptance
+def test_unverified_dax_language_gap_is_not_auto_selected_as_best():
+    # second-compiler.md: a dax_language_gap approximation needs a MANDATORY oracle match before it may
+    # be proposed. With no oracle it passes the gate (medium) but must NOT be picked as best.
+    req = {"name": "m", "category": RC.DAX_LANGUAGE_GAP}
+    out = RC.rank_candidates("m", ["SUM('Orders'[Sales])"], request=req)   # no oracle -> not verified
+    entry = out["ranked"][0]
+    assert entry["confidence"] == RC.RANK_MEDIUM           # plausible, but...
+    assert entry["requires_oracle"] is True                # ...the mandatory oracle is not satisfied
+    assert out["best"] is None                             # so it is NOT auto-selected
+    assert "mandatory" in entry["reason"].lower()
+
+
+def test_verified_dax_language_gap_is_selected_as_best():
+    # Once the oracle CONFIRMS the approximation, the mandatory-oracle bar is met -> selectable.
+    req = {"name": "m", "category": RC.DAX_LANGUAGE_GAP}
+    out = RC.rank_candidates("m", ["SUM('Orders'[GOOD])"], request=req,
+                             fabric_oracle=_oracle_by_marker({"GOOD": 12.0}), tableau_value=12.0)
+    entry = out["ranked"][0]
+    assert entry["confidence"] == RC.RANK_HIGH
+    assert entry["requires_oracle"] is False
+    assert out["best"] == "SUM('Orders'[GOOD])"
+
+
+def test_non_gap_medium_candidate_is_still_selectable_as_best():
+    # The mandatory-oracle bar is SPECIFIC to dax_language_gap -- an ordinary medium candidate in a
+    # different category is still a valid best when no oracle is available.
+    req = {"name": "m", "category": "type_or_shape_mismatch"}
+    out = RC.rank_candidates("m", ["SUM('Orders'[Sales])"], request=req)
+    assert out["ranked"][0]["requires_oracle"] is False
+    assert out["best"] == "SUM('Orders'[Sales])"
+
+
+def test_each_ranked_entry_carries_an_auditable_signal_breakdown():
+    req = {"name": "m", "category": "type_or_shape_mismatch"}
+    out = RC.rank_candidates("m", ["SUM('Orders'[GOOD])", "SUM('Orders'[BAD])"], request=req,
+                             fabric_oracle=_oracle_by_marker({"GOOD": 3.0, "BAD": 9.0}),
+                             tableau_value=3.0)
+    for r in out["ranked"]:
+        sig = r["signals"]
+        assert sig["gate"] in ("pass", "fail")
+        assert sig["oracle"] in (RC.VERIFIED, RC.MISMATCH, RC.NOT_EVALUATED)
+        assert sig["category"] == "type_or_shape_mismatch"
+    top = out["ranked"][0]
+    assert top["signals"]["oracle"] == RC.VERIFIED and top["signals"]["gate"] == "pass"
+
+
