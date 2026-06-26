@@ -1476,6 +1476,140 @@ def _assemble_report(twb, pbir, visual_results, slicer_results,
 
 
 # =====================================================================================
+# Per-visual fidelity verdict: the migration loop's objective function
+# =====================================================================================
+# The structural tier above scores each paired visual on a 0..1 continuum. The fidelity *loop*
+# wants a coarse, honest, per-visual VERDICT it can read at a glance and optimize toward. This
+# layer reduces a structural per-visual record to one of four states:
+#   REPRODUCED -- exact chart family AND every source field present (a faithful rebuild).
+#   PARTIAL    -- recognizable but not faithful: exact family with some source fields missing, OR a
+#                 related/soft-typed substitution (e.g. an area sheet rebuilt as a line) with the
+#                 full source field set intact.
+#   DEGRADED   -- a material visual-fidelity loss: wrong chart family (e.g. a map rebuilt as a
+#                 table), none of the source fields reproduced, or a soft-typed pairing that also
+#                 dropped source fields.
+#   MISSING    -- the Tableau worksheet has no paired Power BI visual at all.
+# It is DETERMINISTIC and derived ENTIRELY from the structural per-visual record (no new parsing)
+# and never feeds the structural aggregate, the combined headline, or any calibration -- it is a
+# separate, additive, advisory read layered on top of score_report's output.
+STATE_REPRODUCED = "REPRODUCED"
+STATE_PARTIAL = "PARTIAL"
+STATE_DEGRADED = "DEGRADED"
+STATE_MISSING = "MISSING"
+# Advisory loop-credit per state: lets the loop reduce the four-state verdicts to one objective
+# number to optimize. Faithful=1.0, recognizable=0.5, lossy=0.25, absent=0.0.
+_STATE_CREDIT = {STATE_REPRODUCED: 1.0, STATE_PARTIAL: 0.5, STATE_DEGRADED: 0.25, STATE_MISSING: 0.0}
+
+
+def classify_visual_state(visual_result):
+    """Map one structural per-visual record (a :func:`_score_pair` dict) to a coarse fidelity state.
+
+    Reads only keys the structural tier already emits: ``components.type`` (1.0 exact-family,
+    ``0 < c < 1`` related/soft, 0.0 asserted-mismatch), ``type_note`` (to tell a related
+    substitution apart from a type-indeterminate pairing) and ``fields_matched`` / ``fields_missing``.
+    Deterministic; never raises. Returns ``(state, reason)``.
+    """
+    comp = visual_result.get("components") or {}
+    type_s = comp.get("type")
+    note = visual_result.get("type_note") or ""
+    matched = visual_result.get("fields_matched") or []
+    missing = visual_result.get("fields_missing") or []
+    type_exact = type_s is not None and type_s >= 1.0
+    type_related = note.startswith("type-related")
+    # Asserted wrong family (both sides typed, families differ) is a clear visual-fidelity loss.
+    if type_s == 0.0:
+        return STATE_DEGRADED, "wrong chart type: %s" % (note or "family mismatch")
+    # A paired visual that carries NONE of the source fields is degraded regardless of type.
+    if not matched:
+        return STATE_DEGRADED, "no source field reproduced on the rebuilt visual"
+    if type_exact:
+        if not missing:
+            return STATE_REPRODUCED, "exact chart type; all %d source field(s) present" % len(matched)
+        return STATE_PARTIAL, "exact chart type; %d source field(s) missing" % len(missing)
+    # Soft type (related family, indeterminate, or unasserted) with matched fields.
+    if not missing:
+        if type_related:
+            return STATE_PARTIAL, "related chart-type substitution (%s); all source fields present" % note
+        return STATE_PARTIAL, "%s; all source fields present" % (note or "soft type match")
+    return STATE_DEGRADED, "%s with %d source field(s) missing" % (note or "soft type", len(missing))
+
+
+def _per_visual_record(v):
+    """Compact per-visual verdict record built from a structural :func:`_score_pair` result."""
+    state, reason = classify_visual_state(v)
+    return {
+        "worksheet": v.get("worksheet"),
+        "visual": v.get("visual"),
+        "visual_type": v.get("visual_type"),
+        "state": state,
+        "reason": reason,
+        "score": v.get("score"),
+        "band": v.get("band"),
+        "type_note": v.get("type_note"),
+        "components": v.get("components"),
+        "fields_missing": v.get("fields_missing"),
+        "fields_extra": v.get("fields_extra"),
+        "diagnosis": v.get("diagnosis"),
+    }
+
+
+def _missing_record(name, reason):
+    return {"worksheet": name, "visual": None, "visual_type": None, "state": STATE_MISSING,
+            "reason": reason, "score": None, "band": None, "type_note": None, "components": None,
+            "fields_missing": None, "fields_extra": None, "diagnosis": None}
+
+
+def per_visual_fidelity(report, on_view=None):
+    """Reduce a structural :func:`score_report` result to a per-visual
+    REPRODUCED / PARTIAL / DEGRADED / MISSING verdict list -- the migration loop's objective function.
+
+    ``on_view`` (optional) restricts scoring to a set/list of Tableau worksheet names (the
+    dashboard's on-view sheets); an on-view worksheet that has no paired visual -- whether it landed
+    in ``summary.unmatched_worksheets`` or was never parsed at all -- is still reported MISSING.
+    When ``on_view`` is ``None`` every matched visual and every unmatched worksheet is scored.
+    Off-view worksheets (and off-view calcs by construction) are ignored.
+
+    Additive + advisory: never mutates ``report`` and never raises. Returns a dict with the per-visual
+    ``verdicts``, a four-state ``tally``, and an advisory ``objective_score`` (the credit-weighted mean).
+    """
+    want = None if on_view is None else {_norm(n): n for n in on_view if n}
+    verdicts = []
+    seen = set()
+    for v in report.get("visuals", []) or []:
+        ws = v.get("worksheet")
+        if want is not None and _norm(ws) not in want:
+            continue
+        seen.add(_norm(ws))
+        verdicts.append(_per_visual_record(v))
+    summary = report.get("summary") or {}
+    for ws in summary.get("unmatched_worksheets", []) or []:
+        if want is not None and _norm(ws) not in want:
+            continue
+        seen.add(_norm(ws))
+        verdicts.append(_missing_record(ws, "no paired Power BI visual"))
+    if want is not None:
+        for nk, name in want.items():
+            if nk not in seen:
+                verdicts.append(_missing_record(name, "worksheet not found in the rebuild"))
+    tally = {STATE_REPRODUCED: 0, STATE_PARTIAL: 0, STATE_DEGRADED: 0, STATE_MISSING: 0}
+    for r in verdicts:
+        tally[r["state"]] = tally.get(r["state"], 0) + 1
+    n = len(verdicts)
+    objective = round(sum(_STATE_CREDIT[r["state"]] for r in verdicts) / n, 4) if n else None
+    verdicts.sort(key=lambda r: (_STATE_CREDIT[r["state"]], r["worksheet"] or ""))
+    return {
+        "tier": "per-visual",
+        "advisory": True,
+        "scoped_to": (list(want.values()) if want is not None else "all-matched+unmatched"),
+        "scored_visuals": n,
+        "tally": tally,
+        "objective_score": objective,
+        "state_credit": dict(_STATE_CREDIT),
+        "verdicts": verdicts,
+    }
+
+
+# =====================================================================================
 # Optional Tier-2: DAX-value oracle (live model measure values via local Analysis Services)
 # =====================================================================================
 # Cross-engine value agreement is tolerance-banded: Tableau and Power BI can round or aggregate
@@ -3643,7 +3777,7 @@ def _resolve_reference_png(source, name=None):
 def run_oracle(twb_path, report_dir, engine_report_path=None,
                dax_options=None, image_options=None, candidate_records_path=None,
                field_aliases=None, validate=False, openability_options=None,
-               llm_options=None, metadata_options=None):
+               llm_options=None, metadata_options=None, per_visual_options=None):
     """Read both sides and score them. Returns the advisory report dict.
 
     The structural tier always runs. The optional value/image tiers run only when their options are
@@ -3667,6 +3801,11 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
     bundle + agent prompt AFTER the combined headline is attached; pass ``{"answers": <json/dict>}``
     to fold the agent's adjudication back. No network/key -- the agent running this skill is the
     judgment model.
+
+    ``per_visual_options`` (optional; pass ``{}`` to enable, or ``{"on_view": [names]}`` to scope to
+    the dashboard's on-view sheets) attaches the per-visual REPRODUCED/PARTIAL/DEGRADED/MISSING
+    verdict layer as ``per_visual`` -- the migration loop's objective function. Additive: it reads the
+    structural per-visual records only and never feeds the structural aggregate or calibration.
 
     ``image_options`` may carry ``render_pbip`` (a .pbip path): when set and no ``candidate_png`` is
     given, the Power BI candidate render is captured locally via the ``powerbi-desktop`` bridge and
@@ -3734,6 +3873,8 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
         opts = dict(metadata_options)
         opts.setdefault("twb_path", twb_path)
         report["metadata"] = metadata_tier(report_dir=report_dir, **opts)
+    if per_visual_options is not None:
+        report["per_visual"] = per_visual_fidelity(report, **per_visual_options)
     combined = _combined_fidelity(report)
     if combined is not None:
         report["combined_fidelity"] = combined
@@ -3801,6 +3942,24 @@ def render_markdown(report):
             type_cell,
             ", ".join(r["fields_missing"]) or "-",
             ", ".join(r["fields_extra"]) or "-"))
+    pv = report.get("per_visual")
+    if pv is not None:
+        lines.append("")
+        lines.append("## Per-visual fidelity (advisory loop objective)")
+        t = pv.get("tally") or {}
+        scoped = pv.get("scoped_to")
+        scope_txt = (", ".join(scoped) if isinstance(scoped, list) else str(scoped))
+        lines.append("- **Objective score:** %s — %d visual(s) scored (scope: %s)" % (
+            pv.get("objective_score"), pv.get("scored_visuals", 0), scope_txt))
+        lines.append("- **Tally:** REPRODUCED %d · PARTIAL %d · DEGRADED %d · MISSING %d" % (
+            t.get(STATE_REPRODUCED, 0), t.get(STATE_PARTIAL, 0),
+            t.get(STATE_DEGRADED, 0), t.get(STATE_MISSING, 0)))
+        lines.append("")
+        lines.append("| Worksheet | State | Visual type | Reason |")
+        lines.append("|---|---|---|---|")
+        for r in pv.get("verdicts", []):
+            lines.append("| %s | %s | %s | %s |" % (
+                r["worksheet"], r["state"], r.get("visual_type") or "-", r.get("reason") or "-"))
     placed = [r for r in report["visuals"] if r.get("placement")]
     if placed:
         lines.append("")
@@ -4056,6 +4215,14 @@ def main(argv=None):
     ap.add_argument("--llm-answers", default=None,
                     help="Path to a JSON file of the agent's adjudication answers to fold back into "
                          "the LLM-assist record. Implies --llm.")
+    ap.add_argument("--per-visual", action="store_true",
+                    help="Attach the per-visual REPRODUCED/PARTIAL/DEGRADED/MISSING verdict layer "
+                         "(the migration loop's objective function). ADDITIVE -- it never feeds the "
+                         "structural aggregate or the combined headline.")
+    ap.add_argument("--on-view", default=None,
+                    help="Comma-separated Tableau worksheet names to scope the per-visual verdicts to "
+                         "(the dashboard's on-view sheets); off-view sheets/calcs are ignored. "
+                         "Implies --per-visual.")
     args = ap.parse_args(argv)
 
     dax_options = None
@@ -4096,13 +4263,20 @@ def main(argv=None):
         if args.model_dir:
             metadata_options["model_dir"] = args.model_dir
 
+    per_visual_options = None
+    if args.per_visual or args.on_view:
+        per_visual_options = {}
+        if args.on_view:
+            per_visual_options["on_view"] = [s.strip() for s in args.on_view.split(",") if s.strip()]
+
     report = run_oracle(args.twb, args.report_dir, args.engine_report,
                         dax_options=dax_options, image_options=image_options,
                         candidate_records_path=args.candidate_records,
                         validate=args.validate,
                         openability_options=openability_options,
                         llm_options=llm_options,
-                        metadata_options=metadata_options)
+                        metadata_options=metadata_options,
+                        per_visual_options=per_visual_options)
     text = (render_markdown(report) if args.format == "md"
             else json.dumps(report, indent=2, ensure_ascii=False))
     if args.out:
