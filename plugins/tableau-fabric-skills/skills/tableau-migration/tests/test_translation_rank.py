@@ -132,3 +132,45 @@ def test_never_raises_on_a_throwing_oracle():
     out = RC.rank_candidates("m", ["SUM('Orders'[Sales])"], fabric_oracle=boom, tableau_value=5.0)
     assert out["ranked"][0]["confidence"] == RC.RANK_MEDIUM
     assert out["ranked"][0]["record"]["state"] == RC.NOT_EVALUATED
+
+
+# --------------------------------------------------------------------------- candidate input shapes
+def test_candidate_can_be_a_suggest_assisted_dax_suggestion_dict():
+    # The natural producer -- calc_to_dax.suggest_assisted_dax -- yields a dict carrying the DAX under
+    # "dax" (plus pattern/confidence/caveats). rank_candidates must read that, not choke on the dict,
+    # and emit the resolved DAX *string* so best is directly landable via approved_calc_dax.
+    cands = [
+        {"pattern": "argmin-dimension", "dax": "MINX('Orders',[BAD])", "confidence": "medium",
+         "requires_approval": True, "caveats": []},
+        {"pattern": "argmax-dimension", "dax": "MAXX('Orders',[GOOD])", "confidence": "medium",
+         "requires_approval": True, "caveats": []},
+    ]
+    oracle = _oracle_by_marker({"GOOD": 100.0, "BAD": 999.0})
+    out = RC.rank_candidates("m", cands, fabric_oracle=oracle, tableau_value=100.0)
+    assert out["best"] == "MAXX('Orders',[GOOD])"               # the resolved string, not the dict
+    assert isinstance(out["best"], str)
+    assert out["ranked"][0]["candidate_dax"] == "MAXX('Orders',[GOOD])"
+    assert out["ranked"][0]["confidence"] == RC.RANK_HIGH
+    assert out["ranked"][1]["confidence"] == RC.RANK_LOW
+
+
+def test_candidate_can_be_a_reconcile_all_style_dict():
+    # reconcile_all items key the DAX under "candidate_dax"; accept that shape too.
+    cands = [{"candidate_dax": "SUM('Orders'[GOOD])"}]
+    oracle = _oracle_by_marker({"GOOD": 42.0})
+    out = RC.rank_candidates("m", cands, fabric_oracle=oracle, tableau_value=42.0)
+    assert out["best"] == "SUM('Orders'[GOOD])"
+    assert out["ranked"][0]["confidence"] == RC.RANK_HIGH
+
+
+def test_mixed_string_and_dict_candidates_rank_together():
+    # A raw hand-authored string and a registry suggestion dict can be ranked in one call; the raw
+    # string path stays byte-identical (its candidate_dax is the string itself).
+    cands = ["SUM('Orders'[BAD])", {"dax": "SUM('Orders'[GOOD])", "pattern": "x"}]
+    oracle = _oracle_by_marker({"GOOD": 7.0, "BAD": 999.0})
+    out = RC.rank_candidates("m", cands, fabric_oracle=oracle, tableau_value=7.0)
+    assert out["best"] == "SUM('Orders'[GOOD])"
+    assert out["ranked"][0]["confidence"] == RC.RANK_HIGH
+    assert out["ranked"][1]["candidate_dax"] == "SUM('Orders'[BAD])"
+    assert out["ranked"][1]["confidence"] == RC.RANK_LOW
+

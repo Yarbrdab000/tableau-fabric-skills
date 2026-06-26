@@ -414,9 +414,26 @@ def _candidate_confidence(record):
     return _TIER_UNEVALUATED, RANK_MEDIUM, rec.get("detail") or "well-formed but not reconciled"
 
 
+def _candidate_dax(candidate):
+    """Extract the DAX text from one ranking candidate.
+
+    Accepts a raw DAX **string**, or a mapping carrying it under ``dax`` (the
+    :func:`calc_to_dax.suggest_assisted_dax` suggestion shape an agent collects idiom candidates
+    from) or ``candidate_dax`` (the :func:`reconcile_all` item shape). A non-string, non-mapping is
+    returned unchanged so the syntactic gate can reject it. Pure.
+    """
+    if isinstance(candidate, str):
+        return candidate
+    if isinstance(candidate, dict):
+        for key in ("dax", "candidate_dax"):
+            if candidate.get(key) is not None:
+                return candidate[key]
+    return candidate
+
+
 def rank_candidates(name, candidates, *, fabric_oracle=None, tableau_value=_UNSET,
                     tableau_oracle=None, kind=None, request=None, **reconcile_kw):
-    """Rank N agent-authored candidate DAX strings for ONE translation by SEMANTIC equivalence.
+    """Rank N agent-authored candidate DAX translations for ONE calc by SEMANTIC equivalence.
 
     The second compiler (the agent running this skill) proposes one or more candidate DAX
     translations for a calc the deterministic tier fell back on; this ranks them **best-first** by
@@ -431,6 +448,11 @@ def rank_candidates(name, candidates, *, fabric_oracle=None, tableau_value=_UNSE
     submission order (stable). This is the optional acceleration tier's selection step -- it never
     lands anything; the chosen candidate still flows through the normal human-approval gate.
 
+    Each ``candidate`` may be a raw DAX **string** or a mapping carrying it under ``dax`` (the
+    :func:`calc_to_dax.suggest_assisted_dax` suggestion shape) / ``candidate_dax``; the emitted
+    ``candidate_dax`` and ``best`` are always the resolved DAX **string**, so ``best`` is directly
+    landable via ``approved_calc_dax``.
+
     ``request`` (an optional handoff dict) is echoed back and its ``category`` annotated on each
     record. ``tableau_value`` / ``tableau_oracle`` / ``fabric_oracle`` / ``kind`` and any extra
     ``reconcile_kw`` (e.g. ``grain_filters``, ``value_name``, ``rel_tol``) pass through to
@@ -444,7 +466,8 @@ def rank_candidates(name, candidates, *, fabric_oracle=None, tableau_value=_UNSE
         }
     """
     scored = []
-    for idx, dax in enumerate(list(candidates or [])):
+    for idx, candidate in enumerate(list(candidates or [])):
+        dax = _candidate_dax(candidate)
         rec = reconcile(name, dax, fabric_oracle=fabric_oracle, tableau_value=tableau_value,
                         tableau_oracle=tableau_oracle, kind=kind, **reconcile_kw)
         if request is not None:
