@@ -186,6 +186,28 @@ def test_generate_relationships_tmdl_none_when_empty():
     assert generate_relationships_tmdl([]) is None
 
 
+def test_generate_relationships_tmdl_many_to_many_cardinality():
+    # An authored Tableau object-graph relationship (``cardinality="many_to_many"``) is emitted
+    # many-to-many with a single-direction (dim->fact) cross filter, while a relationship with no
+    # ``cardinality`` key (e.g. the generated Date-dimension join) stays the default many-to-one
+    # with NO explicit cardinality props. The split is what keeps Power BI from rejecting a
+    # non-unique authored target and cancelling the batch (which collateral-drops the Date join).
+    rels = [
+        {"from_table": "Orders", "from_col": "Region", "to_table": "People",
+         "to_col": "Region", "cardinality": "many_to_many"},
+        {"from_table": "Orders", "from_col": "Order_Date", "to_table": "Date",
+         "to_col": "Date"},
+    ]
+    tmdl = generate_relationships_tmdl(rels)
+    blocks = [b for b in tmdl.split("relationship ") if b.strip()]
+    m2m = next(b for b in blocks if "Orders.Region" in b)
+    assert "toCardinality: many" in m2m
+    assert "crossFilteringBehavior: oneDirection" in m2m
+    date_block = next(b for b in blocks if "Orders.Order_Date" in b)
+    assert "toCardinality: many" not in date_block
+    assert "crossFilteringBehavior" not in date_block
+
+
 # -- calculated-column rendering contract (column-mode / dimension calcs) ------
 def test_translated_calc_column_carries_dax_and_annotations():
     c = generate_calc_column_tmdl(

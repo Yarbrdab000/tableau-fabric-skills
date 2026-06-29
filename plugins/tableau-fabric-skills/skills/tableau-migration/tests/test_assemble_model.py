@@ -933,6 +933,24 @@ def test_migrate_explicit_empty_relationships_opts_out():
     assert out["report"]["relationships"] == []
 
 
+def test_authored_relationships_emit_many_to_many():
+    # A Tableau object-graph relationship (the "noodle") is an ad-hoc, uniqueness-agnostic join:
+    # Tableau never requires a unique key on either side. Power BI's DEFAULT many-to-one DOES, and
+    # on a non-unique authored target it rejects the relationship and cancels the WHOLE batch on
+    # first refresh -- collateral-dropping the generated Date join. So every authored relationship
+    # is emitted many-to-many (single-direction dim->fact cross filter), which Power BI accepts
+    # without a uniqueness check. This is connection-type-agnostic (pure .tds metadata). [cause #1]
+    out = migrate_tds_to_semantic_model(FEDERATED_STAR, model_name="Star")
+    rels = out["parts"]["definition/relationships.tmdl"]
+    # both authored joins (SALE->REP, SALE->RMA) are many-to-many
+    assert rels.count("toCardinality: many") == 2
+    assert rels.count("crossFilteringBehavior: oneDirection") == 2
+    # the cardinality is carried additively on every reported (authored) relationship
+    assert out["report"]["relationships"]
+    assert all(r.get("cardinality") == "many_to_many"
+               for r in out["report"]["relationships"])
+
+
 def test_no_credentials_in_any_part():
     out = migrate_tds_to_semantic_model(LIVE_SQLSERVER, model_name="Superstore")
     blob = "\n".join(out["parts"].values())
