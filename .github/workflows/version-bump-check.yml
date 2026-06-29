@@ -1,0 +1,37 @@
+name: version-bump-check
+
+# Fail any PR that changes a skill's shipped payload (scripts / resources /
+# SKILL.md, canonical or plugin mirror) without a strictly-increasing bump to
+# that skill's skills/<name>/VERSION. The skills' self-update runbook gates on
+# "published VERSION newer than installed", so an un-bumped change ships to
+# main but stays invisible to every client. This makes the bump mandatory.
+#
+# No `paths:` filter on purpose: the check runs on every PR and exits 0 fast
+# when no skill payload changed, so it is safe to mark as a required status
+# check without the "required but skipped" branch-protection trap.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  enforce-version-bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full PR history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Enforce per-skill VERSION bumps
+        run: >-
+          python .github/scripts/check_version_bumps.py
+          --base "${{ github.event.pull_request.base.sha }}"
+          --head "${{ github.event.pull_request.head.sha }}"
