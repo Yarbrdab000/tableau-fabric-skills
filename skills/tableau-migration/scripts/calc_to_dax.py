@@ -2172,9 +2172,106 @@ def translate_percent_diff_to_dax(base_formula, resolver, partition_by=(), order
         return None, str(e), tables_used
 
 
-# ===========================================================================
-# Assisted translation (opt-in, human-approved) -- a SEPARATE layer ABOVE the
-# deterministic safe-subset translator.
+def translate_difference_to_dax(base_formula, resolver, partition_by=(), order_by=(),
+                                known_tables=None, order_resolver=None):
+    """Translate a *difference-from-the-previous-row* quick table calc to faithful DAX.
+
+    Tableau's difference-from-prior over a base aggregate ``X`` is ``X - LOOKUP(X, -1)``. The
+    prior-row value reuses the very same OFFSET picker as :func:`translate_tableau_table_calc_to_dax`'s
+    ``LOOKUP`` handler, so the result is::
+
+        VAR _prev = CALCULATE(X, OFFSET(-1, <spec>))
+        RETURN IF(ISBLANK(_prev), BLANK(), (X) - _prev)
+
+    where ``<spec>`` is the ``ORDERBY(...)[, PARTITIONBY(...)]`` addressing. On the FIRST row of each
+    partition ``OFFSET(-1, ...)`` yields blank, and Tableau shows that first row as NULL (no prior to
+    compare against); the ISBLANK guard returns BLANK rather than letting DAX coerce the missing prior
+    into ``(X) - 0``. ``base_formula`` is the Tableau aggregate the calc is computed over -- a directly
+    aggregated pill (``SUM([Sales])``) or an already-inlined calc base. Same
+    ``(dax|None, reason, tables_used)`` shape as the other entry points; an order spec is REQUIRED.
+    """
+    tables_used = set()
+    required_facts = set()
+    f = (base_formula or "").strip()
+    if not f:
+        return None, "empty base formula", tables_used
+    try:
+        toks = _tokenize(f)
+        p = _Parser(toks, resolver, tables_used, mode="measure", known_tables=known_tables)
+        inner = p._expr()
+        if p.pos != len(toks):
+            raise _CalcError("unexpected trailing tokens after difference base aggregate")
+        if inner[1] != "number":
+            return None, "difference requires a numeric base aggregate", tables_used
+        order_clause = _orderby_clause(order_by, resolver, tables_used,
+                                       order_resolver=order_resolver, required_facts=required_facts)
+        if order_clause is None:
+            return None, "difference requires an explicit order-by spec", tables_used
+        part_clause = _partitionby_clause(partition_by, resolver, tables_used)
+        spec = order_clause if part_clause is None else f"{order_clause}, {part_clause}"
+        if len(tables_used) > 1:
+            return None, "cross-table terms (fields span multiple tables)", tables_used
+        guard = _addressing_fact_guard(tables_used, required_facts)
+        if guard:
+            return None, guard, tables_used
+        prev = f"CALCULATE({inner[0]}, OFFSET(-1, {spec}))"
+        dax = f"VAR _prev = {prev} RETURN IF(ISBLANK(_prev), BLANK(), ({inner[0]}) - _prev)"
+        leak = validate_dax(dax)
+        if leak:
+            return None, f"emit guardrail: {leak}", tables_used
+        return dax, "ok", tables_used
+    except _CalcError as e:
+        return None, str(e), tables_used
+
+
+def translate_percent_of_total_to_dax(base_formula, resolver, partition_by=(), order_by=(),
+                                      known_tables=None, order_resolver=None):
+    """Translate a *percent-of-total* quick table calc to faithful DAX.
+
+    Tableau's percent-of-total over a base aggregate ``X`` is ``X / TOTAL(X)``, where ``TOTAL``
+    re-aggregates ``X`` over the addressing (Compute-Using) scope, restarting at each partition. The
+    denominator reuses the trusted ``TOTAL`` handler of :func:`translate_tableau_table_calc_to_dax`
+    -- ``CALCULATE(X, FILTER(ALLSELECTED(<marks>), <partition pinned>))`` -- so the result is::
+
+        DIVIDE(X, CALCULATE(X, <partition scope>))
+
+    On a zero / blank scope total ``DIVIDE`` returns BLANK. The value is order-INDEPENDENT (a whole-
+    scope re-aggregation), so multiple addressing dimensions stay faithful. ``base_formula`` is the
+    Tableau aggregate the calc is computed over. Same ``(dax|None, reason, tables_used)`` shape as the
+    other entry points; an addressing spec is REQUIRED (it names the scope the total spans).
+    """
+    tables_used = set()
+    f = (base_formula or "").strip()
+    if not f:
+        return None, "empty base formula", tables_used
+    try:
+        toks = _tokenize(f)
+        p = _Parser(toks, resolver, tables_used, mode="measure", known_tables=known_tables)
+        inner = p._expr()
+        if p.pos != len(toks):
+            raise _CalcError("unexpected trailing tokens after percent-of-total base aggregate")
+        if inner[1] != "number":
+            return None, "percent of total requires a numeric base aggregate", tables_used
+    except _CalcError as e:
+        return None, str(e), tables_used
+    # The denominator is TOTAL(X) over the addressing scope -- delegate to the trusted seam rather
+    # than rebuild the ALLSELECTED/partition relation here. It re-tokenizes X in its own parser and
+    # carries the same tables, which we fold in for the single-table guard.
+    denom, denom_reason, denom_tables = translate_tableau_table_calc_to_dax(
+        f"TOTAL({f})", resolver, partition_by=partition_by, order_by=order_by,
+        known_tables=known_tables, order_resolver=order_resolver)
+    if denom is None:
+        return None, f"percent-of-total denominator fallback: {denom_reason}", tables_used
+    tables_used |= denom_tables
+    if len(tables_used) > 1:
+        return None, "cross-table terms (fields span multiple tables)", tables_used
+    dax = f"DIVIDE({inner[0]}, {denom})"
+    leak = validate_dax(dax)
+    if leak:
+        return None, f"emit guardrail: {leak}", tables_used
+    return dax, "ok", tables_used
+
+
 #
 # translate_tableau_calc_to_dax only emits DAX when the mapping is provably 1:1;
 # everything else FALLS BACK to an inert `= 0` stub. That contract is unchanged.
