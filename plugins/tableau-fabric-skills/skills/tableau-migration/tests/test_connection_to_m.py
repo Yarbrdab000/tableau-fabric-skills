@@ -404,9 +404,11 @@ WHERE o.Profit << 0
   </connection>
 </datasource>"""
 
-# Databricks custom SQL carrying a Tableau parameter reference. After de-escaping the brackets,
-# the <Parameters.[Threshold]> token survives -- it cannot yet be translated to a Power Query
-# parameter, so the partition is still emitted but must be flagged needs_review.
+# Databricks custom SQL carrying a Tableau parameter reference, in the VERIFIED stored form: the
+# reference is <[Parameters].[Name]> (single delimiters, bracketed 'Parameters') while the literal
+# comparison operators around it are doubled. After de-escaping, the <[Parameters].[Threshold]>
+# token survives -- it cannot yet be translated to a Power Query parameter, so the partition is
+# still emitted but must be flagged needs_review.
 DATABRICKS_CUSTOM_SQL_PARAM = """<?xml version='1.0' encoding='utf-8' ?>
 <datasource formatted-name='DbxSQL' version='18.1'>
   <connection class='federated'>
@@ -419,7 +421,8 @@ DATABRICKS_CUSTOM_SQL_PARAM = """<?xml version='1.0' encoding='utf-8' ?>
     </named-connections>
     <relation connection='databricks.a' name='Custom SQL Query' type='text'><![CDATA[SELECT o.`Order ID`, o.Sales
 FROM orders o
-WHERE o.Sales >> <<Parameters.[Threshold]>>]]></relation>
+WHERE o.Profit >> <[Parameters].[Threshold]>
+  AND o.Sales  << 5000]]></relation>
     <metadata-records>
       <metadata-record class='column'>
         <remote-name>Order ID</remote-name><local-name>[Order ID]</local-name>
@@ -1411,14 +1414,21 @@ def test_deescape_custom_sql_is_not_idempotent():
 
 
 def test_deescape_custom_sql_preserves_parameter_tokens():
-    # A Tableau parameter reference is masked before the halve and restored to canonical single
-    # brackets, regardless of how its own delimiters were stored, and even when a doubled operator
-    # sits adjacent to it.
-    assert (_deescape_custom_sql("WHERE Region = <<Parameters.[Region]>>")
-            == "WHERE Region = <Parameters.[Region]>")
-    assert (_deescape_custom_sql("WHERE Sales << <<Parameters.[T]>>")
-            == "WHERE Sales < <Parameters.[T]>")
-    assert custom_sql_parameter_refs("a <Parameters.[X]> and <Parameters.[X]>") == ["<Parameters.[X]>"]
+    # The VERIFIED stored form is single-delimiter and bracketed: <[Parameters].[Name]>. Only the
+    # literal operators around it are doubled. The token is masked before the halve and restored
+    # verbatim, even when a doubled operator sits adjacent to it.
+    assert (_deescape_custom_sql("WHERE o.Profit >> <[Parameters].[Threshold]>")
+            == "WHERE o.Profit > <[Parameters].[Threshold]>")
+    assert (_deescape_custom_sql("WHERE o.Sales << <[Parameters].[T]>")
+            == "WHERE o.Sales < <[Parameters].[T]>")
+    # The exact spelling captured from a live parameterized save round-trips and is detected.
+    live = "WHERE o.Profit >> <[Parameters].[Parameter 0014036665946123]>   -- parameter"
+    assert (_deescape_custom_sql(live)
+            == "WHERE o.Profit > <[Parameters].[Parameter 0014036665946123]>   -- parameter")
+    assert (custom_sql_parameter_refs(_deescape_custom_sql(live))
+            == ["<[Parameters].[Parameter 0014036665946123]>"])
+    assert (custom_sql_parameter_refs("a <[Parameters].[X]> and <[Parameters].[X]>")
+            == ["<[Parameters].[X]>"])
 
 
 def test_parse_tds_deescapes_custom_sql_at_the_boundary():
@@ -1446,16 +1456,16 @@ def test_emit_databricks_doubled_custom_sql_emits_clean_native_query():
 
 
 def test_emit_databricks_custom_sql_flags_surviving_parameter():
-    # A recovered <Parameters.[Name]> token can't be translated yet, so the partition is still
+    # A recovered <[Parameters].[Name]> token can't be translated yet, so the partition is still
     # emitted (deploy-valid) but flagged needs_review with the token named.
     d = parse_tds(DATABRICKS_CUSTOM_SQL_PARAM)
     rel = d["relations"][0]
-    assert "<Parameters.[Threshold]>" in rel["sql"]
+    assert "<[Parameters].[Threshold]>" in rel["sql"]
     body = emit_m_partition_source(rel, d, "DirectQuery")
     assert "TODO" not in body                                # real query is emitted, not a scaffold
     assert "Value.NativeQuery(Catalog, " in body
     reason = m_partition_review_reason(rel, d, "DirectQuery")
-    assert reason and "<Parameters.[Threshold]>" in reason
+    assert reason and "<[Parameters].[Threshold]>" in reason
     assert "parameter" in reason.lower()
 
 

@@ -124,21 +124,30 @@ def escape_m_string(s):
 
 
 # -- Custom SQL de-escape ------------------------------------------------------
-# Tableau serializes a Custom SQL relation by doubling EVERY angle bracket in the query
-# text ('<' -> '<<', '>' -> '>>'). It is a blind, global, per-character substitution -- it
-# also rewrites the inside of line/block comments and string literals -- used to escape the
-# angle brackets that delimit Tableau's own parameter syntax (<Parameters.[Name]>); Tableau
-# halves the brackets back on read/execute, so the query that actually runs is single-operator
-# and correct. A migration tool that reads the raw .tds XML therefore sees the DOUBLED form,
-# and emitting it verbatim corrupts the query: on Spark/Databricks '<<'/'>>' are the bitwise
-# shiftleft/shiftright operators, so a comparison predicate like (Profit << 0) fails at refresh
-# with DATATYPE_MISMATCH while the deploy itself looks clean. The inverse of a clean
+# Tableau serializes a Custom SQL relation by doubling every LITERAL angle bracket in the query
+# text ('<' -> '<<', '>' -> '>>'). It is a global, per-character substitution -- it also rewrites
+# the inside of line/block comments and string literals -- whose purpose is to escape literal
+# brackets so they cannot be confused with Tableau's own parameter syntax. The parameter-reference
+# delimiters themselves are NOT doubled: a reference is emitted with SINGLE brackets in the verified
+# form <[Parameters].[Name]> (note 'Parameters' is itself bracketed). Tableau halves the doubled
+# literals back on read/execute and substitutes the parameter value, so the query that actually
+# runs is single-operator and correct. A migration tool that reads the raw .tds XML therefore sees
+# the DOUBLED form, and emitting it verbatim corrupts the query: on Spark/Databricks '<<'/'>>' are
+# the bitwise shiftleft/shiftright operators, so a comparison predicate like (Profit << 0) fails at
+# refresh with DATATYPE_MISMATCH while the deploy itself looks clean. The inverse of a clean
 # per-character double is a global halve. Verified against controlled Databricks Superstore
 # diagnostic saves: an operator matrix (< <= > >= <> -> << <<= >> >>= <<>>), contamination of
-# comment + string-literal text, an all-even bracket-run invariant, and an executable .hyper
-# (proving Tableau itself halves on read). See resources/migration-gotchas.md.
-_TABLEAU_PARAM_REF = re.compile(r"<+\s*Parameters\s*\.\s*(\[[^\]]+\])\s*>+", re.IGNORECASE)
-_DEESCAPED_PARAM_REF = re.compile(r"<\s*Parameters\s*\.\s*\[[^\]]+\]\s*>", re.IGNORECASE)
+# comment + string-literal text, an all-even bracket-run invariant for literals, an executable
+# .hyper (proving Tableau itself halves on read), and a live parameterized save in which a
+# 'Min Profit Threshold' parameter serialized as <[Parameters].[Parameter 0014036665946123]> with
+# single delimiters between two doubled operators ('Profit >> <[Parameters]...> ... Sales << 5000').
+# See resources/migration-gotchas.md.
+_TABLEAU_PARAM_REF = re.compile(
+    r"<\s*\[?\s*Parameters\s*\]?\s*\.\s*(\[[^\]]+\])\s*>", re.IGNORECASE
+)
+_DEESCAPED_PARAM_REF = re.compile(
+    r"<\s*\[?\s*Parameters\s*\]?\s*\.\s*\[[^\]]+\]\s*>", re.IGNORECASE
+)
 
 
 def _deescape_custom_sql(sql):
@@ -151,11 +160,11 @@ def _deescape_custom_sql(sql):
     downstream stage (M emission, profiling, comparison) only ever sees the recovered
     single-operator form.
 
-    Parameter-aware: a Tableau parameter reference (``<Parameters.[Name]>``) uses angle brackets
-    as delimiter syntax. Its exact stored bracketing is not re-verified here, so each token is
-    masked out before the halve and restored to canonical single-bracket form afterwards. The
-    mask also prevents a doubled operator sitting flush against a parameter delimiter from
-    forming an odd-length run that a blind halve would mangle.
+    Parameter-aware: a Tableau parameter reference (``<[Parameters].[Name]>``) uses angle brackets
+    as delimiter syntax and -- unlike literal operators -- is stored with SINGLE brackets. Each
+    token is masked out before the halve and restored to its canonical single-bracket form
+    afterwards. The mask also prevents a doubled operator sitting flush against a parameter
+    delimiter from forming an odd-length run that a blind halve would mangle.
     """
     if not sql:
         return sql
@@ -168,12 +177,12 @@ def _deescape_custom_sql(sql):
     work = _TABLEAU_PARAM_REF.sub(_stash, sql)
     work = work.replace("<<", "<").replace(">>", ">")
     for i, inner in enumerate(masked):
-        work = work.replace(f"\x00P{i}\x00", f"<Parameters.{inner}>")
+        work = work.replace(f"\x00P{i}\x00", f"<[Parameters].{inner}>")
     return work
 
 
 def custom_sql_parameter_refs(sql):
-    """Distinct canonical Tableau parameter tokens (``<Parameters.[Name]>``) in de-escaped
+    """Distinct canonical Tableau parameter tokens (``<[Parameters].[Name]>``) in de-escaped
     Custom SQL.
 
     A recovered parameter reference cannot yet be translated into a Power BI / Power Query
@@ -1527,7 +1536,7 @@ def _emit_m_partition_review(relation, descriptor, mode):
         body = ",\n\t\t\t\t".join(steps)
         # The operators are already de-escaped at parse, so a real native query is emitted. The
         # one thing we cannot complete is a recovered Tableau parameter reference
-        # (<Parameters.[Name]>): the source can't run it and we don't translate it to a Power
+        # (<[Parameters].[Name]>): the source can't run it and we don't translate it to a Power
         # Query parameter yet, so flag it for review (the partition is still emitted) rather than
         # ship a query that fails at refresh.
         param_reason = None

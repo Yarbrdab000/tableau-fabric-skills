@@ -1009,7 +1009,7 @@ def test_databricks_doubled_custom_sql_emits_clean_partition_and_report():
 
 
 def test_databricks_custom_sql_parameter_is_flagged_needs_review():
-    # A recovered <Parameters.[Threshold]> token can't be translated yet: the partition still emits
+    # A recovered <[Parameters].[Threshold]> token can't be translated yet: the partition still emits
     # a real native query, but the datasource is flagged needs_review (additively) with the
     # de-escaped SQL preserved -- not silently shipped to fail at refresh.
     out = migrate_tds_to_semantic_model(DATABRICKS_CUSTOM_SQL_PARAM, model_name="DbxSQL")
@@ -1018,8 +1018,8 @@ def test_databricks_custom_sql_parameter_is_flagged_needs_review():
     entry = report["partitions_needs_review"][0]
     assert entry["table"] == "Custom SQL Query"
     assert entry["kind"] == "m_partition"
-    assert "<Parameters.[Threshold]>" in entry["reason"]
-    assert "<Parameters.[Threshold]>" in entry["sql"]      # de-escaped SQL carried for the reviewer
+    assert "<[Parameters].[Threshold]>" in entry["reason"]
+    assert "<[Parameters].[Threshold]>" in entry["sql"]      # de-escaped SQL carried for the reviewer
     # the emitted partition is still a real native query (deploy-valid), not a scaffold
     part = out["parts"]["definition/tables/Custom SQL Query.tmdl"]
     assert "Value.NativeQuery(Catalog, " in part
