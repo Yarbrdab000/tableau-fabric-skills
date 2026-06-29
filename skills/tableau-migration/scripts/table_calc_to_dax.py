@@ -36,6 +36,8 @@ from typing import List, Optional, Tuple
 from calc_to_dax import (
     translate_tableau_table_calc_to_dax,
     translate_percent_diff_to_dax,
+    translate_difference_to_dax,
+    translate_percent_of_total_to_dax,
 )
 
 
@@ -76,11 +78,32 @@ _WINDOW_FN = {"Sum": "WINDOW_SUM", "Avg": "WINDOW_AVG",
               "Min": "WINDOW_MIN", "Max": "WINDOW_MAX"}
 _AGG_FN = {"Sum": "SUM", "Avg": "AVG", "Min": "MIN", "Max": "MAX"}
 
+# Rank quick-table-calc ``rank-options`` tie-mode token -> the Tableau RANK* function the window
+# seam translates to RANKX. Unlike CumTotal/WindowTotal a Rank QTC carries NO ``aggregation`` attr
+# (it lives on the pill), so the inner aggregate is taken from the pill's own ``derivation``.
+#   Competition          -> RANK          (1, 2, 2, 4 -- standard competition ranking; Tableau default)
+#   Dense                -> RANK_DENSE    (1, 2, 2, 3)
+#   ModifiedCompetition  -> RANK_MODIFIED (1, 3, 3, 4 -- ties take the HIGHEST ordinal)
+# "Unique" is intentionally ABSENT: Tableau's unique ranking breaks ties by ADDRESSING ORDER, which
+# the window seam cannot reproduce faithfully (RANK_UNIQUE falls back), so it stays a handoff.
+_RANK_TIE_FN = {
+    "competition": "RANK",
+    "dense": "RANK_DENSE",
+    "modifiedcompetition": "RANK_MODIFIED",
+}
+
 # QTC ``calc_type`` values that encode "percent difference from the previous row" -- a COMPOSITE
 # ``(X - LOOKUP(X,-1)) / ABS(LOOKUP(X,-1))`` the single-head window seam cannot parse, so it routes
 # to the dedicated :func:`calc_to_dax.translate_percent_diff_to_dax` emitter. Tableau writes the
 # type as ``PctDiff`` in the .twb; the older/internal spelling ``PercentDifference`` is accepted too.
 _PCT_DIFF_TYPES = {"PctDiff", "PercentDifference", "PercentDifferenceFrom"}
+# QTC ``calc_type`` for "difference from the previous row" -- the ADDITIVE composite
+# ``X - LOOKUP(X,-1)`` (the percent-difference's un-normalised sibling), routed to the dedicated
+# :func:`calc_to_dax.translate_difference_to_dax` emitter (single-head seam cannot parse a composite).
+_DIFF_TYPES = {"Difference", "DifferenceFrom"}
+# QTC ``calc_type`` for "percent of total" -- the composite ``X / TOTAL(X)`` (the current mark's
+# share of its addressing-scope total), routed to :func:`calc_to_dax.translate_percent_of_total_to_dax`.
+_PCT_TOTAL_TYPES = {"PercentOfTotal", "PctOfTotal"}
 # A short human label for the derived measure name so the percent-difference measure reads distinctly
 # from the untransformed base measure it is computed over (the two are bound by DIFFERENT tokens).
 _PCT_DIFF_LABEL = "% Difference"
@@ -129,10 +152,41 @@ def _intent_for(usage) -> str:
     return "table calculation"
 
 
+def _has_moving_bounds(formula: str) -> bool:
+    """True iff a WINDOW_* call carries explicit ``, start, end`` moving bounds (>1 top-level arg).
+
+    The whole-partition form ``WINDOW_AVG(AVG([x]))`` has no top-level comma inside its outermost
+    parens; the moving form ``WINDOW_AVG(AVG([x]), -2, 0)`` has two. Commas nested inside the inner
+    aggregate's own parens sit at a deeper paren depth and are not counted.
+    """
+    f = (formula or "").strip()
+    i = f.find("(")
+    if i < 0:
+        return False
+    depth = 0
+    for ch in f[i:]:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        elif ch == "," and depth == 1:
+            return True
+    return False
+
+
 def _is_order_sensitive(formula: str) -> bool:
-    """True unless the formula is a full-partition window aggregate (order-independent value)."""
+    """True unless the formula is a FULL-PARTITION window aggregate (order-independent value).
+
+    The four WINDOW_SUM/AVG/MIN/MAX heads are order-independent ONLY in their bare whole-partition
+    form; the SAME head with explicit moving (start, end) bounds is a sliding frame whose value
+    depends on the addressing order, so it is order-sensitive like every other table calc.
+    """
     head = (formula or "").lstrip().upper()
-    return not any(head.startswith(h) for h in _ORDER_INSENSITIVE_HEADS)
+    if not any(head.startswith(h) for h in _ORDER_INSENSITIVE_HEADS):
+        return True
+    return _has_moving_bounds(formula)
 
 
 # -- result --------------------------------------------------------------------
@@ -206,6 +260,32 @@ def _handoff(usage, intent, reason) -> TableCalcTranslation:
         status="handoff", reason=reason, handoff=request)
 
 
+def _rank_formula(usage, col) -> Tuple[Optional[str], Optional[str]]:
+    """Synthesize the Tableau ``RANK*`` formula for a Rank quick table calc from its ``rank-options``.
+
+    A Rank QTC has no ``aggregation`` attr (it sits on the pill), so the inner aggregate is the
+    pill's ``derivation`` (e.g. ``Sum`` -> ``SUM([col])``). ``rank-options`` is a comma-joined
+    ``"<tie-mode>,<direction>"`` (e.g. ``"Competition,Descending"``); a missing token defaults to
+    Tableau's own default (competition ranking, descending). Fail-closed: the 'Unique' tie mode (its
+    addressing-order tiebreak is not faithfully expressible in DAX) and any unrecognized ranking
+    token hand off rather than emit an unfaithful rank.
+    """
+    agg = usage.aggregation or getattr(usage, "derivation", None)
+    if agg not in _AGG_FN:
+        return None, f"Rank over unsupported aggregation {agg!r}"
+    tokens = [t.strip().lower() for t in (usage.rank_options or "").split(",") if t.strip()]
+    direction = "asc" if any(t.startswith("asc") for t in tokens) else "desc"
+    tie_tokens = [t for t in tokens if not (t.startswith("asc") or t.startswith("desc"))]
+    if "unique" in tie_tokens:
+        return None, ("Rank with 'Unique' ranking breaks ties by addressing order, which is not "
+                      "faithfully expressible in DAX (RANK_UNIQUE falls back)")
+    unknown = [t for t in tie_tokens if t not in _RANK_TIE_FN]
+    if unknown:
+        return None, f"Rank with unsupported ranking option {unknown[0]!r}"
+    tie = tie_tokens[0] if tie_tokens else "competition"
+    return f"{_RANK_TIE_FN[tie]}({_AGG_FN[agg]}([{col}]), '{direction}')", None
+
+
 def _synthesize_formula(usage) -> Tuple[Optional[str], Optional[str]]:
     """For a Quick Table Calc, build the equivalent Tableau table-calc formula.
 
@@ -225,13 +305,21 @@ def _synthesize_formula(usage) -> Tuple[Optional[str], Optional[str]]:
             return None, f"CumTotal with unsupported aggregation {agg!r}"
         return f"{_RUNNING_FN[agg]}({_AGG_FN[agg]}([{col}]))", None
     if ct == "WindowTotal":
-        if usage.window_from is not None or usage.window_to is not None:
-            return None, "moving window (relative from/to bounds) not yet supported in Tier 0"
         if agg not in _WINDOW_FN:
             return None, f"WindowTotal with unsupported aggregation {agg!r}"
+        if usage.window_from is not None or usage.window_to is not None:
+            # A moving window with relative bounds: faithful only when BOTH bounds are integer
+            # literals (the seam's WINDOW(start, REL, end, REL) form, oracle-certified for
+            # SUM/AVG/MIN/MAX). A one-sided / non-integer bound is not a complete moving frame, so
+            # fall back rather than guess.
+            if not (isinstance(usage.window_from, int) and isinstance(usage.window_to, int)):
+                return None, ("moving window needs both integer-literal bounds (got "
+                              f"from={usage.window_from!r}, to={usage.window_to!r})")
+            return (f"{_WINDOW_FN[agg]}({_AGG_FN[agg]}([{col}]), "
+                    f"{usage.window_from}, {usage.window_to})", None)
         return f"{_WINDOW_FN[agg]}({_AGG_FN[agg]}([{col}]))", None
     if ct == "Rank":
-        return None, "Rank (RANKX with rank-options) not yet supported in Tier 0"
+        return _rank_formula(usage, col)
     return None, f"Quick Table Calc type {ct!r} not yet supported in Tier 0"
 
 
@@ -396,7 +484,7 @@ def _pct_diff_base_formula(usage, base_formula_lookup):
     agg = getattr(usage, "aggregation", None)
     if agg in _AGG_FN:
         return f"{_AGG_FN[agg]}([{col}])", None
-    return None, (f"percent-difference base [{col}] is neither a known calc nor a directly "
+    return None, (f"table-calc base [{col}] is neither a known calc nor a directly "
                   f"aggregated pill (aggregation={agg!r})")
 
 
@@ -529,6 +617,31 @@ def translate_unplaced_percent_diff(calc_formula, consumer_usage, resolver,
     return dax, None, order_by, partition_by
 
 
+def _translate_composite_over_base(usage, intent, resolver, *, base_formula_lookup, known_tables,
+                                   order_resolver, order_sensitive, emitter, fallback_label):
+    """Shared driver for the composite over-a-base QTCs (percent-difference / difference /
+    percent-of-total): recover the base aggregate, recover the worksheet addressing, then hand both
+    to the dedicated faithful ``emitter``. Each is a scalar composite the single-head window seam
+    cannot parse, so each gets its own emitter; the base recovery + addressing recovery + result
+    shaping are identical, and fail-closed at every step (an unrecoverable base, an un-pinnable
+    addressing, or an emitter fallback all hand off with the recovered facts intact)."""
+    base, base_reason = _pct_diff_base_formula(usage, base_formula_lookup or {})
+    if base is None:
+        return _handoff(usage, intent, base_reason)
+    order_by, partition_by, reason = _addressing_for(usage, order_sensitive=order_sensitive)
+    if reason is not None:
+        return _handoff(usage, intent, reason)
+    dax, seam_reason, _tables = emitter(
+        base, resolver, partition_by=partition_by, order_by=order_by,
+        known_tables=known_tables, order_resolver=order_resolver)
+    if dax is None:
+        return _handoff(usage, intent, f"{fallback_label} seam fallback: {seam_reason}")
+    return TableCalcTranslation(
+        worksheet=usage.worksheet, field=usage.caption, intent=intent,
+        status="translated", dax=dax, partition_by=partition_by, order_by=order_by,
+        translated_by="deterministic (workbook addressing)")
+
+
 def translate_table_calc_usage(usage, resolver, known_tables=None,
                                base_formula_lookup=None, order_resolver=None) -> TableCalcTranslation:
     """Map one :class:`TableCalcUsage` to faithful DAX or a structured Tier-1 handoff.
@@ -553,25 +666,27 @@ def translate_table_calc_usage(usage, resolver, known_tables=None,
             "secondary (stacked) table calculation: only the primary pass is synthesized in "
             "Tier 0, so the second addressing pass would be silently dropped")
 
-    # 1) percent-difference-from-prior QTC: a COMPOSITE the single-head window seam cannot parse,
-    #    routed to its own faithful emitter. Its base may be a named calc (inlined) or an aggregated
-    #    pill; addressing is order-sensitive (it looks back one row), recovered like any other QTC.
-    if usage.kind == "quick" and (getattr(usage, "calc_type", "") or "") in _PCT_DIFF_TYPES:
-        base, base_reason = _pct_diff_base_formula(usage, base_formula_lookup or {})
-        if base is None:
-            return _handoff(usage, intent, base_reason)
-        order_by, partition_by, reason = _addressing_for(usage, order_sensitive=True)
-        if reason is not None:
-            return _handoff(usage, intent, reason)
-        dax, seam_reason, _tables = translate_percent_diff_to_dax(
-            base, resolver, partition_by=partition_by, order_by=order_by,
-            known_tables=known_tables, order_resolver=order_resolver)
-        if dax is None:
-            return _handoff(usage, intent, f"percent-difference seam fallback: {seam_reason}")
-        return TableCalcTranslation(
-            worksheet=usage.worksheet, field=usage.caption, intent=intent,
-            status="translated", dax=dax, partition_by=partition_by, order_by=order_by,
-            translated_by="deterministic (workbook addressing)")
+    # 1) composite over-a-base QTCs the single-head window seam cannot parse, each routed to its own
+    #    faithful emitter. Their base may be a named calc (inlined) or an aggregated pill.
+    ct = (getattr(usage, "calc_type", "") or "")
+    if usage.kind == "quick" and ct in _PCT_DIFF_TYPES:
+        # (X - LOOKUP(X,-1)) / ABS(LOOKUP(X,-1)) -- order-sensitive (looks back one row).
+        return _translate_composite_over_base(
+            usage, intent, resolver, base_formula_lookup=base_formula_lookup,
+            known_tables=known_tables, order_resolver=order_resolver, order_sensitive=True,
+            emitter=translate_percent_diff_to_dax, fallback_label="percent-difference")
+    if usage.kind == "quick" and ct in _DIFF_TYPES:
+        # X - LOOKUP(X,-1) -- order-sensitive (looks back one row); null on the first row.
+        return _translate_composite_over_base(
+            usage, intent, resolver, base_formula_lookup=base_formula_lookup,
+            known_tables=known_tables, order_resolver=order_resolver, order_sensitive=True,
+            emitter=translate_difference_to_dax, fallback_label="difference")
+    if usage.kind == "quick" and ct in _PCT_TOTAL_TYPES:
+        # X / TOTAL(X) -- order-INSENSITIVE (a whole-scope re-aggregation), so multi-dim is faithful.
+        return _translate_composite_over_base(
+            usage, intent, resolver, base_formula_lookup=base_formula_lookup,
+            known_tables=known_tables, order_resolver=order_resolver, order_sensitive=False,
+            emitter=translate_percent_of_total_to_dax, fallback_label="percent-of-total")
 
     # 2) the table-calc formula (synthesized for a QTC; given for a user calc field).
     if usage.kind == "quick":

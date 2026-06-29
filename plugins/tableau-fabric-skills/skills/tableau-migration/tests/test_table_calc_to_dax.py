@@ -17,6 +17,10 @@ from table_calc_to_dax import (
     translate_table_calc_usage,
     translate_table_calc_usages,
     _intent_for,
+    _rank_formula,
+    _is_order_sensitive,
+    _has_moving_bounds,
+    _synthesize_formula,
     extract_percent_diff_base,
     inherited_addressing,
     translate_unplaced_percent_diff,
@@ -129,6 +133,183 @@ def test_scope_relative_tokens_hand_off(token):
     assert t.status == "handoff"
     assert "scope-relative addressing" in t.reason
     assert t.handoff["ordering_type"] == token
+
+
+# -- Rank (RANKX) -- synthesized from the QTC rank-options, translated by the window seam ------
+def _rank_usage(**kw):
+    """A Field-scope Rank QTC ranking sub-categories by Sum(Profit). A Rank QTC carries no
+    ``aggregation`` attr -- the inner aggregate comes from the pill ``derivation``."""
+    defaults = dict(
+        worksheet="WS", instance="i", column="Profit", caption="Profit", kind="quick",
+        calc_type="Rank", aggregation=None, derivation="Sum",
+        rank_options="Competition,Descending", ordering_type="Field",
+        ordering_fields=["Sub-Category"],
+        rows=[_pill("Sub-Category")], cols=[_pill("Profit", "Sum")],
+    )
+    defaults.update(kw)
+    return TableCalcUsage(**defaults)
+
+
+class _RankOpts:
+    """Duck-typed minimal usage for the pure ``_rank_formula`` synthesis unit."""
+    def __init__(self, **kw):
+        self.aggregation = None
+        self.derivation = "Sum"
+        self.rank_options = None
+        self.__dict__.update(kw)
+
+
+@pytest.mark.parametrize("opts, expected", [
+    ("Competition,Descending", "RANK(SUM([Profit]), 'desc')"),
+    ("Dense,Ascending",        "RANK_DENSE(SUM([Profit]), 'asc')"),
+    ("ModifiedCompetition,Descending", "RANK_MODIFIED(SUM([Profit]), 'desc')"),
+    ("",                       "RANK(SUM([Profit]), 'desc')"),   # Tableau default
+    ("Descending",             "RANK(SUM([Profit]), 'desc')"),   # tie mode omitted -> competition
+])
+def test_rank_formula_maps_tie_modes_and_direction(opts, expected):
+    formula, reason = _rank_formula(_RankOpts(rank_options=opts), "Profit")
+    assert reason is None
+    assert formula == expected
+
+
+def test_rank_formula_unique_hands_off():
+    # Tableau's 'Unique' ranking breaks ties by addressing order -> not faithful in DAX.
+    formula, reason = _rank_formula(_RankOpts(rank_options="Unique,Descending"), "Profit")
+    assert formula is None
+    assert "Unique" in reason and "addressing order" in reason
+
+
+def test_rank_formula_unknown_option_hands_off():
+    formula, reason = _rank_formula(_RankOpts(rank_options="Percentile,Descending"), "Profit")
+    assert formula is None
+    assert "unsupported ranking option" in reason
+
+
+def test_rank_formula_unsupported_aggregation_hands_off():
+    # Count-distinct is not in the small faithful aggregate set; fail closed (no guessing).
+    formula, reason = _rank_formula(_RankOpts(derivation="Cntd"), "Profit")
+    assert formula is None
+    assert "unsupported aggregation" in reason
+
+
+def test_field_rank_competition_translates_as_rankx():
+    t = translate_table_calc_usage(_rank_usage(), resolver)
+    assert t.status == "translated"
+    assert t.translated_by == "deterministic (workbook addressing)"
+    assert t.intent == "rank within partition"
+    assert t.partition_by == ()                      # ranks across all sub-categories
+    assert t.order_by == (("Sub-Category", "ASC"),)
+    # competition ranking (Skip ties), highest profit -> rank 1 (DESC), no partition FILTER.
+    assert t.dax == ("RANKX(ALLSELECTED('Orders'[Sub-Category]), "
+                     "CALCULATE(SUM('Orders'[Profit])), , DESC, Skip)")
+
+
+def test_field_rank_dense_ascending_translates():
+    t = translate_table_calc_usage(_rank_usage(rank_options="Dense,Ascending"), resolver)
+    assert t.status == "translated"
+    assert "Dense)" in t.dax                         # dense ranking
+    assert ", ASC, " in t.dax                        # lowest value -> rank 1
+
+
+def test_field_rank_partitioned_restricts_relation():
+    # rank sub-categories by profit WITHIN each Region: Region is the unchecked partition dim.
+    t = translate_table_calc_usage(
+        _rank_usage(rows=[_pill("Region"), _pill("Sub-Category")]), resolver)
+    assert t.status == "translated"
+    assert t.partition_by == ("Region",)
+    assert "FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Sub-Category])" in t.dax
+    assert "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])" in t.dax
+
+
+def test_field_rank_unique_hands_off_preserving_options():
+    t = translate_table_calc_usage(_rank_usage(rank_options="Unique,Descending"), resolver)
+    assert t.status == "handoff"
+    assert "RANK_UNIQUE" in t.reason
+    assert t.handoff["rank_options"] == "Unique,Descending"
+    assert t.handoff["intent"] == "rank within partition"
+
+
+# -- moving window (WindowTotal with relative from/to bounds) ------------------
+def _moving_usage(**kw):
+    """A WindowTotal moving-window QTC over Sum/Avg([Profit]) with integer relative bounds, addressed
+    under the 'Rows' scope (partition = Rows dims, order across the Cols date axis)."""
+    defaults = dict(
+        worksheet="Moving", instance="i", column="Profit", caption="Profit", kind="quick",
+        calc_type="WindowTotal", aggregation="Avg", window_from=-2, window_to=0,
+        ordering_type="Rows", rows=[_pill("Segment")],
+        cols=[_pill("Order Date", "Day-Trunc")],
+    )
+    defaults.update(kw)
+    return TableCalcUsage(**defaults)
+
+
+@pytest.mark.parametrize("formula, moving", [
+    ("WINDOW_AVG(AVG([Sales]))", False),          # whole partition
+    ("WINDOW_AVG(AVG([Sales]), -2, 0)", True),    # trailing-3 moving frame
+    ("WINDOW_SUM(SUM([a]) + SUM([b]))", False),   # compound inner, no bounds
+])
+def test_has_moving_bounds_distinguishes_moving_from_whole_partition(formula, moving):
+    assert _has_moving_bounds(formula) is moving
+
+
+def test_is_order_sensitive_moving_window_is_order_sensitive():
+    # a whole-partition window is order-independent; the SAME head with moving bounds is NOT.
+    assert _is_order_sensitive("WINDOW_AVG(AVG([Sales]))") is False
+    assert _is_order_sensitive("WINDOW_AVG(AVG([Sales]), -2, 0)") is True
+
+
+def test_synthesize_moving_window_emits_bounds():
+    formula, reason = _synthesize_formula(_moving_usage())
+    assert reason is None
+    assert formula == "WINDOW_AVG(AVG([Profit]), -2, 0)"
+
+
+def test_rows_scope_moving_window_translates_with_relative_frame():
+    t = translate_table_calc_usage(_moving_usage(), resolver)
+    assert t.status == "translated"
+    assert t.partition_by == ("Segment",)            # restarts at each Rows-shelf row
+    assert t.order_by == (("Order Date", "ASC"),)    # runs across the Cols date axis
+    assert "WINDOW(-2, REL, 0, REL" in t.dax         # relative moving frame
+    assert "ORDERBY('Orders'[Order_Date], ASC)" in t.dax
+    assert "PARTITIONBY('Orders'[Segment])" in t.dax
+    assert "CALCULATE(AVERAGE('Orders'[Profit]))" in t.dax
+
+
+def test_field_single_dim_moving_window_translates():
+    u = _moving_usage(
+        aggregation="Sum", window_from=-1, window_to=1, ordering_type="Field",
+        ordering_fields=["Order Date"],
+        rows=[_pill("Order Date")], cols=[_pill("Profit", "Sum")])
+    t = translate_table_calc_usage(u, resolver)
+    assert t.status == "translated"
+    assert "SUMX(WINDOW(-1, REL, 1, REL" in t.dax
+    assert "CALCULATE(SUM('Orders'[Profit]))" in t.dax
+
+
+def test_field_multi_dim_moving_window_hands_off():
+    # a moving window is order-SENSITIVE, so >1 addressing dim leaves the order ambiguous -> handoff
+    # (contrast the whole-partition window, which stays translated with multiple dims).
+    u = _moving_usage(
+        ordering_type="Field", ordering_fields=["Category", "Sub-Category"],
+        rows=[_pill("Category"), _pill("Sub-Category"), _pill("Segment")],
+        cols=[_pill("Profit", "Sum")])
+    t = translate_table_calc_usage(u, resolver)
+    assert t.status == "handoff"
+    assert "multiple dimensions" in t.reason
+
+
+def test_moving_window_unsupported_aggregation_hands_off():
+    # the seam only certifies SUM/AVG/MIN/MAX moving frames; a moving COUNT/STDEV stays a handoff.
+    formula, reason = _synthesize_formula(_moving_usage(aggregation="Count"))
+    assert formula is None
+    assert "unsupported aggregation" in reason
+
+
+def test_moving_window_one_sided_bound_hands_off():
+    # a complete relative frame needs BOTH integer bounds; a None bound is not a moving frame.
+    formula, reason = _synthesize_formula(_moving_usage(window_from=-2, window_to=None))
+    assert formula is None
+    assert "both integer-literal bounds" in reason
 
 
 # -- the 'Rows' pane scope (verified against real Tableau output) --------------
@@ -271,6 +452,139 @@ def test_pct_diff_first_row_is_blank_via_divide_offset():
     assert t.dax.count("OFFSET(-1") == 2  # current - prior, and ABS(prior)
 
 
+# -- difference-from-prior quick table calc (composite; the percent-diff's additive sibling) ---------
+def _diff_usage(**kw):
+    """A difference-from-prior quick table calc: the composite X - LOOKUP(X,-1), restarting per
+    Rows-shelf dim and running across a date Cols axis (partition=[Segment], order=[Order Date])."""
+    defaults = dict(
+        worksheet="Sales Diff", instance="diff:usr:Calculation_0014172369735704:qk",
+        column="Sales", caption="SUM(Sales)", kind="quick", calc_type="Difference",
+        aggregation="Sum", ordering_type="Rows", ordering_fields=[],
+        rows=[_pill("Segment")], cols=[_pill("Order Date", "Day-Trunc")],
+    )
+    defaults.update(kw)
+    return TableCalcUsage(**defaults)
+
+
+def test_difference_over_aggregated_pill_translates():
+    # X - LOOKUP(X,-1) over a directly-aggregated pill: faithful (X) - prior over an OFFSET prior row,
+    # addressed partition=[Segment] / order=[Order Date] from the Rows/Cols shelves.
+    t = translate_table_calc_usage(_diff_usage(), resolver)
+    assert t.status == "translated"
+    assert t.translated_by == "deterministic (workbook addressing)"
+    assert t.intent == "difference from a prior row"
+    assert t.partition_by == ("Segment",)
+    assert t.order_by == (("Order Date", "ASC"),)
+    assert t.dax == (
+        "VAR _prev = CALCULATE(SUM('Orders'[Sales]), "
+        "OFFSET(-1, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Segment]))) "
+        "RETURN IF(ISBLANK(_prev), BLANK(), (SUM('Orders'[Sales])) - _prev)")
+
+
+def test_difference_inlines_named_calc_base():
+    # The base is the NAMED calc [count orders] + 100, inlined to a self-contained aggregate, with the
+    # nested [count orders] = ZN(COUNT(<object-id>)) -> COALESCE(COUNTROWS('Orders'),0) (known table).
+    lookup = {
+        "calculation_0014172369248279": f"ZN(COUNT({_OID}))",
+        "calculation_0014172369735704": "[Calculation_0014172369248279] + 100",
+    }
+    u = _diff_usage(column="[Calculation_0014172369735704]", caption="[count orders] + 100",
+                    aggregation=None)
+    t = translate_table_calc_usage(u, resolver, known_tables={"Orders"}, base_formula_lookup=lookup)
+    assert t.status == "translated"
+    assert t.partition_by == ("Segment",)
+    assert t.order_by == (("Order Date", "ASC"),)
+    assert "COUNTROWS('Orders')" in t.dax
+    assert "+ 100" in t.dax
+    assert "OFFSET(-1, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Segment]))" in t.dax
+
+
+def test_difference_multi_dim_hands_off():
+    # Difference looks back one row, so it is order-SENSITIVE: two addressing dimensions leave the
+    # slowest->fastest order unrecoverable from the workbook -> honest handoff (never a guessed order).
+    u = _diff_usage(ordering_type="Field", ordering_fields=["Category", "Sub-Category"],
+                    rows=[_pill("Category"), _pill("Sub-Category")], cols=[_pill("Sales", "Sum")])
+    t = translate_table_calc_usage(u, resolver)
+    assert t.status == "handoff"
+    assert "addressed by multiple dimensions" in t.reason
+
+
+def test_difference_unresolvable_base_hands_off():
+    # No known calc base and no aggregation -> the base is not a single aggregate -> honest handoff.
+    u = _diff_usage(column="MysteryPill", caption="MysteryPill", aggregation=None)
+    t = translate_table_calc_usage(u, resolver)
+    assert t.status == "handoff"
+    assert "neither a known calc nor a directly aggregated pill" in t.reason
+
+
+def test_difference_first_row_is_blank_via_isblank_guard():
+    # Contract: Tableau shows the first row of each partition as NULL (no prior to compare). The shape
+    # guards that exactly -- OFFSET(-1,...) is blank on the first row and ISBLANK returns BLANK rather
+    # than letting DAX coerce the missing prior into (X) - 0. A single prior-row lookup (unlike
+    # percent-diff, which needs the prior twice: current - prior and ABS(prior)).
+    t = translate_table_calc_usage(_diff_usage(), resolver)
+    assert "RETURN IF(ISBLANK(_prev), BLANK(), " in t.dax
+    assert t.dax.count("OFFSET(-1") == 1
+
+
+# -- percent-of-total quick table calc (composite; order-INSENSITIVE whole-scope re-aggregation) ------
+def _pct_total_usage(**kw):
+    """A percent-of-total quick table calc: X / TOTAL(X) over an addressing scope. Order-INSENSITIVE
+    (a whole-scope re-aggregation), so it addresses faithfully even across multiple dimensions."""
+    defaults = dict(
+        worksheet="Share of Total", instance="pctt:usr:Calculation_0014172369735704:qk",
+        column="Sales", caption="SUM(Sales)", kind="quick", calc_type="PercentOfTotal",
+        aggregation="Sum", ordering_type="Field", ordering_fields=["Sub-Category"],
+        rows=[_pill("Sub-Category")], cols=[_pill("Sales", "Sum")],
+    )
+    defaults.update(kw)
+    return TableCalcUsage(**defaults)
+
+
+def test_pct_of_total_single_dim_translates():
+    # One addressing dim, no remaining partition -> the scope total spans that whole column:
+    # DIVIDE(X, CALCULATE(X, ALLSELECTED(<addr dim>))).
+    t = translate_table_calc_usage(_pct_total_usage(), resolver)
+    assert t.status == "translated"
+    assert t.translated_by == "deterministic (workbook addressing)"
+    assert t.intent == "percent-of-scope ratio"
+    assert t.partition_by == ()
+    assert t.dax == ("DIVIDE(SUM('Orders'[Sales]), "
+                     "CALCULATE(SUM('Orders'[Sales]), ALLSELECTED('Orders'[Sub-Category])))")
+
+
+def test_pct_of_total_multi_dim_translates():
+    # The KEY differentiator from Difference: percent-of-total is order-INSENSITIVE, so two or more
+    # addressing dimensions stay faithful (the order spec merely frames the scope). partition=[Segment]
+    # (the dim not addressed); the scope total re-aggregates over Sub-Category x Order Date per Segment.
+    u = _pct_total_usage(ordering_fields=["Sub-Category", "Order Date"],
+                         rows=[_pill("Segment"), _pill("Sub-Category"), _pill("Order Date")],
+                         cols=[_pill("Sales", "Sum")])
+    t = translate_table_calc_usage(u, resolver)
+    assert t.status == "translated"
+    assert t.partition_by == ("Segment",)
+    assert t.dax == (
+        "DIVIDE(SUM('Orders'[Sales]), CALCULATE(SUM('Orders'[Sales]), "
+        "FILTER(ALLSELECTED('Orders'[Segment], 'Orders'[Sub-Category], 'Orders'[Order_Date]), "
+        "'Orders'[Segment] = SELECTEDVALUE('Orders'[Segment]))))")
+
+
+def test_pct_of_total_unresolvable_base_hands_off():
+    # No known calc base and no aggregation -> the base is not a single aggregate -> honest handoff.
+    u = _pct_total_usage(column="MysteryPill", caption="MysteryPill", aggregation=None)
+    t = translate_table_calc_usage(u, resolver)
+    assert t.status == "handoff"
+    assert "neither a known calc nor a directly aggregated pill" in t.reason
+
+
+def test_pct_of_total_denominator_is_calculate_over_total_scope():
+    # Structural contract: the share is DIVIDE(X, <total>), where the denominator is a CALCULATE that
+    # re-aggregates the SAME base over the addressing scope (so a zero/blank scope total -> BLANK).
+    t = translate_table_calc_usage(_pct_total_usage(), resolver)
+    assert t.dax.startswith("DIVIDE(SUM('Orders'[Sales]), CALCULATE(SUM('Orders'[Sales]), ")
+    assert t.dax.count("SUM('Orders'[Sales])") == 2  # numerator mark + denominator scope total
+
+
 # -- force-translating an UNPLACED percent-difference measure (the pilot's `Percent Difference`) ----
 _PCT_DIFF_FORMULA = (f"(ZN(COUNT({_OID})) - LOOKUP(ZN(COUNT({_OID})),-1)) "
                      f"/ ABS(LOOKUP(ZN(COUNT({_OID})),-1))")
@@ -395,13 +709,17 @@ def test_rank_quick_calc_hands_off():
     assert "Rank" in t.reason
 
 
-def test_moving_window_relative_bounds_hands_off():
+def test_moving_window_relative_bounds_single_dim_translates():
+    # a single addressing dim leaves no order ambiguity, so a moving frame now translates faithfully
+    # (this case formerly handed off when moving windows were unsupported in Tier 0).
     u = _usage(calc_type="WindowTotal", aggregation="Avg", window_from=-2, window_to=0,
                ordering_fields=["Category"])
     t = translate_table_calc_usage(u, resolver)
-    assert t.status == "handoff"
-    assert "moving window" in t.reason
+    assert t.status == "translated"
     assert t.intent == "moving window"
+    assert t.order_by == (("Category", "ASC"),)
+    assert "WINDOW(-2, REL, 0, REL" in t.dax
+    assert "CALCULATE(AVERAGE('Orders'[Profit]))" in t.dax
 
 
 # -- shape / batch / intent ----------------------------------------------------
