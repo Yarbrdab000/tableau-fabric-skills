@@ -21,6 +21,13 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   position binding to the migrated semantic model. Emitted only where it can be bound faithfully;
   anything ambiguous still degrades to a structured warning (warn-never-wrong). Additive; the
   migration suite stays green. Skill `VERSION` `1.10.0` → `1.11.0`.
+- **tableau-migration:** **broader deterministic table-calculation → DAX coverage.** The Tier-0
+  compiler now translates more Tableau quick table calcs faithfully: **Difference** and **Percent of
+  Total**, the **Rank family** (`RANK` / `RANK_DENSE` / `RANK_MODIFIED`), and **moving `WINDOW`**
+  aggregates with integer-literal bounds. Each is emitted only when it maps faithfully — e.g. `Unique`
+  ranking (whose tiebreak depends on addressing order) and one-sided / non-integer window bounds still
+  hand off rather than emit an unfaithful result. Tier-0 guarantees unchanged; the original Tableau
+  formula is preserved as an annotation. Additive; the migration suite stays green.
 - **tableau-migration:** **a Databricks Custom SQL relation now migrates to a deploy-valid native
   query.** A `<relation type='text'>` custom-SQL connection emits a `Value.NativeQuery(...)` M
   partition against the bound source instead of an unresolvable placeholder, so the generated model
