@@ -123,6 +123,80 @@ def escape_m_string(s):
     return (s or "").replace('"', '""')
 
 
+# -- Custom SQL de-escape ------------------------------------------------------
+# Tableau serializes a Custom SQL relation by doubling every LITERAL angle bracket in the query
+# text ('<' -> '<<', '>' -> '>>'). It is a global, per-character substitution -- it also rewrites
+# the inside of line/block comments and string literals -- whose purpose is to escape literal
+# brackets so they cannot be confused with Tableau's own parameter syntax. The parameter-reference
+# delimiters themselves are NOT doubled: a reference is emitted with SINGLE brackets in the verified
+# form <[Parameters].[Name]> (note 'Parameters' is itself bracketed). Tableau halves the doubled
+# literals back on read/execute and substitutes the parameter value, so the query that actually
+# runs is single-operator and correct. A migration tool that reads the raw .tds XML therefore sees
+# the DOUBLED form, and emitting it verbatim corrupts the query: on Spark/Databricks '<<'/'>>' are
+# the bitwise shiftleft/shiftright operators, so a comparison predicate like (Profit << 0) fails at
+# refresh with DATATYPE_MISMATCH while the deploy itself looks clean. The inverse of a clean
+# per-character double is a global halve. Verified against controlled Databricks Superstore
+# diagnostic saves: an operator matrix (< <= > >= <> -> << <<= >> >>= <<>>), contamination of
+# comment + string-literal text, an all-even bracket-run invariant for literals, an executable
+# .hyper (proving Tableau itself halves on read), and a live parameterized save in which a
+# 'Min Profit Threshold' parameter serialized as <[Parameters].[Parameter 0014036665946123]> with
+# single delimiters between two doubled operators ('Profit >> <[Parameters]...> ... Sales << 5000').
+# See resources/migration-gotchas.md.
+_TABLEAU_PARAM_REF = re.compile(
+    r"<\s*\[?\s*Parameters\s*\]?\s*\.\s*(\[[^\]]+\])\s*>", re.IGNORECASE
+)
+_DEESCAPED_PARAM_REF = re.compile(
+    r"<\s*\[?\s*Parameters\s*\]?\s*\.\s*\[[^\]]+\]\s*>", re.IGNORECASE
+)
+
+
+def _deescape_custom_sql(sql):
+    """Reverse Tableau's on-disk angle-bracket doubling for Custom SQL text.
+
+    Apply EXACTLY ONCE, at the .tds parse boundary -- a global halve is NOT idempotent. A
+    genuine source ``<<`` (e.g. a real Spark bitwise shift) is stored as ``<<<<`` and a single
+    halve correctly recovers ``<<``; a second halve would wrongly collapse it to ``<``. The
+    relation descriptor's ``sql`` field is the single canonical home for this, so every
+    downstream stage (M emission, profiling, comparison) only ever sees the recovered
+    single-operator form.
+
+    Parameter-aware: a Tableau parameter reference (``<[Parameters].[Name]>``) uses angle brackets
+    as delimiter syntax and -- unlike literal operators -- is stored with SINGLE brackets. Each
+    token is masked out before the halve and restored to its canonical single-bracket form
+    afterwards. The mask also prevents a doubled operator sitting flush against a parameter
+    delimiter from forming an odd-length run that a blind halve would mangle.
+    """
+    if not sql:
+        return sql
+    masked = []
+
+    def _stash(m):
+        masked.append(m.group(1))  # the [Name] portion
+        return f"\x00P{len(masked) - 1}\x00"
+
+    work = _TABLEAU_PARAM_REF.sub(_stash, sql)
+    work = work.replace("<<", "<").replace(">>", ">")
+    for i, inner in enumerate(masked):
+        work = work.replace(f"\x00P{i}\x00", f"<[Parameters].{inner}>")
+    return work
+
+
+def custom_sql_parameter_refs(sql):
+    """Distinct canonical Tableau parameter tokens (``<[Parameters].[Name]>``) in de-escaped
+    Custom SQL.
+
+    A recovered parameter reference cannot yet be translated into a Power BI / Power Query
+    parameter, and the source engine cannot run it as-is, so a surviving token is a real
+    needs-review signal rather than something to emit silently.
+    """
+    out = []
+    for m in _DEESCAPED_PARAM_REF.finditer(sql or ""):
+        tok = m.group(0)
+        if tok not in out:
+            out.append(tok)
+    return out
+
+
 # -- parsing -------------------------------------------------------------------
 def _named_connections(datasource):
     """Return the live ``<named-connection>`` elements (those under a ``<named-connections>``
@@ -618,7 +692,7 @@ def _classify_relation(rel, cols_by_parent, nc_map=None):
         entry = {
             "kind": "custom_sql",
             "name": name,
-            "sql": (rel.text or "").strip(),
+            "sql": _deescape_custom_sql((rel.text or "").strip()),
             "columns": cols_by_parent.get(item_key, []),
         }
         if conn:
@@ -1460,7 +1534,19 @@ def _emit_m_partition_review(relation, descriptor, mode):
                          f"{{{', '.join(rename_pairs)}}}, MissingField.Ignore)")
             prev = "Renamed"
         body = ",\n\t\t\t\t".join(steps)
-        return f"let\n\t\t\t\t{body}\n\t\t\tin\n\t\t\t\t{prev}", None
+        # The operators are already de-escaped at parse, so a real native query is emitted. The
+        # one thing we cannot complete is a recovered Tableau parameter reference
+        # (<[Parameters].[Name]>): the source can't run it and we don't translate it to a Power
+        # Query parameter yet, so flag it for review (the partition is still emitted) rather than
+        # ship a query that fails at refresh.
+        param_reason = None
+        params = custom_sql_parameter_refs(relation.get("sql", ""))
+        if params:
+            param_reason = (
+                "custom SQL contains Tableau parameter reference(s) "
+                f"{', '.join(params)} that are not translated to a Power Query parameter; "
+                "replace them with a literal or a bound parameter before refresh")
+        return f"let\n\t\t\t\t{body}\n\t\t\tin\n\t\t\t\t{prev}", param_reason
 
     source = _connect_expr(connector, connect_style)
 
