@@ -1797,10 +1797,13 @@ _GRADIENT_PALETTE_TYPES = ("ordered-diverging", "ordered-sequential")
 def _parse_color_gradient(table):
     """Extract a continuous background colour-scale spec from a worksheet's mark colour encoding.
 
-    Returns ``{"field_token", "center", "palette_type", "colors", "interpolated",
-    "is_table_calc"}`` when the colour encoding carries a continuous (interpolated / ordered)
-    palette of at least two stops, else ``None``. ``colors`` preserves the Tableau author order
-    (first -> min, last -> max); the direction is never guessed.
+    Returns ``{"field_token", "center", "palette_type", "colors", "interpolated", "num_steps",
+    "reverse", "is_table_calc"}`` when the colour encoding carries a continuous (interpolated /
+    ordered) palette of at least two stops, else ``None``. ``colors`` preserves the Tableau author
+    order (first stop -> last stop); ``reverse`` (the explicit Tableau "Reversed" toggle, NOT a
+    guess) records whether that author order is flipped onto the data min->max axis, and
+    ``num_steps`` records a Tableau "Stepped Color" band count (informational -- Power BI's gradient
+    is continuous). Both default to a no-op (``reverse`` False / ``num_steps`` None) when absent.
     """
     if table is None:
         return None
@@ -1833,6 +1836,20 @@ def _parse_color_gradient(table):
                     center = float(raw_center)
                 except (TypeError, ValueError):
                     center = None
+            # Tableau "Stepped Color: N steps" renders the legend as N discrete bands, and the
+            # "Reversed" toggle flips the palette onto the data axis. Both are explicit author
+            # signals (not guesses) carried additively: ``num_steps`` is informational (Power BI's
+            # gradient FillRule is continuous, so a faithful N-step binning is disclosed via a
+            # warning rather than invented), while ``reverse`` swaps which palette end maps to the
+            # data min vs max at emit time. A num-steps of 1 / 0 / non-numeric is treated as absent.
+            num_steps = None
+            try:
+                steps = int(enc.get("num-steps"))
+                if steps >= 2:
+                    num_steps = steps
+            except (TypeError, ValueError):
+                num_steps = None
+            reverse = (enc.get("reverse") or "").strip().lower() == "true"
             _, fid = _split_token_attr(enc.get("field"))
             return {
                 "field_token": enc.get("field") or "",
@@ -1841,6 +1858,8 @@ def _parse_color_gradient(table):
                                               else "ordered-sequential")),
                 "colors": colors,
                 "interpolated": interpolated,
+                "num_steps": num_steps,
+                "reverse": reverse,
                 "is_table_calc": _instance_is_table_calc(fid),
             }
     return None
@@ -3451,12 +3470,19 @@ def _gradient_color_stops(cg):
     A diverging palette (a ``center`` value, >= 3 stops) becomes ``linearGradient3``: ``min`` =
     first colour, ``mid`` = the neutral middle colour pinned at the centre value, ``max`` = last
     colour. A sequential palette becomes ``linearGradient2`` (``min`` / ``max``). Tableau's author
-    order (first -> min, last -> max) is preserved exactly. Colours are single-quoted semantic-query
-    literals; the centre is a double literal. ``nullColoringStrategy`` defaults to ``asZero`` (the
-    Power BI default), matching real formatted PBIR. Shape verified against a real MS-community
-    ``tableEx`` gradient (min/mid/max with per-stop optional ``value``).
+    order is preserved exactly UNLESS the encoding sets ``reverse`` (Tableau's "Reversed" toggle),
+    which flips which end maps to the data min vs max -- the diverging mid stays the list centre and
+    ``center`` keeps its value, so only the two arms swap and the emitted JSON shape is unchanged.
+    Colours are single-quoted semantic-query literals; the centre is a double literal.
+    ``nullColoringStrategy`` defaults to ``asZero`` (the Power BI default), matching real formatted
+    PBIR. Shape verified against a real MS-community ``tableEx`` gradient (min/mid/max with per-stop
+    optional ``value``); the reversed direction was validated against the user's rendered legend
+    (an orange-first reversed diverging palette renders low=near-white, high=orange).
     """
-    colors = cg["colors"]
+    # ``reverse`` flips the author order onto the data axis; the stored ``colors`` list is left
+    # untouched (the candidate-record fact reports author order) and only this emit-time view is
+    # reversed, so min/max swap while the centre stop and ``center`` value are unaffected.
+    colors = cg["colors"][::-1] if cg.get("reverse") else cg["colors"]
 
     def _stop(hexv, value=None):
         stop = {"color": {"Literal": {"Value": _semantic_string_literal(hexv)}}}
@@ -3504,6 +3530,8 @@ def _conditional_format(ws, state, model_table, field_map, warnings):
         "palette_type": cg["palette_type"],
         "center": cg["center"],
         "colors": cg["colors"],
+        "num_steps": cg.get("num_steps"),
+        "reverse": bool(cg.get("reverse")),
     }
 
     values = (state.get("Values") or {}).get("projections", [])
@@ -3556,6 +3584,15 @@ def _conditional_format(ws, state, model_table, field_map, warnings):
     fact["status"] = "emitted"
     fact["bound_measure"] = driver_proj["queryRef"]
     fact["target"] = target_proj["queryRef"]
+    # Tableau "Stepped Color" bins the scale into N discrete bands; Power BI's backColor FillRule is
+    # a continuous gradient, so the colours/direction are faithful but the binning is not reproduced.
+    # Disclose it (the gradient still emits) rather than invent an unvalidated "rules" FillRule.
+    if cg.get("num_steps"):
+        warnings.append(_warn(
+            "worksheet", ws["name"],
+            "stepped colour ({0} steps) approximated as a continuous gradient; the rebuilt "
+            "backColor scale keeps the palette and direction but not the discrete "
+            "banding".format(cg["num_steps"])))
     return value_objects, fact
 
 

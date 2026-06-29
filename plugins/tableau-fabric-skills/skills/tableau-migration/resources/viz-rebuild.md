@@ -248,7 +248,14 @@ emits a two-stop `linearGradient2` (min/max); a diverging scale with a centre em
 `linearGradient3` whose `mid.value` pins the centre (e.g. `0.0D`). Colours are single-quoted
 literals, nulls colour `asZero`, and the `selector.metadata` targets the **displayed** value
 column — so "colour the cells by a *different* measure than the one shown" is preserved (the
-gradient `Input` is the colour driver, the selector targets the shown column).
+gradient `Input` is the colour driver, the selector targets the shown column). When the encoding
+sets Tableau's **Reversed** toggle (`reverse="true"`), the palette is flipped onto the data axis —
+the two arms swap (the diverging mid and its pinned centre are untouched) so low/high render in the
+author's intended direction; the emitted JSON shape is otherwise identical. **Stepped Color**
+(`num-steps`) is recorded on the fact and **disclosed** via a `stepped colour (N steps) approximated
+as a continuous gradient …` warning rather than invented as a rules block — Power BI's `backColor`
+FillRule is a continuous gradient, so the palette and direction are faithful but the discrete
+banding is not reproduced.
 
 **Warn-never-wrong.** The fill is emitted **only** when the colour driver is a clean value-kind
 model measure that is already projected in the visual (matched by exact field expression so the

@@ -3533,11 +3533,15 @@ def test_property_invariants_hold_across_a_wide_worksheet_sweep():
 # ``backColor`` FillRule gradient. WARN-NEVER-WRONG: the fill emits only when the colour driver is
 # a clean model measure projected in the visual and NOT a quick table calc; otherwise the visual
 # emits with no fill, a warning, and the raw palette preserved on the candidate record.
-def _mark_color_style(field_token, palette_type, colors, center=None, enc_type="interpolated"):
+def _mark_color_style(field_token, palette_type, colors, center=None, enc_type="interpolated",
+                      num_steps=None, reverse=False):
     center_attr = f" center='{center}'" if center is not None else ""
+    steps_attr = f" num-steps='{num_steps}'" if num_steps is not None else ""
+    reverse_attr = " reverse='true'" if reverse else ""
     color_xml = "".join(f"<color>{c}</color>" for c in colors)
     return (f"<style><style-rule element='mark'>"
-            f"<encoding attr='color'{center_attr} type='{enc_type}' field='{field_token}'>"
+            f"<encoding attr='color'{center_attr}{steps_attr}{reverse_attr} "
+            f"type='{enc_type}' field='{field_token}'>"
             f"<color-palette type='{palette_type}'>{color_xml}</color-palette>"
             f"</encoding></style-rule></style>")
 
@@ -3707,6 +3711,140 @@ def test_categorical_colour_legend_is_not_a_gradient():
     ir = parse_twb(_workbook(_heat_ws("Heat", color_field="none:Region:nk",
                                       encodings=enc, style=style)))
     assert ir["worksheets"][0]["color_gradient"] is None
+
+
+# -- stepped colour + reversed palette (additive backColor refinements) --------
+# Grounded on a real workbook: a highlight table whose mark-colour encoding carries
+# ``num-steps='5'`` (Tableau "Stepped Color") and ``reverse='true'`` (the "Reversed" toggle).
+# ``reverse`` flips which palette end maps to the data min/max -- validated against the user's
+# rendered legend (an orange-first reversed diverging palette renders low=near-white, high=orange).
+# ``num-steps`` is recorded additively and disclosed (Power BI's gradient is continuous); the
+# already-validated linearGradient2/3 shape is unchanged.
+def test_color_gradient_parses_num_steps_and_reverse_into_ir():
+    # The real-workbook encoding shape: custom-interpolated ordered-diverging, centred, 5 steps,
+    # reversed. ``num_steps``/``reverse`` are parsed additively; ``colors`` stays author order.
+    style = _mark_color_style("[federated.abc].[sum:Sales:qk]", "ordered-diverging",
+                              ["#f28e2b", "#d9d9d9", "#e6e6e6"], center="0.0",
+                              enc_type="custom-interpolated", num_steps=5, reverse=True)
+    enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    ir = parse_twb(_workbook(_heat_ws("Heat", color_field="sum:Sales:qk",
+                                      encodings=enc, style=style)))
+    cg = ir["worksheets"][0]["color_gradient"]
+    assert cg["num_steps"] == 5
+    assert cg["reverse"] is True
+    assert cg["colors"] == ["#f28e2b", "#d9d9d9", "#e6e6e6"]   # author order preserved
+
+
+def test_plain_gradient_has_default_reverse_and_num_steps():
+    # Additivity: a gradient with neither attribute carries the no-op defaults, so a report built
+    # before these keys existed is unchanged in meaning.
+    style = _mark_color_style("[federated.abc].[sum:Sales:qk]", "ordered-sequential",
+                              ["#f7fbff", "#08306b"])
+    enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    ir = parse_twb(_workbook(_heat_ws("Heat", color_field="sum:Sales:qk",
+                                      encodings=enc, style=style)))
+    cg = ir["worksheets"][0]["color_gradient"]
+    assert cg["num_steps"] is None
+    assert cg["reverse"] is False
+
+
+def test_reversed_sequential_gradient_swaps_min_and_max():
+    # reverse='true' on a 2-stop sequential palette swaps which end is the data min vs max; the
+    # emitted linearGradient2 shape is otherwise identical.
+    style = _mark_color_style("[federated.abc].[sum:Sales:qk]", "ordered-sequential",
+                              ["#f7fbff", "#08306b"], reverse=True)
+    enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    parts = emit_pbir(parse_twb(_workbook(
+        _heat_ws("Heat", color_field="sum:Sales:qk", encodings=enc, style=style))))
+    fr = _fill_rule(_values_objects(list(_visual_parts(parts).values())[0]))
+    grad = fr["FillRule"]["linearGradient2"]
+    assert grad["min"]["color"]["Literal"]["Value"] == "'#08306b'"   # last author colour -> min
+    assert grad["max"]["color"]["Literal"]["Value"] == "'#f7fbff'"   # first author colour -> max
+
+
+def test_reversed_diverging_gradient_swaps_arms_and_keeps_mid_pinned():
+    # reverse='true' on a diverging palette swaps the two arms but leaves the neutral mid stop and
+    # the pinned centre value alone -- mirroring the user's image (orange -> high, near-white -> low).
+    style = _mark_color_style("[federated.abc].[sum:Profit:qk]", "ordered-diverging",
+                              ["#f28e2b", "#d9d9d9", "#e6e6e6"], center="0.0",
+                              enc_type="custom-interpolated", reverse=True)
+    enc = "<encodings><color column='[federated.abc].[sum:Profit:qk]' /></encodings>"
+    parts = emit_pbir(parse_twb(_workbook(
+        _heat_ws("Heat", color_field="sum:Profit:qk", encodings=enc, style=style))))
+    fr = _fill_rule(_values_objects(list(_visual_parts(parts).values())[0]))
+    grad = fr["FillRule"]["linearGradient3"]
+    assert grad["min"]["color"]["Literal"]["Value"] == "'#e6e6e6'"   # arms swapped
+    assert grad["mid"]["color"]["Literal"]["Value"] == "'#d9d9d9'"   # neutral mid unchanged
+    assert grad["mid"]["value"]["Literal"]["Value"] == "0.0D"        # centre still pinned
+    assert grad["max"]["color"]["Literal"]["Value"] == "'#f28e2b'"
+
+
+def test_stepped_gradient_emits_continuous_gradient_with_disclosure():
+    # A bindable stepped gradient still emits the (faithful-coloured) continuous backColor scale and
+    # discloses the dropped binning; the fact records the step count for a later rules-based pass.
+    style = _mark_color_style("[federated.abc].[sum:Sales:qk]", "ordered-sequential",
+                              ["#f7fbff", "#08306b"], num_steps=5)
+    enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    res = migrate_twb_to_pbir(_workbook(
+        _heat_ws("Heat", color_field="sum:Sales:qk", encodings=enc, style=style)))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _values_objects(vj), "stepped gradient should still emit a continuous backColor scale"
+    fact = _cf_fact(res["candidate_records"], "Heat")
+    assert fact["status"] == "emitted"
+    assert fact["num_steps"] == 5
+    assert any("stepped colour (5 steps)" in w["reason"] for w in res["warnings"])
+
+
+def test_magnitude_gradient_shape_matches_real_pbip_oracle():
+    # SHAPE LOCK against a real Power BI Desktop-authored matrix (a hand-built Comcast_Test.pbip
+    # magnitude background scale on Sum(Sales)). The oracle's emit is, key-for-key:
+    #   objects.values[0].properties.backColor.solid.color.expr.FillRule = {
+    #     Input: <Sales aggregation>,
+    #     FillRule: { linearGradient3: { min:#FFFFFF, mid:#FFFFFF@0, max:#E66C37,
+    #                                    nullColoringStrategy: 'asZero' } } }
+    #   selector = { data:[{dataViewWildcard:{matchingOption:1}}], metadata:"Sum(Orders.Sales)" }
+    # This pins our generator to the validated shape (we mirror the oracle's min=mid=low palette).
+    style = _mark_color_style("[federated.abc].[sum:Sales:qk]", "ordered-diverging",
+                              ["#ffffff", "#ffffff", "#e66c37"], center="0.0",
+                              enc_type="custom-interpolated")
+    enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    parts = emit_pbir(parse_twb(_workbook(
+        _heat_ws("Heat", color_field="sum:Sales:qk", encodings=enc, style=style))))
+    vo = _values_objects(list(_visual_parts(parts).values())[0])
+    back = vo[0]["properties"]["backColor"]["solid"]["color"]["expr"]["FillRule"]
+    assert back["Input"]["Aggregation"]["Function"] == 0          # SUM, like the oracle's Input
+    grad = back["FillRule"]["linearGradient3"]
+    assert grad["min"]["color"]["Literal"]["Value"] == "'#ffffff'"
+    assert grad["mid"]["color"]["Literal"]["Value"] == "'#ffffff'"
+    assert grad["max"]["color"]["Literal"]["Value"] == "'#e66c37'"
+    assert grad["nullColoringStrategy"]["strategy"]["Literal"]["Value"] == "'asZero'"
+    # selector shape is byte-identical to the oracle (wildcard match + the coloured measure queryRef)
+    assert vo[0]["selector"]["data"][0]["dataViewWildcard"]["matchingOption"] == 1
+    assert vo[0]["selector"]["metadata"] == "Sum(Orders.Sales_Amount)"
+
+
+def test_table_calc_defer_still_records_num_steps_and_reverse():
+    # The user's actual sheet: a PctDiff quick-table-calc colour driver (pcdf:) with a 5-step
+    # reversed diverging palette. The emit correctly DEFERS (no model measure yet), but the fact
+    # faithfully records the stepped + reversed signal so a later binding pass can reproduce it.
+    calc_col = ("<column caption='DoD %' datatype='real' name='[Calculation_1]' role='measure' "
+                "type='quantitative'><calculation class='tableau' formula='[Sales]' /></column>")
+    calc_inst = ("<column-instance column='[Calculation_1]' derivation='User' "
+                 "name='[pcdf:Calculation_1:qk]' pivot='key' type='quantitative' />")
+    style = _mark_color_style("[federated.abc].[pcdf:Calculation_1:qk]", "ordered-diverging",
+                              ["#f28e2b", "#d9d9d9", "#e6e6e6"], center="0.0",
+                              enc_type="custom-interpolated", num_steps=5, reverse=True)
+    enc = ("<encodings><color column='[federated.abc].[pcdf:Calculation_1:qk]' />"
+           "<text column='[federated.abc].[sum:Sales:qk]' /></encodings>")
+    res = migrate_twb_to_pbir(_workbook(
+        _heat_ws("Heat", color_field="pcdf:Calculation_1:qk", encodings=enc, style=style,
+                 deps_extra=_INST + calc_col + calc_inst)))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _values_objects(vj) is None                       # still deferred (no wrong colour)
+    fact = _cf_fact(res["candidate_records"], "Heat")
+    assert fact["status"] == "deferred"
+    assert fact["num_steps"] == 5
+    assert fact["reverse"] is True
 
 
 # -- categorical mark colours (explicit author member -> hex palette) ----------

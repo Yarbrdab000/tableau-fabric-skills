@@ -13,6 +13,19 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **table/matrix background colour scale now honours Tableau's *Reversed*
+  toggle and discloses *Stepped Color*** in the visual rebuilder (`twb_to_pbir.py`). The mark-colour
+  encoding's `reverse="true"` attribute flips the palette onto the data axis at emit time (the two
+  arms of a diverging scale swap while the neutral `mid` and its pinned `center` are untouched), so
+  a reversed heat scale renders in the author's intended direction instead of backwards; the emitted
+  `linearGradient2`/`linearGradient3` JSON shape is unchanged (validated against a real Power BI
+  Desktop-authored `pivotTable` oracle). `num-steps` ("Stepped Color: N steps") is recorded on the
+  `conditional_format` candidate-record fact (new additive `num_steps` / `reverse` keys) and surfaced
+  as a `stepped colour (N steps) approximated as a continuous gradient …` warning rather than invented
+  as an unvalidated rules block — Power BI's `backColor` FillRule is continuous, so the palette and
+  direction are faithful but the discrete banding is disclosed, not guessed. Font colour and data bars
+  remain a deferred Tier-2 concern (no faithful source signal in scope). Fully additive — no existing
+  report/IR key renamed or removed; CLEANROOM pass.
 - **tableau-migration:** **a candidate-ranking step for the assisted (second-compiler) tier**
   (`translation_reconcile.rank_candidates`) — the optional acceleration tier's *selection* helper.
   Given the N candidate DAX translations the agent (the documented second compiler) authors for one
