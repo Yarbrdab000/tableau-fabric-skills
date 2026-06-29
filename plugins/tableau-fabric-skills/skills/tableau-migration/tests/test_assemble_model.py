@@ -327,6 +327,199 @@ def test_pct_diff_quick_calc_emits_second_measure_keyed_by_instance_token():
     assert b["Calculation_0014172369735704"]["measure_name"] == "[count orders] + 100"
 
 
+def _rank_quick_usage(**kw):
+    """A Rank quick table calc ranking 'Order ID' marks by Sum(Sales), Field scope. A Rank QTC has no
+    ``aggregation`` attr -- the inner aggregate comes from the pill derivation ('Sum')."""
+    d = dict(
+        worksheet="Ranking", instance="rank:sum:Sales:qk", column="Sales", caption="Sales",
+        kind="quick", calc_type="Rank", aggregation=None, derivation="Sum",
+        rank_options="Competition,Descending", ordering_type="Field", ordering_fields=["Order ID"],
+        rows=[Pill("none:Order ID:nk", "Order ID", "None")],
+        cols=[Pill("sum:Sales:qk", "Sales", "Sum")],
+    )
+    d.update(kw)
+    return TableCalcUsage(**d)
+
+
+def test_rank_quick_calc_lands_as_translated_rankx_measure():
+    # A Rank quick table calc lands as a derived, intent-suffixed _Measures measure carrying RANKX
+    # (synthesized RANK(SUM([Sales]),'desc') -> the window seam), bound by its full instance token.
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                                calcs=[], table_calc_usages=[_rank_quick_usage()])
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    name = "Sales (rank within partition)"
+    assert "measure 'Sales (rank within partition)' =" in measures
+    assert "RANKX(ALLSELECTED('Orders'[Order_ID]), CALCULATE(SUM('Orders'[Sales])), , DESC, Skip)" \
+        in measures
+    pr = {r["measure"]: r for r in out["report"]["measures"]}[name]
+    assert pr["status"] == "translated"
+    src = pr["source"]
+    assert src["kind"] == "table_calc"
+    assert src["calc_instance_token"] == "rank:sum:Sales:qk"
+    assert src["calc_id"] is None                  # a QTC never claims the bare base token
+    assert src["intent"] == "rank within partition"
+    assert src["partition_by"] == []
+    assert src["order_by"] == [["Order ID", "ASC"]]
+    # the heat-grid-style binder joins the rank by its full instance token
+    assert out["report"]["calc_bindings"]["rank:sum:Sales:qk"]["measure_name"] == name
+
+
+def test_rank_quick_calc_unique_ties_fails_closed():
+    # Tableau's 'Unique' ranking breaks ties by addressing order -> not faithful in DAX; the rank
+    # must NOT emit a measure (fail-closed), leaving the base model otherwise unchanged.
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                                calcs=[], table_calc_usages=[
+                                    _rank_quick_usage(rank_options="Unique,Descending")])
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    assert "rank within partition" not in measures
+    assert not any(r["measure"] == "Sales (rank within partition)"
+                   for r in out["report"]["measures"])
+
+
+def _moving_quick_usage(**kw):
+    """A moving-window quick table calc: trailing-3 average of Sum(Sales) across 'Order ID', Field
+    scope. The integer from/to bounds make it a sliding (order-sensitive) frame."""
+    d = dict(
+        worksheet="Trend", instance="win:avg:Sales:qk", column="Sales", caption="Sales",
+        kind="quick", calc_type="WindowTotal", aggregation="Avg", window_from=-2, window_to=0,
+        ordering_type="Field", ordering_fields=["Order ID"],
+        rows=[Pill("none:Order ID:nk", "Order ID", "None")],
+        cols=[Pill("sum:Sales:qk", "Sales", "Sum")],
+    )
+    d.update(kw)
+    return TableCalcUsage(**d)
+
+
+def test_moving_window_quick_calc_lands_as_translated_measure():
+    # A moving WindowTotal lands as a derived 'moving window' _Measures measure carrying the seam's
+    # relative WINDOW(-2, REL, 0, REL, ...) frame, bound by its full instance token.
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                                calcs=[], table_calc_usages=[_moving_quick_usage()])
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    name = "Sales (moving window)"
+    assert "measure 'Sales (moving window)' =" in measures
+    assert "WINDOW(-2, REL, 0, REL, ORDERBY('Orders'[Order_ID], ASC))" in measures
+    assert "CALCULATE(AVERAGE('Orders'[Sales]))" in measures
+    pr = {r["measure"]: r for r in out["report"]["measures"]}[name]
+    assert pr["status"] == "translated"
+    src = pr["source"]
+    assert src["kind"] == "table_calc"
+    assert src["calc_instance_token"] == "win:avg:Sales:qk"
+    assert src["intent"] == "moving window"
+    assert src["order_by"] == [["Order ID", "ASC"]]
+    assert out["report"]["calc_bindings"]["win:avg:Sales:qk"]["measure_name"] == name
+
+
+def test_moving_window_quick_calc_multi_dim_fails_closed():
+    # a moving frame is order-sensitive, so >1 addressing dim leaves the order ambiguous -> no measure.
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                                calcs=[], table_calc_usages=[_moving_quick_usage(
+                                    ordering_fields=["Order ID", "Quantity"],
+                                    rows=[Pill("none:Order ID:nk", "Order ID", "None"),
+                                          Pill("none:Quantity:nk", "Quantity", "None")])])
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    assert "moving window" not in measures
+    assert not any(r["measure"] == "Sales (moving window)"
+                   for r in out["report"]["measures"])
+
+
+def _diff_quick_usage(**kw):
+    """A difference-from-prior quick table calc: X - LOOKUP(X,-1) over Sum(Sales), addressed across
+    'Order ID' (Field scope). Order-sensitive (looks back one row)."""
+    d = dict(
+        worksheet="Sales Diff", instance="diff:sum:Sales:qk", column="Sales", caption="Sales",
+        kind="quick", calc_type="Difference", aggregation="Sum",
+        ordering_type="Field", ordering_fields=["Order ID"],
+        rows=[Pill("none:Order ID:nk", "Order ID", "None")],
+        cols=[Pill("sum:Sales:qk", "Sales", "Sum")],
+    )
+    d.update(kw)
+    return TableCalcUsage(**d)
+
+
+def test_difference_quick_calc_lands_as_translated_measure():
+    # A Difference quick table calc lands as a derived 'difference from a prior row' _Measures measure
+    # carrying the OFFSET(-1,...) prior-row lookup with Tableau's null first row guarded by ISBLANK.
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                                calcs=[], table_calc_usages=[_diff_quick_usage()])
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    name = "Sales (difference from a prior row)"
+    assert "measure 'Sales (difference from a prior row)' =" in measures
+    assert "VAR _prev = CALCULATE(SUM('Orders'[Sales]), OFFSET(-1, ORDERBY('Orders'[Order_ID], ASC)))" \
+        in measures
+    assert "RETURN IF(ISBLANK(_prev), BLANK(), (SUM('Orders'[Sales])) - _prev)" in measures
+    pr = {r["measure"]: r for r in out["report"]["measures"]}[name]
+    assert pr["status"] == "translated"
+    src = pr["source"]
+    assert src["kind"] == "table_calc"
+    assert src["calc_instance_token"] == "diff:sum:Sales:qk"
+    assert src["intent"] == "difference from a prior row"
+    assert out["report"]["calc_bindings"]["diff:sum:Sales:qk"]["measure_name"] == name
+
+
+def test_difference_quick_calc_multi_dim_fails_closed():
+    # Difference looks back one row, so it is order-sensitive: >1 addressing dim leaves the order
+    # ambiguous -> no measure (never a guessed order), base model otherwise unchanged.
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                                calcs=[], table_calc_usages=[_diff_quick_usage(
+                                    ordering_fields=["Order ID", "Quantity"],
+                                    rows=[Pill("none:Order ID:nk", "Order ID", "None"),
+                                          Pill("none:Quantity:nk", "Quantity", "None")])])
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    assert "difference from a prior row" not in measures
+    assert not any(r["measure"] == "Sales (difference from a prior row)"
+                   for r in out["report"]["measures"])
+
+
+def _pct_total_quick_usage(**kw):
+    """A percent-of-total quick table calc: X / TOTAL(X) over Sum(Sales), addressed across 'Order ID'
+    (Field scope). Order-INSENSITIVE (a whole-scope re-aggregation)."""
+    d = dict(
+        worksheet="Share of Total", instance="pctt:sum:Sales:qk", column="Sales", caption="Sales",
+        kind="quick", calc_type="PercentOfTotal", aggregation="Sum",
+        ordering_type="Field", ordering_fields=["Order ID"],
+        rows=[Pill("none:Order ID:nk", "Order ID", "None")],
+        cols=[Pill("sum:Sales:qk", "Sales", "Sum")],
+    )
+    d.update(kw)
+    return TableCalcUsage(**d)
+
+
+def test_percent_of_total_quick_calc_lands_as_translated_measure():
+    # A PercentOfTotal quick table calc lands as a derived 'percent-of-scope ratio' _Measures measure
+    # carrying DIVIDE(X, CALCULATE(X, ALLSELECTED(<scope>))), bound by its full instance token.
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                                calcs=[], table_calc_usages=[_pct_total_quick_usage()])
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    name = "Sales (percent-of-scope ratio)"
+    assert "measure 'Sales (percent-of-scope ratio)' =" in measures
+    assert "DIVIDE(SUM('Orders'[Sales]), CALCULATE(SUM('Orders'[Sales]), " \
+        "ALLSELECTED('Orders'[Order_ID])))" in measures
+    pr = {r["measure"]: r for r in out["report"]["measures"]}[name]
+    assert pr["status"] == "translated"
+    src = pr["source"]
+    assert src["kind"] == "table_calc"
+    assert src["calc_instance_token"] == "pctt:sum:Sales:qk"
+    assert src["intent"] == "percent-of-scope ratio"
+    assert out["report"]["calc_bindings"]["pctt:sum:Sales:qk"]["measure_name"] == name
+
+
+def test_percent_of_total_quick_calc_multi_dim_translates():
+    # The differentiator from Difference: percent-of-total is order-INSENSITIVE, so two addressing
+    # dimensions stay faithful (the scope total spans both) -- it does NOT fail closed.
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                                calcs=[], table_calc_usages=[_pct_total_quick_usage(
+                                    ordering_fields=["Order ID", "Quantity"],
+                                    rows=[Pill("none:Order ID:nk", "Order ID", "None"),
+                                          Pill("none:Quantity:nk", "Quantity", "None")])])
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    name = "Sales (percent-of-scope ratio)"
+    assert "measure 'Sales (percent-of-scope ratio)' =" in measures
+    assert "ALLSELECTED('Orders'[Order_ID], 'Orders'[Quantity])" in measures
+    pr = {r["measure"]: r for r in out["report"]["measures"]}[name]
+    assert pr["status"] == "translated"
+
+
 def _diff_coloring_usage(**kw):
     """The pilot's Grey/Red colour rule on 'Line chart (2)' -- a PLACED secondary calc that references
     the UNPLACED ``Percent Difference`` (Calculation1). Its worksheet lends Calculation1 a window:
