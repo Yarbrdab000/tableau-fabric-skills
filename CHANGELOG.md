@@ -13,6 +13,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **higher-fidelity Tableau dashboard → Power BI (PBIR) visual rebuilds.** A
+  workbook's worksheets and dashboards now reproduce more of their original look: a **dual-axis**
+  line/bar measure pair, **per-measure series colours** (each measure keeps its authored colour on
+  bar / line / area / combo marks and in KPI multi-row cards), filled/symbol **maps** that carry the
+  geographic `dataCategory` and a measure-driven colour gradient, and faithful chart-type / field /
+  position binding to the migrated semantic model. Emitted only where it can be bound faithfully;
+  anything ambiguous still degrades to a structured warning (warn-never-wrong). Additive; the
+  migration suite stays green. Skill `VERSION` `1.10.0` → `1.11.0`.
+- **tableau-migration:** **a Databricks Custom SQL relation now migrates to a deploy-valid native
+  query.** A `<relation type='text'>` custom-SQL connection emits a `Value.NativeQuery(...)` M
+  partition against the bound source instead of an unresolvable placeholder, so the generated model
+  is structurally valid and deploys. Additive.
+- **tableau-migration:** the (advisory, quarantined) fidelity oracle gained a **per-visual
+  REPRODUCED / PARTIAL / DEGRADED / MISSING** scorer so a rebuilt report page can be graded visual by
+  visual against its Tableau source. Lives in `tests_oracle/` and the optional oracle tooling only —
+  no change to the deterministic migration runtime or its report schema.
 - **tableau-migration:** **a candidate-ranking step for the assisted (second-compiler) tier**
   (`translation_reconcile.rank_candidates`) — the optional acceleration tier's *selection* helper.
   Given the N candidate DAX translations the agent (the documented second compiler) authors for one
@@ -533,6 +549,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
+- **tableau-migration:** **a migrated model's generated `Date` relationship no longer disappears on
+  first refresh** (which had silently flatlined every time series). Two independent root causes in the
+  Import/M emit path are fixed, both pure `.tds`-metadata so they behave identically for Import,
+  DirectQuery, federated and flat-file: (1) authored object-graph relationships are translated as
+  **many-to-many, single-direction dim→fact** instead of the default many-to-one — Power BI's
+  unique-key check on a non-unique join (e.g. `Returns[Order_ID]` with duplicates) was rejecting the
+  whole relationship batch and collateral-dropping the valid `Orders → Date` sibling; and (2) the M
+  column emitter no longer writes a bogus `sourceLineageTag` (M columns bind via `sourceColumn`, not a
+  schema), which had made Desktop treat the binding as speculative and drop relationships on refresh.
+  The generated `Date` relationship stays many-to-one (its key is unique by construction). Additive
+  (`report["relationships"]` gains a `cardinality` key); the migration suite stays green.
+- **tableau-migration:** **Custom SQL is now de-escaped at the parse boundary, fixing a refresh-time
+  type error.** When Tableau serializes a Custom SQL relation it **doubles every literal angle
+  bracket** (`<`→`<<`, `>`→`>>`) to escape them from its own `<[Parameters].[Name]>` syntax; emitting
+  that doubled form verbatim corrupted the query on Spark/Databricks, where `<<` / `>>` are the bitwise
+  shift operators (so a predicate like `Profit < 0` failed `[DATATYPE_MISMATCH]` at refresh even though
+  deploy succeeded). A single-chokepoint, parameter-aware global halve recovers the query the user
+  actually wrote (proven exact by an even-run invariant); a surviving Tableau parameter reference is
+  flagged `needs_review` rather than shipped silently. Connector-independent (also corrects Snowflake /
+  SQL Server custom SQL).
 - **tableau-migration:** the TMDL serializer now emits an **openable** model when a measure or
   calculated column carries a **multi-line** DAX expression. A deterministic multi-line body (e.g.
   the Date Filter keep-flag's `VAR … RETURN … SWITCH(…)`) was written inline after `measure 'X' = `,
