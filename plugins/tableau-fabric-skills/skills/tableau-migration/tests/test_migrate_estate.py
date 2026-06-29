@@ -674,6 +674,67 @@ def test_viz_stage_injected_builds_and_writes_parts(tmp_path):
     assert (tmp_path / "b" / "reports" / "Dash.Report" / "definition" / "report.json").is_file()
 
 
+# -- opt-in Tier-2 viz-advice sidecar (additive; byte-identical no-op when off) ------------------
+def _advice_viz(text, name):
+    """Injected viz stage that emits parts + candidate records (one typed visual, one detail table)."""
+    return {
+        "parts": {"definition/report.json": "{}"},
+        "warnings": [],
+        "ir": {"worksheets": []},
+        "candidate_records": [
+            {"page": "p1", "visual": "v1", "worksheet": "By Segment",
+             "visual_type": "clusteredColumnChart",
+             "fields": {"Category": ["Orders.Segment"], "Y": ["Orders.Sales"]}},
+            {"page": "p1", "visual": "v2", "worksheet": "Detail",
+             "visual_type": "tableEx", "fields": {"Values": ["Orders.Sales"]}},
+        ],
+    }
+
+
+def test_viz_advice_off_writes_no_sidecar_and_no_key(tmp_path):
+    out = tmp_path / "b"
+    src = InMemoryTableauSource(workbooks={"Dash": "<workbook/>"})
+    report = migrate_estate(src, str(out), viz_stage=_advice_viz, pbip=False)
+    wb = report["workbooks"][0]
+    assert "viz_advice" not in wb                                   # byte-identical no-op
+    sidecars = [p.name for p in (out / "reports").iterdir() if p.name.endswith(".viz-advice.json")]
+    assert sidecars == []
+
+
+def test_viz_advice_on_writes_sidecar_and_records_summary(tmp_path):
+    out = tmp_path / "b"
+    src = InMemoryTableauSource(workbooks={"Dash": "<workbook/>"})
+    report = migrate_estate(src, str(out), viz_stage=_advice_viz, pbip=False, viz_advice=True)
+    wb = report["workbooks"][0]
+    assert wb["viz_advice"]["status"] == "written"
+    assert wb["viz_advice"]["path"] == "reports/Dash.viz-advice.json"
+    assert wb["viz_advice"]["summary"] == {"visuals": 2, "advisable": 1, "with_alternative": 1}
+
+    sidecar = out / "reports" / "Dash.viz-advice.json"
+    assert sidecar.is_file()
+    body = json.load(open(sidecar, encoding="utf-8"))
+    assert body["kind"] == "tableau-to-powerbi-viz-advice"
+    assert body["advice"][0]["current_type"] == "clusteredColumnChart"
+    assert body["advice"][0]["advisable"] is True
+    assert body["advice"][1]["advisable"] is False                 # the detail table is left alone
+
+    # The advice is a SIBLING of the .Report folder; the PBIR definition is never touched by it.
+    assert (out / "reports" / "Dash.Report" / "definition" / "report.json").is_file()
+    assert not (out / "reports" / "Dash.Report" / "Dash.viz-advice.json").exists()
+
+
+def test_viz_advice_on_leaves_pbir_definition_byte_identical(tmp_path):
+    # The rebuilt report folder must be identical whether or not the advice sidecar is produced.
+    src = InMemoryTableauSource(workbooks={"Dash": "<workbook/>"})
+    off = tmp_path / "off"
+    on = tmp_path / "on"
+    migrate_estate(src, str(off), viz_stage=_advice_viz, pbip=False)
+    migrate_estate(InMemoryTableauSource(workbooks={"Dash": "<workbook/>"}),
+                   str(on), viz_stage=_advice_viz, pbip=False, viz_advice=True)
+    rel = os.path.join("reports", "Dash.Report", "definition", "report.json")
+    assert open(off / rel, encoding="utf-8").read() == open(on / rel, encoding="utf-8").read()
+
+
 def test_viz_stage_without_parts_builds_no_folder(tmp_path):
     src = InMemoryTableauSource(workbooks={"Dash": "<workbook/>"})
     report = migrate_estate(src, str(tmp_path / "b"), viz_stage=lambda t, n: {"note": "noted"})
@@ -2173,3 +2234,47 @@ def test_rebuild_from_published_match_threads_parameters(monkeypatch):
     params = captured.get("parameters")
     assert isinstance(params, list)
     assert any(p.get("caption") == "Date Selection" for p in params)
+
+
+def test_rebuild_from_published_match_threads_flatfile_path(monkeypatch):
+    # A .twbx connected to a published EXTRACT backed by a flat file bundles no data itself -- the
+    # Excel lives in the sibling .tdsx the estate already migrated. That datasource's catalog entry
+    # carries the ABSOLUTE path of the extracted Excel; the workbook rebuild MUST reuse it, or the
+    # workbook .pbip emits a relative File.Contents path that Power BI Desktop opens with NO data.
+    # This is the regression lock for "a flat-file workbook must open AND load."
+    captured = {}
+
+    def _fake_migrate(text, **kw):
+        captured.update(kw)
+        return {"report": {"fallback": False}}
+
+    monkeypatch.setattr(me, "migrate_datasource", _fake_migrate)
+    twb = ("<workbook><datasources><datasource name='ds' caption='Superstore - Extract'>"
+           "</datasource></datasources></workbook>")
+    detail = {"binding_signal": {"kind": "published", "published_ds_name": "Superstore - Extract"}}
+    abs_xlsx = r"C:\out\data\Superstore_-_Extract\Sample - Superstore.xlsx"
+    catalog = {me._norm_ds("Superstore - Extract"):
+               {"text": "<datasource/>", "name": "Superstore - Extract", "flatfile_path": abs_xlsx}}
+
+    res = me._rebuild_from_published_match(detail, twb, "Model", catalog)
+    assert res is not None
+    assert captured.get("flatfile_path") == abs_xlsx     # reuses the sibling's extracted Excel
+
+
+def test_rebuild_from_published_match_flatfile_path_none_when_catalog_lacks_it(monkeypatch):
+    # A published live-DB match (no bundled flat file) has no flatfile_path in its catalog entry ->
+    # the rebuild threads None and the connection-string path is left exactly as before (untouched).
+    captured = {}
+
+    def _fake_migrate(text, **kw):
+        captured.update(kw)
+        return {"report": {"fallback": False}}
+
+    monkeypatch.setattr(me, "migrate_datasource", _fake_migrate)
+    twb = "<workbook><datasources><datasource name='ds' caption='Sales DS'/></datasources></workbook>"
+    detail = {"binding_signal": {"kind": "published", "published_ds_name": "Sales DS"}}
+    catalog = {me._norm_ds("Sales DS"): {"text": "<datasource/>", "name": "Sales DS"}}
+
+    res = me._rebuild_from_published_match(detail, twb, "Model", catalog)
+    assert res is not None
+    assert captured.get("flatfile_path") is None

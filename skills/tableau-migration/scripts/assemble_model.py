@@ -32,6 +32,7 @@ try:  # package or scripts-on-path
         connection_details_for_bind,
         emit_connection_parameters,
         emit_table_tmdl_m,
+        extract_bundled_flatfile,
         m_partition_review_reason,
         extract_calcs,
         parse_tds,
@@ -68,6 +69,7 @@ except ImportError:
         connection_details_for_bind,
         emit_connection_parameters,
         emit_table_tmdl_m,
+        extract_bundled_flatfile,
         m_partition_review_reason,
         extract_calcs,
         parse_tds,
@@ -207,10 +209,19 @@ def _date_axis_order_resolver(resolve, date_table, active_date_cols, date_key="D
     it as the ``required_facts`` the redirect depends on, so it can fail-closed when the inner
     aggregate is on an UNRELATED table (whose order would not propagate through the Date relationship).
     Returns ``None`` (no redirect) when there is no Date dimension or no active date column, making the
-    no-date-dimension path byte-for-byte identical. The redirect is ORDERBY-only: the inner aggregate
-    and the partition still resolve to the fact table, and because the Date dimension relates to the
-    fact, the window's date order propagates to the aggregate through that relationship -- valid DAX
-    whose addressing dimension is deliberately exempt from the single-table guard.
+    no-date-dimension path byte-for-byte identical.
+
+    DISABLED (not wired into the model build): the redirect is ORDERBY-only -- the inner aggregate and
+    the partition stay on the fact -- on the assumption that the Date->fact relationship would propagate
+    the date order to the aggregate. That assumption is FALSE for OFFSET/WINDOW. Microsoft's spec
+    requires, when the ``relation`` argument is omitted, that every ``orderBy``/``partitionBy`` column
+    come from a SINGLE table; ordering on ``Date[Date]`` while partitioning on ``Orders`` is cross-table
+    and the live Fabric engine rejects it (``0x413A0003``: "OFFSET's Relation parameter is omitted. In
+    this case, all OrderBy and PartitionBy columns must be from the same table."). The sole call site
+    therefore passes ``order_resolver=None`` so the ORDERBY resolves to the fact's own date column (same
+    table as the partition -> valid single-table DAX). This builder is retained for a future
+    relation-supplying implementation (emit an explicit ``<relation>`` spanning the calendar key + the
+    partition) that would make calendar-key ordering valid; until then it must NOT be re-wired.
     """
     if not date_table or not active_date_cols:
         return None
@@ -931,13 +942,15 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
     doesn't introduce ambiguous snowflake paths. For each eligible table the primary date column
     gets an ACTIVE relationship and any others are inactive (role-playing, via USERELATIONSHIP).
 
-    For an **Import** model the date relationships carry ``joinOnDateBehavior: datePartOnly`` so a
-    timestamp's time component can't silently drop rows against the midnight calendar key. For a
-    **DirectQuery** (``mode == 'DirectQuery'``) model that behavior is ILLEGAL -- Power BI rejects a
-    DirectQuery table that participates in a datePartOnly (datetime-to-date) relationship ("...must
-    have its query mode set to Import") -- so the relationships are emitted as plain dateTime joins
-    instead (both endpoints are already dateTime; a source DATE lands at midnight and matches the
-    midnight calendar key exactly). A report warning flags the exact-join caveat.
+    Every date relationship is a plain exact ``dateTime``-to-``dateTime`` join with NO
+    ``joinOnDateBehavior``. The generated Date table is a CALCULATED table (CALENDARAUTO/CALENDAR),
+    and Power BI Desktop silently DROPS a ``datePartOnly`` relationship that involves a calculated
+    table when the ``.pbip`` is opened -- the relationship disappears and any time series collapses to
+    a single aggregated value (the "flat line"). Because both endpoints are ``dateTime`` an exact join
+    is valid, and a source DATE (stored at midnight) matches the midnight calendar key exactly. On a
+    **DirectQuery** (``mode == 'DirectQuery'``) model ``datePartOnly`` is independently ILLEGAL --
+    Power BI rejects a DirectQuery table in a datePartOnly (datetime-to-date) relationship ("...must
+    have its query mode set to Import") -- and a report warning flags the exact-join caveat there.
 
     The calendar source also differs by mode: Import uses ``CALENDARAUTO()`` (the model holds the
     data, so its date-column scan works at refresh); DirectQuery uses a self-contained fixed-range
@@ -988,10 +1001,12 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
                 "to_table": date_name, "to_col": "Date",
                 "is_active": active,
             }
-            # datePartOnly (a datetime-to-date join) is illegal on a DirectQuery table; relate on the
-            # full dateTime there instead (see this function's docstring).
-            if not is_directquery:
-                rel["join_on_date_behavior"] = "datePartOnly"
+            # No joinOnDateBehavior -- every date relationship is a plain exact dateTime join. The
+            # generated Date table is a CALCULATED table (CALENDARAUTO/CALENDAR), and Power BI Desktop
+            # silently DROPS a datePartOnly relationship that involves a calculated table on .pbip open
+            # (the relationship vanishes and the time series flattens). Both endpoints are dateTime so
+            # an exact join is valid; a source DATE at midnight matches the midnight calendar key
+            # exactly. (datePartOnly is independently illegal on a DirectQuery table.)
             rels.append(rel)
             details.append({"table": disp, "column": col, "active": active})
 
@@ -1678,7 +1693,16 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
         approved_calc_dax=approved_calc_dax, synth_measures=fp.get("measures"),
         known_tables=set(table_names), table_calc_usages=table_calc_usages,
-        order_resolver=_date_axis_order_resolver(resolve, date_name, active_date_cols),
+        # ADD #1's date-axis ORDERBY redirect is DISABLED. It rewrote a positional table-calc's
+        # ORDERBY to the calendar key Date[Date] while the partition + inner aggregate stayed on the
+        # fact (Orders), producing an OFFSET/WINDOW whose orderBy and partitionBy span two tables with
+        # no <relation>. Microsoft's OFFSET/WINDOW spec requires every orderBy/partitionBy column to
+        # come from ONE table when relation is omitted, and the live Fabric engine rejects the
+        # cross-table form (0x413A0003: "OFFSET's Relation parameter is omitted ... all OrderBy and
+        # PartitionBy columns must be from the same table"). Passing None resolves the ORDERBY to the
+        # fact's own date column (Orders[Order_Date]) -- same table as the partition -> valid DAX. The
+        # _date_axis_order_resolver builder is retained for a future relation-supplying re-enable.
+        order_resolver=None,
         flag_measures=flag_measures)
     parts["definition/tables/_Measures.tmdl"] = measures_table
     table_names.append("_Measures")
@@ -2336,7 +2360,7 @@ def _resolve_local_csv_paths(local_data, *, source, model_name, write_to):
 
 def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, datasource=None,
                        calcs=None, dim_calcs=None, approved_calc_dax=None, date_range=None,
-                       local_data=None, **kwargs):
+                       local_data=None, packaged_source=None, flatfile_dest_dir=None, **kwargs):
     """**One call** from a downloaded datasource to everything needed to land it in Fabric.
 
     ``source`` may be a path to a ``.tdsx``/``.tds``/``.twbx``/``.twb``, raw bytes, or XML text.
@@ -2427,6 +2451,20 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
                                 write_to=write_to)
     else:
         _split_auto_calcs()
+        # Flat-file Import (Excel/CSV bundled inside a .tdsx/.twbx): lift the embedded data file out
+        # to an ABSOLUTE path so the emitted M's File.Contents loads in Power BI Desktop -- a relative
+        # path opens but loads nothing. ``packaged_source`` is the original zip when ``source`` is XML
+        # text (the workbook path passes the .twbx); ``flatfile_dest_dir`` lets that caller choose
+        # where the data lands (else it lands beside the written model). Only fires when the caller
+        # didn't already pass flatfile_path. A live DB source carries no flatfile_filename -> no-op,
+        # so Snowflake/Databricks/SQL Server connection strings are left untouched.
+        import os as _os
+        _ff_dest = flatfile_dest_dir or (
+            _os.path.join(write_to, f"{model_name}.Data") if write_to else None)
+        if _ff_dest and not kwargs.get("flatfile_path") and descriptor.get("flatfile_filename"):
+            _ff = extract_bundled_flatfile(packaged_source or source, descriptor, _ff_dest)
+            if _ff:
+                kwargs["flatfile_path"] = _ff
         result = migrate_tds_to_semantic_model(
             tds_text, model_name=model_name, calcs=calcs, dim_calcs=dim_calcs, select=datasource,
             approved_calc_dax=approved_calc_dax, date_range=date_range, **kwargs)

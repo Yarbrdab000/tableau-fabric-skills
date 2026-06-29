@@ -14,7 +14,9 @@ from twb_to_pbir import (
     MEASURES_TABLE,
     PAGE_HEIGHT,
     PAGE_WIDTH,
+    SCHEMA_VISUAL,
     SCHEMA_VISUAL_FP,
+    SCHEMA_VISUAL_SM,
     _drop_resolved_flag_warnings,
     _flag_filter_container,
     _norm_param_key,
@@ -202,8 +204,40 @@ def test_line_chart_truncated_date_stays_on_x_axis_region_to_series():
     assert {p["field"]["Aggregation"]["Expression"]["Column"]["Property"]
             for p in state["Y"]["projections"]} == {"Sales_Amount", "Profit"}
     # the Rows paning dimension lands on Small multiples (Tableau trellis), not the x-axis
-    assert state["SmallMultiples"]["projections"][0]["field"]["Column"]["Property"] == "Region"
+    assert state["SmallMultiple"]["projections"][0]["field"]["Column"]["Property"] == "Region"
     assert "Series" not in state
+
+
+def test_small_multiples_visual_uses_newer_schema_others_stay_1_0_0():
+    # A visual that binds a SmallMultiple (trellis) role must be stamped at the newer
+    # visualContainer schema -- Power BI Desktop silently DROPS the small-multiples role on the
+    # legacy 1.0.0 stamp (the chart collapses to a single aggregated panel). The bump is gated to
+    # ONLY trellis visuals so the verified non-trellis gates keep their proven 1.0.0 stamp.
+    tmonth = ("<column-instance column='[Order Date]' derivation='Month-Trunc' "
+              "name='[tmn:Order Date:qk]' pivot='key' type='quantitative' />")
+    trellis = _worksheet("Trend by Region", "Line",
+                         rows="([federated.abc].[none:Region:nk] * "
+                              "[federated.abc].[sum:Sales:qk])",
+                         cols="[federated.abc].[tmn:Order Date:qk]",
+                         deps_extra=_INST + tmonth)
+    vis = list(_visual_parts(emit_pbir(parse_twb(_workbook(trellis)))).values())[0]
+    assert "SmallMultiple" in vis["visual"]["query"]["queryState"]
+    assert vis["$schema"] == SCHEMA_VISUAL_SM
+    # the data-plane formatting card that actually lays the panes out (without it the role binds
+    # but no trellis renders)
+    sm = vis["visual"]["objects"]["smallMultiple"][0]["properties"]
+    assert sm["layoutMode"]["expr"]["Literal"]["Value"] == "'flow'"
+    assert sm["maxItemsPerRow"]["expr"]["Literal"]["Value"] == "3L"
+
+    # a plain bar (no paning dimension -> no SmallMultiple role) keeps the proven 1.0.0 stamp
+    plain = _worksheet("Sales by Region", "Bar",
+                       rows="[federated.abc].[sum:Sales:qk]",
+                       cols="[federated.abc].[none:Region:nk]",
+                       deps_extra=_INST)
+    bar = list(_visual_parts(emit_pbir(parse_twb(_workbook(plain)))).values())[0]
+    assert "SmallMultiple" not in bar["visual"]["query"]["queryState"]
+    assert bar["$schema"] == SCHEMA_VISUAL
+    assert "smallMultiple" not in bar["visual"].get("objects", {})
 
 
 # -- IR: Automatic mark + continuous date -> line (Tableau's default chart type) ----
@@ -510,20 +544,20 @@ def test_single_dimension_color_and_label_same_field_is_one_column():
     assert len(state["Values"]["projections"]) == 1
 
 
-def test_geo_dimension_on_detail_only_is_location_only_shapemap():
+def test_geo_dimension_on_detail_only_is_location_only_filled_map():
     # A geographic dimension alone on Detail with no measure is Tableau's default map of that
-    # geography -> a faithful location-only shapeMap (Category = the location, no colour Value);
-    # it must NOT be flattened into a one-column text list.
+    # geography -> a faithful location-only filledMap (Category = the location, no saturation
+    # measure); it must NOT be flattened into a one-column text list.
     enc = "<encodings><lod column='[federated.abc].[none:State:nk]' /></encodings>"
     ws = _worksheet("State Map", "Automatic", rows="", cols="",
                     deps_extra=_INST, encodings=enc)
     ir = parse_twb(_workbook(ws))
     assert ir["worksheets"][0]["visual_type"] == "filled_map"
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
-    assert vis["visual"]["visualType"] == "shapeMap"
+    assert vis["visual"]["visualType"] == "filledMap"
     state = _query_state(vis)
     assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
-    assert "Value" not in state
+    assert "Tooltips" not in state
 
 
 def test_area_mark_maps_to_area_chart():
@@ -1136,9 +1170,10 @@ def test_dashboard_device_layouts_do_not_duplicate_worksheet_visuals():
 
 
 def test_dashboard_page_surfaces_worksheet_filter_slicers_deduped():
-    # a dashboard page carries the filter slicers of the worksheets it places, deduped across
-    # worksheets: two sheets each filtered on Region (+ one also on State) -> the dashboard page
-    # gets exactly two distinct slicers (Region once, State once), alongside the two chart visuals.
+    # a dashboard page carries a slicer for each filter the author SHOWED as a dashboard filter card
+    # (a <zone type-v2='filter'>), deduped across worksheets: Region + State are both shown on the
+    # dashboard (two sheets reference Region, one also State) -> exactly two distinct slicers (Region
+    # once, State once), alongside the two chart visuals.
     f_region = ("<filter class='categorical' column='[federated.abc].[none:Region:nk]'>"
                 "<groupfilter function='member' level='[none:Region:nk]' /></filter>")
     f_state = ("<filter class='categorical' column='[federated.abc].[none:State:nk]'>"
@@ -1151,7 +1186,11 @@ def test_dashboard_page_surfaces_worksheet_filter_slicers_deduped():
                      deps_extra=_INST, filters=f_region)
     inner = ("<zone h='100000' w='100000' x='0' y='0'>"
              "<zone h='45000' w='90000' x='5000' y='5000' name='SalesWs' id='2' />"
-             "<zone h='45000' w='90000' x='5000' y='55000' name='ProfitWs' id='3' /></zone>")
+             "<zone h='45000' w='90000' x='5000' y='55000' name='ProfitWs' id='3' />"
+             "<zone name='SalesWs' param='[federated.abc].[none:Region:nk]' type-v2='filter' "
+             "h='6000' w='20000' x='5000' y='92000' id='20' />"
+             "<zone name='SalesWs' param='[federated.abc].[none:State:nk]' type-v2='filter' "
+             "h='6000' w='20000' x='30000' y='92000' id='21' /></zone>")
     dash = ("<dashboard name='D'><size maxheight='800' maxwidth='1200' />"
             "<zones>" + inner + "</zones></dashboard>")
     parts = emit_pbir(parse_twb(_workbook(ws1 + ws2, dash)))
@@ -1161,6 +1200,54 @@ def test_dashboard_page_surfaces_worksheet_filter_slicers_deduped():
         v["visual"]["query"]["queryState"]["Values"]["projections"][0]["field"]["Column"]["Property"]
         for v in _visual_parts(parts).values() if v["visual"]["visualType"] == "slicer")
     assert slicer_props == ["Region", "State"]  # deduped: Region once despite two sheets
+
+
+def test_unshown_dashboard_filter_does_not_fabricate_a_slicer():
+    # Faithful contract (warn-never-wrong): a worksheet filter the author did NOT expose as a
+    # dashboard filter card -- e.g. a single-member scope include that merely narrows one sheet to a
+    # region -- must NOT fabricate a page slicer the dashboard never had. With no <zone
+    # type-v2='filter'> on the dashboard, the page carries zero slicers (the chart visuals remain).
+    filt = ("<filter class='categorical' column='[federated.abc].[none:Region:nk]'>"
+            "<groupfilter function='member' member='&quot;West&quot;' /></filter>")
+    ws1 = _worksheet("MapWs", "Bar", "[federated.abc].[sum:Sales:qk]",
+                     "[federated.abc].[none:Category:nk]", deps_extra=_INST, filters=filt)
+    ws2 = _worksheet("TrendWs", "Bar", "[federated.abc].[sum:Profit:qk]",
+                     "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    inner = ("<zone h='100000' w='100000' x='0' y='0'>"
+             "<zone h='45000' w='90000' x='5000' y='5000' name='MapWs' id='2' />"
+             "<zone h='45000' w='90000' x='5000' y='55000' name='TrendWs' id='3' /></zone>")
+    dash = ("<dashboard name='D'><size maxheight='800' maxwidth='1200' />"
+            "<zones>" + inner + "</zones></dashboard>")
+    parts = emit_pbir(parse_twb(_workbook(ws1 + ws2, dash)))
+    slicers = [v for v in _visual_parts(parts).values()
+               if v["visual"]["visualType"] == "slicer"]
+    assert slicers == []
+    mains = [v for v in _visual_parts(parts).values()
+             if v["visual"]["visualType"] != "slicer"]
+    assert len(mains) == 2  # the charts are still emitted -- only the fabricated slicer is gone
+
+
+def test_dashboard_filter_card_in_nested_container_is_still_surfaced_as_slicer():
+    # A shown filter card can live INSIDE a (collapsible) layout container rather than at the top
+    # level; the zone walk recurses, so a nested <zone type-v2='filter'> is still recognised and the
+    # field becomes a slicer.
+    f_region = ("<filter class='categorical' column='[federated.abc].[none:Region:nk]'>"
+                "<groupfilter function='member' level='[none:Region:nk]' /></filter>")
+    ws = _worksheet("Ws", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST, filters=f_region)
+    inner = ("<zone h='100000' w='100000' x='0' y='0' type-v2='layout-basic'>"
+             "<zone h='98000' w='98000' x='1000' y='1000' type-v2='layout-flow' param='vert'>"
+             "<zone h='80000' w='90000' x='5000' y='5000' name='Ws' id='2' />"
+             "<zone name='Ws' param='[federated.abc].[none:Region:nk]' type-v2='filter' "
+             "h='6000' w='20000' x='5000' y='90000' id='20' /></zone></zone>")
+    dash = ("<dashboard name='D'><size maxheight='800' maxwidth='1200' />"
+            "<zones>" + inner + "</zones></dashboard>")
+    parts = emit_pbir(parse_twb(_workbook(ws, dash)))
+    slicer_props = sorted(
+        v["visual"]["query"]["queryState"]["Values"]["projections"][0]["field"]["Column"]["Property"]
+        for v in _visual_parts(parts).values() if v["visual"]["visualType"] == "slicer")
+    assert slicer_props == ["Region"]
+
 
 
 def test_duplicate_field_queryrefs_are_unique_per_visual():
@@ -1188,9 +1275,12 @@ def test_dashboard_page_relies_on_default_cross_filter_no_interaction_overrides(
                      "[federated.abc].[none:Category:nk]", deps_extra=_INST, filters=f_region)
     ws2 = _worksheet("ProfitWs", "Bar", "[federated.abc].[sum:Profit:qk]",
                      "[federated.abc].[none:Region:nk]", deps_extra=_INST)
+    # Region is shown as a dashboard filter card -> it surfaces as a slicer that cross-filters both charts.
     inner = ("<zone h='100000' w='100000' x='0' y='0'>"
              "<zone h='45000' w='90000' x='5000' y='5000' name='SalesWs' id='2' />"
-             "<zone h='45000' w='90000' x='5000' y='55000' name='ProfitWs' id='3' /></zone>")
+             "<zone h='45000' w='90000' x='5000' y='55000' name='ProfitWs' id='3' />"
+             "<zone name='SalesWs' param='[federated.abc].[none:Region:nk]' type-v2='filter' "
+             "h='6000' w='20000' x='5000' y='92000' id='20' /></zone>")
     dash = ("<dashboard name='D'><size maxheight='800' maxwidth='1200' />"
             "<zones>" + inner + "</zones></dashboard>")
     parts = emit_pbir(parse_twb(_workbook(ws1 + ws2, dash)))
@@ -1749,11 +1839,11 @@ def test_secondary_date_is_never_rebound():
     assert any("date part" in x["reason"].lower() for x in ir["warnings"])
 
 
-def test_continuous_day_or_coarser_trunc_on_active_date_rebinds_to_calendar_key():
-    # A continuous month truncation (green `tmn:` pill) on the ACTIVE business date binds to the
-    # marked calendar KEY column Date[Date]: the day-grain Date table relates to the fact date and
-    # Power BI's continuous date axis carries the monthly display grain. This matches a Desktop-
-    # authored rebuild whose line-chart date axis is Date[Date] (never the fact's raw date column).
+def test_continuous_trunc_on_active_date_rebinds_to_calendar_hierarchy():
+    # A continuous month truncation (green `tmn:` pill) on the ACTIVE business date is a display-grain
+    # axis -> the marked Date table's Calendar drill hierarchy, drilled to the truncation grain
+    # (Year + Month). This matches a Desktop-authored rebuild whose area/line date axis carries the
+    # Calendar Year + Month levels (never the flat fact date column, never an undrillable key column).
     tmonth = ("<column-instance column='[Order Date]' derivation='Month-Trunc' "
               "name='[tmn:Order Date:qk]' pivot='key' type='quantitative' />")
     ws = _worksheet("Monthly Trend", "Line",
@@ -1762,9 +1852,19 @@ def test_continuous_day_or_coarser_trunc_on_active_date_rebinds_to_calendar_key(
                     deps_extra=_INST + tmonth)
     ir = parse_twb(_workbook(ws), date_binding=_DATE_BINDING)
     col = ir["worksheets"][0]["cols"][0]
-    assert (col["entity"], col["property"]) == ("Date", "Date")
+    assert col["entity"] == "Date"
+    assert col["hierarchy"] == {"name": "Calendar", "levels": ["Year", "Month"]}
     # rebound to the calendar -> the "grain not applied" degrade warning is gone
     assert not any("grain not applied" in x["reason"].lower() for x in ir["warnings"])
+    # emits one HierarchyLevel projection per level (Year + Month), each active, against Date.Calendar
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    cats = _query_state(vis)["Category"]["projections"]
+    assert [(p["field"]["HierarchyLevel"]["Level"], p["queryRef"], p.get("active")) for p in cats] == [
+        ("Year", "Date.Calendar.Year", True), ("Month", "Date.Calendar.Month", True)]
+    hexpr = cats[0]["field"]["HierarchyLevel"]["Expression"]["Hierarchy"]
+    assert hexpr["Hierarchy"] == "Calendar"
+    assert hexpr["Expression"]["SourceRef"]["Entity"] == "Date"
+    assert cats[0]["nativeQueryRef"] == "Calendar Year"
 
 
 def test_subday_trunc_on_active_date_is_deferred():
@@ -1805,31 +1905,136 @@ def _geo_ws(name, mark, encodings, rows="[federated.abc].[Latitude (generated)]"
                       deps_extra=_INST, encodings=encodings)
 
 
-def test_filled_map_from_geo_detail_and_color_measure():
+def test_shape_map_from_geo_detail_and_color_measure():
     enc = ("<encodings>"
            "<color column='[federated.abc].[sum:Sales:qk]' />"
            "<lod column='[federated.abc].[none:State:nk]' />"
            "</encodings>")
     ir = parse_twb(_workbook(_geo_ws("Sales by State", "Automatic", enc)))
-    assert ir["worksheets"][0]["visual_type"] == "filled_map"
+    assert ir["worksheets"][0]["visual_type"] == "shape_map"
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
     assert vis["visual"]["visualType"] == "shapeMap"
     state = _query_state(vis)
-    # Category = the geographic dimension; Value = the colour saturation measure
+    # Category = the geographic dimension; the colour-saturation measure binds the "Value" role
+    # (the PBIR well behind shapeMap "Color saturation"), so the choropleth shades by the measure.
     assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
     assert state["Value"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
+    assert "Tooltips" not in state  # the measure is the colour driver, not a redundant tooltip copy
     # generated lat/lon are dropped quietly, not bound as fields
     assert "no model binding" not in json.dumps(ir["warnings"])
 
 
-def test_filled_map_explicit_map_mark_needs_no_latlon_signal():
+def test_shape_map_measure_binds_value_color_saturation_well():
+    # A Tableau measure on the Color shelf of a filled map is the choropleth's saturation driver.
+    # The faithful Power BI home is the shapeMap "Value" role (its "Color saturation" well), NOT
+    # Tooltips/Gradient -- so Power BI actually shades each state by the measure with its default ramp.
+    enc = ("<encodings>"
+           "<color column='[federated.abc].[sum:Profit:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Profit by State", "Automatic", enc)))
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "shapeMap"
+    state = _query_state(vis)
+    # the measure lands on Value (colour saturation), and ONLY there -- no redundant Tooltips copy
+    assert "Value" in state
+    assert "Tooltips" not in state
+    assert "Gradient" not in state
+    assert state["Value"]["projections"][0]["field"]["Aggregation"]["Function"] == 0  # Sum(Profit)
+    # the geo dimension is still the Location/Category at the finest level
+    assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
+
+
+def test_shape_map_objects_pin_usa_states_topo_built_in_map():
+    # A state-grain choropleth emits the objects.shape block that pins Power BI's built-in
+    # "usa.states.topo" SHARED map (PackageType 2) + the albersUsa projection, so the shapeMap
+    # renders OFFLINE with no bundled TopoJSON. Shape verified against real Desktop shapeMap JSON.
+    enc = ("<encodings>"
+           "<color column='[federated.abc].[sum:Profit:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Profit by State", "Automatic", enc)))
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "shapeMap"
+    shape = vis["visual"]["objects"]["shape"][0]["properties"]
+    geo = shape["map"]["geoJson"]
+    assert geo["type"]["expr"]["Literal"]["Value"] == "'shared'"
+    assert geo["name"]["expr"]["Literal"]["Value"] == "'usa.states.topo'"
+    rpi = geo["content"]["expr"]["ResourcePackageItem"]
+    assert rpi == {"PackageName": "SharedResources", "PackageType": 2,
+                   "ItemName": "usa.states.topo"}
+    assert shape["projectionEnum"]["expr"]["Literal"]["Value"] == "'albersUsa'"
+
+
+def test_shape_map_objects_emit_diverging_saturation_gradient_centred_at_zero():
+    # A measure shapeMap must carry an explicit objects.dataPoint colour-saturation gradient or
+    # Desktop renders a FLAT fill until the Value field is nudged off-and-on. We emit a DIVERGING
+    # linearGradient3 -- orange (loss) -> white (0) -> blue (high profit) -- matching Tableau's
+    # Orange-Blue map palette. Power BI does NOT default the centre to 0 (it auto-centres on the
+    # data midpoint), so we PIN the mid stop's value to 0; white then lands on break-even with the
+    # min/max stops left to auto-scale. Verified against a real Desktop filledMap/shapeMap visual.json.
+    enc = ("<encodings>"
+           "<color column='[federated.abc].[sum:Profit:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Profit by State", "Automatic", enc)))
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "shapeMap"
+    dp = vis["visual"]["objects"]["dataPoint"][0]["properties"]
+    grad = dp["fillRule"]["linearGradient3"]
+    # orange -> white -> blue, white PINNED at the 0 centre (mid carries a value anchor; min/max
+    # stay value-less so they auto-scale to the data low/high)
+    assert grad["min"]["color"]["expr"]["Literal"]["Value"] == "'#FEA043'"
+    assert grad["mid"]["color"]["expr"]["Literal"]["Value"] == "'#FFFFFF'"
+    assert grad["max"]["color"]["expr"]["Literal"]["Value"] == "'#4A88C2'"
+    assert grad["mid"]["value"]["expr"]["Literal"]["Value"] == "0D"   # centre pinned at break-even
+    assert "value" not in grad["min"]                                 # endpoints auto-scale...
+    assert "value" not in grad["max"]                                 # ...to the data range
+    assert grad["nullColoringStrategy"]["strategy"]["expr"]["Literal"]["Value"] == "'asZero'"
+    assert dp["showAllDataPoints"]["expr"]["Literal"]["Value"] == "true"
+    assert "linearGradient2" not in dp["fillRule"]  # not the old sequential 2-colour ramp
+
+
+# Country/Region declared with its own geo semantic-role, so both it AND State carry a geo_area and
+# both land on the Detail (lod) shelf -- the exact Superstore Sheet-3 shape (a Country -> State drill).
+_CI_COUNTRY_DECL = ("<column caption='Country/Region' datatype='string' name='[Country/Region]' "
+                    "role='dimension' semantic-role='[Country].[ISO3166_2]' type='nominal' />")
+_CI_COUNTRY = ("<column-instance column='[Country/Region]' derivation='None' "
+               "name='[none:Country/Region:nk]' pivot='key' type='nominal' />")
+
+
+def test_shape_map_binds_finest_geo_level_not_coarsest():
+    # Tableau serialises a geo drill hierarchy coarse->fine: Country/Region BEFORE State/Province.
+    # The map renders at the FINEST level (each state is its own fill), so the faithful Power BI
+    # Location is State, not the first-serialised Country. Without finest-geo selection the old
+    # first-wins logic would (wrongly) bind Country here -- this locks the fix.
+    enc = ("<encodings>"
+           "<color column='[federated.abc].[sum:Profit:qk]' />"
+           "<lod column='[federated.abc].[none:Country/Region:nk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    ws = _worksheet("Profit by State", "Automatic",
+                    rows="[federated.abc].[Latitude (generated)]",
+                    cols="[federated.abc].[Longitude (generated)]",
+                    deps_extra=_INST + _CI_COUNTRY_DECL + _CI_COUNTRY, encodings=enc)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["visual_type"] == "shape_map"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "shapeMap"
+    state = _query_state(vis)
+    cat = [p["field"]["Column"]["Property"] for p in state["Category"]["projections"]]
+    assert cat == ["State"]   # finest level only, NOT the coarser Country/Region
+    assert state["Value"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
+
+
+def test_shape_map_explicit_map_mark_needs_no_latlon_signal():
     enc = ("<encodings>"
            "<color column='[federated.abc].[sum:Profit:qk]' />"
            "<lod column='[federated.abc].[none:State:nk]' />"
            "</encodings>")
     # explicit Map mark is self-signaling: no generated lat/lon on the (empty) axes
     ir = parse_twb(_workbook(_geo_ws("Profit Map", "Map", enc, rows="", cols="")))
-    assert ir["worksheets"][0]["visual_type"] == "filled_map"
+    assert ir["worksheets"][0]["visual_type"] == "shape_map"
     state = _query_state(list(_visual_parts(emit_pbir(ir)).values())[0])
     assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
 
@@ -1844,11 +2049,29 @@ def test_symbol_map_circle_mark_with_size_measure():
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
     assert vis["visual"]["visualType"] == "map"
     state = _query_state(vis)
-    assert state["Location"]["projections"][0]["field"]["Column"]["Property"] == "State"
+    assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
     assert state["Size"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
 
 
-def test_multipolygon_custom_geometry_is_deferred_with_warning():
+def test_symbol_map_color_measure_binds_gradient_not_color_well():
+    # A distinct colour MEASURE on a symbol/bubble map binds the PBIR "Gradient" role -- the Bing
+    # map "Color saturation" well (a measure), the SAME role the filled map uses. The classic map
+    # visual has NO "Color" role, so a colour measure must land on Gradient to shade the bubbles.
+    enc = ("<encodings>"
+           "<size column='[federated.abc].[sum:Sales:qk]' />"
+           "<color column='[federated.abc].[sum:Profit:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Bubble Map", "Circle", enc)))
+    assert ir["worksheets"][0]["visual_type"] == "map"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "map"
+    state = _query_state(vis)
+    assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
+    # size keeps its own measure; the distinct colour measure shades via Gradient, never "Color"
+    assert state["Size"]["projections"][0]["queryRef"] == "Sum(Orders.Sales_Amount)"
+    assert state["Gradient"]["projections"][0]["queryRef"] == "Sum(Orders.Profit)"
+    assert "Color" not in state
     enc = ("<encodings>"
            "<color column='[federated.abc].[sum:Sales:qk]' />"
            "<lod column='[federated.abc].[none:State:nk]' />"
@@ -1858,6 +2081,43 @@ def test_multipolygon_custom_geometry_is_deferred_with_warning():
     assert ir["worksheets"][0]["visual_type"] == "unsupported"
     assert _visual_parts(emit_pbir(ir)) == {}
     assert any("deferred" in w["reason"] and "Spatial" == w["name"] for w in ir["warnings"])
+
+
+def test_filled_map_categorical_color_binds_series_legend():
+    # A categorical (dimension) colour on a filled map is the map LEGEND -> the "Series" role
+    # (each area shaded by its legend member), NOT the Gradient saturation well (that is only for
+    # a colour MEASURE). Geo stays on Category at the finest level; no measure -> no Gradient.
+    enc = ("<encodings>"
+           "<color column='[federated.abc].[none:Region:nk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Region Map", "Automatic", enc, rows="", cols="")))
+    assert ir["worksheets"][0]["visual_type"] == "filled_map"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "filledMap"
+    state = _query_state(vis)
+    assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
+    assert state["Series"]["projections"][0]["field"]["Column"]["Property"] == "Region"
+    assert "Gradient" not in state   # a dimension colour is a legend, not a saturation measure
+
+
+def test_symbol_map_categorical_color_binds_series_legend():
+    # A categorical (dimension) colour on a symbol/bubble map binds the "Series" legend role
+    # (bubbles coloured by member), distinct from a colour MEASURE (which would bind Gradient).
+    enc = ("<encodings>"
+           "<size column='[federated.abc].[sum:Sales:qk]' />"
+           "<color column='[federated.abc].[none:Region:nk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Bubble Legend Map", "Circle", enc)))
+    assert ir["worksheets"][0]["visual_type"] == "map"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "map"
+    state = _query_state(vis)
+    assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
+    assert state["Size"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
+    assert state["Series"]["projections"][0]["field"]["Column"]["Property"] == "Region"
+    assert "Gradient" not in state
 
 
 def test_geo_dimension_on_axis_is_not_a_map():
@@ -2930,11 +3190,36 @@ def test_no_reference_line_means_empty_list_and_no_warning():
     assert not any("deferred (Tier-2 analytics)" in x["reason"] for x in ir["warnings"])
 
 
-def test_measure_values_no_dimension_is_multi_row_card():
+def test_measure_values_no_dimension_is_table():
+    # A Measure Values text table with NO real dimension is Tableau's "measure table" (the measure
+    # names listed down the side with their values) -> a faithful tableEx of the member measures,
+    # NOT a multiRowCard of standalone value tiles. The implicit Measure Names pill is never bound
+    # (Power BI's column headers are the measure names); the member measures fill the Values well.
     ws = _worksheet("KPIs", "Text",
                     rows="[federated.abc].[Multiple Values]",
                     cols="",
                     deps_extra=_INST,
+                    filters=_mv_filter(["sum:Sales:qk", "sum:Profit:qk"]))
+    ir = parse_twb(_workbook(ws))
+    w = ir["worksheets"][0]
+    assert w["visual_type"] == "table"
+    assert w["fidelity_note"] and "implicit" in w["fidelity_note"].lower()
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "tableEx"
+    vrefs = [p["queryRef"] for p in _query_state(vis)["Values"]["projections"]]
+    assert vrefs == ["Sum(Orders.Sales_Amount)", "Sum(Orders.Profit)"]
+
+
+def test_measure_values_no_dimension_names_on_cols_is_card():
+    # A Measure Values "BAN strip": Measure Names on COLUMNS with the values shown as Text marks
+    # (each measure its own labelled big number across a horizontal band) is Tableau's KPI tile row
+    # -> a multiRowCard (Power BI's native row of labelled big numbers), NOT a single-column tableEx.
+    # The implicit Measure Names pill stays unbound; the member measures fill the Values well in order.
+    ws = _worksheet("KPIs", "Text",
+                    rows="",
+                    cols="[federated.abc].[:Measure Names]",
+                    deps_extra=_INST,
+                    encodings="<encodings><text column='[federated.abc].[Multiple Values]' /></encodings>",
                     filters=_mv_filter(["sum:Sales:qk", "sum:Profit:qk"]))
     ir = parse_twb(_workbook(ws))
     w = ir["worksheets"][0]
@@ -3075,7 +3360,7 @@ def test_golden_visual_types_lock_full_bindings():
         "Golden Card": ("Text", "[federated.abc].[sum:Sales:qk]", "", "", ""),
         "Golden MultiCard": ("Bar", "[federated.abc].[sum:Sales:qk]",
                              "[federated.abc].[sum:Profit:qk]", "", ""),
-        "Golden FilledMap": ("Automatic", geo, geo2, fmap_enc, ""),
+        "Golden ShapeMap": ("Automatic", geo, geo2, fmap_enc, ""),
         "Golden SymbolMap": ("Circle", geo, geo2, smap_enc, ""),
         "Golden MeasureValues": ("Text", "[federated.abc].[none:Region:nk]",
                                  "[federated.abc].[:Measure Names]", mv_text,
@@ -3103,10 +3388,11 @@ def test_golden_visual_types_lock_full_bindings():
         "Golden Card": ("card", {"Values": ["Sum(Orders.Sales_Amount)"]}),
         "Golden MultiCard": ("multiRowCard",
                              {"Values": ["Sum(Orders.Sales_Amount)", "Sum(Orders.Profit)"]}),
-        "Golden FilledMap": ("shapeMap",
-                             {"Category": ["Orders.State"], "Value": ["Sum(Orders.Sales_Amount)"]}),
+        "Golden ShapeMap": ("shapeMap",
+                            {"Category": ["Orders.State"],
+                             "Value": ["Sum(Orders.Sales_Amount)"]}),
         "Golden SymbolMap": ("map",
-                             {"Location": ["Orders.State"], "Size": ["Sum(Orders.Sales_Amount)"]}),
+                             {"Category": ["Orders.State"], "Size": ["Sum(Orders.Sales_Amount)"]}),
         "Golden MeasureValues": ("pivotTable",
                                  {"Rows": ["Orders.Region"],
                                   "Values": ["Sum(Orders.Sales_Amount)", "Sum(Orders.Profit)"]}),
@@ -3556,6 +3842,189 @@ def test_single_default_mark_color_is_not_emitted():
     assert ir["worksheets"][0]["mark_colors"] is None
     vj = list(_visual_parts(emit_pbir(ir)).values())[0]
     assert _data_point_objects(vj) is None
+
+
+# -- measure-series colours (datasource "Measure Names" palette) ---------------
+# When a chart colours its marks by MEASURE IDENTITY -- either a [:Measure Names] colour pill or a
+# measure VALUE on Color -- each member measure renders in its own colour drawn from the workbook's
+# datasource-level "Measure Names" palette (the author's Sales-orange / Profit-blue convention). The
+# faithful PBIR home is a per-measure ``dataPoint`` fill targeted by a ``metadata`` selector (the
+# measure's queryRef). A chart coloured by a DIMENSION keeps its own categorical palette instead.
+_PROFIT_HEX = "#4e79a7"   # blue
+_SALES_HEX = "#f28e2b"    # orange
+
+
+def _measure_palette_ds():
+    # the shared datasource with Sales un-renamed (remote-name == logical name, as in the real
+    # target workbook, so BOTH measure series resolve) + the global Measure-Names colour palette
+    # (stored once on ``<datasource><style>``, shared by every Measure-Names-coloured sheet).
+    ds = _DATASOURCE.replace("<remote-name>Sales Amount</remote-name>",
+                             "<remote-name>Sales</remote-name>")
+    style = (
+        "<style><style-rule element='mark'>"
+        "<encoding attr='color' field='[:Measure Names]' type='palette'>"
+        f"<map to='{_PROFIT_HEX}'><bucket>&quot;[federated.abc].[sum:Profit:qk]&quot;</bucket></map>"
+        f"<map to='{_SALES_HEX}'><bucket>&quot;[federated.abc].[sum:Sales:qk]&quot;</bucket></map>"
+        "</encoding></style-rule></style>")
+    return ds.replace("</datasource>", style + "</datasource>", 1)
+
+
+def _measure_palette_workbook(worksheets):
+    return ("<?xml version='1.0' encoding='utf-8' ?>\n<workbook>"
+            + _measure_palette_ds()
+            + "<worksheets>" + worksheets + "</worksheets></workbook>")
+
+
+def _metadata_fills(visual_json):
+    # {queryRef -> literal hex value} for every dataPoint fill targeted by a metadata (measure)
+    # selector (the per-measure series fills); ignores categorical scopeId / gradient fills.
+    dp = visual_json["visual"].get("objects", {}).get("dataPoint") or []
+    return {e["selector"]["metadata"]:
+            e["properties"]["fill"]["solid"]["color"]["expr"]["Literal"]["Value"]
+            for e in dp if "metadata" in e.get("selector", {})}
+
+
+def _ms_line_ws(name="MN Line"):
+    # two measures on Rows + a date on Cols, coloured by Measure Names -> a line measure series.
+    enc = "<encodings><color column='[federated.abc].[:Measure Names]' /></encodings>"
+    return _worksheet(name, "Line",
+                      rows="[federated.abc].[Multiple Values]",
+                      cols="[federated.abc].[mn:Order Date:ok]",
+                      deps_extra=_INST, encodings=enc,
+                      filters=_mv_filter(["sum:Sales:qk", "sum:Profit:qk"]))
+
+
+def _ms_bar_ws(name="MV Bar"):
+    # two measures on Rows + a dimension on Cols, coloured by a measure VALUE (sum:Profit) -- the
+    # broadened "colour by measure identity" path (the Sheet-1 case), not Measure Names.
+    enc = "<encodings><color column='[federated.abc].[sum:Profit:qk]' /></encodings>"
+    return _worksheet(name, "Bar",
+                      rows="[federated.abc].[Multiple Values]",
+                      cols="[federated.abc].[none:Category:nk]",
+                      deps_extra=_INST, encodings=enc,
+                      filters=_mv_filter(["sum:Sales:qk", "sum:Profit:qk"]))
+
+
+def test_measure_names_palette_parsed_into_ir():
+    ir = parse_twb(_measure_palette_workbook(_ms_line_ws()))
+    assert ir["worksheets"][0]["measure_colors"] == {"profit": _PROFIT_HEX, "sales": _SALES_HEX}
+
+
+def test_measure_series_line_emits_per_measure_metadata_fills():
+    parts = emit_pbir(parse_twb(_measure_palette_workbook(_ms_line_ws())))
+    vj = list(_visual_parts(parts).values())[0]
+    assert vj["visual"]["visualType"] == "lineChart"
+    assert _metadata_fills(vj) == {
+        "Sum(Orders.Sales)": "'{0}'".format(_SALES_HEX),
+        "Sum(Orders.Profit)": "'{0}'".format(_PROFIT_HEX)}
+
+
+def test_measure_value_colour_attaches_palette_detection():
+    # The broadened detection branch: colouring by a measure VALUE (kind == "value"), not only by
+    # Measure Names, still attaches the datasource measure palette to the worksheet (the Sheet-1
+    # case). Emit of the per-measure fills is exercised by the Measure-Names line test above -- the
+    # two paths share ``_measure_series_colors``, which only depends on ``measure_colors`` being set.
+    ir = parse_twb(_measure_palette_workbook(_ms_bar_ws()))
+    assert ir["worksheets"][0]["measure_colors"] == {"profit": _PROFIT_HEX, "sales": _SALES_HEX}
+
+
+def test_measure_series_fact_recorded_emitted():
+    res = migrate_twb_to_pbir(_measure_palette_workbook(_ms_line_ws()))
+    rec = next(r for r in res["candidate_records"] if r["worksheet"] == "MN Line")
+    fact = rec["measure_colors"]
+    assert fact["status"] == "emitted"
+    assert fact["kind"] == "measure_series_palette"
+    assert fact["count"] == 2
+
+
+def test_dimension_coloured_chart_skips_measure_series_palette():
+    # A chart coloured by a DIMENSION (Region) must NOT pick up the measure palette even though the
+    # datasource declares one -- measure_colors stays None and no metadata fill is emitted.
+    enc = "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings>"
+    ws = _worksheet("Dim Bar", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, encodings=enc)
+    ir = parse_twb(_measure_palette_workbook(ws))
+    assert ir["worksheets"][0]["measure_colors"] is None
+    vj = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert _metadata_fills(vj) == {}
+
+
+def test_measure_palette_does_not_leak_into_map():
+    # A measure-coloured choropleth carries measure_colors (its colour pill IS a measure value) but
+    # is NOT a per-measure series -> no metadata fill and no deferral warning (silent skip).
+    enc = ("<encodings><color column='[federated.abc].[sum:Profit:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' /></encodings>")
+    res = migrate_twb_to_pbir(_measure_palette_workbook(
+        _geo_ws("Profit by State", "Automatic", enc)))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert vj["visual"]["visualType"] == "shapeMap"
+    assert _metadata_fills(vj) == {}
+    assert not any("measure series colours deferred" in w["reason"] for w in res["warnings"])
+
+
+def test_no_datasource_palette_emits_no_measure_series():
+    # Additivity: the same Measure-Names line WITHOUT a datasource palette emits no metadata fill
+    # and carries no measure_colors fact (the report is byte-unchanged from before).
+    ir = parse_twb(_workbook(_ms_line_ws()))
+    assert ir["worksheets"][0]["measure_colors"] is None
+    vj = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert _metadata_fills(vj) == {}
+
+
+# -- KPI / card label colours --------------------------------------------------
+# A recoloured Tableau KPI card writes the category-label colour on its Measure-Names run and the
+# value (big-number) colour + size on its value run, inside a ``customized-label``. These map to the
+# card formatting objects ``categoryLabels`` (label) and ``dataLabels`` (value); bold is not emitted.
+def _card_label_xml():
+    return ("<customized-label><formatted-text>"
+            f"<run fontcolor='{_SALES_HEX}'><![CDATA[<[federated.abc].[:Measure Names]>]]></run>"
+            f"<run bold='true' fontcolor='{_PROFIT_HEX}' fontsize='14'>"
+            "<![CDATA[<[federated.abc].[Multiple Values]>]]></run>"
+            "</formatted-text></customized-label>")
+
+
+def _kpi_card_ws(name="KPIs"):
+    # two measures, no dimension -> a multiRowCard, with a recoloured customized-label.
+    return _worksheet(name, "Bar",
+                      rows="[federated.abc].[sum:Sales:qk]",
+                      cols="[federated.abc].[sum:Profit:qk]",
+                      deps_extra=_INST, pane_extra=_card_label_xml())
+
+
+def test_card_label_colours_parsed_into_ir():
+    ir = parse_twb(_workbook(_kpi_card_ws()))
+    cc = ir["worksheets"][0]["card_label_colors"]
+    assert cc["category_color"] == _SALES_HEX
+    assert cc["value_color"] == _PROFIT_HEX
+    assert cc["value_size"] == "14D"
+
+
+def test_card_label_colours_emit_category_and_data_label_objects():
+    vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(_kpi_card_ws())))).values())[0]
+    assert vj["visual"]["visualType"] == "multiRowCard"
+    objs = vj["visual"]["objects"]
+    cat = objs["categoryLabels"][0]["properties"]["color"]["solid"]["color"]["expr"]["Literal"]["Value"]
+    val = objs["dataLabels"][0]["properties"]["color"]["solid"]["color"]["expr"]["Literal"]["Value"]
+    size = objs["dataLabels"][0]["properties"]["fontSize"]["expr"]["Literal"]["Value"]
+    assert cat == "'{0}'".format(_SALES_HEX)
+    assert val == "'{0}'".format(_PROFIT_HEX)
+    assert size == "14D"
+
+
+def test_card_without_recoloured_label_emits_no_label_objects():
+    # Additivity: a plain KPI card (no customized-label) carries neither card_label_colors nor the
+    # categoryLabels / dataLabels objects.
+    ws = _worksheet("Plain KPIs", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[sum:Profit:qk]",
+                    deps_extra=_INST)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["card_label_colors"] is None
+    vj = list(_visual_parts(emit_pbir(ir)).values())[0]
+    objs = vj["visual"].get("objects", {})
+    assert "categoryLabels" not in objs and "dataLabels" not in objs
 
 
 # -- data labels (Tableau "Show Mark Labels" toggle) ---------------------------

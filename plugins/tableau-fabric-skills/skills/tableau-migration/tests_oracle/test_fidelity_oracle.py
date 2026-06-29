@@ -256,7 +256,9 @@ def test_read_twb_worksheets_and_families():
     assert set(ws) == {"Bars", "Trend", "Card"}
     assert ws["Bars"]["family"] == fo.FAM_BAR
     assert ws["Trend"]["family"] == fo.FAM_AREA and ws["Trend"]["family_asserted"] is True
-    assert ws["Card"]["family"] == fo.FAM_CARD
+    # The "Card" worksheet lays out Measure Names + 2 Measure Values (Discount + My Ratio): that is a
+    # measures TABLE (faithful rebuild = a Power BI table/tableEx), not a single-value card.
+    assert ws["Card"]["family"] == fo.FAM_TABLE
     assert {f["norm"] for f in ws["Bars"]["fields"]} == {"category", "sales", "profit"}
     assert {f["norm"] for f in ws["Bars"]["measures"]} == {"sales", "profit"}
     assert {f["norm"] for f in ws["Bars"]["dims"]} == {"category"}
@@ -265,9 +267,24 @@ def test_read_twb_worksheets_and_families():
 def test_twb_caption_resolution_for_calc_member():
     twb = fo.read_twb_views(TWB_XML)
     card = twb["worksheets"]["Card"]
-    # the Measure Values card resolves [Calculation_99] -> caption 'My Ratio', plus Discount
+    # the Measure Values table resolves [Calculation_99] -> caption 'My Ratio', plus Discount
     norms = {f["norm"] for f in card["fields"]}
     assert "myratio" in norms and "discount" in norms
+
+
+def test_infer_family_measure_table_vs_single_card():
+    # Measure Names + multiple Measure Values is a measures TABLE (faithful rebuild: a Power BI
+    # table/tableEx), so tableEx scores as a type-match rather than a card->table substitution.
+    fam, asserted = fo._infer_twb_family(
+        "Text", [], [{"norm": "sales"}, {"norm": "profit"}], False, True)
+    assert fam == fo.FAM_TABLE and asserted is True
+    # The same shape under an Automatic mark is also a measures table.
+    fam_a, asserted_a = fo._infer_twb_family(
+        "Automatic", [], [{"norm": "sales"}, {"norm": "profit"}], False, True)
+    assert fam_a == fo.FAM_TABLE and asserted_a is True
+    # A single dimensionless Measure Value is still a card, not a table.
+    fam_c, asserted_c = fo._infer_twb_family("Text", [], [{"norm": "sales"}], False, True)
+    assert fam_c == fo.FAM_CARD and asserted_c is True
 
 
 def test_twb_dashboard_zones_normalized():
@@ -480,6 +497,225 @@ def test_score_pair_no_remodel_flag_on_type_mismatch():
     r = fo._score_pair(twb_ws, pbir_visual, None)
     assert r["components"]["type"] == pytest.approx(0.0)
     assert r["diagnosis"] is None
+
+
+# --------------------------------------- geographic map: finest bound geo level satisfies ancestors
+def _geo_map_ws():
+    # A filled-map worksheet: Country/Region + State/Province on Marks detail (lod), Profit on color.
+    return {
+        "name": "Sheet 3", "family": fo.FAM_MAP, "family_asserted": True, "has_geometry": True,
+        "fields": [{"norm": "countryregion", "is_measure": False, "channel": "lod"},
+                   {"norm": "stateprovince", "is_measure": False, "channel": "lod"},
+                   {"norm": "profit", "is_measure": True, "channel": "color"}],
+        "dims": [{"norm": "countryregion", "is_measure": False, "channel": "lod"},
+                 {"norm": "stateprovince", "is_measure": False, "channel": "lod"}],
+        "measures": [{"norm": "profit", "is_measure": True, "channel": "color"}],
+    }
+
+
+def test_geo_rank_known_levels_only():
+    assert fo._geo_rank("countryregion") == 0 and fo._geo_rank("country") == 0
+    assert fo._geo_rank("stateprovince") == 1 and fo._geo_rank("state") == 1
+    assert fo._geo_rank("city") == 3
+    # "region" alone is a categorical group (Central/East/...), not a geocoded level -> non-geo.
+    assert fo._geo_rank("region") is None and fo._geo_rank("sales") is None
+
+
+def test_geo_ancestor_satisfied_when_finer_level_bound():
+    # A filledMap binds State/Province (finest) + Profit. Country/Region (only on detail) is implied
+    # by geocoding the finer level -> not a missing field; the map scores a clean REPRODUCED.
+    ws = _geo_map_ws()
+    v = {"name": "v-map", "visual_type": "filledMap", "family": fo.FAM_MAP,
+         "fields": [{"norm": "stateprovince", "is_measure": False},
+                    {"norm": "profit", "is_measure": True}]}
+    r = fo._score_pair(ws, v, None)
+    assert r["fields_missing"] == [] and "countryregion" not in r["fields_missing"]
+    assert r["geo_implied"] == ["countryregion"]
+    assert r["components"]["type"] == pytest.approx(1.0)
+    assert fo.classify_visual_state(r)[0] == fo.STATE_REPRODUCED
+
+
+def test_geo_ancestor_not_suppressed_when_only_coarser_level_bound():
+    # The honest negative: a Country-grain shapeMap (binds only Country/Region) must NOT have the
+    # finer, genuinely-absent State/Province masked -> it stays missing (a real grain gap).
+    ws = _geo_map_ws()
+    v = {"name": "v-map", "visual_type": "shapeMap", "family": fo.FAM_MAP,
+         "fields": [{"norm": "countryregion", "is_measure": False},
+                    {"norm": "profit", "is_measure": True}]}
+    r = fo._score_pair(ws, v, None)
+    assert "stateprovince" in r["fields_missing"]
+    assert "geo_implied" not in r
+
+
+def test_geo_ancestor_only_on_geographic_map():
+    # Map-gated: the same field shape on a non-map worksheet (no geometry) suppresses nothing.
+    ws = dict(_geo_map_ws())
+    ws["has_geometry"] = False
+    ws["family"] = fo.FAM_TABLE
+    v = {"name": "v-tbl", "visual_type": "tableEx", "family": fo.FAM_TABLE,
+         "fields": [{"norm": "stateprovince", "is_measure": False},
+                    {"norm": "profit", "is_measure": True}]}
+    r = fo._score_pair(ws, v, None)
+    assert "countryregion" in r["fields_missing"]
+    assert "geo_implied" not in r
+
+
+def test_geo_ancestor_on_strong_channel_not_suppressed():
+    # Guard: a coarser geo level carried on an independent encoding (color, not detail) is a real
+    # binding -- a choropleth-by-Country -- so it is never suppressed even under a finer bound level.
+    ws = _geo_map_ws()
+    ws["fields"][0]["channel"] = "color"
+    ws["dims"][0]["channel"] = "color"
+    v = {"name": "v-map", "visual_type": "filledMap", "family": fo.FAM_MAP,
+         "fields": [{"norm": "stateprovince", "is_measure": False},
+                    {"norm": "profit", "is_measure": True}]}
+    r = fo._score_pair(ws, v, None)
+    assert "countryregion" in r["fields_missing"]
+    assert "geo_implied" not in r
+
+
+# ---------------------------------- date axis rebound onto a related Date dimension via active rel
+def _date_rel(from_table, from_col, to_table, to_col, active=True):
+    """Build a normalized relationship record in the shape _parse_tmdl_relationships emits."""
+    return {"active": active, "date_behavior": "datePartOnly",
+            "from_table": from_table, "from_col": from_col, "from_norm": fo._norm(from_col),
+            "to_table": to_table, "to_table_norm": fo._norm(to_table),
+            "to_col": to_col, "to_norm": fo._norm(to_col)}
+
+
+def _date_axis_ws():
+    # An area worksheet: a continuous Order Date axis (date-truncation green pill) + Region small
+    # multiple + Sales/Profit. The rebuild rebinds the continuous order-date axis onto a Date dim.
+    return {
+        "name": "Sheet 2", "family": fo.FAM_AREA, "family_asserted": True, "has_geometry": False,
+        "fields": [{"norm": "orderdate", "is_measure": False, "deriv": "tmn", "continuous": True},
+                   {"norm": "region", "is_measure": False, "deriv": "none"},
+                   {"norm": "sales", "is_measure": True, "deriv": "sum"},
+                   {"norm": "profit", "is_measure": True, "deriv": "sum"}],
+        "dims": [{"norm": "orderdate", "is_measure": False, "deriv": "tmn", "continuous": True},
+                 {"norm": "region", "is_measure": False, "deriv": "none"}],
+        "measures": [{"norm": "sales", "is_measure": True, "deriv": "sum"},
+                     {"norm": "profit", "is_measure": True, "deriv": "sum"}],
+    }
+
+
+def _date_axis_visual():
+    # The rebuilt area: the date axis is bound to Date[Date] (a related dimension), the rest by name.
+    return {"name": "v-area", "visual_type": "areaChart", "family": fo.FAM_AREA,
+            "fields": [{"norm": "date", "is_measure": False, "entity": "Date"},
+                       {"norm": "region", "is_measure": False, "entity": "Orders"},
+                       {"norm": "sales", "is_measure": True, "entity": "Orders"},
+                       {"norm": "profit", "is_measure": True, "entity": "Orders"}]}
+
+
+def test_split_tmdl_colref_variants():
+    assert fo._split_tmdl_colref("Orders.Order_Date") == ("Orders", "Order_Date")
+    assert fo._split_tmdl_colref("'Date Dim'.Date") == ("Date Dim", "Date")
+    assert fo._split_tmdl_colref("Orders.'Order Date'") == ("Orders", "Order Date")
+    assert fo._split_tmdl_colref("") == (None, None)
+
+
+def test_parse_tmdl_relationships_grammar(tmp_path):
+    defn = tmp_path / "definition"
+    defn.mkdir()
+    (defn / "relationships.tmdl").write_text(
+        "relationship aaa\n"
+        "\tjoinOnDateBehavior: datePartOnly\n"
+        "\tfromColumn: Orders.Order_Date\n"
+        "\ttoColumn: Date.Date\n"
+        "\n"
+        "relationship bbb\n"
+        "\tisActive: false\n"
+        "\tfromColumn: Orders.Ship_Date\n"
+        "\ttoColumn: 'Date'.Date\n",
+        encoding="utf-8")
+    rels = fo._parse_tmdl_relationships(str(defn))
+    assert len(rels) == 2
+    a, b = rels
+    assert a["active"] is True and a["from_norm"] == "orderdate" and a["to_table_norm"] == "date"
+    assert a["date_behavior"] == "datePartOnly"
+    assert b["active"] is False and b["from_norm"] == "shipdate" and b["to_table_norm"] == "date"
+
+
+def test_parse_tmdl_relationships_missing_file(tmp_path):
+    # A missing/absent relationships.tmdl (or None) yields [] -> scoring stays relationship-blind.
+    assert fo._parse_tmdl_relationships(str(tmp_path)) == []
+    assert fo._parse_tmdl_relationships(None) == []
+
+
+def test_date_axis_credited_via_active_relationship():
+    # The faithful star pattern: the order-date axis is rebound onto Date[Date], and an ACTIVE
+    # relationship runs Orders.Order_Date -> Date.Date -> the source date field is reproduced.
+    ws, v = _date_axis_ws(), _date_axis_visual()
+    rels = [_date_rel("Orders", "Order_Date", "Date", "Date", active=True)]
+    r = fo._score_pair(ws, v, None, relationships=rels)
+    assert r["date_implied"] == ["orderdate"]
+    assert r["fields_missing"] == []
+    assert r["components"]["type"] == pytest.approx(1.0)
+    assert fo.classify_visual_state(r)[0] == fo.STATE_REPRODUCED
+
+
+def test_date_axis_not_credited_when_only_inactive_relationship():
+    # The honest negative (mirrors geo): an axis backed ONLY by an inactive (isActive:false) rel --
+    # e.g. a secondary Ship Date role-playing relationship -- is NOT credited; orderdate stays
+    # missing and the visual stays PARTIAL, so a real grain/field gap is never masked.
+    ws, v = _date_axis_ws(), _date_axis_visual()
+    rels = [_date_rel("Orders", "Order_Date", "Date", "Date", active=False),
+            _date_rel("Orders", "Ship_Date", "Date", "Date", active=False)]
+    r = fo._score_pair(ws, v, None, relationships=rels)
+    assert "orderdate" in r["fields_missing"]
+    assert "date_implied" not in r
+    assert fo.classify_visual_state(r)[0] == fo.STATE_PARTIAL
+
+
+def test_date_axis_not_credited_when_active_relationship_is_other_field():
+    # Active rel runs from Ship_Date (not the Order Date actually on the axis): the order-date axis
+    # has no active relationship of its own -> it correctly stays missing.
+    ws, v = _date_axis_ws(), _date_axis_visual()
+    rels = [_date_rel("Orders", "Ship_Date", "Date", "Date", active=True)]
+    r = fo._score_pair(ws, v, None, relationships=rels)
+    assert "orderdate" in r["fields_missing"]
+    assert "date_implied" not in r
+
+
+def test_date_axis_not_credited_when_visual_binds_no_date_table():
+    # The active rel exists, but the rebuilt visual binds no Date-dimension entity at all -> there is
+    # no related date table standing in for the dropped axis, so nothing is credited.
+    ws = _date_axis_ws()
+    v = {"name": "v-area", "visual_type": "areaChart", "family": fo.FAM_AREA,
+         "fields": [{"norm": "region", "is_measure": False, "entity": "Orders"},
+                    {"norm": "sales", "is_measure": True, "entity": "Orders"}]}
+    rels = [_date_rel("Orders", "Order_Date", "Date", "Date", active=True)]
+    r = fo._score_pair(ws, v, None, relationships=rels)
+    assert "orderdate" in r["fields_missing"]
+    assert "date_implied" not in r
+
+
+def test_date_implied_only_credits_date_truncation_axes():
+    # A non-date categorical dim the rebuild dropped is NOT laundered by a relationship: only a
+    # date-truncation axis qualifies, so the implied credit cannot mask an ordinary field gap.
+    ws = {
+        "name": "Sheet X", "family": fo.FAM_BAR, "family_asserted": True, "has_geometry": False,
+        "fields": [{"norm": "segment", "is_measure": False, "deriv": "none"},
+                   {"norm": "sales", "is_measure": True, "deriv": "sum"}],
+        "dims": [{"norm": "segment", "is_measure": False, "deriv": "none"}],
+        "measures": [{"norm": "sales", "is_measure": True, "deriv": "sum"}],
+    }
+    v = {"name": "v", "visual_type": "barChart", "family": fo.FAM_BAR,
+         "fields": [{"norm": "segmentkey", "is_measure": False, "entity": "SegmentDim"},
+                    {"norm": "sales", "is_measure": True, "entity": "Orders"}]}
+    rels = [_date_rel("Orders", "Segment", "SegmentDim", "SegmentKey", active=True)]
+    r = fo._score_pair(ws, v, None, relationships=rels)
+    assert "segment" in r["fields_missing"]
+    assert "date_implied" not in r
+
+
+def test_date_implied_noop_without_relationships():
+    # Default (relationship-blind) scoring is unchanged: no relationships -> orderdate stays missing.
+    ws, v = _date_axis_ws(), _date_axis_visual()
+    r = fo._score_pair(ws, v, None)
+    assert "orderdate" in r["fields_missing"]
+    assert "date_implied" not in r
 
 
 def test_assemble_report_counts_remodel_suspected():

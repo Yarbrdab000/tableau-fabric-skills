@@ -608,6 +608,12 @@ def _is_continuous_date_dim(field):
     return bool(field.get("continuous")) and (field.get("deriv") or "") in _DATE_TRUNC_DERIVS
 
 
+def _distinct_measure_count(measures):
+    """Count distinct measures on a worksheet by normalized name (a Measure Names/Values layout
+    lists each measure once); used to tell a single-value card from a multi-measure table."""
+    return len({(m.get("norm") or "") for m in (measures or []) if isinstance(m, dict)})
+
+
 def _infer_twb_family(mark, dims, measures, has_geometry, uses_measure_values):
     """Second-opinion chart-family classifier for a Tableau worksheet.
 
@@ -624,10 +630,12 @@ def _infer_twb_family(mark, dims, measures, has_geometry, uses_measure_values):
         return (FAM_MATRIX, True) if dims else (FAM_UNKNOWN, False)
     if mlow in _MARK_FAMILY and mlow != "automatic":
         fam = _MARK_FAMILY[mlow]
-        # A Text mark with no dimensions is a card, not a table.
-        if fam == FAM_TABLE and not dims and not uses_measure_values:
-            return FAM_CARD, True
-        if fam == FAM_TABLE and uses_measure_values and not dims:
+        # A dimensionless Text mark is a card -- UNLESS it lays out Measure Names + multiple Measure
+        # Values, which is a measures TABLE (its faithful rebuild is a Power BI table/tableEx, not a
+        # multiRowCard); a single dimensionless value stays a card.
+        if fam == FAM_TABLE and not dims:
+            if uses_measure_values and _distinct_measure_count(measures) >= 2:
+                return FAM_TABLE, True
             return FAM_CARD, True
         return fam, True
     # Automatic: infer from shelf shape (Tableau's own default heuristic, applied conservatively).
@@ -636,6 +644,9 @@ def _infer_twb_family(mark, dims, measures, has_geometry, uses_measure_values):
     if any(_is_continuous_date_dim(d) for d in dims) and (measures or len(dims) == 1):
         return FAM_LINE, True
     if uses_measure_values and not dims:
+        # Measure Names + multiple Measure Values is a measures TABLE; a single value is a card.
+        if _distinct_measure_count(measures) >= 2:
+            return FAM_TABLE, True
         return FAM_CARD, True
     if not dims and measures:
         return FAM_CARD, True
@@ -893,6 +904,106 @@ def _field_norms(fields):
     return {f["norm"] for f in fields if f.get("norm")}
 
 
+# Standard geographic drill hierarchy (coarse -> fine), by normalized field name. A filled/choropleth
+# map geocodes its finest level *within* its ancestors, and Tableau auto-adds the whole hierarchy to
+# the Marks "Detail" (lod) card -- so a coarser geo ancestor sitting only on detail is implied by the
+# geocoding of the finer level, not an independent visual encoding the rebuild must reproduce. This is
+# the general geographic-role principle; "region" alone is excluded because Tableau's Superstore
+# "Region" (Central/East/West/South) is a categorical group, not a geocoded map level.
+_GEO_LEVEL_RANK = {
+    "country": 0, "countryregion": 0, "nation": 0,
+    "state": 1, "stateprovince": 1, "province": 1,
+    "county": 2,
+    "city": 3,
+    "postalcode": 4, "zipcode": 4, "zippostalcode": 4,
+}
+
+# Marks channels that merely carry a geocoding-implied geo ancestor (vs an independent encoding such
+# as color/size/label/path or a rows/cols axis, which would make a coarser level a real binding).
+_GEO_IMPLIED_CHANNELS = frozenset({"lod", "detail"})
+
+
+def _geo_rank(norm):
+    """Return a field's geographic-drill rank (smaller = coarser), or None if it is not a geo level."""
+    return _GEO_LEVEL_RANK.get(norm)
+
+
+def _suppressed_geo_ancestors(twb_ws, pbir_visual):
+    """Source geo dims that a faithful map rebuild does NOT need to project independently.
+
+    For a geographic map worksheet, if the rebuilt visual binds a source geo level (e.g.
+    State/Province), any *coarser* same-hierarchy ancestor (e.g. Country/Region) that the Tableau
+    sheet carries only on the Marks detail/lod card is satisfied by geocoding the finer level -- so
+    it must not be charged as a "missing" field. Map-gated (``has_geometry``), detail-only, and tied
+    to a finest level that is itself a bound source geo dim, so it cannot mask a genuine grain
+    mismatch or touch any non-map visual.
+    """
+    if not twb_ws.get("has_geometry"):
+        return set()
+    tgt = _field_norms(pbir_visual.get("fields") or [])
+    # Finest source geo level that the rebuild actually bound (rank; larger = finer).
+    bound_src_ranks = [r for f in twb_ws.get("dims") or []
+                       for r in (_geo_rank(f.get("norm")),)
+                       if r is not None and f.get("norm") in tgt]
+    if not bound_src_ranks:
+        return set()
+    finest_bound = max(bound_src_ranks)
+    suppressed = set()
+    for f in twb_ws.get("dims") or []:
+        norm = f.get("norm")
+        rank = _geo_rank(norm)
+        if rank is None or rank >= finest_bound or norm in tgt:
+            continue
+        if (f.get("channel") or "").lower() in _GEO_IMPLIED_CHANNELS:
+            suppressed.add(norm)
+    return suppressed
+
+
+def _date_implied_sources(twb_ws, pbir_visual, relationships):
+    """Source date axes a faithful rebuild satisfies via an ACTIVE model date relationship.
+
+    When a Tableau worksheet carries a continuous date-truncation axis (e.g. ``Order Date``) that the
+    rebuilt visual does NOT bind by name, but the visual instead binds a related ``Date`` dimension
+    table, credit the source date field as reproduced IFF an **ACTIVE** relationship runs from that
+    exact source date column to the Date table the visual binds. This is the documented Power BI star
+    pattern -- the engine rebinds the continuous order-date axis onto a proper ``Date`` dimension
+    whose ACTIVE relationship (``Orders.Order_Date -> Date.Date``) makes it display identical values
+    to Tableau's "Order Date" axis.
+
+    Honesty gate (mirrors the geo-implied principle, but on live directional relationship evidence):
+    an axis backed only by an **INACTIVE** relationship (e.g. a secondary ``Ship_Date`` role-playing
+    rel ``isActive: false``) or by an UNRELATED date table is NOT credited -- the source date field
+    correctly stays a missing binding, so a real grain/field gap is never masked. Returns ``set()``
+    whenever no relationships are supplied, so the default (relationship-blind) scoring is unchanged.
+    """
+    if not relationships:
+        return set()
+    fields = pbir_visual.get("fields") or []
+    tgt = _field_norms(fields)
+    # Tables the rebuilt visual binds as a (non-measure) dimension axis, by normalized entity name.
+    bound_dim_entities = {
+        _norm(f.get("entity")) for f in fields
+        if not f.get("is_measure") and f.get("entity")
+    }
+    if not bound_dim_entities:
+        return set()
+    active_rels = [r for r in relationships
+                   if r.get("active") and r.get("from_norm") and r.get("to_table_norm")]
+    if not active_rels:
+        return set()
+    credited = set()
+    for f in twb_ws.get("dims") or []:
+        norm = f.get("norm")
+        # Only a source DATE-truncation axis the rebuild did not bind by name is a candidate.
+        if not norm or norm in tgt or (f.get("deriv") or "") not in _DATE_TRUNC_DERIVS:
+            continue
+        for r in active_rels:
+            if r["from_norm"] == norm and r["to_table_norm"] in bound_dim_entities:
+                credited.add(norm)
+                break
+    return credited
+
+
 def _type_score(twb_ws, pbir_visual):
     src = twb_ws["family"]
     tgt = pbir_visual["family"]
@@ -984,12 +1095,28 @@ def _placement_delta(zone, pbir_visual, canvas_w, canvas_h):
     }
 
 
-def _score_pair(twb_ws, pbir_visual, zone, canvas_w=None, canvas_h=None):
+def _score_pair(twb_ws, pbir_visual, zone, canvas_w=None, canvas_h=None, relationships=None):
     type_s, type_note = _type_score(twb_ws, pbir_visual)
-    src_fields = _field_norms(twb_ws["fields"])
+    # On a geographic map, a coarser geo ancestor carried only on Marks detail is implied by
+    # geocoding the finer bound level (see _suppressed_geo_ancestors) -- drop it from the scored
+    # source set so a faithful map is not charged for "omitting" Country/Region above State/Province.
+    geo_implied = _suppressed_geo_ancestors(twb_ws, pbir_visual)
+    # A continuous date axis the rebuild rebinds onto a related Date dimension is reproduced when an
+    # ACTIVE model relationship runs from the source date column to that Date table (see
+    # _date_implied_sources) -- drop it from the scored source set so a faithful star-schema date
+    # rebind is not charged as a "missing" Order Date. Inactive/unrelated rels are NOT credited.
+    date_implied = _date_implied_sources(twb_ws, pbir_visual, relationships)
+    suppressed = geo_implied | date_implied
+    if suppressed:
+        scored_ws = dict(twb_ws)
+        scored_ws["fields"] = [f for f in twb_ws["fields"] if f.get("norm") not in suppressed]
+        scored_ws["dims"] = [f for f in twb_ws["dims"] if f.get("norm") not in suppressed]
+    else:
+        scored_ws = twb_ws
+    src_fields = _field_norms(scored_ws["fields"])
     tgt_fields = _field_norms(pbir_visual["fields"])
     field_s = _jaccard(src_fields, tgt_fields)
-    roles_s = _roles_score(twb_ws, pbir_visual)
+    roles_s = _roles_score(scored_ws, pbir_visual)
     pos_s = _position_score(zone, pbir_visual)
 
     weights = {"type": W_TYPE, "fields": W_FIELDS, "roles": W_ROLES}
@@ -1025,6 +1152,12 @@ def _score_pair(twb_ws, pbir_visual, zone, canvas_w=None, canvas_h=None):
         "fields_missing": missing,   # in Tableau source, absent from rebuilt visual
         "fields_extra": extra,       # in rebuilt visual, absent from Tableau source
     }
+    if geo_implied:
+        # Coarser geo ancestors satisfied by geocoding the finer bound level (not counted missing).
+        result["geo_implied"] = sorted(geo_implied)
+    if date_implied:
+        # Source date axes reproduced via an ACTIVE model relationship onto a related Date dimension.
+        result["date_implied"] = sorted(date_implied)
     placement = _placement_delta(zone, pbir_visual, canvas_w, canvas_h)
     if placement is not None:
         result["placement"] = placement
@@ -1134,7 +1267,7 @@ def _apply_field_aliases(pbir, field_aliases):
     return remapped
 
 
-def score_report(twb, pbir, engine_report=None, field_aliases=None):
+def score_report(twb, pbir, engine_report=None, field_aliases=None, relationships=None):
     """Score a parsed Tableau workbook against a parsed PBIR report. Both come from the readers above.
 
     Pairs each Tableau dashboard to the PBIR page sharing its display name, greedily matches that
@@ -1145,6 +1278,11 @@ def score_report(twb, pbir, engine_report=None, field_aliases=None):
     ``field_aliases`` (optional ``{emitted queryRef -> Tableau caption}``, e.g. from
     ``aliases_from_candidate_records``) lets the field/role components see through a faithful
     star-schema rename before name overlap is computed. Omitting it leaves scoring exactly as-is.
+
+    ``relationships`` (optional, from ``_parse_tmdl_relationships``) supplies the emitted model's
+    ACTIVE/inactive relationship edges so a continuous date axis rebound onto a related ``Date``
+    dimension can be credited as reproducing its source date field (see ``_date_implied_sources``).
+    Omitting it (the default) leaves scoring relationship-blind and therefore exactly as-is.
     """
     alias_resolved = _apply_field_aliases(pbir, field_aliases) if field_aliases else 0
     ws_by_name = twb["worksheets"]
@@ -1174,7 +1312,8 @@ def score_report(twb, pbir, engine_report=None, field_aliases=None):
             ws = ws_by_name[wsn]
             v = vidx[vn]
             zone = zone_by_ws.get(wsn)
-            res = _score_pair(ws, v, zone, page.get("width"), page.get("height"))
+            res = _score_pair(ws, v, zone, page.get("width"), page.get("height"),
+                              relationships=relationships)
             res["page"] = page["display"]
             res["dashboard"] = dash["name"]
             res["engine_intent"] = engine_intent.get(wsn)
@@ -1212,7 +1351,7 @@ def score_report(twb, pbir, engine_report=None, field_aliases=None):
                 best = (sim, p, v)
         if best and best[0] > 0.0:
             _sim, p, v = best
-            res = _score_pair(ws, v, None)
+            res = _score_pair(ws, v, None, relationships=relationships)
             res["page"] = p["display"]
             res["dashboard"] = None
             res["engine_intent"] = engine_intent.get(wsn)
@@ -1472,6 +1611,140 @@ def _assemble_report(twb, pbir, visual_results, slicer_results,
         "extra_visuals_detail": extra_visuals,
         "dashboard_objects_detail": dashboard_objects,
         "notes": notes,
+    }
+
+
+# =====================================================================================
+# Per-visual fidelity verdict: the migration loop's objective function
+# =====================================================================================
+# The structural tier above scores each paired visual on a 0..1 continuum. The fidelity *loop*
+# wants a coarse, honest, per-visual VERDICT it can read at a glance and optimize toward. This
+# layer reduces a structural per-visual record to one of four states:
+#   REPRODUCED -- exact chart family AND every source field present (a faithful rebuild).
+#   PARTIAL    -- recognizable but not faithful: exact family with some source fields missing, OR a
+#                 related/soft-typed substitution (e.g. an area sheet rebuilt as a line) with the
+#                 full source field set intact.
+#   DEGRADED   -- a material visual-fidelity loss: wrong chart family (e.g. a map rebuilt as a
+#                 table), none of the source fields reproduced, or a soft-typed pairing that also
+#                 dropped source fields.
+#   MISSING    -- the Tableau worksheet has no paired Power BI visual at all.
+# It is DETERMINISTIC and derived ENTIRELY from the structural per-visual record (no new parsing)
+# and never feeds the structural aggregate, the combined headline, or any calibration -- it is a
+# separate, additive, advisory read layered on top of score_report's output.
+STATE_REPRODUCED = "REPRODUCED"
+STATE_PARTIAL = "PARTIAL"
+STATE_DEGRADED = "DEGRADED"
+STATE_MISSING = "MISSING"
+# Advisory loop-credit per state: lets the loop reduce the four-state verdicts to one objective
+# number to optimize. Faithful=1.0, recognizable=0.5, lossy=0.25, absent=0.0.
+_STATE_CREDIT = {STATE_REPRODUCED: 1.0, STATE_PARTIAL: 0.5, STATE_DEGRADED: 0.25, STATE_MISSING: 0.0}
+
+
+def classify_visual_state(visual_result):
+    """Map one structural per-visual record (a :func:`_score_pair` dict) to a coarse fidelity state.
+
+    Reads only keys the structural tier already emits: ``components.type`` (1.0 exact-family,
+    ``0 < c < 1`` related/soft, 0.0 asserted-mismatch), ``type_note`` (to tell a related
+    substitution apart from a type-indeterminate pairing) and ``fields_matched`` / ``fields_missing``.
+    Deterministic; never raises. Returns ``(state, reason)``.
+    """
+    comp = visual_result.get("components") or {}
+    type_s = comp.get("type")
+    note = visual_result.get("type_note") or ""
+    matched = visual_result.get("fields_matched") or []
+    missing = visual_result.get("fields_missing") or []
+    type_exact = type_s is not None and type_s >= 1.0
+    type_related = note.startswith("type-related")
+    # Asserted wrong family (both sides typed, families differ) is a clear visual-fidelity loss.
+    if type_s == 0.0:
+        return STATE_DEGRADED, "wrong chart type: %s" % (note or "family mismatch")
+    # A paired visual that carries NONE of the source fields is degraded regardless of type.
+    if not matched:
+        return STATE_DEGRADED, "no source field reproduced on the rebuilt visual"
+    if type_exact:
+        if not missing:
+            return STATE_REPRODUCED, "exact chart type; all %d source field(s) present" % len(matched)
+        return STATE_PARTIAL, "exact chart type; %d source field(s) missing" % len(missing)
+    # Soft type (related family, indeterminate, or unasserted) with matched fields.
+    if not missing:
+        if type_related:
+            return STATE_PARTIAL, "related chart-type substitution (%s); all source fields present" % note
+        return STATE_PARTIAL, "%s; all source fields present" % (note or "soft type match")
+    return STATE_DEGRADED, "%s with %d source field(s) missing" % (note or "soft type", len(missing))
+
+
+def _per_visual_record(v):
+    """Compact per-visual verdict record built from a structural :func:`_score_pair` result."""
+    state, reason = classify_visual_state(v)
+    return {
+        "worksheet": v.get("worksheet"),
+        "visual": v.get("visual"),
+        "visual_type": v.get("visual_type"),
+        "state": state,
+        "reason": reason,
+        "score": v.get("score"),
+        "band": v.get("band"),
+        "type_note": v.get("type_note"),
+        "components": v.get("components"),
+        "fields_missing": v.get("fields_missing"),
+        "fields_extra": v.get("fields_extra"),
+        "diagnosis": v.get("diagnosis"),
+    }
+
+
+def _missing_record(name, reason):
+    return {"worksheet": name, "visual": None, "visual_type": None, "state": STATE_MISSING,
+            "reason": reason, "score": None, "band": None, "type_note": None, "components": None,
+            "fields_missing": None, "fields_extra": None, "diagnosis": None}
+
+
+def per_visual_fidelity(report, on_view=None):
+    """Reduce a structural :func:`score_report` result to a per-visual
+    REPRODUCED / PARTIAL / DEGRADED / MISSING verdict list -- the migration loop's objective function.
+
+    ``on_view`` (optional) restricts scoring to a set/list of Tableau worksheet names (the
+    dashboard's on-view sheets); an on-view worksheet that has no paired visual -- whether it landed
+    in ``summary.unmatched_worksheets`` or was never parsed at all -- is still reported MISSING.
+    When ``on_view`` is ``None`` every matched visual and every unmatched worksheet is scored.
+    Off-view worksheets (and off-view calcs by construction) are ignored.
+
+    Additive + advisory: never mutates ``report`` and never raises. Returns a dict with the per-visual
+    ``verdicts``, a four-state ``tally``, and an advisory ``objective_score`` (the credit-weighted mean).
+    """
+    want = None if on_view is None else {_norm(n): n for n in on_view if n}
+    verdicts = []
+    seen = set()
+    for v in report.get("visuals", []) or []:
+        ws = v.get("worksheet")
+        if want is not None and _norm(ws) not in want:
+            continue
+        seen.add(_norm(ws))
+        verdicts.append(_per_visual_record(v))
+    summary = report.get("summary") or {}
+    for ws in summary.get("unmatched_worksheets", []) or []:
+        if want is not None and _norm(ws) not in want:
+            continue
+        seen.add(_norm(ws))
+        verdicts.append(_missing_record(ws, "no paired Power BI visual"))
+    if want is not None:
+        for nk, name in want.items():
+            if nk not in seen:
+                verdicts.append(_missing_record(name, "worksheet not found in the rebuild"))
+    tally = {STATE_REPRODUCED: 0, STATE_PARTIAL: 0, STATE_DEGRADED: 0, STATE_MISSING: 0}
+    for r in verdicts:
+        tally[r["state"]] = tally.get(r["state"], 0) + 1
+    n = len(verdicts)
+    objective = round(sum(_STATE_CREDIT[r["state"]] for r in verdicts) / n, 4) if n else None
+    verdicts.sort(key=lambda r: (_STATE_CREDIT[r["state"]], r["worksheet"] or ""))
+    return {
+        "tier": "per-visual",
+        "advisory": True,
+        "scoped_to": (list(want.values()) if want is not None else "all-matched+unmatched"),
+        "scored_visuals": n,
+        "tally": tally,
+        "objective_score": objective,
+        "state_credit": dict(_STATE_CREDIT),
+        "verdicts": verdicts,
     }
 
 
@@ -2610,6 +2883,689 @@ def openability_tier(report_dir=None, model_dir=None, tabular_editor_dir=None):
 
 
 # =====================================================================================
+# Deterministic advisory tier: metadata / binding fidelity (emitted TMDL vs Tableau source)
+# =====================================================================================
+# Stdlib-only and offline -- no Power BI Desktop, no Analysis Services, no credentials. It re-reads
+# the emitted ``*.SemanticModel`` TMDL with its OWN line reader (never the engine's emitter) and the
+# Tableau ``.twb``/``.tds`` column schema with ElementTree, then cross-references three things:
+#   * DATATYPE DRIFT  -- an emitted physical column's ``dataType`` vs the mapped Tableau source type.
+#   * BINDING RESOLUTION -- every ``'Table'[Column]`` / ``[Column]`` reference inside a measure body,
+#     a calculated-column body, or a calculated-table partition ``source`` resolves to a real model
+#     column or measure. This is the static catch for the whole UNRESOLVABLE-REF defect class: a
+#     sanitized-name mismatch (``[State/Province]`` vs ``[State_Province]``), or a window function
+#     (OFFSET / WINDOW / INDEX) whose ORDERBY/relation points at a column that is not in the model
+#     ("cross-table" defect) -- both surface here as an unresolved binding BEFORE any live fire.
+#   * COVERAGE -- Tableau source columns absent from the model (dropped), and physical model columns
+#     with no Tableau source (added).
+# Advisory and tolerance-banded like every other tier; it does NOT feed the combined headline, so it
+# can never move calibration -- it is a separate, fail-loud pre-fire fidelity gate.
+
+# A Tableau scalar datatype maps to the TMDL ``dataType`` the engine should land. The COMPATIBLE sets
+# keep faithful cross-engine widenings (a Tableau ``date`` landing as ``dateTime``; an ``integer``
+# measure summarized as ``double``) from reading as drift -- only a genuine family change is flagged.
+_TABLEAU_TO_TMDL_DTYPE = {
+    "integer": "int64",
+    "real": "double",
+    "string": "string",
+    "boolean": "boolean",
+    "date": "dateTime",
+    "datetime": "dateTime",
+}
+_DTYPE_COMPATIBLE = {
+    "int64": {"int64", "double", "decimal"},
+    "double": {"double", "decimal", "int64"},
+    "decimal": {"decimal", "double", "int64"},
+    "dateTime": {"dateTime", "date"},
+    "date": {"date", "dateTime"},
+    "string": {"string"},
+    "boolean": {"boolean"},
+}
+# A column reference: ``'Quoted Table'[Col]``, ``Table[Col]``, or a bare ``[Col]`` (measure / context
+# column). DAX string literals use double quotes, so a bracket pair is always an identifier ref.
+_DAX_REF_RE = re.compile(r"(?:'(?P<tq>[^']+)'|(?P<tb>[A-Za-z_]\w*))?\s*\[(?P<col>[^\]]+)\]")
+# Window/navigation functions whose arguments routinely reach ACROSS tables -- an unresolved ref here
+# is exactly the recent cross-table defect class, so it is tagged for fail-loud emphasis.
+_DAX_WINDOW_FUNCS = ("OFFSET", "WINDOW", "INDEX", "RANK", "ROWNUMBER", "MOVINGAVERAGE", "RUNNINGSUM")
+
+
+def _tmdl_unquote(token):
+    """Strip TMDL single-quote object quoting (``'Dim Swap Calc 1'`` -> ``Dim Swap Calc 1``)."""
+    token = (token or "").strip()
+    if len(token) >= 2 and token.startswith("'") and token.endswith("'"):
+        return token[1:-1].replace("''", "'")
+    return token
+
+
+def _extract_dax_refs(expression):
+    """Yield ``(table_or_None, column)`` for each column/measure reference in a DAX string."""
+    for m in _DAX_REF_RE.finditer(expression or ""):
+        table = m.group("tq") or m.group("tb")
+        yield (table, m.group("col"))
+
+
+# The navigation clauses inside a window function whose column argument fixes the SORT and the GROUP
+# the window walks over. The semantic rule (matched to the engine's own positional-measure fix): a
+# window's ORDERBY column must live in the SAME table the window partitions / aggregates -- a
+# resolvable-but-cross-table ORDERBY (e.g. ``ORDERBY('Date'[Date])`` over an ``'Orders'`` aggregate)
+# is invalid at query time even though every column reference exists, so pure binding resolution
+# cannot see it. This is the deterministic, offline catch for that class.
+_ORDERBY_CLAUSE_RE = re.compile(r"ORDERBY\s*\(", re.IGNORECASE)
+_PARTITIONBY_CLAUSE_RE = re.compile(r"PARTITIONBY\s*\(", re.IGNORECASE)
+# A single-quoted token in DAX is ALWAYS a table identifier (string literals use double quotes), so
+# this captures table-only references like ``COUNTROWS('Orders')`` / ``ALLEXCEPT('Orders', ...)`` that
+# carry no bracketed column and are therefore invisible to ``_extract_dax_refs``.
+_DAX_TABLE_TOKEN_RE = re.compile(r"'([^']+)'")
+
+
+def _balanced_paren_arg(expression, open_idx):
+    """Return the substring inside the parentheses whose ``(`` is at ``open_idx`` (balanced)."""
+    depth = 0
+    for i in range(open_idx, len(expression)):
+        ch = expression[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return expression[open_idx + 1:i]
+    return expression[open_idx + 1:]
+
+
+def _clause_tables(expression, clause_re):
+    """Set of explicitly-qualified table names referenced inside every ``clause_re`` invocation."""
+    tables = set()
+    for m in clause_re.finditer(expression or ""):
+        arg = _balanced_paren_arg(expression, m.end() - 1)
+        for tbl, _col in _extract_dax_refs(arg):
+            if tbl:
+                tables.add(tbl.strip())
+    return tables
+
+
+def _strip_clause(expression, clause_re):
+    """Remove every balanced ``clause_re(...)`` invocation, leaving the surrounding body intact."""
+    out = expression or ""
+    while True:
+        m = clause_re.search(out)
+        if not m:
+            return out
+        open_idx = m.end() - 1
+        depth = 0
+        close = None
+        for i in range(open_idx, len(out)):
+            if out[i] == "(":
+                depth += 1
+            elif out[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    close = i
+                    break
+        if close is None:
+            return out[:m.start()]
+        out = out[:m.start()] + out[close + 1:]
+
+
+def _all_table_tokens(text):
+    """Every table identifier in ``text``: quoted ``'Table'`` tokens plus the table of any
+    ``Table[Col]`` / ``'Table'[Col]`` bracketed reference. Catches table-only refs (``COUNTROWS(
+    'Orders')``) that carry no column."""
+    tables = {t.strip() for t in _DAX_TABLE_TOKEN_RE.findall(text or "")}
+    for tbl, _col in _extract_dax_refs(text or ""):
+        if tbl:
+            tables.add(tbl.strip())
+    return tables
+
+
+def _mask_dax_string_literals(expression):
+    """Blank out DAX string literals (double-quoted; ``""`` is an escaped inner quote) with
+    same-length spaces so any ``ORDERBY(`` / ``PARTITIONBY(`` / bracket / single-quote that appears
+    INSIDE a string can never be mis-parsed as a real navigation clause or table/column reference.
+    Length is preserved exactly so the balanced-paren index math downstream stays valid. Returns the
+    input unchanged when it carries no string literal."""
+    if not expression or '"' not in expression:
+        return expression or ""
+    out = []
+    in_str = False
+    i = 0
+    n = len(expression)
+    while i < n:
+        ch = expression[i]
+        if in_str:
+            if ch == '"':
+                if i + 1 < n and expression[i + 1] == '"':  # "" -> escaped quote, stay in string
+                    out.append("  ")
+                    i += 2
+                    continue
+                out.append(" ")
+                in_str = False
+            else:
+                out.append(" ")
+        elif ch == '"':
+            out.append(" ")
+            in_str = True
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _window_cross_table_findings(home_table, kind, obj_name, expression):
+    """Flag a window-function ORDERBY whose table is not the table the window groups/aggregates.
+
+    Conservative + deterministic: explicit-table refs only (a bare ``[Col]`` ORDERBY never flags),
+    and a finding is raised only when there is a contradicting anchor table (a PARTITIONBY column or
+    a non-ORDERBY body reference on a DIFFERENT table). A same-table ORDERBY -- the corrected form --
+    never flags. String literals are masked first so a clause/ref quoted inside a DAX string cannot
+    raise a false alarm. Returns a possibly-empty list; never raises."""
+    if not expression:
+        return []
+    scan = _mask_dax_string_literals(expression)
+    if not any(fn in scan.upper() for fn in _DAX_WINDOW_FUNCS):
+        return []
+    order_tables = _clause_tables(scan, _ORDERBY_CLAUSE_RE)
+    if not order_tables:
+        return []
+    part_tables = _clause_tables(scan, _PARTITIONBY_CLAUSE_RE)
+    body = _strip_clause(scan, _ORDERBY_CLAUSE_RE)
+    body_tables = _all_table_tokens(body)
+    anchor = part_tables | body_tables
+    if not anchor:
+        return []
+    findings = []
+    for ot in sorted(order_tables):
+        if ot not in anchor:
+            findings.append({
+                "table": home_table, "object": obj_name, "kind": kind,
+                "orderby_table": ot, "anchor_tables": sorted(anchor),
+                "partition_tables": sorted(part_tables),
+                "reason": ("window-function ORDERBY references table '%s' but the window "
+                           "partitions/aggregates over %s -- a cross-table ORDERBY is invalid at "
+                           "query/refresh time even though every column resolves"
+                           % (ot, sorted(anchor))),
+            })
+    return findings
+
+
+def _parse_tmdl_model(definition_dir):
+    """Parse ``definition/tables/*.tmdl`` into a light model with its own stdlib line reader.
+
+    Returns ``{"definition", "tables": {name: {...}}}`` where each table carries ``physical_columns``
+    (``{name, data_type, source_column}``), ``calc_columns`` / ``measures`` (``{name, expression}``),
+    and ``partition_sources`` (calculated-partition ``source`` bodies). The expression-bearing
+    objects feed binding resolution; the physical columns feed datatype/coverage. Never raises on a
+    malformed file -- a file that cannot be read is skipped."""
+    tables_dir = os.path.join(definition_dir, "tables")
+    if not os.path.isdir(tables_dir):
+        tables_dir = definition_dir
+    model = {"definition": os.path.abspath(definition_dir), "tables": {}}
+    try:
+        names = sorted(os.listdir(tables_dir))
+    except OSError:
+        return model
+    for fname in names:
+        if not fname.lower().endswith(".tmdl"):
+            continue
+        try:
+            with open(os.path.join(tables_dir, fname), "r", encoding="utf-8-sig") as fh:
+                lines = fh.read().replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        except OSError:
+            continue
+        _parse_tmdl_table_lines(lines, model)
+    return model
+
+
+def _split_tmdl_colref(ref):
+    """Split a TMDL column reference into ``(table, column)``.
+
+    Handles bare ``Orders.Order_Date`` as well as single-quoted object names on either side
+    (``'Date Dim'.Date`` / ``Orders.'Order Date'``), including a dotted name inside the quotes.
+    Returns ``(None, None)`` for an empty/garbage reference.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return None, None
+    if ref.startswith("'"):
+        end = ref.find("'", 1)
+        if end == -1:
+            return _tmdl_unquote(ref), None
+        table = ref[1:end].replace("''", "'")
+        rest = ref[end + 1:].lstrip()
+        if rest.startswith("."):
+            rest = rest[1:].strip()
+        return table, (_tmdl_unquote(rest) if rest else None)
+    if "." in ref:
+        table, col = ref.split(".", 1)
+        return _tmdl_unquote(table), _tmdl_unquote(col)
+    return _tmdl_unquote(ref), None
+
+
+def _parse_tmdl_relationships(definition_dir):
+    """Parse ``definition/relationships.tmdl`` into a list of normalized relationship records.
+
+    Each record is ``{from_table, from_col, from_norm, to_table, to_table_norm, to_col, to_norm,
+    active, date_behavior}``. ``active`` defaults to ``True`` -- a TMDL relationship is active unless
+    it declares ``isActive: false`` -- which is exactly the directional/active evidence the date-axis
+    credit (see ``_date_implied_sources``) gates on. Stdlib-only, own line reader; never raises -- a
+    missing or unreadable file yields ``[]`` so scoring degrades to relationship-blind.
+    """
+    if not definition_dir:
+        return []
+    path = os.path.join(definition_dir, "relationships.tmdl")
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            lines = fh.read().replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    except OSError:
+        return []
+    rels = []
+    cur = None
+
+    def _flush(rec):
+        if rec and rec.get("from_col") and rec.get("to_col"):
+            rels.append(rec)
+
+    for raw in lines:
+        content = raw.strip()
+        if not content:
+            continue
+        if content.startswith("relationship "):
+            _flush(cur)
+            cur = {"active": True, "date_behavior": None,
+                   "from_table": None, "from_col": None, "from_norm": None,
+                   "to_table": None, "to_table_norm": None, "to_col": None, "to_norm": None}
+            continue
+        if cur is None or ":" not in content:
+            continue
+        key, val = content.split(":", 1)
+        key = key.strip().lower()
+        val = val.strip()
+        if key == "isactive":
+            cur["active"] = val.lower() not in ("false", "0", "no")
+        elif key == "joinondatebehavior":
+            cur["date_behavior"] = val or None
+        elif key == "fromcolumn":
+            t, c = _split_tmdl_colref(val)
+            cur["from_table"], cur["from_col"], cur["from_norm"] = t, c, (_norm(c) if c else None)
+        elif key == "tocolumn":
+            t, c = _split_tmdl_colref(val)
+            cur["to_table"], cur["to_col"] = t, c
+            cur["to_table_norm"] = _norm(t) if t else None
+            cur["to_norm"] = _norm(c) if c else None
+    _flush(cur)
+    return rels
+
+
+def _parse_tmdl_table_lines(lines, model):
+    """Stateful single pass over one TMDL file's lines, folding tables into ``model``."""
+    cur = None            # current table record
+    obj = None            # ("physcol", dict) | ("partition", dict) | None -- the open child
+    capturing = False     # inside a calculated-partition ``source`` block
+    for raw in lines:
+        indent = len(raw) - len(raw.lstrip("\t"))
+        content = raw.strip()
+        if not content:
+            continue
+        if indent == 0 and content.startswith("table "):
+            name = _tmdl_unquote(content[len("table "):])
+            cur = {"name": name, "physical_columns": [], "calc_columns": [],
+                   "measures": [], "partition_sources": []}
+            model["tables"][name] = cur
+            obj, capturing = None, False
+            continue
+        if cur is None:
+            continue
+        if indent == 1:
+            obj, capturing = None, False
+            if content.startswith("column "):
+                rest = content[len("column "):]
+                if _looks_like_assignment(rest):
+                    name, expr = rest.split("=", 1)
+                    cur["calc_columns"].append(
+                        {"name": _tmdl_unquote(name), "expression": expr.strip()})
+                else:
+                    col = {"name": _tmdl_unquote(rest), "data_type": None, "source_column": None}
+                    cur["physical_columns"].append(col)
+                    obj = ("physcol", col)
+            elif content.startswith("measure "):
+                rest = content[len("measure "):]
+                if _looks_like_assignment(rest):
+                    name, expr = rest.split("=", 1)
+                    cur["measures"].append(
+                        {"name": _tmdl_unquote(name), "expression": expr.strip()})
+            elif content.startswith("partition ") and "calculated" in content:
+                part = {"name": content, "expression": ""}
+                cur["partition_sources"].append(part)
+                obj = ("partition", part)
+        elif indent >= 2 and obj is not None:
+            kind, rec = obj
+            if kind == "physcol":
+                if content.startswith("dataType:"):
+                    rec["data_type"] = content.split(":", 1)[1].strip()
+                elif content.startswith("sourceColumn:"):
+                    rec["source_column"] = content.split(":", 1)[1].strip()
+            elif kind == "partition":
+                if content.startswith("source"):
+                    capturing = True
+                    after = content[len("source"):].lstrip()
+                    if after.startswith("="):
+                        after = after[1:].strip()
+                    if after:
+                        rec["expression"] += after + " "
+                elif capturing:
+                    rec["expression"] += content + " "
+
+
+def _looks_like_assignment(rest):
+    """True when a ``column``/``measure`` header line carries an ``= <expr>`` body (not just a name
+    that happens to contain ``=`` inside quotes)."""
+    head = rest.split("=", 1)[0]
+    if "=" not in rest:
+        return False
+    # A quoted name with no closing quote before ``=`` means the ``=`` is inside the name.
+    return head.count("'") % 2 == 0
+
+
+def _map_tableau_dtype(dt):
+    return _TABLEAU_TO_TMDL_DTYPE.get((dt or "").strip().lower())
+
+
+_DERIVED_SRC_RE = re.compile(r"\(copy\)|\(group\)|\(bin\)|^Calculation_\d", re.IGNORECASE)
+_TRAILING_PAREN_RE = re.compile(r"\s*\([^()]*\)\s*$")
+
+
+def _is_derived_source_name(name):
+    """True for a Tableau-DERIVED source field name (a group, a copy, a bin, or an internal
+    ``Calculation_<hash>``) -- these are not dropped physical columns, so they are not coverage gaps."""
+    return bool(_DERIVED_SRC_RE.search(name or ""))
+
+
+def _strip_trailing_paren(name):
+    """Drop a single trailing ``(Qualifier)`` from a field name (``Region (People)`` -> ``Region``),
+    so a blend/secondary-source reference matches its base physical column."""
+    return _TRAILING_PAREN_RE.sub("", name or "").strip()
+
+
+def _parse_tableau_schema(twb_path):
+    """Source-column schema from the Tableau ``.twb`` (and any sibling ``.tds``).
+
+    Returns ``{norm_name: {"name", "datatype", "role", "calculated"}}`` keyed by the normalized
+    field name, unioning ``<column>`` elements (caption/datatype/role, a ``<calculation>`` child marks
+    a calc) with ``<metadata-record class='column'>`` physical records (``remote-name``/``local-type``)
+    so a column the workbook only references physically is still seen. Best-effort: a parse failure
+    returns ``{}`` so the tier degrades to "no source schema" rather than raising."""
+    paths = []
+    if twb_path and os.path.isfile(twb_path):
+        paths.append(twb_path)
+        sib_dir = os.path.dirname(os.path.abspath(twb_path))
+        try:
+            for n in sorted(os.listdir(sib_dir)):
+                if n.lower().endswith(".tds") and os.path.join(sib_dir, n) not in paths:
+                    paths.append(os.path.join(sib_dir, n))
+        except OSError:
+            pass
+    schema = {}
+    for path in paths:
+        try:
+            root = ET.parse(path).getroot()
+        except (ET.ParseError, OSError):
+            continue
+        for col in _iter_local(root, "column"):
+            name = _strip_brackets(col.get("caption") or col.get("name") or "")
+            if not name:
+                continue
+            dt = (col.get("datatype") or "").strip().lower()
+            if dt in ("", "table"):
+                continue
+            calc = _first_child(col, "calculation") is not None
+            key = _norm(name)
+            if key and (key not in schema or not schema[key].get("datatype")):
+                schema[key] = {"name": name, "datatype": dt,
+                               "role": (col.get("role") or "").strip().lower(), "calculated": calc}
+        for rec in _iter_local(root, "metadata-record"):
+            if (rec.get("class") or "") != "column":
+                continue
+            rn = _first_child(rec, "remote-name")
+            lt = _first_child(rec, "local-type")
+            if rn is None or not (rn.text or "").strip():
+                continue
+            name = _strip_brackets((rn.text or "").strip())
+            key = _norm(name)
+            dt = ((lt.text or "").strip().lower() if lt is not None else "")
+            if key and key not in schema:
+                schema[key] = {"name": name, "datatype": dt, "role": "", "calculated": False}
+    return schema
+
+
+def metadata_tier(report_dir=None, model_dir=None, twb_path=None):
+    """Deterministic metadata / binding fidelity of an emitted semantic model vs its Tableau source.
+
+    Walks every emitted table -- physical columns (datatype + coverage vs the Tableau schema) and
+    every expression-bearing object (measures, calculated columns, calculated-partition sources) --
+    resolving each column/measure reference against the parsed model. Returns an advisory record:
+
+    * ``tables`` -- per table: physical/expression counts, datatype drift, extra (unmatched) physical
+      columns, and a 0..1 ``confidence`` (clean physical matches / physical columns).
+    * ``datatype_drift`` / ``missing_source_columns`` / ``extra_model_columns`` -- flat roll-ups.
+    * ``unresolved_bindings`` -- every reference that does NOT resolve (the fail-loud catch), each
+      tagged with its owner object, the offending ref, a reason, and a ``window_function`` flag.
+    * ``scores`` -- ``metadata`` (mean table confidence), ``binding`` (resolved objects / total),
+      and an ``overall`` mean, each with a band.
+
+    Offline + stdlib only. Never raises: a missing model/twb degrades to ``{available: False}``."""
+    defn = _resolve_model_definition(report_dir, model_dir)
+    if not defn:
+        return {"tier": "metadata", "available": False,
+                "reason": "no *.SemanticModel/definition folder found near %s"
+                          % (model_dir or report_dir)}
+    try:
+        model = _parse_tmdl_model(defn)
+    except Exception as exc:  # noqa: BLE001 -- a parse fault degrades, never raises
+        return {"tier": "metadata", "available": False, "definition": defn,
+                "reason": "TMDL parse failed: %s" % str(exc).strip()[:200]}
+    schema = _parse_tableau_schema(twb_path) if twb_path else {}
+
+    # Two resolution namespaces, deliberately different:
+    #   * NORMALIZED (``_norm``) -- cross-engine COVERAGE/datatype matching, where ``Order Date`` and
+    #     ``Order_Date`` are the same source column (cosmetic rename is faithful).
+    #   * EXACT (case-insensitive literal) -- BINDING resolution, where DAX is literal: ``[State/
+    #     Province]`` and ``[State_Province]`` are DIFFERENT identifiers. Using ``_norm`` here would
+    #     hide the sanitized-name defect (the engine lands DAX verbatim; AS resolves it literally).
+    col_norms_by_table = {}
+    exact_cols_by_table = {}
+    exact_table_lookup = {}
+    exact_measures = set()
+    for tname, t in model["tables"].items():
+        exact_table_lookup[tname.lower()] = tname
+        norms = set()
+        exact = set()
+        for c in t["physical_columns"]:
+            norms.add(_norm(c["name"]))
+            exact.add(c["name"].lower())
+        for c in t["calc_columns"]:
+            norms.add(_norm(c["name"]))
+            exact.add(c["name"].lower())
+        col_norms_by_table[tname] = norms
+        exact_cols_by_table[tname] = exact
+        for mrec in t["measures"]:
+            exact_measures.add(mrec["name"].lower())
+
+    def _resolve(home_table, ref_table, ref_col):
+        ecol = (ref_col or "").strip().lower()
+        if ref_table:
+            real = exact_table_lookup.get(ref_table.strip().lower())
+            if real is None:
+                return (False, "unknown table '%s'" % ref_table)
+            if ecol in exact_cols_by_table.get(real, set()) or ecol in exact_measures:
+                return (True, None)
+            return (False, "column '%s' not found in table '%s'" % (ref_col, ref_table))
+        # bare [Col]: a measure, or a column reachable in the home-table row context
+        if ecol in exact_measures or ecol in exact_cols_by_table.get(home_table, set()):
+            return (True, None)
+        for exact in exact_cols_by_table.values():
+            if ecol in exact:
+                return (True, None)
+        return (False, "unresolved bare reference '[%s]'" % ref_col)
+
+    unresolved = []
+    cross_table_windows = []
+    window_objects = 0
+    total_objs = 0
+    resolved_objs = 0
+
+    def _scan(home_table, kind, obj_name, expression):
+        nonlocal total_objs, resolved_objs, window_objects
+        total_objs += 1
+        # Mask DAX string literals before any raw-DAX scan so a bracket / single-quote / window-name
+        # quoted INSIDE a string can never be mis-read as a real reference (a false unresolved
+        # binding) or a phantom window object. Outside string literals the text is byte-identical, so
+        # resolution of every genuine reference -- and thus the established calibration -- is unchanged.
+        scan = _mask_dax_string_literals(expression)
+        up = scan.upper()
+        is_window = any(fn in up for fn in _DAX_WINDOW_FUNCS)
+        if is_window:
+            window_objects += 1
+            cross_table_windows.extend(
+                _window_cross_table_findings(home_table, kind, obj_name, expression))
+        obj_ok = True
+        for ref_table, ref_col in _extract_dax_refs(scan):
+            ok, reason = _resolve(home_table, ref_table, ref_col)
+            if not ok:
+                obj_ok = False
+                ref_txt = ("'%s'[%s]" % (ref_table, ref_col)) if ref_table else "[%s]" % ref_col
+                unresolved.append({
+                    "table": home_table, "object": obj_name, "kind": kind,
+                    "ref": ref_txt, "reason": reason, "window_function": is_window})
+        if obj_ok:
+            resolved_objs += 1
+
+    tables_out = []
+    datatype_drift = []
+    extra_model_columns = []
+    model_col_norms = set()
+    for tname, t in model["tables"].items():
+        for c in t["physical_columns"]:
+            src = c.get("source_column") or ""
+            if src and not src.startswith("["):
+                model_col_norms.add(_norm(c["name"]))
+                model_col_norms.add(_norm(_strip_brackets(src)))
+    for tname, t in model["tables"].items():
+        drift_here = []
+        extra_here = []
+        clean = 0
+        physical = t["physical_columns"]
+        for c in physical:
+            # calc-table tuple columns bind to a synthetic [ValueN]; only real source columns
+            # (an unbracketed sourceColumn) are checked against the Tableau schema.
+            src = c.get("source_column") or ""
+            is_real_source = bool(src) and not src.startswith("[")
+            if not is_real_source:
+                continue
+            match = schema.get(_norm(c["name"])) or schema.get(_norm(_strip_brackets(src)))
+            if match is None:
+                extra_here.append(c["name"])
+                continue
+            expected = _map_tableau_dtype(match["datatype"])
+            emitted = c.get("data_type")
+            if expected and emitted and emitted not in _DTYPE_COMPATIBLE.get(expected, {expected}):
+                drift_here.append({"table": tname, "column": c["name"],
+                                   "emitted_type": emitted, "tableau_type": match["datatype"],
+                                   "expected_type": expected})
+            else:
+                clean += 1
+        for mrec in t["measures"]:
+            _scan(tname, "measure", mrec["name"], mrec["expression"])
+        for crec in t["calc_columns"]:
+            _scan(tname, "calc_column", crec["name"], crec["expression"])
+        for prec in t["partition_sources"]:
+            _scan(tname, "partition_source", tname, prec["expression"])
+        real_physical = [c for c in physical
+                         if (c.get("source_column") or "") and not (c["source_column"]).startswith("[")]
+        n_real = len(real_physical)
+        confidence = round(clean / n_real, 4) if n_real else None
+        datatype_drift.extend(drift_here)
+        extra_model_columns.extend({"table": tname, "column": x} for x in extra_here)
+        tables_out.append({
+            "table": tname,
+            "physical_columns": len(physical),
+            "source_backed_columns": n_real,
+            "calc_columns": len(t["calc_columns"]),
+            "measures": len(t["measures"]),
+            "datatype_drift": drift_here,
+            "extra_columns": extra_here,
+            "confidence": confidence,
+        })
+
+    # A Tableau source field is "missing" only when it is a genuine, non-derived physical field with
+    # no matching model column. Tableau-derived fields (groups, copies, internal ``Calculation_*``)
+    # and blend references (a trailing ``(Other Source)`` suffix) are not dropped physical columns --
+    # match them by their base name so they do not read as false gaps.
+    missing = []
+    for k, v in sorted(schema.items()):
+        if v.get("calculated"):
+            continue
+        name = v["name"]
+        if _is_derived_source_name(name):
+            continue
+        base = _strip_trailing_paren(name)
+        if k in model_col_norms or _norm(base) in model_col_norms:
+            continue
+        missing.append({"name": name, "datatype": v["datatype"]})
+
+    confidences = [t["confidence"] for t in tables_out if t["confidence"] is not None]
+    meta_score = round(sum(confidences) / len(confidences), 4) if confidences else None
+    binding_score = round(resolved_objs / total_objs, 4) if total_objs else None
+    parts = [s for s in (meta_score, binding_score) if s is not None]
+    overall = round(sum(parts) / len(parts), 4) if parts else None
+    # window_consistency is a SEPARATE, additive signal -- it never feeds ``overall`` (so the
+    # established calibration is untouched) and it never re-counts a cross-table window as an
+    # "unresolved binding" (those refs DO resolve). It is the deterministic catch for the
+    # resolvable-but-cross-table ORDERBY class that pure binding resolution is blind to.
+    flagged_window_objs = len({(f["table"], f["object"]) for f in cross_table_windows})
+    window_consistency = (round(1 - flagged_window_objs / window_objects, 4)
+                          if window_objects else None)
+
+    notes = [
+        "ADVISORY metadata/binding tier: deterministic, offline, stdlib-only -- it re-reads the "
+        "emitted TMDL and the Tableau schema with independent readers and does NOT feed the combined "
+        "headline (so it can never move calibration).",
+        "BINDING is the fail-loud catch: an unresolved ref is a query/refresh-time break the "
+        "openability gate cannot see (a model can deserialize yet reference a column that is not in "
+        "it) -- e.g. a sanitized-name mismatch or a window-function ORDERBY pointing across tables.",
+        "WINDOW CONSISTENCY is a distinct fail-loud catch: a window function (OFFSET/WINDOW/INDEX/"
+        "ROWNUMBER/...) whose ORDERBY column lives in a DIFFERENT table than the partition/aggregate "
+        "is invalid at query time even though every column resolves -- pure binding resolution is "
+        "blind to it, so it is reported separately and never moves the binding score.",
+    ]
+    if not schema:
+        notes.append("No Tableau source schema parsed (no twb_path or unreadable): datatype/coverage "
+                     "checks are skipped; binding resolution still ran against the model alone.")
+
+    return {
+        "tier": "metadata", "available": True, "advisory": True,
+        "definition": defn,
+        "source_schema_columns": len(schema),
+        "tables": tables_out,
+        "datatype_drift": datatype_drift,
+        "missing_source_columns": missing,
+        "extra_model_columns": extra_model_columns,
+        "unresolved_bindings": unresolved,
+        "cross_table_windows": cross_table_windows,
+        "window_objects_total": window_objects,
+        "objects_total": total_objs,
+        "objects_resolved": resolved_objs,
+        "scores": {
+            "metadata": meta_score, "metadata_band": _band(meta_score) if meta_score is not None else None,
+            "binding": binding_score, "binding_band": _band(binding_score) if binding_score is not None else None,
+            "overall": overall, "overall_band": _band(overall) if overall is not None else None,
+            "window_consistency": window_consistency,
+            "window_consistency_band": _band(window_consistency) if window_consistency is not None else None,
+        },
+        "notes": notes,
+    }
+
+
+# =====================================================================================
 # Optional advisory tier: LLM-assist adjudication (a deterministic harness; the agent IS the model)
 # =====================================================================================
 # This mirrors the skill's two established agent-assisted tiers -- the second compiler
@@ -3042,7 +3998,7 @@ def _resolve_reference_png(source, name=None):
 def run_oracle(twb_path, report_dir, engine_report_path=None,
                dax_options=None, image_options=None, candidate_records_path=None,
                field_aliases=None, validate=False, openability_options=None,
-               llm_options=None):
+               llm_options=None, metadata_options=None, per_visual_options=None):
     """Read both sides and score them. Returns the advisory report dict.
 
     The structural tier always runs. The optional value/image tiers run only when their options are
@@ -3067,6 +4023,11 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
     to fold the agent's adjudication back. No network/key -- the agent running this skill is the
     judgment model.
 
+    ``per_visual_options`` (optional; pass ``{}`` to enable, or ``{"on_view": [names]}`` to scope to
+    the dashboard's on-view sheets) attaches the per-visual REPRODUCED/PARTIAL/DEGRADED/MISSING
+    verdict layer as ``per_visual`` -- the migration loop's objective function. Additive: it reads the
+    structural per-visual records only and never feeds the structural aggregate or calibration.
+
     ``image_options`` may carry ``render_pbip`` (a .pbip path): when set and no ``candidate_png`` is
     given, the Power BI candidate render is captured locally via the ``powerbi-desktop`` bridge and
     used as the image-tier candidate; the raw render record is attached as ``pbi_render``.
@@ -3078,7 +4039,13 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
         engine_report = _read_json(engine_report_path)
     if field_aliases is None and candidate_records_path and os.path.isfile(candidate_records_path):
         field_aliases = _load_field_aliases(candidate_records_path)
-    report = score_report(twb, pbir, engine_report=engine_report, field_aliases=field_aliases)
+    # Resolve the emitted model's relationships (ACTIVE/inactive edges) so a faithful star-schema
+    # date rebind onto a related Date dimension can be credited (see _date_implied_sources). Absent a
+    # *.SemanticModel near report_dir this is [], leaving scoring relationship-blind (unchanged).
+    _defn_dir = _resolve_model_definition(report_dir=report_dir)
+    relationships = _parse_tmdl_relationships(_defn_dir) if _defn_dir else []
+    report = score_report(twb, pbir, engine_report=engine_report, field_aliases=field_aliases,
+                          relationships=relationships)
     report["inputs"] = {
         "twb": os.path.abspath(twb_path),
         "report_dir": os.path.abspath(report_dir),
@@ -3129,6 +4096,12 @@ def run_oracle(twb_path, report_dir, engine_report_path=None,
         report["summary"]["pbir_valid"] = vrec.get("valid") if vrec.get("available") else None
     if openability_options is not None:
         report["openability"] = openability_tier(report_dir=report_dir, **openability_options)
+    if metadata_options is not None:
+        opts = dict(metadata_options)
+        opts.setdefault("twb_path", twb_path)
+        report["metadata"] = metadata_tier(report_dir=report_dir, **opts)
+    if per_visual_options is not None:
+        report["per_visual"] = per_visual_fidelity(report, **per_visual_options)
     combined = _combined_fidelity(report)
     if combined is not None:
         report["combined_fidelity"] = combined
@@ -3196,6 +4169,24 @@ def render_markdown(report):
             type_cell,
             ", ".join(r["fields_missing"]) or "-",
             ", ".join(r["fields_extra"]) or "-"))
+    pv = report.get("per_visual")
+    if pv is not None:
+        lines.append("")
+        lines.append("## Per-visual fidelity (advisory loop objective)")
+        t = pv.get("tally") or {}
+        scoped = pv.get("scoped_to")
+        scope_txt = (", ".join(scoped) if isinstance(scoped, list) else str(scoped))
+        lines.append("- **Objective score:** %s — %d visual(s) scored (scope: %s)" % (
+            pv.get("objective_score"), pv.get("scored_visuals", 0), scope_txt))
+        lines.append("- **Tally:** REPRODUCED %d · PARTIAL %d · DEGRADED %d · MISSING %d" % (
+            t.get(STATE_REPRODUCED, 0), t.get(STATE_PARTIAL, 0),
+            t.get(STATE_DEGRADED, 0), t.get(STATE_MISSING, 0)))
+        lines.append("")
+        lines.append("| Worksheet | State | Visual type | Reason |")
+        lines.append("|---|---|---|---|")
+        for r in pv.get("verdicts", []):
+            lines.append("| %s | %s | %s | %s |" % (
+                r["worksheet"], r["state"], r.get("visual_type") or "-", r.get("reason") or "-"))
     placed = [r for r in report["visuals"] if r.get("placement")]
     if placed:
         lines.append("")
@@ -3315,6 +4306,46 @@ def render_markdown(report):
                 loc = "%s line %s" % (loc, openrec.get("error_line"))
             lines.append("- ⛔ **BLOCKED** — model does not deserialize (%s)" % loc)
             lines.append("  - %s" % openrec.get("error"))
+    meta = report.get("metadata")
+    if meta is not None:
+        lines.append("")
+        lines.append("## Metadata / binding fidelity (advisory, deterministic)")
+        if not meta.get("available"):
+            lines.append("- _unavailable_: %s" % meta.get("reason"))
+        else:
+            sc = meta.get("scores") or {}
+            lines.append("- **Scores:** metadata %s (%s) · binding %s (%s) · overall %s (%s)" % (
+                sc.get("metadata"), sc.get("metadata_band"), sc.get("binding"),
+                sc.get("binding_band"), sc.get("overall"), sc.get("overall_band")))
+            lines.append("- **Bindings:** %d/%d expression objects fully resolve; %d unresolved "
+                         "reference(s)." % (
+                             meta.get("objects_resolved", 0), meta.get("objects_total", 0),
+                             len(meta.get("unresolved_bindings", []))))
+            lines.append("- **Coverage:** %d datatype drift · %d missing source column(s) · %d extra "
+                         "model column(s)." % (
+                             len(meta.get("datatype_drift", [])),
+                             len(meta.get("missing_source_columns", [])),
+                             len(meta.get("extra_model_columns", []))))
+            for u in meta.get("unresolved_bindings", []):
+                wf = " [window-fn]" if u.get("window_function") else ""
+                lines.append("  - ⛔ UNRESOLVED `%s` in %s `%s` (%s) — %s%s" % (
+                    u.get("ref"), u.get("table"), u.get("object"), u.get("kind"),
+                    u.get("reason"), wf))
+            for d in meta.get("datatype_drift", []):
+                lines.append("  - ⚠ DRIFT %s[%s]: emitted `%s` vs Tableau `%s` (expected `%s`)" % (
+                    d.get("table"), d.get("column"), d.get("emitted_type"),
+                    d.get("tableau_type"), d.get("expected_type")))
+            ctw = meta.get("cross_table_windows", [])
+            if sc.get("window_consistency") is not None:
+                lines.append("- **Window consistency:** %s (%s) — %d window object(s), %d "
+                             "cross-table ORDERBY finding(s)." % (
+                                 sc.get("window_consistency"), sc.get("window_consistency_band"),
+                                 meta.get("window_objects_total", 0), len(ctw)))
+            for f in ctw:
+                lines.append("  - ⛔ CROSS-TABLE WINDOW in %s `%s` (%s): ORDERBY uses `%s` but the "
+                             "window aggregates/partitions over %s — %s" % (
+                                 f.get("table"), f.get("object"), f.get("kind"),
+                                 f.get("orderby_table"), f.get("anchor_tables"), f.get("reason")))
     llm = report.get("llm_assist")
     if llm is not None:
         lines.append("")
@@ -3400,12 +4431,25 @@ def main(argv=None):
     ap.add_argument("--model-dir", default=None,
                     help="Override the semantic-model folder Gate 0 inspects (defaults to the "
                          "*.SemanticModel/definition resolved from report_dir).")
+    ap.add_argument("--metadata", action="store_true",
+                    help="Run the deterministic metadata/binding fidelity tier: emitted TMDL columns/"
+                         "measures vs the Tableau source schema (datatype drift, coverage) plus static "
+                         "binding resolution of every DAX column/measure reference. ADDITIVE -- it "
+                         "never feeds the combined headline. Offline, stdlib-only.")
     ap.add_argument("--llm", action="store_true",
                     help="Build the advisory LLM-assist adjudication bundle + agent prompt (no "
                          "network/key -- the agent running this skill is the judgment model).")
     ap.add_argument("--llm-answers", default=None,
                     help="Path to a JSON file of the agent's adjudication answers to fold back into "
                          "the LLM-assist record. Implies --llm.")
+    ap.add_argument("--per-visual", action="store_true",
+                    help="Attach the per-visual REPRODUCED/PARTIAL/DEGRADED/MISSING verdict layer "
+                         "(the migration loop's objective function). ADDITIVE -- it never feeds the "
+                         "structural aggregate or the combined headline.")
+    ap.add_argument("--on-view", default=None,
+                    help="Comma-separated Tableau worksheet names to scope the per-visual verdicts to "
+                         "(the dashboard's on-view sheets); off-view sheets/calcs are ignored. "
+                         "Implies --per-visual.")
     args = ap.parse_args(argv)
 
     dax_options = None
@@ -3440,12 +4484,26 @@ def main(argv=None):
         if args.llm_answers and os.path.isfile(args.llm_answers):
             llm_options["answers"] = _read_json(args.llm_answers)
 
+    metadata_options = None
+    if args.metadata:
+        metadata_options = {}
+        if args.model_dir:
+            metadata_options["model_dir"] = args.model_dir
+
+    per_visual_options = None
+    if args.per_visual or args.on_view:
+        per_visual_options = {}
+        if args.on_view:
+            per_visual_options["on_view"] = [s.strip() for s in args.on_view.split(",") if s.strip()]
+
     report = run_oracle(args.twb, args.report_dir, args.engine_report,
                         dax_options=dax_options, image_options=image_options,
                         candidate_records_path=args.candidate_records,
                         validate=args.validate,
                         openability_options=openability_options,
-                        llm_options=llm_options)
+                        llm_options=llm_options,
+                        metadata_options=metadata_options,
+                        per_visual_options=per_visual_options)
     text = (render_markdown(report) if args.format == "md"
             else json.dumps(report, indent=2, ensure_ascii=False))
     if args.out:

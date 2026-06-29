@@ -147,7 +147,10 @@ def test_build_date_dimension_relates_only_fact_tables():
 
     assert name == "Date" and part is not None
     assert {r["from_table"] for r in date_rels} == {"Orders"}
-    assert all(r["join_on_date_behavior"] == "datePartOnly" for r in date_rels)
+    # Plain exact dateTime join -- no joinOnDateBehavior. The generated Date table is a CALCULATED
+    # CALENDARAUTO table, and Power BI Desktop drops a datePartOnly relationship that involves a
+    # calculated table on .pbip open (the relationship vanishes and the time series flattens).
+    assert all("join_on_date_behavior" not in r for r in date_rels)
     assert report["generated"] is True
 
 

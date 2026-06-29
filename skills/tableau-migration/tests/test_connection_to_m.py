@@ -8,6 +8,7 @@ from connection_to_m import (
     emit_connection_parameters,
     emit_m_partition_source,
     emit_table_tmdl_m,
+    extract_bundled_flatfile,
     m_partition_review_reason,
     parse_tds,
     tableau_type_to_tmdl,
@@ -1524,6 +1525,96 @@ def test_snowflake_collection_auth_method_maps_to_basic_no_secret_leak():
     assert details["credential_kind"] == "Basic"               # 'Username Password' -> Basic
     blob = repr(d) + repr(details)
     assert "svc_loader" not in blob                            # the username value is never read
+
+
+# -- extract_bundled_flatfile: lift a packaged Excel/CSV to an absolute path -----------------------
+# A workbook/datasource extract backed by a flat file stores only a RELATIVE path in <connection>;
+# Power BI's File.Contents rejects a relative path, so the Import model opens but loads no data. The
+# fix lifts the bundled member out of the .tdsx/.twbx zip to an absolute on-disk path. Live database
+# connections carry no bundled file (no flatfile_filename) and MUST be left untouched -> None.
+import io as _io
+import zipfile as _zip
+
+_XLSX_BYTES = b"PK\x03\x04 fake-excel-bytes for the bundled flat file " + b"x" * 64
+
+
+def _make_tdsx(members):
+    """A minimal .tdsx/.twbx: an in-memory zip mapping member-path -> bytes."""
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w") as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def test_extract_bundled_flatfile_lifts_member_to_absolute_path(tmp_path):
+    raw = _make_tdsx({
+        "Superstore.tds": "<datasource/>",
+        "Data/Datasources/Sample - Superstore.xlsx": _XLSX_BYTES,
+    })
+    src = tmp_path / "Superstore_-_Extract.tdsx"
+    src.write_bytes(raw)
+    dest = tmp_path / "data" / "Superstore_-_Extract"
+    descriptor = {"flatfile_filename": "Data/Datasources/Sample - Superstore.xlsx"}
+
+    out = extract_bundled_flatfile(str(src), descriptor, str(dest))
+
+    import os
+    assert out is not None
+    assert os.path.isabs(out)                       # absolute -> File.Contents accepts it
+    assert os.path.isfile(out)
+    assert os.path.basename(out) == "Sample - Superstore.xlsx"
+    with open(out, "rb") as fh:
+        assert fh.read() == _XLSX_BYTES             # the real bytes were copied, not a stub
+
+
+def test_extract_bundled_flatfile_unique_basename_fallback(tmp_path):
+    # descriptor path does not match the member path exactly, but the basename is unique -> extracted
+    raw = _make_tdsx({
+        "Data/the-real-folder/Sample - Superstore.xlsx": _XLSX_BYTES,
+    })
+    descriptor = {"flatfile_filename": "Data/Datasources/Sample - Superstore.xlsx"}
+    out = extract_bundled_flatfile(raw, descriptor, str(tmp_path / "out"))
+    assert out is not None and out.lower().endswith("sample - superstore.xlsx")
+
+
+def test_extract_bundled_flatfile_accepts_raw_zip_bytes(tmp_path):
+    raw = _make_tdsx({"Data/Datasources/Sample - Superstore.xlsx": _XLSX_BYTES})
+    descriptor = {"flatfile_filename": "Data/Datasources/Sample - Superstore.xlsx"}
+    out = extract_bundled_flatfile(raw, descriptor, str(tmp_path / "out"))
+    assert out is not None
+
+
+def test_extract_bundled_flatfile_none_for_live_db_descriptor(tmp_path):
+    # a Snowflake/Databricks/SQL Server connection has no bundled flat file -> NEVER touched
+    raw = _make_tdsx({"Data/Datasources/Sample - Superstore.xlsx": _XLSX_BYTES})
+    assert extract_bundled_flatfile(raw, {}, str(tmp_path / "out")) is None
+    assert extract_bundled_flatfile(raw, {"flatfile_filename": None}, str(tmp_path / "out")) is None
+
+
+def test_extract_bundled_flatfile_none_for_non_zip(tmp_path):
+    # bare .tds/.twb XML text or a path to one (not a zip) -> keep the relative path unchanged
+    descriptor = {"flatfile_filename": "Data/Datasources/Sample - Superstore.xlsx"}
+    assert extract_bundled_flatfile("<datasource/>", descriptor, str(tmp_path / "out")) is None
+    tds = tmp_path / "plain.tds"
+    tds.write_text("<datasource/>", encoding="utf-8")
+    assert extract_bundled_flatfile(str(tds), descriptor, str(tmp_path / "out")) is None
+
+
+def test_extract_bundled_flatfile_none_for_missing_member(tmp_path):
+    raw = _make_tdsx({"Data/Datasources/Other.xlsx": _XLSX_BYTES})
+    descriptor = {"flatfile_filename": "Data/Datasources/Sample - Superstore.xlsx"}
+    assert extract_bundled_flatfile(raw, descriptor, str(tmp_path / "out")) is None
+
+
+def test_extract_bundled_flatfile_none_for_ambiguous_basename(tmp_path):
+    # two members share the basename and neither matches the full relative path -> never guess
+    raw = _make_tdsx({
+        "Data/a/Sample - Superstore.xlsx": _XLSX_BYTES,
+        "Data/b/Sample - Superstore.xlsx": _XLSX_BYTES,
+    })
+    descriptor = {"flatfile_filename": "Data/Datasources/Sample - Superstore.xlsx"}
+    assert extract_bundled_flatfile(raw, descriptor, str(tmp_path / "out")) is None
 
 
 def test_parse_databricks_federated_collection_yields_directquery_tables():

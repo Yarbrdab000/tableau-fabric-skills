@@ -24,12 +24,14 @@ import re
 import xml.etree.ElementTree as ET
 
 try:  # works whether imported as a package or run with scripts/ on sys.path
-    from .tmdl_generate import clean_col, generate_column_tmdl, q, tableau_default_format_to_pbi
+    from .tmdl_generate import (clean_col, generate_column_tmdl, q, tableau_default_format_to_pbi,
+                                tableau_geo_role_to_data_category)
     from .storage_mode import (
         ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
         NATIVE_QUERY_CATALOG_DRILL, PARTIAL_LIVE_CONNECTORS, connector_spec)
 except ImportError:
-    from tmdl_generate import clean_col, generate_column_tmdl, q, tableau_default_format_to_pbi
+    from tmdl_generate import (clean_col, generate_column_tmdl, q, tableau_default_format_to_pbi,
+                               tableau_geo_role_to_data_category)
     from storage_mode import (
         ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
         NATIVE_QUERY_CATALOG_DRILL, PARTIAL_LIVE_CONNECTORS, connector_spec)
@@ -343,6 +345,104 @@ def _default_formats_by_physical(datasource):
     return out
 
 
+def _metadata_identity_index(datasource):
+    """Map a logical column name -> its UNIQUE physical ``(parent, model_col)`` identity.
+
+    Built from ``<metadata-record class='column'>`` descriptors: a record's ``local-name`` (the
+    bracketed logical id, e.g. ``[State/Province]``) and its ``clean_col(remote-name)`` both index
+    the ``(parent, clean_col(remote))`` identity that ``_columns_by_parent`` emits under. A name
+    resolving to more than one distinct identity is poisoned (dropped) so an ambiguous name is never
+    guessed. This recovers the logical->physical join for ``.hyper`` extracts, which inline the
+    physical layer and carry no live-connection ``<cols><map>`` mapping.
+    """
+    by_name = {}
+    for rec in _findall_local(datasource, "metadata-record"):
+        if (rec.get("class") or "").lower() != "column":
+            continue
+        def _txt(tag):
+            els = _children_local(rec, tag)
+            return els[0].text if els and els[0].text is not None else None
+        parent = _strip_brackets((_txt("parent-name") or "").strip()) or None
+        remote = (_txt("remote-name") or "").strip() or None
+        if not parent or not remote:
+            continue
+        local = (_txt("local-name") or "").strip() or None
+        ident = (parent, clean_col(remote))
+        names = {clean_col(remote)}
+        if local:
+            names.add(_strip_brackets(local))
+        for nm in names:
+            if not nm:
+                continue
+            if nm not in by_name:
+                by_name[nm] = ident
+            elif by_name[nm] != ident:
+                by_name[nm] = None  # same name, two identities -> never guess
+    return {k: v for k, v in by_name.items() if v is not None}
+
+
+_OID_HASH_RE = re.compile(r"_[0-9A-Fa-f]{32}$")
+
+
+def _strip_oid_hash(table):
+    """Drop a trailing Tableau object-id hash from a physical table name.
+
+    An extract-backed ``.tds`` duplicates every ``<cols><map>`` for the ``.hyper`` cache twin
+    ``<Base>_<hex32>`` (e.g. ``Orders_ECFCA1FB690A41FE803BC071773BA862``) -- a LOCAL cache of the
+    same logical table, never an independent upstream. Collapsing the suffix lets the geo join treat
+    the base table and its extract twin as ONE identity instead of a false ambiguity, while leaving
+    an un-suffixed live table name unchanged.
+    """
+    return _OID_HASH_RE.sub("", table or "")
+
+
+def _geo_categories_by_physical(datasource):
+    """Map ``(table, model_col) -> Power BI dataCategory`` from a column's geo ``semantic-role``.
+
+    Each logical ``<column semantic-role=...>`` carrying a geographic role (State/Country/City/
+    County/PostalCode) is joined to its physical ``(table, column)`` and keyed by
+    ``(table, clean_col(physical))`` -- the SAME identity the ``<metadata-record>`` descriptors
+    carry, so the column emitter can apply it. The join consults the live-connection ``<cols><map>``
+    mapping first (collapsing object-id-hash ``.hyper`` twins of the same table so a base+twin pair
+    is not read as a false ambiguity); when that mapping is SILENT for a column (a ``.hyper`` extract
+    inlines the physical layer and carries no ``<cols><map>``), it falls back to the metadata-record
+    identity by name. A genuinely ambiguous ``<cols><map>`` (a lid mapped to several DISTINCT
+    physical columns) fails closed -- it is NOT overridden by the fallback -- and a role with no
+    faithful Power BI category, or a name that resolves nowhere, is omitted (never a guess, never a
+    regression).
+    """
+    lid_to_phys = {}
+    for cols in _findall_local(datasource, "cols"):
+        for m in _children_local(cols, "map"):
+            key = _strip_brackets((m.get("key") or "").strip())
+            _cat, table, col = _parse_table_name((m.get("value") or "").strip())
+            if key and table and col:
+                lid_to_phys.setdefault(key, set()).add((table, col))
+    name_to_identity = _metadata_identity_index(datasource)
+    out = {}
+    for col in _children_local(datasource, "column"):
+        cat = tableau_geo_role_to_data_category(col.get("semantic-role"))
+        if not cat:
+            continue
+        lid = _strip_brackets((col.get("name") or "").strip())
+        phys = lid_to_phys.get(lid)
+        if phys is not None:
+            # <cols><map> spoke for this lid. Collapse object-id-hash twins first: an extract
+            # duplicates every map for a <Base>_<hex32> .hyper cache of the SAME logical table, so a
+            # base+twin pair is ONE identity, not a false ambiguity. A single surviving identity
+            # resolves; several genuinely-distinct ones fail closed (never guess); neither defers to
+            # the metadata fallback.
+            collapsed = {(_strip_oid_hash(table), clean_col(col)) for table, col in phys}
+            if len(collapsed) == 1:
+                out[next(iter(collapsed))] = cat
+            continue
+        # <cols><map> silent (extract): fall back to the metadata-record identity by name.
+        ident = name_to_identity.get(lid)
+        if ident:
+            out[ident] = cat
+    return out
+
+
 def _columns_by_parent(datasource):
     """Map relation item-name -> [ {remote_name, model_name, tmdl_type, local_name} ].
 
@@ -353,6 +453,7 @@ def _columns_by_parent(datasource):
     """
     out = {}
     fmt_by_physical = _default_formats_by_physical(datasource)
+    geo_by_physical = _geo_categories_by_physical(datasource)
     for rec in _findall_local(datasource, "metadata-record"):
         if (rec.get("class") or "").lower() != "column":
             continue
@@ -375,6 +476,9 @@ def _columns_by_parent(datasource):
         fmt = fmt_by_physical.get((parent, model_name))
         if fmt:
             col["format_string"] = fmt
+        cat = geo_by_physical.get((parent, model_name))
+        if cat:
+            col["data_category"] = cat
         out.setdefault(parent, []).append(col)
     return out
 
@@ -1125,6 +1229,81 @@ def _flatfile_path_for(conn):
         conn.get("flatfile_filename") or conn.get("filename"))
 
 
+def extract_bundled_flatfile(packaged_source, descriptor, dest_dir):
+    """Lift a packaged datasource's BUNDLED flat-file (Excel/CSV) out to an ABSOLUTE on-disk path.
+
+    A Tableau ``.tdsx``/``.twbx`` is a zip that bundles its flat-file data under ``Data/`` while the
+    ``<connection>`` element stores only a path RELATIVE to the workbook (e.g.
+    ``Data/Datasources/Sample - Superstore.xlsx``). Power BI's ``File.Contents`` rejects a relative
+    path -- *"The supplied file path must be a valid absolute path"* -- so an Import model emitted
+    straight from that relative path OPENS but loads NO data. This copies the bundled member to an
+    absolute location the emitted M can read, so the ``.pbip`` opens AND loads.
+
+    Returns the absolute path of the extracted file, or ``None`` -- in which case the caller keeps the
+    existing (relative) path, i.e. behavior is UNCHANGED. ``None`` is returned whenever there is
+    nothing to extract: a live database connection (Snowflake/Databricks/SQL Server/... carries no
+    bundled file, so ``flatfile_filename`` is absent); ``packaged_source`` is not a zip (a bare
+    ``.tds``/``.twb`` XML path or in-memory XML text); or the member is missing/ambiguous. The helper
+    is fail-closed and never raises.
+    """
+    import io as _io
+    import os as _os
+    import zipfile as _zip
+
+    filename = (descriptor or {}).get("flatfile_filename")
+    if not filename:  # not a flat-file source (live DB / federated SQL) -> nothing to extract
+        return None
+
+    raw = None
+    if isinstance(packaged_source, (bytes, bytearray)):
+        raw = bytes(packaged_source)
+    else:
+        try:
+            p = _os.fspath(packaged_source)
+        except TypeError:
+            p = None
+        if isinstance(p, str) and "\n" not in p and "<" not in p:
+            try:
+                if _os.path.isfile(p):
+                    with open(p, "rb") as fh:
+                        raw = fh.read()
+            except (OSError, ValueError):
+                raw = None
+    if not raw or raw[:2] != b"PK":  # not a zip archive (.tdsx/.twbx) -> keep the relative path
+        return None
+
+    directory = (descriptor or {}).get("flatfile_directory") or ""
+    rel = (directory.rstrip("/\\") + "/" + filename) if directory else filename
+    rel_norm = rel.replace("\\", "/").lstrip("./").lower()
+    base_norm = _os.path.basename(filename.replace("\\", "/")).lower()
+    try:
+        with _zip.ZipFile(_io.BytesIO(raw)) as zf:
+            member = None
+            for n in zf.namelist():  # exact relative-path match first (most precise)
+                if n.replace("\\", "/").lower() == rel_norm:
+                    member = n
+                    break
+            if member is None:  # fall back to a UNIQUE basename match only (never guess)
+                cands = [n for n in zf.namelist()
+                         if _os.path.basename(n.replace("\\", "/")).lower() == base_norm]
+                if len(cands) == 1:
+                    member = cands[0]
+            if member is None:
+                return None
+            data = zf.read(member)
+    except Exception:  # fail-closed: any zip/read problem -> keep the relative path unchanged
+        return None
+
+    try:
+        _os.makedirs(dest_dir, exist_ok=True)
+        out_path = _os.path.join(dest_dir, _os.path.basename(filename.replace("\\", "/")))
+        with open(out_path, "wb") as fh:
+            fh.write(data)
+    except OSError:
+        return None
+    return _os.path.abspath(out_path)
+
+
 def emit_flatfile_source(relation, conn, cls):
     """Emit a real, typed Import ``let ... in`` body for an Excel/CSV ("full data") relation.
 
@@ -1432,7 +1611,8 @@ def emit_table_tmdl_m(relation, descriptor, mode):
         summarize = "sum" if c["tmdl_type"] in ("int64", "double", "decimal") else "none"
         # In the M path the model column name == its sourceColumn (the remote source name).
         columns_tmdl += generate_column_tmdl(
-            c["model_name"], c["tmdl_type"], summarize, False, c.get("format_string"))
+            c["model_name"], c["tmdl_type"], summarize, False, c.get("format_string"),
+            c.get("data_category"))
 
     partition_name = relation.get("item") or clean_col(table_display)
     source_body = emit_m_partition_source(relation, descriptor, mode)
