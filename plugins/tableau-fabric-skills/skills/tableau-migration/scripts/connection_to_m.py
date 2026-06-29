@@ -883,8 +883,19 @@ def _extract_relationships(datasource, relations):
             if dedup in seen:
                 continue
             seen.add(dedup)
+            # A Tableau object-graph relationship (the "noodle") is an ad-hoc, uniqueness-agnostic
+            # join: Tableau keeps each table at its native grain and chooses the join per-viz at
+            # query time, never requiring a unique key on either side. Power BI relationships are
+            # static, and the DEFAULT many-to-one requires the target ("one" side) to be unique --
+            # on a non-unique target (e.g. a duplicate Order ID in returns) Power BI rejects the
+            # relationship and cancels the WHOLE relationship batch on first refresh, collateral-
+            # dropping sibling relationships (notably the generated Date join). Emitting these as
+            # many-to-many -- which Power BI accepts WITHOUT any uniqueness check -- is both the
+            # faithful translation of a Tableau relationship and crash-proof for every connection
+            # type (import / live / federated / flat-file), since it is pure metadata, not data.
             out.append({"from_table": from_table, "from_col": from_col,
-                        "to_table": to_table, "to_col": to_col})
+                        "to_table": to_table, "to_col": to_col,
+                        "cardinality": "many_to_many"})
     return out, warnings
 
 

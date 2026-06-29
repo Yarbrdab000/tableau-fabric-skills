@@ -176,7 +176,13 @@ def generate_column_tmdl(col_name, tmdl_type, summarize, is_hidden, format_strin
     if fmt:
         lines.append(f"\t\tformatString: {fmt}")
     lines.append(f"\t\tlineageTag: {uuid.uuid4()}")
-    lines.append(f"\t\tsourceLineageTag: {col_name}")
+    # Deliberately NO sourceLineageTag here. This emitter feeds the M (Import / DirectQuery)
+    # table path, whose columns are bound by Power Query via ``sourceColumn`` -- they are NOT
+    # backed by a physical source-system schema. Emitting a sourceLineageTag makes Power BI
+    # treat the column binding as speculative, so it DROPS relationships into the table on the
+    # first refresh (verified in Power BI Desktop). DirectLake columns, which legitimately carry
+    # source lineage, are emitted by a separate path (generate_table_tmdl), so this omission does
+    # not affect them.
     lines.append(f"\t\tsummarizeBy: {summarize}")
     lines.append(f"\t\tsourceColumn: {col_name}")
     if data_category:
@@ -555,14 +561,24 @@ def infer_relationships(meta_fields, landed_tables, count_fn):
     return rels
 
 def generate_relationships_tmdl(rels):
-    """One TMDL relationship per inferred join. Default cardinality is many-to-one,
-    which matches from=many -> to=one, so no explicit cardinality props are required.
+    """One TMDL relationship per join. Default cardinality is many-to-one (omitted props),
+    which matches from=many -> to=one.
 
     Optional per-relationship keys (default off, so existing callers are byte-identical):
     ``is_active`` -- when explicitly ``False`` the relationship is emitted ``isActive: false``
     (a role-playing/secondary join activated via ``USERELATIONSHIP``); ``join_on_date_behavior``
     -- e.g. ``"datePartOnly"`` so a Date-dimension join ignores any time component on the fact
-    column (otherwise a timestamp at 13:45 silently fails to match a midnight calendar key).
+    column (otherwise a timestamp at 13:45 silently fails to match a midnight calendar key);
+    ``cardinality`` -- when ``"many_to_many"`` the relationship is emitted with ``toCardinality:
+    many`` + ``crossFilteringBehavior: oneDirection``. An authored Tableau object-graph
+    relationship is an ad-hoc, uniqueness-agnostic join, so it is translated many-to-many: Power
+    BI never applies its unique-key requirement to an m:m join, so a non-unique target can't
+    reject the relationship and cancel the batch (which would collateral-drop the generated Date
+    join on first refresh). Filter propagates ONE way, from the ``toColumn`` (dimension/lookup)
+    side to the ``fromColumn`` (fact) side -- the same dim->fact direction as the default
+    many-to-one, but without the uniqueness constraint. The generated Date-dimension relationships
+    carry no ``cardinality`` key and so stay the default many-to-one (Date[Date] is unique by
+    construction).
     """
     if not rels:
         return None
@@ -573,6 +589,9 @@ def generate_relationships_tmdl(rels):
             lines.append("\tisActive: false")
         if r.get("join_on_date_behavior"):
             lines.append(f"\tjoinOnDateBehavior: {r['join_on_date_behavior']}")
+        if r.get("cardinality") == "many_to_many":
+            lines.append("\ttoCardinality: many")
+            lines.append("\tcrossFilteringBehavior: oneDirection")
         lines.append(f"\tfromColumn: {q(r['from_table'])}.{q(r['from_col'])}")
         lines.append(f"\ttoColumn: {q(r['to_table'])}.{q(r['to_col'])}")
         blocks.append("\n".join(lines))

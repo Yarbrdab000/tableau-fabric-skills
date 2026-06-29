@@ -246,6 +246,9 @@ def test_migrate_generates_date_table_by_default():
     # illegal -- Power BI rejects such a model. The calendar relationships must be plain dateTime
     # joins instead, so no joinOnDateBehavior is emitted.
     assert "joinOnDateBehavior" not in rels
+    # The generated Date joins are many-to-one (Date[Date] is unique by construction) -- they must
+    # NOT be emitted many-to-many; only authored Tableau object-graph relationships are (cause #1).
+    assert "toCardinality: many" not in rels
     assert "isActive: false" in rels   # exactly the secondary (Ship Date) role
 
     dt = out["report"]["date_table"]
