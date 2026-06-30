@@ -144,7 +144,14 @@ foreach ($ds in @("<Datasource A>","<Datasource B>")) {   # D2 scope
 D5=B (JWT): replace `--auth pat --pat-name $PAT_NAME` with
 `--auth jwt --client-id $CA_CLIENT_ID --secret-id $CA_SECRET_ID --secret-value $env:TABLEAU_PAT_VALUE --jwt-username $JWT_USERNAME`.
 
-**Checkpoint 1:** `.\tds` holds one `.tds` per requested datasource. Fewer than expected → STOP.
+- **D1=A (workbook + its embedded datasource):** `fetch_tds.py` also downloads a published
+  **workbook** — in the loop above swap `--datasource-name $ds` for `--workbook-name "<Workbook>"`
+  (or `--workbook-luid <luid>`), add `--include-extract` to pull the packaged `.twbx`, and keep
+  `--out .\tds`. STEP 2's `migrate_estate.py` ingests the `.twb`/`.twbx` from `.\tds` and rebuilds the
+  embedded datasource as a semantic model **and** the workbook as a report.
+
+**Checkpoint 1:** `.\tds` holds one `.tds` per requested datasource (or the requested `.twb`/`.twbx`
+per workbook). Fewer than expected → STOP.
 
 **STEP 2 — build the Fabric bundle**
 
@@ -276,7 +283,7 @@ The pure-Python cores are offline, deterministic, and stdlib-only (no Spark / pa
 
 | Script | Purpose |
 |---|---|
-| [`scripts/fetch_tds.py`](scripts/fetch_tds.py) | **Tableau-side download** (stdlib-only): REST sign-in (PAT **or** Connected-App JWT), find a published datasource by name, download it, and extract the inner `.tds` from a `.tdsx` (`inner_tds_from_zip`) **or** the inner `.tds`/`.twb` from any Tableau archive incl. `.twbx` (`inner_doc_from_zip`). CLI **and** importable (`sign_in`, `resolve_datasource_luid`, `download_datasource`). Use this instead of hand-writing Tableau REST. |
+| [`scripts/fetch_tds.py`](scripts/fetch_tds.py) | **Tableau-side download** (stdlib-only): REST sign-in (PAT **or** Connected-App JWT), find a published **datasource _or_ workbook** by name (or LUID), download it, and extract the inner `.tds` from a `.tdsx` (`inner_tds_from_zip`) **or** the inner `.tds`/`.twb` from any Tableau archive incl. `.twbx` (`inner_doc_from_zip`). CLI (`--datasource-name`/`--datasource-luid`/`--workbook-name`/`--workbook-luid`, `--include-extract`, `--out`) **and** importable (`sign_in`, `resolve_datasource_luid`, `download_datasource`, `resolve_workbook_luid`, `download_workbook`). Use this instead of hand-writing Tableau REST. |
 | `calc_to_dax.py` | Deterministic, typed Tableau calc → DAX translator. Recursive-descent parser: single-field aggregations + arithmetic, `IF`/`ELSEIF`/`IIF` conditionals, comparison + `AND`/`OR`/`NOT`, and `ZN`/`IFNULL`/`ISNULL`; `None` on fallback. Plus `suggest_assisted_dax` — opt-in idiom suggestions (e.g. argmax-over-a-dimension) emitted for human approval, never silently live. |
 | [`scripts/translation_router.py`](scripts/translation_router.py) | **Tier-0 → Tier-1 support layer** (pure, dependency-free). `classify_fallback(reason, role, fields)` — the **router** — maps the deterministic engine's honest `fallback_reason` to a stable charter category (`model_object_parameter` / `missing_addressing_intent` / `missing_outer_aggregation` / `dax_language_gap` / `type_or_shape_mismatch` / `unresolved_reference` / `unsupported_other`) + agent guidance; drives `translation_handoff` (the second-compiler input). `check_candidate_dax(dax, request)` — the **syntactic gate** — vets a second-compiler candidate (balanced parens/brackets/quotes, not an inert stub, no leftover `{FIXED}`/`[Parameters]` idioms) before approval. See [second-compiler.md](resources/second-compiler.md). |
 | [`scripts/tmdl_generate.py`](scripts/tmdl_generate.py) | TMDL generators: typed columns, tables, measures, relationship inference, model files. |

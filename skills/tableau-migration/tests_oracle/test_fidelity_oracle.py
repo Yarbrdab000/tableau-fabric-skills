@@ -8,6 +8,7 @@ never fails offline.
 """
 import json
 import os
+import time
 
 import pytest
 
@@ -1056,7 +1057,13 @@ def test_run_oracle_and_markdown(tmp_path):
 
 
 # --------------------------------------------------------------------------- optional tiers / guards
-def test_optional_tiers_degrade_gracefully():
+def test_optional_tiers_degrade_gracefully(monkeypatch):
+    # Hermetic: force the ADOMD-load guard so the value tier returns its unavailable record without
+    # discovering or connecting to any instance. (With Power BI Desktop open, real discovery + a raw
+    # conn.Open() would block indefinitely -- the bug this guard + _open_bounded fix.)
+    def _raise():
+        raise RuntimeError("ADOMD.NET client DLL not found")
+    monkeypatch.setattr(fo, "_load_adomd", _raise)
     dax = fo.dax_value_tier()
     img = fo.image_tier()
     assert dax["available"] is False and "reason" in dax
@@ -1419,8 +1426,82 @@ def test_dax_value_tier_unavailable_degrades(tmp_path):
     assert out["tier"] == "dax-value" and out["available"] is False and "reason" in out
 
 
+def test_dax_value_tier_degrades_when_no_live_instance(monkeypatch):
+    # ADOMD importable but discovery finds nothing -> the "no live instance" branch, and crucially
+    # _connect is never invoked (proven by a connection class that explodes if constructed).
+    class _NoConnect:
+        def __init__(self, *a, **k):
+            raise AssertionError("must not attempt a connection when nothing is discovered")
+    monkeypatch.setattr(fo, "_load_adomd", lambda: _NoConnect)
+    monkeypatch.setattr(fo, "discover_pbi_instances", lambda *a, **k: [])
+    out = fo.dax_value_tier(port=None)
+    assert out["available"] is False
+    assert "no live" in out["reason"].lower()
+    assert out["discovered_ports"] == []
+
+
+def test_dax_value_tier_discovery_budget_degrades(monkeypatch):
+    # A host littered with stale Desktop port files must not grind for minutes: discovery stops once the
+    # wall-clock budget is spent and returns a structured unavailable record naming the budget, instead of
+    # probing every instance. Hermetic -- no real Analysis Services contact.
+    monkeypatch.setattr(fo, "_DISCOVERY_BUDGET_SECONDS", 0.3)
+    monkeypatch.setattr(fo, "discover_pbi_instances",
+                        lambda *a, **k: [{"port": 50000 + i} for i in range(50)])
+
+    class _StaleConn:
+        def __init__(self, *a, **k):
+            pass
+
+        def Open(self):
+            time.sleep(0.2)            # each probe is slow ...
+            raise RuntimeError("stale")  # ... and never succeeds
+
+        def Close(self):
+            pass
+
+    monkeypatch.setattr(fo, "_load_adomd", lambda: _StaleConn)
+    t0 = time.monotonic()
+    out = fo.dax_value_tier(port=None)
+    elapsed = time.monotonic() - t0
+    assert out["available"] is False
+    assert "budget" in out["reason"]
+    assert elapsed < 5  # bounded: did NOT probe all 50 stale instances at 0.2s each (=10s)
+
+
+def test_open_bounded_returns_opened_conn_on_fast_open():
+    class _Conn:
+        def __init__(self):
+            self.opened = False
+        def Open(self):
+            self.opened = True
+    c = _Conn()
+    assert fo._open_bounded(c, seconds=2) is c and c.opened is True
+
+
+def test_open_bounded_times_out_instead_of_hanging():
+    import time
+    class _Conn:
+        def Open(self):
+            time.sleep(5)  # simulate a blocked native Open(); the bound must not wait this long
+    with pytest.raises(TimeoutError):
+        fo._open_bounded(_Conn(), seconds=0.2)
+
+
+def test_open_bounded_propagates_connect_error():
+    class _Conn:
+        def Open(self):
+            raise RuntimeError("connection refused")
+    with pytest.raises(RuntimeError, match="connection refused"):
+        fo._open_bounded(_Conn(), seconds=2)
+
+
 def test_dax_value_tier_live_if_available():
-    # Offline-safe: skips unless a real Power BI Desktop model is reachable on this host.
+    # Opt-in live test: it connects to a real local Power BI Desktop Analysis Services instance, so it is
+    # skipped by default -- including in the self-update pytest gate -- to keep the suite hermetic and fast
+    # (a host with many stale Desktop instances would otherwise make it slow). Set
+    # TABLEAU_MIGRATION_LIVE_ORACLE=1 to exercise it against a running Desktop model.
+    if not os.environ.get("TABLEAU_MIGRATION_LIVE_ORACLE"):
+        pytest.skip("set TABLEAU_MIGRATION_LIVE_ORACLE=1 to run the live ADOMD value-tier test")
     try:
         AdomdConnection = fo._load_adomd()
     except Exception:  # noqa: BLE001
@@ -1429,7 +1510,7 @@ def test_dax_value_tier_live_if_available():
     for inst in fo.discover_pbi_instances():
         try:
             c = AdomdConnection("Data Source=localhost:%d" % inst["port"])
-            c.Open()
+            fo._open_bounded(c)
             c.Close()
             live_port = inst["port"]
             break

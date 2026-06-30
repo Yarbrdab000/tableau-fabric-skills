@@ -46,6 +46,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 
 ORACLE_VERSION = 2
@@ -1976,6 +1977,44 @@ def _score_value_results(results, comparisons):
     return round(sum(1 for r in results if r["ok"]) / n, 4) if n else None
 
 
+_CONNECT_TIMEOUT_SECONDS = 5  # daemon-thread join bound on conn.Open() -- the load-bearing backstop
+_NATIVE_CONNECT_TIMEOUT_SECONDS = 2  # connection-string "Connect Timeout=" hint; ADOMD's Open() empirically
+# self-terminates at roughly twice this, so keeping it below the join bound above lets the daemon thread
+# complete on its own (a clean error) instead of being abandoned mid-native-call -- abandoning many such
+# threads can crash pythonnet, so this pairing matters when several stale instances are probed.
+_DISCOVERY_BUDGET_SECONDS = 15  # total wall-clock cap on auto-select probing so a host littered with stale
+# Power BI Desktop port files (dozens of dead instances) degrades gracefully instead of grinding for minutes
+
+
+def _open_bounded(conn, seconds=_CONNECT_TIMEOUT_SECONDS):
+    """Call ``conn.Open()`` but stop *waiting* after ``seconds`` instead of blocking indefinitely.
+
+    A blocked native ADOMD ``Open()`` cannot be interrupted from Python, so the call runs on a
+    daemon thread and we stop waiting (raise ``TimeoutError``) if it has not returned -- the lingering
+    daemon dies with the process. This is the load-bearing guard: it lets the value tier degrade
+    instead of hanging when Power BI Desktop has a stale/unreachable Analysis Services instance open.
+    Any error ``Open()`` raises is re-raised here; on success the (opened) ``conn`` is returned.
+    """
+    import threading
+    box = {}
+
+    def _run():
+        try:
+            conn.Open()
+            box["ok"] = True
+        except BaseException as exc:  # noqa: BLE001 -- surfaced to the caller below
+            box["err"] = exc
+
+    t = threading.Thread(target=_run, name="adomd-open", daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        raise TimeoutError("ADOMD Open() exceeded %ss (stale/unreachable instance)" % seconds)
+    if "err" in box:
+        raise box["err"]
+    return conn
+
+
 def dax_value_tier(report_dir=None, host="localhost", port=None, expected=None,
                    measures=None, tolerance=DEFAULT_VALUE_TOLERANCE, workspace_roots=None):
     """Optional Tier-2: evaluate a live Power BI model's measures and (optionally) compare them to
@@ -1994,15 +2033,26 @@ def dax_value_tier(report_dir=None, host="localhost", port=None, expected=None,
                 "reason": "ADOMD.NET/pythonnet not available: %s" % str(exc).strip()[:160]}
 
     def _connect(p):
-        conn = AdomdConnection("Data Source=%s:%d" % (host, p))
-        conn.Open()
-        return conn
+        # Native Connect Timeout hint (kept below the daemon-thread join bound so Open() self-terminates
+        # before the bound expires -> the thread completes cleanly instead of being abandoned) plus the
+        # load-bearing _open_bounded backstop, so neither discovery nor an explicit-port connect can hang
+        # on a stale/unreachable instance.
+        conn = AdomdConnection(
+            "Data Source=%s:%d;Connect Timeout=%d" % (host, p, _NATIVE_CONNECT_TIMEOUT_SECONDS))
+        return _open_bounded(conn)
 
     chosen = port
     if chosen is None:
         discovered = discover_pbi_instances(workspace_roots)
         live = []
+        probed = 0
+        budget_exhausted = False
+        _start = time.monotonic()
         for inst in discovered:
+            if time.monotonic() - _start > _DISCOVERY_BUDGET_SECONDS:
+                budget_exhausted = True  # too many stale instances -> stop probing, degrade gracefully
+                break
+            probed += 1
             try:
                 c = _connect(inst["port"]); c.Close(); live.append(inst)
             except Exception:  # noqa: BLE001 -- stale/closed instance
@@ -2010,8 +2060,12 @@ def dax_value_tier(report_dir=None, host="localhost", port=None, expected=None,
         if len(live) == 1:
             chosen = live[0]["port"]
         elif not live:
-            return {"tier": "dax-value", "available": False,
-                    "reason": "no live Power BI Desktop Analysis Services instance found",
+            reason = "no live Power BI Desktop Analysis Services instance found"
+            if budget_exhausted:
+                reason = ("discovery time budget (%ss) exceeded after probing %d of %d instances; "
+                          "pass an explicit port"
+                          % (_DISCOVERY_BUDGET_SECONDS, probed, len(discovered)))
+            return {"tier": "dax-value", "available": False, "reason": reason,
                     "discovered_ports": [i["port"] for i in discovered]}
         else:
             return {"tier": "dax-value", "available": False,
