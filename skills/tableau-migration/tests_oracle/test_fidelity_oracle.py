@@ -719,6 +719,139 @@ def test_date_implied_noop_without_relationships():
     assert "date_implied" not in r
 
 
+# ---------------------------------- data-load openability gate (the false-1.0 sentinel)
+def _model_with_source(tmp_path, m_source_line):
+    """Write a minimal ``*.SemanticModel/definition/tables/Orders.tmdl`` whose import partition M
+    carries ``m_source_line`` (the ``Source = ...`` line). Returns the ``definition`` path."""
+    defn = tmp_path / "Model.SemanticModel" / "definition"
+    (defn / "tables").mkdir(parents=True)
+    (defn / "tables" / "Orders.tmdl").write_text(
+        "table Orders\n"
+        "\tcolumn Sales\n"
+        "\t\tdataType: double\n"
+        "\tpartition 'Orders' = m\n"
+        "\t\tmode: import\n"
+        "\t\tsource =\n"
+        "\t\t\tlet\n"
+        "\t\t\t\t" + m_source_line + "\n"
+        "\t\t\t\tNavigation = Source{[Item=\"Orders\", Kind=\"Sheet\"]}[Data]\n"
+        "\t\t\tin\n"
+        "\t\t\t\tNavigation\n",
+        encoding="utf-8")
+    return str(defn)
+
+
+def _gated_report(loadable, aggregate=0.9625, objective=1.0):
+    """A minimal report dict in run_oracle's assembled shape carrying a data-load gate verdict."""
+    return {
+        "summary": {"aggregate_score": aggregate, "aggregate_band": fo._band(aggregate)},
+        "per_visual": {"objective_score": objective},
+        "dataload_openability": {"tier": "dataload_openability", "available": True,
+                                 "loadable": loadable},
+    }
+
+
+def test_is_loadable_data_path():
+    assert fo._is_loadable_data_path(r"C:\data\Sample.xlsx") is True
+    assert fo._is_loadable_data_path("C:/data/Sample.xlsx") is True
+    assert fo._is_loadable_data_path(r"\\server\share\Sample.xlsx") is True
+    assert fo._is_loadable_data_path("Data/Datasources/Sample.xlsx") is False
+    assert fo._is_loadable_data_path("/rooted/Sample.xlsx") is False
+    assert fo._is_loadable_data_path("") is False
+    assert fo._is_loadable_data_path(None) is False
+
+
+def test_scan_data_file_paths_skips_strings_comments_and_parameters():
+    # Only the genuine File.Contents("C:\\real.xlsx") call is reported: a function name quoted inside
+    # a string, behind a // comment, on an identifier boundary (MyFile.Contents), or a parameterized
+    # arg (not a literal) are all correctly ignored -- so the gate cannot trip on a phantom path.
+    expr = ('let A = "File.Contents(not-a-call)", '
+            'B = MyFile.Contents("ignored-identifier-boundary"), '
+            '// File.Contents("commented")\n'
+            'Source = Excel.Workbook(File.Contents("C:\\real.xlsx"), null, true), '
+            'P = File.Contents(SomeParam) in Source')
+    assert fo._scan_data_file_paths(expr) == [("File.Contents", "C:\\real.xlsx")]
+
+
+def test_check_dataload_openability_trips_on_relative_path(tmp_path):
+    # (i) a relative File.Contents path -> the gate trips (loadable False) and names the broken file.
+    defn = _model_with_source(
+        tmp_path,
+        'Source = Excel.Workbook(File.Contents('
+        '"Data/Datasources/Sample - Superstore.xlsx"), null, true),')
+    rec = fo._check_dataload_openability(defn)
+    assert rec["available"] is True and rec["loadable"] is False
+    assert rec["broken_paths"] and rec["broken_paths"][0]["table_file"] == "Orders.tmdl"
+    assert rec["broken_paths"][0]["path"] == "Data/Datasources/Sample - Superstore.xlsx"
+
+
+def test_check_dataload_openability_passes_on_absolute_path(tmp_path):
+    # (ii) an absolute path -> the gate does NOT trip (healthy models are never false-zeroed).
+    defn = _model_with_source(
+        tmp_path,
+        'Source = Excel.Workbook(File.Contents("C:\\data\\Sample.xlsx"), null, true),')
+    rec = fo._check_dataload_openability(defn)
+    assert rec["loadable"] is True
+    assert "broken_paths" not in rec
+
+
+def test_check_dataload_openability_not_applicable_without_file_source(tmp_path):
+    # A database (or any non-File.Contents) source has no static local path to check -> NOT applicable
+    # (loadable None), so the gate never trips on a connector it cannot statically reason about.
+    defn = _model_with_source(tmp_path, 'Source = Sql.Database("server", "db"),')
+    rec = fo._check_dataload_openability(defn)
+    assert rec["available"] is True and rec["loadable"] is None and rec["checked"] == 0
+
+
+def test_check_dataload_openability_missing_definition():
+    rec = fo._check_dataload_openability(None)
+    assert rec["available"] is False
+
+
+def test_apply_dataload_gate_forces_scores_to_zero():
+    # (i) trip -> structural aggregate AND per-visual objective forced to 0, raw_* preserved.
+    rep = _gated_report(False)
+    assert fo._apply_dataload_gate(rep) is True
+    assert rep["summary"]["aggregate_score"] == 0.0
+    assert rep["summary"]["raw_aggregate_score"] == 0.9625
+    assert rep["summary"]["dataload_blocked"] is True
+    assert rep["per_visual"]["objective_score"] == 0.0
+    assert rep["per_visual"]["raw_objective_score"] == 1.0
+    assert rep["per_visual"]["dataload_blocked"] is True
+
+
+def test_apply_dataload_gate_noop_when_loadable():
+    # (ii) loadable True or undeterminable None -> strict no-op (no false-zero, no raw_* stamped).
+    for loadable in (True, None):
+        rep = _gated_report(loadable)
+        assert fo._apply_dataload_gate(rep) is False
+        assert rep["summary"]["aggregate_score"] == 0.9625
+        assert "raw_aggregate_score" not in rep["summary"]
+        assert "dataload_blocked" not in rep["summary"]
+        assert rep["per_visual"]["objective_score"] == 1.0
+
+
+def test_combined_fidelity_dataload_blocked_forces_zero():
+    # The combined headline is dominated to 0 when the data-load gate trips (verdict "blocked").
+    rep = _gated_report(False)
+    fo._apply_dataload_gate(rep)
+    cf = fo._combined_fidelity(rep)
+    assert cf["combined_score"] == 0.0
+    assert cf["blocked"] is True
+    assert cf["dataload_blocked"] is True
+    assert cf["verdict"] == "blocked"
+
+
+def test_combined_fidelity_unaffected_when_dataload_ok():
+    # Honest negative at the headline: a loadable model's combined score is untouched by the gate.
+    rep = _gated_report(True)
+    fo._apply_dataload_gate(rep)
+    cf = fo._combined_fidelity(rep)
+    assert cf["combined_score"] == pytest.approx(0.9625)
+    assert cf.get("blocked") is None
+    assert cf.get("dataload_blocked") is None
+
+
 def test_assemble_report_counts_remodel_suspected():
     twb = {"worksheets": [{"name": "A"}]}
     vis = [{"worksheet": "A", "score": 0.45, "diagnosis": fo._REMODEL_DIAGNOSIS}]
