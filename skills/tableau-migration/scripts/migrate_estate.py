@@ -48,19 +48,21 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 
 try:  # works whether imported as a package or run with scripts/ on sys.path
-    from .connection_to_m import parse_tds, extract_bundled_flatfile
+    from .connection_to_m import parse_tds, extract_bundled_flatfile, extract_calcs
     from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
-    from .assemble_model import (assemble_import_model, write_model_folder, write_local_pbip,
-                                 migrate_datasource, list_workbook_datasources)
+    from .assemble_model import (assemble_import_model, assemble_local_import_model,
+                                 materialize_bundled_flatfile_data, write_model_folder,
+                                 write_local_pbip, migrate_datasource, list_workbook_datasources)
     from .parameters import parse_parameters
     from .workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
     from .workbook_calc_usage import workbook_calc_usage
     from . import fetch_tds as F
 except ImportError:
-    from connection_to_m import parse_tds, extract_bundled_flatfile
+    from connection_to_m import parse_tds, extract_bundled_flatfile, extract_calcs
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
-    from assemble_model import (assemble_import_model, write_model_folder, write_local_pbip,
-                                migrate_datasource, list_workbook_datasources)
+    from assemble_model import (assemble_import_model, assemble_local_import_model,
+                                materialize_bundled_flatfile_data, write_model_folder,
+                                write_local_pbip, migrate_datasource, list_workbook_datasources)
     from parameters import parse_parameters
     from workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
     from workbook_calc_usage import workbook_calc_usage
@@ -633,25 +635,45 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
                       error="; ".join(problems) + "; cannot emit a clean model")
         return detail
 
-    # Flat-file Import (Excel/CSV bundled inside a .tdsx/.twbx): extract the embedded data file to an
-    # ABSOLUTE path so the emitted M's File.Contents loads in Power BI Desktop. A relative path opens
-    # but loads NO data ("The supplied file path must be a valid absolute path"). A live DB source
-    # (Snowflake/Databricks/SQL Server/...) carries no flatfile_filename -> no-op; its connection
-    # string is left exactly as-is.
+    # Flat-file Import (Excel/CSV or extract bundled inside a .tdsx/.twbx): materialize the embedded
+    # data to an ABSOLUTE path so the emitted M's File.Contents loads in Power BI Desktop. A relative
+    # path opens but loads NO data ("The supplied file path must be a valid absolute path"). A bundled
+    # Excel/CSV is lifted out verbatim; an EXTRACT-backed source (only a .hyper packaged) is read to
+    # one CSV per table and built as a local-CSV Import model. A live DB source (Snowflake/Databricks/
+    # SQL Server/...) carries no flatfile_filename -> no-op; its connection string is left as-is.
     flatfile_path = None
+    table_csv_paths = None
+    ff_mat = None
     if descriptor.get("flatfile_filename"):
         data_dir = os.path.join(os.path.dirname(os.path.abspath(sm_dir)), "data",
                                 re.sub(r"[^\w.-]+", "_", name) or "ds")
         try:
-            flatfile_path = extract_bundled_flatfile(ds_id, descriptor, data_dir)
+            ff_mat = materialize_bundled_flatfile_data(ds_id, descriptor, data_dir, model_name=name)
         except Exception:
-            flatfile_path = None
+            ff_mat = None
+        if ff_mat and ff_mat.get("kind") == "flatfile":
+            flatfile_path = ff_mat.get("flatfile_path")
+        elif ff_mat and ff_mat.get("kind") == "csv":
+            table_csv_paths = ff_mat.get("table_csv_paths")
     detail["flatfile_landed"] = flatfile_path
+    if ff_mat is not None:
+        detail["flatfile_data"] = {
+            "landed": ff_mat.get("kind") is not None,
+            "kind": ff_mat.get("kind"),
+            "reason": ff_mat.get("reason"),
+            "hyper_present": ff_mat.get("hyper_present", False),
+        }
 
     try:
-        out = assemble_import_model(descriptor, model_name=name, calcs=calcs, dim_calcs=dim_calcs,
-                                    parameters=parameters, approved_calc_dax=approved_calc_dax,
-                                    flatfile_path=flatfile_path)
+        if table_csv_paths:
+            out = assemble_local_import_model(descriptor, model_name=name,
+                                              table_csv_paths=table_csv_paths, calcs=calcs,
+                                              dim_calcs=dim_calcs, parameters=parameters,
+                                              approved_calc_dax=approved_calc_dax)
+        else:
+            out = assemble_import_model(descriptor, model_name=name, calcs=calcs, dim_calcs=dim_calcs,
+                                        parameters=parameters, approved_calc_dax=approved_calc_dax,
+                                        flatfile_path=flatfile_path)
     except ValueError as exc:  # storage policy / no-columns -> documented land-to-Delta fallback
         detail.update(status="fallback", storage_mode=None, storage_decision=decision,
                       reason=str(exc),
@@ -702,6 +724,22 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
     cc_stubbed = sum(1 for c in calc_columns if c.get("status") == "stub")
     fully = bool(decision.get("fully_supported"))
 
+    # Honest flat-file data follow-up: a flat-file source whose data did NOT materialize to an
+    # absolute path yields a model that opens but loads no rows. Record it as a follow-up (and force
+    # the with-followups status) so the run never silently reports a clean migration of empty tables.
+    followups = list(decision.get("manual_followups", []))
+    if detail.get("flatfile_data") and not detail["flatfile_data"].get("landed"):
+        _reason = detail["flatfile_data"].get("reason")
+        _hint = {
+            "hyperapi_unavailable": "bundles a .hyper extract but tableauhyperapi is not installed "
+                                    "(pip install tableauhyperapi), so its data was not landed",
+            "no_bundled_data": "bundles neither the source file nor a .hyper extract -- re-export "
+                               "the .tdsx/.twbx with its extract included",
+        }.get(_reason, f"data not materialized ({_reason})")
+        followups.append(f"flat-file source {_hint}; the model opens but loads no rows until the "
+                         "data file is supplied at an absolute path")
+        fully = False
+
     detail.update(
         status="migrated" if fully else "migrated_with_followups",
         fully_supported=fully,
@@ -723,11 +761,12 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
         calc_columns=calc_columns,
         calc_columns_translated=cc_translated,
         calc_columns_stubbed=cc_stubbed,
-        manual_followups=decision.get("manual_followups", []),
+        manual_followups=followups,
     )
     if ds_catalog is not None:
         ds_catalog[_norm_ds(name)] = {"name": name, "text": text, "safe_base": safe_base,
-                                      "flatfile_path": flatfile_path}
+                                      "flatfile_path": flatfile_path,
+                                      "table_csv_paths": table_csv_paths}
     return detail
 
 
@@ -1385,9 +1424,10 @@ def _norm_ds(name):
 def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog, approved_calc_dax=None):
     """Rebuild a published-datasource workbook's model from the matching ALREADY-MIGRATED published
     datasource (its real schema) instead of the workbook's own unusable ``sqlproxy`` proxy stub --
-    carrying the workbook's own calculated fields so its view-local measures translate against that
-    schema. Returns a ``migrate_datasource`` result bound to the real schema, or ``None`` when there
-    is no faithful name match (the caller then keeps the honest skip). Never raises.
+    carrying BOTH the workbook's own calculated fields AND the published datasource's own calculated
+    fields so the attached model holds every calculation either side defines (workbook-local calcs win
+    on a name clash). Returns a ``migrate_datasource`` result bound to the real schema, or ``None``
+    when there is no faithful name match (the caller then keeps the honest skip). Never raises.
     """
     if not ds_catalog:
         return None
@@ -1401,6 +1441,37 @@ def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog, appr
         wb_calcs, _skipped, wb_dim_calcs = extract_calculations(twb_text, include_dimensions=True)
     except Exception:
         wb_calcs, wb_dim_calcs = None, None
+    # Union the PUBLISHED datasource's OWN calculated fields (from its real ``.tds``) with the
+    # workbook's. A workbook caches only the calcs it actually places on a shelf, so a published
+    # calc the workbook never referenced would otherwise be dropped from the rebuilt model. Pulling
+    # the ``.tds``'s own calcs guarantees the model attached to a published-datasource workbook
+    # carries BOTH the datasource's and the workbook's calculations -- by construction, not
+    # contingent on Tableau's cache. Workbook-local calcs WIN on a caption clash (they are this
+    # workbook's authored intent). Fail-closed: a parse hiccup leaves the workbook-only calcs
+    # exactly as before. ``match["text"]`` is the published ``.tds`` XML text (same value already
+    # passed to ``migrate_datasource`` below), so ``extract_calcs`` parses it directly.
+    try:
+        own_calcs = extract_calcs(match["text"])
+    except Exception:
+        own_calcs = []
+    if own_calcs:
+        wb_calcs = list(wb_calcs or [])
+        wb_dim_calcs = list(wb_dim_calcs or [])
+        have = {(c.get("name") or "").strip().lower()
+                for c in (*wb_calcs, *wb_dim_calcs) if c.get("name")}
+        for c in own_calcs:
+            nm = (c.get("name") or "").strip().lower()
+            if not nm or nm in have:
+                continue
+            entry = {"name": c["name"], "formula": c["formula"]}
+            if c.get("internal_name"):
+                entry["internal_name"] = c["internal_name"]
+            if (c.get("role") or "measure").strip().lower() == "dimension":
+                entry["role"] = "dimension"
+                wb_dim_calcs.append(entry)
+            else:
+                wb_calcs.append(entry)
+            have.add(nm)
     # Table-calc addressing (partition / order) lives in the WORKBOOK's worksheet shelves, never in
     # the published ``.tds`` schema we rebuild from -- so extract the usages from ``twb_text`` and
     # thread them through. Without this, positional measures (WINDOW_STDEV, percent-difference, LAST)
@@ -1515,28 +1586,50 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
     _ff_dest = None
     if wb_id is not None and pbip_dir:
         _ff_dest = os.path.join(os.path.dirname(os.path.abspath(pbip_dir)), "data", model_safe)
-    # Reuse a sibling datasource's already-extracted flat-file data. A .twbx usually does NOT bundle
+    # Reuse a sibling datasource's already-materialized flat-file data. A .twbx usually does NOT bundle
     # its extract -- the data lives in the published/sibling .tdsx that the estate migrated separately
     # (datasources are migrated before workbooks). When that datasource already landed its Excel/CSV at
-    # an absolute path, bind the workbook's model to the SAME file (one shared copy) so the workbook
-    # .pbip loads, instead of leaving the relative path Power BI Desktop cannot open. When there is no
-    # sibling match, migrate_datasource still tries to extract data bundled in the .twbx itself.
+    # an absolute path (``flatfile_path``) or read its .hyper to CSV (``table_csv_paths``), bind the
+    # workbook's model to the SAME data so the workbook .pbip loads, instead of leaving the relative
+    # path Power BI Desktop cannot open. When there is no sibling match, migrate_datasource still tries
+    # to materialize data bundled in the .twbx itself (Excel/CSV, or an embedded .hyper extract).
     ff_path = None
+    local_data = None
     if ds_catalog:
         cat = ds_catalog.get(_norm_ds(primary.get("caption") or primary.get("name") or label))
         if cat:
             ff_path = cat.get("flatfile_path")
+            local_data = cat.get("table_csv_paths")
     try:
         res = migrate_datasource(twb_text, model_name=model_safe, datasource=label,
                                  approved_calc_dax=approved_calc_dax,
                                  packaged_source=wb_id, flatfile_dest_dir=_ff_dest,
-                                 flatfile_path=ff_path)
+                                 flatfile_path=ff_path, local_data=local_data)
     except Exception as exc:
         warns.append(_PBIP_WARN + f"could not rebuild embedded datasource {label!r} "
                      f"({type(exc).__name__}: {exc}) -- workbook .pbip skipped")
         return
 
     res_report = res.get("report") or {}
+    # Honest flat-file data signal: when the embedded datasource names a flat file but the data could
+    # NOT be materialized to an absolute path (no bundled file / a .hyper present but tableauhyperapi
+    # not installed / fetched without includeExtract), the emitted model OPENS but loads no data. Warn
+    # explicitly rather than silently shipping a broken model. Successful landings stay quiet.
+    _ffd = res_report.get("flatfile_data")
+    if _ffd:
+        detail["flatfile_data"] = {"landed": bool(_ffd.get("landed")),
+                                   "kind": _ffd.get("kind"), "reason": _ffd.get("reason"),
+                                   "hyper_present": _ffd.get("hyper_present")}
+    if _ffd and not _ffd.get("landed"):
+        _why = {
+            "hyperapi_unavailable": "the workbook bundles a .hyper extract but the optional "
+                                    "tableauhyperapi is not installed (pip install tableauhyperapi)",
+            "no_bundled_data": "the workbook bundles neither the source file nor a .hyper extract -- "
+                               "re-fetch the workbook with --include-extract",
+            "not_a_package": "the embedded datasource carries no bundled data to land",
+        }.get(_ffd.get("reason"), _ffd.get("reason") or "data could not be materialized")
+        warns.append(_PBIP_WARN + f"embedded datasource {label!r} is flat-file but its data was not "
+                     f"landed to an absolute path -- the model opens but loads no rows ({_why})")
     if res_report.get("fallback"):
         # Published-datasource workbook: its own embedded copy is a sqlproxy proxy stub with no
         # usable schema, so rebuilding it lands in the lakehouse fallback. When the estate already

@@ -9,6 +9,12 @@ per-phase resource docs on demand as you reach each phase.
 > report is **supported as a preview** (Tier-1 structure, bound into an openable `.pbip`) via the estate
 > orchestrator and `twb_to_pbir`; visual formatting is a later pass. See
 > [viz-rebuild.md](viz-rebuild.md) and [feature-parity.md](feature-parity.md).
+>
+> **Migrating a workbook (not a bare datasource)?** Follow the strict workbook procedure in
+> **SKILL.md STEP 1** — download every workbook with `fetch_tds.py --workbook-name` (never hand-roll a
+> REST downloader or unzip the `.twbx`), and when the workbook connects to a **published** datasource,
+> co-migrate that datasource in the **same** `.\tds` so the workbook's model carries both the
+> datasource's and the workbook's calculations. `migrate_estate.py` auto-detects embedded vs published.
 
 ---
 
