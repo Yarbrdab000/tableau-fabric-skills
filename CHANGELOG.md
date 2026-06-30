@@ -13,7 +13,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration:** **extract-backed flat-file data is now materialized to an absolute path, so a
+- **tableau-migration:** **the live pull can now obtain the Tableau secret without Azure Key Vault, via a
+  masked terminal prompt.** The runbook asks an explicit credential-access question — **(A) Azure Key Vault**
+  (the default) or **(B) a local secure terminal prompt** — instead of silently assuming Key Vault. When the
+  user chooses the local terminal, `fetch_tds.py --prompt-secret` reads the PAT (or Connected-App) secret at
+  a hidden `getpass` prompt, exchanges it for a session token, and clears it from the process environment in
+  a `finally` block. The secret is held **in memory only** — never echoed, written to disk (`.env`, logs) or
+  the report, or shown in chat — an **empty entry is rejected** (fail fast), and `--no-prompt` forbids the
+  prompt for unattended/CI runs. This routes `fetch_tds.py` through the existing dependency-free
+  `credential_resolver` (explicit → `TABLEAU_PAT_VALUE` env → git-ignored `.env` → OS keyring → masked
+  prompt), and adds a value-free `clear_secret_env` cleanup helper. Additive — no report-schema change; the
+  Key Vault path is unchanged and remains the default. Folded into skill `VERSION` `1.13.0`.
+- **tableau-migration:** **a generic-ODBC datasource running Custom SQL now migrates to a working
+  Power BI Import model.** A Tableau `genericodbc` connection that fronts a query engine with Custom
+  SQL (for example MinIO object storage reached through an ODBC driver) previously had no mappable
+  Power BI connector, so it fell through to the lakehouse fallback and never produced a model. The
+  custom-SQL relation now emits an `Odbc.Query("<connection string>", "<SQL>")` M partition: the SQL
+  passes straight through the ODBC driver to whatever engine sits behind it, so the tier is
+  **engine-agnostic**. The connection string is reconstructed from the parsed connection — a
+  `Driver={…};Server=…;Port=…;Database=…` form, or `dsn=<DSN>` when a DSN is present (a DSN wins over
+  an inline driver) — and a DSN-only **table** relation instead scaffolds an `Odbc.DataSource(…)` for
+  review. **Secrets never leak:** inline credentials in the ODBC connect-string extras
+  (`UID` / `PWD` / `username` / `password` / tokens / access keys, case-insensitive) are scrubbed at
+  parse time, so neither the emitted M nor the migration descriptor/report carries a credential, and
+  `emit_connection_parameters` stays empty for ODBC (the connection string is inlined into
+  `Odbc.Query`). **Fail-closed:** when neither a driver nor a DSN can be recovered the run routes to
+  land-to-Delta / DirectLake with a manual follow-up rather than emitting an unusable partition, and
+  `genericjdbc` is deliberately excluded (Power BI has no JDBC connector). Additive — the migration
+  report schema only gains non-secret `odbc_*` routing hints; the migration suite stays green. Skill
+  `VERSION` `1.12.0` → `1.13.0`.
   migrated Import model actually loads rows.** Previously an Excel/CSV or extract-backed source (e.g. a
   `… - Extract` datasource whose `.tdsx`/`.twbx` bundles a `.hyper` rather than the original workbook)
   emitted `File.Contents` with Tableau's **relative** path — Power BI Desktop rejected it (*"The supplied

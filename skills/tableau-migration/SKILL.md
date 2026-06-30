@@ -40,7 +40,7 @@ do not improvise flags or infer answers. The detailed reference body begins afte
 ### Phase 0A — Decision Menu (present verbatim; defaults marked)
 
 ```
-Before I migrate anything, confirm these 5 choices (e.g. reply "D1=A, D2=all, D3=A, D4=C, D5=A"):
+Before I migrate anything, confirm these choices (e.g. reply "D1=A, D2=all, D3=A, D4=C, D5=A, D6=A"):
 
 D1 — SOURCE
    A) Live pull from Tableau Server/Cloud   (datasources and/or workbooks; needs Tableau creds)
@@ -61,6 +61,10 @@ D4 — CONFLICTS (a model of the same name already exists in the workspace)
 D5 — AUTH  (forces the auth choice)
    A) PAT                       (default, recommended)
    B) Connected App JWT (Direct Trust)
+
+D6 — CREDENTIAL ACCESS  (only if D1=A; how I obtain the PAT / Connected-App secret)
+   A) Azure Key Vault           (default — I read it into TABLEAU_PAT_VALUE at run time)
+   B) Local secure terminal     (no Key Vault — you type it into a hidden prompt; never in chat)
 ```
 
 > **Workbook in scope?** If D2 names a **workbook**, also state whether it uses an **embedded**
@@ -71,20 +75,24 @@ D5 — AUTH  (forces the auth choice)
 
 ### Phase 0B — Credentials form (simple 2-file pattern)
 
+**Ask D6 first (only when D1=A): "How would you like me to access the Tableau credentials —
+(A) Azure Key Vault, or (B) a local secure terminal prompt?"** Never accept a secret pasted into
+chat under either choice.
+
 Collect the values below, then write them into a **git-ignored** local vars file — never paste the
-PAT/Connected-App secret into chat; it lives in Key Vault.
+PAT/Connected-App secret into chat.
 
 | Variable | Meaning |
 |---|---|
 | `SITE_URL` | Tableau host, e.g. `10ay.online.tableau.com` (no `https://`) |
 | `SITE_NAME` | site contentUrl (URL slug; empty string for Default) |
 | `PAT_NAME` | Personal Access Token name (D5=A) |
-| `KV_NAME` | Azure Key Vault holding the secret value |
-| `SECRET_NAME` | the Key Vault secret whose value is the PAT (or Connected-App) secret |
+| `KV_NAME` | Azure Key Vault holding the secret value (**D6=A only**) |
+| `SECRET_NAME` | the Key Vault secret whose value is the PAT (or Connected-App) secret (**D6=A only**) |
 | `FABRIC_WORKSPACE` | target Fabric workspace name or GUID (only if D3 ≠ C) |
 
 If **D5=B**, also collect the Connected App `CLIENT_ID`, `SECRET_ID`, and impersonation
-`JWT_USERNAME` (the secret value still comes from Key Vault) instead of `PAT_NAME`.
+`JWT_USERNAME` (the secret value comes from Key Vault or the terminal prompt) instead of `PAT_NAME`.
 
 Set up the local vars file (mirrors the repo's `.env.example` → `.env` convention):
 
@@ -97,16 +105,16 @@ Copy-Item .\migration.vars.example.ps1 .\migration.vars.local.ps1   # once
 `migration.vars.example.ps1` is committed with **placeholders**; `migration.vars.local.ps1` holds
 the **real** values and is git-ignored — never commit or mirror it.
 
-> **No Azure Key Vault? (local / POC runs.)** Key Vault is the default for the live pull, but it is
-> **not required**. `LiveTableauSource` resolves the PAT secret through a layered, Key-Vault-free
-> resolver (`scripts/credential_resolver.py`) that tries, in order: an explicit value, the
-> **`TABLEAU_PAT`** environment variable, that same key in a git-ignored `.env` file, an OS-keyring
-> secret (Windows Credential Manager / macOS Keychain / Secret Service via the optional
-> `pip install keyring`), then — only if `allow_prompt=True` and a console is attached — an
-> interactive `getpass` prompt. So a POC can authenticate with just `set TABLEAU_PAT=<secret>` (or a
-> `.env`), and falls back to the Key Vault path only when no local layer is configured. The secret is
-> returned to the caller only — never logged, persisted, or written to the report; only a value-free
-> layer label (`_pat_source`) is retained.
+> **D6=B — Local secure terminal (no Azure Key Vault).** Key Vault is the default, but it is **not
+> required**. When the user chooses the local terminal, run `fetch_tds.py` with **`--prompt-secret`**
+> (or simply leave `TABLEAU_PAT_VALUE` unset): it asks for the PAT secret at a **hidden** `getpass`
+> prompt in that terminal, exchanges it for a session token, and clears it from the process
+> environment afterward. The secret is held **in memory only** — never echoed, written to disk
+> (`.env`, logs, the report), or placed in chat — and an empty entry is rejected (fail fast). Tell
+> the user explicitly: *"enter your PAT secret in the terminal now; don't paste it in chat."* This
+> is the same masked path the layered, Key-Vault-free resolver (`scripts/credential_resolver.py`)
+> exposes — which also supports `TABLEAU_PAT_VALUE`, a git-ignored `.env`, or an OS keyring
+> (`pip install keyring`) when those are preferred. Use `--no-prompt` for unattended/CI runs.
 
 ### Phase 0C — Confirmation Ledger (the run gate)
 
@@ -119,7 +127,7 @@ LEDGER — confirm, then reply GO
   workbook ds: <none | embedded | published: "<DS>" co-migrated in scope>   (omit if no workbook)
   outputs    : <D3 A both / B Fabric only / C local only>
   conflicts  : <D4 overwrite | skip | stop>
-  auth       : <D5 PAT | Connected App JWT>   (secret from KV <KV_NAME>/<SECRET_NAME>)
+  auth       : <D5 PAT | Connected App JWT>   (D6 secret via <Key Vault KV_NAME/SECRET_NAME | local terminal prompt>)
   fabric ws  : <FABRIC_WORKSPACE>             (omit if D3=C)
 ```
 
@@ -140,7 +148,8 @@ PowerShell (Windows lead). Dot-source the vars first: `. .\migration.vars.local.
   `.twb`/`.twbx` **workbooks** — then go to STEP 2. For a **flat-file or extract-backed** source
   (Excel/CSV, or a `… - Extract` source carrying a `.hyper`), export the **packaged** form
   (`.tdsx`/`.twbx`) so the data travels inside the file — STEP 2 lifts it to an absolute path.
-- **D1=A (live):** pull the secret from Key Vault, then loop `fetch_tds.py` per datasource name:
+- **D1=A (live):** obtain the secret per **D6**, then loop `fetch_tds.py` per datasource name.
+  **D6=A (Key Vault):** read it into the env var, then run the loop:
 
 ```powershell
 $env:TABLEAU_PAT_VALUE = az keyvault secret show --vault-name $KV_NAME --name $SECRET_NAME --query value -o tsv
@@ -151,8 +160,13 @@ foreach ($ds in @("<Datasource A>","<Datasource B>")) {   # D2 scope
 }
 ```
 
+D6=B (local terminal, no Key Vault): skip the `az keyvault` line, leave `TABLEAU_PAT_VALUE` unset,
+and add `--prompt-secret` to each `fetch_tds.py` call — it asks for the PAT secret at a hidden
+terminal prompt (tell the user to type it **into the terminal**, never in chat).
+
 D5=B (JWT): replace `--auth pat --pat-name $PAT_NAME` with
-`--auth jwt --client-id $CA_CLIENT_ID --secret-id $CA_SECRET_ID --secret-value $env:TABLEAU_PAT_VALUE --jwt-username $JWT_USERNAME`.
+`--auth jwt --client-id $CA_CLIENT_ID --secret-id $CA_SECRET_ID --jwt-username $JWT_USERNAME`
+(add `--secret-value $env:TABLEAU_PAT_VALUE` for D6=A, or `--prompt-secret` for D6=B).
 
 - **D1=A (live workbook + its embedded datasource):** `fetch_tds.py` also downloads a published
   **workbook** — in the loop above swap `--datasource-name $ds` for `--workbook-name "<Workbook>"`

@@ -101,6 +101,29 @@ def _stdin_is_tty():
         return False
 
 
+def clear_secret_env(*names, environ=None):
+    """Remove each named secret variable from the process environment; return the names cleared.
+
+    A centralized cleanup so a secret pulled into ``os.environ`` (e.g. ``TABLEAU_PAT_VALUE`` set
+    from a vault or a masked prompt) does not linger in **this** process after it has been used.
+    Designed to be called from a ``finally`` block so it runs on both the success and the failure
+    path. Returns the sorted list of names that were actually present and removed (a value-free
+    audit trace); names that are absent are ignored. Never reads, returns, or logs a value, and --
+    because a child process only ever holds a COPY of the environment -- it cannot affect the
+    parent shell's variables. ``environ`` is an injectable test seam (defaults to ``os.environ``).
+    """
+    environ = os.environ if environ is None else environ
+    cleared = []
+    for name in names:
+        if name and name in environ:
+            try:
+                del environ[name]
+            except Exception:
+                continue
+            cleared.append(name)
+    return sorted(cleared)
+
+
 def resolve_secret(name, *, explicit=None, env_var=None, env_file=None,
                    keyring_service=None, keyring_username=None, allow_prompt=False,
                    prompt_text=None, environ=None, keyring_module=None, prompt_func=None,

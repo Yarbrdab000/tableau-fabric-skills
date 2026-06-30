@@ -206,6 +206,115 @@ def test_pick_workbook_ambiguous_raises():
         F.pick_workbook(wb, "Dup")
 
 
+# -- _resolve_auth: masked Local Secure Prompt (no Key Vault) --------------------------------
+class _AuthArgs:
+    """Minimal stand-in for argparse.Namespace covering the fields _resolve_auth reads."""
+    def __init__(self, **kw):
+        self.auth = "pat"
+        self.pat_name = "Migration-PAT"
+        self.pat_secret = None
+        self.client_id = None
+        self.secret_id = None
+        self.secret_value = None
+        self.jwt_username = None
+        self.prompt_secret = False
+        self.no_prompt = False
+        self.__dict__.update(kw)
+
+
+@pytest.fixture
+def _no_secret_env(monkeypatch):
+    """Ensure no ambient secret env var leaks into the prompt tests."""
+    monkeypatch.delenv("TABLEAU_PAT_VALUE", raising=False)
+    monkeypatch.delenv("TABLEAU_CONNECTED_APP_SECRET_VALUE", raising=False)
+    monkeypatch.delenv("TABLEAU_PAT_NAME", raising=False)
+
+
+def test_resolve_auth_prompts_masked_for_pat_secret(_no_secret_env):
+    seen = {}
+
+    def fake_prompt(text):
+        seen["text"] = text
+        return "typed-secret"
+
+    err = io.StringIO()
+    name, secret, jwt = F._resolve_auth(_AuthArgs(), prompt_func=fake_prompt, isatty=True, stream=err)
+    assert (name, secret, jwt) == ("Migration-PAT", "typed-secret", None)
+    # the prompt is hidden-input (getpass passed our func a label, never the value)
+    assert seen["text"] == "Tableau PAT secret (input hidden): "
+    out = err.getvalue()
+    assert "type it into THIS terminal" in out      # explicit terminal-not-chat instruction
+    assert "received (hidden)" in out               # neutral confirmation after entry
+    assert "typed-secret" not in out                # the secret value never reaches the stream
+
+
+def test_resolve_auth_env_var_wins_no_prompt(_no_secret_env, monkeypatch):
+    monkeypatch.setenv("TABLEAU_PAT_VALUE", "fromenv")
+
+    def boom(_t):
+        raise AssertionError("must not prompt when the env var is set")
+
+    err = io.StringIO()
+    name, secret, jwt = F._resolve_auth(_AuthArgs(), prompt_func=boom, isatty=True, stream=err)
+    assert secret == "fromenv"
+    assert err.getvalue() == ""                     # no instruction line when not prompting
+
+
+def test_resolve_auth_prompt_secret_forces_prompt_over_env(_no_secret_env, monkeypatch):
+    monkeypatch.setenv("TABLEAU_PAT_VALUE", "fromenv")
+
+    def fake_prompt(_t):
+        return "typed-fresh"
+
+    name, secret, jwt = F._resolve_auth(
+        _AuthArgs(prompt_secret=True), prompt_func=fake_prompt, isatty=True, stream=io.StringIO())
+    assert secret == "typed-fresh"                  # --prompt-secret ignores the env layer
+
+
+def test_resolve_auth_fails_fast_on_empty_entry(_no_secret_env):
+    with pytest.raises(SystemExit) as ei:
+        F._resolve_auth(_AuthArgs(), prompt_func=lambda _t: "   ", isatty=True, stream=io.StringIO())
+    assert "empty entry is rejected" in str(ei.value)
+
+
+def test_resolve_auth_no_prompt_forbids_prompting(_no_secret_env):
+    def boom(_t):
+        raise AssertionError("must not prompt under --no-prompt")
+
+    with pytest.raises(SystemExit):
+        F._resolve_auth(_AuthArgs(no_prompt=True), prompt_func=boom, isatty=True, stream=io.StringIO())
+
+
+def test_resolve_auth_pat_name_required_before_secret(_no_secret_env):
+    with pytest.raises(SystemExit) as ei:
+        F._resolve_auth(_AuthArgs(pat_name=None), prompt_func=lambda _t: "x",
+                        isatty=True, stream=io.StringIO())
+    assert "token NAME" in str(ei.value)
+
+
+def test_resolve_auth_jwt_secret_value_reuses_masked_prompt(_no_secret_env):
+    seen = {}
+
+    def fake_prompt(text):
+        seen["text"] = text
+        return "jwt-secret"
+
+    err = io.StringIO()
+    name, secret, jwt = F._resolve_auth(
+        _AuthArgs(auth="jwt", pat_name=None, client_id="cid", secret_id="sid",
+                  jwt_username="admin@corp.com"),
+        prompt_func=fake_prompt, isatty=True, stream=err)
+    assert name is None and secret is None and jwt   # a signed JWT was produced
+    assert "Connected App secret value" in seen["text"]
+    assert "jwt-secret" not in err.getvalue()        # secret never echoed
+
+
+def test_resolve_auth_unattended_no_tty_does_not_hang(_no_secret_env):
+    # allow_prompt defaults on, but no console + no injected prompt -> fail fast, never block.
+    with pytest.raises(SystemExit):
+        F._resolve_auth(_AuthArgs(), isatty=False, stream=io.StringIO())
+
+
 def test_resolve_workbook_luid_parses_rest_shape(monkeypatch):
     # Mirror the datasource response shape: {"workbooks": {"workbook": [...]}}.
     captured = {}

@@ -143,3 +143,28 @@ def test_resolved_secret_repr_redacts_value():
 def test_all_default_call_finds_nothing():
     with pytest.raises(C.CredentialNotFound):
         C.resolve_secret("PAT", environ={})
+
+
+# -- clear_secret_env (cleanup) -----------------------------------------------------------------
+def test_clear_secret_env_removes_present_and_returns_names():
+    env = {"TABLEAU_PAT_VALUE": "s3cr3t", "OTHER": "keep"}
+    cleared = C.clear_secret_env("TABLEAU_PAT_VALUE", "TABLEAU_CONNECTED_APP_SECRET_VALUE",
+                                 environ=env)
+    assert cleared == ["TABLEAU_PAT_VALUE"]      # only the one that was present
+    assert "TABLEAU_PAT_VALUE" not in env        # actually removed
+    assert env["OTHER"] == "keep"                # untouched
+
+
+def test_clear_secret_env_ignores_absent_and_is_value_free():
+    env = {"OTHER": "keep"}
+    cleared = C.clear_secret_env("TABLEAU_PAT_VALUE", environ=env)
+    assert cleared == []                          # nothing present -> nothing cleared
+    assert "s3cr3t" not in repr(cleared)          # the return trace carries no value
+    assert env == {"OTHER": "keep"}
+
+
+def test_clear_secret_env_clears_multiple_sorted():
+    env = {"B_SECRET": "x", "A_SECRET": "y", "OTHER": "z"}
+    cleared = C.clear_secret_env("B_SECRET", "A_SECRET", environ=env)
+    assert cleared == ["A_SECRET", "B_SECRET"]    # sorted, value-free
+    assert env == {"OTHER": "z"}

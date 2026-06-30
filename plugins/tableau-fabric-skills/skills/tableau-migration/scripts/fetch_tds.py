@@ -61,7 +61,16 @@ import urllib.request
 import uuid
 import zipfile
 
+try:  # script-run (scripts/ on sys.path) and the test import both resolve this absolute form
+    from credential_resolver import resolve_secret, CredentialNotFound, clear_secret_env
+except ImportError:  # package-style consumers
+    from .credential_resolver import resolve_secret, CredentialNotFound, clear_secret_env
+
 DEFAULT_REST_VERSION = "3.24"
+
+# Secret environment variables this tool may read; cleared from the process env after sign-in
+# (success or failure) so a secret pulled from a vault / masked prompt does not linger in-process.
+_SECRET_ENV_VARS = ("TABLEAU_PAT_VALUE", "TABLEAU_CONNECTED_APP_SECRET_VALUE")
 
 
 # == pure helpers (offline-testable; no network) =============================================
@@ -346,16 +355,69 @@ def save_outputs(raw, out_path, name, kind="datasource"):
     return doc_path, archive_path
 
 
-def _resolve_auth(args):
-    """Return ``(pat_name, pat_secret, jwt)`` from args/env per the chosen --auth mode."""
+def _resolve_secret_value(label, *, explicit, env_var, allow_prompt, force_prompt=False,
+                          prompt_func=None, isatty=None, stream=None):
+    """Resolve a secret from a flag/env, else a **masked** terminal prompt -- never chat or disk.
+
+    Delegates to ``credential_resolver.resolve_secret`` so the value is held in memory only and is
+    never logged or persisted. When the secret is not supplied through ``explicit`` (a CLI flag) or
+    ``env_var`` and ``allow_prompt`` is set, the user is asked to type it into THIS terminal behind
+    a hidden ``getpass`` prompt. ``force_prompt`` ignores the flag/env layers and always prompts
+    (the explicit "Local Secure Prompt" choice). A short instruction is written to ``stream``
+    (stderr) before the prompt and a neutral confirmation after -- only when a prompt actually
+    happens -- and the secret VALUE is never echoed. Fails fast with ``SystemExit`` when no layer
+    yields a value (e.g. an empty entry, or no console on an unattended run). Returns the value.
+    ``prompt_func`` / ``isatty`` / ``stream`` are injectable test seams.
+    """
+    stream = sys.stderr if stream is None else stream
+    use_explicit = None if force_prompt else explicit
+    use_env_var = None if force_prompt else env_var
+    direct = (use_explicit or "").strip()
+    if not direct and use_env_var:
+        direct = (os.environ.get(use_env_var) or "").strip()
+    will_prompt = allow_prompt and not direct
+    if will_prompt:
+        print(f"[auth] {label}: type it into THIS terminal now (input is hidden). "
+              f"Do NOT paste secrets into chat.", file=stream)
+    try:
+        resolved = resolve_secret(
+            label, explicit=use_explicit, env_var=use_env_var,
+            allow_prompt=allow_prompt, prompt_text=f"{label} (input hidden): ",
+            prompt_func=prompt_func, isatty=isatty)
+    except CredentialNotFound:
+        raise SystemExit(
+            f"No {label} was provided. Supply --pat-secret / the matching --secret-value, set "
+            f"{env_var}, or run in an interactive terminal so it can be entered at a hidden prompt "
+            f"(do not paste secrets into chat). An empty entry is rejected.")
+    if will_prompt and resolved.source == "prompt":
+        print(f"[auth] {label} received (hidden) -- not stored, not echoed.", file=stream)
+    return resolved.value
+
+
+def _resolve_auth(args, *, prompt_func=None, isatty=None, stream=None):
+    """Return ``(pat_name, pat_secret, jwt)`` from args/env per the chosen --auth mode.
+
+    The non-secret identifiers (PAT name, Connected-App client/secret IDs, the impersonation
+    username) come from a flag or an environment variable as before. The SECRET values (the PAT
+    secret, the Connected-App secret value) additionally fall back to a masked terminal prompt via
+    :func:`_resolve_secret_value` when they are not supplied and prompting is allowed -- so a run
+    with **no Azure Key Vault** can authenticate by typing the secret into the terminal. ``--no-prompt``
+    forbids the prompt (unattended/CI); ``--prompt-secret`` forces it even when an env var is set.
+    """
+    allow_prompt = not getattr(args, "no_prompt", False)
+    force_prompt = bool(getattr(args, "prompt_secret", False)) and allow_prompt
     if args.auth == "jwt":
         client_id = args.client_id or os.environ.get("TABLEAU_CONNECTED_APP_CLIENT_ID")
         secret_id = args.secret_id or os.environ.get("TABLEAU_CONNECTED_APP_SECRET_ID")
-        secret_value = args.secret_value or os.environ.get("TABLEAU_CONNECTED_APP_SECRET_VALUE")
         username = args.jwt_username or os.environ.get("TABLEAU_JWT_USERNAME")
-        if not (client_id and secret_id and secret_value and username):
-            raise SystemExit("--auth jwt needs client id, secret id, secret value, and a username "
-                             "(flags or TABLEAU_CONNECTED_APP_* / TABLEAU_JWT_USERNAME).")
+        if not (client_id and secret_id and username):
+            raise SystemExit("--auth jwt needs a client id, a secret id, and a username "
+                             "(flags or TABLEAU_CONNECTED_APP_CLIENT_ID / "
+                             "TABLEAU_CONNECTED_APP_SECRET_ID / TABLEAU_JWT_USERNAME).")
+        secret_value = _resolve_secret_value(
+            "Tableau Connected App secret value", explicit=args.secret_value,
+            env_var="TABLEAU_CONNECTED_APP_SECRET_VALUE", allow_prompt=allow_prompt,
+            force_prompt=force_prompt, prompt_func=prompt_func, isatty=isatty, stream=stream)
         scope_env = os.environ.get("TABLEAU_JWT_SCOPES")
         scopes = None
         if scope_env:
@@ -363,12 +425,15 @@ def _resolve_auth(args):
         jwt = build_connected_app_jwt(client_id, secret_id, secret_value, username, scopes)
         return None, None, jwt
     pat_name = args.pat_name or os.environ.get("TABLEAU_PAT_NAME")
-    pat_secret = args.pat_secret or os.environ.get("TABLEAU_PAT_VALUE")
-    if not (pat_name and pat_secret):
+    if not pat_name:
         raise SystemExit(
-            "Tableau sign-in needs BOTH a token NAME and a token SECRET (two different values).\n"
-            "  pass --pat-name AND --pat-secret, or set TABLEAU_PAT_NAME / TABLEAU_PAT_VALUE,\n"
-            "  or use --auth jwt for a Connected App. A vault secret alone is only the secret half.")
+            "Tableau PAT sign-in needs a token NAME (it is not a secret): pass --pat-name or set "
+            "TABLEAU_PAT_NAME. The token SECRET is separate -- pass --pat-secret, set "
+            "TABLEAU_PAT_VALUE, or enter it at the hidden prompt.")
+    pat_secret = _resolve_secret_value(
+        "Tableau PAT secret", explicit=args.pat_secret, env_var="TABLEAU_PAT_VALUE",
+        allow_prompt=allow_prompt, force_prompt=force_prompt,
+        prompt_func=prompt_func, isatty=isatty, stream=stream)
     return pat_name, pat_secret, None
 
 
@@ -392,6 +457,11 @@ def main(argv=None):
     ap.add_argument("--secret-id", help="Connected App secret id (--auth jwt)")
     ap.add_argument("--secret-value", help="Connected App secret value (--auth jwt)")
     ap.add_argument("--jwt-username", help="user to act as for --auth jwt")
+    ap.add_argument("--prompt-secret", action="store_true",
+                    help="always enter the secret at a hidden terminal prompt, even if an env var "
+                         "is set (the no-Key-Vault 'Local Secure Prompt' choice)")
+    ap.add_argument("--no-prompt", action="store_true",
+                    help="never prompt for the secret (unattended/CI); require a flag or env var")
     ap.add_argument("--rest-version", default=DEFAULT_REST_VERSION,
                     help=f"Tableau REST API version (default {DEFAULT_REST_VERSION})")
     ap.add_argument("--include-extract", action="store_true",
@@ -427,8 +497,17 @@ def main(argv=None):
 
     pat_name, pat_secret, jwt = _resolve_auth(args)
 
-    token, site_id = sign_in(server, args.rest_version, args.site,
-                             pat_name=pat_name, pat_secret=pat_secret, jwt=jwt)
+    try:
+        token, site_id = sign_in(server, args.rest_version, args.site,
+                                 pat_name=pat_name, pat_secret=pat_secret, jwt=jwt)
+    finally:
+        # The secret has been exchanged for a session token (or sign-in failed); either way it is
+        # no longer needed. Drop the in-memory copy and clear it from this process's environment so
+        # it does not linger for the rest of the run (a child env is a copy -- the parent shell is
+        # unaffected, so a fetch loop that re-exports the var per call still works).
+        pat_secret = None
+        clear_secret_env(*_SECRET_ENV_VARS)
+
     try:
         if is_workbook:
             if args.workbook_luid:

@@ -141,6 +141,16 @@ FLAT_FILE_CLASSES = {
     "csv": "Csv.Document",
 }
 
+# Generic ODBC. Unlike the DIRECT_CONNECTORS, an ODBC source has no fixed connector function:
+# the driver named in the .tds (or its DSN) is what binds, and a Custom SQL relation passes its
+# query straight THROUGH the driver to whatever engine sits behind it -- so the SAME emitter is
+# correct regardless of the upstream (e.g. a query engine such as Trino / Starburst / Dremio
+# fronting object storage like MinIO). Power Query's generic ``Odbc.Query`` (custom SQL) /
+# ``Odbc.DataSource`` (tables) are the faithful targets, engine-agnostic by construction. The
+# JDBC sibling class ('genericjdbc') is deliberately NOT here: Power BI has no JDBC connector
+# (it cannot load Java drivers), so a JDBC source stays on the land-to-Delta fallback.
+ODBC_CLASSES = {"genericodbc"}
+
 # Connector classes a hyper extract may sit over; used only to report whether a live
 # alternative exists for an extracted datasource.
 _LIVE_CLASSES = set(DIRECT_CONNECTORS) | set(PARTIAL_LIVE_CONNECTORS)
@@ -171,12 +181,20 @@ SCORE_DIRECTQUERY_FULL = 95   # live, fully-supported (server, database) connect
 SCORE_IMPORT_FULL = 90        # extract over a fully-supported live source
 SCORE_FLAT_FILE = 80          # Excel/CSV Import (still needs a file path)
 SCORE_PARTIAL = 60            # recognized connector emitted as a flagged scaffold
+SCORE_ODBC = 60              # generic-ODBC custom SQL emitted via Odbc.Query (needs driver + creds)
 SCORE_FALLBACK = 30           # no direct rebuild; route to land-to-Delta + DirectLake
 NATIVE_QUERY_PENALTY = 10     # custom-SQL native query needs a folding review before refresh
 
 _CREDENTIALS_FOLLOWUP = "Configure connection credentials in Fabric (bind links IDs only)."
 _GATEWAY_FOLLOWUP = "If the source is on-premises, set up / select a data gateway for the connection."
 _NATIVE_QUERY_FOLLOWUP = "Review the preserved custom SQL native query (folding / approval) before refresh."
+# Generic ODBC binds through a named driver (or DSN); that driver must be present wherever the
+# model runs. It is the SAME driver Tableau already uses, so this is a known quantity, not a new
+# dependency -- but Power BI Desktop (authoring) and the on-premises data gateway (refresh) each
+# need it installed, so we always surface it.
+_ODBC_DRIVER_FOLLOWUP = ("Install the matching ODBC driver where the model runs (Power BI Desktop to "
+                         "author, the on-premises data gateway to refresh) -- it is the same driver "
+                         "Tableau uses; then set the connection credentials in Fabric.")
 # Databricks emits a doc-verified function shape, but two values can't be sourced portably from
 # the .tds: the SQL-warehouse HTTP path and (depending on the workbook) the Unity Catalog name.
 _DATABRICKS_FOLLOWUP = ('Databricks: set the SQL-warehouse HTTP Path parameter (#"HttpPath") and confirm '
@@ -210,6 +228,18 @@ def _decision(mode, connector, **kw):
 
 def _has_custom_sql(descriptor):
     return any(r.get("kind") == "custom_sql" for r in descriptor.get("relations", []))
+
+
+def _odbc_reconstructable(descriptor):
+    """True if a generic-ODBC descriptor carries enough to rebuild a connection string.
+
+    The precondition mirrors ``connection_to_m._odbc_connection_string``: a DSN name (the DSN
+    encapsulates driver + host) OR a driver name (a driver-based string is then built from
+    server/port/database). With neither there is nothing to bind, so the caller fails closed to
+    the land-to-Delta fallback. Reads only descriptor facts -- no XML, no secrets.
+    """
+    return bool((descriptor.get("odbc_dsn") or "").strip()
+                or (descriptor.get("odbc_driver") or "").strip())
 
 
 def _structurally_unsupported_reason(descriptor):
@@ -294,6 +324,40 @@ def select_storage_mode(descriptor):
             score=SCORE_FALLBACK,
             rationale=f"Direct-upstream rebuild not safe ({reason}); use land-to-Delta + DirectLake "
                       f"(default storage mode if rebuilt directly: Import).",
+        )
+
+    # 1.5 generic ODBC -> Odbc.Query (custom SQL) / Odbc.DataSource (tables), Import by default.
+    #     The query passes straight through the named driver to whatever engine sits behind it,
+    #     so this is engine-agnostic (the upstream can be a query engine such as Trino / Starburst
+    #     / Dremio over object storage). A Custom SQL snapshot mirrors how Tableau uses the source,
+    #     so Import is the natural mode. Fails closed to land-to-Delta when the .tds carries neither
+    #     a DSN nor a driver name (nothing to bind).
+    if cls in ODBC_CLASSES:
+        if not _odbc_reconstructable(descriptor):
+            return _decision(
+                None, None,
+                fallback=FALLBACK_LAND_TO_DELTA,
+                score=SCORE_FALLBACK,
+                rationale=(f"Generic ODBC source ({cls}) carried neither a DSN nor a driver name, "
+                           "so no connection string can be reconstructed; use land-to-Delta + "
+                           "DirectLake (default storage mode if rebuilt directly: Import)."),
+                manual_followups=base_followups,
+            )
+        connector = "Odbc.Query" if uses_native else "Odbc.DataSource"
+        followups = list(base_followups) + [_ODBC_DRIVER_FOLLOWUP, _GATEWAY_FOLLOWUP]
+        if uses_native:
+            followups.append(_NATIVE_QUERY_FOLLOWUP)
+        return _decision(
+            "Import", connector,
+            fully_supported=False,
+            uses_native_query=uses_native,
+            score=SCORE_ODBC,
+            rationale=(f"Generic ODBC source ({cls}) -> Import via "
+                       + ("Odbc.Query (the custom SQL passes through the driver to the upstream "
+                          "engine, preserving its dialect)." if uses_native
+                          else "Odbc.DataSource.")
+                       + " Engine-agnostic: the driver/DSN named in the .tds binds the connection."),
+            manual_followups=followups,
         )
 
     # 2. unknown connector class -> fall back.
