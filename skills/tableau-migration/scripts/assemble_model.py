@@ -2358,6 +2358,119 @@ def _resolve_local_csv_paths(local_data, *, source, model_name, write_to):
         ".hyper/.tdsx/.twbx path, or True to auto-extract the source's embedded .hyper")
 
 
+def _archive_path_for(packaged_source):
+    """Resolve ``packaged_source`` to a real ``.tdsx``/``.twbx`` path on disk for archive
+    introspection, returning ``(path, is_temp)``. Bytes are spilled to a temp file (caller cleans
+    up when ``is_temp``); an existing zip path is returned as-is; anything else yields ``(None,
+    False)``. Fail-closed -- never raises."""
+    import os as _os
+    import tempfile as _tf
+    import zipfile as _zip
+    if isinstance(packaged_source, (bytes, bytearray)):
+        if bytes(packaged_source[:2]) != b"PK":
+            return None, False
+        try:
+            fd, tmp = _tf.mkstemp(suffix=".twbx")
+            with _os.fdopen(fd, "wb") as fh:
+                fh.write(bytes(packaged_source))
+            return tmp, True
+        except OSError:
+            return None, False
+    try:
+        p = _os.fspath(packaged_source)
+    except TypeError:
+        return None, False
+    if isinstance(p, str) and "\n" not in p and "<" not in p:
+        try:
+            if _os.path.isfile(p) and _zip.is_zipfile(p):
+                return p, False
+        except (OSError, ValueError):
+            return None, False
+    return None, False
+
+
+def materialize_bundled_flatfile_data(packaged_source, descriptor, dest_dir, *, model_name="model"):
+    """Land a flat-file datasource's BUNDLED data to ABSOLUTE on-disk paths so the emitted Import
+    model loads in Power BI Desktop -- a relative ``File.Contents`` path opens but loads nothing
+    (*"The supplied file path must be a valid absolute path"*).
+
+    A Tableau ``.tdsx``/``.twbx`` may carry its data in one of two shapes, handled in order:
+
+    1. **Bundled Excel/CSV** -- the original file is packaged under ``Data/``. Lifted out with
+       :func:`extract_bundled_flatfile`. Returns ``{"kind": "flatfile", "flatfile_path": <abs>}``.
+    2. **Extract** -- the package bundles only a ``.hyper`` (the named Excel/CSV is NOT packaged, so
+       step 1 finds nothing). The ``.hyper`` is extracted to one CSV per table via
+       :func:`hyper_reader.extract_to_csv`. Returns
+       ``{"kind": "csv", "table_csv_paths": {table: <abs csv>}}``.
+
+    When neither applies, returns ``{"kind": None, "reason": <str>}`` so the caller can surface an
+    HONEST warning instead of silently emitting an unusable relative path. ``reason`` is one of
+    ``"not_flatfile"`` (no ``flatfile_filename``), ``"not_a_package"`` (bare ``.tds``/XML/in-memory
+    text -- nothing bundled to lift), ``"hyperapi_unavailable"`` (a ``.hyper`` IS present but the
+    optional ``tableauhyperapi`` is not installed), or ``"no_bundled_data"`` (a real package that
+    carries neither the named flat file nor a ``.hyper`` -- e.g. fetched without ``includeExtract``).
+    Every result also carries ``"hyper_present"`` (bool). The helper is fail-closed and never raises.
+    """
+    import os as _os
+    import tempfile as _tf
+    result = {"kind": None, "reason": None, "hyper_present": False,
+              "flatfile_path": None, "table_csv_paths": None}
+    if not (descriptor or {}).get("flatfile_filename"):
+        result["reason"] = "not_flatfile"
+        return result
+
+    # 1. Bundled Excel/CSV: lift the original file out to an absolute path (most faithful).
+    try:
+        ff = extract_bundled_flatfile(packaged_source, descriptor, dest_dir)
+    except Exception:
+        ff = None
+    if ff:
+        result.update(kind="flatfile", flatfile_path=ff)
+        return result
+
+    # 2. Extract case: the named flat file is not packaged, but a .hyper may be. Resolve a usable
+    #    archive path, confirm a .hyper is present, then extract it to CSV (optional dependency).
+    arc_path, is_temp = _archive_path_for(packaged_source)
+    if arc_path is None:
+        result["reason"] = "not_a_package"  # bare .tds / XML text / live source: nothing to lift
+        return result
+    try:
+        from . import hyper_reader as _hr
+    except ImportError:
+        import hyper_reader as _hr
+    try:
+        try:
+            hyper_members = _hr.list_hyper_in_archive(arc_path)
+        except ValueError:
+            hyper_members = []
+        if not hyper_members:
+            result["reason"] = "no_bundled_data"
+            return result
+        result["hyper_present"] = True
+        out_dir = dest_dir or _os.path.join(_tf.mkdtemp(prefix="tableau_extract_"),
+                                            f"{model_name}.Data")
+        try:
+            mapping = _hr.extract_to_csv(arc_path, out_dir)
+        except _hr.HyperApiUnavailable:
+            result["reason"] = "hyperapi_unavailable"
+            return result
+        table_csv_paths = {name: info["csv_path"] for name, info in mapping.items()}
+        if not table_csv_paths:
+            result["reason"] = "no_bundled_data"
+            return result
+        result.update(kind="csv", table_csv_paths=table_csv_paths)
+        return result
+    except Exception as exc:  # fail-closed: any archive/extract problem keeps behavior unchanged
+        result["reason"] = f"extract_error:{type(exc).__name__}"
+        return result
+    finally:
+        if is_temp:
+            try:
+                _os.remove(arc_path)
+            except OSError:
+                pass
+
+
 def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, datasource=None,
                        calcs=None, dim_calcs=None, approved_calc_dax=None, date_range=None,
                        local_data=None, packaged_source=None, flatfile_dest_dir=None, **kwargs):
@@ -2435,6 +2548,30 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
             if dim_calcs is None:
                 dim_calcs = extracted_dims
 
+    # Flat-file Import (Excel/CSV or extract bundled inside a .tdsx/.twbx): materialize the embedded
+    # data to ABSOLUTE on-disk paths so the emitted model LOADS in Power BI Desktop -- a relative
+    # File.Contents path opens but loads nothing ("The supplied file path must be a valid absolute
+    # path"). A bundled Excel/CSV is lifted out verbatim (``flatfile_path``); an EXTRACT-backed
+    # source (only a ``.hyper`` packaged, the original file absent) is read to one CSV per table and
+    # routed through the local-CSV Import path (``local_data``). ``packaged_source`` is the original
+    # zip when ``source`` is XML text (the workbook path passes the ``.twbx``); ``flatfile_dest_dir``
+    # chooses where data lands (else beside the written model). A live DB source carries no
+    # flatfile_filename -> no-op. Skipped when the caller already passed flatfile_path/local_data, or
+    # when there is nowhere to land data (no write_to and no flatfile_dest_dir).
+    _ff_mat = None
+    if (local_data is None and decision.get("mode") is not None
+            and descriptor.get("flatfile_filename") and not kwargs.get("flatfile_path")):
+        import os as _os
+        _ff_dest = flatfile_dest_dir or (
+            _os.path.join(write_to, f"{model_name}.Data") if write_to else None)
+        if _ff_dest:
+            _ff_mat = materialize_bundled_flatfile_data(
+                packaged_source or source, descriptor, _ff_dest, model_name=model_name)
+            if _ff_mat.get("kind") == "flatfile":
+                kwargs["flatfile_path"] = _ff_mat.get("flatfile_path")
+            elif _ff_mat.get("kind") == "csv":
+                local_data = _ff_mat.get("table_csv_paths")
+
     if local_data is not None:
         # Local-POC path: a CSV-backed Import model regardless of connector; never land-to-Delta.
         _split_auto_calcs()
@@ -2451,23 +2588,19 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
                                 write_to=write_to)
     else:
         _split_auto_calcs()
-        # Flat-file Import (Excel/CSV bundled inside a .tdsx/.twbx): lift the embedded data file out
-        # to an ABSOLUTE path so the emitted M's File.Contents loads in Power BI Desktop -- a relative
-        # path opens but loads nothing. ``packaged_source`` is the original zip when ``source`` is XML
-        # text (the workbook path passes the .twbx); ``flatfile_dest_dir`` lets that caller choose
-        # where the data lands (else it lands beside the written model). Only fires when the caller
-        # didn't already pass flatfile_path. A live DB source carries no flatfile_filename -> no-op,
-        # so Snowflake/Databricks/SQL Server connection strings are left untouched.
-        import os as _os
-        _ff_dest = flatfile_dest_dir or (
-            _os.path.join(write_to, f"{model_name}.Data") if write_to else None)
-        if _ff_dest and not kwargs.get("flatfile_path") and descriptor.get("flatfile_filename"):
-            _ff = extract_bundled_flatfile(packaged_source or source, descriptor, _ff_dest)
-            if _ff:
-                kwargs["flatfile_path"] = _ff
         result = migrate_tds_to_semantic_model(
             tds_text, model_name=model_name, calcs=calcs, dim_calcs=dim_calcs, select=datasource,
             approved_calc_dax=approved_calc_dax, date_range=date_range, **kwargs)
+
+    # Additive, honest record of how flat-file data was (or was not) landed, so a caller -- and the
+    # estate orchestrator's warnings -- never silently ship a model that opens but loads no data.
+    if _ff_mat is not None:
+        result.setdefault("report", {})["flatfile_data"] = {
+            "landed": _ff_mat.get("kind") is not None,
+            "kind": _ff_mat.get("kind"),
+            "reason": _ff_mat.get("reason"),
+            "hyper_present": _ff_mat.get("hyper_present", False),
+        }
 
     try:
         result["bind"] = connection_details_for_bind(descriptor)

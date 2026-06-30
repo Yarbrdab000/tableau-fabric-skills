@@ -43,12 +43,12 @@ do not improvise flags or infer answers. The detailed reference body begins afte
 Before I migrate anything, confirm these 5 choices (e.g. reply "D1=A, D2=all, D3=A, D4=C, D5=A"):
 
 D1 — SOURCE
-   A) Live pull from Tableau Server/Cloud   (needs Tableau creds)
-   B) Local exported .tds files I already have
+   A) Live pull from Tableau Server/Cloud   (datasources and/or workbooks; needs Tableau creds)
+   B) Local files I already have            (.tds/.tdsx datasources or .twb/.twbx workbooks)
 
-D2 — SCOPE
-   all)      migrate every datasource found
-   <names>)  a subset — list the datasource names
+D2 — SCOPE   (name datasources, workbooks, or both)
+   all)      migrate every datasource / workbook found in .\tds
+   <names>)  a subset — list the datasource or workbook names
 
 D3 — OUTPUTS  (forces both-vs-one)
    A) Fabric + local bundle   (deploy AND keep the TMDL on disk)
@@ -109,7 +109,7 @@ Echo the resolved choices + resources back, then wait for `GO`:
 ```
 LEDGER — confirm, then reply GO
   source     : <D1 A live / B local>   from <SITE_URL/SITE_NAME  or  .\tds>
-  scope      : <all | name1, name2, ...>
+  scope      : <all | datasource and/or workbook names>
   outputs    : <D3 A both / B Fabric only / C local only>
   conflicts  : <D4 overwrite | skip | stop>
   auth       : <D5 PAT | Connected App JWT>   (secret from KV <KV_NAME>/<SECRET_NAME>)
@@ -127,9 +127,12 @@ Run nothing until the user replies `GO`.
 
 PowerShell (Windows lead). Dot-source the vars first: `. .\migration.vars.local.ps1`.
 
-**STEP 1 — assemble `.\tds` (one `.tds` per datasource)**
+**STEP 1 — assemble `.\tds` (one `.tds`/`.tdsx` per datasource, or a `.twb`/`.twbx` per workbook)**
 
-- **D1=B (local):** drop the exported `.tds` files into `.\tds`, then go to STEP 2.
+- **D1=B (local):** drop your exported files into `.\tds` — `.tds`/`.tdsx` **datasources** and/or
+  `.twb`/`.twbx` **workbooks** — then go to STEP 2. For a **flat-file or extract-backed** source
+  (Excel/CSV, or a `… - Extract` source carrying a `.hyper`), export the **packaged** form
+  (`.tdsx`/`.twbx`) so the data travels inside the file — STEP 2 lifts it to an absolute path.
 - **D1=A (live):** pull the secret from Key Vault, then loop `fetch_tds.py` per datasource name:
 
 ```powershell
@@ -144,11 +147,19 @@ foreach ($ds in @("<Datasource A>","<Datasource B>")) {   # D2 scope
 D5=B (JWT): replace `--auth pat --pat-name $PAT_NAME` with
 `--auth jwt --client-id $CA_CLIENT_ID --secret-id $CA_SECRET_ID --secret-value $env:TABLEAU_PAT_VALUE --jwt-username $JWT_USERNAME`.
 
-- **D1=A (workbook + its embedded datasource):** `fetch_tds.py` also downloads a published
+- **D1=A (live workbook + its embedded datasource):** `fetch_tds.py` also downloads a published
   **workbook** — in the loop above swap `--datasource-name $ds` for `--workbook-name "<Workbook>"`
-  (or `--workbook-luid <luid>`), add `--include-extract` to pull the packaged `.twbx`, and keep
-  `--out .\tds`. STEP 2's `migrate_estate.py` ingests the `.twb`/`.twbx` from `.\tds` and rebuilds the
-  embedded datasource as a semantic model **and** the workbook as a report.
+  (or `--workbook-luid <luid>`) and keep `--out .\tds`. STEP 2's `migrate_estate.py` ingests the
+  `.twb`/`.twbx` from `.\tds` and rebuilds the embedded datasource as a semantic model **and** the
+  workbook as a report — no separate datasource fetch is needed for an embedded source.
+
+> **`--include-extract` is REQUIRED for a flat-file / extract-backed source.** Add it to the
+> `fetch_tds.py` call for any workbook or datasource whose data is an Excel/CSV file or a Tableau
+> extract (`.hyper`). It downloads the **packaged** `.twbx`/`.tdsx` with the data inside; STEP 2 then
+> materializes that data to an **absolute** path (Excel/CSV lifted as-is; a `.hyper` extract read to
+> one CSV per table) so the Import model loads rows. Omit it and only the metadata travels, so the
+> model opens **empty** with a relative-path error. (A live DB source — SQL Server / Snowflake /
+> Postgres — needs no extract; it repoints at the live connection.)
 
 **Checkpoint 1:** `.\tds` holds one `.tds` per requested datasource (or the requested `.twb`/`.twbx`
 per workbook). Fewer than expected → STOP.
@@ -160,7 +171,10 @@ py -3.11 scripts\migrate_estate.py -i .\tds -o .\out
 ```
 
 **Checkpoint 2:** `.\out\semantic_models` has one `*.SemanticModel` per datasource and
-`.\out\report.json` shows `summary.datasources_migrated > 0`. Empty / `0` → STOP and read
+`.\out\report.json` shows `summary.datasources_migrated > 0`. For a **workbook** source, `.\out\pbip`
+also holds an openable `<Workbook>.pbip` (the rebuilt report bound to its model), and
+`report.json` lists the workbook with its `flatfile_data.landed` status — confirm it is `true` for a
+flat-file/extract source (if `false`, re-fetch with `--include-extract`). Empty / `0` → STOP and read
 `.\out\summary.md`.
 
 **STEP 3 — deploy (skip entirely if D3=C / local only)**

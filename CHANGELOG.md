@@ -13,6 +13,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **extract-backed flat-file data is now materialized to an absolute path, so a
+  migrated Import model actually loads rows.** Previously an Excel/CSV or extract-backed source (e.g. a
+  `… - Extract` datasource whose `.tdsx`/`.twbx` bundles a `.hyper` rather than the original workbook)
+  emitted `File.Contents` with Tableau's **relative** path — Power BI Desktop rejected it (*"The supplied
+  file path must be a valid absolute path"*) and the model opened **empty**. The estate and workbook
+  paths now lift bundled flat-file data to an **absolute** path: a packaged Excel/CSV is copied out
+  as-is, and a `.hyper` **extract** is read to one CSV per table (via the optional `tableauhyperapi`)
+  and imported with `Csv.Document`. When the data genuinely cannot be landed (no bundled file / extract,
+  or `tableauhyperapi` not installed) the run reports it honestly — an additive
+  `report["flatfile_data"]` / workbook `flatfile_data` signal (`landed`, `kind`, `reason`,
+  `hyper_present`) plus a manual-follow-up that tells you to re-fetch with `--include-extract` or install
+  `tableauhyperapi` — instead of silently shipping a model that loads nothing. **Workbooks are now
+  first-class in the runbook:** the Phase 0A Decision Menu (D1 SOURCE / D2 SCOPE), the Confirmation
+  Ledger, STEP 1, and Checkpoint 2 all present a `.twb`/`.twbx` workbook alongside a datasource, and
+  STEP 1 documents that `--include-extract` is **required** for any flat-file/extract source. Additive;
+  the migration suite stays green. Skill `VERSION` `1.11.1` → `1.12.0`.
 - **tableau-migration:** **`fetch_tds.py` now downloads a published _workbook_, not just a datasource.**
   New `--workbook-name` / `--workbook-luid` selectors fetch the `.twb`/`.twbx` (add `--include-extract`
   for the packaged archive) into the same `.\tds` folder, so a workbook and its embedded datasource
