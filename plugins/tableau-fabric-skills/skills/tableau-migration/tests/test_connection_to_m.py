@@ -14,6 +14,7 @@ from connection_to_m import (
     tableau_type_to_tmdl,
 )
 from connection_to_m import _deescape_custom_sql
+from connection_to_m import _odbc_connection_string, _scrub_odbc_extras
 
 # -- fixtures (trimmed but structurally faithful .tds documents) ---------------
 LIVE_SQLSERVER = """<?xml version='1.0' encoding='utf-8' ?>
@@ -216,6 +217,50 @@ CUSTOM_SQL = """<?xml version='1.0' encoding='utf-8' ?>
       <metadata-record class='column'>
         <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
         <parent-name>[Custom SQL Query]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+GENERIC_ODBC_DRIVER = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='MinIO Lake' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='minio' name='genericodbc.abc'>
+        <connection class='genericodbc' dbname='lake'
+                    odbc-connect-string-extras='SSL=true;UID=admin;PWD=hunter2'
+                    odbc-dbms-name='Trino' odbc-driver='Simba Trino ODBC Driver' odbc-dsn=''
+                    port='8080' server='trino.minio.local' username='admin' password='hunter2' />
+      </named-connection>
+    </named-connections>
+    <relation connection='genericodbc.abc' name='Custom SQL Query' type='text'>SELECT "region", SUM(sales) AS total FROM lake.orders GROUP BY "region"</relation>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>region</remote-name><local-name>[region]</local-name>
+        <parent-name>[Custom SQL Query]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>total</remote-name><local-name>[total]</local-name>
+        <parent-name>[Custom SQL Query]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+GENERIC_ODBC_DSN = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Bamboo' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='bamboo' name='genericodbc.dsn'>
+        <connection class='genericodbc' odbc-dsn='Bamboo DSN'
+                    odbc-driver='PostgreSQL Unicode(x64)' odbc-connect-string-extras='' />
+      </named-connection>
+    </named-connections>
+    <relation connection='genericodbc.dsn' name='orders' table='[orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>region</remote-name><local-name>[region]</local-name>
+        <parent-name>[orders]</parent-name><local-type>string</local-type>
       </metadata-record>
     </metadata-records>
   </connection>
@@ -1119,6 +1164,107 @@ def test_emit_oracle_table_is_deploy_ready_server_only_m():
     assert "Database" not in params             # no unused database parameter
 
 
+# -- generic ODBC (engine-agnostic lift-and-shift) -----------------------------
+def test_odbc_connection_string_driver_form_scrubs_secrets():
+    conn = {"odbc_driver": "Simba Trino ODBC Driver", "odbc_dsn": "",
+            "server": "trino.local", "port": "8080", "database": "lake",
+            "odbc_connect_string_extras": "SSL=true;UID=admin;PWD=secret;Region=us-east-1"}
+    cs = _odbc_connection_string(conn)
+    assert cs == ("Driver={Simba Trino ODBC Driver};Server=trino.local;Port=8080;"
+                  "Database=lake;SSL=true;Region=us-east-1")
+    # credential-bearing extras are dropped.
+    assert "UID" not in cs and "admin" not in cs
+    assert "PWD" not in cs and "secret" not in cs
+
+
+def test_odbc_connection_string_dsn_form_wins_over_driver():
+    # when both are present the DSN wins (it encapsulates the driver + host).
+    conn = {"odbc_dsn": "Bamboo DSN", "odbc_driver": "PostgreSQL Unicode(x64)",
+            "server": "x", "port": "1", "database": "d"}
+    assert _odbc_connection_string(conn) == "dsn=Bamboo DSN"
+
+
+def test_odbc_connection_string_none_when_neither_dsn_nor_driver():
+    assert _odbc_connection_string({"odbc_dsn": "", "odbc_driver": ""}) is None
+
+
+def test_scrub_odbc_extras_drops_credentials_keeps_rest():
+    out = _scrub_odbc_extras("UID=admin;PWD=secret;Token=abc;SSL=true;Region=us")
+    assert out == "SSL=true;Region=us"
+    assert _scrub_odbc_extras("") == ""
+    assert _scrub_odbc_extras(None) == ""
+
+
+def test_parse_genericodbc_descriptor_carries_odbc_facts():
+    d = parse_tds(GENERIC_ODBC_DRIVER)
+    assert d["connection_class"] == "genericodbc"
+    assert d["odbc_driver"] == "Simba Trino ODBC Driver"
+    assert d["odbc_dsn"] == ""
+    assert d["server"] == "trino.minio.local"
+    assert d["port"] == "8080"
+    assert d["database"] == "lake"
+    # the descriptor is serialized into the report, so the extras are scrubbed of inline creds.
+    assert d["odbc_connect_string_extras"] == "SSL=true"
+    assert "hunter2" not in (d["odbc_connect_string_extras"] or "")
+    assert d["odbc_dbms_name"] == "Trino"
+    rel = d["relations"][0]
+    assert rel["kind"] == "custom_sql"
+
+
+def test_emit_genericodbc_custom_sql_uses_odbc_query():
+    d = parse_tds(GENERIC_ODBC_DRIVER)
+    body = emit_m_partition_source(d["relations"][0], d, "Import")
+    # the driver-form connection string is rebuilt and the custom SQL passes straight through.
+    assert 'Source = Odbc.Query("Driver={Simba Trino ODBC Driver};' in body
+    assert "Server=trino.minio.local;Port=8080;Database=lake;SSL=true" in body
+    assert "FROM lake.orders" in body
+    # embedded double quotes in the SQL are escaped for the M string literal.
+    assert '""region""' in body
+    # not a scaffold.
+    assert "TODO" not in body
+    assert m_partition_review_reason(d["relations"][0], d, "Import") is None
+
+
+def test_emit_genericodbc_never_emits_inline_secret():
+    # the .tds carries inline username/password AND UID/PWD in the extras; NONE may reach the M.
+    d = parse_tds(GENERIC_ODBC_DRIVER)
+    body = emit_m_partition_source(d["relations"][0], d, "Import")
+    assert "hunter2" not in body
+    assert "PWD" not in body
+    assert "UID" not in body
+    # the non-secret extra is preserved.
+    assert "SSL=true" in body
+
+
+def test_genericodbc_emits_no_connection_parameters():
+    # Odbc.Query inlines the whole connection string, so no #"Server"/#"Database" params are emitted.
+    d = parse_tds(GENERIC_ODBC_DRIVER)
+    assert emit_connection_parameters(d) == ""
+
+
+def test_emit_genericodbc_dsn_table_relation_scaffolds_odbc_datasource():
+    d = parse_tds(GENERIC_ODBC_DSN)
+    assert d["odbc_dsn"] == "Bamboo DSN"
+    rel = d["relations"][0]
+    assert rel["kind"] == "table"
+    body = emit_m_partition_source(rel, d, "Import")
+    # generic-ODBC table navigation isn't portable -> a clearly-flagged Odbc.DataSource scaffold.
+    assert "TODO" in body
+    assert "Odbc.DataSource" in body
+    reason = m_partition_review_reason(rel, d, "Import")
+    assert reason is not None and "driver-specific" in reason
+
+
+def test_genericodbc_storage_routes_to_import_odbc_query():
+    from storage_mode import select_storage_mode
+    decision = select_storage_mode(parse_tds(GENERIC_ODBC_DRIVER))
+    assert decision["mode"] == "Import"
+    assert decision["connector"] == "Odbc.Query"
+    assert decision["uses_native_query"] is True
+    assert decision["fallback"] is None
+
+
+
 def test_emit_snowflake_table_is_deploy_ready_three_level_navigation():
     # Snowflake.Databases(server, warehouse) then database -> schema -> table, keyed by [Name, Kind].
     d = parse_tds(SNOWFLAKE)
@@ -1744,9 +1890,12 @@ def test_multi_connection_exposes_connections_map_secret_free():
     assert set(conns) == {"snowflake.s", "sqlserver.t"}
     assert conns["snowflake.s"]["connection_class"] == "snowflake"
     assert conns["sqlserver.t"]["connection_class"] == "sqlserver"
-    # each fact dict carries ONLY the non-secret routing whitelist -- never a credential field
+    # each fact dict carries ONLY the non-secret routing whitelist -- never a credential field.
+    # The odbc_* keys are non-secret (driver / DSN names, a connect-string hint, scrubbed extras,
+    # the DBMS-name hint, port); the connect-string extras are scrubbed of inline creds at parse.
     allowed = {"connection_class", "server", "database", "warehouse", "http_path",
-               "schema", "auth_method", "filename", "directory"}
+               "schema", "auth_method", "filename", "directory",
+               "odbc_driver", "odbc_dsn", "odbc_connect_string_extras", "odbc_dbms_name", "port"}
     for facts in conns.values():
         assert set(facts) <= allowed
     # the actual username VALUE in the fixture must never surface (auth_method is a label, not a secret)

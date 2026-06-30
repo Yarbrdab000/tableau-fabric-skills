@@ -240,3 +240,75 @@ def test_native_query_lowers_score():
     native = select_storage_mode(_desc(relations=[native_rel]))
     assert native["uses_native_query"] is True
     assert native["score"] < plain["score"]
+
+
+# -- generic ODBC routing (engine-agnostic lift-and-shift) ---------------------
+def _odbc_desc(**kw):
+    base = {
+        "connection_class": "genericodbc",
+        "server": "trino.minio.local",
+        "database": "lake",
+        "port": "8080",
+        "odbc_driver": "Simba Trino ODBC Driver",
+        "odbc_dsn": "",
+        "is_extract": False,
+        "named_connection_count": 1,
+        "relations": [{"kind": "custom_sql", "name": "Q", "sql": "SELECT 1",
+                       "columns": [{"model_name": "x", "tmdl_type": "int64"}]}],
+        "unsupported_reasons": [],
+    }
+    base.update(kw)
+    return base
+
+
+def test_generic_odbc_custom_sql_is_import_via_odbc_query():
+    d = select_storage_mode(_odbc_desc())
+    assert d["mode"] == "Import"
+    assert d["connector"] == "Odbc.Query"
+    assert d["uses_native_query"] is True
+    assert d["fallback"] is None
+    assert d["score"] == 60
+    # the SAME driver Tableau uses must be present wherever the model runs (Desktop + gateway),
+    # and the preserved custom SQL is surfaced for native-query review.
+    assert any("odbc driver" in f.lower() for f in d["manual_followups"])
+    assert any("gateway" in f.lower() for f in d["manual_followups"])
+    assert any("native query" in f.lower() for f in d["manual_followups"])
+
+
+def test_generic_odbc_table_relation_is_import_via_odbc_datasource():
+    table_rel = {"kind": "table", "name": "orders", "item": "orders",
+                 "columns": [{"model_name": "region", "tmdl_type": "string"}]}
+    d = select_storage_mode(_odbc_desc(relations=[table_rel]))
+    assert d["mode"] == "Import"
+    assert d["connector"] == "Odbc.DataSource"
+    assert d["uses_native_query"] is False
+    # a plain table has no preserved native query, so no native-query review step.
+    assert not any("native query" in f.lower() for f in d["manual_followups"])
+
+
+def test_generic_odbc_dsn_only_is_reconstructable():
+    # DSN form (no driver name) is enough to bind -> still Import.
+    d = select_storage_mode(_odbc_desc(odbc_driver="", odbc_dsn="Bamboo DSN"))
+    assert d["mode"] == "Import"
+    assert d["connector"] == "Odbc.Query"
+    assert d["score"] == 60
+
+
+def test_generic_odbc_without_driver_or_dsn_falls_back():
+    # neither a DSN nor a driver name -> nothing to bind -> fail closed to land-to-Delta.
+    d = select_storage_mode(_odbc_desc(odbc_driver="", odbc_dsn=""))
+    assert d["mode"] is None
+    assert d["fallback"] == FALLBACK_LAND_TO_DELTA
+    assert d["score"] == 30
+    assert d["recommended_mode"] == "Import"
+
+
+def test_generic_jdbc_is_not_routed_as_odbc():
+    # genericjdbc is deliberately EXCLUDED from the ODBC tier (Power BI has no JDBC connector and
+    # cannot load Java drivers); it must fall through to the land-to-Delta fallback, never Odbc.Query.
+    table_rel = {"kind": "table", "name": "orders", "item": "orders",
+                 "columns": [{"model_name": "region", "tmdl_type": "string"}]}
+    d = select_storage_mode(_odbc_desc(connection_class="genericjdbc", relations=[table_rel]))
+    assert d["mode"] is None
+    assert d["connector"] is None
+    assert d["fallback"] == FALLBACK_LAND_TO_DELTA

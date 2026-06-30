@@ -28,13 +28,13 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
                                 tableau_geo_role_to_data_category)
     from .storage_mode import (
         ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
-        NATIVE_QUERY_CATALOG_DRILL, PARTIAL_LIVE_CONNECTORS, connector_spec)
+        NATIVE_QUERY_CATALOG_DRILL, ODBC_CLASSES, PARTIAL_LIVE_CONNECTORS, connector_spec)
 except ImportError:
     from tmdl_generate import (clean_col, generate_column_tmdl, q, tableau_default_format_to_pbi,
                                tableau_geo_role_to_data_category)
     from storage_mode import (
         ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
-        NATIVE_QUERY_CATALOG_DRILL, PARTIAL_LIVE_CONNECTORS, connector_spec)
+        NATIVE_QUERY_CATALOG_DRILL, ODBC_CLASSES, PARTIAL_LIVE_CONNECTORS, connector_spec)
 
 
 # -- type mapping --------------------------------------------------------------
@@ -197,6 +197,79 @@ def custom_sql_parameter_refs(sql):
     return out
 
 
+# -- generic ODBC connection string -------------------------------------------
+# A generic-ODBC <connection> can carry credentials inline (a real .tds may even hold
+# password='...'); we NEVER emit them -- Power BI / the gateway supplies credentials at bind
+# time -- so any credential-bearing key is dropped from the connect-string extras before it is
+# emitted. Names are matched case-insensitively, surrounding whitespace ignored.
+_ODBC_SECRET_KEYS = frozenset({
+    "uid", "user", "userid", "username", "pwd", "passwd", "password",
+    "token", "accesstoken", "apikey", "api_key", "auth", "authentication",
+    "accesskeyid", "secretaccesskey", "secretkey", "awsaccesskeyid",
+    "awssecretkey", "sessiontoken",
+})
+
+
+def _scrub_odbc_extras(extras):
+    """Drop any credential-bearing ``key=value`` pairs from an odbc-connect-string-extras string.
+
+    The extras are semicolon-separated ``key=value`` pairs. A pair whose key (case-insensitive,
+    trimmed) is in ``_ODBC_SECRET_KEYS`` is removed entirely, so a ``UID``/``PWD``/``Token`` a user
+    left inline in the .tds never lands in the emitted M. Non-secret pairs are preserved verbatim
+    in their original order. Returns ``""`` for empty/None input.
+    """
+    if not extras:
+        return ""
+    kept = []
+    for part in extras.split(";"):
+        if not part.strip():
+            continue
+        key = part.split("=", 1)[0].strip().lower()
+        if key in _ODBC_SECRET_KEYS:
+            continue
+        kept.append(part.strip())
+    return ";".join(kept)
+
+
+def _odbc_connection_string(conn):
+    """Reconstruct a Power Query ODBC connection string from NON-SECRET ``.tds`` facts, or None.
+
+    * DSN-based (the .tds carries ``odbc-dsn``) -> ``dsn=<DSN>`` (the DSN encapsulates the driver
+      and host, so no server/port/database clauses are added).
+    * Driver-based -> ``Driver={<driver>};Server=<server>;Port=<port>;Database=<db>`` -- each
+      clause only when its value is present.
+
+    The non-secret ``odbc-connect-string-extras`` are appended after a credential scrub. Returns
+    ``None`` when the .tds carries NEITHER a DSN nor a driver (nothing to bind), so the caller
+    fails closed to the land-to-Delta fallback rather than emitting an unusable string.
+
+    STRICT secret boundary: username / password are NEVER read or emitted; Power BI / the gateway
+    supplies credentials at bind time.
+    """
+    dsn = (conn.get("odbc_dsn") or "").strip()
+    driver = (conn.get("odbc_driver") or "").strip()
+    clauses = []
+    if dsn:
+        clauses.append(f"dsn={dsn}")
+    elif driver:
+        clauses.append(f"Driver={{{driver}}}")
+        server = (conn.get("server") or "").strip()
+        port = str(conn.get("port") or "").strip()
+        database = (conn.get("database") or "").strip()
+        if server:
+            clauses.append(f"Server={server}")
+        if port:
+            clauses.append(f"Port={port}")
+        if database:
+            clauses.append(f"Database={database}")
+    else:
+        return None
+    extras = _scrub_odbc_extras(conn.get("odbc_connect_string_extras"))
+    if extras:
+        clauses.append(extras)
+    return ";".join(clauses)
+
+
 # -- parsing -------------------------------------------------------------------
 def _named_connections(datasource):
     """Return the live ``<named-connection>`` elements (those under a ``<named-connections>``
@@ -220,6 +293,25 @@ def _http_path_of(conn):
         if v:
             return v
     return None
+
+
+# Non-secret ODBC attributes lifted from one inner <connection class='genericodbc'>. STRICT
+# secret boundary: only the driver name, DSN name, the connect-string EXTRAS, the DBMS-name hint,
+# and the port are read -- NEVER username / password (a generic ODBC .tds can carry both inline).
+# The extras are additionally scrubbed of credential-bearing keys before emission (see
+# _odbc_connection_string). Tolerates a None element (returns all-None) so callers need no guard.
+def _odbc_facts(c):
+    get = (lambda _k: None) if c is None else c.get
+    # The connect-string EXTRAS can carry inline credentials (UID/PWD/token); the descriptor is
+    # serialized into the migration report, so scrub them HERE -- the descriptor must never carry a
+    # secret. _odbc_connection_string scrubs again (idempotent) as defense in depth.
+    return {
+        "odbc_driver": get("odbc-driver"),
+        "odbc_dsn": get("odbc-dsn"),
+        "odbc_connect_string_extras": _scrub_odbc_extras(get("odbc-connect-string-extras")) or None,
+        "odbc_dbms_name": get("odbc-dbms-name"),
+        "port": get("port"),
+    }
 
 
 def _live_connection(datasource):
@@ -249,6 +341,24 @@ def _live_connection(datasource):
     return (None, None, None, None, None, None, len(named))
 
 
+def _primary_connection_el(datasource):
+    """Return the inner ``<connection>`` element ``_live_connection`` reads (the federated
+    named-connection inner first, then a non-federated ``<connection>``), or ``None``.
+
+    Used to lift the primary connection's ODBC attributes onto the descriptor with the SAME
+    descent ``_live_connection`` uses, so the descriptor's class/server/database and its ODBC
+    facts always come from one consistent connection.
+    """
+    for nc in _named_connections(datasource):
+        inner = _children_local(nc, "connection")
+        if inner:
+            return inner[0]
+    for c in _children_local(datasource, "connection"):
+        if (c.get("class") or "").lower() != "federated":
+            return c
+    return None
+
+
 # Non-secret routing facts lifted from one inner <connection>. A federated datasource can carry
 # several named connections (one per upstream), each driving its OWN connector/navigation, so we
 # capture each connection's facts to route per relation. STRICT secret boundary: only the class,
@@ -265,6 +375,7 @@ def _connection_facts(c):
         "auth_method": c.get("authentication"),
         "filename": c.get("filename"),
         "directory": c.get("directory"),
+        **_odbc_facts(c),
     }
 
 
@@ -1043,6 +1154,10 @@ def parse_tds(xml_text, select=None):
     cls, server, dbname, warehouse, http_path, auth_method, nconns = _live_connection(datasource)
     cols_by_parent = _columns_by_parent(datasource)
     nc_map = _named_connection_map(datasource)
+    # Non-secret ODBC facts from the primary connection (all-None for non-ODBC sources). A real
+    # generic-ODBC .tds is single-named-connection, so _effective_connection returns the descriptor
+    # itself -- the ODBC facts must therefore live ON the descriptor for the emitter to read them.
+    odbc_facts = _odbc_facts(_primary_connection_el(datasource))
 
     relations = _extract_relations(datasource, cols_by_parent, nc_map)
     relationships, relationship_warnings = _extract_relationships(datasource, relations)
@@ -1079,6 +1194,7 @@ def parse_tds(xml_text, select=None):
         "relationship_warnings": relationship_warnings,
         "logical_fields": _logical_fields(datasource),
         "unsupported_reasons": unsupported,
+        **odbc_facts,
     }
 
 
@@ -1164,6 +1280,12 @@ def emit_connection_parameters(descriptor):
     """
     spec = connector_spec(descriptor.get("connection_class"))
     connect_style = spec[1] if spec else None
+    # Generic ODBC inlines its entire connection string inside Odbc.Query/Odbc.DataSource (see
+    # _emit_odbc_partition); it never references #"Server"/#"Database", so emitting those params
+    # would only leave unused expressions. connector_spec(genericodbc) is None, so without this
+    # guard the server/database below would emit anyway. Fail-safe: skip them for ODBC classes.
+    if (descriptor.get("connection_class") or "").lower() in ODBC_CLASSES:
+        return ""
     no_database = ("server_only", "server_warehouse", "server_httppath")
     lines = []
     if descriptor.get("server"):
@@ -1477,6 +1599,57 @@ def _scaffold_review(cls, intended, detail):
     return _scaffold_source(cls, intended, detail), detail
 
 
+def _emit_odbc_partition(relation, conn, cls):
+    """Emit the ``(source, stub_reason)`` for a generic-ODBC relation.
+
+    Engine-agnostic by design: the connection string (rebuilt from the .tds's NON-SECRET driver/
+    DSN facts) and the Custom SQL pass straight through the ODBC driver to whatever engine sits
+    behind it (e.g. a query engine over object storage), so we never need to know that engine's
+    dialect -- the source does the parsing.
+
+    * Custom SQL  -> ``Source = Odbc.Query("<connStr>", "<sql>")`` (folds the query at the source),
+      then the SAME remote->model column rename the native-query path uses. A surviving Tableau
+      parameter reference in the SQL is a needs-review reason (the partition is still emitted),
+      mirroring the ``Value.NativeQuery`` path.
+    * A plain table -> a flagged ``Odbc.DataSource`` scaffold: generic-ODBC table navigation keys
+      are driver-specific and not portable, so we never guess them.
+
+    Fails closed to a scaffold when no connection string can be rebuilt (defensive: the storage-mode
+    router already routes such a source to land-to-Delta, so this is rarely reached).
+    """
+    conn_str = _odbc_connection_string(conn)
+    if not conn_str:
+        return _scaffold_review(
+            cls, "Odbc.Query",
+            "generic ODBC source carried neither a DSN nor a driver name, so no connection string "
+            "could be reconstructed; set the ODBC connection manually")
+    conn_str_m = escape_m_string(conn_str)
+
+    if relation.get("kind") == "custom_sql":
+        sql = escape_m_string(relation.get("sql", ""))
+        steps = [f'Source = Odbc.Query("{conn_str_m}", "{sql}")']
+        prev = "Source"
+        rename_pairs = _native_query_rename_pairs(relation)
+        if rename_pairs:
+            steps.append(f"Renamed = Table.RenameColumns(Source, "
+                         f"{{{', '.join(rename_pairs)}}}, MissingField.Ignore)")
+            prev = "Renamed"
+        body = ",\n\t\t\t\t".join(steps)
+        param_reason = None
+        params = custom_sql_parameter_refs(relation.get("sql", ""))
+        if params:
+            param_reason = (
+                "custom SQL contains Tableau parameter reference(s) "
+                f"{', '.join(params)} that are not translated to a Power Query parameter; "
+                "replace them with a literal or a bound parameter before refresh")
+        return f"let\n\t\t\t\t{body}\n\t\t\tin\n\t\t\t\t{prev}", param_reason
+
+    return _scaffold_review(
+        cls, "Odbc.DataSource",
+        "generic-ODBC table navigation keys are driver-specific and not portable; complete the "
+        "Odbc.DataSource navigation manually, or model this table via a Custom SQL relation")
+
+
 def _emit_m_partition_review(relation, descriptor, mode):
     """Core of ``emit_m_partition_source``: return ``(source, stub_reason)`` where ``stub_reason``
     is ``None`` for a real, deploy-ready partition and a short explanation for a scaffold."""
@@ -1489,6 +1662,10 @@ def _emit_m_partition_review(relation, descriptor, mode):
             cls, None,
             "Microsoft Analysis Services is already a tabular/multidimensional semantic model; "
             "migrate the model directly (XMLA endpoint / semantic-model import), not as an M partition")
+    if cls in ODBC_CLASSES:
+        # Generic ODBC (engine-agnostic): emit Odbc.Query for custom SQL / a flagged Odbc.DataSource
+        # scaffold for a table. Handled before connector_spec (which returns None for genericodbc).
+        return _emit_odbc_partition(relation, conn, cls)
     spec = connector_spec(cls)
     if spec is None:
         if cls in FLAT_FILE_CLASSES:
