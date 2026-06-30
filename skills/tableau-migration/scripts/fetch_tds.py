@@ -116,6 +116,23 @@ def download_content_url(server, rest_version, site_id, datasource_id, include_e
         {"includeExtract": "true" if include_extract else "false"})
 
 
+def workbooks_url(server, rest_version, site_id, name=None, page_size=100):
+    """List/filter URL for published workbooks on a site (mirror of ``datasources_url``)."""
+    base = f"{rest_base(server, rest_version)}/sites/{site_id}/workbooks"
+    params = {"pageSize": str(page_size)}
+    if name:
+        params["filter"] = f"name:eq:{name}"
+    return base + "?" + urllib.parse.urlencode(params)
+
+
+def download_workbook_url(server, rest_version, site_id, workbook_id, include_extract=False):
+    """**Download Workbook** URL. ``includeExtract=false`` keeps the payload small (no .hyper)."""
+    base = (f"{rest_base(server, rest_version)}/sites/{site_id}"
+            f"/workbooks/{workbook_id}/content")
+    return base + "?" + urllib.parse.urlencode(
+        {"includeExtract": "true" if include_extract else "false"})
+
+
 def pick_datasource(datasources, name):
     """Return ``(luid, name)`` for the one datasource matching ``name``; raise on none/ambiguous."""
     matches = [d for d in (datasources or [])
@@ -128,6 +145,20 @@ def pick_datasource(datasources, name):
             f"Multiple datasources matched {name!r}; pass --datasource-luid to disambiguate.")
     d = matches[0]
     return d.get("id", ""), d.get("name", name)
+
+
+def pick_workbook(workbooks, name):
+    """Return ``(luid, name)`` for the one workbook matching ``name``; raise on none/ambiguous."""
+    matches = [w for w in (workbooks or [])
+               if (w.get("name") or "").strip().lower() == (name or "").strip().lower()]
+    if not matches:
+        avail = ", ".join(sorted(w.get("name", "?") for w in (workbooks or []))) or "(none)"
+        raise LookupError(f"No published workbook named {name!r}. Available: {avail}")
+    if len(matches) > 1:
+        raise LookupError(
+            f"Multiple workbooks matched {name!r}; pass --workbook-luid to disambiguate.")
+    w = matches[0]
+    return w.get("id", ""), w.get("name", name)
 
 
 def is_zip(data):
@@ -262,36 +293,57 @@ def download_datasource(server, rest_version, site_id, token, datasource_id, inc
     return cd, raw
 
 
-def save_outputs(raw, out_path, datasource_name):
-    """Write the download to disk and, if it is a .tdsx, also extract the inner .tds.
+def resolve_workbook_luid(server, rest_version, site_id, token, name):
+    out = _http_json("GET", workbooks_url(server, rest_version, site_id, name=name), token=token)
+    workbooks = (out.get("workbooks") or {}).get("workbook") or []
+    return pick_workbook(workbooks, name)
 
-    Returns ``(tds_path, archive_path_or_None)`` -- ``tds_path`` is what the migration engine reads.
+
+def download_workbook(server, rest_version, site_id, token, workbook_id, include_extract=False):
+    """Return ``(content_disposition, body_bytes)`` for the downloaded workbook (.twb or .twbx)."""
+    url = download_workbook_url(server, rest_version, site_id, workbook_id, include_extract)
+    status, headers, raw = _http("GET", url, headers={"X-Tableau-Auth": token}, timeout=300)
+    if status != 200:
+        raise RuntimeError(f"download workbook failed ({status}): {raw[:300]!r}")
+    cd = headers.get("Content-Disposition") or headers.get("content-disposition")
+    return cd, raw
+
+
+def save_outputs(raw, out_path, name, kind="datasource"):
+    """Write the download to disk and, if it is packaged (a zip), also extract the inner document.
+
+    ``kind`` selects the Tableau artifact shape (additive; defaults to the original datasource
+    behavior): ``"datasource"`` -> ``.tds`` / ``.tdsx`` (inner ``.tds``), ``"workbook"`` ->
+    ``.twb`` / ``.twbx`` (inner ``.twb``). Returns ``(doc_path, archive_path_or_None)`` --
+    ``doc_path`` is the unpacked XML the migration engine reads.
     """
+    doc_ext, archive_ext = ("twb", "twbx") if kind == "workbook" else ("tds", "tdsx")
     archive = is_zip(raw)
-    # Decide directory + base name from --out (a dir, a .tds path, or omitted).
-    if out_path and (out_path.lower().endswith(".tds") or out_path.lower().endswith(".tdsx")):
+    # Decide directory + base name from --out (a dir, a .tds/.twb path, or omitted).
+    if out_path and (out_path.lower().endswith("." + doc_ext)
+                     or out_path.lower().endswith("." + archive_ext)):
         out_dir = os.path.dirname(out_path) or "."
         base = os.path.splitext(os.path.basename(out_path))[0]
     else:
         out_dir = out_path or "."
         base = "".join(c if (c.isalnum() or c in "-_.") else "_"
-                       for c in (datasource_name or "datasource"))
+                       for c in (name or kind))
     os.makedirs(out_dir, exist_ok=True)
 
     archive_path = None
     if archive:
-        archive_path = os.path.join(out_dir, base + ".tdsx")
+        archive_path = os.path.join(out_dir, base + "." + archive_ext)
         with open(archive_path, "wb") as fh:
             fh.write(raw)
-        tds_text = inner_tds_from_zip(raw)
-        tds_path = os.path.join(out_dir, base + ".tds")
-        with open(tds_path, "w", encoding="utf-8") as fh:
-            fh.write(tds_text)
+        doc_text = inner_doc_from_zip(raw) if kind == "workbook" else inner_tds_from_zip(raw)
+        doc_path = os.path.join(out_dir, base + "." + doc_ext)
+        with open(doc_path, "w", encoding="utf-8") as fh:
+            fh.write(doc_text)
     else:
-        tds_path = os.path.join(out_dir, base + ".tds")
-        with open(tds_path, "wb") as fh:
+        doc_path = os.path.join(out_dir, base + "." + doc_ext)
+        with open(doc_path, "wb") as fh:
             fh.write(raw)
-    return tds_path, archive_path
+    return doc_path, archive_path
 
 
 def _resolve_auth(args):
@@ -322,7 +374,8 @@ def _resolve_auth(args):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Download a published Tableau datasource to a local .tds for migration.")
+        description="Download a published Tableau datasource (.tds) or workbook (.twb/.twbx) "
+                    "to a local file for migration.")
     ap.add_argument("--server", required=True,
                     help="Tableau server/host, e.g. 10ay.online.tableau.com or https://host")
     ap.add_argument("--site", default="",
@@ -330,6 +383,8 @@ def main(argv=None):
     sel = ap.add_mutually_exclusive_group(required=True)
     sel.add_argument("--datasource-name", help="published datasource name (resolved to a LUID)")
     sel.add_argument("--datasource-luid", help="published datasource LUID (skips name lookup)")
+    sel.add_argument("--workbook-name", help="published workbook name (resolved to a LUID)")
+    sel.add_argument("--workbook-luid", help="published workbook LUID (skips name lookup)")
     ap.add_argument("--auth", choices=["pat", "jwt"], default="pat", help="auth mode (default pat)")
     ap.add_argument("--pat-name", help="PAT name (or TABLEAU_PAT_NAME)")
     ap.add_argument("--pat-secret", help="PAT secret value (or TABLEAU_PAT_VALUE)")
@@ -341,24 +396,33 @@ def main(argv=None):
                     help=f"Tableau REST API version (default {DEFAULT_REST_VERSION})")
     ap.add_argument("--include-extract", action="store_true",
                     help="include extract data (.hyper) in the download (default: metadata only)")
-    ap.add_argument("--out", help="output .tds path OR a directory (default: current dir)")
+    ap.add_argument("--out", help="output .tds/.twb path OR a directory (default: current dir)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the sign-in + download plan without calling Tableau")
     args = ap.parse_args(argv)
 
     server = normalize_server(args.server)
 
+    is_workbook = bool(args.workbook_name or args.workbook_luid)
+
     if args.dry_run:
         pat_name = args.pat_name or os.environ.get("TABLEAU_PAT_NAME") or "<PAT_NAME>"
-        target = args.datasource_luid or f"name:eq:{args.datasource_name}"
         print("DRY RUN -- no requests sent")
         print(f"  POST {rest_base(server, args.rest_version)}/auth/signin")
         print(f"       auth={args.auth}" + (f", pat-name={pat_name}" if args.auth == "pat" else ""))
         print(f"       site contentUrl={args.site!r}")
-        if args.datasource_name:
-            print(f"  GET  {datasources_url(server, args.rest_version, '<SITE_ID>', name=args.datasource_name)}")
-        print(f"  GET  {download_content_url(server, args.rest_version, '<SITE_ID>', target, args.include_extract)}")
-        print(f"  -> save .tds to {args.out or '.'}")
+        if is_workbook:
+            target = args.workbook_luid or f"name:eq:{args.workbook_name}"
+            if args.workbook_name:
+                print(f"  GET  {workbooks_url(server, args.rest_version, '<SITE_ID>', name=args.workbook_name)}")
+            print(f"  GET  {download_workbook_url(server, args.rest_version, '<SITE_ID>', target, args.include_extract)}")
+            print(f"  -> save .twb/.twbx to {args.out or '.'}")
+        else:
+            target = args.datasource_luid or f"name:eq:{args.datasource_name}"
+            if args.datasource_name:
+                print(f"  GET  {datasources_url(server, args.rest_version, '<SITE_ID>', name=args.datasource_name)}")
+            print(f"  GET  {download_content_url(server, args.rest_version, '<SITE_ID>', target, args.include_extract)}")
+            print(f"  -> save .tds to {args.out or '.'}")
         return 0
 
     pat_name, pat_secret, jwt = _resolve_auth(args)
@@ -366,21 +430,35 @@ def main(argv=None):
     token, site_id = sign_in(server, args.rest_version, args.site,
                              pat_name=pat_name, pat_secret=pat_secret, jwt=jwt)
     try:
-        if args.datasource_luid:
-            ds_id, ds_name = args.datasource_luid, (args.datasource_name or "datasource")
+        if is_workbook:
+            if args.workbook_luid:
+                content_id, content_name = args.workbook_luid, (args.workbook_name or "workbook")
+            else:
+                content_id, content_name = resolve_workbook_luid(
+                    server, args.rest_version, site_id, token, args.workbook_name)
+            _cd, raw = download_workbook(
+                server, args.rest_version, site_id, token, content_id, args.include_extract)
         else:
-            ds_id, ds_name = resolve_datasource_luid(
-                server, args.rest_version, site_id, token, args.datasource_name)
-        _cd, raw = download_datasource(
-            server, args.rest_version, site_id, token, ds_id, args.include_extract)
+            if args.datasource_luid:
+                content_id, content_name = args.datasource_luid, (args.datasource_name or "datasource")
+            else:
+                content_id, content_name = resolve_datasource_luid(
+                    server, args.rest_version, site_id, token, args.datasource_name)
+            _cd, raw = download_datasource(
+                server, args.rest_version, site_id, token, content_id, args.include_extract)
     finally:
         sign_out(server, args.rest_version, token)
 
-    tds_path, archive_path = save_outputs(raw, args.out, ds_name)
+    kind = "workbook" if is_workbook else "datasource"
+    doc_path, archive_path = save_outputs(raw, args.out, content_name, kind=kind)
     if archive_path:
-        print(f"[fetch] downloaded .tdsx -> {archive_path}")
-    print(f"[fetch] datasource '{ds_name}' (LUID {ds_id}) ready: {tds_path}")
-    print(f"  next: feed this .tds to the migration (parse_tds -> assemble_model -> deploy_to_fabric).")
+        print(f"[fetch] downloaded {os.path.basename(archive_path)} -> {archive_path}")
+    print(f"[fetch] {kind} '{content_name}' (LUID {content_id}) ready: {doc_path}")
+    if is_workbook:
+        print(f"  next: point migrate_estate.py at this folder "
+              f"(it ingests .twb/.twbx and rebuilds the model + report).")
+    else:
+        print(f"  next: feed this .tds to the migration (parse_tds -> assemble_model -> deploy_to_fabric).")
     return 0
 
 

@@ -13,6 +13,13 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **`fetch_tds.py` now downloads a published _workbook_, not just a datasource.**
+  New `--workbook-name` / `--workbook-luid` selectors fetch the `.twb`/`.twbx` (add `--include-extract`
+  for the packaged archive) into the same `.\tds` folder, so a workbook and its embedded datasource
+  migrate together through `migrate_estate.py` (which already ingests `.twb`/`.twbx` and rebuilds the
+  model **and** the report). Importable helpers `resolve_workbook_luid` / `download_workbook` mirror the
+  datasource path; the datasource flags and behaviour are unchanged. Additive. Skill `VERSION` `1.11.0`
+  → `1.11.1`.
 - **tableau-migration:** **higher-fidelity Tableau dashboard → Power BI (PBIR) visual rebuilds.** A
   workbook's worksheets and dashboards now reproduce more of their original look: a **dual-axis**
   line/bar measure pair, **per-measure series colours** (each measure keeps its authored colour on
@@ -556,6 +563,15 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
+- **tableau-migration:** **the optional fidelity oracle's live DAX-value tier no longer hangs the
+  self-update / test gate.** Its auto-discovery probed *every* local Analysis Services / Power BI
+  Desktop instance and could block indefinitely on a stale one (`conn.Open()` never returns when many
+  dead port files are present). Three bounded guards fix it: each connect runs on a daemon thread with a
+  hard join timeout, the connection string carries a shorter native `Connect Timeout` so `Open()`
+  self-terminates cleanly (no abandoned threads), and auto-select stops after a total discovery-time
+  budget and degrades with a "pass an explicit port" reason. The inherently-live oracle test is now
+  opt-in via `TABLEAU_MIGRATION_LIVE_ORACLE`, so the committed suite is fully hermetic. Optional oracle
+  tooling only — no change to the deterministic migration runtime or its report schema.
 - **tableau-migration:** **a migrated model's generated `Date` relationship no longer disappears on
   first refresh** (which had silently flatlined every time series). Two independent root causes in the
   Import/M emit path are fixed, both pure `.tds`-metadata so they behave identically for Import,

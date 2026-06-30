@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import io
 import json
+import os
 import zipfile
 
 import pytest
@@ -171,3 +172,113 @@ def test_save_outputs_explicit_tds_path(tmp_path):
     raw = b"<datasource name='x'/>"
     tds_path, _archive = F.save_outputs(raw, out, "Ignored-Name")
     assert tds_path.endswith("model.tds")
+
+
+# -- workbook URL builders ------------------------------------------------------------------
+def test_workbooks_url_filters_by_name():
+    url = F.workbooks_url("h", "3.24", "SITE", name="My WB")
+    assert url.startswith("https://h/api/3.24/sites/SITE/workbooks?")
+    assert "filter=name%3Aeq%3AMy+WB" in url
+
+
+def test_download_workbook_url_include_extract_flag():
+    off = F.download_workbook_url("h", "3.24", "SITE", "WBID", include_extract=False)
+    on = F.download_workbook_url("h", "3.24", "SITE", "WBID", include_extract=True)
+    assert off.endswith("/workbooks/WBID/content?includeExtract=false")
+    assert on.endswith("includeExtract=true")
+
+
+# -- pick_workbook --------------------------------------------------------------------------
+def test_pick_workbook_one_match_case_insensitive():
+    wb = [{"id": "a", "name": "Comcast Test"}, {"id": "b", "name": "Other"}]
+    assert F.pick_workbook(wb, "comcast test") == ("a", "Comcast Test")
+
+
+def test_pick_workbook_none_raises_with_available_list():
+    with pytest.raises(LookupError) as ei:
+        F.pick_workbook([{"id": "b", "name": "Other"}], "Missing")
+    assert "Other" in str(ei.value)
+
+
+def test_pick_workbook_ambiguous_raises():
+    wb = [{"id": "a", "name": "Dup"}, {"id": "b", "name": "dup"}]
+    with pytest.raises(LookupError):
+        F.pick_workbook(wb, "Dup")
+
+
+def test_resolve_workbook_luid_parses_rest_shape(monkeypatch):
+    # Mirror the datasource response shape: {"workbooks": {"workbook": [...]}}.
+    captured = {}
+
+    def _fake_http_json(method, url, token=None):
+        captured["url"] = url
+        return {"workbooks": {"workbook": [{"id": "wb-luid", "name": "Comcast Test"}]}}
+
+    monkeypatch.setattr(F, "_http_json", _fake_http_json)
+    assert F.resolve_workbook_luid("h", "3.24", "SITE", "tok", "Comcast Test") == (
+        "wb-luid", "Comcast Test")
+    assert "/sites/SITE/workbooks?" in captured["url"]
+
+
+# -- save_outputs (workbook) ----------------------------------------------------------------
+def _make_twbx(twb_text, extra=None):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("Data/extract.hyper", b"\x00\x01binary")
+        if extra:
+            zf.writestr(extra, "x")
+        zf.writestr("Comcast Test.twb", twb_text)
+    return buf.getvalue()
+
+
+def test_save_outputs_workbook_plain_twb(tmp_path):
+    raw = b"<workbook name='x'/>"
+    doc_path, archive = F.save_outputs(raw, str(tmp_path), "Comcast Test", kind="workbook")
+    assert archive is None
+    # Reuses the same derive_filename sanitization as the datasource path (space -> "_").
+    assert os.path.basename(doc_path) == "Comcast_Test.twb"
+    with open(doc_path, "rb") as fh:
+        assert fh.read() == raw
+
+
+def test_save_outputs_workbook_twbx_extracts_inner_twb(tmp_path):
+    raw = _make_twbx("<workbook name='inner'/>")
+    doc_path, archive = F.save_outputs(raw, str(tmp_path), "Comcast Test", kind="workbook")
+    assert archive is not None and archive.endswith(".twbx")
+    assert doc_path.endswith(".twb")
+    with open(doc_path, encoding="utf-8") as fh:
+        assert fh.read() == "<workbook name='inner'/>"
+
+
+def test_save_outputs_workbook_explicit_twb_path(tmp_path):
+    out = str(tmp_path / "wb.twb")
+    raw = b"<workbook name='x'/>"
+    doc_path, _archive = F.save_outputs(raw, out, "Ignored-Name", kind="workbook")
+    assert doc_path.endswith("wb.twb")
+
+
+def test_save_outputs_default_kind_is_datasource(tmp_path):
+    # The added kind= param defaults to datasource -> unchanged .tds behavior for existing callers.
+    raw = b"<datasource name='x'/>"
+    doc_path, _archive = F.save_outputs(raw, str(tmp_path), "DS")
+    assert doc_path.endswith("DS.tds")
+
+
+# -- main() selector + dispatch (offline dry-run) -------------------------------------------
+def test_main_dry_run_workbook_plans_workbook_endpoints(capsys):
+    rc = F.main(["--server", "10ay.online.tableau.com", "--site", "s",
+                 "--workbook-name", "Comcast Test", "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "/sites/<SITE_ID>/workbooks?" in out
+    assert "/workbooks/name:eq:Comcast Test/content" in out
+    assert "save .twb/.twbx" in out
+
+
+def test_main_requires_exactly_one_selector():
+    # Neither selector -> argparse error (required mutually-exclusive group).
+    with pytest.raises(SystemExit):
+        F.main(["--server", "h", "--dry-run"])
+    # Datasource + workbook together -> mutually-exclusive error.
+    with pytest.raises(SystemExit):
+        F.main(["--server", "h", "--datasource-name", "D", "--workbook-name", "W", "--dry-run"])
