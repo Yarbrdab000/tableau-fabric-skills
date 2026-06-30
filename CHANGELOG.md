@@ -13,6 +13,17 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **the live pull can now obtain the Tableau secret without Azure Key Vault, via a
+  masked terminal prompt.** The runbook asks an explicit credential-access question — **(A) Azure Key Vault**
+  (the default) or **(B) a local secure terminal prompt** — instead of silently assuming Key Vault. When the
+  user chooses the local terminal, `fetch_tds.py --prompt-secret` reads the PAT (or Connected-App) secret at
+  a hidden `getpass` prompt, exchanges it for a session token, and clears it from the process environment in
+  a `finally` block. The secret is held **in memory only** — never echoed, written to disk (`.env`, logs) or
+  the report, or shown in chat — an **empty entry is rejected** (fail fast), and `--no-prompt` forbids the
+  prompt for unattended/CI runs. This routes `fetch_tds.py` through the existing dependency-free
+  `credential_resolver` (explicit → `TABLEAU_PAT_VALUE` env → git-ignored `.env` → OS keyring → masked
+  prompt), and adds a value-free `clear_secret_env` cleanup helper. Additive — no report-schema change; the
+  Key Vault path is unchanged and remains the default. Folded into skill `VERSION` `1.13.0`.
 - **tableau-migration:** **a generic-ODBC datasource running Custom SQL now migrates to a working
   Power BI Import model.** A Tableau `genericodbc` connection that fronts a query engine with Custom
   SQL (for example MinIO object storage reached through an ODBC driver) previously had no mappable
