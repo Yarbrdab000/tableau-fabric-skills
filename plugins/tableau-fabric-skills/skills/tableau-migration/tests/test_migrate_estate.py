@@ -2278,3 +2278,93 @@ def test_rebuild_from_published_match_flatfile_path_none_when_catalog_lacks_it(m
     res = me._rebuild_from_published_match(detail, twb, "Model", catalog)
     assert res is not None
     assert captured.get("flatfile_path") is None
+
+# --- published-DS workbook carries BOTH the workbook's AND the datasource's own calcs ----------
+# A published-DS workbook's rebuilt model must hold every calculation either side defines. The
+# workbook only caches the calcs it actually placed on a shelf, so _rebuild_from_published_match
+# unions the published .tds's OWN calcs (match["text"]) in too -- workbook-local wins on a clash.
+
+_PUBCALC_WB = (
+    "<workbook><datasources><datasource name='ds' caption='Sales DS'>"
+    "<column caption='WB Calc' name='[Calculation_wb]' role='measure'>"
+    "<calculation class='tableau' formula='SUM([Sales])' /></column>"
+    "</datasource></datasources></workbook>"
+)
+
+
+def _capture_migrate(monkeypatch):
+    captured = {}
+
+    def _fake_migrate(text, **kw):
+        captured.update(kw)
+        return {"report": {"fallback": False}}
+
+    monkeypatch.setattr(me, "migrate_datasource", _fake_migrate)
+    return captured
+
+
+def test_rebuild_from_published_match_unions_published_only_calc(monkeypatch):
+    # A measure calc that lives in the published .tds but was NEVER placed on a workbook shelf (so
+    # the workbook never cached it) must still land on the rebuilt model via the union.
+    captured = _capture_migrate(monkeypatch)
+    tds = ("<datasource caption='Sales DS'>"
+           "<column caption='WB Calc' name='[Calculation_wb]' role='measure'>"
+           "<calculation class='tableau' formula='SUM([Sales])' /></column>"
+           "<column caption='DS Only Margin' name='[Calculation_ds]' role='measure'>"
+           "<calculation class='tableau' formula='SUM([Profit])/SUM([Sales])' /></column>"
+           "</datasource>")
+    detail = {"binding_signal": {"kind": "published", "published_ds_name": "Sales DS"}}
+    catalog = {me._norm_ds("Sales DS"): {"text": tds, "name": "Sales DS"}}
+    res = me._rebuild_from_published_match(detail, _PUBCALC_WB, "Model", catalog)
+    assert res is not None
+    names = [c.get("name") for c in (captured.get("calcs") or [])]
+    assert "DS Only Margin" in names      # the published-only calc came across
+    assert "WB Calc" in names             # the workbook's own calc is still there
+
+
+def test_rebuild_from_published_match_dedups_cached_calc_workbook_wins(monkeypatch):
+    # When the SAME caption exists on both sides (the workbook cached the published calc), it must
+    # appear exactly once and the WORKBOOK's formula wins (it is this workbook's authored intent).
+    captured = _capture_migrate(monkeypatch)
+    tds = ("<datasource caption='Sales DS'>"
+           "<column caption='WB Calc' name='[Calculation_wb]' role='measure'>"
+           "<calculation class='tableau' formula='SUM([DS_VERSION])' /></column>"
+           "</datasource>")
+    detail = {"binding_signal": {"kind": "published", "published_ds_name": "Sales DS"}}
+    catalog = {me._norm_ds("Sales DS"): {"text": tds, "name": "Sales DS"}}
+    res = me._rebuild_from_published_match(detail, _PUBCALC_WB, "Model", catalog)
+    assert res is not None
+    everything = (captured.get("calcs") or []) + (captured.get("dim_calcs") or [])
+    shared = [c for c in everything if (c.get("name") or "").lower() == "wb calc"]
+    assert len(shared) == 1                       # no duplicate
+    assert shared[0].get("formula") == "SUM([Sales])"   # workbook formula wins, not SUM([DS_VERSION])
+
+
+def test_rebuild_from_published_match_routes_published_dimension_calc(monkeypatch):
+    # A dimension-role calc that lives only in the published .tds must land as a calculated COLUMN
+    # (dim_calcs), never mis-routed into the measure list.
+    captured = _capture_migrate(monkeypatch)
+    tds = ("<datasource caption='Sales DS'>"
+           "<column caption='DS Region Bucket' name='[Calculation_dim]' role='dimension'>"
+           "<calculation class='tableau' formula='IF [Sales]&gt;100 THEN \"Hi\" ELSE \"Lo\" END' />"
+           "</column></datasource>")
+    detail = {"binding_signal": {"kind": "published", "published_ds_name": "Sales DS"}}
+    catalog = {me._norm_ds("Sales DS"): {"text": tds, "name": "Sales DS"}}
+    res = me._rebuild_from_published_match(detail, _PUBCALC_WB, "Model", catalog)
+    assert res is not None
+    dim_names = [c.get("name") for c in (captured.get("dim_calcs") or [])]
+    measure_names = [c.get("name") for c in (captured.get("calcs") or [])]
+    assert "DS Region Bucket" in dim_names
+    assert "DS Region Bucket" not in measure_names
+
+
+def test_rebuild_from_published_match_calc_union_fail_closed(monkeypatch):
+    # If the published .tds text can't be parsed, the union degrades to the workbook's own calcs --
+    # never raising, never dropping the workbook calcs.
+    captured = _capture_migrate(monkeypatch)
+    detail = {"binding_signal": {"kind": "published", "published_ds_name": "Sales DS"}}
+    catalog = {me._norm_ds("Sales DS"): {"text": "this is not xml <<<", "name": "Sales DS"}}
+    res = me._rebuild_from_published_match(detail, _PUBCALC_WB, "Model", catalog)
+    assert res is not None
+    names = [c.get("name") for c in (captured.get("calcs") or [])]
+    assert names == ["WB Calc"]    # exactly the workbook's own calc, unchanged

@@ -29,6 +29,20 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   Ledger, STEP 1, and Checkpoint 2 all present a `.twb`/`.twbx` workbook alongside a datasource, and
   STEP 1 documents that `--include-extract` is **required** for any flat-file/extract source. Additive;
   the migration suite stays green. Skill `VERSION` `1.11.1` → `1.12.0`.
+- **tableau-migration:** **a published-datasource workbook's model now carries the calculations from
+  BOTH sides — the published datasource's own calculated fields AND the workbook-local calculations.**
+  When a workbook connects to a published datasource (`sqlproxy`) and that datasource is co-migrated in
+  the same run, the workbook's model is rebuilt on the datasource's real schema; it now unions the
+  datasource's own calcs (read from the matched `.tds`) with the workbook's, so a published calc the
+  workbook never placed on a shelf (and so never cached) is no longer dropped. Workbook-local definitions
+  win on a name clash; fail-closed (a parse hiccup leaves the workbook's own calcs exactly as before).
+  The **workbook runbook is also hardened against improvisation:** STEP 1 adds an explicit
+  published-datasource-workbook branch (co-migrate the datasource in the same `.\tds`) and a DO / DON'T
+  guardrail block (download workbooks only via `fetch_tds.py --workbook-name`; never hand-roll a REST
+  downloader or unzip the `.twbx`; never migrate a published-datasource workbook without its datasource),
+  the Phase 0A menu + Confirmation Ledger declare the workbook's datasource binding (embedded vs
+  published + the co-migrated datasource), and Checkpoint 2 verifies the
+  `bound_via: published_catalog_match` signal. Additive; folded into `1.12.0`.
 - **tableau-migration:** **`fetch_tds.py` now downloads a published _workbook_, not just a datasource.**
   New `--workbook-name` / `--workbook-luid` selectors fetch the `.twb`/`.twbx` (add `--include-extract`
   for the packaged archive) into the same `.\tds` folder, so a workbook and its embedded datasource

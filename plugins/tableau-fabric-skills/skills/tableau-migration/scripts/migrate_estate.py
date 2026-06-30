@@ -48,7 +48,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 
 try:  # works whether imported as a package or run with scripts/ on sys.path
-    from .connection_to_m import parse_tds, extract_bundled_flatfile
+    from .connection_to_m import parse_tds, extract_bundled_flatfile, extract_calcs
     from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from .assemble_model import (assemble_import_model, assemble_local_import_model,
                                  materialize_bundled_flatfile_data, write_model_folder,
@@ -58,7 +58,7 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .workbook_calc_usage import workbook_calc_usage
     from . import fetch_tds as F
 except ImportError:
-    from connection_to_m import parse_tds, extract_bundled_flatfile
+    from connection_to_m import parse_tds, extract_bundled_flatfile, extract_calcs
     from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
     from assemble_model import (assemble_import_model, assemble_local_import_model,
                                 materialize_bundled_flatfile_data, write_model_folder,
@@ -1424,9 +1424,10 @@ def _norm_ds(name):
 def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog, approved_calc_dax=None):
     """Rebuild a published-datasource workbook's model from the matching ALREADY-MIGRATED published
     datasource (its real schema) instead of the workbook's own unusable ``sqlproxy`` proxy stub --
-    carrying the workbook's own calculated fields so its view-local measures translate against that
-    schema. Returns a ``migrate_datasource`` result bound to the real schema, or ``None`` when there
-    is no faithful name match (the caller then keeps the honest skip). Never raises.
+    carrying BOTH the workbook's own calculated fields AND the published datasource's own calculated
+    fields so the attached model holds every calculation either side defines (workbook-local calcs win
+    on a name clash). Returns a ``migrate_datasource`` result bound to the real schema, or ``None``
+    when there is no faithful name match (the caller then keeps the honest skip). Never raises.
     """
     if not ds_catalog:
         return None
@@ -1440,6 +1441,37 @@ def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog, appr
         wb_calcs, _skipped, wb_dim_calcs = extract_calculations(twb_text, include_dimensions=True)
     except Exception:
         wb_calcs, wb_dim_calcs = None, None
+    # Union the PUBLISHED datasource's OWN calculated fields (from its real ``.tds``) with the
+    # workbook's. A workbook caches only the calcs it actually places on a shelf, so a published
+    # calc the workbook never referenced would otherwise be dropped from the rebuilt model. Pulling
+    # the ``.tds``'s own calcs guarantees the model attached to a published-datasource workbook
+    # carries BOTH the datasource's and the workbook's calculations -- by construction, not
+    # contingent on Tableau's cache. Workbook-local calcs WIN on a caption clash (they are this
+    # workbook's authored intent). Fail-closed: a parse hiccup leaves the workbook-only calcs
+    # exactly as before. ``match["text"]`` is the published ``.tds`` XML text (same value already
+    # passed to ``migrate_datasource`` below), so ``extract_calcs`` parses it directly.
+    try:
+        own_calcs = extract_calcs(match["text"])
+    except Exception:
+        own_calcs = []
+    if own_calcs:
+        wb_calcs = list(wb_calcs or [])
+        wb_dim_calcs = list(wb_dim_calcs or [])
+        have = {(c.get("name") or "").strip().lower()
+                for c in (*wb_calcs, *wb_dim_calcs) if c.get("name")}
+        for c in own_calcs:
+            nm = (c.get("name") or "").strip().lower()
+            if not nm or nm in have:
+                continue
+            entry = {"name": c["name"], "formula": c["formula"]}
+            if c.get("internal_name"):
+                entry["internal_name"] = c["internal_name"]
+            if (c.get("role") or "measure").strip().lower() == "dimension":
+                entry["role"] = "dimension"
+                wb_dim_calcs.append(entry)
+            else:
+                wb_calcs.append(entry)
+            have.add(nm)
     # Table-calc addressing (partition / order) lives in the WORKBOOK's worksheet shelves, never in
     # the published ``.tds`` schema we rebuild from -- so extract the usages from ``twb_text`` and
     # thread them through. Without this, positional measures (WINDOW_STDEV, percent-difference, LAST)

@@ -63,6 +63,12 @@ D5 — AUTH  (forces the auth choice)
    B) Connected App JWT (Direct Trust)
 ```
 
+> **Workbook in scope?** If D2 names a **workbook**, also state whether it uses an **embedded**
+> datasource or connects to a **published** one. For a published datasource, **name that datasource
+> too** (D2) so it co-migrates in the same run — its calculations and the workbook's are both built
+> into the model attached to the workbook. (Embedded needs nothing extra; `migrate_estate.py`
+> auto-detects either case — see STEP 1.)
+
 ### Phase 0B — Credentials form (simple 2-file pattern)
 
 Collect the values below, then write them into a **git-ignored** local vars file — never paste the
@@ -110,6 +116,7 @@ Echo the resolved choices + resources back, then wait for `GO`:
 LEDGER — confirm, then reply GO
   source     : <D1 A live / B local>   from <SITE_URL/SITE_NAME  or  .\tds>
   scope      : <all | datasource and/or workbook names>
+  workbook ds: <none | embedded | published: "<DS>" co-migrated in scope>   (omit if no workbook)
   outputs    : <D3 A both / B Fabric only / C local only>
   conflicts  : <D4 overwrite | skip | stop>
   auth       : <D5 PAT | Connected App JWT>   (secret from KV <KV_NAME>/<SECRET_NAME>)
@@ -153,6 +160,39 @@ D5=B (JWT): replace `--auth pat --pat-name $PAT_NAME` with
   `.twb`/`.twbx` from `.\tds` and rebuilds the embedded datasource as a semantic model **and** the
   workbook as a report — no separate datasource fetch is needed for an embedded source.
 
+- **Workbook connected to a PUBLISHED datasource (co-migrate the datasource in the SAME run):** a
+  workbook can connect to a datasource that was *published separately* to Tableau Server/Cloud
+  (its connection class is `sqlproxy`) instead of embedding one. When the source is such a workbook,
+  **download its published datasource into the SAME `.\tds` folder** so the two migrate together:
+  - **D1=A (live):** add the published datasource to the fetch loop — keep the workbook's
+    `--workbook-name "<Workbook>"` call AND add a `--datasource-name "<Published DS>"` call (both
+    `--out .\tds`). Add `--include-extract` to **both** if the data is a flat file / `.hyper` extract.
+  - **D1=B (local):** drop the workbook's `.twb`/`.twbx` **and** the published datasource's
+    `.tds`/`.tdsx` into `.\tds` together.
+  STEP 2 then catalog-matches the workbook to that migrated datasource, rebuilds the workbook's model
+  on the **real** datasource schema, and lands **every calculation from both sides** — the published
+  datasource's own calculated fields **and** the workbook-local calculations — onto the model attached
+  to the workbook. Migrate a published-datasource workbook **without** its datasource and the
+  workbook's model routes to the lakehouse fallback and is skipped (`sqlproxy` carries no usable
+  schema or data on its own).
+
+> **`migrate_estate.py` auto-detects embedded vs published — you never inspect the XML to choose.**
+> Drop the workbook (and, for the published case, its datasource) into `.\tds` and run STEP 2.
+> The tool decides the binding and rebinds automatically; there is no flag and no per-workbook
+> decision for you to make. Your only job is to make sure a published workbook's datasource is in
+> scope (above).
+
+> **⛔ WORKBOOK DO / DON'T — follow exactly; do not improvise around a perceived gap.**
+> - **DO** download every workbook with `fetch_tds.py --workbook-name "<W>"` (or `--workbook-luid`)
+>   `--include-extract --out .\tds`. It already handles `.twb` AND packaged `.twbx`.
+> - **DO** co-migrate a published workbook's datasource in the same run (the branch above).
+> - **DON'T** write a custom Tableau REST downloader or call the REST API by hand — `fetch_tds.py`
+>   is the one and only download tool.
+> - **DON'T** manually unzip a `.twbx` or extract the inner `.twb` — `migrate_estate.py` ingests the
+>   packaged file directly.
+> - **DON'T** migrate a published-datasource workbook without its published datasource in `.\tds`.
+> - If something seems missing, **STOP and ask** — never hand-roll a workaround.
+
 > **`--include-extract` is REQUIRED for a flat-file / extract-backed source.** Add it to the
 > `fetch_tds.py` call for any workbook or datasource whose data is an Excel/CSV file or a Tableau
 > extract (`.hyper`). It downloads the **packaged** `.twbx`/`.tdsx` with the data inside; STEP 2 then
@@ -174,8 +214,11 @@ py -3.11 scripts\migrate_estate.py -i .\tds -o .\out
 `.\out\report.json` shows `summary.datasources_migrated > 0`. For a **workbook** source, `.\out\pbip`
 also holds an openable `<Workbook>.pbip` (the rebuilt report bound to its model), and
 `report.json` lists the workbook with its `flatfile_data.landed` status — confirm it is `true` for a
-flat-file/extract source (if `false`, re-fetch with `--include-extract`). Empty / `0` → STOP and read
-`.\out\summary.md`.
+flat-file/extract source (if `false`, re-fetch with `--include-extract`). For a **published-datasource
+workbook**, that workbook entry also shows `bound_via: published_catalog_match:<DS>` — confirming it
+rebuilt on the co-migrated datasource and carries both the datasource's and the workbook's
+calculations; if instead the workbook was skipped to the lakehouse fallback, its published datasource
+was not in `.\tds` — add it (STEP 1) and re-run. Empty / `0` → STOP and read `.\out\summary.md`.
 
 **STEP 3 — deploy (skip entirely if D3=C / local only)**
 
