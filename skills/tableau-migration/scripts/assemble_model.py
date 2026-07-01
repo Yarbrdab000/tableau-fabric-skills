@@ -36,6 +36,7 @@ try:  # package or scripts-on-path
         m_partition_review_reason,
         extract_calcs,
         parse_tds,
+        reconcile_flatfile_headers,
         workbook_datasources,
         AmbiguousDatasourceError,
     )
@@ -73,6 +74,7 @@ except ImportError:
         m_partition_review_reason,
         extract_calcs,
         parse_tds,
+        reconcile_flatfile_headers,
         workbook_datasources,
         AmbiguousDatasourceError,
     )
@@ -145,6 +147,8 @@ def _expression_names(descriptor):
         names.append("Server")
     if descriptor.get("database"):
         names.append("Database")
+    if descriptor.get("flatfile_source_folder"):
+        names.append("SourceFolder")
     return names
 
 
@@ -1548,6 +1552,13 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     """
     if flatfile_path is not None:
         descriptor = {**descriptor, "flatfile_path": flatfile_path}
+    else:
+        descriptor = dict(descriptor)  # own the dict so header reconciliation can't leak to caller
+    # Reconcile flat-file source column names against the ACTUAL headers in the landed data, so the
+    # emitted M types a column that physically exists (Tableau can alias a column to a name absent
+    # from the Excel/CSV header row -> "column ... wasn't found" at load). No-op for live/DB sources
+    # or when the file can't be read; see connection_to_m.reconcile_flatfile_headers.
+    header_reconcile = reconcile_flatfile_headers(descriptor)
     decision = select_storage_mode(descriptor)
     if decision["mode"] is None:
         raise ValueError(
@@ -1770,6 +1781,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     }
     if filter_bindings:
         report["filter_bindings"] = filter_bindings
+    if header_reconcile["remaps"] or header_reconcile["mismatches"]:
+        report["flatfile_header_reconcile"] = header_reconcile
     return {"parts": parts, "report": report}
 
 
@@ -2358,6 +2371,44 @@ def _resolve_local_csv_paths(local_data, *, source, model_name, write_to):
         ".hyper/.tdsx/.twbx path, or True to auto-extract the source's embedded .hyper")
 
 
+def _sibling_package_for(packaged_source):
+    """If ``packaged_source`` is a bare ``.tds``/``.twb`` file path whose bundled data lives in a
+    same-stem, same-directory ``.tdsx``/``.twbx`` package, return that sibling package path; else
+    ``None``.
+
+    The estate can discover a datasource as a bare ``.tds`` (schema + only a RELATIVE flat-file
+    reference) while the real DATA bytes are bundled in its ``.tdsx`` twin -- e.g. a live pull that
+    landed both, or an upload deduped down to the ``.tds``. Recovering the sibling package lets the
+    data come from the ``.tdsx``/``.twbx`` while the descriptor (schema) still comes from the
+    ``.tds``. Fail-closed -- never raises; returns ``None`` for bytes, in-memory XML text, or when
+    no readable sibling package exists.
+    """
+    import os as _os
+    import zipfile as _zip
+    try:
+        p = _os.fspath(packaged_source)
+    except TypeError:
+        return None
+    if not isinstance(p, str) or "\n" in p or "<" in p:
+        return None  # in-memory XML text / non-path
+    try:
+        if not _os.path.isfile(p) or _zip.is_zipfile(p):
+            return None  # missing, or already a package (handled directly)
+    except (OSError, ValueError):
+        return None
+    stem, ext = _os.path.splitext(p)
+    pkg_ext = {".tds": ".tdsx", ".twb": ".twbx"}.get(ext.lower())
+    if not pkg_ext:
+        return None
+    for cand in (stem + pkg_ext, stem + pkg_ext.upper()):
+        try:
+            if _os.path.isfile(cand) and _zip.is_zipfile(cand):
+                return cand
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def _archive_path_for(packaged_source):
     """Resolve ``packaged_source`` to a real ``.tdsx``/``.twbx`` path on disk for archive
     introspection, returning ``(path, is_temp)``. Bytes are spilled to a temp file (caller cleans
@@ -2419,9 +2470,13 @@ def materialize_bundled_flatfile_data(packaged_source, descriptor, dest_dir, *, 
         result["reason"] = "not_flatfile"
         return result
 
+    # The estate can discover a datasource as a bare .tds (schema only) while its DATA bytes live in
+    # a same-stem .tdsx/.twbx twin -- recover that sibling package so the data still lands.
+    effective_source = _sibling_package_for(packaged_source) or packaged_source
+
     # 1. Bundled Excel/CSV: lift the original file out to an absolute path (most faithful).
     try:
-        ff = extract_bundled_flatfile(packaged_source, descriptor, dest_dir)
+        ff = extract_bundled_flatfile(effective_source, descriptor, dest_dir)
     except Exception:
         ff = None
     if ff:
@@ -2430,7 +2485,7 @@ def materialize_bundled_flatfile_data(packaged_source, descriptor, dest_dir, *, 
 
     # 2. Extract case: the named flat file is not packaged, but a .hyper may be. Resolve a usable
     #    archive path, confirm a .hyper is present, then extract it to CSV (optional dependency).
-    arc_path, is_temp = _archive_path_for(packaged_source)
+    arc_path, is_temp = _archive_path_for(effective_source)
     if arc_path is None:
         result["reason"] = "not_a_package"  # bare .tds / XML text / live source: nothing to lift
         return result

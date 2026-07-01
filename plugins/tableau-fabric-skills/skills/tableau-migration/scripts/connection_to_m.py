@@ -601,6 +601,15 @@ def _columns_by_parent(datasource):
             "tmdl_type": tmdl_type,
             "local_name": _strip_brackets(local) if local else remote,
         }
+        # Physical column position, when Tableau records it. Used to reconcile a Tableau alias
+        # (remote-name) back to the real Excel/CSV header at the same position when the two diverge
+        # (see reconcile_flatfile_headers) -- a deterministic anchor, not a guess.
+        ordinal = _txt("ordinal")
+        if ordinal is not None:
+            try:
+                col["ordinal"] = int(str(ordinal).strip())
+            except (TypeError, ValueError):
+                pass
         fmt = fmt_by_physical.get((parent, model_name))
         if fmt:
             col["format_string"] = fmt
@@ -1318,6 +1327,13 @@ def emit_connection_parameters(descriptor):
     if connect_style == "server_httppath":
         http_path = escape_m_string(descriptor.get("http_path") or "")
         lines.append(f'expression HttpPath = "{http_path}" {_PARAM_META}\n')
+    # Flat-file Import landed inside the .pbip: a relocatable SourceFolder parameter (default = the
+    # absolute .Data folder) that the emitted File.Contents references, so the project survives being
+    # moved/zipped -- the recipient re-points this one parameter instead of every hard-coded path.
+    if descriptor.get("flatfile_source_folder"):
+        lines.append(
+            f'expression SourceFolder = "{escape_m_string(descriptor["flatfile_source_folder"])}" '
+            f'{_PARAM_META}\n')
     return "\n".join(lines)
 
 
@@ -1455,6 +1471,284 @@ def extract_bundled_flatfile(packaged_source, descriptor, dest_dir):
     return _os.path.abspath(out_path)
 
 
+def _col_ref_to_index(letters):
+    """Excel column letters -> 0-based index (``A`` -> 0, ``B`` -> 1, ``AA`` -> 26)."""
+    idx = 0
+    for ch in letters.upper():
+        if "A" <= ch <= "Z":
+            idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1
+
+
+def _read_xlsx_sheet_headers(path):
+    """Return ``{sheet_name: [ordered first-row header strings]}`` for an ``.xlsx``/``.xlsm``.
+
+    Stdlib only (an xlsx is a zip of XML parts): resolves shared strings, the workbook's sheet
+    order, and each sheet's first row into ordered header text. Fail-closed -- returns ``{}`` on any
+    problem so a caller treats the file as unreadable rather than raising.
+    """
+    import zipfile as _zip
+    import xml.etree.ElementTree as _ET
+    NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    RELNS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    RNS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    out = {}
+    try:
+        with _zip.ZipFile(path) as z:
+            names = set(z.namelist())
+            shared = []
+            if "xl/sharedStrings.xml" in names:
+                sroot = _ET.fromstring(z.read("xl/sharedStrings.xml"))
+                for si in sroot.findall(f"{NS}si"):
+                    shared.append("".join(t.text or "" for t in si.iter(f"{NS}t")))
+            wroot = _ET.fromstring(z.read("xl/workbook.xml"))
+            sheets = []
+            sheets_el = wroot.find(f"{NS}sheets")
+            if sheets_el is not None:
+                for sh in sheets_el.findall(f"{NS}sheet"):
+                    sheets.append((sh.get("name"), sh.get(f"{RNS}id")))
+            rid_target = {}
+            if "xl/_rels/workbook.xml.rels" in names:
+                rroot = _ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+                for rel in rroot.findall(f"{RELNS}Relationship"):
+                    rid_target[rel.get("Id")] = rel.get("Target")
+            for sname, rid in sheets:
+                target = rid_target.get(rid)
+                if not sname or not target:
+                    continue
+                member = target if target.startswith("xl/") else "xl/" + target.lstrip("/")
+                if member not in names:
+                    continue
+                wsroot = _ET.fromstring(z.read(member))
+                data = wsroot.find(f"{NS}sheetData")
+                first = data.find(f"{NS}row") if data is not None else None
+                cells = []
+                if first is not None:
+                    for c in first.findall(f"{NS}c"):
+                        ref = c.get("r") or ""
+                        col_idx = _col_ref_to_index("".join(ch for ch in ref if ch.isalpha()))
+                        t = c.get("t")
+                        val = ""
+                        if t == "s":
+                            v = c.find(f"{NS}v")
+                            if v is not None and v.text is not None:
+                                try:
+                                    val = shared[int(v.text)]
+                                except (ValueError, IndexError):
+                                    val = ""
+                        elif t == "inlineStr":
+                            is_el = c.find(f"{NS}is")
+                            if is_el is not None:
+                                val = "".join(tt.text or "" for tt in is_el.iter(f"{NS}t"))
+                        else:
+                            v = c.find(f"{NS}v")
+                            val = v.text if (v is not None and v.text is not None) else ""
+                        cells.append((col_idx, val))
+                cells.sort(key=lambda x: x[0])
+                out[sname] = [v for _, v in cells]
+    except Exception:
+        return {}
+    return out
+
+
+def _is_excel_path(path):
+    try:
+        return str(path).lower().endswith((".xlsx", ".xlsm"))
+    except Exception:
+        return False
+
+
+def read_flatfile_headers(path, *, sheet=None):
+    """Ordered physical column headers of a landed flat file, or ``None`` if it can't be read.
+
+    For an ``.xlsx``/``.xlsm`` pass the ``sheet`` name (the bare Excel sheet, e.g. ``People``); for a
+    ``.csv``/``.txt`` the first line is split on commas. Fail-closed -- never raises; returns ``None``
+    when the file is missing/unreadable (so reconciliation simply no-ops and emission is unchanged).
+    """
+    import os as _os
+    if not path:
+        return None
+    try:
+        if not _os.path.isfile(path):
+            return None
+    except Exception:
+        return None
+    if _is_excel_path(path):
+        sheets = _read_xlsx_sheet_headers(path)
+        if not sheets:
+            return None
+        if sheet is not None and sheet in sheets:
+            return sheets[sheet]
+        if len(sheets) == 1:
+            return next(iter(sheets.values()))
+        return sheets.get(sheet)
+    try:
+        import csv as _csv
+        with open(path, "r", encoding="utf-8-sig", newline="") as fh:
+            for row in _csv.reader(fh):
+                return list(row)
+        return []
+    except Exception:
+        return None
+
+
+def reconcile_flatfile_headers(descriptor):
+    """Align each flat-file relation's source column names to the ACTUAL headers in the landed data.
+
+    Tableau can expose a column under an ALIAS (its ``remote-name``, e.g. ``Person``) that never
+    appears as a physical Excel/CSV header (physically ``Regional Manager``). Emitting M that types
+    the alias makes Power BI fail to load the query (*"The column 'Person' of the table wasn't
+    found"*). Because every column of a flat-file relation is DERIVED FROM that file, a column whose
+    ``remote_name`` is not a physical header must be an aliased/renamed view of some physical column
+    that no exactly-named column claims. This reconciles each relation deterministically:
+
+    * exact-name columns bind first and CLAIM their header (a working column is never stolen);
+    * the leftover unmatched columns are paired to the leftover unclaimed headers *positionally* --
+      ordered by the ``.tds``'s own physical ``<ordinal>`` (falling back to document order) against
+      the file's header order -- but ONLY when the two counts match, so the pairing is unambiguous.
+      This is the common real case (one aliased column, e.g. ``Person`` -> ``Regional Manager``) and
+      needs no absolute index, so it is robust whether Tableau numbers ordinals per-sheet (``0``) or
+      datasource-globally (``21``);
+    * if the counts differ (e.g. a physical column was dropped as an unsupported type), each
+      remaining column is remapped by absolute ``<ordinal>`` only when that lands on an unclaimed
+      header, and is otherwise left untouched and reported as a ``mismatch`` -- never a wrong bind.
+
+    Mutates only a COPY of the affected relations/columns on ``descriptor`` (the caller's original
+    relation dicts are untouched) and returns ``{"remaps": [...], "mismatches": [...]}``. A live DB
+    source (no flat file) or a file that can't be read is a no-op -> emission byte-identical.
+    """
+    result = {"remaps": [], "mismatches": []}
+    if not descriptor.get("flatfile_filename") and not descriptor.get("flatfile_path"):
+        return result
+    orig = descriptor.get("relations") or []
+    ff_path = descriptor.get("flatfile_path")
+    copied = None
+
+    def _ord(col):
+        ov = col.get("ordinal")
+        return ov if (isinstance(ov, int) and not isinstance(ov, bool)) else None
+
+    for idx, rel in enumerate(orig):
+        if rel.get("kind") != "table":
+            continue
+        cols = rel.get("columns") or []
+        if not cols:
+            continue
+        path = rel.get("flatfile_path") or ff_path
+        if not path:
+            continue
+        sheet = _excel_sheet_name(rel) if _is_excel_path(path) else None
+        headers = read_flatfile_headers(path, sheet=sheet)
+        if not headers:
+            continue
+        header_set = set(headers)
+
+        header_pos = {h: i for i, h in enumerate(headers)}
+
+        # 1. Exact-name columns bind to (and claim) their physical header. Each exact anchor that
+        #    carries an ordinal votes for a single global->local offset (ordinal - header index):
+        #    real .tds ordinals are datasource-GLOBAL, so a bare `headers[ordinal]` would wrong-bind.
+        claimed = set()
+        unmatched = []  # [(cpos, col)] in document order
+        anchor_offsets = []  # ordinal - physical index, one per exact anchor with an ordinal
+        for cpos, col in enumerate(cols):
+            rn = col.get("remote_name")
+            if rn in header_set and rn not in claimed:
+                claimed.add(rn)
+                ov = _ord(col)
+                if ov is not None:
+                    anchor_offsets.append(ov - header_pos[rn])
+            else:
+                unmatched.append((cpos, col))
+        if not unmatched:
+            continue  # every column already types a real header
+        unclaimed = [h for h in headers if h not in claimed]  # physical order
+
+        # A single consistent offset across every exact anchor lets us translate a global ordinal
+        # into a physical header index; disagreement (or no anchors) means we cannot trust ordinals.
+        offset = anchor_offsets[0] if (anchor_offsets and len(set(anchor_offsets)) == 1) else None
+
+        rel_changes = []  # [(cpos, new_header)]
+
+        def _remap(cpos, col, header, via):
+            rel_changes.append((cpos, header))
+            claimed.add(header)
+            result["remaps"].append({
+                "relation": rel.get("name"), "from": col.get("remote_name"), "to": header,
+                "model_name": col.get("model_name"), "via": via})
+
+        def _mismatch(col):
+            result["mismatches"].append({
+                "relation": rel.get("name"), "source_column": col.get("remote_name"),
+                "model_name": col.get("model_name"), "headers": list(headers)})
+
+        if len(unmatched) == 1 and len(unclaimed) == 1:
+            # 2a. Exactly one leftover column and one leftover header -> unambiguous (no ordinal
+            #     needed): every flat-file column derives from the file, so the lone unmatched
+            #     column must be an aliased view of the lone remaining header. (The People case.)
+            (cpos, col) = unmatched[0]
+            _remap(cpos, col, unclaimed[0], "positional")
+        elif len(unmatched) == len(unclaimed) and all(_ord(c) is not None for _, c in unmatched):
+            # 2b. Equal counts, >1: pair leftover columns to leftover headers positionally. Require a
+            #     real ordinal on EVERY unmatched column so we can order them into physical order;
+            #     ordinals preserve relative physical order (global or local), so a sort aligns them
+            #     with the physically-ordered unclaimed headers. Without ordinals this is unsafe (doc
+            #     order may be display order) -> fall through to a warn.
+            ordered = sorted(unmatched, key=lambda pc: (_ord(pc[1]), pc[0]))
+            for (cpos, col), header in zip(ordered, unclaimed):
+                _remap(cpos, col, header, "positional")
+        elif offset is not None:
+            # 2c. Counts differ (dropped/hidden physical columns): translate each ordinal through the
+            #     exact-anchor-derived offset; only bind when it lands on an in-range, unclaimed
+            #     header, warn on anything still unresolved.
+            for cpos, col in unmatched:
+                ov = _ord(col)
+                hi = None if ov is None else ov - offset
+                if hi is not None and 0 <= hi < len(headers) and headers[hi] not in claimed:
+                    _remap(cpos, col, headers[hi], "ordinal")
+                else:
+                    _mismatch(col)
+        else:
+            # 2d. No safe basis (no exact-anchor offset, and not an unambiguous/ordinal-ordered
+            #     equal-count case) -> never guess; surface every leftover as a mismatch.
+            for _cpos, col in unmatched:
+                _mismatch(col)
+
+        if rel_changes:
+            if copied is None:
+                copied = [dict(r) for r in orig]
+            new_cols = [dict(c) for c in cols]
+            for cpos, header in rel_changes:
+                new_cols[cpos] = {**new_cols[cpos], "remote_name": header}
+            copied[idx] = {**copied[idx], "columns": new_cols}
+    if copied is not None:
+        descriptor["relations"] = copied
+    return result
+
+
+def _flatfile_contents_expr(path, conn):
+    """The ``File.Contents(...)`` expression for a flat-file ``path``.
+
+    When the descriptor opts into a relocatable source folder (``flatfile_source_folder`` -- an
+    absolute directory that CONTAINS this file, set when the data is landed INSIDE the ``.pbip``),
+    emit ``File.Contents(#"SourceFolder" & "\\<basename>")`` so the model references the
+    ``SourceFolder`` Power Query parameter instead of a hard-coded absolute path. Moving or zipping
+    the project then only needs that one parameter re-pointed. A file that is NOT under the source
+    folder, or when no folder is set, falls back to the absolute path -- byte-identical to before.
+    """
+    folder = (conn or {}).get("flatfile_source_folder")
+    if folder:
+        parts = re.split(r"[\\/]", path)
+        base = parts[-1]
+        file_dir = "/".join(parts[:-1]).rstrip("/").lower()
+        want = re.sub(r"[\\/]+$", "", str(folder)).replace("\\", "/").lower()
+        if base and file_dir == want:
+            # Windows separator: the emitted .pbip opens in Power BI Desktop on Windows and the
+            # SourceFolder default is an absolute Windows directory with no trailing separator.
+            return f'File.Contents(#"SourceFolder" & "{escape_m_string(chr(92) + base)}")'
+    return f'File.Contents("{escape_m_string(path)}")'
+
+
 def emit_flatfile_source(relation, conn, cls):
     """Emit a real, typed Import ``let ... in`` body for an Excel/CSV ("full data") relation.
 
@@ -1475,16 +1769,16 @@ def emit_flatfile_source(relation, conn, cls):
     if not path or not cols or connector is None:
         return None
 
-    p = escape_m_string(path)
+    contents = _flatfile_contents_expr(path, conn)
     steps = []
     if connector == "Excel.Workbook":
         sheet = escape_m_string(_excel_sheet_name(relation))
-        steps.append(f'Source = Excel.Workbook(File.Contents("{p}"), null, true)')
+        steps.append(f'Source = Excel.Workbook({contents}, null, true)')
         steps.append(f'Navigation = Source{{[Item="{sheet}", Kind="Sheet"]}}[Data]')
         steps.append("Promoted = Table.PromoteHeaders(Navigation, [PromoteAllScalars=true])")
     else:  # Csv.Document
         steps.append(
-            f'Source = Csv.Document(File.Contents("{p}"), '
+            f'Source = Csv.Document({contents}, '
             '[Delimiter=",", Encoding=1252, QuoteStyle=QuoteStyle.Csv])')
         steps.append("Promoted = Table.PromoteHeaders(Source, [PromoteAllScalars=true])")
     prev = "Promoted"

@@ -2285,3 +2285,254 @@ def test_azure_sqldb_full_pipeline_emits_deploy_ready_sql_database_m():
     bind = connection_details_for_bind(d)
     assert bind["bind_type"] == "SQL"
     assert bind["path"] == "example.database.windows.net;Superstore"
+
+
+# -- flat-file header reconciliation (Tableau alias vs physical Excel/CSV header) ----------------
+import os as _os
+import zipfile as _zipfile
+from connection_to_m import (
+    read_flatfile_headers,
+    reconcile_flatfile_headers,
+)
+
+
+def _write_min_xlsx(path, sheet_name, headers):
+    """Write a minimal single-sheet .xlsx (inline strings) with the given first-row headers."""
+    def _col_letter(i):
+        s = ""
+        i += 1
+        while i:
+            i, r = divmod(i - 1, 26)
+            s = chr(ord("A") + r) + s
+        return s
+    cells = "".join(
+        '<c r="%s1" t="inlineStr"><is><t>%s</t></is></c>' % (_col_letter(i), h)
+        for i, h in enumerate(headers)
+    )
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<sheetData><row r="1">' + cells + '</row></sheetData></worksheet>'
+    )
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="%s" sheetId="1" r:id="rId1"/></sheets></workbook>' % sheet_name
+    )
+    wb_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        'Target="worksheets/sheet1.xml"/></Relationships>'
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '</Types>'
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/></Relationships>'
+    )
+    with _zipfile.ZipFile(path, "w") as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", root_rels)
+        z.writestr("xl/workbook.xml", workbook_xml)
+        z.writestr("xl/_rels/workbook.xml.rels", wb_rels)
+        z.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+
+
+def test_read_flatfile_headers_xlsx_by_sheet(tmp_path):
+    xlsx = _os.path.join(str(tmp_path), "people.xlsx")
+    _write_min_xlsx(xlsx, "People", ["Regional Manager", "Region"])
+    assert read_flatfile_headers(xlsx, sheet="People") == ["Regional Manager", "Region"]
+
+
+def test_read_flatfile_headers_csv_first_line(tmp_path):
+    csv = _os.path.join(str(tmp_path), "orders.csv")
+    with open(csv, "w", encoding="utf-8", newline="") as fh:
+        fh.write("Order ID,Country/Region,Sales\n1,US,10\n")
+    assert read_flatfile_headers(csv) == ["Order ID", "Country/Region", "Sales"]
+
+
+def test_read_flatfile_headers_missing_returns_none(tmp_path):
+    assert read_flatfile_headers(_os.path.join(str(tmp_path), "nope.csv")) is None
+    assert read_flatfile_headers(None) is None
+
+
+def test_reconcile_flatfile_headers_ordinal_remap(tmp_path):
+    # The People table: Tableau exposes the first physical column under the ALIAS "Person" while the
+    # physical header is "Regional Manager"; "Region" matches exactly. Reconcile must remap Person via
+    # its ordinal (0) to the real header and leave Region alone.
+    csv = _os.path.join(str(tmp_path), "people.csv")
+    with open(csv, "w", encoding="utf-8", newline="") as fh:
+        fh.write("Regional Manager,Region\nAlice,West\n")
+    desc = {
+        "flatfile_filename": "people.csv",
+        "flatfile_path": csv,
+        "relations": [{
+            "name": "People", "kind": "table",
+            "columns": [
+                {"remote_name": "Person", "model_name": "Person", "ordinal": 0},
+                {"remote_name": "Region", "model_name": "Region", "ordinal": 1},
+            ],
+        }],
+    }
+    res = reconcile_flatfile_headers(desc)
+    assert res["mismatches"] == []
+    assert [(r["from"], r["to"]) for r in res["remaps"]] == [("Person", "Regional Manager")]
+    cols = {c["model_name"]: c["remote_name"] for c in desc["relations"][0]["columns"]}
+    assert cols["Person"] == "Regional Manager"   # now types a header that physically exists
+    assert cols["Region"] == "Region"             # exact match untouched
+
+
+def test_reconcile_flatfile_headers_exact_match_is_noop(tmp_path):
+    csv = _os.path.join(str(tmp_path), "orders.csv")
+    with open(csv, "w", encoding="utf-8", newline="") as fh:
+        fh.write("Order ID,Sales\n1,10\n")
+    rels = [{
+        "name": "Orders", "kind": "table",
+        "columns": [
+            {"remote_name": "Order ID", "model_name": "Order_ID", "ordinal": 0},
+            {"remote_name": "Sales", "model_name": "Sales", "ordinal": 1},
+        ],
+    }]
+    desc = {"flatfile_filename": "orders.csv", "flatfile_path": csv, "relations": rels}
+    res = reconcile_flatfile_headers(desc)
+    assert res == {"remaps": [], "mismatches": []}
+    assert desc["relations"] is rels               # untouched -> same object, no copy made
+
+
+def test_reconcile_flatfile_headers_unresolvable_warns_never_wrong(tmp_path):
+    # A column whose alias is not a header AND whose ordinal is out of range, with MORE physical
+    # headers than model columns (a hidden column), cannot be paired unambiguously -- it must NOT be
+    # guessed: it is reported as a mismatch and left as-is.
+    csv = _os.path.join(str(tmp_path), "t.csv")
+    with open(csv, "w", encoding="utf-8", newline="") as fh:
+        fh.write("Header A,Header B\nx,y\n")
+    desc = {
+        "flatfile_filename": "t.csv",
+        "flatfile_path": csv,
+        "relations": [{
+            "name": "T", "kind": "table",
+            "columns": [{"remote_name": "Ghost", "model_name": "Ghost", "ordinal": 9}],
+        }],
+    }
+    res = reconcile_flatfile_headers(desc)
+    assert res["remaps"] == []
+    assert len(res["mismatches"]) == 1
+    assert res["mismatches"][0]["source_column"] == "Ghost"
+    # left untouched (never silently rebound to a wrong header)
+    assert desc["relations"][0]["columns"][0]["remote_name"] == "Ghost"
+
+
+def test_reconcile_flatfile_headers_robust_to_global_ordinal(tmp_path):
+    # A real .tds numbers metadata-record <ordinal> datasource-GLOBALLY (People's columns are 21/22,
+    # not 0/1). Reconciliation must still fix the alias via exact-match anchoring + positional pairing
+    # -- NOT by using the ordinal as an absolute index (which would be out of range and miss the fix).
+    csv = _os.path.join(str(tmp_path), "people.csv")
+    with open(csv, "w", encoding="utf-8", newline="") as fh:
+        fh.write("Regional Manager,Region\nAlice,West\n")
+    desc = {
+        "flatfile_filename": "people.csv",
+        "flatfile_path": csv,
+        "relations": [{
+            "name": "People", "kind": "table",
+            "columns": [
+                {"remote_name": "Person", "model_name": "Person", "ordinal": 21},
+                {"remote_name": "Region", "model_name": "Region", "ordinal": 22},
+            ],
+        }],
+    }
+    res = reconcile_flatfile_headers(desc)
+    assert res["mismatches"] == []
+    assert [(r["from"], r["to"]) for r in res["remaps"]] == [("Person", "Regional Manager")]
+    cols = {c["model_name"]: c["remote_name"] for c in desc["relations"][0]["columns"]}
+    assert cols["Person"] == "Regional Manager"
+    assert cols["Region"] == "Region"
+
+
+def test_reconcile_flatfile_headers_all_aliased_pairs_in_order(tmp_path):
+    # When EVERY column is aliased (no exact anchor), equal counts still pair positionally in ordinal
+    # order against the file's header order.
+    csv = _os.path.join(str(tmp_path), "t.csv")
+    with open(csv, "w", encoding="utf-8", newline="") as fh:
+        fh.write("First,Second\n1,2\n")
+    desc = {
+        "flatfile_filename": "t.csv",
+        "flatfile_path": csv,
+        "relations": [{
+            "name": "T", "kind": "table",
+            "columns": [
+                {"remote_name": "AliasA", "model_name": "AliasA", "ordinal": 5},
+                {"remote_name": "AliasB", "model_name": "AliasB", "ordinal": 6},
+            ],
+        }],
+    }
+    res = reconcile_flatfile_headers(desc)
+    assert res["mismatches"] == []
+    assert [(r["from"], r["to"]) for r in res["remaps"]] == [("AliasA", "First"), ("AliasB", "Second")]
+
+
+def test_reconcile_flatfile_headers_no_flatfile_is_noop():
+    desc = {"relations": [{"name": "Orders", "kind": "table", "columns": []}]}
+    assert reconcile_flatfile_headers(desc) == {"remaps": [], "mismatches": []}
+
+
+def test_reconcile_flatfile_headers_excel_sheet_aware(tmp_path):
+    xlsx = _os.path.join(str(tmp_path), "people.xlsx")
+    _write_min_xlsx(xlsx, "People", ["Regional Manager", "Region"])
+    desc = {
+        "flatfile_filename": "people.xlsx",
+        "flatfile_path": xlsx,
+        "relations": [{
+            "name": "People", "kind": "table", "raw_table": "[People$]",
+            "columns": [
+                {"remote_name": "Person", "model_name": "Person", "ordinal": 0},
+                {"remote_name": "Region", "model_name": "Region", "ordinal": 1},
+            ],
+        }],
+    }
+    res = reconcile_flatfile_headers(desc)
+    assert [(r["from"], r["to"]) for r in res["remaps"]] == [("Person", "Regional Manager")]
+
+
+def test_flatfile_source_folder_emits_relocatable_reference(tmp_path):
+    # When data is landed inside the .pbip and flatfile_source_folder is set, the emitted M must
+    # reference the relocatable #"SourceFolder" parameter instead of a hard-coded absolute path.
+    d = parse_tds(EXCEL_COLLECTION)
+    folder = _os.path.abspath(_os.path.join(str(tmp_path), "Superstore.Data"))
+    d["flatfile_source_folder"] = folder
+    xlsx = _os.path.join(folder, "Sample - Superstore.xlsx")
+    for rel in d["relations"]:
+        rel["flatfile_path"] = xlsx
+    by_name = {r["name"]: r for r in d["relations"]}
+    orders_m = emit_table_tmdl_m(by_name["Orders"], d, "import")
+    assert '#"SourceFolder" & "\\Sample - Superstore.xlsx"' in orders_m
+    assert xlsx not in orders_m                      # the hard-coded absolute path is NOT emitted
+    params = emit_connection_parameters(d)
+    assert ('expression SourceFolder = "' + folder + '"') in params
+
+
+def test_flatfile_without_source_folder_still_absolute(tmp_path):
+    # Backward-compatible: with no flatfile_source_folder, the emitted M keeps the absolute path.
+    d = parse_tds(EXCEL_COLLECTION)
+    xlsx = _os.path.abspath(_os.path.join(str(tmp_path), "Sample - Superstore.xlsx"))
+    for rel in d["relations"]:
+        rel["flatfile_path"] = xlsx
+    by_name = {r["name"]: r for r in d["relations"]}
+    orders_m = emit_table_tmdl_m(by_name["Orders"], d, "import")
+    assert "SourceFolder" not in orders_m
+    assert "File.Contents(" in orders_m
+    assert "SourceFolder" not in emit_connection_parameters(d)
