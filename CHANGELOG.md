@@ -13,6 +13,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **a migrated flat-file (Excel/CSV) datasource now produces a `.pbip` that
+  both opens locally and actually loads its data — two long-standing load blockers are fixed.**
+  (1) *Data lands inside the project.* The one-button estate path now materializes the bundled
+  Excel/CSV **inside** the openable project at `pbip/<name>/<name>.Data` (beside the
+  `.SemanticModel`) and points the emitted `File.Contents` at a relocatable `SourceFolder` Power
+  Query parameter (default = that absolute `.Data` folder) instead of a hard-coded path — so moving
+  or zipping the project only needs that one parameter re-pointed, and a bare `.tds` discovered by
+  the estate now recovers its data bytes from a same-stem `.tdsx`/`.twbx` twin. (2) *Tableau alias
+  vs. physical header.* Tableau can expose a column under an **alias** (its `remote-name`, e.g.
+  `Person`) that is not the physical spreadsheet header (`Regional Manager`); the generated M typed
+  the alias, so Power BI failed to load (*"The column 'Person' … wasn't found"*). A new deterministic
+  **header reconciliation** step reads the landed file's real headers and re-anchors each source
+  column: exact-name columns bind first, then any leftover aliased column is paired to the leftover
+  physical header (ordered by the `.tds`'s own `<ordinal>`) so the emitted M types a header that
+  exists and renames it to the model column — robust even though real `.tds` files number ordinals
+  datasource-globally (e.g. `21`/`22`, not `0`/`1`). A column that cannot be resolved unambiguously
+  is **never wrong-bound** — it is left as-is and surfaced as a `flatfile_header_reconcile` mismatch
+  follow-up. Additive report key `report["flatfile_header_reconcile"]` (`{remaps, mismatches}`); no
+  existing report key changed. Skill `VERSION` `1.14.0` → `1.15.0`.
 - **tableau-migration:** **the native query engines Spark, Presto, Trino, and Starburst are now
   first-class — they migrate cleanly over ODBC instead of being landed in Delta.** A Tableau
   datasource (or workbook) on a `spark` / `presto` / `trino` / `starburst` connection previously had

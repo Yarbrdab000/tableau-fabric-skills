@@ -641,12 +641,27 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
     # Excel/CSV is lifted out verbatim; an EXTRACT-backed source (only a .hyper packaged) is read to
     # one CSV per table and built as a local-CSV Import model. A live DB source (Snowflake/Databricks/
     # SQL Server/...) carries no flatfile_filename -> no-op; its connection string is left as-is.
+    # Resolve the output folder name up-front (mutates used_folders -> call exactly once) so flat-file
+    # data can land INSIDE the .pbip project below.
+    safe_base = _safe_folder(name, used_folders)
+
     flatfile_path = None
     table_csv_paths = None
     ff_mat = None
     if descriptor.get("flatfile_filename"):
-        data_dir = os.path.join(os.path.dirname(os.path.abspath(sm_dir)), "data",
-                                re.sub(r"[^\w.-]+", "_", name) or "ds")
+        if pbip_dir is not None:
+            # Land the data INSIDE the openable project (pbip/<name>/<name>.Data, beside the
+            # .SemanticModel) so the whole folder is self-contained + portable; a relocatable
+            # SourceFolder parameter (set below) points the emitted File.Contents at it.
+            data_dir = os.path.join(pbip_dir, safe_base, safe_base + ".Data")
+        else:
+            data_dir = os.path.join(os.path.dirname(os.path.abspath(sm_dir)), "data",
+                                    re.sub(r"[^\w.-]+", "_", name) or "ds")
+        try:
+            if os.path.isdir(data_dir):
+                shutil.rmtree(data_dir)  # clean rerun: never mix stale data files
+        except OSError:
+            pass
         try:
             ff_mat = materialize_bundled_flatfile_data(ds_id, descriptor, data_dir, model_name=name)
         except Exception:
@@ -655,6 +670,10 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
             flatfile_path = ff_mat.get("flatfile_path")
         elif ff_mat and ff_mat.get("kind") == "csv":
             table_csv_paths = ff_mat.get("table_csv_paths")
+        # Data landed inside the .pbip -> emit the relocatable SourceFolder parameter (default = the
+        # absolute .Data folder) so moving/zipping the project only needs that one value re-pointed.
+        if pbip_dir is not None and (flatfile_path or table_csv_paths):
+            descriptor["flatfile_source_folder"] = os.path.abspath(data_dir)
     detail["flatfile_landed"] = flatfile_path
     if ff_mat is not None:
         detail["flatfile_data"] = {
@@ -684,7 +703,6 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
                       error=f"{type(exc).__name__}: {exc}")
         return detail
 
-    safe_base = _safe_folder(name, used_folders)
     folder = safe_base + ".SemanticModel"
     dest = os.path.join(sm_dir, folder)
     try:
@@ -706,9 +724,16 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
     pbip_folder = None
     if pbip_dir is not None:
         ds_pbip_dir = os.path.join(pbip_dir, safe_base)
+        data_child = safe_base + ".Data"
         try:
             if os.path.isdir(ds_pbip_dir):
-                shutil.rmtree(ds_pbip_dir)
+                # Clear stale project parts but KEEP the freshly-materialized <name>.Data folder
+                # (landed above) so the flat-file data stays bundled inside the project.
+                for _child in os.listdir(ds_pbip_dir):
+                    if _child == data_child:
+                        continue
+                    _p = os.path.join(ds_pbip_dir, _child)
+                    shutil.rmtree(_p) if os.path.isdir(_p) else os.remove(_p)
             write_local_pbip(out["parts"], ds_pbip_dir, model_name=safe_base,
                              swap_specs=(report.get("field_parameters") or {}).get("specs") or None)
             pbip_folder = f"pbip/{safe_base}/{safe_base}.pbip"
@@ -739,6 +764,21 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
         followups.append(f"flat-file source {_hint}; the model opens but loads no rows until the "
                          "data file is supplied at an absolute path")
         fully = False
+
+    # Header reconciliation follow-up: a Tableau alias whose physical header could not be located
+    # positionally is emitted as a warning (never a wrong binding) -- surface it so the user can
+    # confirm the source column mapping. Successful remaps need no follow-up (they load correctly).
+    _hdr = report.get("flatfile_header_reconcile")
+    if _hdr and _hdr.get("mismatches"):
+        detail["flatfile_header_reconcile"] = _hdr
+        for _mm in _hdr["mismatches"]:
+            followups.append(
+                f"flat-file column '{_mm.get('model_name')}' (Tableau source name "
+                f"'{_mm.get('source_column')}') did not match any physical header in "
+                f"'{_mm.get('relation')}' -- verify the source column name")
+        fully = False
+    elif _hdr and _hdr.get("remaps"):
+        detail["flatfile_header_reconcile"] = _hdr
 
     detail.update(
         status="migrated" if fully else "migrated_with_followups",
