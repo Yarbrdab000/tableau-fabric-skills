@@ -13,6 +13,15 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **the self-update runbook no longer rolls back a good install on machines
+  where an optional fidelity engine is present.** `resources/self-update.md` Step 3 (post-install
+  verification) ran an **unscoped** `pytest`, which swept in the environment-optional `tests_oracle/`
+  fidelity tiers; one such test only passes when an optional DAX/image engine is *absent*, so on a
+  machine where that engine is present the gate failed by environment and the runbook's fail-loud
+  rule discarded the freshly-installed skill and restored the older copy. Step 3 (and the
+  macOS/Linux note) now scope the gate to the deterministic `pytest tests -q` suite — the same suite
+  CI treats as canonical — so a correct install verifies and sticks. Skill `VERSION` `1.15.0` →
+  `1.15.1`.
 - **tableau-migration:** **a migrated flat-file (Excel/CSV) datasource now produces a `.pbip` that
   both opens locally and actually loads its data — two long-standing load blockers are fixed.**
   (1) *Data lands inside the project.* The one-button estate path now materializes the bundled

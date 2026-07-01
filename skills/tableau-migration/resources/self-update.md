@@ -123,9 +123,13 @@ foreach ($file in $needSymbols.Keys) {
 }
 
 # Tests (only if the install shipped them). py -3.11 on Windows; python3.11 elsewhere.
+# Scope to the deterministic `tests/` gate -- the same suite CI treats as canonical. Do NOT run an
+# unscoped `pytest` here: it also sweeps in the environment-optional `tests_oracle/` fidelity tiers,
+# some of which only pass when an optional DAX/image engine is ABSENT, so on a machine where that
+# engine is present the gate would fail by environment and needlessly roll back a good install.
 if ($ok -and (Test-Path (Join-Path $Install "tests"))) {
   Push-Location $Install
-  py -3.11 -m pytest -q
+  py -3.11 -m pytest tests -q
   if ($LASTEXITCODE -ne 0) { Write-Output "PYTEST FAILED"; $ok = $false }
   Pop-Location
 }
@@ -174,7 +178,7 @@ tmp="$(mktemp -d)"; git clone --depth 1 https://github.com/Yarbrdab000/tableau-f
 cp -a "$Install" "$Install.bak-$(date +%Y%m%d%H%M%S)"
 rsync -a --delete --exclude '.git' --exclude '__pycache__' --exclude '.pytest_cache' \
   "$tmp/skills/tableau-migration/" "$Install/"
-rm -rf "$tmp"   # then run the same file/symbol asserts + python3.11 -m pytest -q
+rm -rf "$tmp"   # then run the same file/symbol asserts + python3.11 -m pytest tests -q
 ```
 
 ## Author note — bump the stamp on every release
