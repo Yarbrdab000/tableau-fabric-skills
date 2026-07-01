@@ -1264,6 +1264,105 @@ def test_genericodbc_storage_routes_to_import_odbc_query():
     assert decision["fallback"] is None
 
 
+# -- native query engines over ODBC (Spark / Presto / Trino / Starburst) --------------------------
+# A native engine .tds carries server/port/catalog but NO odbc-driver attribute (Tableau used its
+# bundled native driver). The emitter must synthesize the per-engine driver and bind over ODBC.
+def _native_engine_tds(cls, custom_sql=True):
+    if custom_sql:
+        rel = (f"<relation connection='{cls}.abc' name='Custom SQL Query' type='text'>"
+               'SELECT "region", SUM(sales) AS total FROM hive.orders GROUP BY "region"</relation>')
+        parent = "[Custom SQL Query]"
+    else:
+        rel = f"<relation connection='{cls}.abc' name='orders' table='[orders]' type='table' />"
+        parent = "[orders]"
+    return f"""<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Lakehouse' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='engine' name='{cls}.abc'>
+        <connection class='{cls}' dbname='hive' port='8080' server='engine.example.com'
+                    username='analyst' password='hunter2' />
+      </named-connection>
+    </named-connections>
+    {rel}
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>region</remote-name><local-name>[region]</local-name>
+        <parent-name>{parent}</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>total</remote-name><local-name>[total]</local-name>
+        <parent-name>{parent}</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+
+_NATIVE_ENGINE_DRIVER = {
+    "spark": "Simba Spark ODBC Driver",
+    "presto": "Simba Presto ODBC Driver",
+    "trino": "Starburst ODBC Driver for Trino",
+    "starburst": "Starburst ODBC Driver for Trino",
+}
+
+
+@pytest.mark.parametrize("cls", ["spark", "presto", "trino", "starburst"])
+def test_parse_native_engine_descriptor_has_facts_but_no_odbc_driver(cls):
+    d = parse_tds(_native_engine_tds(cls))
+    assert d["connection_class"] == cls
+    assert d["server"] == "engine.example.com"
+    assert d["port"] == "8080"
+    assert d["database"] == "hive"
+    # the native .tds carries no ODBC driver/DSN -- the emitter supplies one.
+    assert not (d.get("odbc_driver") or "")
+    assert not (d.get("odbc_dsn") or "")
+    assert d["relations"][0]["kind"] == "custom_sql"
+
+
+@pytest.mark.parametrize("cls", ["spark", "presto", "trino", "starburst"])
+def test_emit_native_engine_custom_sql_uses_odbc_query_with_synth_driver(cls):
+    d = parse_tds(_native_engine_tds(cls))
+    body = emit_m_partition_source(d["relations"][0], d, "Import")
+    driver = _NATIVE_ENGINE_DRIVER[cls]
+    assert f'Source = Odbc.Query("Driver={{{driver}}};' in body
+    assert "Server=engine.example.com;Port=8080;Database=hive" in body
+    assert "FROM hive.orders" in body
+    # a clean, deploy-ready partition (not a scaffold).
+    assert "TODO" not in body
+    assert m_partition_review_reason(d["relations"][0], d, "Import") is None
+
+
+@pytest.mark.parametrize("cls", ["spark", "presto", "trino", "starburst"])
+def test_emit_native_engine_never_emits_inline_secret(cls):
+    # the inner <connection> carries username/password; NEITHER may reach the M body.
+    d = parse_tds(_native_engine_tds(cls))
+    body = emit_m_partition_source(d["relations"][0], d, "Import")
+    assert "hunter2" not in body
+    assert "analyst" not in body
+    assert "password" not in body.lower()
+
+
+@pytest.mark.parametrize("cls", ["spark", "presto", "trino", "starburst"])
+def test_native_engine_emits_no_connection_parameters(cls):
+    # Odbc.Query inlines the whole connection string -> no #"Server"/#"Database" params.
+    d = parse_tds(_native_engine_tds(cls))
+    assert emit_connection_parameters(d) == ""
+
+
+@pytest.mark.parametrize("cls", ["spark", "presto", "trino", "starburst"])
+def test_emit_native_engine_table_relation_scaffolds_odbc_datasource(cls):
+    d = parse_tds(_native_engine_tds(cls, custom_sql=False))
+    rel = d["relations"][0]
+    assert rel["kind"] == "table"
+    body = emit_m_partition_source(rel, d, "Import")
+    # ODBC table navigation is driver-specific -> a clearly-flagged Odbc.DataSource scaffold,
+    # but still NOT a land-to-Delta fallback.
+    assert "TODO" in body
+    assert "Odbc.DataSource" in body
+    assert m_partition_review_reason(rel, d, "Import") is not None
+
+
 
 def test_emit_snowflake_table_is_deploy_ready_three_level_navigation():
     # Snowflake.Databases(server, warehouse) then database -> schema -> table, keyed by [Name, Kind].

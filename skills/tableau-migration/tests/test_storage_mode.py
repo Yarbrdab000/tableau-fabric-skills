@@ -312,3 +312,90 @@ def test_generic_jdbc_is_not_routed_as_odbc():
     assert d["mode"] is None
     assert d["connector"] is None
     assert d["fallback"] == FALLBACK_LAND_TO_DELTA
+
+
+# -- native query-engine routing over ODBC (Spark / Presto / Trino / Starburst) ------------------
+# These classes have no clean first-party Power BI connector but ship an ODBC driver, so we promote
+# them to first-class by binding over the engine-agnostic ODBC emitter -- Import, never Delta.
+def _engine_desc(cls, **kw):
+    # A native engine .tds records server/port/catalog but NO odbc-driver/odbc-dsn (Tableau used its
+    # bundled native driver) -- the descriptor reflects that absence.
+    base = {
+        "connection_class": cls,
+        "server": "engine.example.com",
+        "database": "hive",
+        "port": "8080",
+        "odbc_driver": None,
+        "odbc_dsn": None,
+        "is_extract": False,
+        "named_connection_count": 1,
+        "relations": [{"kind": "custom_sql", "name": "Q", "sql": "SELECT 1",
+                       "columns": [{"model_name": "x", "tmdl_type": "int64"}]}],
+        "unsupported_reasons": [],
+    }
+    base.update(kw)
+    return base
+
+
+_EXPECTED_DRIVER = {
+    "spark": "Simba Spark ODBC Driver",
+    "presto": "Simba Presto ODBC Driver",
+    "trino": "Starburst ODBC Driver for Trino",
+    "starburst": "Starburst ODBC Driver for Trino",
+}
+
+
+@pytest.mark.parametrize("cls", ["spark", "presto", "trino", "starburst"])
+def test_native_engine_custom_sql_is_import_via_odbc_query(cls):
+    d = select_storage_mode(_engine_desc(cls))
+    assert d["mode"] == "Import"
+    assert d["connector"] == "Odbc.Query"
+    assert d["uses_native_query"] is True
+    assert d["fully_supported"] is False
+    assert d["fallback"] is None          # never lands in Delta
+    assert d["score"] == 60
+    # the assumed per-engine ODBC driver is named and flagged confirm-required.
+    fu = " || ".join(d["manual_followups"])
+    assert _EXPECTED_DRIVER[cls] in fu
+    assert "confirm" in fu.lower()
+    assert any("native query" in f.lower() for f in d["manual_followups"])
+
+
+@pytest.mark.parametrize("cls", ["spark", "presto", "trino", "starburst"])
+def test_native_engine_table_relation_is_import_via_odbc_datasource(cls):
+    table_rel = {"kind": "table", "name": "orders", "item": "orders",
+                 "columns": [{"model_name": "region", "tmdl_type": "string"}]}
+    d = select_storage_mode(_engine_desc(cls, relations=[table_rel]))
+    assert d["mode"] == "Import"
+    assert d["connector"] == "Odbc.DataSource"
+    assert d["uses_native_query"] is False
+    assert d["fallback"] is None          # a plain table still binds over ODBC, never Delta
+
+
+def test_native_engine_without_server_falls_back_to_delta():
+    # no server/host -> no ODBC connection string can be reconstructed -> fail closed.
+    d = select_storage_mode(_engine_desc("presto", server=""))
+    assert d["mode"] is None
+    assert d["fallback"] == FALLBACK_LAND_TO_DELTA
+    assert d["score"] == 30
+    assert d["recommended_mode"] == "Import"
+
+
+def test_native_engine_extract_still_routes_over_odbc_not_plain_scaffold():
+    # an extract-enabled native-engine source must take the ODBC path (branch 1.6 precedes the
+    # extract branch), not the unknown-connector / plain-extract scaffold.
+    d = select_storage_mode(_engine_desc("starburst", is_extract=True))
+    assert d["mode"] == "Import"
+    assert d["connector"] == "Odbc.Query"
+    assert d["fallback"] is None
+
+
+def test_native_engine_trino_and_starburst_share_driver_presto_differs():
+    # Trino and its enterprise distribution Starburst share the Starburst Trino driver; Presto and
+    # Spark use the Simba drivers -- lock the per-engine mapping so a rename is caught.
+    def driver_in(cls):
+        return " || ".join(select_storage_mode(_engine_desc(cls))["manual_followups"])
+    assert "Starburst ODBC Driver for Trino" in driver_in("trino")
+    assert "Starburst ODBC Driver for Trino" in driver_in("starburst")
+    assert "Simba Presto ODBC Driver" in driver_in("presto")
+    assert "Simba Spark ODBC Driver" in driver_in("spark")
