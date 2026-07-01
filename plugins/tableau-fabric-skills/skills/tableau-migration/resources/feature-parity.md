@@ -21,6 +21,8 @@ before a migration and to populate the "Not migrated" section of the report.
 | Extract (`.hyper`) | Import model | ✅ |
 | Live connection | DirectQuery model | ✅ (`Sql.Database` family + Oracle/Snowflake/Databricks emit deploy-ready M; Teradata/BigQuery flagged scaffold — live-navigator M not yet verified) |
 | Custom SQL | `Value.NativeQuery` partition | ✅ Preserved; folding requested (verify before refresh) |
+| Generic ODBC + Custom SQL (e.g. MinIO/object storage behind a driver) | `Odbc.Query` Import partition | ✅ Engine-agnostic; reconstructed from the driver/DSN facts (install the ODBC driver where the model runs) |
+| Native query engine (Spark / Presto / Trino / Starburst) | `Odbc.Query` (custom SQL) / `Odbc.DataSource` (table) Import partition | ✅ Bound over ODBC, **never landed in Delta**; the per-engine ODBC driver name is assumed and flagged confirm-required |
 | Federated / blended / join tree | — | ⚠️ Fallback to land-to-Delta + DirectLake |
 
 ---

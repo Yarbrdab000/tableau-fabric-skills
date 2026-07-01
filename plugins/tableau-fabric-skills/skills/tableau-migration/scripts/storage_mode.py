@@ -151,6 +151,26 @@ FLAT_FILE_CLASSES = {
 # (it cannot load Java drivers), so a JDBC source stays on the land-to-Delta fallback.
 ODBC_CLASSES = {"genericodbc"}
 
+# Native Tableau query-engine classes (Spark / Presto / Trino / Starburst). Power BI has no
+# first-party connector that transfers these cleanly without a live-verified scaffold, but each
+# engine ships an ODBC driver -- so we promote them to first-class by binding over the SAME
+# engine-agnostic ODBC emitter as ODBC_CLASSES (Odbc.Query for custom SQL / Odbc.DataSource for
+# tables), Import by default, and NEVER landing in Delta. Unlike a 'genericodbc' .tds these carry
+# no odbc-driver attribute (Tableau used its bundled native driver), but the inner <connection>
+# still records server / port / catalog, so the connection IS reconstructable; the one missing
+# value -- the ODBC driver NAME -- is supplied per-engine below and flagged confirm-required.
+NATIVE_ODBC_ENGINES = {"spark", "presto", "trino", "starburst"}
+
+# Per-engine default ODBC driver name. The exact registered name varies by installer version (hence
+# the confirm-required follow-up). Trino and its enterprise distribution Starburst share the
+# Starburst Trino driver; Spark and Presto bind through the Simba drivers Tableau bundles.
+NATIVE_ODBC_DRIVER = {
+    "spark": "Simba Spark ODBC Driver",
+    "presto": "Simba Presto ODBC Driver",
+    "trino": "Starburst ODBC Driver for Trino",
+    "starburst": "Starburst ODBC Driver for Trino",
+}
+
 # Connector classes a hyper extract may sit over; used only to report whether a live
 # alternative exists for an extracted datasource.
 _LIVE_CLASSES = set(DIRECT_CONNECTORS) | set(PARTIAL_LIVE_CONNECTORS)
@@ -195,6 +215,18 @@ _NATIVE_QUERY_FOLLOWUP = "Review the preserved custom SQL native query (folding 
 _ODBC_DRIVER_FOLLOWUP = ("Install the matching ODBC driver where the model runs (Power BI Desktop to "
                          "author, the on-premises data gateway to refresh) -- it is the same driver "
                          "Tableau uses; then set the connection credentials in Fabric.")
+
+
+def _native_engine_driver_followup(cls, driver):
+    """Confirm-required follow-up for a native query engine bound over ODBC. The native .tds did
+    not record an ODBC driver name (Tableau used its bundled driver), so we assume a per-engine
+    default; the user must confirm it matches the driver actually installed."""
+    return (f"{cls.capitalize()}: no first-party Power BI connector exists, so the model binds over "
+            f"ODBC using the assumed driver '{driver}'. The .tds did not record an ODBC driver name "
+            "(Tableau used its bundled native driver), so confirm this matches the ODBC driver "
+            "installed where the model runs (Power BI Desktop to author, the on-premises data "
+            "gateway to refresh); adjust the Driver=/Host= clauses to your driver's spelling if "
+            "needed, then set the connection credentials in Fabric.")
 # Databricks emits a doc-verified function shape, but two values can't be sourced portably from
 # the .tds: the SQL-warehouse HTTP path and (depending on the workbook) the Unity Catalog name.
 _DATABRICKS_FOLLOWUP = ('Databricks: set the SQL-warehouse HTTP Path parameter (#"HttpPath") and confirm '
@@ -357,6 +389,45 @@ def select_storage_mode(descriptor):
                           "engine, preserving its dialect)." if uses_native
                           else "Odbc.DataSource.")
                        + " Engine-agnostic: the driver/DSN named in the .tds binds the connection."),
+            manual_followups=followups,
+        )
+
+    # 1.6 native query engine (Spark / Presto / Trino / Starburst) -> route through the SAME
+    #     engine-agnostic ODBC emitter as generic ODBC (Odbc.Query for custom SQL / Odbc.DataSource
+    #     for a table), Import by default, NEVER landing in Delta. These classes have no clean
+    #     first-party Power BI connector, but each ships an ODBC driver and the .tds carries the
+    #     server/port/catalog, so the connection IS reconstructable -- the only value the native
+    #     .tds does not record is the ODBC driver NAME, which we supply per-engine and flag
+    #     confirm-required. Placed before branches 2-5 so BOTH extract and live native-engine
+    #     sources take the ODBC path. Fails closed to land-to-Delta only when there is no server.
+    if cls in NATIVE_ODBC_ENGINES:
+        if not (descriptor.get("server") or "").strip():
+            return _decision(
+                None, None,
+                fallback=FALLBACK_LAND_TO_DELTA,
+                score=SCORE_FALLBACK,
+                rationale=(f"{cls.capitalize()} source carried no server/host, so no ODBC connection "
+                           "string can be reconstructed; use land-to-Delta + DirectLake (default "
+                           "storage mode if rebuilt directly: Import)."),
+                manual_followups=base_followups,
+            )
+        driver = NATIVE_ODBC_DRIVER[cls]
+        connector = "Odbc.Query" if uses_native else "Odbc.DataSource"
+        followups = list(base_followups) + [_native_engine_driver_followup(cls, driver), _GATEWAY_FOLLOWUP]
+        if uses_native:
+            followups.append(_NATIVE_QUERY_FOLLOWUP)
+        return _decision(
+            "Import", connector,
+            fully_supported=False,
+            uses_native_query=uses_native,
+            score=SCORE_ODBC,
+            rationale=(f"{cls.capitalize()} query engine -> Import via "
+                       + ("Odbc.Query (the custom SQL passes through the ODBC driver to the engine, "
+                          "preserving its SQL dialect)." if uses_native else "Odbc.DataSource.")
+                       + f" Power BI has no first-party {cls} connector that transfers cleanly without "
+                         f"a live-verified scaffold, so the connection is rebuilt over ODBC using the "
+                         f"'{driver}' driver (confirm/replace with the driver installed where the model "
+                         "runs); never landed in Delta."),
             manual_followups=followups,
         )
 

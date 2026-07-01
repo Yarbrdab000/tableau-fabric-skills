@@ -28,12 +28,14 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
                                 tableau_geo_role_to_data_category)
     from .storage_mode import (
         ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
+        NATIVE_ODBC_DRIVER, NATIVE_ODBC_ENGINES,
         NATIVE_QUERY_CATALOG_DRILL, ODBC_CLASSES, PARTIAL_LIVE_CONNECTORS, connector_spec)
 except ImportError:
     from tmdl_generate import (clean_col, generate_column_tmdl, q, tableau_default_format_to_pbi,
                                tableau_geo_role_to_data_category)
     from storage_mode import (
         ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
+        NATIVE_ODBC_DRIVER, NATIVE_ODBC_ENGINES,
         NATIVE_QUERY_CATALOG_DRILL, ODBC_CLASSES, PARTIAL_LIVE_CONNECTORS, connector_spec)
 
 
@@ -238,6 +240,10 @@ def _odbc_connection_string(conn):
       and host, so no server/port/database clauses are added).
     * Driver-based -> ``Driver={<driver>};Server=<server>;Port=<port>;Database=<db>`` -- each
       clause only when its value is present.
+    * A native query engine (Spark/Presto/Trino/Starburst) carries NO ``odbc-driver`` attribute (it
+      used Tableau's bundled driver), so the per-engine default driver name (``NATIVE_ODBC_DRIVER``)
+      is substituted -- flagged confirm-required by the storage-mode follow-up -- and the same
+      ``Driver={...};Server=...`` string is built from its server/port/catalog.
 
     The non-secret ``odbc-connect-string-extras`` are appended after a credential scrub. Returns
     ``None`` when the .tds carries NEITHER a DSN nor a driver (nothing to bind), so the caller
@@ -248,6 +254,8 @@ def _odbc_connection_string(conn):
     """
     dsn = (conn.get("odbc_dsn") or "").strip()
     driver = (conn.get("odbc_driver") or "").strip()
+    if not dsn and not driver:
+        driver = NATIVE_ODBC_DRIVER.get((conn.get("connection_class") or "").lower(), "")
     clauses = []
     if dsn:
         clauses.append(f"dsn={dsn}")
@@ -1280,11 +1288,12 @@ def emit_connection_parameters(descriptor):
     """
     spec = connector_spec(descriptor.get("connection_class"))
     connect_style = spec[1] if spec else None
-    # Generic ODBC inlines its entire connection string inside Odbc.Query/Odbc.DataSource (see
-    # _emit_odbc_partition); it never references #"Server"/#"Database", so emitting those params
-    # would only leave unused expressions. connector_spec(genericodbc) is None, so without this
-    # guard the server/database below would emit anyway. Fail-safe: skip them for ODBC classes.
-    if (descriptor.get("connection_class") or "").lower() in ODBC_CLASSES:
+    # Generic ODBC (and the native query engines routed over ODBC) inline the entire connection
+    # string inside Odbc.Query/Odbc.DataSource (see _emit_odbc_partition); they never reference
+    # #"Server"/#"Database", so emitting those params would only leave unused expressions.
+    # connector_spec is None for these classes, so without this guard the server/database below
+    # would emit anyway. Fail-safe: skip them for every ODBC-bound class.
+    if (descriptor.get("connection_class") or "").lower() in (ODBC_CLASSES | NATIVE_ODBC_ENGINES):
         return ""
     no_database = ("server_only", "server_warehouse", "server_httppath")
     lines = []
@@ -1662,9 +1671,10 @@ def _emit_m_partition_review(relation, descriptor, mode):
             cls, None,
             "Microsoft Analysis Services is already a tabular/multidimensional semantic model; "
             "migrate the model directly (XMLA endpoint / semantic-model import), not as an M partition")
-    if cls in ODBC_CLASSES:
-        # Generic ODBC (engine-agnostic): emit Odbc.Query for custom SQL / a flagged Odbc.DataSource
-        # scaffold for a table. Handled before connector_spec (which returns None for genericodbc).
+    if cls in ODBC_CLASSES or cls in NATIVE_ODBC_ENGINES:
+        # Generic ODBC and the native query engines (Spark/Presto/Trino/Starburst) bind the SAME
+        # engine-agnostic way: Odbc.Query for custom SQL / a flagged Odbc.DataSource scaffold for a
+        # table. Handled before connector_spec (which returns None for these classes).
         return _emit_odbc_partition(relation, conn, cls)
     spec = connector_spec(cls)
     if spec is None:

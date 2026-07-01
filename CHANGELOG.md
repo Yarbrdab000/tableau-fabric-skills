@@ -13,6 +13,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **the native query engines Spark, Presto, Trino, and Starburst are now
+  first-class — they migrate cleanly over ODBC instead of being landed in Delta.** A Tableau
+  datasource (or workbook) on a `spark` / `presto` / `trino` / `starburst` connection previously had
+  no mappable Power BI connector, so it fell through to the lakehouse (land-to-Delta + DirectLake)
+  fallback. These classes now route through the same engine-agnostic ODBC emitter as generic ODBC: a
+  **Custom SQL** relation emits `Odbc.Query("<connection string>", "<SQL>")` (the SQL passes straight
+  through the driver to the engine, preserving its dialect) and a plain **table** relation scaffolds an
+  `Odbc.DataSource(…)` for review — both **Import**, never Delta. The connection string is rebuilt from
+  the parsed server/port/catalog; because a native engine `.tds` records no ODBC driver name (Tableau
+  used its bundled driver), a per-engine default is supplied — Spark → `Simba Spark ODBC Driver`,
+  Presto → `Simba Presto ODBC Driver`, Trino and Starburst → `Starburst ODBC Driver for Trino` — and
+  surfaced as a **confirm-required** follow-up (install/confirm the matching ODBC driver where the
+  model runs). Both extract-enabled and live native-engine sources take the ODBC path; a source with
+  no server fails closed to the lakehouse fallback. The **strict secret boundary** is unchanged — no
+  username/password is ever read or emitted, and `emit_connection_parameters` stays empty for these
+  classes (the connection string is inlined). Additive — no report-schema change. Skill `VERSION`
+  `1.13.0` → `1.14.0`.
 - **tableau-migration:** **the live pull can now obtain the Tableau secret without Azure Key Vault, via a
   masked terminal prompt.** The runbook asks an explicit credential-access question — **(A) Azure Key Vault**
   (the default) or **(B) a local secure terminal prompt** — instead of silently assuming Key Vault. When the
