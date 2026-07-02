@@ -42,6 +42,26 @@ try:  # package or scripts-on-path (mirrors the other cores)
 except ImportError:
     from tmdl_generate import clean_col
 
+# View-only Quick Table Calc -> Power BI Visual Calculation (additive; report-layer counterpart to
+# the model measure path). These three cooperate: ``extract_table_calc_usages`` recovers the quick
+# pill's addressing facts, ``usage_to_visual_calc_spec`` normalizes them to a view-layer IR, and
+# ``emit_visual_calc`` renders the Visual-Calculation DAX. The wiring below projects the base measure
+# + the VC into the visual's ``queryState`` (see ``_apply_visual_calcs``). Import is optional-safe so
+# a partial checkout still emits everything else.
+try:
+    from .workbook_table_calcs import extract_table_calc_usages
+    from .visual_calc_spec import usage_to_visual_calc_spec
+    from .visual_calc_emitter import emit_visual_calc
+except ImportError:  # pragma: no cover - flat scripts-on-path
+    try:
+        from workbook_table_calcs import extract_table_calc_usages
+        from visual_calc_spec import usage_to_visual_calc_spec
+        from visual_calc_emitter import emit_visual_calc
+    except ImportError:
+        extract_table_calc_usages = None
+        usage_to_visual_calc_spec = None
+        emit_visual_calc = None
+
 
 # -- PBIR schema URLs ----------------------------------------------------------
 _S = "https://developer.microsoft.com/json-schemas/fabric/item/report"
@@ -3559,6 +3579,263 @@ def _conditional_format(ws, state, model_table, field_map, warnings):
     return value_objects, fact
 
 
+# -- View-only Quick Table Calc -> Power BI Visual Calculation --------------------------------------
+# The report-layer counterpart to the model measure path. A Tableau *quick* table calc (applied on a
+# pill via the pill menu -- ``cum:`` / ``movavg:`` / ``pcto:`` ...) has no model equivalent: it is a
+# view-layer transform over the worksheet's own result matrix. Its Power BI twin is a **Visual
+# Calculation** stored in this visual's ``queryState`` and evaluated along the matrix axis. The quick
+# token is stripped off the resolved value pill at the viz layer, so these are correlated back to the
+# worksheet by NAME through ``extract_table_calc_usages`` (which recovers each quick pill's addressing
+# facts), normalized by ``usage_to_visual_calc_spec``, and rendered by ``emit_visual_calc``.
+
+# Deterministic queryRefs for the projected Visual Calculation(s). Inner-before-outer; the value is
+# self-consistent within the visual (a FillRule ``Input`` references the outer calc's queryRef).
+_VC_QUERY_REFS = ("select", "select1", "select2", "select3", "select4")
+
+# Cartesian charts carry their measure on the Y axis (not the matrix Values shelf) and their
+# dimensions on a single Category axis -- so a Visual Calculation runs along ROWS regardless of the
+# Tableau ordering token (chart geometry). The reorder set is the subset whose Category is built
+# ``categories(rows) + categories(cols)`` (so a projection-count split can re-nest it); a line/area
+# splits its shelves into Category vs SmallMultiple instead, which already carries the partition.
+_VC_CHART_TYPES = frozenset({VT_COLUMN, VT_BAR, VT_LINE, VT_AREA})
+_VC_REORDER_TYPES = frozenset({VT_COLUMN, VT_BAR})
+
+
+def _reorder_chart_category(ws, state, usage, model_table, field_map):
+    """Re-nest a chart's Category so a COLLAPSE percent-of-total lands on the addressed dimension.
+
+    ``COLLAPSE(m, ROWS)`` removes the **innermost** category level, so the addressed dimension (the one
+    the percent runs over) must be innermost and the partition dimension outermost. For a Tableau
+    ``ordering-type='Columns'`` the addressed dims are the Rows-shelf dims and the partition dims are
+    the Cols-shelf dims, i.e. the reverse of the default ``categories(rows) + categories(cols)`` order,
+    so the two shelf groups are swapped. The groups are found by a **projection count** -- how many
+    Category projections came from the Rows shelf (a side-effect-free ``_role_projections`` over a
+    throwaway ``used_refs``; the count is dedup- and hierarchy-consistent) -- never by fragile
+    pill<->projection name matching. Fails closed (leaves the order unchanged) if the split does not
+    reconcile. ``ordering-type='Rows'`` already yields partition-outer/addressed-inner, so it is a
+    no-op here.
+    """
+    ot = getattr(usage, "ordering_type", None) or "Table"
+    if ot != "Columns":
+        return
+    cat_state = state.get("Category") or {}
+    projections = cat_state.get("projections") or []
+    if len(projections) < 2:
+        return
+
+    def _categories(fs):
+        return [f for f in fs if isinstance(f, dict) and f.get("kind") == "category"]
+
+    def _drop_calc_axis(fs):
+        return [f for f in fs
+                if not (f.get("is_calc") and f.get("binding") == "measure")]
+
+    n_row = len(_role_projections(
+        _drop_calc_axis(_dedupe(_categories(list(ws.get("rows") or [])))),
+        model_table, field_map, set()))
+    if not 0 < n_row < len(projections):
+        return
+    row_group = projections[:n_row]
+    col_group = projections[n_row:]
+    cat_state["projections"] = col_group + row_group   # partition (Cols) outer, addressed (Rows) inner
+
+
+def _view_only_quick_index(table_calc_usages):
+    """Group view-only **quick** table-calc usages by worksheet name.
+
+    Only ``kind == "quick"`` usages are candidates for the Visual-Calculation path; a model-level
+    calc-field table calc is the measure path's job. Returns ``{worksheet_name: [usage, ...]}`` -- an
+    empty dict when nothing (or ``None``) is passed, so every existing caller (which passes none)
+    keeps byte-identical output.
+    """
+    index = {}
+    for usage in (table_calc_usages or []):
+        if getattr(usage, "kind", None) != "quick":
+            continue
+        index.setdefault(getattr(usage, "worksheet", None), []).append(usage)
+    index.pop(None, None)
+    return index
+
+
+def _apply_visual_calcs(ws, state, vc_index, model_table, field_map, warnings):
+    """Project a view-only quick table calc into this visual as a Power BI Visual Calculation.
+
+    Returns ``(value_objects_or_None, vc_fact_or_None)``:
+
+    * On success it mutates ``state`` in place -- setting the base measure's visibility per role and
+      appending the Visual Calculation projection(s) after it -- and, for a conditionally-formatted
+      table (``role == "color"``), returns the ``backColor`` FillRule ``value_objects`` that drive the
+      cell colour from the (hidden) outer calc. ``vc_fact`` is an additive candidate-record descriptor.
+    * When the quick calc cannot be pinned from the workbook facts (axis, calendar offset, or chain
+      shape unresolved), it degrades-and-warns (route-to-review): the base-only visual is left
+      untouched and ``vc_fact["status"] == "review"`` carries the reason -- never a guessed calc.
+    * It is a no-op (``(None, None)``) when there is no quick calc for this worksheet, the emitter
+      modules are unavailable, or the visual carries no base value projection to run the calc over.
+
+    Precedence: the model-level table-calc measure path is the first-class owner. If the base value
+    pill was rebound to a real model measure (``measure_rebound``), this yields so the two paths never
+    double-emit the same transform.
+
+    Cartesian charts (bar / column / line / area) are supported alongside tables/matrices: a chart
+    carries its base measure on the ``Y`` role (not the matrix ``Values`` shelf) and its dimensions on
+    a single Category axis, so the Visual Calculation runs along ``ROWS`` (chart geometry) and is
+    appended to ``Y``. A chart has no colour-role conditional-format concept, so its calc is always the
+    shown value (role ``"value"``) and it carries no ``backColor`` FillRule. When the worksheet is not
+    a cartesian chart (no / other ``visual_type``) the matrix path runs exactly as before.
+    """
+    if not vc_index or usage_to_visual_calc_spec is None or emit_visual_calc is None:
+        return None, None
+    usages = vc_index.get(ws["name"])
+    if not usages:
+        return None, None
+
+    # Chart vs matrix decides which role the base + Visual Calculation live on, the axis, and how the
+    # base pill is found. An absent / non-cartesian ``visual_type`` takes the matrix path unchanged.
+    is_chart = ws.get("visual_type") in _VC_CHART_TYPES
+    value_key = "Y" if is_chart else "Values"
+    values = (state.get(value_key) or {}).get("projections", [])
+    if not values:
+        return None, None
+
+    usage = usages[0]
+
+    if is_chart:
+        # A chart's category axis is the "rows" of its result matrix, so any chart Visual Calculation
+        # runs along ROWS regardless of the Tableau ordering token; the calc is always the shown value.
+        role = "value"
+        visual_axis = "ROWS"
+        base_field = next(
+            (f for f in (list(ws.get("rows") or []) + list(ws.get("cols") or []))
+             if isinstance(f, dict) and f.get("kind") == "value"), None)
+    else:
+        # A conditionally-formatted table carries a colour encoding pill (the calc drives the fill); a
+        # plain table does not (the calc is the shown value). This split decides base/calc visibility.
+        role = "color" if ws["encodings"].get("color") else "value"
+        visual_axis = None
+        # The base measure the calc runs over is the displayed value pill (label / text / colour).
+        base_field = (ws["encodings"].get("label") or ws["encodings"].get("text")
+                      or ws["encodings"].get("color"))
+
+    # Yield to the model measure path when the base pill was rebound to a real model measure (precedence).
+    if not base_field or base_field.get("kind") != "value":
+        return None, None
+    if base_field.get("measure_rebound"):
+        return None, None
+    _, base_qref, base_nref = _field_expression(base_field, model_table, field_map)
+    base_proj = next((p for p in values if p.get("queryRef") == base_qref), None)
+    if base_proj is None:
+        return None, None
+
+    # A rank / percentile partitions by the outermost level on its axis (the pane boundary). Resolve
+    # it from THIS visual's own outer axis projection so the partition is matrix-true: a chart's single
+    # Category axis, else the matrix's outer Columns (then Rows).
+    if is_chart:
+        part_src = (state.get("Category") or {}).get("projections", [])
+    else:
+        part_src = ((state.get("Columns") or state.get("Rows") or {}).get("projections", []))
+    partition_column = part_src[0].get("nativeQueryRef") if part_src else None
+
+    def _review(reason, family=None):
+        warnings.append(_warn(
+            "worksheet", ws["name"],
+            "view-only quick table calc routed to review ({0}); the visual is emitted "
+            "with the base measure only".format(reason)))
+        fact = {"kind": "visual_calculation", "worksheet": ws["name"], "role": role,
+                "status": "review", "reason": reason,
+                "tableau_calc_type": getattr(usage, "calc_type", None),
+                "tableau_instance": getattr(usage, "instance", None)}
+        if family:
+            fact["family"] = family
+        return None, fact
+
+    spec, reason = usage_to_visual_calc_spec(usage, role=role, visual_axis=visual_axis)
+    if spec is None:
+        return _review(reason)
+
+    defs, reason = emit_visual_calc(
+        spec, base_measure=base_nref, partition_column=partition_column)
+    if not defs:
+        return _review(reason, family=spec.family)
+
+    # Project the Visual Calculation(s) after the base measure (inner -> outer), each carrying its
+    # native-DAX expression. ``_visual_json`` writes ``queryState`` verbatim, so the custom
+    # ``NativeVisualCalculation`` field + ``hidden`` flag pass straight through.
+    vc_projections = []
+    for i, vc in enumerate(defs):
+        qref = _VC_QUERY_REFS[i] if i < len(_VC_QUERY_REFS) else "select{0}".format(i)
+        proj = {"field": {"NativeVisualCalculation": {
+                    "Language": "dax", "Expression": vc.expression, "Name": vc.name}},
+                "queryRef": qref, "nativeQueryRef": vc.name}
+        if vc.hidden:
+            proj["hidden"] = True
+        vc_projections.append((proj, vc))
+
+    # Plain table / chart: hide the base measure (the calc is the shown value). Conditionally-formatted
+    # table: keep the base measure visible (it is the shown number; the hidden calc only drives colour).
+    if role == "value":
+        base_proj["hidden"] = True
+    else:
+        base_proj.pop("hidden", None)
+    state[value_key]["projections"] = values + [p for p, _ in vc_projections]
+
+    # A chart percent-of-total that collapses to a partition subtotal (COLLAPSE, not COLLAPSEALL)
+    # needs the addressed dimension innermost on the Category axis; re-nest it from the same resolver.
+    if is_chart and not spec.collapse_all:
+        _reorder_chart_category(ws, state, usage, model_table, field_map)
+
+    outer_proj, _ = vc_projections[-1]
+    # Background conditional formatting (a heat scale) is faithful to BOTH roles; only WHICH cell it
+    # tints differs, because ``selector.metadata`` binds the fill to the measure column that is
+    # actually shown (a fill anchored to a hidden column paints nothing):
+    #   * colour role -- the shown base cell is tinted (metadata = base), driven by the hidden calc;
+    #   * value role  -- the shown calc cell is tinted (metadata = the visible calc), driven by that
+    #     same calc's magnitude.
+    # Either way the FillRule ``Input`` is the outer Visual Calculation's queryRef and the gradient is
+    # the Tableau palette (mirrors ``_conditional_format`` but drives off the calc, not a model
+    # measure). Emitted only when the worksheet actually carries a continuous colour gradient; without
+    # one ``value_objects`` stays ``None`` and the plain / base-only visual is unchanged. (The oracle
+    # anchors even its value-role fills to the base -- a Desktop duplicate-and-flip artifact that
+    # leaves them inert; anchoring to the visible calc is the faithful, actually-rendering choice.)
+    # A backColor cell fill is a table/matrix concept; a cartesian chart never carries one.
+    value_objects = None
+    cg = ws.get("color_gradient")
+    if cg and not is_chart:
+        fill_target = base_qref if role == "color" else outer_proj["queryRef"]
+        value_objects = [{
+            "properties": {"backColor": {"solid": {"color": {"expr": {"FillRule": {
+                "Input": {"SelectRef": {"ExpressionName": outer_proj["queryRef"]}},
+                "FillRule": _gradient_color_stops(cg)}}}}}},
+            "selector": {"data": [{"dataViewWildcard": {"matchingOption": 1}}],
+                         "metadata": fill_target}}]
+
+    vc_fact = {
+        "kind": "visual_calculation",
+        "worksheet": ws["name"],
+        "role": role,
+        "status": "emitted",
+        "family": spec.family,
+        "axis": spec.axis,
+        "base_measure": base_nref,
+        "tableau_calc_type": getattr(usage, "calc_type", None),
+        "tableau_instance": getattr(usage, "instance", None),
+        "tableau_summary": spec.tableau_summary,
+        "visual_calcs": [
+            {"name": vc.name, "expression": vc.expression, "hidden": vc.hidden,
+             "is_inner": vc.is_inner, "queryRef": p["queryRef"]}
+            for p, vc in vc_projections],
+    }
+    if role == "color":
+        vc_fact["backColor"] = {"driver": outer_proj["queryRef"], "target": base_qref,
+                                "emitted": value_objects is not None}
+    elif value_objects is not None:
+        # Value role only records the fact when it actually tinted the shown calc (gradient present);
+        # a plain value table without a colour scale keeps no backColor fact and stays unchanged. The
+        # fill both drives off and paints the visible calc, so driver == target here.
+        vc_fact["backColor"] = {"driver": outer_proj["queryRef"], "target": outer_proj["queryRef"],
+                                "emitted": True}
+    return value_objects, vc_fact
+
+
 # A per-member dataPoint fill (a ``scopeId`` data selector) is safe on the discrete categorical
 # charts where a colour dimension drives separate bars / slices. Line / area charts colour a
 # continuous series and an explicit dataPoint override there can drop the line (per the Power BI
@@ -4488,7 +4765,7 @@ def _filter_slicer_fields(ws_list, shown_tokens=None):
 
 
 def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
-              model_table=None, field_map=None):
+              model_table=None, field_map=None, table_calc_usages=None):
     """Emit a PBIR report definition (a ``{relative_path: text}`` parts dict) from the IR.
 
     One page per dashboard (a visual per worksheet zone), plus one page per worksheet not
@@ -4496,11 +4773,18 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     ``model_table`` to force every column ``Entity`` to a single model table, or ``field_map``
     (``{caption: {"entity","property","binding"}}``) to remap individual fields. Worksheets
     whose ``visual_type`` is ``unsupported`` are skipped (already recorded in ``warnings``).
+
+    ``table_calc_usages`` (optional) carries the workbook's extracted table-calc usages (from
+    ``extract_table_calc_usages``). When given, a worksheet whose displayed value is a **view-only
+    quick table calc** with no bound model measure gets a Power BI **Visual Calculation** projected
+    into its visual (the report-layer twin of the model measure path); without it, that transform
+    degrades-and-warns unchanged. Defaults to ``None`` so every existing caller stays byte-identical.
     """
     parts = {}
     ws_by_name = {w["name"]: w for w in ir["worksheets"]}
     warnings = []
     records = []
+    vc_index = _view_only_quick_index(table_calc_usages)
 
     parts["definition.pbir"] = _dumps({
         "$schema": SCHEMA_DEFINITION_PROPERTIES,
@@ -4544,8 +4828,20 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             vname = _sanitize(f"v-{page_name}-{i}-{ws['name']}")
             vtype = _pbir_vtype(ws["visual_type"], state)
             pos = _position(x, y, w, h, tab=i)
-            value_objects, cf_fact = _conditional_format(
-                ws, state, model_table, field_map, warnings)
+            vc_value_objects, vc_fact = _apply_visual_calcs(
+                ws, state, vc_index, model_table, field_map, warnings)
+            # The Visual Calculation owns the cell colour whenever it emitted a backColor FillRule --
+            # a colour-role table always (the hidden calc drives the fill), and a value-role table when
+            # the worksheet carries a colour gradient (the shown calc tints its own column). Skip the
+            # measure-driven conditional format then, so the fill is not double-emitted and the stale
+            # "colour driver is a quick table calc" defer warning is not raised.
+            vc_owns_fill = (vc_fact is not None and vc_fact.get("status") == "emitted"
+                            and (vc_fact.get("role") == "color" or vc_value_objects is not None))
+            if vc_owns_fill:
+                value_objects, cf_fact = vc_value_objects, None
+            else:
+                value_objects, cf_fact = _conditional_format(
+                    ws, state, model_table, field_map, warnings)
             data_point_objects, mc_fact = _data_point_colors(
                 ws, state, ws["visual_type"], model_table, field_map, warnings)
             ms_objects, ms_fact = _measure_series_colors(
@@ -4578,6 +4874,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                                     model_table=model_table, field_map=field_map)
             if cf_fact:
                 rec["conditional_format"] = cf_fact
+            if vc_fact:
+                rec["visual_calc"] = vc_fact
             if mc_fact:
                 rec["mark_colors"] = mc_fact
             if ms_fact:
@@ -4619,8 +4917,20 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         vname = _sanitize("v-" + ws["name"])
         vtype = _pbir_vtype(ws["visual_type"], state)
         pos = _position(40, 40, 880, 620)
-        value_objects, cf_fact = _conditional_format(
-            ws, state, model_table, field_map, warnings)
+        vc_value_objects, vc_fact = _apply_visual_calcs(
+            ws, state, vc_index, model_table, field_map, warnings)
+        # The Visual Calculation owns the cell colour whenever it emitted a backColor FillRule -- a
+        # colour-role table always (the hidden calc drives the fill), and a value-role table when the
+        # worksheet carries a colour gradient (the shown calc tints its own column). Skip the measure-
+        # driven conditional format then, so the fill is not double-emitted and the stale "colour
+        # driver is a quick table calc" defer warning is not raised.
+        vc_owns_fill = (vc_fact is not None and vc_fact.get("status") == "emitted"
+                        and (vc_fact.get("role") == "color" or vc_value_objects is not None))
+        if vc_owns_fill:
+            value_objects, cf_fact = vc_value_objects, None
+        else:
+            value_objects, cf_fact = _conditional_format(
+                ws, state, model_table, field_map, warnings)
         data_point_objects, mc_fact = _data_point_colors(
             ws, state, ws["visual_type"], model_table, field_map, warnings)
         ms_objects, ms_fact = _measure_series_colors(
@@ -4648,6 +4958,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                                 model_table=model_table, field_map=field_map)
         if cf_fact:
             rec["conditional_format"] = cf_fact
+        if vc_fact:
+            rec["visual_calc"] = vc_fact
         if mc_fact:
             rec["mark_colors"] = mc_fact
         if ms_fact:
@@ -4790,8 +5102,23 @@ def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
     """
     ir = parse_twb(xml_text, date_binding=date_binding, row_count_binding=row_count_binding,
                    measure_binding=measure_binding, param_binding=param_binding)
+    # Recover the workbook's view-only quick table calcs (the quick token is stripped off the
+    # resolved value pill, so the addressing facts live only here) and hand them to the emitter, which
+    # projects each as a Power BI Visual Calculation. Fail-open: a parse hiccup never blocks the rest
+    # of the report emission.
+    table_calc_usages = None
+    if extract_table_calc_usages is not None:
+        try:
+            # Normalize exactly as ``parse_twb`` does (``.twb`` files carry a UTF-8 BOM) so the
+            # usage extraction never trips on a byte string or a leading BOM.
+            norm = (xml_text.decode("utf-8-sig") if isinstance(xml_text, bytes)
+                    else xml_text.lstrip("\ufeff"))
+            table_calc_usages = extract_table_calc_usages(norm)
+        except Exception:
+            table_calc_usages = None
     parts = emit_pbir(ir, dataset_name=dataset_name, report_name=report_name,
-                      model_table=model_table, field_map=field_map)
+                      model_table=model_table, field_map=field_map,
+                      table_calc_usages=table_calc_usages)
     return {"ir": ir, "parts": parts, "warnings": ir["warnings"],
             "candidate_records": ir.get("candidate_records", [])}
 

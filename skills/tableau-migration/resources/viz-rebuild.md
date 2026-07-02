@@ -444,6 +444,70 @@ status is reported as `viz_fidelity` (`rebuilt` / `warned`); anything that can't
 bind, a missing `definition.pbir`) is recorded in `pbip_warnings` and the `.pbip` is skipped rather
 than mis-bound. See [migration-report.md](migration-report.md) for the exact report keys.
 
+## Visual Calculations (view-only quick table calcs)
+
+A Tableau **quick table calc** applied on a pill via the pill menu (Running Total, YTD, YTD Growth,
+Moving Average, Percentile, Compound Growth, Percent Difference, Percent of Total, Year-over-Year,
+Difference) is a **report/view-layer** transform: it re-shapes the worksheet's own result matrix
+along an axis with a restart scope, and has **no model equivalent**. The measure pipeline
+deliberately hands these off, so historically the base aggregate survived on the value shelf but the
+transform was emitted as neither a measure nor a calc, and the visual was judged incomplete and
+skipped. Power BI **Visual Calculations** are the structurally identical home — also stored in the
+visual (`queryState` projections carrying a `NativeVisualCalculation` DAX field) and evaluated over
+the visual's own matrix along `ROWS`/`COLUMNS` with a partition/reset scope — so a view-only quick
+calc rebuilds as a view-only Visual Calculation: same layer in, same layer out, no model measure.
+
+**Precedence (never a double-emit).** Three paths coexist with strict ordering: the datasource
+model and the **model-level** table-calc measure engine (named calc-field table calcs →
+`WINDOW`/`OFFSET`/`ROWNUMBER`/`RANKX` measures) are first-class and untouched. The Visual-Calculation
+path fires **only** when a pill is a quick table calc *and* the measure path did not bind a measure
+for it (`measure_rebound`). When it doesn't fire, output is byte-identical.
+
+**Compiler, not pattern-matcher.** `workbook_table_calcs.extract_table_calc_usages` recovers each
+usage's addressing facts (including the `level-break`/`level-address`/`diff-options` reset-and-grain
+facts and any stacked secondary pass); `visual_calc_spec` normalizes them into a small view-layer IR
+(family + axis + reset + offset + scope + role + chain); `visual_calc_emitter` renders that IR into
+faithful DAX (`RUNNINGSUM`, `MOVINGAVERAGE`, `RANK`, `PREVIOUS`, `FIRST`, `ROWNUMBER`, `COLLAPSE`/
+`COLLAPSEALL`). The axis is derived from the **view** — the shelf carrying the ordering/date
+dimension — not the raw ordering token (so the corpus' "computed Down" twin, whose token is
+`Columns`, correctly flips to axis `ROWS`). An above-leaf offset is a resolved calendar ratio
+(Year-over-Quarter = 4 periods). Any calc whose axis, calendar ratio, or chain shape cannot be
+pinned from the workbook facts routes to **review** with a reason rather than a guess.
+
+**One shared addressing decomposition.** `visual_calc_spec.resolve_addressing(usage)` is the single
+view-layer superset every Visual-Calculation consumer reads from. It splits the visual's dimension
+pills into **addressed** (the calc runs/sums/offsets along these) and **partition** (it restarts/
+subtotals within these): `Rows` → addressed on the Cols shelf, partition on Rows; `Columns` →
+addressed on Rows, partition on Cols (the token a model measure hands off, but a matrix-relative
+Visual Calculation can resolve); `Table` → all addressed, no partition; `Field` → the ordering
+fields addressed, the rest partition. A compound/pane token that the shelves alone don't disambiguate
+fails closed to a review reason. `partition ≠ ∅` → `COLLAPSE` (a partition subtotal); `partition = ∅`
+→ `COLLAPSEALL` (the grand total). The dim-vs-measure classification comes from the shared
+`workbook_table_calcs.AGG_DERIVATIONS` set / `Pill.is_dimension`, so both paths agree on the edges
+(`Cntd`/`Attr`/`Stdev`/a `User` LOD reference are not partition dimensions).
+
+**Matrix vs cartesian chart.** A **matrix** carries its base measure on the `Values` shelf and its
+dimensions on `Rows`/`Columns`, so the axis is derived from those shelves as above. A **cartesian
+chart** (bar / column / line / area) carries its base measure on the `Y` role and its dimensions on a
+single **Category** axis, which is the "rows" of the chart's result matrix — so any chart Visual
+Calculation runs along `ROWS` regardless of the Tableau ordering token (a structural fact of chart
+geometry). When a chart percent-of-total collapses to a partition subtotal (`COLLAPSE`, not
+`COLLAPSEALL`), `COLLAPSE(m, ROWS)` removes the **innermost** Category level, so the Category
+projections are re-nested **partition-outer / addressed-inner** (via a side-effect-free
+projection-count split over the same `resolve_addressing`, never fragile pill↔name matching) so the
+collapse lands on the addressed dimension. A chart has no colour-role conditional-format concept, so
+its calc is always the shown value and it carries no `backColor` fill.
+
+**Roles + visibility.** A *plain* table/chart hides the base measure and shows the calc (role
+`value`); a *conditionally-formatted* table keeps the base measure visible and hides the calc, which
+only drives the `backColor` heat scale (role `color`, detected from the marks colour encoding). The
+`backColor` FillRule's `Input` is the outer Visual Calculation's `queryRef`; `selector.metadata`
+binds the fill to whichever measure column is actually shown (a fill anchored to a hidden column
+paints nothing) — the base cell for a colour-role table, the calc cell for a value-role one. A
+stacked secondary calc (e.g. YTD → Year-over-Year growth) emits as a two-pass chain with the inner
+calc always hidden. `report.json` / `summary.md` gain an additive `visual_calculations` routing
+rollup (emitted / review, by role and calc family).
+
 ## Unsupported handling (→ `warnings`, never a wrong visual)
 
 Every warning is `{"scope": "worksheet"|"dashboard", "name": <name>, "reason": "manual attention required: ..."}`.
@@ -465,7 +529,13 @@ Cases that degrade to a warning instead of a visual/binding:
   *KPI target/goal* on a card, a *reference/target/trend line* on a chart). The annotation
   descriptors are also recorded on the worksheet IR (`reference_lines`) for a future analytics pass.
   Drawing the overlay itself (the line/band on the canvas) stays Tier-2.
-- **Table calculations** and other window/running derivations (e.g. `WindowSum`) → field skipped.
+- **Table calculations** and other window/running derivations (e.g. `WindowSum`) → field skipped
+  **here**, but note this is now the *fallback of last resort*: a view-only **quick** table calc is
+  first rebuilt as a Power BI **Visual Calculation** (see the section above), and a named model-level
+  table-calc field is bound to a `WINDOW`/`OFFSET`/`RANKX` **measure** by the measure engine. A field
+  is only skipped when neither path can pin it (an off-substrate calc — `SCRIPT_*`, `PREVIOUS_VALUE`
+  recursion, a filters-shelf calc — or an axis/chain that the workbook facts don't fix), in which case
+  the reason is disclosed rather than guessed.
 - **Aggregation/type mismatch**: `Sum`/`Avg`/`Median` on a non-numeric column, or `Min`/`Max`
   on a non-numeric/non-date column → field skipped.
 - **Date parts** (`Year`, `Month`, `Quarter`, …) → approximated as a plain date column; the

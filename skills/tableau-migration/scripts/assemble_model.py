@@ -618,6 +618,18 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             fm["measure"], fm.get("tableau_formula", ""), fm["dax"],
             translated_by=fm.get("translated_by") or "deterministic (parameter-driven date window)")
         report.append(fm["report_row"])
+    # View-only quick table calcs (running total, YTD, moving average, ...) are reproduced in the
+    # REPORT layer as Power BI Visual Calculations, not model measures -- but each references a
+    # concrete base measure. Synthesize that base -- ``Count <fact> = COALESCE(COUNTROWS('<fact>'),0)``
+    # -- for every fact table a quick calc implicitly row-counts, unless the table already exposes a
+    # whole-table count. Additive and fail-closed: ``[]`` (and byte-for-byte identical output) unless
+    # the workbook actually carries such a view-only quick table calc. The appended rows flow into
+    # ``_row_count_targets`` so the viz layer binds the implicit-count pill to this measure for free.
+    for br in _visual_calc_base_measures(table_calc_usages, known_tables, report):
+        measures_tmdl += T.generate_measure_tmdl(
+            br["measure"], br["tableau_formula"], br["dax"],
+            translated_by=br.get("translated_by") or "deterministic (visual-calculation base measure)")
+        report.append(br)
     return T.generate_measures_table_tmdl(measures_tmdl), report, suggestions
 
 
@@ -758,6 +770,91 @@ def _row_count_targets(measure_report):
         tbl, meas = next(iter(measures.items()))
         default = {"table": tbl, "measure": meas}
     return {"measures": measures, "default": default}
+
+
+# Tableau's object-model row-identity internal: an aggregate over it (COUNT([__tableau_internal
+# _object_id__])) is a whole-table row count, so its faithful Power BI target is COUNTROWS of that
+# table (mirrors the same recognizer in the viz layer). Kept as a local literal so the model builder
+# never reaches into the viz module for it.
+_VC_INTERNAL_OBJECT_ID = "__tableau_internal_object_id__"
+_VC_OBJECT_ID_SUFFIX_RE = re.compile(r"^(.*)_[0-9A-Fa-f]{32}$")
+
+
+def _vc_base_count_table(usage, known_tables):
+    """The fact table a VIEW-ONLY quick table calc implicitly row-counts, or ``None``.
+
+    A quick table calc placed directly on a pill whose base aggregate is Tableau's object-model row
+    identity -- ``COUNT([__tableau_internal_object_id__])`` -- is a whole-table row count; the
+    internal's caption names the counted table (validated against ``known_tables``, else recovered
+    from the ``<Table>_<32-hex>`` object-id token). Anything else (a count over a real column, a
+    SUM/AVG/named-calc base) returns ``None`` -- no implicit-count base measure is synthesised for it
+    here."""
+    if getattr(usage, "kind", None) != "quick":
+        return None
+    if (getattr(usage, "derivation", "") or "").strip().lower() != "count":
+        return None
+    col = getattr(usage, "column", "") or ""
+    if _VC_INTERNAL_OBJECT_ID not in col:
+        return None
+    known = {str(t) for t in (known_tables or [])}
+    cap = (getattr(usage, "caption", "") or "").strip()
+    if cap and cap in known:
+        return cap
+    tail = col.split(".")[-1].strip("[]")
+    m = _VC_OBJECT_ID_SUFFIX_RE.match(tail)
+    if m and m.group(1) in known:
+        return m.group(1)
+    return None
+
+
+def _visual_calc_base_measures(table_calc_usages, known_tables, existing_report):
+    """Synthesize ``Count <Table> = COALESCE(COUNTROWS('<Table>'), 0)`` base measures for the
+    view-only quick-table-calc -> Power BI Visual Calculation path.
+
+    A view-only quick table calc (running total, YTD, moving average, percent of total, ...) has NO
+    measure of its own -- the addressing-bearing measure path deliberately hands it off, because a
+    model measure cannot pin the across/down direction those view-layer scopes imply. It is instead
+    reproduced in Power BI as a *Visual Calculation* in the REPORT layer, which must reference a
+    concrete base measure. This synthesises that base for every fact table whose quick calc
+    row-counts it, matching the hand-built oracle's ``COALESCE(COUNTROWS('Orders'), 0)``. The
+    ``COALESCE(..., 0)`` (not ``BLANK``) is deliberate fidelity: RUNNINGSUM / PREVIOUS / window math
+    over a sparse result matrix needs ``0`` so resets and windows reproduce Tableau's densified view.
+
+    Additive + fail-closed. A table that ALREADY exposes a whole-table row-count measure (per
+    ``_row_count_targets``) is skipped -- its existing count is reused -- as is a ``Count <Table>``
+    name another measure already owns. Returns ``[]`` when no fact table carries such a quick calc,
+    so a workbook without view-only quick table calcs is byte-for-byte unchanged.
+    """
+    existing_names = {(r.get("measure") or "").strip().lower() for r in (existing_report or [])}
+    existing_rc = set((_row_count_targets(existing_report).get("measures") or {}).keys())
+    rows, seen = [], set()
+    for u in table_calc_usages or []:
+        table = _vc_base_count_table(u, known_tables)
+        if not table or table in seen or table in existing_rc:
+            continue
+        name = f"Count {table}"
+        if name.strip().lower() in existing_names:
+            continue
+        seen.add(table)
+        rows.append({
+            "measure": name,
+            "status": "translated",
+            "reason": None,
+            "dax": f"COALESCE(COUNTROWS('{table}'), 0)",
+            "tableau_formula": f"COUNT([{table}])",
+            "translated_by": "deterministic (visual-calculation base measure)",
+            # Cross-layer source identity: the viz layer's ``row_count_binding`` (derived from the
+            # ``_row_count_targets`` of this report) binds the implicit-count pill to this measure,
+            # and the emitted Visual Calculation references ``[Count <Table>]`` by name.
+            "source": {
+                "kind": "visual_calc_base",
+                "model_table": "_Measures",
+                "field_caption": name,
+                "fact_table": table,
+                "intent": "count",
+            },
+        })
+    return rows
 
 
 def build_model_manifest(*, table_names, relations, measure_report, calc_column_report,

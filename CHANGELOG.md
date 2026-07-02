@@ -13,6 +13,61 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **the view-only quick-table-calc → Visual Calculation path now covers
+  cartesian charts (bar / column / line / area), not just tables and matrices — closing a gap where a
+  chart whose measure was a quick table calc emitted no calc at all.** A chart carries its base
+  measure on the `Y` role (not the matrix `Values` shelf) and its dimensions on a single **Category**
+  axis, so the earlier matrix-only wiring returned early (the base was never found) and no Visual
+  Calculation was attempted — a line "moving average" showed the raw measure and a bar "percent of
+  region" showed nothing computed. The wiring seam is now chart-aware: it sources the base from `Y`,
+  appends the Visual Calculation there (base hidden, calc shown), and — because a chart's Category is
+  the "rows" of its result matrix — runs the calc along `ROWS` regardless of the Tableau ordering
+  token (a structural fact of chart geometry, not a per-example override). The COLLAPSE/COLLAPSEALL
+  choice and the axis all flow from **one shared addressing decomposition**
+  (`visual_calc_spec.resolve_addressing`): a partitioned percent-of-total emits `COLLAPSE(m, ROWS)`
+  and re-nests the chart's Category **partition-outer / addressed-inner** (via a side-effect-free
+  projection-count split, never fragile name matching) so the collapse lands on the addressed
+  dimension, while a whole-table one keeps `COLLAPSEALL`. The dim-vs-measure classification is now a
+  single shared set (`workbook_table_calcs.AGG_DERIVATIONS` / `Pill.is_dimension`, consumed by both
+  the measure and view-layer paths) so the two agree on the edge derivations (`Cntd`/`Attr`/`Stdev`/a
+  `User` LOD reference). Validated against a hand-built Power BI oracle: the line rebuilds to
+  `MOVINGAVERAGE([Sum of Sales], 3, TRUE, ROWS)` and the bar to
+  `DIVIDE([Sum of Sales], COLLAPSE([Sum of Sales], ROWS))` with Category `[Segment, Region]`, both
+  matching the oracle. Strictly **additive**: the matrix path is byte-identical (a worksheet with no
+  cartesian `visual_type` takes the matrix path unchanged), the measure engine and datasource
+  migration are untouched, and precedence still yields to a bound model measure so the two paths never
+  double-emit. Skill `VERSION` `1.16.0` → `1.16.1`.
+- **tableau-migration:** **view-only quick table calcs now rebuild as Power BI Visual Calculations
+  instead of being dropped — closing a fidelity gap that silently deleted whole worksheets.** A
+  Tableau *quick table calc* applied on a pill (Running Total, YTD, YTD Growth, Moving Average,
+  Percentile, Compound Growth, Percent Difference, Percent of Total, Year-over-Year, Difference) is a
+  **report/view-layer** transform with no model equivalent, so it fell through the measure pipeline
+  and the viz layer deferred it — the base aggregate survived but the transform was emitted as
+  neither a measure nor a calc, and the visual was judged incomplete and skipped (19 of 21 worksheets
+  in the ground-truth corpus). A new **additive** path recovers the calc's addressing facts
+  (`workbook_table_calcs.extract_table_calc_usages`, extended with the previously-dropped
+  `level-break` / `level-address` / `diff-options` reset-and-grain facts and the stacked secondary
+  pass), normalizes them into a small view-layer IR (`visual_calc_spec`) and renders that IR into
+  faithful **Visual-Calculation DAX** (`visual_calc_emitter`) — `RUNNINGSUM` / `MOVINGAVERAGE` /
+  `RANK` / `PREVIOUS` / `FIRST` / `ROWNUMBER` / `COLLAPSEALL` over the visual's own matrix axis. It is
+  a **compiler, not a pattern-matcher**: the axis is derived from the *view* (the shelf carrying the
+  ordering/date dimension), not the raw ordering token — so the corpus' "computed Down" twin
+  correctly flips COLUMNS→ROWS — an above-leaf offset is a resolved calendar ratio (Year-over-Quarter
+  = 4 periods), and any calc whose axis, calendar ratio, or chain shape cannot be pinned from the
+  workbook routes to **review** with a reason rather than a guess. Strict precedence keeps the three
+  paths from colliding: the datasource-migration engine and the model-level table-calc **measure**
+  engine are untouched and first-class; the Visual-Calculation path fires only when a pill is a quick
+  table calc *and* the measure path did not bind a measure for it (never a double-emit; byte-identical
+  output when the path doesn't fire). The base aggregate is materialized once as
+  `Count Orders = COALESCE(COUNTROWS(Orders), 0)` so windows and resets match Tableau's densified
+  result, the original Tableau spec is preserved as a provenance annotation (mirroring the
+  `TableauFormula` / `TranslatedBy` discipline), and `report.json` / `summary.md` gain an **additive**
+  `visual_calculations` routing rollup (emitted / review, by role and calc family). Both worksheet
+  roles also carry their Tableau colour scale as a matrix `backColor` heat map: a *conditionally
+  formatted* table tints its shown base cell (driven by the hidden calc) and a plain table tints its
+  shown calc cell (driven by that calc) — the FillRule is bound to whichever column is actually
+  visible so the fill renders, and the same white→orange gradient drives both. This boosts
+  dashboard-rebuild fidelity toward pixel-parity replicas. Skill `VERSION` `1.15.1` → `1.16.0`.
 - **tableau-migration:** **the self-update runbook no longer rolls back a good install on machines
   where an optional fidelity engine is present.** `resources/self-update.md` Step 3 (post-install
   verification) ran an **unscoped** `pytest`, which swept in the environment-optional `tests_oracle/`

@@ -12,6 +12,9 @@ table-calc function -- the facts the ``.tds`` cannot carry:
 * rank options (e.g. ``Unique,Descending``),
 * the **ordering scope** (``Table`` / ``Pane`` / ``Cell`` / ``Rows`` / ``Columns`` /
   ``Field``), explicit ordering field(s) and an explicit ``sort``,
+* the **reset / grain** facts -- ``level-break`` (restart level, e.g. YTD), ``level-address``
+  (above-leaf addressing grain, e.g. Year-over-Year) and ``diff-options`` (``Relative`` vs a
+  compounded ``Relative,Compounded``) -- plus the stacked **secondary pass** of a chained calc,
 * the **rows / cols shelf layout** the partition is read against.
 
 These are surfaced as plain typed facts (:class:`TableCalcUsage`); turning a ``Pane`` /
@@ -88,6 +91,18 @@ def _int_or_none(value: Optional[str]) -> Optional[int]:
         return None
 
 
+# Pill derivations that mean "an aggregated measure", not a partition dimension. This is the
+# canonical set (Tableau's SHORT spellings -- ``Cntd`` / ``Attr`` / ``Stdev`` -- as they appear on
+# a column-instance ``derivation`` attribute) shared by BOTH table-calc consumers: the measure path
+# (:mod:`table_calc_to_dax`, whose ``_dim_pills`` skips these) and the view-layer path
+# (:mod:`visual_calc_spec`, via :attr:`Pill.is_dimension`). A ``Pill``'s dim-vs-measure nature is
+# intrinsically a property of the pill, so it lives here with the :class:`Pill` both paths import.
+AGG_DERIVATIONS = frozenset({
+    "Sum", "Avg", "Min", "Max", "Count", "Cntd", "Median", "Attr",
+    "Stdev", "StdevP", "Var", "VarP", "Measure",
+})
+
+
 # -- typed records -------------------------------------------------------------
 @dataclass
 class Pill:
@@ -95,6 +110,14 @@ class Pill:
     instance: str           # instance id, e.g. "none:Sub-Category:nk"
     column: str             # underlying field id, e.g. "Sub-Category"
     derivation: str         # "None" / "Sum" / "Year" / "Month-Trunc" / "User" / ...
+
+    @property
+    def is_dimension(self) -> bool:
+        """True iff this pill is a real partition dimension (not an aggregated measure).
+
+        ``User`` (a user-level LOD reference) is excluded alongside the aggregations: neither can
+        carry a table-calc partition. Matches the measure path's ``_dim_pills`` gate exactly."""
+        return self.derivation not in AGG_DERIVATIONS and self.derivation != "User"
 
     def to_dict(self) -> dict:
         return {"instance": self.instance, "column": self.column,
@@ -117,12 +140,26 @@ class TableCalcUsage:
     window_to: Optional[int] = None     # relative window end (WindowTotal), e.g. 0
     window_options: Optional[str] = None  # e.g. "IncludeCurrent"
     rank_options: Optional[str] = None  # e.g. "Unique,Descending"
+    # -- reset / grain facts (primary pass). Present on the raw <table-calc> but historically
+    # dropped; carried now (additive, default None) so a *view-layer* consumer can recover the
+    # restart level (level-break -> "reset at the highest parent", e.g. YTD) and the above-leaf
+    # addressing grain (level-address, e.g. Year-over-Year offset). diff-options distinguishes a
+    # plain difference ("Relative") from a compounded one ("Relative,Compounded" -> CAGR).
+    level_break: Optional[str] = None    # restart level, e.g. "[...].[qr:Order Date:ok]" (YTD)
+    level_address: Optional[str] = None  # above-leaf addressing grain, e.g. "[...].[yr:...]" (YoY)
+    diff_options: Optional[str] = None   # e.g. "Relative" / "Relative,Compounded"
     # Table / Pane / Cell / Rows / Columns / ColumnInPane / PaneCol / CellInPane / Field
     ordering_type: str = "Table"
     ordering_fields: List[str] = field(default_factory=list)  # underlying field ids
     sort_field: Optional[str] = None    # underlying field id of an explicit sort
     sort_direction: Optional[str] = None  # "ASC" / "DESC"
     secondary: bool = False             # a stacked "secondary calculation" is present (-> Tier 1)
+    # Facts of the stacked secondary <table-calc> when ``secondary`` is True (a Tableau QTC allows
+    # exactly one secondary pass, so a single record suffices). A plain dict of the same fact names
+    # as above -- used by the view-layer visual-calc path to build a two-pass chain (e.g. YTD then
+    # Year-over-Year growth). ``None`` for the common single-pass usage. Additive: existing
+    # (measure-path) consumers ignore it and hand off on ``secondary`` as before.
+    secondary_pass: Optional[dict] = None
     shelf: Optional[str] = None         # "rows" | "cols" | None (where the calc pill sits)
     rows: List[Pill] = field(default_factory=list)
     cols: List[Pill] = field(default_factory=list)
@@ -228,6 +265,40 @@ def _detect_secondary(ci, tc) -> bool:
     return False
 
 
+def _secondary_pass_facts(tc, instances) -> dict:
+    """Extract one stacked secondary ``<table-calc>`` element into a plain facts dict.
+
+    Mirrors the primary-pass field names (``calc_type`` / ``aggregation`` / window bounds /
+    ordering / reset & grain) so a view-layer consumer can rebuild the second addressing pass of a
+    chained Quick Table Calc (e.g. a running YTD followed by a Year-over-Year growth). Read-only and
+    resolution-only -- it never guesses a direction; that stays the consumer's job.
+    """
+    ordering_fields = []
+    if tc.get("ordering-field"):
+        ordering_fields.append(_resolve_field_id(tc.get("ordering-field"), instances))
+    for order in _children_local(tc, "order"):
+        fid = _resolve_field_id(order.get("field"), instances)
+        if fid:
+            ordering_fields.append(fid)
+    sort_el = _first(tc, "sort")
+    return {
+        "calc_type": tc.get("type"),
+        "aggregation": tc.get("aggregation"),
+        "window_from": _int_or_none(tc.get("from")),
+        "window_to": _int_or_none(tc.get("to")),
+        "window_options": tc.get("window-options"),
+        "rank_options": tc.get("rank-options"),
+        "ordering_type": tc.get("ordering-type") or "Table",
+        "ordering_fields": ordering_fields,
+        "sort_field": (_resolve_field_id(sort_el.get("using"), instances)
+                       if sort_el is not None else None),
+        "sort_direction": sort_el.get("direction") if sort_el is not None else None,
+        "level_break": tc.get("level-break"),
+        "level_address": tc.get("level-address"),
+        "diff_options": tc.get("diff-options"),
+    }
+
+
 def extract_table_calc_usages(xml_text: str) -> List[TableCalcUsage]:
     """Parse a ``.twb`` XML string into one :class:`TableCalcUsage` per table-calc usage.
 
@@ -288,6 +359,14 @@ def extract_table_calc_usages(xml_text: str) -> List[TableCalcUsage]:
                               if sort_el is not None else None)
                 sort_direction = sort_el.get("direction") if sort_el is not None else None
 
+                # A stacked "secondary calculation" leaves a second <table-calc> on the same pill.
+                # Read the primary pass into the flat fields (unchanged) and carry the secondary
+                # pass's facts separately so a view-layer chain can be rebuilt. Direct children only
+                # (table-calc are always direct children of the column-instance).
+                tc_children = _children_local(ci, "table-calc")
+                secondary_pass = (_secondary_pass_facts(tc_children[1], instances)
+                                  if len(tc_children) > 1 else None)
+
                 usages.append(TableCalcUsage(
                     worksheet=ws_name,
                     instance=iid,
@@ -302,11 +381,15 @@ def extract_table_calc_usages(xml_text: str) -> List[TableCalcUsage]:
                     window_to=_int_or_none(tc.get("to")),
                     window_options=tc.get("window-options"),
                     rank_options=tc.get("rank-options"),
+                    level_break=tc.get("level-break"),
+                    level_address=tc.get("level-address"),
+                    diff_options=tc.get("diff-options"),
                     ordering_type=tc.get("ordering-type") or "Table",
                     ordering_fields=ordering_fields,
                     sort_field=sort_field,
                     sort_direction=sort_direction,
                     secondary=_detect_secondary(ci, tc),
+                    secondary_pass=secondary_pass,
                     shelf=("rows" if iid in rows_inst
                            else "cols" if iid in cols_inst else None),
                     rows=rows,

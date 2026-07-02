@@ -904,6 +904,46 @@ def _viz_fidelity(result):
     return fidelity
 
 
+def _visual_calc_rollup(result):
+    """Additive routing-decision rollup for the view-only quick-table-calc -> Visual-Calculation path.
+
+    Summarizes the per-visual ``visual_calc`` facts the viz stage recorded on its candidate records
+    (see ``twb_to_pbir._apply_visual_calcs``): how many worksheets were emitted as Power BI Visual
+    Calculations (split by marks role and by calc family), how many carried a hidden inner calc in a
+    two-pass chain, and how many were routed to review (with reasons). Purely a CONSUMER of facts the
+    viz stage already produced -- it never re-derives a calc. Returns ``None`` when no visual-calc
+    facts were recorded, so the report key is added ONLY when the path actually fired (byte-identical
+    otherwise).
+    """
+    records = result.get("candidate_records") if isinstance(result, dict) else None
+    facts = [r.get("visual_calc") for r in (records or [])
+             if isinstance(r, dict) and isinstance(r.get("visual_calc"), dict)]
+    if not facts:
+        return None
+    emitted = [f for f in facts if f.get("status") == "emitted"]
+    review = [f for f in facts if f.get("status") == "review"]
+    families = {}
+    for f in emitted:
+        fam = f.get("family") or "unknown"
+        families[fam] = families.get(fam, 0) + 1
+    return {
+        "emitted_total": len(emitted),
+        "review_total": len(review),
+        "by_role": {
+            "value": sum(1 for f in emitted if f.get("role") == "value"),
+            "color": sum(1 for f in emitted if f.get("role") == "color"),
+        },
+        "chained": sum(1 for f in emitted
+                       if any(vc.get("is_inner") for vc in (f.get("visual_calcs") or []))),
+        "families": families,
+        "worksheets": [
+            {"worksheet": f.get("worksheet"), "status": f.get("status"),
+             "role": f.get("role"), "family": f.get("family"),
+             "axis": f.get("axis"), "reason": f.get("reason")}
+            for f in facts],
+    }
+
+
 _PBIP_WARN = "manual attention required: "
 
 
@@ -1764,6 +1804,12 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
                 detail["viz_implicit_row_count"] = sum(
                     1 for w in (rebuilt.get("warnings") or [])
                     if "implicit row count" in (w.get("reason") or ""))
+                # The visual-calculation rollup must likewise reflect the rebound pass -- the
+                # first pass has no row-count binding, so view-only quick calcs whose base is the
+                # implicit COUNT(*) only resolve here (base measure Count Orders binds in pass 2).
+                _vc_rollup = _visual_calc_rollup(rebuilt)
+                if _vc_rollup:
+                    detail["visual_calculations"] = _vc_rollup
         except Exception as exc:
             warns.append(_PBIP_WARN + f"model-fact rebind skipped ({type(exc).__name__}: {exc}) -- "
                          f"report binds to the standing source/deferred fields")
@@ -1873,6 +1919,10 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_di
                   output_folder=output_folder,
                   viz_fidelity=_viz_fidelity(result),
                   viz_implicit_row_count=rc_unbound)
+
+    vc_rollup = _visual_calc_rollup(result)
+    if vc_rollup:
+        detail["visual_calculations"] = vc_rollup
 
     signal = _workbook_binding_signal(text, result.get("ir") if isinstance(result, dict) else None)
     if signal is not None:
@@ -2515,6 +2565,23 @@ def _render_summary_md(report):
                 "(Tableau's `COUNT(*)` / legacy `Number of Records`) are flagged for manual "
                 "attention — add a `COUNTROWS` measure to the fact table and bind it. These are "
                 "warned, never emitted as a dangling reference.",
+            ]
+        vc_workbooks = [w for w in report["workbooks"] if w.get("visual_calculations")]
+        if vc_workbooks:
+            vc_emitted = sum(w["visual_calculations"].get("emitted_total", 0)
+                             for w in vc_workbooks)
+            vc_review = sum(w["visual_calculations"].get("review_total", 0)
+                            for w in vc_workbooks)
+            lines += [
+                "",
+                f"> **Visual Calculations:** {vc_emitted} view-only quick table calc(s) across "
+                f"{len(vc_workbooks)} workbook(s) were rebuilt as Power BI **Visual Calculations** — "
+                "the report-layer twin of a Tableau quick table calc (RUNNINGSUM / MOVINGAVERAGE / "
+                "RANK / PREVIOUS evaluated over the visual's own matrix axis), preserving the "
+                "original Tableau addressing. "
+                + (f"{vc_review} routed to review. " if vc_review else "")
+                + "Per-worksheet family / axis / role detail is in `report.json` under each "
+                "workbook's `visual_calculations`.",
             ]
 
     lines += [

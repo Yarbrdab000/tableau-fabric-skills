@@ -39,6 +39,7 @@ from calc_to_dax import (
     translate_difference_to_dax,
     translate_percent_of_total_to_dax,
 )
+from workbook_table_calcs import AGG_DERIVATIONS
 
 
 # -- intent classification -----------------------------------------------------
@@ -115,11 +116,11 @@ _PCT_DIFF_LABEL = "% Difference"
 # order-SENSITIVE: its value changes with the slowest->fastest order among addressing dims.
 _ORDER_INSENSITIVE_HEADS = ("WINDOW_SUM", "WINDOW_AVG", "WINDOW_MIN", "WINDOW_MAX")
 
-# Pill derivations that mean "an aggregated measure", not a partition dimension.
-_AGG_DERIVATIONS = {
-    "Sum", "Avg", "Min", "Max", "Count", "Cntd", "Median", "Attr",
-    "Stdev", "StdevP", "Var", "VarP", "Measure",
-}
+# Pill derivations that mean "an aggregated measure", not a partition dimension. Shared with the
+# view-layer path: the canonical set now lives in :mod:`workbook_table_calcs` (next to the ``Pill``
+# both paths import); this alias keeps the local references below behaviour-identical. An equality
+# test guards the two from drifting apart.
+_AGG_DERIVATIONS = AGG_DERIVATIONS
 
 # Tableau writes a calculated field's shelf reference as its INTERNAL token -- the auto-generated
 # ``Calculation_<digits>`` / legacy ``Calculation<n>`` form -- whereas a physical field appears by its
