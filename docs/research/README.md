@@ -15,6 +15,23 @@ and color**, produced for the Tableau → Power BI dashboard-migration path.
 | [`powerbi-formatting-color-reference.md`](./powerbi-formatting-color-reference.md) | Reasoned synthesis (~1,100 lines): value grammar, color forms, the 5-layer precedence model, a per-visual-type matrix, and a Tableau → Power BI mapping table rated fit / partial / GAP. | The human-readable spec + design rationale when building a formatting feature. |
 | [`powerbi-formatting-inventory.json`](./powerbi-formatting-inventory.json) | Machine-readable companion (~1.4 MB): a flat `object → property → type → default → layer → Tableau-equivalent → sources` index. | Programmatic lookups / a test oracle. **Not shipped** (size); repo provenance only. |
 
+## Tableau → Power BI view & dashboard rebuild — prior-art study
+
+A clean-room, facts-and-method study of how the *view / dashboard* side of a Tableau → Power BI
+migration works — chart-type mapping, encoding routing, formatting/layout fidelity, interactivity, and
+the semantic-model scaffolding views depend on — with a running **LLM-enhancement playbook** for
+raising the ceiling of our deterministic engine.
+
+| File | What it is | Use it for |
+| --- | --- | --- |
+| [`tableau-to-powerbi-view-rebuild-reference.md`](./tableau-to-powerbi-view-rebuild-reference.md) | ~880-line study organized as five rebuild sub-problems (R1 chart-type → R5 interactivity) + model + gap map + a 12-hook LLM playbook. Every mapping is independently validated and confidence-rated (✅ faithful / 🟡 approximate / 🔴 gap). | The design reference when building the dashboard/view-rebuild path, and the map of *where to add LLM judgment* over deterministic rules. |
+
+**Clean-room note.** This study was *informed by* the third-party `cyphou/Tableau-To-PowerBI` prior
+art (MIT) but copies **no** source, mapping tables, regexes, fixtures, or structure — per
+[`CLEANROOM.md`](../../CLEANROOM.md) we decline the copy grant. Facts/method were re-derived and
+re-organized; `[PRIOR-ART]` tags mark ideas prompted by it, `[OUR-ANALYSIS]` marks our own
+contribution. See the document's §0 and provenance footer.
+
 **Corpus.** 52 legacy `Report/Layout` `.pbix` + 1 enhanced-format (PBIR) `.pbip`, deduplicated by
 MD5. Root JSON sections: `objectIndex` (113 objects), `byVisualType` (49 types), `themesObserved`
 (76), `coverageMatrix` (features × files), plus `valueGrammar`, `themeSchema`, `precedenceModel`,
