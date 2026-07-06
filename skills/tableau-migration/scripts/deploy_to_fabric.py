@@ -39,6 +39,13 @@ Usage
 
     # see exactly what would be sent, without calling Fabric
     py -3.11 deploy_to_fabric.py --model-dir Superstore.SemanticModel --workspace "WS" --dry-run
+
+    # deploy a produced PBIP bundle: the model AND its report (report rebound byConnection)
+    py -3.11 deploy_to_fabric.py --pbip "C:\\...\\out\\pbip\\Superstore" --workspace "WS" --use-az
+
+    # deploy just a report, rebound to an already-deployed model (by GUID or by name)
+    py -3.11 deploy_to_fabric.py --report-dir "C:\\...\\Superstore.Report" \
+        --semantic-model-name Superstore --workspace "WS" --use-az
 """
 import argparse
 import json
@@ -73,6 +80,11 @@ _GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
 # Files that make up a .SemanticModel definition. All are UTF-8 text.
 _MODEL_EXT = (".tmdl", ".json", ".pbism")
 _MODEL_DOTFILE = (".platform",)
+# Files that make up a .Report (PBIR) definition. All are UTF-8 text; ``.pbir`` is listed so the
+# required ``definition.pbir`` (which ``_MODEL_EXT`` would miss) is captured. The viz stage emits no
+# binary static resources, so a plain text read is faithful.
+_REPORT_EXT = (".pbir", ".json")
+_REPORT_DOTFILE = (".platform",)
 
 
 # == pure builders (offline-testable; no network) ============================================
@@ -98,6 +110,29 @@ def read_model_folder(model_dir):
     return parts
 
 
+def read_report_folder(report_dir):
+    """Read a ``<Name>.Report`` folder into a ``{relative/forward/slash/path: text}`` dict.
+
+    The report twin of :func:`read_model_folder`: every ``.pbir`` / ``.json`` / ``.platform`` file
+    under ``report_dir`` becomes a part keyed by its POSIX-style relative path (the shape the Fabric
+    definition payload expects). The allow-list includes ``.pbir`` so the required ``definition.pbir``
+    -- which ``read_model_folder`` would skip -- is captured. PBIR report parts are all UTF-8 text;
+    the viz stage emits no binary static resources. Raises ``FileNotFoundError`` if nothing is found.
+    """
+    parts = {}
+    for root, _dirs, files in os.walk(report_dir):
+        for fname in files:
+            if not (fname.endswith(_REPORT_EXT) or fname in _REPORT_DOTFILE):
+                continue
+            full = os.path.join(root, fname)
+            rel = os.path.relpath(full, report_dir).replace(os.sep, "/")
+            with open(full, encoding="utf-8") as fh:
+                parts[rel] = fh.read()
+    if not parts:
+        raise FileNotFoundError(f"no report (PBIR) parts found under {report_dir!r}")
+    return parts
+
+
 def build_create_payload(model_name, parts, description=None):
     """Body for ``POST /v1/workspaces/{ws}/semanticModels`` (create): displayName + definition."""
     body = {"displayName": model_name}
@@ -110,6 +145,52 @@ def build_create_payload(model_name, parts, description=None):
 def build_update_definition_payload(parts):
     """Body for ``POST .../semanticModels/{id}/updateDefinition`` (update an existing model)."""
     return fabric_definition_payload(parts)
+
+
+def build_report_create_payload(report_name, parts, description=None):
+    """Body for ``POST /v1/workspaces/{ws}/reports`` (create a report): displayName + definition."""
+    body = {"displayName": report_name}
+    if description:
+        body["description"] = description
+    body.update(fabric_definition_payload(parts))  # adds {"definition": {"parts": [...]}}
+    return body
+
+
+def build_report_update_payload(parts):
+    """Body for ``POST .../reports/{id}/updateDefinition`` (override an existing report's definition)."""
+    return fabric_definition_payload(parts)
+
+
+def rebind_report_byConnection(parts, semantic_model_id):
+    """Return a copy of report ``parts`` whose ``definition.pbir`` binds ``byConnection`` to a model.
+
+    The local report definition is bound ``byPath`` to a sibling ``.SemanticModel`` folder, which the
+    Fabric service does **not** resolve on deploy -- deploying a report over REST requires a
+    ``byConnection`` reference. This rewrites ``datasetReference`` to
+    ``{"byConnection": {"connectionString": "semanticmodelid=<id>"}}`` (the minimal REST-deploy form),
+    leaving ``$schema`` and ``version`` exactly as the viz stage stamped them (definitionProperties
+    ``2.0.0`` / version ``4.0`` -- the shape that byConnection example uses).
+
+    Fail-closed: returns ``None`` -- so the caller skips rather than emitting a half-bound report --
+    when ``parts`` has no ``definition.pbir``, it is not valid JSON, or ``semantic_model_id`` is empty.
+    """
+    if not isinstance(parts, dict) or "definition.pbir" not in parts:
+        return None
+    model_id = (semantic_model_id or "").strip()
+    if not model_id:
+        return None
+    try:
+        doc = json.loads(parts["definition.pbir"])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    doc["datasetReference"] = {
+        "byConnection": {"connectionString": f"semanticmodelid={model_id}"}
+    }
+    out = dict(parts)
+    out["definition.pbir"] = json.dumps(doc, indent=2)
+    return out
 
 
 def find_item_id(items, display_name):
@@ -205,6 +286,13 @@ def list_semantic_models(workspace_id, token, base_url=FABRIC_BASE):
     return (body or {}).get("value") or []
 
 
+def list_reports(workspace_id, token, base_url=FABRIC_BASE):
+    status, _h, body = _http("GET", f"{base_url}/v1/workspaces/{workspace_id}/reports", token)
+    if status != 200:
+        raise RuntimeError(f"list reports failed ({status}): {body}")
+    return (body or {}).get("value") or []
+
+
 def await_operation(headers, token, base_url=FABRIC_BASE, timeout=600, default_interval=5):
     """Poll a Fabric LRO to completion. Returns the final operation result (or status dict)."""
     loc, retry = parse_operation_headers(headers)
@@ -261,6 +349,41 @@ def deploy_model(parts, *, model_name, workspace, token, base_url=FABRIC_BASE,
             "http_status": status, "result": result}
 
 
+def deploy_report(parts, *, report_name, workspace, token, base_url=FABRIC_BASE,
+                  description=None, poll=True, timeout=600):
+    """createOrUpdate a report from ``parts``. Returns a summary dict (the twin of ``deploy_model``).
+
+    If a report with ``report_name`` already exists in the workspace it is updated in place
+    (``updateDefinition``); otherwise it is created. 202 responses are polled to completion when
+    ``poll`` is true. ``parts`` must already be bound ``byConnection`` (see
+    :func:`rebind_report_byConnection`) -- a byPath report does not bind in the service.
+    """
+    ws_id = resolve_workspace_id(workspace, token, base_url)
+    existing = find_item_id(list_reports(ws_id, token, base_url), report_name)
+    if existing:
+        url = f"{base_url}/v1/workspaces/{ws_id}/reports/{existing}/updateDefinition"
+        status, headers, body = _http("POST", url, token, build_report_update_payload(parts))
+        operation = "updated"
+        item_id = existing
+    else:
+        url = f"{base_url}/v1/workspaces/{ws_id}/reports"
+        status, headers, body = _http("POST", url, token,
+                                      build_report_create_payload(report_name, parts, description))
+        operation = "created"
+        item_id = body.get("id") if isinstance(body, dict) else None
+
+    if status not in (200, 201, 202):
+        raise RuntimeError(f"report {operation} failed ({status}): {body}")
+
+    result = None
+    if status == 202 and poll:
+        result = await_operation(headers, token, base_url, timeout=timeout)
+        if isinstance(result, dict) and result.get("id"):
+            item_id = result["id"]
+    return {"workspace_id": ws_id, "item_id": item_id, "operation": operation,
+            "http_status": status, "result": result}
+
+
 def refresh_dataset(workspace_id, dataset_id, token, base_url=POWERBI_BASE):
     """Trigger an enhanced refresh (Power BI REST). Returns ``(status, body)``."""
     url = f"{base_url}/v1.0/myorg/groups/{workspace_id}/datasets/{dataset_id}/refreshes"
@@ -280,15 +403,105 @@ def bind_to_gateway(workspace_id, dataset_id, gateway_id, datasource_ids, token,
     return status, body
 
 
+# == PBIP bundle deploy (model then report, one workspace) ===================================
+
+def _model_name_from_folder(model_dir):
+    """``<Name>.SemanticModel`` folder path -> bare ``<Name>`` display name."""
+    name = os.path.basename(os.path.normpath(model_dir))
+    if name.lower().endswith(".semanticmodel"):
+        name = name[: -len(".SemanticModel")]
+    return name
+
+
+def _report_name_from_folder(report_dir):
+    """Report display name: the ``.platform`` ``metadata.displayName`` if present, else folder stem."""
+    name = os.path.basename(os.path.normpath(report_dir))
+    if name.lower().endswith(".report"):
+        name = name[: -len(".Report")]
+    platform = os.path.join(report_dir, ".platform")
+    if os.path.isfile(platform):
+        try:
+            with open(platform, encoding="utf-8-sig") as fh:
+                meta = (json.load(fh) or {}).get("metadata") or {}
+            disp = meta.get("displayName")
+            if disp:
+                return disp
+        except (OSError, ValueError):
+            pass
+    return name
+
+
+def _discover_single(dir_path, suffix):
+    """Return the single immediate subfolder of ``dir_path`` whose name ends with ``suffix`` (CI).
+
+    Raises ``FileNotFoundError`` when none match and ``RuntimeError`` when more than one does.
+    """
+    want = suffix.lower()
+    matches = [os.path.join(dir_path, name) for name in sorted(os.listdir(dir_path))
+               if name.lower().endswith(want) and os.path.isdir(os.path.join(dir_path, name))]
+    if not matches:
+        raise FileNotFoundError(f"no {suffix} folder found in {dir_path!r}")
+    if len(matches) > 1:
+        raise RuntimeError(f"multiple {suffix} folders in {dir_path!r}: "
+                           f"{[os.path.basename(m) for m in matches]}")
+    return matches[0]
+
+
+def discover_pbip(path):
+    """Resolve a produced PBIP bundle to its ``(model_dir, report_dir)`` folders.
+
+    ``path`` may be the bundle DIRECTORY -- the shape ``write_local_pbip`` and ``migrate_estate``
+    emit (``<dir>/{<Model>.SemanticModel, <Report>.Report, <Proj>.pbip}``) -- or the ``.pbip`` pointer
+    file itself (its parent directory is used). Requires exactly one ``.SemanticModel`` and one
+    ``.Report`` folder; raises otherwise so the caller never guesses.
+    """
+    base = path
+    if os.path.isfile(path) and path.lower().endswith(".pbip"):
+        base = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(base):
+        raise FileNotFoundError(f"PBIP bundle not found: {path!r}")
+    return _discover_single(base, ".SemanticModel"), _discover_single(base, ".Report")
+
+
+def deploy_pbip(model_dir, report_dir, *, workspace, token, base_url=FABRIC_BASE,
+                model_name=None, report_name=None, description=None, timeout=600):
+    """Deploy a PBIP bundle: the semantic model first, then the report rebound ``byConnection`` to it.
+
+    Returns ``{"model": <deploy_model summary>, "report": <deploy_report summary | skip dict>}``. The
+    report is skipped (never emitted half-bound) with a recorded reason when the model produced no id
+    or the report has no rebindable ``definition.pbir``.
+    """
+    model_parts = read_model_folder(model_dir)
+    m_name = model_name or _model_name_from_folder(model_dir)
+    model_summary = deploy_model(model_parts, model_name=m_name, workspace=workspace, token=token,
+                                 base_url=base_url, description=description, timeout=timeout)
+    result = {"model": model_summary}
+
+    model_id = model_summary.get("item_id")
+    if not model_id:
+        result["report"] = {"status": "skipped",
+                            "reason": "model deploy returned no item id -- cannot rebind the report"}
+        return result
+
+    report_parts = rebind_report_byConnection(read_report_folder(report_dir), model_id)
+    if report_parts is None:
+        result["report"] = {"status": "skipped",
+                            "reason": "report has no rebindable definition.pbir -- not deployed"}
+        return result
+
+    r_name = report_name or _report_name_from_folder(report_dir)
+    result["report"] = deploy_report(report_parts, report_name=r_name, workspace=workspace,
+                                     token=token, base_url=base_url, timeout=timeout)
+    return result
+
+
 # == CLI =====================================================================================
 
 def _load_parts(args):
     """Resolve the model parts + display name from --model-dir or --tds."""
     if args.model_dir:
         parts = read_model_folder(args.model_dir)
-        name = args.model_name or os.path.basename(os.path.normpath(args.model_dir))
-        if name.lower().endswith(".semanticmodel"):
-            name = name[: -len(".SemanticModel")]
+        name = args.model_name or _model_name_from_folder(args.model_dir)
         return parts, name
     if args.tds:
         if not args.model_name:
@@ -318,43 +531,25 @@ def _dry_run(parts, model_name, args):
               "POST {pbi}/v1.0/myorg/groups/<ws>/datasets/<id>/refreshes".format(pbi=POWERBI_BASE))
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description="Deploy a rebuilt semantic model to Microsoft Fabric.")
-    src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--model-dir", help="path to an existing <Name>.SemanticModel folder")
-    src.add_argument("--tds", help="path to a .tds to build AND deploy (datasource only)")
-    ap.add_argument("--workspace", required=True, help="target workspace name or GUID")
-    ap.add_argument("--model-name", help="model display name (defaults to the folder name)")
-    ap.add_argument("--description", help="optional model description")
-    ap.add_argument("--token", help="Fabric bearer token (else FABRIC_TOKEN / --use-az)")
-    ap.add_argument("--powerbi-token", help="Power BI token for refresh/bind (else POWERBI_TOKEN)")
-    ap.add_argument("--use-az", action="store_true",
-                    help="acquire tokens via 'az account get-access-token'")
-    ap.add_argument("--refresh", action="store_true", help="trigger a refresh after deploy")
-    ap.add_argument("--gateway-id", help="bind the dataset to this gateway/connection after deploy")
-    ap.add_argument("--datasource-id", action="append", default=[],
-                    help="datasource object id for the gateway bind (repeatable)")
-    ap.add_argument("--base-url", default=FABRIC_BASE, help="Fabric API base url")
-    ap.add_argument("--timeout", type=int, default=600, help="LRO poll timeout seconds")
-    ap.add_argument("--save-model-dir", help="also write the built model here (with --tds)")
-    ap.add_argument("--dry-run", action="store_true", help="print the plan without calling Fabric")
-    args = ap.parse_args(argv)
+def _dry_run_report(report_dir, report_name, args, model_id="<deployed-model-id>"):
+    parts = read_report_folder(report_dir)
+    print("DRY RUN -- report (no request sent)")
+    print(f"  target workspace : {args.workspace}")
+    print(f"  report name      : {report_name}")
+    print(f"  base url         : {args.base_url}")
+    print("  rebind           : datasetReference.byConnection.connectionString = "
+          f"semanticmodelid={model_id}")
+    print(f"  parts ({len(parts)}):")
+    for p in sorted(parts):
+        print(f"      {p}")
+    print("  create endpoint  : "
+          f"POST {args.base_url}/v1/workspaces/<workspace-id>/reports")
+    print("  update endpoint  : "
+          f"POST {args.base_url}/v1/workspaces/<workspace-id>/reports/<id>/updateDefinition")
 
-    parts, model_name = _load_parts(args)
-    if args.save_model_dir and args.tds:
-        write_model_folder(parts, args.save_model_dir)
 
-    if args.dry_run:
-        _dry_run(parts, model_name, args)
-        return 0
-
-    token = acquire_token(FABRIC_RESOURCE, args.token, "FABRIC_TOKEN", args.use_az)
-    summary = deploy_model(parts, model_name=model_name, workspace=args.workspace, token=token,
-                           base_url=args.base_url, description=args.description, timeout=args.timeout)
-    print(f"[{summary['operation']}] semantic model '{model_name}' "
-          f"-> workspace {summary['workspace_id']} (item {summary['item_id']}, "
-          f"HTTP {summary['http_status']})")
-
+def _apply_model_post_ops(args, summary):
+    """Optional gateway bind + refresh for a deployed MODEL (Power BI REST). Credentials stay manual."""
     if args.gateway_id:
         pbi = acquire_token(POWERBI_RESOURCE, args.powerbi_token, "POWERBI_TOKEN", args.use_az)
         b_status, b_body = bind_to_gateway(summary["workspace_id"], summary["item_id"],
@@ -370,6 +565,119 @@ def main(argv=None):
             print(f"[refresh] FAILED (HTTP {r_status}): {r_body}")
             print("  credentials/gateway are a manual step -- set the connection in Fabric, then "
                   "re-run with --refresh.")
+
+
+def _print_deploy_line(kind, name, summary):
+    print(f"[{summary['operation']}] {kind} '{name}' -> workspace {summary['workspace_id']} "
+          f"(item {summary['item_id']}, HTTP {summary['http_status']})")
+
+
+def _run_pbip(args):
+    """Deploy a PBIP bundle (--pbip): model + report (rebound byConnection), one workspace."""
+    model_dir, report_dir = discover_pbip(args.pbip)
+    model_name = args.model_name or _model_name_from_folder(model_dir)
+    report_name = _report_name_from_folder(report_dir)
+
+    if args.dry_run:
+        _dry_run(read_model_folder(model_dir), model_name, args)
+        _dry_run_report(report_dir, report_name, args)
+        return 0
+
+    token = acquire_token(FABRIC_RESOURCE, args.token, "FABRIC_TOKEN", args.use_az)
+    summary = deploy_pbip(model_dir, report_dir, workspace=args.workspace, token=token,
+                          base_url=args.base_url, model_name=model_name, report_name=report_name,
+                          description=args.description, timeout=args.timeout)
+    _print_deploy_line("semantic model", model_name, summary["model"])
+    rep = summary["report"]
+    if rep.get("status") == "skipped":
+        print(f"[skip] report '{report_name}' not deployed -- {rep.get('reason')}")
+    else:
+        _print_deploy_line("report", report_name, rep)
+    _apply_model_post_ops(args, summary["model"])
+    return 0
+
+
+def _run_report_only(args):
+    """Deploy just a report (--report-dir) rebound byConnection to an already-deployed model."""
+    if not (args.semantic_model_id or args.semantic_model_name):
+        raise SystemExit("--report-dir requires --semantic-model-id or --semantic-model-name")
+    report_name = _report_name_from_folder(args.report_dir)
+
+    if args.dry_run:
+        mid = args.semantic_model_id or f"<resolved from name {args.semantic_model_name!r}>"
+        _dry_run_report(args.report_dir, report_name, args, model_id=mid)
+        return 0
+
+    token = acquire_token(FABRIC_RESOURCE, args.token, "FABRIC_TOKEN", args.use_az)
+    model_id = args.semantic_model_id
+    if not model_id:
+        ws_id = resolve_workspace_id(args.workspace, token, args.base_url)
+        model_id = find_item_id(list_semantic_models(ws_id, token, args.base_url),
+                                args.semantic_model_name)
+        if not model_id:
+            raise SystemExit(f"semantic model {args.semantic_model_name!r} not found in "
+                             f"workspace {args.workspace!r}")
+
+    report_parts = rebind_report_byConnection(read_report_folder(args.report_dir), model_id)
+    if report_parts is None:
+        print(f"[skip] report '{report_name}' not deployed -- no rebindable definition.pbir")
+        return 0
+
+    summary = deploy_report(report_parts, report_name=report_name, workspace=args.workspace,
+                            token=token, base_url=args.base_url, description=args.description,
+                            timeout=args.timeout)
+    _print_deploy_line("report", report_name, summary)
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Deploy a rebuilt semantic model to Microsoft Fabric.")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--model-dir", help="path to an existing <Name>.SemanticModel folder")
+    src.add_argument("--tds", help="path to a .tds to build AND deploy (datasource only)")
+    src.add_argument("--pbip", help="path to a produced PBIP bundle dir (or its .pbip file) -- "
+                                    "deploy the model AND its report (rebound byConnection)")
+    src.add_argument("--report-dir", help="path to a <Name>.Report folder -- deploy the report only "
+                                          "(requires --semantic-model-id or --semantic-model-name)")
+    ap.add_argument("--workspace", required=True, help="target workspace name or GUID")
+    ap.add_argument("--model-name", help="model display name (defaults to the folder name)")
+    ap.add_argument("--semantic-model-id",
+                    help="deployed model GUID to rebind a --report-dir report to (byConnection)")
+    ap.add_argument("--semantic-model-name",
+                    help="deployed model name (resolved in the workspace) to rebind a --report-dir to")
+    ap.add_argument("--description", help="optional model description")
+    ap.add_argument("--token", help="Fabric bearer token (else FABRIC_TOKEN / --use-az)")
+    ap.add_argument("--powerbi-token", help="Power BI token for refresh/bind (else POWERBI_TOKEN)")
+    ap.add_argument("--use-az", action="store_true",
+                    help="acquire tokens via 'az account get-access-token'")
+    ap.add_argument("--refresh", action="store_true", help="trigger a refresh after deploy")
+    ap.add_argument("--gateway-id", help="bind the dataset to this gateway/connection after deploy")
+    ap.add_argument("--datasource-id", action="append", default=[],
+                    help="datasource object id for the gateway bind (repeatable)")
+    ap.add_argument("--base-url", default=FABRIC_BASE, help="Fabric API base url")
+    ap.add_argument("--timeout", type=int, default=600, help="LRO poll timeout seconds")
+    ap.add_argument("--save-model-dir", help="also write the built model here (with --tds)")
+    ap.add_argument("--dry-run", action="store_true", help="print the plan without calling Fabric")
+    args = ap.parse_args(argv)
+
+    if args.pbip:
+        return _run_pbip(args)
+    if args.report_dir:
+        return _run_report_only(args)
+
+    parts, model_name = _load_parts(args)
+    if args.save_model_dir and args.tds:
+        write_model_folder(parts, args.save_model_dir)
+
+    if args.dry_run:
+        _dry_run(parts, model_name, args)
+        return 0
+
+    token = acquire_token(FABRIC_RESOURCE, args.token, "FABRIC_TOKEN", args.use_az)
+    summary = deploy_model(parts, model_name=model_name, workspace=args.workspace, token=token,
+                           base_url=args.base_url, description=args.description, timeout=args.timeout)
+    _print_deploy_line("semantic model", model_name, summary)
+    _apply_model_post_ops(args, summary)
     return 0
 
 

@@ -42,7 +42,7 @@ Phase 2  Storage mode .......... select_storage_mode(descriptor) -> Import | Dir
 Phase 3  Rebuild model ......... TMDL tables + typed columns + inferred relationships
 Phase 4  Calc -> DAX ........... translate the safe subset; preserve every formula as annotation
 Phase 5  Connection ............ emit M partitions + bind the Fabric Data Connection
-Phase 6  Deploy & refresh ...... bundled deploy_to_fabric.py (or DELEGATE to semantic-model-authoring)
+Phase 6  Deploy & refresh ...... bundled deploy_to_fabric.py — model + report (--pbip) (or DELEGATE model to semantic-model-authoring)
 Final    Validate ............... reconcile ExecuteQuery vs VDS ; emit the migration report
 ```
 
@@ -136,6 +136,21 @@ py -3.11 scripts/deploy_to_fabric.py --model-dir <ModelFolder>.SemanticModel --w
 
 Inside a **Fabric notebook**, get a token with no `az login`:
 `notebookutils.credentials.getToken("https://api.fabric.microsoft.com")` → pass to `deploy_model(token=...)`.
+
+**Report deploy (migrated workbooks).** For a PBIP bundle (model + `.Report`), add the report as a
+Fabric `reports` item — deploy the model first, then rebind the report `byConnection` to it (a `byPath`
+reference does not bind over REST). Same script:
+
+```bash
+# Deploy the model AND its report from a produced bundle (report rebound byConnection):
+py -3.11 scripts/deploy_to_fabric.py --pbip <out>/pbip/<Workbook> --workspace "<workspace>" --use-az
+
+# Or deploy just the report against an already-deployed model (by GUID or name):
+py -3.11 scripts/deploy_to_fabric.py --report-dir <Report>.Report --semantic-model-name <Model> --workspace "<workspace>"
+```
+
+The rebind is fail-closed: a report with no rebindable `definition.pbir` is **skipped** (recorded with
+a reason), never emitted half-bound. Refresh / gateway bind remain model-only.
 
 **B. Delegate.** Use `semantic-model-authoring` for `createOrUpdate` of the TMDL model, best-practice analysis
 on the translated measures, connection binding, and refresh.

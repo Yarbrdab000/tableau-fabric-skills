@@ -362,7 +362,7 @@ The pure-Python cores are offline, deterministic, and stdlib-only (no Spark / pa
 | [`scripts/storage_mode.py`](scripts/storage_mode.py) | Per-datasource storage-mode auto-selection (pure policy). |
 | [`scripts/connection_to_m.py`](scripts/connection_to_m.py) | Parse Tableau `.tds`/`.twb` → descriptor (`parse_tds(text, select=None)`); **`extract_calcs`** (calculated fields → `calcs=`); **`workbook_datasources`** (list selectable datasources, skipping `Parameters` + worksheet stubs); emit M partitions + bind details (`connection_details_for_bind`); M-path field resolver. |
 | [`scripts/assemble_model.py`](scripts/assemble_model.py) | Tier-1 orchestrator: `.tds`/`.twb` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`), base64 deploy payload. **One-call `migrate_datasource(.tdsx/.tds/.twbx/.twb/text, datasource=None)` → `{parts, report, bind}`** (auto-extracts calcs; `datasource=` selects from a multi-datasource workbook; a genuine fallback returns `parts={}` + `report["landing_plan"]` via `directlake_landing_plan`); `list_workbook_datasources`, `write_model_folder` / **`write_local_pbip`** for local output. |
-| [`scripts/deploy_to_fabric.py`](scripts/deploy_to_fabric.py) | Self-contained Fabric REST deploy (stdlib-only urllib): createOrUpdate / updateDefinition of the SemanticModel, 202 LRO polling, optional refresh + gateway bind. Importable `acquire_token` (handles `az` on Windows) + `refresh_dataset` for post-deploy ops. Lets the skill finish **in Fabric** without depending on a peer skill. |
+| [`scripts/deploy_to_fabric.py`](scripts/deploy_to_fabric.py) | Self-contained Fabric REST deploy (stdlib-only urllib): createOrUpdate / updateDefinition of the SemanticModel, 202 LRO polling, optional refresh + gateway bind. **Also deploys the workbook's REPORT** as a Fabric `reports` item — `deploy_pbip` / `deploy_report` + the fail-closed `rebind_report_byConnection` (rewrites `definition.pbir` to a **`byConnection`** `semanticmodelid=<id>` reference, required for REST deploy) via `--pbip` / `--report-dir`. Importable `acquire_token` (handles `az` on Windows) + `refresh_dataset` for post-deploy ops. Lets the skill finish **in Fabric** without depending on a peer skill. |
 
 For exact signatures and a copy-paste **download → migrate → deploy** snippet, see [public-api.md](resources/public-api.md).
 
@@ -396,7 +396,7 @@ This skill rebuilds Tableau artifacts via REST APIs — no Tableau or Fabric UI 
 | Phase 3 | Schema + fields | TMDL tables, typed columns, relationships | [semantic-model-rebuild.md](resources/semantic-model-rebuild.md) |
 | Phase 4 | Calculated fields | DAX measures (+ preserved formula annotations) | [calc-to-dax.md](resources/calc-to-dax.md) |
 | Phase 5 | Connection | M partitions + Fabric connection bind | [connection-binding.md](resources/connection-binding.md) |
-| Phase 6 | Deploy & refresh | Semantic model (bundled `scripts/deploy_to_fabric.py`; or delegate to `semantic-model-authoring`) | [migration-orchestrator.md](resources/migration-orchestrator.md) |
+| Phase 6 | Deploy & refresh | Semantic model **+ report** (bundled `scripts/deploy_to_fabric.py` — `--pbip` deploys the model then the report rebound `byConnection`; or delegate the model to `semantic-model-authoring`) | [migration-orchestrator.md](resources/migration-orchestrator.md) |
 | Final | Validation & reconciliation | Verified model | [validation-reconciliation.md](resources/validation-reconciliation.md) |
 | Optional | Security & Governance | — | [security-governance.md](resources/security-governance.md) |
 
@@ -669,6 +669,13 @@ shell — the dataset is fully functional on its own — but the estate orchestr
 `report_parts=` (from `twb_to_pbir`) to supply a **real rebuilt report** per workbook (see the note
 below), and `project_name=` to name the project after the source asset. See
 [semantic-model-rebuild.md](resources/semantic-model-rebuild.md).
+
+> **Deploying the report to Fabric rebinds `byPath` → `byConnection`.** `byPath` is for opening the
+> project locally; the Fabric REST API does **not** resolve it on deploy. `scripts/deploy_to_fabric.py`
+> (`--pbip` / `--report-dir`, or `deploy_pbip` / `rebind_report_byConnection`) deploys the model first,
+> then rewrites `definition.pbir` to a `byConnection` `semanticmodelid=<deployed-model-id>` reference
+> before creating the `reports` item — fail-closed (report skipped, never half-bound) if there is no
+> rebindable `definition.pbir`. See [public-api.md](resources/public-api.md) §3a.
 
 > **Estate / local runs emit `.pbip` by default.** The one-button estate orchestrator
 > (`scripts/migrate_estate.py`) writes an openable `pbip/<Name>/<Name>.pbip` for **every** migrated

@@ -151,6 +151,43 @@ status, body = refresh_dataset(summary["workspace_id"], summary["item_id"], pbi)
 CLI: `py scripts\deploy_to_fabric.py --model-dir <...>.SemanticModel --workspace <ws> --use-az [--refresh]`
 (supports `--dry-run`). Token sources: `--token` / `FABRIC_TOKEN` env / `--use-az`.
 
+### 3a. Deploy the REPORT too (workbook migrations) — `deploy_report` / `deploy_pbip`
+
+A migrated **workbook** produces a PBIP bundle (`<Model>.SemanticModel` + `<Report>.Report` bound
+`byPath`). Deploying the report over REST requires a **`byConnection`** reference — a `byPath`
+reference does not bind in the service — so the deploy order is: model first → capture its item id →
+rebind the report `byConnection` to it → create/update the report.
+
+```python
+from deploy_to_fabric import acquire_token, deploy_pbip, discover_pbip, rebind_report_byConnection
+
+fabric = acquire_token("https://api.fabric.microsoft.com", use_az=True)
+model_dir, report_dir = discover_pbip(r"out\pbip\Superstore")   # dir or its .pbip file
+summary = deploy_pbip(model_dir, report_dir, workspace="<ws name or GUID>", token=fabric)
+# -> {"model": {..., "item_id": <id>}, "report": {..., "item_id": <id>} | {"status": "skipped", ...}}
+```
+
+`rebind_report_byConnection(parts, semantic_model_id)` is the deterministic seam — it swaps only
+`definition.pbir`'s `datasetReference` to `{"byConnection": {"connectionString":
+"semanticmodelid=<id>"}}` (preserving `$schema` / `version`) and is **fail-closed**: it returns
+`None` (report skipped, never emitted half-bound) when there is no `definition.pbir`, it is not valid
+JSON, or the model id is empty. `deploy_report(parts, report_name=..., workspace=..., token=...)`
+mirrors `deploy_model` for the `reports` item (create `POST .../reports` / update
+`POST .../reports/{id}/updateDefinition`, LRO-polled, find-by-name idempotent).
+
+CLI:
+
+```
+# deploy a produced PBIP bundle: model AND its report (report rebound byConnection)
+py scripts\deploy_to_fabric.py --pbip out\pbip\Superstore --workspace <ws> --use-az
+
+# deploy just a report, rebound to an already-deployed model (by GUID or by name)
+py scripts\deploy_to_fabric.py --report-dir out\reports\Superstore.Report \
+    --semantic-model-name Superstore --workspace <ws> --use-az
+```
+
+Both support `--dry-run`. Refresh / gateway bind stay **model-only** (a report has no credentials).
+
 > **Credential boundary (do not cross):** never write a source password into the model, M, the
 > report, or any file, and never bind it via API on the user's behalf — credentials live on a Fabric
 > data connection, not in the model. Editing those credentials needs a **Pro / Fabric per-user**
