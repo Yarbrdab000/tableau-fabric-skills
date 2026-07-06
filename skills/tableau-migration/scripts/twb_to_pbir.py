@@ -62,6 +62,16 @@ except ImportError:  # pragma: no cover - flat scripts-on-path
         usage_to_visual_calc_spec = None
         emit_visual_calc = None
 
+# Report-layer formatting emit builders (additive; PBIR analytics/format objects grounded on the
+# Power BI formatting inventory). Optional-safe so a partial checkout still emits everything else.
+try:
+    from . import report_formatting
+except ImportError:  # pragma: no cover - flat scripts-on-path
+    try:
+        import report_formatting
+    except ImportError:
+        report_formatting = None
+
 
 # -- PBIR schema URLs ----------------------------------------------------------
 _S = "https://developer.microsoft.com/json-schemas/fabric/item/report"
@@ -2111,6 +2121,66 @@ def _parse_reference_lines(all_panes):
     return refs
 
 
+# A CONSTANT reference line (Tableau ``formula='constant'`` with a fixed numeric ``value=``) on a
+# value-axis cartesian chart (column/line/area -- the measure is on the Y axis) is faithfully rebuilt
+# as a Power BI analytics reference line (``y1AxisReferenceLine``). Every other annotation -- a
+# computed line (average/median/min/max/total), a parameter-driven line, a percentage-band
+# distribution, a trend fit, or any non-value-axis chart -- has no constant to place and stays a
+# Tier-2 defer. (Discriminator + XML shape grounded on real workbooks: a constant line carries
+# ``formula='constant' value='100.0'`` and no ``percentage-bands``/``<reference-line-value>`` band.)
+_REFLINE_VALUE_AXIS_VTYPES = (VT_COLUMN, VT_LINE, VT_AREA)
+
+
+def _constant_reference_value(el):
+    """The fixed numeric value of a Tableau ``formula='constant'`` reference line, or ``None`` when
+    the line is computed / parameter-driven / a percentage-band distribution (nothing to emit)."""
+    if (el.get("formula") or "").strip().lower() != "constant":
+        return None
+    if (el.get("percentage-bands") or "").strip().lower() == "true":
+        return None
+    if _children_local(el, "reference-line-value"):
+        return None
+    raw = el.get("value")
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _custom_reference_label(el):
+    """A reference line's author-typed custom label (``<Value>`` tokens stripped), or ``None`` when
+    the label is automatic/none -- so an emitted line only carries a genuine caption."""
+    if (el.get("label-type") or "").strip().lower() != "custom":
+        return None
+    cleaned = re.sub(r"\s*<[^>]*>", "", (el.get("label") or "")).strip()
+    return cleaned or None
+
+
+def _classify_reference_lines(all_panes, visual_type):
+    """Split a worksheet's reference/trend annotations into ``(constants, deferred_labels)``.
+
+    ``constants`` is a list of ``{"value": float, "display_name": str|None}`` for the faithfully
+    rebuildable constant lines (only on a value-axis cartesian chart); ``deferred_labels`` lists the
+    human-readable names of every annotation that must stay a Tier-2 defer.
+    """
+    value_axis = visual_type in _REFLINE_VALUE_AXIS_VTYPES
+    constants, deferred = [], []
+    for pn in all_panes:
+        for tag in _REFERENCE_LINE_TAGS:
+            for el in _children_local(pn, tag):
+                const = _constant_reference_value(el)
+                if value_axis and const is not None:
+                    constants.append({"value": const,
+                                      "display_name": _custom_reference_label(el)})
+                else:
+                    deferred.append(_annotation_label(el))
+        for el in _findall_local(pn, "trend-line"):
+            deferred.append("trend line")
+    return constants, deferred
+
+
 def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date_binding=None,
                      row_count_binding=None, measure_binding=None, measure_palette=None):
     name = ws.get("name")
@@ -2376,18 +2446,25 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     # rebuilt visual is never silently missing an author's target overlay. Gated on an emitted
     # visual -- an unsupported worksheet is already wholly deferred, so no extra warning is added.
     reference_lines = []
+    reference_line_constants = []
     if visual_type != VT_UNSUPPORTED:
         reference_lines = _parse_reference_lines(all_panes)
         if reference_lines:
-            is_card = visual_type == VT_CARD
-            labels = ", ".join(dict.fromkeys(r["label"] for r in reference_lines))
-            warnings.append(_warn(
-                "worksheet", name,
-                "{0}(s) deferred (Tier-2 analytics): {1} -> the rebuilt {2} shows the value "
-                "without the target/trend overlay".format(
-                    "KPI target/goal" if is_card else "reference/target/trend line",
-                    labels,
-                    "card" if is_card else "visual")))
+            # A constant line on a value-axis chart is now REBUILT as a Power BI analytics reference
+            # line; only the annotations we cannot faithfully place (computed / parameter / band /
+            # non-value-axis) are deferred and disclosed, so the warning names just the drops.
+            reference_line_constants, deferred_labels = _classify_reference_lines(
+                all_panes, visual_type)
+            if deferred_labels:
+                is_card = visual_type == VT_CARD
+                labels = ", ".join(dict.fromkeys(deferred_labels))
+                warnings.append(_warn(
+                    "worksheet", name,
+                    "{0}(s) deferred (Tier-2 analytics): {1} -> the rebuilt {2} shows the value "
+                    "without the target/trend overlay".format(
+                        "KPI target/goal" if is_card else "reference/target/trend line",
+                        labels,
+                        "card" if is_card else "visual")))
 
     return {
         "name": name,
@@ -2404,6 +2481,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "card_label_colors": card_label_colors,
         "data_labels": data_labels,
         "reference_lines": reference_lines,
+        "reference_line_constants": reference_line_constants,
         "rows": rows,
         "cols": cols,
         "encodings": encodings,
@@ -3768,6 +3846,12 @@ def _apply_visual_calcs(ws, state, vc_index, model_table, field_map, warnings):
                 "queryRef": qref, "nativeQueryRef": vc.name}
         if vc.hidden:
             proj["hidden"] = True
+        elif vc.number_format:
+            # A visible percent-family calc carries its display format on the projection itself
+            # (PBIR ``RoleProjection.format`` -- "format string scoped to the visual"), so the shown
+            # ratio renders as a percentage. A hidden colour-driver shows nothing, so it stays
+            # unformatted (matching the hand-built oracle, whose hidden calc carries no format).
+            proj["format"] = vc.number_format
         vc_projections.append((proj, vc))
 
     # Plain table / chart: hide the base measure (the calc is the shown value). Conditionally-formatted
@@ -3821,7 +3905,7 @@ def _apply_visual_calcs(ws, state, vc_index, model_table, field_map, warnings):
         "tableau_summary": spec.tableau_summary,
         "visual_calcs": [
             {"name": vc.name, "expression": vc.expression, "hidden": vc.hidden,
-             "is_inner": vc.is_inner, "queryRef": p["queryRef"]}
+             "is_inner": vc.is_inner, "queryRef": p["queryRef"], "format": p.get("format")}
             for p, vc in vc_projections],
     }
     if role == "color":
@@ -4231,11 +4315,29 @@ def _shape_map_datapoint_objects():
     }]
 
 
+def _reference_line_analytics_objects(ws):
+    """Constant reference lines (``ws['reference_line_constants']``) -> a Power BI
+    ``y1AxisReferenceLine`` analytics object dict, ready to merge into ``visual.objects``.
+
+    Only value-axis constants ever reach here (the parse gate populates the field solely for
+    column/line/area charts); a computed / parameter / band / non-value-axis line was already
+    deferred. Returns ``None`` when there is nothing to draw -- byte-identical output for every
+    existing visual.
+    """
+    if report_formatting is None:
+        return None
+    consts = ws.get("reference_line_constants") or []
+    if not consts:
+        return None
+    lines = [{"value": c["value"], "display_name": c.get("display_name")} for c in consts]
+    return report_formatting.reference_line_objects(lines, "value")
+
+
 def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  filter_config=None, title=None, title_style=None, axis_titles=None,
                  value_objects=None,
                  data_point_objects=None, label_objects=None, legend_objects=None,
-                 shape_objects=None, card_label_objects=None):
+                 shape_objects=None, card_label_objects=None, analytics_objects=None):
     visual = {"visualType": vtype}
     if query_state:
         visual["query"] = {"queryState": query_state}
@@ -4289,6 +4391,15 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     if card_label_objects:
         for _ck, _cv in card_label_objects.items():
             visual.setdefault("objects", {})[_ck] = _cv
+    # Analytics overlays (Tier-2, lifted for value-axis charts): the data-plane
+    # ``visual.objects.y1AxisReferenceLine`` list -- one ``{properties, selector:{id}}`` element per
+    # faithfully-rebuilt CONSTANT reference line. Object name, ``selectors:{id}`` envelope, and the
+    # double ``value`` / string ``displayName`` / solid ``lineColor`` encodings are verified against
+    # the Power BI formatting inventory's real reference-line raws. Computed / parameter / band lines
+    # never reach here (they were deferred at parse time), so an approximate overlay is never drawn.
+    if analytics_objects:
+        for _ak, _av in analytics_objects.items():
+            visual.setdefault("objects", {})[_ak] = _av
     # Small multiples (trellis): the data-plane ``visual.objects.smallMultiple`` formatting card.
     # A ``SmallMultiple`` query role (a Rows paning dimension -> one pane per member) BINDS the
     # field, but Desktop needs this card to actually lay the panes out -- without it the role is
@@ -4860,6 +4971,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             # through the ``dataPoint`` channel (a measure choropleth has no categorical colours).
             if ws["visual_type"] == VT_SHAPE_MAP and not data_point_objects:
                 data_point_objects = _shape_map_datapoint_objects()
+            analytics_objects = _reference_line_analytics_objects(ws)
             visuals.append(_visual_json(
                 vname, vtype, pos, state,
                 _sort_definition(ws, state, model_table, field_map),
@@ -4868,7 +4980,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 axis_titles=ws.get("axis_titles"),
                 value_objects=value_objects, data_point_objects=data_point_objects,
                 label_objects=label_objects, legend_objects=legend_objects,
-                shape_objects=shape_objects, card_label_objects=card_label_objects))
+                shape_objects=shape_objects, card_label_objects=card_label_objects,
+                analytics_objects=analytics_objects))
             rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                     page_display=db["name"] or page_name,
                                     model_table=model_table, field_map=field_map)
@@ -4944,6 +5057,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                          if ws["visual_type"] == VT_SHAPE_MAP else None)
         if ws["visual_type"] == VT_SHAPE_MAP and not data_point_objects:
             data_point_objects = _shape_map_datapoint_objects()
+        analytics_objects = _reference_line_analytics_objects(ws)
         main = _visual_json(
             vname, vtype, pos, state,
             _sort_definition(ws, state, model_table, field_map),
@@ -4952,7 +5066,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             axis_titles=ws.get("axis_titles"),
             value_objects=value_objects, data_point_objects=data_point_objects,
             label_objects=label_objects, shape_objects=shape_objects,
-            card_label_objects=card_label_objects)
+            card_label_objects=card_label_objects,
+            analytics_objects=analytics_objects)
         rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                 page_display=ws["name"],
                                 model_table=model_table, field_map=field_map)

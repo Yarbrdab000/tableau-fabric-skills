@@ -508,6 +508,13 @@ stacked secondary calc (e.g. YTD → Year-over-Year growth) emits as a two-pass 
 calc always hidden. `report.json` / `summary.md` gain an additive `visual_calculations` routing
 rollup (emitted / review, by role and calc family).
 
+**Number format.** A *visible* percent-family calc (Percent of Total, Percent Difference,
+Year-over-Year, YTD Growth, Compound Growth, Percentile) also carries a Power BI `format` string
+(`0.00%`) on its projection's schema-verified `format` property (PBIR `RoleProjection`), so it
+renders as a percentage rather than a bare ratio. A hidden colour-driver calc and the absolute-valued
+families (Running Total, Moving Average, Difference, YTD) are left at the column default — matching
+the hand-built oracle, which formats only the shown percent.
+
 ## Unsupported handling (→ `warnings`, never a wrong visual)
 
 Every warning is `{"scope": "worksheet"|"dashboard", "name": <name>, "reason": "manual attention required: ..."}`.
@@ -524,11 +531,20 @@ Cases that degrade to a warning instead of a visual/binding:
   richer PBIR `kpi` visual (with `Indicator`/`TrendAxis`/`TargetValue` roles) is deferred to a
   Tier-2 analytics pass. When the worksheet carries an explicit **reference / target / trend line**
   (a Tableau `<reference-line>`/`<trend-line>` annotation — e.g. a sales goal, an average band, a
-  fitted trend), it is now **detected and disclosed**: the faithful value/visual still emits, and a
-  `… deferred (Tier-2 analytics): <target> …` warning names the dropped overlay (phrased as a
-  *KPI target/goal* on a card, a *reference/target/trend line* on a chart). The annotation
-  descriptors are also recorded on the worksheet IR (`reference_lines`) for a future analytics pass.
-  Drawing the overlay itself (the line/band on the canvas) stays Tier-2.
+  fitted trend), a **constant line** (`formula='constant'` with a fixed numeric `value`) on a
+  **value-axis cartesian chart** (`column` / `line` / `area`, where the measure is unambiguously the
+  Y axis) is now **rebuilt** as a Power BI analytics reference line: a `y1AxisReferenceLine` object
+  (`{properties:{show, value, [displayName]}, selector:{id}}`, the `value` a `D`-suffixed double
+  literal, an author-typed custom label a single-quoted string) is merged onto `visual.objects` so the
+  goal line renders on the canvas. The emittable constants are recorded on the worksheet IR
+  (`reference_line_constants`) alongside the unchanged `reference_lines` descriptors. Every **other**
+  annotation is still **detected and disclosed, never guessed** — a computed line
+  (average/median/min/max/total), a parameter-driven line, a percentage-band distribution, a trend
+  fit, or a constant on a non-value-axis visual (a horizontal `bar`'s ambiguous measure axis, a
+  `scatter`'s dual axes, a `card`) keeps the faithful value/visual and raises a `… deferred (Tier-2
+  analytics): <target> …` warning naming exactly the dropped overlay (phrased as a *KPI target/goal*
+  on a card, a *reference/target/trend line* on a chart). Drawing those remaining overlays stays
+  Tier-2.
 - **Table calculations** and other window/running derivations (e.g. `WindowSum`) → field skipped
   **here**, but note this is now the *fallback of last resort*: a view-only **quick** table calc is
   first rebuilt as a Power BI **Visual Calculation** (see the section above), and a named model-level

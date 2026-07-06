@@ -13,6 +13,44 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **percent-family Visual Calculations now carry a Power BI `format`
+  string** so a view-only quick table calc that Tableau renders as a percentage (Percent of Total,
+  Percent Difference, Year-over-Year, YTD Growth, Compound Growth, Percentile) shows as `0.00%` in
+  the rebuilt visual instead of a bare ratio. The format is written on the projection's
+  schema-verified `format` property (PBIR `RoleProjection`, `visualContainer` 2.x) and ONLY on a
+  *visible* percent calc — a hidden colour-driver calc stays unformatted, matching the hand-built
+  oracle. Absolute-valued families (Running Total, Moving Average, Difference, YTD) inherit the
+  column default unchanged. Grounded on the PBIR schema plus the formatting-research inventory.
+- **tableau-migration:** **constant reference / target lines now rebuild as native Power BI analytics
+  reference lines instead of being dropped.** A Tableau reference line with a fixed value
+  (`<reference-line formula='constant' value='…'>`) on a value-axis cartesian chart (column / line /
+  area — where the measure is unambiguously the Y axis) is emitted as a `y1AxisReferenceLine` object
+  (schema-verified `{properties:{show,value,[displayName]}, selector:{id}}`, the numeric `value` a
+  `D`-suffixed double literal and the custom label a single-quoted string) so the goal line the author
+  drew now renders in the rebuilt visual. **Warn-never-wrong:** only a *constant* on a value-axis chart
+  is drawn; a computed line (average / median / min / max / total), a parameter-driven line, a
+  percentage-band distribution, a trend fit, or any non-value-axis chart (a horizontal bar's ambiguous
+  measure axis, a scatter's dual axes, a card) still defers with a precise message naming exactly which
+  overlay was not carried. Strictly **additive** — the `_parse_reference_lines` descriptor and every
+  existing deferral test are byte-identical; the emittable constants live in a new
+  `reference_line_constants` IR field. Grounded on real workbooks (a Tableau Cloud Migration Readiness
+  assessment: `100 GB` on an area chart, `5 minutes` / `2 hours` on column charts) and the
+  formatting-research inventory, and validated end to end (the migrated `.pbip` carries the
+  `y1AxisReferenceLine` on disk).
+- **tableau-migration:** added `report_formatting.py` — pure, inventory-grounded PBIR builders for
+  four report-layer formatting features that are currently detected-and-deferred or dropped:
+  Analytics **reference lines** (`y1AxisReferenceLine` / `xAxisReferenceLine`), **rule-based
+  conditional formatting** (`Conditional.Cases[]` solid fills for backColor / fontColor), in-cell
+  **data bars** (`columnFormatting.dataBars`), and mark **opacity** (the inverted `transparency`
+  property). Every shape is copied from real `.pbix` serializations catalogued in the
+  formatting-research inventory (`objectIndex` raws + `valueGrammar`) and unit-tested against them.
+  The **reference-line builder is now wired** (see above); the other three remain **emit-half only**
+  — grounding against the formatting inventory shows they are not yet faithfully representable end to
+  end (Power BI cartesian data marks expose no `transparency` target for Tableau's mark opacity;
+  Power BI's only gradient forms are the continuous 2-/3-stop scales the migrator already emits, with
+  no stepped/`num-steps` form; and Tableau has no in-cell data-bar construct to source), so they stay
+  detection-independent builders pending a visual type that supports them. Skill `VERSION`
+  `1.16.1` → `1.17.0`.
 - **tableau-migration:** **the view-only quick-table-calc → Visual Calculation path now covers
   cartesian charts (bar / column / line / area), not just tables and matrices — closing a gap where a
   chart whose measure was a quick table calc emitted no calc at all.** A chart carries its base

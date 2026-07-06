@@ -3190,6 +3190,132 @@ def test_no_reference_line_means_empty_list_and_no_warning():
     assert not any("deferred (Tier-2 analytics)" in x["reason"] for x in ir["warnings"])
 
 
+# -- constant reference lines -> Power BI analytics y1AxisReferenceLine (additive, Tier-2 lift) ----
+def _const_ref_line(value, label=None, label_type="none", extra_attrs="", child=""):
+    """A Tableau ``formula='constant'`` reference line at a fixed numeric ``value`` (the shape a user
+    gets by dropping a constant line on a value axis)."""
+    lbl = f"label='{label}' " if label else ""
+    head = (f"<reference-line {lbl}label-type='{label_type}' formula='constant' "
+            f"value='{value}' scope='per-pane' {extra_attrs}")
+    return f"{head}>{child}</reference-line>" if child else f"{head}/>"
+
+
+def _visual_objects_of(res):
+    return _only_visual(res)["visual"].get("objects", {})
+
+
+def test_constant_reference_line_emits_y1_axis_object():
+    # a constant target on a value-axis column chart is faithfully rebuilt as a Power BI analytics
+    # reference line (y1AxisReferenceLine) carrying the value + custom caption; no Tier-2 defer.
+    ref = _const_ref_line(50000, label="Target", label_type="custom")
+    ws = _worksheet("Sales vs Target", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, pane_extra=ref)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["visual_type"] == "column"
+    assert w["reference_line_constants"] == [{"value": 50000.0, "display_name": "Target"}]
+    # the emittable constant does NOT trigger the deferral warning
+    assert not any(x["name"] == "Sales vs Target" and "deferred (Tier-2 analytics)" in x["reason"]
+                   for x in parse_twb(_workbook(ws))["warnings"])
+    res = migrate_twb_to_pbir(_workbook(ws), dataset_name="M", report_name="R")
+    rl = _visual_objects_of(res)["y1AxisReferenceLine"]
+    assert len(rl) == 1
+    props = rl[0]["properties"]
+    assert props["value"]["expr"]["Literal"]["Value"] == "50000D"
+    assert props["displayName"]["expr"]["Literal"]["Value"] == "'Target'"
+    assert props["show"]["expr"]["Literal"]["Value"] == "true"
+    assert rl[0]["selector"]["id"] == "Ref0"
+
+
+def test_constant_reference_line_without_custom_label_omits_display_name():
+    # value-only constant (automatic/none label) -> line with a value but no displayName override.
+    ref = _const_ref_line(0, label_type="none")
+    ws = _worksheet("Break-even", "Line",
+                    rows="[federated.abc].[sum:Profit:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, pane_extra=ref)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["reference_line_constants"] == [{"value": 0.0, "display_name": None}]
+    res = migrate_twb_to_pbir(_workbook(ws), dataset_name="M", report_name="R")
+    rl = _visual_objects_of(res)["y1AxisReferenceLine"]
+    assert len(rl) == 1
+    assert rl[0]["properties"]["value"]["expr"]["Literal"]["Value"] == "0D"
+    assert "displayName" not in rl[0]["properties"]
+
+
+def test_computed_reference_line_defers_and_emits_no_axis_object():
+    # a computed (average) line has no fixed value to place -> stays a Tier-2 defer, and NO
+    # approximate analytics object is emitted (warn-never-wrong).
+    ref = _ref_line("[federated.abc].[sum:Profit:qk]", formula="average")
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, pane_extra=ref)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["reference_line_constants"] == []
+    res = migrate_twb_to_pbir(_workbook(ws), dataset_name="M", report_name="R")
+    assert "y1AxisReferenceLine" not in _visual_objects_of(res)
+    assert any(x["name"] == "Sales by Category" and "deferred (Tier-2 analytics)" in x["reason"]
+               and "average of Profit" in x["reason"]
+               for x in res["ir"]["warnings"])
+
+
+def test_percentage_band_reference_line_defers():
+    # a percentage-band distribution is not a single constant line -> defer, no analytics object.
+    ref = _const_ref_line(25, extra_attrs="percentage-bands='true'",
+                          child="<reference-line-value percentage='60' />")
+    ws = _worksheet("Banded", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, pane_extra=ref)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["reference_line_constants"] == []
+    res = migrate_twb_to_pbir(_workbook(ws), dataset_name="M", report_name="R")
+    assert "y1AxisReferenceLine" not in _visual_objects_of(res)
+    assert any(x["name"] == "Banded" and "deferred (Tier-2 analytics)" in x["reason"]
+               for x in res["ir"]["warnings"])
+
+
+def test_constant_reference_line_on_horizontal_bar_defers():
+    # on a horizontal bar the measure axis is X (ambiguous for a y1 line) -> defer rather than risk
+    # drawing the line on the wrong axis.
+    ref = _const_ref_line(50000, label="Target", label_type="custom")
+    ws = _worksheet("Sales by Cat H", "Bar",
+                    rows="[federated.abc].[none:Category:nk]",
+                    cols="[federated.abc].[sum:Sales:qk]",
+                    deps_extra=_INST, pane_extra=ref)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["visual_type"] == "bar"
+    assert w["reference_line_constants"] == []
+    res = migrate_twb_to_pbir(_workbook(ws), dataset_name="M", report_name="R")
+    assert "y1AxisReferenceLine" not in _visual_objects_of(res)
+    assert any(x["name"] == "Sales by Cat H" and "deferred (Tier-2 analytics)" in x["reason"]
+               for x in res["ir"]["warnings"])
+
+
+def test_mixed_constant_and_computed_reference_lines():
+    # a column chart with BOTH a constant target and an average line: the constant is rebuilt, the
+    # average is deferred, and the warning names only the dropped (computed) line.
+    ref = (_const_ref_line(50000, label="Target", label_type="custom")
+           + _ref_line("[federated.abc].[sum:Profit:qk]", formula="average"))
+    ws = _worksheet("Sales mixed", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, pane_extra=ref)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["reference_line_constants"] == [{"value": 50000.0, "display_name": "Target"}]
+    res = migrate_twb_to_pbir(_workbook(ws), dataset_name="M", report_name="R")
+    rl = _visual_objects_of(res)["y1AxisReferenceLine"]
+    assert len(rl) == 1
+    assert rl[0]["properties"]["value"]["expr"]["Literal"]["Value"] == "50000D"
+    warn = [x for x in res["ir"]["warnings"]
+            if x["name"] == "Sales mixed" and "deferred (Tier-2 analytics)" in x["reason"]]
+    assert len(warn) == 1
+    assert "average of Profit" in warn[0]["reason"]
+    assert "Target" not in warn[0]["reason"]
+
+
 def test_measure_values_no_dimension_is_table():
     # A Measure Values text table with NO real dimension is Tableau's "measure table" (the measure
     # names listed down the side with their values) -> a faithful tableEx of the member measures,

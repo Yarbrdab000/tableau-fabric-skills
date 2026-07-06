@@ -735,3 +735,65 @@ def test_agg_derivations_is_one_shared_set_across_paths():
     assert _pill("Customer", "User").is_dimension is False  # a user LOD reference is excluded too
 
 
+# -- 13. per-projection number format (percent families) -----------------------
+# A Tableau quick table calc that yields a RATIO (percent of total / difference, YoY, YTD growth,
+# compound growth, percentile) is shown by Tableau as a percentage, so the VISIBLE Visual Calculation
+# carries a percent display format on its projection -- the PBIR ``RoleProjection.format`` seam
+# ("format string scoped to the visual", schema-verified). The absolute families keep the default/
+# base format, and a hidden colour-driver stays unformatted (matching the hand-built oracle, whose
+# hidden percent calc carries no format).
+def test_emit_percent_family_carries_percent_number_format():
+    (d,) = _emit(_spec(calc_type="PctTotal"))
+    assert d.family == vcs.FAMILY_PERCENT_OF_TOTAL
+    assert d.number_format == "0.00%"
+
+
+def test_emit_absolute_family_has_no_number_format():
+    (running,) = _emit(_spec(calc_type="CumTotal"))
+    assert running.family == vcs.FAMILY_RUNNING_TOTAL
+    assert running.number_format is None
+    (movavg,) = _emit(_spec(calc_type="WindowTotal", aggregation="Avg",
+                            window_from=-2, window_to=0))
+    assert movavg.family == vcs.FAMILY_MOVING_AVERAGE
+    assert movavg.number_format is None
+
+
+def test_emit_ytd_growth_chain_formats_only_the_visible_outer():
+    inner, outer = _emit(_spec(
+        calc_type="CumTotal", secondary=True,
+        secondary_pass={"calc_type": "PctDiff", "level_address": "[ds].[yr:Order Date:ok]"},
+        level_break="[ds].[yr:Order Date:ok]"))
+    assert inner.family == vcs.FAMILY_YTD
+    assert inner.number_format is None                 # the inner YTD is absolute (and hidden)
+    assert outer.family == vcs.FAMILY_YTD_GROWTH
+    assert outer.number_format == "0.00%"              # only the visible growth ratio is a percent
+
+
+def test_apply_visual_calcs_value_role_percent_projection_carries_format():
+    base = _base_measure_field()
+    ws = {"name": "WS", "encodings": {"color": None, "label": base, "text": None}}
+    state, base_proj = _matrix_state()
+    value_objects, fact = _apply_visual_calcs(
+        ws, state, {"WS": [_usage(calc_type="PctTotal", level_break=None)]}, None, None, [])
+
+    assert fact["family"] == vcs.FAMILY_PERCENT_OF_TOTAL
+    vc_proj = state["Values"]["projections"][1]
+    assert "hidden" not in vc_proj                     # value role: the percent is the shown value ...
+    assert vc_proj["format"] == "0.00%"                # ... so it carries a percent display format
+    assert fact["visual_calcs"][-1]["format"] == "0.00%"   # additive report enrichment
+
+
+def test_apply_visual_calcs_color_role_percent_calc_stays_unformatted():
+    base = _base_measure_field()
+    ws = {"name": "WS", "encodings": {"color": base, "label": None, "text": None},
+          "color_gradient": {"colors": ["#FFFFFF", "#FF0000"]}}
+    state, base_proj = _matrix_state()
+    value_objects, fact = _apply_visual_calcs(
+        ws, state, {"WS": [_usage(calc_type="PctTotal", level_break=None)]}, None, None, [])
+
+    assert fact["role"] == "color"
+    vc_proj = state["Values"]["projections"][1]
+    assert vc_proj["hidden"] is True                   # colour-driver: hidden, shows nothing ...
+    assert "format" not in vc_proj                     # ... so no display format (matches the oracle)
+
+

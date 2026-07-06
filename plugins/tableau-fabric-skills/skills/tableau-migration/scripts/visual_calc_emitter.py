@@ -59,6 +59,28 @@ _FAMILY_NAME = {
     FAMILY_DIFFERENCE: "Difference",
 }
 
+# Families whose DAX yields a RATIO (0..1-scaled), which Tableau's quick table calc shows as a
+# percentage. The visible projection therefore carries a percent display format ``0.00%`` -- the
+# faithful counterpart of Tableau's automatic percent display for these calcs. The absolute families
+# (running total, YTD, moving average, plain difference) keep the default/base format -- no override,
+# which also matches the hand-built oracle (it leaves those unformatted). The number format is a
+# per-projection ``format`` string, the PBIR ``RoleProjection.format`` seam ("format string scoped to
+# the visual"); it is emitted only for the VISIBLE calc, never a hidden colour-driver.
+_PERCENT_FAMILIES = frozenset({
+    FAMILY_PERCENT_OF_TOTAL,
+    FAMILY_PERCENT_DIFFERENCE,
+    FAMILY_YEAR_OVER_YEAR,
+    FAMILY_YTD_GROWTH,
+    FAMILY_COMPOUND_GROWTH,
+    FAMILY_PERCENTILE,
+})
+_PERCENT_FORMAT = "0.00%"
+
+
+def _family_number_format(family: str) -> Optional[str]:
+    """The visual-scoped display format for a family, or ``None`` to inherit the default/base format."""
+    return _PERCENT_FORMAT if family in _PERCENT_FAMILIES else None
+
 
 @dataclass
 class VisualCalcDef:
@@ -70,6 +92,7 @@ class VisualCalcDef:
     role: str = "value"
     family: str = ""
     tableau_summary: str = ""
+    number_format: Optional[str] = None   # per-projection ``format`` string (percent families) or None
 
 
 def _ref(name: str) -> str:
@@ -174,6 +197,7 @@ def emit_visual_calc(
         inner = VisualCalcDef(
             name=inner_name, expression=inner_body, hidden=True, is_inner=True,
             role=role, family=inner_spec.family, tableau_summary=spec.tableau_summary,
+            number_format=_family_number_format(inner_spec.family),
         )
         inner_ref = _ref(inner_name)
         prev = _previous(inner_ref, spec.offset_k, spec.axis)
@@ -184,6 +208,7 @@ def emit_visual_calc(
         outer = VisualCalcDef(
             name=_FAMILY_NAME[FAMILY_YTD_GROWTH], expression=outer_body, hidden=main_hidden,
             role=role, family=FAMILY_YTD_GROWTH, tableau_summary=spec.tableau_summary,
+            number_format=_family_number_format(FAMILY_YTD_GROWTH),
         )
         return [inner, outer], None
 
@@ -194,4 +219,5 @@ def emit_visual_calc(
     return [VisualCalcDef(
         name=name, expression=body, hidden=main_hidden, role=role,
         family=spec.family, tableau_summary=spec.tableau_summary,
+        number_format=_family_number_format(spec.family),
     )], None
