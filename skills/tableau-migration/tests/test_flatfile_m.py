@@ -1,9 +1,10 @@
 """Real ("full data") flat-file M emission for Excel and CSV sources.
 
 These prove the Import partitions a flat-file datasource produces are deploy-ready Power Query --
-read the file, promote headers, type every column from the Tableau metadata, and rename the
-promoted headers to the model (``clean_col``) names so they bind to each TMDL ``sourceColumn`` --
-rather than the ``let Source = null in Source`` scaffold that flat files used to fall back to.
+read the file, promote headers, and type every column from the Tableau metadata -- rather than the
+``let Source = null in Source`` scaffold that flat files used to fall back to. The promoted headers
+keep their RAW names; each model column binds to that raw name via a (quoted-when-spaced) TMDL
+``sourceColumn`` instead of a ``Table.RenameColumns`` step, which is fold-safe on the Service.
 """
 import connection_to_m as C
 from assemble_model import migrate_tds_to_semantic_model
@@ -111,7 +112,7 @@ def test_parse_captures_csv_directory_and_filename():
 # =============================================================================
 # Excel emission.
 # =============================================================================
-def test_excel_emits_typed_promoted_renamed_partition():
+def test_excel_emits_typed_promoted_partition_binds_raw_source_columns():
     tmdl, _d = _orders_partition(EXCEL_DS)
 
     # not the scaffold
@@ -120,15 +121,17 @@ def test_excel_emits_typed_promoted_renamed_partition():
     assert 'Excel.Workbook(File.Contents("Data/Superstore/Sample - Superstore.xlsx"), null, true)' in tmdl
     assert 'Source{[Item="Orders", Kind="Sheet"]}[Data]' in tmdl
     assert "Table.PromoteHeaders(Navigation, [PromoteAllScalars=true])" in tmdl
-    # every column typed from the Tableau metadata
+    # every column typed from the Tableau metadata (typing uses the RAW promoted header name)
     assert '{"Order Date", type datetime}' in tmdl
     assert '{"Sales", type number}' in tmdl
     assert '{"Quantity", Int64.Type}' in tmdl
     assert '{"Region", type text}' in tmdl
-    # promoted headers renamed to the model (clean_col) names so they match sourceColumn
-    assert 'Table.RenameColumns(Typed, {{"Order Date", "Order_Date"}}, MissingField.Ignore)' in tmdl
-    # the typed model columns exist with their source binding
-    assert "column Order_Date" in tmdl and "sourceColumn: Order_Date" in tmdl
+    # NO rename step: the model column keeps its underscored name but binds to the RAW header via a
+    # quoted sourceColumn (fold-safe -- a rename above the source breaks query folding on the Service).
+    assert "Table.RenameColumns" not in tmdl
+    assert "column Order_Date" in tmdl and 'sourceColumn: "Order Date"' in tmdl
+    # a simple (space-free) header stays a bare sourceColumn
+    assert "column Sales" in tmdl and "sourceColumn: Sales" in tmdl
     assert "mode: import" in tmdl
 
 

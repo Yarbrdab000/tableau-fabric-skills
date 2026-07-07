@@ -1581,14 +1581,24 @@ def test_emit_databricks_custom_sql_drills_catalog_then_native_query():
     assert "Value.NativeQuery(Catalog, " in body
     assert "Value.NativeQuery(Source" not in body          # never against the root collection
     assert "[EnableFolding=true]" in body
-    # native query returns the RAW source headers -> rename to each column's underscored sourceColumn
-    assert "Table.RenameColumns(Result, " in body
-    assert '{"Order ID", "Order_ID"}' in body
-    assert '{"Country/Region", "Country_Region"}' in body
-    assert '"Sales", "Sales"' not in body                  # a clean name is NOT renamed (no-op)
-    assert "MissingField.Ignore" in body
+    # NO rename in the M body: the native query returns the RAW source headers and each TMDL column
+    # binds to that raw name via its sourceColumn (fold-safe). A Table.RenameColumns above a folded
+    # native query breaks in Fabric ("The name 't0.Order_Date' doesn't exist in the current context").
+    assert "Table.RenameColumns" not in body
     # build-time fail-loud: a real drilled partition is NOT flagged as needing review
     assert m_partition_review_reason(rel, d, "DirectQuery") is None
+
+
+def test_emit_databricks_custom_sql_binds_raw_source_columns_in_tmdl():
+    # The fold-safe binding for a spaced/special remote name lives in the TMDL as a quoted
+    # sourceColumn (NOT a rename step in the M). The model column name stays underscored so DAX and
+    # visual bindings are unaffected.
+    d = parse_tds(DATABRICKS_CUSTOM_SQL)
+    tmdl = emit_table_tmdl_m(d["relations"][0], d, "DirectQuery")
+    assert "Table.RenameColumns" not in tmdl                       # never rename in M
+    assert 'column Order_ID' in tmdl and 'sourceColumn: "Order ID"' in tmdl
+    assert 'column Country_Region' in tmdl and 'sourceColumn: "Country/Region"' in tmdl
+    assert "column Sales" in tmdl and "sourceColumn: Sales" in tmdl  # simple name stays bare
 
 
 def test_emit_snowflake_custom_sql_still_scaffolds():

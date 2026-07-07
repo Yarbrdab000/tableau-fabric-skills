@@ -1752,9 +1752,11 @@ def _flatfile_contents_expr(path, conn):
 def emit_flatfile_source(relation, conn, cls):
     """Emit a real, typed Import ``let ... in`` body for an Excel/CSV ("full data") relation.
 
-    Builds a deterministic, deploy-ready Power Query: read the file, promote the header row, set
-    each column's type from the parsed Tableau metadata, and rename the promoted headers to the
-    model column names (``clean_col``) so they match each column's ``sourceColumn`` in the TMDL.
+    Builds a deterministic, deploy-ready Power Query: read the file, promote the header row, and set
+    each column's type from the parsed Tableau metadata. The promoted headers keep their RAW names;
+    each TMDL column binds to that raw name via its ``sourceColumn`` (no ``Table.RenameColumns`` --
+    a rename above the source is unnecessary once the binding is declarative, and would break query
+    folding on DirectQuery-capable sources).
     Returns ``None`` (caller falls back to a scaffold) when the file path or columns are unknown,
     so a flat file we can't fully resolve is never emitted as a silently-empty partition.
 
@@ -1783,48 +1785,24 @@ def emit_flatfile_source(relation, conn, cls):
         steps.append("Promoted = Table.PromoteHeaders(Source, [PromoteAllScalars=true])")
     prev = "Promoted"
 
-    # Type by the RAW promoted header (the Tableau remote name), then rename to the model name so
-    # the query output column names equal each TMDL column's sourceColumn (clean_col of remote).
-    type_pairs, rename_pairs = [], []
+    # Type by the RAW promoted header (the Tableau remote name) and STOP there: the query output
+    # keeps the raw header names, and each TMDL column binds to that raw name via its sourceColumn.
+    # We deliberately do NOT rename to the model name -- a Table.RenameColumns step is unnecessary
+    # once the binding is declared in TMDL, and it would break query folding on DirectQuery-capable
+    # sources exactly as it does for Value.NativeQuery (post-rename names referenced against the
+    # pre-rename subquery).
+    type_pairs = []
     for c in cols:
         remote = c.get("remote_name") or c["model_name"]
         mt = _M_TYPE.get(c["tmdl_type"])
         if mt:
             type_pairs.append(f'{{"{escape_m_string(remote)}", {mt}}}')
-        if remote != c["model_name"]:
-            rename_pairs.append(
-                f'{{"{escape_m_string(remote)}", "{escape_m_string(c["model_name"])}"}}')
     if type_pairs:
         steps.append(f"Typed = Table.TransformColumnTypes({prev}, {{{', '.join(type_pairs)}}})")
         prev = "Typed"
-    if rename_pairs:
-        steps.append(f"Renamed = Table.RenameColumns({prev}, "
-                     f"{{{', '.join(rename_pairs)}}}, MissingField.Ignore)")
-        prev = "Renamed"
 
     body = ",\n\t\t\t\t".join(steps)
     return f"let\n\t\t\t\t{body}\n\t\t\tin\n\t\t\t\t{prev}"
-
-
-def _native_query_rename_pairs(relation):
-    """Build ``Table.RenameColumns`` pairs that map each native-query output column (the true
-    remote name, e.g. ``Order ID`` / ``Country/Region``) to its model name (``sourceColumn`` =
-    ``clean_col`` of the remote, e.g. ``Order_ID`` / ``Country_Region``).
-
-    This is the SAME remote->model rename the flat-file path already emits (see
-    ``emit_flatfile_source``): a native query returns the raw source headers, so without it the
-    underscored model columns wouldn't bind. Pairs where the remote name already equals the model
-    name are skipped, so a query whose columns need no aliasing yields NO rename step and the
-    emitted M is byte-identical to the pre-rename form (the no-op guarantee).
-    """
-    pairs = []
-    for c in (relation.get("columns") or []):
-        remote = c.get("remote_name")
-        model = c.get("model_name")
-        if remote and model and remote != model:
-            pairs.append(
-                f'{{"{escape_m_string(remote)}", "{escape_m_string(model)}"}}')
-    return pairs
 
 
 def _connect_expr(connector, connect_style):
@@ -1910,10 +1888,10 @@ def _emit_odbc_partition(relation, conn, cls):
     behind it (e.g. a query engine over object storage), so we never need to know that engine's
     dialect -- the source does the parsing.
 
-    * Custom SQL  -> ``Source = Odbc.Query("<connStr>", "<sql>")`` (folds the query at the source),
-      then the SAME remote->model column rename the native-query path uses. A surviving Tableau
-      parameter reference in the SQL is a needs-review reason (the partition is still emitted),
-      mirroring the ``Value.NativeQuery`` path.
+    * Custom SQL  -> ``Source = Odbc.Query("<connStr>", "<sql>")`` (folds the query at the source);
+      columns bind to the raw query headers via ``sourceColumn`` (no rename -- fold-safe). A
+      surviving Tableau parameter reference in the SQL is a needs-review reason (the partition is
+      still emitted), mirroring the ``Value.NativeQuery`` path.
     * A plain table -> a flagged ``Odbc.DataSource`` scaffold: generic-ODBC table navigation keys
       are driver-specific and not portable, so we never guess them.
 
@@ -1932,11 +1910,8 @@ def _emit_odbc_partition(relation, conn, cls):
         sql = escape_m_string(relation.get("sql", ""))
         steps = [f'Source = Odbc.Query("{conn_str_m}", "{sql}")']
         prev = "Source"
-        rename_pairs = _native_query_rename_pairs(relation)
-        if rename_pairs:
-            steps.append(f"Renamed = Table.RenameColumns(Source, "
-                         f"{{{', '.join(rename_pairs)}}}, MissingField.Ignore)")
-            prev = "Renamed"
+        # No Table.RenameColumns: columns bind to the raw ODBC query headers via sourceColumn
+        # (fold-safe -- see the Value.NativeQuery path for why renaming in M breaks folding).
         body = ",\n\t\t\t\t".join(steps)
         param_reason = None
         params = custom_sql_parameter_refs(relation.get("sql", ""))
@@ -2018,13 +1993,12 @@ def _emit_m_partition_review(relation, descriptor, mode):
         steps.append(
             f'Result = Value.NativeQuery({nq_target}, "{sql}", null, [EnableFolding=true])')
         prev = "Result"
-        # Align native-query output (raw remote headers) to each column's sourceColumn. No-ops
-        # (emits no step) when every remote name already equals its model name.
-        rename_pairs = _native_query_rename_pairs(relation)
-        if rename_pairs:
-            steps.append(f"Renamed = Table.RenameColumns({prev}, "
-                         f"{{{', '.join(rename_pairs)}}}, MissingField.Ignore)")
-            prev = "Renamed"
+        # NO Table.RenameColumns here. The native query returns the RAW source headers, and each
+        # TMDL column binds to that raw name via its sourceColumn (declarative, fold-safe). A rename
+        # step would sit ABOVE the folded native query, so when Fabric folds a downstream query it
+        # references the post-rename names against the pre-rename subquery -> "The name
+        # 't0.Order_Date' doesn't exist in the current context" at query time (Import works locally
+        # because the mashup applies the rename in-engine, but the Service folds it into SQL).
         body = ",\n\t\t\t\t".join(steps)
         # The operators are already de-escaped at parse, so a real native query is emitted. The
         # one thing we cannot complete is a recovered Tableau parameter reference
@@ -2110,10 +2084,14 @@ def emit_table_tmdl_m(relation, descriptor, mode):
     columns_tmdl = ""
     for c in cols:
         summarize = "sum" if c["tmdl_type"] in ("int64", "double", "decimal") else "none"
-        # In the M path the model column name == its sourceColumn (the remote source name).
+        # Bind each model column to its RAW remote source name via sourceColumn (declarative, in
+        # TMDL) rather than renaming in the M partition. The model column NAME stays underscored
+        # (clean_col) so DAX / visual bindings are unaffected; only the source-side binding is the
+        # raw name -- which is fold-safe (a Table.RenameColumns above a folded native query breaks
+        # at query time in Fabric: "The name 't0.Order_Date' doesn't exist").
         columns_tmdl += generate_column_tmdl(
             c["model_name"], c["tmdl_type"], summarize, False, c.get("format_string"),
-            c.get("data_category"))
+            c.get("data_category"), source_column=(c.get("remote_name") or c["model_name"]))
 
     partition_name = relation.get("item") or clean_col(table_display)
     source_body = emit_m_partition_source(relation, descriptor, mode)
