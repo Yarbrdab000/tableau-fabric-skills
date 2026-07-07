@@ -1180,7 +1180,10 @@ def test_databricks_custom_sql_emits_real_partition_no_review():
     part = out["parts"]["definition/tables/Custom SQL Query.tmdl"]
     assert 'Catalog = Source{[Name="tableau_migration_databricks", Kind="Database"]}[Data]' in part
     assert "Value.NativeQuery(Catalog, " in part
-    assert '{"Order ID", "Order_ID"}' in part
+    # NO rename in the M partition: the spaced remote name binds via a quoted sourceColumn in the
+    # TMDL (fold-safe -- a rename above the folded native query breaks at query time in Fabric).
+    assert "Table.RenameColumns" not in part
+    assert 'column Order_ID' in part and 'sourceColumn: "Order ID"' in part
     # a real, deploy-ready partition is NOT flagged for review (additive report keys present)
     report = out["report"]
     assert report["partitions_stubbed"] == 0

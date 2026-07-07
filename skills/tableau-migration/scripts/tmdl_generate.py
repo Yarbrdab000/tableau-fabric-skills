@@ -69,6 +69,18 @@ def q(name):
         return name
     return "'" + name.replace("'", "''") + "'"
 
+def _source_column_value(name):
+    """Serialize a ``sourceColumn`` property value the way TOM's TMDL serializer does: bare when the
+    name is a simple identifier, else DOUBLE-quoted -- e.g. ``ProductKey`` stays bare but
+    ``Net Price`` becomes ``"Net Price"`` (see the official TMDL example). ``sourceColumn`` is NOT a
+    rest-of-line property, so a name with a space/slash/other special MUST be quoted or the model
+    won't bind. Reuses the identifier rule from ``q`` (hyphens allowed bare), so a name Power Query
+    already emits bare -- like ``Sub-Category`` -- is unchanged; embedded double-quotes are doubled.
+    """
+    if _UNQUOTED.match(name):
+        return name
+    return '"' + name.replace('"', '""') + '"'
+
 def _format_string(tmdl_type, summarize):
     if tmdl_type == "dateTime":
         return "Short Date"
@@ -154,8 +166,17 @@ def tableau_geo_role_to_data_category(semantic_role):
     return _GEO_ROLE_DATA_CATEGORY.get(m.group(1).strip().lower())
 
 def generate_column_tmdl(col_name, tmdl_type, summarize, is_hidden, format_string=None,
-                         data_category=None):
-    """One column. col_name is the ACTUAL Delta column name (sourceColumn must match).
+                         data_category=None, source_column=None):
+    """One column. col_name is the model column NAME.
+
+    ``source_column`` is an OPTIONAL raw source name to bind to (the Power Query output column /
+    physical remote name, e.g. ``Order Date``). When provided, ``sourceColumn:`` is emitted for THAT
+    name (double-quoted per TMDL rules when it contains a space/special) while the column NAME stays
+    ``col_name`` -- so an M-path model column ``Order_Date`` binds fold-safely to the raw ``Order
+    Date`` the query returns, with no ``Table.RenameColumns`` in the partition. When None the binding
+    falls back to ``col_name`` and the emitted TMDL is byte-for-byte unchanged from before this
+    parameter existed (additive; the DirectLake path, where ``sourceColumn`` must equal the Delta
+    column name, keeps passing None).
 
     ``format_string`` is an OPTIONAL explicit Power BI formatString (e.g. decoded from a
     Tableau ``<column @default-format>`` code via ``tableau_default_format_to_pbi``). When
@@ -184,7 +205,10 @@ def generate_column_tmdl(col_name, tmdl_type, summarize, is_hidden, format_strin
     # source lineage, are emitted by a separate path (generate_table_tmdl), so this omission does
     # not affect them.
     lines.append(f"\t\tsummarizeBy: {summarize}")
-    lines.append(f"\t\tsourceColumn: {col_name}")
+    if source_column is not None:
+        lines.append(f"\t\tsourceColumn: {_source_column_value(source_column)}")
+    else:
+        lines.append(f"\t\tsourceColumn: {col_name}")
     if data_category:
         lines.append(f"\t\tdataCategory: {data_category}")
     lines.append("")

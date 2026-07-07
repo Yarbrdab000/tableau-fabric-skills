@@ -759,8 +759,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
-- **tableau-migration:** **the optional fidelity oracle's live DAX-value tier no longer hangs the
-  self-update / test gate.** Its auto-discovery probed *every* local Analysis Services / Power BI
+- **tableau-migration:** **migrated Import / DirectQuery models no longer fail at query time in the
+  Fabric Service on any column whose source name contains a space or special character** (e.g.
+  `Expression.Error: The name 't0.Order_Date' doesn't exist in the current context`, which also left
+  relationships on those columns showing red validation triangles until manually toggled). The M
+  partition used to append a `Table.RenameColumns` step that renamed the raw source headers
+  (`Order Date`) to the underscored model names (`Order_Date`) above the query; the Service folds that
+  query into SQL and then references the post-rename names against a subquery that still exposes only
+  the pre-rename headers, so the fold fails. (It worked in Power BI Desktop because the mashup engine
+  applies the rename in-process rather than folding it.) The rename is now removed from **every** M
+  path (custom-SQL native query, generic-ODBC custom SQL, and flat-file Excel/CSV); instead each TMDL
+  column binds to its **raw** source name via a `sourceColumn` — double-quoted when the name has a
+  space/special (`sourceColumn: "Order Date"`), bare otherwise — while the model column NAME stays the
+  underscored identifier. The binding is therefore declarative and fold-safe, and DAX, visual bindings,
+  and the calc→DAX resolver are all unaffected because the model column name is unchanged. Simple
+  names (including hyphenated ones like `Sub-Category`) emit a byte-identical bare `sourceColumn`, and
+  the DirectLake path — where `sourceColumn` must equal the Delta column name — is untouched
+  (`source_column` defaults to the column name). Its auto-discovery probed *every* local Analysis Services / Power BI
   Desktop instance and could block indefinitely on a stale one (`conn.Open()` never returns when many
   dead port files are present). Three bounded guards fix it: each connect runs on a daemon thread with a
   hard join timeout, the connection string carries a shorter native `Connect Timeout` so `Open()`
