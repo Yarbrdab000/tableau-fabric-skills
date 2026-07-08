@@ -5,6 +5,7 @@ thin ``_http`` network layer. No Fabric tenant or network is touched.
 """
 import base64
 import os
+import types
 
 import pytest
 
@@ -96,3 +97,236 @@ def test_acquire_token_errors_without_source(monkeypatch):
     monkeypatch.delenv("MISSING_TOKEN", raising=False)
     with pytest.raises(RuntimeError):
         D.acquire_token("res", explicit=None, env_var="MISSING_TOKEN", use_az=False)
+
+
+# -- recalc_dataset / refresh_dataset (enhanced-refresh request shape) -----------------------
+def test_recalc_dataset_posts_calculate(monkeypatch):
+    captured = {}
+
+    def fake_http(method, url, token, body=None, extra_headers=None, timeout=120):
+        captured.update(method=method, url=url, token=token, body=body)
+        return 202, {}, None
+
+    monkeypatch.setattr(D, "_http", fake_http)
+    status, body = D.recalc_dataset("WS", "DS", "tok")
+    assert status == 202
+    assert captured["method"] == "POST"
+    assert captured["url"].endswith("/groups/WS/datasets/DS/refreshes")
+    # the whole point: ProcessRecalc only (no ProcessData -> no credentials needed)
+    assert captured["body"] == {"type": "Calculate"}
+
+
+def test_refresh_dataset_posts_full(monkeypatch):
+    captured = {}
+
+    def fake_http(method, url, token, body=None, extra_headers=None, timeout=120):
+        captured.update(body=body)
+        return 202, {}, None
+
+    monkeypatch.setattr(D, "_http", fake_http)
+    D.refresh_dataset("WS", "DS", "tok")
+    assert captured["body"] == {"type": "full"}
+
+
+# -- _apply_model_post_ops (default, credential-free recalc clears benign triangles) ---------
+def _post_ops_args(**over):
+    base = dict(gateway_id=None, datasource_id=[], refresh=False, no_recalc=False,
+                upgrade_cardinality=False, powerbi_token="tok", token="fabtok",
+                use_az=False, base_url=D.FABRIC_BASE, timeout=600)
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+def test_apply_model_post_ops_recalcs_by_default(monkeypatch):
+    calls = []
+    monkeypatch.setattr(D, "acquire_token", lambda *a, **k: "tok")
+    monkeypatch.setattr(D, "recalc_dataset", lambda ws, ds, tok: (calls.append((ws, ds)), (202, None))[1])
+    monkeypatch.setattr(D, "refresh_dataset", lambda *a, **k: (202, None))
+    D._apply_model_post_ops(_post_ops_args(), {"workspace_id": "WS", "item_id": "DS"})
+    assert calls == [("WS", "DS")]  # recalc fired automatically, no --refresh needed
+
+
+def test_apply_model_post_ops_skips_recalc_with_no_recalc(monkeypatch):
+    calls = []
+    monkeypatch.setattr(D, "acquire_token", lambda *a, **k: "tok")
+    monkeypatch.setattr(D, "recalc_dataset", lambda *a, **k: (calls.append(1), (202, None))[1])
+    D._apply_model_post_ops(_post_ops_args(no_recalc=True),
+                            {"workspace_id": "WS", "item_id": "DS"})
+    assert calls == []
+
+
+def test_apply_model_post_ops_recalc_is_best_effort_without_token(monkeypatch):
+    def no_token(*a, **k):
+        raise RuntimeError("no token")
+
+    recalced = []
+    monkeypatch.setattr(D, "acquire_token", no_token)
+    monkeypatch.setattr(D, "recalc_dataset", lambda *a, **k: (recalced.append(1), (202, None))[1])
+    # a missing Power BI token must skip recalc and let the deploy stand -- never raise
+    D._apply_model_post_ops(_post_ops_args(), {"workspace_id": "WS", "item_id": "DS"})
+    assert recalced == []
+
+
+# -- execute_queries / get_model_definition (thin REST wrappers) ----------------------------
+def test_execute_queries_posts_dax(monkeypatch):
+    captured = {}
+
+    def fake_http(method, url, token, body=None, extra_headers=None, timeout=120):
+        captured.update(method=method, url=url, body=body)
+        return 200, {}, {"results": []}
+
+    monkeypatch.setattr(D, "_http", fake_http)
+    status, _body = D.execute_queries("WS", "DS", 'EVALUATE ROW("t", 1)', "tok")
+    assert status == 200 and captured["method"] == "POST"
+    assert captured["url"].endswith("/groups/WS/datasets/DS/executeQueries")
+    assert captured["body"]["queries"][0]["query"].startswith("EVALUATE ROW")
+
+
+def test_get_model_definition_decodes_base64_parts(monkeypatch):
+    parts_payload = [
+        {"path": "definition/relationships.tmdl",
+         "payload": base64.b64encode(b"relationship x").decode(), "payloadType": "InlineBase64"},
+        {"path": ".platform",
+         "payload": base64.b64encode(b"{}").decode(), "payloadType": "InlineBase64"},
+    ]
+
+    def fake_http(method, url, token, body=None, extra_headers=None, timeout=120):
+        assert url.endswith("/semanticModels/ITEM/getDefinition")
+        return 200, {}, {"definition": {"parts": parts_payload}}
+
+    monkeypatch.setattr(D, "_http", fake_http)
+    parts = D.get_model_definition("WS", "ITEM", "tok")
+    assert parts["definition/relationships.tmdl"] == "relationship x"
+    assert parts[".platform"] == "{}"
+
+
+# -- make_dax_count_fn (uniqueness verdict from an executeQueries response) ------------------
+def _exec_row(total, distinct):
+    return 200, {"results": [{"tables": [{"rows": [{"[t]": total, "[d]": distinct}]}]}]}
+
+
+def test_make_dax_count_fn_verdicts():
+    assert D.make_dax_count_fn(lambda dax: _exec_row(4, 4))("People", "Region") is True
+    assert D.make_dax_count_fn(lambda dax: _exec_row(800, 296))("Returns", "Order ID") is False
+    # empty table, a non-200 status, and an exception ALL mean "unknown" -> keep many-to-many
+    assert D.make_dax_count_fn(lambda dax: _exec_row(0, 0))("T", "C") is None
+    assert D.make_dax_count_fn(lambda dax: (403, {"error": "off"}))("T", "C") is None
+
+    def boom(_dax):
+        raise RuntimeError("net")
+    assert D.make_dax_count_fn(boom)("T", "C") is None
+    assert D.make_dax_count_fn(lambda dax: _exec_row(4, 4))(None, "C") is None  # short-circuits
+
+
+def test_make_dax_count_fn_quotes_identifiers():
+    seen = {}
+
+    def cap(dax):
+        seen["dax"] = dax
+        return _exec_row(2, 2)
+
+    D.make_dax_count_fn(cap)("Order's Table", "Col]ish")
+    assert "'Order''s Table'" in seen["dax"]  # single quote doubled in the table ref
+    assert "[Col]]ish]" in seen["dax"]        # closing bracket doubled in the column ref
+
+
+# -- upgrade_cardinality (getDefinition -> DAX probe -> updateDefinition) --------------------
+def test_upgrade_cardinality_flips_only_unique_target(monkeypatch):
+    from tmdl_generate import generate_relationships_tmdl, parse_relationships_tmdl
+    rel_text = generate_relationships_tmdl([
+        {"from_table": "Orders", "from_col": "Region", "to_table": "People",
+         "to_col": "Region", "cardinality": "many_to_many"},
+        {"from_table": "Orders", "from_col": "Order ID", "to_table": "Returns",
+         "to_col": "Order ID", "cardinality": "many_to_many"},
+    ])
+    served = {"definition/relationships.tmdl": rel_text, "definition/model.tmdl": "model M"}
+    captured = {}
+
+    monkeypatch.setattr(D, "get_model_definition", lambda *a, **k: dict(served))
+    monkeypatch.setattr(D, "execute_queries",
+                        lambda ws, ds, dax, tok, **k: _exec_row(4, 4) if "People" in dax
+                        else _exec_row(800, 296))
+
+    def fake_http(method, url, token, body=None, extra_headers=None, timeout=120):
+        captured.update(url=url, body=body)
+        return 200, {}, {"status": "Succeeded"}
+
+    monkeypatch.setattr(D, "_http", fake_http)
+    D.upgrade_cardinality("WS", "ITEM", "fabtok", "pbitok")
+
+    assert "updateDefinition" in captured["url"]
+    sent = {p["path"]: base64.b64decode(p["payload"]).decode()
+            for p in captured["body"]["definition"]["parts"]}
+    out = sent["definition/relationships.tmdl"]
+    people = next(b for b in out.split("\n\n") if "toColumn: People.Region" in b)
+    returns = next(b for b in out.split("\n\n") if "toColumn: Returns.'Order ID'" in b)
+    assert "toCardinality" not in people          # unique target -> upgraded to many-to-one
+    assert "toCardinality: many" in returns        # non-unique target -> left many-to-many
+    assert [r["name"] for r in parse_relationships_tmdl(out)] == \
+           [r["name"] for r in parse_relationships_tmdl(rel_text)]  # GUIDs preserved
+
+
+def test_upgrade_cardinality_no_update_when_nothing_unique(monkeypatch):
+    from tmdl_generate import generate_relationships_tmdl
+    rel_text = generate_relationships_tmdl([
+        {"from_table": "Orders", "from_col": "Order ID", "to_table": "Returns",
+         "to_col": "Order ID", "cardinality": "many_to_many"},
+    ])
+    monkeypatch.setattr(D, "get_model_definition",
+                        lambda *a, **k: {"definition/relationships.tmdl": rel_text})
+    monkeypatch.setattr(D, "execute_queries", lambda *a, **k: _exec_row(800, 296))
+    posted = []
+    monkeypatch.setattr(D, "_http", lambda *a, **k: (posted.append(1), (200, {}, {}))[1])
+    D.upgrade_cardinality("WS", "ITEM", "fabtok", "pbitok")
+    assert posted == []  # nothing provably unique -> no updateDefinition posted
+
+
+def test_upgrade_cardinality_never_probes_when_no_mm(monkeypatch):
+    from tmdl_generate import generate_relationships_tmdl
+    rel_text = generate_relationships_tmdl([
+        {"from_table": "Orders", "from_col": "Order Date", "to_table": "Date", "to_col": "Date"},
+    ])
+    monkeypatch.setattr(D, "get_model_definition",
+                        lambda *a, **k: {"definition/relationships.tmdl": rel_text})
+    posted = []
+    monkeypatch.setattr(D, "_http", lambda *a, **k: (posted.append(1), (200, {}, {}))[1])
+    monkeypatch.setattr(D, "execute_queries",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not probe")))
+    D.upgrade_cardinality("WS", "ITEM", "fabtok", "pbitok")  # no m:m -> no probe, no post
+    assert posted == []
+
+
+# -- _apply_model_post_ops wiring for --upgrade-cardinality ----------------------------------
+def test_apply_model_post_ops_runs_cardinality_when_flagged(monkeypatch):
+    calls = []
+    monkeypatch.setattr(D, "acquire_token", lambda *a, **k: "tok")
+    monkeypatch.setattr(D, "recalc_dataset", lambda *a, **k: (202, None))
+    monkeypatch.setattr(D, "upgrade_cardinality",
+                        lambda ws, item, fab, pbi, **k: calls.append((ws, item)))
+    D._apply_model_post_ops(_post_ops_args(upgrade_cardinality=True),
+                            {"workspace_id": "WS", "item_id": "DS"})
+    assert calls == [("WS", "DS")]
+
+
+def test_apply_model_post_ops_skips_cardinality_by_default(monkeypatch):
+    calls = []
+    monkeypatch.setattr(D, "acquire_token", lambda *a, **k: "tok")
+    monkeypatch.setattr(D, "recalc_dataset", lambda *a, **k: (202, None))
+    monkeypatch.setattr(D, "upgrade_cardinality", lambda *a, **k: calls.append(1))
+    D._apply_model_post_ops(_post_ops_args(), {"workspace_id": "WS", "item_id": "DS"})
+    assert calls == []  # opt-in only -- no flag, no cardinality pass
+
+
+def test_apply_model_post_ops_cardinality_best_effort_without_token(monkeypatch):
+    # the upgrade needs BOTH a Fabric and a Power BI token; a missing one skips cleanly (never raises)
+    def maybe_token(resource, *a, **k):
+        if resource == D.POWERBI_RESOURCE:
+            raise RuntimeError("no pbi token")
+        return "tok"
+
+    calls = []
+    monkeypatch.setattr(D, "acquire_token", maybe_token)
+    monkeypatch.setattr(D, "upgrade_cardinality", lambda *a, **k: calls.append(1))
+    D._apply_model_post_ops(_post_ops_args(upgrade_cardinality=True, no_recalc=True),
+                            {"workspace_id": "WS", "item_id": "DS"})
+    assert calls == []

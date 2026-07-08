@@ -12,8 +12,11 @@ from tmdl_generate import (
     generate_measure_tmdl,
     generate_relationships_tmdl,
     infer_relationships,
+    parse_relationships_tmdl,
     q,
+    render_relationships_tmdl,
     spark_type_to_tmdl,
+    upgrade_relationship_cardinality,
 )
 
 
@@ -206,6 +209,80 @@ def test_generate_relationships_tmdl_many_to_many_cardinality():
     date_block = next(b for b in blocks if "Orders.Order_Date" in b)
     assert "toCardinality: many" not in date_block
     assert "crossFilteringBehavior" not in date_block
+
+
+# -- relationships.tmdl round-trip + post-deploy cardinality upgrade -----------
+def test_parse_relationships_tmdl_extracts_fields_and_preserves_guid():
+    text = generate_relationships_tmdl([
+        {"from_table": "Orders", "from_col": "Region", "to_table": "People",
+         "to_col": "Region", "cardinality": "many_to_many"},
+        {"from_table": "Orders", "from_col": "Order Date", "to_table": "Date",
+         "to_col": "Date", "join_on_date_behavior": "datePartOnly"},
+        {"from_table": "Orders", "from_col": "Order ID", "to_table": "Returns",
+         "to_col": "Order ID", "cardinality": "many_to_many", "is_active": False},
+    ])
+    parsed = parse_relationships_tmdl(text)
+    assert all(p["name"] for p in parsed)  # a GUID identifier was captured for each block
+
+    people = parsed[0]
+    assert (people["from_table"], people["from_col"]) == ("Orders", "Region")
+    assert (people["to_table"], people["to_col"]) == ("People", "Region")
+    assert people["to_cardinality"] == "many" and people["cross_filter"] == "oneDirection"
+
+    date = parsed[1]
+    assert date["to_col"] == "Date" and date["join_on_date_behavior"] == "datePartOnly"
+    assert date["to_cardinality"] is None  # default many-to-one
+
+    returns = parsed[2]
+    assert returns["to_col"] == "Order ID"  # a quoted, spaced column name unquotes cleanly
+    assert returns["is_active"] is False
+
+
+def test_render_relationships_tmdl_round_trips():
+    text = generate_relationships_tmdl([
+        {"from_table": "Orders", "from_col": "Region", "to_table": "People",
+         "to_col": "Region", "cardinality": "many_to_many"},
+        {"from_table": "Orders", "from_col": "Order Date", "to_table": "Date", "to_col": "Date"},
+    ])
+    assert render_relationships_tmdl(parse_relationships_tmdl(text)) == text
+    assert render_relationships_tmdl([]) is None
+
+
+def test_upgrade_relationship_cardinality_only_flips_unique_target():
+    rels = parse_relationships_tmdl(generate_relationships_tmdl([
+        {"from_table": "Orders", "from_col": "Region", "to_table": "People",
+         "to_col": "Region", "cardinality": "many_to_many"},
+        {"from_table": "Orders", "from_col": "Order ID", "to_table": "Returns",
+         "to_col": "Order ID", "cardinality": "many_to_many"},
+        {"from_table": "Orders", "from_col": "Order Date", "to_table": "Date", "to_col": "Date"},
+    ]))
+    unique = {("People", "Region"): True, ("Returns", "Order ID"): False}
+    new_rels, changed = upgrade_relationship_cardinality(rels, lambda t, c: unique.get((t, c)))
+
+    assert len(changed) == 1  # only the unique-target join is upgraded
+    out = render_relationships_tmdl(new_rels)
+    people = next(b for b in out.split("\n\n") if "toColumn: People.Region" in b)
+    returns = next(b for b in out.split("\n\n") if "toColumn: Returns.'Order ID'" in b)
+    assert "toCardinality" not in people and "crossFilteringBehavior" not in people
+    assert "toCardinality: many" in returns          # non-unique target stays many-to-many
+    assert [r["name"] for r in new_rels] == [r["name"] for r in rels]  # GUIDs preserved
+
+
+def test_upgrade_relationship_cardinality_keeps_mm_on_unknown_and_skips_non_mm():
+    rels = parse_relationships_tmdl(generate_relationships_tmdl([
+        {"from_table": "Orders", "from_col": "Region", "to_table": "People",
+         "to_col": "Region", "cardinality": "many_to_many"},
+        {"from_table": "Orders", "from_col": "Order Date", "to_table": "Date", "to_col": "Date"},
+    ]))
+    assert upgrade_relationship_cardinality(rels, lambda t, c: None)[1] == []  # unknown -> keep m:m
+
+    def boom(_t, _c):
+        raise RuntimeError("probe failed")
+    assert upgrade_relationship_cardinality(rels, boom)[1] == []  # probe error is swallowed
+
+    probed = []
+    upgrade_relationship_cardinality(rels, lambda t, c: probed.append((t, c)) or True)
+    assert ("Date", "Date") not in probed  # an already many-to-one join is never probed
 
 
 # -- calculated-column rendering contract (column-mode / dimension calcs) ------

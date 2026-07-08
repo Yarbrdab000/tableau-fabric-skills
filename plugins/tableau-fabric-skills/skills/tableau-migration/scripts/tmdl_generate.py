@@ -621,6 +621,176 @@ def generate_relationships_tmdl(rels):
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks) + "\n"
 
+
+# -- relationships.tmdl round-trip (post-deploy cardinality upgrade) -----------
+# These read a DEPLOYED ``definition/relationships.tmdl`` back (getDefinition), let a data probe
+# decide which many-to-many joins have a unique target, and re-emit -- PRESERVING each relationship's
+# identifier (GUID) and every property line, changing only the cardinality of the joins being
+# upgraded. Distinct from ``generate_relationships_tmdl`` (which mints a fresh ``uuid4()`` per call
+# and only knows the from/to dict shape): a post-deploy rewrite must keep the existing relationship
+# identities and pass through any property the service serialized that the generator never emits.
+
+_REL_HEADER = re.compile(r"^relationship\s+(.+?)\s*$")
+_REL_PROP = re.compile(r"^(\w+):\s*(.*)$")
+
+
+def _unq_ident(token):
+    """Reverse :func:`q`: a single-quoted TMDL identifier -> its raw name (``''`` -> ``'``); a bare
+    identifier is returned unchanged."""
+    token = token.strip()
+    if len(token) >= 2 and token.startswith("'") and token.endswith("'"):
+        return token[1:-1].replace("''", "'")
+    return token
+
+
+def _split_col_ref(value):
+    """Split a ``Table.Column`` TMDL reference into ``(table, column)`` raw names, honoring the
+    single-quote quoting :func:`q` applies (so a dotted or spaced name inside quotes is not split on
+    its interior ``.``). Returns ``(None, None)`` when a table/column pair can't be recovered."""
+    value = value.strip()
+    parts, buf, in_q, i = [], "", False, 0
+    while i < len(value):
+        ch = value[i]
+        if ch == "'":
+            if in_q and i + 1 < len(value) and value[i + 1] == "'":
+                buf += "''"
+                i += 2
+                continue
+            in_q = not in_q
+            buf += ch
+        elif ch == "." and not in_q:
+            parts.append(buf)
+            buf = ""
+        else:
+            buf += ch
+        i += 1
+    parts.append(buf)
+    if len(parts) < 2:
+        return None, None
+    return _unq_ident(parts[0]), _unq_ident(parts[-1])
+
+
+def parse_relationships_tmdl(text):
+    """Parse a ``relationships.tmdl`` body into an ordered list of relationship dicts.
+
+    Tolerant of the service's own re-serialization (arbitrary indentation, property order, and
+    properties this skill never emits): each block starts at a column-0 ``relationship <name>`` line;
+    every following indented ``key: value`` line is captured in order in ``_props`` (non key/value
+    lines are kept verbatim as ``(None, rawline)``) so :func:`render_relationships_tmdl` can round-trip
+    it without dropping anything. The semantic fields used by the cardinality decision are lifted out
+    alongside: ``name`` (the identifier/GUID), ``from_table``/``from_col``, ``to_table``/``to_col``,
+    ``to_cardinality``, ``cross_filter``, ``is_active``, ``join_on_date_behavior``.
+    """
+    if not text:
+        return []
+    raw_blocks, cur = [], None
+    for line in text.splitlines():
+        if _REL_HEADER.match(line) and not line[:1].isspace():
+            if cur is not None:
+                raw_blocks.append(cur)
+            cur = [line]
+        elif cur is not None:
+            cur.append(line)
+    if cur is not None:
+        raw_blocks.append(cur)
+
+    rels = []
+    for block in raw_blocks:
+        name = _REL_HEADER.match(block[0]).group(1)
+        props = []
+        for line in block[1:]:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            m = _REL_PROP.match(stripped)
+            if m:
+                props.append((m.group(1), m.group(2).strip()))
+            else:
+                props.append((None, stripped))
+        rel = {"name": name, "_props": props, "from_table": None, "from_col": None,
+               "to_table": None, "to_col": None, "to_cardinality": None, "cross_filter": None,
+               "is_active": None, "join_on_date_behavior": None}
+        for key, val in props:
+            if key == "fromColumn":
+                rel["from_table"], rel["from_col"] = _split_col_ref(val)
+            elif key == "toColumn":
+                rel["to_table"], rel["to_col"] = _split_col_ref(val)
+            elif key == "toCardinality":
+                rel["to_cardinality"] = val
+            elif key == "crossFilteringBehavior":
+                rel["cross_filter"] = val
+            elif key == "isActive":
+                rel["is_active"] = (val == "true")
+            elif key == "joinOnDateBehavior":
+                rel["join_on_date_behavior"] = val
+        rels.append(rel)
+    return rels
+
+
+def render_relationships_tmdl(rels):
+    """Re-emit parsed relationship dicts, PRESERVING each ``name`` (GUID) and its ``_props`` order.
+
+    The inverse of :func:`parse_relationships_tmdl`: ``parse -> render`` normalizes only whitespace
+    (tab indentation, single blank line between blocks) -- never the identifiers or the set of
+    properties. Property lines are re-tab-indented; a captured non key/value line is re-emitted
+    verbatim. Returns ``None`` for an empty list (matching ``generate_relationships_tmdl``).
+    """
+    if not rels:
+        return None
+    blocks = []
+    for r in rels:
+        lines = [f"relationship {r['name']}"]
+        for key, val in r.get("_props", []):
+            lines.append(f"\t{val}" if key is None else f"\t{key}: {val}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) + "\n"
+
+
+def upgrade_relationship_cardinality(rels, unique_fn):
+    """Upgrade the cardinality of many-to-many relationships whose TARGET column is unique.
+
+    ``unique_fn(table, column) -> True | False | None`` reports whether ``column`` is a candidate key
+    of ``table`` (``None`` = unknown/could-not-probe). For every relationship currently emitted
+    ``toCardinality: many`` (the marker :func:`generate_relationships_tmdl` writes for an
+    uniqueness-agnostic Tableau object-graph join), the ``toColumn`` side is probed; when -- and only
+    when -- it is definitively unique (``True``) the join is upgraded to the default many-to-one by
+    dropping its ``toCardinality: many`` and companion ``crossFilteringBehavior: oneDirection`` lines.
+
+    Deliberately conservative -- this runs unattended against a live model, and a wrong m:1 on a
+    non-unique target would be rejected on refresh and cancel the whole relationship batch:
+      * only the ``toColumn`` (dimension/lookup) side is tested; the direction is never flipped and
+        one-to-one is never inferred, so an authored join's orientation is preserved;
+      * ``False`` or ``None`` (probe failed, empty table, or genuinely non-unique) keeps m:m;
+      * relationships not currently m:m are passed through untouched.
+    Returns ``(new_rels, changed_names)`` -- a fresh list (inputs untouched) and the identifiers of
+    the relationships that were upgraded.
+    """
+    new_rels, changed = [], []
+    for r in rels:
+        if r.get("to_cardinality") != "many":
+            new_rels.append(r)
+            continue
+        verdict = None
+        try:
+            verdict = unique_fn(r.get("to_table"), r.get("to_col"))
+        except Exception:
+            verdict = None
+        if verdict is not True:
+            new_rels.append(r)
+            continue
+        upgraded = dict(r)
+        upgraded["_props"] = [
+            (k, v) for (k, v) in r.get("_props", [])
+            if not (k == "toCardinality" and v.strip() == "many")
+            and not (k == "crossFilteringBehavior" and v.strip() == "oneDirection")
+        ]
+        upgraded["to_cardinality"] = None
+        upgraded["cross_filter"] = None
+        new_rels.append(upgraded)
+        changed.append(r["name"])
+    return new_rels, changed
+
+
 def generate_pbism():
     return json.dumps({
         "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/semanticModel/definitionProperties/1.0.0/schema.json",
