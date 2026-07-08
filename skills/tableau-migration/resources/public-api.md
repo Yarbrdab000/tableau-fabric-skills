@@ -135,20 +135,33 @@ Delta, building the DirectLake model) stays bridge-side; this plan emits no cred
 ## 3. Deploy + refresh — `deploy_to_fabric.py`
 
 ```python
-from deploy_to_fabric import acquire_token, deploy_model, refresh_dataset, FABRIC_BASE, POWERBI_BASE
+from deploy_to_fabric import acquire_token, deploy_model, refresh_dataset, recalc_dataset, upgrade_cardinality, FABRIC_BASE, POWERBI_BASE
 
 fabric = acquire_token("https://api.fabric.microsoft.com", use_az=True)   # handles az.cmd on Windows
 summary = deploy_model(out["parts"], model_name="Snowflake-Superstore",
                        workspace="<workspace name or GUID>", token=fabric)
 
-# A fresh model has NO credential bound -> the first refresh fails with
+pbi = acquire_token("https://analysis.windows.net/powerbi/api", use_az=True)
+
+# Credential-free ProcessRecalc (type: Calculate) -- processes the self-contained Import calc
+# tables (auto Date table, _Measures) so a composite/DirectQuery model opens without benign
+# "needs refresh" warning triangles. No ProcessData, so it needs no datasource credentials.
+# The CLI runs this automatically at deploy (pass --no-recalc to skip).
+recalc_dataset(summary["workspace_id"], summary["item_id"], pbi)
+
+# A fresh model has NO credential bound -> the first (full) refresh fails with
 # ModelRefreshFailed_CredentialsNotSpecified. That's expected: the user binds the Snowflake
 # credential in Fabric (Settings -> Data source credentials, or Manage connections and gateways).
-pbi = acquire_token("https://analysis.windows.net/powerbi/api", use_az=True)
 status, body = refresh_dataset(summary["workspace_id"], summary["item_id"], pbi)
+
+# Opt-in, run AFTER credentials are bound + a first refresh (needs the model queryable): probe each
+# DirectQuery many-to-many join's target column and upgrade only the unique ones to many-to-one --
+# GUID-preserving + best-effort (a non-unique/unprobeable target stays m:m). The CLI exposes this as
+# --upgrade-cardinality; --finalize runs bind -> recalc -> refresh -> upgrade-cardinality in one switch.
+upgrade_cardinality(summary["workspace_id"], summary["item_id"], fabric, pbi)
 ```
 
-CLI: `py scripts\deploy_to_fabric.py --model-dir <...>.SemanticModel --workspace <ws> --use-az [--refresh]`
+CLI: `py scripts\deploy_to_fabric.py --model-dir <...>.SemanticModel --workspace <ws> --use-az [--refresh] [--no-recalc] [--upgrade-cardinality] [--finalize]`
 (supports `--dry-run`). Token sources: `--token` / `FABRIC_TOKEN` env / `--use-az`.
 
 ### 3a. Deploy the REPORT too (workbook migrations) — `deploy_report` / `deploy_pbip`

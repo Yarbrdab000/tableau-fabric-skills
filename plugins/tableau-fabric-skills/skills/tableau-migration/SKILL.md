@@ -248,6 +248,10 @@ D4 handling: overwrite redeploys same-named models; skip → exclude existing na
 stop → halt on the first conflict and ask. If a model binds an on-prem source, add
 `--gateway-id <id>`.
 
+> Each deploy also runs a **credential-free ProcessRecalc** by default so the model opens without
+> benign "needs refresh" warning triangles (see *After deploy: the credential-binding wall* below).
+> Pass `--no-recalc` to skip it.
+
 **Checkpoint 3:** each deploy completes its LRO without error. Any failure → STOP, do not continue.
 If D3=B (Fabric only), remove `.\out` after a clean deploy; if D3=A, keep it.
 
@@ -362,7 +366,7 @@ The pure-Python cores are offline, deterministic, and stdlib-only (no Spark / pa
 | [`scripts/storage_mode.py`](scripts/storage_mode.py) | Per-datasource storage-mode auto-selection (pure policy). |
 | [`scripts/connection_to_m.py`](scripts/connection_to_m.py) | Parse Tableau `.tds`/`.twb` → descriptor (`parse_tds(text, select=None)`); **`extract_calcs`** (calculated fields → `calcs=`); **`workbook_datasources`** (list selectable datasources, skipping `Parameters` + worksheet stubs); emit M partitions + bind details (`connection_details_for_bind`); M-path field resolver. |
 | [`scripts/assemble_model.py`](scripts/assemble_model.py) | Tier-1 orchestrator: `.tds`/`.twb` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`), base64 deploy payload. **One-call `migrate_datasource(.tdsx/.tds/.twbx/.twb/text, datasource=None)` → `{parts, report, bind}`** (auto-extracts calcs; `datasource=` selects from a multi-datasource workbook; a genuine fallback returns `parts={}` + `report["landing_plan"]` via `directlake_landing_plan`); `list_workbook_datasources`, `write_model_folder` / **`write_local_pbip`** for local output. |
-| [`scripts/deploy_to_fabric.py`](scripts/deploy_to_fabric.py) | Self-contained Fabric REST deploy (stdlib-only urllib): createOrUpdate / updateDefinition of the SemanticModel, 202 LRO polling, optional refresh + gateway bind. **Also deploys the workbook's REPORT** as a Fabric `reports` item — `deploy_pbip` / `deploy_report` + the fail-closed `rebind_report_byConnection` (rewrites `definition.pbir` to a **`byConnection`** `semanticmodelid=<id>` reference, required for REST deploy) via `--pbip` / `--report-dir`. Importable `acquire_token` (handles `az` on Windows) + `refresh_dataset` for post-deploy ops. Lets the skill finish **in Fabric** without depending on a peer skill. |
+| [`scripts/deploy_to_fabric.py`](scripts/deploy_to_fabric.py) | Self-contained Fabric REST deploy (stdlib-only urllib): createOrUpdate / updateDefinition of the SemanticModel, 202 LRO polling, optional refresh + gateway bind. **Also deploys the workbook's REPORT** as a Fabric `reports` item — `deploy_pbip` / `deploy_report` + the fail-closed `rebind_report_byConnection` (rewrites `definition.pbir` to a **`byConnection`** `semanticmodelid=<id>` reference, required for REST deploy) via `--pbip` / `--report-dir`. Importable `acquire_token` (handles `az` on Windows) + `refresh_dataset` / **`recalc_dataset`** (a default, credential-free `type: Calculate` ProcessRecalc that processes the Import calc tables so a composite model opens without benign warning triangles; `--no-recalc` to skip) for post-deploy ops. Lets the skill finish **in Fabric** without depending on a peer skill. |
 
 For exact signatures and a copy-paste **download → migrate → deploy** snippet, see [public-api.md](resources/public-api.md).
 
@@ -634,6 +638,30 @@ human-owned bind is the only thing left. Hand off, then offer to re-trigger the 
 1. Portal route — workspace → semantic model → **Settings → Data source credentials → Edit** (Basic auth + gateway if the source isn't publicly reachable).
 2. **Licensing reality:** editing data-source credentials needs a **Pro / Fabric per-user** license — **F2 (or any capacity) alone is not enough**, and a trial may be expired. If the per-dataset Settings page is gated, try **Manage connections and gateways** (capacity-backed) to create a cloud connection and bind by ID, or have any Pro/Fabric-licensed colleague bind it once (it persists on the connection, not per-user).
 3. Once bound by any route, re-run the refresh via the Power BI REST API (no portal needed for that step).
+
+**Benign "needs refresh" triangles clear automatically.** A migrated model always carries two
+self-contained Import calc tables — the auto `Date` table (`CALENDAR(...)`) and the `_Measures`
+holder — alongside its (often DirectQuery) fact tables. A REST `createOrUpdate` deploy leaves those
+Import tables *unprocessed*, so a composite model can open in the Fabric model view showing benign
+limited-relationship / "column needs to be recalculated or refreshed" warning triangles until its
+first refresh. `deploy_to_fabric.py` prevents this by running a **credential-free ProcessRecalc**
+(`type: Calculate`) right after deploy: it processes only the calculated tables/columns, relationships
+and hierarchies — **no `ProcessData`, so it needs no datasource credentials and never queries the
+DirectQuery source** (verified even against an unreachable source) — mirroring how Power BI Desktop
+recalculates a model when it is opened. This is **on by default**; pass `--no-recalc` to skip it. It
+uses a Power BI token (`--use-az` or `POWERBI_TOKEN`) and is **best-effort** — if no token is available
+the deploy still succeeds and simply logs that recalc was skipped.
+
+**DirectQuery relationship cardinality (opt-in polish).** An authored Tableau object-graph join is
+translated **many-to-many** by design — a wrong many-to-one on a non-unique target is rejected on
+refresh and cancels the whole relationship batch (collateral-dropping the generated `Date` join). Once
+the model is queryable (credentials bound + a first refresh done), `--upgrade-cardinality` reads the
+deployed `relationships.tmdl` back, DAX-probes each many-to-many join's **target** column (`COUNTROWS`
+vs `DISTINCTCOUNT` via `executeQueries`), and upgrades **only** the joins whose target is genuinely
+unique to many-to-one — preserving each relationship's GUID and leaving any non-unique or unprobeable
+join many-to-many. It is opt-in and best-effort (any doubt keeps the safe m:m), and it touches no
+secret. `--finalize` runs the whole secret-free finish chain in one switch: bind (with `--gateway-id`)
+→ recalc → refresh → upgrade-cardinality.
 
 ---
 

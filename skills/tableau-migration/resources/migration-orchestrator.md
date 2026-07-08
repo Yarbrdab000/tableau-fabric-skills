@@ -137,6 +137,20 @@ py -3.11 scripts/deploy_to_fabric.py --model-dir <ModelFolder>.SemanticModel --w
 Inside a **Fabric notebook**, get a token with no `az login`:
 `notebookutils.credentials.getToken("https://api.fabric.microsoft.com")` → pass to `deploy_model(token=...)`.
 
+> **Credential-free ProcessRecalc (default).** After deploy the script runs a `type: Calculate`
+> refresh (`recalc_dataset`) that processes the model's self-contained Import calc tables (the auto
+> `Date` table + `_Measures`) so a composite/DirectQuery model opens without benign "needs refresh"
+> warning triangles. It performs **no `ProcessData`** — no datasource credentials, no query to the
+> DirectQuery source. On by default (best-effort — skipped with a log line if no Power BI token);
+> pass `--no-recalc` to disable. This is distinct from `--refresh` (a full data load that DOES need
+> the bound credential).
+
+> **Cardinality upgrade (opt-in, `--upgrade-cardinality`).** Once the model is queryable (credentials
+> bound + a first refresh), the script reads `relationships.tmdl` back and DAX-probes each DirectQuery
+> many-to-many join's **target** column via `executeQueries`; a genuinely unique target is upgraded to
+> many-to-one, others stay m:m. GUID-preserving and best-effort (any doubt keeps the safe m:m); no
+> secret is touched. `--finalize` chains bind → recalc → refresh → upgrade-cardinality in one switch.
+
 **Report deploy (migrated workbooks).** For a PBIP bundle (model + `.Report`), add the report as a
 Fabric `reports` item — deploy the model first, then rebind the report `byConnection` to it (a `byPath`
 reference does not bind over REST). Same script:

@@ -48,6 +48,7 @@ Usage
         --semantic-model-name Superstore --workspace "WS" --use-az
 """
 import argparse
+import base64
 import json
 import os
 import re
@@ -69,6 +70,11 @@ except ImportError:
         migrate_tds_to_semantic_model,
         write_model_folder,
     )
+
+try:  # package or scripts-on-path
+    from . import tmdl_generate as T
+except ImportError:
+    import tmdl_generate as T
 
 FABRIC_BASE = "https://api.fabric.microsoft.com"
 POWERBI_BASE = "https://api.powerbi.com"
@@ -391,6 +397,24 @@ def refresh_dataset(workspace_id, dataset_id, token, base_url=POWERBI_BASE):
     return status, body
 
 
+def recalc_dataset(workspace_id, dataset_id, token, base_url=POWERBI_BASE):
+    """Trigger a ProcessRecalc-only refresh (Power BI enhanced refresh ``type: Calculate``).
+
+    Recomputes calculated tables, calculated columns, relationships and hierarchies but performs
+    NO ProcessData -- so it needs no datasource credentials and never queries a DirectQuery source
+    (verified: it completes even when the DirectQuery source is unreachable). This processes the
+    self-contained Import calc tables a migrated model always carries -- the auto ``Date`` table
+    (``CALENDAR(...)``) and the ``_Measures`` holder -- which a REST ``createOrUpdate`` deploy
+    otherwise leaves unprocessed. On a composite (DirectQuery + Import) model those unprocessed
+    Import tables surface benign "... needs to be recalculated or refreshed" warning glyphs in the
+    Fabric model view until the first refresh; running this at deploy clears them up front,
+    mirroring how Power BI Desktop recalculates a model when it is opened. Returns ``(status, body)``.
+    """
+    url = f"{base_url}/v1.0/myorg/groups/{workspace_id}/datasets/{dataset_id}/refreshes"
+    status, _h, body = _http("POST", url, token, {"type": "Calculate"})
+    return status, body
+
+
 def bind_to_gateway(workspace_id, dataset_id, gateway_id, datasource_ids, token,
                     base_url=POWERBI_BASE):
     """Bind a dataset to a gateway/connection (Power BI REST). Credentials remain manual."""
@@ -401,6 +425,182 @@ def bind_to_gateway(workspace_id, dataset_id, gateway_id, datasource_ids, token,
         payload["datasourceObjectIds"] = datasource_ids
     status, _h, body = _http("POST", url, token, payload)
     return status, body
+
+
+# == executeQueries + getDefinition + post-deploy cardinality upgrade ========================
+
+def execute_queries(workspace_id, dataset_id, dax, token, base_url=POWERBI_BASE):
+    """Run one DAX query via the Power BI *executeQueries* REST endpoint. Returns ``(status, body)``.
+
+    Used only for tiny scalar probes (a table row count vs. a column distinct count). It needs the
+    model queryable -- credentials bound and, for an Import table, data already loaded; a DirectQuery
+    probe is pushed down to the source, so it likewise needs a bound, reachable connection. Any
+    failure (a 403 when the tenant's *Dataset Execute Queries* REST setting is off, a DAX error on an
+    unbound source, ...) surfaces as a non-200 status the caller treats as "unknown".
+    """
+    url = f"{base_url}/v1.0/myorg/groups/{workspace_id}/datasets/{dataset_id}/executeQueries"
+    payload = {"queries": [{"query": dax}], "serializerSettings": {"includeNulls": True}}
+    status, _h, body = _http("POST", url, token, payload)
+    return status, body
+
+
+def get_model_definition(workspace_id, item_id, token, base_url=FABRIC_BASE, timeout=600):
+    """Read a deployed semantic model's definition back via *getDefinition*.
+
+    Returns a ``{part_path: text}`` dict (InlineBase64 payloads decoded to UTF-8) -- the same shape
+    :func:`read_model_folder` produces, so it round-trips straight back through
+    :func:`build_update_definition_payload`. Polls the LRO on a 202.
+    """
+    url = f"{base_url}/v1/workspaces/{workspace_id}/semanticModels/{item_id}/getDefinition"
+    status, headers, body = _http("POST", url, token)
+    if status == 202:
+        body = await_operation(headers, token, base_url, timeout=timeout)
+    elif status != 200:
+        raise RuntimeError(f"getDefinition failed ({status}): {body}")
+    parts = {}
+    definition = (body or {}).get("definition") if isinstance(body, dict) else None
+    for part in (definition or {}).get("parts", []) or []:
+        path = part.get("path")
+        payload = part.get("payload")
+        if not path or payload is None:
+            continue
+        if part.get("payloadType") == "InlineBase64":
+            try:
+                parts[path] = base64.b64decode(payload).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                continue
+        else:
+            parts[path] = payload
+    return parts
+
+
+def _dax_table_ref(table):
+    return "'" + str(table).replace("'", "''") + "'"
+
+
+def _dax_column_ref(table, col):
+    return _dax_table_ref(table) + "[" + str(col).replace("]", "]]") + "]"
+
+
+def _first_result_row(body):
+    """Pull the single row dict out of an executeQueries response, or ``None``."""
+    if not isinstance(body, dict):
+        return None
+    results = body.get("results") or []
+    if not results or not isinstance(results[0], dict):
+        return None
+    tables = results[0].get("tables") or []
+    if not tables or not isinstance(tables[0], dict):
+        return None
+    rows = tables[0].get("rows") or []
+    if not rows or not isinstance(rows[0], dict):
+        return None
+    return rows[0]
+
+
+def _row_scalar(row, name):
+    """Read a named scalar from an executeQueries row (keys arrive bracketed, e.g. ``[t]``)."""
+    if f"[{name}]" in row:
+        return row[f"[{name}]"]
+    for key, val in row.items():
+        if key.strip("[]") == name:
+            return val
+    return None
+
+
+def _as_number(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def make_dax_count_fn(exec_fn):
+    """Build ``unique_fn(table, col) -> True | False | None`` from ``exec_fn(dax) -> (status, body)``.
+
+    Issues ``EVALUATE ROW("t", COUNTROWS('T'), "d", DISTINCTCOUNT('T'[C]))`` and reports the column a
+    candidate key when the table has rows and every row is distinct (``total > 0 and total ==
+    distinct``). Returns ``None`` -- treated downstream as "leave the relationship many-to-many" -- on
+    any error, a non-200 status, an empty/garbled result, or an empty table.
+    """
+    def unique_fn(table, col):
+        if not table or not col:
+            return None
+        dax = (f'EVALUATE ROW("t", COUNTROWS({_dax_table_ref(table)}), '
+               f'"d", DISTINCTCOUNT({_dax_column_ref(table, col)}))')
+        try:
+            status, body = exec_fn(dax)
+        except Exception:
+            return None
+        if status != 200:
+            return None
+        row = _first_result_row(body)
+        if not row:
+            return None
+        total = _as_number(_row_scalar(row, "t"))
+        distinct = _as_number(_row_scalar(row, "d"))
+        if total is None or distinct is None or total <= 0:
+            return None
+        return total == distinct
+    return unique_fn
+
+
+def upgrade_cardinality(workspace_id, item_id, fabric_token, powerbi_token,
+                        base_url=FABRIC_BASE, timeout=600):
+    """Best-effort post-deploy pass: flip each DirectQuery many-to-many join whose TARGET column is a
+    candidate key to the default many-to-one, in place (getDefinition -> DAX probe ->
+    updateDefinition). Never raises -- logs ``[cardinality]`` lines and returns; safe to re-run.
+
+    Needs the model queryable (credentials bound + data present), so it runs LAST in the post-deploy
+    chain. Every relationship whose target is not *provably* unique is left many-to-many, and each
+    relationship's identifier (GUID) and other properties are preserved.
+    """
+    try:
+        parts = get_model_definition(workspace_id, item_id, fabric_token, base_url, timeout)
+    except Exception as exc:
+        print(f"[cardinality] skipped -- could not read the model definition: {exc}")
+        return
+    rel_path = next((p for p in parts if p.endswith("relationships.tmdl")), None)
+    if not rel_path or not parts.get(rel_path):
+        print("[cardinality] no relationships.tmdl in the model -- nothing to upgrade.")
+        return
+    rels = T.parse_relationships_tmdl(parts[rel_path])
+    if not any(r.get("to_cardinality") == "many" for r in rels):
+        print("[cardinality] no many-to-many relationships -- nothing to probe.")
+        return
+
+    unique_fn = make_dax_count_fn(
+        lambda dax: execute_queries(workspace_id, item_id, dax, powerbi_token))
+
+    def probe(table, col):
+        verdict = unique_fn(table, col)
+        label = {True: "unique -> many-to-one", False: "not unique -> keep m:m",
+                 None: "unknown -> keep m:m"}[verdict]
+        print(f"[cardinality] probe {table}[{col}]: {label}")
+        return verdict
+
+    new_rels, changed = T.upgrade_relationship_cardinality(rels, probe)
+    if not changed:
+        print("[cardinality] no relationships upgraded; model unchanged.")
+        return
+    parts[rel_path] = T.render_relationships_tmdl(new_rels)
+    url = f"{base_url}/v1/workspaces/{workspace_id}/semanticModels/{item_id}/updateDefinition"
+    status, headers, body = _http("POST", url, fabric_token, build_update_definition_payload(parts))
+    if status == 202:
+        try:
+            await_operation(headers, fabric_token, base_url, timeout=timeout)
+        except Exception as exc:
+            print(f"[cardinality] update submitted but did not confirm: {exc}")
+            return
+    elif status not in (200, 201):
+        print(f"[cardinality] update FAILED (HTTP {status}): {body}")
+        return
+    print(f"[cardinality] upgraded {len(changed)} relationship(s) to many-to-one "
+          f"({', '.join(changed)}).")
 
 
 # == PBIP bundle deploy (model then report, one workspace) ===================================
@@ -526,9 +726,19 @@ def _dry_run(parts, model_name, args):
           f"POST {args.base_url}/v1/workspaces/<workspace-id>/semanticModels")
     print("  update endpoint  : "
           f"POST {args.base_url}/v1/workspaces/<workspace-id>/semanticModels/<id>/updateDefinition")
+    if not getattr(args, "no_recalc", False):
+        print("  recalc endpoint  : "
+              "POST {pbi}/v1.0/myorg/groups/<ws>/datasets/<id>/refreshes  (type=Calculate, "
+              "credential-free -- clears benign triangles)".format(pbi=POWERBI_BASE))
     if args.refresh:
         print("  refresh endpoint : "
               "POST {pbi}/v1.0/myorg/groups/<ws>/datasets/<id>/refreshes".format(pbi=POWERBI_BASE))
+    if getattr(args, "upgrade_cardinality", False):
+        print("  cardinality      : "
+              "GET  {fab}/v1/workspaces/<ws>/semanticModels/<id>/getDefinition, probe each m:m "
+              "target via POST {pbi}/v1.0/myorg/groups/<ws>/datasets/<id>/executeQueries, then "
+              "updateDefinition relationships.tmdl for any unique target (else keep m:m)".format(
+                  fab=args.base_url, pbi=POWERBI_BASE))
 
 
 def _dry_run_report(report_dir, report_name, args, model_id="<deployed-model-id>"):
@@ -549,22 +759,56 @@ def _dry_run_report(report_dir, report_name, args, model_id="<deployed-model-id>
 
 
 def _apply_model_post_ops(args, summary):
-    """Optional gateway bind + refresh for a deployed MODEL (Power BI REST). Credentials stay manual."""
+    """Optional gateway bind + a default credential-free ProcessRecalc + optional full refresh for a
+    deployed MODEL (Power BI REST). Data credentials stay a manual step."""
+    item_id = summary.get("item_id")
     if args.gateway_id:
         pbi = acquire_token(POWERBI_RESOURCE, args.powerbi_token, "POWERBI_TOKEN", args.use_az)
-        b_status, b_body = bind_to_gateway(summary["workspace_id"], summary["item_id"],
+        b_status, b_body = bind_to_gateway(summary["workspace_id"], item_id,
                                            args.gateway_id, args.datasource_id, pbi)
         print(f"[bind] gateway {args.gateway_id} -> HTTP {b_status} {b_body or ''}".rstrip())
 
+    # Default, best-effort: process the self-contained Import calc tables (the auto Date table and
+    # the _Measures holder) so a freshly REST-deployed composite/DirectQuery model does not open
+    # with benign "needs refresh" warning triangles. ProcessRecalc needs no datasource credentials,
+    # so this runs even before the connection is bound; a missing Power BI token is non-fatal.
+    if not getattr(args, "no_recalc", False) and item_id:
+        try:
+            pbi = acquire_token(POWERBI_RESOURCE, args.powerbi_token, "POWERBI_TOKEN", args.use_az)
+        except RuntimeError:
+            pbi = None
+            print("[recalc] skipped -- no Power BI token (pass --use-az or set POWERBI_TOKEN to "
+                  "auto-process calc tables and clear benign warning triangles).")
+        if pbi:
+            c_status, c_body = recalc_dataset(summary["workspace_id"], item_id, pbi)
+            if c_status in (200, 202):
+                print(f"[recalc] ProcessRecalc started (HTTP {c_status}) -- processes Import calc "
+                      "tables (Date table, _Measures); no credentials required.")
+            else:
+                print(f"[recalc] non-fatal (HTTP {c_status}): {c_body}")
+
     if args.refresh:
         pbi = acquire_token(POWERBI_RESOURCE, args.powerbi_token, "POWERBI_TOKEN", args.use_az)
-        r_status, r_body = refresh_dataset(summary["workspace_id"], summary["item_id"], pbi)
+        r_status, r_body = refresh_dataset(summary["workspace_id"], item_id, pbi)
         if r_status in (200, 202):
             print(f"[refresh] started (HTTP {r_status})")
         else:
             print(f"[refresh] FAILED (HTTP {r_status}): {r_body}")
             print("  credentials/gateway are a manual step -- set the connection in Fabric, then "
                   "re-run with --refresh.")
+
+    # Opt-in, runs LAST (needs the model queryable): probe each DirectQuery many-to-many join's
+    # target column and upgrade only the ones with a unique target to many-to-one. Best-effort --
+    # a missing token or any probe failure just leaves the relationships many-to-many.
+    if getattr(args, "upgrade_cardinality", False) and item_id:
+        try:
+            fab = acquire_token(FABRIC_RESOURCE, args.token, "FABRIC_TOKEN", args.use_az)
+            pbi = acquire_token(POWERBI_RESOURCE, args.powerbi_token, "POWERBI_TOKEN", args.use_az)
+        except RuntimeError as exc:
+            print(f"[cardinality] skipped -- {exc}")
+        else:
+            upgrade_cardinality(summary["workspace_id"], item_id, fab, pbi,
+                                base_url=args.base_url, timeout=args.timeout)
 
 
 def _print_deploy_line(kind, name, summary):
@@ -651,6 +895,18 @@ def main(argv=None):
     ap.add_argument("--use-az", action="store_true",
                     help="acquire tokens via 'az account get-access-token'")
     ap.add_argument("--refresh", action="store_true", help="trigger a refresh after deploy")
+    ap.add_argument("--no-recalc", action="store_true",
+                    help="skip the default credential-free ProcessRecalc (type=Calculate) that "
+                         "processes Import calc tables (Date table, _Measures) at deploy so a "
+                         "composite/DirectQuery model opens without benign warning triangles")
+    ap.add_argument("--upgrade-cardinality", action="store_true",
+                    help="post-deploy: probe each DirectQuery many-to-many relationship's target "
+                         "column and, when it is unique, upgrade that one join to many-to-one -- needs "
+                         "the model queryable, so run it after credentials are bound and an initial "
+                         "refresh (any non-unique/unprobeable target is safely left many-to-many)")
+    ap.add_argument("--finalize", action="store_true",
+                    help="run the whole secret-free finish chain: bind (with --gateway-id) -> recalc "
+                         "-> refresh -> upgrade-cardinality (implies --refresh --upgrade-cardinality)")
     ap.add_argument("--gateway-id", help="bind the dataset to this gateway/connection after deploy")
     ap.add_argument("--datasource-id", action="append", default=[],
                     help="datasource object id for the gateway bind (repeatable)")
@@ -659,6 +915,9 @@ def main(argv=None):
     ap.add_argument("--save-model-dir", help="also write the built model here (with --tds)")
     ap.add_argument("--dry-run", action="store_true", help="print the plan without calling Fabric")
     args = ap.parse_args(argv)
+    if args.finalize:
+        args.refresh = True
+        args.upgrade_cardinality = True
 
     if args.pbip:
         return _run_pbip(args)

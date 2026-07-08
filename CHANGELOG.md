@@ -13,6 +13,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **deployed models now open without benign "needs refresh" warning
+  triangles.** `deploy_to_fabric.py` runs a credential-free ProcessRecalc (Power BI enhanced refresh
+  `type: Calculate`) automatically after every model deploy, exposed as the importable
+  `recalc_dataset(workspace_id, dataset_id, token)`. A migrated model always carries two
+  self-contained Import calc tables — the auto `Date` table (`CALENDAR(...)`) and the `_Measures`
+  holder — which a REST `createOrUpdate` deploy leaves *unprocessed*, so a composite (DirectQuery +
+  Import) model surfaces benign limited-relationship / "column needs to be recalculated or refreshed"
+  triangles in the Fabric model view until its first refresh. ProcessRecalc processes only calculated
+  tables/columns, relationships and hierarchies — **no `ProcessData`, so it needs no datasource
+  credentials and never queries the DirectQuery source** (verified against an unreachable source) —
+  mirroring how Power BI Desktop recalculates a model when opened. On by default and **best-effort**
+  (a missing Power BI token skips it with a log line and never fails the deploy); pass `--no-recalc`
+  to disable. Distinct from `--refresh`, which is a full data load that DOES need the bound
+  credential. Additive: new function + CLI flag + dry-run line; no existing report keys changed.
+- **tableau-migration:** **opt-in post-deploy relationship-cardinality upgrade** so a migrated
+  composite model ships with correct join cardinality instead of everything conservatively
+  many-to-many. `deploy_to_fabric.py` gains `--upgrade-cardinality`: once the model is queryable
+  (credentials bound + a first refresh), it reads the deployed `relationships.tmdl` back
+  (`get_model_definition`), DAX-probes each DirectQuery `many_to_many` join's **target** column
+  (`COUNTROWS` vs `DISTINCTCOUNT` via the new `execute_queries` / `make_dax_count_fn`), and upgrades
+  **only** the joins whose target is genuinely unique to the default many-to-one — preserving each
+  relationship's GUID and leaving any non-unique, empty, or unprobeable join many-to-many. Exposed as
+  the importable `upgrade_cardinality(...)` plus the pure, offline-testable TMDL helpers
+  `parse_relationships_tmdl` / `render_relationships_tmdl` / `upgrade_relationship_cardinality` in
+  `tmdl_generate.py`. Opt-in, best-effort (any doubt keeps the safe m:m), and **secret-free** — it
+  binds only by ID and never reads or writes a credential. A new umbrella flag `--finalize` runs the
+  whole secret-free finish chain in one switch: bind (with `--gateway-id`) → recalc → refresh →
+  upgrade-cardinality. Additive: new functions + two CLI flags + dry-run lines; no existing behavior
+  or report keys changed.
 - **tableau-migration:** **percent-family Visual Calculations now carry a Power BI `format`
   string** so a view-only quick table calc that Tableau renders as a percentage (Percent of Total,
   Percent Difference, Year-over-Year, YTD Growth, Compound Growth, Percentile) shows as `0.00%` in
