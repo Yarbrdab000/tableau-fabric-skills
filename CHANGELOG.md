@@ -821,8 +821,20 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
-- **tableau-migration:** **migrated Import / DirectQuery models no longer fail at query time in the
-  Fabric Service on any column whose source name contains a space or special character** (e.g.
+- **tableau-migration:** **calculated fields containing comments now translate to DAX instead of
+  silently falling back to a stub.** Tableau's calc editor allows `//` line comments and
+  `/* ... */` block comments, which are documentation only and never affect the computed value. The
+  calc tokenizer (`calc_to_dax.py` `_tokenize`) had no comment handling, so it read the first `/` as
+  a division operator and the parse failed — every commented calculation false-stubbed with reason
+  *"expected a value"* (on real workbooks this dropped the large majority of calcs, since authors
+  routinely annotate them). `_tokenize` now strips `//` (to end of line) and `/* ... */` (across
+  newlines) comments, placed **after** the string-literal scan (so a `//` or `/*` inside a quoted
+  string is preserved as data) and **before** the operator scan (so `/` is never first consumed as
+  division). A comment-only formula fails closed as an empty formula, and an unterminated `/*` block
+  fails closed with a clear reason — both honest stubs, matching Tableau's own rejection. Division,
+  string literals, and every previously-translating formula tokenize byte-identically (the new
+  branches only fire on `//` / `/*`). Verified with comment variants (leading / trailing / mid-
+  expression / multi-line) each translating to exactly the same DAX as their comment-free form.
   `Expression.Error: The name 't0.Order_Date' doesn't exist in the current context`, which also left
   relationships on those columns showing red validation triangles until manually toggled). The M
   partition used to append a `Table.RenameColumns` step that renamed the raw source headers

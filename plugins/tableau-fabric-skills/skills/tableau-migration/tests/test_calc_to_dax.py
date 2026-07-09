@@ -17,6 +17,8 @@ from calc_to_dax import (
     translate_tableau_calc_to_column_dax,
     validate_dax,
     date_attribute_binding,
+    _tokenize,
+    _CalcError,
 )
 
 # Shared resolver: caption -> (table_display_name, clean_col, tmdl_type).
@@ -357,6 +359,62 @@ def test_returns_reason_and_tables_used():
     assert dax is not None
     assert reason == "ok"
     assert tables == {"Orders"}
+
+
+# --- BUG-001: calc comments (// line, /* ... */ block) must be stripped, not tokenized. ---
+# Tableau's calc editor allows ``//`` line comments and ``/* ... */`` block comments; they are
+# documentation only and never change the computed value. The tokenizer previously read ``/`` as
+# division, so ANY commented calc false-stubbed (real workbooks lost ~14/15 calcs to this). Each
+# commented form must translate to EXACTLY the same DAX as its comment-free equivalent.
+COMMENT_EQUIVALENTS = [
+    ("SUM([Sales]) // grand total", "SUM([Sales])"),                       # trailing line comment
+    ("// leading note\nSUM([Sales])", "SUM([Sales])"),                     # leading line comment
+    ("/* block */ SUM([Sales])", "SUM([Sales])"),                         # leading block comment
+    ("SUM([Sales]) /* mid */ + SUM([Profit])", "SUM([Sales]) + SUM([Profit])"),   # mid-expression block
+    ("SUM([Sales])\n/* multi\n line\n note */\n + SUM([Profit])",         # block spanning newlines
+     "SUM([Sales]) + SUM([Profit])"),
+    ("SUM([Profit]) / SUM([Sales]) // ratio", "SUM([Profit]) / SUM([Sales])"),    # '/' division still works
+    ('SUM(IF [Region] = "East" THEN [Sales] END) // filtered',            # comment after a string literal
+     'SUM(IF [Region] = "East" THEN [Sales] END)'),
+]
+
+
+@pytest.mark.parametrize("commented,plain", COMMENT_EQUIVALENTS, ids=[repr(c[0]) for c in COMMENT_EQUIVALENTS])
+def test_comments_are_stripped_and_translate_identically(commented, plain):
+    assert _tx(commented) is not None
+    assert _tx(commented) == _tx(plain)
+
+
+def test_comment_markers_inside_string_literals_are_preserved():
+    # A // or /* inside a quoted string is data, not a comment (comment scan runs AFTER string scan).
+    assert _tokenize('"a // b"') == [("str", "a // b")]
+    assert _tokenize("'x /* y */ z'") == [("str", "x /* y */ z")]
+    # ...and end-to-end the literal survives verbatim into the emitted DAX.
+    dax = _tx('SUM(IF [Region] = "a // b" THEN [Sales] END)')
+    assert dax is not None
+    assert '"a // b"' in dax
+
+
+def test_comment_only_formula_fails_closed():
+    # A calc that is nothing but a comment has no value -> honest stub.
+    dax, reason, _tables = translate_tableau_calc_to_dax("// just a note", _resolver)
+    assert dax is None
+    assert reason == "empty formula"
+
+
+def test_unterminated_block_comment_fails_closed():
+    dax, reason, _tables = translate_tableau_calc_to_dax("SUM([Sales]) /* oops", _resolver)
+    assert dax is None
+    assert "block comment" in reason
+
+
+def test_tokenizer_strips_comments_to_identical_tokens():
+    # Direct tokenizer contract: comment forms yield the same token stream as the clean form.
+    base = _tokenize("SUM([Sales])")
+    assert _tokenize("SUM([Sales]) // note") == base
+    assert _tokenize("/* c */ SUM([Sales])") == base
+    assert _tokenize("SUM([Sales]) /* c */") == base
+    assert _tokenize("// only a comment") == []
 
 
 def test_cross_table_reason_is_explicit():

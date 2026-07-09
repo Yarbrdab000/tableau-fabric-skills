@@ -363,6 +363,22 @@ def _tokenize(formula):
             toks.append(("str", inner))
             i = j + 1
             continue
+        # Comments (Tableau): '//' to end of line, '/* ... */' block (may span newlines). They are
+        # documentation only and never affect the result, so they are stripped (emit no tokens).
+        # Placed AFTER the string-literal branch so a // or /* inside a quoted string is preserved,
+        # and BEFORE the operator scan so '/' is not first tokenized as division.
+        if c == "/" and i + 1 < n and s[i + 1] == "/":
+            j = i + 2
+            while j < n and s[j] not in "\r\n":
+                j += 1
+            i = j
+            continue
+        if c == "/" and i + 1 < n and s[i + 1] == "*":
+            j = s.find("*/", i + 2)
+            if j == -1:
+                raise _CalcError("unterminated block comment")
+            i = j + 2
+            continue
         two = s[i:i + 2]
         if two in _CMP_2:
             toks.append(("cmp", _CMP_2[two]))
