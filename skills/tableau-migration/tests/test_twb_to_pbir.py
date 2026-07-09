@@ -17,7 +17,9 @@ from twb_to_pbir import (
     SCHEMA_VISUAL,
     SCHEMA_VISUAL_FP,
     SCHEMA_VISUAL_SM,
+    _apply_override,
     _drop_resolved_flag_warnings,
+    _field_expression,
     _flag_filter_container,
     _norm_param_key,
     _reconcile_caption_fallback,
@@ -1120,6 +1122,62 @@ def test_reconcile_caption_fallback_drops_model_confirmed_keeps_unverified():
     assert any("something unrelated" in r for r in reasons)
     # the internal marker never leaks into the surfaced warnings
     assert all("caption_fallback" not in w for w in out)
+
+
+# -- _apply_override: rebind a mis-roled ref to its real column (never a dangling measure) ------
+def _ir_field(caption, binding, *, entity="sqlproxy", prop=None, aggregation=None):
+    """Minimal IR field dict for the ``_apply_override`` / ``_field_expression`` seam."""
+    return {"caption": caption, "entity": entity, "property": prop or caption,
+            "binding": binding, "aggregation": aggregation}
+
+
+def test_apply_override_rebinds_measure_kind_ref_to_the_resolved_column():
+    # a ``measure``-kind pill whose caption the (columns-only) field_map resolves to a real model
+    # column must be rebound TO that column -- a ``{"Measure"}`` expr pointing at a column is invalid
+    fld = _ir_field("Region", "measure")
+    fm = {"Region": {"entity": "Orders", "property": "Region"}}  # real producer: no "binding" key
+    entity, prop, binding = _apply_override(fld, "Orders", fm)
+    assert (entity, prop, binding) == ("Orders", "Region", "column")
+    expr, qref, _ = _field_expression(fld, "Orders", fm)
+    assert "Column" in expr and "Measure" not in expr
+    assert qref == "Orders.Region"
+
+
+def test_apply_override_keeps_aggregation_pill_aggregation():
+    # a SUM([Sales]) pill in the field_map keeps its aggregation (entity corrected only) -- the
+    # documented invariant the change must not disturb
+    fld = _ir_field("Sales", "aggregation", aggregation="Sum")
+    fm = {"Sales": {"entity": "Orders", "property": "Sales"}}
+    entity, prop, binding = _apply_override(fld, "Orders", fm)
+    assert (entity, prop, binding) == ("Orders", "Sales", "aggregation")
+    expr, _, _ = _field_expression(fld, "Orders", fm)
+    assert "Aggregation" in expr
+
+
+def test_apply_override_keeps_plain_column_pill_column():
+    fld = _ir_field("Category", "column")
+    fm = {"Category": {"entity": "Orders", "property": "Category"}}
+    _, _, binding = _apply_override(fld, "Orders", fm)
+    assert binding == "column"
+
+
+def test_apply_override_measure_ref_not_in_field_map_stays_measure():
+    # the zero-regression guard: a genuine _Measures ref (row-count / measure_binding) whose caption
+    # is NOT in the columns-only field_map is untouched -- it must still emit a {"Measure"} expr
+    fld = _ir_field("count orders", "measure", entity="_Measures")
+    fm = {"Sales": {"entity": "Orders", "property": "Sales"}}
+    entity, prop, binding = _apply_override(fld, "Orders", fm)
+    assert (entity, prop, binding) == ("_Measures", "count orders", "measure")
+    expr, _, _ = _field_expression(fld, "Orders", fm)
+    assert "Measure" in expr and "Column" not in expr
+
+
+def test_apply_override_explicit_field_map_binding_wins():
+    # a producer that DOES stamp an explicit binding is honoured verbatim (guards the ``or`` path)
+    fld = _ir_field("Region", "measure")
+    fm = {"Region": {"entity": "Orders", "property": "Region", "binding": "column"}}
+    _, _, binding = _apply_override(fld, "Orders", fm)
+    assert binding == "column"
 
 
 def test_caption_fallback_warning_cleared_when_field_map_confirms_binding():

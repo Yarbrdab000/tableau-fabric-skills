@@ -842,8 +842,18 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
-- **tableau-migration:** **KPI cards that count a joined table no longer come up blank when Tableau
-  stamped a join-order prefix on the table name.** When a physical table is added to a Tableau join it
+- **tableau-migration:** **a report visual whose field reference is mis-roled as a measure now rebinds to
+  its real model column instead of emitting an invalid measure reference.** When the model build hands the
+  viz re-run its authoritative naming map (`_field_map_from_model`, which only ever carries model **columns**),
+  `twb_to_pbir._apply_override` rebinds a pill's entity/property to the named column but previously kept the
+  pill's original `binding` — so a `measure`-kind pill whose caption resolved to a column emitted a
+  `{"Measure"}` expression pointing at a column (invalid PBIR). The override now flips a raw `measure`-kind
+  ref to `column` when the columns-only field map resolves its caption, while an `aggregation` pill keeps its
+  aggregation (`SUM` stays `SUM`) and a plain `column` is unchanged; an explicit override `binding` still
+  wins. On today's pipeline the collision is unreachable (measure calcs are rebound via the token-keyed
+  `measure_binding`, never the column field map), so this is a defensive invariant that also hardens the seam
+  a measure-role calc routed to column mode would otherwise hit — warn-never-wrong, zero behavior change on
+  the existing paths. *(AAR #1 Issue I)* When a physical table is added to a Tableau join it
   surfaces as e.g. `1. LoginHistory`, while the migrated model declares the clean table (`LoginHistory`)
   and keys its `COUNTROWS` measure clean. The implicit object-id `COUNT(*)` binding matched table names
   exactly, so the prefixed name missed and the card silently dropped its value. `twb_to_pbir`'s row-count

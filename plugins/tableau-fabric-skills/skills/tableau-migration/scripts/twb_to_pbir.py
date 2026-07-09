@@ -2979,7 +2979,13 @@ def _apply_override(field, model_table, field_map):
         ov = field_map[field["caption"]]
         entity = ov.get("entity", entity)
         prop = ov.get("property", prop)
-        binding = ov.get("binding", binding)
+        # ``field_map`` targets are always model COLUMNS (measure calcs are rebound via
+        # ``measure_binding``, never here). An explicit override ``binding`` still wins; otherwise a
+        # raw ``measure``-kind ref whose caption resolves to a column is rebound TO that column --
+        # a ``{"Measure"}`` expression pointing at a column is invalid PBIR -- while an
+        # ``aggregation`` pill keeps its aggregation (``SUM`` stays) and a ``column`` stays a column.
+        # So a mis-roled ref lands as its real column instead of a dangling measure reference.
+        binding = ov.get("binding") or ("column" if binding == "measure" else binding)
     elif model_table and binding != "measure":
         entity = model_table
     return entity, prop, binding
