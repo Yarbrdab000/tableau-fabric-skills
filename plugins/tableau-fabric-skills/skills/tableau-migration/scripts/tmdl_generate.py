@@ -215,17 +215,41 @@ def generate_column_tmdl(col_name, tmdl_type, summarize, is_hidden, format_strin
     lines.append("\t\tannotation SummarizationSetBy = Automatic")
     return "\n" + "\n".join(lines) + "\n"
 
-def generate_table_tmdl(table_display_name, delta_table_name, columns_tmdl, expression_source):
+def generate_table_tmdl(table_display_name, delta_table_name, columns_tmdl, expression_source,
+                        schema_name="dbo"):
+    """Emit a DirectLake table entity bound to an already-landed Delta table.
+
+    ``schema_name`` is the TARGET LAKEHOUSE schema the Delta table lives under (NOT the
+    Tableau source-system schema). It governs how the entity is addressed:
+
+    * a non-empty schema (default ``"dbo"``) -- a SCHEMA-ENABLED lakehouse / warehouse: the
+      source lineage and the partition source are schema-qualified
+      (``sourceLineageTag: [<schema>].[<delta>]`` + ``schemaName: <schema>``). The ``"dbo"``
+      default keeps every existing caller byte-for-byte identical, and a custom schema
+      (e.g. a named schema on a schema-enabled lakehouse) is emitted verbatim.
+    * ``None`` / ``""`` -- a NON-SCHEMA (classic) lakehouse whose tables are flat: the
+      ``schemaName`` line is OMITTED and the lineage tag is unqualified
+      (``sourceLineageTag: [<delta>]``). Emitting ``schemaName: dbo`` against such a
+      lakehouse silently breaks the DirectLake binding (AAR#3 G3 -- the entity resolves to a
+      ``dbo``-qualified name that does not exist), so the qualifier must be elided.
+    """
+    schema = (schema_name or "").strip()
+    if schema:
+        source_lineage = f"[{schema}].[{delta_table_name}]"
+        schema_line = f"\t\t\tschemaName: {schema}\n"
+    else:
+        source_lineage = f"[{delta_table_name}]"
+        schema_line = ""
     return (
         f"table {q(table_display_name)}\n"
         f"\tlineageTag: {uuid.uuid4()}\n"
-        f"\tsourceLineageTag: [dbo].[{delta_table_name}]\n"
+        f"\tsourceLineageTag: {source_lineage}\n"
         f"{columns_tmdl}\n"
         f"\tpartition {delta_table_name} = entity\n"
         f"\t\tmode: directLake\n"
         f"\t\tsource\n"
         f"\t\t\tentityName: {delta_table_name}\n"
-        f"\t\t\tschemaName: dbo\n"
+        f"{schema_line}"
         f"\t\t\texpressionSource: {q(expression_source)}\n\n"
     )
 

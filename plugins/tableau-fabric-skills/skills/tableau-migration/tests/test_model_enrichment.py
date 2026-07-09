@@ -308,6 +308,31 @@ def test_directlake_model_accepts_resolved_enrichment():
     assert "ref role 'DL Role'" in parts["definition/model.tmdl"]
 
 
+def test_directlake_model_threads_non_schema_lakehouse():
+    # schema_name=None flows to every table entity: no 'dbo' qualifier anywhere, so a
+    # non-schema (classic) lakehouse binds instead of silently failing (AAR#3 G3).
+    columns = T.generate_column_tmdl("Region", "string", "none", False)
+    out = assemble_directlake_model(
+        model_name="DL", expression_name="DL", directlake_url="https://x/y",
+        tables=[("Sales", "sales_delta", columns)], measures_tmdl="",
+        schema_name=None)
+    tbl = out["parts"]["definition/tables/Sales.tmdl"]
+    assert "sourceLineageTag: [sales_delta]" in tbl
+    assert "schemaName" not in tbl
+    assert "[dbo]" not in tbl
+
+
+def test_directlake_model_default_schema_is_dbo_backcompat():
+    # Default keeps the schema-enabled 'dbo' addressing (no caller change -> no output change).
+    columns = T.generate_column_tmdl("Region", "string", "none", False)
+    out = assemble_directlake_model(
+        model_name="DL", expression_name="DL", directlake_url="https://x/y",
+        tables=[("Sales", "sales_delta", columns)], measures_tmdl="")
+    tbl = out["parts"]["definition/tables/Sales.tmdl"]
+    assert "sourceLineageTag: [dbo].[sales_delta]" in tbl
+    assert "schemaName: dbo" in tbl
+
+
 # -- TMDL emission units -------------------------------------------------------
 def test_generate_hierarchy_tmdl_orders_levels():
     block = T.generate_hierarchy_tmdl("Geo", [("Country", "Country"), ("City", "City")])

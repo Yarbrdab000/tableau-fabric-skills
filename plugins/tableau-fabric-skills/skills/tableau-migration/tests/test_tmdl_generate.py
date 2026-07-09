@@ -11,6 +11,7 @@ from tmdl_generate import (
     generate_calc_column_tmdl,
     generate_measure_tmdl,
     generate_relationships_tmdl,
+    generate_table_tmdl,
     infer_relationships,
     parse_relationships_tmdl,
     q,
@@ -330,6 +331,54 @@ def test_assisted_calc_column_name_with_bang_prefix_is_quoted():
     )
     assert "column '!Lowest selling city' = 'Orders'[City]" in c
     assert "annotation TranslatedBy = assisted-unverified" in c
+
+
+# -- generate_table_tmdl: DirectLake schema-aware addressing (AAR#3 G3) --------
+def _dl_table(**kw):
+    cols = "\n\tcolumn Sales\n\t\tdataType: double\n"
+    return generate_table_tmdl("Orders", "orders_delta", cols, "DirectLake", **kw)
+
+
+def test_generate_table_tmdl_default_schema_is_dbo():
+    # Default (no schema_name) is the historical schema-enabled 'dbo' form -- back-compat.
+    out = _dl_table()
+    assert "sourceLineageTag: [dbo].[orders_delta]" in out
+    assert "\t\t\tschemaName: dbo\n" in out
+    assert "entityName: orders_delta" in out
+    assert "mode: directLake" in out
+
+
+def test_generate_table_tmdl_custom_schema_enabled():
+    # A named schema on a schema-enabled lakehouse is emitted verbatim on the lineage tag
+    # AND the partition source; the 'dbo' hardcode is gone.
+    out = _dl_table(schema_name="sales")
+    assert "sourceLineageTag: [sales].[orders_delta]" in out
+    assert "\t\t\tschemaName: sales\n" in out
+    assert "[dbo]" not in out
+
+
+def test_generate_table_tmdl_non_schema_lakehouse_omits_schema():
+    # A non-schema (classic) lakehouse: NO schemaName line + unqualified lineage tag. A
+    # hardcoded 'dbo' would resolve the entity to a name that does not exist and silently
+    # break the DirectLake binding (AAR#3 G3).
+    for empty in (None, "", "  "):
+        out = _dl_table(schema_name=empty)
+        assert "sourceLineageTag: [orders_delta]" in out
+        assert "schemaName" not in out
+        assert "[dbo]" not in out
+        assert "entityName: orders_delta" in out
+        assert "expressionSource: DirectLake" in out
+        assert "mode: directLake" in out
+
+
+def test_generate_table_tmdl_partition_source_order_preserved():
+    # entityName -> (schemaName?) -> expressionSource ordering holds in both modes.
+    schema_out = _dl_table(schema_name="dbo")
+    assert (schema_out.index("entityName:")
+            < schema_out.index("schemaName:")
+            < schema_out.index("expressionSource:"))
+    flat_out = _dl_table(schema_name=None)
+    assert flat_out.index("entityName:") < flat_out.index("expressionSource:")
 
 
 # -- enrich_table_tmdl: calc-column injection ---------------------------------

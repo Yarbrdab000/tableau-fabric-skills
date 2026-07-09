@@ -842,7 +842,15 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
-- **tableau-migration:** **a report visual whose field reference is mis-roled as a measure now rebinds to
+- **tableau-migration:** **the DirectLake table emitter no longer hardcodes `schemaName: dbo`, so a model
+  landed to a non-`dbo` or non-schema lakehouse binds instead of silently failing.** `generate_table_tmdl`
+  (and `assemble_directlake_model`, which threads it) gained an additive `schema_name` parameter that
+  governs how the entity is addressed: a non-empty schema (default `"dbo"` → byte-for-byte identical to
+  prior output) emits a schema-qualified `sourceLineageTag: [<schema>].[<delta>]` + `schemaName: <schema>`
+  (a custom schema on a schema-enabled lakehouse is now honored verbatim), while `None`/`""` (a non-schema
+  "classic" lakehouse) omits the `schemaName` line and emits an unqualified `sourceLineageTag: [<delta>]`.
+  Previously the hardcoded `dbo` resolved the entity to a name that doesn't exist on such a lakehouse and
+  silently broke the DirectLake binding. Existing callers are unchanged (the `dbo` default). *(AAR #3 G3)*
   its real model column instead of emitting an invalid measure reference.** When the model build hands the
   viz re-run its authoritative naming map (`_field_map_from_model`, which only ever carries model **columns**),
   `twb_to_pbir._apply_override` rebinds a pill's entity/property to the named column but previously kept the

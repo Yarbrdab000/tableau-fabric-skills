@@ -2123,7 +2123,7 @@ def assemble_local_import_model(descriptor, *, model_name, table_csv_paths, calc
 def assemble_directlake_model(*, model_name, tables, measures_tmdl, expression_name,
                               directlake_url, relationships_tmdl=None,
                               hierarchies=None, display_folders=None, rls_roles=None,
-                              field_parameters=None):
+                              field_parameters=None, schema_name="dbo"):
     """Assemble a DirectLake model from ALREADY-LANDED Delta tables (the fallback path).
 
     ``tables`` is a list of ``(display_name, delta_table_name, columns_tmdl)`` tuples (the
@@ -2140,12 +2140,17 @@ def assemble_directlake_model(*, model_name, tables, measures_tmdl, expression_n
     "table_names": [...]}``) the caller built from its swap calcs; its tables are injected as
     additive scaffolding (before ``_Measures``, never in relationships). The caller is responsible
     for excluding the consumed swap calcs from ``measures_tmdl``.
+
+    ``schema_name`` is the TARGET LAKEHOUSE schema every landed table lives under (default
+    ``"dbo"`` -> byte-identical to prior output). Pass ``None`` / ``""`` for a NON-SCHEMA
+    (classic) lakehouse so the entities are addressed without a ``dbo`` qualifier (see
+    ``generate_table_tmdl``); a hardcoded ``dbo`` would silently break the binding there.
     """
     parts = {}
     table_names = []
     for disp, delta_name, columns_tmdl in tables:
         parts[f"definition/tables/{disp}.tmdl"] = T.generate_table_tmdl(
-            disp, delta_name, columns_tmdl, expression_name)
+            disp, delta_name, columns_tmdl, expression_name, schema_name=schema_name)
         table_names.append(disp)
     if measures_tmdl is not None:
         parts["definition/tables/_Measures.tmdl"] = T.generate_measures_table_tmdl(measures_tmdl)
