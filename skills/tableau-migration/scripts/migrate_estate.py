@@ -944,6 +944,42 @@ def _visual_calc_rollup(result):
     }
 
 
+def _color_scale_rollup(result):
+    """Additive disclosure rollup for heat-scale fills that rode Tableau's DEFAULT continuous palette.
+
+    When a table/matrix colour gradient carried no serialised ``<color-palette>`` (the author left the
+    heatmap on Tableau's default automatic ramp, which serialises no colours), the viz stage synthesises
+    a faithful-direction default gradient and stamps ``default_palette`` on the per-visual
+    conditional-format / visual-calculation fact (see ``twb_to_pbir._parse_color_gradient`` and
+    ``_disclose_default_palette``). The colour IS emitted -- strictly better than the prior silent drop --
+    but it is an APPROXIMATION of the source, so this rollup names the affected worksheets in the report.
+    The per-worksheet disclosure warning can be collapsed by ``_viz_fidelity``'s one-reason-per-worksheet
+    summary (e.g. a heatmap that also warns on date grain), so this rollup GUARANTEES the approximation
+    stays visible. Purely a CONSUMER of facts the viz stage already produced -- it never re-derives a
+    palette; returns ``None`` when no default palette was synthesised (report byte-identical otherwise).
+    """
+    records = result.get("candidate_records") if isinstance(result, dict) else None
+    worksheets = []
+    for r in (records or []):
+        if not isinstance(r, dict):
+            continue
+        cf, vc = r.get("conditional_format"), r.get("visual_calc")
+        defaulted = ((isinstance(cf, dict) and cf.get("default_palette"))
+                     or (isinstance(vc, dict) and vc.get("default_palette")))
+        if defaulted:
+            nm = r.get("worksheet")
+            if nm and nm not in worksheets:
+                worksheets.append(nm)
+    if not worksheets:
+        return None
+    return {
+        "count": len(worksheets),
+        "worksheets": worksheets,
+        "note": ("background colour scale used Tableau's default continuous palette (no serialised "
+                 "colours); a default gradient was applied -- verify the colours against the source"),
+    }
+
+
 _PBIP_WARN = "manual attention required: "
 
 
@@ -1788,6 +1824,9 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                 _vc_rollup = _visual_calc_rollup(rebuilt)
                 if _vc_rollup:
                     entry["visual_calculations"] = _vc_rollup
+                _cs_rollup = _color_scale_rollup(rebuilt)
+                if _cs_rollup:
+                    entry["color_scale_defaults"] = _cs_rollup
         except Exception as exc:
             warns.append(_PBIP_WARN + f"model-fact rebind skipped ({type(exc).__name__}: {exc}) -- "
                          f"report binds to the standing source/deferred fields")
@@ -1986,6 +2025,10 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_di
     vc_rollup = _visual_calc_rollup(result)
     if vc_rollup:
         detail["visual_calculations"] = vc_rollup
+
+    cs_rollup = _color_scale_rollup(result)
+    if cs_rollup:
+        detail["color_scale_defaults"] = cs_rollup
 
     signal = _workbook_binding_signal(text, result.get("ir") if isinstance(result, dict) else None)
     if signal is not None:

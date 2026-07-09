@@ -1823,6 +1823,51 @@ def _instance_is_table_calc(instance):
 # styling concern, not a cell heat scale -- and is ignored here.
 _GRADIENT_PALETTE_TYPES = ("ordered-diverging", "ordered-sequential")
 
+# Tableau hard-codes its "automatic" continuous colour ramp: when the author keeps the default, it
+# serialises the colour encoding (``type='interpolated'``) but NO ``<color-palette>`` element, so the
+# exact ramp cannot be recovered from the workbook XML. These standard ColorBrewer ramps -- "Blues"
+# (sequential) and "RdBu" (diverging), the published colour-science families Tableau's own defaults
+# derive from -- stand in for that default with faithful DIRECTION (low -> light, high -> dark) and
+# are DISCLOSED at emit time, so a default heat scale is reconstructed rather than silently dropped.
+# Provenance: original work. The stop values are an unprotectable published colour-science fact
+# (ColorBrewer, Cynthia Brewer / Penn State), sourced independently -- not copied from any migration
+# tool. The reference tool cyphou/Tableau-To-PowerBI keys all colour handling on an explicit
+# ``<color-palette>`` and has no default-ramp handling, so this default-synthesis path is entirely ours.
+_DEFAULT_SEQUENTIAL_COLORS = ("#eff3ff", "#08519c")
+_DEFAULT_DIVERGING_COLORS = ("#ca0020", "#f7f7f7", "#0571b0")
+
+
+def _parse_gradient_center(enc):
+    """The numeric ``center`` attribute of a colour encoding, or ``None`` when absent/unparseable."""
+    raw = enc.get("center")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _default_continuous_gradient(enc):
+    """Synthesise a continuous-gradient spec for a colour encoding that is continuous
+    (``interpolated``) but carries NO explicit ``<color-palette>`` -- the author kept Tableau's
+    default automatic ramp, which Tableau does not serialise. Uses a standard ColorBrewer stand-in
+    and flags ``default_palette`` so the emitter discloses the approximation (warn-never-wrong). A
+    ``center`` on the encoding implies a diverging default; otherwise the ramp is sequential.
+    """
+    center = _parse_gradient_center(enc)
+    diverging = center is not None
+    _, fid = _split_token_attr(enc.get("field"))
+    return {
+        "field_token": enc.get("field") or "",
+        "center": center,
+        "palette_type": "ordered-diverging" if diverging else "ordered-sequential",
+        "colors": list(_DEFAULT_DIVERGING_COLORS if diverging else _DEFAULT_SEQUENTIAL_COLORS),
+        "interpolated": True,
+        "is_table_calc": _instance_is_table_calc(fid),
+        "default_palette": True,
+    }
+
 
 def _parse_color_gradient(table):
     """Extract a continuous background colour-scale spec from a worksheet's mark colour encoding.
@@ -1831,48 +1876,53 @@ def _parse_color_gradient(table):
     "is_table_calc"}`` when the colour encoding carries a continuous (interpolated / ordered)
     palette of at least two stops, else ``None``. ``colors`` preserves the Tableau author order
     (first -> min, last -> max); the direction is never guessed.
+
+    When the colour encoding is continuous (``interpolated``) but Tableau serialised NO explicit
+    ``<color-palette>`` (the author kept the default automatic ramp), a default gradient is
+    synthesised (with an additive ``default_palette: True`` flag) so the heat scale is reconstructed
+    and disclosed rather than silently dropped. An EXPLICIT palette on any colour encoding always
+    wins over the default; only when no encoding yields an explicit gradient is the default used.
     """
     if table is None:
         return None
     style = _first(table, "style")
     if style is None:
         return None
+    default_enc = None
     for rule in _children_local(style, "style-rule"):
         if (rule.get("element") or "").lower() != "mark":
             continue
         for enc in _children_local(rule, "encoding"):
             if (enc.get("attr") or "") != "color":
                 continue
-            palette = _first(enc, "color-palette")
-            if palette is None:
-                continue
             enc_type = (enc.get("type") or "").lower()
-            pal_type = (palette.get("type") or "").lower()
             interpolated = "interpolated" in enc_type
-            if not interpolated and pal_type not in _GRADIENT_PALETTE_TYPES:
-                continue
-            colors = [(c.text or "").strip()
-                      for c in _children_local(palette, "color")
-                      if (c.text or "").strip()]
-            if len(colors) < 2:
-                continue
-            center = None
-            raw_center = enc.get("center")
-            if raw_center is not None:
-                try:
-                    center = float(raw_center)
-                except (TypeError, ValueError):
-                    center = None
-            _, fid = _split_token_attr(enc.get("field"))
-            return {
-                "field_token": enc.get("field") or "",
-                "center": center,
-                "palette_type": (pal_type or ("ordered-diverging" if center is not None
-                                              else "ordered-sequential")),
-                "colors": colors,
-                "interpolated": interpolated,
-                "is_table_calc": _instance_is_table_calc(fid),
-            }
+            palette = _first(enc, "color-palette")
+            if palette is not None:
+                pal_type = (palette.get("type") or "").lower()
+                if interpolated or pal_type in _GRADIENT_PALETTE_TYPES:
+                    colors = [(c.text or "").strip()
+                              for c in _children_local(palette, "color")
+                              if (c.text or "").strip()]
+                    if len(colors) >= 2:
+                        center = _parse_gradient_center(enc)
+                        _, fid = _split_token_attr(enc.get("field"))
+                        return {
+                            "field_token": enc.get("field") or "",
+                            "center": center,
+                            "palette_type": (pal_type or ("ordered-diverging" if center is not None
+                                                          else "ordered-sequential")),
+                            "colors": colors,
+                            "interpolated": interpolated,
+                            "is_table_calc": _instance_is_table_calc(fid),
+                        }
+            # A continuous colour encoding with no usable explicit palette -> Tableau's default
+            # automatic ramp. Remembered (not returned) so an explicit palette on a later encoding
+            # still wins; synthesised below only if no explicit gradient is found.
+            if interpolated and default_enc is None:
+                default_enc = enc
+    if default_enc is not None:
+        return _default_continuous_gradient(default_enc)
     return None
 
 
@@ -3577,6 +3627,18 @@ def _gradient_color_stops(cg):
         "nullColoringStrategy": nulls}}
 
 
+def _disclose_default_palette(ws, cg, warnings):
+    """Append a warn-never-wrong disclosure that a SYNTHESISED default continuous palette was used
+    because Tableau serialised no explicit colours for the author's default automatic ramp. The
+    disclosed direction (sequential / diverging) mirrors ``_gradient_color_stops`` exactly."""
+    diverging = cg.get("center") is not None and len(cg.get("colors") or []) >= 3
+    warnings.append(_warn(
+        "worksheet", ws["name"],
+        "background colour scale used Tableau's default continuous palette (the source serialised "
+        "no explicit colours); applied a default {0} gradient -- verify the colours against the "
+        "source".format("diverging" if diverging else "sequential")))
+
+
 def _conditional_format(ws, state, model_table, field_map, warnings):
     """Table / matrix BACKGROUND colour scale (heat cells) -> (value_objects, fact).
 
@@ -3654,6 +3716,9 @@ def _conditional_format(ws, state, model_table, field_map, warnings):
     fact["status"] = "emitted"
     fact["bound_measure"] = driver_proj["queryRef"]
     fact["target"] = target_proj["queryRef"]
+    if cg.get("default_palette"):
+        fact["default_palette"] = True
+        _disclose_default_palette(ws, cg, warnings)
     return value_objects, fact
 
 
@@ -3891,6 +3956,11 @@ def _apply_visual_calcs(ws, state, vc_index, model_table, field_map, warnings):
                 "FillRule": _gradient_color_stops(cg)}}}}}},
             "selector": {"data": [{"dataViewWildcard": {"matchingOption": 1}}],
                          "metadata": fill_target}}]
+    if value_objects is not None and cg.get("default_palette"):
+        # The heat scale rode Tableau's default automatic ramp (no serialised colours) -> disclose the
+        # synthesised default gradient. Mutually exclusive with the ``_conditional_format`` disclosure:
+        # the caller uses whichever path emitted the fill, never both, so a worksheet warns at most once.
+        _disclose_default_palette(ws, cg, warnings)
 
     vc_fact = {
         "kind": "visual_calculation",
@@ -3917,6 +3987,10 @@ def _apply_visual_calcs(ws, state, vc_index, model_table, field_map, warnings):
         # fill both drives off and paints the visible calc, so driver == target here.
         vc_fact["backColor"] = {"driver": outer_proj["queryRef"], "target": outer_proj["queryRef"],
                                 "emitted": True}
+    if value_objects is not None and cg and cg.get("default_palette"):
+        # Mirror the general path's fact flag so the estate's colour-scale rollup surfaces this
+        # synthesised default gradient regardless of which fill path emitted it.
+        vc_fact["default_palette"] = True
     return value_objects, vc_fact
 
 
