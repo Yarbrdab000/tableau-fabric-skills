@@ -842,6 +842,16 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
+- **tableau-migration:** **`MIN([str])` / `MAX([str])` over a text (or date) dimension now translate, so
+  the `MIN([A]) + " / " + MIN([B])` tooltip idiom lands as a string concat instead of stubbing.** The
+  single-column DAX `MIN`/`MAX` functions accept text (alphabetical order) and dates, matching Tableau's
+  `MIN`/`MAX` on those field types, but the deterministic compiler's fast path rejected anything non-numeric/
+  non-`dateTime` — so a Tableau author's common trick of wrapping a string dimension in `MIN()` to make it
+  aggregate-valid in a tooltip false-stubbed on the aggregate. `MIN`/`MAX` over a bare field now emit for
+  number, text, and date columns (a boolean or unmapped type still fails closed), a text result keeps its
+  `text` dtype, and the null-propagating string `+` concat (previously column-mode only) is now also valid in
+  a measure — where only aggregated/scalar text can reach it (a bare row-level text field still rejects
+  upstream). Numeric and date `MIN`/`MAX` output is byte-for-byte unchanged. *(AAR #2 F-10)*
 - **tableau-migration:** **the DirectLake table emitter no longer hardcodes `schemaName: dbo`, so a model
   landed to a non-`dbo` or non-schema lakehouse binds instead of silently failing.** `generate_table_tmdl`
   (and `assemble_directlake_model`, which threads it) gained an additive `schema_name` parameter that

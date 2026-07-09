@@ -918,6 +918,54 @@ def test_table_calc_cross_table_falls_back():
     assert "cross-table" in reason
 
 
+# --- MIN/MAX over TEXT + the MIN()-wrapped string-concat tooltip idiom (rm-string-concat-tooltip) ---
+# DAX's single-column MIN/MAX support text (alphabetical order), matching Tableau MIN/MAX on a string
+# dimension (per the DAX MIN/MAX spec: Numbers, Texts, Dates count; TRUE/FALSE are unsupported).
+# Tableau authors wrap a string dimension in MIN() to make it aggregate-valid in a tooltip; that
+# idiom now lands as a null-propagating DAX string concat instead of stubbing on the MIN.
+def test_min_max_over_text_field_measure():
+    assert _tx("MIN([Region])") == "MIN('Orders'[Region])"
+    assert _tx("MAX([Region])") == "MAX('Orders'[Region])"
+
+
+def test_min_max_over_boolean_field_still_stubs():
+    # DAX MIN/MAX do NOT support TRUE/FALSE (MINA/MAXA would) -> stay fail-closed on a boolean field.
+    assert translate_tableau_calc_to_dax("MIN([Returned])", _resolver)[0] is None
+    assert translate_tableau_calc_to_dax("MAX([Returned])", _resolver)[0] is None
+
+
+def test_min_text_plus_literal_measure_concat():
+    # A single MIN(text) + string literal in a MEASURE concatenates (null-propagating), mirroring the
+    # existing column-mode string-concat behavior (Tableau '+' on strings propagates null).
+    assert _tx('MIN([Region]) + "!"') == (
+        "IF(ISBLANK(MIN('Orders'[Region])) || ISBLANK(\"!\"), "
+        "BLANK(), MIN('Orders'[Region]) & \"!\")"
+    )
+
+
+def test_min_wrapped_string_concat_tooltip_idiom():
+    # The full tooltip idiom MIN([A]) + text + MIN([B]) (two distinct string dims) now translates.
+    fields = {
+        "Client Segment": ("Clients", "Client Segment", "string"),
+        "Client Region": ("Clients", "Client Region", "string"),
+    }
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        'MIN([Client Segment]) + " / " + MIN([Client Region])', lambda c: fields.get(c))
+    assert reason == "ok"
+    assert dax is not None
+    # A null-propagating concat of the two single-column text aggregates.
+    assert "MIN('Clients'[Client Segment])" in dax
+    assert "MIN('Clients'[Client Region])" in dax
+    assert '" / "' in dax
+    assert "ISBLANK(" in dax and " & " in dax
+
+
+def test_numeric_and_date_min_max_measure_unchanged():
+    # Regression guard: numeric/date MIN/MAX stay byte-identical to prior output.
+    assert _tx("MIN([Sales])") == "MIN('Orders'[Sales])"
+    assert _tx("MAX([Order Date])") == "MAX('Orders'[Order_Date])"
+
+
 # --- ADD #1: ORDERBY-only date-axis redirect plumbing (marked-calendar key) -------------------
 # A positional table calc orders by the worksheet's continuous-date axis. An ``order_resolver``
 # redirects ONLY the ORDERBY (never the inner aggregate or the partition) to the calendar key
