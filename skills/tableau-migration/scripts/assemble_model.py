@@ -37,6 +37,7 @@ try:  # package or scripts-on-path
         extract_calcs,
         parse_tds,
         reconcile_flatfile_headers,
+        read_flatfile_headers,
         workbook_datasources,
         AmbiguousDatasourceError,
     )
@@ -75,6 +76,7 @@ except ImportError:
         extract_calcs,
         parse_tds,
         reconcile_flatfile_headers,
+        read_flatfile_headers,
         workbook_datasources,
         AmbiguousDatasourceError,
     )
@@ -1914,6 +1916,69 @@ def _match_csv_path(relation, csv_index, *, single_default=None):
     return single_default
 
 
+def _reconcile_local_csv_columns(relations, matched):
+    """Prune each local-CSV relation's columns to the columns its file physically contains.
+
+    A local-CSV Import model is dead-on-arrival when a relation declares columns the materialized CSV
+    does not physically contain: Power BI's ``Csv.Document`` type-transform errors on a header that is
+    not in the file (a PHANTOM column -- e.g. a hidden/removed extract column or a metadata artifact),
+    and a duplicate TMDL column name is invalid (a DUPLICATE -- e.g. an object-id-twin column). Both
+    are pruned against the real CSV header, matched by physical ``remote_name``:
+
+    * aliased source names (a ``remote_name`` that is not itself a header but a renamed view of one,
+      e.g. Tableau's ``Person`` -> physical ``Regional Manager``) are FIRST remapped to their real
+      header by the tested flat-file reconciler, so an alias is never mistaken for a phantom;
+    * a column whose (remapped) ``remote_name`` is still absent from the header is DROPPED (phantom);
+    * a second column mapping to an already-claimed header is DROPPED (duplicate).
+
+    Fail-safe: a relation whose CSV header can't be read (missing/unreadable file) is left exactly
+    as-is -- nothing is dropped when absence can't be confirmed, so emission stays byte-identical to
+    the pre-fix behaviour. Returns ``(new_relations, {"dropped": [...], "deduped": [...],
+    "remapped": [...]})``; with clean columns every list is empty and the relations are unchanged.
+    """
+    remapped = []
+    if matched:
+        # Alias-remap first via the tested reconciler. Its guard early-returns unless a top-level
+        # flat-file key is set, so give it a truthy ``flatfile_filename`` sentinel while leaving the
+        # top-level ``flatfile_path`` None -- the reconciler then reads each relation's OWN
+        # ``flatfile_path`` (matched relations have one; unmatched fall through to None and are
+        # skipped, so no cross-file contamination). It mutates only a copy of the relations.
+        recon_desc = {"flatfile_filename": "local.csv", "flatfile_path": None,
+                      "relations": relations}
+        remapped = (reconcile_flatfile_headers(recon_desc) or {}).get("remaps", [])
+        relations = recon_desc.get("relations", relations)
+
+    dropped, deduped, out = [], [], []
+    for rel in relations:
+        path = rel.get("flatfile_path")
+        cols = rel.get("columns") or []
+        if not path or not cols:
+            out.append(rel)
+            continue
+        headers = read_flatfile_headers(path)  # local CSV -> no sheet argument
+        if not headers:
+            out.append(rel)  # fail-safe: header unknown -> keep every column
+            continue
+        header_set = set(headers)
+        disp = _table_display(rel)
+        kept, claimed = [], set()
+        for col in cols:
+            rn = col.get("remote_name")
+            if not rn:
+                kept.append(col)  # nothing to match on -> keep (conservative)
+                continue
+            if rn not in header_set:
+                dropped.append({"table": disp, "source_column": rn})
+                continue
+            if rn in claimed:
+                deduped.append({"table": disp, "source_column": rn})
+                continue
+            claimed.add(rn)
+            kept.append(col)
+        out.append({**rel, "columns": kept} if len(kept) != len(cols) else rel)
+    return out, {"dropped": dropped, "deduped": deduped, "remapped": remapped}
+
+
 def assemble_local_import_model(descriptor, *, model_name, table_csv_paths, calcs=None,
                                 dim_calcs=None, **kwargs):
     """Assemble a LOCAL Import semantic model whose tables read from on-disk CSV files.
@@ -1957,6 +2022,10 @@ def assemble_local_import_model(descriptor, *, model_name, table_csv_paths, calc
     filt_rels = [r for r in (descriptor.get("relationships") or [])
                  if r.get("from_table") in surviving_set and r.get("to_table") in surviving_set]
 
+    # Prune each relation's columns to what its CSV physically holds (drop phantoms, dedupe twins,
+    # alias-remap) so the emitted TMDL + Csv.Document type-transform never reference a missing header.
+    new_relations, column_reconcile = _reconcile_local_csv_columns(new_relations, matched)
+
     local_desc = {
         **descriptor,
         "connection_class": _LOCAL_CSV_CLASS,
@@ -1975,6 +2044,7 @@ def assemble_local_import_model(descriptor, *, model_name, table_csv_paths, calc
         "unmatched_tables": unmatched,
         "table_count": len(surviving),
         "matched_count": len(matched),
+        "column_reconcile": column_reconcile,
     }
     return result
 

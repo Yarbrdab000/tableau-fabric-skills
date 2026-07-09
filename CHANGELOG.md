@@ -821,6 +821,20 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
+- **tableau-migration:** **local-CSV Import models no longer emit phantom or duplicate columns that
+  made the model dead-on-arrival in Power BI.** When a `.tds`/`.tdsx` is migrated on the local-CSV
+  Import path (`migrate_datasource(local_data=…)`), each table's columns are now reconciled against
+  the header the materialized CSV physically contains. Previously a column present in the datasource
+  metadata but absent from the CSV (a **phantom** — e.g. a hidden/removed extract column or an
+  object-id metadata artifact) was still emitted as a TMDL `column` and typed in the `Csv.Document`
+  `Table.TransformColumnTypes` step, so Power BI errored on load referencing a header that isn't in
+  the file; and a column that appeared twice (a **duplicate** — e.g. an object-id-twin) produced an
+  invalid repeated TMDL column name. `assemble_local_import_model` now alias-remaps first (so a
+  renamed source name like `Person` → physical `Regional Manager` is kept, never dropped), then drops
+  phantoms and collapses duplicates against the real header, disclosing every change in the additive
+  `report["local_import"]["column_reconcile"]` (`dropped` / `deduped` / `remapped`). Fail-safe: a CSV
+  whose header can't be read leaves every column untouched, so clean models are byte-identical to
+  before.
 - **tableau-migration:** **calculated fields containing comments now translate to DAX instead of
   silently falling back to a stub.** Tableau's calc editor allows `//` line comments and
   `/* ... */` block comments, which are documentation only and never affect the computed value. The
