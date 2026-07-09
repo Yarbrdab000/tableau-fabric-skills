@@ -2745,12 +2745,17 @@ def _render_summary_md(report):
 
 # -- CLI -----------------------------------------------------------------------
 def _load_approved_dax(path):
-    """Load a ``{calc_name: dax}`` mapping of human-approved assisted translations from a JSON file.
+    """Load a mapping of human-approved assisted translations from a JSON file.
+
+    Each value may be the flat ``"DAX"`` string form, or the additive dict form
+    ``{"dax": "DAX", "table": "TargetTable"}`` -- the latter lets an approval also name a calc's
+    home table (honored by the column-mode landing; not applicable to measures, which live in the
+    shared ``_Measures`` table).
 
     Returns ``None`` when ``path`` is falsy (the run is then byte-identical to a no-approval run).
-    Raises ``ValueError`` when the file is missing, unreadable, not JSON, or not a flat object of
-    string -> string -- a fail-fast so a typo never silently drops an approval. Tolerates a UTF-8
-    BOM (the file is often hand-authored on Windows).
+    Raises ``ValueError`` when the file is missing, unreadable, not JSON, or not an object of
+    ``str -> (str | {"dax": str, "table"?: str})`` -- a fail-fast so a typo never silently drops an
+    approval. Tolerates a UTF-8 BOM (the file is often hand-authored on Windows).
     """
     if not path:
         return None
@@ -2761,10 +2766,20 @@ def _load_approved_dax(path):
         raise ValueError(f"--approved-dax file not found: {path}")
     except (OSError, ValueError) as exc:  # ValueError covers json.JSONDecodeError
         raise ValueError(f"--approved-dax file is not readable JSON ({path}): {exc}")
+
+    def _valid_value(v):
+        if isinstance(v, str):
+            return True
+        if isinstance(v, dict):
+            tbl = v.get("table")
+            return isinstance(v.get("dax"), str) and (tbl is None or isinstance(tbl, str))
+        return False
+
     if not isinstance(data, dict) or not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+            isinstance(k, str) and _valid_value(v) for k, v in data.items()):
         raise ValueError(
-            f"--approved-dax JSON must be an object mapping calc name -> DAX string ({path})")
+            "--approved-dax JSON must map calc name -> DAX string (or "
+            '{"dax": ..., "table": ...}) ' f"({path})")
     return data or None
 
 
@@ -2781,9 +2796,11 @@ def main(argv=None):
     parser.add_argument("--no-pbip", action="store_true",
                         help="skip the openable .pbip projects (emit only semantic_models/ folders)")
     parser.add_argument("--approved-dax", metavar="JSON",
-                        help="path to a {calc_name: dax} JSON file of human-approved second-compiler "
-                             "(assisted-translation) results; each name-matching stub lands as a "
-                             "live, audit-stamped measure/calc column instead of an inert stub")
+                        help="path to a JSON file of human-approved second-compiler "
+                             "(assisted-translation) results, mapping calc name -> DAX string (or "
+                             '{"dax": ..., "table": ...} to also name a calc column\'s home table); '
+                             "each name-matching stub lands as a live, audit-stamped measure/calc "
+                             "column instead of an inert stub")
     parser.add_argument("--viz-advice", action="store_true",
                         help="also write a reports/<Name>.viz-advice.json sidecar per workbook with "
                              "ranked alternative chart types per visual (Tier-2 viz advisor; "

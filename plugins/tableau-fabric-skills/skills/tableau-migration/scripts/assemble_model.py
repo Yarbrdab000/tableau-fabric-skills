@@ -461,6 +461,26 @@ def _forced_percent_diff_measures(calcs, usages, resolve, known_tables, consumed
     return rows, forced
 
 
+def _approved_entry(value):
+    """Normalise one ``approved_calc_dax`` value into ``(dax, target_table)``.
+
+    Accepts the original flat string form (``"DAX expr"``) and the additive dict form
+    (``{"dax": "DAX expr", "table": "TargetTable"}``), so a human approving an assisted
+    translation can also name the calc's home table. ``target_table`` is ``None`` unless a
+    non-empty string ``table`` is supplied. Anything else -- or a dict without a usable ``dax``
+    -- yields ``(None, None)`` so the caller falls through to the suggestion/stub path
+    (fail-closed). The string form returns ``(value, None)``, so its behavior is byte-identical.
+    """
+    if isinstance(value, str):
+        return value, None
+    if isinstance(value, dict):
+        dax = value.get("dax")
+        if isinstance(dax, str) and dax.strip():
+            tbl = value.get("table")
+            return dax, (tbl.strip() if isinstance(tbl, str) and tbl.strip() else None)
+    return None, None
+
+
 def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    calc_lookup=None, approved_calc_dax=None, synth_measures=None,
                    known_tables=None, table_calc_usages=None, order_resolver=None,
@@ -609,9 +629,11 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
 
         # Deterministic fallback -> consult the assisted-translation idiom registry.
         sugg = suggest_assisted_dax(formula, resolve, calc_lookup=calc_lookup)
-        approved = approved_lower.get(name.lower())
-        if approved:
-            approved_expr = " ".join(approved.split())  # collapse to one valid DAX line
+        # A measure always lands in the shared _Measures table, so an approval's optional target
+        # table (the additive dict form) is not applicable here -- only its DAX is consumed.
+        approved_dax, _approved_tbl = _approved_entry(approved_lower.get(name.lower()))
+        if approved_dax:
+            approved_expr = " ".join(approved_dax.split())  # collapse to one valid DAX line
             measures_tmdl += T.generate_measure_tmdl(
                 name, formula, approved_expr,
                 translated_by="assisted translation (human-approved)")
@@ -1352,7 +1374,7 @@ def _related_date_dax(date_table, column):
 
 def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
                        date_table=None, active_date_cols=None, consumed=None,
-                       approved_calc_dax=None):
+                       approved_calc_dax=None, known_tables=None):
     """Translate row-level (dimension) ``dim_calcs`` via column mode and group the rendered
     calculated-column TMDL by target table, plus a per-column report.
 
@@ -1382,6 +1404,14 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
     ``TranslatedBy = assisted translation (human-approved)`` with status ``assisted-approved``; the
     original Tableau formula is preserved as ``TableauFormula``. With no approval the behavior is
     byte-for-byte unchanged.
+
+    Each value may be the flat string ``"DAX"`` or the additive dict ``{"dax": "DAX", "table":
+    "TargetTable"}``. The dict form lets the approver name the calc's home table -- the fix for a
+    row-context calc Tier 0 could not place, which otherwise defaults to ``anchor_table`` and yields
+    invalid row-context DAX. A named ``table`` overrides the computed home only when it is in
+    ``known_tables`` (the caller injects each block into an existing table part, so an unknown name
+    would be silently dropped); an unknown name keeps the computed home and is recorded on the report
+    row as ``approved_target_unknown``. The honored/requested target is echoed as ``approved_target``.
 
     **Date-dimension binding (optional).** When ``date_table`` (the generated calendar's name)
     and ``active_date_cols`` (the set of ``(table, column)`` carrying the ACTIVE date
@@ -1432,13 +1462,22 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
         # Deterministic fallback -> a human-approved assisted translation (the column-mode peer of
         # the measures' approved_calc_dax landing). Consulted ONLY when Tier 0 produced no DAX, so a
         # faithful deterministic column is never overridden; the approved expression lands LIVE.
-        approved = approved_lower.get(name.lower()) if not dax else None
-        if approved:
-            approved_expr = " ".join(approved.split())  # collapse to one valid DAX line
-            by_table[target] = by_table.get(target, "") + T.generate_calc_column_tmdl(
-                name, formula, approved_expr,
-                translated_by="assisted translation (human-approved)")
-            report.append({
+        approved_dax, approved_tbl = (
+            _approved_entry(approved_lower.get(name.lower())) if not dax else (None, None))
+        if approved_dax:
+            approved_expr = " ".join(approved_dax.split())  # collapse to one valid DAX line
+            # The approval's optional target table (additive dict form) overrides the computed home
+            # -- the fix for a row-context calc Tier 0 could not place, which otherwise defaults to
+            # the anchor and yields invalid row-context DAX. Honor a NAMED table only when it is a
+            # real one: the caller injects each block into an existing table part, so an unknown name
+            # would be silently dropped -- keep the computed home and flag the miss instead.
+            approved_target_unknown = None
+            if approved_tbl and approved_tbl != target:
+                if known_tables is None or approved_tbl in known_tables:
+                    target = approved_tbl
+                else:
+                    approved_target_unknown = approved_tbl
+            row = {
                 "column": name,
                 "table": target,
                 "status": "assisted-approved",
@@ -1448,7 +1487,15 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
                 "date_bound": False,
                 "date_table": None,
                 "date_attribute": None,
-            })
+            }
+            if approved_tbl:
+                row["approved_target"] = approved_tbl
+            if approved_target_unknown:
+                row["approved_target_unknown"] = approved_target_unknown
+            by_table[target] = by_table.get(target, "") + T.generate_calc_column_tmdl(
+                name, formula, approved_expr,
+                translated_by="assisted translation (human-approved)")
+            report.append(row)
             continue
         by_table[target] = by_table.get(target, "") + T.generate_calc_column_tmdl(name, formula, dax)
         report.append({
@@ -1809,7 +1856,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     calc_columns_by_table, calc_column_report = _calc_columns_part(
         dim_calcs, resolve, anchor_table=table_names[0],
         date_table=date_name, active_date_cols=active_date_cols,
-        approved_calc_dax=approved_calc_dax,
+        approved_calc_dax=approved_calc_dax, known_tables=set(table_names),
         consumed=(set(consumed) | flag_source_names) if flag_source_names else consumed)
     for disp, block in calc_columns_by_table.items():
         path = f"definition/tables/{disp}.tmdl"

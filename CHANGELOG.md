@@ -13,6 +13,17 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **an approved assisted translation can now name its calc column's home table.**
+  `approved_calc_dax` values accept an additive dict form (`{"dax": "<DAX>", "table": "<TargetTable>"}`)
+  alongside the existing flat `{name: "<DAX>"}` string form. When the deterministic tier could not place a
+  row-context (dimension) calc, it defaulted the column to the anchor table — where the approved DAX
+  referenced columns that don't exist, producing an invalid row-context expression. The dict form lets the
+  approver land the column on its real table. The named table is honored only when it is a real model table
+  (an unknown name would be silently dropped by the per-table inject, so the computed home is kept and the
+  miss is recorded on the report row as `approved_target_unknown`); the requested target is echoed as
+  `approved_target`. Measures are unaffected — they live in the shared `_Measures` table, so a measure
+  approval's `table` is accepted but not applicable. The flat string form stays byte-for-byte identical, and
+  `migrate_estate --approved-dax` loads either form (fail-fast on a malformed entry). *(AAR #1 Issue C)*
 - **tableau-migration:** **every migrated model now ships a hermetic openability self-check so a run can
   no longer report success while emitting a model that will not open.** A new dependency-free gate
   (`openability_gate.check_model_openability`) validates the built model's TMDL parts — no duplicate

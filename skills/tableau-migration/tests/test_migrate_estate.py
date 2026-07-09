@@ -1990,6 +1990,30 @@ def test_load_approved_dax_unreadable_json_raises(tmp_path):
         me._load_approved_dax(str(p))
 
 
+def test_load_approved_dax_accepts_dict_form_with_table(tmp_path):
+    # additive dict value form: {"dax": ..., "table": ...} lets an approval also name a home table.
+    p = tmp_path / "approved.json"
+    entry = {"dax": "\"US\"", "table": "REP"}
+    p.write_text(json.dumps({"Geo Tag": entry, "Running Amount": _APPROVED_RUNNING_AMOUNT_DAX}),
+                 encoding="utf-8-sig")
+    got = me._load_approved_dax(str(p))
+    assert got == {"Geo Tag": entry, "Running Amount": _APPROVED_RUNNING_AMOUNT_DAX}
+
+
+def test_load_approved_dax_dict_without_dax_string_raises(tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps({"Geo Tag": {"table": "REP"}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="calc name -> DAX"):
+        me._load_approved_dax(str(p))
+
+
+def test_load_approved_dax_dict_non_string_table_raises(tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps({"Geo Tag": {"dax": "\"US\"", "table": 5}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="calc name -> DAX"):
+        me._load_approved_dax(str(p))
+
+
 def test_migrate_estate_approved_dax_lands_stub_as_assisted_approved(fixtures_dir, tmp_path):
     out = str(tmp_path / "bundle")
     report = migrate_estate(LocalFilesSource(fixtures_dir), out,
