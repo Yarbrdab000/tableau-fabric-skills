@@ -1618,47 +1618,25 @@ def _field_map_from_model(res_report):
     return fact_table, field_map
 
 
-def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None, ds_catalog=None,
-                          approved_calc_dax=None, wb_id=None):
-    """Build an openable, self-contained workbook ``.pbip`` and record it on ``detail`` (never raises).
+def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, model_safe, dest,
+                           folder_rel, report_base, viz_name, viz=None, ds_catalog=None,
+                           approved_calc_dax=None, wb_id=None, pbip_dir=None):
+    """Rebuild ONE embedded datasource into a self-contained ``.pbip`` and record it on ``entry``.
 
-    Rebuilds the workbook's OWN primary embedded datasource into a semantic model (reusing the
-    datasource pipeline, so calculated fields are auto-extracted and role-split) and binds the
-    rebuilt report to it *by path* as a sibling, yielding ``pbip/<WB>/{<DS>.SemanticModel,
-    <WB>.Report, <WB>.pbip}``. Purely additive: it never alters the bare ``reports/`` write. Sets
-    ``pbip_status``/``pbip_folder``/``bound_model``/``bound_datasource``/``model_translation_handoff``
-    and appends honest ``pbip_warnings`` for every case it cannot faithfully bind (no embedded
-    datasource, lakehouse fallback, secondary datasources, write failure).
+    Extracted verbatim from ``_attach_workbook_pbip`` so a workbook with several embedded datasources
+    can build one PBIP per datasource with per-datasource error isolation -- a failure here marks only
+    THIS ``entry`` skipped-loud (its own ``pbip_warnings``); sibling datasources still build. ``entry``
+    is the per-datasource result dict; for the single/primary datasource the caller passes the
+    workbook's own ``detail`` so the top-level keys stay byte-identical. ``wb_detail`` is always the
+    workbook-level detail -- ``_rebuild_from_published_match`` reads the workbook ``binding_signal``
+    from it. ``dest`` is the absolute output folder, ``folder_rel`` the reported ``pbip_folder``,
+    ``report_base`` names the ``.Report``/``.pbip``, and ``viz_name`` is the viz report name. Never
+    raises; appends honest ``pbip_warnings`` for every case it cannot faithfully bind.
     """
-    detail.update(pbip_status="skipped", pbip_folder=None, bound_model=None,
-                  bound_datasource=None, model_translation_handoff=None)
-    detail.setdefault("pbip_ref_drops", [])
-    warns = detail.setdefault("pbip_warnings", [])
-
-    report_parts = _rebind_report_byPath(result.get("parts") if isinstance(result, dict) else None,
-                                         "__placeholder__")
-    if report_parts is None:
-        warns.append(_PBIP_WARN + "viz stage produced no PBIR report definition -- "
-                     "cannot assemble an openable workbook project")
-        return
-
-    try:
-        inventory = list_workbook_datasources(twb_text)
-    except Exception:
-        inventory = []
-    if not inventory:
-        warns.append(_PBIP_WARN + "no embedded datasource found to rebuild -- "
-                     "workbook report not bound to a local model")
-        return
-
-    primary, secondaries = _rank_primary_datasource(inventory, result.get("ir"))
-    label = primary.get("label") or primary.get("caption") or primary.get("name")
-    model_safe = _fs_safe(primary.get("caption") or primary.get("name") or label, "Model")
-    detail["bound_datasource"] = label
-    for sec in secondaries:
-        warns.append(_PBIP_WARN + f"secondary datasource {sec.get('label')!r} not bound -- "
-                     f"a single PBIR report binds one model; bound the primary {label!r}")
-
+    entry.setdefault("pbip_warnings", [])
+    entry.setdefault("pbip_ref_drops", [])
+    warns = entry["pbip_warnings"]
+    entry["bound_datasource"] = label
     # Flat-file Import (Excel/CSV bundled inside the .twbx): extract the embedded data to an ABSOLUTE
     # path under the bundle's data/ dir so the workbook .pbip opens AND loads. ``wb_id`` is the packaged
     # workbook (the .twbx path for a local source); a live DB embedded source has no flatfile_filename,
@@ -1676,7 +1654,7 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
     ff_path = None
     local_data = None
     if ds_catalog:
-        cat = ds_catalog.get(_norm_ds(primary.get("caption") or primary.get("name") or label))
+        cat = ds_catalog.get(_norm_ds(ds.get("caption") or ds.get("name") or label))
         if cat:
             ff_path = cat.get("flatfile_path")
             local_data = cat.get("table_csv_paths")
@@ -1697,7 +1675,7 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
     # explicitly rather than silently shipping a broken model. Successful landings stay quiet.
     _ffd = res_report.get("flatfile_data")
     if _ffd:
-        detail["flatfile_data"] = {"landed": bool(_ffd.get("landed")),
+        entry["flatfile_data"] = {"landed": bool(_ffd.get("landed")),
                                    "kind": _ffd.get("kind"), "reason": _ffd.get("reason"),
                                    "hyper_present": _ffd.get("hyper_present")}
     if _ffd and not _ffd.get("landed"):
@@ -1717,7 +1695,7 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
         # carrying the workbook's own calculated fields so its view-local measures translate -- and
         # bind the report to it. Never guesses (a real datasource-name match is required); any
         # failure keeps the honest skip below (warn-never-wrong).
-        recovered = _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog,
+        recovered = _rebuild_from_published_match(wb_detail, twb_text, model_safe, ds_catalog,
                                                   approved_calc_dax=approved_calc_dax)
         if recovered is not None:
             res = recovered
@@ -1772,36 +1750,36 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
     if (date_binding or measure_binding or row_count_binding or param_binding
             or field_map) and viz is not None:
         try:
-            rebuilt = viz(twb_text, detail.get("name") or safe_base,
+            rebuilt = viz(twb_text, viz_name,
                           date_binding=date_binding, measure_binding=measure_binding,
                           row_count_binding=row_count_binding, param_binding=param_binding,
                           model_table=field_model_table, field_map=field_map)
             if isinstance(rebuilt, dict) and rebuilt.get("parts"):
                 report_parts = _rebind_report_byPath(rebuilt["parts"], model_safe)
                 if date_binding:
-                    detail["date_rebind"] = {"date_table": date_binding["date_table"],
+                    entry["date_rebind"] = {"date_table": date_binding["date_table"],
                                              "active_keys": date_binding["active_keys"]}
                 if measure_binding:
-                    detail["measure_rebind"] = {
+                    entry["measure_rebind"] = {
                         "count": len((measure_binding.get("measures") or {}))}
                 if row_count_binding:
-                    detail["row_count_rebind"] = {
+                    entry["row_count_rebind"] = {
                         "count": len((row_count_binding.get("measures") or {}))
                         + (1 if row_count_binding.get("default") else 0)}
                 if param_binding:
-                    detail["param_rebind"] = {
+                    entry["param_rebind"] = {
                         "slicers": len((param_binding.get("slicers") or {})),
                         "flags": len((param_binding.get("flags") or {}))}
                 if field_map:
-                    detail["field_rebind"] = {
+                    entry["field_rebind"] = {
                         "count": len(field_map), "model_table": field_model_table}
                 # The rebound report -- not the pre-rebind first pass -- is what lands in the
                 # openable .pbip, so refresh the per-worksheet fidelity + implicit-row-count tally
                 # from it. Now-bound row counts / measures / params clear their warnings here, so the
                 # reported fidelity matches the project the user actually opens (warn-never-wrong: any
                 # warning the rebound run still emits is carried, never masked).
-                detail["viz_fidelity"] = _viz_fidelity(rebuilt)
-                detail["viz_implicit_row_count"] = sum(
+                entry["viz_fidelity"] = _viz_fidelity(rebuilt)
+                entry["viz_implicit_row_count"] = sum(
                     1 for w in (rebuilt.get("warnings") or [])
                     if "implicit row count" in (w.get("reason") or ""))
                 # The visual-calculation rollup must likewise reflect the rebound pass -- the
@@ -1809,7 +1787,7 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
                 # implicit COUNT(*) only resolve here (base measure Count Orders binds in pass 2).
                 _vc_rollup = _visual_calc_rollup(rebuilt)
                 if _vc_rollup:
-                    detail["visual_calculations"] = _vc_rollup
+                    entry["visual_calculations"] = _vc_rollup
         except Exception as exc:
             warns.append(_PBIP_WARN + f"model-fact rebind skipped ({type(exc).__name__}: {exc}) -- "
                          f"report binds to the standing source/deferred fields")
@@ -1818,25 +1796,110 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
     # that dangles), so the whole viz layer is warn-never-wrong on field references -- not just MV.
     report_parts, ref_drops = _crosscheck_report_refs(report_parts, res.get("parts"))
     if ref_drops:
-        detail["pbip_ref_drops"] = ref_drops
+        entry["pbip_ref_drops"] = ref_drops
         for d in ref_drops:
             tail = " (visual emptied)" if d["emptied"] else ""
             warns.append(_PBIP_WARN + f"visual {d['visual']!r} dropped {len(d['dropped'])} "
                          f"reference(s) the model did not emit: {', '.join(d['dropped'])}{tail}")
-    dest = os.path.join(pbip_dir, safe_base)
     try:
         if os.path.isdir(dest):
             shutil.rmtree(dest)
-        write_local_pbip(res["parts"], dest, model_name=model_safe, report_name=safe_base,
-                         report_parts=report_parts, project_name=safe_base)
+        write_local_pbip(res["parts"], dest, model_name=model_safe, report_name=report_base,
+                         report_parts=report_parts, project_name=report_base)
     except OSError as exc:
         warns.append(_PBIP_WARN + f"workbook .pbip write failed ({exc})")
         return
 
-    detail.update(pbip_status="built",
-                  pbip_folder=f"pbip/{safe_base}/{safe_base}.pbip",
+    entry.update(pbip_status="built",
+                  pbip_folder=folder_rel,
                   bound_model=model_safe,
                   model_translation_handoff=res_report.get("translation_handoff"))
+
+
+def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None, ds_catalog=None,
+                          approved_calc_dax=None, wb_id=None):
+    """Build openable, self-contained workbook ``.pbip`` project(s) and record them on ``detail``.
+
+    A workbook with a SINGLE embedded datasource keeps the established flat layout: its one datasource
+    is rebuilt into a semantic model (reusing the datasource pipeline, so calculated fields are
+    auto-extracted and role-split) and the rebuilt report is bound to it *by path* as a sibling,
+    yielding ``pbip/<WB>/{<DS>.SemanticModel, <WB>.Report, <WB>.pbip}``. A workbook with SEVERAL
+    embedded datasources instead gets ONE self-contained project per datasource, nested at
+    ``pbip/<WB>/<DS>/`` (each datasource's own model + a report rebound to it), because a single PBIR
+    report binds exactly one model; ``detail["datasource_pbips"]`` lists every datasource's outcome and
+    the top-level keys mirror the primary (most-used) datasource. Purely additive: it never alters the
+    bare ``reports/`` write. Sets ``pbip_status``/``pbip_folder``/``bound_model``/``bound_datasource``/
+    ``model_translation_handoff`` and appends honest ``pbip_warnings`` for every case it cannot
+    faithfully bind (no embedded datasource, lakehouse fallback, write failure). Never raises.
+    """
+    detail.update(pbip_status="skipped", pbip_folder=None, bound_model=None,
+                  bound_datasource=None, model_translation_handoff=None)
+    detail.setdefault("pbip_ref_drops", [])
+    warns = detail.setdefault("pbip_warnings", [])
+
+    report_parts = _rebind_report_byPath(result.get("parts") if isinstance(result, dict) else None,
+                                         "__placeholder__")
+    if report_parts is None:
+        warns.append(_PBIP_WARN + "viz stage produced no PBIR report definition -- "
+                     "cannot assemble an openable workbook project")
+        return
+
+    try:
+        inventory = list_workbook_datasources(twb_text)
+    except Exception:
+        inventory = []
+    if not inventory:
+        warns.append(_PBIP_WARN + "no embedded datasource found to rebuild -- "
+                     "workbook report not bound to a local model")
+        return
+
+    primary, secondaries = _rank_primary_datasource(inventory, result.get("ir"))
+    all_ds = [primary] + secondaries
+    label = primary.get("label") or primary.get("caption") or primary.get("name")
+    model_safe = _fs_safe(primary.get("caption") or primary.get("name") or label, "Model")
+    detail["bound_datasource"] = label
+    viz_name = detail.get("name") or safe_base
+
+    # SINGLE embedded datasource (the common case): keep the established FLAT ``pbip/<WB>/`` layout so
+    # the top-level detail keys and the on-disk paths stay byte-identical. The report binds to the one
+    # rebuilt model.
+    if len(all_ds) == 1:
+        _build_datasource_pbip(detail, detail, twb_text, result, primary, label=label,
+                               model_safe=model_safe, dest=os.path.join(pbip_dir, safe_base),
+                               folder_rel=f"pbip/{safe_base}/{safe_base}.pbip", report_base=safe_base,
+                               viz_name=viz_name, viz=viz, ds_catalog=ds_catalog,
+                               approved_calc_dax=approved_calc_dax, wb_id=wb_id, pbip_dir=pbip_dir)
+        return
+
+    # MULTIPLE embedded datasources: a single PBIR report binds exactly ONE model, so faithful parity
+    # in a single report is impossible. Instead migrate EACH embedded datasource individually into its
+    # own self-contained project nested at ``pbip/<WB>/<DS>/`` (that datasource's full-fidelity model +
+    # the report rebound to it). A dashboard whose views span datasources is split across these
+    # per-datasource projects -- an accepted, documented limitation. Per-datasource error isolation: a
+    # failure in one datasource marks only its own entry; the siblings still build. The top-level detail
+    # keys mirror the PRIMARY (most-used) datasource for back-compat, and ``detail["datasource_pbips"]``
+    # lists every datasource's outcome.
+    used = set()
+    entries = []
+    for ds in all_ds:
+        ds_label = ds.get("label") or ds.get("caption") or ds.get("name")
+        ds_model = _fs_safe(ds.get("caption") or ds.get("name") or ds_label, "Model")
+        ds_folder = _safe_folder(ds.get("caption") or ds.get("name") or ds_label, used)
+        entry = detail if ds is primary else {}
+        _build_datasource_pbip(entry, detail, twb_text, result, ds, label=ds_label,
+                               model_safe=ds_model,
+                               dest=os.path.join(pbip_dir, safe_base, ds_folder),
+                               folder_rel=f"pbip/{safe_base}/{ds_folder}/{ds_folder}.pbip",
+                               report_base=ds_folder, viz_name=viz_name, viz=viz,
+                               ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax,
+                               wb_id=wb_id, pbip_dir=pbip_dir)
+        entries.append({"datasource": ds_label, "model": ds_model, "folder": ds_folder,
+                        "is_primary": ds is primary,
+                        "pbip_status": entry.get("pbip_status", "skipped"),
+                        "pbip_folder": entry.get("pbip_folder"),
+                        "bound_model": entry.get("bound_model"),
+                        "pbip_warnings": list(entry.get("pbip_warnings") or [])})
+    detail["datasource_pbips"] = entries
 
 
 def _attach_viz_advice(detail, result, safe_base, reports_dir):
@@ -2382,6 +2445,22 @@ def _summarize(ds_details, wb_details, viz_available):
     wb_warned = sum(1 for w in wb_details if w.get("viz_status") == "warned")
     wb_error = sum(1 for w in wb_details if w.get("viz_status") == "error")
     wb_pbip_built = sum(1 for w in wb_details if w.get("pbip_status") == "built")
+    # Per-datasource PBIP rollup (additive): a workbook with several embedded datasources emits one
+    # self-contained project per datasource (nested at pbip/<WB>/<DS>/); a single-datasource workbook
+    # keeps its flat pbip/<WB>/ project. Count datasource-level projects so the breakdown is explicit
+    # alongside the workbook-level `workbooks_pbip_built` (which counts the primary/top-level only).
+    datasource_pbips_total = 0
+    datasource_pbips_built = 0
+    for w in wb_details:
+        entries = w.get("datasource_pbips")
+        if entries:
+            datasource_pbips_total += len(entries)
+            datasource_pbips_built += sum(1 for e in entries if e.get("pbip_status") == "built")
+        elif w.get("pbip_status"):
+            # single-datasource workbook: its flat project is itself one datasource-level project
+            datasource_pbips_total += 1
+            datasource_pbips_built += 1 if w.get("pbip_status") == "built" else 0
+    workbooks_multi_datasource = sum(1 for w in wb_details if w.get("datasource_pbips"))
     visuals_rebuilt = sum(1 for w in wb_details for f in (w.get("viz_fidelity") or [])
                           if f.get("status") == "rebuilt")
     visuals_warned = sum(1 for w in wb_details for f in (w.get("viz_fidelity") or [])
@@ -2419,6 +2498,9 @@ def _summarize(ds_details, wb_details, viz_available):
         "workbooks_viz_warned": wb_warned,
         "workbooks_viz_error": wb_error,
         "workbooks_pbip_built": wb_pbip_built,
+        "datasource_pbips_total": datasource_pbips_total,
+        "datasource_pbips_built": datasource_pbips_built,
+        "workbooks_multi_datasource": workbooks_multi_datasource,
         "visuals_rebuilt": visuals_rebuilt,
         "visuals_warned": visuals_warned,
         "workbooks_published_ds": workbooks_published_ds,
@@ -2545,17 +2627,37 @@ def _render_summary_md(report):
             fid = w.get("viz_fidelity") or []
             rebuilt = sum(1 for f in fid if f.get("status") == "rebuilt")
             warned = sum(1 for f in fid if f.get("status") == "warned")
+            note = w.get("note") or ""
+            entries = w.get("datasource_pbips")
+            if entries:
+                built = sum(1 for e in entries if e.get("pbip_status") == "built")
+                note = (note + " " if note else "") + (
+                    f"{len(entries)} datasources → {built} project(s) built, one per datasource")
             lines.append(
                 f"| {w['name']} | {w.get('viz_status', '')} | {rebuilt}/{warned} "
                 f"| {w.get('pbip_folder') or '-'} | {w.get('bound_model') or '-'} "
-                f"| {w.get('note') or ''} |")
+                f"| {note} |")
+        # For multi-datasource workbooks, list each nested per-datasource project so the split is
+        # explicit (a single PBIR report binds one model, so each datasource gets its own project).
+        multi = [w for w in report["workbooks"] if w.get("datasource_pbips")]
+        if multi:
+            lines += ["", "### Per-datasource projects (multi-datasource workbooks)", ""]
+            for w in multi:
+                lines.append(f"- **{w['name']}**")
+                for e in w["datasource_pbips"]:
+                    tag = "primary" if e.get("is_primary") else "secondary"
+                    where = e.get("pbip_folder") or f"skipped ({tag})"
+                    lines.append(f"  - {e.get('datasource')} [{e.get('pbip_status')}]: {where}")
         if any(w.get("pbip_folder") for w in report["workbooks"]):
             lines += [
                 "",
                 "> **Open locally:** each rebuilt workbook with a bound model has a self-contained, "
                 "openable Power BI project at `pbip/<Workbook>/<Workbook>.pbip` (report + a model "
                 "rebuilt from the workbook's own embedded datasource) — double-click to open it in "
-                "Power BI Desktop. The `semantic_models/` folders remain the canonical deploy target.",
+                "Power BI Desktop. A workbook with several embedded datasources instead gets one "
+                "project per datasource nested at `pbip/<Workbook>/<Datasource>/` (a single report "
+                "binds one model, so dashboards spanning datasources are split across them). The "
+                "`semantic_models/` folders remain the canonical deploy target.",
             ]
         if s.get("implicit_row_count_unbound", 0):
             lines += [
