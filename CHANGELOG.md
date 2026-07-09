@@ -13,6 +13,16 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **every migrated model now ships a hermetic openability self-check so a run can
+  no longer report success while emitting a model that will not open.** A new dependency-free gate
+  (`openability_gate.check_model_openability`) validates the built model's TMDL parts — no duplicate
+  column declarations, every M-typed column both declared and (when the landed flat file is readable) an
+  actual physical header, and every `.tmdl` part well-formed (reusing the `tmdl_lint` openability rules).
+  The verdict surfaces as the additive `report["openability_selfcheck"]` (`{ok, checks, issues}`), wired
+  into `assemble_import_model` so it covers the datasource, local-CSV and workbook-rebuild paths. It is
+  intentionally distinct from the opt-in TOM `report["openability"]` tier — cheap, always-on, and hermetic
+  (never opens a file for the structural checks). Fail-safe: a table with no typed columns or no readable
+  header is skipped, never mis-flagged.
 - **tableau-migration:** **heatmaps that used Tableau's default colour scale now keep their colour
   instead of dropping it silently.** When an author leaves a table/matrix colour gradient on Tableau's
   *default* continuous palette, the workbook serialises no explicit `<color-palette>` element — so the

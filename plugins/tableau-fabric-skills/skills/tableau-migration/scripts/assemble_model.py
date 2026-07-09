@@ -65,6 +65,7 @@ try:  # package or scripts-on-path
     )
     from .workbook_table_calcs import extract_table_calc_usages
     from .date_window_flag import build_date_window_flags
+    from .openability_gate import check_model_openability
 except ImportError:
     from connection_to_m import (
         build_m_field_resolver,
@@ -104,10 +105,31 @@ except ImportError:
     )
     from workbook_table_calcs import extract_table_calc_usages
     from date_window_flag import build_date_window_flags
+    from openability_gate import check_model_openability
 
 
 def _table_display(rel):
     return rel.get("name") or rel.get("item") or "Table"
+
+
+def _gate_flatfile_headers(descriptor, flatfile_path=None):
+    """Best-effort ``{table_display: [physical_header, ...]}`` for the openability gate's
+    physical-header check. Reads the actual landed flat file per relation (CSV first line /
+    single-sheet Excel); fully fail-safe -- any relation without a readable header is simply
+    omitted so the gate's ``typed_columns_in_header`` check skips it rather than mis-firing.
+    """
+    headers = {}
+    try:
+        for rel in (descriptor or {}).get("relations", []):
+            path = rel.get("flatfile_path") or flatfile_path
+            if not path:
+                continue
+            hs = read_flatfile_headers(path, sheet=rel.get("excel_sheet"))
+            if hs:
+                headers[_table_display(rel)] = hs
+    except Exception:
+        return {}
+    return headers
 
 
 # Fixed calendar span for a DirectQuery Date table (see _build_date_dimension). A wide, static,
@@ -1882,6 +1904,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         report["filter_bindings"] = filter_bindings
     if header_reconcile["remaps"] or header_reconcile["mismatches"]:
         report["flatfile_header_reconcile"] = header_reconcile
+    report["openability_selfcheck"] = check_model_openability(
+        parts, flatfile_headers=_gate_flatfile_headers(descriptor, flatfile_path))
     return {"parts": parts, "report": report}
 
 

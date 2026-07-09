@@ -348,3 +348,33 @@ def test_local_csv_aliased_column_remapped_not_dropped(tmp_path):
     cr = result["report"]["local_import"]["column_reconcile"]
     assert any(r.get("to") == "Regional Manager" for r in cr["remapped"])
     assert cr["dropped"] == []
+
+
+# -- openability self-check is wired into the build and agrees the model is open ----------------
+def test_openability_selfcheck_present_and_ok_on_local_build(tmp_path):
+    csv_path = _write_csv(str(tmp_path / "snap.csv"),
+                          ["Region", "PendingJobs", "SnapshotDate"],
+                          [["Beltway", 32000, "2024-01-01"]])
+    result = A.migrate_datasource(
+        PENDING_TDS, model_name="Pending", local_data={"PendingJobSnapshot": csv_path})
+
+    gate = result["report"]["openability_selfcheck"]
+    assert gate["ok"] is True
+    assert gate["issues"] == []
+    assert gate["checks"]["no_duplicate_columns"] is True
+    assert gate["checks"]["typed_columns_declared"] is True
+    # the physical-header check actually ran against the real landed CSV (not merely skipped)
+    assert gate["checks"]["typed_columns_in_header"] is True
+
+
+def test_openability_selfcheck_ok_after_phantom_dedupe(tmp_path):
+    # PHANTOM_DUP_TDS would emit a duplicate + a phantom column; the local-CSV reconcile fixes both.
+    # The gate must independently confirm the RESULT is open (no dup, no typed phantom vs header).
+    csv_path = _write_csv(str(tmp_path / "snap.csv"), ["Region", "PendingJobs"], [["Beltway", 1]])
+    result = A.migrate_datasource(PHANTOM_DUP_TDS, model_name="Snap",
+                                  local_data={"Snap": csv_path})
+    gate = result["report"]["openability_selfcheck"]
+    assert gate["ok"] is True, gate["issues"]
+    assert gate["checks"]["no_duplicate_columns"] is True
+    assert gate["checks"]["typed_columns_in_header"] is True
+
