@@ -1016,6 +1016,70 @@ def test_real_countd_on_column_is_not_a_row_count():
     assert rows[0]["property"] == "Category"
 
 
+# -- implicit row count across a Tableau join-order prefix (AAR #1 Issue E) -----
+# When a physical table is added to a join Tableau stamps an order prefix on its name ("1. Login-
+# History"); the migrated model declares the clean table ("LoginHistory") and keys its COUNTROWS
+# measure clean. The implicit object-id COUNT (from the workbook) still carries the prefixed name,
+# so an exact-only match blanked the KPI card. The binding now normalises the prefix on either side.
+_HEX3 = "A1B2C3D4E5F607182930415263748596"
+_COL_OID_LOGIN = (f"<column caption='1. LoginHistory' datatype='integer' "
+                  f"name='[{_OID}].[LoginHistory_{_HEX3}]' role='measure' type='quantitative' />")
+_CI_CNT_LOGIN = (f"<column-instance column='[{_OID}].[LoginHistory_{_HEX3}]' derivation='Count' "
+                 f"name='[cnt:LoginHistory_{_HEX3}:qk]' pivot='key' type='quantitative' />")
+_OID_COUNT_PILL_LOGIN = f"[federated.abc].[{_OID}].[cnt:LoginHistory_{_HEX3}:qk]"
+
+
+def test_object_id_row_count_binds_across_tableau_order_prefix():
+    # workbook count names the prefixed physical table "1. LoginHistory"; the model measure is keyed
+    # by the clean table "LoginHistory" -> the KPI card binds (no silent blank, no warning).
+    ws = _worksheet("KPI", "Bar",
+                    rows=_OID_COUNT_PILL_LOGIN,
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST + _COL_OID_LOGIN + _CI_CNT_LOGIN)
+    rcb = {"measures": {"LoginHistory": {"entity": "_Measures", "measure": "count logins"}}}
+    ir = parse_twb(_workbook(ws), row_count_binding=rcb)
+    rows = ir["worksheets"][0]["rows"]
+    assert len(rows) == 1
+    f = rows[0]
+    assert f["binding"] == "measure" and f["entity"] == "_Measures" and f["property"] == "count logins"
+    assert _count_warns(ir) == []
+
+
+def test_strip_table_order_prefix_only_strips_the_tableau_shape():
+    from twb_to_pbir import _strip_table_order_prefix
+    assert _strip_table_order_prefix("1. LoginHistory") == "LoginHistory"
+    assert _strip_table_order_prefix("12.  Orders") == "Orders"      # multi-digit + extra space
+    assert _strip_table_order_prefix("LoginHistory") == "LoginHistory"
+    assert _strip_table_order_prefix("2024.Q1") == "2024.Q1"          # dot, no space -> untouched
+    assert _strip_table_order_prefix("3D Models") == "3D Models"      # no dot -> untouched
+    assert _strip_table_order_prefix("") == ""
+
+
+def test_row_count_measure_target_prefix_tolerant_both_directions():
+    from twb_to_pbir import _row_count_measure_target
+    # prefix on the workbook side, clean model key
+    rc_pref = {"kind": "object_id", "table": "1. LoginHistory", "candidates": ["1. LoginHistory"]}
+    clean = {"measures": {"LoginHistory": {"entity": "_Measures", "measure": "count logins"}}}
+    assert _row_count_measure_target(rc_pref, clean) == ("_Measures", "count logins")
+    # clean workbook side, prefixed model key (symmetric)
+    rc_clean = {"kind": "object_id", "table": "LoginHistory", "candidates": ["LoginHistory"]}
+    pref = {"measures": {"1. LoginHistory": {"entity": "_Measures", "measure": "count logins"}}}
+    assert _row_count_measure_target(rc_clean, pref) == ("_Measures", "count logins")
+
+
+def test_row_count_measure_target_prefix_match_must_be_unambiguous():
+    from twb_to_pbir import _row_count_measure_target
+    rc = {"kind": "object_id", "table": "LoginHistory", "candidates": ["LoginHistory"]}
+    # two model measures normalise to the same physical table -> ambiguous -> no bind (warn later)
+    ambiguous = {"measures": {"1. LoginHistory": {"entity": "_Measures", "measure": "A"},
+                              "2. LoginHistory": {"entity": "_Measures", "measure": "B"}}}
+    assert _row_count_measure_target(rc, ambiguous) is None
+    # an exact key still wins even when a normalised collision also exists
+    exact_wins = {"measures": {"LoginHistory": {"entity": "_Measures", "measure": "X"},
+                               "1. LoginHistory": {"entity": "_Measures", "measure": "Y"}}}
+    assert _row_count_measure_target(rc, exact_wins) == ("_Measures", "X")
+
+
 # -- caption fallback (no embedded metadata) -----------------------------------
 def test_caption_fallback_when_no_datasource_metadata_warns():
     # workbook WITHOUT a <datasources> metadata tree -> binding falls back to caption

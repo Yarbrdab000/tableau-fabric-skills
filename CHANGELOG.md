@@ -831,6 +831,15 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
+- **tableau-migration:** **KPI cards that count a joined table no longer come up blank when Tableau
+  stamped a join-order prefix on the table name.** When a physical table is added to a Tableau join it
+  surfaces as e.g. `1. LoginHistory`, while the migrated model declares the clean table (`LoginHistory`)
+  and keys its `COUNTROWS` measure clean. The implicit object-id `COUNT(*)` binding matched table names
+  exactly, so the prefixed name missed and the card silently dropped its value. `twb_to_pbir`'s row-count
+  binding now normalises a leading `"<n>. "` order prefix on either side (`_strip_table_order_prefix`),
+  binding the card to its clean COUNTROWS measure. A normalised match binds only when it is unambiguous
+  (two prefixed instances of the same physical table stay unbound and warned) and an exact key still
+  wins — warn-never-wrong. *(AAR #1 Issue E)*
 - **tableau-migration:** **local-CSV Import models no longer emit phantom or duplicate columns that
   made the model dead-on-arrival in Power BI.** When a `.tds`/`.tdsx` is migrated on the local-CSV
   Import path (`migrate_datasource(local_data=…)`), each table's columns are now reconciled against
