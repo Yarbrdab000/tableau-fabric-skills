@@ -1029,6 +1029,143 @@ def test_workbook_pbip_is_openable_and_bound_bypath(tmp_path):
     assert s["visuals_rebuilt"] >= 1
 
 
+# -- definition-of-done gate for workbook inputs (rm-dashboard-default-discoverability) ----------
+# A Tableau workbook migration is not "done" when only its semantic model lands -- its dashboards
+# must be rebuilt and bound into an openable .pbip. The estate CLI now emits a machine
+# definition-of-done ledger (report["definition_of_done"]) and a LOUD summary banner when a
+# workbook input produced no openable, model-bound report. It is soft-but-loud: additive, never
+# raises, never changes exit status. The one honest carve-out is a published-datasource workbook
+# whose published datasource was not migrated in the same run (recorded "skipped", not "failed").
+def test_definition_of_done_classifier_pass_fail_skip():
+    wb_details = [
+        {"name": "Bound WB", "pbip_status": "built", "bound_model": "M",
+         "pbip_folder": "pbip/Bound WB/Bound WB.pbip"},
+        {"name": "Multi WB",
+         "datasource_pbips": [{"pbip_status": "built"}, {"pbip_status": "skipped"}]},
+        {"name": "Orphan WB", "viz_status": "built", "pbip_status": "skipped",
+         "pbip_warnings": ["manual attention required: routes to the lakehouse fallback -- "
+                           "workbook .pbip skipped"]},
+        {"name": "Published WB", "pbip_status": "skipped",
+         "binding_signal": {"kind": "published"},
+         "pbip_warnings": ["manual attention required: routes to the lakehouse fallback"]},
+    ]
+    dod = me._definition_of_done(wb_details, pbip_enabled=True)
+
+    assert dod["applicable"] is True
+    assert dod["status"] == "failed"                       # any failure -> overall failed
+    assert dod["workbooks_total"] == 4
+    assert dod["reports_bound"] == 2                        # Bound WB + Multi WB (any DS built)
+    assert dod["reports_failed"] == 1                       # Orphan WB only
+    by_name = {e["workbook"]: e for e in dod["workbooks"]}
+    assert by_name["Bound WB"]["status"] == "pass"
+    assert by_name["Bound WB"]["report_bound"] is True
+    assert by_name["Multi WB"]["status"] == "pass"          # a multi-DS workbook with any DS bound
+    assert by_name["Orphan WB"]["status"] == "failed"
+    assert "lakehouse fallback" in by_name["Orphan WB"]["reason"]
+    assert not by_name["Orphan WB"]["reason"].startswith("manual attention required")  # prefix stripped
+    assert by_name["Published WB"]["status"] == "skipped"   # the honest carve-out
+    assert "published" in by_name["Published WB"]["reason"].lower()
+
+
+def test_definition_of_done_classifier_pbip_disabled_and_empty():
+    # --no-pbip: the user opted out of openable projects -> skipped, never failed.
+    off = me._definition_of_done([{"name": "X", "pbip_status": "built"}], pbip_enabled=False)
+    assert off["status"] == "skipped"
+    assert off["workbooks"][0]["status"] == "skipped"
+    assert "no-pbip" in off["workbooks"][0]["reason"]
+    # No workbook inputs at all -> not applicable (a pure datasource run).
+    none = me._definition_of_done([], pbip_enabled=True)
+    assert none["applicable"] is False
+    assert none["status"] == "not_applicable"
+    assert none["workbooks"] == []
+
+
+def test_definition_of_done_pass_end_to_end(tmp_path):
+    src = InMemoryTableauSource(workbooks={"Exec Dashboard": SUPERSTORE_DASHBOARD_TWB})
+    out = tmp_path / "b"
+    report = migrate_estate(src, str(out))
+
+    dod = report["definition_of_done"]
+    assert dod["applicable"] is True
+    assert dod["status"] == "pass"
+    assert dod["reports_bound"] == 1
+    assert dod["workbooks"][0]["workbook"] == "Exec Dashboard"
+    assert dod["workbooks"][0]["report_bound"] is True
+
+    summary_md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "DEFINITION OF DONE: PASS" in summary_md
+
+
+def test_definition_of_done_failed_end_to_end_is_soft(tmp_path):
+    # An injected viz builds report parts, but the workbook has no embedded datasource to bind the
+    # rebuilt report to -> an ORPHANED report (the AAR failure). The gate must FAIL LOUD yet stay
+    # soft: migrate_estate still returns a report and writes the bundle (exit status unchanged).
+    def fake_viz(text, name):
+        return {"parts": {"definition/report.json": "{}"}, "note": "rebuilt 1 sheet"}
+
+    src = InMemoryTableauSource(workbooks={"Orphan Dashboard": "<workbook/>"})
+    out = tmp_path / "b"
+    report = migrate_estate(src, str(out), viz_stage=fake_viz)   # does not raise -> soft
+
+    dod = report["definition_of_done"]
+    assert dod["status"] == "failed"
+    assert dod["reports_failed"] == 1
+    entry = dod["workbooks"][0]
+    assert entry["workbook"] == "Orphan Dashboard"
+    assert entry["report_bound"] is False
+    assert entry["reason"]                                   # a concrete reason is recorded
+
+    summary_md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "DEFINITION OF DONE: FAILED" in summary_md
+    assert "Orphan Dashboard" in summary_md                  # the failing workbook is named loudly
+
+
+def test_definition_of_done_published_workbook_without_datasource_is_skipped(tmp_path):
+    # A published-datasource (sqlproxy) workbook migrated WITHOUT its published datasource in the run
+    # legitimately produces no bound report -- the named honest carve-out. It must be "skipped", not
+    # "failed", so a real co-migrate-the-datasource limitation never trips the loud FAILED banner.
+    src = InMemoryTableauSource(workbooks={"Published WB": PUBLISHED_DS_WORKBOOK_TWB})
+    out = tmp_path / "b"
+    report = migrate_estate(src, str(out))
+
+    wb = report["workbooks"][0]
+    assert (wb.get("binding_signal") or {}).get("kind") == "published"
+    dod = report["definition_of_done"]
+    assert dod["status"] == "skipped"
+    assert dod["reports_failed"] == 0
+    assert dod["workbooks"][0]["status"] == "skipped"
+
+    summary_md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "DEFINITION OF DONE: FAILED" not in summary_md
+
+
+def test_definition_of_done_not_applicable_for_datasource_only_run(tmp_path):
+    # A pure datasource run has no workbook inputs -> the gate is not applicable and adds no banner
+    # (the datasource-only summary head stays byte-identical to before the gate existed).
+    src = InMemoryTableauSource(datasources={"Orders DS": LIVE_TDS})
+    out = tmp_path / "b"
+    report = migrate_estate(src, str(out))
+
+    assert report["definition_of_done"]["applicable"] is False
+    assert report["definition_of_done"]["status"] == "not_applicable"
+    summary_md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "DEFINITION OF DONE" not in summary_md
+
+
+def test_definition_of_done_main_exits_zero_with_workbook(tmp_path, capsys):
+    # main() wires the gate and prints a loud one-liner, but exit status is unchanged (soft-but-loud).
+    src_dir = tmp_path / "in"
+    src_dir.mkdir()
+    (src_dir / "Exec Dashboard.twb").write_text(SUPERSTORE_DASHBOARD_TWB, encoding="utf-8")
+    out_dir = tmp_path / "out"
+
+    rc = me.main(["-i", str(src_dir), "-o", str(out_dir)])
+    assert rc == 0
+    printed = capsys.readouterr().out
+    assert "definition of done" in printed.lower()
+    assert (out_dir / "summary.md").read_text(encoding="utf-8").count("DEFINITION OF DONE") >= 1
+
+
 # A workbook whose only date column (Order Date) becomes the model's ACTIVE calendar date. The
 # rebuilt report's date axis must rebind to the shared marked Date table, not the Orders fact's raw
 # date column, so time intelligence runs through the calendar.

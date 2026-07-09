@@ -13,7 +13,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration:** **an approved assisted translation can now name its calc column's home table.**
+- **tableau-migration:** **a workbook migration now fails loud when it produces no openable, model-bound
+  report, and report rebuild is framed as a default deliverable instead of a preview.** Across three
+  real-world migrations the running agent rebuilt only the semantic model and left the workbook's
+  dashboards unbuilt — the skill advertised "semantic models," called report rebuild a *preview*, and had
+  no check that a workbook actually yielded a bound report. A new machine definition-of-done gate now
+  classifies every workbook input (`_definition_of_done`) and surfaces the verdict three ways: an additive
+  `report["definition_of_done"]` ledger (`{applicable, status, workbooks_total, reports_bound,
+  reports_failed, workbooks:[…]}`), a `summary.md` banner (a loud **⛔ DEFINITION OF DONE: FAILED**
+  section naming each unbound workbook, or a `✅`/`ℹ️` one-line status), and an ASCII `[FAIL]/[OK]/[--]`
+  stdout line. The gate is *soft-but-loud*: it never changes the process exit status (stays `0`) and
+  honestly **skips** the two legitimate cases — openable projects disabled (`--no-pbip`), and a
+  published-datasource workbook whose `.tds` was not co-migrated in the same run. Pure datasource runs are
+  unaffected (`applicable: false`, no banner, byte-identical summary head). The frontmatter description,
+  title, intro, and a new RUN CONTRACT gate rule are reworded so that whole-workbook → semantic model **+**
+  bound Power BI report reads as the unmissable default. No existing report keys renamed or removed.
+  *(AAR #1 / #2 / #3 — report rebuild was real but neither discoverable nor enforced by default)*
   `approved_calc_dax` values accept an additive dict form (`{"dax": "<DAX>", "table": "<TargetTable>"}`)
   alongside the existing flat `{name: "<DAX>"}` string form. When the deterministic tier could not place a
   row-context (dimension) calc, it defaulted the column to the anchor table — where the approved DAX

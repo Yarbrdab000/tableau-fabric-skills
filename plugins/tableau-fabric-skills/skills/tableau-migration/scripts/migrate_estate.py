@@ -2426,6 +2426,7 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
         "summary": summary,
         "datasources": ds_details,
         "workbooks": wb_details,
+        "definition_of_done": _definition_of_done(wb_details, pbip_dir is not None),
         "fallbacks": fallbacks,
     }
 
@@ -2557,6 +2558,117 @@ def _summarize(ds_details, wb_details, viz_available):
     }
 
 
+def _dod_fail_reason(w):
+    """A short, human reason a workbook produced no openable, model-bound report.
+
+    Prefers the concrete viz/pbip signal already recorded on the workbook detail: a hard viz error,
+    else the first ``pbip_warnings`` entry (with the ``manual attention required:`` prefix stripped),
+    else a viz warning, else a generic fallback. Read-only; never raises.
+    """
+    if w.get("viz_status") == "error":
+        return (w.get("note") or "viz rebuild failed").strip()
+    for warn in (w.get("pbip_warnings") or []):
+        if warn:
+            return warn[len(_PBIP_WARN):] if warn.startswith(_PBIP_WARN) else warn
+    if w.get("viz_status") == "warned":
+        return (w.get("note") or "viz rebuild warned").strip()
+    return "no openable, model-bound report was produced"
+
+
+def _definition_of_done(wb_details, pbip_enabled):
+    """A machine definition-of-done ledger for workbook inputs (additive; never raises).
+
+    A Tableau *workbook* migration is only complete when its dashboards are rebuilt and bound into an
+    openable ``.pbip`` -- not when its semantic model alone lands. This classifies every workbook:
+
+    - **pass** -- an openable, model-bound report was produced (``pbip_status == "built"``, or, for a
+      multi-datasource workbook, any ``datasource_pbips`` entry built).
+    - **skipped** -- either openable projects were disabled (``--no-pbip``), or the workbook connects
+      to a *published* Tableau datasource that was not co-migrated in the same run (the one honest
+      carve-out: its ``.tds`` must be in scope to bind an openable report).
+    - **failed** -- a workbook that should have produced a bound report did not (an orphaned report).
+
+    The overall status is ``not_applicable`` (no workbook inputs), ``failed`` (any failure -- the loud
+    case), ``skipped`` (no failures, nothing bound / pbip disabled), or ``pass``. Purely a report key:
+    it changes no behaviour and never alters exit status (soft-but-loud).
+    """
+    workbooks = []
+    for w in wb_details:
+        bound = (w.get("pbip_status") == "built") or any(
+            (e or {}).get("pbip_status") == "built" for e in (w.get("datasource_pbips") or []))
+        if not pbip_enabled:
+            status = "skipped"
+            reason = "openable .pbip projects disabled (--no-pbip)"
+        elif bound:
+            status, reason = "pass", ""
+        elif (w.get("binding_signal") or {}).get("kind") == "published":
+            status = "skipped"
+            reason = ("published-datasource workbook -- co-migrate its published datasource (.tds) "
+                      "in the same run to bind an openable report")
+        else:
+            status, reason = "failed", _dod_fail_reason(w)
+        workbooks.append({
+            "workbook": w.get("name"),
+            "report_bound": bool(bound),
+            "bound_model": w.get("bound_model"),
+            "pbip_folder": w.get("pbip_folder"),
+            "status": status,
+            "reason": reason,
+        })
+
+    reports_bound = sum(1 for e in workbooks if e["report_bound"])
+    reports_failed = sum(1 for e in workbooks if e["status"] == "failed")
+    if not wb_details:
+        overall = "not_applicable"
+    elif reports_failed:
+        overall = "failed"
+    elif not pbip_enabled:
+        overall = "skipped"
+    elif reports_bound:
+        overall = "pass"
+    else:
+        overall = "skipped"
+    return {
+        "applicable": bool(wb_details),
+        "status": overall,
+        "workbooks_total": len(wb_details),
+        "reports_bound": reports_bound,
+        "reports_failed": reports_failed,
+        "workbooks": workbooks,
+    }
+
+
+def _dod_banner(dod):
+    """Render the definition-of-done section for ``summary.md`` as a list of lines.
+
+    Returns ``[]`` for a run with no workbook inputs, so a pure datasource run's summary head stays
+    byte-identical. A ``failed`` run gets a loud banner naming each unbound workbook; ``pass`` and
+    ``skipped`` get a one-line status. Emoji is safe here (``summary.md`` is written UTF-8).
+    """
+    if not dod or not dod.get("applicable"):
+        return []
+    status = dod.get("status")
+    total = dod.get("workbooks_total", 0)
+    if status == "failed":
+        failed = [w for w in dod.get("workbooks", []) if w.get("status") == "failed"]
+        out = [
+            "## \u26d4 DEFINITION OF DONE: FAILED",
+            "",
+            (f"{len(failed)} of {total} workbook input(s) produced no openable, model-bound Power BI "
+             "report. A Tableau workbook migration is not complete until its dashboards are rebuilt "
+             "and bound into a `.pbip` (see the Workbooks table below)."),
+            "",
+        ]
+        out += [f"- **{w.get('workbook')}** -- {w.get('reason')}" for w in failed]
+        out.append("")
+        return out
+    if status == "pass":
+        return [f"## \u2705 DEFINITION OF DONE: PASS -- {dod.get('reports_bound', 0)} of {total} "
+                "workbook report(s) rebuilt and bound into an openable `.pbip`.", ""]
+    return [f"## \u2139\ufe0f DEFINITION OF DONE: SKIPPED -- no workbook report was bound "
+            "(see the Workbooks table for why).", ""]
+
+
 def _render_summary_md(report):
     """Render the human-readable ``summary.md`` from the report dict."""
     s = report["summary"]
@@ -2566,6 +2678,7 @@ def _render_summary_md(report):
         f"_Generated {report['generated_at']} by `{report['tool']}` "
         f"from {report['source'].get('kind')}._",
         "",
+        *_dod_banner(report.get("definition_of_done")),
         "## Summary",
         "",
         f"- **Datasources:** {s['datasources_total']} total -> "
@@ -2833,6 +2946,13 @@ def main(argv=None):
         print(f"Next step: {s['partitions_stubbed_total']} table partition(s) need manual M "
               f"completion -> see summary.md ('manual M partition completion'); the original SQL "
               f"is preserved in report.json.")
+    dod = report.get("definition_of_done") or {}
+    if dod.get("applicable"):
+        # ASCII markers only -- Windows cp1252 stdout raises on emoji. Soft-but-loud: exit stays 0.
+        marker = {"failed": "[FAIL]", "pass": "[OK]", "skipped": "[--]"}.get(dod.get("status"), "[--]")
+        print(f"{marker} Definition of done: {dod.get('status')} -- {dod.get('reports_bound', 0)}/"
+              f"{dod.get('workbooks_total', 0)} workbook report(s) rebuilt and bound "
+              f"(see summary.md).")
     return 0
 
 
