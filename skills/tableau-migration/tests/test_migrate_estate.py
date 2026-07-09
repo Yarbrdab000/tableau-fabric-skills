@@ -10,6 +10,7 @@ machine-readable ``report.json``, fallback handling, the viz seam, and the no-cr
 import io
 import json
 import os
+import tempfile
 import zipfile
 
 import pytest
@@ -879,13 +880,30 @@ SAPHANA_WORKBOOK_TWB = _viz_wb(
     _viz_ds("Hana Source", "federated.hana", "saphana.bb22", "saphana", "Stock"),
     _viz_ws("Stock by Category", "federated.hana", "Hana Source"))
 
-# Two embedded SQL Server datasources: a single PBIR report binds one model, so the primary is bound
-# and each remaining datasource is reported as a warning (never mis-bound silently).
+# Two embedded SQL Server datasources: each is migrated individually into its own nested project
+# (pbip/<WB>/<DS>/), because a single PBIR report binds exactly one model.
 MULTI_SOURCE_TWB = _viz_wb(
     _viz_ds("Sales Source", "federated.s1", "sqlserver.s1", "sqlserver", "Sales")
     + _viz_ds("Inventory Source", "federated.s2", "sqlserver.s2", "sqlserver", "Inventory"),
     _viz_ws("Sales by Category", "federated.s1", "Sales Source")
     + _viz_ws("Inventory by Category", "federated.s2", "Inventory Source"))
+
+
+# A mixed multi-datasource workbook: one mappable SQL Server datasource (builds a bound .pbip) plus a
+# SAP HANA datasource that routes to the land-to-Delta fallback (cannot be assembled into a bound
+# model). Proves per-datasource error isolation -- the fallback datasource is skipped-loud while its
+# sibling still builds, and the failure never pollutes the primary/top-level detail.
+MIXED_FALLBACK_TWB = _viz_wb(
+    _viz_ds("Sales Source", "federated.s1", "sqlserver.s1", "sqlserver", "Sales")
+    + _viz_ds("Hana Source", "federated.hana", "saphana.bb22", "saphana", "Stock"),
+    _viz_ws("Sales by Category", "federated.s1", "Sales Source")
+    + _viz_ws("Stock by Category", "federated.hana", "Hana Source"))
+
+
+# A single embedded datasource -> keeps the flat pbip/<WB>/ layout (no per-datasource nesting).
+SOLO_SOURCE_TWB = _viz_wb(
+    _viz_ds("Solo Source", "federated.s1", "sqlserver.s1", "sqlserver", "Sales"),
+    _viz_ws("Sales by Category", "federated.s1", "Solo Source"))
 
 
 # A workbook whose embedded datasource carries a calculated MEASURE (Profit Ratio) that a worksheet
@@ -1370,15 +1388,92 @@ def test_workbook_pbip_skipped_on_fallback_datasource(tmp_path):
     assert report["summary"]["workbooks_pbip_built"] == 0
 
 
-def test_workbook_pbip_warns_on_secondary_datasource(tmp_path):
-    src = InMemoryTableauSource(workbooks={"Multi WB": MULTI_SOURCE_TWB})
-    report = migrate_estate(src, str(tmp_path / "b"))
-    wb = report["workbooks"][0]
-    assert wb["pbip_status"] == "built"          # the primary still binds
-    assert wb["bound_model"]                       # a primary datasource was chosen
-    secondary = [w for w in wb["pbip_warnings"] if "secondary datasource" in w]
-    assert len(secondary) == 1
-    assert (tmp_path / "b" / "pbip" / "Multi WB" / "Multi WB.pbip").is_file()
+def test_workbook_pbip_builds_each_datasource_when_multiple():
+    # Multiple embedded datasources -> one self-contained project per datasource, nested at
+    # pbip/<WB>/<DS>/. The top-level keys mirror the primary; detail["datasource_pbips"] lists all.
+    # (A short temp root is used deliberately: the nested layout repeats the datasource name, so the
+    # deep pytest tmp_path prefix would trip Windows' 260-char MAX_PATH -- an environment artifact, not
+    # a product defect, since a real output dir like .\out stays well within budget.)
+    with tempfile.TemporaryDirectory() as out:
+        src = InMemoryTableauSource(workbooks={"Multi WB": MULTI_SOURCE_TWB})
+        report = migrate_estate(src, os.path.join(out, "b"))
+        wb = report["workbooks"][0]
+        assert wb["pbip_status"] == "built"          # top-level mirrors the primary datasource
+        assert wb["bound_model"]                       # a primary datasource was chosen + bound
+        # every embedded datasource is migrated individually -- none is silently dropped or warned away
+        assert not any("secondary datasource" in w for w in wb["pbip_warnings"])
+        entries = wb["datasource_pbips"]
+        assert len(entries) == 2
+        assert {e["datasource"] for e in entries} == {"Sales Source", "Inventory Source"}
+        assert all(e["pbip_status"] == "built" for e in entries)
+        assert sum(1 for e in entries if e["is_primary"]) == 1
+        # each datasource lands its own openable, self-contained project nested under the workbook folder
+        base = os.path.join(out, "b", "pbip", "Multi WB")
+        assert os.path.isfile(os.path.join(base, "Sales Source", "Sales Source.pbip"))
+        assert os.path.isfile(os.path.join(base, "Inventory Source", "Inventory Source.pbip"))
+
+
+def test_workbook_pbip_multi_datasource_projects_are_self_contained():
+    # Each nested per-datasource project carries its OWN semantic model + report bound to that model,
+    # so it opens independently (the accepted split: dashboards spanning datasources are separated).
+    with tempfile.TemporaryDirectory() as out:
+        src = InMemoryTableauSource(workbooks={"Multi WB": MULTI_SOURCE_TWB})
+        migrate_estate(src, os.path.join(out, "b"))
+        for ds in ("Sales Source", "Inventory Source"):
+            proj = os.path.join(out, "b", "pbip", "Multi WB", ds)
+            assert os.path.isfile(os.path.join(proj, f"{ds}.pbip"))
+            assert os.path.isdir(os.path.join(proj, f"{ds}.Report"))
+            assert os.path.isdir(os.path.join(proj, f"{ds}.SemanticModel"))
+
+
+def test_workbook_pbip_multi_datasource_isolates_per_datasource_failure():
+    # Per-datasource error isolation: when one embedded datasource routes to the lakehouse fallback
+    # (SAP HANA here), it is skipped-loud with its OWN warning while the sibling SQL Server datasource
+    # still builds. The failure never pollutes the primary/top-level detail (warn-never-wrong).
+    with tempfile.TemporaryDirectory() as out:
+        src = InMemoryTableauSource(workbooks={"Mixed WB": MIXED_FALLBACK_TWB})
+        report = migrate_estate(src, os.path.join(out, "b"))
+        wb = report["workbooks"][0]
+        # top-level mirrors the built primary (SQL Server), and carries none of the fallback's warnings
+        assert wb["pbip_status"] == "built"
+        assert wb["bound_model"] == "Sales Source"
+        assert wb["pbip_warnings"] == []
+        entries = {e["datasource"]: e for e in wb["datasource_pbips"]}
+        assert entries["Sales Source"]["pbip_status"] == "built"
+        assert entries["Hana Source"]["pbip_status"] == "skipped"
+        assert any("lakehouse fallback" in w for w in entries["Hana Source"]["pbip_warnings"])
+        # the built sibling lands on disk; the skipped one writes no project
+        base = os.path.join(out, "b", "pbip", "Mixed WB")
+        assert os.path.isfile(os.path.join(base, "Sales Source", "Sales Source.pbip"))
+        assert not os.path.exists(os.path.join(base, "Hana Source"))
+
+
+def test_summary_counts_datasource_pbips_across_workbooks():
+    # Slice 4: the estate summary carries an additive per-datasource rollup. A multi-datasource
+    # workbook contributes one project per datasource; a single-datasource workbook contributes its
+    # flat project. workbooks_multi_datasource counts only the nested ones.
+    with tempfile.TemporaryDirectory() as out:
+        src = InMemoryTableauSource(workbooks={"Multi WB": MULTI_SOURCE_TWB,
+                                               "Solo WB": SOLO_SOURCE_TWB})
+        report = migrate_estate(src, os.path.join(out, "b"))
+        s = report["summary"]
+        assert s["workbooks_multi_datasource"] == 1          # only "Multi WB" nested
+        assert s["datasource_pbips_total"] == 3              # 2 (multi) + 1 (solo)
+        assert s["datasource_pbips_built"] == 3              # all three build
+        # the workbook-level count is unchanged (one top-level project per workbook)
+        assert s["workbooks_pbip_built"] == 2
+
+
+def test_summary_datasource_pbip_rollup_reflects_partial_failure():
+    # A workbook where one datasource falls back counts toward total but not built, and the summary
+    # stays honest (the fallback datasource is not counted as a built project).
+    with tempfile.TemporaryDirectory() as out:
+        src = InMemoryTableauSource(workbooks={"Mixed WB": MIXED_FALLBACK_TWB})
+        report = migrate_estate(src, os.path.join(out, "b"))
+        s = report["summary"]
+        assert s["workbooks_multi_datasource"] == 1
+        assert s["datasource_pbips_total"] == 2
+        assert s["datasource_pbips_built"] == 1              # only the SQL Server datasource built
 
 
 def test_workbook_pbip_skipped_without_pbir_definition(tmp_path):

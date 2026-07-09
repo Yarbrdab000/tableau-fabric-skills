@@ -13,6 +13,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **multi-datasource workbooks now migrate every embedded datasource, not
+  just the primary.** A published Tableau workbook can embed several datasources; previously the
+  estate migration bound the report to the single most-used one and dropped the rest with a warning.
+  `migrate_estate.py` now migrates **each** embedded datasource into its own self-contained,
+  openable Power BI project. A single-datasource workbook keeps the established flat
+  `pbip/<Workbook>/` layout byte-for-byte; a workbook with several datasources instead emits one
+  project per datasource nested at `pbip/<Workbook>/<Datasource>/` — each a full-fidelity model
+  rebuilt from that datasource plus a PBIR report rebound to it (a single report binds exactly one
+  model, so a dashboard whose views span datasources is split across the per-datasource projects, an
+  accepted and documented limitation). Per-datasource error isolation: an unmappable/fallback
+  datasource is skipped-loud on its own entry while its siblings still build, and the failure never
+  pollutes the primary. Additive report schema only — the primary datasource still mirrors onto the
+  existing top-level keys for back-compat, and new keys `datasource_pbips` (per-workbook),
+  `datasource_pbips_total`, `datasource_pbips_built`, and `workbooks_multi_datasource` (summary)
+  make the per-datasource breakdown explicit; `summary.md` gains a per-datasource projects section.
+  Verified end-to-end on a real 3-embedded-datasource workbook (all three projects built,
+  self-contained, and open in Power BI Desktop). No existing report keys renamed or removed.
 - **tableau-migration:** **deployed models now open without benign "needs refresh" warning
   triangles.** `deploy_to_fabric.py` runs a credential-free ProcessRecalc (Power BI enhanced refresh
   `type: Calculate`) automatically after every model deploy, exposed as the importable
