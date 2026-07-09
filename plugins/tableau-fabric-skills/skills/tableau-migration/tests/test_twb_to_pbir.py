@@ -3835,6 +3835,86 @@ def test_categorical_colour_legend_is_not_a_gradient():
     assert ir["worksheets"][0]["color_gradient"] is None
 
 
+# -- default (automatic) continuous colour ramp -- Tableau serialises NO <color-palette> -----------
+# When the author keeps Tableau's default automatic colour ramp on a continuous measure, Tableau
+# writes the colour encoding (``type='interpolated'``) but NO ``<color-palette>``. The exact colours
+# are unrecoverable, so a standard ColorBrewer stand-in is SYNTHESISED (faithful direction) and
+# DISCLOSED via a warning, rather than silently dropping the heat scale (the prior behaviour).
+def _mark_color_style_no_palette(field_token, enc_type="interpolated", center=None):
+    center_attr = f" center='{center}'" if center is not None else ""
+    return (f"<style><style-rule element='mark'>"
+            f"<encoding attr='color'{center_attr} type='{enc_type}' field='{field_token}'>"
+            f"</encoding></style-rule></style>")
+
+
+def test_default_continuous_palette_synthesised_when_no_explicit_stops():
+    # A continuous (interpolated) colour encoding with NO <color-palette> -> a synthesised sequential
+    # default gradient flagged ``default_palette`` (was ``None`` = a silent drop before the fix).
+    style = _mark_color_style_no_palette("[federated.abc].[sum:Sales:qk]")
+    enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    ir = parse_twb(_workbook(_heat_ws("Heat", color_field="sum:Sales:qk",
+                                      encodings=enc, style=style)))
+    cg = ir["worksheets"][0]["color_gradient"]
+    assert cg is not None
+    assert cg["default_palette"] is True
+    assert cg["palette_type"] == "ordered-sequential"
+    assert cg["center"] is None
+    assert len(cg["colors"]) >= 2          # a usable min -> max ramp
+    assert cg["interpolated"] is True
+    assert cg["is_table_calc"] is False
+
+
+def test_default_continuous_palette_emits_backcolor_and_discloses():
+    # The synthesised default ramp emits a real backColor FillRule (linearGradient2) AND a disclosure
+    # warning naming the default palette -- warn-never-wrong (emit the scale, flag the approximation).
+    style = _mark_color_style_no_palette("[federated.abc].[sum:Sales:qk]")
+    enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    res = migrate_twb_to_pbir(_workbook(
+        _heat_ws("Heat", color_field="sum:Sales:qk", encodings=enc, style=style)))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    vo = _values_objects(vj)
+    assert vo, "expected a default-palette conditional-format fill"
+    assert "linearGradient2" in _fill_rule(vo)["FillRule"]
+    fact = _cf_fact(res["candidate_records"], "Heat")
+    assert fact["status"] == "emitted"
+    assert fact["default_palette"] is True
+    disclosures = [w for w in res["warnings"] if "default continuous palette" in w["reason"]]
+    assert len(disclosures) == 1           # exactly one warning, no double-warn
+    assert "sequential" in disclosures[0]["reason"]
+
+
+def test_default_diverging_palette_when_center_present():
+    # A continuous encoding with a ``center`` but no palette -> a synthesised DIVERGING default
+    # (linearGradient3, centre pinned) with a matching disclosure.
+    style = _mark_color_style_no_palette("[federated.abc].[sum:Profit:qk]", center="0.0")
+    enc = "<encodings><color column='[federated.abc].[sum:Profit:qk]' /></encodings>"
+    res = migrate_twb_to_pbir(_workbook(
+        _heat_ws("Heat", color_field="sum:Profit:qk", encodings=enc, style=style)))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    vo = _values_objects(vj)
+    assert vo, "expected a default diverging fill"
+    grad = _fill_rule(vo)["FillRule"]["linearGradient3"]
+    assert grad["mid"]["value"]["Literal"]["Value"] == "0.0D"   # centre pinned
+    assert any("diverging" in w["reason"] and "default continuous palette" in w["reason"]
+               for w in res["warnings"])
+
+
+def test_explicit_palette_not_flagged_default_and_no_disclosure():
+    # Guard: an EXPLICIT palette is byte-unchanged by the default-synthesis path -- no
+    # ``default_palette`` flag on the IR or the fact, and no default-palette disclosure warning.
+    style = _mark_color_style("[federated.abc].[sum:Sales:qk]", "ordered-sequential",
+                              ["#f7fbff", "#08306b"])
+    enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    wb = _workbook(_heat_ws("Heat", color_field="sum:Sales:qk", encodings=enc, style=style))
+    cg = parse_twb(wb)["worksheets"][0]["color_gradient"]
+    assert "default_palette" not in cg
+    res = migrate_twb_to_pbir(wb)
+    fact = _cf_fact(res["candidate_records"], "Heat")
+    assert fact["status"] == "emitted"
+    assert "default_palette" not in fact
+    assert not any("default continuous palette" in w["reason"] for w in res["warnings"])
+
+
 # -- categorical mark colours (explicit author member -> hex palette) ----------
 # An explicit per-member colour map (``<map to='#hex'><bucket>"Member"</bucket></map>``) is
 # unambiguous author intent. On the discrete categorical charts (column / bar / pie / donut) it

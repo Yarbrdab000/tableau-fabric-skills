@@ -13,6 +13,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **heatmaps that used Tableau's default colour scale now keep their colour
+  instead of dropping it silently.** When an author leaves a table/matrix colour gradient on Tableau's
+  *default* continuous palette, the workbook serialises no explicit `<color-palette>` element — so the
+  viz rebuilder (`twb_to_pbir.py`) previously found no stops, returned no fill, and the conditional
+  formatting vanished with no trace. `_parse_color_gradient` now recognises a continuous colour
+  encoding that lacks serialised stops and synthesises a faithful-direction default gradient
+  (sequential ColorBrewer *Blues* when the encoding has no centre; diverging *RdBu* when it pins a
+  centre), so the heat scale is reconstructed on the rebuilt matrix. Because the colours are an
+  approximation of the source, every synthesised scale is disclosed: a per-worksheet warning
+  (`_disclose_default_palette`) plus a new additive report rollup
+  `color_scale_defaults` (`{count, worksheets, note}`) that `migrate_estate.py` attaches to a
+  workbook's report whenever the path fires, guaranteeing the approximation stays visible even when
+  the per-worksheet warning is collapsed by the fidelity summary. Explicit palettes are unaffected
+  (parsed byte-identically, never flagged). Verified end-to-end: a default-palette heatmap now emits a
+  `backColor` gradient on its rebuilt matrix and lists the worksheet under `color_scale_defaults`. No
+  existing report keys renamed or removed.
 - **tableau-migration:** **multi-datasource workbooks now migrate every embedded datasource, not
   just the primary.** A published Tableau workbook can embed several datasources; previously the
   estate migration bound the report to the single most-used one and dropped the rest with a warning.

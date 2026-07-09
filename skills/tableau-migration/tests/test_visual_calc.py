@@ -26,7 +26,7 @@ from visual_calc_spec import usage_to_visual_calc_spec
 from visual_calc_emitter import emit_visual_calc
 from twb_to_pbir import _apply_visual_calcs, _view_only_quick_index
 from twb_to_pbir import emit_pbir, parse_twb
-from migrate_estate import _visual_calc_rollup
+from migrate_estate import _visual_calc_rollup, _color_scale_rollup
 
 
 # -- fact factories ------------------------------------------------------------
@@ -524,6 +524,51 @@ def test_visual_calc_rollup_counts_by_status_role_family_and_chain():
 def test_visual_calc_rollup_none_when_no_facts():
     assert _visual_calc_rollup({"candidate_records": [{"other": 1}]}) is None
     assert _visual_calc_rollup({}) is None
+
+
+# -- default-palette disclosure rollup -----------------------------------------
+def test_color_scale_rollup_lists_default_palette_worksheets():
+    # A conditional-format fill and a visual-calculation fill each rode Tableau's default palette
+    # (default_palette=True); an explicit-palette fill and a non-dict record do NOT contribute.
+    result = {"candidate_records": [
+        {"worksheet": "ProductView",
+         "conditional_format": {"kind": "background_color_scale", "default_palette": True}},
+        {"worksheet": "HeatVC",
+         "visual_calc": {"kind": "visual_calculation", "default_palette": True}},
+        {"worksheet": "ExplicitPalette",
+         "conditional_format": {"kind": "background_color_scale"}},   # no default_palette -> skipped
+        {"no_facts_here": True},                                       # ignored
+        "not-a-dict",                                                  # ignored
+    ]}
+    roll = _color_scale_rollup(result)
+    assert roll is not None
+    assert roll["count"] == 2
+    assert roll["worksheets"] == ["ProductView", "HeatVC"]
+    assert "default continuous palette" in roll["note"]
+    assert "verify the colours against the source" in roll["note"]
+
+
+def test_color_scale_rollup_dedupes_worksheet_with_both_facts():
+    # A single worksheet that carries BOTH a cf and a vc default-palette fact is listed once.
+    result = {"candidate_records": [
+        {"worksheet": "ProductView",
+         "conditional_format": {"default_palette": True},
+         "visual_calc": {"default_palette": True}},
+    ]}
+    roll = _color_scale_rollup(result)
+    assert roll["count"] == 1
+    assert roll["worksheets"] == ["ProductView"]
+
+
+def test_color_scale_rollup_none_when_no_default_palette():
+    # Facts present but none flagged default_palette -> None (report byte-identical).
+    assert _color_scale_rollup({"candidate_records": [
+        {"worksheet": "A", "conditional_format": {"kind": "background_color_scale"}},
+        {"worksheet": "B", "visual_calc": {"kind": "visual_calculation"}},
+    ]}) is None
+    assert _color_scale_rollup({"candidate_records": [{"other": 1}]}) is None
+    assert _color_scale_rollup({}) is None
+    assert _color_scale_rollup(None) is None
 
 
 # -- 10. full parse_twb -> emit_pbir integration (VC lands in visual.json) -----
