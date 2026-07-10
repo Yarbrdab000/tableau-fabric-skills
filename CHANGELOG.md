@@ -13,15 +13,32 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration:** **new public `migrate_workbook` primitive — one code path for standalone-workbook and
+- **tableau-migration:** **a multi-datasource workbook now consolidates ALL its embedded datasources into ONE
+  openable semantic model — a simplification that closes a silent-drop bug and removes the per-datasource
+  project split.** Previously a workbook with several embedded datasources emitted one nested project per
+  datasource (`pbip/<WB>/<DS>/`), splitting a dashboard whose views span datasources. It now rebuilds every
+  embedded datasource into a *single* model as disconnected table islands — each table bound to its own
+  upstream connection, exactly like a federated multi-connection datasource, sharing only the assembler's
+  synthesized `Date` dimension — with one PBIR report bound to that one model, in the established flat
+  `pbip/<WB>/{<WB>.SemanticModel, <WB>.Report, <WB>.pbip}` layout (single-datasource workbooks are byte-for-byte
+  unchanged). This fixes a silent-drop defect where only the *primary* datasource's tables landed: the combined
+  descriptor now reaches the table build (`migrate_tds_to_semantic_model` accepts a pre-built `descriptor=`),
+  so every island's tables are present — zero datasources dropped. An island on an unmapped connector (e.g. SAP
+  HANA alongside SQL Server) lands as an honest needs-review M-partition scaffold, recorded on the workbook
+  detail's new additive `partitions_needs_review`, rather than being silently discarded ("stub it, never drop
+  it"). Two additive workbook-detail keys — `consolidated_datasources` (the island captions folded into the one
+  model, an anti-silent-drop audit trail) and `partitions_needs_review` — plus the estate summary's
+  `workbooks_multi_datasource` now counts consolidated workbooks. Additive: existing report keys and the
+  single-datasource layout are unchanged.
   estate workbook migration.** Rebuilding a Tableau workbook (its embedded datasource(s) **and** the report bound
   to them, into an openable `pbip/<Name>/` project) was previously only reachable through the private, estate-only
   loop inside `migrate_estate` — so an agent handed a lone `.twb`/`.twbx` had no public entry point and tended to
   hand-roll one, orphaning the report. `migrate_estate.migrate_workbook(source, *, write_to=…, name=None, pbip=True,
   …)` exposes that machinery directly: `source` accepts a `.twb`/`.twbx` path, raw workbook XML (`str`/`bytes`), or
   a live `TableauSource` + `wb_id`; it returns the same per-workbook detail dict the estate reports (`name`,
-  `viz_status`, `pbip_status`, `bound_model`/`bound_datasource`, `pbip_folder`, `viz_fidelity`, …), nesting one
-  project per datasource for a multi-datasource workbook, and only raises on invalid arguments (a per-workbook
+  `viz_status`, `pbip_status`, `bound_model`/`bound_datasource`, `pbip_folder`, `viz_fidelity`, …),
+  consolidating a multi-datasource workbook into a single model (see the consolidation entry above), and only
+  raises on invalid arguments (a per-workbook
   migration failure is reported on the detail, never raised). `migrate_estate` now **delegates** its workbook loop
   to this same function, so a standalone workbook and an estate workbook are byte-for-byte the same operation — the
   estate just runs it once per workbook. `migrate_datasource` stays datasource-scoped (model only); SKILL.md, the
@@ -881,9 +898,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   Connected App via the sidecar).
 
 ### Changed
-- **tableau-migration:** the `TranslatedBy` provenance annotation on deterministically-translated
-  measures now reads `deterministic`, matching the calculated-column path (previously an internal
-  project codename leaked into emitted TMDL). No report keys were renamed or removed.
+- **tableau-migration:** **the second compiler (Tier-1 assisted calc→DAX translation) is now a mandatory,
+  automatic, immediate stage of every migration — no longer an optional end-of-run offer.** Previously the
+  runbook framed the assisted pass as an end-of-run check-in that asked the user whether to run it and left
+  stubs inert if they declined. It now runs the moment the deterministic (Tier 0) pass leaves any calc
+  stubbed (`needs_review_total > 0`): the agent announces a one-line, non-optional gate
+  (`▶ Starting second compiler — N of M translated; K need review …`) and immediately proceeds — there is no
+  "want me to?" prompt, no decline path, and no configuration that turns it off. Landing shifts from *human
+  approval* to *automatic validation-gated*: every candidate that passes the syntactic gate
+  (`check_candidate_dax`, always) plus the reconciliation oracle (when data is landed) is landed
+  automatically via `approved_calc_dax`; a candidate with no faithful DAX form stays an inert stub with its
+  `TableauFormula` preserved (the **faithful-or-stub** invariant now binds at the *landing* step, not the
+  *run* step). Documentation-and-framing change only — `SKILL.md` step 3 + the *Assisted translation*
+  section, `resources/second-compiler.md`, and `resources/migration-orchestrator.md` Phase 4 were rewritten,
+  and the machine-emitted `summary.md` / CLI "Next step" strings now read as a mandatory instruction. No
+  report keys renamed or removed; the two-pass `approved_calc_dax` API is unchanged.
 - **tableau-migration:** refreshed `resources/feature-parity.md` Calculations section to reflect
   the translator's actual behavior — `FIXED` and table-scoped LOD, row-level calculated columns,
   scalar date/string functions as columns, and `CASE`/`WHEN` → DAX `SWITCH` all translate;
@@ -905,6 +934,14 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
+- **tableau-migration:** **generated PBIR object names are now much shorter, keeping deep report paths under
+  the Windows MAX_PATH (260) limit.** `twb_to_pbir._sanitize` built every page/visual/slicer folder and name
+  as a 32-char readable prefix + 8-char md5 (capped at 50), and several visual/slicer names redundantly
+  embedded their already-hashed page slug — producing names like `paramslicer-page-Dashboard118f16894ac216`
+  that pushed the nested `…Report/definition/pages/<page>/visuals/<visual>/visual.json` path over MAX_PATH on
+  real dashboards. The readable prefix is now truncated to 16 chars (max name 16 + 8 = 24), which also strips
+  away the redundant embedded page slug automatically. Uniqueness is unchanged — it was always carried by the
+  8-char md5 of the full name text, so the shorter prefix costs no collision safety.
 - **tableau-migration:** **a join/union datasource now rebuilds directly to source as a multi-table model
   instead of being skipped.** A Tableau physical `join`/`union` tree previously collapsed into one opaque
   "combination" table, which the storage policy could only fall back on — so a join-tree datasource never

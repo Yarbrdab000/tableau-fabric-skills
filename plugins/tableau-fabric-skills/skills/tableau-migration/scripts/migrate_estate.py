@@ -49,7 +49,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 
 try:  # works whether imported as a package or run with scripts/ on sys.path
-    from .connection_to_m import parse_tds, extract_bundled_flatfile, extract_calcs
+    from .connection_to_m import (parse_tds, extract_bundled_flatfile, extract_calcs,
+                                  combine_descriptors)
     from .storage_mode import select_storage_mode, FALLBACK_NEEDS_DECISION
     from .assemble_model import (assemble_import_model, assemble_local_import_model,
                                  materialize_bundled_flatfile_data, write_model_folder,
@@ -59,7 +60,8 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .workbook_calc_usage import workbook_calc_usage
     from . import fetch_tds as F
 except ImportError:
-    from connection_to_m import parse_tds, extract_bundled_flatfile, extract_calcs
+    from connection_to_m import (parse_tds, extract_bundled_flatfile, extract_calcs,
+                                 combine_descriptors)
     from storage_mode import select_storage_mode, FALLBACK_NEEDS_DECISION
     from assemble_model import (assemble_import_model, assemble_local_import_model,
                                 materialize_bundled_flatfile_data, write_model_folder,
@@ -1667,7 +1669,8 @@ def _field_map_from_model(res_report):
 
 def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, model_safe, dest,
                            folder_rel, report_base, viz_name, viz=None, ds_catalog=None,
-                           approved_calc_dax=None, wb_id=None, pbip_dir=None):
+                           approved_calc_dax=None, wb_id=None, pbip_dir=None,
+                           descriptor=None, combine_datasources=None):
     """Rebuild ONE embedded datasource into a self-contained ``.pbip`` and record it on ``entry``.
 
     Extracted verbatim from ``_attach_workbook_pbip`` so a workbook with several embedded datasources
@@ -1700,13 +1703,30 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
     # to materialize data bundled in the .twbx itself (Excel/CSV, or an embedded .hyper extract).
     ff_path = None
     local_data = None
-    if ds_catalog:
+    if descriptor is not None and combine_datasources:
+        # Consolidated model: each island's flat-file data was materialized when its datasource was
+        # migrated separately (datasources run before workbooks). Merge every island's landed CSV set
+        # into one ``local_data`` dict so the single combined model loads them all; the first Excel
+        # ``flatfile_path`` seeds the scalar (per-relation connection facts route each table).
+        merged_local = {}
+        for _d in combine_datasources:
+            cat = (ds_catalog or {}).get(
+                _norm_ds(_d.get("caption") or _d.get("name") or _d.get("label")))
+            if cat:
+                if cat.get("table_csv_paths"):
+                    merged_local.update(cat["table_csv_paths"])
+                if ff_path is None and cat.get("flatfile_path"):
+                    ff_path = cat.get("flatfile_path")
+        local_data = merged_local or None
+    elif ds_catalog:
         cat = ds_catalog.get(_norm_ds(ds.get("caption") or ds.get("name") or label))
         if cat:
             ff_path = cat.get("flatfile_path")
             local_data = cat.get("table_csv_paths")
     try:
-        res = migrate_datasource(twb_text, model_name=model_safe, datasource=label,
+        res = migrate_datasource(twb_text, model_name=model_safe,
+                                 datasource=(None if descriptor is not None else label),
+                                 descriptor=descriptor,
                                  approved_calc_dax=approved_calc_dax,
                                  packaged_source=wb_id, flatfile_dest_dir=_ff_dest,
                                  flatfile_path=ff_path, local_data=local_data)
@@ -1741,12 +1761,15 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
         # estate already built the matching published datasource, rebuild the model from THAT real
         # schema -- carrying the workbook's own calculated fields so its view-local measures
         # translate -- and bind the report to it. Never guesses (a real datasource-name match is
-        # required); any failure keeps the honest skip below (warn-never-wrong).
-        recovered = _rebuild_from_published_match(wb_detail, twb_text, model_safe, ds_catalog,
-                                                  approved_calc_dax=approved_calc_dax)
-        if recovered is not None:
-            res = recovered
-            res_report = res.get("report") or {}
+        # required); any failure keeps the honest skip below (warn-never-wrong). Skipped for a
+        # pre-combined descriptor (its islands are already real schemas -- a fallback there is a
+        # genuinely-undoable shape, so it stubs loud below).
+        if descriptor is None:
+            recovered = _rebuild_from_published_match(wb_detail, twb_text, model_safe, ds_catalog,
+                                                      approved_calc_dax=approved_calc_dax)
+            if recovered is not None:
+                res = recovered
+                res_report = res.get("report") or {}
         if res_report.get("fallback"):
             rationale = (res_report.get("storage_decision") or {}).get("rationale") or "undoable shape"
             warns.append(_PBIP_WARN + f"embedded datasource {label!r} needs a storage decision "
@@ -1864,23 +1887,30 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                   pbip_folder=folder_rel,
                   bound_model=model_safe,
                   model_translation_handoff=res_report.get("translation_handoff"))
+    # Honest disclosure (additive): any island that landed as a needs-review M partition scaffold
+    # (an unmapped connector consolidated alongside mapped ones) is surfaced here so a stubbed-not-
+    # dropped table is visible at the estate level -- for a consolidated workbook the model is built
+    # in this path, so its stubbed partitions are not counted in the datasource-level rollup.
+    _needs_review = res_report.get("partitions_needs_review")
+    if _needs_review:
+        entry["partitions_needs_review"] = _needs_review
 
 
 def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None, ds_catalog=None,
                           approved_calc_dax=None, wb_id=None):
-    """Build openable, self-contained workbook ``.pbip`` project(s) and record them on ``detail``.
+    """Build ONE openable, self-contained workbook ``.pbip`` project and record it on ``detail``.
 
-    A workbook with a SINGLE embedded datasource keeps the established flat layout: its one datasource
-    is rebuilt into a semantic model (reusing the datasource pipeline, so calculated fields are
-    auto-extracted and role-split) and the rebuilt report is bound to it *by path* as a sibling,
-    yielding ``pbip/<WB>/{<DS>.SemanticModel, <WB>.Report, <WB>.pbip}``. A workbook with SEVERAL
-    embedded datasources instead gets ONE self-contained project per datasource, nested at
-    ``pbip/<WB>/<DS>/`` (each datasource's own model + a report rebound to it), because a single PBIR
-    report binds exactly one model; ``detail["datasource_pbips"]`` lists every datasource's outcome and
-    the top-level keys mirror the primary (most-used) datasource. Purely additive: it never alters the
-    bare ``reports/`` write. Sets ``pbip_status``/``pbip_folder``/``bound_model``/``bound_datasource``/
-    ``model_translation_handoff`` and appends honest ``pbip_warnings`` for every case it cannot
-    faithfully bind (no embedded datasource, needs-storage-decision fallback, write failure). Never raises.
+    Every embedded datasource in the workbook is rebuilt into a SINGLE semantic model. A workbook with
+    one datasource yields it directly; a workbook with several has their descriptors combined into one
+    model whose tables are disconnected islands -- each bound to its own upstream connection, exactly
+    like a federated multi-connection datasource -- sharing only the assembler's synthesized Date
+    dimension. Either way the layout is the established flat ``pbip/<WB>/{<Model>.SemanticModel,
+    <WB>.Report, <WB>.pbip}`` and the single rebuilt report binds to that one model by path, so a
+    dashboard whose views span datasources rebuilds in one pass instead of being split. Purely additive:
+    it never alters the bare ``reports/`` write. Sets ``pbip_status``/``pbip_folder``/``bound_model``/
+    ``bound_datasource``/``model_translation_handoff`` and appends honest ``pbip_warnings`` for every
+    case it cannot faithfully bind (no embedded datasource, a datasource that will not parse, a
+    needs-storage-decision fallback, write failure). Never raises.
     """
     detail.update(pbip_status="skipped", pbip_folder=None, bound_model=None,
                   bound_datasource=None, model_translation_handoff=None)
@@ -1921,35 +1951,39 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
                                approved_calc_dax=approved_calc_dax, wb_id=wb_id, pbip_dir=pbip_dir)
         return
 
-    # MULTIPLE embedded datasources: a single PBIR report binds exactly ONE model, so faithful parity
-    # in a single report is impossible. Instead migrate EACH embedded datasource individually into its
-    # own self-contained project nested at ``pbip/<WB>/<DS>/`` (that datasource's full-fidelity model +
-    # the report rebound to it). A dashboard whose views span datasources is split across these
-    # per-datasource projects -- an accepted, documented limitation. Per-datasource error isolation: a
-    # failure in one datasource marks only its own entry; the siblings still build. The top-level detail
-    # keys mirror the PRIMARY (most-used) datasource for back-compat, and ``detail["datasource_pbips"]``
-    # lists every datasource's outcome.
-    used = set()
-    entries = []
+    # MULTIPLE embedded datasources: rebuild ALL of them into ONE semantic model as disconnected table
+    # islands -- each table bound to its OWN upstream connection, exactly like a federated multi-
+    # connection datasource (Power BI keeps the islands as separate tables sharing only the assembler's
+    # synthesized Date dimension). A single PBIR report then binds to that ONE model in a single pass, so
+    # a dashboard whose views span datasources rebuilds faithfully instead of being split across per-
+    # datasource projects. Combining the parsed descriptors up front is the WHOLE change -- the model +
+    # report build is the SAME single-datasource path fed a pre-combined descriptor. Zero silent drops:
+    # combine_descriptors is a total union, and a datasource that fails to parse is recorded loud and
+    # excluded while the rest still land.
+    model_safe = _fs_safe(detail.get("name") or safe_base, "Model")
+    descriptors = []
+    captions = []
     for ds in all_ds:
         ds_label = ds.get("label") or ds.get("caption") or ds.get("name")
-        ds_model = _fs_safe(ds.get("caption") or ds.get("name") or ds_label, "Model")
-        ds_folder = _safe_folder(ds.get("caption") or ds.get("name") or ds_label, used)
-        entry = detail if ds is primary else {}
-        _build_datasource_pbip(entry, detail, twb_text, result, ds, label=ds_label,
-                               model_safe=ds_model,
-                               dest=os.path.join(pbip_dir, safe_base, ds_folder),
-                               folder_rel=f"pbip/{safe_base}/{ds_folder}/{ds_folder}.pbip",
-                               report_base=ds_folder, viz_name=viz_name, viz=viz,
-                               ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax,
-                               wb_id=wb_id, pbip_dir=pbip_dir)
-        entries.append({"datasource": ds_label, "model": ds_model, "folder": ds_folder,
-                        "is_primary": ds is primary,
-                        "pbip_status": entry.get("pbip_status", "skipped"),
-                        "pbip_folder": entry.get("pbip_folder"),
-                        "bound_model": entry.get("bound_model"),
-                        "pbip_warnings": list(entry.get("pbip_warnings") or [])})
-    detail["datasource_pbips"] = entries
+        try:
+            descriptors.append(parse_tds(twb_text, ds_label))
+            captions.append(ds.get("caption") or ds.get("name") or ds_label)
+        except Exception as exc:
+            warns.append(_PBIP_WARN + f"could not parse embedded datasource {ds_label!r} "
+                         f"({type(exc).__name__}: {exc}) -- excluded from the combined model")
+    if not descriptors:
+        warns.append(_PBIP_WARN + "no embedded datasource could be parsed -- workbook .pbip skipped")
+        return
+    combined = combine_descriptors(descriptors, captions=captions)
+    # Audit trail (additive): the island captions folded into the ONE model. Proves zero silent drops
+    # (every parsed datasource is listed) and drives the summary's ``workbooks_multi_datasource`` stat.
+    detail["consolidated_datasources"] = list(captions)
+    _build_datasource_pbip(detail, detail, twb_text, result, primary, label=label,
+                           model_safe=model_safe, dest=os.path.join(pbip_dir, safe_base),
+                           folder_rel=f"pbip/{safe_base}/{safe_base}.pbip", report_base=safe_base,
+                           viz_name=viz_name, viz=viz, ds_catalog=ds_catalog,
+                           approved_calc_dax=approved_calc_dax, wb_id=wb_id, pbip_dir=pbip_dir,
+                           descriptor=combined, combine_datasources=all_ds)
 
 
 def _attach_viz_advice(detail, result, safe_base, reports_dir):
@@ -2584,10 +2618,11 @@ def _summarize(ds_details, wb_details, viz_available):
     wb_warned = sum(1 for w in wb_details if w.get("viz_status") == "warned")
     wb_error = sum(1 for w in wb_details if w.get("viz_status") == "error")
     wb_pbip_built = sum(1 for w in wb_details if w.get("pbip_status") == "built")
-    # Per-datasource PBIP rollup (additive): a workbook with several embedded datasources emits one
-    # self-contained project per datasource (nested at pbip/<WB>/<DS>/); a single-datasource workbook
-    # keeps its flat pbip/<WB>/ project. Count datasource-level projects so the breakdown is explicit
-    # alongside the workbook-level `workbooks_pbip_built` (which counts the primary/top-level only).
+    # Per-workbook PBIP rollup. A multi-datasource workbook now consolidates ALL its embedded
+    # datasources into ONE openable project (flat pbip/<WB>/), so it counts as a single built project
+    # -- the same as a single-datasource workbook. ``consolidated_datasources`` records the island
+    # captions folded into that one model (the anti-silent-drop audit trail). The legacy
+    # ``datasource_pbips`` branch is kept only for backward compatibility with any older detail shape.
     datasource_pbips_total = 0
     datasource_pbips_built = 0
     for w in wb_details:
@@ -2596,10 +2631,12 @@ def _summarize(ds_details, wb_details, viz_available):
             datasource_pbips_total += len(entries)
             datasource_pbips_built += sum(1 for e in entries if e.get("pbip_status") == "built")
         elif w.get("pbip_status"):
-            # single-datasource workbook: its flat project is itself one datasource-level project
+            # one consolidated project per workbook (single- or multi-datasource)
             datasource_pbips_total += 1
             datasource_pbips_built += 1 if w.get("pbip_status") == "built" else 0
-    workbooks_multi_datasource = sum(1 for w in wb_details if w.get("datasource_pbips"))
+    workbooks_multi_datasource = sum(
+        1 for w in wb_details
+        if len(w.get("consolidated_datasources") or []) > 1 or w.get("datasource_pbips"))
     visuals_rebuilt = sum(1 for w in wb_details for f in (w.get("viz_fidelity") or [])
                           if f.get("status") == "rebuilt")
     visuals_warned = sum(1 for w in wb_details for f in (w.get("viz_fidelity") or [])
@@ -2823,12 +2860,14 @@ def _render_summary_md(report):
     if review:
         lines += [
             "",
-            "## Next step — assisted (second-compiler) translation",
+            "## Next step — second compiler (MANDATORY, run now)",
             "",
             f"{len(review)} calculation(s) fell back to inert stubs (the original Tableau formula is "
-            "preserved). To translate them, run each through the **second compiler**: author a "
-            "candidate DAX, validate it with `check_candidate_dax`, then land the approved set via "
-            "`approved_calc_dax` and redeploy. See "
+            "preserved). The second compiler is **not optional** — run it now as a built-in stage of "
+            "this migration: for each calc author a candidate DAX, validate it with "
+            "`check_candidate_dax` (and the reconciliation oracle when data is landed), then land every "
+            "validated candidate via `approved_calc_dax` and redeploy. Anything with no faithful DAX "
+            "form stays an inert stub. See "
             "[second-compiler.md](resources/second-compiler.md).",
             "",
             "| Datasource | Calculation | Role | Category | Fallback reason | Suggestion ready |",
@@ -2880,10 +2919,14 @@ def _render_summary_md(report):
             warned = sum(1 for f in fid if f.get("status") == "warned")
             note = w.get("note") or ""
             entries = w.get("datasource_pbips")
+            consolidated = w.get("consolidated_datasources") or []
             if entries:
                 built = sum(1 for e in entries if e.get("pbip_status") == "built")
                 note = (note + " " if note else "") + (
                     f"{len(entries)} datasources → {built} project(s) built, one per datasource")
+            elif len(consolidated) > 1:
+                note = (note + " " if note else "") + (
+                    f"{len(consolidated)} datasources consolidated into one model")
             lines.append(
                 f"| {w['name']} | {w.get('viz_status', '')} | {rebuilt}/{warned} "
                 f"| {w.get('pbip_folder') or '-'} | {w.get('bound_model') or '-'} "
@@ -3034,9 +3077,10 @@ def main(argv=None):
     if not args.no_pbip:
         print("Openable projects: pbip/<Name>/<Name>.pbip (double-click in Power BI Desktop)")
     if s.get("needs_review_total"):
-        print(f"Next step: {s['needs_review_total']} calculation(s) stubbed -> see summary.md "
-              f"('Next step') to run them through the second compiler, then re-run with "
-              f"--approved-dax <file.json> to land the approved results.")
+        print(f"Next step: MANDATORY second-compiler pass -- {s['needs_review_total']} calculation(s) "
+              f"stubbed -> run them through the second compiler NOW (see summary.md 'Next step'); it is "
+              f"a built-in stage, not an option. Land the validated results by re-running with "
+              f"--approved-dax <file.json>.")
     if s.get("partitions_stubbed_total"):
         print(f"Next step: {s['partitions_stubbed_total']} table partition(s) need manual M "
               f"completion -> see summary.md ('manual M partition completion'); the original SQL "

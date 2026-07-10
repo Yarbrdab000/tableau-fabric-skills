@@ -418,11 +418,19 @@ def _split_token(token):
 
 
 def _sanitize(text):
-    """A deterministic PBIR object name: word chars / hyphen only, <= 50 chars."""
+    """A deterministic, COMPACT PBIR object name: word chars / hyphen only.
+
+    Uniqueness is carried entirely by the 8-char md5 of the FULL input text, so the
+    human-readable prefix is deliberately short (<= 16 chars). This keeps the nested
+    ``.Report/definition/pages/<page>/visuals/<visual>/visual.json`` paths well under the
+    Windows MAX_PATH (260) limit -- two names that share a 16-char prefix (e.g. a visual
+    name that redundantly embeds its already-hashed page slug) still differ by hash, so the
+    shorter prefix costs no uniqueness. Max length is 16 + 8 = 24 chars.
+    """
     base = re.sub(r"[^0-9A-Za-z_-]+", "", (text or "").replace(" ", ""))
     h = hashlib.md5((text or "").encode("utf-8")).hexdigest()[:8]
-    name = (base[:32] + h) if base else ("v" + h)
-    return name[:50]
+    name = (base[:16] + h) if base else ("v" + h)
+    return name[:24]
 
 
 # -- workbook datasource index (the binding contract) --------------------------

@@ -1365,6 +1365,110 @@ def extract_calcs(xml_text, select=None):
     return out
 
 
+# Descriptor scalar/primary keys copied from the first datasource when several are combined. The
+# per-relation ``connection`` refs (preserved by combine_descriptors) drive each table's actual
+# partition source, so these primary facts are only the model default -- a mixed-connection /
+# mixed-storage combined model still emits every table against its own source.
+_COMBINE_SCALAR_KEYS = (
+    "datasource_name", "connection_class", "server", "database", "warehouse", "http_path",
+    "auth_method", "is_extract", "named_connection_count", "flatfile_filename",
+    "flatfile_directory", "flatfile_path",
+)
+
+
+def combine_descriptors(descriptors, *, captions=None):
+    """Combine several single-datasource descriptors (each from :func:`parse_tds`) into ONE.
+
+    A Tableau *workbook* is one workbook with several embedded datasources. Combining their parsed
+    descriptors lets :func:`assemble_model.assemble_import_model` build a SINGLE semantic model that
+    holds EVERY datasource's tables -- kept as disconnected islands, sharing only the one Date
+    dimension the assembler synthesizes -- instead of one model (and one split report) per
+    datasource. The report then binds to that one model in a single pass.
+
+    The combination is a TOTAL union: every input table is carried into the output, so no datasource
+    is ever silently dropped. Embedded datasources are independent, so two may share a physical table
+    name; because the assembler keys each table file by its display name, a table whose name is
+    already taken by an earlier datasource is disambiguated (suffixed with that datasource's caption)
+    and EVERY in-descriptor reference to it -- relationship endpoints and logical-field bindings --
+    is rewritten to match, so nothing dangles and nothing is overwritten.
+
+    ``captions`` (optional, positional-parallel to ``descriptors``) is the human name used to
+    disambiguate a collision; each entry falls back to the descriptor's own ``datasource_name``.
+    Returns a single descriptor of the same shape :func:`parse_tds` returns; a one-descriptor input
+    is returned unchanged. Per-relation ``connection`` refs are preserved and the named-connection
+    maps are unioned, so mixed-connection / mixed-storage sources still emit each table faithfully.
+    """
+    kept = [d for d in (descriptors or []) if d]
+    if not kept:
+        raise ValueError("combine_descriptors needs at least one descriptor")
+    if len(kept) == 1:
+        return kept[0]
+    captions = list(captions or [])
+
+    combined = {k: kept[0].get(k) for k in _COMBINE_SCALAR_KEYS}
+    # Carry the primary's ODBC facts (odbc_*/driver/dsn) so a generic-ODBC primary still emits.
+    for k, v in kept[0].items():
+        if k.startswith("odbc") or k in ("driver", "dsn"):
+            combined.setdefault(k, v)
+    combined.update({
+        "relations": [], "relationships": [], "relationship_warnings": [],
+        "logical_fields": [], "connections": {}, "unsupported_reasons": [],
+    })
+
+    def _display(rel):
+        return rel.get("name") or rel.get("item") or "Table"
+
+    taken = set()  # lowercased display names already used across all combined datasources
+    for i, desc in enumerate(kept):
+        caption = ((captions[i] if i < len(captions) else None)
+                   or desc.get("datasource_name") or f"ds{i + 1}")
+        # A single-connection datasource never stamps a per-relation `connection` (its scalar facts
+        # ARE the connection). In the combined multi-connection descriptor each table must route to
+        # its OWN upstream, so inherit that lone connection's facts onto this datasource's tables.
+        dconns = list((desc.get("connections") or {}).values())
+        origin_conn = dconns[0] if len(dconns) == 1 else None
+        rename = {}  # old display -> new display, for THIS datasource only
+        for rel in desc.get("relations", []) or []:
+            if rel.get("kind") not in ("table", "custom_sql"):
+                combined["relations"].append(rel)  # combination markers pass through untouched
+                continue
+            name = _display(rel)
+            if name.lower() in taken:
+                new = f"{name} ({caption})"
+                n = 2
+                while new.lower() in taken:
+                    new = f"{name} ({caption} {n})"
+                    n += 1
+                rename[name] = new
+                rel = dict(rel, name=new)
+                name = new
+            if origin_conn is not None and not rel.get("connection"):
+                rel = dict(rel, connection=origin_conn)
+            taken.add(name.lower())
+            combined["relations"].append(rel)
+        for r in desc.get("relationships", []) or []:
+            if rename:
+                r = dict(r,
+                         from_table=rename.get(r.get("from_table"), r.get("from_table")),
+                         to_table=rename.get(r.get("to_table"), r.get("to_table")))
+            combined["relationships"].append(r)
+        for lf in desc.get("logical_fields", []) or []:
+            if rename and lf.get("table") in rename:
+                lf = dict(lf, table=rename[lf["table"]])
+            combined["logical_fields"].append(lf)
+        combined["relationship_warnings"].extend(desc.get("relationship_warnings", []) or [])
+        combined["unsupported_reasons"].extend(desc.get("unsupported_reasons", []) or [])
+        for cid, facts in (desc.get("connections") or {}).items():
+            combined["connections"].setdefault(cid, facts)
+    # This descriptor spans every datasource's upstreams, so it IS a multi-named-connection source:
+    # the count (>1 by construction, since a single input returns early above) is what makes
+    # emit_table_tmdl_m route each relation to its OWN connection via _effective_connection, exactly
+    # as it already does for a federated source with several named connections.
+    combined["named_connection_count"] = sum(
+        int(d.get("named_connection_count") or 1) for d in kept)
+    return combined
+
+
 # -- M / TMDL emission ---------------------------------------------------------
 _PARAM_META = 'meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=true]'
 

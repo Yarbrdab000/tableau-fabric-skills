@@ -880,8 +880,9 @@ SAPHANA_WORKBOOK_TWB = _viz_wb(
     _viz_ds("Hana Source", "federated.hana", "saphana.bb22", "saphana", "Stock"),
     _viz_ws("Stock by Category", "federated.hana", "Hana Source"))
 
-# Two embedded SQL Server datasources: each is migrated individually into its own nested project
-# (pbip/<WB>/<DS>/), because a single PBIR report binds exactly one model.
+# Two embedded SQL Server datasources: both are consolidated into ONE semantic model as disconnected
+# table islands (Sales + Inventory), each bound to its own connection, with a single PBIR report bound
+# to that one model -- exactly like a federated multi-connection datasource.
 MULTI_SOURCE_TWB = _viz_wb(
     _viz_ds("Sales Source", "federated.s1", "sqlserver.s1", "sqlserver", "Sales")
     + _viz_ds("Inventory Source", "federated.s2", "sqlserver.s2", "sqlserver", "Inventory"),
@@ -889,10 +890,11 @@ MULTI_SOURCE_TWB = _viz_wb(
     + _viz_ws("Inventory by Category", "federated.s2", "Inventory Source"))
 
 
-# A mixed multi-datasource workbook: one mappable SQL Server datasource (builds a bound .pbip) plus a
-# SAP HANA datasource that routes to the needs-storage-decision fallback (cannot be assembled into a bound
-# model). Proves per-datasource error isolation -- the fallback datasource is skipped-loud while its
-# sibling still builds, and the failure never pollutes the primary/top-level detail.
+# A mixed multi-datasource workbook: one mappable SQL Server datasource (real DirectQuery partition)
+# plus a SAP HANA datasource whose connector is not mapped for direct M. Both are consolidated into ONE
+# model -- neither is dropped: the SQL Server island lands a real partition, and the SAP HANA island
+# lands an honest needs-review M partition scaffold (recorded in the model's ``partitions_needs_review``)
+# rather than being silently discarded. Proves zero-drop consolidation with an honest per-island stub.
 MIXED_FALLBACK_TWB = _viz_wb(
     _viz_ds("Sales Source", "federated.s1", "sqlserver.s1", "sqlserver", "Sales")
     + _viz_ds("Hana Source", "federated.hana", "saphana.bb22", "saphana", "Stock"),
@@ -1525,92 +1527,98 @@ def test_workbook_pbip_skipped_on_fallback_datasource(tmp_path):
     assert report["summary"]["workbooks_pbip_built"] == 0
 
 
-def test_workbook_pbip_builds_each_datasource_when_multiple():
-    # Multiple embedded datasources -> one self-contained project per datasource, nested at
-    # pbip/<WB>/<DS>/. The top-level keys mirror the primary; detail["datasource_pbips"] lists all.
-    # (A short temp root is used deliberately: the nested layout repeats the datasource name, so the
-    # deep pytest tmp_path prefix would trip Windows' 260-char MAX_PATH -- an environment artifact, not
-    # a product defect, since a real output dir like .\out stays well within budget.)
+def test_workbook_pbip_consolidates_multiple_datasources_into_one_model():
+    # Multiple embedded datasources -> ONE openable project (flat pbip/<WB>/) whose single semantic
+    # model carries every datasource's tables as disconnected islands, with one report bound to it.
+    # Zero silent drops: both islands land in the one model. The top-level bound_model is the WORKBOOK
+    # (not a per-datasource split), and no per-datasource projects are produced.
     with tempfile.TemporaryDirectory() as out:
         src = InMemoryTableauSource(workbooks={"Multi WB": MULTI_SOURCE_TWB})
         report = migrate_estate(src, os.path.join(out, "b"))
         wb = report["workbooks"][0]
-        assert wb["pbip_status"] == "built"          # top-level mirrors the primary datasource
-        assert wb["bound_model"]                       # a primary datasource was chosen + bound
-        # every embedded datasource is migrated individually -- none is silently dropped or warned away
+        assert wb["pbip_status"] == "built"
+        assert wb["bound_model"] == "Multi WB"          # one model named for the workbook
+        # every embedded datasource is folded in -- none silently dropped or warned away
         assert not any("secondary datasource" in w for w in wb["pbip_warnings"])
-        entries = wb["datasource_pbips"]
-        assert len(entries) == 2
-        assert {e["datasource"] for e in entries} == {"Sales Source", "Inventory Source"}
-        assert all(e["pbip_status"] == "built" for e in entries)
-        assert sum(1 for e in entries if e["is_primary"]) == 1
-        # each datasource lands its own openable, self-contained project nested under the workbook folder
+        assert wb["pbip_warnings"] == []
+        # the consolidation audit trail lists every island that landed (anti-silent-drop proof)
+        assert set(wb["consolidated_datasources"]) == {"Sales Source", "Inventory Source"}
+        # no per-datasource split: the legacy nested rollup key is not set
+        assert "datasource_pbips" not in wb
+        # ONE flat project on disk with ONE model + ONE report
         base = os.path.join(out, "b", "pbip", "Multi WB")
-        assert os.path.isfile(os.path.join(base, "Sales Source", "Sales Source.pbip"))
-        assert os.path.isfile(os.path.join(base, "Inventory Source", "Inventory Source.pbip"))
+        assert os.path.isfile(os.path.join(base, "Multi WB.pbip"))
+        assert os.path.isdir(os.path.join(base, "Multi WB.Report"))
+        assert os.path.isdir(os.path.join(base, "Multi WB.SemanticModel"))
+        # both islands' tables land in the SINGLE model (the zero-drop guarantee)
+        tables = os.path.join(base, "Multi WB.SemanticModel", "definition", "tables")
+        assert os.path.isfile(os.path.join(tables, "Sales.tmdl"))
+        assert os.path.isfile(os.path.join(tables, "Inventory.tmdl"))
 
 
-def test_workbook_pbip_multi_datasource_projects_are_self_contained():
-    # Each nested per-datasource project carries its OWN semantic model + report bound to that model,
-    # so it opens independently (the accepted split: dashboards spanning datasources are separated).
+def test_workbook_pbip_consolidated_model_routes_each_island_to_its_own_connector():
+    # Each island in the consolidated model keeps its OWN upstream connection -- exactly like a
+    # federated multi-connection datasource. Here both are SQL Server, so each table emits its own
+    # Sql.Database partition (nothing is collapsed onto a single shared source).
     with tempfile.TemporaryDirectory() as out:
         src = InMemoryTableauSource(workbooks={"Multi WB": MULTI_SOURCE_TWB})
         migrate_estate(src, os.path.join(out, "b"))
-        for ds in ("Sales Source", "Inventory Source"):
-            proj = os.path.join(out, "b", "pbip", "Multi WB", ds)
-            assert os.path.isfile(os.path.join(proj, f"{ds}.pbip"))
-            assert os.path.isdir(os.path.join(proj, f"{ds}.Report"))
-            assert os.path.isdir(os.path.join(proj, f"{ds}.SemanticModel"))
+        tables = os.path.join(out, "b", "pbip", "Multi WB", "Multi WB.SemanticModel",
+                              "definition", "tables")
+        for tbl in ("Sales", "Inventory"):
+            tmdl = open(os.path.join(tables, f"{tbl}.tmdl"), encoding="utf-8-sig").read()
+            assert "Sql.Database(" in tmdl                       # its own DB partition, not dropped
+            assert f'Item="{tbl}"' in tmdl                       # bound to its own source table
 
 
-def test_workbook_pbip_multi_datasource_isolates_per_datasource_failure():
-    # Per-datasource error isolation: when one embedded datasource needs a storage decision
-    # (SAP HANA here), it is skipped-loud with its OWN warning while the sibling SQL Server datasource
-    # still builds. The failure never pollutes the primary/top-level detail (warn-never-wrong).
+def test_workbook_pbip_consolidates_mixed_connectors_with_honest_stub():
+    # A workbook mixing a mappable connector (SQL Server) with an unmapped one (SAP HANA) consolidates
+    # BOTH into one model -- neither is dropped. The SQL Server island lands a real partition; the SAP
+    # HANA island lands an honest needs-review M scaffold (recorded in partitions_needs_review) instead
+    # of being silently discarded. This is the "stub it, never drop it" guarantee.
     with tempfile.TemporaryDirectory() as out:
         src = InMemoryTableauSource(workbooks={"Mixed WB": MIXED_FALLBACK_TWB})
         report = migrate_estate(src, os.path.join(out, "b"))
         wb = report["workbooks"][0]
-        # top-level mirrors the built primary (SQL Server), and carries none of the fallback's warnings
         assert wb["pbip_status"] == "built"
-        assert wb["bound_model"] == "Sales Source"
-        assert wb["pbip_warnings"] == []
-        entries = {e["datasource"]: e for e in wb["datasource_pbips"]}
-        assert entries["Sales Source"]["pbip_status"] == "built"
-        assert entries["Hana Source"]["pbip_status"] == "skipped"
-        assert any("needs a storage decision" in w for w in entries["Hana Source"]["pbip_warnings"])
-        # the built sibling lands on disk; the skipped one writes no project
-        base = os.path.join(out, "b", "pbip", "Mixed WB")
-        assert os.path.isfile(os.path.join(base, "Sales Source", "Sales Source.pbip"))
-        assert not os.path.exists(os.path.join(base, "Hana Source"))
+        assert wb["bound_model"] == "Mixed WB"
+        assert set(wb["consolidated_datasources"]) == {"Sales Source", "Hana Source"}
+        # both islands' tables land -- the SAP HANA one is stubbed, never dropped
+        tables = os.path.join(out, "b", "pbip", "Mixed WB", "Mixed WB.SemanticModel",
+                              "definition", "tables")
+        sales = open(os.path.join(tables, "Sales.tmdl"), encoding="utf-8-sig").read()
+        stock = open(os.path.join(tables, "Stock.tmdl"), encoding="utf-8-sig").read()
+        assert "Sql.Database(" in sales                          # real partition for the mapped island
+        assert "saphana" in stock.lower()                        # honest needs-review scaffold, present
+        # the incomplete partition is recorded honestly on the workbook detail (not silently passed)
+        review = {e.get("table") for e in (wb.get("partitions_needs_review") or [])}
+        assert "Stock" in review
 
 
-def test_summary_counts_datasource_pbips_across_workbooks():
-    # Slice 4: the estate summary carries an additive per-datasource rollup. A multi-datasource
-    # workbook contributes one project per datasource; a single-datasource workbook contributes its
-    # flat project. workbooks_multi_datasource counts only the nested ones.
+def test_summary_counts_consolidated_workbooks():
+    # The estate summary counts one consolidated project per workbook, and flags workbooks that folded
+    # in multiple datasources (workbooks_multi_datasource) from the consolidation audit trail.
     with tempfile.TemporaryDirectory() as out:
         src = InMemoryTableauSource(workbooks={"Multi WB": MULTI_SOURCE_TWB,
                                                "Solo WB": SOLO_SOURCE_TWB})
         report = migrate_estate(src, os.path.join(out, "b"))
         s = report["summary"]
-        assert s["workbooks_multi_datasource"] == 1          # only "Multi WB" nested
-        assert s["datasource_pbips_total"] == 3              # 2 (multi) + 1 (solo)
-        assert s["datasource_pbips_built"] == 3              # all three build
-        # the workbook-level count is unchanged (one top-level project per workbook)
+        assert s["workbooks_multi_datasource"] == 1          # only "Multi WB" consolidated several
+        assert s["datasource_pbips_total"] == 2              # one project per workbook
+        assert s["datasource_pbips_built"] == 2              # both build
         assert s["workbooks_pbip_built"] == 2
 
 
-def test_summary_datasource_pbip_rollup_reflects_partial_failure():
-    # A workbook where one datasource falls back counts toward total but not built, and the summary
-    # stays honest (the fallback datasource is not counted as a built project).
+def test_summary_consolidated_mixed_connector_workbook_still_builds():
+    # A workbook mixing a mapped and an unmapped connector still consolidates into one BUILT project
+    # (the unmapped island is stubbed, not dropped), and is flagged as multi-datasource.
     with tempfile.TemporaryDirectory() as out:
         src = InMemoryTableauSource(workbooks={"Mixed WB": MIXED_FALLBACK_TWB})
         report = migrate_estate(src, os.path.join(out, "b"))
         s = report["summary"]
         assert s["workbooks_multi_datasource"] == 1
-        assert s["datasource_pbips_total"] == 2
-        assert s["datasource_pbips_built"] == 1              # only the SQL Server datasource built
+        assert s["datasource_pbips_total"] == 1
+        assert s["datasource_pbips_built"] == 1              # one consolidated model, built
 
 
 def test_workbook_pbip_skipped_without_pbir_definition(tmp_path):
