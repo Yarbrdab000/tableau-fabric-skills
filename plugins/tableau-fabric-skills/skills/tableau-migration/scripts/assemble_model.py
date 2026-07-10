@@ -2713,7 +2713,12 @@ def materialize_bundled_flatfile_data(packaged_source, descriptor, dest_dir, *, 
     import tempfile as _tf
     result = {"kind": None, "reason": None, "hyper_present": False,
               "flatfile_path": None, "table_csv_paths": None}
-    if not (descriptor or {}).get("flatfile_filename"):
+    # A flat-file source is identified by its bundled filename; an extract-backed source (including a
+    # SaaS connector such as Salesforce that has no first-party Power BI rebuild) carries only a
+    # .hyper and no named file, so ``is_extract`` also engages the materializer -- step 1 no-ops (no
+    # named file to lift) and step 2 extracts the .hyper to CSV.
+    _desc = descriptor or {}
+    if not _desc.get("flatfile_filename") and not _desc.get("is_extract"):
         result["reason"] = "not_flatfile"
         return result
 
@@ -2865,7 +2870,8 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
     # when there is nowhere to land data (no write_to and no flatfile_dest_dir).
     _ff_mat = None
     if (local_data is None and decision.get("mode") is not None
-            and descriptor.get("flatfile_filename") and not kwargs.get("flatfile_path")):
+            and (descriptor.get("flatfile_filename") or decision.get("import_from_extract"))
+            and not kwargs.get("flatfile_path")):
         import os as _os
         _ff_dest = flatfile_dest_dir or (
             _os.path.join(write_to, f"{model_name}.Data") if write_to else None)
@@ -2877,6 +2883,17 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
             elif _ff_mat.get("kind") == "csv":
                 local_data = _ff_mat.get("table_csv_paths")
 
+    # Honest record of how bundled data was (or was not) landed -- computed once so the fail-closed
+    # fallback below carries it too (the normal path stamps it onto ``result`` further down).
+    _ff_report = None
+    if _ff_mat is not None:
+        _ff_report = {
+            "landed": _ff_mat.get("kind") is not None,
+            "kind": _ff_mat.get("kind"),
+            "reason": _ff_mat.get("reason"),
+            "hyper_present": _ff_mat.get("hyper_present", False),
+        }
+
     if local_data is not None:
         # Local-POC path: a CSV-backed Import model regardless of connector; never land-to-Delta.
         _split_auto_calcs()
@@ -2886,11 +2903,14 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
             descriptor, model_name=model_name, calcs=calcs, dim_calcs=dim_calcs,
             table_csv_paths=table_csv_paths, approved_calc_dax=approved_calc_dax,
             date_range=date_range, **kwargs)
-    elif decision.get("mode") is None:
-        # Genuinely-undoable shape: return the needs-storage-decision hand-off (no parts) rather than raising.
+    elif decision.get("mode") is None or decision.get("import_from_extract"):
+        # Genuinely-undoable shape -> needs-storage-decision hand-off (no parts) rather than raising.
+        # An extract-backed SaaS source (import_from_extract) whose .hyper did NOT materialize also
+        # fails closed here -- there is no honest live model to build for an unmapped connector, so we
+        # return the fallback (with the honest flatfile_data) instead of a dataless/broken model.
         # Pass the FULL (un-split) calc list so the landing plan's inventory stays complete.
         return _fallback_result(descriptor, decision, model_name=model_name, calcs=calcs,
-                                write_to=write_to)
+                                write_to=write_to, flatfile_data=_ff_report)
     else:
         _split_auto_calcs()
         result = migrate_tds_to_semantic_model(
@@ -2899,13 +2919,8 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
 
     # Additive, honest record of how flat-file data was (or was not) landed, so a caller -- and the
     # estate orchestrator's warnings -- never silently ship a model that opens but loads no data.
-    if _ff_mat is not None:
-        result.setdefault("report", {})["flatfile_data"] = {
-            "landed": _ff_mat.get("kind") is not None,
-            "kind": _ff_mat.get("kind"),
-            "reason": _ff_mat.get("reason"),
-            "hyper_present": _ff_mat.get("hyper_present", False),
-        }
+    if _ff_report is not None:
+        result.setdefault("report", {})["flatfile_data"] = _ff_report
 
     try:
         result["bind"] = connection_details_for_bind(descriptor)
@@ -2924,7 +2939,7 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
     return result
 
 
-def _fallback_result(descriptor, decision, *, model_name, calcs, write_to):
+def _fallback_result(descriptor, decision, *, model_name, calcs, write_to, flatfile_data=None):
     """Build the ``migrate_datasource`` result for a datasource reported as a storage fallback.
 
     Returns ``parts={}`` (no semantic model is emitted) with a ``report`` carrying the storage
@@ -2933,6 +2948,10 @@ def _fallback_result(descriptor, decision, *, model_name, calcs, write_to):
     ``manual_followups`` already point at the direct-to-source / semantic-model path -- but no
     landing plan, since neither is an automatic Delta-landing case. When ``write_to`` is given and a
     landing plan was produced, it is also written next to where the model folder would have gone.
+
+    ``flatfile_data`` carries the honest bundled-data record when the fallback is an extract-backed
+    source whose data could NOT be materialized (so the caller still sees ``landed: False`` + reason
+    instead of a missing key).
     """
     report = {
         "model_name": model_name,
@@ -2941,6 +2960,8 @@ def _fallback_result(descriptor, decision, *, model_name, calcs, write_to):
         "tables": [],
         "relationship_confidence": relationship_confidence_manifest(descriptor),
     }
+    if flatfile_data is not None:
+        report["flatfile_data"] = flatfile_data
     if decision.get("fallback") == FALLBACK_LAND_TO_DELTA:
         report["landing_plan"] = directlake_landing_plan(
             descriptor, calcs=calcs, datasource_name=descriptor.get("datasource_name"),

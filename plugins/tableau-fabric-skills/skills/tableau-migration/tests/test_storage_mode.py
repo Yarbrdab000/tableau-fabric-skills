@@ -163,6 +163,56 @@ def test_needs_decision_defaults_to_import_and_points_at_optin():
     assert "auto-selected" not in d["rationale"].lower() or "never auto-selected" in d["rationale"].lower()
 
 
+# -- extract-backed SaaS (unmapped connector) -> honest offline Import ---------
+def test_extract_backed_saas_routes_to_import_over_extract():
+    # A Salesforce (or any unmapped-connector) datasource shipped WITH an extract carries a full
+    # .hyper snapshot of its data. Power BI has no live Salesforce DirectQuery rebuild we support,
+    # but the snapshot IS the data -> land it as an offline Import (over the materialized extract),
+    # NOT the honest-but-dead needs-storage-decision, and NEVER an automatic DirectLake landing.
+    d = select_storage_mode(_desc(connection_class="salesforce", is_extract=True))
+    assert d["mode"] == "Import"
+    assert d["import_from_extract"] is True
+    assert d["fallback"] is None
+    assert d["recommended_mode"] == "Import"
+    # no live upstream connector we can rebuild -> the Import over the snapshot is the only home.
+    assert d["direct_upstream_available"] is False
+    assert d["fully_supported"] is False
+    assert "snapshot" in d["rationale"].lower() or "extract" in d["rationale"].lower()
+
+
+def test_extract_backed_saas_not_stamped_directlake():
+    # The de-default contract holds for the SaaS extract too: never land-to-Delta / DirectLake.
+    d = select_storage_mode(_desc(connection_class="salesforce", is_extract=True))
+    assert d["fallback"] != FALLBACK_LAND_TO_DELTA
+
+
+def test_non_extract_unmapped_connector_still_needs_decision():
+    # The new branch is gated on is_extract: a Salesforce datasource with NO extract (no bundled
+    # snapshot) has no data to import offline -> it stays the honest needs-storage-decision.
+    d = select_storage_mode(_desc(connection_class="salesforce", is_extract=False))
+    assert d["mode"] is None
+    assert d["fallback"] == FALLBACK_NEEDS_DECISION
+    assert not d.get("import_from_extract")
+
+
+def test_mapped_extract_stays_live_connector_import_not_import_from_extract():
+    # A mapped-live connector (sqlserver) shipped as an extract already builds an Import over its
+    # live Sql.Database connector (branch 4) -- it must NOT be diverted to the extract-CSV path.
+    d = select_storage_mode(_desc(connection_class="sqlserver", is_extract=True))
+    assert d["mode"] == "Import"
+    assert d["connector"] == "Sql.Database"
+    assert d["direct_upstream_available"] is True
+    assert not d.get("import_from_extract")
+
+
+def test_flat_file_extract_stays_flatfile_not_import_from_extract():
+    # A flat-file class (excel-direct) with an extract flag still routes through the flat-file
+    # Import branch, not the extract-over-unmapped branch (which excludes flat-file classes).
+    d = select_storage_mode(_desc(connection_class="excel-direct", is_extract=True))
+    assert d["mode"] == "Import"
+    assert not d.get("import_from_extract")
+
+
 # -- expanded connector dispatch ----------------------------------------------
 @pytest.mark.parametrize("cls,connector", [
     ("sqlserver", "Sql.Database"),

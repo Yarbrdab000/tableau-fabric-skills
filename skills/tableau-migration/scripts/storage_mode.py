@@ -222,6 +222,15 @@ _NEEDS_DECISION_FOLLOWUP = (
     "No safe direct-to-source rebuild for this shape: choose a storage approach. Default -- rebuild "
     "directly as an Import model once a connection can be supplied. Opt-in -- land the source to Delta "
     "and rebuild as DirectLake (never auto-selected; must be chosen deliberately).")
+# An extract-backed source on a connector with NO first-party Power BI rebuild (Salesforce and other
+# SaaS): the .hyper extract IS a point-in-time snapshot of the data, so we land it as an offline
+# Import over the materialized extract (one table per CSV), exactly like a flat-file Import -- rather
+# than dying at the unknown-connector needs-decision branch. There is no live upstream to rebuild;
+# refreshing means re-exporting the extract.
+_EXTRACT_IMPORT_FOLLOWUP = (
+    "Extract-backed source with no first-party Power BI connector: imported as an offline snapshot of "
+    "the bundled extract (one table per CSV). To refresh, re-export the Tableau extract from the "
+    "source, or opt in to land-to-Delta + DirectLake (never auto-selected).")
 # Generic ODBC binds through a named driver (or DSN); that driver must be present wherever the
 # model runs. It is the SAME driver Tableau already uses, so this is a known quantity, not a new
 # dependency -- but Power BI Desktop (authoring) and the on-premises data gateway (refresh) each
@@ -449,6 +458,27 @@ def select_storage_mode(descriptor):
                          f"'{driver}' driver (confirm/replace with the driver installed where the model "
                          "runs); never landed in Delta."),
             manual_followups=followups,
+        )
+
+    # 1.7 extract-backed source on an UNMAPPED connector (SaaS such as Salesforce) -> land the
+    #     bundled extract as an offline Import (one CSV per table), the same faithful snapshot home a
+    #     flat-file extract gets. Placed BEFORE branch 2 (unknown-connector) so a SaaS extract lands
+    #     its data instead of dying at needs-decision; the ``import_from_extract`` marker tells the
+    #     assembler to materialize the .hyper -> CSV. Mapped-live extracts (branch 4) and flat-file
+    #     extracts (branch 3) are excluded here and route unchanged. A structurally-unsupported shape
+    #     (join / union tree, multi-connection) was already caught above, so it still fails closed.
+    if descriptor.get("is_extract") and cls not in _LIVE_CLASSES and cls not in FLAT_FILE_CLASSES:
+        return _decision(
+            "Import", None,
+            fully_supported=False,
+            uses_native_query=uses_native,
+            direct_upstream_available=False,
+            import_from_extract=True,
+            score=SCORE_FLAT_FILE,
+            rationale=(f"Extract-backed source ({cls or 'unknown connector'}) with no first-party "
+                       "Power BI connector -> Import over the bundled extract snapshot (one table per "
+                       "CSV). No live upstream rebuild is available; never landed in Delta."),
+            manual_followups=base_followups + [_EXTRACT_IMPORT_FOLLOWUP],
         )
 
     # 2. unknown connector class -> no mapped direct rebuild; route to needs-decision.

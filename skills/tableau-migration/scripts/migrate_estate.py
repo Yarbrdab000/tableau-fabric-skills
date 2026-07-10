@@ -649,7 +649,7 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
     flatfile_path = None
     table_csv_paths = None
     ff_mat = None
-    if descriptor.get("flatfile_filename"):
+    if descriptor.get("flatfile_filename") or decision.get("import_from_extract"):
         if pbip_dir is not None:
             # Land the data INSIDE the openable project (pbip/<name>/<name>.Data, beside the
             # .SemanticModel) so the whole folder is self-contained + portable; a relocatable
@@ -683,6 +683,16 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
             "reason": ff_mat.get("reason"),
             "hyper_present": ff_mat.get("hyper_present", False),
         }
+
+    # Extract-backed SaaS (import_from_extract) whose bundled .hyper did NOT materialize to CSV: fail
+    # closed to the honest needs-storage-decision fallback rather than emitting a dataless/broken
+    # model for an unmapped connector (the estate would otherwise write a model that opens with no
+    # data). Mirrors the mode-None fallback above; the honest flatfile_data record is preserved.
+    if decision.get("import_from_extract") and not table_csv_paths:
+        detail.update(status="fallback", storage_mode=None, storage_decision=decision,
+                      reason=(ff_mat or {}).get("reason") or decision.get("rationale"),
+                      fallback_path=decision.get("fallback") or FALLBACK_NEEDS_DECISION)
+        return detail
 
     try:
         if table_csv_paths:

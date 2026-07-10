@@ -13,7 +13,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration:** **DirectLake is no longer the silent default fallback — residual unresolved
+- **tableau-migration:** **extract-backed SaaS datasources (Salesforce, Marketo, ServiceNow, …) now have an
+  honest offline Import home instead of falling through to a fallback.** A datasource on an unmapped SaaS
+  connector that is extract-backed (a bundled `.hyper` snapshot, no reconstructable live Power BI connector)
+  previously produced `mode=None` → needs-storage-decision, so it never landed as a model even though its data
+  was sitting in the package. `storage_mode.select_storage_mode` now recognizes this shape (extract enabled +
+  connector neither a mapped live class nor a flat file) and returns an `Import` decision marked
+  `import_from_extract: True`; the materializer (`assemble_model.materialize_bundled_flatfile_data`) reads the
+  bundled `.hyper` to one CSV per table even when there is no `flatfile_filename`, and both the direct
+  (`migrate_datasource`) and estate (`migrate_estate`) paths build a local-CSV Import model over the
+  materialized snapshot — preserving the point-in-time semantics of a Tableau extract without inventing a live
+  SaaS connection. When no `.hyper` is bundled, both paths **fail closed** to the honest
+  needs-storage-decision fallback with a `flatfile_data` record (`landed: False`) rather than writing a
+  dataless/broken model. A mapped connector that happens to be extract-backed (e.g. SQL Server + extract) is
+  unchanged — it still builds Import over its live connector. Additive: `import_from_extract` is a new
+  decision key, `flatfile_data` shape is unchanged, and no existing report keys were renamed or removed.
+  *(natural pair to the DirectLake-not-default pivot — the offline Import path the de-defaulted router points
+  extract-backed SaaS sources toward)*
   datasources now route to an honest needs-storage-decision state instead of being auto-landed as
   Delta + DirectLake.** When the storage router could not map a connector (a structurally-unsupported
   join tree, an ODBC source with no reconstructable driver, a native engine with no server, or an
