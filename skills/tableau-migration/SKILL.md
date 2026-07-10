@@ -78,11 +78,12 @@ D6 — CREDENTIAL ACCESS  (only if D1=A; how I obtain the PAT / Connected-App se
    B) Local secure terminal     (no Key Vault — you type it into a hidden prompt; never in chat)
 ```
 
-> **Workbook in scope?** If D2 names a **workbook**, also state whether it uses an **embedded**
-> datasource or connects to a **published** one. For a published datasource, **name that datasource
-> too** (D2) so it co-migrates in the same run — its calculations and the workbook's are both built
-> into the model attached to the workbook. (Embedded needs nothing extra; `migrate_estate.py`
-> auto-detects either case — see STEP 1.)
+> **Workbook in scope?** If D2 names a **workbook**, you do **not** classify it — `migrate_estate.py`
+> auto-detects whether it embeds its datasource or connects to a **published** one (STEP 2; you never
+> inspect XML). The only thing to decide is **scope**: if you already know it's backed by a **published**
+> datasource, add **that datasource to D2** too so it co-migrates (its calculations and the workbook's are
+> both built into the workbook's model). If you're unsure, record **`auto-detect`** and STEP 2 resolves it
+> — a published datasource that turns out **not** to be in scope is reported, never silently wrong.
 
 ### Phase 0B — Credentials form (simple 2-file pattern)
 
@@ -109,7 +110,16 @@ If **D5=B**, also collect the Connected App `CLIENT_ID`, `SECRET_ID`, and impers
 Set two paths and run **every** later command from `$RUN`:
 - **`$SKILL`** = the folder holding this SKILL.md (where `scripts\` and `migration.vars.example.ps1`
   live — the folder you loaded these instructions from).
-- **`$RUN`** = a **fresh, empty** working folder for THIS migration.
+- **`$RUN`** = a **fresh, empty** working folder for THIS migration. On **Windows, keep it SHORT and
+  near the drive root** (e.g. `C:\tfmig`) — **not** the deep session/temp path. A rebuilt workbook's
+  PBIR report nests many folders deep
+  (`…\<Workbook>.Report\definition\pages\<page>\visuals\<visual>\visual.json`), so a long `$RUN` can push
+  a file past the Windows **MAX_PATH (260)** limit. The build itself handles this — deep writes and the
+  Fabric deploy use Windows extended-length (`\\?\`) paths, so a long root **no longer fails the build**
+  (and a long root deployed straight to Fabric is fine). The reason to keep `$RUN` short is the **local**
+  `.pbip`: to open it in **Power BI Desktop** on a deep path you'd otherwise need Windows long paths
+  enabled, so a short root keeps the local project openable everywhere. (Only a genuinely unwritable path
+  still marks that workbook `failed` with a `path_too_long` reason in `report.json`.)
 
 `in\` (fetched inputs) and `out\` (the built bundle) live **under `$RUN`, never under `$SKILL`** — that
 keeps the run clear of the skill's bundled sample datasources and never pollutes the installed skill.
@@ -119,7 +129,7 @@ Then set up the local vars file (mirrors the repo's `.env.example` → `.env` co
 
 ```powershell
 $SKILL = "<the folder holding this SKILL.md>"
-$RUN   = "<a fresh, empty working folder, e.g. C:\work\tableau-run>"
+$RUN   = "<a fresh, empty working folder — keep it SHORT on Windows, e.g. C:\tfmig>"
 New-Item -ItemType Directory -Force -Path $RUN | Out-Null ; Set-Location $RUN ; $RUN = (Get-Location).Path
 Copy-Item "$SKILL\migration.vars.example.ps1" .\migration.vars.local.ps1   # once
 # fill migration.vars.local.ps1 with the real values (it is git-ignored), then:
@@ -149,7 +159,7 @@ LEDGER — confirm, then reply GO
   work dir   : <$RUN>   (scripts run from here; skill at <$SKILL>)
   source     : <D1 A live / B local>   from <SITE_URL/SITE_NAME  or  .\in>
   scope      : <all | datasource and/or workbook names>
-  workbook ds: <none | embedded | published: "<DS>" co-migrated in scope>   (omit if no workbook)
+  workbook ds: <none | auto-detect | published "<DS>" also in scope>   (omit if no workbook; "auto-detect" = let STEP 2 classify embedded vs published — you never inspect XML)
   outputs    : <D3 A both / B Fabric only / C local only>
   conflicts  : <D4 overwrite | skip | stop>
   auth       : <D5 PAT | Connected App JWT>   (D6 secret via <Key Vault KV_NAME/SECRET_NAME | local terminal prompt>)
@@ -249,6 +259,13 @@ The deployed **model name** defaults to the `.SemanticModel` folder stem — a f
 datasource name (spaces / parens / apostrophes may become `_`, sometimes doubled, e.g.
 `Databricks_Example_-_Tier_1__Lod_s_`). For a clean display name, add `--model-name "<Real Name>"` to
 that model's call.
+
+> **Avoid duplicate models for the same datasource.** The name a datasource gets depends on **how** it was
+> migrated: **standalone** it takes the sanitized folder stem above; **inside a workbook** it lands in that
+> workbook's consolidated model (named from the workbook / its primary datasource). So deploying both — or
+> re-running the other way — can create **two near-duplicate models** for one datasource. If a model for
+> this datasource already exists in the workspace, pass `--model-name "<the existing model's name>"` so the
+> deploy **overwrites** it instead of spawning a duplicate.
 
 D4 handling — the script does **createOrUpdate only** (it always overwrites a same-named model; there is
 no skip/error flag). **D4=A (overwrite):** the loop above is correct as-is. **D4=B (skip) / D4=C (stop):**

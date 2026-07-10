@@ -2193,14 +2193,38 @@ def fabric_definition_payload(parts):
     }
 
 
+def _win_long_path(path):
+    r"""Return a Windows extended-length (``\\?\``) form of *path* so a write is not bound by the
+    260-char ``MAX_PATH`` limit; a no-op off Windows, on falsy input, and on an already-prefixed path.
+
+    A rebuilt PBIR report nests deeply
+    (``<report>.Report/definition/pages/<page>/visuals/<visual>/visual.json``), so a long output root
+    can push a file past ``MAX_PATH`` -- where the OS raises a cryptic ``WinError`` / ``FileNotFound``
+    mid-write. The ``\\?\`` prefix lifts the limit to ~32,767, but it also DISABLES all path
+    normalisation, so the path must be **absolute** and use **backslashes only** -- ``os.path.abspath``
+    guarantees both on Windows. A UNC path takes the ``\\?\UNC\server\share`` form. Callers keep the
+    CLEAN path in any returned/reported value and pass this form only to the OS call itself.
+    """
+    import os
+    if os.name != "nt" or not path:
+        return path
+    ap = os.path.abspath(path)
+    if ap.startswith("\\\\?\\"):
+        return ap
+    if ap.startswith("\\\\"):  # UNC:  \\server\share  ->  \\?\UNC\server\share
+        return "\\\\?\\UNC\\" + ap[2:]
+    return "\\\\?\\" + ap
+
+
 def write_model_folder(parts, dest_dir):
     """Write a parts dict to ``dest_dir`` (a ``<Name>.SemanticModel`` folder). Returns paths."""
     import os
     written = []
     for rel_path, text in parts.items():
         full = os.path.join(dest_dir, rel_path.replace("/", os.sep))
-        os.makedirs(os.path.dirname(full), exist_ok=True)
-        with open(full, "w", encoding="utf-8") as fh:
+        lp = _win_long_path(full)  # lift MAX_PATH for the deep PBIR/TMDL write; clean path is reported
+        os.makedirs(os.path.dirname(lp), exist_ok=True)
+        with open(lp, "w", encoding="utf-8") as fh:
             fh.write(text)
         written.append(full)
     return written
@@ -2313,9 +2337,9 @@ def write_local_pbip(parts, dest_dir, *, model_name, report_name=None, report_pa
         else:
             report_parts = build_thin_report_parts(model_name, report_name=report_name)
     write_model_folder(report_parts, os.path.join(dest_dir, f"{report_name}.Report"))
-    os.makedirs(dest_dir, exist_ok=True)
+    os.makedirs(_win_long_path(dest_dir), exist_ok=True)
     pbip_path = os.path.join(dest_dir, f"{project_name}.pbip")
-    with open(pbip_path, "w", encoding="utf-8") as fh:
+    with open(_win_long_path(pbip_path), "w", encoding="utf-8") as fh:
         json.dump({
             "$schema": PBIP_PROPERTIES_SCHEMA,
             "version": "1.0",

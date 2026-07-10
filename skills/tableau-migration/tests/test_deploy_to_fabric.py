@@ -39,6 +39,56 @@ def test_read_model_folder_empty_raises(tmp_path):
         D.read_model_folder(str(tmp_path / "Empty.SemanticModel"))
 
 
+def test_win_long_path_prefixes_on_windows_noop_elsewhere():
+    # The deploy copy of the long-path helper: prefixes an absolute path with \\?\ on Windows (lifting
+    # the 260 MAX_PATH read limit), is idempotent, and is a pure no-op off Windows / on falsy input.
+    p = os.path.join(os.getcwd(), "a", "b", "deep.json")
+    out = D._win_long_path(p)
+    if os.name == "nt":
+        assert out.startswith("\\\\?\\")
+        assert D._win_long_path(out) == out          # idempotent -- never double-prefixes
+    else:
+        assert out == os.path.abspath(p)             # no-op off Windows
+    assert D._win_long_path("") == ""                # falsy passthrough
+    assert D._win_long_path(None) is None
+
+
+def test_deep_pbip_write_read_roundtrips_past_max_path():
+    # A rebuilt PBIR that nests past the Windows MAX_PATH (260) limit must still WRITE (assemble_model)
+    # and READ BACK (deploy) losslessly, with the \\?\ prefix NEVER leaking into the Fabric part keys.
+    # Uses a self-managed temp root so teardown can remove the deep tree via the long-path helper (a
+    # plain shutil.rmtree would itself trip MAX_PATH on Windows).
+    import shutil
+    import tempfile
+    import assemble_model as A
+    base = tempfile.mkdtemp(prefix="pbip1b_")
+    try:
+        name = "Databricks Example - Tier 1 (Lod s) " + "z" * 30  # long, realistic report/model name
+        dest = os.path.join(base, "out", "pbip", name)
+        model_parts = {"definition/model.tmdl": "model x",
+                       "definition/tables/Sales.tmdl": "table Sales"}
+        deep_page = "p" + "a" * 22
+        deep_vis = "v" + "b" * 40
+        deep_key = f"definition/pages/{deep_page}/visuals/{deep_vis}/visual.json"
+        report_parts = {"definition.pbir": "{}", ".platform": "{}", deep_key: '{"deep": true}'}
+
+        longest = os.path.abspath(os.path.join(dest, name + ".Report", *deep_key.split("/")))
+        assert len(longest) >= 260  # the write genuinely crosses the MAX_PATH budget
+
+        pbip = A.write_local_pbip(model_parts, dest, model_name=name, report_name=name,
+                                  report_parts=report_parts, project_name=name)
+        assert not pbip.startswith("\\\\?\\")  # callers always get the CLEAN path, never the prefix
+
+        m = D.read_model_folder(os.path.join(dest, name + ".SemanticModel"))
+        r = D.read_report_folder(os.path.join(dest, name + ".Report"))
+        assert set(m) == set(model_parts)
+        assert set(r) == set(report_parts)
+        assert r[deep_key] == '{"deep": true}'                       # deep part read back verbatim
+        assert all("?" not in k and "\\" not in k for k in list(m) + list(r))  # clean POSIX keys
+    finally:
+        shutil.rmtree(D._win_long_path(base), ignore_errors=True)
+
+
 # -- build_create_payload / build_update_definition_payload ---------------------------------
 def test_build_create_payload_has_displayname_and_base64_parts():
     parts = {"definition/model.tmdl": "model Demo"}

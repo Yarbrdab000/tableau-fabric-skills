@@ -1309,6 +1309,118 @@ def test_definition_of_done_warn_precedence_and_banner():
     assert "Warn WB" in banner
 
 
+# -- Windows MAX_PATH: a hard .pbip write failure is reported LOUD (failed), never masked -----------
+# Run-2 AAR: a deep output root pushed a PBIR file past the Windows MAX_PATH (260) limit; the OS raised
+# a cryptic WinError 3 mid-write, but the failure was swallowed as a benign "skipped" -- and on a
+# published-datasource workbook it was further mis-reported as the "published DS not in scope"
+# carve-out. These lock the fix end-to-end: 1a projects the longest path and fails fast; 1c classifies
+# the write error and the definition-of-done reports it FAILED *before* the published carve-out.
+def test_pbip_write_error_helpers_classify_and_record():
+    import errno
+    # classification matrix: projected over budget, WinError 206/3, POSIX ENAMETOOLONG -> path-length.
+    assert me._classify_pbip_write_error(projected="x" * 260) == "path_too_long"
+    assert me._classify_pbip_write_error(projected="x" * 100) == "write_error"
+    e206 = OSError("too long"); e206.winerror = 206
+    assert me._classify_pbip_write_error(e206, projected="x" * 50) == "path_too_long"
+    e3 = OSError("path not found"); e3.winerror = 3
+    assert me._classify_pbip_write_error(e3) == "path_too_long"
+    assert me._classify_pbip_write_error(OSError(errno.ENAMETOOLONG, "name too long")) == "path_too_long"
+    assert me._classify_pbip_write_error(OSError("disk full")) == "write_error"
+
+    # record: marks failed + additive pbip_write_error + a loud warning; _dod_fail_reason prefers it.
+    entry, warns = {}, []
+    me._record_pbip_write_failure(entry, warns, cause="path_too_long",
+                                  dest=os.path.join("C:\\", "deep", "root"), projected="Z" * 275)
+    assert entry["pbip_status"] == "failed"
+    err = entry["pbip_write_error"]
+    assert err["cause"] == "path_too_long"
+    assert err["projected_length"] == 275
+    assert "MAX_PATH" in err["message"] and "shorter output root" in err["message"]
+    assert warns and "MAX_PATH" in warns[0]
+    # even with an unrelated pbip_warnings entry present, the write-error message wins the DoD reason.
+    entry["pbip_warnings"] = ["some earlier ref-drop warning"]
+    assert me._dod_fail_reason(entry) == err["message"]
+
+
+def test_longest_projected_path_matches_writer_layout(tmp_path):
+    parts = {"definition/tables/_Measures.tmdl": "x", "definition.tmdl": "y"}
+    report_parts = {"definition/pages/p/visuals/v/visual.json": "z", ".platform": "w"}
+    longest = me._longest_projected_path(str(tmp_path), "MyModel", parts, "MyReport", report_parts)
+    # the deepest report visual path is the longest, and it lands under the .Report folder.
+    assert longest.endswith(os.path.join(
+        "MyReport.Report", "definition", "pages", "p", "visuals", "v", "visual.json"))
+    assert "MyModel.SemanticModel" not in longest  # a shorter model path is never the longest
+
+
+def test_definition_of_done_write_failure_not_masked_by_published_carveout():
+    # THE regression: a published-datasource workbook whose .pbip write FAILED (MAX_PATH) must be
+    # reported FAILED -- not swept into the benign published-DS "skipped" carve-out.
+    wb = {"name": "Deep WB", "pbip_status": "failed",
+          "binding_signal": {"kind": "published"},
+          "pbip_write_error": {
+              "cause": "path_too_long",
+              "message": ("workbook .pbip output path exceeds the Windows MAX_PATH (260) limit -- "
+                          "re-run with a shorter output root")},
+          "pbip_warnings": ["manual attention required: ... MAX_PATH ..."]}
+    dod = me._definition_of_done([wb], pbip_enabled=True)
+    assert dod["status"] == "failed"
+    assert dod["reports_failed"] == 1
+    entry = dod["workbooks"][0]
+    assert entry["status"] == "failed"                       # NOT "skipped"
+    assert "MAX_PATH" in entry["reason"]                     # the classified cause surfaces
+    banner = "\n".join(me._dod_banner(dod))
+    assert "DEFINITION OF DONE: FAILED" in banner
+    assert "Deep WB" in banner and "MAX_PATH" in banner
+
+
+def test_pbip_write_oserror_reported_failed_end_to_end(tmp_path, monkeypatch):
+    # A write-time OSError (simulated MAX_PATH WinError 206) is caught, classified, and reported FAILED
+    # end-to-end through migrate_estate -- not swallowed as a silent skip. MAX_PATH is raised so the
+    # pre-flight never fires and the OSError catch is exercised deterministically on any host/tmp depth.
+    monkeypatch.setattr(me, "MAX_PATH", 100_000)
+
+    def _boom(*a, **k):
+        e = OSError(206, "The filename or extension is too long")
+        e.winerror = 206
+        raise e
+    monkeypatch.setattr(me, "write_local_pbip", _boom)
+
+    src = InMemoryTableauSource(workbooks={"Exec Dashboard": SUPERSTORE_DASHBOARD_TWB})
+    report = migrate_estate(src, str(tmp_path / "b"))
+    wb = report["workbooks"][0]
+    assert wb["pbip_status"] == "failed"                     # not "skipped"
+    assert wb["pbip_write_error"]["cause"] == "path_too_long"
+    assert wb["pbip_write_error"]["winerror"] == 206
+    dod = report["definition_of_done"]
+    assert dod["status"] == "failed"
+    assert "MAX_PATH" in dod["workbooks"][0]["reason"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the MAX_PATH long-path warning is Windows-only")
+def test_pbip_long_path_downgraded_to_warning_still_builds(tmp_path, monkeypatch):
+    # 1b era: a projected path at/over MAX_PATH no longer FAILS the build -- the writer lifts the limit
+    # via ``\\?\`` long-path writes, so the .pbip still builds and only a NON-FATAL warning is recorded
+    # (recommending a shorter root so the LOCAL .pbip opens in Power BI Desktop). MAX_PATH is lowered so
+    # any real tmp path trips the guard; the writer is stubbed to a no-op success so no deep tree is cut.
+    monkeypatch.setattr(me, "MAX_PATH", 50)
+    hit = {}
+
+    def _ok(*a, **k):
+        hit["called"] = True
+        return "stub.pbip"
+
+    monkeypatch.setattr(me, "write_local_pbip", _ok)
+
+    src = InMemoryTableauSource(workbooks={"Exec Dashboard": SUPERSTORE_DASHBOARD_TWB})
+    report = migrate_estate(src, str(tmp_path / "b"))
+    wb = report["workbooks"][0]
+    assert hit.get("called")                     # the write PROCEEDED -- it was not aborted pre-flight
+    assert wb["pbip_status"] == "built"          # built, NOT "failed"/"skipped"
+    assert "pbip_write_error" not in wb          # a warning, not a recorded failure
+    assert any("MAX_PATH" in w for w in wb.get("pbip_warnings", []))
+    assert report["definition_of_done"]["status"] in ("pass", "warn")  # never "failed"
+
+
 # A workbook whose only date column (Order Date) becomes the model's ACTIVE calendar date. The
 # rebuilt report's date axis must rebind to the shared marked Date table, not the Orders fact's raw
 # date column, so time intelligence runs through the calendar.

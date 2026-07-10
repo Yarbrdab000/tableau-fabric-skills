@@ -13,6 +13,33 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Fixed
+- **tableau-migration:** **Windows `MAX_PATH` (260) no longer breaks — or silently masks — a deep
+  workbook `.pbip` build.** A rebuilt PBIR report nests many folders deep
+  (`<report>.Report/definition/pages/<page>/visuals/<visual>/visual.json`), so a long output root could
+  push a file past the Windows 260-character `MAX_PATH` limit. The write then failed with a raw
+  `[WinError 3]`/`FileNotFound`, which the estate caught as a generic warning and left
+  `pbip_status="skipped"` — and for a workbook bound to a **published** datasource that skip was
+  indistinguishable from the legitimate "published datasource not in scope" carve-out, so a genuine
+  failure could be silently swallowed while the definition-of-done still reported the workbook skipped.
+  The fix lifts the limit at its source: every deep write (`assemble_model.write_model_folder`, the
+  `.pbip` pointer) and every deep read (`deploy_to_fabric.read_model_folder` / `read_report_folder`)
+  now routes its OS call through a Windows extended-length (`\\?\`) path helper, so a deep project both
+  **writes and deploys** without hitting `MAX_PATH` — no-op off Windows, and the `\\?\` prefix never
+  leaks into the returned paths or the Fabric part keys. The estate's pre-write `shutil.rmtree` cleanups
+  are long-path-aware too, so re-runs over a previously-written deep tree stay idempotent. Because the
+  writer now succeeds at any depth, the earlier hard pre-flight failure is **downgraded to a non-fatal
+  warning** (the build proceeds; it recommends a shorter output root so the *local* `.pbip` opens in
+  Power BI Desktop even without Windows long paths enabled). A genuine `OSError` at write time is still
+  classified (`WinError 3`/`206`, `ENAMETOOLONG`, or an over-limit projected path → `path_too_long`),
+  recorded as `pbip_write_error` with `pbip_status="failed"`, and surfaced through the
+  definition-of-done banner and `summary.md` — and the definition-of-done still checks for that write
+  failure **before** the published-datasource carve-out, so a real failure is always reported `failed`
+  and never hidden behind a `skipped`. Also documents (SKILL.md) keeping the working `$RUN` root short
+  on Windows, makes `auto-detect` a first-class answer for a workbook's datasource binding (removing the
+  earlier contradiction that demanded an embedded-vs-published classification the pipeline resolves
+  itself), and warns against spawning a duplicate model for a datasource migrated both standalone and
+  inside a workbook (pass `--model-name` to overwrite). Report-schema change is additive only
+  (`pbip_write_error`); the plugin mirror is updated in lockstep.
 - **tableau-migration:** **the runbook's opening phases are now mechanical — the agent no longer
   deliberates before `GO`.** Three latent `SKILL.md` defects stalled an agent at Phase 0: (1) no
   working-directory anchor — every command used a bare `.\` with no pinned cwd, so the agent had to
