@@ -78,12 +78,25 @@ D6 — CREDENTIAL ACCESS  (only if D1=A; how I obtain the PAT / Connected-App se
    B) Local secure terminal     (no Key Vault — you type it into a hidden prompt; never in chat)
 ```
 
-> **Workbook in scope?** If D2 names a **workbook**, you do **not** classify it — `migrate_estate.py`
-> auto-detects whether it embeds its datasource or connects to a **published** one (STEP 2; you never
-> inspect XML). The only thing to decide is **scope**: if you already know it's backed by a **published**
-> datasource, add **that datasource to D2** too so it co-migrates (its calculations and the workbook's are
-> both built into the workbook's model). If you're unsure, record **`auto-detect`** and STEP 2 resolves it
-> — a published datasource that turns out **not** to be in scope is reported, never silently wrong.
+> **A workbook's datasource migrates first, then the report binds to it — exactly like an embedded
+> datasource.** You never hand-classify a workbook: `migrate_estate.py` auto-detects whether it
+> **embeds** its datasource or connects to a **published** one (STEP 2; you never inspect XML) and
+> rebuilds the report against the real schema either way. An **embedded** datasource rides inside the
+> workbook, so it's already in scope and consolidated automatically — nothing extra to do. A
+> **published** datasource is the *same flow* with one extra step: it lives outside the workbook (only a
+> `sqlproxy` stub travels along), so scope it as its **own D2 datasource name** and fetch it alongside
+> the workbook — then it migrates first and the workbook binds to it, just like embedded.
+>
+> **For local output (D3=C, and the local bundle of D3=A) this is mandatory, not a choice.** There is no
+> workbook-only migration and no `auto-detect` defer — a published-backed workbook whose datasource is
+> missing from scope rebuilds to an **empty report**. STEP 2 **names** any published datasource it
+> detected; if that name isn't in scope yet, add it and re-run so the datasource lands first. Never ship
+> the empty result.
+>
+> **Fabric outputs (D3=A/B) are a *different decision tree*** — the published datasource may already
+> exist in the target workspace as a semantic model, so the choice is **bind-to-existing vs.
+> migrate-fresh**, not an automatic co-migrate. That tree is defined at STEP 3; do **not** apply the
+> local "always migrate first" rule to a Fabric deploy.
 
 ### Phase 0B — Credentials form (simple 2-file pattern)
 
@@ -161,7 +174,7 @@ LEDGER — confirm, then reply GO
   work dir   : <$RUN>   (scripts run from here; skill at <$SKILL>)
   source     : <D1 A live / B local>   from <SITE_URL/SITE_NAME  or  .\in>
   scope      : <all | datasource and/or workbook names>
-  workbook ds: <none | auto-detect | published "<DS>" also in scope>   (omit if no workbook; "auto-detect" = let STEP 2 classify embedded vs published — you never inspect XML)
+  workbook ds: <none | embedded (engine consolidates) | published "<DS>" — its datasource also scoped as a D2 name>   (omit if no workbook; a published-backed workbook's datasource MUST be its own D2 name so it's in scope — never "workbook only", never an `auto-detect` defer)
   outputs    : <D3 A both / B Fabric only / C local only>
   conflicts  : <D4 overwrite | skip | stop>
   auth       : <D5 PAT | Connected App JWT>   (D6 secret via <Key Vault KV_NAME/SECRET_NAME | local terminal prompt>)
@@ -226,9 +239,10 @@ is already a quoted PowerShell string; only a literal `"` inside a name must be 
 > sole downloader: never hand-roll a Tableau REST call, never unzip a `.twbx` (STEP 2 ingests packaged
 > files directly). A workbook is just another name to fetch (`--workbook-name`); whether it embeds its
 > datasource or connects to a **published** one, STEP 2 auto-detects and binds it — you never inspect
-> XML or read a connection class. The **only** requirement is that a published workbook's datasource is
+> > XML or read a connection class. The **only** requirement is that a published workbook's datasource is
 > itself a name in your D2 scope, so it's already in the datasource list above and the two migrate
-> together. If a required name is missing from scope, **STOP and ask** — never hand-roll a workaround.
+> together. If STEP 2 names a published datasource that is **not** yet in scope, **fetch that name into
+> `.\in` and re-run** so it migrates first and the workbook binds — never hand-roll a workaround.
 
 **Checkpoint 1:** `.\in` holds one file per scoped name — and **only** those. `migrate_estate.py` has
 **no name filter**: it migrates *everything* in `-i`, so scope is enforced solely by what's in `.\in` (a

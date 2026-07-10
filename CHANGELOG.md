@@ -13,6 +13,15 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Fixed
+- **tableau-migration:** **A published-backed workbook's datasource now co-migrates by default for a
+  local output — no more empty reports.** The runbook (`SKILL.md`) let an agent migrate a
+  published-datasource workbook without putting that datasource in scope, so the report rebuilt against
+  the workbook's unusable `sqlproxy` proxy stub and opened empty. `SKILL.md` now frames a published
+  datasource exactly like an **embedded** one — the datasource migrates **first** and the report binds
+  to it — and makes this mandatory for local output (no workbook-only migration, no passive
+  `auto-detect` defer): if STEP 2 names a published datasource that is not yet in scope, fetch it into
+  `.\in` and re-run so it lands first and the workbook binds. Documentation only — the engine already
+  rebuilt-and-bound the report from the matching published datasource once it was in scope.
 - **tableau-migration:** **Windows `MAX_PATH` (260) no longer breaks — or silently masks — a deep
   workbook `.pbip` build.** A rebuilt PBIR report nests many folders deep
   (`<report>.Report/definition/pages/<page>/visuals/<visual>/visual.json`), so a long output root could
