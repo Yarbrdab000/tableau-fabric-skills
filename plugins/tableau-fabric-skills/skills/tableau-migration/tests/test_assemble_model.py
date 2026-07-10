@@ -20,6 +20,7 @@ from test_connection_to_m import (
     EXCEL_COLLECTION,
     LIVE_SQLSERVER,
     JOIN_TREE,
+    PHYSICAL_JOIN_KEYS,
     FEDERATED_STAR,
     FEDERATED_REL_EDGECASE,
     DATABRICKS_CUSTOM_SQL,
@@ -1165,6 +1166,27 @@ def test_assemble_join_tree_raises_for_fallback():
     with pytest.raises(ValueError) as ei:
         migrate_tds_to_semantic_model(JOIN_TREE, model_name="Joined")
     assert "needs-storage-decision" in str(ei.value).lower()
+
+
+def test_assemble_physical_join_builds_multi_table_model_with_relationships():
+    # A physical join tree WITH real join clauses + columns now rebuilds as a multi-table model --
+    # one table per surfaced leaf, wired by the relationships recovered from its <clause> keys --
+    # instead of collapsing to an opaque combination the storage policy could only skip.
+    out = migrate_tds_to_semantic_model(PHYSICAL_JOIN_KEYS, model_name="Joined")
+    parts = out["parts"]
+    assert "definition/tables/Orders.tmdl" in parts
+    assert "definition/tables/Customer.tmdl" in parts
+    # the role-playing alias surfaces as its own model table.
+    assert "definition/tables/Manager.tmdl" in parts
+    rels = parts["definition/relationships.tmdl"]
+    assert "fromColumn: Orders.CustomerId" in rels and "toColumn: Customer.Id" in rels
+    assert "fromColumn: Orders.ManagerId" in rels and "toColumn: Manager.Id" in rels
+    reported = {(r["from_table"], r["from_col"], r["to_table"], r["to_col"])
+                for r in out["report"]["relationships"]}
+    assert reported == {
+        ("Orders", "CustomerId", "Customer", "Id"),
+        ("Orders", "ManagerId", "Manager", "Id"),
+    }
 
 
 def test_migrate_auto_wires_parsed_relationships():

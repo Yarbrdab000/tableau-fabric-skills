@@ -905,6 +905,20 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
+- **tableau-migration:** **a join/union datasource now rebuilds directly to source as a multi-table model
+  instead of being skipped.** A Tableau physical `join`/`union` tree previously collapsed into one opaque
+  "combination" table, which the storage policy could only fall back on — so a join-tree datasource never
+  landed as a model. `connection_to_m._extract_relations` no longer collapses the combination: the container
+  is dropped and each **leaf table is surfaced as its own independent model table** (exactly like a
+  multi-table object-graph source), and a new `_extract_join_relationships` recovers each physical join key
+  (`<clause type='join'>` `[Table].[Column] = [Table].[Column]`) as a `many_to_many` model relationship,
+  de-duplicated against the object-graph relationships in either orientation. A role-playing **alias** (same
+  physical `item`, distinct `name` — e.g. `Contact1` over `[Contact]`) now surfaces as its own model table
+  (the display name joined the de-dup key) instead of collapsing into the base table, while genuine
+  physical/logical copies of one table still collapse. Fail-closed throughout: a composite/calculated
+  predicate, an unqualified operand, or an unresolvable table/column is skipped with a warning rather than
+  forcing the whole datasource to fall back. Additive — no existing report keys changed; parity with the
+  object-graph relationship path.
 - **tableau-migration:** **`MIN([str])` / `MAX([str])` over a text (or date) dimension now translate, so
   the `MIN([A]) + " / " + MIN([B])` tooltip idiom lands as a string concat instead of stubbing.** The
   single-column DAX `MIN`/`MAX` functions accept text (alphabetical order) and dates, matching Tableau's

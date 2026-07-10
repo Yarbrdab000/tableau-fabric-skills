@@ -675,24 +675,6 @@ def _logical_fields(datasource):
     return out
 
 
-def _build_parent_map(root):
-    """Map ``id(child) -> parent`` (ElementTree elements have no parent pointer)."""
-    parent = {}
-    for p in root.iter():
-        for c in list(p):
-            parent[id(c)] = p
-    return parent
-
-
-def _nearest_relation_ancestor(rel, parent_map):
-    p = parent_map.get(id(rel))
-    while p is not None:
-        if _local(p.tag) == "relation":
-            return p
-        p = parent_map.get(id(p))
-    return None
-
-
 def _is_combination_relation(rel):
     """True for a ``join``/``union`` tree (or any non-collection relation that nests child
     relations): these collapse their leaves into ONE logical table and are reported as a
@@ -733,8 +715,11 @@ def _extract_relations(datasource, cols_by_parent, nc_map=None):
 
     * ``collection`` containers are dropped; their child tables are emitted as INDEPENDENT
       model tables (multi-sheet Excel / multi-table sources become multiple model tables).
-    * ``join``/``union`` trees collapse to a single combination entry; their leaf tables are
-      consumed (never leaked as standalone tables) so the policy can fall back cleanly.
+    * ``join``/``union`` trees are NOT collapsed: the combination container is dropped and each
+      leaf table is surfaced as its OWN independent model table (its join keys become model
+      relationships via ``_extract_join_relationships``), so the source rebuilds directly as a
+      multi-table model -- exactly like a multi-table object-graph source -- instead of an opaque
+      combination the storage policy could only skip.
     * duplicate physical/logical copies of the same table (same ``item``) are de-duplicated,
       preferring the copy that actually resolves column metadata, while preserving a resolved
       per-relation ``connection`` from whichever copy carried it.
@@ -744,25 +729,20 @@ def _extract_relations(datasource, cols_by_parent, nc_map=None):
       them -- an extract-ONLY datasource keeps its ``[Extract]`` tables, since they are all it has.
     """
     nc_map = nc_map or {}
-    parent_map = _build_parent_map(datasource)
 
-    # First pass: classify every candidate relation (skipping benign collection containers and the
-    # leaves consumed by a join/union tree) so the extract-twin decision can be made with
-    # whole-datasource knowledge before any table is emitted.
+    # First pass: classify every candidate relation so the extract-twin decision can be made with
+    # whole-datasource knowledge before any table is emitted. A join/union COMBINATION node is not
+    # itself a table -- drop the container and let its LEAF tables surface individually (they appear
+    # in the same ``<relation>`` walk), so a join/union tree rebuilds as separate model tables
+    # related by their join keys (recovered by ``_extract_join_relationships``), exactly like a
+    # multi-table object-graph source, instead of collapsing to one opaque combination the storage
+    # policy could only skip.
     candidates = []
     for rel in _findall_local(datasource, "relation"):
         if (rel.get("type") or "").lower() == "collection":
             continue  # benign container; its child tables are emitted independently
-        # Skip any leaf nested inside a join/union tree: the top combination represents it.
-        anc = _nearest_relation_ancestor(rel, parent_map)
-        consumed = False
-        while anc is not None:
-            if _is_combination_relation(anc):
-                consumed = True
-                break
-            anc = _nearest_relation_ancestor(anc, parent_map)
-        if consumed:
-            continue
+        if _is_combination_relation(rel):
+            continue  # a join/union container; its leaf tables are surfaced individually
         candidates.append(_classify_relation(rel, cols_by_parent, nc_map))
 
     # Only drop ``[Extract]`` cache twins when at least one live (non-extract) table remains to
@@ -779,11 +759,15 @@ def _extract_relations(datasource, cols_by_parent, nc_map=None):
                 continue  # prefer the live/logical relation over its extract-cache twin
             # De-dup on the fully-qualified path so the physical + logical copies of ONE table
             # collapse, but two genuinely different tables that merely share a leaf name (different
-            # catalog/schema) stay distinct.
+            # catalog/schema) stay distinct. The display name is part of the key so a role-playing
+            # ALIAS (same physical ``item`` but a distinct ``name``, e.g. ``Contact1`` over
+            # ``[Contact]``) surfaces as its own model table instead of collapsing into the base
+            # table -- physical/logical copies share both item and name, so they still collapse.
             key = (
                 (entry.get("catalog") or "").lower(),
                 (entry.get("schema") or "").lower(),
                 (entry.get("item") or entry.get("name") or "").lower(),
+                (_table_display(entry) or "").lower(),
             )
             if key in table_index:
                 idx = table_index[key]
@@ -1027,6 +1011,91 @@ def _extract_relationships(datasource, relations):
     return out, warnings
 
 
+def _split_qualified_operand(op):
+    """Split a physical-join operand ``[Table].[Column]`` into ``(table, '[Column]')``.
+
+    Physical ``<clause type='join'>`` predicates reference their operands fully-qualified, e.g.
+    ``[caseman__CasePlan__c].[Id]``. Returns ``(table, '[Column]')`` (the column part keeps its
+    brackets so it can flow straight into :func:`_resolve_rel_column`). A bare, unqualified operand
+    (``[Column]`` with no table prefix) returns ``(None, op)`` so the caller can skip a predicate it
+    cannot attribute to a specific table.
+    """
+    if not op:
+        return None, None
+    op = op.strip()
+    idx = op.find("].[")
+    if idx != -1 and op.startswith("["):
+        return op[1:idx], op[idx + 2:]
+    return None, op
+
+
+def _extract_join_relationships(datasource, relations):
+    """Recover model relationships from PHYSICAL ``<relation type='join'>`` clause predicates.
+
+    A Tableau physical join tree stores each join key as a ``<clause type='join'><expression op='='>``
+    whose two operands are fully-qualified ``[Table].[Column]`` references. Because the leaf tables are
+    now surfaced as independent model tables (see :func:`_extract_relations`), every such predicate
+    becomes a model relationship between those tables -- the SAME treatment
+    :func:`_extract_relationships` gives the object-graph "noodle", so a join tree rebuilds as a star
+    of related tables instead of being skipped. Emitted ``many_to_many`` for the same crash-proof
+    reason documented in :func:`_extract_relationships` (a Tableau join never guarantees a unique key
+    on either side).
+
+    Fail-closed: the table qualifier and both columns must resolve to emitted identifiers; anything
+    that does not (a composite/calculated predicate, an unqualified operand, an unknown table/column)
+    is skipped and recorded in the returned warnings -- never forcing the whole datasource to fall
+    back. Returns ``(relationships, warnings)``.
+    """
+    name_index = {}
+    for r in relations:
+        if r.get("kind") in ("table", "custom_sql"):
+            disp = _table_display(r)
+            if disp:
+                name_index.setdefault(disp.lower(), disp)
+    cols_index = _columns_index(relations)
+    out, warnings, seen = [], [], set()
+    for rel in _findall_local(datasource, "relation"):
+        if not _is_combination_relation(rel):
+            continue
+        for clause in _children_local(rel, "clause"):
+            ops = _equality_operands(clause)
+            if not ops:
+                warnings.append(
+                    "join clause is not a single-column equality "
+                    "(composite / calculated / non-'=' predicate); skipped")
+                continue
+            (ft, fc_op) = _split_qualified_operand(ops[0])
+            (tt, tc_op) = _split_qualified_operand(ops[1])
+            if not ft or not tt:
+                warnings.append(
+                    f"join clause operands ({ops[0]} / {ops[1]}) are not both "
+                    "table-qualified; skipped")
+                continue
+            from_table = name_index.get(ft.lower())
+            to_table = name_index.get(tt.lower())
+            if not from_table or not to_table:
+                warnings.append(
+                    f"join clause references a table that did not surface "
+                    f"({ft!r} / {tt!r}); skipped")
+                continue
+            from_col = _resolve_rel_column(fc_op, cols_index.get(from_table.lower(), []))
+            to_col = _resolve_rel_column(tc_op, cols_index.get(to_table.lower(), []))
+            if not from_col or not to_col:
+                warnings.append(
+                    f"join clause columns ({fc_op} / {tc_op}) between '{from_table}' and "
+                    f"'{to_table}' did not resolve to emitted columns; skipped")
+                continue
+            dedup = (from_table.lower(), from_col.lower(), to_table.lower(), to_col.lower())
+            rdedup = (to_table.lower(), to_col.lower(), from_table.lower(), from_col.lower())
+            if dedup in seen or rdedup in seen:
+                continue
+            seen.add(dedup)
+            out.append({"from_table": from_table, "from_col": from_col,
+                        "to_table": to_table, "to_col": to_col,
+                        "cardinality": "many_to_many"})
+    return out, warnings
+
+
 class AmbiguousDatasourceError(ValueError):
     """Raised when a workbook exposes more than one real datasource and none was selected.
 
@@ -1178,6 +1247,25 @@ def parse_tds(xml_text, select=None):
 
     relations = _extract_relations(datasource, cols_by_parent, nc_map)
     relationships, relationship_warnings = _extract_relationships(datasource, relations)
+    # Recover join keys from any PHYSICAL join tree as model relationships and merge them in,
+    # de-duplicating against the object-graph relationships in either orientation (a datasource
+    # normally uses one representation or the other, but guard against overlap).
+    join_relationships, join_rel_warnings = _extract_join_relationships(datasource, relations)
+    if join_relationships:
+        _rel_seen = set()
+        for r in relationships:
+            _rel_seen.add((r["from_table"].lower(), r["from_col"].lower(),
+                           r["to_table"].lower(), r["to_col"].lower()))
+        for r in join_relationships:
+            key = (r["from_table"].lower(), r["from_col"].lower(),
+                   r["to_table"].lower(), r["to_col"].lower())
+            rkey = (r["to_table"].lower(), r["to_col"].lower(),
+                    r["from_table"].lower(), r["from_col"].lower())
+            if key in _rel_seen or rkey in _rel_seen:
+                continue
+            _rel_seen.add(key)
+            relationships.append(r)
+    relationship_warnings = list(relationship_warnings) + join_rel_warnings
     ff_filename, ff_directory = _flatfile_location(datasource)
 
     is_extract = False
