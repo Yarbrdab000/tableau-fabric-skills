@@ -12,9 +12,54 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+- **tableau-migration:** **multi-line Custom SQL no longer emits undeployable TMDL.** The M-string
+  escaper (`connection_to_m.escape_m_string`, used by both the `Value.NativeQuery` and `Odbc.Query`
+  custom-SQL partition paths) only escaped double quotes, so a Custom SQL query spanning several
+  physical lines left its interior lines at column 0 inside indentation-sensitive TMDL — Fabric then
+  rejected the model with `Workload_FailedToParseFile — Invalid indentation`. The escaper now renders
+  a complete M double-quoted string literal: CRLF/CR are normalised to LF, `"`→`""`, and embedded
+  newlines/tabs become the standard M character escapes `#(lf)`/`#(tab)`, keeping the whole query on one
+  physical TMDL line (runtime-identical SQL). `#` is deliberately not escaped, so `#temp` table names
+  and existing `#(...)` escapes are untouched. Additive: single-line SQL is byte-for-byte unchanged.
+- **tableau-migration:** **workbook-datasource consolidation no longer silently drops calculated fields
+  from every island but the first.** When a multi-datasource workbook consolidated its embedded
+  datasources into one model, the build passed `calcs=None` into `migrate_datasource`, which then
+  auto-extracted calcs scoped to the *first* datasource island only — so a `Profit Ratio` (or any calc)
+  defined on a second/third island was dropped with no trace, yielding a false `coverage_pct: 100`, an
+  empty `needs_review`, and a second-compiler handoff that never fired. `_build_datasource_pbip` now
+  extracts calculations globally across the whole workbook (`extract_calculations(…,
+  include_dimensions=True)`) and threads the explicit `calcs=`/`dim_calcs=` into the consolidated build,
+  so every island's calculated fields are present by construction. The recovered set is always a superset
+  of the old first-island-only set (additive/no-regression); single-datasource workbooks pass `None`
+  and are byte-identical. Fail-closed: an extraction error falls back to the prior auto-extract.
+- **tableau-migration:** **the definition-of-done gate no longer reports a green PASS over a
+  low-fidelity migration.** The gate classified a workbook as `pass` purely because an openable `.pbip`
+  was *written* (`pbip_status == "built"`) — ignoring whether the report was faithful — so a run that
+  stubbed calculated fields, rebuilt visuals with warnings, dropped a model reference, or landed a
+  review-stub partition still printed `✅ DEFINITION OF DONE: PASS`. A new additive `warn` tier
+  (`_dod_warn_reasons`) degrades such a built-but-not-faithful workbook from `pass` to `warn`, with a
+  loud `⚠️ DEFINITION OF DONE: WARN` banner naming each degraded workbook and its concrete fidelity
+  gaps, an additive `report["definition_of_done"]["reports_warned"]` count, and a `[WARN]` stdout
+  marker. Precedence is `failed > warn > pass > skipped`; the gate stays *soft-but-loud* (exit status
+  unchanged) and a fully-faithful build still passes. Additive: no existing report keys renamed or
+  removed.
+
 ### Added
-- **tableau-migration:** **a multi-datasource workbook now consolidates ALL its embedded datasources into ONE
-  openable semantic model — a simplification that closes a silent-drop bug and removes the per-datasource
+- **tableau-migration:** **the STEP 1–3 run contract is now an airtight, decision-free script sequence — the agent
+  runs the scripts in order and reasons nowhere before the second compiler.** The runbook previously documented the
+  scripts' own internal logic (extract-backed vs live, embedded vs published, flat-file materialization, binding) as
+  agent-facing conditionals — "add `--include-extract` *if* extract-backed," "swap to `--workbook-name` for a
+  workbook," a `sqlproxy` published-datasource branch, checkpoints that said "if `false`, re-fetch." That prose
+  invited the agent to re-derive decisions the scripts already make, producing exactly the ad-hoc deliberation the
+  contract forbids. STEP 1 now fetches every scoped name — datasource **or** workbook — through one uniform
+  `fetch_tds.py` loop with `--include-extract` **always on** (required for extract/flat-file, harmless on live DB);
+  the embedded-vs-published classification, storage-mode, and flat-file walls are deleted (auto-detected by
+  `migrate_estate.py` in STEP 2); the three checkpoints are pure pass/fail asserts whose only failure action is
+  **STOP and ask** — no self-diagnosis, re-fetch, or re-run. A new non-negotiable gate rule ("**No deliberation in
+  the mechanical span**") states that between `GO` and the second compiler the agent may not classify a source, pick
+  a per-source flag, add error-handling, tune timeouts, or reason about a corrective action; the first place it may
+  reason is the second compiler (stubbed calcs). Documentation-only: the scripts and report schema are unchanged.
   project split.** Previously a workbook with several embedded datasources emitted one nested project per
   datasource (`pbip/<WB>/<DS>/`), splitting a dashboard whose views span datasources. It now rebuilds every
   embedded datasource into a *single* model as disconnected table islands — each table bound to its own

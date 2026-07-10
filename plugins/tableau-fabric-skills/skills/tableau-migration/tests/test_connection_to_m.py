@@ -9,6 +9,7 @@ from connection_to_m import (
     emit_connection_parameters,
     emit_m_partition_source,
     emit_table_tmdl_m,
+    escape_m_string,
     extract_bundled_flatfile,
     m_partition_review_reason,
     parse_tds,
@@ -1239,6 +1240,49 @@ def test_emit_custom_sql_uses_native_query_with_folding():
     assert "[EnableFolding=true]" in body
     # embedded double quotes in the SQL are escaped for the M string literal.
     assert '""Region""' in body
+
+
+def test_escape_m_string_escapes_control_chars_for_single_line_literal():
+    # A complete M double-quoted-literal escaper: quotes doubled, and CR/LF/tab become M character
+    # escapes so a multi-line value stays on ONE physical line (TMDL indentation safety).
+    assert escape_m_string('a"b') == 'a""b'
+    assert escape_m_string("a\r\nb") == "a#(lf)b"      # CRLF normalized to a single #(lf)
+    assert escape_m_string("a\nb") == "a#(lf)b"
+    assert escape_m_string("a\rb") == "a#(lf)b"
+    assert escape_m_string("a\tb") == "a#(tab)b"
+    # identifier-shaped values carry no control chars -> byte-identical output (other callers safe).
+    assert escape_m_string("myserver.database.windows.net") == "myserver.database.windows.net"
+    assert escape_m_string("") == ""
+    assert escape_m_string(None) == ""
+
+
+def test_emit_multiline_custom_sql_native_query_stays_single_line():
+    # Regression (Defect A): multi-line Custom SQL must not leak raw newlines into the
+    # Value.NativeQuery M literal -- interior SQL lines at column 0 break the indentation-significant
+    # TMDL partition (Fabric: Workload_FailedToParseFile -- Invalid indentation).
+    d = parse_tds(CUSTOM_SQL)
+    rel = dict(d["relations"][0])
+    rel["sql"] = "SELECT o.id, o.amount\r\nFROM orders o\r\nJOIN detail d ON d.id = o.id"
+    body = emit_m_partition_source(rel, d, "DirectQuery")
+    assert "Value.NativeQuery" in body
+    # the SQL is folded onto one line with escaped newlines...
+    assert "o.amount#(lf)FROM orders o#(lf)JOIN detail d ON d.id = o.id" in body
+    # ...so NO interior SQL line lands at column 0, and a source CRLF does not double into a blank line.
+    assert "\nFROM orders o" not in body
+    assert "\nJOIN detail" not in body
+    assert "#(lf)#(lf)" not in body
+
+
+def test_emit_multiline_odbc_custom_sql_stays_single_line():
+    # Same indentation-safety guarantee for the generic-ODBC Odbc.Query custom-SQL path (Defect A).
+    d = parse_tds(GENERIC_ODBC_DRIVER)
+    rel = dict(d["relations"][0])
+    rel["sql"] = "SELECT a,\r\nb\r\nFROM lake.orders"
+    body = emit_m_partition_source(rel, d, "Import")
+    assert "Odbc.Query" in body
+    assert "SELECT a,#(lf)b#(lf)FROM lake.orders" in body
+    assert "\nFROM lake.orders" not in body
+    assert "#(lf)#(lf)" not in body
 
 
 def test_emit_oracle_table_is_deploy_ready_server_only_m():

@@ -39,6 +39,12 @@ do not improvise flags or infer answers. The detailed reference body begins afte
 4. **A workbook input's rebuilt report is a REQUIRED output.** For a `.twb`/`.twbx` source, an openable,
    model-bound `.pbip` report ships alongside the semantic model; the run's definition-of-done ledger
    (`report.json` → `definition_of_done` + a `summary.md` banner) **fails loud** if one is missing.
+5. **No deliberation in the mechanical span.** Between `GO` and the second compiler you do exactly one
+   thing: run the STEP 1→3 scripts in order and read their reports. The scripts determine **everything** —
+   extract vs live, embedded vs published, storage mode, flat-file landing, binding — so you never
+   classify a source, pick a per-source flag, add error-handling, tune timeouts, or reason about a
+   "corrective action." A checkpoint that fails = **STOP and ask**, never self-correct. The **first**
+   place you are permitted to reason is the second compiler (stubbed calcs).
 
 ### Phase 0A — Decision Menu (present verbatim; defaults marked)
 
@@ -145,81 +151,48 @@ Run nothing until the user replies `GO`.
 
 PowerShell (Windows lead). Dot-source the vars first: `. .\migration.vars.local.ps1`.
 
-**STEP 1 — assemble `.\tds` (one `.tds`/`.tdsx` per datasource, or a `.twb`/`.twbx` per workbook)**
+**STEP 1 — assemble `.\tds`: get every scoped name into the folder (one `fetch_tds.py` call each)**
 
-- **D1=B (local):** drop your exported files into `.\tds` — `.tds`/`.tdsx` **datasources** and/or
-  `.twb`/`.twbx` **workbooks** — then go to STEP 2. For a **flat-file or extract-backed** source
-  (Excel/CSV, or a `… - Extract` source carrying a `.hyper`), export the **packaged** form
-  (`.tdsx`/`.twbx`) so the data travels inside the file — STEP 2 lifts it to an absolute path.
-- **D1=A (live):** obtain the secret per **D6**, then loop `fetch_tds.py` per datasource name.
-  **D6=A (Key Vault):** read it into the env var, then run the loop:
+Every name in D2 scope — datasource **or** workbook — is fetched the same way, always with
+`--include-extract`. You do **not** classify sources, choose per-source flags, or decide
+embedded-vs-published; STEP 2 auto-detects all of that.
+
+- **D1=B (local):** drop the exported files into `.\tds` (`.tds`/`.tdsx` **datasources** and/or
+  `.twb`/`.twbx` **workbooks**; export the **packaged** `.tdsx`/`.twbx` so any extract/flat-file data
+  travels inside). Go to STEP 2.
+- **D1=A (live):** run this block exactly — fill the two name lists from D2 scope (leave a list empty
+  if that kind isn't in scope):
 
 ```powershell
-$env:TABLEAU_PAT_VALUE = az keyvault secret show --vault-name $KV_NAME --name $SECRET_NAME --query value -o tsv
+$env:TABLEAU_PAT_VALUE = az keyvault secret show --vault-name $KV_NAME --name $SECRET_NAME --query value -o tsv   # D6=A only; omit this line for D6=B
 New-Item -ItemType Directory -Force -Path .\tds | Out-Null
-foreach ($ds in @("<Datasource A>","<Datasource B>")) {   # D2 scope
+foreach ($name in @("<Datasource A>","<Published DS>")) {   # D2 datasource scope
   py -3.11 scripts\fetch_tds.py --server $SITE_URL --site $SITE_NAME `
-    --datasource-name $ds --auth pat --pat-name $PAT_NAME --out .\tds
+    --datasource-name $name --include-extract --auth pat --pat-name $PAT_NAME --out .\tds
+}
+foreach ($name in @("<Workbook A>")) {                       # D2 workbook scope
+  py -3.11 scripts\fetch_tds.py --server $SITE_URL --site $SITE_NAME `
+    --workbook-name $name --include-extract --auth pat --pat-name $PAT_NAME --out .\tds
 }
 ```
 
-D6=B (local terminal, no Key Vault): skip the `az keyvault` line, leave `TABLEAU_PAT_VALUE` unset,
-and add `--prompt-secret` to each `fetch_tds.py` call — it asks for the PAT secret at a hidden
-terminal prompt (tell the user to type it **into the terminal**, never in chat).
+`--include-extract` is **always on** — required for an extract/flat-file source, harmless on a live DB
+source (Tableau returns the `.tds` with no `.hyper`) — so it is never a per-source decision. Auth/secret
+flags come straight from the menu, never re-derived here: **D6=B** → omit the `az keyvault` line, leave
+`TABLEAU_PAT_VALUE` unset, add `--prompt-secret` to each call (user types the PAT in the terminal, never
+in chat). **D5=B (JWT)** → replace `--auth pat --pat-name $PAT_NAME` with
+`--auth jwt --client-id $CA_CLIENT_ID --secret-id $CA_SECRET_ID --jwt-username $JWT_USERNAME`.
 
-D5=B (JWT): replace `--auth pat --pat-name $PAT_NAME` with
-`--auth jwt --client-id $CA_CLIENT_ID --secret-id $CA_SECRET_ID --jwt-username $JWT_USERNAME`
-(add `--secret-value $env:TABLEAU_PAT_VALUE` for D6=A, or `--prompt-secret` for D6=B).
+> **⛔ The one and only download path — do not improvise around a perceived gap.** `fetch_tds.py` is the
+> sole downloader: never hand-roll a Tableau REST call, never unzip a `.twbx` (STEP 2 ingests packaged
+> files directly). A workbook is just another name to fetch (`--workbook-name`); whether it embeds its
+> datasource or connects to a **published** one, STEP 2 auto-detects and binds it — you never inspect
+> XML or read a connection class. The **only** requirement is that a published workbook's datasource is
+> itself a name in your D2 scope, so it's already in the datasource list above and the two migrate
+> together. If a required name is missing from scope, **STOP and ask** — never hand-roll a workaround.
 
-- **D1=A (live workbook + its embedded datasource):** `fetch_tds.py` also downloads a published
-  **workbook** — in the loop above swap `--datasource-name $ds` for `--workbook-name "<Workbook>"`
-  (or `--workbook-luid <luid>`) and keep `--out .\tds`. STEP 2's `migrate_estate.py` ingests the
-  `.twb`/`.twbx` from `.\tds` and rebuilds the embedded datasource as a semantic model **and** the
-  workbook as a report — no separate datasource fetch is needed for an embedded source.
-
-- **Workbook connected to a PUBLISHED datasource (co-migrate the datasource in the SAME run):** a
-  workbook can connect to a datasource that was *published separately* to Tableau Server/Cloud
-  (its connection class is `sqlproxy`) instead of embedding one. When the source is such a workbook,
-  **download its published datasource into the SAME `.\tds` folder** so the two migrate together:
-  - **D1=A (live):** add the published datasource to the fetch loop — keep the workbook's
-    `--workbook-name "<Workbook>"` call AND add a `--datasource-name "<Published DS>"` call (both
-    `--out .\tds`). Add `--include-extract` to **both** if the data is a flat file / `.hyper` extract.
-  - **D1=B (local):** drop the workbook's `.twb`/`.twbx` **and** the published datasource's
-    `.tds`/`.tdsx` into `.\tds` together.
-  STEP 2 then catalog-matches the workbook to that migrated datasource, rebuilds the workbook's model
-  on the **real** datasource schema, and lands **every calculation from both sides** — the published
-  datasource's own calculated fields **and** the workbook-local calculations — onto the model attached
-  to the workbook. Migrate a published-datasource workbook **without** its datasource and the
-  workbook's model routes to the lakehouse fallback and is skipped (`sqlproxy` carries no usable
-  schema or data on its own).
-
-> **`migrate_estate.py` auto-detects embedded vs published — you never inspect the XML to choose.**
-> Drop the workbook (and, for the published case, its datasource) into `.\tds` and run STEP 2.
-> The tool decides the binding and rebinds automatically; there is no flag and no per-workbook
-> decision for you to make. Your only job is to make sure a published workbook's datasource is in
-> scope (above).
-
-> **⛔ WORKBOOK DO / DON'T — follow exactly; do not improvise around a perceived gap.**
-> - **DO** download every workbook with `fetch_tds.py --workbook-name "<W>"` (or `--workbook-luid`)
->   `--include-extract --out .\tds`. It already handles `.twb` AND packaged `.twbx`.
-> - **DO** co-migrate a published workbook's datasource in the same run (the branch above).
-> - **DON'T** write a custom Tableau REST downloader or call the REST API by hand — `fetch_tds.py`
->   is the one and only download tool.
-> - **DON'T** manually unzip a `.twbx` or extract the inner `.twb` — `migrate_estate.py` ingests the
->   packaged file directly.
-> - **DON'T** migrate a published-datasource workbook without its published datasource in `.\tds`.
-> - If something seems missing, **STOP and ask** — never hand-roll a workaround.
-
-> **`--include-extract` is REQUIRED for a flat-file / extract-backed source.** Add it to the
-> `fetch_tds.py` call for any workbook or datasource whose data is an Excel/CSV file or a Tableau
-> extract (`.hyper`). It downloads the **packaged** `.twbx`/`.tdsx` with the data inside; STEP 2 then
-> materializes that data to an **absolute** path (Excel/CSV lifted as-is; a `.hyper` extract read to
-> one CSV per table) so the Import model loads rows. Omit it and only the metadata travels, so the
-> model opens **empty** with a relative-path error. (A live DB source — SQL Server / Snowflake /
-> Postgres — needs no extract; it repoints at the live connection.)
-
-**Checkpoint 1:** `.\tds` holds one `.tds` per requested datasource (or the requested `.twb`/`.twbx`
-per workbook). Fewer than expected → STOP.
+**Checkpoint 1:** `.\tds` holds one file per scoped name. Fewer → **STOP and ask** (do not re-derive or
+substitute names).
 
 **STEP 2 — build the Fabric bundle**
 
@@ -227,15 +200,12 @@ per workbook). Fewer than expected → STOP.
 py -3.11 scripts\migrate_estate.py -i .\tds -o .\out
 ```
 
-**Checkpoint 2:** `.\out\semantic_models` has one `*.SemanticModel` per datasource and
-`.\out\report.json` shows `summary.datasources_migrated > 0`. For a **workbook** source, `.\out\pbip`
-also holds an openable `<Workbook>.pbip` (the rebuilt report bound to its model), and
-`report.json` lists the workbook with its `flatfile_data.landed` status — confirm it is `true` for a
-flat-file/extract source (if `false`, re-fetch with `--include-extract`). For a **published-datasource
-workbook**, that workbook entry also shows `bound_via: published_catalog_match:<DS>` — confirming it
-rebuilt on the co-migrated datasource and carries both the datasource's and the workbook's
-calculations; if instead the workbook was skipped to the lakehouse fallback, its published datasource
-was not in `.\tds` — add it (STEP 1) and re-run. Empty / `0` → STOP and read `.\out\summary.md`.
+**Checkpoint 2:** confirm `.\out\semantic_models` holds one `*.SemanticModel` per datasource,
+`.\out\report.json` shows `summary.datasources_migrated > 0`, and every workbook source has an openable
+`.\out\pbip\<Workbook>.pbip` bound to its model. Anything missing or `0` → **STOP**, read
+`.\out\summary.md`, and report it to the user. Do not self-diagnose, re-fetch, or re-run — the scripts
+have already done their own detection and binding; a shortfall is a STOP-and-ask, never something for
+you to fix by hand.
 
 **STEP 3 — deploy (skip entirely if D3=C / local only)**
 
@@ -255,7 +225,8 @@ stop → halt on the first conflict and ask. If a model binds an on-prem source,
 > benign "needs refresh" warning triangles (see *After deploy: the credential-binding wall* below).
 > Pass `--no-recalc` to skip it.
 
-**Checkpoint 3:** each deploy completes its LRO without error. Any failure → STOP, do not continue.
+**Checkpoint 3:** each deploy completes its LRO without error. Any failure → **STOP and ask**, do not
+continue or retry with altered flags.
 If D3=B (Fabric only), remove `.\out` after a clean deploy; if D3=A, keep it.
 
 bash equivalent: same flags with `python3.11` instead of `py -3.11`; export the same variables in

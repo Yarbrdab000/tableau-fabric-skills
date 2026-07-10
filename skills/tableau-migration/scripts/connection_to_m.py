@@ -121,8 +121,19 @@ def _strip_brackets(name):
 
 
 def escape_m_string(s):
-    """Escape a string for embedding inside a Power Query M double-quoted literal."""
-    return (s or "").replace('"', '""')
+    """Escape a string for embedding inside a Power Query M double-quoted literal.
+
+    Doubles ``"`` per M and -- critically for multi-line Custom SQL embedded in
+    ``Value.NativeQuery`` / ``Odbc.Query`` -- normalizes line endings to a single LF and emits M's
+    character escapes (``#(lf)`` for newline, ``#(tab)`` for tab) so the literal stays on ONE
+    physical line. A raw newline would otherwise survive into the surrounding TMDL partition block,
+    whose grammar is indentation-significant: interior SQL lines land at column 0 and Fabric rejects
+    the file with ``Workload_FailedToParseFile -- Invalid indentation`` (and a source ``\\r\\n``
+    would double into a blank line). Identifier callers (server, database, catalog, file paths)
+    carry none of these characters, so their output is byte-identical.
+    """
+    s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
+    return s.replace('"', '""').replace("\t", "#(tab)").replace("\n", "#(lf)")
 
 
 # -- Custom SQL de-escape ------------------------------------------------------
