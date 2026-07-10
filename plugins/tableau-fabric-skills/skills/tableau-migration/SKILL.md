@@ -34,11 +34,19 @@ do not improvise flags or infer answers. The detailed reference body begins afte
    Phase 0A Decision Menu below — issue **no** tool call, shell command, or file read in that turn.
 2. **No defaults inferred, no question skipped.** Every decision (D1–D5) and every credential comes
    from the user. A blank or ambiguous answer = **STOP and ASK**, never guess.
-3. **Do not run STEP 1 until the Confirmation Ledger (Phase 0C) is filled and the user replies
-   `GO`.** No early script execution.
+3. **`GO` gates STEP 1+ only.** Pinning `$SKILL` / `$RUN` and writing + dot-sourcing
+   `migration.vars.local.ps1` is **local setup** — it reaches nothing external and spends nothing, so
+   do it *before* `GO`. Run no STEP 1/2/3 script (anything that touches Tableau, Fabric, or writes the
+   bundle) until the Confirmation Ledger (Phase 0C) is filled and the user replies `GO`.
 4. **A workbook input's rebuilt report is a REQUIRED output.** For a `.twb`/`.twbx` source, an openable,
    model-bound `.pbip` report ships alongside the semantic model; the run's definition-of-done ledger
    (`report.json` → `definition_of_done` + a `summary.md` banner) **fails loud** if one is missing.
+5. **No deliberation in the mechanical span.** Between `GO` and the second compiler you do exactly one
+   thing: run the STEP 1→3 scripts in order and read their reports. The scripts determine **everything** —
+   extract vs live, embedded vs published, storage mode, flat-file landing, binding — so you never
+   classify a source, pick a per-source flag, add error-handling, tune timeouts, or reason about a
+   "corrective action." A checkpoint that fails = **STOP and ask**, never self-correct. The **first**
+   place you are permitted to reason is the second compiler (stubbed calcs).
 
 ### Phase 0A — Decision Menu (present verbatim; defaults marked)
 
@@ -50,7 +58,7 @@ D1 — SOURCE
    B) Local files I already have            (.tds/.tdsx datasources or .twb/.twbx workbooks)
 
 D2 — SCOPE   (name datasources, workbooks, or both)
-   all)      migrate every datasource / workbook found in .\tds
+   all)      migrate every datasource / workbook found in .\in
    <names>)  a subset — list the datasource or workbook names
 
 D3 — OUTPUTS  (forces both-vs-one)
@@ -97,10 +105,23 @@ PAT/Connected-App secret into chat.
 If **D5=B**, also collect the Connected App `CLIENT_ID`, `SECRET_ID`, and impersonation
 `JWT_USERNAME` (the secret value comes from Key Vault or the terminal prompt) instead of `PAT_NAME`.
 
-Set up the local vars file (mirrors the repo's `.env.example` → `.env` convention):
+**Working directory — pin once (before anything touches disk; no `GO` needed — this is local setup).**
+Set two paths and run **every** later command from `$RUN`:
+- **`$SKILL`** = the folder holding this SKILL.md (where `scripts\` and `migration.vars.example.ps1`
+  live — the folder you loaded these instructions from).
+- **`$RUN`** = a **fresh, empty** working folder for THIS migration.
+
+`in\` (fetched inputs) and `out\` (the built bundle) live **under `$RUN`, never under `$SKILL`** — that
+keeps the run clear of the skill's bundled sample datasources and never pollutes the installed skill.
+Every script call is `py -3.11 "$SKILL\scripts\<name>.py"`.
+
+Then set up the local vars file (mirrors the repo's `.env.example` → `.env` convention):
 
 ```powershell
-Copy-Item .\migration.vars.example.ps1 .\migration.vars.local.ps1   # once
+$SKILL = "<the folder holding this SKILL.md>"
+$RUN   = "<a fresh, empty working folder, e.g. C:\work\tableau-run>"
+New-Item -ItemType Directory -Force -Path $RUN | Out-Null ; Set-Location $RUN ; $RUN = (Get-Location).Path
+Copy-Item "$SKILL\migration.vars.example.ps1" .\migration.vars.local.ps1   # once
 # fill migration.vars.local.ps1 with the real values (it is git-ignored), then:
 . .\migration.vars.local.ps1
 ```
@@ -125,7 +146,8 @@ Echo the resolved choices + resources back, then wait for `GO`:
 
 ```
 LEDGER — confirm, then reply GO
-  source     : <D1 A live / B local>   from <SITE_URL/SITE_NAME  or  .\tds>
+  work dir   : <$RUN>   (scripts run from here; skill at <$SKILL>)
+  source     : <D1 A live / B local>   from <SITE_URL/SITE_NAME  or  .\in>
   scope      : <all | datasource and/or workbook names>
   workbook ds: <none | embedded | published: "<DS>" co-migrated in scope>   (omit if no workbook)
   outputs    : <D3 A both / B Fabric only / C local only>
@@ -143,99 +165,75 @@ Run nothing until the user replies `GO`.
 > `migrate_estate.py` takes `-i/-o` and emits `<out>/semantic_models/<Name>.SemanticModel` +
 > `report.json` + `summary.md`; `deploy_to_fabric.py` deploys **one** `--model-dir` per call.
 
-PowerShell (Windows lead). Dot-source the vars first: `. .\migration.vars.local.ps1`.
+PowerShell (Windows lead). Run every command from `$RUN` (pinned in Phase 0B); call scripts as
+`"$SKILL\scripts\…"`. Starting a fresh shell? Re-run `Set-Location $RUN ; . .\migration.vars.local.ps1`
+first.
 
-**STEP 1 — assemble `.\tds` (one `.tds`/`.tdsx` per datasource, or a `.twb`/`.twbx` per workbook)**
+**STEP 1 — assemble `.\in`: get every scoped name into the folder (one `fetch_tds.py` call each)**
 
-- **D1=B (local):** drop your exported files into `.\tds` — `.tds`/`.tdsx` **datasources** and/or
-  `.twb`/`.twbx` **workbooks** — then go to STEP 2. For a **flat-file or extract-backed** source
-  (Excel/CSV, or a `… - Extract` source carrying a `.hyper`), export the **packaged** form
-  (`.tdsx`/`.twbx`) so the data travels inside the file — STEP 2 lifts it to an absolute path.
-- **D1=A (live):** obtain the secret per **D6**, then loop `fetch_tds.py` per datasource name.
-  **D6=A (Key Vault):** read it into the env var, then run the loop:
+Every name in D2 scope — datasource **or** workbook — is fetched the same way, always with
+`--include-extract`. You do **not** classify sources, choose per-source flags, or decide
+embedded-vs-published; STEP 2 auto-detects all of that.
+
+- **D1=B (local):** drop the exported files into `.\in` (`.tds`/`.tdsx` **datasources** and/or
+  `.twb`/`.twbx` **workbooks**; export the **packaged** `.tdsx`/`.twbx` so any extract/flat-file data
+  travels inside). A packaged export and its unpacked twin of the **same stem** (`Sales.tdsx` +
+  `Sales.tds`) count as **one** asset — dropping both is safe. Go to STEP 2.
+- **D1=A (live):** run this block exactly — fill the two name lists from D2 scope (leave a list empty
+  if that kind isn't in scope):
 
 ```powershell
-$env:TABLEAU_PAT_VALUE = az keyvault secret show --vault-name $KV_NAME --name $SECRET_NAME --query value -o tsv
-New-Item -ItemType Directory -Force -Path .\tds | Out-Null
-foreach ($ds in @("<Datasource A>","<Datasource B>")) {   # D2 scope
-  py -3.11 scripts\fetch_tds.py --server $SITE_URL --site $SITE_NAME `
-    --datasource-name $ds --auth pat --pat-name $PAT_NAME --out .\tds
+$env:TABLEAU_PAT_VALUE = az keyvault secret show --vault-name $KV_NAME --name $SECRET_NAME --query value -o tsv   # D6=A only; omit this line for D6=B
+New-Item -ItemType Directory -Force -Path .\in | Out-Null
+foreach ($name in @("<Datasource A>","<Published DS>")) {   # D2 datasource scope
+  py -3.11 "$SKILL\scripts\fetch_tds.py" --server $SITE_URL --site $SITE_NAME `
+    --datasource-name $name --include-extract --auth pat --pat-name $PAT_NAME --out .\in
+}
+foreach ($name in @("<Workbook A>")) {                       # D2 workbook scope
+  py -3.11 "$SKILL\scripts\fetch_tds.py" --server $SITE_URL --site $SITE_NAME `
+    --workbook-name $name --include-extract --auth pat --pat-name $PAT_NAME --out .\in
 }
 ```
 
-D6=B (local terminal, no Key Vault): skip the `az keyvault` line, leave `TABLEAU_PAT_VALUE` unset,
-and add `--prompt-secret` to each `fetch_tds.py` call — it asks for the PAT secret at a hidden
-terminal prompt (tell the user to type it **into the terminal**, never in chat).
+`--include-extract` is **always on** — required for an extract/flat-file source, harmless on a live DB
+source (Tableau returns the `.tds` with no `.hyper`) — so it is never a per-source decision. Auth/secret
+flags come straight from the menu, never re-derived here: **D6=B** → omit the `az keyvault` line, leave
+`TABLEAU_PAT_VALUE` unset, add `--prompt-secret` to each call (user types the PAT in the terminal, never
+in chat). **D5=B (JWT)** → replace `--auth pat --pat-name $PAT_NAME` with
+`--auth jwt --client-id $CA_CLIENT_ID --secret-id $CA_SECRET_ID --jwt-username $JWT_USERNAME`. A name
+with spaces, parentheses, or an apostrophe (e.g. `Sales (Lod's)`) is fine inside the `@("…")` list — it
+is already a quoted PowerShell string; only a literal `"` inside a name must be doubled (`""`).
 
-D5=B (JWT): replace `--auth pat --pat-name $PAT_NAME` with
-`--auth jwt --client-id $CA_CLIENT_ID --secret-id $CA_SECRET_ID --jwt-username $JWT_USERNAME`
-(add `--secret-value $env:TABLEAU_PAT_VALUE` for D6=A, or `--prompt-secret` for D6=B).
+> **⛔ The one and only download path — do not improvise around a perceived gap.** `fetch_tds.py` is the
+> sole downloader: never hand-roll a Tableau REST call, never unzip a `.twbx` (STEP 2 ingests packaged
+> files directly). A workbook is just another name to fetch (`--workbook-name`); whether it embeds its
+> datasource or connects to a **published** one, STEP 2 auto-detects and binds it — you never inspect
+> XML or read a connection class. The **only** requirement is that a published workbook's datasource is
+> itself a name in your D2 scope, so it's already in the datasource list above and the two migrate
+> together. If a required name is missing from scope, **STOP and ask** — never hand-roll a workaround.
 
-- **D1=A (live workbook + its embedded datasource):** `fetch_tds.py` also downloads a published
-  **workbook** — in the loop above swap `--datasource-name $ds` for `--workbook-name "<Workbook>"`
-  (or `--workbook-luid <luid>`) and keep `--out .\tds`. STEP 2's `migrate_estate.py` ingests the
-  `.twb`/`.twbx` from `.\tds` and rebuilds the embedded datasource as a semantic model **and** the
-  workbook as a report — no separate datasource fetch is needed for an embedded source.
-
-- **Workbook connected to a PUBLISHED datasource (co-migrate the datasource in the SAME run):** a
-  workbook can connect to a datasource that was *published separately* to Tableau Server/Cloud
-  (its connection class is `sqlproxy`) instead of embedding one. When the source is such a workbook,
-  **download its published datasource into the SAME `.\tds` folder** so the two migrate together:
-  - **D1=A (live):** add the published datasource to the fetch loop — keep the workbook's
-    `--workbook-name "<Workbook>"` call AND add a `--datasource-name "<Published DS>"` call (both
-    `--out .\tds`). Add `--include-extract` to **both** if the data is a flat file / `.hyper` extract.
-  - **D1=B (local):** drop the workbook's `.twb`/`.twbx` **and** the published datasource's
-    `.tds`/`.tdsx` into `.\tds` together.
-  STEP 2 then catalog-matches the workbook to that migrated datasource, rebuilds the workbook's model
-  on the **real** datasource schema, and lands **every calculation from both sides** — the published
-  datasource's own calculated fields **and** the workbook-local calculations — onto the model attached
-  to the workbook. Migrate a published-datasource workbook **without** its datasource and the
-  workbook's model routes to the lakehouse fallback and is skipped (`sqlproxy` carries no usable
-  schema or data on its own).
-
-> **`migrate_estate.py` auto-detects embedded vs published — you never inspect the XML to choose.**
-> Drop the workbook (and, for the published case, its datasource) into `.\tds` and run STEP 2.
-> The tool decides the binding and rebinds automatically; there is no flag and no per-workbook
-> decision for you to make. Your only job is to make sure a published workbook's datasource is in
-> scope (above).
-
-> **⛔ WORKBOOK DO / DON'T — follow exactly; do not improvise around a perceived gap.**
-> - **DO** download every workbook with `fetch_tds.py --workbook-name "<W>"` (or `--workbook-luid`)
->   `--include-extract --out .\tds`. It already handles `.twb` AND packaged `.twbx`.
-> - **DO** co-migrate a published workbook's datasource in the same run (the branch above).
-> - **DON'T** write a custom Tableau REST downloader or call the REST API by hand — `fetch_tds.py`
->   is the one and only download tool.
-> - **DON'T** manually unzip a `.twbx` or extract the inner `.twb` — `migrate_estate.py` ingests the
->   packaged file directly.
-> - **DON'T** migrate a published-datasource workbook without its published datasource in `.\tds`.
-> - If something seems missing, **STOP and ask** — never hand-roll a workaround.
-
-> **`--include-extract` is REQUIRED for a flat-file / extract-backed source.** Add it to the
-> `fetch_tds.py` call for any workbook or datasource whose data is an Excel/CSV file or a Tableau
-> extract (`.hyper`). It downloads the **packaged** `.twbx`/`.tdsx` with the data inside; STEP 2 then
-> materializes that data to an **absolute** path (Excel/CSV lifted as-is; a `.hyper` extract read to
-> one CSV per table) so the Import model loads rows. Omit it and only the metadata travels, so the
-> model opens **empty** with a relative-path error. (A live DB source — SQL Server / Snowflake /
-> Postgres — needs no extract; it repoints at the live connection.)
-
-**Checkpoint 1:** `.\tds` holds one `.tds` per requested datasource (or the requested `.twb`/`.twbx`
-per workbook). Fewer than expected → STOP.
+**Checkpoint 1:** `.\in` holds one file per scoped name — and **only** those. `migrate_estate.py` has
+**no name filter**: it migrates *everything* in `-i`, so scope is enforced solely by what's in `.\in` (a
+fresh `$RUN\in` can't pick up the skill's bundled samples). Fewer files than scoped, or any extra →
+**STOP and ask** (do not re-derive or substitute names).
 
 **STEP 2 — build the Fabric bundle**
 
 ```powershell
-py -3.11 scripts\migrate_estate.py -i .\tds -o .\out
+py -3.11 "$SKILL\scripts\migrate_estate.py" -i .\in -o .\out
 ```
 
-**Checkpoint 2:** `.\out\semantic_models` has one `*.SemanticModel` per datasource and
-`.\out\report.json` shows `summary.datasources_migrated > 0`. For a **workbook** source, `.\out\pbip`
-also holds an openable `<Workbook>.pbip` (the rebuilt report bound to its model), and
-`report.json` lists the workbook with its `flatfile_data.landed` status — confirm it is `true` for a
-flat-file/extract source (if `false`, re-fetch with `--include-extract`). For a **published-datasource
-workbook**, that workbook entry also shows `bound_via: published_catalog_match:<DS>` — confirming it
-rebuilt on the co-migrated datasource and carries both the datasource's and the workbook's
-calculations; if instead the workbook was skipped to the lakehouse fallback, its published datasource
-was not in `.\tds` — add it (STEP 1) and re-run. Empty / `0` → STOP and read `.\out\summary.md`.
+**Checkpoint 2:** confirm `.\out\semantic_models` holds one `*.SemanticModel` per datasource,
+`.\out\report.json` shows `summary.datasources_migrated > 0`, and every workbook source has an openable
+`.\out\pbip\<Workbook>.pbip` bound to its model. Anything missing or `0` → **STOP**, read
+`.\out\summary.md`, and report it to the user. Do not self-diagnose, re-fetch, or re-run — the scripts
+have already done their own detection and binding; a shortfall is a STOP-and-ask, never something for
+you to fix by hand.
+
+> **Second-compiler gate — read `report.json` → `summary.needs_review_total` and branch on it:** if it
+> is **`0`**, no calc was left stubbed, so the assisted-translation stage is **auto-satisfied — skip it**
+> and continue (do not re-read the report to "make sure"). Only when it is **`> 0`** does the mandatory
+> second-compiler pass apply (see *Post-Migration* step 3 / [second-compiler.md](resources/second-compiler.md)).
 
 **STEP 3 — deploy (skip entirely if D3=C / local only)**
 
@@ -243,20 +241,31 @@ Deploy each model folder (one `--model-dir` per call):
 
 ```powershell
 Get-ChildItem .\out\semantic_models -Directory | ForEach-Object {
-  py -3.11 scripts\deploy_to_fabric.py --model-dir $_.FullName --workspace $FABRIC_WORKSPACE --use-az
+  py -3.11 "$SKILL\scripts\deploy_to_fabric.py" --model-dir $_.FullName --workspace $FABRIC_WORKSPACE --use-az
 }
 ```
 
-D4 handling: overwrite redeploys same-named models; skip → exclude existing names from the loop;
-stop → halt on the first conflict and ask. If a model binds an on-prem source, add
-`--gateway-id <id>`.
+The deployed **model name** defaults to the `.SemanticModel` folder stem — a filesystem-safe form of the
+datasource name (spaces / parens / apostrophes may become `_`, sometimes doubled, e.g.
+`Databricks_Example_-_Tier_1__Lod_s_`). For a clean display name, add `--model-name "<Real Name>"` to
+that model's call.
+
+D4 handling — the script does **createOrUpdate only** (it always overwrites a same-named model; there is
+no skip/error flag). **D4=A (overwrite):** the loop above is correct as-is. **D4=B (skip) / D4=C (stop):**
+list the workspace first and branch yourself — pre-fetch existing model names, then for B exclude those
+folders from the loop, and for C halt and ask on the first name that already exists. If a model binds an
+on-prem source, add `--gateway-id <id>`.
 
 > Each deploy also runs a **credential-free ProcessRecalc** by default so the model opens without
 > benign "needs refresh" warning triangles (see *After deploy: the credential-binding wall* below).
 > Pass `--no-recalc` to skip it.
 
-**Checkpoint 3:** each deploy completes its LRO without error. Any failure → STOP, do not continue.
-If D3=B (Fabric only), remove `.\out` after a clean deploy; if D3=A, keep it.
+**Checkpoint 3:** each deploy completes its LRO without error. Any failure → **STOP and ask**, do not
+continue or retry with altered flags.
+If D3=B (Fabric only), remove `.\out` after a clean deploy; if D3=A, keep it. Either way the fetched
+inputs in `.\in` are **sensitive** (they carry the datasource's connection details and any embedded
+extract data) — delete `.\in` once the run is verified, unless the user asked to keep it. Never commit
+`.\in` or `.\out`.
 
 bash equivalent: same flags with `python3.11` instead of `py -3.11`; export the same variables in
 your shell (or a local, git-ignored file you `source`) and read the secret with
@@ -736,7 +745,7 @@ below), and `project_name=` to name the project after the source asset. See
 
 1. **Deploy** with the bundled `scripts/deploy_to_fabric.py` (self-contained Fabric REST), or **deploy & manage** with `semantic-model-authoring` when available (best-practice analysis, refresh, edits).
 2. **Query & explore** with `semantic-model-consumption` and `fabriciq` (natural-language analysis over the migrated model).
-3. **Run the second compiler on every stubbed calc — MANDATORY, automatic, immediate (not an offer).** The second compiler is a **built-in stage of every migration**, not a post-hoc option and not an end-of-run offer. The moment the deterministic pass leaves any calc stubbed (`report["summary"]["needs_review_total"] > 0`, also in `summary.md`'s **Next step** section and each `report["datasources"][n]["translation_handoff"]`), **announce a one-line gate and immediately proceed on your own** — there is no "want me to?", no decline path, and no configuration that turns it off (a migration is *not complete* while a translatable calc sits stubbed). Work the Tier-1 loop per [second-compiler.md](resources/second-compiler.md): author the leanest *faithful* candidate DAX → `check_candidate_dax` (syntactic gate) → reconcile against the oracle when data is landed → **land every validated candidate automatically** via `approved_calc_dax` → redeploy. The **faithful-or-stub** charter binds at the *landing* step, not the *run* step: the pass **always runs**, but a calc with no faithful DAX form stays an inert stub (original `TableauFormula` preserved) — the validation gate, not a human prompt, is what prevents a guess going live.
+3. **Run the second compiler on every stubbed calc — MANDATORY, automatic, immediate (not an offer).** _Guard first: this step applies **only** when `report["summary"]["needs_review_total"] > 0`. If it is `0`, nothing is stubbed — the stage is already satisfied; skip it and move on without re-reading the report._ The second compiler is a **built-in stage of every migration**, not a post-hoc option and not an end-of-run offer. The moment the deterministic pass leaves any calc stubbed (`report["summary"]["needs_review_total"] > 0`, also in `summary.md`'s **Next step** section and each `report["datasources"][n]["translation_handoff"]`), **announce a one-line gate and immediately proceed on your own** — there is no "want me to?", no decline path, and no configuration that turns it off (a migration is *not complete* while a translatable calc sits stubbed). Work the Tier-1 loop per [second-compiler.md](resources/second-compiler.md): author the leanest *faithful* candidate DAX → `check_candidate_dax` (syntactic gate) → reconcile against the oracle when data is landed → **land every validated candidate automatically** via `approved_calc_dax` → redeploy. The **faithful-or-stub** charter binds at the *landing* step, not the *run* step: the pass **always runs**, but a calc with no faithful DAX form stays an inert stub (original `TableauFormula` preserved) — the validation gate, not a human prompt, is what prevents a guess going live.
    > _Announce, then proceed automatically (no question):_ "▶ Starting second compiler — N of M calculations translated deterministically; K need review: `<Calc A>`, `<Calc B>`, … authoring and validating candidates now."
 4. **Open the rebuilt reports (preview)** — each workbook with a rebuildable embedded datasource already ships as an openable `pbip/<Workbook>/<Workbook>.pbip` (Tier-1 *structure* — chart type, exact field bindings, layout, slicers — bound to the model). Open it in Power BI Desktop to review the rebuilt pages; check the per-workbook `viz_fidelity` for any `warned` visuals and apply visual *formatting* (colors, fonts, legends) by hand for now — that styling layer is a later pass.
 5. **(Optional) Run the image oracle to settle ambiguous chart types** — for a workbook with non-standard / "hacky" views (a dual-axis pie that renders as a donut, a running-total Gantt that reads as a waterfall, an INDEX()/RANK() bump, a donut with a KPI floating in its hole), an opt-in **agent-driven vision pass** can confirm or correct each visual's *chart type* against the original Tableau rendering — **without ever touching field bindings**. It consumes the additive per-visual `candidate_records` `twb_to_pbir` already emits, resolves an offline-first image (caller-provided file → embedded `.twb`/`.twbx` thumbnail → none), and re-binds a visual's type **only** to a type in its candidate list. Follow the numbered runbook in [image-oracle.md](resources/image-oracle.md). Sheet swaps and field bindings stay deterministic; the Tier-1 report stands on its own if you skip this.

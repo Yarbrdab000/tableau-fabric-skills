@@ -908,6 +908,88 @@ SOLO_SOURCE_TWB = _viz_wb(
     _viz_ws("Sales by Category", "federated.s1", "Solo Source"))
 
 
+# A two-island workbook whose calculated MEASURE lives on the SECOND embedded datasource. When the
+# workbook's datasources are consolidated into ONE model, that calc MUST still land. The consolidation
+# path used to auto-extract calcs scoped to the FIRST island only (extract_calcs(tds, datasource=None)),
+# so every calc defined on a later island was silently dropped -- and translation coverage was falsely
+# reported 100% (needs_review empty), so the mandatory second compiler never fired. Island 1 (Sales
+# Source) carries no calc; island 2 (Ratio Source) defines Profit Ratio = SUM([Profit])/SUM([Sales]) on
+# columns unique to that island so it resolves unambiguously in the combined model and yields real DAX.
+_RATIO_ISLAND = """
+    <datasource caption='Ratio Source' inline='true' name='federated.s2' version='18.1'>
+      <connection class='federated'>
+        <named-connections>
+          <named-connection caption='c' name='sqlserver.s2'>
+            <connection class='sqlserver' dbname='DB' server='srv.example.com' username='svc' />
+          </named-connection>
+        </named-connections>
+        <relation connection='sqlserver.s2' name='Orders' table='[dbo].[Orders]' type='table' />
+        <metadata-records>
+          <metadata-record class='column'>
+            <remote-name>Segment</remote-name><local-name>[Segment]</local-name>
+            <parent-name>[Orders]</parent-name><local-type>string</local-type>
+          </metadata-record>
+          <metadata-record class='column'>
+            <remote-name>Sales Amount</remote-name><local-name>[Sales]</local-name>
+            <parent-name>[Orders]</parent-name><local-type>real</local-type>
+          </metadata-record>
+          <metadata-record class='column'>
+            <remote-name>Profit Amount</remote-name><local-name>[Profit]</local-name>
+            <parent-name>[Orders]</parent-name><local-type>real</local-type>
+          </metadata-record>
+        </metadata-records>
+      </connection>
+      <column caption='Profit Ratio' datatype='real' name='[Calculation_ratio1]'
+              role='measure' type='quantitative'>
+        <calculation class='tableau' formula='SUM([Profit])/SUM([Sales])' />
+      </column>
+    </datasource>"""
+
+_RATIO_WS = """
+    <worksheet name='Ratio by Segment'>
+      <table>
+        <view>
+          <datasources><datasource caption='Ratio Source' name='federated.s2' /></datasources>
+          <datasource-dependencies datasource='federated.s2'>
+            <column caption='Segment' datatype='string' name='[Segment]' role='dimension' type='nominal' />
+            <column caption='Profit Ratio' datatype='real' name='[Calculation_ratio1]' role='measure' type='quantitative'>
+              <calculation class='tableau' formula='SUM([Profit])/SUM([Sales])' />
+            </column>
+            <column-instance column='[Segment]' derivation='None' name='[none:Segment:nk]' pivot='key' type='nominal' />
+            <column-instance column='[Calculation_ratio1]' derivation='None' name='[none:Calculation_ratio1:qk]' pivot='key' type='quantitative' />
+          </datasource-dependencies>
+        </view>
+        <panes><pane><mark class='Bar' /></pane></panes>
+        <rows>[federated.s2].[none:Calculation_ratio1:qk]</rows>
+        <cols>[federated.s2].[none:Segment:nk]</cols>
+      </table>
+    </worksheet>"""
+
+MULTI_SOURCE_SECOND_ISLAND_CALC_TWB = _viz_wb(
+    _viz_ds("Sales Source", "federated.s1", "sqlserver.s1", "sqlserver", "Sales") + _RATIO_ISLAND,
+    _viz_ws("Sales by Category", "federated.s1", "Sales Source") + _RATIO_WS)
+
+
+def test_workbook_consolidation_lands_calc_from_second_datasource_island():
+    # Defect B regression: a measure calc defined on a NON-first embedded datasource must survive when
+    # the workbook's datasources are consolidated into one model. The old path scoped auto-extraction to
+    # the first (calc-less) island, silently dropping it and falsely reporting full coverage.
+    with tempfile.TemporaryDirectory() as out:
+        src = InMemoryTableauSource(workbooks={"Multi WB": MULTI_SOURCE_SECOND_ISLAND_CALC_TWB})
+        report = migrate_estate(src, os.path.join(out, "b"))
+        wb = report["workbooks"][0]
+        assert wb["pbip_status"] == "built"
+        # the second island's calc is SEEN by the model build (not scoped away to the first island)
+        assert wb["model_translation_handoff"]["summary"]["total"] >= 1
+        # and it lands as a real (translated) measure in the ONE consolidated model
+        measures = os.path.join(out, "b", "pbip", "Multi WB", "Multi WB.SemanticModel",
+                                "definition", "tables", "_Measures.tmdl")
+        assert os.path.isfile(measures), "consolidated model has no _Measures table -- calc was dropped"
+        blob = open(measures, encoding="utf-8-sig").read()
+        assert "measure 'Profit Ratio'" in blob
+        assert "DIVIDE(" in blob                            # SUM([Profit])/SUM([Sales]) -> real DAX
+
+
 # A workbook whose embedded datasource carries a calculated MEASURE (Profit Ratio) that a worksheet
 # puts on a shelf. The estate migration must auto-extract + translate that calc into the emitted model
 # AND the rebuilt visual must bind to it -- the regression guard for using migrate_datasource (which
@@ -1166,6 +1248,65 @@ def test_definition_of_done_main_exits_zero_with_workbook(tmp_path, capsys):
     printed = capsys.readouterr().out
     assert "definition of done" in printed.lower()
     assert (out_dir / "summary.md").read_text(encoding="utf-8").count("DEFINITION OF DONE") >= 1
+
+
+# Defect E -- a workbook that BUILDS an openable .pbip is NOT automatically faithful. If it stubbed a
+# calc, warned a visual, dropped a model reference, or landed a review-stub partition, the report opens
+# but under-delivers -- so the gate must degrade PASS -> WARN (soft; exit stays 0) and never print a
+# green PASS over a low-fidelity result. A clean build still passes.
+def test_definition_of_done_built_but_low_fidelity_degrades_to_warn():
+    wb_details = [
+        {"name": "Clean WB", "pbip_status": "built", "bound_model": "M",
+         "pbip_folder": "pbip/Clean WB/Clean WB.pbip"},
+        {"name": "Stubbed WB", "pbip_status": "built", "bound_model": "M",
+         "pbip_folder": "pbip/Stubbed WB/Stubbed WB.pbip",
+         "model_translation_handoff": {"summary": {"total": 5, "needs_review": 2}}},
+        {"name": "Warned Viz WB", "pbip_status": "built", "bound_model": "M",
+         "pbip_folder": "pbip/Warned Viz WB/Warned Viz WB.pbip",
+         "viz_fidelity": [{"worksheet": "S1", "status": "rebuilt"},
+                          {"worksheet": "S2", "status": "warned", "reason": "date grain not applied"}]},
+        {"name": "Ref Drop WB", "pbip_status": "built", "bound_model": "M",
+         "pbip_folder": "pbip/Ref Drop WB/Ref Drop WB.pbip",
+         "pbip_ref_drops": [{"visual": "v1", "ref": "Orders.Ghost"}]},
+    ]
+    dod = me._definition_of_done(wb_details, pbip_enabled=True)
+
+    assert dod["status"] == "warn"                         # no failures, but fidelity gaps -> WARN
+    assert dod["reports_bound"] == 4                        # all four still opened + bound
+    assert dod["reports_failed"] == 0
+    assert dod["reports_warned"] == 3                       # everything except the clean build
+    by_name = {e["workbook"]: e for e in dod["workbooks"]}
+    assert by_name["Clean WB"]["status"] == "pass"
+    assert by_name["Stubbed WB"]["status"] == "warn"
+    assert "not faithfully translated" in by_name["Stubbed WB"]["reason"]
+    assert by_name["Warned Viz WB"]["status"] == "warn"
+    assert "warning" in by_name["Warned Viz WB"]["reason"].lower()
+    assert by_name["Ref Drop WB"]["status"] == "warn"
+    assert "reference" in by_name["Ref Drop WB"]["reason"].lower()
+    # every WARN workbook is still report_bound (it opened) -- WARN is soft, not a failure
+    assert all(by_name[n]["report_bound"] is True for n in
+               ("Stubbed WB", "Warned Viz WB", "Ref Drop WB"))
+
+
+def test_definition_of_done_warn_precedence_and_banner():
+    # A hard failure still wins over a fidelity warning (failed > warn).
+    mixed = me._definition_of_done(
+        [{"name": "Warn WB", "pbip_status": "built",
+          "model_translation_handoff": {"summary": {"needs_review": 1}}},
+         {"name": "Fail WB", "pbip_status": "skipped",
+          "pbip_warnings": ["manual attention required: needs a storage decision"]}],
+        pbip_enabled=True)
+    assert mixed["status"] == "failed"
+
+    # The WARN banner names each degraded workbook and does NOT print a green PASS.
+    warn_dod = me._definition_of_done(
+        [{"name": "Warn WB", "pbip_status": "built",
+          "model_translation_handoff": {"summary": {"needs_review": 3}}}],
+        pbip_enabled=True)
+    banner = "\n".join(me._dod_banner(warn_dod))
+    assert "DEFINITION OF DONE: WARN" in banner
+    assert "DEFINITION OF DONE: PASS" not in banner
+    assert "Warn WB" in banner
 
 
 # A workbook whose only date column (Order Date) becomes the model's ACTIVE calendar date. The
