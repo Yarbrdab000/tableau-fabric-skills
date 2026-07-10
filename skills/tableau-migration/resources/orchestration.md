@@ -139,11 +139,42 @@ Viz rebuild is a **pluggable, never-hard-wired** stage so this branch's tests pa
 
 1. An injected `viz_stage=callable(twb_text, name) -> dict` wins if provided.
 2. Otherwise, if a `twb_to_pbir` module is importable (Stream B), the first recognized entry point
-   (`migrate_workbook`, `build_pbir`, `twb_to_pbir`, `build_report`) is bound lazily.
+   (`migrate_workbook`, `build_pbir`, `twb_to_pbir`, `build_report`) is bound lazily. (These names are
+   looked up on the **`twb_to_pbir` module** — the viz renderer — not to be confused with the public
+   `migrate_workbook` primitive documented below, which lives in `migrate_estate`.)
 3. If neither is available, each workbook is recorded `viz_status="warned"` and the run continues.
 
 A stage may return `{"parts": {path: text}}` to have a `<Name>.Report` folder written, and/or a
 `"note"`. A stage that raises is isolated as a per-workbook `error`.
+
+---
+
+## Single-workbook migration (`migrate_workbook`)
+
+`migrate_workbook` is the public single-workbook primitive — the workbook analog of
+`migrate_datasource`. It rebuilds one workbook's embedded datasource(s) into semantic model(s) **and**
+the workbook's report bound to them, producing an openable project:
+
+```python
+from migrate_estate import migrate_workbook
+detail = migrate_workbook(r"C:\exports\Exec Dashboard.twbx", write_to=r"C:\out\exec")
+# -> C:\out\exec\pbip\Exec Dashboard\Exec Dashboard.pbip   (model + report bound by path)
+#  + C:\out\exec\reports\Exec Dashboard.Report              (the bare rebuilt report)
+```
+
+`source` is a filesystem path to a `.twb`/`.twbx`, raw workbook XML (`str`/`bytes`), or — for the
+estate — a live `TableauSource` plus a `wb_id`. `write_to` (required) is the output project directory;
+`name=` overrides the display name of a standalone workbook (default: the file stem, or `"workbook"`
+for raw XML); `pbip=False` writes only the bare `reports/<Name>.Report`. Returns the same per-workbook
+**detail dict** the estate reports (`name`, `viz_status`, `pbip_status`, `bound_model` /
+`bound_datasource`, `pbip_folder`, `viz_fidelity`, …); a multi-datasource workbook nests one project
+per datasource. Only invalid **arguments** raise (e.g. a missing `write_to`) — a per-workbook migration
+failure is reported on the returned detail, never raised.
+
+**One code path.** `migrate_estate` loops exactly this function once per workbook, so a standalone
+workbook migration and an estate workbook migration are the same operation — the estate simply runs it
+more times (and first migrates the estate's standalone datasources to populate the published-datasource
+match catalog it threads in as `ds_catalog`).
 
 ---
 

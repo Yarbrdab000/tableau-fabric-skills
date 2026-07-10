@@ -600,6 +600,37 @@ def _classify_row_count(ds, field_id, base_id, deriv, base_cols, instances):
     return None
 
 
+# Tableau stamps a join/relationship *order* prefix onto a physical table name -- the second table
+# added to a join surfaces as ``1. LoginHistory`` -- while the migrated model declares the clean
+# table (``LoginHistory``). ``<digits>. `` + whitespace is that order prefix (a real table named in
+# the exact ``<digits>. <name>`` shape does not occur in practice); stripping it lets an implicit
+# object-id COUNT bind to its COUNTROWS measure across the rename. The trailing ``\s+`` is required
+# so a name like ``2024.Q1`` (dot, no space) is left untouched.
+_TABLE_ORDER_PREFIX_RE = re.compile(r"^\d+\.\s+")
+
+
+def _strip_table_order_prefix(name):
+    """Drop a leading Tableau join-order prefix (``"1. LoginHistory"`` -> ``"LoginHistory"``)."""
+    return _TABLE_ORDER_PREFIX_RE.sub("", name or "").strip()
+
+
+def _match_row_count_measure(table, measures):
+    """Find ``table``'s row-count measure in ``measures``, tolerating a Tableau join-order prefix on
+    either side (``"1. LoginHistory"`` vs ``"LoginHistory"``). Exact match wins; an
+    order-prefix-normalised match binds ONLY when it is unambiguous (exactly one candidate), so two
+    prefixed instances of the same physical table stay unbound and are warned -- warn-never-wrong.
+    """
+    if not table or not measures:
+        return None
+    if table in measures:
+        return measures[table] or None
+    norm = _strip_table_order_prefix(table)
+    if not norm:
+        return None
+    cands = [v for k, v in measures.items() if _strip_table_order_prefix(k) == norm]
+    return cands[0] if len(cands) == 1 else None
+
+
 def _row_count_measure_target(rc, row_count_binding):
     """Resolve the ``(entity, measure)`` to bind an implicit row count to, or ``None``.
 
@@ -608,12 +639,16 @@ def _row_count_measure_target(rc, row_count_binding):
     "measure": ...}}``. An ``object_id`` count binds only when its specific table has a measure
     (never via ``default`` -- it names a fact, so binding requires that fact's COUNTROWS measure); a
     ``numrec`` count (the legacy single-fact row count) binds via ``default``.
+
+    The ``object_id`` table match tolerates a Tableau join-order prefix (``"1. LoginHistory"``) on
+    either side via :func:`_match_row_count_measure`, so a KPI card counting a prefixed physical
+    table still binds to its clean COUNTROWS measure instead of silently blanking.
     """
     if not row_count_binding:
         return None
     measures = row_count_binding.get("measures") or {}
-    if rc["kind"] == "object_id" and rc.get("table") in measures:
-        m = measures[rc["table"]] or {}
+    if rc["kind"] == "object_id":
+        m = _match_row_count_measure(rc.get("table"), measures) or {}
         if m.get("entity") and m.get("measure"):
             return (m["entity"], m["measure"])
     if rc["kind"] == "numrec":
@@ -2944,7 +2979,13 @@ def _apply_override(field, model_table, field_map):
         ov = field_map[field["caption"]]
         entity = ov.get("entity", entity)
         prop = ov.get("property", prop)
-        binding = ov.get("binding", binding)
+        # ``field_map`` targets are always model COLUMNS (measure calcs are rebound via
+        # ``measure_binding``, never here). An explicit override ``binding`` still wins; otherwise a
+        # raw ``measure``-kind ref whose caption resolves to a column is rebound TO that column --
+        # a ``{"Measure"}`` expression pointing at a column is invalid PBIR -- while an
+        # ``aggregation`` pill keeps its aggregation (``SUM`` stays) and a ``column`` stays a column.
+        # So a mis-roled ref lands as its real column instead of a dangling measure reference.
+        binding = ov.get("binding") or ("column" if binding == "measure" else binding)
     elif model_table and binding != "measure":
         entity = model_table
     return entity, prop, binding

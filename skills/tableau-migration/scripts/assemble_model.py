@@ -16,8 +16,10 @@ each part into the Fabric ``createOrUpdate`` payload (see ``fabric_definition_pa
 Storage paths:
 * **Import / DirectQuery** (direct-to-upstream): tables use ``= m`` partitions from
   ``connection_to_m.emit_table_tmdl_m``; connection parameters become named expressions.
-* **DirectLake fallback** (``mode is None``): the caller should land data as Delta first;
-  ``assemble_directlake_model`` then reuses the proven import-model generators.
+* **Needs-storage-decision fallback** (``mode is None``): the shape can't be rebuilt
+  direct-to-source, so it is reported as a fallback (default: land as Import direct-to-source).
+  DirectLake is an explicit opt-in -- ``assemble_directlake_model`` reuses the import-model
+  generators after data is landed as Delta -- never auto-selected.
 
 Credentials are never embedded. Anything outside the safe subset stays an inert ``= 0`` stub
 with its original formula preserved as a ``TableauFormula`` annotation.
@@ -37,10 +39,11 @@ try:  # package or scripts-on-path
         extract_calcs,
         parse_tds,
         reconcile_flatfile_headers,
+        read_flatfile_headers,
         workbook_datasources,
         AmbiguousDatasourceError,
     )
-    from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
+    from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA, FALLBACK_NEEDS_DECISION
     from .calc_to_dax import (
         translate_tableau_calc_to_dax,
         translate_tableau_calc_to_dax_typed,
@@ -64,6 +67,7 @@ try:  # package or scripts-on-path
     )
     from .workbook_table_calcs import extract_table_calc_usages
     from .date_window_flag import build_date_window_flags
+    from .openability_gate import check_model_openability
 except ImportError:
     from connection_to_m import (
         build_m_field_resolver,
@@ -75,10 +79,11 @@ except ImportError:
         extract_calcs,
         parse_tds,
         reconcile_flatfile_headers,
+        read_flatfile_headers,
         workbook_datasources,
         AmbiguousDatasourceError,
     )
-    from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
+    from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA, FALLBACK_NEEDS_DECISION
     from calc_to_dax import (
         translate_tableau_calc_to_dax,
         translate_tableau_calc_to_dax_typed,
@@ -102,10 +107,31 @@ except ImportError:
     )
     from workbook_table_calcs import extract_table_calc_usages
     from date_window_flag import build_date_window_flags
+    from openability_gate import check_model_openability
 
 
 def _table_display(rel):
     return rel.get("name") or rel.get("item") or "Table"
+
+
+def _gate_flatfile_headers(descriptor, flatfile_path=None):
+    """Best-effort ``{table_display: [physical_header, ...]}`` for the openability gate's
+    physical-header check. Reads the actual landed flat file per relation (CSV first line /
+    single-sheet Excel); fully fail-safe -- any relation without a readable header is simply
+    omitted so the gate's ``typed_columns_in_header`` check skips it rather than mis-firing.
+    """
+    headers = {}
+    try:
+        for rel in (descriptor or {}).get("relations", []):
+            path = rel.get("flatfile_path") or flatfile_path
+            if not path:
+                continue
+            hs = read_flatfile_headers(path, sheet=rel.get("excel_sheet"))
+            if hs:
+                headers[_table_display(rel)] = hs
+    except Exception:
+        return {}
+    return headers
 
 
 # Fixed calendar span for a DirectQuery Date table (see _build_date_dimension). A wide, static,
@@ -437,6 +463,26 @@ def _forced_percent_diff_measures(calcs, usages, resolve, known_tables, consumed
     return rows, forced
 
 
+def _approved_entry(value):
+    """Normalise one ``approved_calc_dax`` value into ``(dax, target_table)``.
+
+    Accepts the original flat string form (``"DAX expr"``) and the additive dict form
+    (``{"dax": "DAX expr", "table": "TargetTable"}``), so a human approving an assisted
+    translation can also name the calc's home table. ``target_table`` is ``None`` unless a
+    non-empty string ``table`` is supplied. Anything else -- or a dict without a usable ``dax``
+    -- yields ``(None, None)`` so the caller falls through to the suggestion/stub path
+    (fail-closed). The string form returns ``(value, None)``, so its behavior is byte-identical.
+    """
+    if isinstance(value, str):
+        return value, None
+    if isinstance(value, dict):
+        dax = value.get("dax")
+        if isinstance(dax, str) and dax.strip():
+            tbl = value.get("table")
+            return dax, (tbl.strip() if isinstance(tbl, str) and tbl.strip() else None)
+    return None, None
+
+
 def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    calc_lookup=None, approved_calc_dax=None, synth_measures=None,
                    known_tables=None, table_calc_usages=None, order_resolver=None,
@@ -585,9 +631,11 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
 
         # Deterministic fallback -> consult the assisted-translation idiom registry.
         sugg = suggest_assisted_dax(formula, resolve, calc_lookup=calc_lookup)
-        approved = approved_lower.get(name.lower())
-        if approved:
-            approved_expr = " ".join(approved.split())  # collapse to one valid DAX line
+        # A measure always lands in the shared _Measures table, so an approval's optional target
+        # table (the additive dict form) is not applicable here -- only its DAX is consumed.
+        approved_dax, _approved_tbl = _approved_entry(approved_lower.get(name.lower()))
+        if approved_dax:
+            approved_expr = " ".join(approved_dax.split())  # collapse to one valid DAX line
             measures_tmdl += T.generate_measure_tmdl(
                 name, formula, approved_expr,
                 translated_by="assisted translation (human-approved)")
@@ -1328,7 +1376,7 @@ def _related_date_dax(date_table, column):
 
 def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
                        date_table=None, active_date_cols=None, consumed=None,
-                       approved_calc_dax=None):
+                       approved_calc_dax=None, known_tables=None):
     """Translate row-level (dimension) ``dim_calcs`` via column mode and group the rendered
     calculated-column TMDL by target table, plus a per-column report.
 
@@ -1358,6 +1406,14 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
     ``TranslatedBy = assisted translation (human-approved)`` with status ``assisted-approved``; the
     original Tableau formula is preserved as ``TableauFormula``. With no approval the behavior is
     byte-for-byte unchanged.
+
+    Each value may be the flat string ``"DAX"`` or the additive dict ``{"dax": "DAX", "table":
+    "TargetTable"}``. The dict form lets the approver name the calc's home table -- the fix for a
+    row-context calc Tier 0 could not place, which otherwise defaults to ``anchor_table`` and yields
+    invalid row-context DAX. A named ``table`` overrides the computed home only when it is in
+    ``known_tables`` (the caller injects each block into an existing table part, so an unknown name
+    would be silently dropped); an unknown name keeps the computed home and is recorded on the report
+    row as ``approved_target_unknown``. The honored/requested target is echoed as ``approved_target``.
 
     **Date-dimension binding (optional).** When ``date_table`` (the generated calendar's name)
     and ``active_date_cols`` (the set of ``(table, column)`` carrying the ACTIVE date
@@ -1408,13 +1464,22 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
         # Deterministic fallback -> a human-approved assisted translation (the column-mode peer of
         # the measures' approved_calc_dax landing). Consulted ONLY when Tier 0 produced no DAX, so a
         # faithful deterministic column is never overridden; the approved expression lands LIVE.
-        approved = approved_lower.get(name.lower()) if not dax else None
-        if approved:
-            approved_expr = " ".join(approved.split())  # collapse to one valid DAX line
-            by_table[target] = by_table.get(target, "") + T.generate_calc_column_tmdl(
-                name, formula, approved_expr,
-                translated_by="assisted translation (human-approved)")
-            report.append({
+        approved_dax, approved_tbl = (
+            _approved_entry(approved_lower.get(name.lower())) if not dax else (None, None))
+        if approved_dax:
+            approved_expr = " ".join(approved_dax.split())  # collapse to one valid DAX line
+            # The approval's optional target table (additive dict form) overrides the computed home
+            # -- the fix for a row-context calc Tier 0 could not place, which otherwise defaults to
+            # the anchor and yields invalid row-context DAX. Honor a NAMED table only when it is a
+            # real one: the caller injects each block into an existing table part, so an unknown name
+            # would be silently dropped -- keep the computed home and flag the miss instead.
+            approved_target_unknown = None
+            if approved_tbl and approved_tbl != target:
+                if known_tables is None or approved_tbl in known_tables:
+                    target = approved_tbl
+                else:
+                    approved_target_unknown = approved_tbl
+            row = {
                 "column": name,
                 "table": target,
                 "status": "assisted-approved",
@@ -1424,7 +1489,15 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
                 "date_bound": False,
                 "date_table": None,
                 "date_attribute": None,
-            })
+            }
+            if approved_tbl:
+                row["approved_target"] = approved_tbl
+            if approved_target_unknown:
+                row["approved_target_unknown"] = approved_target_unknown
+            by_table[target] = by_table.get(target, "") + T.generate_calc_column_tmdl(
+                name, formula, approved_expr,
+                translated_by="assisted translation (human-approved)")
+            report.append(row)
             continue
         by_table[target] = by_table.get(target, "") + T.generate_calc_column_tmdl(name, formula, dax)
         report.append({
@@ -1660,8 +1733,9 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     if decision["mode"] is None:
         raise ValueError(
             f"datasource '{descriptor.get('datasource_name')}' requires the "
-            f"{decision.get('fallback', FALLBACK_LAND_TO_DELTA)} path "
-            f"({decision['rationale']}); use assemble_directlake_model after landing data."
+            f"{decision.get('fallback', FALLBACK_NEEDS_DECISION)} path "
+            f"({decision['rationale']}); rebuild direct-to-source as Import, or opt into "
+            f"DirectLake via assemble_directlake_model after landing data as Delta."
         )
     mode = decision["mode"]
     tables = [r for r in descriptor.get("relations", []) if r["kind"] in ("table", "custom_sql")]
@@ -1692,7 +1766,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     if not table_names:
         raise ValueError(
             f"no table produced columns for '{descriptor.get('datasource_name')}'; "
-            f"fall back to land-to-Delta + DirectLake."
+            f"it needs a storage decision (rebuild direct-to-source as Import, or opt into "
+            f"land-to-Delta + DirectLake)."
         )
 
     resolve = build_m_field_resolver(descriptor)
@@ -1785,7 +1860,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     calc_columns_by_table, calc_column_report = _calc_columns_part(
         dim_calcs, resolve, anchor_table=table_names[0],
         date_table=date_name, active_date_cols=active_date_cols,
-        approved_calc_dax=approved_calc_dax,
+        approved_calc_dax=approved_calc_dax, known_tables=set(table_names),
         consumed=(set(consumed) | flag_source_names) if flag_source_names else consumed)
     for disp, block in calc_columns_by_table.items():
         path = f"definition/tables/{disp}.tmdl"
@@ -1880,6 +1955,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         report["filter_bindings"] = filter_bindings
     if header_reconcile["remaps"] or header_reconcile["mismatches"]:
         report["flatfile_header_reconcile"] = header_reconcile
+    report["openability_selfcheck"] = check_model_openability(
+        parts, flatfile_headers=_gate_flatfile_headers(descriptor, flatfile_path))
     return {"parts": parts, "report": report}
 
 
@@ -1912,6 +1989,69 @@ def _match_csv_path(relation, csv_index, *, single_default=None):
         if key in csv_index:
             return csv_index[key]
     return single_default
+
+
+def _reconcile_local_csv_columns(relations, matched):
+    """Prune each local-CSV relation's columns to the columns its file physically contains.
+
+    A local-CSV Import model is dead-on-arrival when a relation declares columns the materialized CSV
+    does not physically contain: Power BI's ``Csv.Document`` type-transform errors on a header that is
+    not in the file (a PHANTOM column -- e.g. a hidden/removed extract column or a metadata artifact),
+    and a duplicate TMDL column name is invalid (a DUPLICATE -- e.g. an object-id-twin column). Both
+    are pruned against the real CSV header, matched by physical ``remote_name``:
+
+    * aliased source names (a ``remote_name`` that is not itself a header but a renamed view of one,
+      e.g. Tableau's ``Person`` -> physical ``Regional Manager``) are FIRST remapped to their real
+      header by the tested flat-file reconciler, so an alias is never mistaken for a phantom;
+    * a column whose (remapped) ``remote_name`` is still absent from the header is DROPPED (phantom);
+    * a second column mapping to an already-claimed header is DROPPED (duplicate).
+
+    Fail-safe: a relation whose CSV header can't be read (missing/unreadable file) is left exactly
+    as-is -- nothing is dropped when absence can't be confirmed, so emission stays byte-identical to
+    the pre-fix behaviour. Returns ``(new_relations, {"dropped": [...], "deduped": [...],
+    "remapped": [...]})``; with clean columns every list is empty and the relations are unchanged.
+    """
+    remapped = []
+    if matched:
+        # Alias-remap first via the tested reconciler. Its guard early-returns unless a top-level
+        # flat-file key is set, so give it a truthy ``flatfile_filename`` sentinel while leaving the
+        # top-level ``flatfile_path`` None -- the reconciler then reads each relation's OWN
+        # ``flatfile_path`` (matched relations have one; unmatched fall through to None and are
+        # skipped, so no cross-file contamination). It mutates only a copy of the relations.
+        recon_desc = {"flatfile_filename": "local.csv", "flatfile_path": None,
+                      "relations": relations}
+        remapped = (reconcile_flatfile_headers(recon_desc) or {}).get("remaps", [])
+        relations = recon_desc.get("relations", relations)
+
+    dropped, deduped, out = [], [], []
+    for rel in relations:
+        path = rel.get("flatfile_path")
+        cols = rel.get("columns") or []
+        if not path or not cols:
+            out.append(rel)
+            continue
+        headers = read_flatfile_headers(path)  # local CSV -> no sheet argument
+        if not headers:
+            out.append(rel)  # fail-safe: header unknown -> keep every column
+            continue
+        header_set = set(headers)
+        disp = _table_display(rel)
+        kept, claimed = [], set()
+        for col in cols:
+            rn = col.get("remote_name")
+            if not rn:
+                kept.append(col)  # nothing to match on -> keep (conservative)
+                continue
+            if rn not in header_set:
+                dropped.append({"table": disp, "source_column": rn})
+                continue
+            if rn in claimed:
+                deduped.append({"table": disp, "source_column": rn})
+                continue
+            claimed.add(rn)
+            kept.append(col)
+        out.append({**rel, "columns": kept} if len(kept) != len(cols) else rel)
+    return out, {"dropped": dropped, "deduped": deduped, "remapped": remapped}
 
 
 def assemble_local_import_model(descriptor, *, model_name, table_csv_paths, calcs=None,
@@ -1957,6 +2097,10 @@ def assemble_local_import_model(descriptor, *, model_name, table_csv_paths, calc
     filt_rels = [r for r in (descriptor.get("relationships") or [])
                  if r.get("from_table") in surviving_set and r.get("to_table") in surviving_set]
 
+    # Prune each relation's columns to what its CSV physically holds (drop phantoms, dedupe twins,
+    # alias-remap) so the emitted TMDL + Csv.Document type-transform never reference a missing header.
+    new_relations, column_reconcile = _reconcile_local_csv_columns(new_relations, matched)
+
     local_desc = {
         **descriptor,
         "connection_class": _LOCAL_CSV_CLASS,
@@ -1975,6 +2119,7 @@ def assemble_local_import_model(descriptor, *, model_name, table_csv_paths, calc
         "unmatched_tables": unmatched,
         "table_count": len(surviving),
         "matched_count": len(matched),
+        "column_reconcile": column_reconcile,
     }
     return result
 
@@ -1982,7 +2127,7 @@ def assemble_local_import_model(descriptor, *, model_name, table_csv_paths, calc
 def assemble_directlake_model(*, model_name, tables, measures_tmdl, expression_name,
                               directlake_url, relationships_tmdl=None,
                               hierarchies=None, display_folders=None, rls_roles=None,
-                              field_parameters=None):
+                              field_parameters=None, schema_name="dbo"):
     """Assemble a DirectLake model from ALREADY-LANDED Delta tables (the fallback path).
 
     ``tables`` is a list of ``(display_name, delta_table_name, columns_tmdl)`` tuples (the
@@ -1999,12 +2144,17 @@ def assemble_directlake_model(*, model_name, tables, measures_tmdl, expression_n
     "table_names": [...]}``) the caller built from its swap calcs; its tables are injected as
     additive scaffolding (before ``_Measures``, never in relationships). The caller is responsible
     for excluding the consumed swap calcs from ``measures_tmdl``.
+
+    ``schema_name`` is the TARGET LAKEHOUSE schema every landed table lives under (default
+    ``"dbo"`` -> byte-identical to prior output). Pass ``None`` / ``""`` for a NON-SCHEMA
+    (classic) lakehouse so the entities are addressed without a ``dbo`` qualifier (see
+    ``generate_table_tmdl``); a hardcoded ``dbo`` would silently break the binding there.
     """
     parts = {}
     table_names = []
     for disp, delta_name, columns_tmdl in tables:
         parts[f"definition/tables/{disp}.tmdl"] = T.generate_table_tmdl(
-            disp, delta_name, columns_tmdl, expression_name)
+            disp, delta_name, columns_tmdl, expression_name, schema_name=schema_name)
         table_names.append(disp)
     if measures_tmdl is not None:
         parts["definition/tables/_Measures.tmdl"] = T.generate_measures_table_tmdl(measures_tmdl)
@@ -2563,7 +2713,12 @@ def materialize_bundled_flatfile_data(packaged_source, descriptor, dest_dir, *, 
     import tempfile as _tf
     result = {"kind": None, "reason": None, "hyper_present": False,
               "flatfile_path": None, "table_csv_paths": None}
-    if not (descriptor or {}).get("flatfile_filename"):
+    # A flat-file source is identified by its bundled filename; an extract-backed source (including a
+    # SaaS connector such as Salesforce that has no first-party Power BI rebuild) carries only a
+    # .hyper and no named file, so ``is_extract`` also engages the materializer -- step 1 no-ops (no
+    # named file to lift) and step 2 extracts the .hyper to CSV.
+    _desc = descriptor or {}
+    if not _desc.get("flatfile_filename") and not _desc.get("is_extract"):
         result["reason"] = "not_flatfile"
         return result
 
@@ -2644,17 +2799,27 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
     ``AmbiguousDatasourceError`` listing the options (call ``list_workbook_datasources`` to enumerate
     them). The ``Parameters`` pseudo-datasource is always skipped.
 
+    **Datasource-scoped -- for a whole workbook use ``migrate_workbook``.** This call builds the
+    *model* for one datasource; it never rebuilds the workbook's report. To rebuild an entire workbook
+    as an openable project -- its embedded datasource(s) AND the report bound to them -- call
+    ``migrate_estate.migrate_workbook(source, write_to=...)`` (the single-workbook form of
+    ``migrate_estate``). Reach for that whenever the input is a workbook and you want the report, not
+    just a datasource model.
+
     **Default-direct policy.** A datasource is rebuilt in place -- each table bound to its own source
     -- whenever that is safe, INCLUDING a multi-connection federation (Power BI relates the tables in
     the model layer). Only a genuinely-undoable shape (a cross-engine ``join``/``union`` relation,
-    unfoldable custom SQL, an unknown connector, or a table with no resolvable columns) routes to the
-    lakehouse OPTION: this call then returns ``parts={}`` with ``report["fallback"]=True`` and a
-    ``report["landing_plan"]`` (see ``directlake_landing_plan``) instead of raising -- and, when
-    ``write_to`` is given, writes ``<model_name>.landing_plan.json`` (``"landing_plan_path"``).
+    unfoldable custom SQL, an unknown connector, or a table with no resolvable columns) is reported as
+    a NEEDS-STORAGE-DECISION fallback: this call then returns ``parts={}`` with
+    ``report["fallback"]=True`` and the ``report["storage_decision"]`` (default: rebuild
+    direct-to-source as Import) instead of raising. DirectLake is an explicit opt-in, never
+    auto-selected -- only when the decision is the land-to-Delta option does this write a
+    ``report["landing_plan"]`` (see ``directlake_landing_plan``) and, with ``write_to``, a
+    ``<model_name>.landing_plan.json`` (``"landing_plan_path"``).
 
     **Local-POC opt-in (``local_data=``).** For a laptop demo with NO Fabric and NO cloud
     credentials, pass ``local_data`` to build an Import model backed by LOCAL CSV files instead. This
-    bypasses the land-to-Delta fallback entirely (no lakehouse this skill never writes to), so even an
+    bypasses the storage-decision fallback entirely (no lakehouse this skill never writes to), so even an
     unmapped connector (S3 / generic ODBC-JDBC / Web Data Connector) yields a clickable model. Accepts:
 
     * a ``{table_name: csv_path}`` dict;
@@ -2712,7 +2877,8 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
     # when there is nowhere to land data (no write_to and no flatfile_dest_dir).
     _ff_mat = None
     if (local_data is None and decision.get("mode") is not None
-            and descriptor.get("flatfile_filename") and not kwargs.get("flatfile_path")):
+            and (descriptor.get("flatfile_filename") or decision.get("import_from_extract"))
+            and not kwargs.get("flatfile_path")):
         import os as _os
         _ff_dest = flatfile_dest_dir or (
             _os.path.join(write_to, f"{model_name}.Data") if write_to else None)
@@ -2724,6 +2890,17 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
             elif _ff_mat.get("kind") == "csv":
                 local_data = _ff_mat.get("table_csv_paths")
 
+    # Honest record of how bundled data was (or was not) landed -- computed once so the fail-closed
+    # fallback below carries it too (the normal path stamps it onto ``result`` further down).
+    _ff_report = None
+    if _ff_mat is not None:
+        _ff_report = {
+            "landed": _ff_mat.get("kind") is not None,
+            "kind": _ff_mat.get("kind"),
+            "reason": _ff_mat.get("reason"),
+            "hyper_present": _ff_mat.get("hyper_present", False),
+        }
+
     if local_data is not None:
         # Local-POC path: a CSV-backed Import model regardless of connector; never land-to-Delta.
         _split_auto_calcs()
@@ -2733,11 +2910,14 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
             descriptor, model_name=model_name, calcs=calcs, dim_calcs=dim_calcs,
             table_csv_paths=table_csv_paths, approved_calc_dax=approved_calc_dax,
             date_range=date_range, **kwargs)
-    elif decision.get("mode") is None:
-        # Genuinely-undoable shape: return the lakehouse hand-off (no parts) rather than raising.
+    elif decision.get("mode") is None or decision.get("import_from_extract"):
+        # Genuinely-undoable shape -> needs-storage-decision hand-off (no parts) rather than raising.
+        # An extract-backed SaaS source (import_from_extract) whose .hyper did NOT materialize also
+        # fails closed here -- there is no honest live model to build for an unmapped connector, so we
+        # return the fallback (with the honest flatfile_data) instead of a dataless/broken model.
         # Pass the FULL (un-split) calc list so the landing plan's inventory stays complete.
         return _fallback_result(descriptor, decision, model_name=model_name, calcs=calcs,
-                                write_to=write_to)
+                                write_to=write_to, flatfile_data=_ff_report)
     else:
         _split_auto_calcs()
         result = migrate_tds_to_semantic_model(
@@ -2746,13 +2926,8 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
 
     # Additive, honest record of how flat-file data was (or was not) landed, so a caller -- and the
     # estate orchestrator's warnings -- never silently ship a model that opens but loads no data.
-    if _ff_mat is not None:
-        result.setdefault("report", {})["flatfile_data"] = {
-            "landed": _ff_mat.get("kind") is not None,
-            "kind": _ff_mat.get("kind"),
-            "reason": _ff_mat.get("reason"),
-            "hyper_present": _ff_mat.get("hyper_present", False),
-        }
+    if _ff_report is not None:
+        result.setdefault("report", {})["flatfile_data"] = _ff_report
 
     try:
         result["bind"] = connection_details_for_bind(descriptor)
@@ -2771,14 +2946,19 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
     return result
 
 
-def _fallback_result(descriptor, decision, *, model_name, calcs, write_to):
-    """Build the ``migrate_datasource`` result for a datasource routed to the lakehouse fallback.
+def _fallback_result(descriptor, decision, *, model_name, calcs, write_to, flatfile_data=None):
+    """Build the ``migrate_datasource`` result for a datasource reported as a storage fallback.
 
     Returns ``parts={}`` (no semantic model is emitted) with a ``report`` carrying the storage
-    decision and -- for the land-to-Delta fallback -- a ``landing_plan``. SSAS/XMLA fallbacks carry
-    the decision (whose ``manual_followups`` already point at the semantic-model path) but no landing
-    plan, since they are not a Delta-landing case. When ``write_to`` is given and a landing plan was
-    produced, it is also written next to where the model folder would have gone.
+    decision. A ``landing_plan`` is added ONLY for the explicit land-to-Delta DirectLake opt-in;
+    the default needs-storage-decision fallback (and SSAS/XMLA) carry the decision -- whose
+    ``manual_followups`` already point at the direct-to-source / semantic-model path -- but no
+    landing plan, since neither is an automatic Delta-landing case. When ``write_to`` is given and a
+    landing plan was produced, it is also written next to where the model folder would have gone.
+
+    ``flatfile_data`` carries the honest bundled-data record when the fallback is an extract-backed
+    source whose data could NOT be materialized (so the caller still sees ``landed: False`` + reason
+    instead of a missing key).
     """
     report = {
         "model_name": model_name,
@@ -2787,6 +2967,8 @@ def _fallback_result(descriptor, decision, *, model_name, calcs, write_to):
         "tables": [],
         "relationship_confidence": relationship_confidence_manifest(descriptor),
     }
+    if flatfile_data is not None:
+        report["flatfile_data"] = flatfile_data
     if decision.get("fallback") == FALLBACK_LAND_TO_DELTA:
         report["landing_plan"] = directlake_landing_plan(
             descriptor, calcs=calcs, datasource_name=descriptor.get("datasource_name"),

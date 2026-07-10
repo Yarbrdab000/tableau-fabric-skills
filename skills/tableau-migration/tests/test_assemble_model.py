@@ -12,6 +12,7 @@ from assemble_model import (
     relationship_confidence_manifest,
     write_model_folder,
     _date_axis_order_resolver,
+    _approved_entry,
 )
 from connection_to_m import parse_tds
 from workbook_table_calcs import TableCalcUsage, Pill
@@ -19,6 +20,7 @@ from test_connection_to_m import (
     EXCEL_COLLECTION,
     LIVE_SQLSERVER,
     JOIN_TREE,
+    PHYSICAL_JOIN_KEYS,
     FEDERATED_STAR,
     FEDERATED_REL_EDGECASE,
     DATABRICKS_CUSTOM_SQL,
@@ -788,6 +790,71 @@ def test_no_approval_leaves_dim_calc_stub_byte_identical():
     assert norm(base) == norm(same)
 
 
+# -- approved_calc_dax dict form: an approval may also name the calc column's home table -----------
+# (AAR #1 Issue C). A stubbed row-context calc otherwise defaults to the anchor table, where its
+# row-context DAX references columns that don't exist -> invalid. The additive dict value
+# ({"dax": ..., "table": ...}) lets the approver place the column on its real table.
+def test_approved_dim_calc_dict_form_targets_named_table():
+    # FEDERATED_STAR has SALE (anchor) + REP + RMA. A stubbed dim calc lands on SALE by default; the
+    # dict form redirects it onto REP, and it must NOT also remain on the computed home.
+    dim_calcs = [{"name": "Geo Tag", "formula": "AVG([REGION])"}]
+    out = assemble_import_model(
+        parse_tds(FEDERATED_STAR), model_name="Star", dim_calcs=dim_calcs,
+        approved_calc_dax={"Geo Tag": {"dax": '"US"', "table": "REP"}})
+    row = {r["column"]: r for r in out["report"]["calc_columns"]}["Geo Tag"]
+    assert row["status"] == "assisted-approved"
+    assert row["table"] == "REP"                 # redirected off the anchor SALE
+    assert row["approved_target"] == "REP"
+    assert '"US"' in out["parts"]["definition/tables/REP.tmdl"]
+    assert '"US"' not in out["parts"]["definition/tables/SALE.tmdl"]
+    assert "annotation TranslatedBy = assisted translation (human-approved)" in \
+        out["parts"]["definition/tables/REP.tmdl"]
+
+
+def test_approved_dim_calc_dict_form_unknown_table_keeps_computed_home():
+    # A named table that isn't a real model table would be silently dropped by the per-table inject,
+    # so the column keeps its computed home (SALE) and the miss is flagged, never lost.
+    dim_calcs = [{"name": "Geo Tag", "formula": "AVG([REGION])"}]
+    out = assemble_import_model(
+        parse_tds(FEDERATED_STAR), model_name="Star", dim_calcs=dim_calcs,
+        approved_calc_dax={"Geo Tag": {"dax": '"US"', "table": "Nope"}})
+    row = {r["column"]: r for r in out["report"]["calc_columns"]}["Geo Tag"]
+    assert row["status"] == "assisted-approved"
+    assert row["table"] == "SALE"                 # unknown target ignored -> computed home kept
+    assert row["approved_target"] == "Nope"
+    assert row["approved_target_unknown"] == "Nope"
+    assert '"US"' in out["parts"]["definition/tables/SALE.tmdl"]
+
+
+def test_approved_dim_calc_string_form_lands_on_computed_home_unchanged():
+    # The flat string form is byte-compatible: no target table -> the column stays on its home (SALE),
+    # and no approved_target/approved_target_unknown key is added.
+    dim_calcs = [{"name": "Geo Tag", "formula": "AVG([REGION])"}]
+    out = assemble_import_model(
+        parse_tds(FEDERATED_STAR), model_name="Star", dim_calcs=dim_calcs,
+        approved_calc_dax={"Geo Tag": '"US"'})
+    row = {r["column"]: r for r in out["report"]["calc_columns"]}["Geo Tag"]
+    assert row["status"] == "assisted-approved"
+    assert row["table"] == "SALE"
+    assert "approved_target" not in row and "approved_target_unknown" not in row
+    assert '"US"' in out["parts"]["definition/tables/SALE.tmdl"]
+
+
+def test_approved_entry_normalises_string_and_dict_forms():
+    # string form -> (dax, None)
+    assert _approved_entry('"US"') == ('"US"', None)
+    # dict form -> (dax, table); table whitespace trimmed
+    assert _approved_entry({"dax": "X", "table": "  REP "}) == ("X", "REP")
+    # dict with a blank/absent table -> (dax, None)
+    assert _approved_entry({"dax": "X", "table": "  "}) == ("X", None)
+    assert _approved_entry({"dax": "X"}) == ("X", None)
+    # fail-closed: no usable dax, or an unexpected type -> (None, None)
+    assert _approved_entry({"table": "REP"}) == (None, None)
+    assert _approved_entry({"dax": "   "}) == (None, None)
+    assert _approved_entry(None) == (None, None)
+    assert _approved_entry(5) == (None, None)
+
+
 def test_dim_calcs_do_not_disturb_measures_or_default_shape():
     out = _dim_calc_model()
     measures = out["parts"]["definition/tables/_Measures.tmdl"]
@@ -1098,7 +1165,28 @@ def test_assemble_excel_collection_multi_table():
 def test_assemble_join_tree_raises_for_fallback():
     with pytest.raises(ValueError) as ei:
         migrate_tds_to_semantic_model(JOIN_TREE, model_name="Joined")
-    assert "land-to-delta" in str(ei.value).lower()
+    assert "needs-storage-decision" in str(ei.value).lower()
+
+
+def test_assemble_physical_join_builds_multi_table_model_with_relationships():
+    # A physical join tree WITH real join clauses + columns now rebuilds as a multi-table model --
+    # one table per surfaced leaf, wired by the relationships recovered from its <clause> keys --
+    # instead of collapsing to an opaque combination the storage policy could only skip.
+    out = migrate_tds_to_semantic_model(PHYSICAL_JOIN_KEYS, model_name="Joined")
+    parts = out["parts"]
+    assert "definition/tables/Orders.tmdl" in parts
+    assert "definition/tables/Customer.tmdl" in parts
+    # the role-playing alias surfaces as its own model table.
+    assert "definition/tables/Manager.tmdl" in parts
+    rels = parts["definition/relationships.tmdl"]
+    assert "fromColumn: Orders.CustomerId" in rels and "toColumn: Customer.Id" in rels
+    assert "fromColumn: Orders.ManagerId" in rels and "toColumn: Manager.Id" in rels
+    reported = {(r["from_table"], r["from_col"], r["to_table"], r["to_col"])
+                for r in out["report"]["relationships"]}
+    assert reported == {
+        ("Orders", "CustomerId", "Customer", "Id"),
+        ("Orders", "ManagerId", "Manager", "Id"),
+    }
 
 
 def test_migrate_auto_wires_parsed_relationships():

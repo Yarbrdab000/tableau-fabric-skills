@@ -1,18 +1,18 @@
 ---
 name: tableau-migration
 description: >-
-  Rebuild Tableau datasources as Microsoft Fabric / Power BI semantic models.
-  Recreates the data model as TMDL (typed columns, inferred relationships),
-  translates the safe subset of Tableau calculated fields into working DAX measures
-  (preserving each original formula as an annotation), and auto-selects a storage
-  mode per datasource (extract to Import, live connection to DirectQuery). Accepts a
-  .tds/.tdsx datasource or a .twb/.twbx workbook. Use to migrate Tableau datasources
-  to Power BI semantic models, convert Tableau calculated fields to DAX, or repoint a
-  migrated model at its original SQL Server / Snowflake / Postgres source.
+  Migrate Tableau to Microsoft Fabric / Power BI. A .tds/.tdsx datasource rebuilds as a
+  semantic model: TMDL data model (typed columns + relationships), safe-subset calculated
+  fields translated to DAX (original formula kept as an annotation), storage mode
+  auto-selected (Import or DirectQuery). A .twb/.twbx WORKBOOK migrates whole: that model
+  PLUS its dashboards/worksheets rebuilt as a model-bound Power BI (PBIR) report — chart
+  type, field bindings, layout, filters/parameters as slicers — packaged as an openable
+  .pbip. Use to migrate Tableau datasources or whole workbooks, convert calculated fields
+  to DAX, or rebuild Tableau dashboards/worksheets as Power BI reports.
   Triggers: "migrate from tableau", "tableau to fabric", "tableau to power bi",
-  "tableau datasource to semantic model", "tableau workbook to power bi",
-  "convert tableau calculation to dax", "tableau calculated field to dax",
-  "rebuild tableau datasource in fabric".
+  "migrate tableau workbook", "tableau workbook to power bi", "tableau dashboard to power bi",
+  "rebuild tableau dashboard", "tableau report to pbir", "tableau datasource to semantic model",
+  "convert tableau calculation to dax".
 ---
 
 > **AUTH MODEL — tableau-migration**
@@ -36,6 +36,9 @@ do not improvise flags or infer answers. The detailed reference body begins afte
    from the user. A blank or ambiguous answer = **STOP and ASK**, never guess.
 3. **Do not run STEP 1 until the Confirmation Ledger (Phase 0C) is filled and the user replies
    `GO`.** No early script execution.
+4. **A workbook input's rebuilt report is a REQUIRED output.** For a `.twb`/`.twbx` source, an openable,
+   model-bound `.pbip` report ships alongside the semantic model; the run's definition-of-done ledger
+   (`report.json` → `definition_of_done` + a `summary.md` banner) **fails loud** if one is missing.
 
 ### Phase 0A — Decision Menu (present verbatim; defaults marked)
 
@@ -277,18 +280,19 @@ your shell (or a local, git-ignored file you `source`) and read the secret with
 > 4. **Calculated-field translation is a deterministic safe subset, not full coverage.** Anything outside the subset stays an inert `= 0` stub; the original Tableau formula is ALWAYS preserved as a `TableauFormula` annotation so a human (or an optional validation-gated LLM pass) can finish it. Never claim full DAX parity.
 > 5. **Credentials and on-premises gateways are a manual security boundary.** This skill emits the model, the connection parameters, and the structured **bind inputs** (`connection_details_for_bind`), and can deploy the model itself via the bundled `scripts/deploy_to_fabric.py` (or delegate to `semantic-model-authoring`) — but the user enters credentials and selects/sets up the gateway. On a credential error, stop and have the user configure the connection.
 
-# Tableau → Microsoft Fabric Semantic Model Migration
+# Tableau → Microsoft Fabric Migration — semantic models + rebuilt dashboards
 
 This skill packages a proven Tableau → Fabric toolkit as a reusable migration skill. The **north star
 is estate-wide rebuild** — point at a Tableau deployment and rebuild its datasources, calculated fields,
 and workbooks as equivalent Fabric / Power BI assets, with **executed reconciliation** verifying the
-numbers actually match. **Available today:** the semantic-model path — rebuild the datasource (data model
-+ relationships), translate calculated fields to DAX, and wire the connection — **plus single-entry
-estate orchestration** and a **preview of workbook / worksheet → Power BI (PBIR) report rebuild**:
-Tier-1 *structure* (chart type, exact field bindings, position/layout, filters/parameters → slicers,
-default cross-filter, structural titles/axis names) rebuilt into an openable, model-bound `.pbip`.
-**Actively landing:** model-object enrichment (hierarchies / display folders / RLS) and visual
-*formatting* (specific colors, fonts, legends, conditional formats — deferred to a later pass). See
+numbers actually match. **A datasource** rebuilds as a semantic model (data model + relationships,
+calculated fields → DAX, connection wired). **A workbook** migrates as a whole: that semantic model
+**plus** its dashboards/worksheets rebuilt as a model-bound Power BI (PBIR) report — Tier-1 *structure*
+(chart type, exact field bindings, position/layout, filters/parameters → slicers, default cross-filter,
+structural titles/axis names) — packaged as an openable, model-bound `.pbip`. This report rebuild is a
+**default deliverable**, not an add-on: the run's definition-of-done fails loud if a workbook lands no
+bound report. **Deferred to a later pass:** model-object enrichment (hierarchies / display folders / RLS)
+and visual *formatting* (specific colors, fonts, legends, conditional formats). See
 [§ Feature Parity](#feature-parity-reference) for current vs. in-progress coverage.
 
 ## Inputs — Locate the Datasource FIRST
@@ -301,6 +305,8 @@ default cross-filter, structural titles/axis names) rebuilt into an openable, mo
 > If the user just says "migrate my Tableau datasource" without specifying, **ask which route** (file path vs. published-datasource name + Tableau connection) rather than guessing. Once you hold the `.tds`, continue to the Migration Phases below.
 >
 > **Workbooks may embed several datasources.** A `.twb`/`.twbx` can contain more than one datasource (worksheet reference stubs and the `Parameters` pseudo-datasource are ignored). Call `list_workbook_datasources(source)` (or `workbook_datasources(xml)`) to enumerate the real ones; if there's exactly one, it's used automatically, otherwise pass `datasource="<name>"` to `migrate_datasource` to pick. Selecting an ambiguous workbook without a `datasource=` raises `AmbiguousDatasourceError` listing the choices.
+>
+> **Migrating a whole workbook (model + report together).** `migrate_datasource` is datasource-scoped — it builds the *model* for one datasource and never rebuilds the workbook's report. To rebuild an entire workbook as an openable project — its embedded datasource(s) **and** the report bound to them — call **`migrate_workbook(source, write_to=…)`** (in `migrate_estate.py`). It is the single-workbook form of `migrate_estate` (the estate loops it per workbook), so one workbook and a whole estate share one code path; a multi-datasource workbook nests one project per datasource. Prefer it over `migrate_datasource` whenever the input is a workbook and you want the report, not just a datasource model.
 
 ## Prerequisite Knowledge
 
@@ -366,6 +372,7 @@ The pure-Python cores are offline, deterministic, and stdlib-only (no Spark / pa
 | [`scripts/storage_mode.py`](scripts/storage_mode.py) | Per-datasource storage-mode auto-selection (pure policy). |
 | [`scripts/connection_to_m.py`](scripts/connection_to_m.py) | Parse Tableau `.tds`/`.twb` → descriptor (`parse_tds(text, select=None)`); **`extract_calcs`** (calculated fields → `calcs=`); **`workbook_datasources`** (list selectable datasources, skipping `Parameters` + worksheet stubs); emit M partitions + bind details (`connection_details_for_bind`); M-path field resolver. |
 | [`scripts/assemble_model.py`](scripts/assemble_model.py) | Tier-1 orchestrator: `.tds`/`.twb` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`), base64 deploy payload. **One-call `migrate_datasource(.tdsx/.tds/.twbx/.twb/text, datasource=None)` → `{parts, report, bind}`** (auto-extracts calcs; `datasource=` selects from a multi-datasource workbook; a genuine fallback returns `parts={}` + `report["landing_plan"]` via `directlake_landing_plan`); `list_workbook_datasources`, `write_model_folder` / **`write_local_pbip`** for local output. |
+| [`scripts/migrate_estate.py`](scripts/migrate_estate.py) | **Estate + workbook orchestrator.** `migrate_estate(source, out)` migrates a whole folder / site (every datasource + workbook) in one run. **`migrate_workbook(source, write_to=…, name=None)`** is the single-workbook primitive the estate loops: it rebuilds the workbook's embedded datasource(s) into semantic model(s) **and** the workbook's report bound to them — an openable `pbip/<Name>/` (plus a bare `reports/<Name>.Report`), a multi-datasource workbook nesting one project per datasource. Reach for it (over `migrate_datasource`) whenever the input is a **workbook** and you want the **report**, not just a datasource model. |
 | [`scripts/deploy_to_fabric.py`](scripts/deploy_to_fabric.py) | Self-contained Fabric REST deploy (stdlib-only urllib): createOrUpdate / updateDefinition of the SemanticModel, 202 LRO polling, optional refresh + gateway bind. **Also deploys the workbook's REPORT** as a Fabric `reports` item — `deploy_pbip` / `deploy_report` + the fail-closed `rebind_report_byConnection` (rewrites `definition.pbir` to a **`byConnection`** `semanticmodelid=<id>` reference, required for REST deploy) via `--pbip` / `--report-dir`. Importable `acquire_token` (handles `az` on Windows) + `refresh_dataset` / **`recalc_dataset`** (a default, credential-free `type: Calculate` ProcessRecalc that processes the Import calc tables so a composite model opens without benign warning triangles; `--no-recalc` to skip) for post-deploy ops. Lets the skill finish **in Fabric** without depending on a peer skill. |
 
 For exact signatures and a copy-paste **download → migrate → deploy** snippet, see [public-api.md](resources/public-api.md).

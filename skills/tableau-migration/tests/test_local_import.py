@@ -2,8 +2,9 @@
 
 These cover the customer scenario where the source connector is UNMAPPED (S3 / generic ODBC / Web
 Data Connector) but the published datasource carries an extract: today that routes to the
-land-to-Delta fallback (a plan, not a runnable model), and the opt-in ``local_data=`` instead builds
-a clickable Import model backed by local CSV files -- no Fabric, no lakehouse, no credentials.
+needs-storage-decision fallback (no runnable model, DirectLake is opt-in), and the opt-in
+``local_data=`` instead builds a clickable Import model backed by local CSV files -- no Fabric, no
+lakehouse, no credentials.
 
 All inline ``.tds`` documents are authored here (the repo git-ignores real Tableau artifacts) and
 all CSVs are written to pytest ``tmp_path``; nothing is committed.
@@ -115,12 +116,20 @@ def _table_part(result):
     return ""
 
 
+def _count_columns(body, name):
+    """Count ``column <name>`` declarations in a TMDL table body (exact line match)."""
+    return sum(1 for ln in body.splitlines() if ln.strip() == "column {}".format(name))
+
+
 # -- the blocker: unmapped extract without local_data falls back (no runnable model) -------------
 def test_unmapped_extract_falls_back_without_local_data():
     result = A.migrate_datasource(PENDING_TDS, model_name="Pending")
     assert result["parts"] == {}
     assert result["report"]["fallback"] is True
-    assert "landing_plan" in result["report"]
+    # de-default: an unmapped extract with no local_data is a needs-storage-decision fallback --
+    # DirectLake is opt-in, so NO landing_plan is auto-built.
+    assert "landing_plan" not in result["report"]
+    assert result["report"]["storage_decision"]["fallback"] == "needs-storage-decision"
 
 
 # -- local_data dict builds a real CSV-backed Import model ---------------------------------------
@@ -226,3 +235,150 @@ def test_assemble_local_import_model_directly(tmp_path):
         desc, model_name="Pending", table_csv_paths={"PendingJobSnapshot": csv_path})
     assert result["report"]["local_import"]["matched_count"] == 1
     assert result["report"]["storage_decision"]["connector"] == "Csv.Document"
+
+
+# -- rm-local-csv-column-dedupe: phantom-drop + dedupe against the real CSV header ---------------
+# A .tds whose metadata lists a column absent from the materialized CSV (``SnapshotDate``) and a
+# duplicate physical column (``Region`` twice -- an object-id-twin artifact). Emitting either makes
+# the Import model dead-on-arrival: Power BI's ``Csv.Document`` type-transform references a header
+# that isn't in the file, and a duplicate TMDL column name is invalid.
+PHANTOM_DUP_TDS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Snap' inline='true' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='minio' name='odbc.cc11'>
+        <connection class='genericodbc' dbname='dx' server='data.comcast.com' />
+      </named-connection>
+    </named-connections>
+    <relation connection='odbc.cc11' name='Snap' table='[dx].[Snap]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Region</remote-name><local-name>[Region]</local-name>
+        <parent-name>[Snap]</parent-name><local-type>string</local-type><ordinal>0</ordinal>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>PendingJobs</remote-name><local-name>[PendingJobs]</local-name>
+        <parent-name>[Snap]</parent-name><local-type>integer</local-type><ordinal>1</ordinal>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>SnapshotDate</remote-name><local-name>[SnapshotDate]</local-name>
+        <parent-name>[Snap]</parent-name><local-type>date</local-type><ordinal>2</ordinal>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Region</remote-name><local-name>[Region (copy)]</local-name>
+        <parent-name>[Snap]</parent-name><local-type>string</local-type><ordinal>3</ordinal>
+      </metadata-record>
+    </metadata-records>
+    <extract enabled='true' />
+  </connection>
+</datasource>"""
+
+# A .tds that exposes a column under a Tableau ALIAS (``Person``) that never appears as a physical
+# header (physically ``Regional Manager``). This must be REMAPPED to the real header (kept), never
+# mistaken for a phantom and dropped.
+ALIAS_TDS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Team' inline='true' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='minio' name='odbc.cc11'>
+        <connection class='genericodbc' dbname='dx' server='data.comcast.com' />
+      </named-connection>
+    </named-connections>
+    <relation connection='odbc.cc11' name='Team' table='[dx].[Team]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>EmployeeId</remote-name><local-name>[EmployeeId]</local-name>
+        <parent-name>[Team]</parent-name><local-type>integer</local-type><ordinal>0</ordinal>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Person</remote-name><local-name>[Person]</local-name>
+        <parent-name>[Team]</parent-name><local-type>string</local-type><ordinal>1</ordinal>
+      </metadata-record>
+    </metadata-records>
+    <extract enabled='true' />
+  </connection>
+</datasource>"""
+
+
+def test_local_csv_drops_phantom_column(tmp_path):
+    # SnapshotDate is in the .tds metadata but NOT in the materialized CSV header.
+    csv_path = _write_csv(str(tmp_path / "snap.csv"), ["Region", "PendingJobs"], [["Beltway", 1]])
+    result = A.migrate_datasource(PHANTOM_DUP_TDS, model_name="Snap",
+                                  local_data={"Snap": csv_path})
+    body = _table_part(result)
+    # the phantom must not be emitted as a column nor typed in the M partition (both are DOA)
+    assert _count_columns(body, "SnapshotDate") == 0
+    assert '"SnapshotDate"' not in body
+    # ...and it is disclosed, never silently dropped
+    dropped = result["report"]["local_import"]["column_reconcile"]["dropped"]
+    assert any(d["source_column"] == "SnapshotDate" for d in dropped)
+    # the real columns survive
+    assert _count_columns(body, "PendingJobs") == 1
+
+
+def test_local_csv_dedupes_duplicate_columns(tmp_path):
+    # Region appears twice in the metadata but is a single physical header.
+    csv_path = _write_csv(str(tmp_path / "snap.csv"), ["Region", "PendingJobs"], [["Beltway", 1]])
+    result = A.migrate_datasource(PHANTOM_DUP_TDS, model_name="Snap",
+                                  local_data={"Snap": csv_path})
+    body = _table_part(result)
+    assert _count_columns(body, "Region") == 1        # duplicate column collapsed to one
+    assert body.count('"Region"') == 1                # and typed once in the M partition
+    deduped = result["report"]["local_import"]["column_reconcile"]["deduped"]
+    assert any(d["source_column"] == "Region" for d in deduped)
+
+
+def test_local_csv_keeps_columns_when_header_unreadable(tmp_path):
+    # An unreadable CSV header must never trigger a drop (fail-safe: we can't confirm absence).
+    from connection_to_m import parse_tds
+    missing = str(tmp_path / "does_not_exist.csv")
+    result = A.assemble_local_import_model(
+        parse_tds(PHANTOM_DUP_TDS), model_name="Snap", table_csv_paths={"Snap": missing})
+    body = _table_part(result)
+    assert _count_columns(body, "SnapshotDate") == 1  # phantom retained (header unknown)
+    cr = result["report"]["local_import"]["column_reconcile"]
+    assert cr["dropped"] == [] and cr["deduped"] == []
+
+
+def test_local_csv_aliased_column_remapped_not_dropped(tmp_path):
+    # An aliased source name (Person -> physical "Regional Manager") is remapped, never dropped.
+    csv_path = _write_csv(str(tmp_path / "team.csv"),
+                          ["EmployeeId", "Regional Manager"], [[1, "Ada"]])
+    result = A.migrate_datasource(ALIAS_TDS, model_name="Team",
+                                  local_data={"Team": csv_path})
+    body = _table_part(result)
+    assert _count_columns(body, "Person") == 1        # kept (remapped), not dropped
+    assert '"Regional Manager"' in body               # typed against the real header
+    cr = result["report"]["local_import"]["column_reconcile"]
+    assert any(r.get("to") == "Regional Manager" for r in cr["remapped"])
+    assert cr["dropped"] == []
+
+
+# -- openability self-check is wired into the build and agrees the model is open ----------------
+def test_openability_selfcheck_present_and_ok_on_local_build(tmp_path):
+    csv_path = _write_csv(str(tmp_path / "snap.csv"),
+                          ["Region", "PendingJobs", "SnapshotDate"],
+                          [["Beltway", 32000, "2024-01-01"]])
+    result = A.migrate_datasource(
+        PENDING_TDS, model_name="Pending", local_data={"PendingJobSnapshot": csv_path})
+
+    gate = result["report"]["openability_selfcheck"]
+    assert gate["ok"] is True
+    assert gate["issues"] == []
+    assert gate["checks"]["no_duplicate_columns"] is True
+    assert gate["checks"]["typed_columns_declared"] is True
+    # the physical-header check actually ran against the real landed CSV (not merely skipped)
+    assert gate["checks"]["typed_columns_in_header"] is True
+
+
+def test_openability_selfcheck_ok_after_phantom_dedupe(tmp_path):
+    # PHANTOM_DUP_TDS would emit a duplicate + a phantom column; the local-CSV reconcile fixes both.
+    # The gate must independently confirm the RESULT is open (no dup, no typed phantom vs header).
+    csv_path = _write_csv(str(tmp_path / "snap.csv"), ["Region", "PendingJobs"], [["Beltway", 1]])
+    result = A.migrate_datasource(PHANTOM_DUP_TDS, model_name="Snap",
+                                  local_data={"Snap": csv_path})
+    gate = result["report"]["openability_selfcheck"]
+    assert gate["ok"] is True, gate["issues"]
+    assert gate["checks"]["no_duplicate_columns"] is True
+    assert gate["checks"]["typed_columns_in_header"] is True
+

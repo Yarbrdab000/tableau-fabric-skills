@@ -301,6 +301,62 @@ SNOWFLAKE = """<?xml version='1.0' encoding='utf-8' ?>
   </connection>
 </datasource>"""
 
+# A physical join tree WITH real equality clauses, columns, and a role-playing alias (`Manager`
+# over the physical [Customer] table). Exercises leaf-table surfacing, physical-join relationship
+# recovery from the join <clause> predicates, and alias distinctness -- the shape a real
+# Salesforce / SQL-Server join datasource uses.
+PHYSICAL_JOIN_KEYS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Joined' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='srv' name='sqlserver.z'>
+        <connection class='sqlserver' dbname='Sales' server='srv.example.com' />
+      </named-connection>
+    </named-connections>
+    <relation join='inner' type='join'>
+      <relation join='left' type='join'>
+        <relation name='Orders' table='[dbo].[Orders]' type='table' />
+        <relation name='Customer' table='[dbo].[Customer]' type='table' />
+        <clause type='join'>
+          <expression op='='>
+            <expression op='[Orders].[CustomerId]' />
+            <expression op='[Customer].[Id]' />
+          </expression>
+        </clause>
+      </relation>
+      <relation name='Manager' table='[dbo].[Customer]' type='table' />
+      <clause type='join'>
+        <expression op='='>
+          <expression op='[Orders].[ManagerId]' />
+          <expression op='[Manager].[Id]' />
+        </expression>
+      </clause>
+    </relation>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Id</remote-name><local-name>[Id]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>integer</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>CustomerId</remote-name><local-name>[CustomerId]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>integer</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>ManagerId</remote-name><local-name>[ManagerId]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>integer</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Id</remote-name><local-name>[Id]</local-name>
+        <parent-name>[Customer]</parent-name><local-type>integer</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Name</remote-name><local-name>[Name]</local-name>
+        <parent-name>[Customer]</parent-name><local-type>string</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
 ORACLE = """<?xml version='1.0' encoding='utf-8' ?>
 <datasource formatted-name='Ora' version='18.1'>
   <connection class='federated'>
@@ -1081,11 +1137,46 @@ def test_parse_custom_sql_relation():
     assert len(rel["columns"]) == 2
 
 
-def test_parse_join_tree_is_flagged_not_expanded():
+def test_parse_join_tree_surfaces_leaf_tables():
     d = parse_tds(JOIN_TREE)
-    # the two leaf tables must NOT leak out as independent relations.
+    # A physical join tree is NOT collapsed: its leaf tables surface as independent model tables
+    # (the container `join` entry is dropped) so the source rebuilds as a multi-table model, exactly
+    # like a multi-table object-graph source.
     kinds = [r["kind"] for r in d["relations"]]
-    assert kinds == ["join"]
+    assert kinds == ["table", "table"]
+    assert sorted(r["name"] for r in d["relations"]) == ["Orders", "People"]
+    assert "join" not in kinds
+    # This degenerate fixture's join clause carries no operands, so no relationship is inferred.
+    assert d["relationships"] == []
+
+
+def test_parse_physical_join_surfaces_leaves_with_columns():
+    d = parse_tds(PHYSICAL_JOIN_KEYS)
+    tables = [r for r in d["relations"] if r["kind"] == "table"]
+    # every leaf table surfaces (no `join` container kind leaks out) WITH its resolved columns.
+    assert sorted(r["name"] for r in tables) == ["Customer", "Manager", "Orders"]
+    assert "join" not in {r["kind"] for r in d["relations"]}
+    by_name = {r["name"]: r for r in tables}
+    assert {c["remote_name"] for c in by_name["Orders"]["columns"]} == {
+        "Id", "CustomerId", "ManagerId"}
+    # the role-playing alias `Manager` (over the physical [Customer] table) stays a DISTINCT table
+    # carrying the physical table's columns -- it does not collapse into the base `Customer` table.
+    assert {c["remote_name"] for c in by_name["Manager"]["columns"]} == {"Id", "Name"}
+    assert {c["remote_name"] for c in by_name["Customer"]["columns"]} == {"Id", "Name"}
+
+
+def test_parse_physical_join_recovers_relationships_from_clauses():
+    d = parse_tds(PHYSICAL_JOIN_KEYS)
+    rels = {(r["from_table"], r["from_col"], r["to_table"], r["to_col"])
+            for r in d["relationships"]}
+    # each physical join <clause> equality predicate becomes a model relationship, keyed to the
+    # surfaced leaf tables -- including the one onto the role-playing alias `Manager`.
+    assert rels == {
+        ("Orders", "CustomerId", "Customer", "Id"),
+        ("Orders", "ManagerId", "Manager", "Id"),
+    }
+    # a physical join is uniqueness-agnostic -> emitted many_to_many (crash-proof), like the noodle.
+    assert all(r["cardinality"] == "many_to_many" for r in d["relationships"])
 
 
 def test_parse_excel_collection_yields_independent_deduped_tables():

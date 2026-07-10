@@ -17,6 +17,8 @@ from calc_to_dax import (
     translate_tableau_calc_to_column_dax,
     validate_dax,
     date_attribute_binding,
+    _tokenize,
+    _CalcError,
 )
 
 # Shared resolver: caption -> (table_display_name, clean_col, tmdl_type).
@@ -357,6 +359,62 @@ def test_returns_reason_and_tables_used():
     assert dax is not None
     assert reason == "ok"
     assert tables == {"Orders"}
+
+
+# --- BUG-001: calc comments (// line, /* ... */ block) must be stripped, not tokenized. ---
+# Tableau's calc editor allows ``//`` line comments and ``/* ... */`` block comments; they are
+# documentation only and never change the computed value. The tokenizer previously read ``/`` as
+# division, so ANY commented calc false-stubbed (real workbooks lost ~14/15 calcs to this). Each
+# commented form must translate to EXACTLY the same DAX as its comment-free equivalent.
+COMMENT_EQUIVALENTS = [
+    ("SUM([Sales]) // grand total", "SUM([Sales])"),                       # trailing line comment
+    ("// leading note\nSUM([Sales])", "SUM([Sales])"),                     # leading line comment
+    ("/* block */ SUM([Sales])", "SUM([Sales])"),                         # leading block comment
+    ("SUM([Sales]) /* mid */ + SUM([Profit])", "SUM([Sales]) + SUM([Profit])"),   # mid-expression block
+    ("SUM([Sales])\n/* multi\n line\n note */\n + SUM([Profit])",         # block spanning newlines
+     "SUM([Sales]) + SUM([Profit])"),
+    ("SUM([Profit]) / SUM([Sales]) // ratio", "SUM([Profit]) / SUM([Sales])"),    # '/' division still works
+    ('SUM(IF [Region] = "East" THEN [Sales] END) // filtered',            # comment after a string literal
+     'SUM(IF [Region] = "East" THEN [Sales] END)'),
+]
+
+
+@pytest.mark.parametrize("commented,plain", COMMENT_EQUIVALENTS, ids=[repr(c[0]) for c in COMMENT_EQUIVALENTS])
+def test_comments_are_stripped_and_translate_identically(commented, plain):
+    assert _tx(commented) is not None
+    assert _tx(commented) == _tx(plain)
+
+
+def test_comment_markers_inside_string_literals_are_preserved():
+    # A // or /* inside a quoted string is data, not a comment (comment scan runs AFTER string scan).
+    assert _tokenize('"a // b"') == [("str", "a // b")]
+    assert _tokenize("'x /* y */ z'") == [("str", "x /* y */ z")]
+    # ...and end-to-end the literal survives verbatim into the emitted DAX.
+    dax = _tx('SUM(IF [Region] = "a // b" THEN [Sales] END)')
+    assert dax is not None
+    assert '"a // b"' in dax
+
+
+def test_comment_only_formula_fails_closed():
+    # A calc that is nothing but a comment has no value -> honest stub.
+    dax, reason, _tables = translate_tableau_calc_to_dax("// just a note", _resolver)
+    assert dax is None
+    assert reason == "empty formula"
+
+
+def test_unterminated_block_comment_fails_closed():
+    dax, reason, _tables = translate_tableau_calc_to_dax("SUM([Sales]) /* oops", _resolver)
+    assert dax is None
+    assert "block comment" in reason
+
+
+def test_tokenizer_strips_comments_to_identical_tokens():
+    # Direct tokenizer contract: comment forms yield the same token stream as the clean form.
+    base = _tokenize("SUM([Sales])")
+    assert _tokenize("SUM([Sales]) // note") == base
+    assert _tokenize("/* c */ SUM([Sales])") == base
+    assert _tokenize("SUM([Sales]) /* c */") == base
+    assert _tokenize("// only a comment") == []
 
 
 def test_cross_table_reason_is_explicit():
@@ -858,6 +916,54 @@ def test_table_calc_cross_table_falls_back():
         "RUNNING_SUM(SUM([People Count]))", _resolver, (), _ORDER)
     assert dax is None
     assert "cross-table" in reason
+
+
+# --- MIN/MAX over TEXT + the MIN()-wrapped string-concat tooltip idiom (rm-string-concat-tooltip) ---
+# DAX's single-column MIN/MAX support text (alphabetical order), matching Tableau MIN/MAX on a string
+# dimension (per the DAX MIN/MAX spec: Numbers, Texts, Dates count; TRUE/FALSE are unsupported).
+# Tableau authors wrap a string dimension in MIN() to make it aggregate-valid in a tooltip; that
+# idiom now lands as a null-propagating DAX string concat instead of stubbing on the MIN.
+def test_min_max_over_text_field_measure():
+    assert _tx("MIN([Region])") == "MIN('Orders'[Region])"
+    assert _tx("MAX([Region])") == "MAX('Orders'[Region])"
+
+
+def test_min_max_over_boolean_field_still_stubs():
+    # DAX MIN/MAX do NOT support TRUE/FALSE (MINA/MAXA would) -> stay fail-closed on a boolean field.
+    assert translate_tableau_calc_to_dax("MIN([Returned])", _resolver)[0] is None
+    assert translate_tableau_calc_to_dax("MAX([Returned])", _resolver)[0] is None
+
+
+def test_min_text_plus_literal_measure_concat():
+    # A single MIN(text) + string literal in a MEASURE concatenates (null-propagating), mirroring the
+    # existing column-mode string-concat behavior (Tableau '+' on strings propagates null).
+    assert _tx('MIN([Region]) + "!"') == (
+        "IF(ISBLANK(MIN('Orders'[Region])) || ISBLANK(\"!\"), "
+        "BLANK(), MIN('Orders'[Region]) & \"!\")"
+    )
+
+
+def test_min_wrapped_string_concat_tooltip_idiom():
+    # The full tooltip idiom MIN([A]) + text + MIN([B]) (two distinct string dims) now translates.
+    fields = {
+        "Client Segment": ("Clients", "Client Segment", "string"),
+        "Client Region": ("Clients", "Client Region", "string"),
+    }
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        'MIN([Client Segment]) + " / " + MIN([Client Region])', lambda c: fields.get(c))
+    assert reason == "ok"
+    assert dax is not None
+    # A null-propagating concat of the two single-column text aggregates.
+    assert "MIN('Clients'[Client Segment])" in dax
+    assert "MIN('Clients'[Client Region])" in dax
+    assert '" / "' in dax
+    assert "ISBLANK(" in dax and " & " in dax
+
+
+def test_numeric_and_date_min_max_measure_unchanged():
+    # Regression guard: numeric/date MIN/MAX stay byte-identical to prior output.
+    assert _tx("MIN([Sales])") == "MIN('Orders'[Sales])"
+    assert _tx("MAX([Order Date])") == "MAX('Orders'[Order_Date])"
 
 
 # --- ADD #1: ORDERBY-only date-axis redirect plumbing (marked-calendar key) -------------------

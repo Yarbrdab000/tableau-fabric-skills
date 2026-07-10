@@ -2,7 +2,7 @@
 
 Given a normalized Tableau connection *descriptor* (produced by ``connection_to_m.parse_tds``),
 decide which Power BI storage mode rebuilds the datasource with the least manual remapping,
-or fall back to the land-to-Delta + DirectLake path when direct-to-upstream is unsafe.
+or route to an honest **needs-decision** state when a direct-to-upstream rebuild is unsafe.
 
 This module is deliberately pure: it knows nothing about XML or TMDL syntax, only about the
 descriptor shape, so the policy is trivially unit-testable. ``connection_to_m`` does the
@@ -10,12 +10,12 @@ parsing and M emission; it may *call* this to decide a mode, but never the rever
 
 Decision policy (first match wins):
 
-1. Structurally unsafe shape -> no direct mode; fall back to land-to-Delta + DirectLake. This is
+1. Structurally unsafe shape -> no direct mode; route to ``needs-storage-decision``. This is
    NOT triggered by multiple connections per se: a federated source whose tables each resolve to
    their own connection is rebuilt directly (multi-source model + model relationships). It is
    only a ``join``/``union`` relation tree (one logical table spans relations), a multi-connection
    table that can't be routed to a specific upstream, or no resolvable columns.
-2. Unknown / unmapped connector class -> fall back.
+2. Unknown / unmapped connector class -> needs-storage-decision.
 3. Flat file (Excel/CSV) -> Import.
 4. Extract enabled -> Import (preserve Tableau snapshot semantics); if the underlying live
    connector is supported, also report ``direct_upstream_available`` so the caller can offer
@@ -23,9 +23,12 @@ Decision policy (first match wins):
 5. Live relational -> DirectQuery (live-to-live), including a multi-connection federation, where
    each table binds to its OWN upstream and the joins become model relationships.
 
-DirectLake is never auto-selected here; it is only reached via the explicit fallback path
-(the existing land-to-Delta + DirectLake pipeline), offered as an OPTION for the unsafe shapes above
-rather than as the default for any multi-source datasource.
+**DirectLake is OPT-IN ONLY and is never auto-selected or defaulted here.** An unsafe shape does
+NOT silently route to land-to-Delta + DirectLake; it routes to ``needs-storage-decision`` -- an
+honest flag whose ``recommended_mode`` defaults to Import (rebuild direct-to-source where a
+connection can be supplied) and whose follow-ups point at the explicit land-to-Delta + DirectLake
+OPT-IN. The land-to-Delta + DirectLake capability stays available, but only when a caller opts in
+to it deliberately, never as the automatic fallback for an unresolved or multi-source datasource.
 
 Credentials and on-prem gateway setup are ALWAYS left to the user (security boundary) and
 surfaced as ``manual_followups``.
@@ -190,8 +193,13 @@ def connector_function(cls):
     return spec[0] if spec else PARTIAL_LIVE_CONNECTORS.get(cls)
 
 FALLBACK_LAND_TO_DELTA = "land-to-delta-directlake"
+# The honest default for an unresolved / undoable shape: no direct-to-source rebuild was safe, so a
+# STORAGE DECISION is required. This is NOT DirectLake -- DirectLake (land-to-Delta) is opt-in only
+# and is never auto-stamped here. ``recommended_mode`` defaults to Import (rebuild direct-to-source
+# where a connection can be supplied); the follow-ups point at the explicit land-to-Delta OPT-IN.
+FALLBACK_NEEDS_DECISION = "needs-storage-decision"
 # Analysis Services is a finished semantic model, not a datasource to rebuild -- it gets its own
-# routing label so callers don't mistake it for the relational land-to-Delta fallback.
+# routing label so callers don't mistake it for the relational needs-decision fallback.
 FALLBACK_ANALYSIS_SERVICES = "analysis-services-model-migration"
 
 # Confidence scores (0-100) for the scored recommendation: higher == less manual remapping.
@@ -202,12 +210,27 @@ SCORE_IMPORT_FULL = 90        # extract over a fully-supported live source
 SCORE_FLAT_FILE = 80          # Excel/CSV Import (still needs a file path)
 SCORE_PARTIAL = 60            # recognized connector emitted as a flagged scaffold
 SCORE_ODBC = 60              # generic-ODBC custom SQL emitted via Odbc.Query (needs driver + creds)
-SCORE_FALLBACK = 30           # no direct rebuild; route to land-to-Delta + DirectLake
+SCORE_FALLBACK = 30           # no direct rebuild; storage decision required (Import default / opt-in DirectLake)
 NATIVE_QUERY_PENALTY = 10     # custom-SQL native query needs a folding review before refresh
 
 _CREDENTIALS_FOLLOWUP = "Configure connection credentials in Fabric (bind links IDs only)."
 _GATEWAY_FOLLOWUP = "If the source is on-premises, set up / select a data gateway for the connection."
 _NATIVE_QUERY_FOLLOWUP = "Review the preserved custom SQL native query (folding / approval) before refresh."
+# Pointer for a needs-decision shape: default to a direct-to-source Import rebuild where a connection
+# can be supplied; DirectLake (land-to-Delta) is an explicit OPT-IN, never auto-selected here.
+_NEEDS_DECISION_FOLLOWUP = (
+    "No safe direct-to-source rebuild for this shape: choose a storage approach. Default -- rebuild "
+    "directly as an Import model once a connection can be supplied. Opt-in -- land the source to Delta "
+    "and rebuild as DirectLake (never auto-selected; must be chosen deliberately).")
+# An extract-backed source on a connector with NO first-party Power BI rebuild (Salesforce and other
+# SaaS): the .hyper extract IS a point-in-time snapshot of the data, so we land it as an offline
+# Import over the materialized extract (one table per CSV), exactly like a flat-file Import -- rather
+# than dying at the unknown-connector needs-decision branch. There is no live upstream to rebuild;
+# refreshing means re-exporting the extract.
+_EXTRACT_IMPORT_FOLLOWUP = (
+    "Extract-backed source with no first-party Power BI connector: imported as an offline snapshot of "
+    "the bundled extract (one table per CSV). To refresh, re-export the Tableau extract from the "
+    "source, or opt in to land-to-Delta + DirectLake (never auto-selected).")
 # Generic ODBC binds through a named driver (or DSN); that driver must be present wherever the
 # model runs. It is the SAME driver Tableau already uses, so this is a known quantity, not a new
 # dependency -- but Power BI Desktop (authoring) and the on-premises data gateway (refresh) each
@@ -317,11 +340,12 @@ def select_storage_mode(descriptor):
 
     Returns a decision dict: ``mode`` ('Import'|'DirectQuery'|None), ``connector``,
     ``fully_supported``, ``uses_native_query``, ``direct_upstream_available``,
-    ``fallback`` (e.g. 'land-to-delta-directlake' when ``mode`` is None), ``rationale``,
-    ``manual_followups`` (security-boundary steps that stay with the user), plus the scored
-    recommendation: ``score`` (0-100 confidence; higher == less manual remapping) and
-    ``recommended_mode`` (the mode to default to -- equal to ``mode`` for a direct rebuild, or
-    'Import' when ``mode`` is None, since unknown/unsupported shapes default to an Import model).
+    ``fallback`` (e.g. 'needs-storage-decision' when ``mode`` is None -- DirectLake is opt-in only
+    and is never auto-stamped), ``rationale``, ``manual_followups`` (security-boundary steps that
+    stay with the user), plus the scored recommendation: ``score`` (0-100 confidence; higher ==
+    less manual remapping) and ``recommended_mode`` (the mode to default to -- equal to ``mode``
+    for a direct rebuild, or 'Import' when ``mode`` is None, since unknown/unsupported shapes
+    default to a direct-to-source Import rebuild rather than an automatic DirectLake landing).
     """
     cls = (descriptor.get("connection_class") or "").lower()
     uses_native = _has_custom_sql(descriptor)
@@ -347,33 +371,37 @@ def select_storage_mode(descriptor):
                 "do not rebuild it from a datasource M query."],
         )
 
-    # 1. structurally unsupported -> fall back to the proven land-to-Delta path.
+    # 1. structurally unsupported -> no safe direct rebuild; route to an honest needs-decision
+    #    state (DirectLake is opt-in only and is never auto-stamped here).
     reason = _structurally_unsupported_reason(descriptor)
     if reason:
         return _decision(
             None, None,
-            fallback=FALLBACK_LAND_TO_DELTA,
+            fallback=FALLBACK_NEEDS_DECISION,
             score=SCORE_FALLBACK,
-            rationale=f"Direct-upstream rebuild not safe ({reason}); use land-to-Delta + DirectLake "
-                      f"(default storage mode if rebuilt directly: Import).",
+            rationale=f"Direct-upstream rebuild not safe ({reason}); storage decision required -- "
+                      f"default to a direct-to-source Import rebuild once a connection can be "
+                      f"supplied, or opt in to land-to-Delta + DirectLake (never auto-selected).",
+            manual_followups=base_followups + [_NEEDS_DECISION_FOLLOWUP],
         )
 
     # 1.5 generic ODBC -> Odbc.Query (custom SQL) / Odbc.DataSource (tables), Import by default.
     #     The query passes straight through the named driver to whatever engine sits behind it,
     #     so this is engine-agnostic (the upstream can be a query engine such as Trino / Starburst
     #     / Dremio over object storage). A Custom SQL snapshot mirrors how Tableau uses the source,
-    #     so Import is the natural mode. Fails closed to land-to-Delta when the .tds carries neither
-    #     a DSN nor a driver name (nothing to bind).
+    #     so Import is the natural mode. Fails closed to a needs-decision state when the .tds carries
+    #     neither a DSN nor a driver name (nothing to bind).
     if cls in ODBC_CLASSES:
         if not _odbc_reconstructable(descriptor):
             return _decision(
                 None, None,
-                fallback=FALLBACK_LAND_TO_DELTA,
+                fallback=FALLBACK_NEEDS_DECISION,
                 score=SCORE_FALLBACK,
                 rationale=(f"Generic ODBC source ({cls}) carried neither a DSN nor a driver name, "
-                           "so no connection string can be reconstructed; use land-to-Delta + "
-                           "DirectLake (default storage mode if rebuilt directly: Import)."),
-                manual_followups=base_followups,
+                           "so no connection string can be reconstructed; storage decision required "
+                           "-- default Import once the driver/DSN is supplied, or opt in to "
+                           "land-to-Delta + DirectLake (never auto-selected)."),
+                manual_followups=base_followups + [_NEEDS_DECISION_FOLLOWUP],
             )
         connector = "Odbc.Query" if uses_native else "Odbc.DataSource"
         followups = list(base_followups) + [_ODBC_DRIVER_FOLLOWUP, _GATEWAY_FOLLOWUP]
@@ -399,17 +427,18 @@ def select_storage_mode(descriptor):
     #     server/port/catalog, so the connection IS reconstructable -- the only value the native
     #     .tds does not record is the ODBC driver NAME, which we supply per-engine and flag
     #     confirm-required. Placed before branches 2-5 so BOTH extract and live native-engine
-    #     sources take the ODBC path. Fails closed to land-to-Delta only when there is no server.
+    #     sources take the ODBC path. Fails closed to a needs-decision state only when there is no server.
     if cls in NATIVE_ODBC_ENGINES:
         if not (descriptor.get("server") or "").strip():
             return _decision(
                 None, None,
-                fallback=FALLBACK_LAND_TO_DELTA,
+                fallback=FALLBACK_NEEDS_DECISION,
                 score=SCORE_FALLBACK,
                 rationale=(f"{cls.capitalize()} source carried no server/host, so no ODBC connection "
-                           "string can be reconstructed; use land-to-Delta + DirectLake (default "
-                           "storage mode if rebuilt directly: Import)."),
-                manual_followups=base_followups,
+                           "string can be reconstructed; storage decision required -- default Import "
+                           "once a server/driver is supplied, or opt in to land-to-Delta + DirectLake "
+                           "(never auto-selected)."),
+                manual_followups=base_followups + [_NEEDS_DECISION_FOLLOWUP],
             )
         driver = NATIVE_ODBC_DRIVER[cls]
         connector = "Odbc.Query" if uses_native else "Odbc.DataSource"
@@ -431,14 +460,37 @@ def select_storage_mode(descriptor):
             manual_followups=followups,
         )
 
-    # 2. unknown connector class -> fall back.
+    # 1.7 extract-backed source on an UNMAPPED connector (SaaS such as Salesforce) -> land the
+    #     bundled extract as an offline Import (one CSV per table), the same faithful snapshot home a
+    #     flat-file extract gets. Placed BEFORE branch 2 (unknown-connector) so a SaaS extract lands
+    #     its data instead of dying at needs-decision; the ``import_from_extract`` marker tells the
+    #     assembler to materialize the .hyper -> CSV. Mapped-live extracts (branch 4) and flat-file
+    #     extracts (branch 3) are excluded here and route unchanged. A structurally-unsupported shape
+    #     (join / union tree, multi-connection) was already caught above, so it still fails closed.
+    if descriptor.get("is_extract") and cls not in _LIVE_CLASSES and cls not in FLAT_FILE_CLASSES:
+        return _decision(
+            "Import", None,
+            fully_supported=False,
+            uses_native_query=uses_native,
+            direct_upstream_available=False,
+            import_from_extract=True,
+            score=SCORE_FLAT_FILE,
+            rationale=(f"Extract-backed source ({cls or 'unknown connector'}) with no first-party "
+                       "Power BI connector -> Import over the bundled extract snapshot (one table per "
+                       "CSV). No live upstream rebuild is available; never landed in Delta."),
+            manual_followups=base_followups + [_EXTRACT_IMPORT_FOLLOWUP],
+        )
+
+    # 2. unknown connector class -> no mapped direct rebuild; route to needs-decision.
     if cls not in _LIVE_CLASSES and cls not in FLAT_FILE_CLASSES:
         return _decision(
             None, None,
-            fallback=FALLBACK_LAND_TO_DELTA,
+            fallback=FALLBACK_NEEDS_DECISION,
             score=SCORE_FALLBACK,
-            rationale=f"Connector class '{cls or 'unknown'}' is not mapped for direct M; "
-                      f"use land-to-Delta + DirectLake (default storage mode if rebuilt directly: Import).",
+            rationale=f"Connector class '{cls or 'unknown'}' is not mapped for direct M; storage "
+                      f"decision required -- default to a direct-to-source Import rebuild, or opt in "
+                      f"to land-to-Delta + DirectLake (never auto-selected).",
+            manual_followups=base_followups + [_NEEDS_DECISION_FOLLOWUP],
         )
 
     # 3. flat file -> Import (mode is correct; M is a path-based scaffold, not Sql.Database).

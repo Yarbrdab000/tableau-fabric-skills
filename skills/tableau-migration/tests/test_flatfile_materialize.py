@@ -503,3 +503,118 @@ def test_estate_flatfile_rerun_preserves_landed_data(tmp_path):
     children = set(os.listdir(tmp_path / "pbip" / safe_base))
     assert (safe_base + ".Data") in children
     assert (safe_base + ".SemanticModel") in children
+
+
+# =============================================================================
+# Extract-backed SaaS (unmapped connector, e.g. Salesforce): the .hyper snapshot
+# IS the data -> land an offline Import over it, exactly like a flat-file extract.
+# The connector has no live Power BI rebuild, so without this the datasource died
+# at the unknown-connector "needs-storage-decision" branch (item #11).
+# =============================================================================
+# A Salesforce datasource shipped WITH an extract: connection_class='salesforce', is_extract=True,
+# and NO flatfile_filename -- so the extract-over-unmapped path (not the flat-file path) engages.
+SALESFORCE_EXTRACT_DS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Salesforce Admin Insights' inline='true' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='Salesforce' name='salesforce.abc'>
+        <connection class='salesforce' server='login.salesforce.com' authentication='oauth' />
+      </named-connection>
+    </named-connections>
+    <relation connection='salesforce.abc' name='Account' table='[Account]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Id</remote-name><local-name>[Id]</local-name>
+        <parent-name>[Account]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>AnnualRevenue</remote-name><local-name>[AnnualRevenue]</local-name>
+        <parent-name>[Account]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+  <extract enabled='true'>
+    <connection class='hyper' dbname='Data/extract/extract.hyper' />
+  </extract>
+</datasource>"""
+
+
+def test_materialize_extracts_saas_hyper_without_flatfile_filename(tmp_path, monkeypatch):
+    # The materializer previously refused any descriptor with no flatfile_filename ("not_flatfile").
+    # A SaaS extract has no bundled named file, only a .hyper -> it must now proceed and extract it.
+    arc = _make_zip(tmp_path / "Salesforce Admin Insights.tdsx", {
+        "ds.tds": "<datasource/>",
+        "Data/extract/extract.hyper": b"HYPERBINARY",
+    })
+    monkeypatch.setattr(hr, "extract_to_csv",
+                        _fake_extract_to_csv({"Account": (["Id", "AnnualRevenue"],
+                                                          [["001", 100.0], ["002", 250.0]])}))
+    d = C.parse_tds(SALESFORCE_EXTRACT_DS)
+    assert d["is_extract"] is True and d["flatfile_filename"] is None
+    res = A.materialize_bundled_flatfile_data(arc, d, str(tmp_path / "out"))
+    assert res["kind"] == "csv"
+    assert res["hyper_present"] is True
+    assert set(res["table_csv_paths"]) == {"Account"}
+    csv_path = res["table_csv_paths"]["Account"]
+    assert os.path.isabs(csv_path) and os.path.isfile(csv_path)
+
+
+def test_migrate_datasource_routes_saas_extract_to_csv_import(tmp_path, monkeypatch):
+    # The direct path (migrate_datasource) builds a local-CSV Import over the SaaS extract snapshot.
+    arc = _make_zip(tmp_path / "Salesforce Admin Insights.tdsx", {
+        "ds.tds": "<datasource/>",
+        "Data/extract/extract.hyper": b"HYPERBINARY",
+    })
+    monkeypatch.setattr(hr, "extract_to_csv",
+                        _fake_extract_to_csv({"Account": (["Id", "AnnualRevenue"],
+                                                          [["001", 100.0]])}))
+    dest = tmp_path / "data"
+    res = A.migrate_datasource(SALESFORCE_EXTRACT_DS, model_name="M", packaged_source=arc,
+                               flatfile_dest_dir=str(dest))
+    ffd = res["report"]["flatfile_data"]
+    assert ffd["landed"] is True and ffd["kind"] == "csv"
+    assert res["report"].get("local_import")
+    blob = "\n".join(res["parts"].values())
+    assert "Csv.Document" in blob
+
+
+def test_migrate_datasource_saas_extract_no_hyper_fails_closed(tmp_path):
+    # A SaaS extract descriptor whose package carries NO .hyper has no data to land -> the direct
+    # path must fail closed (no dishonest live-connection model), reporting the honest reason.
+    arc = _make_zip(tmp_path / "Salesforce Admin Insights.tdsx", {"ds.tds": "<datasource/>"})
+    dest = tmp_path / "data"
+    res = A.migrate_datasource(SALESFORCE_EXTRACT_DS, model_name="M", packaged_source=arc,
+                               flatfile_dest_dir=str(dest))
+    ffd = res["report"]["flatfile_data"]
+    assert ffd["landed"] is False
+    assert ffd["reason"] == "no_bundled_data"
+    # no local-CSV Import was built, and it did not fall through to a live Salesforce model.
+    blob = "\n".join(res["parts"].values())
+    assert "Csv.Document" not in blob
+
+
+def test_estate_saas_extract_lands_csv_import(tmp_path, monkeypatch):
+    # The estate path (_migrate_one_datasource) lands the SaaS extract as a local-CSV Import too.
+    arc = _make_zip(tmp_path / "Salesforce Admin Insights.tdsx", {
+        "ds.tds": "<datasource/>",
+        "Data/extract/extract.hyper": b"HYPERBINARY",
+    })
+    monkeypatch.setattr(hr, "extract_to_csv",
+                        _fake_extract_to_csv({"Account": (["Id", "AnnualRevenue"], [["001", 100.0]])}))
+    sm_dir = tmp_path / "semantic_models"
+    sm_dir.mkdir()
+    detail = E._migrate_one_datasource(_ZipSource(SALESFORCE_EXTRACT_DS), arc, str(sm_dir), set())
+    assert detail["flatfile_data"]["landed"] is True
+    assert detail["flatfile_data"]["kind"] == "csv"
+    assert detail["status"] in ("migrated", "migrated_with_followups")
+
+
+def test_estate_saas_extract_no_hyper_fails_closed(tmp_path):
+    # SaaS extract with no bundled .hyper -> the estate never writes a dataless model; it fails
+    # closed to a fallback/followup, mirroring the flat-file "no data landed" path.
+    arc = _make_zip(tmp_path / "Salesforce Admin Insights.tdsx", {"ds.tds": "<datasource/>"})
+    sm_dir = tmp_path / "semantic_models"
+    sm_dir.mkdir()
+    detail = E._migrate_one_datasource(_ZipSource(SALESFORCE_EXTRACT_DS), arc, str(sm_dir), set())
+    assert detail["flatfile_data"]["landed"] is False
+    assert detail["status"] in ("fallback", "migrated_with_followups")

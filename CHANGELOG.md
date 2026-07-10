@@ -13,6 +13,90 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **new public `migrate_workbook` primitive — one code path for standalone-workbook and
+  estate workbook migration.** Rebuilding a Tableau workbook (its embedded datasource(s) **and** the report bound
+  to them, into an openable `pbip/<Name>/` project) was previously only reachable through the private, estate-only
+  loop inside `migrate_estate` — so an agent handed a lone `.twb`/`.twbx` had no public entry point and tended to
+  hand-roll one, orphaning the report. `migrate_estate.migrate_workbook(source, *, write_to=…, name=None, pbip=True,
+  …)` exposes that machinery directly: `source` accepts a `.twb`/`.twbx` path, raw workbook XML (`str`/`bytes`), or
+  a live `TableauSource` + `wb_id`; it returns the same per-workbook detail dict the estate reports (`name`,
+  `viz_status`, `pbip_status`, `bound_model`/`bound_datasource`, `pbip_folder`, `viz_fidelity`, …), nesting one
+  project per datasource for a multi-datasource workbook, and only raises on invalid arguments (a per-workbook
+  migration failure is reported on the detail, never raised). `migrate_estate` now **delegates** its workbook loop
+  to this same function, so a standalone workbook and an estate workbook are byte-for-byte the same operation — the
+  estate just runs it once per workbook. `migrate_datasource` stays datasource-scoped (model only); SKILL.md, the
+  `migrate_datasource` docstring, and `resources/orchestration.md` now steer workbook-with-report inputs to
+  `migrate_workbook`. Additive: a new public function and docs only — no existing report keys or behavior changed.
+- **tableau-migration:** **extract-backed SaaS datasources (Salesforce, Marketo, ServiceNow, …) now have an
+  honest offline Import home instead of falling through to a fallback.** A datasource on an unmapped SaaS
+  connector that is extract-backed (a bundled `.hyper` snapshot, no reconstructable live Power BI connector)
+  previously produced `mode=None` → needs-storage-decision, so it never landed as a model even though its data
+  was sitting in the package. `storage_mode.select_storage_mode` now recognizes this shape (extract enabled +
+  connector neither a mapped live class nor a flat file) and returns an `Import` decision marked
+  `import_from_extract: True`; the materializer (`assemble_model.materialize_bundled_flatfile_data`) reads the
+  bundled `.hyper` to one CSV per table even when there is no `flatfile_filename`, and both the direct
+  (`migrate_datasource`) and estate (`migrate_estate`) paths build a local-CSV Import model over the
+  materialized snapshot — preserving the point-in-time semantics of a Tableau extract without inventing a live
+  SaaS connection. When no `.hyper` is bundled, both paths **fail closed** to the honest
+  needs-storage-decision fallback with a `flatfile_data` record (`landed: False`) rather than writing a
+  dataless/broken model. A mapped connector that happens to be extract-backed (e.g. SQL Server + extract) is
+  unchanged — it still builds Import over its live connector. Additive: `import_from_extract` is a new
+  decision key, `flatfile_data` shape is unchanged, and no existing report keys were renamed or removed.
+  *(natural pair to the DirectLake-not-default pivot — the offline Import path the de-defaulted router points
+  extract-backed SaaS sources toward)*
+  datasources now route to an honest needs-storage-decision state instead of being auto-landed as
+  Delta + DirectLake.** When the storage router could not map a connector (a structurally-unsupported
+  join tree, an ODBC source with no reconstructable driver, a native engine with no server, or an
+  unknown connector) it previously stamped `land-to-delta-directlake` and auto-built a lakehouse
+  `landing_plan` — silently choosing DirectLake for the user. `storage_mode.select_storage_mode` now
+  stamps `needs-storage-decision` for every `mode is None` shape, and the fallback reporting
+  (`assemble_model` / `migrate_estate`) carries `storage_decision.fallback ==
+  "needs-storage-decision"` / `fallback_path == "needs-storage-decision"` with **no** auto-built
+  `landing_plan` and **no** `<model>.landing_plan.json` written — byte-identical in shape to the
+  existing SSAS/XMLA fallback. The land-to-Delta + DirectLake capability is unchanged and stays
+  reachable via the explicit opt-in helper `assemble_model.directlake_landing_plan(...)` (the
+  `FALLBACK_LAND_TO_DELTA` constant and the auto-build gate remain as the opt-in hook). The default
+  for an inferable shape is to rebuild direct-to-source as Import/DirectQuery; the residual
+  needs-decision fallback points the user at the opt-in rather than choosing it for them. Additive:
+  the `fallback` report key is unchanged, `landing_plan` is now emitted **only** through the opt-in,
+  and no existing report keys were renamed or removed. *(2026-07-09 storage-model architecture pivot —
+  DirectLake is opt-in only)*
+- **tableau-migration:** **a workbook migration now fails loud when it produces no openable, model-bound
+  report, and report rebuild is framed as a default deliverable instead of a preview.** Across three
+  real-world migrations the running agent rebuilt only the semantic model and left the workbook's
+  dashboards unbuilt — the skill advertised "semantic models," called report rebuild a *preview*, and had
+  no check that a workbook actually yielded a bound report. A new machine definition-of-done gate now
+  classifies every workbook input (`_definition_of_done`) and surfaces the verdict three ways: an additive
+  `report["definition_of_done"]` ledger (`{applicable, status, workbooks_total, reports_bound,
+  reports_failed, workbooks:[…]}`), a `summary.md` banner (a loud **⛔ DEFINITION OF DONE: FAILED**
+  section naming each unbound workbook, or a `✅`/`ℹ️` one-line status), and an ASCII `[FAIL]/[OK]/[--]`
+  stdout line. The gate is *soft-but-loud*: it never changes the process exit status (stays `0`) and
+  honestly **skips** the two legitimate cases — openable projects disabled (`--no-pbip`), and a
+  published-datasource workbook whose `.tds` was not co-migrated in the same run. Pure datasource runs are
+  unaffected (`applicable: false`, no banner, byte-identical summary head). The frontmatter description,
+  title, intro, and a new RUN CONTRACT gate rule are reworded so that whole-workbook → semantic model **+**
+  bound Power BI report reads as the unmissable default. No existing report keys renamed or removed.
+  *(AAR #1 / #2 / #3 — report rebuild was real but neither discoverable nor enforced by default)*
+  `approved_calc_dax` values accept an additive dict form (`{"dax": "<DAX>", "table": "<TargetTable>"}`)
+  alongside the existing flat `{name: "<DAX>"}` string form. When the deterministic tier could not place a
+  row-context (dimension) calc, it defaulted the column to the anchor table — where the approved DAX
+  referenced columns that don't exist, producing an invalid row-context expression. The dict form lets the
+  approver land the column on its real table. The named table is honored only when it is a real model table
+  (an unknown name would be silently dropped by the per-table inject, so the computed home is kept and the
+  miss is recorded on the report row as `approved_target_unknown`); the requested target is echoed as
+  `approved_target`. Measures are unaffected — they live in the shared `_Measures` table, so a measure
+  approval's `table` is accepted but not applicable. The flat string form stays byte-for-byte identical, and
+  `migrate_estate --approved-dax` loads either form (fail-fast on a malformed entry). *(AAR #1 Issue C)*
+- **tableau-migration:** **every migrated model now ships a hermetic openability self-check so a run can
+  no longer report success while emitting a model that will not open.** A new dependency-free gate
+  (`openability_gate.check_model_openability`) validates the built model's TMDL parts — no duplicate
+  column declarations, every M-typed column both declared and (when the landed flat file is readable) an
+  actual physical header, and every `.tmdl` part well-formed (reusing the `tmdl_lint` openability rules).
+  The verdict surfaces as the additive `report["openability_selfcheck"]` (`{ok, checks, issues}`), wired
+  into `assemble_import_model` so it covers the datasource, local-CSV and workbook-rebuild paths. It is
+  intentionally distinct from the opt-in TOM `report["openability"]` tier — cheap, always-on, and hermetic
+  (never opens a file for the structural checks). Fail-safe: a table with no typed columns or no readable
+  header is skipped, never mis-flagged.
 - **tableau-migration:** **heatmaps that used Tableau's default colour scale now keep their colour
   instead of dropping it silently.** When an author leaves a table/matrix colour gradient on Tableau's
   *default* continuous palette, the workbook serialises no explicit `<color-palette>` element — so the
@@ -821,8 +905,85 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   canonical install location and `~/.copilot/skills/tableau-migration` is a manual-only fallback.
 
 ### Fixed
-- **tableau-migration:** **migrated Import / DirectQuery models no longer fail at query time in the
-  Fabric Service on any column whose source name contains a space or special character** (e.g.
+- **tableau-migration:** **a join/union datasource now rebuilds directly to source as a multi-table model
+  instead of being skipped.** A Tableau physical `join`/`union` tree previously collapsed into one opaque
+  "combination" table, which the storage policy could only fall back on — so a join-tree datasource never
+  landed as a model. `connection_to_m._extract_relations` no longer collapses the combination: the container
+  is dropped and each **leaf table is surfaced as its own independent model table** (exactly like a
+  multi-table object-graph source), and a new `_extract_join_relationships` recovers each physical join key
+  (`<clause type='join'>` `[Table].[Column] = [Table].[Column]`) as a `many_to_many` model relationship,
+  de-duplicated against the object-graph relationships in either orientation. A role-playing **alias** (same
+  physical `item`, distinct `name` — e.g. `Contact1` over `[Contact]`) now surfaces as its own model table
+  (the display name joined the de-dup key) instead of collapsing into the base table, while genuine
+  physical/logical copies of one table still collapse. Fail-closed throughout: a composite/calculated
+  predicate, an unqualified operand, or an unresolvable table/column is skipped with a warning rather than
+  forcing the whole datasource to fall back. Additive — no existing report keys changed; parity with the
+  object-graph relationship path.
+- **tableau-migration:** **`MIN([str])` / `MAX([str])` over a text (or date) dimension now translate, so
+  the `MIN([A]) + " / " + MIN([B])` tooltip idiom lands as a string concat instead of stubbing.** The
+  single-column DAX `MIN`/`MAX` functions accept text (alphabetical order) and dates, matching Tableau's
+  `MIN`/`MAX` on those field types, but the deterministic compiler's fast path rejected anything non-numeric/
+  non-`dateTime` — so a Tableau author's common trick of wrapping a string dimension in `MIN()` to make it
+  aggregate-valid in a tooltip false-stubbed on the aggregate. `MIN`/`MAX` over a bare field now emit for
+  number, text, and date columns (a boolean or unmapped type still fails closed), a text result keeps its
+  `text` dtype, and the null-propagating string `+` concat (previously column-mode only) is now also valid in
+  a measure — where only aggregated/scalar text can reach it (a bare row-level text field still rejects
+  upstream). Numeric and date `MIN`/`MAX` output is byte-for-byte unchanged. *(AAR #2 F-10)*
+- **tableau-migration:** **the DirectLake table emitter no longer hardcodes `schemaName: dbo`, so a model
+  landed to a non-`dbo` or non-schema lakehouse binds instead of silently failing.** `generate_table_tmdl`
+  (and `assemble_directlake_model`, which threads it) gained an additive `schema_name` parameter that
+  governs how the entity is addressed: a non-empty schema (default `"dbo"` → byte-for-byte identical to
+  prior output) emits a schema-qualified `sourceLineageTag: [<schema>].[<delta>]` + `schemaName: <schema>`
+  (a custom schema on a schema-enabled lakehouse is now honored verbatim), while `None`/`""` (a non-schema
+  "classic" lakehouse) omits the `schemaName` line and emits an unqualified `sourceLineageTag: [<delta>]`.
+  Previously the hardcoded `dbo` resolved the entity to a name that doesn't exist on such a lakehouse and
+  silently broke the DirectLake binding. Existing callers are unchanged (the `dbo` default). *(AAR #3 G3)*
+  its real model column instead of emitting an invalid measure reference.** When the model build hands the
+  viz re-run its authoritative naming map (`_field_map_from_model`, which only ever carries model **columns**),
+  `twb_to_pbir._apply_override` rebinds a pill's entity/property to the named column but previously kept the
+  pill's original `binding` — so a `measure`-kind pill whose caption resolved to a column emitted a
+  `{"Measure"}` expression pointing at a column (invalid PBIR). The override now flips a raw `measure`-kind
+  ref to `column` when the columns-only field map resolves its caption, while an `aggregation` pill keeps its
+  aggregation (`SUM` stays `SUM`) and a plain `column` is unchanged; an explicit override `binding` still
+  wins. On today's pipeline the collision is unreachable (measure calcs are rebound via the token-keyed
+  `measure_binding`, never the column field map), so this is a defensive invariant that also hardens the seam
+  a measure-role calc routed to column mode would otherwise hit — warn-never-wrong, zero behavior change on
+  the existing paths. *(AAR #1 Issue I)* When a physical table is added to a Tableau join it
+  surfaces as e.g. `1. LoginHistory`, while the migrated model declares the clean table (`LoginHistory`)
+  and keys its `COUNTROWS` measure clean. The implicit object-id `COUNT(*)` binding matched table names
+  exactly, so the prefixed name missed and the card silently dropped its value. `twb_to_pbir`'s row-count
+  binding now normalises a leading `"<n>. "` order prefix on either side (`_strip_table_order_prefix`),
+  binding the card to its clean COUNTROWS measure. A normalised match binds only when it is unambiguous
+  (two prefixed instances of the same physical table stay unbound and warned) and an exact key still
+  wins — warn-never-wrong. *(AAR #1 Issue E)*
+- **tableau-migration:** **local-CSV Import models no longer emit phantom or duplicate columns that
+  made the model dead-on-arrival in Power BI.** When a `.tds`/`.tdsx` is migrated on the local-CSV
+  Import path (`migrate_datasource(local_data=…)`), each table's columns are now reconciled against
+  the header the materialized CSV physically contains. Previously a column present in the datasource
+  metadata but absent from the CSV (a **phantom** — e.g. a hidden/removed extract column or an
+  object-id metadata artifact) was still emitted as a TMDL `column` and typed in the `Csv.Document`
+  `Table.TransformColumnTypes` step, so Power BI errored on load referencing a header that isn't in
+  the file; and a column that appeared twice (a **duplicate** — e.g. an object-id-twin) produced an
+  invalid repeated TMDL column name. `assemble_local_import_model` now alias-remaps first (so a
+  renamed source name like `Person` → physical `Regional Manager` is kept, never dropped), then drops
+  phantoms and collapses duplicates against the real header, disclosing every change in the additive
+  `report["local_import"]["column_reconcile"]` (`dropped` / `deduped` / `remapped`). Fail-safe: a CSV
+  whose header can't be read leaves every column untouched, so clean models are byte-identical to
+  before.
+- **tableau-migration:** **calculated fields containing comments now translate to DAX instead of
+  silently falling back to a stub.** Tableau's calc editor allows `//` line comments and
+  `/* ... */` block comments, which are documentation only and never affect the computed value. The
+  calc tokenizer (`calc_to_dax.py` `_tokenize`) had no comment handling, so it read the first `/` as
+  a division operator and the parse failed — every commented calculation false-stubbed with reason
+  *"expected a value"* (on real workbooks this dropped the large majority of calcs, since authors
+  routinely annotate them). `_tokenize` now strips `//` (to end of line) and `/* ... */` (across
+  newlines) comments, placed **after** the string-literal scan (so a `//` or `/*` inside a quoted
+  string is preserved as data) and **before** the operator scan (so `/` is never first consumed as
+  division). A comment-only formula fails closed as an empty formula, and an unterminated `/*` block
+  fails closed with a clear reason — both honest stubs, matching Tableau's own rejection. Division,
+  string literals, and every previously-translating formula tokenize byte-identically (the new
+  branches only fire on `//` / `/*`). Verified with comment variants (leading / trailing / mid-
+  expression / multi-line) each translating to exactly the same DAX as their comment-free form.
   `Expression.Error: The name 't0.Order_Date' doesn't exist in the current context`, which also left
   relationships on those columns showing red validation triangles until manually toggled). The M
   partition used to append a `Table.RenameColumns` step that renamed the raw source headers

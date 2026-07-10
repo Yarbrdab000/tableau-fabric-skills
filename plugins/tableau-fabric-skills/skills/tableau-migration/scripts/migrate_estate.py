@@ -32,8 +32,9 @@ is exercised offline, with no files, network, or credentials.
 Honesty boundaries are inherited from the cores: column types come from Tableau metadata,
 only the safe subset of calcs becomes DAX (everything else stays an inert ``= 0`` stub with the
 original formula preserved), and any datasource whose shape is not safe to rebuild directly is
-reported as a land-to-Delta + DirectLake *fallback* rather than emitted wrong. No credentials
-are read, stored, or written anywhere in the bundle.
+reported as a *needs-storage-decision* fallback (default: rebuild direct-to-source as Import;
+land-to-Delta + DirectLake is an explicit opt-in, never auto-selected) rather than emitted wrong.
+No credentials are read, stored, or written anywhere in the bundle.
 """
 from __future__ import annotations
 
@@ -49,7 +50,7 @@ from datetime import datetime, timezone
 
 try:  # works whether imported as a package or run with scripts/ on sys.path
     from .connection_to_m import parse_tds, extract_bundled_flatfile, extract_calcs
-    from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
+    from .storage_mode import select_storage_mode, FALLBACK_NEEDS_DECISION
     from .assemble_model import (assemble_import_model, assemble_local_import_model,
                                  materialize_bundled_flatfile_data, write_model_folder,
                                  write_local_pbip, migrate_datasource, list_workbook_datasources)
@@ -59,7 +60,7 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from . import fetch_tds as F
 except ImportError:
     from connection_to_m import parse_tds, extract_bundled_flatfile, extract_calcs
-    from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
+    from storage_mode import select_storage_mode, FALLBACK_NEEDS_DECISION
     from assemble_model import (assemble_import_model, assemble_local_import_model,
                                 materialize_bundled_flatfile_data, write_model_folder,
                                 write_local_pbip, migrate_datasource, list_workbook_datasources)
@@ -615,7 +616,7 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
     if decision.get("mode") is None:
         detail.update(status="fallback", storage_mode=None, storage_decision=decision,
                       reason=decision.get("rationale"),
-                      fallback_path=decision.get("fallback") or FALLBACK_LAND_TO_DELTA)
+                      fallback_path=decision.get("fallback") or FALLBACK_NEEDS_DECISION)
         return detail
 
     # Preflight: model-table display names must each map to a distinct, writable TMDL part.
@@ -648,7 +649,7 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
     flatfile_path = None
     table_csv_paths = None
     ff_mat = None
-    if descriptor.get("flatfile_filename"):
+    if descriptor.get("flatfile_filename") or decision.get("import_from_extract"):
         if pbip_dir is not None:
             # Land the data INSIDE the openable project (pbip/<name>/<name>.Data, beside the
             # .SemanticModel) so the whole folder is self-contained + portable; a relocatable
@@ -683,6 +684,16 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
             "hyper_present": ff_mat.get("hyper_present", False),
         }
 
+    # Extract-backed SaaS (import_from_extract) whose bundled .hyper did NOT materialize to CSV: fail
+    # closed to the honest needs-storage-decision fallback rather than emitting a dataless/broken
+    # model for an unmapped connector (the estate would otherwise write a model that opens with no
+    # data). Mirrors the mode-None fallback above; the honest flatfile_data record is preserved.
+    if decision.get("import_from_extract") and not table_csv_paths:
+        detail.update(status="fallback", storage_mode=None, storage_decision=decision,
+                      reason=(ff_mat or {}).get("reason") or decision.get("rationale"),
+                      fallback_path=decision.get("fallback") or FALLBACK_NEEDS_DECISION)
+        return detail
+
     try:
         if table_csv_paths:
             out = assemble_local_import_model(descriptor, model_name=name,
@@ -693,10 +704,10 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
             out = assemble_import_model(descriptor, model_name=name, calcs=calcs, dim_calcs=dim_calcs,
                                         parameters=parameters, approved_calc_dax=approved_calc_dax,
                                         flatfile_path=flatfile_path)
-    except ValueError as exc:  # storage policy / no-columns -> documented land-to-Delta fallback
+    except ValueError as exc:  # storage policy / no-columns -> documented needs-storage-decision fallback
         detail.update(status="fallback", storage_mode=None, storage_decision=decision,
                       reason=str(exc),
-                      fallback_path=decision.get("fallback") or FALLBACK_LAND_TO_DELTA)
+                      fallback_path=decision.get("fallback") or FALLBACK_NEEDS_DECISION)
         return detail
     except Exception as exc:
         detail.update(status="error", storage_decision=decision,
@@ -1726,11 +1737,11 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                      f"landed to an absolute path -- the model opens but loads no rows ({_why})")
     if res_report.get("fallback"):
         # Published-datasource workbook: its own embedded copy is a sqlproxy proxy stub with no
-        # usable schema, so rebuilding it lands in the lakehouse fallback. When the estate already
-        # built the matching published datasource, rebuild the model from THAT real schema --
-        # carrying the workbook's own calculated fields so its view-local measures translate -- and
-        # bind the report to it. Never guesses (a real datasource-name match is required); any
-        # failure keeps the honest skip below (warn-never-wrong).
+        # usable schema, so rebuilding it routes to the needs-storage-decision fallback. When the
+        # estate already built the matching published datasource, rebuild the model from THAT real
+        # schema -- carrying the workbook's own calculated fields so its view-local measures
+        # translate -- and bind the report to it. Never guesses (a real datasource-name match is
+        # required); any failure keeps the honest skip below (warn-never-wrong).
         recovered = _rebuild_from_published_match(wb_detail, twb_text, model_safe, ds_catalog,
                                                   approved_calc_dax=approved_calc_dax)
         if recovered is not None:
@@ -1738,7 +1749,7 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
             res_report = res.get("report") or {}
         if res_report.get("fallback"):
             rationale = (res_report.get("storage_decision") or {}).get("rationale") or "undoable shape"
-            warns.append(_PBIP_WARN + f"embedded datasource {label!r} routes to the lakehouse fallback "
+            warns.append(_PBIP_WARN + f"embedded datasource {label!r} needs a storage decision "
                          f"({rationale}) -- workbook .pbip skipped (model lands separately)")
             return
 
@@ -1869,7 +1880,7 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
     the top-level keys mirror the primary (most-used) datasource. Purely additive: it never alters the
     bare ``reports/`` write. Sets ``pbip_status``/``pbip_folder``/``bound_model``/``bound_datasource``/
     ``model_translation_handoff`` and appends honest ``pbip_warnings`` for every case it cannot
-    faithfully bind (no embedded datasource, lakehouse fallback, write failure). Never raises.
+    faithfully bind (no embedded datasource, needs-storage-decision fallback, write failure). Never raises.
     """
     detail.update(pbip_status="skipped", pbip_folder=None, bound_model=None,
                   bound_datasource=None, model_translation_handoff=None)
@@ -2041,6 +2052,92 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_di
         _attach_workbook_pbip(detail, text, result, safe_base, pbip_dir, viz=viz,
                               ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax, wb_id=wb_id)
     return detail
+
+
+def _looks_like_path(source):
+    """True iff ``source`` is a filesystem path that exists (tolerant of raw-XML strings)."""
+    if isinstance(source, (bytes, bytearray)) or not isinstance(source, (str, os.PathLike)):
+        return False
+    try:
+        return os.path.exists(source)
+    except (ValueError, OSError):  # e.g. an over-long or NUL-bearing raw-XML string
+        return False
+
+
+def _single_workbook_source(source, name=None):
+    """Wrap a standalone workbook as a one-workbook :class:`TableauSource`.
+
+    Returns ``(source, wb_id)`` ready for :func:`_migrate_one_workbook`. A filesystem path to a
+    ``.twb`` / ``.twbx`` is served by :class:`LocalFilesSource` with the ABSOLUTE path as the id, so a
+    packaged ``.twbx``'s bundled flat-file data is extracted at full fidelity (the downstream model
+    build reads the bundle via that same path). Raw workbook XML (``str``/``bytes``, incl. ``.twbx``
+    zip bytes) is served in memory; a bare XML body carries no bundled extract, so flat-file data
+    honestly degrades (there is nothing to land). The display name is the file stem for a path, else
+    ``name`` (default ``"workbook"``).
+    """
+    if _looks_like_path(source):
+        path = os.path.abspath(os.fspath(source))
+        return LocalFilesSource(os.path.dirname(path)), path
+    if isinstance(source, (bytes, bytearray)):
+        data = bytes(source)
+        text = F.inner_doc_from_zip(data) if F.is_zip(data) else data.decode("utf-8-sig")
+    else:
+        text = source
+    key = name or "workbook"
+    return InMemoryTableauSource(workbooks={key: text}), key
+
+
+def migrate_workbook(source, *, write_to=None, wb_id=None, name=None, viz_stage=None,
+                     approved_calc_dax=None, viz_advice=False, pbip=True,
+                     ds_catalog=None, used_folders=None):
+    """Migrate ONE Tableau workbook into an openable Power BI project (model + bound report).
+
+    This is the public workbook primitive -- the same faithful rebuild+bind the estate performs per
+    workbook, callable for a single workbook. :func:`migrate_estate` loops exactly this function, so a
+    standalone workbook migration and an estate workbook migration share ONE code path.
+
+    ``source`` is either a standalone workbook -- a filesystem path to a ``.twb`` / ``.twbx`` or raw
+    ``.twb`` XML (``str``/``bytes``) -- or, for the estate, a live :class:`TableauSource` plus a
+    ``wb_id`` selecting the workbook within it. Set ``name`` to override the display name of a
+    standalone workbook (default: the file stem, or ``"workbook"`` for raw XML).
+
+    ``write_to`` (required) is the output project directory: the rebuilt report is written under
+    ``<write_to>/reports/<Name>.Report`` and, unless ``pbip=False``, the openable project under
+    ``<write_to>/pbip/<Name>/`` (model rebuilt from the workbook's own embedded datasource + report
+    bound to it by path). Returns the workbook detail dict (``name``, ``viz_status``, ``pbip_status``,
+    ``bound_model`` / ``bound_datasource``, ``pbip_folder``, ``viz_fidelity`` ...). Never raises for a
+    per-workbook migration failure -- the failure is reported on the detail dict (as ``_migrate_one_
+    workbook`` does); only invalid ARGUMENTS raise ``ValueError``.
+
+    ``ds_catalog`` / ``used_folders`` are the estate's shared caches (a published-datasource match
+    catalog and the set of already-claimed output folder names). Standalone callers omit them.
+    """
+    if not write_to:
+        raise ValueError(
+            "migrate_workbook writes an openable project (model + bound report); pass write_to=<dir>")
+
+    if isinstance(source, TableauSource):
+        single = source
+        if wb_id is None:
+            workbooks = source.list_workbooks()
+            if len(workbooks) != 1:
+                raise ValueError("pass wb_id to select which workbook to migrate from a "
+                                 "multi-workbook source")
+            wb_id = workbooks[0]
+    else:
+        single, wb_id = _single_workbook_source(source, name=name)
+
+    reports_dir = os.path.join(write_to, "reports")
+    pbip_dir = os.path.join(write_to, "pbip") if pbip else None
+    os.makedirs(write_to, exist_ok=True)
+
+    viz = _resolve_viz_stage(viz_stage)
+    if used_folders is None:
+        used_folders = set()
+
+    return _migrate_one_workbook(single, wb_id, viz, reports_dir, used_folders, pbip_dir,
+                                 ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax,
+                                 viz_advice=viz_advice)
 
 
 # -- rebind plan ingest / routing (opt-in; byte-identical no-op when absent) ---
@@ -2392,7 +2489,6 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
     ``viz_advice`` key per workbook -- so when omitted the run is byte-identical.
     """
     sm_dir = os.path.join(output_dir, "semantic_models")
-    reports_dir = os.path.join(output_dir, "reports")
     pbip_dir = os.path.join(output_dir, "pbip") if pbip else None
     os.makedirs(output_dir, exist_ok=True)
 
@@ -2404,10 +2500,9 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
                                           ds_catalog=ds_catalog,
                                           approved_calc_dax=approved_calc_dax)
                   for ds_id in source.list_datasources()]
-    wb_details = [_migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir,
-                                        ds_catalog=ds_catalog,
-                                        approved_calc_dax=approved_calc_dax,
-                                        viz_advice=viz_advice)
+    wb_details = [migrate_workbook(source, write_to=output_dir, wb_id=wb_id, viz_stage=viz,
+                                   approved_calc_dax=approved_calc_dax, viz_advice=viz_advice,
+                                   pbip=pbip, ds_catalog=ds_catalog, used_folders=used_folders)
                   for wb_id in source.list_workbooks()]
 
     summary = _summarize(ds_details, wb_details, viz is not None)
@@ -2415,7 +2510,7 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
         {"datasource": d["name"],
          "source_id": d.get("source_id"),
          "reason": d.get("reason"),
-         "fallback_path": d.get("fallback_path") or FALLBACK_LAND_TO_DELTA}
+         "fallback_path": d.get("fallback_path") or FALLBACK_NEEDS_DECISION}
         for d in ds_details if d.get("status") == "fallback"
     ]
 
@@ -2426,6 +2521,7 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
         "summary": summary,
         "datasources": ds_details,
         "workbooks": wb_details,
+        "definition_of_done": _definition_of_done(wb_details, pbip_dir is not None),
         "fallbacks": fallbacks,
     }
 
@@ -2557,6 +2653,117 @@ def _summarize(ds_details, wb_details, viz_available):
     }
 
 
+def _dod_fail_reason(w):
+    """A short, human reason a workbook produced no openable, model-bound report.
+
+    Prefers the concrete viz/pbip signal already recorded on the workbook detail: a hard viz error,
+    else the first ``pbip_warnings`` entry (with the ``manual attention required:`` prefix stripped),
+    else a viz warning, else a generic fallback. Read-only; never raises.
+    """
+    if w.get("viz_status") == "error":
+        return (w.get("note") or "viz rebuild failed").strip()
+    for warn in (w.get("pbip_warnings") or []):
+        if warn:
+            return warn[len(_PBIP_WARN):] if warn.startswith(_PBIP_WARN) else warn
+    if w.get("viz_status") == "warned":
+        return (w.get("note") or "viz rebuild warned").strip()
+    return "no openable, model-bound report was produced"
+
+
+def _definition_of_done(wb_details, pbip_enabled):
+    """A machine definition-of-done ledger for workbook inputs (additive; never raises).
+
+    A Tableau *workbook* migration is only complete when its dashboards are rebuilt and bound into an
+    openable ``.pbip`` -- not when its semantic model alone lands. This classifies every workbook:
+
+    - **pass** -- an openable, model-bound report was produced (``pbip_status == "built"``, or, for a
+      multi-datasource workbook, any ``datasource_pbips`` entry built).
+    - **skipped** -- either openable projects were disabled (``--no-pbip``), or the workbook connects
+      to a *published* Tableau datasource that was not co-migrated in the same run (the one honest
+      carve-out: its ``.tds`` must be in scope to bind an openable report).
+    - **failed** -- a workbook that should have produced a bound report did not (an orphaned report).
+
+    The overall status is ``not_applicable`` (no workbook inputs), ``failed`` (any failure -- the loud
+    case), ``skipped`` (no failures, nothing bound / pbip disabled), or ``pass``. Purely a report key:
+    it changes no behaviour and never alters exit status (soft-but-loud).
+    """
+    workbooks = []
+    for w in wb_details:
+        bound = (w.get("pbip_status") == "built") or any(
+            (e or {}).get("pbip_status") == "built" for e in (w.get("datasource_pbips") or []))
+        if not pbip_enabled:
+            status = "skipped"
+            reason = "openable .pbip projects disabled (--no-pbip)"
+        elif bound:
+            status, reason = "pass", ""
+        elif (w.get("binding_signal") or {}).get("kind") == "published":
+            status = "skipped"
+            reason = ("published-datasource workbook -- co-migrate its published datasource (.tds) "
+                      "in the same run to bind an openable report")
+        else:
+            status, reason = "failed", _dod_fail_reason(w)
+        workbooks.append({
+            "workbook": w.get("name"),
+            "report_bound": bool(bound),
+            "bound_model": w.get("bound_model"),
+            "pbip_folder": w.get("pbip_folder"),
+            "status": status,
+            "reason": reason,
+        })
+
+    reports_bound = sum(1 for e in workbooks if e["report_bound"])
+    reports_failed = sum(1 for e in workbooks if e["status"] == "failed")
+    if not wb_details:
+        overall = "not_applicable"
+    elif reports_failed:
+        overall = "failed"
+    elif not pbip_enabled:
+        overall = "skipped"
+    elif reports_bound:
+        overall = "pass"
+    else:
+        overall = "skipped"
+    return {
+        "applicable": bool(wb_details),
+        "status": overall,
+        "workbooks_total": len(wb_details),
+        "reports_bound": reports_bound,
+        "reports_failed": reports_failed,
+        "workbooks": workbooks,
+    }
+
+
+def _dod_banner(dod):
+    """Render the definition-of-done section for ``summary.md`` as a list of lines.
+
+    Returns ``[]`` for a run with no workbook inputs, so a pure datasource run's summary head stays
+    byte-identical. A ``failed`` run gets a loud banner naming each unbound workbook; ``pass`` and
+    ``skipped`` get a one-line status. Emoji is safe here (``summary.md`` is written UTF-8).
+    """
+    if not dod or not dod.get("applicable"):
+        return []
+    status = dod.get("status")
+    total = dod.get("workbooks_total", 0)
+    if status == "failed":
+        failed = [w for w in dod.get("workbooks", []) if w.get("status") == "failed"]
+        out = [
+            "## \u26d4 DEFINITION OF DONE: FAILED",
+            "",
+            (f"{len(failed)} of {total} workbook input(s) produced no openable, model-bound Power BI "
+             "report. A Tableau workbook migration is not complete until its dashboards are rebuilt "
+             "and bound into a `.pbip` (see the Workbooks table below)."),
+            "",
+        ]
+        out += [f"- **{w.get('workbook')}** -- {w.get('reason')}" for w in failed]
+        out.append("")
+        return out
+    if status == "pass":
+        return [f"## \u2705 DEFINITION OF DONE: PASS -- {dod.get('reports_bound', 0)} of {total} "
+                "workbook report(s) rebuilt and bound into an openable `.pbip`.", ""]
+    return [f"## \u2139\ufe0f DEFINITION OF DONE: SKIPPED -- no workbook report was bound "
+            "(see the Workbooks table for why).", ""]
+
+
 def _render_summary_md(report):
     """Render the human-readable ``summary.md`` from the report dict."""
     s = report["summary"]
@@ -2566,6 +2773,7 @@ def _render_summary_md(report):
         f"_Generated {report['generated_at']} by `{report['tool']}` "
         f"from {report['source'].get('kind')}._",
         "",
+        *_dod_banner(report.get("definition_of_done")),
         "## Summary",
         "",
         f"- **Datasources:** {s['datasources_total']} total -> "
@@ -2658,7 +2866,7 @@ def _render_summary_md(report):
             )
 
     if report["fallbacks"]:
-        lines += ["", "## Fallbacks (route to land-to-Delta + DirectLake)", ""]
+        lines += ["", "## Fallbacks (need a storage decision -- Import default / DirectLake opt-in)", ""]
         for f in report["fallbacks"]:
             lines.append(f"- **{f['datasource']}** ({f['fallback_path']}): {f['reason']}")
 
@@ -2745,12 +2953,17 @@ def _render_summary_md(report):
 
 # -- CLI -----------------------------------------------------------------------
 def _load_approved_dax(path):
-    """Load a ``{calc_name: dax}`` mapping of human-approved assisted translations from a JSON file.
+    """Load a mapping of human-approved assisted translations from a JSON file.
+
+    Each value may be the flat ``"DAX"`` string form, or the additive dict form
+    ``{"dax": "DAX", "table": "TargetTable"}`` -- the latter lets an approval also name a calc's
+    home table (honored by the column-mode landing; not applicable to measures, which live in the
+    shared ``_Measures`` table).
 
     Returns ``None`` when ``path`` is falsy (the run is then byte-identical to a no-approval run).
-    Raises ``ValueError`` when the file is missing, unreadable, not JSON, or not a flat object of
-    string -> string -- a fail-fast so a typo never silently drops an approval. Tolerates a UTF-8
-    BOM (the file is often hand-authored on Windows).
+    Raises ``ValueError`` when the file is missing, unreadable, not JSON, or not an object of
+    ``str -> (str | {"dax": str, "table"?: str})`` -- a fail-fast so a typo never silently drops an
+    approval. Tolerates a UTF-8 BOM (the file is often hand-authored on Windows).
     """
     if not path:
         return None
@@ -2761,10 +2974,20 @@ def _load_approved_dax(path):
         raise ValueError(f"--approved-dax file not found: {path}")
     except (OSError, ValueError) as exc:  # ValueError covers json.JSONDecodeError
         raise ValueError(f"--approved-dax file is not readable JSON ({path}): {exc}")
+
+    def _valid_value(v):
+        if isinstance(v, str):
+            return True
+        if isinstance(v, dict):
+            tbl = v.get("table")
+            return isinstance(v.get("dax"), str) and (tbl is None or isinstance(tbl, str))
+        return False
+
     if not isinstance(data, dict) or not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+            isinstance(k, str) and _valid_value(v) for k, v in data.items()):
         raise ValueError(
-            f"--approved-dax JSON must be an object mapping calc name -> DAX string ({path})")
+            "--approved-dax JSON must map calc name -> DAX string (or "
+            '{"dax": ..., "table": ...}) ' f"({path})")
     return data or None
 
 
@@ -2781,9 +3004,11 @@ def main(argv=None):
     parser.add_argument("--no-pbip", action="store_true",
                         help="skip the openable .pbip projects (emit only semantic_models/ folders)")
     parser.add_argument("--approved-dax", metavar="JSON",
-                        help="path to a {calc_name: dax} JSON file of human-approved second-compiler "
-                             "(assisted-translation) results; each name-matching stub lands as a "
-                             "live, audit-stamped measure/calc column instead of an inert stub")
+                        help="path to a JSON file of human-approved second-compiler "
+                             "(assisted-translation) results, mapping calc name -> DAX string (or "
+                             '{"dax": ..., "table": ...} to also name a calc column\'s home table); '
+                             "each name-matching stub lands as a live, audit-stamped measure/calc "
+                             "column instead of an inert stub")
     parser.add_argument("--viz-advice", action="store_true",
                         help="also write a reports/<Name>.viz-advice.json sidecar per workbook with "
                              "ranked alternative chart types per visual (Tier-2 viz advisor; "
@@ -2816,6 +3041,13 @@ def main(argv=None):
         print(f"Next step: {s['partitions_stubbed_total']} table partition(s) need manual M "
               f"completion -> see summary.md ('manual M partition completion'); the original SQL "
               f"is preserved in report.json.")
+    dod = report.get("definition_of_done") or {}
+    if dod.get("applicable"):
+        # ASCII markers only -- Windows cp1252 stdout raises on emoji. Soft-but-loud: exit stays 0.
+        marker = {"failed": "[FAIL]", "pass": "[OK]", "skipped": "[--]"}.get(dod.get("status"), "[--]")
+        print(f"{marker} Definition of done: {dod.get('status')} -- {dod.get('reports_bound', 0)}/"
+              f"{dod.get('workbooks_total', 0)} workbook report(s) rebuilt and bound "
+              f"(see summary.md).")
     return 0
 
 

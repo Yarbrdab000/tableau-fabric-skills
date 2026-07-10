@@ -71,7 +71,7 @@ WIDGET_SALES_TDS = """<?xml version='1.0' encoding='utf-8' ?>
   </column>
 </datasource>"""
 
-# An unmapped connector class -> land-to-Delta + DirectLake fallback.
+# An unmapped connector class -> needs-storage-decision fallback (DirectLake is opt-in, not default).
 INVENTORY_FEED_TDS = """<?xml version='1.0' encoding='utf-8' ?>
 <datasource formatted-name='Inventory Feed' inline='true' version='18.1'>
   <connection class='federated'>
@@ -434,7 +434,7 @@ def test_migrate_estate_records_fallback_with_reason(fixtures_dir, tmp_path):
     assert len(report["fallbacks"]) == 1
     fb = report["fallbacks"][0]
     assert fb["datasource"] == "inventory_feed"
-    assert fb["fallback_path"] == "land-to-delta-directlake"
+    assert fb["fallback_path"] == "needs-storage-decision"
     assert "saphana" in fb["reason"]
 
     detail = next(d for d in report["datasources"] if d["name"] == "inventory_feed")
@@ -609,7 +609,7 @@ def test_assemble_layer_value_error_is_fallback(tmp_path, monkeypatch):
     # A non-fallback storage decision, but the assembler itself signals a fallback
     # (e.g. "no table produced columns") -> must be classified fallback, not error.
     def boom(descriptor, **kwargs):
-        raise ValueError("no table produced columns; fall back to land-to-Delta + DirectLake.")
+        raise ValueError("no table produced columns; it needs a storage decision.")
 
     monkeypatch.setattr(me, "assemble_import_model", boom)
     src = InMemoryTableauSource(datasources={"Orders DS": LIVE_TDS})
@@ -619,7 +619,7 @@ def test_assemble_layer_value_error_is_fallback(tmp_path, monkeypatch):
     detail = report["datasources"][0]
     assert detail["status"] == "fallback"
     assert "no table produced columns" in detail["reason"]
-    assert report["fallbacks"][0]["fallback_path"] == "land-to-delta-directlake"
+    assert report["fallbacks"][0]["fallback_path"] == "needs-storage-decision"
 
 
 def test_case_insensitive_table_name_collision_is_error(tmp_path):
@@ -874,8 +874,8 @@ def _viz_wb(ds_blocks, ws_blocks):
             + "</workbook>")
 
 
-# Embedded SAP HANA datasource -> select_storage_mode routes it to the land-to-Delta fallback, so
-# the bound .pbip cannot be assembled (the model lands separately) and must be skipped with a warning.
+# Embedded SAP HANA datasource -> select_storage_mode routes it to the needs-storage-decision fallback,
+# so the bound .pbip cannot be assembled (the model lands separately) and must be skipped with a warning.
 SAPHANA_WORKBOOK_TWB = _viz_wb(
     _viz_ds("Hana Source", "federated.hana", "saphana.bb22", "saphana", "Stock"),
     _viz_ws("Stock by Category", "federated.hana", "Hana Source"))
@@ -890,7 +890,7 @@ MULTI_SOURCE_TWB = _viz_wb(
 
 
 # A mixed multi-datasource workbook: one mappable SQL Server datasource (builds a bound .pbip) plus a
-# SAP HANA datasource that routes to the land-to-Delta fallback (cannot be assembled into a bound
+# SAP HANA datasource that routes to the needs-storage-decision fallback (cannot be assembled into a bound
 # model). Proves per-datasource error isolation -- the fallback datasource is skipped-loud while its
 # sibling still builds, and the failure never pollutes the primary/top-level detail.
 MIXED_FALLBACK_TWB = _viz_wb(
@@ -1027,6 +1027,143 @@ def test_workbook_pbip_is_openable_and_bound_bypath(tmp_path):
     s = report["summary"]
     assert s["workbooks_pbip_built"] == 1
     assert s["visuals_rebuilt"] >= 1
+
+
+# -- definition-of-done gate for workbook inputs (rm-dashboard-default-discoverability) ----------
+# A Tableau workbook migration is not "done" when only its semantic model lands -- its dashboards
+# must be rebuilt and bound into an openable .pbip. The estate CLI now emits a machine
+# definition-of-done ledger (report["definition_of_done"]) and a LOUD summary banner when a
+# workbook input produced no openable, model-bound report. It is soft-but-loud: additive, never
+# raises, never changes exit status. The one honest carve-out is a published-datasource workbook
+# whose published datasource was not migrated in the same run (recorded "skipped", not "failed").
+def test_definition_of_done_classifier_pass_fail_skip():
+    wb_details = [
+        {"name": "Bound WB", "pbip_status": "built", "bound_model": "M",
+         "pbip_folder": "pbip/Bound WB/Bound WB.pbip"},
+        {"name": "Multi WB",
+         "datasource_pbips": [{"pbip_status": "built"}, {"pbip_status": "skipped"}]},
+        {"name": "Orphan WB", "viz_status": "built", "pbip_status": "skipped",
+         "pbip_warnings": ["manual attention required: needs a storage decision -- "
+                           "workbook .pbip skipped"]},
+        {"name": "Published WB", "pbip_status": "skipped",
+         "binding_signal": {"kind": "published"},
+         "pbip_warnings": ["manual attention required: needs a storage decision"]},
+    ]
+    dod = me._definition_of_done(wb_details, pbip_enabled=True)
+
+    assert dod["applicable"] is True
+    assert dod["status"] == "failed"                       # any failure -> overall failed
+    assert dod["workbooks_total"] == 4
+    assert dod["reports_bound"] == 2                        # Bound WB + Multi WB (any DS built)
+    assert dod["reports_failed"] == 1                       # Orphan WB only
+    by_name = {e["workbook"]: e for e in dod["workbooks"]}
+    assert by_name["Bound WB"]["status"] == "pass"
+    assert by_name["Bound WB"]["report_bound"] is True
+    assert by_name["Multi WB"]["status"] == "pass"          # a multi-DS workbook with any DS bound
+    assert by_name["Orphan WB"]["status"] == "failed"
+    assert "needs a storage decision" in by_name["Orphan WB"]["reason"]
+    assert not by_name["Orphan WB"]["reason"].startswith("manual attention required")  # prefix stripped
+    assert by_name["Published WB"]["status"] == "skipped"   # the honest carve-out
+    assert "published" in by_name["Published WB"]["reason"].lower()
+
+
+def test_definition_of_done_classifier_pbip_disabled_and_empty():
+    # --no-pbip: the user opted out of openable projects -> skipped, never failed.
+    off = me._definition_of_done([{"name": "X", "pbip_status": "built"}], pbip_enabled=False)
+    assert off["status"] == "skipped"
+    assert off["workbooks"][0]["status"] == "skipped"
+    assert "no-pbip" in off["workbooks"][0]["reason"]
+    # No workbook inputs at all -> not applicable (a pure datasource run).
+    none = me._definition_of_done([], pbip_enabled=True)
+    assert none["applicable"] is False
+    assert none["status"] == "not_applicable"
+    assert none["workbooks"] == []
+
+
+def test_definition_of_done_pass_end_to_end(tmp_path):
+    src = InMemoryTableauSource(workbooks={"Exec Dashboard": SUPERSTORE_DASHBOARD_TWB})
+    out = tmp_path / "b"
+    report = migrate_estate(src, str(out))
+
+    dod = report["definition_of_done"]
+    assert dod["applicable"] is True
+    assert dod["status"] == "pass"
+    assert dod["reports_bound"] == 1
+    assert dod["workbooks"][0]["workbook"] == "Exec Dashboard"
+    assert dod["workbooks"][0]["report_bound"] is True
+
+    summary_md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "DEFINITION OF DONE: PASS" in summary_md
+
+
+def test_definition_of_done_failed_end_to_end_is_soft(tmp_path):
+    # An injected viz builds report parts, but the workbook has no embedded datasource to bind the
+    # rebuilt report to -> an ORPHANED report (the AAR failure). The gate must FAIL LOUD yet stay
+    # soft: migrate_estate still returns a report and writes the bundle (exit status unchanged).
+    def fake_viz(text, name):
+        return {"parts": {"definition/report.json": "{}"}, "note": "rebuilt 1 sheet"}
+
+    src = InMemoryTableauSource(workbooks={"Orphan Dashboard": "<workbook/>"})
+    out = tmp_path / "b"
+    report = migrate_estate(src, str(out), viz_stage=fake_viz)   # does not raise -> soft
+
+    dod = report["definition_of_done"]
+    assert dod["status"] == "failed"
+    assert dod["reports_failed"] == 1
+    entry = dod["workbooks"][0]
+    assert entry["workbook"] == "Orphan Dashboard"
+    assert entry["report_bound"] is False
+    assert entry["reason"]                                   # a concrete reason is recorded
+
+    summary_md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "DEFINITION OF DONE: FAILED" in summary_md
+    assert "Orphan Dashboard" in summary_md                  # the failing workbook is named loudly
+
+
+def test_definition_of_done_published_workbook_without_datasource_is_skipped(tmp_path):
+    # A published-datasource (sqlproxy) workbook migrated WITHOUT its published datasource in the run
+    # legitimately produces no bound report -- the named honest carve-out. It must be "skipped", not
+    # "failed", so a real co-migrate-the-datasource limitation never trips the loud FAILED banner.
+    src = InMemoryTableauSource(workbooks={"Published WB": PUBLISHED_DS_WORKBOOK_TWB})
+    out = tmp_path / "b"
+    report = migrate_estate(src, str(out))
+
+    wb = report["workbooks"][0]
+    assert (wb.get("binding_signal") or {}).get("kind") == "published"
+    dod = report["definition_of_done"]
+    assert dod["status"] == "skipped"
+    assert dod["reports_failed"] == 0
+    assert dod["workbooks"][0]["status"] == "skipped"
+
+    summary_md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "DEFINITION OF DONE: FAILED" not in summary_md
+
+
+def test_definition_of_done_not_applicable_for_datasource_only_run(tmp_path):
+    # A pure datasource run has no workbook inputs -> the gate is not applicable and adds no banner
+    # (the datasource-only summary head stays byte-identical to before the gate existed).
+    src = InMemoryTableauSource(datasources={"Orders DS": LIVE_TDS})
+    out = tmp_path / "b"
+    report = migrate_estate(src, str(out))
+
+    assert report["definition_of_done"]["applicable"] is False
+    assert report["definition_of_done"]["status"] == "not_applicable"
+    summary_md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "DEFINITION OF DONE" not in summary_md
+
+
+def test_definition_of_done_main_exits_zero_with_workbook(tmp_path, capsys):
+    # main() wires the gate and prints a loud one-liner, but exit status is unchanged (soft-but-loud).
+    src_dir = tmp_path / "in"
+    src_dir.mkdir()
+    (src_dir / "Exec Dashboard.twb").write_text(SUPERSTORE_DASHBOARD_TWB, encoding="utf-8")
+    out_dir = tmp_path / "out"
+
+    rc = me.main(["-i", str(src_dir), "-o", str(out_dir)])
+    assert rc == 0
+    printed = capsys.readouterr().out
+    assert "definition of done" in printed.lower()
+    assert (out_dir / "summary.md").read_text(encoding="utf-8").count("DEFINITION OF DONE") >= 1
 
 
 # A workbook whose only date column (Order Date) becomes the model's ACTIVE calendar date. The
@@ -1382,7 +1519,7 @@ def test_workbook_pbip_skipped_on_fallback_datasource(tmp_path):
     assert wb["viz_status"] == "built"
     assert wb["pbip_status"] == "skipped"
     assert wb["pbip_folder"] is None
-    assert any("lakehouse fallback" in w for w in wb["pbip_warnings"])
+    assert any("needs a storage decision" in w for w in wb["pbip_warnings"])
     assert all(w.startswith("manual attention required: ") for w in wb["pbip_warnings"])
     assert not (tmp_path / "b" / "pbip" / "Hana WB").exists()
     assert report["summary"]["workbooks_pbip_built"] == 0
@@ -1427,7 +1564,7 @@ def test_workbook_pbip_multi_datasource_projects_are_self_contained():
 
 
 def test_workbook_pbip_multi_datasource_isolates_per_datasource_failure():
-    # Per-datasource error isolation: when one embedded datasource routes to the lakehouse fallback
+    # Per-datasource error isolation: when one embedded datasource needs a storage decision
     # (SAP HANA here), it is skipped-loud with its OWN warning while the sibling SQL Server datasource
     # still builds. The failure never pollutes the primary/top-level detail (warn-never-wrong).
     with tempfile.TemporaryDirectory() as out:
@@ -1441,7 +1578,7 @@ def test_workbook_pbip_multi_datasource_isolates_per_datasource_failure():
         entries = {e["datasource"]: e for e in wb["datasource_pbips"]}
         assert entries["Sales Source"]["pbip_status"] == "built"
         assert entries["Hana Source"]["pbip_status"] == "skipped"
-        assert any("lakehouse fallback" in w for w in entries["Hana Source"]["pbip_warnings"])
+        assert any("needs a storage decision" in w for w in entries["Hana Source"]["pbip_warnings"])
         # the built sibling lands on disk; the skipped one writes no project
         base = os.path.join(out, "b", "pbip", "Mixed WB")
         assert os.path.isfile(os.path.join(base, "Sales Source", "Sales Source.pbip"))
@@ -1987,6 +2124,30 @@ def test_load_approved_dax_unreadable_json_raises(tmp_path):
     p = tmp_path / "bad.json"
     p.write_text("{ not json", encoding="utf-8")
     with pytest.raises(ValueError, match="not readable JSON"):
+        me._load_approved_dax(str(p))
+
+
+def test_load_approved_dax_accepts_dict_form_with_table(tmp_path):
+    # additive dict value form: {"dax": ..., "table": ...} lets an approval also name a home table.
+    p = tmp_path / "approved.json"
+    entry = {"dax": "\"US\"", "table": "REP"}
+    p.write_text(json.dumps({"Geo Tag": entry, "Running Amount": _APPROVED_RUNNING_AMOUNT_DAX}),
+                 encoding="utf-8-sig")
+    got = me._load_approved_dax(str(p))
+    assert got == {"Geo Tag": entry, "Running Amount": _APPROVED_RUNNING_AMOUNT_DAX}
+
+
+def test_load_approved_dax_dict_without_dax_string_raises(tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps({"Geo Tag": {"table": "REP"}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="calc name -> DAX"):
+        me._load_approved_dax(str(p))
+
+
+def test_load_approved_dax_dict_non_string_table_raises(tmp_path):
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps({"Geo Tag": {"dax": "\"US\"", "table": 5}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="calc name -> DAX"):
         me._load_approved_dax(str(p))
 
 

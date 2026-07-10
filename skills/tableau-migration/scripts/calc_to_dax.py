@@ -363,6 +363,22 @@ def _tokenize(formula):
             toks.append(("str", inner))
             i = j + 1
             continue
+        # Comments (Tableau): '//' to end of line, '/* ... */' block (may span newlines). They are
+        # documentation only and never affect the result, so they are stripped (emit no tokens).
+        # Placed AFTER the string-literal branch so a // or /* inside a quoted string is preserved,
+        # and BEFORE the operator scan so '/' is not first tokenized as division.
+        if c == "/" and i + 1 < n and s[i + 1] == "/":
+            j = i + 2
+            while j < n and s[j] not in "\r\n":
+                j += 1
+            i = j
+            continue
+        if c == "/" and i + 1 < n and s[i + 1] == "*":
+            j = s.find("*/", i + 2)
+            if j == -1:
+                raise _CalcError("unterminated block comment")
+            i = j + 2
+            continue
         two = s[i:i + 2]
         if two in _CMP_2:
             toks.append(("cmp", _CMP_2[two]))
@@ -608,9 +624,11 @@ class _Parser:
         while self._peek() == ("op", "+") or self._peek() == ("op", "-"):
             op = self._next()[1]
             right = self._mul()
-            if op == "+" and self.mode == "column" and left[1] == "text" and right[1] == "text":
+            if op == "+" and left[1] == "text" and right[1] == "text":
                 # Tableau '+' concatenates strings and PROPAGATES null; DAX '&' coerces a
                 # BLANK operand to "", so wrap to keep Tableau's null-propagating semantics.
+                # Valid in a measure too: only aggregated/scalar text (e.g. MIN([str]) or a
+                # literal) can reach here -- a bare row-level text field already rejects upstream.
                 left = (
                     f"IF(ISBLANK({left[0]}) || ISBLANK({right[0]}), BLANK(), {left[0]} & {right[0]})",
                     "text",
@@ -949,13 +967,18 @@ class _Parser:
             # Reject aggregates invalid for the column's data type (would emit DAX that errors).
             if name in _NUMERIC_ONLY_AGGS and tmdl_type not in _NUMERIC_TYPES:
                 raise _CalcError(f"{name} requires a numeric field, got {tmdl_type} for [{v}]")
-            if name in ("MIN", "MAX") and tmdl_type not in (_NUMERIC_TYPES | {"dateTime"}):
-                raise _CalcError(f"{name} requires a numeric/date field, got {tmdl_type} for [{v}]")
-            self.tables_used.add(table)
-            if name in ("MIN", "MAX") and tmdl_type == "dateTime":
-                dtype = "date"
+            if name in ("MIN", "MAX"):
+                # DAX single-column MIN/MAX accept number, text (alphabetical order) and date --
+                # matching Tableau MIN/MAX on those field types -- but NOT a boolean (that is MINA/
+                # MAXA). Reject boolean and any unmapped type (fail-closed); text stays text so the
+                # result can feed a string concat (the MIN()-wrapped tooltip idiom).
+                dtype = _DTYPE_BY_TMDL.get(tmdl_type)
+                if dtype not in ("number", "text", "date"):
+                    raise _CalcError(
+                        f"{name} requires a number/text/date field, got {tmdl_type} for [{v}]")
             else:
-                dtype = "number"  # SUM/AVG/MEDIAN/COUNT/COUNTD and numeric MIN/MAX
+                dtype = "number"  # SUM/AVG/MEDIAN/COUNT/COUNTD
+            self.tables_used.add(table)
             return (f"{_AGG_MAP[name]}({_dax_table(table)}{_dax_col(col)})", dtype)
         # Otherwise the argument is a conditional/arithmetic ROW-level expression
         # (e.g. SUM(IF c THEN v END), SUM([x] * [y])) -> fold with the X-iterator.

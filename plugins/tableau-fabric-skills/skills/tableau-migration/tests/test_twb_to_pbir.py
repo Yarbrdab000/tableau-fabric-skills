@@ -17,7 +17,9 @@ from twb_to_pbir import (
     SCHEMA_VISUAL,
     SCHEMA_VISUAL_FP,
     SCHEMA_VISUAL_SM,
+    _apply_override,
     _drop_resolved_flag_warnings,
+    _field_expression,
     _flag_filter_container,
     _norm_param_key,
     _reconcile_caption_fallback,
@@ -1016,6 +1018,70 @@ def test_real_countd_on_column_is_not_a_row_count():
     assert rows[0]["property"] == "Category"
 
 
+# -- implicit row count across a Tableau join-order prefix (AAR #1 Issue E) -----
+# When a physical table is added to a join Tableau stamps an order prefix on its name ("1. Login-
+# History"); the migrated model declares the clean table ("LoginHistory") and keys its COUNTROWS
+# measure clean. The implicit object-id COUNT (from the workbook) still carries the prefixed name,
+# so an exact-only match blanked the KPI card. The binding now normalises the prefix on either side.
+_HEX3 = "A1B2C3D4E5F607182930415263748596"
+_COL_OID_LOGIN = (f"<column caption='1. LoginHistory' datatype='integer' "
+                  f"name='[{_OID}].[LoginHistory_{_HEX3}]' role='measure' type='quantitative' />")
+_CI_CNT_LOGIN = (f"<column-instance column='[{_OID}].[LoginHistory_{_HEX3}]' derivation='Count' "
+                 f"name='[cnt:LoginHistory_{_HEX3}:qk]' pivot='key' type='quantitative' />")
+_OID_COUNT_PILL_LOGIN = f"[federated.abc].[{_OID}].[cnt:LoginHistory_{_HEX3}:qk]"
+
+
+def test_object_id_row_count_binds_across_tableau_order_prefix():
+    # workbook count names the prefixed physical table "1. LoginHistory"; the model measure is keyed
+    # by the clean table "LoginHistory" -> the KPI card binds (no silent blank, no warning).
+    ws = _worksheet("KPI", "Bar",
+                    rows=_OID_COUNT_PILL_LOGIN,
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST + _COL_OID_LOGIN + _CI_CNT_LOGIN)
+    rcb = {"measures": {"LoginHistory": {"entity": "_Measures", "measure": "count logins"}}}
+    ir = parse_twb(_workbook(ws), row_count_binding=rcb)
+    rows = ir["worksheets"][0]["rows"]
+    assert len(rows) == 1
+    f = rows[0]
+    assert f["binding"] == "measure" and f["entity"] == "_Measures" and f["property"] == "count logins"
+    assert _count_warns(ir) == []
+
+
+def test_strip_table_order_prefix_only_strips_the_tableau_shape():
+    from twb_to_pbir import _strip_table_order_prefix
+    assert _strip_table_order_prefix("1. LoginHistory") == "LoginHistory"
+    assert _strip_table_order_prefix("12.  Orders") == "Orders"      # multi-digit + extra space
+    assert _strip_table_order_prefix("LoginHistory") == "LoginHistory"
+    assert _strip_table_order_prefix("2024.Q1") == "2024.Q1"          # dot, no space -> untouched
+    assert _strip_table_order_prefix("3D Models") == "3D Models"      # no dot -> untouched
+    assert _strip_table_order_prefix("") == ""
+
+
+def test_row_count_measure_target_prefix_tolerant_both_directions():
+    from twb_to_pbir import _row_count_measure_target
+    # prefix on the workbook side, clean model key
+    rc_pref = {"kind": "object_id", "table": "1. LoginHistory", "candidates": ["1. LoginHistory"]}
+    clean = {"measures": {"LoginHistory": {"entity": "_Measures", "measure": "count logins"}}}
+    assert _row_count_measure_target(rc_pref, clean) == ("_Measures", "count logins")
+    # clean workbook side, prefixed model key (symmetric)
+    rc_clean = {"kind": "object_id", "table": "LoginHistory", "candidates": ["LoginHistory"]}
+    pref = {"measures": {"1. LoginHistory": {"entity": "_Measures", "measure": "count logins"}}}
+    assert _row_count_measure_target(rc_clean, pref) == ("_Measures", "count logins")
+
+
+def test_row_count_measure_target_prefix_match_must_be_unambiguous():
+    from twb_to_pbir import _row_count_measure_target
+    rc = {"kind": "object_id", "table": "LoginHistory", "candidates": ["LoginHistory"]}
+    # two model measures normalise to the same physical table -> ambiguous -> no bind (warn later)
+    ambiguous = {"measures": {"1. LoginHistory": {"entity": "_Measures", "measure": "A"},
+                              "2. LoginHistory": {"entity": "_Measures", "measure": "B"}}}
+    assert _row_count_measure_target(rc, ambiguous) is None
+    # an exact key still wins even when a normalised collision also exists
+    exact_wins = {"measures": {"LoginHistory": {"entity": "_Measures", "measure": "X"},
+                               "1. LoginHistory": {"entity": "_Measures", "measure": "Y"}}}
+    assert _row_count_measure_target(rc, exact_wins) == ("_Measures", "X")
+
+
 # -- caption fallback (no embedded metadata) -----------------------------------
 def test_caption_fallback_when_no_datasource_metadata_warns():
     # workbook WITHOUT a <datasources> metadata tree -> binding falls back to caption
@@ -1056,6 +1122,62 @@ def test_reconcile_caption_fallback_drops_model_confirmed_keeps_unverified():
     assert any("something unrelated" in r for r in reasons)
     # the internal marker never leaks into the surfaced warnings
     assert all("caption_fallback" not in w for w in out)
+
+
+# -- _apply_override: rebind a mis-roled ref to its real column (never a dangling measure) ------
+def _ir_field(caption, binding, *, entity="sqlproxy", prop=None, aggregation=None):
+    """Minimal IR field dict for the ``_apply_override`` / ``_field_expression`` seam."""
+    return {"caption": caption, "entity": entity, "property": prop or caption,
+            "binding": binding, "aggregation": aggregation}
+
+
+def test_apply_override_rebinds_measure_kind_ref_to_the_resolved_column():
+    # a ``measure``-kind pill whose caption the (columns-only) field_map resolves to a real model
+    # column must be rebound TO that column -- a ``{"Measure"}`` expr pointing at a column is invalid
+    fld = _ir_field("Region", "measure")
+    fm = {"Region": {"entity": "Orders", "property": "Region"}}  # real producer: no "binding" key
+    entity, prop, binding = _apply_override(fld, "Orders", fm)
+    assert (entity, prop, binding) == ("Orders", "Region", "column")
+    expr, qref, _ = _field_expression(fld, "Orders", fm)
+    assert "Column" in expr and "Measure" not in expr
+    assert qref == "Orders.Region"
+
+
+def test_apply_override_keeps_aggregation_pill_aggregation():
+    # a SUM([Sales]) pill in the field_map keeps its aggregation (entity corrected only) -- the
+    # documented invariant the change must not disturb
+    fld = _ir_field("Sales", "aggregation", aggregation="Sum")
+    fm = {"Sales": {"entity": "Orders", "property": "Sales"}}
+    entity, prop, binding = _apply_override(fld, "Orders", fm)
+    assert (entity, prop, binding) == ("Orders", "Sales", "aggregation")
+    expr, _, _ = _field_expression(fld, "Orders", fm)
+    assert "Aggregation" in expr
+
+
+def test_apply_override_keeps_plain_column_pill_column():
+    fld = _ir_field("Category", "column")
+    fm = {"Category": {"entity": "Orders", "property": "Category"}}
+    _, _, binding = _apply_override(fld, "Orders", fm)
+    assert binding == "column"
+
+
+def test_apply_override_measure_ref_not_in_field_map_stays_measure():
+    # the zero-regression guard: a genuine _Measures ref (row-count / measure_binding) whose caption
+    # is NOT in the columns-only field_map is untouched -- it must still emit a {"Measure"} expr
+    fld = _ir_field("count orders", "measure", entity="_Measures")
+    fm = {"Sales": {"entity": "Orders", "property": "Sales"}}
+    entity, prop, binding = _apply_override(fld, "Orders", fm)
+    assert (entity, prop, binding) == ("_Measures", "count orders", "measure")
+    expr, _, _ = _field_expression(fld, "Orders", fm)
+    assert "Measure" in expr and "Column" not in expr
+
+
+def test_apply_override_explicit_field_map_binding_wins():
+    # a producer that DOES stamp an explicit binding is honoured verbatim (guards the ``or`` path)
+    fld = _ir_field("Region", "measure")
+    fm = {"Region": {"entity": "Orders", "property": "Region", "binding": "column"}}
+    _, _, binding = _apply_override(fld, "Orders", fm)
+    assert binding == "column"
 
 
 def test_caption_fallback_warning_cleared_when_field_map_confirms_binding():

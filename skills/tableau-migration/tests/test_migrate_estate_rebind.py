@@ -41,7 +41,7 @@ ORDERS_TDS = """<?xml version='1.0' encoding='utf-8' ?>
   </column>
 </datasource>"""
 
-# SAP HANA datasource with no resolvable columns -> storage-mode land-to-Delta fallback.
+# SAP HANA datasource with no resolvable columns -> storage-mode needs-storage-decision fallback.
 FALLBACK_TDS = """<?xml version='1.0' encoding='utf-8' ?>
 <datasource formatted-name='Inventory Feed' version='18.1'>
   <connection class='saphana'>
