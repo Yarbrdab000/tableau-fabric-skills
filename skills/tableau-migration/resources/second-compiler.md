@@ -9,8 +9,10 @@ off** to a second compiler.
 > **The second compiler is the agent running this skill — not an embedded LLM API and not value
 > materialization.** Tier 0 emits a structured, *categorized* translation request; the agent reads
 > it, supplies the missing intent, authors a candidate DAX, **validates** it (syntactic always,
-> reconciliation oracle when data is landed), and only then asks for human approval to land it. The
-> deterministic guarantees never change, and **nothing goes live silently.**
+> reconciliation oracle when data is landed), and **automatically lands every candidate that passes
+> validation** — a mandatory, built-in stage, not an optional offer and not a human-approval prompt.
+> The deterministic guarantees never change, and **nothing goes live *unvalidated*** (an unverifiable
+> candidate stays an inert stub).
 
 This doc is the agent's operating contract. The deterministic *router* that categorizes each
 fallback lives in [`scripts/translation_router.py`](../scripts/translation_router.py); the handoff
@@ -42,39 +44,46 @@ Tier 1 (the Axis-A/Axis-B boundary behind every category), see the
                          │  2. supply the missing INTENT for the category                                │
                          │  3. author the LEANEST faithful candidate DAX                                  │
                          │  4. VALIDATE  (check_candidate_dax always; reconciliation oracle when landed) │
-                         │  5. present candidate + provenance + confidence + cost/caveat for approval     │
-                         │  6. on approval → land via approved_calc_dax  (name gains the ! prefix)        │
+                         │  5. LAND every VALIDATED candidate automatically via approved_calc_dax        │
+                         │  6. report what landed + provenance/confidence; unverifiable stays a stub     │
                          └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Tier 0 is the only thing that emits live DAX by default. A Tier-1 candidate is inert until a human
-approves it on the explicit `approved_calc_dax` pass — exactly the existing assisted-translation
-landing path (see SKILL.md § *Assisted translation*), generalized from a fixed idiom registry to the
-full categorized handoff.
+Tier 0 emits live DAX for the safe subset; the second compiler (Tier 1) runs **immediately after the
+deterministic pass and automatically** — landing every candidate that passes validation (the syntactic
+gate always, plus the reconciliation oracle whenever data is landed) through the same `approved_calc_dax`
+path. There is **no separate human-approval step and no path where the pass is skipped**; what cannot be
+validated stays an inert stub. Nothing lands *unvalidated* — the validation gate, not a human prompt, is
+the faithfulness guarantee. This generalizes the existing assisted-translation landing path (see SKILL.md
+§ *Assisted translation*) from a fixed idiom registry to the full categorized handoff.
 
 ---
 
-## When to start — the end-of-run check-in
+## When to start — immediately, automatically, always
 
-**Don't wait to be asked.** The moment a migration run finishes, inspect the report:
+The second compiler is a **mandatory, built-in stage of every migration** — not an optional add-on and
+not an end-of-run offer. It runs **immediately after the deterministic (Tier 0) pass**, the moment that
+pass leaves any calc stubbed. You do **not** wait to be asked, and there is **no path where it is
+skipped**: the chance the second compiler does not run must be zero.
+
+Inspect the report the instant the deterministic pass returns:
 `report["summary"]["needs_review_total"]` (estate path) or each datasource's
-`report["translation_handoff"]["summary"]["needs_review"]` (direct path). When it is `> 0`, the run
-left one or more calculations as inert stubs — so **proactively offer the second-compiler pass** as
-part of reporting the result, rather than silently handing back a model with `= 0` stubs.
+`report["translation_handoff"]["summary"]["needs_review"]` (direct path). When it is `> 0`, **announce a
+one-line gate and proceed on your own** — the gate is an *announcement, not a question*:
 
-The check-in is short and concrete: state how many calcs translated vs. stubbed, **name each stubbed
-calc** (and the one-line reason from its handoff entry), and ask whether to run them through the
-second compiler now. The estate orchestrator also writes this list into `summary.md` under a
-**Next step — assisted (second-compiler) translation** heading, so the offer is durable even when the
-run was unattended.
+> `▶ Starting second compiler — N of M calculations translated deterministically; K need review:`
+> `` `<Calc A>` ``, `` `<Calc B>` ``, … authoring and validating candidates now.`
 
-> _Phrasing template:_ "This migration translated N of M calculations. K fell back to stubs (original
-> formulas preserved): `<Calc A>`, `<Calc B>`, … Want me to run these through the second compiler now
-> (author candidate DAX → `check_candidate_dax` → land via `approved_calc_dax`)?"
+Then work the loop below for every needs-review calc. The estate orchestrator also writes the same list
+into `summary.md` under a **Next step — second compiler (MANDATORY, run now)** heading, so the mandatory
+pass is picked up even when the run was unattended. Never hand back a model with `= 0` stubs without
+having run this pass over them first.
 
-If the user declines, leave the stubs inert (the `TableauFormula` annotation is preserved for later).
-If they accept, work the loop below. Either way the **faithful-or-stub** invariant holds — a declined
-or unfinished calc stays a stub, never a guess.
+The **faithful-or-stub** invariant binds at the *landing* step, not the *run* step: the second compiler
+**always runs**, but a calc with no faithful DAX form (an unverifiable `dax_language_gap` approximation,
+an unrecoverable addressing intent) stays an inert stub with its `TableauFormula` preserved. You never
+skip the pass; you also never land a guess — the validation gate below is what enforces that, in place of
+a human approval prompt.
 
 ---
 
@@ -208,18 +217,18 @@ A candidate is **not** acceptable just because it parses.
   returned as `best` until it is VERIFIED (it stays listed at its medium grade for you to reconcile or
   revise) — the same faithful-or-stub rule the gate enforces, applied to selection. This is the
   optional acceleration tier's **selection** step: it ranks by **semantic equivalence, not string
-  similarity**, and — like everything in Tier 1 — lands nothing; the chosen candidate still flows
-  through `approved_calc_dax` and the human gate. Its `confidence` is the **semantic** signal that
-  feeds the §output-contract `confidence` field above.
+  similarity**, and — like everything in Tier 1 — lands nothing itself; the chosen candidate still flows
+  through `approved_calc_dax` after clearing the validation gate. Its `confidence` is the **semantic**
+  signal that feeds the §output-contract `confidence` field above.
 - For a `dax_language_gap` approximation, the oracle match is **mandatory** before proposing — an
   unverifiable approximation stays a stub. (The syntactic gate emits a warning reminder for this
   category when you thread the request through as `request=`.)
 
 ---
 
-## Landing an approved candidate
+## Landing a validated candidate
 
-Landing reuses the existing two-pass assisted path — no new mechanism:
+Landing reuses the existing two-pass path — no new mechanism:
 
 ```python
 from assemble_model import migrate_tds_to_semantic_model
@@ -229,15 +238,15 @@ out = migrate_tds_to_semantic_model(tds_text, model_name="Superstore", calcs=cal
 ho = out["report"]["translation_handoff"]
 # group ho["requests"] by ["category"]; author + validate candidates for the ones you can.
 
-# Human approves a subset. Pass 2 — flip approved candidates into live objects:
+# Pass 2 — flip every VALIDATED candidate into a live object (automatic; no human-approval step):
 approved = {"Running Sales": "<validated candidate DAX>"}          # {calc_name: dax}, case-insensitive
 final = migrate_tds_to_semantic_model(tds_text, model_name="Superstore",
                                       calcs=calcs, approved_calc_dax=approved)
 ```
 
-- Approval is **batch, not per-calc** — present the check-in (*"N of M translated faithfully; these
-  X need review — [grouped by category] — author candidates?"*), then land the approved subset in one
-  pass.
+- Landing is **batch, not per-calc** — validate all the candidates you can (syntactic gate always,
+  oracle when data is landed), then land the whole validated set in one pass. There is no per-calc
+  human-approval prompt; the validation gate is what authorizes a candidate to land.
 - Every second-compiler field is named with a leading **`!`** (configurable) so it stands out for
   review and clusters at the top of the field list; the `!` means *"not from the trusted
   deterministic path."* Verified vs. unverified state lives in the `TranslatedBy` metadata — names
@@ -248,12 +257,15 @@ final = migrate_tds_to_semantic_model(tds_text, model_name="Superstore",
 
 ## Hard safety invariants (all tiers)
 
-1. **Faithful-or-stub.** Anything correct only in a narrow context is a stub or an approval-gated
-   suggestion — never silent live DAX.
-2. **Tier 0 is untouched.** The second compiler only adds approval-gated candidates; it never
+1. **Faithful-or-stub.** Anything correct only in a narrow context is a stub or a validation-gated
+   candidate — never silent, unvalidated live DAX.
+2. **Tier 0 is untouched.** The second compiler only adds validation-gated candidates; it never
    changes the deterministic output or its guarantees.
-3. **A default run adds ZERO live assisted objects.** Candidates are surfaced as suggestions and go
-   live only on explicit `approved_calc_dax`.
+3. **Landing stays explicit; the pass is not optional.** A single migrate call with no
+   `approved_calc_dax` adds ZERO live assisted objects — landing always happens on the explicit
+   `approved_calc_dax` pass, so the deterministic default is never mutated implicitly. The agent
+   performs that pass **automatically, as a mandatory stage** (it is never skipped); "explicit" is
+   about the *mechanism*, not an opportunity to opt out.
 4. **Leanness ladder — stop at the FIRST faithful rung:** (1) inline expression in a single
    measure/column → (2) one extra calculated column → (3) a small bounded set of cooperating objects
    → (4) a real dimension table + relationship *when a PBI modeler genuinely would* → (5) honest stub
@@ -285,5 +297,5 @@ fields           = [ {caption:"Sales", kind:"field", …},
    usage falls outside the emitter's grammar.
 4. **Validate:** `check_candidate_dax` ✓ (balanced, not a stub, no leftover Tableau idioms); oracle
    at a fixed Growth Rate value vs Tableau with the same parameter ✓.
-5. **Cost line:** "adds 1 disconnected parameter table + 1 measure; value follows the slicer." →
-   present for approval → land via `approved_calc_dax`.
+5. **Land:** note the cost ("adds 1 disconnected parameter table + 1 measure; value follows the
+   slicer") in the report, then land automatically via `approved_calc_dax` — no approval prompt.

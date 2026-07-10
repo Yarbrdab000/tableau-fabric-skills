@@ -3,6 +3,7 @@ import pytest
 
 from connection_to_m import (
     build_m_field_resolver,
+    combine_descriptors,
     connection_details_for_bind,
     custom_sql_parameter_refs,
     emit_connection_parameters,
@@ -2637,3 +2638,125 @@ def test_flatfile_without_source_folder_still_absolute(tmp_path):
     assert "SourceFolder" not in orders_m
     assert "File.Contents(" in orders_m
     assert "SourceFolder" not in emit_connection_parameters(d)
+
+
+# -- combine_descriptors: workbook's many embedded datasources -> ONE model (islands) ---------
+
+def _desc(name, tables, *, relationships=None, logical=None, connections=None, **scalars):
+    """Tiny descriptor shaped like parse_tds output (only the keys combine_descriptors reads)."""
+    base = {
+        "datasource_name": name, "connection_class": "federated", "is_extract": True,
+        "relations": [{"kind": "table", "name": t, "columns": [{"model_name": "X"}]}
+                      for t in tables],
+        "relationships": list(relationships or []),
+        "logical_fields": list(logical or []),
+        "connections": dict(connections or {}),
+        "relationship_warnings": [], "unsupported_reasons": [],
+    }
+    base.update(scalars)
+    return base
+
+
+def test_combine_descriptors_unions_every_table_no_drop():
+    a = _desc("Sales", ["Orders", "Customers"],
+              relationships=[{"from_table": "Orders", "from_col": "CustID",
+                              "to_table": "Customers", "to_col": "ID"}],
+              logical=[{"caption": "Sales", "table": "Orders", "physical_col": "Sales"}],
+              connections={"c.a": {"class": "sqlserver"}})
+    b = _desc("Finance", ["Ledger"],
+              logical=[{"caption": "Amount", "table": "Ledger", "physical_col": "Amt"}],
+              connections={"c.b": {"class": "snowflake"}})
+    combined = combine_descriptors([a, b], captions=["Sales", "Finance"])
+    names = [r["name"] for r in combined["relations"]]
+    assert names == ["Orders", "Customers", "Ledger"]        # every table carried, none dropped
+    assert len(combined["relationships"]) == 1
+    assert {lf["table"] for lf in combined["logical_fields"]} == {"Orders", "Ledger"}
+    assert combined["connections"] == {"c.a": {"class": "sqlserver"},
+                                       "c.b": {"class": "snowflake"}}
+
+
+def test_combine_descriptors_disambiguates_colliding_table_and_rewrites_refs():
+    # Both datasources have an 'Orders' table -> the SECOND is renamed so neither table file is
+    # overwritten (zero silent drops), and its relationship + logical-field refs are rewritten.
+    a = _desc("Sales", ["Orders"],
+              logical=[{"caption": "Sales", "table": "Orders", "physical_col": "Sales"}])
+    b = _desc("Finance", ["Orders", "Ledger"],
+              relationships=[{"from_table": "Orders", "from_col": "LID",
+                              "to_table": "Ledger", "to_col": "ID"}],
+              logical=[{"caption": "Amount", "table": "Orders", "physical_col": "Amt"}])
+    combined = combine_descriptors([a, b], captions=["Sales", "Finance"])
+    names = [r["name"] for r in combined["relations"]]
+    assert names == ["Orders", "Orders (Finance)", "Ledger"]  # collision disambiguated, nothing lost
+    rel = combined["relationships"][0]                        # renamed endpoint follows the rename
+    assert rel["from_table"] == "Orders (Finance)" and rel["to_table"] == "Ledger"
+    fin = [lf for lf in combined["logical_fields"] if lf["caption"] == "Amount"][0]
+    assert fin["table"] == "Orders (Finance)"                # Finance's field -> renamed table
+    sal = [lf for lf in combined["logical_fields"] if lf["caption"] == "Sales"][0]
+    assert sal["table"] == "Orders"                          # Sales's field -> untouched original
+
+
+def test_combine_descriptors_single_is_passthrough():
+    a = _desc("Solo", ["Orders"])
+    assert combine_descriptors([a]) is a
+
+
+def test_combine_descriptors_empty_raises():
+    with pytest.raises(ValueError):
+        combine_descriptors([])
+
+
+TWO_DATASOURCE_WB = """<?xml version='1.0' encoding='utf-8' ?>
+<workbook>
+  <datasources>
+    <datasource caption='Sales' formatted-name='federated.sales' inline='true'>
+      <connection class='federated'>
+        <named-connections>
+          <named-connection caption='s1' name='sqlserver.sales'>
+            <connection authentication='sqlserver' class='sqlserver' dbname='SalesDB'
+                        server='sql.example.com' username='svc' />
+          </named-connection>
+        </named-connections>
+        <relation connection='sqlserver.sales' name='Orders' table='[dbo].[Orders]' type='table' />
+        <metadata-records>
+          <metadata-record class='column'>
+            <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+            <parent-name>[Orders]</parent-name><local-type>real</local-type>
+          </metadata-record>
+        </metadata-records>
+      </connection>
+      <column caption='Sales' datatype='real' name='[Sales]' role='measure' type='quantitative' />
+      <cols><map key='[Sales]' value='[Orders].[Sales]' /></cols>
+    </datasource>
+    <datasource caption='Finance' formatted-name='federated.finance' inline='true'>
+      <connection class='federated'>
+        <named-connections>
+          <named-connection caption='f1' name='snowflake.fin'>
+            <connection authentication='oauth' class='snowflake' dbname='FinDB'
+                        server='acct.snowflakecomputing.com' warehouse='WH' />
+          </named-connection>
+        </named-connections>
+        <relation connection='snowflake.fin' name='Ledger' table='[PUBLIC].[Ledger]' type='table' />
+        <metadata-records>
+          <metadata-record class='column'>
+            <remote-name>Amount</remote-name><local-name>[Amount]</local-name>
+            <parent-name>[Ledger]</parent-name><local-type>real</local-type>
+          </metadata-record>
+        </metadata-records>
+      </connection>
+      <column caption='Amount' datatype='real' name='[Amount]' role='measure' type='quantitative' />
+      <cols><map key='[Amount]' value='[Ledger].[Amount]' /></cols>
+    </datasource>
+  </datasources>
+</workbook>
+"""
+
+
+def test_combine_descriptors_from_real_two_datasource_workbook():
+    from connection_to_m import workbook_datasources
+    labels = [d["label"] for d in workbook_datasources(TWO_DATASOURCE_WB)]
+    assert len(labels) == 2
+    descriptors = [parse_tds(TWO_DATASOURCE_WB, lbl) for lbl in labels]
+    combined = combine_descriptors(descriptors, captions=labels)
+    names = {r["name"] for r in combined["relations"] if r.get("kind") in ("table", "custom_sql")}
+    assert names == {"Orders", "Ledger"}            # both datasources' tables in ONE descriptor
+    assert len(combined["connections"]) == 2        # each table still routes to its own source

@@ -40,7 +40,7 @@ Phase 0  Connectivity .......... authenticate to Tableau (REST/Metadata/VDS) and
 Phase 1  Extract source ........ Download Data Source -> .tds ; parse_tds() -> descriptor
 Phase 2  Storage mode .......... select_storage_mode(descriptor) -> Import | DirectQuery | fallback
 Phase 3  Rebuild model ......... TMDL tables + typed columns + inferred relationships
-Phase 4  Calc -> DAX ........... translate the safe subset; preserve every formula as annotation
+Phase 4  Calc -> DAX ........... Tier 0 translates the safe subset (formula kept as annotation), then the second compiler (Tier 1) runs automatically over any stubs
 Phase 5  Connection ............ emit M partitions + bind the Fabric Data Connection
 Phase 6  Deploy & refresh ...... bundled deploy_to_fabric.py — model + report (--pbip) (or DELEGATE model to semantic-model-authoring)
 Final    Validate ............... reconcile ExecuteQuery vs VDS ; emit the migration report
@@ -113,6 +113,17 @@ dax, reason, _ = translate_tableau_calc_to_dax(formula, resolve)
 A non-`None` `dax` is a real translation; `None` means the formula is outside the safe subset and must be
 emitted as an inert `= 0` stub. **Always** attach the original formula as a `TableauFormula` annotation.
 See `calc-to-dax.md`.
+
+**Then run the second compiler — immediately, automatically, always.** The deterministic pass above is
+Tier 0; the moment it leaves any calc as a stub (`needs_review_total > 0`), the **second compiler (Tier 1)
+runs as a mandatory, built-in stage of the same migration** — not an optional add-on and not an
+end-of-run offer. Announce a one-line gate (`▶ Starting second compiler — N of M translated; K need
+review …`) and proceed on your own: for each stubbed calc, read its categorized handoff request, author
+the leanest faithful candidate DAX, **validate** it (`check_candidate_dax` always; the reconciliation
+oracle when data is landed), and **land every validated candidate automatically via `approved_calc_dax`**.
+There is no human-approval prompt and no path where this pass is skipped — the validation gate, not a
+person, is the faithfulness guarantee, and a candidate that cannot be validated stays an inert stub. Full
+playbook: `second-compiler.md`.
 
 ## Phase 5 — Connection → M partition + bind
 

@@ -2330,7 +2330,7 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                   hierarchies=None, display_folders=None, rls_roles=None,
                                   date_table=True, mark_as_date=True, flatfile_path=None,
                                   approved_calc_dax=None, date_range=None, select=None,
-                                  parameters=None, table_calc_usages=None):
+                                  parameters=None, table_calc_usages=None, descriptor=None):
     """One-call convenience: parse ``.tds``/``.twb`` text and assemble the Import/DirectQuery model.
 
     ``calcs`` are the MEASURE-role calculated fields and ``dim_calcs`` the DIMENSION/row-level ones
@@ -2362,8 +2362,14 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
     ``assisted_suggestions`` lists every idiom match for review; re-run with the approved subset to
     emit them. A cross-calc reference lookup is built from the FULL ``.tds`` (captions + internal
     ``Calculation_*`` names) so an argmax calc that points at a separate "max" calc resolves.
+
+    ``descriptor`` optionally supplies a pre-built parse (e.g. a ``combine_descriptors`` union of a
+    workbook's several embedded datasources). When given, the internal ``parse_tds`` is skipped and
+    the model is built from it verbatim -- so every relation across every combined island lands in the
+    ONE model. ``None`` (default) re-parses ``tds_text`` as before, so existing callers are unchanged.
     """
-    descriptor = parse_tds(tds_text, select)
+    if descriptor is None:
+        descriptor = parse_tds(tds_text, select)
     if relationships is None:
         relationships = descriptor.get("relationships") or []
     if parameters is None:
@@ -2779,6 +2785,7 @@ def materialize_bundled_flatfile_data(packaged_source, descriptor, dest_dir, *, 
 
 
 def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, datasource=None,
+                       descriptor=None,
                        calcs=None, dim_calcs=None, approved_calc_dax=None, date_range=None,
                        local_data=None, packaged_source=None, flatfile_dest_dir=None, **kwargs):
     """**One call** from a downloaded datasource to everything needed to land it in Fabric.
@@ -2834,7 +2841,7 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
     step (``deploy_to_fabric.py``) -- this function never touches the network or credentials.
     """
     tds_text = _read_tds_source(source)
-    if datasource is None:
+    if descriptor is None and datasource is None:
         try:
             available = workbook_datasources(tds_text)
         except Exception:
@@ -2851,7 +2858,8 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
         except Exception:
             calcs = None
 
-    descriptor = parse_tds(tds_text, datasource)
+    if descriptor is None:
+        descriptor = parse_tds(tds_text, datasource)
     decision = select_storage_mode(descriptor)
 
     # Strict role->mode routing: when calcs were auto-extracted, split off dimension-role calcs to
@@ -2922,6 +2930,7 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
         _split_auto_calcs()
         result = migrate_tds_to_semantic_model(
             tds_text, model_name=model_name, calcs=calcs, dim_calcs=dim_calcs, select=datasource,
+            descriptor=descriptor,
             approved_calc_dax=approved_calc_dax, date_range=date_range, **kwargs)
 
     # Additive, honest record of how flat-file data was (or was not) landed, so a caller -- and the

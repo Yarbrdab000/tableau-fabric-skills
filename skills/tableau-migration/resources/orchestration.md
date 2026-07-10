@@ -167,9 +167,10 @@ estate — a live `TableauSource` plus a `wb_id`. `write_to` (required) is the o
 `name=` overrides the display name of a standalone workbook (default: the file stem, or `"workbook"`
 for raw XML); `pbip=False` writes only the bare `reports/<Name>.Report`. Returns the same per-workbook
 **detail dict** the estate reports (`name`, `viz_status`, `pbip_status`, `bound_model` /
-`bound_datasource`, `pbip_folder`, `viz_fidelity`, …); a multi-datasource workbook nests one project
-per datasource. Only invalid **arguments** raise (e.g. a missing `write_to`) — a per-workbook migration
-failure is reported on the returned detail, never raised.
+`bound_datasource`, `pbip_folder`, `viz_fidelity`, …); a multi-datasource workbook consolidates every
+embedded datasource into one model (disconnected table islands, each bound to its own connection) with a
+single report bound to it. Only invalid **arguments** raise (e.g. a missing `write_to`) — a per-workbook
+migration failure is reported on the returned detail, never raised.
 
 **One code path.** `migrate_estate` loops exactly this function once per workbook, so a standalone
 workbook migration and an estate workbook migration are the same operation — the estate simply runs it
