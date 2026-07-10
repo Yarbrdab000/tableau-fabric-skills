@@ -806,8 +806,9 @@ def _apply_model_post_ops(args, summary):
         if pbi:
             c_status, c_body = recalc_dataset(summary["workspace_id"], item_id, pbi)
             if c_status in (200, 202):
-                print(f"[recalc] ProcessRecalc started (HTTP {c_status}) -- processes Import calc "
-                      "tables (Date table, _Measures); no credentials required.")
+                print(f"[recalc] ProcessRecalc STARTED asynchronously (HTTP {c_status}) -- fire-and-"
+                      "forget, NOT polled to completion (the model deploy above IS). Processes Import "
+                      "calc tables (Date table, _Measures); no credentials required; best-effort.")
             else:
                 print(f"[recalc] non-fatal (HTTP {c_status}): {c_body}")
 
