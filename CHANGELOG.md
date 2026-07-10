@@ -13,6 +13,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Fixed
+- **tableau-migration:** **the runbook's opening phases are now mechanical — the agent no longer
+  deliberates before `GO`.** Three latent `SKILL.md` defects stalled an agent at Phase 0: (1) no
+  working-directory anchor — every command used a bare `.\` with no pinned cwd, so the agent had to
+  reason about where the installed skill lived and where outputs should land; (2) `GATE RULE 3`
+  forbade "early script execution" yet Phase 0B told the agent to write and dot-source
+  `migration.vars.local.ps1`, a contradiction it had to resolve itself; and (3) the fetch step wrote
+  into `.\tds`, which collides with the skill's bundled sample datasources, so D2 scope could
+  silently widen. The runbook now pins `$SKILL` (skill dir) plus a fresh, empty `$RUN` (working dir)
+  once in Phase 0B, routes every call as `py -3.11 "$SKILL\scripts\<name>.py"`, and fetches into a
+  fresh `.\in` under `$RUN` (never `$SKILL`) — so "scope = whatever is in `-i`" holds by construction.
+  `GATE RULE 3` now states that pinning and writing the git-ignored vars file is pre-`GO` local setup,
+  while `GO` still gates every STEP 1–3 script. Also adds a one-line second-compiler zero-guard
+  (`needs_review_total == 0` → stage auto-satisfied, skip without re-reading the report), a
+  `--model-name` / name-derivation note, a `.tds`+`.tdsx` same-stem dedup note, a PowerShell quoting
+  note for names with spaces/parens/apostrophes, an honest D4 skip/stop note (deploy is
+  createOrUpdate-only, no flag), and `.\in` cleanup guidance for the sensitive fetched inputs.
+  Documentation-only: no script, report-schema, or test-behavior change; the plugin mirror is updated
+  in lockstep.
 - **tableau-migration:** **multi-line Custom SQL no longer emits undeployable TMDL.** The M-string
   escaper (`connection_to_m.escape_m_string`, used by both the `Value.NativeQuery` and `Odbc.Query`
   custom-SQL partition paths) only escaped double quotes, so a Custom SQL query spanning several
