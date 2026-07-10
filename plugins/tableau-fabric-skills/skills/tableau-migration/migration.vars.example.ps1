@@ -21,6 +21,9 @@ $SECRET_NAME = "<pat-secret-name>"          # secret whose value is the PAT secr
 # --- Fabric target (STEP 3 deploy; omit if D3=C / local only) ---
 $FABRIC_WORKSPACE = "<fabric-workspace>"    # target Fabric workspace name or GUID
 
+# --- Azure subscription (OPTIONAL) — set ONLY if your `az` CLI default isn't the sub holding the KV / capacity ---
+$SUBSCRIPTION_ID = ""                        # e.g. "00000000-0000-0000-0000-000000000000"; leave "" to use the az default
+
 # --- Connected App JWT (D5=B only) — leave as-is unless using JWT ---
 $CA_CLIENT_ID = "<connected-app-client-id>"
 $CA_SECRET_ID = "<connected-app-secret-id>"

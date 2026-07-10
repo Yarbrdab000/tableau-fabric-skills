@@ -102,6 +102,7 @@ PAT/Connected-App secret into chat.
 | `KV_NAME` | Azure Key Vault holding the secret value (**D6=A only**) |
 | `SECRET_NAME` | the Key Vault secret whose value is the PAT (or Connected-App) secret (**D6=A only**) |
 | `FABRIC_WORKSPACE` | target Fabric workspace name or GUID (only if D3 ≠ C) |
+| `SUBSCRIPTION_ID` | *(optional)* Azure subscription that holds the Key Vault / Fabric capacity — set **only** if your `az` CLI default subscription isn't already it (**D6=A or `--use-az`**) |
 
 If **D5=B**, also collect the Connected App `CLIENT_ID`, `SECRET_ID`, and impersonation
 `JWT_USERNAME` (the secret value comes from Key Vault or the terminal prompt) instead of `PAT_NAME`.
@@ -134,6 +135,7 @@ New-Item -ItemType Directory -Force -Path $RUN | Out-Null ; Set-Location $RUN ; 
 Copy-Item "$SKILL\migration.vars.example.ps1" .\migration.vars.local.ps1   # once
 # fill migration.vars.local.ps1 with the real values (it is git-ignored), then:
 . .\migration.vars.local.ps1
+if ($SUBSCRIPTION_ID) { az account set --subscription $SUBSCRIPTION_ID }   # only if your az default sub isn't the one holding the KV / Fabric capacity
 ```
 
 `migration.vars.example.ps1` is committed with **placeholders**; `migration.vars.local.ps1` holds
@@ -205,6 +207,12 @@ foreach ($name in @("<Workbook A>")) {                       # D2 workbook scope
 }
 ```
 
+> **One process, one call — read the secret and fetch in the SAME call.** Every PowerShell/terminal call
+> is a **fresh process**, so an env var set in one call (like `TABLEAU_PAT_VALUE` from the `az keyvault`
+> line) is **gone** by the next. Run the `az keyvault` read and the fetch loop as the **single block
+> above** — never "verify" the Key Vault read in its own separate call (that read evaporates and you just
+> re-do it).
+
 `--include-extract` is **always on** — required for an extract/flat-file source, harmless on a live DB
 source (Tableau returns the `.tds` with no `.hyper`) — so it is never a per-source decision. Auth/secret
 flags come straight from the menu, never re-derived here: **D6=B** → omit the `az keyvault` line, leave
@@ -273,12 +281,14 @@ list the workspace first and branch yourself — pre-fetch existing model names,
 folders from the loop, and for C halt and ask on the first name that already exists. If a model binds an
 on-prem source, add `--gateway-id <id>`.
 
-> Each deploy also runs a **credential-free ProcessRecalc** by default so the model opens without
-> benign "needs refresh" warning triangles (see *After deploy: the credential-binding wall* below).
-> Pass `--no-recalc` to skip it.
+> Each deploy also fires a **credential-free ProcessRecalc** by default so the model opens without
+> benign "needs refresh" warning triangles (see *After deploy: the credential-binding wall* below). It is
+> **best-effort and asynchronous — started, not polled to completion** (unlike the model-deploy LRO that
+> Checkpoint 3 waits on), so its `202` means *accepted*, not *finished*. Pass `--no-recalc` to skip it.
 
-**Checkpoint 3:** each deploy completes its LRO without error. Any failure → **STOP and ask**, do not
-continue or retry with altered flags.
+**Checkpoint 3:** each deploy completes its **model-deploy LRO** without error (the follow-on ProcessRecalc
+is best-effort/async — started, not awaited; a non-`2xx` there is logged non-fatal, not a stop). Any deploy
+failure → **STOP and ask**, do not continue or retry with altered flags.
 If D3=B (Fabric only), remove `.\out` after a clean deploy; if D3=A, keep it. Either way the fetched
 inputs in `.\in` are **sensitive** (they carry the datasource's connection details and any embedded
 extract data) — delete `.\in` once the run is verified, unless the user asked to keep it. Never commit
@@ -288,6 +298,15 @@ bash equivalent: same flags with `python3.11` instead of `py -3.11`; export the 
 your shell (or a local, git-ignored file you `source`) and read the secret with
 `az keyvault secret show --vault-name "$KV_NAME" --name "$SECRET_NAME" --query value -o tsv` into
 `TABLEAU_PAT_VALUE`.
+
+**STEP 4 — value reconciliation (post-bind; the check that makes "migrated" mean "numbers match")**
+
+Deploy proves the model is **structurally** correct; it does **not** prove the numbers match Tableau. That
+proof is **value reconciliation** — `executeQueries` DAX vs the Tableau VDS — and it is **blocked until the
+human credential bind** (see *After deploy: the credential-binding wall* below), because the model can't be
+queried until its connection is bound. So **queue it as an explicit follow-up**, never skip it silently: the
+moment credentials are bound, run the reconciliation per [validation-reconciliation.md](resources/validation-reconciliation.md).
+Until then, report the model as **structurally migrated — numbers not yet verified**, never as "verified."
 
 <!-- ===== Run contract ends; detailed reference body below ===== -->
 
@@ -685,7 +704,8 @@ first refresh. `deploy_to_fabric.py` prevents this by running a **credential-fre
 and hierarchies — **no `ProcessData`, so it needs no datasource credentials and never queries the
 DirectQuery source** (verified even against an unreachable source) — mirroring how Power BI Desktop
 recalculates a model when it is opened. This is **on by default**; pass `--no-recalc` to skip it. It
-uses a Power BI token (`--use-az` or `POWERBI_TOKEN`) and is **best-effort** — if no token is available
+uses a Power BI token (`--use-az` or `POWERBI_TOKEN`) and is **best-effort and asynchronous** — it is
+**started, not polled to completion** (a `202` is *accepted*, not *finished*), and if no token is available
 the deploy still succeeds and simply logs that recalc was skipped.
 
 **DirectQuery relationship cardinality (opt-in polish).** An authored Tableau object-graph join is

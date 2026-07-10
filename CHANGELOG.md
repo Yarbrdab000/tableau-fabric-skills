@@ -40,6 +40,20 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   itself), and warns against spawning a duplicate model for a datasource migrated both standalone and
   inside a workbook (pass `--model-name` to overwrite). Report-schema change is additive only
   (`pbip_write_error`); the plugin mirror is updated in lockstep.
+- **tableau-migration:** **post-deploy status and pre-`GO` setup read more honestly, from a clean first
+  run of the long-path build.** Four small runbook/reporting gaps surfaced by an after-action review:
+  (1) the credential-free **ProcessRecalc is now described — and logged — as asynchronous and
+  best-effort, _started_ but not polled to completion** (unlike the model-deploy LRO, which `Checkpoint 3`
+  still waits on), so a `202` is reported as _accepted_, not _finished_; (2) `SKILL.md` now states the
+  **fresh-process rule** — every PowerShell call is a new process, so the Key Vault secret read and the
+  fetch loop must run in the **same** call (never "verify" the read in a separate call, or the
+  `TABLEAU_PAT_VALUE` env var evaporates and is re-fetched); (3) an explicit **STEP 4 — value
+  reconciliation** names the post-credential-bind `executeQueries`-vs-Tableau-VDS check as the step that
+  turns "structurally migrated" into "numbers verified," so it is queued as a follow-up rather than
+  silently skipped and a model is never reported "verified" before it is; and (4) an **optional
+  `SUBSCRIPTION_ID`** is collected up front (vars template + a guarded `az account set`) so a non-default
+  Azure subscription no longer forces an improvised choice mid-run. Documentation plus one cosmetic
+  deploy log string; no report-schema or translation change; the plugin mirror is updated in lockstep.
 - **tableau-migration:** **the runbook's opening phases are now mechanical — the agent no longer
   deliberates before `GO`.** Three latent `SKILL.md` defects stalled an agent at Phase 0: (1) no
   working-directory anchor — every command used a bare `.\` with no pinned cwd, so the agent had to
