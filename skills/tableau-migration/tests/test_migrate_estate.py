@@ -71,7 +71,7 @@ WIDGET_SALES_TDS = """<?xml version='1.0' encoding='utf-8' ?>
   </column>
 </datasource>"""
 
-# An unmapped connector class -> land-to-Delta + DirectLake fallback.
+# An unmapped connector class -> needs-storage-decision fallback (DirectLake is opt-in, not default).
 INVENTORY_FEED_TDS = """<?xml version='1.0' encoding='utf-8' ?>
 <datasource formatted-name='Inventory Feed' inline='true' version='18.1'>
   <connection class='federated'>
@@ -434,7 +434,7 @@ def test_migrate_estate_records_fallback_with_reason(fixtures_dir, tmp_path):
     assert len(report["fallbacks"]) == 1
     fb = report["fallbacks"][0]
     assert fb["datasource"] == "inventory_feed"
-    assert fb["fallback_path"] == "land-to-delta-directlake"
+    assert fb["fallback_path"] == "needs-storage-decision"
     assert "saphana" in fb["reason"]
 
     detail = next(d for d in report["datasources"] if d["name"] == "inventory_feed")
@@ -609,7 +609,7 @@ def test_assemble_layer_value_error_is_fallback(tmp_path, monkeypatch):
     # A non-fallback storage decision, but the assembler itself signals a fallback
     # (e.g. "no table produced columns") -> must be classified fallback, not error.
     def boom(descriptor, **kwargs):
-        raise ValueError("no table produced columns; fall back to land-to-Delta + DirectLake.")
+        raise ValueError("no table produced columns; it needs a storage decision.")
 
     monkeypatch.setattr(me, "assemble_import_model", boom)
     src = InMemoryTableauSource(datasources={"Orders DS": LIVE_TDS})
@@ -619,7 +619,7 @@ def test_assemble_layer_value_error_is_fallback(tmp_path, monkeypatch):
     detail = report["datasources"][0]
     assert detail["status"] == "fallback"
     assert "no table produced columns" in detail["reason"]
-    assert report["fallbacks"][0]["fallback_path"] == "land-to-delta-directlake"
+    assert report["fallbacks"][0]["fallback_path"] == "needs-storage-decision"
 
 
 def test_case_insensitive_table_name_collision_is_error(tmp_path):
@@ -874,8 +874,8 @@ def _viz_wb(ds_blocks, ws_blocks):
             + "</workbook>")
 
 
-# Embedded SAP HANA datasource -> select_storage_mode routes it to the land-to-Delta fallback, so
-# the bound .pbip cannot be assembled (the model lands separately) and must be skipped with a warning.
+# Embedded SAP HANA datasource -> select_storage_mode routes it to the needs-storage-decision fallback,
+# so the bound .pbip cannot be assembled (the model lands separately) and must be skipped with a warning.
 SAPHANA_WORKBOOK_TWB = _viz_wb(
     _viz_ds("Hana Source", "federated.hana", "saphana.bb22", "saphana", "Stock"),
     _viz_ws("Stock by Category", "federated.hana", "Hana Source"))
@@ -890,7 +890,7 @@ MULTI_SOURCE_TWB = _viz_wb(
 
 
 # A mixed multi-datasource workbook: one mappable SQL Server datasource (builds a bound .pbip) plus a
-# SAP HANA datasource that routes to the land-to-Delta fallback (cannot be assembled into a bound
+# SAP HANA datasource that routes to the needs-storage-decision fallback (cannot be assembled into a bound
 # model). Proves per-datasource error isolation -- the fallback datasource is skipped-loud while its
 # sibling still builds, and the failure never pollutes the primary/top-level detail.
 MIXED_FALLBACK_TWB = _viz_wb(
@@ -1043,11 +1043,11 @@ def test_definition_of_done_classifier_pass_fail_skip():
         {"name": "Multi WB",
          "datasource_pbips": [{"pbip_status": "built"}, {"pbip_status": "skipped"}]},
         {"name": "Orphan WB", "viz_status": "built", "pbip_status": "skipped",
-         "pbip_warnings": ["manual attention required: routes to the lakehouse fallback -- "
+         "pbip_warnings": ["manual attention required: needs a storage decision -- "
                            "workbook .pbip skipped"]},
         {"name": "Published WB", "pbip_status": "skipped",
          "binding_signal": {"kind": "published"},
-         "pbip_warnings": ["manual attention required: routes to the lakehouse fallback"]},
+         "pbip_warnings": ["manual attention required: needs a storage decision"]},
     ]
     dod = me._definition_of_done(wb_details, pbip_enabled=True)
 
@@ -1061,7 +1061,7 @@ def test_definition_of_done_classifier_pass_fail_skip():
     assert by_name["Bound WB"]["report_bound"] is True
     assert by_name["Multi WB"]["status"] == "pass"          # a multi-DS workbook with any DS bound
     assert by_name["Orphan WB"]["status"] == "failed"
-    assert "lakehouse fallback" in by_name["Orphan WB"]["reason"]
+    assert "needs a storage decision" in by_name["Orphan WB"]["reason"]
     assert not by_name["Orphan WB"]["reason"].startswith("manual attention required")  # prefix stripped
     assert by_name["Published WB"]["status"] == "skipped"   # the honest carve-out
     assert "published" in by_name["Published WB"]["reason"].lower()
@@ -1519,7 +1519,7 @@ def test_workbook_pbip_skipped_on_fallback_datasource(tmp_path):
     assert wb["viz_status"] == "built"
     assert wb["pbip_status"] == "skipped"
     assert wb["pbip_folder"] is None
-    assert any("lakehouse fallback" in w for w in wb["pbip_warnings"])
+    assert any("needs a storage decision" in w for w in wb["pbip_warnings"])
     assert all(w.startswith("manual attention required: ") for w in wb["pbip_warnings"])
     assert not (tmp_path / "b" / "pbip" / "Hana WB").exists()
     assert report["summary"]["workbooks_pbip_built"] == 0
@@ -1564,7 +1564,7 @@ def test_workbook_pbip_multi_datasource_projects_are_self_contained():
 
 
 def test_workbook_pbip_multi_datasource_isolates_per_datasource_failure():
-    # Per-datasource error isolation: when one embedded datasource routes to the lakehouse fallback
+    # Per-datasource error isolation: when one embedded datasource needs a storage decision
     # (SAP HANA here), it is skipped-loud with its OWN warning while the sibling SQL Server datasource
     # still builds. The failure never pollutes the primary/top-level detail (warn-never-wrong).
     with tempfile.TemporaryDirectory() as out:
@@ -1578,7 +1578,7 @@ def test_workbook_pbip_multi_datasource_isolates_per_datasource_failure():
         entries = {e["datasource"]: e for e in wb["datasource_pbips"]}
         assert entries["Sales Source"]["pbip_status"] == "built"
         assert entries["Hana Source"]["pbip_status"] == "skipped"
-        assert any("lakehouse fallback" in w for w in entries["Hana Source"]["pbip_warnings"])
+        assert any("needs a storage decision" in w for w in entries["Hana Source"]["pbip_warnings"])
         # the built sibling lands on disk; the skipped one writes no project
         base = os.path.join(out, "b", "pbip", "Mixed WB")
         assert os.path.isfile(os.path.join(base, "Sales Source", "Sales Source.pbip"))

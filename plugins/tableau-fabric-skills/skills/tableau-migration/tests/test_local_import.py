@@ -2,8 +2,9 @@
 
 These cover the customer scenario where the source connector is UNMAPPED (S3 / generic ODBC / Web
 Data Connector) but the published datasource carries an extract: today that routes to the
-land-to-Delta fallback (a plan, not a runnable model), and the opt-in ``local_data=`` instead builds
-a clickable Import model backed by local CSV files -- no Fabric, no lakehouse, no credentials.
+needs-storage-decision fallback (no runnable model, DirectLake is opt-in), and the opt-in
+``local_data=`` instead builds a clickable Import model backed by local CSV files -- no Fabric, no
+lakehouse, no credentials.
 
 All inline ``.tds`` documents are authored here (the repo git-ignores real Tableau artifacts) and
 all CSVs are written to pytest ``tmp_path``; nothing is committed.
@@ -125,7 +126,10 @@ def test_unmapped_extract_falls_back_without_local_data():
     result = A.migrate_datasource(PENDING_TDS, model_name="Pending")
     assert result["parts"] == {}
     assert result["report"]["fallback"] is True
-    assert "landing_plan" in result["report"]
+    # de-default: an unmapped extract with no local_data is a needs-storage-decision fallback --
+    # DirectLake is opt-in, so NO landing_plan is auto-built.
+    assert "landing_plan" not in result["report"]
+    assert result["report"]["storage_decision"]["fallback"] == "needs-storage-decision"
 
 
 # -- local_data dict builds a real CSV-backed Import model ---------------------------------------

@@ -1,11 +1,13 @@
 """Storage-mode policy tests (pure, descriptor-driven — no XML).
 
 Locks the per-datasource decision tree: extract->Import, live relational->DirectQuery,
-flat file->Import, and the fallback to land-to-Delta + DirectLake for shapes that can't be
-rebuilt directly (join trees, multi-connection, unknown/partial connectors).
+flat file->Import, and the honest needs-storage-decision routing for shapes that can't be
+rebuilt directly (join trees, multi-connection, unknown/partial connectors). DirectLake
+(land-to-Delta) is opt-in only and is never auto-stamped by the router.
 """
 from storage_mode import (
-    FALLBACK_ANALYSIS_SERVICES, FALLBACK_LAND_TO_DELTA, select_storage_mode)
+    FALLBACK_ANALYSIS_SERVICES, FALLBACK_LAND_TO_DELTA, FALLBACK_NEEDS_DECISION,
+    select_storage_mode)
 
 import pytest
 
@@ -110,29 +112,55 @@ def test_custom_sql_sets_native_query_flag():
 def test_join_tree_falls_back():
     d = select_storage_mode(_desc(relations=[{"kind": "join", "name": "Orders+People"}]))
     assert d["mode"] is None
-    assert d["fallback"] == FALLBACK_LAND_TO_DELTA
+    assert d["fallback"] == FALLBACK_NEEDS_DECISION
     assert "join" in d["rationale"].lower()
 
 
 def test_multiple_named_connections_fall_back():
     d = select_storage_mode(_desc(named_connection_count=2))
     assert d["mode"] is None
-    assert d["fallback"] == FALLBACK_LAND_TO_DELTA
+    assert d["fallback"] == FALLBACK_NEEDS_DECISION
 
 
 def test_unknown_connector_falls_back():
-    # SAP HANA is intentionally outside the verified v1 connector set -> fall back.
+    # SAP HANA is intentionally outside the verified v1 connector set -> needs a storage decision.
     d = select_storage_mode(_desc(connection_class="saphana"))
     assert d["mode"] is None
-    assert d["fallback"] == FALLBACK_LAND_TO_DELTA
+    assert d["fallback"] == FALLBACK_NEEDS_DECISION
 
 
 def test_no_columns_falls_back():
     d = select_storage_mode(_desc(relations=[{"kind": "table", "name": "Orders",
                                               "item": "Orders", "columns": []}]))
     assert d["mode"] is None
-    assert d["fallback"] == FALLBACK_LAND_TO_DELTA
+    assert d["fallback"] == FALLBACK_NEEDS_DECISION
     assert "column" in d["rationale"].lower()
+
+
+def test_needs_decision_label_is_distinct_from_land_to_delta_optin():
+    # The de-default contract: an unresolved shape routes to the honest needs-storage-decision
+    # label, which is a DIFFERENT value from the land-to-Delta + DirectLake opt-in. DirectLake is
+    # never auto-stamped -- the opt-in label still exists (Wave-5 hook) but is never the auto route.
+    assert FALLBACK_NEEDS_DECISION == "needs-storage-decision"
+    assert FALLBACK_LAND_TO_DELTA == "land-to-delta-directlake"
+    assert FALLBACK_NEEDS_DECISION != FALLBACK_LAND_TO_DELTA
+    d = select_storage_mode(_desc(relations=[{"kind": "join", "name": "Orders+People"}]))
+    assert d["fallback"] != FALLBACK_LAND_TO_DELTA
+
+
+def test_needs_decision_defaults_to_import_and_points_at_optin():
+    # A needs-decision shape must (a) default recommended_mode to a direct-to-source Import rebuild,
+    # never an automatic DirectLake landing, and (b) surface a follow-up that names the land-to-Delta
+    # + DirectLake path as an explicit OPT-IN the user chooses deliberately.
+    d = select_storage_mode(_desc(connection_class="saphana"))
+    assert d["mode"] is None
+    assert d["fallback"] == FALLBACK_NEEDS_DECISION
+    assert d["recommended_mode"] == "Import"
+    fu = " || ".join(d["manual_followups"]).lower()
+    assert "opt-in" in fu or "opt in" in fu
+    assert "directlake" in fu.replace(" ", "") or "land-to-delta" in fu
+    # the rationale never claims DirectLake/land-to-Delta was auto-selected
+    assert "auto-selected" not in d["rationale"].lower() or "never auto-selected" in d["rationale"].lower()
 
 
 # -- expanded connector dispatch ----------------------------------------------
@@ -168,11 +196,12 @@ def test_databricks_directquery_flags_httppath_followup():
 @pytest.mark.parametrize("cls", ["msolap", "sqlserver-analysis-services"])
 def test_analysis_services_is_model_migration_not_relational_fallback(cls):
     # SSAS / MSOLAP is already a semantic model: no Import/DirectQuery rebuild, and NOT the
-    # relational land-to-Delta path -- it gets its own model-migration routing + rationale.
+    # relational needs-decision path -- it gets its own model-migration routing + rationale.
     d = select_storage_mode(_desc(connection_class=cls))
     assert d["mode"] is None
     assert d["connector"] is None
     assert d["fallback"] == FALLBACK_ANALYSIS_SERVICES
+    assert d["fallback"] != FALLBACK_NEEDS_DECISION
     assert d["fallback"] != FALLBACK_LAND_TO_DELTA
     assert "model" in d["rationale"].lower()
     assert any("xmla" in f.lower() or "semantic-model" in f.lower() for f in d["manual_followups"])
@@ -295,23 +324,23 @@ def test_generic_odbc_dsn_only_is_reconstructable():
 
 
 def test_generic_odbc_without_driver_or_dsn_falls_back():
-    # neither a DSN nor a driver name -> nothing to bind -> fail closed to land-to-Delta.
+    # neither a DSN nor a driver name -> nothing to bind -> fail closed to needs-storage-decision.
     d = select_storage_mode(_odbc_desc(odbc_driver="", odbc_dsn=""))
     assert d["mode"] is None
-    assert d["fallback"] == FALLBACK_LAND_TO_DELTA
+    assert d["fallback"] == FALLBACK_NEEDS_DECISION
     assert d["score"] == 30
     assert d["recommended_mode"] == "Import"
 
 
 def test_generic_jdbc_is_not_routed_as_odbc():
     # genericjdbc is deliberately EXCLUDED from the ODBC tier (Power BI has no JDBC connector and
-    # cannot load Java drivers); it must fall through to the land-to-Delta fallback, never Odbc.Query.
+    # cannot load Java drivers); it must route to needs-storage-decision, never Odbc.Query.
     table_rel = {"kind": "table", "name": "orders", "item": "orders",
                  "columns": [{"model_name": "region", "tmdl_type": "string"}]}
     d = select_storage_mode(_odbc_desc(connection_class="genericjdbc", relations=[table_rel]))
     assert d["mode"] is None
     assert d["connector"] is None
-    assert d["fallback"] == FALLBACK_LAND_TO_DELTA
+    assert d["fallback"] == FALLBACK_NEEDS_DECISION
 
 
 # -- native query-engine routing over ODBC (Spark / Presto / Trino / Starburst) ------------------
@@ -372,11 +401,11 @@ def test_native_engine_table_relation_is_import_via_odbc_datasource(cls):
     assert d["fallback"] is None          # a plain table still binds over ODBC, never Delta
 
 
-def test_native_engine_without_server_falls_back_to_delta():
+def test_native_engine_without_server_needs_decision():
     # no server/host -> no ODBC connection string can be reconstructed -> fail closed.
     d = select_storage_mode(_engine_desc("presto", server=""))
     assert d["mode"] is None
-    assert d["fallback"] == FALLBACK_LAND_TO_DELTA
+    assert d["fallback"] == FALLBACK_NEEDS_DECISION
     assert d["score"] == 30
     assert d["recommended_mode"] == "Import"
 

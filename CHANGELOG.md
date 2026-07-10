@@ -13,6 +13,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **DirectLake is no longer the silent default fallback — residual unresolved
+  datasources now route to an honest needs-storage-decision state instead of being auto-landed as
+  Delta + DirectLake.** When the storage router could not map a connector (a structurally-unsupported
+  join tree, an ODBC source with no reconstructable driver, a native engine with no server, or an
+  unknown connector) it previously stamped `land-to-delta-directlake` and auto-built a lakehouse
+  `landing_plan` — silently choosing DirectLake for the user. `storage_mode.select_storage_mode` now
+  stamps `needs-storage-decision` for every `mode is None` shape, and the fallback reporting
+  (`assemble_model` / `migrate_estate`) carries `storage_decision.fallback ==
+  "needs-storage-decision"` / `fallback_path == "needs-storage-decision"` with **no** auto-built
+  `landing_plan` and **no** `<model>.landing_plan.json` written — byte-identical in shape to the
+  existing SSAS/XMLA fallback. The land-to-Delta + DirectLake capability is unchanged and stays
+  reachable via the explicit opt-in helper `assemble_model.directlake_landing_plan(...)` (the
+  `FALLBACK_LAND_TO_DELTA` constant and the auto-build gate remain as the opt-in hook). The default
+  for an inferable shape is to rebuild direct-to-source as Import/DirectQuery; the residual
+  needs-decision fallback points the user at the opt-in rather than choosing it for them. Additive:
+  the `fallback` report key is unchanged, `landing_plan` is now emitted **only** through the opt-in,
+  and no existing report keys were renamed or removed. *(2026-07-09 storage-model architecture pivot —
+  DirectLake is opt-in only)*
 - **tableau-migration:** **a workbook migration now fails loud when it produces no openable, model-bound
   report, and report rebuild is framed as a default deliverable instead of a preview.** Across three
   real-world migrations the running agent rebuilt only the semantic model and left the workbook's

@@ -32,8 +32,9 @@ is exercised offline, with no files, network, or credentials.
 Honesty boundaries are inherited from the cores: column types come from Tableau metadata,
 only the safe subset of calcs becomes DAX (everything else stays an inert ``= 0`` stub with the
 original formula preserved), and any datasource whose shape is not safe to rebuild directly is
-reported as a land-to-Delta + DirectLake *fallback* rather than emitted wrong. No credentials
-are read, stored, or written anywhere in the bundle.
+reported as a *needs-storage-decision* fallback (default: rebuild direct-to-source as Import;
+land-to-Delta + DirectLake is an explicit opt-in, never auto-selected) rather than emitted wrong.
+No credentials are read, stored, or written anywhere in the bundle.
 """
 from __future__ import annotations
 
@@ -49,7 +50,7 @@ from datetime import datetime, timezone
 
 try:  # works whether imported as a package or run with scripts/ on sys.path
     from .connection_to_m import parse_tds, extract_bundled_flatfile, extract_calcs
-    from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
+    from .storage_mode import select_storage_mode, FALLBACK_NEEDS_DECISION
     from .assemble_model import (assemble_import_model, assemble_local_import_model,
                                  materialize_bundled_flatfile_data, write_model_folder,
                                  write_local_pbip, migrate_datasource, list_workbook_datasources)
@@ -59,7 +60,7 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from . import fetch_tds as F
 except ImportError:
     from connection_to_m import parse_tds, extract_bundled_flatfile, extract_calcs
-    from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
+    from storage_mode import select_storage_mode, FALLBACK_NEEDS_DECISION
     from assemble_model import (assemble_import_model, assemble_local_import_model,
                                 materialize_bundled_flatfile_data, write_model_folder,
                                 write_local_pbip, migrate_datasource, list_workbook_datasources)
@@ -615,7 +616,7 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
     if decision.get("mode") is None:
         detail.update(status="fallback", storage_mode=None, storage_decision=decision,
                       reason=decision.get("rationale"),
-                      fallback_path=decision.get("fallback") or FALLBACK_LAND_TO_DELTA)
+                      fallback_path=decision.get("fallback") or FALLBACK_NEEDS_DECISION)
         return detail
 
     # Preflight: model-table display names must each map to a distinct, writable TMDL part.
@@ -693,10 +694,10 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
             out = assemble_import_model(descriptor, model_name=name, calcs=calcs, dim_calcs=dim_calcs,
                                         parameters=parameters, approved_calc_dax=approved_calc_dax,
                                         flatfile_path=flatfile_path)
-    except ValueError as exc:  # storage policy / no-columns -> documented land-to-Delta fallback
+    except ValueError as exc:  # storage policy / no-columns -> documented needs-storage-decision fallback
         detail.update(status="fallback", storage_mode=None, storage_decision=decision,
                       reason=str(exc),
-                      fallback_path=decision.get("fallback") or FALLBACK_LAND_TO_DELTA)
+                      fallback_path=decision.get("fallback") or FALLBACK_NEEDS_DECISION)
         return detail
     except Exception as exc:
         detail.update(status="error", storage_decision=decision,
@@ -1726,11 +1727,11 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                      f"landed to an absolute path -- the model opens but loads no rows ({_why})")
     if res_report.get("fallback"):
         # Published-datasource workbook: its own embedded copy is a sqlproxy proxy stub with no
-        # usable schema, so rebuilding it lands in the lakehouse fallback. When the estate already
-        # built the matching published datasource, rebuild the model from THAT real schema --
-        # carrying the workbook's own calculated fields so its view-local measures translate -- and
-        # bind the report to it. Never guesses (a real datasource-name match is required); any
-        # failure keeps the honest skip below (warn-never-wrong).
+        # usable schema, so rebuilding it routes to the needs-storage-decision fallback. When the
+        # estate already built the matching published datasource, rebuild the model from THAT real
+        # schema -- carrying the workbook's own calculated fields so its view-local measures
+        # translate -- and bind the report to it. Never guesses (a real datasource-name match is
+        # required); any failure keeps the honest skip below (warn-never-wrong).
         recovered = _rebuild_from_published_match(wb_detail, twb_text, model_safe, ds_catalog,
                                                   approved_calc_dax=approved_calc_dax)
         if recovered is not None:
@@ -1738,7 +1739,7 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
             res_report = res.get("report") or {}
         if res_report.get("fallback"):
             rationale = (res_report.get("storage_decision") or {}).get("rationale") or "undoable shape"
-            warns.append(_PBIP_WARN + f"embedded datasource {label!r} routes to the lakehouse fallback "
+            warns.append(_PBIP_WARN + f"embedded datasource {label!r} needs a storage decision "
                          f"({rationale}) -- workbook .pbip skipped (model lands separately)")
             return
 
@@ -1869,7 +1870,7 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
     the top-level keys mirror the primary (most-used) datasource. Purely additive: it never alters the
     bare ``reports/`` write. Sets ``pbip_status``/``pbip_folder``/``bound_model``/``bound_datasource``/
     ``model_translation_handoff`` and appends honest ``pbip_warnings`` for every case it cannot
-    faithfully bind (no embedded datasource, lakehouse fallback, write failure). Never raises.
+    faithfully bind (no embedded datasource, needs-storage-decision fallback, write failure). Never raises.
     """
     detail.update(pbip_status="skipped", pbip_folder=None, bound_model=None,
                   bound_datasource=None, model_translation_handoff=None)
@@ -2415,7 +2416,7 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
         {"datasource": d["name"],
          "source_id": d.get("source_id"),
          "reason": d.get("reason"),
-         "fallback_path": d.get("fallback_path") or FALLBACK_LAND_TO_DELTA}
+         "fallback_path": d.get("fallback_path") or FALLBACK_NEEDS_DECISION}
         for d in ds_details if d.get("status") == "fallback"
     ]
 
@@ -2771,7 +2772,7 @@ def _render_summary_md(report):
             )
 
     if report["fallbacks"]:
-        lines += ["", "## Fallbacks (route to land-to-Delta + DirectLake)", ""]
+        lines += ["", "## Fallbacks (need a storage decision -- Import default / DirectLake opt-in)", ""]
         for f in report["fallbacks"]:
             lines.append(f"- **{f['datasource']}** ({f['fallback_path']}): {f['reason']}")
 

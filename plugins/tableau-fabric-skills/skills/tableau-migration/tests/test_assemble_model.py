@@ -1164,7 +1164,7 @@ def test_assemble_excel_collection_multi_table():
 def test_assemble_join_tree_raises_for_fallback():
     with pytest.raises(ValueError) as ei:
         migrate_tds_to_semantic_model(JOIN_TREE, model_name="Joined")
-    assert "land-to-delta" in str(ei.value).lower()
+    assert "needs-storage-decision" in str(ei.value).lower()
 
 
 def test_migrate_auto_wires_parsed_relationships():

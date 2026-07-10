@@ -166,37 +166,43 @@ def test_migrate_datasource_from_tdsx_path(tmp_path):
     assert "SUM('Orders'[Sales])" in _all_text(out["parts"])
 
 
-# == default-direct policy: genuine fallback returns a landing plan, never crashes ============
+# == de-default policy: a genuinely-undoable shape returns the storage decision, never a model ===
+# DirectLake is OPT-IN ONLY, so the DEFAULT fallback carries NO auto-built landing_plan.
 
-def test_migrate_datasource_fallback_returns_landing_plan_not_model():
+def test_migrate_datasource_fallback_returns_decision_not_model():
     out = A.migrate_datasource(SAPHANA_FALLBACK, model_name="Hana")
     assert out["parts"] == {}                       # no semantic model emitted
     assert out["report"]["fallback"] is True
-    plan = out["report"]["landing_plan"]
+    assert "landing_plan" not in out["report"]      # DirectLake is opt-in, never auto-built
+    assert out["report"]["storage_decision"]["fallback"] == "needs-storage-decision"
+    assert "error" not in out["bind"]
+
+
+def test_migrate_datasource_fallback_writes_no_landing_plan_json(tmp_path):
+    dest = str(tmp_path / "out")
+    out = A.migrate_datasource(SAPHANA_FALLBACK, model_name="Hana", write_to=dest)
+    assert "model_dir" not in out                    # nothing to assemble
+    assert "landing_plan_path" not in out            # DirectLake opt-in not taken -> no plan file
+    assert not os.path.exists(os.path.join(dest, "Hana.landing_plan.json"))
+
+
+# == the land-to-Delta + DirectLake capability STAYS, reachable via the explicit opt-in helper ===
+
+def test_directlake_optin_landing_plan_carries_targets_columns_and_calcs():
+    # directlake_landing_plan is the Wave-5 opt-in hook; call it directly (as the opt-in would) to
+    # cover the plan content that migrate_datasource no longer auto-builds by default.
+    plan = A.directlake_landing_plan(
+        A.parse_tds(SAPHANA_FALLBACK),
+        calcs=[{"name": "Total", "formula": "SUM([Sales])", "role": "measure"}])
     assert plan["target_lakehouse"] == "h1_ultrastore"
     t = {row["source_table"]: row for row in plan["tables"]}["Orders"]
     assert t["delta_table"] == "hana_ds_orders"     # slugified {datasource}_{table} (land-to-Delta naming)
     assert t["connection_class"] == "saphana"
     assert {c["name"] for c in t["columns"]} == {"Order_ID", "Sales"}          # cleaned model names
     assert {c["source_column"] for c in t["columns"]} == {"Order ID", "Sales"}  # raw source names
-    assert "error" not in out["bind"]
-
-
-def test_fallback_landing_plan_carries_cutover_mechanism_and_calcs():
-    plan = A.migrate_datasource(SAPHANA_FALLBACK, model_name="Hana")["report"]["landing_plan"]
     assert "VizQL Data Service" in plan["landing_mechanism"]      # snapshot pull on the Tableau PAT
     assert [n["connection_class"] for n in plan["native_cutover"]] == ["saphana"]
     assert plan["calc_inventory"] == [{"name": "Total", "formula": "SUM([Sales])", "role": "measure"}]
-
-
-def test_migrate_datasource_fallback_writes_landing_plan_json(tmp_path):
-    dest = str(tmp_path / "out")
-    out = A.migrate_datasource(SAPHANA_FALLBACK, model_name="Hana", write_to=dest)
-    assert "model_dir" not in out                    # nothing to assemble
-    path = out["landing_plan_path"]
-    assert os.path.basename(path) == "Hana.landing_plan.json"
-    on_disk = json.loads(open(path, encoding="utf-8").read())
-    assert on_disk["tables"][0]["delta_table"] == "hana_ds_orders"
 
 
 def test_directlake_landing_plan_routes_each_table_to_its_own_engine():

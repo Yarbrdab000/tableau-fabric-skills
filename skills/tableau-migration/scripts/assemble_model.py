@@ -16,8 +16,10 @@ each part into the Fabric ``createOrUpdate`` payload (see ``fabric_definition_pa
 Storage paths:
 * **Import / DirectQuery** (direct-to-upstream): tables use ``= m`` partitions from
   ``connection_to_m.emit_table_tmdl_m``; connection parameters become named expressions.
-* **DirectLake fallback** (``mode is None``): the caller should land data as Delta first;
-  ``assemble_directlake_model`` then reuses the proven import-model generators.
+* **Needs-storage-decision fallback** (``mode is None``): the shape can't be rebuilt
+  direct-to-source, so it is reported as a fallback (default: land as Import direct-to-source).
+  DirectLake is an explicit opt-in -- ``assemble_directlake_model`` reuses the import-model
+  generators after data is landed as Delta -- never auto-selected.
 
 Credentials are never embedded. Anything outside the safe subset stays an inert ``= 0`` stub
 with its original formula preserved as a ``TableauFormula`` annotation.
@@ -41,7 +43,7 @@ try:  # package or scripts-on-path
         workbook_datasources,
         AmbiguousDatasourceError,
     )
-    from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
+    from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA, FALLBACK_NEEDS_DECISION
     from .calc_to_dax import (
         translate_tableau_calc_to_dax,
         translate_tableau_calc_to_dax_typed,
@@ -81,7 +83,7 @@ except ImportError:
         workbook_datasources,
         AmbiguousDatasourceError,
     )
-    from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA
+    from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA, FALLBACK_NEEDS_DECISION
     from calc_to_dax import (
         translate_tableau_calc_to_dax,
         translate_tableau_calc_to_dax_typed,
@@ -1731,8 +1733,9 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     if decision["mode"] is None:
         raise ValueError(
             f"datasource '{descriptor.get('datasource_name')}' requires the "
-            f"{decision.get('fallback', FALLBACK_LAND_TO_DELTA)} path "
-            f"({decision['rationale']}); use assemble_directlake_model after landing data."
+            f"{decision.get('fallback', FALLBACK_NEEDS_DECISION)} path "
+            f"({decision['rationale']}); rebuild direct-to-source as Import, or opt into "
+            f"DirectLake via assemble_directlake_model after landing data as Delta."
         )
     mode = decision["mode"]
     tables = [r for r in descriptor.get("relations", []) if r["kind"] in ("table", "custom_sql")]
@@ -1763,7 +1766,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     if not table_names:
         raise ValueError(
             f"no table produced columns for '{descriptor.get('datasource_name')}'; "
-            f"fall back to land-to-Delta + DirectLake."
+            f"it needs a storage decision (rebuild direct-to-source as Import, or opt into "
+            f"land-to-Delta + DirectLake)."
         )
 
     resolve = build_m_field_resolver(descriptor)
@@ -2793,14 +2797,17 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
     **Default-direct policy.** A datasource is rebuilt in place -- each table bound to its own source
     -- whenever that is safe, INCLUDING a multi-connection federation (Power BI relates the tables in
     the model layer). Only a genuinely-undoable shape (a cross-engine ``join``/``union`` relation,
-    unfoldable custom SQL, an unknown connector, or a table with no resolvable columns) routes to the
-    lakehouse OPTION: this call then returns ``parts={}`` with ``report["fallback"]=True`` and a
-    ``report["landing_plan"]`` (see ``directlake_landing_plan``) instead of raising -- and, when
-    ``write_to`` is given, writes ``<model_name>.landing_plan.json`` (``"landing_plan_path"``).
+    unfoldable custom SQL, an unknown connector, or a table with no resolvable columns) is reported as
+    a NEEDS-STORAGE-DECISION fallback: this call then returns ``parts={}`` with
+    ``report["fallback"]=True`` and the ``report["storage_decision"]`` (default: rebuild
+    direct-to-source as Import) instead of raising. DirectLake is an explicit opt-in, never
+    auto-selected -- only when the decision is the land-to-Delta option does this write a
+    ``report["landing_plan"]`` (see ``directlake_landing_plan``) and, with ``write_to``, a
+    ``<model_name>.landing_plan.json`` (``"landing_plan_path"``).
 
     **Local-POC opt-in (``local_data=``).** For a laptop demo with NO Fabric and NO cloud
     credentials, pass ``local_data`` to build an Import model backed by LOCAL CSV files instead. This
-    bypasses the land-to-Delta fallback entirely (no lakehouse this skill never writes to), so even an
+    bypasses the storage-decision fallback entirely (no lakehouse this skill never writes to), so even an
     unmapped connector (S3 / generic ODBC-JDBC / Web Data Connector) yields a clickable model. Accepts:
 
     * a ``{table_name: csv_path}`` dict;
@@ -2880,7 +2887,7 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
             table_csv_paths=table_csv_paths, approved_calc_dax=approved_calc_dax,
             date_range=date_range, **kwargs)
     elif decision.get("mode") is None:
-        # Genuinely-undoable shape: return the lakehouse hand-off (no parts) rather than raising.
+        # Genuinely-undoable shape: return the needs-storage-decision hand-off (no parts) rather than raising.
         # Pass the FULL (un-split) calc list so the landing plan's inventory stays complete.
         return _fallback_result(descriptor, decision, model_name=model_name, calcs=calcs,
                                 write_to=write_to)
@@ -2918,13 +2925,14 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
 
 
 def _fallback_result(descriptor, decision, *, model_name, calcs, write_to):
-    """Build the ``migrate_datasource`` result for a datasource routed to the lakehouse fallback.
+    """Build the ``migrate_datasource`` result for a datasource reported as a storage fallback.
 
     Returns ``parts={}`` (no semantic model is emitted) with a ``report`` carrying the storage
-    decision and -- for the land-to-Delta fallback -- a ``landing_plan``. SSAS/XMLA fallbacks carry
-    the decision (whose ``manual_followups`` already point at the semantic-model path) but no landing
-    plan, since they are not a Delta-landing case. When ``write_to`` is given and a landing plan was
-    produced, it is also written next to where the model folder would have gone.
+    decision. A ``landing_plan`` is added ONLY for the explicit land-to-Delta DirectLake opt-in;
+    the default needs-storage-decision fallback (and SSAS/XMLA) carry the decision -- whose
+    ``manual_followups`` already point at the direct-to-source / semantic-model path -- but no
+    landing plan, since neither is an automatic Delta-landing case. When ``write_to`` is given and a
+    landing plan was produced, it is also written next to where the model folder would have gone.
     """
     report = {
         "model_name": model_name,
