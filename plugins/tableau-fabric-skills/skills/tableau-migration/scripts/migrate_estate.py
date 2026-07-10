@@ -54,7 +54,8 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .storage_mode import select_storage_mode, FALLBACK_NEEDS_DECISION
     from .assemble_model import (assemble_import_model, assemble_local_import_model,
                                  materialize_bundled_flatfile_data, write_model_folder,
-                                 write_local_pbip, migrate_datasource, list_workbook_datasources)
+                                 write_local_pbip, migrate_datasource, list_workbook_datasources,
+                                 _win_long_path)
     from .parameters import parse_parameters
     from .workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
     from .workbook_calc_usage import workbook_calc_usage
@@ -65,7 +66,8 @@ except ImportError:
     from storage_mode import select_storage_mode, FALLBACK_NEEDS_DECISION
     from assemble_model import (assemble_import_model, assemble_local_import_model,
                                 materialize_bundled_flatfile_data, write_model_folder,
-                                write_local_pbip, migrate_datasource, list_workbook_datasources)
+                                write_local_pbip, migrate_datasource, list_workbook_datasources,
+                                _win_long_path)
     from parameters import parse_parameters
     from workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
     from workbook_calc_usage import workbook_calc_usage
@@ -720,7 +722,7 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
     dest = os.path.join(sm_dir, folder)
     try:
         if os.path.isdir(dest):
-            shutil.rmtree(dest)  # clear stale parts so a rerun never leaves renamed/dropped tables
+            shutil.rmtree(_win_long_path(dest))  # clear stale parts so a rerun never leaves renamed/dropped tables
         write_model_folder(out["parts"], dest)
     except OSError as exc:
         detail.update(status="error", storage_decision=decision, error=f"write failed: {exc}")
@@ -746,7 +748,7 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
                     if _child == data_child:
                         continue
                     _p = os.path.join(ds_pbip_dir, _child)
-                    shutil.rmtree(_p) if os.path.isdir(_p) else os.remove(_p)
+                    shutil.rmtree(_win_long_path(_p)) if os.path.isdir(_p) else os.remove(_win_long_path(_p))
             write_local_pbip(out["parts"], ds_pbip_dir, model_name=safe_base,
                              swap_specs=(report.get("field_parameters") or {}).get("specs") or None)
             pbip_folder = f"pbip/{safe_base}/{safe_base}.pbip"
@@ -1667,6 +1669,91 @@ def _field_map_from_model(res_report):
     return fact_table, field_map
 
 
+# -- Windows MAX_PATH guard for the openable .pbip write ----------------------------------------
+# A PBIR report nests deeply (``.Report/definition/pages/<page>/visuals/<visual>/visual.json``), so a
+# long output root can push a file path past the Windows MAX_PATH (260) limit -- where the OS raises a
+# cryptic ``WinError 3`` mid-write and the project lands half-written. We PROJECT the longest path
+# ``write_local_pbip`` will create and fail fast with an actionable message BEFORE writing, and we
+# CLASSIFY a write-time ``OSError`` as a path-length cause so a real failure is reported LOUD (failed),
+# never masked as a benign skip. (The ``\\?\`` long-path writer that would REMOVE the limit outright is
+# deliberately out of scope for this change -- the writer stays untouched here.)
+MAX_PATH = 260  # Windows limit incl. the terminating null -> a usable path length is 259 chars.
+
+
+def _projected_pbip_paths(dest, model_name, parts, report_name, report_parts):
+    """Yield every absolute file path :func:`write_local_pbip` will create under ``dest``.
+
+    Mirrors that writer's layout exactly: model parts land under
+    ``<dest>/<model_name>.SemanticModel/<rel>``, report parts under ``<dest>/<report_name>.Report/<rel>``,
+    plus the ``<dest>/<report_name>.pbip`` pointer (the workbook call site passes ``project_name`` ==
+    ``report_name``). Read-only; the writer itself is not touched.
+    """
+    root = os.path.abspath(dest)
+    model_dir = os.path.join(root, model_name + ".SemanticModel")
+    report_dir = os.path.join(root, report_name + ".Report")
+    for rel in (parts or {}):
+        yield os.path.join(model_dir, rel.replace("/", os.sep))
+    for rel in (report_parts or {}):
+        yield os.path.join(report_dir, rel.replace("/", os.sep))
+    yield os.path.join(root, report_name + ".pbip")
+
+
+def _longest_projected_path(dest, model_name, parts, report_name, report_parts):
+    """The single longest projected ``.pbip`` file path (the MAX_PATH budget proxy). Never raises."""
+    longest = os.path.abspath(dest)
+    for p in _projected_pbip_paths(dest, model_name, parts, report_name, report_parts):
+        if len(p) > len(longest):
+            longest = p
+    return longest
+
+
+def _classify_pbip_write_error(exc=None, projected=None):
+    """Classify a ``.pbip`` write failure as ``"path_too_long"`` or ``"write_error"``. Read-only.
+
+    A projected path at/over the Windows MAX_PATH budget, or a Windows ``WinError`` 206
+    (ERROR_FILENAME_EXCED_RANGE) / 3 (ERROR_PATH_NOT_FOUND -- the symptom of a too-long path once the
+    parent dirs already exist), or a POSIX ``ENAMETOOLONG`` -> path-length. Anything else -> generic.
+    """
+    if projected is not None and len(projected) >= MAX_PATH:
+        return "path_too_long"
+    if getattr(exc, "winerror", None) in (3, 206):
+        return "path_too_long"
+    import errno as _errno
+    if getattr(exc, "errno", None) == getattr(_errno, "ENAMETOOLONG", 36):
+        return "path_too_long"
+    return "write_error"
+
+
+def _record_pbip_write_failure(entry, warns, *, cause, dest, projected=None, exc=None):
+    """Mark ``entry`` a LOUD ``.pbip`` write failure and record why (additive ``pbip_write_error``).
+
+    A failed write must never masquerade as a benign skip. The definition-of-done reads
+    ``pbip_write_error`` and reports the workbook FAILED *before* the published-datasource carve-out (so
+    a MAX_PATH failure on a published-DS workbook is not mis-reported as "published DS not in scope").
+    The actionable message is built once and stored so the DoD banner + ``summary.md`` surface the exact
+    cause and remedy. Additive: ``pbip_write_error`` is a new key; the ``pbip_warnings`` note is kept.
+    """
+    if cause == "path_too_long":
+        loc = f" ({len(projected)} chars: {projected})" if projected else ""
+        message = ("workbook .pbip output path exceeds the Windows MAX_PATH (260) limit" + loc +
+                   " -- re-run with a shorter output root (e.g. -o C:\\tfmig) or enable Windows long "
+                   "paths")
+    elif exc is not None:
+        message = f"workbook .pbip write failed ({exc})"
+    else:
+        message = "workbook .pbip write failed"
+    err = {"cause": cause, "message": message, "path": os.path.abspath(dest)}
+    if projected is not None:
+        err["projected_path"] = projected
+        err["projected_length"] = len(projected)
+    winerr = getattr(exc, "winerror", None)
+    if winerr is not None:
+        err["winerror"] = winerr
+    entry["pbip_write_error"] = err
+    entry["pbip_status"] = "failed"
+    warns.append(_PBIP_WARN + message)
+
+
 def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, model_safe, dest,
                            folder_rel, report_base, viz_name, viz=None, ds_catalog=None,
                            approved_calc_dax=None, wb_id=None, pbip_dir=None,
@@ -1889,13 +1976,28 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
             tail = " (visual emptied)" if d["emptied"] else ""
             warns.append(_PBIP_WARN + f"visual {d['visual']!r} dropped {len(d['dropped'])} "
                          f"reference(s) the model did not emit: {', '.join(d['dropped'])}{tail}")
+    projected = _longest_projected_path(dest, model_safe, res.get("parts"), report_base, report_parts)
+    if os.name == "nt" and len(projected) >= MAX_PATH:
+        # 1a (long-path era): the writer lifts MAX_PATH via ``\\?\`` so the build no longer FAILS on a
+        # long path -- but a LOCAL .pbip nested this deep may not OPEN in Power BI Desktop unless Windows
+        # long paths are enabled. Warn (non-fatal) and proceed; a shorter -o yields a locally-openable
+        # project. A genuine write failure is still caught + reported LOUD below.
+        warns.append(_PBIP_WARN + (
+            f"workbook .pbip output path is {len(projected)} chars, at/over the Windows MAX_PATH "
+            f"({MAX_PATH}) limit -- the build proceeds via long-path (\\\\?\\) writes, but to OPEN this "
+            f".pbip locally in Power BI Desktop re-run with a shorter output root (e.g. -o C:\\tfmig) or "
+            f"enable Windows long paths"))
     try:
         if os.path.isdir(dest):
-            shutil.rmtree(dest)
+            shutil.rmtree(_win_long_path(dest))
         write_local_pbip(res["parts"], dest, model_name=model_safe, report_name=report_base,
                          report_parts=report_parts, project_name=report_base)
     except OSError as exc:
-        warns.append(_PBIP_WARN + f"workbook .pbip write failed ({exc})")
+        # 1c: a write failure is reported LOUD (failed), classified (path-length vs generic), never a
+        # silent skip -- so a MAX_PATH failure on a published-DS workbook is not masked as "published
+        # DS not in scope".
+        cause = _classify_pbip_write_error(exc, projected)
+        _record_pbip_write_failure(entry, warns, cause=cause, dest=dest, projected=projected, exc=exc)
         return
 
     entry.update(pbip_status="built",
@@ -2066,7 +2168,7 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_di
         dest = os.path.join(reports_dir, folder)
         try:
             if os.path.isdir(dest):
-                shutil.rmtree(dest)
+                shutil.rmtree(_win_long_path(dest))
             write_model_folder(parts, dest)
             output_folder = f"reports/{folder}"
         except OSError as exc:
@@ -2714,6 +2816,9 @@ def _dod_fail_reason(w):
     """
     if w.get("viz_status") == "error":
         return (w.get("note") or "viz rebuild failed").strip()
+    wperr = w.get("pbip_write_error")
+    if wperr and wperr.get("message"):
+        return wperr["message"]
     for warn in (w.get("pbip_warnings") or []):
         if warn:
             return warn[len(_PBIP_WARN):] if warn.startswith(_PBIP_WARN) else warn
@@ -2761,7 +2866,9 @@ def _definition_of_done(wb_details, pbip_enabled):
     - **skipped** -- either openable projects were disabled (``--no-pbip``), or the workbook connects
       to a *published* Tableau datasource that was not co-migrated in the same run (the one honest
       carve-out: its ``.tds`` must be in scope to bind an openable report).
-    - **failed** -- a workbook that should have produced a bound report did not (an orphaned report).
+    - **failed** -- a workbook that should have produced a bound report did not: either an orphaned
+      report, or a hard ``.pbip`` write failure (e.g. a Windows MAX_PATH violation, recorded as
+      ``pbip_write_error`` and reported LOUD before the published carve-out so it is never masked).
 
     The overall status is ``not_applicable`` (no workbook inputs), then by precedence ``failed`` (any
     failure -- the loud case) > ``warn`` (any fidelity gap) > ``pass`` (all clean) > ``skipped``.
@@ -2780,6 +2887,10 @@ def _definition_of_done(wb_details, pbip_enabled):
                 status, reason = "warn", "; ".join(warn_reasons)
             else:
                 status, reason = "pass", ""
+        elif w.get("pbip_write_error"):
+            # A hard .pbip write failure (e.g. a Windows MAX_PATH violation) is a LOUD failure, checked
+            # BEFORE the published carve-out so it is never mis-reported as a benign skip.
+            status, reason = "failed", _dod_fail_reason(w)
         elif (w.get("binding_signal") or {}).get("kind") == "published":
             status = "skipped"
             reason = ("published-datasource workbook -- co-migrate its published datasource (.tds) "

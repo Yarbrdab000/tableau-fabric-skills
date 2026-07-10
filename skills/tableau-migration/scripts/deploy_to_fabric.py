@@ -95,6 +95,28 @@ _REPORT_DOTFILE = (".platform",)
 
 # == pure builders (offline-testable; no network) ============================================
 
+def _win_long_path(path):
+    r"""Windows extended-length (``\\?\``) form of *path* so a deep-tree READ is not bound by the
+    260-char ``MAX_PATH`` limit; a no-op off Windows / on falsy / already-prefixed input.
+
+    The writer (``assemble_model.write_model_folder``) lands PBIR reports many folders deep, so
+    ``os.walk`` + ``open`` here must lift the same limit to read every part back for the Fabric
+    payload. ``\\?\`` disables path normalisation, so the path must be absolute + backslash-only
+    (``os.path.abspath`` guarantees both); a UNC path takes the ``\\?\UNC\server\share`` form. Passing
+    the prefixed root to ``os.walk`` propagates it to every child, so the joined file paths are already
+    long-path-safe -- compute the relative part key against this same prefixed root so no ``\\?\`` leaks
+    into the Fabric part names. (Kept local so this deploy CLI stays standalone.)
+    """
+    if os.name != "nt" or not path:
+        return path
+    ap = os.path.abspath(path)
+    if ap.startswith("\\\\?\\"):
+        return ap
+    if ap.startswith("\\\\"):  # UNC:  \\server\share  ->  \\?\UNC\server\share
+        return "\\\\?\\UNC\\" + ap[2:]
+    return "\\\\?\\" + ap
+
+
 def read_model_folder(model_dir):
     """Read a ``<Name>.SemanticModel`` folder into a ``{relative/forward/slash/path: text}`` dict.
 
@@ -103,12 +125,13 @@ def read_model_folder(model_dir):
     shape the Fabric definition payload expects). Raises ``FileNotFoundError`` if nothing is found.
     """
     parts = {}
-    for root, _dirs, files in os.walk(model_dir):
+    walk_root = _win_long_path(model_dir)  # lift MAX_PATH; rel keys computed against this same base
+    for root, _dirs, files in os.walk(walk_root):
         for fname in files:
             if not (fname.endswith(_MODEL_EXT) or fname in _MODEL_DOTFILE):
                 continue
             full = os.path.join(root, fname)
-            rel = os.path.relpath(full, model_dir).replace(os.sep, "/")
+            rel = os.path.relpath(full, walk_root).replace(os.sep, "/")
             with open(full, encoding="utf-8") as fh:
                 parts[rel] = fh.read()
     if not parts:
@@ -126,12 +149,13 @@ def read_report_folder(report_dir):
     the viz stage emits no binary static resources. Raises ``FileNotFoundError`` if nothing is found.
     """
     parts = {}
-    for root, _dirs, files in os.walk(report_dir):
+    walk_root = _win_long_path(report_dir)  # lift MAX_PATH; rel keys computed against this same base
+    for root, _dirs, files in os.walk(walk_root):
         for fname in files:
             if not (fname.endswith(_REPORT_EXT) or fname in _REPORT_DOTFILE):
                 continue
             full = os.path.join(root, fname)
-            rel = os.path.relpath(full, report_dir).replace(os.sep, "/")
+            rel = os.path.relpath(full, walk_root).replace(os.sep, "/")
             with open(full, encoding="utf-8") as fh:
                 parts[rel] = fh.read()
     if not parts:

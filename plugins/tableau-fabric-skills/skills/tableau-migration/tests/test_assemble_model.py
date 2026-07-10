@@ -13,6 +13,7 @@ from assemble_model import (
     write_model_folder,
     _date_axis_order_resolver,
     _approved_entry,
+    _win_long_path,
 )
 from connection_to_m import parse_tds
 from workbook_table_calcs import TableCalcUsage, Pill
@@ -1276,6 +1277,48 @@ def test_databricks_custom_sql_emits_real_partition_no_review():
     report = out["report"]
     assert report["partitions_stubbed"] == 0
     assert report["partitions_needs_review"] == []
+
+
+# -- Windows long-path (\\?\) writer: lift the 260 MAX_PATH limit for deep PBIR/TMDL writes ----------
+def test_win_long_path_prefixes_on_windows_noop_elsewhere():
+    import os
+    p = os.path.join(os.getcwd(), "a", "b", "c", "deep.json")
+    out = _win_long_path(p)
+    if os.name == "nt":
+        assert out == "\\\\?\\" + os.path.abspath(p)  # extended-length prefix on Windows
+        assert _win_long_path(out) == out            # idempotent -- never double-prefixes
+    else:
+        assert out == os.path.abspath(p)             # pure no-op off Windows
+    assert _win_long_path("") == ""                  # falsy passthrough
+    assert _win_long_path(None) is None
+
+
+def test_win_long_path_unc_form():
+    import os
+    if os.name != "nt":
+        pytest.skip("UNC \\\\?\\UNC form is Windows-only")
+    unc = "\\\\server\\share\\deep\\model.tmdl"
+    assert _win_long_path(unc) == "\\\\?\\UNC\\server\\share\\deep\\model.tmdl"
+
+
+def test_write_model_folder_writes_past_max_path():
+    # The canonical writer lands a part whose absolute path exceeds MAX_PATH (260). On Windows this only
+    # succeeds via the \\?\ long-path handling; the returned path list stays CLEAN (no prefix leak).
+    import os
+    import shutil
+    import tempfile
+    base = tempfile.mkdtemp(prefix="wmf1b_")
+    try:
+        dest = os.path.join(base, "M" * 40 + ".SemanticModel")
+        deep_rel = "definition/tables/" + "T" * 90 + "/" + "C" * 90 + ".tmdl"
+        parts = {deep_rel: "table body", "definition.pbism": "{}"}
+        full = os.path.abspath(os.path.join(dest, *deep_rel.split("/")))
+        assert len(full) >= 260                       # genuinely over the MAX_PATH budget
+        written = write_model_folder(parts, dest)
+        assert os.path.exists(_win_long_path(full))   # the deep file really landed on disk
+        assert all(not w.startswith("\\\\?\\") for w in written)  # reported paths are clean
+    finally:
+        shutil.rmtree(_win_long_path(base), ignore_errors=True)
 
 
 def test_snowflake_custom_sql_is_flagged_needs_review():
