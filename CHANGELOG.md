@@ -13,6 +13,20 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration:** **new public `migrate_workbook` primitive — one code path for standalone-workbook and
+  estate workbook migration.** Rebuilding a Tableau workbook (its embedded datasource(s) **and** the report bound
+  to them, into an openable `pbip/<Name>/` project) was previously only reachable through the private, estate-only
+  loop inside `migrate_estate` — so an agent handed a lone `.twb`/`.twbx` had no public entry point and tended to
+  hand-roll one, orphaning the report. `migrate_estate.migrate_workbook(source, *, write_to=…, name=None, pbip=True,
+  …)` exposes that machinery directly: `source` accepts a `.twb`/`.twbx` path, raw workbook XML (`str`/`bytes`), or
+  a live `TableauSource` + `wb_id`; it returns the same per-workbook detail dict the estate reports (`name`,
+  `viz_status`, `pbip_status`, `bound_model`/`bound_datasource`, `pbip_folder`, `viz_fidelity`, …), nesting one
+  project per datasource for a multi-datasource workbook, and only raises on invalid arguments (a per-workbook
+  migration failure is reported on the detail, never raised). `migrate_estate` now **delegates** its workbook loop
+  to this same function, so a standalone workbook and an estate workbook are byte-for-byte the same operation — the
+  estate just runs it once per workbook. `migrate_datasource` stays datasource-scoped (model only); SKILL.md, the
+  `migrate_datasource` docstring, and `resources/orchestration.md` now steer workbook-with-report inputs to
+  `migrate_workbook`. Additive: a new public function and docs only — no existing report keys or behavior changed.
 - **tableau-migration:** **extract-backed SaaS datasources (Salesforce, Marketo, ServiceNow, …) now have an
   honest offline Import home instead of falling through to a fallback.** A datasource on an unmapped SaaS
   connector that is extract-backed (a bundled `.hyper` snapshot, no reconstructable live Power BI connector)

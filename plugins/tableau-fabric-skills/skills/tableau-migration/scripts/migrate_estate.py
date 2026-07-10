@@ -2054,6 +2054,92 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_di
     return detail
 
 
+def _looks_like_path(source):
+    """True iff ``source`` is a filesystem path that exists (tolerant of raw-XML strings)."""
+    if isinstance(source, (bytes, bytearray)) or not isinstance(source, (str, os.PathLike)):
+        return False
+    try:
+        return os.path.exists(source)
+    except (ValueError, OSError):  # e.g. an over-long or NUL-bearing raw-XML string
+        return False
+
+
+def _single_workbook_source(source, name=None):
+    """Wrap a standalone workbook as a one-workbook :class:`TableauSource`.
+
+    Returns ``(source, wb_id)`` ready for :func:`_migrate_one_workbook`. A filesystem path to a
+    ``.twb`` / ``.twbx`` is served by :class:`LocalFilesSource` with the ABSOLUTE path as the id, so a
+    packaged ``.twbx``'s bundled flat-file data is extracted at full fidelity (the downstream model
+    build reads the bundle via that same path). Raw workbook XML (``str``/``bytes``, incl. ``.twbx``
+    zip bytes) is served in memory; a bare XML body carries no bundled extract, so flat-file data
+    honestly degrades (there is nothing to land). The display name is the file stem for a path, else
+    ``name`` (default ``"workbook"``).
+    """
+    if _looks_like_path(source):
+        path = os.path.abspath(os.fspath(source))
+        return LocalFilesSource(os.path.dirname(path)), path
+    if isinstance(source, (bytes, bytearray)):
+        data = bytes(source)
+        text = F.inner_doc_from_zip(data) if F.is_zip(data) else data.decode("utf-8-sig")
+    else:
+        text = source
+    key = name or "workbook"
+    return InMemoryTableauSource(workbooks={key: text}), key
+
+
+def migrate_workbook(source, *, write_to=None, wb_id=None, name=None, viz_stage=None,
+                     approved_calc_dax=None, viz_advice=False, pbip=True,
+                     ds_catalog=None, used_folders=None):
+    """Migrate ONE Tableau workbook into an openable Power BI project (model + bound report).
+
+    This is the public workbook primitive -- the same faithful rebuild+bind the estate performs per
+    workbook, callable for a single workbook. :func:`migrate_estate` loops exactly this function, so a
+    standalone workbook migration and an estate workbook migration share ONE code path.
+
+    ``source`` is either a standalone workbook -- a filesystem path to a ``.twb`` / ``.twbx`` or raw
+    ``.twb`` XML (``str``/``bytes``) -- or, for the estate, a live :class:`TableauSource` plus a
+    ``wb_id`` selecting the workbook within it. Set ``name`` to override the display name of a
+    standalone workbook (default: the file stem, or ``"workbook"`` for raw XML).
+
+    ``write_to`` (required) is the output project directory: the rebuilt report is written under
+    ``<write_to>/reports/<Name>.Report`` and, unless ``pbip=False``, the openable project under
+    ``<write_to>/pbip/<Name>/`` (model rebuilt from the workbook's own embedded datasource + report
+    bound to it by path). Returns the workbook detail dict (``name``, ``viz_status``, ``pbip_status``,
+    ``bound_model`` / ``bound_datasource``, ``pbip_folder``, ``viz_fidelity`` ...). Never raises for a
+    per-workbook migration failure -- the failure is reported on the detail dict (as ``_migrate_one_
+    workbook`` does); only invalid ARGUMENTS raise ``ValueError``.
+
+    ``ds_catalog`` / ``used_folders`` are the estate's shared caches (a published-datasource match
+    catalog and the set of already-claimed output folder names). Standalone callers omit them.
+    """
+    if not write_to:
+        raise ValueError(
+            "migrate_workbook writes an openable project (model + bound report); pass write_to=<dir>")
+
+    if isinstance(source, TableauSource):
+        single = source
+        if wb_id is None:
+            workbooks = source.list_workbooks()
+            if len(workbooks) != 1:
+                raise ValueError("pass wb_id to select which workbook to migrate from a "
+                                 "multi-workbook source")
+            wb_id = workbooks[0]
+    else:
+        single, wb_id = _single_workbook_source(source, name=name)
+
+    reports_dir = os.path.join(write_to, "reports")
+    pbip_dir = os.path.join(write_to, "pbip") if pbip else None
+    os.makedirs(write_to, exist_ok=True)
+
+    viz = _resolve_viz_stage(viz_stage)
+    if used_folders is None:
+        used_folders = set()
+
+    return _migrate_one_workbook(single, wb_id, viz, reports_dir, used_folders, pbip_dir,
+                                 ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax,
+                                 viz_advice=viz_advice)
+
+
 # -- rebind plan ingest / routing (opt-in; byte-identical no-op when absent) ---
 # The comparison skill writes ``rebind-plan.json`` to the estate output root; this orchestrator
 # INGESTS it -- the JSON file is the ONLY coupling (nothing is shelled or invoked). The plan is
@@ -2403,7 +2489,6 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
     ``viz_advice`` key per workbook -- so when omitted the run is byte-identical.
     """
     sm_dir = os.path.join(output_dir, "semantic_models")
-    reports_dir = os.path.join(output_dir, "reports")
     pbip_dir = os.path.join(output_dir, "pbip") if pbip else None
     os.makedirs(output_dir, exist_ok=True)
 
@@ -2415,10 +2500,9 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
                                           ds_catalog=ds_catalog,
                                           approved_calc_dax=approved_calc_dax)
                   for ds_id in source.list_datasources()]
-    wb_details = [_migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir,
-                                        ds_catalog=ds_catalog,
-                                        approved_calc_dax=approved_calc_dax,
-                                        viz_advice=viz_advice)
+    wb_details = [migrate_workbook(source, write_to=output_dir, wb_id=wb_id, viz_stage=viz,
+                                   approved_calc_dax=approved_calc_dax, viz_advice=viz_advice,
+                                   pbip=pbip, ds_catalog=ds_catalog, used_folders=used_folders)
                   for wb_id in source.list_workbooks()]
 
     summary = _summarize(ds_details, wb_details, viz is not None)

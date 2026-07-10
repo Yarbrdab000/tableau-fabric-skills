@@ -2799,6 +2799,13 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
     ``AmbiguousDatasourceError`` listing the options (call ``list_workbook_datasources`` to enumerate
     them). The ``Parameters`` pseudo-datasource is always skipped.
 
+    **Datasource-scoped -- for a whole workbook use ``migrate_workbook``.** This call builds the
+    *model* for one datasource; it never rebuilds the workbook's report. To rebuild an entire workbook
+    as an openable project -- its embedded datasource(s) AND the report bound to them -- call
+    ``migrate_estate.migrate_workbook(source, write_to=...)`` (the single-workbook form of
+    ``migrate_estate``). Reach for that whenever the input is a workbook and you want the report, not
+    just a datasource model.
+
     **Default-direct policy.** A datasource is rebuilt in place -- each table bound to its own source
     -- whenever that is safe, INCLUDING a multi-connection federation (Power BI relates the tables in
     the model layer). Only a genuinely-undoable shape (a cross-engine ``join``/``union`` relation,
