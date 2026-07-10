@@ -13,6 +13,18 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Fixed
+- **tableau-migration:** **A workbook migration no longer stops to ask the user whether the workbook
+  embeds its datasource or connects to a published one — STEP 2 auto-detection is the immediate,
+  mandatory behavior.** The 1.27.2 runbook tightened the confirmation-ledger `workbook ds:` line so hard
+  (it forbade any `auto-detect` deferral and offered only `embedded` / `published "<DS>"`) that the agent
+  concluded auto-detection was off the table and interrogated the user instead — the exact opposite of
+  the intent, and a contradiction of the runbook's own "never hand-classify" rule. `SKILL.md` now makes
+  **auto-detect run immediately for every workbook** (the ledger records the datasource as `auto-detected
+  at STEP 2`, and the agent never asks or hand-classifies), while keeping the hard guarantee intact: if
+  STEP 2 detects a published datasource it must be in scope so the report binds — fetch it and re-run
+  before accepting a local build, and never ship an empty workbook-only rebuild. Also corrects a dangling
+  forward reference — the Fabric note pointed at a STEP 3 "decision tree" that does not exist yet — to
+  point at STEP 3's actual duplicate-model guidance instead. Documentation only.
 - **tableau-migration:** **A published-backed workbook's datasource now co-migrates by default for a
   local output — no more empty reports.** The runbook (`SKILL.md`) let an agent migrate a
   published-datasource workbook without putting that datasource in scope, so the report rebuilt against

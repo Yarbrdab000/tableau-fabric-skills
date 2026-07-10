@@ -84,19 +84,19 @@ D6 — CREDENTIAL ACCESS  (only if D1=A; how I obtain the PAT / Connected-App se
 > rebuilds the report against the real schema either way. An **embedded** datasource rides inside the
 > workbook, so it's already in scope and consolidated automatically — nothing extra to do. A
 > **published** datasource is the *same flow* with one extra step: it lives outside the workbook (only a
-> `sqlproxy` stub travels along), so scope it as its **own D2 datasource name** and fetch it alongside
-> the workbook — then it migrates first and the workbook binds to it, just like embedded.
+> `sqlproxy` stub travels along), so once STEP 2 detects it, fetch that datasource by name into scope and
+> re-run — then it migrates first and the workbook binds to it, just like embedded.
 >
-> **For local output (D3=C, and the local bundle of D3=A) this is mandatory, not a choice.** There is no
-> workbook-only migration and no `auto-detect` defer — a published-backed workbook whose datasource is
-> missing from scope rebuilds to an **empty report**. STEP 2 **names** any published datasource it
-> detected; if that name isn't in scope yet, add it and re-run so the datasource lands first. Never ship
-> the empty result.
+> **For local output (D3=C, and the local bundle of D3=A), STEP 2 auto-detects immediately — you never
+> ask.** It tells you embedded or published; the only hard rule is that a published datasource's data
+> must be in scope so the report binds. If STEP 2 names one that isn't in scope yet, fetch that name and
+> re-run so it lands first. There is no workbook-only migration: a published-backed workbook whose
+> datasource is missing rebuilds to an **empty report** — never ship that empty result.
 >
 > **Fabric outputs (D3=A/B) are a *different decision tree*** — the published datasource may already
-> exist in the target workspace as a semantic model, so the choice is **bind-to-existing vs.
-> migrate-fresh**, not an automatic co-migrate. That tree is defined at STEP 3; do **not** apply the
-> local "always migrate first" rule to a Fabric deploy.
+> exist in the target workspace as a semantic model, so it's **bind-to-existing vs. migrate-fresh**
+> rather than an automatic co-migrate. Handle that deliberately at deploy (STEP 3, which flags
+> duplicate models); do **not** apply the local "always migrate first" rule to a Fabric deploy.
 
 ### Phase 0B — Credentials form (simple 2-file pattern)
 
@@ -174,7 +174,7 @@ LEDGER — confirm, then reply GO
   work dir   : <$RUN>   (scripts run from here; skill at <$SKILL>)
   source     : <D1 A live / B local>   from <SITE_URL/SITE_NAME  or  .\in>
   scope      : <all | datasource and/or workbook names>
-  workbook ds: <none | embedded (engine consolidates) | published "<DS>" — its datasource also scoped as a D2 name>   (omit if no workbook; a published-backed workbook's datasource MUST be its own D2 name so it's in scope — never "workbook only", never an `auto-detect` defer)
+  workbook ds: auto-detected at STEP 2 — never ask the user, never hand-classify (the engine reads the workbook itself)   (omit if no workbook. Embedded → consolidated automatically; published → its datasource is co-migrated FIRST so the report binds. For a local build, if STEP 2 names a published datasource that isn't in scope yet, fetch that name and re-run before accepting the build — never ship an empty workbook-only rebuild.)
   outputs    : <D3 A both / B Fabric only / C local only>
   conflicts  : <D4 overwrite | skip | stop>
   auth       : <D5 PAT | Connected App JWT>   (D6 secret via <Key Vault KV_NAME/SECRET_NAME | local terminal prompt>)
