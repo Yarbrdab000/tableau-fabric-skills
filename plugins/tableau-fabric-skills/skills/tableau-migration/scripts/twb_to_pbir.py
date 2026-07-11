@@ -3508,17 +3508,85 @@ _CANDIDATE_ALTS = {
 }
 
 
-def _candidate_plan(vt, chosen_pbir):
+def _candidate_plan(vt, chosen_pbir, ws=None, state=None):
     """(ranked candidate PBIR types [chosen first], confidence, hack flag) for a visual."""
     candidates = [chosen_pbir]
     flip = _orientation_flip(chosen_pbir)
     if flip:
         candidates.append(flip)
     extra, confidence, hack = _CANDIDATE_ALTS.get(vt, ([], "high", None))
+    if vt == VT_CARD:
+        # Spec 9a: a worksheet that card-collapsed but carries a LATENT dimension (a pie's slice
+        # category demoted to colour, a scatter's granularity dim on detail, a histogram bin calc,
+        # or a field-parameter dimension swap) is really a pie / scatter / bar. We do NOT change the
+        # deterministic emit (the safest step) -- we only widen the candidate list the image oracle
+        # may switch WITHIN and drop confidence to "medium", so the six real card-collapses become
+        # oracle-rescuable. A genuine KPI card has no latent signal -> keeps its single high candidate.
+        latent, latent_hack = _card_latent_candidates(ws, state)
+        if latent:
+            extra, confidence, hack = latent, "medium", latent_hack
     for c in extra:
         if c not in candidates:
             candidates.append(c)
     return candidates, confidence, hack
+
+
+_BIN_TOKEN_RE = re.compile(r"\bbin(s|ned|ning)?\b", re.I)
+_DIM_SWAP_RE = re.compile(r"by dimension|show by", re.I)
+
+
+def _card_is_constant_measure(ref):
+    """A bare-number 'measure' (e.g. ``_Measures.1``) is a Tableau dummy/spacer constant used to fake
+    a ring or pad a layout -- it is not a real datum, so it does not count toward the measure tally
+    that distinguishes a 1-measure pie from a 2-measure scatter."""
+    tail = str(ref or "").rsplit(".", 1)[-1].strip().strip('"')
+    return bool(re.fullmatch(r"-?\d+(\.\d+)?", tail))
+
+
+def _card_latent_candidates(ws, state):
+    """Spec 9a latent-dimension detector for a card-collapsed worksheet.
+
+    Returns ``([alternate PBIR chart types], hack_label)`` when a latent dimension is present, else
+    ``([], None)``. Conservative + additive: it only reads the already-parsed worksheet IR (encodings
+    survive the Measure-Values path) and the emitted value well; it never changes a deterministic emit.
+    Signals, in priority order (each maps to the faithful shape the fidelity-oracle confirmed):
+      * a **binned calc** demoted into the value well  -> histogram ``clusteredColumn/BarChart``
+      * a **field-parameter dimension swap** ("… by Dimension") -> swapped-category column/bar
+      * **>=2 measures + a latent detail dimension**  -> ``scatterChart``
+      * **<=1 measure + a latent legend/detail category** -> ``pieChart``/``donutChart``
+    Bin/swap are detected on the bound fields' CAPTIONS (which keep the Tableau spelling, e.g.
+    "Age Bins Label") -- the emitted queryRefs are underscore-sanitised, so a caption is the reliable
+    signal. The measure tally comes from the emitted Values well, ignoring bare-number spacer
+    constants (a Tableau donut-ring "1" is not a real measure)."""
+    if not isinstance(ws, dict):
+        return [], None
+    enc = ws.get("encodings") or {}
+
+    def _cat(role):
+        f = enc.get(role)
+        return isinstance(f, dict) and f.get("kind") == "category"
+
+    latent_color = _cat("color")
+    latent_detail = _cat("detail")
+    # captions of every field this worksheet binds (shelves + marks-card encodings)
+    bound = list(ws.get("rows") or []) + list(ws.get("cols") or [])
+    for role in ("color", "detail", "size", "label", "angle", "text"):
+        f = enc.get(role)
+        if isinstance(f, dict):
+            bound.append(f)
+    captions = [str(f.get("caption") or "") for f in bound if isinstance(f, dict)]
+    vals = (state.get("Values") or {}).get("projections", []) if isinstance(state, dict) else []
+    refs = [p.get("queryRef") or p.get("field") for p in vals]
+    n_real = sum(1 for r in refs if not _card_is_constant_measure(r))
+    if any(_BIN_TOKEN_RE.search(c) for c in captions):
+        return ["clusteredColumnChart", "clusteredBarChart"], "binned-calc card-collapse"
+    if ws.get("swap_controls") or any(_DIM_SWAP_RE.search(c) for c in captions):
+        return ["clusteredColumnChart", "clusteredBarChart"], "field-param dimension-swap card-collapse"
+    if latent_detail and n_real >= 2:
+        return ["scatterChart"], "latent-detail scatter card-collapse"
+    if (latent_color or latent_detail) and n_real <= 1:
+        return ["pieChart", "donutChart"], "latent-legend pie card-collapse"
+    return [], None
 
 
 def _visual_field_summary(query_state):
@@ -3564,7 +3632,7 @@ def _field_alias_map(ws, model_table, field_map):
 
 def _candidate_record(page_name, vname, ws, vtype, state, position, page_display=None,
                       model_table=None, field_map=None):
-    candidates, confidence, hack = _candidate_plan(ws["visual_type"], vtype)
+    candidates, confidence, hack = _candidate_plan(ws["visual_type"], vtype, ws=ws, state=state)
     fields = _visual_field_summary(state)
     rec = {
         "page": page_name,

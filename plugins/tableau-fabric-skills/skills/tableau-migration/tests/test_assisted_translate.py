@@ -256,3 +256,138 @@ def test_non_idiom_stub_is_byte_for_byte_unchanged():
     assert suggestions == []
     assert "TranslationSuggestion" not in tmdl
     assert "\tmeasure 'weird calc' = 0\n" in tmdl
+
+
+# ------------------------------------------------------- first/last-value-by-date detector
+# A resolver carrying a date column and a same-table numeric measure, plus a text column.
+_DT_FIELDS = {
+    "Score": ("Assess", "Score", "decimal"),
+    "Assess Date": ("Assess", "Assess_Date", "dateTime"),
+    "Client": ("Assess", "Client", "string"),
+    "Sales": ("Orders", "Sales", "decimal"),
+    "Order Date": ("Orders", "Order_Date", "dateTime"),
+}
+
+
+def _dt_resolver(caption):
+    return _DT_FIELDS.get(caption)
+
+
+_LAST_BY_DATE_DAX = (
+    "VAR __d = MAX('Assess'[Assess_Date])\n"
+    "RETURN\n"
+    "    CALCULATE(AVERAGE('Assess'[Score]), 'Assess'[Assess_Date] = __d)"
+)
+_FIRST_BY_DATE_DAX = _LAST_BY_DATE_DAX.replace("MAX(", "MIN(")
+
+
+def test_last_value_by_date_detected_with_exact_dax():
+    f = "IF [Assess Date] = WINDOW_MAX([Assess Date]) THEN [Score] END"
+    s = suggest_assisted_dax(f, _dt_resolver)
+    assert s is not None
+    assert s["pattern"] == "last-value-by-date"
+    assert s["requires_approval"] is True
+    assert s["dax"] == _LAST_BY_DATE_DAX
+    assert any("latest" in c for c in s["caveats"])
+
+
+def test_first_value_by_date_detected_with_exact_dax():
+    # WINDOW_MIN -> earliest, and the equality is written the other way round.
+    f = "IF WINDOW_MIN([Assess Date]) = [Assess Date] THEN [Score] END"
+    s = suggest_assisted_dax(f, _dt_resolver)
+    assert s is not None
+    assert s["pattern"] == "first-value-by-date"
+    assert s["dax"] == _FIRST_BY_DATE_DAX
+    assert "MIN('Assess'[Assess_Date])" in s["dax"] and "MAX(" not in s["dax"]
+
+
+def test_first_last_by_date_gate_passes():
+    from translation_router import check_candidate_dax
+    for f in ("IF [Assess Date] = WINDOW_MAX([Assess Date]) THEN [Score] END",
+              "IF [Assess Date] = WINDOW_MIN([Assess Date]) THEN [Score] END"):
+        s = suggest_assisted_dax(f, _dt_resolver)
+        assert check_candidate_dax(s["dax"])["ok"] is True
+
+
+def test_first_last_by_date_text_result_abstains():
+    # the THEN result is a text column -> AVERAGE would be invalid, abstain
+    f = "IF [Assess Date] = WINDOW_MAX([Assess Date]) THEN [Client] END"
+    assert suggest_assisted_dax(f, _dt_resolver) is None
+
+
+def test_first_last_by_date_else_abstains():
+    f = "IF [Assess Date] = WINDOW_MAX([Assess Date]) THEN [Score] ELSE 0 END"
+    assert suggest_assisted_dax(f, _dt_resolver) is None
+
+
+def test_first_last_by_date_mismatched_field_abstains():
+    # the windowed date field differs from the compared field -> not the idiom
+    f = "IF [Assess Date] = WINDOW_MAX([Order Date]) THEN [Score] END"
+    assert suggest_assisted_dax(f, _dt_resolver) is None
+
+
+def test_first_last_by_date_cross_table_abstains():
+    # date on Orders, measure on Assess -> single-table only
+    f = "IF [Order Date] = WINDOW_MAX([Order Date]) THEN [Score] END"
+    assert suggest_assisted_dax(f, _dt_resolver) is None
+
+
+# ------------------------------------------------------------------- year-gated detector
+def test_year_gated_literal_detected_with_exact_dax():
+    f = "IF YEAR([Order Date]) = 2024 THEN [Sales] END"
+    s = suggest_assisted_dax(f, _dt_resolver)
+    assert s is not None
+    assert s["pattern"] == "year-gated-measure"
+    assert s["dax"] == (
+        "CALCULATE(SUM('Orders'[Sales]), KEEPFILTERS(YEAR('Orders'[Order_Date]) = 2024))")
+
+
+def test_year_gated_current_year_today_uses_maxyr_anchor():
+    f = "IF YEAR([Order Date]) = YEAR(TODAY()) THEN [Sales] END"
+    s = suggest_assisted_dax(f, _dt_resolver)
+    assert s is not None
+    assert s["dax"] == (
+        "VAR __y = YEAR(CALCULATE(MAX('Orders'[Order_Date]), "
+        "REMOVEFILTERS('Orders'[Order_Date])))\n"
+        "RETURN\n"
+        "    CALCULATE(SUM('Orders'[Sales]), KEEPFILTERS(YEAR('Orders'[Order_Date]) = __y))")
+    assert any("MAX year" in c for c in s["caveats"])
+
+
+def test_year_gated_current_year_maxdate_signal():
+    # YEAR(MAX([d])) on the SAME date field is also a "current year" signal.
+    f = "IF YEAR([Order Date]) = YEAR(MAX([Order Date])) THEN [Sales] END"
+    s = suggest_assisted_dax(f, _dt_resolver)
+    assert s is not None and "VAR __y = YEAR(CALCULATE(MAX(" in s["dax"]
+
+
+def test_year_gated_current_year_via_referenced_calc():
+    # the year signal is a bare calc reference resolving to YEAR(TODAY()).
+    f = "IF YEAR([Order Date]) = [This Year] THEN [Sales] END"
+    s = suggest_assisted_dax(f, _dt_resolver, calc_lookup={"this year": "YEAR(TODAY())"})
+    assert s is not None and "VAR __y = YEAR(CALCULATE(MAX(" in s["dax"]
+
+
+def test_year_gated_gate_passes():
+    from translation_router import check_candidate_dax
+    for f in ("IF YEAR([Order Date]) = 2024 THEN [Sales] END",
+              "IF YEAR([Order Date]) = YEAR(TODAY()) THEN [Sales] END"):
+        s = suggest_assisted_dax(f, _dt_resolver)
+        assert check_candidate_dax(s["dax"])["ok"] is True
+
+
+def test_year_gated_non_date_arg_abstains():
+    # YEAR() over a numeric field is not a date gate -> abstain
+    f = "IF YEAR([Sales]) = 2024 THEN [Sales] END"
+    assert suggest_assisted_dax(f, _dt_resolver) is None
+
+
+def test_year_gated_text_result_abstains():
+    f = "IF YEAR([Order Date]) = 2024 THEN [Client] END"
+    assert suggest_assisted_dax(f, _dt_resolver) is None
+
+
+def test_year_gated_unknown_year_signal_abstains():
+    # a non-literal, non-current-year RHS (e.g. prior-year arithmetic) is out of scope -> abstain
+    f = "IF YEAR([Order Date]) = YEAR(TODAY()) - 1 THEN [Sales] END"
+    assert suggest_assisted_dax(f, _dt_resolver) is None

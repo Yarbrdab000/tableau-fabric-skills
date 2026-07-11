@@ -2768,6 +2768,31 @@ def test_combine_descriptors_empty_raises():
         combine_descriptors([])
 
 
+def test_combine_descriptors_table_map_reused_base_and_self_join():
+    # Spec 6: the consolidation surfaces the base-table -> consolidated-name map it computes.
+    # Assessments' Contact stays bare (primary); Service Delivery's Contact -> suffixed (reused
+    # base); a same-datasource self-join alias keeps its own distinct consolidated name.
+    a = _desc("Assessments", ["Contact", "Assessment"])
+    b = _desc("Service Delivery", ["Contact", "Contact (Manager)", "ServiceDelivery"])
+    combined = combine_descriptors([a, b], captions=["Assessments", "Service Delivery"])
+    assert combined["table_map"] == {
+        "Assessments||Contact": "Contact",
+        "Assessments||Assessment": "Assessment",
+        "Service Delivery||Contact": "Contact (Service Delivery)",
+        "Service Delivery||Contact (Manager)": "Contact (Manager)",
+        "Service Delivery||ServiceDelivery": "ServiceDelivery",
+    }
+    # every mapped value is a real emitted relation name (nothing dangles)
+    rel_names = {r["name"] for r in combined["relations"]}
+    assert set(combined["table_map"].values()) <= rel_names
+
+
+def test_combine_descriptors_single_has_no_table_map():
+    # A one-datasource passthrough carries no consolidation renaming, so no table_map key.
+    a = _desc("Solo", ["Orders"])
+    assert "table_map" not in combine_descriptors([a])
+
+
 TWO_DATASOURCE_WB = """<?xml version='1.0' encoding='utf-8' ?>
 <workbook>
   <datasources>

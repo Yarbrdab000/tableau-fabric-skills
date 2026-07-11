@@ -39,6 +39,7 @@ _FIELDS = {
     "Sales": ("Orders", "Sales", "decimal"),
     "State": ("Orders", "State", "string"),
     "City": ("Orders", "City", "string"),
+    "Order Date": ("Orders", "Order_Date", "dateTime"),
 }
 
 
@@ -54,6 +55,10 @@ _ARGMAX_INLINE = f"IF {_ARGMAX_MAX} = {_ARGMAX_DETAIL} THEN [City] END"
 # The argmin twin (MIN selector) -- same structural idiom, MINX/__min emit.
 _ARGMIN_MIN = "{FIXED [State] : MIN({FIXED [State], [City] : SUM([Sales])})}"
 _ARGMIN_INLINE = f"IF {_ARGMIN_MIN} = {_ARGMAX_DETAIL} THEN [City] END"
+# The "value on the latest date" idiom (WINDOW_MAX gate) -> whole-table extreme-date measure.
+_LAST_BY_DATE = "IF [Order Date] = WINDOW_MAX([Order Date]) THEN [Sales] END"
+# The year-gated measure idiom (fixed literal year) -> KEEPFILTERS year filter.
+_YEAR_GATED = "IF YEAR([Order Date]) = 2024 THEN [Sales] END"
 
 
 # --------------------------------------------------------------------------- canonical sidecar DAX
@@ -105,6 +110,26 @@ _CORPUS = [
         "truth": "Burlington",
         "wrong": "New York City",
         "value_kind": None,            # text -> exact compare
+    },
+    {
+        "name": "last value by date: Sales on the latest Order Date",
+        "kind": "detect",
+        "pattern": "last-value-by-date",
+        "formula": _LAST_BY_DATE,
+        "calc_lookup": None,
+        "truth": 88.5,
+        "wrong": 88.5 * 1.10,
+        "value_kind": None,            # numeric -> float compare within rel tol
+    },
+    {
+        "name": "year-gated measure: Sales in 2024",
+        "kind": "detect",
+        "pattern": "year-gated-measure",
+        "formula": _YEAR_GATED,
+        "calc_lookup": None,
+        "truth": 500000.0,
+        "wrong": 550000.0,
+        "value_kind": None,            # numeric -> float compare within rel tol
     },
     {
         "name": "Highest Selling City By State Sales",   # C1 canonical sidecar (scalar measure)
@@ -198,13 +223,21 @@ def test_raw_tableau_formula_is_refused_by_the_gate():
     # The second compiler's worst failure mode is pasting the UN-TRANSLATED Tableau formula (carrying
     # its ``{FIXED ...}`` idiom) as if it were DAX. The gate must refuse it -- with a leftover-idiom
     # issue -- BEFORE any backend call, using the real corpus formulas (faithful, not synthetic).
+    #
+    # This is scoped to the LOD-brace idioms the gate's ``_LEFTOVER_TABLEAU_TOKENS`` check is designed
+    # to catch (DAX has no curly-brace syntax). The IF/THEN/END idioms (first/last-by-date, year-gated)
+    # are deliberately NOT flagged here: bare ``THEN``/``END`` cannot be rejected without false-positives
+    # on legitimate DAX identifiers such as ``[Month End]`` / ``[Quarter End]``, so broadening the gate
+    # was declined. Those idioms' raw formulas are invalid DAX and fail at the engine, not the gate.
     hits = {"n": 0}
 
     def counting_oracle(q):
         hits["n"] += 1
         return _wrap(1.0)
 
-    for entry in _DETECT:
+    lod_entries = [e for e in _DETECT if "{" in e["formula"]]
+    assert lod_entries, "expected at least one LOD-brace idiom in the corpus"
+    for entry in lod_entries:
         raw = entry["formula"]
         verdict = R.check_candidate_dax(raw)
         assert verdict["ok"] is False, entry["name"]

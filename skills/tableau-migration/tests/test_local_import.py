@@ -97,6 +97,36 @@ SQLSERVER_TDS = """<?xml version='1.0' encoding='utf-8' ?>
 </datasource>"""
 
 
+# An extract-backed unmapped-connector datasource that ALSO carries a what-if (range) parameter and a
+# calc that inlines it (``SUM([Sales]) * [Parameters].[Growth Rate]``). The consolidation/local-CSV path
+# assembles straight from the descriptor (no source text in hand), so unless ``migrate_datasource``
+# parses + threads the parameters here, ``param_resolver`` is None and this calc stubs "unmodeled".
+PARAM_LOCAL_TDS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Param Feed' inline='true' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='minio' name='odbc.cc11'>
+        <connection class='genericodbc' dbname='dx' server='data.comcast.com' />
+      </named-connection>
+    </named-connections>
+    <relation connection='odbc.cc11' name='Orders' table='[dx].[Orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>real</local-type>
+      </metadata-record>
+    </metadata-records>
+    <extract enabled='true' />
+  </connection>
+  <column caption='Growth Rate' datatype='real' name='[Growth]' param-domain-type='range' value='1.0'>
+    <range min='0.0' max='2.0' granularity='0.1' />
+  </column>
+  <column caption='Boosted Sales' datatype='real' name='[Calculation_1]' role='measure'>
+    <calculation class='tableau' formula='SUM([Sales]) * [Parameters].[Growth Rate]' />
+  </column>
+</datasource>"""
+
+
 def _write_csv(path, header, rows):
     import csv
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -192,6 +222,40 @@ def test_local_data_overrides_supported_connector(tmp_path):
     body = _table_part(result)
     assert "Csv.Document" in body
     assert "Sql.Database" not in body
+
+
+# -- Spec 3: parameters reach the calc translator on the local-CSV (consolidation) path -----------
+def test_param_driven_calc_translates_on_local_csv_path(tmp_path):
+    # A what-if-parameter-driven measure must land as a REAL measure -- not a stub -- when the model is
+    # built through the local-CSV path (the extract-backed consolidation route). This is the live-DB
+    # analog of the direct migrate_tds_to_semantic_model path, which auto-parses parameters from the
+    # source text; here migrate_datasource must parse + thread them itself so param_resolver is built.
+    csv_path = _write_csv(str(tmp_path / "orders.csv"), ["Sales"], [[10.0], [20.0]])
+    result = A.migrate_datasource(
+        PARAM_LOCAL_TDS, model_name="Orders", local_data={"Orders": csv_path})
+
+    measures = {m["measure"]: m for m in result["report"]["measures"]}
+    boosted = measures["Boosted Sales"]
+    assert boosted["status"] == "translated", boosted
+    # the parameter is inlined as its what-if value measure, not left as an unmodeled reference
+    assert "[Growth Rate Value]" in boosted["dax"]
+    assert "[Parameters]" not in boosted["dax"]
+    # the what-if table backing the parameter was emitted into the model
+    assert any("Growth Rate" in p for p in result["parts"])
+
+
+def test_local_csv_param_absent_leaves_calc_stub_and_no_whatif_table(tmp_path):
+    # Fail-closed / caller-wins guard: an explicit parameters=[] (the pre-fix behaviour) is honoured --
+    # the param stays unmodelled, the calc stubs, and no what-if table is fabricated. Proves the
+    # auto-parse threading is load-bearing (it only engages when the caller did not supply parameters).
+    csv_path = _write_csv(str(tmp_path / "orders.csv"), ["Sales"], [[10.0]])
+    result = A.migrate_datasource(
+        PARAM_LOCAL_TDS, model_name="Orders", local_data={"Orders": csv_path}, parameters=[])
+
+    boosted = {m["measure"]: m for m in result["report"]["measures"]}["Boosted Sales"]
+    assert boosted["status"] == "stub"
+    assert "[Parameters].[Growth Rate]" in (boosted.get("reason") or "")
+    assert not any("Growth Rate" in p for p in result["parts"])
 
 
 def test_multi_table_unmatched_is_reported_not_dropped(tmp_path):
@@ -317,15 +381,58 @@ def test_local_csv_drops_phantom_column(tmp_path):
 
 
 def test_local_csv_dedupes_duplicate_columns(tmp_path):
-    # Region appears twice in the metadata but is a single physical header.
+    # Region appears twice in the metadata but is a single physical header. The twin now collapses at
+    # PARSE (_columns_by_parent, keep-first), so the model is openable regardless of whether a CSV
+    # header is readable; the flat-file reconcile no longer has to dedupe it.
     csv_path = _write_csv(str(tmp_path / "snap.csv"), ["Region", "PendingJobs"], [["Beltway", 1]])
     result = A.migrate_datasource(PHANTOM_DUP_TDS, model_name="Snap",
                                   local_data={"Snap": csv_path})
     body = _table_part(result)
     assert _count_columns(body, "Region") == 1        # duplicate column collapsed to one
     assert body.count('"Region"') == 1                # and typed once in the M partition
-    deduped = result["report"]["local_import"]["column_reconcile"]["deduped"]
-    assert any(d["source_column"] == "Region" for d in deduped)
+    gate = result["report"].get("openability_selfcheck") or {}
+    assert gate.get("checks", {}).get("no_duplicate_columns") is True
+
+
+# A MAPPED (sqlserver) source whose metadata carries a TWIN column record -- one logical record with
+# no <ordinal>, one from the extract cache with an <ordinal> -- both cleaning to the same model_name.
+# There is no local CSV here, so the flat-file column_reconcile never runs; parse-level dedup in
+# _columns_by_parent is the ONLY thing that keeps the model openable (no duplicate column).
+TWIN_TDS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Orders' inline='true' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='srv' name='sqlserver.0a1b2c'>
+        <connection authentication='sqlserver' class='sqlserver' dbname='Sales'
+                    server='srv.database.windows.net' username='svc' />
+      </named-connection>
+    </named-connections>
+    <relation connection='sqlserver.0a1b2c' name='Orders' table='[dbo].[Orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Region</remote-name><local-name>[Region]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>real</local-type><ordinal>1</ordinal>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Region</remote-name><local-name>[Region]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>string</local-type><ordinal>0</ordinal>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+
+def test_twin_metadata_column_deduped_at_parse_live_db():
+    # No local_data: the flat-file reconcile never runs, so parse-level dedup is the only safety net.
+    result = A.migrate_datasource(TWIN_TDS, model_name="Orders")
+    body = _table_part(result)
+    assert _count_columns(body, "Region") == 1        # the twin collapsed to a single column
+    gate = result["report"].get("openability_selfcheck") or {}
+    assert gate.get("checks", {}).get("no_duplicate_columns") is True
 
 
 def test_local_csv_keeps_columns_when_header_unreadable(tmp_path):

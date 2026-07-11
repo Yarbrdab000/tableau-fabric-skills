@@ -18,6 +18,8 @@ from twb_to_pbir import (
     SCHEMA_VISUAL_FP,
     SCHEMA_VISUAL_SM,
     _apply_override,
+    _candidate_plan,
+    _card_latent_candidates,
     _drop_resolved_flag_warnings,
     _field_expression,
     _flag_filter_container,
@@ -1518,6 +1520,118 @@ def test_field_alias_map_maps_star_schema_date_rebind_back_to_source_caption():
                     "binding": "column", "date_rebound": True}],
           "encodings": {}}
     assert _field_alias_map(ws, "Orders", None) == {"Date.Date": "Order Date"}
+
+
+# -- Spec 9a: card-collapse latent-dimension candidate rescue ------------------
+def _mv_card(name, members, encodings_body=""):
+    """A Measure-Values card (measure names on cols, Text marks) -- the exact path the six real
+    ``multiRowCard`` collapses take. ``encodings_body`` adds the latent marks-card pills that survive
+    the MV route (a <color> legend dim, a <lod> detail dim)."""
+    text = "<text column='[federated.abc].[Multiple Values]' />"
+    return _worksheet(name, "Text", rows="", cols="[federated.abc].[:Measure Names]",
+                      deps_extra=_INST,
+                      encodings=f"<encodings>{text}{encodings_body}</encodings>",
+                      filters=_mv_filter(members))
+
+
+def test_card_collapse_with_latent_legend_offers_pie_at_medium_confidence():
+    # A pie whose slice category was demoted to Colour goes through the Measure-Values path and
+    # card-collapses to a single big number; the latent legend dimension survives on the colour
+    # encoding, so Spec 9a widens the candidate list to pie/donut at MEDIUM confidence -- the image
+    # oracle can then rescue it. The DETERMINISTIC emit is unchanged (still a card).
+    ws = _mv_card("Engagements by Stage", ["sum:Sales:qk"],
+                  "<color column='[federated.abc].[none:Region:nk]' />")
+    res = migrate_twb_to_pbir(_workbook(ws))
+    rec = [r for r in res["candidate_records"] if r["worksheet"] == "Engagements by Stage"][0]
+    assert rec["candidates"] == ["card", "pieChart", "donutChart"]
+    assert rec["confidence"] == "medium"
+    assert rec["hack"] == "latent-legend pie card-collapse"
+    # deterministic emit untouched: the visual still renders as the collapsed card
+    vt = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]["visual"]["visualType"]
+    assert vt in ("card", "multiRowCard")
+
+
+def test_card_collapse_with_latent_detail_and_two_measures_offers_scatter():
+    # A scatter (two measures against each other, granularity dim on Detail) card-collapses; the
+    # latent detail dimension + two real measures make it recoverable as a scatterChart at medium.
+    ws = _mv_card("Score Distribution", ["sum:Sales:qk", "sum:Profit:qk"],
+                  "<lod column='[federated.abc].[none:State:nk]' />")
+    res = migrate_twb_to_pbir(_workbook(ws))
+    rec = [r for r in res["candidate_records"] if r["worksheet"] == "Score Distribution"][0]
+    assert rec["candidates"] == ["multiRowCard", "scatterChart"]
+    assert rec["confidence"] == "medium"
+    assert rec["hack"] == "latent-detail scatter card-collapse"
+
+
+def test_genuine_kpi_card_keeps_single_high_confidence_candidate():
+    # A real KPI tile row (measures only, NO latent dimension) must NOT be offered an alternate -- it
+    # stays a single high-confidence multiRowCard so the oracle never second-guesses a true card.
+    ws = _mv_card("KPIs", ["sum:Sales:qk", "sum:Profit:qk"])
+    res = migrate_twb_to_pbir(_workbook(ws))
+    rec = [r for r in res["candidate_records"] if r["worksheet"] == "KPIs"][0]
+    assert rec["candidates"] == ["multiRowCard"]
+    assert rec["confidence"] == "high"
+    assert rec["hack"] is None
+
+
+def test_card_latent_candidates_binned_calc_offers_histogram():
+    # a continuous binned calc demoted into the value well (caption keeps the Tableau spelling
+    # "Age Bins Label"; the emitted ref is underscore-sanitised) -> a histogram column/bar.
+    ws = {"rows": [], "cols": [{"caption": "Age Bins Label", "kind": "value"}],
+          "encodings": {}, "swap_controls": []}
+    state = {"Values": {"projections": [{"queryRef": "Sum(Orders.Age_Bins_Label)"}]}}
+    cands, hack = _card_latent_candidates(ws, state)
+    assert cands == ["clusteredColumnChart", "clusteredBarChart"]
+    assert hack == "binned-calc card-collapse"
+
+
+def test_card_latent_candidates_field_param_dimension_swap_offers_bar():
+    # the field-parameter dimension swap ("... by Dimension"): detected either from swap_controls or
+    # the bound field caption -> a swapped-category column/bar.
+    state = {"Values": {"projections": [{"queryRef": "Sum(Orders.Sales_Amount)"}]}}
+    by_swap = {"rows": [], "cols": [], "encodings": {}, "swap_controls": [{"param_id": "p"}]}
+    c1, h1 = _card_latent_candidates(by_swap, state)
+    assert c1 == ["clusteredColumnChart", "clusteredBarChart"]
+    assert h1 == "field-param dimension-swap card-collapse"
+    by_caption = {"rows": [], "cols": [{"caption": "Show by Dimension", "kind": "value"}],
+                  "encodings": {}, "swap_controls": []}
+    c2, _ = _card_latent_candidates(by_caption, state)
+    assert c2 == ["clusteredColumnChart", "clusteredBarChart"]
+
+
+def test_card_latent_candidates_ignores_constant_spacer_measure():
+    # a Tableau donut-ring "1" is a spacer constant, not a real measure -- excluding it leaves ONE
+    # real measure beside a latent detail category, so the shape is a pie, NOT a two-measure scatter.
+    ws = {"rows": [], "cols": [],
+          "encodings": {"detail": {"caption": "Stage", "kind": "category"}}, "swap_controls": []}
+    state = {"Values": {"projections": [{"queryRef": "Count(Orders.Engagements)"},
+                                        {"queryRef": "_Measures.1"}]}}
+    cands, hack = _card_latent_candidates(ws, state)
+    assert cands == ["pieChart", "donutChart"]
+    assert hack == "latent-legend pie card-collapse"
+
+
+def test_card_latent_candidates_no_signal_returns_empty():
+    ws = {"rows": [], "cols": [], "encodings": {}, "swap_controls": []}
+    state = {"Values": {"projections": [{"queryRef": "Sum(Orders.Sales_Amount)"}]}}
+    assert _card_latent_candidates(ws, state) == ([], None)
+    assert _card_latent_candidates(None, state) == ([], None)
+
+
+def test_candidate_plan_card_medium_only_with_latent_signal_and_non_card_unchanged():
+    from twb_to_pbir import VT_CARD
+    with_latent = {"rows": [], "cols": [],
+                   "encodings": {"color": {"caption": "R", "kind": "category"}}, "swap_controls": []}
+    one_meas = {"Values": {"projections": [{"queryRef": "Sum(Orders.X)"}]}}
+    cands, conf, hack = _candidate_plan(VT_CARD, "card", ws=with_latent, state=one_meas)
+    assert cands == ["card", "pieChart", "donutChart"] and conf == "medium"
+    assert hack == "latent-legend pie card-collapse"
+    no_latent = {"rows": [], "cols": [], "encodings": {}, "swap_controls": []}
+    cands2, conf2, hack2 = _candidate_plan(VT_CARD, "card", ws=no_latent, state=one_meas)
+    assert cands2 == ["card"] and conf2 == "high" and hack2 is None
+    # a non-card visual is unaffected by ws/state (existing orientation-alt behaviour preserved)
+    cands3, conf3, _ = _candidate_plan("bar", "clusteredColumnChart", ws=None, state=None)
+    assert cands3 == ["clusteredColumnChart", "clusteredBarChart"] and conf3 == "high"
 
 
 def test_parse_accepts_utf8_bom_bytes():

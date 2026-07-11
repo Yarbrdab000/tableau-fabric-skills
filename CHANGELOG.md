@@ -13,6 +13,30 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.28.1` → `1.29.0`): native-capability spec integration — a batch of
+  additive, backward-compatible engine behaviors that reproduce hand-done agent adjudication as
+  deterministic build output. All opt-in seams default OFF so an omitted flag is byte-identical to the
+  prior baseline.** Highlights:
+  - **Second-compiler landing driver** (`scripts/second_compiler.py`, net-new): `land_second_compiler` /
+    `land_report` seed keystones from `authored` overrides **plus** the engine's own idiom detectors,
+    gate-and-land each via `check_candidate_dax`, then fix-point-cascade every dependent calc back through
+    the native translator (≤12 rounds, each still gated) so a measure-of-measure stub chain lands whole
+    off one keystone. Returns ONLY the keystone-dependent supplement, preserving `deterministic`
+    provenance for purely-deterministic calcs. Wired as an **opt-in** through `migrate_workbook`
+    (covers estate + standalone), `migrate_estate`, and the CLI (`--second-compile` / `--author FILE`,
+    author implies second-compile); merged UNDER `approved_calc_dax` so a human-approved entry always
+    wins; fail-closed; stamps an additive `second_compile` record per workbook.
+  - **Assisted idiom detectors** (Spec 7): first/last-by-date and year-gated (`IF YEAR([d]) = 2023 THEN
+    [x] END` → `CALCULATE(SUM(...), KEEPFILTERS(YEAR(...) = 2023))`) idioms are recognized and emitted as
+    gated DAX, fired only when the deterministic translate returns falsy.
+  - **Stub triage** (Spec 5): keystone/cascadable classification (`_stub_shape` + `_triage_stubs`) with an
+    additive `triage` key on the translation-handoff artifact, so the assisted tier knows what to author
+    first.
+  - **Openability + de-dup + local-CSV parameter threading + consolidated table map** (Specs 1, 2, 3, 6):
+    openability self-check surfaced on the build detail; datasource de-dup by `(parent, model_name)`;
+    workbook parameters parsed and threaded on the local-CSV consolidation path; a consolidated
+    `table_map` built from combined descriptors.
+  - **Visual-layer latent-dimension candidate seam** (Spec 9a) for report-side card recovery.
 - **tableau-migration:** **`migrate_estate.py --scan` — a read-only pre-build discovery gate that stops a
   published-backed workbook from ever being built to an empty report.** Prior runbook guidance only
   surfaced a missing published datasource *after* a build (in `report.json`), so an agent could run the
