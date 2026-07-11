@@ -68,6 +68,7 @@ try:  # package or scripts-on-path
     from .workbook_table_calcs import extract_table_calc_usages
     from .date_window_flag import build_date_window_flags
     from .openability_gate import check_model_openability
+    from . import linguistic as L
 except ImportError:
     from connection_to_m import (
         build_m_field_resolver,
@@ -108,10 +109,35 @@ except ImportError:
     from workbook_table_calcs import extract_table_calc_usages
     from date_window_flag import build_date_window_flags
     from openability_gate import check_model_openability
+    import linguistic as L
 
 
 def _table_display(rel):
     return rel.get("name") or rel.get("item") or "Table"
+
+
+def _linguistic_fields(descriptor):
+    """``(entity, property, model_column, caption)`` tuples for every real source column.
+
+    Mirrors the column-emission loop in ``assemble_import_model``: only physical ``table`` /
+    ``custom_sql`` relations that carry columns contribute, so generated tables (the Date
+    dimension, ``_Measures``) and calculated columns never appear. ``entity`` is the model table
+    display name (ConceptualEntity), ``property`` and ``model_column`` are the emitted TMDL column
+    name (ConceptualProperty), and ``caption`` is the Tableau display name (``local_name``) that
+    may become a Q&A synonym. A column missing either an emitted name or a caption is skipped.
+    """
+    fields = []
+    for rel in (descriptor or {}).get("relations", []):
+        if rel.get("kind") not in ("table", "custom_sql"):
+            continue
+        entity = _table_display(rel)
+        for c in rel.get("columns") or []:
+            model_name = c.get("model_name") or c.get("remote_name")
+            caption = c.get("local_name") or c.get("remote_name")
+            if not model_name or not caption:
+                continue
+            fields.append((entity, model_name, model_name, caption))
+    return fields
 
 
 def _gate_flatfile_headers(descriptor, flatfile_path=None):
@@ -2491,7 +2517,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                   hierarchies=None, display_folders=None, rls_roles=None,
                                   date_table=True, mark_as_date=True, flatfile_path=None,
                                   approved_calc_dax=None, date_range=None, select=None,
-                                  parameters=None, table_calc_usages=None, descriptor=None):
+                                  parameters=None, table_calc_usages=None, descriptor=None,
+                                  emit_linguistic=False):
     """One-call convenience: parse ``.tds``/``.twb`` text and assemble the Import/DirectQuery model.
 
     ``calcs`` are the MEASURE-role calculated fields and ``dim_calcs`` the DIMENSION/row-level ones
@@ -2528,6 +2555,13 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
     workbook's several embedded datasources). When given, the internal ``parse_tds`` is skipped and
     the model is built from it verbatim -- so every relation across every combined island lands in the
     ONE model. ``None`` (default) re-parses ``tds_text`` as before, so existing callers are unchanged.
+
+    ``emit_linguistic`` (default ``False``) opts in to a Power BI Q&A ``cultureInfo`` part built from
+    the Tableau field captions (``scripts/linguistic.py``): a ``definition/cultures/<lang>.tmdl`` part
+    plus a ``ref cultureInfo`` line on ``model.tmdl``. It is OFF by default because a malformed culture
+    file fails MODEL LOAD; certify the byte-shape once in Power BI Desktop / Tabular Editor before
+    turning it on. When on but no caption differs from its model column, nothing is written and the
+    output is byte-identical.
     """
     if descriptor is None:
         descriptor = parse_tds(tds_text, select)
@@ -2543,6 +2577,7 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
     except Exception:
         calc_lookup = _calc_lookup_from(calcs)
     enrichment_report = None
+    harvest_calc_columns = {}
     if hierarchies is None and display_folders is None and rls_roles is None:
         parsed = T.parse_model_objects(tds_text)
         resolve = build_m_field_resolver(descriptor)
@@ -2550,10 +2585,12 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
             resolve, _build_ci_field_index(descriptor, resolve))
         data_tables = [_table_display(r) for r in descriptor.get("relations", [])
                        if r.get("kind") in ("table", "custom_sql") and r.get("columns")]
-        resolved = T.resolve_model_objects(parsed, resolve, calcs=calcs, data_tables=data_tables)
+        resolved = T.resolve_model_objects(parsed, resolve, calcs=calcs,
+                                            data_tables=data_tables, parameters=parameters)
         hierarchies = resolved["hierarchies"]
         display_folders = resolved["display_folders"]
         rls_roles = resolved["roles"]
+        harvest_calc_columns = resolved.get("calc_columns") or {}
         enrichment_report = resolved["report"]
     # Workbook table calcs (quick table calcs + addressing-bearing field calcs) are recovered from
     # the document text so the model build can emit them as faithful measures. A bare ``.tds`` has no
@@ -2578,6 +2615,32 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                    calc_lookup=calc_lookup, approved_calc_dax=approved_calc_dax,
                                    date_range=date_range, parameters=parameters,
                                    table_calc_usages=table_calc_usages)
+    # Splice harvested Group/Bin calc columns onto their resolved home tables -- the same additive
+    # pre-partition injection as dim_calcs (byte-for-byte unchanged when there are no groups/bins).
+    harvest_parts = result.get("parts") if isinstance(result, dict) else None
+    if harvest_parts and harvest_calc_columns:
+        for _disp, _block in harvest_calc_columns.items():
+            _path = f"definition/tables/{_disp}.tmdl"
+            if _path in harvest_parts:
+                harvest_parts[_path] = T.enrich_table_tmdl(harvest_parts[_path], calc_columns=_block)
+    # Q&A linguistic synonyms (OPT-IN, default off): field captions -> a cultureInfo part + a
+    # ``ref cultureInfo`` on model.tmdl. Fully additive and byte-identical when off or when no
+    # caption differs from its model column. Fail-closed -- a hiccup here must never break the build.
+    if emit_linguistic and isinstance(harvest_parts, dict):
+        try:
+            _ling_fields = _linguistic_fields(descriptor)
+            _culture = L.build_linguistic_culture(_ling_fields)
+            if _culture:
+                harvest_parts["definition/cultures/en-US.tmdl"] = _culture
+                _mkey = "definition/model.tmdl"
+                if _mkey in harvest_parts and "ref cultureInfo" not in harvest_parts[_mkey]:
+                    harvest_parts[_mkey] = (
+                        harvest_parts[_mkey].rstrip("\n") + "\n\nref cultureInfo en-US\n")
+                if enrichment_report is None:
+                    enrichment_report = {}
+                enrichment_report["linguistic"] = L.linguistic_audit(_ling_fields)
+        except Exception:
+            pass
     if enrichment_report is not None:
         result["report"]["model_objects"] = enrichment_report
     return result

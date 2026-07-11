@@ -13,6 +13,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.29.0` → `1.30.0`): Model Object Harvest — three additional Tableau
+  object kinds now rebuild as faithful semantic-model objects. Additive and backward-compatible; the
+  linguistic emission is opt-in and default OFF, so an omitted flag is byte-identical to the prior
+  baseline.** Highlights:
+  - **Groups → `SWITCH` calc columns** (§3.1): a `<calculation class='categorical-bin'>` group over a
+    base column becomes a string calc column `SWITCH(TRUE(), <col> IN {..}, "label", .., <tail>)`, where
+    the tail is the base column itself when the group passes unlisted values through (`new-bin='true'`)
+    else `BLANK()`. Default-ON (reuses the proven calc-column generators).
+  - **Numeric bins → `INT()` calc columns** (§3.2): a `<calculation class='bin'>` becomes
+    `INT((<col> - peg) / size) * size + peg` (INT floors toward negative infinity, matching Tableau's
+    bin flooring). The width is a literal `size=` or the DEFAULT of a referenced `size-parameter`; an
+    unresolvable width leaves an inert `= BLANK()` stub plus a skip reason (a width is never assumed).
+    Default-ON.
+  - **Field captions → Q&A `cultureInfo` synonyms** (§3.3, `scripts/linguistic.py`, net-new): each
+    Tableau `<column caption='...'>` whose caption differs from its model column contributes a Power BI
+    Q&A term, packaged as a `definition/cultures/<lang>.tmdl` linguisticMetadata part plus a single
+    `ref cultureInfo` line on `model.tmdl`, with an additive `report["model_objects"]["linguistic"]`
+    audit. **Opt-in via `migrate_tds_to_semantic_model(..., emit_linguistic=True)`, default OFF** — a
+    malformed culture part fails model load, so it ships behind the flag until a Power BI Desktop /
+    Tabular Editor round-trip certifies the byte-shape in the target environment. When no caption differs
+    from its column, nothing is written and the model is byte-identical.
+
 - **tableau-migration (skill `1.28.1` → `1.29.0`): native-capability spec integration — a batch of
   additive, backward-compatible engine behaviors that reproduce hand-done agent adjudication as
   deterministic build output. All opt-in seams default OFF so an omitted flag is byte-identical to the

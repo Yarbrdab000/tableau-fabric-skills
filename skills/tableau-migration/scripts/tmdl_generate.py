@@ -893,6 +893,59 @@ def _field_token(s):
     return s
 
 
+def _tab_str(literal):
+    """Unwrap a Tableau quoted string literal to its plain value.
+
+    Tableau serializes a group member label / source value as a double-quoted literal
+    (``&quot;3M&quot;`` -> ``"3M"``). Strip one layer of surrounding double quotes and
+    unescape backslash escapes in a single left-to-right pass. A non-quoted token is
+    returned stripped (defensive)."""
+    s = (literal or "").strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
+    return re.sub(r"\\(.)", r"\1", s)
+
+
+def _parse_group_object(col, calc):
+    """Parse a ``categorical-bin`` (Tableau Group) ``<column>`` into a raw group dict, or
+    ``None`` when it carries no usable ``(label, values)`` member. A value-less catch-all
+    ``<bin default-name='true'>`` is naturally excluded by the ``label and vals`` guard."""
+    base = _field_token(calc.get("column"))
+    if not base:
+        return None
+    members = []
+    for b in _children_local(calc, "bin"):
+        label = _tab_str(b.get("value"))
+        vals = [_tab_str(v.text) for v in _children_local(b, "value") if (v.text or "").strip()]
+        vals = [v for v in vals if v]
+        if label and vals:
+            members.append((label, vals))
+    if not members:
+        return None
+    return {
+        "name": col.get("caption") or _field_token(col.get("name")),
+        "base": base,
+        "include_others_as_self": (calc.get("new-bin") == "true"),
+        "members": members,
+    }
+
+
+def _parse_bin_object(col, calc):
+    """Parse a numeric ``bin`` ``<column>`` into a raw bin dict, or ``None`` when it has no
+    base formula. Width is resolved later (literal ``size`` or a ``size-parameter`` default)."""
+    formula = (calc.get("formula") or "").strip()
+    if not formula:
+        return None
+    return {
+        "name": col.get("caption") or _field_token(col.get("name")),
+        "base": _field_token(formula),
+        "base_formula": formula,
+        "peg": (calc.get("peg") or "").strip(),
+        "size_literal": (calc.get("size") or "").strip(),
+        "size_parameter": _field_token(calc.get("size-parameter")),
+    }
+
+
 def parse_model_objects(tds_text):
     """Parse hierarchies, display folders, and user filters out of a Tableau ``.tds``.
 
@@ -912,7 +965,7 @@ def parse_model_objects(tds_text):
     ``<filter>`` references it (an enforced row filter) and ``unwired`` otherwise.
     """
     empty = {"hierarchies": [], "display_folders": {}, "field_index": {},
-             "user_filters": {"wired": [], "unwired": []}}
+             "user_filters": {"wired": [], "unwired": []}, "groups": [], "bins": []}
     try:
         root = ET.fromstring(tds_text)
     except ET.ParseError:
@@ -938,6 +991,8 @@ def parse_model_objects(tds_text):
 
     field_index = {}
     user_calcs = []
+    groups = []
+    bins = []
     for col in _iter_local(root, "column"):
         internal = _field_token(col.get("name"))
         if not internal:
@@ -945,11 +1000,20 @@ def parse_model_objects(tds_text):
         field_index.setdefault(internal, col.get("caption") or internal)
         calc = _children_local(col, "calculation")
         if calc:
+            cls = (calc[0].get("class") or "").strip().lower()
             formula = calc[0].get("formula") or ""
             if _USER_FUNC_RE.search(formula):
                 user_calcs.append({"internal": internal,
                                    "name": col.get("caption") or internal,
                                    "formula": formula})
+            if cls == "categorical-bin":
+                g = _parse_group_object(col, calc[0])
+                if g:
+                    groups.append(g)
+            elif cls == "bin":
+                b = _parse_bin_object(col, calc[0])
+                if b:
+                    bins.append(b)
 
     wired_cols = {_field_token(f.get("column"))
                   for f in _iter_local(root, "filter") if f.get("column")}
@@ -958,7 +1022,8 @@ def parse_model_objects(tds_text):
 
     return {"hierarchies": hierarchies, "display_folders": folders,
             "field_index": field_index,
-            "user_filters": {"wired": wired, "unwired": unwired}}
+            "user_filters": {"wired": wired, "unwired": unwired},
+            "groups": groups, "bins": bins}
 
 
 # -- RLS DAX translation -------------------------------------------------------
@@ -981,6 +1046,11 @@ _UF_EQ_RIGHT = re.compile(r"^USERNAME\s*\(\s*\)\s*=\s*" + _UF_FIELD + r"$", re.I
 _QUALIFIED_FIELD_RE = re.compile(
     r"(?:\[" + _NAME_INNER1 + r"\]\.)*\[(?P<f>" + _NAME_INNER1 + r")\]")
 
+# A numeric bin's base must be a SINGLE (optionally qualified) field reference so it binds to
+# one numeric column; a compound formula (e.g. ``[a] + [b]``) has no single home column and
+# fails closed to a stub rather than mis-binding to a stray bracketed token.
+_BIN_SIMPLE_BASE = re.compile(r"^\s*" + _UF_FIELD + r"\s*$")
+
 
 def _dax_table_ref(name):
     """A DAX table reference: single-quoted, embedded single quotes doubled."""
@@ -990,6 +1060,30 @@ def _dax_table_ref(name):
 def _dax_column_ref(name):
     """A DAX column reference: bracketed, embedded closing brackets doubled."""
     return "[" + str(name).replace("]", "]]") + "]"
+
+
+def _dax_str_literal(value):
+    """A DAX string literal: double-quoted, embedded double quotes doubled."""
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def _dax_string_set(values):
+    """A DAX value set ``{ "a", "b" }`` of string literals (for ``<col> IN {...}``)."""
+    return "{ " + ", ".join(_dax_str_literal(v) for v in values) + " }"
+
+
+def _num_or_none(s):
+    """``float(s)`` or ``None`` -- never raises."""
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_num(n):
+    """Render a number without a trailing ``.0`` for whole values (200 not 200.0)."""
+    f = float(n)
+    return str(int(f)) if f.is_integer() else repr(f)
 
 
 def translate_user_filter_to_dax(formula, resolve_field):
@@ -1131,7 +1225,95 @@ def _build_role(user_filter, resolve_field, data_tables, used_names):
     }
 
 
-def resolve_model_objects(parsed, resolve_field, *, calcs=None, data_tables=None):
+def _group_calc_column(group, resolve_field, field_index):
+    """Resolve a parsed Tableau Group into a ``(table, calc-column TMDL)`` placement plus a
+    report entry, or ``(None, skip-report)`` when the base column does not resolve.
+
+    Emits a faithful ``SWITCH(TRUE(), <col> IN {members}, "label", ..., <tail>)`` calc column:
+    the tail is the base column itself when Tableau folds unlisted values into their own group
+    (``new-bin='true'``), otherwise ``BLANK()``. Never guesses a home when the base is unknown."""
+    name = group["name"]
+    target = _resolve_member(group["base"], resolve_field, field_index)
+    if not target:
+        return None, {"name": name, "reason": "base column did not resolve"}
+    table, column = target
+    ref = _dax_table_ref(table) + _dax_column_ref(column)
+    branches = [f"{ref} IN {_dax_string_set(vals)}, {_dax_str_literal(label)}"
+                for label, vals in group["members"]]
+    tail = ref if group.get("include_others_as_self") else "BLANK()"
+    dax = "SWITCH(\n    TRUE(),\n    " + ",\n    ".join(branches) + ",\n    " + tail + "\n)"
+    labels = ", ".join(label for label, _ in group["members"])
+    formula = f"GROUP([{group['base']}] -> {{{labels}}})"
+    tmdl = generate_calc_column_tmdl(name, formula, dax=dax, tmdl_type="string")
+    entry = {"name": name, "table": table, "reason": "translated"}
+    member_count = sum(len(vals) for _, vals in group["members"])
+    if member_count > 200:
+        entry["note"] = (f"group maps {member_count} source values; the SWITCH is valid but a "
+                         "P2 mapping table (LOOKUPVALUE) scales better")
+    return (table, tmdl), entry
+
+
+def _bin_size(bin_obj, params_by_name):
+    """Resolve a bin width to ``(size_float, source_desc)`` or ``(None, reason)``.
+
+    A literal ``size=`` attribute wins; otherwise a ``size-parameter`` is resolved to the
+    referenced parameter's DEFAULT value. A width is NEVER assumed."""
+    lit = bin_obj.get("size_literal") or ""
+    if lit:
+        n = _num_or_none(lit)
+        return (n, "literal") if n is not None else (None, "size literal is not numeric")
+    ref = bin_obj.get("size_parameter") or ""
+    if ref:
+        p = params_by_name.get(ref.strip().lower())
+        if p is not None:
+            n = _num_or_none(p.get("default"))
+            if n is not None:
+                return n, f"parameter default ({ref})"
+            return None, f"parameter {ref} has no numeric default"
+        return None, f"size parameter {ref} not found"
+    return None, "no bin size"
+
+
+def _bin_calc_column(bin_obj, resolve_field, field_index, params_by_name):
+    """Resolve a parsed numeric bin into a ``(table, calc-column TMDL)`` placement plus a
+    report entry.
+
+    Faithful width available -> a live ``INT((<col> - peg) / size) * size + peg`` calc column
+    (``INT`` floors toward negative infinity, matching Tableau's bin flooring). Base resolves
+    but the width does not -> an inert STUB column (preserves intent, never assumes a width) +
+    a skip reason. Base does not resolve / is a compound formula -> ``(None, skip-report)``."""
+    name = bin_obj["name"]
+    if not _BIN_SIMPLE_BASE.match(bin_obj.get("base_formula") or ""):
+        return None, {"name": name, "reason": "bin base is not a single numeric column"}
+    target = _resolve_member(bin_obj["base"], resolve_field, field_index)
+    if not target:
+        return None, {"name": name, "reason": "base column did not resolve"}
+    table, column = target
+    peg = _num_or_none(bin_obj.get("peg"))
+    peg = 0.0 if peg is None else peg
+    peg_s = _fmt_num(peg)
+    size, size_reason = _bin_size(bin_obj, params_by_name)
+    if size is None or size == 0:
+        formula = f"BIN([{bin_obj['base']}], size=?, peg={peg_s})"
+        tmdl = generate_calc_column_tmdl(name, formula, dax=None)
+        return (table, tmdl), {"name": name, "table": table,
+                               "reason": size_reason, "stub": True}
+    ref = _dax_table_ref(table) + _dax_column_ref(column)
+    size_s = _fmt_num(size)
+    int_type = float(peg).is_integer() and float(size).is_integer()
+    dax = f"INT(({ref} - {peg_s}) / {size_s}) * {size_s} + {peg_s}"
+    formula = f"BIN([{bin_obj['base']}], size={size_s} ({size_reason}), peg={peg_s})"
+    tmdl = generate_calc_column_tmdl(name, formula, dax=dax,
+                                     tmdl_type="int64" if int_type else "double")
+    entry = {"name": name, "table": table, "reason": "translated"}
+    if size_reason.startswith("parameter default"):
+        entry["note"] = (f"bin width {size_s} taken from {size_reason}; a live what-if width "
+                         "(numeric range parameter + SELECTEDVALUE) is P2")
+    return (table, tmdl), entry
+
+
+def resolve_model_objects(parsed, resolve_field, *, calcs=None, data_tables=None,
+                          parameters=None):
     """Resolve RAW parsed model objects against the rebuilt model.
 
     ``parsed`` is the output of :func:`parse_model_objects`; ``resolve_field`` is the
@@ -1203,13 +1385,49 @@ def resolve_model_objects(parsed, resolve_field, *, calcs=None, data_tables=None
         else:
             rls_report["translated"].append(role["name"])
 
+    params_by_name = {}
+    for p in (parameters or []):
+        raw = (p.get("internal_name") or "").strip()
+        for key in ((p.get("caption") or "").strip().lower(),
+                    raw.lower(), raw.strip("[]").strip().lower()):
+            if key:
+                params_by_name.setdefault(key, p)
+
+    calc_columns = {}
+    groups_report = {"emitted": [], "skipped": [], "notes": []}
+    for g in (parsed.get("groups") or []):
+        placement, entry = _group_calc_column(g, resolve_field, field_index)
+        if placement is not None:
+            calc_columns.setdefault(placement[0], []).append(placement[1])
+        if entry.get("reason") == "translated":
+            groups_report["emitted"].append(entry["name"])
+            if entry.get("note"):
+                groups_report["notes"].append({"name": entry["name"], "note": entry["note"]})
+        else:
+            groups_report["skipped"].append({"name": entry["name"], "reason": entry["reason"]})
+
+    bins_report = {"emitted": [], "skipped": [], "notes": []}
+    for b in (parsed.get("bins") or []):
+        placement, entry = _bin_calc_column(b, resolve_field, field_index, params_by_name)
+        if placement is not None:
+            calc_columns.setdefault(placement[0], []).append(placement[1])
+        if entry.get("reason") == "translated":
+            bins_report["emitted"].append(entry["name"])
+            if entry.get("note"):
+                bins_report["notes"].append({"name": entry["name"], "note": entry["note"]})
+        else:
+            bins_report["skipped"].append({"name": entry["name"], "reason": entry["reason"]})
+
     return {
         "display_folders": resolved_folders,
         "hierarchies": resolved_hier,
         "roles": roles,
+        "calc_columns": calc_columns,
         "report": {"display_folders": folder_report,
                    "hierarchies": hier_report,
-                   "rls": rls_report},
+                   "rls": rls_report,
+                   "groups": groups_report,
+                   "bins": bins_report},
     }
 
 
