@@ -30,6 +30,17 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   byte-identical.
 
 ### Fixed
+- **tableau-migration:** **Completed the "DirectLake is opt-in, never the default" contract — the last
+  place that still told users the router auto-routes to DirectLake has been corrected.** The storage
+  router already routes every unresolved/undoable datasource shape to an honest `needs-storage-decision`
+  (Import default; land-to-Delta + DirectLake reachable only via the explicit opt-in), but the M-partition
+  emitter's needs-review reason for a wholly-unmapped connector class still read "route to land-to-Delta +
+  DirectLake," and two internal comments still described the old auto-land behavior. The scaffold reason
+  now points at the same needs-storage-decision path (rebuild direct-to-source once a connection is
+  supplied, or opt in to land-to-Delta + DirectLake — never auto-selected), and a regression test locks it.
+  Verified the direct-to-Fabric deploy path (`deploy_to_fabric.py`) makes **no** storage decision of its
+  own — it deploys the already-assembled artifact — so the de-default holds identically on both the local
+  `.pbip` emit and the direct-to-Fabric deploy targets. Wording/test only; no routing behavior changed.
 - **tableau-migration:** **A workbook migration no longer stops to ask the user whether the workbook
   embeds its datasource or connects to a published one — STEP 2 auto-detection is the immediate,
   mandatory behavior.** The 1.27.2 runbook tightened the confirmation-ledger `workbook ds:` line so hard

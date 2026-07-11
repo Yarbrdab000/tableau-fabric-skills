@@ -306,7 +306,7 @@ def test_recommended_mode_import_for_extract_and_flat_file():
 
 
 def test_recommended_mode_import_default_for_unknown_fallback():
-    # mode is None (route to land-to-Delta), but the scored recommendation defaults to Import.
+    # mode is None (needs-storage-decision), but the scored recommendation defaults to Import.
     d = select_storage_mode(_desc(connection_class="saphana"))
     assert d["mode"] is None
     assert d["recommended_mode"] == "Import"

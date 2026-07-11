@@ -1499,6 +1499,25 @@ def test_emit_native_engine_table_relation_scaffolds_odbc_datasource(cls):
     assert m_partition_review_reason(rel, d, "Import") is not None
 
 
+def test_unmapped_connector_scaffold_reason_points_at_needs_decision_not_land_to_delta():
+    # The de-default contract reaches the partition emitter too: when a wholly-unmapped connector
+    # class scaffolds, its needs-review reason must point at the honest needs-storage-decision path
+    # (rebuild direct-to-source; land-to-Delta + DirectLake framed as an explicit opt-in) and must
+    # NEVER instruct the user that the router auto-routes to land-to-Delta + DirectLake.
+    d = {"connection_class": "acmewarehouse", "named_connection_count": 1,
+         "relations": [{"kind": "table", "name": "T", "item": "T",
+                        "columns": [{"model_name": "x", "tmdl_type": "int64"}]}]}
+    rel = d["relations"][0]
+    reason = m_partition_review_reason(rel, d, "Import")
+    assert reason is not None
+    low = reason.lower()
+    assert "not mapped" in low
+    # the honest de-default: a storage decision is required, DirectLake only via opt-in
+    assert "storage decision" in low
+    assert ("opt in" in low or "opt-in" in low) and "never auto-selected" in low
+    # the OLD auto-route wording is gone (the scaffold no longer directs to land-to-Delta)
+    assert "route to land-to-delta + directlake" not in low
+
 
 def test_emit_snowflake_table_is_deploy_ready_three_level_navigation():
     # Snowflake.Databases(server, warehouse) then database -> schema -> table, keyed by [Name, Kind].
