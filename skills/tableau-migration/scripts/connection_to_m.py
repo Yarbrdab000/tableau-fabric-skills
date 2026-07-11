@@ -2039,8 +2039,9 @@ def _effective_connection(relation, descriptor):
     NOTE: the shared ``#"Server"`` / ``#"Database"`` / ``#"Warehouse"`` / ``#"HttpPath"`` parameters
     are still emitted once per datasource by ``emit_connection_parameters``; full multi-connection
     deployment additionally needs per-connection parameters. Multi-connection sources are routed to
-    the land-to-Delta fallback by ``select_storage_mode`` today, so this routing is groundwork that
-    is never the deployed artifact on its own.
+    the honest needs-storage-decision fallback by ``select_storage_mode`` today (land-to-Delta +
+    DirectLake is opt-in only, never auto-selected), so this routing is groundwork that is never the
+    deployed artifact on its own.
     """
     if descriptor.get("named_connection_count", 1) > 1 and relation.get("connection"):
         return relation["connection"]
@@ -2099,7 +2100,8 @@ def _emit_odbc_partition(relation, conn, cls):
       are driver-specific and not portable, so we never guess them.
 
     Fails closed to a scaffold when no connection string can be rebuilt (defensive: the storage-mode
-    router already routes such a source to land-to-Delta, so this is rarely reached).
+    router already routes such a source to the needs-storage-decision fallback, so this is rarely
+    reached).
     """
     conn_str = _odbc_connection_string(conn)
     if not conn_str:
@@ -2160,7 +2162,9 @@ def _emit_m_partition_review(relation, descriptor, mode):
         elif cls in FLAT_FILE_CLASSES:
             detail = f"flat-file source; set the file path (and sheet/range) for the {intended} partition"
         else:
-            detail = "connector class not mapped for direct M; route to land-to-Delta + DirectLake"
+            detail = ("connector class not mapped for direct M; this datasource needs a storage "
+                      "decision -- rebuild direct-to-source once a connection is supplied, or opt in "
+                      "to land-to-Delta + DirectLake (never auto-selected)")
         return _scaffold_review(cls, intended, detail)
 
     connector, connect_style, nav_style = spec
