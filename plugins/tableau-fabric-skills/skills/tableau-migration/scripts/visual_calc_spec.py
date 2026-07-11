@@ -46,6 +46,18 @@ FAMILY_PERCENT_DIFFERENCE = "PERCENT_DIFFERENCE"
 FAMILY_PERCENT_OF_TOTAL = "PERCENT_OF_TOTAL"
 FAMILY_YEAR_OVER_YEAR = "YEAR_OVER_YEAR"
 FAMILY_DIFFERENCE = "DIFFERENCE"
+FAMILY_RANK = "RANK"
+
+# -- rank tie-mode + direction vocabulary --------------------------------------
+# Tableau's ``rank-options`` is "<TieMode>,<Direction>" (e.g. "Competition,Descending"). Map the tie
+# mode onto the Power BI visual-calculation ``RANK`` ties argument -- but ONLY the two that have a
+# faithful native equivalent: Tableau Competition (1,2,2,4) == PBI SKIP; Tableau Dense (1,2,2,3) ==
+# PBI DENSE. Tableau Modified (1,3,3,4) and Unique (1,2,3,4) have no faithful native RANK tie rule,
+# so they fail closed to review (never a wrong ranking) -- the same posture the measure path takes
+# for RANK_MODIFIED / RANK_UNIQUE.
+_RANK_TIES = {"Competition": "SKIP", "Dense": "DENSE"}
+_RANK_DIRECTION = {"Descending": "DESC", "Ascending": "ASC"}
+_RANK_TIES_REVIEW = frozenset({"Modified", "Unique"})
 
 # -- calendar grain vocabulary -------------------------------------------------
 # Tableau encodes a date grain both as an instance-token prefix (inside a level-break /
@@ -102,6 +114,8 @@ class VisualCalcSpec:
     window_agg: Optional[str] = None           # window aggregation ("Avg")
     partition_pill: Optional[str] = None       # base field of a rank partition (e.g. "Order Date")
     partition_grain: Optional[str] = None      # its grain derivation (e.g. "Year")
+    rank_ties: Optional[str] = None            # RANK ties arg: "SKIP" (competition) | "DENSE"
+    rank_direction: Optional[str] = None       # ORDERBY direction: "DESC" (Tableau default) | "ASC"
     chain_inner: Optional["VisualCalcSpec"] = None   # first-computed calc a chain references
     # -- provenance (mirrors the TableauFormula / TranslatedBy annotation discipline) --
     tableau_calc_type: str = ""
@@ -270,6 +284,30 @@ def _derive_rank_partition(usage, axis) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def _parse_rank_options(rank_options) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """``(ties, direction, reason)`` from a Tableau ``rank-options`` string like ``"Unique,Descending"``.
+
+    Defaults are Tableau's own quick-table-calc default: Competition ties (-> SKIP) and Descending
+    direction (largest value = rank 1 -> ORDERBY DESC). A tie mode with no faithful native
+    visual-calculation equivalent (Modified / Unique) returns a review reason instead of a wrong
+    ranking rule. Unknown tokens are ignored (defaults kept), never guessed into a rule.
+    """
+    ties = "SKIP"
+    direction = "DESC"
+    for tok in (rank_options or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok in _RANK_DIRECTION:
+            direction = _RANK_DIRECTION[tok]
+        elif tok in _RANK_TIES:
+            ties = _RANK_TIES[tok]
+        elif tok in _RANK_TIES_REVIEW:
+            return None, None, (f"rank tie mode {tok!r} has no faithful Power BI visual-calculation "
+                                "RANK equivalent")
+    return ties, direction, None
+
+
 def _summary(usage) -> str:
     bits = [f"Quick Table Calc {usage.calc_type}"]
     if usage.aggregation:
@@ -310,6 +348,8 @@ def _classify(usage) -> Tuple[Optional[str], Optional[str]]:
                       "(only a moving average is)")
     if ct == "PctRank":
         return FAMILY_PERCENTILE, None
+    if ct == "Rank":
+        return FAMILY_RANK, None
     if ct == "PctTotal":
         return FAMILY_PERCENT_OF_TOTAL, None
     if ct == "Difference":
@@ -386,6 +426,21 @@ def usage_to_visual_calc_spec(
         return VisualCalcSpec(family=family, axis=axis,
                               partition_pill=pill, partition_grain=grain, **common), None
 
+    if family == FAMILY_RANK:
+        ties, direction, rank_reason = _parse_rank_options(getattr(usage, "rank_options", None))
+        if rank_reason:
+            return None, rank_reason
+        # A pane-scoped rank restarts per outer temporal grain; a Table/other-scoped rank ranks the
+        # whole visual with no partition. Recover the pane column only when the token is a pane token
+        # (else no partition, which is the faithful whole-table rank -- the common CustomerRank case).
+        pill, grain = _derive_rank_partition(usage, axis)
+        if not pill and usage.ordering_type in _PANE_TOKENS:
+            return None, "rank pane partition is not recoverable (no temporal grain on the axis shelf)"
+        if usage.ordering_type not in _PANE_TOKENS:
+            pill, grain = None, None
+        return VisualCalcSpec(family=family, axis=axis, partition_pill=pill, partition_grain=grain,
+                              rank_ties=ties, rank_direction=direction, **common), None
+
     if family == FAMILY_COMPOUND_GROWTH:
         return VisualCalcSpec(family=family, axis=axis, **common), None
 
@@ -401,7 +456,15 @@ def usage_to_visual_calc_spec(
                                   collapse_all=not partition, **common), None
         scope = _derive_collapse_scope(usage)
         if not scope:
-            return None, "percent of total has no populated shelf to collapse over"
+            if usage.ordering_fields:
+                # An explicit "compute using" names a field that is not on the visual's shelves -> the
+                # collapse target is genuinely unrecoverable. Keep routing to review (faithful-or-stub);
+                # never guess a direction for an explicit addressing we cannot pin.
+                return None, "percent of total has no populated shelf to collapse over"
+            # No explicit "compute using" at all -> Tableau's default is Table (Down): collapse the row
+            # axis to the grand total (COLLAPSEALL, the dataclass default). A documented default, not a
+            # guess -- the axis is already pinned above from the shelves.
+            scope = "ROWS"
         return VisualCalcSpec(family=family, axis=axis, collapse_scope=scope, **common), None
 
     if family == FAMILY_PERCENT_DIFFERENCE:

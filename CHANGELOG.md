@@ -13,6 +13,46 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.30.0` → `1.31.0`): Report visual-fidelity — a Tableau workbook's brand
+  colour and dashboard header now carry through to the rebuilt Power BI report. Additive and
+  never-regress: a workbook with no header banner and no brand signal emits a byte-identical report,
+  theme, and page set to the prior baseline.** Highlights:
+  - **Report theme** — `report.json` now references a bundled `RegisteredResources` custom theme whose
+    `dataColors` lead with the Tableau 10 palette in exact order (so a two-series chart rebuilds
+    blue+orange, never a Tableau-20 interleave), with Tableau 20 trailing as the multi-category
+    fallback. `report_json_part()` with no argument stays byte-identical, and the thin `.pbip` shell
+    never gains a dangling `customTheme`.
+  - **Workbook brand colour** — when a dashboard carries a branded header band, its fill leads the
+    theme `dataColors` (de-duplicated, case-insensitively, against the Tableau tail) so auto-coloured
+    visuals rebuild in the workbook's brand; `brand=None` is byte-identical to the default palette.
+  - **Dashboard header banner** — the full-width filled title zone at the top of a Tableau dashboard
+    rebuilds as a schema-shaped PBIR `textbox` visual carrying the brand fill and the white title text.
+    Only the real top-of-page header is selected (a narrow tinted callout or a low footer box is
+    ignored); a bannerless dashboard emits no textbox. Verified end-to-end against the real
+    5-dashboard Salesforce Nonprofit Case Management workbook (5 crimson banners, brand `#ac145a`).
+- **tableau-migration (skill `1.31.0`): Capability-matrix hardening — four additive, never-regress
+  faithfulness improvements from a field capability report. Each is faithful-or-stub: it either emits a
+  verified-correct shape or leaves the honest review path untouched, and every default-off/unset case is
+  byte-identical to the prior baseline.** Highlights:
+  - **RANK quick-table-calc → Power BI visual-calculation `RANK`** — a `Rank` quick table calc rebuilds
+    as a native visual-calculation `RANK` with the faithful tie rule and direction (Tableau Competition
+    → `SKIP`, Dense → `DENSE`, default Descending → `ORDERBY DESC`). Modified/Unique tie modes have no
+    faithful native equivalent, so they fail closed to review (never a wrong ranking) — the same posture
+    the measure path takes for `RANK_MODIFIED` / `RANK_UNIQUE`.
+  - **Sibling calculated-column cascade** — a bare `[X]` that names another calculated column being
+    created on the same datasource (absent from the source metadata) now resolves to `'Table'[X]` with
+    its recorded type, the column-mode peer of the measures' `measure_refs` fix-point. Fully type-checked
+    and single-table-guarded, so a row-level column that would span tables still fails closed.
+  - **Extract connector detection** — a bare/federated `.hyper` extract whose connector class did not
+    set the extract flag now routes to the offline Import home (rather than dying at needs-decision),
+    matching the established extract-backed Import path.
+  - **Dropped aggregate/measure filter disclosure** — a worksheet filter on an aggregate (`SUM(Sales)`)
+    or calculated measure that has no faithful slicer mapping is now rolled up into an additive
+    `measure_filters_needs_review` report entry (per workbook), so a number-changing filter left to
+    review stays visible even when the per-worksheet warning is collapsed. Emits nothing into the PBIR;
+    filters the model faithfully rebuilt as visual-level measure filters are excluded.
+  - **Docs** — the SKILL.md LOD note now states the real boundary: a FIXED LOD is translated, while
+    INCLUDE/EXCLUDE and non-additive LODs stub to review.
 - **tableau-migration (skill `1.29.0` → `1.30.0`): Model Object Harvest — three additional Tableau
   object kinds now rebuild as faithful semantic-model objects. Additive and backward-compatible; the
   linguistic emission is opt-in and default OFF, so an omitted flag is byte-identical to the prior

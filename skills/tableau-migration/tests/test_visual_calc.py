@@ -26,7 +26,7 @@ from visual_calc_spec import usage_to_visual_calc_spec
 from visual_calc_emitter import emit_visual_calc
 from twb_to_pbir import _apply_visual_calcs, _view_only_quick_index
 from twb_to_pbir import emit_pbir, parse_twb
-from migrate_estate import _visual_calc_rollup, _color_scale_rollup
+from migrate_estate import _visual_calc_rollup, _color_scale_rollup, _measure_filter_rollup
 
 
 # -- fact factories ------------------------------------------------------------
@@ -84,6 +84,48 @@ def test_percentile_partitions_by_outermost_temporal_on_axis():
     assert s.family == vcs.FAMILY_PERCENTILE
     assert s.partition_pill == "Order Date"
     assert s.partition_grain == "Year"
+
+
+def test_rank_table_scope_maps_to_family_rank_with_no_partition():
+    # A Table-scoped rank (the common CustomerRank shape) ranks the WHOLE visual -> no PARTITIONBY.
+    s = _spec(calc_type="Rank")
+    assert s.family == vcs.FAMILY_RANK
+    assert s.rank_ties == "SKIP"            # Tableau "Competition" default -> DAX SKIP
+    assert s.rank_direction == "DESC"       # largest value = rank 1
+    assert s.partition_pill is None
+
+
+def test_rank_options_dense_ascending_parsed():
+    s = _spec(calc_type="Rank", rank_options="Dense,Ascending")
+    assert s.rank_ties == "DENSE"
+    assert s.rank_direction == "ASC"
+
+
+def test_rank_pane_scope_partitions_by_outer_temporal_grain():
+    s = _spec(calc_type="Rank", ordering_type="Pane")
+    assert s.family == vcs.FAMILY_RANK
+    assert s.partition_pill == "Order Date"
+    assert s.partition_grain == "Year"
+
+
+def test_rank_modified_tie_mode_routes_to_review():
+    # Tableau "Modified" (1,3,3,4) has no faithful native RANK equivalent -> review, never a wrong rule.
+    spec, reason = usage_to_visual_calc_spec(_usage(calc_type="Rank", rank_options="Modified,Descending"))
+    assert spec is None
+    assert "Modified" in reason
+
+
+def test_rank_unique_tie_mode_routes_to_review():
+    spec, reason = usage_to_visual_calc_spec(_usage(calc_type="Rank", rank_options="Unique,Descending"))
+    assert spec is None
+    assert "Unique" in reason
+
+
+def test_rank_pane_without_temporal_grain_is_reviewed():
+    spec, reason = usage_to_visual_calc_spec(
+        _usage(calc_type="Rank", ordering_type="Pane", rows=[], cols=[_pill("Region")]))
+    assert spec is None
+    assert "pane partition" in reason
 
 
 def test_compound_growth_from_compounded_diff():
@@ -186,6 +228,24 @@ def test_emit_percentile_dax_uses_rank_pair_and_partition():
     assert "PARTITIONBY([Calendar Year])" in d.expression
     assert "RANK(DENSE, ORDERBY([Count Orders], ASC)" in d.expression
     assert "DIVIDE(RankAsc - 1, N - 1)" in d.expression
+
+
+def test_emit_rank_table_scope_has_no_partition():
+    (d,) = _emit(_spec(calc_type="Rank"))
+    assert d.expression == "RANK(SKIP, ORDERBY([Count Orders], DESC))"
+    assert d.hidden is False            # value role -> shown
+    assert d.number_format is None      # rank is an integer, not a percent family
+
+
+def test_emit_rank_dense_ascending():
+    (d,) = _emit(_spec(calc_type="Rank", rank_options="Dense,Ascending"))
+    assert d.expression == "RANK(DENSE, ORDERBY([Count Orders], ASC))"
+
+
+def test_emit_rank_pane_scope_partitions_by_resolved_column():
+    (d,) = _emit(_spec(calc_type="Rank", ordering_type="Pane"),
+                 partition_column="Calendar Year")
+    assert d.expression == "RANK(SKIP, ORDERBY([Count Orders], DESC), PARTITIONBY([Calendar Year]))"
 
 
 def test_emit_compound_growth_dax_uses_first_and_rownumber():
@@ -310,6 +370,31 @@ def test_percentile_without_partition_column_is_refused_by_emitter():
                                     base_measure="Count Orders", partition_column=None)
     assert defs is None
     assert "partition column" in reason
+
+
+def test_rank_pane_without_partition_column_is_refused_by_emitter():
+    defs, reason = emit_visual_calc(_spec(calc_type="Rank", ordering_type="Pane"),
+                                    base_measure="Count Orders", partition_column=None)
+    assert defs is None
+    assert "partition column" in reason
+
+
+def test_percent_of_total_falls_back_to_row_axis_without_compute_using():
+    # No explicit "compute using" (a Rows/Columns token) + no residual shelf -> Tableau's Table (Down)
+    # default: collapse the row axis to the grand total, rather than route the whole visual to review.
+    s = _spec(calc_type="PctTotal", ordering_type="Rows", rows=[], cols=[])
+    assert s.family == vcs.FAMILY_PERCENT_OF_TOTAL
+    assert s.collapse_scope == "ROWS"
+
+
+def test_percent_of_total_with_unmapped_explicit_compute_using_stays_review():
+    # An explicit "compute using" field that is not on the visual's shelves is genuinely unpinnable ->
+    # keep routing to review (faithful-or-stub); never guess a direction for explicit addressing.
+    spec, reason = usage_to_visual_calc_spec(_usage(
+        calc_type="PctTotal", ordering_type="Field", ordering_fields=["Ship Mode"],
+        rows=[_SEGMENT], cols=[_YEAR]))
+    assert spec is None
+    assert "collapse over" in reason
 
 
 # -- 6. provenance is preserved (mirrors TableauFormula / TranslatedBy) --------
@@ -569,6 +654,52 @@ def test_color_scale_rollup_none_when_no_default_palette():
     assert _color_scale_rollup({"candidate_records": [{"other": 1}]}) is None
     assert _color_scale_rollup({}) is None
     assert _color_scale_rollup(None) is None
+
+
+def test_measure_filter_rollup_lists_dropped_aggregate_filters():
+    # Two worksheets each dropped an aggregate/measure filter to review; a non-matching warning and a
+    # non-dict entry do NOT contribute. Mirrors twb_to_pbir._parse_filters' exact reason string.
+    result = {"warnings": [
+        {"scope": "worksheet", "name": "Sales by Region",
+         "reason": "aggregate/measure filter on 'SUM(Sales)' is not mapped to a slicer "
+                   "(filter scope requires manual attention)"},
+        {"scope": "worksheet", "name": "Profit Detail",
+         "reason": "aggregate/measure filter on 'Profit Ratio' is not mapped to a slicer "
+                   "(filter scope requires manual attention)"},
+        {"scope": "worksheet", "name": "Sales by Region",
+         "reason": "Day-Trunc grain not applied"},   # unrelated -> ignored
+        "not-a-dict",                                 # ignored
+    ]}
+    roll = _measure_filter_rollup(result)
+    assert roll is not None
+    assert roll["count"] == 2
+    assert [w["worksheet"] for w in roll["worksheets"]] == ["Sales by Region", "Profit Detail"]
+    assert "SUM(Sales)" in roll["worksheets"][0]["reason"]
+    assert "re-apply it as a visual-level filter" in roll["note"]
+
+
+def test_measure_filter_rollup_dedupes_identical_warning():
+    # The same (worksheet, reason) emitted twice is listed once.
+    reason = ("aggregate/measure filter on 'SUM(Sales)' is not mapped to a slicer "
+              "(filter scope requires manual attention)")
+    result = {"warnings": [
+        {"scope": "worksheet", "name": "Sheet 1", "reason": reason},
+        {"scope": "worksheet", "name": "Sheet 1", "reason": reason},
+    ]}
+    roll = _measure_filter_rollup(result)
+    assert roll["count"] == 1
+    assert roll["worksheets"] == [{"worksheet": "Sheet 1", "reason": reason}]
+
+
+def test_measure_filter_rollup_none_when_no_dropped_filters():
+    # No matching warning -> None (report byte-identical); resolved flag filters never reach here
+    # because twb_to_pbir._drop_resolved_flag_warnings removes them before the result is returned.
+    assert _measure_filter_rollup({"warnings": [
+        {"scope": "worksheet", "name": "A", "reason": "Day-Trunc grain not applied"},
+    ]}) is None
+    assert _measure_filter_rollup({"warnings": []}) is None
+    assert _measure_filter_rollup({}) is None
+    assert _measure_filter_rollup(None) is None
 
 
 # -- 10. full parse_twb -> emit_pbir integration (VC lands in visual.json) -----

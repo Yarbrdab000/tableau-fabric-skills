@@ -1757,7 +1757,7 @@ def translate_tableau_calc_to_dax_typed(formula, resolver, param_resolver=None, 
         return None, str(e), tables_used, None
 
 
-def translate_tableau_calc_to_column_dax(formula, resolver, known_tables=None):
+def translate_tableau_calc_to_column_dax(formula, resolver, known_tables=None, column_refs=None):
     """Translate a ROW-LEVEL Tableau calc to a DAX *calculated-column* expression.
 
     Companion to translate_tableau_calc_to_dax with the SAME public shape --
@@ -1774,25 +1774,63 @@ def translate_tableau_calc_to_column_dax(formula, resolver, known_tables=None):
     ``tables_used`` is a single ``{T}``, the emitted expression must be materialized as a
     calculated column on table ``T``. Empty ``tables_used`` -> no field references, bindable
     anywhere. More than one table -> falls back here (a row-level column cannot span tables).
+
+    ``column_refs`` lets a bare ``[X]`` that names a *sibling calculated column* (one being
+    created on this datasource, absent from the datasource metadata ``resolver``) resolve to
+    ``'Table'[X]`` -- the column-mode peer of ``measure_refs``. Default None -> byte-identical.
+    See ``translate_tableau_calc_to_column_dax_typed`` for the full contract.
+    """
+    dax, reason, tables_used, _dtype = translate_tableau_calc_to_column_dax_typed(
+        formula, resolver, known_tables=known_tables, column_refs=column_refs)
+    return dax, reason, tables_used
+
+
+def translate_tableau_calc_to_column_dax_typed(formula, resolver, known_tables=None,
+                                               column_refs=None):
+    """Like ``translate_tableau_calc_to_column_dax`` but also returns the result dtype as a 4th item.
+
+    Returns ``(dax|None, reason, tables_used, dtype|None)``. The extra ``dtype`` ("number" /
+    "text" / "date" / "bool") lets the calc-column cascade (``_calc_columns_part``) record a
+    translated calculated column's type so a SIBLING calc that references it stays type-checked and
+    fail-closed -- the column-mode peer of the measures' ``measure_refs`` fix-point.
+
+    ``column_refs`` ({normalized-name: (table_display, column_name, tmdl_type)}) | None: lets a bare
+    ``[X]`` that names another *already-translated calculated column on this datasource* resolve to
+    ``'Table'[X]`` (with its recorded type) instead of falling back. Consulted ONLY when the base
+    ``resolver`` (datasource metadata) does not know the caption, so a real source column is never
+    shadowed. Because a resolved sibling adds ITS table to ``tables_used``, the single-table guard
+    still fails a calc that would reference a sibling on another table (faithful: a row-level column
+    cannot span tables). Default None -> byte-identical prior output.
     """
     tables_used = set()
     f = (formula or "").strip()
     if not f:
-        return None, "empty formula", tables_used
+        return None, "empty formula", tables_used, None
+    if column_refs:
+        _base_resolver = resolver
+        _cr = {(k or "").strip().lower(): v for k, v in column_refs.items()}
+
+        def _augmented(cap, _b=_base_resolver, _c=_cr):
+            hit = _b(cap)
+            if hit is not None:
+                return hit
+            return _c.get((cap or "").strip().lower())
+
+        resolver = _augmented
     try:
         toks = _tokenize(f)
         if not toks:
-            return None, "empty formula", tables_used
-        dax, _dtype = _Parser(toks, resolver, tables_used, mode="column",
-                              known_tables=known_tables).parse()
+            return None, "empty formula", tables_used, None
+        dax, dtype = _Parser(toks, resolver, tables_used, mode="column",
+                             known_tables=known_tables).parse()
         if len(tables_used) > 1:
-            return None, "cross-table terms (fields span multiple tables)", tables_used
+            return None, "cross-table terms (fields span multiple tables)", tables_used, None
         leak = validate_dax(dax)
         if leak:
-            return None, f"emit guardrail: {leak}", tables_used
-        return dax, "ok", tables_used
+            return None, f"emit guardrail: {leak}", tables_used, None
+        return dax, "ok", tables_used, dtype
     except _CalcError as e:
-        return None, str(e), tables_used
+        return None, str(e), tables_used, None
 
 
 def _addressing_fact_guard(tables_used, required_facts):

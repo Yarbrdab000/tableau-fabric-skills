@@ -48,6 +48,7 @@ try:  # package or scripts-on-path
         translate_tableau_calc_to_dax,
         translate_tableau_calc_to_dax_typed,
         translate_tableau_calc_to_column_dax,
+        translate_tableau_calc_to_column_dax_typed,
         suggest_assisted_dax,
         field_references,
         date_attribute_binding,
@@ -89,6 +90,7 @@ except ImportError:
         translate_tableau_calc_to_dax,
         translate_tableau_calc_to_dax_typed,
         translate_tableau_calc_to_column_dax,
+        translate_tableau_calc_to_column_dax_typed,
         suggest_assisted_dax,
         field_references,
         date_attribute_binding,
@@ -1440,6 +1442,12 @@ def _related_date_dax(date_table, column):
     return f"RELATED('{date_table.replace(chr(39), chr(39) * 2)}'[{column}])"
 
 
+# Inverse of calc_to_dax._DTYPE_BY_TMDL: the parser returns an internal dtype ("text"/"number"/
+# "date"/"bool"); a sibling calc-column reference resolver expects a TMDL-simple type. A representative
+# member of each class is enough -- the parser re-maps it back through _DTYPE_BY_TMDL identically.
+_DTYPE_TO_TMDL = {"text": "string", "number": "decimal", "date": "dateTime", "bool": "boolean"}
+
+
 def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
                        date_table=None, active_date_cols=None, consumed=None,
                        approved_calc_dax=None, known_tables=None):
@@ -1464,6 +1472,16 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
     ``TableauFormula`` for audit/repair. Aggregations / LODs / multi-table terms fall back to the
     inert stub here -- the measure entry point owns those. Returns ``(by_table, report)`` where
     ``by_table`` is ``{table_display: concatenated_tmdl}``.
+
+    SIBLING CALC CASCADE: a dimension calc that references ANOTHER dimension calc column (a chain
+    such as ``[Grouped Category] = SWITCH(TRUE(), [Cleaned Category] = ...)`` where
+    ``[Cleaned Category] = UPPER([Category])``) resolved to an ``unresolved_reference`` stub before,
+    because the sibling is being created and is absent from the datasource-metadata ``resolve``. A
+    pre-scan fix-point (mirroring the measures' ``measure_refs`` cascade) records each
+    deterministically-translated single-home calc, so the main pass resolves a bare ``[Sibling Calc]``
+    to ``'Home'[Sibling Calc]`` with its real type. Fail-closed: only a faithful, single-home, typed
+    sibling is a reference target (a sibling on another table still trips the single-table guard), so
+    a chain that cannot be resolved stays a stub -- never wrong DAX.
 
     ASSISTED TRANSLATION (opt-in): ``approved_calc_dax`` (``{calc_name: dax}``, case-insensitive) is
     the column-mode peer of the measures' approved landing. It is consulted ONLY when the
@@ -1497,6 +1515,36 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
     consumed_lower = {(c or "").lower() for c in (consumed or set())}
     approved_lower = {(k or "").lower(): v for k, v in (approved_calc_dax or {}).items()}
     active_date_cols = active_date_cols or set()
+    # Sibling calc-column cascade (the column-mode peer of the measures' ``measure_refs`` fix-point in
+    # ``_measures_part``). A dimension calc that references ANOTHER dimension calc column stubs today
+    # with ``unresolved_reference`` -- the sibling is being CREATED and so is absent from the
+    # datasource-metadata ``resolve``. Pre-scan the deterministically-translatable calcs to a
+    # fix-point, recording each single-home translation as a ``column_refs`` entry
+    # {name: (home_table, column_name, tmdl_type)} so the main loop can resolve a bare
+    # ``[Sibling Calc]`` to ``'Home'[Sibling Calc]`` with its real type. ONLY a deterministic,
+    # single-home, typed translation is recorded -- a constant (no single home), date-bound, approved,
+    # or stub calc is NOT a safe reference target, so a chain that cannot be faithfully resolved stays
+    # a stub. Empty when no calc references a sibling -> the main loop is byte-identical to the prior
+    # single pass. (A sibling on another table still fails the single-table guard downstream.)
+    column_refs = {}
+    _pending = [c for c in (dim_calcs or [])
+                if (c.get("name") or "").lower() not in consumed_lower]
+    _changed = True
+    while _changed and _pending:
+        _changed = False
+        _still = []
+        for _calc in _pending:
+            _cname = _calc["name"]
+            _cdax, _cr, _ctabs, _cdt = translate_tableau_calc_to_column_dax_typed(
+                _calc.get("formula", ""), resolve, known_tables=known_tables,
+                column_refs=column_refs)
+            if _cdax and len(_ctabs) == 1 and _cdt:
+                column_refs[_cname.strip().lower()] = (
+                    next(iter(_ctabs)), _cname, _DTYPE_TO_TMDL.get(_cdt, "string"))
+                _changed = True
+            else:
+                _still.append(_calc)
+        _pending = _still
     for calc in dim_calcs or []:
         name, formula = calc["name"], calc.get("formula", "")
         if name.lower() in consumed_lower:
@@ -1520,7 +1568,8 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
                 "date_bound": True, "date_table": date_table, "date_attribute": date_column,
             })
             continue
-        dax, reason, tables_used = translate_tableau_calc_to_column_dax(formula, resolve)
+        dax, reason, tables_used = translate_tableau_calc_to_column_dax(
+            formula, resolve, column_refs=column_refs)
         if dax and len(tables_used) == 1:
             target = next(iter(tables_used))
         elif len(tables_used) == 1:          # untranslatable but single known home

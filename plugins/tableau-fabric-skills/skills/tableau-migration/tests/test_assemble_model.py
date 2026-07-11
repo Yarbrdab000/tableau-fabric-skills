@@ -14,6 +14,7 @@ from assemble_model import (
     write_model_folder,
     _date_axis_order_resolver,
     _approved_entry,
+    _calc_columns_part,
     _win_long_path,
 )
 from connection_to_m import parse_tds, combine_descriptors
@@ -690,7 +691,75 @@ def test_approved_dim_calc_lands_as_assisted_approved_calc_column():
     assert cov["live_coverage_pct"] == 100.0
 
 
-# -- AUTO-DETECT (no human approval) of the argmax/argmin idiom on a MEASURE, end-to-end through the
+# -- B9: sibling calculated-column reference cascade (the column-mode peer of the measures'
+#    measure_refs fix-point). A dimension calc that references ANOTHER dimension calc column resolved
+#    to an unresolved stub before, because the sibling is being created and is absent from the
+#    datasource-metadata resolver. The pre-scan cascade in _calc_columns_part seeds each single-home
+#    deterministic translation so a bare [Sibling Calc] resolves to 'Home'[Sibling Calc] with its type.
+def _sibling_chain_model(dim_calcs):
+    return assemble_import_model(
+        parse_tds(LIVE_SQLSERVER), model_name="Superstore", dim_calcs=dim_calcs)
+
+
+def test_sibling_calc_chain_resolves_two_deep():
+    # "Order Label" references sibling "Order Code" (which references the base [Order ID]). Declared
+    # consumer-BEFORE-producer to prove the fix-point is order-independent (not a single forward pass).
+    out = _sibling_chain_model([
+        {"name": "Order Label", "formula": '[Order Code] + " (x)"'},
+        {"name": "Order Code", "formula": "UPPER([Order ID])"},
+    ])
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "column 'Order Code' = UPPER('Orders'[Order_ID])" in orders
+    # the sibling reference now binds to the real model column instead of stubbing.
+    assert "'Orders'[Order Code]" in orders
+    rows = {r["column"]: r for r in out["report"]["calc_columns"]}
+    assert rows["Order Label"]["status"] == "translated"
+    assert rows["Order Label"]["table"] == "Orders"
+    assert rows["Order Code"]["status"] == "translated"
+
+
+def test_sibling_calc_chain_resolves_three_deep():
+    out = _sibling_chain_model([
+        {"name": "C", "formula": '[B] + "!"'},
+        {"name": "B", "formula": '[Order Code] + "?"'},
+        {"name": "Order Code", "formula": "UPPER([Order ID])"},
+    ])
+    rows = {r["column"]: r for r in out["report"]["calc_columns"]}
+    assert rows["Order Code"]["status"] == "translated"
+    assert rows["B"]["status"] == "translated"
+    assert rows["C"]["status"] == "translated"
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "'Orders'[B]" in orders          # C resolved its sibling B
+    assert "'Orders'[Order Code]" in orders  # B resolved its sibling Order Code
+
+
+def test_no_sibling_chain_is_byte_identical_to_prior_single_pass():
+    # When no calc references a sibling, the cascade records nothing and the main loop is unchanged.
+    out = _dim_calc_model()
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert 'column \'Sales Flag\' = IF(\'Orders\'[Sales] > 0, "Y", "N")' in orders
+    assert "column 'Order Code' = UPPER('Orders'[Order_ID])" in orders
+    assert "column 'Avg Sale Col' = BLANK()" in orders  # aggregation still an honest stub
+
+
+def test_cross_table_sibling_reference_stays_stub():
+    # A calc that references a sibling on a DIFFERENT table than its other term spans >1 table -> the
+    # single-table row-level guard falls back to an honest stub (never emits unfaithful cross-table DAX).
+    base = {"Category": ("Orders", "Category", "string"),
+            "Region": ("People", "Region", "string")}
+    resolve = lambda c: base.get(c)
+    dim = [
+        {"name": "SibOrders", "formula": "UPPER([Category])"},
+        {"name": "X", "formula": "[SibOrders] + [Region]"},
+    ]
+    _, report = _calc_columns_part(dim, resolve, "Orders", known_tables={"Orders", "People"})
+    rows = {r["column"]: r for r in report}
+    assert rows["SibOrders"]["status"] == "translated"
+    assert rows["X"]["status"] == "stub"
+    assert rows["X"]["dax"] is None
+
+
+
 #    real assemble_model resolver. LIVE_SQLSERVER lacks State + City, so the detector (which resolves
 #    its fields against the model) could not fire there; this minimal model carries them. This is the
 #    peer of the approved-DAX test above: it locks the real suggest_assisted_dax wiring (the path an
