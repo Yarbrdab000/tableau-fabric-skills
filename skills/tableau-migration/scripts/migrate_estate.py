@@ -3211,6 +3211,56 @@ def _load_approved_dax(path):
     return data or None
 
 
+def scan_estate(source):
+    """Read-only pre-build discovery -- the datasource-before-workbook gate.
+
+    For every workbook in ``source``, report whether it binds to a PUBLISHED Tableau datasource (and
+    name it), and flag any published datasource that is NOT yet present in the input scope. This lets
+    the runbook fetch a workbook's published datasource FIRST, so the workbook is never built before
+    its datasource is in scope (which would rebind to nothing and ship an empty report).
+
+    Presence is computed with the SAME ``_norm_ds`` key the build uses to populate ``ds_catalog``
+    (keyed by each datasource's file stem via :meth:`asset_name`), so ``datasource_present`` means
+    exactly "the build will find it and rebind the workbook to it". No build, no network, no creds.
+
+    Returns::
+
+        {"datasources_present": [names],
+         "workbooks": [{"name", "kind", "published_ds_name", "datasource_present"}],
+         "missing_published_datasources": [names]}
+    """
+    ds_present = {}
+    for ds_id in source.list_datasources():
+        nm = source.asset_name(ds_id)
+        ds_present[_norm_ds(nm)] = nm
+
+    workbooks = []
+    missing = {}
+    for wb_id in source.list_workbooks():
+        entry = {"name": source.asset_name(wb_id), "kind": None,
+                 "published_ds_name": None, "datasource_present": None}
+        try:
+            signal = _workbook_binding_signal(source.read_workbook(wb_id), None)
+        except Exception:
+            signal = None
+        if signal:
+            entry["kind"] = signal.get("kind")
+            pub = signal.get("published_ds_name")
+            entry["published_ds_name"] = pub
+            if signal.get("kind") == "published" and pub:
+                present = _norm_ds(pub) in ds_present
+                entry["datasource_present"] = present
+                if not present:
+                    missing[_norm_ds(pub)] = pub
+        workbooks.append(entry)
+
+    return {
+        "datasources_present": sorted(ds_present.values()),
+        "workbooks": workbooks,
+        "missing_published_datasources": sorted(missing.values()),
+    }
+
+
 def main(argv=None):
     """One-command estate migration over a local folder of ``.tds`` / ``.twb`` files (offline)."""
     parser = argparse.ArgumentParser(
@@ -3233,6 +3283,12 @@ def main(argv=None):
                         help="also write a reports/<Name>.viz-advice.json sidecar per workbook with "
                              "ranked alternative chart types per visual (Tier-2 viz advisor; "
                              "deterministic, additive, never alters the rebuilt PBIR)")
+    parser.add_argument("--scan", action="store_true",
+                        help="PRE-BUILD DISCOVERY ONLY (no build): report each workbook's datasource "
+                             "binding (embedded/published) and flag any PUBLISHED datasource not yet "
+                             "in the input folder, so it can be fetched FIRST. Writes "
+                             "<output>/scan.json. Exits non-zero when a published datasource is "
+                             "missing (do not build until this exits 0).")
     args = parser.parse_args(argv)
 
     try:
@@ -3241,6 +3297,31 @@ def main(argv=None):
         parser.error(str(exc))
 
     source = LocalFilesSource(args.input)
+
+    if args.scan:
+        manifest = scan_estate(source)
+        os.makedirs(args.output, exist_ok=True)
+        scan_path = os.path.join(args.output, "scan.json")
+        with open(scan_path, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2)
+        for wb in manifest["workbooks"]:
+            if wb["kind"] == "published":
+                state = "present" if wb["datasource_present"] else "MISSING"
+                print(f"  {wb['name']}: published datasource "
+                      f"{wb['published_ds_name']!r} [{state}]")
+            else:
+                print(f"  {wb['name']}: {wb['kind'] or 'no datasource detected'}")
+        missing = manifest["missing_published_datasources"]
+        if missing:
+            print(f"[ACTION] Fetch these published datasource(s) into "
+                  f"{os.path.abspath(args.input)} BEFORE building, then re-scan: {missing}")
+            print('  e.g. python fetch_tds.py --datasource-name "<name>" '
+                  "--include-extract --out <input folder>")
+        else:
+            print("[OK] All workbook datasources are in scope -- safe to build (STEP 2).")
+        print(f"Scan manifest written to: {os.path.abspath(scan_path)}")
+        return 1 if missing else 0
+
     report = migrate_estate(source, args.output, pbip=not args.no_pbip,
                             approved_calc_dax=approved_calc_dax, viz_advice=args.viz_advice)
     s = report["summary"]

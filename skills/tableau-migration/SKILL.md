@@ -80,18 +80,20 @@ D6 — CREDENTIAL ACCESS  (only if D1=A; how I obtain the PAT / Connected-App se
 
 > **A workbook's datasource migrates first, then the report binds to it — exactly like an embedded
 > datasource.** You never hand-classify a workbook: `migrate_estate.py` auto-detects whether it
-> **embeds** its datasource or connects to a **published** one (STEP 2; you never inspect XML) and
-> rebuilds the report against the real schema either way. An **embedded** datasource rides inside the
-> workbook, so it's already in scope and consolidated automatically — nothing extra to do. A
-> **published** datasource is the *same flow* with one extra step: it lives outside the workbook (only a
-> `sqlproxy` stub travels along), so once STEP 2 detects it, fetch that datasource by name into scope and
-> re-run — then it migrates first and the workbook binds to it, just like embedded.
+> **embeds** its datasource or connects to a **published** one (the STEP 1.5 scan, before any build; you
+> never inspect XML) and rebuilds the report against the real schema either way. An **embedded**
+> datasource rides inside the workbook, so it's already in scope and consolidated automatically — nothing
+> extra to do. A **published** datasource is the *same flow* with one extra step: it lives outside the
+> workbook (only a `sqlproxy` stub travels along), so the STEP 1.5 scan names it *before* building —
+> fetch that datasource by name into scope and re-scan, then it migrates first and the workbook binds to
+> it, just like embedded.
 >
-> **For local output (D3=C, and the local bundle of D3=A), STEP 2 auto-detects immediately — you never
-> ask.** It tells you embedded or published; the only hard rule is that a published datasource's data
-> must be in scope so the report binds. If STEP 2 names one that isn't in scope yet, fetch that name and
-> re-run so it lands first. There is no workbook-only migration: a published-backed workbook whose
-> datasource is missing rebuilds to an **empty report** — never ship that empty result.
+> **For local output (D3=C, and the local bundle of D3=A), the STEP 1.5 scan auto-detects immediately —
+> you never ask.** It tells you embedded or published; the only hard rule is that a published
+> datasource's data must be in scope so the report binds. If the scan names one that isn't in scope yet,
+> fetch that name and re-scan so it lands first. There is no workbook-only migration: a published-backed
+> workbook whose datasource is missing rebuilds to an **empty report** — the scan gate stops you before
+> you ever ship that empty result.
 >
 > **Fabric outputs (D3=A/B) are a *different decision tree*** — the published datasource may already
 > exist in the target workspace as a semantic model, so it's **bind-to-existing vs. migrate-fresh**
@@ -174,7 +176,7 @@ LEDGER — confirm, then reply GO
   work dir   : <$RUN>   (scripts run from here; skill at <$SKILL>)
   source     : <D1 A live / B local>   from <SITE_URL/SITE_NAME  or  .\in>
   scope      : <all | datasource and/or workbook names>
-  workbook ds: auto-detected at STEP 2 — never ask the user, never hand-classify (the engine reads the workbook itself)   (omit if no workbook. Embedded → consolidated automatically; published → its datasource is co-migrated FIRST so the report binds. For a local build, if STEP 2 names a published datasource that isn't in scope yet, fetch that name and re-run before accepting the build — never ship an empty workbook-only rebuild.)
+  workbook ds: auto-detected at STEP 1.5 (scan) — never ask the user, never hand-classify (the engine reads the workbook itself)   (omit if no workbook. Embedded → consolidated automatically; published → its datasource is co-migrated FIRST so the report binds. The STEP 1.5 scan names any published datasource that isn't in scope yet and exits non-zero; fetch that name into `.\in` and re-scan until it exits 0 BEFORE STEP 2 — never build an empty workbook-only rebuild.)
   outputs    : <D3 A both / B Fabric only / C local only>
   conflicts  : <D4 overwrite | skip | stop>
   auth       : <D5 PAT | Connected App JWT>   (D6 secret via <Key Vault KV_NAME/SECRET_NAME | local terminal prompt>)
@@ -238,16 +240,46 @@ is already a quoted PowerShell string; only a literal `"` inside a name must be 
 > **⛔ The one and only download path — do not improvise around a perceived gap.** `fetch_tds.py` is the
 > sole downloader: never hand-roll a Tableau REST call, never unzip a `.twbx` (STEP 2 ingests packaged
 > files directly). A workbook is just another name to fetch (`--workbook-name`); whether it embeds its
-> datasource or connects to a **published** one, STEP 2 auto-detects and binds it — you never inspect
-> > XML or read a connection class. The **only** requirement is that a published workbook's datasource is
-> itself a name in your D2 scope, so it's already in the datasource list above and the two migrate
-> together. If STEP 2 names a published datasource that is **not** yet in scope, **fetch that name into
-> `.\in` and re-run** so it migrates first and the workbook binds — never hand-roll a workaround.
+> datasource or connects to a **published** one, the STEP 1.5 scan auto-detects and binds it — you never
+> inspect XML or read a connection class. The **only** requirement is that a published workbook's
+> datasource is itself a name in your D2 scope, so it's already in the datasource list above and the two
+> migrate together. If the STEP 1.5 scan names a published datasource that is **not** yet in scope,
+> **fetch that name into `.\in` and re-scan** so it migrates first and the workbook binds — never
+> hand-roll a workaround.
 
 **Checkpoint 1:** `.\in` holds one file per scoped name — and **only** those. `migrate_estate.py` has
 **no name filter**: it migrates *everything* in `-i`, so scope is enforced solely by what's in `.\in` (a
 fresh `$RUN\in` can't pick up the skill's bundled samples). Fewer files than scoped, or any extra →
 **STOP and ask** (do not re-derive or substitute names).
+
+**STEP 1.5 — scan first: never build a workbook before its datasource is in scope**
+
+Before building, run the read-only scan (no creds, no build, no unzip). It reports, per workbook,
+whether it binds to a **published** datasource and whether that datasource is already in `.\in`, and it
+**exits non-zero** while any published datasource is missing:
+
+```powershell
+py -3.11 "$SKILL\scripts\migrate_estate.py" -i .\in -o .\out --scan
+```
+
+For every name under `missing_published_datasources` in `.\out\scan.json` (echoed on the `[ACTION]`
+line), fetch it into `.\in` with the **same** `fetch_tds.py` call as STEP 1, then **re-scan** — repeat
+until the scan prints `[OK]` and exits `0`:
+
+```powershell
+py -3.11 "$SKILL\scripts\fetch_tds.py" --server $SITE_URL --site $SITE_NAME `
+  --datasource-name "<missing name>" --include-extract --auth pat --pat-name $PAT_NAME --out .\in   # D1=A live
+# D1=B local: drop that published datasource's packaged .tdsx into .\in instead, then re-scan
+```
+
+> **⛔ Hard gate — do not run STEP 2 until the scan exits `0`.** A published-backed workbook built while
+> its datasource is missing rebinds to nothing and ships an **empty report**; the scan exists to stop
+> exactly that, *before* any build. Datasource-only runs and embedded-datasource workbooks scan clean
+> immediately (nothing to fetch). This is still not "inspecting XML" — the script reads the workbook and
+> tells you; you only fetch the name it prints.
+
+**Checkpoint 1.5:** `.\out\scan.json` shows `missing_published_datasources: []` and the command exited
+`0`. If not, fetch the named datasource(s) and re-scan — never proceed to STEP 2 with a missing one.
 
 **STEP 2 — build the Fabric bundle**
 
@@ -257,10 +289,12 @@ py -3.11 "$SKILL\scripts\migrate_estate.py" -i .\in -o .\out
 
 **Checkpoint 2:** confirm `.\out\semantic_models` holds one `*.SemanticModel` per datasource,
 `.\out\report.json` shows `summary.datasources_migrated > 0`, and every workbook source has an openable
-`.\out\pbip\<Workbook>.pbip` bound to its model. Anything missing or `0` → **STOP**, read
-`.\out\summary.md`, and report it to the user. Do not self-diagnose, re-fetch, or re-run — the scripts
-have already done their own detection and binding; a shortfall is a STOP-and-ask, never something for
-you to fix by hand.
+`.\out\pbip\<Workbook>.pbip` bound to its model. A workbook whose report is empty or unbound almost
+always means its published datasource wasn't in scope at build time — which the STEP 1.5 scan gate is
+designed to prevent, so re-run the scan and confirm it exits `0` before anything else. Anything missing
+or `0` → **STOP**, read `.\out\summary.md`, and report it to the user. Do not self-diagnose, re-fetch,
+or re-run — the scripts have already done their own detection and binding; a shortfall is a
+STOP-and-ask, never something for you to fix by hand.
 
 > **Second-compiler gate — read `report.json` → `summary.needs_review_total` and branch on it:** if it
 > is **`0`**, no calc was left stubbed, so the assisted-translation stage is **auto-satisfied — skip it**
@@ -431,7 +465,7 @@ The pure-Python cores are offline, deterministic, and stdlib-only (no Spark / pa
 | [`scripts/storage_mode.py`](scripts/storage_mode.py) | Per-datasource storage-mode auto-selection (pure policy). |
 | [`scripts/connection_to_m.py`](scripts/connection_to_m.py) | Parse Tableau `.tds`/`.twb` → descriptor (`parse_tds(text, select=None)`); **`extract_calcs`** (calculated fields → `calcs=`); **`workbook_datasources`** (list selectable datasources, skipping `Parameters` + worksheet stubs); emit M partitions + bind details (`connection_details_for_bind`); M-path field resolver. |
 | [`scripts/assemble_model.py`](scripts/assemble_model.py) | Tier-1 orchestrator: `.tds`/`.twb` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`), base64 deploy payload. **One-call `migrate_datasource(.tdsx/.tds/.twbx/.twb/text, datasource=None)` → `{parts, report, bind}`** (auto-extracts calcs; `datasource=` selects from a multi-datasource workbook; a genuine fallback returns `parts={}` + `report["landing_plan"]` via `directlake_landing_plan`); `list_workbook_datasources`, `write_model_folder` / **`write_local_pbip`** for local output. |
-| [`scripts/migrate_estate.py`](scripts/migrate_estate.py) | **Estate + workbook orchestrator.** `migrate_estate(source, out)` migrates a whole folder / site (every datasource + workbook) in one run. **`migrate_workbook(source, write_to=…, name=None)`** is the single-workbook primitive the estate loops: it rebuilds the workbook's embedded datasource(s) into one semantic model **and** the workbook's report bound to it — an openable `pbip/<Name>/` (plus a bare `reports/<Name>.Report`); a multi-datasource workbook consolidates every embedded datasource into one model (disconnected table islands, each bound to its own connection) with a single report bound to it. Reach for it (over `migrate_datasource`) whenever the input is a **workbook** and you want the **report**, not just a datasource model. |
+| [`scripts/migrate_estate.py`](scripts/migrate_estate.py) | **Estate + workbook orchestrator.** `migrate_estate(source, out)` migrates a whole folder / site (every datasource + workbook) in one run. **`--scan`** is a read-only pre-build gate: it writes `<out>/scan.json` naming each workbook's published datasource and whether it's in scope, and **exits non-zero** while any is missing (run it before building so a published-backed workbook is never rebuilt to an empty report — see STEP 1.5). **`migrate_workbook(source, write_to=…, name=None)`** is the single-workbook primitive the estate loops: it rebuilds the workbook's embedded datasource(s) into one semantic model **and** the workbook's report bound to it — an openable `pbip/<Name>/` (plus a bare `reports/<Name>.Report`); a multi-datasource workbook consolidates every embedded datasource into one model (disconnected table islands, each bound to its own connection) with a single report bound to it. Reach for it (over `migrate_datasource`) whenever the input is a **workbook** and you want the **report**, not just a datasource model. |
 | [`scripts/deploy_to_fabric.py`](scripts/deploy_to_fabric.py) | Self-contained Fabric REST deploy (stdlib-only urllib): createOrUpdate / updateDefinition of the SemanticModel, 202 LRO polling, optional refresh + gateway bind. **Also deploys the workbook's REPORT** as a Fabric `reports` item — `deploy_pbip` / `deploy_report` + the fail-closed `rebind_report_byConnection` (rewrites `definition.pbir` to a **`byConnection`** `semanticmodelid=<id>` reference, required for REST deploy) via `--pbip` / `--report-dir`. Importable `acquire_token` (handles `az` on Windows) + `refresh_dataset` / **`recalc_dataset`** (a default, credential-free `type: Calculate` ProcessRecalc that processes the Import calc tables so a composite model opens without benign warning triangles; `--no-recalc` to skip) for post-deploy ops. Lets the skill finish **in Fabric** without depending on a peer skill. |
 
 For exact signatures and a copy-paste **download → migrate → deploy** snippet, see [public-api.md](resources/public-api.md).
