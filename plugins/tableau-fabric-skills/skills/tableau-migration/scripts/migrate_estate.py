@@ -995,6 +995,43 @@ def _color_scale_rollup(result):
     }
 
 
+def _measure_filter_rollup(result):
+    """Additive disclosure rollup for aggregate/measure filters the viz stage dropped to review.
+
+    A Tableau worksheet filter on an aggregate (``SUM(Sales)``) or a calculated measure has no
+    faithful slicer mapping -- ``twb_to_pbir._parse_filters`` warns ("aggregate/measure filter on
+    '<field>' is not mapped to a slicer") and does NOT emit a possibly-wrong control (warn-never-wrong).
+    That is the honest stub, but such a filter CHANGES THE NUMBERS a visual shows, and
+    ``_viz_fidelity``'s one-reason-per-worksheet summary can collapse the warning behind another (e.g.
+    a date-grain note on the same worksheet). This rollup scans the viz warnings and GUARANTEES every
+    dropped aggregate/measure filter stays visible in the report, so a reviewer re-applies it manually.
+    Purely a CONSUMER of warnings the viz stage already produced -- it emits nothing into the PBIR and
+    never re-derives a filter; returns ``None`` when none were dropped (report byte-identical otherwise).
+    """
+    warnings = (result.get("warnings") if isinstance(result, dict) else None) or []
+    seen, items = set(), []
+    for w in warnings:
+        if not isinstance(w, dict):
+            continue
+        reason = w.get("reason") or ""
+        if "aggregate/measure filter on " not in reason:
+            continue
+        key = (w.get("name"), reason)
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append({"worksheet": w.get("name"), "reason": reason})
+    if not items:
+        return None
+    return {
+        "count": len(items),
+        "worksheets": items,
+        "note": ("worksheet filter on an aggregate/calculated measure was left to review (no faithful "
+                 "slicer mapping); it changes the values shown -- re-apply it as a visual-level filter "
+                 "in Power BI"),
+    }
+
+
 _PBIP_WARN = "manual attention required: "
 
 
@@ -1963,6 +2000,9 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                 _cs_rollup = _color_scale_rollup(rebuilt)
                 if _cs_rollup:
                     entry["color_scale_defaults"] = _cs_rollup
+                _mf_rollup = _measure_filter_rollup(rebuilt)
+                if _mf_rollup:
+                    entry["measure_filters_needs_review"] = _mf_rollup
         except Exception as exc:
             warns.append(_PBIP_WARN + f"model-fact rebind skipped ({type(exc).__name__}: {exc}) -- "
                          f"report binds to the standing source/deferred fields")
@@ -2198,6 +2238,10 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_di
     cs_rollup = _color_scale_rollup(result)
     if cs_rollup:
         detail["color_scale_defaults"] = cs_rollup
+
+    mf_rollup = _measure_filter_rollup(result)
+    if mf_rollup:
+        detail["measure_filters_needs_review"] = mf_rollup
 
     signal = _workbook_binding_signal(text, result.get("ir") if isinstance(result, dict) else None)
     if signal is not None:

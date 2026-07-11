@@ -1131,6 +1131,38 @@ def test_parse_extract_only_keeps_extract_tables():
     assert {c["remote_name"] for c in tables[0]["columns"]} == {"Amount"}
 
 
+def test_bare_hyper_connection_class_detected_as_extract():
+    # A standalone .hyper datasource (connection class 'hyper', no <extract enabled> wrapper) IS a
+    # materialized extract -> is_extract must fire on the class alone so it routes to offline Import
+    # instead of dying at needs-decision. (EXTRACT_ONLY has no <extract> element.)
+    assert parse_tds(EXTRACT_ONLY)["is_extract"] is True
+
+
+def test_federated_hyper_named_connection_detected_as_extract():
+    # The extract-engine class is detected through a federated wrapper's named-connection too.
+    fed_hyper = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Sales' inline='true' version='18.1'>
+  <connection class='federated'>
+    <named-connections><named-connection caption='ex' name='hyper.1'>
+      <connection class='hyper' dbname='sales.hyper' /></named-connection></named-connections>
+    <relation connection='hyper.1' name='Orders' table='[Extract].[Orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'><remote-name>Sales</remote-name><local-name>[Sales]</local-name>
+        <parent-name>[Orders]</parent-name><local-type>real</local-type></metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+    d = parse_tds(fed_hyper)
+    assert d["connection_class"] == "hyper"
+    assert d["is_extract"] is True
+
+
+def test_live_connection_not_falsely_flagged_as_extract():
+    # Guard: a genuine live source with no extract is NOT flagged (the class check must be narrow).
+    assert parse_tds(LIVE_SQLSERVER)["is_extract"] is False
+
+
+
 def test_parse_custom_sql_relation():
     d = parse_tds(CUSTOM_SQL)
     rel = d["relations"][0]

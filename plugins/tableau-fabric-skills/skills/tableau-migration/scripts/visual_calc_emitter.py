@@ -42,6 +42,7 @@ from visual_calc_spec import (
     FAMILY_PERCENT_OF_TOTAL,
     FAMILY_YEAR_OVER_YEAR,
     FAMILY_DIFFERENCE,
+    FAMILY_RANK,
 )
 
 # Deterministic display / DAX-reference name per family. The name is also the ``nativeQueryRef`` a
@@ -57,6 +58,7 @@ _FAMILY_NAME = {
     FAMILY_PERCENT_OF_TOTAL: "Percent of Total",
     FAMILY_YEAR_OVER_YEAR: "Year over Year",
     FAMILY_DIFFERENCE: "Difference",
+    FAMILY_RANK: "Rank",
 }
 
 # Families whose DAX yields a RATIO (0..1-scaled), which Tableau's quick table calc shows as a
@@ -132,6 +134,21 @@ def _body(spec: VisualCalcSpec, base_ref: str, partition_column: Optional[str]) 
             f"VAR N = RankAsc + RankDesc - 1\n"
             f"RETURN DIVIDE(RankAsc - 1, N - 1)"
         ), None
+
+    if spec.family == FAMILY_RANK:
+        # Faithful RANK: the tie rule + direction come from the parsed rank-options (default SKIP =
+        # Tableau Competition, DESC = Tableau descending). A pane-scoped rank restarts per partition
+        # column; a whole-table rank (the common CustomerRank case) has NO partition -- partitioning
+        # by the sole category would make every partition size 1 and every rank 1. So PARTITIONBY is
+        # emitted only when the spec pinned a pane partition AND its column resolved (else fail closed).
+        ties = spec.rank_ties or "SKIP"
+        direction = spec.rank_direction or "DESC"
+        order = f"ORDERBY({m}, {direction})"
+        if spec.partition_pill:
+            if not partition_column:
+                return None, "rank pane partition was detected but no resolved partition column was provided"
+            return f"RANK({ties}, {order}, PARTITIONBY({_ref(partition_column)}))", None
+        return f"RANK({ties}, {order})", None
 
     if spec.family == FAMILY_COMPOUND_GROWTH:
         return (

@@ -333,6 +333,12 @@ def _odbc_facts(c):
     }
 
 
+# Tableau extract-engine connection classes. A datasource whose primary connection is one of these
+# IS a materialized extract (a standalone .hyper, or a legacy .tde over the pre-Hyper Data Engine),
+# even without an <extract enabled> wrapper -- so ``is_extract`` is set from the class alone.
+_EXTRACT_ENGINE_CLASSES = frozenset({"hyper", "dataengine"})
+
+
 def _live_connection(datasource):
     """Return ``(class, server, dbname, warehouse, http_path, auth_method, named_connection_count)``.
 
@@ -1299,6 +1305,12 @@ def parse_tds(xml_text, select=None):
         if (ex.get("enabled") or "true").lower() != "false":
             is_extract = True
             break
+    # A bare extract-engine connection (a standalone .hyper / legacy .tde datasource) IS an extract
+    # by definition, even when it carries no <extract enabled> wrapper element -- the whole source is
+    # the materialized extract. Detect it by connector class so an extract-only .tds routes to the
+    # offline-Import-over-extract path (storage_mode branch 1.7) instead of dying at needs-decision.
+    if not is_extract and (cls or "").lower() in _EXTRACT_ENGINE_CLASSES:
+        is_extract = True
 
     unsupported = []
     table_like = [r for r in relations if r["kind"] in ("table", "custom_sql")]

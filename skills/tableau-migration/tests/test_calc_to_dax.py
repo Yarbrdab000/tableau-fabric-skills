@@ -15,6 +15,7 @@ import pytest
 from calc_to_dax import (
     translate_tableau_calc_to_dax,
     translate_tableau_calc_to_column_dax,
+    translate_tableau_calc_to_column_dax_typed,
     validate_dax,
     date_attribute_binding,
     _tokenize,
@@ -1260,5 +1261,46 @@ def test_out_of_engine_constructs_never_translate(formula):
     # The permanent-fallback boundary: neither entry point may emit DAX for these.
     assert translate_tableau_calc_to_dax(formula, _resolver)[0] is None
     assert translate_tableau_calc_to_column_dax(formula, _resolver)[0] is None
+
+
+# -- B9: typed column translator + column_refs (sibling calculated-column reference resolution) ------
+def test_column_typed_default_no_refs_byte_identical_and_returns_dtype():
+    # column_refs=None (default) -> identical dax/reason/tables to the 3-tuple wrapper, plus the dtype.
+    dax3, reason3, tabs3 = translate_tableau_calc_to_column_dax("UPPER([Region])", _resolver)
+    dax4, reason4, tabs4, dtype = translate_tableau_calc_to_column_dax_typed(
+        "UPPER([Region])", _resolver)
+    assert (dax4, reason4, tabs4) == (dax3, reason3, tabs3)
+    assert dax4 == "UPPER('Orders'[Region])"
+    assert dtype == "text"
+
+
+def test_column_refs_resolves_sibling_calc_reference():
+    # A bare [Cleaned Region] names a sibling calc column absent from the base resolver; column_refs
+    # supplies its home table + TMDL type so it resolves instead of stubbing.
+    refs = {"cleaned region": ("Orders", "Cleaned Region", "string")}
+    dax, reason, tabs, dtype = translate_tableau_calc_to_column_dax_typed(
+        '[Cleaned Region] + " (r)"', _resolver, column_refs=refs)
+    assert dax is not None
+    assert "'Orders'[Cleaned Region]" in dax
+    assert tabs == {"Orders"}
+    assert dtype == "text"
+
+
+def test_column_refs_absent_sibling_still_stubs():
+    # No base resolution and no column_refs entry -> unresolved, fail-closed (no fabricated column).
+    dax, reason, tabs, dtype = translate_tableau_calc_to_column_dax_typed(
+        '[Cleaned Region] + " (r)"', _resolver, column_refs={})
+    assert dax is None
+
+
+def test_column_refs_base_resolver_wins_over_refs():
+    # A caption the datasource metadata knows resolves via the base resolver; column_refs is consulted
+    # only as a fallback, so a real source column is never shadowed by a sibling entry.
+    refs = {"region": ("OtherTable", "WrongCol", "string")}
+    dax, reason, tabs, dtype = translate_tableau_calc_to_column_dax_typed(
+        "UPPER([Region])", _resolver, column_refs=refs)
+    assert dax == "UPPER('Orders'[Region])"
+    assert tabs == {"Orders"}
+
 
 

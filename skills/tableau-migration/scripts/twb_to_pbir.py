@@ -2594,6 +2594,68 @@ def _zone_num(zone, attr):
         return None
 
 
+def _zone_background_fill(zone):
+    """A dashboard zone's authored background fill -> a ``#rrggbb`` (lower-cased) or ``None``.
+
+    Reads the ``<zone-style>`` ``<format attr='background-color' value='#..'/>`` a Tableau author
+    sets on a decoration zone. On a full-width top text zone this fill is the workbook's most
+    deliberate brand signal (the crimson header band), so it seeds both the header banner and the
+    brand-first report theme. Only a well-formed ``#rrggbb`` is returned (never a name / rgba)."""
+    style = _first(zone, "zone-style")
+    if style is None:
+        return None
+    for fmt in _children_local(style, "format"):
+        if fmt.get("attr") == "background-color":
+            val = (fmt.get("value") or "").strip()
+            if _HEX6_RE.match(val):
+                return val.lower()
+    return None
+
+
+def _zone_formatted_text(zone):
+    """Flatten a dashboard zone's ``<formatted-text>`` ``<run>`` descendants to plain text.
+
+    STRUCTURAL content only (the concatenated run text, stripped); per-run font attributes are read
+    separately (see ``_zone_run_color``). Returns ``""`` when the zone carries no formatted text."""
+    ft = _first(zone, "formatted-text")
+    if ft is None:
+        return ""
+    return "".join((r.text or "") for r in _findall_local(ft, "run")).strip()
+
+
+def _zone_run_color(zone):
+    """The first text-bearing ``<run>``'s ``fontcolor`` on a zone -> a ``#rrggbb`` or ``None``.
+
+    The banner title's font colour (white over the crimson fill). Returns ``None`` when the first
+    text run declares no colour, or declares one that is not a plain ``#rrggbb``."""
+    ft = _first(zone, "formatted-text")
+    if ft is None:
+        return None
+    for r in _findall_local(ft, "run"):
+        if (r.text or "").strip():
+            c = (r.get("fontcolor") or "").strip()
+            return c.lower() if _HEX6_RE.match(c) else None
+    return None
+
+
+def _select_title_banner(candidates, ext_w, ext_h):
+    """Choose the dashboard's title banner from its filled top text-zone candidates.
+
+    A title banner is the author's header band: a ``type='text'`` zone carrying a background fill
+    AND a non-empty title, spanning most of the dashboard width and sitting at/near the top. The
+    two gates (wide + top) exclude the other filled text zones a dashboard may hold -- narrow tinted
+    separators / callouts (small ``w``) and lower annotation boxes (large ``y``) -- so only the real
+    header is picked, and a dashboard with none returns ``None`` (never-regress). Ties break on the
+    topmost, then widest, then leftmost candidate, so the pick is fully deterministic."""
+    picks = [c for c in candidates
+             if ext_w and c["w"] >= 0.5 * ext_w
+             and ((not ext_h) or c["y"] <= 0.2 * ext_h)]
+    if not picks:
+        return None
+    picks.sort(key=lambda c: (round(c["y"], 3), -round(c["w"], 3), round(c["x"], 3)))
+    return picks[0]
+
+
 def _parse_dashboard(db, worksheet_names, warnings):
     name = db.get("name")
     size_el = _first(db, "size")
@@ -2617,6 +2679,7 @@ def _parse_dashboard(db, worksheet_names, warnings):
     legend_zones = []
     filter_field_tokens = set()
     seen_params = set()
+    banner_candidates = []
     ext_w = ext_h = 0.0
     for zone in _findall_local(db, "zone"):
         if zone in device_zones:
@@ -2630,6 +2693,19 @@ def _parse_dashboard(db, worksheet_names, warnings):
             ext_w = max(ext_w, x + w)
             ext_h = max(ext_h, y + h)
         ztype = zone.get("type-v2") or zone.get("type")
+        # A title/header zone is a decoration ``type='text'`` zone the author filled and titled
+        # (e.g. the full-width crimson band at the very top). It is NOT a worksheet, so it must not
+        # enter ``zones`` (existing behaviour below still skips it on the name check); we only
+        # additively CAPTURE it here as a banner candidate. The final header is chosen after the
+        # loop, once the canvas extent is known (a text zone can appear anywhere in document order).
+        if ztype == "text" and None not in (x, y, w, h) and w > 0 and h > 0:
+            fill = _zone_background_fill(zone)
+            text = _zone_formatted_text(zone)
+            if fill and text:
+                banner_candidates.append({
+                    "text": text, "fill": fill,
+                    "text_color": _zone_run_color(zone) or "#ffffff",
+                    "x": x, "y": y, "w": w, "h": h})
         # A dashboard FILTER card -- the filter the author actually exposed on the dashboard surface
         # (possibly nested inside a collapsible layout container; the zone walk recurses) -- is what
         # faithfully becomes a page slicer. Capture its field token so slicer emit only surfaces a
@@ -2672,7 +2748,8 @@ def _parse_dashboard(db, worksheet_names, warnings):
     return {"name": name, "size": size,
             "extent": {"w": ext_w or None, "h": ext_h or None}, "zones": zones,
             "param_controls": param_controls, "legend_zones": legend_zones,
-            "filter_field_tokens": sorted(filter_field_tokens)}
+            "filter_field_tokens": sorted(filter_field_tokens),
+            "title_banner": _select_title_banner(banner_candidates, ext_w, ext_h)}
 
 
 def _warn(scope, name, reason):
@@ -4894,7 +4971,126 @@ def _dumps(obj):
     return json.dumps(obj, indent=2)
 
 
-def report_json_part():
+# -- dashboard title banner (header band) -------------------------------------
+# The banner font size is fixed rather than lifted from the source run: a scaled header band is a
+# few dozen px tall, so a single "reasonably large" bold size reads as a header at any page scale
+# (the source point size, tuned to Tableau's own banner geometry, does not transfer 1:1).
+_BANNER_FONT_SIZE = "20pt"
+
+
+def _banner_textbox_visual(name, position, banner):
+    """A dashboard title banner -> a schema-valid PBIR ``textbox`` ``visual.json`` dict.
+
+    Rebuilds the author's header band: a full-width rectangle filled with the banner colour, showing
+    the dashboard title in the banner's text colour (white over the crimson fill), bold and header-
+    sized. The text lives in the classic ``objects.general.paragraphs[].textRuns`` channel; the fill
+    is the container ``visualContainerObjects.background`` colour (a single-quoted hex literal). The
+    visual carries no data binding, so it never dangles against the model. Shape + this exact nesting
+    verified against Microsoft's PBIR ``textbox`` examples and validated against the
+    ``visualContainer/1.0.0`` schema this engine stamps for every visual (``SCHEMA_VISUAL``)."""
+    fill = banner["fill"]
+    color = banner.get("text_color") or "#ffffff"
+    run = {"value": banner["text"],
+           "textStyle": {"fontWeight": "bold", "fontSize": _BANNER_FONT_SIZE, "color": color}}
+    visual = {
+        "visualType": "textbox",
+        "objects": {
+            "general": [{"properties": {"paragraphs": [
+                {"textRuns": [run], "horizontalTextAlignment": "left"}]}}]
+        },
+        "visualContainerObjects": {
+            "background": [{"properties": {
+                "show": {"expr": {"Literal": {"Value": "true"}}},
+                "color": {"solid": {"color": {"expr": {"Literal": {
+                    "Value": _semantic_string_literal(fill)}}}}},
+                "transparency": {"expr": {"Literal": {"Value": "0D"}}},
+            }}],
+            "title": [{"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}],
+        },
+        "drillFilterOtherVisuals": True,
+    }
+    return {"$schema": SCHEMA_VISUAL, "name": name, "position": position, "visual": visual}
+
+
+# -- Tableau palette custom theme ---------------------------------------------
+# Power BI applies the report theme's ``dataColors`` to every AUTOMATICALLY coloured categorical
+# mark (the bulk of a workbook's charts). A migrated report with no custom theme falls back to
+# Power BI's default palette, so a Tableau view that read blue/orange/red rebuilds in Fabric's teal
+# default -- the single biggest at-a-glance colour mismatch. A custom theme whose ``dataColors`` are
+# Tableau's canonical categorical palette recolours every chart at once to the source's colour
+# language WITHOUT touching data (a theme is purely cosmetic, and an explicit per-visual ``dataPoint``
+# fill still overrides it, so author-assigned member colours keep winning). Positions 1-10 are
+# Tableau 10 in EXACT order -- Tableau's default automatic assignment for <=10 categories -- so a
+# two-series chart rebuilds blue+orange like Tableau, never blue+light-blue. Positions 11-20 extend
+# with distinct darker Tableau 20 hues for the rare >10-category chart; they never perturb the first
+# ten. Hex verified against Tableau's published "Tableau 10"/"Tableau 20" palettes.
+_TABLEAU_10 = [
+    "#4E79A7", "#F28E2B", "#E15759", "#76B7B2", "#59A14F",
+    "#EDC948", "#B07AA1", "#FF9DA7", "#9C755F", "#BAB0AC"]
+_TABLEAU_EXTRA = [
+    "#499894", "#D37295", "#B6992D", "#86BCB6", "#79706E",
+    "#8CD17D", "#D7B5A6", "#FABFD2", "#A0CBE8", "#FFBE7D"]
+_TABLEAU_THEME_FILE = "TableauPalette.json"
+_TABLEAU_THEME_DISPLAY = "Tableau"
+
+
+def _derive_brand_color(ir):
+    """The workbook's brand colour -> a ``#rrggbb``, or ``None`` when the workbook carries no signal.
+
+    Derived purely from the parsed dashboards: the brand is the dashboards' title-banner fill (the
+    author's deliberate header colour). When several dashboards carry banners of different fills the
+    most frequent wins (ties break on the lexically smallest hex, so the pick is deterministic).
+    Returns ``None`` when no dashboard has a title banner -- the never-regress guard, so a workbook
+    with no header band leaves the report theme byte-identical to the default Tableau palette. No hex
+    is hardcoded here: the value is whatever the workbook painted its header band."""
+    counts = {}
+    for db in ir.get("dashboards", []):
+        banner = db.get("title_banner")
+        fill = banner.get("fill") if banner else None
+        if fill and _HEX6_RE.match(fill):
+            key = fill.lower()
+            counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return None
+    top = max(counts.values())
+    return sorted(h for h, c in counts.items() if c == top)[0]
+
+
+def tableau_theme_dict(brand=None, extra_palette=None):
+    """The custom-theme JSON: a minimal, always-valid Power BI theme (``name`` + ``dataColors``).
+
+    ``dataColors`` is Tableau's categorical palette (Tableau 10, then the distinct Tableau 20
+    extras) so automatically coloured marks rebuild in the source's colour language. Deliberately
+    minimal -- no ``background``/``foreground`` overrides -- so it recolours marks only and never
+    fights the base theme on text/canvas.
+
+    ``brand`` (a workbook-derived ``#rrggbb``, see ``_derive_brand_color``) leads ``dataColors`` when
+    given, so a single-series / auto-coloured chart rebuilds in the workbook's brand colour instead of
+    Power BI's blue-first default, while the full Tableau 10/20 sequence still trails as the fallback
+    for multi-category charts (the brand is de-duplicated out of that tail, case-insensitively, so it
+    never appears twice). ``extra_palette`` (an optional ordered list of ``#rrggbb`` -- reserved for a
+    later per-member-palette lever) is inserted after the brand, ahead of the Tableau tail, likewise
+    de-duplicated. With no ``brand`` and no ``extra_palette`` the return is byte-identical to the prior
+    default (the never-regress contract)."""
+    base = list(_TABLEAU_10 + _TABLEAU_EXTRA)
+    lead = []
+    if brand and _HEX6_RE.match(brand):
+        lead.append(brand)
+    for hex_color in (extra_palette or []):
+        if hex_color and _HEX6_RE.match(hex_color):
+            lead.append(hex_color)
+    if not lead:
+        return {"name": _TABLEAU_THEME_DISPLAY, "dataColors": base}
+    ordered, seen = [], set()
+    for hex_color in lead + base:
+        low = hex_color.lower()
+        if low not in seen:
+            seen.add(low)
+            ordered.append(hex_color)
+    return {"name": _TABLEAU_THEME_DISPLAY, "dataColors": ordered}
+
+
+def report_json_part(custom_theme_name=None):
     """The ``definition/report.json`` content shared by the full viz seam (``emit_pbir``) and the
     thin ``.pbip`` shell (``assemble_model.build_thin_report_parts``).
 
@@ -4903,8 +5099,15 @@ def report_json_part():
     with no ``baseTheme`` throws a ``NullReferenceException`` when the report opens (the semantic
     model still loads, but the authoring canvas/Visualizations pane never initializes). Keeping a
     single builder prevents the two emit paths from drifting on this again.
+
+    When ``custom_theme_name`` is given (the full rebuilt-report path), a ``customTheme`` layered on
+    the base theme plus its ``RegisteredResources`` package are added so the report loads a bundled
+    theme file at ``StaticResources/RegisteredResources/<custom_theme_name>``. Shape verified against
+    the ``report/1.0.0`` schema (``ThemeMetadata`` + ``ResourcePackage``/``ResourcePackageItem``) and
+    a real Microsoft enhanced-format report. Default ``None`` is byte-for-byte the prior output, so
+    the thin ``.pbip`` shell is unchanged.
     """
-    return {
+    part = {
         "$schema": SCHEMA_REPORT,
         "layoutOptimization": "None",
         "themeCollection": {"baseTheme": {
@@ -4912,6 +5115,18 @@ def report_json_part():
             "reportVersionAtImport": "5.61",
             "type": "SharedResources"}},
     }
+    if custom_theme_name:
+        part["themeCollection"]["customTheme"] = {
+            "name": custom_theme_name,
+            "reportVersionAtImport": "5.61",
+            "type": "RegisteredResources"}
+        part["resourcePackages"] = [{
+            "name": "RegisteredResources",
+            "type": "RegisteredResources",
+            "items": [{"name": custom_theme_name,
+                       "path": custom_theme_name,
+                       "type": "CustomTheme"}]}]
+    return part
 
 
 # -- Field-parameter (swap) self-service report --------------------------------
@@ -5095,7 +5310,14 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     })
     parts["definition/version.json"] = _dumps({
         "$schema": SCHEMA_VERSION, "version": "2.0.0"})
-    parts["definition/report.json"] = _dumps(report_json_part())
+    parts["definition/report.json"] = _dumps(
+        report_json_part(custom_theme_name=_TABLEAU_THEME_FILE))
+    # Brand-first theme: lead ``dataColors`` with the workbook's derived brand colour (the dashboards'
+    # title-banner fill) so auto-coloured single-series charts rebuild in the brand instead of Power
+    # BI's blue-first default. ``None`` (no banner/brand) keeps the theme byte-identical (never-regress).
+    brand_color = _derive_brand_color(ir)
+    parts["StaticResources/RegisteredResources/" + _TABLEAU_THEME_FILE] = _dumps(
+        tableau_theme_dict(brand=brand_color))
     parts[".platform"] = _dumps({
         "$schema": SCHEMA_PLATFORM,
         "metadata": {"type": "Report", "displayName": report_name},
@@ -5201,6 +5423,18 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             shown_tokens={tuple(t) for t in (db.get("filter_field_tokens") or ())})
         visuals += _emit_param_control_slicers(
             ir.get("parameter_controls", []), db["name"], page_name, ref_w, ref_h, warnings)
+        # Header band: rebuild the author's full-width title banner (crimson fill + white title) as a
+        # textbox pinned to the top strip. High ``z`` keeps the header above any content it abuts;
+        # ``tabOrder`` 0 makes it first in reading order. Emitted before the empty-page guard so a
+        # dashboard that is only a banner still yields a page. Absent a banner nothing is added, so a
+        # bannerless dashboard's output is byte-identical to before (never-regress).
+        banner = db.get("title_banner")
+        if banner and banner.get("fill"):
+            bx, by, bw, bh = _scale_zone(banner, ref_w, ref_h)
+            visuals.append(_banner_textbox_visual(
+                _sanitize(f"v-{page_name}-banner"),
+                _position(bx, by, bw, bh, z=1000, tab=0),
+                banner))
         if not visuals:
             warnings.append(_warn("dashboard", db["name"],
                                   "no supported visuals on this dashboard"))
