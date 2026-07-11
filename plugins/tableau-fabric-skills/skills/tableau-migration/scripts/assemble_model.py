@@ -1008,6 +1008,46 @@ def build_model_manifest(*, table_names, relations, measure_report, calc_column_
     }
 
 
+def resolve_consolidated_column(report, datasource, caption):
+    """Resolve a Tableau field caption within a specific embedded ``datasource`` to the fully
+    qualified ``'<consolidated table>'[<column>]`` reference the consolidated model emitted (Spec 6).
+
+    Complements ``report["calc_bindings"]`` (calc -> measure) by covering base-table fields, using
+    the two surfaces the consolidation already emits: ``report["model_manifest"]["columns"]`` (every
+    field's ``tableau_field`` -> ``model_table``/``model_name``) and ``report["table_map"]`` (the
+    ``"<datasource>||<base>" -> <consolidated table>`` map) to disambiguate a caption that collides
+    across datasources. Returns the quoted reference string, or ``None`` when it can't be resolved
+    unambiguously (fail-closed -- an authoring pass should treat ``None`` as "author it explicitly").
+    """
+    if not isinstance(report, dict):
+        return None
+    cap = str(caption or "").strip().strip("[]").strip()
+    if not cap:
+        return None
+    cap_l = cap.lower()
+    columns = ((report.get("model_manifest") or {}).get("columns")) or []
+    matches = [c for c in columns
+               if str(c.get("tableau_field") or "").strip().lower() == cap_l
+               and c.get("model_table") and c.get("model_name")]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        # Colliding caption across datasources: keep only columns whose consolidated table
+        # belongs to the requested datasource, per table_map.
+        tmap = report.get("table_map") or {}
+        ds = str(datasource or "").strip()
+        prefix = f"{ds}||"
+        ds_tables = {v for k, v in tmap.items() if str(k).startswith(prefix)}
+        if ds_tables:
+            narrowed = [c for c in matches if c.get("model_table") in ds_tables]
+            if narrowed:
+                matches = narrowed
+        if len(matches) > 1 and len({(c["model_table"], c["model_name"]) for c in matches}) > 1:
+            return None  # still ambiguous -> fail closed
+    c = matches[0]
+    return f"'{c['model_table']}'[{c['model_name']}]"
+
+
 def _safe_role_filename(name, used):
     """A filesystem-safe, de-duplicated file base for a role's ``roles/<name>.tmdl`` part."""
     base = re.sub(r'[\\/:*?"<>|]+', "_", name).strip() or "Role"
@@ -1592,7 +1632,89 @@ def _handoff_fields(formula, resolve, calc_lookup):
     return out
 
 
-def translation_handoff_artifact(measure_report, calc_column_report, resolve, *, calc_lookup=None):
+# Coarse lexical families for grouping IRREDUCIBLE keystones so a human / second compiler can batch
+# authoring by kind. This is a shape HINT (which authoring recipe to reach for), never a parser or a
+# translation -- the authored DAX is still gated + reconciled downstream. First match wins.
+def _stub_shape(formula):
+    fl = " ".join((formula or "").split()).lower()
+    if not fl:
+        return "other"
+    compact = fl.replace(" ", "")
+    if "countd(" in fl and ("if " in fl or "iif(" in compact):
+        return "conditional_countd"
+    if fl.startswith("countd(") or fl.startswith("count("):
+        return "simple_count"
+    if any(tok in compact for tok in ("{fixed", "{include", "{exclude")):
+        return "lod"
+    if "zn(if" in compact or ("if " in fl and "then [quantity]" in fl):
+        return "flag_quantity"
+    if "datediff(" in fl:
+        return "datediff"
+    if "datetrunc(" in fl or "datepart(" in fl:
+        return "date_shape"
+    if "[parameters]" in fl:
+        return "param"
+    return "other"
+
+
+def _triage_stubs(requests, calc_lookup, resolve, *, param_resolver=None, known_tables=None):
+    """Partition the needs-review stubs into IRREDUCIBLE keystones vs CASCADABLE dependents.
+
+    The engine's own ``measure_refs`` cascade (see ``_measures_part``) already resolves a calc that
+    fails ONLY because a calc it references has not been translated yet -- once the referent is a live
+    measure, the dependent translates on a later pass. What the flat handoff never says is *which few
+    calcs are the bases that unlock the many*, so migration effort can't be targeted. This re-attempts
+    each stub with an OPTIMISTIC seed -- every known calc name/alias assumed already translated -- and
+    splits:
+
+      * translates now  -> ``cascadable`` (the native cascade auto-resolves it once its bases are
+        authored, so it needs no direct authoring);
+      * still fails     -> ``irreducible`` keystone (intrinsically outside the deterministic safe
+        subset -> a human / second compiler must author its base DAX), grouped by rough ``shape`` so
+        authoring can be batched by kind.
+
+    Dimension-role calcs use the column translator, which has no ``measure_refs`` cascade, so a
+    dimension stub that only fails on a cross-calc reference is (correctly) irreducible: the native
+    cascade lifts measures, not calculated columns.
+
+    Pure: emits NO DAX and NO model objects -- only names, roles, categories, and shape buckets.
+    Returns ``{"irreducible": {shape: [{name, role, category}]}, "cascadable": [name],
+    "summary": {"irreducible", "cascadable", "shapes"}}``.
+    """
+    # Optimistically assume every known calc (by caption AND internal alias -- both are calc_lookup
+    # keys) is already a live measure, so a bare cross-calc reference resolves. Only the truthiness of
+    # the re-translation is used; the emitted DAX is discarded.
+    optimistic = {key: (key, "number") for key in (calc_lookup or {})}
+    irreducible = {}
+    cascadable = []
+    for req in requests or []:
+        formula = req.get("formula") or ""
+        role = req.get("role")
+        if role == "dimension":
+            dax, _reason, _tables = translate_tableau_calc_to_column_dax(
+                formula, resolve, known_tables=known_tables)
+        else:
+            dax, _reason, _tables = translate_tableau_calc_to_dax(
+                formula, resolve, param_resolver=param_resolver,
+                measure_refs=optimistic, known_tables=known_tables)
+        if dax:
+            cascadable.append(req.get("name"))
+        else:
+            irreducible.setdefault(_stub_shape(formula), []).append(
+                {"name": req.get("name"), "role": role, "category": req.get("category")})
+    return {
+        "irreducible": irreducible,
+        "cascadable": cascadable,
+        "summary": {
+            "irreducible": sum(len(v) for v in irreducible.values()),
+            "cascadable": len(cascadable),
+            "shapes": {shape: len(names) for shape, names in irreducible.items()},
+        },
+    }
+
+
+def translation_handoff_artifact(measure_report, calc_column_report, resolve, *, calc_lookup=None,
+                                 param_resolver=None, known_tables=None):
     """Additive Tier-0 -> Tier-1 handoff manifest -- the deterministic engine's honest report of
     what it could and could NOT faithfully translate, plus a STRUCTURED request for each calc that
     fell back, so a second compiler can propose (and the oracle later verify) a faithful DAX.
@@ -1605,7 +1727,7 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
     already-computed per-calc report rows + the field resolver and emits **no DAX and no model
     objects** (so it can never bloat the model or introduce a fragile translation).
 
-    Returns ``{"summary", "needs_review", "requests"}``:
+    Returns ``{"summary", "needs_review", "requests", "triage"}``:
       * ``summary`` -- counts: ``total`` / ``live`` (faithfully translated, deterministic or
         approved) / ``needs_review`` (stub or pending suggestion), with the per-status breakdown, an
         honest ``coverage_pct`` (``None`` when there are no calcs), and a ``categories`` map giving
@@ -1619,6 +1741,11 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
         stable Tier-1 classification (see ``translation_router.classify_fallback``) telling the second
         compiler what intent to supply and which DAX shape to aim for -- everything it needs to
         propose a translation at the right grain.
+      * ``triage`` (see ``_triage_stubs``) -- the needs-review set split into ``irreducible``
+        keystones (grouped by rough shape) that must be authored vs ``cascadable`` dependents the
+        native ``measure_refs`` cascade resolves once those keystones exist, so effort targets only
+        the few bases. ``param_resolver`` / ``known_tables`` (the same the build used) make the
+        re-translation faithful; default ``None`` -> a conservative triage.
     """
     buckets = {"translated": 0, "assisted_approved": 0, "assisted_suggested": 0, "stub": 0}
     category_counts = {}
@@ -1675,7 +1802,10 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
         "coverage_pct": _coverage_pct(live, total),
         "categories": category_counts,
     }
-    return {"summary": summary, "needs_review": needs_review, "requests": requests}
+    triage = _triage_stubs(requests, calc_lookup, resolve,
+                           param_resolver=param_resolver, known_tables=known_tables)
+    return {"summary": summary, "needs_review": needs_review, "requests": requests,
+            "triage": triage}
 
 
 def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
@@ -1931,7 +2061,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         "assisted_suggestions": assisted_suggestions,
         "translation_handoff": translation_handoff_artifact(
             measure_report, calc_column_report, resolve,
-            calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs)),
+            calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
+            param_resolver=param_resolver, known_tables=set(table_names)),
         "relationships": relationships or [],
         "relationship_confidence": relationship_confidence_manifest(descriptor, relationships or []),
         "date_table": date_report,
@@ -1953,6 +2084,12 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     }
     if filter_bindings:
         report["filter_bindings"] = filter_bindings
+    # Spec 6: surface the base-table -> consolidated-name map the consolidation computed (present
+    # only on a combine_descriptors union) so an authoring / second-compiler pass can resolve a
+    # field to its exact consolidated table without reverse-engineering the naming rule.
+    tmap = descriptor.get("table_map")
+    if tmap:
+        report["table_map"] = dict(tmap)
     if header_reconcile["remaps"] or header_reconcile["mismatches"]:
         report["flatfile_header_reconcile"] = header_reconcile
     report["openability_selfcheck"] = check_model_openability(
@@ -2936,6 +3073,17 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
     if local_data is not None:
         # Local-POC path: a CSV-backed Import model regardless of connector; never land-to-Delta.
         _split_auto_calcs()
+        # Thread the workbook's parameters so param-driven calcs (CASE [Parameters].[X], what-if
+        # selectors, goal-difference measures) translate into real measures instead of stubbing. The
+        # main migrate_tds_to_semantic_model path auto-parses these from the source text and builds the
+        # param_resolver, but this local-CSV branch assembles straight from the descriptor (no text in
+        # hand), so parse + pass them here to reach the same resolver. Fail-closed: a parse error leaves
+        # them absent (behaviour unchanged); an explicit caller kwargs['parameters'] (incl. []) wins.
+        if "parameters" not in kwargs:
+            try:
+                kwargs["parameters"] = parse_parameters(tds_text)
+            except Exception:
+                pass
         table_csv_paths = _resolve_local_csv_paths(
             local_data, source=source, model_name=model_name, write_to=write_to)
         result = assemble_local_import_model(

@@ -22,6 +22,7 @@ from migrate_estate import (
     LocalFilesSource,
     extract_calculations,
     migrate_estate,
+    migrate_workbook,
 )
 
 
@@ -1288,7 +1289,58 @@ def test_definition_of_done_built_but_low_fidelity_degrades_to_warn():
                ("Stubbed WB", "Warned Viz WB", "Ref Drop WB"))
 
 
-def test_definition_of_done_warn_precedence_and_banner():
+def test_definition_of_done_non_openable_model_fails_loud():
+    # A report bound to a model that fails the openability self-check (e.g. a duplicate column survived
+    # to TMDL) OPENS but will not load -> it must FAIL LOUD, ahead of the warn/pass branch, even when
+    # the workbook also carries soft fidelity gaps that would otherwise only WARN.
+    dup_issue = {"ok": False,
+                 "checks": {"tmdl_wellformed": True, "no_duplicate_columns": False},
+                 "issues": [{"check": "no_duplicate_columns", "table": "Orders",
+                             "detail": "column 'Region' is declared more than once"}]}
+    wb_details = [
+        {"name": "Clean WB", "pbip_status": "built", "bound_model": "M",
+         "pbip_folder": "pbip/Clean WB/Clean WB.pbip",
+         "openability_selfcheck": {"ok": True, "checks": {"no_duplicate_columns": True}, "issues": []}},
+        # single-datasource path: the self-check lands on the workbook detail itself
+        {"name": "Broken WB", "pbip_status": "built", "bound_model": "M",
+         "pbip_folder": "pbip/Broken WB/Broken WB.pbip",
+         "openability_selfcheck": dup_issue,
+         # also carries a would-be WARN gap -> openability must win (loud > soft)
+         "model_translation_handoff": {"summary": {"total": 5, "needs_review": 2}}},
+        # consolidated path: the self-check lands on a datasource_pbips entry
+        {"name": "Broken Consolidated WB", "pbip_status": "skipped",
+         "datasource_pbips": [{"datasource": "A", "pbip_status": "built",
+                               "openability_selfcheck": {"ok": True, "checks": {}, "issues": []}},
+                              {"datasource": "B", "pbip_status": "built",
+                               "openability_selfcheck": dup_issue}]},
+    ]
+    dod = me._definition_of_done(wb_details, pbip_enabled=True)
+
+    assert dod["status"] == "failed"                        # any non-openable model -> loud overall fail
+    by_name = {e["workbook"]: e for e in dod["workbooks"]}
+    assert by_name["Clean WB"]["status"] == "pass"
+    assert by_name["Broken WB"]["status"] == "failed"
+    assert "not openable" in by_name["Broken WB"]["reason"]
+    assert "Region" in by_name["Broken WB"]["reason"]       # the concrete issue is named
+    assert by_name["Broken Consolidated WB"]["status"] == "failed"
+    assert "not openable" in by_name["Broken Consolidated WB"]["reason"]
+    # a loud failure banner is rendered (not the green pass line)
+    assert "FAILED" in "\n".join(me._dod_banner(dod))
+
+
+def test_dod_openability_failure_helper_tolerates_missing_and_ok():
+    # No signal (missing or ok) -> None; ok is False -> a concise loud reason.
+    assert me._dod_openability_failure({"name": "X"}) is None
+    assert me._dod_openability_failure(
+        {"openability_selfcheck": {"ok": True, "checks": {}, "issues": []}}) is None
+    # ok False but no issue detail -> falls back to naming the failed check(s)
+    reason = me._dod_openability_failure(
+        {"openability_selfcheck": {"ok": False,
+                                   "checks": {"typed_columns_declared": False}, "issues": []}})
+    assert reason is not None and "typed_columns_declared" in reason
+
+
+
     # A hard failure still wins over a fidelity warning (failed > warn).
     mixed = me._definition_of_done(
         [{"name": "Warn WB", "pbip_status": "built",
@@ -2536,6 +2588,164 @@ def test_main_approved_dax_missing_file_errors(fixtures_dir, tmp_path):
     out = str(tmp_path / "bundle")
     with pytest.raises(SystemExit):
         me.main(["-i", fixtures_dir, "-o", out, "--approved-dax", str(tmp_path / "missing.json")])
+
+
+# -- Spec-4 SECOND-COMPILER landing pre-pass wiring (--second-compile / --author) ----------------
+# The opt-in threads ``second_compiler.land_report`` through migrate_workbook (so estate + standalone
+# share one path): keystone-dependent stub chains land as gated, faithful DAX and flow through the
+# SAME approved-dax landing seam. Default-off must be byte-identical (no report key, no landing).
+def _sc_wb(calc_cols):
+    """A single-datasource (SQL Server) workbook whose resolver binds Sales/Region/Order Date --
+    the LIVE shape the driver needs to translate a keystone."""
+    return f"""<?xml version='1.0' encoding='utf-8' ?>
+<workbook><datasources>
+ <datasource formatted-name='Superstore' caption='Sales' name='fed.sales' version='18.1'>
+  <connection class='federated'>
+   <named-connections><named-connection caption='myserver' name='sqlserver.0a1b2c'>
+     <connection authentication='sqlserver' class='sqlserver' dbname='Superstore'
+                 server='myserver.database.windows.net' username='svc' />
+   </named-connection></named-connections>
+   <relation connection='sqlserver.0a1b2c' name='Orders' table='[dbo].[Orders]' type='table' />
+   <metadata-records>
+    <metadata-record class='column'><remote-name>Sales</remote-name><local-name>[Sales]</local-name><parent-name>[Orders]</parent-name><local-type>real</local-type></metadata-record>
+    <metadata-record class='column'><remote-name>Region</remote-name><local-name>[Region]</local-name><parent-name>[Orders]</parent-name><local-type>string</local-type></metadata-record>
+    <metadata-record class='column'><remote-name>Order Date</remote-name><local-name>[Order Date]</local-name><parent-name>[Orders]</parent-name><local-type>date</local-type></metadata-record>
+   </metadata-records>
+  </connection>
+  {calc_cols}
+ </datasource>
+</datasources></workbook>"""
+
+
+def _sc_col(caption, name, formula, role="measure"):
+    return (f"<column caption='{caption}' name='[{name}]' role='{role}'>"
+            f"<calculation class='tableau' formula='{formula}'/></column>")
+
+
+# Base stubs (SCRIPT_REAL has no faithful DAX); Plus/Ratio form the measure-of-measure chain.
+_SC_STUB_CHAIN = "\n".join([
+    _sc_col("Base", "Calculation_base", 'SCRIPT_REAL(&quot;x&quot;, SUM([Sales]))'),
+    _sc_col("Plus", "Calculation_plus", "[Base] + 1"),
+    _sc_col("Ratio", "Calculation_ratio", "[Base] / [Plus]"),
+])
+# A detector-recognizable keystone (Spec-7 year-gated idiom) needs NO authored override.
+_SC_DETECTOR_CHAIN = "\n".join([
+    _sc_col("Base", "Calculation_base", "IF YEAR([Order Date]) = 2023 THEN [Sales] END"),
+    _sc_col("Plus", "Calculation_plus", "[Base] + 1"),
+])
+
+
+def _measures_tmdl_text(bundle_root, wb_name="Chain WB", model="Sales.SemanticModel"):
+    path = os.path.join(bundle_root, "pbip", wb_name, model,
+                        "definition", "tables", "_Measures.tmdl")
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_second_compile_default_off_is_byte_identical(tmp_path):
+    # Default-off: no ``second_compile`` report key, and the keystone base stays an inert stub (its
+    # SUM('Orders'[Sales]) DAX never lands). This is the additive/byte-identical guarantee.
+    src = InMemoryTableauSource(workbooks={"Chain WB": _sc_wb(_SC_STUB_CHAIN)})
+    detail = migrate_workbook(src, write_to=str(tmp_path / "off"), wb_id="Chain WB")
+    assert detail["pbip_status"] == "built"
+    assert "second_compile" not in detail
+    tmdl = _measures_tmdl_text(str(tmp_path / "off"))
+    assert "SUM('Orders'[Sales])" not in tmdl          # the base did not land -- it is a stub
+
+
+def test_second_compile_on_authored_keystone_lands_whole_chain(tmp_path):
+    # Opt-in with an authored keystone lands Base + the cascaded Plus/Ratio into the REAL emitted
+    # model (assisted-approved), and stamps an additive ``second_compile`` record on the detail.
+    src = InMemoryTableauSource(workbooks={"Chain WB": _sc_wb(_SC_STUB_CHAIN)})
+    detail = migrate_workbook(src, write_to=str(tmp_path / "on"), wb_id="Chain WB",
+                              second_compile=True, authored={"Base": "SUM('Orders'[Sales])"})
+    sc = detail["second_compile"]
+    assert sc["count"] == 3
+    assert set(sc["landed"]) == {"Base", "Plus", "Ratio"}
+    assert sc["authored"] == ["Base"]
+    assert set(sc["cascaded"]) == {"Plus", "Ratio"}
+    tmdl = _measures_tmdl_text(str(tmp_path / "on"))
+    assert "measure Base = SUM('Orders'[Sales])" in tmdl
+    assert "measure Plus = [Base] + 1" in tmdl
+    assert "measure Ratio = DIVIDE([Base], [Plus])" in tmdl
+    # provenance preserved: assisted stamp + original Tableau formula annotation kept
+    assert "assisted translation (human-approved)" in tmdl
+    assert 'TableauFormula = SCRIPT_REAL("x", SUM([Sales]))' in tmdl
+
+
+def test_second_compile_prepass_human_approved_wins_over_supplement(tmp_path):
+    # The pre-pass merges the supplement UNDER approved_calc_dax, so an explicit human-approved entry
+    # for the same calc name always wins (explicit intent beats an auto-landed keystone).
+    src = InMemoryTableauSource(workbooks={"Chain WB": _sc_wb(_SC_STUB_CHAIN)})
+    merged, sc = me._second_compile_prepass(
+        src, "Chain WB", {"Base": "SUM('Orders'[Profit])"}, {"Base": "SUM('Orders'[Sales])"})
+    assert merged["Base"] == "SUM('Orders'[Profit])"   # the pre-existing approval, not the supplement
+    assert merged["Plus"] and merged["Ratio"]          # dependents still cascade in
+    assert sc["count"] == 3
+
+
+def test_second_compile_prepass_fail_closed_on_unreadable_workbook():
+    # Any failure in the driver leaves the approved map untouched and records an honest note -- the
+    # opt-in never corrupts the build (fail-closed).
+    class _Boom:
+        def read_workbook(self, wb_id):
+            raise RuntimeError("cannot read")
+
+    approved = {"Existing": "SUM('Orders'[Sales])"}
+    merged, sc = me._second_compile_prepass(_Boom(), "WB", approved, None)
+    assert merged == approved                           # unchanged
+    assert sc["count"] == 0 and "note" in sc
+
+
+def test_main_author_flag_lands_chain_via_cli(tmp_path):
+    # End-to-end through the documented CLI: --author <file.json> implies --second-compile and lands
+    # the authored keystone + its cascade into the workbook's model.
+    indir = tmp_path / "in"
+    indir.mkdir()
+    with open(indir / "Chain WB.twb", "w", encoding="utf-8-sig") as fh:
+        fh.write(_sc_wb(_SC_STUB_CHAIN))
+    author_json = tmp_path / "author.json"
+    author_json.write_text(json.dumps({"Base": "SUM('Orders'[Sales])"}), encoding="utf-8")
+    out = str(tmp_path / "out")
+
+    rc = me.main(["-i", str(indir), "-o", out, "--author", str(author_json)])
+    assert rc == 0
+    on_disk = json.load(open(os.path.join(out, "report.json"), encoding="utf-8"))
+    wb = next(w for w in on_disk["workbooks"] if w["name"] == "Chain WB")
+    assert set(wb["second_compile"]["landed"]) == {"Base", "Plus", "Ratio"}
+    assert "measure Base = SUM('Orders'[Sales])" in _measures_tmdl_text(out)
+
+
+def test_main_second_compile_flag_lands_detector_keystone_via_cli(tmp_path):
+    # --second-compile ALONE (no --author) still lands a keystone the engine's OWN Spec-7 detectors
+    # recognize (year-gated idiom), proving the flag is wired independently of authored overrides.
+    indir = tmp_path / "in"
+    indir.mkdir()
+    with open(indir / "Chain WB.twb", "w", encoding="utf-8-sig") as fh:
+        fh.write(_sc_wb(_SC_DETECTOR_CHAIN))
+    out = str(tmp_path / "out")
+
+    rc = me.main(["-i", str(indir), "-o", out, "--second-compile"])
+    assert rc == 0
+    on_disk = json.load(open(os.path.join(out, "report.json"), encoding="utf-8"))
+    wb = next(w for w in on_disk["workbooks"] if w["name"] == "Chain WB")
+    sc = wb["second_compile"]
+    assert sc["detectors"] == ["Base"] and sc["authored"] == []
+    assert set(sc["landed"]) == {"Base", "Plus"}
+    tmdl = _measures_tmdl_text(out)
+    assert "CALCULATE(" in tmdl and "YEAR(" in tmdl
+
+
+def test_main_author_missing_file_errors(tmp_path):
+    # A bad --author path fails fast (argparse error -> SystemExit) so a typo never silently drops a
+    # keystone.
+    indir = tmp_path / "in"
+    indir.mkdir()
+    with open(indir / "Chain WB.twb", "w", encoding="utf-8-sig") as fh:
+        fh.write(_sc_wb(_SC_STUB_CHAIN))
+    out = str(tmp_path / "out")
+    with pytest.raises(SystemExit):
+        me.main(["-i", str(indir), "-o", out, "--author", str(tmp_path / "missing.json")])
 
 
 def test_viz_adapter_forwards_row_count_binding_only_when_supported():

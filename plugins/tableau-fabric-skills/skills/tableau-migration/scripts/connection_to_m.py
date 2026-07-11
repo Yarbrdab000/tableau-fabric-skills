@@ -591,6 +591,7 @@ def _columns_by_parent(datasource):
     additionally gets a ``format_string`` key; the key is simply absent otherwise.
     """
     out = {}
+    seen = {}  # (parent, model_name) -> col dict already emitted, for twin-record dedup
     fmt_by_physical = _default_formats_by_physical(datasource)
     geo_by_physical = _geo_categories_by_physical(datasource)
     for rec in _findall_local(datasource, "metadata-record"):
@@ -627,6 +628,20 @@ def _columns_by_parent(datasource):
         cat = geo_by_physical.get((parent, model_name))
         if cat:
             col["data_category"] = cat
+        # Tableau emits TWIN <metadata-record> entries for join-key / calc-referenced columns: one
+        # federated/logical record (often lacking <ordinal>) and one from the extract's .hyper cache
+        # (ordinal set). Both clean to the same model_name, so emitting both yields a duplicate TMDL
+        # column -> an invalid, un-openable model. Dedup at this single upstream source (keep first,
+        # merge in any anchor a later twin carries) so EVERY downstream consumer -- live-DB and
+        # flat-file alike -- sees each physical column once. The flat-file column_reconcile still runs
+        # for phantom-drop / header-remap; twin collapse simply no longer depends on a readable header.
+        prior = seen.get((parent, model_name))
+        if prior is not None:
+            for k in ("ordinal", "format_string", "data_category"):
+                if k not in prior and k in col:
+                    prior[k] = col[k]
+            continue
+        seen[(parent, model_name)] = col
         out.setdefault(parent, []).append(col)
     return out
 
@@ -1430,6 +1445,10 @@ def combine_descriptors(descriptors, *, captions=None):
         return rel.get("name") or rel.get("item") or "Table"
 
     taken = set()  # lowercased display names already used across all combined datasources
+    # base-table -> consolidated-name map the consolidation *computes* here, keyed
+    # "<datasource caption>||<original base name>" so an authoring/second-compiler pass can
+    # resolve a field to its final consolidated table (surfaced as report["table_map"], Spec 6).
+    table_map = {}
     for i, desc in enumerate(kept):
         caption = ((captions[i] if i < len(captions) else None)
                    or desc.get("datasource_name") or f"ds{i + 1}")
@@ -1444,6 +1463,7 @@ def combine_descriptors(descriptors, *, captions=None):
                 combined["relations"].append(rel)  # combination markers pass through untouched
                 continue
             name = _display(rel)
+            orig = name
             if name.lower() in taken:
                 new = f"{name} ({caption})"
                 n = 2
@@ -1457,6 +1477,12 @@ def combine_descriptors(descriptors, *, captions=None):
                 rel = dict(rel, connection=origin_conn)
             taken.add(name.lower())
             combined["relations"].append(rel)
+            # Record base -> consolidated. A same-display self-join within one datasource keys
+            # the second (suffixed) copy by its final name so both stay reachable.
+            key = f"{caption}||{orig}"
+            if key in table_map and table_map[key] != name:
+                key = f"{caption}||{name}"
+            table_map[key] = name
         for r in desc.get("relationships", []) or []:
             if rename:
                 r = dict(r,
@@ -1477,6 +1503,7 @@ def combine_descriptors(descriptors, *, captions=None):
     # as it already does for a federated source with several named connections.
     combined["named_connection_count"] = sum(
         int(d.get("named_connection_count") or 1) for d in kept)
+    combined["table_map"] = table_map
     return combined
 
 

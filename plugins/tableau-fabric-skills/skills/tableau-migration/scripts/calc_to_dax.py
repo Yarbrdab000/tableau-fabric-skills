@@ -2619,9 +2619,221 @@ def _detect_argmax_dimension(formula, resolver, calc_lookup):
     }
 
 
+def _parse_if_single(toks):
+    """``IF <cond> THEN <result> END`` with nothing after END -> ``(cond, result)`` else ``None``.
+
+    A single unconditional IF/THEN/END only -- an ELSEIF/ELSE leaves extra tokens in ``result``
+    (the END split stops at the first top-level END), so those shapes are rejected by the caller
+    when it fails to parse ``result`` as the one construct it expects."""
+    if not toks or not _tok_is_kw(toks[0], "IF"):
+        return None
+    ct = _split_top_level(toks[1:], "THEN")
+    if ct is None:
+        return None
+    cond, after = ct
+    te = _split_top_level(after, "END")
+    if te is None:
+        return None
+    result, tail = te
+    if tail:
+        return None
+    return cond, result
+
+
+def _cap_numeric(resolver, cap):
+    """The caption resolves to a numeric column (tolerant across resolver type vocabularies)."""
+    r = resolver(cap)
+    if not r:
+        return False
+    t = str(r[2] or "").lower()
+    return t in _NUMERIC_TYPES or any(
+        k in t for k in ("int", "decimal", "double", "number", "real", "float",
+                         "money", "currency"))
+
+
+def _cap_date(resolver, cap):
+    """The caption resolves to a date / datetime column (tolerant)."""
+    r = resolver(cap)
+    if not r:
+        return False
+    t = str(r[2] or "").lower()
+    return "date" in t or "time" in t
+
+
+def _detect_first_last_by_date(formula, resolver, calc_lookup):
+    """Detect the "value on the latest / earliest date" idiom and emit a faithful whole-table measure.
+
+    Shape:  ``IF [d] = WINDOW_MAX([d]) THEN [s] END``  (last / most-recent) or ``WINDOW_MIN``
+    (first / earliest), where ``[d]`` is a date column and ``[s]`` a numeric column in the same
+    table. Tableau's WINDOW_* is a table calc addressed over the viz; with no addressing available
+    at the model layer the faithful, honest reduction is the whole-table extreme date. Returns a
+    suggestion dict or ``None``.
+    """
+    try:
+        toks = _tokenize(formula)
+    except _CalcError:
+        return None
+    parsed = _parse_if_single(toks)
+    if parsed is None:
+        return None
+    cond, result = parsed
+    s = _parse_simple_field(result)
+    if s is None:
+        return None
+    eq = _split_top_level_eq(cond)
+    if eq is None:
+        return None
+    left, right = eq
+    # One side must be a bare date field [d]; the other WINDOW_MAX([d]) / WINDOW_MIN([d]) on the
+    # SAME field. Accept either order.
+    win = date_field = None
+    for cand_d, cand_w in ((left, right), (right, left)):
+        d = _parse_simple_field(cand_d)
+        w = _parse_simple_agg(cand_w)
+        if d is not None and w is not None and w[0] in ("WINDOW_MAX", "WINDOW_MIN") and w[1] == d:
+            win, date_field = w[0], d
+            break
+    if win is None:
+        return None
+    if not _cap_date(resolver, date_field) or not _cap_numeric(resolver, s):
+        return None
+    rd, rs = resolver(date_field), resolver(s)
+    if rd[0] != rs[0]:                      # single-table only
+        return None
+    table, d_col, s_col = rd[0], rd[1], rs[1]
+    tdax = _dax_table(table)
+    is_last = win == "WINDOW_MAX"
+    ext_fn = "MAX" if is_last else "MIN"
+    word = "latest" if is_last else "earliest"
+    other = "WINDOW_MIN (earliest)" if is_last else "WINDOW_MAX (latest)"
+    dax = (
+        f"VAR __d = {ext_fn}({tdax}{_dax_col(d_col)})\n"
+        "RETURN\n"
+        f"    CALCULATE(AVERAGE({tdax}{_dax_col(s_col)}), {tdax}{_dax_col(d_col)} = __d)"
+    )
+    caveats = [
+        f"Returns the {word} {s_col} by {d_col} across the WHOLE table. Tableau's WINDOW_"
+        f"{'MAX' if is_last else 'MIN'} is addressed over the viz partition; if the source "
+        "partitions (e.g. per customer), wrap in the partition context or emit as a Visual "
+        "Calculation on that axis instead.",
+        f"Ties on the {word} date are AVERAGEd. Use MAX/MIN/SELECTEDVALUE for a single-value form.",
+        f"Emitted as a MEASURE. Swap MAX<->MIN to switch {other}.",
+    ]
+    return {
+        "pattern": "last-value-by-date" if is_last else "first-value-by-date",
+        "dax": dax,
+        "confidence": "medium",
+        "requires_approval": True,
+        "caveats": caveats,
+    }
+
+
+def _is_current_year_signal(toks, d_field, calc_lookup, _depth=0):
+    """``toks`` denotes the CURRENT year -- ``YEAR(TODAY())`` / ``YEAR(NOW())`` / ``YEAR(MAX([d]))``
+    on the gate's date field, or a bare calc reference resolving to one of those. Per Spec 8 rule 6
+    there is no "today" in landed data, so a max-of-date signal is the faithful "current year"."""
+    toks = _strip_outer_parens(toks)
+    if (len(toks) >= 3 and toks[0][0] == "id" and toks[0][1].upper() == "YEAR"
+            and toks[1] == ("op", "(") and toks[-1] == ("op", ")")):
+        inner = _strip_outer_parens(toks[2:-1])
+        if (len(inner) == 3 and inner[0][0] == "id" and inner[0][1].upper() in ("TODAY", "NOW")
+                and inner[1] == ("op", "(") and inner[2] == ("op", ")")):
+            return True
+        agg = _parse_simple_agg(inner)
+        if agg is not None and agg[0] in ("MAX", "MIN") and agg[1] == d_field:
+            return True
+    if _depth == 0 and calc_lookup:
+        ref = _parse_simple_field(toks)
+        if ref is not None:
+            rf = calc_lookup.get(ref.lower())
+            if rf:
+                try:
+                    return _is_current_year_signal(_tokenize(rf), d_field, calc_lookup, _depth=1)
+                except _CalcError:
+                    return False
+    return False
+
+
+def _detect_year_gated(formula, resolver, calc_lookup):
+    """Detect a year-gated measure ``IF YEAR([d]) = <Y> THEN [x] END`` and emit faithful DAX.
+
+    ``<Y>`` is either a numeric literal year (emit a literal filter) or a "current year" signal --
+    ``YEAR(TODAY())`` / ``YEAR(MAX([d]))`` / a calc resolving to one -- in which case a grand-max
+    anchor (``_maxyr``, the max year in the fact) supplies "current year" (Spec 8 rule 6). ``[x]``
+    is a numeric column defaulted to SUM (Tableau's default measure aggregation). Returns a
+    suggestion dict or ``None``.
+    """
+    try:
+        toks = _tokenize(formula)
+    except _CalcError:
+        return None
+    parsed = _parse_if_single(toks)
+    if parsed is None:
+        return None
+    cond, result = parsed
+    x = _parse_simple_field(result)
+    if x is None or not _cap_numeric(resolver, x):
+        return None
+    eq = _split_top_level_eq(cond)
+    if eq is None:
+        return None
+    left, right = eq
+    # One side must be YEAR([d]) on a date field; capture the other as <Y>.
+    d_field = y_side = None
+    for cand_year, cand_y in ((left, right), (right, left)):
+        yr = _parse_simple_agg(cand_year)
+        if yr is not None and yr[0] == "YEAR" and _cap_date(resolver, yr[1]):
+            d_field, y_side = yr[1], cand_y
+            break
+    if d_field is None:
+        return None
+    rd, rx = resolver(d_field), resolver(x)
+    if rd[0] != rx[0]:                      # single-table only
+        return None
+    table, d_col, x_col = rd[0], rd[1], rx[1]
+    tdax = _dax_table(table)
+    detail = f"SUM({tdax}{_dax_col(x_col)})"
+    ycol = f"YEAR({tdax}{_dax_col(d_col)})"
+
+    y_toks = _strip_outer_parens(y_side)
+    literal = None
+    if len(y_toks) == 1 and y_toks[0][0] == "num" and "." not in y_toks[0][1]:
+        literal = y_toks[0][1]
+    if literal is not None:
+        dax = f"CALCULATE({detail}, KEEPFILTERS({ycol} = {literal}))"
+        anchor_note = f"Fixed year {literal}."
+    elif _is_current_year_signal(y_side, d_field, calc_lookup):
+        dax = (
+            f"VAR __y = YEAR(CALCULATE(MAX({tdax}{_dax_col(d_col)}), REMOVEFILTERS({tdax}{_dax_col(d_col)})))\n"
+            "RETURN\n"
+            f"    CALCULATE({detail}, KEEPFILTERS({ycol} = __y))"
+        )
+        anchor_note = ('"Current year" = the MAX year in the fact (no "today" exists in landed '
+                       "data); use __y - 1 for the prior year.")
+    else:
+        return None
+    caveats = [
+        f"{x_col} defaulted to SUM (Tableau's default measure aggregation) -- change the "
+        "aggregation if the field is averaged / counted.",
+        anchor_note,
+        "Emitted as a MEASURE; KEEPFILTERS preserves any existing year filter on the visual.",
+    ]
+    return {
+        "pattern": "year-gated-measure",
+        "dax": dax,
+        "confidence": "medium",
+        "requires_approval": True,
+        "caveats": caveats,
+    }
+
+
 # Idiom registry. Each detector takes (formula, resolver, calc_lookup) and returns a
 # suggestion dict or None. First match wins. Add new idioms here.
-_ASSISTED_DETECTORS = (_detect_argmax_dimension,)
+_ASSISTED_DETECTORS = (
+    _detect_argmax_dimension,
+    _detect_first_last_by_date,
+    _detect_year_gated,
+)
 
 
 def suggest_assisted_dax(formula, resolver, *, calc_lookup=None):

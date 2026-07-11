@@ -134,6 +134,80 @@ def test_handoff_passes_through_existing_suggestion():
     assert top["suggestion"]["pattern"] == "argmax-dimension"
 
 
+# --------------------------------------------------------------------------- triage (Spec 5)
+def test_stub_shape_classifies_families():
+    # coarse lexical family hints, whitespace/brace-robust, fail-safe to "other"
+    assert A._stub_shape("COUNTD(IF [Flag] THEN [Id] END)") == "conditional_countd"
+    assert A._stub_shape("COUNTD([Customer Id])") == "simple_count"
+    assert A._stub_shape("COUNT([Orders])") == "simple_count"
+    assert A._stub_shape("{FIXED [State] : SUM([Sales])}") == "lod"
+    assert A._stub_shape("{ INCLUDE [City] : AVG([Profit]) }") == "lod"
+    assert A._stub_shape("ZN(IF [x] > 0 THEN [Quantity] END)") == "flag_quantity"
+    assert A._stub_shape("DATEDIFF('day',[Start],[End])") == "datediff"
+    assert A._stub_shape("DATETRUNC('month',[Order Date])") == "date_shape"
+    assert A._stub_shape("[Parameters].[Region]") == "param"
+    assert A._stub_shape("REGEXP_EXTRACT([City],'x')") == "other"
+    assert A._stub_shape("") == "other"
+    assert A._stub_shape(None) == "other"
+
+
+def test_triage_partitions_existing_fixture_into_irreducible_shapes():
+    # the shared fixture has no cross-calc dependents that translate under the optimistic seed;
+    # every stub is a genuine keystone -> all irreducible, grouped by lexical shape.
+    tri = _artifact()["triage"]
+    assert tri["cascadable"] == []
+    assert tri["summary"] == {"irreducible": 3, "cascadable": 0,
+                              "shapes": {"lod": 2, "param": 1}}
+    by_name = {e["name"]: e for grp in tri["irreducible"].values() for e in grp}
+    assert set(by_name) == {"Top City", "Top City Name", "Mystery"}
+    assert [e["name"] for e in tri["irreducible"]["lod"]] == ["Top City", "Top City Name"]
+    assert [e["name"] for e in tri["irreducible"]["param"]] == ["Mystery"]
+    assert by_name["Top City Name"]["role"] == "dimension"
+
+
+def test_triage_chain_leaf_irreducible_dependents_cascadable():
+    # REGEXP_EXTRACT has no faithful DAX -> a genuine leaf keystone that references only a field;
+    # its dependents fail ONLY on the cross-calc ref, so they cascade once the leaf is authored.
+    resolve = {"City": ("Orders", "City", "string")}.get
+    measures = [
+        {"measure": "Regex Base", "status": "stub", "reason": "unsupported REGEXP_EXTRACT",
+         "tableau_formula": "REGEXP_EXTRACT([City],'([0-9]+)')"},
+        {"measure": "Regex Plus", "status": "stub", "reason": "cross-calc",
+         "tableau_formula": "[Regex Base] + 1"},
+        {"measure": "Regex Ratio", "status": "stub", "reason": "cross-calc",
+         "tableau_formula": "[Regex Base] / [Regex Plus]"},
+    ]
+    lookup = {"regex base": "REGEXP_EXTRACT([City],'([0-9]+)')",
+              "regex plus": "[Regex Base] + 1",
+              "regex ratio": "[Regex Base] / [Regex Plus]"}
+    tri = A.translation_handoff_artifact(measures, [], resolve, calc_lookup=lookup)["triage"]
+    assert tri["cascadable"] == ["Regex Plus", "Regex Ratio"]
+    irr = [e["name"] for grp in tri["irreducible"].values() for e in grp]
+    assert irr == ["Regex Base"]
+    assert tri["summary"]["irreducible"] == 1 and tri["summary"]["cascadable"] == 2
+
+
+def test_triage_dimension_cross_calc_stays_irreducible_no_column_cascade():
+    # the SAME dependent formula cascades as a measure but is irreducible as a dimension column,
+    # because the column translator has no measure_refs cascade to seed.
+    resolve = {"City": ("Orders", "City", "string")}.get
+    lookup = {"regex base": "REGEXP_EXTRACT([City],'([0-9]+)')", "dep": "[Regex Base] + 1"}
+    measures = [{"measure": "Dep M", "status": "stub", "reason": "x",
+                 "tableau_formula": "[Regex Base] + 1"}]
+    columns = [{"column": "Dep C", "table": "Orders", "status": "stub", "reason": "x",
+                "tableau_formula": "[Regex Base] + 1"}]
+    tri = A.translation_handoff_artifact(measures, columns, resolve, calc_lookup=lookup)["triage"]
+    assert tri["cascadable"] == ["Dep M"]
+    irr = {e["name"]: e for grp in tri["irreducible"].values() for e in grp}
+    assert set(irr) == {"Dep C"} and irr["Dep C"]["role"] == "dimension"
+
+
+def test_triage_empty_when_no_requests():
+    tri = A.translation_handoff_artifact([], [], _resolver)["triage"]
+    assert tri == {"irreducible": {}, "cascadable": [],
+                   "summary": {"irreducible": 0, "cascadable": 0, "shapes": {}}}
+
+
 def test_handoff_is_additive_on_assembled_report():
     # a real assembled report carries translation_handoff alongside every pre-existing key
     out = A.migrate_tds_to_semantic_model(
@@ -145,5 +219,5 @@ def test_handoff_is_additive_on_assembled_report():
                 "calc_coverage", "calc_column_coverage"):
         assert key in report
     ho = report["translation_handoff"]
-    assert set(ho) == {"summary", "needs_review", "requests"}
+    assert set(ho) == {"summary", "needs_review", "requests", "triage"}
     assert ho["summary"]["total"] >= 1

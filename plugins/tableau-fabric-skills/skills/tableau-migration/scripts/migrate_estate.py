@@ -2004,6 +2004,13 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                   pbip_folder=folder_rel,
                   bound_model=model_safe,
                   model_translation_handoff=res_report.get("translation_handoff"))
+    # Surface the model's structural openability self-check (produced by the datasource build) onto the
+    # entry so the workbook definition-of-done can FAIL LOUD when a report bound to a non-openable model
+    # (e.g. a duplicate column that survived to TMDL) is produced -- a built .pbip is not the same as an
+    # openable one. Additive; absent/malformed -> no axis contribution.
+    _selfcheck = res_report.get("openability_selfcheck")
+    if isinstance(_selfcheck, dict):
+        entry["openability_selfcheck"] = _selfcheck
     # Honest disclosure (additive): any island that landed as a needs-review M partition scaffold
     # (an unmapped connector consolidated alongside mapped ones) is surfaced here so a stubbed-not-
     # dropped table is visible at the estate level -- for a consolidated workbook the model is built
@@ -2238,9 +2245,51 @@ def _single_workbook_source(source, name=None):
     return InMemoryTableauSource(workbooks={key: text}), key
 
 
+def _second_compile_prepass(single, wb_id, approved_calc_dax, authored):
+    """Opt-in Spec-4 pre-pass: land keystone-dependent stub calcs as faithful DAX and merge them
+    UNDER any explicit ``approved_calc_dax`` (a human-approved entry always wins on a name clash).
+
+    Fail-closed and side-effect-free: any error (workbook unreadable, driver import/runtime failure)
+    yields the *unchanged* approved map plus a detail note, so turning the pre-pass on can never break
+    a run. Returns ``(merged_approved_or_None, detail)`` where ``detail`` is the additive
+    ``second_compile`` report record.
+    """
+    try:
+        text = single.read_workbook(wb_id)
+    except Exception as exc:
+        return approved_calc_dax, {"landed": [], "count": 0,
+                                   "note": f"workbook unreadable: {type(exc).__name__}: {exc}"}
+    try:
+        try:  # scripts/ is on sys.path both as a CLI run and in tests
+            from . import second_compiler as _sc
+        except ImportError:
+            import second_compiler as _sc
+        rep = _sc.land_report(text, authored=authored)
+    except Exception as exc:
+        return approved_calc_dax, {"landed": [], "count": 0,
+                                   "note": f"second-compile unavailable: {type(exc).__name__}: {exc}"}
+
+    supplement = rep.get("approved") or {}
+    if supplement:
+        merged = dict(supplement)
+        merged.update(approved_calc_dax or {})  # explicit human-approved DAX wins on a name clash
+    else:
+        merged = approved_calc_dax
+    detail = {
+        "landed": sorted(supplement),
+        "count": len(supplement),
+        "authored": rep.get("authored", []),
+        "detectors": rep.get("detectors", []),
+        "cascaded": rep.get("cascaded", []),
+        "gate_failures": sorted(rep.get("gate_failures") or {}),
+    }
+    return merged, detail
+
+
 def migrate_workbook(source, *, write_to=None, wb_id=None, name=None, viz_stage=None,
                      approved_calc_dax=None, viz_advice=False, pbip=True,
-                     ds_catalog=None, used_folders=None):
+                     ds_catalog=None, used_folders=None,
+                     second_compile=False, authored=None):
     """Migrate ONE Tableau workbook into an openable Power BI project (model + bound report).
 
     This is the public workbook primitive -- the same faithful rebuild+bind the estate performs per
@@ -2262,6 +2311,14 @@ def migrate_workbook(source, *, write_to=None, wb_id=None, name=None, viz_stage=
 
     ``ds_catalog`` / ``used_folders`` are the estate's shared caches (a published-datasource match
     catalog and the set of already-claimed output folder names). Standalone callers omit them.
+
+    ``second_compile`` / ``authored`` (opt-in) turn on the Spec-4 SECOND-COMPILER landing pre-pass.
+    When ``second_compile`` is true (or ``authored`` overrides are supplied) the driver
+    (:mod:`second_compiler`) lands keystone-dependent stub calcs as faithful, gated DAX -- seeded from
+    the engine's own idiom detectors plus any ``authored`` ``{calc_name: dax}`` overrides -- and merges
+    the result UNDER ``approved_calc_dax`` (a human-approved entry always wins), so the very same
+    ``--approved-dax`` landing seam carries them into every model build. The landed set is reported on
+    the additive ``detail["second_compile"]`` key. When both are omitted the run is byte-identical.
     """
     if not write_to:
         raise ValueError(
@@ -2286,9 +2343,17 @@ def migrate_workbook(source, *, write_to=None, wb_id=None, name=None, viz_stage=
     if used_folders is None:
         used_folders = set()
 
-    return _migrate_one_workbook(single, wb_id, viz, reports_dir, used_folders, pbip_dir,
-                                 ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax,
-                                 viz_advice=viz_advice)
+    sc_detail = None
+    if second_compile or authored:
+        approved_calc_dax, sc_detail = _second_compile_prepass(
+            single, wb_id, approved_calc_dax, authored)
+
+    detail = _migrate_one_workbook(single, wb_id, viz, reports_dir, used_folders, pbip_dir,
+                                   ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax,
+                                   viz_advice=viz_advice)
+    if sc_detail is not None:
+        detail["second_compile"] = sc_detail
+    return detail
 
 
 # -- rebind plan ingest / routing (opt-in; byte-identical no-op when absent) ---
@@ -2596,7 +2661,8 @@ def _write_compile_report(output_dir, compile_report):
 
 
 def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan=None,
-                   rebind_bind_stage=None, approved_calc_dax=None, viz_advice=False):
+                   rebind_bind_stage=None, approved_calc_dax=None, viz_advice=False,
+                   second_compile=False, authored=None):
     """Run the whole estate migration and write the output bundle. Returns the report dict.
 
     ``source`` is any :class:`TableauSource`. ``output_dir`` receives::
@@ -2638,6 +2704,15 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
     ALTERNATIVE chart types for each visual's existing fields (deterministic; no model/LLM call). It
     is purely additive -- nothing is written into the PBIR definition and ``report.json`` only gains a
     ``viz_advice`` key per workbook -- so when omitted the run is byte-identical.
+
+    ``second_compile`` / ``authored`` (optional, opt-in) turn on the Spec-4 SECOND-COMPILER landing
+    pre-pass per workbook (see :func:`migrate_workbook`): keystone-dependent stub calcs are landed as
+    faithful, gated DAX -- from the engine's own idiom detectors plus any ``authored``
+    ``{calc_name: dax}`` overrides -- and merged UNDER ``approved_calc_dax`` (a human-approved entry
+    always wins) so the same landing seam carries them into every model build. Each workbook detail
+    gains an additive ``second_compile`` record. When both are omitted the run is byte-identical --
+    this opt-in IS the spec's "automatic" second-compiler behavior, kept opt-in so the default remains
+    byte-for-byte the committed baseline.
     """
     sm_dir = os.path.join(output_dir, "semantic_models")
     pbip_dir = os.path.join(output_dir, "pbip") if pbip else None
@@ -2653,7 +2728,8 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
                   for ds_id in source.list_datasources()]
     wb_details = [migrate_workbook(source, write_to=output_dir, wb_id=wb_id, viz_stage=viz,
                                    approved_calc_dax=approved_calc_dax, viz_advice=viz_advice,
-                                   pbip=pbip, ds_catalog=ds_catalog, used_folders=used_folders)
+                                   pbip=pbip, ds_catalog=ds_catalog, used_folders=used_folders,
+                                   second_compile=second_compile, authored=authored)
                   for wb_id in source.list_workbooks()]
 
     summary = _summarize(ds_details, wb_details, viz is not None)
@@ -2853,6 +2929,35 @@ def _dod_warn_reasons(w):
     return reasons
 
 
+def _dod_openability_failure(w):
+    """A loud reason a workbook's bound model is structurally NOT openable, or ``None`` if it is.
+
+    Reads the ``openability_selfcheck`` (``{"ok", "checks", "issues"}``) recorded on the workbook detail
+    (single-datasource path) AND on each ``datasource_pbips`` entry (consolidated path). A built ``.pbip``
+    whose model fails the self-check (e.g. a duplicate column survived to TMDL, or M types a column no
+    ``column`` declares) OPENS but will not load -- so this must fail the definition-of-done LOUD, not be
+    softened to a fidelity warning. Returns the first failing check's concise detail, else ``None``.
+    Read-only; tolerates a missing/malformed self-check (treated as no signal); never raises.
+    """
+    checks = [w.get("openability_selfcheck")]
+    for e in (w.get("datasource_pbips") or []):
+        checks.append((e or {}).get("openability_selfcheck"))
+    for sc in checks:
+        if not isinstance(sc, dict) or sc.get("ok") is not False:
+            continue
+        issues = sc.get("issues") or []
+        first = issues[0] if issues and isinstance(issues[0], dict) else {}
+        detail = first.get("detail")
+        table = first.get("table") or first.get("part")
+        if detail:
+            return f"model is not openable: {detail}" + (f" (table {table})" if table else "")
+        failed = [name for name, ok in (sc.get("checks") or {}).items() if ok is False]
+        if failed:
+            return "model is not openable: failed " + ", ".join(sorted(failed))
+        return "model is not openable"
+    return None
+
+
 def _definition_of_done(wb_details, pbip_enabled):
     """A machine definition-of-done ledger for workbook inputs (additive; never raises).
 
@@ -2867,8 +2972,11 @@ def _definition_of_done(wb_details, pbip_enabled):
       to a *published* Tableau datasource that was not co-migrated in the same run (the one honest
       carve-out: its ``.tds`` must be in scope to bind an openable report).
     - **failed** -- a workbook that should have produced a bound report did not: either an orphaned
-      report, or a hard ``.pbip`` write failure (e.g. a Windows MAX_PATH violation, recorded as
-      ``pbip_write_error`` and reported LOUD before the published carve-out so it is never masked).
+      report, a hard ``.pbip`` write failure (e.g. a Windows MAX_PATH violation, recorded as
+      ``pbip_write_error`` and reported LOUD before the published carve-out so it is never masked), or a
+      report bound to a structurally NON-OPENABLE model (the ``openability_selfcheck`` failed -- the
+      ``.pbip`` opens but will not load; see ``_dod_openability_failure``), which fails LOUD ahead of
+      the warn/pass branch so a green PASS is never reported over a model that will not open.
 
     The overall status is ``not_applicable`` (no workbook inputs), then by precedence ``failed`` (any
     failure -- the loud case) > ``warn`` (any fidelity gap) > ``pass`` (all clean) > ``skipped``.
@@ -2882,11 +2990,18 @@ def _definition_of_done(wb_details, pbip_enabled):
             status = "skipped"
             reason = "openable .pbip projects disabled (--no-pbip)"
         elif bound:
-            warn_reasons = _dod_warn_reasons(w)
-            if warn_reasons:
-                status, reason = "warn", "; ".join(warn_reasons)
+            openability_fail = _dod_openability_failure(w)
+            if openability_fail:
+                # A report bound to a structurally non-openable model is a LOUD failure -- it opens but
+                # will not load (e.g. a duplicate column survived to TMDL). Checked before warn/pass so
+                # a run never reports a green PASS over a model that will not open.
+                status, reason = "failed", openability_fail
             else:
-                status, reason = "pass", ""
+                warn_reasons = _dod_warn_reasons(w)
+                if warn_reasons:
+                    status, reason = "warn", "; ".join(warn_reasons)
+                else:
+                    status, reason = "pass", ""
         elif w.get("pbip_write_error"):
             # A hard .pbip write failure (e.g. a Windows MAX_PATH violation) is a LOUD failure, checked
             # BEFORE the published carve-out so it is never mis-reported as a benign skip.
@@ -3211,6 +3326,26 @@ def _load_approved_dax(path):
     return data or None
 
 
+def _load_authored(path):
+    """Load a ``{calc_name: dax_string}`` mapping of authored keystone DAX for the second-compiler
+    pre-pass from a JSON file. Returns ``None`` when ``path`` is falsy. Raises ``ValueError`` (a
+    fail-fast) when the file is missing, unreadable, not JSON, or not an object of ``str -> str`` --
+    so a typo never silently drops a keystone. Tolerates a UTF-8 BOM."""
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        raise ValueError(f"--author file not found: {path}")
+    except (OSError, ValueError) as exc:  # ValueError covers json.JSONDecodeError
+        raise ValueError(f"--author file is not readable JSON ({path}): {exc}")
+    if not isinstance(data, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+        raise ValueError(f"--author JSON must map calc name -> DAX string ({path})")
+    return data or None
+
+
 def scan_estate(source):
     """Read-only pre-build discovery -- the datasource-before-workbook gate.
 
@@ -3283,6 +3418,15 @@ def main(argv=None):
                         help="also write a reports/<Name>.viz-advice.json sidecar per workbook with "
                              "ranked alternative chart types per visual (Tier-2 viz advisor; "
                              "deterministic, additive, never alters the rebuilt PBIR)")
+    parser.add_argument("--second-compile", action="store_true",
+                        help="turn on the SECOND-COMPILER landing pre-pass per workbook: land "
+                             "keystone-dependent stub calcs as faithful, gated DAX (from the engine's "
+                             "own idiom detectors + fix-point cascade) and feed them through the same "
+                             "--approved-dax landing seam. Opt-in; the default run is byte-identical")
+    parser.add_argument("--author", metavar="JSON",
+                        help="path to a JSON file of authored keystone DAX (calc name -> DAX string) "
+                             "for the second-compiler pre-pass; implies --second-compile. Each entry "
+                             "is gate-checked and used to seed the cascade so its dependents land too")
     parser.add_argument("--scan", action="store_true",
                         help="PRE-BUILD DISCOVERY ONLY (no build): report each workbook's datasource "
                              "binding (embedded/published) and flag any PUBLISHED datasource not yet "
@@ -3295,6 +3439,12 @@ def main(argv=None):
         approved_calc_dax = _load_approved_dax(args.approved_dax)
     except ValueError as exc:
         parser.error(str(exc))
+
+    try:
+        authored = _load_authored(args.author)
+    except ValueError as exc:
+        parser.error(str(exc))
+    second_compile = bool(args.second_compile or authored)
 
     source = LocalFilesSource(args.input)
 
@@ -3323,7 +3473,8 @@ def main(argv=None):
         return 1 if missing else 0
 
     report = migrate_estate(source, args.output, pbip=not args.no_pbip,
-                            approved_calc_dax=approved_calc_dax, viz_advice=args.viz_advice)
+                            approved_calc_dax=approved_calc_dax, viz_advice=args.viz_advice,
+                            second_compile=second_compile, authored=authored)
     s = report["summary"]
     print(
         f"Datasources: {s['datasources_migrated']}/{s['datasources_total']} migrated "

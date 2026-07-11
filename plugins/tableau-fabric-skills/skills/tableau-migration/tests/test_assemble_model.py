@@ -10,12 +10,13 @@ from assemble_model import (
     fabric_definition_payload,
     migrate_tds_to_semantic_model,
     relationship_confidence_manifest,
+    resolve_consolidated_column,
     write_model_folder,
     _date_axis_order_resolver,
     _approved_entry,
     _win_long_path,
 )
-from connection_to_m import parse_tds
+from connection_to_m import parse_tds, combine_descriptors
 from workbook_table_calcs import TableCalcUsage, Pill
 from test_connection_to_m import (
     EXCEL_COLLECTION,
@@ -1000,6 +1001,35 @@ def test_model_manifest_present_and_inert_without_parameters():
     assert mf["parameters"] == []
     assert mf["tables"] == ["Orders"]
     assert mf["naming"]["Sales"]["model_name"] == "Sales"
+
+
+# -- Spec 6: base-table -> consolidated-name map + column resolver ----------------------------
+
+def test_report_table_map_and_resolve_consolidated_column():
+    # Two datasources, each with an 'Orders' table -> the second is renamed on consolidation.
+    # The report surfaces the map, and resolve_consolidated_column disambiguates a colliding
+    # caption using the datasource, returning the EXACT emitted 'table'[col] the model wrote.
+    a = parse_tds(LIVE_SQLSERVER)
+    b = parse_tds(LIVE_SQLSERVER)
+    combined = combine_descriptors([a, b], captions=["Sales", "Finance"])
+    assert combined["table_map"] == {"Sales||Orders": "Orders",
+                                     "Finance||Orders": "Orders (Finance)"}
+    out = assemble_import_model(combined, model_name="Consolidated")
+    report = out["report"]
+    assert report["table_map"] == combined["table_map"]
+    # 'Sales' caption exists on both Orders tables -> resolver picks the right one per datasource.
+    assert resolve_consolidated_column(report, "Sales", "Sales") == "'Orders'[Sales]"
+    assert resolve_consolidated_column(report, "Finance", "[Sales]") == "'Orders (Finance)'[Sales]"
+    # unknown caption fails closed
+    assert resolve_consolidated_column(report, "Sales", "Nope") is None
+
+
+def test_single_datasource_report_has_no_table_map():
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore")
+    assert "table_map" not in out["report"]
+    # helper still degrades gracefully (single-table caption resolves via the manifest alone)
+    assert resolve_consolidated_column(out["report"], "Superstore", "Sales") == "'Orders'[Sales]"
+    assert resolve_consolidated_column(None, "x", "y") is None
 
 
 # -- Stage 4: parameter-driven date-window keep-flag measure ----------------------------------
