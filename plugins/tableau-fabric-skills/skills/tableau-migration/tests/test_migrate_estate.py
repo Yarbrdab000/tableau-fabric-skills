@@ -1627,6 +1627,63 @@ def test_binding_signal_surfaced_in_estate_report_and_summary(tmp_path):
     assert s["workbooks_rebind_candidate"] == 0
 
 
+# -- pre-build scan: the datasource-before-workbook gate -----------------------
+def test_scan_estate_flags_missing_published_datasource():
+    # A published-datasource (sqlproxy) workbook whose datasource is NOT in scope must be flagged as
+    # MISSING so the runbook fetches it FIRST -- never building the workbook to an empty report.
+    src = InMemoryTableauSource(workbooks={"Published WB": PUBLISHED_DS_WORKBOOK_TWB})
+    manifest = me.scan_estate(src)
+    assert manifest["missing_published_datasources"] == ["Superstore (Published)"]
+    wb = manifest["workbooks"][0]
+    assert wb["name"] == "Published WB"
+    assert wb["kind"] == "published"
+    assert wb["published_ds_name"] == "Superstore (Published)"
+    assert wb["datasource_present"] is False
+
+
+def test_scan_estate_present_when_datasource_in_scope():
+    # With the published datasource present (its stem normalizes to the workbook's published caption
+    # via the SAME _norm_ds key the build uses), nothing is missing -- safe to build.
+    src = InMemoryTableauSource(
+        datasources={"Superstore (Published)": "<datasource/>"},
+        workbooks={"Published WB": PUBLISHED_DS_WORKBOOK_TWB})
+    manifest = me.scan_estate(src)
+    assert manifest["missing_published_datasources"] == []
+    assert manifest["workbooks"][0]["datasource_present"] is True
+    assert manifest["datasources_present"] == ["Superstore (Published)"]
+
+
+def test_scan_estate_embedded_workbook_reports_nothing_missing():
+    # An EMBEDDED-datasource workbook carries its own model -> no published datasource to fetch first.
+    src = InMemoryTableauSource(workbooks={"Embedded WB": SUPERSTORE_DASHBOARD_TWB})
+    manifest = me.scan_estate(src)
+    assert manifest["missing_published_datasources"] == []
+    assert manifest["workbooks"][0]["kind"] == "embedded"
+
+
+def test_scan_cli_writes_manifest_and_gates_on_missing(tmp_path):
+    # The --scan CLI writes scan.json and exits NON-ZERO while a published datasource is missing
+    # (the runbook's hard gate: do not build until this exits 0), then exits 0 once it is in scope.
+    indir = tmp_path / "in"
+    outdir = tmp_path / "out"
+    indir.mkdir()
+    with open(indir / "Published WB.twb", "w", encoding="utf-8-sig") as fh:
+        fh.write(PUBLISHED_DS_WORKBOOK_TWB)
+
+    rc = me.main(["-i", str(indir), "-o", str(outdir), "--scan"])
+    assert rc == 1  # missing datasource -> gate blocks the build
+    manifest = json.loads((outdir / "scan.json").read_text(encoding="utf-8"))
+    assert manifest["missing_published_datasources"] == ["Superstore (Published)"]
+
+    # Drop the published datasource into scope; the gate now clears (exit 0).
+    with open(indir / "Superstore (Published).tds", "w", encoding="utf-8-sig") as fh:
+        fh.write("<datasource/>")
+    rc2 = me.main(["-i", str(indir), "-o", str(outdir), "--scan"])
+    assert rc2 == 0
+    manifest2 = json.loads((outdir / "scan.json").read_text(encoding="utf-8"))
+    assert manifest2["missing_published_datasources"] == []
+
+
 def test_estate_summary_rolls_up_unbound_implicit_row_counts(tmp_path):
     # An object-id COUNT(*) with no model-side COUNTROWS target (the cross-layer gap) is warned,
     # never silently dropped or dangling -- and the estate summary rolls up the volume additively.

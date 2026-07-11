@@ -12,6 +12,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+- **tableau-migration:** **`migrate_estate.py --scan` — a read-only pre-build discovery gate that stops a
+  published-backed workbook from ever being built to an empty report.** Prior runbook guidance only
+  surfaced a missing published datasource *after* a build (in `report.json`), so an agent could run the
+  build, see an empty pass, and improvise or ask instead of fetching the datasource. `--scan` runs no
+  build, needs no credentials, and unzips nothing: it reads each workbook's binding, writes
+  `<out>/scan.json` (`{datasources_present, workbooks:[{name,kind,published_ds_name,datasource_present}],
+  missing_published_datasources}`), prints a per-workbook summary plus an `[ACTION]`/`[OK]` line, and
+  **exits non-zero while any published datasource is missing**. Presence is computed with the *same*
+  `_norm_ds` key the build uses to populate its datasource catalog, so `datasource_present` means exactly
+  "the build will find it and rebind the workbook to it." `SKILL.md` gains a **STEP 1.5** that runs the
+  scan before STEP 2 and hard-gates the build until it exits `0` (fetch each missing name into `.\in`,
+  re-scan, repeat), plus a Checkpoint 1.5; the note block, confirmation ledger, STEP 1 download-path
+  guardrail, capability table, and Checkpoint 2 are re-sequenced around scan-first / fetch-first. Purely
+  additive — no existing report key renamed or removed, and the default (no `--scan`) build path is
+  byte-identical.
+
 ### Fixed
 - **tableau-migration:** **A workbook migration no longer stops to ask the user whether the workbook
   embeds its datasource or connects to a published one — STEP 2 auto-detection is the immediate,
