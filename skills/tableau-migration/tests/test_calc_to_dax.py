@@ -247,6 +247,21 @@ TRANSLATIONS = [
      "VAR _mx = AVERAGEX(_t, 'Orders'[Sales]) VAR _my = AVERAGEX(_t, 'Orders'[Profit]) "
      "VAR _sxy = SUMX(_t, ('Orders'[Sales] - _mx) * ('Orders'[Profit] - _my)) "
      "VAR _n = COUNTROWS(_t) RETURN DIVIDE(_sxy, _n))"),
+    # --- '^' power operator -> POWER (functions_operators.htm: "equivalent to the POWER function") ---
+    ("SUM([Profit]) ^ 2", "POWER(SUM('Orders'[Profit]), 2)"),
+    ("SUM([Sales]) ^ 2 + SUM([Profit])",
+     "POWER(SUM('Orders'[Sales]), 2) + SUM('Orders'[Profit])"),   # power binds tighter than +
+    ("SUM([Sales]) * SUM([Profit]) ^ 2",
+     "SUM('Orders'[Sales]) * POWER(SUM('Orders'[Profit]), 2)"),    # power binds tighter than *
+    ("2 ^ 3 ^ 2", "POWER(2, POWER(3, 2))"),                        # right-associative
+    # --- '%' modulo operator -> MOD (integer remainder, divisor sign == DAX MOD) ---
+    ("SUM([Quantity]) % 10000", "MOD(SUM('Orders'[Quantity]), 10000)"),
+    ("SUM([Quantity]) % 100 + 1", "MOD(SUM('Orders'[Quantity]), 100) + 1"),  # % binds tighter than +
+    # --- #date# literals -> DATE()/TIME() (functions_operators.htm: unambiguous ISO + long forms) ---
+    ("#2020-01-01#", "DATE(2020, 1, 1)"),
+    ("#August 22, 2005#", "DATE(2005, 8, 22)"),                    # doc's long-form example
+    ("#2004-04-15 10:30:00#", "(DATE(2004, 4, 15) + TIME(10, 30, 0))"),  # datetime keeps time
+    ("DATEADD('day', 15, #2020-01-01#)", "(DATE(2020, 1, 1) + (15))"),   # literal as a date arg
 ]
 
 # Each of these MUST fall back (translator returns None).
@@ -562,6 +577,19 @@ COLUMN_TRANSLATIONS = [
      "SWITCH('Orders'[Quantity], 1, 10, 2, 20, 0)"),
     ("TODAY()", "TODAY()"),
     ("NOW()", "NOW()"),
+    # --- '^' power / '%' modulo at row level (functions_operators.htm operators + precedence table) ---
+    ("[Profit] ^ 2", "POWER('Orders'[Profit], 2)"),
+    # negate (precedence 1) binds TIGHTER than power (precedence 2): -x^2 == (-x)^2, NOT -(x^2)
+    ("-[Profit] ^ 2", "POWER(-('Orders'[Profit]), 2)"),
+    ("[Quantity] % 100", "MOD('Orders'[Quantity], 100)"),
+    # the real "numerical dates" corpus idiom: extract a component via INT(.../n) % m
+    ("INT([Quantity] / 100) % 100", "MOD(TRUNC(DIVIDE('Orders'[Quantity], 100)), 100)"),
+    # --- #date# literals in row-level comparisons / date functions ---
+    ("[Order Date] >= #2020-01-01#", "'Orders'[Order_Date] >= DATE(2020, 1, 1)"),
+    ("DATEDIFF('day', #2020-01-01#, [Order Date])",
+     "DATEDIFF(DATE(2020, 1, 1), 'Orders'[Order_Date], DAY)"),
+    ("IF [Order Date] >= #2020-01-01# THEN 1 ELSE 0 END",
+     "IF('Orders'[Order_Date] >= DATE(2020, 1, 1), 1, 0)"),
 ]
 
 COLUMN_FALLBACKS = [
@@ -683,10 +711,55 @@ def test_column_with_no_field_has_empty_tables_used():
     assert tables == set()  # no field refs -> bindable anywhere
 
 
-# ---------------------------------------------------------------------------
-# date_attribute_binding: the read-only recognizer for "calendar attribute of a single date
-# field" calcs that the orchestrator can bind to the generated Date dimension. Strict by design.
-# ---------------------------------------------------------------------------
+def test_power_operator_precedence_matches_tableau_negate_over_power():
+    """Tableau precedence (functions_operators.htm): 1=negate, 2=power, 3=*/%, 4=+-.
+
+    Negate binds TIGHTER than power -- ``-x^2`` is ``(-x)^2`` in Tableau, the opposite of most
+    languages -- so a faithful compiler must emit ``POWER(-(x), 2)``, not ``-(POWER(x, 2))``.
+    Power binds tighter than * and +, and is right-associative.
+    """
+    assert _col("-[Profit] ^ 2") == "POWER(-('Orders'[Profit]), 2)"          # negate > power
+    assert _tx("SUM([Sales]) * SUM([Profit]) ^ 2") == \
+        "SUM('Orders'[Sales]) * POWER(SUM('Orders'[Profit]), 2)"             # power > *
+    assert _tx("SUM([Sales]) ^ 2 + SUM([Profit])") == \
+        "POWER(SUM('Orders'[Sales]), 2) + SUM('Orders'[Profit])"            # power > +
+    assert _tx("2 ^ 3 ^ 2") == "POWER(2, POWER(3, 2))"                       # right-associative
+
+
+def test_modulo_operator_maps_to_mod():
+    """Tableau ``%`` (functions_operators.htm: integer remainder, sign of the divisor) is exactly
+    DAX ``MOD(number, divisor)``. Binds like * and / (precedence 3), tighter than + (4)."""
+    assert _col("[Quantity] % 100") == "MOD('Orders'[Quantity], 100)"
+    assert _tx("SUM([Quantity]) % 100 + 1") == "MOD(SUM('Orders'[Quantity]), 100) + 1"
+    # the "numerical dates" corpus idiom: pull a 2-digit component out of a packed integer
+    assert _col("INT([Quantity] / 100) % 100") == \
+        "MOD(TRUNC(DIVIDE('Orders'[Quantity], 100)), 100)"
+
+
+def test_date_literal_supported_forms():
+    """Tableau ``#...#`` date literals: the two *unambiguous* spellings Tableau documents map to
+    faithful DAX ``DATE()``/``TIME()``. ISO ``#YYYY-MM-DD[ HH:MM:SS]#`` and the long English form
+    ``#Month DD, YYYY#`` (functions_operators.htm). Works as a constant, a date-function argument,
+    and a row-level comparison operand."""
+    assert _tx("#2020-01-01#") == "DATE(2020, 1, 1)"
+    assert _tx("#August 22, 2005#") == "DATE(2005, 8, 22)"
+    assert _tx("#2004-04-15 10:30:00#") == "(DATE(2004, 4, 15) + TIME(10, 30, 0))"
+    assert _col("DATEDIFF('day', #2020-01-01#, [Order Date])") == \
+        "DATEDIFF(DATE(2020, 1, 1), 'Orders'[Order_Date], DAY)"
+    assert _col("[Order Date] >= #2020-01-01#") == "'Orders'[Order_Date] >= DATE(2020, 1, 1)"
+
+
+def test_date_literal_ambiguous_forms_fail_closed():
+    """Faithfulness over coverage: a locale-ambiguous literal like ``#01-02-2000#`` (MM-DD vs
+    DD-MM depends on the workbook locale) has no single correct reading, so the compiler must
+    NOT guess -- it stubs (returns None) rather than risk emitting the wrong day. Same for a
+    non-date and an impossible date."""
+    for bad in ("#01-01-2000#", "#01-02-2000#", "#13-01-2000#", "#4/15/2024#", "#not a date#"):
+        assert translate_tableau_calc_to_dax(bad, _resolver)[0] is None, bad
+        assert translate_tableau_calc_to_column_dax(bad, _resolver)[0] is None, bad
+
+
+
 @pytest.mark.parametrize("formula,expected", [
     # numeric extractors -- Tableau returns the NUMBER, so MONTH/QUARTER map to the numeric
     # helper columns ([Month No]/[Quarter No]), never the display text ([Month]/[Quarter]).
