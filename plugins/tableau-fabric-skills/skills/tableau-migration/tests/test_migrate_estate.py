@@ -1870,9 +1870,59 @@ def test_workbook_viz_fidelity_section_shape(tmp_path):
     assert entry["visual_type"] == "column"
     assert entry["status"] == "rebuilt"
     assert entry["reason"] is None
+    assert entry["tier"] == "rebuilt"          # clean rebuild, no deferral note
     for f in fid:
-        assert set(f) == {"worksheet", "visual_type", "status", "reason"}
-        assert f["status"] in {"rebuilt", "warned"}
+        assert set(f) == {"worksheet", "visual_type", "status", "reason", "tier"}
+        assert f["status"] in {"rebuilt", "warned"}          # status unchanged (additive tier)
+        assert f["tier"] in {"rebuilt", "rebuilt_with_deferrals", "degraded", "empty"}
+        # the additive tier never contradicts the existing status
+        if f["status"] == "rebuilt":
+            assert f["tier"] in {"rebuilt", "rebuilt_with_deferrals"}
+
+
+def test_fidelity_tier_classifies_each_bucket():
+    # empty: no faithful visual emitted (unsupported / no visual type), regardless of status.
+    assert me._fidelity_tier("warned", None, "manual attention required: unsupported visual type") == "empty"
+    assert me._fidelity_tier("warned", "unsupported", "anything") == "empty"
+    assert me._fidelity_tier("rebuilt", None, None) == "empty"
+    # rebuilt: a clean rebuild with no deferral note.
+    assert me._fidelity_tier("rebuilt", "column", None) == "rebuilt"
+    assert me._fidelity_tier("rebuilt", "column", "") == "rebuilt"
+    # rebuilt_with_deferrals: a rebuilt visual that recorded a deferral note (still renders).
+    assert me._fidelity_tier("rebuilt", "column", "implicit row count binds on model rebind") \
+        == "rebuilt_with_deferrals"
+    # rebuilt_with_deferrals: a WARNED worksheet that still rendered a real visual, warned only by a
+    # documented faithful-or-stub deferral (dropped measure filter / date grain / default palette).
+    for r in ("aggregate/measure filter on 'SUM(Sales)' is not mapped to a slicer",
+              "Day-Trunc grain not applied", "used Tableau's default continuous palette"):
+        assert me._fidelity_tier("warned", "matrix", r) == "rebuilt_with_deferrals"
+    # degraded: a warned worksheet with a real visual but a non-deferral (genuine) problem.
+    assert me._fidelity_tier("warned", "column", "manual attention required: something broke") == "degraded"
+
+
+def test_viz_fidelity_tiers_deferral_vs_degraded_vs_empty():
+    # A synthetic viz result exercising every tier through the real _viz_fidelity.
+    result = {
+        "ir": {"worksheets": [
+            {"name": "Clean", "visual_type": "column"},                       # -> rebuilt
+            {"name": "Noted", "visual_type": "column", "fidelity_note": "row count deferred"},  # -> rebuilt_with_deferrals
+            {"name": "Deferred", "visual_type": "matrix"},                     # warned by a deferral -> rebuilt_with_deferrals
+            {"name": "Broken", "visual_type": "line"},                        # warned, non-deferral -> degraded
+            {"name": "NoViz", "visual_type": None},                           # -> empty
+        ]},
+        "warnings": [
+            {"scope": "worksheet", "name": "Deferred",
+             "reason": "aggregate/measure filter on 'SUM(Sales)' is not mapped to a slicer"},
+            {"scope": "worksheet", "name": "Broken",
+             "reason": "manual attention required: axis binding lost"},
+        ],
+    }
+    tiers = {f["worksheet"]: f["tier"] for f in me._viz_fidelity(result)}
+    assert tiers == {"Clean": "rebuilt", "Noted": "rebuilt_with_deferrals",
+                     "Deferred": "rebuilt_with_deferrals", "Broken": "degraded", "NoViz": "empty"}
+    # status stays binary (additive guarantee): the deferral-warned worksheet is still "warned".
+    statuses = {f["worksheet"]: f["status"] for f in me._viz_fidelity(result)}
+    assert statuses["Deferred"] == "warned" and statuses["Clean"] == "rebuilt"
 
 
 def test_workbook_pbip_skipped_on_fallback_datasource(tmp_path):

@@ -881,13 +881,41 @@ def _rebind_report_byPath(parts, model_folder_name):
     return out
 
 
+_FIDELITY_DEFERRAL_MARKERS = (
+    "aggregate/measure filter on ",   # B7: dropped aggregate/measure filter (visual renders without it)
+    "grain not applied",              # date-grain approximation, fail-closed (visual still renders)
+    "default continuous palette",     # colour scale fell back to Tableau's default palette (approx)
+    "default palette",
+)
+
+
+def _fidelity_tier(status, visual_type, reason):
+    """Additive tier for a viz-fidelity row: ``rebuilt`` | ``rebuilt_with_deferrals`` | ``degraded`` | ``empty``.
+
+    A strictly additive refinement of ``status`` (never mutates it) so a visual that renders minus a
+    deferred, fail-closed feature (a dropped aggregate/measure filter, a date-grain approximation, a
+    default colour palette -- the documented faithful-or-stub deferrals) stops being conflated with an
+    outright failure. ``empty`` = no faithful visual emitted; ``degraded`` = a rendered visual whose
+    warning is a genuine degradation, not a known safe deferral; ``rebuilt`` = a clean rebuild.
+    """
+    reason = reason or ""
+    if visual_type in (None, "unsupported"):
+        return "empty"
+    if status == "rebuilt":
+        return "rebuilt_with_deferrals" if reason else "rebuilt"
+    if any(m in reason for m in _FIDELITY_DEFERRAL_MARKERS):
+        return "rebuilt_with_deferrals"
+    return "degraded"
+
+
 def _viz_fidelity(result):
-    """Per-worksheet rebuild fidelity from a viz result: ``[{worksheet, visual_type, status, reason}]``.
+    """Per-worksheet rebuild fidelity from a viz result: ``[{worksheet, visual_type, status, reason, tier}]``.
 
     ``status`` is ``"rebuilt"`` for a worksheet emitted cleanly and ``"warned"`` for one the viz
     stage flagged (or an unsupported visual type). Dashboard-scope or unmatched warnings are kept as
     their own ``warned`` rows so nothing is dropped. Reasons reuse the engine's
-    ``"manual attention required: "`` prefix.
+    ``"manual attention required: "`` prefix. ``tier`` is an ADDITIVE refinement of ``status`` (see
+    ``_fidelity_tier``) -- ``status`` itself is unchanged, so existing consumers are byte-identical.
     """
     ir = result.get("ir") if isinstance(result, dict) else None
     warnings = (result.get("warnings") if isinstance(result, dict) else None) or []
@@ -906,16 +934,21 @@ def _viz_fidelity(result):
         nm, vt = ws.get("name"), ws.get("visual_type")
         if nm in warned_ws:
             fidelity.append({"worksheet": nm, "visual_type": vt,
-                             "status": "warned", "reason": warned_ws[nm]})
+                             "status": "warned", "reason": warned_ws[nm],
+                             "tier": _fidelity_tier("warned", vt, warned_ws[nm])})
         elif vt in (None, "unsupported"):
+            _r = "manual attention required: unsupported visual type"
             fidelity.append({"worksheet": nm, "visual_type": vt, "status": "warned",
-                             "reason": "manual attention required: unsupported visual type"})
+                             "reason": _r, "tier": _fidelity_tier("warned", vt, _r)})
         else:
+            _note = ws.get("fidelity_note")
             fidelity.append({"worksheet": nm, "visual_type": vt,
-                             "status": "rebuilt", "reason": ws.get("fidelity_note")})
+                             "status": "rebuilt", "reason": _note,
+                             "tier": _fidelity_tier("rebuilt", vt, _note)})
     for w in extra:
         fidelity.append({"worksheet": w.get("name"), "visual_type": w.get("scope"),
-                         "status": "warned", "reason": w.get("reason")})
+                         "status": "warned", "reason": w.get("reason"),
+                         "tier": _fidelity_tier("warned", w.get("scope"), w.get("reason"))})
     return fidelity
 
 

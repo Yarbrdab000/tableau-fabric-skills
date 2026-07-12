@@ -13,6 +13,16 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.31.0` → `1.32.0`): Tiered viz-fidelity reporting — the per-worksheet
+  rebuild report now carries an additive `tier` field so a visual that renders but merely defers a
+  fail-closed feature is no longer conflated with an outright failure. Strictly additive: the existing
+  `status` (`rebuilt`/`warned`) is unchanged and every existing consumer/counter is byte-identical.**
+  Each `viz_fidelity` row gains `tier` ∈ `rebuilt` (clean), `rebuilt_with_deferrals` (a visual rendered
+  but a documented faithful-or-stub deferral was recorded — a dropped aggregate/measure filter, a
+  date-grain approximation, or a default colour palette), `degraded` (a rendered visual whose warning is
+  a genuine problem, not a known deferral), or `empty` (no faithful visual emitted). Pass/fail counting
+  is intentionally left unchanged; making the summary stop degrading on deferral-only visuals is a
+  separate, behaviour-changing follow-up.
 - **tableau-migration (skill `1.30.0` → `1.31.0`): Report visual-fidelity — a Tableau workbook's brand
   colour and dashboard header now carry through to the rebuilt Power BI report. Additive and
   never-regress: a workbook with no header banner and no brand signal emits a byte-identical report,
