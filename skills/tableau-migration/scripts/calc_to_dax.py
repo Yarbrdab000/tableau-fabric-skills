@@ -316,6 +316,55 @@ _ID_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _CMP_2 = {"<=": "<=", ">=": ">=", "<>": "<>", "==": "=", "!=": "<>"}
 _CMP_1 = {"<": "<", ">": ">", "=": "="}
 
+# Date-literal parsing. Tableau writes a literal date/datetime as ``#...#``. Only the two
+# *unambiguous* spellings Tableau documents are accepted here: ISO ``#YYYY-MM-DD#`` (optionally
+# with ``HH:MM[:SS]``) and the long English form ``#August 22, 2005#``. Locale-ambiguous forms
+# such as ``#01-02-2000#`` (MM-DD vs DD-MM depends on the workbook's locale) are deliberately
+# NOT parsed -- guessing an order could silently emit the wrong day, so they fail closed to a
+# stub instead. Faithfulness over coverage.
+_DATELIT_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8,
+    "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_DATELIT_ISO = re.compile(
+    r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$"
+)
+_DATELIT_LONG = re.compile(r"^([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})$")
+
+
+def _date_literal_to_dax(text):
+    """Convert the inside of a Tableau ``#...#`` date literal to faithful DAX, or None.
+
+    Returns ``DATE(y, m, d)`` for a pure date, ``(DATE(y, m, d) + TIME(h, mi, s))`` for a
+    datetime, or ``None`` when *text* is not one of the two unambiguous forms Tableau documents
+    (ISO or long English). The caller stubs on ``None`` rather than guessing an ambiguous
+    day/month order.
+    """
+    hh = mm = ss = None
+    m = _DATELIT_ISO.match(text)
+    if m:
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if m.group(4) is not None:
+            hh, mm, ss = int(m.group(4)), int(m.group(5)), int(m.group(6) or 0)
+    else:
+        m = _DATELIT_LONG.match(text)
+        if not m:
+            return None
+        month = _DATELIT_MONTHS.get(m.group(1).lower())
+        if month is None:
+            return None
+        day, year = int(m.group(2)), int(m.group(3))
+    if not (1 <= month <= 12 and 1 <= day <= 31 and 1 <= year <= 9999):
+        return None
+    date_dax = f"DATE({year}, {month}, {day})"
+    if hh is None:
+        return date_dax
+    if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
+        return None
+    return f"({date_dax} + TIME({hh}, {mm}, {ss}))"
+
 
 def _dax_string(value):
     # DAX string literal: double-quoted, embedded double quotes doubled.
@@ -363,6 +412,16 @@ def _tokenize(formula):
             toks.append(("str", inner))
             i = j + 1
             continue
+        if c == "#":
+            # Tableau date/datetime literal: #August 22, 2005#, #2020-01-01#, #2004-04-15 10:30:00#
+            # (functions_operators.htm "Date Literals"). Placed AFTER the string branch so a '#'
+            # inside a quoted string stays literal text.
+            j = s.find("#", i + 1)
+            if j == -1:
+                raise _CalcError("unterminated date literal")
+            toks.append(("datelit", s[i + 1:j].strip()))
+            i = j + 1
+            continue
         # Comments (Tableau): '//' to end of line, '/* ... */' block (may span newlines). They are
         # documentation only and never affect the result, so they are stripped (emit no tokens).
         # Placed AFTER the string-literal branch so a // or /* inside a quoted string is preserved,
@@ -388,7 +447,7 @@ def _tokenize(formula):
             toks.append(("cmp", _CMP_1[c]))
             i += 1
             continue
-        if c in "+-*/(),{}:":
+        if c in "+-*/(),{}:%^":
             toks.append(("op", c))
             i += 1
             continue
@@ -413,7 +472,8 @@ def _tokenize(formula):
 #   or     := and (OR and)*            ; and := not (AND not)*
 #   not    := NOT not | cmp
 #   cmp    := add (CMP add)?           ; add := mul (('+'|'-') mul)*
-#   mul    := unary (('*'|'/') unary)* ; unary := '-' unary | primary
+#   mul    := power (('*'|'/'|'%') power)*   ; power := unary ('^' power)?   ('%'->MOD, '^'->POWER)
+#   unary  := '-' unary | primary
 #   primary:= agg | number | string | IIF(...) | ZN(...) | IFNULL(...) | ISNULL(...) | '(' expr ')'
 #   agg    := AGGFUNC '(' ( '[' fieldref ']' | '{' FIXED-lod '}' | rowexpr ) ')'
 # A bare [field] is legal only inside an aggregate -- either directly, or within an
@@ -640,17 +700,35 @@ class _Parser:
         return left
 
     def _mul(self):
-        left = self._unary()
-        while self._peek() == ("op", "*") or self._peek() == ("op", "/"):
+        left = self._power()
+        while self._peek() in (("op", "*"), ("op", "/"), ("op", "%")):
             op = self._next()[1]
-            right = self._unary()
+            right = self._power()
             self._expect_number(left)
             self._expect_number(right)
             if op == "/":
                 left = (f"DIVIDE({left[0]}, {right[0]})", "number")
+            elif op == "%":
+                # Tableau '%' (integer remainder, sign of the divisor -- functions_operators.htm)
+                # is exactly DAX MOD(number, divisor). Integer-only in Tableau; MOD tolerates reals.
+                left = (f"MOD({left[0]}, {right[0]})", "number")
             else:
                 left = (f"{left[0]} * {right[0]}", "number")
         return left
+
+    def _power(self):
+        # Tableau '^' "is equivalent to the POWER function" (functions_operators.htm).
+        # Precedence (functions_operators.htm): 1=negate, 2=power, 3=*/%, so negate binds TIGHTER
+        # than power -- ``-3^2`` == ``(-3)^2`` because the leading '-' is consumed by the _unary
+        # base BEFORE '^' is seen. Right-associative (``2^3^2`` == ``2^(3^2)``).
+        base = self._unary()
+        if self._peek() == ("op", "^"):
+            self._next()
+            exp = self._power()
+            self._expect_number(base)
+            self._expect_number(exp)
+            return (f"POWER({base[0]}, {exp[0]})", "number")
+        return base
 
     def _unary(self):
         if self._peek() == ("op", "-"):
@@ -667,6 +745,15 @@ class _Parser:
         if k == "str":
             self._next()
             return (_dax_string(v), "text")
+        if k == "datelit":
+            self._next()
+            emitted = _date_literal_to_dax(v)
+            if emitted is None:
+                raise _CalcError(
+                    f"unrecognized date literal '#{v}#' (only ISO #YYYY-MM-DD# and long "
+                    "'#Month DD, YYYY#' forms are supported; ambiguous forms are not guessed)"
+                )
+            return (emitted, "date")
         if k == "op" and v == "(":
             self._next()
             inner = self._expr()

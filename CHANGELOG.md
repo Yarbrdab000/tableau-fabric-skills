@@ -13,6 +13,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.32.0` → `1.33.0`): Calc→DAX compiler breadth + row-level routing depth.**
+  Additive and faithful-or-stub — every calc that already translated is byte-identical; the new work only
+  turns former stubs into provably-correct DAX (or leaves them stubs). Highlights:
+  - **Arithmetic operators** — Tableau `%` (modulo) now compiles to DAX `MOD(a, b)` (integer-remainder,
+    divisor-signed — matching DAX exactly), and `^` (power) to `POWER(base, exp)` (right-associative, and
+    honouring Tableau's quirk that unary negation binds tighter than power, so `-x^2` = `(-x)^2`).
+  - **Date literals** — `#…#` date/datetime literals compile to `DATE(y, m, d)` (plus `+ TIME(h, mi, s)`
+    when a time is present). Only unambiguous forms are accepted — ISO `#YYYY-MM-DD[ HH:MM:SS]#` and long
+    `#Month DD, YYYY#`; locale-ambiguous dash/slash forms (e.g. `#01-02-2000#`) **fail closed** rather than
+    guess a day/month order. Works inside comparisons and date functions (`DATEDIFF`/`DATEADD`/…) in both
+    measure and calculated-column mode.
+  - **Row-level calc pre-router** — Tableau types a purely row-level numeric calculation (e.g.
+    `- [Profit]`, `[Sales] * 2`) as a *measure* by its output type, which then failed closed in measure
+    mode. The assembler now reclassifies such a calc onto the calculated-column path — faithful, because a
+    row-level column summed in the visual yields the same result and still respects filter context. The
+    reroute is conservative: it fires only when measure mode stubs with the specific "bare row-level field
+    not valid in a measure" reason **and** calculated-column mode renders the calc, and it defers to any
+    human-/second-compiler-approved measure landing (`approved_calc_dax`) and to field-parameter/flag-source
+    pins, so an approved measure is never silently demoted.
 - **tableau-migration (skill `1.31.0` → `1.32.0`): Tiered viz-fidelity reporting — the per-worksheet
   rebuild report now carries an additive `tier` field so a visual that renders but merely defers a
   fail-closed feature is no longer conflated with an outright failure. Strictly additive: the existing

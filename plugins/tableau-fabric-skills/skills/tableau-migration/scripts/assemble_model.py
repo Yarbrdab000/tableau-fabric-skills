@@ -2056,12 +2056,27 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
             if _k:
                 flag_source_names.add(_k)
 
+    # Pre-router (additive, fail-closed): Tableau assigns a calc's role by OUTPUT type, so a purely
+    # row-level numeric calc (e.g. INT([Dates] % 10000 / 100)) is labelled a *measure* and would be
+    # sent to measure mode below, where its bare row-level field reference correctly stubs. Its
+    # faithful form is a DAX calculated column, so reclassify those onto the column path -- but ONLY
+    # the ones the column translator can actually render (a stub is never merely relocated). This
+    # touches only the two calc lists; all_calcs/reserved/params above are computed from the unchanged
+    # union, so with nothing to move the output is byte-for-byte identical. A calc that already has a
+    # designated MEASURE landing -- a human-approved / second-compiler ``approved_calc_dax`` entry --
+    # is left on the measure path to receive it (that opt-in tier owns the measure-vs-column choice).
+    _measure_landed = {(k or "").strip().lower() for k in (approved_calc_dax or {})}
+    calcs, dim_calcs, _rerouted_row_level = _reroute_row_level_measure_calcs(
+        calcs, dim_calcs, resolve, known_tables=set(table_names),
+        param_resolver=param_resolver,
+        skip_names=(set(consumed) | flag_source_names | _measure_landed))
+
     # Row-level (dimension) calcs become DAX calculated columns via column mode, injected onto
     # their resolved home table (constants / honest stubs default to the first data table). This
     # is additive: with no dim_calcs the table parts are byte-for-byte unchanged. A date-attribute
     # calc over the ACTIVE date binds to the Date dimension instead (RELATED). A dimension-swap calc
     # already consumed as a field parameter is skipped here. Measures are handled separately below;
-    # a calc is only ever sent through one mode (no cross-mode retry).
+    # each calc is emitted through exactly one mode (the pre-router above has already decided which).
     calc_columns_by_table, calc_column_report = _calc_columns_part(
         dim_calcs, resolve, anchor_table=table_names[0],
         date_table=date_name, active_date_cols=active_date_cols,
@@ -2844,6 +2859,61 @@ def _split_calcs_by_role(calcs):
         else:
             measure_calcs.append(c)
     return measure_calcs, dim_calcs
+
+
+# The exact stub reason ``calc_to_dax`` raises when a row-level field is used bare in a measure
+# (see calc_to_dax.py, ``_primary``: "bare row-level field [..] not valid in a measure"). Kept in
+# sync by ``test_row_level_measure_role_calc_reroutes_to_column`` -- if the message drifts, that
+# end-to-end test fails rather than the router silently going inert.
+_ROW_LEVEL_IN_MEASURE_REASON = "bare row-level field [..] not valid in a measure"
+
+
+def _reroute_row_level_measure_calcs(measure_calcs, dim_calcs, resolve, *, known_tables,
+                                     param_resolver=None, skip_names=None):
+    """Move measure-path calcs that are actually ROW-LEVEL onto the calculated-column path.
+
+    Tableau assigns a calc's role by its OUTPUT type, so a purely row-level numeric calc -- e.g.
+    ``INT([Dates] % 10000 / 100)`` or ``[Sales] - [Cost]`` -- is labelled a *measure* and sent to
+    measure mode, where a bare row-level field reference correctly stubs. Its faithful Power BI form
+    is a DAX calculated COLUMN (row context, aggregated in the visual by default -- matching how
+    Tableau aggregates such a measure). This ground-truth, fail-closed router moves a calc ONLY when
+    the REAL measure translator stubs it with exactly ``_ROW_LEVEL_IN_MEASURE_REASON`` AND the REAL
+    column translator produces faithful DAX for it, so:
+
+      * a measure that translates is never touched (it does not hit the reason gate);
+      * a calc the column translator cannot render faithfully stays a measure stub, exactly as before;
+      * a rerouted calc was, by definition, a bare-row-level *stub* as a measure, so it never seeded
+        the ``measure_refs`` cascade -- any measure that referenced it already stubbed and still does
+        (no phantom, no regression).
+
+    The change is therefore strictly additive: each moved calc goes stub -> faithful calculated
+    column. Returns ``(new_measure_calcs, new_dim_calcs, rerouted_names)``; with nothing to move the
+    input lists are returned unchanged. ``skip_names`` (case-insensitive) pins a calc to the measure
+    path regardless -- used for names already consumed as field parameters, flag sources, or given a
+    designated measure landing by the ``approved_calc_dax`` (human-approved / second-compiler) tier.
+    """
+    skip_lower = {(s or "").strip().lower() for s in (skip_names or set())}
+    kt = set(known_tables or ())
+    keep, moved, moved_names = [], [], []
+    for c in measure_calcs or []:
+        name = c.get("name") or ""
+        formula = c.get("formula", "") or ""
+        if not formula or name.strip().lower() in skip_lower:
+            keep.append(c)
+            continue
+        mdax, mreason, _ = translate_tableau_calc_to_dax(
+            formula, resolve, param_resolver=param_resolver, known_tables=kt)
+        if mdax is None and mreason == _ROW_LEVEL_IN_MEASURE_REASON:
+            cdax, _creason, _ctables = translate_tableau_calc_to_column_dax(
+                formula, resolve, known_tables=kt)
+            if cdax is not None:
+                moved.append(c)
+                moved_names.append(name)
+                continue
+        keep.append(c)
+    if not moved:
+        return measure_calcs, dim_calcs, []
+    return keep, list(dim_calcs or []) + moved, moved_names
 
 
 def _extract_local_csv(source, model_name, write_to):

@@ -73,7 +73,8 @@ def test_assemble_live_sqlserver_full_definition():
 def test_assemble_measure_report_translates_and_stubs():
     calcs = [
         {"name": "Profit Ratio", "formula": "SUM([Sales])/SUM([Quantity])"},
-        {"name": "Profit Bucket", "formula": 'IF [Sales]>0 THEN "Y" ELSE "N" END'},
+        # REGEXP_MATCH has no faithful DAX (no native regex) -> irreducible stub in either mode.
+        {"name": "Profit Bucket", "formula": 'REGEXP_MATCH([Region], "^A")'},
     ]
     out = migrate_tds_to_semantic_model(LIVE_SQLSERVER, model_name="Superstore", calcs=calcs)
     report = {r["measure"]: r for r in out["report"]["measures"]}
@@ -90,6 +91,50 @@ def test_assemble_measure_report_translates_and_stubs():
     assert "TranslatedBy" in measures              # only the translated one
 
 
+def test_row_level_measure_role_calc_reroutes_to_column():
+    # Tableau labels a purely row-level numeric calc a *measure* (by output type), so it lands on the
+    # measure path where its bare field references correctly stub. The faithful Power BI form is a DAX
+    # calculated COLUMN (summed in the visual by default, matching Tableau). The additive pre-router
+    # reclassifies such a calc onto the column path -- but ONLY when the column translator renders it,
+    # so a stub is never merely relocated. A genuine aggregate measure is untouched.
+    calcs = [
+        {"name": "Profit Ratio", "formula": "SUM([Sales])/SUM([Quantity])"},  # real measure -> stays
+        {"name": "Margin", "formula": "[Sales] * 2"},                         # row-level -> reroutes
+    ]
+    out = migrate_tds_to_semantic_model(LIVE_SQLSERVER, model_name="Superstore", calcs=calcs)
+    measures = {r["measure"]: r for r in out["report"]["measures"]}
+    columns = {r["column"]: r for r in out["report"]["calc_columns"]}
+
+    # the real aggregate stays a measure; the row-level calc left the measure path entirely
+    assert measures["Profit Ratio"]["status"] == "translated"
+    assert "Margin" not in measures
+
+    # ... and lands as a faithful, translated calculated column on the fact table
+    assert columns["Margin"]["status"] == "translated"
+    assert columns["Margin"]["table"] == "Orders"
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "column Margin =" in orders
+    assert "'Orders'[Sales] * 2" in orders
+    # the original Tableau formula is preserved as an annotation (provenance intact)
+    assert "[Sales] * 2" in orders
+
+
+def test_row_level_measure_role_calc_with_approved_dax_stays_a_measure():
+    # The pre-router must DEFER to a designated measure landing: a calc given human-approved /
+    # second-compiler DAX via approved_calc_dax stays on the measure path to receive it (that opt-in
+    # tier owns the measure-vs-column choice), even though column mode could also render it.
+    calcs = [{"name": "Margin", "formula": "[Sales] * 2"}]
+    approved = {"Margin": "SUMX('Orders', 'Orders'[Sales] * 2)"}
+    out = migrate_tds_to_semantic_model(
+        LIVE_SQLSERVER, model_name="Superstore", calcs=calcs, approved_calc_dax=approved)
+    measures = {r["measure"]: r for r in out["report"]["measures"]}
+    columns = {r["column"] for r in out["report"]["calc_columns"]}
+
+    assert measures["Margin"]["status"] == "assisted-approved"
+    assert measures["Margin"]["dax"] == "SUMX('Orders', 'Orders'[Sales] * 2)"
+    assert "Margin" not in columns  # NOT rerouted
+
+
 def test_measure_report_carries_source_identity_for_viz_binding():
     # Cross-layer contract (additive): every measure row carries a deterministic `source` so the
     # viz/report layer can join a worksheet calc token -> this emitted measure. The Tableau internal
@@ -97,7 +142,7 @@ def test_measure_report_carries_source_identity_for_viz_binding():
     calcs = [
         {"name": "Count Orders", "formula": "ZN(SUM([Quantity]))",
          "internal_name": "Calculation_0014172369248279"},
-        {"name": "Profit Bucket", "formula": 'IF [Sales]>0 THEN "Y" ELSE "N" END'},  # no internal_name
+        {"name": "Profit Bucket", "formula": 'REGEXP_MATCH([Region], "^A")'},  # no internal_name; irreducible stub
     ]
     out = migrate_tds_to_semantic_model(LIVE_SQLSERVER, model_name="Superstore", calcs=calcs)
     report = {r["measure"]: r for r in out["report"]["measures"]}
@@ -147,7 +192,7 @@ def test_calc_bindings_index_keyed_by_token_and_caption():
     calcs = [
         {"name": "Count Orders", "formula": "ZN(SUM([Quantity]))",
          "internal_name": "Calculation_0014172369248279"},
-        {"name": "Profit Bucket", "formula": 'IF [Sales]>0 THEN "Y" ELSE "N" END'},  # stub, no token
+        {"name": "Profit Bucket", "formula": 'REGEXP_MATCH([Region], "^A")'},  # stub, no token
     ]
     out = migrate_tds_to_semantic_model(LIVE_SQLSERVER, model_name="Superstore", calcs=calcs)
     bindings = out["report"]["calc_bindings"]
@@ -1551,11 +1596,11 @@ def test_relationship_confidence_is_additive_not_destructive():
 
 # -- Calc-coverage artifact (additive report output) --------------------------
 def test_calc_coverage_counts_translated_and_stubbed():
-    # Two single-field aggregates translate; the IF/THEN string calc stays an inert stub.
+    # Two single-field aggregates translate; the REGEXP calc (no DAX regex) stays an inert stub.
     calcs = [
         {"name": "Profit Ratio", "formula": "SUM([Sales])/SUM([Quantity])"},
         {"name": "Avg Sale", "formula": "AVG([Sales])"},
-        {"name": "Profit Bucket", "formula": 'IF [Sales]>0 THEN "Y" ELSE "N" END'},
+        {"name": "Profit Bucket", "formula": 'REGEXP_MATCH([Region], "^A")'},
     ]
     out = migrate_tds_to_semantic_model(LIVE_SQLSERVER, model_name="Superstore", calcs=calcs)
     cov = out["report"]["calc_coverage"]
@@ -1571,7 +1616,7 @@ def test_calc_coverage_counts_translated_and_stubbed():
     assert by["Profit Ratio"]["live"] is True and by["Profit Ratio"]["bucket"] == "translated"
     assert by["Profit Bucket"]["live"] is False and by["Profit Bucket"]["bucket"] == "stub"
     # every formula is carried for an auditable report
-    assert by["Profit Bucket"]["tableau_formula"] == 'IF [Sales]>0 THEN "Y" ELSE "N" END'
+    assert by["Profit Bucket"]["tableau_formula"] == 'REGEXP_MATCH([Region], "^A")'
 
 
 def test_calc_coverage_is_additive_and_undefined_without_calcs():
