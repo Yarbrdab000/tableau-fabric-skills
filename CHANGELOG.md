@@ -13,7 +13,30 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration (skill `1.32.0` → `1.33.0`): Calc→DAX compiler breadth + row-level routing depth.**
+- **tableau-migration (skill `1.33.0` → `1.34.0`): Calc→DAX compiler depth — FIXED LODs in calculated
+  columns, the nested-argmax cascade, and Tableau's stock `[Number of Records]` field.** Additive and
+  faithful-or-stub — every calc that already translated is byte-identical; the new work only turns former
+  stubs into provably-correct DAX (or leaves them stubs). Highlights:
+  - **FIXED LODs now translate in calculated-column (row-level) mode** — a bare `{FIXED d,…: AGG(…)}` or
+    table-scoped `{AGG(…)}` level-of-detail expression previously failed closed in a row-level column calc.
+    Because an LOD value is row-invariant within its declared grain, it emits the *same*
+    `CALCULATE(inner, ALLEXCEPT/ALL('Table'))` scalar as measure mode; and since a calculated column carries
+    no visual filter context, the column form is the more faithful home (it avoids even the measure-mode
+    divergence-under-a-dimension-filter caveat). A *top-level re-aggregation* of an LOD (e.g. `SUM({FIXED …})`)
+    is a viz-grain aggregate and still falls back. This is the symmetric inverse of the 1.33.0 row-level
+    pre-router, and it makes measure-labelled-but-genuinely-row-level **nested-FIXED-LOD argmax/argmin**
+    calcs (`IF {FIXED d : MAX({FIXED d,e : agg})} = {FIXED d,e : agg} THEN [dim] END`) resolve
+    **deterministically** as columns rather than being handed to the assisted idiom registry.
+  - **Date arithmetic in calculated columns** — `[date] - [date]` yields the day difference, and
+    `[date] ± N` / `N + [date]` shift a date by N days (DAX stores dates as day serials, so these are exact).
+    Disallowed combinations (`number - date`, `date + date`, text arithmetic) fail closed, matching Tableau.
+  - **`[Number of Records]` synthetic field** — Tableau adds a stock 1-per-row field named
+    "Number of Records" to every datasource (renamed to a per-table "Count of `<Table>`" auto-field in
+    2020.2+). `SUM`/`COUNT` of it now compiles to `COUNTROWS('<Table>')` and a bare row-level reference to
+    the constant `1`. Matched narrowly to the reserved legacy caption and gated fail-safe: it emits only when
+    the caption does **not** resolve to a real model column (a genuine same-named column always wins) and the
+    counted table is unambiguous (the single table already in play, else the model's sole table, else it
+    fails closed). The modern per-table count continues to arrive via the existing object-id `COUNT` path.
   Additive and faithful-or-stub — every calc that already translated is byte-identical; the new work only
   turns former stubs into provably-correct DAX (or leaves them stubs). Highlights:
   - **Arithmetic operators** — Tableau `%` (modulo) now compiles to DAX `MOD(a, b)` (integer-remainder,

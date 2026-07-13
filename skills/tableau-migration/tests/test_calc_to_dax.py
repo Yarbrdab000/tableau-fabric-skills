@@ -590,6 +590,37 @@ COLUMN_TRANSLATIONS = [
      "DATEDIFF(DATE(2020, 1, 1), 'Orders'[Order_Date], DAY)"),
     ("IF [Order Date] >= #2020-01-01# THEN 1 ELSE 0 END",
      "IF('Orders'[Order_Date] >= DATE(2020, 1, 1), 1, 0)"),
+    # --- FIXED LODs are faithful inside a row-level calculated column (v1.34.0) ---
+    # A FIXED LOD is a datasource-level value (constant within its declared grain), so
+    # CALCULATE(inner, ALLEXCEPT/ALL) re-aggregates at the LOD grain under the current row's
+    # context transition -- exactly Tableau FIXED -- and the emitted scalar is identical to
+    # measure mode. This lifts the old "LOD not valid in a row-level column" stub for the bare
+    # forms; a top-level re-aggregated LOD (SUM({FIXED ...})) still falls back (see COLUMN_FALLBACKS).
+    ("{FIXED [Region] : SUM([Sales])}",
+     "CALCULATE(SUM('Orders'[Sales]), ALLEXCEPT('Orders', 'Orders'[Region]))"),
+    ("{FIXED [Region], [Order Date] : SUM([Sales])}",
+     "CALCULATE(SUM('Orders'[Sales]), ALLEXCEPT('Orders', 'Orders'[Region], 'Orders'[Order_Date]))"),
+    ("{FIXED : SUM([Sales])}", "CALCULATE(SUM('Orders'[Sales]), ALL('Orders'))"),   # fixed-to-nothing
+    ("{MAX([Order Date])}", "CALCULATE(MAX('Orders'[Order_Date]), ALL('Orders'))"),  # bare table-scoped LOD
+    # a row-level term composed with a FIXED LOD (the "value vs its group total" idiom)
+    ("[Sales] - {FIXED [Region] : SUM([Sales])}",
+     "'Orders'[Sales] - CALCULATE(SUM('Orders'[Sales]), ALLEXCEPT('Orders', 'Orders'[Region]))"),
+    # corpus witness: is this row's date the MAX within its group? (filter-to-most-recent-date LOD)
+    ("{ FIXED [Region] : MAX([Order Date]) } = [Order Date]",
+     "CALCULATE(MAX('Orders'[Order_Date]), ALLEXCEPT('Orders', 'Orders'[Region])) = 'Orders'[Order_Date]"),
+    # corpus witness (NESTED FIXED-in-AVG-in-FIXED boolean): customers-above-average. The whole
+    # LOD subtree parses in measure context, so the existing re-aggregation recursion handles it.
+    ("{FIXED [Region] : SUM([Sales])} > { FIXED : AVG({FIXED [Region] : SUM([Sales])}) }",
+     "CALCULATE(SUM('Orders'[Sales]), ALLEXCEPT('Orders', 'Orders'[Region])) > "
+     "CALCULATE(AVERAGEX(SUMMARIZE('Orders', 'Orders'[Region]), CALCULATE(SUM('Orders'[Sales]))), ALL('Orders'))"),
+    # --- date arithmetic (v1.34.0): DAX stores dates as day-serial floats, so these are exact ---
+    ("[Order Date] + 7", "'Orders'[Order_Date] + 7"),          # date + N days -> date
+    ("[Order Date] - 7", "'Orders'[Order_Date] - 7"),          # date - N days -> date
+    ("7 + [Order Date]", "7 + 'Orders'[Order_Date]"),          # '+' commutes
+    ("TODAY() - [Order Date]", "TODAY() - 'Orders'[Order_Date]"),  # date - date -> number of days
+    # corpus witness (previous-workday): shift every date by (today - grand-max date)
+    ("[Order Date] + (TODAY() - {MAX([Order Date])})",
+     "'Orders'[Order_Date] + (TODAY() - CALCULATE(MAX('Orders'[Order_Date]), ALL('Orders')))"),
 ]
 
 COLUMN_FALLBACKS = [
@@ -601,7 +632,10 @@ COLUMN_FALLBACKS = [
     "CORR([Sales], [Profit])",                    # two-arg statistical aggregate -> measure-only
     "COVAR([Sales], [Profit])",                   # measure-only
     "COVARP([Sales], [Profit])",                  # measure-only
-    "{FIXED [Region] : SUM([Sales])}",            # LOD
+    # A bare {FIXED ...} value now translates in a column (see COLUMN_TRANSLATIONS), but a
+    # TOP-LEVEL re-aggregation of one is a viz-grain aggregate -> still measure-only here.
+    "SUM({FIXED [Region] : SUM([Sales])})",       # re-aggregated LOD at column top level
+    "COUNTD({FIXED [Region] : SUM([Sales])})",    # COUNTD cannot re-aggregate an LOD (and is an agg)
     # functions whose DAX equivalent is not faithful -> deferred to fallback
     "TRIM([Region])",                             # DAX TRIM also collapses internal spaces
     "LTRIM([Region])",
@@ -637,6 +671,11 @@ COLUMN_FALLBACKS = [
     "[federated.a1b2c3].[Latitude Start]",        # blend (federated) qualified field
     # cross-table row-level column (cannot span tables)
     "[Sales] + [People Count]",
+    # invalid date arithmetic (Tableau rejects these too) -> fail closed
+    "[Order Date] + [Order Date]",                # date + date is meaningless
+    "5 - [Order Date]",                           # number - date is not a date shift
+    # a FIXED LOD whose dimensions span tables is still unsupported in a column
+    "{FIXED [Region], [People Count] : SUM([Sales])}",
 ]
 
 
@@ -1374,6 +1413,117 @@ def test_column_refs_base_resolver_wins_over_refs():
         "UPPER([Region])", _resolver, column_refs=refs)
     assert dax == "UPPER('Orders'[Region])"
     assert tabs == {"Orders"}
+
+
+# --- [Number of Records]: Tableau's stock synthetic 1-per-row field ----------
+# SUM/COUNT of it is a row count -> COUNTROWS('<table>'); bare row-level -> the constant 1.
+# The counted table comes from the LOD dimension / single known table (fail closed on ambiguity),
+# and a genuine model column literally named "Number of Records" always resolves normally and wins.
+_NOR_FIELDS = {
+    "Customer Name": ("Orders", "Customer_Name", "string"),
+    "Sales": ("Orders", "Sales", "decimal"),
+}
+
+
+def _nor_resolver(caption):
+    return _NOR_FIELDS.get(caption)
+
+
+def test_number_of_records_sum_measure_is_countrows_of_the_single_known_table():
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        "SUM([Number of Records])", _nor_resolver, known_tables={"Orders"})
+    assert dax == "COUNTROWS('Orders')"
+    assert reason == "ok"
+    assert tables == {"Orders"}
+
+
+def test_number_of_records_count_measure_is_also_countrows():
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        "COUNT([Number of Records])", _nor_resolver, known_tables={"Orders"})
+    assert dax == "COUNTROWS('Orders')"
+    assert tables == {"Orders"}
+
+
+def test_number_of_records_caption_match_is_case_insensitive():
+    dax, _reason, _tables = translate_tableau_calc_to_dax(
+        "SUM([NUMBER OF RECORDS])", _nor_resolver, known_tables={"Orders"})
+    assert dax == "COUNTROWS('Orders')"
+
+
+def test_number_of_records_inside_fixed_lod_uses_the_lod_dimension_table():
+    # The LOD dimension resolves the table before the inner SUM runs, so no known_tables is needed.
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        "{FIXED [Customer Name] : SUM([Number of Records])}", _nor_resolver)
+    assert dax == "CALCULATE(COUNTROWS('Orders'), ALLEXCEPT('Orders', 'Orders'[Customer_Name]))"
+    assert reason == "ok"
+    assert tables == {"Orders"}
+
+
+def test_above_avg_lod_witness_translates_deterministically_in_measure_mode():
+    # The real corpus witness `Above Avg LOD` -- previously stubbed on the unresolved [Number of
+    # Records] field -- now compiles end to end (FIXED-LOD reagg over COUNTROWS).
+    witness = ("{FIXED [Customer Name] : SUM([Number of Records])} > "
+               "{ FIXED : AVG({FIXED [Customer Name] : SUM([Number of Records])}) }")
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        witness, _nor_resolver, known_tables={"Orders"})
+    assert dax == (
+        "CALCULATE(COUNTROWS('Orders'), ALLEXCEPT('Orders', 'Orders'[Customer_Name])) > "
+        "CALCULATE(AVERAGEX(SUMMARIZE('Orders', 'Orders'[Customer_Name]), "
+        "CALCULATE(COUNTROWS('Orders'))), ALL('Orders'))")
+    assert reason == "ok"
+    assert tables == {"Orders"}
+
+
+def test_above_avg_lod_witness_translates_in_column_mode_too():
+    # Tableau types the boolean comparison a dimension -> it can reach the column path; it must
+    # translate identically there (the column path reuses the same LOD reaggregation).
+    witness = ("{FIXED [Customer Name] : SUM([Number of Records])} > "
+               "{ FIXED : AVG({FIXED [Customer Name] : SUM([Number of Records])}) }")
+    dax, reason, _tables = translate_tableau_calc_to_column_dax(
+        witness, _nor_resolver, known_tables={"Orders"})
+    assert dax == (
+        "CALCULATE(COUNTROWS('Orders'), ALLEXCEPT('Orders', 'Orders'[Customer_Name])) > "
+        "CALCULATE(AVERAGEX(SUMMARIZE('Orders', 'Orders'[Customer_Name]), "
+        "CALCULATE(COUNTROWS('Orders'))), ALL('Orders'))")
+    assert reason == "ok"
+
+
+def test_a_real_model_column_named_number_of_records_resolves_normally_and_wins():
+    # Fail-safe: the synthetic mapping is reached ONLY when the caption is unresolved. A genuine
+    # model column literally named "Number of Records" resolves via SUM as itself, not COUNTROWS.
+    resolver = {"Number of Records": ("Orders", "Number_of_Records", "int64")}.get
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        "SUM([Number of Records])", resolver, known_tables={"Orders"})
+    assert dax == "SUM('Orders'[Number_of_Records])"
+    assert reason == "ok"
+    assert tables == {"Orders"}
+
+
+def test_number_of_records_fails_closed_when_the_counted_table_is_ambiguous():
+    # More than one candidate table and no single-table context -> no faithful COUNTROWS target.
+    dax, _reason, _tables = translate_tableau_calc_to_dax(
+        "SUM([Number of Records])", _nor_resolver, known_tables={"Orders", "People"})
+    assert dax is None
+
+
+def test_number_of_records_fails_closed_with_no_table_context():
+    dax, _reason, _tables = translate_tableau_calc_to_dax(
+        "SUM([Number of Records])", _nor_resolver)
+    assert dax is None
+
+
+def test_number_of_records_row_level_is_the_constant_one():
+    dax, reason, _tables = translate_tableau_calc_to_column_dax(
+        "[Number of Records] * 2", _nor_resolver)
+    assert dax == "1 * 2"
+    assert reason == "ok"
+
+
+def test_number_of_records_only_sum_and_count_map_to_countrows():
+    # AVG/MIN/etc. of a stock 1-per-row field has no faithful row-count meaning -> fail closed.
+    dax, _reason, _tables = translate_tableau_calc_to_dax(
+        "AVG([Number of Records])", _nor_resolver, known_tables={"Orders"})
+    assert dax is None
 
 
 
