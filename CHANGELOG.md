@@ -13,6 +13,20 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.41.0` → `1.42.0`): Hidden-column prune — physically drops the hidden schema
+  columns a workbook never needs while carving out (keeping, flagged) every load-bearing one, and reports how
+  many were pruned. Additive and strictly coverage-preserving.** A live embed emitted roughly 11x too many
+  physical columns (~2,567 across 42 tables) because most raw `<metadata-record class='column'>` entries are
+  hidden schema columns Tableau itself never surfaces as fields. The prune drops those hidden physical columns
+  but **carves out** the load-bearing ones — any hidden column a calculated field references, and hidden join
+  keys — so no relationship or calc translation is lost. Proven coverage-neutral on a live Salesforce workbook:
+  calc coverage was **byte-identical before and after** (53/154 translated, 101 needing review) while physical
+  columns collapsed **2,567 → ~233** (42 tables both). It keys on the hidden flag plus calc references, not on
+  any connector specifics, so it scales connector-agnostically. **Telemetry (additive):** each workbook /
+  datasource detail now carries `column_prune { columns_emitted, columns_pruned_hidden }`, and those fold into a
+  new estate rollup `summary.columns_pruned_hidden_total` — no existing report key was renamed or removed. Emit
+  path types the kept-hidden columns from the source schema exactly as before; the original Tableau formula is
+  still preserved on every measure.
 - **tableau-migration (skill `1.40.0` → `1.41.0`): Deterministic parameter-driven date-window translation
   and a cascade-aware row-level reroute — additive and strictly faithfulness-preserving.** Hardens several
   cross-calc paths so more real-workbook calculations translate deterministically, without ever emitting a

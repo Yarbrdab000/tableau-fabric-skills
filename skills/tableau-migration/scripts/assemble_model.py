@@ -2485,6 +2485,14 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     }
     if filter_bindings:
         report["filter_bindings"] = filter_bindings
+    # Additive hidden-column prune summary (present ONLY when the source hid columns; a Superstore-
+    # style datasource that hides nothing yields hidden_prune=None -> the key is omitted and the
+    # report is byte-identical). columns_emitted = distinct physical columns kept (visible + the
+    # carved-out hidden join-key / calc-referenced columns); columns_pruned_hidden = hidden schema
+    # columns dropped.
+    hidden_prune = descriptor.get("hidden_prune")
+    if hidden_prune:
+        report["column_prune"] = hidden_prune
     # Spec 6: surface the base-table -> consolidated-name map the consolidation computed (present
     # only on a combine_descriptors union) so an authoring / second-compiler pass can resolve a
     # field to its exact consolidated table without reverse-engineering the naming rule.

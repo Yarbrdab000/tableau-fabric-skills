@@ -607,6 +607,31 @@ def test_summarize_datasource_only_run_leaves_workbook_calc_keys_inert():
     assert s["needs_review_total"] == 0
 
 
+def test_summarize_folds_workbook_path_column_prune_into_estate_total():
+    # Telemetry-gap fix: a consolidated workbook prunes hidden columns inside its OWN model build, so the
+    # prune count lives on the workbook detail's ``column_prune`` -- NOT in ds_details. A pure-workbook run
+    # (no standalone datasources) must therefore fold wb_details prunes into ``columns_pruned_hidden_total``
+    # instead of reporting 0 while the physical collapse fired.
+    wb_details = [
+        {"column_prune": {"columns_emitted": 233, "columns_pruned_hidden": 2334}},
+        {"column_prune": {"columns_emitted": 40, "columns_pruned_hidden": 10}},
+        {"column_prune": None},                       # a workbook that pruned nothing contributes 0
+        {},                                           # a workbook detail without the key at all
+    ]
+    s = me._summarize(ds_details=[], wb_details=wb_details, viz_available=True)
+    assert s["columns_pruned_hidden_total"] == 2344
+
+
+def test_summarize_column_prune_total_combines_datasource_and_workbook_paths():
+    # Additive: the datasource-path prune (ds_details) and the workbook-path prune (wb_details) both feed
+    # the SAME total, so a mixed estate sums both without double counting or dropping either.
+    ds_details = [{"status": "migrated",
+                   "column_prune": {"columns_emitted": 12, "columns_pruned_hidden": 5}}]
+    wb_details = [{"column_prune": {"columns_emitted": 6, "columns_pruned_hidden": 4}}]
+    s = me._summarize(ds_details=ds_details, wb_details=wb_details, viz_available=True)
+    assert s["columns_pruned_hidden_total"] == 9
+
+
 def test_malformed_asset_is_isolated_as_error(tmp_path):
     src = InMemoryTableauSource(
         datasources={"Good DS": LIVE_TDS, "Bad DS": MALFORMED_TDS},
