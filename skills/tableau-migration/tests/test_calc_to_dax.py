@@ -551,6 +551,21 @@ COLUMN_TRANSLATIONS = [
      "(EDATE('Orders'[Order_Date], (1) * 12) + MOD('Orders'[Order_Date], 1))"),
     ('DATEDIFF("day", [Order Date], TODAY())', "DATEDIFF('Orders'[Order_Date], TODAY(), DAY)"),
     ('DATETRUNC("month", [Order Date])', "DATE(YEAR('Orders'[Order_Date]), MONTH('Orders'[Order_Date]), 1)"),
+    # sub-day truncation: midnight of the calendar date + the time-of-day up to the requested unit
+    ('DATETRUNC("hour", [Order Date])',
+     "(DATE(YEAR('Orders'[Order_Date]), MONTH('Orders'[Order_Date]), DAY('Orders'[Order_Date])) "
+     "+ TIME(HOUR('Orders'[Order_Date]), 0, 0))"),
+    ('DATETRUNC("minute", [Order Date])',
+     "(DATE(YEAR('Orders'[Order_Date]), MONTH('Orders'[Order_Date]), DAY('Orders'[Order_Date])) "
+     "+ TIME(HOUR('Orders'[Order_Date]), MINUTE('Orders'[Order_Date]), 0))"),
+    ('DATETRUNC("second", [Order Date])',
+     "(DATE(YEAR('Orders'[Order_Date]), MONTH('Orders'[Order_Date]), DAY('Orders'[Order_Date])) "
+     "+ TIME(HOUR('Orders'[Order_Date]), MINUTE('Orders'[Order_Date]), SECOND('Orders'[Order_Date])))"),
+    # sub-day DATETRUNC composes inside DATEADD (the 3-deep "nearest 15 min" corpus idiom): the
+    # parenthesized truncation is a safe date operand for the interval add.
+    ("DATEADD('minute', 15, DATETRUNC('hour', [Order Date]))",
+     "((DATE(YEAR('Orders'[Order_Date]), MONTH('Orders'[Order_Date]), DAY('Orders'[Order_Date])) "
+     "+ TIME(HOUR('Orders'[Order_Date]), 0, 0)) + (15) / 1440)"),
     ("DATE([Order Date])",
      "DATE(YEAR('Orders'[Order_Date]), MONTH('Orders'[Order_Date]), DAY('Orders'[Order_Date]))"),  # strips time
     ("MAKEDATE(2024, 1, 15)", "DATE(2024, 1, 15)"),                       # exact, culture-independent
@@ -715,6 +730,9 @@ def test_scalar_functions_over_non_row_operands_translate_in_measure_context():
     assert _tx("YEAR(MAX([Order Date]))") == "YEAR(MAX('Orders'[Order_Date]))"
     assert _tx("DATETRUNC('month', MAX([Order Date]))") == \
         "DATE(YEAR(MAX('Orders'[Order_Date])), MONTH(MAX('Orders'[Order_Date])), 1)"
+    assert _tx("DATETRUNC('hour', MAX([Order Date]))") == \
+        ("(DATE(YEAR(MAX('Orders'[Order_Date])), MONTH(MAX('Orders'[Order_Date])), "
+         "DAY(MAX('Orders'[Order_Date]))) + TIME(HOUR(MAX('Orders'[Order_Date])), 0, 0))")
     assert _tx("DATEADD('month', 1, MAX([Order Date]))") == \
         "(EDATE(MAX('Orders'[Order_Date]), 1) + MOD(MAX('Orders'[Order_Date]), 1))"
     # A table-scoped LOD is measure-valid too, so DATEDIFF over one translates end-to-end.

@@ -1539,8 +1539,19 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
                 _calc.get("formula", ""), resolve, known_tables=known_tables,
                 column_refs=column_refs)
             if _cdax and len(_ctabs) == 1 and _cdt:
-                column_refs[_cname.strip().lower()] = (
-                    next(iter(_ctabs)), _cname, _DTYPE_TO_TMDL.get(_cdt, "string"))
+                _entry = (next(iter(_ctabs)), _cname, _DTYPE_TO_TMDL.get(_cdt, "string"))
+                column_refs[_cname.strip().lower()] = _entry
+                # Also key by the Tableau internal id token (e.g. ``Calculation_1551010115902434``)
+                # so a sibling that references this calc by its raw ``[Calculation_*]`` token -- the
+                # common form for auto-named calcs in real workbooks -- resolves too. This mirrors the
+                # measures' ``measure_refs`` cascade, which already keys by caption AND internal_name
+                # (see ``_measures_part``). The stored ``column_name`` stays the CAPTION, so the emitted
+                # ``'Table'[Caption]`` reference targets the real calculated column regardless of which
+                # key resolved it. Fail-closed is unchanged: only a faithful single-home typed calc is
+                # recorded, so a token pointing at an untranslatable sibling still stubs.
+                _tid = _calc.get("internal_name")
+                if _tid:
+                    column_refs[str(_tid).strip().lower()] = _entry
                 _changed = True
             else:
                 _still.append(_calc)

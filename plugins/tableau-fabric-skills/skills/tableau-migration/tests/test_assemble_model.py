@@ -804,6 +804,63 @@ def test_cross_table_sibling_reference_stays_stub():
     assert rows["X"]["dax"] is None
 
 
+def test_token_keyed_sibling_reference_resolves():
+    # Real Tableau auto-named calcs are referenced in sibling formulas by their internal
+    # ``[Calculation_*]`` token, NOT their caption. The producer now registers its ``column_refs`` entry
+    # under both the caption AND the internal_name token, so a consumer that references it by token
+    # resolves to the real ``'Table'[Caption]`` column (the stored column_name is the CAPTION, so the
+    # emitted reference is correct regardless of which key matched).
+    base = {"Order ID": ("Orders", "Order_ID", "string")}
+    resolve = lambda c: base.get(c)
+    dim = [
+        # consumer references the producer by its internal token, declared BEFORE the producer to
+        # prove the fix-point is order-independent.
+        {"name": "Order Label", "formula": '[Calculation_9911] + " (x)"'},
+        {"name": "Order Code", "internal_name": "Calculation_9911", "formula": "UPPER([Order ID])"},
+    ]
+    by_table, report = _calc_columns_part(dim, resolve, "Orders", known_tables={"Orders"})
+    rows = {r["column"]: r for r in report}
+    assert rows["Order Code"]["status"] == "translated"
+    assert rows["Order Label"]["status"] == "translated"
+    # the token reference binds to the real calculated column by its CAPTION, never the raw token.
+    orders_tmdl = by_table["Orders"]
+    assert "'Orders'[Order Code]" in orders_tmdl
+    # the token is never emitted as a DAX column reference (it survives only in the preserved
+    # ``TableauFormula`` annotation of the original formula, which is expected).
+    assert "'Orders'[Calculation_9911]" not in orders_tmdl
+
+
+def test_token_keyed_reference_to_untranslatable_sibling_stays_stub():
+    # Fail-closed is preserved: a token that points at a sibling which cannot be faithfully translated
+    # (here an aggregation, invalid in a row-level column) is NOT recorded as a reference target, so the
+    # consumer stubs instead of emitting an unfaithful reference.
+    base = {"Sales": ("Orders", "Sales", "number")}
+    resolve = lambda c: base.get(c)
+    dim = [
+        {"name": "Avg Col", "internal_name": "Calculation_7", "formula": "AVG([Sales])"},
+        {"name": "Uses Avg", "formula": "[Calculation_7] + 1"},
+    ]
+    _, report = _calc_columns_part(dim, resolve, "Orders", known_tables={"Orders"})
+    rows = {r["column"]: r for r in report}
+    assert rows["Avg Col"]["status"] == "stub"      # aggregation is an honest column-mode stub
+    assert rows["Uses Avg"]["status"] == "stub"     # its token consumer stays a stub too
+    assert rows["Uses Avg"]["dax"] is None
+
+
+def test_sibling_calc_chain_resolves_by_internal_token_end_to_end():
+    # End-to-end through the full assemble path (not just _calc_columns_part) to prove ``internal_name``
+    # is threaded intact so a token-referencing chain resolves in a real model build.
+    out = _sibling_chain_model([
+        {"name": "Order Label", "formula": '[Calculation_9911] + " (x)"'},
+        {"name": "Order Code", "internal_name": "Calculation_9911", "formula": "UPPER([Order ID])"},
+    ])
+    rows = {r["column"]: r for r in out["report"]["calc_columns"]}
+    assert rows["Order Code"]["status"] == "translated"
+    assert rows["Order Label"]["status"] == "translated"
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "'Orders'[Order Code]" in orders   # the token consumer bound to the caption column
+
+
 
 #    real assemble_model resolver. LIVE_SQLSERVER lacks State + City, so the detector (which resolves
 #    its fields against the model) could not fire there; this minimal model carries them. This is the
