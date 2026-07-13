@@ -482,6 +482,77 @@ def test_qualified_reference_reason_is_clean_not_a_dot_error():
         assert bad not in param_reason and bad not in ds_reason
 
 
+# ---------------------------------------------------------------------------
+# Aggregate-wrapped scalar parameter collapse: MIN/MAX/AVG/MEDIAN/SUM([Parameters].[P])
+# ---------------------------------------------------------------------------
+# A Tableau parameter is a single scalar. Authors wrap it in a value-preserving aggregate purely to
+# satisfy Tableau's "aggregate in a measure" rule; over that singleton the aggregate equals the
+# scalar, so it must collapse to the SAME SELECTEDVALUE param measure the bare scalar position emits.
+def _param_resolver(name):
+    # Mirrors emit_value_parameters' resolver: a modeled value/what-if param -> its scalar measure.
+    return {"Goal": "[Goal Value]", "Service Goal": "[Service Goal Value]"}.get(name)
+
+
+@pytest.mark.parametrize("agg", ["MIN", "MAX", "AVG", "MEDIAN", "SUM"])
+def test_aggregate_wrapped_parameter_collapses_to_scalar_measure(agg):
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        f"SUM([Quantity]) - {agg}([Parameters].[Goal])", _resolver,
+        param_resolver=_param_resolver)
+    assert reason == "ok"
+    assert dax == "SUM('Orders'[Quantity]) - [Goal Value]"
+    # The param measure has no fact home -> the host expression stays single-table (Orders only).
+    assert tables == {"Orders"}
+
+
+def test_lone_aggregate_wrapped_parameter_collapses():
+    # The whole measure is just the wrapped param -> the bare scalar param measure.
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        "MIN([Parameters].[Goal])", _resolver, param_resolver=_param_resolver)
+    assert reason == "ok"
+    assert dax == "[Goal Value]"
+
+
+def test_bare_scalar_parameter_reference_still_resolves():
+    # Regression: the scalar (unwrapped) position was already supported; behavior unchanged.
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        "SUM([Quantity]) - [Parameters].[Goal]", _resolver, param_resolver=_param_resolver)
+    assert reason == "ok"
+    assert dax == "SUM('Orders'[Quantity]) - [Goal Value]"
+
+
+@pytest.mark.parametrize("agg", ["COUNT", "COUNTD", "STDEV", "VAR"])
+def test_counting_or_spread_aggregate_over_parameter_stays_stub(agg):
+    # COUNT/COUNTD (count of one = 1) and STDEV/VAR (spread of one = 0/blank) do NOT return the
+    # parameter's value, so they are deliberately EXCLUDED -- they stay an honest unmodeled stub.
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        f"{agg}([Parameters].[Goal])", _resolver, param_resolver=_param_resolver)
+    assert dax is None
+    assert "parameter reference" in reason
+
+
+def test_aggregate_wrapped_parameter_without_resolver_stays_stub():
+    # Fail-closed: no param_resolver -> unchanged "(unmodeled)" stub (byte-identical old behavior).
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        "SUM([Quantity]) - MIN([Parameters].[Goal])", _resolver)
+    assert dax is None
+    assert "parameter reference" in reason
+
+
+def test_aggregate_wrapped_unmodeled_parameter_stays_stub():
+    # Resolver present but this param isn't modeled -> still an honest stub, never a guess.
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        "MIN([Parameters].[Unmodeled])", _resolver, param_resolver=_param_resolver)
+    assert dax is None
+    assert "parameter reference" in reason
+
+
+def test_non_param_aggregate_unaffected_by_collapse_guard():
+    # A normal MIN([field]) must be byte-identical whether or not a param_resolver is present.
+    plain = translate_tableau_calc_to_dax("MIN([Sales])", _resolver)[0]
+    withpr = translate_tableau_calc_to_dax("MIN([Sales])", _resolver, param_resolver=_param_resolver)[0]
+    assert plain == withpr == "MIN('Orders'[Sales])"
+
+
 def test_count_maps_to_counta_not_count():
     # Tableau COUNT counts non-null of any type; DAX COUNT errors on text -> COUNTA.
     assert _tx("COUNT([Region])") == "COUNTA('Orders'[Region])"
@@ -1613,6 +1684,119 @@ def test_number_of_records_only_sum_and_count_map_to_countrows():
     dax, _reason, _tables = translate_tableau_calc_to_dax(
         "AVG([Number of Records])", _nor_resolver, known_tables={"Orders"})
     assert dax is None
+
+
+# ---------------------------------------------------------------------------
+# inline_calcs -- the Stage-2 date-filter inliner
+# ---------------------------------------------------------------------------
+# A parameter-driven date-window boolean dimension calc (e.g.
+#   [Order Date] >= [Parameters].[Start Date] AND [Order Date] <= [Parameters].[End Date])
+# stubs on its own as a calculated COLUMN (a row-level column can't read a slicer
+# selection). But a MEASURE that consumes it -- COUNTD(IF [Date Window] THEN [field] END)
+# -- CAN read the slicer, so when the dim calc's body is supplied via inline_calcs the
+# measure entry point inlines the body into the COUNTD-IF filter and translates. This also
+# exercises Option D: a "date" param compared against a date column must type-check.
+def _date_param_resolver(name):
+    # Option D: date params return (ref, "date") tuples, keyed bracket-less exactly as
+    # parameters.py's real resolver registers them (parts[1] of [Parameters].[Start Date]).
+    return {
+        "start date": ("[Start Date Value]", "date"),
+        "end date": ("[End Date Value]", "date"),
+    }.get((name or "").strip().lower())
+
+
+_DATE_WINDOW_BODY = (
+    "[Order Date] >= [Parameters].[Start Date] AND "
+    "[Order Date] <= [Parameters].[End Date]"
+)
+_INLINED_COUNTD_DAX = (
+    "COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK('Orders'[Region]), "
+    "FILTER('Orders', ('Orders'[Order_Date] >= [Start Date Value] && "
+    "'Orders'[Order_Date] <= [End Date Value]))), 0)"
+)
+
+
+def test_inline_date_window_into_countd_if_translates():
+    # The headline: a stubbed date-window boolean, inlined into a consuming COUNTD-IF, emits
+    # the faithful COALESCE/CALCULATE/FILTER form. Proves the inliner AND Option D together.
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        "COUNTD(IF [Date Window] THEN [Region] END)", _resolver,
+        param_resolver=_date_param_resolver, known_tables={"Orders"},
+        inline_calcs={"date window": _DATE_WINDOW_BODY})
+    assert reason == "ok"
+    assert dax == _INLINED_COUNTD_DAX
+    assert tables == {"Orders"}
+
+
+def test_inline_date_window_referenced_by_internal_id():
+    # The consumer may reference the dim calc by its internal Calculation_* id; the inliner
+    # keys inline_calcs case-insensitively, so both forms resolve to the same DAX.
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        "COUNTD(IF [Calculation_123] THEN [Region] END)", _resolver,
+        param_resolver=_date_param_resolver, known_tables={"Orders"},
+        inline_calcs={"calculation_123": _DATE_WINDOW_BODY})
+    assert reason == "ok"
+    assert dax == _INLINED_COUNTD_DAX
+
+
+def test_inline_without_inline_calcs_stays_stub():
+    # Baseline: the same consumer with NO inline_calcs supplied stays a fail-closed stub
+    # (the dim-calc reference is genuinely unresolved).
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        "COUNTD(IF [Date Window] THEN [Region] END)", _resolver,
+        param_resolver=_date_param_resolver, known_tables={"Orders"})
+    assert dax is None
+    assert "unresolved/ambiguous field" in reason
+
+
+def test_inline_cross_table_countd_if_stays_stub():
+    # An inlined body whose date column lives on a DIFFERENT table than the counted field
+    # fails closed on the single-table COUNTD-IF guard -- never unfaithful cross-table DAX.
+    cross_body = (
+        "[People Signup] >= [Parameters].[Start Date] AND "
+        "[People Signup] <= [Parameters].[End Date]"
+    )
+    resolver = dict(_FIELDS)
+    resolver["People Signup"] = ("People", "People_Signup", "dateTime")
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        "COUNTD(IF [Date Window] THEN [Region] END)", resolver.get,
+        param_resolver=_date_param_resolver, known_tables={"Orders", "People"},
+        inline_calcs={"date window": cross_body})
+    assert dax is None
+    assert "one table" in reason
+
+
+def test_inline_non_boolean_candidate_not_inlined():
+    # A non-boolean dim calc keyed in inline_calcs (a numeric body) must NOT inline -- the
+    # nested parser rejects a non-bool node, so the reference stays an honest stub.
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        "COUNTD(IF [Amount X2] THEN [Region] END)", _resolver,
+        param_resolver=_date_param_resolver, known_tables={"Orders"},
+        inline_calcs={"amount x2": "[Quantity] * 2"})
+    assert dax is None
+    assert "unresolved/ambiguous field" in reason
+
+
+def test_inline_self_referential_candidate_no_infinite_loop():
+    # A cyclic inline body (references itself) must fail closed via the cycle guard, never
+    # recurse forever.
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        "COUNTD(IF [Self Ref] THEN [Region] END)", _resolver,
+        param_resolver=_date_param_resolver, known_tables={"Orders"},
+        inline_calcs={"self ref": "[Self Ref] AND [Quantity] > 0"})
+    assert dax is None
+    assert "unresolved/ambiguous field" in reason
+
+
+def test_inline_date_param_vs_text_column_fails_closed():
+    # Option-D type gate still bites: a "date" param compared against a TEXT column is
+    # incomparable, so the inlined body rejects and the consumer stays a stub (never a guess).
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        "COUNTD(IF [Bad Window] THEN [Region] END)", _resolver,
+        param_resolver=_date_param_resolver, known_tables={"Orders"},
+        inline_calcs={"bad window": "[Region] >= [Parameters].[Start Date]"})
+    assert dax is None
+    assert "unresolved/ambiguous field" in reason
 
 
 

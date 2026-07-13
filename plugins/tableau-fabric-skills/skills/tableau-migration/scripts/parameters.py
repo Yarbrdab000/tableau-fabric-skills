@@ -342,6 +342,28 @@ def _emit_numeric_list_value_param(param, table_name, value_col, measure_name, t
     return tmdl, dtype, [], value_col
 
 
+_DATE_DEFAULT_RE = re.compile(
+    r"^#(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{1,2}):(\d{1,2}))?#$")
+
+
+def _date_default_literal(param):
+    """Parse a Tableau date/datetime default (``#2020-01-01#`` or ``#2020-01-01 13:30:00#``) into a
+    DAX ``DATE(y, m, d)`` literal (plus ``+ TIME(h, mi, s)`` when a non-midnight time part is
+    present). Returns ``None`` when the default is missing or is not a Tableau date literal, so the
+    caller fails closed rather than inventing a non-deterministic date anchor."""
+    raw = (param.get("default") or "").strip()
+    m = _DATE_DEFAULT_RE.match(raw)
+    if not m:
+        return None
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    lit = f"DATE({y}, {mo}, {d})"
+    if m.group(4) is not None:
+        hh, mi, ss = int(m.group(4)), int(m.group(5)), int(m.group(6))
+        if (hh, mi, ss) != (0, 0, 0):
+            lit = f"{lit} + TIME({hh}, {mi}, {ss})"
+    return lit
+
+
 def _emit_one_value_param(param, table_name, column_name, measure_name):
     """Build the TMDL for one value param. Returns ``(tmdl_text, dtype, warnings, picker_column)``
     or ``(None, None, [], None)`` if the param can't be represented as a value control.
@@ -386,10 +408,26 @@ def _emit_one_value_param(param, table_name, column_name, measure_name):
             default_literal=default_literal, measure_fmt=None)
         return tmdl, dtype, [], column_name
 
+    if datatype in ("date", "datetime"):
+        # A Tableau date parameter has no member list -- it is a free date picker. Model it as a
+        # DISCONNECTED single-column date table spanning the model's own date range (CALENDARAUTO,
+        # which auto-derives min..max from every date column in the model) so a slicer offers the
+        # real data domain, plus a SELECTEDVALUE capture measure that falls back to the Tableau
+        # default date. The table stays disconnected (value-param tables are never wired into
+        # relationships), so a downstream calc reads the picked date as a VALUE via the measure --
+        # without filtering through a relationship, the invariant a date-range filter needs to
+        # compute (e.g.) a prior period outside the selected range. CALENDARAUTO names its column
+        # "Date". Fail closed on a default that is not a Tableau date literal (no guessed anchor).
+        default_literal = _date_default_literal(param)
+        if default_literal is None:
+            return None, None, [], None
+        tmdl = _value_table_tmdl(
+            table_name, display_col=column_name, source_col="Date", tmdl_type="dateTime",
+            fmt=None, source_expr="CALENDARAUTO()", measure_name=measure_name,
+            default_literal=default_literal, measure_fmt=None)
+        return tmdl, dtype, [], column_name
+
     return None, None, [], None
-
-
-# =============================================================================
 # FIELD PARAMETERS  (Tableau dimension/measure *swap* calcs -> Power BI field parameter)
 # =============================================================================
 #
@@ -858,8 +896,11 @@ def emit_value_parameters(params, *, calcs, reserved_names=None):
 
     Returns ``{parts:[(filename, tmdl)], table_names:[...], measure_names:[...], param_resolver,
     consumed_params:[...], warnings:[...]}``. ``param_resolver(name)`` maps a parameter reference
-    (by caption or bracket-less internal name) to its value measure ``[<Param> Value]`` so the calc
-    translator can inline the selection; it deliberately registers NO table in ``tables_used`` so the
+    (by caption or bracket-less internal name) to a ``(measure_ref, dtype)`` tuple -- the value
+    measure ``[<Param> Value]`` plus the param's comparison dtype (the translator's canonical
+    ``number``/``text``/``bool``/``date`` vocabulary) so a calc that compares the param against a
+    typed column type-checks. The calc translator inlines the selection and deliberately registers
+    NO table in ``tables_used`` so the
     host expression stays single-table (e.g. ``SUM('Orders'[Sales]) * [Sales Multiplier Value]`` does
     not trip the cross-table fallback). ``consumed_params`` lists the SOURCE parameters that became
     what-if tables (``{caption, internal_name, table, measure, picker_column}``) so the model manifest
@@ -911,8 +952,13 @@ def emit_value_parameters(params, *, calcs, reserved_names=None):
                                 "table": table_name, "measure": measure_name,
                                 "picker_column": picker_column})
         ref = dax_ref(None, measure_name, measure=True)
+        # Register the param's COMPARISON dtype alongside its measure ref. ``_dtype`` is already the
+        # translator's canonical vocab (number/text/bool/date -- see _TYPE_MAP), so a calc that
+        # compares the param against a typed column -- e.g. an inlined date-window filter comparing a
+        # date column to a date parameter -- type-checks instead of failing "incomparable types".
+        # The translator's tolerant reader accepts either this (ref, dtype) tuple or a bare string.
         for k in _param_keys(p):
-            resolver_map[k] = ref
+            resolver_map[k] = (ref, _dtype)
 
     def param_resolver(name):
         return resolver_map.get((name or "").strip().lower())

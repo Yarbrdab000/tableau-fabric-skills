@@ -567,6 +567,46 @@ def test_migrate_estate_summary_omits_next_step_when_no_stubs(tmp_path):
     assert (tmp_path / "b" / "pbip" / "Orders DS" / "Orders DS.pbip").is_file()
 
 
+def test_summarize_rolls_up_workbook_model_calcs_and_folds_needs_review():
+    # Fix (2): a consolidated workbook builds its OWN semantic model whose calc summary lives on
+    # ``model_translation_handoff`` -- NOT in ds_details. Without the rollup, those calcs never reach
+    # the top-level summary and the mandatory second-compiler gate (needs_review_total) reads 0 even
+    # when workbook calcs are stubbed. The fixture uses live != translated (live=3, translated=2) to
+    # LOCK that ``workbook_calcs_translated`` reads the ``live`` key (translated + assisted_approved),
+    # not the raw deterministic ``translated`` -- so live/needs_review is a clean partition of total.
+    wb_details = [{
+        "model_translation_handoff": {"summary": {
+            "total": 4, "live": 3, "translated": 2, "assisted_approved": 1,
+            "assisted_suggested": 0, "stub": 1, "needs_review": 1,
+        }},
+    }]
+    s = me._summarize(ds_details=[], wb_details=wb_details, viz_available=True)
+
+    assert s["workbook_calcs_total"] == 4
+    # reads ``live`` (3), NOT the raw ``translated`` (2) -- the load-bearing lock
+    assert s["workbook_calcs_translated"] == 3
+    assert s["workbook_calcs_stubbed"] == 1
+    assert s["workbook_calcs_needs_review"] == 1
+    # live + needs_review is a clean partition of total (mirrors live = translated + assisted_approved,
+    # needs_review = assisted_suggested + stub)
+    assert s["workbook_calcs_translated"] + s["workbook_calcs_needs_review"] == s["workbook_calcs_total"]
+    assert s["workbook_calcs_coverage_pct"] == 75.0            # round(100 * 3 / 4, 1)
+    # the workbook's needs_review is folded into the mandatory second-compiler gate
+    assert s["needs_review_total"] == 1
+
+
+def test_summarize_datasource_only_run_leaves_workbook_calc_keys_inert():
+    # Byte-identical guarantee for a datasource-only run: no wb_details -> every additive workbook_calcs
+    # key is 0 and coverage is None (not 0.0), and the gate total is untouched.
+    s = me._summarize(ds_details=[], wb_details=[], viz_available=True)
+    assert s["workbook_calcs_total"] == 0
+    assert s["workbook_calcs_translated"] == 0
+    assert s["workbook_calcs_stubbed"] == 0
+    assert s["workbook_calcs_needs_review"] == 0
+    assert s["workbook_calcs_coverage_pct"] is None
+    assert s["needs_review_total"] == 0
+
+
 def test_malformed_asset_is_isolated_as_error(tmp_path):
     src = InMemoryTableauSource(
         datasources={"Good DS": LIVE_TDS, "Bad DS": MALFORMED_TDS},
@@ -969,6 +1009,73 @@ _RATIO_WS = """
 MULTI_SOURCE_SECOND_ISLAND_CALC_TWB = _viz_wb(
     _viz_ds("Sales Source", "federated.s1", "sqlserver.s1", "sqlserver", "Sales") + _RATIO_ISLAND,
     _viz_ws("Sales by Category", "federated.s1", "Sales Source") + _RATIO_WS)
+
+
+# Fix (1) island-scoped resolution: two islands reuse the SAME [Amount] caption on DIFFERENT physical
+# tables (Sales vs Inventory), and island 2 defines a calc MEASURE that references the colliding
+# [Amount]. In the consolidated model the pooled resolver is ambiguous on [Amount] (it lives on both
+# tables) -> the calc would STUB and coverage would be falsely reported. Scoping resolution to the
+# calc's own island binds [Amount] to THAT island's physical table (Inventory), so the calc translates
+# to the CORRECT island. This is the synthetic stand-in for the real Salesforce 4-island collision.
+_ISLAND_COLLISION_CALC = """
+    <datasource caption='Inventory Source' inline='true' name='federated.s2' version='18.1'>
+      <connection class='federated'>
+        <named-connections>
+          <named-connection caption='c' name='sqlserver.s2'>
+            <connection class='sqlserver' dbname='DB' server='srv.example.com' username='svc' />
+          </named-connection>
+        </named-connections>
+        <relation connection='sqlserver.s2' name='Inventory' table='[dbo].[Inventory]' type='table' />
+        <metadata-records>
+          <metadata-record class='column'>
+            <remote-name>Category</remote-name><local-name>[Category]</local-name>
+            <parent-name>[Inventory]</parent-name><local-type>string</local-type>
+          </metadata-record>
+          <metadata-record class='column'>
+            <remote-name>Amount</remote-name><local-name>[Amount]</local-name>
+            <parent-name>[Inventory]</parent-name><local-type>real</local-type>
+          </metadata-record>
+        </metadata-records>
+      </connection>
+      <column caption='Stock Value' datatype='real' name='[Calculation_stock1]'
+              role='measure' type='quantitative'>
+        <calculation class='tableau' formula='SUM([Amount]) * 2' />
+      </column>
+    </datasource>"""
+
+# Island 1 (Sales) shares the identical [Category]/[Amount] captions on its OWN table 'Sales'.
+ISLAND_COLLISION_CALC_TWB = _viz_wb(
+    _viz_ds("Sales Source", "federated.s1", "sqlserver.s1", "sqlserver", "Sales")
+    + _ISLAND_COLLISION_CALC,
+    _viz_ws("Sales by Category", "federated.s1", "Sales Source")
+    + _viz_ws("Inventory by Category", "federated.s2", "Inventory Source"))
+
+
+def test_workbook_consolidation_scopes_colliding_caption_to_calc_island():
+    # Fix (1) regression: island 2's calc references [Amount], a caption that ALSO exists on island 1's
+    # 'Sales' table. Without island-scoped resolution the pooled resolver is ambiguous -> the calc stubs
+    # (or, worse, could bind to the wrong island). Island-scoped resolution binds it to THIS island's
+    # 'Inventory' table, so the calc translates deterministically to the CORRECT physical table.
+    with tempfile.TemporaryDirectory() as out:
+        src = InMemoryTableauSource(workbooks={"Multi WB": ISLAND_COLLISION_CALC_TWB})
+        report = migrate_estate(src, os.path.join(out, "b"))
+        wb = report["workbooks"][0]
+        assert wb["pbip_status"] == "built"
+        # the colliding-caption calc is SEEN and TRANSLATED (not stubbed away on ambiguity)
+        summary = wb["model_translation_handoff"]["summary"]
+        assert summary["total"] >= 1
+        assert summary["translated"] >= 1
+        measures = os.path.join(out, "b", "pbip", "Multi WB", "Multi WB.SemanticModel",
+                                "definition", "tables", "_Measures.tmdl")
+        assert os.path.isfile(measures), "consolidated model has no _Measures table -- calc was dropped"
+        blob = open(measures, encoding="utf-8-sig").read()
+        assert "measure 'Stock Value'" in blob
+        # bound to the CORRECT island's physical table (Inventory), NOT the colliding Sales table
+        assert "SUM('Inventory'[Amount]) * 2" in blob
+        assert "'Sales'[Amount]" not in blob
+        # deterministic provenance + original formula preserved
+        assert "annotation TranslatedBy = deterministic" in blob
+        assert "annotation TableauFormula = SUM([Amount]) * 2" in blob
 
 
 def test_workbook_consolidation_lands_calc_from_second_datasource_island():

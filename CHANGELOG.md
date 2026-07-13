@@ -13,6 +13,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.40.0` → `1.41.0`): Deterministic parameter-driven date-window translation
+  and a cascade-aware row-level reroute — additive and strictly faithfulness-preserving.** Hardens several
+  cross-calc paths so more real-workbook calculations translate deterministically, without ever emitting a
+  guess. **(1) Option-D date-parameter modelling** — a `date`/`datetime` Tableau parameter (a free date
+  picker, no member list) now emits a *disconnected* single-column date table spanning the model's own date
+  range (`CALENDARAUTO`) plus a `[<Param> Value]` `SELECTEDVALUE` capture measure that falls back to the
+  Tableau default date literal, giving the parameter a real, slicer-drivable model home (the *capability* a
+  Tableau date parameter provides, not its mechanism); fail-closed on a default that is not a Tableau date
+  literal (no invented anchor). **(2) Date-window inliner (`inline_calcs`)** — a boolean date-window
+  dimension calc (a "within the selected window" flag) is inlined into a consuming `COUNTD(IF …)` measure's
+  `FILTER`, so a parameter-driven date-range count that previously fail-closed now emits faithful DAX. **(3)
+  Aggregate-over-parameter collapse** — a value-preserving aggregate wrapped directly around a bare parameter
+  reference (`MIN`/`MAX`/`AVG`/`MEDIAN`/`SUM([Parameters].[P])`, a Tableau scalar formality) collapses to the
+  same `SELECTEDVALUE` parameter measure the bare scalar emits; `COUNT`/`COUNTD`/`STDEV`/`VAR` are excluded
+  and stay honest stubs. **(4) Cascade-aware row-level reroute** — the measure/row-level reclassification and
+  the cross-calc reference maps now run to a fix-point, so a calc that becomes row-level (or resolvable) only
+  after a dependency is rerouted is itself picked up. **(5) Per-island field resolvers** — a consolidated
+  multi-datasource workbook now resolves each calc against the disconnected table *island* that best resolves
+  its physical fields, so identically-captioned fields across merged Salesforce datasources no longer
+  cross-resolve (fail-closed: a retag happens only when exactly one island strictly out-resolves the
+  document-order tag). Every shape without a single provably-correct target stays an inert stub with its
+  original `TableauFormula` preserved. Report schema additive-only; no existing key renamed or removed.
 - **tableau-migration (skill `1.39.0` → `1.40.0`): Two test-only correctness-lock harnesses for the
   translator and the report emitter (no engine or report-schema change).** Additive regression coverage that
   pins current, provably-faithful behaviour so a future change cannot silently drift it. **(T3.2) Concept

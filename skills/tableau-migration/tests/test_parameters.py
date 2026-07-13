@@ -395,6 +395,13 @@ def _str_param(caption="Segment Parameter", internal="[Parameter 2]", default='"
             "aliases": {}}
 
 
+def _date_param(caption="Start Date", internal="[Parameter 5]", default="#2020-01-01#"):
+    # Mirrors the real Salesforce "Start Date" / "End Date": a free date picker (no member list),
+    # datatype date, default a Tableau ``#YYYY-MM-DD#`` literal.
+    return {"caption": caption, "internal_name": internal, "datatype": "date", "domain": "range",
+            "default": default, "format": None, "range": None, "members": [], "aliases": {}}
+
+
 def test_canon_num_key_trailing_dot():
     # Tableau serializes integer alias keys with a trailing dot; they must canonicalize by value.
     assert P._canon_num_key("1.") == P._canon_num_key("1") == P._canon_num_key("1.0") == "1"
@@ -427,8 +434,8 @@ def test_emit_value_parameter_numeric_whatif():
     assert 'ROW("Value", 19.47014925)' in tmdl               # off-grid default unioned in
     assert "sourceColumn: [Value]" in tmdl                   # physical partition column is "Value"
     assert "SELECTEDVALUE('Sales Multiplier'[Sales Multiplier], 19.47014925)" in tmdl
-    assert res["param_resolver"]("Sales Multiplier") == "[Sales Multiplier Value]"
-    assert res["param_resolver"]("Parameter 7") == "[Sales Multiplier Value]"   # by internal name
+    assert res["param_resolver"]("Sales Multiplier") == ("[Sales Multiplier Value]", "number")
+    assert res["param_resolver"]("Parameter 7") == ("[Sales Multiplier Value]", "number")   # by internal name
 
 
 def test_emit_value_parameter_string_slicer():
@@ -440,6 +447,73 @@ def test_emit_value_parameter_string_slicer():
     assert "DATATABLE(" in tmdl
     assert all(s in tmdl for s in ('"Consumer"', '"Corporate"', '"Home Office"'))
     assert "SELECTEDVALUE(" in tmdl                          # default fallback is "Consumer"
+
+
+def test_emit_value_parameter_date_whatif():
+    # A DATE parameter is a free picker: a DISCONNECTED single-column date table spanning the model's
+    # own dates (CALENDARAUTO) + a SELECTEDVALUE capture measure defaulting to the Tableau #...# date.
+    calc = {"name": "In Range", "role": "dimension",
+            "formula": "[Closed Date] >= [Parameters].[Start Date]"}
+    res = P.emit_value_parameters([_date_param()], calcs=[calc], reserved_names=set())
+    assert res["table_names"] == ["Start Date"]
+    assert res["measure_names"] == ["Start Date Value"]
+    _fn, tmdl = res["parts"][0]
+    assert "CALENDARAUTO()" in tmdl                          # disconnected model-date domain
+    assert "dataType: dateTime" in tmdl
+    assert "sourceColumn: [Date]" in tmdl                    # CALENDARAUTO's column is named "Date"
+    assert "SELECTEDVALUE('Start Date'[Start Date], DATE(2020, 1, 1))" in tmdl
+    # the capture measure is resolvable by caption AND bracket-less internal name
+    assert res["param_resolver"]("Start Date") == ("[Start Date Value]", "date")
+    assert res["param_resolver"]("Parameter 5") == ("[Start Date Value]", "date")
+
+
+def test_emit_value_parameter_datetime_default_carries_time():
+    p = _date_param(caption="Cutoff", internal="[Parameter 9]", default="#2021-03-31 13:30:00#")
+    calc = {"name": "c", "role": "measure", "formula": "[Parameters].[Cutoff]"}
+    res = P.emit_value_parameters([p], calcs=[calc], reserved_names=set())
+    _fn, tmdl = res["parts"][0]
+    assert "SELECTEDVALUE('Cutoff'[Cutoff], DATE(2021, 3, 31) + TIME(13, 30, 0))" in tmdl
+
+
+def test_emit_value_parameter_date_unparseable_default_stubs():
+    # No usable Tableau date literal -> fail closed (no table, no guessed anchor); the calc stubs.
+    p = _date_param(default="")
+    calc = {"name": "c", "role": "measure", "formula": "[Parameters].[Start Date]"}
+    res = P.emit_value_parameters([p], calcs=[calc], reserved_names=set())
+    assert res["table_names"] == []
+    assert res["param_resolver"]("Start Date") is None
+    assert any("not a representable value" in w for w in res["warnings"])
+
+
+def test_option_d_date_param_vs_date_column_type_checks_end_to_end():
+    # Option D across BOTH halves: the REAL param_resolver from emit_value_parameters returns a
+    # ("[Start Date Value]", "date") tuple, and the translator uses that dtype to type-check the
+    # comparison. A date column vs the date param is comparable -> the consuming COUNTD-IF inlines
+    # its date-window body and translates; a TEXT column vs the date param is incomparable -> the
+    # inlined body rejects and the consumer stays a fail-closed stub (never a guess).
+    from calc_to_dax import translate_tableau_calc_to_dax
+    body_calc = {"name": "Date Window", "role": "dimension",
+                 "formula": "[Order Date] >= [Parameters].[Start Date]"}
+    res = P.emit_value_parameters([_date_param()], calcs=[body_calc], reserved_names=set())
+    presolve = res["param_resolver"]
+    assert presolve("Start Date") == ("[Start Date Value]", "date")
+
+    resolver = {"Order Date": ("Orders", "Order_Date", "dateTime"),
+                "Region": ("Orders", "Region", "string")}.get
+    # date column vs date param -> comparable -> the COUNTD-IF consumer translates
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        "COUNTD(IF [Date Window] THEN [Region] END)", resolver,
+        param_resolver=presolve, known_tables={"Orders"},
+        inline_calcs={"date window": "[Order Date] >= [Parameters].[Start Date]"})
+    assert reason == "ok"
+    assert "[Start Date Value]" in dax
+    assert "'Orders'[Order_Date] >= [Start Date Value]" in dax
+    # TEXT column vs date param -> incomparable -> fail closed, no unfaithful DAX
+    dax2, _reason2, _ = translate_tableau_calc_to_dax(
+        "COUNTD(IF [Bad Window] THEN [Region] END)", resolver,
+        param_resolver=presolve, known_tables={"Orders"},
+        inline_calcs={"bad window": "[Region] >= [Parameters].[Start Date]"})
+    assert dax2 is None
 
 
 def test_emit_value_parameter_name_collision_gets_suffix():
@@ -557,10 +631,22 @@ def test_value_param_without_resolver_stubs():
     assert dax is None and "parameter reference" in reason
 
 
-def test_param_not_resolved_inside_aggregation():
-    # A parameter is a scalar -> SUM([Parameters].[X]) must still stub even WITH a resolver.
-    dax, _reason, _ = translate_tableau_calc_to_dax(
+def test_param_collapses_inside_value_preserving_aggregation():
+    # A parameter is a scalar; a value-preserving aggregate over that singleton (SUM/MIN/MAX/AVG/
+    # MEDIAN) equals the scalar, so it collapses to the same SELECTEDVALUE param measure the bare
+    # scalar position emits (Tableau authors wrap a param in an aggregate only as a measure-context
+    # formality).
+    dax, reason, _ = translate_tableau_calc_to_dax(
         "SUM([Parameters].[X])", _sales_resolver, param_resolver=lambda n: "[X Value]")
+    assert reason == "ok"
+    assert dax == "[X Value]"
+
+
+def test_param_not_resolved_inside_counting_aggregation():
+    # COUNT of a singleton = 1 (not the value) -> a counting/spread aggregate over a param must
+    # still stub even WITH a resolver (the fail-closed guard the collapse deliberately excludes).
+    dax, _reason, _ = translate_tableau_calc_to_dax(
+        "COUNT([Parameters].[X])", _sales_resolver, param_resolver=lambda n: "[X Value]")
     assert dax is None
 
 

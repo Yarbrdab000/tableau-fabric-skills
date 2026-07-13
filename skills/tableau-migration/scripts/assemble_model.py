@@ -544,10 +544,93 @@ def _approved_dtype(value):
     return None
 
 
+_FIELD_TOKEN_RE = re.compile(r"\[([^\[\]]+)\]")
+
+
+def _calc_field_tokens(formula):
+    """Bracketed field tokens in a Tableau formula (physical-field candidates).
+
+    ``[Id (Contact)]`` -> ``Id (Contact)``. Calc-reference (``[Calculation_*]``) and parameter
+    (``[Parameters]``/``[X]``) tokens are captured too, but they resolve to ``None`` under EVERY
+    island scope, so they are neutral to the cross-scope comparison in ``_best_scoped_resolver``.
+    """
+    if not formula:
+        return set()
+    return {t.strip() for t in _FIELD_TOKEN_RE.findall(formula) if t.strip()}
+
+
+def _best_scoped_resolver(formula, tagged_ds, resolve_for, island_dss, base_resolve):
+    """Choose the field resolver that best resolves a calc's physical fields (smart island scoping).
+
+    Fail-closed correction of the doc-order datasource mis-tag. In a CONSOLIDATED multi-datasource
+    workbook a ``(copy)`` calc can be TAGGED (by document order in ``extract_calculations``) to an
+    island whose scope leaves its ``[...]`` fields unresolved -- e.g. a COUNTD-IF over ``[Id (Contact)]``
+    tagged ``Service Delivery`` where that caption is cross-island-ambiguous (``None``) yet resolves
+    UNAMBIGUOUSLY under ``Intake`` (single ``Contact`` table). This picks the island that resolves the
+    most of the calc's fields.
+
+    Guarantees:
+    * **Byte-identical for every currently-translating calc.** When the tagged scope already resolves
+      EVERY field token, the tagged resolver is returned UNCHANGED (a calc whose fields all resolve
+      cannot be improved, so it is never touched -- only currently-stubbing calcs are candidates).
+    * **Fail-closed.** A promotion happens only when the tag leaves a gap AND *exactly one* island
+      strictly out-resolves it. Zero or more-than-one improving islands -> keep the tag (never guess).
+    * **Can only flip a stub to a translation, never regress.** A field left unresolved by the tag
+      already stubs the calc; promoting to a scope that resolves it can only help.
+
+    ``resolve_for`` (``ds -> resolver | None``) and ``island_dss`` (candidate island captions) come
+    from ``_measures_part``. With ``resolve_for is None`` (single/standalone datasource) this returns
+    the same resolver ``_rc`` returned before, so output is byte-for-byte identical.
+    """
+    tagged = None
+    if resolve_for is not None and tagged_ds:
+        tagged = resolve_for(tagged_ds)
+    if tagged is None:
+        tagged = base_resolve
+    if resolve_for is None:
+        return tagged
+    fields = _calc_field_tokens(formula)
+    if not fields:
+        return tagged
+
+    def _score(r):
+        if r is None:
+            return 0
+        n = 0
+        for f in fields:
+            try:
+                if r(f) is not None:
+                    n += 1
+            except Exception:
+                pass
+        return n
+
+    tagged_hits = _score(tagged)
+    if tagged_hits >= len(fields):
+        return tagged  # tag fully resolves -> unchanged (byte-identical)
+    best_score = tagged_hits
+    winners = []
+    for ds in island_dss:
+        if not ds or ds == tagged_ds:
+            continue
+        r = resolve_for(ds)
+        if r is None:
+            continue
+        s = _score(r)
+        if s > best_score:
+            best_score = s
+            winners = [r]
+        elif s == best_score and best_score > tagged_hits:
+            winners.append(r)
+    if len(winners) == 1 and best_score > tagged_hits:
+        return winners[0]
+    return tagged  # 0 or >1 improving islands -> keep the tag (fail-closed)
+
+
 def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    calc_lookup=None, approved_calc_dax=None, synth_measures=None,
                    known_tables=None, table_calc_usages=None, order_resolver=None,
-                   flag_measures=None):
+                   flag_measures=None, resolve_for=None, inline_calcs=None):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
     ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
@@ -569,9 +652,34 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     into the real measure, tagged ``TranslatedBy = assisted translation (human-approved)``. The
     deterministic safe-subset behavior is unchanged: with neither a matching idiom nor an approval,
     output is byte-for-byte identical to before.
+
+    ``inline_calcs`` ({normalized-name: tableau-formula}, keyed by caption AND internal id, lowercased)
+    is threaded verbatim into the measure translator so a MEASURE that references a stubbed
+    dimension-calc body row-level -- e.g. a parameter-driven date-window boolean consumed inside a
+    ``COUNTD(IF ...)`` -- can inline that body (parsed column-mode, pure-boolean, fully consumed,
+    single-table) instead of stubbing. Default ``None`` -> byte-for-byte identical prior output.
     """
     consumed_lower = {(c or "").lower() for c in (consumed or set())}
     approved_lower = {(k or "").lower(): v for k, v in (approved_calc_dax or {}).items()}
+    # Per-calc resolver selection (island scoping). ``resolve_for`` (optional) maps a calc's home
+    # datasource caption -> a field resolver scoped to that island's tables. It is threaded ONLY for a
+    # consolidated multi-datasource workbook, where the same caption maps to different physical tables
+    # per island, so the pooled ``resolve`` returns None. Default None -- and any calc lacking a
+    # ``datasource`` tag, or whose scoped resolver comes back None -- falls through to the global
+    # ``resolve``, so single-datasource / standalone output is byte-for-byte identical.
+    #
+    # FIX 1 (smart island-scope selection): a ``(copy)`` calc mis-TAGGED by document order to an island
+    # whose scope leaves its fields unresolved is retagged, at resolve-time, to the single island that
+    # resolves them -- fail-closed (see ``_best_scoped_resolver``). ``_island_dss`` is the candidate set
+    # of island captions (the distinct ``datasource`` tags on this calc list). Inert when ``resolve_for``
+    # is None (single-datasource) or when the tag already fully resolves.
+    _island_dss = {(_c or {}).get("datasource") for _c in (calcs or [])}
+    _island_dss = {d for d in _island_dss if d}
+
+    def _rc(calc):
+        return _best_scoped_resolver(
+            (calc or {}).get("formula", ""), (calc or {}).get("datasource"),
+            resolve_for, _island_dss, resolve)
     # Source calcs whose stub is SUPERSEDED by a synthesized date-window flag measure (emitted
     # at the end). Keyed by both the calc caption and its internal id, case-insensitive.
     flag_source_lower = set()
@@ -672,8 +780,8 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         for calc in pending:
             cname = calc["name"]
             cdax, _r, _t, cdtype = translate_tableau_calc_to_dax_typed(
-                calc.get("formula", ""), resolve, param_resolver=param_resolver,
-                measure_refs=measure_refs, known_tables=known_tables)
+                calc.get("formula", ""), _rc(calc), param_resolver=param_resolver,
+                measure_refs=measure_refs, known_tables=known_tables, inline_calcs=inline_calcs)
             if cdax:
                 entry = (cname, cdtype or "number")
                 measure_refs[cname.strip().lower()] = entry
@@ -700,8 +808,8 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         if _superseded_by_table_calc(calc, superseded):
             continue  # the addressed table-calc form (emitted below) is the faithful one.
         dax, reason, _ = translate_tableau_calc_to_dax(
-            formula, resolve, param_resolver=param_resolver, measure_refs=measure_refs,
-            known_tables=known_tables)
+            formula, _rc(calc), param_resolver=param_resolver, measure_refs=measure_refs,
+            known_tables=known_tables, inline_calcs=inline_calcs)
         row = {
             "measure": name,
             "status": "translated" if dax else "stub",
@@ -725,7 +833,7 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             continue
 
         # Deterministic fallback -> consult the assisted-translation idiom registry.
-        sugg = suggest_assisted_dax(formula, resolve, calc_lookup=calc_lookup)
+        sugg = suggest_assisted_dax(formula, _rc(calc), calc_lookup=calc_lookup)
         # A measure always lands in the shared _Measures table, so an approval's optional target
         # table (the additive dict form) is not applicable here -- only its DAX is consumed.
         approved_dax, _approved_tbl = _approved_entry(approved_lower.get(name.lower()))
@@ -1515,9 +1623,57 @@ def _related_date_dax(date_table, column):
 _DTYPE_TO_TMDL = {"text": "string", "number": "decimal", "date": "dateTime", "bool": "boolean"}
 
 
+def _build_column_refs(calcs, rc, known_tables, *, consumed_lower=None):
+    """Fix-point map ``{ref_key: (home_table, caption, tmdl_type)}`` of the deterministically
+    translatable, single-home, typed calc COLUMNS among ``calcs``.
+
+    The column-mode peer of the measures' ``measure_refs`` cascade. A dimension calc that references
+    ANOTHER dimension calc column stubs on a single pass with ``unresolved_reference`` -- the sibling
+    is being CREATED and so is absent from the datasource-metadata resolver. Pre-scan the
+    deterministically-translatable calcs to a fix-point, recording each single-home translation so a
+    later calc can resolve a bare ``[Sibling Calc]`` to ``'Home'[Sibling Calc]`` with its real type.
+
+    ``rc`` is a per-calc resolver selector (``calc -> resolver``) for island scoping; pass
+    ``lambda _c: resolve`` for the un-scoped case. Each recorded calc is dual-keyed by its caption
+    (stripped/lowered) AND its internal ``Calculation_*`` token, so a sibling that references it by
+    either form resolves -- the stored ``column_name`` stays the CAPTION so the emitted
+    ``'Table'[Caption]`` reference targets the real calculated column regardless of which key
+    resolved it. ONLY a deterministic, single-home, typed translation is recorded, so a chain that
+    cannot be faithfully resolved stays a stub (fail-closed). Empty when no calc references a sibling
+    -> a caller's main loop is byte-identical to a single pass.
+
+    Factored out of ``_calc_columns_part`` so the row-level reroute pre-router
+    (``_reroute_row_level_measure_calcs``) shares the EXACT same sibling-resolution semantics.
+    """
+    consumed_lower = consumed_lower or set()
+    column_refs = {}
+    pending = [c for c in (calcs or [])
+               if (c.get("name") or "").lower() not in consumed_lower]
+    changed = True
+    while changed and pending:
+        changed = False
+        still = []
+        for calc in pending:
+            cname = calc["name"]
+            cdax, _cr, ctabs, cdt = translate_tableau_calc_to_column_dax_typed(
+                calc.get("formula", ""), rc(calc), known_tables=known_tables,
+                column_refs=column_refs)
+            if cdax and len(ctabs) == 1 and cdt:
+                entry = (next(iter(ctabs)), cname, _DTYPE_TO_TMDL.get(cdt, "string"))
+                column_refs[cname.strip().lower()] = entry
+                tid = calc.get("internal_name")
+                if tid:
+                    column_refs[str(tid).strip().lower()] = entry
+                changed = True
+            else:
+                still.append(calc)
+        pending = still
+    return column_refs
+
+
 def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
                        date_table=None, active_date_cols=None, consumed=None,
-                       approved_calc_dax=None, known_tables=None):
+                       approved_calc_dax=None, known_tables=None, resolve_for=None):
     """Translate row-level (dimension) ``dim_calcs`` via column mode and group the rendered
     calculated-column TMDL by target table, plus a per-column report.
 
@@ -1589,47 +1745,22 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
     consumed_lower = {(c or "").lower() for c in (consumed or set())}
     approved_lower = {(k or "").lower(): v for k, v in (approved_calc_dax or {}).items()}
     active_date_cols = active_date_cols or set()
+    # Per-calc resolver selection (island scoping) -- the column-mode peer of ``_measures_part._rc``.
+    # ``resolve_for`` (optional) maps a calc's home datasource caption -> a resolver scoped to that
+    # island's tables (only meaningful for a consolidated multi-datasource workbook). Default None,
+    # an untagged calc, or a None scoped resolver -> the global ``resolve`` -> byte-identical output.
+    def _rc(calc):
+        if resolve_for is not None:
+            rr = resolve_for((calc or {}).get("datasource"))
+            if rr is not None:
+                return rr
+        return resolve
     # Sibling calc-column cascade (the column-mode peer of the measures' ``measure_refs`` fix-point in
-    # ``_measures_part``). A dimension calc that references ANOTHER dimension calc column stubs today
-    # with ``unresolved_reference`` -- the sibling is being CREATED and so is absent from the
-    # datasource-metadata ``resolve``. Pre-scan the deterministically-translatable calcs to a
-    # fix-point, recording each single-home translation as a ``column_refs`` entry
-    # {name: (home_table, column_name, tmdl_type)} so the main loop can resolve a bare
-    # ``[Sibling Calc]`` to ``'Home'[Sibling Calc]`` with its real type. ONLY a deterministic,
-    # single-home, typed translation is recorded -- a constant (no single home), date-bound, approved,
-    # or stub calc is NOT a safe reference target, so a chain that cannot be faithfully resolved stays
-    # a stub. Empty when no calc references a sibling -> the main loop is byte-identical to the prior
-    # single pass. (A sibling on another table still fails the single-table guard downstream.)
-    column_refs = {}
-    _pending = [c for c in (dim_calcs or [])
-                if (c.get("name") or "").lower() not in consumed_lower]
-    _changed = True
-    while _changed and _pending:
-        _changed = False
-        _still = []
-        for _calc in _pending:
-            _cname = _calc["name"]
-            _cdax, _cr, _ctabs, _cdt = translate_tableau_calc_to_column_dax_typed(
-                _calc.get("formula", ""), resolve, known_tables=known_tables,
-                column_refs=column_refs)
-            if _cdax and len(_ctabs) == 1 and _cdt:
-                _entry = (next(iter(_ctabs)), _cname, _DTYPE_TO_TMDL.get(_cdt, "string"))
-                column_refs[_cname.strip().lower()] = _entry
-                # Also key by the Tableau internal id token (e.g. ``Calculation_1551010115902434``)
-                # so a sibling that references this calc by its raw ``[Calculation_*]`` token -- the
-                # common form for auto-named calcs in real workbooks -- resolves too. This mirrors the
-                # measures' ``measure_refs`` cascade, which already keys by caption AND internal_name
-                # (see ``_measures_part``). The stored ``column_name`` stays the CAPTION, so the emitted
-                # ``'Table'[Caption]`` reference targets the real calculated column regardless of which
-                # key resolved it. Fail-closed is unchanged: only a faithful single-home typed calc is
-                # recorded, so a token pointing at an untranslatable sibling still stubs.
-                _tid = _calc.get("internal_name")
-                if _tid:
-                    column_refs[str(_tid).strip().lower()] = _entry
-                _changed = True
-            else:
-                _still.append(_calc)
-        _pending = _still
+    # ``_measures_part``): resolve a bare ``[Sibling Calc]`` to ``'Home'[Sibling Calc]`` by pre-scanning
+    # the deterministically-translatable dim calcs to a fix-point. Factored into the shared
+    # ``_build_column_refs`` so the row-level reroute pre-router uses the EXACT same semantics. Empty
+    # when no calc references a sibling -> the main loop is byte-identical to the prior single pass.
+    column_refs = _build_column_refs(dim_calcs, _rc, known_tables, consumed_lower=consumed_lower)
     for calc in dim_calcs or []:
         name, formula = calc["name"], calc.get("formula", "")
         if name.lower() in consumed_lower:
@@ -1655,7 +1786,7 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
             match = date_attribute_binding(formula)
             if match:
                 field_caption, date_column = match
-                resolved = resolve(field_caption)
+                resolved = _rc(calc)(field_caption)
                 if resolved and (resolved[0], resolved[1]) in active_date_cols:
                     bound_attr = (resolved[0], date_column)
         if bound_attr is not None:
@@ -1670,7 +1801,7 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
             })
             continue
         dax, reason, tables_used = translate_tableau_calc_to_column_dax(
-            formula, resolve, column_refs=column_refs)
+            formula, _rc(calc), column_refs=column_refs)
         if dax and len(tables_used) == 1:
             target = next(iter(tables_used))
         elif len(tables_used) == 1:          # untranslatable but single known home
@@ -2078,6 +2209,24 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
 
     resolve = build_m_field_resolver(descriptor)
 
+    # Island-scoped resolver factory (multi-datasource workbook consolidation). In a CONSOLIDATED
+    # workbook the same field caption can map to DIFFERENT physical tables across datasource islands,
+    # so the pooled ``resolve`` returns None for a caption that is unambiguous only WITHIN its own
+    # island. ``_raw_scoped_resolver(ds)`` (memoized) restricts resolution to the island whose
+    # datasource caption is ``ds`` -- and, per ``build_m_field_resolver``, still falls back to the
+    # full table set on a scoped miss, so a scoped resolver is a strict SUPERSET of ``resolve``: it
+    # can only disambiguate a cross-island collision, never regress a caption that already resolved.
+    # ``ds`` None -> None -> callers use the pooled ``resolve``; a single/un-combined descriptor has
+    # no ``source_datasource`` relations, so the scope collapses to None and the result is the exact
+    # full-descriptor behavior (byte-for-byte unchanged).
+    _scoped_cache = {}
+    def _raw_scoped_resolver(ds):
+        if not ds:
+            return None
+        if ds not in _scoped_cache:
+            _scoped_cache[ds] = build_m_field_resolver(descriptor, datasource=ds)
+        return _scoped_cache[ds]
+
     # Build the shared Date dimension FIRST: its active-relationship map lets a date-attribute
     # dimension calc (e.g. YEAR([Order Date])) bind to a Date-table column via RELATED instead of
     # recomputing it inline (see _calc_columns_part). It is emitted before _Measures so the final
@@ -2170,7 +2319,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     calcs, dim_calcs, _rerouted_row_level = _reroute_row_level_measure_calcs(
         calcs, dim_calcs, resolve, known_tables=set(table_names),
         param_resolver=param_resolver,
-        skip_names=(set(consumed) | flag_source_names | _measure_landed))
+        skip_names=(set(consumed) | flag_source_names | _measure_landed),
+        resolve_for=_raw_scoped_resolver)
 
     # Row-level (dimension) calcs become DAX calculated columns via column mode, injected onto
     # their resolved home table (constants / honest stubs default to the first data table). This
@@ -2182,6 +2332,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         dim_calcs, resolve, anchor_table=table_names[0],
         date_table=date_name, active_date_cols=active_date_cols,
         approved_calc_dax=approved_calc_dax, known_tables=set(table_names),
+        resolve_for=_raw_scoped_resolver,
         consumed=(set(consumed) | flag_source_names) if flag_source_names else consumed)
     for disp, block in calc_columns_by_table.items():
         path = f"definition/tables/{disp}.tmdl"
@@ -2208,6 +2359,44 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                 return hit
             return _refs.get((name or "").strip().lower())
 
+    # Parallel island-scoped resolver for the MEASURE side: wrap each island's raw scoped resolver
+    # with the SAME calc-column layering applied to ``measure_resolve`` above, so a scoped measure can
+    # also bind a calc column. ``ds`` None / no scoped resolver -> None -> ``_measures_part`` uses the
+    # pooled ``measure_resolve``. Inert (all-None) for a single/un-combined descriptor, so its output
+    # is byte-for-byte unchanged.
+    def _measure_scoped_resolver(ds, _refs=calc_col_refs):
+        rr = _raw_scoped_resolver(ds)
+        if rr is None:
+            return None
+        if not _refs:
+            return rr
+        def _mr(name, _base=rr, _r=_refs):
+            hit = _base(name)
+            if hit is not None:
+                return hit
+            return _r.get((name or "").strip().lower())
+        return _mr
+
+    # Build the inline-calc map (Stage 2): every dimension calc's formula, keyed by BOTH its caption
+    # and internal id (lowercased). A MEASURE that references a dim calc which the column path left a
+    # STUB -- most importantly a parameter-driven date-window boolean consumed inside a COUNTD(IF ...)
+    # -- can then inline that body row-level (see calc_to_dax._try_inline_calc). Keying ALL dim_calcs
+    # is safe: a translated dim-calc's REAL column always resolves first (via ``measure_resolve``, which
+    # layers ``calc_col_refs`` under ``resolve``), so the inline hook is reached only for a dim calc with
+    # no emitted column; and the hook self-rejects any non-boolean / partially-consumed / cross-table /
+    # cyclic body. Inert (byte-identical) when there are no dim_calcs.
+    inline_calcs = {}
+    for _dc in (dim_calcs or []):
+        _dcf = _dc.get("formula") or ""
+        if not _dcf:
+            continue
+        _dcn = (_dc.get("name") or "").strip().lower()
+        if _dcn:
+            inline_calcs[_dcn] = _dcf
+        _dct = str(_dc.get("internal_name") or "").strip().lower()
+        if _dct:
+            inline_calcs[_dct] = _dcf
+
     # Measure-role calcs become DAX measures. A measure-swap consumed as a field parameter is
     # skipped (consumed); a value/what-if `[Parameters].[X]` scalar reference is inlined via
     # param_resolver. A row-level `[Parameters].[X]` (filter parameter) has no faithful measure form
@@ -2227,7 +2416,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         # fact's own date column (Orders[Order_Date]) -- same table as the partition -> valid DAX. The
         # _date_axis_order_resolver builder is retained for a future relation-supplying re-enable.
         order_resolver=None,
-        flag_measures=flag_measures)
+        resolve_for=_measure_scoped_resolver,
+        flag_measures=flag_measures, inline_calcs=inline_calcs)
     parts["definition/tables/_Measures.tmdl"] = measures_table
     table_names.append("_Measures")
 
@@ -3018,7 +3208,7 @@ _ROW_LEVEL_IN_MEASURE_REASON = "bare row-level field [..] not valid in a measure
 
 
 def _reroute_row_level_measure_calcs(measure_calcs, dim_calcs, resolve, *, known_tables,
-                                     param_resolver=None, skip_names=None):
+                                     param_resolver=None, skip_names=None, resolve_for=None):
     """Move measure-path calcs that are actually ROW-LEVEL onto the calculated-column path.
 
     Tableau assigns a calc's role by its OUTPUT type, so a purely row-level numeric calc -- e.g.
@@ -3035,34 +3225,67 @@ def _reroute_row_level_measure_calcs(measure_calcs, dim_calcs, resolve, *, known
         the ``measure_refs`` cascade -- any measure that referenced it already stubbed and still does
         (no phantom, no regression).
 
-    The change is therefore strictly additive: each moved calc goes stub -> faithful calculated
-    column. Returns ``(new_measure_calcs, new_dim_calcs, rerouted_names)``; with nothing to move the
-    input lists are returned unchanged. ``skip_names`` (case-insensitive) pins a calc to the measure
-    path regardless -- used for names already consumed as field parameters, flag sources, or given a
-    designated measure landing by the ``approved_calc_dax`` (human-approved / second-compiler) tier.
+    **Cascade-aware fix-point.** A row-level calc frequently references a *sibling* calc -- a
+    boolean dimension flag (``IF [Is CY] THEN [Qty] END``) or two other row-level measure calcs
+    (a difference ``[CYQ] - [PYQ]``). The column probe must therefore see the SAME sibling
+    ``column_refs`` the ``_calc_columns_part`` builder assembles, and it must ITERATE: a difference
+    calc only becomes column-translatable AFTER its two operands have themselves been moved onto the
+    column path. So each round rebuilds ``column_refs`` over the *current* dim calcs (originals plus
+    everything moved so far) and re-probes the still-measure calcs; a round that moves nothing ends
+    the loop. Without both the shared ``column_refs`` and the outer loop the whole downstream cascade
+    stays blocked (the historical bug: the probe passed no ``column_refs`` at all).
+
+    The change is strictly additive: each moved calc goes stub -> faithful calculated column. Returns
+    ``(new_measure_calcs, new_dim_calcs, rerouted_names)``; with nothing to move the input lists are
+    returned unchanged (identity-preserving fast path). ``skip_names`` (case-insensitive) pins a calc
+    to the measure path regardless -- used for names already consumed as field parameters, flag
+    sources, or given a designated measure landing by the ``approved_calc_dax`` (human-approved /
+    second-compiler) tier. ``resolve_for`` (optional ``calc -> resolver | None``) supplies a
+    per-calc island-scoped resolver for a multi-datasource workbook; when ``None`` every calc uses the
+    single global ``resolve`` (byte-identical to the pre-cascade behaviour).
     """
     skip_lower = {(s or "").strip().lower() for s in (skip_names or set())}
     kt = set(known_tables or ())
-    keep, moved, moved_names = [], [], []
-    for c in measure_calcs or []:
-        name = c.get("name") or ""
-        formula = c.get("formula", "") or ""
-        if not formula or name.strip().lower() in skip_lower:
-            keep.append(c)
-            continue
-        mdax, mreason, _ = translate_tableau_calc_to_dax(
-            formula, resolve, param_resolver=param_resolver, known_tables=kt)
-        if mdax is None and mreason == _ROW_LEVEL_IN_MEASURE_REASON:
-            cdax, _creason, _ctables = translate_tableau_calc_to_column_dax(
-                formula, resolve, known_tables=kt)
-            if cdax is not None:
-                moved.append(c)
-                moved_names.append(name)
+
+    def _rc(calc):
+        if resolve_for is not None:
+            rr = resolve_for((calc or {}).get("datasource"))
+            if rr is not None:
+                return rr
+        return resolve
+
+    keep = list(measure_calcs or [])
+    cur_dims = list(dim_calcs or [])
+    moved_names = []
+    changed = True
+    while changed:
+        changed = False
+        # Rebuild the sibling map over the CURRENT dim calcs each round: a calc moved in an earlier
+        # round becomes a resolvable reference target for a later one (the fix-point that unlocks a
+        # difference-of-calcs cascade). Shares ``_build_column_refs`` with ``_calc_columns_part``.
+        col_refs = _build_column_refs(cur_dims, _rc, kt)
+        still = []
+        for c in keep:
+            name = c.get("name") or ""
+            formula = c.get("formula", "") or ""
+            if not formula or name.strip().lower() in skip_lower:
+                still.append(c)
                 continue
-        keep.append(c)
-    if not moved:
+            mdax, mreason, _ = translate_tableau_calc_to_dax(
+                formula, _rc(c), param_resolver=param_resolver, known_tables=kt)
+            if mdax is None and mreason == _ROW_LEVEL_IN_MEASURE_REASON:
+                cdax, _creason, _ctables = translate_tableau_calc_to_column_dax(
+                    formula, _rc(c), known_tables=kt, column_refs=col_refs)
+                if cdax is not None:
+                    cur_dims.append(c)
+                    moved_names.append(name)
+                    changed = True
+                    continue
+            still.append(c)
+        keep = still
+    if not moved_names:
         return measure_calcs, dim_calcs, []
-    return keep, list(dim_calcs or []) + moved, moved_names
+    return keep, cur_dims, moved_names
 
 
 def _extract_local_csv(source, model_name, write_to):

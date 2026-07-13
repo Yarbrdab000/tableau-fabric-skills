@@ -20,7 +20,13 @@ from assemble_model import (
     _is_stock_row_count_calc,
     _approved_dtype,
     _win_long_path,
+    _reroute_row_level_measure_calcs,
+    _build_column_refs,
+    _calc_field_tokens,
+    _best_scoped_resolver,
+    _ROW_LEVEL_IN_MEASURE_REASON,
 )
+from calc_to_dax import translate_tableau_calc_to_dax
 from connection_to_m import parse_tds, combine_descriptors
 from workbook_table_calcs import TableCalcUsage, Pill
 from test_connection_to_m import (
@@ -137,6 +143,239 @@ def test_row_level_measure_role_calc_with_approved_dax_stays_a_measure():
     assert measures["Margin"]["status"] == "assisted-approved"
     assert measures["Margin"]["dax"] == "SUMX('Orders', 'Orders'[Sales] * 2)"
     assert "Margin" not in columns  # NOT rerouted
+
+
+# -- Fix B: cascade-aware reroute fix-point ----------------------------------
+def _phys_resolver(cols):
+    """A physical-column resolver: name (case-insensitive) -> (table, column, tmdl_type)."""
+    idx = {k.strip().lower(): v for k, v in cols.items()}
+
+    def r(name):
+        return idx.get((name or "").strip().lower())
+    return r
+
+
+def test_build_column_refs_cascades_a_two_level_dim_chain():
+    # The shared cascade builder factored out of _calc_columns_part: a dim calc that references
+    # ANOTHER dim calc resolves only after the sibling is itself recorded (fix-point). L1 is a bool
+    # over a physical column; L2 references L1 by caption; both must land as single-home typed refs.
+    resolve = _phys_resolver({"Region": ("F", "Region", "string"), "Qty": ("F", "Qty", "int64")})
+    dims = [
+        {"name": "Is West", "formula": '[Region] = "West"'},          # L1 (bool)
+        {"name": "West Qty", "formula": "IF [Is West] THEN [Qty] END"},  # L2 -> refs L1
+    ]
+    refs = _build_column_refs(dims, lambda _c: resolve, {"F"})
+    assert "is west" in refs and refs["is west"][0] == "F"
+    assert "west qty" in refs and refs["west qty"][0] == "F"   # only resolvable AFTER L1 recorded
+
+    # An untranslatable sibling is NOT a reference target (fail-closed) -- no faithful DAX form.
+    bad = [{"name": "Bad", "formula": 'REGEXP_MATCH([Region], "^A")'}]
+    assert _build_column_refs(bad, lambda _c: resolve, {"F"}) == {}
+
+
+def test_reroute_moves_row_level_measure_that_references_a_sibling_dim_calc():
+    # THE CORE FIX B CASE. A measure-role calc that is genuinely ROW-LEVEL but references a
+    # translatable sibling DIM calc must reroute onto the column path -- which requires the column
+    # probe to see column_refs built over the dim calcs. (Before the fix the probe passed no
+    # column_refs, so the sibling was unresolved, column mode failed, and the calc stayed a stub.)
+    resolve = _phys_resolver({"Region": ("F", "Region", "string"), "Qty": ("F", "Qty", "int64")})
+    dims = [{"name": "Is West", "formula": '[Region] = "West"'}]           # translatable sibling
+    measures = [{"name": "West Qty", "formula": "IF [Is West] THEN [Qty] END"}]  # row-level measure
+    keep, new_dims, moved = _reroute_row_level_measure_calcs(
+        measures, dims, resolve, known_tables={"F"})
+    assert moved == ["West Qty"]
+    assert not keep
+    assert {c["name"] for c in new_dims} == {"Is West", "West Qty"}
+
+
+def test_reroute_cascades_a_diff_of_two_calcs_via_fixpoint():
+    # THE 2-LEVEL CASCADE (the reason the reroute must ITERATE to a fix-point). A difference calc
+    # [CYQ] - [PYQ] references two OTHER row-level measure calcs. It can only reroute AFTER its two
+    # operands have themselves been moved onto the column path -- so round 1 moves CYQ/PYQ, round 2
+    # rebuilds column_refs to include them and moves the diff. A single pass would leave the diff
+    # stubbed forever.
+    resolve = _phys_resolver({
+        "Region": ("F", "Region", "string"),
+        "Qty": ("F", "Qty", "int64"),
+        "Sales": ("F", "Sales", "decimal"),
+    })
+    dims = [{"name": "Is CY", "formula": '[Region] = "West"'}]
+    measures = [
+        {"name": "CYQ", "formula": "IF [Is CY] THEN [Qty] END"},     # round 1 (refs dim Is CY)
+        {"name": "PYQ", "formula": "IF [Is CY] THEN [Sales] END"},   # round 1
+        {"name": "Diff", "formula": "[CYQ] - [PYQ]"},                # round 2 (refs CYQ + PYQ)
+    ]
+    keep, new_dims, moved = _reroute_row_level_measure_calcs(
+        measures, dims, resolve, known_tables={"F"})
+    assert set(moved) == {"CYQ", "PYQ", "Diff"}
+    assert "Diff" in moved and moved.index("Diff") > moved.index("CYQ")  # moved AFTER its operands
+    assert not keep
+    assert {c["name"] for c in new_dims} == {"Is CY", "CYQ", "PYQ", "Diff"}
+
+
+def test_reroute_fails_closed_when_sibling_is_untranslatable():
+    # A row-level measure calc whose referenced sibling has NO faithful DAX form (or is absent) must
+    # stay an honest measure stub -- the reroute only moves a calc the column translator can render.
+    resolve = _phys_resolver({"Region": ("F", "Region", "string"), "Qty": ("F", "Qty", "int64")})
+    dims = [{"name": "Bad Sib", "formula": 'REGEXP_MATCH([Region], "^A")'}]   # untranslatable
+    measures = [{"name": "Uses Bad", "formula": "IF [Bad Sib] THEN [Qty] END"}]
+    keep, new_dims, moved = _reroute_row_level_measure_calcs(
+        measures, dims, resolve, known_tables={"F"})
+    assert moved == []
+    assert keep is measures            # nothing moved -> inputs returned unchanged (byte-identical)
+    assert new_dims is dims
+
+
+def test_reroute_never_moves_a_genuine_aggregate_measure():
+    # A real aggregate measure (SUM over a physical column) translates in MEASURE mode, so it never
+    # hits the row-level reason gate and is never rerouted -- even though its operands resolve.
+    resolve = _phys_resolver({"Qty": ("F", "Qty", "int64")})
+    measures = [{"name": "Total Qty", "formula": "SUM([Qty])"}]
+    keep, new_dims, moved = _reroute_row_level_measure_calcs(
+        measures, [], resolve, known_tables={"F"})
+    assert moved == []
+    assert keep is measures            # unchanged fast path
+    assert {c["name"] for c in keep} == {"Total Qty"}
+
+
+def test_reroute_row_level_measure_cascade_end_to_end():
+    # End-to-end through migrate_tds_to_semantic_model: a dimension calc L1 + two measure-role but
+    # genuinely ROW-LEVEL calcs (L2 references L1; L3 differences two L2-siblings) all land as
+    # faithful, translated calculated COLUMNS on the fact table -- the whole cascade unlocked by the
+    # fix-point. (LIVE_SQLSERVER's Orders carries Sales(real) + Quantity(integer).)
+    dim_calcs = [{"name": "Big Order", "formula": "[Quantity] > 5"}]        # L1 (dimension, bool)
+    calcs = [
+        {"name": "Big Qty", "formula": "IF [Big Order] THEN [Quantity] END"},  # L2 -> refs L1
+        {"name": "Small Qty", "formula": "IF [Big Order] THEN [Sales] END"},   # L2 -> refs L1
+        {"name": "Qty Gap", "formula": "[Big Qty] - [Small Qty]"},             # L3 -> refs 2x L2
+    ]
+    out = migrate_tds_to_semantic_model(
+        LIVE_SQLSERVER, model_name="Superstore", calcs=calcs, dim_calcs=dim_calcs)
+    measures = {r["measure"] for r in out["report"]["measures"]}
+    columns = {r["column"]: r for r in out["report"]["calc_columns"]}
+
+    # none of the row-level calcs remained a measure
+    assert not ({"Big Qty", "Small Qty", "Qty Gap"} & measures)
+    # all three cascaded onto the column path as translated columns on Orders
+    for name in ("Big Qty", "Small Qty", "Qty Gap"):
+        assert columns[name]["status"] == "translated", name
+        assert columns[name]["table"] == "Orders", name
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "column 'Qty Gap' =" in orders
+    assert "'Orders'[Big Qty] - 'Orders'[Small Qty]" in orders   # the diff resolved via the cascade
+
+
+# ---------------------------------------------------------------------------
+# FIX 1 -- smart island-scope selection (fail-closed doc-order-tag correction)
+# ---------------------------------------------------------------------------
+
+def test_calc_field_tokens_extracts_bracketed_fields():
+    assert _calc_field_tokens("COUNTD(IF [Flag] THEN [Id (Contact)] END)") == {"Flag", "Id (Contact)"}
+    assert _calc_field_tokens("{FIXED [Contact ID],[Program Name] : MAX([Total Score])}") == {
+        "Contact ID", "Program Name", "Total Score"}
+    # calc-ref + parameter tokens are captured (they are neutral -- resolve to None everywhere)
+    assert _calc_field_tokens("[Calculation_1] + [Parameters].[Sel]") == {
+        "Calculation_1", "Parameters", "Sel"}
+    assert _calc_field_tokens("") == set()
+    assert _calc_field_tokens(None) == set()
+    assert _calc_field_tokens("SUM([Sales]) - LAST()") == {"Sales"}   # LAST() has no bracket
+
+
+def _fake_resolver(mapping):
+    """caption -> resolver returning (table, col, type) for known captions, else None."""
+    def _r(name):
+        return mapping.get((name or "").strip())
+    return _r
+
+
+def test_best_scoped_resolver_promotes_when_exactly_one_island_resolves_the_gap():
+    # Tagged island (SD) leaves [Id (Contact)] unresolved; Intake resolves it -> promote to Intake.
+    sd = _fake_resolver({"Flag": ("SDFlag", "F", "boolean")})               # no Id (Contact)
+    intake = _fake_resolver({"Flag": ("IntakeFlag", "F", "boolean"),
+                             "Id (Contact)": ("Contact", "Id", "int64")})
+    base = _fake_resolver({})   # pooled: ambiguous -> None for both
+    resolve_for = {"SD": sd, "Intake": intake}.get
+    chosen = _best_scoped_resolver(
+        "COUNTD(IF [Flag] THEN [Id (Contact)] END)", "SD", resolve_for, {"SD", "Intake"}, base)
+    assert chosen is intake
+    assert chosen("Id (Contact)") == ("Contact", "Id", "int64")
+
+
+def test_best_scoped_resolver_keeps_tag_when_it_fully_resolves():
+    # The tag already resolves every field -> UNCHANGED (byte-identical for translating calcs),
+    # even though another island would ALSO resolve them (no promotion when there is no gap).
+    sd = _fake_resolver({"Flag": ("SDFlag", "F", "boolean"),
+                         "Id (Contact)": ("SDContact", "Id", "int64")})
+    intake = _fake_resolver({"Flag": ("IntakeFlag", "F", "boolean"),
+                             "Id (Contact)": ("Contact", "Id", "int64")})
+    resolve_for = {"SD": sd, "Intake": intake}.get
+    chosen = _best_scoped_resolver(
+        "COUNTD(IF [Flag] THEN [Id (Contact)] END)", "SD", resolve_for, {"SD", "Intake"},
+        _fake_resolver({}))
+    assert chosen is sd
+
+
+def test_best_scoped_resolver_fails_closed_when_two_islands_tie():
+    # Two islands each resolve the missing field equally well -> ambiguous -> keep the tag.
+    sd = _fake_resolver({})                                                  # tag resolves nothing
+    intake = _fake_resolver({"Id (Contact)": ("Contact", "Id", "int64")})
+    enroll = _fake_resolver({"Id (Contact)": ("Enroll", "Id", "int64")})
+    resolve_for = {"SD": sd, "Intake": intake, "Enroll": enroll}.get
+    chosen = _best_scoped_resolver(
+        "COUNTD([Id (Contact)])", "SD", resolve_for, {"SD", "Intake", "Enroll"}, sd)
+    assert chosen is sd   # >1 improving island -> fail closed
+
+
+def test_best_scoped_resolver_keeps_tag_when_no_island_improves():
+    sd = _fake_resolver({})
+    intake = _fake_resolver({})   # nobody resolves the field
+    resolve_for = {"SD": sd, "Intake": intake}.get
+    chosen = _best_scoped_resolver("COUNTD([Nowhere])", "SD", resolve_for, {"SD", "Intake"}, sd)
+    assert chosen is sd
+
+
+def test_best_scoped_resolver_inert_without_resolve_for():
+    # Single/standalone datasource (resolve_for=None) -> always the base resolver (byte-identical).
+    base = _fake_resolver({"Sales": ("Orders", "Sales", "double")})
+    chosen = _best_scoped_resolver("SUM([Sales])", "SD", None, {"SD"}, base)
+    assert chosen is base
+
+
+def test_best_scoped_resolver_promotes_from_base_when_tag_has_no_scoped_resolver():
+    # A calc whose datasource tag has no scoped resolver falls back to base; if exactly one island
+    # resolves its otherwise-unresolved field, promote to that island (still fail-closed).
+    base = _fake_resolver({})                                               # pooled: None
+    intake = _fake_resolver({"Amount": ("Intake", "Amount", "double")})
+    resolve_for = {"Intake": intake}.get                                    # "SD" -> None
+    chosen = _best_scoped_resolver("SUM([Amount])", "SD", resolve_for, {"SD", "Intake"}, base)
+    assert chosen is intake
+
+
+def test_measures_part_promotes_mistagged_calc_to_resolving_island_end_to_end():
+    # Integration through _measures_part: a measure tagged to the WRONG island (SD, where [Amount]
+    # is unresolved) is retagged at resolve-time to Intake (where it resolves) and TRANSLATES,
+    # instead of stubbing -- proving FIX 1 flips a doc-order-mis-tag stub into a real measure.
+    from assemble_model import _measures_part
+    sd = _fake_resolver({})                                                  # SD: [Amount] -> None
+    intake = _fake_resolver({"Amount": ("Contact", "Amount", "double")})     # Intake resolves it
+    resolve_for = {"SD": sd, "Intake": intake}.get
+    calcs = [{"name": "Total Amount", "formula": "SUM([Amount])", "datasource": "SD"},
+             {"name": "_probe", "formula": "SUM([Amount])", "datasource": "Intake"}]  # seeds island set
+    _, report, _ = _measures_part(calcs, sd, resolve_for=resolve_for, known_tables={"Contact"})
+    rows = {r["measure"]: r for r in report}
+    assert rows["Total Amount"]["status"] == "translated"
+    assert "SUM('Contact'[Amount])" in rows["Total Amount"]["dax"]
+
+
+def test_measures_part_mistag_stubs_without_the_fix_when_only_pooled_resolver():
+    # Control: the SAME mis-tagged calc, with NO resolve_for (pooled resolver only), stays a stub --
+    # confirming the promotion (not some incidental resolution) is what translates it above.
+    from assemble_model import _measures_part
+    base = _fake_resolver({})     # pooled cannot resolve [Amount]
+    calcs = [{"name": "Total Amount", "formula": "SUM([Amount])", "datasource": "SD"}]
+    _, report, _ = _measures_part(calcs, base, resolve_for=None, known_tables={"Contact"})
+    rows = {r["measure"]: r for r in report}
+    assert rows["Total Amount"]["status"] != "translated"
 
 
 def test_measure_report_carries_source_identity_for_viz_binding():
@@ -904,17 +1143,32 @@ def test_measure_aggregation_over_numeric_calc_column_resolves_end_to_end():
     assert meas["Total Double"]["dax"] == "SUM('Orders'[Double Qty])"
 
 
-def test_measure_bare_reference_to_calc_column_stays_stub_end_to_end():
-    # Fail-closed is preserved: making the calc column VISIBLE to the measure resolver does NOT make a
-    # BARE row-level reference to it a valid measure -- a measure must aggregate, so ``[Order Bucket]``
-    # alone still stubs with the same measure-context reason (only an aggregation arg or an LOD grain
-    # over the column becomes valid). No phantom DAX is emitted.
+def test_measure_bare_reference_to_calc_column_reroutes_to_faithful_column_end_to_end():
+    # v1.41.0 (Fix B) CONSISTENCY: a bare row-level reference ``[Order Bucket]`` in a measure-role calc
+    # is genuinely ROW-LEVEL, so -- exactly like a DIRECT row-level measure calc such as
+    # ``UPPER([Order ID])`` already does -- it reroutes onto the faithful calculated-COLUMN path (both
+    # stub in measure mode with the same ``bare row-level field not valid in a measure`` reason; the
+    # cascade-aware reroute resolves the sibling ``[Order Bucket]`` via ``column_refs`` and moves it).
+    # The DEEPER invariant is preserved and asserted below: measure mode ITSELF never emits phantom
+    # measure DAX for a bare row-level ref -- the reroute is what carries it to a column, not a
+    # measure-resolver trick. Pre-Fix-B this calc stayed a stub ONLY because the reroute probe lacked
+    # ``column_refs`` to see the sibling; that was an artifact, not a faithfulness boundary.
     out = _model_with_calc_cols_and_measures(
         dim_calcs=[{"name": "Order Bucket", "formula": "UPPER([Order ID])"}],
         calcs=[{"name": "Bare Ref", "formula": "[Order Bucket]"}])
-    meas = {r["measure"]: r for r in out["report"]["measures"]}
-    assert meas["Bare Ref"]["status"] == "stub"
-    assert meas["Bare Ref"]["dax"] is None
+    meas = {r["measure"] for r in out["report"]["measures"]}
+    cols = {r["column"]: r for r in out["report"]["calc_columns"]}
+    # no phantom measure was emitted -- the calc left the measure path entirely
+    assert "Bare Ref" not in meas
+    # it landed as a faithful, translated calc column (identical row-level value)
+    assert cols["Bare Ref"]["status"] == "translated"
+    assert cols["Bare Ref"]["table"] == "Orders"
+    # fail-closed guard still holds at the source: measure mode alone stubs the bare row-level ref
+    # (the augmented resolver never turns a bare calc-column ref into valid measure DAX)
+    mdax, mreason, _ = translate_tableau_calc_to_dax(
+        "[Order Bucket]", _phys_resolver({"Order Bucket": ("Orders", "Order Bucket", "string")}),
+        known_tables={"Orders"})
+    assert mdax is None and mreason == _ROW_LEVEL_IN_MEASURE_REASON
 
 
 # --- v1.37.0: Tableau's stock "Number of Records" -> a Sum-aggregated column of 1s ----------------
@@ -2019,4 +2273,89 @@ def test_approved_dtype_helper_normalises_vocabulary():
     assert _approved_dtype({"dax": "x"}) is None
     assert _approved_dtype({"dax": "x", "dtype": "  "}) is None
     assert _approved_dtype("CALCULATE(SUM('Orders'[Sales]))") is None
+
+
+# -- Stage-2 inline_calcs: a parameter-driven date-window boolean DIM calc is inlined into its
+#    consuming COUNTD-IF MEASURE so the measure translates end-to-end through assemble_import_model.
+#    A row-level column can't read a slicer selection, so the date-window calc STUBS on its own; but
+#    the consuming measure CAN read the slicer, and the orchestrator threads the dim-calc body +
+#    the date params' resolver into the measure entry point, which inlines the body into the filter.
+_CASES_TDS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Cases' inline='true' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='srv' name='sqlserver.0a1b2c'>
+        <connection authentication='sqlserver' class='sqlserver' dbname='Cases'
+                    server='myserver.database.windows.net' username='svc' />
+      </named-connection>
+    </named-connections>
+    <relation connection='sqlserver.0a1b2c' name='Cases' table='[dbo].[Cases]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Case Id</remote-name><local-name>[Case Id]</local-name>
+        <parent-name>[Cases]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Intake Created Date</remote-name><local-name>[Intake Created Date]</local-name>
+        <parent-name>[Cases]</parent-name><local-type>date</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Region</remote-name><local-name>[Region]</local-name>
+        <parent-name>[Cases]</parent-name><local-type>string</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+
+def _date_param_e2e(caption, internal, default):
+    return {"caption": caption, "internal_name": internal, "datatype": "date", "domain": "range",
+            "default": default, "format": None, "range": None, "members": [], "aliases": {}}
+
+
+_CASES_DATE_PARAMS = [_date_param_e2e("Start Date", "[Parameter 5]", "#2020-01-01#"),
+                      _date_param_e2e("End Date", "[Parameter 6]", "#2020-12-31#")]
+_CASES_DIM_CALCS = [{"name": "Date Filter Case", "internal_name": "Calculation_dw",
+                     "formula": "[Intake Created Date] >= [Parameters].[Start Date] AND "
+                                "[Intake Created Date] <= [Parameters].[End Date]"}]
+_CASES_CONSUMER = [{"name": "Open Cases in Range",
+                    "formula": "COUNTD(IF [Date Filter Case] THEN [Case Id] END)"}]
+_CASES_INLINED_DAX = (
+    "COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK('Cases'[Case_Id]), "
+    "FILTER('Cases', ('Cases'[Intake_Created_Date] >= [Start Date Value] && "
+    "'Cases'[Intake_Created_Date] <= [End Date Value]))), 0)")
+
+
+def test_stage2_inline_date_window_measure_translates_end_to_end():
+    # The headline: assemble_import_model threads the stubbed date-window dim calc into the COUNTD-IF
+    # measure entry point, which inlines it + resolves the date params (Option D) to the value
+    # measures, so the measure comes back translated with the exact faithful COALESCE/FILTER DAX.
+    out = assemble_import_model(
+        parse_tds(_CASES_TDS), model_name="Cases",
+        calcs=_CASES_CONSUMER, dim_calcs=_CASES_DIM_CALCS, parameters=_CASES_DATE_PARAMS)
+    row = {r["measure"]: r for r in out["report"]["measures"]}["Open Cases in Range"]
+    assert row["status"] == "translated"
+    assert row["reason"] == "ok"
+    assert row["dax"] == _CASES_INLINED_DAX
+    # and the exact measure line lands byte-identically in _Measures.tmdl
+    meas = out["parts"]["definition/tables/_Measures.tmdl"]
+    assert ("measure 'Open Cases in Range' = " + _CASES_INLINED_DAX) in meas
+    # the date params modelled a disconnected value table + [<Param> Value] SELECTEDVALUE measure
+    assert "definition/tables/Start Date.tmdl" in out["parts"]
+    assert "definition/tables/End Date.tmdl" in out["parts"]
+
+
+def test_stage2_inline_without_dim_calc_measure_stays_stub():
+    # The forcing function: the SAME model + measure + date params but WITHOUT the date-window dim
+    # calc gives the inliner no body to splice, so the consumer stays an honest fail-closed stub --
+    # proving it is the Stage-2 inline (not some other path) that flips the measure to translated.
+    out = assemble_import_model(
+        parse_tds(_CASES_TDS), model_name="Cases",
+        calcs=_CASES_CONSUMER, parameters=_CASES_DATE_PARAMS)
+    row = {r["measure"]: r for r in out["report"]["measures"]}["Open Cases in Range"]
+    assert row["status"] == "stub"
+    assert row["dax"] is None
+    assert "[Date Filter Case]" in row["reason"]
+    # the faithful inlined DAX must NOT appear anywhere in the emitted measures
+    assert _CASES_INLINED_DAX not in out["parts"]["definition/tables/_Measures.tmdl"]
 
