@@ -13,6 +13,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.37.0` → `1.38.0`): Approved-keystone nested-calc cascade — author one
+  irreducible base, get the whole dependent chain deterministically.** When a nested calc→calc→calc chain
+  bottoms out at an *irreducible* base — a `WINDOW_`/`RUNNING_` table calc or other construct the
+  deterministic tier cannot render at datasource scope — the whole downstream subtree used to stub, even
+  though every dependent's own structure is faithfully translatable. Authoring **just that base** via
+  `approved_calc_dax` (the human / second-compiler tier) now seeds it into the measure-side cross-calc
+  reference map **before** the deterministic fix-point, so every dependent that stubbed *only* because that
+  base was an untranslatable measure now translates deterministically by referencing the approved measure —
+  and so do *its* dependents, to any depth. The emitted reference is an ordinary DAX measure reference,
+  exactly mirroring Tableau's own calc→calc structure. This turns "the second compiler must author the
+  entire nesting chain" into "author only the few irreducible keystones; the rest fall out for free."
+  Faithful and fail-closed: a dependent carrying **any other** unsupported construct still stubs; the
+  approved base's output type defaults to `number` (the dominant aggregate-measure case) and can be declared
+  via an additive `"dtype"` key on the dict form of an approval (`{"dax": …, "dtype": "boolean"|"text"|
+  "date"|"number"}`, with friendly synonyms folded onto the translator's canonical tokens), so a boolean
+  keystone branched on in an `IF`, or a text keystone concatenated by a dependent, cascades correctly — and
+  a mis-typed keystone can only make a dependent **stub**, never emit wrong DAX. Inert with no approvals
+  (byte-identical output). Measures-side only; the column-mode dimension chains already cascade. Report
+  schema is additive (no keys renamed or removed).
 - **tableau-migration (skill `1.36.0` → `1.37.0`): Faithful emission of Tableau's stock
   `Number of Records` field — a Sum-aggregated calculated column of 1s.** Tableau's generic 1-per-row
   row-count field (the classic `Number of Records`, or the modern `Count of <Table>`) is defined as the
