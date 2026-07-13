@@ -124,6 +124,14 @@ _AGG_MAP = {
 # Aggregations that require a NUMERIC column (emit DAX that errors on text/date otherwise).
 _NUMERIC_ONLY_AGGS = {"SUM", "AVG", "MEDIAN", "STDEV", "STDEVP", "VAR", "VARP"}
 
+# A Tableau parameter is a single scalar. Wrapping it in a value-preserving aggregate --
+# MIN/MAX/AVG/MEDIAN/SUM([Parameters].[P]) -- is a Tableau formality (a bare scalar can't sit in a
+# measure/aggregate context, so authors wrap it), and over a singleton each of these returns that
+# scalar value. Such a wrapper therefore collapses to the SAME scalar SELECTEDVALUE param measure
+# the bare position emits. COUNT/COUNTD (count of one = 1) and STDEV/VAR (spread of one = 0/blank)
+# are deliberately EXCLUDED -- they do NOT return the parameter's value, so they stay honest stubs.
+_PARAM_SCALAR_COLLAPSE_AGGS = {"SUM", "AVG", "MIN", "MAX", "MEDIAN"}
+
 # CORR / COVAR / COVARP are two-argument statistical aggregates with no native DAX function; they
 # are synthesized from the standard SUMX covariance/correlation identities (see _corr_covar).
 _CORR_COVAR_FNS = {"CORR", "COVAR", "COVARP"}
@@ -509,7 +517,7 @@ def _tokenize(formula):
 # at measure top level is therefore a parse error (-> fallback).
 class _Parser:
     def __init__(self, toks, resolver, tables_used, mode="measure", param_resolver=None,
-                 measure_refs=None, known_tables=None):
+                 measure_refs=None, known_tables=None, inline_calcs=None):
         self.toks = toks
         self.pos = 0
         self.resolver = resolver
@@ -524,11 +532,41 @@ class _Parser:
         # known_tables: the model's table display names, enabling object-id COUNT -> COUNTROWS('T')
         # with validation. Empty -> trust the hash-stripped relation token.
         self.known_tables = set(known_tables) if known_tables else set()
+        # inline_calcs: {normalized-key -> tableau-formula} of dimension calcs (keyed by BOTH caption
+        # and internal id, lowercased) that a MEASURE may reference row-level -- e.g. a stubbed
+        # parameter-driven date-window boolean dimension inside a COUNTD(IF ...). When a bare
+        # row-level reference in a measure resolves to no model column, ``_try_inline_calc`` inlines
+        # the referenced calc's body (parsed in column mode, pure-boolean, fully-consumed) so the
+        # consuming measure translates. Empty -> the prior "bare field not valid" fallback (byte-
+        # identical when no inline_calcs are supplied).
+        self.inline_calcs = inline_calcs or {}
+        # Cycle guard: the set of inline-calc keys currently being expanded up the call stack, so a
+        # calc that (transitively) references itself fails closed instead of recursing forever.
+        self._inline_stack = frozenset()
         self._lod_dim_stack = []
         # Depth counter: >0 while parsing the inner expression of an INCLUDE/EXCLUDE LOD. Any LOD
         # opened while this is non-zero falls back (a compound view-relative context transition
         # cannot be proven faithful).
         self._relative_lod_depth = 0
+
+    def _resolve_param(self, name):
+        """Return ``(measure_ref, dtype)`` for a parameter, tolerating either resolver shape.
+
+        ``emit_value_parameters`` registers ``(ref, dtype)`` tuples (Option D) so a param compared
+        against a typed column type-checks. External/lambda resolvers (tests, callers) may still
+        return a bare-string ref; those default to ``"number"`` for back-compatibility. Returns
+        ``(None, None)`` when there is no resolver or the parameter is unmodeled.
+        """
+        if not self.param_resolver:
+            return None, None
+        raw = self.param_resolver(name)
+        if raw is None:
+            return None, None
+        if isinstance(raw, (list, tuple)):
+            ref = raw[0] if len(raw) >= 1 else None
+            dtype = raw[1] if len(raw) >= 2 and raw[1] else "number"
+            return (ref, dtype) if ref else (None, None)
+        return raw, "number"
 
     def _peek(self):
         return self.toks[self.pos] if self.pos < len(self.toks) else (None, None)
@@ -1123,6 +1161,23 @@ class _Parser:
                     self._expect_op(")")
                     self.tables_used.add(table)
                     return (f"COUNTROWS({_dax_table(table)})", "number")
+            # AGG([Parameters].[P]) for a value-preserving aggregate (MIN/MAX/AVG/MEDIAN/SUM):
+            # a Tableau parameter is a single scalar, wrapped in an aggregate only to satisfy
+            # Tableau's "aggregate in a measure" rule, so over that singleton the aggregate equals
+            # the scalar. Collapse to the SAME SELECTEDVALUE param measure the bare scalar position
+            # emits (deliberately NOT added to tables_used -- a param measure has no fact home).
+            # Gated on a pure [Parameters].[P] the resolver models, with no other aggregate argument;
+            # anything else (COUNT/COUNTD/STDEV/VAR, an unmodeled param, extra args) falls through to
+            # the "(unmodeled)" raise and stays an honest stub.
+            if (name in _PARAM_SCALAR_COLLAPSE_AGGS and self.param_resolver
+                    and isinstance(v, (list, tuple)) and len(v) >= 2
+                    and str(v[0]).strip().lower() == "parameters"
+                    and self._peek_at(1) == ("op", ")")):
+                ref, _pdtype = self._resolve_param(v[1])
+                if ref:
+                    self._next()            # consume the [Parameters].[P] qfield
+                    self._expect_op(")")
+                    return (ref, "number")
             self._qualified_ref(v)  # specific "(unmodeled)" reason instead of the generic one
         # Fast path: AGG([field]) over a single bare field -> the scalar aggregate AGG('T'[Col]).
         if k == "field" and self._peek_at(1) == ("op", ")"):
@@ -1383,6 +1438,13 @@ class _Parser:
             # at row level (fail-safe: reached only when it names no real model column above).
             if _is_number_of_records(cap):
                 return ("1", "number")
+            # A bare reference to a dimension calc the model did NOT emit as a real column -- e.g. a
+            # parameter-driven date-window boolean the column path stubbed (no param_resolver in
+            # column mode). Inline its body here (parsed row-level) so the consuming measure can
+            # translate; fail closed to the original raise when it can't be inlined faithfully.
+            inlined = self._try_inline_calc(cap)
+            if inlined is not None:
+                return inlined
             raise _CalcError(f"unresolved/ambiguous field [{cap}]")
         table, col, tmdl_type = resolved
         dtype = _DTYPE_BY_TMDL.get(tmdl_type)
@@ -1390,6 +1452,38 @@ class _Parser:
             raise _CalcError(f"unsupported field type {tmdl_type} for [{cap}]")
         self.tables_used.add(table)
         return (f"{_dax_table(table)}{_dax_col(col)}", dtype)
+
+    def _try_inline_calc(self, cap):
+        # Inline a referenced dimension calc's BODY at row level so a MEASURE consuming a stubbed
+        # pure-boolean dimension calc -- e.g. a parameter-driven date-window filter used inside a
+        # COUNTD(IF ...) -- can translate. Returns (dax, "bool") only when the referenced calc parses
+        # in COLUMN mode as a single, fully-consumed boolean expression; None otherwise (fail closed).
+        key = (cap or "").strip().lower()
+        formula = self.inline_calcs.get(key)
+        if not formula:
+            return None
+        if key in self._inline_stack:
+            return None  # cycle: the calc (transitively) references itself
+        try:
+            toks = _tokenize(formula)
+        except _CalcError:
+            return None
+        # Nested parser sharing this parser's resolvers/param_resolver + the SAME tables_used set, so
+        # the inlined field's table lands in the caller's table set. A cross-table inline therefore
+        # trips the consumer's single-table guard (e.g. _countd_if) and fails closed for free.
+        sub = _Parser(toks, self.resolver, self.tables_used, mode="column",
+                      param_resolver=self.param_resolver, measure_refs=self.measure_refs,
+                      known_tables=self.known_tables, inline_calcs=self.inline_calcs)
+        sub._inline_stack = self._inline_stack | {key}
+        try:
+            node = sub._expr()
+        except _CalcError:
+            return None
+        if sub.pos != len(sub.toks):
+            return None  # trailing tokens -> not a single clean expression
+        if node[1] != "bool":
+            return None  # only a pure row-level boolean is safe to inline into a filter predicate
+        return (f"({node[0]})", "bool")
 
     def _qualified_ref(self, parts, *, allow_param=False):
         # Tableau qualified reference [A].[B] (parameter, datasource-qualified, or blend field).
@@ -1402,9 +1496,9 @@ class _Parser:
         pretty = ".".join(f"[{p}]" for p in parts)
         if parts and parts[0].strip().lower() == "parameters":
             if allow_param and self.param_resolver and len(parts) >= 2:
-                ref = self.param_resolver(parts[1])
+                ref, pdtype = self._resolve_param(parts[1])
                 if ref:
-                    return ref, "number"
+                    return ref, pdtype
             raise _CalcError(f"parameter reference {pretty} (unmodeled)")
         raise _CalcError(f"qualified reference {pretty} (unmodeled)")
 
@@ -1933,7 +2027,7 @@ def date_attribute_binding(formula):
 
 
 def translate_tableau_calc_to_dax(formula, resolver, param_resolver=None, measure_refs=None,
-                                  known_tables=None):
+                                  known_tables=None, inline_calcs=None):
     """Translate a SAFE-subset Tableau calc to DAX. Returns (dax|None, reason, tables_used).
 
     dax is None on any unsupported construct -> caller keeps the inert `= 0` stub.
@@ -1950,15 +2044,20 @@ def translate_tableau_calc_to_dax(formula, resolver, param_resolver=None, measur
     when omitted, trusts the relation token). Also supplies the counted table for Tableau's stock
     ``[Number of Records]`` field (``SUM``/``COUNT`` of it -> ``COUNTROWS('<table>')``) when no
     single-table context is otherwise in play. Default None -> still emits for a clean relation id.
+    inline_calcs({normalized-name: tableau-formula}) | None: dimension-calc bodies (keyed by BOTH
+    caption and internal id, lowercased) a MEASURE may reference row-level -- e.g. a stubbed
+    parameter-driven date-window boolean inside a ``COUNTD(IF ...)``. When a bare row-level reference
+    resolves to no model column, its body is inlined (parsed column-mode, pure-boolean, fully
+    consumed) so the consuming measure translates. Default None -> byte-identical prior output.
     """
     dax, reason, tables_used, _dtype = translate_tableau_calc_to_dax_typed(
         formula, resolver, param_resolver=param_resolver, measure_refs=measure_refs,
-        known_tables=known_tables)
+        known_tables=known_tables, inline_calcs=inline_calcs)
     return dax, reason, tables_used
 
 
 def translate_tableau_calc_to_dax_typed(formula, resolver, param_resolver=None, measure_refs=None,
-                                        known_tables=None):
+                                        known_tables=None, inline_calcs=None):
     """Like ``translate_tableau_calc_to_dax`` but also returns the result dtype as a 4th item.
 
     Returns ``(dax|None, reason, tables_used, dtype|None)``. The extra ``dtype`` ("number" /
@@ -1976,7 +2075,8 @@ def translate_tableau_calc_to_dax_typed(formula, resolver, param_resolver=None, 
             return None, "empty formula", tables_used, None
         dax, dtype = _Parser(
             toks, resolver, tables_used, param_resolver=param_resolver,
-            measure_refs=measure_refs, known_tables=known_tables).parse()
+            measure_refs=measure_refs, known_tables=known_tables,
+            inline_calcs=inline_calcs).parse()
         # Single-table only: terms spanning >1 table fall back (a relationship path
         # does not guarantee the DAX filter context reproduces Tableau's result).
         if len(tables_used) > 1:

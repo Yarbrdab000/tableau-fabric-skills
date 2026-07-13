@@ -2395,6 +2395,98 @@ def test_logical_resolver_fails_closed_on_case_distinct_physical():
     assert resolve("Quota Cap") is None
 
 
+# -- island-scoped field resolution (Fix (1): cross-island caption collision) --------------------
+# A consolidated multi-datasource workbook pools EVERY island's tables into one descriptor
+# (combine_descriptors). When the SAME caption is reused across islands on DIFFERENT physical tables
+# -- the real Salesforce 4-island shape -- the pooled resolver is ambiguous and returns None, so any
+# calc referencing that caption STUBS. Naming the island (``datasource=``) scopes resolution to THAT
+# island's tables so the caption binds to the right physical table. The scope is a strict SUPERSET:
+# on an island miss it falls back to the pooled set, so it can only FIX a stub, never regress a
+# previously-resolved binding.
+def _island_tds(name, conn, table, *, extra=None):
+    """A one-table island .tds carrying colliding ``[Category]``/``[Amount]`` captions on ``table``,
+    plus an optional ``extra`` caption column unique to this island (for the superset test)."""
+    extra_meta = ""
+    if extra:
+        extra_meta = f"""
+      <metadata-record class='column'>
+        <remote-name>{extra}</remote-name><local-name>[{extra}]</local-name>
+        <parent-name>[{table}]</parent-name><local-type>real</local-type>
+      </metadata-record>"""
+    return f"""<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='{name}' inline='true' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='c' name='{conn}'>
+        <connection class='sqlserver' dbname='DB' server='srv.example.com' username='svc' />
+      </named-connection>
+    </named-connections>
+    <relation connection='{conn}' name='{table}' table='[dbo].[{table}]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Category</remote-name><local-name>[Category]</local-name>
+        <parent-name>[{table}]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Amount</remote-name><local-name>[Amount]</local-name>
+        <parent-name>[{table}]</parent-name><local-type>real</local-type>
+      </metadata-record>{extra_meta}
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+
+def test_m_field_resolver_island_scope_disambiguates_colliding_caption():
+    # Two islands reuse the SAME [Category]/[Amount] captions on DIFFERENT physical tables.
+    sales = parse_tds(_island_tds("Sales Source", "sqlserver.s1", "Sales"))
+    inventory = parse_tds(_island_tds("Inventory Source", "sqlserver.s2", "Inventory"))
+    combined = combine_descriptors([sales, inventory],
+                                   captions=["Sales Source", "Inventory Source"])
+
+    # Pooled (datasource=None): [Amount] lives on BOTH islands -> ambiguous -> None (calc stubs).
+    assert build_m_field_resolver(combined)("Amount") is None
+    # Scoped to an island: the SAME caption resolves to THAT island's physical table.
+    assert build_m_field_resolver(combined, datasource="Inventory Source")("Amount") \
+        == ("Inventory", "Amount", "double")
+    assert build_m_field_resolver(combined, datasource="Sales Source")("Amount") \
+        == ("Sales", "Amount", "double")
+    # A caption absent from every island still returns None under a scope (no invented binding).
+    assert build_m_field_resolver(combined, datasource="Inventory Source")("Nope") is None
+
+
+def test_m_field_resolver_island_scope_is_superset_falls_back_to_pooled():
+    # Superset guarantee: [SalesOnly] lives on ONLY the Sales island. Scoping to the OTHER island
+    # (Inventory) still resolves it -- a scoped miss falls back to the full pooled table set -- so
+    # naming an island can only ADD resolutions, never drop a globally-unambiguous one.
+    sales = parse_tds(_island_tds("Sales Source", "sqlserver.s1", "Sales", extra="SalesOnly"))
+    inventory = parse_tds(_island_tds("Inventory Source", "sqlserver.s2", "Inventory"))
+    combined = combine_descriptors([sales, inventory],
+                                   captions=["Sales Source", "Inventory Source"])
+
+    scoped_inv = build_m_field_resolver(combined, datasource="Inventory Source")
+    # colliding caption -> the scoped island wins
+    assert scoped_inv("Amount") == ("Inventory", "Amount", "double")
+    # globally-unique caption absent from the scoped island -> pooled fallback still resolves it
+    assert scoped_inv("SalesOnly") == ("Sales", "SalesOnly", "double")
+
+
+def test_m_field_resolver_unscoped_is_byte_identical_when_no_collision():
+    # When captions do NOT collide, an unscoped resolver over the combined descriptor behaves exactly
+    # as before Fix (1): a globally-unique caption resolves to its one physical table. This locks the
+    # "byte-identical when unscoped / no collision" contract.
+    sales = parse_tds(_island_tds("Sales Source", "sqlserver.s1", "Sales", extra="SalesOnly"))
+    # Rename Finance's captions away so nothing collides across the two islands.
+    finance = parse_tds(
+        _island_tds("Finance Source", "sqlserver.s2", "Finance")
+        .replace("Category", "FinCategory").replace("Amount", "FinAmount"))
+    combined = combine_descriptors([sales, finance],
+                                   captions=["Sales Source", "Finance Source"])
+    resolve = build_m_field_resolver(combined)   # unscoped
+    assert resolve("SalesOnly") == ("Sales", "SalesOnly", "double")
+    assert resolve("FinAmount") == ("Finance", "FinAmount", "double")
+    assert resolve("FinCategory") == ("Finance", "FinCategory", "string")
+
+
 # -- bind details --------------------------------------------------------------
 def test_connection_details_for_bind():
     d = parse_tds(LIVE_SQLSERVER)

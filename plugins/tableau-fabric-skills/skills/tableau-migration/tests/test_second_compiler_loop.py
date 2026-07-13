@@ -148,7 +148,7 @@ def test_loop_model_object_parameter_path_via_deterministic_emitter():
              "formula": "SUM([Sales]) * (1 + [Parameters].[Growth Rate])"}
     res = P.emit_value_parameters([growth], calcs=[grown], reserved_names={"orders", "sales"})
     assert res["measure_names"] == ["Growth Rate Value"]
-    assert res["param_resolver"]("Growth Rate") == "[Growth Rate Value]"
+    assert res["param_resolver"]("Growth Rate") == ("[Growth Rate Value]", "number")
 
     def _resolver(caption):
         return {"Sales": ("Orders", "Sales", "double")}.get(caption)

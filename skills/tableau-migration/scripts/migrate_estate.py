@@ -446,6 +446,18 @@ def extract_calculations(xml_text, *, include_dimensions=False):
         return (calcs, skipped, dim_calcs) if include_dimensions else (calcs, skipped)
 
     seen = set()
+    # Map each <column> element (by object identity) to its owning datasource caption. In a
+    # multi-datasource workbook the same caption means different things per datasource, so a calc's
+    # home island must be recorded for the M field resolver to be scoped to it. ``root`` stays alive
+    # for the whole function, so id(col) below matches id(c) here. A None value (column under no
+    # <datasource>, or single-datasource run) degrades to global resolution -- byte-identical.
+    col_ds = {}
+    for ds_el in (e for e in root.iter() if _local(e.tag) == "datasource"):
+        ds_name = ds_el.get("caption") or ds_el.get("name")
+        if not ds_name:
+            continue
+        for c in (x for x in ds_el.iter() if _local(x.tag) == "column"):
+            col_ds.setdefault(id(c), ds_name)
     for col in (e for e in root.iter() if _local(e.tag) == "column"):
         calc_el = next((c for c in list(col) if _local(c.tag) == "calculation"), None)
         if calc_el is None:
@@ -479,6 +491,7 @@ def extract_calculations(xml_text, *, include_dimensions=False):
             dim_entry = {"name": caption, "formula": formula, "role": role}
             if internal_name and internal_name.lower() != caption.lower():
                 dim_entry["internal_name"] = internal_name
+            dim_entry["datasource"] = col_ds.get(id(col))
             dim_calcs.append(dim_entry)
             continue
         if caption in seen:
@@ -488,6 +501,7 @@ def extract_calculations(xml_text, *, include_dimensions=False):
         entry = {"name": caption, "formula": formula}
         if internal_name and internal_name.lower() != caption.lower():
             entry["internal_name"] = internal_name
+        entry["datasource"] = col_ds.get(id(col))
         calcs.append(entry)
 
     return (calcs, skipped, dim_calcs) if include_dimensions else (calcs, skipped)
@@ -2884,6 +2898,28 @@ def _summarize(ds_details, wb_details, viz_available):
         else:
             error += 1
 
+    # Workbook-model calc rollup. A consolidated workbook builds its OWN semantic model (from the
+    # workbook's embedded/published datasources); that model's calc-translation summary lives on
+    # ``model_translation_handoff`` -- NOT in ``ds_details``. Without this fold-in, a workbook's calcs
+    # never reach the top-level ``summary`` and the mandatory second-compiler gate
+    # (``needs_review_total``) reads 0 even when dozens of workbook calcs are stubbed. Fold the
+    # workbook ``needs_review`` into the existing gate and expose additive ``workbook_calcs_*`` totals
+    # (never touches ``measures_*``). Empty ``wb_details`` (a datasource-only run) leaves every value
+    # at 0, so a datasource-only summary is byte-for-byte unchanged.
+    workbook_calcs_total = workbook_calcs_translated = 0
+    workbook_calcs_stubbed = workbook_calcs_needs_review = 0
+    for w in wb_details:
+        wsum = (w.get("model_translation_handoff") or {}).get("summary") or {}
+        workbook_calcs_total += int(wsum.get("total") or 0)
+        workbook_calcs_translated += int(wsum.get("live") or 0)
+        workbook_calcs_stubbed += int(wsum.get("stub") or 0)
+        wb_nr = int(wsum.get("needs_review") or 0)
+        workbook_calcs_needs_review += wb_nr
+        needs_review_total += wb_nr
+    workbook_calcs_coverage_pct = (
+        round(100.0 * workbook_calcs_translated / workbook_calcs_total, 1)
+        if workbook_calcs_total else None)
+
     wb_built = sum(1 for w in wb_details if w.get("viz_status") == "built")
     wb_warned = sum(1 for w in wb_details if w.get("viz_status") == "warned")
     wb_error = sum(1 for w in wb_details if w.get("viz_status") == "error")
@@ -2937,6 +2973,11 @@ def _summarize(ds_details, wb_details, viz_available):
         "calc_columns_total": calc_columns_total,
         "calc_columns_translated": calc_columns_translated,
         "calc_columns_stubbed": calc_columns_stubbed,
+        "workbook_calcs_total": workbook_calcs_total,
+        "workbook_calcs_translated": workbook_calcs_translated,
+        "workbook_calcs_stubbed": workbook_calcs_stubbed,
+        "workbook_calcs_needs_review": workbook_calcs_needs_review,
+        "workbook_calcs_coverage_pct": workbook_calcs_coverage_pct,
         "needs_review_total": needs_review_total,
         "partitions_stubbed_total": partitions_stubbed_total,
         "workbooks_total": len(wb_details),
@@ -3192,6 +3233,12 @@ def _render_summary_md(report):
         f"- **Calc columns:** {s.get('calc_columns_total', 0)} total -> "
         f"{s.get('calc_columns_translated', 0)} translated, "
         f"{s.get('calc_columns_stubbed', 0)} stubbed",
+        *([f"- **Workbook calcs:** {s['workbook_calcs_total']} total -> "
+           f"{s['workbook_calcs_translated']} translated, "
+           f"{s['workbook_calcs_stubbed']} stubbed, "
+           f"{s['workbook_calcs_needs_review']} need review "
+           f"({s['workbook_calcs_coverage_pct']}% coverage)"]
+          if s.get('workbook_calcs_total') else []),
         f"- **Storage modes:** Import {s['storage_modes']['Import']}, "
         f"DirectQuery {s['storage_modes']['DirectQuery']}, "
         f"fallback {s['storage_modes']['fallback']}",
@@ -3559,6 +3606,12 @@ def main(argv=None):
         f"Measures: {s['measures_translated']}/{s['measures_total']} translated | "
         f"Workbooks: {s['workbooks_viz_built']}/{s['workbooks_total']} viz built"
     )
+    if s.get("workbook_calcs_total"):
+        print(
+            f"Workbook calcs: {s['workbook_calcs_translated']}/{s['workbook_calcs_total']} "
+            f"translated ({s['workbook_calcs_coverage_pct']}% coverage), "
+            f"{s['workbook_calcs_needs_review']} need review"
+        )
     print(f"Bundle written to: {os.path.abspath(args.output)}")
     if not args.no_pbip:
         print("Openable projects: pbip/<Name>/<Name>.pbip (double-click in Power BI Desktop)")

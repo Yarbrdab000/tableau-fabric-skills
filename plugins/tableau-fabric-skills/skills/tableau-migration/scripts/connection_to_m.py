@@ -1488,6 +1488,10 @@ def combine_descriptors(descriptors, *, captions=None):
             if origin_conn is not None and not rel.get("connection"):
                 rel = dict(rel, connection=origin_conn)
             taken.add(name.lower())
+            # Tag this relation with its island's datasource caption so the M field resolver can be
+            # scoped per island (build_m_field_resolver(descriptor, datasource=caption)). Ride the
+            # possibly-renamed/connection-tagged rel; markers (line 1475) are never tagged.
+            rel = dict(rel, source_datasource=caption)
             combined["relations"].append(rel)
             # Record base -> consolidated. A same-display self-join within one datasource keys
             # the second (suffixed) copy by its final name so both stay reachable.
@@ -2351,8 +2355,16 @@ def emit_table_tmdl_m(relation, descriptor, mode):
     )
 
 
-def build_m_field_resolver(descriptor):
+def build_m_field_resolver(descriptor, datasource=None):
     """Build ``resolve_field(caption) -> (table, clean_col, tmdl_type) | None`` for the M path.
+
+    ``datasource`` (optional) names one island of a *combined* multi-datasource descriptor (the
+    ``source_datasource`` caption :func:`combine_descriptors` stamps on each relation). When given,
+    a caption is resolved against THAT island's tables first, so the same caption reused by several
+    embedded datasources -- which pools to an ambiguous ``None`` for every leaf across the whole
+    workbook -- binds to the right physical table. It is inert for a single (un-combined) descriptor
+    or ``datasource=None``: no relation carries a ``source_datasource`` tag, so the scope collapses
+    to ``None`` and resolution is byte-for-byte the full-descriptor behavior below.
 
     Mirrors the DirectLake field resolver, but sources columns/types from the parsed Tableau
     metadata instead of landed Delta. Resolves only when exactly one table exposes the caption
@@ -2375,10 +2387,14 @@ def build_m_field_resolver(descriptor):
     counts = {}   # (table, clean_col) -> set(captions)  (collision detector)
     phys_exact = {}   # (table, remote) -> (table, clean_col, tmdl_type)  -- exact, case-sensitive
     phys_ci = {}      # (lower(table), lower(remote)) -> set of those targets (case collisions)
+    rel_ds = {}   # table -> source_datasource (only populated in a combined descriptor; scopes resolution)
     for rel in descriptor.get("relations", []):
         if rel.get("kind") not in ("table", "custom_sql"):
             continue
         table = rel.get("name") or rel.get("item")
+        sds = rel.get("source_datasource")
+        if sds is not None:
+            rel_ds[table] = sds
         for c in rel.get("columns", []):
             cap = c.get("local_name") or c.get("remote_name")
             cc = c["model_name"]
@@ -2394,6 +2410,12 @@ def build_m_field_resolver(descriptor):
     tables = {(rel.get("name") or rel.get("item"))
               for rel in descriptor.get("relations", [])
               if rel.get("kind") in ("table", "custom_sql")}
+
+    # Restrict resolution to one island's tables when a datasource is named (combined descriptor only).
+    # Empty match (single/un-combined descriptor, or a name no relation carries) -> None -> global.
+    scoped_tables = None
+    if datasource is not None:
+        scoped_tables = {t for t in tables if rel_ds.get(t) == datasource} or None
 
     def _phys_target(table, physical):
         """Resolve a logical map's (table, physical) to the EMITTED relation column target.
@@ -2422,9 +2444,9 @@ def build_m_field_resolver(descriptor):
             if k:
                 logical.setdefault(k, set()).add(target)
 
-    def resolve_field(caption):
+    def _resolve_over(caption, table_set):
         hits = []
-        for table in tables:
+        for table in table_set:
             got = cap_to.get((table, caption))
             if got is None:
                 continue
@@ -2437,11 +2459,26 @@ def build_m_field_resolver(descriptor):
         # Exact metadata-record resolution was empty OR ambiguous: defer to the logical layer,
         # which is the authoritative disambiguator for a caption / logical-id reference (e.g. a
         # physical ``REGION`` present in two joined tables resolves by the caption ``Region`` ->
-        # ORDERS vs ``Region (People)`` -> PEOPLE). Only an unambiguous logical hit binds.
+        # ORDERS vs ``Region (People)`` -> PEOPLE). Only an unambiguous logical hit binds. Under a
+        # scope, restrict the logical bucket to the island too (byte-identical when table_set IS the
+        # full set -- ``table_set is tables`` -- so the global path is unchanged).
         bucket = logical.get((caption or "").strip().lower())
+        if bucket and table_set is not tables:
+            bucket = {t for t in bucket if t[0] in table_set}
         if bucket and len(bucket) == 1:
             return next(iter(bucket))
         return None
+
+    def resolve_field(caption):
+        # Island-scoped resolution wins; fall back to full-descriptor resolution so a caption living
+        # outside the named island still binds when it is globally unambiguous. With no scope
+        # (single descriptor, or datasource=None) this is exactly _resolve_over(caption, tables).
+        if scoped_tables is not None:
+            hit = _resolve_over(caption, scoped_tables)
+            if hit is not None:
+                return hit
+            return _resolve_over(caption, tables)
+        return _resolve_over(caption, tables)
 
     return resolve_field
 
