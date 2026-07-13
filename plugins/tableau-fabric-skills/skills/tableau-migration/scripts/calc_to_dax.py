@@ -28,17 +28,23 @@ Translates a SAFE subset of Tableau calculated fields into working DAX measures:
   * null handling: ZN(x) -> COALESCE(x, 0) ; IFNULL(a, b) -> COALESCE(a, b) ;
     ISNULL(x) -> ISBLANK(x)
   * string literals "..." / '...'
-  * FIXED level-of-detail expressions wrapped in an outer aggregation:
+  * FIXED / INCLUDE level-of-detail expressions wrapped in an outer aggregation:
     AGG({FIXED d1,d2,...: inner}) -> AGG_X(SUMMARIZE('T', 'T'[d1], ...), CALCULATE(inner))
-    with SUM->SUMX, AVG->AVERAGEX, MIN->MINX, MAX->MAXX, MEDIAN->MEDIANX, COUNT->COUNTAX.
-    Nested FIXED LODs translate only when each inner FIXED's dimension set is a SUPERSET of
-    the enclosing FIXED's dimensions (otherwise the context-transition emit could silently
-    compute the wrong number, so it falls back).
+    with SUM->SUMX, AVG->AVERAGEX, MIN->MINX, MAX->MAXX, MEDIAN->MEDIANX, COUNT->COUNTAX. An
+    INCLUDE re-aggregation emits the same context-respecting SUMMARIZE form: it ADDS its
+    dimensions to the live view grain and rolls up, which is exactly a SUMMARIZE over the current
+    context folded with a context-transition inner. Nested FIXED LODs translate only when each
+    inner FIXED's dimension set is a SUPERSET of the enclosing FIXED's dimensions (otherwise the
+    context-transition emit could silently compute the wrong number, so it falls back).
+  * Bare EXCLUDE level-of-detail expressions -- {EXCLUDE d1,...: AGG(...)} -- which DROP the listed
+    dimensions from the CURRENT view grain: emitted as CALCULATE(inner, REMOVEFILTERS('T'[d1], ...)),
+    view-adaptive and in the same per-mark fidelity class as a bare FIXED value.
   * Table-scoped LODs with no dimensions -- {AGG(...)}, equivalently {FIXED : AGG(...)} -- which
     evaluate the inner aggregate across the ENTIRE source table (whatever the aggregate is: MAX,
     MIN, AVG, SUM, ...), ignoring filter/row context. Emitted as CALCULATE(inner, ALL('T')).
-    INCLUDE/EXCLUDE LODs, COUNTD over an LOD, re-aggregating a table-scoped LOD, and a dimensioned
-    bare LOD not wrapped in an outer aggregation all fall back.
+    A bare INCLUDE (no outer aggregation), a re-aggregated EXCLUDE, any INCLUDE/EXCLUDE nested in
+    another LOD (or any LOD nested inside an INCLUDE/EXCLUDE), COUNTD over an LOD, re-aggregating a
+    table-scoped LOD, and a dimensioned bare FIXED not wrapped in an outer aggregation all fall back.
 
 MEASURE-CONTEXT INVARIANT: the default entry point (translate_tableau_calc_to_dax) emits a
 DAX *measure*, so every leaf operand must be an aggregation or a literal. A bare row-level field
@@ -64,7 +70,7 @@ DAX equivalent is NOT faithful are deliberately left to fall back: TRIM/LTRIM/RT
 collapses internal whitespace), SPLIT (no general DAX form), STR and DATE(text) (culture-sensitive
 formatting/parsing), and the start-of-week-dependent DATEPART('week'/'weekday')/DATEDIFF('week').
 
-Anything outside this subset (INCLUDE/EXCLUDE LODs, table calcs WINDOW_/RUNNING_/RANK/LOOKUP/
+Anything outside this subset (the unsupported LOD forms noted above, table calcs WINDOW_/RUNNING_/RANK/LOOKUP/
 INDEX/TOTAL, scalar date/string/regex functions, row-level operands inside a scalar math
 function or CASE, nested arithmetic inside an aggregation, 4-arg IIF, references to other
 calcs, unresolved or ambiguous fields, cross-table terms) deterministically FALLS BACK by
@@ -519,6 +525,10 @@ class _Parser:
         # with validation. Empty -> trust the hash-stripped relation token.
         self.known_tables = set(known_tables) if known_tables else set()
         self._lod_dim_stack = []
+        # Depth counter: >0 while parsing the inner expression of an INCLUDE/EXCLUDE LOD. Any LOD
+        # opened while this is non-zero falls back (a compound view-relative context transition
+        # cannot be proven faithful).
+        self._relative_lod_depth = 0
 
     def _peek(self):
         return self.toks[self.pos] if self.pos < len(self.toks) else (None, None)
@@ -799,6 +809,13 @@ class _Parser:
             return (f"({inner[0]})", inner[1])
         if k == "op" and v == "{":
             if self.mode == "column":
+                # Only a datasource-absolute FIXED (or the {inner} table-scoped shorthand) has a
+                # faithful row-level column form. INCLUDE/EXCLUDE are view-relative -- their grain
+                # is the worksheet's dimensionality, which a calc column has no access to -> fall
+                # back rather than emit a context transition against a grain that does not exist here.
+                nxt = self._peek_at(1)
+                if nxt[0] == "id" and nxt[1].upper() in ("INCLUDE", "EXCLUDE"):
+                    raise _CalcError("INCLUDE/EXCLUDE LOD is view-relative; no row-level column form")
                 # A FIXED LOD is a datasource-level value (constant within its declared grain), so it
                 # is faithful inside a row-level calculated column: CALCULATE(inner, ALLEXCEPT/ALL)
                 # re-aggregates at the LOD grain under the current row's context transition -- exactly
@@ -1656,32 +1673,41 @@ class _Parser:
         raise _CalcError(f"unsupported DATETRUNC part {part!r}")
 
     def _lod_core(self):
-        # Parse a FIXED LOD body. Returns (table, [clean_cols], inner_node). Accepted shapes:
-        #   {FIXED d1, d2, ... : inner}  -- dimensioned (>=1 [field] dimension)
-        #   {FIXED : inner}              -- table-scoped (explicit empty dimension list)
-        #   {inner}                      -- table-scoped shorthand: no keyword == "FIXED to nothing"
-        # A table-scoped LOD (no dimensions) evaluates the inner aggregate across the ENTIRE
-        # table -- whatever that aggregate is (MAX, MIN, AVG, SUM, ...), not necessarily a sum --
-        # ignoring filter/row context, so it emits
-        # CALCULATE(inner, ALL('T')) instead of ALLEXCEPT. Only FIXED is datasource-level and
-        # deterministically translatable; INCLUDE/EXCLUDE depend on the view's dimensionality (a
-        # worksheet artifact, not in the .tds) -> fall back. Enforces the nested-superset rule: a
-        # nested FIXED must fix at least every dimension of the LOD enclosing it; otherwise the
+        # Parse an LOD body. Returns (kind, table, [clean_cols], inner_node) where kind is one of
+        # "FIXED" / "INCLUDE" / "EXCLUDE". Accepted shapes:
+        #   {FIXED d1, d2, ... : inner}    -- dimensioned FIXED (>=1 [field] dimension)
+        #   {FIXED : inner}                -- table-scoped FIXED (explicit empty dimension list)
+        #   {inner}                        -- table-scoped shorthand: no keyword == "FIXED to nothing"
+        #   {INCLUDE d1, ... : inner}      -- view-relative: ADD d... to the view grain (>=1 dim)
+        #   {EXCLUDE d1, ... : inner}      -- view-relative: DROP d... from the view grain (>=1 dim)
+        # A table-scoped FIXED (no dimensions) evaluates the inner aggregate across the ENTIRE table
+        # -- whatever that aggregate is (MAX, MIN, AVG, SUM, ...), not necessarily a sum -- ignoring
+        # filter/row context, so it emits CALCULATE(inner, ALL('T')) instead of ALLEXCEPT. FIXED is
+        # datasource-absolute; INCLUDE/EXCLUDE are view-RELATIVE (their grain is the worksheet's
+        # dimensionality, not a .tds fact) and key off the live filter context, so they are parsed
+        # here only at the OUTERMOST LOD level: an INCLUDE/EXCLUDE nested inside another LOD, or any
+        # LOD nested inside an INCLUDE/EXCLUDE inner, falls back rather than emit a compound context
+        # transition we cannot prove faithful. The nested-superset rule still guards FIXED-in-FIXED:
+        # a nested FIXED must fix at least every dimension of the LOD enclosing it; otherwise the
         # emitted context transition could compute a value Tableau never would, so we fall back.
         self._expect_op("{")
-        if self._is_kw("INCLUDE") or self._is_kw("EXCLUDE"):
-            raise _CalcError("only FIXED LOD is translated (INCLUDE/EXCLUDE fall back)")
+        if self._relative_lod_depth:
+            raise _CalcError("LOD nested inside an INCLUDE/EXCLUDE is not supported")
         cols = []
         table = None
-        if self._is_kw("FIXED"):
-            self._next()  # FIXED
-            if self._peek() != ("op", ":"):  # {FIXED : inner} is the explicit table-scoped form
+        kind = "FIXED"  # {inner} shorthand and {FIXED ...} both fix; overwritten for INCLUDE/EXCLUDE
+        if self._is_kw("FIXED") or self._is_kw("INCLUDE") or self._is_kw("EXCLUDE"):
+            kind = self._next()[1].upper()
+            # Only FIXED accepts the explicit table-scoped {FIXED : inner} (no dimensions); an
+            # INCLUDE/EXCLUDE with no dimension is a no-op the view can't interpret -> fall back
+            # (the dimension loop's "requires at least one [dimension]" guard rejects it).
+            if not (kind == "FIXED" and self._peek() == ("op", ":")):
                 while True:
                     k, v = self._peek()
                     if k == "qfield":
                         self._qualified_ref(v)  # specific "(unmodeled)" reason instead of the generic one
                     if k != "field":
-                        raise _CalcError("FIXED LOD requires at least one [dimension]")
+                        raise _CalcError(f"{kind} LOD requires at least one [dimension]")
                     self._next()
                     resolved = self.resolver(v)
                     if resolved is None:
@@ -1690,7 +1716,7 @@ class _Parser:
                     if table is None:
                         table = t
                     elif t != table:
-                        raise _CalcError("cross-table FIXED LOD dimensions not supported")
+                        raise _CalcError("cross-table LOD dimensions not supported")
                     self.tables_used.add(t)
                     cols.append(c)
                     if self._peek() == ("op", ","):
@@ -1698,13 +1724,21 @@ class _Parser:
                         continue
                     break
             self._expect_op(":")
-        # else: {inner} shorthand -- no FIXED/INCLUDE/EXCLUDE keyword == fixed to nothing (table-scoped)
+        # else: {inner} shorthand -- no keyword == FIXED to nothing (table-scoped)
+        if kind in ("INCLUDE", "EXCLUDE") and self._lod_dim_stack:
+            # A view-relative LOD inside another LOD would compute against a synthetic grain rather
+            # than the worksheet's -> fall back.
+            raise _CalcError(f"{kind} LOD may not be nested inside another LOD")
         dim_set = frozenset(cols)
         if self._lod_dim_stack and not (dim_set >= self._lod_dim_stack[-1]):
             raise _CalcError("nested FIXED LOD does not fix a superset of the enclosing LOD")
         before = frozenset(self.tables_used)
         self._lod_dim_stack.append(dim_set)
+        if kind in ("INCLUDE", "EXCLUDE"):
+            self._relative_lod_depth += 1
         inner = self._expr()
+        if kind in ("INCLUDE", "EXCLUDE"):
+            self._relative_lod_depth -= 1
         self._lod_dim_stack.pop()
         self._expect_op("}")
         if table is None:
@@ -1718,7 +1752,7 @@ class _Parser:
                 table = next(iter(self.tables_used))
             else:
                 raise _CalcError("table-scoped LOD must reference exactly one table")
-        return table, cols, inner
+        return kind, table, cols, inner
 
     def _lod_cols_dax(self, table, cols):
         return ", ".join(_dax_table(table) + _dax_col(c) for c in cols)
@@ -1726,17 +1760,36 @@ class _Parser:
     def _fixed_lod_bare(self):
         # {FIXED d : AGG(...)}        -> CALCULATE(AGG(...), ALLEXCEPT('T', 'T'[d], ...))
         # {AGG(...)} / {FIXED : AGG(...)} (table-scoped, no dims) -> CALCULATE(AGG(...), ALL('T'))
-        table, cols, inner = self._lod_core()
+        # {EXCLUDE d : AGG(...)}      -> CALCULATE(AGG(...), REMOVEFILTERS('T'[d], ...))
+        kind, table, cols, inner = self._lod_core()
+        if kind == "INCLUDE":
+            # A bare INCLUDE has no enclosing aggregation to roll its added dimension back up to the
+            # view grain, so its value is not determined by the .tds alone -> fall back.
+            raise _CalcError("bare INCLUDE LOD requires an enclosing aggregation")
+        if kind == "EXCLUDE":
+            # EXCLUDE drops its dimensions from the CURRENT filter context (the live view grain),
+            # which DAX models exactly as REMOVEFILTERS on those columns: view-adaptive and faithful,
+            # the same per-mark fidelity class as the bare FIXED value. >=1 dim is guaranteed by core.
+            cols_dax = self._lod_cols_dax(table, cols)
+            return (f"CALCULATE({inner[0]}, REMOVEFILTERS({cols_dax}))", inner[1])
         if not cols:
             return (f"CALCULATE({inner[0]}, ALL({_dax_table(table)}))", inner[1])
         cols_dax = self._lod_cols_dax(table, cols)
         return (f"CALCULATE({inner[0]}, ALLEXCEPT({_dax_table(table)}, {cols_dax}))", inner[1])
 
     def _fixed_lod_reagg(self, outer_agg):
-        # AGG_outer({FIXED d : inner}) -> AGGX_outer(SUMMARIZE('T', 'T'[d], ...), CALCULATE(inner))
+        # AGG_outer({FIXED d : inner})   -> AGGX_outer(SUMMARIZE('T', 'T'[d], ...), CALCULATE(inner))
+        # AGG_outer({INCLUDE d : inner}) -> AGGX_outer(SUMMARIZE('T', 'T'[d], ...), CALCULATE(inner))
+        #   INCLUDE shares the FIXED re-aggregation emit: the context-respecting SUMMARIZE materializes
+        #   the d-values present in the CURRENT view context and CALCULATE re-enters row context for
+        #   the inner -- exactly "add d to the view grain, then roll up", which is INCLUDE.
         if outer_agg not in _AGG_X:
             raise _CalcError(f"{outer_agg} cannot re-aggregate a FIXED LOD")
-        table, cols, inner = self._lod_core()
+        kind, table, cols, inner = self._lod_core()
+        if kind == "EXCLUDE":
+            # An EXCLUDE is already a view-relative value with no grain to iterate for a second
+            # aggregation -> fall back rather than emit a window Tableau never computes.
+            raise _CalcError("re-aggregating an EXCLUDE LOD is not supported")
         if not cols:
             # A table-scoped LOD is already a single value evaluated over the whole table;
             # re-aggregating it has no SUMMARIZE grain to iterate, so fall back rather than emit

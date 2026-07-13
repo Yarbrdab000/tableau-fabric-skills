@@ -70,7 +70,7 @@ _CALCS = [
     {"name": "Profit Ratio", "formula": "SUM([Profit]) / SUM([Sales])"},      # control -> live
     {"name": "Sales Rank", "formula": "RANK(SUM([Sales]))"},                  # -> addressing
     {"name": "Regional Mix",
-     "formula": "SUM([Sales]) / SUM({ INCLUDE [Region] : SUM([Sales]) })"},   # -> outer aggregation
+     "formula": "SUM([Sales]) / { INCLUDE [Region] : SUM([Sales]) }"},         # -> outer aggregation
     {"name": "San Flag", "formula": "REGEXP_MATCH([City], '^San')"},          # -> dax language gap
     {"name": "Grown Sales",
      "formula": "SUM([Sales]) * (1 + [Parameters].[Growth Rate])"},           # -> model object param

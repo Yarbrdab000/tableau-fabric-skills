@@ -13,6 +13,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.38.0` → `1.39.0`): Faithful deterministic translation of INCLUDE / EXCLUDE
+  level-of-detail expressions.** `INCLUDE` and `EXCLUDE` LODs were previously fail-closed because, unlike a
+  `FIXED` LOD (whose grain is datasource-absolute), their grain is *view-relative* — it depends on the
+  dimensions on the worksheet, not on the `.tds`. Two shapes now translate to provably-faithful, filter-context
+  DAX: a re-aggregated `INCLUDE` — `AGG({ INCLUDE [d] : inner })` — emits `AGGX(SUMMARIZE('T', 'T'[d]),
+  CALCULATE(inner))` (`SUMX`/`AVERAGEX`/`MINX`/`MAXX` per the outer aggregate), precisely "add `d` to the view
+  grain, then roll up"; and a bare `EXCLUDE` — `{ EXCLUDE [d] : inner }` — emits `CALCULATE(inner,
+  REMOVEFILTERS('T'[d]))`, precisely "the view grain minus `d`" (multi-dimension → `REMOVEFILTERS('T'[d1],
+  'T'[d2])`), the same view-adaptive fidelity class as the already-shipped bare `FIXED` → `ALLEXCEPT`. Strictly
+  fail-closed on every shape that has no single provably-correct target: a bare `INCLUDE` (genuinely needs an
+  outer aggregation the deterministic tier will not guess), a re-aggregated `EXCLUDE`, a no-dimension
+  `INCLUDE`/`EXCLUDE`, any `INCLUDE`/`EXCLUDE` nested inside another LOD (or any LOD nested inside their inner
+  expression), and `INCLUDE`/`EXCLUDE` in a calculated column (they are view-relative, so there is no row-level
+  column form). `FIXED` behaviour is unchanged, and all fail-closed reasons route coherently through the
+  translation router's `MISSING_OUTER_AGGREGATION` handoff category. Report schema is additive (no keys renamed
+  or removed).
 - **tableau-migration (skill `1.37.0` → `1.38.0`): Approved-keystone nested-calc cascade — author one
   irreducible base, get the whole dependent chain deterministically.** When a nested calc→calc→calc chain
   bottoms out at an *irreducible* base — a `WINDOW_`/`RUNNING_` table calc or other construct the
