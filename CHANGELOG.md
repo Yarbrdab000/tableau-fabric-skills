@@ -13,7 +13,27 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration (skill `1.33.0` → `1.34.0`): Calc→DAX compiler depth — FIXED LODs in calculated
+- **tableau-migration (skill `1.34.0` → `1.35.0`): Calc→DAX compiler depth — cross-calc token-keying
+  cascade in calculated-column mode, and sub-day `DATETRUNC`.** Additive and faithful-or-stub — every calc
+  that already translated is byte-identical; the new work only turns former stubs into provably-correct DAX
+  (or leaves them honest stubs). This is the big cascading lever for nested/chained calcs: resolving a
+  keystone reference unblocks its whole downstream subtree. Highlights:
+  - **A calculated column may now reference a sibling calc by its internal `[Calculation_*]` token, not just
+    its caption.** Real Tableau workbooks reference auto-named calcs by their internal id, but the
+    column-mode sibling-resolution fix-point keyed its reference table only by caption — so a row-level calc
+    that referenced a sibling by token failed closed with `unresolved/ambiguous field [Calculation_…]` even
+    though the sibling itself translated cleanly. Each single-home, typed, deterministic sibling translation
+    is now registered under **both** its caption and its internal-name token (mirroring the measure-side
+    cascade, which already dual-keyed). The stored reference is always the sibling's real
+    `'Table'[Caption]` column, so the emitted DAX is correct regardless of which key matched. Fail-closed is
+    unchanged: only a faithful single-home typed calc is a valid reference target, so a token that points at
+    an untranslatable sibling still stubs.
+  - **`DATETRUNC` now supports the sub-day units `hour` / `minute` / `second`** — truncation to
+    `(DATE(y,m,d) + TIME(h,[m],[s]))`, parenthesized so it composes safely inside `DATEADD`. Combined with
+    the token cascade above, this completes real three-deep date chains (e.g. truncate to the hour → add an
+    integer-minute interval → round to the nearest 15 minutes) fully deterministically. `quarter` / `week`
+    truncation continue to fall back (they depend on the workbook's start-of-week setting).
+
   columns, the nested-argmax cascade, and Tableau's stock `[Number of Records]` field.** Additive and
   faithful-or-stub — every calc that already translated is byte-identical; the new work only turns former
   stubs into provably-correct DAX (or leaves them stubs). Highlights:

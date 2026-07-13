@@ -1639,6 +1639,19 @@ class _Parser:
             return f"DATE(YEAR({d}), MONTH({d}), 1)"
         if part == "year":
             return f"DATE(YEAR({d}), 1, 1)"
+        # Sub-day truncation: rebuild the calendar date at midnight and add back the time-of-day up
+        # to the requested unit. DAX stores a dateTime as (day serial + fractional day), and
+        # ``TIME(h, m, s)`` is that fraction, so ``DATE(...) + TIME(...)`` is the exact truncation.
+        # Parenthesized so it composes safely inside a larger expression (e.g. nested in DATEADD).
+        if part == "hour":
+            return (f"(DATE(YEAR({d}), MONTH({d}), DAY({d})) "
+                    f"+ TIME(HOUR({d}), 0, 0))")
+        if part == "minute":
+            return (f"(DATE(YEAR({d}), MONTH({d}), DAY({d})) "
+                    f"+ TIME(HOUR({d}), MINUTE({d}), 0))")
+        if part == "second":
+            return (f"(DATE(YEAR({d}), MONTH({d}), DAY({d})) "
+                    f"+ TIME(HOUR({d}), MINUTE({d}), SECOND({d})))")
         # 'quarter'/'week' need extra arithmetic / a start-of-week setting -> fall back.
         raise _CalcError(f"unsupported DATETRUNC part {part!r}")
 
