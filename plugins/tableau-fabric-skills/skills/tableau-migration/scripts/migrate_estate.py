@@ -830,6 +830,7 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
         calc_columns=calc_columns,
         calc_columns_translated=cc_translated,
         calc_columns_stubbed=cc_stubbed,
+        column_prune=report.get("column_prune"),
         manual_followups=followups,
     )
     if ds_catalog is not None:
@@ -2090,6 +2091,7 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
     entry.update(pbip_status="built",
                   pbip_folder=folder_rel,
                   bound_model=model_safe,
+                  column_prune=res_report.get("column_prune"),
                   model_translation_handoff=res_report.get("translation_handoff"))
     # Surface the model's structural openability self-check (produced by the datasource build) onto the
     # entry so the workbook definition-of-done can FAIL LOUD when a report bound to a non-openable model
@@ -2870,6 +2872,7 @@ def _summarize(ds_details, wb_details, viz_available):
     calc_columns_total = calc_columns_translated = calc_columns_stubbed = 0
     needs_review_total = 0
     partitions_stubbed_total = 0
+    columns_pruned_hidden_total = 0
 
     for d in ds_details:
         if d.get("connector"):
@@ -2892,6 +2895,8 @@ def _summarize(ds_details, wb_details, viz_available):
             calc_columns_stubbed += d.get("calc_columns_stubbed", 0)
             needs_review_total += len((d.get("translation_handoff") or {}).get("needs_review") or [])
             partitions_stubbed_total += d.get("partitions_stubbed", 0)
+            _cp = d.get("column_prune") or {}
+            columns_pruned_hidden_total += int(_cp.get("columns_pruned_hidden") or 0)
         elif status == "fallback":
             fallback += 1
             modes["fallback"] += 1
@@ -2916,6 +2921,13 @@ def _summarize(ds_details, wb_details, viz_available):
         wb_nr = int(wsum.get("needs_review") or 0)
         workbook_calcs_needs_review += wb_nr
         needs_review_total += wb_nr
+        # Fold each workbook model's hidden-column prune into the estate total. A consolidated workbook
+        # prunes inside its OWN model build (``column_prune`` on the workbook detail), NOT via
+        # ``ds_details`` -- so a pure-workbook run (no standalone datasources) would otherwise report
+        # ``columns_pruned_hidden_total: 0`` even though the physical collapse fired. Additive and
+        # None-safe: a workbook that pruned nothing contributes 0, so a no-hidden estate is unchanged.
+        _wcp = w.get("column_prune") or {}
+        columns_pruned_hidden_total += int(_wcp.get("columns_pruned_hidden") or 0)
     workbook_calcs_coverage_pct = (
         round(100.0 * workbook_calcs_translated / workbook_calcs_total, 1)
         if workbook_calcs_total else None)
@@ -2980,6 +2992,7 @@ def _summarize(ds_details, wb_details, viz_available):
         "workbook_calcs_coverage_pct": workbook_calcs_coverage_pct,
         "needs_review_total": needs_review_total,
         "partitions_stubbed_total": partitions_stubbed_total,
+        "columns_pruned_hidden_total": columns_pruned_hidden_total,
         "workbooks_total": len(wb_details),
         "workbooks_viz_built": wb_built,
         "workbooks_viz_warned": wb_warned,

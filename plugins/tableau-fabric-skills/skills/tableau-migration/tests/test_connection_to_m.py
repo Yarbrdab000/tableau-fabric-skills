@@ -2972,3 +2972,217 @@ def test_combine_descriptors_from_real_two_datasource_workbook():
     names = {r["name"] for r in combined["relations"] if r.get("kind") in ("table", "custom_sql")}
     assert names == {"Orders", "Ledger"}            # both datasources' tables in ONE descriptor
     assert len(combined["connections"]) == 2        # each table still routes to its own source
+
+
+def test_combine_descriptors_aggregates_hidden_prune_across_islands():
+    # Each embedded datasource pruned in place before combining; the combined descriptor must carry the
+    # workbook-wide prune totals so the consolidated model report can surface column_prune (fixing the
+    # workbook-path telemetry gap where a physically-effective prune was under-reported as absent).
+    a = _desc("Sales", ["Orders"],
+              hidden_prune={"columns_emitted": 6, "columns_pruned_hidden": 4})
+    b = _desc("Finance", ["Ledger"],
+              hidden_prune={"columns_emitted": 5, "columns_pruned_hidden": 90})
+    combined = combine_descriptors([a, b], captions=["Sales", "Finance"])
+    assert combined["hidden_prune"] == {"columns_emitted": 11, "columns_pruned_hidden": 94}
+
+
+def test_combine_descriptors_hidden_prune_sums_only_pruned_islands():
+    # Mixed workbook: one island hid columns, the other (e.g. an all-Superstore datasource) did not.
+    # Sum comes only from the island that pruned; the un-pruned island contributes nothing.
+    a = _desc("SF", ["Case"],
+              hidden_prune={"columns_emitted": 6, "columns_pruned_hidden": 4})
+    b = _desc("Superstore", ["Orders"])            # no hidden_prune key at all
+    combined = combine_descriptors([a, b], captions=["SF", "Superstore"])
+    assert combined["hidden_prune"] == {"columns_emitted": 6, "columns_pruned_hidden": 4}
+
+
+def test_combine_descriptors_omits_hidden_prune_when_no_island_pruned():
+    # A workbook where nothing was hidden must stay byte-identical: no hidden_prune key on the combined
+    # descriptor (so column_prune stays None, exactly as before this fix).
+    a = _desc("Sales", ["Orders"])
+    b = _desc("Finance", ["Ledger"])
+    combined = combine_descriptors([a, b], captions=["Sales", "Finance"])
+    assert "hidden_prune" not in combined
+
+
+# -- hidden-column prune (connector-agnostic) ---------------------------------
+# A Salesforce-style datasource exposes the full physical schema but HIDES ~90% of it via logical
+# <column hidden='true'> elements. The prune drops the unreferenced hidden columns while CARVING OUT
+# (keeping, flagged isHidden) the load-bearing ones -- relationship join keys and calc-referenced
+# fields (incl. one resolved only through the <cols><map> lid bridge, not the metadata-name index).
+HIDDEN_HEAVY_TDS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='SF' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='sf' name='salesforce.s'>
+        <connection authentication='OAuth' class='salesforce' server='login.salesforce.com' />
+      </named-connection>
+    </named-connections>
+    <relation type='collection'>
+      <relation connection='salesforce.s' name='Case' table='[Case]' type='table' />
+      <relation connection='salesforce.s' name='Contact' table='[Contact]' type='table' />
+    </relation>
+    <cols>
+      <map key='[CaseNumber]' value='[Case].[CaseNumber]' />
+      <map key='[Status]' value='[Case].[Status]' />
+      <map key='[ContactId]' value='[Case].[ContactId]' />
+      <map key='[Priority]' value='[Case].[Priority]' />
+      <map key='[Priority Rank]' value='[Case].[Internal_Flag]' />
+      <map key='[Junk_A]' value='[Case].[Junk_A]' />
+      <map key='[Junk_B]' value='[Case].[Junk_B]' />
+      <map key='[Id]' value='[Contact].[Id]' />
+      <map key='[FullName]' value='[Contact].[FullName]' />
+      <map key='[SecretEmail]' value='[Contact].[SecretEmail]' />
+    </cols>
+    <object-graph>
+      <objects>
+        <object caption='Case' id='Case (Case)_A1'>
+          <properties>
+            <relation connection='salesforce.s' name='Case' table='[Case]' type='table' />
+          </properties>
+        </object>
+        <object caption='Contact' id='Contact (Contact)_B2'>
+          <properties>
+            <relation connection='salesforce.s' name='Contact' table='[Contact]' type='table' />
+          </properties>
+        </object>
+      </objects>
+      <relationships>
+        <relationship>
+          <expression op='='>
+            <expression op='[ContactId]' />
+            <expression op='[Id]' />
+          </expression>
+          <first-end-point object-id='Case (Case)_A1' />
+          <second-end-point object-id='Contact (Contact)_B2' />
+        </relationship>
+      </relationships>
+    </object-graph>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>CaseNumber</remote-name><local-name>[CaseNumber]</local-name>
+        <parent-name>[Case]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Status</remote-name><local-name>[Status]</local-name>
+        <parent-name>[Case]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>ContactId</remote-name><local-name>[ContactId]</local-name>
+        <parent-name>[Case]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Priority</remote-name><local-name>[Priority]</local-name>
+        <parent-name>[Case]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Internal_Flag</remote-name><local-name>[Internal_Flag]</local-name>
+        <parent-name>[Case]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Junk_A</remote-name><local-name>[Junk_A]</local-name>
+        <parent-name>[Case]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Junk_B</remote-name><local-name>[Junk_B]</local-name>
+        <parent-name>[Case]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Id</remote-name><local-name>[Id]</local-name>
+        <parent-name>[Contact]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>FullName</remote-name><local-name>[FullName]</local-name>
+        <parent-name>[Contact]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>SecretEmail</remote-name><local-name>[SecretEmail]</local-name>
+        <parent-name>[Contact]</parent-name><local-type>string</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+  <column caption='Case Health' datatype='integer' name='[Calculation_1]' role='measure' type='quantitative'>
+    <calculation class='tableau' formula='IF [Priority Rank] = "High" THEN 1 ELSE 0 END' />
+  </column>
+  <column datatype='string' hidden='true' name='[ContactId]' />
+  <column datatype='string' hidden='true' name='[Priority]' />
+  <column datatype='string' hidden='true' name='[Priority Rank]' />
+  <column datatype='string' hidden='true' name='[Junk_A]' />
+  <column datatype='string' hidden='true' name='[Junk_B]' />
+  <column datatype='string' hidden='true' name='[Id]' />
+  <column datatype='string' hidden='true' name='[SecretEmail]' />
+</datasource>"""
+
+
+def _prune_cols(desc, table):
+    """{model_name: is_hidden(bool)} for each emitted column of a table (by display name)."""
+    rel = next(r for r in desc["relations"] if r.get("name") == table)
+    return {c["model_name"]: bool(c.get("is_hidden")) for c in (rel.get("columns") or [])}
+
+
+def test_hidden_prune_drops_unreferenced_keeps_loadbearing():
+    desc = parse_tds(HIDDEN_HEAVY_TDS)
+    assert desc["hidden_prune"] == {"columns_emitted": 6, "columns_pruned_hidden": 4}
+    case = _prune_cols(desc, "Case")
+    # visible physical columns kept, never flagged
+    assert case["CaseNumber"] is False
+    assert case["Status"] is False
+    # unreferenced hidden columns dropped entirely
+    assert "Priority" not in case
+    assert "Junk_A" not in case
+    assert "Junk_B" not in case
+    # hidden JOIN KEY + hidden CALC-REF kept, flagged isHidden
+    assert case["ContactId"] is True
+    assert case["Internal_Flag"] is True
+    contact = _prune_cols(desc, "Contact")
+    assert contact["FullName"] is False
+    assert contact["Id"] is True             # hidden join key kept
+    assert "SecretEmail" not in contact      # unreferenced hidden dropped
+
+
+def test_hidden_prune_carves_calc_ref_via_cols_map_bridge():
+    # 'Case Health' references [Priority Rank] -- a cols-map-only lid mapping to [Case].[Internal_Flag].
+    # The metadata-name index has no 'Priority Rank' entry, so ONLY the <cols><map> bridge can carve
+    # Internal_Flag out. If the bridge regressed, Internal_Flag would be dropped and the calc dangle.
+    desc = parse_tds(HIDDEN_HEAVY_TDS)
+    case = _prune_cols(desc, "Case")
+    assert "Internal_Flag" in case and case["Internal_Flag"] is True
+
+
+def test_hidden_prune_emits_isHidden_in_tmdl():
+    desc = parse_tds(HIDDEN_HEAVY_TDS)
+    case_rel = next(r for r in desc["relations"] if r.get("name") == "Case")
+    tmdl = emit_table_tmdl_m(case_rel, desc, "import")
+    # carved-out hidden columns emit isHidden; a visible column does not
+    assert "column ContactId\n\t\tdataType: string\n\t\tisHidden" in tmdl
+    assert "column Internal_Flag\n\t\tdataType: string\n\t\tisHidden" in tmdl
+    assert "column CaseNumber\n\t\tdataType: string\n\t\tisHidden" not in tmdl
+
+
+def test_hidden_prune_connector_agnostic():
+    # The prune keys off the generic (parent, model_name) identity space and NEVER branches on the
+    # connector class. A SQL Server datasource with the identical hidden-heavy shape prunes identically
+    # to the Salesforce one -- the fix scales across all connectors, not just Salesforce.
+    sql = (HIDDEN_HEAVY_TDS
+           .replace("class='salesforce' server='login.salesforce.com'",
+                    "class='sqlserver' server='db.example.com' dbname='SF'")
+           .replace("authentication='OAuth'", "authentication='sqlserver'"))
+    desc = parse_tds(sql)
+    assert desc["hidden_prune"] == {"columns_emitted": 6, "columns_pruned_hidden": 4}
+    case = _prune_cols(desc, "Case")
+    assert case["ContactId"] is True and case["Internal_Flag"] is True
+    assert "Junk_A" not in case and "Junk_B" not in case
+    assert _prune_cols(desc, "Contact")["Id"] is True
+
+
+def test_hidden_prune_noop_when_nothing_hidden():
+    # With no hidden <column> elements the prune is a byte-identical no-op: the descriptor carries
+    # no hidden_prune record and every physical column emits, unflagged (Superstore-fixture parity).
+    import re as _re
+    no_hidden = _re.sub(r"\s*<column datatype='string' hidden='true'[^>]*/>", "", HIDDEN_HEAVY_TDS)
+    desc = parse_tds(no_hidden)
+    assert desc.get("hidden_prune") is None
+    case = _prune_cols(desc, "Case")
+    assert len(case) == 7 and not any(case.values())
+    contact = _prune_cols(desc, "Contact")
+    assert len(contact) == 3 and not any(contact.values())

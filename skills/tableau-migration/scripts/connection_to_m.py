@@ -652,6 +652,166 @@ def _columns_by_parent(datasource):
     return out
 
 
+# A bracketed field reference inside a calc formula, e.g. ``[Sales]`` or ``[Id (Contact)]``.
+_CALC_REF_RE = re.compile(r"\[([^\]]+)\]")
+
+
+def _lid_to_physical(datasource):
+    """Map a logical column id -> the set of physical ``(table, model_col)`` identities it maps to.
+
+    Built from the live-connection ``<cols><map key='[lid]' value='[table].[col]'>`` bridge. Each
+    physical endpoint is normalized to the SAME identity ``_columns_by_parent`` emits under --
+    object-id-hash ``.hyper`` twins collapsed (``_strip_oid_hash``) and the column ``clean_col``'d --
+    so a lid the metadata-record name index alone can't resolve (a caption a calc uses) still lands
+    on the emitted column. A lid mapping to several DISTINCT identities is kept as a set so the caller
+    can fail closed on genuine ambiguity.
+    """
+    out = {}
+    for cols in _findall_local(datasource, "cols"):
+        for m in _children_local(cols, "map"):
+            key = _strip_brackets((m.get("key") or "").strip())
+            _cat, table, col = _parse_table_name((m.get("value") or "").strip())
+            if key and table and col:
+                out.setdefault(key, set()).add((_strip_oid_hash(table), clean_col(col)))
+    return out
+
+
+def _hidden_physical_columns(datasource):
+    """Set of ``(parent, model_col)`` physical identities the author HID in this datasource.
+
+    A Salesforce (or similar) ``.tds`` exposes the full physical schema but hides most of it via a
+    logical ``<column hidden='true'>`` element. This resolves each hidden NON-calc column to the
+    ``(parent, clean_col(remote))`` identity ``_columns_by_parent`` emits under -- via the
+    live-connection ``<cols><map>`` bridge (object-id twins collapsed) first, else the
+    ``<metadata-record>`` identity by name. A hidden ``<column>`` that carries a ``<calculation>`` is
+    NOT a physical column and is skipped. An unresolvable or genuinely-ambiguous id is omitted
+    (fail-closed: a hidden column we cannot pin to a single emitted identity is simply never pruned,
+    so pruning can only ever DROP a column it positively identified as hidden).
+    """
+    name_to_identity = _metadata_identity_index(datasource)
+    lid_to_phys = _lid_to_physical(datasource)
+    hidden = set()
+    for col in _children_local(datasource, "column"):
+        if (col.get("hidden") or "").strip().lower() != "true":
+            continue
+        if _children_local(col, "calculation"):
+            continue  # a hidden calculated field is not a physical column
+        lid = _strip_brackets((col.get("name") or "").strip())
+        if not lid:
+            continue
+        phys = lid_to_phys.get(lid)
+        if phys is not None:
+            if len(phys) == 1:  # <cols><map> spoke unambiguously
+                hidden.add(next(iter(phys)))
+            continue            # ambiguous cols-map -> fail closed (never over-drop)
+        ident = name_to_identity.get(lid)
+        if ident:
+            hidden.add(ident)
+    return hidden
+
+
+def _calc_referenced_physical(datasource):
+    """Set of ``(parent, model_col)`` physical identities referenced by ANY calc formula.
+
+    Every ``<column><calculation formula=...>`` in the datasource is scanned for ``[field]`` tokens;
+    each token is resolved to a physical identity through BOTH the ``<metadata-record>`` name index
+    AND the ``<cols><map>`` caption bridge (which catches a caption a calc uses that metadata-name
+    resolution alone misses). Used to CARVE OUT a hidden physical column a calc depends on -- Tableau
+    lets an author reference a field and then hide it, so a hidden calc dependency must survive the
+    prune (kept, flagged ``isHidden``) or the calc's DAX would dangle.
+    """
+    name_to_identity = _metadata_identity_index(datasource)
+    lid_to_phys = _lid_to_physical(datasource)
+    refs = set()
+    for col in _findall_local(datasource, "column"):
+        for calc in _children_local(col, "calculation"):
+            formula = calc.get("formula")
+            if not formula:
+                continue
+            for raw in _CALC_REF_RE.findall(formula):
+                tok = _strip_brackets(raw.strip())
+                if not tok:
+                    continue
+                ident = name_to_identity.get(tok)
+                if ident:
+                    refs.add(ident)
+                phys = lid_to_phys.get(tok)
+                if phys is not None and len(phys) == 1:
+                    refs.add(next(iter(phys)))
+    return refs
+
+
+def _prune_hidden_physical_columns(datasource, cols_by_parent, relations, relationships):
+    """Drop hidden physical columns from the emitted tables, keeping the load-bearing ones hidden.
+
+    A Salesforce-style datasource exposes the full physical schema but HIDES ~90% of it, so emitting
+    every ``<metadata-record>`` column yields a model many times wider than the real Tableau
+    datasource (e.g. 2,500+ columns vs the ~290 the author actually uses). Keep a physical column iff
+    it is (a) NOT hidden, (b) a relationship JOIN KEY, or (c) referenced by a calc formula -- Tableau
+    always hides join keys, and a calc can reference a field the author later hid, so both classes are
+    load-bearing and must survive (kept but flagged ``is_hidden`` so they emit with ``isHidden``). The
+    rest are dropped.
+
+    The prune operates in the ``(parent, model_name)`` identity space ``_columns_by_parent`` groups
+    under; join keys are matched in the emitted-table DISPLAY-name space (a role-playing alias that
+    shares a physical column list contributes its own display name). Mutates each emitted table's
+    column list (and column dicts) IN PLACE -- the relation and ``cols_by_parent`` lists are the same
+    objects, so the mutation is seen by every consumer. A table that would be emptied entirely is
+    kept intact (as hidden) rather than emit an invalid zero-column table. Returns
+    ``{"columns_emitted", "columns_pruned_hidden"}``; returns ``None`` (a byte-identical no-op) when
+    the datasource hides nothing (e.g. the Superstore fixtures).
+    """
+    hidden_set = _hidden_physical_columns(datasource)
+    if not hidden_set:
+        return None
+    calc_ref_set = _calc_referenced_physical(datasource)
+    join_key_set = set()
+    for r in relationships:
+        join_key_set.add((r["from_table"].lower(), r["from_col"]))
+        join_key_set.add((r["to_table"].lower(), r["to_col"]))
+
+    # Every emitted-table DISPLAY name that references each shared column-list object. Role-playing
+    # aliases (a distinct <name> over the same physical <item>) share ONE list, so join keys resolved
+    # under EITHER display name must carve out of that single list.
+    displays_by_list = {}
+    for r in relations:
+        if r.get("kind") not in ("table", "custom_sql"):
+            continue
+        cols = r.get("columns")
+        if not cols:
+            continue
+        disp = _table_display(r)
+        if disp:
+            displays_by_list.setdefault(id(cols), set()).add(disp.lower())
+
+    emitted = pruned = 0
+    for parent, cols in cols_by_parent.items():
+        if not cols:
+            continue
+        displays = displays_by_list.get(id(cols), set())
+        keep_ids = set()
+        for c in cols:
+            mn = c["model_name"]
+            if (parent, mn) not in hidden_set:
+                keep_ids.add(id(c))            # visible physical column -> always kept
+                continue
+            carve = (parent, mn) in calc_ref_set or any((d, mn) in join_key_set for d in displays)
+            if carve:
+                c["is_hidden"] = True
+                keep_ids.add(id(c))            # load-bearing hidden column -> kept, flagged
+        new = [c for c in cols if id(c) in keep_ids]
+        if not new:
+            # Pathological: the whole table is hidden with no load-bearing column. Keep it intact
+            # (as hidden) rather than emit an invalid zero-column table.
+            for c in cols:
+                c["is_hidden"] = True
+            new = list(cols)
+        pruned += len(cols) - len(new)
+        emitted += len(new)
+        cols[:] = new
+    return {"columns_emitted": emitted, "columns_pruned_hidden": pruned}
+
+
 def _logical_fields(datasource):
     """Bridge Tableau's LOGICAL field layer to physical columns, for calc->DAX resolution.
 
@@ -1298,6 +1458,13 @@ def parse_tds(xml_text, select=None):
             _rel_seen.add(key)
             relationships.append(r)
     relationship_warnings = list(relationship_warnings) + join_rel_warnings
+    # Prune the hidden physical schema down to what the datasource actually uses (visible columns +
+    # calc-referenced + join-key hidden columns kept, flagged isHidden). Runs AFTER relationships are
+    # fully merged so every join key is resolved against the FULL column set before any column is
+    # dropped; a no-op (None) when nothing is hidden. Mutates the relation/cols_by_parent lists in
+    # place, so the emitter sees the pruned tables.
+    hidden_prune = _prune_hidden_physical_columns(
+        datasource, cols_by_parent, relations, relationships)
     ff_filename, ff_directory = _flatfile_location(datasource)
 
     is_extract = False
@@ -1335,6 +1502,7 @@ def parse_tds(xml_text, select=None):
         "relations": relations,
         "relationships": relationships,
         "relationship_warnings": relationship_warnings,
+        "hidden_prune": hidden_prune,
         "logical_fields": _logical_fields(datasource),
         "unsupported_reasons": unsupported,
         **odbc_facts,
@@ -1520,6 +1688,20 @@ def combine_descriptors(descriptors, *, captions=None):
     combined["named_connection_count"] = sum(
         int(d.get("named_connection_count") or 1) for d in kept)
     combined["table_map"] = table_map
+    # Aggregate each island's hidden-column prune. ``parse_tds`` already pruned every embedded
+    # datasource IN PLACE before combining (the physical collapse has happened; the emitted table
+    # column lists are the pruned ones), and stamped each descriptor's ``hidden_prune``. Sum them so
+    # the consolidated descriptor carries the workbook-wide totals -- without this the combined report
+    # would honestly emit the pruned model yet UNDER-report the prune as absent (``column_prune: None``
+    # / ``columns_pruned_hidden_total: 0``). Connector-agnostic (keys only on the per-island prune
+    # dicts). None when no island hid anything (e.g. all-Superstore workbooks) -> the key is omitted,
+    # so a no-hidden combine stays byte-identical.
+    prunes = [d.get("hidden_prune") for d in kept if d.get("hidden_prune")]
+    if prunes:
+        combined["hidden_prune"] = {
+            "columns_emitted": sum(int(p.get("columns_emitted") or 0) for p in prunes),
+            "columns_pruned_hidden": sum(int(p.get("columns_pruned_hidden") or 0) for p in prunes),
+        }
     return combined
 
 
@@ -2340,7 +2522,7 @@ def emit_table_tmdl_m(relation, descriptor, mode):
         # raw name -- which is fold-safe (a Table.RenameColumns above a folded native query breaks
         # at query time in Fabric: "The name 't0.Order_Date' doesn't exist").
         columns_tmdl += generate_column_tmdl(
-            c["model_name"], c["tmdl_type"], summarize, False, c.get("format_string"),
+            c["model_name"], c["tmdl_type"], summarize, bool(c.get("is_hidden")), c.get("format_string"),
             c.get("data_category"), source_column=(c.get("remote_name") or c["model_name"]))
 
     partition_name = relation.get("item") or clean_col(table_display)
