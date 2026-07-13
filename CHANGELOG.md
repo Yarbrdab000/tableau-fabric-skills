@@ -13,6 +13,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.36.0` → `1.37.0`): Faithful emission of Tableau's stock
+  `Number of Records` field — a Sum-aggregated calculated column of 1s.** Tableau's generic 1-per-row
+  row-count field (the classic `Number of Records`, or the modern `Count of <Table>`) is defined as the
+  literal `1`; dragging it into a view auto-sums that column of 1s to the table's row count. It carries
+  `role=measure`, so the migrator previously emitted a nonsense `measure 'Number of Records' = 1` — a measure
+  that in Power BI **always returns 1**, never the row count. It now lands faithfully as a real calculated
+  **column** `= 1` on the fact table, typed `int64` with `summarizeBy: sum`, so it aggregates to the row count
+  exactly as it does in Tableau. Detection is fail-closed: the reclassification fires only when the formula is
+  the literal `1` **and** the field carries the stock name, so a user field that merely borrows the name but
+  computes something else — or a plain `= 1` measure with a different name — is left untouched. The stock field
+  is deliberately **not** registered as a resolvable model column, so a measure's `SUM([Number of Records])`
+  keeps using the compiler's existing `COUNTROWS` path (which fails closed on an ambiguous multi-table count).
+  Purely additive: a corpus audit over the TableauChallenge solutions shows **0 changes** to any other calc
+  (17 translated / 12 stub / 14 addressing-dependent, unchanged). Report schema is additive (no keys renamed
+  or removed).
 - **tableau-migration (skill `1.35.0` → `1.36.0`): Calc→DAX compiler depth — calculated columns are now
   visible to the measure resolver (nested-LOD-over-a-calculated-dimension).** Additive and faithful-or-stub —
   every measure that already translated is byte-identical; the new work only turns former stubs into

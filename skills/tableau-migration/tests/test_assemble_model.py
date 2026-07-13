@@ -1,6 +1,7 @@
 """Orchestrator tests: .tds -> complete Fabric semantic model definition."""
 import base64
 import json
+import re
 
 import pytest
 
@@ -15,6 +16,8 @@ from assemble_model import (
     _date_axis_order_resolver,
     _approved_entry,
     _calc_columns_part,
+    _split_calcs_by_role,
+    _is_stock_row_count_calc,
     _win_long_path,
 )
 from connection_to_m import parse_tds, combine_descriptors
@@ -911,6 +914,80 @@ def test_measure_bare_reference_to_calc_column_stays_stub_end_to_end():
     meas = {r["measure"]: r for r in out["report"]["measures"]}
     assert meas["Bare Ref"]["status"] == "stub"
     assert meas["Bare Ref"]["dax"] is None
+
+
+# --- v1.37.0: Tableau's stock "Number of Records" -> a Sum-aggregated column of 1s ----------------
+
+def test_is_stock_row_count_calc_detects_stock_fields_and_fails_closed():
+    # Detector unit: the classic name and the modern "Count of <Table>" both match ONLY with the
+    # literal-1 formula; anything else (borrowed name, different formula, empty) fails closed.
+    assert _is_stock_row_count_calc({"name": "Number of Records", "formula": "1"})
+    assert _is_stock_row_count_calc({"name": "number of records", "formula": " 1 "})
+    assert _is_stock_row_count_calc({"name": "Count of Orders", "formula": "1"})
+    assert not _is_stock_row_count_calc({"name": "Number of Records", "formula": "2"})
+    assert not _is_stock_row_count_calc({"name": "Always One", "formula": "1"})
+    assert not _is_stock_row_count_calc({"name": "Count", "formula": "1"})   # "count of <table>" only
+    assert not _is_stock_row_count_calc({"name": "Number of Records", "formula": ""})
+
+
+def test_split_calcs_by_role_reroutes_stock_number_of_records_to_column():
+    # v1.37.0: the stock 1-per-row field carries role=measure, but emitting it as a measure yields a
+    # nonsense ``measure = 1`` (always 1, never the row count). The role splitter recognises it and
+    # reroutes it to COLUMN mode, where it becomes a real column of 1s that Sum-aggregates to the
+    # row count. A genuine measure alongside it is untouched.
+    measures, dims = _split_calcs_by_role([
+        {"name": "Number of Records", "formula": "1", "role": "measure"},
+        {"name": "Total Sales", "formula": "SUM([Sales])", "role": "measure"},
+    ])
+    assert [c["name"] for c in measures] == ["Total Sales"]
+    assert [c["name"] for c in dims] == ["Number of Records"]
+
+
+def test_split_calcs_by_role_reroutes_modern_count_of_table_to_column():
+    # Newer Tableau renames the stock field to ``Count of <Table>`` -- same 1-per-row semantics, so
+    # it reroutes the same way.
+    measures, dims = _split_calcs_by_role([
+        {"name": "Count of Orders", "formula": "1", "role": "measure"},
+    ])
+    assert measures == []
+    assert [c["name"] for c in dims] == ["Count of Orders"]
+
+
+def test_split_calcs_by_role_only_reroutes_the_genuine_stock_field():
+    # Fail-closed: a user measure that merely evaluates to 1 but is NOT the stock field stays a
+    # measure, and a field that borrows the stock NAME but computes something else (formula != 1)
+    # stays a measure too. Surgical -- neither is silently turned into a column of 1s.
+    measures, dims = _split_calcs_by_role([
+        {"name": "Always One", "formula": "1", "role": "measure"},          # not the stock name
+        {"name": "Number of Records", "formula": "2", "role": "measure"},   # stock name, wrong formula
+    ])
+    assert {c["name"] for c in measures} == {"Always One", "Number of Records"}
+    assert dims == []
+
+
+def test_stock_number_of_records_emits_as_sum_aggregated_column_of_ones():
+    # End-to-end emission: the rerouted stock field lands as a real ``column 'Number of Records' = 1``
+    # on the fact (anchor) table -- int64 + summarizeBy sum so dropping it into a visual SUMs to the
+    # row count (Tableau's auto-aggregation). It is emitted as a COLUMN, never a ``measure = 1``.
+    out = _model_with_calc_cols_and_measures(
+        dim_calcs=[{"name": "Number of Records", "formula": "1"}], calcs=[])
+    cols = {r["column"]: r for r in out["report"]["calc_columns"]}
+    assert cols["Number of Records"]["status"] == "translated"
+    assert cols["Number of Records"]["dax"] == "1"
+    assert cols["Number of Records"]["table"] == "Orders"
+
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "column 'Number of Records' = 1" in orders
+    # scope the type + default-aggregation assertions to the Number of Records column block
+    blk = orders[orders.index("column 'Number of Records'"):]
+    nxt = re.search(r"\n\t(?:column|measure|partition|hierarchy) ", blk[30:])
+    blk = blk[: (30 + nxt.start()) if nxt else len(blk)]
+    assert "dataType: int64" in blk
+    assert "summarizeBy: sum" in blk
+
+    # NEVER a measure = 1
+    assert "measure 'Number of Records'" not in out["parts"].get(
+        "definition/tables/_Measures.tmdl", "")
 
 
 

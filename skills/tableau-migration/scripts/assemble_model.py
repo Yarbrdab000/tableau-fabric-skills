@@ -1567,6 +1567,22 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
         name, formula = calc["name"], calc.get("formula", "")
         if name.lower() in consumed_lower:
             continue
+        if _is_stock_row_count_calc(calc):
+            # Tableau's stock 1-per-row field -> a real column of 1s on the fact (anchor) table,
+            # int64 + summarizeBy sum so dropping it into a visual SUMs to the row count (matching
+            # Tableau's auto-aggregation). Faithful, unlike the nonsense ``measure = 1`` the naive
+            # measure path would emit. Deliberately NOT registered in ``column_refs``: a measure's
+            # ``SUM([Number of Records])`` keeps using the compiler's COUNTROWS path, which fails
+            # closed on an ambiguous multi-table count -- a guarantee a blanket column ref would lose.
+            by_table[anchor_table] = by_table.get(anchor_table, "") + T.generate_calc_column_tmdl(
+                name, formula, "1", tmdl_type="int64", summarize="sum",
+                translated_by="deterministic (stock row-count field)")
+            report.append({
+                "column": name, "table": anchor_table, "status": "translated",
+                "reason": "ok", "dax": "1", "tableau_formula": formula,
+                "date_bound": False, "date_table": None, "date_attribute": None,
+            })
+            continue
         bound_attr = None
         if date_table and active_date_cols:
             match = date_attribute_binding(formula)
@@ -2883,16 +2899,44 @@ def list_workbook_datasources(source):
     return workbook_datasources(_read_tds_source(source))
 
 
+# Tableau's stock 1-per-row field: the classic "Number of Records" or the modern "Count of
+# <Table>", both defined as the literal ``1``. Dragging it into a viz auto-SUMs that column of 1s
+# to the table's row count. It carries role=measure, so the naive role routing emits a nonsense
+# ``measure 'Number of Records' = 1`` -- a measure that ALWAYS returns 1, never the row count.
+# Recognised here (stock name + constant-1 formula) so the orchestrator can emit it faithfully as a
+# real calculated COLUMN of 1s (int64, summarizeBy sum), matching Tableau's own representation. The
+# constant-1 gate keeps this fail-closed: a user field that merely borrows the name but computes
+# something else is NOT reclassified.
+_COUNT_OF_TABLE_RE = re.compile(r"^count of\s+\S", re.IGNORECASE)
+
+
+def _is_stock_row_count_calc(calc):
+    """True for Tableau's stock 1-per-row row-count field (classic ``Number of Records`` or the
+    modern ``Count of <Table>``), identified by its literal ``1`` formula. Fail-closed: any calc
+    whose formula is not exactly ``1`` -- even one borrowing the name -- returns False."""
+    if (calc.get("formula") or "").strip() != "1":
+        return False
+    name = (calc.get("name") or "").strip()
+    return name.casefold() == "number of records" or bool(_COUNT_OF_TABLE_RE.match(name))
+
+
 def _split_calcs_by_role(calcs):
     """Partition an ``extract_calcs`` list into ``(measure_calcs, dim_calcs)`` by Tableau role.
 
     Dimension-role calcs are routed to column mode (DAX calculated columns); everything else
     (measure-role and roleless calcs) stays on the measure path. Roleless calcs default to the
     measure path -- the historical, safe behavior. Returns two new lists; the input is unchanged.
+
+    EXCEPTION: Tableau's stock 1-per-row field (``Number of Records`` / ``Count of <Table>``, formula
+    ``1``) carries role=measure but is faithfully a column of 1s, so it is rerouted to column mode --
+    otherwise it emits a nonsense ``measure = 1`` (always 1, never the row count). See
+    ``_is_stock_row_count_calc`` and the column-mode emission in ``_calc_columns_part``.
     """
     measure_calcs, dim_calcs = [], []
     for c in calcs or []:
-        if (c.get("role") or "").strip().lower() == "dimension":
+        if _is_stock_row_count_calc(c):
+            dim_calcs.append(c)          # column of 1s (Sum-aggregated), not measure = 1
+        elif (c.get("role") or "").strip().lower() == "dimension":
             dim_calcs.append(c)
         else:
             measure_calcs.append(c)
