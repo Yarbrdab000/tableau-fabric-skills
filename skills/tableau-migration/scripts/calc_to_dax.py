@@ -53,7 +53,13 @@ public shape but parses in row context (mode="column"): a bare ``[field]`` resol
 ``'Table'[Col]`` and the row-level string / date / numeric-cast functions become available
 (LEN/LEFT/RIGHT/MID/UPPER/LOWER/REPLACE/CONTAINS/STARTSWITH/ENDSWITH/FIND; YEAR/MONTH/DAY/TODAY/
 NOW/DATEPART/DATEADD/DATEDIFF/DATETRUNC/DATE/MAKEDATE; INT/FLOAT; string ``+`` -> null-preserving
-concatenation). Aggregations, PERCENTILE, and LODs are invalid there and fall back. Mappings whose
+concatenation; and date arithmetic -- ``[date] +/- N`` shifts by N days, ``[date] - [date]`` yields
+the day difference, since DAX stores dates as day-serial numbers). A bare ``{FIXED d1,...: AGG(...)}``
+or table-scoped ``{AGG(...)}`` also translates here: the level-of-detail value is row-invariant within
+its declared grain, so it emits the same CALCULATE(inner, ALLEXCEPT/ALL('T')) scalar as measure mode
+(a calculated column carries no viz filter context, so this is exactly Tableau FIXED). Non-LOD
+aggregations, PERCENTILE, and a TOP-LEVEL re-aggregation of an LOD (``SUM({FIXED ...})``) are viz-grain
+aggregates -- invalid in a column, so they fall back. Mappings whose
 DAX equivalent is NOT faithful are deliberately left to fall back: TRIM/LTRIM/RTRIM (DAX TRIM also
 collapses internal whitespace), SPLIT (no general DAX form), STR and DATE(text) (culture-sensitive
 formatting/parsing), and the start-of-week-dependent DATEPART('week'/'weekday')/DATEDIFF('week').
@@ -139,6 +145,21 @@ def _oid_relation_tail(parts):
         if _INTERNAL_OBJECT_ID not in (p or ""):
             return p or ""
     return (parts[-1] if parts else "") or ""
+
+# -- Stock row-count field [Number of Records] --------------------------------
+# Tableau adds a synthetic 1-per-row field named "Number of Records" to every datasource (renamed
+# to the per-table auto-field "Count of <Table>" in 2020.2+). It maps to no real model column, so
+# an aggregate of it (SUM/COUNT) is the table's row count -> COUNTROWS('<table>') and a bare
+# row-level reference is the constant 1. Matched narrowly to the reserved legacy caption -- the
+# modern per-table count already arrives via the object-id COUNT path above, and a broader match
+# would collide with a user calc named "Count of <x>". The name is an unprotectable Tableau fact;
+# the emit is gated on the caption NOT resolving to a real column (a genuine same-named column
+# always wins) and on the counted table being unambiguous, so it is fail-safe by construction.
+_ROW_COUNT_AGGS = {"SUM", "COUNT"}
+
+
+def _is_number_of_records(caption):
+    return (caption or "").strip().casefold() == "number of records"
 
 # Outer aggregation -> DAX iterator used to RE-AGGREGATE a FIXED LOD over its own grain:
 # SUMMARIZE materializes the LOD grain, CALCULATE re-enters row context for the inner measure.
@@ -694,6 +715,23 @@ class _Parser:
                     "text",
                 )
                 continue
+            # Date arithmetic. DAX stores dates as day-serial floats, so these are exact and
+            # faithful (and already emitted internally by DATEADD/ISOYEAR):
+            #   date - date       -> number of days   (Tableau `date - date`)
+            #   date +/- number   -> date shifted by N days
+            #   number + date     -> date             ('+' commutes)
+            # The disallowed combinations (number - date, date + date, text +/- x) are NOT
+            # matched here and fall through to the numeric check below -> fail closed, matching
+            # Tableau (which rejects them).
+            if op == "-" and left[1] == "date" and right[1] == "date":
+                left = (f"{left[0]} - {right[0]}", "number")
+                continue
+            if left[1] == "date" and right[1] == "number":
+                left = (f"{left[0]} {op} {right[0]}", "date")
+                continue
+            if op == "+" and left[1] == "number" and right[1] == "date":
+                left = (f"{left[0]} + {right[0]}", "date")
+                continue
             self._expect_number(left)
             self._expect_number(right)
             left = (f"{left[0]} {op} {right[0]}", "number")
@@ -761,7 +799,22 @@ class _Parser:
             return (f"({inner[0]})", inner[1])
         if k == "op" and v == "{":
             if self.mode == "column":
-                raise _CalcError("LOD expression not valid in a row-level column calc")
+                # A FIXED LOD is a datasource-level value (constant within its declared grain), so it
+                # is faithful inside a row-level calculated column: CALCULATE(inner, ALLEXCEPT/ALL)
+                # re-aggregates at the LOD grain under the current row's context transition -- exactly
+                # Tableau FIXED. (A calc column carries no viz filter context, so it avoids even the
+                # measure-mode divergence-under-a-dimension-filter caveat: the column form is the more
+                # faithful home.) Parse the whole LOD -- including its inner aggregate -- in measure
+                # context so the aggregate is legal; the emitted scalar is mode-independent, then
+                # row-level parsing resumes for the rest of the column calc. A top-level aggregate
+                # (incl. a top-level re-aggregated LOD like SUM({FIXED ...})) is NOT reached here and
+                # still falls back -- only a bare {FIXED ...}/{AGG(...)} value is row-level-valid.
+                saved_mode = self.mode
+                self.mode = "measure"
+                try:
+                    return self._fixed_lod_bare()
+                finally:
+                    self.mode = saved_mode
             return self._fixed_lod_bare()
         if k == "id":
             u = v.upper()
@@ -1019,6 +1072,17 @@ class _Parser:
             return table
         return {t.lower(): t for t in self.known_tables}.get(table.lower())
 
+    def _row_count_table(self):
+        # The table whose rows Tableau's [Number of Records] counts: the single table already in
+        # play (e.g. an enclosing FIXED LOD's dimension table lands in tables_used before the inner
+        # aggregate is parsed), else the model's sole known table. 0 or >1 candidates -> None so the
+        # caller fails closed (ambiguous which table to count).
+        if len(self.tables_used) == 1:
+            return next(iter(self.tables_used))
+        if len(self.known_tables) == 1:
+            return next(iter(self.known_tables))
+        return None
+
     def _agg(self):
         name = self._next()[1].upper()
         if name not in _AGG_MAP:
@@ -1049,6 +1113,15 @@ class _Parser:
             self._expect_op(")")
             resolved = self.resolver(v)
             if resolved is None:
+                # Tableau's stock row-count field [Number of Records] resolves to no real column;
+                # SUM/COUNT of it is the table's row count -> COUNTROWS('T'). Fail-safe: reached
+                # only because the caption did not resolve above (a genuine same-named column wins),
+                # and gated on an unambiguous single counted table (else fall closed).
+                if name in _ROW_COUNT_AGGS and _is_number_of_records(v):
+                    rc_table = self._row_count_table()
+                    if rc_table is not None:
+                        self.tables_used.add(rc_table)
+                        return (f"COUNTROWS({_dax_table(rc_table)})", "number")
                 raise _CalcError(f"unresolved/ambiguous field [{v}]")
             table, col, tmdl_type = resolved
             # Reject aggregates invalid for the column's data type (would emit DAX that errors).
@@ -1289,6 +1362,10 @@ class _Parser:
         _, cap = self._next()
         resolved = self.resolver(cap)
         if resolved is None:
+            # Tableau's stock [Number of Records] is a synthetic 1-per-row field -> the constant 1
+            # at row level (fail-safe: reached only when it names no real model column above).
+            if _is_number_of_records(cap):
+                return ("1", "number")
             raise _CalcError(f"unresolved/ambiguous field [{cap}]")
         table, col, tmdl_type = resolved
         dtype = _DTYPE_BY_TMDL.get(tmdl_type)
@@ -1804,7 +1881,9 @@ def translate_tableau_calc_to_dax(formula, resolver, param_resolver=None, measur
     known_tables(iterable of table display names) | None: enables object-model row-count
     translation -- ``COUNT``/``COUNTD`` over ``[__tableau_internal_object_id__].[<relation>_<hex32>]``
     emits ``COUNTROWS('<table>')`` when the hash-stripped relation matches one of these tables (or,
-    when omitted, trusts the relation token). Default None -> still emits for a clean relation id.
+    when omitted, trusts the relation token). Also supplies the counted table for Tableau's stock
+    ``[Number of Records]`` field (``SUM``/``COUNT`` of it -> ``COUNTROWS('<table>')``) when no
+    single-table context is otherwise in play. Default None -> still emits for a clean relation id.
     """
     dax, reason, tables_used, _dtype = translate_tableau_calc_to_dax_typed(
         formula, resolver, param_resolver=param_resolver, measure_refs=measure_refs,
@@ -1853,9 +1932,13 @@ def translate_tableau_calc_to_column_dax(formula, resolver, known_tables=None, c
       * the row-level string / date / numeric-cast functions become available
         (LEN/LEFT/RIGHT/MID/UPPER/LOWER/REPLACE/CONTAINS/STARTSWITH/ENDSWITH/FIND;
         YEAR/MONTH/DAY/TODAY/NOW/DATEPART/DATEADD/DATEDIFF/DATETRUNC/DATE/MAKEDATE; INT/FLOAT),
-        plus string ``+`` -> null-preserving concatenation.
-    Aggregations, PERCENTILE, and LOD expressions are NOT valid in a row-level column and
-    fall back here (use the measure entry point for those).
+        plus string ``+`` -> null-preserving concatenation and date arithmetic
+        (``[date] +/- N`` days, ``[date] - [date]`` day difference).
+    A bare ``{FIXED d1,...: AGG(...)}`` / table-scoped ``{AGG(...)}`` LOD ALSO translates here
+    (v1.34.0): the LOD value is row-invariant within its grain, so it emits the same
+    ``CALCULATE(inner, ALLEXCEPT/ALL('T'))`` scalar as the measure entry point. Non-LOD
+    aggregations, PERCENTILE, and a top-level re-aggregation of an LOD (``SUM({FIXED ...})``)
+    are viz-grain aggregates and fall back here (use the measure entry point for those).
 
     Caller binding contract (the orchestrator/renderer owns the actual binding): when
     ``tables_used`` is a single ``{T}``, the emitted expression must be materialized as a

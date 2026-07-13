@@ -843,24 +843,35 @@ _ARGMIN_MEASURE_FORMULA = (
     "IF {FIXED [State] : MIN(%s)} = %s THEN [City] END" % (_ARGMAX_DETAIL_LOD, _ARGMAX_DETAIL_LOD))
 
 
-def test_argmax_and_argmin_measures_auto_suggest_through_assemble_model():
-    # The deterministic tier STUBS a nested-FIXED-LOD argmax/argmin measure; assemble_model must then
-    # consult the idiom registry and surface an `assisted-suggested` row + an `assisted_suggestions`
-    # review entry carrying the detected pattern -- the real auto-detect wiring an actual workbook hits.
+def test_argmax_and_argmin_nested_lod_measures_translate_deterministically_as_columns():
+    # v1.34.0 CASCADE: once column mode translates FIXED LODs in place, a measure-LABELLED but
+    # genuinely row-level nested-FIXED-LOD argmax/argmin (IF {FIXED d : MAX({FIXED d,e : agg})} =
+    # {FIXED d,e : agg} THEN [dim] END) is reclassified onto the calc-column path by the row-level
+    # pre-router and translates DETERMINISTICALLY + faithfully -- so it no longer needs the assisted
+    # idiom registry. Deterministic beating the assisted tier is the correct priority, and it is the
+    # nested-calc "cascading win": the secondary compiler no longer has to sift this nesting chain.
     calcs = [
         {"name": "Top City", "formula": _ARGMAX_MEASURE_FORMULA, "internal_name": "Calc_argmax"},
         {"name": "Bottom City", "formula": _ARGMIN_MEASURE_FORMULA, "internal_name": "Calc_argmin"},
     ]
     out = assemble_import_model(parse_tds(_ARGMAX_MODEL_TDS), model_name="Superstore", calcs=calcs)
-    rows = {r["measure"]: r for r in out["report"]["measures"]}
-    assert rows["Top City"]["status"] == "assisted-suggested"
-    assert rows["Top City"]["assisted_suggestion"]["pattern"] == "argmax-dimension"
-    assert rows["Bottom City"]["status"] == "assisted-suggested"
-    assert rows["Bottom City"]["assisted_suggestion"]["pattern"] == "argmin-dimension"
-    # both surface in the review list the orchestrator reads, each carrying its detected pattern
-    sugg = {s["measure"]: s["pattern"] for s in out["report"]["assisted_suggestions"]}
-    assert sugg["Top City"] == "argmax-dimension"
-    assert sugg["Bottom City"] == "argmin-dimension"
+    cols = {r["column"]: r for r in out["report"]["calc_columns"]}
+    assert cols["Top City"]["status"] == "translated"
+    assert cols["Top City"]["table"] == "Orders"
+    assert cols["Top City"]["dax"] == (
+        "IF(CALCULATE(MAXX(SUMMARIZE('Orders', 'Orders'[State], 'Orders'[City]), "
+        "CALCULATE(SUM('Orders'[Sales]))), ALLEXCEPT('Orders', 'Orders'[State])) = "
+        "CALCULATE(SUM('Orders'[Sales]), ALLEXCEPT('Orders', 'Orders'[State], 'Orders'[City])), "
+        "'Orders'[City])")
+    assert cols["Bottom City"]["status"] == "translated"
+    assert cols["Bottom City"]["dax"] == (
+        "IF(CALCULATE(MINX(SUMMARIZE('Orders', 'Orders'[State], 'Orders'[City]), "
+        "CALCULATE(SUM('Orders'[Sales]))), ALLEXCEPT('Orders', 'Orders'[State])) = "
+        "CALCULATE(SUM('Orders'[Sales]), ALLEXCEPT('Orders', 'Orders'[State], 'Orders'[City])), "
+        "'Orders'[City])")
+    # deterministic won: neither is left on the measure path or handed to the assisted tier
+    assert "Top City" not in {r["measure"] for r in out["report"]["measures"]}
+    assert out["report"]["assisted_suggestions"] == []
 
 
 def test_approved_dim_calc_never_overrides_a_deterministic_translation():
