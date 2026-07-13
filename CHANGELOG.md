@@ -13,6 +13,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.35.0` → `1.36.0`): Calc→DAX compiler depth — calculated columns are now
+  visible to the measure resolver (nested-LOD-over-a-calculated-dimension).** Additive and faithful-or-stub —
+  every measure that already translated is byte-identical; the new work only turns former stubs into
+  provably-correct DAX (or leaves them honest stubs). A calculated column is a genuine row-level model column,
+  so a measure that references one should resolve to it. Previously the measure-mode resolver knew only
+  **physical** columns, so a measure whose FIXED-LOD grain was a calc dimension — e.g.
+  `{ FIXED : AVG({ FIXED [Order Date (Months)] : SUM([Sales]) }) }` where `[Order Date (Months)]` is itself a
+  calculated column — stubbed with `unresolved/ambiguous LOD dimension`. The orchestrator now layers the
+  faithfully-emitted, single-home, typed calc-column identities **under** the datasource resolver it hands the
+  measure path: the base physical resolver always wins (so every previously-translated measure is byte-for-byte
+  unchanged and the augmented resolver is inert when a datasource has no calc columns), and the calc-column
+  identities fill only the references the base could not resolve. The nested LOD then re-aggregates over the
+  calc column's grain (`AVERAGEX(SUMMARIZE(...))`) exactly as it would over a physical dimension. Fail-closed is
+  preserved: a **bare** row-level calc-column reference in a measure still stubs (a measure must aggregate), and
+  the existing type checks are untouched (e.g. `AVG([date column])` still errors). Report schema is additive
+  (no keys renamed or removed).
 - **tableau-migration (skill `1.34.0` → `1.35.0`): Calc→DAX compiler depth — cross-calc token-keying
   cascade in calculated-column mode, and sub-day `DATETRUNC`.** Additive and faithful-or-stub — every calc
   that already translated is byte-identical; the new work only turns former stubs into provably-correct DAX

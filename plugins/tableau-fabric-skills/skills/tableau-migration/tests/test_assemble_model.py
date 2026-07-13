@@ -797,7 +797,7 @@ def test_cross_table_sibling_reference_stays_stub():
         {"name": "SibOrders", "formula": "UPPER([Category])"},
         {"name": "X", "formula": "[SibOrders] + [Region]"},
     ]
-    _, report = _calc_columns_part(dim, resolve, "Orders", known_tables={"Orders", "People"})
+    _, report, _ = _calc_columns_part(dim, resolve, "Orders", known_tables={"Orders", "People"})
     rows = {r["column"]: r for r in report}
     assert rows["SibOrders"]["status"] == "translated"
     assert rows["X"]["status"] == "stub"
@@ -818,7 +818,7 @@ def test_token_keyed_sibling_reference_resolves():
         {"name": "Order Label", "formula": '[Calculation_9911] + " (x)"'},
         {"name": "Order Code", "internal_name": "Calculation_9911", "formula": "UPPER([Order ID])"},
     ]
-    by_table, report = _calc_columns_part(dim, resolve, "Orders", known_tables={"Orders"})
+    by_table, report, _ = _calc_columns_part(dim, resolve, "Orders", known_tables={"Orders"})
     rows = {r["column"]: r for r in report}
     assert rows["Order Code"]["status"] == "translated"
     assert rows["Order Label"]["status"] == "translated"
@@ -840,7 +840,7 @@ def test_token_keyed_reference_to_untranslatable_sibling_stays_stub():
         {"name": "Avg Col", "internal_name": "Calculation_7", "formula": "AVG([Sales])"},
         {"name": "Uses Avg", "formula": "[Calculation_7] + 1"},
     ]
-    _, report = _calc_columns_part(dim, resolve, "Orders", known_tables={"Orders"})
+    _, report, _ = _calc_columns_part(dim, resolve, "Orders", known_tables={"Orders"})
     rows = {r["column"]: r for r in report}
     assert rows["Avg Col"]["status"] == "stub"      # aggregation is an honest column-mode stub
     assert rows["Uses Avg"]["status"] == "stub"     # its token consumer stays a stub too
@@ -859,6 +859,58 @@ def test_sibling_calc_chain_resolves_by_internal_token_end_to_end():
     assert rows["Order Label"]["status"] == "translated"
     orders = out["parts"]["definition/tables/Orders.tmdl"]
     assert "'Orders'[Order Code]" in orders   # the token consumer bound to the caption column
+
+
+def _model_with_calc_cols_and_measures(dim_calcs, calcs):
+    return assemble_import_model(
+        parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+        dim_calcs=dim_calcs, calcs=calcs)
+
+
+def test_measure_lod_grain_over_calc_column_resolves_end_to_end():
+    # v1.36.0 CASCADE: a calculated column is a genuine row-level model column, so a MEASURE whose
+    # FIXED-LOD grain is that calc dimension must bind to it. The orchestrator layers the emitted
+    # calc-column identities under the datasource resolver it hands the measure path, so
+    # ``{ FIXED : AVG({ FIXED [Order Bucket] : SUM([Sales]) }) }`` -- where ``[Order Bucket]`` is
+    # itself a calc column -- translates instead of stubbing on ``unresolved/ambiguous LOD dimension``.
+    # This is the deterministic form of the real "Avg. Sales by Month LOD" nested-LOD-over-a-calc-date
+    # witness. The inner LOD re-aggregates over the calc column's grain (SUMMARIZE) and the outer
+    # table-scoped LOD averages it, ignoring filter context (ALL).
+    out = _model_with_calc_cols_and_measures(
+        dim_calcs=[{"name": "Order Bucket", "formula": "UPPER([Order ID])"}],
+        calcs=[{"name": "Avg Sales by Bucket",
+                "formula": "{ FIXED : AVG({ FIXED [Order Bucket] : SUM([Sales]) }) }"}])
+    cols = {r["column"]: r for r in out["report"]["calc_columns"]}
+    assert cols["Order Bucket"]["status"] == "translated"   # the grain is a real calc column
+    meas = {r["measure"]: r for r in out["report"]["measures"]}
+    assert meas["Avg Sales by Bucket"]["status"] == "translated"
+    assert meas["Avg Sales by Bucket"]["dax"] == (
+        "CALCULATE(AVERAGEX(SUMMARIZE('Orders', 'Orders'[Order Bucket]), "
+        "CALCULATE(SUM('Orders'[Sales]))), ALL('Orders'))")
+
+
+def test_measure_aggregation_over_numeric_calc_column_resolves_end_to_end():
+    # A measure may AGGREGATE a calculated column: SUM([Double Qty]) where [Double Qty] = [Quantity]*2
+    # is a real numeric column, so it binds to SUM('Orders'[Double Qty]) via the layered resolver.
+    out = _model_with_calc_cols_and_measures(
+        dim_calcs=[{"name": "Double Qty", "formula": "[Quantity] * 2"}],
+        calcs=[{"name": "Total Double", "formula": "SUM([Double Qty])"}])
+    meas = {r["measure"]: r for r in out["report"]["measures"]}
+    assert meas["Total Double"]["status"] == "translated"
+    assert meas["Total Double"]["dax"] == "SUM('Orders'[Double Qty])"
+
+
+def test_measure_bare_reference_to_calc_column_stays_stub_end_to_end():
+    # Fail-closed is preserved: making the calc column VISIBLE to the measure resolver does NOT make a
+    # BARE row-level reference to it a valid measure -- a measure must aggregate, so ``[Order Bucket]``
+    # alone still stubs with the same measure-context reason (only an aggregation arg or an LOD grain
+    # over the column becomes valid). No phantom DAX is emitted.
+    out = _model_with_calc_cols_and_measures(
+        dim_calcs=[{"name": "Order Bucket", "formula": "UPPER([Order ID])"}],
+        calcs=[{"name": "Bare Ref", "formula": "[Order Bucket]"}])
+    meas = {r["measure"]: r for r in out["report"]["measures"]}
+    assert meas["Bare Ref"]["status"] == "stub"
+    assert meas["Bare Ref"]["dax"] is None
 
 
 
