@@ -18,6 +18,7 @@ from assemble_model import (
     _calc_columns_part,
     _split_calcs_by_role,
     _is_stock_row_count_calc,
+    _approved_dtype,
     _win_long_path,
 )
 from connection_to_m import parse_tds, combine_descriptors
@@ -1850,4 +1851,172 @@ def test_calc_coverage_buckets_assisted_states():
     assert by["b"]["live"] is True and by["b"]["has_suggestion"] is True
     assert by["c"]["live"] is False and by["c"]["has_suggestion"] is True
     assert by["d"]["has_suggestion"] is False
+
+
+# -- approved-keystone nested cascade seeding (measures side) ---------------------------------------
+#    An irreducible base (e.g. a WINDOW_ table calc) authored via approved_calc_dax is seeded into
+#    the cross-calc reference map BEFORE the deterministic fix-point, so every dependent that stubbed
+#    ONLY because that base was an untranslatable measure now translates by referencing the approved
+#    measure -- and so do ITS dependents, to any depth. This is the second-compiler "author one
+#    keystone, get the whole chain" cascade. Faithful + fail-closed throughout.
+def _keystone_measures(*, approved=None):
+    # Slope is a WINDOW_ table calc -> the deterministic tier cannot render it at datasource scope,
+    # so it STUBS unless approved. Residuals references it by CAPTION; AboveBelow references Residuals.
+    calcs = [
+        {"name": "Slope", "formula": "WINDOW_SUM(SUM([Sales]))",
+         "role": "measure", "internal_name": "Calculation_11"},
+        {"name": "Residuals", "formula": "SUM([Sales]) - [Slope]",
+         "role": "measure", "internal_name": "Calculation_22"},
+        {"name": "AboveBelow", "formula": "[Residuals] > 0",
+         "role": "measure", "internal_name": "Calculation_33"},
+    ]
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                               calcs=calcs, dim_calcs=[], approved_calc_dax=approved)
+    return {r["measure"]: r for r in out["report"]["measures"]}
+
+
+def test_approved_keystone_cascades_to_dependent_measure():
+    # Authoring ONLY the irreducible Slope keystone makes its 1-level dependent Residuals translate
+    # deterministically by referencing the approved measure [Slope].
+    m = _keystone_measures(approved={"Slope": "CALCULATE(SUM('Orders'[Sales]))"})
+    assert m["Slope"]["status"] == "assisted-approved"
+    assert m["Residuals"]["status"] == "translated"
+    assert m["Residuals"]["dax"] == "SUM('Orders'[Sales]) - [Slope]"
+    # provenance preserved on the cascaded dependent
+    assert m["Residuals"]["tableau_formula"] == "SUM([Sales]) - [Slope]"
+
+
+def test_approved_keystone_cascades_two_levels():
+    # The seed precedes the fix-point, so a dependent-of-a-dependent (AboveBelow -> Residuals ->
+    # Slope) cascades too -- to any depth -- from a single authored keystone.
+    m = _keystone_measures(approved={"Slope": "CALCULATE(SUM('Orders'[Sales]))"})
+    assert m["Residuals"]["status"] == "translated"
+    assert m["AboveBelow"]["status"] == "translated"
+    assert m["AboveBelow"]["dax"] == "[Residuals] > 0"
+
+
+def test_approved_keystone_seeding_inert_without_approvals():
+    # Fail-closed / inert: with NO approvals the whole chain stubs exactly as before (the seeding loop
+    # skips every calc that has no approved DAX), so the seeding never invents a translation.
+    m = _keystone_measures(approved=None)
+    assert m["Slope"]["status"] == "stub"
+    assert m["Residuals"]["status"] == "stub"
+    assert m["AboveBelow"]["status"] == "stub"
+    assert m["Residuals"]["dax"] is None
+
+
+def test_approved_keystone_cascade_by_internal_token():
+    # Dependents that reference the keystone by its internal Calculation_* token (not the caption)
+    # also cascade -- the keystone is seeded under BOTH keys.
+    calcs = [
+        {"name": "Slope", "formula": "WINDOW_SUM(SUM([Sales]))",
+         "role": "measure", "internal_name": "Calculation_11"},
+        {"name": "Residuals", "formula": "SUM([Sales]) - [Calculation_11]",
+         "role": "measure", "internal_name": "Calculation_22"},
+    ]
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                               calcs=calcs, dim_calcs=[],
+                               approved_calc_dax={"Slope": "CALCULATE(SUM('Orders'[Sales]))"})
+    m = {r["measure"]: r for r in out["report"]["measures"]}
+    assert m["Residuals"]["status"] == "translated"
+    assert m["Residuals"]["dax"] == "SUM('Orders'[Sales]) - [Slope]"
+
+
+def test_approved_keystone_dtype_bool_cascades_through_if():
+    # A boolean keystone declared via the additive dict-form dtype cascades through an IF condition:
+    # authoring Flag (a boolean table calc) lets Counter -> Both (2-level) translate.
+    calcs = [
+        {"name": "Flag", "formula": "WINDOW_SUM(SUM([Sales])) > 0",
+         "role": "measure", "internal_name": "Calculation_A"},
+        {"name": "Counter", "formula": "IF [Flag] THEN 1 ELSE 0 END",
+         "role": "measure", "internal_name": "Calculation_B"},
+        {"name": "Both", "formula": "IF [Flag] AND ([Counter] > 0) THEN 1 ELSE 0 END",
+         "role": "measure", "internal_name": "Calculation_C"},
+    ]
+    approved = {"Flag": {"dax": "CALCULATE(SUM('Orders'[Sales]))>0", "dtype": "boolean"}}
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                               calcs=calcs, dim_calcs=[], approved_calc_dax=approved)
+    m = {r["measure"]: r for r in out["report"]["measures"]}
+    assert m["Flag"]["status"] == "assisted-approved"
+    assert m["Counter"]["status"] == "translated"
+    assert m["Counter"]["dax"] == "IF([Flag], 1, 0)"
+    assert m["Both"]["status"] == "translated"
+
+
+def test_approved_keystone_default_dtype_fails_closed_for_boolean():
+    # Without the dtype hint the keystone defaults to "number"; a dependent that BRANCHES on it as a
+    # boolean can only stub (the type check fails closed) -- never emit wrong DAX.
+    calcs = [
+        {"name": "Flag", "formula": "WINDOW_SUM(SUM([Sales])) > 0",
+         "role": "measure", "internal_name": "Calculation_A"},
+        {"name": "Counter", "formula": "IF [Flag] THEN 1 ELSE 0 END",
+         "role": "measure", "internal_name": "Calculation_B"},
+    ]
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                               calcs=calcs, dim_calcs=[],
+                               approved_calc_dax={"Flag": "CALCULATE(SUM('Orders'[Sales]))>0"})
+    m = {r["measure"]: r for r in out["report"]["measures"]}
+    assert m["Flag"]["status"] == "assisted-approved"
+    assert m["Counter"]["status"] == "stub"
+    assert m["Counter"]["dax"] is None
+
+
+def test_approved_keystone_dtype_text_cascades_string_concat():
+    # A text keystone (declared dtype) cascades a string-concat dependent that would otherwise stub as
+    # a number+text type mismatch under the default "number".
+    calcs = [
+        {"name": "Label", "formula": "LOOKUP(MAX([Order ID]),0)",
+         "role": "measure", "internal_name": "Calculation_L"},
+        {"name": "Full", "formula": '[Label] + "!"',
+         "role": "measure", "internal_name": "Calculation_F"},
+    ]
+    approved = {"Label": {"dax": "SELECTEDVALUE('Orders'[Order ID])", "dtype": "text"}}
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                               calcs=calcs, dim_calcs=[], approved_calc_dax=approved)
+    m = {r["measure"]: r for r in out["report"]["measures"]}
+    assert m["Label"]["status"] == "assisted-approved"
+    assert m["Full"]["status"] == "translated"
+    assert "[Label]" in m["Full"]["dax"]
+
+    # ... and WITHOUT the dtype hint (default number) the same dependent fails closed.
+    out2 = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                                calcs=calcs, dim_calcs=[],
+                                approved_calc_dax={"Label": "SELECTEDVALUE('Orders'[Order ID])"})
+    m2 = {r["measure"]: r for r in out2["report"]["measures"]}
+    assert m2["Full"]["status"] == "stub"
+
+
+def test_approved_keystone_dependent_with_other_unsupported_still_stubs():
+    # Fail-closed: seeding the keystone does NOT rescue a dependent that carries ANOTHER unsupported
+    # construct (its own table calc). Only the pure keystone-blocked dependents cascade.
+    calcs = [
+        {"name": "Slope", "formula": "WINDOW_SUM(SUM([Sales]))",
+         "role": "measure", "internal_name": "Calculation_11"},
+        {"name": "Mixed", "formula": "[Slope] + WINDOW_MAX(SUM([Sales]))",
+         "role": "measure", "internal_name": "Calculation_99"},
+    ]
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                               calcs=calcs, dim_calcs=[],
+                               approved_calc_dax={"Slope": "CALCULATE(SUM('Orders'[Sales]))"})
+    m = {r["measure"]: r for r in out["report"]["measures"]}
+    assert m["Slope"]["status"] == "assisted-approved"
+    assert m["Mixed"]["status"] == "stub"
+    assert m["Mixed"]["dax"] is None
+
+
+def test_approved_dtype_helper_normalises_vocabulary():
+    # Unit: the dict-form "dtype" is folded onto the translator's canonical tokens
+    # (number/text/bool/date); flat string form / absent / blank / unknown -> None (caller defaults).
+    assert _approved_dtype({"dax": "x", "dtype": "boolean"}) == "bool"
+    assert _approved_dtype({"dax": "x", "dtype": "BOOL"}) == "bool"
+    assert _approved_dtype({"dax": "x", "dtype": "string"}) == "text"
+    assert _approved_dtype({"dax": "x", "dtype": "Text"}) == "text"
+    assert _approved_dtype({"dax": "x", "dtype": "integer"}) == "number"
+    assert _approved_dtype({"dax": "x", "dtype": "datetime"}) == "date"
+    assert _approved_dtype({"dax": "x", "dtype": "date"}) == "date"
+    # unrecognised / absent / blank / flat-string -> None
+    assert _approved_dtype({"dax": "x", "dtype": "widget"}) is None
+    assert _approved_dtype({"dax": "x"}) is None
+    assert _approved_dtype({"dax": "x", "dtype": "  "}) is None
+    assert _approved_dtype("CALCULATE(SUM('Orders'[Sales]))") is None
 

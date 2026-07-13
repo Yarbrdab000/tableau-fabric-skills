@@ -511,6 +511,39 @@ def _approved_entry(value):
     return None, None
 
 
+# Canonical output types an ``approved_calc_dax`` keystone may declare, normalised to the exact
+# vocabulary the calc translator's type checks compare against -- "number" / "text" / "bool" /
+# "date" (see the ``dtype not in ("number", "text", "date")`` guard in calc_to_dax, plus the
+# "bool" boolean-expression checks). Friendly synonyms (string/boolean/integer/datetime/...) are
+# accepted and folded onto those four canonical tokens; "datetime" collapses to "date" (the
+# translator carries no separate datetime dtype through its arithmetic guards). A keystone seeded
+# into the cross-calc reference map with the wrong type can only make a dependent fail closed
+# (stub), never emit wrong DAX, so an unrecognised value safely falls back to the caller's
+# ``number`` default.
+_APPROVED_DTYPE_ALIASES = {
+    "number": "number", "int": "number", "integer": "number", "decimal": "number",
+    "float": "number", "real": "number", "double": "number",
+    "text": "text", "string": "text", "str": "text",
+    "bool": "bool", "boolean": "bool",
+    "date": "date", "datetime": "date", "datetimetz": "date", "timestamp": "date",
+}
+
+
+def _approved_dtype(value):
+    """The output dtype an ``approved_calc_dax`` dict form may declare via an additive ``"dtype"``
+    key, normalised to the translator's type vocabulary (see ``_APPROVED_DTYPE_ALIASES``). Used
+    when seeding a human-approved keystone into the cross-calc reference map so a dependent's type
+    checks stay faithful (e.g. a boolean keystone branched on in an ``IF``). Returns ``None`` for
+    the flat-string form, an absent/blank value, or an unrecognised type -- the caller then
+    defaults to ``number`` (the dominant aggregate-measure case). Fail-closed either way: a wrong
+    seeded type only makes a dependent stub, never wrong DAX."""
+    if isinstance(value, dict):
+        dt = value.get("dtype")
+        if isinstance(dt, str) and dt.strip():
+            return _APPROVED_DTYPE_ALIASES.get(dt.strip().lower())
+    return None
+
+
 def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    calc_lookup=None, approved_calc_dax=None, synth_measures=None,
                    known_tables=None, table_calc_usages=None, order_resolver=None,
@@ -595,6 +628,40 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         cid = (r["source"].get("calc_id") or "").strip().lower()
         if cid:
             measure_refs[cid] = entry
+    # Seed measure_refs with HUMAN-APPROVED / second-compiler keystones (``approved_calc_dax``)
+    # BEFORE the deterministic fix-point below, so authoring an IRREDUCIBLE base -- e.g. a
+    # WINDOW_/RUNNING_ table calc the deterministic tier cannot render at datasource scope --
+    # CASCADES: every dependent that stubbed ONLY because that base was an untranslatable measure
+    # now translates deterministically by referencing the approved measure, and (because the seed
+    # precedes the fix-point) so do ITS dependents, to any depth. This turns "author the whole
+    # nesting chain" into "author only the few irreducible keystones"; the rest fall out for free.
+    # Faithful + fail-closed: the emitted reference is a DAX measure reference -- exactly Tableau's
+    # own calc->calc structure; a dependent carrying ANY other unsupported construct still stubs;
+    # and the approved base's output type defaults to number (the dominant aggregate-measure case,
+    # overridable via an additive ``dtype`` on the approval), so a type check can only make a
+    # dependent STUB, never emit wrong DAX. Keyed by caption AND internal Calculation_* token
+    # because dependents use either form. A calc that is consumed / flag-superseded /
+    # table-calc-superseded is skipped -- it is not emitted as a plain measure, so it is not a
+    # valid reference target. Inert (measure_refs unchanged, output byte-identical) with no approval.
+    for _ac in (calcs or []):
+        _anm = (_ac.get("name") or "").strip()
+        _atid = str(_ac.get("internal_name") or "").strip()
+        if not _anm or _anm.lower() in consumed_lower:
+            continue
+        if _anm.lower() in flag_source_lower or _atid.lower() in flag_source_lower:
+            continue
+        if _superseded_by_table_calc(_ac, superseded):
+            continue
+        _aval = approved_lower.get(_anm.lower())
+        if _aval is None and _atid:
+            _aval = approved_lower.get(_atid.lower())
+        _adax, _atbl = _approved_entry(_aval)
+        if not _adax:
+            continue
+        _aentry = (_anm, _approved_dtype(_aval) or "number")
+        measure_refs[_anm.lower()] = _aentry
+        if _atid:
+            measure_refs[_atid.lower()] = _aentry
     pending = [c for c in (calcs or [])
                if (c.get("name") or "").lower() not in consumed_lower
                and not _superseded_by_table_calc(c, superseded)]
