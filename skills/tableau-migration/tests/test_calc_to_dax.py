@@ -131,6 +131,25 @@ TRANSLATIONS = [
      "AVERAGEX(SUMMARIZE('Orders', 'Orders'[Region]), "
      "CALCULATE(MAXX(SUMMARIZE('Orders', 'Orders'[Region], 'Orders'[Order_Date]), "
      "CALCULATE(SUM('Orders'[Sales])))))"),
+    # --- EXCLUDE LOD (view-relative): DROP the listed dims from the current view grain ->
+    #     CALCULATE(inner, REMOVEFILTERS('T'[d], ...)). View-adaptive; same fidelity class as a bare
+    #     FIXED value (the "difference from the group excluding d" idiom). ---
+    ("{EXCLUDE [Region] : SUM([Sales])}",
+     "CALCULATE(SUM('Orders'[Sales]), REMOVEFILTERS('Orders'[Region]))"),
+    ("{EXCLUDE [Region], [Order Date] : SUM([Sales])}",
+     "CALCULATE(SUM('Orders'[Sales]), REMOVEFILTERS('Orders'[Region], 'Orders'[Order_Date]))"),
+    ("SUM([Sales]) - {EXCLUDE [Region] : SUM([Sales])}",
+     "SUM('Orders'[Sales]) - CALCULATE(SUM('Orders'[Sales]), REMOVEFILTERS('Orders'[Region]))"),
+    # --- INCLUDE LOD (view-relative): ADD the listed dims to the view grain, then roll up. Only
+    #     meaningful wrapped in an outer aggregation -> AGGX + context-respecting SUMMARIZE (same
+    #     emit as the FIXED re-aggregation: the d-values present in the current context, folded with
+    #     a context-transition inner). ---
+    ("SUM({INCLUDE [Region] : SUM([Sales])})",
+     "SUMX(SUMMARIZE('Orders', 'Orders'[Region]), CALCULATE(SUM('Orders'[Sales])))"),
+    ("AVG({INCLUDE [Region] : SUM([Sales])})",
+     "AVERAGEX(SUMMARIZE('Orders', 'Orders'[Region]), CALCULATE(SUM('Orders'[Sales])))"),
+    ("MIN({INCLUDE [Region] : MAX([Order Date])})",
+     "MINX(SUMMARIZE('Orders', 'Orders'[Region]), CALCULATE(MAX('Orders'[Order_Date])))"),
     # --- scalar math over numeric (aggregated) operands ---
     ("ABS(SUM([Profit]))", "ABS(SUM('Orders'[Profit]))"),
     ("SIGN(SUM([Profit]))", "SIGN(SUM('Orders'[Profit]))"),
@@ -309,9 +328,14 @@ FALLBACKS = [
     "SUM([Sales]) AND SUM([Profit])",             # AND on numbers
     "IIF(SUM([Sales]) > 0, 1, 0, -1)",            # 4-arg IIF
     "IF MIN([Order Date]) > 0 THEN 1 ELSE 0 END", # date vs number comparison
-    # --- FIXED LOD forms that must fall back (not deterministically translatable) ---
-    "{INCLUDE [Region] : SUM([Sales])}",          # INCLUDE depends on the view's dimensions
-    "{EXCLUDE [Region] : SUM([Sales])}",          # EXCLUDE depends on the view's dimensions
+    # --- LOD forms that must fall back (not deterministically translatable) ---
+    "{INCLUDE [Region] : SUM([Sales])}",          # bare INCLUDE needs an enclosing aggregation
+    "SUM({EXCLUDE [Region] : SUM([Sales])})",     # re-aggregating an EXCLUDE has no grain to iterate
+    "{INCLUDE : SUM([Sales])}",                   # INCLUDE requires >=1 dimension
+    "{EXCLUDE : SUM([Sales])}",                   # EXCLUDE requires >=1 dimension
+    "AVG({FIXED [Region] : {INCLUDE [Order Date] : SUM([Sales])}})",  # view-relative LOD nested in a LOD
+    "{EXCLUDE [Region], [People Count] : SUM([Sales])}",  # cross-table EXCLUDE dimensions
+    "COUNTD({INCLUDE [Region] : SUM([Sales])})",  # COUNTD cannot re-aggregate an LOD
     "{FIXED [Region] : [Sales]}",                 # bare row-level inner (not aggregated)
     "SUM({SUM([Sales])})",                        # re-aggregating a table-scoped LOD has no grain
     "COUNTD({FIXED [Region] : SUM([Sales])})",    # COUNTD cannot re-aggregate an LOD
@@ -354,6 +378,7 @@ FALLBACKS = [
     "SUM([Datasource].[Sales])",                  # qualified field inside an aggregate
     "PERCENTILE([Datasource].[Sales], 0.5)",      # qualified field inside PERCENTILE
     "{FIXED [Datasource].[Region] : SUM([Sales])}",  # qualified field as a FIXED dimension
+    "{EXCLUDE [Datasource].[Region] : SUM([Sales])}",  # qualified field as an EXCLUDE dimension
     # --- boolean comparison violations ---
     "true > false",                               # booleans are equatable, not ordered
     "true = 1",                                   # bool vs number type mismatch
@@ -691,6 +716,10 @@ COLUMN_FALLBACKS = [
     "5 - [Order Date]",                           # number - date is not a date shift
     # a FIXED LOD whose dimensions span tables is still unsupported in a column
     "{FIXED [Region], [People Count] : SUM([Sales])}",
+    # INCLUDE/EXCLUDE are view-relative (grain = the worksheet's dimensionality); a calc column has
+    # no view, so both fall back at row level even though a bare FIXED value translates there.
+    "{EXCLUDE [Region] : SUM([Sales])}",
+    "{INCLUDE [Region] : SUM([Sales])}",
 ]
 
 
@@ -1504,6 +1533,48 @@ def test_above_avg_lod_witness_translates_in_column_mode_too():
         "CALCULATE(AVERAGEX(SUMMARIZE('Orders', 'Orders'[Customer_Name]), "
         "CALCULATE(COUNTROWS('Orders'))), ALL('Orders'))")
     assert reason == "ok"
+
+
+def test_exclude_lod_bare_maps_to_removefilters_on_its_dimensions():
+    # {EXCLUDE d... : AGG} drops d from the CURRENT view grain -> CALCULATE(AGG, REMOVEFILTERS(d)).
+    # View-adaptive: it reacts to the live filter context, so no view metadata is needed to emit it.
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        "{EXCLUDE [Region] : SUM([Sales])}", _resolver)
+    assert dax == "CALCULATE(SUM('Orders'[Sales]), REMOVEFILTERS('Orders'[Region]))"
+    assert reason == "ok"
+    assert tables == {"Orders"}
+    assert validate_dax(dax) == ""
+
+
+def test_include_lod_reaggregated_uses_context_respecting_summarize():
+    # AGG_outer({INCLUDE d : inner}) ADDS d to the view grain then rolls up -> the same AGGX +
+    # context-respecting SUMMARIZE + context-transition inner the FIXED re-aggregation emits.
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        "AVG({INCLUDE [Region] : SUM([Sales])})", _resolver)
+    assert dax == "AVERAGEX(SUMMARIZE('Orders', 'Orders'[Region]), CALCULATE(SUM('Orders'[Sales])))"
+    assert reason == "ok"
+    assert tables == {"Orders"}
+    assert validate_dax(dax) == ""
+
+
+def test_bare_include_and_reaggregated_exclude_fall_back_closed():
+    # A bare INCLUDE has no outer aggregation to collapse its added dimension, and re-aggregating an
+    # already view-relative EXCLUDE has no grain to iterate -> both must fall back, never mis-emit.
+    for formula in ("{INCLUDE [Region] : SUM([Sales])}",
+                    "SUM({EXCLUDE [Region] : SUM([Sales])})"):
+        assert translate_tableau_calc_to_dax(formula, _resolver)[0] is None
+
+
+def test_include_exclude_are_rejected_in_a_calculated_column():
+    # Only a datasource-absolute FIXED has a faithful row-level column form; INCLUDE/EXCLUDE are
+    # view-relative and must fall back in column mode even though the bare FIXED value translates.
+    for formula in ("{EXCLUDE [Region] : SUM([Sales])}",
+                    "{INCLUDE [Region] : SUM([Sales])}"):
+        assert translate_tableau_calc_to_column_dax(formula, _resolver)[0] is None
+    # FIXED still works row-level (guard is specific to INCLUDE/EXCLUDE).
+    assert translate_tableau_calc_to_column_dax(
+        "{FIXED [Region] : SUM([Sales])}", _resolver)[0] == (
+        "CALCULATE(SUM('Orders'[Sales]), ALLEXCEPT('Orders', 'Orders'[Region]))")
 
 
 def test_a_real_model_column_named_number_of_records_resolves_normally_and_wins():

@@ -213,6 +213,9 @@ def classify_fallback(reason, *, role=None, fields=None, has_suggestion=False):
             or "re-aggregate" in rl
             or "re-aggregating" in rl
             or "nested fixed lod" in rl
+            or "nested inside another lod" in rl
+            or "enclosing aggregation" in rl
+            or "at least one [dimension]" in rl
             or "table-scoped lod" in rl
             or "over an lod" in rl
             or "lod expression not valid" in rl):
