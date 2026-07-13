@@ -1470,8 +1470,15 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
     constant (no field refs) and any honest ``= BLANK()`` stub default to ``anchor_table`` so a
     dimension calc is NEVER silently dropped (today's behavior) and always carries its preserved
     ``TableauFormula`` for audit/repair. Aggregations / LODs / multi-table terms fall back to the
-    inert stub here -- the measure entry point owns those. Returns ``(by_table, report)`` where
-    ``by_table`` is ``{table_display: concatenated_tmdl}``.
+    inert stub here -- the measure entry point owns those. Returns ``(by_table, report, column_refs)``
+    where ``by_table`` is ``{table_display: concatenated_tmdl}`` and ``column_refs`` is the
+    calc-column identity map ``{caption/token(lower): (home_table, column_name, tmdl_type)}`` for
+    every faithfully-emitted single-home typed calc column (keyed by BOTH caption and internal token).
+    The orchestrator layers ``column_refs`` onto the base resolver it hands the MEASURE path, so a
+    measure whose formula references a calculated column -- most importantly a FIXED-LOD grain over a
+    calculated dimension, e.g. ``{FIXED [Order Date (Months)] : SUM([Sales])}`` -- binds to that real
+    column instead of stubbing. A calc column is a genuine row-level model column, so this only ADDS a
+    resolution path base ``resolve`` lacked; a bare row-level reference in a measure still stubs.
 
     SIBLING CALC CASCADE: a dimension calc that references ANOTHER dimension calc column (a chain
     such as ``[Grouped Category] = SWITCH(TRUE(), [Cleaned Category] = ...)`` where
@@ -1637,7 +1644,7 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
             "date_table": None,
             "date_attribute": None,
         })
-    return by_table, report
+    return by_table, report, column_refs
 
 
 def calc_column_coverage_artifact(calc_column_report):
@@ -2088,7 +2095,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     # calc over the ACTIVE date binds to the Date dimension instead (RELATED). A dimension-swap calc
     # already consumed as a field parameter is skipped here. Measures are handled separately below;
     # each calc is emitted through exactly one mode (the pre-router above has already decided which).
-    calc_columns_by_table, calc_column_report = _calc_columns_part(
+    calc_columns_by_table, calc_column_report, calc_col_refs = _calc_columns_part(
         dim_calcs, resolve, anchor_table=table_names[0],
         date_table=date_name, active_date_cols=active_date_cols,
         approved_calc_dax=approved_calc_dax, known_tables=set(table_names),
@@ -2098,12 +2105,32 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         if path in parts:
             parts[path] = T.enrich_table_tmdl(parts[path], calc_columns=block)
 
+    # A calculated column emitted just above is a genuine row-level model column, so a MEASURE that
+    # references it -- most importantly a FIXED-LOD grain over a calculated dimension, e.g.
+    # ``{FIXED [Order Date (Months)] : SUM([Sales])}`` where ``[Order Date (Months)]`` is itself a
+    # calc column -- must be able to bind to it. The datasource-metadata ``resolve`` only knows
+    # PHYSICAL columns, so layer the calc-column identities (``calc_col_refs``, keyed by caption AND
+    # internal ``Calculation_*`` token) UNDER it: base ``resolve`` always wins (a real column keeps
+    # priority and its own ambiguity handling), and a calc column only fills a gap ``resolve`` returned
+    # ``None`` for. Strictly additive -- it never changes an already-resolved reference, so every
+    # measure that translated before is byte-for-byte unchanged -- and fail-closed: a bare row-level
+    # calc-column reference in a measure still stubs (the measure-context guard is unaffected; only an
+    # AGGREGATION arg or an LOD grain over the column becomes valid). Inert when there are no calc
+    # columns (``resolve`` passes through untouched).
+    measure_resolve = resolve
+    if calc_col_refs:
+        def measure_resolve(name, _base=resolve, _refs=calc_col_refs):
+            hit = _base(name)
+            if hit is not None:
+                return hit
+            return _refs.get((name or "").strip().lower())
+
     # Measure-role calcs become DAX measures. A measure-swap consumed as a field parameter is
     # skipped (consumed); a value/what-if `[Parameters].[X]` scalar reference is inlined via
     # param_resolver. A row-level `[Parameters].[X]` (filter parameter) has no faithful measure form
     # and lands as a preserved `= 0` stub keeping its original Tableau formula as TableauFormula.
     measures_table, measure_report, assisted_suggestions = _measures_part(
-        calcs, resolve, consumed=consumed, param_resolver=param_resolver,
+        calcs, measure_resolve, consumed=consumed, param_resolver=param_resolver,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
         approved_calc_dax=approved_calc_dax, synth_measures=fp.get("measures"),
         known_tables=set(table_names), table_calc_usages=table_calc_usages,
