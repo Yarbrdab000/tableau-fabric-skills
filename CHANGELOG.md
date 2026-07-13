@@ -13,6 +13,19 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.39.0` → `1.40.0`): Two test-only correctness-lock harnesses for the
+  translator and the report emitter (no engine or report-schema change).** Additive regression coverage that
+  pins current, provably-faithful behaviour so a future change cannot silently drift it. **(T3.2) Concept
+  golden corpus** (`tests/test_concept_golden_corpus.py`) drives the real deterministic Tableau→DAX translator
+  over the nine migration-crosswalk concepts (LOD re-aggregation, parameter references, glyph-`IF` KPI
+  strings, integer date-part extraction, positional/table calcs, …) and asserts, per case, either the exact
+  emitted DAX (byte-for-byte) or a fail-closed stub with a stable reason keyword — guarded by a
+  badge-consistency forcing function that fails loudly if a translator change flips a concept's
+  deterministic / stub / mixed category. **(T3.1) PBIR conformance oracle**
+  (`tests/test_pbir_conformance.py`) validates the report emitter's PBIR output against the distilled
+  Power BI visual-container vocabulary (visual types, role bindings, structural shape). Both suites are
+  offline / stdlib / synthetic and pin *our own* emitted output; the crosswalk DAX and the PBIR vocabulary
+  serve only as the validated semantic oracle. Report schema is unchanged.
 - **tableau-migration (skill `1.38.0` → `1.39.0`): Faithful deterministic translation of INCLUDE / EXCLUDE
   level-of-detail expressions.** `INCLUDE` and `EXCLUDE` LODs were previously fail-closed because, unlike a
   `FIXED` LOD (whose grain is datasource-absolute), their grain is *view-relative* — it depends on the
