@@ -517,7 +517,7 @@ def _tokenize(formula):
 # at measure top level is therefore a parse error (-> fallback).
 class _Parser:
     def __init__(self, toks, resolver, tables_used, mode="measure", param_resolver=None,
-                 measure_refs=None, known_tables=None, inline_calcs=None):
+                 measure_refs=None, known_tables=None, inline_calcs=None, related_tables=None):
         self.toks = toks
         self.pos = 0
         self.resolver = resolver
@@ -540,6 +540,13 @@ class _Parser:
         # consuming measure translates. Empty -> the prior "bare field not valid" fallback (byte-
         # identical when no inline_calcs are supplied).
         self.inline_calcs = inline_calcs or {}
+        # related_tables: an undirected table-adjacency graph built from the model's relationships
+        # (build_table_adjacency) -- {table_display_name: [(neighbor, this_col, neighbor_col), ...]}.
+        # It lets a cross-table COUNTD(IF cond THEN [F.field] END), whose condition table C is
+        # DIRECTLY related to the counted table F, translate via a direction-independent TREATAS on
+        # the join keys instead of stubbing on the single-table guard. Empty -> the prior
+        # single-table-only behaviour (byte-identical when no graph is supplied).
+        self.related_tables = related_tables or {}
         # Cycle guard: the set of inline-calc keys currently being expanded up the call stack, so a
         # calc that (transitively) references itself fails closed instead of recursing forever.
         self._inline_stack = frozenset()
@@ -1264,7 +1271,11 @@ class _Parser:
         # a CALCULATE with a FILTER. When the FILTER matches no rows, DISTINCTCOUNTNOBLANK returns
         # BLANK, but Tableau COUNTD of an empty set is 0 (verified live), so COALESCE(..., 0) keeps
         # the count numeric. Only this exact shape (a bare-field value, single THEN, no ELSE) is
-        # supported; anything else falls back.
+        # supported; anything else falls back. A CROSS-table shape (condition table C != counted
+        # table F) is relaxed below via a direct-relationship TREATAS when C and F are directly
+        # related; ``tables_before`` is the pre-COUNTD table set (any sibling tables the OUTER
+        # formula already referenced), preserved across the tables_used reset in that branch.
+        tables_before = set(self.tables_used)
         if not self._is_kw("IF"):
             raise _CalcError("COUNTD(...) supports only COUNTD(IF cond THEN [field] END)")
         self._next()  # IF
@@ -1286,13 +1297,68 @@ class _Parser:
             raise _CalcError(f"unresolved/ambiguous field [{v}]")
         table, col, _tmdl_type = resolved
         self.tables_used.add(table)
-        if len(set(cond_tables) | {table}) != 1:
-            raise _CalcError("COUNTD(IF ...) must reference exactly one table")
-        return (
-            f"COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK({_dax_table(table)}{_dax_col(col)}), "
-            f"FILTER({_dax_table(table)}, {cond[0]})), 0)",
-            "number",
+        span = set(cond_tables) | {table}
+        if len(span) == 1:
+            return (
+                f"COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK({_dax_table(table)}{_dax_col(col)}), "
+                f"FILTER({_dax_table(table)}, {cond[0]})), 0)",
+                "number",
+            )
+        # Cross-table: the condition references a DIFFERENT table (C) than the counted field's
+        # table (F). DISTINCTCOUNT is idempotent to join fan-out, so when C is DIRECTLY related to F
+        # we can filter F to exactly the qualifying C-key set via a direction-independent TREATAS on
+        # the join columns (immune to the emitted relationship's single cross-filter direction).
+        # Anything the v1 gate can't prove (multi-table condition, no/ambiguous direct rel) stubs.
+        cross = self._countd_if_cross_table(table, col, cond, cond_tables, tables_before)
+        if cross is not None:
+            return cross
+        raise _CalcError("COUNTD(IF ...) must reference exactly one table")
+
+    def _direct_relationships(self, c_table, f_table):
+        """Return the ``(key_on_C, key_on_F)`` pairs of every DIRECT relationship between C and F.
+
+        Reads the undirected ``related_tables`` adjacency (build_table_adjacency): each entry for
+        ``c_table`` is ``(neighbor, this_col, neighbor_col)`` where ``this_col`` sits on C and
+        ``neighbor_col`` on the neighbor.
+        """
+        out = []
+        for neighbor, this_col, neighbor_col in self.related_tables.get(c_table, ()):  # undirected
+            if neighbor == f_table:
+                out.append((this_col, neighbor_col))
+        return out
+
+    def _countd_if_cross_table(self, f_table, f_col, cond, cond_tables, tables_before):
+        """Direct-relationship TREATAS emit for a cross-table COUNTD(IF cond THEN [F.field] END).
+
+        v1 scope (else -> ``None`` -> the caller keeps the honest stub): the condition references
+        exactly ONE table C, C != F, and there is exactly ONE direct relationship between C and F
+        (0 = disconnected islands; >1 = an ambiguous multi-key join we will not guess). On success
+        the C-filter is fully encapsulated inside the TREATAS, so the aggregate is a self-contained
+        scalar whose only free table is F -- reset ``tables_used`` (IN PLACE, to keep the alias the
+        entry points read after parse) to ``tables_before | {F}`` so the top-level cross-table guard
+        passes for this isolated term while any genuinely cross-table OUTER combination still stubs.
+        """
+        if len(cond_tables) != 1:
+            return None
+        c_table = next(iter(cond_tables))
+        if c_table == f_table:
+            return None
+        rels = self._direct_relationships(c_table, f_table)
+        if len(rels) != 1:
+            return None
+        c_key, f_key = rels[0]
+        # Mutate in place (do NOT rebind): the *_typed entry point reads this same set object after
+        # parse to run the len(tables_used) > 1 guard; rebinding would break the alias and stub.
+        self.tables_used.clear()
+        self.tables_used.update(tables_before)
+        self.tables_used.add(f_table)
+        dax = (
+            f"COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK({_dax_table(f_table)}{_dax_col(f_col)}), "
+            f"TREATAS(CALCULATETABLE(VALUES({_dax_table(c_table)}{_dax_col(c_key)}), "
+            f"FILTER({_dax_table(c_table)}, {cond[0]})), "
+            f"{_dax_table(f_table)}{_dax_col(f_key)})), 0)"
         )
+        return (dax, "number")
 
     def _percentile(self):
         # PERCENTILE([field], n) -> PERCENTILE.INC('T'[field], n). Aggregation over a single
@@ -2026,8 +2092,34 @@ def date_attribute_binding(formula):
     return None
 
 
+def build_table_adjacency(relationships):
+    """Build an undirected table-adjacency graph from a model's relationship list.
+
+    ``relationships`` is an iterable of ``{from_table, from_col, to_table, to_col, ...}`` dicts (the
+    shape ``tmdl_generate`` emits and ``descriptor["relationships"]`` carries). Returns
+    ``{table_display_name: [(neighbor, this_col, neighbor_col), ...]}`` -- one entry per endpoint of
+    every relationship, so a lookup from EITHER table yields the join columns oriented
+    ``(key_on_this_table, key_on_neighbor)``. A relationship missing any of the four keys is skipped.
+
+    Threaded (as ``related_tables=``) into the calc translator so a cross-table COUNTD(IF cond THEN
+    [F.field] END) whose condition table C is DIRECTLY related to the counted table F can emit a
+    faithful TREATAS instead of stubbing. Connector-agnostic: it reads only the relationship shape,
+    so it works for any source. Building it from the FULL model's relationships keeps within-island
+    pairs connected and cross-island pairs disconnected.
+    """
+    adj = {}
+    for rel in relationships or ():
+        ft, fc = (rel or {}).get("from_table"), (rel or {}).get("from_col")
+        tt, tc = (rel or {}).get("to_table"), (rel or {}).get("to_col")
+        if not (ft and fc and tt and tc):
+            continue
+        adj.setdefault(ft, []).append((tt, fc, tc))
+        adj.setdefault(tt, []).append((ft, tc, fc))
+    return adj
+
+
 def translate_tableau_calc_to_dax(formula, resolver, param_resolver=None, measure_refs=None,
-                                  known_tables=None, inline_calcs=None):
+                                  known_tables=None, inline_calcs=None, related_tables=None):
     """Translate a SAFE-subset Tableau calc to DAX. Returns (dax|None, reason, tables_used).
 
     dax is None on any unsupported construct -> caller keeps the inert `= 0` stub.
@@ -2049,15 +2141,19 @@ def translate_tableau_calc_to_dax(formula, resolver, param_resolver=None, measur
     parameter-driven date-window boolean inside a ``COUNTD(IF ...)``. When a bare row-level reference
     resolves to no model column, its body is inlined (parsed column-mode, pure-boolean, fully
     consumed) so the consuming measure translates. Default None -> byte-identical prior output.
+    related_tables({table: [(neighbor, this_col, neighbor_col), ...]}) | None: an undirected
+    table-adjacency graph (build_table_adjacency) enabling a cross-table COUNTD(IF ...) whose
+    condition table is directly related to the counted table to emit a TREATAS. Default None ->
+    the single-table-only behaviour (byte-identical prior output).
     """
     dax, reason, tables_used, _dtype = translate_tableau_calc_to_dax_typed(
         formula, resolver, param_resolver=param_resolver, measure_refs=measure_refs,
-        known_tables=known_tables, inline_calcs=inline_calcs)
+        known_tables=known_tables, inline_calcs=inline_calcs, related_tables=related_tables)
     return dax, reason, tables_used
 
 
 def translate_tableau_calc_to_dax_typed(formula, resolver, param_resolver=None, measure_refs=None,
-                                        known_tables=None, inline_calcs=None):
+                                        known_tables=None, inline_calcs=None, related_tables=None):
     """Like ``translate_tableau_calc_to_dax`` but also returns the result dtype as a 4th item.
 
     Returns ``(dax|None, reason, tables_used, dtype|None)``. The extra ``dtype`` ("number" /
@@ -2076,7 +2172,7 @@ def translate_tableau_calc_to_dax_typed(formula, resolver, param_resolver=None, 
         dax, dtype = _Parser(
             toks, resolver, tables_used, param_resolver=param_resolver,
             measure_refs=measure_refs, known_tables=known_tables,
-            inline_calcs=inline_calcs).parse()
+            inline_calcs=inline_calcs, related_tables=related_tables).parse()
         # Single-table only: terms spanning >1 table fall back (a relationship path
         # does not guarantee the DAX filter context reproduces Tableau's result).
         if len(tables_used) > 1:

@@ -52,6 +52,7 @@ try:  # package or scripts-on-path
         suggest_assisted_dax,
         field_references,
         date_attribute_binding,
+        build_table_adjacency,
     )
     from .translation_router import classify_fallback
     from . import tmdl_generate as T
@@ -94,6 +95,7 @@ except ImportError:
         suggest_assisted_dax,
         field_references,
         date_attribute_binding,
+        build_table_adjacency,
     )
     from translation_router import classify_fallback
     import tmdl_generate as T
@@ -630,7 +632,8 @@ def _best_scoped_resolver(formula, tagged_ds, resolve_for, island_dss, base_reso
 def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    calc_lookup=None, approved_calc_dax=None, synth_measures=None,
                    known_tables=None, table_calc_usages=None, order_resolver=None,
-                   flag_measures=None, resolve_for=None, inline_calcs=None):
+                   flag_measures=None, resolve_for=None, inline_calcs=None,
+                   related_tables=None):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
     ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
@@ -781,7 +784,8 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             cname = calc["name"]
             cdax, _r, _t, cdtype = translate_tableau_calc_to_dax_typed(
                 calc.get("formula", ""), _rc(calc), param_resolver=param_resolver,
-                measure_refs=measure_refs, known_tables=known_tables, inline_calcs=inline_calcs)
+                measure_refs=measure_refs, known_tables=known_tables, inline_calcs=inline_calcs,
+                related_tables=related_tables)
             if cdax:
                 entry = (cname, cdtype or "number")
                 measure_refs[cname.strip().lower()] = entry
@@ -809,7 +813,7 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             continue  # the addressed table-calc form (emitted below) is the faithful one.
         dax, reason, _ = translate_tableau_calc_to_dax(
             formula, _rc(calc), param_resolver=param_resolver, measure_refs=measure_refs,
-            known_tables=known_tables, inline_calcs=inline_calcs)
+            known_tables=known_tables, inline_calcs=inline_calcs, related_tables=related_tables)
         row = {
             "measure": name,
             "status": "translated" if dax else "stub",
@@ -2401,6 +2405,11 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     # skipped (consumed); a value/what-if `[Parameters].[X]` scalar reference is inlined via
     # param_resolver. A row-level `[Parameters].[X]` (filter parameter) has no faithful measure form
     # and lands as a preserved `= 0` stub keeping its original Tableau formula as TableauFormula.
+    # Cross-table COUNTD-IF: an undirected join-key adjacency graph over the full model's
+    # relationships (source rels + the generated Date joins) lets _countd_if relax its single-table
+    # guard when the IF-condition table and the counted-field table are directly related, emitting a
+    # direction-independent TREATAS on the join keys. Connector-agnostic (pure DAX from rel keys).
+    related_tables = build_table_adjacency(all_rels)
     measures_table, measure_report, assisted_suggestions = _measures_part(
         calcs, measure_resolve, consumed=consumed, param_resolver=param_resolver,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
@@ -2417,7 +2426,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         # _date_axis_order_resolver builder is retained for a future relation-supplying re-enable.
         order_resolver=None,
         resolve_for=_measure_scoped_resolver,
-        flag_measures=flag_measures, inline_calcs=inline_calcs)
+        flag_measures=flag_measures, inline_calcs=inline_calcs,
+        related_tables=related_tables)
     parts["definition/tables/_Measures.tmdl"] = measures_table
     table_names.append("_Measures")
 

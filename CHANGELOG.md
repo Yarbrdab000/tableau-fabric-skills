@@ -13,6 +13,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.42.0` → `1.43.0`): Cross-table `COUNTD(IF …)` translation via `TREATAS` —
+  a distinct count whose condition and counted field live on two *directly related* tables now translates
+  deterministically instead of stubbing.** Tableau denormalizes its object model, so a calc like
+  `COUNTD(IF [Stage on Intake] = … THEN [Case ID] END)` counts distinct `Case` rows filtered by a condition
+  on the related `Intake` table. Power BI keeps the tables normalized, so the engine now emits the canonical
+  virtual-relationship idiom — `COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK(F[key]), TREATAS(CALCULATETABLE(VALUES(C[c_key]),
+  FILTER(C, <cond>)), F[f_key])), 0)` — pushing the condition table's key set onto the fact table's foreign key.
+  `DISTINCTCOUNT` is idempotent to join fan-out, so the result is faithful in either relationship direction.
+  **Fail-closed gate (unchanged guarantee):** it translates only when the condition references exactly one table
+  `C`, `C ≠` the counted field's table `F`, and there is exactly one direct relationship between them; an
+  ambiguous, disconnected, or multi-condition-table shape stays an honest `= 0` stub with the original
+  `TableauFormula` preserved — never a guess. **Connector-agnostic:** adjacency comes from the datasource's own
+  `relationships`, and the emitted `TREATAS` is pure DAX, so it scales across every connector. **Composes with the
+  `1.41.0` inline date-window calc** — a parameter-driven `CreatedDate` window nests inside the `TREATAS` filter.
+  Live-proven on a real Salesforce workbook: `Open Intakes` and `Open Intakes in Date Range` flipped stub →
+  deterministic (physical API columns resolved live), moving workbook calc coverage **53 → 55/154 with zero
+  regressions**. Additive — no report key was renamed or removed; the original formula is still preserved and
+  measures stamp `TranslatedBy = deterministic`.
 - **tableau-migration (skill `1.41.0` → `1.42.0`): Hidden-column prune — physically drops the hidden schema
   columns a workbook never needs while carving out (keeping, flagged) every load-bearing one, and reports how
   many were pruned. Additive and strictly coverage-preserving.** A live embed emitted roughly 11x too many

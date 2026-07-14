@@ -18,6 +18,7 @@ from calc_to_dax import (
     translate_tableau_calc_to_column_dax_typed,
     validate_dax,
     date_attribute_binding,
+    build_table_adjacency,
     _tokenize,
     _CalcError,
 )
@@ -1764,6 +1765,123 @@ def test_inline_cross_table_countd_if_stays_stub():
         inline_calcs={"date window": cross_body})
     assert dax is None
     assert "one table" in reason
+
+
+# ---------------------------------------------------------------------------
+# Cross-table COUNTD-IF -- direction-independent TREATAS on the join keys
+# ---------------------------------------------------------------------------
+# COUNTD(IF <cond on table C> THEN [field on table F] END) where C != F but C and F are
+# DIRECTLY related emits a TREATAS that injects C's qualifying key set straight onto F's
+# join column -- immune to cross-filter direction and grain-independent (DISTINCTCOUNT is
+# idempotent to join fan-out). v1 gate: cond references exactly ONE table C; C != F; exactly
+# ONE direct relationship between C and F. Anything ambiguous / disconnected -> honest stub.
+# The relationship adjacency is threaded in via related_tables (built by build_table_adjacency
+# from the model's relationships). Fixtures mirror the real Salesforce "Open Intakes" calc:
+#   C = caseman__Intake__c (Stage; c_key = Id), F = Case ([Case ID] -> Id; f_key = the FK),
+#   relationship: Case[caseman__Intake__c] -> caseman__Intake__c[Id].
+_XT_FIELDS = {
+    "Stage": ("caseman__Intake__c", "Stage", "string"),
+    "Case ID": ("Case", "Id", "string"),
+    "Other Flag": ("Contact", "Flag", "string"),
+}
+_XT_REL = {
+    "from_table": "Case", "from_col": "caseman__Intake__c",
+    "to_table": "caseman__Intake__c", "to_col": "Id", "kind": "many_to_many",
+}
+# The exact TREATAS DAX captured from the real translator (NOT assumed): string equality
+# emits as EXACT(col, "val") (case-sensitive), the parenthesized source condition keeps its
+# outer (...), OR terms join with ||, and the counted field lands as DISTINCTCOUNTNOBLANK.
+_XT_OPEN_INTAKES = (
+    'COUNTD( IF ([Stage]="Not Started" OR [Stage]="In Progress" OR '
+    '[Stage]="Awaiting Client Input" or [Stage]="In Review") THEN [Case ID] END)'
+)
+_XT_OPEN_INTAKES_DAX = (
+    "COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK('Case'[Id]), "
+    "TREATAS(CALCULATETABLE(VALUES('caseman__Intake__c'[Id]), "
+    "FILTER('caseman__Intake__c', (EXACT('caseman__Intake__c'[Stage], \"Not Started\") || "
+    "EXACT('caseman__Intake__c'[Stage], \"In Progress\") || "
+    "EXACT('caseman__Intake__c'[Stage], \"Awaiting Client Input\") || "
+    "EXACT('caseman__Intake__c'[Stage], \"In Review\")))), "
+    "'Case'[caseman__Intake__c])), 0)"
+)
+
+
+def test_countd_if_cross_table_direct_related_translates():
+    # Headline: the condition table (C) and counted-field table (F) are directly related, so
+    # the guard relaxes and emits the exact direction-independent TREATAS form. tables_used
+    # collapses to just F (the aggregated table) -- the *_typed top-level guard reads that set.
+    adj = build_table_adjacency([_XT_REL])
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        _XT_OPEN_INTAKES, _XT_FIELDS.get, related_tables=adj)
+    assert reason == "ok"
+    assert dax == _XT_OPEN_INTAKES_DAX
+    assert tables == {"Case"}
+
+
+def test_countd_if_cross_table_without_graph_stays_stub():
+    # No relationship graph supplied (the pre-feature call shape) -> the single-table guard
+    # holds and the cross-table calc stays a fail-closed stub. Byte-identical old behaviour.
+    dax, reason, _ = translate_tableau_calc_to_dax(_XT_OPEN_INTAKES, _XT_FIELDS.get)
+    assert dax is None
+    assert "one table" in reason
+
+
+def test_countd_if_cross_table_disconnected_stays_stub():
+    # C and F exist but are on DISCONNECTED islands (empty adjacency between them) -> stub.
+    # This is the 4-island Salesforce structure: cross-island pairs must never emit TREATAS.
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        _XT_OPEN_INTAKES, _XT_FIELDS.get, related_tables={})
+    assert dax is None
+    assert "one table" in reason
+
+
+def test_countd_if_cross_table_ambiguous_multi_rel_stays_stub():
+    # TWO distinct direct relationships between C and F -> the join key is ambiguous, so we
+    # can't pick one faithful TREATAS pair -> honest stub (never guess a key).
+    alt = {"from_table": "Case", "from_col": "AltKey",
+           "to_table": "caseman__Intake__c", "to_col": "AltId", "kind": "many_to_many"}
+    adj = build_table_adjacency([_XT_REL, alt])
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        _XT_OPEN_INTAKES, _XT_FIELDS.get, related_tables=adj)
+    assert dax is None
+    assert "one table" in reason
+
+
+def test_countd_if_cross_table_two_condition_tables_stays_stub():
+    # The IF condition itself spans TWO tables (Stage on C + Other Flag on a third table).
+    # v1 requires the condition to reference exactly ONE table -> multi-cond-table -> stub,
+    # even though a relationship exists (never emit an under-specified TREATAS).
+    adj = build_table_adjacency([_XT_REL])
+    formula = 'COUNTD(IF [Stage]="Active" OR [Other Flag]="Y" THEN [Case ID] END)'
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        formula, _XT_FIELDS.get, related_tables=adj)
+    assert dax is None
+    assert "one table" in reason
+
+
+def test_countd_if_single_table_with_graph_byte_identical():
+    # Regression guard: a genuine single-table COUNTD-IF (C == F) must emit the SAME DAX
+    # whether or not a relationship graph is supplied -- the cross-table branch only engages
+    # when the counted field resolves to a DIFFERENT table than the condition.
+    res = {"Stage": ("caseman__Intake__c", "Stage", "string")}
+    formula = 'COUNTD(IF [Stage]="Active" THEN [Stage] END)'
+    with_graph, r1, _ = translate_tableau_calc_to_dax(
+        formula, res.get, related_tables=build_table_adjacency([_XT_REL]))
+    without, r2, _ = translate_tableau_calc_to_dax(formula, res.get)
+    assert r1 == r2 == "ok"
+    assert with_graph == without
+    assert with_graph == (
+        "COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK('caseman__Intake__c'[Stage]), "
+        "FILTER('caseman__Intake__c', EXACT('caseman__Intake__c'[Stage], \"Active\"))), 0)")
+
+
+def test_build_table_adjacency_orientation():
+    # Unit: one relationship Case[caseman__Intake__c] -> caseman__Intake__c[Id] yields an
+    # undirected graph with each side keyed to (neighbor, this_side_col, neighbor_col), so a
+    # lookup from either table recovers the correct (own_key, other_key) join pair.
+    adj = build_table_adjacency([_XT_REL])
+    assert adj["Case"] == [("caseman__Intake__c", "caseman__Intake__c", "Id")]
+    assert adj["caseman__Intake__c"] == [("Case", "Id", "caseman__Intake__c")]
 
 
 def test_inline_non_boolean_candidate_not_inlined():
