@@ -126,16 +126,21 @@ If **D5=B**, also collect the Connected App `CLIENT_ID`, `SECRET_ID`, and impers
 Set two paths and run **every** later command from `$RUN`:
 - **`$SKILL`** = the folder holding this SKILL.md (where `scripts\` and `migration.vars.example.ps1`
   live — the folder you loaded these instructions from).
-- **`$RUN`** = a **fresh, empty** working folder for THIS migration. On **Windows, keep it SHORT and
-  near the drive root** (e.g. `C:\tfmig`) — **not** the deep session/temp path. A rebuilt workbook's
-  PBIR report nests many folders deep
-  (`…\<Workbook>.Report\definition\pages\<page>\visuals\<visual>\visual.json`), so a long `$RUN` can push
+- **`$RUN`** = a **fresh, empty** working folder for THIS migration — **you don't name or create it by
+  hand**. The bundled **`new_run.py`** mints the next one and **prints its path**; set `$RUN` to that
+  (the code block below does exactly this). It auto-increments a clean `C:\tfmig\runs\NNNN\` with empty
+  `in\`+`out\` already made, so a **reused root can never carry stale `in\`/`out\` from a prior run** (a
+  recurring foot-gun) and you never have to hunt for "the next free number". Its default root is
+  deliberately **SHORT and near the drive root** (`C:\tfmig`) — **not** the deep session/temp path —
+  because a rebuilt workbook's PBIR report nests many folders deep
+  (`…\<Workbook>.Report\definition\pages\<page>\visuals\<visual>\visual.json`), so a long root can push
   a file past the Windows **MAX_PATH (260)** limit. The build itself handles this — deep writes and the
   Fabric deploy use Windows extended-length (`\\?\`) paths, so a long root **no longer fails the build**
-  (and a long root deployed straight to Fabric is fine). The reason to keep `$RUN` short is the **local**
+  (and a long root deployed straight to Fabric is fine). The reason to keep it short is the **local**
   `.pbip`: to open it in **Power BI Desktop** on a deep path you'd otherwise need Windows long paths
   enabled, so a short root keeps the local project openable everywhere. (Only a genuinely unwritable path
-  still marks that workbook `failed` with a `path_too_long` reason in `report.json`.)
+  still marks that workbook `failed` with a `path_too_long` reason in `report.json`.) To pin a different
+  root, pass `--root <dir>` to `new_run.py`.
 
 `in\` (fetched inputs) and `out\` (the built bundle) live **under `$RUN`, never under `$SKILL`** — that
 keeps the run clear of the skill's bundled sample datasources and never pollutes the installed skill.
@@ -145,8 +150,8 @@ Then set up the local vars file (mirrors the repo's `.env.example` → `.env` co
 
 ```powershell
 $SKILL = "<the folder holding this SKILL.md>"
-$RUN   = "<a fresh, empty working folder — keep it SHORT on Windows, e.g. C:\tfmig>"
-New-Item -ItemType Directory -Force -Path $RUN | Out-Null ; Set-Location $RUN ; $RUN = (Get-Location).Path
+$RUN   = (py -3.11 "$SKILL\scripts\new_run.py" --root C:\tfmig)   # auto-mints a clean C:\tfmig\runs\NNNN (empty in\+out\) and prints its path
+Set-Location $RUN
 Copy-Item "$SKILL\migration.vars.example.ps1" .\migration.vars.local.ps1   # once
 # fill migration.vars.local.ps1 with the real values (it is git-ignored), then:
 . .\migration.vars.local.ps1
@@ -297,9 +302,12 @@ or re-run — the scripts have already done their own detection and binding; a s
 STOP-and-ask, never something for you to fix by hand.
 
 > **Second-compiler gate — read `report.json` → `summary.needs_review_total` and branch on it:** if it
-> is **`0`**, no calc was left stubbed, so the assisted-translation stage is **auto-satisfied — skip it**
-> and continue (do not re-read the report to "make sure"). Only when it is **`> 0`** does the mandatory
-> second-compiler pass apply (see *Post-Migration* step 3 / [second-compiler.md](resources/second-compiler.md)).
+> is **`0`**, no calc was left stubbed, so there is nothing to offer — continue (do not re-read the report
+> to "make sure"). When it is **`> 0`**, **STOP and OFFER the second compiler**: show the user the stubbed
+> calcs (count + names) and ask whether to run the LLM-assisted second-compiler pass. Run it **only** on an
+> explicit `GO`; if the user declines, ship the deterministic result as-is — every stub keeps its preserved
+> `TableauFormula` (a complete, honest outcome). See *Post-Migration* step 3 /
+> [second-compiler.md](resources/second-compiler.md).
 
 **STEP 3 — deploy (skip entirely if D3=C / local only)**
 
@@ -624,12 +632,12 @@ measure 'city with the most sales' = 0
     annotation TranslationSuggestionPattern = argmax-dimension
 ```
 
-Landing is **batch, not per-calc**, and it is **automatic** — part of the mandatory second-compiler
-stage, not a human-approval prompt: the second compiler validates the `assisted_suggestions` list (the
-syntactic gate always; the reconciliation oracle when data is landed), then re-runs with the validated
-subset to flip them into real measures in one pass (tagged `TranslatedBy = assisted translation
-(human-approved)` — the historical provenance stamp for the assisted tier). The deterministic safe-subset
-behavior is unchanged for everything else.
+Landing is **batch, not per-calc** — and once the user has authorized the second-compiler stage (see
+*Post-Migration* step 3), it is **automatic** with no per-calc approval prompt: the second compiler
+validates the `assisted_suggestions` list (the syntactic gate always; the reconciliation oracle when data
+is landed), then re-runs with the validated subset to flip them into real measures in one pass (tagged
+`TranslatedBy = assisted translation (human-approved)` — the historical provenance stamp for the assisted
+tier). The deterministic safe-subset behavior is unchanged for everything else.
 
 ```python
 from assemble_model import migrate_tds_to_semantic_model
@@ -830,8 +838,8 @@ below), and `project_name=` to name the project after the source asset. See
 
 1. **Deploy** with the bundled `scripts/deploy_to_fabric.py` (self-contained Fabric REST), or **deploy & manage** with `semantic-model-authoring` when available (best-practice analysis, refresh, edits).
 2. **Query & explore** with `semantic-model-consumption` and `fabriciq` (natural-language analysis over the migrated model).
-3. **Run the second compiler on every stubbed calc — MANDATORY, automatic, immediate (not an offer).** _Guard first: this step applies **only** when `report["summary"]["needs_review_total"] > 0`. If it is `0`, nothing is stubbed — the stage is already satisfied; skip it and move on without re-reading the report._ The second compiler is a **built-in stage of every migration**, not a post-hoc option and not an end-of-run offer. The moment the deterministic pass leaves any calc stubbed (`report["summary"]["needs_review_total"] > 0`, also in `summary.md`'s **Next step** section and each `report["datasources"][n]["translation_handoff"]`), **announce a one-line gate and immediately proceed on your own** — there is no "want me to?", no decline path, and no configuration that turns it off (a migration is *not complete* while a translatable calc sits stubbed). Work the Tier-1 loop per [second-compiler.md](resources/second-compiler.md): author the leanest *faithful* candidate DAX → `check_candidate_dax` (syntactic gate) → reconcile against the oracle when data is landed → **land every validated candidate automatically** via `approved_calc_dax` → redeploy. The **faithful-or-stub** charter binds at the *landing* step, not the *run* step: the pass **always runs**, but a calc with no faithful DAX form stays an inert stub (original `TableauFormula` preserved) — the validation gate, not a human prompt, is what prevents a guess going live.
-   > _Announce, then proceed automatically (no question):_ "▶ Starting second compiler — N of M calculations translated deterministically; K need review: `<Calc A>`, `<Calc B>`, … authoring and validating candidates now."
+3. **Offer the second compiler on every stubbed calc — an explicit, user-gated opt-in.** _Guard first: this step applies **only** when `report["summary"]["needs_review_total"] > 0`. If it is `0`, nothing is stubbed — there is nothing to offer; move on without re-reading the report._ When the deterministic pass leaves any calc stubbed (`report["summary"]["needs_review_total"] > 0`, also in `summary.md`'s **Next step** section and each `report["datasources"][n]["translation_handoff"]`), **present the stubbed calcs and ask the user whether to run the LLM-assisted second compiler — do not proceed on your own.** You must always *offer* it when there are stubs (never silently ship as if nothing can be done), but you *run* it **only** on an explicit yes/`GO`. If the user declines, the deterministic result ships as-is and every stub keeps its preserved `TableauFormula` — a complete, honest outcome (a stubbed calc is not a failed migration). **Once the user replies `GO`, run the full pass and auto-land every validated candidate (no per-calc approval):** work the Tier-1 loop per [second-compiler.md](resources/second-compiler.md): author the leanest *faithful* candidate DAX → `check_candidate_dax` (syntactic gate) → reconcile against the oracle when data is landed → **land every validated candidate automatically** via `approved_calc_dax` → redeploy. The **faithful-or-stub** charter still binds at the *landing* step: once authorized, the pass runs in full, but a calc with no faithful DAX form stays an inert stub (original `TableauFormula` preserved) — the validation gate, not the user prompt, is what prevents a guess going live.
+   > _Ask, then run only on `GO` (do not proceed unprompted):_ "N of M calculations translated deterministically; K need review: `<Calc A>`, `<Calc B>`, … — run the LLM-assisted second compiler to attempt these? Reply `GO` to run it, or skip to ship the deterministic result as-is."
 4. **Open the rebuilt reports (preview)** — each workbook with a rebuildable embedded datasource already ships as an openable `pbip/<Workbook>/<Workbook>.pbip` (Tier-1 *structure* — chart type, exact field bindings, layout, slicers — bound to the model). Open it in Power BI Desktop to review the rebuilt pages; check the per-workbook `viz_fidelity` for any `warned` visuals and apply visual *formatting* (colors, fonts, legends) by hand for now — that styling layer is a later pass.
 5. **(Optional) Run the image oracle to settle ambiguous chart types** — for a workbook with non-standard / "hacky" views (a dual-axis pie that renders as a donut, a running-total Gantt that reads as a waterfall, an INDEX()/RANK() bump, a donut with a KPI floating in its hole), an opt-in **agent-driven vision pass** can confirm or correct each visual's *chart type* against the original Tableau rendering — **without ever touching field bindings**. It consumes the additive per-visual `candidate_records` `twb_to_pbir` already emits, resolves an offline-first image (caller-provided file → embedded `.twb`/`.twbx` thumbnail → none), and re-binds a visual's type **only** to a type in its candidate list. Follow the numbered runbook in [image-oracle.md](resources/image-oracle.md). Sheet swaps and field bindings stay deterministic; the Tier-1 report stands on its own if you skip this.
 

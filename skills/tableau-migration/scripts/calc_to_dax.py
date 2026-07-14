@@ -185,6 +185,14 @@ _AGG_X = {
 }
 _NUMERIC_TYPES = {"int64", "double", "decimal"}
 
+# Cross-table COUNTD(IF ...) multi-hop TREATAS bounds (see _unique_countd_path). A unique simple
+# path longer than _COUNTD_MAX_HOPS edges is left a stub (a deep chain is faithful in theory but
+# fragile/unreadable in practice); the DFS bails to a stub after _COUNTD_MAX_EXPLORE node
+# expansions so a pathologically dense graph fails closed rather than hanging. Real datasource
+# relationship graphs are tiny and sparse, so neither bound triggers in practice.
+_COUNTD_MAX_HOPS = 4
+_COUNTD_MAX_EXPLORE = 20000
+
 # Scalar math functions that wrap a NUMERIC (aggregated) operand and stay valid in a measure
 # (they compose with the existing arithmetic). Operand(s) must be numeric or the whole calc
 # falls back. Most Tableau math names map identically to DAX, so we re-emit the (uppercased)
@@ -1305,10 +1313,11 @@ class _Parser:
                 "number",
             )
         # Cross-table: the condition references a DIFFERENT table (C) than the counted field's
-        # table (F). DISTINCTCOUNT is idempotent to join fan-out, so when C is DIRECTLY related to F
-        # we can filter F to exactly the qualifying C-key set via a direction-independent TREATAS on
-        # the join columns (immune to the emitted relationship's single cross-filter direction).
-        # Anything the v1 gate can't prove (multi-table condition, no/ambiguous direct rel) stubs.
+        # table (F). DISTINCTCOUNT is idempotent to join fan-out, so when C is connected to F by a
+        # single unambiguous join path we filter F to exactly the qualifying C-key set via a chain
+        # of direction-independent TREATAS on the join columns -- one hop per edge (immune to the
+        # emitted relationships' cross-filter direction). Anything the gate can't prove (multi-table
+        # condition, disconnected, or an ambiguous/too-deep path) stubs.
         cross = self._countd_if_cross_table(table, col, cond, cond_tables, tables_before)
         if cross is not None:
             return cross
@@ -1328,37 +1337,117 @@ class _Parser:
         return out
 
     def _countd_if_cross_table(self, f_table, f_col, cond, cond_tables, tables_before):
-        """Direct-relationship TREATAS emit for a cross-table COUNTD(IF cond THEN [F.field] END).
+        """Cross-table TREATAS emit for a COUNTD(IF cond THEN [F.field] END).
 
-        v1 scope (else -> ``None`` -> the caller keeps the honest stub): the condition references
-        exactly ONE table C, C != F, and there is exactly ONE direct relationship between C and F
-        (0 = disconnected islands; >1 = an ambiguous multi-key join we will not guess). On success
-        the C-filter is fully encapsulated inside the TREATAS, so the aggregate is a self-contained
-        scalar whose only free table is F -- reset ``tables_used`` (IN PLACE, to keep the alias the
-        entry points read after parse) to ``tables_before | {F}`` so the top-level cross-table guard
-        passes for this isolated term while any genuinely cross-table OUTER combination still stubs.
+        The condition references exactly ONE table C != F. When C and F are connected by a single
+        unambiguous join path, the qualifying-C key set is pushed onto F through a chain of TREATAS
+        -- one hop per edge -- so the aggregate is a self-contained scalar whose only free table is F.
+
+        Path selection (else -> ``None`` -> the caller keeps the honest stub):
+          * a UNIQUE DIRECT relationship C<->F -> the single-hop path ``[C, F]`` (the v1.43.0 form,
+            byte-identical); ``>=2`` direct rels -> stub (ambiguous multi-key join, never guessed);
+          * otherwise a UNIQUE simple multi-hop path C..F (``_unique_countd_path``) -- a Case-hub-style
+            bridge. 0 paths (disconnected islands) or ``>=2`` simple paths (ambiguous) -> stub.
+
+        On success ``tables_used`` is reset IN PLACE (to keep the alias the entry points read after
+        parse) to ``tables_before | {F}``: every intermediate hop table lives only inside the filter
+        arguments, so F is the sole free table -- the top-level cross-table guard passes for this
+        isolated term while a genuinely cross-table OUTER combination still stubs.
         """
         if len(cond_tables) != 1:
             return None
         c_table = next(iter(cond_tables))
         if c_table == f_table:
             return None
-        rels = self._direct_relationships(c_table, f_table)
-        if len(rels) != 1:
-            return None
-        c_key, f_key = rels[0]
+        direct = self._direct_relationships(c_table, f_table)
+        if len(direct) == 1:
+            path, edges = [c_table, f_table], [direct[0]]
+        elif len(direct) >= 2:
+            return None  # ambiguous multi-key direct join -- never guess the key pair
+        else:
+            found = self._unique_countd_path(c_table, f_table)
+            if found is None:
+                return None
+            path, edges = found
         # Mutate in place (do NOT rebind): the *_typed entry point reads this same set object after
         # parse to run the len(tables_used) > 1 guard; rebinding would break the alias and stub.
         self.tables_used.clear()
         self.tables_used.update(tables_before)
         self.tables_used.add(f_table)
-        dax = (
-            f"COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK({_dax_table(f_table)}{_dax_col(f_col)}), "
-            f"TREATAS(CALCULATETABLE(VALUES({_dax_table(c_table)}{_dax_col(c_key)}), "
-            f"FILTER({_dax_table(c_table)}, {cond[0]})), "
-            f"{_dax_table(f_table)}{_dax_col(f_key)})), 0)"
-        )
-        return (dax, "number")
+        return (self._chained_treatas_countd(path, edges, f_col, cond[0]), "number")
+
+    def _unique_countd_path(self, c_table, f_table):
+        """Return ``(path, edges)`` for the UNIQUE simple join path C..F, else ``None`` (stub).
+
+        ``path`` is ``[C, ..., F]`` (distinct tables); ``edges[i]`` is the ``(key_on_path[i],
+        key_on_path[i+1])`` pair of the single relationship joining consecutive tables. Reads the
+        undirected ``related_tables`` adjacency (build_table_adjacency).
+
+        Fail-closed gates (any -> ``None``):
+          * enumerates simple paths (no repeated table) and returns ``None`` the instant a SECOND
+            path is found -- 2+ paths mean the join is ambiguous;
+          * a visit budget (``_COUNTD_MAX_EXPLORE`` node expansions) so a pathological graph fails
+            closed instead of hanging;
+          * the unique path must be at most ``_COUNTD_MAX_HOPS`` edges (a deeper chain is left a stub);
+          * every edge on the path must have EXACTLY ONE relationship key-pair (a parallel/multi-key
+            edge is ambiguous).
+
+        The ambiguity search itself is NOT depth-capped (only the emitted path is), so a second
+        simple path beyond the hop cap is still detected and correctly forces a stub.
+        """
+        adj = self.related_tables or {}
+        found = None                       # the first complete simple path, if any
+        budget = _COUNTD_MAX_EXPLORE
+        stack = [(c_table, (c_table,), frozenset((c_table,)))]
+        while stack:
+            node, tpath, visited = stack.pop()
+            budget -= 1
+            if budget <= 0:
+                return None                # too dense -> fail closed
+            for neighbor, _this_col, _neighbor_col in adj.get(node, ()):  # undirected
+                if neighbor == f_table:
+                    if found is not None:
+                        return None        # a 2nd simple path -> ambiguous
+                    found = tpath + (f_table,)
+                elif neighbor not in visited:
+                    stack.append((neighbor, tpath + (neighbor,), visited | {neighbor}))
+        if found is None:
+            return None                    # disconnected islands
+        path = list(found)
+        if len(path) - 1 > _COUNTD_MAX_HOPS:
+            return None                    # unique but too deep to emit
+        edges = []
+        for a, b in zip(path, path[1:]):
+            pairs = [(tc, nc) for (nb, tc, nc) in adj.get(a, ()) if nb == b]
+            if len(pairs) != 1:
+                return None                # missing or parallel/multi-key edge -> ambiguous
+            edges.append(pairs[0])
+        return path, edges
+
+    def _chained_treatas_countd(self, path, edges, f_col, cond_dax):
+        """Fold a chain of TREATAS along ``path`` (>=1 edge) for a cross-table COUNTD(IF ...).
+
+        ``edges[i] = (a_i, b_i)`` where ``a_i`` is the join key on ``path[i]`` and ``b_i`` the key on
+        ``path[i+1]``. Innermost is the qualifying-C key set (``FILTER(C, cond)``); each intermediate
+        table bridges its incoming key set onto its outgoing key via TREATAS; the last set is treated
+        onto F's join key and DISTINCTCOUNTNOBLANK counts the field. The single-edge fold is
+        byte-identical to the v1.43.0 direct-relationship form.
+        """
+        c_table, f_table = path[0], path[-1]
+        a0 = edges[0][0]
+        # innermost: the C keys whose rows satisfy the condition
+        keyset = (f"CALCULATETABLE(VALUES({_dax_table(c_table)}{_dax_col(a0)}), "
+                  f"FILTER({_dax_table(c_table)}, {cond_dax}))")
+        # each intermediate hub: push the incoming key set onto this table, read its outgoing key
+        for i in range(1, len(path) - 1):
+            hub = path[i]
+            in_key = edges[i - 1][1]       # key on hub joining the previous table
+            out_key = edges[i][0]          # key on hub joining the next table
+            keyset = (f"CALCULATETABLE(VALUES({_dax_table(hub)}{_dax_col(out_key)}), "
+                      f"TREATAS({keyset}, {_dax_table(hub)}{_dax_col(in_key)}))")
+        f_key = edges[-1][1]               # key on F joining the last hub (or C, single hop)
+        return (f"COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK({_dax_table(f_table)}{_dax_col(f_col)}), "
+                f"TREATAS({keyset}, {_dax_table(f_table)}{_dax_col(f_key)})), 0)")
 
     def _percentile(self):
         # PERCENTILE([field], n) -> PERCENTILE.INC('T'[field], n). Aggregation over a single
