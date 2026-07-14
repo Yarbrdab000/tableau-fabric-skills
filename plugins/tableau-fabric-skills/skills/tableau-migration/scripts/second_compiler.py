@@ -25,6 +25,11 @@ Faithful-by-construction guarantees:
   approved. An unfaithful/ungated base is dropped, so it can never silently drag a dependent live.
 * The cascade seeds ``measure_refs`` from APPROVED names only (never an optimistic all-names seed),
   so a dependent lands only once its bases are genuinely approved.
+* Optional model-aware GUARDS (``guards=`` / :func:`build_guards`) act purely as ADDITIONAL rejection
+  filters at the same landing chokepoint -- a candidate is dropped if it names a model reference that
+  does not exist (the reference gate, catching the ``(copy)_NNNN`` duplicate-name trap) or if its value
+  diverges from the Tableau formula over landed data (the reconciliation oracle). The guards never
+  author or alter a candidate, and ``guards=None`` is byte-identical to the unguarded driver.
 
 Public entry point: :func:`land_second_compiler` -> ``{calc_name: dax}``.
 """
@@ -34,6 +39,8 @@ from __future__ import annotations
 import os
 
 import connection_to_m as _cm
+import reference_gate as _reference_gate
+import reconciliation_oracle as _reconciliation_oracle
 from calc_to_dax import (
     suggest_assisted_dax,
     translate_tableau_calc_to_column_dax,
@@ -139,15 +146,105 @@ def _build_refs(approved_names, per, selects):
     return refs
 
 
-def _gate_ok(dax, gate):
+def build_guards(*, model_manifest=None, tmdl_parts=None, tables=None,
+                 table_csv_paths=None, column_map=None, resolver=None):
+    """Assemble the optional GUARD bundle for the landing chokepoint, or ``None`` when unusable.
+
+    The reference gate needs a model *surface* (from ``model_manifest`` -- the ``report["model_manifest"]``
+    shape -- or a ``{path: tmdl_text}`` map ``tmdl_parts``). The reconciliation oracle needs landed
+    ``tables`` (given directly, or loaded from ``table_csv_paths`` via ``column_map``) and a ``resolver``
+    mapping a Tableau caption to ``(model_table, model_column, ...)``. Either half may be absent; a guard
+    with no surface skips the reference check and a guard with no tables skips the oracle. When NEITHER
+    half is available the function returns ``None`` (so the caller stays byte-identical to the unguarded
+    driver). Every construction step fails closed -- any error degrades to the absent half, never a raise.
+    """
+    surface = None
+    if model_manifest is not None or tmdl_parts is not None:
+        try:
+            surface = _reference_gate.build_model_surface(
+                model_manifest=model_manifest, tmdl_parts=tmdl_parts)
+        except Exception:
+            surface = None
+    if tables is None and table_csv_paths:
+        try:
+            tables = _reconciliation_oracle.load_tables_from_csv(table_csv_paths, column_map)
+        except Exception:
+            tables = None
+    if surface is None and not tables:
+        return None
+    return {"surface": surface, "tables": tables, "resolver": resolver}
+
+
+def _reference_ok(dax, guards):
+    """Reference gate: True unless the candidate names a model reference that cannot exist."""
+    surface = guards.get("surface")
+    if surface is None:
+        return True
+    try:
+        return bool(_reference_gate.check_candidate_references(dax, surface)["ok"])
+    except Exception:
+        return True  # a guard failure must never REJECT a candidate the syntactic gate already passed
+
+
+def _oracle_ok(dax, guards, tableau_formula):
+    """Reconciliation oracle: reject ONLY a genuine numeric divergence (FAIL); PASS/INCONCLUSIVE land."""
+    tables = guards.get("tables")
+    if not tables or not tableau_formula:
+        return True
+    try:
+        verdict = _reconciliation_oracle.reconcile(
+            tableau_formula, dax, tables, resolver=guards.get("resolver"))
+    except Exception:
+        return True  # fail open -- an oracle error must never reject a syntactically clean candidate
+    return verdict.get("status") != _reconciliation_oracle.FAIL
+
+
+def _gate_ok(dax, gate, *, guards=None, tableau_formula=None):
     if dax is None or not str(dax).strip():
         return False
-    if not gate:
-        return True
-    return bool(check_candidate_dax(dax)["ok"])
+    if gate and not check_candidate_dax(dax)["ok"]:
+        return False
+    if guards is not None:
+        if not _reference_ok(dax, guards):
+            return False
+        if not _oracle_ok(dax, guards, tableau_formula):
+            return False
+    return True
 
 
-def _cascade(initial, home, form, role, per, selects, *, rounds, gate, param_resolver):
+def _guard_verdicts(supplement, form, guards):
+    """Per-landed-calc guard telemetry (additive) -- ``{}`` when guards are off.
+
+    For every calc in the landed ``supplement`` re-runs both gates once so the report can two-bucket a
+    landing: ``reference`` in ``ok``/``blocked``/``skipped`` and ``oracle`` in the PASS/FAIL/INCONCLUSIVE
+    constant (or ``skipped`` when there is no surface / no landed data / no Tableau formula).
+    """
+    if guards is None:
+        return {}
+    surface = guards.get("surface")
+    tables = guards.get("tables")
+    resolver = guards.get("resolver")
+    out = {}
+    for nm, dax in supplement.items():
+        ref = "skipped"
+        if surface is not None:
+            try:
+                ref = "ok" if _reference_gate.check_candidate_references(dax, surface)["ok"] else "blocked"
+            except Exception:
+                ref = "ok"
+        orc = "skipped"
+        tf = form.get(nm)
+        if tables and tf:
+            try:
+                orc = _reconciliation_oracle.reconcile(
+                    tf, dax, tables, resolver=resolver).get("status", "skipped")
+            except Exception:
+                orc = "skipped"
+        out[nm] = {"reference": ref, "oracle": orc}
+    return out
+
+
+def _cascade(initial, home, form, role, per, selects, *, rounds, gate, param_resolver, guards=None):
     """Fix-point: land every calc reachable from ``initial`` via APPROVED-only ``measure_refs``."""
     approved = dict(initial)
     changed = True
@@ -160,20 +257,21 @@ def _cascade(initial, home, form, role, per, selects, *, rounds, gate, param_res
             if nm in approved:
                 continue
             dax = _translate(nm, home, form, role, per, refs, param_resolver)
-            if _gate_ok(dax, gate):
+            if _gate_ok(dax, gate, guards=guards, tableau_formula=form.get(nm)):
                 approved[nm] = _norm(dax)
                 changed = True
     return approved, used_rounds
 
 
-def land_second_compiler(twb, *, authored=None, param_resolver=None, rounds=12, gate=True):
+def land_second_compiler(twb, *, authored=None, param_resolver=None, rounds=12, gate=True, guards=None):
     """Land keystone-dependent stub calcs as faithful DAX -> ``{calc_name: dax}``.
 
     ``twb`` -- a ``.twb``/``.twbx`` path, or raw workbook/``.tds`` XML (``str``/``bytes``).
     ``authored`` -- optional ``{calc_name: dax}`` human/LLM overrides used as extra keystones (each
     still gate-checked). ``param_resolver`` -- passed through to the measure translator for
     parameter references. ``rounds`` -- cascade fix-point cap. ``gate`` -- run ``check_candidate_dax``
-    on every candidate (leave True; False is for diagnostics only).
+    on every candidate (leave True; False is for diagnostics only). ``guards`` -- optional model-aware
+    GUARD bundle (see :func:`build_guards`) that only ADDS rejection filters; ``None`` is byte-identical.
 
     Returns only the SUPPLEMENT the normal build cannot already produce: the calcs that land solely
     because of a keystone (the keystone idioms/overrides themselves plus everything that cascades off
@@ -181,38 +279,42 @@ def land_second_compiler(twb, *, authored=None, param_resolver=None, rounds=12, 
     excluded so they keep their ``deterministic`` provenance in the normal build.
     """
     return _land(twb, authored=authored, param_resolver=param_resolver,
-                 rounds=rounds, gate=gate)["approved"]
+                 rounds=rounds, gate=gate, guards=guards)["approved"]
 
 
-def land_report(twb, *, authored=None, param_resolver=None, rounds=12, gate=True):
+def land_report(twb, *, authored=None, param_resolver=None, rounds=12, gate=True, guards=None):
     """Full-detail variant of :func:`land_second_compiler`.
 
     Returns the whole driver detail dict -- ``approved`` (the ``{name: dax}`` supplement),
     ``authored`` / ``detectors`` (which keystones came from an override vs an idiom detector),
     ``cascaded`` (dependents that landed off the keystones), ``gate_failures`` (candidates the gate
-    rejected), ``rounds`` (cascade rounds used), and ``plain_count`` (deterministic-closure size).
-    Callers that only need the landed map should use :func:`land_second_compiler`.
+    rejected), ``rounds`` (cascade rounds used), ``plain_count`` (deterministic-closure size), plus --
+    when ``guards`` is supplied -- ``guarded`` (bool) and ``guard_verdicts`` (per-landed-calc gate
+    telemetry). Callers that only need the landed map should use :func:`land_second_compiler`.
     """
-    return _land(twb, authored=authored, param_resolver=param_resolver, rounds=rounds, gate=gate)
+    return _land(twb, authored=authored, param_resolver=param_resolver,
+                 rounds=rounds, gate=gate, guards=guards)
 
 
-def _land(twb, *, authored=None, param_resolver=None, rounds=12, gate=True):
+def _land(twb, *, authored=None, param_resolver=None, rounds=12, gate=True, guards=None):
     """Full-detail driver; :func:`land_second_compiler` returns ``["approved"]``."""
     twb = _load_twb(twb)
     selects = _datasource_selects(twb)
     per, home, form, role, lookup = _collect(twb, selects)
     authored = dict(authored or {})
 
-    # (1) Plain deterministic closure -- what the normal build already lands on its own.
+    # (1) Plain deterministic closure -- what the normal build already lands on its own. This is the
+    #     baseline the supplement is diffed against, so it stays UNGUARDED (the normal build runs no
+    #     guards); guarding it would wrongly push a deterministic calc into the supplement.
     plain, _ = _cascade({}, home, form, role, per, selects,
-                        rounds=rounds, gate=gate, param_resolver=param_resolver)
+                        rounds=rounds, gate=gate, param_resolver=param_resolver, guards=None)
 
     # (2) Keystones = gated authored overrides + idiom-detector defaults for genuine stubs.
     keystones = {}
     authored_landed = []
     gate_failures = {}
     for nm, dax in authored.items():
-        if _gate_ok(dax, gate):
+        if _gate_ok(dax, gate, guards=guards, tableau_formula=form.get(nm)):
             keystones[nm] = _norm(dax)
             authored_landed.append(nm)
         else:
@@ -228,14 +330,14 @@ def _land(twb, *, authored=None, param_resolver=None, rounds=12, gate=True):
         cand = sugg.get("dax") if sugg else None
         if cand is None:
             continue
-        if _gate_ok(cand, gate):
+        if _gate_ok(cand, gate, guards=guards, tableau_formula=form.get(nm)):
             keystones[nm] = _norm(cand)
         else:
             gate_failures[nm] = cand
 
     # (3) Keystone-seeded closure, then diff against the plain closure.
     full, used_rounds = _cascade(keystones, home, form, role, per, selects,
-                                 rounds=rounds, gate=gate, param_resolver=param_resolver)
+                                 rounds=rounds, gate=gate, param_resolver=param_resolver, guards=guards)
     detector_landed = [n for n in keystones if n not in authored_landed]
     supplement = {}
     cascaded = []
@@ -254,4 +356,6 @@ def _land(twb, *, authored=None, param_resolver=None, rounds=12, gate=True):
         "gate_failures": gate_failures,
         "rounds": used_rounds,
         "plain_count": len(plain),
+        "guarded": guards is not None,
+        "guard_verdicts": _guard_verdicts(supplement, form, guards),
     }

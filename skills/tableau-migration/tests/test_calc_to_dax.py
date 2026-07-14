@@ -1884,6 +1884,132 @@ def test_build_table_adjacency_orientation():
     assert adj["caseman__Intake__c"] == [("Case", "Id", "caseman__Intake__c")]
 
 
+# --- v2 multi-hop cross-table COUNTD-IF (chained TREATAS through a hub) -----------------------
+# Live target: "Count of Active and Enrolled Clients" on the Salesforce Nonprofit Case Management
+# workbook -- COUNTD(IF <Stage on Intake> THEN [Contact.Id] END) bridged through the Case hub. The
+# condition table (Intake) and the counted-field table (Contact) are NOT directly related; they are
+# joined by the unique 2-hop path Intake -> Case -> Contact.
+_MH_FIELDS = {
+    "Stage": ("Intake", "Stage", "string"),
+    "Id (Contact)": ("Contact", "Id", "string"),
+    "Case ID": ("Case", "Id", "string"),
+}
+_MH_REL_CASE_INTAKE = {"from_table": "Case", "from_col": "caseman__Intake__c",
+                       "to_table": "Intake", "to_col": "Id", "kind": "many_to_many"}
+_MH_REL_CASE_CONTACT = {"from_table": "Case", "from_col": "ContactId",
+                        "to_table": "Contact", "to_col": "Id", "kind": "many_to_many"}
+_MH_ACTIVE = 'COUNTD( If [Stage] = "Active" OR [Stage] = "Enrolled" THEN [Id (Contact)] END )'
+# Captured from the real translator (NOT assumed): a chain of TREATAS pushes the qualifying-Intake
+# key set through the Case hub (VALUES('Case'[ContactId]) filtered by the Intake key set) onto
+# Contact's join key, then DISTINCTCOUNTNOBLANK counts the Contact Id.
+_MH_ACTIVE_DAX = (
+    "COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK('Contact'[Id]), "
+    "TREATAS(CALCULATETABLE(VALUES('Case'[ContactId]), "
+    "TREATAS(CALCULATETABLE(VALUES('Intake'[Id]), "
+    "FILTER('Intake', EXACT('Intake'[Stage], \"Active\") || EXACT('Intake'[Stage], \"Enrolled\"))), "
+    "'Case'[caseman__Intake__c])), "
+    "'Contact'[Id])), 0)"
+)
+
+
+def test_countd_if_cross_table_multi_hop_translates():
+    # Headline v2: C (Intake) and F (Contact) are joined by a UNIQUE 2-hop path through the Case hub.
+    # The engine folds a chain of TREATAS -- one hop per edge -- and collapses tables_used to just F.
+    adj = build_table_adjacency([_MH_REL_CASE_INTAKE, _MH_REL_CASE_CONTACT])
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        _MH_ACTIVE, _MH_FIELDS.get, related_tables=adj)
+    assert reason == "ok"
+    assert dax == _MH_ACTIVE_DAX
+    assert tables == {"Contact"}
+
+
+def test_countd_if_single_hop_is_multi_hop_special_case():
+    # The single-hop (direct-rel) output is byte-identical to the v1.43.0 form -- v1 is just the
+    # n=1 fold. Guards that generalizing to N hops did not perturb the shipped single-hop DAX.
+    adj = build_table_adjacency([_MH_REL_CASE_INTAKE])
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        'COUNTD(IF [Stage] = "Active" THEN [Case ID] END)', _MH_FIELDS.get, related_tables=adj)
+    assert reason == "ok"
+    assert tables == {"Case"}
+    assert dax == (
+        "COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK('Case'[Id]), "
+        "TREATAS(CALCULATETABLE(VALUES('Intake'[Id]), "
+        "FILTER('Intake', EXACT('Intake'[Stage], \"Active\"))), "
+        "'Case'[caseman__Intake__c])), 0)")
+
+
+def test_countd_if_cross_table_multi_hop_disconnected_stays_stub():
+    # F (Contact) is reachable from the hub but NOT from C (Intake): no Intake<->Case edge -> no
+    # path Intake..Contact -> honest stub (never invent a bridge).
+    adj = build_table_adjacency([_MH_REL_CASE_CONTACT])
+    dax, reason, _ = translate_tableau_calc_to_dax(_MH_ACTIVE, _MH_FIELDS.get, related_tables=adj)
+    assert dax is None
+    assert "one table" in reason
+
+
+def test_countd_if_cross_table_two_simple_paths_stays_stub():
+    # TWO simple paths C..F -- Intake->Case->Contact AND Intake->Program->Contact -- make the join
+    # ambiguous, so we refuse to pick one and keep the honest stub.
+    rels = [
+        _MH_REL_CASE_INTAKE, _MH_REL_CASE_CONTACT,
+        {"from_table": "Intake", "from_col": "ProgId", "to_table": "Program", "to_col": "Id"},
+        {"from_table": "Program", "from_col": "ContactId", "to_table": "Contact", "to_col": "Id"},
+    ]
+    adj = build_table_adjacency(rels)
+    dax, reason, _ = translate_tableau_calc_to_dax(_MH_ACTIVE, _MH_FIELDS.get, related_tables=adj)
+    assert dax is None
+    assert "one table" in reason
+
+
+def test_countd_if_cross_table_multi_key_hop_stays_stub():
+    # The Intake<->Case hop has TWO distinct relationships (a parallel/composite join): the path is
+    # otherwise unique but one edge's key pair is ambiguous -> stub (never guess the hop key).
+    alt = {"from_table": "Case", "from_col": "AltIntake", "to_table": "Intake", "to_col": "AltId"}
+    adj = build_table_adjacency([_MH_REL_CASE_INTAKE, alt, _MH_REL_CASE_CONTACT])
+    dax, reason, _ = translate_tableau_calc_to_dax(_MH_ACTIVE, _MH_FIELDS.get, related_tables=adj)
+    assert dax is None
+    assert "one table" in reason
+
+
+def _chain_rels(n):
+    # A straight chain C - H1 - ... - H(n-1) - F of n edges (n+1 tables), each a single key "k".
+    tables = ["C"] + [f"H{i}" for i in range(1, n)] + ["F"]
+    return [{"from_table": tables[i], "from_col": "k", "to_table": tables[i + 1], "to_col": "k"}
+            for i in range(n)]
+
+
+def test_countd_if_cross_table_path_too_deep_stays_stub():
+    # A UNIQUE path longer than _COUNTD_MAX_HOPS (4) edges is left a stub -- faithful in theory but
+    # too fragile/unreadable to emit. Five edges here (C-H1-H2-H3-H4-F).
+    fields = {"Stage": ("C", "S", "string"), "Id (Contact)": ("F", "Id", "string")}
+    adj = build_table_adjacency(_chain_rels(5))
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        'COUNTD(IF [Stage] = "Active" THEN [Id (Contact)] END)', fields.get, related_tables=adj)
+    assert dax is None
+    assert "one table" in reason
+
+
+def test_countd_if_cross_table_path_at_cap_translates():
+    # A unique 4-edge path (exactly _COUNTD_MAX_HOPS) still translates -- the fold nests four TREATAS.
+    fields = {"Stage": ("C", "S", "string"), "Id (Contact)": ("F", "Id", "string")}
+    adj = build_table_adjacency(_chain_rels(4))
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        'COUNTD(IF [Stage] = "Active" THEN [Id (Contact)] END)', fields.get, related_tables=adj)
+    assert reason == "ok"
+    assert tables == {"F"}
+    assert dax.count("TREATAS(") == 4
+    assert dax.startswith("COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK('F'[Id]),")
+    assert dax.endswith("'F'[k])), 0)")
+
+
+def test_countd_if_cross_table_multi_hop_without_graph_stays_stub():
+    # No relationship graph supplied -> even a genuinely bridgeable cross-table calc stays a
+    # fail-closed stub (byte-identical pre-feature behaviour when related_tables is omitted).
+    dax, reason, _ = translate_tableau_calc_to_dax(_MH_ACTIVE, _MH_FIELDS.get)
+    assert dax is None
+    assert "one table" in reason
+
+
 def test_inline_non_boolean_candidate_not_inlined():
     # A non-boolean dim calc keyed in inline_calcs (a numeric body) must NOT inline -- the
     # nested parser rejects a non-bool node, so the reference stays an honest stub.

@@ -2338,7 +2338,90 @@ def _single_workbook_source(source, name=None):
     return InMemoryTableauSource(workbooks={key: text}), key
 
 
-def _second_compile_prepass(single, wb_id, approved_calc_dax, authored):
+def _second_compile_guards(workbook_text, output_dir):
+    """Best-effort model-aware GUARD bundle for the second-compiler landing chokepoint, or ``None``.
+
+    Assembles the reference gate + reconciliation oracle from the PRIOR build's on-disk artifacts:
+
+    * reference-gate SURFACE = every ``*.tmdl`` under ``output_dir`` (a superset surface is safe for a
+      rejection-only guard -- a bigger surface can only make the reference gate MORE permissive, never
+      wrongly block; on a typical single-workbook re-run there is exactly one model anyway). This is the
+      generated model's REAL, dedup'd names, so it catches the ``(copy)_NNNN`` duplicate-name trap a
+      descriptor-built surface would miss;
+    * oracle TABLES = every landed ``*.csv`` under ``output_dir`` (``materialize_bundled_flatfile_data``
+      writes one CSV per table), keyed by CSV stem;
+    * resolver = ONE combined ``caption -> (model_table, model_column, type)`` over the workbook's
+      datasources, so the oracle can evaluate the Tableau formula in model terms.
+
+    Meaningfully active ONLY on the opt-in ``--second-compile`` RE-RUN over an already-built output dir:
+    the prepass runs BEFORE this run writes any model, so a FRESH dir holds no prior TMDL/CSV, every
+    discovery step yields nothing, and :func:`second_compiler.build_guards` returns ``None`` -> the driver
+    stays byte-identical to the unguarded pass. Every step fails closed to the absent half (never a raise);
+    the guards only ever REJECT a candidate, so an imperfect bundle degrades to inert, never to a wrong
+    landing (the oracle also evaluates BOTH sides against the SAME tables, so a CSV-stem/model-name
+    mismatch makes it INCONCLUSIVE, never a false FAIL).
+    """
+    if not output_dir or not os.path.isdir(output_dir):
+        return None
+    try:
+        try:  # scripts/ is on sys.path both as a CLI run and in tests
+            from . import second_compiler as _sc
+            from .connection_to_m import (workbook_datasources as _wds,
+                                          build_m_field_resolver as _bmfr)
+        except ImportError:
+            import second_compiler as _sc
+            from connection_to_m import (workbook_datasources as _wds,
+                                         build_m_field_resolver as _bmfr)
+    except Exception:
+        return None
+
+    tmdl_parts = {}
+    table_csv_paths = {}
+    try:
+        for root, _dirs, files in os.walk(output_dir):
+            for fn in files:
+                low = fn.lower()
+                if low.endswith(".tmdl"):
+                    fp = os.path.join(root, fn)
+                    try:
+                        with open(fp, encoding="utf-8-sig") as fh:
+                            tmdl_parts[os.path.relpath(fp, output_dir)] = fh.read()
+                    except OSError:
+                        pass
+                elif low.endswith(".csv"):
+                    table_csv_paths.setdefault(os.path.splitext(fn)[0], os.path.join(root, fn))
+    except Exception:
+        tmdl_parts, table_csv_paths = {}, {}
+    tmdl_parts = tmdl_parts or None
+    table_csv_paths = table_csv_paths or None
+
+    resolver = None
+    try:
+        descriptors = []
+        for ds in (_wds(workbook_text) or []):
+            label = ds.get("label") or ds.get("caption") or ds.get("name")
+            try:
+                descriptors.append(parse_tds(workbook_text, label))
+            except Exception:
+                pass
+        if not descriptors:
+            try:
+                descriptors = [parse_tds(workbook_text)]
+            except Exception:
+                descriptors = []
+        if descriptors:
+            combined = combine_descriptors(descriptors) if len(descriptors) > 1 else descriptors[0]
+            resolver = _bmfr(combined)
+    except Exception:
+        resolver = None
+
+    try:
+        return _sc.build_guards(tmdl_parts=tmdl_parts, table_csv_paths=table_csv_paths, resolver=resolver)
+    except Exception:
+        return None
+
+
+def _second_compile_prepass(single, wb_id, approved_calc_dax, authored, output_dir=None):
     """Opt-in Spec-4 pre-pass: land keystone-dependent stub calcs as faithful DAX and merge them
     UNDER any explicit ``approved_calc_dax`` (a human-approved entry always wins on a name clash).
 
@@ -2346,6 +2429,14 @@ def _second_compile_prepass(single, wb_id, approved_calc_dax, authored):
     yields the *unchanged* approved map plus a detail note, so turning the pre-pass on can never break
     a run. Returns ``(merged_approved_or_None, detail)`` where ``detail`` is the additive
     ``second_compile`` report record.
+
+    ``output_dir`` (optional) is the run's output project directory. When it holds a PRIOR build's TMDL
+    and/or landed CSVs (the opt-in ``--second-compile`` re-run over an existing ``.\\out``), a model-aware
+    GUARD bundle is assembled from them and passed to the landing driver so a candidate that names a
+    non-existent model reference (the ``(copy)_NNNN`` trap) or numerically diverges from its Tableau
+    formula is REJECTED. On a fresh run the dir holds no prior artifacts -> guards ``None`` -> byte-
+    identical to the unguarded pass. Guards act purely as rejection filters and never author/alter a
+    candidate.
     """
     try:
         text = single.read_workbook(wb_id)
@@ -2357,7 +2448,8 @@ def _second_compile_prepass(single, wb_id, approved_calc_dax, authored):
             from . import second_compiler as _sc
         except ImportError:
             import second_compiler as _sc
-        rep = _sc.land_report(text, authored=authored)
+        guards = _second_compile_guards(text, output_dir)
+        rep = _sc.land_report(text, authored=authored, guards=guards)
     except Exception as exc:
         return approved_calc_dax, {"landed": [], "count": 0,
                                    "note": f"second-compile unavailable: {type(exc).__name__}: {exc}"}
@@ -2439,7 +2531,7 @@ def migrate_workbook(source, *, write_to=None, wb_id=None, name=None, viz_stage=
     sc_detail = None
     if second_compile or authored:
         approved_calc_dax, sc_detail = _second_compile_prepass(
-            single, wb_id, approved_calc_dax, authored)
+            single, wb_id, approved_calc_dax, authored, output_dir=write_to)
 
     detail = _migrate_one_workbook(single, wb_id, viz, reports_dir, used_folders, pbip_dir,
                                    ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax,
@@ -3289,11 +3381,12 @@ def _render_summary_md(report):
     if review:
         lines += [
             "",
-            "## Next step — second compiler (MANDATORY, run now)",
+            "## Next step — second compiler (optional; offer to run)",
             "",
             f"{len(review)} calculation(s) fell back to inert stubs (the original Tableau formula is "
-            "preserved). The second compiler is **not optional** — run it now as a built-in stage of "
-            "this migration: for each calc author a candidate DAX, validate it with "
+            "preserved). The second compiler is an **opt-in** stage: offer it to the user, then run it "
+            "only on an explicit GO. If they decline, this deterministic result ships as-is. Once "
+            "authorized: for each calc author a candidate DAX, validate it with "
             "`check_candidate_dax` (and the reconciliation oracle when data is landed), then land every "
             "validated candidate via `approved_calc_dax` and redeploy. Anything with no faithful DAX "
             "form stays an inert stub. See "
@@ -3570,6 +3663,10 @@ def main(argv=None):
                              "in the input folder, so it can be fetched FIRST. Writes "
                              "<output>/scan.json. Exits non-zero when a published datasource is "
                              "missing (do not build until this exits 0).")
+    parser.add_argument("--force", "--overwrite", action="store_true", dest="force",
+                        help="build even if <output> already holds a prior report.json (overwrite "
+                             "in place); the default is to STOP so a new run never silently mixes "
+                             "with a previous run's stale outputs")
     args = parser.parse_args(argv)
 
     try:
@@ -3609,6 +3706,23 @@ def main(argv=None):
         print(f"Scan manifest written to: {os.path.abspath(scan_path)}")
         return 1 if missing else 0
 
+    # Fail-loud stale-output guard: refuse a FRESH build into an -o that already holds a prior
+    # report.json, so a new migration never silently mixes with a previous run's outputs (the
+    # AAR's stale-$RUN foot-gun, on the OUTPUT side; new_run.py fixes the input side). An
+    # intentional re-run that LANDS calcs into the same bundle (--approved-dax / --author /
+    # --second-compile -- the documented second-compiler loop) is exempt, as is an explicit
+    # --force overwrite-in-place.
+    prior_report = os.path.join(args.output, "report.json")
+    landing_rerun = bool(args.approved_dax or second_compile)
+    if not args.force and not landing_rerun and os.path.isfile(prior_report):
+        print(f"[STOP] Refusing to build: {os.path.abspath(prior_report)} already exists -- "
+              f"'{os.path.abspath(args.output)}' holds a prior migration's output.")
+        print("       Building here would mix this run with a previous run's stale outputs. Point "
+              "-o at a FRESH, empty folder")
+        print(r'       (mint one with: py -3.11 "$SKILL\scripts\new_run.py" --root C:\tfmig), or '
+              "pass --force to overwrite in place.")
+        return 2
+
     report = migrate_estate(source, args.output, pbip=not args.no_pbip,
                             approved_calc_dax=approved_calc_dax, viz_advice=args.viz_advice,
                             second_compile=second_compile, authored=authored)
@@ -3629,10 +3743,10 @@ def main(argv=None):
     if not args.no_pbip:
         print("Openable projects: pbip/<Name>/<Name>.pbip (double-click in Power BI Desktop)")
     if s.get("needs_review_total"):
-        print(f"Next step: MANDATORY second-compiler pass -- {s['needs_review_total']} calculation(s) "
-              f"stubbed -> run them through the second compiler NOW (see summary.md 'Next step'); it is "
-              f"a built-in stage, not an option. Land the validated results by re-running with "
-              f"--approved-dax <file.json>.")
+        print(f"Next step: OFFER the second-compiler pass -- {s['needs_review_total']} calculation(s) "
+              f"stubbed -> present them to the user and run the second compiler only on an explicit GO "
+              f"(see summary.md 'Next step'); if declined, this deterministic result ships as-is. Land "
+              f"any validated results by re-running with --approved-dax <file.json>.")
     if s.get("partitions_stubbed_total"):
         print(f"Next step: {s['partitions_stubbed_total']} table partition(s) need manual M "
               f"completion -> see summary.md ('manual M partition completion'); the original SQL "

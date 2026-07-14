@@ -2487,6 +2487,87 @@ def test_m_field_resolver_unscoped_is_byte_identical_when_no_collision():
     assert resolve("FinCategory") == ("Finance", "FinCategory", "string")
 
 
+# -- island-aware disambiguated captions ('<Field> (<Object>)') ----------------
+# The real Salesforce "Service Delivery" shape: an object model joins Contact TWICE (Contact, Contact1),
+# so BOTH copies' Id column parses to local_name='Id (Contact)' / model_name='Id'. Within one island
+# the caption 'Id (Contact)' is therefore ambiguous (two tables expose it) and drops to a stub -- even
+# though Tableau's own disambiguator, the '(Contact)' object token, names the intended relation exactly.
+# Matching that object token to the relation literally named 'Contact' reclaims the binding.
+def _disambig_island_tds(name="SD Source", conn="sqlserver.sd"):
+    """A one-datasource island whose object model joins ``Contact`` twice (``Contact``/``Contact1``),
+    so the disambiguated caption ``[Id (Contact)]`` lands on BOTH -> a two-table collision. ``Stage``
+    lives on ``Fact``. Reproduces the exact stub the island-aware resolver must reclaim."""
+    return f"""<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='{name}' inline='true' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='c' name='{conn}'>
+        <connection class='sqlserver' dbname='DB' server='srv.example.com' username='svc' />
+      </named-connection>
+    </named-connections>
+    <relation type='collection'>
+      <relation connection='{conn}' name='Fact' table='[dbo].[Fact]' type='table' />
+      <relation connection='{conn}' name='Contact' table='[dbo].[Contact]' type='table' />
+      <relation connection='{conn}' name='Contact1' table='[dbo].[Contact]' type='table' />
+    </relation>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Stage</remote-name><local-name>[Stage]</local-name>
+        <parent-name>[Fact]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Id</remote-name><local-name>[Id (Contact)]</local-name>
+        <parent-name>[Contact]</parent-name><local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Id</remote-name><local-name>[Id (Contact)]</local-name>
+        <parent-name>[Contact1]</parent-name><local-type>string</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+
+def test_m_field_resolver_island_aware_disambiguates_twin_join_copy():
+    # Headline: the two-copy collision drops [Id (Contact)] to a stub (the shipped bug), but the
+    # '(Contact)' object token names the 'Contact' relation, so island-aware resolution reclaims it.
+    resolve = build_m_field_resolver(parse_tds(_disambig_island_tds()))
+    assert resolve("Id (Contact)") == ("Contact", "Id", "string")
+    # The bare model name is genuinely ambiguous across the two copies -> stays None (no guess).
+    assert resolve("Id") is None
+    # A plain (non-suffixed) caption on a single table is unaffected.
+    assert resolve("Stage") == ("Fact", "Stage", "string")
+
+
+def test_m_field_resolver_island_aware_reaches_through_scoped_path():
+    # The scoped resolver (combined workbook, datasource=<island>) must ALSO reach island-aware
+    # resolution on a base miss. The 2nd island uses DISTINCT table names so combine_descriptors does
+    # NOT rename SD's Contact/Contact1 (a rename would defeat the object-token match).
+    sd = parse_tds(_disambig_island_tds("SD Source", "sqlserver.sd"))
+    other = parse_tds(_island_tds("Other Source", "sqlserver.o1", "Other"))
+    combined = combine_descriptors([sd, other], captions=["SD Source", "Other Source"])
+    resolve = build_m_field_resolver(combined, datasource="SD Source")
+    assert resolve("Id (Contact)") == ("Contact", "Id", "string")
+
+
+def test_m_field_resolver_island_aware_fails_closed_when_object_matches_no_relation():
+    # '(Nonexistent)' names no relation -> no unique object match -> stays None (never invents a table).
+    resolve = build_m_field_resolver(parse_tds(_disambig_island_tds()))
+    assert resolve("Id (Nonexistent)") is None
+
+
+def test_m_field_resolver_island_aware_fails_closed_when_field_absent_on_object():
+    # '(Contact)' matches the Contact relation, but Contact carries no 'Stage' column -> None.
+    resolve = build_m_field_resolver(parse_tds(_disambig_island_tds()))
+    assert resolve("Stage (Contact)") is None
+
+
+def test_m_field_resolver_island_aware_leaves_plain_caption_none():
+    # A caption with no '<Field> (<Object>)' shape and no metadata match is unchanged: None.
+    resolve = build_m_field_resolver(parse_tds(_disambig_island_tds()))
+    assert resolve("Nope") is None
+
+
 # -- bind details --------------------------------------------------------------
 def test_connection_details_for_bind():
     d = parse_tds(LIVE_SQLSERVER)

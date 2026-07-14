@@ -13,6 +13,32 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.43.0` → `1.44.0`): Island-aware caption resolution unblocks cross-table
+  `COUNTD(IF …)` on denormalized object models, plus N-hop cross-table reach and the second-compiler
+  validation gates — all additive and faithfulness-preserving.** **(1) Island-aware field resolver** — a
+  Tableau `<Field> (<Object>)` caption (e.g. `[Id (Contact)]`) whose object joins into the model *twice* (as
+  `Contact` and `Contact1`) was ambiguous under the calc's home data-island and silently dropped, stubbing any
+  calc that referenced it. The resolver now matches the `(Object)` token to the single owning join relation and
+  re-resolves the physical column within it — fail-closed on a zero- or multi-relation match, so an
+  unresolvable caption still stubs rather than guesses. Live-proven on a real Salesforce workbook: the headline
+  `Count of Active and Enrolled Clients` (`COUNTD(IF [Stage] = "Active" OR [Stage] = "Enrolled" THEN
+  [Id (Contact)] END)`) flipped stub → deterministic once `[Id (Contact)]` resolved to `'Contact'[Id]`,
+  cascading through its dependent `Clients per Staff` ratio and the ●/▲/▼ KPI-glyph family — workbook calc
+  coverage **55 → 61/154 with zero regressions**. **(2) N-hop cross-table `COUNTD(IF …)`** — the `1.43.0`
+  direct-relationship `TREATAS` idiom now also fires when the condition table `C` and counted-field table `F`
+  are joined by a *unique simple relationship path* of more than one hop, chaining the key set along the path;
+  still fail-closed on any ambiguous, disconnected, or multi-condition-table shape (an unstubbed calc is never
+  a guess). **(3) Second-compiler validation gates (rejection-only, opt-in)** — two guard primitives now vet an
+  assisted-tier candidate before it may land: a **reference gate** that rejects a candidate referencing a
+  nonexistent `[Measure]` or `'Table'[Column]` (catching the `(copy)_NNNN` duplicate-name trap), and a
+  **reconciliation oracle** that proves numeric faithfulness of the candidate DAX against the original Tableau
+  formula over landed CSV rows (returning INCONCLUSIVE rather than a false PASS outside a tight subset). Policy
+  is **guard-only** — the gates never author or alter a candidate and the whole pass is user-opt-in; with no
+  guards supplied the landing flow is byte-identical to `1.43.0`. **(4) Auto-incrementing run folders** — a
+  `new_run.py` minter lays down `runs/NNNN_<label>/{in,out}` so repeat migrations never collide on a stale
+  output dir, backed by a fail-loud guard that refuses to overwrite a prior run's `report.json`. Additive
+  throughout — no report key was renamed or removed, every original Tableau formula is still preserved, and
+  deterministically translated measures stamp `TranslatedBy = deterministic`.
 - **tableau-migration (skill `1.42.0` → `1.43.0`): Cross-table `COUNTD(IF …)` translation via `TREATAS` —
   a distinct count whose condition and counted field live on two *directly related* tables now translates
   deterministically instead of stubbing.** Tableau denormalizes its object model, so a calc like

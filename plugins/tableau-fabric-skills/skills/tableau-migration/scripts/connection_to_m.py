@@ -39,6 +39,23 @@ except ImportError:
         NATIVE_QUERY_CATALOG_DRILL, ODBC_CLASSES, PARTIAL_LIVE_CONNECTORS, connector_spec)
 
 
+# -- disambiguated caption resolution -----------------------------------------
+# Tableau writes a field whose base name collides across joined objects as ``<Field> (<Object>)``
+# (e.g. ``Id (Contact)`` -- Id on the Contact object). When an object model joins the SAME object
+# twice (Contact + Contact1), BOTH copies expose the identical disambiguated caption, so within one
+# island it resolves to two tables and drops to a stub. The ``(<Object>)`` token is Tableau's own
+# disambiguator: matching it to the relation literally named ``<Object>`` reclaims the binding.
+# The leading space before ``(`` is required, so this matches ``Field (Object)`` -- NEVER ``SUM(x)``.
+_OBJECT_SUFFIX_RE = re.compile(r"^(.+) \((.+)\)$")
+
+
+def _norm_obj(s):
+    """Casefold + strip ALL spaces so a caption's ``(Contact 1)`` object token matches the relation
+    ``Contact1`` while an island-renamed ``Contact (Intake)`` never collapses onto ``Contact``.
+    Exact match (not a prefix); ``None`` -> ``''`` so a nameless relation never matches an object."""
+    return (s or "").replace(" ", "").casefold()
+
+
 # -- type mapping --------------------------------------------------------------
 # Tableau metadata-record <local-type> -> TMDL column dataType. This is the Import/DQ
 # analog of spark_type_to_tmdl (which types the DirectLake path from landed Delta).
@@ -2651,16 +2668,44 @@ def build_m_field_resolver(descriptor, datasource=None):
             return next(iter(bucket))
         return None
 
+    def _island_aware(caption, table_set):
+        # Reclaim a disambiguated caption '<Field> (<Object>)' that a base pass could not resolve,
+        # by matching the '(<Object>)' token to the ONE relation literally named <Object>. Runs ONLY
+        # after both base passes miss, and only on the '<Field> (<Object>)' shape, so a caption that
+        # already resolves (via metadata or the logical bucket) is byte-identical to before.
+        m = _OBJECT_SUFFIX_RE.match(caption or "")
+        if m is None:
+            return None
+        field, obj = m.group(1).strip(), m.group(2).strip()
+        if not field or not obj:
+            return None
+        obj_norm = _norm_obj(obj)
+        matched = [t for t in table_set if _norm_obj(t) == obj_norm]
+        if len(matched) != 1:  # no object, or an ambiguous object -> fail closed (never guess)
+            return None
+        one = {matched[0]}
+        # Prefer the full disambiguated caption on that one table; else the bare field name on it.
+        # Both go through _resolve_over so the single-column-per-name guard still holds (a field
+        # genuinely absent on the matched object stays None).
+        return _resolve_over(caption, one) or _resolve_over(field, one)
+
     def resolve_field(caption):
         # Island-scoped resolution wins; fall back to full-descriptor resolution so a caption living
         # outside the named island still binds when it is globally unambiguous. With no scope
         # (single descriptor, or datasource=None) this is exactly _resolve_over(caption, tables).
+        # Only when every base pass misses do we consult island-aware object-token disambiguation.
         if scoped_tables is not None:
             hit = _resolve_over(caption, scoped_tables)
             if hit is not None:
                 return hit
-            return _resolve_over(caption, tables)
-        return _resolve_over(caption, tables)
+            hit = _resolve_over(caption, tables)
+            if hit is not None:
+                return hit
+            return _island_aware(caption, scoped_tables) or _island_aware(caption, tables)
+        hit = _resolve_over(caption, tables)
+        if hit is not None:
+            return hit
+        return _island_aware(caption, tables)
 
     return resolve_field
 

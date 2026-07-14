@@ -114,16 +114,16 @@ A non-`None` `dax` is a real translation; `None` means the formula is outside th
 emitted as an inert `= 0` stub. **Always** attach the original formula as a `TableauFormula` annotation.
 See `calc-to-dax.md`.
 
-**Then run the second compiler — immediately, automatically, always.** The deterministic pass above is
-Tier 0; the moment it leaves any calc as a stub (`needs_review_total > 0`), the **second compiler (Tier 1)
-runs as a mandatory, built-in stage of the same migration** — not an optional add-on and not an
-end-of-run offer. Announce a one-line gate (`▶ Starting second compiler — N of M translated; K need
-review …`) and proceed on your own: for each stubbed calc, read its categorized handoff request, author
-the leanest faithful candidate DAX, **validate** it (`check_candidate_dax` always; the reconciliation
-oracle when data is landed), and **land every validated candidate automatically via `approved_calc_dax`**.
-There is no human-approval prompt and no path where this pass is skipped — the validation gate, not a
-person, is the faithfulness guarantee, and a candidate that cannot be validated stays an inert stub. Full
-playbook: `second-compiler.md`.
+**Then offer the second compiler — an explicit, user-gated opt-in.** The deterministic pass above is
+Tier 0; the moment it leaves any calc as a stub (`needs_review_total > 0`), **present the stubbed calcs
+and ask the user whether to run the LLM-assisted second compiler (Tier 1)** — always offer it when a stub
+remains, but run it **only** on an explicit `GO`. If the user declines, the deterministic result ships
+as-is with every stub's `TableauFormula` preserved. Once the user says `GO`, run the pass in full: for
+each stubbed calc, read its categorized handoff request, author the leanest faithful candidate DAX,
+**validate** it (`check_candidate_dax` always; the reconciliation oracle when data is landed), and **land
+every validated candidate automatically via `approved_calc_dax`** (no per-calc approval). The validation
+gate, not a person, is the faithfulness guarantee — a candidate that cannot be validated stays an inert
+stub. Full playbook: `second-compiler.md`.
 
 ## Phase 5 — Connection → M partition + bind
 

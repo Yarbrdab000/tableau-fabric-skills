@@ -2456,6 +2456,68 @@ def test_cli_main_no_pbip_flag_suppresses_projects(fixtures_dir, tmp_path, capsy
     assert "Openable projects:" not in capsys.readouterr().out
 
 
+# -- stale-output build guard (refuse a FRESH build over a prior run's report.json) --------------
+# Companion to new_run.py: the minter keeps the INPUT side fresh; this guard keeps the OUTPUT side
+# fresh, so a second migration never silently mixes into a first migration's bundle. The documented
+# second-compiler landing re-run (--approved-dax / --author / --second-compile) and an explicit
+# --force are exempt.
+
+def test_cli_refuses_plain_rebuild_over_existing_report(fixtures_dir, tmp_path, capsys):
+    out = str(tmp_path / "b")
+    assert me.main(["-i", fixtures_dir, "-o", out]) == 0
+    original = open(os.path.join(out, "report.json"), "rb").read()
+    capsys.readouterr()  # drop the first build's output
+
+    rc = me.main(["-i", fixtures_dir, "-o", out])  # plain rebuild into the SAME dir
+    assert rc == 2
+    printed = capsys.readouterr().out
+    assert "[STOP]" in printed and "Refusing to build" in printed
+    # Guard returns BEFORE the build, so the prior report.json is left untouched.
+    assert open(os.path.join(out, "report.json"), "rb").read() == original
+
+
+def test_cli_force_allows_rebuild_over_existing_report(fixtures_dir, tmp_path):
+    out = str(tmp_path / "b")
+    assert me.main(["-i", fixtures_dir, "-o", out]) == 0
+    assert me.main(["-i", fixtures_dir, "-o", out, "--force"]) == 0
+    # --overwrite is an accepted alias for --force.
+    assert me.main(["-i", fixtures_dir, "-o", out, "--overwrite"]) == 0
+
+
+def test_cli_approved_dax_rerun_into_existing_bundle_bypasses_guard(fixtures_dir, tmp_path):
+    # The documented second-compiler loop: build, author approved DAX, re-run --approved-dax into
+    # the SAME bundle to land it. That intentional re-run must NOT trip the stale-output guard.
+    out = str(tmp_path / "b")
+    assert me.main(["-i", fixtures_dir, "-o", out]) == 0
+    approved_json = tmp_path / "approved.json"
+    approved_json.write_text(json.dumps({"Running Amount": _APPROVED_RUNNING_AMOUNT_DAX}),
+                             encoding="utf-8")
+    rc = me.main(["-i", fixtures_dir, "-o", out, "--approved-dax", str(approved_json)])
+    assert rc == 0
+    on_disk = json.load(open(os.path.join(out, "report.json"), encoding="utf-8"))
+    detail = next(d for d in on_disk["datasources"] if d["name"] == "widget_sales")
+    by_status = {m["measure"]: m["status"] for m in detail["measures"]}
+    assert by_status["Running Amount"] == "assisted-approved"
+
+
+def test_cli_second_compile_rerun_into_existing_bundle_bypasses_guard(fixtures_dir, tmp_path):
+    out = str(tmp_path / "b")
+    assert me.main(["-i", fixtures_dir, "-o", out]) == 0
+    assert me.main(["-i", fixtures_dir, "-o", out, "--second-compile"]) == 0
+
+
+def test_cli_scan_not_blocked_by_existing_report(fixtures_dir, tmp_path, capsys):
+    # --scan is read-only pre-build discovery; it legitimately writes scan.json into a folder that
+    # already holds a prior report.json and must never be caught by the build guard.
+    out = str(tmp_path / "b")
+    assert me.main(["-i", fixtures_dir, "-o", out]) == 0
+    capsys.readouterr()
+    rc = me.main(["-i", fixtures_dir, "-o", out, "--scan"])
+    assert rc == 0  # fixtures have no missing published datasource
+    assert "[STOP]" not in capsys.readouterr().out
+    assert os.path.isfile(os.path.join(out, "scan.json"))
+
+
 # -- measure_binding producer (model build's calc->measure facts -> viz consumer map) ----------
 # `_measure_binding_from_model` is a pure CONSUMER of the datasource-migration report: it shapes the
 # model build's calc->measure identity into the {"measures": {key: entry}} map twb_to_pbir reads.
@@ -2877,6 +2939,90 @@ def test_second_compile_prepass_fail_closed_on_unreadable_workbook():
     merged, sc = me._second_compile_prepass(_Boom(), "WB", approved, None)
     assert merged == approved                           # unchanged
     assert sc["count"] == 0 and "note" in sc
+
+
+# -- second-compiler GUARDS (caller-side wiring: model-aware reference gate + reconciliation oracle) --
+# _second_compile_guards builds a rejection-only guard bundle from a PRIOR build's on-disk TMDL/CSV and
+# the workbook resolver; _second_compile_prepass threads it into land_report. Guards NEVER author or
+# alter a candidate -- they only reject one that names a non-existent model reference (the (copy)_NNNN
+# trap) or numerically diverges from its Tableau formula. output_dir with no prior artifacts -> guards
+# None -> byte-identical to the unguarded pass.
+def test_second_compile_guards_none_without_prior_artifacts(tmp_path):
+    # No dir / missing dir / empty dir -> None (the byte-identical guarantee: nothing to guard against).
+    wb = _sc_wb(_SC_STUB_CHAIN)
+    assert me._second_compile_guards(wb, None) is None
+    assert me._second_compile_guards(wb, str(tmp_path / "does-not-exist")) is None
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert me._second_compile_guards(wb, str(empty)) is None
+
+
+def test_second_compile_guards_csv_seeds_reconciliation_oracle(tmp_path):
+    # A dir holding landed CSVs -> the oracle half is active (tables loaded, surface None). The oracle
+    # rejects a candidate whose value diverges from the Tableau formula and passes a faithful one.
+    import second_compiler as SC
+    csvdir = tmp_path / "csv"
+    csvdir.mkdir()
+    with open(csvdir / "Orders.csv", "w", encoding="utf-8") as fh:
+        fh.write("Sales,Profit\n100,10\n200,20\n300,30\n")
+    guards = me._second_compile_guards(_sc_wb(_SC_STUB_CHAIN), str(csvdir))
+    assert guards is not None
+    assert guards["surface"] is None                     # no TMDL -> reference gate inactive
+    assert sorted(guards["tables"]) == ["Orders"]
+    assert guards["tables"]["Orders"]["columns"] == ["Sales", "Profit"]
+    # oracle FIRES: a wrong candidate (Profit total != the Tableau Sales total) is rejected; the right one passes.
+    assert SC._gate_ok("SUM('Orders'[Profit])", True, guards=guards, tableau_formula="SUM([Sales])") is False
+    assert SC._gate_ok("SUM('Orders'[Sales])",  True, guards=guards, tableau_formula="SUM([Sales])") is True
+
+
+def test_second_compile_guards_tmdl_seeds_reference_gate(tmp_path):
+    # A dir holding a prior build's TMDL -> the reference-gate half is active (surface set, tables None).
+    # It blocks a candidate naming a table that isn't in the model and passes one that is.
+    import second_compiler as SC
+    tdir = tmp_path / "tmdl" / "M.SemanticModel" / "definition" / "tables"
+    tdir.mkdir(parents=True)
+    with open(tdir / "Orders.tmdl", "w", encoding="utf-8") as fh:
+        fh.write("table Orders\n\tcolumn Sales\n\t\tdataType: double\n\t\tsourceColumn: Sales\n")
+    guards = me._second_compile_guards(_sc_wb(_SC_STUB_CHAIN), str(tmp_path / "tmdl"))
+    assert guards is not None
+    assert guards["surface"] is not None                 # TMDL parsed -> reference gate active
+    assert guards["tables"] is None                      # no CSV -> oracle inactive
+    # reference gate FIRES: a nonexistent table is blocked; a real one passes.
+    assert SC._gate_ok("SUM('Nope'[Sales])",   True, guards=guards) is False
+    assert SC._gate_ok("SUM('Orders'[Sales])", True, guards=guards) is True
+
+
+def test_second_compile_prepass_reference_gate_rejects_copy_trap(tmp_path):
+    # Headline: on a --second-compile RE-RUN over an existing build, the reference gate catches the
+    # (copy)_NNNN duplicate-name trap. An authored keystone that names a non-existent table is REJECTED
+    # (in gate_failures, never in merged) -- yet the identical authored DAX lands when guards are off,
+    # proving the syntactic gate alone cannot catch it and that the guard is the only difference.
+    src = InMemoryTableauSource(workbooks={"Chain WB": _sc_wb(_SC_STUB_CHAIN)})
+    out = str(tmp_path / "run")
+    migrate_workbook(src, write_to=out, wb_id="Chain WB")   # a real prior build -> on-disk TMDL surface
+
+    bad = {"Base": "SUM('Orders Copy'[Sales])"}             # 'Orders Copy' is not a model table
+    merged_g, sc_g = me._second_compile_prepass(src, "Chain WB", {}, bad, output_dir=out)
+    assert "Base" not in (merged_g or {})                  # the copy-trap keystone did NOT land
+    assert "Base" in sc_g["gate_failures"]                 # it is recorded as a gate failure
+
+    merged_u, _ = me._second_compile_prepass(src, "Chain WB", {}, bad, output_dir=None)
+    assert merged_u["Base"] == "SUM('Orders Copy'[Sales])"  # unguarded: the same bad DAX ships (the bug the gate prevents)
+
+
+def test_second_compile_prepass_empty_output_dir_is_byte_identical(tmp_path):
+    # Fresh-run guarantee: a guarded pass whose output_dir holds no prior artifacts (guards -> None)
+    # produces the SAME merged map as the fully unguarded pass -- a good-ref keystone cascades identically.
+    src = InMemoryTableauSource(workbooks={"Chain WB": _sc_wb(_SC_STUB_CHAIN)})
+    good = {"Base": "SUM('Orders'[Sales])"}
+    empty = tmp_path / "fresh"
+    empty.mkdir()
+    merged_empty, sc_empty = me._second_compile_prepass(src, "Chain WB", {}, good, output_dir=str(empty))
+    merged_none, sc_none = me._second_compile_prepass(src, "Chain WB", {}, good, output_dir=None)
+    assert merged_empty == merged_none                     # byte-identical merged map
+    assert merged_empty["Base"] == "SUM('Orders'[Sales])"
+    assert set(sc_empty["landed"]) == {"Base", "Plus", "Ratio"} == set(sc_none["landed"])
+    assert sc_empty["count"] == sc_none["count"] == 3       # full cascade both ways
 
 
 def test_main_author_flag_lands_chain_via_cli(tmp_path):
