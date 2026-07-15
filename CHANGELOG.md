@@ -13,6 +13,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.47.0` → `1.48.0`): Translate `MAX([bool])` / `MIN([bool])` in measure mode so
+  a boolean-aggregating root calc stops shipping as a bare-row-level stub — cascade-unblocking its whole
+  dependent tower. Additive and fail-closed — byte-identical unless a measure aggregates a boolean column.**
+  Tableau `MAX(bool)` is OR-aggregation (TRUE iff any row is TRUE) and `MIN(bool)` is AND (TRUE iff all rows
+  are TRUE), but DAX `MIN`/`MAX` reject a boolean column outright (that is `MINA`/`MAXA`), so the single-field
+  `AGG([field])` fast-path in `calc_to_dax.py` previously stubbed the whole calc — and every dependent that
+  referenced it collapsed with `bare row-level field [..] not valid in a measure`. The fast-path now folds
+  each row to `1`/`0` and iterates, emitting `(MAXX/MINX('T', IF('T'[col], 1, 0)) = 1)` with return type
+  `bool` so it can feed an `IF` condition — e.g. the flagship root shape `ZN(IF MAX([bool]) THEN [agg] END)`
+  → `COALESCE(IF((MAXX(…) = 1), <agg>), 0)`. The explicit `IF(…, 1, 0)` (never a blank-else) is required for
+  `MIN`'s AND-semantics. Live-proven on the real `Salesforce_Nonprofit_Case_Management` workbook: the root
+  `Previous Year Active Clients` flipped from a stub to a translated `MAXX` measure, and **all 24 "Previous
+  Year" / "Active Client" measures now translate (0 stub)** — the root plus its full dependent tower cascade
+  via the existing `measure_refs` fix-point in `_measures_part`, dropping the datasource's bare-row-level stub
+  count by 11 with zero regressions across the other datasources. **Fail-closed:** the `dtype not in
+  ("number", "text", "date")` reject still fires for a genuinely-unmapped aggregate type, so a mis-typed
+  aggregate can only leave a dependent stubbed, never emit wrong DAX; the original Tableau formula is always
+  preserved as a `TableauFormula` annotation.
 - **tableau-migration (skill `1.46.0` → `1.47.0`): Lay a zero-physical-table, row-invariant foundation calc
   as a real column so its dimension-role dependents stop shipping as bare-row-level measure stubs. Additive
   and fail-closed — byte-identical unless a genuinely row-invariant foundation calc is present.** A Tableau

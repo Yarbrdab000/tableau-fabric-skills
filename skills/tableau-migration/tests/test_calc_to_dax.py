@@ -1160,10 +1160,34 @@ def test_min_max_over_text_field_measure():
     assert _tx("MAX([Region])") == "MAX('Orders'[Region])"
 
 
-def test_min_max_over_boolean_field_still_stubs():
-    # DAX MIN/MAX do NOT support TRUE/FALSE (MINA/MAXA would) -> stay fail-closed on a boolean field.
-    assert translate_tableau_calc_to_dax("MIN([Returned])", _resolver)[0] is None
-    assert translate_tableau_calc_to_dax("MAX([Returned])", _resolver)[0] is None
+def test_max_over_boolean_field_is_or_aggregation():
+    # Tableau MAX over a boolean field = OR-aggregation (FALSE < TRUE -> TRUE iff ANY row is TRUE).
+    # DAX MIN/MAX reject a boolean column (that is MINA/MAXA), so fold each row to 1/0 and iterate
+    # with MAXX, comparing the aggregate back to 1 -> a faithful, boolean-typed result.
+    assert _tx("MAX([Returned])") == "(MAXX('Orders', IF('Orders'[Returned], 1, 0)) = 1)"
+
+
+def test_min_over_boolean_field_is_and_aggregation():
+    # Tableau MIN over a boolean field = AND-aggregation (TRUE iff ALL rows are TRUE) -> MINX form.
+    assert _tx("MIN([Returned])") == "(MINX('Orders', IF('Orders'[Returned], 1, 0)) = 1)"
+
+
+def test_zn_if_max_boolean_then_agg_measure_cascade_shape():
+    # The flagship Service-Delivery root shape: ZN(IF MAX([bool]) THEN [agg] END). The boolean MAX
+    # now yields a faithful OR condition the IF consumes, so the whole measure translates instead of
+    # stubbing -- this is the root that cascade-unblocks its dependents in a full run.
+    assert _tx("ZN(IF MAX([Returned]) THEN SUM([Sales]) END)") == (
+        "COALESCE(IF((MAXX('Orders', IF('Orders'[Returned], 1, 0)) = 1), "
+        "SUM('Orders'[Sales])), 0)")
+
+
+def test_min_max_over_unmapped_agg_type_still_stubs():
+    # Fail-closed boundary preserved: only boolean now joins number/text/date. A genuinely unmapped
+    # field type (no DAX ordering) still stubs, so opening the boolean gate did not widen it further.
+    def _bad(caption):
+        return ("Orders", "Weird", "variant") if caption == "Weird" else _FIELDS.get(caption)
+    assert translate_tableau_calc_to_dax("MAX([Weird])", _bad)[0] is None
+    assert translate_tableau_calc_to_dax("MIN([Weird])", _bad)[0] is None
 
 
 def test_min_text_plus_literal_measure_concat():
