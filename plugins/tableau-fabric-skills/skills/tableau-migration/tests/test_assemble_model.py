@@ -333,6 +333,74 @@ def test_sibling_anchor_fails_closed_when_two_pinned_tables_carry_the_caption():
     assert wrapped("Created Date") is None        # still unresolved (no false anchor)
 
 
+# --- Cross-table row-level reroute needs `relationships` for the LOOKUPVALUE flip ---------------
+#
+# The real-workbook shape is NOT the sibling-anchor same-table collapse above. On the live consolidated
+# model `[Created Date]` resolves DIRECTLY to Case (Case is the anchor table carrying a real
+# `CreatedDate`), so `DATEDIFF('month', [Close Date], [Created Date])` is genuinely CROSS-TABLE
+# ({Case, caseman__Intake__c}). Its faithful column form pulls the foreign `[Close Date]` into the Case
+# home row via `LOOKUPVALUE(...)` -- which the column translator can only emit when it is given the
+# model `relationships`. So the reroute's column probe MUST be handed `relationships`; without them the
+# probe stubs `cross-table` and the calc wrongly stays a measure `= 0` stub. These tests lock that
+# threading (the historical bug: the reroute called the column probe with NO `relationships=`).
+
+_XT_REL_CASE_INTAKE = {  # Case (child/FK) -> caseman__Intake__c (parent/PK) -- the real Target-1 edge
+    "from_table": "Case", "from_col": "caseman__Intake__c",
+    "to_table": "caseman__Intake__c", "to_col": "Id", "cardinality": "many_to_one",
+}
+
+
+def _xt_datediff_measures():
+    return [{"name": "Days to Close",
+             "formula": "ZN(DATEDIFF('month', [Close Date], [Created Date]))"}]
+
+
+def _xt_resolver():
+    # Both captions resolve at top level, to DIFFERENT tables (no anchoring) -> a real cross-table calc.
+    return _phys_resolver({
+        "Close Date": ("caseman__Intake__c", "caseman__CloseDate__c", "dateTime"),
+        "Created Date": ("Case", "CreatedDate", "dateTime"),
+    })
+
+
+def test_reroute_cross_table_datediff_stays_measure_without_relationships():
+    # WITHOUT relationships the column probe cannot anchor the foreign `[Close Date]` -> it stubs
+    # `cross-table` -> the calc stays on the measure path (fail-closed / byte-identical to before).
+    measures = _xt_datediff_measures()
+    keep, new_dims, moved = _reroute_row_level_measure_calcs(
+        measures, [], _xt_resolver(), known_tables={"Case", "caseman__Intake__c"})
+    assert moved == []
+    assert keep is measures            # nothing moved -> inputs returned unchanged (identity fast path)
+    assert new_dims == []
+
+
+def test_reroute_cross_table_datediff_moves_to_column_with_relationships():
+    # WITH relationships the column probe emits the LOOKUPVALUE flip -> `cdax` is not None -> the calc
+    # reroutes off the measure path onto a faithful calculated COLUMN. This is the whole fix: the
+    # reroute threads `relationships` into its column probe.
+    measures = _xt_datediff_measures()
+    keep, new_dims, moved = _reroute_row_level_measure_calcs(
+        measures, [], _xt_resolver(), known_tables={"Case", "caseman__Intake__c"},
+        relationships=[_XT_REL_CASE_INTAKE])
+    assert moved == ["Days to Close"]
+    assert not keep
+    assert {c["name"] for c in new_dims} == {"Days to Close"}
+
+
+def test_reroute_cross_table_datediff_unrelated_relationships_stays_measure():
+    # Relationships are supplied but none bridge Case<->Intake -> no home -> the column probe still
+    # stubs -> the calc stays a measure (never a guess when the tables are disconnected).
+    unrelated = {"from_table": "People", "from_col": "RegionId",
+                 "to_table": "Region", "to_col": "Id", "cardinality": "many_to_one"}
+    measures = _xt_datediff_measures()
+    keep, new_dims, moved = _reroute_row_level_measure_calcs(
+        measures, [], _xt_resolver(), known_tables={"Case", "caseman__Intake__c"},
+        relationships=[unrelated])
+    assert moved == []
+    assert {c["name"] for c in keep} == {"Days to Close"}
+    assert new_dims == []
+
+
 def test_sibling_anchored_resolver_identity_when_nothing_anchors():
     # Unit-level fail-closed guarantees on the wrapper itself: it returns the SAME object (never a
     # wrapper) when it cannot help -- no `resolve_in_tables`, fewer than 2 field tokens, or no

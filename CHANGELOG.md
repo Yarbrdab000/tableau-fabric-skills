@@ -13,6 +13,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.45.0` → `1.46.0`): Thread relationships into the row-level measure reroute so
+  the cross-table `DATEDIFF` → `LOOKUPVALUE` flip actually lands. Additive and fail-closed — byte-identical
+  unless relationships strictly help.** The column translator already knew how to rewrite a measure-role
+  row-level calc that spans two related tables (e.g. `ZN(DATEDIFF('month', [Close Date], [Created Date]))`
+  where `[Close Date]` lives on a parent record and `[Created Date]` on the child) into a faithful
+  calculated *column* that reaches across the foreign key with `LOOKUPVALUE`. But the orchestrator's
+  row-level reroute (`_reroute_row_level_measure_calcs` in `assemble_model.py`) invoked that column probe
+  **without** passing the model's `relationships`, so the cross-table branch could never find the related
+  home table — the probe stubbed `'cross-table'`, the calc was never moved off the measure path, and it
+  shipped as an inert `measure … = 0`. The reroute now threads `relationships` through to the column probe
+  (signature kwarg + call-site `relationships=all_rels`), so a row-level measure calc whose fields span a
+  *single, unambiguous* foreign-key relationship flips from a `= 0` measure stub to a translated calc-column
+  that emits the `LOOKUPVALUE` reach. Live-proven on the real `Salesforce_Nonprofit_Case_Management`
+  workbook: **`Days to Close` and `Days Assessment since Start Date` both flipped stub → deterministic
+  calc-column** (`Case.tmdl` and `caseman__Assessment__c.tmdl` now carry the `LOOKUPVALUE` DAX), with no
+  double-emit and no regression to the rest of the estate. **Faithful-or-stub held:** when `relationships`
+  is omitted, unavailable, or the field-set does not resolve to exactly one relationship home, the reroute
+  is byte-identical to before and the calc stays an honest `= 0` stub with its original `TableauFormula`
+  preserved — the more general win is that threading relationships through the reroute unblocks the whole
+  measure-role cross-table row-level family, not `DATEDIFF` alone.
 - **tableau-migration (skill `1.44.0` → `1.45.0`): Two faithfulness-preserving fixes for the dominant
   "bare row-level field not valid in a measure" stub family — a conformed-hub transit exclusion and a
   sibling-anchored field resolver. Additive and fail-closed throughout.** Both target the same recurring

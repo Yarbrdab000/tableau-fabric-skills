@@ -1767,7 +1767,8 @@ def _build_column_refs(calcs, rc, known_tables, *, consumed_lower=None):
 
 def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
                        date_table=None, active_date_cols=None, consumed=None,
-                       approved_calc_dax=None, known_tables=None, resolve_for=None):
+                       approved_calc_dax=None, known_tables=None, resolve_for=None,
+                       relationships=None):
     """Translate row-level (dimension) ``dim_calcs`` via column mode and group the rendered
     calculated-column TMDL by target table, plus a per-column report.
 
@@ -1796,6 +1797,10 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
     calculated dimension, e.g. ``{FIXED [Order Date (Months)] : SUM([Sales])}`` -- binds to that real
     column instead of stubbing. A calc column is a genuine row-level model column, so this only ADDS a
     resolution path base ``resolve`` lacked; a bare row-level reference in a measure still stubs.
+
+    ``relationships`` (the model's raw relationship list) is forwarded to the column translator so a
+    cross-table row-level calc can materialize on one home table via LOOKUPVALUE (see
+    ``translate_tableau_calc_to_column_dax``). Default None -> the prior cross-table stub.
 
     SIBLING CALC CASCADE: a dimension calc that references ANOTHER dimension calc column (a chain
     such as ``[Grouped Category] = SWITCH(TRUE(), [Cleaned Category] = ...)`` where
@@ -1899,7 +1904,7 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
             })
             continue
         dax, reason, tables_used = translate_tableau_calc_to_column_dax(
-            formula, _arc(calc), column_refs=column_refs)
+            formula, _arc(calc), column_refs=column_refs, relationships=relationships)
         if dax and len(tables_used) == 1:
             target = next(iter(tables_used))
         elif len(tables_used) == 1:          # untranslatable but single known home
@@ -2418,7 +2423,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         calcs, dim_calcs, resolve, known_tables=set(table_names),
         param_resolver=param_resolver,
         skip_names=(set(consumed) | flag_source_names | _measure_landed),
-        resolve_for=_raw_scoped_resolver)
+        resolve_for=_raw_scoped_resolver, relationships=all_rels)
 
     # Row-level (dimension) calcs become DAX calculated columns via column mode, injected onto
     # their resolved home table (constants / honest stubs default to the first data table). This
@@ -2430,7 +2435,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         dim_calcs, resolve, anchor_table=table_names[0],
         date_table=date_name, active_date_cols=active_date_cols,
         approved_calc_dax=approved_calc_dax, known_tables=set(table_names),
-        resolve_for=_raw_scoped_resolver,
+        resolve_for=_raw_scoped_resolver, relationships=all_rels,
         consumed=(set(consumed) | flag_source_names) if flag_source_names else consumed)
     for disp, block in calc_columns_by_table.items():
         path = f"definition/tables/{disp}.tmdl"
@@ -3329,7 +3334,8 @@ _ROW_LEVEL_IN_MEASURE_REASON = "bare row-level field [..] not valid in a measure
 
 
 def _reroute_row_level_measure_calcs(measure_calcs, dim_calcs, resolve, *, known_tables,
-                                     param_resolver=None, skip_names=None, resolve_for=None):
+                                     param_resolver=None, skip_names=None, resolve_for=None,
+                                     relationships=None):
     """Move measure-path calcs that are actually ROW-LEVEL onto the calculated-column path.
 
     Tableau assigns a calc's role by its OUTPUT type, so a purely row-level numeric calc -- e.g.
@@ -3363,7 +3369,13 @@ def _reroute_row_level_measure_calcs(measure_calcs, dim_calcs, resolve, *, known
     sources, or given a designated measure landing by the ``approved_calc_dax`` (human-approved /
     second-compiler) tier. ``resolve_for`` (optional ``calc -> resolver | None``) supplies a
     per-calc island-scoped resolver for a multi-datasource workbook; when ``None`` every calc uses the
-    single global ``resolve`` (byte-identical to the pre-cascade behaviour).
+    single global ``resolve`` (byte-identical to the pre-cascade behaviour). ``relationships`` (the
+    model's inferred join graph) is threaded into the column probe so a genuinely CROSS-TABLE row-level
+    calc -- e.g. ``DATEDIFF('month', [Close Date], [Created Date])`` where the two dates live on two
+    related tables -- reroutes to a faithful calculated column via the ``LOOKUPVALUE`` flip (the column
+    translator pulls the foreign field into the home row along the relationship). With ``relationships``
+    omitted the column probe stubs such a calc ``cross-table`` and it stays a measure (fail-closed /
+    byte-identical to the pre-relationship behaviour).
     """
     skip_lower = {(s or "").strip().lower() for s in (skip_names or set())}
     kt = set(known_tables or ())
@@ -3407,7 +3419,8 @@ def _reroute_row_level_measure_calcs(measure_calcs, dim_calcs, resolve, *, known
                 formula, rr, param_resolver=param_resolver, known_tables=kt)
             if mdax is None and mreason == _ROW_LEVEL_IN_MEASURE_REASON:
                 cdax, _creason, _ctables = translate_tableau_calc_to_column_dax(
-                    formula, rr, known_tables=kt, column_refs=col_refs)
+                    formula, rr, known_tables=kt, column_refs=col_refs,
+                    relationships=relationships)
                 if cdax is not None:
                     cur_dims.append(c)
                     moved_names.append(name)
