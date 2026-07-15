@@ -13,6 +13,33 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.44.0` → `1.45.0`): Two faithfulness-preserving fixes for the dominant
+  "bare row-level field not valid in a measure" stub family — a conformed-hub transit exclusion and a
+  sibling-anchored field resolver. Additive and fail-closed throughout.** Both target the same recurring
+  failure — a real row-level calc that stubbed because a distinct-count path went ambiguous or a field
+  token stayed unresolved — and both are byte-identical no-ops unless they strictly help. **(1) Conformed-hub
+  transit-node exclusion (`conformed_hubs`)** — the migrator's auto-generated `Date` calendar dimension is a
+  *degenerate transit hub*: every fact table joins its date column into the shared `Date[Date]`, so any two
+  facts appear "connected" through same-calendar-date co-occurrence rather than a genuine entity foreign-key
+  path. In `_unique_countd_path` that manufactured ≥2 simple paths → ambiguous → `None` → stub, killing the
+  cross-table `COUNTD(IF …)` cascade behind current-year-vs-previous-year distinct-client counts. The path
+  finder now excludes a conformed hub as an *intermediate* transit hop only (never as the start `C` or the
+  matched destination `F`), threaded from `assemble_model` as `conformed_hubs = {date_name}`; a genuine entity
+  FK path is therefore never removed, and an empty/`None` set restores prior behaviour exactly. **(2)
+  Sibling-anchored field resolver** — a row-level calc that combines a *unique* business field with an
+  *ambiguous* system field on the same record (e.g. `DATEDIFF('day', [Close Date], [Created Date])` where
+  `[Close Date]` pins exactly one table but `[Created Date]`/`CreatedDate` exists on many) previously stubbed
+  wholesale. The resolver now collects the tables its *resolved* tokens pin and, for each *unresolved* token,
+  re-resolves it restricted to exactly those pinned tables via a new fail-closed `resolve_in_tables` primitive
+  (0 or >1 hits → still `None`); it returns the resolver unchanged whenever nothing anchors, tries the plain
+  resolve first so a real hit is never overridden, and forwards `resolve_in_tables` so it composes. Live-proven
+  on a real Salesforce workbook (`Salesforce_Nonprofit_Case_Management`): **14 measures flipped stub →
+  deterministic (73 → 59 stubs) with zero regressions** — the entire CY−PY difference/ratio and ●/▲/▼ KPI-glyph
+  cascade, the Goal-variant family, and a bonus Waitlisted-Engagements `COUNTD(IF …)`. The **faithful-or-stub**
+  charter held under test: a `MAX`-of-boolean shape with no faithful DAX form correctly stayed an inert `= 0`
+  stub, and so did its dependent subtree — the validation gate, not a guess, is what draws the line. Additive —
+  no report key was renamed or removed, every original Tableau formula is still preserved, and deterministically
+  translated measures stamp `TranslatedBy = deterministic`.
 - **tableau-migration (skill `1.43.0` → `1.44.0`): Island-aware caption resolution unblocks cross-table
   `COUNTD(IF …)` on denormalized object models, plus N-hop cross-table reach and the second-compiler
   validation gates — all additive and faithfulness-preserving.** **(1) Island-aware field resolver** — a

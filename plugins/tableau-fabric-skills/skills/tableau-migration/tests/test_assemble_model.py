@@ -24,6 +24,8 @@ from assemble_model import (
     _build_column_refs,
     _calc_field_tokens,
     _best_scoped_resolver,
+    _sibling_anchored_resolver,
+    _anchoring_rc,
     _ROW_LEVEL_IN_MEASURE_REASON,
 )
 from calc_to_dax import translate_tableau_calc_to_dax
@@ -238,6 +240,154 @@ def test_reroute_never_moves_a_genuine_aggregate_measure():
     assert {c["name"] for c in keep} == {"Total Qty"}
 
 
+# --- Sibling-anchored ambiguity resolution (the corpus `Days to Close` lever) -------------------
+#
+# A row-level calc frequently combines a UNIQUE business field with an AMBIGUOUS system field read
+# from the SAME record -- e.g. `DATEDIFF('day', [Close Date], [Created Date])` where `[Close Date]`
+# resolves to exactly one table (Intake) but `[Created Date]` is a system column present on many
+# tables, so it resolves to None and the whole calc stubs. Because both operands are one record, the
+# ambiguous field must live on a table a resolved sibling already pins. `resolve_in_tables` restricts
+# a caption to a pinned table-set (fail-closed: 0 or >1 hits -> None). These tests exercise the REAL
+# translators end to end so the assertions reflect genuine engine behaviour, not a synthetic double.
+
+_ANCHOR_INTAKE = "caseman__Intake__c"
+
+
+def _anchoring_resolver(unique_cols, ambiguous_col, ambiguous_tables):
+    """A physical resolver whose ambiguous system caption fails closed at top level but binds via a
+    `resolve_in_tables(caption, table_set)` primitive iff EXACTLY ONE pinned table carries it.
+
+    ``unique_cols``    -- {caption: (table, column, type)} that resolve uniquely at top level.
+    ``ambiguous_col``  -- (caption, column, type) the base resolver returns None for.
+    ``ambiguous_tables`` -- the set of tables that physically carry ``ambiguous_col`` (>1 -> ambiguous).
+    """
+    idx = {k.strip().lower(): v for k, v in unique_cols.items()}
+    amb_cap, amb_col, amb_type = ambiguous_col
+    amb_key = amb_cap.strip().lower()
+
+    def r(name):
+        return idx.get((name or "").strip().lower())
+
+    def resolve_in_tables(name, table_set):
+        if (name or "").strip().lower() == amb_key:
+            hits = [t for t in table_set if t in ambiguous_tables]
+            if len(hits) == 1:
+                return (hits[0], amb_col, amb_type)
+        return None
+
+    r.resolve_in_tables = resolve_in_tables
+    return r
+
+
+def test_sibling_anchor_reroutes_ambiguous_datediff_to_a_column():
+    # THE CORPUS `Days to Close` CASE, through the real reroute. `[Close Date]` uniquely pins Intake;
+    # `[Created Date]` is a system field on many tables (base resolver -> None). The sibling anchor
+    # binds `[Created Date]` to Intake (the sole pinned table carrying it), so the row-level DATEDIFF
+    # reroutes to a faithful calculated COLUMN instead of staying a measure stub.
+    resolve = _anchoring_resolver(
+        {"Close Date": (_ANCHOR_INTAKE, "CloseDate", "dateTime")},
+        ("Created Date", "CreatedDate", "dateTime"),
+        {_ANCHOR_INTAKE, "Case", "Contact"},
+    )
+    measures = [{"name": "Days to Close",
+                 "formula": "DATEDIFF('day', [Close Date], [Created Date])"}]
+    keep, new_dims, moved = _reroute_row_level_measure_calcs(
+        measures, [], resolve, known_tables={_ANCHOR_INTAKE, "Case", "Contact"})
+    assert moved == ["Days to Close"]
+    assert not keep
+    assert {c["name"] for c in new_dims} == {"Days to Close"}
+
+
+def test_sibling_anchor_is_load_bearing_stub_without_resolve_in_tables():
+    # Prove the anchor is what flips it: the SAME resolver WITHOUT the `resolve_in_tables` primitive
+    # leaves `[Created Date]` unresolved, the column probe fails, and the calc stays a measure stub
+    # (identity-preserving fast path -- byte-identical to the pre-anchor behaviour).
+    resolve = _anchoring_resolver(
+        {"Close Date": (_ANCHOR_INTAKE, "CloseDate", "dateTime")},
+        ("Created Date", "CreatedDate", "dateTime"),
+        {_ANCHOR_INTAKE, "Case", "Contact"},
+    )
+    delattr(resolve, "resolve_in_tables")   # strip the primitive -> no anchoring possible
+    measures = [{"name": "Days to Close",
+                 "formula": "DATEDIFF('day', [Close Date], [Created Date])"}]
+    keep, new_dims, moved = _reroute_row_level_measure_calcs(
+        measures, [], resolve, known_tables={_ANCHOR_INTAKE, "Case", "Contact"})
+    assert moved == []
+    assert keep is measures        # nothing moved -> inputs returned unchanged
+    assert new_dims == []
+
+
+def test_sibling_anchor_fails_closed_when_two_pinned_tables_carry_the_caption():
+    # Fail-closed at the resolver: when TWO unique siblings pin two different tables that BOTH carry
+    # the ambiguous system column, `resolve_in_tables` sees >1 hit and returns None -> no anchor, so
+    # the wrapper is a pass-through that still cannot resolve the ambiguous caption.
+    resolve = _anchoring_resolver(
+        {"Close Date": (_ANCHOR_INTAKE, "CloseDate", "dateTime"),
+         "Amount": ("Case", "Amount", "double")},
+        ("Created Date", "CreatedDate", "dateTime"),
+        {_ANCHOR_INTAKE, "Case", "Contact"},   # both pinned tables (Intake, Case) carry it
+    )
+    wrapped = _sibling_anchored_resolver(
+        "IF [Amount] > 0 THEN DATEDIFF('day', [Close Date], [Created Date]) END", resolve)
+    assert wrapped is resolve                     # two pins -> ambiguous -> nothing anchored -> identity
+    assert wrapped("Created Date") is None        # still unresolved (no false anchor)
+
+
+def test_sibling_anchored_resolver_identity_when_nothing_anchors():
+    # Unit-level fail-closed guarantees on the wrapper itself: it returns the SAME object (never a
+    # wrapper) when it cannot help -- no `resolve_in_tables`, fewer than 2 field tokens, or no
+    # unresolved token to anchor.
+    base = _anchoring_resolver(
+        {"Close Date": (_ANCHOR_INTAKE, "CloseDate", "dateTime")},
+        ("Created Date", "CreatedDate", "dateTime"),
+        {_ANCHOR_INTAKE},
+    )
+    # No resolve_in_tables attr -> identity.
+    plain = _phys_resolver({"A": ("F", "A", "int64")})
+    assert _sibling_anchored_resolver("DATEDIFF('day',[A],[B])", plain) is plain
+    # Fewer than 2 field tokens -> identity.
+    assert _sibling_anchored_resolver("MAX([Close Date])", base) is base
+    # Every token already resolves (no unresolved token) -> identity.
+    both = _anchoring_resolver(
+        {"Close Date": (_ANCHOR_INTAKE, "CloseDate", "dateTime"),
+         "Created Date": (_ANCHOR_INTAKE, "CreatedDate", "dateTime")},
+        ("Nonexistent", "X", "int64"), {_ANCHOR_INTAKE},
+    )
+    assert _sibling_anchored_resolver(
+        "DATEDIFF('day',[Close Date],[Created Date])", both) is both
+
+
+def test_sibling_anchored_resolver_never_overrides_a_base_hit_and_forwards_primitive():
+    # The wrapper tries the base resolver FIRST (never overrides a real hit) and FORWARDS
+    # `resolve_in_tables` so it composes with a later wrap.
+    resolve = _anchoring_resolver(
+        {"Close Date": (_ANCHOR_INTAKE, "CloseDate", "dateTime")},
+        ("Created Date", "CreatedDate", "dateTime"),
+        {_ANCHOR_INTAKE, "Case"},
+    )
+    wrapped = _sibling_anchored_resolver(
+        "DATEDIFF('day',[Close Date],[Created Date])", resolve)
+    assert wrapped is not resolve                                   # something anchored -> a wrapper
+    assert wrapped("Close Date") == (_ANCHOR_INTAKE, "CloseDate", "dateTime")   # base hit preserved
+    assert wrapped("Created Date") == (_ANCHOR_INTAKE, "CreatedDate", "dateTime")  # anchored
+    assert getattr(wrapped, "resolve_in_tables", None) is resolve.resolve_in_tables
+
+
+def test_anchoring_rc_lifts_a_per_calc_selector():
+    # `_anchoring_rc(rc)` turns a `rc(calc) -> resolver` selector into one that also sibling-anchors,
+    # using the calc's OWN formula to find the sibling pins.
+    resolve = _anchoring_resolver(
+        {"Close Date": (_ANCHOR_INTAKE, "CloseDate", "dateTime")},
+        ("Created Date", "CreatedDate", "dateTime"),
+        {_ANCHOR_INTAKE, "Case"},
+    )
+    arc = _anchoring_rc(lambda _calc: resolve)
+    r = arc({"formula": "DATEDIFF('day',[Close Date],[Created Date])"})
+    assert r("Created Date") == (_ANCHOR_INTAKE, "CreatedDate", "dateTime")
+    # A calc whose formula gives no sibling pin -> the same base resolver (byte-identical).
+    assert arc({"formula": "MAX([Close Date])"}) is resolve
+
+
 def test_reroute_row_level_measure_cascade_end_to_end():
     # End-to-end through migrate_tds_to_semantic_model: a dimension calc L1 + two measure-role but
     # genuinely ROW-LEVEL calcs (L2 references L1; L3 differences two L2-siblings) all land as
@@ -376,6 +526,69 @@ def test_measures_part_mistag_stubs_without_the_fix_when_only_pooled_resolver():
     _, report, _ = _measures_part(calcs, base, resolve_for=None, known_tables={"Contact"})
     rows = {r["measure"]: r for r in report}
     assert rows["Total Amount"]["status"] != "translated"
+
+
+def test_measures_part_conformed_hub_flips_countd_if_and_cascades_cy_py():
+    # Wiring + cascade proof at the _measures_part boundary. A cross-table COUNTD-IF (Current Year
+    # Clients) is falsely ambiguous ONLY because the generated Date calendar is a shared transit hub
+    # (SD -> Date -> PE -> Contact spurious paths alongside the real SD -> PE -> Contact). Passing
+    # conformed_hubs={"Date"} excludes Date as a transit node -> the root flips to translated -> and
+    # the CY-PY difference dependent that referenced it cascades to translated via measure_refs.
+    from assemble_model import _measures_part
+    from calc_to_dax import build_table_adjacency
+    resolve = _fake_resolver({
+        "Active Flag": ("SD", "Stage", "string"),
+        "Id (Contact)": ("Contact", "Id", "string"),
+    })
+    adj = build_table_adjacency([
+        {"from_table": "SD", "from_col": "PE_Id", "to_table": "PE", "to_col": "Id"},
+        {"from_table": "PE", "from_col": "Contact_Id", "to_table": "Contact", "to_col": "Id"},
+        {"from_table": "SD", "from_col": "DeliveryDate", "to_table": "Date", "to_col": "Date"},
+        {"from_table": "PE", "from_col": "EndDate", "to_table": "Date", "to_col": "Date"},
+        {"from_table": "PE", "from_col": "StartDate", "to_table": "Date", "to_col": "Date"},
+    ])
+    calcs = [
+        {"name": "Current Year Clients",
+         "formula": 'COUNTD(IF [Active Flag] = "Active" THEN [Id (Contact)] END)'},
+        {"name": "Client Growth", "formula": "[Current Year Clients] + 100"},  # CY-PY-shaped dependent
+    ]
+    _, report, _ = _measures_part(
+        calcs, resolve, known_tables={"Contact"}, related_tables=adj, conformed_hubs={"Date"})
+    rows = {r["measure"]: r for r in report}
+    assert rows["Current Year Clients"]["status"] == "translated"
+    assert "DISTINCTCOUNTNOBLANK('Contact'[Id])" in rows["Current Year Clients"]["dax"]
+    # the dependent cascades because its only blocker (the untranslatable root) now resolves
+    assert rows["Client Growth"]["status"] == "translated"
+    assert "[Current Year Clients]" in rows["Client Growth"]["dax"]
+
+
+def test_measures_part_without_conformed_hub_both_countd_if_and_dependent_stub():
+    # Control / fail-closed + byte-identical default: the SAME calcs + SAME Date-hub adjacency but NO
+    # conformed_hubs leaves the root falsely ambiguous -> stub, and the dependent stubs with it. This
+    # is exactly today's pre-fix behaviour, proving the hub exclusion (not something else) is the flip.
+    from assemble_model import _measures_part
+    from calc_to_dax import build_table_adjacency
+    resolve = _fake_resolver({
+        "Active Flag": ("SD", "Stage", "string"),
+        "Id (Contact)": ("Contact", "Id", "string"),
+    })
+    adj = build_table_adjacency([
+        {"from_table": "SD", "from_col": "PE_Id", "to_table": "PE", "to_col": "Id"},
+        {"from_table": "PE", "from_col": "Contact_Id", "to_table": "Contact", "to_col": "Id"},
+        {"from_table": "SD", "from_col": "DeliveryDate", "to_table": "Date", "to_col": "Date"},
+        {"from_table": "PE", "from_col": "EndDate", "to_table": "Date", "to_col": "Date"},
+        {"from_table": "PE", "from_col": "StartDate", "to_table": "Date", "to_col": "Date"},
+    ])
+    calcs = [
+        {"name": "Current Year Clients",
+         "formula": 'COUNTD(IF [Active Flag] = "Active" THEN [Id (Contact)] END)'},
+        {"name": "Client Growth", "formula": "[Current Year Clients] + 100"},
+    ]
+    _, report, _ = _measures_part(
+        calcs, resolve, known_tables={"Contact"}, related_tables=adj)  # conformed_hubs omitted
+    rows = {r["measure"]: r for r in report}
+    assert rows["Current Year Clients"]["status"] != "translated"
+    assert rows["Client Growth"]["status"] != "translated"
 
 
 def test_measure_report_carries_source_identity_for_viz_binding():

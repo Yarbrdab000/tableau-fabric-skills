@@ -629,11 +629,95 @@ def _best_scoped_resolver(formula, tagged_ds, resolve_for, island_dss, base_reso
     return tagged  # 0 or >1 improving islands -> keep the tag (fail-closed)
 
 
+def _sibling_anchored_resolver(formula, r):
+    """Wrap a field resolver so an AMBIGUOUS caption anchors to a table pinned by a UNIQUE sibling.
+
+    A real-world row-level calc frequently combines a UNIQUE business field with an AMBIGUOUS system
+    field on the SAME record -- e.g. ``DATEDIFF('day', [Close Date], [Created Date])`` where
+    ``[Close Date]`` resolves to exactly one table (Intake) but ``[Created Date]`` is a system column
+    (``CreatedDate``) present on many tables, so it resolves to ``None`` and the whole calc stubs. The
+    two operands are read from ONE record, so the ambiguous field must live on a table a resolved
+    sibling already pins. This wrapper: resolves each of the calc's field tokens, collects the tables
+    the *resolved* ones pin, and for each *unresolved* token asks the resolver's ``resolve_in_tables``
+    primitive to bind it restricted to exactly those pinned tables -- fail-closed, so it binds iff
+    exactly one pinned table carries the caption (0 or >1 -> stays unresolved).
+
+    Guarantees (all fail-closed / byte-identical unless it strictly helps):
+    * Resolver has no ``resolve_in_tables`` (a test double / a resolver layer that doesn't forward it)
+      -> return ``r`` UNCHANGED.
+    * Fewer than 2 field tokens, or no resolved sibling, or no unresolved token, or nothing anchors
+      -> return ``r`` UNCHANGED (identity object, not a wrapper).
+    * Otherwise return a wrapper that tries ``r(caption)`` FIRST (never overrides a real hit) and only
+      falls back to an anchored binding for a caption the base resolver still can't resolve. The
+      wrapper FORWARDS ``resolve_in_tables`` so it composes (a later wrap can pin more).
+
+    Can only flip a stub to a translation, never regress: it fills a gap the base resolver left
+    ``None`` and never changes a caption the base already resolves.
+    """
+    resolve_in_tables = getattr(r, "resolve_in_tables", None)
+    if resolve_in_tables is None:
+        return r
+    tokens = _calc_field_tokens(formula)
+    if len(tokens) < 2:
+        return r
+    pinned = set()
+    unresolved = []
+    for tok in tokens:
+        try:
+            hit = r(tok)
+        except Exception:
+            hit = None
+        if hit is not None:
+            pinned.add(hit[0])
+        else:
+            unresolved.append(tok)
+    if not pinned or not unresolved:
+        return r
+    anchored = {}
+    for tok in unresolved:
+        try:
+            hit = resolve_in_tables(tok, pinned)
+        except Exception:
+            hit = None
+        if hit is not None:
+            anchored[tok] = hit
+    if not anchored:
+        return r
+
+    def _anchored_resolve(caption):
+        try:
+            base = r(caption)
+        except Exception:
+            base = None
+        if base is not None:
+            return base
+        got = anchored.get(caption)
+        if got is None and caption is not None:
+            got = anchored.get(caption.strip())
+        return got
+
+    _anchored_resolve.resolve_in_tables = resolve_in_tables
+    return _anchored_resolve
+
+
+def _anchoring_rc(rc):
+    """Lift a per-calc resolver selector ``rc(calc) -> resolver`` into one that also sibling-anchors.
+
+    Returns ``calc -> _sibling_anchored_resolver(calc.formula, rc(calc))`` so a call site can apply
+    sibling anchoring at EVERY probe by swapping ``rc`` for ``_anchoring_rc(rc)`` -- keeping the base
+    ``rc`` (un-anchored) available where the raw scope is wanted. Byte-identical wherever the resolver
+    carries no ``resolve_in_tables`` or a calc anchors nothing (the wrapper is then the same object).
+    """
+    def _arc(calc):
+        return _sibling_anchored_resolver((calc or {}).get("formula", "") or "", rc(calc))
+    return _arc
+
+
 def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    calc_lookup=None, approved_calc_dax=None, synth_measures=None,
                    known_tables=None, table_calc_usages=None, order_resolver=None,
                    flag_measures=None, resolve_for=None, inline_calcs=None,
-                   related_tables=None):
+                   related_tables=None, conformed_hubs=None):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
     ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
@@ -683,6 +767,11 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         return _best_scoped_resolver(
             (calc or {}).get("formula", ""), (calc or {}).get("datasource"),
             resolve_for, _island_dss, resolve)
+    # Sibling-anchored variant of the scoped resolver: an ambiguous system-field caption anchors to a
+    # table a UNIQUE sibling in the SAME calc already pins (e.g. row-level DATEDIFF over a unique
+    # business date + an ambiguous ``CreatedDate``). Applied at EVERY probe below via ``_arc``; the base
+    # ``_rc`` stays un-anchored. Fail-closed / byte-identical where nothing anchors.
+    _arc = _anchoring_rc(_rc)
     # Source calcs whose stub is SUPERSEDED by a synthesized date-window flag measure (emitted
     # at the end). Keyed by both the calc caption and its internal id, case-insensitive.
     flag_source_lower = set()
@@ -783,9 +872,9 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         for calc in pending:
             cname = calc["name"]
             cdax, _r, _t, cdtype = translate_tableau_calc_to_dax_typed(
-                calc.get("formula", ""), _rc(calc), param_resolver=param_resolver,
+                calc.get("formula", ""), _arc(calc), param_resolver=param_resolver,
                 measure_refs=measure_refs, known_tables=known_tables, inline_calcs=inline_calcs,
-                related_tables=related_tables)
+                related_tables=related_tables, conformed_hubs=conformed_hubs)
             if cdax:
                 entry = (cname, cdtype or "number")
                 measure_refs[cname.strip().lower()] = entry
@@ -812,8 +901,9 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         if _superseded_by_table_calc(calc, superseded):
             continue  # the addressed table-calc form (emitted below) is the faithful one.
         dax, reason, _ = translate_tableau_calc_to_dax(
-            formula, _rc(calc), param_resolver=param_resolver, measure_refs=measure_refs,
-            known_tables=known_tables, inline_calcs=inline_calcs, related_tables=related_tables)
+            formula, _arc(calc), param_resolver=param_resolver, measure_refs=measure_refs,
+            known_tables=known_tables, inline_calcs=inline_calcs, related_tables=related_tables,
+            conformed_hubs=conformed_hubs)
         row = {
             "measure": name,
             "status": "translated" if dax else "stub",
@@ -837,7 +927,7 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             continue
 
         # Deterministic fallback -> consult the assisted-translation idiom registry.
-        sugg = suggest_assisted_dax(formula, _rc(calc), calc_lookup=calc_lookup)
+        sugg = suggest_assisted_dax(formula, _arc(calc), calc_lookup=calc_lookup)
         # A measure always lands in the shared _Measures table, so an approval's optional target
         # table (the additive dict form) is not applicable here -- only its DAX is consumed.
         approved_dax, _approved_tbl = _approved_entry(approved_lower.get(name.lower()))
@@ -1759,12 +1849,16 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
             if rr is not None:
                 return rr
         return resolve
+    # Sibling-anchored variant (column-mode peer of ``_measures_part._arc``): an ambiguous system-field
+    # caption anchors to the table a unique sibling in the same calc pins. Fail-closed / byte-identical
+    # where nothing anchors; base ``_rc`` stays un-anchored.
+    _arc = _anchoring_rc(_rc)
     # Sibling calc-column cascade (the column-mode peer of the measures' ``measure_refs`` fix-point in
     # ``_measures_part``): resolve a bare ``[Sibling Calc]`` to ``'Home'[Sibling Calc]`` by pre-scanning
     # the deterministically-translatable dim calcs to a fix-point. Factored into the shared
     # ``_build_column_refs`` so the row-level reroute pre-router uses the EXACT same semantics. Empty
     # when no calc references a sibling -> the main loop is byte-identical to the prior single pass.
-    column_refs = _build_column_refs(dim_calcs, _rc, known_tables, consumed_lower=consumed_lower)
+    column_refs = _build_column_refs(dim_calcs, _arc, known_tables, consumed_lower=consumed_lower)
     for calc in dim_calcs or []:
         name, formula = calc["name"], calc.get("formula", "")
         if name.lower() in consumed_lower:
@@ -1790,7 +1884,7 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
             match = date_attribute_binding(formula)
             if match:
                 field_caption, date_column = match
-                resolved = _rc(calc)(field_caption)
+                resolved = _arc(calc)(field_caption)
                 if resolved and (resolved[0], resolved[1]) in active_date_cols:
                     bound_attr = (resolved[0], date_column)
         if bound_attr is not None:
@@ -1805,7 +1899,7 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
             })
             continue
         dax, reason, tables_used = translate_tableau_calc_to_column_dax(
-            formula, _rc(calc), column_refs=column_refs)
+            formula, _arc(calc), column_refs=column_refs)
         if dax and len(tables_used) == 1:
             target = next(iter(tables_used))
         elif len(tables_used) == 1:          # untranslatable but single known home
@@ -2410,6 +2504,15 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     # guard when the IF-condition table and the counted-field table are directly related, emitting a
     # direction-independent TREATAS on the join keys. Connector-agnostic (pure DAX from rel keys).
     related_tables = build_table_adjacency(all_rels)
+    # Conformed-hub exclusion: the auto-generated Date calendar is a degenerate hub -- every fact joins
+    # its date columns into the shared Date[Date] key, so ANY two facts appear "connected" through
+    # same-calendar-date co-occurrence. That manufactures spurious cross-table COUNTD-IF join paths
+    # (SD -> Date -> PE -> Contact) that drown the single faithful entity-FK path and force a false-
+    # ambiguity stub. Excluding the generated Date table as a TRANSIT node in _unique_countd_path
+    # collapses those spurious paths, leaving the real FK path. C/F in a COUNTD-IF are always entity
+    # tables (never Date), so this can only remove co-occurrence paths, never a genuine FK path
+    # (fail-closed: a pair with no real FK path still correctly stubs).
+    conformed_hubs = {date_name} if date_name else None
     measures_table, measure_report, assisted_suggestions = _measures_part(
         calcs, measure_resolve, consumed=consumed, param_resolver=param_resolver,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
@@ -2427,7 +2530,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         order_resolver=None,
         resolve_for=_measure_scoped_resolver,
         flag_measures=flag_measures, inline_calcs=inline_calcs,
-        related_tables=related_tables)
+        related_tables=related_tables, conformed_hubs=conformed_hubs)
     parts["definition/tables/_Measures.tmdl"] = measures_table
     table_names.append("_Measures")
 
@@ -3272,6 +3375,12 @@ def _reroute_row_level_measure_calcs(measure_calcs, dim_calcs, resolve, *, known
                 return rr
         return resolve
 
+    # Sibling-anchored variant: pins an ambiguous system-field caption to a table a unique sibling in
+    # the SAME calc resolves (e.g. the corpus ``Days to Close = DATEDIFF('day', [Close Date],
+    # [Created Date])`` -- ``[Close Date]`` is unique -> pins Intake -> the ambiguous ``[Created Date]``
+    # anchors to Intake, so both probes below see a same-record row-level calc). Fail-closed /
+    # byte-identical where nothing anchors; base ``_rc`` stays un-anchored.
+    _arc = _anchoring_rc(_rc)
     keep = list(measure_calcs or [])
     cur_dims = list(dim_calcs or [])
     moved_names = []
@@ -3281,7 +3390,7 @@ def _reroute_row_level_measure_calcs(measure_calcs, dim_calcs, resolve, *, known
         # Rebuild the sibling map over the CURRENT dim calcs each round: a calc moved in an earlier
         # round becomes a resolvable reference target for a later one (the fix-point that unlocks a
         # difference-of-calcs cascade). Shares ``_build_column_refs`` with ``_calc_columns_part``.
-        col_refs = _build_column_refs(cur_dims, _rc, kt)
+        col_refs = _build_column_refs(cur_dims, _arc, kt)
         still = []
         for c in keep:
             name = c.get("name") or ""
@@ -3289,11 +3398,16 @@ def _reroute_row_level_measure_calcs(measure_calcs, dim_calcs, resolve, *, known
             if not formula or name.strip().lower() in skip_lower:
                 still.append(c)
                 continue
+            # Anchor ONCE and feed BOTH probes the same resolver: the measure probe must see the
+            # sibling-anchored binding to hit the row-level-in-measure gate, and the column probe must
+            # emit against that same binding -- otherwise the reroute's first (measure) probe would
+            # stub for a different reason and never reach the column form.
+            rr = _arc(c)
             mdax, mreason, _ = translate_tableau_calc_to_dax(
-                formula, _rc(c), param_resolver=param_resolver, known_tables=kt)
+                formula, rr, param_resolver=param_resolver, known_tables=kt)
             if mdax is None and mreason == _ROW_LEVEL_IN_MEASURE_REASON:
                 cdax, _creason, _ctables = translate_tableau_calc_to_column_dax(
-                    formula, _rc(c), known_tables=kt, column_refs=col_refs)
+                    formula, rr, known_tables=kt, column_refs=col_refs)
                 if cdax is not None:
                     cur_dims.append(c)
                     moved_names.append(name)

@@ -2707,6 +2707,15 @@ def build_m_field_resolver(descriptor, datasource=None):
             return hit
         return _island_aware(caption, tables)
 
+    # Sibling-anchor primitive: resolve a caption restricted to a PINNED set of tables. Passing a
+    # FRESH set (so ``table_set is not tables`` at the logical-layer gate is True) both scopes the
+    # metadata-record pass and restricts the logical bucket to the pins, so an otherwise-AMBIGUOUS
+    # caption (a system field like ``Created Date`` that maps to a column on many tables) binds iff
+    # exactly one of the pinned tables carries it -- fail-closed (0 or >1 hits -> None) by reusing
+    # ``_resolve_over``. Used by the orchestrator's sibling-anchored resolver; byte-identical to
+    # today when the attribute is never read.
+    resolve_field.resolve_in_tables = lambda caption, table_set: _resolve_over(caption, set(table_set))
+
     return resolve_field
 
 
