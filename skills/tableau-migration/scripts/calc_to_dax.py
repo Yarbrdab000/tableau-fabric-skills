@@ -1244,9 +1244,21 @@ class _Parser:
             if name in ("MIN", "MAX"):
                 # DAX single-column MIN/MAX accept number, text (alphabetical order) and date --
                 # matching Tableau MIN/MAX on those field types -- but NOT a boolean (that is MINA/
-                # MAXA). Reject boolean and any unmapped type (fail-closed); text stays text so the
-                # result can feed a string concat (the MIN()-wrapped tooltip idiom).
+                # MAXA). Text stays text so the result can feed a string concat (the MIN()-wrapped
+                # tooltip idiom).
                 dtype = _DTYPE_BY_TMDL.get(tmdl_type)
+                if dtype == "bool":
+                    # Tableau MAX(bool) = OR-aggregation (FALSE < TRUE -> TRUE iff ANY row TRUE);
+                    # MIN(bool) = AND (TRUE iff ALL rows TRUE). DAX MIN/MAX reject a boolean column,
+                    # so fold each row to 1/0 and iterate: MAXX/MINX(..IF([col],1,0)..) = 1. The
+                    # explicit IF(...,1,0) (not a blank-else) is required for MIN's AND-semantics.
+                    # Result is boolean-typed, so it can feed an IF condition -- e.g. the flagship
+                    # `ZN(IF MAX([bool]) THEN [agg] END)` root shape.
+                    self.tables_used.add(table)
+                    tref = _dax_table(table)
+                    iterfn = "MAXX" if name == "MAX" else "MINX"
+                    return (
+                        f"({iterfn}({tref}, IF({tref}{_dax_col(col)}, 1, 0)) = 1)", "bool")
                 if dtype not in ("number", "text", "date"):
                     raise _CalcError(
                         f"{name} requires a number/text/date field, got {tmdl_type} for [{v}]")
