@@ -229,6 +229,13 @@ _DTYPE_BY_TMDL = {
     "dateTime": "date", "date": "date",
     "boolean": "bool",
 }
+# Sentinel home-table for a ROW-INVARIANT foundation calc (zero physical tables -- TODAY()/NOW()/
+# literals) whose already-rendered DAX body should be INLINED into a dependent's row context instead
+# of resolved to a 'Table'[Column] reference. Stored as the first slot of a column_refs entry
+# ``(_INLINE_REF_SENTINEL, <rendered_dax>, <tmdl_type>)`` by assemble_model._build_column_refs; the
+# NUL byte can never be a real table display name, so the marker is collision-proof. Intercepted in
+# _row_field (below) before the normal (table, col, type) unpack.
+_INLINE_REF_SENTINEL = "\x00__inline_row_invariant__"
 _STRING_FNS = {
     "LEN", "UPPER", "LOWER", "LEFT", "RIGHT", "MID",
     "REPLACE", "CONTAINS", "STARTSWITH", "ENDSWITH", "FIND",
@@ -1628,6 +1635,19 @@ class _Parser:
             if inlined is not None:
                 return inlined
             raise _CalcError(f"unresolved/ambiguous field [{cap}]")
+        if (isinstance(resolved, tuple) and len(resolved) == 3
+                and resolved[0] == _INLINE_REF_SENTINEL):
+            # A ROW-INVARIANT foundation calc (zero physical tables) referenced by this row-level
+            # calc: inline its already-rendered body instead of a 'Table'[Column] reference. The
+            # value is constant per row, so the parenthesized body is faithful in this row context;
+            # it adds NO table to tables_used (a row-invariant calc has no home table), so the
+            # dependent's home collapses to its OTHER field's table -- letting a calc like
+            # ``DATEDIFF('year',[Birthdate],[Today])`` register as a single-home column.
+            _, inline_dax, tmdl_type = resolved
+            dtype = _DTYPE_BY_TMDL.get(tmdl_type)
+            if dtype is None:
+                raise _CalcError(f"unsupported field type {tmdl_type} for [{cap}]")
+            return (f"({inline_dax})", dtype)
         table, col, tmdl_type = resolved
         dtype = _DTYPE_BY_TMDL.get(tmdl_type)
         if dtype is None:

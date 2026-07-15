@@ -53,6 +53,7 @@ try:  # package or scripts-on-path
         field_references,
         date_attribute_binding,
         build_table_adjacency,
+        _INLINE_REF_SENTINEL,
     )
     from .translation_router import classify_fallback
     from . import tmdl_generate as T
@@ -96,6 +97,7 @@ except ImportError:
         field_references,
         date_attribute_binding,
         build_table_adjacency,
+        _INLINE_REF_SENTINEL,
     )
     from translation_router import classify_fallback
     import tmdl_generate as T
@@ -1759,6 +1761,24 @@ def _build_column_refs(calcs, rc, known_tables, *, consumed_lower=None):
                 if tid:
                     column_refs[str(tid).strip().lower()] = entry
                 changed = True
+            elif cdax and len(ctabs) == 0 and cdt:
+                # A ROW-INVARIANT FOUNDATION calc: it renders in column mode (``cdax``) but touches
+                # ZERO physical tables (``TODAY()``/``NOW()``/literals/literal arithmetic, or chains
+                # thereof). It has no single home table, so the ``len(ctabs) == 1`` gate above dropped
+                # it -- leaving every dependent (e.g. ``Age = DATEDIFF('year',[Birthdate],[Today])``)
+                # unresolvable and stubbed as a bare row-level measure. Register it as an INLINE
+                # sentinel so ``_row_field`` splices its already-rendered body into a dependent's row
+                # context (the value is constant per row -> faithful) instead of a ``'Table'[Col]``
+                # reference. Dual-keyed (caption + internal token) like the single-home case; chains
+                # via the fix-point (a second zero-table calc referencing this one re-renders with the
+                # sentinel already in ``column_refs``). Fail-closed: a param ref stubs (cdax falsy) in
+                # column mode, so this truthiness gate never registers one.
+                entry = (_INLINE_REF_SENTINEL, cdax, _DTYPE_TO_TMDL.get(cdt, "string"))
+                column_refs[cname.strip().lower()] = entry
+                tid = calc.get("internal_name")
+                if tid:
+                    column_refs[str(tid).strip().lower()] = entry
+                changed = True
             else:
                 still.append(calc)
         pending = still
@@ -2437,6 +2457,20 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         approved_calc_dax=approved_calc_dax, known_tables=set(table_names),
         resolve_for=_raw_scoped_resolver, relationships=all_rels,
         consumed=(set(consumed) | flag_source_names) if flag_source_names else consumed)
+    # FIX C -- keep the INLINE-sentinel foundation entries OUT of the measure-side resolver. A
+    # row-invariant foundation calc (``_INLINE_REF_SENTINEL`` first slot) is meaningful only to the
+    # column translator's ``_row_field`` (which splices its body at row level). The measure resolvers
+    # below (``measure_resolve`` / ``_measure_scoped_resolver``) unpack a resolved ref as
+    # ``(table, col, type)``; a sentinel entry would mis-unpack -- and a measure that references the
+    # foundation (e.g. ``SUM([Today])``) must stay an honest stub, exactly as it does today. Filtering
+    # here (before either resolver closes over ``calc_col_refs``) guarantees byte-identical measure
+    # output: the foundation was never in the physical ``resolve``, so a measure ref returned ``None``
+    # (stub) before, and still returns ``None`` after.
+    if calc_col_refs:
+        calc_col_refs = {
+            k: v for k, v in calc_col_refs.items()
+            if not (isinstance(v, tuple) and len(v) == 3 and v[0] == _INLINE_REF_SENTINEL)
+        }
     for disp, block in calc_columns_by_table.items():
         path = f"definition/tables/{disp}.tmdl"
         if path in parts:

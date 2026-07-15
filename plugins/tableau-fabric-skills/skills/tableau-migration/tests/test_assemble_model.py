@@ -27,6 +27,7 @@ from assemble_model import (
     _sibling_anchored_resolver,
     _anchoring_rc,
     _ROW_LEVEL_IN_MEASURE_REASON,
+    _INLINE_REF_SENTINEL,
 )
 from calc_to_dax import translate_tableau_calc_to_dax
 from connection_to_m import parse_tds, combine_descriptors
@@ -1973,6 +1974,75 @@ def test_no_date_band_means_no_filter_bindings_key():
         parse_tds(LIVE_SQLSERVER), model_name="Superstore",
         calcs=[{"name": "Profit Ratio", "formula": "SUM([Sales])/SUM([Quantity])"}])
     assert "filter_bindings" not in out["report"]
+
+
+# -- Roots-first foundation-inline: a zero-physical-table row-invariant calc (TODAY()) must be laid
+#    as a column FIRST so its dependents can inline it, killing the bare-row-level stub family. -----
+def test_row_invariant_foundation_calc_inlines_into_dependent_column_end_to_end():
+    """A zero-physical-table foundation calc (``Today = TODAY()``) and its DATEDIFF dependent
+    (``Age = DATEDIFF('year', [Order Date], [Today])``) BOTH land as translated calc columns, with
+    ``[Today]`` inlined into ``Age`` as the parenthesized body ``(TODAY())``.
+
+    This is the roots-first / dependency-order fix (build the foundation before the dependent), NOT a
+    translator-capability gap: ``Today`` renders fine on its own; the only failure without the fix is
+    that ``_build_column_refs`` dropped the zero-table foundation, so ``Age``'s ``[Today]`` never
+    resolved and ``Age`` collapsed to a ``bare row-level`` stub. The fix registers the foundation's
+    rendered DAX behind a NUL sentinel so a row-level dependent inlines it verbatim.
+    """
+    out = assemble_import_model(
+        parse_tds(_DATE_BAND_SQLSERVER), model_name="Superstore",
+        dim_calcs=[
+            {"name": "Today", "formula": "TODAY()",
+             "internal_name": "Calculation_today0001"},
+            {"name": "Age", "formula": "DATEDIFF('year', [Order Date], [Today])",
+             "internal_name": "Calculation_age00002"},
+        ])
+    cols = {r["column"]: r for r in out["report"]["calc_columns"]}
+
+    # The foundation lands as its own translated column on the anchor fact table.
+    assert cols["Today"]["status"] == "translated"
+    assert cols["Today"]["table"] == "Orders"
+    assert cols["Today"]["dax"] == "TODAY()"
+
+    # The dependent resolves ONLY because the foundation was laid first: [Today] is inlined as the
+    # parenthesized rendered body (TODAY()) — no dangling [Today], no bare-row-level stub.
+    assert cols["Age"]["status"] == "translated"
+    assert cols["Age"]["table"] == "Orders"
+    assert cols["Age"]["dax"] == "DATEDIFF('Orders'[Order_Date], (TODAY()), YEAR)"
+    assert "[Today]" not in cols["Age"]["dax"]
+
+    # The emitted TMDL carries both columns, and the NUL registration sentinel never leaks into it.
+    orders_tmdl = next(t for p, t in out["parts"].items() if p.endswith("Orders.tmdl"))
+    assert "column Today = TODAY()" in orders_tmdl
+    assert "column Age = DATEDIFF('Orders'[Order_Date], (TODAY()), YEAR)" in orders_tmdl
+    assert _INLINE_REF_SENTINEL not in orders_tmdl
+
+
+def test_measure_over_row_invariant_foundation_stays_stub_end_to_end():
+    """FIX-C fail-closed guard: a MEASURE that references the zero-physical-table foundation
+    (``MAX([Today])`` over ``Today = TODAY()``) must stay an honest stub — the measure resolver
+    must never see the NUL inline sentinel.
+
+    Without the sentinel-strip in the measure path, ``MAX([Today])`` mis-unpacks the 3-tuple sentinel
+    entry and emits GARBAGE DAX ``MAX('<NUL>__inline_row_invariant__'[TODAY()])``. ``MAX`` (not
+    ``SUM``) is the load-bearing witness here: ``SUM([Today])`` would fail its numeric typecheck first
+    and stub either way (a vacuous test), whereas ``MAX`` accepts a date and would emit the garbage.
+    """
+    out = assemble_import_model(
+        parse_tds(_DATE_BAND_SQLSERVER), model_name="Superstore",
+        dim_calcs=[{"name": "Today", "formula": "TODAY()",
+                    "internal_name": "Calculation_today0001"}],
+        calcs=[{"name": "Latest Today", "formula": "MAX([Today])",
+                "internal_name": "Calculation_latest001"}])
+    rows = {r["measure"]: r for r in out["report"]["measures"]}
+
+    assert rows["Latest Today"]["status"] == "stub"
+    assert not rows["Latest Today"]["dax"]
+    assert "[Today]" in rows["Latest Today"]["reason"]
+
+    # The NUL sentinel must never leak into ANY emitted TMDL part (the real fail-closed guarantee).
+    for part_text in out["parts"].values():
+        assert _INLINE_REF_SENTINEL not in part_text
 
 
 # -- ADD #1: date-axis ORDERBY redirect builder ------------------------------------------------
