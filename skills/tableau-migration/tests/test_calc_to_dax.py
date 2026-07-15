@@ -2010,6 +2010,90 @@ def test_countd_if_cross_table_multi_hop_without_graph_stays_stub():
     assert "one table" in reason
 
 
+# --- conformed-hub (generated Date calendar) transit exclusion -------------------------------------
+# Grounded in the real Salesforce Nonprofit Case Management model. A cross-table
+# COUNTD(IF <cond on ServiceDelivery> THEN [Contact.Id] END) has ONE faithful FK bridge
+# SD -> ProgramEngagement -> Contact (2-hop). But the migrator's auto-generated Date calendar is a
+# degenerate hub: SD and PE both join their date columns into the shared Date[Date] key, so the path
+# finder ALSO sees spurious same-calendar-date co-occurrence paths SD -> Date -> PE -> Contact. Two+
+# paths => false ambiguity => the calc stubs. Excluding the generated Date table as a TRANSIT node
+# collapses the spurious paths and leaves the single real FK path.
+_DH_FIELDS = {
+    "Active Flag": ("SD", "Stage", "string"),        # condition table C = ServiceDelivery
+    "Id (Contact)": ("Contact", "Id", "string"),     # counted table F = Contact
+}
+_DH_FK_RELS = [
+    {"from_table": "SD", "from_col": "pmdm__ProgramEngagement__c", "to_table": "PE", "to_col": "Id"},
+    {"from_table": "PE", "from_col": "pmdm__Contact__c", "to_table": "Contact", "to_col": "Id"},
+]
+# The degenerate Date hub: SD and PE each join TWO date columns into Date[Date], so WITHOUT exclusion
+# there are 3 simple paths SD..Contact (1 real FK + 2 via Date) -> ambiguous.
+_DH_DATE_RELS = [
+    {"from_table": "SD", "from_col": "DeliveryDate", "to_table": "Date", "to_col": "Date"},
+    {"from_table": "PE", "from_col": "EndDate", "to_table": "Date", "to_col": "Date"},
+    {"from_table": "PE", "from_col": "StartDate", "to_table": "Date", "to_col": "Date"},
+]
+_DH_COUNTD = 'COUNTD(IF [Active Flag] = "Active" THEN [Id (Contact)] END)'
+_DH_EXPECTED_DAX = (
+    "COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK('Contact'[Id]), "
+    "TREATAS(CALCULATETABLE(VALUES('PE'[pmdm__Contact__c]), "
+    "TREATAS(CALCULATETABLE(VALUES('SD'[pmdm__ProgramEngagement__c]), "
+    "FILTER('SD', EXACT('SD'[Stage], \"Active\"))), "
+    "'PE'[Id])), "
+    "'Contact'[Id])), 0)"
+)
+
+
+def test_countd_if_date_hub_transit_stays_stub_without_exclusion():
+    # WITHOUT conformed_hubs the shared Date calendar manufactures extra co-occurrence paths
+    # SD -> Date -> PE -> Contact alongside the real SD -> PE -> Contact, so the join looks ambiguous
+    # and the calc correctly stays a fail-closed stub (this is the pre-fix behaviour = byte-identical).
+    adj = build_table_adjacency(_DH_FK_RELS + _DH_DATE_RELS)
+    dax, reason, _ = translate_tableau_calc_to_dax(_DH_COUNTD, _DH_FIELDS.get, related_tables=adj)
+    assert dax is None
+    assert "one table" in reason
+
+
+def test_countd_if_date_hub_excluded_flips_to_unique_path():
+    # Headline flip: excluding the generated 'Date' table as a TRANSIT node collapses the spurious
+    # co-occurrence paths, leaving the SINGLE faithful FK path SD -> PE -> Contact, so the chained
+    # TREATAS emits. This is the CY-PY root-cause fix on the real Salesforce model.
+    adj = build_table_adjacency(_DH_FK_RELS + _DH_DATE_RELS)
+    dax, reason, tables = translate_tableau_calc_to_dax(
+        _DH_COUNTD, _DH_FIELDS.get, related_tables=adj, conformed_hubs={"Date"})
+    assert reason == "ok"
+    assert dax == _DH_EXPECTED_DAX
+    assert tables == {"Contact"}
+
+
+def test_countd_if_date_hub_exclusion_fails_closed_without_fk_path():
+    # Fail-closed proof: if the ONLY connection between C and F is through the Date hub (no real FK
+    # bridge), excluding Date leaves them disconnected -> the calc still (correctly) stubs. Excluding
+    # the hub can never invent a path; it only removes spurious ones.
+    date_only = [
+        {"from_table": "SD", "from_col": "DeliveryDate", "to_table": "Date", "to_col": "Date"},
+        {"from_table": "Contact", "from_col": "BirthDate", "to_table": "Date", "to_col": "Date"},
+    ]
+    adj = build_table_adjacency(date_only)
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        _DH_COUNTD, _DH_FIELDS.get, related_tables=adj, conformed_hubs={"Date"})
+    assert dax is None
+    assert "one table" in reason
+
+
+def test_countd_if_conformed_hubs_default_none_byte_identical():
+    # Additive/inert guarantee: on a graph with NO hub ambiguity (a single clean FK path), passing
+    # conformed_hubs=None and conformed_hubs={"Date"} produce byte-identical DAX -- the parameter only
+    # ever removes a hub that is actually present as a transit node, so default None changes nothing.
+    adj = build_table_adjacency(_DH_FK_RELS)  # no Date rels at all
+    dax_default, r1, t1 = translate_tableau_calc_to_dax(_DH_COUNTD, _DH_FIELDS.get, related_tables=adj)
+    dax_hub, r2, t2 = translate_tableau_calc_to_dax(
+        _DH_COUNTD, _DH_FIELDS.get, related_tables=adj, conformed_hubs={"Date"})
+    assert r1 == r2 == "ok"
+    assert dax_default == dax_hub == _DH_EXPECTED_DAX
+    assert t1 == t2 == {"Contact"}
+
+
 def test_inline_non_boolean_candidate_not_inlined():
     # A non-boolean dim calc keyed in inline_calcs (a numeric body) must NOT inline -- the
     # nested parser rejects a non-bool node, so the reference stays an honest stub.

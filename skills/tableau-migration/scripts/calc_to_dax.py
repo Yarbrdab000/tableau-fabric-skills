@@ -525,7 +525,8 @@ def _tokenize(formula):
 # at measure top level is therefore a parse error (-> fallback).
 class _Parser:
     def __init__(self, toks, resolver, tables_used, mode="measure", param_resolver=None,
-                 measure_refs=None, known_tables=None, inline_calcs=None, related_tables=None):
+                 measure_refs=None, known_tables=None, inline_calcs=None, related_tables=None,
+                 conformed_hubs=None):
         self.toks = toks
         self.pos = 0
         self.resolver = resolver
@@ -555,6 +556,17 @@ class _Parser:
         # the join keys instead of stubbing on the single-table guard. Empty -> the prior
         # single-table-only behaviour (byte-identical when no graph is supplied).
         self.related_tables = related_tables or {}
+        # conformed_hubs: table display names that are CONFORMED / degenerate hub dimensions (e.g. the
+        # migrator's auto-generated ``Date`` calendar, which every fact joins its date columns into via a
+        # shared ``Date[Date]`` key). Such a table connects ANY two facts through same-calendar-date
+        # CO-OCCURRENCE, not entity FK membership, so in a cross-table COUNTD(IF cond THEN [F.field] END)
+        # it manufactures spurious join paths (SD -> Date -> PE -> Contact) that drown the single faithful
+        # FK path and force ``_unique_countd_path`` to stub on false ambiguity. A hub is therefore excluded
+        # as a TRANSIT (intermediate) node in the path search. C and F in a COUNTD-IF are always ENTITY
+        # tables (never a conformed hub), so a hub only ever appears as an intermediate hop -- skipping it
+        # can never remove a genuine FK path, only the spurious co-occurrence ones (fail-closed: a pair
+        # with no real FK path still correctly stubs). Empty -> the prior behaviour (byte-identical).
+        self.conformed_hubs = set(conformed_hubs) if conformed_hubs else set()
         # Cycle guard: the set of inline-calc keys currently being expanded up the call stack, so a
         # calc that (transitively) references itself fails closed instead of recursing forever.
         self._inline_stack = frozenset()
@@ -1386,6 +1398,10 @@ class _Parser:
         Fail-closed gates (any -> ``None``):
           * enumerates simple paths (no repeated table) and returns ``None`` the instant a SECOND
             path is found -- 2+ paths mean the join is ambiguous;
+          * a ``conformed_hubs`` table (e.g. the generated ``Date`` calendar) is skipped as a TRANSIT
+            node, so a spurious same-calendar-date co-occurrence path (SD -> Date -> PE) never counts
+            toward ambiguity nor is ever emitted (C and F are entities, never a hub, so a real FK path
+            is never removed);
           * a visit budget (``_COUNTD_MAX_EXPLORE`` node expansions) so a pathological graph fails
             closed instead of hanging;
           * the unique path must be at most ``_COUNTD_MAX_HOPS`` edges (a deeper chain is left a stub);
@@ -1396,6 +1412,7 @@ class _Parser:
         simple path beyond the hop cap is still detected and correctly forces a stub.
         """
         adj = self.related_tables or {}
+        hubs = self.conformed_hubs or frozenset()
         found = None                       # the first complete simple path, if any
         budget = _COUNTD_MAX_EXPLORE
         stack = [(c_table, (c_table,), frozenset((c_table,)))]
@@ -1409,6 +1426,8 @@ class _Parser:
                     if found is not None:
                         return None        # a 2nd simple path -> ambiguous
                     found = tpath + (f_table,)
+                elif neighbor in hubs:
+                    continue               # conformed hub: not a valid ENTITY transit node
                 elif neighbor not in visited:
                     stack.append((neighbor, tpath + (neighbor,), visited | {neighbor}))
         if found is None:
@@ -2208,7 +2227,8 @@ def build_table_adjacency(relationships):
 
 
 def translate_tableau_calc_to_dax(formula, resolver, param_resolver=None, measure_refs=None,
-                                  known_tables=None, inline_calcs=None, related_tables=None):
+                                  known_tables=None, inline_calcs=None, related_tables=None,
+                                  conformed_hubs=None):
     """Translate a SAFE-subset Tableau calc to DAX. Returns (dax|None, reason, tables_used).
 
     dax is None on any unsupported construct -> caller keeps the inert `= 0` stub.
@@ -2234,15 +2254,21 @@ def translate_tableau_calc_to_dax(formula, resolver, param_resolver=None, measur
     table-adjacency graph (build_table_adjacency) enabling a cross-table COUNTD(IF ...) whose
     condition table is directly related to the counted table to emit a TREATAS. Default None ->
     the single-table-only behaviour (byte-identical prior output).
+    conformed_hubs(iterable of table display names) | None: conformed/degenerate hub dimensions (the
+    generated ``Date`` calendar) excluded as TRANSIT nodes in the cross-table COUNTD-IF path search,
+    so a spurious same-calendar-date co-occurrence path never masks the single faithful FK path.
+    Default None -> byte-identical prior output.
     """
     dax, reason, tables_used, _dtype = translate_tableau_calc_to_dax_typed(
         formula, resolver, param_resolver=param_resolver, measure_refs=measure_refs,
-        known_tables=known_tables, inline_calcs=inline_calcs, related_tables=related_tables)
+        known_tables=known_tables, inline_calcs=inline_calcs, related_tables=related_tables,
+        conformed_hubs=conformed_hubs)
     return dax, reason, tables_used
 
 
 def translate_tableau_calc_to_dax_typed(formula, resolver, param_resolver=None, measure_refs=None,
-                                        known_tables=None, inline_calcs=None, related_tables=None):
+                                        known_tables=None, inline_calcs=None, related_tables=None,
+                                        conformed_hubs=None):
     """Like ``translate_tableau_calc_to_dax`` but also returns the result dtype as a 4th item.
 
     Returns ``(dax|None, reason, tables_used, dtype|None)``. The extra ``dtype`` ("number" /
@@ -2261,7 +2287,8 @@ def translate_tableau_calc_to_dax_typed(formula, resolver, param_resolver=None, 
         dax, dtype = _Parser(
             toks, resolver, tables_used, param_resolver=param_resolver,
             measure_refs=measure_refs, known_tables=known_tables,
-            inline_calcs=inline_calcs, related_tables=related_tables).parse()
+            inline_calcs=inline_calcs, related_tables=related_tables,
+            conformed_hubs=conformed_hubs).parse()
         # Single-table only: terms spanning >1 table fall back (a relationship path
         # does not guarantee the DAX filter context reproduces Tableau's result).
         if len(tables_used) > 1:
