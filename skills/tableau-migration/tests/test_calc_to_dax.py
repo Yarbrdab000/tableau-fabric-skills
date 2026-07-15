@@ -2127,4 +2127,204 @@ def test_inline_date_param_vs_text_column_fails_closed():
     assert "unresolved/ambiguous field" in reason
 
 
+# =====================================================================================================
+# Cross-table row-level (calculated-COLUMN) LOOKUPVALUE rewrite.
+# -----------------------------------------------------------------------------------------------------
+# A row-level calc that references a field on a DIRECTLY-RELATED foreign table (e.g.
+# ``DATEDIFF('month', [Close Date], [Created Date])`` where [Close Date] lives on Intake and
+# [Created Date] on Case) is normally a fail-closed cross-table stub -- a calculated column carries no
+# viz filter context, so a bare foreign field is not resolvable. When the model relationships pin a
+# single home table H that is the direct CHILD (FK side) of every other referenced table, each foreign
+# reference is rewritten as a single-valued ``LOOKUPVALUE('F'[col], 'F'[pk], 'H'[fk])`` and the calc
+# collapses onto H. Direction comes from PK detection (``_is_pk_like``), NEVER relationship orientation.
+# Grounded in the real Salesforce Nonprofit Case Management workbook (two live target calcs).
+# =====================================================================================================
+from calc_to_dax import _is_pk_like, _pk_base, find_related_home  # noqa: E402
+
+
+# ---- unit: _pk_base (island/role-suffix strip + separator squash) -----------------------------------
+def test_pk_base_strips_island_suffix_and_squashes_separators():
+    assert _pk_base("caseman__Assessment__c") == "casemanassessmentc"
+    assert _pk_base("Contact (Intake)") == "contact"          # object-copy disambiguator dropped
+    assert _pk_base("pmdm__ProgramEngagement__c (Assessments)") == "pmdmprogramengagementc"
+    assert _pk_base("") == ""
+
+
+# ---- unit: _is_pk_like (high precision, low recall) -------------------------------------------------
+def test_is_pk_like_accepts_bare_id_and_entity_id_rejects_fk():
+    assert _is_pk_like("caseman__Intake__c", "Id") is True          # bare id
+    assert _is_pk_like("Case", "CaseId") is True                    # <Entity>Id
+    assert _is_pk_like("Case", "Case_Key") is True                  # <Entity>Key, separators ignored
+    assert _is_pk_like("Case", "CasePk") is True                    # <Entity>Pk
+    # A foreign key ends in "id" but is neither bare id nor the table's own <Entity>id -> NOT a PK.
+    assert _is_pk_like("Case", "caseman__Intake__c") is False
+    assert _is_pk_like("Case", "ContactId") is False
+    # The generated Date calendar edge (fact.DateCol -> Date.Date) must never look PK-like, so a
+    # cross-table date calc can't be mis-anchored onto the Date dimension.
+    assert _is_pk_like("Date", "Date") is False
+    assert _is_pk_like("caseman__Intake__c", "") is False
+    # island-suffixed PK still detected (Target 2 shape)
+    assert _is_pk_like("pmdm__ProgramEngagement__c (Assessments)", "Id") is True
+
+
+# ---- unit: find_related_home ------------------------------------------------------------------------
+_LV_REL_CASE_INTAKE = {  # Case is the child (FK) of Intake (PK) -- Target 1's real edge
+    "from_table": "Case", "from_col": "caseman__Intake__c",
+    "to_table": "caseman__Intake__c", "to_col": "Id", "cardinality": "many_to_one",
+}
+
+
+def test_find_related_home_target1_picks_child_as_home():
+    home, wrap = find_related_home({"Case", "caseman__Intake__c"}, [_LV_REL_CASE_INTAKE])
+    assert home == "Case"                                   # the FK/child side, NOT rel `from`/`to` order
+    assert wrap == {"caseman__Intake__c": ("Id", "caseman__Intake__c")}  # (foreign PK, home FK)
+
+
+def test_find_related_home_ignores_date_hub_edge():
+    # A generated Date-dim edge (Case.CreatedDate -> Date.Date) shares no PK side and must be ignored,
+    # leaving the single real FK edge to resolve the home.
+    date_edge = {"from_table": "Case", "from_col": "CreatedDate", "to_table": "Date", "to_col": "Date"}
+    home, wrap = find_related_home({"Case", "caseman__Intake__c"}, [_LV_REL_CASE_INTAKE, date_edge])
+    assert home == "Case"
+    assert set(wrap) == {"caseman__Intake__c"}
+
+
+def test_find_related_home_single_table_returns_none():
+    assert find_related_home({"Case"}, [_LV_REL_CASE_INTAKE]) is None
+
+
+def test_find_related_home_disconnected_returns_none():
+    # The two referenced tables share no relationship at all -> no home.
+    assert find_related_home({"Case", "caseman__Intake__c"}, []) is None
+    other = {"from_table": "People", "from_col": "RegionId", "to_table": "Region", "to_col": "Id"}
+    assert find_related_home({"Case", "caseman__Intake__c"}, [other]) is None
+
+
+def test_find_related_home_no_pk_side_returns_none():
+    # Neither joined column is PK-like (a value-join on Region) -> direction unknowable -> stub.
+    rel = {"from_table": "Case", "from_col": "Region", "to_table": "caseman__Intake__c", "to_col": "Region"}
+    assert find_related_home({"Case", "caseman__Intake__c"}, [rel]) is None
+
+
+def test_find_related_home_both_pk_sides_returns_none():
+    # A shared-PK 1:1 edge (both sides look like a PK) can't tell parent from child -> stub.
+    rel = {"from_table": "caseman__Intake__c", "from_col": "Id", "to_table": "Case", "to_col": "CaseId"}
+    assert find_related_home({"Case", "caseman__Intake__c"}, [rel]) is None
+
+
+def test_find_related_home_parallel_multi_key_edge_returns_none():
+    # Two distinct relationships between the same pair (composite / parallel join), each a real FK->PK
+    # edge, is ambiguous: never guess which key pair bridges the hop.
+    alt = {"from_table": "Case", "from_col": "AltIntakeId", "to_table": "caseman__Intake__c", "to_col": "Id"}
+    assert find_related_home({"Case", "caseman__Intake__c"}, [_LV_REL_CASE_INTAKE, alt]) is None
+
+
+def test_find_related_home_mutual_fk_resolves_faithful_single_home():
+    # A mutual-FK 1:1 (each table carries an FK to the other's PK) is NOT ambiguous for LOOKUPVALUE:
+    # either lookup is single-valued, so it resolves to ONE faithful home (the first-listed child).
+    # Lock that it collapses to a single home with a valid (foreign PK, home FK) wrap, order-agnostic.
+    a = {"from_table": "Case", "from_col": "IntakeId", "to_table": "caseman__Intake__c", "to_col": "Id"}
+    b = {"from_table": "caseman__Intake__c", "from_col": "CaseId", "to_table": "Case", "to_col": "Id"}
+    res = find_related_home({"Case", "caseman__Intake__c"}, [a, b])
+    assert res is not None
+    home, wrap = res
+    assert home in {"Case", "caseman__Intake__c"}
+    (foreign,) = list(wrap)
+    assert foreign != home                                  # the wrap looks up the OTHER table
+    assert wrap[foreign] == ("Id", "IntakeId" if home == "Case" else "CaseId")
+
+
+# ---- end-to-end: column-mode translate with LOOKUPVALUE rewrite -------------------------------------
+_LV_FIELDS_T1 = {
+    "Close Date": ("caseman__Intake__c", "caseman__CloseDate__c", "dateTime"),
+    "Created Date": ("Case", "CreatedDate", "dateTime"),
+}
+
+
+def _lv_resolver_t1(caption):
+    return _LV_FIELDS_T1.get(caption)
+
+
+def test_cross_table_datediff_rewrites_to_lookupvalue_target1():
+    # Target 1 -- "Days Between Close and Created": ZN(DATEDIFF('month',[Close Date],[Created Date])).
+    # [Close Date] on Intake is looked up into the Case home row; [Created Date] is already on Case.
+    dax, reason, tables = translate_tableau_calc_to_column_dax(
+        "ZN(DATEDIFF('month', [Close Date], [Created Date]))",
+        _lv_resolver_t1, known_tables={"Case", "caseman__Intake__c"},
+        relationships=[_LV_REL_CASE_INTAKE])
+    assert reason == "ok"
+    assert tables == {"Case"}                                # collapses onto the single home table
+    assert dax == (
+        "COALESCE(DATEDIFF("
+        "LOOKUPVALUE('caseman__Intake__c'[caseman__CloseDate__c], "
+        "'caseman__Intake__c'[Id], 'Case'[caseman__Intake__c]), "
+        "'Case'[CreatedDate], MONTH), 0)"
+    )
+    assert not validate_dax(dax)                             # emitted DAX is balanced/valid
+
+
+_LV_FIELDS_T2 = {
+    "Start Date": ("pmdm__ProgramEngagement__c (Assessments)", "pmdm__StartDate__c", "dateTime"),
+    "Assessment Completed Date": ("caseman__Assessment__c", "caseman__AssessmentCompletedDate__c", "dateTime"),
+}
+_LV_REL_ASSESS_PE = {
+    "from_table": "caseman__Assessment__c", "from_col": "caseman__ProgramEngagement__c",
+    "to_table": "pmdm__ProgramEngagement__c (Assessments)", "to_col": "Id", "cardinality": "many_to_one",
+}
+
+
+def test_cross_table_datediff_rewrites_to_lookupvalue_target2_island_suffix():
+    # Target 2 -- "Days Assessment since Start Date": DATEDIFF('day',[Start Date],[Assessment Completed
+    # Date]). The foreign table name carries an island suffix `` (Assessments)`` that _pk_base strips so
+    # its `Id` is still detected as the PK. No ZN -> no COALESCE.
+    dax, reason, tables = translate_tableau_calc_to_column_dax(
+        "DATEDIFF('day', [Start Date], [Assessment Completed Date])",
+        _LV_FIELDS_T2.get, known_tables={"caseman__Assessment__c", "pmdm__ProgramEngagement__c (Assessments)"},
+        relationships=[_LV_REL_ASSESS_PE])
+    assert reason == "ok"
+    assert tables == {"caseman__Assessment__c"}
+    assert dax == (
+        "DATEDIFF("
+        "LOOKUPVALUE('pmdm__ProgramEngagement__c (Assessments)'[pmdm__StartDate__c], "
+        "'pmdm__ProgramEngagement__c (Assessments)'[Id], "
+        "'caseman__Assessment__c'[caseman__ProgramEngagement__c]), "
+        "'caseman__Assessment__c'[caseman__AssessmentCompletedDate__c], DAY)"
+    )
+    assert not validate_dax(dax)
+
+
+def test_cross_table_datediff_without_relationships_stays_stub():
+    # No relationships supplied -> the foreign reference can't be anchored -> honest cross-table stub
+    # (byte-identical to pre-feature behaviour when relationships is omitted).
+    dax, reason, tables = translate_tableau_calc_to_column_dax(
+        "ZN(DATEDIFF('month', [Close Date], [Created Date]))",
+        _lv_resolver_t1, known_tables={"Case", "caseman__Intake__c"})
+    assert dax is None
+    assert "cross-table" in reason
+    assert tables == {"Case", "caseman__Intake__c"}
+
+
+def test_cross_table_datediff_unrelated_tables_stays_stub():
+    # Relationships exist but none bridge the two referenced tables -> no home -> stub (never a guess).
+    unrelated = {"from_table": "People", "from_col": "RegionId", "to_table": "Region", "to_col": "Id"}
+    dax, reason, _ = translate_tableau_calc_to_column_dax(
+        "ZN(DATEDIFF('month', [Close Date], [Created Date]))",
+        _lv_resolver_t1, known_tables={"Case", "caseman__Intake__c"},
+        relationships=[unrelated])
+    assert dax is None
+    assert "cross-table" in reason
+
+
+def test_cross_table_lookupvalue_typed_entry_point_threads_relationships():
+    # The typed variant accepts the same `relationships` kwarg and returns the same dtype-carrying tuple.
+    dax, reason, tables, dtype = translate_tableau_calc_to_column_dax_typed(
+        "ZN(DATEDIFF('month', [Close Date], [Created Date]))",
+        _lv_resolver_t1, known_tables={"Case", "caseman__Intake__c"},
+        relationships=[_LV_REL_CASE_INTAKE])
+    assert reason == "ok"
+    assert tables == {"Case"}
+    assert dtype == "number"
+    assert dax.startswith("COALESCE(DATEDIFF(LOOKUPVALUE('caseman__Intake__c'")
+
+
 

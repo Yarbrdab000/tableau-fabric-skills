@@ -526,7 +526,7 @@ def _tokenize(formula):
 class _Parser:
     def __init__(self, toks, resolver, tables_used, mode="measure", param_resolver=None,
                  measure_refs=None, known_tables=None, inline_calcs=None, related_tables=None,
-                 conformed_hubs=None):
+                 conformed_hubs=None, related_wrap=None):
         self.toks = toks
         self.pos = 0
         self.resolver = resolver
@@ -567,6 +567,14 @@ class _Parser:
         # can never remove a genuine FK path, only the spurious co-occurrence ones (fail-closed: a pair
         # with no real FK path still correctly stubs). Empty -> the prior behaviour (byte-identical).
         self.conformed_hubs = set(conformed_hubs) if conformed_hubs else set()
+        # related_wrap: {foreign_table_display: (foreign_pk_col, home_table_display, home_fk_col)} --
+        # in COLUMN (row-level) mode, a resolved field whose table is a KEY here is a foreign reference
+        # that ``_row_field`` rewrites as ``LOOKUPVALUE('F'[col], 'F'[pk], 'H'[fk])`` (a faithful
+        # single-valued FK->PK lookup into the home row) and records the HOME table -- not F -- in
+        # ``tables_used``, so a cross-table row-level calc collapses onto one home table instead of
+        # stubbing on the single-table guard. Built by ``find_related_home``; empty -> byte-identical
+        # prior behaviour (every field emits its own ``'T'[col]`` and adds its own table).
+        self.related_wrap = related_wrap or {}
         # Cycle guard: the set of inline-calc keys currently being expanded up the call stack, so a
         # calc that (transitively) references itself fails closed instead of recursing forever.
         self._inline_stack = frozenset()
@@ -1624,6 +1632,18 @@ class _Parser:
         dtype = _DTYPE_BY_TMDL.get(tmdl_type)
         if dtype is None:
             raise _CalcError(f"unsupported field type {tmdl_type} for [{cap}]")
+        wrap = self.related_wrap.get(table)
+        if wrap is not None:
+            # This field lives on a FOREIGN table related to the calc's home table by a direct
+            # FK->PK edge. Rewrite it as a single-valued lookup into the current (home) row and
+            # record the HOME table, so the whole row-level calc collapses onto one home table.
+            f_pk, home, h_fk = wrap
+            self.tables_used.add(home)
+            return (
+                f"LOOKUPVALUE({_dax_table(table)}{_dax_col(col)}, "
+                f"{_dax_table(table)}{_dax_col(f_pk)}, {_dax_table(home)}{_dax_col(h_fk)})",
+                dtype,
+            )
         self.tables_used.add(table)
         return (f"{_dax_table(table)}{_dax_col(col)}", dtype)
 
@@ -2226,6 +2246,96 @@ def build_table_adjacency(relationships):
     return adj
 
 
+def _pk_base(table):
+    # The casefolded, separator-stripped base ENTITY name of a table: a trailing island/role suffix
+    # `` (…)`` (Tableau's object-copy disambiguator, e.g. ``Contact (Intake)``) is removed first, so a
+    # disambiguated copy keys off its base entity (``contact``). Spaces and underscores are dropped so
+    # ``caseman__Assessment__c`` -> ``casemanassessmentc``.
+    name = table or ""
+    m = re.match(r"^(.*?)\s*\([^()]*\)\s*$", name)
+    if m:
+        name = m.group(1)
+    return re.sub(r"[\s_]+", "", name).casefold()
+
+
+def _is_pk_like(table, col):
+    # True when ``col`` is PRIMARY-KEY-like on ``table``: the bare ``Id``, or the table's own
+    # ``<Entity>Id`` / ``<Entity>Key`` / ``<Entity>Pk`` (separators + case ignored). Deliberately high
+    # precision / low recall: a FOREIGN key such as ``Case.ContactId`` ends in ``id`` but is neither
+    # bare ``id`` nor ``Case``'s own ``caseid``, so it is correctly NOT a PK. Home-finding therefore
+    # under-fires to an honest stub rather than ever inferring the wrong parent/child direction.
+    c = (col or "").strip().casefold()
+    if not c:
+        return False
+    if c == "id":
+        return True
+    squashed = c.replace("_", "")
+    base = _pk_base(table)
+    return squashed in (base + "id", base + "key", base + "pk")
+
+
+def find_related_home(tables_used, relationships):
+    """Resolve the single HOME table for a cross-table row-level calc + its foreign-field wrap map.
+
+    Given the tables a row-level (calculated-column) calc references and the model's raw
+    ``relationships`` list, decide whether the calc can be faithfully materialized as ONE calculated
+    column on a single home table H by rewriting each foreign field reference as a ``LOOKUPVALUE``.
+
+    Returns ``(home_table, {foreign_table: (foreign_pk_col, home_fk_col)})`` -- H plus, for every
+    OTHER referenced table F, the key pair that looks a value up from F into H's row -- or ``None``
+    when no unique, single-hop, unambiguous home exists (fail-closed: the caller keeps the honest
+    cross-table stub).
+
+    H is the child that sits at the many end of a direct FK->PK edge to EVERY other referenced table:
+    H carries an FK column pointing at F's own primary key, so exactly one F row matches each H row and
+    ``LOOKUPVALUE('F'[field], 'F'[pk], 'H'[fk])`` is a faithful single-valued lookup. Direction comes
+    from ``_is_pk_like`` (PK detection), NOT relationship orientation -- the ``from``/``to`` order in a
+    relationship dict follows Tableau's arbitrary authored operand order and is unreliable.
+
+    Fail-closed by construction: an edge without exactly one PK side (0 or 2) is unusable; a second
+    relationship between the same pair (parallel / multi-key) is ambiguous; the home must be the direct
+    child of every other referenced table (single-hop, no intermediates); anything else -> ``None``.
+    """
+    tset = {t for t in (tables_used or set()) if t}
+    if len(tset) < 2:
+        return None
+    # Directed child->parent edges among the referenced tables: (child, parent) -> (child_fk, parent_pk).
+    # A pair seen twice (parallel / multi-key) is marked ambiguous (value None) and can never anchor a home.
+    edges = {}
+    seen_pairs = set()
+    for rel in relationships or ():
+        r = rel or {}
+        ft, fc = r.get("from_table"), r.get("from_col")
+        tt, tc = r.get("to_table"), r.get("to_col")
+        if not (ft and fc and tt and tc):
+            continue
+        if ft not in tset or tt not in tset or ft == tt:
+            continue
+        a_pk = _is_pk_like(ft, fc)
+        b_pk = _is_pk_like(tt, tc)
+        if a_pk == b_pk:
+            continue  # need EXACTLY one PK side to know parent (PK) from child (FK)
+        if b_pk:
+            child, child_fk, parent, parent_pk = ft, fc, tt, tc
+        else:
+            child, child_fk, parent, parent_pk = tt, tc, ft, fc
+        pair = frozenset((child, parent))
+        if pair in seen_pairs:
+            edges[(child, parent)] = None  # parallel / multi-key edge -> ambiguous
+            continue
+        seen_pairs.add(pair)
+        edges[(child, parent)] = (child_fk, parent_pk)
+    homes = [h for h in tset if all(edges.get((h, f)) for f in (tset - {h}))]
+    if len(homes) != 1:
+        return None
+    home = homes[0]
+    wrap = {}
+    for f in tset - {home}:
+        child_fk, parent_pk = edges[(home, f)]
+        wrap[f] = (parent_pk, child_fk)  # (foreign PK col on F, home FK col on H)
+    return home, wrap
+
+
 def translate_tableau_calc_to_dax(formula, resolver, param_resolver=None, measure_refs=None,
                                   known_tables=None, inline_calcs=None, related_tables=None,
                                   conformed_hubs=None):
@@ -2301,7 +2411,8 @@ def translate_tableau_calc_to_dax_typed(formula, resolver, param_resolver=None, 
         return None, str(e), tables_used, None
 
 
-def translate_tableau_calc_to_column_dax(formula, resolver, known_tables=None, column_refs=None):
+def translate_tableau_calc_to_column_dax(formula, resolver, known_tables=None, column_refs=None,
+                                         relationships=None):
     """Translate a ROW-LEVEL Tableau calc to a DAX *calculated-column* expression.
 
     Companion to translate_tableau_calc_to_dax with the SAME public shape --
@@ -2327,14 +2438,19 @@ def translate_tableau_calc_to_column_dax(formula, resolver, known_tables=None, c
     created on this datasource, absent from the datasource metadata ``resolver``) resolve to
     ``'Table'[X]`` -- the column-mode peer of ``measure_refs``. Default None -> byte-identical.
     See ``translate_tableau_calc_to_column_dax_typed`` for the full contract.
+
+    ``relationships`` (the model's raw relationship list) enables the cross-table LOOKUPVALUE rewrite:
+    a row-level calc referencing a foreign field is materialized on one home table when a unique,
+    single-hop FK->PK home exists. Default None -> the prior cross-table stub.
     """
     dax, reason, tables_used, _dtype = translate_tableau_calc_to_column_dax_typed(
-        formula, resolver, known_tables=known_tables, column_refs=column_refs)
+        formula, resolver, known_tables=known_tables, column_refs=column_refs,
+        relationships=relationships)
     return dax, reason, tables_used
 
 
 def translate_tableau_calc_to_column_dax_typed(formula, resolver, known_tables=None,
-                                               column_refs=None):
+                                               column_refs=None, relationships=None):
     """Like ``translate_tableau_calc_to_column_dax`` but also returns the result dtype as a 4th item.
 
     Returns ``(dax|None, reason, tables_used, dtype|None)``. The extra ``dtype`` ("number" /
@@ -2372,6 +2488,23 @@ def translate_tableau_calc_to_column_dax_typed(formula, resolver, known_tables=N
         dax, dtype = _Parser(toks, resolver, tables_used, mode="column",
                              known_tables=known_tables).parse()
         if len(tables_used) > 1:
+            # Cross-table row-level calc. Try to materialize it as ONE calculated column on a single
+            # home table by rewriting each foreign field as a LOOKUPVALUE (a faithful single-valued
+            # FK->PK lookup): requires the model relationships + a unique, single-hop, unambiguous
+            # home. On success the calc collapses to {home}; otherwise keep the honest cross-table stub.
+            hw = find_related_home(tables_used, relationships) if relationships else None
+            if hw is not None:
+                home, wrap = hw
+                related_wrap = {ft: (f_pk, home, h_fk) for ft, (f_pk, h_fk) in wrap.items()}
+                tables2 = set()
+                try:
+                    dax2, dtype2 = _Parser(_tokenize(f), resolver, tables2, mode="column",
+                                           known_tables=known_tables,
+                                           related_wrap=related_wrap).parse()
+                except _CalcError:
+                    dax2 = None
+                if dax2 is not None and tables2 == {home} and not validate_dax(dax2):
+                    return dax2, "ok", tables2, dtype2
             return None, "cross-table terms (fields span multiple tables)", tables_used, None
         leak = validate_dax(dax)
         if leak:
