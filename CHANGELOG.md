@@ -13,6 +13,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.46.0` → `1.47.0`): Lay a zero-physical-table, row-invariant foundation calc
+  as a real column so its dimension-role dependents stop shipping as bare-row-level measure stubs. Additive
+  and fail-closed — byte-identical unless a genuinely row-invariant foundation calc is present.** A Tableau
+  calc like `Today = TODAY()` has no physical table behind it (its `tables_used` is empty), so the
+  orchestrator's `_build_column_refs` never registered it in `column_refs`. Any dependent that referenced it
+  — e.g. `Age = DATEDIFF('year', [Birthdate], [Today])` — therefore couldn't resolve `[Today]`, and even
+  after `_reroute_row_level_measure_calcs` correctly reclassified the genuinely row-level `Age` from a
+  measure to a column, that column probe still failed because its foundation `[Today]` wasn't laid down.
+  A new inline sentinel (`_INLINE_REF_SENTINEL`) closes the gap: `_build_column_refs` now registers a
+  zero-physical-table, typed foundation calc as a sentinel `column_refs` entry (`calc_to_dax._row_field`
+  intercepts the sentinel and inlines the foundation's DAX directly into the dependent, e.g. `TODAY()`),
+  and a fail-closed filter strips those sentinel entries before `measure_resolve` so a measure never
+  mis-unpacks one. Live-proven on the real `Salesforce_Nonprofit_Case_Management` workbook: the CEP `Age`
+  calc flipped from a `bare row-level field [..] not valid in a measure` stub to a translated calc-column
+  `DATEDIFF('Contact'[Birthdate], (TODAY()), YEAR)`, and `Today = TODAY()` now lands as a translated column
+  in every datasource. Ships alongside a new pure `calc_graph.py` module (calc dependency DAG + roots-first
+  topological layering + conservative row-level form inference) that the roots-first resolver builds on.
+  Byte-identical where no row-invariant foundation calc exists; the original Tableau formula is always
+  preserved as a `TableauFormula` annotation.
 - **tableau-migration (skill `1.45.0` → `1.46.0`): Thread relationships into the row-level measure reroute so
   the cross-table `DATEDIFF` → `LOOKUPVALUE` flip actually lands. Additive and fail-closed — byte-identical
   unless relationships strictly help.** The column translator already knew how to rewrite a measure-role
