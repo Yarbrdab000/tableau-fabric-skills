@@ -2395,6 +2395,120 @@ def test_logical_resolver_fails_closed_on_case_distinct_physical():
     assert resolve("Quota Cap") is None
 
 
+# -- <cols><map> pin harvest: bind an unambiguous logical pin that has NO <column> declaration -----
+# A Salesforce workbook can pin a caption to exactly one physical column in <cols><map> WITHOUT ever
+# declaring a matching <column caption=.. name=..>. The `_logical_fields` emit loop only walks
+# <column> declarations, so that unique pin is dropped and the caption STUBS at resolve-time even
+# though the mapping is unambiguous. `metadata cap_to` alone can't rescue it when the same caption
+# case-folds to two physical tables (the real "Contact ID" -> Contact/Contact1 shape). Harvesting the
+# unique, undeclared pin makes the caption resolve -- fail-closed (a >1-target pin is never guessed;
+# a caption already handled by a <column> or metadata never shadowed).
+HARVEST_UNIQUE_PIN = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='SF-Assess' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='sf' name='salesforce.1'>
+        <connection class='salesforce' server='login.salesforce.com' authentication='OAuth' />
+      </named-connection>
+    </named-connections>
+    <relation type='collection'>
+      <relation connection='salesforce.1' name='Assessment' table='[Assessment]' type='table' />
+      <relation connection='salesforce.1' name='Contact' table='[Contact]' type='table' />
+    </relation>
+    <cols>
+      <map key='[Score]' value='[Assessment].[Score]' />
+      <map key='[Contact ID]' value='[Contact].[Id]' />
+    </cols>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Score</remote-name>
+        <local-name>[Score]</local-name>
+        <parent-name>[Assessment]</parent-name>
+        <local-type>real</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>Id</remote-name>
+        <local-name>[Id]</local-name>
+        <parent-name>[Contact]</parent-name>
+        <local-type>string</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+  <column caption='Score' datatype='real' name='[Score]' role='measure' type='quantitative' />
+</datasource>"""
+
+
+# A caption that IS <column>-declared (emit loop) on Contact, PLUS a same-caption map pin to a
+# DIFFERENT table (Case). Gate #2 (don't shadow a working caption/id) must keep "Contact ID" bound
+# to the declared Contact.Id target and never ambiguate it with the Case pin. A third pin
+# [Case Number] -> [Case].[CaseNumber] has no <column> and no metadata caption, so it SHOULD harvest
+# -- proving the harvest is live in this fixture (so the "Contact ID untouched" claim is non-vacuous).
+HARVEST_DECLARED_CAPTION_COLLISION = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='SF-Reg' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='sf' name='salesforce.1'>
+        <connection class='salesforce' server='login.salesforce.com' authentication='OAuth' />
+      </named-connection>
+    </named-connections>
+    <relation type='collection'>
+      <relation connection='salesforce.1' name='Case' table='[Case]' type='table' />
+      <relation connection='salesforce.1' name='Contact' table='[Contact]' type='table' />
+    </relation>
+    <cols>
+      <map key='[ContactRef]' value='[Contact].[Id]' />
+      <map key='[Contact ID]' value='[Case].[ContactId]' />
+      <map key='[Case Number]' value='[Case].[CaseNumber]' />
+    </cols>
+    <metadata-records>
+      <metadata-record class='column'>
+        <remote-name>Id</remote-name>
+        <local-name>[Id]</local-name>
+        <parent-name>[Contact]</parent-name>
+        <local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>ContactId</remote-name>
+        <local-name>[ContactId]</local-name>
+        <parent-name>[Case]</parent-name>
+        <local-type>string</local-type>
+      </metadata-record>
+      <metadata-record class='column'>
+        <remote-name>CaseNumber</remote-name>
+        <local-name>[CaseNumber]</local-name>
+        <parent-name>[Case]</parent-name>
+        <local-type>string</local-type>
+      </metadata-record>
+    </metadata-records>
+  </connection>
+  <column caption='Contact ID' datatype='string' name='[ContactRef]' role='dimension' type='nominal' />
+</datasource>"""
+
+
+def test_logical_harvests_unique_map_pin_without_column():
+    # RED before the harvest: [Contact ID] is pinned to exactly one physical column
+    # ([Contact].[Id]) in <cols><map>, but there is NO <column caption='Contact ID' ...> for the
+    # emit loop to bind, so the caption resolves to None and any calc referencing it STUBS.
+    d = parse_tds(HARVEST_UNIQUE_PIN)
+    resolve = build_m_field_resolver(d)
+    # The declared-column path still resolves (baseline the harvest must not disturb).
+    assert resolve("Score") == ("Assessment", "Score", "double")
+    # The undeclared-but-unambiguous pin now binds to its single physical target.
+    assert resolve("Contact ID") == ("Contact", "Id", "string")
+
+
+def test_logical_harvest_does_not_ambiguate_declared_caption():
+    # Regression: "Contact ID" is <column>-declared to Contact.Id AND separately map-pinned to
+    # Case.ContactId. Gate #2 must keep the declared binding and refuse to add the Case target.
+    d = parse_tds(HARVEST_DECLARED_CAPTION_COLLISION)
+    resolve = build_m_field_resolver(d)
+    # Declared caption stays bound to Contact.Id -- never shadowed/ambiguated by the Case pin.
+    assert resolve("Contact ID") == ("Contact", "Id", "string")
+    # A genuinely undeclared, unambiguous pin DOES harvest -> the harvest is live in this fixture,
+    # so the "Contact ID untouched" assertion above is non-vacuous.
+    assert resolve("Case Number") == ("Case", "CaseNumber", "string")
+
+
 # -- island-scoped field resolution (Fix (1): cross-island caption collision) --------------------
 # A consolidated multi-datasource workbook pools EVERY island's tables into one descriptor
 # (combine_descriptors). When the SAME caption is reused across islands on DIFFERENT physical tables

@@ -13,6 +13,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.49.0` → `1.50.0`): Harvest unambiguous `<cols><map>` pins that carry no
+  `<column>` declaration, so a workbook whose only pointer to a physical column is a unique map pin (with no
+  caption declaration for the emit loop to bind) still resolves — killing the Assessments `[Contact ID]`
+  bare-row-level stubs. Additive and fail-closed — can only ADD a resolution the metadata layer left
+  unresolved/ambiguous, never override a working one.** In the Assessments island, `<cols><map>` pins the
+  Tableau caption `[Contact ID]` to exactly one physical `('Contact','Id')`, but there is no
+  `<column caption='Contact ID' name='[Contact ID]'>` for `_logical_fields`'s emit loop to bind against, so
+  the unique pin was never emitted into the resolver's `logical` bucket; the metadata `cap_to` index alone
+  was 2-hit ambiguous, so `resolve_field('Contact ID')` returned `None` → `_CalcError` → stub. `_logical_fields`
+  in `connection_to_m.py` now appends, after its emit loop, any single-target map pin that (1) has no
+  `<column>` declaration, (2) would not shadow an already-emitted caption/logical-id, (3) is not an
+  internal/synthetic token (`Calculation_*`/`Parameter*`/`:`-scoped), and (4) does not collide
+  case-insensitively with another harvested pin — emitting NEITHER on any ambiguity. The placeholder
+  `tmdl_type` is cosmetic: `build_m_field_resolver` derives the real type from the emitted relation column via
+  `_phys_target`, and the `logical` bucket is consulted only on a metadata miss/ambiguity. Live-verified on
+  the real `Salesforce_Nonprofit_Case_Management.twbx`: `resolve_field('Contact ID')` flips
+  `None → ('Contact','Id','string')`, bare-row-level stubs dropped 10 → 8 (Assessments 4 → 2), the whole
+  `Count of Contacts` / `% of Contacts with Assessment` / `Select Metric %` family cascaded to translated
+  DAX, `Age` flipped stub → translated, and Service Delivery / Intake / Client-Enrollment counts are
+  byte-identical (0 regressions). The 2 remaining Assessments stubs are a separate LOD root, unaffected.
 - **tableau-migration (skill `1.48.0` → `1.49.0`): Translate the cross-table FIXED-LOD keystone wrapped in an
   outer conditional in column mode, so the Assessments `Total Score First/Last Assessment` calcs stop shipping
   as bare-row-level stubs — cascade-unblocking their dependent tower. Additive and fail-closed — byte-identical
