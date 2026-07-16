@@ -590,6 +590,13 @@ class _Parser:
         # opened while this is non-zero falls back (a compound view-relative context transition
         # cannot be proven faithful).
         self._relative_lod_depth = 0
+        # True only while parsing a COLUMN-mode bare FIXED LOD (set around the _fixed_lod_bare() call
+        # in the ``{``-dispatch below). It gates BOTH the cross-table grain DEFERRAL in _lod_core and
+        # the cross-table VAR-capture EMIT in _fixed_lod_bare. It is NOT self.mode, because column mode
+        # flips self.mode to "measure" before calling _fixed_lod_bare (so the inner aggregate is legal),
+        # so gating on self.mode would also (wrongly) fire in genuine measure mode -- which must stay a
+        # stub for a cross-table FIXED LOD (no row context to capture the grain).
+        self._lod_column_context = False
 
     def _resolve_param(self, name):
         """Return ``(measure_ref, dtype)`` for a parameter, tolerating either resolver shape.
@@ -908,10 +915,13 @@ class _Parser:
                 # still falls back -- only a bare {FIXED ...}/{AGG(...)} value is row-level-valid.
                 saved_mode = self.mode
                 self.mode = "measure"
+                saved_lod_ctx = self._lod_column_context
+                self._lod_column_context = True
                 try:
                     return self._fixed_lod_bare()
                 finally:
                     self.mode = saved_mode
+                    self._lod_column_context = saved_lod_ctx
             return self._fixed_lod_bare()
         if k == "id":
             u = v.upper()
@@ -1495,6 +1505,79 @@ class _Parser:
         return (f"COALESCE(CALCULATE(DISTINCTCOUNTNOBLANK({_dax_table(f_table)}{_dax_col(f_col)}), "
                 f"TREATAS({keyset}, {_dax_table(f_table)}{_dax_col(f_key)})), 0)")
 
+    def _reachable_grain_tables(self, f_table):
+        # The set of tables reachable from ``f_table`` by a UNIQUE directed child->parent (M:1)
+        # FK->PK path (plus ``f_table`` itself). A cross-table FIXED-LOD grain dimension is only
+        # resolvable/faithful when it lives on such a table -- each fact row maps to exactly one
+        # parent row, so RELATED(parent[col]) is single-valued. Used to fact-anchor an otherwise
+        # ambiguous grain caption (e.g. [Contact ID]) via the resolver's resolve_in_tables primitive.
+        reachable = {f_table}
+        for d in (self.related_tables or {}):
+            if d != f_table and self._related_grain_path(f_table, d) is not None:
+                reachable.add(d)
+        return reachable
+
+    def _related_grain_path(self, f_table, d_table):
+        # The UNIQUE directed child->parent (M:1) key path from fact ``f_table`` up to ``d_table``, as
+        # [f_table, ..., d_table], or None when there is no such path, MORE than one (ambiguous), or it
+        # exceeds _COUNTD_MAX_HOPS. Only edges whose NEIGHBOR side is PK-like and whose CURRENT side is
+        # NOT (a genuine FK->PK child->parent) are walked, so the search climbs the many-to-one chain
+        # and each RELATED() hop is single-valued. The destination is captured but NOT pushed, so every
+        # simple path ending at d_table is enumerated and a SECOND one forces None (fail closed). A
+        # dense/cyclic graph bails to None after _COUNTD_MAX_EXPLORE node expansions.
+        if f_table == d_table:
+            return None
+        adj = self.related_tables or {}
+        found = None
+        budget = _COUNTD_MAX_EXPLORE
+        stack = [(f_table, (f_table,), frozenset((f_table,)))]
+        while stack:
+            node, tpath, visited = stack.pop()
+            budget -= 1
+            if budget <= 0:
+                return None
+            for neighbor, this_col, neighbor_col in adj.get(node, ()):
+                if not (_is_pk_like(neighbor, neighbor_col) and not _is_pk_like(node, this_col)):
+                    continue  # keep ONLY a child->parent FK->PK edge (climb the M:1 chain)
+                if neighbor == d_table:
+                    if found is not None:
+                        return None  # a 2nd distinct path -> ambiguous grain, fail closed
+                    found = tpath + (d_table,)
+                elif neighbor not in visited:
+                    stack.append((neighbor, tpath + (neighbor,), visited | {neighbor}))
+        if found is None:
+            return None
+        if len(found) - 1 > _COUNTD_MAX_HOPS:
+            return None
+        return list(found)
+
+    def _resolve_xgrain(self, raw_caps, f_table):
+        # Resolve each cross-table FIXED-LOD grain caption to a (kind, table, col) triple for the emit:
+        # 'local' when it resolves onto the fact itself, 'related' when it resolves onto a table reached
+        # by a unique M:1 path from the fact (so RELATED is single-valued). A caption that resolves
+        # nowhere -- even via the fact-anchored resolve_in_tables over the reachable set -- or onto an
+        # unreachable/non-M:1 table fails closed, so the caller keeps the honest stub.
+        reachable = self._reachable_grain_tables(f_table)
+        resolve_in = getattr(self.resolver, "resolve_in_tables", None)
+        out = []
+        for v in raw_caps:
+            r = self.resolver(v)
+            if r is None:
+                if resolve_in is None:
+                    raise _CalcError(f"unresolved/ambiguous LOD dimension [{v}]")
+                r = resolve_in(v, reachable)
+                if r is None:
+                    raise _CalcError(f"unresolved/ambiguous LOD dimension [{v}]")
+            d_table, d_col = r[0], r[1]
+            if d_table == f_table:
+                out.append(("local", d_table, d_col))
+            else:
+                path = self._related_grain_path(f_table, d_table)
+                if path is None:
+                    raise _CalcError("cross-table LOD dimensions not supported")
+                out.append(("related", d_table, d_col))
+        return out
+
     def _percentile(self):
         # PERCENTILE([field], n) -> PERCENTILE.INC('T'[field], n). Aggregation over a single
         # numeric field; n (the 0..1 fraction) must be numeric. A non-numeric field or a bare
@@ -1993,8 +2076,10 @@ class _Parser:
         raise _CalcError(f"unsupported DATETRUNC part {part!r}")
 
     def _lod_core(self):
-        # Parse an LOD body. Returns (kind, table, [clean_cols], inner_node) where kind is one of
-        # "FIXED" / "INCLUDE" / "EXCLUDE". Accepted shapes:
+        # Parse an LOD body. Returns (kind, table, [clean_cols], inner_node, xgrain) where kind is one of
+        # "FIXED" / "INCLUDE" / "EXCLUDE" and xgrain is None EXCEPT for a deferred cross-table FIXED LOD
+        # in column mode, where it is a list of (kind, table, col) grain triples ("local"/"related") the
+        # caller (_fixed_lod_bare) broadcasts as a RELATED grouping over the fact. Accepted shapes:
         #   {FIXED d1, d2, ... : inner}    -- dimensioned FIXED (>=1 [field] dimension)
         #   {FIXED : inner}                -- table-scoped FIXED (explicit empty dimension list)
         #   {inner}                        -- table-scoped shorthand: no keyword == "FIXED to nothing"
@@ -2016,12 +2101,18 @@ class _Parser:
         cols = []
         table = None
         kind = "FIXED"  # {inner} shorthand and {FIXED ...} both fix; overwritten for INCLUDE/EXCLUDE
+        xgrain = None
+        defer_xgrain = False
+        raw_caps = []
         if self._is_kw("FIXED") or self._is_kw("INCLUDE") or self._is_kw("EXCLUDE"):
             kind = self._next()[1].upper()
             # Only FIXED accepts the explicit table-scoped {FIXED : inner} (no dimensions); an
             # INCLUDE/EXCLUDE with no dimension is a no-op the view can't interpret -> fall back
             # (the dimension loop's "requires at least one [dimension]" guard rejects it).
             if not (kind == "FIXED" and self._peek() == ("op", ":")):
+                # Token-consume the grain captions into raw_caps WITHOUT resolving yet, so a cross-table
+                # FIXED grain in column mode can be DEFERRED (resolved later against the fact-anchored
+                # reachable M:1 set) instead of raising mid-parse.
                 while True:
                     k, v = self._peek()
                     if k == "qfield":
@@ -2029,20 +2120,42 @@ class _Parser:
                     if k != "field":
                         raise _CalcError(f"{kind} LOD requires at least one [dimension]")
                     self._next()
-                    resolved = self.resolver(v)
-                    if resolved is None:
-                        raise _CalcError(f"unresolved/ambiguous LOD dimension [{v}]")
-                    t, c, _ty = resolved
-                    if table is None:
-                        table = t
-                    elif t != table:
-                        raise _CalcError("cross-table LOD dimensions not supported")
-                    self.tables_used.add(t)
-                    cols.append(c)
+                    raw_caps.append(v)
                     if self._peek() == ("op", ","):
                         self._next()
                         continue
                     break
+                # DRY-resolve each caption WITHOUT mutating tables_used, so a failure can be DEFERRED
+                # (column-mode FIXED) or RAISED (everything else) before any commit. When every caption
+                # resolves onto ONE table this commits byte-identically to the old inline loop.
+                fail = None
+                dry = []
+                dry_table = None
+                for v in raw_caps:
+                    resolved = self.resolver(v)
+                    if resolved is None:
+                        fail = _CalcError(f"unresolved/ambiguous LOD dimension [{v}]")
+                        break
+                    t, c, _ty = resolved
+                    if dry_table is None:
+                        dry_table = t
+                    elif t != dry_table:
+                        fail = _CalcError("cross-table LOD dimensions not supported")
+                        break
+                    dry.append((t, c))
+                if fail is None:
+                    table = dry_table
+                    for t, c in dry:
+                        self.tables_used.add(t)
+                        cols.append(c)
+                elif kind == "FIXED" and self._lod_column_context:
+                    # A cross-table / fact-anchored FIXED grain in a row-level column: defer grain
+                    # resolution to _resolve_xgrain (over the reachable M:1 set) AFTER the inner parses,
+                    # so a genuine cross-table FIXED LOD emits a RELATED grouping instead of stubbing.
+                    # tables_used/cols stay untouched so the inner's fact is the only free table.
+                    defer_xgrain = True
+                else:
+                    raise fail
             self._expect_op(":")
         # else: {inner} shorthand -- no keyword == FIXED to nothing (table-scoped)
         if kind in ("INCLUDE", "EXCLUDE") and self._lod_dim_stack:
@@ -2061,7 +2174,7 @@ class _Parser:
             self._relative_lod_depth -= 1
         self._lod_dim_stack.pop()
         self._expect_op("}")
-        if table is None:
+        if table is None and not defer_xgrain:
             # table-scoped LOD (no dimensions): derive the single source table from the inner
             # aggregate's field references. A constant or cross-table inner has no single table
             # to scope ALL() over, so it falls back.
@@ -2072,7 +2185,29 @@ class _Parser:
                 table = next(iter(self.tables_used))
             else:
                 raise _CalcError("table-scoped LOD must reference exactly one table")
-        return kind, table, cols, inner
+        if defer_xgrain:
+            # Cross-table FIXED grain in column mode: the inner aggregate must live on exactly ONE fact
+            # table; resolve each deferred grain caption against that fact's reachable M:1 set. The fact
+            # becomes the LOD's home table (the RELATED grouping in _fixed_lod_bare broadcasts over it).
+            inner_tables = self.tables_used - before
+            if not inner_tables:
+                # The inner aggregate added NO NEW table because its fact was already pulled into
+                # scope by the OUTER expression wrapping this LOD -- e.g. the keystone shape
+                # ``IF [factcol] = [factcol] THEN {FIXED xgrain: MIN(IF ... THEN [factnum] END)} END``,
+                # where the outer conditional references the same fact the inner aggregate does. Since
+                # ``defer_xgrain`` kept the grain dims OUT of ``tables_used`` (line ~2156), the set here
+                # is exactly {outer tables} u {inner tables}; fall back to it (still requiring a single
+                # fact) so a conditional-wrapped cross-table FIXED LOD resolves instead of stubbing.
+                # ``tables_used`` is monotonic, so an inner reference to an already-scoped fact is
+                # invisible to the subtraction -- this recovers it. Fails closed at ``len != 1`` below
+                # when the outer and inner genuinely span two different tables.
+                inner_tables = frozenset(self.tables_used)
+            if len(inner_tables) != 1:
+                raise _CalcError("cross-table FIXED LOD requires a single-table inner aggregate")
+            f_table = next(iter(inner_tables))
+            xgrain = self._resolve_xgrain(raw_caps, f_table)
+            table = f_table
+        return kind, table, cols, inner, xgrain
 
     def _lod_cols_dax(self, table, cols):
         return ", ".join(_dax_table(table) + _dax_col(c) for c in cols)
@@ -2081,7 +2216,20 @@ class _Parser:
         # {FIXED d : AGG(...)}        -> CALCULATE(AGG(...), ALLEXCEPT('T', 'T'[d], ...))
         # {AGG(...)} / {FIXED : AGG(...)} (table-scoped, no dims) -> CALCULATE(AGG(...), ALL('T'))
         # {EXCLUDE d : AGG(...)}      -> CALCULATE(AGG(...), REMOVEFILTERS('T'[d], ...))
-        kind, table, cols, inner = self._lod_core()
+        kind, table, cols, inner, xgrain = self._lod_core()
+        if xgrain is not None:
+            # Deferred cross-table FIXED LOD (column mode): broadcast the inner aggregate over the fact,
+            # grouped so each fact row sees the value for ITS own grain tuple. Capture the current row's
+            # grain into VARs, then FILTER(ALL(fact)) down to the rows sharing that tuple and aggregate.
+            # A "related" grain hops to a parent table via RELATED; a "local" grain reads the fact column.
+            var_lines, conj = [], []
+            for i, (gk, gtable, gcol) in enumerate(xgrain, start=1):
+                expr = (f"RELATED({_dax_table(gtable)}{_dax_col(gcol)})" if gk == "related"
+                        else f"{_dax_table(table)}{_dax_col(gcol)}")
+                var_lines.append(f"VAR __g{i} = {expr}")
+                conj.append(f"{expr} = __g{i}")
+            body = f"CALCULATE({inner[0]}, FILTER(ALL({_dax_table(table)}), {' && '.join(conj)}))"
+            return (f"({' '.join(var_lines)} RETURN {body})", inner[1])
         if kind == "INCLUDE":
             # A bare INCLUDE has no enclosing aggregation to roll its added dimension back up to the
             # view grain, so its value is not determined by the .tds alone -> fall back.
@@ -2105,7 +2253,11 @@ class _Parser:
         #   the inner -- exactly "add d to the view grain, then roll up", which is INCLUDE.
         if outer_agg not in _AGG_X:
             raise _CalcError(f"{outer_agg} cannot re-aggregate a FIXED LOD")
-        kind, table, cols, inner = self._lod_core()
+        kind, table, cols, inner, xgrain = self._lod_core()
+        if xgrain is not None:
+            # A cross-table FIXED grain broadcast is already a per-fact-row scalar; re-aggregating it
+            # would need a SUMMARIZE over a synthetic cross-table grain we cannot prove faithful.
+            raise _CalcError("cross-table FIXED LOD cannot be re-aggregated")
         if kind == "EXCLUDE":
             # An EXCLUDE is already a view-relative value with no grain to iterate for a second
             # aggregation -> fall back rather than emit a window Tableau never computes.
@@ -2513,12 +2665,21 @@ def translate_tableau_calc_to_column_dax_typed(formula, resolver, known_tables=N
             return _c.get((cap or "").strip().lower())
 
         resolver = _augmented
+        # GAP #1: a cross-table FIXED-LOD grain dimension (e.g. [Contact ID]) resolves via the BASE
+        # resolver's fact-anchored disambiguation primitive (resolve_in_tables), so the column_refs
+        # wrapper must carry it forward or a keystone that supplies column_refs loses grain resolution
+        # and falls back. getattr -> None when the base resolver has none (fail-closed at every use).
+        _augmented.resolve_in_tables = getattr(_base_resolver, "resolve_in_tables", None)
     try:
         toks = _tokenize(f)
         if not toks:
             return None, "empty formula", tables_used, None
+        # GAP #2: the cross-table FIXED-LOD emit needs the model's table adjacency to walk M:1 grain
+        # paths (RELATED chains) and to compute which grain tables are reachable from the fact. Built
+        # once and threaded into BOTH the initial parse and the LOOKUPVALUE re-parse below.
+        adj = build_table_adjacency(relationships) if relationships else None
         dax, dtype = _Parser(toks, resolver, tables_used, mode="column",
-                             known_tables=known_tables).parse()
+                             known_tables=known_tables, related_tables=adj).parse()
         if len(tables_used) > 1:
             # Cross-table row-level calc. Try to materialize it as ONE calculated column on a single
             # home table by rewriting each foreign field as a LOOKUPVALUE (a faithful single-valued
@@ -2532,6 +2693,7 @@ def translate_tableau_calc_to_column_dax_typed(formula, resolver, known_tables=N
                 try:
                     dax2, dtype2 = _Parser(_tokenize(f), resolver, tables2, mode="column",
                                            known_tables=known_tables,
+                                           related_tables=adj,
                                            related_wrap=related_wrap).parse()
                 except _CalcError:
                     dax2 = None

@@ -2351,4 +2351,183 @@ def test_cross_table_lookupvalue_typed_entry_point_threads_relationships():
     assert dax.startswith("COALESCE(DATEDIFF(LOOKUPVALUE('caseman__Intake__c'")
 
 
+# =====================================================================================================
+# Cross-table FIXED-LOD grouping in COLUMN mode -- the "bare row-level FIXED LOD" killer.
+# A row-level FIXED LOD whose grain dimensions live on RELATED parent tables, e.g.
+# ``{FIXED [Contact ID],[Program Name]: MIN([Total Score])}`` where the fact is
+# ``caseman__Assessment__c`` and both grain dims resolve onto many-to-one PARENT tables reachable by a
+# unique child->parent FK->PK path -- now translates as a VAR-captured RELATED grouping: capture each
+# row's related grain value, then aggregate over the fact rows that share those values. Grounded in the
+# real Salesforce Nonprofit Case Management workbook (Assessments datasource: 6 bare-row-level stubs all
+# descend from this one LOD root). Cross-table FIXED is deferred+emitted only inside the column-entry
+# context; TRUE measure mode stays a fail-closed stub.
+# =====================================================================================================
+_XLOD_ASSESS_FIELDS = {
+    "Total Score": ("caseman__Assessment__c", "Total Score", "double"),
+    "Program Name": ("pmdm__Program__c", "Name", "string"),
+    # [Contact ID] is deliberately ABSENT -- ambiguous across Contact/Contact1 so the base resolver
+    # returns None; the fact-anchored resolve_in_tables recovers Contact.Id only when 'Contact' is
+    # reachable from the fact (mirrors connection_to_m.resolve_field.resolve_in_tables).
+}
+
+
+def _xlod_assess_resolver(caption):
+    return _XLOD_ASSESS_FIELDS.get(caption)
+
+
+_xlod_assess_resolver.resolve_in_tables = (
+    lambda caption, table_set: ("Contact", "Id", "string")
+    if caption == "Contact ID" and "Contact" in set(table_set)
+    else None
+)
+
+# All child -> parent (FK -> PK), many_to_one -- the real Assessments relationship edges.
+_XLOD_ASSESS_RELS = [
+    {"from_table": "caseman__Assessment__c", "from_col": "caseman__Client__c",
+     "to_table": "Contact", "to_col": "Id", "cardinality": "many_to_one"},
+    {"from_table": "caseman__Assessment__c", "from_col": "caseman__ProgramEngagement__c",
+     "to_table": "pmdm__ProgramEngagement__c", "to_col": "Id", "cardinality": "many_to_one"},
+    {"from_table": "pmdm__ProgramEngagement__c", "from_col": "pmdm__Program__c",
+     "to_table": "pmdm__Program__c", "to_col": "Id", "cardinality": "many_to_one"},
+]
+_XLOD_ASSESS_TABLES = {
+    "caseman__Assessment__c", "Contact", "pmdm__ProgramEngagement__c", "pmdm__Program__c",
+}
+_XLOD_KEYSTONE_MIN = (
+    "(VAR __g1 = RELATED('Contact'[Id]) "
+    "VAR __g2 = RELATED('pmdm__Program__c'[Name]) "
+    "RETURN CALCULATE(MIN('caseman__Assessment__c'[Total Score]), "
+    "FILTER(ALL('caseman__Assessment__c'), "
+    "RELATED('Contact'[Id]) = __g1 && RELATED('pmdm__Program__c'[Name]) = __g2)))"
+)
+
+
+def test_cross_table_fixed_lod_min_grouping_column_mode():
+    dax, reason, tables = translate_tableau_calc_to_column_dax(
+        "{FIXED [Contact ID],[Program Name]: MIN([Total Score])}",
+        _xlod_assess_resolver, known_tables=_XLOD_ASSESS_TABLES,
+        relationships=_XLOD_ASSESS_RELS)
+    assert reason == "ok"
+    # The deferred grain dims never enter tables_used (their RELATED refs live only in the emit);
+    # the calc collapses to the fact, so it lands as ONE calculated column on the fact table.
+    assert tables == {"caseman__Assessment__c"}
+    assert dax == _XLOD_KEYSTONE_MIN
+    assert not validate_dax(dax)
+
+
+def test_cross_table_fixed_lod_avg_grouping_column_mode():
+    dax, reason, tables = translate_tableau_calc_to_column_dax(
+        "{FIXED [Contact ID],[Program Name]: AVG([Total Score])}",
+        _xlod_assess_resolver, known_tables=_XLOD_ASSESS_TABLES,
+        relationships=_XLOD_ASSESS_RELS)
+    assert reason == "ok"
+    assert tables == {"caseman__Assessment__c"}
+    assert dax == _XLOD_KEYSTONE_MIN.replace(
+        "MIN('caseman__Assessment__c'[Total Score])",
+        "AVERAGE('caseman__Assessment__c'[Total Score])")
+    assert not validate_dax(dax)
+
+
+def test_cross_table_fixed_lod_gap1_wrapper_carries_resolve_in_tables():
+    # GAP #1 lock: when column_refs is supplied the typed translator wraps the base resolver in an
+    # _augmented closure; that wrapper MUST forward resolve_in_tables so a fact-anchored grain dim
+    # ([Contact ID], base-unresolved) still resolves through the reachable-table disambiguation.
+    # column_refs carries an unrelated sibling purely to exercise the wrapper path.
+    dax, reason, tables, dtype = translate_tableau_calc_to_column_dax_typed(
+        "{FIXED [Contact ID],[Program Name]: MIN([Total Score])}",
+        _xlod_assess_resolver, known_tables=_XLOD_ASSESS_TABLES,
+        relationships=_XLOD_ASSESS_RELS,
+        column_refs={"Some Sibling": ("caseman__Assessment__c", "Some Sibling", "double")})
+    assert reason == "ok"
+    assert tables == {"caseman__Assessment__c"}
+    assert dtype == "number"
+    assert dax == _XLOD_KEYSTONE_MIN
+    assert not validate_dax(dax)
+
+
+def test_cross_table_fixed_lod_measure_mode_stays_stub():
+    # In TRUE measure mode (viz filter context) the row-context RELATED grouping is NOT faithful and
+    # must NOT emit -- the calc stays an honest stub. Locks that the cross-table deferral+emit are gated
+    # on the column-entry context flag, not on self.mode (the {-branch temporarily flips mode to
+    # "measure" while parsing the inner aggregate).
+    dax, reason, _tables = translate_tableau_calc_to_dax(
+        "{FIXED [Contact ID],[Program Name]: MIN([Total Score])}",
+        _xlod_assess_resolver, known_tables=_XLOD_ASSESS_TABLES,
+        related_tables=build_table_adjacency(_XLOD_ASSESS_RELS))
+    assert dax is None
+
+
+# --- Conditional-wrapped cross-table FIXED LOD (THE Assessments keystone) --------------------------
+# The real `Total Score First/Last Assessment` calcs wrap the bare cross-table FIXED LOD in an OUTER
+# conditional that references the SAME fact (Assessment):
+#   IF [Max Assessment Date per Contact] = [Assessment Completed Date] THEN
+#      {FIXED [Contact ID],[Program Name]:
+#         MIN(IF [Max Assessment Date per Contact] = [Assessment Completed Date] THEN [Total Score] END)}
+#   END
+# The outer IF pre-populated tables_used with the fact BEFORE the inner-aggregate fact-table snapshot,
+# so ``inner_tables = tables_used - before`` came back EMPTY and the single-table guard stubbed it -- the
+# exact defect behind 2 of the 6 Assessments bare-row-level stubs. The empty-subtraction fallback now
+# recovers the single fact (and still fails closed when the outer/inner span two tables).
+_XLOD_KEYSTONE_FIELDS = {
+    "Total Score": ("caseman__Assessment__c", "Total Score", "double"),
+    "Program Name": ("pmdm__Program__c", "Name", "string"),
+    "Assessment Completed Date": ("caseman__Assessment__c", "Assessment Completed Date", "dateTime"),
+    "Contact Name": ("Contact", "Contact Name", "string"),
+    "Assessment Region": ("caseman__Assessment__c", "Assessment Region", "string"),
+    # [Contact ID] resolved via resolve_in_tables (fact-anchored), exactly like _XLOD_ASSESS.
+}
+
+
+def _xlod_keystone_resolver(caption):
+    return _XLOD_KEYSTONE_FIELDS.get(caption)
+
+
+_xlod_keystone_resolver.resolve_in_tables = _xlod_assess_resolver.resolve_in_tables
+
+_XLOD_KEYSTONE_COND = (
+    "'caseman__Assessment__c'[Max Assessment Date per Contact] = "
+    "'caseman__Assessment__c'[Assessment Completed Date]"
+)
+_XLOD_KEYSTONE_CONDITIONAL_DAX = (
+    "IF(" + _XLOD_KEYSTONE_COND + ", "
+    "(VAR __g1 = RELATED('Contact'[Id]) "
+    "VAR __g2 = RELATED('pmdm__Program__c'[Name]) "
+    "RETURN CALCULATE(MINX('caseman__Assessment__c', "
+    "IF(" + _XLOD_KEYSTONE_COND + ", 'caseman__Assessment__c'[Total Score])), "
+    "FILTER(ALL('caseman__Assessment__c'), "
+    "RELATED('Contact'[Id]) = __g1 && RELATED('pmdm__Program__c'[Name]) = __g2))))"
+)
+
+
+def test_cross_table_fixed_lod_conditional_wrapped_keystone_column_mode():
+    # The keystone that stubs `Total Score First/Last Assessment`: outer IF over the SAME fact wrapping
+    # the cross-table FIXED LOD, inner aggregate also conditional. Emits faithfully after the fix.
+    dax, reason, tables, dtype = translate_tableau_calc_to_column_dax_typed(
+        "IF [Max Assessment Date per Contact] = [Assessment Completed Date] THEN "
+        "{FIXED [Contact ID],[Program Name]: MIN(IF [Max Assessment Date per Contact] = "
+        "[Assessment Completed Date] THEN [Total Score] END)} END",
+        _xlod_keystone_resolver, known_tables=_XLOD_ASSESS_TABLES,
+        relationships=_XLOD_ASSESS_RELS,
+        column_refs={"Max Assessment Date per Contact":
+                     ("caseman__Assessment__c", "Max Assessment Date per Contact", "dateTime")})
+    assert reason == "ok"
+    assert tables == {"caseman__Assessment__c"}
+    assert dtype == "number"
+    assert dax == _XLOD_KEYSTONE_CONDITIONAL_DAX
+    assert not validate_dax(dax)
+
+
+def test_cross_table_fixed_lod_conditional_outer_spans_two_tables_stays_stub():
+    # Fail-closed: when the OUTER conditional references a DIFFERENT table (Contact) than the inner
+    # aggregate's fact (Assessment), the empty-subtraction fallback unions to TWO tables, so the
+    # single-fact guard must STILL fire -- we never emit a genuinely cross-table inner as single-fact.
+    dax, reason, _tables, _dtype = translate_tableau_calc_to_column_dax_typed(
+        "IF [Contact Name] = [Assessment Region] THEN "
+        "{FIXED [Contact ID],[Program Name]: MIN([Total Score])} END",
+        _xlod_keystone_resolver, known_tables=_XLOD_ASSESS_TABLES,
+        relationships=_XLOD_ASSESS_RELS)
+    assert dax is None
+    assert reason == "cross-table FIXED LOD requires a single-table inner aggregate"
+
+
 

@@ -13,7 +13,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration (skill `1.47.0` → `1.48.0`): Translate `MAX([bool])` / `MIN([bool])` in measure mode so
+- **tableau-migration (skill `1.48.0` → `1.49.0`): Translate the cross-table FIXED-LOD keystone wrapped in an
+  outer conditional in column mode, so the Assessments `Total Score First/Last Assessment` calcs stop shipping
+  as bare-row-level stubs — cascade-unblocking their dependent tower. Additive and fail-closed — byte-identical
+  unless a column-mode FIXED LOD whose inner aggregate reuses a fact already scoped by the outer conditional is
+  translated.** For a shape like `IF [factcol] = [factcol] THEN {FIXED xgrain : MIN(IF … THEN [factnum] END)} END`,
+  the cross-table FIXED-LOD column-mode path in `calc_to_dax.py` `_lod_core` derived the inner aggregate's fact
+  from `inner_tables = self.tables_used - before`, where `before` is snapshotted after the outer conditional
+  parses. Because the outer `IF` already references the same fact, the inner aggregate added no new table, the
+  subtraction came back empty, and the `len(inner_tables) != 1` guard fired → the whole calc stubbed. The path
+  now falls back to the full deferred-grain scoped set (`frozenset(self.tables_used)`) when the subtraction is
+  empty — which, under `defer_xgrain`, is exactly `{outer-conditional fact} ∪ {inner fact}`; size 1 means outer
+  and inner share one fact (safe), and size > 1 still fails closed. Live-verified on the real
+  `Salesforce_Nonprofit_Case_Management.twbx`: bare-row-level stubs dropped 12 → 10 (Assessments 6 → 4), the two
+  keystones emit faithful `RELATED(...) + FILTER(ALL(...))` DAX as calc columns, `Up or Down Assessment Score`
+  cascaded to translated, and Service Delivery / Intake / Client-Enrollment counts are byte-identical (0
+  regressions). Column-mode-scoped; the bare no-outer-conditional path is unchanged.
+
   a boolean-aggregating root calc stops shipping as a bare-row-level stub — cascade-unblocking its whole
   dependent tower. Additive and fail-closed — byte-identical unless a measure aggregates a boolean column.**
   Tableau `MAX(bool)` is OR-aggregation (TRUE iff any row is TRUE) and `MIN(bool)` is AND (TRUE iff all rows

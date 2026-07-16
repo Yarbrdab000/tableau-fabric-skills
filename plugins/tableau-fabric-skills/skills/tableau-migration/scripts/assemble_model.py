@@ -1719,7 +1719,7 @@ def _related_date_dax(date_table, column):
 _DTYPE_TO_TMDL = {"text": "string", "number": "decimal", "date": "dateTime", "bool": "boolean"}
 
 
-def _build_column_refs(calcs, rc, known_tables, *, consumed_lower=None):
+def _build_column_refs(calcs, rc, known_tables, *, consumed_lower=None, relationships=None):
     """Fix-point map ``{ref_key: (home_table, caption, tmdl_type)}`` of the deterministically
     translatable, single-home, typed calc COLUMNS among ``calcs``.
 
@@ -1753,7 +1753,7 @@ def _build_column_refs(calcs, rc, known_tables, *, consumed_lower=None):
             cname = calc["name"]
             cdax, _cr, ctabs, cdt = translate_tableau_calc_to_column_dax_typed(
                 calc.get("formula", ""), rc(calc), known_tables=known_tables,
-                column_refs=column_refs)
+                column_refs=column_refs, relationships=relationships)
             if cdax and len(ctabs) == 1 and cdt:
                 entry = (next(iter(ctabs)), cname, _DTYPE_TO_TMDL.get(cdt, "string"))
                 column_refs[cname.strip().lower()] = entry
@@ -1883,7 +1883,8 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
     # the deterministically-translatable dim calcs to a fix-point. Factored into the shared
     # ``_build_column_refs`` so the row-level reroute pre-router uses the EXACT same semantics. Empty
     # when no calc references a sibling -> the main loop is byte-identical to the prior single pass.
-    column_refs = _build_column_refs(dim_calcs, _arc, known_tables, consumed_lower=consumed_lower)
+    column_refs = _build_column_refs(dim_calcs, _arc, known_tables, consumed_lower=consumed_lower,
+                                     relationships=relationships)
     for calc in dim_calcs or []:
         name, formula = calc["name"], calc.get("formula", "")
         if name.lower() in consumed_lower:
@@ -3436,7 +3437,7 @@ def _reroute_row_level_measure_calcs(measure_calcs, dim_calcs, resolve, *, known
         # Rebuild the sibling map over the CURRENT dim calcs each round: a calc moved in an earlier
         # round becomes a resolvable reference target for a later one (the fix-point that unlocks a
         # difference-of-calcs cascade). Shares ``_build_column_refs`` with ``_calc_columns_part``.
-        col_refs = _build_column_refs(cur_dims, _arc, kt)
+        col_refs = _build_column_refs(cur_dims, _arc, kt, relationships=relationships)
         still = []
         for c in keep:
             name = c.get("name") or ""
