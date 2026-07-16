@@ -881,6 +881,56 @@ def _logical_fields(datasource):
             "model_col": clean_col(physical_col),
             "tmdl_type": tmdl_type,
         })
+
+    # Harvest unambiguous <cols><map> pins that have NO <column> declaration for the emit loop to
+    # bind. A Salesforce workbook can pin a caption to exactly one physical column without declaring
+    # a matching <column caption=.. name=..>, so the pin is dropped above and the caption stubs at
+    # resolve-time (metadata `cap_to` alone can't rescue it when the caption case-folds to two
+    # physical tables). We add the pin ONLY when it is provably safe -- four fail-closed gates:
+    #   1. exactly one physical target (never guess an ambiguous pin);
+    #   2. no <column name='[key]'> already declares it (gate 1) and it does not shadow a caption/id
+    #      a declared/emitted entry already resolves (gate 2 -- fail closed against ambiguation);
+    #   3. it is a user caption, not an internal/synthetic token (Calculation_*/Parameter*/scoped);
+    #   4. no case-insensitive collision against ANOTHER harvest candidate (emit neither if so).
+    # The entry's `tmdl_type` is cosmetic -- build_m_field_resolver derives the real type from the
+    # emitted relation column via `_phys_target`, so the "string" placeholder is never surfaced. The
+    # logical layer is consulted only when metadata resolution misses/is ambiguous, so this can only
+    # ADD a resolution, never override a working one.
+    declared_ids = set()
+    for col in _children_local(datasource, "column"):
+        cid = _strip_brackets((col.get("name") or "").strip())
+        if cid:
+            declared_ids.add(cid)
+    declared_resolver_keys = set()
+    for e in out:
+        declared_resolver_keys.add(e["caption"].strip().lower())
+        declared_resolver_keys.add(e["logical_id"].strip().lower())
+    harvest_candidates = []  # (key, table, physical_col)
+    for key, phys in logical_to_physical.items():
+        if len(phys) != 1:
+            continue  # gate 1: ambiguous pin -> never guess
+        if key in declared_ids:
+            continue  # a <column name='[key]'> already handles it
+        if key.strip().lower() in declared_resolver_keys:
+            continue  # gate 2: would shadow/ambiguate a working caption/id
+        if (":" in key) or key.startswith("Calculation_") or key.startswith("Parameter"):
+            continue  # gate 3: internal/synthetic token, not a user caption
+        table, physical_col = next(iter(phys))
+        harvest_candidates.append((key, table, physical_col))
+    _low_counts = {}
+    for key, _t, _c in harvest_candidates:
+        _low_counts[key.strip().lower()] = _low_counts.get(key.strip().lower(), 0) + 1
+    for key, table, physical_col in harvest_candidates:
+        if _low_counts[key.strip().lower()] != 1:
+            continue  # gate 4: harvest-vs-harvest case-insensitive collision -> emit NEITHER
+        out.append({
+            "caption": key,
+            "logical_id": key,
+            "table": table,
+            "physical_col": physical_col,
+            "model_col": clean_col(physical_col),
+            "tmdl_type": "string",  # cosmetic: resolver derives the real type from _phys_target
+        })
     return out
 
 
