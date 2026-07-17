@@ -301,6 +301,88 @@ def test_extract_calculations_include_dimensions_surfaces_dim_calcs():
     assert extract_calculations("<broken", include_dimensions=True) == ([], [], [])
 
 
+# -- Fix 2: read the built model's TMDL back into the report's column_binding manifest ----------
+def test_parse_tmdl_columns_flags_only_tableau_calc_dimensions():
+    # The subtle discrimination Fix 2 depends on: a DAX calc column is a Tableau calc dimension ONLY
+    # when it ALSO carries ``annotation TableauFormula`` -- so a model-generated calendar column
+    # (``Year = YEAR(...)``, no such annotation) and a raw ``sourceColumn`` passthrough are NOT calc.
+    part = (
+        "table Sheet1\n"
+        "    column Director\n"
+        "        dataType: string\n"
+        "        sourceColumn: Director\n"
+        "\n"
+        "    column Cohort = IF([Sales] > 100, \"Hi\", \"Lo\")\n"
+        "        dataType: string\n"
+        "        annotation TableauFormula = IF [Sales] > 100 THEN \"Hi\" ELSE \"Lo\" END\n"
+        "\n"
+        "    column Year = YEAR([Order Date])\n"
+        "        dataType: int64\n"
+    )
+    table, cols = me._parse_tmdl_columns(part)
+    assert table == "Sheet1"
+    flags = dict(cols)
+    assert flags["Director"] is False          # raw passthrough
+    assert flags["Cohort"] is True             # Tableau calc dimension (TableauFormula-stamped)
+    assert flags["Year"] is False              # model calendar calc column (no TableauFormula)
+    # a part that declares no table (relationships / model / culture) yields ("", [])
+    assert me._parse_tmdl_columns("relationship abc\n    fromColumn: Sheet1.Region\n") == ("", [])
+
+
+def test_column_binding_from_model_shapes_unique_calc_dims_and_drops_ambiguous():
+    # Shape the manifest twb_to_pbir consumes: a visible field-parameter picker (a ``= calculated``
+    # partition with a ``[Value...]`` sourceColumn -- the Choose Date shape) is a calc dimension in
+    # its OWN table; a raw column is excluded; a calc name in TWO tables is ambiguous -> dropped.
+    sheet1 = (
+        "table Sheet1\n"
+        "    column Director = IF([Sales] > 0, \"A\", \"B\")\n"
+        "        dataType: string\n"
+        "        annotation TableauFormula = IF [Sales] > 0 THEN 'A' ELSE 'B' END\n"
+        "\n"
+        "    column Region\n"
+        "        dataType: string\n"
+        "        sourceColumn: Region\n"
+        "\n"
+        "    column Dup = IF(TRUE, 1, 0)\n"
+        "        dataType: int64\n"
+        "        annotation TableauFormula = 1\n"
+    )
+    choose_date = (
+        "table 'Choose Date'\n"
+        "    column 'Choose Date'\n"
+        "        dataType: string\n"
+        "        sourceColumn: [Value1]\n"
+        "\n"
+        "    partition 'Choose Date' = calculated\n"
+        "        source = {(\"Completed Date\", NAMEOF('Sheet1'[Completed Date]), 0)}\n"
+    )
+    other = (
+        "table Other\n"
+        "    column Dup = IF(TRUE, 1, 0)\n"
+        "        dataType: int64\n"
+        "        annotation TableauFormula = 1\n"
+    )
+    parts = {
+        "definition/tables/Sheet1.tmdl": sheet1,
+        "definition/tables/Choose Date.tmdl": choose_date,
+        "definition/tables/Other.tmdl": other,
+        "definition/relationships.tmdl": "relationship r1\n    fromColumn: Sheet1.Region\n",
+    }
+    cb = me._column_binding_from_model(parts)
+    cols = cb["columns"]
+    # unique Tableau calc dimension -> bound to its real (table, column)
+    assert cols["director"] == {"table": "Sheet1", "column": "Director"}
+    # the field-parameter picker lands in its OWN calculated table (the Choose Date fix)
+    assert cols["choose date"] == {"table": "Choose Date", "column": "Choose Date"}
+    # a raw passthrough column is not a calc dimension -> absent
+    assert "region" not in cols
+    # 'Dup' materialised in TWO tables is ambiguous -> dropped (warn-never-wrong, caption fallback wins)
+    assert "dup" not in cols
+    # a model that materialised no calc dimension returns None (report keeps its standing resolution)
+    assert me._column_binding_from_model(
+        {"definition/tables/Plain.tmdl": "table Plain\n    column A\n        sourceColumn: A\n"}) is None
+
+
 def test_extract_calculations_dedupes_and_tolerates_bom_and_garbage():
     dup = ("\ufeff<datasource>"
            "<column caption='M' role='measure'><calculation formula='SUM([X])'/></column>"
@@ -1939,7 +2021,7 @@ def test_attach_workbook_pbip_refreshes_fidelity_from_rebound_run(tmp_path, monk
     monkeypatch.setattr(me, "write_local_pbip", lambda *a, **kw: None)
 
     def bound_viz(xml, name, date_binding=None, measure_binding=None, row_count_binding=None,
-                  param_binding=None, model_table=None, field_map=None):
+                  param_binding=None, model_table=None, field_map=None, column_binding=None):
         # the row count is bound now -> the rebound report carries no implicit-row-count warning.
         assert row_count_binding  # the model-derived binding reached the single re-run
         return {"parts": {"definition.pbir": pbir},

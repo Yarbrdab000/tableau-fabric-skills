@@ -1184,6 +1184,28 @@ def test_apply_override_explicit_field_map_binding_wins():
     assert binding == "column"
 
 
+def test_apply_override_column_rebound_survives_model_table_clobber():
+    # THE Choose-Date regression: a calc DIMENSION the model materialised into its OWN table (a
+    # field-parameter axis lands in 'Choose Date'[Choose Date]) is stamped ``column_rebound`` by
+    # ``_resolve_field``. The ``model_table`` fallback must NOT re-pin it onto the sheet's fact and
+    # dangle Sheet1[Choose Date] -- the stamp makes the manifest binding authoritative.
+    fld = _ir_field("Choose Date", "column", entity="Choose Date")
+    fld["column_rebound"] = True
+    entity, prop, binding = _apply_override(fld, "Sheet1", {})
+    assert (entity, prop, binding) == ("Choose Date", "Choose Date", "column")
+    # even a field_map entry for the caption cannot pull it back (guard returns before field_map)
+    fm = {"Choose Date": {"entity": "Sheet1", "property": "Choose Date"}}
+    assert _apply_override(fld, "Sheet1", fm) == ("Choose Date", "Choose Date", "column")
+
+
+def test_apply_override_unstamped_column_still_takes_model_table_fallback():
+    # zero-regression companion: an ordinary column pill NOT stamped ``column_rebound`` still takes
+    # the ``model_table`` fallback (entity corrected to the sheet's model table) exactly as before,
+    # so the fail-closed stamp changes nothing for a field with no manifest hit.
+    fld = _ir_field("Widget", "column", entity="sqlproxy")
+    assert _apply_override(fld, "Sheet1", {}) == ("Sheet1", "Widget", "column")
+
+
 def test_caption_fallback_warning_cleared_when_field_map_confirms_binding():
     # workbook WITHOUT a <datasources> metadata tree -> Sales + Category fall back to caption
     wb = ("<?xml version='1.0' encoding='utf-8' ?>\n<workbook><worksheets>"
@@ -1203,6 +1225,78 @@ def test_caption_fallback_warning_cleared_when_field_map_confirms_binding():
     # the emitted Sales projection is bound to the model table the field_map named
     blob = "\n".join(res["parts"].values())
     assert '"Entity": "Orders"' in blob and '"Property": "Sales"' in blob
+
+
+# -- calc-dimension crosstab: stays a matrix, binds to the model column (Fix 1 + column_binding) --
+# Two calculated fields used as discrete DIMENSIONS on both axes of a Text crosstab. Before the fix
+# every calc pill was forced into the measure well, so ``_visual_type`` saw zero dimensions and
+# collapsed the crosstab into a single ``card`` (axes dropped). Now a calc dimension binds to its
+# real model column and lands in the category well, so the crosstab rebuilds as a matrix.
+_CALC_DIM_COHORT = (
+    "<column caption='Cohort' datatype='string' name='[Calculation_CO]' role='dimension' type='nominal'>"
+    "<calculation class='tableau' formula='IF [Sales] &gt; 100 THEN &quot;Hi&quot; ELSE &quot;Lo&quot; END' />"
+    "</column>"
+    "<column-instance column='[Calculation_CO]' derivation='None' name='[none:Calculation_CO:nk]' pivot='key' type='nominal' />"
+)
+_CALC_DIM_SEGMENT = (
+    "<column caption='Segment' datatype='string' name='[Calculation_SG]' role='dimension' type='nominal'>"
+    "<calculation class='tableau' formula='IF [Profit] &gt; 0 THEN &quot;Win&quot; ELSE &quot;Loss&quot; END' />"
+    "</column>"
+    "<column-instance column='[Calculation_SG]' derivation='None' name='[none:Calculation_SG:nk]' pivot='key' type='nominal' />"
+)
+
+
+def _calc_dim_crosstab_workbook():
+    enc = "<encodings><text column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    ws = _worksheet("Cross", "Text",
+                    rows="[federated.abc].[none:Calculation_CO:nk]",
+                    cols="[federated.abc].[none:Calculation_SG:nk]",
+                    deps_extra=_INST + _CALC_DIM_COHORT + _CALC_DIM_SEGMENT, encodings=enc)
+    return _workbook(ws)
+
+
+def _matrix_state(res):
+    vparts = {k: json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")}
+    return list(vparts.values())[0]["visual"]["query"]["queryState"]
+
+
+def test_calc_dimension_crosstab_binds_to_model_columns_and_survives_model_table():
+    # WITH the model-confirmed manifest each calc dim binds to its OWN model table+column; passing a
+    # distinct fact ``model_table`` proves the ``column_rebound`` stamp protects the binding from the
+    # clobber end-to-end (Cohort stays DimCohort[Cohort], never Sheet1[Cohort]).
+    wb = _calc_dim_crosstab_workbook()
+    cb = {"columns": {
+        "Cohort": {"table": "DimCohort", "column": "Cohort"},
+        "Segment": {"table": "DimSegment", "column": "Segment"},
+    }}
+    res = migrate_twb_to_pbir(wb, dataset_name="Superstore", model_table="Sheet1", column_binding=cb)
+    assert res["ir"]["worksheets"][0]["visual_type"] == "matrix"
+    state = _matrix_state(res)
+    assert set(state) == {"Rows", "Columns", "Values"}
+    rows_field = state["Rows"]["projections"][0]["field"]["Column"]
+    cols_field = state["Columns"]["projections"][0]["field"]["Column"]
+    assert rows_field["Property"] == "Cohort"
+    assert rows_field["Expression"]["SourceRef"]["Entity"] == "DimCohort"
+    assert cols_field["Property"] == "Segment"
+    assert cols_field["Expression"]["SourceRef"]["Entity"] == "DimSegment"
+    # the SUM(Sales) pill is the matrix value (aggregation over the fact) -- the calc dims are the
+    # axes, so nothing collapsed into the value well and neither dim was clobbered onto the fact
+    val_field = state["Values"]["projections"][0]["field"]
+    assert val_field["Aggregation"]["Expression"]["Column"]["Property"] == "Sales_Amount"
+
+
+def test_calc_dimension_crosstab_stays_matrix_without_column_binding():
+    # Fix 1 is robust WITHOUT the manifest: a calc dimension still resolves as a category (caption
+    # fallback + warning), so the crosstab is a matrix -- never a card -- even when no column_binding
+    # is supplied. Binding to the real column is the manifest's job; keeping the axes is the fix's.
+    wb = _calc_dim_crosstab_workbook()
+    res = migrate_twb_to_pbir(wb, dataset_name="Superstore")
+    assert res["ir"]["worksheets"][0]["visual_type"] == "matrix"
+    state = _matrix_state(res)
+    assert set(state) == {"Rows", "Columns", "Values"}
+    # the axes carry the calc dimensions (as categories), not a single collapsed value well
+    assert state["Rows"]["projections"][0]["field"]["Column"]["Property"] == "Cohort"
+    assert state["Columns"]["projections"][0]["field"]["Column"]["Property"] == "Segment"
 
 
 # -- PBIR report structure -----------------------------------------------------

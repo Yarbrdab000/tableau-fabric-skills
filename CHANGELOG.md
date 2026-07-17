@@ -13,7 +13,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration (skill `1.51.0` → `1.52.0`): Rebuild a Tableau dashboard's whole filter band as
+- **tableau-migration (skill `1.52.0` → `1.53.0`): Rebuild a Tableau crosstab whose Rows/Columns are
+  calculated-field *dimensions* as a real Power BI matrix bound to model columns — instead of collapsing it
+  to a single card and dropping the axes — and keep a field-parameter axis (a Tableau field-swap like
+  `Choose Date`) bound to its own picker table instead of dangling on the fact. Additive and fail-closed —
+  byte-identical on any workbook without calc-dimension axes.** Verified against the real
+  `ATTI/ATTR Hierarchy` workbook:
+  - **Calc-dimension crosstab stays a matrix.** `twb_to_pbir._resolve_field` now detects a calculated field
+    used as a discrete axis dimension (`calc_is_axis`) and binds it to a real model column in the category
+    well, so `_visual_type` keeps both axes and emits a `matrix`. Previously every calc pill was forced into
+    the measure well, leaving zero dimensions and collapsing the crosstab into one `card` (axes dropped).
+  - **Field-parameter axis no longer clobbered.** A calc dimension the model materialised into its OWN table
+    (a field-parameter picker lands in e.g. `'Choose Date'[Choose Date]`) is stamped `column_rebound`, and
+    `_apply_override` now honours that stamp alongside `date_rebound`, so neither `field_map` nor the
+    `model_table` fallback can re-pin it onto the sheet's fact and produce a dangling `Sheet1[Choose Date]`.
+    Fail-closed: a calc with no model-confirmed binding is never stamped, so `_apply_override` is byte-for-byte
+    unchanged for every other field.
+  - **Model-confirmed column binding.** `migrate_estate` reads the built model's TMDL back
+    (`_parse_tmdl_columns` / `_column_binding_from_model`) into a `column_binding` manifest naming the real
+    `(table, column)` each Tableau calc dimension was materialised into — keyed on the `TableauFormula`
+    annotation to include real calc dimensions while excluding model calendar columns, and dropping any
+    ambiguous name (warn-never-wrong). Without a manifest hit the calc dimension still resolves as a category
+    via the caption fallback, never a measure. Locked by 6 new regression tests.
   faithful Power BI slicers — every filter card at its authored position and show mode, row-level dimension
   calcs kept as sliceable columns, and a discrete exact-date display format bound as an ordinary date.
   Additive and fail-closed — byte-identical on any surface without dashboard filter cards.** Three fixes to

@@ -556,8 +556,9 @@ def _viz_adapter(cand):
     supports_param = "param_binding" in params
     supports_model_table = "model_table" in params
     supports_field_map = "field_map" in params
+    supports_column = "column_binding" in params
     def _call(twb_text, name, date_binding=None, measure_binding=None, row_count_binding=None,
-              param_binding=None, model_table=None, field_map=None):
+              param_binding=None, model_table=None, field_map=None, column_binding=None):
         if name_kwargs:
             kwargs = {k: name for k in name_kwargs}
             if supports_date and date_binding is not None:
@@ -572,6 +573,8 @@ def _viz_adapter(cand):
                 kwargs["model_table"] = model_table
             if supports_field_map and field_map is not None:
                 kwargs["field_map"] = field_map
+            if supports_column and column_binding is not None:
+                kwargs["column_binding"] = column_binding
             return cand(twb_text, **kwargs)
         return cand(twb_text, name)
     return _call
@@ -1230,6 +1233,82 @@ def _measure_binding_from_model(res_report):
             if key:
                 entries.setdefault(key, entry)
     return {"measures": entries} if entries else None
+
+
+def _parse_tmdl_columns(content):
+    """Parse a TMDL table part into ``(table_name, [(column_name, is_calc), ...])``.
+
+    ``is_calc`` marks a column materialised from a Tableau CALCULATED FIELD (a dimension calc), as
+    opposed to a raw ``sourceColumn`` passthrough or a model-generated calendar column. Two shapes
+    qualify (mirroring how the datasource build emits calc columns):
+      * a DAX calculated column (``column X = <expr>``) that ALSO carries an
+        ``annotation TableauFormula`` -- the stamp the build puts on every translated Tableau calc.
+        Requiring that annotation EXCLUDES model-generated Date/calendar calc columns (``Year =
+        YEAR(...)`` etc., which carry no TableauFormula) while INCLUDING real Tableau calc dimensions.
+      * a VISIBLE field-parameter / picker column in a ``= calculated`` partition whose
+        ``sourceColumn`` is a ``[Value...]`` slot (e.g. a ``Choose Date`` date picker); its hidden
+        helper columns (Fields/Order) are excluded by the ``not hidden`` guard.
+    Returns ``("", [])`` for a part that declares no table (relationships/model/expressions/culture).
+    Pure text parse; never raises.
+    """
+    if not isinstance(content, str) or not content:
+        return "", []
+    tm = re.search(r"(?m)^[^\S\n]*table[^\S\n]+(?:'([^']+)'|(\S+))", content)
+    table = (tm.group(1) or tm.group(2)) if tm else ""
+    if not table:
+        return "", []
+    calc_partition = bool(re.search(r"(?m)^[^\S\n]*partition\b.*=[^\S\n]*calculated\b", content))
+    col_re = re.compile(r"(?m)^[^\S\n]*column[^\S\n]+(?:'([^']+)'|([^\s=]+))([^\S\n]*=)?")
+    matches = list(col_re.finditer(content))
+    cols = []
+    for i, mm in enumerate(matches):
+        cname = mm.group(1) or mm.group(2)
+        has_expr = bool(mm.group(3))
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+        block = content[mm.start():end]
+        hidden = bool(re.search(r"(?m)^[^\S\n]*isHidden\b", block))
+        tabformula = "annotation TableauFormula" in block
+        value_src = bool(re.search(r"(?m)^[^\S\n]*sourceColumn:[^\S\n]*\[?Value", block))
+        is_calc = (has_expr and tabformula) or (calc_partition and value_src and not hidden)
+        if cname:
+            cols.append((cname, is_calc))
+    return table, cols
+
+
+def _column_binding_from_model(model_parts):
+    """Derive the report binder's ``column_binding`` from the BUILT model's TMDL parts.
+
+    Pure CONSUMER of the model the datasource build just emitted (``res["parts"]``): it reads every
+    table part, finds the columns materialised from Tableau CALCULATED FIELDS that are DIMENSIONS
+    (see :func:`_parse_tmdl_columns`), and shapes them into the ``{"columns": {name_lower: {"table",
+    "column"}}}`` manifest ``twb_to_pbir._lookup_column_binding`` reads. So a calc DIMENSION pill on
+    a crosstab axis binds to the REAL model table+column (e.g. ``Sheet1[Director]``, ``'Choose
+    Date'[Choose Date]``) instead of the datasource-caption fallback -- which is what keeps a
+    calc-dimension crosstab a matrix bound to real fields, not an empty/mis-bound one.
+
+    A calc name that resolves to more than one ``(table, column)`` is AMBIGUOUS and skipped (warn-
+    never-wrong: better the caption fallback than a wrong-table bind). Returns ``None`` when the model
+    materialised no such calc column, so the report keeps its standing resolution (byte-unchanged).
+    """
+    if not isinstance(model_parts, dict) or not model_parts:
+        return None
+    targets = {}
+    for path, content in model_parts.items():
+        p = str(path).replace("\\", "/")
+        if not (isinstance(content, str) and p.endswith(".tmdl")):
+            continue
+        table, cols = _parse_tmdl_columns(content)
+        if not table:
+            continue
+        for cname, is_calc in cols:
+            if is_calc and cname:
+                targets.setdefault(cname.lower(), set()).add((table, cname))
+    columns = {}
+    for low, tset in targets.items():
+        if len(tset) == 1:
+            tbl, col = next(iter(tset))
+            columns[low] = {"table": tbl, "column": col}
+    return {"columns": columns} if columns else None
 
 
 def _row_count_binding_from_model(res_report):
@@ -2004,13 +2083,20 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
         param_binding["slicers"] = merged
         param_binding.setdefault("flags", {})
     field_model_table, field_map = _field_map_from_model(res_report)
+    # column_binding -- calc DIMENSION pills (a crosstab axis built from a Tableau calculated field)
+    # rebind to the REAL model table+column the datasource build emitted, so a calc-dimension crosstab
+    # stays a matrix bound to real fields (e.g. Sheet1[Director]) instead of the datasource-caption
+    # fallback that ships an empty/mis-bound visual. Read from the BUILT model parts (res["parts"]);
+    # None when the model materialised no such calc column (byte-unchanged standing resolution).
+    column_binding = _column_binding_from_model(res.get("parts"))
     if (date_binding or measure_binding or row_count_binding or param_binding
-            or field_map) and viz is not None:
+            or field_map or column_binding) and viz is not None:
         try:
             rebuilt = viz(twb_text, viz_name,
                           date_binding=date_binding, measure_binding=measure_binding,
                           row_count_binding=row_count_binding, param_binding=param_binding,
-                          model_table=field_model_table, field_map=field_map)
+                          model_table=field_model_table, field_map=field_map,
+                          column_binding=column_binding)
             if isinstance(rebuilt, dict) and rebuilt.get("parts"):
                 report_parts = _rebind_report_byPath(rebuilt["parts"], model_safe)
                 if date_binding:
@@ -2030,6 +2116,9 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                 if field_map:
                     entry["field_rebind"] = {
                         "count": len(field_map), "model_table": field_model_table}
+                if column_binding:
+                    entry["column_rebind"] = {
+                        "count": len((column_binding.get("columns") or {}))}
                 # The rebound report -- not the pre-rebind first pass -- is what lands in the
                 # openable .pbip, so refresh the per-worksheet fidelity + implicit-row-count tally
                 # from it. Now-bound row counts / measures / params clear their warnings here, so the
