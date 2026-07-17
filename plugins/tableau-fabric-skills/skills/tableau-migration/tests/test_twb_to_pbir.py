@@ -7,6 +7,7 @@ visual, and (c) that unsupported marks/derivations/filters degrade to ``warnings
 producing a wrong visual.
 """
 import json
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -25,18 +26,27 @@ from twb_to_pbir import (
     _drop_resolved_flag_warnings,
     _field_expression,
     _flag_filter_container,
+    _image_item_name,
+    _image_visual,
     _norm_param_key,
+    _position,
     _reconcile_caption_fallback,
     _resolve_parameter_controls,
+    _resolve_resource_bytes,
     _resolve_visual_flags,
+    _resource_basename,
     _tableau_filter_mode_to_pbi,
+    _text_object_textbox_visual,
     _visual_json,
+    _zone_background_fill2,
+    _zone_run_font,
     build_field_parameter_page,
     emit_pbir,
     field_parameter_slicer,
     field_parameter_table_visual,
     migrate_twb_to_pbir,
     parse_twb,
+    report_json_part,
     report_json_part_fp,
 )
 
@@ -1337,9 +1347,13 @@ def test_dashboard_zone_scales_within_page_bounds_and_one_page_per_dashboard():
     parts = emit_pbir(parse_twb(_workbook(ws, dash)))
     page_jsons = [k for k in parts if k.endswith("page.json")]
     assert len(page_jsons) == 1
+    # §13 geometry: the page adopts the dashboard's real <size> (1200x800), not the fixed
+    # 1280x720 default; the placed zone scales within those real page bounds.
+    page = json.loads(parts[page_jsons[0]])
+    assert (page["width"], page["height"]) == (1200, 800)
     pos = list(_visual_parts(parts).values())[0]["position"]
-    assert 0 <= pos["x"] and pos["x"] + pos["width"] <= PAGE_WIDTH
-    assert 0 <= pos["y"] and pos["y"] + pos["height"] <= PAGE_HEIGHT
+    assert 0 <= pos["x"] and pos["x"] + pos["width"] <= page["width"]
+    assert 0 <= pos["y"] and pos["y"] + pos["height"] <= page["height"]
 
 
 def test_orphan_worksheet_gets_its_own_page():
@@ -3085,11 +3099,22 @@ def _auto_size_value(vis):
             .get("expr", {}).get("Literal", {}).get("Value"))
 
 
+def _col_adjustment_value(vis):
+    """Pull columnHeaders[0].columnAdjustment's literal ("'growToFit'"/None) from a built visual."""
+    ch = (vis["visual"].get("objects") or {}).get("columnHeaders")
+    if not ch:
+        return None
+    return (ch[0].get("properties", {}).get("columnAdjustment", {})
+            .get("expr", {}).get("Literal", {}).get("Value"))
+
+
 def test_grid_visuals_default_to_grow_to_fit():
-    # Every rebuilt table (tableEx) and matrix (pivotTable) opens "Grow to fit": the columnHeaders
-    # object carries autoSizeColumnWidth=true so Power BI never falls back to fixed "Custom" widths.
+    # Every rebuilt table (tableEx) and matrix (pivotTable) opens "Grow to fit": columnAdjustment is
+    # the enum the modern "Auto-size behavior" dropdown reads (autoSizeColumnWidth alone resolves to
+    # "Fit to content"); the boolean rides along so Power BI never falls back to fixed "Custom" widths.
     for vtype in ("tableEx", "pivotTable"):
         vis = _visual_json("g", vtype, {"x": 0, "y": 0}, {"Values": {"projections": []}})
+        assert _col_adjustment_value(vis) == "'growToFit'"
         assert _auto_size_value(vis) == "true"
 
 
@@ -3103,10 +3128,11 @@ def test_grid_visuals_emit_no_custom_width_selectors():
 
 def test_non_grid_visuals_have_no_column_headers_object():
     # Grow-to-fit is a table/matrix-only control; a bar/line/pie/card/slicer stays byte-unchanged
-    # (no columnHeaders object at all).
+    # (no columnHeaders object at all) -- neither the columnAdjustment enum nor the boolean.
     for vtype in ("clusteredColumnChart", "lineChart", "pieChart", "card", "slicer"):
         vis = _visual_json("n", vtype, {"x": 0, "y": 0}, {"Category": {}})
         assert "columnHeaders" not in (vis["visual"].get("objects") or {})
+        assert _col_adjustment_value(vis) is None
         assert _auto_size_value(vis) is None
 
 
@@ -4091,6 +4117,16 @@ def _values_objects(visual_json):
     return visual_json["visual"].get("objects", {}).get("values")
 
 
+def _values_backcolor(visual_json):
+    # The conditional-format FILL only: a matrix/table now always carries an additive compact-grid
+    # font on ``values`` (documented 9pt), so presence of a ``values`` object no longer implies a
+    # fill. Assert on the ``backColor`` heat rule specifically.
+    vo = _values_objects(visual_json)
+    if not vo:
+        return None
+    return vo[0].get("properties", {}).get("backColor")
+
+
 def _fill_rule(values_objects):
     return (values_objects[0]["properties"]["backColor"]["solid"]["color"]
             ["expr"]["FillRule"])
@@ -4196,9 +4232,10 @@ def test_table_calc_colour_driver_defers_with_palette_preserved():
     res = migrate_twb_to_pbir(_workbook(
         _heat_ws("Heat", color_field="pcdf:Calculation_1:qk", encodings=enc, style=style,
                  deps_extra=_INST + calc_col + calc_inst)))
-    # no fill emitted on the visual
+    # no conditional-format fill emitted on the visual (the additive compact-grid font may ride
+    # ``values`` but no backColor heat rule)
     vj = list(_visual_parts(res["parts"]).values())[0]
-    assert _values_objects(vj) is None
+    assert _values_backcolor(vj) is None
     # candidate record keeps the palette + a deferred status
     fact = _cf_fact(res["candidate_records"], "Heat")
     assert fact["status"] == "deferred"
@@ -4221,13 +4258,13 @@ def test_emitted_conditional_format_fact_recorded_on_candidate_record():
 
 
 def test_matrix_without_colour_gradient_emits_no_conditional_format():
-    # Additivity: a plain highlight-table matrix (no <style> colour scale) carries neither a
-    # values object nor a conditional_format fact -- the report is byte-unchanged from before.
+    # Additivity: a plain highlight-table matrix (no <style> colour scale) carries no backColor
+    # conditional-format fill (only the additive compact-grid font) and no conditional_format fact.
     enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
     res = migrate_twb_to_pbir(_workbook(
         _heat_ws("Heat", color_field="sum:Sales:qk", encodings=enc, style="")))
     vj = list(_visual_parts(res["parts"]).values())[0]
-    assert _values_objects(vj) is None
+    assert _values_backcolor(vj) is None
     assert _cf_fact(res["candidate_records"], "Heat") is None
 
 
@@ -5106,7 +5143,7 @@ def test_measure_binding_non_bindable_status_still_defers():
                                         "measure": "Percent Difference", "status": status}}
         res = migrate_twb_to_pbir(_pcdf_heat_workbook(), measure_binding=mb)
         vj = list(_visual_parts(res["parts"]).values())[0]
-        assert _values_objects(vj) is None, f"{status} should not emit a fill"
+        assert _values_backcolor(vj) is None, f"{status} should not emit a fill"
         fact = _cf_fact(res["candidate_records"], "Heat")
         assert fact["status"] == "deferred"
         assert "quick table calc" in fact["reason"]
@@ -5495,3 +5532,439 @@ def test_exact_date_derivation_set_is_scoped_and_unknown_derivations_still_warn(
                     "[federated.abc].[xyz:Order Date:ok]", deps_extra=_INST + inst)
     ir = parse_twb(_workbook(ws))
     assert any("unsupported derivation" in w["reason"] for w in ir["warnings"])
+
+
+# == §13 geometry fidelity acceptance ==========================================
+# Per-dashboard page size (from <size maxwidth/maxheight>), dropdown-slicer height
+# floor, and the shown-state worksheet reflow. All fixtures are the same inline-XML
+# helpers the rest of the suite uses; assertions are hand-derived from _scale_zone
+# (sx=page_w/ref_w, sy=page_h/ref_h; the outer 100000x100000 zone is the ref frame).
+
+def _page_dims(parts):
+    """displayName -> (width, height) for every emitted page.json."""
+    out = {}
+    for k, v in parts.items():
+        if k.endswith("page.json"):
+            pj = json.loads(v)
+            out[pj["displayName"]] = (pj["width"], pj["height"])
+    return out
+
+
+def _content_visual(parts):
+    return [v for v in _visual_parts(parts).values()
+            if v["visual"]["visualType"] != "slicer"][0]
+
+
+def _one_card_dashboard(ws_name, token, card_h, card_y, mode=None):
+    """A single-worksheet, single-filter-card dashboard on a 1200x800 canvas.
+
+    The outer 100000x100000 zone is the scaling frame (sx=0.012, sy=0.008), matching
+    the MDY single-card idiom already used above. ``card_h``/``card_y`` are Tableau's
+    normalized zone units; ``mode`` (absent -> Dropdown) drives the slicer show mode."""
+    attr = f" mode='{mode}'" if mode else ""
+    card = (f"<zone name='{ws_name}' param='[federated.abc].[{token}]' type-v2='filter' "
+            f"h='{card_h}' w='20000' x='5000' y='{card_y}' id='30'{attr} />")
+    inner = ("<zone h='100000' w='100000' x='0' y='0'>"
+             f"<zone h='80000' w='90000' x='5000' y='15000' name='{ws_name}' id='2' />"
+             + card + "</zone>")
+    return ("<dashboard name='D'><size maxheight='800' maxwidth='1200' />"
+            "<zones>" + inner + "</zones></dashboard>")
+
+
+def test_dashboard_page_adopts_declared_size_1400x1000():
+    # §13.2: the PBIR page is emitted at the dashboard's OWN fixed pixel canvas -- a
+    # 1400x1000 Tableau <size> becomes a 1400x1000 page (not the 1280x720 default).
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Big'><size maxheight='1000' maxwidth='1400' />"
+            "<zones><zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='90000' x='5000' y='5000' name='W' id='2' /></zone>"
+            "</zones></dashboard>")
+    parts = emit_pbir(parse_twb(_workbook(ws, dash)))
+    assert _page_dims(parts)["Big"] == (1400, 1000)
+
+
+def test_sizeless_dashboard_page_falls_back_to_1000x800_default():
+    # §13.2: a dashboard that declares no <size> (automatic/range canvas) falls back to
+    # Tableau's own 1000x800 default (DASH_DEFAULT_W/H), NOT the 1280x720 module default.
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Auto'><zones>"
+            "<zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='90000' x='5000' y='5000' name='W' id='2' /></zone>"
+            "</zones></dashboard>")
+    parts = emit_pbir(parse_twb(_workbook(ws, dash)))
+    assert _page_dims(parts)["Auto"] == (1000, 800)
+
+
+def test_orphan_page_stays_1280x720_after_a_sized_dashboard():
+    # §13.2 reset: the per-dashboard override is cleared after the dashboard loop, so a
+    # standalone (orphan) worksheet page keeps the 1280x720 default even when a sized
+    # dashboard (1400x1000) was emitted just before it -- the override never leaks.
+    ws1 = _worksheet("Placed", "Bar", "[federated.abc].[sum:Sales:qk]",
+                     "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    ws2 = _worksheet("Orphan", "Bar", "[federated.abc].[sum:Profit:qk]",
+                     "[federated.abc].[none:Region:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='D'><size maxheight='1000' maxwidth='1400' />"
+            "<zones><zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='90000' x='5000' y='5000' name='Placed' id='2' /></zone>"
+            "</zones></dashboard>")
+    dims = _page_dims(emit_pbir(parse_twb(_workbook(ws1 + ws2, dash))))
+    assert dims["D"] == (1400, 1000)       # dashboard page adopts <size>
+    assert dims["Orphan"] == (1280, 720)   # orphan page keeps the default (no leak)
+
+
+def test_dropdown_filter_card_height_is_floored_at_64():
+    # §13.3: a scaled filter card (h=6000 -> 6000*0.008 = 48px) in Dropdown mode is
+    # floored at SLICER_DROPDOWN_MIN_H (64) so Power BI never clips the control.
+    filt = ("<filter class='categorical' column='[federated.abc].[none:Region:nk]'>"
+            "<groupfilter function='member' level='[none:Region:nk]' /></filter>")
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST, filters=filt)
+    dash = _one_card_dashboard("W", "none:Region:nk", card_h=6000, card_y=90000)
+    slicers = _page_slicers(emit_pbir(parse_twb(_workbook(ws, dash))))
+    assert len(slicers) == 1
+    assert slicers[0]["position"]["height"] == 64.0
+
+
+def test_checklist_filter_card_height_tracks_the_scaled_zone():
+    # §13.3: a NON-dropdown (checklist -> Basic/List) card takes its own scaled height
+    # (48px), floored only at the smaller SLICER_CTRL_H (40) -- so it stays 48, NOT 64.
+    filt = ("<filter class='categorical' column='[federated.abc].[none:Region:nk]'>"
+            "<groupfilter function='member' level='[none:Region:nk]' /></filter>")
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST, filters=filt)
+    dash = _one_card_dashboard("W", "none:Region:nk", card_h=6000, card_y=90000,
+                               mode="checklist")
+    slicers = _page_slicers(emit_pbir(parse_twb(_workbook(ws, dash))))
+    assert len(slicers) == 1
+    assert slicers[0]["position"]["height"] == 48.0
+
+
+def test_reflow_is_a_noop_when_the_slicer_band_clears_content():
+    # §13.4: a worksheet authored well ABOVE the slicer band (no overlap) is untouched
+    # -- content stays at its scaled top and never runs into the slicer band below it.
+    filt = ("<filter class='categorical' column='[federated.abc].[none:Region:nk]'>"
+            "<groupfilter function='member' level='[none:Region:nk]' /></filter>")
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST, filters=filt)
+    # worksheet zone h=60000 y=2000 -> [16, 496]; filter card y=90000 -> band ~[720, 784]
+    card = ("<zone name='W' param='[federated.abc].[none:Region:nk]' type-v2='filter' "
+            "h='6000' w='20000' x='5000' y='90000' id='30' />")
+    inner = ("<zone h='100000' w='100000' x='0' y='0'>"
+             "<zone h='60000' w='90000' x='5000' y='2000' name='W' id='2' />" + card + "</zone>")
+    dash = ("<dashboard name='D'><size maxheight='800' maxwidth='1200' />"
+            "<zones>" + inner + "</zones></dashboard>")
+    parts = emit_pbir(parse_twb(_workbook(ws, dash)))
+    content = _content_visual(parts)
+    slicer = _page_slicers(parts)[0]
+    assert content["position"]["y"] < 100  # stayed at its authored top (not pushed down)
+    assert (content["position"]["y"] + content["position"]["height"]
+            <= slicer["position"]["y"])    # clears the band entirely
+
+
+def test_reflow_pushes_content_below_an_overlapping_slicer_band():
+    # §13.4: a worksheet authored at its hidden-state position that now OVERLAPS the
+    # shown slicer band is pushed below the band bottom (Tableau's "Show Filters" reflow).
+    filt = ("<filter class='categorical' column='[federated.abc].[none:Region:nk]'>"
+            "<groupfilter function='member' level='[none:Region:nk]' /></filter>")
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST, filters=filt)
+    # worksheet zone h=90000 y=10000 -> [80, 800]; filter card y=20000 -> band ~[160, 224]
+    card = ("<zone name='W' param='[federated.abc].[none:Region:nk]' type-v2='filter' "
+            "h='6000' w='20000' x='5000' y='20000' id='30' />")
+    inner = ("<zone h='100000' w='100000' x='0' y='0'>"
+             "<zone h='90000' w='90000' x='5000' y='10000' name='W' id='2' />" + card + "</zone>")
+    dash = ("<dashboard name='D'><size maxheight='800' maxwidth='1200' />"
+            "<zones>" + inner + "</zones></dashboard>")
+    parts = emit_pbir(parse_twb(_workbook(ws, dash)))
+    content = _content_visual(parts)
+    slicer = _page_slicers(parts)[0]
+    assert (content["position"]["y"]
+            >= slicer["position"]["y"] + slicer["position"]["height"])  # below the band
+
+
+# -- dashboard text objects (§12) ----------------------------------------------
+# The §12 tests pass a bare ``<zone …>…</zone>`` XML string straight to the parse-side readers, so a
+# tiny helper turns that string into the ElementTree node those readers expect. The three fixtures are
+# structurally faithful (but trimmed) Tableau dashboards: a wide+top filled banner (the header the
+# selector picks), narrower/lower section-header caption bars with 8-digit ``#rrggbbaa`` fills, and a
+# fill-less instruction line -- every text zone the rebuild must capture as its own textbox.
+def _zone_from_xml(xml):
+    return ET.fromstring(xml)
+
+
+def _text_object_zone(text, fill=None, color="#ffffff", bold=True, size=12,
+                      x=0, y=0, w=100000, h=6000, zid="9"):
+    """A dashboard ``type='text'`` zone: an author-titled caption/banner/instruction box.
+
+    ``fill`` optional -- a section-header bar carries an ``#rrggbb`` / 8-digit ``#rrggbbaa`` fill; a
+    fill-less instruction line omits the ``<zone-style>`` entirely (transparent)."""
+    run = (f"<run bold='{'true' if bold else 'false'}' fontcolor='{color}' "
+           f"fontsize='{size}'>{text}</run>")
+    style = (f"<zone-style><format attr='background-color' value='{fill}' /></zone-style>"
+             if fill else "")
+    return (f"<zone type-v2='text' h='{h}' w='{w}' x='{x}' y='{y}' id='{zid}'>"
+            f"<formatted-text>{run}</formatted-text>{style}</zone>")
+
+
+def _text_object_ws_zone(name, x=0, y=40000, w=100000, h=50000, zid="2"):
+    return f"<zone h='{h}' w='{w}' x='{x}' y='{y}' name='{name}' id='{zid}' />"
+
+
+def _text_object_container(*inner):
+    return "<zone h='100000' w='100000' x='0' y='0'>" + "".join(inner) + "</zone>"
+
+
+# Tech Hierarchy -- a top banner (wide+top, picked as the header) plus four role caption bars that are
+# narrower AND lower, so the selector never mistakes them for the header. Director/Supervisor carry the
+# two 8-digit fills (#5a23b9c1 -> transparency 24; #5a23b981 -> 49); the <size> fixes the pixel canvas.
+TECH_HIERARCHY_TWB = _workbook(
+    _worksheet("Placeholder", "Bar", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[none:Category:nk]", deps_extra=_INST),
+    "<dashboard name='Tech Hierarchy'><size maxwidth='1400' maxheight='1000' /><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("Placeholder"),
+        _text_object_zone("ATTI/ATTR Tech Hierarchy", fill="#5a23b9", color="#ffffff",
+                          x=0, y=0, w=100000, h=9245, zid="99"),
+        _text_object_zone("Director", fill="#5a23b9c1", color="#ffffff",
+                          x=0, y=25000, w=25000, h=5000, zid="10"),
+        _text_object_zone("Manager", fill="#5a23b9c1", color="#ffffff",
+                          x=25000, y=25000, w=25000, h=5000, zid="11"),
+        _text_object_zone("Supervisor", fill="#5a23b981", color="#ffffff",
+                          x=50000, y=25000, w=25000, h=5000, zid="12"),
+        _text_object_zone("Technician", fill="#5a23b9c1", color="#ffffff",
+                          x=75000, y=25000, w=25000, h=5000, zid="13"),
+    )
+    + "</zones></dashboard>",
+)
+
+
+# Hierarchy Trending -- a fill-less instruction line (no <zone-style>, so fill is None) placed low over
+# the trend worksheet; there is no filled top band, so this dashboard has no banner.
+HIERARCHY_TRENDING_TWB = _workbook(
+    _worksheet("Trend", "Line", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+    "<dashboard name='Hierarchy Trending'><size maxwidth='1400' maxheight='1000' /><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("Trend"),
+        _text_object_zone("Click on Director Name to Expand", fill=None, color="#000000",
+                          bold=False, size=10, x=0, y=30000, w=40000, h=4000, zid="20"),
+    )
+    + "</zones></dashboard>",
+)
+
+
+# Banner Only -- the single text zone is the wide+top banner, so after de-dupe text_objects is empty.
+BANNER_ONLY_TWB = _workbook(
+    _worksheet("Solo", "Bar", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[none:Category:nk]", deps_extra=_INST),
+    "<dashboard name='Banner Only'><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("Solo"),
+        _text_object_zone("ATTI/ATTR Tech Hierarchy", fill="#5a23b9", color="#ffffff",
+                          x=0, y=0, w=100000, h=9245, zid="99"),
+    )
+    + "</zones></dashboard>",
+)
+
+
+def test_hex8_fill_reader_splits_alpha():
+    # #5a23b9c1 (alpha c1) -> ("#5a23b9", 24); #5a23b981 -> ("#5a23b9", 49);
+    # 6-digit -> (hex, None); name/rgba -> (None, None)
+    z_c1 = _zone_from_xml("<zone type-v2='text'><zone-style>"
+                          "<format attr='background-color' value='#5a23b9c1'/></zone-style></zone>")
+    assert _zone_background_fill2(z_c1) == ("#5a23b9", 24)
+    z_81 = _zone_from_xml("<zone type-v2='text'><zone-style>"
+                          "<format attr='background-color' value='#5a23b981'/></zone-style></zone>")
+    assert _zone_background_fill2(z_81) == ("#5a23b9", 49)
+    z6 = _zone_from_xml("<zone type-v2='text'><zone-style>"
+                        "<format attr='background-color' value='#5a23b9'/></zone-style></zone>")
+    assert _zone_background_fill2(z6) == ("#5a23b9", None)
+    z_named = _zone_from_xml("<zone type-v2='text'><zone-style>"
+                             "<format attr='background-color' value='red'/></zone-style></zone>")
+    assert _zone_background_fill2(z_named) == (None, None)
+
+
+def test_run_font_reads_weight_and_size():
+    z = _zone_from_xml("<zone type-v2='text'><formatted-text>"
+                       "<run bold='true' fontcolor='#ffffff' fontsize='12'>Director</run>"
+                       "</formatted-text></zone>")
+    assert _zone_run_font(z) == ("#ffffff", True, 12.0)
+
+
+def test_all_text_objects_captured_tech_hierarchy():
+    ir = parse_twb(TECH_HIERARCHY_TWB)
+    db = next(d for d in ir["dashboards"] if d["name"] == "Tech Hierarchy")
+    texts = {t["text"] for t in db["text_objects"]}
+    assert {"Director", "Manager", "Supervisor", "Technician"} <= texts
+    # banner is kept as title_banner and NOT duplicated in text_objects
+    assert db["title_banner"]["text"] == "ATTI/ATTR Tech Hierarchy"
+    assert not any(t["text"] == "ATTI/ATTR Tech Hierarchy" for t in db["text_objects"])
+    # 8-digit fills split into rgb + transparency
+    director = next(t for t in db["text_objects"] if t["text"] == "Director")
+    assert director["fill"] == "#5a23b9" and director["transparency"] == 24
+    supervisor = next(t for t in db["text_objects"] if t["text"] == "Supervisor")
+    assert supervisor["transparency"] == 49
+
+
+def test_fill_less_text_captured():
+    ir = parse_twb(HIERARCHY_TRENDING_TWB)
+    db = next(d for d in ir["dashboards"] if d["name"] == "Hierarchy Trending")
+    instr = [t for t in db["text_objects"] if t["text"].startswith("Click on Director Name")]
+    assert instr and any(t["fill"] is None or t["fill"] == "#5a23b9" for t in instr)
+
+
+def test_text_object_emits_faithful_textbox():
+    tob = {"text": "Director", "fill": "#5a23b9", "transparency": 24,
+           "text_color": "#ffffff", "bold": True, "font_size": 12.0}
+    vis = _text_object_textbox_visual("v-x-text-0", _position(0, 0, 100, 20, z=900, tab=1), tob)
+    v = vis["visual"]
+    assert v["visualType"] == "textbox"
+    run = v["objects"]["general"][0]["properties"]["paragraphs"][0]["textRuns"][0]
+    assert run["value"] == "Director"
+    assert run["textStyle"] == {"fontSize": "12pt", "color": "#ffffff", "fontWeight": "bold"}
+    bg = v["visualContainerObjects"]["background"][0]["properties"]
+    assert bg["show"]["expr"]["Literal"]["Value"] == "true"
+    assert bg["color"]["solid"]["color"]["expr"]["Literal"]["Value"] == "'#5a23b9'"
+    assert bg["transparency"]["expr"]["Literal"]["Value"] == "24D"
+
+
+def test_fill_less_textbox_is_transparent():
+    tob = {"text": "Click on Director Name to Expand", "fill": None, "transparency": None,
+           "text_color": "#000000", "bold": False, "font_size": 10.0}
+    vis = _text_object_textbox_visual("v-x-text-1", _position(0, 0, 100, 20, z=900, tab=1), tob)
+    bg = vis["visual"]["visualContainerObjects"]["background"][0]["properties"]
+    assert bg["show"]["expr"]["Literal"]["Value"] == "false"
+    run = vis["visual"]["objects"]["general"][0]["properties"]["paragraphs"][0]["textRuns"][0]
+    assert "fontWeight" not in run["textStyle"]   # not bold
+    assert run["textStyle"]["fontSize"] == "10pt"
+
+
+def test_banner_only_dashboard_never_regresses():
+    # a dashboard whose only text zone is the top banner keeps text_objects empty after de-dupe,
+    # so emit_pbir adds exactly one banner textbox and nothing else.
+    ir = parse_twb(BANNER_ONLY_TWB)
+    db = ir["dashboards"][0]
+    assert db["text_objects"] == []
+
+
+def test_dashboard_size_dict_survives_capture():
+    # regression guard for the variable-name trap: capturing text objects must NOT clobber db["size"].
+    ir = parse_twb(TECH_HIERARCHY_TWB)
+    db = next(d for d in ir["dashboards"] if d["name"] == "Tech Hierarchy")
+    assert isinstance(db["size"], dict) and "w" in db["size"] and "h" in db["size"]
+
+
+# -- §13 dashboard image & button objects --------------------------------------------------------
+_IMAGE_ZONE = ("<zone type-v2='bitmap' param='Image/Logo.png' h='9245' w='20000' "
+               "x='0' y='0' id='40' />")
+_BUTTON_ZONE = ("<zone type-v2='dashboard-object' id='41' x='30000' y='0' w='20000' h='9245'>"
+                "<image-path>Image/Icon.png</image-path></zone>")
+
+IMAGE_BUTTON_TWB = _workbook(
+    _worksheet("Sheet1", "Bar", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[none:Category:nk]", deps_extra=_INST),
+    "<dashboard name='Cover'><size maxwidth='1200' maxheight='800' /><zones>"
+    + _text_object_container(_text_object_ws_zone("Sheet1"), _IMAGE_ZONE, _BUTTON_ZONE, _IMAGE_ZONE)
+    + "</zones></dashboard>",
+)
+
+_PNG = b"\x89PNG\r\n\x1a\nFAKE"
+_PNG2 = b"\x89PNG\r\n\x1a\nICON"
+
+
+def test_resource_basename_handles_slashes_and_none():
+    assert _resource_basename("Image/Logo.png") == "Logo.png"
+    assert _resource_basename("Image\\Sub\\Logo.png") == "Logo.png"
+    assert _resource_basename("Logo.png") == "Logo.png"
+    assert _resource_basename(None) == ""
+
+
+def test_image_item_name_is_deterministic_collision_safe_and_fs_safe():
+    n1 = _image_item_name("Image/EBI Logo Black.png", set())
+    assert n1 == _image_item_name("Image/EBI Logo Black.png", set())
+    assert " " not in n1 and n1.endswith(".png")
+    assert n1 != _image_item_name("Image/EBI Logo Black.png", {n1})
+    assert _image_item_name("Image/logo", set()).endswith(".png")
+
+
+def test_resolve_resource_bytes_exact_ci_and_misses():
+    res = {"Image/Logo.png": _PNG}
+    assert _resolve_resource_bytes(res, "Image/Logo.png") == _PNG
+    assert _resolve_resource_bytes(res, "other/logo.PNG") == _PNG
+    assert _resolve_resource_bytes(res, None) is None
+    assert _resolve_resource_bytes(None, "Image/Logo.png") is None
+    assert _resolve_resource_bytes(res, "Image/Missing.png") is None
+
+
+def test_image_visual_shape_has_resource_package_item_and_no_data_binding():
+    vis = _image_visual("v-cover-img-40", _position(0, 0, 200, 100), "Logo0123.png")
+    assert vis["$schema"] == SCHEMA_VISUAL
+    v = vis["visual"]
+    assert v["visualType"] == "image"
+    assert v["drillFilterOtherVisuals"] is True
+    rp = v["objects"]["general"][0]["properties"]["imageUrl"]["expr"]["ResourcePackageItem"]
+    assert rp["PackageName"] == "RegisteredResources"
+    assert rp["PackageType"] == 1
+    assert rp["ItemName"] == "Logo0123.png"
+    assert "query" not in v
+
+
+def test_report_json_part_registers_image_items_else_none():
+    part = report_json_part(image_items=[{"name": "x.png", "path": "x.png", "type": "Image"}])
+    pkg = part["resourcePackages"][0]
+    assert pkg["name"] == "RegisteredResources"
+    assert "x.png" in [it["name"] for it in pkg["items"]]
+    assert part["themeCollection"]["baseTheme"]["name"] == "CY24SU10"
+    plain = report_json_part()
+    assert "resourcePackages" not in plain
+    assert plain["themeCollection"]["baseTheme"]["name"] == "CY24SU10"
+
+
+def test_parse_captures_image_and_button_zones_deduped():
+    ir = parse_twb(IMAGE_BUTTON_TWB)
+    db = next(d for d in ir["dashboards"] if d["name"] == "Cover")
+    zones = db["image_zones"]
+    assert sorted(z["kind"] for z in zones) == ["button", "image"]
+    img = next(z for z in zones if z["kind"] == "image")
+    assert img["image"] == "Image/Logo.png"
+    assert img["w"] > 0 and img["h"] > 0
+    assert all(k in img for k in ("x", "y", "w", "h"))
+    assert next(z for z in zones if z["kind"] == "button")["image"] == "Image/Icon.png"
+
+
+def test_migrate_emits_image_visual_and_packages_bytes():
+    result = migrate_twb_to_pbir(
+        IMAGE_BUTTON_TWB, resources={"Image/Logo.png": _PNG, "Image/Icon.png": _PNG2})
+    parts = result["parts"]
+    image_vis = [v for v in _visual_parts(parts).values()
+                 if v["visual"]["visualType"] == "image"]
+    assert len(image_vis) == 2
+    png_parts = {k: v for k, v in parts.items()
+                 if k.startswith("StaticResources/RegisteredResources/")
+                 and isinstance(v, (bytes, bytearray))}
+    assert set(png_parts.values()) == {_PNG, _PNG2}
+    report = json.loads(parts["definition/report.json"])
+    image_items = [it for it in report["resourcePackages"][0]["items"] if it["type"] == "Image"]
+    assert len(image_items) == 2
+
+
+def test_image_object_fail_closed_when_bytes_missing():
+    result = migrate_twb_to_pbir(IMAGE_BUTTON_TWB, resources={"Image/Nope.png": _PNG})
+    assert not any(v["visual"]["visualType"] == "image"
+                   for v in _visual_parts(result["parts"]).values())
+    assert any("image object" in str(w)
+               and "not rebuilt (image bytes not packaged with the workbook)" in str(w)
+               for w in result["warnings"])
+
+
+def test_image_objects_never_regress_when_resources_none():
+    result = migrate_twb_to_pbir(IMAGE_BUTTON_TWB)
+    assert not any(v["visual"]["visualType"] == "image"
+                   for v in _visual_parts(result["parts"]).values())
+    assert not any("image object" in str(w) for w in result["warnings"])
+    report = json.loads(result["parts"]["definition/report.json"])
+    pkgs = report.get("resourcePackages", [])
+    image_items = [it for pkg in pkgs for it in pkg.get("items", []) if it.get("type") == "Image"]
+    assert image_items == []

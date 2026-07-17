@@ -149,9 +149,10 @@ def test_emit_pbir_emits_one_banner_textbox_carrying_fill_and_title():
     assert b["$schema"] == SCHEMA_VISUAL
     assert {"$schema", "name", "position", "visual"} <= set(b)
     assert {"x", "y", "width", "height", "tabOrder"} <= set(b["position"])
-    # the full-width top strip
+    # the full-width top strip — spans the real per-dashboard page width (§13 geometry)
+    page = next(json.loads(v) for k, v in parts.items() if k.endswith("page.json"))
     assert b["position"]["x"] == 0 and b["position"]["y"] == 0
-    assert b["position"]["width"] == R.PAGE_WIDTH
+    assert b["position"]["width"] == page["width"]
     # the white bold title text
     run = b["visual"]["objects"]["general"][0]["properties"]["paragraphs"][0]["textRuns"][0]
     assert run["value"] == "Intake"
@@ -211,10 +212,16 @@ def test_salesforce_proof_workbook_banner_and_brand_end_to_end():
     parts = emit_pbir(ir)
     theme = json.loads(parts["StaticResources/RegisteredResources/" + R._TABLEAU_THEME_FILE])
     assert theme["dataColors"][0] == "#ac145a"
-    banners = [v for v in _visual_parts(parts).values()
-               if v["visual"]["visualType"] == "textbox"]
-    assert len(banners) == len(ir["dashboards"]) == 5
-    for b in banners:
+    textboxes = [v for v in _visual_parts(parts).values()
+                 if v["visual"]["visualType"] == "textbox"]
+    # every dashboard still contributes exactly one rebuilt title banner...
+    n_banners = sum(1 for db in ir["dashboards"] if db["title_banner"])
+    assert n_banners == len(ir["dashboards"]) == 5
+    # ...and §12 dashboard text objects (caption bars / instruction lines) now ALSO rebuild as their
+    # own textboxes, so the total textbox count is additively banners + every captured text object.
+    n_text_objects = sum(len(db["text_objects"]) for db in ir["dashboards"])
+    assert len(textboxes) == n_banners + n_text_objects
+    for b in textboxes:
         assert b["$schema"] == SCHEMA_VISUAL
         run = b["visual"]["objects"]["general"][0]["properties"]["paragraphs"][0]["textRuns"][0]
         assert run["value"].strip()

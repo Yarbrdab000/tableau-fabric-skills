@@ -13,6 +13,79 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.56.0` → `1.57.0`): Dashboard image & button objects — the report
+  rebuilder now rebuilds a dashboard's floating `bitmap` image zones and `dashboard-object` buttons
+  (with an `<image-path>`) as native PBIR `image` visuals, packaging each referenced PNG/JPG as a
+  registered report resource. Additive and fail-closed — a dashboard with no image/button objects, or a
+  workbook whose image bytes were never packaged, stays byte-identical.**
+  - **Image & button capture.** `_parse_dashboard` additively captures each `type-v2='bitmap'` image zone
+    and each `type-v2='dashboard-object'` button zone that carries an `<image-path>` into
+    `db["image_zones"]` (kind `image` / `button`), preserving the authored source ref and pixel geometry;
+    duplicate references to the same image are deduped to one packaged resource.
+  - **Native image visuals + resource packaging.** `_image_visual` emits a PBIR `image` visual bound to a
+    `ResourcePackageItem` (`RegisteredResources`) with no data binding, and `report_json_part` registers
+    each image under `resourcePackages` so the emitted `definition/report.json` lists the packaged item;
+    raw image bytes are written verbatim under `StaticResources/RegisteredResources/`.
+  - **Fail-closed byte handling.** `_resolve_resource_bytes` resolves an image reference by exact key or
+    case-insensitive basename; when a workbook's image bytes were not packaged with it, the image object
+    is skipped with a `manual attention required` warning (never a broken visual), and a run with no
+    `resources` supplied emits no image visuals and no warning.
+  - Locked by new hermetic tests (`test_twb_to_pbir.py` §13 dashboard image & button objects), inline-XML
+    fixtures only; no customer artifact committed. Plugin mirror kept byte-identical.
+- **tableau-migration (skill `1.55.0` → `1.56.0`): Dashboard text objects + "Grow to fit" column
+  auto-size — the report rebuilder now captures EVERY dashboard `type='text'` zone (not just the top
+  title banner) and rebuilds each as its own PBIR `textbox`, and rebuilt matrices actually grow their
+  columns to fit. Additive and fail-closed — a banner-only dashboard stays byte-identical.** Verified
+  against the real `New Comcast Test` / `ATTI/ATTR Hierarchy` workbooks:
+  - **Every dashboard text zone rebuilt as its own textbox.** `_parse_dashboard` now additively
+    captures each content-bearing `type='text'` zone — the section-header caption bars (Director /
+    Manager / Supervisor / Technician over each matrix) and the fill-less instruction / metric lines a
+    dashboard places over its worksheets — into `db["text_objects"]`, and `emit_pbir` emits each as a
+    `_text_object_textbox_visual` (`z=900`) carrying the run's own colour / weight / size over the
+    zone's authored fill. The single wide+top title banner is still chosen separately and de-duped out,
+    so it is never drawn twice.
+  - **rgba-aware fill reader.** New `_zone_background_fill2` accepts Tableau's 8-digit `#rrggbbaa`
+    (e.g. a `#5a23b9c1` ~76%-opaque caption bar) and splits it into a `#rrggbb` fill plus a transparency
+    percent, so a rebuilt caption keeps its authored see-through look; a colour name / `rgba()` /
+    malformed value yields no fill (never a guessed blend). `_zone_run_font` reads the caption run's
+    colour, weight, and point size for a faithful rebuild.
+  - **"Grow to fit" column auto-size.** `_apply_grow_to_fit` now emits the modern `columnAdjustment`
+    enum (`'growToFit'`) alongside the legacy `autoSizeColumnWidth` boolean, exactly as a Desktop-saved
+    grid writes them — fixing the "Fit to content" default that made every rebuilt matrix's columns
+    render wonky.
+  - Locked by new hermetic tests (`test_twb_to_pbir.py` §12 dashboard text objects + the grow-to-fit
+    assertion), inline-XML fixtures only; no customer artifact committed. Plugin mirror kept
+    byte-identical.
+- **tableau-migration (skill `1.54.0` → `1.55.0`): Font/formatting fidelity + §13 geometry fidelity —
+  the report rebuilder now carries a worksheet's typed fonts, cell/container shading, faithful slicer
+  sizing, and each dashboard's real pixel canvas onto the rebuilt PBIR report. Additive and fail-closed —
+  byte-identical on any surface that records no font/fill/geometry override.** Verified against the real
+  `ATTI/ATTR Hierarchy` workbook:
+  - **Typed fonts from the worksheet `<style>`.** New `_parse_style_font` / `_resolve_element_font`
+    resolve a per-element (title / header / pane / cell) font face, size, colour, and bold/italic from the
+    Tableau worksheet style, and `_grid_font_objects` / `_title_style_props` stamp them onto the emitted
+    grid and title. A silent element seeds the Tableau 9pt app default (so every matrix carries a values
+    font), never a fabricated face.
+  - **Cell + container shading.** `_normalize_fill_hex` / `_parse_style_fill` / `_resolve_element_fill`
+    plus `_fill_style_props` / `_container_background_props` translate a recorded worksheet/zone fill into
+    the visual's background, and `_parse_zone_padding` reads a zone's authored inset — emitted only when
+    the author actually set a face (no fill recorded ⇒ no `<format>` written, matching Tableau).
+  - **Faithful slicer sizing.** `_layout_slicers` lays each dashboard filter card out at its own scaled
+    position and show mode with inter-card gaps (`SLICER_PAD_X` / `SLICER_ROW_GUTTER`); a Dropdown card's
+    height is translated directly and floored at `SLICER_DROPDOWN_MIN_H` (64) so Power BI never clips the
+    control, while a List/checklist card keeps its own scaled height (floored at `SLICER_CTRL_H` = 40).
+    `_apply_slicer_format` stamps the compact `SLICER_FONT_PT` (9pt) header/item font.
+  - **§13 per-dashboard page geometry.** Each PBIR page is emitted at the dashboard's OWN fixed pixel
+    canvas from `<size maxwidth/maxheight>` (`_PAGE_W_OVERRIDE` / `_PAGE_H_OVERRIDE`, `_page_w` / `_page_h`)
+    — a 1400×1000 dashboard becomes a 1400×1000 page, a sizeless dashboard falls back to Tableau's own
+    1000×800 default (`DASH_DEFAULT_W/H`), and the override is reset after the loop so a standalone
+    worksheet page keeps the 1280×720 default (no leak).
+  - **§13 shown-state reflow.** `_reflow_worksheets_below_slicers` reproduces Tableau's "Show Filters"
+    reflow: when a surfaced slicer band overlaps a worksheet authored at its hidden-state position, the
+    sheet is pushed below the band bottom and compressed to fit; a band that sits in its own clear space
+    is a no-op (never-regress).
+  - Locked by new hermetic acceptance tests (`test_twb_to_pbir.py` §13 geometry + `test_header_banner.py`
+    font/formatting), all inline-XML fixtures — no customer artifact is committed.
 - **tableau-migration (skill `1.53.0` → `1.54.0`): Rebuilt tables and matrices now default to
   "Grow to fit" column widths.** Every `tableEx` (table) and `pivotTable` (matrix) the report rebuilder
   emits — including the self-service field-parameter table — now carries an explicit
