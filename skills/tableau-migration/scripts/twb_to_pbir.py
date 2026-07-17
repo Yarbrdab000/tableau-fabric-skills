@@ -3110,6 +3110,53 @@ def _zone_run_color(zone):
     return None
 
 
+def _zone_background_fill2(zone):
+    """A dashboard text zone's background fill -> ``(#rrggbb|None, transparency_pct|None)``.
+
+    Unlike ``_zone_background_fill`` (strict 6-digit, used for the banner/brand signal), this also
+    accepts Tableau's 8-digit ``#rrggbbaa`` -- the form written for ANY non-100%-opaque fill (a
+    section-header caption bar is typically ``#5a23b9c1`` ~76% opaque, or ``#5a23b981`` ~50%). It
+    returns the 6-digit RGB plus the transparency percent (0 = opaque .. 100 = clear) so a rebuilt
+    textbox reproduces the authored see-through look. ``(None, None)`` for a colour name / ``rgba()``
+    / malformed value -- never a guessed blend."""
+    style = _first(zone, "zone-style")
+    if style is None:
+        return None, None
+    for fmt in _children_local(style, "format"):
+        if fmt.get("attr") == "background-color":
+            val = (fmt.get("value") or "").strip()
+            if _HEX6_RE.match(val):
+                return val.lower(), None
+            if _HEX8_RE.match(val):
+                aa = int(val[7:9], 16)
+                return val[:7].lower(), round((255 - aa) / 255 * 100)
+            return None, None
+    return None, None
+
+
+def _zone_run_font(zone):
+    """The first text-bearing ``<run>``'s ``(colour, bold, size_pt)`` on a zone.
+
+    Colour is a ``#rrggbb`` or ``None``; ``bold`` is ``True`` only when the run declares
+    ``bold='true'``; ``size_pt`` is the numeric ``fontsize`` (points) or ``None``. Used to rebuild a
+    general text object's caption faithfully (weight / size / colour from the author's own run).
+    Mirrors ``_zone_run_color`` for colour, which the banner path still uses on its own."""
+    ft = _first(zone, "formatted-text")
+    if ft is None:
+        return None, False, None
+    for r in _findall_local(ft, "run"):
+        if (r.text or "").strip():
+            c = (r.get("fontcolor") or "").strip()
+            color = c.lower() if _HEX6_RE.match(c) else None
+            bold = r.get("bold") == "true"
+            try:
+                size = float(r.get("fontsize")) if r.get("fontsize") else None
+            except (TypeError, ValueError):
+                size = None
+            return color, bold, size
+    return None, False, None
+
+
 def _select_title_banner(candidates, ext_w, ext_h):
     """Choose the dashboard's title banner from its filled top text-zone candidates.
 
@@ -3153,6 +3200,7 @@ def _parse_dashboard(db, worksheet_names, warnings):
     filter_zones = []
     seen_params = set()
     banner_candidates = []
+    text_objects = []
     ext_w = ext_h = 0.0
     for zone in _findall_local(db, "zone"):
         if zone in device_zones:
@@ -3178,6 +3226,22 @@ def _parse_dashboard(db, worksheet_names, warnings):
                 banner_candidates.append({
                     "text": text, "fill": fill,
                     "text_color": _zone_run_color(zone) or "#ffffff",
+                    "x": x, "y": y, "w": w, "h": h})
+            # Additively capture EVERY text zone that carries content (fill OPTIONAL) as a general
+            # text object -- the section-header caption bars (Director / Manager / Supervisor /
+            # Technician over each matrix) and the fill-less instruction / metric-label lines a
+            # dashboard places over its worksheets. Each rebuilds as its own textbox (emit loop
+            # below), independent of the single wide+top title banner chosen from
+            # ``banner_candidates``. Uses the rgba-aware reader so an 8-digit ``#rrggbbaa`` caption
+            # keeps its authored transparency instead of collapsing to no-fill, and reads the run's
+            # own colour / weight / size for a faithful caption. The chosen banner is de-duped out of
+            # this list after the loop so the header is never drawn twice.
+            if text:
+                fill2, tpct = _zone_background_fill2(zone)
+                run_color, run_bold, run_size = _zone_run_font(zone)
+                text_objects.append({
+                    "text": text, "fill": fill2, "transparency": tpct,
+                    "text_color": run_color or "#000000", "bold": run_bold, "font_size": run_size,
                     "x": x, "y": y, "w": w, "h": h})
         # A dashboard FILTER card -- the filter the author actually exposed on the dashboard surface
         # (possibly nested inside a collapsible layout container; the zone walk recurses) -- is what
@@ -3233,12 +3297,21 @@ def _parse_dashboard(db, worksheet_names, warnings):
             continue
         zones.append({"worksheet": zname, "x": x, "y": y, "w": w, "h": h})
 
+    title_banner = _select_title_banner(banner_candidates, ext_w, ext_h)
+    if title_banner:
+        # The header band is emitted from ``title_banner`` (its own crimson-fill textbox); drop the
+        # matching zone from the general text-object list so it is never drawn a second time.
+        text_objects = [t for t in text_objects
+                        if not (t["text"] == title_banner["text"]
+                                and t["x"] == title_banner["x"]
+                                and t["y"] == title_banner["y"])]
     return {"name": name, "size": size,
             "extent": {"w": ext_w or None, "h": ext_h or None}, "zones": zones,
             "param_controls": param_controls, "legend_zones": legend_zones,
             "filter_field_tokens": sorted(filter_field_tokens),
             "filter_zones": filter_zones,
-            "title_banner": _select_title_banner(banner_candidates, ext_w, ext_h)}
+            "text_objects": text_objects,
+            "title_banner": title_banner}
 
 
 def _warn(scope, name, reason):
@@ -5098,26 +5171,30 @@ def _reference_line_analytics_objects(ws):
 
 
 def _apply_grow_to_fit(visual, pbir_vtype):
-    """Pin ``autoSizeColumnWidth=true`` ("Grow to fit") on a table/matrix's ``columnHeaders`` object.
+    """Pin "Grow to fit" column auto-size on a table/matrix's ``columnHeaders`` object.
 
-    "Grow to fit" is the column-width DEFAULT a user expects on a grid. With the property ABSENT,
-    Power BI Desktop's modern "Auto-size behavior" resolves to "Custom" (fixed widths) and the grid
-    renders wonky -- columns clipped or over-wide -- until each visual is manually flipped. Grid-only:
-    column width is a ``tableEx``/``pivotTable`` concept, so ``pbir_vtype`` gates every other visual
-    out (the call is a safe no-op for cartesian charts, cards, slicers, textboxes). Shape verified
-    against a real MS-format PBIR ``tableEx`` visual.json
-    (``objects.columnHeaders[].properties.autoSizeColumnWidth`` = a quoted-boolean semantic-query
-    literal, matching how every other boolean is written here). The per-column ``columnWidth[]``
-    "Custom widths" selectors are deliberately NOT emitted -- adding them (even empty) is what flips
-    the toggle toward fixed widths. ``setdefault`` twice so a ``columnHeaders`` object a later
-    formatting pass might add (header font/colour) is never clobbered; only ``autoSizeColumnWidth``
-    is filled when unset, co-existing with any ``values`` background gradient a table already carries.
+    "Grow to fit" is the modern "Auto-size behavior" dropdown = the ``columnAdjustment`` ENUM
+    ('growToFit'). The legacy ``autoSizeColumnWidth`` boolean ALONE only governs "Custom widths" and,
+    with ``columnAdjustment`` absent, resolves to "Fit to content" -- the wonky non-grow default a
+    user reported on every rebuilt matrix. So emit BOTH, exactly as a Desktop-saved grid writes them
+    (shape verified against real PBIR visual.json + Microsoft's base theme). ``columnAdjustment``'s
+    value is a single-quoted semantic-query string literal, matching every other enum literal here
+    (e.g. slicer ``mode`` ``'Dropdown'``). Grid-only: column width is a ``tableEx``/``pivotTable``
+    concept, so ``pbir_vtype`` gates every other visual out (a safe no-op for cartesian charts, cards,
+    slicers, textboxes). The per-column ``columnWidth[]`` "Custom widths" selectors are deliberately
+    NOT emitted -- adding them (even empty) is what flips the toggle toward fixed widths. ``setdefault``
+    twice so a ``columnHeaders`` object a later formatting pass adds (header font/colour) is never
+    clobbered, and a future Tier-2 fixed-width override (``autoSizeColumnWidth=false`` +
+    ``columnAdjustment='fixed'``) is respected -- co-existing with any ``values`` background gradient a
+    table already carries.
     """
     if pbir_vtype not in ("tableEx", "pivotTable"):
         return
-    ch = visual.setdefault("objects", {}).setdefault("columnHeaders", [{"properties": {}}])
-    ch[0].setdefault("properties", {}).setdefault(
-        "autoSizeColumnWidth", {"expr": {"Literal": {"Value": "true"}}})
+    props = (visual.setdefault("objects", {})
+             .setdefault("columnHeaders", [{"properties": {}}])[0]
+             .setdefault("properties", {}))
+    props.setdefault("columnAdjustment", {"expr": {"Literal": {"Value": "'growToFit'"}}})
+    props.setdefault("autoSizeColumnWidth", {"expr": {"Literal": {"Value": "true"}}})
 
 
 def _visual_json(name, vtype, position, query_state, sort_definition=None,
@@ -5645,6 +5722,52 @@ def _banner_textbox_visual(name, position, banner):
     return {"$schema": SCHEMA_VISUAL, "name": name, "position": position, "visual": visual}
 
 
+_TEXT_OBJECT_FONT_SIZE = "12pt"
+
+
+def _text_object_textbox_visual(name, position, tob):
+    """A general dashboard text object -> a schema-valid PBIR ``textbox`` ``visual.json`` dict.
+
+    Rebuilds any captured dashboard text zone (a section-header caption bar, or a fill-less
+    instruction / metric line) as its own textbox: the author's text in its run colour, weight, and
+    size, over the zone's authored fill (with transparency preserved when the source was an 8-digit
+    ``#rrggbbaa``) or transparent when the zone had no fill. Same ``objects.general.paragraphs`` /
+    ``visualContainerObjects.background`` nesting as the title banner, and carries no data binding so
+    it never dangles against the model. Distinct from ``_banner_textbox_visual`` only in defaulting to
+    a smaller body font and honouring the optional fill / transparency / weight the zone declared."""
+    color = tob.get("text_color") or "#000000"
+    size = tob.get("font_size")
+    font_size = ("%gpt" % size) if size else _TEXT_OBJECT_FONT_SIZE
+    style = {"fontSize": font_size, "color": color}
+    if tob.get("bold"):
+        style["fontWeight"] = "bold"
+    run = {"value": tob["text"], "textStyle": style}
+    fill = tob.get("fill")
+    if fill:
+        background = {"properties": {
+            "show": {"expr": {"Literal": {"Value": "true"}}},
+            "color": {"solid": {"color": {"expr": {"Literal": {
+                "Value": _semantic_string_literal(fill)}}}}},
+            "transparency": {"expr": {"Literal": {
+                "Value": "%dD" % round(tob.get("transparency") or 0)}}},
+        }}
+    else:
+        background = {"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}
+    visual = {
+        "visualType": "textbox",
+        "objects": {
+            "general": [{"properties": {"paragraphs": [
+                {"textRuns": [run], "horizontalTextAlignment": "left"}]}}]
+        },
+        "visualContainerObjects": {
+            "background": [background],
+            "title": [{"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}],
+        },
+        "drillFilterOtherVisuals": True,
+    }
+    return {"$schema": SCHEMA_VISUAL, "name": name, "position": position, "visual": visual}
+
+
 # -- Tableau palette custom theme ---------------------------------------------
 # Power BI applies the report theme's ``dataColors`` to every AUTOMATICALLY coloured categorical
 # mark (the bulk of a workbook's charts). A migrated report with no custom theme falls back to
@@ -6084,6 +6207,17 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 _sanitize(f"v-{page_name}-banner"),
                 _position(bx, by, bw, bh, z=1000, tab=0),
                 banner))
+        # General text objects: every OTHER captured dashboard text zone (section-header caption bars
+        # + fill-less instruction/metric lines) rebuilds as its own textbox at its authored position.
+        # ``z=900`` sits below the banner (1000) and images (1100) but above worksheet content, so a
+        # caption bar layered over a matrix stays on top. The title banner is already de-duped out of
+        # this list upstream, so it is never drawn twice. Empty list -> nothing added (never-regress).
+        for j, tob in enumerate(db.get("text_objects") or []):
+            tx, ty, tw, th = _scale_zone(tob, ref_w, ref_h)
+            visuals.append(_text_object_textbox_visual(
+                _sanitize("v-%s-text-%d" % (page_name, j)),
+                _position(tx, ty, tw, th, z=900, tab=len(visuals) + 1),
+                tob))
         # Shown-state reflow: if the slicers we surfaced (a hidden/collapsed Tableau filter band) now
         # collide with a worksheet zone authored at its hidden-state position, push the sheets below the
         # band and compress to fit -- exactly what Tableau does on "Show Filters". No-op when nothing

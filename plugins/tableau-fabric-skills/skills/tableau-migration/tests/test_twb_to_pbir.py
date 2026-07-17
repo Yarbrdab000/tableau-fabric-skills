@@ -7,6 +7,7 @@ visual, and (c) that unsupported marks/derivations/filters degrade to ``warnings
 producing a wrong visual.
 """
 import json
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -26,11 +27,15 @@ from twb_to_pbir import (
     _field_expression,
     _flag_filter_container,
     _norm_param_key,
+    _position,
     _reconcile_caption_fallback,
     _resolve_parameter_controls,
     _resolve_visual_flags,
     _tableau_filter_mode_to_pbi,
+    _text_object_textbox_visual,
     _visual_json,
+    _zone_background_fill2,
+    _zone_run_font,
     build_field_parameter_page,
     emit_pbir,
     field_parameter_slicer,
@@ -3089,11 +3094,22 @@ def _auto_size_value(vis):
             .get("expr", {}).get("Literal", {}).get("Value"))
 
 
+def _col_adjustment_value(vis):
+    """Pull columnHeaders[0].columnAdjustment's literal ("'growToFit'"/None) from a built visual."""
+    ch = (vis["visual"].get("objects") or {}).get("columnHeaders")
+    if not ch:
+        return None
+    return (ch[0].get("properties", {}).get("columnAdjustment", {})
+            .get("expr", {}).get("Literal", {}).get("Value"))
+
+
 def test_grid_visuals_default_to_grow_to_fit():
-    # Every rebuilt table (tableEx) and matrix (pivotTable) opens "Grow to fit": the columnHeaders
-    # object carries autoSizeColumnWidth=true so Power BI never falls back to fixed "Custom" widths.
+    # Every rebuilt table (tableEx) and matrix (pivotTable) opens "Grow to fit": columnAdjustment is
+    # the enum the modern "Auto-size behavior" dropdown reads (autoSizeColumnWidth alone resolves to
+    # "Fit to content"); the boolean rides along so Power BI never falls back to fixed "Custom" widths.
     for vtype in ("tableEx", "pivotTable"):
         vis = _visual_json("g", vtype, {"x": 0, "y": 0}, {"Values": {"projections": []}})
+        assert _col_adjustment_value(vis) == "'growToFit'"
         assert _auto_size_value(vis) == "true"
 
 
@@ -3107,10 +3123,11 @@ def test_grid_visuals_emit_no_custom_width_selectors():
 
 def test_non_grid_visuals_have_no_column_headers_object():
     # Grow-to-fit is a table/matrix-only control; a bar/line/pie/card/slicer stays byte-unchanged
-    # (no columnHeaders object at all).
+    # (no columnHeaders object at all) -- neither the columnAdjustment enum nor the boolean.
     for vtype in ("clusteredColumnChart", "lineChart", "pieChart", "card", "slicer"):
         vis = _visual_json("n", vtype, {"x": 0, "y": 0}, {"Category": {}})
         assert "columnHeaders" not in (vis["visual"].get("objects") or {})
+        assert _col_adjustment_value(vis) is None
         assert _auto_size_value(vis) is None
 
 
@@ -5660,3 +5677,175 @@ def test_reflow_pushes_content_below_an_overlapping_slicer_band():
     slicer = _page_slicers(parts)[0]
     assert (content["position"]["y"]
             >= slicer["position"]["y"] + slicer["position"]["height"])  # below the band
+
+
+# -- dashboard text objects (§12) ----------------------------------------------
+# The §12 tests pass a bare ``<zone …>…</zone>`` XML string straight to the parse-side readers, so a
+# tiny helper turns that string into the ElementTree node those readers expect. The three fixtures are
+# structurally faithful (but trimmed) Tableau dashboards: a wide+top filled banner (the header the
+# selector picks), narrower/lower section-header caption bars with 8-digit ``#rrggbbaa`` fills, and a
+# fill-less instruction line -- every text zone the rebuild must capture as its own textbox.
+def _zone_from_xml(xml):
+    return ET.fromstring(xml)
+
+
+def _text_object_zone(text, fill=None, color="#ffffff", bold=True, size=12,
+                      x=0, y=0, w=100000, h=6000, zid="9"):
+    """A dashboard ``type='text'`` zone: an author-titled caption/banner/instruction box.
+
+    ``fill`` optional -- a section-header bar carries an ``#rrggbb`` / 8-digit ``#rrggbbaa`` fill; a
+    fill-less instruction line omits the ``<zone-style>`` entirely (transparent)."""
+    run = (f"<run bold='{'true' if bold else 'false'}' fontcolor='{color}' "
+           f"fontsize='{size}'>{text}</run>")
+    style = (f"<zone-style><format attr='background-color' value='{fill}' /></zone-style>"
+             if fill else "")
+    return (f"<zone type-v2='text' h='{h}' w='{w}' x='{x}' y='{y}' id='{zid}'>"
+            f"<formatted-text>{run}</formatted-text>{style}</zone>")
+
+
+def _text_object_ws_zone(name, x=0, y=40000, w=100000, h=50000, zid="2"):
+    return f"<zone h='{h}' w='{w}' x='{x}' y='{y}' name='{name}' id='{zid}' />"
+
+
+def _text_object_container(*inner):
+    return "<zone h='100000' w='100000' x='0' y='0'>" + "".join(inner) + "</zone>"
+
+
+# Tech Hierarchy -- a top banner (wide+top, picked as the header) plus four role caption bars that are
+# narrower AND lower, so the selector never mistakes them for the header. Director/Supervisor carry the
+# two 8-digit fills (#5a23b9c1 -> transparency 24; #5a23b981 -> 49); the <size> fixes the pixel canvas.
+TECH_HIERARCHY_TWB = _workbook(
+    _worksheet("Placeholder", "Bar", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[none:Category:nk]", deps_extra=_INST),
+    "<dashboard name='Tech Hierarchy'><size maxwidth='1400' maxheight='1000' /><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("Placeholder"),
+        _text_object_zone("ATTI/ATTR Tech Hierarchy", fill="#5a23b9", color="#ffffff",
+                          x=0, y=0, w=100000, h=9245, zid="99"),
+        _text_object_zone("Director", fill="#5a23b9c1", color="#ffffff",
+                          x=0, y=25000, w=25000, h=5000, zid="10"),
+        _text_object_zone("Manager", fill="#5a23b9c1", color="#ffffff",
+                          x=25000, y=25000, w=25000, h=5000, zid="11"),
+        _text_object_zone("Supervisor", fill="#5a23b981", color="#ffffff",
+                          x=50000, y=25000, w=25000, h=5000, zid="12"),
+        _text_object_zone("Technician", fill="#5a23b9c1", color="#ffffff",
+                          x=75000, y=25000, w=25000, h=5000, zid="13"),
+    )
+    + "</zones></dashboard>",
+)
+
+
+# Hierarchy Trending -- a fill-less instruction line (no <zone-style>, so fill is None) placed low over
+# the trend worksheet; there is no filled top band, so this dashboard has no banner.
+HIERARCHY_TRENDING_TWB = _workbook(
+    _worksheet("Trend", "Line", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+    "<dashboard name='Hierarchy Trending'><size maxwidth='1400' maxheight='1000' /><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("Trend"),
+        _text_object_zone("Click on Director Name to Expand", fill=None, color="#000000",
+                          bold=False, size=10, x=0, y=30000, w=40000, h=4000, zid="20"),
+    )
+    + "</zones></dashboard>",
+)
+
+
+# Banner Only -- the single text zone is the wide+top banner, so after de-dupe text_objects is empty.
+BANNER_ONLY_TWB = _workbook(
+    _worksheet("Solo", "Bar", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[none:Category:nk]", deps_extra=_INST),
+    "<dashboard name='Banner Only'><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("Solo"),
+        _text_object_zone("ATTI/ATTR Tech Hierarchy", fill="#5a23b9", color="#ffffff",
+                          x=0, y=0, w=100000, h=9245, zid="99"),
+    )
+    + "</zones></dashboard>",
+)
+
+
+def test_hex8_fill_reader_splits_alpha():
+    # #5a23b9c1 (alpha c1) -> ("#5a23b9", 24); #5a23b981 -> ("#5a23b9", 49);
+    # 6-digit -> (hex, None); name/rgba -> (None, None)
+    z_c1 = _zone_from_xml("<zone type-v2='text'><zone-style>"
+                          "<format attr='background-color' value='#5a23b9c1'/></zone-style></zone>")
+    assert _zone_background_fill2(z_c1) == ("#5a23b9", 24)
+    z_81 = _zone_from_xml("<zone type-v2='text'><zone-style>"
+                          "<format attr='background-color' value='#5a23b981'/></zone-style></zone>")
+    assert _zone_background_fill2(z_81) == ("#5a23b9", 49)
+    z6 = _zone_from_xml("<zone type-v2='text'><zone-style>"
+                        "<format attr='background-color' value='#5a23b9'/></zone-style></zone>")
+    assert _zone_background_fill2(z6) == ("#5a23b9", None)
+    z_named = _zone_from_xml("<zone type-v2='text'><zone-style>"
+                             "<format attr='background-color' value='red'/></zone-style></zone>")
+    assert _zone_background_fill2(z_named) == (None, None)
+
+
+def test_run_font_reads_weight_and_size():
+    z = _zone_from_xml("<zone type-v2='text'><formatted-text>"
+                       "<run bold='true' fontcolor='#ffffff' fontsize='12'>Director</run>"
+                       "</formatted-text></zone>")
+    assert _zone_run_font(z) == ("#ffffff", True, 12.0)
+
+
+def test_all_text_objects_captured_tech_hierarchy():
+    ir = parse_twb(TECH_HIERARCHY_TWB)
+    db = next(d for d in ir["dashboards"] if d["name"] == "Tech Hierarchy")
+    texts = {t["text"] for t in db["text_objects"]}
+    assert {"Director", "Manager", "Supervisor", "Technician"} <= texts
+    # banner is kept as title_banner and NOT duplicated in text_objects
+    assert db["title_banner"]["text"] == "ATTI/ATTR Tech Hierarchy"
+    assert not any(t["text"] == "ATTI/ATTR Tech Hierarchy" for t in db["text_objects"])
+    # 8-digit fills split into rgb + transparency
+    director = next(t for t in db["text_objects"] if t["text"] == "Director")
+    assert director["fill"] == "#5a23b9" and director["transparency"] == 24
+    supervisor = next(t for t in db["text_objects"] if t["text"] == "Supervisor")
+    assert supervisor["transparency"] == 49
+
+
+def test_fill_less_text_captured():
+    ir = parse_twb(HIERARCHY_TRENDING_TWB)
+    db = next(d for d in ir["dashboards"] if d["name"] == "Hierarchy Trending")
+    instr = [t for t in db["text_objects"] if t["text"].startswith("Click on Director Name")]
+    assert instr and any(t["fill"] is None or t["fill"] == "#5a23b9" for t in instr)
+
+
+def test_text_object_emits_faithful_textbox():
+    tob = {"text": "Director", "fill": "#5a23b9", "transparency": 24,
+           "text_color": "#ffffff", "bold": True, "font_size": 12.0}
+    vis = _text_object_textbox_visual("v-x-text-0", _position(0, 0, 100, 20, z=900, tab=1), tob)
+    v = vis["visual"]
+    assert v["visualType"] == "textbox"
+    run = v["objects"]["general"][0]["properties"]["paragraphs"][0]["textRuns"][0]
+    assert run["value"] == "Director"
+    assert run["textStyle"] == {"fontSize": "12pt", "color": "#ffffff", "fontWeight": "bold"}
+    bg = v["visualContainerObjects"]["background"][0]["properties"]
+    assert bg["show"]["expr"]["Literal"]["Value"] == "true"
+    assert bg["color"]["solid"]["color"]["expr"]["Literal"]["Value"] == "'#5a23b9'"
+    assert bg["transparency"]["expr"]["Literal"]["Value"] == "24D"
+
+
+def test_fill_less_textbox_is_transparent():
+    tob = {"text": "Click on Director Name to Expand", "fill": None, "transparency": None,
+           "text_color": "#000000", "bold": False, "font_size": 10.0}
+    vis = _text_object_textbox_visual("v-x-text-1", _position(0, 0, 100, 20, z=900, tab=1), tob)
+    bg = vis["visual"]["visualContainerObjects"]["background"][0]["properties"]
+    assert bg["show"]["expr"]["Literal"]["Value"] == "false"
+    run = vis["visual"]["objects"]["general"][0]["properties"]["paragraphs"][0]["textRuns"][0]
+    assert "fontWeight" not in run["textStyle"]   # not bold
+    assert run["textStyle"]["fontSize"] == "10pt"
+
+
+def test_banner_only_dashboard_never_regresses():
+    # a dashboard whose only text zone is the top banner keeps text_objects empty after de-dupe,
+    # so emit_pbir adds exactly one banner textbox and nothing else.
+    ir = parse_twb(BANNER_ONLY_TWB)
+    db = ir["dashboards"][0]
+    assert db["text_objects"] == []
+
+
+def test_dashboard_size_dict_survives_capture():
+    # regression guard for the variable-name trap: capturing text objects must NOT clobber db["size"].
+    ir = parse_twb(TECH_HIERARCHY_TWB)
+    db = next(d for d in ir["dashboards"] if d["name"] == "Tech Hierarchy")
+    assert isinstance(db["size"], dict) and "w" in db["size"] and "h" in db["size"]

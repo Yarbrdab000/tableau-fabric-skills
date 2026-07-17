@@ -13,6 +13,30 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.55.0` → `1.56.0`): Dashboard text objects + "Grow to fit" column
+  auto-size — the report rebuilder now captures EVERY dashboard `type='text'` zone (not just the top
+  title banner) and rebuilds each as its own PBIR `textbox`, and rebuilt matrices actually grow their
+  columns to fit. Additive and fail-closed — a banner-only dashboard stays byte-identical.** Verified
+  against the real `New Comcast Test` / `ATTI/ATTR Hierarchy` workbooks:
+  - **Every dashboard text zone rebuilt as its own textbox.** `_parse_dashboard` now additively
+    captures each content-bearing `type='text'` zone — the section-header caption bars (Director /
+    Manager / Supervisor / Technician over each matrix) and the fill-less instruction / metric lines a
+    dashboard places over its worksheets — into `db["text_objects"]`, and `emit_pbir` emits each as a
+    `_text_object_textbox_visual` (`z=900`) carrying the run's own colour / weight / size over the
+    zone's authored fill. The single wide+top title banner is still chosen separately and de-duped out,
+    so it is never drawn twice.
+  - **rgba-aware fill reader.** New `_zone_background_fill2` accepts Tableau's 8-digit `#rrggbbaa`
+    (e.g. a `#5a23b9c1` ~76%-opaque caption bar) and splits it into a `#rrggbb` fill plus a transparency
+    percent, so a rebuilt caption keeps its authored see-through look; a colour name / `rgba()` /
+    malformed value yields no fill (never a guessed blend). `_zone_run_font` reads the caption run's
+    colour, weight, and point size for a faithful rebuild.
+  - **"Grow to fit" column auto-size.** `_apply_grow_to_fit` now emits the modern `columnAdjustment`
+    enum (`'growToFit'`) alongside the legacy `autoSizeColumnWidth` boolean, exactly as a Desktop-saved
+    grid writes them — fixing the "Fit to content" default that made every rebuilt matrix's columns
+    render wonky.
+  - Locked by new hermetic tests (`test_twb_to_pbir.py` §12 dashboard text objects + the grow-to-fit
+    assertion), inline-XML fixtures only; no customer artifact committed. Plugin mirror kept
+    byte-identical.
 - **tableau-migration (skill `1.54.0` → `1.55.0`): Font/formatting fidelity + §13 geometry fidelity —
   the report rebuilder now carries a worksheet's typed fonts, cell/container shading, faithful slicer
   sizing, and each dashboard's real pixel canvas onto the rebuilt PBIR report. Additive and fail-closed —
