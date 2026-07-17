@@ -13,6 +13,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.53.0` → `1.54.0`): Rebuilt tables and matrices now default to
+  "Grow to fit" column widths.** Every `tableEx` (table) and `pivotTable` (matrix) the report rebuilder
+  emits — including the self-service field-parameter table — now carries an explicit
+  `objects.columnHeaders[].autoSizeColumnWidth = true`, so grids open auto-sized instead of Power BI
+  Desktop's absent-value **"Custom"** (fixed-width) default, which rendered columns clipped or over-wide
+  until a user manually flipped each visual to *Layout → Column width → Auto-size behavior → Grow to fit*.
+  Grid-only, additive, and merge-safe:
+  - **Grid-only.** "Grow to fit" is a table/matrix column-width control, so a new `_apply_grow_to_fit`
+    guard emits it for `tableEx`/`pivotTable` only — no cartesian chart, card, or slicer is touched
+    (they stay byte-identical).
+  - **No fixed-width scaffolding.** The per-column `columnWidth[]` "Custom widths" selectors are
+    deliberately *not* emitted — adding them (even empty) is what flips a grid toward fixed widths.
+  - **Merge-safe.** Applied via `setdefault`, so a table already carrying a `values` background gradient
+    keeps it, and a `columnHeaders` object a later formatting pass adds (header font/colour) or an
+    explicit `autoSizeColumnWidth=false` is never clobbered.
+  - Wired into both grid builders (`twb_to_pbir._visual_json` and `field_parameter_table_visual`);
+    7 regression tests lock the default, the no-custom-width guarantee, and non-grid byte-parity.
 - **tableau-migration (skill `1.52.0` → `1.53.0`): Rebuild a Tableau crosstab whose Rows/Columns are
   calculated-field *dimensions* as a real Power BI matrix bound to model columns — instead of collapsing it
   to a single card and dropping the axes — and keep a field-parameter axis (a Tableau field-swap like

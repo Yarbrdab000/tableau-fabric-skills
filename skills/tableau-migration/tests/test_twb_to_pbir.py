@@ -18,6 +18,7 @@ from twb_to_pbir import (
     SCHEMA_VISUAL_FP,
     SCHEMA_VISUAL_SM,
     _DATE_EXACT_DERIVATIONS,
+    _apply_grow_to_fit,
     _apply_override,
     _candidate_plan,
     _card_latent_candidates,
@@ -29,6 +30,7 @@ from twb_to_pbir import (
     _resolve_parameter_controls,
     _resolve_visual_flags,
     _tableau_filter_mode_to_pbi,
+    _visual_json,
     build_field_parameter_page,
     emit_pbir,
     field_parameter_slicer,
@@ -3073,6 +3075,79 @@ def test_field_parameter_slicer_binds_display_column():
     assert proj["field"]["Column"]["Expression"]["SourceRef"]["Entity"] == "Dim Swap Calc"
 
 
+# -- "Grow to fit" column auto-size: the table/matrix column-width DEFAULT --------------------------
+def _auto_size_value(vis):
+    """Pull columnHeaders[0].autoSizeColumnWidth's literal ('true'/None) from a built visual."""
+    ch = (vis["visual"].get("objects") or {}).get("columnHeaders")
+    if not ch:
+        return None
+    return (ch[0].get("properties", {}).get("autoSizeColumnWidth", {})
+            .get("expr", {}).get("Literal", {}).get("Value"))
+
+
+def test_grid_visuals_default_to_grow_to_fit():
+    # Every rebuilt table (tableEx) and matrix (pivotTable) opens "Grow to fit": the columnHeaders
+    # object carries autoSizeColumnWidth=true so Power BI never falls back to fixed "Custom" widths.
+    for vtype in ("tableEx", "pivotTable"):
+        vis = _visual_json("g", vtype, {"x": 0, "y": 0}, {"Values": {"projections": []}})
+        assert _auto_size_value(vis) == "true"
+
+
+def test_grid_visuals_emit_no_custom_width_selectors():
+    # The per-column columnWidth[] "Custom widths" scaffolding is deliberately NOT emitted -- adding
+    # it (even empty) is what flips a grid toward fixed widths.
+    for vtype in ("tableEx", "pivotTable"):
+        vis = _visual_json("g", vtype, {"x": 0, "y": 0}, {"Values": {"projections": []}})
+        assert "columnWidth" not in (vis["visual"].get("objects") or {})
+
+
+def test_non_grid_visuals_have_no_column_headers_object():
+    # Grow-to-fit is a table/matrix-only control; a bar/line/pie/card/slicer stays byte-unchanged
+    # (no columnHeaders object at all).
+    for vtype in ("clusteredColumnChart", "lineChart", "pieChart", "card", "slicer"):
+        vis = _visual_json("n", vtype, {"x": 0, "y": 0}, {"Category": {}})
+        assert "columnHeaders" not in (vis["visual"].get("objects") or {})
+        assert _auto_size_value(vis) is None
+
+
+def test_grow_to_fit_is_merge_safe_with_a_background_gradient():
+    # A table that also carries a values background gradient keeps it AND gains grow-to-fit.
+    vis = _visual_json("g", "tableEx", {"x": 0, "y": 0}, {"Values": {"projections": []}},
+                       value_objects=[{"properties": {"__grad": 1}}])
+    assert "values" in vis["visual"]["objects"]
+    assert _auto_size_value(vis) == "true"
+
+
+def test_field_parameter_table_defaults_to_grow_to_fit():
+    # The self-service field-parameter table is a real grid the user sees -- same default, no
+    # custom-width selectors.
+    vis = field_parameter_table_visual(
+        "fp", _fp_specs(), {"x": 0, "y": 0, "width": 100, "height": 100})
+    assert _auto_size_value(vis) == "true"
+    assert "columnWidth" not in (vis["visual"].get("objects") or {})
+
+
+def test_grow_to_fit_preserves_existing_column_headers_props():
+    # setdefault twice: a columnHeaders object a later formatting pass added (header font/colour)
+    # keeps its props and merely GAINS autoSizeColumnWidth.
+    vis = {"visualType": "tableEx",
+           "objects": {"columnHeaders": [{"properties": {"fontColor": "kept"}}]}}
+    _apply_grow_to_fit(vis, "tableEx")
+    props = vis["objects"]["columnHeaders"][0]["properties"]
+    assert props["fontColor"] == "kept"
+    assert props["autoSizeColumnWidth"]["expr"]["Literal"]["Value"] == "true"
+
+
+def test_grow_to_fit_does_not_overwrite_an_explicit_auto_size():
+    # A future Tier-2 pass pinning fixed widths (autoSizeColumnWidth=false) is respected, not clobbered.
+    vis = {"visualType": "pivotTable",
+           "objects": {"columnHeaders": [{"properties": {
+               "autoSizeColumnWidth": {"expr": {"Literal": {"Value": "false"}}}}}]}}
+    _apply_grow_to_fit(vis, "pivotTable")
+    assert (vis["objects"]["columnHeaders"][0]["properties"]
+            ["autoSizeColumnWidth"]["expr"]["Literal"]["Value"] == "false")
+
+
 def test_build_field_parameter_page_writes_table_and_one_slicer_per_spec():
     parts = {}
     page = build_field_parameter_page(parts, _fp_specs(), page_name="pageSS",
@@ -3439,7 +3514,10 @@ def test_non_cartesian_visual_ignores_axis_titles():
     res = migrate_twb_to_pbir(_workbook(ws))
     assert res["ir"]["worksheets"][0]["visual_type"] == "matrix"
     assert res["ir"]["worksheets"][0]["axis_titles"] == {}
-    assert "objects" not in _only_visual(res)["visual"]
+    # A matrix now always carries a grow-to-fit columnHeaders object; it must still emit NO
+    # axis-title objects (categoryAxis / valueAxis) -- the axis style-rule is not reproduced on a grid.
+    objects = _only_visual(res)["visual"].get("objects", {})
+    assert "categoryAxis" not in objects and "valueAxis" not in objects
 
 
 def _ref_line(value_column, formula="average", label="", label_type="none"):
