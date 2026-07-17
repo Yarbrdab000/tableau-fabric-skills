@@ -13,7 +13,32 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration (skill `1.50.0` → `1.51.0`): Fix a case-insensitive column-name collision that made the
+- **tableau-migration (skill `1.51.0` → `1.52.0`): Rebuild a Tableau dashboard's whole filter band as
+  faithful Power BI slicers — every filter card at its authored position and show mode, row-level dimension
+  calcs kept as sliceable columns, and a discrete exact-date display format bound as an ordinary date.
+  Additive and fail-closed — byte-identical on any surface without dashboard filter cards.** Three fixes to
+  `twb_to_pbir.py`, verified against the real `ATTI/ATTR Hierarchy` workbook:
+  - **Filter band, not a truncated stack.** `_parse_dashboard` now retains each `<zone type-v2='filter'>`
+    card's real geometry and Tableau show `mode`, and `_emit_dashboard_slicers` places one deduped slicer per
+    card at its own `_scale_zone`-scaled grid position with the mapped show mode
+    (`_tableau_filter_mode_to_pbi`: `checkdropdown`/`typeindropdown` → `'Dropdown'`, `checklist`/`radiolist` →
+    `'Basic'` List, default `'Dropdown'`). This replaces the synthetic right-rail stack that a page-height
+    guard truncated to five, so a band of a dozen-plus cards no longer collapses to five vertical List
+    slicers. `hidden-by-user` is recorded but **never** used to drop — it is a Tableau collapsible-container
+    show/hide toggle (no Tier-1 Power BI equivalent), so a toggled-hidden band still rebuilds its filters,
+    usable, at their authored positions. The standalone worksheet-page surface has no card geometry, so its
+    original synthetic-stack slicer path is kept byte-for-byte.
+  - **Row-level dimension calc kept as a slicer.** `_parse_filters` previously dropped **every** calc filter;
+    it now keeps a row-level DIMENSION calc (an `IF`/`CASE` bucket like `Job Type`) — which lands as a real
+    sliceable model column — and warns-and-drops only calcs that roll up to a measure or compare against a
+    parameter (`[Parameters]` in the formula, whose value is not a bindable column).
+  - **Exact-date display format binds as a plain date.** A discrete "exact date" derivation
+    (`MDY`/`MDYH`/`MDYHM`/`MDYHMS` — the full date value shown as e.g. "Month, Day, Year", day-grain-or-finer)
+    is an ordinary date column, so `_resolve_field` and `_rebind_date_axis` now bind it like a plain date
+    (a normal date slicer/axis, `Date[Date]` key) instead of dropping it as an unsupported derivation. A
+    display-format choice on a physical date (e.g. a `Fiscal Month` column shown MDY) is never dropped;
+    coarser/unknown derivations stay fail-closed (warn+skip). Locked by 12 new regression tests; the report
+    schema is unchanged.
   generated `.pbip` refuse to open, and make the rename atomic so a colliding join key is never left dangling.**
   When a calculated field's name case-collides with a physical column on the same table (e.g. a calc `Order ID`
   alongside a physical `order ID`), the model previously declared both on one table; Power BI treats column names

@@ -196,6 +196,18 @@ _DATE_PARTS = {
     "MonthYear", "DayOfYear",
 }
 
+# Tableau DISCRETE "exact date" derivations: a date pill shown as the literal DATE VALUE at a grain
+# (NOT a numeric part like Year/Month). The code is the retained-field prefix of the canonical
+# Year->Month->Day->Hour->Minute->Second sequence, so "MDY" = Month/Day/Year = the exact date at DAY
+# grain (Tableau's "Month, Day, Year" display) and the longer codes just add a finer time grain. This
+# is an ORDINARY date column -- the same underlying date as a continuous exact-date pill, only
+# rendered as discrete members -- so a filter / axis on it is faithfully a normal date slicer / axis,
+# and a display-format choice like MDY must never drop the field. (Day-grain-or-finer loses no grain;
+# a coarser year/month exact date stays fail-closed -> honest warn+skip until verified against a real
+# artifact.) Verified against the real ATTI/ATTR Hierarchy workbook, whose FiscalMonth filter card
+# carries derivation "MDY" and is otherwise an ordinary date column.
+_DATE_EXACT_DERIVATIONS = frozenset({"MDY", "MDYH", "MDYHM", "MDYHMS"})
+
 # Tableau discrete date PART -> column name on the model's shared Date dimension. The datasource
 # migration build (assemble_model._build_date_dimension + tmdl_generate.generate_date_table_tmdl)
 # already emits a marked Date table carrying these exact columns, so a date pill on the active
@@ -240,7 +252,8 @@ def _rebind_date_axis(field, deriv, date_binding):
     inactive date (e.g. Ship Date, or any date when the primary is ambiguous) is never bound to the
     calendar and therefore can't silently display the active date's values -- the exact "break a lot
     of stuff" risk. A discrete date PART rebinds to its calendar column (Year -> Date[Year]); a plain
-    exact/continuous date rebinds to the marked key column (Date[Date]); a day-or-coarser CONTINUOUS
+    exact/continuous date, OR a discrete exact-date VALUE (e.g. MDY -- the full date shown as "Month,
+    Day, Year"), rebinds to the marked key column (Date[Date]); a day-or-coarser CONTINUOUS
     truncation (Day/Week/Month/Quarter/Year-Trunc, the green ``t*:`` pills) rebinds to the marked Date
     table's Calendar drill hierarchy, drilled to the truncation grain (Month-Trunc -> Year + Month) --
     this is what a Desktop-authored rebuild does (its area/line date axis carries the Calendar levels,
@@ -261,7 +274,10 @@ def _rebind_date_axis(field, deriv, date_binding):
         grains = date_binding.get("grain_columns") or _DEFAULT_DATE_GRAIN_COLUMNS
         col = grains.get(deriv)
         return {"entity": table, "property": col} if col else None
-    if deriv in ("None", "", None):  # plain/continuous exact date -> the marked calendar key
+    if deriv in ("None", "", None) or deriv in _DATE_EXACT_DERIVATIONS:
+        # plain / continuous exact date, or a discrete exact-date VALUE (e.g. MDY = the full date
+        # shown as "Month, Day, Year") -> the marked calendar key column. Both are the same
+        # underlying date, so the exact-date-value display format binds exactly like a plain date.
         return {"entity": table, "property": date_binding.get("key_column") or "Date"}
     # A continuous DAY-or-coarser truncation (Day/Week/Month/Quarter/Year-Trunc, the green `t*:`
     # pills) on the active business date is a display-grain axis -> the marked Date table's Calendar
@@ -914,6 +930,14 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
         field["kind"] = "category"
         return field
 
+    if deriv in _DATE_EXACT_DERIVATIONS:
+        # Discrete exact-date VALUE (e.g. MDY = the full date shown as "Month, Day, Year"). This is
+        # just a display format on an ordinary date column -- the same underlying date as a plain
+        # date pill -- so bind it as a normal date column (a date slicer/axis), never drop it.
+        field["binding"] = "column"
+        field["kind"] = "value" if role == "measure" else "category"
+        return field
+
     if deriv not in ("None", "", None):
         warnings.append(_warn(
             "worksheet", worksheet,
@@ -1320,9 +1344,16 @@ def _parse_filters(ws, ds_default, base_cols, instances, index, ds_caption,
                     "members": list(sel["values"]) if sel and sel.get("mode") == "include" else [],
                 })
                 continue
-        # A slicer binds a raw column; an aggregate (SUM(Sales)) or calculated-measure
-        # filter has no faithful slicer mapping -> warn instead of emitting a wrong slicer.
-        if f["binding"] == "aggregation" or f["is_calc"]:
+        # A slicer binds a raw column. An aggregate (SUM(Sales)) or a measure-role /
+        # parameter-comparing calc has no faithful slicer mapping -> warn instead of
+        # emitting a wrong slicer. A row-level DIMENSION calc (an IF/CASE bucket like
+        # "Job Type ") lands as a real sliceable model column, so it IS kept as a slicer;
+        # only calcs that (a) roll up to a measure or (b) compare against a parameter
+        # (whose value isn't a column the slicer can bind) stay warned-and-dropped.
+        _calc_formula = (base_cols.get((ds or ds_default, f["field_id"])) or {}).get("formula") or ""
+        _calc_unsliceable = f["is_calc"] and (
+            f["role"] == "measure" or "[Parameters]" in _calc_formula)
+        if f["binding"] == "aggregation" or _calc_unsliceable:
             warnings.append(_warn(
                 "worksheet", worksheet,
                 f"aggregate/measure filter on '{f['caption']}' is not mapped to a slicer "
@@ -2678,6 +2709,7 @@ def _parse_dashboard(db, worksheet_names, warnings):
     param_controls = []
     legend_zones = []
     filter_field_tokens = set()
+    filter_zones = []
     seen_params = set()
     banner_candidates = []
     ext_w = ext_h = 0.0
@@ -2718,6 +2750,21 @@ def _parse_dashboard(db, worksheet_names, warnings):
             ftok = _split_token_attr(zone.get("param"))
             if ftok[1] is not None:
                 filter_field_tokens.add(ftok)
+                # Keep the card's real geometry + Tableau show ``mode`` (the sibling ``paramctrl`` /
+                # ``color`` branches already retain theirs). Without this, slicer emit has to
+                # fabricate a right-rail stack that a page-height guard truncates to five, dropping
+                # most cards. ``hidden-by-user`` is a Tableau dashboard SHOW/HIDE TOGGLE on a
+                # collapsible filter container -- not a delete -- so it is recorded for diagnostics
+                # but is NOT used to drop the slicer downstream: Power BI has no Tier-1 collapse
+                # equivalent, so the faithful rebuild surfaces the filter (usable) at its authored
+                # position regardless (a dashboard whose whole band is toggled-hidden still rebuilds
+                # its filters).
+                if None not in (x, y, w, h) and w > 0 and h > 0:
+                    filter_zones.append({
+                        "token": ftok, "x": x, "y": y, "w": w, "h": h,
+                        "mode": zone.get("mode"),
+                        "hidden": zone.get("hidden-by-user") == "true",
+                    })
             continue
         # A parameter-control ("hamburger") zone hosts a Tableau parameter on the dashboard.
         # Capture it structurally so the fidelity report is honest about it: Tier-1 rebuilds it
@@ -2749,6 +2796,7 @@ def _parse_dashboard(db, worksheet_names, warnings):
             "extent": {"w": ext_w or None, "h": ext_h or None}, "zones": zones,
             "param_controls": param_controls, "legend_zones": legend_zones,
             "filter_field_tokens": sorted(filter_field_tokens),
+            "filter_zones": filter_zones,
             "title_banner": _select_title_banner(banner_candidates, ext_w, ext_h)}
 
 
@@ -4605,7 +4653,8 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  filter_config=None, title=None, title_style=None, axis_titles=None,
                  value_objects=None,
                  data_point_objects=None, label_objects=None, legend_objects=None,
-                 shape_objects=None, card_label_objects=None, analytics_objects=None):
+                 shape_objects=None, card_label_objects=None, analytics_objects=None,
+                 slicer_mode=None):
     visual = {"visualType": vtype}
     if query_state:
         visual["query"] = {"queryState": query_state}
@@ -4668,6 +4717,16 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     if analytics_objects:
         for _ak, _av in analytics_objects.items():
             visual.setdefault("objects", {})[_ak] = _av
+    # Categorical slicer show mode (Tableau dashboard filter card ``checkdropdown`` -> Power BI
+    # ``'Dropdown'``; ``checklist`` / ``radiolist`` -> ``'Basic'`` List): the data-plane
+    # ``visual.objects.data`` ``mode`` property. Without it Power BI renders its default vertical
+    # List, which does not read as the compact dropdown a top filter band uses. Shape (a single-
+    # quoted semantic-query string literal under ``data[0].properties.mode``) verified against real
+    # PBIR slicer visual.json. Only set for slicers (``slicer_mode`` is None everywhere else), so
+    # every non-slicer visual stays byte-identical.
+    if slicer_mode:
+        visual.setdefault("objects", {})["data"] = [{"properties": {"mode":
+            {"expr": {"Literal": {"Value": _semantic_string_literal(slicer_mode)}}}}}]
     # Small multiples (trellis): the data-plane ``visual.objects.smallMultiple`` formatting card.
     # A ``SmallMultiple`` query role (a Rows paning dimension -> one pane per member) BINDS the
     # field, but Desktop needs this card to actually lay the panes out -- without it the role is
@@ -4924,13 +4983,33 @@ def _slicer_filter_config(field, model_table, field_map, name, warnings):
     return None
 
 
-def _slicer_json(name, field, position, model_table, field_map, *, warnings=None):
+# -- Tableau filter-card show mode -> Power BI slicer mode ---------------------
+# A Tableau dashboard filter card is authored with a show ``mode``: ``checkdropdown`` /
+# ``typeindropdown`` render as a DROPDOWN, while ``checklist`` / ``radiolist`` render as an in-place
+# LIST. Power BI's categorical slicer carries the same choice as its ``mode`` formatting property --
+# ``'Dropdown'`` or ``'Basic'`` (the List rendering). Map dropdown-family modes to ``'Dropdown'`` and
+# list/radio modes to ``'Basic'``, defaulting to ``'Dropdown'`` (the overwhelmingly common Tableau
+# quick-filter style and the compact form a top filter band needs). The Power BI mode names and this
+# categorical mapping are unprotectable PBIR-schema interop facts.
+_LIST_FILTER_MODES = frozenset({"checklist", "radiolist", "radio", "single", "multiple"})
+
+
+def _tableau_filter_mode_to_pbi(mode):
+    m = (mode or "").strip().lower()
+    if "dropdown" in m:
+        return "Dropdown"
+    if m in _LIST_FILTER_MODES:
+        return "Basic"
+    return "Dropdown"
+
+
+def _slicer_json(name, field, position, model_table, field_map, *, mode=None, warnings=None):
     expr, qref, nref = _field_expression(field, model_table, field_map)
     state = {"Values": {"projections": [
         {"field": expr, "queryRef": qref, "nativeQueryRef": nref}]}}
     fc = _slicer_filter_config(field, model_table, field_map, name + "-sel",
                                warnings if warnings is not None else [])
-    return _visual_json(name, "slicer", position, state, filter_config=fc)
+    return _visual_json(name, "slicer", position, state, filter_config=fc, slicer_mode=mode)
 
 
 def _position(x, y, w, h, z=0, tab=0):
@@ -5420,7 +5499,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             records.append(rec)
         visuals += _emit_slicers(
             page_ws, page_name, model_table, field_map, warnings,
-            shown_tokens={tuple(t) for t in (db.get("filter_field_tokens") or ())})
+            shown_tokens={tuple(t) for t in (db.get("filter_field_tokens") or ())},
+            filter_zones=db.get("filter_zones") or [], ref_w=ref_w, ref_h=ref_h)
         visuals += _emit_param_control_slicers(
             ir.get("parameter_controls", []), db["name"], page_name, ref_w, ref_h, warnings)
         # Header band: rebuild the author's full-width title banner (crimson fill + white title) as a
@@ -5553,7 +5633,73 @@ def _reconcile_caption_fallback(warnings, field_map):
     return kept
 
 
-def _emit_slicers(ws_list, page_name, model_table, field_map, warnings=None, shown_tokens=None):
+def _filter_fields_by_token(ws_list):
+    """Map each worksheet filter's raw ``(datasource, field-instance)`` token to its resolved slicer
+    field descriptor, so a dashboard filter *card* (which carries only that token + its own geometry)
+    can be placed as a slicer bound to the real model column. First occurrence wins on a repeated
+    token (the descriptor is identical either way). Uses the same token shape a dashboard
+    ``<zone type-v2='filter' param=...>`` carries -- both go through :func:`_split_token_attr`."""
+    out = {}
+    for ws in ws_list:
+        for f in ws.get("filters", []):
+            ft = f.get("filter_token")
+            if ft is None:
+                continue
+            out.setdefault(tuple(ft), f)
+    return out
+
+
+def _emit_dashboard_slicers(ws_list, page_name, model_table, field_map, filter_zones,
+                            ref_w, ref_h, warnings=None):
+    """Emit one slicer per dashboard filter *card*, at its own scaled position + show mode.
+
+    Each ``filter_zones`` entry is a parsed ``<zone type-v2='filter'>`` (raw token + geometry +
+    Tableau ``mode`` + ``hidden`` flag, from :func:`_parse_dashboard`). A card resolves to its slicer
+    field via the same raw token the matching worksheet filter carries, so the slicer binds the real
+    model column and lands at the card's authored grid position with the faithful dropdown/List mode.
+    There is NO page-height cap, so a full top filter band is rebuilt instead of a five-deep
+    right-rail stack silently truncated by a page guard.
+
+    ``hidden-by-user`` is a Tableau SHOW/HIDE TOGGLE on a collapsible filter container, not a delete;
+    Power BI has no Tier-1 collapse equivalent, so a toggled-hidden card is still surfaced (usable),
+    never dropped -- a dashboard whose whole band is hidden still rebuilds its filters. Cards whose
+    token resolves to no raw column (a calc/date control) are skipped (miss-over-wrong); binding
+    those to their model objects is a separate parity step, not a fabricated raw-column slicer.
+    Distinct model columns are de-duplicated so a field carded twice (e.g. one card per sheet in the
+    band) yields a single slicer."""
+    visuals = []
+    by_token = _filter_fields_by_token(ws_list)
+    seen = set()
+    for i, fz in enumerate(filter_zones):
+        f = by_token.get(tuple(fz.get("token") or ()))
+        if f is None:
+            continue
+        key = (f["entity"], f["property"])
+        if key in seen:
+            continue
+        seen.add(key)
+        x, y, w, h = _scale_zone(fz, ref_w, ref_h)
+        mode = _tableau_filter_mode_to_pbi(fz.get("mode"))
+        vname = _sanitize(f"slicer-{page_name}-{i}-{f['property']}")
+        visuals.append(_slicer_json(
+            vname, f, _position(x, y, w, h, z=1, tab=100 + i),
+            model_table, field_map, mode=mode, warnings=warnings))
+    return visuals
+
+
+def _emit_slicers(ws_list, page_name, model_table, field_map, warnings=None, shown_tokens=None,
+                  filter_zones=None, ref_w=None, ref_h=None):
+    """Emit the page's filter slicers.
+
+    On a dashboard page ``filter_zones`` carries the parsed filter *cards* (geometry + Tableau
+    ``mode`` + ``hidden`` flag); each is placed faithfully at its own scaled zone with the right
+    dropdown/List mode and no page-height cap (see :func:`_emit_dashboard_slicers`). The standalone
+    worksheet-page surface has no dashboard card geometry, so ``filter_zones`` is ``None``/empty
+    there and the original synthetic right-rail stack is kept byte-for-byte (``shown_tokens`` gate
+    unchanged)."""
+    if filter_zones:
+        return _emit_dashboard_slicers(
+            ws_list, page_name, model_table, field_map, filter_zones, ref_w, ref_h, warnings)
     visuals = []
     fields = _filter_slicer_fields(ws_list, shown_tokens)
     for i, f in enumerate(fields):
