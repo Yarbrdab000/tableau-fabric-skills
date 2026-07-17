@@ -45,6 +45,12 @@ except Exception:  # pragma: no cover - tmdl_lint is a sibling module, always im
     def lint_tmdl_text(_text):  # type: ignore
         return []
 
+try:
+    from tmdl_generate import parse_relationships_tmdl
+except Exception:  # pragma: no cover - tmdl_generate is a sibling module, always importable in-package
+    def parse_relationships_tmdl(_text):  # type: ignore
+        return []
+
 _TABLE_PART_RE = re.compile(r"^definition/tables/.+\.tmdl$")
 # a top-level ``table <name>`` declaration (name bare or quoted)
 _TABLE_DECL_RE = re.compile(r"^table\s+(?P<name>'(?:[^']|'')*'|\"[^\"]*\"|\S+)", re.MULTILINE)
@@ -116,12 +122,20 @@ def _typed_columns(text):
 
 
 def _duplicates(seq):
+    """Names that collide CASE-INSENSITIVELY within ``seq`` (each colliding occurrence past the
+    first). Power BI's engine treats a table's column names as case-insensitive, so ``director`` and
+    ``Director`` on one table are a genuine duplicate that makes the table object invalid and the
+    ``.pbip`` unopenable ("Item 'Director' already exists in the collection"). Matching the engine --
+    not a case-sensitive ``set`` -- is what lets this check catch that variant instead of reporting a
+    false clean. An exact duplicate is just the trivial case of a case-insensitive one, so this stays
+    a strict superset of the prior behaviour."""
     seen = set()
     dups = []
     for item in seq:
-        if item in seen and item not in dups:
+        key = item.casefold()
+        if key in seen and item not in dups:
             dups.append(item)
-        seen.add(item)
+        seen.add(key)
     return dups
 
 
@@ -151,6 +165,7 @@ def check_model_openability(parts, flatfile_headers=None):
     typed_declared = True
     typed_in_header = True
     header_check_ran = False
+    declared_cf_by_table = {}   # table_name.casefold() -> {declared column display name.casefold()}
 
     for path in sorted(parts):
         if not _TABLE_PART_RE.match(path):
@@ -158,13 +173,14 @@ def check_model_openability(parts, flatfile_headers=None):
         text = parts[path] or ""
         table = _table_name(text) or path
         declared = _declared_columns(text)
+        declared_cf_by_table[table.casefold()] = {d.casefold() for d in declared}
 
         for dup in _duplicates(declared):
             no_dupes = False
             issues.append({
                 "check": "no_duplicate_columns",
                 "table": table,
-                "detail": "column %r is declared more than once" % dup,
+                "detail": "column %r collides case-insensitively with another column on this table" % dup,
             })
 
         typed = _typed_columns(text)
@@ -193,6 +209,36 @@ def check_model_openability(parts, flatfile_headers=None):
                             "detail": "M types column %r which is not a physical header of the landed file" % tc,
                         })
 
+    # relationship_columns_exist -- every relationship endpoint must reference a column that actually
+    # exists (case-insensitively) on its table. Defense-in-depth for the case-collision rename: a
+    # renamed physical join key whose relationship endpoint was NOT rewritten to match would dangle
+    # onto a non-existent column -- this catches that loud instead of shipping a broken join. It is
+    # secondary to the root-cause endpoint rewrite in assemble_model (which prevents the dangle in the
+    # first place). Fail-safe: only runs when a relationships part exists; an endpoint whose table is
+    # not among the parsed table parts is skipped (never flagged), and a malformed part never raises.
+    rels_present = "definition/relationships.tmdl" in parts
+    rels_ok = True
+    if rels_present:
+        try:
+            parsed_rels = parse_relationships_tmdl(parts.get("definition/relationships.tmdl") or "")
+        except Exception:
+            parsed_rels = []
+        for rel in parsed_rels:
+            for tbl, col in ((rel.get("from_table"), rel.get("from_col")),
+                             (rel.get("to_table"), rel.get("to_col"))):
+                if not tbl or not col:
+                    continue
+                cols_cf = declared_cf_by_table.get(tbl.casefold())
+                if cols_cf is None:
+                    continue  # endpoint table not among parsed table parts -> fail-safe skip
+                if col.casefold() not in cols_cf:
+                    rels_ok = False
+                    issues.append({
+                        "check": "relationship_columns_exist",
+                        "table": tbl,
+                        "detail": "relationship references column %r not declared on table %r" % (col, tbl),
+                    })
+
     checks = {
         "tmdl_wellformed": wellformed,
         "no_duplicate_columns": no_dupes,
@@ -200,5 +246,7 @@ def check_model_openability(parts, flatfile_headers=None):
     }
     if header_check_ran:
         checks["typed_columns_in_header"] = typed_in_header
+    if rels_present:
+        checks["relationship_columns_exist"] = rels_ok
 
     return {"ok": not issues, "checks": checks, "issues": issues}

@@ -26,6 +26,7 @@ with its original formula preserved as a ``TableauFormula`` annotation.
 """
 from __future__ import annotations
 
+import copy
 import re
 
 try:  # package or scripts-on-path
@@ -2239,6 +2240,167 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
             "triage": triage}
 
 
+def _unique_source_name(base, taken_casefold):
+    """``<base> (source)`` -- bumped to ``(source 2)``, ``(source 3)`` ... until its casefold is not
+    already in ``taken_casefold`` -- so the disambiguated physical column name never itself
+    introduces a fresh case-insensitive collision on the table."""
+    cand = "%s (source)" % base
+    if cand.casefold() not in taken_casefold:
+        return cand
+    n = 2
+    while True:
+        cand = "%s (source %d)" % (base, n)
+        if cand.casefold() not in taken_casefold:
+            return cand
+        n += 1
+
+
+def _plan_source_suffix_renames(descriptor, tables, dim_calcs, relationships):
+    """Rename plan for physical columns that case-insensitively collide with a dimension calc that
+    lands on the SAME table.
+
+    Power BI's engine treats column names as case-INSENSITIVE, so a calculated field that is a
+    case-only alias of a physical column -- the common Tableau "prettify a raw DB field" pattern,
+    e.g. calc ``Director = [director]`` beside physical column ``director`` -- would declare two
+    columns whose names collide on one table, and Power BI Desktop refuses to open the ``.pbip``
+    ("Failed to add a deserialized Column object ... Item 'Director' already exists in the
+    collection"). This plans a rename of the *physical* (source-backed) column's MODEL name to
+    ``<name> (source)`` while its ``remote_name`` / ``local_name`` (the source header and the caption
+    the resolver keys on) stay untouched -- so the calc keeps the report-facing name worksheets bind
+    to, and the source column still loads its real header.
+
+    The plan is applied to a DEEP COPY of the descriptor BEFORE the base table TMDL, the field
+    resolver, and the calc DAX are emitted, so the emitted physical column, every generated DAX
+    reference, and the report binder all agree from the start (no fragile post-emission string
+    rewrite). Returns ``{(table_display, physical_model_name): new_model_name}`` -- EMPTY in the
+    common no-collision case, so the caller skips the deep copy and the output is byte-identical.
+
+    Scope: dimension calcs (the reported case; ``dim_calcs`` become calculated COLUMNS, which is
+    where a column-vs-column name clash arises). A residual case-collision from any other path
+    (physical-vs-physical, calc-vs-calc, a rerouted row-level measure) is caught LOUD by the
+    openability self-check (:func:`openability_gate.check_model_openability`, now case-insensitive)
+    rather than silently shipped -- fail-closed by design.
+    """
+    dim_calcs = list(dim_calcs or [])
+    if not dim_calcs:
+        return {}
+    phys_by_table = {}   # table_display -> {model_name.casefold(): model_name}
+    order = []           # table displays in emit order (order[0] is the anchor table)
+    for rel in tables:
+        cols = rel.get("columns") or []
+        if not cols:
+            continue
+        disp = _table_display(rel)
+        idx = phys_by_table.setdefault(disp, {})
+        if disp not in order:
+            order.append(disp)
+        for c in cols:
+            mn = c.get("model_name")
+            if mn:
+                idx.setdefault(mn.casefold(), mn)
+    if not order:
+        return {}
+    # Cheap pre-filter: a collision is possible only when a dim-calc NAME casefold-matches some
+    # physical column model_name. If none do (the overwhelming common case) skip ALL translation.
+    all_phys_cf = set()
+    for idx in phys_by_table.values():
+        all_phys_cf |= set(idx.keys())
+    if not any((c.get("name") or "").casefold() in all_phys_cf for c in dim_calcs):
+        return {}
+
+    anchor = order[0]
+    rels = list(relationships if relationships is not None
+                else (descriptor.get("relationships") or []))
+    probe = build_m_field_resolver(descriptor)
+    known = set(order)
+    # Sibling cascade (shared with _calc_columns_part) so a candidate calc that references another
+    # calc still resolves to a single home table; un-scoped resolver (lambda _c: probe).
+    col_refs = _build_column_refs(dim_calcs, lambda _c: probe, known, relationships=rels)
+
+    calc_cf_by_table = {}   # home -> {calc_name.casefold()} (for a collision-free (source) suffix)
+    homes = []              # (calc_name, home_table)
+    for calc in dim_calcs:
+        name = calc.get("name") or ""
+        if not name:
+            continue
+        try:
+            _dax, _reason, tables_used = translate_tableau_calc_to_column_dax(
+                calc.get("formula", "") or "", probe, column_refs=col_refs, relationships=rels)
+        except Exception:
+            tables_used = set()
+        # Home table follows _calc_columns_part: a single resolved table, else the anchor table.
+        home = next(iter(tables_used)) if len(tables_used) == 1 else anchor
+        homes.append((name, home))
+        calc_cf_by_table.setdefault(home, set()).add(name.casefold())
+
+    plan = {}
+    for name, home in homes:
+        idx = phys_by_table.get(home)
+        if not idx:
+            continue
+        phys_mn = idx.get(name.casefold())
+        if phys_mn is None or (home, phys_mn) in plan:
+            continue
+        # Collision: a physical column on ``home`` casefold-matches the calc name that will be
+        # injected there. Rename the physical column; the calc keeps its report-facing name.
+        taken = set(idx.keys()) | calc_cf_by_table.get(home, set())
+        new = _unique_source_name(phys_mn, taken)
+        plan[(home, phys_mn)] = new
+        idx[new.casefold()] = new   # reserve so a second rename on this table stays unique
+    return plan
+
+
+def _apply_source_suffix_renames(descriptor, plan):
+    """Apply a :func:`_plan_source_suffix_renames` plan onto ``descriptor`` (mutated in place; the
+    caller passes a deep copy). Only the physical column's ``model_name`` changes -- ``remote_name``
+    / ``local_name`` are untouched, so the emitted ``sourceColumn`` still binds the real source
+    header and a ``[caption]`` reference still resolves (now to the renamed model column)."""
+    for rel in descriptor.get("relations", []):
+        if rel.get("kind") not in ("table", "custom_sql"):
+            continue
+        disp = _table_display(rel)
+        for c in rel.get("columns") or []:
+            new = plan.get((disp, c.get("model_name")))
+            if new:
+                c["model_name"] = new
+    # Follow the rename onto the descriptor's own relationship endpoints so a renamed physical join
+    # key keeps its join pointing at the real key (see _rename_relationship_endpoints). Safe on the
+    # deep copy the caller owns; a no-op when the descriptor carries no relationships.
+    if descriptor.get("relationships"):
+        descriptor["relationships"] = _rename_relationship_endpoints(
+            descriptor["relationships"], plan)
+
+
+def _rename_relationship_endpoints(rels, plan):
+    """Return a copy of ``rels`` with any endpoint whose ``(table, column)`` matches a
+    :func:`_plan_source_suffix_renames` plan key rewritten to the renamed model column.
+
+    Part A renames a physical column that case-collides with a dimension calc to ``<name> (source)``.
+    When that physical column is ALSO a relationship join key, the relationship's stored endpoint
+    still names the OLD column; because Power BI resolves an endpoint by column name
+    case-INSENSITIVELY, leaving the old name would silently re-bind the join to the case-colliding
+    calc that triggered the rename (a value-identical alias is harmless, but a calc that reshapes the
+    key would quietly change join results). Rewriting the endpoint the SAME way makes the rename
+    atomic -- exactly how Power BI Desktop rewrites every reference when a column is renamed.
+
+    Pure: never mutates the input dicts (returns new dicts), mirroring the rename-follows-endpoint
+    precedent in :func:`connection_to_m.combine_descriptors`. Returns the list unchanged (shallow
+    copied) when ``plan`` is empty -- the common no-collision case."""
+    if not plan:
+        return list(rels or [])
+    out = []
+    for r in (rels or []):
+        r2 = dict(r)
+        fr = plan.get((r.get("from_table"), r.get("from_col")))
+        if fr:
+            r2["from_col"] = fr
+        to = plan.get((r.get("to_table"), r.get("to_col")))
+        if to:
+            r2["to_col"] = to
+        out.append(r2)
+    return out
+
+
 def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                           relationships=None,
                           hierarchies=None, display_folders=None, rls_roles=None,
@@ -2300,6 +2462,26 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         )
     mode = decision["mode"]
     tables = [r for r in descriptor.get("relations", []) if r["kind"] in ("table", "custom_sql")]
+
+    # Case-insensitive column-name reconciliation. Power BI treats a table's column names as
+    # case-INSENSITIVE, so a calculated field that is a case-only alias of a physical column (calc
+    # ``Director = [director]`` beside physical ``director``) would declare two columns that collide
+    # on one table and make the ``.pbip`` refuse to open. Rename the physical column's MODEL name to
+    # ``<name> (source)`` (its source header untouched, so data still loads) BEFORE the table TMDL,
+    # the field resolver, and the calc DAX are emitted, so every reference agrees from the start.
+    # Inert (no deep copy, byte-identical output) in the common no-collision case; the openability
+    # self-check is the case-insensitive backstop for any residual collision (see
+    # _plan_source_suffix_renames).
+    _source_renames = _plan_source_suffix_renames(descriptor, tables, dim_calcs, relationships)
+    if _source_renames:
+        descriptor = copy.deepcopy(descriptor)
+        _apply_source_suffix_renames(descriptor, _source_renames)
+        tables = [r for r in descriptor.get("relations", []) if r["kind"] in ("table", "custom_sql")]
+        # Explicit-arg path: all_rels reads the ``relationships`` local (not the descriptor), so
+        # follow the rename onto it too. The estate path (relationships is None) already reads the
+        # rewritten descriptor["relationships"] that _apply_source_suffix_renames produced above.
+        if relationships is not None:
+            relationships = _rename_relationship_endpoints(relationships, _source_renames)
 
     parts = {}
     table_names = []
