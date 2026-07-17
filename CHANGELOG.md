@@ -13,6 +13,36 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.54.0` → `1.55.0`): Font/formatting fidelity + §13 geometry fidelity —
+  the report rebuilder now carries a worksheet's typed fonts, cell/container shading, faithful slicer
+  sizing, and each dashboard's real pixel canvas onto the rebuilt PBIR report. Additive and fail-closed —
+  byte-identical on any surface that records no font/fill/geometry override.** Verified against the real
+  `ATTI/ATTR Hierarchy` workbook:
+  - **Typed fonts from the worksheet `<style>`.** New `_parse_style_font` / `_resolve_element_font`
+    resolve a per-element (title / header / pane / cell) font face, size, colour, and bold/italic from the
+    Tableau worksheet style, and `_grid_font_objects` / `_title_style_props` stamp them onto the emitted
+    grid and title. A silent element seeds the Tableau 9pt app default (so every matrix carries a values
+    font), never a fabricated face.
+  - **Cell + container shading.** `_normalize_fill_hex` / `_parse_style_fill` / `_resolve_element_fill`
+    plus `_fill_style_props` / `_container_background_props` translate a recorded worksheet/zone fill into
+    the visual's background, and `_parse_zone_padding` reads a zone's authored inset — emitted only when
+    the author actually set a face (no fill recorded ⇒ no `<format>` written, matching Tableau).
+  - **Faithful slicer sizing.** `_layout_slicers` lays each dashboard filter card out at its own scaled
+    position and show mode with inter-card gaps (`SLICER_PAD_X` / `SLICER_ROW_GUTTER`); a Dropdown card's
+    height is translated directly and floored at `SLICER_DROPDOWN_MIN_H` (64) so Power BI never clips the
+    control, while a List/checklist card keeps its own scaled height (floored at `SLICER_CTRL_H` = 40).
+    `_apply_slicer_format` stamps the compact `SLICER_FONT_PT` (9pt) header/item font.
+  - **§13 per-dashboard page geometry.** Each PBIR page is emitted at the dashboard's OWN fixed pixel
+    canvas from `<size maxwidth/maxheight>` (`_PAGE_W_OVERRIDE` / `_PAGE_H_OVERRIDE`, `_page_w` / `_page_h`)
+    — a 1400×1000 dashboard becomes a 1400×1000 page, a sizeless dashboard falls back to Tableau's own
+    1000×800 default (`DASH_DEFAULT_W/H`), and the override is reset after the loop so a standalone
+    worksheet page keeps the 1280×720 default (no leak).
+  - **§13 shown-state reflow.** `_reflow_worksheets_below_slicers` reproduces Tableau's "Show Filters"
+    reflow: when a surfaced slicer band overlaps a worksheet authored at its hidden-state position, the
+    sheet is pushed below the band bottom and compressed to fit; a band that sits in its own clear space
+    is a no-op (never-regress).
+  - Locked by new hermetic acceptance tests (`test_twb_to_pbir.py` §13 geometry + `test_header_banner.py`
+    font/formatting), all inline-XML fixtures — no customer artifact is committed.
 - **tableau-migration (skill `1.53.0` → `1.54.0`): Rebuilt tables and matrices now default to
   "Grow to fit" column widths.** Every `tableEx` (table) and `pivotTable` (matrix) the report rebuilder
   emits — including the self-service field-parameter table — now carries an explicit

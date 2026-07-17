@@ -110,6 +110,54 @@ SCHEMA_VISUAL_SM = f"{_S}/definition/visualContainer/2.7.0/schema.json"
 MEASURES_TABLE = "_Measures"
 PAGE_WIDTH = 1280
 PAGE_HEIGHT = 720
+# Tableau's own default dashboard canvas (Desktop "Fixed size" default) -- used only as the fallback
+# when a dashboard declares no fixed <size> (e.g. an automatic/range-sized dashboard).
+DASH_DEFAULT_W = 1000
+DASH_DEFAULT_H = 800
+
+# Per-dashboard page dimensions. A Tableau dashboard declares its own fixed pixel canvas via
+# <size maxwidth= maxheight=> (e.g. 1400x1000). We emit the PBIR page at those exact pixel dimensions
+# and scale the zone coordinates straight into it -- so a 1400x1000 dashboard becomes a 1400x1000 page,
+# a 1000x1000 one becomes 1000x1000, etc. (NOT a uniform 1280 width). Tableau normalizes every
+# dashboard's zone coordinates to 100000x100000 PER AXIS regardless of the real pixel aspect, so the
+# real aspect lives ONLY in <size>; mapping the normalized zone rect into the real <size> page (with
+# independent sx = page_w/extent_w, sy = page_h/extent_h) de-normalizes it back to faithful pixels.
+# Both overrides are set per dashboard and reset to None afterwards so standalone worksheet pages stay
+# the default 1280x720 (never-regress).
+_PAGE_W_OVERRIDE = None
+_PAGE_H_OVERRIDE = None
+# A Power BI slicer fills its whole rectangle, unlike a Tableau filter *card*, which renders its
+# control inset inside the zone with padding. Tableau packs filter zones edge-to-edge (tangent in
+# BOTH axes) and relies on that per-card padding for the visible gaps, so emitting a slicer at the
+# raw scaled zone makes neighbours collide. We therefore lay each slicer out as a fixed-height
+# control inset in its zone: a uniform SLICER_CTRL_H tall, horizontally padded by SLICER_PAD_X, and
+# vertically centered inside its (taller) zone -- which reproduces Tableau's inter-card gaps. A zone
+# shorter than the control grows to it and pushes the rows below down (plus SLICER_ROW_GUTTER) so a
+# cramped band never overlaps. The control height is sized for the SLICER_FONT_PT text below: a 9pt
+# header + dropdown fits ~40px, versus the ~52px the oversized Power BI default (~12pt) forced. The
+# font itself is the other half of the fix -- a Power BI slicer defaults to a larger face than
+# Tableau's compact ~9pt filter card, which inflates every card's minimum footprint; stamping the
+# source point size (here 9pt) both matches Tableau and lets the box shrink.
+SLICER_CTRL_H = 40.0
+# A DROPDOWN-mode slicer's height is the real scaled Tableau card height, translated DIRECTLY (no
+# chrome pad added) -- the emitted box tracks the SOURCE card number-for-number, per the user. A small
+# absolute floor (SLICER_DROPDOWN_MIN_H) guarantees a degenerate tiny card still renders its control:
+# Power BI clips a dropdown below ~40px (only the field name shows), so the floor keeps it usable
+# without inflating a card that is already tall enough.
+SLICER_DROPDOWN_MIN_H = 64.0
+SLICER_PAD_X = 7.0
+SLICER_ROW_GUTTER = 8.0
+SLICER_FONT_PT = 9.0
+
+
+def _page_w():
+    """Active page width: the per-dashboard real <size> width override, else the default."""
+    return _PAGE_W_OVERRIDE or PAGE_WIDTH
+
+
+def _page_h():
+    """Active page height: the per-dashboard aspect-faithful override, else the default."""
+    return _PAGE_H_OVERRIDE or PAGE_HEIGHT
 
 # -- Tableau mark class -> internal visual-type enum ---------------------------
 # A small, deliberately conservative enum. The shelf layout decides bar vs column
@@ -1883,6 +1931,287 @@ def _parse_title_style(ws):
     return style
 
 
+# --- Font/formatting-fidelity cascade (Tier-2) -------------------------------
+# Resolve Tableau's per-object <style-rule element='X'> font/shading cascade and stamp the resolved
+# formatting onto the rebuilt PBIR visual. Mirrors _parse_title_style's warn-never-wrong contract:
+# a property is emitted only when every in-scope value agrees; anything ambiguous defers (never a
+# guess). See files handoff spec (Font & Formatting Fidelity full build).
+
+# Tableau's documented per-element DEFAULT font size, transcribed from Tableau Desktop's Format
+# dialogs (build 2026.2) and confirmed by the workbook owner. A Pure-Defaults workbook writes NO
+# font at all, so these app defaults are not recoverable from the file; they are used ONLY as the
+# cascade base layer when the workbook is silent at every level. Any authored <style-rule> overrides
+# them (pure extraction wins). SIZE ONLY: the default family is always a Tableau-internal face
+# (Book/Medium/Light) with no Power BI equivalent, so family is never defaulted; default weight
+# ("Tableau Medium" = semibold) has no clean PBI toggle, so bold is emitted only when authored.
+_TABLEAU_FONT_DEFAULTS = {
+    "quick-filter-title":   {"font_size": "9"},   # filter/set/param title
+    "quick-filter":         {"font_size": "9"},   # filter/set/param body
+    "parameter-ctrl-title": {"font_size": "9"},
+    "parameter-ctrl":       {"font_size": "9"},
+    "worksheet":            {"font_size": "9"},   # worksheet base (cascades to pane/header/cell)
+    "pane":                 {"font_size": "9"},   # matrix/table body
+    "header":               {"font_size": "9"},   # matrix/table headers (+ totals)
+    "cell":                 {"font_size": "9"},
+    "label":                {"font_size": "9"},   # axis / data labels
+    "tooltip":              {"font_size": "10"},
+    "worksheet-title":      {"font_size": "15"},  # sheet title when shown but silent
+    "dashboard-title":      {"font_size": "18"},  # banner
+    "dashboard-text":       {"font_size": "9"},   # dashboard text object
+}
+# Font <format attr=...> names Tableau uses; 'color' and 'font-color' are aliases.
+_FONT_ATTRS = ("font-size", "font-family", "font-weight", "color", "font-color")
+
+
+def _parse_style_font(style, element, *, field=None, data_class=None):
+    """Resolve one rendered element's font from a <style> block's <style-rule element='X'> rules.
+
+    Mirrors _parse_title_style's contract: returns a style dict with any confidently-resolvable
+    {font_size (a "Nd" literal), font_color (#rrggbb), bold (True), font_family (real face)} plus an
+    additive 'deferred' list of property names seen but not uniformly resolvable; None when the
+    element has no font rule at all. A <format> that carries a field= / data-class= applies only to
+    the matching scope (a None scope on the format = applies to all). Warn-never-wrong: a property is
+    emitted only when every in-scope value agrees; conflicting values defer (never guess).
+    """
+    if style is None:
+        return None
+    picks = {}
+    for rule in _children_local(style, "style-rule"):
+        if (rule.get("element") or "").lower() != element.lower():
+            continue
+        for fmt in _children_local(rule, "format"):
+            attr = fmt.get("attr")
+            if attr not in _FONT_ATTRS:
+                continue
+            if fmt.get("field") not in (None, field):
+                continue
+            if fmt.get("data-class") not in (None, data_class):
+                continue
+            picks.setdefault(attr, []).append(fmt.get("value"))
+    if not picks:
+        return None
+
+    def _uniform(attr):
+        vals = [v for v in picks.get(attr, []) if v is not None]
+        return vals[0] if vals and len(set(vals)) == 1 else None
+
+    out, deferred = {}, []
+    size = _font_size_points(_uniform("font-size"))
+    if size is not None:
+        out["font_size"] = size
+    elif picks.get("font-size"):
+        deferred.append("font-size")
+
+    color = _uniform("color") or _uniform("font-color")
+    if color is not None and _HEX6_RE.match(color):
+        out["font_color"] = color
+    elif picks.get("color") or picks.get("font-color"):
+        deferred.append("color")
+
+    if _uniform("font-weight") == "bold":
+        out["bold"] = True
+    elif "font-weight" in picks and _uniform("font-weight") is None:
+        deferred.append("font-weight")
+
+    family = _uniform("font-family")
+    if family is not None and not _TITLE_INTERNAL_FONT_RE.match(family.strip()):
+        out["font_family"] = family.strip()
+    elif picks.get("font-family"):
+        deferred.append("font-family")
+
+    if deferred:
+        out["deferred"] = deferred
+    return out or None
+
+
+def _resolve_element_font(ws_table_style, element, *, field=None, data_class=None,
+                          zone_style=None, wb_style=None):
+    """Compose the effective font for one element across the FULL Tableau cascade, low -> high:
+       (1) Tableau app default (documented, SIZE only)      _TABLEAU_FONT_DEFAULTS[element]
+       (2) workbook <style> default font                    _parse_style_font(wb_style, ...)
+       (3) worksheet sheet-wide default                     _parse_style_font(ws_style, 'worksheet')
+       (4) worksheet element-specific rule                  _parse_style_font(ws_style, element, ...)
+       (5) dashboard <zone-style> override                  _parse_style_font(zone_style, element, ...)
+    Higher layer wins per-property. No invented values beyond the documented (1); layers (2)-(5) are
+    pure extraction from the workbook. Returns {font_size?, font_color?, bold?, font_family?} of only
+    the properties that resolve, or None.
+
+    NOTE layer (3): Tableau writes a sheet-wide default as <style-rule element='worksheet'> (and
+    sometimes 'table'); it cascades to every rendered element on that sheet. This is the layer that
+    carries e.g. this workbook's authored 'Segoe UI' family, so it MUST be composed beneath the
+    element-specific rule.
+    """
+    eff = {}
+    base = _TABLEAU_FONT_DEFAULTS.get(element)
+    if base:
+        sz = _font_size_points(base.get("font_size"))
+        if sz:
+            eff["font_size"] = sz
+    layers = [
+        _parse_style_font(wb_style, element, field=field, data_class=data_class)
+        if wb_style is not None else None,
+        _parse_style_font(ws_table_style, "worksheet"),
+        _parse_style_font(ws_table_style, "table"),
+        _parse_style_font(ws_table_style, element, field=field, data_class=data_class),
+        _parse_style_font(zone_style, element, field=field, data_class=data_class)
+        if zone_style is not None else None,
+    ]
+    for layer in layers:
+        if not layer:
+            continue
+        for k in ("font_size", "font_color", "bold", "font_family"):
+            if k in layer:
+                eff[k] = layer[k]
+    return eff or None
+
+
+# --- Shading / fill (companion pass: background-color -> PBIR fill) -----------
+# Shading resolves through the SAME cascade as fonts but is a separate property. No documented app
+# default is seeded -- Tableau's default sheet/filter background is *no shading*, so fills are pure
+# extraction only (a silent element gets no fill).
+_SHADE_ATTRS = ("background-color", "band-color", "shading")
+# 8-digit #rrggbbAA (Tableau writes alpha); 6-digit handled by the existing _HEX6_RE.
+_HEX8_RE = re.compile(r"^#[0-9a-fA-F]{8}$")
+# Sentinel: element explicitly resolved to a fully-transparent fill => emit NO fill (never a box).
+_FILL_NONE = object()
+
+
+def _normalize_fill_hex(value):
+    """Warn-never-wrong hex normaliser for a fill value:
+         '#rrggbb'                -> '#rrggbb'      (opaque, emit)
+         '#rrggbbff'              -> '#rrggbb'      (opaque alpha, strip -> emit)
+         '#rrggbb00' / any AA==00 -> _FILL_NONE     (fully transparent -> emit no fill)
+         '#rrggbbAA' (other alpha) / malformed -> None (defer; never guess a blend)
+    """
+    if not value:
+        return None
+    v = value.strip()
+    if _HEX6_RE.match(v):
+        return v.lower()
+    if _HEX8_RE.match(v):
+        rgb, aa = v[:7].lower(), v[7:9].lower()
+        if aa == "ff":
+            return rgb
+        if aa == "00":
+            return _FILL_NONE
+        return None          # partial alpha -> defer (no faithful single-hex blend)
+    return None
+
+
+def _parse_style_fill(style, element, *, field=None, data_class=None):
+    """Companion to _parse_style_font: resolve one element's SHADING from a <style> block.
+    Returns {'fill': '#rrggbb'} (opaque), {'fill': _FILL_NONE} (explicitly transparent -> no fill),
+    {'deferred': ['background-color']} (partial-alpha/conflict), or None (no fill rule).
+    Same scope rules as _parse_style_font (field / data-class; None scope applies to all).
+    """
+    if style is None:
+        return None
+    picks = []
+    for rule in _children_local(style, "style-rule"):
+        if (rule.get("element") or "").lower() != element.lower():
+            continue
+        for fmt in _children_local(rule, "format"):
+            if fmt.get("attr") not in _SHADE_ATTRS:
+                continue
+            if fmt.get("field") not in (None, field):
+                continue
+            if fmt.get("data-class") not in (None, data_class):
+                continue
+            picks.append(fmt.get("value"))
+    if not picks:
+        return None
+    vals = [v for v in picks if v is not None]
+    if not vals or len(set(vals)) != 1:          # conflicting deltas -> defer
+        return {"deferred": ["background-color"]}
+    norm = _normalize_fill_hex(vals[0])
+    if norm is None:                              # partial alpha / malformed -> defer
+        return {"deferred": ["background-color"]}
+    return {"fill": norm}                         # opaque hex or _FILL_NONE
+
+
+def _resolve_element_fill(ws_table_style, element, *, field=None, data_class=None,
+                          zone_style=None, wb_style=None):
+    """Compose the effective FILL across the cascade (low -> high), pure extraction (no base default).
+    A higher opaque layer wins; a higher _FILL_NONE layer explicitly clears a lower fill (transparent
+    override is a real authored decision). Returns {'fill': '#rrggbb'} to emit, or None to emit
+    nothing (either no rule anywhere, or the winning layer is transparent)."""
+    eff = None
+    layers = [
+        _parse_style_fill(wb_style, element, field=field, data_class=data_class)
+        if wb_style is not None else None,
+        _parse_style_fill(ws_table_style, "worksheet"),
+        _parse_style_fill(ws_table_style, "table"),
+        _parse_style_fill(ws_table_style, element, field=field, data_class=data_class),
+        _parse_style_fill(zone_style, element, field=field, data_class=data_class)
+        if zone_style is not None else None,
+    ]
+    for layer in layers:
+        if layer and "fill" in layer:
+            eff = layer["fill"]                   # opaque hex OR _FILL_NONE (transparent wins if higher)
+    if not eff or eff is _FILL_NONE:
+        return None                               # nothing to paint
+    return {"fill": eff}
+
+
+def _fill_style_props(fill):
+    """A resolved fill dict -> the PBIR data-plane fill property 'backColor' (matrix/table channels:
+    values / columnHeaders / rowHeaders / subTotals). Single-quoted hex literal, same shape as
+    fontColor. Merge these into the SAME per-channel 'properties' dict as _font_style_props so a
+    channel can carry both a face and a plate."""
+    props = {}
+    if fill and fill.get("fill"):
+        props["backColor"] = {"solid": {"color": {"expr": {"Literal": {
+            "Value": _semantic_string_literal(fill["fill"])}}}}}
+    return props
+
+
+def _container_background_props(fill):
+    """A resolved fill -> the visual-CONTAINER background 'properties' (color + show), the shape the
+    banner/textbox already emits. None -> caller passes container_objects=None (no plate)."""
+    if not fill or not fill.get("fill"):
+        return None
+    return {
+        "color": {"solid": {"color": {"expr": {"Literal": {
+            "Value": _semantic_string_literal(fill["fill"])}}}}},
+        "show": {"expr": {"Literal": {"Value": "true"}}},
+    }
+
+
+# --- Object padding (margin = outer, padding = inner; defaults 4 / 0) ---------
+# Tableau Layout-panel defaults (px): Outer Padding = 4 all sides (stored <format attr='margin'>),
+# Inner Padding = 0 all sides (stored <format attr='padding'>). NOTE the naming flip: UI "Outer" ->
+# XML 'margin'; UI "Inner" -> XML 'padding'.
+_TABLEAU_PADDING_DEFAULTS = {"outer": 4, "inner": 0}
+_SIDES = ("top", "right", "bottom", "left")
+
+
+def _parse_zone_padding(zone_style):
+    """Resolve a dashboard object's outer (margin) + inner (padding) box from its <zone-style>.
+    Returns {'outer': {top,right,bottom,left}, 'inner': {top,right,bottom,left}} in px. An all-sides
+    <format attr='margin'|'padding' value='N'> seeds all four; a per-side 'margin-top' etc. overrides
+    that side. When a family is entirely silent, the documented default (4 outer / 0 inner) fills it.
+    A non-numeric value is ignored (keeps the default)."""
+    def _num(v):
+        try:
+            return max(0, int(round(float(v))))
+        except (TypeError, ValueError):
+            return None
+    fmts = {}
+    for fmt in _children_local(zone_style, "format") if zone_style is not None else []:
+        fmts[fmt.get("attr")] = fmt.get("value")
+    box = {}
+    for ui, xml_attr in (("outer", "margin"), ("inner", "padding")):
+        base = _num(fmts.get(xml_attr))
+        if base is None:
+            base = _TABLEAU_PADDING_DEFAULTS[ui]      # documented fallback only when silent
+        sides = {}
+        for s in _SIDES:
+            per = _num(fmts.get("{0}-{1}".format(xml_attr, s)))
+            sides[s] = per if per is not None else base
+        box[ui] = sides
+    return box
+
+
 # Cartesian visual types that carry an explicit category/value axis pair whose titles can be
 # faithfully reproduced. Pie/scatter/matrix/etc. either lack a category-vs-value axis split or
 # put measures on both axes, so an axis-title override there is deferred (warn-never-wrong).
@@ -2627,6 +2956,29 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
 
     title_style = _parse_title_style(ws) if title_text else None
 
+    # Font/shading fidelity for any filter cards this worksheet owns: resolve the slicer header
+    # (quick-filter-title), items (quick-filter) faces + the card plate from the worksheet's
+    # <table><style> cascade, so a dashboard slicer reproduces the authored face + grey plate
+    # rather than Power BI's oversized default. Resolves to the documented 9pt size when silent.
+    _tbl_style = _first(table, "style") if table is not None else None
+    filter_hdr_style = _resolve_element_font(_tbl_style, "quick-filter-title")
+    filter_itm_style = _resolve_element_font(_tbl_style, "quick-filter")
+    filter_plate_fill = _resolve_element_fill(_tbl_style, "quick-filter")
+    # Grid (matrix/table) header / body / total faces + plates from the same cascade -- resolves to
+    # the documented 9pt when silent, matching Tableau's compact grid instead of Power BI's larger
+    # default. Only consumed for the matrix/table family at emit time (_grid_font_objects).
+    grid_styles = {
+        "header": _resolve_element_font(_tbl_style, "header"),
+        "body": (_resolve_element_font(_tbl_style, "pane")
+                 or _resolve_element_font(_tbl_style, "cell")),
+        "header_fill": _resolve_element_fill(_tbl_style, "header"),
+        "body_fill": (_resolve_element_fill(_tbl_style, "pane")
+                      or _resolve_element_fill(_tbl_style, "cell")),
+        "total": _resolve_element_font(_tbl_style, "header", data_class="total"),
+        "subtotal_fill": (_resolve_element_fill(_tbl_style, "header", data_class="subtotal")
+                          or _resolve_element_fill(_tbl_style, "pane", data_class="subtotal")),
+    }
+
     axis_titles = {}
     if visual_type in _AXIS_TITLE_TYPES:
         axis_titles = _parse_axis_titles(table, dims_rows, dims_cols, meas_rows, meas_cols)
@@ -2683,6 +3035,10 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "visual_type": visual_type,
         "title": title_text,
         "title_style": title_style,
+        "filter_hdr_style": filter_hdr_style,
+        "filter_itm_style": filter_itm_style,
+        "filter_plate_fill": filter_plate_fill,
+        "grid_styles": grid_styles,
         "axis_titles": axis_titles,
         "color_gradient": color_gradient,
         "mark_colors": mark_colors,
@@ -4769,7 +5125,7 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  value_objects=None,
                  data_point_objects=None, label_objects=None, legend_objects=None,
                  shape_objects=None, card_label_objects=None, analytics_objects=None,
-                 slicer_mode=None):
+                 slicer_mode=None, font_objects=None):
     visual = {"visualType": vtype}
     if query_state:
         visual["query"] = {"queryState": query_state}
@@ -4879,6 +5235,18 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
                 "show": {"expr": {"Literal": {"Value": "false"}}},
             }}],
         }
+    # Font/formatting fidelity (Tier-2, resolved from the Tableau <style> cascade): per-channel
+    # format objects (columnHeaders/values/... for grids; categoryAxis/valueAxis for axes). Each
+    # channel's "properties" dict may carry BOTH font props (_font_style_props) AND a fill (backColor,
+    # _fill_style_props) -- they share one dict, so one merge loop handles both.
+    # ``setdefault(...).update(...)`` composes with any channel object an earlier pass added (e.g. the
+    # ``values`` gradient, ``columnHeaders`` grow-to-fit) rather than clobbering it. Emitted only when
+    # the cascade resolved a face. (Slicer header/items/plate are applied separately, post-build, by
+    # _apply_slicer_format -- a slicer never routes its format through font_objects.)
+    if font_objects:
+        for _fk, _fv in font_objects.items():
+            visual.setdefault("objects", {}).setdefault(_fk, [{"properties": {}}])
+            visual["objects"][_fk][0]["properties"].update(_fv[0]["properties"])
     # Small-multiples visuals need a newer schema (see SCHEMA_VISUAL_SM): Desktop drops a
     # SmallMultiple role on the legacy 1.0.0 stamp. The bump is gated to exactly those visuals so the
     # verified non-trellis gates keep their proven 1.0.0 stamp.
@@ -4915,31 +5283,60 @@ def _semantic_string_literal(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def _title_style_props(title_style):
-    """Uniform title font styling -> ``visualContainerObjects.title`` property entries.
-
-    Emits the schema-grounded container-title font properties -- ``fontSize`` (a numeric ``"Nd"``
-    literal), ``fontColor`` (a solid single-quoted hex literal), ``bold`` (a quoted-boolean weight),
-    and ``fontFamily`` (a single-quoted real font face) -- all verified against the Microsoft PBIR
-    visual-title reference. Any ``deferred`` styling recorded on the style dict (italic / underline /
-    alignment / Tableau-internal family / non-uniform values) is intentionally NOT emitted
-    (warn-never-wrong)."""
+def _font_style_props(style):
+    """A resolved font dict -> PBIR object 'properties' entries: fontSize (Nd literal),
+    fontColor (solid single-quoted hex), bold (quoted boolean), fontFamily (single-quoted face).
+    Shared by title / slicer / grid / axis channels -- the property NAMES are identical across them.
+    Any 'deferred' styling recorded on the style dict is intentionally NOT emitted (warn-never-wrong).
+    """
     props = {}
-    if not title_style:
+    if not style:
         return props
-    size = title_style.get("font_size")
+    size = style.get("font_size")
     if size:
         props["fontSize"] = {"expr": {"Literal": {"Value": size}}}
-    color = title_style.get("font_color")
+    color = style.get("font_color")
     if color:
         props["fontColor"] = {"solid": {"color": {"expr": {"Literal": {
             "Value": _semantic_string_literal(color)}}}}}
-    if title_style.get("bold"):
+    if style.get("bold"):
         props["bold"] = {"expr": {"Literal": {"Value": "true"}}}
-    family = title_style.get("font_family")
+    family = style.get("font_family")
     if family:
         props["fontFamily"] = {"expr": {"Literal": {"Value": _semantic_string_literal(family)}}}
     return props
+
+
+def _title_style_props(title_style):
+    """Uniform title font styling -> ``visualContainerObjects.title`` property entries. Delegates to
+    the shared :func:`_font_style_props` (the property names are identical); kept as a named wrapper
+    so the existing title callers are unchanged."""
+    return _font_style_props(title_style)
+
+
+def _grid_font_objects(ws):
+    """Build the matrix/table per-channel format objects (columnHeaders / rowHeaders / values /
+    subTotals) from the worksheet's resolved grid styles, each carrying resolved font props and/or a
+    backColor plate. Only the grid family; None for anything else so other visuals stay unchanged."""
+    if not ws or ws.get("visual_type") not in (VT_MATRIX, VT_TABLE):
+        return None
+    gs = ws.get("grid_styles") or {}
+    fo = {}
+
+    def _put(channel, font, fill):
+        props = {}
+        if font:
+            props.update(_font_style_props(font))
+        if fill:
+            props.update(_fill_style_props(fill))
+        if props:
+            fo[channel] = [{"properties": props}]
+
+    _put("columnHeaders", gs.get("header"), gs.get("header_fill"))
+    _put("rowHeaders", gs.get("header"), gs.get("header_fill"))
+    _put("values", gs.get("body"), gs.get("body_fill"))
+    _put("subTotals", gs.get("total"), gs.get("subtotal_fill"))
+    return fo or None
 
 
 def _semantic_numeric_literal(value):
@@ -5123,13 +5520,48 @@ def _tableau_filter_mode_to_pbi(mode):
     return "Dropdown"
 
 
+def _apply_slicer_format(visual, hdr_style=None, itm_style=None, plate_fill=None):
+    """Stamp the resolved Tableau quick-filter style onto an already-built slicer visual.
+
+    ``hdr_style`` / ``itm_style`` are resolved font dicts (family/size/weight/color) for the slicer
+    header (the filter caption) and the item list; each maps to a PBIR ``objects.header`` /
+    ``objects.items`` font block via :func:`_font_style_props`. ``plate_fill`` is the resolved slicer
+    background fill -> a ``visualContainerObjects.background`` via :func:`_container_background_props`.
+    All three are applied post-build (a slicer NEVER routes its format through ``_visual_json``'s
+    ``font_objects`` channel-merge) with ``setdefault(...).update(...)`` so an existing header/items
+    object or plate is composed with, not clobbered. A falsy arg is skipped -> that face keeps its
+    Power BI default.
+    """
+    if hdr_style:
+        visual.setdefault("objects", {}).setdefault(
+            "header", [{"properties": {}}])[0]["properties"].update(_font_style_props(hdr_style))
+    if itm_style:
+        visual.setdefault("objects", {}).setdefault(
+            "items", [{"properties": {}}])[0]["properties"].update(_font_style_props(itm_style))
+    cont = _container_background_props(plate_fill) if plate_fill else None
+    if cont:
+        visual.setdefault("visualContainerObjects", {}).setdefault(
+            "background", [{"properties": {}}])[0]["properties"].update(cont)
+
+
 def _slicer_json(name, field, position, model_table, field_map, *, mode=None, warnings=None):
     expr, qref, nref = _field_expression(field, model_table, field_map)
     state = {"Values": {"projections": [
         {"field": expr, "queryRef": qref, "nativeQueryRef": nref}]}}
     fc = _slicer_filter_config(field, model_table, field_map, name + "-sel",
                                warnings if warnings is not None else [])
-    return _visual_json(name, "slicer", position, state, filter_config=fc, slicer_mode=mode)
+    out = _visual_json(name, "slicer", position, state, filter_config=fc, slicer_mode=mode)
+    # Slicer face font defaults to Tableau's 9pt quick-filter text; the plate has no default (absent
+    # -> Power BI's own slicer background). The ws->field style stash (``_slicer_hdr``/``_slicer_itm``/
+    # ``_slicer_plate``) is set in _filter_fields_by_token, where the owning worksheet is in scope; a
+    # freshly-built field dict (e.g. a parameter-control slicer) carries none -> the 9pt fallback.
+    _default_pt = {"font_size": _font_size_points("9")}
+    _apply_slicer_format(
+        out["visual"],
+        hdr_style=(field.get("_slicer_hdr") if isinstance(field, dict) else None) or _default_pt,
+        itm_style=(field.get("_slicer_itm") if isinstance(field, dict) else None) or _default_pt,
+        plate_fill=(field.get("_slicer_plate") if isinstance(field, dict) else None))
+    return out
 
 
 def _position(x, y, w, h, z=0, tab=0):
@@ -5138,12 +5570,14 @@ def _position(x, y, w, h, z=0, tab=0):
 
 
 def _scale_zone(zone, ref_w, ref_h):
-    sx = PAGE_WIDTH / ref_w if ref_w else 1
-    sy = PAGE_HEIGHT / ref_h if ref_h else 1
-    x = max(0.0, min(zone["x"] * sx, PAGE_WIDTH - 1))
-    y = max(0.0, min(zone["y"] * sy, PAGE_HEIGHT - 1))
-    w = max(40.0, min(zone["w"] * sx, PAGE_WIDTH - x))
-    h = max(40.0, min(zone["h"] * sy, PAGE_HEIGHT - y))
+    pw = _page_w()
+    ph = _page_h()
+    sx = pw / ref_w if ref_w else 1
+    sy = ph / ref_h if ref_h else 1
+    x = max(0.0, min(zone["x"] * sx, pw - 1))
+    y = max(0.0, min(zone["y"] * sy, ph - 1))
+    w = max(40.0, min(zone["w"] * sx, pw - x))
+    h = max(40.0, min(zone["h"] * sy, ph - y))
     return x, y, w, h
 
 
@@ -5153,8 +5587,8 @@ def _page_json(name, display_name):
         "name": name,
         "displayName": display_name,
         "displayOption": "FitToPage",
-        "height": PAGE_HEIGHT,
-        "width": PAGE_WIDTH,
+        "height": _page_h(),
+        "width": _page_w(),
     }
 
 
@@ -5174,7 +5608,7 @@ def _dumps(obj):
 # The banner font size is fixed rather than lifted from the source run: a scaled header band is a
 # few dozen px tall, so a single "reasonably large" bold size reads as a header at any page scale
 # (the source point size, tuned to Tableau's own banner geometry, does not transfer 1:1).
-_BANNER_FONT_SIZE = "20pt"
+_BANNER_FONT_SIZE = "18pt"
 
 
 def _banner_textbox_visual(name, position, banner):
@@ -5531,6 +5965,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     page_order = []
     placed = set()
 
+    global _PAGE_H_OVERRIDE, _PAGE_W_OVERRIDE
     for db in ir["dashboards"]:
         page_name = _sanitize("page-" + (db["name"] or "dashboard"))
         zones = db["zones"]
@@ -5538,6 +5973,14 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                  or db["size"]["w"])
         ref_h = (db["extent"]["h"] or max((z["y"] + z["h"] for z in zones), default=0)
                  or db["size"]["h"])
+        # Emit the page at the dashboard's OWN fixed pixel canvas (<size maxwidth/maxheight>), so a
+        # 1400x1000 Tableau dashboard becomes a 1400x1000 page -- exact number-for-number match, aspect
+        # preserved. Tableau normalizes the zone coords to a square 100000x100000 (see _scale_zone),
+        # so the real aspect is recoverable ONLY from <size>; scaling the normalized rect into the real
+        # page (independent sx/sy) de-normalizes it back to faithful pixels. Fallback (no fixed size):
+        # Tableau's own 1000x800 default canvas.
+        _PAGE_W_OVERRIDE = db["size"]["w"] or DASH_DEFAULT_W
+        _PAGE_H_OVERRIDE = db["size"]["h"] or DASH_DEFAULT_H
         visuals = []
         page_ws = []
         for i, zone in enumerate(zones):
@@ -5598,7 +6041,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 value_objects=value_objects, data_point_objects=data_point_objects,
                 label_objects=label_objects, legend_objects=legend_objects,
                 shape_objects=shape_objects, card_label_objects=card_label_objects,
-                analytics_objects=analytics_objects))
+                analytics_objects=analytics_objects,
+                font_objects=_grid_font_objects(ws)))
             rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                     page_display=db["name"] or page_name,
                                     model_table=model_table, field_map=field_map)
@@ -5640,6 +6084,11 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 _sanitize(f"v-{page_name}-banner"),
                 _position(bx, by, bw, bh, z=1000, tab=0),
                 banner))
+        # Shown-state reflow: if the slicers we surfaced (a hidden/collapsed Tableau filter band) now
+        # collide with a worksheet zone authored at its hidden-state position, push the sheets below the
+        # band and compress to fit -- exactly what Tableau does on "Show Filters". No-op when nothing
+        # overlaps (never-regress).
+        _reflow_worksheets_below_slicers(visuals, _page_h())
         if not visuals:
             warnings.append(_warn("dashboard", db["name"],
                                   "no supported visuals on this dashboard"))
@@ -5647,6 +6096,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         _emit_page(parts, page_name, db["name"] or page_name, visuals)
         page_order.append(page_name)
 
+    _PAGE_W_OVERRIDE = None
+    _PAGE_H_OVERRIDE = None
     for ws in ir["worksheets"]:
         if ws["name"] in placed or ws["visual_type"] == VT_UNSUPPORTED:
             continue
@@ -5697,7 +6148,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             value_objects=value_objects, data_point_objects=data_point_objects,
             label_objects=label_objects, shape_objects=shape_objects,
             card_label_objects=card_label_objects,
-            analytics_objects=analytics_objects)
+            analytics_objects=analytics_objects,
+            font_objects=_grid_font_objects(ws))
         rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                 page_display=ws["name"],
                                 model_table=model_table, field_map=field_map)
@@ -5770,8 +6222,51 @@ def _filter_fields_by_token(ws_list):
             ft = f.get("filter_token")
             if ft is None:
                 continue
+            # Carry the owning worksheet's resolved slicer formatting onto the field, so the
+            # dashboard card rebuilds with the authored face + plate (all filters on a sheet share it).
+            f.setdefault("_slicer_hdr", ws.get("filter_hdr_style"))
+            f.setdefault("_slicer_itm", ws.get("filter_itm_style"))
+            f.setdefault("_slicer_plate", ws.get("filter_plate_fill"))
             out.setdefault(tuple(ft), f)
     return out
+
+
+def _layout_slicers(entries, *, ctrl_h=SLICER_CTRL_H, pad_x=SLICER_PAD_X,
+                    gutter=SLICER_ROW_GUTTER, tol=8.0):
+    """In place: turn raw tangent slicer zones into an evenly-gapped grid.
+
+    Tableau packs filter zones edge-to-edge and relies on each card's internal padding for the
+    visible gaps; a Power BI slicer instead fills its whole rectangle, so the raw zones collide.
+    Each slicer is inset horizontally by ``pad_x`` (reproducing Tableau's inter-card gaps) and its
+    height is taken from the REAL scaled card: a DROPDOWN card's height is translated DIRECTLY from the
+    Tableau card (floored at ``SLICER_DROPDOWN_MIN_H`` so a tiny card still renders its control), and a
+    List/other card keeps its own height (floored at ``ctrl_h``). Nothing is a hardcoded fixed
+    size -- the emitted height tracks the source card. When a row's control ends up taller than its
+    source zone, the rows below shift down by the growth plus ``gutter`` so tangent bands never
+    overlap. Rows are clustered by top-y (``tol`` px)."""
+    if not entries:
+        return
+    rows = []
+    for e in sorted(entries, key=lambda z: z["y"]):
+        if rows and abs(e["y"] - rows[-1][0]["y"]) <= tol:
+            rows[-1].append(e)
+        else:
+            rows.append([e])
+    shift = 0.0
+    for row in rows:
+        top = min(e["y"] for e in row) + shift
+        zone_h = max(e["h"] for e in row)
+        if any(e.get("mode") == "Dropdown" for e in row):
+            box = max(zone_h, SLICER_DROPDOWN_MIN_H)
+        else:
+            box = max(zone_h, ctrl_h)
+        for e in row:
+            e["y"] = round(top, 2)
+            e["h"] = round(box, 2)
+            e["x"] = round(e["x"] + pad_x, 2)
+            e["w"] = round(max(40.0, e["w"] - 2.0 * pad_x), 2)
+        grew = box - zone_h
+        shift += grew + (gutter if grew > 0 else 0.0)
 
 
 def _emit_dashboard_slicers(ws_list, page_name, model_table, field_map, filter_zones,
@@ -5795,6 +6290,7 @@ def _emit_dashboard_slicers(ws_list, page_name, model_table, field_map, filter_z
     visuals = []
     by_token = _filter_fields_by_token(ws_list)
     seen = set()
+    entries = []
     for i, fz in enumerate(filter_zones):
         f = by_token.get(tuple(fz.get("token") or ()))
         if f is None:
@@ -5804,11 +6300,17 @@ def _emit_dashboard_slicers(ws_list, page_name, model_table, field_map, filter_z
             continue
         seen.add(key)
         x, y, w, h = _scale_zone(fz, ref_w, ref_h)
-        mode = _tableau_filter_mode_to_pbi(fz.get("mode"))
-        vname = _sanitize(f"slicer-{page_name}-{i}-{f['property']}")
+        entries.append({"x": x, "y": y, "w": w, "h": h,
+                        "mode": _tableau_filter_mode_to_pbi(fz.get("mode")),
+                        "f": f, "i": i})
+    # Reproduce Tableau's inter-card gaps: inset each slicer inside its (tangent) zone as a uniform
+    # centered control so neighbouring rows/columns no longer collide (see _layout_slicers).
+    _layout_slicers(entries)
+    for e in entries:
+        vname = _sanitize(f"slicer-{page_name}-{e['i']}-{e['f']['property']}")
         visuals.append(_slicer_json(
-            vname, f, _position(x, y, w, h, z=1, tab=100 + i),
-            model_table, field_map, mode=mode, warnings=warnings))
+            vname, e["f"], _position(e["x"], e["y"], e["w"], e["h"], z=1, tab=100 + e["i"]),
+            model_table, field_map, mode=e["mode"], warnings=warnings))
     return visuals
 
 
@@ -5867,6 +6369,49 @@ def _emit_param_control_slicers(controls, db_name, page_name, ref_w, ref_h, warn
             vname, field, _position(x, y, w, h, z=1, tab=200 + i),
             None, None, warnings=warnings))
     return visuals
+
+
+def _reflow_worksheets_below_slicers(visuals, page_h, *, gap=8.0, tol=1.0):
+    """Reproduce Tableau's SHOWN-state reflow when surfaced slicers collide with worksheet content.
+
+    On a dashboard whose filter band is ``hidden-by-user`` (collapsed behind the funnel icon), Tableau
+    reflows the sheets UP to fill the freed space, so the authored zone coords put the sheets where the
+    filters would be. We choose to SHOW those filters as slicers (Power BI has no collapse toggle), which
+    reintroduces the band -- so a sheet authored at the hidden-state position now overlaps the slicers
+    (the ATTI card at y=241 under a filter band at y~211-320). This mirrors what Tableau itself does the
+    moment you click "Show Filters": the sheet stack is pushed BELOW the band and compressed to fit the
+    remaining canvas (ATTI -> y~351, h~285). We reflow the ``z==0`` worksheet visuals into
+    ``[band_bottom+gap, page_h]`` proportionally, keeping their relative layout.
+
+    Guard: only fires when a worksheet visual actually intersects the slicer band -- a dashboard whose
+    slicers sit in their own clear band (no overlap) is untouched (never-regress). Slicers (``z==1``) and
+    the banner (``z==1000``) are never moved; only worksheet content is reflowed."""
+    slicers = [v for v in visuals if (v.get("position") or {}).get("z") == 1]
+    content = [v for v in visuals if (v.get("position") or {}).get("z") == 0]
+    if not slicers or not content:
+        return
+    band_top = min(v["position"]["y"] for v in slicers)
+    band_bottom = max(v["position"]["y"] + v["position"]["height"] for v in slicers)
+    intersect = [v for v in content
+                 if v["position"]["y"] < band_bottom - tol
+                 and v["position"]["y"] + v["position"]["height"] > band_top + tol]
+    if not intersect:
+        return
+    # Move every sheet at or below the band start (content strictly ABOVE the band -- e.g. a header
+    # sheet -- stays put). Compress the [orig_top, page_h] span into [new_top, page_h].
+    movable = [v for v in content
+               if v["position"]["y"] + v["position"]["height"] > band_top + tol]
+    orig_top = min(v["position"]["y"] for v in movable)
+    new_top = band_bottom + gap
+    avail = page_h - new_top
+    span = page_h - orig_top
+    if avail <= 0 or span <= 0:
+        return
+    scale = avail / span
+    for v in movable:
+        p = v["position"]
+        p["y"] = round(new_top + (p["y"] - orig_top) * scale, 2)
+        p["height"] = round(p["height"] * scale, 2)
 
 
 def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",

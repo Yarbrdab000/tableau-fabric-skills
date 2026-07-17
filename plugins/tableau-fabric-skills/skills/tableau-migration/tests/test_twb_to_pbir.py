@@ -1337,9 +1337,13 @@ def test_dashboard_zone_scales_within_page_bounds_and_one_page_per_dashboard():
     parts = emit_pbir(parse_twb(_workbook(ws, dash)))
     page_jsons = [k for k in parts if k.endswith("page.json")]
     assert len(page_jsons) == 1
+    # §13 geometry: the page adopts the dashboard's real <size> (1200x800), not the fixed
+    # 1280x720 default; the placed zone scales within those real page bounds.
+    page = json.loads(parts[page_jsons[0]])
+    assert (page["width"], page["height"]) == (1200, 800)
     pos = list(_visual_parts(parts).values())[0]["position"]
-    assert 0 <= pos["x"] and pos["x"] + pos["width"] <= PAGE_WIDTH
-    assert 0 <= pos["y"] and pos["y"] + pos["height"] <= PAGE_HEIGHT
+    assert 0 <= pos["x"] and pos["x"] + pos["width"] <= page["width"]
+    assert 0 <= pos["y"] and pos["y"] + pos["height"] <= page["height"]
 
 
 def test_orphan_worksheet_gets_its_own_page():
@@ -4091,6 +4095,16 @@ def _values_objects(visual_json):
     return visual_json["visual"].get("objects", {}).get("values")
 
 
+def _values_backcolor(visual_json):
+    # The conditional-format FILL only: a matrix/table now always carries an additive compact-grid
+    # font on ``values`` (documented 9pt), so presence of a ``values`` object no longer implies a
+    # fill. Assert on the ``backColor`` heat rule specifically.
+    vo = _values_objects(visual_json)
+    if not vo:
+        return None
+    return vo[0].get("properties", {}).get("backColor")
+
+
 def _fill_rule(values_objects):
     return (values_objects[0]["properties"]["backColor"]["solid"]["color"]
             ["expr"]["FillRule"])
@@ -4196,9 +4210,10 @@ def test_table_calc_colour_driver_defers_with_palette_preserved():
     res = migrate_twb_to_pbir(_workbook(
         _heat_ws("Heat", color_field="pcdf:Calculation_1:qk", encodings=enc, style=style,
                  deps_extra=_INST + calc_col + calc_inst)))
-    # no fill emitted on the visual
+    # no conditional-format fill emitted on the visual (the additive compact-grid font may ride
+    # ``values`` but no backColor heat rule)
     vj = list(_visual_parts(res["parts"]).values())[0]
-    assert _values_objects(vj) is None
+    assert _values_backcolor(vj) is None
     # candidate record keeps the palette + a deferred status
     fact = _cf_fact(res["candidate_records"], "Heat")
     assert fact["status"] == "deferred"
@@ -4221,13 +4236,13 @@ def test_emitted_conditional_format_fact_recorded_on_candidate_record():
 
 
 def test_matrix_without_colour_gradient_emits_no_conditional_format():
-    # Additivity: a plain highlight-table matrix (no <style> colour scale) carries neither a
-    # values object nor a conditional_format fact -- the report is byte-unchanged from before.
+    # Additivity: a plain highlight-table matrix (no <style> colour scale) carries no backColor
+    # conditional-format fill (only the additive compact-grid font) and no conditional_format fact.
     enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
     res = migrate_twb_to_pbir(_workbook(
         _heat_ws("Heat", color_field="sum:Sales:qk", encodings=enc, style="")))
     vj = list(_visual_parts(res["parts"]).values())[0]
-    assert _values_objects(vj) is None
+    assert _values_backcolor(vj) is None
     assert _cf_fact(res["candidate_records"], "Heat") is None
 
 
@@ -5106,7 +5121,7 @@ def test_measure_binding_non_bindable_status_still_defers():
                                         "measure": "Percent Difference", "status": status}}
         res = migrate_twb_to_pbir(_pcdf_heat_workbook(), measure_binding=mb)
         vj = list(_visual_parts(res["parts"]).values())[0]
-        assert _values_objects(vj) is None, f"{status} should not emit a fill"
+        assert _values_backcolor(vj) is None, f"{status} should not emit a fill"
         fact = _cf_fact(res["candidate_records"], "Heat")
         assert fact["status"] == "deferred"
         assert "quick table calc" in fact["reason"]
@@ -5495,3 +5510,153 @@ def test_exact_date_derivation_set_is_scoped_and_unknown_derivations_still_warn(
                     "[federated.abc].[xyz:Order Date:ok]", deps_extra=_INST + inst)
     ir = parse_twb(_workbook(ws))
     assert any("unsupported derivation" in w["reason"] for w in ir["warnings"])
+
+
+# == §13 geometry fidelity acceptance ==========================================
+# Per-dashboard page size (from <size maxwidth/maxheight>), dropdown-slicer height
+# floor, and the shown-state worksheet reflow. All fixtures are the same inline-XML
+# helpers the rest of the suite uses; assertions are hand-derived from _scale_zone
+# (sx=page_w/ref_w, sy=page_h/ref_h; the outer 100000x100000 zone is the ref frame).
+
+def _page_dims(parts):
+    """displayName -> (width, height) for every emitted page.json."""
+    out = {}
+    for k, v in parts.items():
+        if k.endswith("page.json"):
+            pj = json.loads(v)
+            out[pj["displayName"]] = (pj["width"], pj["height"])
+    return out
+
+
+def _content_visual(parts):
+    return [v for v in _visual_parts(parts).values()
+            if v["visual"]["visualType"] != "slicer"][0]
+
+
+def _one_card_dashboard(ws_name, token, card_h, card_y, mode=None):
+    """A single-worksheet, single-filter-card dashboard on a 1200x800 canvas.
+
+    The outer 100000x100000 zone is the scaling frame (sx=0.012, sy=0.008), matching
+    the MDY single-card idiom already used above. ``card_h``/``card_y`` are Tableau's
+    normalized zone units; ``mode`` (absent -> Dropdown) drives the slicer show mode."""
+    attr = f" mode='{mode}'" if mode else ""
+    card = (f"<zone name='{ws_name}' param='[federated.abc].[{token}]' type-v2='filter' "
+            f"h='{card_h}' w='20000' x='5000' y='{card_y}' id='30'{attr} />")
+    inner = ("<zone h='100000' w='100000' x='0' y='0'>"
+             f"<zone h='80000' w='90000' x='5000' y='15000' name='{ws_name}' id='2' />"
+             + card + "</zone>")
+    return ("<dashboard name='D'><size maxheight='800' maxwidth='1200' />"
+            "<zones>" + inner + "</zones></dashboard>")
+
+
+def test_dashboard_page_adopts_declared_size_1400x1000():
+    # §13.2: the PBIR page is emitted at the dashboard's OWN fixed pixel canvas -- a
+    # 1400x1000 Tableau <size> becomes a 1400x1000 page (not the 1280x720 default).
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Big'><size maxheight='1000' maxwidth='1400' />"
+            "<zones><zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='90000' x='5000' y='5000' name='W' id='2' /></zone>"
+            "</zones></dashboard>")
+    parts = emit_pbir(parse_twb(_workbook(ws, dash)))
+    assert _page_dims(parts)["Big"] == (1400, 1000)
+
+
+def test_sizeless_dashboard_page_falls_back_to_1000x800_default():
+    # §13.2: a dashboard that declares no <size> (automatic/range canvas) falls back to
+    # Tableau's own 1000x800 default (DASH_DEFAULT_W/H), NOT the 1280x720 module default.
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Auto'><zones>"
+            "<zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='90000' x='5000' y='5000' name='W' id='2' /></zone>"
+            "</zones></dashboard>")
+    parts = emit_pbir(parse_twb(_workbook(ws, dash)))
+    assert _page_dims(parts)["Auto"] == (1000, 800)
+
+
+def test_orphan_page_stays_1280x720_after_a_sized_dashboard():
+    # §13.2 reset: the per-dashboard override is cleared after the dashboard loop, so a
+    # standalone (orphan) worksheet page keeps the 1280x720 default even when a sized
+    # dashboard (1400x1000) was emitted just before it -- the override never leaks.
+    ws1 = _worksheet("Placed", "Bar", "[federated.abc].[sum:Sales:qk]",
+                     "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    ws2 = _worksheet("Orphan", "Bar", "[federated.abc].[sum:Profit:qk]",
+                     "[federated.abc].[none:Region:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='D'><size maxheight='1000' maxwidth='1400' />"
+            "<zones><zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='90000' x='5000' y='5000' name='Placed' id='2' /></zone>"
+            "</zones></dashboard>")
+    dims = _page_dims(emit_pbir(parse_twb(_workbook(ws1 + ws2, dash))))
+    assert dims["D"] == (1400, 1000)       # dashboard page adopts <size>
+    assert dims["Orphan"] == (1280, 720)   # orphan page keeps the default (no leak)
+
+
+def test_dropdown_filter_card_height_is_floored_at_64():
+    # §13.3: a scaled filter card (h=6000 -> 6000*0.008 = 48px) in Dropdown mode is
+    # floored at SLICER_DROPDOWN_MIN_H (64) so Power BI never clips the control.
+    filt = ("<filter class='categorical' column='[federated.abc].[none:Region:nk]'>"
+            "<groupfilter function='member' level='[none:Region:nk]' /></filter>")
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST, filters=filt)
+    dash = _one_card_dashboard("W", "none:Region:nk", card_h=6000, card_y=90000)
+    slicers = _page_slicers(emit_pbir(parse_twb(_workbook(ws, dash))))
+    assert len(slicers) == 1
+    assert slicers[0]["position"]["height"] == 64.0
+
+
+def test_checklist_filter_card_height_tracks_the_scaled_zone():
+    # §13.3: a NON-dropdown (checklist -> Basic/List) card takes its own scaled height
+    # (48px), floored only at the smaller SLICER_CTRL_H (40) -- so it stays 48, NOT 64.
+    filt = ("<filter class='categorical' column='[federated.abc].[none:Region:nk]'>"
+            "<groupfilter function='member' level='[none:Region:nk]' /></filter>")
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST, filters=filt)
+    dash = _one_card_dashboard("W", "none:Region:nk", card_h=6000, card_y=90000,
+                               mode="checklist")
+    slicers = _page_slicers(emit_pbir(parse_twb(_workbook(ws, dash))))
+    assert len(slicers) == 1
+    assert slicers[0]["position"]["height"] == 48.0
+
+
+def test_reflow_is_a_noop_when_the_slicer_band_clears_content():
+    # §13.4: a worksheet authored well ABOVE the slicer band (no overlap) is untouched
+    # -- content stays at its scaled top and never runs into the slicer band below it.
+    filt = ("<filter class='categorical' column='[federated.abc].[none:Region:nk]'>"
+            "<groupfilter function='member' level='[none:Region:nk]' /></filter>")
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST, filters=filt)
+    # worksheet zone h=60000 y=2000 -> [16, 496]; filter card y=90000 -> band ~[720, 784]
+    card = ("<zone name='W' param='[federated.abc].[none:Region:nk]' type-v2='filter' "
+            "h='6000' w='20000' x='5000' y='90000' id='30' />")
+    inner = ("<zone h='100000' w='100000' x='0' y='0'>"
+             "<zone h='60000' w='90000' x='5000' y='2000' name='W' id='2' />" + card + "</zone>")
+    dash = ("<dashboard name='D'><size maxheight='800' maxwidth='1200' />"
+            "<zones>" + inner + "</zones></dashboard>")
+    parts = emit_pbir(parse_twb(_workbook(ws, dash)))
+    content = _content_visual(parts)
+    slicer = _page_slicers(parts)[0]
+    assert content["position"]["y"] < 100  # stayed at its authored top (not pushed down)
+    assert (content["position"]["y"] + content["position"]["height"]
+            <= slicer["position"]["y"])    # clears the band entirely
+
+
+def test_reflow_pushes_content_below_an_overlapping_slicer_band():
+    # §13.4: a worksheet authored at its hidden-state position that now OVERLAPS the
+    # shown slicer band is pushed below the band bottom (Tableau's "Show Filters" reflow).
+    filt = ("<filter class='categorical' column='[federated.abc].[none:Region:nk]'>"
+            "<groupfilter function='member' level='[none:Region:nk]' /></filter>")
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST, filters=filt)
+    # worksheet zone h=90000 y=10000 -> [80, 800]; filter card y=20000 -> band ~[160, 224]
+    card = ("<zone name='W' param='[federated.abc].[none:Region:nk]' type-v2='filter' "
+            "h='6000' w='20000' x='5000' y='20000' id='30' />")
+    inner = ("<zone h='100000' w='100000' x='0' y='0'>"
+             "<zone h='90000' w='90000' x='5000' y='10000' name='W' id='2' />" + card + "</zone>")
+    dash = ("<dashboard name='D'><size maxheight='800' maxwidth='1200' />"
+            "<zones>" + inner + "</zones></dashboard>")
+    parts = emit_pbir(parse_twb(_workbook(ws, dash)))
+    content = _content_visual(parts)
+    slicer = _page_slicers(parts)[0]
+    assert (content["position"]["y"]
+            >= slicer["position"]["y"] + slicer["position"]["height"])  # below the band

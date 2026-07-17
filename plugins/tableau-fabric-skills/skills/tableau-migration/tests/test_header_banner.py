@@ -149,9 +149,10 @@ def test_emit_pbir_emits_one_banner_textbox_carrying_fill_and_title():
     assert b["$schema"] == SCHEMA_VISUAL
     assert {"$schema", "name", "position", "visual"} <= set(b)
     assert {"x", "y", "width", "height", "tabOrder"} <= set(b["position"])
-    # the full-width top strip
+    # the full-width top strip — spans the real per-dashboard page width (§13 geometry)
+    page = next(json.loads(v) for k, v in parts.items() if k.endswith("page.json"))
     assert b["position"]["x"] == 0 and b["position"]["y"] == 0
-    assert b["position"]["width"] == R.PAGE_WIDTH
+    assert b["position"]["width"] == page["width"]
     # the white bold title text
     run = b["visual"]["objects"]["general"][0]["properties"]["paragraphs"][0]["textRuns"][0]
     assert run["value"] == "Intake"
