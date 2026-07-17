@@ -778,9 +778,54 @@ def _lookup_measure_binding(measure_binding, field_id, base_id, caption, workshe
     return None
 
 
+def _column_binding_entries(column_binding):
+    """Normalise the consumer-owned ``column_binding`` into a flat ``{name_lower: entry}`` map.
+
+    Accepts a flat ``{key: entry}`` dict or a ``{"columns": {key: entry}}`` wrapper (mirroring
+    ``measure_binding``). Each entry names the REAL model ``table`` + ``column`` a Tableau calc
+    *dimension* was materialised into -- read back from the built model's TMDL by the estate
+    orchestrator (Fix 2). Pure consumer: this layer never invents a binding, it only echoes a
+    model-confirmed one (an entry missing either half is dropped).
+    """
+    if not isinstance(column_binding, dict) or not column_binding:
+        return {}
+    inner = column_binding.get("columns")
+    src = inner if isinstance(inner, dict) else column_binding
+    out = {}
+    for k, entry in src.items():
+        if not isinstance(k, str) or not isinstance(entry, dict):
+            continue
+        table = entry.get("table") or entry.get("entity") or entry.get("model_table")
+        column = entry.get("column") or entry.get("property")
+        if table and column:
+            out[k.lower()] = {"table": table, "column": column}
+    return out
+
+
+def _lookup_column_binding(column_binding, field_id, base_id, caption, worksheet):
+    """Resolve a calc DIMENSION pill to its model ``(table, column)``, or ``None``.
+
+    Tries candidate keys case-insensitively in a deterministic order (caption, trimmed caption,
+    bare calc id, pill instance token) and returns the first model-confirmed hit; a miss (or no
+    binding supplied) -> ``None`` so the caller degrades to the caption fallback + warns. A pure
+    consumer of the model-built manifest -- never a fuzzy/guessed match.
+    """
+    entries = _column_binding_entries(column_binding)
+    if not entries:
+        return None
+    for key in (caption, (caption or "").strip(), base_id, field_id):
+        if not key:
+            continue
+        hit = entries.get(str(key).lower())
+        if hit:
+            return (hit["table"], hit["column"])
+    return None
+
+
 def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
                    worksheet, warnings, warn_special=True, internal_fields=None,
-                   date_binding=None, row_count_binding=None, measure_binding=None):
+                   date_binding=None, row_count_binding=None, measure_binding=None,
+                   column_binding=None):
     """Resolve one shelf/encoding pill into an IR field dict (or ``None`` if it must be dropped).
 
     Records a structured warning whenever a token cannot be bound to a model field, or is
@@ -856,14 +901,33 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
     is_calc = base["is_calc"]
 
     bound = index.get((ds, base_id))
+
+    # A calculated field used as a DIMENSION on an axis (a discrete pill, not an aggregation) is a
+    # category column in the rebuilt model -- NOT a _Measures value. Detect that case so it binds to
+    # the real model column and lands in the CATEGORY well, instead of being forced into the measure
+    # well where _visual_type sees zero dimensions and collapses a crosstab of calc dimensions into a
+    # single card. ``column_binding`` (Fix 2, model-confirmed) supplies the exact (table, column) the
+    # calc was materialised into; without it the pill degrades to the caption fallback below (still a
+    # category), never a measure.
+    calc_is_axis = (is_calc and bound is None and role != "measure"
+                    and deriv not in _AGG_FUNC)
+    calc_col = (_lookup_column_binding(column_binding, field_id, base_id, caption, worksheet)
+                if calc_is_axis else None)
+
     if bound:
         entity, prop = bound["entity"], bound["property"]
         if not datatype:
             datatype = bound["datatype"]
-    elif is_calc:
+    elif calc_col is not None:
+        entity, prop = calc_col
+    elif is_calc and not calc_is_axis:
         entity, prop = MEASURES_TABLE, caption
     else:
-        entity, prop = ds_caption.get(ds, ds), clean_col(caption)
+        # A plain field with no datasource metadata, OR a calc dimension with no model-confirmed
+        # column: bind by caption fallback and warn. A calc's model column name is the trimmed
+        # caption (the model build trims it); a raw field uses clean_col.
+        entity = ds_caption.get(ds, ds)
+        prop = (caption or "").strip() if calc_is_axis else clean_col(caption)
         _wcf = _warn(
             "worksheet", worksheet,
             f"field '{caption}' bound by caption fallback (no datasource metadata); "
@@ -881,8 +945,21 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
         "formula": base.get("formula"),
     }
 
-    # measure calc: only valid in a value role; an axis role is flagged + dropped later.
-    if is_calc and bound is None:
+    # A model-confirmed calc-DIMENSION binding (from the ``column_binding`` manifest) is AUTHORITATIVE
+    # -- exactly like a date rebind, neither ``field_map`` nor the ``model_table`` fallback in
+    # ``_apply_override`` may pull it back onto the fact table. Without this stamp a field-parameter axis
+    # (materialised into its OWN ``calculated`` table, e.g. ``'Choose Date'[Choose Date]``) or any calc
+    # dimension living outside the fact would be re-pinned to ``model_table`` and dangle as
+    # ``Sheet1[<calc>]``. Fail-closed: a field with no manifest hit (``calc_col is None``) is never
+    # stamped, so ``_apply_override`` behaves byte-for-byte as before.
+    if calc_col is not None:
+        field["column_rebound"] = True
+
+    # A measure calc with no model binding lands in the value well; a calc DIMENSION (calc_is_axis)
+    # is NOT stamped here -- it falls through to the plain-field path below so it binds as a category
+    # column (binding="column", kind="category"), which is what lets a calc-dimension crosstab keep
+    # its axes and rebuild as a matrix.
+    if is_calc and bound is None and not calc_is_axis:
         field["binding"] = "measure"
         field["kind"] = "value"
         return field
@@ -952,14 +1029,16 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
 
 def _resolve_shelf(text, ds_default, base_cols, instances, index, ds_caption,
                    worksheet, warnings, warn_special=True, internal_fields=None,
-                   date_binding=None, row_count_binding=None, measure_binding=None):
+                   date_binding=None, row_count_binding=None, measure_binding=None,
+                   column_binding=None):
     fields = []
     for tok in _TOKEN_RE.findall(text or ""):
         ds, fid = _split_token(tok)
         f = _resolve_field(ds or ds_default, fid, base_cols, instances, index,
                            ds_caption, worksheet, warnings, warn_special=warn_special,
                            internal_fields=internal_fields, date_binding=date_binding,
-                           row_count_binding=row_count_binding, measure_binding=measure_binding)
+                           row_count_binding=row_count_binding, measure_binding=measure_binding,
+                           column_binding=column_binding)
         if f:
             fields.append(f)
     return fields
@@ -967,7 +1046,8 @@ def _resolve_shelf(text, ds_default, base_cols, instances, index, ds_caption,
 
 def _parse_encodings(pane, ds_default, base_cols, instances, index, ds_caption,
                      worksheet, warnings, warn_special=True, internal_fields=None,
-                     date_binding=None, row_count_binding=None, measure_binding=None):
+                     date_binding=None, row_count_binding=None, measure_binding=None,
+                     column_binding=None):
     enc = {"color": None, "size": None, "label": None, "detail": None, "angle": None,
            "geo_levels": []}
     if pane is None:
@@ -986,7 +1066,8 @@ def _parse_encodings(pane, ds_default, base_cols, instances, index, ds_caption,
         f = _resolve_field(ds or ds_default, fid, base_cols, instances, index,
                            ds_caption, worksheet, warnings, warn_special=warn_special,
                            internal_fields=internal_fields, date_binding=date_binding,
-                           row_count_binding=row_count_binding, measure_binding=measure_binding)
+                           row_count_binding=row_count_binding, measure_binding=measure_binding,
+                           column_binding=column_binding)
         if f:
             if enc[role] is None:
                 enc[role] = f
@@ -2306,7 +2387,8 @@ def _classify_reference_lines(all_panes, visual_type):
 
 
 def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date_binding=None,
-                     row_count_binding=None, measure_binding=None, measure_palette=None):
+                     row_count_binding=None, measure_binding=None, column_binding=None,
+                     measure_palette=None):
     name = ws.get("name")
     table = _first(ws, "table")
     if table is None:
@@ -2348,15 +2430,18 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     rows = _resolve_shelf(rows_text, ds_default, base_cols, instances, index,
                           ds_caption, name, warnings, warn_special=warn_special,
                           internal_fields=internal_fields, date_binding=date_binding,
-                          row_count_binding=row_count_binding, measure_binding=measure_binding)
+                          row_count_binding=row_count_binding, measure_binding=measure_binding,
+                          column_binding=column_binding)
     cols = _resolve_shelf(cols_text, ds_default, base_cols, instances, index,
                           ds_caption, name, warnings, warn_special=warn_special,
                           internal_fields=internal_fields, date_binding=date_binding,
-                          row_count_binding=row_count_binding, measure_binding=measure_binding)
+                          row_count_binding=row_count_binding, measure_binding=measure_binding,
+                          column_binding=column_binding)
     encodings = _parse_encodings(pane, ds_default, base_cols, instances, index,
                                  ds_caption, name, warnings, warn_special=warn_special,
                                  internal_fields=internal_fields, date_binding=date_binding,
-                                 row_count_binding=row_count_binding, measure_binding=measure_binding)
+                                 row_count_binding=row_count_binding, measure_binding=measure_binding,
+                                 column_binding=column_binding)
     filters, swap_controls = _parse_filters(view, ds_default, base_cols, instances, index,
                                             ds_caption, name, warnings, warn_special=warn_special,
                                             internal_fields=internal_fields)
@@ -3038,7 +3123,7 @@ def _detect_sheet_swaps(worksheets, dashboards, params, warnings):
 
 
 def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_binding=None,
-              param_binding=None):
+              column_binding=None, param_binding=None):
     """Parse a Tableau ``.twb`` (workbook XML) into the normalized viz IR.
 
     Accepts ``str`` or ``bytes``; ``.twb`` files carry a UTF-8 BOM, so callers reading from
@@ -3066,6 +3151,7 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
                                   internal_fields=internal_fields, date_binding=date_binding,
                                   row_count_binding=row_count_binding,
                                   measure_binding=measure_binding,
+                                  column_binding=column_binding,
                                   measure_palette=measure_palette)
         if parsed:
             worksheets.append(parsed)
@@ -3104,9 +3190,14 @@ def _apply_override(field, model_table, field_map):
     A field already rebound to the marked Date dimension by ``_rebind_date_axis`` is AUTHORITATIVE:
     neither ``field_map`` nor the ``model_table`` fallback may pull the active date axis back onto the
     fact's raw date column, so the model build's date facts win over the published-DS column rebind.
+
+    A calc DIMENSION resolved by the model build's ``column_binding`` manifest (``column_rebound``) is
+    AUTHORITATIVE for the same reason: the model materialised it into a specific table (a field-parameter
+    axis lands in its OWN ``calculated`` table, e.g. ``'Choose Date'[Choose Date]``), so the
+    ``model_table`` fallback must not re-pin it onto the fact and produce a dangling ``Sheet1[<calc>]``.
     """
     entity, prop, binding = field["entity"], field["property"], field["binding"]
-    if field.get("date_rebound"):
+    if field.get("date_rebound") or field.get("column_rebound"):
         return entity, prop, binding
     if field_map and field["caption"] in field_map:
         ov = field_map[field["caption"]]
@@ -3221,7 +3312,8 @@ def _build_query_state(ws, model_table, field_map, warnings):
     def values(fs):
         return [f for f in fs if f["kind"] == "value"]
 
-    # calc fields can only live in a value role; flag any that landed on an axis.
+    # A calc DIMENSION now binds as a category column (binding="column"); only a genuine measure
+    # calc (binding="measure") is invalid on an axis, so flag/drop just those if one lands here.
     def drop_calc_axis(fs):
         kept = []
         for f in fs:
@@ -5746,7 +5838,8 @@ def _emit_param_control_slicers(controls, db_name, page_name, ref_w, ref_h, warn
 
 def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
                         model_table=None, field_map=None, date_binding=None,
-                        row_count_binding=None, measure_binding=None, param_binding=None):
+                        row_count_binding=None, measure_binding=None, column_binding=None,
+                        param_binding=None):
     """One-call convenience: parse ``.twb`` text and emit the PBIR parts.
 
     Returns ``{"ir": ..., "parts": ..., "warnings": ...}``. ``parts`` is the
@@ -5774,6 +5867,14 @@ def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
     translated / assisted-approved measures) -- so a calc-driven value, a background colour-scale
     driver, etc. references the real measure. Without it, those pills degrade-and-warn unchanged.
 
+    ``column_binding`` (optional) carries the model build's calc-DIMENSION manifest -- a
+    ``{"columns": {<calc name>: {"table", "column"}}}`` map (a flat ``{name: entry}`` is also
+    accepted) naming the REAL model table + column each Tableau calc *dimension* was materialised
+    into (read back from the built model TMDL by the estate orchestrator). When given, a calc
+    dimension on an axis binds to that model column and lands in the category well; without it the
+    calc dimension still resolves as a category (via a caption fallback + warning), never a measure
+    -- so a crosstab whose Rows/Columns are calc dimensions rebuilds as a matrix, not a card.
+
     ``param_binding`` (optional) carries the model build's resolved parameter targets --
     ``{"slicers": {<param id>: {"table", "column", "single_select", "caption"}},
     "flags": {<token>: {"entity", "measure", "value", "visuals"}}}``.
@@ -5787,7 +5888,8 @@ def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
     worksheet scope, an unknown worksheet, or a non-numeric value is left unapplied and warned.
     """
     ir = parse_twb(xml_text, date_binding=date_binding, row_count_binding=row_count_binding,
-                   measure_binding=measure_binding, param_binding=param_binding)
+                   measure_binding=measure_binding, column_binding=column_binding,
+                   param_binding=param_binding)
     # Recover the workbook's view-only quick table calcs (the quick token is stripped off the
     # resolved value pill, so the addressing facts live only here) and hand them to the emitter, which
     # projects each as a Power BI Visual Calculation. Fail-open: a parse hiccup never blocks the rest
