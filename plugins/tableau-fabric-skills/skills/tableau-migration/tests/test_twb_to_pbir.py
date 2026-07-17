@@ -17,6 +17,7 @@ from twb_to_pbir import (
     SCHEMA_VISUAL,
     SCHEMA_VISUAL_FP,
     SCHEMA_VISUAL_SM,
+    _DATE_EXACT_DERIVATIONS,
     _apply_override,
     _candidate_plan,
     _card_latent_candidates,
@@ -27,6 +28,7 @@ from twb_to_pbir import (
     _reconcile_caption_fallback,
     _resolve_parameter_controls,
     _resolve_visual_flags,
+    _tableau_filter_mode_to_pbi,
     build_field_parameter_page,
     emit_pbir,
     field_parameter_slicer,
@@ -5030,3 +5032,294 @@ def test_measure_binding_same_base_pcdf_and_plain_pills_disambiguate():
     # id to the BASE measure -- a different measure than the colour, no mis-colour.
     assert enc_ir["label"]["measure_rebound"] is True
     assert enc_ir["label"]["property"] == "[count orders] + 100"
+
+
+# =============================================================================
+# Regression: dashboard filter-card -> Power BI slicer fidelity.
+#   (1) a full top filter BAND rebuilds one slicer per card at its authored grid
+#       position + show mode, with no five-deep synthetic-stack cap;
+#   (2) a row-level DIMENSION calc ("Job Type") is kept as a sliceable column,
+#       while measure-role / parameter-comparing calcs stay warned-and-dropped;
+#   (3) a discrete exact-date VALUE derivation ("Fiscal Month" shown MDY) binds
+#       as an ordinary date column instead of being dropped as unsupported.
+# Locks the filter/slicer fidelity fixes; the report schema stays additive.
+# =============================================================================
+
+# -- a wide datasource with >= 6 filterable dimensions. The shared _DATASOURCE
+#    has only three plain dimensions -- too few to prove a filter band of more
+#    than five cards is NOT truncated to five by the old synthetic-stack guard.
+_WIDE_DIMS = ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot"]
+
+
+def _wide_datasource():
+    recs = "".join(
+        f"<metadata-record class='column'><remote-name>{d}</remote-name>"
+        f"<local-name>[{d}]</local-name><parent-name>[T]</parent-name>"
+        f"<local-type>string</local-type></metadata-record>" for d in _WIDE_DIMS)
+    recs += ("<metadata-record class='column'><remote-name>Amount</remote-name>"
+             "<local-name>[Amount]</local-name><parent-name>[T]</parent-name>"
+             "<local-type>real</local-type></metadata-record>")
+    return (
+        "<datasources><datasource caption='Wide' inline='true' "
+        "name='federated.wide' version='18.1'><connection class='federated'>"
+        "<relation name='T' table='[dbo].[T]' type='table' />"
+        "<metadata-records>" + recs + "</metadata-records>"
+        "</connection></datasource></datasources>")
+
+
+def _wide_deps():
+    cols = "".join(
+        f"<column caption='{d}' datatype='string' name='[{d}]' role='dimension' "
+        "type='nominal' />" for d in _WIDE_DIMS)
+    cols += ("<column caption='Amount' datatype='real' name='[Amount]' role='measure' "
+             "type='quantitative' />")
+    insts = "".join(
+        f"<column-instance column='[{d}]' derivation='None' name='[none:{d}:nk]' "
+        "pivot='key' type='nominal' />" for d in _WIDE_DIMS)
+    insts += ("<column-instance column='[Amount]' derivation='Sum' name='[sum:Amount:qk]' "
+              "pivot='key' type='quantitative' />")
+    return cols + insts
+
+
+def _wide_worksheet(name, dims):
+    filters = "".join(
+        f"<filter class='categorical' column='[federated.wide].[none:{d}:nk]'>"
+        f"<groupfilter function='member' level='[none:{d}:nk]' /></filter>" for d in dims)
+    return (
+        f"<worksheet name='{name}'><table><view>"
+        "<datasources><datasource caption='Wide' name='federated.wide' /></datasources>"
+        f"<datasource-dependencies datasource='federated.wide'>{_wide_deps()}"
+        "</datasource-dependencies>"
+        f"{filters}</view>"
+        "<panes><pane><mark class='Bar' /></pane></panes>"
+        "<rows>[federated.wide].[sum:Amount:qk]</rows>"
+        "<cols>[federated.wide].[none:Alpha:nk]</cols>"
+        "</table></worksheet>")
+
+
+def _wide_workbook(worksheets, dashboards=""):
+    return (
+        "<?xml version='1.0' encoding='utf-8' ?>\n<workbook>"
+        + _wide_datasource()
+        + "<worksheets>" + worksheets + "</worksheets>"
+        + ("<dashboards>" + dashboards + "</dashboards>" if dashboards else "")
+        + "</workbook>")
+
+
+def _wide_filter_cards(ws_name, dims, mode=None, hidden=False):
+    attrs = (f" mode='{mode}'" if mode else "") + (" hidden-by-user='true'" if hidden else "")
+    # each card at its own authored x (5000, 20000, ...) -> distinct scaled positions, never the
+    # single x == PAGE_WIDTH-220 the synthetic right-rail stack uses.
+    return "".join(
+        f"<zone name='{ws_name}' param='[federated.wide].[none:{d}:nk]' type-v2='filter' "
+        f"h='6000' w='15000' x='{5000 + i * 15000}' y='2000' id='{30 + i}'{attrs} />"
+        for i, d in enumerate(dims))
+
+
+def _wide_dashboard(ws_name, dims, mode=None, hidden=False):
+    inner = (
+        "<zone h='100000' w='100000' x='0' y='0'>"
+        f"<zone h='80000' w='90000' x='5000' y='15000' name='{ws_name}' id='2' />"
+        + _wide_filter_cards(ws_name, dims, mode=mode, hidden=hidden)
+        + "</zone>")
+    return (
+        "<dashboard name='Dash'><size maxheight='800' maxwidth='1200' />"
+        f"<zones>{inner}</zones></dashboard>")
+
+
+def _page_slicers(parts):
+    return [v for v in _visual_parts(parts).values()
+            if v["visual"]["visualType"] == "slicer"]
+
+
+def _slicer_prop(v):
+    return (v["visual"]["query"]["queryState"]["Values"]["projections"][0]
+            ["field"]["Column"]["Property"])
+
+
+def _slicer_show_mode(v):
+    return v["visual"]["objects"]["data"][0]["properties"]["mode"]["expr"]["Literal"]["Value"]
+
+
+def test_dashboard_filter_band_emits_a_slicer_per_card_not_capped_at_five():
+    dims = _WIDE_DIMS  # six distinct filter cards
+    ws = _wide_worksheet("W", dims)
+    parts = emit_pbir(parse_twb(_wide_workbook(ws, _wide_dashboard("W", dims))))
+    slicers = _page_slicers(parts)
+    assert len(slicers) == len(dims)  # all six -- NOT truncated to five by a page-height guard
+    assert sorted(_slicer_prop(s) for s in slicers) == sorted(dims)
+    xs = [s["position"]["x"] for s in slicers]
+    assert all(x != PAGE_WIDTH - 220 for x in xs)      # not the synthetic right-rail stack (x==1060)
+    assert len({round(x, 3) for x in xs}) == len(slicers)  # each card at its own authored position
+
+
+def test_tableau_filter_show_mode_maps_to_pbi_slicer_mode():
+    # dropdown-family -> compact 'Dropdown'; list/radio -> 'Basic' (List); unknown/absent defaults to
+    # 'Dropdown' (the overwhelmingly common quick-filter style a top filter band uses).
+    assert _tableau_filter_mode_to_pbi("checkdropdown") == "Dropdown"
+    assert _tableau_filter_mode_to_pbi("typeindropdown") == "Dropdown"
+    assert _tableau_filter_mode_to_pbi("checklist") == "Basic"
+    assert _tableau_filter_mode_to_pbi("radiolist") == "Basic"
+    assert _tableau_filter_mode_to_pbi(None) == "Dropdown"
+
+
+def test_dashboard_filter_card_show_mode_lands_on_the_slicer():
+    dims = _WIDE_DIMS[:2]
+    ws = _wide_worksheet("W", dims)
+    dd = emit_pbir(parse_twb(_wide_workbook(ws, _wide_dashboard("W", dims, mode="checkdropdown"))))
+    assert _page_slicers(dd) and all(_slicer_show_mode(s) == "'Dropdown'" for s in _page_slicers(dd))
+    lst = emit_pbir(parse_twb(_wide_workbook(ws, _wide_dashboard("W", dims, mode="checklist"))))
+    assert _page_slicers(lst) and all(_slicer_show_mode(s) == "'Basic'" for s in _page_slicers(lst))
+
+
+def test_hidden_by_user_filter_band_still_rebuilds_its_slicers():
+    # ``hidden-by-user`` is a Tableau show/hide TOGGLE on a collapsible filter container, not a
+    # delete; Power BI has no Tier-1 collapse equivalent, so the faithful rebuild surfaces every
+    # filter (usable) regardless -- a fully-toggled-hidden band is never silently dropped.
+    dims = _WIDE_DIMS
+    ws = _wide_worksheet("W", dims)
+    parts = emit_pbir(parse_twb(_wide_workbook(ws, _wide_dashboard("W", dims, hidden=True))))
+    assert len(_page_slicers(parts)) == len(dims)
+
+
+def test_non_slicer_visual_carries_no_slicer_mode_object():
+    # the slicer show-mode block lives ONLY under a slicer's ``objects.data``; every other visual
+    # stays byte-identical (no fabricated mode card), so the fix never regresses a chart.
+    ws = _worksheet("Bars", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    mains = [v for v in _visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values()
+             if v["visual"]["visualType"] != "slicer"]
+    assert mains and all("data" not in v["visual"].get("objects", {}) for v in mains)
+
+
+def test_worksheet_page_filter_slicer_keeps_the_synthetic_right_rail_stack():
+    # a STANDALONE worksheet page has no dashboard card geometry, so the original synthetic
+    # right-rail slicer stack (x == PAGE_WIDTH-220, no show-mode object) is kept byte-for-byte --
+    # the new dashboard-band path only engages when filter cards are present.
+    filt = ("<filter class='categorical' column='[federated.abc].[none:Region:nk]'>"
+            "<groupfilter function='member' level='[none:Region:nk]' /></filter>")
+    ws = _worksheet("Solo", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST, filters=filt)
+    slicers = _page_slicers(emit_pbir(parse_twb(_workbook(ws))))
+    assert len(slicers) == 1
+    assert slicers[0]["position"]["x"] == PAGE_WIDTH - 220
+    assert "data" not in slicers[0]["visual"].get("objects", {})
+
+
+# -- row-level dimension calc kept as a slicer ("Job Type") --------------------
+_JOBTYPE_CALC = (
+    "<column caption='Job Type' datatype='string' name='[JobType]' role='dimension' "
+    "type='nominal'><calculation class='tableau' "
+    "formula='IF [Sales] &gt; 100 THEN &quot;High&quot; ELSE &quot;Low&quot; END' /></column>"
+    "<column-instance column='[JobType]' derivation='None' name='[none:JobType:nk]' "
+    "pivot='key' type='nominal' />")
+
+_MEASURE_CALC = (
+    "<column caption='Big Sales' datatype='real' name='[BigSales]' role='measure' "
+    "type='quantitative'><calculation class='tableau' formula='SUM([Sales]) * 2' /></column>"
+    "<column-instance column='[BigSales]' derivation='None' name='[none:BigSales:qk]' "
+    "pivot='key' type='quantitative' />")
+
+
+def _calc_filter(inst):
+    return (f"<filter class='categorical' column='[federated.abc].[{inst}]'>"
+            f"<groupfilter function='member' level='[{inst}]' /></filter>")
+
+
+def test_row_level_dimension_calc_filter_is_kept_as_a_slicer():
+    # "Job Type" is a row-level IF/CASE dimension bucket -> a real sliceable model column, so a
+    # dashboard filter card on it must surface as a slicer, not be dropped as an unmappable calc.
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST + _JOBTYPE_CALC, filters=_calc_filter("none:JobType:nk"))
+    card = ("<zone name='W' param='[federated.abc].[none:JobType:nk]' type-v2='filter' "
+            "h='6000' w='20000' x='5000' y='2000' id='30' />")
+    inner = ("<zone h='100000' w='100000' x='0' y='0'>"
+             "<zone h='80000' w='90000' x='5000' y='15000' name='W' id='2' />" + card + "</zone>")
+    dash = ("<dashboard name='D'><size maxheight='800' maxwidth='1200' />"
+            "<zones>" + inner + "</zones></dashboard>")
+    ir = parse_twb(_workbook(ws, dash))
+    kept = [f for f in ir["worksheets"][0]["filters"] if f["caption"] == "Job Type"]
+    assert len(kept) == 1 and kept[0]["binding"] == "column"
+    assert not any("aggregate/measure filter on 'Job Type'" in w["reason"] for w in ir["warnings"])
+    assert "Job Type" in [_slicer_prop(s) for s in _page_slicers(emit_pbir(ir))]
+
+
+def test_measure_role_calc_filter_is_still_warned_and_dropped():
+    # the guard is narrow: a calc that ROLLS UP to a measure has no faithful slicer mapping and
+    # stays warned-and-dropped -- only row-level dimension calcs are kept.
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST + _MEASURE_CALC, filters=_calc_filter("none:BigSales:qk"))
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["filters"] == []
+    assert any("aggregate/measure filter on 'Big Sales'" in w["reason"] for w in ir["warnings"])
+
+
+def test_parameter_comparing_calc_filter_is_still_warned_and_dropped():
+    # a DIMENSION calc that COMPARES against a parameter ([Parameters] in its formula) exposes no
+    # column a slicer can bind, so it stays warned-and-dropped despite its dimension role.
+    calc = ("<column caption='Over Target' datatype='boolean' name='[OverTgt]' role='dimension' "
+            "type='nominal'><calculation class='tableau' "
+            "formula='[Sales] &gt; [Parameters].[Parameter 1]' /></column>"
+            "<column-instance column='[OverTgt]' derivation='None' name='[none:OverTgt:nk]' "
+            "pivot='key' type='nominal' />")
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST + calc, filters=_calc_filter("none:OverTgt:nk"))
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["filters"] == []
+    assert any("aggregate/measure filter on 'Over Target'" in w["reason"] for w in ir["warnings"])
+
+
+# -- discrete exact-date VALUE derivation binds as a plain date ("Fiscal Month") --
+_MDY_INST = ("<column-instance column='[Order Date]' derivation='MDY' "
+             "name='[md:Order Date:ok]' pivot='key' type='ordinal' />")
+
+
+def test_mdy_exact_date_derivation_filter_is_kept_as_a_date_slicer():
+    # "Fiscal Month" is an ordinary date column merely SHOWN in Month/Day/Year (MDY) discrete
+    # format -- the same underlying date as a plain pill -- so a filter card on it is a faithful
+    # date slicer; a display-format choice must never drop the field.
+    filt = ("<filter class='categorical' column='[federated.abc].[md:Order Date:ok]'>"
+            "<groupfilter function='member' level='[md:Order Date:ok]' /></filter>")
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST + _MDY_INST, filters=filt)
+    card = ("<zone name='W' param='[federated.abc].[md:Order Date:ok]' type-v2='filter' "
+            "h='6000' w='20000' x='5000' y='2000' id='30' />")
+    inner = ("<zone h='100000' w='100000' x='0' y='0'>"
+             "<zone h='80000' w='90000' x='5000' y='15000' name='W' id='2' />" + card + "</zone>")
+    dash = ("<dashboard name='D'><size maxheight='800' maxwidth='1200' />"
+            "<zones>" + inner + "</zones></dashboard>")
+    ir = parse_twb(_workbook(ws, dash))
+    kept = ir["worksheets"][0]["filters"]
+    assert len(kept) == 1 and kept[0]["caption"] == "Order Date" and kept[0]["binding"] == "column"
+    assert not any("unsupported derivation" in w["reason"] for w in ir["warnings"])
+    assert len(_page_slicers(emit_pbir(ir))) == 1
+
+
+def test_mdy_exact_date_derivation_on_axis_binds_as_a_plain_date_column():
+    # MDY on a shelf is the exact date VALUE at day grain -> a plain date category axis, bound (not
+    # dropped): the visual keeps both the measure and the date pill.
+    ws = _worksheet("Trend", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[md:Order Date:ok]", deps_extra=_INST + _MDY_INST)
+    ir = parse_twb(_workbook(ws))
+    assert not any("unsupported derivation" in w["reason"] for w in ir["warnings"])
+    main = [v for v in _visual_parts(emit_pbir(ir)).values()
+            if v["visual"]["visualType"] != "slicer"][0]
+    refs = [p["queryRef"] for st in _query_state(main).values() for p in st["projections"]]
+    assert len(refs) == 2  # the Sales measure AND the MDY date axis are both bound (date not dropped)
+
+
+def test_exact_date_derivation_set_is_scoped_and_unknown_derivations_still_warn():
+    # the exact-date allowance is scoped to the MDY value family; a coarser / unknown derivation is
+    # NOT silently accepted -- it stays fail-closed (warn+skip) until verified against a real artifact.
+    assert "MDY" in _DATE_EXACT_DERIVATIONS and "MDYHMS" in _DATE_EXACT_DERIVATIONS
+    assert "MY" not in _DATE_EXACT_DERIVATIONS and "Xyz" not in _DATE_EXACT_DERIVATIONS
+    inst = ("<column-instance column='[Order Date]' derivation='Xyz' "
+            "name='[xyz:Order Date:ok]' pivot='key' type='ordinal' />")
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[xyz:Order Date:ok]", deps_extra=_INST + inst)
+    ir = parse_twb(_workbook(ws))
+    assert any("unsupported derivation" in w["reason"] for w in ir["warnings"])
