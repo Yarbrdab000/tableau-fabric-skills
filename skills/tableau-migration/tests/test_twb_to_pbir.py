@@ -4362,6 +4362,86 @@ def test_explicit_palette_not_flagged_default_and_no_disclosure():
     assert not any("default continuous palette" in w["reason"] for w in res["warnings"])
 
 
+# -- named built-in continuous palettes (name-only, no explicit stops) ---------
+# Tableau serialises a built-in NAMED continuous palette (e.g. ``orange_blue_diverging_10_0``) by
+# NAME + ``min`` / ``max`` / ``reverse`` with NO ``<color-palette>`` stops. The name's hue tokens
+# name the two ends and ``diverging`` (or a domain straddling zero) marks a diverging scale centred
+# at zero; ``reverse='true'`` flips min <-> max. A DISCLOSED stand-in is reconstructed (warn-never-
+# wrong) rather than falling back to a generic sequential ramp that loses the author's intent.
+def _mark_color_style_named(field_token, palette, min_v=None, max_v=None, reverse=None):
+    attrs = f" palette='{palette}'"
+    if min_v is not None:
+        attrs += f" min='{min_v}'"
+    if max_v is not None:
+        attrs += f" max='{max_v}'"
+    if reverse is not None:
+        attrs += f" reverse='{reverse}'"
+    return (f"<style><style-rule element='mark'>"
+            f"<encoding attr='color'{attrs} type='interpolated' field='{field_token}'>"
+            f"</encoding></style-rule></style>")
+
+
+def _named_cg(palette, min_v=None, max_v=None, reverse=None):
+    style = _mark_color_style_named("[federated.abc].[sum:Sent:qk]", palette,
+                                    min_v=min_v, max_v=max_v, reverse=reverse)
+    enc = "<encodings><color column='[federated.abc].[sum:Sent:qk]' /></encodings>"
+    ir = parse_twb(_workbook(_heat_ws("Heat", color_field="sum:Sent:qk",
+                                      encodings=enc, style=style)))
+    return ir["worksheets"][0]["color_gradient"]
+
+
+def test_named_diverging_palette_reconstructs_centered_family_ramp():
+    # ``orange_blue_diverging_10_0`` (min<0<max, no explicit stops) -> a diverging (3-stop) ramp
+    # pinned at zero whose ends are the named hues (orange .. blue), flagged default_palette.
+    cg = _named_cg("orange_blue_diverging_10_0", min_v="-1.0", max_v="1.0")
+    assert cg is not None
+    assert cg["default_palette"] is True
+    assert cg["palette_type"] == "ordered-diverging"
+    assert cg["center"] == 0.0
+    assert len(cg["colors"]) == 3
+    assert cg["colors"][0].lower() == "#f28e2b"     # orange -> min
+    assert cg["colors"][-1].lower() == "#4e79a7"    # blue -> max
+
+
+def test_named_diverging_palette_reverse_flips_ends():
+    # ``reverse='true'`` flips the domain ends: blue -> min, orange -> max (matches the source
+    # dashboard where negative sentiment reads blue and positive reads orange). Centre unchanged.
+    cg = _named_cg("orange_blue_diverging_10_0", min_v="-1.0", max_v="1.0", reverse="true")
+    assert cg["palette_type"] == "ordered-diverging"
+    assert cg["center"] == 0.0
+    assert cg["colors"][0].lower() == "#4e79a7"     # blue -> min after reverse
+    assert cg["colors"][-1].lower() == "#f28e2b"    # orange -> max after reverse
+
+
+def test_named_palette_domain_straddling_zero_is_diverging_without_name():
+    # A domain that straddles zero marks a diverging scale centred at zero even when the name lacks
+    # the word "diverging".
+    cg = _named_cg("red_green_10_0", min_v="-5", max_v="5")
+    assert cg["palette_type"] == "ordered-diverging"
+    assert cg["center"] == 0.0
+    assert len(cg["colors"]) == 3
+
+
+def test_named_sequential_single_hue_stays_sequential():
+    # A single-hue named palette with a non-straddling domain stays sequential (2-stop, no centre).
+    cg = _named_cg("blue_10_0", min_v="0", max_v="10")
+    assert cg["palette_type"] == "ordered-sequential"
+    assert cg["center"] is None
+    assert len(cg["colors"]) == 2
+    assert cg["colors"][-1].lower() == "#4e79a7"    # blue -> max
+
+
+def test_named_diverging_unrecognised_hue_falls_back_to_generic():
+    # An unrecognised hue family still gets a diverging generic ColorBrewer stand-in (3 stops,
+    # centred) -- never a silent drop, never a guessed hue.
+    from twb_to_pbir import _DEFAULT_DIVERGING_COLORS
+    cg = _named_cg("mystery_diverging_10_0", min_v="-1", max_v="1")
+    assert cg["palette_type"] == "ordered-diverging"
+    assert cg["center"] == 0.0
+    assert len(cg["colors"]) == 3
+    assert cg["colors"] == list(_DEFAULT_DIVERGING_COLORS)
+
+
 # -- categorical mark colours (explicit author member -> hex palette) ----------
 # An explicit per-member colour map (``<map to='#hex'><bucket>"Member"</bucket></map>``) is
 # unambiguous author intent. On the discrete categorical charts (column / bar / pie / donut) it
@@ -4624,6 +4704,128 @@ def test_no_datasource_palette_emits_no_measure_series():
     assert ir["worksheets"][0]["measure_colors"] is None
     vj = list(_visual_parts(emit_pbir(ir)).values())[0]
     assert _metadata_fills(vj) == {}
+
+
+# -- continuous mark colour on a CARTESIAN chart -> dataPoint.fill FillRule ---------------------------
+# A measure on Tableau's Color shelf with an interpolated ramp (e.g. a diverging blue -> grey -> orange
+# scale on Sum(Profit)) colours a chart's marks continuously. Unlike a highlight table (backColor bound
+# to a projected queryRef), a chart carries the colour measure on neither the Category nor the value
+# axis, so the FillRule ``Input`` is built directly from the colour field's aggregation and the
+# selector is a data-plane wildcard (matchingOption 0, no metadata). Verified against a Desktop render.
+_CONT_STOPS = ["#4E79A7", "#BAB0AC", "#F28E2B"]
+
+
+def _cont_color_chart_ws(name="Cont Bar", mark="Bar", center="0.0", palette_type="ordered-diverging",
+                         stops=None, color_field="[federated.abc].[sum:Profit:qk]"):
+    stops = stops if stops is not None else _CONT_STOPS
+    style = _mark_color_style(color_field, palette_type, stops, center=center,
+                              enc_type="custom-interpolated")
+    enc = f"<encodings><color column='{color_field}' /></encodings>"
+    return _worksheet(name, mark,
+                      rows="[federated.abc].[sum:Sales:qk]",
+                      cols="[federated.abc].[none:Category:nk]",
+                      deps_extra=_INST, encodings=enc, style=style)
+
+
+def _chart_fill_rule(visual_json):
+    dp = visual_json["visual"].get("objects", {}).get("dataPoint") or []
+    grad = next((e for e in dp
+                 if "FillRule" in e["properties"]["fill"]["solid"]["color"].get("expr", {})), None)
+    return grad
+
+
+def test_continuous_colour_bar_emits_datapoint_lineargradient3_wildcard_selector():
+    vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(_cont_color_chart_ws())))).values())[0]
+    assert vj["visual"]["visualType"] == "clusteredColumnChart"
+    entry = _chart_fill_rule(vj)
+    assert entry is not None, "expected a continuous dataPoint fill on the chart"
+    # a data-plane wildcard selector (per-mark), NOT a metadata (measure-series) or scopeId selector
+    assert entry["selector"]["data"][0]["dataViewWildcard"]["matchingOption"] == 0
+    assert "metadata" not in entry["selector"]
+    fr = entry["properties"]["fill"]["solid"]["color"]["expr"]["FillRule"]
+    # Input is the colour measure's aggregation (Sum of Profit), built directly (no projection needed)
+    assert fr["Input"]["Aggregation"]["Function"] == 0
+    assert fr["Input"]["Aggregation"]["Expression"]["Column"]["Property"] == "Profit"
+    grad = fr["FillRule"]["linearGradient3"]
+    assert grad["min"]["color"]["Literal"]["Value"] == "'#4E79A7'"
+    assert grad["mid"]["color"]["Literal"]["Value"] == "'#BAB0AC'"
+    assert grad["mid"]["value"]["Literal"]["Value"] == "0.0D"     # centre pinned as a double literal
+    assert grad["max"]["color"]["Literal"]["Value"] == "'#F28E2B'"
+
+
+def test_continuous_colour_scatter_emits_datapoint_fill():
+    # The scatter case (the Twitter dashboard headline): a diverging measure on Color -> a per-mark
+    # continuous fill on the scatterChart, same shape as the bar. A scatter needs a detail (lod)
+    # dimension to disaggregate its marks.
+    enc = ("<encodings><lod column='[federated.abc].[none:Category:nk]' />"
+           "<color column='[federated.abc].[sum:Sales:qk]' /></encodings>")
+    ws = _worksheet("Cont Scatter", "Circle",
+                    rows="[federated.abc].[sum:Profit:qk]",
+                    cols="[federated.abc].[sum:Sales:qk]",
+                    deps_extra=_INST, encodings=enc,
+                    style=_mark_color_style("[federated.abc].[sum:Sales:qk]", "ordered-diverging",
+                                            _CONT_STOPS, center="0.0", enc_type="custom-interpolated"))
+    vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
+    assert vj["visual"]["visualType"] == "scatterChart"
+    assert _chart_fill_rule(vj) is not None
+
+
+def test_continuous_colour_sequential_emits_lineargradient2():
+    ws = _cont_color_chart_ws(center=None, palette_type="ordered-sequential",
+                              stops=["#f7fbff", "#08306b"])
+    vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
+    fr = _chart_fill_rule(vj)["properties"]["fill"]["solid"]["color"]["expr"]["FillRule"]
+    grad = fr["FillRule"]["linearGradient2"]
+    assert grad["min"]["color"]["Literal"]["Value"] == "'#f7fbff'"
+    assert grad["max"]["color"]["Literal"]["Value"] == "'#08306b'"
+    assert "linearGradient3" not in fr["FillRule"]
+
+
+def test_continuous_colour_chart_fact_recorded_emitted():
+    res = migrate_twb_to_pbir(_workbook(_cont_color_chart_ws()))
+    rec = next(r for r in res["candidate_records"] if r["worksheet"] == "Cont Bar")
+    fact = rec["chart_continuous_fill"]
+    assert fact["status"] == "emitted"
+    assert fact["kind"] == "chart_continuous_fill"
+    assert fact["colors"] == _CONT_STOPS
+    assert fact["center"] == 0.0
+    assert fact["bound_measure"] == "Sum(Orders.Profit)"
+
+
+def test_continuous_colour_chart_does_not_emit_measure_series_deferral():
+    # With a datasource measure palette present, a continuous-coloured chart must NOT also fire the
+    # spurious "measure series colours deferred" warning -- the continuous fill owns the mark colour.
+    res = migrate_twb_to_pbir(_measure_palette_workbook(_cont_color_chart_ws()))
+    assert not any("measure series colours deferred" in w["reason"] for w in res["warnings"])
+    assert not any("continuous mark colours deferred" in w["reason"] for w in res["warnings"])
+
+
+def test_chart_without_gradient_emits_no_continuous_fill():
+    # Additivity: a plain bar chart (no interpolated colour <style>) carries no chart_continuous_fill
+    # fact and no gradient dataPoint fill (byte-unchanged from before).
+    ws = _worksheet("Plain Bar", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST)
+    res = migrate_twb_to_pbir(_workbook(ws))
+    rec = next(r for r in res["candidate_records"] if r["worksheet"] == "Plain Bar")
+    assert "chart_continuous_fill" not in rec
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _chart_fill_rule(vj) is None
+
+
+def test_matrix_gradient_still_uses_backcolor_not_chart_fill():
+    # A highlight-table matrix with an interpolated colour keeps its backColor conditional format and
+    # does NOT pick up a chart dataPoint continuous fill (the new emitter is gated to cartesian charts).
+    style = _mark_color_style("[federated.abc].[sum:Sales:qk]", "ordered-sequential",
+                              ["#f7fbff", "#08306b"])
+    enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    res = migrate_twb_to_pbir(_workbook(
+        _heat_ws("Heat", color_field="sum:Sales:qk", encodings=enc, style=style)))
+    rec = next(r for r in res["candidate_records"] if r["worksheet"] == "Heat")
+    assert "chart_continuous_fill" not in rec       # silent skip on a matrix
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert _values_backcolor(vj) is not None        # backColor path still owns the gradient
 
 
 # -- KPI / card label colours --------------------------------------------------

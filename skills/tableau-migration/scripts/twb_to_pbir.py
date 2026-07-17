@@ -2320,6 +2320,22 @@ _GRADIENT_PALETTE_TYPES = ("ordered-diverging", "ordered-sequential")
 _DEFAULT_SEQUENTIAL_COLORS = ("#eff3ff", "#08519c")
 _DEFAULT_DIVERGING_COLORS = ("#ca0020", "#f7f7f7", "#0571b0")
 
+# Tableau also ships BUILT-IN NAMED continuous palettes (e.g. ``orange_blue_diverging_10_0``) that it
+# serialises by NAME + ``min`` / ``max`` / ``reverse`` only -- NO explicit ``<color-palette>`` stops --
+# so the exact ramp is unrecoverable from the workbook XML just like the unnamed automatic default.
+# The palette NAME still carries recoverable author intent: its hue tokens (orange <-> blue, red <->
+# green, ...) name the two ends, and a ``diverging`` name (or a domain straddling zero) is a diverging
+# scale. These single-hue anchors are published Tableau-10 palette facts, sourced independently, and
+# reconstruct a DISCLOSED stand-in that matches the author's chosen ends and direction (warn-never-
+# wrong). The neutral middle is Tableau-10 grey; both were render-verified against the source
+# dashboard. The reference tool cyphou/Tableau-To-PowerBI drops named continuous palettes entirely,
+# so this named-palette reconstruction is entirely ours.
+_NAMED_HUE_STOPS = {
+    "orange": "#f28e2b", "blue": "#4e79a7", "red": "#d62728", "green": "#59a14f",
+    "purple": "#b07aa1", "brown": "#9c755f", "teal": "#4e9caf", "gold": "#edc948",
+}
+_NAMED_NEUTRAL_MID = "#bab0ac"
+
 
 def _parse_gradient_center(enc):
     """The numeric ``center`` attribute of a colour encoding, or ``None`` when absent/unparseable."""
@@ -2332,21 +2348,65 @@ def _parse_gradient_center(enc):
         return None
 
 
+def _parse_gradient_bounds(enc):
+    """The numeric ``(min, max)`` domain of a colour encoding; each is ``None`` when absent or
+    unparseable. A domain that straddles zero (``min < 0 < max``) marks a diverging scale centred
+    at zero even when Tableau serialised no explicit ``center``."""
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+    return _f(enc.get("min")), _f(enc.get("max"))
+
+
+def _named_family_stops(name, diverging):
+    """Reconstruct a DISCLOSED stand-in ramp from the hue tokens of a Tableau built-in continuous
+    palette NAME (``orange_blue_diverging`` -> orange .. grey .. blue). Author token order is
+    preserved (first -> min, last -> max). Returns ``None`` when no hue is recognised, so the caller
+    falls back to the generic ColorBrewer default; never guesses beyond the named hues."""
+    tokens = []
+    for tok in re.split(r"[^a-z]+", (name or "").lower()):
+        if tok in _NAMED_HUE_STOPS and tok not in tokens:
+            tokens.append(tok)
+    if diverging:
+        if len(tokens) >= 2:
+            return [_NAMED_HUE_STOPS[tokens[0]], _NAMED_NEUTRAL_MID, _NAMED_HUE_STOPS[tokens[-1]]]
+        return None
+    if tokens:
+        return ["#f7f7f7", _NAMED_HUE_STOPS[tokens[-1]]]
+    return None
+
+
 def _default_continuous_gradient(enc):
     """Synthesise a continuous-gradient spec for a colour encoding that is continuous
-    (``interpolated``) but carries NO explicit ``<color-palette>`` -- the author kept Tableau's
-    default automatic ramp, which Tableau does not serialise. Uses a standard ColorBrewer stand-in
-    and flags ``default_palette`` so the emitter discloses the approximation (warn-never-wrong). A
-    ``center`` on the encoding implies a diverging default; otherwise the ramp is sequential.
+    (``interpolated``) but carries NO explicit ``<color-palette>`` -- either the author kept
+    Tableau's unnamed automatic ramp, or chose a built-in NAMED palette
+    (e.g. ``orange_blue_diverging_10_0``) serialised by name only. A ``center``, a name containing
+    ``diverging``, or a domain straddling zero all mark a DIVERGING scale centred at the domain
+    midpoint (zero when it straddles zero); otherwise the ramp is sequential. The hue family is read
+    from the palette name so the stand-in matches the author's ends, and ``reverse='true'`` flips
+    min <-> max. Flags ``default_palette`` so the emitter discloses the approximation
+    (warn-never-wrong).
     """
+    name = enc.get("palette") or ""
     center = _parse_gradient_center(enc)
-    diverging = center is not None
+    lo, hi = _parse_gradient_bounds(enc)
+    spans_zero = lo is not None and hi is not None and lo < 0 < hi
+    diverging = center is not None or "diverging" in name.lower() or spans_zero
+    if center is None and diverging:
+        center = 0.0 if spans_zero or lo is None or hi is None else (lo + hi) / 2.0
+    colors = _named_family_stops(name, diverging)
+    if colors is None:
+        colors = list(_DEFAULT_DIVERGING_COLORS if diverging else _DEFAULT_SEQUENTIAL_COLORS)
+    if (enc.get("reverse") or "").strip().lower() == "true":
+        colors = list(reversed(colors))
     _, fid = _split_token_attr(enc.get("field"))
     return {
         "field_token": enc.get("field") or "",
         "center": center,
         "palette_type": "ordered-diverging" if diverging else "ordered-sequential",
-        "colors": list(_DEFAULT_DIVERGING_COLORS if diverging else _DEFAULT_SEQUENTIAL_COLORS),
+        "colors": colors,
         "interpolated": True,
         "is_table_calc": _instance_is_table_calc(fid),
         "default_palette": True,
@@ -2983,12 +3043,15 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     if visual_type in _AXIS_TITLE_TYPES:
         axis_titles = _parse_axis_titles(table, dims_rows, dims_cols, meas_rows, meas_cols)
 
-    # Continuous background colour scale (heat / gradient cells) on a table or matrix. Parsed here
-    # (additive IR key) and turned into a PBIR backColor FillRule at emit time -- faithful-or-warn,
-    # so a colour driver the model cannot yet bind (a quick table calc) defers rather than colours
-    # by the wrong measure. Only the table/matrix family carries a cell heat scale.
+    # Continuous colour scale on a worksheet's mark colour encoding. On a table / matrix it becomes a
+    # cell heat scale (a PBIR ``backColor`` FillRule via ``_conditional_format``); on a cartesian
+    # chart the SAME continuous encoding colours the marks (a ``dataPoint.fill`` FillRule via
+    # ``_chart_continuous_fill``). Parsed here for both families (additive IR key); each emit path is
+    # gated by visual type and defers faithfully when the colour driver cannot bind to a model
+    # measure. Other visual types (cards / pies / maps) carry their colour elsewhere -- not parsed here.
     color_gradient = None
-    if visual_type in (VT_MATRIX, VT_TABLE):
+    if visual_type in (VT_MATRIX, VT_TABLE, VT_COLUMN, VT_BAR, VT_LINE,
+                       VT_AREA, VT_SCATTER, VT_COMBO):
         color_gradient = _parse_color_gradient(table)
 
     # Explicit categorical mark-colour palette (author member -> hex). Parsed here (additive IR key)
@@ -4452,6 +4515,12 @@ def _conditional_format(ws, state, model_table, field_map, warnings):
     cg = ws.get("color_gradient")
     if not cg:
         return None, None
+    if ws["visual_type"] not in (VT_MATRIX, VT_TABLE):
+        # A cartesian chart's continuous mark colour is owned by ``_chart_continuous_fill``
+        # (a ``dataPoint.fill`` FillRule), not a table/matrix cell ``backColor``. Now that the
+        # gradient is also parsed for charts, skip silently here rather than feign a
+        # conditional-format deferral for a visual that never carries a cell fill.
+        return None, None
     color = ws["encodings"].get("color")
     fact = {
         "kind": "background_color_scale",
@@ -4930,6 +4999,83 @@ def _measure_series_colors(ws, state, vtype, warnings):
     fact["status"] = "emitted"
     fact["count"] = len(objects)
     return objects, fact
+
+
+# Continuous colour scale on a CARTESIAN chart's marks: a measure on Tableau's Color shelf with an
+# interpolated ramp (e.g. a diverging blue -> grey -> orange scale on Sum(Sentiment Score)). Unlike a
+# highlight table / matrix -- whose gradient rides ``values.backColor`` bound to a projected queryRef
+# (``_conditional_format``) -- a chart carries its colour measure on neither the Category nor the
+# value axis, so there is no projection to bind against. The faithful PBIR home is a ``dataPoint``
+# ``fill`` FillRule whose ``Input`` is built DIRECTLY from the colour field's aggregation expression
+# and whose selector is a data-plane wildcard (``matchingOption`` 0, no ``metadata``) -- the shape
+# Power BI Desktop honours for a per-mark continuous fill. Verified against a Desktop render of a
+# scatter + bar coloured by a continuous measure. Discrete colour (a dimension member palette or a
+# Measure-Names series) is handled by ``_data_point_colors`` / ``_measure_series_colors`` instead.
+_CHART_CONTINUOUS_FILL_TYPES = (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA, VT_SCATTER, VT_COMBO)
+
+
+def _chart_continuous_fill(ws, state, vtype, model_table, field_map, warnings):
+    """Continuous colour measure on a chart's marks -> (data_point_objects, fact).
+
+    ``data_point_objects`` is the ``visual.objects.dataPoint`` entry list (a single ``fill`` FillRule
+    gradient driven by the colour measure's aggregation) or ``None``; ``fact`` is an additive
+    descriptor of the fill (``status`` ``emitted`` / ``deferred`` plus the raw palette) for the
+    candidate record, or ``None`` when the worksheet has no continuous colour scale OR is not a chart
+    that carries a per-mark fill (a table / matrix / map colours elsewhere -- silent skip, no fact).
+
+    WARN-NEVER-WRONG: the fill is emitted ONLY for the cartesian chart types AND when the colour
+    driver resolves to a clean model measure (an ``aggregation`` / ``measure`` binding) that is not a
+    quick table calc without a rebound model measure. Otherwise the visual emits with theme colours,
+    a structured warning names the deferral, and the raw Tableau palette is preserved in ``fact``.
+    The FillRule ``Input`` reuses the EXACT aggregation expression the colour field would project, so
+    the fill never references something the model does not carry.
+    """
+    cg = ws.get("color_gradient")
+    if not cg:
+        return None, None
+    if vtype not in _CHART_CONTINUOUS_FILL_TYPES:
+        # Tables / matrices / maps carry their continuous colour on backColor / the Value / Gradient
+        # role -- not a per-mark chart fill. Silently skip (no fact, no warning) rather than feign a
+        # deferral (the highlight-table path in ``_conditional_format`` owns those).
+        return None, None
+    color = ws["encodings"].get("color")
+    fact = {
+        "kind": "chart_continuous_fill",
+        "palette_type": cg["palette_type"],
+        "center": cg["center"],
+        "colors": cg["colors"],
+    }
+    # A quick table calc normally defers (the model carries no equivalent measure) unless the colour
+    # pill was rebound to a real model measure via the model<->viz contract (``measure_rebound``).
+    is_table_calc_defer = cg["is_table_calc"] and not (color or {}).get("measure_rebound")
+    if (color is None or color["kind"] != "value"
+            or color["binding"] not in ("aggregation", "measure")
+            or is_table_calc_defer):
+        reason = ("colour driver is a quick table calc -- no equivalent model measure yet"
+                  if is_table_calc_defer
+                  else "colour driver is not a continuous model measure in this visual")
+        warnings.append(_warn(
+            "worksheet", ws["name"],
+            "continuous mark colours deferred ({0}); the visual is emitted with theme "
+            "colours".format(reason)))
+        fact["status"] = "deferred"
+        fact["reason"] = reason
+        return None, fact
+
+    input_expr, bound_ref, _ = _field_expression(color, model_table, field_map)
+    data_point_objects = [{
+        "properties": {"fill": {"solid": {"color": {"expr": {
+            "FillRule": {
+                "Input": input_expr,
+                "FillRule": _gradient_color_stops(cg)}}}}}},
+        "selector": {"data": [{"dataViewWildcard": {"matchingOption": 0}}]},
+    }]
+    fact["status"] = "emitted"
+    fact["bound_measure"] = bound_ref
+    if cg.get("default_palette"):
+        fact["default_palette"] = True
+        _disclose_default_palette(ws, cg, warnings)
+    return data_point_objects, fact
 
 
 # KPI / card label colours: a recoloured Tableau card writes the category-label colour and the
@@ -6261,10 +6407,18 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                     ws, state, model_table, field_map, warnings)
             data_point_objects, mc_fact = _data_point_colors(
                 ws, state, ws["visual_type"], model_table, field_map, warnings)
-            ms_objects, ms_fact = _measure_series_colors(
-                ws, state, ws["visual_type"], warnings)
-            if ms_objects and not data_point_objects:
-                data_point_objects = ms_objects
+            cont_objects, cont_fact = _chart_continuous_fill(
+                ws, state, ws["visual_type"], model_table, field_map, warnings)
+            if cont_objects:
+                # a continuous colour scale owns the mark fill; the Measure-Names series is N/A
+                ms_objects, ms_fact = None, None
+                if not data_point_objects:
+                    data_point_objects = cont_objects
+            else:
+                ms_objects, ms_fact = _measure_series_colors(
+                    ws, state, ws["visual_type"], warnings)
+                if ms_objects and not data_point_objects:
+                    data_point_objects = ms_objects
             card_label_objects = _card_label_objects(ws, vtype)
             label_objects, dl_fact = _data_labels(ws, ws["visual_type"], warnings)
             legend_objects, lg_fact = _legend_objects(
@@ -6298,6 +6452,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 rec["visual_calc"] = vc_fact
             if mc_fact:
                 rec["mark_colors"] = mc_fact
+            if cont_fact:
+                rec["chart_continuous_fill"] = cont_fact
             if ms_fact:
                 rec["measure_colors"] = ms_fact
             if card_label_objects:
@@ -6411,10 +6567,18 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 ws, state, model_table, field_map, warnings)
         data_point_objects, mc_fact = _data_point_colors(
             ws, state, ws["visual_type"], model_table, field_map, warnings)
-        ms_objects, ms_fact = _measure_series_colors(
-            ws, state, ws["visual_type"], warnings)
-        if ms_objects and not data_point_objects:
-            data_point_objects = ms_objects
+        cont_objects, cont_fact = _chart_continuous_fill(
+            ws, state, ws["visual_type"], model_table, field_map, warnings)
+        if cont_objects:
+            # a continuous colour scale owns the mark fill; the Measure-Names series is N/A
+            ms_objects, ms_fact = None, None
+            if not data_point_objects:
+                data_point_objects = cont_objects
+        else:
+            ms_objects, ms_fact = _measure_series_colors(
+                ws, state, ws["visual_type"], warnings)
+            if ms_objects and not data_point_objects:
+                data_point_objects = ms_objects
         card_label_objects = _card_label_objects(ws, vtype)
         label_objects, dl_fact = _data_labels(ws, ws["visual_type"], warnings)
         flag_fc = _flag_filter_config_for(ir, ws["name"])
@@ -6443,6 +6607,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             rec["visual_calc"] = vc_fact
         if mc_fact:
             rec["mark_colors"] = mc_fact
+        if cont_fact:
+            rec["chart_continuous_fill"] = cont_fact
         if ms_fact:
             rec["measure_colors"] = ms_fact
         if card_label_objects:
