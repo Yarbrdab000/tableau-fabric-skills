@@ -72,6 +72,16 @@ except ImportError:  # pragma: no cover - flat scripts-on-path
     except ImportError:
         report_formatting = None
 
+# Deterministic remediation worklist (additive; folds warnings + candidate_records into a structured
+# per-visual audit). Optional-safe so the engine still runs standalone if the module is absent.
+try:
+    from .remediation_worklist import build_worklist as _build_worklist
+except ImportError:  # pragma: no cover - flat scripts-on-path
+    try:
+        from remediation_worklist import build_worklist as _build_worklist
+    except ImportError:
+        _build_worklist = None
+
 
 # -- PBIR schema URLs ----------------------------------------------------------
 _S = "https://developer.microsoft.com/json-schemas/fabric/item/report"
@@ -6870,9 +6880,12 @@ def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
                         param_binding=None, resources=None):
     """One-call convenience: parse ``.twb`` text and emit the PBIR parts.
 
-    Returns ``{"ir": ..., "parts": ..., "warnings": ...}``. ``parts`` is the
-    ``{relative_path: text}`` PBIR definition; write it to a ``<report_name>.Report`` folder
-    or base64-encode each part for the Fabric report *Update Definition* API.
+    Returns ``{"ir": ..., "parts": ..., "warnings": ..., "candidate_records": ...,
+    "worklist": ...}``. ``parts`` is the ``{relative_path: text}`` PBIR definition; write it to a
+    ``<report_name>.Report`` folder or base64-encode each part for the Fabric report *Update
+    Definition* API. ``worklist`` (additive, present when ``remediation_worklist`` is importable) is
+    the deterministic per-visual remediation audit -- a structured, full-dashboard superset of
+    ``warnings`` -- and never affects the emitted PBIR.
 
     ``date_binding`` (optional) carries the model build's date facts -- ``date_table`` (the marked
     calendar table name), ``active_keys`` (the fact date column(s) the calendar relates to ACTIVELY,
@@ -6935,8 +6948,16 @@ def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
     parts = emit_pbir(ir, dataset_name=dataset_name, report_name=report_name,
                       model_table=model_table, field_map=field_map,
                       table_calc_usages=table_calc_usages, resources=resources)
-    return {"ir": ir, "parts": parts, "warnings": ir["warnings"],
-            "candidate_records": ir.get("candidate_records", [])}
+    result = {"ir": ir, "parts": parts, "warnings": ir["warnings"],
+              "candidate_records": ir.get("candidate_records", [])}
+    # Additive per-visual remediation worklist (folds warnings + candidate_records into a structured,
+    # full-dashboard audit). Fail-open: never blocks the report emission, never changes the PBIR.
+    if _build_worklist is not None:
+        try:
+            result["worklist"] = _build_worklist(result["warnings"], result["candidate_records"])
+        except Exception:  # pragma: no cover - defensive; worklist is advisory
+            pass
+    return result
 
 
 # -- command-line entry point --------------------------------------------------
@@ -6986,6 +7007,10 @@ def main(argv=None):
     parser.add_argument(
         "--model-table", default=os.environ.get("TWB_PBIR_MODEL_TABLE"),
         help="optional: pin every column binding to this single model table.")
+    parser.add_argument(
+        "--worklist", default=os.environ.get("TWB_PBIR_WORKLIST"), metavar="PATH",
+        help="optional: also write the deterministic per-visual remediation worklist JSON here "
+             "(a structured, full-dashboard superset of the warnings). Never changes the PBIR.")
     args = parser.parse_args(argv)
 
     if args.input == "-":
@@ -6998,6 +7023,17 @@ def main(argv=None):
         xml_text, dataset_name=args.dataset, report_name=args.report,
         model_table=args.model_table)
     parts, warnings = result["parts"], result["warnings"]
+
+    if args.worklist and result.get("worklist") is not None:
+        wl_parent = os.path.dirname(args.worklist)
+        if wl_parent:
+            os.makedirs(wl_parent, exist_ok=True)
+        with open(args.worklist, "w", encoding="utf-8") as fh:
+            json.dump(result["worklist"], fh, indent=2, ensure_ascii=False)
+        s = result["worklist"]["summary"]
+        print("wrote remediation worklist: {0} item(s) across {1} visual(s) ({2} flagged) to {3}"
+              .format(s["items_total"], s["visuals_total"], s["visuals_flagged"], args.worklist),
+              file=sys.stderr)
 
     if args.out:
         root, written = _write_parts(args.out, args.report, parts)
