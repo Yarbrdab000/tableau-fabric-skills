@@ -4741,6 +4741,29 @@ def _reference_line_analytics_objects(ws):
     return report_formatting.reference_line_objects(lines, "value")
 
 
+def _apply_grow_to_fit(visual, pbir_vtype):
+    """Pin ``autoSizeColumnWidth=true`` ("Grow to fit") on a table/matrix's ``columnHeaders`` object.
+
+    "Grow to fit" is the column-width DEFAULT a user expects on a grid. With the property ABSENT,
+    Power BI Desktop's modern "Auto-size behavior" resolves to "Custom" (fixed widths) and the grid
+    renders wonky -- columns clipped or over-wide -- until each visual is manually flipped. Grid-only:
+    column width is a ``tableEx``/``pivotTable`` concept, so ``pbir_vtype`` gates every other visual
+    out (the call is a safe no-op for cartesian charts, cards, slicers, textboxes). Shape verified
+    against a real MS-format PBIR ``tableEx`` visual.json
+    (``objects.columnHeaders[].properties.autoSizeColumnWidth`` = a quoted-boolean semantic-query
+    literal, matching how every other boolean is written here). The per-column ``columnWidth[]``
+    "Custom widths" selectors are deliberately NOT emitted -- adding them (even empty) is what flips
+    the toggle toward fixed widths. ``setdefault`` twice so a ``columnHeaders`` object a later
+    formatting pass might add (header font/colour) is never clobbered; only ``autoSizeColumnWidth``
+    is filled when unset, co-existing with any ``values`` background gradient a table already carries.
+    """
+    if pbir_vtype not in ("tableEx", "pivotTable"):
+        return
+    ch = visual.setdefault("objects", {}).setdefault("columnHeaders", [{"properties": {}}])
+    ch[0].setdefault("properties", {}).setdefault(
+        "autoSizeColumnWidth", {"expr": {"Literal": {"Value": "true"}}})
+
+
 def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  filter_config=None, title=None, title_style=None, axis_titles=None,
                  value_objects=None,
@@ -4833,6 +4856,11 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
                 "showEmptyItems": {"expr": {"Literal": {"Value": "false"}}},
             }
         }]
+    # Column auto-size ("Grow to fit") -- the table/matrix column-width DEFAULT. Emitted for every
+    # rebuilt grid so it opens grow-to-fit instead of Power BI's absent-value "Custom" (fixed) default;
+    # a no-op for every non-grid visual. Placed after all data-plane ``objects`` are assembled so it
+    # merges (via ``setdefault``) with any ``values`` gradient rather than being clobbered.
+    _apply_grow_to_fit(visual, vtype)
     # Structural title text (Tier-1): the worksheet's authored caption -> the visual's container
     # title. Shape verified against the official PBIR visualContainer schema + real reports: a
     # single-quoted semantic-query string literal under visualContainerObjects.title; the
@@ -5363,11 +5391,16 @@ def field_parameter_table_visual(name, specs, position, *, visual_type=VT_TABLE)
                 "Property": spec["display_col"]}},
             "index": idx, "length": 1})
     state = {"Values": {"projections": projections, "fieldParameters": field_params}}
+    fp_vtype = _VT_TO_PBIR[visual_type]
+    visual = {"visualType": fp_vtype, "query": {"queryState": state}}
+    # A self-service field-parameter table is a real grid the user sees -- give it the same
+    # "Grow to fit" column default as every other rebuilt table/matrix (see ``_apply_grow_to_fit``).
+    _apply_grow_to_fit(visual, fp_vtype)
     return {
         "$schema": SCHEMA_VISUAL_FP,
         "name": name,
         "position": position,
-        "visual": {"visualType": _VT_TO_PBIR[visual_type], "query": {"queryState": state}},
+        "visual": visual,
     }
 
 
