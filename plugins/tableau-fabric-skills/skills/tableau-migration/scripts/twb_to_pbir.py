@@ -3201,6 +3201,8 @@ def _parse_dashboard(db, worksheet_names, warnings):
     seen_params = set()
     banner_candidates = []
     text_objects = []
+    image_zones = []
+    seen_images = set()
     ext_w = ext_h = 0.0
     for zone in _findall_local(db, "zone"):
         if zone in device_zones:
@@ -3281,6 +3283,34 @@ def _parse_dashboard(db, worksheet_names, warnings):
                 seen_params.add(pid)
                 param_controls.append({"param_id": pid, "x": x, "y": y, "w": w, "h": h})
             continue
+        # A dashboard IMAGE object: either a straight bitmap (``type-v2='bitmap'`` with
+        # ``param='Image/..png'`` -- e.g. the corner logo) or an image BUTTON
+        # (``type-v2='dashboard-object'`` hosting an ``<image-path>`` -- an export / filter-toggle /
+        # info icon). Tableau packages the PNG inside the ``.twbx`` (the ``Image/`` archive folder);
+        # the faithful Tier-1 rebuild lays each out as a positioned Power BI image visual at the same
+        # zone geometry. A button's INTERACTIVITY is not recreated (structure, not behaviour) -- the
+        # icon is placed as-is. Captured with its raw image ref + geometry; the emitter resolves the
+        # bytes from the packaged resources and skips any image whose bytes are not supplied
+        # (fail-closed -- never a broken resource reference). A 2-state toggle button lists
+        # ``[outline, filled]``; the shown/active state is the last, matching the always-visible
+        # slicer rebuild.
+        if ztype in ("bitmap", "dashboard-object") and None not in (x, y, w, h) and w > 0 and h > 0:
+                    if ztype == "bitmap":
+                        refs = [zone.get("param")] if zone.get("param") else []
+                    else:
+                        refs = [ip.text for ip in zone.findall(".//image-path") if ip.text]
+                    if refs:
+                        ref = refs[-1]
+                        key = (zone.get("id"), ref, round(x), round(y))
+                        if key not in seen_images:
+                            seen_images.add(key)
+                            image_zones.append({
+                                "id": zone.get("id"),
+                                "kind": "image" if ztype == "bitmap" else "button",
+                                "image": ref, "x": x, "y": y, "w": w, "h": h,
+                                "url": zone.get("url"),
+                            })
+                    continue
         zname = zone.get("name")
         if not zname or zname not in worksheet_names:
             continue
@@ -3311,6 +3341,7 @@ def _parse_dashboard(db, worksheet_names, warnings):
             "filter_field_tokens": sorted(filter_field_tokens),
             "filter_zones": filter_zones,
             "text_objects": text_objects,
+            "image_zones": image_zones,
             "title_banner": title_banner}
 
 
@@ -5768,6 +5799,69 @@ def _text_object_textbox_visual(name, position, tob):
     return {"$schema": SCHEMA_VISUAL, "name": name, "position": position, "visual": visual}
 
 
+def _resource_basename(ref):
+    """The bare file name of a Tableau image ref (``Image/EBI Logo Black.png`` -> ``EBI Logo
+    Black.png``). Tolerates either slash and a bare name."""
+    return (ref or "").replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _image_item_name(ref, taken):
+    """A deterministic, filesystem-safe RegisteredResources item name for a packaged image.
+
+    Mirrors Power BI Desktop's convention (descriptive stem + a unique suffix + extension) so two
+    images with the same base name never collide: ``EBI Logo Black.png`` -> ``EBILogoBlack<hash>.png``.
+    The hash is derived from the FULL original ref, so the mapping is stable across runs and unique
+    per source image. ``taken`` is the set of already-issued names (defensive against a hash clash)."""
+    base = _resource_basename(ref)
+    stem, dot, ext = base.rpartition(".")
+    stem = stem or base
+    ext = ("." + ext) if dot else ".png"
+    safe = _sanitize(stem) or "image"
+    suffix = hashlib.md5((ref or "").encode("utf-8")).hexdigest()[:12]
+    item = f"{safe}{suffix}{ext}"
+    while item in taken:
+        suffix = hashlib.md5((suffix + ref).encode("utf-8")).hexdigest()[:12]
+        item = f"{safe}{suffix}{ext}"
+    return item
+
+
+def _resolve_resource_bytes(resources, ref):
+    """Look up an image ref in the packaged ``{archive_path: bytes}`` map.
+
+    Matches the exact archive path first (``Image/EBI Logo Black.png``), then falls back to a
+    case-insensitive base-name match so a ref and its archive entry that differ only in folder
+    casing still resolve. Returns ``bytes`` or ``None`` (never raises)."""
+    if not resources or not ref:
+        return None
+    if ref in resources:
+        return resources[ref]
+    want = _resource_basename(ref).lower()
+    for k, v in resources.items():
+        if _resource_basename(k).lower() == want:
+            return v
+    return None
+
+
+def _image_visual(name, position, item_name):
+    """A Tableau dashboard image/button object -> a schema-valid PBIR ``image`` ``visual.json`` dict.
+
+    The visual references a PNG bundled in the report's ``RegisteredResources`` package via a
+    ``ResourcePackageItem`` expression (``PackageType`` 1). Shape verified against a Power BI Desktop
+    image-visual export (``objects.general[].properties.imageUrl`` -> ``ResourcePackageItem``) and the
+    ``visualContainer`` schema this engine stamps for every visual (``SCHEMA_VISUAL``). Carries no
+    data binding, so it never dangles against the model."""
+    visual = {
+        "visualType": "image",
+        "objects": {"general": [{"properties": {"imageUrl": {"expr": {"ResourcePackageItem": {
+            "PackageName": "RegisteredResources",
+            "PackageType": 1,
+            "ItemName": item_name,
+        }}}}}]},
+        "drillFilterOtherVisuals": True,
+    }
+    return {"$schema": SCHEMA_VISUAL, "name": name, "position": position, "visual": visual}
+
+
 # -- Tableau palette custom theme ---------------------------------------------
 # Power BI applies the report theme's ``dataColors`` to every AUTOMATICALLY coloured categorical
 # mark (the bulk of a workbook's charts). A migrated report with no custom theme falls back to
@@ -5846,7 +5940,7 @@ def tableau_theme_dict(brand=None, extra_palette=None):
     return {"name": _TABLEAU_THEME_DISPLAY, "dataColors": ordered}
 
 
-def report_json_part(custom_theme_name=None):
+def report_json_part(custom_theme_name=None, image_items=None):
     """The ``definition/report.json`` content shared by the full viz seam (``emit_pbir``) and the
     thin ``.pbip`` shell (``assemble_model.build_thin_report_parts``).
 
@@ -5860,8 +5954,13 @@ def report_json_part(custom_theme_name=None):
     the base theme plus its ``RegisteredResources`` package are added so the report loads a bundled
     theme file at ``StaticResources/RegisteredResources/<custom_theme_name>``. Shape verified against
     the ``report/1.0.0`` schema (``ThemeMetadata`` + ``ResourcePackage``/``ResourcePackageItem``) and
-    a real Microsoft enhanced-format report. Default ``None`` is byte-for-byte the prior output, so
-    the thin ``.pbip`` shell is unchanged.
+    a real Microsoft enhanced-format report.
+
+    ``image_items`` (an optional list of ``{"name","path","type":"Image"}`` records, one per packaged
+    dashboard image) registers those PNGs in the SAME ``RegisteredResources`` package alongside the
+    theme item, so ``image`` visuals resolve their ``ResourcePackageItem`` bytes. Default ``None`` (and
+    no ``custom_theme_name``) is byte-for-byte the prior output, so the thin ``.pbip`` shell is
+    unchanged.
     """
     part = {
         "$schema": SCHEMA_REPORT,
@@ -5871,17 +5970,22 @@ def report_json_part(custom_theme_name=None):
             "reportVersionAtImport": "5.61",
             "type": "SharedResources"}},
     }
+    items = []
     if custom_theme_name:
         part["themeCollection"]["customTheme"] = {
             "name": custom_theme_name,
             "reportVersionAtImport": "5.61",
             "type": "RegisteredResources"}
+        items.append({"name": custom_theme_name,
+                      "path": custom_theme_name,
+                      "type": "CustomTheme"})
+    for it in (image_items or []):
+        items.append(it)
+    if items:
         part["resourcePackages"] = [{
             "name": "RegisteredResources",
             "type": "RegisteredResources",
-            "items": [{"name": custom_theme_name,
-                       "path": custom_theme_name,
-                       "type": "CustomTheme"}]}]
+            "items": items}]
     return part
 
 
@@ -6043,7 +6147,7 @@ def _filter_slicer_fields(ws_list, shown_tokens=None):
 
 
 def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
-              model_table=None, field_map=None, table_calc_usages=None):
+              model_table=None, field_map=None, table_calc_usages=None, resources=None):
     """Emit a PBIR report definition (a ``{relative_path: text}`` parts dict) from the IR.
 
     One page per dashboard (a visual per worksheet zone), plus one page per worksheet not
@@ -6064,6 +6168,25 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     records = []
     vc_index = _view_only_quick_index(table_calc_usages)
 
+    # Pre-pass: register every referenced-and-packaged dashboard image once, so report.json can list
+    # it and each page's image visual can reference it by a stable RegisteredResources item name.
+    image_resources = {}   # raw Tableau ref -> registered RegisteredResources item name
+    image_items = []       # report.json RegisteredResources items ({"name","path","type":"Image"})
+    if resources:
+        seen_refs = []
+        for db in ir.get("dashboards", []):
+            for iz in (db.get("image_zones") or []):
+                if iz.get("image"):
+                    seen_refs.append(iz["image"])
+        for ref in dict.fromkeys(seen_refs):   # stable de-dup, one resource per distinct image
+            data = _resolve_resource_bytes(resources, ref)
+            if data is None:
+                continue
+            item = _image_item_name(ref, set(image_resources.values()))
+            image_resources[ref] = item
+            parts["StaticResources/RegisteredResources/" + item] = data   # raw PNG bytes
+            image_items.append({"name": item, "path": item, "type": "Image"})
+
     parts["definition.pbir"] = _dumps({
         "$schema": SCHEMA_DEFINITION_PROPERTIES,
         "version": "4.0",
@@ -6072,7 +6195,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     parts["definition/version.json"] = _dumps({
         "$schema": SCHEMA_VERSION, "version": "2.0.0"})
     parts["definition/report.json"] = _dumps(
-        report_json_part(custom_theme_name=_TABLEAU_THEME_FILE))
+        report_json_part(custom_theme_name=_TABLEAU_THEME_FILE, image_items=image_items or None))
     # Brand-first theme: lead ``dataColors`` with the workbook's derived brand colour (the dashboards'
     # title-banner fill) so auto-coloured single-series charts rebuild in the brand instead of Power
     # BI's blue-first default. ``None`` (no banner/brand) keeps the theme byte-identical (never-regress).
@@ -6223,6 +6346,33 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         # band and compress to fit -- exactly what Tableau does on "Show Filters". No-op when nothing
         # overlaps (never-regress).
         _reflow_worksheets_below_slicers(visuals, _page_h())
+        # Dashboard image / button objects: place each packaged PNG (logo, export/filter/info icon) as
+        # a positioned image visual at its own zone geometry. Added AFTER the reflow so a top-corner
+        # image is never shoved by the slicer-band compaction (it is decoration, not worksheet
+        # content). ``z=1100`` keeps it above the title banner (z=1000) so a logo overlapping the band
+        # renders on top. An image whose bytes were not packaged is skipped with an honest warning; a
+        # click-through URL (a linked logo/help icon) is noted -- the Tier-1 rebuild places the image
+        # faithfully but does not recreate the hyperlink action.
+        for iz in (db.get("image_zones") or []):
+            item = image_resources.get(iz.get("image"))
+            if not item:
+                if resources:
+                    warnings.append(_warn(
+                        "dashboard", db["name"],
+                        "image object '%s' not rebuilt (image bytes not packaged with the workbook)"
+                        % _resource_basename(iz.get("image"))))
+                continue
+            ix, iy, iw, ih = _scale_zone(iz, ref_w, ref_h)
+            visuals.append(_image_visual(
+                _sanitize("v-%s-img-%s" % (page_name, iz.get("id") or item)),
+                _position(ix, iy, iw, ih, z=1100, tab=len(visuals) + 1),
+                item))
+            if iz.get("url"):
+                warnings.append(_warn(
+                    "dashboard", db["name"],
+                    "image object '%s' has a click-through URL that is not rebuilt as a link action "
+                    "(image placed faithfully; interactivity deferred)"
+                    % _resource_basename(iz.get("image"))))
         if not visuals:
             warnings.append(_warn("dashboard", db["name"],
                                   "no supported visuals on this dashboard"))
@@ -6551,7 +6701,7 @@ def _reflow_worksheets_below_slicers(visuals, page_h, *, gap=8.0, tol=1.0):
 def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
                         model_table=None, field_map=None, date_binding=None,
                         row_count_binding=None, measure_binding=None, column_binding=None,
-                        param_binding=None):
+                        param_binding=None, resources=None):
     """One-call convenience: parse ``.twb`` text and emit the PBIR parts.
 
     Returns ``{"ir": ..., "parts": ..., "warnings": ...}``. ``parts`` is the
@@ -6618,7 +6768,7 @@ def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
             table_calc_usages = None
     parts = emit_pbir(ir, dataset_name=dataset_name, report_name=report_name,
                       model_table=model_table, field_map=field_map,
-                      table_calc_usages=table_calc_usages)
+                      table_calc_usages=table_calc_usages, resources=resources)
     return {"ir": ir, "parts": parts, "warnings": ir["warnings"],
             "candidate_records": ir.get("candidate_records", [])}
 

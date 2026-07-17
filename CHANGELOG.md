@@ -13,6 +13,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.56.0` → `1.57.0`): Dashboard image & button objects — the report
+  rebuilder now rebuilds a dashboard's floating `bitmap` image zones and `dashboard-object` buttons
+  (with an `<image-path>`) as native PBIR `image` visuals, packaging each referenced PNG/JPG as a
+  registered report resource. Additive and fail-closed — a dashboard with no image/button objects, or a
+  workbook whose image bytes were never packaged, stays byte-identical.**
+  - **Image & button capture.** `_parse_dashboard` additively captures each `type-v2='bitmap'` image zone
+    and each `type-v2='dashboard-object'` button zone that carries an `<image-path>` into
+    `db["image_zones"]` (kind `image` / `button`), preserving the authored source ref and pixel geometry;
+    duplicate references to the same image are deduped to one packaged resource.
+  - **Native image visuals + resource packaging.** `_image_visual` emits a PBIR `image` visual bound to a
+    `ResourcePackageItem` (`RegisteredResources`) with no data binding, and `report_json_part` registers
+    each image under `resourcePackages` so the emitted `definition/report.json` lists the packaged item;
+    raw image bytes are written verbatim under `StaticResources/RegisteredResources/`.
+  - **Fail-closed byte handling.** `_resolve_resource_bytes` resolves an image reference by exact key or
+    case-insensitive basename; when a workbook's image bytes were not packaged with it, the image object
+    is skipped with a `manual attention required` warning (never a broken visual), and a run with no
+    `resources` supplied emits no image visuals and no warning.
+  - Locked by new hermetic tests (`test_twb_to_pbir.py` §13 dashboard image & button objects), inline-XML
+    fixtures only; no customer artifact committed. Plugin mirror kept byte-identical.
 - **tableau-migration (skill `1.55.0` → `1.56.0`): Dashboard text objects + "Grow to fit" column
   auto-size — the report rebuilder now captures EVERY dashboard `type='text'` zone (not just the top
   title banner) and rebuilds each as its own PBIR `textbox`, and rebuilt matrices actually grow their

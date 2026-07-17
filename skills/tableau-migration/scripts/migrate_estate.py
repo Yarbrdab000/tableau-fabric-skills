@@ -557,8 +557,10 @@ def _viz_adapter(cand):
     supports_model_table = "model_table" in params
     supports_field_map = "field_map" in params
     supports_column = "column_binding" in params
+    supports_resources = "resources" in params
     def _call(twb_text, name, date_binding=None, measure_binding=None, row_count_binding=None,
-              param_binding=None, model_table=None, field_map=None, column_binding=None):
+              param_binding=None, model_table=None, field_map=None, column_binding=None,
+              resources=None):
         if name_kwargs:
             kwargs = {k: name for k in name_kwargs}
             if supports_date and date_binding is not None:
@@ -575,6 +577,8 @@ def _viz_adapter(cand):
                 kwargs["field_map"] = field_map
             if supports_column and column_binding is not None:
                 kwargs["column_binding"] = column_binding
+            if supports_resources and resources:
+                kwargs["resources"] = resources
             return cand(twb_text, **kwargs)
         return cand(twb_text, name)
     return _call
@@ -1918,6 +1922,35 @@ def _record_pbip_write_failure(entry, warns, *, cause, dest, projected=None, exc
     warns.append(_PBIP_WARN + message)
 
 
+def _twbx_images(wb_id):
+    """Return the packaged image bytes from a ``.twbx`` as ``{archive_path: bytes}`` (else ``{}``).
+
+    A ``.twbx`` is a zip; its dashboard logos/icons live under ``Image/`` (occasionally ``Assets/``
+    or with an ``image/`` prefix). ``wb_id`` is the workbook source id -- a filesystem path for a
+    local source. Anything that is not a readable zip on disk (a live-source LUID, a bare ``.twb``,
+    an in-memory fake) yields ``{}`` so the caller simply emits no image visuals (never-regress).
+    """
+    import zipfile
+    try:
+        if not (isinstance(wb_id, str) and os.path.isfile(wb_id)):
+            return {}
+        if not zipfile.is_zipfile(wb_id):
+            return {}
+        out = {}
+        with zipfile.ZipFile(wb_id) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                name = info.filename
+                low = name.lower()
+                if not low.rsplit(".", 1)[-1] in ("png", "jpg", "jpeg", "gif", "bmp", "svg"):
+                    continue
+                out[name] = zf.read(info)
+        return out
+    except Exception:
+        return {}
+
+
 def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, model_safe, dest,
                            folder_rel, report_base, viz_name, viz=None, ds_catalog=None,
                            approved_calc_dax=None, wb_id=None, pbip_dir=None,
@@ -2089,14 +2122,18 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
     # fallback that ships an empty/mis-bound visual. Read from the BUILT model parts (res["parts"]);
     # None when the model materialised no such calc column (byte-unchanged standing resolution).
     column_binding = _column_binding_from_model(res.get("parts"))
+    # Packaged dashboard images (logos / export-filter-info icons stored inside the .twbx). Extracted
+    # once here and threaded to the viz stage so each image object rebuilds as a positioned PBIR image
+    # visual. Empty for a bare .twb / live source (never-regress: viz emits no image visuals).
+    wb_images = _twbx_images(wb_id)
     if (date_binding or measure_binding or row_count_binding or param_binding
-            or field_map or column_binding) and viz is not None:
+            or field_map or column_binding or wb_images) and viz is not None:
         try:
             rebuilt = viz(twb_text, viz_name,
                           date_binding=date_binding, measure_binding=measure_binding,
                           row_count_binding=row_count_binding, param_binding=param_binding,
                           model_table=field_model_table, field_map=field_map,
-                          column_binding=column_binding)
+                          column_binding=column_binding, resources=wb_images or None)
             if isinstance(rebuilt, dict) and rebuilt.get("parts"):
                 report_parts = _rebind_report_byPath(rebuilt["parts"], model_safe)
                 if date_binding:

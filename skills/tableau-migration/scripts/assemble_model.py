@@ -3105,8 +3105,13 @@ def write_model_folder(parts, dest_dir):
         full = os.path.join(dest_dir, rel_path.replace("/", os.sep))
         lp = _win_long_path(full)  # lift MAX_PATH for the deep PBIR/TMDL write; clean path is reported
         os.makedirs(os.path.dirname(lp), exist_ok=True)
-        with open(lp, "w", encoding="utf-8") as fh:
-            fh.write(text)
+        if isinstance(text, (bytes, bytearray)):
+            # a binary part (e.g. a packaged dashboard image PNG under StaticResources) -- write raw
+            with open(lp, "wb") as fh:
+                fh.write(text)
+        else:
+            with open(lp, "w", encoding="utf-8") as fh:
+                fh.write(text)
         written.append(full)
     return written
 

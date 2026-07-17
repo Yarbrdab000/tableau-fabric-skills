@@ -26,11 +26,15 @@ from twb_to_pbir import (
     _drop_resolved_flag_warnings,
     _field_expression,
     _flag_filter_container,
+    _image_item_name,
+    _image_visual,
     _norm_param_key,
     _position,
     _reconcile_caption_fallback,
     _resolve_parameter_controls,
+    _resolve_resource_bytes,
     _resolve_visual_flags,
+    _resource_basename,
     _tableau_filter_mode_to_pbi,
     _text_object_textbox_visual,
     _visual_json,
@@ -42,6 +46,7 @@ from twb_to_pbir import (
     field_parameter_table_visual,
     migrate_twb_to_pbir,
     parse_twb,
+    report_json_part,
     report_json_part_fp,
 )
 
@@ -5849,3 +5854,117 @@ def test_dashboard_size_dict_survives_capture():
     ir = parse_twb(TECH_HIERARCHY_TWB)
     db = next(d for d in ir["dashboards"] if d["name"] == "Tech Hierarchy")
     assert isinstance(db["size"], dict) and "w" in db["size"] and "h" in db["size"]
+
+
+# -- §13 dashboard image & button objects --------------------------------------------------------
+_IMAGE_ZONE = ("<zone type-v2='bitmap' param='Image/Logo.png' h='9245' w='20000' "
+               "x='0' y='0' id='40' />")
+_BUTTON_ZONE = ("<zone type-v2='dashboard-object' id='41' x='30000' y='0' w='20000' h='9245'>"
+                "<image-path>Image/Icon.png</image-path></zone>")
+
+IMAGE_BUTTON_TWB = _workbook(
+    _worksheet("Sheet1", "Bar", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[none:Category:nk]", deps_extra=_INST),
+    "<dashboard name='Cover'><size maxwidth='1200' maxheight='800' /><zones>"
+    + _text_object_container(_text_object_ws_zone("Sheet1"), _IMAGE_ZONE, _BUTTON_ZONE, _IMAGE_ZONE)
+    + "</zones></dashboard>",
+)
+
+_PNG = b"\x89PNG\r\n\x1a\nFAKE"
+_PNG2 = b"\x89PNG\r\n\x1a\nICON"
+
+
+def test_resource_basename_handles_slashes_and_none():
+    assert _resource_basename("Image/Logo.png") == "Logo.png"
+    assert _resource_basename("Image\\Sub\\Logo.png") == "Logo.png"
+    assert _resource_basename("Logo.png") == "Logo.png"
+    assert _resource_basename(None) == ""
+
+
+def test_image_item_name_is_deterministic_collision_safe_and_fs_safe():
+    n1 = _image_item_name("Image/EBI Logo Black.png", set())
+    assert n1 == _image_item_name("Image/EBI Logo Black.png", set())
+    assert " " not in n1 and n1.endswith(".png")
+    assert n1 != _image_item_name("Image/EBI Logo Black.png", {n1})
+    assert _image_item_name("Image/logo", set()).endswith(".png")
+
+
+def test_resolve_resource_bytes_exact_ci_and_misses():
+    res = {"Image/Logo.png": _PNG}
+    assert _resolve_resource_bytes(res, "Image/Logo.png") == _PNG
+    assert _resolve_resource_bytes(res, "other/logo.PNG") == _PNG
+    assert _resolve_resource_bytes(res, None) is None
+    assert _resolve_resource_bytes(None, "Image/Logo.png") is None
+    assert _resolve_resource_bytes(res, "Image/Missing.png") is None
+
+
+def test_image_visual_shape_has_resource_package_item_and_no_data_binding():
+    vis = _image_visual("v-cover-img-40", _position(0, 0, 200, 100), "Logo0123.png")
+    assert vis["$schema"] == SCHEMA_VISUAL
+    v = vis["visual"]
+    assert v["visualType"] == "image"
+    assert v["drillFilterOtherVisuals"] is True
+    rp = v["objects"]["general"][0]["properties"]["imageUrl"]["expr"]["ResourcePackageItem"]
+    assert rp["PackageName"] == "RegisteredResources"
+    assert rp["PackageType"] == 1
+    assert rp["ItemName"] == "Logo0123.png"
+    assert "query" not in v
+
+
+def test_report_json_part_registers_image_items_else_none():
+    part = report_json_part(image_items=[{"name": "x.png", "path": "x.png", "type": "Image"}])
+    pkg = part["resourcePackages"][0]
+    assert pkg["name"] == "RegisteredResources"
+    assert "x.png" in [it["name"] for it in pkg["items"]]
+    assert part["themeCollection"]["baseTheme"]["name"] == "CY24SU10"
+    plain = report_json_part()
+    assert "resourcePackages" not in plain
+    assert plain["themeCollection"]["baseTheme"]["name"] == "CY24SU10"
+
+
+def test_parse_captures_image_and_button_zones_deduped():
+    ir = parse_twb(IMAGE_BUTTON_TWB)
+    db = next(d for d in ir["dashboards"] if d["name"] == "Cover")
+    zones = db["image_zones"]
+    assert sorted(z["kind"] for z in zones) == ["button", "image"]
+    img = next(z for z in zones if z["kind"] == "image")
+    assert img["image"] == "Image/Logo.png"
+    assert img["w"] > 0 and img["h"] > 0
+    assert all(k in img for k in ("x", "y", "w", "h"))
+    assert next(z for z in zones if z["kind"] == "button")["image"] == "Image/Icon.png"
+
+
+def test_migrate_emits_image_visual_and_packages_bytes():
+    result = migrate_twb_to_pbir(
+        IMAGE_BUTTON_TWB, resources={"Image/Logo.png": _PNG, "Image/Icon.png": _PNG2})
+    parts = result["parts"]
+    image_vis = [v for v in _visual_parts(parts).values()
+                 if v["visual"]["visualType"] == "image"]
+    assert len(image_vis) == 2
+    png_parts = {k: v for k, v in parts.items()
+                 if k.startswith("StaticResources/RegisteredResources/")
+                 and isinstance(v, (bytes, bytearray))}
+    assert set(png_parts.values()) == {_PNG, _PNG2}
+    report = json.loads(parts["definition/report.json"])
+    image_items = [it for it in report["resourcePackages"][0]["items"] if it["type"] == "Image"]
+    assert len(image_items) == 2
+
+
+def test_image_object_fail_closed_when_bytes_missing():
+    result = migrate_twb_to_pbir(IMAGE_BUTTON_TWB, resources={"Image/Nope.png": _PNG})
+    assert not any(v["visual"]["visualType"] == "image"
+                   for v in _visual_parts(result["parts"]).values())
+    assert any("image object" in str(w)
+               and "not rebuilt (image bytes not packaged with the workbook)" in str(w)
+               for w in result["warnings"])
+
+
+def test_image_objects_never_regress_when_resources_none():
+    result = migrate_twb_to_pbir(IMAGE_BUTTON_TWB)
+    assert not any(v["visual"]["visualType"] == "image"
+                   for v in _visual_parts(result["parts"]).values())
+    assert not any("image object" in str(w) for w in result["warnings"])
+    report = json.loads(result["parts"]["definition/report.json"])
+    pkgs = report.get("resourcePackages", [])
+    image_items = [it for pkg in pkgs for it in pkg.get("items", []) if it.get("type") == "Image"]
+    assert image_items == []

@@ -2021,7 +2021,8 @@ def test_attach_workbook_pbip_refreshes_fidelity_from_rebound_run(tmp_path, monk
     monkeypatch.setattr(me, "write_local_pbip", lambda *a, **kw: None)
 
     def bound_viz(xml, name, date_binding=None, measure_binding=None, row_count_binding=None,
-                  param_binding=None, model_table=None, field_map=None, column_binding=None):
+                  param_binding=None, model_table=None, field_map=None, column_binding=None,
+                  resources=None):
         # the row count is bound now -> the rebound report carries no implicit-row-count warning.
         assert row_count_binding  # the model-derived binding reached the single re-run
         return {"parts": {"definition.pbir": pbir},
