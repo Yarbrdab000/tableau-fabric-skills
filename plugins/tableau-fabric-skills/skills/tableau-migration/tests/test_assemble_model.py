@@ -28,9 +28,14 @@ from assemble_model import (
     _anchoring_rc,
     _ROW_LEVEL_IN_MEASURE_REASON,
     _INLINE_REF_SENTINEL,
+    _unique_source_name,
+    _plan_source_suffix_renames,
+    _apply_source_suffix_renames,
+    _rename_relationship_endpoints,
 )
 from calc_to_dax import translate_tableau_calc_to_dax
 from connection_to_m import parse_tds, combine_descriptors
+from openability_gate import check_model_openability
 from workbook_table_calcs import TableCalcUsage, Pill
 from test_connection_to_m import (
     EXCEL_COLLECTION,
@@ -1451,6 +1456,128 @@ def test_measure_bare_reference_to_calc_column_reroutes_to_faithful_column_end_t
         "[Order Bucket]", _phys_resolver({"Order Bucket": ("Orders", "Order Bucket", "string")}),
         known_tables={"Orders"})
     assert mdax is None and mreason == _ROW_LEVEL_IN_MEASURE_REASON
+
+
+# --- case-insensitive calc/physical column collision -> rename the physical to "<name> (source)" --
+# Power BI's engine is case-insensitive, so a calc dimension that case-aliases a physical column
+# (calc ``sales`` beside physical ``Sales``) would declare TWO columns whose names differ only by
+# case on one table -> Desktop refuses to open the .pbip. The generator keeps the report-facing calc
+# name and renames the PHYSICAL column's MODEL name to "<name> (source)", leaving its sourceColumn /
+# M header bound to the real DB header so data still loads. All downstream consumers (TMDL emit,
+# resolver, calc DAX, gate) then agree by construction.
+
+def test_unique_source_name_bumps_on_collision():
+    # the base suffix is "<name> (source)"; a taken casefold bumps to "(source 2)", "(source 3)", ...
+    assert _unique_source_name("Sales", set()) == "Sales (source)"
+    assert _unique_source_name("Sales", {"sales (source)"}) == "Sales (source 2)"
+    assert _unique_source_name("Sales", {"sales (source)", "sales (source 2)"}) == "Sales (source 3)"
+
+
+def test_plan_source_suffix_renames_empty_when_no_collision():
+    # a dim-calc whose name does NOT casefold-match any physical column plans no rename (common path)
+    desc = parse_tds(LIVE_SQLSERVER)
+    tables = [r for r in desc.get("relations", []) if r["kind"] in ("table", "custom_sql")]
+    plan = _plan_source_suffix_renames(
+        desc, tables, [{"name": "Sales Label", "formula": "[Sales]"}], None)
+    assert plan == {}
+
+
+def test_plan_source_suffix_renames_flags_case_collision():
+    # calc ``sales`` casefold-matches physical ``Sales`` on ``Orders`` -> plan renames the PHYSICAL
+    # column's model name (keyed by table-display + physical model name) to "Sales (source)"
+    desc = parse_tds(LIVE_SQLSERVER)
+    tables = [r for r in desc.get("relations", []) if r["kind"] in ("table", "custom_sql")]
+    plan = _plan_source_suffix_renames(
+        desc, tables, [{"name": "sales", "formula": "[Sales]"}], None)
+    assert plan == {("Orders", "Sales"): "Sales (source)"}
+
+
+def test_calc_case_aliases_physical_column_renames_source_end_to_end():
+    # END-TO-END: calc ``sales`` = [Sales] beside physical ``Sales`` -> the physical column is emitted
+    # as ``column 'Sales (source)'`` with ``sourceColumn: Sales`` (real header UNCHANGED, data loads),
+    # the calc keeps its name ``sales`` and its DAX references the renamed physical column, and the
+    # openability gate sees exactly ONE column per case-folded name -> the model opens.
+    out = _model_with_calc_cols_and_measures(
+        dim_calcs=[{"name": "sales", "formula": "[Sales]"}], calcs=[])
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "column 'Sales (source)'" in orders          # physical column renamed (model name only)
+    assert "sourceColumn: Sales" in orders              # ... but its DB header binding is untouched
+    assert "column sales = 'Orders'[Sales (source)]" in orders   # calc keeps its name, refs the rename
+    cols = {r["column"]: r for r in out["report"]["calc_columns"]}
+    assert cols["sales"]["status"] == "translated"
+    assert cols["sales"]["dax"] == "'Orders'[Sales (source)]"
+    verdict = check_model_openability(out["parts"])
+    assert verdict["checks"]["no_duplicate_columns"] is True
+    assert verdict["ok"] is True
+
+
+def test_non_colliding_calc_leaves_physical_column_unrenamed_end_to_end():
+    # a calc whose name does NOT case-collide with a physical column leaves every physical column's
+    # model name byte-identical -- the "(source)" suffix appears nowhere (common-path no-op).
+    out = _model_with_calc_cols_and_measures(
+        dim_calcs=[{"name": "Sales Label", "formula": "[Sales]"}], calcs=[])
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "(source)" not in orders
+    assert "column Sales\n" in orders                    # physical column kept its original model name
+    cols = {r["column"]: r for r in out["report"]["calc_columns"]}
+    assert cols["Sales Label"]["dax"] == "'Orders'[Sales]"
+
+
+# --- the rename follows onto the relationship endpoint (an atomic rename) -------------------------
+# When the case-colliding physical column is ALSO a join key, Part A's rename of its model name to
+# "<name> (source)" must be followed onto the relationship endpoint. Power BI resolves an endpoint by
+# column name CASE-INSENSITIVELY, so a stale ``SALE.REGION`` endpoint would silently re-bind the join
+# to the case-colliding calc that triggered the rename (harmless for a value-identical alias, wrong
+# for a calc that reshapes the key). Rewriting the endpoint the same way makes the rename atomic --
+# exactly how Power BI Desktop rewrites every reference when a column is renamed.
+
+def test_rename_relationship_endpoints_follows_plan():
+    # unit: only the endpoint whose (table, column) is a plan key is rewritten; the input is never
+    # mutated (new dicts), and an empty plan returns an equal copy (the common no-collision path).
+    rels = [
+        {"from_table": "SALE", "from_col": "REGION", "to_table": "REP", "to_col": "REGION"},
+        {"from_table": "SALE", "from_col": "Order_Key", "to_table": "RMA", "to_col": "Order_Key"},
+    ]
+    plan = {("SALE", "REGION"): "REGION (source)"}
+    out = _rename_relationship_endpoints(rels, plan)
+    assert out[0]["from_col"] == "REGION (source)" and out[0]["to_col"] == "REGION"  # SALE side only
+    assert out[1]["from_col"] == "Order_Key" and out[1]["to_col"] == "Order_Key"     # unrelated join
+    assert rels[0]["from_col"] == "REGION"                    # input not mutated
+    assert _rename_relationship_endpoints(rels, {}) == rels   # empty plan -> equal copy
+
+
+def test_calc_case_aliases_join_key_rewrites_relationship_endpoint_estate():
+    # END-TO-END estate path (relationships auto-wired from the .tds): a dim calc ``region`` = [REGION]
+    # case-aliases the physical join key ``REGION`` on SALE. The physical column is renamed to
+    # ``REGION (source)`` AND the SALE-side relationship endpoint follows, so the join still points at
+    # the real key. The non-colliding REP side is untouched; the openability backstop is satisfied.
+    out = migrate_tds_to_semantic_model(
+        FEDERATED_STAR, model_name="Star",
+        dim_calcs=[{"name": "region", "formula": "[REGION]"}])
+    sale = out["parts"]["definition/tables/SALE.tmdl"]
+    assert "column 'REGION (source)'" in sale                    # physical join key renamed (Part A)
+    rels = out["parts"]["definition/relationships.tmdl"]
+    assert "fromColumn: SALE.'REGION (source)'" in rels          # endpoint follows the rename
+    assert "fromColumn: SALE.REGION\n" not in rels               # the stale endpoint is gone
+    assert "toColumn: REP.REGION" in rels                        # the non-colliding side is untouched
+    verdict = check_model_openability(out["parts"])
+    assert verdict["checks"]["relationship_columns_exist"] is True
+    assert verdict["ok"] is True
+
+
+def test_calc_case_aliases_join_key_rewrites_relationship_endpoint_explicit():
+    # Same hardening via the EXPLICIT relationships path: when the caller passes ``relationships=``,
+    # all_rels reads that local list, so the rename must be followed onto it at the call site too.
+    # The caller's own list is not mutated in place (the rewrite returns a new list).
+    rels_in = [{"from_table": "SALE", "from_col": "REGION", "to_table": "REP", "to_col": "REGION"}]
+    out = migrate_tds_to_semantic_model(
+        FEDERATED_STAR, model_name="Star",
+        dim_calcs=[{"name": "region", "formula": "[REGION]"}], relationships=rels_in)
+    rels = out["parts"]["definition/relationships.tmdl"]
+    assert "fromColumn: SALE.'REGION (source)'" in rels
+    assert "fromColumn: SALE.REGION\n" not in rels
+    assert "toColumn: REP.REGION" in rels
+    assert rels_in[0]["from_col"] == "REGION"                    # caller's list untouched (pure)
 
 
 # --- v1.37.0: Tableau's stock "Number of Records" -> a Sum-aggregated column of 1s ----------------

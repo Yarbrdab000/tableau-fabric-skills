@@ -81,6 +81,27 @@ def test_duplicate_column_is_flagged():
     assert dup and dup[0]["table"] == "Orders" and "Region" in dup[0]["detail"]
 
 
+def test_case_only_duplicate_column_is_flagged():
+    """Power BI's engine is case-INSENSITIVE, so a calc that case-aliases a physical column
+    (``director`` vs ``Director``) collides even though a case-sensitive set sees two distinct
+    names -- the exact "reported success but unopenable .pbip" incident this gate exists to catch.
+    """
+    parts = _clean_parts()
+    parts["definition/tables/Orders.tmdl"] = _orders_part(
+        [("Order ID", "Order ID"), ("director", "director"), ("Director", "Director")],
+        ["Order ID", "director"],
+    )
+    verdict = check_model_openability(parts)
+    assert verdict["ok"] is False
+    assert verdict["checks"]["no_duplicate_columns"] is False
+    dup = [i for i in verdict["issues"] if i["check"] == "no_duplicate_columns"]
+    assert dup and dup[0]["table"] == "Orders"
+    # the collision is reported against the second (case-variant) occurrence, and the message
+    # states the collision is case-insensitive so the reader knows why a case-sensitive eye missed it
+    assert "Director" in dup[0]["detail"]
+    assert "case-insensitiv" in dup[0]["detail"]
+
+
 # -- typed but undeclared ------------------------------------------------------------------
 
 def test_typed_column_without_declaration_is_flagged():
@@ -213,3 +234,81 @@ def test_rename_columns_names_are_not_treated_as_typed():
 def test_empty_parts_are_open():
     assert check_model_openability({})["ok"] is True
     assert check_model_openability(None)["ok"] is True
+
+
+# -- relationship_columns_exist: dangling endpoint backstop --------------------------------
+# Defense-in-depth for the case-collision rename. The root-cause fix (assemble_model) rewrites a
+# renamed physical join key's relationship endpoint so it never dangles; this backstop catches a
+# GENUINELY dangling endpoint (a relationship referencing a column no table declares) loud, so a
+# regression that skipped the rewrite cannot ship a silently broken join. Fail-safe: it only runs
+# when a relationships part exists, skips an endpoint whose table is not among the parsed parts, and
+# never raises.
+
+def _min_table(name, cols):
+    """Minimal table part: ``table <name>`` + a bare ``column`` per name (quoted when spaced)."""
+    def q(n):
+        return "'%s'" % n if (" " in n or "(" in n) else n
+    lines = ["table %s" % q(name), "\tlineageTag: t-%s" % name.lower().replace(" ", "-")]
+    for i, c in enumerate(cols):
+        lines += ["\tcolumn %s" % q(c), "\t\tdataType: string",
+                  "\t\tlineageTag: c%d" % i, "\t\tsummarizeBy: none"]
+    return "\n".join(lines) + "\n"
+
+
+def _rels_part(rows):
+    """Relationships part from ``(from_table, from_col, to_table, to_col)`` rows."""
+    def q(n):
+        return "'%s'" % n if (" " in n or "(" in n) else n
+    lines = []
+    for i, (ft, fc, tt, tc) in enumerate(rows):
+        lines += ["relationship r%d" % i,
+                  "\tfromColumn: %s.%s" % (q(ft), q(fc)),
+                  "\ttoColumn: %s.%s" % (q(tt), q(tc))]
+    return "\n".join(lines) + "\n"
+
+
+def _rel_model(orders_cols, region_cols, rows):
+    return {
+        "definition/tables/Orders.tmdl": _min_table("Orders", orders_cols),
+        "definition/tables/RegionDim.tmdl": _min_table("RegionDim", region_cols),
+        "definition/relationships.tmdl": _rels_part(rows),
+        "definition/model.tmdl": "model Model\n\tculture: en-US\n",
+    }
+
+
+def test_relationship_columns_exist_clean():
+    # every endpoint names a declared column (case-insensitively) -> the check passes and is present.
+    verdict = check_model_openability(
+        _rel_model(["Order ID", "Region"], ["Region", "Name"],
+                   [("Orders", "Region", "RegionDim", "Region")]))
+    assert verdict["checks"]["relationship_columns_exist"] is True
+    assert verdict["ok"] is True
+
+
+def test_relationship_dangling_endpoint_is_flagged():
+    # Simulates the residual the endpoint rewrite prevents: the physical join key was renamed to
+    # ``Region (source)`` but the relationship still names the OLD ``Region`` -> the endpoint dangles
+    # onto a column no table declares, and the backstop fails LOUD instead of shipping a broken join.
+    verdict = check_model_openability(
+        _rel_model(["Order ID", "Region (source)"], ["Region", "Name"],
+                   [("Orders", "Region", "RegionDim", "Region")]))
+    assert verdict["ok"] is False
+    assert verdict["checks"]["relationship_columns_exist"] is False
+    bad = [i for i in verdict["issues"] if i["check"] == "relationship_columns_exist"]
+    assert bad and bad[0]["table"] == "Orders" and "Region" in bad[0]["detail"]
+
+
+def test_relationship_endpoint_matches_case_insensitively():
+    # the endpoint check mirrors Power BI's case-insensitivity: ``Orders.region`` resolves to the
+    # declared ``Region`` -> no false alarm on a legitimate case variation.
+    verdict = check_model_openability(
+        _rel_model(["Order ID", "Region"], ["Region", "Name"],
+                   [("Orders", "region", "RegionDim", "REGION")]))
+    assert verdict["checks"]["relationship_columns_exist"] is True
+    assert verdict["ok"] is True
+
+
+def test_relationship_check_absent_without_relationships_part():
+    # gated key: a model with no relationships part does not carry the check at all (additive).
+    verdict = check_model_openability(_clean_parts())
+    assert "relationship_columns_exist" not in verdict["checks"]

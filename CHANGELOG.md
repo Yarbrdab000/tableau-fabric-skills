@@ -13,6 +13,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.50.0` → `1.51.0`): Fix a case-insensitive column-name collision that made the
+  generated `.pbip` refuse to open, and make the rename atomic so a colliding join key is never left dangling.**
+  When a calculated field's name case-collides with a physical column on the same table (e.g. a calc `Order ID`
+  alongside a physical `order ID`), the model previously declared both on one table; Power BI treats column names
+  case-insensitively, so Desktop failed to load the project (`Item 'Order ID' already exists in the collection`)
+  even though the build's openability self-check — which deduped case-*sensitively* — reported success.
+  `assemble_model.py` now renames the physical/source-backed column's **model name** to `<name> (source)` while
+  keeping its `sourceColumn:` and the M `Table.TransformColumnTypes(...)` header **unchanged** (so the file/DB
+  data still loads); the calc keeps the report-facing name, and because the field resolver maps the physical
+  caption to the renamed model column, every generated DAX reference and PBIR report binding follows
+  automatically. The rename now **also** rewrites the relationship join-key endpoints in `relationships.tmdl`
+  (`_rename_relationship_endpoints`), wired into both the estate and explicit-argument code paths, so a
+  case-colliding column that is also a relationship key is renamed everywhere at once (atomic, the way Power BI
+  Desktop rewrites references) rather than leaving the join pointing at the stale name. As fail-loud backstops,
+  `openability_gate.py` now detects duplicate columns **case-insensitively** (`casefold`, matching the PBI
+  engine) and adds a gated `relationship_columns_exist` check that flags any relationship endpoint whose column
+  no table declares. Additive and fail-closed: no rename is planned in the common no-collision case (output is
+  byte-identical), the collision handling is scoped strictly per table (identical column names across unrelated
+  tables are legal and untouched), and the new gate check runs only when a relationships part exists and never
+  raises.
 - **tableau-migration (skill `1.49.0` → `1.50.0`): Harvest unambiguous `<cols><map>` pins that carry no
   `<column>` declaration, so a workbook whose only pointer to a physical column is a unique map pin (with no
   caption declaration for the emit loop to bind) still resolves — killing the Assessments `[Contact ID]`
