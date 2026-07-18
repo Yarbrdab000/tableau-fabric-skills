@@ -13,6 +13,27 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.63.0` → `1.64.0`): Emit measure `formatString` decoded from the Tableau
+  calc's `default-format`, so an author's declared percent/currency/precision survives migration instead of
+  being dropped. Fixes the pervasive format loss seen in a real Superstore run (e.g. Profit Ratio rendering
+  `0.13` instead of `12.6%`, and currency measures losing their `$`). Additive and conservative — a calc
+  with no decodable format is byte-identical to before.**
+  - **Conservative measure decoder.** New `tmdl_generate.tableau_measure_format_to_pbi` decodes ONLY the
+    explicit lowercase author prefixes (`c`/`n`/`p`/`*`, e.g. `p0.0%` → `0.0%`, `c"$"#,##0` → currency) and
+    deliberately **declines the ambiguous built-in `C<lcid>%` form** — in the wild that code decorates both
+    currency and percent calcs, so decoding it would risk mis-rendering a dollar figure as a percentage.
+    Undecodable/empty codes yield `None` (no format), preserving the type-derived floor.
+  - **Additive serializer param.** `generate_measure_tmdl(format_string=...)` emits a `formatString:` line
+    between the measure expression and its `lineageTag`; omitting it (or `None`) is byte-identical to the
+    prior output.
+  - **Both calc extractors stamp the format.** `migrate_estate.extract_calculations` (`.twb`) and
+    `connection_to_m.extract_calcs` (`.tds`) now attach `format_string` to a measure calc when its
+    `default-format` decodes; `assemble_model._measures_part` threads it into every `generate_measure_tmdl`
+    call site.
+  - **Coverage.** New `tests/test_measure_format_wiring.py` (10 tests): decoder accepts explicit codes /
+    declines `C1033%` / `None` on garbage; the serializer param emits + stays byte-identical without it;
+    both extractors stamp the right calc and skip the ambiguous/absent ones; end-to-end through
+    `_measures_part`. The physical-column path (`test_default_format_wiring.py`) is untouched.
 - **tableau-migration (skill `1.62.0` → `1.63.0`): Bulletproofed both LLM-assisted tier runbooks so the
   agent never stalls with a "what do I do?" question — fixes the calc second-compiler regression seen in a
   real 1.61 run and gives the Tier-3 dashboard audit the same gated invocation procedure. Docs/runtime-guidance
