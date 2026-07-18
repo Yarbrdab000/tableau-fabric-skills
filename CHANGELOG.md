@@ -13,6 +13,32 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.62.0` → `1.63.0`): Bulletproofed both LLM-assisted tier runbooks so the
+  agent never stalls with a "what do I do?" question — fixes the calc second-compiler regression seen in a
+  real 1.61 run and gives the Tier-3 dashboard audit the same gated invocation procedure. Docs/runtime-guidance
+  only; the deterministic default path is byte-identical.**
+  - **Calc "second compiler" identity fix.** `resources/second-compiler.md` now opens with an unmissable
+    "you ARE the second compiler — there is no script" block plus a disambiguation table clarifying what
+    `second_compiler.py` / `--second-compile` / `--author` / `check_candidate_dax` / `--approved-dax` each
+    actually do (and do NOT do). Purged the misleading "re-run Tier 0" / "re-translate" framing that made
+    the agent hunt for a nonexistent auto-fix script.
+  - **Exact estate-CLI loop.** Added the verbatim author → gate → `approved_dax.json` → re-run sequence with
+    the exact `--approved-dax` JSON object shape (`{"Calc Name": "DAX"}` or
+    `{"Calc Name": {"dax": "…", "table": "Target"}}`), resolved-model column identifiers, and the
+    same-output re-run command. Fixed the reconciliation "no data" trap (a landed `.twbx` extract is not a
+    Fabric deployment).
+  - **Router runtime guidance.** `scripts/translation_router.py` `TYPE_OR_SHAPE_MISMATCH` and
+    `UNRESOLVED_REFERENCE` guidance now frame the action as "YOU author the corrected DAX," matching the
+    stub-handoff architecture (Tier 0 stubs what it can't prove 1:1; the agent adjudicates).
+  - **Tier-3 gated dashboard-audit runbook.** New `resources/dashboard-audit.md` mirrors the calc tier:
+    gated offer → GO → adjudicate every visual → monotonic-gate validation (assisted kept only when it
+    regresses nothing) → report. Honest about the current landing boundary (`land_dashboard_audit` gates
+    in-process; a dedicated on-disk `--approved-viz` seam is a later increment). `SKILL.md` Post-Migration
+    steps reinforce the calc tier and add the gated Tier-3 offer keyed off `viz_fidelity == "warned"` /
+    worklist `visuals_flagged > 0`.
+  - **Regression guard.** New `tests/test_runbook_regression_guard.py` pins the fix: runtime guidance and
+    runbooks stay clean of the banned "re-run Tier 0" / "re-translate" phrasing, both identity anchors and
+    the exact approved-JSON shapes are present, and `SKILL.md` offers both gated tiers.
 - **tableau-migration (skill `1.61.0` → `1.62.0`): Self-update runbook now updates the ACTUAL loaded
   install (plugin-aware) instead of a hardcoded manual path — fixes the defect where a plugin/marketplace
   user running the update procedure would silently create a shadow copy under `~/.copilot/skills/` that

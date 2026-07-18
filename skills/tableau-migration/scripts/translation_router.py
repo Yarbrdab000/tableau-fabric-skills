@@ -54,7 +54,7 @@ DAX_LANGUAGE_GAP = "dax_language_gap"
 # A typing / parse / shape mismatch the deterministic engine refused on (inconsistent IF/CASE
 # branch types, incomparable operands, the 4-arg IIF unknown branch, an aggregate inside a
 # row-level column calc, ...). Frequently resolvable: the agent supplies an explicit cast or
-# restructures (e.g. re-routes an aggregating "column" calc to a measure) and re-translates.
+# restructures (e.g. re-routes an aggregating "column" calc to a measure) and authors the DAX.
 TYPE_OR_SHAPE_MISMATCH = "type_or_shape_mismatch"
 
 # A referenced field / dimension / calc that could not be bound (unresolved or ambiguous name,
@@ -119,19 +119,23 @@ _GUIDANCE = {
         "The deterministic engine refused on a typing/parse/shape mismatch (inconsistent IF/CASE "
         "branch types, incomparable operands, the 4-arg IIF unknown branch, an aggregate used "
         "inside a row-level column calc, or a bare row-level field used where a measure -- which "
-        "needs an aggregation -- is required). This is often resolvable: supply an explicit cast, "
-        "align the branch types, re-route an aggregating calc to a measure instead of a calculated "
-        "column, or -- for a row-level expression with no aggregation (e.g. "
-        "IF [Region]=\"east\" THEN [Sales] END) -- either wrap it in the intended aggregation (SUM/"
-        "MIN/...) to make a measure, exactly as the SUM(...) West-Sales form already translates, or "
-        "emit it as a calculated column (the row-level translator handles it directly). Then "
-        "re-translate and validate."
+        "needs an aggregation -- is required). This is usually resolvable, and YOU author the "
+        "corrected DAX: supply an explicit cast, align the branch types, re-route an aggregating "
+        "calc to a measure instead of a calculated column, or -- for a row-level expression with no "
+        "aggregation (e.g. IF [Region]=\"east\" THEN [Sales] END) -- either wrap it in the intended "
+        "aggregation (SUM/MIN/...) to write the measure, exactly as the SUM(...) West-Sales form "
+        "shows, or write it as a calculated column. Then run check_candidate_dax and (when data is "
+        "landed) the reconciliation oracle before proposing -- there is no deterministic re-run; the "
+        "repaired expression is yours."
     ),
     UNRESOLVED_REFERENCE: (
         "A referenced field, dimension, or calc could not be bound (unresolved/ambiguous name, terms "
-        "spanning multiple tables, or an unsupported field type). Supply the correct table binding or "
-        "relationship, or translate the referenced calc first, then re-run Tier 0 -- this may need no "
-        "second-compiler DAX at all once the reference resolves."
+        "spanning multiple tables, or an unsupported field type). Resolve the binding yourself: choose "
+        "the correct 'Table'[Column] qualifier or the relationship path, and if it points at another "
+        "stubbed calc, author that calc's DAX first. Then write the faithful expression using the "
+        "resolved model identifiers and validate it (check_candidate_dax, plus the reconciliation "
+        "oracle when data is landed). Resolving the reference does not re-invoke Tier 0 -- once it "
+        "binds, YOU author the DAX."
     ),
     UNSUPPORTED_OTHER: (
         "Not matched to a specific category. A faithful DAX form may still exist (for example "

@@ -25,6 +25,34 @@ Tier 1 (the Axis-A/Axis-B boundary behind every category), see the
 
 ---
 
+## Read this first — you ARE the second compiler
+
+**The second compiler is you, the agent. It is the act of authoring DAX, not a script you run.**
+Tier 0 has already finished: it translated the provably-safe subset and left every calc it could not
+translate as an **inert stub** (the original formula preserved in `TableauFormula`). Those stubs are
+listed for you in the handoff — the in-process report's `translation_handoff["requests"]`, or, from
+the estate CLI, in `report.json` (per-datasource `translation_handoff`, per-workbook
+`model_translation_handoff`) whenever `report["summary"]["needs_review_total"] > 0`. **Nothing else
+is going to translate them.** You read each stub, supply the missing intent, write the faithful DAX,
+validate it, and land it. That authoring *is* the second compiler.
+
+**There is no script that authors the tail for you. Do not go looking for one.** The scripts whose
+names *sound* like "the compiler" are narrow helpers — none of them writes DAX for an arbitrary
+stubbed calc:
+
+| Script / flag | What it actually does | What it is **not** |
+|---|---|---|
+| `second_compiler.py` · `migrate_estate.py --second-compile` | Optional **keystone accelerator**: auto-lands only the calcs the engine's *own* idiom detectors already recognize, then cascades their dependents. | Not the authoring tier. It invents no DAX; an unrecognized keystone is left as a stub for **you**. |
+| `migrate_estate.py --author <json>` | Seeds that cascade from keystone DAX **you already wrote**. | Not automatic authoring — you write the JSON. |
+| `translation_router.check_candidate_dax(dax, request=req)` | The **syntactic gate** for DAX **you** authored. | Not a translator. |
+| `migrate_estate.py --approved-dax <json>` | The **landing seam**: flips each name-matching stub into a live, audit-stamped object using DAX **you authored and validated**. | Not authoring — it lands only what you hand it. |
+
+So the loop is: **you** author → the gate + oracle **validate** → the seam **lands**. If you ever
+find yourself hunting for a command that "runs the second compiler," stop — that command is you
+writing DAX into `approved_dax.json`.
+
+---
+
 ## Where the two compilers meet
 
 ```text
@@ -160,13 +188,15 @@ guidance string ships in the request as `category_guidance`.
 | `missing_addressing_intent` | A **table calc** whose partition/order/scope (Tableau "Compute Using") is not in the `.tds`. | The **addressing** — partition + order — ideally recovered from worksheet context (`.twb`). | cumulative → running total / time-intelligence; prior/offset → `OFFSET`; rank → `RANKX` over the partition; size/row-number → `COUNTROWS`/`RANKX` over `ALLSELECTED`. |
 | `missing_outer_aggregation` | An **LOD** whose result depends on the visual's dimensionality (INCLUDE/EXCLUDE, bare LOD, non-superset nested LOD). | The intended **grain** and outer aggregation. | INCLUDE → `CALCULATE` over an added group; EXCLUDE → `CALCULATE(…, REMOVEFILTERS(dims))`; bare LOD → an explicit outer aggregate. |
 | `dax_language_gap` | **No faithful native DAX form exists** (regex, arbitrary `DATEPARSE`, general `SPLIT`, `FINDNTH`, case-sensitive ordered text, exotic date part). | Whether the *real* usage is narrow enough to approximate safely. | An **approximation** only (e.g. `PATH`/`SUBSTITUTE` for a fixed delimiter, a known date format) — **flagged approximate** and oracle-verified, else keep the stub. |
-| `type_or_shape_mismatch` | A typing/parse/shape refusal (inconsistent IF/CASE branches, incomparable operands, 4-arg `IIF`, an aggregate inside a row-level column calc). | An explicit cast, aligned branch types, or a measure-vs-column re-route. | The repaired expression, then **re-run Tier 0** — often it then translates deterministically. |
-| `unresolved_reference` | A field/dimension/calc could not be bound (unresolved/ambiguous name, cross-table terms, unsupported type). | The correct table binding / relationship, or the referenced calc translated first. | Usually **no new DAX** — fix the binding and re-run Tier 0. |
+| `type_or_shape_mismatch` | A typing/parse/shape refusal (inconsistent IF/CASE branches, incomparable operands, 4-arg `IIF`, an aggregate inside a row-level column calc). | An explicit cast, aligned branch types, or a measure-vs-column re-route. | The repaired expression — **you author it** (cast / align / re-route), then gate + oracle. |
+| `unresolved_reference` | A field/dimension/calc could not be bound (unresolved/ambiguous name, cross-table terms, unsupported type). | The correct table binding / relationship, or the referenced calc authored first. | Fix the binding, then **you author** the faithful expression with the resolved `'Table'[Column]` identifiers. |
 | `unsupported_other` | Unmatched. A faithful form may still exist (e.g. `CORR`/`COVAR`/`COVARP` via a `VAR`/`RETURN` closed form). | Author and validate a candidate at the right grain. | The leanest faithful form; validate before proposing. |
 
-> **`unresolved_reference` and `type_or_shape_mismatch` are the cheapest wins** — they frequently
-> need *no* second-compiler DAX at all: fix the reference or add a cast and the deterministic tier
-> translates the calc on the next pass. Always try Tier 0 again before authoring bespoke DAX.
+> **`unresolved_reference` and `type_or_shape_mismatch` are the cheapest wins** — the repair is
+> usually small (bind the reference, add a cast, or re-route a column calc to a measure) rather than
+> a novel idiom. But *you* still author the corrected DAX: **there is no deterministic re-run to fall
+> back on.** Make the small repair, write the faithful expression, then gate and oracle it like any
+> other candidate.
 
 ---
 
@@ -208,6 +238,15 @@ A candidate is **not** acceptable just because it parses.
   `EVALUATE ROW(…)` probe, and applies the tolerance policy, taking the Fabric and Tableau backends
   as **injected** `fabric_oracle` / `tableau_value` hooks (nothing runs silently). It returns a
   `verified` / `mismatch` / `not-evaluated` record per candidate.
+  - **"Data is landed" does NOT mean "deployed to Fabric."** It means the model has real rows to
+    query. A `.twbx` / `.tdsx` **embeds its extract**, so a local migration of one has data you can
+    reconcile against **without any Fabric deploy** — land the extract into the model and run the
+    oracle. Do not reason "this run is local-only, therefore there is no data, therefore skip
+    reconciliation": that is the exact trap that ships unverified DAX. Reconciliation is only
+    genuinely unavailable when the source truly carries no rows anywhere (a bare `.tds` / `.twb`
+    with neither an embedded extract nor a reachable live connection). In that one case, land the
+    gate-passing candidate but **stamp it gate-passed / not-yet-reconciled** (medium confidence) and
+    say so plainly — never call it verified.
 - **When you author more than one candidate**, rank them by the oracle rather than by eye:
   `translation_reconcile.rank_candidates(name, [dax1, dax2, …], fabric_oracle=…, tableau_value=…)`
   reconciles each (gate → numeric oracle) and returns them **best-first**, each with a `confidence`
@@ -257,6 +296,52 @@ final = migrate_tds_to_semantic_model(tds_text, model_name="Superstore",
   deterministic path."* Verified vs. unverified state lives in the `TranslatedBy` metadata — names
   never change on verification (renaming would re-break references). Landing is **idempotent** (never
   `!!`).
+
+### The estate-CLI loop, exactly (this is the path that regressed — follow it verbatim)
+
+When the migration was run through `migrate_estate.py` (the one-button estate flow), you do **not**
+call Python. You author a JSON file and re-run the same command with `--approved-dax`. Step by step:
+
+1. **Find the stubs.** Open `<output>/report.json` and read `summary.needs_review_total`. If it is
+   `> 0`, collect the stubbed calcs from each datasource's `translation_handoff.requests` (and each
+   workbook's `model_translation_handoff`). Each request carries `name`, `category`,
+   `category_guidance`, the original `tableau_formula`, and the resolved field bindings.
+2. **Author the DAX** for each one you can, per its category playbook above. Write column refs as
+   **resolved MODEL identifiers** — `'Table'[Column_Sanitized]`, the sanitized names in the built
+   model — never Tableau captions like `[Sales]`.
+3. **Gate every candidate:** `check_candidate_dax(dax, request=req)` must return `ok: True`. When
+   data is landed, also reconcile against the oracle. Fix or drop anything that fails — a stub is an
+   acceptable outcome; unvalidated live DAX is not.
+4. **Write `approved_dax.json`** — a single JSON **object** mapping the calc's name to the DAX you
+   authored (name match is case-insensitive). Two accepted value shapes, freely mixed:
+
+   ```json
+   {
+     "Running Sales": "CALCULATE(SUM('Orders'[Sales]), FILTER(ALLSELECTED('Orders'[Order Date]), 'Orders'[Order Date] <= MAX('Orders'[Order Date])))",
+     "Region Margin": { "dax": "DIVIDE(SUM('Orders'[Profit]), SUM('Orders'[Sales]))", "table": "Orders" }
+   }
+   ```
+
+   The flat `"name": "DAX"` form lands a measure; the `{"dax": ..., "table": ...}` form also names a
+   calc **column's** home table (ignored for measures, which live in the shared `_Measures` table).
+   The loader is UTF-8-BOM tolerant and **fail-fast**: any other shape (a list, a bare string, a
+   non-string `dax`) aborts the run rather than silently dropping an approval. So the file must be an
+   object at the top level, nothing else.
+5. **Re-run the same migrate command with `--approved-dax`:**
+
+   ```text
+   py -3.11 "$SKILL\scripts\migrate_estate.py" -i <input> -o <output> --approved-dax approved_dax.json
+   ```
+
+   Point `-o` at the **same** output bundle — the `--approved-dax` re-run is an intentional
+   land-into-the-same-bundle pass and is exempt from the stale-output guard (no `--force` needed).
+   Each name-matching stub is replaced by a live, audit-stamped object; every other stub stays inert
+   with its `TableauFormula` preserved. Re-reading `report.json` afterward confirms
+   `needs_review_total` dropped by exactly the count you landed.
+
+The in-process `migrate_tds_to_semantic_model(..., approved_calc_dax={...})` above and the estate
+`--approved-dax <json>` file are the **same seam** — a `{calc name -> DAX}` mapping — one as a Python
+dict, one as a JSON file. Pick the one matching how the migration was run.
 
 ---
 
