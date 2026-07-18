@@ -3031,6 +3031,47 @@ def test_cli_dry_run_prints_manifest_to_stdout(monkeypatch, capsys):
     assert pbir["datasetReference"]["byPath"]["path"] == "../Superstore.SemanticModel"
 
 
+def test_cli_audit_flag_writes_dashboard_audit_sidecar(tmp_path):
+    # The opt-in --audit flag writes a Tier-3 dashboard audit request alongside the PBIR, without
+    # changing the emitted parts (additive). Mirrors the --worklist sidecar contract.
+    from twb_to_pbir import main
+
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST)
+    twb = tmp_path / "wb.twb"
+    twb.write_text(_workbook(ws), encoding="utf-8")
+    out_dir = tmp_path / "out"
+    audit_path = tmp_path / "audit.json"
+
+    rc = main([str(twb), "-o", str(out_dir), "--report", "R", "--audit", str(audit_path)])
+    assert rc == 0
+    assert audit_path.exists()
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert audit["kind"] == "tableau-fabric-dashboard-audit-request"
+    assert audit["summary"]["visuals"] >= 1
+    # every audited visual is a real rebuilt visual with a priority and a status
+    assert all("priority" in v and "status" in v for v in audit["visuals"])
+
+
+def test_cli_without_audit_flag_writes_no_sidecar(tmp_path):
+    # Additivity: no --audit flag -> the audit is never built and nothing extra is written.
+    from twb_to_pbir import main
+
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST)
+    twb = tmp_path / "wb.twb"
+    twb.write_text(_workbook(ws), encoding="utf-8")
+    out_dir = tmp_path / "out"
+
+    rc = main([str(twb), "-o", str(out_dir), "--report", "R"])
+    assert rc == 0
+    assert not (tmp_path / "audit.json").exists()
+
+
 # -- field-parameter (swap) self-service report --------------------------------
 def _fp_specs():
     """Two swap specs (one dimension, one measure) -> a 2-slot self-service table."""

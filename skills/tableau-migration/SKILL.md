@@ -475,10 +475,33 @@ The pure-Python cores are offline, deterministic, and stdlib-only (no Spark / pa
 | [`scripts/assemble_model.py`](scripts/assemble_model.py) | Tier-1 orchestrator: `.tds`/`.twb` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`), base64 deploy payload. **One-call `migrate_datasource(.tdsx/.tds/.twbx/.twb/text, datasource=None)` → `{parts, report, bind}`** (auto-extracts calcs; `datasource=` selects from a multi-datasource workbook; a genuine fallback returns `parts={}` + `report["landing_plan"]` via `directlake_landing_plan`); `list_workbook_datasources`, `write_model_folder` / **`write_local_pbip`** for local output. |
 | [`scripts/migrate_estate.py`](scripts/migrate_estate.py) | **Estate + workbook orchestrator.** `migrate_estate(source, out)` migrates a whole folder / site (every datasource + workbook) in one run. **`--scan`** is a read-only pre-build gate: it writes `<out>/scan.json` naming each workbook's published datasource and whether it's in scope, and **exits non-zero** while any is missing (run it before building so a published-backed workbook is never rebuilt to an empty report — see STEP 1.5). **`migrate_workbook(source, write_to=…, name=None)`** is the single-workbook primitive the estate loops: it rebuilds the workbook's embedded datasource(s) into one semantic model **and** the workbook's report bound to it — an openable `pbip/<Name>/` (plus a bare `reports/<Name>.Report`); a multi-datasource workbook consolidates every embedded datasource into one model (disconnected table islands, each bound to its own connection) with a single report bound to it. Reach for it (over `migrate_datasource`) whenever the input is a **workbook** and you want the **report**, not just a datasource model. |
 | [`scripts/deploy_to_fabric.py`](scripts/deploy_to_fabric.py) | Self-contained Fabric REST deploy (stdlib-only urllib): createOrUpdate / updateDefinition of the SemanticModel, 202 LRO polling, optional refresh + gateway bind. **Also deploys the workbook's REPORT** as a Fabric `reports` item — `deploy_pbip` / `deploy_report` + the fail-closed `rebind_report_byConnection` (rewrites `definition.pbir` to a **`byConnection`** `semanticmodelid=<id>` reference, required for REST deploy) via `--pbip` / `--report-dir`. Importable `acquire_token` (handles `az` on Windows) + `refresh_dataset` / **`recalc_dataset`** (a default, credential-free `type: Calculate` ProcessRecalc that processes the Import calc tables so a composite model opens without benign warning triangles; `--no-recalc` to skip) for post-deploy ops. Lets the skill finish **in Fabric** without depending on a peer skill. |
+| [`scripts/remediation_worklist.py`](scripts/remediation_worklist.py) | **Assisted tier (opt-in), producer.** Folds the engine's `warnings` + `candidate_records` into ONE structured, machine-readable, per-visual **remediation worklist** that covers the ENTIRE dashboard (every rebuilt visual, `ok` or `needs_attention`), is a **superset of the warnings**, and tags each item with a deterministic category + severity + remediation hint. Emitted additively as the `worklist` key on `migrate_twb_to_pbir(...)` and via the `--worklist PATH` CLI sidecar. Read-only — never touches the emitted PBIR. |
+| [`scripts/monotonic_gate.py`](scripts/monotonic_gate.py) | **Assisted tier (opt-in), safety net.** A deterministic selector that scores a deterministic-baseline visual and an assisted-candidate visual on the SAME axes — **structural** (reuses `fidelity_oracle`: type/fields/roles/position) + **feature** (continuous colour-fill richness, per-point colour, data labels, legend, title, read off the emitted objects) — and keeps the assisted visual ONLY when it regresses no scored component; otherwise reverts to the deterministic object by identity. Makes opting into the assisted tier **provably ≥ the deterministic tier, per visual**. Pure `decide()` core + batch `gate_changes()` + `verify_monotonic()`. |
+| [`scripts/audit_tier.py`](scripts/audit_tier.py) | **Assisted tier (opt-in), Tier-3 orchestrator.** `build_dashboard_audit(...)` folds the worklist (coverage + priority + items) and the viz-advisor chart alternatives into ONE priority-ordered, **full-dashboard** audit request (every visual, highest-attention first; dashboard-scope items never dropped); `audit_prompt(...)` renders the out-of-band runbook. `land_dashboard_audit(...)` runs every proposed replacement through `monotonic_gate` and reports how many flagged visuals actually improved. Built on demand via the `--audit PATH` CLI sidecar; **not** on the default migrate path (byte-identical). |
 
 For exact signatures and a copy-paste **download → migrate → deploy** snippet, see [public-api.md](resources/public-api.md).
 
-Run the test suite with `pytest` from `skills/tableau-migration/` (900+ offline assertions).
+Run the test suite with `pytest` from `skills/tableau-migration/` (2,600+ offline assertions).
+
+### Optional: assisted chart-fidelity tier (opt-in, additive)
+
+The default migrate path is unchanged and byte-identical. When a user wants higher chart fidelity than
+the deterministic rebuild, three opt-in modules layer on top **without ever regressing** it:
+
+1. **Worklist** — every run already exposes a per-visual `worklist` (also `--worklist PATH`): a
+   full-dashboard, prioritised superset of the warnings naming exactly what each visual is missing.
+2. **Audit** — `--audit PATH` (or `audit_tier.build_dashboard_audit`) turns that worklist + chart-type
+   advice into ONE priority-ordered audit request covering **every** visual, plus a runbook prompt for
+   the out-of-band LLM/vision pass to propose faithful improvements.
+3. **Gate** — `audit_tier.land_dashboard_audit` runs each proposed visual through `monotonic_gate`, which
+   keeps an assisted visual **only when it regresses nothing** vs the deterministic rebuild (else reverts
+   to the deterministic object). So opting into the assisted tier is **provably ≥ deterministic, per
+   visual** — "better no matter what". None of this touches the default emit.
+
+```powershell
+# deterministic rebuild + both opt-in sidecars (PBIR parts are identical with or without the flags)
+py -3.11 scripts\twb_to_pbir.py "workbook.twb" -o out --report R --worklist out\worklist.json --audit out\audit.json
+```
 
 ---
 

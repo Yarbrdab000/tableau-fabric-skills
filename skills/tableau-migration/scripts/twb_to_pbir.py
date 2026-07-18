@@ -82,6 +82,17 @@ except ImportError:  # pragma: no cover - flat scripts-on-path
     except ImportError:
         _build_worklist = None
 
+# Opt-in Tier-3 dashboard audit request builder (additive; folds the worklist + viz advisor into a
+# full-dashboard, priority-ordered audit for the assisted tier). Built only on demand from the CLI's
+# ``--audit`` flag -- NOT on the default migrate path -- so a standalone run does no extra work.
+try:
+    from .audit_tier import build_dashboard_audit as _build_dashboard_audit
+except ImportError:  # pragma: no cover - flat scripts-on-path
+    try:
+        from audit_tier import build_dashboard_audit as _build_dashboard_audit
+    except ImportError:
+        _build_dashboard_audit = None
+
 
 # -- PBIR schema URLs ----------------------------------------------------------
 _S = "https://developer.microsoft.com/json-schemas/fabric/item/report"
@@ -7011,6 +7022,11 @@ def main(argv=None):
         "--worklist", default=os.environ.get("TWB_PBIR_WORKLIST"), metavar="PATH",
         help="optional: also write the deterministic per-visual remediation worklist JSON here "
              "(a structured, full-dashboard superset of the warnings). Never changes the PBIR.")
+    parser.add_argument(
+        "--audit", default=os.environ.get("TWB_PBIR_AUDIT"), metavar="PATH",
+        help="optional: also write the opt-in Tier-3 dashboard AUDIT request JSON here (folds the "
+             "worklist + chart-type advice into a full-dashboard, priority-ordered audit for the "
+             "assisted tier). Built on demand only; never changes the PBIR.")
     args = parser.parse_args(argv)
 
     if args.input == "-":
@@ -7034,6 +7050,21 @@ def main(argv=None):
         print("wrote remediation worklist: {0} item(s) across {1} visual(s) ({2} flagged) to {3}"
               .format(s["items_total"], s["visuals_total"], s["visuals_flagged"], args.worklist),
               file=sys.stderr)
+
+    if args.audit and _build_dashboard_audit is not None and result.get("worklist") is not None:
+        try:
+            audit = _build_dashboard_audit(result["worklist"], result.get("candidate_records", []))
+        except Exception:  # pragma: no cover - advisory; audit never blocks the emit
+            audit = None
+        if audit is not None:
+            au_parent = os.path.dirname(args.audit)
+            if au_parent:
+                os.makedirs(au_parent, exist_ok=True)
+            with open(args.audit, "w", encoding="utf-8") as fh:
+                json.dump(audit, fh, indent=2, ensure_ascii=False)
+            a_s = audit["summary"]
+            print("wrote dashboard audit: {0} visual(s), {1} need attention to {2}"
+                  .format(a_s["visuals"], a_s["needs_attention"], args.audit), file=sys.stderr)
 
     if args.out:
         root, written = _write_parts(args.out, args.report, parts)
