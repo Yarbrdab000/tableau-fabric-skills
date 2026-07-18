@@ -181,11 +181,59 @@ def hyper_to_csv(hyper_path, out_dir, *, hapi=None, row_limit=None):
 
 
 def extract_to_csv(source, out_dir, *, hapi=None, row_limit=None, dest_dir=None):
-    """Convenience: resolve ``source`` (``.hyper`` / ``.tdsx`` / ``.twbx``) to its extract and write
-    one CSV per table into ``out_dir``.
+    """Convenience: resolve ``source`` (``.hyper`` / ``.tdsx`` / ``.twbx``) to its extract(s) and
+    write one CSV per table into ``out_dir``.
 
-    Returns the same mapping as :func:`hyper_to_csv`. Raises :class:`HyperApiUnavailable` if the
-    optional dependency is missing, or ``FileNotFoundError`` when an archive has no embedded extract.
+    Returns the same mapping as :func:`hyper_to_csv`
+    (``{qualified_table_name: {"csv_path", "columns", "row_count"}}``). Raises
+    :class:`HyperApiUnavailable` if the optional dependency is missing, or ``FileNotFoundError``
+    when an archive has no embedded extract.
+
+    A packaged workbook can bundle **more than one** ``.hyper`` (e.g. a workbook that embeds
+    several extract-backed datasources). When it does, every embedded extract is read and the
+    per-table results are merged **first-wins**, so a table that lives only in a secondary extract
+    still lands instead of stubbing to an empty partition. A source with a single extract (a bare
+    ``.hyper`` or an archive with one ``.hyper``) takes the original single-extract path unchanged.
     """
-    hyper_path = find_hyper_in_archive(source, dest_dir=dest_dir)
-    return hyper_to_csv(hyper_path, out_dir, hapi=hapi, row_limit=row_limit)
+    s = str(source)
+    # Bare .hyper: original behavior, byte-for-byte unchanged.
+    if s.lower().endswith(".hyper"):
+        return hyper_to_csv(s, out_dir, hapi=hapi, row_limit=row_limit)
+    members = list_hyper_in_archive(source)
+    if not members:
+        raise FileNotFoundError(
+            f"no .hyper extract found in {s!r}; the datasource is live (no embedded data) -- "
+            "use the bring-your-own CSV path instead")
+    if len(members) == 1:
+        # Single-extract archive: original path unchanged (CSVs land directly in ``out_dir``).
+        hyper_path = find_hyper_in_archive(source, dest_dir=dest_dir)
+        return hyper_to_csv(hyper_path, out_dir, hapi=hapi, row_limit=row_limit)
+
+    # Multiple embedded extracts: land EVERY table, first-wins on a name collision so the primary
+    # extract's (typically richer) copy is the one kept. Each extract is staged to its own temp dir
+    # so same-named tables can't clobber each other's CSV before the first-wins decision is made.
+    os.makedirs(out_dir, exist_ok=True)
+    merged = {}
+    for member in members:
+        stage = tempfile.mkdtemp(prefix="tableau_hyper_")
+        try:
+            hyper_path = os.path.join(stage, os.path.basename(member))
+            with zipfile.ZipFile(source) as zf, zf.open(member) as src, \
+                    open(hyper_path, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            staged_csv = os.path.join(stage, "csv")
+            mapping = hyper_to_csv(hyper_path, staged_csv, hapi=hapi, row_limit=row_limit)
+            for qname, info in mapping.items():
+                if qname in merged:
+                    continue  # first-wins: keep the primary extract's copy of a shared table
+                final_csv = os.path.join(out_dir, os.path.basename(info["csv_path"]))
+                if not os.path.exists(final_csv):
+                    shutil.copyfile(info["csv_path"], final_csv)
+                merged[qname] = {
+                    "csv_path": os.path.abspath(final_csv),
+                    "columns": info["columns"],
+                    "row_count": info["row_count"],
+                }
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+    return merged

@@ -1951,6 +1951,47 @@ def _twbx_images(wb_id):
         return {}
 
 
+def _land_combined_flatfiles(packaged_source, descriptor, dest_dir):
+    """Land EVERY flat-file island's bundled data for a consolidated multi-datasource workbook model.
+
+    A ``.twbx`` that embeds several datasources consolidates into ONE model whose relations each route
+    to their OWN named connection (``_effective_connection`` returns ``relation["connection"]`` when
+    ``named_connection_count > 1``). Each of those per-relation connections carries only the workbook-
+    RELATIVE flat-file path (e.g. ``Data/Superstore/Sample - Superstore.xlsx``), which Power BI's
+    ``File.Contents`` rejects -- so the emitted partition opens but loads NO data, and only the primary
+    island's file was ever lifted to disk. This lifts EACH relation's bundled Excel/CSV out of the
+    package to an ABSOLUTE on-disk path and pins it on the relation as ``flatfile_path`` (which the
+    emitter prefers over the connection's relative path), so every island's data both lands and loads.
+
+    Reuses the proven, fail-closed :func:`extract_bundled_flatfile` per relation (deduped by absolute
+    destination, so tables sharing a workbook -- Orders/People/Returns -> one Excel -- lift it once).
+    Returns the list of absolute paths landed. Fail-closed: a relation whose file can't be lifted is
+    left untouched (keeps its relative path, exactly as before), and the helper never raises. A single-
+    connection descriptor has no per-relation ``connection`` facts, so this is a no-op there.
+    """
+    landed = []
+    if not packaged_source or not dest_dir or not isinstance(descriptor, dict):
+        return landed
+    for rel in (descriptor.get("relations") or []):
+        if rel.get("flatfile_path"):  # already absolute (e.g. seeded from a sibling) -> leave it
+            continue
+        conn = rel.get("connection") or {}
+        filename = conn.get("flatfile_filename") or conn.get("filename")
+        if not filename:  # live-DB / non-flat-file relation -> nothing bundled to lift
+            continue
+        directory = conn.get("flatfile_directory") or conn.get("directory")
+        mini = {"flatfile_filename": filename, "flatfile_directory": directory}
+        try:
+            abs_path = extract_bundled_flatfile(packaged_source, mini, dest_dir)
+        except Exception:
+            abs_path = None
+        if abs_path:
+            rel["flatfile_path"] = abs_path
+            if abs_path not in landed:
+                landed.append(abs_path)
+    return landed
+
+
 def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, model_safe, dest,
                            folder_rel, report_base, viz_name, viz=None, ds_catalog=None,
                            approved_calc_dax=None, wb_id=None, pbip_dir=None,
@@ -2002,6 +2043,12 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                 if ff_path is None and cat.get("flatfile_path"):
                     ff_path = cat.get("flatfile_path")
         local_data = merged_local or None
+        # >>> PATCH: embedded-only workbook -> ds_catalog is empty, so nothing backfilled the non-
+        # primary islands. Lift EVERY island's bundled flat file straight from the .twbx and pin an
+        # absolute per-relation ``flatfile_path`` so all islands' data lands AND loads. No-op when
+        # there is nothing bundled to lift (live-DB islands, or a sibling supplied absolute paths).
+        _land_combined_flatfiles(wb_id, descriptor, _ff_dest)
+        # <<< PATCH
     elif ds_catalog:
         cat = ds_catalog.get(_norm_ds(ds.get("caption") or ds.get("name") or label))
         if cat:

@@ -256,3 +256,62 @@ def test_real_hyper_round_trip(tmp_path, monkeypatch):
     key = next(iter(res))
     assert res[key]["row_count"] == 2
     assert "Region" in res[key]["columns"]
+
+
+def _fake_hapi_by_db(tables_by_db):
+    """Like ``_fake_hapi`` but returns a DIFFERENT table set per database file basename, so a
+    multi-extract archive can be exercised hermetically."""
+    import os as _os
+    import types
+    mod = types.SimpleNamespace()
+    mod.Telemetry = _FakeTelemetry
+    mod.HyperProcess = _FakeProcess
+    mod.Connection = lambda *, endpoint, database: _FakeConnection(
+        endpoint=endpoint, database=database,
+        tables=tables_by_db[_os.path.basename(str(database))])
+    return mod
+
+
+def test_extract_to_csv_merges_all_embedded_hypers_first_wins(tmp_path):
+    # Two embedded extracts: each has a private table plus a shared one with different row counts.
+    arc = _make_archive(tmp_path / "wb.twbx", {
+        "wb.twb": "<workbook/>",
+        "Data/a.hyper": b"HYPER-A",
+        "Data/b.hyper": b"HYPER-B",
+    })
+    tables_by_db = {
+        "a.hyper": {
+            "Shared":     {"columns": ["K", "V"], "rows": [[1, 10], [2, 20], [3, 30]]},
+            "OnlyInA":    {"columns": ["X"],      "rows": [["a1"], ["a2"]]},
+        },
+        "b.hyper": {
+            "Shared":     {"columns": ["K", "V"], "rows": [[9, 90]]},          # different -> must lose
+            "OnlyInB":    {"columns": ["Y"],      "rows": [["b1"], ["b2"], ["b3"], ["b4"]]},
+        },
+    }
+    out = tmp_path / "data"
+    res = hr.extract_to_csv(str(arc), str(out), hapi=_fake_hapi_by_db(tables_by_db))
+
+    # Every table across BOTH extracts is landed (the bug dropped OnlyInB entirely).
+    assert set(res) == {"Shared", "OnlyInA", "OnlyInB"}
+    # First-wins: the shared table keeps the FIRST extract's rows, not the second's.
+    assert res["Shared"]["row_count"] == 3
+    assert res["OnlyInB"]["row_count"] == 4
+    # All three CSVs exist on disk in out_dir.
+    for info in res.values():
+        assert os.path.isfile(info["csv_path"])
+        assert os.path.dirname(info["csv_path"]) == os.path.abspath(str(out))
+
+
+def test_extract_to_csv_single_hyper_unchanged(tmp_path):
+    # Regression guard: a single-extract archive still lands via the original path.
+    arc = _make_archive(tmp_path / "one.twbx", {
+        "one.twb": "<workbook/>",
+        "Data/only.hyper": b"HYPER",
+    })
+    tables = {"snapshot": {"columns": ["Region", "Pending"],
+                           "rows": [["Beltway", 32000], ["Florida", 3500]]}}
+    res = hr.extract_to_csv(str(arc), str(tmp_path / "data"),
+                            hapi=_fake_hapi({"snapshot": tables["snapshot"]}))
+    assert set(res) == {"snapshot"}
+    assert res["snapshot"]["row_count"] == 2
