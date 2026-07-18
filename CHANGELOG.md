@@ -13,6 +13,58 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.60.0` → `1.61.0`): Tableau date-parameter-driven calc rebuild — the
+  engine now faithfully rebuilds calcs whose logic is driven by a Tableau date parameter, so date-window
+  worksheets stop rendering blank. Additive and fail-closed — a workbook with no date-parameter calcs is
+  byte-identical, and every new code path defaults off for existing callers.**
+  - **Date-parameter tables.** Each date parameter lands as its own one-column table with a
+    `SELECTEDVALUE(...)`-backed value measure carrying the parameter's authored default (e.g.
+    `Start Date Value = SELECTEDVALUE('Start Date'[Start Date], DATE(2020, 1, 1))`), so a slicer over the
+    table drives every dependent measure.
+  - **Shape 2 — flag-gated measures.** `translate_flag_gated_measure` rebuilds an
+    `IF([Date Filter … Flag] = 1, [Base Measure])` calc, and the keep-flag itself becomes an
+    `IF(COUNTROWS(FILTER('Table', 'Table'[Date] >= [Start Date Value] && … <= [End Date Value])) > 0, 1)`.
+    Flag references are emitted **unqualified** (`[Flag] = 1`, not `'_Measures'[Flag] = 1`) so the measure
+    renders (R1).
+  - **Shape 3 — aggregated param-row calcs.** `translate_aggregated_param_row_calc` rebuilds
+    row-level-within-window aggregates as `SUMX/AVERAGEX(...)` carrying the row date predicate (e.g.
+    `Days to Close … = SUMX('Case', IF(… ClosedDate in window …, …))`).
+  - **Null-labeled dimension swap (Component S).** `_reduce_null_labeled_swap` collapses a null-labeled
+    field-swap branch so a swapped dimension keeps its real label instead of a blank.
+  - **R2 render guard.** `_role_projections` now skips an empty / quotes-only spacer field that would
+    otherwise dangle an ``Entity[""]`` reference and error the whole visual.
+  - **Byte-identical for existing callers.** `migrate_tds_to_semantic_model` auto-extracts calc outer
+    aggregations (`extract_calc_outer_aggs`) with a `None` default, so a bare `.tds` yields `{}` and no
+    behavior change. Locked by new hermetic tests (`test_assemble_model.py`, `test_calc_to_dax.py`,
+    `test_parameters.py`, `test_twb_to_pbir.py`) and reconciled against the real
+    `Salesforce Intake Simplified` proof bed (23/23 calcs translated). Plugin mirror kept byte-identical.
+- **tableau-migration (skill `1.59.0` → `1.60.0`): Multi-datasource data landing — a workbook with more
+  than one datasource now lands the data for EVERY datasource, not just the first, so a combined /
+  multi-island model binds and reconciles. Additive and fail-closed — a single-datasource workbook, a
+  bare `.hyper`, or a live-DB source stays byte-identical.** *(Fix.)*
+  - **Every embedded `.hyper` read.** `hyper_reader.extract_to_csv` now reads EVERY embedded `.hyper`
+    member and merges its tables first-wins (previously only `members[0]` was read), so a `.twbx` bundling
+    multiple extracts unloads all of them.
+  - **Every flat-file island landed.** `migrate_estate._land_combined_flatfiles` lifts each flat-file
+    island's bundled Excel/CSV to an absolute per-relation `flatfile_path` in the combined model branch.
+  - Locked by new hermetic tests (`test_hyper_reader.py`: multi-extract first-wins + single-extract
+    regression). Plugin mirror kept byte-identical.
+- **tableau-migration (skill `1.58.0` → `1.59.0`): Assisted (Tier-3) dashboard audit tier — an opt-in
+  `--audit` path that, for users who elect LLM-assisted migration, audits the WHOLE dashboard and can only
+  ever match or beat the deterministic output per visual. Additive and opt-in — the default deterministic
+  path is byte-identical and never invokes the audit tier.**
+  - **Opt-in `--audit` CLI flag** documents and gates the assisted chart-fidelity tier; omitting it leaves
+    every existing invocation unchanged.
+  - **Deterministic per-visual remediation worklist** enumerates, for each visual, what needs attention
+    and how to remediate it — surfacing the hard cases, not just the easy ones.
+  - **Monotonic fidelity gate** guarantees the assisted result is `>=` the deterministic result for every
+    visual, so electing the assisted tier can never regress a visual.
+  - **Tier-3 composition** wires the worklist + advisor + monotonic gate into one audit pass.
+  - Locked by new hermetic tests. Plugin mirror kept byte-identical.
+- **tableau-migration (skill `1.57.0` → `1.58.0`): Continuous chart-color fill — the migration engine now
+  carries a continuous (measure-driven) color encoding onto the rebuilt visual as a continuous fill,
+  instead of dropping it. Additive and fail-closed — a visual with no continuous color encoding is
+  byte-identical.** Locked by new hermetic tests; plugin mirror kept byte-identical.
 - **tableau-migration (skill `1.56.0` → `1.57.0`): Dashboard image & button objects — the report
   rebuilder now rebuilds a dashboard's floating `bitmap` image zones and `dashboard-object` buttons
   (with an `<image-path>`) as native PBIR `image` visuals, packaging each referenced PNG/JPG as a
