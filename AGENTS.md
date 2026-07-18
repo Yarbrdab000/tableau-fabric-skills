@@ -107,6 +107,40 @@ governed by **opposite** rules:
   convention files), but author your own prose. Retain the MIT notice on any file ever copied
   verbatim.
 
+## Versioning & rollback
+
+**Every change under `skills/<name>/` ships as a versioned release — this is mandatory, not optional.**
+A code/resource/doc change that lands on `main` without a version bump + CHANGELOG entry + rollback tag
+is an incomplete release (clients' self-update sees no newer stamp and skips it, and there is no clean
+anchor to revert a bad release). Do all three, every time:
+
+1. **Bump the skill `VERSION`.** Edit `skills/<name>/VERSION` (semver). This collection uses
+   **MINOR-only skill bumps, one focused version per feature** (e.g. `1.61.0 → 1.62.0`); never a bare
+   PATCH. Re-mirror so `plugins/tableau-fabric-skills/skills/<name>/VERSION` is **byte-identical**
+   (enforced by `test_mirror_parity`).
+2. **Add a `CHANGELOG.md` entry** under `[Unreleased]` (newest first) noting the skill delta and what
+   changed — e.g. **`tableau-migration (skill \`1.61.0\` → \`1.62.0\`): …`**. Keep entries additive.
+3. **Cut the rollback anchor BEFORE the change lands.** Create an annotated tag on the *pre-change*
+   commit, matching the existing `rollback/pre-vX.Y.Z` series, and push it:
+   ```
+   git tag -a rollback/pre-v1.62.0 <pre-change-commit> -m "Pre-v1.62.0 anchor (<feature>)"
+   git push origin rollback/pre-v1.62.0
+   ```
+   Rollback is then a one-liner: `git reset --hard rollback/pre-v1.62.0`.
+
+When several features shipped unversioned, catch up per feature: assign each its own MINOR version +
+CHANGELOG entry + `rollback/pre-v` tag at that feature's pre-change ancestor (see the 1.58.0–1.61.0
+catch-up for the pattern).
+
+**Collection version is decoupled.** The four packaging manifests share one **collection** version
+(`.claude-plugin/marketplace.json`, `.github/plugin/marketplace.json`, and the two `plugin.json`s,
+currently `0.12.0`). A skill-only change bumps the skill `VERSION` **only** — do **not** bump the
+collection manifests for it (they move separately, less often, for collection-level packaging changes).
+
+The self-update runbook (`skills/tableau-migration/resources/self-update.md`) is the consumer side of
+this contract: it compares installed `VERSION` against the raw `VERSION` on `main` and only reinstalls
+when `main` is newer. If you forget the bump, no client ever updates.
+
 ## Commits
 
 - Make the **user** the commit author, and append the trailer:

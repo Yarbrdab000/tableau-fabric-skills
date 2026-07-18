@@ -45,7 +45,31 @@ Windows / PowerShell (lead — the user is on Windows):
 
 ```powershell
 $RepoRaw = "https://raw.githubusercontent.com/Yarbrdab000/tableau-fabric-skills/main/skills/tableau-migration/VERSION"
-$Install = "$HOME\.copilot\skills\tableau-migration"   # OR the actual folder this SKILL.md loaded from
+
+# --- Resolve <INSTALL_DIR>: the folder THIS SKILL.md was loaded from. Do NOT hardcode the manual
+#     fallback. A plugin / marketplace install loads from `installed-plugins\...`, NOT from
+#     `~/.copilot/skills\`; updating the wrong folder silently creates a shadow copy the loader never
+#     loads, so the running skill stays stale and the user thinks they updated. ---
+$Install = ""   # <- SET THIS to the folder this SKILL.md loaded from if you know it (you usually do):
+                #    plugin : "$HOME\.copilot\installed-plugins\<marketplace>\<plugin>\skills\tableau-migration"
+                #    project: "<repo>\.github\skills\tableau-migration"   (or "<repo>\.agents\skills\...")
+                #    manual : "$HOME\.copilot\skills\tableau-migration"
+
+# Discover every real install copy (has a VERSION), plugin scope first -- that is what a marketplace
+# install actually loads -- then the manual fallback.
+$pluginCopies = @(Get-ChildItem "$HOME\.copilot\installed-plugins" -Recurse -Directory -Filter tableau-migration -ErrorAction SilentlyContinue |
+                    Where-Object { Test-Path (Join-Path $_.FullName 'VERSION') } | Select-Object -Expand FullName)
+if (-not $Install) {
+  $Install = ($pluginCopies | Select-Object -First 1)
+  if (-not $Install) { $Install = "$HOME\.copilot\skills\tableau-migration" }   # first-time manual install
+}
+Write-Output "install dir = $Install"
+
+# Shadow-copy guard: refuse to CREATE a brand-new folder while a loaded plugin copy already exists --
+# that new copy would be ignored by the loader. Stop and confirm the real loaded path with the user.
+if (-not (Test-Path (Join-Path $Install 'VERSION')) -and $pluginCopies.Count -gt 0) {
+  throw "Refusing to shadow-install into '$Install' while a loaded plugin copy exists at: $($pluginCopies -join '; '). Set `$Install to the real loaded folder."
+}
 
 $localRaw  = (Get-Content (Join-Path $Install "VERSION") -ErrorAction SilentlyContinue | Select-Object -First 1)
 $localVer  = if ($localRaw) { $localRaw.Trim() } else { "0.0.0" }
@@ -54,6 +78,12 @@ $remoteVer = (Invoke-RestMethod -Uri $RepoRaw -Headers @{ 'Cache-Control' = 'no-
 $isNewer = [version]$remoteVer -gt [version]$localVer
 Write-Output "installed=$localVer  remote=$remoteVer  remoteIsNewer=$isNewer"
 ```
+
+> **Plugin installs update in place.** Overwriting the plugin's own skill folder is valid — the loader
+> re-reads it fresh at the next session start (see the "not live until a new session" gotcha below). If
+> your plugin manager later re-pins/reverts that folder, the manager-blessed equivalent is the plugin
+> channel: refresh the marketplace and reinstall (`/plugin` — e.g. `marketplace update` then
+> `install tableau-fabric-skills@tableau-collection`). Either path lands the same bytes; both need a new session.
 
 - If `-not $isNewer` and the user did **not** force → report `tableau-migration is already current ($localVer)` and **STOP**.
 - Else continue to Step 2. (`[version]` compares numeric `x.y.z`. If a stamp ever carries a non-numeric
@@ -80,7 +110,7 @@ if (Test-Path $Install) { Copy-Item $Install $Backup -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $Install | Out-Null
 
 # Wholesale overwrite of the payload folders (Remove-then-Copy = no stale files survive).
-foreach ($d in 'scripts','resources','tests') {
+foreach ($d in 'scripts','resources','tests','tests_oracle') {
   $dst = Join-Path $Install $d
   if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
   if (Test-Path (Join-Path $Src $d)) { Copy-Item (Join-Path $Src $d) $dst -Recurse -Force }
@@ -169,7 +199,11 @@ report the on-disk version delta so they know the next session will run fresh co
 Same logic, POSIX tools (no `Copy-Item`/`Invoke-RestMethod`):
 
 ```bash
-Install="$HOME/.copilot/skills/tableau-migration"
+# Install must be the folder THIS SKILL.md loaded from -- a plugin install loads from
+# ~/.copilot/installed-plugins/<marketplace>/<plugin>/skills/tableau-migration, NOT the path below.
+# Discover the plugin copy first; only fall back to the manual path when none exists.
+Install="$(find "$HOME/.copilot/installed-plugins" -type d -name tableau-migration -exec test -f '{}/VERSION' ';' -print 2>/dev/null | head -n1)"
+: "${Install:=$HOME/.copilot/skills/tableau-migration}"
 RepoRaw="https://raw.githubusercontent.com/Yarbrdab000/tableau-fabric-skills/main/skills/tableau-migration/VERSION"
 local_ver="$(head -n1 "$Install/VERSION" 2>/dev/null | tr -d '[:space:]')"; : "${local_ver:=0.0.0}"
 remote_ver="$(curl -fsSL "$RepoRaw" | tr -d '[:space:]')"
@@ -181,9 +215,19 @@ rsync -a --delete --exclude '.git' --exclude '__pycache__' --exclude '.pytest_ca
 rm -rf "$tmp"   # then run the same file/symbol asserts + python3.11 -m pytest tests -q
 ```
 
-## Author note — bump the stamp on every release
+## Author note — version + rollback-tag on every release
 
-The whole mechanism hinges on the stamp. **Whenever you change the skill, bump
-`skills/tableau-migration/VERSION`** (semver) and push to `main`; optionally tag the release
-(`git tag v1.4.0 && git push --tags`) so installs can pin. If the stamp does not move, clients will
-think they are current and skip the update.
+The whole mechanism hinges on the stamp. This is a hard rule, not a "nice to have" — **every time you
+change anything under `skills/tableau-migration/`, ship it as a versioned release:**
+
+1. **Bump `skills/tableau-migration/VERSION`** (semver; this collection uses MINOR-only skill bumps,
+   one focused version per feature) — canonical **and** the plugin mirror, kept byte-identical.
+2. **Add a `CHANGELOG.md` `[Unreleased]` entry** noting the skill delta (e.g. `1.61.0 → 1.62.0`).
+3. **Cut the rollback anchor** *before* the change lands: an annotated tag
+   `git tag -a rollback/pre-v<new> <pre-change-commit> -m "..."` (matches the existing
+   `rollback/pre-vX.Y.Z` series), then push it (`git push origin rollback/pre-v<new>`). Rollback is
+   then a one-liner: `git reset --hard rollback/pre-v<new>`.
+
+If the stamp does not move, clients think they are current and skip the update. If the rollback tag is
+missing, there is no clean anchor to revert a bad release to. See `AGENTS.md` → "Versioning & rollback"
+for the authoritative protocol.

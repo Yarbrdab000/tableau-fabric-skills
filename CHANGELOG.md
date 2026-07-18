@@ -13,6 +13,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.61.0` → `1.62.0`): Self-update runbook now updates the ACTUAL loaded
+  install (plugin-aware) instead of a hardcoded manual path — fixes the defect where a plugin/marketplace
+  user running the update procedure would silently create a shadow copy under `~/.copilot/skills/` that
+  the loader never loads, leaving the running skill stale. Docs/runbook only; no engine behavior change.**
+  - **Plugin-aware `<INSTALL_DIR>` resolution.** `resources/self-update.md` Step 1 no longer hardcodes
+    `~/.copilot/skills/tableau-migration`; it resolves the folder this `SKILL.md` was loaded from,
+    discovering plugin copies under `~/.copilot/installed-plugins/…` first (that is what a marketplace
+    install actually loads), then the manual fallback. POSIX section given the same discovery.
+  - **Shadow-copy guard.** Refuses to create a brand-new install folder while a loaded plugin copy
+    already exists (which would be ignored by the loader) — stops and asks for the real loaded path.
+  - **Complete payload sync.** Step 2 wholesale-overwrite list now includes `tests_oracle` alongside
+    `scripts` / `resources` / `tests`.
+  - **Release-protocol note.** The author note now mandates VERSION bump + CHANGELOG entry +
+    `rollback/pre-vX.Y.Z` tag on every skill change, cross-referencing `AGENTS.md` → "Versioning &
+    rollback" (newly codified). Plugin mirror kept byte-identical.
 - **tableau-migration (skill `1.60.0` → `1.61.0`): Tableau date-parameter-driven calc rebuild — the
   engine now faithfully rebuilds calcs whose logic is driven by a Tableau date parameter, so date-window
   worksheets stop rendering blank. Additive and fail-closed — a workbook with no date-parameter calcs is
