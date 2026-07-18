@@ -119,6 +119,67 @@ def test_detect_if_requires_single_controller():
     assert P.detect_field_swap(f, role="dimension") is None
 
 
+# -- detection: null-labeled swap (reduce ISNULL relabel wrapper to the core swap) ----------
+_NULL_LABELED_SWAP = (
+    'IF\nISNULL(\nCASE [Parameters].[Show by Dimension]\n'
+    'WHEN 1 THEN [Program Issue Area]\nWHEN 2 THEN [Program Name]\nWHEN 3 THEN [Name (User)]\nEND\n)\n'
+    'AND [Parameters].[Show by Dimension] = 1 THEN  "No Program Issue Area Assigned"\n\n'
+    'ELSEIF ISNULL(\nCASE [Parameters].[Show by Dimension]\n'
+    'WHEN 1 THEN [Program Issue Area]\nWHEN 2 THEN [Program Name]\nWHEN 3 THEN [Name (User)]\nEND\n)\n'
+    'AND [Parameters].[Show by Dimension] = 2 THEN  "No Program Assigned"\n\n'
+    'ELSEIF ISNULL(\nCASE [Parameters].[Show by Dimension]\n'
+    'WHEN 1 THEN [Program Issue Area]\nWHEN 2 THEN [Program Name]\nWHEN 3 THEN [Name (User)]\nEND\n)\n'
+    'AND [Parameters].[Show by Dimension] = 3 THEN  "No Owner Assigned"\n\n'
+    'ELSE \nCASE [Parameters].[Show by Dimension]\n'
+    'WHEN 1 THEN [Program Issue Area]\nWHEN 2 THEN [Program Name]\nWHEN 3 THEN [Name (User)]\n\nEND\n\nEND')
+
+
+def test_reduce_null_labeled_swap_extracts_core_case():
+    reduced = P._reduce_null_labeled_swap(_NULL_LABELED_SWAP)
+    assert reduced.lower().startswith("case [parameters].[show by dimension]")
+    assert "isnull" not in reduced.lower()
+    assert "no program issue area assigned" not in reduced.lower()
+
+
+def test_detect_null_labeled_swap_is_recognized():
+    sw = P.detect_field_swap(_NULL_LABELED_SWAP, role="dimension")
+    assert sw is not None
+    assert sw["controller"] == "Show by Dimension"
+    assert sw["form"] == "case"
+    assert [(b["label"], b["field"]) for b in sw["branches"]] == [
+        ("1", "Program Issue Area"), ("2", "Program Name"), ("3", "Name (User)")]
+
+
+def test_reduce_null_labeled_swap_reversed_operand():
+    f = ('IF ISNULL(CASE [Parameters].[p] WHEN 1 THEN [A] WHEN 2 THEN [B] END) '
+         'AND 1 = [Parameters].[p] THEN "No A" '
+         'ELSE CASE [Parameters].[p] WHEN 1 THEN [A] WHEN 2 THEN [B] END END')
+    sw = P.detect_field_swap(f, role="dimension")
+    assert sw is not None
+    assert [b["field"] for b in sw["branches"]] == ["A", "B"]
+
+
+def test_reduce_null_labeled_swap_fails_closed_on_mismatched_guard():
+    # The ISNULL guard wraps a DIFFERENT swap than the ELSE -> not a faithful relabel; leave it alone.
+    f = ('IF ISNULL(CASE [Parameters].[p] WHEN 1 THEN [X] WHEN 2 THEN [Y] END) '
+         'AND [Parameters].[p] = 1 THEN "No A" '
+         'ELSE CASE [Parameters].[p] WHEN 1 THEN [A] WHEN 2 THEN [B] END END')
+    assert P.detect_field_swap(f, role="dimension") is None
+
+
+def test_reduce_null_labeled_swap_fails_closed_when_else_not_swap():
+    # A non-swap ELSE (bare field, not a [Parameters] CASE) must not be reduced.
+    f = ('IF ISNULL([Program Issue Area]) AND [Parameters].[p] = 1 THEN "No A" '
+         'ELSE [Program Issue Area] END')
+    assert P.detect_field_swap(f, role="dimension") is None
+
+
+def test_reduce_null_labeled_swap_noop_on_plain_swap():
+    # A clean swap with no ISNULL wrapper is returned untouched by the reducer.
+    f = 'CASE [Parameters].[p] WHEN 1 THEN [A] WHEN 2 THEN [B] END'
+    assert P._reduce_null_labeled_swap(f) == f
+
+
 # -- DAX escaping ---------------------------------------------------------------------------
 def test_dax_ref_escapes_table_and_field():
     assert P.dax_ref("Sales' Data", "Sub]Cat") == "'Sales'' Data'[Sub]]Cat]"

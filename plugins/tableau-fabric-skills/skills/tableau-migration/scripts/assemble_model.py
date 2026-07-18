@@ -50,6 +50,7 @@ try:  # package or scripts-on-path
         translate_tableau_calc_to_dax_typed,
         translate_tableau_calc_to_column_dax,
         translate_tableau_calc_to_column_dax_typed,
+        translate_aggregated_param_row_calc,
         suggest_assisted_dax,
         field_references,
         date_attribute_binding,
@@ -70,6 +71,7 @@ try:  # package or scripts-on-path
         extract_percent_diff_base,
     )
     from .workbook_table_calcs import extract_table_calc_usages
+    from .workbook_calc_usage import extract_calc_outer_aggs
     from .date_window_flag import build_date_window_flags
     from .openability_gate import check_model_openability
     from . import linguistic as L
@@ -94,6 +96,7 @@ except ImportError:
         translate_tableau_calc_to_dax_typed,
         translate_tableau_calc_to_column_dax,
         translate_tableau_calc_to_column_dax_typed,
+        translate_aggregated_param_row_calc,
         suggest_assisted_dax,
         field_references,
         date_attribute_binding,
@@ -114,6 +117,7 @@ except ImportError:
         extract_percent_diff_base,
     )
     from workbook_table_calcs import extract_table_calc_usages
+    from workbook_calc_usage import extract_calc_outer_aggs
     from date_window_flag import build_date_window_flags
     from openability_gate import check_model_openability
     import linguistic as L
@@ -716,11 +720,285 @@ def _anchoring_rc(rc):
     return _arc
 
 
+def _calc_id_key(calc):
+    """The bare, bracket-stripped, lowercased ``Calculation_<id>`` for a calc dict.
+
+    Matches the key shape ``extract_calc_outer_aggs`` returns, so a calc joins its captured pill
+    aggregation by internal id. Empty string when the calc carries no internal name.
+    """
+    return str((calc or {}).get("internal_name") or "").strip().strip("[]").strip().lower()
+
+
+_PARAM_REF_RE = re.compile(r"\[Parameters\]\.\[([^\]]+)\]", re.IGNORECASE)
+
+# A row-level boolean date-filter calc consumed at AGGREGATE level -- ``MAX([Date Filter])`` /
+# ``MIN([..])`` / ``ATTR([..])`` -- returns "is any row in the current group inside the window", which
+# is exactly what its synthesized keep-flag measure already computes. This matches such a wrapper so a
+# ``IF Max([Date Filter]) THEN [Measure] END`` gate collapses to ``IF([Flag]=1, [Measure])``.
+_AGG_FLAG_RE = re.compile(
+    r"\b(?:MAX|MIN|ATTR)\s*\(\s*\[([^\]]+)\]\s*\)", re.IGNORECASE)
+
+
+def _split_if_then(formula):
+    """Split a top-level ``IF <cond> THEN <body> END`` / ``IIF(<cond>, <body>[, <else>])``.
+
+    Returns ``(cond, body, else_body)`` (strings; ``else_body`` may be None) or None when the shape is
+    not a single-branch IF/IIF -- an ``ELSEIF`` chain, a nested/again-``IF`` cond, or a malformed body
+    all return None so the caller stubs rather than guesses. Bracketed field refs are treated opaque
+    so a ``THEN``/``END`` token inside ``[..]`` never splits.
+    """
+    s = (formula or "").strip()
+    if not s:
+        return None
+    low = s.lower()
+    if low.startswith("iif"):
+        i = s.find("(")
+        if i < 0 or not s.rstrip().endswith(")"):
+            return None
+        inner = s[i + 1:s.rstrip().rfind(")")]
+        args = _split_top_commas(inner)
+        if len(args) == 2:
+            return args[0].strip(), args[1].strip(), None
+        if len(args) == 3:
+            return args[0].strip(), args[1].strip(), args[2].strip()
+        return None
+    if not (low.startswith("if ") or low.startswith("if\t") or low.startswith("if\n")
+            or low.startswith("if(")):
+        return None
+    # No ELSEIF chain (keep the deterministic scope tight).
+    if re.search(r"\belseif\b", s, re.IGNORECASE):
+        return None
+    then_pos = _find_kw(s, "then")
+    end_pos = _find_kw(s, "end", last=True)
+    if then_pos < 0 or end_pos < 0 or end_pos < then_pos:
+        return None
+    cond = s[2:then_pos].strip()
+    rest = s[then_pos + 4:end_pos]
+    else_pos = _find_kw(rest, "else", last=True)
+    if else_pos >= 0:
+        body = rest[:else_pos].strip()
+        else_body = rest[else_pos + 4:].strip()
+    else:
+        body = rest.strip()
+        else_body = None
+    if not cond or not body:
+        return None
+    return cond, body, else_body
+
+
+def _split_top_commas(s):
+    """Split ``s`` on commas that are outside brackets/parens/quotes."""
+    out, depth, buf, q = [], 0, [], None
+    for ch in s:
+        if q:
+            buf.append(ch)
+            if ch == q:
+                q = None
+            continue
+        if ch in "'\"":
+            q = ch; buf.append(ch); continue
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(buf)); buf = []
+        else:
+            buf.append(ch)
+    out.append("".join(buf))
+    return out
+
+
+def _find_kw(s, kw, last=False):
+    """Index of a whole-word keyword ``kw`` in ``s`` outside brackets/parens/quotes (-1 if none)."""
+    hits = []
+    depth, q, i, n, kl = 0, None, 0, len(s), len(kw)
+    while i < n:
+        ch = s[i]
+        if q:
+            if ch == q:
+                q = None
+            i += 1; continue
+        if ch in "'\"":
+            q = ch; i += 1; continue
+        if ch in "([":
+            depth += 1; i += 1; continue
+        if ch in ")]":
+            depth -= 1; i += 1; continue
+        if depth == 0 and s[i:i + kl].lower() == kw.lower():
+            before = s[i - 1] if i > 0 else " "
+            after = s[i + kl] if i + kl < n else " "
+            if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+                hits.append(i)
+                if not last:
+                    return i
+        i += 1
+    return hits[-1] if hits else -1
+
+
+def translate_flag_gated_measure(formula, resolver, flag_ref_lookup, *, param_resolver=None,
+                                 measure_refs=None, known_tables=None, related_tables=None,
+                                 conformed_hubs=None):
+    """Translate ``IF <agg-of-date-filter> THEN <measure> END`` -> ``IF([Flag]=1, <measure DAX>)``.
+
+    A measure calc that gates an inner aggregate on ``MAX([<date-filter calc>])`` (Tableau's "is any
+    row of this group inside the parameter window?") has no faithful safe-subset measure form -- the
+    ``MAX`` of a row-level boolean calc stubs. But that boolean already has a synthesized keep-flag
+    measure (``_param_predicate_flags`` / ``build_date_window_flags``) that computes exactly that group
+    predicate, so the gate collapses to ``IF([<Flag>] = 1, <inner measure>)``.
+
+    ``flag_ref_lookup`` maps a date-filter calc's caption/internal-id (lowercased) to its flag measure
+    name. Fail-closed: returns ``(None, reason)`` unless (1) the formula is a single-branch IF/IIF with
+    no ELSE (or an explicitly null ELSE), (2) its condition is composed ONLY of ``MAX/MIN/ATTR([flag
+    calc])`` terms joined by AND/OR/NOT/parens (each resolvable via ``flag_ref_lookup``), and (3) the
+    THEN body translates through the ordinary measure translator (so a bare ``[Calculation_..]`` measure
+    ref resolves via ``measure_refs``). Anything else -> stub, never a guess.
+    """
+    if not flag_ref_lookup:
+        return None, "no flag references"
+    split = _split_if_then(formula)
+    if not split:
+        return None, "not a single-branch IF/IIF"
+    cond, body, else_body = split
+    if else_body is not None and else_body.strip().lower() not in ("", "null"):
+        return None, "IF has a non-null ELSE"
+
+    # Condition: every MAX/MIN/ATTR([flag calc]) -> [Flag] = 1; nothing else but boolean connectors.
+    unresolved = []
+
+    def _sub(m):
+        key = m.group(1).strip().strip("[]").strip().lower()
+        fm = flag_ref_lookup.get(key)
+        if not fm:
+            unresolved.append(m.group(1))
+            return m.group(0)
+        return f"[{fm}] = 1"
+
+    cond_dax = _AGG_FLAG_RE.sub(_sub, cond)
+    if unresolved:
+        return None, f"aggregated boolean over a non-flag calc {unresolved!r}"
+    # Convert Tableau boolean words; then the residue must contain only flag terms + connectors.
+    cond_dax = re.sub(r"\bAND\b", "&&", cond_dax, flags=re.IGNORECASE)
+    cond_dax = re.sub(r"\bOR\b", "||", cond_dax, flags=re.IGNORECASE)
+    cond_dax = re.sub(r"\bNOT\b", "NOT", cond_dax, flags=re.IGNORECASE)
+    residue = _AGG_FLAG_RE.sub("", cond)
+    residue = re.sub(r"\b(AND|OR|NOT)\b", "", residue, flags=re.IGNORECASE)
+    residue = residue.replace("(", "").replace(")", "").strip()
+    if residue:
+        return None, f"condition has non-flag terms: {residue!r}"
+
+    body_dax, breason, _bt = translate_tableau_calc_to_dax(
+        body, resolver, param_resolver=param_resolver, measure_refs=measure_refs,
+        known_tables=known_tables, related_tables=related_tables, conformed_hubs=conformed_hubs)
+    if not body_dax:
+        return None, f"THEN body did not translate ({breason})"
+    return f"IF({cond_dax}, {body_dax})", "ok"
+
+
+def _param_predicate_flags(calcs, resolve, param_resolver, *, known_tables,
+                           reserved_names=None, skip_lower=None):
+    """Recognize a row-level BOOLEAN calc of parameter(s) vs a data column used as a keep-filter.
+
+    The peer of :func:`build_date_window_flags` for the *general* parameter-range predicate — e.g.
+    ``[Parameters].[Start Date] <= [Order Date] and [Parameters].[Close Date] >= [Order Date]`` used
+    as a Tableau ``member='true'`` filter. Such a calc is role=dimension (boolean output), so without
+    this it would either stub or freeze as a static SELECTEDVALUE calc column. Instead synthesize the
+    same keep-flag MEASURE + filter binding the date-window pipeline uses:
+
+      ``<Calc> = IF(COUNTROWS(FILTER('<fact>', <predicate>)) > 0, 1)``   (1 keep / BLANK drop)
+
+    The predicate is produced by the column-mode translator with ``param_resolver`` inlined, so each
+    ``[Parameters].[X]`` becomes its ``[<Param> Value]`` picker measure — valid inside ``FILTER`` under
+    context transition (reads the slicer selection). The report layer applies the binding as a
+    visual-level ``== 1`` filter on exactly the worksheets that used the calc as a filter.
+
+    Fail-closed: a calc qualifies ONLY when it references a parameter AND the column translator yields
+    a PURE BOOLEAN (``dtype == "bool"``) over exactly one known table. Anything else is left untouched
+    (its normal stub / calc-column path). ``skip_lower`` (caption/id, lowercased) excludes calcs a
+    prior flag pipeline already consumed. Returns ``(flag_measures, filter_bindings)`` in the exact
+    shape ``build_date_window_flags`` returns, so the two merge directly. Empty when nothing matched,
+    so a no-such-calc build stays byte-for-byte identical.
+    """
+    flag_measures, filter_bindings = [], {}
+    if not param_resolver:
+        return flag_measures, filter_bindings
+    reserved_lower = {(r or "").lower() for r in (reserved_names or set())}
+    skip_lower = {(s or "").lower() for s in (skip_lower or set())}
+    for calc in calcs or []:
+        name = calc.get("name")
+        formula = calc.get("formula")
+        if not name or not formula or not formula.strip():
+            continue
+        cid = _calc_id_key(calc)
+        if name.lower() in skip_lower or (cid and cid in skip_lower):
+            continue
+        if "[parameters]" not in formula.lower():
+            continue
+        pred, _reason, tables, dtype = translate_tableau_calc_to_column_dax_typed(
+            formula, resolve, known_tables=known_tables, param_resolver=param_resolver)
+        if not pred or dtype != "bool" or len(tables) != 1:
+            continue
+        table = next(iter(tables))
+        # ORIGINAL-CASE internal id (bracket-stripped only): ``_scope_flag_visuals`` maps this to the
+        # worksheets that filtered on the calc via ``workbook_calc_usage``, whose keys are the raw
+        # ``Calculation_<id>`` (mixed case). ``_calc_id_key`` (lowercased) is only for the ``calc_outer_aggs``
+        # join + the skip set above; using it here would miss the worksheet scope and the flag would be
+        # emitted but never applied. Mirrors ``build_date_window_flags`` (``source_internal`` verbatim).
+        raw_cid = str(calc.get("internal_name") or "").strip().strip("[]").strip()
+        src_id = raw_cid or name
+        base_name = name if name.lower() not in reserved_lower else f"{name} Flag"
+        measure_name, i = base_name, 2
+        while measure_name.lower() in reserved_lower:
+            measure_name = f"{base_name} {i}"
+            i += 1
+        reserved_lower.add(measure_name.lower())
+        dax = f"IF(COUNTROWS(FILTER('{table}', {pred})) > 0, 1)"
+        translated_by = "deterministic (parameter-driven row filter)"
+        param_internal = None
+        m = _PARAM_REF_RE.search(formula)
+        if m:
+            param_internal = m.group(1).strip()
+        report_row = {
+            "measure": measure_name,
+            "status": "translated",
+            "reason": None,
+            "dax": dax,
+            "tableau_formula": formula,
+            "translated_by": translated_by,
+            "source": {
+                "kind": "calc_column",
+                "model_table": "_Measures",
+                "field_caption": name,
+                "calc_instance_token": src_id,
+                "intent": "measure",
+            },
+        }
+        flag_measures.append({
+            "measure": measure_name,
+            "dax": dax,
+            "tableau_formula": formula,
+            "translated_by": translated_by,
+            "source_calc_name": name,
+            "source_calc_id": src_id,
+            "report_row": report_row,
+        })
+        filter_bindings[name] = {
+            "model_table": "_Measures",
+            "measure_name": measure_name,
+            "status": "translated",
+            "predicate": {"op": "==", "value": 1},
+            "value": 1,
+            "calc_id": src_id,
+            "param_internal": param_internal,
+        }
+    return flag_measures, filter_bindings
+
+
 def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    calc_lookup=None, approved_calc_dax=None, synth_measures=None,
                    known_tables=None, table_calc_usages=None, order_resolver=None,
                    flag_measures=None, resolve_for=None, inline_calcs=None,
-                   related_tables=None, conformed_hubs=None):
+                   related_tables=None, conformed_hubs=None, calc_outer_aggs=None):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
     ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
@@ -778,10 +1056,15 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     # Source calcs whose stub is SUPERSEDED by a synthesized date-window flag measure (emitted
     # at the end). Keyed by both the calc caption and its internal id, case-insensitive.
     flag_source_lower = set()
+    flag_ref_lookup = {}
     for _fm in (flag_measures or []):
+        _fm_name = _fm.get("measure")
         for _k in (_fm.get("source_calc_name"), _fm.get("source_calc_id")):
             if _k:
-                flag_source_lower.add(str(_k).strip().lower())
+                _kl = str(_k).strip().lower()
+                flag_source_lower.add(_kl)
+                if _fm_name:
+                    flag_ref_lookup[_kl] = _fm_name
     measures_tmdl = ""
     report = []
     suggestions = []
@@ -907,6 +1190,51 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             formula, _arc(calc), param_resolver=param_resolver, measure_refs=measure_refs,
             known_tables=known_tables, inline_calcs=inline_calcs, related_tables=related_tables,
             conformed_hubs=conformed_hubs)
+        # Parameter-driven ROW-LEVEL calc consumed under one outer aggregation (e.g.
+        # MAX(DATEDIFF([Date Parameter], [Order Date]))). Measure mode (above) correctly stubs its
+        # bare row-level column, and the row-level pre-router refused it (a parameter has no static
+        # calc-column form), so rescue it here as an AGGX measure with the pill's aggregation --
+        # slicer-reactive by construction. Fail-closed: only when the pill aggregation was captured
+        # AND the body translates column-mode-with-param to one fact table (else byte-identical stub).
+        agg_provenance = None
+        if not dax and param_resolver and calc_outer_aggs:
+            _agg = calc_outer_aggs.get((name or "").strip().lower()) \
+                or calc_outer_aggs.get(_calc_id_key(calc))
+            if _agg:
+                _adax, _areason, _ = translate_aggregated_param_row_calc(
+                    formula, _agg, _arc(calc), param_resolver=param_resolver,
+                    known_tables=known_tables, inline_calcs=inline_calcs)
+                if _adax:
+                    dax, reason, agg_provenance = _adax, "ok", _agg
+        # Shape 3 -- a row-level measure-role calc that reaches a parameter INDIRECTLY through a
+        # date-filter boolean it references, e.g. ``IF <conds> AND [Date Filter] THEN {FIXED [key]:
+        # MIN(DATEDIFF(...))} END``. There is no pill aggregation to read (a role=measure calc carries
+        # no ``sum:`` prefix on the shelf), so Tableau applies its default SUM. The whole IF translates
+        # column-mode to a per-row scalar that is BLANK for non-qualifying rows (the FIXED-LOD keeps its
+        # own ALLEXCEPT grain), so ``SUMX('T', <scalar>)`` reproduces ``SUM(IF ... THEN {FIXED ...}
+        # END)`` faithfully. Fail-closed inside translate_aggregated_param_row_calc: fires only when the
+        # formula references an inline-able boolean AND the body resolves to one fact table.
+        lod_gated = False
+        if not dax and param_resolver and inline_calcs:
+            _references_inline = any(
+                ("[" + str(_k).lower() + "]") in (formula or "").lower() for _k in inline_calcs)
+            if _references_inline:
+                _ldax, _lreason, _ = translate_aggregated_param_row_calc(
+                    formula, "SUM", _arc(calc), param_resolver=param_resolver,
+                    known_tables=known_tables, inline_calcs=inline_calcs)
+                if _ldax:
+                    dax, reason, lod_gated = _ldax, "ok", True
+        # Shape 2 -- flag-gated inner measure: ``IF Max([Date Filter]) THEN [Measure] END``.
+        # The MAX-of-a-row-level-boolean stubs above; collapse it to ``IF([<Flag>]=1, [Measure])``
+        # using the synthesized keep-flag measure. Fail-closed inside the recognizer.
+        flag_gated = False
+        if not dax and flag_ref_lookup:
+            _fdax, _freason = translate_flag_gated_measure(
+                formula, _arc(calc), flag_ref_lookup, param_resolver=param_resolver,
+                measure_refs=measure_refs, known_tables=known_tables,
+                related_tables=related_tables, conformed_hubs=conformed_hubs)
+            if _fdax:
+                dax, reason, flag_gated = _fdax, "ok", True
         row = {
             "measure": name,
             "status": "translated" if dax else "stub",
@@ -925,7 +1253,20 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             },
         }
         if dax:
-            measures_tmdl += T.generate_measure_tmdl(name, formula, dax)
+            if agg_provenance:
+                measures_tmdl += T.generate_measure_tmdl(
+                    name, formula, dax,
+                    translated_by=f"deterministic (parameter-driven {agg_provenance} over row-level calc)")
+            elif flag_gated:
+                measures_tmdl += T.generate_measure_tmdl(
+                    name, formula, dax,
+                    translated_by="deterministic (flag-gated inner measure over date-window keep-flag)")
+            elif lod_gated:
+                measures_tmdl += T.generate_measure_tmdl(
+                    name, formula, dax,
+                    translated_by="deterministic (default-SUM over param-gated row-level FIXED LOD)")
+            else:
+                measures_tmdl += T.generate_measure_tmdl(name, formula, dax)
             report.append(row)
             continue
 
@@ -2406,7 +2747,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                           hierarchies=None, display_folders=None, rls_roles=None,
                           date_table=True, mark_as_date=True, flatfile_path=None,
                           calc_lookup=None, approved_calc_dax=None, date_range=None,
-                          parameters=None, table_calc_usages=None):
+                          parameters=None, table_calc_usages=None, calc_outer_aggs=None):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -2606,6 +2947,23 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     flag_measures, filter_bindings = build_date_window_flags(
         all_calcs, parameters or [], vp.get("consumed_params") or [],
         date_name=date_name, active_date_cols=active_date_cols, reserved_names=reserved)
+    # General parameter-range boolean filter -> keep-flag measure + binding (the peer of the
+    # positional date-window pipeline for a plain ``[Parameters].[A] <= [col] and ...`` predicate used
+    # as a member='true' filter). Recognized only when the column translator (param inlined) yields a
+    # pure BOOLEAN over one table; fail-closed, so with no such calc this is inert. Reuses the SAME
+    # reserved-name set + already-consumed band flag names so no measure name or source calc collides.
+    _band_flag_sources = set()
+    for _fm in flag_measures:
+        for _k in (_fm.get("source_calc_name"), _fm.get("source_calc_id")):
+            if _k:
+                _band_flag_sources.add(_k)
+    _pred_flags, _pred_bindings = _param_predicate_flags(
+        all_calcs, resolve, param_resolver, known_tables=set(table_names),
+        reserved_names=reserved | {(fm.get("measure") or "").lower() for fm in flag_measures},
+        skip_lower=_band_flag_sources)
+    flag_measures.extend(_pred_flags)
+    for _tok, _spec in _pred_bindings.items():
+        filter_bindings.setdefault(_tok, _spec)
     flag_source_names = set()
     for _fm in flag_measures:
         for _k in (_fm.get("source_calc_name"), _fm.get("source_calc_id")):
@@ -2752,7 +3110,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         order_resolver=None,
         resolve_for=_measure_scoped_resolver,
         flag_measures=flag_measures, inline_calcs=inline_calcs,
-        related_tables=related_tables, conformed_hubs=conformed_hubs)
+        related_tables=related_tables, conformed_hubs=conformed_hubs,
+        calc_outer_aggs=calc_outer_aggs)
     parts["definition/tables/_Measures.tmdl"] = measures_table
     table_names.append("_Measures")
 
@@ -3241,7 +3600,7 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                   date_table=True, mark_as_date=True, flatfile_path=None,
                                   approved_calc_dax=None, date_range=None, select=None,
                                   parameters=None, table_calc_usages=None, descriptor=None,
-                                  emit_linguistic=False):
+                                  emit_linguistic=False, calc_outer_aggs=None):
     """One-call convenience: parse ``.tds``/``.twb`` text and assemble the Import/DirectQuery model.
 
     ``calcs`` are the MEASURE-role calculated fields and ``dim_calcs`` the DIMENSION/row-level ones
@@ -3330,6 +3689,16 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
             table_calc_usages = extract_table_calc_usages(tds_text)
         except Exception:
             table_calc_usages = []
+    # Per-calc OUTER AGGREGATION from the workbook's pill tokens (``[max:Calculation_..:qk]``), so a
+    # parameter-driven row-level calc consumed under one aggregation rebuilds as a faithful AGGX
+    # measure (see ``translate_aggregated_param_row_calc``). Same auto-extract/override contract as
+    # ``table_calc_usages``: ``None`` -> auto-extract (``{}`` for a bare ``.tds`` -> byte-identical);
+    # a caller may pass a map explicitly. Guarded -- a parse hiccup never breaks the build.
+    if calc_outer_aggs is None:
+        try:
+            calc_outer_aggs = extract_calc_outer_aggs(tds_text)
+        except Exception:
+            calc_outer_aggs = {}
     result = assemble_import_model(descriptor, model_name=model_name,
                                    calcs=calcs, dim_calcs=dim_calcs, relationships=relationships,
                                    hierarchies=hierarchies, display_folders=display_folders,
@@ -3337,7 +3706,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                    mark_as_date=mark_as_date, flatfile_path=flatfile_path,
                                    calc_lookup=calc_lookup, approved_calc_dax=approved_calc_dax,
                                    date_range=date_range, parameters=parameters,
-                                   table_calc_usages=table_calc_usages)
+                                   table_calc_usages=table_calc_usages,
+                                   calc_outer_aggs=calc_outer_aggs)
     # Splice harvested Group/Bin calc columns onto their resolved home tables -- the same additive
     # pre-partition injection as dim_calcs (byte-for-byte unchanged when there are no groups/bins).
     harvest_parts = result.get("parts") if isinstance(result, dict) else None

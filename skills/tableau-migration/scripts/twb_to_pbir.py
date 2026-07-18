@@ -3814,8 +3814,15 @@ def _role_projections(fields, model_table, field_map, used_refs):
     for f in fields:
         if f.get("hierarchy"):
             out.extend(_hierarchy_level_projections(f, used_refs))
-        else:
-            out.append(_projection(f, model_table, field_map, used_refs))
+            continue
+        # A field that resolves to an EMPTY (or quotes-only) property -- e.g. a Tableau degenerate
+        # spacer calc named "" whose formula is the empty-string literal "" -- can only form a
+        # dangling ``Entity[""]`` reference, which errors the whole visual at render. Skip it: it
+        # never named a real column.
+        _e, _p, _b = _apply_override(f, model_table, field_map)
+        if not (_p or "").strip().strip("\"'").strip():
+            continue
+        out.append(_projection(f, model_table, field_map, used_refs))
     return out
 
 

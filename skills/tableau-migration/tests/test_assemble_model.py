@@ -32,6 +32,8 @@ from assemble_model import (
     _plan_source_suffix_renames,
     _apply_source_suffix_renames,
     _rename_relationship_endpoints,
+    translate_flag_gated_measure,
+    _split_if_then,
 )
 from calc_to_dax import translate_tableau_calc_to_dax
 from connection_to_m import parse_tds, combine_descriptors
@@ -2836,4 +2838,70 @@ def test_stage2_inline_without_dim_calc_measure_stays_stub():
     assert "[Date Filter Case]" in row["reason"]
     # the faithful inlined DAX must NOT appear anywhere in the emitted measures
     assert _CASES_INLINED_DAX not in out["parts"]["definition/tables/_Measures.tmdl"]
+
+
+# --- Shape 2: flag-gated inner measure (IF Max([Date Filter]) THEN [Measure] END) ---------------
+
+def _flag_gate_lookup():
+    # a date-window keep-flag measure, addressable by the boolean calc's caption AND internal id
+    return {"date filter case created date": "Date Filter Case Created Date Flag",
+            "calculation_dw": "Date Filter Case Created Date Flag"}
+
+
+def _measure_only_refs():
+    # the inner measure is referenced by caption and by internal id in different formulas
+    entry = ("New Inbound Referrals", "number")
+    return {"new inbound referrals": entry, "calculation_2222": entry}
+
+
+def test_split_if_then_variants():
+    assert _split_if_then("IF Max([X]) THEN [Y] END") == ("Max([X])", "[Y]", None)
+    assert _split_if_then("IIF(Max([X]), [Y], NULL)") == ("Max([X])", "[Y]", "NULL")
+    # a THEN/END token INSIDE a bracketed field name must not split
+    got = _split_if_then("IF Max([Trend END]) THEN [Y] END")
+    assert got == ("Max([Trend END])", "[Y]", None)
+    # ELSEIF chains are out of scope (return None -> caller stubs)
+    assert _split_if_then("IF a THEN b ELSEIF c THEN d END") is None
+    assert _split_if_then("SUM([Sales])") is None
+
+
+def test_flag_gated_measure_collapses_max_of_date_filter_to_flag():
+    dax, reason = translate_flag_gated_measure(
+        "IF Max([Date Filter Case Created Date]) THEN [New Inbound Referrals] END",
+        lambda name: None, _flag_gate_lookup(), measure_refs=_measure_only_refs())
+    assert reason == "ok"
+    assert dax == "IF([Date Filter Case Created Date Flag] = 1, [New Inbound Referrals])"
+
+
+def test_flag_gated_measure_resolves_inner_measure_by_internal_id():
+    # the boolean by internal id, the inner measure by internal id -- both must map
+    dax, reason = translate_flag_gated_measure(
+        "IF Max([Calculation_dw]) THEN [Calculation_2222] END",
+        lambda name: None, _flag_gate_lookup(), measure_refs=_measure_only_refs())
+    assert reason == "ok"
+    assert dax == "IF([Date Filter Case Created Date Flag] = 1, [New Inbound Referrals])"
+
+
+def test_flag_gated_measure_fails_closed_on_non_flag_condition_term():
+    # an extra non-flag comparison in the condition must NOT be guessed away -> stub
+    dax, reason = translate_flag_gated_measure(
+        "IF Max([Date Filter Case Created Date]) AND SUM([Sales]) > 0 THEN [New Inbound Referrals] END",
+        lambda name: None, _flag_gate_lookup(), measure_refs=_measure_only_refs())
+    assert dax is None
+    assert "non-flag" in reason
+
+
+def test_flag_gated_measure_fails_closed_when_flag_unknown():
+    dax, reason = translate_flag_gated_measure(
+        "IF Max([Some Other Boolean]) THEN [New Inbound Referrals] END",
+        lambda name: None, _flag_gate_lookup(), measure_refs=_measure_only_refs())
+    assert dax is None
+
+
+def test_flag_gated_measure_fails_closed_on_nonnull_else():
+    dax, reason = translate_flag_gated_measure(
+        "IF Max([Date Filter Case Created Date]) THEN [New Inbound Referrals] ELSE 0 END",
+        lambda name: None, _flag_gate_lookup(), measure_refs=_measure_only_refs())
+    assert dax is None
+    assert "ELSE" in reason
 

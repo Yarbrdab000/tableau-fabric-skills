@@ -2531,3 +2531,66 @@ def test_cross_table_fixed_lod_conditional_outer_spans_two_tables_stays_stub():
 
 
 
+
+
+# -- Shape 3: param-gated row-level FIXED-LOD measure via inline_calcs (SUMX default-SUM) -----------
+from calc_to_dax import translate_aggregated_param_row_calc as _agg_row  # noqa: E402
+
+_CASE_FIELDS = {
+    "Status": ("Cases", "Status", "string"),
+    "Created Date": ("Cases", "CreatedDate", "dateTime"),
+    "Closed Date": ("Cases", "ClosedDate", "dateTime"),
+    "Case ID": ("Cases", "Id", "string"),
+}
+
+
+def _case_resolver(caption):
+    return _CASE_FIELDS.get(caption)
+
+
+def _case_param_resolver(name):
+    return {"Start": ("[Start Value]", "date"), "End": ("[End Value]", "date")}.get((name or "").strip())
+
+
+_DATE_FILTER_BODY = "[Closed Date] >= [Parameters].[Start] AND [Closed Date] <= [Parameters].[End]"
+_SHAPE3_FORMULA = ('IF [Status] = "Closed" AND [date filter] THEN '
+                   "{FIXED [Case ID]:MIN(DATEDIFF('day',[Created Date],[Closed Date]))} END")
+
+
+def test_shape3_param_gated_lod_measure_via_inline_calc():
+    dax, reason, tables = _agg_row(
+        _SHAPE3_FORMULA, "SUM", _case_resolver, param_resolver=_case_param_resolver,
+        inline_calcs={"date filter": _DATE_FILTER_BODY})
+    assert reason == "ok"
+    assert tables == {"Cases"}
+    assert dax.startswith("SUMX('Cases', IF(")
+    # date window (slicer-reactive picker measures) inlined from the referenced boolean
+    assert "'Cases'[ClosedDate] >= [Start Value]" in dax
+    assert "'Cases'[ClosedDate] <= [End Value]" in dax
+    # the FIXED [Case ID] LOD kept its own per-case grain via ALLEXCEPT
+    assert "ALLEXCEPT('Cases', 'Cases'[Id])" in dax
+    assert "DATEDIFF('Cases'[CreatedDate], 'Cases'[ClosedDate], DAY)" in dax
+
+
+def test_shape3_fails_closed_without_inline_calcs():
+    # the boolean [date filter] cannot be expanded -> unresolved -> stub (never a guess)
+    dax, reason, tables = _agg_row(
+        _SHAPE3_FORMULA, "SUM", _case_resolver, param_resolver=_case_param_resolver)
+    assert dax is None
+
+
+def test_shape3_fails_closed_without_param_resolver():
+    dax, reason, tables = _agg_row(
+        _SHAPE3_FORMULA, "SUM", _case_resolver, param_resolver=None,
+        inline_calcs={"date filter": _DATE_FILTER_BODY})
+    assert dax is None
+    assert reason == "not a parameter-driven row calc"
+
+
+def test_agg_row_param_free_calc_stays_out_of_scope():
+    # a param-free / inline-free row calc must not be rescued here (byte-identical prior behaviour)
+    dax, reason, tables = _agg_row(
+        'IF [Status] = "Closed" THEN 1 END', "SUM", _case_resolver,
+        param_resolver=_case_param_resolver)
+    assert dax is None
+    assert reason == "not a parameter-driven row calc"

@@ -2596,7 +2596,7 @@ def translate_tableau_calc_to_dax_typed(formula, resolver, param_resolver=None, 
 
 
 def translate_tableau_calc_to_column_dax(formula, resolver, known_tables=None, column_refs=None,
-                                         relationships=None):
+                                         relationships=None, param_resolver=None, inline_calcs=None):
     """Translate a ROW-LEVEL Tableau calc to a DAX *calculated-column* expression.
 
     Companion to translate_tableau_calc_to_dax with the SAME public shape --
@@ -2626,15 +2626,25 @@ def translate_tableau_calc_to_column_dax(formula, resolver, known_tables=None, c
     ``relationships`` (the model's raw relationship list) enables the cross-table LOOKUPVALUE rewrite:
     a row-level calc referencing a foreign field is materialized on one home table when a unique,
     single-hop FK->PK home exists. Default None -> the prior cross-table stub.
+
+    ``param_resolver`` (name -> "[Measure]"|(ref,dtype)|None) | None: inlines a value/what-if
+    ``[Parameters].[X]`` as its ``[<Param> Value]`` picker measure -- valid HERE because a measure
+    reference inside row/iterator context reads the slicer selection under context transition. Default
+    None (every existing caller, incl. the row-level pre-router) -> ``[Parameters].[X]`` stays
+    "(unmodeled)" and the calc stubs, so output is byte-for-byte identical. This entry point is a
+    calculated-COLUMN emitter, so a param-referencing body it translates must be consumed by an
+    iterator wrapper (see ``translate_aggregated_param_row_calc``), never materialized as a static
+    calc column (a column's SELECTEDVALUE would freeze at refresh and ignore the slicer).
     """
     dax, reason, tables_used, _dtype = translate_tableau_calc_to_column_dax_typed(
         formula, resolver, known_tables=known_tables, column_refs=column_refs,
-        relationships=relationships)
+        relationships=relationships, param_resolver=param_resolver, inline_calcs=inline_calcs)
     return dax, reason, tables_used
 
 
 def translate_tableau_calc_to_column_dax_typed(formula, resolver, known_tables=None,
-                                               column_refs=None, relationships=None):
+                                               column_refs=None, relationships=None,
+                                               param_resolver=None, inline_calcs=None):
     """Like ``translate_tableau_calc_to_column_dax`` but also returns the result dtype as a 4th item.
 
     Returns ``(dax|None, reason, tables_used, dtype|None)``. The extra ``dtype`` ("number" /
@@ -2679,7 +2689,8 @@ def translate_tableau_calc_to_column_dax_typed(formula, resolver, known_tables=N
         # once and threaded into BOTH the initial parse and the LOOKUPVALUE re-parse below.
         adj = build_table_adjacency(relationships) if relationships else None
         dax, dtype = _Parser(toks, resolver, tables_used, mode="column",
-                             known_tables=known_tables, related_tables=adj).parse()
+                             known_tables=known_tables, related_tables=adj,
+                             param_resolver=param_resolver, inline_calcs=inline_calcs).parse()
         if len(tables_used) > 1:
             # Cross-table row-level calc. Try to materialize it as ONE calculated column on a single
             # home table by rewriting each foreign field as a LOOKUPVALUE (a faithful single-valued
@@ -2694,7 +2705,9 @@ def translate_tableau_calc_to_column_dax_typed(formula, resolver, known_tables=N
                     dax2, dtype2 = _Parser(_tokenize(f), resolver, tables2, mode="column",
                                            known_tables=known_tables,
                                            related_tables=adj,
-                                           related_wrap=related_wrap).parse()
+                                           related_wrap=related_wrap,
+                                           param_resolver=param_resolver,
+                                           inline_calcs=inline_calcs).parse()
                 except _CalcError:
                     dax2 = None
                 if dax2 is not None and tables2 == {home} and not validate_dax(dax2):
@@ -2706,6 +2719,70 @@ def translate_tableau_calc_to_column_dax_typed(formula, resolver, known_tables=N
         return dax, "ok", tables_used, dtype
     except _CalcError as e:
         return None, str(e), tables_used, None
+
+
+def translate_aggregated_param_row_calc(formula, agg, resolver, param_resolver=None,
+                                        known_tables=None, relationships=None, inline_calcs=None):
+    """Translate a PARAMETER-driven ROW-LEVEL calc consumed under one outer aggregation to a MEASURE.
+
+    The gap this closes: a Tableau calc that mixes a value/what-if ``[Parameters].[P]`` with a bare
+    row-level data column -- e.g. ``DATEDIFF('day', [Parameters].[Date Parameter], [Order Date])`` --
+    placed on a shelf with an aggregation (``[max:Calculation_..:qk]``). It stubs on BOTH existing
+    paths: measure mode rejects the bare ``[Order Date]`` ("not valid in a measure"); the row-level
+    pre-router refuses it because a parameter has no faithful *static calculated column* form
+    (``SELECTEDVALUE`` freezes at refresh). The faithful form is a measure that pushes the per-row
+    expression through the pill's aggregation as an X-iterator over the single fact table::
+
+        <AGG>X('<table>', <row-level-dax with [Parameters].[P] inlined as its [P Value] measure>)
+
+    The inlined ``[P Value]`` picker measure is constant across the iteration (its disconnected
+    slicer table ignores the fact's row context) yet slicer-reactive (it is read in the measure's
+    filter context), so every fact row sees the picked value and the whole measure recomputes on a
+    slicer change -- exactly the Tableau semantics.
+
+    ``inline_calcs`` extends this to a row calc that reaches a parameter INDIRECTLY -- an
+    ``IF <conds incl [Date Filter boolean]> THEN {FIXED [key]:MIN(<expr>)} END`` where ``[Date Filter
+    boolean]`` is a stubbed parameter-driven date-window dimension calc. The column translator inlines
+    that boolean's body (a ``[Parameters].[Start]<=[date]<=[Parameters].[End]`` predicate) row-level and
+    the whole IF becomes a per-row scalar that is BLANK for non-qualifying rows, so ``SUMX('T', <that
+    scalar>)`` faithfully reproduces Tableau's ``SUM(IF ... THEN {FIXED ...} END)`` -- the embedded
+    FIXED-LOD keeps its own ``CALCULATE(..., ALLEXCEPT('T','T'[key]))`` grain, so the row-invariance is
+    preserved with or without a unique key.
+
+    Returns ``(dax|None, reason, tables_used)``. ``None`` (caller keeps the inert stub) unless ALL
+    hold, so it is strictly additive and fail-closed:
+      * ``agg`` maps to an X-iterator in ``_AGG_X`` (SUM/AVG/MIN/MAX/MEDIAN/COUNT); COUNTD/PERCENTILE
+        have no faithful single-column iterator here -> fall back;
+      * a ``param_resolver`` is supplied AND the formula reaches a parameter -- directly (``[Parameters].``
+        in the text) OR indirectly through an ``inline_calcs`` boolean it references (a param-free calc
+        is out of scope and left to the existing measure/column routing, so output is byte-identical);
+      * the body translates in COLUMN mode (param + boolean inlined) to a SINGLE-table row expression
+        (0 or >1 tables -> nothing faithful to iterate -> fall back).
+    """
+    tables_used = set()
+    a = (agg or "").strip().upper()
+    itr = _AGG_X.get(a)
+    if not itr:
+        return None, f"outer aggregation {agg!r} has no faithful iterator", tables_used
+    low = (formula or "").lower()
+    reaches_param = "[parameters]" in low
+    if not reaches_param and inline_calcs:
+        reaches_param = any(("[" + str(k).lower() + "]") in low for k in inline_calcs)
+    if not param_resolver or not reaches_param:
+        return None, "not a parameter-driven row calc", tables_used
+    inner, reason, tables = translate_tableau_calc_to_column_dax(
+        formula, resolver, known_tables=known_tables, relationships=relationships,
+        param_resolver=param_resolver, inline_calcs=inline_calcs)
+    if inner is None:
+        return None, reason, tables
+    if len(tables) != 1:
+        return None, "aggregated param row calc must reference exactly one fact table", tables
+    table = next(iter(tables))
+    dax = f"{itr}({_dax_table(table)}, {inner})"
+    leak = validate_dax(dax)
+    if leak:
+        return None, f"emit guardrail: {leak}", tables
+    return dax, "ok", tables
 
 
 def _addressing_fact_guard(tables_used, required_facts):

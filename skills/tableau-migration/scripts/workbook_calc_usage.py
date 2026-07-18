@@ -417,6 +417,43 @@ def usage_from_file(path: str) -> dict:
     return workbook_calc_usage(load_workbook_xml(path))
 
 
+# Tableau field-instance token = ``[<derivation>:<column>:<pivot-suffix>]``. For an AGGREGATED pill
+# the derivation segment is the aggregation name (``[max:Calculation_123:qk]``); for a raw/date/none
+# pill it is a passthrough/date-truncation token (``none``/``md``/``tmn``/``tyr`` ...), which is NOT
+# an aggregation and is ignored here. Only these canonical aggregations map to a faithful single-column
+# DAX iterator (AGGX) downstream; COUNTD (``ctd``) and ATTR are intentionally omitted (no faithful
+# single-column iterator form), so a calc consumed only that way is left to stub.
+_CALC_AGG_TOKEN_RE = re.compile(r"\[([a-z]+):(Calculation_[0-9A-Za-z]+):[a-z]+\]")
+_TABLEAU_AGG_CANON = {
+    "sum": "SUM", "avg": "AVG", "min": "MIN", "max": "MAX", "median": "MEDIAN", "cnt": "COUNT",
+}
+
+
+def extract_calc_outer_aggs(xml_text: str) -> Dict[str, str]:
+    """``{calc_id_lower: AGG}`` for every calc consumed through ONE consistent outer aggregation.
+
+    Scans the workbook for pill tokens ``[<agg>:Calculation_<id>:<suffix>]`` and records the
+    canonical aggregation (``SUM``/``AVG``/``MIN``/``MAX``/``MEDIAN``/``COUNT``) each calc is placed
+    with. Fail-closed and deterministic:
+
+      * a calc placed with >1 DIFFERENT canonical aggregations is AMBIGUOUS -> omitted (the caller
+        keeps its stub rather than guessing which aggregation to iterate);
+      * a non-aggregating derivation (``none``/``md``/date truncations) or an unsupported aggregation
+        (``ctd`` COUNTD / ``attr``) is not counted, so a calc only ever used those ways is omitted.
+
+    The bare ``Calculation_<id>`` (lowercased, no brackets) is the same key the model build reports a
+    measure under, so a caller joins it to a calc via ``internal_name``. Returns ``{}`` for a workbook
+    with no aggregated calc pills (byte-identical downstream).
+    """
+    seen: Dict[str, set] = {}
+    for m in _CALC_AGG_TOKEN_RE.finditer(xml_text or ""):
+        agg = _TABLEAU_AGG_CANON.get(m.group(1))
+        if not agg:
+            continue
+        seen.setdefault(m.group(2).strip().lower(), set()).add(agg)
+    return {cid: next(iter(aggs)) for cid, aggs in seen.items() if len(aggs) == 1}
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv:

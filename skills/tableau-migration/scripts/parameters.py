@@ -490,18 +490,96 @@ def _safe_filename(name):
     return base + ".tmdl"
 
 
+def _canon_ws(s):
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+# A single null-relabel guard branch: ``ISNULL(<case-swap>) AND [Parameters].[X] = <lit>
+# THEN <string-literal>`` -- the shape Tableau authors wrap around a clean swap to give NULL
+# rows a per-selection caption. Both operand orders of the ``=`` are accepted.
+_NULL_LABEL_BRANCH = re.compile(
+    r"""(?isx)^\s*isnull\s*\(\s*(?P<case>case\s*\[Parameters\]\.\[[^\]]+\].*?\bend\b)\s*\)\s*
+        and\s*(?:
+            \[Parameters\]\.\[(?P<ctrlA>[^\]]+)\]\s*=\s*(?P<litA>"[^"]*"|'[^']*'|-?\d+(?:\.\d+)?)
+          | (?P<litB>"[^"]*"|'[^']*'|-?\d+(?:\.\d+)?)\s*=\s*\[Parameters\]\.\[(?P<ctrlB>[^\]]+)\]
+        )\s*\bthen\b\s*(?:"[^"]*"|'[^']*')\s*$""")
+
+_CASE_SWAP_RE = re.compile(r"(?is)case\s*\[Parameters\]\.\[[^\]]+\].*?\bend\b")
+
+
+def _reduce_null_labeled_swap(f):
+    """Reduce a NULL-labeled dimension-swap calc to its core ``CASE`` swap, else return ``f``.
+
+    Tableau users routinely wrap a clean field swap in per-selection NULL relabeling::
+
+        IF ISNULL(CASE [Parameters].[X] WHEN 1 THEN [A] ... END) AND [Parameters].[X] = 1
+            THEN "No A"
+        ELSEIF ISNULL(CASE ... END) AND [Parameters].[X] = 2 THEN "No B"
+        ...
+        ELSE CASE [Parameters].[X] WHEN 1 THEN [A] ... END
+        END
+
+    The ELSE branch is the true swap; every earlier branch only substitutes a caption for the
+    swapped field's NULL rows (cosmetic in Power BI, where a swapped column's blanks render as
+    blank). When the shape matches EXACTLY -- an ELSE that is a clean ``[Parameters]``-driven
+    ``CASE`` swap, and every earlier branch an ``ISNULL(<same swap>) AND [Parameters].[X] =
+    <lit> THEN <string-literal>`` relabel over that SAME controller/swap -- return the ELSE
+    swap so detection proceeds. Any deviation returns ``f`` unchanged (fail-closed)."""
+    if not f:
+        return f
+    low = f.lower()
+    if "isnull" not in low or "case" not in low or "then" not in low:
+        return f
+    norm = re.sub(r"(?is)\belse\s+if\b", "ELSEIF", f).strip()
+    if not re.match(r"(?is)^if\b", norm):
+        return f
+    cases = _CASE_SWAP_RE.findall(norm)
+    if not cases:
+        return f
+    cand = cases[0].strip()
+    sw = _detect_case_swap(cand, "dimension")
+    if not sw:
+        return f  # inner CASE is not a clean bare-field swap
+    ctrl = _canon_ws(sw["controller"])
+    cand_c = _canon_ws(cand)
+    if any(_canon_ws(c) != cand_c for c in cases):
+        return f  # every embedded swap must be byte-identical to the ELSE swap
+    body = re.sub(r"(?is)^if\b\s*", "", norm)
+    body = re.sub(r"(?is)\bend\b\s*$", "", body).strip()  # drop the outer IF's trailing END
+    segs = re.split(r"(?is)\belseif\b", body)
+    last = segs[-1]
+    else_parts = re.split(r"(?is)\belse\b", last)
+    if len(else_parts) != 2:
+        return f  # need exactly one ELSE (the true swap)
+    if _canon_ws(else_parts[1]) != cand_c:
+        return f  # ELSE body must be exactly the swap
+    guard_branches = [s for s in segs[:-1]] + [else_parts[0]]
+    for gb in guard_branches:
+        m = _NULL_LABEL_BRANCH.match(gb.strip())
+        if not m:
+            return f  # a non-else branch is not a pure NULL relabel -> not this shape
+        if _canon_ws(m.group("case")) != cand_c:
+            return f  # its ISNULL guard must wrap the SAME swap
+        gctrl = m.group("ctrlA") or m.group("ctrlB") or ""
+        if _canon_ws(gctrl) != ctrl:
+            return f  # relabel condition must test the SAME controller
+    return cand
+
+
 def detect_field_swap(formula, *, role="measure"):
     """Recognise a Tableau field-*swap* calc and return its structure, else ``None``.
 
     Returns ``{controller, branches:[{label, field, is_else?}], role, form}`` only when the
     formula is a clean ``[Parameters].[X]``-driven ``CASE`` or ``IF`` whose every branch is a
     BARE field reference (no arithmetic/extra tokens) and there are >= 2 branches. Keywords are
-    case-insensitive and a glued ``]END`` is tolerated. Anything else (arithmetic, nested calls,
-    a non-parameter controller) returns ``None`` so it falls through to normal calc translation.
+    case-insensitive and a glued ``]END`` is tolerated. A swap wrapped in per-selection NULL
+    relabeling (``IF ISNULL(<swap>) AND [Parameters].[X]=k THEN "caption" ... ELSE <swap> END``)
+    is reduced to its core swap first. Anything else (arithmetic, nested calls, a non-parameter
+    controller) returns ``None`` so it falls through to normal calc translation.
     """
     if not formula or not formula.strip():
         return None
-    f = formula.strip()
+    f = _reduce_null_labeled_swap(formula.strip())
     low = f.lower()
     if low.startswith("case"):
         return _detect_case_swap(f, role)

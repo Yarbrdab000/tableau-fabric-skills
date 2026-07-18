@@ -35,6 +35,7 @@ from twb_to_pbir import (
     _resolve_resource_bytes,
     _resolve_visual_flags,
     _resource_basename,
+    _role_projections,
     _tableau_filter_mode_to_pbi,
     _text_object_textbox_visual,
     _visual_json,
@@ -1216,6 +1217,32 @@ def test_apply_override_unstamped_column_still_takes_model_table_fallback():
     # so the fail-closed stamp changes nothing for a field with no manifest hit.
     fld = _ir_field("Widget", "column", entity="sqlproxy")
     assert _apply_override(fld, "Sheet1", {}) == ("Sheet1", "Widget", "column")
+
+
+def test_role_projections_skips_empty_and_quotes_only_spacer_fields():
+    # R2 render fix: a Tableau degenerate spacer calc named "" (formula "") resolves to an EMPTY
+    # property and could only form a dangling ``Entity[""]`` reference, which errors the whole
+    # visual at render. ``_role_projections`` skips such a field; real fields are unaffected.
+    used = set()
+    fields = [
+        _ir_field("Category", "column", prop="Category"),  # real column -> keeps its projection
+        _ir_field("", "column", prop=""),                  # empty-property spacer -> skipped
+        _ir_field("spacer", "column", prop='""'),          # quotes-only property -> skipped
+    ]
+    out = _role_projections(fields, "Orders", {}, used)
+    assert len(out) == 1
+    assert out[0]["queryRef"] == "Orders.Category"
+
+
+def test_role_projections_keeps_all_real_fields():
+    # zero-regression: a field list with no degenerate spacer emits one projection per field.
+    used = set()
+    fields = [
+        _ir_field("Category", "column", prop="Category"),
+        _ir_field("Region", "column", prop="Region"),
+    ]
+    out = _role_projections(fields, "Orders", {}, used)
+    assert [p["queryRef"] for p in out] == ["Orders.Category", "Orders.Region"]
 
 
 def test_caption_fallback_warning_cleared_when_field_map_confirms_binding():
