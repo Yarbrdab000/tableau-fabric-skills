@@ -4835,9 +4835,14 @@ def _apply_visual_calcs(ws, state, vc_index, model_table, field_map, warnings):
     * It is a no-op (``(None, None)``) when there is no quick calc for this worksheet, the emitter
       modules are unavailable, or the visual carries no base value projection to run the calc over.
 
-    Precedence: the model-level table-calc measure path is the first-class owner. If the base value
-    pill was rebound to a real model measure (``measure_rebound``), this yields so the two paths never
-    double-emit the same transform.
+    Precedence: the model-level table-calc measure path is the first-class owner of a **value**-role
+    calc. If the base value pill was rebound to a real model measure (``measure_rebound``), a
+    ``role == "value"`` calc yields so the two paths never double-emit the same shown transform. A
+    ``role == "color"`` calc does **not** yield when a SEPARATE base value pill (label / text) drives the
+    shown number and the colour is a distinct quick-calc DRIVER (e.g. a ``pcdf`` percent-difference over
+    that base): it survives the rebind and keeps colouring the cells from the (hidden) calc rather than
+    the raw rebound measure. It yields only when the colour pill IS the base (no label/text value), where
+    the rebound measure may already embody the transform and re-applying it would double-count.
 
     Cartesian charts (bar / column / line / area) are supported alongside tables/matrices: a chart
     carries its base measure on the ``Y`` role (not the matrix ``Values`` shelf) and its dimensions on
@@ -4882,8 +4887,18 @@ def _apply_visual_calcs(ws, state, vc_index, model_table, field_map, warnings):
     # Yield to the model measure path when the base pill was rebound to a real model measure (precedence).
     if not base_field or base_field.get("kind") != "value":
         return None, None
+    # A VALUE-role calc yields: the rebound model measure IS the shown transform and re-applying the
+    # quick calc would double-transform. A COLOUR-role calc is a distinct colour DRIVER (a view-only
+    # quick table calc such as a ``pcdf`` percent-difference) that runs over a SEPARATE base value pill
+    # (label / text), so it must survive the rebind and keep colouring the cells -- yielding here dropped
+    # the Visual Calculation in the final rebind pass, leaving the heat scale bound to the RAW rebound
+    # measure instead of the percent-difference Tableau colours by. It yields ONLY when the colour pill
+    # IS the base (no separate label/text value): then the rebound measure may already embody the
+    # transform, so re-applying the quick calc would double it -- defer to the model-measure fill.
     if base_field.get("measure_rebound"):
-        return None, None
+        _color_is_base = base_field is ws["encodings"].get("color")
+        if role == "value" or _color_is_base:
+            return None, None
     _, base_qref, base_nref = _field_expression(base_field, model_table, field_map)
     base_proj = next((p for p in values if p.get("queryRef") == base_qref), None)
     if base_proj is None:

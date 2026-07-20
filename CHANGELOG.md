@@ -13,7 +13,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration (skill `1.82.0` → `1.83.0`): Reconstruct Tableau's automatic default continuous
+- **tableau-migration (skill `1.83.0` → `1.84.0`): Preserve a color-role visual calculation through the
+  report rebind pass so the heat map colors by the percent-difference calc, not the raw rebound measure.**
+  On the *Simple Example* workbook (Test Dashboard 2) the **Measure Swap Heat Map** colored correctly in
+  the first pass (the `Percent Difference` `NativeVisualCalculation`, hidden, drove `backColor` via
+  `SelectRef "select"`) but the **final** two-pass PBIP dropped the visual calc and tinted cells by the
+  raw `Measure Swap Calc 2` model measure. Root cause (verified against both passes of a real run):
+  `_apply_visual_calcs` (`twb_to_pbir.py`) yielded `(None, None)` on **any** `measure_rebound` base,
+  which in the rebind pass is `True` for the color-role base — so the color driver was discarded and
+  `_conditional_format` recolored by the plain rebound measure. Fix (additive): the yield now fires only
+  for a **value**-role calc (where the rebound model measure already *is* the shown transform, so
+  re-applying would double-count) or when the color pill **is** the base value pill (no separate
+  label/text). When a *separate* base value pill drives the shown number and the color is a distinct
+  quick-calc driver (a `pcdf` percent-difference over that base), the visual calc **survives** the rebind
+  and keeps coloring the cells from the hidden calc. +2 regressions (color-role VC survives the rebind;
+  color-pill-is-base still yields). Default emit path byte-identical when no color-role calc rebinds.
   color palette so a measure on the Color shelf is no longer silently dropped.** On the *Simple Example*
   workbook (Test Dashboard 2) the **Scatter** (colored by *Profit Ratio*) rendered plain blue and the
   **Measure Swap Heat Map** rendered as a plain table — both because the author kept Tableau's

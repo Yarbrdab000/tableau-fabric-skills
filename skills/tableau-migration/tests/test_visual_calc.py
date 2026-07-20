@@ -520,6 +520,50 @@ def test_apply_visual_calcs_color_role_keeps_base_and_drives_backcolor():
     assert fact["backColor"]["target"] == "_Measures.Count Orders"
 
 
+def test_apply_visual_calcs_color_role_survives_measure_rebind():
+    # v1.84.0 regression (Simple Example / Test Dashboard 2 heat map): a colour-role view-only quick calc
+    # runs over a SEPARATE base value pill (text) that the model<->viz contract rebound to a real model
+    # measure (measure_rebound). The Visual Calculation must SURVIVE the rebind pass and keep driving the
+    # backColor from the (hidden) calc -- yielding here dropped it in the final pass and left the heat
+    # scale bound to the raw rebound measure instead of the percent-difference Tableau colours by.
+    base = _base_measure_field()
+    base["measure_rebound"] = True                        # the shown value pill rebound to a model measure
+    colour_pill = {"kind": "value", "instance": "pcdf:usr:x:qk"}   # a DISTINCT colour driver
+    ws = {"name": "WS", "encodings": {"color": colour_pill, "label": None, "text": base},
+          "color_gradient": {"colors": ["#f28e2b", "#4e79a7"]}}
+    state, base_proj = _matrix_state()
+    warnings = []
+    value_objects, fact = _apply_visual_calcs(
+        ws, state, {"WS": [_usage(calc_type="CumTotal", level_break=None)]},
+        None, None, warnings)
+
+    assert fact is not None and fact["status"] == "emitted"      # NOT yielded away by the rebind
+    assert fact["role"] == "color"
+    assert "hidden" not in base_proj                             # the shown base stays visible ...
+    assert state["Values"]["projections"][1]["hidden"] is True   # ... the calc is hidden, drives fill
+    fill_input = (value_objects[0]["properties"]["backColor"]["solid"]["color"]["expr"]
+                  ["FillRule"]["Input"]["SelectRef"]["ExpressionName"])
+    assert fill_input == "select"                                # coloured by the calc, not the raw measure
+    assert fact["backColor"]["driver"] == "select"
+
+
+def test_apply_visual_calcs_color_pill_is_rebound_base_yields():
+    # The guard's other arm: when the colour pill IS the only value pill (no separate label / text) and it
+    # was rebound to a model measure, that measure may already embody the transform, so the quick calc
+    # yields -- the model-measure conditional format owns the fill and re-applying would double-count.
+    base = _base_measure_field()
+    base["measure_rebound"] = True
+    ws = {"name": "WS", "encodings": {"color": base, "label": None, "text": None},
+          "color_gradient": {"colors": ["#f28e2b", "#4e79a7"]}}
+    state, _ = _matrix_state()
+    warnings = []
+    result = _apply_visual_calcs(
+        ws, state, {"WS": [_usage(calc_type="CumTotal", level_break=None)]},
+        None, None, warnings)
+
+    assert result == (None, None)                                # yields to the model-measure fill path
+
+
 def test_apply_visual_calcs_value_role_with_gradient_drives_backcolor():
     # A value-role table that also carries a continuous colour scale tints its shown calc column: the
     # base stays hidden and the (visible) calc drives the backColor FillRule -- mirroring the oracle,
