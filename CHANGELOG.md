@@ -13,6 +13,20 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.76.0` → `1.77.0`): Runbook input step now tells a driving agent that an
+  already-attached Tableau file IS the input — stops the filesystem scavenger-hunt / mode-confusion
+  drift. A real VS Code run failed not in code but in the runbook: given an attached `.twbx`, the agent
+  treated it as a file to "find" on disk, searched the working directory (which ships no user file),
+  wasted turns, and conflated a workbook with a datasource-only migration. The words "attach"/
+  "attachment" appeared nowhere in `SKILL.md`, the D1=B step only said "drop the exported files into
+  `.\in`", and the older "Locate the Datasource FIRST" block even said to "extract the inner
+  `.tds`/`.twb` first" — contradicting the hard **never-unzip** gate. The D1=B step now states the
+  attached/handed file is the input (copy it verbatim into `.\in`, go straight to STEP 1.5), that you
+  must **not** search the repo/disk for it (ask for a path instead of scavenging), that you **never
+  unzip** a packaged `.tdsx`/`.twbx`, and that the **file extension alone decides the mode**
+  (`.twb`/`.twbx` → workbook = report + model; `.tds`/`.tdsx` → datasource = model only) with no
+  hand-classification. The reference "(A) Local file" bullet is corrected to use the attached file
+  directly and stop instructing an unzip. Prose-only, additive — no script, schema, or flag change.**
 - **tableau-migration (skill `1.75.0` → `1.76.0`): Visuals whose Y/Values used a parameter-driven
   measure keep that measure when the model remodels it as a field parameter. When a Tableau
   parameter-switched measure calc (e.g. the "Twitter Sentiment Analysis – Scatter Plot" `Metric`,

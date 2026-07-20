@@ -222,10 +222,19 @@ Every name in D2 scope — datasource **or** workbook — is fetched the same wa
 `--include-extract`. You do **not** classify sources, choose per-source flags, or decide
 embedded-vs-published; STEP 2 auto-detects all of that.
 
-- **D1=B (local):** drop the exported files into `.\in` (`.tds`/`.tdsx` **datasources** and/or
-  `.twb`/`.twbx` **workbooks**; export the **packaged** `.tdsx`/`.twbx` so any extract/flat-file data
-  travels inside). A packaged export and its unpacked twin of the **same stem** (`Sales.tdsx` +
-  `Sales.tds`) count as **one** asset — dropping both is safe. Go to STEP 2.
+- **D1=B (local):** **the file(s) the user already attached / handed you ARE the inputs — copy them
+  verbatim into `.\in`, then go straight to STEP 1.5.** Do **not** search the repo, working directory,
+  or disk for a workbook (the installed skill folder ships **no** user file, so a filesystem scan finds
+  nothing and only wastes turns); if you were given an attachment but have no path to copy, **ASK the
+  user for the path — never scavenge.** Copy the exported files in **as-is** (`.tds`/`.tdsx`
+  **datasources** and/or `.twb`/`.twbx` **workbooks**) — **never unzip** a packaged `.tdsx`/`.twbx`;
+  STEP 2 ingests packaged files directly and the packaging carries any extract/flat-file data inside.
+  The **file extension alone decides the mode, and you never hand-classify beyond it**: `.twb`/`.twbx`
+  → a **workbook** run (report **and** model rebuilt together — the report is a required output);
+  `.tds`/`.tdsx` → a **datasource** run (model only). Never treat a `.twbx` as datasource-only or go
+  looking for a separate datasource to migrate instead of it. A packaged export and its unpacked twin
+  of the **same stem** (`Sales.tdsx` + `Sales.tds`) count as **one** asset — dropping both is safe.
+  Go to STEP 1.5 (scan).
 - **D1=A (live):** run this block exactly — fill the two name lists from D2 scope (leave a list empty
   if that kind isn't in scope):
 
@@ -427,7 +436,7 @@ and visual *formatting* (specific colors, fonts, legends, conditional formats). 
 
 > **The datasource to migrate is supplied by the user. Do NOT assume it lives in the current repo or working directory.** This skill is the migration *toolkit*, not a datasource — a fresh checkout contains no `.tds`. Do **not** search the working directory, find nothing, and stall. Before any other phase, establish the input by asking the user which route applies:
 >
-> - **(A) Local file** *(simplest — no Tableau credentials)* — the user has a Tableau file. Ask for the path to a `.tds`, `.tdsx`, `.twb`, or `.twbx`. `.tdsx`/`.twbx` are zips: extract the inner `.tds`/`.twb` first. Always read with `encoding="utf-8-sig"` (the files carry a UTF-8 BOM).
+> - **(A) Local file** *(simplest — no Tableau credentials)* — the user has (almost always **already attached**) a Tableau file. Use the attached / named file **directly** — do **not** search the repo or working directory for it, and do **not** unzip a `.tdsx`/`.twbx`; the bundled scripts (`migrate_estate.py` / `migrate_workbook`) ingest packaged files as-is. The extension decides the mode: `.twb`/`.twbx` → **workbook** (report + model), `.tds`/`.tdsx` → **datasource** (model only) — never conflate the two. If you must *read* the inner XML for inspection, open the package in memory with `encoding="utf-8-sig"` (the files carry a UTF-8 BOM) — but that is never a required migration step.
 > - **(B) Live published datasource** — the user names a datasource published on Tableau Server / Cloud (a *name*, not a file path). Pull it down first with the **`tableau-datasource-profiler`** skill (or the Tableau **Download Data Source** REST API + Metadata API) using a PAT or Connected-App JWT; that yields the `.tds` this skill consumes, plus field/lineage metadata and reconciliation values.
 >
 > If the user just says "migrate my Tableau datasource" without specifying, **ask which route** (file path vs. published-datasource name + Tableau connection) rather than guessing. Once you hold the `.tds`, continue to the Migration Phases below.
