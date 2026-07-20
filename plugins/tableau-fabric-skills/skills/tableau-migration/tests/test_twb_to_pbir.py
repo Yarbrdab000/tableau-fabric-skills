@@ -4512,15 +4512,25 @@ def test_emitted_conditional_format_fact_recorded_on_candidate_record():
     assert fact["target"] == "Sum(Orders.Sales_Amount)"
 
 
-def test_matrix_without_colour_gradient_emits_no_conditional_format():
-    # Additivity: a plain highlight-table matrix (no <style> colour scale) carries no backColor
-    # conditional-format fill (only the additive compact-grid font) and no conditional_format fact.
+def test_matrix_bare_continuous_colour_emits_automatic_default_heat_scale():
+    # A highlight-table matrix whose Color shelf holds a continuous MEASURE but whose FORMAT <style>
+    # carries no explicit <color-palette> uses Tableau's AUTOMATIC default continuous ramp. It is now
+    # reconstructed as a DISCLOSED default diverging heat scale (orange .. grey@0 .. blue) instead of
+    # being silently dropped -- the fact is recorded with default_palette True and a disclosure warns.
     enc = "<encodings><color column='[federated.abc].[sum:Sales:qk]' /></encodings>"
     res = migrate_twb_to_pbir(_workbook(
         _heat_ws("Heat", color_field="sum:Sales:qk", encodings=enc, style="")))
     vj = list(_visual_parts(res["parts"]).values())[0]
-    assert _values_backcolor(vj) is None
-    assert _cf_fact(res["candidate_records"], "Heat") is None
+    bc = _values_backcolor(vj)
+    assert bc is not None
+    grad = bc["solid"]["color"]["expr"]["FillRule"]["FillRule"]["linearGradient3"]
+    assert grad["min"]["color"]["Literal"]["Value"] == "'#f28e2b'"
+    assert grad["mid"]["value"]["Literal"]["Value"] == "0.0D"
+    assert grad["max"]["color"]["Literal"]["Value"] == "'#4e79a7'"
+    fact = _cf_fact(res["candidate_records"], "Heat")
+    assert fact["status"] == "emitted"
+    assert fact["default_palette"] is True
+    assert any("default continuous palette" in w["reason"] for w in res["warnings"])
 
 
 def test_categorical_colour_legend_is_not_a_gradient():
@@ -5023,6 +5033,29 @@ def test_continuous_colour_scatter_emits_datapoint_fill():
     vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
     assert vj["visual"]["visualType"] == "scatterChart"
     assert _chart_fill_rule(vj) is not None
+
+
+def test_scatter_bare_continuous_colour_emits_automatic_default_fill():
+    # The Test Dashboard 2 headline: a scatter whose Color shelf holds a continuous measure but whose
+    # worksheet <style> is empty (Tableau's AUTOMATIC default palette). It now emits a DISCLOSED default
+    # diverging dataPoint fill (orange .. grey@0 .. blue) instead of dropping the colour channel.
+    enc = ("<encodings><lod column='[federated.abc].[none:Category:nk]' />"
+           "<color column='[federated.abc].[sum:Sales:qk]' /></encodings>")
+    ws = _worksheet("Auto Scatter", "Circle",
+                    rows="[federated.abc].[sum:Profit:qk]",
+                    cols="[federated.abc].[sum:Sales:qk]",
+                    deps_extra=_INST, encodings=enc, style="")
+    res = migrate_twb_to_pbir(_workbook(ws))
+    vj = list(_visual_parts(res["parts"]).values())[0]
+    assert vj["visual"]["visualType"] == "scatterChart"
+    fr = _chart_fill_rule(vj)
+    assert fr is not None
+    grad = fr["properties"]["fill"]["solid"]["color"]["expr"]["FillRule"]["FillRule"]["linearGradient3"]
+    assert grad["min"]["color"]["Literal"]["Value"] == "'#f28e2b'"
+    assert grad["mid"]["value"]["Literal"]["Value"] == "0.0D"
+    assert grad["max"]["color"]["Literal"]["Value"] == "'#4e79a7'"
+    rec = next(r for r in res["candidate_records"] if r["worksheet"] == "Auto Scatter")
+    assert rec["chart_continuous_fill"]["default_palette"] is True
 
 
 def test_continuous_colour_sequential_emits_lineargradient2():

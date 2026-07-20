@@ -13,6 +13,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.82.0` → `1.83.0`): Reconstruct Tableau's automatic default continuous
+  color palette so a measure on the Color shelf is no longer silently dropped.** On the *Simple Example*
+  workbook (Test Dashboard 2) the **Scatter** (colored by *Profit Ratio*) rendered plain blue and the
+  **Measure Swap Heat Map** rendered as a plain table — both because the author kept Tableau's
+  *Automatic* palette, so the worksheet FORMAT `<style>` block carries **no** `<color-palette>` and
+  `_parse_color_gradient` returned `None`, causing every color emit path (`_chart_continuous_fill`
+  dataPoint fill, `_conditional_format` matrix `backColor`, and the Visual-Calculation heat scale) to
+  early-return with no fill and no warning. Root cause (verified against the real worksheet XML): the
+  color *field* is parsed independently into the mark `<encodings>`; only the gradient *spec* was
+  missing. Fix (`twb_to_pbir.py`, additive): when no explicit palette is found **and** a continuous
+  measure sits on the Color shelf, synthesize Tableau's documented automatic default — a **diverging
+  orange → grey\@0 → blue** ramp centered at zero — via the new `_automatic_color_gradient`, flagged
+  `default_palette`/`automatic_default` and **disclosed** (never-wrong warning). It feeds the identical
+  emit paths, so the Scatter now emits a `dataPoint.fill` `linearGradient3` and the Heat Map a
+  `values.backColor`, both reading the color pill's `instance` token so a quick-table-calc color driver
+  (e.g. a `pcdf` percent-difference) is still recognized downstream. Byte-identical when a palette is
+  explicit, when the Color shelf holds a dimension/categorical legend, or when no color pill is present.
+  Two regression tests updated/added (matrix + scatter bare-continuous-color automatic default);
+  suite 2772 passed / 3 skipped / 1 xfailed.
 - **tableau-migration (skill `1.81.0` → `1.82.0`): Emit a slicer for dimension/measure-SWAP field
   parameters so a dashboard's swap control is rebuilt, not dropped.** A real run of the *Simple
   Example* workbook (Test Dashboard 2, which hosts four parameter controls — *Dim Swap*, *Dim

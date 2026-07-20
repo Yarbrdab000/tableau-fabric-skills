@@ -2478,6 +2478,49 @@ def _default_continuous_gradient(enc):
     }
 
 
+# Tableau's AUTOMATIC continuous colour ramp: when a MEASURE is dropped on the Color shelf and the
+# author leaves the palette on "Automatic", the worksheet carries the colour ENCODING
+# (``<encodings><color column=.../>``) but the FORMAT ``<style>`` block holds NO ``<color-palette>``
+# and NO min/max/center -- an empty or format-only style. ``_parse_color_gradient`` (which reads only
+# the style cascade) therefore returns ``None`` and the colour channel is dropped silently even though
+# a continuous measure is unambiguously colour-encoded. Tableau renders that automatic default as an
+# ORANGE-BLUE DIVERGING ramp centred at zero (orange for negatives, blue for positives) that collapses
+# to a single hue when the data does not cross zero -- documented Tableau behaviour, render-verified.
+# Pinning the synthesised centre at literal 0 lets Power BI's own domain computation reproduce that
+# adaptive behaviour without the workbook carrying a data range: signed data renders diverging about 0,
+# one-signed data renders the single relevant half (neutral -> blue, or orange -> neutral). The hues
+# are the Tableau-10 orange / blue anchors already used for named-palette reconstruction; the middle is
+# Tableau-10 grey. DISCLOSED via ``default_palette`` (warn-never-wrong). Provenance: original work --
+# the reference tool cyphou/Tableau-To-PowerBI keys all colour handling on an explicit ``<color-palette>``
+# and has no automatic-default synthesis, so this path is entirely ours.
+_TABLEAU_AUTO_NEG = _NAMED_HUE_STOPS["orange"]
+_TABLEAU_AUTO_POS = _NAMED_HUE_STOPS["blue"]
+
+
+def _automatic_color_gradient(color_enc):
+    """Synthesise Tableau's automatic default continuous ramp for a MEASURE on the Color shelf that
+    carries no explicit ``<style>`` palette.
+
+    ``color_enc`` is the resolved colour ENCODING (from ``_parse_encodings``); the caller only invokes
+    this for a continuous measure (``kind == "value"`` with an ``aggregation`` / ``measure`` binding).
+    Returns a gradient spec shaped exactly like ``_parse_color_gradient`` -- a DIVERGING orange-blue
+    ramp centred at zero, flagged ``default_palette`` (and ``automatic_default``) for disclosure. The
+    ``is_table_calc`` flag is read from the colour pill's instance token so a quick-table-calc colour
+    driver (e.g. a ``pcdf`` percent-difference heat scale) is still recognised downstream and lit up
+    through the Visual-Calculation path rather than mis-bound to a base measure."""
+    inst = color_enc.get("instance") or ""
+    return {
+        "field_token": inst,
+        "center": 0.0,
+        "palette_type": "ordered-diverging",
+        "colors": [_TABLEAU_AUTO_NEG, _NAMED_NEUTRAL_MID, _TABLEAU_AUTO_POS],
+        "interpolated": True,
+        "is_table_calc": _instance_is_table_calc(inst),
+        "default_palette": True,
+        "automatic_default": True,
+    }
+
+
 def _parse_color_gradient(table):
     """Extract a continuous background colour-scale spec from a worksheet's mark colour encoding.
 
@@ -3123,6 +3166,16 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     if visual_type in (VT_MATRIX, VT_TABLE, VT_COLUMN, VT_BAR, VT_LINE,
                        VT_AREA, VT_SCATTER, VT_COMBO):
         color_gradient = _parse_color_gradient(table)
+        if color_gradient is None:
+            # No explicit ``<color-palette>`` in the worksheet FORMAT style, but a continuous MEASURE
+            # sits on the Color shelf (an "Automatic" palette). Synthesise Tableau's automatic default
+            # continuous ramp so the colour channel is reconstructed and DISCLOSED rather than silently
+            # dropped -- feeding the identical emit paths (chart ``dataPoint.fill`` / matrix
+            # ``backColor``, incl. the Visual-Calculation-driven heat scale) as an explicit palette.
+            _color_enc_g = encodings.get("color")
+            if (_color_enc_g and _color_enc_g.get("kind") == "value"
+                    and _color_enc_g.get("binding") in ("aggregation", "measure")):
+                color_gradient = _automatic_color_gradient(_color_enc_g)
 
     # Explicit categorical mark-colour palette (author member -> hex). Parsed here (additive IR key)
     # and turned into PBIR dataPoint per-member fills at emit time -- faithful-or-warn, so a palette
