@@ -39,6 +39,7 @@ from twb_to_pbir import (
     _resource_basename,
     _role_projections,
     _tableau_filter_mode_to_pbi,
+    _tableau_param_control_mode_to_pbi,
     _text_object_textbox_visual,
     _visual_json,
     _zone_background_fill2,
@@ -2832,8 +2833,9 @@ def test_lone_param_gated_sheet_is_not_a_swap_group():
 
 
 # -- dashboard parameter controls (hamburger filters): structural capture + honest warning ----
-def _paramctrl_zone(pid, x=78833, y=9500):
-    return (f"<zone h='9333' w='16000' x='{x}' y='{y}' type-v2='paramctrl' "
+def _paramctrl_zone(pid, x=78833, y=9500, mode=None):
+    mode_attr = f"mode='{mode}' " if mode else ""
+    return (f"<zone h='9333' w='16000' x='{x}' y='{y}' {mode_attr}type-v2='paramctrl' "
             f"param='[Parameters].[{pid}]' id='9' />")
 
 
@@ -2989,6 +2991,60 @@ def test_migrate_twb_to_pbir_accepts_param_binding_and_places_slicer_in_dashboar
     pos = v["position"]
     assert 0 <= pos["x"] <= PAGE_WIDTH and 0 <= pos["y"] <= PAGE_HEIGHT
     assert pos["x"] > PAGE_WIDTH / 2  # the control was on the right (x=80000 of 100000)
+
+
+def test_tableau_param_control_mode_maps_to_pbi_slicer_mode():
+    # A Tableau parameter control's ``mode`` decides the slicer face: ``compact`` (Tableau's default
+    # single-select presentation) and type-in pickers are DROPDOWNS; ``radio`` / ``slider`` are the
+    # in-place List. An absent mode defaults to Dropdown -- compact is Tableau's own default, so an
+    # unread control still rebuilds as a dropdown rather than Power BI's default vertical button list.
+    assert _tableau_param_control_mode_to_pbi("compact") == "Dropdown"
+    assert _tableau_param_control_mode_to_pbi("typein") == "Dropdown"
+    assert _tableau_param_control_mode_to_pbi("radio") == "Basic"
+    assert _tableau_param_control_mode_to_pbi("slider") == "Basic"
+    assert _tableau_param_control_mode_to_pbi(None) == "Dropdown"
+
+
+def test_compact_parameter_control_slicer_emits_dropdown_mode():
+    # A resolved parameter control authored ``mode='compact'`` (a dropdown in Tableau) must emit a
+    # slicer with an explicit ``objects.data`` mode of 'Dropdown' -- without it Power BI renders its
+    # default vertical List (a stack of buttons), which is exactly the regression this guards.
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Dash'><zones>"
+            "<zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='60000' x='0' y='0' name='Sales by Category' id='2' />"
+            + _paramctrl_zone("Parameter 1", mode="compact") +
+            "</zone></zones></dashboard>")
+    pb = {"slicers": {"[Parameter 1]": {"table": "Orders", "column": "Segment",
+                                        "single_select": True, "caption": "view swap"}},
+          "flags": {}}
+    parts = _visual_parts(emit_pbir(parse_twb(_workbook_with_params(ws, dash), param_binding=pb)))
+    slicers = [v for v in parts.values() if v["visual"]["visualType"] == "slicer"]
+    assert len(slicers) == 1
+    assert _slicer_show_mode(slicers[0]) == "'Dropdown'"
+
+
+def test_radio_parameter_control_slicer_emits_basic_list_mode():
+    # A parameter control authored ``mode='radio'`` is an in-place radio LIST -> the slicer's List
+    # ('Basic') rendering, not a dropdown (faithful to the source control style).
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Dash'><zones>"
+            "<zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='60000' x='0' y='0' name='Sales by Category' id='2' />"
+            + _paramctrl_zone("Parameter 1", mode="radio") +
+            "</zone></zones></dashboard>")
+    pb = {"slicers": {"[Parameter 1]": {"table": "Orders", "column": "Segment",
+                                        "single_select": True, "caption": "view swap"}},
+          "flags": {}}
+    parts = _visual_parts(emit_pbir(parse_twb(_workbook_with_params(ws, dash), param_binding=pb)))
+    slicers = [v for v in parts.values() if v["visual"]["visualType"] == "slicer"]
+    assert len(slicers) == 1
+    assert _slicer_show_mode(slicers[0]) == "'Basic'"
+
 
 
 # -- model keep-flag -> visual-level measure filter (param_binding["flags"]) ---

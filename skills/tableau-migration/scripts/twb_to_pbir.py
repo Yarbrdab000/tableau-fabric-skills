@@ -3509,7 +3509,8 @@ def _parse_dashboard(db, worksheet_names, warnings):
             pid = _param_control_ref(zone.get("param") or "")
             if pid and pid not in seen_params and None not in (x, y, w, h):
                 seen_params.add(pid)
-                param_controls.append({"param_id": pid, "x": x, "y": y, "w": w, "h": h})
+                param_controls.append({"param_id": pid, "x": x, "y": y, "w": w, "h": h,
+                                       "mode": zone.get("mode")})
             continue
         # A dashboard IMAGE object: either a straight bitmap (``type-v2='bitmap'`` with
         # ``param='Image/..png'`` -- e.g. the corner logo) or an image BUTTON
@@ -3619,6 +3620,7 @@ def _resolve_parameter_controls(dashboards, params, warnings, param_binding=None
                 "dashboard": db.get("name"),
                 "position": {"x": pc.get("x"), "y": pc.get("y"),
                              "w": pc.get("w"), "h": pc.get("h")},
+                "mode": pc.get("mode"),
             }
             bound = slicers.get(_norm_param_key(pid))
             if bound:
@@ -6030,6 +6032,27 @@ def _tableau_filter_mode_to_pbi(mode):
     return "Dropdown"
 
 
+# -- Tableau PARAMETER-control show mode -> Power BI slicer mode ---------------
+# A dashboard parameter control is authored with its own ``mode``, a DIFFERENT vocabulary from a
+# filter card: ``compact`` is the collapsed DROPDOWN (Tableau's default single-select parameter
+# presentation) and ``typein`` / ``typeinlist`` are type-in pickers (still a single-value
+# dropdown-family control), whereas ``radio`` is an in-place radio LIST and ``slider`` is a value
+# slider (no Power BI slicer equivalent -> the in-place List reads closest). Map dropdown-family
+# modes to ``'Dropdown'`` and radio/slider to ``'Basic'``, defaulting to ``'Dropdown'`` -- ``compact``
+# is the overwhelmingly common parameter-control style AND matches Tableau's default, so a control
+# whose mode we could not read still rebuilds as the compact dropdown a top control band needs
+# (rather than Power BI's default vertical List, which reads as a stack of buttons). The Power BI
+# mode names are unprotectable PBIR-schema interop facts.
+_LIST_PARAM_MODES = frozenset({"radio", "radiolist", "slider", "checklist"})
+
+
+def _tableau_param_control_mode_to_pbi(mode):
+    m = (mode or "").strip().lower()
+    if m in _LIST_PARAM_MODES:
+        return "Basic"
+    return "Dropdown"
+
+
 def _apply_slicer_format(visual, hdr_style=None, itm_style=None, plate_fill=None):
     """Stamp the resolved Tableau quick-filter style onto an already-built slicer visual.
 
@@ -7075,9 +7098,14 @@ def _emit_param_control_slicers(controls, db_name, page_name, ref_w, ref_h, warn
                  "caption": res.get("caption") or res["column"], "aggregation": None,
                  "selection": None, "range": None, "datatype": None}
         vname = _sanitize(f"paramslicer-{page_name}-{i}-{res['column']}")
+        # A Tableau parameter control is a single-value picker; its ``mode`` (``compact`` -> dropdown)
+        # decides the slicer face. Without an explicit mode Power BI renders its default vertical
+        # List (a stack of buttons), which does not read as the dropdown the source control is --
+        # so map the captured mode (defaulting to the compact Dropdown Tableau itself defaults to).
+        slicer_mode = _tableau_param_control_mode_to_pbi(pc.get("mode"))
         visuals.append(_slicer_json(
             vname, field, _position(x, y, w, h, z=1, tab=200 + i),
-            None, None, warnings=warnings))
+            None, None, mode=slicer_mode, warnings=warnings))
     return visuals
 
 

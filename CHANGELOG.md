@@ -13,6 +13,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.85.0` → `1.86.0`): Parameter-control slicers rebuild as dropdowns —
+  a Tableau dashboard parameter control authored as a compact dropdown now emits a Power BI slicer in
+  Dropdown mode instead of Power BI's default vertical List (a stack of buttons).** On the *Simple
+  Example* / *Test Dashboard 2* workbook the four swap controls (Dim Swap, Dim Swap 2, Measure Swap,
+  Measure Swap 2) are all `type-v2='paramctrl'` with `mode='compact'` (Tableau's collapsed dropdown
+  presentation), but the emitter dropped the `mode` attribute during the dashboard scan, so the
+  resulting slicers carried no `objects.data` mode and Power BI fell back to its List rendering. The
+  paramctrl scan now captures `mode`, `_resolve_parameter_controls` carries it on the record, and
+  `_emit_param_control_slicers` maps it through a new `_tableau_param_control_mode_to_pbi` (dropdown
+  family — `compact`/`typein`/absent — → `Dropdown`; `radio`/`radiolist`/`slider`/`checklist` →
+  `Basic`/List) and threads it into `_slicer_json`. Verified on the real workbook: all four
+  `paramslicer-*` on Test Dashboard 2 now emit `objects.data[0].properties.mode` = `Dropdown`. Purely
+  additive (adds an `objects.data.mode` object to param slicers; a control whose mode cannot be read
+  still defaults to the compact Dropdown Tableau itself defaults to). +3 tests (mode mapper unit;
+  `compact`→Dropdown and `radio`→Basic slicer end-to-end) plus the `_paramctrl_zone` test helper
+  extended with an optional `mode`. Full suite 2784 passed / 3 skipped / 1 xfailed.
 - **tableau-migration (skill `1.84.0` → `1.85.0`): Native treemap support — a Tableau treemap now
   rebuilds as a Power BI `treemap` visual instead of degrading to a card or an unsupported warning.**
   On the *Simple Example* workbook the **Tree Map** sheet (a categorical dimension on the **Text** shelf,
