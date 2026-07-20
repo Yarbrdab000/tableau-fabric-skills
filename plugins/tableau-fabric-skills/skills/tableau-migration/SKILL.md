@@ -46,7 +46,11 @@ do not improvise flags or infer answers. The detailed reference body begins afte
    extract vs live, embedded vs published, storage mode, flat-file landing, binding — so you never
    classify a source, pick a per-source flag, add error-handling, tune timeouts, or reason about a
    "corrective action." A checkpoint that fails = **STOP and ask**, never self-correct. The **first**
-   place you are permitted to reason is the second compiler (stubbed calcs).
+   place you are permitted to reason is the second compiler (stubbed calcs). **Keep the narration boring:
+   one short status line per step, never a reflective paragraph.** A checkpoint is a pass/fail *glance* at
+   one named field (e.g. `STEP 2 ✅ — bundle built; DoD=warn`) — do not restate what a script does,
+   re-derive why a number is what it is, or write a paragraph before/after `GO`. If you catch yourself
+   explaining an *expected* value to yourself, stop: the run is meant to be fast and uneventful.
 
 ### Phase 0A — Decision Menu (present verbatim; defaults marked)
 
@@ -307,14 +311,22 @@ py -3.11 "$SKILL\scripts\fetch_tds.py" --server $SITE_URL --site $SITE_NAME `
 py -3.11 "$SKILL\scripts\migrate_estate.py" -i .\in -o .\out
 ```
 
-**Checkpoint 2:** confirm `.\out\semantic_models` holds one `*.SemanticModel` per datasource,
-`.\out\report.json` shows `summary.datasources_migrated > 0`, and every workbook source has an openable
-`.\out\pbip\<Workbook>.pbip` bound to its model. A workbook whose report is empty or unbound almost
-always means its published datasource wasn't in scope at build time — which the STEP 1.5 scan gate is
-designed to prevent, so re-run the scan and confirm it exits `0` before anything else. Anything missing
-or `0` → **STOP**, read `.\out\summary.md`, and report it to the user. Do not self-diagnose, re-fetch,
-or re-run — the scripts have already done their own detection and binding; a shortfall is a
-STOP-and-ask, never something for you to fix by hand.
+**Checkpoint 2 — one glance at `.\out\report.json`, then move on (don't narrate a paragraph or re-derive why a number is what it is):**
+
+- **Workbook run** → `definition_of_done.status` is the pass authority. `pass`/`warn` = the report
+  rebuilt and bound into an openable `.\out\pbip\<Workbook>\<Workbook>.pbip`; **`warn` is the normal
+  path (fidelity gaps to review later) — NOT a stop.** `summary.datasources_migrated == 0` is
+  **expected when the workbook's datasource is *embedded*** — the model rides *inside* the `.pbip`, not
+  in `semantic_models\` — so it is not a shortfall and needs no explanation.
+- **Standalone-datasource run** → expect one `*.SemanticModel` in `.\out\semantic_models` per
+  datasource and `summary.datasources_migrated > 0`.
+
+**STOP and ask only if** `definition_of_done.status == "failed"`, a scoped standalone datasource is
+missing/errored, or a workbook report is unbound (its published datasource wasn't co-migrated — the
+STEP 1.5 scan gate is designed to prevent exactly that; re-check the scan exited `0`). Otherwise skim
+`.\out\summary.md` for the WARN follow-ups and continue. Never self-diagnose, re-fetch, or re-run — the
+scripts have already done their own detection and binding; a shortfall is a STOP-and-ask, never
+something for you to fix by hand.
 
 > **Second-compiler gate — read `report.json` → `summary.needs_review_total` and branch on it:** if it
 > is **`0`**, no calc was left stubbed, so there is nothing to offer — continue (do not re-read the report

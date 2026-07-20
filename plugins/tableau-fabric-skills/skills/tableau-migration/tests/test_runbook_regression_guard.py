@@ -184,3 +184,34 @@ def test_skill_output_section_warns_never_to_zip_a_pbip():
     assert "json" in flat and "pointer" in flat
     assert "never repackage it" in flat or "never zip" in flat
     assert "--verify-pbip" in text
+
+
+# ---------------------------------------- (f) the mechanical span stays SIMPLE (no induced over-think)
+# A real run had the agent write essays at every mechanical step and spend ~6 paragraphs agonizing over
+# an EXPECTED `datasources_migrated: 0` on an embedded-workbook run -- because Checkpoint 2 demanded
+# `> 0` and said "0 -> STOP", a false alarm the agent had to reason its way out of. These pin the fix:
+# the checkpoint branches by input kind (0 is expected for an embedded workbook; the DoD status is the
+# authority) and the span caps narration to one line.
+def test_checkpoint2_does_not_stop_on_expected_zero_datasources():
+    text = _read(_SKILL)
+    flat = re.sub(r"\s+", " ", text).lower()
+    # The old trap ("anything missing or 0 -> STOP") must be gone.
+    assert "anything missing or `0` \u2192 **stop**" not in flat
+    assert "anything missing or 0 -> stop" not in flat
+    # A workbook's embedded-datasource 0 is called out as EXPECTED, not a shortfall.
+    assert "datasources_migrated == 0" in text
+    assert "embedded" in flat and "expected" in flat
+    # The definition-of-done status is the workbook pass authority, and WARN is not a stop.
+    assert "definition_of_done.status" in text
+    assert "warn is the normal path" in flat or "`warn` is the normal" in text.lower()
+    # A stop is scoped to a real failure, not to a benign 0.
+    assert 'status == "failed"' in text or "== \u201cfailed\u201d" in text
+
+
+def test_mechanical_span_caps_narration_to_one_line():
+    text = _read(_SKILL)
+    flat = re.sub(r"\s+", " ", text).lower()
+    # Rule 5 must explicitly forbid the reflective-paragraph narration and frame a checkpoint as a glance.
+    assert "one short status line per step" in flat
+    assert "never a reflective paragraph" in flat
+    assert "glance" in flat

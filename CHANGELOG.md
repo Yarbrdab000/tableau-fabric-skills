@@ -13,6 +13,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.71.0` → `1.72.0`): Stop the mechanical span from making an agent *think
+  too hard*. A real run had the agent write an essay at every step and spend ~6 paragraphs agonizing over
+  an **expected** `datasources_migrated: 0` on an embedded-workbook run — because Checkpoint 2 demanded
+  `> 0` and said "Anything missing or 0 → STOP", a false alarm the agent had to reason its way out of.
+  Docs-only; no code/API change.**
+  - **`SKILL.md` Checkpoint 2 rewritten to branch by input kind and pre-empt the false alarm** — a
+    workbook run's pass authority is `definition_of_done.status` (`pass`/`warn`, where **`warn` is the
+    normal path, not a stop**); `summary.datasources_migrated == 0` is stated as **expected when the
+    workbook's datasource is embedded** (the model rides inside the `.pbip`). A STOP is now scoped to a
+    real failure (`definition_of_done.status == "failed"`, a scoped standalone datasource
+    missing/errored, or an unbound workbook report) — never a benign `0`.
+  - **Gate Rule 5 now caps narration** — one short status line per step, never a reflective paragraph; a
+    checkpoint is a pass/fail *glance* at one named field, not an analysis. Kills the double-narration
+    the transcript showed.
+  - **+2 regression guards** (`test_checkpoint2_does_not_stop_on_expected_zero_datasources`,
+    `test_mechanical_span_caps_narration_to_one_line`). Full suite **2754 passed / 3 skipped / 1
+    xfailed**.
+
 - **tableau-migration (skill `1.70.0` → `1.71.0`): Stop an agent from *corrupting correct output* by
   re-zipping a `.pbip`. A real run destroyed openable projects because the agent assumed a ~300-byte
   `.pbip` was a "broken un-zipped stub" and zipped it — every sibling format it knows (`.pbix`,
