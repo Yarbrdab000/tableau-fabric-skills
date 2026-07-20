@@ -59,6 +59,7 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .parameters import parse_parameters
     from .workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
     from .workbook_calc_usage import workbook_calc_usage
+    from .tmdl_generate import tableau_measure_format_to_pbi
     from . import fetch_tds as F
 except ImportError:
     from connection_to_m import (parse_tds, extract_bundled_flatfile, extract_calcs,
@@ -71,6 +72,7 @@ except ImportError:
     from parameters import parse_parameters
     from workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
     from workbook_calc_usage import workbook_calc_usage
+    from tmdl_generate import tableau_measure_format_to_pbi
     import fetch_tds as F
 
 
@@ -502,6 +504,13 @@ def extract_calculations(xml_text, *, include_dimensions=False):
         if internal_name and internal_name.lower() != caption.lower():
             entry["internal_name"] = internal_name
         entry["datasource"] = col_ds.get(id(col))
+        # Author's explicit number format (currency/percent/precision) declared on the calc
+        # <column @default-format>. Conservatively decoded (explicit c/n/p/* codes only; the
+        # ambiguous built-in C<lcid>% form is declined) so the measure keeps the author's format
+        # instead of degrading to the raw number. Additive: absent when there is no decodable code.
+        fmt = tableau_measure_format_to_pbi(col.get("default-format"))
+        if fmt:
+            entry["format_string"] = fmt
         calcs.append(entry)
 
     return (calcs, skipped, dim_calcs) if include_dimensions else (calcs, skipped)

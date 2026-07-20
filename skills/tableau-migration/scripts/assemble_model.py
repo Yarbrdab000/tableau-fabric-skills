@@ -1068,6 +1068,22 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     measures_tmdl = ""
     report = []
     suggestions = []
+    # Author-declared number format per calc (currency/percent/precision), decoded conservatively
+    # at extraction onto ``format_string`` (see ``tableau_measure_format_to_pbi``). Keyed by BOTH
+    # caption and internal ``Calculation_*`` token, case-insensitive, so a measure emitted under
+    # either name recovers its format. Empty when no calc carries a decodable code -> the emitted
+    # ``formatString`` line is simply absent and output is byte-for-byte identical to before.
+    fmt_by_name = {}
+    for _c in (calcs or []):
+        _fs = _c.get("format_string")
+        if not _fs:
+            continue
+        for _k in (_c.get("name"), _c.get("internal_name")):
+            if _k:
+                fmt_by_name[str(_k).strip().lower()] = _fs
+
+    def _fmt(nm):
+        return fmt_by_name.get((nm or "").strip().lower())
     # Cross-calc references (g2): a calc may reference another calc by name -- e.g.
     # ``[count orders] + 100`` -- which becomes a DAX measure reference once the referent is itself
     # a translated measure. Pre-pass to a FIXPOINT building a {key -> (measure_name, dtype)} map of
@@ -1176,7 +1192,8 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     for sm in (synth_measures or []):
         measures_tmdl += T.generate_measure_tmdl(
             sm["name"], sm.get("tableau_formula", ""), sm["dax"],
-            translated_by="deterministic (measure-swap aggregation)")
+            translated_by="deterministic (measure-swap aggregation)",
+            format_string=_fmt(sm["name"]))
     for calc in calcs or []:
         name, formula = calc["name"], calc.get("formula", "")
         if name.lower() in consumed_lower:
@@ -1256,17 +1273,21 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             if agg_provenance:
                 measures_tmdl += T.generate_measure_tmdl(
                     name, formula, dax,
-                    translated_by=f"deterministic (parameter-driven {agg_provenance} over row-level calc)")
+                    translated_by=f"deterministic (parameter-driven {agg_provenance} over row-level calc)",
+                    format_string=_fmt(name))
             elif flag_gated:
                 measures_tmdl += T.generate_measure_tmdl(
                     name, formula, dax,
-                    translated_by="deterministic (flag-gated inner measure over date-window keep-flag)")
+                    translated_by="deterministic (flag-gated inner measure over date-window keep-flag)",
+                    format_string=_fmt(name))
             elif lod_gated:
                 measures_tmdl += T.generate_measure_tmdl(
                     name, formula, dax,
-                    translated_by="deterministic (default-SUM over param-gated row-level FIXED LOD)")
+                    translated_by="deterministic (default-SUM over param-gated row-level FIXED LOD)",
+                    format_string=_fmt(name))
             else:
-                measures_tmdl += T.generate_measure_tmdl(name, formula, dax)
+                measures_tmdl += T.generate_measure_tmdl(name, formula, dax,
+                                                          format_string=_fmt(name))
             report.append(row)
             continue
 
@@ -1279,18 +1300,21 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             approved_expr = " ".join(approved_dax.split())  # collapse to one valid DAX line
             measures_tmdl += T.generate_measure_tmdl(
                 name, formula, approved_expr,
-                translated_by="assisted translation (human-approved)")
+                translated_by="assisted translation (human-approved)",
+                format_string=_fmt(name))
             row["status"] = "assisted-approved"
             row["dax"] = approved_expr
             if sugg:
                 row["assisted_pattern"] = sugg["pattern"]
         elif sugg:
-            measures_tmdl += T.generate_measure_tmdl(name, formula, None, suggestion=sugg)
+            measures_tmdl += T.generate_measure_tmdl(name, formula, None, suggestion=sugg,
+                                                     format_string=_fmt(name))
             row["status"] = "assisted-suggested"
             row["assisted_suggestion"] = sugg
             suggestions.append({"measure": name, **sugg})
         else:
-            measures_tmdl += T.generate_measure_tmdl(name, formula, None)
+            measures_tmdl += T.generate_measure_tmdl(name, formula, None,
+                                                     format_string=_fmt(name))
         report.append(row)
     # Emit the translated workbook table calcs (addressing-bearing) after the plain measures. Each
     # preserves its original Tableau formula as ``TableauFormula`` and is tagged with the addressing
@@ -1298,14 +1322,16 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     for r in tablecalc_rows:
         measures_tmdl += T.generate_measure_tmdl(
             r["measure"], r["tableau_formula"], r["dax"],
-            translated_by=r.get("translated_by") or "deterministic (workbook addressing)")
+            translated_by=r.get("translated_by") or "deterministic (workbook addressing)",
+            format_string=_fmt(r["measure"]))
         report.append(r)
     # Emit the synthesized parameter-driven date-window keep-flag measures last. Each supersedes
     # its source calc's plain stub (skipped above) and preserves the original Tableau formula.
     for fm in (flag_measures or []):
         measures_tmdl += T.generate_measure_tmdl(
             fm["measure"], fm.get("tableau_formula", ""), fm["dax"],
-            translated_by=fm.get("translated_by") or "deterministic (parameter-driven date window)")
+            translated_by=fm.get("translated_by") or "deterministic (parameter-driven date window)",
+            format_string=_fmt(fm["measure"]))
         report.append(fm["report_row"])
     # View-only quick table calcs (running total, YTD, moving average, ...) are reproduced in the
     # REPORT layer as Power BI Visual Calculations, not model measures -- but each references a
@@ -1317,7 +1343,8 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     for br in _visual_calc_base_measures(table_calc_usages, known_tables, report):
         measures_tmdl += T.generate_measure_tmdl(
             br["measure"], br["tableau_formula"], br["dax"],
-            translated_by=br.get("translated_by") or "deterministic (visual-calculation base measure)")
+            translated_by=br.get("translated_by") or "deterministic (visual-calculation base measure)",
+            format_string=_fmt(br["measure"]))
         report.append(br)
     return T.generate_measures_table_tmdl(measures_tmdl), report, suggestions
 

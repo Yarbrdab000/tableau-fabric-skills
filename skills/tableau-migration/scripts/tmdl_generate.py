@@ -132,6 +132,29 @@ def tableau_default_format_to_pbi(code):
         return "0%"
     return None
 
+
+def tableau_measure_format_to_pbi(code):
+    """A MEASURE-only, conservative decode of a Tableau ``default-format`` code.
+
+    A measure (an aggregate calculated field) carries no physical ``<metadata-record>`` type,
+    so -- unlike a physical column -- there is no independent signal to sanity-check an ambiguous
+    format against. We therefore accept ONLY the author's *explicit* custom-format codes: the
+    lowercase type prefixes ``c`` (currency) / ``n`` (number) / ``p`` (percent) and the ``*``
+    zero-pad prefix, whose remainder is a literal .NET custom-format string (delegated verbatim to
+    ``tableau_default_format_to_pbi``). The uppercase built-in/automatic form ``C<lcid>%`` is
+    DELIBERATELY declined here (it returns None): in the wild that single code appears on both
+    currency measures (e.g. Sales-per-Customer) AND percent measures, so decoding it to ``0%``
+    would silently mis-render a dollar figure as a percentage. Declining it keeps the measure's
+    type-derived floor -- additive, never a regression. Returns the Power BI ``formatString`` or
+    ``None``.
+    """
+    if not code:
+        return None
+    c = code.strip()
+    if not c or c[0] not in _DEFAULT_FORMAT_PREFIXES:
+        return None
+    return tableau_default_format_to_pbi(c)
+
 # Power BI geographic data categories keyed by the Tableau geo-role area token (the first bracketed
 # token of a column's ``semantic-role``, e.g. ``[State].[Name]`` -> ``state``). Only areas with a
 # faithful Power BI data category are listed; any other geo area (Area Code, CBSA, Congressional
@@ -289,7 +312,7 @@ def _tmdl_assignment(decl, expr, body_indent="\t\t\t"):
     return f"{decl} =\n{body}"
 
 def generate_measure_tmdl(field_name, formula, dax=None, *, suggestion=None,
-                          translated_by="deterministic"):
+                          translated_by="deterministic", format_string=None):
     """One measure for the _Measures table. When `dax` is provided the measure carries
     the translated DAX expression; otherwise it stays an inert `= 0` stub. EITHER WAY
     the original Tableau formula is ALWAYS preserved as a TableauFormula annotation --
@@ -299,15 +322,21 @@ def generate_measure_tmdl(field_name, formula, dax=None, *, suggestion=None,
     translator; the orchestrator passes an assisted/approved tag when a human-approved
     suggestion is flipped into the live expression).
 
+    `format_string` is an OPTIONAL Power BI ``formatString`` (e.g. ``0.0%`` / ``"$"#,##0``)
+    decoded from the source calc's Tableau ``default-format`` (see
+    ``tableau_measure_format_to_pbi``). When present it is emitted so the author's declared
+    currency / percent / precision survives on the measure; when None (the default) NO
+    formatString line is written -- byte-for-byte identical to prior output.
+
     `suggestion` is an OPTIONAL assisted-translation suggestion dict (``{"pattern", "dax"}``)
     attached ONLY to a stub (`dax` is None): the measure stays inert `= 0` but carries
     `TranslationSuggestion` + `TranslationSuggestionPattern` annotations so a human can review
     and approve it. The suggestion is NEVER the live expression until approved."""
     expr = dax if dax else "0"
-    out = (
-        _tmdl_assignment(f"\n\tmeasure {q(field_name)}", expr)
-        + f"\t\tlineageTag: {uuid.uuid4()}\n"
-    )
+    out = _tmdl_assignment(f"\n\tmeasure {q(field_name)}", expr)
+    if format_string:
+        out += f"\t\tformatString: {format_string}\n"
+    out += f"\t\tlineageTag: {uuid.uuid4()}\n"
     out += tmdl_annotation_value("TableauFormula", formula)
     if dax:
         out += tmdl_annotation_value("TranslatedBy", translated_by)

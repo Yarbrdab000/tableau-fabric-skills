@@ -25,14 +25,14 @@ import xml.etree.ElementTree as ET
 
 try:  # works whether imported as a package or run with scripts/ on sys.path
     from .tmdl_generate import (clean_col, generate_column_tmdl, q, tableau_default_format_to_pbi,
-                                tableau_geo_role_to_data_category)
+                                tableau_measure_format_to_pbi, tableau_geo_role_to_data_category)
     from .storage_mode import (
         ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
         NATIVE_ODBC_DRIVER, NATIVE_ODBC_ENGINES,
         NATIVE_QUERY_CATALOG_DRILL, ODBC_CLASSES, PARTIAL_LIVE_CONNECTORS, connector_spec)
 except ImportError:
     from tmdl_generate import (clean_col, generate_column_tmdl, q, tableau_default_format_to_pbi,
-                               tableau_geo_role_to_data_category)
+                               tableau_measure_format_to_pbi, tableau_geo_role_to_data_category)
     from storage_mode import (
         ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
         NATIVE_ODBC_DRIVER, NATIVE_ODBC_ENGINES,
@@ -1634,6 +1634,12 @@ def extract_calcs(xml_text, select=None):
         role = (col.get("role") or "").strip()
         if role:
             entry["role"] = role
+        # Author's explicit number format (currency/percent/precision) from the calc
+        # <column @default-format>, conservatively decoded (explicit c/n/p/* codes only).
+        # Additive: absent when there is no decodable code, so prior output is unchanged.
+        fmt = tableau_measure_format_to_pbi(col.get("default-format"))
+        if fmt:
+            entry["format_string"] = fmt
         out.append(entry)
     return out
 
