@@ -3563,6 +3563,22 @@ def test_param_binding_from_model_emits_value_picker_slicer():
     assert pb["flags"] == {}
 
 
+def test_param_binding_from_model_emits_field_param_slicer():
+    # Regression: a kind="field" dimension/measure SWAP controller exposes a picker at its
+    # field-parameter table's DISPLAY column, so the dashboard control becomes a single-select
+    # slicer on that column -- the field-swap control that previously never rebuilt as a slicer
+    # (only value-swap controls did). Selecting there drives which field every bound visual shows.
+    rr = {"model_manifest": {"parameters": [
+        {"name": "Dim Swap", "internal_name": "[Parameter 3193282020085760]",
+         "kind": "field", "model_object": "Dim Swap calc",
+         "picker": {"table": "Dim Swap calc", "column": "Dim Swap calc"}}]}}
+    pb = me._param_binding_from_model(rr)
+    assert pb["slicers"]["[Parameter 3193282020085760]"] == {
+        "table": "Dim Swap calc", "column": "Dim Swap calc",
+        "single_select": True, "caption": "Dim Swap"}
+    assert pb["flags"] == {}
+
+
 def test_param_binding_from_model_flag_carries_visuals():
     # A translated date-window keep-flag measure binds as a visual-level ``flag = 1`` filter, and the
     # binding carries the scoped worksheet names (set upstream by _scope_flag_visuals) so the viz

@@ -13,6 +13,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.81.0` → `1.82.0`): Emit a slicer for dimension/measure-SWAP field
+  parameters so a dashboard's swap control is rebuilt, not dropped.** A real run of the *Simple
+  Example* workbook (Test Dashboard 2, which hosts four parameter controls — *Dim Swap*, *Dim
+  Swap 2*, *Measure Swap*, *Measure Swap 2*) rebuilt only the two **Measure Swap** slicers; the two
+  **Dim Swap** controls kept the standing *"parameter control … not rebuilt as a slicer yet"*
+  warning even though the model had already emitted their field-parameter tables (`Dim Swap calc`,
+  `Dim Swap calc 2`, each with a `ParameterMetadata` display column). Root cause (verified
+  end-to-end): `_classify_parameters` tagged a swap controller `kind="field"` with a `model_object`
+  but — unlike a `kind="value"` what-if param — attached **no `picker`**, so the report binder
+  `_param_binding_from_model` (which emits a slicer only when a param row exposes a `picker`/
+  `target_column`) had nothing to bind, and `_resolve_parameter_controls` fell through to the
+  warning. Fix (`assemble_model.py`, additive): a `field`-kind param now also exposes the same
+  additive `picker` a value param does, pointing at the field-parameter table's **display column**
+  (the selection column a Power BI field-parameter slicer binds to) — so the dashboard control is
+  rebuilt as a faithful single-select slicer through the identical, already-proven value-picker
+  path. Byte-identical for any workbook without a field-swap parameter (guarded on the swap
+  controller resolving). Verified on the real workbook: `param_rebind.slicers` 2 → **4** (adds
+  `Dim Swap calc[Dim Swap calc]` + `Dim Swap calc 2[Dim Swap calc 2]`), swap "not rebuilt" warnings
+  cleared. +2 regression tests (field-param picker in the manifest; field-param slicer from the
+  binder) and the existing classification test extended.
 - **tableau-migration (skill `1.80.0` → `1.81.0`): Bind extract CSVs to relations by Hyper table
   identity so an Excel/extract-backed workbook actually loads its data.** A real VS Code run of a
   workbook whose live source is `excel-direct` (the `.xlsx` is NOT bundled) but which carries a

@@ -1421,7 +1421,9 @@ def _classify_parameters(parameters, fp, vp):
       ``picker`` ``{table, column}`` so the viz layer slices the model's own picker column (the
       friendly Label column for an aliased list) rather than re-deriving a field slicer.
     * ``"field"``  -- a dimension/measure SWAP controller the model turned into a field-parameter
-      table (``model_object`` = that table); likewise model-owned.
+      table (``model_object`` = that table); likewise model-owned, and it too exposes an additive
+      ``picker`` ``{table, column}`` pointing at the field-parameter table's DISPLAY column (the
+      selection column) so the viz layer slices that control the same way it slices a value picker.
     * ``"filter"`` -- a plain filter parameter the model did NOT consume (``model_object`` = None);
       the report/viz layer owns it as an ordinary slicer.
 
@@ -1432,11 +1434,12 @@ def _classify_parameters(parameters, fp, vp):
     for cp in (vp.get("consumed_params") or []):
         for k in _norm_param_keys(cp):
             value_tbl[k] = (cp.get("table"), cp.get("picker_column") or cp.get("table"))
-    field_tbl = {}     # controller key -> field-parameter table name
+    field_tbl = {}     # controller key -> (field-parameter table name, display column a slicer binds to)
     for spec in (fp.get("specs") or []):
         ctrl = (spec.get("controller") or "").strip().strip("[]").strip().lower()
         if ctrl:
-            field_tbl.setdefault(ctrl, spec.get("table_name"))
+            field_tbl.setdefault(ctrl, (spec.get("table_name"),
+                                        spec.get("display_col") or spec.get("table_name")))
 
     out = []
     for p in (parameters or []):
@@ -1452,7 +1455,14 @@ def _classify_parameters(parameters, fp, vp):
             # slicer binds to (the friendly Label column for an aliased list, else the value column).
             picker = {"table": table, "column": picker_col}
         elif fhit is not None:
-            kind, model_object = "field", fhit
+            table, disp = fhit
+            kind, model_object = "field", table
+            # A field-parameter (dimension/measure SWAP) controller is sliced on the field-parameter
+            # table's DISPLAY column -- selecting a value there drives which field/measure every bound
+            # visual shows. Expose that as the same additive ``picker`` a value param uses so the
+            # report binder emits a faithful single-select slicer for the dashboard control (mirrors
+            # the value-picker path; without it a field-swap control never became a slicer at all).
+            picker = {"table": table, "column": disp}
         rec = {"name": name, "internal_name": p.get("internal_name"),
                "kind": kind, "model_object": model_object}
         if picker:
