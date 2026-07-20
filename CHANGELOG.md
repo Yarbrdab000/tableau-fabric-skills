@@ -13,7 +13,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration (skill `1.79.0` → `1.80.0`): Lock the Defect-1 invariant — a parameter *swap*
+- **tableau-migration (skill `1.80.0` → `1.81.0`): Bind extract CSVs to relations by Hyper table
+  identity so an Excel/extract-backed workbook actually loads its data.** A real VS Code run of a
+  workbook whose live source is `excel-direct` (the `.xlsx` is NOT bundled) but which carries a
+  bundled `.hyper` extract opened in Power BI Desktop with every table empty —
+  *"This query does not have any columns with the supported data types. It will be disabled from
+  being loaded to the model."* Root cause (verified end-to-end, correcting an earlier "no data
+  extracted" theory): the `.hyper` **does** materialize — `hyper_reader.extract_to_csv` writes
+  `Extract_<Table>_<32-hex-GUID>.csv` and returns them keyed by the Hyper table *identity*
+  (`"Extract"."Orders_ECFCA1FB…862"`), but `assemble_local_import_model` matched each relation
+  (`Orders`/`People`/`Returns`) by exact/normalized name, which never equals the GUID-suffixed
+  identity → `flatfile_path` left unset → the partition emitted a column-less
+  `Source = #table(type table [], {})` stub Power BI refuses to load. Fix (`assemble_model.py`,
+  additive): after the exact-match phase, a new extract-GUID fallback strips the trailing
+  `_<GUID>` suffix from unmatched candidates and binds each still-unmatched relation to its extract
+  CSV at the table-name boundary — **unique-hit only** (an ambiguous base, two CSVs for one relation
+  or two relations for one CSV, is left unmatched, never guessed). Byte-identical when the exact
+  phase already bound everything. Disclosed additively under
+  `report["local_import"]["extract_guid_fallback"]`. Verified: the Simple Example workbook now emits
+  real typed `Csv.Document` partitions for all three tables (absolute path + `PromoteHeaders` +
+  `TransformColumnTypes`) and loads. +5 tests. Report schema additive (new key only).
   calc has exactly one representation.** An agent post-mortem alleged the engine could emit one
   measure-swap parameter as BOTH a field-parameter table AND a SWITCH/aggregating measure in the same
   run (a "two-pass" contradiction). Verified against the code (2026-07-20): it cannot — `assemble_model`

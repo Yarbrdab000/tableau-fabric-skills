@@ -3243,6 +3243,26 @@ def _normalize_match_key(name):
     return raw.strip().lower()
 
 
+# A Tableau extract table identity is ``<sheet-or-table>_<32-hex-GUID>`` -- match a trailing ``_``
+# then 16+ hex chars (32 is the norm; 16+ keeps it robust without ever eating a real short suffix).
+_EXTRACT_GUID_RE = re.compile(r"_[0-9a-f]{16,}$")
+
+
+def _extract_base_key(norm_key):
+    """Strip a trailing Tableau-extract GUID suffix (and any Excel ``$`` sheet marker) from an
+    already-:func:`_normalize_match_key`-normalized key, yielding the plain table-name BASE.
+
+    Tableau names every extract table ``<sheet>_<32-hex-GUID>``; the Hyper reader surfaces that as
+    ``"Extract"."Orders_ECFCA1FB...862"`` -> normalized ``orders_ecfca1fb...862`` -> CSV
+    ``Extract_Orders_ECFCA1FB...862.csv``. A relation named ``Orders`` therefore never matches by
+    exact/normalized key. Reducing both sides to their base (``orders``) lets a still-unmatched
+    relation bind to its extract CSV at the table-name boundary. Returns the key unchanged when there
+    is no such suffix (so a non-extract name is never altered).
+    """
+    key = str(norm_key or "").rstrip("$")
+    return _EXTRACT_GUID_RE.sub("", key)
+
+
 def _match_csv_path(relation, csv_index, *, single_default=None):
     """Resolve the local CSV path for one relation from a ``{normalized_name: path}`` index.
 
@@ -3348,6 +3368,7 @@ def assemble_local_import_model(descriptor, *, model_name, table_csv_paths, calc
     single_default = csv_values[0] if (len(table_rels) == 1 and len(csv_values) == 1) else None
 
     surviving, matched, unmatched, new_relations = [], [], [], []
+    pending, claimed_paths = [], set()
     for rel in table_rels:
         disp = _table_display(rel)
         surviving.append(disp)
@@ -3356,9 +3377,38 @@ def assemble_local_import_model(descriptor, *, model_name, table_csv_paths, calc
         if csv_path:
             rel2["flatfile_path"] = csv_path
             matched.append({"table": disp, "csv_path": csv_path})
+            claimed_paths.add(csv_path)
         else:
-            unmatched.append(disp)
+            pending.append((disp, rel2))  # give it a second, extract-GUID-aware chance below
         new_relations.append(rel2)
+
+    # Extract-GUID fallback: a Tableau .hyper names every table ``<sheet>_<32-hex-GUID>`` (Hyper
+    # reader -> ``"Extract"."Orders_ECFCA1FB...862"`` -> CSV ``Extract_Orders_ECFCA1FB...862.csv``),
+    # so a relation named ``Orders`` NEVER matches by exact/normalized key and would otherwise emit a
+    # column-less ``#table`` stub Power BI refuses to load ("This query does not have any columns with
+    # the supported data types"). Bind each still-unmatched relation to a bundled extract CSV whose
+    # Hyper table identity differs only by that trailing GUID suffix -- but ONLY on a UNIQUE hit: an
+    # ambiguous base (two candidate CSVs for one relation, or two relations for one CSV) is left
+    # unmatched, never guessed. No-op (byte-identical) when the exact phase already bound everything.
+    extract_guid_fallback = []
+    if pending:
+        base_to_keys = {}
+        for nk, p in csv_index.items():
+            if p in claimed_paths:
+                continue
+            base_to_keys.setdefault(_extract_base_key(nk), []).append((nk, p))
+        for disp, rel2 in pending:
+            rb = _extract_base_key(_normalize_match_key(disp))
+            cands = ([(nk, p) for (nk, p) in base_to_keys.get(rb, []) if p not in claimed_paths]
+                     if rb else [])
+            if len(cands) == 1:
+                nk, p = cands[0]
+                rel2["flatfile_path"] = p
+                claimed_paths.add(p)
+                matched.append({"table": disp, "csv_path": p})
+                extract_guid_fallback.append({"table": disp, "csv_path": p, "hyper_table": nk})
+            else:
+                unmatched.append(disp)
 
     surviving_set = set(surviving)
     filt_rels = [r for r in (descriptor.get("relationships") or [])
@@ -3386,6 +3436,7 @@ def assemble_local_import_model(descriptor, *, model_name, table_csv_paths, calc
         "unmatched_tables": unmatched,
         "table_count": len(surviving),
         "matched_count": len(matched),
+        "extract_guid_fallback": extract_guid_fallback,
         "column_reconcile": column_reconcile,
     }
     return result

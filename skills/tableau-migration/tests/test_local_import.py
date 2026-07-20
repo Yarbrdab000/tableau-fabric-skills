@@ -301,6 +301,74 @@ def test_assemble_local_import_model_directly(tmp_path):
     assert result["report"]["storage_decision"]["connector"] == "Csv.Document"
 
 
+# -- extract-GUID fallback: relation <-> Hyper table identity binding ---------------------------
+# A Tableau .hyper names every table ``<sheet>_<32-hex-GUID>``; the Hyper reader surfaces those as
+# schema-qualified identities (``"Extract"."Orders_<guid>"``) and writes ``Extract_Orders_<guid>.csv``.
+# A relation named ``Orders`` therefore never matches by exact/normalized key -> the table used to emit
+# a column-less ``#table`` stub Power BI refuses to load. The fallback binds each still-unmatched
+# relation to its extract CSV at the table-name boundary, but only on a UNIQUE hit.
+_GUID_A = "ecfca1fb690a41fe803bc071773ba862"
+_GUID_B = "2aa0fe4d737a4f63970131d0e7480a03"
+
+
+def test_extract_guid_fallback_binds_hyper_identity_keys(tmp_path):
+    from connection_to_m import parse_tds
+    desc = parse_tds(TWO_TABLE_TDS)
+    orders_csv = _write_csv(str(tmp_path / f"Extract_Orders_{_GUID_A}.csv"),
+                            ["OrderId"], [[1]])
+    regions_csv = _write_csv(str(tmp_path / f"Extract_Regions_{_GUID_B}.csv"),
+                             ["RegionName"], [["West"]])
+    # Keyed EXACTLY like hyper_reader.extract_to_csv output (schema-qualified Hyper table identities).
+    tcp = {f'"Extract"."Orders_{_GUID_A}"': orders_csv,
+           f'"Extract"."Regions_{_GUID_B}"': regions_csv}
+    result = A.assemble_local_import_model(desc, model_name="Two Table", table_csv_paths=tcp)
+    li = result["report"]["local_import"]
+    assert li["matched_count"] == 2
+    assert li["unmatched_tables"] == []
+    fb = {x["table"]: x["hyper_table"] for x in li["extract_guid_fallback"]}
+    assert fb == {"Orders": f"orders_{_GUID_A}", "Regions": f"regions_{_GUID_B}"}
+    orders = result["parts"]["definition/tables/Orders.tmdl"]
+    assert "Csv.Document" in orders
+    assert "#table(type table [], {})" not in orders  # no column-less stub
+
+
+def test_extract_guid_fallback_ambiguous_not_guessed(tmp_path):
+    """Two extract CSVs share the same table-name base for one relation -> fail closed, never guess."""
+    from connection_to_m import parse_tds
+    desc = parse_tds(PENDING_TDS)  # single relation 'PendingJobSnapshot'
+    a = _write_csv(str(tmp_path / f"Extract_PendingJobSnapshot_{_GUID_A}.csv"),
+                   ["Region", "PendingJobs"], [["Beltway", 1]])
+    b = _write_csv(str(tmp_path / f"Extract_PendingJobSnapshot_{_GUID_B}.csv"),
+                   ["Region", "PendingJobs"], [["Metro", 2]])
+    tcp = {f'"Extract"."PendingJobSnapshot_{_GUID_A}"': a,
+           f'"Extract"."PendingJobSnapshot_{_GUID_B}"': b}
+    result = A.assemble_local_import_model(desc, model_name="Pending", table_csv_paths=tcp)
+    li = result["report"]["local_import"]
+    assert li["matched_count"] == 0
+    assert li["unmatched_tables"] == ["PendingJobSnapshot"]
+    assert li["extract_guid_fallback"] == []
+
+
+def test_extract_guid_fallback_noop_when_exact_matches(tmp_path):
+    """An exact/normalized name match still binds and records NO fallback (byte-identical path)."""
+    from connection_to_m import parse_tds
+    desc = parse_tds(PENDING_TDS)
+    csv_path = _write_csv(str(tmp_path / "snap.csv"), ["Region", "PendingJobs"], [["Beltway", 1]])
+    result = A.assemble_local_import_model(
+        desc, model_name="Pending", table_csv_paths={"PendingJobSnapshot": csv_path})
+    li = result["report"]["local_import"]
+    assert li["matched_count"] == 1
+    assert li["extract_guid_fallback"] == []
+
+
+def test_extract_base_key_strips_only_guid_suffix():
+    assert A._extract_base_key(f"orders_{_GUID_A}") == "orders"
+    assert A._extract_base_key("orders") == "orders"          # plain name untouched
+    assert A._extract_base_key("orders$") == "orders"          # Excel sheet marker stripped
+    assert A._extract_base_key("order_details_" + _GUID_B) == "order_details"  # inner '_' kept
+    assert A._extract_base_key("orders_2024") == "orders_2024"  # short non-GUID suffix untouched
+
+
 # -- rm-local-csv-column-dedupe: phantom-drop + dedupe against the real CSV header ---------------
 # A .tds whose metadata lists a column absent from the materialized CSV (``SnapshotDate``) and a
 # duplicate physical column (``Region`` twice -- an object-id-twin artifact). Emitting either makes
