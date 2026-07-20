@@ -219,6 +219,9 @@ class _AuthArgs:
         self.jwt_username = None
         self.prompt_secret = False
         self.no_prompt = False
+        self.env_file = None
+        self.keyring_service = None
+        self.keyring_username = None
         self.__dict__.update(kw)
 
 
@@ -313,6 +316,60 @@ def test_resolve_auth_unattended_no_tty_does_not_hang(_no_secret_env):
     # allow_prompt defaults on, but no console + no injected prompt -> fail fast, never block.
     with pytest.raises(SystemExit):
         F._resolve_auth(_AuthArgs(), isatty=False, stream=io.StringIO())
+
+
+# -- _resolve_auth: non-interactive layers (.env file / OS keyring) -- the agent-friendly path ----
+def test_resolve_auth_env_file_supplies_secret_without_prompt(_no_secret_env, tmp_path):
+    # The recommended no-Key-Vault path for a non-interactive / agent-driven run: the secret lives
+    # in a git-ignored .env file, so it resolves with NO hidden prompt (which a fresh-process run
+    # cannot answer) and prints NO "type it into the terminal" instruction.
+    env_path = tmp_path / ".env"
+    env_path.write_text("TABLEAU_PAT_VALUE=from-dotenv\n", encoding="utf-8")
+
+    def boom(_t):
+        raise AssertionError("must not prompt when the .env file supplies the secret")
+
+    err = io.StringIO()
+    name, secret, jwt = F._resolve_auth(
+        _AuthArgs(env_file=str(env_path)), prompt_func=boom, isatty=True, stream=err)
+    assert (name, secret, jwt) == ("Migration-PAT", "from-dotenv", None)
+    assert err.getvalue() == ""                     # a file answered -> no prompt instruction
+
+
+def test_resolve_auth_flag_still_wins_over_env_file(_no_secret_env, tmp_path):
+    # Precedence is preserved: an explicit --pat-secret flag beats the .env file layer.
+    env_path = tmp_path / ".env"
+    env_path.write_text("TABLEAU_PAT_VALUE=from-dotenv\n", encoding="utf-8")
+    _, secret, _ = F._resolve_auth(
+        _AuthArgs(pat_secret="from-flag", env_file=str(env_path)),
+        prompt_func=lambda _t: pytest.fail("must not prompt"), isatty=True, stream=io.StringIO())
+    assert secret == "from-flag"
+
+
+def test_resolve_auth_threads_env_file_and_keyring_into_resolver(_no_secret_env, monkeypatch):
+    # The CLI must pass the .env path and the keyring service/username THROUGH to the resolver so
+    # those non-interactive layers are actually reachable (previously they never left the CLI), and
+    # Phase 1 must be non-interactive (allow_prompt=False) so a hidden prompt is never the first try.
+    seen = {}
+
+    class _Resolved:
+        value = "from-keyring"
+        source = "keyring:tableau-migration"
+
+    def fake_resolve(label, **kw):
+        seen.update(kw)
+        return _Resolved()
+
+    monkeypatch.setattr(F, "resolve_secret", fake_resolve)
+    _, secret, _ = F._resolve_auth(
+        _AuthArgs(env_file="/secrets/x.env", keyring_service="tableau-migration",
+                  keyring_username="svc"),
+        prompt_func=lambda _t: pytest.fail("must not prompt"), isatty=True, stream=io.StringIO())
+    assert secret == "from-keyring"
+    assert seen["env_file"] == "/secrets/x.env"
+    assert seen["keyring_service"] == "tableau-migration"
+    assert seen["keyring_username"] == "svc"
+    assert seen["allow_prompt"] is False
 
 
 def test_resolve_workbook_luid_parses_rest_shape(monkeypatch):

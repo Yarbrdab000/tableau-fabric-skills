@@ -13,6 +13,32 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.67.0` → `1.68.0`): Make the no-Azure-Key-Vault credential path work in
+  agent-driven / non-interactive runs by wiring the resolver's file- and keyring-based secret layers all the
+  way through the `fetch_tds.py` CLI. Previously the only no-Key-Vault route the CLI actually reached was an
+  interactive hidden `getpass` prompt — which cannot be answered when an agent drives the migration, because
+  every command runs in its own fresh process (the prompt opens in a background process the user never sees,
+  and a terminal canvas blocks paste). The dependency-free `credential_resolver` already supported a
+  git-ignored `.env` file and an OS keyring, but `fetch_tds.py` never passed those through, so they were
+  unreachable. Additive and backward-compatible — all existing flags/behaviour unchanged; the default path is
+  byte-identical.**
+  - **Two-phase secret resolution in `fetch_tds._resolve_secret_value`.** Phase 1 resolves every
+    non-interactive layer (explicit flag → `TABLEAU_PAT_VALUE` env var → `.env` entry → OS keyring) with
+    `allow_prompt=False` and returns silently on success (no "type into the terminal" instruction printed).
+    Only if nothing non-interactive yields does Phase 2 (when a prompt is permitted) print the instruction and
+    fall back to the masked `getpass` prompt. Threaded through both the PAT-secret and the Connected-App
+    JWT-secret resolution in `_resolve_auth`.
+  - **New CLI flags on `fetch_tds.py`:** `--env-file [PATH]` (bare `--env-file` reads `./.env`; the
+    recommended no-Key-Vault path), `--keyring-service NAME`, and `--keyring-username USER`. `--no-prompt`
+    still forbids any interactive fallback for unattended/CI/agent runs.
+  - **New `skills/tableau-migration/.env.example`** template (PAT name/value + Connected-App keys) to copy to a
+    git-ignored `.env`.
+  - **Runbook + SKILL.md reframed.** `resources/security-governance.md` and `SKILL.md` now present D6 as three
+    explicit options — (A) Key Vault, (B) git-ignored `.env` / OS keyring, (C) interactive hidden prompt — with
+    a prominent warning that agent-driven runs must use A or B, and B (`--env-file .env --no-prompt`) as the
+    recommended no-Key-Vault path. Guarantees prose (in-memory only, never written to disk/report/chat, empty
+    entry rejected) preserved.
+  - Adds 3 tests (43 total in `test_fetch_tds.py`); full suite 2738 passed / 3 skipped / 1 xfailed.
 - **tableau-migration (skill `1.66.0` → `1.67.0`): Stop dropping a whole dashboard page when its only supported
   worksheets carry their value or field on a marks-card encoding (Size or a calculated dimension on
   Colour/Label). A Tableau highlight/heat grid sized by a measure and an "Automatic" text-list of a

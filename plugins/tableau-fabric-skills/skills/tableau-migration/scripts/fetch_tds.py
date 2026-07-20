@@ -21,6 +21,17 @@ Auth (pick ONE)
   id, secret value, and the username to act as (or the ``TABLEAU_CONNECTED_APP_*`` /
   ``TABLEAU_JWT_USERNAME`` env vars). Signed HS256 with the standard library -- no extra dependency.
 
+Where the SECRET comes from (no Azure Key Vault required)
+--------------------------------------------------------
+The secret *value* is resolved by ``credential_resolver.resolve_secret`` from the first available
+layer, in order: an explicit flag, an environment variable, a git-ignored ``.env`` file
+(``--env-file``), an OS keyring (``--keyring-service``), and only then a masked terminal prompt.
+The four non-interactive layers are the ONLY ones that work in an agent-driven / non-interactive
+run -- where each command executes in a fresh process, so a hidden ``getpass`` prompt appears in a
+process the user cannot see or answer. **Prefer ``--env-file`` (or ``--keyring-service``) in that
+setting; reserve the prompt for a genuine human-attended terminal.** The resolved value is held in
+memory only -- never echoed, written to disk/report, or shown in chat.
+
 Design notes
 ------------
 * **stdlib only** (``urllib``, ``json``, ``zipfile``, ``hmac``): nothing to ``pip install`` -- runs
@@ -38,6 +49,11 @@ Usage
     py -3.11 fetch_tds.py --server 10ay.online.tableau.com \
         --site mysite --datasource-name "Snowflake-Superstore" \
         --pat-name Migration-PAT --pat-secret "$env:TABLEAU_PAT_VALUE" --out .\\pulled
+
+    # NON-INTERACTIVE / agent-driven (no Key Vault, no live prompt): put
+    # TABLEAU_PAT_NAME + TABLEAU_PAT_VALUE in a git-ignored .env, then:
+    py -3.11 fetch_tds.py --server 10ay.online.tableau.com --site mysite \
+        --datasource-name "Snowflake-Superstore" --env-file .env --no-prompt --out .\\pulled
 
     # by LUID, Connected-App JWT acting as an admin
     py -3.11 fetch_tds.py --server https://10ay.online.tableau.com --site mysite \
@@ -356,42 +372,64 @@ def save_outputs(raw, out_path, name, kind="datasource"):
 
 
 def _resolve_secret_value(label, *, explicit, env_var, allow_prompt, force_prompt=False,
+                          env_file=None, keyring_service=None, keyring_username=None,
                           prompt_func=None, isatty=None, stream=None):
-    """Resolve a secret from a flag/env, else a **masked** terminal prompt -- never chat or disk.
+    """Resolve a secret from a non-interactive layer, else a **masked** prompt -- never chat or disk.
 
     Delegates to ``credential_resolver.resolve_secret`` so the value is held in memory only and is
-    never logged or persisted. When the secret is not supplied through ``explicit`` (a CLI flag) or
-    ``env_var`` and ``allow_prompt`` is set, the user is asked to type it into THIS terminal behind
-    a hidden ``getpass`` prompt. ``force_prompt`` ignores the flag/env layers and always prompts
-    (the explicit "Local Secure Prompt" choice). A short instruction is written to ``stream``
-    (stderr) before the prompt and a neutral confirmation after -- only when a prompt actually
-    happens -- and the secret VALUE is never echoed. Fails fast with ``SystemExit`` when no layer
-    yields a value (e.g. an empty entry, or no console on an unattended run). Returns the value.
-    ``prompt_func`` / ``isatty`` / ``stream`` are injectable test seams.
+    never logged or persisted. Resolution is two-phase:
+
+    * **Phase 1 -- non-interactive layers (always tried first, always preferred):** a CLI flag
+      (``explicit``), an environment variable (``env_var``), a git-ignored ``.env`` file
+      (``env_file``, looked up under the ``env_var`` key), and finally an OS keyring
+      (``keyring_service`` / ``keyring_username``). These are the ONLY layers that work in a
+      non-interactive or agent-driven run -- where each command executes in a fresh process and a
+      hidden ``getpass`` prompt cannot be seen or answered -- so they take precedence and never emit
+      a "type into the terminal" instruction.
+    * **Phase 2 -- masked terminal prompt (last resort, human-attended console only):** reached only
+      when Phase 1 found nothing and ``allow_prompt`` is set. A short instruction is written to
+      ``stream`` (stderr) *before* the hidden prompt and a neutral confirmation *after*; the secret
+      VALUE is never echoed. ``--no-prompt`` (``allow_prompt=False``) forbids it for unattended/CI.
+
+    ``force_prompt`` (the ``--prompt-secret`` choice) skips Phase 1 entirely and always prompts.
+    Fails fast with ``SystemExit`` when no layer yields a value (e.g. an empty entry, or no console
+    on an unattended run) -- the error names every non-interactive alternative first. Returns the
+    value. ``prompt_func`` / ``isatty`` / ``stream`` are injectable test seams.
     """
     stream = sys.stderr if stream is None else stream
-    use_explicit = None if force_prompt else explicit
-    use_env_var = None if force_prompt else env_var
-    direct = (use_explicit or "").strip()
-    if not direct and use_env_var:
-        direct = (os.environ.get(use_env_var) or "").strip()
-    will_prompt = allow_prompt and not direct
-    if will_prompt:
-        print(f"[auth] {label}: type it into THIS terminal now (input is hidden). "
-              f"Do NOT paste secrets into chat.", file=stream)
-    try:
-        resolved = resolve_secret(
-            label, explicit=use_explicit, env_var=use_env_var,
-            allow_prompt=allow_prompt, prompt_text=f"{label} (input hidden): ",
-            prompt_func=prompt_func, isatty=isatty)
-    except CredentialNotFound:
-        raise SystemExit(
-            f"No {label} was provided. Supply --pat-secret / the matching --secret-value, set "
-            f"{env_var}, or run in an interactive terminal so it can be entered at a hidden prompt "
-            f"(do not paste secrets into chat). An empty entry is rejected.")
-    if will_prompt and resolved.source == "prompt":
-        print(f"[auth] {label} received (hidden) -- not stored, not echoed.", file=stream)
-    return resolved.value
+
+    # Phase 1 -- non-interactive layers (flag / env var / git-ignored .env file / OS keyring).
+    if not force_prompt:
+        try:
+            return resolve_secret(
+                label, explicit=explicit, env_var=env_var, env_file=env_file,
+                keyring_service=keyring_service, keyring_username=keyring_username,
+                allow_prompt=False).value
+        except CredentialNotFound:
+            pass
+
+    # Phase 2 -- masked terminal prompt: last resort, ONLY for a real human-attended console.
+    if allow_prompt:
+        print(f"[auth] {label}: type it into THIS terminal now (input is hidden). Do NOT paste "
+              f"secrets into chat. For a non-interactive / agent-driven run, provide it instead via "
+              f"--pat-secret / the matching --secret-value, {env_var}, a git-ignored --env-file "
+              f"entry, or an OS keyring (--keyring-service) -- a hidden prompt cannot be answered "
+              f"when each command runs in its own process.", file=stream)
+        try:
+            resolved = resolve_secret(
+                label, allow_prompt=True, prompt_text=f"{label} (input hidden): ",
+                prompt_func=prompt_func, isatty=isatty)
+        except CredentialNotFound:
+            resolved = None
+        if resolved is not None:
+            print(f"[auth] {label} received (hidden) -- not stored, not echoed.", file=stream)
+            return resolved.value
+
+    raise SystemExit(
+        f"No {label} was provided. Supply --pat-secret / the matching --secret-value, set "
+        f"{env_var}, add it to a git-ignored --env-file entry, store it in an OS keyring "
+        f"(--keyring-service), or run in an interactive terminal to enter it at a hidden prompt "
+        f"(never paste secrets into chat). An empty entry is rejected.")
 
 
 def _resolve_auth(args, *, prompt_func=None, isatty=None, stream=None):
@@ -406,6 +444,11 @@ def _resolve_auth(args, *, prompt_func=None, isatty=None, stream=None):
     """
     allow_prompt = not getattr(args, "no_prompt", False)
     force_prompt = bool(getattr(args, "prompt_secret", False)) and allow_prompt
+    # non-interactive secret sources (the no-Key-Vault, agent-friendly path): a git-ignored .env
+    # file and/or an OS keyring service, both threaded into the resolver alongside flag + env var.
+    env_file = getattr(args, "env_file", None)
+    keyring_service = getattr(args, "keyring_service", None)
+    keyring_username = getattr(args, "keyring_username", None)
     if args.auth == "jwt":
         client_id = args.client_id or os.environ.get("TABLEAU_CONNECTED_APP_CLIENT_ID")
         secret_id = args.secret_id or os.environ.get("TABLEAU_CONNECTED_APP_SECRET_ID")
@@ -417,7 +460,8 @@ def _resolve_auth(args, *, prompt_func=None, isatty=None, stream=None):
         secret_value = _resolve_secret_value(
             "Tableau Connected App secret value", explicit=args.secret_value,
             env_var="TABLEAU_CONNECTED_APP_SECRET_VALUE", allow_prompt=allow_prompt,
-            force_prompt=force_prompt, prompt_func=prompt_func, isatty=isatty, stream=stream)
+            force_prompt=force_prompt, env_file=env_file, keyring_service=keyring_service,
+            keyring_username=keyring_username, prompt_func=prompt_func, isatty=isatty, stream=stream)
         scope_env = os.environ.get("TABLEAU_JWT_SCOPES")
         scopes = None
         if scope_env:
@@ -432,7 +476,8 @@ def _resolve_auth(args, *, prompt_func=None, isatty=None, stream=None):
             "TABLEAU_PAT_VALUE, or enter it at the hidden prompt.")
     pat_secret = _resolve_secret_value(
         "Tableau PAT secret", explicit=args.pat_secret, env_var="TABLEAU_PAT_VALUE",
-        allow_prompt=allow_prompt, force_prompt=force_prompt,
+        allow_prompt=allow_prompt, force_prompt=force_prompt, env_file=env_file,
+        keyring_service=keyring_service, keyring_username=keyring_username,
         prompt_func=prompt_func, isatty=isatty, stream=stream)
     return pat_name, pat_secret, None
 
@@ -459,9 +504,22 @@ def main(argv=None):
     ap.add_argument("--jwt-username", help="user to act as for --auth jwt")
     ap.add_argument("--prompt-secret", action="store_true",
                     help="always enter the secret at a hidden terminal prompt, even if an env var "
-                         "is set (the no-Key-Vault 'Local Secure Prompt' choice)")
+                         "is set (only for a human-attended terminal; a hidden prompt cannot be "
+                         "answered in a non-interactive / agent-driven run)")
     ap.add_argument("--no-prompt", action="store_true",
-                    help="never prompt for the secret (unattended/CI); require a flag or env var")
+                    help="never prompt for the secret (unattended/CI); require a flag, env var, "
+                         "--env-file entry, or --keyring-service")
+    ap.add_argument("--env-file", nargs="?", const=".env", default=None, metavar="PATH",
+                    help="read the secret from a git-ignored KEY=VALUE .env file (under the "
+                         "TABLEAU_PAT_VALUE / TABLEAU_CONNECTED_APP_SECRET_VALUE key). Bare "
+                         "--env-file uses ./.env. RECOMMENDED no-Key-Vault path for "
+                         "non-interactive / agent-driven runs -- it needs no live prompt.")
+    ap.add_argument("--keyring-service", metavar="NAME",
+                    help="read the secret from an OS keyring service name (Windows Credential "
+                         "Manager / macOS Keychain / freedesktop Secret Service; needs "
+                         "'pip install keyring'). Another non-interactive, no-Key-Vault option.")
+    ap.add_argument("--keyring-username", metavar="NAME",
+                    help="username key for --keyring-service (default: the secret's label)")
     ap.add_argument("--rest-version", default=DEFAULT_REST_VERSION,
                     help=f"Tableau REST API version (default {DEFAULT_REST_VERSION})")
     ap.add_argument("--include-extract", action="store_true",

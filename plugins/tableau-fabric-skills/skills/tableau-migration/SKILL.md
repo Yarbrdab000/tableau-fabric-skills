@@ -75,7 +75,8 @@ D5 — AUTH  (forces the auth choice)
 
 D6 — CREDENTIAL ACCESS  (only if D1=A; how I obtain the PAT / Connected-App secret)
    A) Azure Key Vault           (default — I read it into TABLEAU_PAT_VALUE at run time)
-   B) Local secure terminal     (no Key Vault — you type it into a hidden prompt; never in chat)
+   B) Local secret file/keyring (no Key Vault — I read it from a git-ignored .env or OS keyring; no prompt, works when I'm driving the run)
+   C) Interactive terminal      (no Key Vault — you type it into a hidden prompt; a real human-attended terminal ONLY)
 ```
 
 > **A workbook's datasource migrates first, then the report binds to it — exactly like an embedded
@@ -103,8 +104,10 @@ D6 — CREDENTIAL ACCESS  (only if D1=A; how I obtain the PAT / Connected-App se
 ### Phase 0B — Credentials form (simple 2-file pattern)
 
 **Ask D6 first (only when D1=A): "How would you like me to access the Tableau credentials —
-(A) Azure Key Vault, or (B) a local secure terminal prompt?"** Never accept a secret pasted into
-chat under either choice.
+(A) Azure Key Vault, (B) a git-ignored local secret file / OS keyring, or (C) an interactive hidden
+terminal prompt?"** Never accept a secret pasted into chat under any choice. **When I am driving the
+run non-interactively, choose A or B — a hidden terminal prompt (C) opens in a background process you
+cannot see or answer, so it will hang the run.**
 
 Collect the values below, then write them into a **git-ignored** local vars file — never paste the
 PAT/Connected-App secret into chat.
@@ -161,16 +164,24 @@ if ($SUBSCRIPTION_ID) { az account set --subscription $SUBSCRIPTION_ID }   # onl
 `migration.vars.example.ps1` is committed with **placeholders**; `migration.vars.local.ps1` holds
 the **real** values and is git-ignored — never commit or mirror it.
 
-> **D6=B — Local secure terminal (no Azure Key Vault).** Key Vault is the default, but it is **not
-> required**. When the user chooses the local terminal, run `fetch_tds.py` with **`--prompt-secret`**
-> (or simply leave `TABLEAU_PAT_VALUE` unset): it asks for the PAT secret at a **hidden** `getpass`
-> prompt in that terminal, exchanges it for a session token, and clears it from the process
-> environment afterward. The secret is held **in memory only** — never echoed, written to disk
-> (`.env`, logs, the report), or placed in chat — and an empty entry is rejected (fail fast). Tell
-> the user explicitly: *"enter your PAT secret in the terminal now; don't paste it in chat."* This
-> is the same masked path the layered, Key-Vault-free resolver (`scripts/credential_resolver.py`)
-> exposes — which also supports `TABLEAU_PAT_VALUE`, a git-ignored `.env`, or an OS keyring
-> (`pip install keyring`) when those are preferred. Use `--no-prompt` for unattended/CI runs.
+> **D6=B — Local secret file / keyring (no Azure Key Vault; the path to use when I drive the run).**
+> Key Vault is the default, but it is **not required**. Put the PAT **name and secret** in a
+> git-ignored `.env` (copy [`.env.example`](.env.example)) and pass **`--env-file .env --no-prompt`** on
+> each `fetch_tds.py` call — the secret is read **from the file with no prompt**, the only thing that
+> works when every command runs in its own fresh process. An OS keyring works too
+> (`--keyring-service <name>`, `pip install keyring`). The secret is held **in memory only** — never
+> echoed, written to disk (the `.env` is read, never written), placed in the report, or shown in chat —
+> and an empty entry is rejected (fail fast). Tell the user: *"put your PAT name + secret in `.env`; I
+> read it directly, nothing is pasted into chat."*
+>
+> **D6=C — Interactive hidden terminal (a genuine human-attended terminal ONLY).** Run `fetch_tds.py`
+> with **`--prompt-secret`** (or leave `TABLEAU_PAT_VALUE` unset): it asks for the PAT secret at a
+> **hidden** `getpass` prompt, exchanges it for a session token, and clears it afterward. **Do NOT
+> choose this when I am driving the run** — each command is a fresh process, so the hidden prompt opens
+> where the user cannot see or answer it (and a terminal canvas blocks paste). Use `--no-prompt` to
+> forbid any prompt in unattended/CI/agent runs. This is the same layered, Key-Vault-free resolver
+> (`scripts/credential_resolver.py`) the CLI wires end-to-end: explicit flag → `TABLEAU_PAT_VALUE` env
+> var → git-ignored `.env` (`--env-file`) → OS keyring (`--keyring-service`) → masked prompt.
 
 ### Phase 0C — Confirmation Ledger (the run gate)
 
@@ -184,7 +195,7 @@ LEDGER — confirm, then reply GO
   workbook ds: auto-detected at STEP 1.5 (scan) — never ask the user, never hand-classify (the engine reads the workbook itself)   (omit if no workbook. Embedded → consolidated automatically; published → its datasource is co-migrated FIRST so the report binds. The STEP 1.5 scan names any published datasource that isn't in scope yet and exits non-zero; fetch that name into `.\in` and re-scan until it exits 0 BEFORE STEP 2 — never build an empty workbook-only rebuild.)
   outputs    : <D3 A both / B Fabric only / C local only>
   conflicts  : <D4 overwrite | skip | stop>
-  auth       : <D5 PAT | Connected App JWT>   (D6 secret via <Key Vault KV_NAME/SECRET_NAME | local terminal prompt>)
+  auth       : <D5 PAT | Connected App JWT>   (D6 secret via <Key Vault KV_NAME/SECRET_NAME | .env/keyring file | interactive terminal prompt>)
   fabric ws  : <FABRIC_WORKSPACE>             (omit if D3=C)
 ```
 
@@ -215,7 +226,7 @@ embedded-vs-published; STEP 2 auto-detects all of that.
   if that kind isn't in scope):
 
 ```powershell
-$env:TABLEAU_PAT_VALUE = az keyvault secret show --vault-name $KV_NAME --name $SECRET_NAME --query value -o tsv   # D6=A only; omit this line for D6=B
+$env:TABLEAU_PAT_VALUE = az keyvault secret show --vault-name $KV_NAME --name $SECRET_NAME --query value -o tsv   # D6=A only; omit for D6=B (.env/keyring) and D6=C (prompt)
 New-Item -ItemType Directory -Force -Path .\in | Out-Null
 foreach ($name in @("<Datasource A>","<Published DS>")) {   # D2 datasource scope
   py -3.11 "$SKILL\scripts\fetch_tds.py" --server $SITE_URL --site $SITE_NAME `
@@ -235,9 +246,13 @@ foreach ($name in @("<Workbook A>")) {                       # D2 workbook scope
 
 `--include-extract` is **always on** — required for an extract/flat-file source, harmless on a live DB
 source (Tableau returns the `.tds` with no `.hyper`) — so it is never a per-source decision. Auth/secret
-flags come straight from the menu, never re-derived here: **D6=B** → omit the `az keyvault` line, leave
-`TABLEAU_PAT_VALUE` unset, add `--prompt-secret` to each call (user types the PAT in the terminal, never
-in chat). **D5=B (JWT)** → replace `--auth pat --pat-name $PAT_NAME` with
+flags come straight from the menu, never re-derived here: **D6=B (.env/keyring)** → omit the `az keyvault`
+line, leave `TABLEAU_PAT_VALUE` unset, and add **`--env-file .env --no-prompt`** (or
+`--keyring-service <name> --no-prompt`) to each call — the secret is read from the git-ignored file/keyring
+with no prompt (the path to use when the agent drives the run). **D6=C (interactive)** → add
+`--prompt-secret` instead, and only in a genuine human-attended terminal (never when the agent is driving —
+the hidden prompt opens where the user can't answer it). **D5=B (JWT)** → replace
+`--auth pat --pat-name $PAT_NAME` with
 `--auth jwt --client-id $CA_CLIENT_ID --secret-id $CA_SECRET_ID --jwt-username $JWT_USERNAME`. A name
 with spaces, parentheses, or an apostrophe (e.g. `Sales (Lod's)`) is fine inside the `@("…")` list — it
 is already a quoted PowerShell string; only a literal `"` inside a name must be doubled (`""`).
