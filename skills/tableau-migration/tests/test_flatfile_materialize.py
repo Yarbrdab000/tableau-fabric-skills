@@ -272,7 +272,8 @@ def test_attach_workbook_pbip_records_flatfile_data(tmp_path, monkeypatch):
                         lambda twb, **kw: {"parts": {"definition/model.tmdl": "x"},
                                            "report": res_report})
     monkeypatch.setattr(E, "_param_slicers_from_workbook", lambda twb, rep: {})
-    monkeypatch.setattr(E, "_crosscheck_report_refs", lambda parts, model_parts: (parts, []))
+    monkeypatch.setattr(E, "_crosscheck_report_refs",
+                        lambda parts, model_parts, swap_specs=None: (parts, [], []))
     monkeypatch.setattr(E, "write_local_pbip", lambda *a, **kw: None)
 
     def bound_viz(xml, name, **kw):

@@ -13,6 +13,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.75.0` → `1.76.0`): Visuals whose Y/Values used a parameter-driven
+  measure keep that measure when the model remodels it as a field parameter. When a Tableau
+  parameter-switched measure calc (e.g. the "Twitter Sentiment Analysis – Scatter Plot" `Metric`,
+  `IF [Twitter Metric Selector]="Likes" THEN [Favourite Count] ELSEIF …`) is correctly rebuilt as a
+  Power BI **field parameter** (a `Metric` table plus the underlying `Total …` measures), the report
+  still bound the scatter Y and the three "Top Tweets" bar Values to a now-nonexistent
+  `measure 'Metric'`, so the openability cross-check DROPPED those references — the scatter lost its Y
+  axis and the bars rendered empty. The cross-check now gives such a dangling measure ref one rescue
+  before dropping: when it names a swap the model turned into a field parameter (from
+  `report["field_parameters"]["specs"]`), the role is REBOUND to that field parameter — a seed
+  projection (the parameter's first candidate measure) plus a sibling `fieldParameters` binding to the
+  display column, exactly the expansion the self-service field-parameter table already emits — so the
+  visual shows the selected measure (driven by a slicer on the parameter) instead of silently losing
+  it. Surfaced additively as `pbip_ref_rebinds`. Purely additive — with no matching swap the reference
+  falls through to the same drop path, so the no-swap result is byte-identical. +2 regression tests.**
 - **tableau-migration (skill `1.74.0` → `1.75.0`): A scatter plot with tooltip measures on Detail is
   rebuilt as a scatter, not flattened to a card. Tableau's Detail shelf holds many pills at once —
   commonly several tooltip MEASURES serialised ahead of the real disaggregating DIMENSION(s) (e.g. the

@@ -2100,7 +2100,8 @@ def test_attach_workbook_pbip_refreshes_fidelity_from_rebound_run(tmp_path, monk
                         lambda twb, **kw: {"parts": {"definition/model.tmdl": "x"},
                                            "report": res_report})
     monkeypatch.setattr(me, "_param_slicers_from_workbook", lambda twb, rep: {})
-    monkeypatch.setattr(me, "_crosscheck_report_refs", lambda parts, model_parts: (parts, []))
+    monkeypatch.setattr(me, "_crosscheck_report_refs",
+                        lambda parts, model_parts, swap_specs=None: (parts, [], []))
     monkeypatch.setattr(me, "write_local_pbip", lambda *a, **kw: None)
 
     def bound_viz(xml, name, date_binding=None, measure_binding=None, row_count_binding=None,
@@ -2382,7 +2383,7 @@ def test_crosscheck_drops_dangling_refs_and_empties_orphan_visual():
             "fp", "tableEx",
             {"Values": {"projections": [col("Nonexistent")], "fieldParameters": [{"index": 0}]}}),
     }
-    new_parts, drops = me._crosscheck_report_refs(report_parts, model_parts)
+    new_parts, drops, _rebinds = me._crosscheck_report_refs(report_parts, model_parts)
 
     a = json.loads(new_parts["definition/pages/p/visuals/a/visual.json"])
     kept = [p["queryRef"] for p in a["visual"]["query"]["queryState"]["Values"]["projections"]]
@@ -2403,8 +2404,73 @@ def test_crosscheck_no_model_inventory_is_a_noop():
         {"name": "a", "visual": {"visualType": "card", "query": {"queryState": {
             "Values": {"projections": [{"field": {"Measure": {"Expression": {
                 "SourceRef": {"Entity": "_Measures"}}, "Property": "X"}}}]}}}}})}
-    out, drops = me._crosscheck_report_refs(dict(parts), {})
+    out, drops, _rebinds = me._crosscheck_report_refs(dict(parts), {})
     assert drops == [] and out == parts
+
+
+def test_crosscheck_rebinds_measure_to_field_parameter_instead_of_dropping():
+    # A parameter-driven measure calc the model remodeled into a field parameter must NOT be dropped
+    # from the visuals that used it -- it is rebound to that field parameter (seed projection + a
+    # sibling `fieldParameters` binding to the display column) so the Y/Values shows the measure.
+    model_parts = {
+        "definition/tables/_Measures.tmdl":
+            "table _Measures\n\tmeasure 'Total Favourite_Count' = SUM(Extract[Favourite_Count])\n",
+        # the field-parameter table (no measure named 'Metric' exists -> the optimistic bind dangles)
+        "definition/tables/Metric.tmdl":
+            "table Metric\n\tcolumn Metric\n\t\tsourceColumn: [Value1]\n"
+            "\tcolumn 'Metric Fields'\n\t\tisHidden\n\tcolumn 'Metric Order'\n\t\tisHidden\n",
+    }
+    swap_specs = [{
+        "calc_name": "Metric", "table_name": "Metric", "display_col": "Metric", "role": "measure",
+        "entries": [
+            {"label": "Likes", "table": "_Measures", "column": "Total Favourite_Count",
+             "is_measure": True, "order": 0},
+            {"label": "Retweets", "table": "_Measures", "column": "Total Retweet_Count",
+             "is_measure": True, "order": 1}],
+    }]
+    # a scatter whose Y is the dangling `_Measures[Metric]` and whose X is a real measure
+    visual = json.dumps({"name": "scatter", "visual": {"visualType": "scatterChart", "query": {
+        "queryState": {
+            "X": {"projections": [{"field": {"Measure": {"Expression": {
+                "SourceRef": {"Entity": "_Measures"}}, "Property": "Total Favourite_Count"}},
+                "queryRef": "_Measures.Total Favourite_Count"}]},
+            "Y": {"projections": [{"field": {"Measure": {"Expression": {
+                "SourceRef": {"Entity": "_Measures"}}, "Property": "Metric"}},
+                "queryRef": "_Measures.Metric"}]}}}}})
+    parts = {"definition/pages/p/visuals/s/visual.json": visual}
+
+    out, drops, rebinds = me._crosscheck_report_refs(parts, model_parts, swap_specs=swap_specs)
+
+    assert drops == []                                          # nothing dropped -- it was rebound
+    assert [r["visual"] for r in rebinds] == ["scatter"]
+    st = json.loads(out["definition/pages/p/visuals/s/visual.json"])[
+        "visual"]["query"]["queryState"]
+    # X untouched; Y now carries a seed projection + a fieldParameters binding to Metric[Metric]
+    assert st["X"]["projections"][0]["queryRef"] == "_Measures.Total Favourite_Count"
+    y = st["Y"]
+    seed = y["projections"][0]
+    assert seed["field"]["Measure"]["Property"] == "Total Favourite_Count"   # first candidate
+    assert seed["nativeQueryRef"] == "Likes"                                 # option label
+    fp = y["fieldParameters"][0]
+    assert fp["parameterExpr"]["Column"]["Expression"]["SourceRef"]["Entity"] == "Metric"
+    assert fp["parameterExpr"]["Column"]["Property"] == "Metric"
+    assert fp["index"] == 0 and fp["length"] == 1
+
+
+def test_crosscheck_unmatched_dangling_measure_still_drops_with_specs_present():
+    # A dangling measure ref that matches NO swap spec still drops even when other swaps are passed --
+    # the rebind is surgical (only the remodeled calc), everything else stays warn-never-wrong.
+    model_parts = {"definition/tables/_Measures.tmdl": "table _Measures\n\tmeasure 'Real' = 1\n"}
+    swap_specs = [{"calc_name": "Metric", "table_name": "Metric", "display_col": "Metric",
+                   "entries": [{"label": "Likes", "table": "_Measures", "column": "Real",
+                                "is_measure": True, "order": 0}]}]
+    visual = json.dumps({"name": "c", "visual": {"visualType": "card", "query": {"queryState": {
+        "Values": {"projections": [{"field": {"Measure": {"Expression": {
+            "SourceRef": {"Entity": "_Measures"}}, "Property": "Ghost"}}}]}}}}})
+    parts = {"definition/pages/p/visuals/c/visual.json": visual}
+    out, drops, rebinds = me._crosscheck_report_refs(parts, model_parts, swap_specs=swap_specs)
+    assert rebinds == []
+    assert [d["visual"] for d in drops] == ["c"] and drops[0]["emptied"] is True
 
 
 def test_workbook_pbip_disabled_when_pbip_false(tmp_path):

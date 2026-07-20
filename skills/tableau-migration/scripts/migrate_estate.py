@@ -1150,8 +1150,28 @@ def _ref_name_kind(field):
     return None, None
 
 
-def _crosscheck_report_refs(report_parts, model_parts):
-    """Drop viz projections that reference a model object the migration did not emit.
+def _fp_swap_lookup(swap_specs):
+    """``{lower-name: spec}`` for every convertible field-parameter swap.
+
+    Keyed by the swap's ``calc_name``, ``display_col`` AND ``table_name`` (all lower-cased) so a
+    report projection that named the parameter-driven measure calc under any of those resolves to
+    its spec. Only specs that carry at least one resolvable ``entries`` candidate (a seed field) are
+    indexed -- a spec with no seed cannot be rebound and must fall through to the drop path. Returns
+    ``{}`` for ``None``/empty specs (the byte-identical no-swap path).
+    """
+    lut = {}
+    for spec in (swap_specs or []):
+        if not (isinstance(spec, dict) and (spec.get("entries") or [])):
+            continue
+        for key in (spec.get("calc_name"), spec.get("display_col"), spec.get("table_name")):
+            if key:
+                lut.setdefault(key.lower(), spec)
+    return lut
+
+
+def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
+    """Reconcile viz projections against the emitted model: REBIND a measure the model remodeled as
+    a field parameter, else DROP a reference the model did not emit.
 
     ``twb_to_pbir._resolve_field`` binds a calculated-field reference optimistically to
     ``_Measures[<caption>]`` without validating it against the emitted model (the field index
@@ -1159,15 +1179,42 @@ def _crosscheck_report_refs(report_parts, model_parts):
     calc), stubbed, or dropped leaves a **dangling** ``_Measures[X]`` reference -- a "missing field"
     in Power BI. At this seam both halves are in hand, so we deterministically verify every
     projection against the real model: a measure ref must name an emitted measure, a column ref an
-    emitted column. Unresolved projections are dropped (warn-never-wrong: drop rather than mis-bind);
-    a visual that loses every projection is emptied to a placeholder zone so it never renders broken.
-    Field-parameter visuals are skipped (a separately validated construct). Returns
-    ``(report_parts, drops)`` where ``drops`` is ``[{"visual", "dropped": [...], "emptied": bool}]``.
+    emitted column.
+
+    A dangling measure ref gets one rescue before it is dropped: when the model remodeled that
+    parameter-driven measure calc into a Power BI **field parameter** (``swap_specs`` from
+    ``report["field_parameters"]["specs"]``), the projection is REBOUND to that field parameter --
+    the role gets a seed projection (the parameter's first candidate measure) plus a sibling
+    ``fieldParameters`` binding to the parameter's display column, exactly the expansion
+    ``twb_to_pbir.field_parameter_table_visual`` emits. The visual then shows the selected measure
+    (driven by a slicer on the field parameter) instead of silently losing its Y/Values. This is
+    additive: with no ``swap_specs`` (or no matching swap) the reference falls through to the same
+    drop path as before, so the no-swap result is byte-identical.
+
+    Anything still unresolved is dropped (warn-never-wrong: drop rather than mis-bind); a visual that
+    loses every projection is emptied to a placeholder zone so it never renders broken. Visuals that
+    ALREADY encode a field parameter are skipped (a separately validated construct). Returns
+    ``(report_parts, drops, rebinds)`` where ``drops`` is
+    ``[{"visual", "dropped": [...], "emptied": bool}]`` and ``rebinds`` is
+    ``[{"visual", "rebound": [...]}]``.
     """
     measures, columns = _model_object_names(model_parts)
-    drops = []
+    drops, rebinds = [], []
     if not (measures or columns):
-        return report_parts, drops  # no model object inventory -> do not risk false drops
+        return report_parts, drops, rebinds  # no model object inventory -> do not risk false drops
+    fp_lut = _fp_swap_lookup(swap_specs)
+    seed_fn = None
+    if fp_lut:  # only reach for the seed-projection builder when a rebind is actually possible
+        try:
+            from . import twb_to_pbir as _tp
+        except ImportError:
+            try:
+                import twb_to_pbir as _tp
+            except ImportError:
+                _tp = None
+        seed_fn = getattr(_tp, "_fp_seed_projection", None) if _tp else None
+        if not callable(seed_fn):
+            fp_lut = {}  # cannot build a valid seed -> disable rebind, fall back to drop
     for path, content in list((report_parts or {}).items()):
         if not (isinstance(content, str) and path.endswith("visual.json")):
             continue
@@ -1179,28 +1226,47 @@ def _crosscheck_report_refs(report_parts, model_parts):
         qs = ((vis.get("query") or {}).get("queryState")) or {}
         if not qs or any(isinstance(s, dict) and s.get("fieldParameters") for s in qs.values()):
             continue
-        dropped = []
+        dropped, rebound = [], []
         for role, spec in list(qs.items()):
             if not isinstance(spec, dict):
                 continue
-            kept = []
+            kept, fp_binds = [], list(spec.get("fieldParameters") or [])
             for p in spec.get("projections", []):
                 name, kind = _ref_name_kind((p or {}).get("field") or {})
                 low = name.lower() if isinstance(name, str) else None
                 ok = (low in measures if kind == "measure"
                       else low in columns if kind == "column"
                       else True)  # unknown ref shape -> keep (conservative)
-                (kept if ok else dropped).append(p if ok else f"{role}:{kind or '?'} {name!r}")
+                if ok:
+                    kept.append(p)
+                    continue
+                fp = fp_lut.get(low) if (kind == "measure" and low and seed_fn) else None
+                if fp:  # model remodeled this measure calc as a field parameter -> rebind, not drop
+                    fp_binds.append({
+                        "parameterExpr": {"Column": {
+                            "Expression": {"SourceRef": {"Entity": fp["table_name"]}},
+                            "Property": fp["display_col"]}},
+                        "index": len(kept), "length": 1})
+                    kept.append(seed_fn(fp["entries"][0]))
+                    rebound.append(f"{role}:measure {name!r} -> field parameter "
+                                   f"{fp['table_name']}[{fp['display_col']}]")
+                else:
+                    dropped.append(f"{role}:{kind or '?'} {name!r}")
             spec["projections"] = kept
+            if fp_binds:
+                spec["fieldParameters"] = fp_binds
             if not kept:
                 del qs[role]
-        if dropped:
+        if dropped or rebound:
             emptied = not qs
             if emptied:
                 vis.pop("query", None)
             report_parts[path] = json.dumps(j, indent=2)
-            drops.append({"visual": j.get("name"), "dropped": dropped, "emptied": emptied})
-    return report_parts, drops
+            if dropped:
+                drops.append({"visual": j.get("name"), "dropped": dropped, "emptied": emptied})
+            if rebound:
+                rebinds.append({"visual": j.get("name"), "rebound": rebound})
+    return report_parts, drops, rebinds
 
 
 def _date_binding_from_model(res_report):
@@ -2260,7 +2326,16 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
     # M1.3 ref cross-check: now that the real model is in hand, drop any viz projection that
     # references a measure/column the model did not emit (an optimistic `_Measures[caption]` bind
     # that dangles), so the whole viz layer is warn-never-wrong on field references -- not just MV.
-    report_parts, ref_drops = _crosscheck_report_refs(report_parts, res.get("parts"))
+    report_parts, ref_drops, ref_rebinds = _crosscheck_report_refs(
+        report_parts, res.get("parts"),
+        swap_specs=(res_report.get("field_parameters") or {}).get("specs") or None)
+    if ref_rebinds:
+        entry["pbip_ref_rebinds"] = ref_rebinds
+        for r in ref_rebinds:
+            warns.append(_PBIP_WARN + f"visual {r['visual']!r} rebound {len(r['rebound'])} "
+                         f"measure reference(s) to a field parameter (the model remodeled a "
+                         f"parameter-driven measure): {', '.join(r['rebound'])} -- keep a slicer on "
+                         f"the field parameter to drive which measure is shown")
     if ref_drops:
         entry["pbip_ref_drops"] = ref_drops
         for d in ref_drops:
