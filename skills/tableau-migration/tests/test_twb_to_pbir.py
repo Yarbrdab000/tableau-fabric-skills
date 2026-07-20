@@ -19,6 +19,7 @@ from twb_to_pbir import (
     SCHEMA_VISUAL_FP,
     SCHEMA_VISUAL_SM,
     _DATE_EXACT_DERIVATIONS,
+    _INTEGER_DATE_PART_COLUMNS,
     _apply_grow_to_fit,
     _apply_override,
     _candidate_plan,
@@ -2265,6 +2266,91 @@ def test_no_date_binding_leaves_date_on_fact_column():
     col = ir["worksheets"][0]["cols"][0]
     assert (col["entity"], col["property"]) == ("Orders", "Order_Date")
     assert any("date part" in x["reason"].lower() for x in ir["warnings"])
+
+
+# -- date-part FILTER selection rebinds to the calendar (consume the date facts) -----------------
+# A worksheet quick-filter that keeps specific date PART members (e.g. "Month in {4}", "Year in
+# {2020, 2021}") on the ACTIVE business date previously bound to the fact's raw datetime column and
+# then DROPPED the applied selection (an integer member can't bind to a datetime column) -- so the
+# rebuilt report opened on ALL months/years, silently over-including. With the model's date_binding
+# the filter field rebinds to the marked calendar's integer part column (Date[Month]/[Year]) and the
+# selection re-emits as an integer categorical filterConfig, so the report opens on the SAME filtered
+# view. Standalone (no date_binding) stays byte-identical: deferred + a fidelity note.
+def test_date_part_month_filter_rebinds_and_emits_integer_selection():
+    filt = ("<filter class='categorical' column='[federated.abc].[mn:Order Date:ok]'>"
+            "<groupfilter function='member' member='&quot;4&quot;' /></filter>")
+    ws = _worksheet("MonthFilter", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, filters=filt)
+    ir = parse_twb(_workbook(ws), date_binding=_DATE_BINDING)
+    f0 = ir["worksheets"][0]["filters"][0]
+    assert (f0["entity"], f0["property"], f0.get("date_rebound")) == ("Date", "Month", True)
+    # the applied Month=4 selection is faithfully bound (no longer deferred) -> no fidelity note
+    assert _filter_scope_warnings(ir) == []
+    cont = _slicer_filter_configs(emit_pbir(ir))[0]["filters"][0]
+    assert cont["type"] == "Categorical"
+    assert cont["field"]["Column"]["Property"] == "Month"
+    assert cont["field"]["Column"]["Expression"]["SourceRef"]["Entity"] == "Date"
+    in_expr = cont["filter"]["Where"][0]["Condition"]["In"]
+    # INTEGER literal (4L), not a string ('4') -- a string would match no row on the integer column
+    assert [row[0]["Literal"]["Value"] for row in in_expr["Values"]] == ["4L"]
+
+
+def test_date_part_year_filter_multi_member_rebinds_to_integer_in_list():
+    yr = ("<column-instance column='[Order Date]' derivation='Year' "
+          "name='[yr:Order Date:ok]' pivot='key' type='ordinal' />")
+    filt = ("<filter class='categorical' column='[federated.abc].[yr:Order Date:ok]'>"
+            "<groupfilter function='union' op='manual'>"
+            "<groupfilter function='member' member='&quot;2020&quot;' />"
+            "<groupfilter function='member' member='&quot;2021&quot;' />"
+            "</groupfilter></filter>")
+    ws = _worksheet("YearFilter", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST + yr, filters=filt)
+    ir = parse_twb(_workbook(ws), date_binding=_DATE_BINDING)
+    f0 = ir["worksheets"][0]["filters"][0]
+    assert (f0["entity"], f0["property"]) == ("Date", "Year")
+    in_expr = (_slicer_filter_configs(emit_pbir(ir))[0]["filters"][0]
+               ["filter"]["Where"][0]["Condition"]["In"])
+    assert [row[0]["Literal"]["Value"] for row in in_expr["Values"]] == ["2020L", "2021L"]
+
+
+def test_date_part_filter_without_date_binding_is_byte_identical_defer():
+    # The exact same Month=4 filter with NO date_binding stays on the fact column and DEFERS the
+    # applied selection with a fidelity note -- the standalone path is untouched by the date fix.
+    filt = ("<filter class='categorical' column='[federated.abc].[mn:Order Date:ok]'>"
+            "<groupfilter function='member' member='&quot;4&quot;' /></filter>")
+    ws = _worksheet("MonthFilter", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, filters=filt)
+    ir = parse_twb(_workbook(ws))  # no date_binding
+    f0 = ir["worksheets"][0]["filters"][0]
+    assert (f0["entity"], f0["property"]) == ("Orders", "Order_Date")
+    assert _slicer_filter_configs(emit_pbir(ir)) == []
+    assert any("not faithfully bindable" in r for r in _filter_scope_warnings(ir))
+
+
+def test_string_date_part_filter_stays_deferred_even_when_rebound():
+    # A Weekday part rebinds to the STRING "Day Name" column, whose members are weekday numbers in
+    # Tableau -- NOT faithfully bindable -- so even rebound it defers with a note (warn-never-wrong).
+    wd = ("<column-instance column='[Order Date]' derivation='Weekday' "
+          "name='[dw:Order Date:ok]' pivot='key' type='ordinal' />")
+    filt = ("<filter class='categorical' column='[federated.abc].[dw:Order Date:ok]'>"
+            "<groupfilter function='member' member='&quot;2&quot;' /></filter>")
+    ws = _worksheet("WeekdayFilter", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST + wd, filters=filt)
+    ir = parse_twb(_workbook(ws), date_binding=_DATE_BINDING)
+    f0 = ir["worksheets"][0]["filters"][0]
+    # it DID rebind to the calendar column (Day Name), but the selection is not emitted
+    assert f0["entity"] == "Date"
+    assert f0["property"] not in _INTEGER_DATE_PART_COLUMNS
+    assert _slicer_filter_configs(emit_pbir(ir)) == []
+    assert any("not faithfully bindable" in r for r in _filter_scope_warnings(ir))
 
 
 # -- geographic maps (filled + symbol; basics only) ----------------------------

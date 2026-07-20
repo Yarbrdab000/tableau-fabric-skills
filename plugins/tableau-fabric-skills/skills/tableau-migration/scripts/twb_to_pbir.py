@@ -291,6 +291,15 @@ _DEFAULT_DATE_GRAIN_COLUMNS = {
     "ISO-Year": "ISO Year", "ISO-Week": "Week of Year",
 }
 
+# The subset of shared Date-dimension columns that are INTEGER-valued AND whose Tableau date-part
+# member integer equals the DAX function output verbatim -- Year (YEAR), Quarter (QUARTER), Month
+# (MONTH), Day (DAY). For these, an applied date-part filter selection (e.g. keep Month in {4}) can be
+# re-emitted faithfully as an integer categorical filter on the calendar column once the field has
+# been rebound to it. "Week of Year" (Tableau week numbering can diverge from DAX WEEKNUM), "Day Name"
+# (a string column, not the weekday integer), and "ISO Year" are deliberately excluded -- their
+# applied selections stay at the slicer's "show all" default with a fidelity note (warn-never-wrong).
+_INTEGER_DATE_PART_COLUMNS = frozenset({"Year", "Quarter", "Month", "Day"})
+
 # The model build's marked Date table also carries a single drill hierarchy named "Calendar"
 # (Year -> Quarter -> Month -> Week -> Day) -- see tmdl_generate.generate_date_table_tmdl. A
 # CONTINUOUS Tableau date truncation (a green ``t*:`` pill, e.g. DATETRUNC('month')) is a
@@ -1463,7 +1472,8 @@ def _dedupe_str(values):
 
 
 def _parse_filters(ws, ds_default, base_cols, instances, index, ds_caption,
-                   worksheet, warnings, warn_special=True, internal_fields=None):
+                   worksheet, warnings, warn_special=True, internal_fields=None,
+                   date_binding=None):
     """Returns ``(filters, swap_controls)``. ``swap_controls`` carries any parameter-driven
     sheet-swap visibility controls detected on this worksheet (a categorical filter pinned to a
     pure parameter-passthrough calc). Recognising them structurally keeps them from being
@@ -1475,9 +1485,15 @@ def _parse_filters(ws, ds_default, base_cols, instances, index, ds_caption,
         ds, fid = _split_token_attr(filt.get("column"))
         if fid is None:
             continue
+        # Thread ``date_binding`` so a discrete date PART filter on the active business date (e.g. a
+        # "keep Year in {2021, 2022}" card) rebinds to the marked Date table's calendar column
+        # (Date[Year]) exactly like the same pill on an axis -- instead of staying on the fact's raw
+        # datetime column, where the integer-year members match no datetime value and silently empty
+        # the visual. Same tight gate as the axis path (active date + mapped part only); a secondary/
+        # inactive date, or any workbook with no date_binding, is byte-identical to before.
         f = _resolve_field(ds or ds_default, fid, base_cols, instances, index,
                            ds_caption, worksheet, warnings, warn_special=warn_special,
-                           internal_fields=internal_fields)
+                           internal_fields=internal_fields, date_binding=date_binding)
         if f is None:
             continue
         # Parameter-driven sheet swap: a categorical filter pinned to a pure passthrough control
@@ -2854,7 +2870,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                                  column_binding=column_binding)
     filters, swap_controls = _parse_filters(view, ds_default, base_cols, instances, index,
                                             ds_caption, name, warnings, warn_special=warn_special,
-                                            internal_fields=internal_fields)
+                                            internal_fields=internal_fields, date_binding=date_binding)
     sort = _parse_sort(view, ds_default, base_cols, instances, index,
                        ds_caption, name, warnings, internal_fields=internal_fields)
 
@@ -5663,11 +5679,15 @@ def _filter_container(entity, prop, condition, name, *, ftype, inverted=False):
     return container
 
 
-def _categorical_condition(entity, prop, values, *, exclude):
+def _categorical_condition(entity, prop, values, *, exclude, numeric=False):
+    # ``numeric=True`` emits integer literals (``4L``) instead of quoted strings -- used when an
+    # applied date-part selection (month ``4``, year ``2021``) has been rebound onto an INTEGER
+    # calendar column (Date[Month]/[Year]/...), where a string literal would match no row.
+    lit = _semantic_numeric_literal if numeric else _semantic_string_literal
     col = _filter_column_ref(entity, prop, source=_FILTER_SOURCE_ALIAS)
     in_expr = {"In": {
         "Expressions": [col],
-        "Values": [[{"Literal": {"Value": _semantic_string_literal(v)}}] for v in values],
+        "Values": [[{"Literal": {"Value": lit(v)}}] for v in values],
     }}
     return {"Not": {"Expression": in_expr}} if exclude else in_expr
 
@@ -5746,6 +5766,24 @@ def _slicer_filter_config(field, model_table, field_map, name, warnings):
     cap = field.get("caption") or prop
     sel, rng = field.get("selection"), field.get("range")
     if sel:
+        # A date-part selection (month "4", year "2021") rebound onto an INTEGER calendar column
+        # (Date[Month]/[Year]/[Quarter]/[Day]) binds faithfully as an integer categorical filter --
+        # the member value equals the DAX part function output verbatim -- so the report opens on the
+        # SAME filtered years/months instead of dropping the selection to "show all". Tightly gated:
+        # the field must have been rebound by the date machinery, land on one of the four exact
+        # integer part columns, and carry only clean-integer members. Everything else (string parts
+        # like Day Name, Week numbering, non-integer members) falls through to the existing paths.
+        rebound_int_values = [v for v in sel["values"] if v != "%null%"]
+        if (field.get("date_rebound") and prop in _INTEGER_DATE_PART_COLUMNS
+                and rebound_int_values
+                and all(_semantic_numeric_literal(v) is not None
+                        and _semantic_numeric_literal(v).endswith("L")
+                        for v in rebound_int_values)):
+            cond = _categorical_condition(entity, prop, rebound_int_values,
+                                          exclude=(sel["mode"] == "exclude"), numeric=True)
+            return {"filters": [_filter_container(
+                entity, prop, cond, name, ftype="Categorical",
+                inverted=(sel["mode"] == "exclude"))]}
         if dt not in ("string", "boolean"):
             warnings.append(_warn(
                 "filter", cap,
