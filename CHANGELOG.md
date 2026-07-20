@@ -13,6 +13,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.84.0` → `1.85.0`): Native treemap support — a Tableau treemap now
+  rebuilds as a Power BI `treemap` visual instead of degrading to a card or an unsupported warning.**
+  On the *Simple Example* workbook the **Tree Map** sheet (a categorical dimension on the **Text** shelf,
+  sized by a measure on **Size**, an Automatic mark, no axis pills) previously classified as a `card`
+  (label-shelf dimensions are not counted toward `has_dim`) — or, when the tiling dimension sat on
+  Detail, as `unsupported`. Fix (additive, `twb_to_pbir.py`): a new `VT_TREEMAP` type + `_VT_TO_PBIR`
+  mapping to PBIR `"treemap"`; a detection pass that rescues **both** a card- and unsupported-classified
+  worksheet when a **categorical dimension is on Text** with a measure on Size/Colour (the Text-shelf
+  requirement keeps it OFF a packed-bubble/heat layout — dimension on Detail + measure on Colour stays
+  unsupported — and OFF a bare KPI card). `_build_query_state` emits Group (tiling dimension, calc
+  dimensions preserved — never `drop_calc_axis`'d), Details (extra category dims), and Values (the size
+  measure); a continuous colour measure shades the tiles via the existing `_chart_continuous_fill`
+  path. `treemap` is added to the continuous-fill and colour-gradient chart-type gates and to
+  `_CANDIDATE_ALTS`. +7 regression tests; `treemap` + `Group`/`Details` role keys added to the PBIR
+  provenance allowlist. Default emit for every other layout is byte-identical.
 - **tableau-migration (skill `1.83.0` → `1.84.0`): Preserve a color-role visual calculation through the
   report rebind pass so the heat map colors by the percent-difference calc, not the raw rebound measure.**
   On the *Simple Example* workbook (Test Dashboard 2) the **Measure Swap Heat Map** colored correctly in

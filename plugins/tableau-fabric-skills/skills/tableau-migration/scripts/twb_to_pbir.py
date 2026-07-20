@@ -215,6 +215,7 @@ VT_COMBO = "combo"        # lineClusteredColumnComboChart (column measure(s) on 
 VT_WATERFALL = "waterfall"  # waterfallChart (running-total Gantt hack: dimension Category + base measure Y)
 VT_DONUT = "donut"          # donutChart (dual-axis pie/donut hack: legend Category + angle measure Y)
 VT_RIBBON = "ribbon"        # ribbonChart (bump/rank hack: ordinal Category + legend Series + base measure Y)
+VT_TREEMAP = "treemap"      # treemap (marks-card dimension tiled by a measure; no axis pills)
 VT_UNSUPPORTED = "unsupported"
 
 _VT_TO_PBIR = {
@@ -254,6 +255,10 @@ _VT_TO_PBIR = {
     # axis) + Series (legend) + Y (base measure) verified against real Microsoft PBIR ribbonChart
     # visual.json files (microsoft/fabric-toolbox) + the visualContainer 1.5.0 schema.
     VT_RIBBON: "ribbonChart",
+    # Marks-card dimension tiled by a measure (Automatic/Square mark, no axis pills) -> native
+    # treemap. Roles Group (category) + Values (size measure) + optional Details (extra categories);
+    # a continuous colour measure shades the tiles via the chart continuous-fill path.
+    VT_TREEMAP: "treemap",
 }
 
 # Mark classes that, when two measures on one shelf carry DIFFERENT mark families, signal a
@@ -3077,6 +3082,31 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                     "running-total Gantt hack -> native waterfallChart "
                     "(Power BI recomputes the running total; per-step gantt size dropped)")
 
+        # Treemap: a categorical TILING dimension on the Text (label) shelf -- the defining treemap
+        # signal (the labelled tiles) -- sized by a measure on Size (or Colour when there is no Size),
+        # with NO axis pills and an Automatic/Square mark, is Tableau's treemap. Power BI has a native
+        # treemap -> Group = the Text dimension (plus any extra category Detail/Colour dims as
+        # Details), Values = the size measure; a continuous colour measure shades the tiles via
+        # _chart_continuous_fill. Requiring the category on TEXT is what keeps this OFF a
+        # packed-bubble / heat layout (dimension on Detail + measure on Colour, which stays
+        # unsupported) and OFF a bare KPI card (a measure on Label with no category) -- so it can
+        # safely rescue BOTH a card- and an unsupported-classified worksheet (a Text dimension + a
+        # Size measure with no axis is a card by the measure-no-axis-dim rule, since label dims are
+        # not counted in enc_dims). Geographic dimensions defer to map routing (not geo_detail).
+        if (visual_type in (VT_CARD, VT_UNSUPPORTED) and not (dims_rows or dims_cols)
+                and not geo_detail
+                and (mark or "").strip().lower() in ("automatic", "square", "")
+                and encodings["label"] and encodings["label"]["kind"] == "category"):
+            tm_group = [f for f in (encodings["label"], encodings["detail"], encodings["color"])
+                        if f and f["kind"] == "category"]
+            tm_value = next((f for f in (encodings["size"], encodings["color"])
+                             if f and f["kind"] == "value"), None)
+            if tm_group and tm_value is not None:
+                visual_type = VT_TREEMAP
+                fidelity_note = (
+                    "categorical dimension on Text + a measure on Size/Colour (no axis pills) "
+                    "-> native treemap (Group + Values; continuous colour shades the tiles)")
+
         # Single-dimension "text list" display: a lone categorical field carried only on the
         # marks card (label / colour / detail) with no measure anywhere and no axis pills is
         # Tableau's Automatic text rendering of that field -> a faithful one-column table that
@@ -3164,7 +3194,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     # measure. Other visual types (cards / pies / maps) carry their colour elsewhere -- not parsed here.
     color_gradient = None
     if visual_type in (VT_MATRIX, VT_TABLE, VT_COLUMN, VT_BAR, VT_LINE,
-                       VT_AREA, VT_SCATTER, VT_COMBO):
+                       VT_AREA, VT_SCATTER, VT_COMBO, VT_TREEMAP):
         color_gradient = _parse_color_gradient(table)
         if color_gradient is None:
             # No explicit ``<color-palette>`` in the worksheet FORMAT style, but a continuous MEASURE
@@ -4071,6 +4101,34 @@ def _build_query_state(ws, model_table, field_map, warnings):
         if series:
             state["Series"] = {"projections": _role_projections(
                 series, model_table, field_map, used_refs)}
+    elif vt == VT_TREEMAP:
+        # Group = the tiling dimension(s): Text/Detail, or a categorical Colour. Values = the SIZE
+        # measure (tile area); when there is no Size, fall back to a value Colour/Label so a single-
+        # measure treemap still sizes its tiles. A *continuous* Colour measure is NOT a second Values
+        # -- it drives the tile fill via _chart_continuous_fill. Extra category dimensions beyond the
+        # first -> Details. Role keys Group / Details / Values match a real Desktop treemap visual.json.
+        #
+        # CALC-DIMENSION GOTCHA: do NOT drop_calc_axis() the Group. drop_calc_axis only drops calc
+        # *measures* (is_calc and binding=="measure"); a calc *dimension* (a field-parameter "swap"
+        # field like `Dim Swap calc 2`, is_calc=True, binding=="column") is a VALID treemap Group and
+        # must be kept -- dropping it would leave the treemap with no Group and silently vanish the
+        # visual (and, if it is the page's only visual, the whole page).
+        group = _dedupe([f for f in (label, detail, color)
+                         if f and f["kind"] == "category"])
+        val = _dedupe(
+            ([size] if size and size["kind"] == "value" else [])
+            or ([color] if color and color["kind"] == "value" else [])
+            or ([label] if label and label["kind"] == "value" else []))
+        primary, details = group[:1], group[1:]
+        if primary:
+            state["Group"] = {"projections": _role_projections(
+                primary, model_table, field_map, used_refs)}
+        if details:
+            state["Details"] = {"projections": _role_projections(
+                details, model_table, field_map, used_refs)}
+        if val:
+            state["Values"] = {"projections": _role_projections(
+                val, model_table, field_map, used_refs)}
     elif vt in (VT_COLUMN, VT_BAR):
         cat = drop_calc_axis(_dedupe(categories(rows) + categories(cols)))
         val = _dedupe(values(rows) + values(cols))
@@ -4350,6 +4408,9 @@ def _query_state_complete(vt, state):
         return "Values" in state and ("Rows" in state or "Columns" in state)
     if vt == VT_TABLE:
         return "Values" in state
+    if vt == VT_TREEMAP:
+        # A faithful treemap needs at least a Group (the tiling) and Values (the sizing measure).
+        return "Group" in state and "Values" in state
     return False
 
 
@@ -4402,6 +4463,7 @@ _CANDIDATE_ALTS = {
     VT_SHAPE_MAP: (["filledMap", "map"], "medium", None),
     VT_TABLE: (["pivotTable"], "medium", None),
     VT_MATRIX: (["tableEx"], "medium", None),
+    VT_TREEMAP: (["clusteredBarChart", "clusteredColumnChart"], "medium", None),
 }
 
 
@@ -5183,7 +5245,7 @@ def _measure_series_colors(ws, state, vtype, warnings):
 # Power BI Desktop honours for a per-mark continuous fill. Verified against a Desktop render of a
 # scatter + bar coloured by a continuous measure. Discrete colour (a dimension member palette or a
 # Measure-Names series) is handled by ``_data_point_colors`` / ``_measure_series_colors`` instead.
-_CHART_CONTINUOUS_FILL_TYPES = (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA, VT_SCATTER, VT_COMBO)
+_CHART_CONTINUOUS_FILL_TYPES = (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA, VT_SCATTER, VT_COMBO, VT_TREEMAP)
 
 
 def _chart_continuous_fill(ws, state, vtype, model_table, field_map, warnings):

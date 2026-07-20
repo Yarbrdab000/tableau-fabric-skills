@@ -86,6 +86,7 @@ VERIFIED_NON_CORPUS_VISUAL_TYPES = frozenset({
     "waterfallChart",                 # running-total Gantt hack
     "donutChart",                     # dual-axis pie/donut hack
     "ribbonChart",                    # bump/rank hack
+    "treemap",                        # marks-card tiling dim + size measure (native PBIR treemap)
     # Emitter literals outside the _VT_TO_PBIR mark map:
     "card", "multiRowCard",           # _resolve_visual_type card split
     "listSlicer",                     # field-parameter self-service page
@@ -94,6 +95,7 @@ VERIFIED_NON_CORPUS_ROLE_KEYS = frozenset({
     "Y2", "Series", "Breakdown",      # combo / waterfall / ribbon legend
     "SmallMultiple",                  # small-multiples well
     "Rows", "Columns",                # pivotTable wells
+    "Group", "Details",               # treemap wells (Group = tiling dim, Details = extra dims)
     "X", "Size",                      # scatter / bubble map
     "Value",                          # shapeMap "Color saturation" well (singular)
     "Gradient",                       # Bing-map "Color saturation" well

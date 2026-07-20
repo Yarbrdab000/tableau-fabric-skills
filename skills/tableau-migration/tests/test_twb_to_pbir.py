@@ -5058,6 +5058,87 @@ def test_scatter_bare_continuous_colour_emits_automatic_default_fill():
     assert rec["chart_continuous_fill"]["default_palette"] is True
 
 
+# -- treemap (marks-card dimension tiled by a measure; no axis pills) ---------------------------------
+# A Tableau treemap is an Automatic/Square mark with a dimension on Text (the tiles) sized by a measure
+# on Size, optionally shaded by a continuous measure on Colour -- and NO axis pills. Power BI has a
+# native treemap (Group + Values), and the continuous colour reuses the cartesian dataPoint.fill path.
+def _treemap_worksheet(name="Tree Map", mark="Automatic",
+                       text_col="[federated.abc].[none:Category:nk]",
+                       size_col="[federated.abc].[sum:Sales:qk]",
+                       color_col="[federated.abc].[sum:Sales:qk]",
+                       deps_extra=_INST, style=""):
+    enc = "<encodings>"
+    if text_col:
+        enc += f"<text column='{text_col}' />"
+    if size_col:
+        enc += f"<size column='{size_col}' />"
+    if color_col:
+        enc += f"<color column='{color_col}' />"
+    enc += "</encodings>"
+    return _worksheet(name, mark, rows="", cols="", deps_extra=deps_extra, encodings=enc, style=style)
+
+
+def test_marks_card_dim_sized_by_measure_is_treemap():
+    ir = parse_twb(_workbook(_treemap_worksheet()))
+    w = ir["worksheets"][0]
+    assert w["visual_type"] == "treemap"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "treemap"
+    state = _query_state(vis)
+    assert "Group" in state and "Values" in state
+    assert state["Group"]["projections"][0]["field"]["Column"]["Property"] == "Category"
+    assert state["Values"]["projections"][0]["field"]["Aggregation"]["Function"] == 0  # Sum(Sales)
+
+
+def test_vt_treemap_maps_to_pbir_treemap():
+    from twb_to_pbir import _VT_TO_PBIR, VT_TREEMAP
+    assert _VT_TO_PBIR[VT_TREEMAP] == "treemap"
+
+
+def test_treemap_continuous_colour_measure_shades_tiles():
+    # A continuous measure on Colour shades the tiles via a dataPoint.fill FillRule -- the SAME per-mark
+    # fill the cartesian charts emit, NOT a second Values well. Size = Sales, Colour = Profit: Values
+    # sizes the tiles by Sales while the fill shades them by Profit -- both bind faithfully.
+    ws = _treemap_worksheet(
+        color_col="[federated.abc].[sum:Profit:qk]",
+        style=_mark_color_style("[federated.abc].[sum:Profit:qk]", "ordered-diverging",
+                                _CONT_STOPS, center="0.0", enc_type="custom-interpolated"))
+    vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
+    assert vj["visual"]["visualType"] == "treemap"
+    fr = _chart_fill_rule(vj)
+    assert fr is not None, "expected a continuous dataPoint fill on the treemap tiles"
+    inp = fr["properties"]["fill"]["solid"]["color"]["expr"]["FillRule"]["Input"]
+    assert inp["Aggregation"]["Expression"]["Column"]["Property"] == "Profit"
+    state = _query_state(vj)
+    val_col = state["Values"]["projections"][0]["field"]["Aggregation"]["Expression"]["Column"]["Property"]
+    assert val_col == "Sales_Amount"                 # the colour measure did not displace the size Values
+
+
+def test_packed_bubble_circle_marks_card_is_not_a_treemap():
+    # A Circle (packed-bubble) marks-card layout is excluded from the treemap rescue by the mark gate
+    # and keeps its own path -- the treemap must never hijack it.
+    ir = parse_twb(_workbook(_treemap_worksheet(mark="Circle")))
+    assert ir["worksheets"][0]["visual_type"] != "treemap"
+
+
+def test_square_mark_with_axis_dims_stays_matrix_not_treemap():
+    # A Square mark WITH dims on both rows and cols (a heat grid / "Measure Swap Heat Map") is already a
+    # matrix; the treemap rescue is gated on EMPTY rows/cols so it never reaches this worksheet.
+    enc = "<encodings><size column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    ws = _worksheet("Heat Grid", "Square",
+                    rows="[federated.abc].[none:Category:nk]",
+                    cols="[federated.abc].[none:Region:nk]",
+                    deps_extra=_INST, encodings=enc)
+    assert parse_twb(_workbook(ws))["worksheets"][0]["visual_type"] == "matrix"
+
+
+def test_dimension_only_marks_card_stays_text_list_table_not_treemap():
+    # A dimension-only marks card (no measure anywhere) is Tableau's text list -> a one-column table,
+    # NOT a treemap (the treemap rescue requires a marks-card measure via tm_value).
+    ir = parse_twb(_workbook(_treemap_worksheet(size_col=None, color_col=None)))
+    assert ir["worksheets"][0]["visual_type"] == "table"
+
+
 def test_continuous_colour_sequential_emits_lineargradient2():
     ws = _cont_color_chart_ws(center=None, palette_type="ordered-sequential",
                               stops=["#f7fbff", "#08306b"])
