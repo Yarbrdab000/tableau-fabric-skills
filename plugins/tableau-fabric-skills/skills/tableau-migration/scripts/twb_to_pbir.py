@@ -4053,11 +4053,15 @@ def _build_query_state(ws, model_table, field_map, warnings):
     elif vt == VT_MATRIX:
         row_dims = drop_calc_axis(_dedupe(categories(rows)))
         col_dims = drop_calc_axis(_dedupe(categories(cols)))
-        # a highlight table carries its measure on the colour (saturation) encoding; in a Tier-1
-        # matrix that measure is the displayed Values (the colour styling itself is deferred).
+        # a highlight table carries its measure on the colour (saturation) OR size encoding; in a
+        # Tier-1 matrix that measure is the displayed Values (the colour/size styling itself is
+        # deferred). Promoting the size measure keeps a heat-grid sized by a measure (rows x cols,
+        # measure on Size, e.g. a "days to ship" grid) from having NO Values and being dropped as an
+        # empty matrix -- its whole dashboard page would then silently vanish.
         vals = _dedupe(values(rows) + values(cols)
                        + ([color] if color and color["kind"] == "value" else [])
-                       + ([label] if label and label["kind"] == "value" else []))
+                       + ([label] if label and label["kind"] == "value" else [])
+                       + ([size] if size and size["kind"] == "value" else []))
         # Heat-grid colour DRIVER -> tooltip, not a visible column. When a continuous colour scale
         # colours a DISTINCT displayed value (Tableau "colour by a different field"), the colour
         # measure is not shown as its own matrix column: it is surfaced on the TOOLTIP (faithful to
@@ -4092,9 +4096,14 @@ def _build_query_state(ws, model_table, field_map, warnings):
         if not ordered:
             # Encoding-only display (Automatic/text mark with the field(s) on label / colour /
             # detail and no axis pills): list whatever single dimension was placed on the marks
-            # card as a one-column table. Calculated pills are dropped (no faithful model binding).
+            # card as a one-column table. A calculated DIMENSION binds as a real model column
+            # (binding="column"), so keep it -- only a calc MEASURE (binding="measure") has no
+            # faithful category binding and is dropped, matching drop_calc_axis on the axis path.
+            # (Dropping the calc dimension here would leave the table with no Values and silently
+            # remove the whole worksheet -- and, if it is the last one, its dashboard page.)
             ordered = _dedupe([f for f in (label, color, detail)
-                               if f and f["kind"] == "category" and not f["is_calc"]])
+                               if f and f["kind"] == "category"
+                               and not (f["is_calc"] and f["binding"] == "measure")])
         if ordered:
             state["Values"] = {"projections": _role_projections(
                 ordered, model_table, field_map, used_refs)}

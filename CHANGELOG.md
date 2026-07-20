@@ -13,6 +13,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.66.0` → `1.67.0`): Stop dropping a whole dashboard page when its only supported
+  worksheets carry their value or field on a marks-card encoding (Size or a calculated dimension on
+  Colour/Label). A Tableau highlight/heat grid sized by a measure and an "Automatic" text-list of a
+  calculated dimension were each classified correctly (matrix / one-column table) but then failed the
+  query-state completeness check and were silently removed; when they were the only supported sheets on a
+  dashboard, the entire page emitted nothing. The Superstore "Shipping" dashboard (DaystoShip heat grid +
+  ShipSummary status list) produced no page at all. Additive and tightly scoped — no other visual's emitted
+  bytes change.**
+  - **Promote a measure on the Size encoding to matrix Values.** `_build_query_state` for a matrix
+    (`VT_MATRIX`) now includes a value field carried on `size` in its `Values`, mirroring the existing
+    measure-on-colour handling, so a Rows×Cols grid whose measure lives only on Size (e.g. "Days to Ship")
+    has real Values and passes completeness instead of being dropped as an empty matrix.
+  - **Keep a calculated dimension in the one-column-table fallback.** The encoding-only `VT_TABLE` fallback
+    dropped every calculated pill; it now drops only a calc *measure* (`binding="measure"`) and keeps a calc
+    *dimension* (`binding="column"`, a real model column) — matching `drop_calc_axis` semantics on the axis
+    path — so a lone calculated dimension on Colour/Label (e.g. an `IF(...)` "Ship Status") renders as its
+    faithful one-column table rather than vanishing.
+  - Guarded by three additive tests (matrix measure-on-size → populated Values; calc dimension on Label →
+    one-column table; lone calc *measure* on Label still a single-value card, never swept into a table).
 - **tableau-migration (skill `1.65.0` → `1.66.0`): Preserve an "automatic"-sized Tableau dashboard's authored
   aspect ratio on the migrated Power BI page instead of squashing every one into a fixed near-square canvas.
   A Tableau dashboard set to "Automatic" (or any that declares only `minwidth`/`minheight` with no fixed

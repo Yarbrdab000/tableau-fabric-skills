@@ -424,6 +424,25 @@ def test_square_mark_both_axes_with_colour_measure_is_highlight_table_matrix():
             ["Expression"]["Column"]["Property"]) == "Sales_Amount"
 
 
+def test_square_mark_both_axes_with_size_measure_is_highlight_table_matrix():
+    # Tableau also drives a heat/highlight grid by putting the measure on the SIZE encoding (e.g. a
+    # "days to ship" grid: Rows x Cols dimensions, the measure on Size). That measure is the matrix's
+    # displayed Values -- if it is not promoted the matrix has NO Values, fails the completeness
+    # check, and is dropped; when it is the only supported sheet the WHOLE dashboard page silently
+    # vanishes (the Superstore "Shipping" dashboard's DaystoShip grid).
+    enc = "<encodings><size column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    ws = _worksheet("Grid", "Square",
+                    rows="[federated.abc].[none:Category:nk]",
+                    cols="[federated.abc].[none:Region:nk]",
+                    deps_extra=_INST, encodings=enc)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["visual_type"] == "matrix"
+    state = _query_state(list(_visual_parts(emit_pbir(ir)).values())[0])
+    assert set(state) == {"Rows", "Columns", "Values"}
+    assert (state["Values"]["projections"][0]["field"]["Aggregation"]
+            ["Expression"]["Column"]["Property"]) == "Sales_Amount"
+
+
 def test_square_mark_without_axis_dims_stays_unsupported():
     # A Square mark with NO axis dimensions (treemap / packed-bubble / heatmap layout: the
     # dimension is on detail, the measure on colour) is deferred -> warn, not guessed as a chart.
@@ -563,6 +582,55 @@ def test_single_dimension_color_and_label_same_field_is_one_column():
     assert ir["worksheets"][0]["visual_type"] == "table"
     state = _query_state(list(_visual_parts(emit_pbir(ir)).values())[0])
     assert len(state["Values"]["projections"]) == 1
+
+
+def test_single_calc_dimension_on_label_is_one_column_table():
+    # A calculated DIMENSION (e.g. an IF(...) "Ship Status" column) placed only on Label/Colour is
+    # Tableau's text-list of that calc field. It binds to a REAL calc column in the model
+    # (binding="column"), so it must render as a one-column table -- NOT be dropped merely because it
+    # is calculated. Dropping it leaves the sheet with no Values and silently removes the whole
+    # dashboard page when it is the only supported sheet (the Superstore "Shipping" ShipSummary).
+    calc_col = ("<column caption='Ship Status' datatype='string' name='[Calc Dim]' "
+                "role='dimension' type='nominal'>"
+                "<calculation class='tableau' formula='IF [Profit] &gt; 0 THEN &quot;Won&quot; "
+                "ELSE &quot;Lost&quot; END' /></column>")
+    calc_inst = ("<column-instance column='[Calc Dim]' derivation='None' "
+                 "name='[none:Calc Dim:nk]' pivot='key' type='nominal' />")
+    enc = "<encodings><label column='[federated.abc].[none:Calc Dim:nk]' /></encodings>"
+    ws = _worksheet("Ship Status", "Automatic", rows="", cols="",
+                    deps_extra=_INST + calc_col + calc_inst, encodings=enc)
+    ir = parse_twb(_workbook(ws))
+    field = ir["worksheets"][0]["encodings"]["label"]
+    assert field["is_calc"] is True
+    assert field["binding"] == "column"
+    assert ir["worksheets"][0]["visual_type"] == "table"
+    state = _query_state(list(_visual_parts(emit_pbir(ir)).values())[0])
+    assert set(state) == {"Values"}
+    projs = state["Values"]["projections"]
+    assert len(projs) == 1
+    # a calc DIMENSION binds as a Column projection (not an Aggregation/Measure) -- it was kept.
+    assert "Column" in projs[0]["field"]
+
+
+def test_single_calc_measure_only_on_label_is_a_card_not_a_one_column_table():
+    # Guard the boundary: a lone calc MEASURE (binding="measure") on Label is a single aggregate
+    # value -> a faithful card, NOT flattened into a one-column text table. Confirms the calc-
+    # dimension fallback relaxation is scoped to dimensions and does not sweep measures into a table.
+    calc_col = ("<column caption='Profit Ratio' datatype='real' name='[Calc Meas]' "
+                "role='measure' type='quantitative'>"
+                "<calculation class='tableau' formula='SUM([Profit])/SUM([Sales])' /></column>")
+    calc_inst = ("<column-instance column='[Calc Meas]' derivation='None' "
+                 "name='[none:Calc Meas:qk]' pivot='key' type='quantitative' />")
+    enc = "<encodings><label column='[federated.abc].[none:Calc Meas:qk]' /></encodings>"
+    ws = _worksheet("Ratio", "Automatic", rows="", cols="",
+                    deps_extra=_INST + calc_col + calc_inst, encodings=enc)
+    ir = parse_twb(_workbook(ws))
+    field = ir["worksheets"][0]["encodings"]["label"]
+    assert field["is_calc"] is True
+    assert field["binding"] == "measure"
+    assert ir["worksheets"][0]["visual_type"] == "card"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "card"  # a single value, never a one-column tableEx
 
 
 def test_geo_dimension_on_detail_only_is_location_only_filled_map():
