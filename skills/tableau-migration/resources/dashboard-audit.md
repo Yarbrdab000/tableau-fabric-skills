@@ -1,5 +1,34 @@
 # Dashboard Audit — Tier-3 Assisted Visual Playbook
 
+> ## ⚡ RUN THIS NOW — the audit is a command you execute, then decisions you make
+>
+> Do **not** re-narrate "I will build the audit bundle" — **build it, in one command, right now.** The
+> bundle is the surface you adjudicate; you cannot adjudicate what you have not printed. Run these in
+> order (`$SKILL` = the folder holding `SKILL.md`; `<workbook.twb>` = the workbook you just migrated —
+> the same input you passed to `migrate_estate` / `twb_to_pbir`):
+>
+> ```powershell
+> # 1. BUILD + READ the audit bundle (prints the runbook + EVERY visual, highest-priority first).
+> #    This is one command. Run it. Do not describe it, do not look for a different one.
+> py -3.11 "$SKILL\scripts\audit_tier.py" "<workbook.twb>" --prompt
+>
+> # 2. Save the STRUCTURED bundle so you can work each visual's items + allowed `alternatives`:
+> py -3.11 "$SKILL\scripts\audit_tier.py" "<workbook.twb>" -o "$RUN\out\audit.json"
+> ```
+>
+> Then, for each visual the bundle lists (§Step 2): **you** decide keep-or-improve, build the proposed
+> visual, and pass every `(deterministic, assisted)` pair through `land_dashboard_audit` (§Step 3, the
+> monotonic gate). That is the whole loop. **If you have run command 1 and printed the bundle, you have
+> already stopped looping — proceed to Step 2.** Everything below explains *why* each step is shaped this
+> way; the three commands above are the *what*.
+>
+> _Alternate inputs for command 1 (only if you do not have the `.twb` on disk): a saved migration-result
+> JSON (`{"worklist":{…},"candidate_records":[…]}`) works as the `input` too; or, mid-rebuild,
+> `twb_to_pbir "<workbook.twb>" -o "<out>" --audit "$RUN\out\audit.json"` emits the same bundle alongside
+> the PBIR. Same bundle either way — **pick one and run it**, do not deliberate between them._
+
+---
+
 The deterministic viz rebuild (**Tier 0 for dashboards**, [`viz-rebuild.md`](viz-rebuild.md)) rebuilds
 each Tableau worksheet as a model-bound PBIR visual — chart type, exact field bindings, roles, layout,
 slicers — for the subset it can rebuild **faithfully**. Every visual it is *unsure* about it does not
@@ -41,8 +70,11 @@ improvement exists (a better chart type from its *listed* alternatives, a colour
 refinement that its worklist items call for), and hand the proposal to the gate — which keeps it only
 if it regresses nothing.
 
-**There is no script that redesigns a visual for you. Do not go looking for one.** The scripts whose
-names *sound* like "the auditor" are narrow helpers — none of them decides anything:
+**There is no script that redesigns a visual for you — the *judgment* is yours. But you absolutely DO
+run `audit_tier.py` to get the bundle you decide from.** Build the bundle with the command in the
+quickstart above (that is not "looking for a magic fixer" — it is loading the surface you adjudicate).
+What no script does is *choose or redesign* a visual; that judgment is yours. The scripts whose names
+*sound* like "the auditor" are narrow helpers — none of them decides anything:
 
 | Script / flag | What it actually does | What it is **not** |
 |---|---|---|
@@ -51,9 +83,10 @@ names *sound* like "the auditor" are narrow helpers — none of them decides any
 | `audit_tier.build_dashboard_audit` · `audit_tier <in> --prompt` · `twb_to_pbir --audit` | The **producer**: folds worklist + advisor into ONE priority-ordered, full-dashboard audit bundle (every visual, its items, its allowed alternatives, the hard rules). | Not authoring. It hands you the whole surface to adjudicate; it changes no PBIR. |
 | `audit_tier.land_dashboard_audit` · `monotonic_gate` | The **gate**: scores each proposed visual against its deterministic baseline and keeps it **only if it regresses nothing**. | Not a designer. It selects between two already-built visuals; it invents none. |
 
-So the loop is: **you** adjudicate → the monotonic gate **validates** → only strict improvements are
-kept. If you ever find yourself hunting for a command that "runs the dashboard auditor," stop — that
-command is you deciding, visual by visual, which flagged rebuild to improve.
+So the loop is: **run `audit_tier.py` to print the bundle** → **you** adjudicate each visual → the
+monotonic gate **validates** → only strict improvements are kept. The one command you run is
+`audit_tier.py` (it *produces* the bundle); the one thing no command does is *decide* — that is you,
+visual by visual, picking which flagged rebuild to improve.
 
 ---
 
@@ -128,16 +161,22 @@ visual is not a failed rebuild — it is a defensible rebuild the engine decline
 ## Step 1 — build the audit bundle
 
 The bundle enumerates **every** rebuilt visual (warned *and* clean), highest-priority first, each with
-its worklist items and its allowed chart-type `alternatives`, plus the hard `rules`. Build it from
-whatever you have:
+its worklist items and its allowed chart-type `alternatives`, plus the hard `rules`. **The canonical way
+is the quickstart command at the top of this doc** — run it now if you have not:
 
 ```text
-# From a .twb (or a saved migration-result JSON):
-py -3.11 "$SKILL\scripts\audit_tier.py" <input.twb|result.json> -o audit.json
-py -3.11 "$SKILL\scripts\audit_tier.py" <input.twb|result.json> --prompt   # print the runbook prompt
+# CANONICAL — from the .twb you migrated:
+py -3.11 "$SKILL\scripts\audit_tier.py" "<workbook.twb>" -o "$RUN\out\audit.json"
+py -3.11 "$SKILL\scripts\audit_tier.py" "<workbook.twb>" --prompt          # print the runbook prompt
+```
 
-# Or alongside a report rebuild:
-py -3.11 "$SKILL\scripts\twb_to_pbir.py" <input.twb> -o <out> --audit audit.json
+Two equivalent alternates (use only if the `.twb` is not on disk — do not deliberate, pick one):
+
+```text
+# a saved migration-result JSON works as the input too:
+py -3.11 "$SKILL\scripts\audit_tier.py" <result.json> -o "$RUN\out\audit.json"
+# or emit the same bundle alongside a report rebuild:
+py -3.11 "$SKILL\scripts\twb_to_pbir.py" "<workbook.twb>" -o <out> --audit "$RUN\out\audit.json"
 ```
 
 In-process (single workbook already migrated):

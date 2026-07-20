@@ -13,6 +13,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.69.0` → `1.70.0`): Stop the Tier-3 dashboard-audit runbook from making
+  an agent *loop* — re-narrating "I will build the audit bundle" without ever running it. In a real run
+  the agent repeated the intent 4+ times because the one concrete build command (`audit_tier.py`) sat
+  ~130 lines down under heavy "there is no script, do not go looking for a command" doctrine, which
+  actively discouraged running the very command it needed. Docs-only; no code/API change.**
+  - **`resources/dashboard-audit.md` now opens with a `⚡ RUN THIS NOW` quickstart** — one copy-paste
+    command block (`audit_tier.py "<workbook.twb>" --prompt` then `-o "$RUN\out\audit.json"`) the agent
+    executes immediately, with "do not re-narrate — build it now" and the philosophy explicitly deferred
+    to "why, below."
+  - **Reframed the "no script" doctrine** so it no longer fights the required invocation: it still says
+    *no script decides/redesigns a visual for you* (judgment is yours), but now states plainly that *you
+    absolutely DO run `audit_tier.py`* to produce the bundle you adjudicate. Step 1 marks the `.twb`
+    command **canonical** and the result-JSON / `twb_to_pbir --audit` forms as equivalent alternates
+    ("pick one, do not deliberate").
+  - Adds 2 regression-guard tests (quickstart-near-top; doctrine-doesn't-fight-the-build-command); full
+    suite 2744 passed / 3 skipped / 1 xfailed.
 - **tableau-migration (skill `1.68.0` → `1.69.0`): Make the migration report self-enforce its own
   user-gated review offers so an agent cannot silently declare a run "complete" while the second-compiler
   (stubbed calcs) or Tier-3 dashboard-audit (warned visuals) offer is still owed. A real run shipped as

@@ -118,6 +118,33 @@ def test_dashboard_audit_runbook_is_honest_about_the_landing_seam():
     assert "later" in low or "separate" in low
 
 
+def test_dashboard_audit_runbook_opens_with_runnable_quickstart():
+    # A real run looped: the agent re-narrated "I will build the audit bundle" 4+ times without ever
+    # executing it, because the concrete `audit_tier.py` command sat ~130 lines down under heavy
+    # "there is no script, do not go looking for a command" doctrine. Pin an actionable, copy-paste
+    # quickstart NEAR THE TOP so the agent hits a runnable command before the philosophy.
+    text = _read(os.path.join(_RES, "dashboard-audit.md"))
+    head = text[:2500]  # the first ~40 lines
+    low = head.lower()
+    # An unmistakable run-it-now marker and the actual build command must be up top.
+    assert "run this now" in low
+    assert "audit_tier.py" in head
+    assert "--prompt" in head
+    # And it must actively discourage re-narrating instead of executing.
+    assert "do not re-narrate" in low or "do not describe it" in low
+
+
+def test_dashboard_audit_runbook_does_not_fight_the_build_command():
+    # The clarified doctrine must keep BOTH truths: no script *decides* for you, but you DO run
+    # audit_tier.py to produce the bundle. The old flat "do not go looking for one" (with no build
+    # carve-out) is what stalled the agent.
+    low = _read(os.path.join(_RES, "dashboard-audit.md")).lower()
+    flat = re.sub(r"\s+", " ", low)  # collapse line-wraps so the phrase matches regardless of wrapping
+    assert "you absolutely do run `audit_tier.py`" in flat
+    # ...while still preserving the identity anchor the earlier test pins.
+    assert "there is no script that redesigns a visual for you" in flat
+
+
 # --------------------------------------------------------------- (d) SKILL Post-Migration wires both
 def test_skill_offers_both_gated_tiers():
     text = _read(_SKILL)
