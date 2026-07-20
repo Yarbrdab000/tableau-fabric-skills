@@ -649,6 +649,64 @@ def test_migrate_estate_summary_omits_next_step_when_no_stubs(tmp_path):
     assert (tmp_path / "b" / "pbip" / "Orders DS" / "Orders DS.pbip").is_file()
 
 
+def test_pending_gates_lists_owed_offers_from_summary():
+    # Pure roll-up: a stubbed calc owes the second-compiler offer; a warned visual owes the Tier-3
+    # dashboard-audit offer. Both fire together; each names its trigger key, SKILL step, and runbook.
+    gates = me._pending_gates({"needs_review_total": 2, "visuals_warned": 3})
+    by = {g["gate"]: g for g in gates}
+    assert set(by) == {"second_compiler", "dashboard_audit"}
+    assert by["second_compiler"]["count"] == 2
+    assert by["second_compiler"]["trigger"] == "summary.needs_review_total"
+    assert by["second_compiler"]["skill_step"] == 3
+    assert "second-compiler.md" in by["second_compiler"]["runbook"]
+    assert by["dashboard_audit"]["count"] == 3
+    assert by["dashboard_audit"]["trigger"] == "summary.visuals_warned"
+    assert by["dashboard_audit"]["skill_step"] == 5
+    assert "dashboard-audit.md" in by["dashboard_audit"]["runbook"]
+    # a clean summary owes nothing (additive: [] -> no banner, artifacts unchanged)
+    assert me._pending_gates({"needs_review_total": 0, "visuals_warned": 0}) == []
+    assert me._pending_gates({}) == []
+
+
+def test_pending_gates_banner_is_loud_and_empty_when_none():
+    # The banner names each owed offer under a loud "NOT done until offered" heading, and is empty
+    # (no lines) when nothing is owed so a clean run's summary.md head stays byte-identical.
+    banner = "\n".join(me._pending_gates_banner(
+        me._pending_gates({"needs_review_total": 1, "visuals_warned": 1})))
+    assert "PENDING REVIEW GATES" in banner
+    assert "NOT done until these are offered" in banner
+    assert "Second compiler" in banner and "Tier-3 dashboard audit" in banner
+    assert me._pending_gates_banner([]) == []
+
+
+def test_migrate_estate_emits_pending_gates_when_stubs_exist(fixtures_dir, tmp_path):
+    # End-to-end: a run that stubs a calc carries a first-class ``pending_gates`` list on the report
+    # AND a loud PENDING REVIEW GATES banner in summary.md -- so the artifact itself blocks a premature
+    # "migration complete" claim (the failure mode that skipped the second-compiler / Tier-3 offer).
+    out = str(tmp_path / "bundle")
+    report = migrate_estate(LocalFilesSource(fixtures_dir), out)
+
+    assert report["summary"]["needs_review_total"] >= 1
+    gates = report["pending_gates"]
+    assert any(g["gate"] == "second_compiler" for g in gates)
+
+    summary_md = (tmp_path / "bundle" / "summary.md").read_text(encoding="utf-8")
+    assert "PENDING REVIEW GATES" in summary_md
+    assert "NOT done until these are offered" in summary_md
+
+
+def test_migrate_estate_no_pending_gates_when_clean(tmp_path):
+    # Additive contract: a clean datasource-only run always carries the ``pending_gates`` KEY, but it
+    # is empty and adds no banner -- the summary head stays byte-identical to before the gate existed.
+    src = InMemoryTableauSource(datasources={"Orders DS": LIVE_TDS})
+    out = str(tmp_path / "b")
+    report = migrate_estate(src, out)
+
+    assert report["pending_gates"] == []
+    summary_md = (tmp_path / "b" / "summary.md").read_text(encoding="utf-8")
+    assert "PENDING REVIEW GATES" not in summary_md
+
+
 def test_summarize_rolls_up_workbook_model_calcs_and_folds_needs_review():
     # Fix (2): a consolidated workbook builds its OWN semantic model whose calc summary lives on
     # ``model_translation_handoff`` -- NOT in ds_details. Without the rollup, those calcs never reach

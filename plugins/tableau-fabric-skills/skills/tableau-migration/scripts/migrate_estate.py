@@ -3116,6 +3116,7 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
         "datasources": ds_details,
         "workbooks": wb_details,
         "definition_of_done": _definition_of_done(wb_details, pbip_dir is not None),
+        "pending_gates": _pending_gates(summary),
         "fallbacks": fallbacks,
     }
 
@@ -3498,6 +3499,68 @@ def _dod_banner(dod):
             "(see the Workbooks table for why).", ""]
 
 
+def _pending_gates(summary):
+    """Structured list of user-gated review offers still owed after the deterministic pass.
+
+    A deterministic run can leave stubbed calculations (``needs_review_total``) or low-fidelity
+    visuals (``visuals_warned``); each carries an explicit, user-gated follow-up offer -- the
+    LLM-assisted **second compiler** and the Tier-3 **dashboard audit** respectively -- that MUST be
+    *offered* before the migration is reported as done (the user may decline, which is a complete,
+    honest outcome, but the offer is owed). Emitting the owed offers as a first-class artifact key
+    means the report itself prevents a premature "complete" claim, rather than relying on the agent
+    to remember ``SKILL.md`` steps 3 and 5. Additive: ``[]`` when nothing is owed, so a clean run's
+    artifacts are unchanged.
+    """
+    gates = []
+    needs_review = summary.get("needs_review_total", 0) or 0
+    if needs_review > 0:
+        gates.append({
+            "gate": "second_compiler",
+            "count": needs_review,
+            "trigger": "summary.needs_review_total",
+            "skill_step": 3,
+            "runbook": "resources/second-compiler.md",
+            "offer": (f"OFFER the LLM-assisted second compiler for {needs_review} stubbed "
+                      "calculation(s) before declaring the migration done -- present them and run "
+                      "only on an explicit GO. If declined, the deterministic result ships as-is "
+                      "(each stub keeps its preserved TableauFormula)."),
+        })
+    warned = summary.get("visuals_warned", 0) or 0
+    if warned > 0:
+        gates.append({
+            "gate": "dashboard_audit",
+            "count": warned,
+            "trigger": "summary.visuals_warned",
+            "skill_step": 5,
+            "runbook": "resources/dashboard-audit.md",
+            "offer": (f"OFFER the LLM-assisted Tier-3 dashboard audit for {warned} warned "
+                      "visual(s) before declaring the migration done -- present them and run only "
+                      "on an explicit GO. If declined, the deterministic rebuild ships as-is (every "
+                      "faithfully-bound visual intact)."),
+        })
+    return gates
+
+
+def _pending_gates_banner(gates):
+    """Render the loud 'not done until offered' section for ``summary.md``; ``[]`` when none owed."""
+    if not gates:
+        return []
+    label = {"second_compiler": "Second compiler (stubbed calcs)",
+             "dashboard_audit": "Tier-3 dashboard audit (warned visuals)"}
+    out = [
+        "## \u23f3 PENDING REVIEW GATES -- the migration is NOT done until these are offered",
+        "",
+        ("The deterministic pass completed, but it left follow-ups that each carry an explicit, "
+         "user-gated offer. **Do not report the migration as complete until every offer below has "
+         "been made** (the user may decline any of them -- that is a complete, honest outcome -- "
+         "but the offer is owed):"),
+        "",
+    ]
+    out += [f"- **{label.get(g['gate'], g['gate'])}** ({g['count']}) -- {g['offer']}" for g in gates]
+    out.append("")
+    return out
+
+
 def _render_summary_md(report):
     """Render the human-readable ``summary.md`` from the report dict."""
     s = report["summary"]
@@ -3508,6 +3571,7 @@ def _render_summary_md(report):
         f"from {report['source'].get('kind')}._",
         "",
         *_dod_banner(report.get("definition_of_done")),
+        *_pending_gates_banner(report.get("pending_gates")),
         "## Summary",
         "",
         f"- **Datasources:** {s['datasources_total']} total -> "
@@ -3929,6 +3993,12 @@ def main(argv=None):
               f"stubbed -> present them to the user and run the second compiler only on an explicit GO "
               f"(see summary.md 'Next step'); if declined, this deterministic result ships as-is. Land "
               f"any validated results by re-running with --approved-dax <file.json>.")
+    if s.get("visuals_warned"):
+        print(f"Next step: OFFER the Tier-3 dashboard audit -- {s['visuals_warned']} visual(s) warned "
+              f"-> present them to the user and run the audit only on an explicit GO (see summary.md "
+              f"'PENDING REVIEW GATES' and resources/dashboard-audit.md); if declined, this "
+              f"deterministic rebuild ships as-is. Do NOT report the migration as done until this and "
+              f"any second-compiler offer above have been made.")
     if s.get("partitions_stubbed_total"):
         print(f"Next step: {s['partitions_stubbed_total']} table partition(s) need manual M "
               f"completion -> see summary.md ('manual M partition completion'); the original SQL "

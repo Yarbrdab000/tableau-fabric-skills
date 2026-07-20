@@ -13,6 +13,27 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.68.0` → `1.69.0`): Make the migration report self-enforce its own
+  user-gated review offers so an agent cannot silently declare a run "complete" while the second-compiler
+  (stubbed calcs) or Tier-3 dashboard-audit (warned visuals) offer is still owed. A real run shipped as
+  "✅ Migration Complete" with 3 warned visuals because the only place the Tier-3 offer was mandated was a
+  `SKILL.md` step the agent skipped — the end-of-run artifact (`summary.md` / `report.json`) said nothing
+  about the owed offers. Additive: a clean run's artifacts are byte-identical (empty list, no banner).**
+  - **New first-class `pending_gates` key on `report.json`** (`migrate_estate`) — a structured list of the
+    owed offers, each naming its `gate` (`second_compiler` / `dashboard_audit`), `count`, `trigger` key
+    (`summary.needs_review_total` / `summary.visuals_warned`), `skill_step`, `runbook`, and a ready-to-read
+    `offer` sentence. Empty `[]` when nothing is owed.
+  - **New `⏳ PENDING REVIEW GATES — the migration is NOT done until these are offered` banner** at the top
+    of `summary.md` (right after the Definition-of-Done banner), listing each owed offer. Absent when the
+    list is empty.
+  - **CLI final-print** now also emits a Tier-3 "Next step: OFFER the dashboard audit …" line when
+    `visuals_warned > 0` (previously only the second-compiler line fired), and explicitly says not to report
+    the migration as done until both offers are made.
+  - **`SKILL.md` completion gate** — a new ⛔ note at the top of "Post-Migration: What's Next" tells the
+    agent to read `report["pending_gates"]` and never narrate "Migration Complete" while it is non-empty and
+    unoffered.
+  - Adds 4 tests (2 pure-unit for `_pending_gates`/`_pending_gates_banner`, 2 end-to-end); full suite 2742
+    passed / 3 skipped / 1 xfailed.
 - **tableau-migration (skill `1.67.0` → `1.68.0`): Make the no-Azure-Key-Vault credential path work in
   agent-driven / non-interactive runs by wiring the resolver's file- and keyring-based secret layers all the
   way through the `fetch_tds.py` CLI. Previously the only no-Key-Vault route the CLI actually reached was an
