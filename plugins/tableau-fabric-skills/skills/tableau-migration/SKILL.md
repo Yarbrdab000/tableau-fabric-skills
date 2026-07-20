@@ -354,6 +354,14 @@ STEP 1.5 scan gate is designed to prevent exactly that; re-check the scan exited
 scripts have already done their own detection and binding; a shortfall is a STOP-and-ask, never
 something for you to fix by hand.
 
+> **Hand the user the absolute path — don't make them ask.** The run prints the absolute openable
+> `.pbip` path(s) to stdout (`Openable projects: …`), lists them at the top of `.\out\summary.md`
+> (**Openable output(s)**), and records them in `report.json` → `openable_outputs[].pbip` (each entry
+> also carries `project_folder` / `report_folder` / `model_folder`). When you report the result, give
+> the user the **absolute `.pbip` path verbatim** from there — never a bare filename and never the
+> `pbip/<Name>/<Name>.pbip` template. It is a real, copy-pasteable path they double-click to open in
+> Power BI Desktop.
+
 > **Second-compiler gate — read `report.json` → `summary.needs_review_total` and branch on it:** if it
 > is **`0`**, no calc was left stubbed, so there is nothing to offer — continue (do not re-read the report
 > to "make sure"). When it is **`> 0`**, **STOP and OFFER the second compiler**: show the user the stubbed

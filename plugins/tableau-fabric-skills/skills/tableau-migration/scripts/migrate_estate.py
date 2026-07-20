@@ -3215,6 +3215,10 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
         "pending_gates": _pending_gates(summary),
         "fallbacks": fallbacks,
     }
+    # Absolute, copy-pasteable paths to every openable .pbip (additive; [] under --no-pbip). Resolved
+    # here where output_dir is in scope, so the report/summary/stdout can hand the user a REAL path
+    # instead of the run-relative pbip/<Name>/<Name>.pbip stored per detail.
+    report["openable_outputs"] = _openable_outputs(report, output_dir)
 
     with open(os.path.join(output_dir, "report.json"), "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2, sort_keys=True)
@@ -3657,6 +3661,72 @@ def _pending_gates_banner(gates):
     return out
 
 
+def _openable_outputs(report, output_dir):
+    """Absolute, copy-pasteable paths to every openable ``.pbip`` the run produced (plus its project
+    folder and sibling ``.Report`` / ``.SemanticModel``), so the caller can hand the user a REAL path
+    instead of a bare filename or a ``pbip/<Name>/<Name>.pbip`` template. Additive: ``[]`` when no
+    ``.pbip`` was built (e.g. ``--no-pbip``), so a suppressed-pbip run's report/summary head stays
+    byte-identical. Never raises -- a path that can't be resolved or is absent on disk is skipped.
+
+    ``report`` stores each ``pbip_folder`` as a run-relative path (``pbip/<Name>/<Name>.pbip``);
+    joining it onto ``os.path.abspath(output_dir)`` yields the absolute path the user opens. Covers
+    datasource projects, workbook projects, and the per-datasource projects nested under a
+    multi-datasource workbook.
+    """
+    base_abs = os.path.abspath(output_dir)
+    out, seen = [], set()
+
+    def _add(name, kind, rel):
+        if not rel:
+            return
+        pbip_abs = os.path.normpath(os.path.join(base_abs, rel))
+        if pbip_abs in seen or not os.path.exists(pbip_abs):
+            return
+        seen.add(pbip_abs)
+        proj = os.path.dirname(pbip_abs)
+        entry = {"name": name or "(unnamed)", "kind": kind,
+                 "pbip": pbip_abs, "project_folder": proj}
+        try:
+            for sub in sorted(os.listdir(proj)):
+                full = os.path.join(proj, sub)
+                if not os.path.isdir(full):
+                    continue
+                if sub.endswith(".Report") and "report_folder" not in entry:
+                    entry["report_folder"] = full
+                elif sub.endswith(".SemanticModel") and "model_folder" not in entry:
+                    entry["model_folder"] = full
+        except OSError:
+            pass
+        out.append(entry)
+
+    for w in report.get("workbooks") or []:
+        _add(w.get("name"), "workbook", w.get("pbip_folder"))
+        for e in w.get("datasource_pbips") or []:
+            base = w.get("name")
+            label = f"{base} / {e.get('datasource')}" if base else e.get("datasource")
+            _add(label, "workbook", e.get("pbip_folder"))
+    for d in report.get("datasources") or []:
+        _add(d.get("name"), "datasource", d.get("pbip_folder"))
+    return out
+
+
+def _openable_outputs_md(outs):
+    """Render the top-of-summary 'Openable output(s)' section listing each absolute ``.pbip`` path;
+    ``[]`` when none, so a ``--no-pbip`` run's summary head stays byte-identical."""
+    if not outs:
+        return []
+    lines = [
+        "## Openable output(s)",
+        "",
+        ("Open in Power BI Desktop by **double-clicking the `.pbip`** below (it is a small JSON "
+         "pointer -- correct and complete; never zip it). Absolute paths, copy-pasteable as-is:"),
+        "",
+    ]
+    lines += [f"- **{o['name']}** ({o['kind']}): `{o['pbip']}`" for o in outs]
+    lines.append("")
+    return lines
+
+
 def _render_summary_md(report):
     """Render the human-readable ``summary.md`` from the report dict."""
     s = report["summary"]
@@ -3668,6 +3738,7 @@ def _render_summary_md(report):
         "",
         *_dod_banner(report.get("definition_of_done")),
         *_pending_gates_banner(report.get("pending_gates")),
+        *_openable_outputs_md(report.get("openable_outputs")),
         "## Summary",
         "",
         f"- **Datasources:** {s['datasources_total']} total -> "
@@ -4087,8 +4158,13 @@ def main(argv=None):
             f"{s['workbook_calcs_needs_review']} need review"
         )
     print(f"Bundle written to: {os.path.abspath(args.output)}")
-    if not args.no_pbip:
-        print("Openable projects: pbip/<Name>/<Name>.pbip (double-click in Power BI Desktop)")
+    openable = report.get("openable_outputs") or []
+    if openable:
+        # Emit REAL absolute paths automatically -- the agent should never have to be asked for the
+        # output filepath, and can copy these straight to the user.
+        print(f"Openable projects: {len(openable)} (double-click the .pbip in Power BI Desktop)")
+        for o in openable:
+            print(f"  {o['name']} ({o['kind']}): {o['pbip']}")
     if s.get("needs_review_total"):
         print(f"Next step: OFFER the second-compiler pass -- {s['needs_review_total']} calculation(s) "
               f"stubbed -> present them to the user and run the second compiler only on an explicit GO "

@@ -115,7 +115,10 @@ def test_rebind_opt_in_does_not_change_canonical_report(tmp_path):
 
     a = json.load(open(os.path.join(plain, "report.json"), encoding="utf-8"))
     b = json.load(open(os.path.join(withp, "report.json"), encoding="utf-8"))
+    # generated_at (timestamp) and openable_outputs (absolute paths under each distinct output dir)
+    # differ by construction between the two runs -- drop both before comparing the canonical content.
     a.pop("generated_at"); b.pop("generated_at")
+    a.pop("openable_outputs"); b.pop("openable_outputs")
     assert a == b
     assert (tmp_path / "withp" / "semantic_models" / "Orders DS.SemanticModel").is_dir()
 

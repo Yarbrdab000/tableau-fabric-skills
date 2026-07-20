@@ -629,6 +629,71 @@ def test_migrate_estate_emits_openable_pbip_by_default(fixtures_dir, tmp_path):
     assert "--verify-pbip" in summary_md
 
 
+def test_migrate_estate_emits_absolute_openable_paths(fixtures_dir, tmp_path):
+    # report.json + summary.md must expose an ABSOLUTE, copy-pasteable .pbip path (not just the
+    # run-relative pbip/<Name>/<Name>.pbip template) so the caller can hand the user a real filepath.
+    out = str(tmp_path / "bundle")
+    report = migrate_estate(LocalFilesSource(fixtures_dir), out)
+
+    outs = report["openable_outputs"]
+    assert outs, "expected at least one openable .pbip"
+    o = next(o for o in outs if o["name"] == "widget_sales")
+    assert o["kind"] == "datasource"
+    assert os.path.isabs(o["pbip"]) and o["pbip"].endswith(".pbip") and os.path.isfile(o["pbip"])
+    assert o["pbip"] == str(tmp_path / "bundle" / "pbip" / "widget_sales" / "widget_sales.pbip")
+    # sibling folders resolved by inspecting the real project dir on disk
+    assert o["report_folder"].endswith(".Report") and os.path.isdir(o["report_folder"])
+    assert o["model_folder"].endswith(".SemanticModel") and os.path.isdir(o["model_folder"])
+    # summary.md surfaces the absolute path in a dedicated, front-of-report section
+    summary_md = (tmp_path / "bundle" / "summary.md").read_text(encoding="utf-8")
+    assert "## Openable output(s)" in summary_md
+    assert o["pbip"] in summary_md
+
+
+def test_openable_outputs_helper_covers_all_project_kinds(tmp_path):
+    # Unit-level: datasource, workbook, and nested per-datasource projects each yield one absolute
+    # entry; a pbip_folder pointing at a missing file is skipped; an empty run yields [].
+    out = str(tmp_path)
+
+    def _mkpbip(rel):
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('{"version":"1.0"}', encoding="utf-8")
+        (p.parent / (p.stem + ".Report")).mkdir(exist_ok=True)
+        (p.parent / (p.stem + ".SemanticModel")).mkdir(exist_ok=True)
+
+    _mkpbip("pbip/DS/DS.pbip")
+    _mkpbip("pbip/WB/WB.pbip")
+    _mkpbip("pbip/WB2/Primary/Primary.pbip")
+
+    report = {
+        "datasources": [{"name": "DS", "pbip_folder": "pbip/DS/DS.pbip"},
+                        {"name": "NoPbip", "pbip_folder": None}],
+        "workbooks": [
+            {"name": "WB", "pbip_folder": "pbip/WB/WB.pbip"},
+            {"name": "WB2", "pbip_folder": None,
+             "datasource_pbips": [
+                 {"datasource": "Primary", "pbip_status": "built",
+                  "pbip_folder": "pbip/WB2/Primary/Primary.pbip", "is_primary": True},
+                 {"datasource": "Missing", "pbip_status": "built",
+                  "pbip_folder": "pbip/WB2/Missing/Missing.pbip"},  # no file on disk -> skipped
+             ]},
+        ],
+    }
+    outs = me._openable_outputs(report, out)
+    by_name = {o["name"]: o for o in outs}
+    assert set(by_name) == {"DS", "WB", "WB2 / Primary"}
+    for o in outs:
+        assert os.path.isabs(o["pbip"]) and os.path.isfile(o["pbip"])
+        assert o["report_folder"].endswith(".Report")
+        assert o["model_folder"].endswith(".SemanticModel")
+    assert by_name["DS"]["kind"] == "datasource"
+    assert by_name["WB2 / Primary"]["kind"] == "workbook"
+    # nothing built -> empty, so a --no-pbip run stays additive-free
+    assert me._openable_outputs({"datasources": [], "workbooks": []}, out) == []
+    assert me._openable_outputs_md([]) == []
+
+
 def test_migrate_estate_no_pbip_suppresses_pbip_tree(fixtures_dir, tmp_path):
     out = str(tmp_path / "bundle")
     report = migrate_estate(LocalFilesSource(fixtures_dir), out, pbip=False)
@@ -638,6 +703,10 @@ def test_migrate_estate_no_pbip_suppresses_pbip_tree(fixtures_dir, tmp_path):
     assert (tmp_path / "bundle" / "semantic_models" / "widget_sales.SemanticModel").is_dir()
     detail = next(d for d in report["datasources"] if d["name"] == "widget_sales")
     assert detail["pbip_folder"] is None
+    # --no-pbip -> no openable projects, so the additive path/section stay empty (byte-identical head)
+    assert report["openable_outputs"] == []
+    summary_md = (tmp_path / "bundle" / "summary.md").read_text(encoding="utf-8")
+    assert "## Openable output(s)" not in summary_md
 
 
 def test_migrate_estate_summary_offers_second_compiler_when_stubs_exist(fixtures_dir, tmp_path):
@@ -2677,6 +2746,9 @@ def test_cli_main_runs_offline(fixtures_dir, tmp_path, capsys):
     assert "Datasources:" in printed
     assert "Bundle written to:" in printed
     assert "Openable projects:" in printed  # pbip hint surfaced
+    # a REAL absolute .pbip path is printed automatically, not the old pbip/<Name>/<Name>.pbip template
+    assert "widget_sales.pbip" in printed
+    assert "<Name>" not in printed
     assert "Next step:" in printed          # stubbed-calc check-in surfaced (widget_sales stubs one)
 
 

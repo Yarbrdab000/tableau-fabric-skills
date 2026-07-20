@@ -13,6 +13,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.78.0` → `1.79.0`): Auto-output the *absolute* `.pbip` filepath so the
+  agent can hand the user a real, copy-pasteable path instead of a bare filename.** In a real run the
+  user asked "link me to the pbip filepath" / "give me the filepaths" and the agent could only list
+  filenames and labels ("Simple Example report folder") — because nothing in the output ever recorded an
+  absolute path: each per-project `pbip_folder` is stored **run-relative** (`pbip/<Name>/<Name>.pbip`),
+  and the CLI's end-of-run line literally printed the placeholder template `pbip/<Name>/<Name>.pbip`, not
+  a resolved path. Now `migrate_estate` resolves an absolute path for **every** openable `.pbip` the run
+  built — datasource projects, workbook projects, and the per-datasource projects nested under a
+  multi-datasource workbook — and surfaces them three ways, all additive: (1) a new top-level
+  `report.json` → `openable_outputs[]` list, each entry carrying `name` / `kind` / absolute `pbip` +
+  `project_folder` (and sibling `report_folder` / `model_folder` discovered on disk); (2) a new
+  **Openable output(s)** section at the top of `summary.md` listing each absolute `.pbip` path; (3) the
+  CLI prints the real absolute path(s) automatically at run-end under the existing `Openable projects:`
+  line (replacing the `pbip/<Name>/<Name>.pbip` placeholder). A `--no-pbip` run yields `[]` and omits the
+  section/print, so its report/summary/stdout head stays byte-identical. Reinforced in SKILL.md
+  Checkpoint 2: hand the user the absolute `.pbip` path verbatim from `openable_outputs` — never a bare
+  filename or the template. +3 tests (absolute-path end-to-end, helper across all project kinds, and the
+  `--no-pbip` empty guard); the CLI test now asserts a real path is printed. Report schema stays additive
+  (new key only). Suite green.
+
 - **tableau-migration (skill `1.77.0` → `1.78.0`): Stop the agent from *searching* the filesystem for
   inputs and run artifacts — a recurring drift shown in two real runs. Run 1: asked for the workbook's
   "absolute path" after the user had already **attached** it, then ran a disk-wide `Get-ChildItem
