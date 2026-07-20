@@ -155,3 +155,32 @@ def test_skill_offers_both_gated_tiers():
     assert "dashboard audit" in low
     assert "dashboard-audit.md" in text
     assert "visuals_flagged" in text or "warned" in low
+
+
+# ------------------------------------------------ (e) the .pbip-is-a-JSON-pointer-not-a-ZIP contract
+# A real run corrupted correct, openable output because the agent assumed a ~300-byte .pbip was a
+# "broken un-zipped stub" and re-zipped it (every sibling format .pbix/.twbx/.tdsx IS a zip). These
+# pin the loud contract into the docs so the reflex is pre-empted and the agent is pointed at the
+# deterministic --verify-pbip check instead of guessing.
+def test_gotchas_teach_pbip_is_a_pointer_not_a_zip():
+    text = _read(os.path.join(_RES, "migration-gotchas.md"))
+    low = text.lower()
+    flat = re.sub(r"\s+", " ", low)
+    # The positive truth: a tiny .pbip is CORRECT, and it is a JSON pointer, not an archive.
+    assert "json" in low and "pointer" in low
+    assert "not a zip" in flat or "not a zip archive" in flat
+    # The exact failure signature and the deterministic escape hatch.
+    assert "unable to translate bytes" in low
+    assert "--verify-pbip" in text
+    # And the anti-panic rule: a WARN/degraded run is a legitimate result, not a rebuild trigger.
+    assert "stop-and-ask" in flat or "never something to fix by hand" in flat
+
+
+def test_skill_output_section_warns_never_to_zip_a_pbip():
+    text = _read(_SKILL)
+    low = text.lower()
+    flat = re.sub(r"\s+", " ", low)
+    # The loud callout must carry the positive truth + the never-zip rule + the verifier command.
+    assert "json" in flat and "pointer" in flat
+    assert "never repackage it" in flat or "never zip" in flat
+    assert "--verify-pbip" in text

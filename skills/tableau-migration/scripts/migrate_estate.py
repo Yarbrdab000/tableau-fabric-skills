@@ -3616,7 +3616,12 @@ def _render_summary_md(report):
         lines += [
             "",
             "> **Open locally:** each migrated datasource also has an openable Power BI project at "
-            "`pbip/<Name>/<Name>.pbip` — double-click to explore and test it in Power BI Desktop.",
+            "`pbip/<Name>/<Name>.pbip` — double-click to explore and test it in Power BI Desktop. "
+            "Each `.pbip` is a small (~300-byte) JSON **pointer** file — that is correct and complete; "
+            "the report and model live in the sibling `.Report/` and `.SemanticModel/` folders. "
+            "**Never zip or repackage a `.pbip`** (unlike `.pbix`/`.twbx`, it is not an archive). "
+            "To confirm a bundle is healthy: "
+            "`py -3.11 scripts/deploy_to_fabric.py --verify-pbip pbip/<Name>`.",
         ]
 
     review = [

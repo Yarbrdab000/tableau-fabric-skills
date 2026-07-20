@@ -602,6 +602,9 @@ def test_migrate_estate_emits_openable_pbip_by_default(fixtures_dir, tmp_path):
     assert detail["pbip_folder"] == "pbip/widget_sales/widget_sales.pbip"
     summary_md = (tmp_path / "bundle" / "summary.md").read_text(encoding="utf-8")
     assert "pbip/<Name>/<Name>.pbip" in summary_md  # the "Open locally" note
+    # the note also warns never to zip a .pbip and points at the deterministic verifier
+    assert "Never zip or repackage a `.pbip`" in summary_md
+    assert "--verify-pbip" in summary_md
 
 
 def test_migrate_estate_no_pbip_suppresses_pbip_tree(fixtures_dir, tmp_path):

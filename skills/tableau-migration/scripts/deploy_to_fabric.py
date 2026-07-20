@@ -687,6 +687,173 @@ def discover_pbip(path):
     return _discover_single(base, ".SemanticModel"), _discover_single(base, ".Report")
 
 
+# -- Read-only .pbip health check (anti-hallucination ground truth) ----------------------------
+#
+# A ``.pbip`` is a SMALL (~300-byte) JSON *pointer* file -- NOT a ZIP archive. Every SIBLING format
+# an agent knows is a zip (``.pbix``, ``.twbx``, ``.tdsx``), so an agent naturally assumes ``.pbip``
+# is too, sees a ~300-byte file, wrongly concludes it is a "broken un-zipped stub", and ZIPS it --
+# which overwrites correct, openable output with a corrupt archive (a real run did exactly this,
+# then produced a Power BI "Unable to translate bytes [XX] at index N" error by feeding the ZIP's
+# binary header to a JSON parser). ``verify_pbip`` proves the ground truth deterministically so the
+# agent never has to *guess* whether the output is broken: it reports the pointer's kind + byte size
+# and whether the sibling model/report folders are intact.
+_ZIP_MAGICS = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")  # local file / empty / spanned archive
+
+
+def _pbip_pointers_in(base):
+    return [os.path.join(base, n) for n in sorted(os.listdir(base))
+            if n.lower().endswith(".pbip") and os.path.isfile(os.path.join(base, n))]
+
+
+def _classify_pointer(pointer_path):
+    """Classify a ``.pbip`` pointer file's on-disk bytes: ``json`` (correct), ``binary-zip``
+    (clobbered by zipping), or ``non-json`` (some other non-JSON payload)."""
+    size = os.path.getsize(pointer_path)
+    with open(pointer_path, "rb") as fh:
+        raw = fh.read()
+    head = raw[:4]
+    if any(raw.startswith(m) for m in _ZIP_MAGICS):
+        hexhead = " ".join("%02X" % b for b in head)
+        return {"kind": "binary-zip", "bytes": size, "header_hex": hexhead, "doc": None,
+                "issue": ("the .pbip is a ZIP archive (header %s = 'PK..') -- it was overwritten by "
+                          "zipping. A .pbip must be a small JSON pointer; NEVER zip a .pbip. Restore "
+                          "it by re-running the migration (or write_local_pbip) -- do not repackage."
+                          % hexhead)}
+    try:
+        doc = json.loads(raw.decode("utf-8-sig"))
+    except Exception as exc:  # noqa: BLE001 - any decode/parse failure is a verdict, not a raise
+        hexhead = " ".join("%02X" % b for b in head)
+        return {"kind": "non-json", "bytes": size, "header_hex": hexhead, "doc": None,
+                "issue": ("the .pbip is not valid JSON (%s; header %s) -- a .pbip must be a small "
+                          "UTF-8 JSON pointer. Restore it by re-running the migration."
+                          % (type(exc).__name__, hexhead))}
+    return {"kind": "json", "bytes": size, "header_hex": None, "doc": doc, "issue": None}
+
+
+def verify_pbip(path):
+    """Read-only health check of a produced PBIP bundle -- returns a verdict dict, never raises.
+
+    ``path`` may be a ``.pbip`` pointer file OR its bundle directory. The verdict proves, without
+    guessing, that (1) the ``.pbip`` is a small JSON *pointer* and not a ZIP, and (2) the sibling
+    ``<Name>.SemanticModel`` / ``<Name>.Report`` folders it points at are intact. ``ok`` is ``True``
+    only when every checked component is healthy; ``issues`` explains any fault in agent-actionable
+    terms. This exists so an agent CHECKS instead of hallucinating a defect in correct output.
+    """
+    verdict = {"path": path, "ok": False, "pointer": None, "semantic_model": None,
+               "report": None, "issues": []}
+    base = path
+    if os.path.isfile(path) and path.lower().endswith(".pbip"):
+        base = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(base):
+        verdict["issues"].append(f"PBIP bundle not found: {path!r}")
+        return verdict
+    verdict["base"] = base
+
+    # 1. The pointer(s).
+    if os.path.isfile(path) and path.lower().endswith(".pbip"):
+        pointers = [os.path.abspath(path)]
+    else:
+        pointers = _pbip_pointers_in(base)
+    if not pointers:
+        verdict["issues"].append(
+            f"no .pbip pointer file found in {base!r} -- expected a small <Name>.pbip JSON pointer")
+        return verdict
+
+    ptr = _classify_pointer(pointers[0])
+    verdict["pointer"] = {"file": pointers[0], "kind": ptr["kind"], "bytes": ptr["bytes"],
+                          "header_hex": ptr["header_hex"]}
+    if ptr["issue"]:
+        verdict["issues"].append(ptr["issue"])
+        return verdict  # a clobbered pointer is the whole story; folders may still be intact but
+        #                 the project cannot open until the pointer is a JSON pointer again.
+
+    doc = ptr["doc"] or {}
+    schema = doc.get("$schema", "")
+    if "pbipproperties" not in schema.lower():
+        verdict["issues"].append(
+            "the .pbip JSON has an unexpected $schema (want '.../pbip/pbipProperties/1.0.0/schema.json')"
+            f": {schema!r}")
+    report_rel = None
+    for art in doc.get("artifacts", []):
+        rep = art.get("report") if isinstance(art, dict) else None
+        if isinstance(rep, dict) and rep.get("path"):
+            report_rel = rep["path"]
+            break
+
+    # 2. The report folder the pointer references.
+    if report_rel:
+        report_dir = os.path.join(base, report_rel)
+        pbir = os.path.join(report_dir, "definition.pbir")
+        rep_ok = os.path.isdir(report_dir) and os.path.isfile(pbir)
+        verdict["report"] = {"folder": report_rel, "exists": os.path.isdir(report_dir),
+                             "has_definition_pbir": os.path.isfile(pbir)}
+        if not rep_ok:
+            verdict["issues"].append(
+                f"the report folder {report_rel!r} the .pbip points at is missing or has no "
+                "definition.pbir")
+    else:
+        verdict["issues"].append("the .pbip JSON names no report artifact path")
+
+    # 3. The sibling semantic-model folder.
+    try:
+        sm_dir = _discover_single(base, ".SemanticModel")
+        model_tmdl = os.path.join(sm_dir, "definition", "model.tmdl")
+        db = os.path.join(sm_dir, "definition", "database.tmdl")
+        bim = os.path.join(sm_dir, "definition.bim")
+        tables_dir = os.path.join(sm_dir, "definition", "tables")
+        tables = ([n[:-5] for n in sorted(os.listdir(tables_dir)) if n.lower().endswith(".tmdl")]
+                  if os.path.isdir(tables_dir) else [])
+        # A valid TMDL model folder always carries definition/model.tmdl; database.tmdl is standard
+        # too (a .bim is the legacy single-file form). model.tmdl is the robust "this is a real model
+        # folder" signal.
+        has_model = os.path.isfile(model_tmdl) or os.path.isfile(bim)
+        verdict["semantic_model"] = {"folder": os.path.basename(sm_dir), "has_model_tmdl": has_model,
+                                     "has_database_tmdl": os.path.isfile(db), "tables": tables}
+        if not has_model:
+            verdict["issues"].append(
+                f"the semantic-model folder {os.path.basename(sm_dir)!r} has no definition/model.tmdl")
+    except (FileNotFoundError, RuntimeError) as exc:
+        verdict["issues"].append(str(exc))
+
+    verdict["ok"] = not verdict["issues"]
+    return verdict
+
+
+def render_pbip_verdict(verdict):
+    """A compact, human/agent-readable rendering of :func:`verify_pbip`'s verdict."""
+    lines = []
+    ptr = verdict.get("pointer") or {}
+    if verdict.get("ok"):
+        lines.append("OK  valid PBIP project -- open the .pbip in Power BI Desktop (do NOT zip it)")
+    else:
+        lines.append("PROBLEM  this PBIP bundle is not openable as-is:")
+    if ptr:
+        kind = ptr.get("kind")
+        if kind == "json":
+            lines.append("  pointer      : JSON pointer, %s bytes  (correct -- a .pbip is SUPPOSED "
+                         "to be tiny)" % ptr.get("bytes"))
+        elif kind == "binary-zip":
+            lines.append("  pointer      : BINARY ZIP, %s bytes, header %s  (CLOBBERED -- a .pbip "
+                         "must be JSON, never a zip)" % (ptr.get("bytes"), ptr.get("header_hex")))
+        else:
+            lines.append("  pointer      : %s, %s bytes, header %s"
+                         % (kind, ptr.get("bytes"), ptr.get("header_hex")))
+    sm = verdict.get("semantic_model")
+    if sm:
+        lines.append("  semanticModel: %s  (%d table%s%s)" % (
+            sm.get("folder"), len(sm.get("tables") or []),
+            "" if len(sm.get("tables") or []) == 1 else "s",
+            "" if sm.get("has_model_tmdl") else ", NO model.tmdl"))
+    rep = verdict.get("report")
+    if rep:
+        lines.append("  report       : %s  (%s)" % (
+            rep.get("folder"),
+            "definition.pbir present" if rep.get("has_definition_pbir") else "MISSING definition.pbir"))
+    for issue in verdict.get("issues", []):
+        lines.append("  -> " + issue)
+    return "\n".join(lines)
+
+
 def deploy_pbip(model_dir, report_dir, *, workspace, token, base_url=FABRIC_BASE,
                 model_name=None, report_name=None, description=None, timeout=600):
     """Deploy a PBIP bundle: the semantic model first, then the report rebound ``byConnection`` to it.
@@ -900,6 +1067,22 @@ def _run_report_only(args):
 
 
 def main(argv=None):
+    argv_list = list(argv) if argv is not None else sys.argv[1:]
+    # Read-only .pbip health check -- offline, no workspace/token, so intercept BEFORE the deploy
+    # parser (which requires --workspace). Lets an agent CHECK a produced .pbip instead of guessing
+    # whether it is "broken" (a small JSON-pointer .pbip is CORRECT; a zipped one is the fault).
+    if "--verify-pbip" in argv_list:
+        vp = argparse.ArgumentParser(
+            prog="deploy_to_fabric --verify-pbip",
+            description="Read-only health check of a produced .pbip bundle (offline; no token).")
+        vp.add_argument("--verify-pbip", required=True, metavar="PATH",
+                        help="a .pbip pointer file OR its bundle directory")
+        vp.add_argument("--json", action="store_true", help="print the raw verdict JSON")
+        vargs = vp.parse_args(argv_list)
+        verdict = verify_pbip(vargs.verify_pbip)
+        print(json.dumps(verdict, indent=2) if vargs.json else render_pbip_verdict(verdict))
+        return 0 if verdict["ok"] else 1
+
     ap = argparse.ArgumentParser(description="Deploy a rebuilt semantic model to Microsoft Fabric.")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--model-dir", help="path to an existing <Name>.SemanticModel folder")

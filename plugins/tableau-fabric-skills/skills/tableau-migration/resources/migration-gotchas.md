@@ -53,6 +53,34 @@ migration step errors or produces something unexpected.
 
 ---
 
+## The `.pbip` is a JSON *pointer*, NOT a ZIP — never repackage it
+
+> **Read this before you ever conclude a `.pbip` is "broken."** A real run corrupted correct,
+> openable output because the agent assumed a `.pbip` was a zip and re-zipped it. It is not a zip.
+
+A `.pbip` is a **small (~300-byte) plain-text JSON pointer file**. This is the **correct, complete,
+openable** output — a tiny `.pbip` is *by design*, not a truncated or "un-zipped stub." The actual
+report and model live in the **sibling folders** next to it:
+
+```
+Simple_Example.pbip              ← ~300-byte JSON pointer (CORRECT — do not touch)
+Simple_Example.Report/           ← the rebuilt report (.platform, definition.pbir, definition/…)
+Superstore Datasource.SemanticModel/  ← the model (database.tmdl, model.tmdl, tables/…)
+```
+
+Every *sibling* format an agent knows **is** a zip — `.pbix`, `.twbx`, `.tdsx`, `.hyper` — so the
+reflex "it's small, it must be an un-zipped stub, I'll zip it" is wrong here and **destroys the
+output**.
+
+| Symptom | Cause | Response |
+|---|---|---|
+| The `.pbip` is "only ~300 bytes / a tiny JSON stub" | That is exactly what a correct `.pbip` is — a JSON pointer to the sibling folders | **Nothing is wrong.** Do **not** zip, repackage, or "fix" it. Double-click it in Power BI Desktop |
+| Power BI: `Unable to translate bytes [XX] at index N` on open | The `.pbip` was overwritten with a **ZIP** (its binary `PK..` header is being fed to a JSON parser) | You (or a prior step) zipped the pointer. **Restore it**: re-run the migration, or rewrite the pointer with `assemble_model.write_local_pbip(...)`. Never zip a `.pbip` |
+| Not sure whether a produced `.pbip` is healthy | — | **Check, don't guess:** `py -3.11 scripts/deploy_to_fabric.py --verify-pbip <bundle-dir-or-.pbip>`. It reports the pointer's kind + size and whether the sibling folders are intact (exit 0 = openable, exit 1 = a real problem with the specific fix) |
+| A run finished `WARN` / "degraded" (some calcs need review, a visual dropped) | A legitimate, actionable outcome — **not** a broken bundle | Read `summary.md` and report the gaps. Do **not** hand-rebuild, re-zip, or re-run to "fix" it — a shortfall is a STOP-and-ask, never something to fix by hand |
+
+---
+
 ## Editing the output (`.pbip` reload semantics)
 
 | Symptom | Cause | Response |

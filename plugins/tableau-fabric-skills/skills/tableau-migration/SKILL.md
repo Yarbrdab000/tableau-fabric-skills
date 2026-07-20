@@ -842,6 +842,17 @@ It writes the proven layout with the **exact** schemas baked in (the part agents
 <Name>.Report/               # thin one-page shell; definition.pbir datasetReference.byPath = ../<Name>.SemanticModel
 ```
 
+> **⛔ A `.pbip` is a ~300-byte JSON *pointer*, NOT a ZIP — never repackage it.** The tiny `.pbip` is
+> the **correct, complete, openable** output; the report and model live in the sibling `.Report/` and
+> `.SemanticModel/` folders. Unlike its sibling formats (`.pbix`/`.twbx`/`.tdsx`, which *are* zips), a
+> `.pbip` must stay plain-text JSON. **Do not** conclude a small `.pbip` is a "broken un-zipped stub"
+> and zip it — that overwrites correct output and makes Power BI throw
+> `Unable to translate bytes [XX] at index N` (its JSON parser choking on the ZIP's `PK` header). If
+> unsure whether a produced bundle is healthy, **check, don't guess**:
+> `py -3.11 scripts/deploy_to_fabric.py --verify-pbip <bundle-dir-or-.pbip>` (exit 0 = openable; exit 1
+> = a real, named problem). A `WARN`/degraded run is a legitimate result to report — never hand-rebuild
+> or re-zip artifacts to "fix" it. See [migration-gotchas.md](resources/migration-gotchas.md).
+
 The `.pbir` **`datasetReference.byPath`** is the report→model link. The default `.Report` is a thin
 shell — the dataset is fully functional on its own — but the estate orchestrator now passes
 `report_parts=` (from `twb_to_pbir`) to supply a **real rebuilt report** per workbook (see the note

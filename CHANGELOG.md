@@ -13,6 +13,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.70.0` → `1.71.0`): Stop an agent from *corrupting correct output* by
+  re-zipping a `.pbip`. A real run destroyed openable projects because the agent assumed a ~300-byte
+  `.pbip` was a "broken un-zipped stub" and zipped it — every sibling format it knows (`.pbix`,
+  `.twbx`, `.tdsx`) IS a zip, so the reflex is wrong here and overwrites correct output, after which
+  Power BI throws `Unable to translate bytes [XX] at index N` (its JSON parser choking on the ZIP's
+  `PK` header). Additive; default emit byte-identical.**
+  - **New deterministic health check `deploy_to_fabric.py --verify-pbip <bundle-dir-or-.pbip>`**
+    (`verify_pbip` / `render_pbip_verdict`) — proves, without guessing, that a produced `.pbip` is a
+    small JSON *pointer* (not a ZIP) and that the sibling `.SemanticModel/` / `.Report/` folders are
+    intact. Exit `0` = openable; exit `1` = a real, named problem (e.g. a clobbered pointer, with the
+    exact restore instruction). Offline, read-only, no token/workspace; never raises.
+  - **Loud `.pbip`-is-a-JSON-pointer-not-a-ZIP contract in the docs** — a prominent new section in
+    `resources/migration-gotchas.md` and a `⛔` callout in `SKILL.md`'s output section: a tiny `.pbip`
+    is *correct and complete*, never zip/repackage it, the report and model live in the sibling
+    folders, `Unable to translate bytes` = you overwrote the pointer with a ZIP → restore it, and a
+    `WARN`/degraded run is a legitimate result to report — never hand-rebuild or re-zip to "fix" it.
+  - **Additive `summary.md` "Open locally" note** now states each `.pbip` is a JSON pointer (never
+    zip it) and points at `--verify-pbip`. No report keys renamed or removed.
+  - **+8 tests** (6 `verify_pbip`/CLI in `test_deploy_report_to_fabric.py`, 2 doc-contract guards in
+    `test_runbook_regression_guard.py`, plus additive `summary.md` assertions). Full suite
+    **2752 passed / 3 skipped / 1 xfailed**.
+
 - **tableau-migration (skill `1.69.0` → `1.70.0`): Stop the Tier-3 dashboard-audit runbook from making
   an agent *loop* — re-narrating "I will build the audit bundle" without ever running it. In a real run
   the agent repeated the intent 4+ times because the one concrete build command (`audit_tier.py`) sat

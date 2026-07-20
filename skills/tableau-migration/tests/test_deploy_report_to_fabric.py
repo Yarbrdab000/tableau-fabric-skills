@@ -141,6 +141,110 @@ def test_discover_pbip_missing_and_ambiguous(tmp_path):
         D.discover_pbip(str(empty))
 
 
+# -- verify_pbip (read-only .pbip health check; anti-hallucination ground truth) ------------
+_VALID_POINTER = json.dumps({
+    "$schema": "https://developer.microsoft.com/json-schemas/fabric/pbip/pbipProperties/1.0.0/"
+               "schema.json",
+    "version": "1.0",
+    "artifacts": [{"report": {"path": "DemoReport.Report"}}],
+    "settings": {"enableAutoRecovery": True},
+}, indent=2)
+
+
+def _write_valid_bundle(bundle):
+    _write_model_folder(bundle / "DemoModel.SemanticModel")
+    (bundle / "DemoModel.SemanticModel" / "definition" / "tables").mkdir(parents=True)
+    (bundle / "DemoModel.SemanticModel" / "definition" / "tables" / "Orders.tmdl").write_text(
+        "table Orders\n\tcolumn Sales\n", encoding="utf-8")
+    _write_report_folder(bundle / "DemoReport.Report")
+    pbip = bundle / "DemoModel.pbip"
+    pbip.write_text(_VALID_POINTER, encoding="utf-8")
+    return pbip
+
+
+def test_verify_pbip_ok_on_valid_bundle(tmp_path):
+    bundle = tmp_path / "Good"
+    bundle.mkdir()
+    pbip = _write_valid_bundle(bundle)
+
+    v = D.verify_pbip(str(pbip))
+    assert v["ok"] is True
+    assert v["issues"] == []
+    assert v["pointer"]["kind"] == "json"
+    assert v["pointer"]["bytes"] < 1000  # a .pbip is SUPPOSED to be tiny
+    assert v["semantic_model"]["tables"] == ["Orders"]
+    assert v["report"]["has_definition_pbir"] is True
+    # resolving via the bundle DIRECTORY is equivalent
+    assert D.verify_pbip(str(bundle))["ok"] is True
+
+
+def test_verify_pbip_flags_zip_clobbered_pointer(tmp_path):
+    import zipfile
+    bundle = tmp_path / "Clobbered"
+    bundle.mkdir()
+    pbip = _write_valid_bundle(bundle)
+    with zipfile.ZipFile(str(pbip), "w") as z:  # the exact disaster: zip written over the pointer
+        z.writestr("x.txt", "boom")
+
+    v = D.verify_pbip(str(pbip))
+    assert v["ok"] is False
+    assert v["pointer"]["kind"] == "binary-zip"
+    assert v["pointer"]["header_hex"].startswith("50 4B")  # 'PK'
+    joined = " ".join(v["issues"]).lower()
+    assert "never zip a .pbip" in joined
+    assert "restore" in joined
+
+
+def test_verify_pbip_flags_non_json_pointer(tmp_path):
+    bundle = tmp_path / "Garbage"
+    bundle.mkdir()
+    pbip = _write_valid_bundle(bundle)
+    pbip.write_bytes(b"\x00\x01not json at all")
+
+    v = D.verify_pbip(str(pbip))
+    assert v["ok"] is False
+    assert v["pointer"]["kind"] == "non-json"
+
+
+def test_verify_pbip_flags_missing_report_folder(tmp_path):
+    bundle = tmp_path / "NoReport"
+    bundle.mkdir()
+    pbip = _write_valid_bundle(bundle)
+    import shutil
+    shutil.rmtree(str(bundle / "DemoReport.Report"))
+
+    v = D.verify_pbip(str(pbip))
+    assert v["ok"] is False
+    assert any("report folder" in i.lower() for i in v["issues"])
+
+
+def test_verify_pbip_missing_bundle_is_a_verdict_not_a_raise(tmp_path):
+    v = D.verify_pbip(str(tmp_path / "does-not-exist"))
+    assert v["ok"] is False
+    assert v["issues"]
+
+
+def test_verify_pbip_cli_exit_codes_and_output(tmp_path, capsys):
+    bundle = tmp_path / "CliGood"
+    bundle.mkdir()
+    pbip = _write_valid_bundle(bundle)
+
+    assert D.main(["--verify-pbip", str(pbip)]) == 0
+    out = capsys.readouterr().out
+    assert "OK" in out and "do NOT zip" in out
+
+    import zipfile
+    with zipfile.ZipFile(str(pbip), "w") as z:
+        z.writestr("x.txt", "boom")
+    assert D.main(["--verify-pbip", str(pbip)]) == 1
+    out = capsys.readouterr().out
+    assert "CLOBBERED" in out
+
+    # --json prints the raw verdict
+    assert D.main(["--verify-pbip", str(bundle), "--json"]) in (0, 1)
+    assert '"pointer"' in capsys.readouterr().out
+
+
 def test_report_name_from_folder_prefers_platform_displayname(tmp_path):
     root = tmp_path / "folder-stem.Report"
     _write_report_folder(root, display="Pretty Name")
