@@ -13,6 +13,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.79.0` → `1.80.0`): Lock the Defect-1 invariant — a parameter *swap*
+  calc has exactly one representation.** An agent post-mortem alleged the engine could emit one
+  measure-swap parameter as BOTH a field-parameter table AND a SWITCH/aggregating measure in the same
+  run (a "two-pass" contradiction). Verified against the code (2026-07-20): it cannot — `assemble_model`
+  builds field parameters first, derives a single `consumed` set from `emit_field_parameters`, and
+  threads that *same* set into both the calc-column path and the measure path, so a consumed swap is
+  routed through exactly one mode. That guarantee was, however, only enforced *implicitly* by the shared
+  plumbing and had no test naming it. This release adds `tests/test_field_swap_invariants.py`: a
+  **property** test over a class of swap-bearing workbooks (measure-swap-only, dim-swap-only, and both
+  swaps alongside a what-if measure, a plain measure, and a row-level parameter flag) asserting that no
+  name in `report["field_parameters"]["consumed"]` is ever emitted as a `measure` (anywhere) or as a
+  `column` on any table other than its own field-parameter table — with a positive guard that excluding
+  the consumed swaps never collateral-drops the legitimate neighboring measures. Zero behavior change
+  (no runtime/script edit; the assertions pass on today's output); the class of double-emit regressions
+  is now unrepresentable. +3 tests. Report schema unchanged.
 - **tableau-migration (skill `1.78.0` → `1.79.0`): Auto-output the *absolute* `.pbip` filepath so the
   agent can hand the user a real, copy-pasteable path instead of a bare filename.** In a real run the
   user asked "link me to the pbip filepath" / "give me the filepaths" and the agent could only list
