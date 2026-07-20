@@ -1143,7 +1143,7 @@ def _parse_encodings(pane, ds_default, base_cols, instances, index, ds_caption,
                      date_binding=None, row_count_binding=None, measure_binding=None,
                      column_binding=None):
     enc = {"color": None, "size": None, "label": None, "detail": None, "angle": None,
-           "geo_levels": []}
+           "geo_levels": [], "detail_dims": []}
     if pane is None:
         return enc
     holder = _first(pane, "encodings")
@@ -1152,6 +1152,7 @@ def _parse_encodings(pane, ds_default, base_cols, instances, index, ds_caption,
     mapping = {"color": "color", "size": "size", "text": "label",
                "label": "label", "lod": "detail", "level-of-detail": "detail",
                "wedge-size": "angle"}
+    seen_detail_dims = set()
     for child in list(holder):
         role = mapping.get(_local(child.tag))
         if not role:
@@ -1169,6 +1170,17 @@ def _parse_encodings(pane, ds_default, base_cols, instances, index, ds_caption,
             # Location to the FINEST geography present, not whichever level Tableau serialised first.
             if role == "detail" and f.get("geo_area"):
                 enc["geo_levels"].append(f)
+            # Tableau's Detail shelf can hold MANY pills (tooltip measures + the real
+            # disaggregating dimension(s)). enc["detail"] keeps only the FIRST, so a scatter whose
+            # first Detail pill is a measure would otherwise lose its dimension and misclassify as a
+            # card. Retain EVERY category Detail pill (deduped, in order) so scatter classification
+            # and its Category/Details binding see the true granularity dimension(s).
+            if role == "detail" and f.get("kind") == "category":
+                key = (f.get("entity"), f.get("property"),
+                       f.get("binding"), f.get("aggregation"))
+                if key not in seen_detail_dims:
+                    seen_detail_dims.add(key)
+                    enc["detail_dims"].append(f)
     return enc
 
 
@@ -2932,6 +2944,11 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         # dimension (scatter) and label/size can be the measure of a bare card / KPI tile.
         enc_dims = [f for f in (encodings["color"], encodings["detail"])
                     if f and f["kind"] == "category"]
+        # A scatter's disaggregating dimension can be ANY Detail pill, not just the first one
+        # enc["detail"] captured (Tableau serialises tooltip measures on Detail ahead of it). Fold
+        # in every category Detail pill so has_dim reflects the real granularity dimension(s).
+        enc_dims += [f for f in encodings.get("detail_dims", [])
+                     if f and f["kind"] == "category" and f not in enc_dims]
         enc_meas = [f for f in (encodings["size"], encodings["label"], encodings["angle"])
                     if f and f["kind"] == "value"]
         # geographic map signals: a geo-role dimension on Detail is the Location; a measure on
@@ -4110,9 +4127,15 @@ def _build_query_state(ws, model_table, field_map, warnings):
     elif vt == VT_SCATTER:
         x = _dedupe(values(cols))   # measure(s) on columns -> X axis
         y = _dedupe(values(rows))   # measure(s) on rows    -> Y axis
+        # Every category Detail pill is a disaggregating dimension (Tableau allows many); bind them
+        # all to Category/Details so the scatter plots one mark per granularity combination, not
+        # just the first Detail pill enc["detail"] happened to capture.
+        detail_dims = [f for f in ws["encodings"].get("detail_dims", [])
+                       if f and f["kind"] == "category"]
         cat = drop_calc_axis(_dedupe(
             categories(rows) + categories(cols)
-            + ([detail] if detail and detail["kind"] == "category" else [])))
+            + ([detail] if detail and detail["kind"] == "category" else [])
+            + detail_dims))
         series = [color] if (color and color["kind"] == "category"
                              and not color["is_calc"]) else []
         cat = [f for f in cat if f not in series]

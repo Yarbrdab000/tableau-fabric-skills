@@ -2027,6 +2027,38 @@ def test_scatter_size_measure_already_on_axis_is_not_double_bound():
     assert state["X"]["projections"][0]["field"]["Aggregation"]["Expression"]["Column"]["Property"] == "Sales_Amount"
 
 
+def test_scatter_detail_measures_before_dimension_still_scatter():
+    # Tableau's Detail shelf holds MANY pills: tooltip MEASURES are serialised BEFORE the real
+    # disaggregating DIMENSION(s). enc["detail"] keeps only the FIRST (a measure), which used to
+    # drop the dimensions and misclassify the scatter as a card -- the Twitter "Scatter Plot" bug.
+    # Every category Detail pill must survive onto Category/Details so the shape stays a scatter.
+    enc = ("<encodings>"
+           "<lod column='[federated.abc].[sum:Sales:qk]' />"
+           "<lod column='[federated.abc].[none:Category:nk]' />"
+           "<lod column='[federated.abc].[none:Region:nk]' />"
+           "<lod column='[federated.abc].[none:Region:nk]' />"
+           "</encodings>")
+    ws = _worksheet("Detail Scatter", "Circle",
+                    rows="[federated.abc].[sum:Profit:qk]",
+                    cols="[federated.abc].[sum:Sales:qk]",
+                    deps_extra=_INST, encodings=enc)
+    ir = parse_twb(_workbook(ws))
+    parsed = ir["worksheets"][0]
+    assert parsed["visual_type"] == "scatter"
+    # the single detail slot still keeps the first (measure) pill; the dimensions live in detail_dims
+    assert parsed["encodings"]["detail"]["kind"] == "value"
+    assert [f["caption"] for f in parsed["encodings"]["detail_dims"]] == ["Category", "Region"]
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "scatterChart"
+    state = _query_state(vis)
+    assert set(state) >= {"X", "Y", "Category"}
+    assert state["X"]["projections"][0]["field"]["Aggregation"]["Expression"]["Column"]["Property"] == "Sales_Amount"
+    assert state["Y"]["projections"][0]["field"]["Aggregation"]["Expression"]["Column"]["Property"] == "Profit"
+    # both detail dimensions land on Category/Details, in order, deduped (Region appears once)
+    cats = [p["field"]["Column"]["Property"] for p in state["Category"]["projections"]]
+    assert cats == ["Category", "Region"]
+
+
 def test_circle_dot_plot_one_dim_one_measure_is_column():
     # A Circle dot/strip plot with one category axis + one measure axis carries the SAME binding
     # as a column chart; only the dot glyph differs (Tier-2 styling, cf. an area mark -> areaChart).

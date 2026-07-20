@@ -13,6 +13,17 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.74.0` → `1.75.0`): A scatter plot with tooltip measures on Detail is
+  rebuilt as a scatter, not flattened to a card. Tableau's Detail shelf holds many pills at once —
+  commonly several tooltip MEASURES serialised ahead of the real disaggregating DIMENSION(s) (e.g. the
+  "Twitter Sentiment Analysis – Scatter Plot", whose Detail carries `SUM(Retweet Count)`,
+  `SUM(Favourite Count)`, `SUM(User Followers Count)` before `Status Text` / `User Screen Name`). The
+  encoding parser kept only the FIRST Detail pill, so when a measure came first the granularity
+  dimension was lost, `has_dim` went false, and the two-measure view misclassified as a multi-row
+  **card**. The parser now retains every category Detail pill (deduped, in order) on a new additive
+  `encodings["detail_dims"]`; scatter classification counts them toward `has_dim`, and the scatter
+  binding lands them all on Category/Details so the chart plots one mark per granularity combination.
+  Purely additive — byte-identical when Detail holds at most one dimension. +1 regression test.**
 - **tableau-migration (skill `1.73.0` → `1.74.0`): A migrated model opens even when a datasource
   declares a bin/group twice. A published or federated datasource serialises a Tableau numeric bin (or
   categorical group) BOTH as a plain `<column>` and as a `layered='true'` federation shadow with the
