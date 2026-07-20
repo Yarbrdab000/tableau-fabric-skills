@@ -411,3 +411,42 @@ def test_inject_calc_columns_appends_when_no_partition():
     out = enrich_table_tmdl(base, calc_columns=calc)
     assert out.startswith(base)
     assert "column C =" in out
+
+
+def test_inject_calc_columns_skips_name_already_on_table():
+    # A TMDL table must never declare the same column twice: Power BI refuses to merge two Column
+    # objects that both declare ``expression``. A calc column whose name is already declared on the
+    # table (as a base column here) is dropped -- the existing declaration wins, keep-first.
+    base = (
+        "table Orders\n\tlineageTag: x\n"
+        "\n\tcolumn 'Profit (bin)'\n\t\tdataType: int64\n\t\tsourceColumn: Profit (bin)\n\n"
+        "\tpartition Orders = m\n\t\tmode: import\n"
+    )
+    calc = generate_calc_column_tmdl("Profit (bin)", "BIN([Profit])",
+                                     "INT('Orders'[Profit] / 200) * 200", tmdl_type="int64")
+    out = enrich_table_tmdl(base, calc_columns=calc)
+    assert out.count("column 'Profit (bin)'") == 1
+    assert out == base  # nothing injected -- the base column already occupies the name
+
+
+def test_inject_calc_columns_dedups_same_name_within_one_splice():
+    # Two same-named calc blocks passed together (e.g. a federated ``layered='true'`` bin twin) splice
+    # exactly once; distinct names both land. Order-preserving, keep-first.
+    base = "table T\n\tlineageTag: z\n\n\tpartition T = m\n\t\tmode: import\n"
+    dup_a = generate_calc_column_tmdl("Profit (bin)", "BIN([Profit])", "INT('T'[Profit])", tmdl_type="int64")
+    dup_b = generate_calc_column_tmdl("Profit (bin)", "BIN([Profit])", "INT('T'[Profit])", tmdl_type="int64")
+    other = generate_calc_column_tmdl("Sales (bin)", "BIN([Sales])", "INT('T'[Sales])", tmdl_type="int64")
+    out = enrich_table_tmdl(base, calc_columns=[dup_a, dup_b, other])
+    assert out.count("column 'Profit (bin)'") == 1
+    assert out.count("column 'Sales (bin)'") == 1
+
+
+def test_inject_calc_columns_no_duplicate_is_byte_identical():
+    # With no name clash the split-and-rejoin guard reproduces the naive splice byte-for-byte
+    # (additive: the guarded path changes output ONLY when it would emit a duplicate).
+    base = "table T\n\tlineageTag: z\n\n\tpartition T = m\n\t\tmode: import\n"
+    multi = (generate_calc_column_tmdl("A", "[x]", "1")
+             + generate_calc_column_tmdl("B", "[y]", "2"))
+    idx = base.find("\tpartition ")
+    naive = base[:idx] + multi + base[idx:]
+    assert enrich_table_tmdl(base, calc_columns=multi) == naive

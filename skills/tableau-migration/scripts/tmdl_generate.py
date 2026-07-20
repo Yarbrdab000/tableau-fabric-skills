@@ -1423,10 +1423,22 @@ def resolve_model_objects(parsed, resolve_field, *, calcs=None, data_tables=None
                 params_by_name.setdefault(key, p)
 
     calc_columns = {}
+    # A TMDL table must never declare the same column NAME twice (Power BI refuses to merge two
+    # ``Column`` objects that both declare ``expression``). A federated ``layered='true'`` twin
+    # yields two identically-named bins, and a Group and a Bin could share a display name; dedup by
+    # ``(table, name)`` across BOTH loops so each home table gets each calc column exactly once.
+    seen_calc_cols = set()
     groups_report = {"emitted": [], "skipped": [], "notes": []}
     for g in (parsed.get("groups") or []):
         placement, entry = _group_calc_column(g, resolve_field, field_index)
         if placement is not None:
+            _key = (placement[0], (entry.get("name") or "").casefold())
+            if _key in seen_calc_cols:
+                groups_report["notes"].append(
+                    {"name": entry.get("name"),
+                     "note": "duplicate column name collapsed (already emitted on this table)"})
+                continue
+            seen_calc_cols.add(_key)
             calc_columns.setdefault(placement[0], []).append(placement[1])
         if entry.get("reason") == "translated":
             groups_report["emitted"].append(entry["name"])
@@ -1439,6 +1451,13 @@ def resolve_model_objects(parsed, resolve_field, *, calcs=None, data_tables=None
     for b in (parsed.get("bins") or []):
         placement, entry = _bin_calc_column(b, resolve_field, field_index, params_by_name)
         if placement is not None:
+            _key = (placement[0], (entry.get("name") or "").casefold())
+            if _key in seen_calc_cols:
+                bins_report["notes"].append(
+                    {"name": entry.get("name"),
+                     "note": "duplicate column name collapsed (already emitted on this table)"})
+                continue
+            seen_calc_cols.add(_key)
             calc_columns.setdefault(placement[0], []).append(placement[1])
         if entry.get("reason") == "translated":
             bins_report["emitted"].append(entry["name"])
@@ -1569,8 +1588,47 @@ def _inject_hierarchies(table_tmdl, hierarchies):
 def _inject_calc_columns(table_tmdl, calc_columns):
     """Splice pre-rendered calculated-column block(s) into an existing ``table`` TMDL string,
     just before its first ``partition`` declaration (where regular columns live). ``calc_columns``
-    is a single rendered block or an iterable of them (see ``generate_calc_column_tmdl``)."""
-    block = calc_columns if isinstance(calc_columns, str) else "".join(calc_columns)
+    is a single rendered block or an iterable of them (see ``generate_calc_column_tmdl``).
+
+    A TMDL ``table`` must never declare the same column NAME twice: Power BI refuses to merge two
+    ``Column`` objects that both declare an ``expression`` ("TMDL objects cannot be merged because
+    both declare the same property: expression"), so the model will not open. This guard therefore
+    drops any column sub-block whose name is ALREADY declared on the table (case-insensitive) or was
+    already spliced in this call -- keep-first. It makes the splice idempotent across BOTH injection
+    paths (row-level ``dim_calcs`` and harvested Group/Bin calc columns) and within a single call,
+    so a federated ``layered='true'`` twin or a base/calc name clash can never emit a duplicate.
+    With no duplicate the split-and-rejoin reproduces the input byte-for-byte (additive)."""
+    blocks = [calc_columns] if isinstance(calc_columns, str) else list(calc_columns)
+    if not blocks:
+        return table_tmdl
+    existing = set()
+    for line in table_tmdl.splitlines():
+        nm = _decl_name(line, "column")
+        if nm:
+            existing.add(nm.casefold())
+    kept = []
+    for blk in blocks:
+        if not blk:
+            continue
+        # A per-table block may concatenate several ``column`` sub-blocks (the dim_calcs path builds
+        # ``by_table[t] = "" + generate_calc_column_tmdl(...)``); split on the top-level boundary so
+        # each column is deduped independently. The lossless lookahead split rejoins byte-for-byte.
+        for part in re.split(r"(?=\n\tcolumn )", blk):
+            if not part:
+                continue
+            name = None
+            for line in part.splitlines():
+                nm = _decl_name(line, "column")
+                if nm:
+                    name = nm
+                    break
+            if name is not None:
+                key = name.casefold()
+                if key in existing:
+                    continue
+                existing.add(key)
+            kept.append(part)
+    block = "".join(kept)
     if not block:
         return table_tmdl
     idx = table_tmdl.find("\tpartition ")

@@ -188,6 +188,41 @@ def test_numeric_bin_missing_size_parameter_is_inert_stub_and_skipped():
     assert skip is not None and "not found" in skip["reason"]
 
 
+# -- duplicate / federated-twin bin (§3.2 regression) --------------------------
+# A published/federated datasource serialises a bin BOTH as a plain <column> and as a
+# ``layered='true'`` federation shadow with the SAME internal name -- two class='bin' columns.
+# Emitting both would declare ``column 'Profit (bin)'`` twice, and Power BI refuses to merge two
+# Column objects that both carry an ``expression`` ("cannot be merged ... same property: expression"),
+# so the model will not open. The harvest must collapse the twin to a single calc column.
+_TWIN_BIN_TDS = GROUP_BIN_TDS.replace(
+    "  <column caption='Sales (bin)'",
+    "  <column caption='Profit (bin)' datatype='integer' name='[Profit (bin)]' layered='true' "
+    "role='dimension' type='ordinal'>\n"
+    "    <calculation class='bin' decimals='0' formula='[Profit]' peg='0' size='200' />\n"
+    "  </column>\n"
+    "  <column caption='Sales (bin)'",
+    1,
+)
+
+
+def test_federated_twin_bin_emits_single_calc_column():
+    # Two class='bin' columns named [Profit (bin)] (plain + layered twin) parse to two bins ...
+    parsed = T.parse_model_objects(_TWIN_BIN_TDS)
+    assert [b["name"] for b in parsed["bins"]].count("Profit (bin)") == 2
+
+    out = migrate_tds_to_semantic_model(_TWIN_BIN_TDS, model_name="Superstore")
+    orders = _orders(out)
+    # ... but the Orders table declares the calc column EXACTLY ONCE (else the .pbip won't open).
+    assert orders.count("column 'Profit (bin)'") == 1
+    assert "column 'Profit (bin)' = INT(('Orders'[Profit] - 0) / 200) * 200 + 0" in orders
+
+    bins = out["report"]["model_objects"]["bins"]
+    # honest report: emitted once, and the collapsed twin is disclosed as a note (never double-listed)
+    assert bins["emitted"].count("Profit (bin)") == 1
+    assert any(n.get("name") == "Profit (bin)" and "duplicate" in n.get("note", "")
+               for n in bins["notes"])
+
+
 # -- backward compatibility / no-op --------------------------------------------
 def test_harvest_is_a_pure_no_op_without_groups_or_bins():
     out = migrate_tds_to_semantic_model(PLAIN_TDS, model_name="Plain")

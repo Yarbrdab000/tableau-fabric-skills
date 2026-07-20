@@ -13,7 +13,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration (skill `1.72.0` → `1.73.0`): Server-downloaded workbooks keep their dashboard
+- **tableau-migration (skill `1.73.0` → `1.74.0`): A migrated model opens even when a datasource
+  declares a bin/group twice. A published or federated datasource serialises a Tableau numeric bin (or
+  categorical group) BOTH as a plain `<column>` and as a `layered='true'` federation shadow with the
+  SAME internal name, so the model-object harvest appended two identically-named calculated columns to
+  one table. Power BI refuses to merge two `Column` objects that both declare an `expression` ("TMDL
+  objects cannot be merged because both declare the same property: expression"), so the rebuilt `.pbip`
+  would not open. The harvest now collapses same-named calc columns per table, and the calc-column
+  splice (`_inject_calc_columns`) enforces the invariant that a table never declares a column name
+  twice — dropping any calc column whose name is already declared (keep-first), across BOTH the
+  row-level `dim_calcs` and harvested Group/Bin injection paths.**
+  - **`resolve_model_objects` dedups calc columns by `(table, name)`** across the Groups and Bins loops
+    (shared `seen` set); the collapsed twin is disclosed as a note and never double-listed in `emitted`.
+  - **`_inject_calc_columns` is now idempotent** — it splits a multi-column block into its `column`
+    sub-blocks and skips any whose name already occurs on the table or earlier in the same splice. With
+    no duplicate the split-and-rejoin reproduces the prior output byte-for-byte (additive).
+  - +4 regression tests (federated twin-bin end-to-end emits one calc column; inject-guard skips a
+    name already on the table, dedups within one splice, and stays byte-identical without a clash).
+
+
   images. A live/server workbook download lands BOTH twins in the input folder — the packaged `.twbx`
   (the only copy that carries the dashboard image bytes under `Image/`) and its extracted bare `.twb`
   (XML only). The estate's twin-dedup preferred the unpacked `.twb`, so `_twbx_images` had no archive to
