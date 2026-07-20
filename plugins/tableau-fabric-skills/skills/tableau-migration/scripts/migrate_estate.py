@@ -118,8 +118,12 @@ class LocalFilesSource(TableauSource):
     UPLOAD works exactly like a live PULL. A packaged file's inner document is extracted in memory
     (never written to disk); a bare file is read with ``encoding="utf-8-sig"`` so Tableau's UTF-8 BOM
     is consumed transparently. When both a packaged and an unpacked copy of the same asset coexist in
-    a folder, the asset is processed ONCE (the unpacked copy wins). Ids are absolute file paths; the
-    display name is the file stem.
+    a folder, the asset is processed ONCE: a datasource keeps the unpacked ``.tds`` copy, but a
+    WORKBOOK keeps the packaged ``.twbx`` -- only the archive carries the dashboard image/asset bytes
+    (logos, icons) a bare ``.twb`` drops, and the engine reads the workbook XML transparently from
+    either. This matters because a live/server workbook download writes BOTH twins side by side (the
+    archive plus its extracted ``.twb``), so choosing the ``.twbx`` is what keeps its images. Ids are
+    absolute file paths; the display name is the file stem.
     """
 
     def __init__(self, root):
@@ -135,16 +139,30 @@ class LocalFilesSource(TableauSource):
         return sorted(found)
 
     @staticmethod
-    def _dedup_by_stem(paths):
+    def _dedup_by_stem(paths, prefer_packaged=False):
         # A packaged export (.tdsx/.twbx) and its unpacked twin (.tds/.twb) describe ONE asset; emit it
-        # once (prefer the unpacked copy -- already text, and the copy a user is most likely editing)
-        # so the output bundle has no duplicate datasource / name collision.
+        # once so the output bundle has no duplicate datasource / name collision. Which twin wins:
+        #   * datasources (``prefer_packaged`` False) -- the unpacked ``.tds`` wins: already text, and
+        #     the copy a user is most likely editing.
+        #   * workbooks (``prefer_packaged`` True) -- the packaged ``.twbx`` wins: ONLY the archive
+        #     carries the dashboard image/asset bytes (logos, icons); a bare ``.twb`` twin drops them,
+        #     so preferring it would silently lose every image. The engine reads the workbook XML
+        #     transparently from either, so choosing the archive costs nothing. A live/server download
+        #     writes BOTH twins into the input folder, which is exactly when this preference matters.
+        # Order-independent: the choice never depends on which twin ``os.walk`` happened to list first.
         chosen = {}
         for p in paths:
             stem, ext = os.path.splitext(os.path.basename(p))
             key = (os.path.dirname(p), stem.lower())
             packaged = ext.lower() in (".tdsx", ".twbx")
-            if key not in chosen or (chosen[key][1] and not packaged):
+            if key not in chosen:
+                chosen[key] = (p, packaged)
+                continue
+            stored_packaged = chosen[key][1]
+            if prefer_packaged:
+                if packaged and not stored_packaged:
+                    chosen[key] = (p, packaged)
+            elif stored_packaged and not packaged:
                 chosen[key] = (p, packaged)
         return sorted(p for p, _packaged in chosen.values())
 
@@ -159,7 +177,10 @@ class LocalFilesSource(TableauSource):
 
     def list_workbooks(self):
         # Packaged ``.twbx`` is a common local export shape, so discover it alongside the bare ``.twb``.
-        return self._dedup_by_stem(self._discover(".twb") + self._discover(".twbx"))
+        # Prefer the ``.twbx`` twin: only the archive carries the dashboard image bytes (see
+        # ``_dedup_by_stem``), so a server download that lands both twins keeps its logos/icons.
+        return self._dedup_by_stem(self._discover(".twb") + self._discover(".twbx"),
+                                   prefer_packaged=True)
 
     def read_workbook(self, wb_id):
         # ``load_workbook_xml`` transparently handles both a bare ``.twb`` and a packaged ``.twbx``.

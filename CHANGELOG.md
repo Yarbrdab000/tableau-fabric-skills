@@ -13,6 +13,19 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.72.0` → `1.73.0`): Server-downloaded workbooks keep their dashboard
+  images. A live/server workbook download lands BOTH twins in the input folder — the packaged `.twbx`
+  (the only copy that carries the dashboard image bytes under `Image/`) and its extracted bare `.twb`
+  (XML only). The estate's twin-dedup preferred the unpacked `.twb`, so `_twbx_images` had no archive to
+  read and every logo/icon was silently dropped from the rebuilt report. (A local `.twbx`-only upload
+  has no `.twb` twin, so images worked there — hence a regression that only bit server downloads.)**
+  - **`LocalFilesSource` now keeps the packaged `.twbx` for workbooks** (`_dedup_by_stem` grew an
+    order-independent `prefer_packaged` seam; `list_workbooks` sets it). The engine reads the workbook
+    XML transparently from either twin, so choosing the archive costs nothing and preserves the images.
+  - **Datasources are unchanged** — the unpacked `.tds` still wins (its pinned dedup test still passes).
+  - **+1 regression test** (`test_local_files_source_workbook_twin_prefers_packaged_twbx_for_images`)
+    lands both twins and asserts the `.twbx` wins and its image bytes stay reachable. Full suite **2755
+    passed / 3 skipped / 1 xfailed**.
 - **tableau-migration (skill `1.71.0` → `1.72.0`): Stop the mechanical span from making an agent *think
   too hard*. A real run had the agent write an essay at every step and spend ~6 paragraphs agonizing over
   an **expected** `datasources_migrated: 0` on an embedded-workbook run — because Checkpoint 2 demanded

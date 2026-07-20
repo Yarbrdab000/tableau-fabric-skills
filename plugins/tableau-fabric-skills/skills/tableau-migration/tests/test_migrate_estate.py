@@ -466,6 +466,28 @@ def test_local_files_source_dedups_packaged_and_unpacked_twin(tmp_path):
     assert [os.path.basename(p) for p in ds] == ["widget_sales.tds"]
 
 
+def test_local_files_source_workbook_twin_prefers_packaged_twbx_for_images(tmp_path):
+    # REGRESSION: a live/server workbook download lands BOTH twins side by side -- the packaged
+    # ``.twbx`` (the ONLY copy that carries the dashboard image bytes under ``Image/``) and its
+    # extracted bare ``.twb`` (XML only, no images). If the estate preferred the unpacked ``.twb``
+    # here, every dashboard logo/icon would silently vanish from the migrated report. The workbook
+    # twin must therefore keep the ``.twbx`` so ``_twbx_images`` can still recover the packaged bytes.
+    root = tmp_path / "download"
+    root.mkdir()
+    twb_xml = "<workbook><dashboards><dashboard name='Cover'/></dashboards></workbook>"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("widget_dashboard.twb", twb_xml)
+        zf.writestr("Image/Logo.png", b"\x89PNG\r\n\x1a\nlogo-bytes")
+    (root / "widget_dashboard.twbx").write_bytes(buf.getvalue())
+    (root / "widget_dashboard.twb").write_text(twb_xml, encoding="utf-8")
+
+    wb = LocalFilesSource(str(root)).list_workbooks()
+    assert [os.path.basename(p) for p in wb] == ["widget_dashboard.twbx"]   # archive wins, not .twb
+    images = me._twbx_images(wb[0])
+    assert "Image/Logo.png" in images   # packaged image bytes are still reachable
+
+
 # -- full estate run over file-backed fixtures --------------------------------
 def test_migrate_estate_local_full(fixtures_dir, tmp_path):
     out = str(tmp_path / "bundle")
