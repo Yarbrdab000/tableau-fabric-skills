@@ -306,6 +306,9 @@ call Python. You author a JSON file and re-run the same command with `--approved
    `> 0`, collect the stubbed calcs from each datasource's `translation_handoff.requests` (and each
    workbook's `model_translation_handoff`). Each request carries `name`, `category`,
    `category_guidance`, the original `tableau_formula`, and the resolved field bindings.
+   **Read `report.json` by its exact path (`$RUN\out\report.json`) — do not *search* for it or its stub
+   requests:** the run folder is outside the editor workspace and git-ignored, so a workspace/code
+   search returns *"No matches"* and you spin. Every field above already lives inside this one file.
 2. **Author the DAX** for each one you can, per its category playbook above. Write column refs as
    **resolved MODEL identifiers** — `'Table'[Column_Sanitized]`, the sanitized names in the built
    model — never Tableau captions like `[Sales]`.

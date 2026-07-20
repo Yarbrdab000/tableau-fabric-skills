@@ -13,6 +13,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.77.0` → `1.78.0`): Stop the agent from *searching* the filesystem for
+  inputs and run artifacts — a recurring drift shown in two real runs. Run 1: asked for the workbook's
+  "absolute path" after the user had already **attached** it, then ran a disk-wide `Get-ChildItem
+  -Recurse` that surfaced **stale duplicates** (a OneDrive copy, an old run copy) instead of the version
+  just attached. Run 2 (second-compiler phase): used the editor's *"search files"* tool to locate
+  `report.json` / `summary.md` / the skill scripts / the stub-request objects and got repeated *"No
+  matches — excluded by search.exclude / .ignore"* because the run folder (`C:\tfmig\runs\NNNN`) is
+  outside the editor workspace and git-ignored — then flailed, broadening searches. New non-negotiable
+  **Gate Rule 6**: never *search* the filesystem — every path is pinned or handed to you. Inputs come
+  from the **attachment's absolute path the harness surfaces in the message** (copy that exact path into
+  `$RUN\in`; never re-ask for it, never scan for it — a broad scan grabs a stale duplicate). Artifacts
+  (`scan.json`, `report.json`, `summary.md`, `report.json` → `translation_handoff.requests`,
+  `approved_dax.json`, the bundle) sit at **pinned** paths under `$RUN\out` (scripts under
+  `$SKILL\scripts`) and are **read by exact path** — a workspace/code search cannot see a git-ignored,
+  out-of-workspace run folder. Reinforced at the D1=B input step (use the surfaced attachment path, not
+  a scan) and the second-compiler "Find the stubs" step (read `$RUN\out\report.json` directly, don't
+  search). Prose-only, additive — no script, schema, or flag change.**
 - **tableau-migration (skill `1.76.0` → `1.77.0`): Runbook input step now tells a driving agent that an
   already-attached Tableau file IS the input — stops the filesystem scavenger-hunt / mode-confusion
   drift. A real VS Code run failed not in code but in the runbook: given an attached `.twbx`, the agent

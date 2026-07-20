@@ -51,6 +51,20 @@ do not improvise flags or infer answers. The detailed reference body begins afte
    one named field (e.g. `STEP 2 ✅ — bundle built; DoD=warn`) — do not restate what a script does,
    re-derive why a number is what it is, or write a paragraph before/after `GO`. If you catch yourself
    explaining an *expected* value to yourself, stop: the run is meant to be fast and uneventful.
+6. **Never *search* the filesystem for a file — every path is pinned or handed to you.** Both the input
+   and every artifact have a known location, so an editor/workspace/code *"search files"* call is the
+   wrong tool here and will mislead you. **Inputs:** when the user attaches a Tableau file (or says
+   *"I'll attach it"*), the harness writes it to disk and gives you its **absolute path in the message** —
+   that attachment IS the input; copy **that exact path** into `$RUN\in` and move on. Never ask the user
+   to re-type a path they already attached, and never run a recursive/disk-wide scan to "find" it — a
+   broad scan grabs a **stale duplicate** from some other folder (OneDrive, an old run) instead of the
+   bytes just attached. **Artifacts:** `scan.json`, `report.json`, `summary.md`, the second-compiler
+   stub requests (`report.json` → `translation_handoff.requests`), `approved_dax.json`, and the built
+   bundle all sit at **pinned** paths under `$RUN\out` (scripts under `$SKILL\scripts`) — **read them by
+   their exact path.** `$RUN` (`C:\tfmig\runs\NNNN`) is **outside the editor workspace and git-ignored**,
+   so a workspace/code search returns *"No matches — excluded by search.exclude / .ignore"* and you spin.
+   A failed read means the path is wrong or the step didn't run: re-derive it from `$RUN`/`$SKILL`, never
+   broaden a search.
 
 ### Phase 0A — Decision Menu (present verbatim; defaults marked)
 
@@ -225,8 +239,11 @@ embedded-vs-published; STEP 2 auto-detects all of that.
 - **D1=B (local):** **the file(s) the user already attached / handed you ARE the inputs — copy them
   verbatim into `.\in`, then go straight to STEP 1.5.** Do **not** search the repo, working directory,
   or disk for a workbook (the installed skill folder ships **no** user file, so a filesystem scan finds
-  nothing and only wastes turns); if you were given an attachment but have no path to copy, **ASK the
-  user for the path — never scavenge.** Copy the exported files in **as-is** (`.tds`/`.tdsx`
+  nothing and only wastes turns). The harness writes each attachment to disk and hands you its
+  **absolute path in the message** — copy **that exact path** into `.\in`; never run a recursive or
+  disk-wide scan to "find" it, which grabs a **stale duplicate** from another folder (OneDrive, an old
+  run) instead of the version just attached. Only if **no** attachment path is surfaced at all, **ASK
+  the user for the path — never scavenge.** Copy the exported files in **as-is** (`.tds`/`.tdsx`
   **datasources** and/or `.twb`/`.twbx` **workbooks**) — **never unzip** a packaged `.tdsx`/`.twbx`;
   STEP 2 ingests packaged files directly and the packaging carries any extract/flat-file data inside.
   The **file extension alone decides the mode, and you never hand-classify beyond it**: `.twb`/`.twbx`
