@@ -22,6 +22,7 @@ from twb_to_pbir import (
     _INTEGER_DATE_PART_COLUMNS,
     _apply_grow_to_fit,
     _apply_override,
+    _automatic_canvas_dims,
     _candidate_plan,
     _card_latent_candidates,
     _drop_resolved_flag_warnings,
@@ -5968,6 +5969,73 @@ def test_orphan_page_stays_1280x720_after_a_sized_dashboard():
     dims = _page_dims(emit_pbir(parse_twb(_workbook(ws1 + ws2, dash))))
     assert dims["D"] == (1400, 1000)       # dashboard page adopts <size>
     assert dims["Orphan"] == (1280, 720)   # orphan page keeps the default (no leak)
+
+
+def test_automatic_dashboard_scales_up_min_aspect_to_screen():
+    # §13.2: an "automatic" dashboard (no fixed maxwidth/maxheight -- only minwidth/minheight) renders
+    # fit-to-window, usually LARGER than its authored minimum. We keep the authored ASPECT (1000:620,
+    # landscape) but scale it UP to cover the 1280x720 screen frame, so it becomes 1280x794 -- larger
+    # than the old 1000x800 default and NOT squashed into a near-square (which stretched it ~1.3x).
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Auto'><size minheight='620' minwidth='1000' />"
+            "<zones><zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='90000' x='5000' y='5000' name='W' id='2' /></zone>"
+            "</zones></dashboard>")
+    parts = emit_pbir(parse_twb(_workbook(ws, dash)))
+    w, h = _page_dims(parts)["Auto"]
+    assert (w, h) == (1280, 794)
+    assert w >= PAGE_WIDTH and h >= PAGE_HEIGHT      # covers the screen frame (max-cover, never smaller)
+    assert abs(w / h - 1000 / 620) < 0.01            # authored landscape aspect preserved
+
+
+def test_automatic_dashboard_800x600_min_scales_up_preserving_4x3():
+    # §13.2: a second authored aspect (800x600, 4:3) scales up to 1280x960 -- 4:3 preserved, larger.
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Auto2'><size minheight='600' minwidth='800' />"
+            "<zones><zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='90000' x='5000' y='5000' name='W' id='2' /></zone>"
+            "</zones></dashboard>")
+    parts = emit_pbir(parse_twb(_workbook(ws, dash)))
+    assert _page_dims(parts)["Auto2"] == (1280, 960)
+
+
+def test_fixed_size_dashboard_ignores_min_when_max_present():
+    # §13.2: a fixed dashboard that carries BOTH max and min still uses the fixed max canvas --
+    # the automatic scale-up only fills an ABSENT axis, so existing fixed-size behavior is unchanged.
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Fixed'>"
+            "<size maxheight='1000' maxwidth='1400' minheight='500' minwidth='500' />"
+            "<zones><zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='90000' x='5000' y='5000' name='W' id='2' /></zone>"
+            "</zones></dashboard>")
+    parts = emit_pbir(parse_twb(_workbook(ws, dash)))
+    assert _page_dims(parts)["Fixed"] == (1400, 1000)
+
+
+def test_dimensionless_size_element_falls_back_to_1000x800_default():
+    # §13.2: a <size> that declares NEITHER max NOR min dims (e.g. sizing-mode only) still falls
+    # back to Tableau's own 1000x800 default -- there is no authored aspect signal to adopt.
+    ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
+                    "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Modeless'><size sizing-mode='automatic' />"
+            "<zones><zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='90000' x='5000' y='5000' name='W' id='2' /></zone>"
+            "</zones></dashboard>")
+    parts = emit_pbir(parse_twb(_workbook(ws, dash)))
+    assert _page_dims(parts)["Modeless"] == (1000, 800)
+
+
+def test_automatic_canvas_dims_unit():
+    # §13.2: the scale-up helper keeps aspect and covers the frame; degenerate/missing -> (None, None).
+    assert _automatic_canvas_dims(1000, 620) == (1280, 794)    # landscape, height floats
+    assert _automatic_canvas_dims(800, 600) == (1280, 960)     # 4:3, width binds
+    assert _automatic_canvas_dims(620, 1000) == (1280, 2065)   # portrait, width binds (max-cover)
+    assert _automatic_canvas_dims(2000, 1200) == (2000, 1200)  # already >= frame -> k=1.0, unchanged
+    assert _automatic_canvas_dims(None, 620) == (None, None)
+    assert _automatic_canvas_dims(1000, 0) == (None, None)
 
 
 def test_dropdown_filter_card_height_is_floored_at_64():

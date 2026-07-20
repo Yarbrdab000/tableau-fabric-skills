@@ -13,7 +13,27 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
-- **tableau-migration (skill `1.64.0` → `1.65.0`): Bind Tableau date-PART filters to the migrated shared
+- **tableau-migration (skill `1.65.0` → `1.66.0`): Preserve an "automatic"-sized Tableau dashboard's authored
+  aspect ratio on the migrated Power BI page instead of squashing every one into a fixed near-square canvas.
+  A Tableau dashboard set to "Automatic" (or any that declares only `minwidth`/`minheight` with no fixed
+  `maxwidth`/`maxheight`) previously fell back to a flat `1000x800` page, so a landscape `1000x620` design was
+  stretched vertically ~1.3x and its charts distorted. Additive and tightly gated — fixed-size dashboards
+  (both `maxwidth`+`maxheight`) and truly size-less dashboards are byte-identical to before.**
+  - **Capture the authored minimum.** `twb_to_pbir._parse_dashboard` now also reads `minwidth`/`minheight`
+    (and `sizing-mode`) off the primary `<size>` element, alongside the existing `maxwidth`/`maxheight`. The
+    primary (direct-child) `<size>` is used, so alternate phone/tablet device-layout sizes never leak in.
+  - **Scale the aspect up to a screen-sized canvas.** New `_automatic_canvas_dims(min_w, min_h)` keeps the
+    authored aspect exactly but scales it UP with a max-cover factor `k = max(1.0, PAGE_WIDTH/min_w,
+    PAGE_HEIGHT/min_h)` so the page covers at least the standard `1280x720` frame in both axes (Tableau renders
+    an automatic dashboard fit-to-window, almost always larger than its minimum — the raw min would under-size
+    the page). Only the absolute size grows; the aspect (hence every scaled zone's shape) is untouched.
+  - **Emit precedence: fixed max → automatic scale-up → default.** The per-page override now resolves
+    `db["size"]["w"] or _auto_w or DASH_DEFAULT_W` (and height likewise), so a fixed dashboard still emits at
+    its exact `<size>` pixels, an automatic one adopts its scaled authored aspect, and a dashboard with no
+    usable `<size>` still falls back to Tableau's own `1000x800` default.
+  - On the real Superstore run the six automatic dashboards now emit at `1280x794` (the `1000x620` landscape
+    designs) and `1280x960` (the `800x600` designs) — aspect-faithful and larger than the old `1000x800`,
+    rather than uniformly stretched. Adds 5 tests (2727 → 2732 passing).
   calendar so a quick-filter that keeps specific years/quarters/months/days survives migration instead of
   being silently dropped to "show all". Fixes the pervasive date-grain approximation seen in a real
   Superstore run — on that workbook it eliminates all 26 "date part … approximated as a plain date column

@@ -180,6 +180,22 @@ def _page_h():
     """Active page height: the per-dashboard aspect-faithful override, else the default."""
     return _PAGE_H_OVERRIDE or PAGE_HEIGHT
 
+
+def _automatic_canvas_dims(min_w, min_h):
+    """Canvas ``(w, h)`` for an "automatic"-sized Tableau dashboard -- one that declares only a
+    MINIMUM (minwidth/minheight) and no fixed maxwidth/maxheight. Tableau renders such a dashboard
+    fit-to-window, almost always LARGER than its authored minimum, so emitting the raw min would
+    under-size the page (a 1000x620 design would look cramped). We keep the authored ASPECT exactly
+    and scale it UP with a MAX-cover factor so the page covers at least the standard 1280x720 screen
+    frame in BOTH axes (never scaled down): ``k = max(1.0, PAGE_WIDTH/min_w, PAGE_HEIGHT/min_h)``.
+    Only the absolute size grows; the aspect ratio (hence every scaled zone's shape) is untouched.
+    Returns ``(None, None)`` when there is no usable minimum on both axes."""
+    if not min_w or not min_h or min_w <= 0 or min_h <= 0:
+        return None, None
+    k = max(1.0, PAGE_WIDTH / float(min_w), PAGE_HEIGHT / float(min_h))
+    return round(min_w * k), round(min_h * k)
+
+
 # -- Tableau mark class -> internal visual-type enum ---------------------------
 # A small, deliberately conservative enum. The shelf layout decides bar vs column
 # and table vs matrix; anything outside this set becomes ``unsupported``.
@@ -3278,11 +3294,23 @@ def _select_title_banner(candidates, ext_w, ext_h):
 def _parse_dashboard(db, worksheet_names, warnings):
     name = db.get("name")
     size_el = _first(db, "size")
-    size = {"w": None, "h": None}
+    size = {"w": None, "h": None, "min_w": None, "min_h": None, "sizing_mode": None}
     if size_el is not None:
+        size["sizing_mode"] = size_el.get("sizing-mode")
         try:
             size["w"] = float(size_el.get("maxwidth")) if size_el.get("maxwidth") else None
             size["h"] = float(size_el.get("maxheight")) if size_el.get("maxheight") else None
+        except ValueError:
+            pass
+        # An "automatic" dashboard (sizing-mode='automatic', or any <size> that declares only
+        # minwidth/minheight with no fixed max) has no fixed pixel canvas -- Tableau grows it to the
+        # window but the author DESIGNED against the minimum, so minwidth/minheight is the only signal
+        # of the intended aspect ratio. Capture it so emit can adopt that aspect instead of squashing
+        # every automatic dashboard into the flat 1000x800 fallback (which de-normalizes the square
+        # 100000x100000 zone frame to the WRONG shape, vertically stretching a landscape layout).
+        try:
+            size["min_w"] = float(size_el.get("minwidth")) if size_el.get("minwidth") else None
+            size["min_h"] = float(size_el.get("minheight")) if size_el.get("minheight") else None
         except ValueError:
             pass
 
@@ -6435,10 +6463,14 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         # 1400x1000 Tableau dashboard becomes a 1400x1000 page -- exact number-for-number match, aspect
         # preserved. Tableau normalizes the zone coords to a square 100000x100000 (see _scale_zone),
         # so the real aspect is recoverable ONLY from <size>; scaling the normalized rect into the real
-        # page (independent sx/sy) de-normalizes it back to faithful pixels. Fallback (no fixed size):
-        # Tableau's own 1000x800 default canvas.
-        _PAGE_W_OVERRIDE = db["size"]["w"] or DASH_DEFAULT_W
-        _PAGE_H_OVERRIDE = db["size"]["h"] or DASH_DEFAULT_H
+        # page (independent sx/sy) de-normalizes it back to faithful pixels. When the dashboard has no
+        # fixed max size (sizing-mode='automatic' -- only minwidth/minheight), it renders fit-to-window
+        # (usually LARGER than the min), so we keep its authored ASPECT but scale it UP to cover the
+        # 1280x720 screen frame (_automatic_canvas_dims) rather than squashing it into the near-square
+        # 1000x800 default. Final fallback (no usable <size> at all): Tableau's own 1000x800 default.
+        _auto_w, _auto_h = _automatic_canvas_dims(db["size"].get("min_w"), db["size"].get("min_h"))
+        _PAGE_W_OVERRIDE = db["size"]["w"] or _auto_w or DASH_DEFAULT_W
+        _PAGE_H_OVERRIDE = db["size"]["h"] or _auto_h or DASH_DEFAULT_H
         visuals = []
         page_ws = []
         for i, zone in enumerate(zones):
