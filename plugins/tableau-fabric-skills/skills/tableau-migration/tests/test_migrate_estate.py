@@ -9,6 +9,7 @@ machine-readable ``report.json``, fallback handling, the viz seam, and the no-cr
 """
 import io
 import json
+import hashlib
 import os
 import tempfile
 import zipfile
@@ -486,6 +487,79 @@ def test_local_files_source_workbook_twin_prefers_packaged_twbx_for_images(tmp_p
     assert [os.path.basename(p) for p in wb] == ["widget_dashboard.twbx"]   # archive wins, not .twb
     images = me._twbx_images(wb[0])
     assert "Image/Logo.png" in images   # packaged image bytes are still reachable
+
+
+# -- input identity manifest (clean-input audit trail + collision tripwire) ----
+def test_input_manifest_records_identity_of_every_consumed_file(fixtures_dir, tmp_path):
+    out = str(tmp_path / "bundle")
+    report = migrate_estate(LocalFilesSource(fixtures_dir), out)
+    man = report["input_manifest"]
+    assert man["source_kind"] == "LocalFilesSource"
+    assert man["collisions"] == []
+    by_name = {a["name"]: a for a in man["assets"]}
+    assert set(by_name) == {"widget_sales", "inventory_feed", "widget_dashboard"}
+    for a in man["assets"]:
+        p = a["staged_input_path"]
+        assert os.path.isfile(p)
+        assert a["size_bytes"] == os.path.getsize(p)
+        with open(p, "rb") as fh:
+            assert a["sha256"] == hashlib.sha256(fh.read()).hexdigest()
+    # also written as its own artifact next to report.json / summary.md
+    with open(os.path.join(out, "input_manifest.json"), encoding="utf-8") as fh:
+        assert json.load(fh)["assets"]
+
+
+def test_clean_input_run_prints_no_identity_warning(fixtures_dir, tmp_path):
+    out = str(tmp_path / "bundle")
+    migrate_estate(LocalFilesSource(fixtures_dir), out)
+    with open(os.path.join(out, "summary.md"), encoding="utf-8") as fh:
+        assert "INPUT IDENTITY WARNING" not in fh.read()
+
+
+def test_cross_directory_name_collision_is_flagged_not_fatal(tmp_path):
+    # A stale like-named copy in another folder is the exact "wrong bytes" hazard: two workbooks with
+    # the SAME stem at DIFFERENT paths must be surfaced (collision record + loud summary banner), but
+    # the run still completes -- an estate legitimately holds like-named workbooks in different
+    # subfolders, so one ambiguous pair must never abort the whole scan.
+    root = tmp_path / "in"
+    (root / "current").mkdir(parents=True)
+    (root / "stale").mkdir(parents=True)
+    for sub in ("current", "stale"):
+        with open(root / sub / "widget_dashboard.twb", "w", encoding="utf-8-sig") as fh:
+            fh.write(WIDGET_DASHBOARD_TWB)
+    out = str(tmp_path / "bundle")
+    report = migrate_estate(LocalFilesSource(str(root)), out)
+    cols = report["input_manifest"]["collisions"]
+    assert len(cols) == 1
+    assert cols[0]["stem"] == "widget_dashboard" and cols[0]["kind"] == "workbook"
+    assert len(cols[0]["paths"]) == 2
+    with open(os.path.join(out, "summary.md"), encoding="utf-8") as fh:
+        assert "INPUT IDENTITY WARNING" in fh.read()
+    assert report["summary"]["workbooks_total"] == 2   # non-fatal: both still migrated
+
+
+def test_datasource_and_workbook_sharing_a_stem_is_not_a_collision(tmp_path):
+    # A datasource and a workbook that happen to share a stem land in distinct output families, so the
+    # (kind, stem) collision key must NOT raise a false positive for them.
+    root = tmp_path / "in"
+    root.mkdir()
+    with open(root / "widget.tds", "w", encoding="utf-8-sig") as fh:
+        fh.write(WIDGET_SALES_TDS)
+    with open(root / "widget.twb", "w", encoding="utf-8-sig") as fh:
+        fh.write(WIDGET_DASHBOARD_TWB)
+    report = migrate_estate(LocalFilesSource(str(root)), str(tmp_path / "bundle"))
+    assert report["input_manifest"]["collisions"] == []
+
+
+def test_build_input_manifest_skips_non_local_source():
+    # A live PULL has no on-disk chat-attachment bytes -> assets-less manifest (the feature is scoped
+    # to LocalFilesSource by design and never crashes on a non-file source).
+    class _NotLocal:
+        pass
+
+    man = me._build_input_manifest(_NotLocal(), ["x"], ["y"])
+    assert man["source_kind"] == "_NotLocal"
+    assert man["assets"] == [] and man["collisions"] == []
 
 
 # -- full estate run over file-backed fixtures --------------------------------

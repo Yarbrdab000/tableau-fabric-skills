@@ -39,6 +39,7 @@ No credentials are read, stored, or written anywhere in the bundle.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import inspect
 import json
 import os
@@ -3123,6 +3124,72 @@ def _write_compile_report(output_dir, compile_report):
     return path
 
 
+def _sha256_file(path, _chunk=1 << 20):
+    """Streaming SHA-256 of a file's bytes (constant memory, so a large ``.twbx`` is fine)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(_chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _build_input_manifest(source, ds_ids, wb_ids):
+    """Record the identity (path, size, sha256, mtime) of every LOCAL input file the run consumed.
+
+    Purely additive forensic artifact. It answers "*which bytes* did this run actually migrate" so an
+    "use the exact copy I attached" request is auditable after the fact, and -- the tripwire the VS
+    Code sessions asked for -- it surfaces filename COLLISIONS: the same asset stem discovered at two
+    DIFFERENT paths. That is the signature of an input folder that was not staged clean (a stale prior
+    copy sitting next to the freshly attached one), the one situation where an estate scan can migrate
+    bytes the operator did not intend.
+
+    Collisions are REPORTED, never fatal. This deliberately does not fail closed on the whole run: this
+    is an estate scanner (``migrate_estate`` walks a folder and migrates every workbook it finds), and a
+    genuine estate legitimately holds like-named workbooks in different subfolders -- one ambiguous pair
+    must not abort the other 200 assets. The clean-input GUARANTEE lives in the runbook (stage each
+    attached file into a fresh, empty, per-run input dir); this manifest is the audit trail + loud
+    signal when that discipline slipped. ``_dedup_by_stem`` already merged same-directory packaged/bare
+    twins upstream, so any collision seen here is genuinely cross-directory.
+
+    Only :class:`LocalFilesSource` has real on-disk asset ids; a live PULL (Tableau API bytes, no chat
+    attachment) is explicitly out of scope and yields an assets-less manifest.
+    """
+    manifest = {
+        "source_kind": type(source).__name__,
+        "verified_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "verifier": "migrate_estate/input_identity/1",
+        "assets": [],
+        "collisions": [],
+    }
+    if not isinstance(source, LocalFilesSource):
+        return manifest
+    manifest["root"] = str(source.root)
+    seen = {}
+    for kind, asset_id in ([("datasource", i) for i in ds_ids]
+                           + [("workbook", i) for i in wb_ids]):
+        rec = {"kind": kind, "name": source.asset_name(asset_id),
+               "staged_input_path": os.path.abspath(asset_id)}
+        try:
+            st = os.stat(asset_id)
+            rec["size_bytes"] = st.st_size
+            rec["mtime_utc"] = datetime.fromtimestamp(
+                st.st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            rec["sha256"] = _sha256_file(asset_id)
+        except OSError as exc:  # unreadable input: record the reason, never crash the run
+            rec["error"] = str(exc)
+        manifest["assets"].append(rec)
+        # Collision key is (kind, stem): two workbooks named "Sales" at different paths are ambiguous,
+        # but a datasource and a workbook that happen to share a stem are not (they land in distinct
+        # output families), so they must not raise a false collision.
+        stem = os.path.splitext(os.path.basename(asset_id))[0].lower()
+        seen.setdefault((kind, stem), set()).add(rec["staged_input_path"])
+    manifest["collisions"] = [
+        {"kind": kind, "stem": stem, "paths": sorted(paths)}
+        for (kind, stem), paths in sorted(seen.items()) if len(paths) > 1
+    ]
+    return manifest
+
+
 def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan=None,
                    rebind_bind_stage=None, approved_calc_dax=None, viz_advice=False,
                    second_compile=False, authored=None):
@@ -3185,15 +3252,17 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
     used_folders = set()
 
     ds_catalog = {}
+    ds_ids = source.list_datasources()
+    wb_ids = source.list_workbooks()
     ds_details = [_migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir,
                                           ds_catalog=ds_catalog,
                                           approved_calc_dax=approved_calc_dax)
-                  for ds_id in source.list_datasources()]
+                  for ds_id in ds_ids]
     wb_details = [migrate_workbook(source, write_to=output_dir, wb_id=wb_id, viz_stage=viz,
                                    approved_calc_dax=approved_calc_dax, viz_advice=viz_advice,
                                    pbip=pbip, ds_catalog=ds_catalog, used_folders=used_folders,
                                    second_compile=second_compile, authored=authored)
-                  for wb_id in source.list_workbooks()]
+                  for wb_id in wb_ids]
 
     summary = _summarize(ds_details, wb_details, viz is not None)
     fallbacks = [
@@ -3219,6 +3288,12 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
     # here where output_dir is in scope, so the report/summary/stdout can hand the user a REAL path
     # instead of the run-relative pbip/<Name>/<Name>.pbip stored per detail.
     report["openable_outputs"] = _openable_outputs(report, output_dir)
+    # Input identity manifest (additive): proves which local bytes were consumed and surfaces any
+    # cross-directory filename collision (a not-clean input folder). Set BEFORE the summary render so
+    # its collision banner can fire; written as its own artifact so existing outputs are untouched.
+    report["input_manifest"] = _build_input_manifest(source, ds_ids, wb_ids)
+    with open(os.path.join(output_dir, "input_manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(report["input_manifest"], fh, indent=2, sort_keys=True)
 
     with open(os.path.join(output_dir, "report.json"), "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2, sort_keys=True)
@@ -3727,6 +3802,33 @@ def _openable_outputs_md(outs):
     return lines
 
 
+def _input_collision_banner(report):
+    """Render a loud ``summary.md`` warning when the input folder held cross-directory name collisions.
+
+    ``[]`` (byte-identical summary) whenever inputs were clean -- the overwhelming case -- so this only
+    ever appears when a stale like-named copy sat beside the intended one. Not a definition-of-done gate
+    and not fatal: it just makes a not-clean input folder impossible to miss and points at the manifest.
+    """
+    collisions = (report.get("input_manifest") or {}).get("collisions") or []
+    if not collisions:
+        return []
+    out = [
+        "## \u26a0\ufe0f INPUT IDENTITY WARNING -- same asset name found at multiple paths",
+        "",
+        ("The input folder contained more than one file with the same asset name in different "
+         "directories, so this run may have migrated a **different copy than you intended** (for "
+         "example a stale file left over from a prior run). If you meant to migrate an exact file you "
+         "attached, re-run with that file staged **alone** in a fresh, empty input folder. Every path "
+         "and hash actually consumed is recorded in `input_manifest.json`."),
+        "",
+    ]
+    for c in collisions:
+        out.append(f"- **{c['stem']}** ({c['kind']}) found at:")
+        out += [f"  - `{p}`" for p in c["paths"]]
+    out.append("")
+    return out
+
+
 def _render_summary_md(report):
     """Render the human-readable ``summary.md`` from the report dict."""
     s = report["summary"]
@@ -3738,6 +3840,7 @@ def _render_summary_md(report):
         "",
         *_dod_banner(report.get("definition_of_done")),
         *_pending_gates_banner(report.get("pending_gates")),
+        *_input_collision_banner(report),
         *_openable_outputs_md(report.get("openable_outputs")),
         "## Summary",
         "",

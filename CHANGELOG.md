@@ -13,6 +13,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.86.0` → `1.87.0`): Input identity manifest + collision tripwire for
+  local runs — a local migration now proves *which bytes* it consumed and loudly flags a not-clean
+  input folder, so an "use the exact file I attached" request can't silently run against a stale
+  like-named copy.** Every `migrate_estate` run writes an additive `input_manifest.json` recording each
+  consumed input file's absolute path, `size_bytes`, `sha256`, and `mtime_utc` (report gains an
+  `input_manifest` key; live-pull sources are out of scope and yield an assets-less manifest). When the
+  same asset stem is discovered at two *different* paths — the signature of a stale prior copy sitting
+  beside the attached one — the manifest records a `collisions` entry and `summary.md` prints a loud
+  `⚠️ INPUT IDENTITY WARNING` pointing at the exact paths. The collision is **reported, never fatal**:
+  this is an estate scanner and a genuine estate legitimately holds like-named workbooks in different
+  subfolders, so one ambiguous pair must not abort the other assets. Collisions key on `(kind, stem)`
+  so a datasource and a workbook sharing a stem is not a false positive; `_dedup_by_stem` already merged
+  same-directory packaged/bare twins upstream, so any collision seen is genuinely cross-directory. The
+  structural prevention lives in the runbook (SKILL.md Checkpoint 1 now mandates staging each run into a
+  fresh, empty `.\in` and treats the warning as a STOP); this manifest is the audit trail and tripwire
+  when that discipline slips. Purely additive — existing artifacts are byte-identical on a clean run
+  (the banner only renders when collisions exist). +5 tests. Full suite 2789 passed / 3 skipped /
+  1 xfailed.
 - **tableau-migration (skill `1.85.0` → `1.86.0`): Parameter-control slicers rebuild as dropdowns —
   a Tableau dashboard parameter control authored as a compact dropdown now emits a Power BI slicer in
   Dropdown mode instead of Power BI's default vertical List (a stack of buttons).** On the *Simple

@@ -58,7 +58,8 @@ do not improvise flags or infer answers. The detailed reference body begins afte
    that attachment IS the input; copy **that exact path** into `$RUN\in` and move on. Never ask the user
    to re-type a path they already attached, and never run a recursive/disk-wide scan to "find" it — a
    broad scan grabs a **stale duplicate** from some other folder (OneDrive, an old run) instead of the
-   bytes just attached. **Artifacts:** `scan.json`, `report.json`, `summary.md`, the second-compiler
+   bytes just attached. **Artifacts:** `scan.json`, `report.json`, `summary.md`, `input_manifest.json`
+   (the path + `sha256` of every input file consumed — a clean-input audit trail), the second-compiler
    stub requests (`report.json` → `translation_handoff.requests`), `approved_dax.json`, and the built
    bundle all sit at **pinned** paths under `$RUN\out` (scripts under `$SKILL\scripts`) — **read them by
    their exact path.** `$RUN` (`C:\tfmig\runs\NNNN`) is **outside the editor workspace and git-ignored**,
@@ -301,6 +302,16 @@ is already a quoted PowerShell string; only a literal `"` inside a name must be 
 **no name filter**: it migrates *everything* in `-i`, so scope is enforced solely by what's in `.\in` (a
 fresh `$RUN\in` can't pick up the skill's bundled samples). Fewer files than scoped, or any extra →
 **STOP and ask** (do not re-derive or substitute names).
+
+> **Stage every run into a FRESH, EMPTY `.\in` — never reuse a prior run's input folder.** This is the
+> one structural guarantee that a local run migrates the bytes the user just attached and not a stale
+> like-named copy: if `.\in` contains exactly the attached file(s) and nothing else, a same-name
+> collision is impossible by construction. As a backstop, every run writes **`input_manifest.json`**
+> (the absolute path, `size_bytes`, and `sha256` of each file actually consumed); if the same asset
+> name is found at two different paths, `summary.md` prints a loud **`⚠️ INPUT IDENTITY WARNING`** —
+> treat that as a **STOP**, re-stage the intended file alone in a clean `.\in`, and re-run. (The
+> warning is a signal, not a hard failure, because a genuine multi-workbook estate may legitimately
+> hold like-named workbooks in different subfolders.)
 
 **STEP 1.5 — scan first: never build a workbook before its datasource is in scope**
 
