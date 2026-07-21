@@ -55,6 +55,7 @@ try:  # package or scripts-on-path
         field_references,
         date_attribute_binding,
         build_table_adjacency,
+        infer_counterpart,
         _INLINE_REF_SENTINEL,
     )
     from .translation_router import classify_fallback
@@ -101,6 +102,7 @@ except ImportError:
         field_references,
         date_attribute_binding,
         build_table_adjacency,
+        infer_counterpart,
         _INLINE_REF_SENTINEL,
     )
     from translation_router import classify_fallback
@@ -838,7 +840,7 @@ def _find_kw(s, kw, last=False):
 
 def translate_flag_gated_measure(formula, resolver, flag_ref_lookup, *, param_resolver=None,
                                  measure_refs=None, known_tables=None, related_tables=None,
-                                 conformed_hubs=None):
+                                 conformed_hubs=None, hidden_cols=None, lod_counterparts=None):
     """Translate ``IF <agg-of-date-filter> THEN <measure> END`` -> ``IF([Flag]=1, <measure DAX>)``.
 
     A measure calc that gates an inner aggregate on ``MAX([<date-filter calc>])`` (Tableau's "is any
@@ -889,7 +891,8 @@ def translate_flag_gated_measure(formula, resolver, flag_ref_lookup, *, param_re
 
     body_dax, breason, _bt = translate_tableau_calc_to_dax(
         body, resolver, param_resolver=param_resolver, measure_refs=measure_refs,
-        known_tables=known_tables, related_tables=related_tables, conformed_hubs=conformed_hubs)
+        known_tables=known_tables, related_tables=related_tables, conformed_hubs=conformed_hubs,
+        hidden_cols=hidden_cols, lod_counterparts=lod_counterparts)
     if not body_dax:
         return None, f"THEN body did not translate ({breason})"
     return f"IF({cond_dax}, {body_dax})", "ok"
@@ -998,7 +1001,8 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    calc_lookup=None, approved_calc_dax=None, synth_measures=None,
                    known_tables=None, table_calc_usages=None, order_resolver=None,
                    flag_measures=None, resolve_for=None, inline_calcs=None,
-                   related_tables=None, conformed_hubs=None, calc_outer_aggs=None):
+                   related_tables=None, conformed_hubs=None, calc_outer_aggs=None,
+                   hidden_cols=None, lod_counterparts=None):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
     ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
@@ -1176,7 +1180,8 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             cdax, _r, _t, cdtype = translate_tableau_calc_to_dax_typed(
                 calc.get("formula", ""), _arc(calc), param_resolver=param_resolver,
                 measure_refs=measure_refs, known_tables=known_tables, inline_calcs=inline_calcs,
-                related_tables=related_tables, conformed_hubs=conformed_hubs)
+                related_tables=related_tables, conformed_hubs=conformed_hubs,
+                hidden_cols=hidden_cols, lod_counterparts=lod_counterparts)
             if cdax:
                 entry = (cname, cdtype or "number")
                 measure_refs[cname.strip().lower()] = entry
@@ -1206,7 +1211,7 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         dax, reason, _ = translate_tableau_calc_to_dax(
             formula, _arc(calc), param_resolver=param_resolver, measure_refs=measure_refs,
             known_tables=known_tables, inline_calcs=inline_calcs, related_tables=related_tables,
-            conformed_hubs=conformed_hubs)
+            conformed_hubs=conformed_hubs, hidden_cols=hidden_cols, lod_counterparts=lod_counterparts)
         # Parameter-driven ROW-LEVEL calc consumed under one outer aggregation (e.g.
         # MAX(DATEDIFF([Date Parameter], [Order Date]))). Measure mode (above) correctly stubs its
         # bare row-level column, and the row-level pre-router refused it (a parameter has no static
@@ -1249,7 +1254,8 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             _fdax, _freason = translate_flag_gated_measure(
                 formula, _arc(calc), flag_ref_lookup, param_resolver=param_resolver,
                 measure_refs=measure_refs, known_tables=known_tables,
-                related_tables=related_tables, conformed_hubs=conformed_hubs)
+                related_tables=related_tables, conformed_hubs=conformed_hubs,
+                hidden_cols=hidden_cols, lod_counterparts=lod_counterparts)
             if _fdax:
                 dax, reason, flag_gated = _fdax, "ok", True
         row = {
@@ -3130,6 +3136,40 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     # tables (never Date), so this can only remove co-occurrence paths, never a genuine FK path
     # (fail-closed: a pair with no real FK path still correctly stubs).
     conformed_hubs = {date_name} if date_name else None
+    # Hidden-key FIXED-LOD guard inputs (additive; empty -> inert -> byte-identical): a bare
+    # dimensioned FIXED LOD keyed on a HIDDEN column (e.g. Customer_ID behind visible Customer_Name)
+    # would emit ALLEXCEPT on that hidden key, which a view grouped by the VISIBLE counterpart never
+    # constrains -> the ratio collapses to a coarser-grain constant (the "share of own basket" bug).
+    # Build (a) hidden_cols = the set of hidden (table_display, clean_col) tuples and (b)
+    # lod_counterparts = {(table_display, hidden_clean): visible_clean} via the abstain-by-default
+    # naming heuristic, so the translator SWAPS a hidden LOD key to its visible display counterpart
+    # when confident and otherwise ROUTES the calc. Same descriptor["relations"] column shape the
+    # field resolver reads, so (table, clean_col) tuples match what the bare-FIXED emit sees.
+    hidden_cols = set()
+    lod_counterparts = {}
+    for _rel in descriptor.get("relations", []):
+        if (_rel or {}).get("kind") not in ("table", "custom_sql"):
+            continue
+        _t = _rel.get("name") or _rel.get("item")
+        if not _t:
+            continue
+        _vis_caps = {}
+        _hidden_here = []
+        for _c in _rel.get("columns", []):
+            _mn = (_c or {}).get("model_name")
+            if not _mn:
+                continue
+            _cap = _c.get("local_name") or _c.get("remote_name")
+            if _c.get("is_hidden"):
+                hidden_cols.add((_t, _mn))
+                if _cap:
+                    _hidden_here.append((_cap, _mn))
+            elif _cap:
+                _vis_caps.setdefault(_cap, _mn)
+        for _cap, _mn in _hidden_here:
+            _counter = infer_counterpart(_cap, list(_vis_caps.keys()))
+            if _counter and _counter in _vis_caps:
+                lod_counterparts[(_t, _mn)] = _vis_caps[_counter]
     measures_table, measure_report, assisted_suggestions = _measures_part(
         calcs, measure_resolve, consumed=consumed, param_resolver=param_resolver,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
@@ -3148,7 +3188,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         resolve_for=_measure_scoped_resolver,
         flag_measures=flag_measures, inline_calcs=inline_calcs,
         related_tables=related_tables, conformed_hubs=conformed_hubs,
-        calc_outer_aggs=calc_outer_aggs)
+        calc_outer_aggs=calc_outer_aggs,
+        hidden_cols=hidden_cols or None, lod_counterparts=lod_counterparts or None)
     parts["definition/tables/_Measures.tmdl"] = measures_table
     table_names.append("_Measures")
 

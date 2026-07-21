@@ -2594,3 +2594,93 @@ def test_agg_row_param_free_calc_stays_out_of_scope():
         param_resolver=_case_param_resolver)
     assert dax is None
     assert reason == "not a parameter-driven row calc"
+
+
+# ---------------------------------------------------------------------------
+# Hidden-key FIXED-LOD guard (T4.06 "share of own basket"): a bare dimensioned FIXED LOD keyed on a
+# HIDDEN column emits ALLEXCEPT on that hidden id, which never constrains the dimension on a view
+# grouped by the visible display counterpart -> the ratio collapses to a coarser-grain constant.
+# The guard SWAPS the hidden key to its visible counterpart when known, else ROUTES the calc. It is
+# scoped to the bare-FIXED ALLEXCEPT emit only; EXCLUDE (REMOVEFILTERS) and the re-aggregated
+# SUMMARIZE path stay faithful and are NOT guarded. Default (no hidden_cols) is byte-identical.
+# ---------------------------------------------------------------------------
+_HK_FIELDS = {
+    "Sales": ("Orders", "Sales", "decimal"),
+    "Customer ID": ("Orders", "Customer_ID", "string"),
+    "Customer Name": ("Orders", "Customer_Name", "string"),
+    "Region": ("Orders", "Region", "string"),
+}
+
+
+def _hk_resolver(caption):
+    return _HK_FIELDS.get(caption)
+
+
+_HK_CALC = "{ FIXED [Customer ID] : SUM([Sales]) }"
+_HK_HIDDEN = {("Orders", "Customer_ID")}
+_HK_COUNTERPARTS = {("Orders", "Customer_ID"): "Customer_Name"}
+
+
+def test_hidden_key_fixed_lod_default_is_byte_identical():
+    # No hidden_cols supplied -> the guard is inert; output is the prior ALLEXCEPT on the hidden id.
+    dax, reason, _ = translate_tableau_calc_to_dax(_HK_CALC, _hk_resolver)
+    assert reason == "ok"
+    assert dax == "CALCULATE(SUM('Orders'[Sales]), ALLEXCEPT('Orders', 'Orders'[Customer_ID]))"
+
+
+def test_hidden_key_fixed_lod_without_counterpart_routes():
+    # Hidden key with no visible display counterpart -> route (dax None + a hidden-column reason).
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        _HK_CALC, _hk_resolver, hidden_cols=_HK_HIDDEN)
+    assert dax is None
+    assert "on hidden column" in reason
+
+
+def test_hidden_key_fixed_lod_with_counterpart_swaps_to_visible():
+    # Hidden key WITH a visible counterpart -> ALLEXCEPT re-keyed onto the visible display column.
+    dax, reason, _ = translate_tableau_calc_to_dax(
+        _HK_CALC, _hk_resolver, hidden_cols=_HK_HIDDEN, lod_counterparts=_HK_COUNTERPARTS)
+    assert reason == "ok"
+    assert dax == "CALCULATE(SUM('Orders'[Sales]), ALLEXCEPT('Orders', 'Orders'[Customer_Name]))"
+
+
+def test_hidden_key_guard_inert_for_visible_key_column():
+    # T4.05 analogue: a bare FIXED on a VISIBLE key (Region) is untouched even under hidden_cols/
+    # counterparts for a DIFFERENT column -> identical to the default emit.
+    reg = "{ FIXED [Region] : SUM([Sales]) }"
+    guarded, _, _ = translate_tableau_calc_to_dax(
+        reg, _hk_resolver, hidden_cols=_HK_HIDDEN, lod_counterparts=_HK_COUNTERPARTS)
+    default, _, _ = translate_tableau_calc_to_dax(reg, _hk_resolver)
+    assert guarded == default
+    assert guarded == "CALCULATE(SUM('Orders'[Sales]), ALLEXCEPT('Orders', 'Orders'[Region]))"
+
+
+def test_hidden_key_exclude_lod_is_not_guarded():
+    # EXCLUDE emits REMOVEFILTERS (view-relative, faithful) and must stay unchanged even when its
+    # dimension is a hidden key -- the guard is scoped to the bare-FIXED ALLEXCEPT path only.
+    ex = "{ EXCLUDE [Customer ID] : SUM([Sales]) }"
+    guarded, _, _ = translate_tableau_calc_to_dax(
+        ex, _hk_resolver, hidden_cols=_HK_HIDDEN, lod_counterparts=_HK_COUNTERPARTS)
+    default, _, _ = translate_tableau_calc_to_dax(ex, _hk_resolver)
+    assert guarded == default
+    assert guarded == "CALCULATE(SUM('Orders'[Sales]), REMOVEFILTERS('Orders'[Customer_ID]))"
+
+
+def test_infer_counterpart_precision():
+    from calc_to_dax import infer_counterpart as ic
+    # confident swaps
+    assert ic("Customer ID", ["Customer Name", "Category", "Region"]) == "Customer Name"
+    assert ic("Product ID", ["Product Name", "Product ID"]) == "Product Name"
+    assert ic("Store Code", ["Store"]) == "Store"          # base exact match
+    assert ic("Rep Key", ["Rep Description"]) == "Rep Description"
+    assert ic("Cust #", ["Cust Name"]) == "Cust Name"      # trailing '#'
+    assert ic("Customer Id", ["Customer Name"]) == "Customer Name"  # case-insensitive suffix
+    # abstain (route) cases
+    assert ic("Order ID", ["Customer Name", "Region"]) is None     # no counterpart
+    assert ic("Row ID", ["Customer Name"]) is None
+    assert ic("Region", ["Customer Name"]) is None                 # not key-shaped
+    assert ic("Category", ["Customer Name"]) is None               # not key-shaped
+    assert ic("Casino", ["Casino Name"]) is None                   # 'no' needs a separator -> no strip
+    assert ic("Cust ID", ["Cust Name", "Customer Name"]) == "Cust Name"  # exactly-one base-name match
+    assert ic("", ["Anything"]) is None
+    assert ic("Customer ID", []) is None

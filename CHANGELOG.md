@@ -13,6 +13,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.88.0` → `1.89.0`): FIXED-LOD hidden-key swap/route — a dimensioned
+  `{ FIXED [Hidden Key] : … }` calc keyed on a HIDDEN column (e.g. `Customer ID` behind the visible
+  `Customer Name`) now re-keys its `ALLEXCEPT` grain onto the visible display counterpart instead of
+  silently collapsing "share-of-own-basket" ratios to a per-category constant.** Root cause: a bare
+  dimensioned FIXED LOD keyed on a hidden column emitted `ALLEXCEPT('Orders', Customer_ID, …)`, which
+  never constrains the customer dimension on a view grouped by the *visible* `Customer_Name`, so the
+  ratio degenerated. The translator (`calc_to_dax.py`) now swaps each hidden bare-FIXED grain key to
+  its inferred visible counterpart (`_fixed_grain_cols` + `infer_counterpart`, an abstain-by-default
+  name heuristic); when no visible counterpart exists it ROUTEs to the assisted tier with an explicit
+  reason instead of emitting an unconstrained ALLEXCEPT. `assemble_model.py` builds the
+  `hidden_cols` / `lod_counterparts` maps from the descriptor's `is_hidden` relations and threads them
+  through `_measures_part`. A new Tier-2 router category `HIDDEN_LOD_GRAIN_KEY`
+  (`translation_router.py`) carries guidance for the no-counterpart case. **Strictly additive and
+  fail-safe:** only the bare-FIXED dimensioned `ALLEXCEPT` emit is guarded (EXCLUDE `REMOVEFILTERS`
+  and re-aggregated `SUMMARIZE` paths are context-respecting and untouched); the guard fires only when
+  a grain key is actually flagged hidden, so any datasource that hides nothing (the default) is
+  byte-identical to prior output. +10 tests (6 translator, 2 router, 2 assemble-level wiring); full
+  suite 2800 passed / 3 skipped / 1 xfailed.
 - **tableau-migration (skill `1.87.0` → `1.88.0`): Stacked-family chart coverage — stacked-area and
   stacked-column combo now rebuild faithfully instead of collapsing to their overlapping/clustered
   look-alikes.** `_pbir_vtype` (the final PBIR `visualType` resolver) now extends the proven

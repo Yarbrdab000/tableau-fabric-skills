@@ -2910,3 +2910,59 @@ def test_flag_gated_measure_fails_closed_on_nonnull_else():
     assert dax is None
     assert "ELSE" in reason
 
+
+# --- Hidden-key FIXED-LOD guard wiring (T4.06 "share of own basket") -----------------------------
+# End-to-end through assemble_import_model: a descriptor column flagged is_hidden (as
+# _prune_hidden_physical_columns does for a load-bearing hidden column) must drive the bare-FIXED
+# ALLEXCEPT grain onto its visible display counterpart. Nothing hidden -> byte-identical prior emit.
+_HK_LOD_TDS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='Superstore' inline='true' version='18.1'>
+  <connection class='federated'>
+    <named-connections>
+      <named-connection caption='myserver' name='sqlserver.0a1b2c'>
+        <connection authentication='sqlserver' class='sqlserver' dbname='Superstore'
+                    server='s.database.windows.net' username='svc' />
+      </named-connection>
+    </named-connections>
+    <relation connection='sqlserver.0a1b2c' name='Orders' table='[dbo].[Orders]' type='table' />
+    <metadata-records>
+      <metadata-record class='column'><remote-name>Customer ID</remote-name><local-name>[Customer ID]</local-name><parent-name>[Orders]</parent-name><local-type>string</local-type></metadata-record>
+      <metadata-record class='column'><remote-name>Customer Name</remote-name><local-name>[Customer Name]</local-name><parent-name>[Orders]</parent-name><local-type>string</local-type></metadata-record>
+      <metadata-record class='column'><remote-name>Sales</remote-name><local-name>[Sales]</local-name><parent-name>[Orders]</parent-name><local-type>real</local-type></metadata-record>
+    </metadata-records>
+  </connection>
+</datasource>"""
+
+_HK_LOD_CALC = [{"name": "Basket Share Base", "role": "measure",
+                 "formula": "{ FIXED [Customer ID] : SUM([Sales]) }"}]
+
+
+def _hk_hide_customer_id(descriptor):
+    # Flag the Orders 'Customer ID' column isHidden, exactly as the hidden-column prune does for a
+    # load-bearing hidden key (calc-referenced / join key), leaving 'Customer Name' visible.
+    for rel in descriptor.get("relations", []):
+        if rel.get("kind") in ("table", "custom_sql") and rel.get("name") == "Orders":
+            for c in rel.get("columns", []):
+                if c.get("model_name") == "Customer_ID":
+                    c["is_hidden"] = True
+    return descriptor
+
+
+def test_hidden_key_fixed_lod_wiring_swaps_to_visible_counterpart():
+    desc = _hk_hide_customer_id(parse_tds(_HK_LOD_TDS))
+    out = assemble_import_model(desc, model_name="Superstore", calcs=_HK_LOD_CALC, dim_calcs=[])
+    row = {r["measure"]: r for r in out["report"]["measures"]}["Basket Share Base"]
+    assert row["status"] == "translated"
+    # ALLEXCEPT re-keyed onto the VISIBLE Customer_Name, never the hidden Customer_ID.
+    assert row["dax"] == "CALCULATE(SUM('Orders'[Sales]), ALLEXCEPT('Orders', 'Orders'[Customer_Name]))"
+    assert "Customer_ID" not in row["dax"]
+
+
+def test_hidden_key_fixed_lod_wiring_byte_identical_when_nothing_hidden():
+    # No column flagged hidden -> the guard is inert; ALLEXCEPT stays on Customer_ID (prior output).
+    out = assemble_import_model(parse_tds(_HK_LOD_TDS), model_name="Superstore",
+                               calcs=_HK_LOD_CALC, dim_calcs=[])
+    row = {r["measure"]: r for r in out["report"]["measures"]}["Basket Share Base"]
+    assert row["status"] == "translated"
+    assert row["dax"] == "CALCULATE(SUM('Orders'[Sales]), ALLEXCEPT('Orders', 'Orders'[Customer_ID]))"
+

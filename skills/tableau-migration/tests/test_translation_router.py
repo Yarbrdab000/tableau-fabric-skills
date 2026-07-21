@@ -124,6 +124,17 @@ def test_every_category_has_guidance():
         assert cat in R._GUIDANCE and R._GUIDANCE[cat].strip()
 
 
+def test_hidden_key_fixed_lod_reason_routes_to_hidden_grain_key():
+    reason = ("bare FIXED grain keys on hidden column(s) Customer_ID with no visible display "
+              "counterpart (ALLEXCEPT would leave them unconstrained on a view grouped by the "
+              "visible counterpart)")
+    out = R.classify_fallback(reason)
+    assert out["category"] == R.HIDDEN_LOD_GRAIN_KEY
+    assert "visible" in out["guidance"].lower() and "allexcept" in out["guidance"].lower()
+    # a plain INCLUDE/EXCLUDE grain reason must still route to the generic outer-aggregation bucket
+    assert _cat("bare INCLUDE LOD requires an enclosing aggregation") == R.MISSING_OUTER_AGGREGATION
+
+
 def test_classify_returns_guidance_with_category():
     out = R.classify_fallback("unsupported function WINDOW_SUM")
     assert out["category"] == R.MISSING_ADDRESSING_INTENT

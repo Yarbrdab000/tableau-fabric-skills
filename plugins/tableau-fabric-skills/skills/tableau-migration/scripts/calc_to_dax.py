@@ -533,7 +533,7 @@ def _tokenize(formula):
 class _Parser:
     def __init__(self, toks, resolver, tables_used, mode="measure", param_resolver=None,
                  measure_refs=None, known_tables=None, inline_calcs=None, related_tables=None,
-                 conformed_hubs=None, related_wrap=None):
+                 conformed_hubs=None, related_wrap=None, hidden_cols=None, lod_counterparts=None):
         self.toks = toks
         self.pos = 0
         self.resolver = resolver
@@ -582,6 +582,22 @@ class _Parser:
         # stubbing on the single-table guard. Built by ``find_related_home``; empty -> byte-identical
         # prior behaviour (every field emits its own ``'T'[col]`` and adds its own table).
         self.related_wrap = related_wrap or {}
+        # hidden_cols: {(table_display_name, clean_col)} -- model columns marked isHidden. A bare
+        # dimensioned FIXED LOD emits CALCULATE(inner, ALLEXCEPT('T', <this FIXED's keys>)); when a key
+        # is a HIDDEN column the view almost always groups by its VISIBLE display counterpart (e.g. a
+        # hidden "Customer ID" behind the shown "Customer Name"), so ALLEXCEPT on the hidden id keeps
+        # EVERY id in context -- the customer dimension is never constrained -- and the ratio collapses
+        # to a per-category constant (the "share of own basket" bug). Only the bare-FIXED ALLEXCEPT emit
+        # is at risk; EXCLUDE (REMOVEFILTERS) and the re-aggregated SUMMARIZE path are view-relative and
+        # stay faithful, so they are NOT guarded. Empty -> byte-identical prior behaviour (guard inert).
+        self.hidden_cols = set(hidden_cols or [])
+        # lod_counterparts: {(table_display_name, hidden_clean_col): visible_clean_col} -- the visible
+        # display column that stands in for a hidden LOD key (Customer_ID -> Customer_Name). When the
+        # bare-FIXED guard fires, a hidden key WITH a counterpart is SWAPPED to it (view-adaptive and
+        # faithful: ALLEXCEPT on the visible name reproduces Tableau's per-entity grain); a hidden key
+        # WITHOUT one makes the calc fall back (route to the assisted tier) rather than emit a
+        # confidently-wrong constant. Empty -> every hidden key routes (fail-safe).
+        self.lod_counterparts = dict(lod_counterparts or {})
         # Cycle guard: the set of inline-calc keys currently being expanded up the call stack, so a
         # calc that (transitively) references itself fails closed instead of recursing forever.
         self._inline_stack = frozenset()
@@ -2212,6 +2228,37 @@ class _Parser:
     def _lod_cols_dax(self, table, cols):
         return ", ".join(_dax_table(table) + _dax_col(c) for c in cols)
 
+    def _fixed_grain_cols(self, table, cols):
+        # Grain columns for a bare dimensioned FIXED LOD's ALLEXCEPT, with the hidden-key guard.
+        # ALLEXCEPT('T', <these cols>) establishes the FIXED grain by clearing every OTHER column's
+        # filter; if a grain column is HIDDEN it is (almost) never on the view, so ALLEXCEPT leaves it
+        # unconstrained and the value collapses to a coarser grain (the "share of own basket" bug).
+        # For each hidden key: swap to its visible display counterpart when known (faithful and
+        # view-adaptive -- it needs only the in-model id->name mapping, not the view grain), else raise
+        # so the calc falls back and routes to the assisted tier instead of emitting a confidently-wrong
+        # constant. No hidden keys (the default, empty hidden_cols) -> returns cols unchanged
+        # (byte-identical prior output).
+        if not self.hidden_cols:
+            return cols
+        out, unresolved = [], []
+        for c in cols:
+            if (table, c) in self.hidden_cols:
+                swap = self.lod_counterparts.get((table, c))
+                if swap:
+                    out.append(swap)
+                else:
+                    unresolved.append(c)
+                    out.append(c)
+            else:
+                out.append(c)
+        if unresolved:
+            raise _CalcError(
+                "bare FIXED grain keys on hidden column(s) " + ", ".join(unresolved)
+                + " with no visible display counterpart (ALLEXCEPT would leave them unconstrained "
+                "on a view grouped by the visible counterpart)"
+            )
+        return out
+
     def _fixed_lod_bare(self):
         # {FIXED d : AGG(...)}        -> CALCULATE(AGG(...), ALLEXCEPT('T', 'T'[d], ...))
         # {AGG(...)} / {FIXED : AGG(...)} (table-scoped, no dims) -> CALCULATE(AGG(...), ALL('T'))
@@ -2242,6 +2289,7 @@ class _Parser:
             return (f"CALCULATE({inner[0]}, REMOVEFILTERS({cols_dax}))", inner[1])
         if not cols:
             return (f"CALCULATE({inner[0]}, ALL({_dax_table(table)}))", inner[1])
+        cols = self._fixed_grain_cols(table, cols)
         cols_dax = self._lod_cols_dax(table, cols)
         return (f"CALCULATE({inner[0]}, ALLEXCEPT({_dax_table(table)}, {cols_dax}))", inner[1])
 
@@ -2430,6 +2478,47 @@ def build_table_adjacency(relationships):
     return adj
 
 
+_LOD_KEY_SUFFIX = re.compile(r"[\s_]+(?:id|key|code|no|nbr|number)\s*$", re.IGNORECASE)
+
+
+def infer_counterpart(hidden_caption, visible_captions):
+    """Infer the VISIBLE display column that stands in for a HIDDEN LOD key.
+
+    ``hidden_caption`` is a hidden column's Tableau display name (e.g. ``"Customer ID"``);
+    ``visible_captions`` is the iterable of visible display names on the SAME table. Returns the
+    single best visible caption that names the entity behind the hidden key (``"Customer Name"``),
+    or ``None`` to ABSTAIN -- which routes the FIXED calc rather than swap on a guess.
+
+    High precision / abstain-by-default so the deterministic hidden-key FIXED swap only auto-fires
+    when the counterpart is unambiguous:
+      * the hidden caption must be KEY-SHAPED -- ending in a SEPARATED key token
+        (``ID`` / ``Key`` / ``Code`` / ``No`` / ``Nbr`` / ``Number``) or a trailing ``#``; a
+        non-key-shaped caption abstains (returns None), never inventing a swap for a plain dimension;
+      * strip that suffix to the base entity (``Customer ID`` -> ``Customer``);
+      * search the visible captions (case-insensitive) for, in priority order, ``"<base> Name"``,
+        the exact ``"<base>"``, ``"<base> Desc"``, then ``"<base> Description"``; the first tier with
+        EXACTLY ONE visible match wins. A tier that matches zero visibles is skipped; a tier that
+        matches MORE than one abstains (ambiguous -> None).
+    Returns the original-cased visible caption, or None.
+    """
+    cap = (hidden_caption or "").strip()
+    if not cap:
+        return None
+    base = re.sub(r"\s*#\s*$", "", cap)
+    base = _LOD_KEY_SUFFIX.sub("", base).strip()
+    if not base or base == cap:
+        return None  # not key-shaped -> abstain (never swap a plain dimension)
+    vis = [str(v).strip() for v in (visible_captions or []) if str(v or "").strip()]
+    base_l = base.casefold()
+    for cand in (base_l + " name", base_l, base_l + " desc", base_l + " description"):
+        matches = [v for v in vis if v.casefold() == cand]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return None  # ambiguous -> abstain
+    return None
+
+
 def _pk_base(table):
     # The casefolded, separator-stripped base ENTITY name of a table: a trailing island/role suffix
     # `` (…)`` (Tableau's object-copy disambiguator, e.g. ``Contact (Intake)``) is removed first, so a
@@ -2522,7 +2611,7 @@ def find_related_home(tables_used, relationships):
 
 def translate_tableau_calc_to_dax(formula, resolver, param_resolver=None, measure_refs=None,
                                   known_tables=None, inline_calcs=None, related_tables=None,
-                                  conformed_hubs=None):
+                                  conformed_hubs=None, hidden_cols=None, lod_counterparts=None):
     """Translate a SAFE-subset Tableau calc to DAX. Returns (dax|None, reason, tables_used).
 
     dax is None on any unsupported construct -> caller keeps the inert `= 0` stub.
@@ -2552,17 +2641,25 @@ def translate_tableau_calc_to_dax(formula, resolver, param_resolver=None, measur
     generated ``Date`` calendar) excluded as TRANSIT nodes in the cross-table COUNTD-IF path search,
     so a spurious same-calendar-date co-occurrence path never masks the single faithful FK path.
     Default None -> byte-identical prior output.
+    hidden_cols(iterable of (table_display_name, clean_col)) | None: model columns marked isHidden.
+    A bare dimensioned FIXED LOD keyed on a hidden column would emit ``ALLEXCEPT`` on that hidden key,
+    which a view grouped by the visible display counterpart never constrains -> the ratio collapses to
+    a coarser-grain constant. With a counterpart in ``lod_counterparts`` the key is swapped; without one
+    the calc falls back (routes to the assisted tier). Default None -> byte-identical (guard inert).
+    lod_counterparts({(table_display_name, hidden_clean_col): visible_clean_col}) | None: the visible
+    display column that stands in for a hidden LOD key (Customer_ID -> Customer_Name) for the swap above.
+    Default None -> every hidden FIXED key routes (fail-safe).
     """
     dax, reason, tables_used, _dtype = translate_tableau_calc_to_dax_typed(
         formula, resolver, param_resolver=param_resolver, measure_refs=measure_refs,
         known_tables=known_tables, inline_calcs=inline_calcs, related_tables=related_tables,
-        conformed_hubs=conformed_hubs)
+        conformed_hubs=conformed_hubs, hidden_cols=hidden_cols, lod_counterparts=lod_counterparts)
     return dax, reason, tables_used
 
 
 def translate_tableau_calc_to_dax_typed(formula, resolver, param_resolver=None, measure_refs=None,
                                         known_tables=None, inline_calcs=None, related_tables=None,
-                                        conformed_hubs=None):
+                                        conformed_hubs=None, hidden_cols=None, lod_counterparts=None):
     """Like ``translate_tableau_calc_to_dax`` but also returns the result dtype as a 4th item.
 
     Returns ``(dax|None, reason, tables_used, dtype|None)``. The extra ``dtype`` ("number" /
@@ -2582,7 +2679,8 @@ def translate_tableau_calc_to_dax_typed(formula, resolver, param_resolver=None, 
             toks, resolver, tables_used, param_resolver=param_resolver,
             measure_refs=measure_refs, known_tables=known_tables,
             inline_calcs=inline_calcs, related_tables=related_tables,
-            conformed_hubs=conformed_hubs).parse()
+            conformed_hubs=conformed_hubs, hidden_cols=hidden_cols,
+            lod_counterparts=lod_counterparts).parse()
         # Single-table only: terms spanning >1 table fall back (a relationship path
         # does not guarantee the DAX filter context reproduces Tableau's result).
         if len(tables_used) > 1:

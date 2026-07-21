@@ -45,6 +45,13 @@ MISSING_ADDRESSING_INTENT = "missing_addressing_intent"
 # confirms it against the oracle.
 MISSING_OUTER_AGGREGATION = "missing_outer_aggregation"
 
+# A bare dimensioned FIXED LOD whose grain key is a HIDDEN column (e.g. a hidden ``Customer ID``
+# behind the visible ``Customer Name``). The deterministic ``ALLEXCEPT`` on that hidden id never
+# constrains the dimension on a view grouped by the VISIBLE counterpart, so the ratio collapses to a
+# coarser-grain constant (the "share of own basket" bug). The agent re-keys the grain on the visible
+# display counterpart (or keeps the stub if none is 1:1).
+HIDDEN_LOD_GRAIN_KEY = "hidden_lod_grain_key"
+
 # A construct with NO faithful native DAX form at all (regex family; arbitrary-format DATEPARSE;
 # general SPLIT; FINDNTH; case-sensitive ordered text comparison; an exotic date part). Any agent
 # output here is an APPROXIMATION -- it must be flagged as such and oracle-verified, else the stub
@@ -70,6 +77,7 @@ CATEGORIES = (
     MODEL_OBJECT_PARAMETER,
     MISSING_ADDRESSING_INTENT,
     MISSING_OUTER_AGGREGATION,
+    HIDDEN_LOD_GRAIN_KEY,
     DAX_LANGUAGE_GAP,
     TYPE_OR_SHAPE_MISMATCH,
     UNRESOLVED_REFERENCE,
@@ -103,6 +111,19 @@ _GUIDANCE = {
         "context (CALCULATE over a SUMMARIZE/added column), EXCLUDE removes dimensions "
         "(CALCULATE(..., REMOVEFILTERS(dims))), and a bare LOD usually needs an explicit outer "
         "aggregate. Choose the leanest faithful shape and oracle-verify it before proposing."
+    ),
+    HIDDEN_LOD_GRAIN_KEY: (
+        "A bare dimensioned FIXED LOD keys its grain on a HIDDEN column (e.g. a hidden 'Customer ID' "
+        "behind the visible 'Customer Name'). The deterministic ALLEXCEPT('T', 'T'[hidden id]) never "
+        "constrains that dimension on a view grouped by the VISIBLE display counterpart, so the value "
+        "collapses to a coarser-grain constant (the 'share of own basket' bug: every row shows its "
+        "category/group total, not its own). Re-key the grain on the VISIBLE display counterpart that "
+        "1:1 identifies the same entity as the hidden key: "
+        "CALCULATE(<inner>, ALLEXCEPT('T', 'T'[<visible counterpart>])) -- or the explicit form "
+        "CALCULATE(<inner>, REMOVEFILTERS('T'), VALUES('T'[<visible counterpart>])). Confirm the "
+        "id->name mapping is 1:1 first (a display name shared by two ids would merge them); if no "
+        "faithful visible counterpart exists, keep the stub. Oracle-verify that the per-entity value "
+        "VARIES per entity rather than sitting at a per-group constant."
     ),
     DAX_LANGUAGE_GAP: (
         "No faithful native DAX form exists for this construct: regex (no DAX engine); "
@@ -211,7 +232,14 @@ def classify_fallback(reason, *, role=None, fields=None, has_suggestion=False):
 
     fn = _unsupported_function_name(rl, reason)
 
-    # 2. LOD grain / outer-aggregation dependence (INCLUDE/EXCLUDE, re-aggregation, nested superset,
+    # 2. Hidden-key FIXED-LOD grain: a bare dimensioned FIXED LOD whose ALLEXCEPT grain key is a
+    #    hidden column with no visible display counterpart (the deterministic tier routes it rather
+    #    than emit a value that collapses to a coarser-grain constant). Matched before the generic LOD
+    #    grain bucket so it carries its own re-key-on-the-visible-counterpart playbook.
+    if "on hidden column" in rl:
+        return {"category": HIDDEN_LOD_GRAIN_KEY, "guidance": _GUIDANCE[HIDDEN_LOD_GRAIN_KEY]}
+
+    # 2b. LOD grain / outer-aggregation dependence (INCLUDE/EXCLUDE, re-aggregation, nested superset,
     #    a bare LOD inside a row-level column calc).
     if ("include/exclude" in rl
             or "re-aggregate" in rl
