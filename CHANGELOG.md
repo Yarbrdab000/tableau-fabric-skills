@@ -13,6 +13,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.88.0` → `1.89.0`): Native 100%-stacked bar/column for the colour-legend
+  percent-of-total pattern.** A Tableau colour-legend bar/column whose measure carries a **"Percent of
+  Total"** quick table calc addressed across the category axis (each bar spans 0–100%) now emits Power
+  BI's native `hundredPercentStackedBarChart` / `hundredPercentStackedColumnChart` with the **raw
+  aggregate on Y** — letting Power BI normalise each bar's series to 100% by documented behaviour, which
+  faithfully matches Tableau's within-bar percent. Previously this shape emitted a plain `stackedBarChart`
+  plus a percent-of-total Visual Calculation whose `COLLAPSE(…, ROWS)` denominator collapsed the *category*
+  axis, so each **colour** (not each bar) summed to 100% — a silent mis-normalisation. A new fail-closed
+  detector (`_detect_native_pct_stacked`) fires only when every guard holds — mark is bar/column; exactly
+  one Series + one Category + one Y; exactly one view-only `PctTotal` quick calc; the resolved
+  percent-of-total spec keeps a surviving partition (`collapse_all` false) equal to the category-axis
+  dimension with the Series dimension *outside* it — otherwise the previous behaviour is kept verbatim
+  (a non-percent table calc, a percent addressed the wrong direction, or a Series-less bar all stay as
+  before). Both emit sites hooked; the native flip pair added to `_orientation_flip`. **Fully additive** —
+  no report-schema keys renamed or removed; the default deterministic emit is unchanged for every shape
+  that is not this exact pattern. +4 tests (bar + column positives, non-`PctTotal` and no-Series
+  negatives).
 - **tableau-migration (skill `1.87.0` → `1.88.0`): Stacked-family chart coverage — stacked-area and
   stacked-column combo now rebuild faithfully instead of collapsing to their overlapping/clustered
   look-alikes.** `_pbir_vtype` (the final PBIR `visualType` resolver) now extends the proven

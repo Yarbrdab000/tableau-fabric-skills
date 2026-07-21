@@ -1985,6 +1985,90 @@ def test_color_dimension_on_combo_emits_stacked_column_combo():
     assert "Y" in state and "Y2" in state
 
 
+# -- native 100%-stacked (colour-legend percent-of-total) ----------------------
+# A colour-legend bar/column whose measure carries a "Percent of Total" quick table
+# calc addressed across the category axis is a within-bar percent (each bar spans
+# 0-100%). Power BI has a native chart type for exactly this -- emit it with the RAW
+# aggregate on Y (no Visual Calculation) and let PBI normalise each bar's series to
+# 100%, matching Tableau by documented behaviour.
+_PCTO_INST = (
+    "<column-instance column='[Profit]' derivation='Sum' name='[pcto:sum:Profit:qk]' "
+    "pivot='key' type='quantitative'>"
+    "<table-calc ordering-type='{ordering}' type='PctTotal' /></column-instance>")
+_COLOR_CAT = "<encodings><color column='[federated.abc].[none:Category:nk]' /></encodings>"
+
+
+def _emit_with_table_calcs(ws):
+    from workbook_table_calcs import extract_table_calc_usages
+    wb = _workbook(ws)
+    ir = parse_twb(wb)
+    return ir, emit_pbir(ir, table_calc_usages=extract_table_calc_usages(wb))
+
+
+def test_pct_of_total_color_bar_emits_native_hundred_percent_stacked():
+    # dimension on ROWS, percent-of-total measure on cols, colour legend -> horizontal
+    # 100%-stacked bar. Addressing runs down the Rows (category) axis.
+    ws = _worksheet("Pct Bar", "Bar",
+                    rows="[federated.abc].[none:Region:nk]",
+                    cols="[federated.abc].[pcto:sum:Profit:qk]",
+                    deps_extra=_INST + _PCTO_INST.format(ordering="Rows"),
+                    encodings=_COLOR_CAT)
+    _ir, parts = _emit_with_table_calcs(ws)
+    vis = list(_visual_parts(parts).values())[0]
+    assert vis["visual"]["visualType"] == "hundredPercentStackedBarChart"
+    state = _query_state(vis)
+    assert state["Series"]["projections"][0]["field"]["Column"]["Property"] == "Category"
+    # RAW aggregate stays on Y -- exactly one projection, no NativeVisualCalculation, not hidden
+    yproj = state["Y"]["projections"]
+    assert len(yproj) == 1
+    assert "NativeVisualCalculation" not in yproj[0]["field"]
+    assert not yproj[0].get("hidden")
+
+
+def test_pct_of_total_color_column_emits_native_hundred_percent_stacked():
+    # dimension on COLS, percent-of-total measure on rows, colour legend -> vertical
+    # 100%-stacked column. Addressing runs across the Columns (category) axis.
+    ws = _worksheet("Pct Col", "Bar",
+                    rows="[federated.abc].[pcto:sum:Profit:qk]",
+                    cols="[federated.abc].[none:Region:nk]",
+                    deps_extra=_INST + _PCTO_INST.format(ordering="Columns"),
+                    encodings=_COLOR_CAT)
+    _ir, parts = _emit_with_table_calcs(ws)
+    vis = list(_visual_parts(parts).values())[0]
+    assert vis["visual"]["visualType"] == "hundredPercentStackedColumnChart"
+    yproj = _query_state(vis)["Y"]["projections"]
+    assert len(yproj) == 1 and "NativeVisualCalculation" not in yproj[0]["field"]
+
+
+def test_non_pcttotal_table_calc_with_color_stays_stacked():
+    # a colour-legend bar whose table calc is NOT percent-of-total (e.g. running sum)
+    # must NOT be reinterpreted as a 100%-stacked chart -> plain stackedBarChart.
+    run_inst = (
+        "<column-instance column='[Profit]' derivation='Sum' name='[rsum:sum:Profit:qk]' "
+        "pivot='key' type='quantitative'>"
+        "<table-calc ordering-type='Rows' type='RunningSum' /></column-instance>")
+    ws = _worksheet("Run Bar", "Bar",
+                    rows="[federated.abc].[none:Region:nk]",
+                    cols="[federated.abc].[rsum:sum:Profit:qk]",
+                    deps_extra=_INST + run_inst, encodings=_COLOR_CAT)
+    _ir, parts = _emit_with_table_calcs(ws)
+    vis = list(_visual_parts(parts).values())[0]
+    assert vis["visual"]["visualType"] == "stackedBarChart"
+
+
+def test_pct_of_total_without_series_not_native():
+    # percent-of-total measure but NO colour legend -> nothing to stack -> the native
+    # 100%-stacked type requires a Series, so it stays the default clustered chart.
+    ws = _worksheet("Pct NoColor", "Bar",
+                    rows="[federated.abc].[none:Region:nk]",
+                    cols="[federated.abc].[pcto:sum:Profit:qk]",
+                    deps_extra=_INST + _PCTO_INST.format(ordering="Rows"))
+    _ir, parts = _emit_with_table_calcs(ws)
+    vis = list(_visual_parts(parts).values())[0]
+    assert vis["visual"]["visualType"] == "clusteredBarChart"
+    assert "Series" not in _query_state(vis)
+
+
 # -- degenerate visuals are skipped (not emitted as empty shells) --------------
 def test_chart_missing_required_role_is_skipped_by_emit_gate():
     # a column visual whose shelves resolved to nothing must not emit an empty shell

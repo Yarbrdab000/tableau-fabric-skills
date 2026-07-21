@@ -50,16 +50,20 @@ except ImportError:
 # a partial checkout still emits everything else.
 try:
     from .workbook_table_calcs import extract_table_calc_usages
-    from .visual_calc_spec import usage_to_visual_calc_spec
+    from .visual_calc_spec import (usage_to_visual_calc_spec, resolve_addressing,
+                                   FAMILY_PERCENT_OF_TOTAL)
     from .visual_calc_emitter import emit_visual_calc
 except ImportError:  # pragma: no cover - flat scripts-on-path
     try:
         from workbook_table_calcs import extract_table_calc_usages
-        from visual_calc_spec import usage_to_visual_calc_spec
+        from visual_calc_spec import (usage_to_visual_calc_spec, resolve_addressing,
+                                       FAMILY_PERCENT_OF_TOTAL)
         from visual_calc_emitter import emit_visual_calc
     except ImportError:
         extract_table_calc_usages = None
         usage_to_visual_calc_spec = None
+        resolve_addressing = None
+        FAMILY_PERCENT_OF_TOTAL = None
         emit_visual_calc = None
 
 # Report-layer formatting emit builders (additive; PBIR analytics/format objects grounded on the
@@ -4444,6 +4448,59 @@ def _pbir_vtype(vt, state):
     return _VT_TO_PBIR[vt]
 
 
+def _detect_native_pct_stacked(ws, state, vc_index):
+    """Return the native 100%-stacked ``visualType`` when this worksheet is a color-legend, within-bar
+    percent-of-total bar/column -- else ``None`` (fail-closed).
+
+    A Tableau bar/column with a dimension on Colour and a Percent-of-Total quick calc on its measure
+    normalizes each bar's coloured segments to sum to 100%. Power BI's native
+    ``hundredPercentStacked{Bar,Column}Chart`` does exactly that same per-bar normalization on the RAW
+    measure. So the faithful emit is: keep the field wells we already build (Category axis / Series
+    legend / Y measure), pick the native 100%-stacked type, and bind the RAW measure -- letting Power
+    BI normalize -- instead of a Visual Calculation whose ``COLLAPSE`` runs along the category axis
+    (which would divide by each colour's cross-bar total, not each bar's cross-colour total).
+
+    All of the following must hold (any other shape -> ``None`` -> existing behaviour is unchanged):
+      * the mark is a bar or column;
+      * exactly one Series (legend) dimension, one Category-axis dimension, and one Y measure;
+      * exactly one view-only quick calc for the worksheet, a percent-of-total;
+      * its spec is a within-partition percent (``collapse_all`` False -- each bar sums to 100%, not a
+        grand-total percent); and
+      * its addressing partitions by EXACTLY the Category-axis dimension while the Series/colour
+        dimension is the normalized (addressed) one -- i.e. the percent runs across the stack within
+        each bar. This is the deterministic guard that the native per-bar normalization is faithful.
+    """
+    if (usage_to_visual_calc_spec is None or resolve_addressing is None
+            or FAMILY_PERCENT_OF_TOTAL is None):
+        return None
+    vt = ws.get("visual_type")
+    if vt not in (VT_BAR, VT_COLUMN):
+        return None
+    series = (state.get("Series") or {}).get("projections") or []
+    category = (state.get("Category") or {}).get("projections") or []
+    yvals = (state.get("Y") or {}).get("projections") or []
+    if len(series) != 1 or len(category) != 1 or len(yvals) != 1:
+        return None
+    usages = (vc_index or {}).get(ws["name"]) or []
+    if len(usages) != 1:
+        return None
+    usage = usages[0]
+    if getattr(usage, "calc_type", None) != "PctTotal":
+        return None
+    spec, _ = usage_to_visual_calc_spec(usage, role="value", visual_axis="ROWS")
+    if spec is None or spec.family != FAMILY_PERCENT_OF_TOTAL or spec.collapse_all:
+        return None
+    _addressed, partition, _ordering = resolve_addressing(usage)
+    if not partition:
+        return None
+    cat_ref = category[0].get("nativeQueryRef")
+    series_ref = series[0].get("nativeQueryRef")
+    if list(partition) != [cat_ref] or series_ref in partition:
+        return None
+    return ("hundredPercentStackedBarChart" if vt == VT_BAR
+            else "hundredPercentStackedColumnChart")
+
+
 # -- Tier-2 image-oracle seam: per-visual candidate record -------------------------------------
 # The deterministic Tier-1 engine commits to exactly ONE visual type per worksheet. For the later,
 # agent-driven image-oracle pass, each emitted MAIN visual additionally records the small set of
@@ -4457,6 +4514,8 @@ def _orientation_flip(pbir_type):
         "clusteredBarChart": "clusteredColumnChart",
         "stackedColumnChart": "stackedBarChart",
         "stackedBarChart": "stackedColumnChart",
+        "hundredPercentStackedColumnChart": "hundredPercentStackedBarChart",
+        "hundredPercentStackedBarChart": "hundredPercentStackedColumnChart",
     }
     return flips.get(pbir_type)
 
@@ -6685,10 +6744,18 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             page_ws.append(ws)
             x, y, w, h = _scale_zone(zone, ref_w, ref_h)
             vname = _sanitize(f"v-{page_name}-{i}-{ws['name']}")
-            vtype = _pbir_vtype(ws["visual_type"], state)
+            native_pct = _detect_native_pct_stacked(ws, state, vc_index)
+            if native_pct:
+                # A colour-legend within-bar percent-of-total emits as a native 100%-stacked chart:
+                # Power BI normalizes each bar's series to 100% off the RAW measure, so the
+                # percent-of-total Visual Calculation is intentionally skipped (raw Sum stays on Y).
+                vtype = native_pct
+                vc_value_objects, vc_fact = None, None
+            else:
+                vtype = _pbir_vtype(ws["visual_type"], state)
+                vc_value_objects, vc_fact = _apply_visual_calcs(
+                    ws, state, vc_index, model_table, field_map, warnings)
             pos = _position(x, y, w, h, tab=i)
-            vc_value_objects, vc_fact = _apply_visual_calcs(
-                ws, state, vc_index, model_table, field_map, warnings)
             # The Visual Calculation owns the cell colour whenever it emitted a backColor FillRule --
             # a colour-role table always (the hidden calc drives the fill), and a value-role table when
             # the worksheet carries a colour gradient (the shown calc tints its own column). Skip the
@@ -6845,10 +6912,18 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 f"{ws['visual_type']} visual has no usable field bindings (skipped)"))
             continue
         vname = _sanitize("v-" + ws["name"])
-        vtype = _pbir_vtype(ws["visual_type"], state)
+        native_pct = _detect_native_pct_stacked(ws, state, vc_index)
+        if native_pct:
+            # A colour-legend within-bar percent-of-total emits as a native 100%-stacked chart:
+            # Power BI normalizes each bar's series to 100% off the RAW measure, so the
+            # percent-of-total Visual Calculation is intentionally skipped (raw Sum stays on Y).
+            vtype = native_pct
+            vc_value_objects, vc_fact = None, None
+        else:
+            vtype = _pbir_vtype(ws["visual_type"], state)
+            vc_value_objects, vc_fact = _apply_visual_calcs(
+                ws, state, vc_index, model_table, field_map, warnings)
         pos = _position(40, 40, 880, 620)
-        vc_value_objects, vc_fact = _apply_visual_calcs(
-            ws, state, vc_index, model_table, field_map, warnings)
         # The Visual Calculation owns the cell colour whenever it emitted a backColor FillRule -- a
         # colour-role table always (the hidden calc drives the fill), and a value-role table when the
         # worksheet carries a colour gradient (the shown calc tints its own column). Skip the measure-
