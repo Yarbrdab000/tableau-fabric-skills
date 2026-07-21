@@ -364,3 +364,64 @@ def test_empty_view_uses_view_not_parent_table_and_does_not_warn():
     # The view is empty, so nothing is addressable; the stray out-of-view instance must NOT
     # be picked up (the buggy ``or table`` fallback would have surfaced it).
     assert usages == []
+
+
+# A NESTED formula table-calc chain: the displayed ``Rank`` calc field references ``composit`` (another
+# calc field). ``composit`` is NOT itself a pill on the sheet, so its formula lives only in the view's
+# calc-field scope. A view-layer consumer needs that inner formula to rebuild the chain as nested Visual
+# Calculations, so a ``kind == "field"`` usage now carries the whole scope (``scope_formulas`` /
+# ``scope_captions``); a quick usage never nests and carries neither.
+NESTED_CHAIN_FIXTURE = """<?xml version='1.0' encoding='utf-8'?>
+<workbook>
+  <worksheets>
+    <worksheet name='Nested'>
+      <table>
+        <view>
+          <datasource-dependencies datasource='ds0'>
+            <column aggregation='Sum' datatype='real' name='[Sales]' role='measure' type='quantitative' caption='Sales' />
+            <column aggregation='Sum' datatype='integer' name='[Quantity]' role='measure' type='quantitative' caption='Quantity' />
+            <column datatype='string' name='[Order ID]' role='dimension' type='nominal' caption='Order ID' />
+            <column caption='composit Calc' datatype='real' name='[Calculation_composit]' role='measure' type='quantitative'>
+              <calculation class='tableau' formula='RUNNING_SUM(SUM([Sales])) * .15 + RUNNING_SUM(SUM([Quantity])) *15' />
+            </column>
+            <column caption='Rank' datatype='integer' name='[Calculation_rank]' role='measure' type='quantitative'>
+              <calculation class='tableau' formula='RANK([Calculation_composit])'>
+                <table-calc ordering-type='Rows' />
+              </calculation>
+            </column>
+            <column-instance column='[Calculation_rank]' derivation='User' name='[usr:Calculation_rank:qk]' pivot='key' type='quantitative'>
+              <table-calc ordering-type='Rows' />
+            </column-instance>
+            <column-instance column='[Order ID]' derivation='None' name='[none:Order ID:nk]' pivot='key' type='nominal' />
+          </datasource-dependencies>
+        </view>
+        <rows>[ds0].[none:Order ID:nk]</rows>
+        <cols>[ds0].[usr:Calculation_rank:qk]</cols>
+      </table>
+    </worksheet>
+  </worksheets>
+</workbook>
+"""
+
+
+def test_nested_field_usage_carries_scope_formulas():
+    [u] = extract_table_calc_usages(NESTED_CHAIN_FIXTURE)
+    assert u.kind == "field"
+    assert u.caption == "Rank"
+    assert u.formula == "RANK([Calculation_composit])"
+    # The whole view calc-field scope rides the usage, so the inner (un-pilled) composite's formula
+    # is recoverable for a nested Visual-Calculation rebuild.
+    assert u.scope_formulas["Calculation_composit"] == (
+        "RUNNING_SUM(SUM([Sales])) * .15 + RUNNING_SUM(SUM([Quantity])) *15")
+    assert u.scope_captions["Calculation_composit"] == "composit Calc"
+    assert u.scope_captions["Calculation_rank"] == "Rank"
+    # It is JSON-serialisable (the scope is a plain dict).
+    json.dumps(u.to_dict())
+
+
+def test_quick_usage_carries_no_scope():
+    # a quick table calc never nests, so it carries neither scope map (kept None).
+    running = next(u for u in extract_table_calc_usages(FIXTURE) if u.kind == "quick")
+    assert running.scope_formulas is None
+    assert running.scope_captions is None
+

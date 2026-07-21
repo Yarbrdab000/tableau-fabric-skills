@@ -13,6 +13,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.89.0` → `1.90.0`): Nested formula table-calc chains rebuild as nested
+  Power BI Visual Calculations (the Comcast blend/running-sum × weight → RANK case), plus 164 new
+  compiler-tier routing tests.** A displayed calc that references *another* calc field
+  (`Rank = RANK([composit])` over `composit = RUNNING_SUM(SUM([Sales]))*.15 + RUNNING_SUM(SUM([Quantity]))*15`)
+  now rebuilds as a hidden base-measure + hidden inner Visual Calculation + shown outer Visual Calculation,
+  instead of dropping the composite and emitting a bare `Rank` measure. A narrow additive trigger
+  (`_view_only_field_chain_index`) fires **only** for these nested calc-references-calc chains; a single-level
+  formula table calc, a quick table calc, and every non-nested usage stay on the existing measure/QTC path,
+  so output is **byte-identical** wherever the trigger does not fire (and a no-op when no workbook table-calc
+  usages are supplied). The emitter (`_apply_formula_table_calc_chain`) is **fail-closed**: a blended /
+  secondary-source base, a non-calc bare reference, an out-of-subset function, or a displayed calc that is
+  not the shown value routes the worksheet to a disclosed **review** with the base visual emitted unchanged —
+  never a silent wrong calc. The calc→DAX chain compiler (`formula_table_calc_to_visual_calc.py`, weights
+  kept outside the running function, siblings referenced by human name) and the extractor scope-carry
+  (`scope_formulas`/`scope_captions` on nested field usages) land with it. **Fully additive** — no
+  report-schema keys renamed or removed. Test coverage: the proven compiler-core suite + hermetic
+  integration tests (reuse + synthesize hidden bases, exact DAX, blend→review byte-identical) **plus a new
+  `tests/test_compiler_routing.py` of 164 routing tests** spanning `calc_to_dax` (Tier-0 translate-vs-fallback,
+  measure + column mode) → `translation_router` category routing, the `check_candidate_dax` gate, the
+  `twb_to_pbir` nested-VC emit-site router, `storage_mode` Import/DirectQuery/needs-decision selection, and
+  `table_calc_to_dax` translate-vs-handoff — every expectation harvested from the live engines so the tests
+  move in lock-step with the deterministic tier. Suite: **2978 passed / 3 skipped / 1 xfailed**.
 - **tableau-migration (skill `1.88.0` → `1.89.0`): Native 100%-stacked bar/column for the colour-legend
   percent-of-total pattern.** A Tableau colour-legend bar/column whose measure carries a **"Percent of
   Total"** quick table calc addressed across the category axis (each bar spans 0–100%) now emits Power

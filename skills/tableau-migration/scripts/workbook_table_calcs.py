@@ -163,6 +163,14 @@ class TableCalcUsage:
     shelf: Optional[str] = None         # "rows" | "cols" | None (where the calc pill sits)
     rows: List[Pill] = field(default_factory=list)
     cols: List[Pill] = field(default_factory=list)
+    # The worksheet's full calc-field scope (``{field_id: formula}`` / ``{field_id: caption}``), carried
+    # ONLY on ``kind == "field"`` usages so a view-layer consumer can rebuild a *nested* chain -- a
+    # formula table calc that references ANOTHER calc field (e.g. ``RANK([composit])`` over
+    # ``composit = RUNNING_SUM(...)``) -- into nested Visual Calculations. The referenced inner calc
+    # is not itself a pill on the sheet, so its formula lives here and nowhere on the usage list.
+    # ``None`` for quick usages (they never nest), keeping their facts unchanged.
+    scope_formulas: Optional[dict] = None
+    scope_captions: Optional[dict] = None
 
     def to_dict(self) -> dict:
         d = dict(self.__dict__)
@@ -394,6 +402,8 @@ def extract_table_calc_usages(xml_text: str) -> List[TableCalcUsage]:
                            else "cols" if iid in cols_inst else None),
                     rows=rows,
                     cols=cols,
+                    scope_formulas=(dict(formulas) if kind == "field" else None),
+                    scope_captions=(dict(captions) if kind == "field" else None),
                 ))
     return usages
 

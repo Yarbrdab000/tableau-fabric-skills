@@ -21,6 +21,7 @@ from twb_to_pbir import (
     _DATE_EXACT_DERIVATIONS,
     _INTEGER_DATE_PART_COLUMNS,
     _apply_grow_to_fit,
+    _apply_formula_table_calc_chain,
     _apply_override,
     _automatic_canvas_dims,
     _candidate_plan,
@@ -41,6 +42,7 @@ from twb_to_pbir import (
     _tableau_filter_mode_to_pbi,
     _tableau_param_control_mode_to_pbi,
     _text_object_textbox_visual,
+    _view_only_field_chain_index,
     _visual_json,
     _zone_background_fill2,
     _zone_run_font,
@@ -5810,6 +5812,130 @@ def test_title_style_non_hex_color_is_deferred():
     res = migrate_twb_to_pbir(_titled_ws("<run fontcolor='#11223344'>Sales</run>"))
     assert "fontColor" not in _title_props(res)
     assert res["ir"]["worksheets"][0]["title_style"] == {"deferred": ["fontcolor"]}
+
+
+# -- nested formula table-calc chain -> nested Visual Calculations (Feature A) --
+# The Comcast use case: a displayed calc ``Rank = RANK([composit])`` over a composite
+# ``composit = RUNNING_SUM(SUM([Sales]))*.15 + RUNNING_SUM(SUM([Quantity]))*15`` is a calc that
+# references another calc (a nested chain). It rebuilds as nested Power BI Visual Calculations --
+# hidden base measures + a hidden inner ``composit Calc`` VC + the shown outer ``Rank`` VC -- rather
+# than dropping the composite and emitting a bare ``Rank`` measure. The path is additive and
+# fail-closed: a blend / secondary-source base or an out-of-subset function routes to review and
+# leaves the base visual untouched.
+from workbook_table_calcs import TableCalcUsage as _TCU  # noqa: E402
+
+_CID_COMPOSIT = "Calculation_composit"
+_CID_RANK = "Calculation_rank"
+
+
+def _agg_value(caption, prop, agg="Sum", entity="Orders", nref=None):
+    return {"kind": "value", "binding": "aggregation", "aggregation": agg,
+            "entity": entity, "property": prop, "caption": caption}
+
+
+def _nested_chain_usage(composit_formula):
+    return _TCU(
+        worksheet="Sheet3", instance="[rank_inst]", column=_CID_RANK, caption="Rank",
+        kind="field", formula="RANK([{0}])".format(_CID_COMPOSIT),
+        scope_formulas={_CID_COMPOSIT: composit_formula,
+                        _CID_RANK: "RANK([{0}])".format(_CID_COMPOSIT)},
+        scope_captions={_CID_COMPOSIT: "composit Calc", _CID_RANK: "Rank"})
+
+
+def _nested_chain_ws_state(composit_formula):
+    ws = {"name": "Sheet3", "visual_type": "table",
+          "rows": [{"kind": "category", "binding": "column", "aggregation": None,
+                    "entity": "Orders", "property": "Order_ID", "caption": "Order ID"}],
+          "cols": [],
+          "encodings": {"detail": [_agg_value("Sales", "Sales"),
+                                   _agg_value("Quantity", "Quantity")]}}
+    # The shown value pill is the displayed calc, already projected as a plain measure named "Rank".
+    # Sales is ALSO already projected (exercises reuse -> hide); Quantity is NOT (exercises the
+    # synthesize-a-hidden-base path).
+    state = {"Values": {"projections": [
+        {"field": {"Aggregation": {"Expression": {"Column": {
+            "Expression": {"SourceRef": {"Entity": "Orders"}}, "Property": "Sales"}},
+            "Function": 0}}, "queryRef": "Sum(Orders.Sales)", "nativeQueryRef": "Sum of Sales"},
+        {"field": {"Measure": {"Expression": {"SourceRef": {"Entity": "_Measures"}},
+                               "Property": "Rank"}}, "queryRef": "_Measures.Rank",
+         "nativeQueryRef": "Rank"}]},
+        "Rows": {"projections": [{"field": {"Column": {
+            "Expression": {"SourceRef": {"Entity": "Orders"}}, "Property": "Order_ID"}},
+            "queryRef": "Orders.Order_ID", "nativeQueryRef": "Order ID"}]}}
+    return ws, state
+
+
+def test_nested_formula_chain_rebuilds_as_nested_visual_calculations():
+    composit = "RUNNING_SUM(SUM([Sales])) * .15 + RUNNING_SUM(SUM([Quantity])) *15"
+    ws, state = _nested_chain_ws_state(composit)
+    chain_index = _view_only_field_chain_index([_nested_chain_usage(composit)])
+    assert "Sheet3" in chain_index   # the chain is recognised as nested
+
+    warnings = []
+    handled, fact = _apply_formula_table_calc_chain(
+        ws, state, chain_index, "Orders", {}, warnings)
+    assert handled is True
+    assert warnings == []
+
+    projs = state["Values"]["projections"]
+    by_nref = {p["nativeQueryRef"]: p for p in projs}
+    # The plain "Rank" measure projection is gone (the outer VC replaces it as the shown value).
+    assert not any(p.get("field", {}).get("Measure", {}).get("Property") == "Rank"
+                   for p in projs if "Measure" in p.get("field", {}))
+    # Both base aggregates are now hidden projections the inner VC references.
+    assert by_nref["Sum of Sales"].get("hidden") is True
+    assert by_nref["Sum of Quantity"].get("hidden") is True
+    # Hidden inner composite VC with the exact translated DAX (weights OUTSIDE the running function).
+    inner = by_nref["composit Calc"]
+    assert inner.get("hidden") is True
+    assert inner["field"]["NativeVisualCalculation"]["Expression"] == (
+        "RUNNINGSUM([Sum of Sales], ROWS) * 0.15 + RUNNINGSUM([Sum of Quantity], ROWS) * 15")
+    # Shown outer Rank VC referencing the inner calc by its human name.
+    outer = by_nref["Rank"]
+    assert not outer.get("hidden")
+    assert outer["field"]["NativeVisualCalculation"]["Expression"] == (
+        "RANK(SKIP, ORDERBY([composit Calc], DESC))")
+    # The shown VC is projected last (inner -> outer order).
+    assert projs[-1] is outer
+    assert fact["status"] == "emitted" and fact["family"] == "FORMULA_TABLE_CALC"
+    assert fact["entry"] == "Rank"
+    assert sorted(fact["base_measures"]) == ["Sum of Quantity", "Sum of Sales"]
+
+
+def test_nested_formula_chain_blend_secondary_base_routes_to_review():
+    # A running sum over a blended SECONDARY source ([copy].[Sales]) cannot resolve a base measure
+    # from this visual's fields (that is Feature B / a model relationship) -> fail closed, base visual
+    # untouched, a review disclosure raised.
+    composit = ("RUNNING_SUM(SUM([Sample - Superstore (copy)].[Sales])) * .15 "
+                "+ RUNNING_SUM(SUM([Quantity])) *15")
+    ws, state = _nested_chain_ws_state(composit)
+    before = json.dumps(state, sort_keys=True)
+    chain_index = _view_only_field_chain_index([_nested_chain_usage(composit)])
+    warnings = []
+    handled, fact = _apply_formula_table_calc_chain(
+        ws, state, chain_index, "Orders", {}, warnings)
+    assert handled is False
+    assert fact["status"] == "review"
+    assert json.dumps(state, sort_keys=True) == before   # base visual is byte-identical
+    assert any("routed to review" in w["reason"] for w in warnings)
+
+
+def test_single_level_formula_table_calc_is_not_a_nested_chain():
+    # A single-level formula table calc (references no other calc) stays OFF the nested path -> the
+    # measure path keeps owning it, so existing output is unchanged.
+    usage = _TCU(
+        worksheet="Sheet1", instance="[i]", column="Calculation_x", caption="Run Sales",
+        kind="field", formula="RUNNING_SUM(SUM([Sales]))",
+        scope_formulas={"Calculation_x": "RUNNING_SUM(SUM([Sales]))"},
+        scope_captions={"Calculation_x": "Run Sales"})
+    assert _view_only_field_chain_index([usage]) == {}
+
+
+def test_quick_table_calc_usage_is_never_a_nested_chain():
+    usage = _TCU(worksheet="S", instance="[i]", column="[Profit]", caption="Profit",
+                 kind="quick", calc_type="RunningSum")
+    assert _view_only_field_chain_index([usage]) == {}
+
 
 
 def test_title_without_styling_emits_no_font_and_no_fact():
