@@ -1931,6 +1931,60 @@ def test_bar_without_series_stays_clustered():
     assert "Series" not in _query_state(vis)
 
 
+def test_color_dimension_on_area_emits_stacked_area():
+    # Tableau stacks a colour-legend AREA chart by default (the same "Stack marks" default as bars);
+    # Power BI's plain areaChart OVERLAPS the bands, so the faithful rebuild is stackedAreaChart.
+    enc = "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings>"
+    ws = _worksheet("Stacked Area", "Area",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, encodings=enc)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["visual_type"] == "area"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "stackedAreaChart"
+    state = _query_state(vis)
+    assert state["Series"]["projections"][0]["field"]["Column"]["Property"] == "Region"
+
+
+def test_area_without_series_stays_plain_area():
+    # no colour-legend dimension -> nothing to stack -> the plain overlapping areaChart is kept
+    ws = _worksheet("Plain Area", "Area",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST)
+    vis = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
+    assert vis["visual"]["visualType"] == "areaChart"
+    assert "Series" not in _query_state(vis)
+
+
+def test_color_dimension_on_combo_emits_stacked_column_combo():
+    # A dual-axis combo whose COLUMN family carries a colour-legend dimension stacks those columns
+    # by default in Tableau -> the faithful Power BI target is lineStackedColumnComboChart. The
+    # colour encoding lives on the primary (first) pane, which drives the worksheet's Series role.
+    panes = (
+        "<panes>"
+        "<pane><mark class='Bar' />"
+        "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings></pane>"
+        "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'>"
+        "<mark class='Bar' /></pane>"
+        "<pane id='2' y-index='1' y-axis-name='[federated.abc].[sum:Profit:qk]'>"
+        "<mark class='Line' /></pane>"
+        "</panes>")
+    ws = _combo_worksheet(
+        "Combo Stacked",
+        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+        cols="[federated.abc].[mn:Order Date:ok]",
+        panes=panes, deps_extra=_INST)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["visual_type"] == "combo"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "lineStackedColumnComboChart"
+    state = _query_state(vis)
+    assert state["Series"]["projections"][0]["field"]["Column"]["Property"] == "Region"
+    assert "Y" in state and "Y2" in state
+
+
 # -- degenerate visuals are skipped (not emitted as empty shells) --------------
 def test_chart_missing_required_role_is_skipped_by_emit_gate():
     # a column visual whose shelves resolved to nothing must not emit an empty shell

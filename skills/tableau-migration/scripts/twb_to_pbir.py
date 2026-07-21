@@ -4421,13 +4421,26 @@ def _pbir_vtype(vt, state):
     if vt == VT_CARD:
         n = len(state.get("Values", {}).get("projections", []))
         return "multiRowCard" if n > 1 else "card"
-    # A colour DIMENSION on a bar/column mark stacks its segments within each bar by default in
-    # Tableau ("Stack marks" is on by default). Power BI's clustered* charts render the same
-    # legend side-by-side, so when a Series (legend) dimension is present the faithful default is
-    # the stacked* variant -- preserving the Tableau layout rather than silently re-rendering a
-    # stacked chart as grouped. (Default-stacking behaviour fact-checked against Tableau docs.)
-    if vt in (VT_COLUMN, VT_BAR) and state.get("Series", {}).get("projections"):
-        return "stackedColumnChart" if vt == VT_COLUMN else "stackedBarChart"
+    # A colour DIMENSION on a bar/column/area mark stacks its segments within each bar/band by
+    # default in Tableau ("Stack marks" is on by default for bar AND area marks). Power BI's
+    # clustered* charts render the legend side-by-side and its plain areaChart OVERLAPS the bands,
+    # so when a Series (legend) dimension is present the faithful default is the stacked* variant --
+    # preserving the Tableau layout rather than silently re-rendering a stacked chart as grouped /
+    # overlapping. (Default-stacking behaviour fact-checked against Tableau docs.)
+    if state.get("Series", {}).get("projections"):
+        if vt == VT_COLUMN:
+            return "stackedColumnChart"
+        if vt == VT_BAR:
+            return "stackedBarChart"
+        if vt == VT_AREA:
+            # Same "Stack marks" default as bars: a colour-dimension area chart stacks its bands.
+            return "stackedAreaChart"
+        if vt == VT_COMBO:
+            # A dual-axis combo whose COLUMN family carries a colour-dimension legend stacks those
+            # columns by default in Tableau; the faithful Power BI target is the stacked-column
+            # combo. Same role wells as the clustered combo (Category / Y / Y2 / Series) -- only
+            # the column-stacking differs, so the binding path is unchanged.
+            return "lineStackedColumnComboChart"
     return _VT_TO_PBIR[vt]
 
 

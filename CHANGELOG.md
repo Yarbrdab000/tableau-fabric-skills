@@ -13,6 +13,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.87.0` → `1.88.0`): Stacked-family chart coverage — stacked-area and
+  stacked-column combo now rebuild faithfully instead of collapsing to their overlapping/clustered
+  look-alikes.** `_pbir_vtype` (the final PBIR `visualType` resolver) now extends the proven
+  "colour-dimension ⇒ stacked" rule that already covered bars/columns to two more mark families: a
+  Tableau **area** chart carrying a colour-legend dimension emits `stackedAreaChart` (Tableau stacks
+  area bands by the same default "Stack marks" behaviour as bars, whereas Power BI's plain `areaChart`
+  *overlaps* them), and a **dual-axis combo** whose column family carries a colour-legend dimension
+  emits `lineStackedColumnComboChart` (previously always the clustered `lineClusteredColumnComboChart`).
+  Both reuse the existing role wells — Category / Y / Series for area, Category / Y / Y2 / Series for
+  the combo — so only the emitted type string changes; the binding path is untouched. **Fully
+  additive and byte-identical when no Series (legend) dimension is present**: a plain area chart still
+  emits `areaChart` and a plain combo still emits `lineClusteredColumnComboChart`. +3 regression tests
+  (area-with-legend ⇒ stacked area, area-without-legend stays plain, combo-with-legend ⇒ stacked
+  combo). Clean-room: Tableau's default area-stacking behaviour is an unprotectable fact; the detector,
+  role mapping, and tests are independently authored and verified against the emitter's own state model.
 - **tableau-migration (skill `1.86.0` → `1.87.0`): Input identity manifest + collision tripwire for
   local runs — a local migration now proves *which bytes* it consumed and loudly flags a not-clean
   input folder, so an "use the exact file I attached" request can't silently run against a stale
