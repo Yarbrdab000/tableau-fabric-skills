@@ -38,10 +38,12 @@ ADVISOR_VERSION = 1
 ADVISOR_BUNDLE_KIND = "tableau-to-powerbi-viz-advice-request"
 
 # The closed PBIR ``visualType`` vocabulary the advisor may recommend. Mirrors twb_to_pbir's
-# ``_VT_TO_PBIR`` plus its default-stacking (stacked*) and card-split (multiRowCard) variants. A
-# suggestion whose chart type is outside this set is rejected by the gate.
+# ``_VT_TO_PBIR`` plus its default-stacking (unqualified column/bar ARE Power BI's stacked variants)
+# and card-split (multiRowCard) variants. A suggestion whose chart type is outside this set is
+# rejected by the gate. NOTE: "stackedColumnChart" / "stackedBarChart" are NOT valid PBIR types --
+# Power BI spells a stacked column/bar as the unqualified "columnChart" / "barChart".
 PBIR_VISUAL_TYPES = frozenset({
-    "clusteredColumnChart", "clusteredBarChart", "stackedColumnChart", "stackedBarChart",
+    "clusteredColumnChart", "clusteredBarChart", "columnChart", "barChart",
     "lineChart", "areaChart", "scatterChart", "pieChart", "donutChart",
     "lineClusteredColumnComboChart", "waterfallChart", "ribbonChart",
     "card", "multiRowCard", "tableEx", "pivotTable", "map", "shapeMap",
@@ -247,7 +249,7 @@ def _recommend_specs(c):
         d1, d2 = dims[0]["name"], dims[1]["name"]
         out.append(_spec("pivotTable", {"Rows": [d1], "Columns": [d2], "Values": m_names[:1]}, 0.74,
                          f"Two dimensions ({d1} x {d2}) by one measure cross-tab as a matrix."))
-        out.append(_spec("stackedColumnChart", {"Category": [d1], "Series": [d2], "Y": m_names[:1]},
+        out.append(_spec("columnChart", {"Category": [d1], "Series": [d2], "Y": m_names[:1]},
                          0.64, f"Stacked columns show {m_names[0]} of {d1} split by {d2}."))
 
     # Two measures (a relationship) optionally detailed by a dimension: a scatter plot.

@@ -161,7 +161,7 @@ def test_two_dimensions_one_measure_is_a_matrix():
                               _f("Ship Mode", "dimension", "string"),
                               _f("Sales", "measure", "double")])
     assert recs[0]["visual_type"] == "pivotTable"
-    assert "stackedColumnChart" in _types(recs)
+    assert "columnChart" in _types(recs)
 
 
 def test_two_measures_offer_scatter():

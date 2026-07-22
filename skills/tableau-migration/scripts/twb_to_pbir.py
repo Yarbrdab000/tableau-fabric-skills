@@ -4434,14 +4434,18 @@ def _pbir_vtype(vt, state):
     # A colour DIMENSION on a bar/column/area mark stacks its segments within each bar/band by
     # default in Tableau ("Stack marks" is on by default for bar AND area marks). Power BI's
     # clustered* charts render the legend side-by-side and its plain areaChart OVERLAPS the bands,
-    # so when a Series (legend) dimension is present the faithful default is the stacked* variant --
+    # so when a Series (legend) dimension is present the faithful default is the STACKED variant --
     # preserving the Tableau layout rather than silently re-rendering a stacked chart as grouped /
-    # overlapping. (Default-stacking behaviour fact-checked against Tableau docs.)
+    # overlapping. (Default-stacking behaviour fact-checked against Tableau docs.) NOTE: Power BI
+    # spells a stacked column/bar as the UNQUALIFIED "columnChart" / "barChart" -- the look-alikes
+    # "stackedColumnChart" / "stackedBarChart" are NOT valid PBIR types (they render as a missing
+    # custom visual; caught by pbir_lint / powerbi-report-author validate). The clustered variants
+    # are "clusteredColumnChart" / "clusteredBarChart".
     if state.get("Series", {}).get("projections"):
         if vt == VT_COLUMN:
-            return "stackedColumnChart"
+            return "columnChart"
         if vt == VT_BAR:
-            return "stackedBarChart"
+            return "barChart"
         if vt == VT_AREA:
             # Same "Stack marks" default as bars: a colour-dimension area chart stacks its bands.
             return "stackedAreaChart"
@@ -4518,8 +4522,8 @@ def _orientation_flip(pbir_type):
     flips = {
         "clusteredColumnChart": "clusteredBarChart",
         "clusteredBarChart": "clusteredColumnChart",
-        "stackedColumnChart": "stackedBarChart",
-        "stackedBarChart": "stackedColumnChart",
+        "columnChart": "barChart",
+        "barChart": "columnChart",
         "hundredPercentStackedColumnChart": "hundredPercentStackedBarChart",
         "hundredPercentStackedBarChart": "hundredPercentStackedColumnChart",
     }
@@ -6555,7 +6559,6 @@ _TABLEAU_EXTRA = [
     "#499894", "#D37295", "#B6992D", "#86BCB6", "#79706E",
     "#8CD17D", "#D7B5A6", "#FABFD2", "#A0CBE8", "#FFBE7D"]
 _TABLEAU_THEME_FILE = "TableauPalette.json"
-_TABLEAU_THEME_DISPLAY = "Tableau"
 
 
 def _derive_brand_color(ir):
@@ -6588,6 +6591,13 @@ def tableau_theme_dict(brand=None, extra_palette=None):
     minimal -- no ``background``/``foreground`` overrides -- so it recolours marks only and never
     fights the base theme on text/canvas.
 
+    The theme's ``name`` is the bundled FILE name (``_TABLEAU_THEME_FILE``), NOT a display label:
+    Power BI's PBIR schema requires the theme file's internal ``name`` to exactly equal the
+    ``customTheme.name`` and the ``RegisteredResources`` item name/path that ``report_json_part``
+    registers (all four must match and end in ``.json``). A bare display name like "Tableau" trips
+    ``PBIR_THEME_FILE_NAME_MISMATCH`` in ``powerbi-report-author validate`` and the theme -- with its
+    whole palette -- silently fails to load. (Guarded by ``pbir_lint``.)
+
     ``brand`` (a workbook-derived ``#rrggbb``, see ``_derive_brand_color``) leads ``dataColors`` when
     given, so a single-series / auto-coloured chart rebuilds in the workbook's brand colour instead of
     Power BI's blue-first default, while the full Tableau 10/20 sequence still trails as the fallback
@@ -6595,7 +6605,7 @@ def tableau_theme_dict(brand=None, extra_palette=None):
     never appears twice). ``extra_palette`` (an optional ordered list of ``#rrggbb`` -- reserved for a
     later per-member-palette lever) is inserted after the brand, ahead of the Tableau tail, likewise
     de-duplicated. With no ``brand`` and no ``extra_palette`` the return is byte-identical to the prior
-    default (the never-regress contract)."""
+    default apart from the corrected ``name`` (the never-regress contract for ``dataColors``)."""
     base = list(_TABLEAU_10 + _TABLEAU_EXTRA)
     lead = []
     if brand and _HEX6_RE.match(brand):
@@ -6604,14 +6614,14 @@ def tableau_theme_dict(brand=None, extra_palette=None):
         if hex_color and _HEX6_RE.match(hex_color):
             lead.append(hex_color)
     if not lead:
-        return {"name": _TABLEAU_THEME_DISPLAY, "dataColors": base}
+        return {"name": _TABLEAU_THEME_FILE, "dataColors": base}
     ordered, seen = [], set()
     for hex_color in lead + base:
         low = hex_color.lower()
         if low not in seen:
             seen.add(low)
             ordered.append(hex_color)
-    return {"name": _TABLEAU_THEME_DISPLAY, "dataColors": ordered}
+    return {"name": _TABLEAU_THEME_FILE, "dataColors": ordered}
 
 
 def report_json_part(custom_theme_name=None, image_items=None):

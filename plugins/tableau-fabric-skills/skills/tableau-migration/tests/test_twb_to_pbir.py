@@ -1903,7 +1903,9 @@ def test_color_dimension_encoding_populates_series_role():
 
 def test_color_dimension_on_bar_emits_stacked_not_clustered():
     # Tableau stacks a colour-legend bar/column by default ("Stack marks" on); the rebuild must
-    # emit the stacked* variant, not Power BI's side-by-side clustered* chart.
+    # emit Power BI's STACKED variant -- the unqualified columnChart / barChart -- not the
+    # side-by-side clusteredColumnChart / clusteredBarChart. (stacked{Column,Bar}Chart are NOT
+    # valid PBIR types; Power BI spells stacked as the unqualified name.)
     enc = "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings>"
     # dimension on COLUMNS, measure on rows -> vertical column chart, stacked by the colour legend
     col_ws = _worksheet("Stacked Cols", "Bar",
@@ -1911,7 +1913,7 @@ def test_color_dimension_on_bar_emits_stacked_not_clustered():
                         cols="[federated.abc].[none:Category:nk]",
                         deps_extra=_INST, encodings=enc)
     cv = list(_visual_parts(emit_pbir(parse_twb(_workbook(col_ws)))).values())[0]
-    assert cv["visual"]["visualType"] == "stackedColumnChart"
+    assert cv["visual"]["visualType"] == "columnChart"
     assert "Series" in _query_state(cv)
     # dimension on ROWS, measure on cols -> horizontal bar chart, stacked
     bar_ws = _worksheet("Stacked Bars", "Bar",
@@ -1919,7 +1921,7 @@ def test_color_dimension_on_bar_emits_stacked_not_clustered():
                         cols="[federated.abc].[sum:Sales:qk]",
                         deps_extra=_INST, encodings=enc)
     bv = list(_visual_parts(emit_pbir(parse_twb(_workbook(bar_ws)))).values())[0]
-    assert bv["visual"]["visualType"] == "stackedBarChart"
+    assert bv["visual"]["visualType"] == "barChart"
 
 
 def test_bar_without_series_stays_clustered():
@@ -2044,7 +2046,7 @@ def test_pct_of_total_color_column_emits_native_hundred_percent_stacked():
 
 def test_non_pcttotal_table_calc_with_color_stays_stacked():
     # a colour-legend bar whose table calc is NOT percent-of-total (e.g. running sum)
-    # must NOT be reinterpreted as a 100%-stacked chart -> plain stackedBarChart.
+    # must NOT be reinterpreted as a 100%-stacked chart -> plain stacked barChart.
     run_inst = (
         "<column-instance column='[Profit]' derivation='Sum' name='[rsum:sum:Profit:qk]' "
         "pivot='key' type='quantitative'>"
@@ -2055,7 +2057,7 @@ def test_non_pcttotal_table_calc_with_color_stays_stacked():
                     deps_extra=_INST + run_inst, encodings=_COLOR_CAT)
     _ir, parts = _emit_with_table_calcs(ws)
     vis = list(_visual_parts(parts).values())[0]
-    assert vis["visual"]["visualType"] == "stackedBarChart"
+    assert vis["visual"]["visualType"] == "barChart"
 
 
 def test_pct_of_total_without_series_not_native():
@@ -4952,7 +4954,7 @@ def test_categorical_palette_parsed_into_ir():
 def test_categorical_palette_emits_datapoint_fills_with_scope_selectors():
     parts = emit_pbir(parse_twb(_workbook(_stacked_palette_ws())))
     vj = list(_visual_parts(parts).values())[0]
-    assert vj["visual"]["visualType"] == "stackedColumnChart"
+    assert vj["visual"]["visualType"] == "columnChart"
     dp = _data_point_objects(vj)
     assert dp and len(dp) == len(_REGION_PALETTE)
     series_field = _query_state(vj)["Series"]["projections"][0]["field"]
