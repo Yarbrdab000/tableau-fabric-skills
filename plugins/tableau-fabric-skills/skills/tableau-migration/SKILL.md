@@ -12,7 +12,7 @@ description: >-
   Triggers: "migrate from tableau", "tableau to fabric", "tableau to power bi",
   "migrate tableau workbook", "tableau workbook to power bi", "tableau dashboard to power bi",
   "rebuild tableau dashboard", "tableau report to pbir", "tableau datasource to semantic model",
-  "convert tableau calculation to dax".
+  "convert tableau calculation to dax", "tableau migration troubleshooting".
 ---
 
 > **AUTH MODEL — tableau-migration**
@@ -505,6 +505,7 @@ This skill is **self-contained** — the bundled scripts cover the full migratio
 | Connection → M Partition & Binding | [connection-binding.md](resources/connection-binding.md) |
 | Validation & Reconciliation (ExecuteQuery vs VDS) | [validation-reconciliation.md](resources/validation-reconciliation.md) |
 | Migration Gotchas | [migration-gotchas.md](resources/migration-gotchas.md) |
+| Troubleshooting — "I need help" (guided menu) | [troubleshooting.md](resources/troubleshooting.md) |
 | Security & Governance | [security-governance.md](resources/security-governance.md) |
 | Migration Report | [migration-report.md](resources/migration-report.md) |
 | Updating / upgrading this skill | [self-update.md](resources/self-update.md) |
@@ -526,6 +527,7 @@ This skill is **self-contained** — the bundled scripts cover the full migratio
 | Emitting M partitions / binding the connection | [connection-binding.md](resources/connection-binding.md) | ~170 |
 | Validating the migrated model | [validation-reconciliation.md](resources/validation-reconciliation.md) | ~140 |
 | Troubleshooting failures | [migration-gotchas.md](resources/migration-gotchas.md) | ~120 |
+| User says **"I need help"** / "it's not working" (guided menu) | [troubleshooting.md](resources/troubleshooting.md) | ~200 |
 | Production security setup | [security-governance.md](resources/security-governance.md) | ~110 |
 | Generating the migration report | [migration-report.md](resources/migration-report.md) | ~90 |
 | User asks to **update / upgrade this skill** | [self-update.md](resources/self-update.md) | ~110 |
@@ -813,6 +815,27 @@ Full guide in [migration-gotchas.md](resources/migration-gotchas.md).
 | G5 | `NATIVE_QUERY_NO_FOLD` | Custom SQL native query won't fold in DirectQuery | Partial | Keep `[EnableFolding=true]`; if it still fails, switch that table to Import. |
 | G6 | `CREDENTIALS_MANUAL` | Bind succeeds but refresh fails (no credentials) | Yes | User configures credentials on the connection; bind links IDs only. |
 | G7 | `GATEWAY_REQUIRED` | DirectQuery to an on-premises source needs a data gateway | Yes | User sets up / selects a gateway for the connection. |
+
+---
+
+## Troubleshooting — "I need help"
+
+When the user asks for help, says something isn't working, or describes a snag (a rejected PAT, a file that can't be found, an empty report, a deploy error) **and you are not mid-run in the mechanical span**, present the menu below **verbatim**, ask for a number, then open [troubleshooting.md](resources/troubleshooting.md) and work that branch. This is a **guided reference, not a run gate** — it issues no tool call by itself, reaches nothing external, and spends nothing. ("I need help" is honored only once this migration skill is already active; the frontmatter triggers are migration-scoped so an unrelated help request never hijacks the skill.)
+
+```
+What are you running into? Reply with a number and I'll walk you through it:
+
+  1) The skill won't load or run          (install, /skills list empty, wrong Python, out of date)
+  2) Tableau sign-in / credentials        (PAT not working, no Key Vault, no credentials at all)
+  3) Can't pull from Tableau (online)     (server/site, a datasource or workbook not found)
+  4) A local file or its data isn't found (tool can't find my .tds/.twb/.twbx, or a local dashboard's data)
+  5) A step errored or the run stalled    (the happy path isn't completing; is WARN a failure?)
+  6) Deploy to Fabric failed              (az login, workspace/capacity, refresh / credential wall)
+  7) The output looks wrong               (.pbip "tiny/broken", calcs = 0, a visual missing, numbers off)
+  8) Not sure / none of these             (describe it and I'll route you)
+```
+
+The headline branch is **§2 credentials**: a rejected PAT (name **and** secret both required; regenerate an expired token), no Key Vault (use a git-ignored `.env` with `--env-file --no-prompt`), or no online credentials at all (switch to **D1=B local files** and skip the pull entirely). Full detail for every branch is in [troubleshooting.md](resources/troubleshooting.md).
 
 ---
 

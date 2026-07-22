@@ -13,6 +13,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.90.0` → `1.91.0`): A user-facing troubleshooting wizard — a guided
+  "I need help" menu the agent presents when a migration hits a snag.** New `resources/troubleshooting.md`
+  routes a plain-language symptom to a fix across 8 branches (the skill won't load or run; Tableau
+  sign-in / credentials — the headline: a rejected or expired PAT, no Key Vault, or no online
+  credentials at all; can't pull from Tableau online; a local file or its data isn't found; a step
+  errored or the run stalled; deploy to Fabric failed; the output looks wrong; or "not sure / route
+  me"). Each branch is a *symptom → likely cause → do-this-now* table that links into the existing
+  in-skill resource for depth, so it **duplicates nothing** and contradicts neither the agent-facing
+  `migration-gotchas.md` nor the credential model in `security-governance.md`. `SKILL.md` gains a
+  migration-scoped `"tableau migration troubleshooting"` frontmatter trigger and a
+  `## Troubleshooting — "I need help"` section that inlines the top-level menu (turn-1, no file read)
+  plus two resource/context-loading table rows; bare "I need help" is honored only once the migration
+  skill is already active, so an unrelated help request never hijacks it. **Fully additive** — docs
+  and wiring only, no code and no report-schema change; the full suite stays green at 2978 passed / 3
+  skipped / 1 xfailed, and the `SKILL.md` frontmatter description stays within Copilot's 1024-char
+  load-time cap (1013 chars).
 - **tableau-migration (skill `1.89.0` → `1.90.0`): Nested formula table-calc chains rebuild as nested
   Power BI Visual Calculations (the Comcast blend/running-sum × weight → RANK case), plus 164 new
   compiler-tier routing tests.** A displayed calc that references *another* calc field
