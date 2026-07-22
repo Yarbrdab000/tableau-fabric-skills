@@ -13,6 +13,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.92.0` → `1.93.0`): Dual-axis lollipop charts now rebuild
+  deterministically as a native `lineClusteredColumnComboChart` — no LLM, no render loop.** Power BI
+  has no lollipop primitive, so a Tableau worksheet that draws the **same** measure twice on a dual
+  axis (a Circle/Shape/Point *head* pane + a Bar *stick* pane against a shared category) is detected at
+  parse time (`_detect_lollipop` + a full-pane `_all_pane_marks` scan) and re-routed to a combo: the one
+  measure is bound to **both** `Y` and `Y2` (the secondary `queryRef` auto-uniquified), then templatized
+  into the proven lollipop look — a marker-only hidden line (`lineStyles`: `strokeShow` off,
+  `showMarker` on, `markerShape` `circle`, `markerSize` `6`), thin columns (`categoryAxis.innerPadding`),
+  a single shared value axis (`valueAxis` `sharedAxis` on / secondary hidden), and the legend off. The
+  stick/dot colour is sourced from the worksheet's own constant mark colour
+  (`<format attr='mark-color'>`, via `_constant_mark_color`) and applied to both `dataPoint.defaultColor`
+  and `lineStyles.markerColor`, falling back to the theme's first data colour when the source set none.
+  **Warn-never-wrong** — gated on a head mark **and** a Bar mark **and** a single measure identity, and
+  evaluated only after the different-measure combo detector, so ordinary bar/line/area charts, a
+  single-pane area worksheet (the leftover `Lolipop (2)` name), a size-encoded Shape strip-plot, and a
+  genuine two-measure dual-scale combo never misfire. Verified end-to-end through the real engine:
+  Microsoft's `powerbi-report-author validate` **succeeded 0/0** (plus `pbir_lint` clean) and an 11-axis
+  structural signature diff against a hand-built reference matched **11/11**. **Additive only** — no
+  report-schema key renamed or removed; **+5** new tests (1 positive with full-object asserts, 4
+  negatives) and the full suite is green at **2999 passed / 3 skipped / 1 xfailed**.
 - **tableau-migration (skill `1.91.0` → `1.92.0`): Validator-clean PBIR output — the deterministic
   emitter now passes Microsoft's `powerbi-report-author validate` with 0 errors / 0 warnings, plus a
   new dependency-free PBIR linter that guards it.** Three coordinated fixes: **(R4)** a colour-legend

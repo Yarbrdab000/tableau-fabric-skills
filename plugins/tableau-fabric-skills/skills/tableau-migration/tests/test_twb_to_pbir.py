@@ -379,6 +379,133 @@ def test_two_measures_same_mark_stay_clustered_not_combo():
     assert w["combo_split"] is None
 
 
+# -- IR + emit: dual-axis lollipop (Bar stick + Circle head, same measure) -----
+def _lollipop_panes(head_mark="Circle", color="#00bceb"):
+    # a dual-axis worksheet with a head pane (Circle/Shape/Point) and a Bar stick pane, both drawing
+    # the SAME measure; the head pane carries the constant mark colour the sticks/dots inherit.
+    color_style = (f"<style><style-rule element='mark'>"
+                   f"<format attr='mark-color' value='{color}' /></style-rule></style>") if color else ""
+    return (
+        "<panes>"
+        "<pane><mark class='Automatic' /></pane>"
+        f"<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'><mark class='{head_mark}' />"
+        f"{color_style}</pane>"
+        "<pane id='2' y-index='1' y-axis-name='[federated.abc].[sum:Sales:qk]'>"
+        "<mark class='Bar' /></pane>"
+        "</panes>")
+
+
+def test_dual_axis_lollipop_same_measure_is_combo_with_marker_line_and_thin_columns():
+    # Tableau lollipop: the SAME measure plotted twice on a dual axis -- a Circle head pane + a Bar
+    # stick pane -- against a shared date. Power BI has no native lollipop, so the faithful build is a
+    # lineClusteredColumnComboChart with that one measure on BOTH Y and Y2: thin columns (the sticks)
+    # via categoryAxis.innerPadding + a marker-only hidden line (the dots) via lineStyles, one shared
+    # scale, legend off. The stick/dot colour is the worksheet's own constant mark colour.
+    ws = _combo_worksheet(
+        "Lolipop",
+        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Sales:qk])",
+        cols="[federated.abc].[mn:Order Date:ok]",
+        panes=_lollipop_panes(), deps_extra=_INST)
+    ir = parse_twb(_workbook(ws))
+    w = ir["worksheets"][0]
+    assert w["visual_type"] == "combo"
+    assert w["lollipop"] is True
+    assert w["lollipop_color"] == "#00bceb"
+    # both wells bind the SAME measure (Y == Y2)
+    assert [f["property"] for f in w["combo_split"]["Y"]] == ["Sales_Amount"]
+    assert [f["property"] for f in w["combo_split"]["Y2"]] == ["Sales_Amount"]
+
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]["visual"]
+    assert vis["visualType"] == "lineClusteredColumnComboChart"
+    state = vis["query"]["queryState"]
+    y = {p["field"]["Aggregation"]["Expression"]["Column"]["Property"]
+         for p in state["Y"]["projections"]}
+    y2 = {p["field"]["Aggregation"]["Expression"]["Column"]["Property"]
+          for p in state["Y2"]["projections"]}
+    assert y == y2 == {"Sales_Amount"}
+    # the marker line + thin columns + shared axis + off legend that make it read as a lollipop
+    objs = vis["objects"]
+    ls = objs["lineStyles"][0]["properties"]
+    assert ls["strokeShow"]["expr"]["Literal"]["Value"] == "false"
+    assert ls["showMarker"]["expr"]["Literal"]["Value"] == "true"
+    assert ls["markerShape"]["expr"]["Literal"]["Value"] == "'circle'"
+    assert ls["markerColor"]["solid"]["color"]["expr"]["Literal"]["Value"] == "'#00bceb'"
+    assert objs["categoryAxis"][0]["properties"]["innerPadding"]["expr"]["Literal"]["Value"] == "60L"
+    va = objs["valueAxis"][0]["properties"]
+    assert va["secShow"]["expr"]["Literal"]["Value"] == "false"
+    assert va["sharedAxis"]["expr"]["Literal"]["Value"] == "true"
+    assert objs["dataPoint"][0]["properties"]["defaultColor"]["solid"]["color"]["expr"]["Literal"]["Value"] == "'#00bceb'"
+    assert objs["legend"][0]["properties"]["show"]["expr"]["Literal"]["Value"] == "false"
+
+
+def test_lollipop_without_constant_mark_colour_omits_datapoint_and_marker_colour():
+    # No <format mark-color> on the worksheet -> the theme's first data colour drives the marks; the
+    # lollipop still fires (combo + marker line + thin columns) but emits no explicit colour objects.
+    ws = _combo_worksheet(
+        "Lolipop No Colour",
+        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Sales:qk])",
+        cols="[federated.abc].[mn:Order Date:ok]",
+        panes=_lollipop_panes(color=None), deps_extra=_INST)
+    ir = parse_twb(_workbook(ws))
+    w = ir["worksheets"][0]
+    assert w["visual_type"] == "combo"
+    assert w["lollipop"] is True
+    assert w["lollipop_color"] is None
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]["visual"]
+    objs = vis["objects"]
+    assert "dataPoint" not in objs
+    assert "markerColor" not in objs["lineStyles"][0]["properties"]
+    # the colour-independent lollipop objects still emit
+    assert objs["lineStyles"][0]["properties"]["showMarker"]["expr"]["Literal"]["Value"] == "true"
+
+
+def test_single_area_pane_is_not_a_lollipop():
+    # "Lolipop (2)" in the wild is a plain single-pane Area chart (leftover name). One pane, no Bar
+    # stick and no Circle head -> stays an areaChart, never a lollipop combo.
+    ws = _worksheet("Lolipop (2)", "Area",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[mn:Order Date:ok]", deps_extra=_INST)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["visual_type"] == "area"
+    assert w["lollipop"] is False
+    assert w["combo_split"] is None
+
+
+def test_dual_scale_combo_different_measures_is_not_a_lollipop():
+    # A genuine dual-scale combo (Sales Bar + Profit Line, DIFFERENT measures) must route via the
+    # combo detector, NOT the lollipop -- the lollipop requires a SINGLE measure identity, so it never
+    # hijacks a real two-measure combo.
+    panes = (
+        "<panes>"
+        "<pane><mark class='Bar' /></pane>"
+        "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'><mark class='Bar' /></pane>"
+        "<pane id='2' y-index='1' y-axis-name='[federated.abc].[sum:Profit:qk]'><mark class='Line' /></pane>"
+        "</panes>")
+    ws = _combo_worksheet(
+        "Dual Scale",
+        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+        cols="[federated.abc].[mn:Order Date:ok]", panes=panes, deps_extra=_INST)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["visual_type"] == "combo"
+    assert w["lollipop"] is False
+    # the real combo split keeps the two DISTINCT measures (Sales on Y, Profit on Y2)
+    assert [f["property"] for f in w["combo_split"]["Y"]] == ["Sales_Amount"]
+    assert [f["property"] for f in w["combo_split"]["Y2"]] == ["Profit"]
+
+
+def test_size_encoded_shape_strip_plot_is_not_a_lollipop():
+    # A size-encoded Shape strip-plot (the Frequency / Area-Squared idiom) has a head-family mark but
+    # NO Bar stick pane -> it must not misfire as a lollipop. (It stays the deterministic default; the
+    # scatter uplift is a separate rule.)
+    enc = "<encodings><size column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    ws = _worksheet("Frequency", "Shape",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[mn:Order Date:ok]", deps_extra=_INST, encodings=enc)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["lollipop"] is False
+    assert w["combo_split"] is None
+
+
 # -- IR: text table & matrix ---------------------------------------------------
 def test_text_mark_one_axis_is_table():
     ws = _worksheet("Detail", "Text",

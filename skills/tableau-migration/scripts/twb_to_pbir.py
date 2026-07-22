@@ -1286,6 +1286,83 @@ def _detect_combo(meas_rows, meas_cols, has_category, mark_by_instance, primary_
     return None, None
 
 
+_LOLLIPOP_HEAD_MARKS = frozenset({"circle", "shape", "point"})
+
+
+def _all_pane_marks(table):
+    """Every mark class present across ALL of a worksheet's panes (lower-cased).
+
+    Unlike :func:`_pane_mark_map` (which indexes only the ``y-axis-name`` panes used for combo
+    splitting and records just the FIRST primary pane), this surfaces EVERY pane's mark -- needed for
+    the lollipop, whose Circle/Shape head can sit on a primary pane that ``_pane_mark_map`` drops.
+    """
+    marks = set()
+    panes_el = _first(table, "panes")
+    if panes_el is None:
+        return marks
+    for pane in _children_local(panes_el, "pane"):
+        mk_el = _first(pane, "mark")
+        cls = mk_el.get("class") if mk_el is not None else None
+        if cls:
+            marks.add(cls.strip().lower())
+    return marks
+
+
+def _constant_mark_color(table):
+    """A worksheet's single constant mark colour -- the ``<format attr='mark-color' value='#hex'/>``
+    on a ``mark`` style-rule (first valid hex in document order) -- lower-cased, or ``None``.
+
+    This is the flat per-mark default that :func:`_parse_mark_colors` deliberately skips (that reader
+    only takes an explicit per-member palette). The lollipop stick/dot colour is sourced from here,
+    falling back to the theme when the worksheet set no constant colour.
+    """
+    if table is None:
+        return None
+    for el in table.iter():
+        if _local(el.tag) != "format":
+            continue
+        if (el.get("attr") or "") != "mark-color":
+            continue
+        v = (el.get("value") or "").strip()
+        if re.fullmatch(r"#[0-9A-Fa-f]{6}", v):
+            return v.lower()
+    return None
+
+
+def _lollipop_measure_key(field):
+    """Stable identity for the lollipop same-measure test: the pill instance token when present
+    (e.g. ``sum:Sales:qk``), else the caption + aggregation + calc flag."""
+    inst = field.get("instance")
+    if inst:
+        return ("inst", inst)
+    return ("cap", field.get("caption"), field.get("derivation") or field.get("agg"),
+            bool(field.get("is_calc")))
+
+
+def _detect_lollipop(table, meas_rows, meas_cols, has_category):
+    """Detect a dual-axis lollipop: a Bar (stick) pane AND a Circle/Shape/Point (head) pane plotting
+    the SAME measure against a shared category.
+
+    Power BI has no native lollipop; the faithful build is a ``lineClusteredColumnComboChart`` with
+    the one measure on BOTH wells -- thin columns (the sticks) on Y and a marker-only hidden line
+    (the dots) on Y2. Returns the shared measure as a one-element list (to bind to both wells) or
+    ``None``. Deliberately conservative -- requires a head mark AND a Bar mark AND a single measure
+    identity across >=2 axes, so ordinary bar/line charts, area overlays (line+area, no bar), and
+    different-measure dual-scale combos never misfire (warn-never-wrong).
+    """
+    if not has_category:
+        return None
+    measures = list(meas_rows) + list(meas_cols)
+    if len(measures) < 2:
+        return None
+    if len({_lollipop_measure_key(f) for f in measures}) != 1:
+        return None
+    marks = _all_pane_marks(table)
+    if (marks & _LOLLIPOP_HEAD_MARKS) and "bar" in marks:
+        return measures[:1]
+    return None
+
+
 _RUNNING_TOTAL_RE = re.compile(r"\.\[cum:")
 
 # Manual-rank table-calc functions that signal a bump/rank chart: the rank/position is computed
@@ -2981,6 +3058,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
 
     fidelity_note = None
     combo_split = None
+    lollipop = False
+    lollipop_color = None
     if uses_mv:
         # Measure Values/Names (M1.0): expand [Measure Values] to its ordered member measures in
         # the value well and route by mark + where the (implicit) Measure Names pill sits. The
@@ -3042,6 +3121,25 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                 fidelity_note = (
                     "dual-axis combo: column measure(s) on the primary axis + line measure(s) "
                     "on the secondary axis -> lineClusteredColumnComboChart")
+
+        # Dual-axis lollipop: a Bar (stick) pane + a Circle/Shape/Point (head) pane plotting the SAME
+        # measure against a shared category. Power BI has no native lollipop, so re-route to a combo --
+        # thin columns (the sticks) on Y + a marker-only hidden line (the dots) on Y2, BOTH wells bound
+        # to the one shared measure. Checked AFTER _detect_combo (which needs DIFFERENT measures split
+        # across mark families, so it never fires on a same-measure lollipop) and gated on the head +
+        # Bar marks + a single measure identity, so ordinary charts and dual-scale combos never
+        # misfire. The stick/dot colour is the worksheet's own constant mark colour (theme fallback).
+        if visual_type in (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA) and combo_split is None:
+            lolli_meas = _detect_lollipop(
+                table, meas_rows, meas_cols, bool(dims_rows or dims_cols))
+            if lolli_meas:
+                visual_type = VT_COMBO
+                combo_split = {"Y": lolli_meas, "Y2": list(lolli_meas)}
+                lollipop = True
+                lollipop_color = _constant_mark_color(table)
+                fidelity_note = (
+                    "dual-axis lollipop (Bar stick + Circle/Shape/Point head, same measure) -> "
+                    "lineClusteredColumnComboChart (thin columns = sticks; marker-only line = heads)")
 
         # Bump / rank chart hack: a manual rank built from an INDEX()/RANK() table calc plotted on
         # an axis (often a doubled dual-axis spacer), with the real ranked measure on a marks-card
@@ -3280,6 +3378,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "swap_controls": swap_controls,
         "fidelity_note": fidelity_note,
         "combo_split": combo_split,
+        "lollipop": lollipop,
+        "lollipop_color": lollipop_color,
         "sort": sort,
     }
 
@@ -5863,12 +5963,45 @@ def _apply_grow_to_fit(visual, pbir_vtype):
     props.setdefault("autoSizeColumnWidth", {"expr": {"Literal": {"Value": "true"}}})
 
 
+def _lollipop_objects(ws):
+    """Faithful lollipop overlay objects for a dual-axis stick+dot worksheet re-routed to a combo.
+
+    Renders a ``lineClusteredColumnComboChart`` as a lollipop: thin columns (the sticks) via a wide
+    ``categoryAxis.innerPadding``; a hidden line with markers on (the dots) via ``lineStyles``; both
+    wells sharing ONE scale (``valueAxis`` sharedAxis on, secondary hidden); the legend off. The
+    stick/dot colour is the worksheet's own constant mark colour when present (``lollipop_color``,
+    read at parse time), else omitted so the theme's first data colour drives it. Property SHAPES are
+    the standard PBIR single-quoted semantic-query literals used throughout ``_visual_json`` (each
+    object name -> ``[{"properties": {...}}]``).
+    """
+    def lit(v):
+        return {"expr": {"Literal": {"Value": v}}}
+    objs = {
+        "categoryAxis": [{"properties": {"innerPadding": lit("60L")}}],
+        "valueAxis": [{"properties": {
+            "secShow": lit("false"), "sharedAxis": lit("true")}}],
+        "lineStyles": [{"properties": {
+            "strokeShow": lit("false"),
+            "showMarker": lit("true"),
+            "markerShape": lit("'circle'"),
+            "markerSize": lit("6D")}}],
+        "legend": [{"properties": {"show": lit("false")}}],
+    }
+    color = ws.get("lollipop_color")
+    if color:
+        fill = {"solid": {"color": {"expr": {"Literal": {
+            "Value": _semantic_string_literal(color)}}}}}
+        objs["dataPoint"] = [{"properties": {"defaultColor": fill}}]
+        objs["lineStyles"][0]["properties"]["markerColor"] = fill
+    return objs
+
+
 def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  filter_config=None, title=None, title_style=None, axis_titles=None,
                  value_objects=None,
                  data_point_objects=None, label_objects=None, legend_objects=None,
                  shape_objects=None, card_label_objects=None, analytics_objects=None,
-                 slicer_mode=None, font_objects=None):
+                 slicer_mode=None, font_objects=None, extra_objects=None):
     visual = {"visualType": vtype}
     if query_state:
         visual["query"] = {"queryState": query_state}
@@ -5990,6 +6123,22 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
         for _fk, _fv in font_objects.items():
             visual.setdefault("objects", {}).setdefault(_fk, [{"properties": {}}])
             visual["objects"][_fk][0]["properties"].update(_fv[0]["properties"])
+    # Faithful-mark overlay objects (Tier-1): a ready ``{object_name: [{"properties": {...}}]}`` block
+    # a specific mark rule pre-built (e.g. the lollipop's categoryAxis/valueAxis/lineStyles/dataPoint/
+    # legend). Merged LAST so it composes with anything an earlier pass added: when the object already
+    # exists (e.g. an axis-title categoryAxis) its ``properties`` are updated in place rather than
+    # clobbered; otherwise the whole entry is set. ``None`` everywhere except the rules that opt in, so
+    # every other visual stays byte-identical.
+    if extra_objects:
+        for _xk, _xv in extra_objects.items():
+            existing = visual.setdefault("objects", {}).get(_xk)
+            if (isinstance(existing, list) and existing
+                    and isinstance(existing[0], dict) and "properties" in existing[0]
+                    and isinstance(_xv, list) and _xv
+                    and isinstance(_xv[0], dict) and "properties" in _xv[0]):
+                existing[0]["properties"].update(_xv[0]["properties"])
+            else:
+                visual["objects"][_xk] = _xv
     # Small-multiples visuals need a newer schema (see SCHEMA_VISUAL_SM): Desktop drops a
     # SmallMultiple role on the legacy 1.0.0 stamp. The bump is gated to exactly those visuals so the
     # verified non-trellis gates keep their proven 1.0.0 stamp.
@@ -6992,6 +7141,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             if ws["visual_type"] == VT_SHAPE_MAP and not data_point_objects:
                 data_point_objects = _shape_map_datapoint_objects()
             analytics_objects = _reference_line_analytics_objects(ws)
+            lollipop_objects = _lollipop_objects(ws) if ws.get("lollipop") else None
             visuals.append(_visual_json(
                 vname, vtype, pos, state,
                 _sort_definition(ws, state, model_table, field_map),
@@ -7002,7 +7152,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 label_objects=label_objects, legend_objects=legend_objects,
                 shape_objects=shape_objects, card_label_objects=card_label_objects,
                 analytics_objects=analytics_objects,
-                font_objects=_grid_font_objects(ws)))
+                font_objects=_grid_font_objects(ws), extra_objects=lollipop_objects))
             rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                     page_display=db["name"] or page_name,
                                     model_table=model_table, field_map=field_map)
@@ -7164,6 +7314,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         if ws["visual_type"] == VT_SHAPE_MAP and not data_point_objects:
             data_point_objects = _shape_map_datapoint_objects()
         analytics_objects = _reference_line_analytics_objects(ws)
+        lollipop_objects = _lollipop_objects(ws) if ws.get("lollipop") else None
         main = _visual_json(
             vname, vtype, pos, state,
             _sort_definition(ws, state, model_table, field_map),
@@ -7174,7 +7325,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             label_objects=label_objects, shape_objects=shape_objects,
             card_label_objects=card_label_objects,
             analytics_objects=analytics_objects,
-            font_objects=_grid_font_objects(ws))
+            font_objects=_grid_font_objects(ws), extra_objects=lollipop_objects)
         rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                 page_display=ws["name"],
                                 model_table=model_table, field_map=field_map)
