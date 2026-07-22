@@ -56,8 +56,8 @@ fixtures, no disk, no network); the live open/deploy is a separate manual pass.
 
 | Tableau mark + shelf layout                         | IR `visual_type` | PBIR `visualType`      | Data roles            |
 | --------------------------------------------------- | ---------------- | ---------------------- | --------------------- |
-| Bar, dimension on **columns**, measure on **rows**  | `column`         | `clusteredColumnChart` (`stackedColumnChart` with a colour-legend dim) | Category / Y / Series |
-| Bar, dimension on **rows**, measure on **columns**  | `bar`            | `clusteredBarChart` (`stackedBarChart` with a colour-legend dim) | Category / Y / Series |
+| Bar, dimension on **columns**, measure on **rows**  | `column`         | `clusteredColumnChart` (stacked = `columnChart` with a colour-legend dim) | Category / Y / Series |
+| Bar, dimension on **rows**, measure on **columns**  | `bar`            | `clusteredBarChart` (stacked = `barChart` with a colour-legend dim) | Category / Y / Series |
 | Line (needs ≥1 measure)                             | `line`           | `lineChart`            | Category / Y / Series / Small multiples |
 | Area (needs ≥1 measure)                             | `area`           | `areaChart`            | Category / Y / Series / Small multiples |
 | Dual-axis combo: a column-family measure + a line-family measure on one shelf | `combo` | `lineClusteredColumnComboChart` | Category / Y (columns) / Y2 (lines) / Series |
@@ -85,10 +85,12 @@ is not continuous and keeps the column/bar default. The field bindings are ident
 the same shelves — only the chart *type* changes. This applies only to the `Automatic` mark: an
 explicit `Bar` mark means the author chose bars and stays a column chart even over a continuous date.
 
-A colour-legend **dimension** on a bar/column mark renders as a **stacked** chart
-(`stackedColumnChart`/`stackedBarChart`) rather than a clustered one, because Tableau stacks marks
-by default when a discrete colour pill is present. Bars without a colour-legend dimension keep the
-clustered variant. (If a workbook explicitly turned off *Stack marks*, review the subtype after
+A colour-legend **dimension** on a bar/column mark renders as a **stacked** chart rather than a
+clustered one, because Tableau stacks marks by default when a discrete colour pill is present. Power
+BI spells the stacked variant as the **unqualified** `columnChart` / `barChart` (the look-alikes
+`stackedColumnChart` / `stackedBarChart` are NOT valid PBIR types and render as a missing custom
+visual). Bars without a colour-legend dimension keep the clustered variant (`clusteredColumnChart` /
+`clusteredBarChart`). (If a workbook explicitly turned off *Stack marks*, review the subtype after
 import — that non-default setting is not read from the shelves.)
 
 A Tableau **dual axis** that overlays two measures with **different mark families** — a
@@ -733,7 +735,7 @@ It holds the same **warn-never-wrong** contract in three layers:
   (several → `multiRowCard`); a geo dimension + measure → `shapeMap` / `map`; a temporal dimension +
   measure → `lineChart` / `areaChart`; one categorical dimension + measure → `clusteredColumnChart` /
   `clusteredBarChart` (+ `pieChart` only when low-cardinality); one dimension + several measures →
-  grouped columns / combo; two dimensions + measure → `pivotTable` / `stackedColumnChart`; two measures
+  grouped columns / combo; two dimensions + measure → `pivotTable` / `columnChart` (stacked); two measures
   → `scatterChart`; and a universal `tableEx` fallback so the result is never empty. Every recommended
   type is in the closed `PBIR_VISUAL_TYPES` vocabulary (mirrors `twb_to_pbir`'s `_VT_TO_PBIR`).
 - **Out-of-band assist (never auto-lands).** `build_advice_bundle` / `advice_prompt` hand the

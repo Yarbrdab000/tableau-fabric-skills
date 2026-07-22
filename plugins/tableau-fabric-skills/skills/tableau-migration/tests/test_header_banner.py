@@ -25,7 +25,7 @@ import twb_to_pbir as R
 from twb_to_pbir import SCHEMA_VISUAL, emit_pbir, parse_twb
 from test_twb_to_pbir import _INST, _visual_parts, _workbook, _worksheet
 
-_DEFAULT_THEME = {"name": "Tableau", "dataColors": list(R._TABLEAU_10 + R._TABLEAU_EXTRA)}
+_DEFAULT_THEME = {"name": R._TABLEAU_THEME_FILE, "dataColors": list(R._TABLEAU_10 + R._TABLEAU_EXTRA)}
 
 
 # -- inline fixture builders ---------------------------------------------------

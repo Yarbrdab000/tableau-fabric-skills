@@ -13,6 +13,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.91.0` → `1.92.0`): Validator-clean PBIR output — the deterministic
+  emitter now passes Microsoft's `powerbi-report-author validate` with 0 errors / 0 warnings, plus a
+  new dependency-free PBIR linter that guards it.** Three coordinated fixes: **(R4)** a colour-legend
+  stacked column/bar now emits Power BI's valid *unqualified* `columnChart` / `barChart` instead of the
+  invalid `stackedColumnChart` / `stackedBarChart` look-alikes (which Power BI renders as a missing
+  custom visual); `viz_advisor`'s vocabulary/spec stop recommending those invalid types. **(R3)** the
+  bundled Tableau theme's internal `name` is aligned to its file name (`TableauPalette.json`) so
+  `report.json`'s `customTheme.name`, the RegisteredResources item `name`/`path`, and the theme file's
+  own `name` all match and end in `.json` — otherwise the theme (and its palette) silently fails to
+  load. **(R2)** new `scripts/pbir_lint.py` — a never-raising, stdlib-only PBIR linter (visual-type
+  validity + theme-name consistency) wired as an always-on pytest guard, mirroring `tmdl_lint` for the
+  model side; the emitter is asserted to lint clean. **Additive only** — no report-schema key renamed or
+  removed. Both oracles now agree 0/0 on a real emitted stacked-column report (our `pbir_lint` clean +
+  Microsoft `validate` succeeded), and the full suite is green at **2994 passed / 3 skipped / 1 xfailed**
+  (+16 new `pbir_lint` tests). Note: the theme's *display name* in Power BI now reads
+  `TableauPalette.json` (cosmetic, valid).
 - **tableau-migration (skill `1.90.0` → `1.91.0`): A user-facing troubleshooting wizard — a guided
   "I need help" menu the agent presents when a migration hits a snag.** New `resources/troubleshooting.md`
   routes a plain-language symptom to a fix across 8 branches (the skill won't load or run; Tableau

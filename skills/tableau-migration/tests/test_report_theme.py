@@ -34,7 +34,7 @@ def test_report_json_part_with_custom_theme_wires_registered_resource():
 
 def test_tableau_theme_dict_leads_with_tableau_10_in_order():
     t = R.tableau_theme_dict()
-    assert t["name"] == "Tableau"
+    assert t["name"] == R._TABLEAU_THEME_FILE
     # positions 1-10 are Tableau 10 EXACTLY -- Tableau's default automatic categorical assignment,
     # so a two-series chart rebuilds blue+orange (never blue+light-blue from a Tableau-20 interleave)
     assert t["dataColors"][:10] == [
@@ -46,7 +46,7 @@ def test_tableau_theme_dict_leads_with_tableau_10_in_order():
 
 def test_tableau_theme_dict_brand_none_is_byte_identical_to_default():
     # additive contract (Lever A): brand=None (and no extra palette) => byte-identical to today's dict
-    default = {"name": "Tableau", "dataColors": list(R._TABLEAU_10 + R._TABLEAU_EXTRA)}
+    default = {"name": R._TABLEAU_THEME_FILE, "dataColors": list(R._TABLEAU_10 + R._TABLEAU_EXTRA)}
     assert R.tableau_theme_dict() == default
     assert R.tableau_theme_dict(brand=None) == default
     assert R.tableau_theme_dict(brand=None, extra_palette=None) == default
