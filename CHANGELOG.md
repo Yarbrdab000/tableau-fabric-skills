@@ -14,15 +14,15 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 - **tableau-migration (skill `1.97.0` → `1.98.0`): Scrubbed customer-identifying benchmark names from
-  the skill sources.** Real customer workbook labels that had been used as benchmark references — an
-  `ATTI/ATTR (Tech) Hierarchy` workbook and a `Comcast` pilot (including a `data.comcast.com` host and
-  `Comcast Test.twb` filenames) — are replaced with neutral placeholders (`Sample Tech Hierarchy`,
-  `Acme Test`, `data.example.com`, "the pilot benchmark"). Purely a rename of labels inside synthetic
-  inline-XML test fixtures, code comments, CHANGELOG prose, and `resources/fidelity-oracle.md`: no
-  customer workbook/extract was ever committed (a repo-wide `*.twb*/*.tds*/*.hyper` search finds none),
-  no production code branches on these strings, and every test keeps identical coverage. No engine,
-  schema, or default-path change; suite stays 3033. Note: prior git history still contains the original
-  names — a history rewrite would be a separate, destructive follow-up if full removal is required.
+  the skill sources.** Real customer labels that had been used as benchmark references — a hierarchy
+  workbook, a telecom pilot workbook, and that customer's host domain and workbook filenames — are
+  replaced with neutral placeholders (`Sample Tech Hierarchy`, `Acme Test`, `data.example.com`, "the
+  pilot benchmark"). Purely a rename of labels inside synthetic inline-XML test fixtures, code comments,
+  CHANGELOG prose, and `resources/fidelity-oracle.md`: no customer workbook/extract was ever committed
+  (a repo-wide `*.twb*/*.tds*/*.hyper` search finds none), no production code branches on these strings,
+  and every test keeps identical coverage. No engine, schema, or default-path change; suite stays 3033.
+  Note: prior git history still contains the original names — a history rewrite would be a separate,
+  destructive follow-up if full removal is required.
 - **tableau-migration (skill `1.96.0` → `1.97.0`): The fidelity oracle now documents the render‑verify
   operating discipline, so a screenshot handed to the SSIM / vision tier is of the *real, refreshed*
   report — not a blank or stale frame scored as if it were correct.** The render‑bridge section
