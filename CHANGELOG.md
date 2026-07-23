@@ -13,6 +13,17 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.98.0` → `1.99.0`): Regression-locked the bar/column category axis so
+  it is never suppressed by default (sf-npo Lesson 3).** On a horizontal `barChart` the category (e.g.
+  service-name) labels live on the `categoryAxis`; a class of bug confuses "hide the axis *title*" with
+  "hide the whole axis" and collapses those labels into an unlabeled "bar cloud". The deterministic
+  emitter is already correct by omission — it writes only the axis-*title* prop (`showAxisTitle`) and
+  never the whole-axis `show` toggle, so Power BI's default (`show=true`) keeps the labels on. Three
+  additive tests now lock that invariant for the exact bar orientation (dimension on rows): a plain
+  horizontal bar renders category labels by default, a visible category-axis title emits only
+  `showAxisTitle:true` (never a `show` toggle), and blanking the category-axis title emits
+  `showAxisTitle:false` while still never setting `show`. Tests-only; no engine, schema, or
+  default-path change. Suite 3033 → 3036.
 - **tableau-migration (skill `1.97.0` → `1.98.0`): Scrubbed customer-identifying benchmark names from
   the skill sources.** Real customer labels that had been used as benchmark references — a hierarchy
   workbook, a telecom pilot workbook, and that customer's host domain and workbook filenames — are
