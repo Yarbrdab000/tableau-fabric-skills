@@ -13,6 +13,16 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.95.0` → `1.96.0`): The runbook's opening information-collection span
+  is now locked by a regression guard, so the very first steps of a run stay repeatable and can't
+  silently drift.** The existing runbook guard pinned the assisted tiers and the mechanical-span
+  narration cap but left the *front matter* — Gate Rules 1–6, the Phase 0A Decision Menu (D1–D6), and
+  the Phase 0C confirmation ledger — unguarded, so nothing prevented a future edit from eroding the
+  anchors that keep the opening of every migration identical (present the menu verbatim before any
+  tool call, infer no defaults, gate external work on `GO`, never scavenge the filesystem for the
+  input). A new `tests/test_runbook_infocollection_guard.py` asserts those semantic anchors
+  (whitespace-tolerant, no engine imports), locking the info-collection steps against variance.
+  Test-only and additive — no `SKILL.md` prose changed. Baseline suite 3018 → 3028 (ten new tests).
 - **tableau-migration (skill `1.94.0` → `1.95.0`): Two fields with the same column name in one
   visual no longer collide into an "Error fetching data" — each projection now gets a unique
   `nativeQueryRef`.** When a visual drew two category (or value) fields whose native names matched
