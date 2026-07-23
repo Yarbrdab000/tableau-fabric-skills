@@ -304,7 +304,7 @@ _DATE_PARTS = {
 # rendered as discrete members -- so a filter / axis on it is faithfully a normal date slicer / axis,
 # and a display-format choice like MDY must never drop the field. (Day-grain-or-finer loses no grain;
 # a coarser year/month exact date stays fail-closed -> honest warn+skip until verified against a real
-# artifact.) Verified against the real ATTI/ATTR Hierarchy workbook, whose FiscalMonth filter card
+# artifact.) Verified against the real Sample Hierarchy workbook, whose FiscalMonth filter card
 # carries derivation "MDY" and is otherwise an ordinary date column.
 _DATE_EXACT_DERIVATIONS = frozenset({"MDY", "MDYH", "MDYHM", "MDYHMS"})
 
@@ -7650,9 +7650,9 @@ def _reflow_worksheets_below_slicers(visuals, page_h, *, gap=8.0, tol=1.0):
     reflows the sheets UP to fill the freed space, so the authored zone coords put the sheets where the
     filters would be. We choose to SHOW those filters as slicers (Power BI has no collapse toggle), which
     reintroduces the band -- so a sheet authored at the hidden-state position now overlaps the slicers
-    (the ATTI card at y=241 under a filter band at y~211-320). This mirrors what Tableau itself does the
+    (the Sample card at y=241 under a filter band at y~211-320). This mirrors what Tableau itself does the
     moment you click "Show Filters": the sheet stack is pushed BELOW the band and compressed to fit the
-    remaining canvas (ATTI -> y~351, h~285). We reflow the ``z==0`` worksheet visuals into
+    remaining canvas (Sample -> y~351, h~285). We reflow the ``z==0`` worksheet visuals into
     ``[band_bottom+gap, page_h]`` proportionally, keeping their relative layout.
 
     Guard: only fires when a worksheet visual actually intersects the slicer band -- a dashboard whose

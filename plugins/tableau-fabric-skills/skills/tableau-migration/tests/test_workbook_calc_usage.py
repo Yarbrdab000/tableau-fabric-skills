@@ -39,7 +39,7 @@ def _workbook(*worksheets):
 
 # -- formatting (colour-string) calc -> native rule ----------------------------
 def test_grey_red_colour_calc_is_formatting_with_native_rule():
-    # The Comcast "Difference coloring" pattern: a calc that only emits a colour token, used solely
+    # The Acme "Difference coloring" pattern: a calc that only emits a colour token, used solely
     # on the colour shelf -> a native rules-based conditional format (no DAX), with the threshold
     # rule recovered and the input measure named.
     deps = (_calc_col("Pct", "Percent Difference", "SUM([Profit])")

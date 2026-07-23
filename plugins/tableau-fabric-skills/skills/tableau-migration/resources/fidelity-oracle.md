@@ -62,7 +62,7 @@ geometry→map). Under an `Automatic` mark it applies Tableau's own defaults *co
 — is asserted as a **line**, while ambiguous dim+measure shapes stay an *unasserted* bar that earns
 partial credit rather than punishing a plausible rebuild. The continuous/discrete distinction comes
 from the pill **typekey** (`qk` continuous vs `ok`/`nk` discrete), so the *same* `tdy` derivation is a
-line on a continuous axis but a matrix/table axis when discrete (the real Comcast `Line chart` vs
+line on a continuous axis but a matrix/table axis when discrete (the real Acme `Line chart` vs
 `Segment % Dod`).
 
 **Aggregate** = mean per‑visual score × coverage (the fraction of source worksheets that found a
@@ -84,7 +84,7 @@ diffed **edge‑by‑edge** against the emitted PBIR visual's own canvas px:
 
 Because the deterministic engine derives placement from the *same* Tableau zones, a faithful rebuild
 lands **pixel‑exact**: on both calibration cases every visual reports `max_edge_px ≈ 0.00` / IoU
-`1.000` (SIMPLE `Sheet 1–4`, COMCAST `Line chart`/`Segment % Dod`/`Line chart (2)`/`(3)`). This is
+`1.000` (SIMPLE `Sheet 1–4`, ACME `Line chart`/`Segment % Dod`/`Line chart (2)`/`(3)`). This is
 the layout proof — established purely from the `.twb` zone geometry and the PBIR spec, with the PBI
 side **always the spec, never a screenshot**. (Pixel rasterization of a `.pbip` requires Power BI
 Desktop or the Service and would only ever speak to *styling* — colors/marks as drawn — which is the
@@ -151,7 +151,7 @@ In‑process, pass `field_aliases={...}` (or `aliases_from_candidate_records(rec
 `score_report` / `run_oracle`. It is **optional and off by default**, never re‑runs the engine, and
 no‑ops cleanly on builds whose records predate the producer. The report adds a
 `summary.fields_alias_resolved` count, an advisory note, and a markdown line; the original emitted
-name is preserved per field as `norm_emitted`. Measured on the real Comcast rebuild, resolving just
+name is preserved per field as `norm_emitted`. Measured on the real Acme rebuild, resolving just
 `Date.Date → Order Date` lifts the aggregate **0.40 → 0.55** (every visual improves); the residual
 is then source‑side (a dropped implicit `COUNT`), not the rename.
 

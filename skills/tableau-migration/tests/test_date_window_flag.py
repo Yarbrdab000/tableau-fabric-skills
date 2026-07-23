@@ -12,7 +12,7 @@ from date_window_flag import (  # noqa: E402
 )
 
 
-# ---- pilot ground truth (from Comcast Test.twbx) -------------------------------------------
+# ---- pilot ground truth (from Acme Test.twbx) -------------------------------------------
 PILOT_FORMULA = (
     "case [Parameters].[Parameter 0014172370878491] \n"
     "when 15 then [Calculation_0014172370616346] <= 15 \n"

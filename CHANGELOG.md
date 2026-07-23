@@ -13,6 +13,16 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.97.0` → `1.98.0`): Scrubbed customer-identifying benchmark names from
+  the skill sources.** Real customer workbook labels that had been used as benchmark references — an
+  `ATTI/ATTR (Tech) Hierarchy` workbook and a `Comcast` pilot (including a `data.comcast.com` host and
+  `Comcast Test.twb` filenames) — are replaced with neutral placeholders (`Sample Tech Hierarchy`,
+  `Acme Test`, `data.example.com`, "the pilot benchmark"). Purely a rename of labels inside synthetic
+  inline-XML test fixtures, code comments, CHANGELOG prose, and `resources/fidelity-oracle.md`: no
+  customer workbook/extract was ever committed (a repo-wide `*.twb*/*.tds*/*.hyper` search finds none),
+  no production code branches on these strings, and every test keeps identical coverage. No engine,
+  schema, or default-path change; suite stays 3033. Note: prior git history still contains the original
+  names — a history rewrite would be a separate, destructive follow-up if full removal is required.
 - **tableau-migration (skill `1.96.0` → `1.97.0`): The fidelity oracle now documents the render‑verify
   operating discipline, so a screenshot handed to the SSIM / vision tier is of the *real, refreshed*
   report — not a blank or stale frame scored as if it were correct.** The render‑bridge section
@@ -116,7 +126,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   skipped / 1 xfailed, and the `SKILL.md` frontmatter description stays within Copilot's 1024-char
   load-time cap (1013 chars).
 - **tableau-migration (skill `1.89.0` → `1.90.0`): Nested formula table-calc chains rebuild as nested
-  Power BI Visual Calculations (the Comcast blend/running-sum × weight → RANK case), plus 164 new
+  Power BI Visual Calculations (the Acme blend/running-sum × weight → RANK case), plus 164 new
   compiler-tier routing tests.** A displayed calc that references *another* calc field
   (`Rank = RANK([composit])` over `composit = RUNNING_SUM(SUM([Sales]))*.15 + RUNNING_SUM(SUM([Quantity]))*15`)
   now rebuilds as a hidden base-measure + hidden inner Visual Calculation + shown outer Visual Calculation,
@@ -713,7 +723,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   auto-size — the report rebuilder now captures EVERY dashboard `type='text'` zone (not just the top
   title banner) and rebuilds each as its own PBIR `textbox`, and rebuilt matrices actually grow their
   columns to fit. Additive and fail-closed — a banner-only dashboard stays byte-identical.** Verified
-  against the real `New Comcast Test` / `ATTI/ATTR Hierarchy` workbooks:
+  against the real `New Acme Test` / `Sample Hierarchy` workbooks:
   - **Every dashboard text zone rebuilt as its own textbox.** `_parse_dashboard` now additively
     captures each content-bearing `type='text'` zone — the section-header caption bars (Director /
     Manager / Supervisor / Technician over each matrix) and the fill-less instruction / metric lines a
@@ -737,7 +747,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   the report rebuilder now carries a worksheet's typed fonts, cell/container shading, faithful slicer
   sizing, and each dashboard's real pixel canvas onto the rebuilt PBIR report. Additive and fail-closed —
   byte-identical on any surface that records no font/fill/geometry override.** Verified against the real
-  `ATTI/ATTR Hierarchy` workbook:
+  `Sample Hierarchy` workbook:
   - **Typed fonts from the worksheet `<style>`.** New `_parse_style_font` / `_resolve_element_font`
     resolve a per-element (title / header / pane / cell) font face, size, colour, and bold/italic from the
     Tableau worksheet style, and `_grid_font_objects` / `_title_style_props` stamp them onto the emitted
@@ -785,7 +795,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   to a single card and dropping the axes — and keep a field-parameter axis (a Tableau field-swap like
   `Choose Date`) bound to its own picker table instead of dangling on the fact. Additive and fail-closed —
   byte-identical on any workbook without calc-dimension axes.** Verified against the real
-  `ATTI/ATTR Hierarchy` workbook:
+  `Sample Hierarchy` workbook:
   - **Calc-dimension crosstab stays a matrix.** `twb_to_pbir._resolve_field` now detects a calculated field
     used as a discrete axis dimension (`calc_is_axis`) and binds it to a real model column in the category
     well, so `_visual_type` keeps both axes and emits a `matrix`. Previously every calc pill was forced into
@@ -805,7 +815,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   faithful Power BI slicers — every filter card at its authored position and show mode, row-level dimension
   calcs kept as sliceable columns, and a discrete exact-date display format bound as an ordinary date.
   Additive and fail-closed — byte-identical on any surface without dashboard filter cards.** Three fixes to
-  `twb_to_pbir.py`, verified against the real `ATTI/ATTR Hierarchy` workbook:
+  `twb_to_pbir.py`, verified against the real `Sample Hierarchy` workbook:
   - **Filter band, not a truncated stack.** `_parse_dashboard` now retains each `<zone type-v2='filter'>`
     card's real geometry and Tableau show `mode`, and `_emit_dashboard_slicers` places one deduped slicer per
     card at its own `_scale_zone`-scaled grid position with the mapped show mode

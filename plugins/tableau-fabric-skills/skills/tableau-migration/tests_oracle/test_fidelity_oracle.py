@@ -384,7 +384,7 @@ def test_infer_family_card_when_no_dims():
 
 def test_infer_family_square_is_highlight_table_matrix():
     # A Tableau Square mark with axis dimensions is a highlight table -> Power BI matrix (the real
-    # Comcast "Segment % Dod" case): it must NOT misinfer as an unasserted bar.
+    # Acme "Segment % Dod" case): it must NOT misinfer as an unasserted bar.
     fam, asserted = fo._infer_twb_family(
         "Square", [{"norm": "segment"}], [{"norm": "pct"}], False, False)
     assert fam == fo.FAM_MATRIX and asserted is True
@@ -412,7 +412,7 @@ def test_parse_pill_captures_continuous_flag():
 
 def test_infer_family_continuous_date_automatic_is_line():
     # Automatic mark over a continuous (green) date axis is Tableau's default line chart (the real
-    # Comcast "Line chart" anchor: tdy:Order Date:qk). It must assert FAM_LINE, not an unasserted bar.
+    # Acme "Line chart" anchor: tdy:Order Date:qk). It must assert FAM_LINE, not an unasserted bar.
     date_dim = {"norm": "orderdate", "deriv": "tdy", "is_measure": False, "continuous": True}
     fam, asserted = fo._infer_twb_family(
         "Automatic", [date_dim], [{"norm": "stdev"}], False, False)
@@ -424,7 +424,7 @@ def test_infer_family_continuous_date_automatic_is_line():
 
 def test_infer_family_discrete_date_automatic_is_not_line():
     # A discrete (ordinal) date axis under an Automatic mark is NOT a line -- it falls back to the
-    # conservative unasserted bar (the Comcast "Segment % Dod" date is tdy:...:ok = discrete).
+    # conservative unasserted bar (the Acme "Segment % Dod" date is tdy:...:ok = discrete).
     disc_date = {"norm": "orderdate", "deriv": "tdy", "is_measure": False, "continuous": False}
     fam, asserted = fo._infer_twb_family(
         "Automatic", [disc_date], [{"norm": "pct"}], False, False)
@@ -432,7 +432,7 @@ def test_infer_family_discrete_date_automatic_is_not_line():
 
 
 def test_infer_family_text_mark_continuous_date_stays_table():
-    # An explicit Text mark wins over the continuous date: Comcast "Line chart (2)/(3)" carry a
+    # An explicit Text mark wins over the continuous date: Acme "Line chart (2)/(3)" carry a
     # continuous date (tdy:...:qk) but a Text mark, so they are tables -- NOT lines.
     date_dim = {"norm": "orderdate", "deriv": "tdy", "is_measure": False, "continuous": True}
     fam, asserted = fo._infer_twb_family(

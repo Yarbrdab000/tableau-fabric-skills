@@ -17,14 +17,14 @@ import pytest
 import assemble_model as A
 
 
-# An extract-backed datasource over an UNMAPPED connector (generic ODBC, like Comcast's MinIO feed
+# An extract-backed datasource over an UNMAPPED connector (generic ODBC, like Acme's MinIO feed
 # reached via ODBC). One snapshot table + a measure calc. The <extract> marks it extract-enabled.
 PENDING_TDS = """<?xml version='1.0' encoding='utf-8' ?>
 <datasource formatted-name='Pending Truck Rolls' inline='true' version='18.1'>
   <connection class='federated'>
     <named-connections>
       <named-connection caption='minio' name='odbc.cc11'>
-        <connection class='genericodbc' dbname='dx' server='data.comcast.com' />
+        <connection class='genericodbc' dbname='dx' server='data.example.com' />
       </named-connection>
     </named-connections>
     <relation connection='odbc.cc11' name='PendingJobSnapshot'
@@ -106,7 +106,7 @@ PARAM_LOCAL_TDS = """<?xml version='1.0' encoding='utf-8' ?>
   <connection class='federated'>
     <named-connections>
       <named-connection caption='minio' name='odbc.cc11'>
-        <connection class='genericodbc' dbname='dx' server='data.comcast.com' />
+        <connection class='genericodbc' dbname='dx' server='data.example.com' />
       </named-connection>
     </named-connections>
     <relation connection='odbc.cc11' name='Orders' table='[dx].[Orders]' type='table' />
@@ -379,7 +379,7 @@ PHANTOM_DUP_TDS = """<?xml version='1.0' encoding='utf-8' ?>
   <connection class='federated'>
     <named-connections>
       <named-connection caption='minio' name='odbc.cc11'>
-        <connection class='genericodbc' dbname='dx' server='data.comcast.com' />
+        <connection class='genericodbc' dbname='dx' server='data.example.com' />
       </named-connection>
     </named-connections>
     <relation connection='odbc.cc11' name='Snap' table='[dx].[Snap]' type='table' />
@@ -413,7 +413,7 @@ ALIAS_TDS = """<?xml version='1.0' encoding='utf-8' ?>
   <connection class='federated'>
     <named-connections>
       <named-connection caption='minio' name='odbc.cc11'>
-        <connection class='genericodbc' dbname='dx' server='data.comcast.com' />
+        <connection class='genericodbc' dbname='dx' server='data.example.com' />
       </named-connection>
     </named-connections>
     <relation connection='odbc.cc11' name='Team' table='[dx].[Team]' type='table' />
