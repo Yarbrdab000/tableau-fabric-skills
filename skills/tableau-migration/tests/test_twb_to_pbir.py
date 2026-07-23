@@ -4128,6 +4128,56 @@ def test_non_cartesian_visual_ignores_axis_titles():
     assert "categoryAxis" not in objects and "valueAxis" not in objects
 
 
+# -- sf-npo Lesson 3 regression lock: a bar/column category axis is never suppressed ----------------
+# The lesson: on a horizontal barChart the service-name labels live on the CATEGORY axis. A bug that
+# confused "hide the axis TITLE" with "hide the whole axis" set categoryAxis.show=false and produced an
+# unlabeled "bar cloud". Rule: the emitter emits ONLY axis-TITLE props (showAxisTitle) and NEVER the
+# whole-axis `show` toggle, so Power BI's default (show=true) keeps the category labels on. These lock
+# that invariant for the exact bar orientation (dimension on ROWS) the lesson came from.
+def test_horizontal_bar_renders_category_labels_by_default():
+    # No axis override: a horizontal barChart must not suppress its category axis. The emitter writes
+    # no categoryAxis.show toggle at all -> defaults to visible; in particular, never show:false.
+    ws = _worksheet("Service Bars", "Bar",
+                    rows="[federated.abc].[none:Category:nk]",   # dimension on ROWS -> horizontal bar
+                    cols="[federated.abc].[sum:Sales:qk]",
+                    deps_extra=_INST)
+    res = migrate_twb_to_pbir(_workbook(ws))
+    assert res["ir"]["worksheets"][0]["visual_type"] == "bar"
+    cat = (_axis_objects_of(res).get("categoryAxis") or [{}])[0].get("properties", {})
+    assert "show" not in cat
+
+
+def test_horizontal_bar_category_axis_object_never_carries_show_toggle():
+    # Even when a categoryAxis object DOES exist (author set a visible category-axis title), it carries
+    # only the title props -- showAxisTitle:true + titleText -- and no whole-axis show toggle.
+    style = _axis_style("<format attr='title' scope='rows' "
+                        "field='[federated.abc].[none:Category:nk]' value='Service' />")
+    ws = _worksheet("Service Bars", "Bar",
+                    rows="[federated.abc].[none:Category:nk]",
+                    cols="[federated.abc].[sum:Sales:qk]",
+                    deps_extra=_INST, style=style)
+    res = migrate_twb_to_pbir(_workbook(ws), dataset_name="M", report_name="R")
+    cat = _axis_objects_of(res)["categoryAxis"][0]["properties"]
+    assert cat["showAxisTitle"]["expr"]["Literal"]["Value"] == "true"
+    assert "show" not in cat
+
+
+def test_horizontal_bar_blanked_category_title_keeps_category_axis_visible():
+    # The exact L3 confusion, locked for the bar orientation: blanking the category-axis TITLE (value='')
+    # emits showAxisTitle:false but must NEVER set the whole-axis `show` -- the service-name labels stay.
+    style = _axis_style("<format attr='title' scope='rows' "
+                        "field='[federated.abc].[none:Category:nk]' value='' />")
+    ws = _worksheet("Service Bars", "Bar",
+                    rows="[federated.abc].[none:Category:nk]",
+                    cols="[federated.abc].[sum:Sales:qk]",
+                    deps_extra=_INST, style=style)
+    res = migrate_twb_to_pbir(_workbook(ws), dataset_name="M", report_name="R")
+    assert res["ir"]["worksheets"][0]["visual_type"] == "bar"
+    cat = _axis_objects_of(res)["categoryAxis"][0]["properties"]
+    assert cat["showAxisTitle"]["expr"]["Literal"]["Value"] == "false"
+    assert "show" not in cat
+
+
 def _ref_line(value_column, formula="average", label="", label_type="none"):
     lbl = f"label='{label}' " if label else ""
     return (f"<reference-line {lbl}label-type='{label_type}' formula='{formula}' "
