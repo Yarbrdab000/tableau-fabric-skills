@@ -13,6 +13,18 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.93.0` → `1.94.0`): KPI cards now pin their value to display-units
+  None so big numbers are never abbreviated (2,747 stays `2,747`, not `3K`).** Power BI `card` /
+  `multiRowCard` visuals default `labelDisplayUnits` to Auto (`0`), which silently abbreviates the
+  value — a low-fidelity surprise for exact figures. The emitter now forces
+  `dataLabels.labelDisplayUnits` to the None enum (emitted as the Double literal `"1D"`) on every
+  emitted card-family visual (`_apply_card_display_units` in `twb_to_pbir.py`), merged **alongside**
+  any author-recoloured value colour / fontSize via `setdefault` so it never clobbers existing
+  formatting. A plain card gains only the display-units pin (no colour / categoryLabels). A new
+  `pbir_lint` **R5** guard (`_lint_card_display_units`) flags any emitted card whose value
+  `labelDisplayUnits` is missing or Auto, so a future regression is caught rather than silently
+  shipped. Additive-only; scoped to the card family (bar / column / matrix visuals are untouched).
+  Sourced from the sf-npo benchmark (Lesson 1). Baseline suite 3004 → 3008 (four new card tests).
 - **tableau-migration (skill `1.92.0` → `1.93.0`): Dual-axis lollipop charts now rebuild
   deterministically as a native `lineClusteredColumnComboChart` — no LLM, no render loop.** Power BI
   has no lollipop primitive, so a Tableau worksheet that draws the **same** measure twice on a dual

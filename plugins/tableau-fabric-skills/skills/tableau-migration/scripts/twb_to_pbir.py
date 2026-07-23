@@ -5701,6 +5701,29 @@ def _card_label_objects(ws, vtype):
     return out or None
 
 
+# Card value display units (fidelity): a Power BI ``card`` / ``multiRowCard`` defaults its big-number
+# ``labelDisplayUnits`` to Auto (0), which ABBREVIATES (2,747 -> "3K") and breaks fidelity vs the
+# Tableau text / BAN mark, which shows the value in full. Setting it to Auto (0) does NOT disable the
+# abbreviation -- "None" is the display-units enum value 1, emitted as the Double literal ``1D``. We
+# force None on every rebuilt card so the big number reads in full. The property lives on the SAME
+# value object the card family already uses for its colour / size (``dataLabels``); merge-safe via
+# ``setdefault`` so an author-recoloured value keeps its properties and only gains the display units.
+def _apply_card_display_units(visual, vtype):
+    """Force ``dataLabels.labelDisplayUnits = None`` (``1D``) on a rebuilt card / multiRowCard.
+
+    A no-op for every non-card visual type. Never clobbers an existing ``dataLabels`` value object
+    (author colour / font size); it only adds the display-units property when absent.
+    """
+    if vtype not in _CARD_LABEL_COLOR_TYPES:
+        return
+    objs = visual.setdefault("objects", {})
+    data_labels = objs.setdefault("dataLabels", [{"properties": {}}])
+    if not data_labels:
+        data_labels.append({"properties": {}})
+    props = data_labels[0].setdefault("properties", {})
+    props.setdefault("labelDisplayUnits", {"expr": {"Literal": {"Value": "1D"}}})
+
+
 # Data labels (Tableau "Show Mark Labels") -> the PBIR data-plane ``visual.objects.labels`` ``show``
 # property, applied uniformly (the Power BI formatting reference lists ``labels`` as a visual-wide
 # object). The high-value, always-faithful case is turning labels ON to match a Tableau view that
@@ -6055,6 +6078,10 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     if card_label_objects:
         for _ck, _cv in card_label_objects.items():
             visual.setdefault("objects", {})[_ck] = _cv
+    # Card value display units (fidelity): force the big-number display units to None so a card /
+    # multiRowCard shows the value in full (2,747) instead of Power BI's abbreviating Auto ("3K").
+    # A no-op for every non-card visual (see ``_apply_card_display_units``).
+    _apply_card_display_units(visual, vtype)
     # Analytics overlays (Tier-2, lifted for value-axis charts): the data-plane
     # ``visual.objects.y1AxisReferenceLine`` list -- one ``{properties, selector:{id}}`` element per
     # faithfully-rebuilt CONSTANT reference line. Object name, ``selectors:{id}`` envelope, and the

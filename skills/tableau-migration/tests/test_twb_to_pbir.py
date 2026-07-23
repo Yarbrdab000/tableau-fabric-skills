@@ -5560,11 +5560,14 @@ def test_card_label_colours_emit_category_and_data_label_objects():
     assert cat == "'{0}'".format(_SALES_HEX)
     assert val == "'{0}'".format(_PROFIT_HEX)
     assert size == "14D"
+    # Card display units (fidelity): the value object also pins labelDisplayUnits to None ('1D') so
+    # the recoloured big number is not abbreviated -- merged alongside the colour, never clobbering it.
+    assert objs["dataLabels"][0]["properties"]["labelDisplayUnits"]["expr"]["Literal"]["Value"] == "1D"
 
 
-def test_card_without_recoloured_label_emits_no_label_objects():
-    # Additivity: a plain KPI card (no customized-label) carries neither card_label_colors nor the
-    # categoryLabels / dataLabels objects.
+def test_card_without_recoloured_label_pins_display_units_none():
+    # A plain KPI card (no customized-label) carries no card_label_colors and no categoryLabels; its
+    # value object exists only to pin labelDisplayUnits to None ('1D') -- no colour / fontSize added.
     ws = _worksheet("Plain KPIs", "Bar",
                     rows="[federated.abc].[sum:Sales:qk]",
                     cols="[federated.abc].[sum:Profit:qk]",
@@ -5573,7 +5576,32 @@ def test_card_without_recoloured_label_emits_no_label_objects():
     assert ir["worksheets"][0]["card_label_colors"] is None
     vj = list(_visual_parts(emit_pbir(ir)).values())[0]
     objs = vj["visual"].get("objects", {})
-    assert "categoryLabels" not in objs and "dataLabels" not in objs
+    assert "categoryLabels" not in objs
+    props = objs["dataLabels"][0]["properties"]
+    assert props["labelDisplayUnits"]["expr"]["Literal"]["Value"] == "1D"
+    assert "color" not in props and "fontSize" not in props
+
+
+def test_single_measure_card_pins_display_units_none():
+    # A single measure with no dimension -> a "card" (not multiRowCard); it too pins None display units.
+    ws = _worksheet("One KPI", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]", cols="", deps_extra=_INST)
+    vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
+    assert vj["visual"]["visualType"] == "card"
+    objs = vj["visual"]["objects"]
+    assert objs["dataLabels"][0]["properties"]["labelDisplayUnits"]["expr"]["Literal"]["Value"] == "1D"
+
+
+def test_non_card_visual_gets_no_card_display_units():
+    # Additivity: display-units pinning is scoped to the card family; a bar/column visual with a real
+    # dimension never gains a dataLabels.labelDisplayUnits property.
+    ws = _worksheet("Sales by Cat", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
+    assert vj["visual"]["visualType"] not in ("card", "multiRowCard")
+    for entry in vj["visual"].get("objects", {}).get("dataLabels", []):
+        assert "labelDisplayUnits" not in entry.get("properties", {})
 
 
 # -- data labels (Tableau "Show Mark Labels" toggle) ---------------------------
