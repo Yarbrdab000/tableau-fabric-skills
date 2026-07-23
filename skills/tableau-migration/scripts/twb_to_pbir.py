@@ -288,6 +288,10 @@ _AGG_FUNC = {
 }
 # Aggregations restricted to numeric source columns (others -> warn + skip).
 _NUMERIC_AGGS = {"Sum", "Avg", "Average", "Median"}
+# sf-npo Lesson 8: aggregations that collapse a symbol map's bubble sizes toward uniformity. Sizing
+# bubbles by an AVERAGE gives every location a near-identical radius (each place averages to a similar
+# value), so the map reads as undifferentiated dots -- a count/sum measure is what makes it legible.
+_AVERAGE_AGGS = {"Avg", "Average"}
 _NUMERIC_TYPES = {"integer", "real", "decimal", "double"}
 _DATE_TYPES = {"date", "datetime"}
 _DATE_PARTS = {
@@ -4538,6 +4542,19 @@ def _build_query_state(ws, model_table, field_map, warnings):
         if size_sel:
             state["Size"] = {"projections": _role_projections(
                 size_sel, model_table, field_map, used_refs)}
+            # sf-npo Lesson 8: keep the author's Size measure (faithful) but flag when an AVERAGE
+            # drives bubble size -- it renders near-uniform radii, so the symbol map reads as
+            # undifferentiated dots. The caveat nudges toward a count/sum measure on Size.
+            _size_meas = size_sel[0]
+            if _size_meas.get("aggregation") in _AVERAGE_AGGS:
+                _size_label = (_size_meas.get("caption")
+                               or _size_meas.get("property") or "the Size measure")
+                warnings.append(_warn(
+                    "worksheet", ws["name"],
+                    f"symbol map sizes its bubbles by an average "
+                    f"('{_size_meas['aggregation']}' of '{_size_label}'); an average produces "
+                    f"near-uniform bubble radii -- prefer a count or sum measure on Size so the "
+                    f"bubbles are differentiable"))
         if color_sel:
             state["Gradient"] = {"projections": _role_projections(
                 color_sel, model_table, field_map, used_refs)}

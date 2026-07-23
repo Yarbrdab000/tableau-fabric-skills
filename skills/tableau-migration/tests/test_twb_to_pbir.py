@@ -2954,6 +2954,49 @@ def test_symbol_map_categorical_color_binds_series_legend():
     assert "Gradient" not in state
 
 
+# -- sf-npo Lesson 8: symbol-map bubble-size legibility caveat ----------------------------------
+_CI_AVG_SALES = ("<column-instance column='[Sales]' derivation='Avg' "
+                 "name='[avg:Sales:qk]' pivot='key' type='quantitative' />")
+
+
+def test_symbol_map_average_size_measure_emits_bubble_legibility_caveat():
+    # sf-npo Lesson 8: a symbol map whose bubble Size is an AVERAGE renders near-uniform radii --
+    # undifferentiated dots. The author's measure is kept (faithful: it still binds Size), but a
+    # caveat flags it so the migrator can suggest a count/sum measure for legible bubbles.
+    enc = ("<encodings>"
+           "<size column='[federated.abc].[avg:Sales:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    ws = _worksheet("Bubble Map", "Circle", encodings=enc,
+                    rows="[federated.abc].[Latitude (generated)]",
+                    cols="[federated.abc].[Longitude (generated)]",
+                    deps_extra=_INST + _CI_AVG_SALES)
+    res = migrate_twb_to_pbir(_workbook(ws))
+    assert res["ir"]["worksheets"][0]["visual_type"] == "map"
+    # faithful: the average measure still binds the Size role (Aggregation Function 1 == Avg)
+    state = _query_state(list(_visual_parts(res["parts"]).values())[0])
+    assert state["Size"]["projections"][0]["field"]["Aggregation"]["Function"] == 1
+    caveats = [w for w in res["warnings"]
+               if w["name"] == "Bubble Map" and "differentiable" in w["reason"]]
+    assert len(caveats) == 1
+    assert "average" in caveats[0]["reason"]
+
+
+def test_symbol_map_sum_size_measure_emits_no_size_caveat():
+    # Control: a sum-sized symbol map produces differentiable bubbles, so no legibility caveat.
+    enc = ("<encodings>"
+           "<size column='[federated.abc].[sum:Sales:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    ws = _worksheet("Bubble Map", "Circle", encodings=enc,
+                    rows="[federated.abc].[Latitude (generated)]",
+                    cols="[federated.abc].[Longitude (generated)]",
+                    deps_extra=_INST)
+    res = migrate_twb_to_pbir(_workbook(ws))
+    assert res["ir"]["worksheets"][0]["visual_type"] == "map"
+    assert not any("differentiable" in w["reason"] for w in res["warnings"])
+
+
 def test_geo_dimension_on_axis_is_not_a_map():
     # State on a column AXIS (not Detail) with a measure -> an ordinary bar/column chart, not
     # a map. This is the anti-hijack guard: a geographic dimension alone must not force a map.

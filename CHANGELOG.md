@@ -13,6 +13,15 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.99.0` → `2.0.0`): A symbol (bubble) map sized by an average now
+  raises a legibility caveat (sf-npo Lesson 8).** On an azureMap/symbol map the bubble radius encodes
+  the Size measure; sizing by an AVERAGE gives every location a near-identical radius (each place
+  averages to a similar value), collapsing the map into undifferentiated dots — the map equivalent of
+  an unlabeled chart. The migrator stays faithful (it keeps the author's measure bound to Size and
+  changes no binding), but now emits a per-worksheet caveat naming the measure and recommending a
+  count or sum measure on Size so the bubbles are differentiable. Additive: a new warning that fires
+  only for a symbol map whose resolved Size aggregation is an average; sum/count-sized maps are
+  unchanged and raise nothing. No engine, schema, or default-path change. Suite 3036 → 3038.
 - **tableau-migration (skill `1.98.0` → `1.99.0`): Regression-locked the bar/column category axis so
   it is never suppressed by default (sf-npo Lesson 3).** On a horizontal `barChart` the category (e.g.
   service-name) labels live on the `categoryAxis`; a class of bug confuses "hide the axis *title*" with
