@@ -13,6 +13,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.96.0` → `1.97.0`): The fidelity oracle now documents the render‑verify
+  operating discipline, so a screenshot handed to the SSIM / vision tier is of the *real, refreshed*
+  report — not a blank or stale frame scored as if it were correct.** The render‑bridge section
+  described how to capture a Power BI render but not the *order* it must be driven in; four
+  deterministic rules (hard‑won on the Salesforce‑Nonprofit benchmark) are now pinned in
+  `resources/fidelity-oracle.md`: (1) **reload → reconnect → Full `RefreshWithXMLA` → wait → then
+  screenshot** — never capture immediately after a reload, when the report‑bound tables are still cold
+  and every visual is blank even though the model has data; (2) an **export‑then‑reload must recurse
+  `tables\`**, never a flat top‑level copy, or the reloaded report shows the old schema with new
+  columns/measures silently missing; (3) a **theme edit needs a cache‑busting name bump** (bump the
+  theme's internal `name` + its `report.json` reference in the same write) because Power BI caches
+  themes by name; (4) **pin the target Desktop instance by its `.pbip` path and re‑verify it every
+  cycle** on a shared bridge, so a foreign PID is never reloaded or screenshotted by mistake. A new
+  `tests/test_fidelity_oracle_render_discipline.py` locks the four rules. Doc + test only; no engine or
+  default‑path change. Sourced from the sf‑npo benchmark (Lessons 6, 7, 11, 15). Suite 3028 → 3033.
 - **tableau-migration (skill `1.95.0` → `1.96.0`): The runbook's opening information-collection span
   is now locked by a regression guard, so the very first steps of a run stay repeatable and can't
   silently drift.** The existing runbook guard pinned the assisted tiers and the mechanical-span

@@ -297,6 +297,46 @@ py -3.11 scripts\fidelity_oracle.py `
   --format md
 ```
 
+#### Render‑verify operating discipline (reload → refresh → screenshot)
+
+The render bridge only yields a *trustworthy* candidate PNG if it is driven in the right order.
+These are deterministic operating rules — not judgment calls — hard‑won on a real migration
+(the Salesforce‑Nonprofit benchmark); skipping any one of them produces a **confidently wrong**
+oracle input (a blank or stale render scored as if it were the real report). When a step edits the
+model or report on disk and reloads Desktop, always follow this cycle.
+
+- **Reload → reconnect → Full refresh → wait → *then* screenshot. Never screenshot immediately after
+  a reload.** A freshly reloaded `.pbip` opens with its report‑bound tables cold, so an immediate
+  screenshot shows **blank/empty visuals even though the model has data** — and the SSIM tier would
+  score that empty frame as the candidate. After each reload, reconnect to the Analysis Services port
+  and run a **Full** `RefreshWithXMLA`, then **wait for it to complete** before any `screenshot` /
+  `screenshot-all`. This is mandatory **even for report‑only edits** (the reload re‑cold‑starts the
+  cache). Budget the refresh time to the model size — plan for minutes, not seconds, on a large model
+  (the benchmark model took ~3.5 min) — and treat "refresh still running" as *not yet ready to
+  capture*, never as done.
+- **Exporting the live model to disk then reloading must recurse `tables\`, never a flat copy.** When
+  a step edits the model live (e.g. via the modeling MCP) and you export it to disk to reload it, copy
+  **both** the top‑level `definition\*.tmdl` **and** the `definition\tables\*.tmdl` from the export
+  folder into the project's `SemanticModel\definition\` (and `definition\tables\`). A flat copy of only
+  the top‑level files leaves the reloaded report showing the **old schema** — new columns/measures
+  silently missing — because the per‑table definitions never moved. Encode the copy as a **recursive**
+  operation over the whole `definition\` subtree.
+- **A theme edit needs a cache‑busting name bump, not just a reload.** Power BI caches themes by
+  internal name, so editing `theme.json` in place and reloading **does not pick up the change**. On any
+  theme edit, bump the theme's internal `name` (append a short random suffix) **and** update the
+  matching reference in `report.json` **in the same write**, so the cache invalidates on reload. Keep
+  the theme's internal name, its on‑disk filename, and the `report.json` reference **mutually
+  consistent** (the same invariant the build's `pbir_lint` theme check enforces) — bump all three
+  together. (Closing and reopening Desktop is the heavier fallback.)
+- **Pin the target Desktop instance by its `.pbip` path and re‑verify it every cycle.** A shared bridge
+  can host **foreign PIDs** (other reports open in other Desktop windows); reloading or screenshotting
+  the wrong one silently captures someone else's report. Always run `powerbi-desktop status` **first**,
+  select the instance whose open file **is your target `.pbip`**, and pin that PID. Before **every**
+  reload/screenshot, re‑confirm the pinned PID's file still equals the target and **abort** if it does
+  not; serialize all Desktop‑touching operations on your own PID, never touch a foreign PID, and check
+  `hasUnsavedChanges` before a reload so an in‑progress edit isn't discarded. (This is the full form of
+  the "reload/screenshot run serially per PID" note above.)
+
 ### Combined cross‑tier fidelity (advisory headline)
 
 When more than one tier runs, the report also carries a `combined_fidelity` block: a single advisory
