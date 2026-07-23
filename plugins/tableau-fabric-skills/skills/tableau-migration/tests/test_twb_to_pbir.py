@@ -26,7 +26,9 @@ from twb_to_pbir import (
     _automatic_canvas_dims,
     _candidate_plan,
     _card_latent_candidates,
+    _dedupe_native_query_refs,
     _drop_resolved_flag_warnings,
+    _expr_entity,
     _field_expression,
     _flag_filter_container,
     _image_item_name,
@@ -376,6 +378,133 @@ def test_two_measures_same_mark_stay_clustered_not_combo():
         panes=panes, deps_extra=_INST)
     w = parse_twb(_workbook(ws))["worksheets"][0]
     assert w["visual_type"] == "column"
+    assert w["combo_split"] is None
+
+
+# -- IR + emit: dual-axis lollipop (Bar stick + Circle head, same measure) -----
+def _lollipop_panes(head_mark="Circle", color="#00bceb"):
+    # a dual-axis worksheet with a head pane (Circle/Shape/Point) and a Bar stick pane, both drawing
+    # the SAME measure; the head pane carries the constant mark colour the sticks/dots inherit.
+    color_style = (f"<style><style-rule element='mark'>"
+                   f"<format attr='mark-color' value='{color}' /></style-rule></style>") if color else ""
+    return (
+        "<panes>"
+        "<pane><mark class='Automatic' /></pane>"
+        f"<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'><mark class='{head_mark}' />"
+        f"{color_style}</pane>"
+        "<pane id='2' y-index='1' y-axis-name='[federated.abc].[sum:Sales:qk]'>"
+        "<mark class='Bar' /></pane>"
+        "</panes>")
+
+
+def test_dual_axis_lollipop_same_measure_is_combo_with_marker_line_and_thin_columns():
+    # Tableau lollipop: the SAME measure plotted twice on a dual axis -- a Circle head pane + a Bar
+    # stick pane -- against a shared date. Power BI has no native lollipop, so the faithful build is a
+    # lineClusteredColumnComboChart with that one measure on BOTH Y and Y2: thin columns (the sticks)
+    # via categoryAxis.innerPadding + a marker-only hidden line (the dots) via lineStyles, one shared
+    # scale, legend off. The stick/dot colour is the worksheet's own constant mark colour.
+    ws = _combo_worksheet(
+        "Lolipop",
+        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Sales:qk])",
+        cols="[federated.abc].[mn:Order Date:ok]",
+        panes=_lollipop_panes(), deps_extra=_INST)
+    ir = parse_twb(_workbook(ws))
+    w = ir["worksheets"][0]
+    assert w["visual_type"] == "combo"
+    assert w["lollipop"] is True
+    assert w["lollipop_color"] == "#00bceb"
+    # both wells bind the SAME measure (Y == Y2)
+    assert [f["property"] for f in w["combo_split"]["Y"]] == ["Sales_Amount"]
+    assert [f["property"] for f in w["combo_split"]["Y2"]] == ["Sales_Amount"]
+
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]["visual"]
+    assert vis["visualType"] == "lineClusteredColumnComboChart"
+    state = vis["query"]["queryState"]
+    y = {p["field"]["Aggregation"]["Expression"]["Column"]["Property"]
+         for p in state["Y"]["projections"]}
+    y2 = {p["field"]["Aggregation"]["Expression"]["Column"]["Property"]
+          for p in state["Y2"]["projections"]}
+    assert y == y2 == {"Sales_Amount"}
+    # the marker line + thin columns + shared axis + off legend that make it read as a lollipop
+    objs = vis["objects"]
+    ls = objs["lineStyles"][0]["properties"]
+    assert ls["strokeShow"]["expr"]["Literal"]["Value"] == "false"
+    assert ls["showMarker"]["expr"]["Literal"]["Value"] == "true"
+    assert ls["markerShape"]["expr"]["Literal"]["Value"] == "'circle'"
+    assert ls["markerColor"]["solid"]["color"]["expr"]["Literal"]["Value"] == "'#00bceb'"
+    assert objs["categoryAxis"][0]["properties"]["innerPadding"]["expr"]["Literal"]["Value"] == "60L"
+    va = objs["valueAxis"][0]["properties"]
+    assert va["secShow"]["expr"]["Literal"]["Value"] == "false"
+    assert va["sharedAxis"]["expr"]["Literal"]["Value"] == "true"
+    assert objs["dataPoint"][0]["properties"]["defaultColor"]["solid"]["color"]["expr"]["Literal"]["Value"] == "'#00bceb'"
+    assert objs["legend"][0]["properties"]["show"]["expr"]["Literal"]["Value"] == "false"
+
+
+def test_lollipop_without_constant_mark_colour_omits_datapoint_and_marker_colour():
+    # No <format mark-color> on the worksheet -> the theme's first data colour drives the marks; the
+    # lollipop still fires (combo + marker line + thin columns) but emits no explicit colour objects.
+    ws = _combo_worksheet(
+        "Lolipop No Colour",
+        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Sales:qk])",
+        cols="[federated.abc].[mn:Order Date:ok]",
+        panes=_lollipop_panes(color=None), deps_extra=_INST)
+    ir = parse_twb(_workbook(ws))
+    w = ir["worksheets"][0]
+    assert w["visual_type"] == "combo"
+    assert w["lollipop"] is True
+    assert w["lollipop_color"] is None
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]["visual"]
+    objs = vis["objects"]
+    assert "dataPoint" not in objs
+    assert "markerColor" not in objs["lineStyles"][0]["properties"]
+    # the colour-independent lollipop objects still emit
+    assert objs["lineStyles"][0]["properties"]["showMarker"]["expr"]["Literal"]["Value"] == "true"
+
+
+def test_single_area_pane_is_not_a_lollipop():
+    # "Lolipop (2)" in the wild is a plain single-pane Area chart (leftover name). One pane, no Bar
+    # stick and no Circle head -> stays an areaChart, never a lollipop combo.
+    ws = _worksheet("Lolipop (2)", "Area",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[mn:Order Date:ok]", deps_extra=_INST)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["visual_type"] == "area"
+    assert w["lollipop"] is False
+    assert w["combo_split"] is None
+
+
+def test_dual_scale_combo_different_measures_is_not_a_lollipop():
+    # A genuine dual-scale combo (Sales Bar + Profit Line, DIFFERENT measures) must route via the
+    # combo detector, NOT the lollipop -- the lollipop requires a SINGLE measure identity, so it never
+    # hijacks a real two-measure combo.
+    panes = (
+        "<panes>"
+        "<pane><mark class='Bar' /></pane>"
+        "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'><mark class='Bar' /></pane>"
+        "<pane id='2' y-index='1' y-axis-name='[federated.abc].[sum:Profit:qk]'><mark class='Line' /></pane>"
+        "</panes>")
+    ws = _combo_worksheet(
+        "Dual Scale",
+        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+        cols="[federated.abc].[mn:Order Date:ok]", panes=panes, deps_extra=_INST)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["visual_type"] == "combo"
+    assert w["lollipop"] is False
+    # the real combo split keeps the two DISTINCT measures (Sales on Y, Profit on Y2)
+    assert [f["property"] for f in w["combo_split"]["Y"]] == ["Sales_Amount"]
+    assert [f["property"] for f in w["combo_split"]["Y2"]] == ["Profit"]
+
+
+def test_size_encoded_shape_strip_plot_is_not_a_lollipop():
+    # A size-encoded Shape strip-plot (the Frequency / Area-Squared idiom) has a head-family mark but
+    # NO Bar stick pane -> it must not misfire as a lollipop. (It stays the deterministic default; the
+    # scatter uplift is a separate rule.)
+    enc = "<encodings><size column='[federated.abc].[sum:Sales:qk]' /></encodings>"
+    ws = _worksheet("Frequency", "Shape",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[mn:Order Date:ok]", deps_extra=_INST, encodings=enc)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["lollipop"] is False
     assert w["combo_split"] is None
 
 
@@ -5433,11 +5562,14 @@ def test_card_label_colours_emit_category_and_data_label_objects():
     assert cat == "'{0}'".format(_SALES_HEX)
     assert val == "'{0}'".format(_PROFIT_HEX)
     assert size == "14D"
+    # Card display units (fidelity): the value object also pins labelDisplayUnits to None ('1D') so
+    # the recoloured big number is not abbreviated -- merged alongside the colour, never clobbering it.
+    assert objs["dataLabels"][0]["properties"]["labelDisplayUnits"]["expr"]["Literal"]["Value"] == "1D"
 
 
-def test_card_without_recoloured_label_emits_no_label_objects():
-    # Additivity: a plain KPI card (no customized-label) carries neither card_label_colors nor the
-    # categoryLabels / dataLabels objects.
+def test_card_without_recoloured_label_pins_display_units_none():
+    # A plain KPI card (no customized-label) carries no card_label_colors and no categoryLabels; its
+    # value object exists only to pin labelDisplayUnits to None ('1D') -- no colour / fontSize added.
     ws = _worksheet("Plain KPIs", "Bar",
                     rows="[federated.abc].[sum:Sales:qk]",
                     cols="[federated.abc].[sum:Profit:qk]",
@@ -5446,7 +5578,114 @@ def test_card_without_recoloured_label_emits_no_label_objects():
     assert ir["worksheets"][0]["card_label_colors"] is None
     vj = list(_visual_parts(emit_pbir(ir)).values())[0]
     objs = vj["visual"].get("objects", {})
-    assert "categoryLabels" not in objs and "dataLabels" not in objs
+    assert "categoryLabels" not in objs
+    props = objs["dataLabels"][0]["properties"]
+    assert props["labelDisplayUnits"]["expr"]["Literal"]["Value"] == "1D"
+    assert "color" not in props and "fontSize" not in props
+
+
+def test_single_measure_card_pins_display_units_none():
+    # A single measure with no dimension -> a "card" (not multiRowCard); it too pins None display units.
+    ws = _worksheet("One KPI", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]", cols="", deps_extra=_INST)
+    vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
+    assert vj["visual"]["visualType"] == "card"
+    objs = vj["visual"]["objects"]
+    assert objs["dataLabels"][0]["properties"]["labelDisplayUnits"]["expr"]["Literal"]["Value"] == "1D"
+
+
+def test_non_card_visual_gets_no_card_display_units():
+    # Additivity: display-units pinning is scoped to the card family; a bar/column visual with a real
+    # dimension never gains a dataLabels.labelDisplayUnits property.
+    ws = _worksheet("Sales by Cat", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
+    assert vj["visual"]["visualType"] not in ("card", "multiRowCard")
+    for entry in vj["visual"].get("objects", {}).get("dataLabels", []):
+        assert "labelDisplayUnits" not in entry.get("properties", {})
+
+
+# -- nativeQueryRef collision guard (sf-npo Lesson 2) --------------------------
+# Two projections in ONE visual that would serialize the SAME ``nativeQueryRef`` (e.g. two columns
+# named "Name" from different model tables) collide in the visual query and render "Error fetching
+# data". ``_dedupe_native_query_refs`` keeps the first native name clean and qualifies each later
+# collision with its source entity, then a counter. ``queryRef`` (the DAX alias) is untouched.
+def _col_proj(entity, prop, qref, nref):
+    return {"field": {"Column": {"Expression": {"SourceRef": {"Entity": entity}}, "Property": prop}},
+            "queryRef": qref, "nativeQueryRef": nref}
+
+
+def test_dedupe_native_query_refs_qualifies_collision_with_entity():
+    state = {"Category": {"projections": [
+        _col_proj("Program", "Name", "Program.Name", "Name"),
+        _col_proj("Service", "Name", "Service.Name", "Name"),
+    ]}}
+    _dedupe_native_query_refs(state)
+    nrefs = [p["nativeQueryRef"] for p in state["Category"]["projections"]]
+    assert nrefs == ["Name", "Name (Service)"]
+    # queryRefs (the DAX SELECT aliases) are never rewritten by the native-ref de-dup
+    assert [p["queryRef"] for p in state["Category"]["projections"]] == ["Program.Name", "Service.Name"]
+
+
+def test_dedupe_native_query_refs_is_noop_when_all_unique():
+    state = {"Category": {"projections": [
+        _col_proj("Superstore", "Category", "Superstore.Category", "Category"),
+        _col_proj("Superstore", "Region", "Superstore.Region", "Region"),
+    ]}}
+    _dedupe_native_query_refs(state)
+    assert [p["nativeQueryRef"] for p in state["Category"]["projections"]] == ["Category", "Region"]
+
+
+def test_dedupe_native_query_refs_spans_roles_and_counters():
+    # A collision across DIFFERENT roles is caught; a third clash on the same entity falls back to a
+    # numeric counter so every native name in the visual is unique.
+    state = {
+        "Category": {"projections": [_col_proj("Program", "Name", "Program.Name", "Name")]},
+        "Series": {"projections": [_col_proj("Service", "Name", "Service.Name", "Name")]},
+        "Details": {"projections": [_col_proj("Service", "Name", "Service.Name 3", "Name")]},
+    }
+    _dedupe_native_query_refs(state)
+    got = [state["Category"]["projections"][0]["nativeQueryRef"],
+           state["Series"]["projections"][0]["nativeQueryRef"],
+           state["Details"]["projections"][0]["nativeQueryRef"]]
+    assert got == ["Name", "Name (Service)", "Name (Service) 2"]
+    assert len(set(got)) == 3
+
+
+def test_dedupe_native_query_refs_counter_when_entity_unreadable():
+    # A projection whose field carries no readable Entity (e.g. a literal) still gets uniquified via
+    # a bare counter rather than being left to collide.
+    state = {"Category": {"projections": [
+        {"field": {"Literal": {"Value": "1L"}}, "queryRef": "a", "nativeQueryRef": "Name"},
+        {"field": {"Literal": {"Value": "2L"}}, "queryRef": "b", "nativeQueryRef": "Name"},
+    ]}}
+    _dedupe_native_query_refs(state)
+    assert [p["nativeQueryRef"] for p in state["Category"]["projections"]] == ["Name", "Name 2"]
+
+
+def test_expr_entity_reads_every_projection_shape():
+    assert _expr_entity({"Column": {"Expression": {"SourceRef": {"Entity": "T"}}, "Property": "c"}}) == "T"
+    assert _expr_entity({"Measure": {"Expression": {"SourceRef": {"Entity": "M"}}, "Property": "m"}}) == "M"
+    assert _expr_entity({"Aggregation": {"Expression": {"Column": {
+        "Expression": {"SourceRef": {"Entity": "A"}}, "Property": "c"}}, "Function": 0}}) == "A"
+    assert _expr_entity({"HierarchyLevel": {"Expression": {"Hierarchy": {
+        "Expression": {"SourceRef": {"Entity": "H"}}, "Hierarchy": "h"}}, "Level": "Year"}}) == "H"
+    assert _expr_entity({"Literal": {"Value": "1L"}}) is None
+    assert _expr_entity(None) is None
+
+
+def test_build_query_state_uniquifies_native_refs_end_to_end():
+    # Whole-emitter proof: the de-dup post-pass runs inside _build_query_state, so a real worksheet's
+    # emitted queryState never carries a duplicate native name across its projections.
+    ws = _worksheet("By Region", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Region:nk]", deps_extra=_INST)
+    vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
+    refs = [p["nativeQueryRef"]
+            for role in vj["visual"]["query"]["queryState"].values()
+            for p in role.get("projections", []) if p.get("nativeQueryRef")]
+    assert len(refs) == len(set(refs))
 
 
 # -- data labels (Tableau "Show Mark Labels" toggle) ---------------------------

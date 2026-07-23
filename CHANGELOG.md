@@ -13,6 +13,76 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.96.0` → `1.97.0`): The fidelity oracle now documents the render‑verify
+  operating discipline, so a screenshot handed to the SSIM / vision tier is of the *real, refreshed*
+  report — not a blank or stale frame scored as if it were correct.** The render‑bridge section
+  described how to capture a Power BI render but not the *order* it must be driven in; four
+  deterministic rules (hard‑won on the Salesforce‑Nonprofit benchmark) are now pinned in
+  `resources/fidelity-oracle.md`: (1) **reload → reconnect → Full `RefreshWithXMLA` → wait → then
+  screenshot** — never capture immediately after a reload, when the report‑bound tables are still cold
+  and every visual is blank even though the model has data; (2) an **export‑then‑reload must recurse
+  `tables\`**, never a flat top‑level copy, or the reloaded report shows the old schema with new
+  columns/measures silently missing; (3) a **theme edit needs a cache‑busting name bump** (bump the
+  theme's internal `name` + its `report.json` reference in the same write) because Power BI caches
+  themes by name; (4) **pin the target Desktop instance by its `.pbip` path and re‑verify it every
+  cycle** on a shared bridge, so a foreign PID is never reloaded or screenshotted by mistake. A new
+  `tests/test_fidelity_oracle_render_discipline.py` locks the four rules. Doc + test only; no engine or
+  default‑path change. Sourced from the sf‑npo benchmark (Lessons 6, 7, 11, 15). Suite 3028 → 3033.
+- **tableau-migration (skill `1.95.0` → `1.96.0`): The runbook's opening information-collection span
+  is now locked by a regression guard, so the very first steps of a run stay repeatable and can't
+  silently drift.** The existing runbook guard pinned the assisted tiers and the mechanical-span
+  narration cap but left the *front matter* — Gate Rules 1–6, the Phase 0A Decision Menu (D1–D6), and
+  the Phase 0C confirmation ledger — unguarded, so nothing prevented a future edit from eroding the
+  anchors that keep the opening of every migration identical (present the menu verbatim before any
+  tool call, infer no defaults, gate external work on `GO`, never scavenge the filesystem for the
+  input). A new `tests/test_runbook_infocollection_guard.py` asserts those semantic anchors
+  (whitespace-tolerant, no engine imports), locking the info-collection steps against variance.
+  Test-only and additive — no `SKILL.md` prose changed. Baseline suite 3018 → 3028 (ten new tests).
+- **tableau-migration (skill `1.94.0` → `1.95.0`): Two fields with the same column name in one
+  visual no longer collide into an "Error fetching data" — each projection now gets a unique
+  `nativeQueryRef`.** When a visual drew two category (or value) fields whose native names matched
+  (e.g. `Program[Name]` + `Service[Name]`, both serialized as `'Name'`), the PBIR visual query
+  collided and Power BI rendered "Error fetching data". The emitter already uniquified each
+  projection's `queryRef` (the DAX alias) but left `nativeQueryRef` duplicated; a new
+  `_dedupe_native_query_refs` post-pass in `_build_query_state` now keeps the first native name clean
+  and qualifies each later collision with its source entity (`'Name (Service)'`), falling back to a
+  numeric counter — leaving `queryRef`-keyed bindings (sort / FillRule / backColor) untouched and
+  acting as a no-op whenever names are already distinct. A new `pbir_lint` **R6** guard
+  (`_lint_native_query_refs`) flags any visual whose projections still carry a duplicate
+  `nativeQueryRef`, so the regression can never ship silently. Additive-only. Sourced from the
+  sf-npo benchmark (Lesson 2). Baseline suite 3008 → 3018 (ten new tests).
+- **tableau-migration (skill `1.93.0` → `1.94.0`): KPI cards now pin their value to display-units
+  None so big numbers are never abbreviated (2,747 stays `2,747`, not `3K`).** Power BI `card` /
+  `multiRowCard` visuals default `labelDisplayUnits` to Auto (`0`), which silently abbreviates the
+  value — a low-fidelity surprise for exact figures. The emitter now forces
+  `dataLabels.labelDisplayUnits` to the None enum (emitted as the Double literal `"1D"`) on every
+  emitted card-family visual (`_apply_card_display_units` in `twb_to_pbir.py`), merged **alongside**
+  any author-recoloured value colour / fontSize via `setdefault` so it never clobbers existing
+  formatting. A plain card gains only the display-units pin (no colour / categoryLabels). A new
+  `pbir_lint` **R5** guard (`_lint_card_display_units`) flags any emitted card whose value
+  `labelDisplayUnits` is missing or Auto, so a future regression is caught rather than silently
+  shipped. Additive-only; scoped to the card family (bar / column / matrix visuals are untouched).
+  Sourced from the sf-npo benchmark (Lesson 1). Baseline suite 3004 → 3008 (four new card tests).
+- **tableau-migration (skill `1.92.0` → `1.93.0`): Dual-axis lollipop charts now rebuild
+  deterministically as a native `lineClusteredColumnComboChart` — no LLM, no render loop.** Power BI
+  has no lollipop primitive, so a Tableau worksheet that draws the **same** measure twice on a dual
+  axis (a Circle/Shape/Point *head* pane + a Bar *stick* pane against a shared category) is detected at
+  parse time (`_detect_lollipop` + a full-pane `_all_pane_marks` scan) and re-routed to a combo: the one
+  measure is bound to **both** `Y` and `Y2` (the secondary `queryRef` auto-uniquified), then templatized
+  into the proven lollipop look — a marker-only hidden line (`lineStyles`: `strokeShow` off,
+  `showMarker` on, `markerShape` `circle`, `markerSize` `6`), thin columns (`categoryAxis.innerPadding`),
+  a single shared value axis (`valueAxis` `sharedAxis` on / secondary hidden), and the legend off. The
+  stick/dot colour is sourced from the worksheet's own constant mark colour
+  (`<format attr='mark-color'>`, via `_constant_mark_color`) and applied to both `dataPoint.defaultColor`
+  and `lineStyles.markerColor`, falling back to the theme's first data colour when the source set none.
+  **Warn-never-wrong** — gated on a head mark **and** a Bar mark **and** a single measure identity, and
+  evaluated only after the different-measure combo detector, so ordinary bar/line/area charts, a
+  single-pane area worksheet (the leftover `Lolipop (2)` name), a size-encoded Shape strip-plot, and a
+  genuine two-measure dual-scale combo never misfire. Verified end-to-end through the real engine:
+  Microsoft's `powerbi-report-author validate` **succeeded 0/0** (plus `pbir_lint` clean) and an 11-axis
+  structural signature diff against a hand-built reference matched **11/11**. **Additive only** — no
+  report-schema key renamed or removed; **+5** new tests (1 positive with full-object asserts, 4
+  negatives) and the full suite is green at **2999 passed / 3 skipped / 1 xfailed**.
 - **tableau-migration (skill `1.91.0` → `1.92.0`): Validator-clean PBIR output — the deterministic
   emitter now passes Microsoft's `powerbi-report-author validate` with 0 errors / 0 warnings, plus a
   new dependency-free PBIR linter that guards it.** Three coordinated fixes: **(R4)** a colour-legend

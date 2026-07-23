@@ -16,6 +16,18 @@ the two static defects the Microsoft ``powerbi-report-author validate`` CLI flag
      internal ``name``. Any mismatch makes the theme fail to load, silently dropping the palette
      (``PBIR_THEME_FILE_NAME_MISMATCH`` / ``PBIR_THEME_NAME_MISSING_JSON_EXT``).
 
+Plus two FIDELITY / VALIDITY guards on the emitter's own output:
+
+  3. CARD DISPLAY UNITS (R5) -- a ``card`` / ``multiRowCard`` must pin its value ``labelDisplayUnits``
+     to None (``1D``). Power BI defaults it to Auto (0), which abbreviates the big number
+     (2,747 -> "3K"); this guard catches a regression that leaves it Auto or unset, so a migrated KPI
+     never silently abbreviates versus the Tableau text / BAN mark.
+  4. NATIVE QUERY REF UNIQUENESS (R6) -- every projection in ONE visual's ``queryState`` must carry a
+     DISTINCT ``nativeQueryRef``. Two fields from different tables that share a column name (e.g.
+     ``Program[Name]`` + ``Service[Name]``) otherwise both serialize ``'Name'`` and the visual query
+     collides -> "Error fetching data" at render. The emitter uniquifies them; this guard catches a
+     regression that lets a duplicate native name slip back into a single visual.
+
 The valid-visual-type catalog below was ground-truthed against ``powerbi-report-author validate``
 v0.1.4: every type the emitter can produce was confirmed KNOWN, and only genuinely invalid strings
 trip ``PBIR_VISUAL_TYPE_UNKNOWN`` (distinct from role-binding diagnostics). It is deliberately
@@ -95,6 +107,105 @@ def _lint_visual_types(parts):
             problems.append(
                 "%s: unknown visualType %r -- not a valid PBIR built-in visual type "
                 "(Power BI renders it as a missing custom visual)" % (path, vt))
+    return problems
+
+
+# Card value display units (fidelity R5): a Power BI ``card`` / ``multiRowCard`` defaults its
+# big-number ``labelDisplayUnits`` to Auto (0), which ABBREVIATES (2,747 -> "3K"). Setting it to
+# Auto (0) does NOT disable the abbreviation -- "None" is the enum value 1 (emitted as ``1D``). The
+# emitter forces None on every rebuilt card (see ``twb_to_pbir._apply_card_display_units``); this
+# guard catches a regression that drops it or leaves Auto, so a migrated KPI never silently
+# abbreviates its value versus the Tableau text / BAN mark.
+_CARD_VISUAL_TYPES = frozenset({"card", "multiRowCard"})
+
+
+def _card_value_units(visual):
+    """The card value's ``labelDisplayUnits`` literal string (e.g. ``'1D'``), or ``None`` if unset."""
+    objs = visual.get("objects")
+    if not isinstance(objs, dict):
+        return None
+    for entry in (objs.get("dataLabels") or []):
+        props = entry.get("properties") if isinstance(entry, dict) else None
+        if not isinstance(props, dict):
+            continue
+        ldu = props.get("labelDisplayUnits")
+        if isinstance(ldu, dict):
+            val = ldu.get("expr", {}).get("Literal", {}).get("Value")
+            if val is not None:
+                return str(val)
+    return None
+
+
+def _units_is_auto(units):
+    """True when a ``labelDisplayUnits`` literal resolves to Auto (0), which abbreviates big numbers."""
+    core = units.strip().rstrip("DLdl")
+    try:
+        return float(core) == 0.0
+    except ValueError:
+        return False
+
+
+def _lint_card_display_units(parts):
+    problems = []
+    for path in sorted(parts):
+        if not path.endswith("visual.json"):
+            continue
+        doc = _load_json(parts, path)
+        visual = doc.get("visual") if isinstance(doc, dict) else None
+        if not isinstance(visual, dict) or visual.get("visualType") not in _CARD_VISUAL_TYPES:
+            continue
+        units = _card_value_units(visual)
+        if units is None or _units_is_auto(units):
+            problems.append(
+                "%s: %s visual must set dataLabels.labelDisplayUnits to None ('1D'); Auto (0) "
+                "silently abbreviates the big number (2,747 -> '3K'), breaking fidelity vs the "
+                "Tableau text mark" % (path, visual.get("visualType")))
+    return problems
+
+
+# Native-query-ref uniqueness (validity R6): every projection in ONE visual's queryState must carry
+# a DISTINCT ``nativeQueryRef``. Two fields from different tables that share a column name (e.g.
+# ``Program[Name]`` + ``Service[Name]``) otherwise both serialize ``'Name'`` and the visual query
+# collides -> "Error fetching data" at render. The emitter uniquifies them (see
+# ``twb_to_pbir._dedupe_native_query_refs``); this guard catches a regression that lets a duplicate
+# native name slip back into a single visual.
+def _visual_native_refs(visual):
+    """Ordered list of every projection ``nativeQueryRef`` across all queryState roles of a visual."""
+    refs = []
+    query = visual.get("query") if isinstance(visual, dict) else None
+    state = query.get("queryState") if isinstance(query, dict) else None
+    if not isinstance(state, dict):
+        return refs
+    for role in state.values():
+        if not isinstance(role, dict):
+            continue
+        for proj in (role.get("projections") or []):
+            nref = proj.get("nativeQueryRef") if isinstance(proj, dict) else None
+            if nref:
+                refs.append(nref)
+    return refs
+
+
+def _lint_native_query_refs(parts):
+    problems = []
+    for path in sorted(parts):
+        if not path.endswith("visual.json"):
+            continue
+        doc = _load_json(parts, path)
+        visual = doc.get("visual") if isinstance(doc, dict) else None
+        if not isinstance(visual, dict):
+            continue
+        refs = _visual_native_refs(visual)
+        seen, dupes = set(), []
+        for nref in refs:
+            if nref in seen and nref not in dupes:
+                dupes.append(nref)
+            seen.add(nref)
+        for nref in dupes:
+            problems.append(
+                "%s: duplicate nativeQueryRef %r across the visual's projections -- two fields "
+                "with the same native name collide in the visual query and render 'Error fetching "
+                "data'; qualify one with its source entity" % (path, nref))
     return problems
 
 
@@ -179,7 +290,8 @@ def lint_pbir_parts(parts):
     silently skipped so the linter is safe to run on every migration.
     """
     parts = parts or {}
-    return _lint_visual_types(parts) + _lint_theme(parts)
+    return (_lint_visual_types(parts) + _lint_theme(parts)
+            + _lint_card_display_units(parts) + _lint_native_query_refs(parts))
 
 
 def lint_pbir_report(report_dir):

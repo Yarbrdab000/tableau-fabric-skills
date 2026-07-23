@@ -144,6 +144,46 @@ def test_no_custom_theme_item_flagged():
     assert any("no RegisteredResources CustomTheme item" in p for p in problems)
 
 
+# -- unit: card display units (R5) ---------------------------------------------
+def _card_parts(units="1D", visual_type="card"):
+    """A baseTheme-only report (no theme checks) + one card-family visual whose value object carries
+    ``labelDisplayUnits`` = ``units`` (``None`` -> the property is omitted entirely)."""
+    visual = {"visualType": visual_type}
+    if units is not None:
+        visual["objects"] = {"dataLabels": [{"properties": {
+            "labelDisplayUnits": {"expr": {"Literal": {"Value": units}}}}}]}
+    return {
+        "definition/report.json": json.dumps(_report_json(ct_name=None)),
+        "definition/pages/p/visuals/v/visual.json": json.dumps({"visual": visual}),
+    }
+
+
+def test_card_none_display_units_clean():
+    assert lint_pbir_parts(_card_parts(units="1D")) == []
+    assert lint_pbir_parts(_card_parts(units="1D", visual_type="multiRowCard")) == []
+
+
+def test_card_missing_display_units_flagged():
+    problems = lint_pbir_parts(_card_parts(units=None))
+    assert len(problems) == 1 and "labelDisplayUnits" in problems[0]
+
+
+def test_card_auto_display_units_flagged():
+    # Auto is the enum 0 -- setting it does NOT disable abbreviation, so it is flagged like a miss
+    problems = lint_pbir_parts(_card_parts(units="0D"))
+    assert len(problems) == 1 and "Auto" in problems[0]
+
+
+def test_multirowcard_missing_display_units_flagged():
+    problems = lint_pbir_parts(_card_parts(units=None, visual_type="multiRowCard"))
+    assert len(problems) == 1 and "multiRowCard" in problems[0]
+
+
+def test_non_card_missing_display_units_clean():
+    # the guard is scoped to the card family; a non-card visual without display units stays clean
+    assert lint_pbir_parts(_card_parts(units=None, visual_type="columnChart")) == []
+
+
 # -- emitter-clean guard -------------------------------------------------------
 def _representative_workbook():
     """A workbook whose emit exercises multiple visual types + the always-on custom theme:
@@ -205,3 +245,81 @@ def test_lint_catches_injected_regression():
     parts[vkey] = json.dumps(doc)
     problems = lint_pbir_parts(parts)
     assert any("stackedColumnChart" in p for p in problems)
+
+
+def test_emitted_card_pins_display_units_and_lints_clean():
+    # R5 lock: a rebuilt KPI card emits value display units None ('1D') and lints clean.
+    ws = _worksheet("KPI", "Bar", rows="[federated.abc].[sum:Sales:qk]", cols="", deps_extra=_INST)
+    parts = emit_pbir(parse_twb(_workbook(ws)))
+    assert lint_pbir_parts(parts) == []
+    vj = next(iter(_visual_parts(parts).values()))
+    assert vj["visual"]["visualType"] == "card"
+    units = vj["visual"]["objects"]["dataLabels"][0]["properties"]["labelDisplayUnits"]
+    assert units["expr"]["Literal"]["Value"] == "1D"
+
+
+def test_lint_catches_card_display_units_regression():
+    # prove the R5 guard CATCHES a regression that drops the card's display-units pin
+    ws = _worksheet("KPI", "Bar", rows="[federated.abc].[sum:Sales:qk]", cols="", deps_extra=_INST)
+    parts = dict(emit_pbir(parse_twb(_workbook(ws))))
+    vkey = next(k for k in parts if k.endswith("visual.json"))
+    doc = json.loads(parts[vkey])
+    doc["visual"]["objects"].pop("dataLabels", None)
+    parts[vkey] = json.dumps(doc)
+    problems = lint_pbir_parts(parts)
+    assert any("labelDisplayUnits" in p for p in problems)
+
+
+# -- R6: nativeQueryRef uniqueness within a visual -----------------------------
+def _visual_parts_with_refs(*role_refs):
+    """A minimal ``{path: visual.json}`` whose queryState roles carry the given nativeQueryRefs.
+    ``role_refs`` is a sequence of ``(role, [nref, ...])`` pairs."""
+    state = {}
+    for i, (role, nrefs) in enumerate(role_refs):
+        state[role] = {"projections": [
+            {"field": {"Column": {"Expression": {"SourceRef": {"Entity": "T"}}, "Property": n}},
+             "queryRef": f"q{i}_{j}", "nativeQueryRef": n} for j, n in enumerate(nrefs)]}
+    doc = {"visual": {"visualType": "barChart", "query": {"queryState": state}}}
+    return {"definition/pages/p/visuals/v/visual.json": json.dumps(doc)}
+
+
+def test_native_query_refs_unique_is_clean():
+    parts = _visual_parts_with_refs(("Category", ["Name"]), ("Y", ["Sales"]))
+    assert lint_pbir_parts(parts) == []
+
+
+def test_native_query_refs_duplicate_across_roles_flagged():
+    parts = _visual_parts_with_refs(("Category", ["Name"]), ("Series", ["Name"]))
+    problems = lint_pbir_parts(parts)
+    assert len(problems) == 1 and "duplicate nativeQueryRef 'Name'" in problems[0]
+
+
+def test_native_query_refs_duplicate_flagged_once_per_name():
+    # three "Name" projections -> exactly one problem for that name (not one per extra occurrence)
+    parts = _visual_parts_with_refs(("Category", ["Name", "Name"]), ("Series", ["Name"]))
+    problems = lint_pbir_parts(parts)
+    assert len([p for p in problems if "'Name'" in p]) == 1
+
+
+def test_lint_catches_native_query_ref_regression():
+    # prove the R6 guard CATCHES a regression: force two projections back to the same native name.
+    parts = dict(emit_pbir(parse_twb(_representative_workbook())))
+    vkey = next(k for k in parts if k.endswith("visual.json")
+                and "queryState" in _as_text_or_empty(parts[k]))
+    doc = json.loads(parts[vkey])
+    projs = [p for role in doc["visual"]["query"]["queryState"].values()
+             for p in role.get("projections", [])]
+    assert len(projs) >= 2
+    projs[0]["nativeQueryRef"] = projs[1]["nativeQueryRef"] = "Collide"
+    parts[vkey] = json.dumps(doc)
+    problems = lint_pbir_parts(parts)
+    assert any("duplicate nativeQueryRef 'Collide'" in p for p in problems)
+
+
+def _as_text_or_empty(value):
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return value.decode("utf-8-sig")
+        except Exception:
+            return ""
+    return value or ""
