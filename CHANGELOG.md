@@ -13,6 +13,19 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `1.94.0` → `1.95.0`): Two fields with the same column name in one
+  visual no longer collide into an "Error fetching data" — each projection now gets a unique
+  `nativeQueryRef`.** When a visual drew two category (or value) fields whose native names matched
+  (e.g. `Program[Name]` + `Service[Name]`, both serialized as `'Name'`), the PBIR visual query
+  collided and Power BI rendered "Error fetching data". The emitter already uniquified each
+  projection's `queryRef` (the DAX alias) but left `nativeQueryRef` duplicated; a new
+  `_dedupe_native_query_refs` post-pass in `_build_query_state` now keeps the first native name clean
+  and qualifies each later collision with its source entity (`'Name (Service)'`), falling back to a
+  numeric counter — leaving `queryRef`-keyed bindings (sort / FillRule / backColor) untouched and
+  acting as a no-op whenever names are already distinct. A new `pbir_lint` **R6** guard
+  (`_lint_native_query_refs`) flags any visual whose projections still carry a duplicate
+  `nativeQueryRef`, so the regression can never ship silently. Additive-only. Sourced from the
+  sf-npo benchmark (Lesson 2). Baseline suite 3008 → 3018 (ten new tests).
 - **tableau-migration (skill `1.93.0` → `1.94.0`): KPI cards now pin their value to display-units
   None so big numbers are never abbreviated (2,747 stays `2,747`, not `3K`).** Power BI `card` /
   `multiRowCard` visuals default `labelDisplayUnits` to Auto (`0`), which silently abbreviates the

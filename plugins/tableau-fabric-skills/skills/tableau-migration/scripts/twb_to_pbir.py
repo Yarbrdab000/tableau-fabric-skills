@@ -4093,6 +4093,68 @@ def _dedupe(fields):
     return out
 
 
+def _expr_entity(field_expr):
+    """The source Entity (model-table) name carried by a projection's ``field`` expression, or
+    ``None`` when it cannot be read (a literal / unrecognised shape). Handles the Column,
+    Aggregation, Measure and HierarchyLevel expression forms the emitter produces."""
+    if not isinstance(field_expr, dict):
+        return None
+    for key in ("Column", "Measure"):
+        node = field_expr.get(key)
+        if isinstance(node, dict):
+            ref = ((node.get("Expression") or {}).get("SourceRef")) or {}
+            return ref.get("Entity")
+    agg = field_expr.get("Aggregation")
+    if isinstance(agg, dict):
+        col = (agg.get("Expression") or {}).get("Column") or {}
+        ref = ((col.get("Expression") or {}).get("SourceRef")) or {}
+        return ref.get("Entity")
+    hier = field_expr.get("HierarchyLevel")
+    if isinstance(hier, dict):
+        h = (hier.get("Expression") or {}).get("Hierarchy") or {}
+        ref = ((h.get("Expression") or {}).get("SourceRef")) or {}
+        return ref.get("Entity")
+    return None
+
+
+def _uniquify_native_ref(base, seen):
+    """Return ``base`` if unused, else ``base 2`` / ``base 3`` ... -- the first free variant."""
+    if base not in seen:
+        return base
+    n = 2
+    while f"{base} {n}" in seen:
+        n += 1
+    return f"{base} {n}"
+
+
+def _dedupe_native_query_refs(state):
+    """sf-npo Lesson 2: two projections in ONE visual that serialize the SAME ``nativeQueryRef``
+    (e.g. ``Program[Name]`` + ``Service[Name]`` both -> ``'Name'``) collide in the visual query and
+    render 'Error fetching data'. ``queryRef`` (the DAX SELECT alias) is already uniquified per
+    visual; this guarantees ``nativeQueryRef`` is too. The FIRST occurrence keeps its clean native
+    name; each later collision is qualified with its source entity (``'Name (Service)'``), then a
+    numeric counter if that still clashes. Pure serialization guard -- no LLM judgment, no effect on
+    ``queryRef``-keyed bindings (sort / FillRule / backColor), which are untouched. A no-op for the
+    common case where every native name is already distinct."""
+    seen = set()
+    for role in state.values():
+        if not isinstance(role, dict):
+            continue
+        for proj in role.get("projections", []):
+            nref = proj.get("nativeQueryRef")
+            if not nref:
+                continue
+            if nref not in seen:
+                seen.add(nref)
+                continue
+            entity = _expr_entity(proj.get("field"))
+            base = f"{nref} ({entity})" if entity else nref
+            new_ref = _uniquify_native_ref(base, seen)
+            proj["nativeQueryRef"] = new_ref
+            seen.add(new_ref)
+    return state
+
+
 def _build_query_state(ws, model_table, field_map, warnings):
     """Map a worksheet IR to a PBIR ``queryState`` (role -> projections)."""
     vt = ws["visual_type"]
@@ -4488,7 +4550,7 @@ def _build_query_state(ws, model_table, field_map, warnings):
         if color_series:
             state["Series"] = {"projections": _role_projections(
                 color_series, model_table, field_map, used_refs)}
-    return state
+    return _dedupe_native_query_refs(state)
 
 
 def _query_state_complete(vt, state):

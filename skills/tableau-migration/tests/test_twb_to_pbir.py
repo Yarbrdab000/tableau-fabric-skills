@@ -26,7 +26,9 @@ from twb_to_pbir import (
     _automatic_canvas_dims,
     _candidate_plan,
     _card_latent_candidates,
+    _dedupe_native_query_refs,
     _drop_resolved_flag_warnings,
+    _expr_entity,
     _field_expression,
     _flag_filter_container,
     _image_item_name,
@@ -5602,6 +5604,88 @@ def test_non_card_visual_gets_no_card_display_units():
     assert vj["visual"]["visualType"] not in ("card", "multiRowCard")
     for entry in vj["visual"].get("objects", {}).get("dataLabels", []):
         assert "labelDisplayUnits" not in entry.get("properties", {})
+
+
+# -- nativeQueryRef collision guard (sf-npo Lesson 2) --------------------------
+# Two projections in ONE visual that would serialize the SAME ``nativeQueryRef`` (e.g. two columns
+# named "Name" from different model tables) collide in the visual query and render "Error fetching
+# data". ``_dedupe_native_query_refs`` keeps the first native name clean and qualifies each later
+# collision with its source entity, then a counter. ``queryRef`` (the DAX alias) is untouched.
+def _col_proj(entity, prop, qref, nref):
+    return {"field": {"Column": {"Expression": {"SourceRef": {"Entity": entity}}, "Property": prop}},
+            "queryRef": qref, "nativeQueryRef": nref}
+
+
+def test_dedupe_native_query_refs_qualifies_collision_with_entity():
+    state = {"Category": {"projections": [
+        _col_proj("Program", "Name", "Program.Name", "Name"),
+        _col_proj("Service", "Name", "Service.Name", "Name"),
+    ]}}
+    _dedupe_native_query_refs(state)
+    nrefs = [p["nativeQueryRef"] for p in state["Category"]["projections"]]
+    assert nrefs == ["Name", "Name (Service)"]
+    # queryRefs (the DAX SELECT aliases) are never rewritten by the native-ref de-dup
+    assert [p["queryRef"] for p in state["Category"]["projections"]] == ["Program.Name", "Service.Name"]
+
+
+def test_dedupe_native_query_refs_is_noop_when_all_unique():
+    state = {"Category": {"projections": [
+        _col_proj("Superstore", "Category", "Superstore.Category", "Category"),
+        _col_proj("Superstore", "Region", "Superstore.Region", "Region"),
+    ]}}
+    _dedupe_native_query_refs(state)
+    assert [p["nativeQueryRef"] for p in state["Category"]["projections"]] == ["Category", "Region"]
+
+
+def test_dedupe_native_query_refs_spans_roles_and_counters():
+    # A collision across DIFFERENT roles is caught; a third clash on the same entity falls back to a
+    # numeric counter so every native name in the visual is unique.
+    state = {
+        "Category": {"projections": [_col_proj("Program", "Name", "Program.Name", "Name")]},
+        "Series": {"projections": [_col_proj("Service", "Name", "Service.Name", "Name")]},
+        "Details": {"projections": [_col_proj("Service", "Name", "Service.Name 3", "Name")]},
+    }
+    _dedupe_native_query_refs(state)
+    got = [state["Category"]["projections"][0]["nativeQueryRef"],
+           state["Series"]["projections"][0]["nativeQueryRef"],
+           state["Details"]["projections"][0]["nativeQueryRef"]]
+    assert got == ["Name", "Name (Service)", "Name (Service) 2"]
+    assert len(set(got)) == 3
+
+
+def test_dedupe_native_query_refs_counter_when_entity_unreadable():
+    # A projection whose field carries no readable Entity (e.g. a literal) still gets uniquified via
+    # a bare counter rather than being left to collide.
+    state = {"Category": {"projections": [
+        {"field": {"Literal": {"Value": "1L"}}, "queryRef": "a", "nativeQueryRef": "Name"},
+        {"field": {"Literal": {"Value": "2L"}}, "queryRef": "b", "nativeQueryRef": "Name"},
+    ]}}
+    _dedupe_native_query_refs(state)
+    assert [p["nativeQueryRef"] for p in state["Category"]["projections"]] == ["Name", "Name 2"]
+
+
+def test_expr_entity_reads_every_projection_shape():
+    assert _expr_entity({"Column": {"Expression": {"SourceRef": {"Entity": "T"}}, "Property": "c"}}) == "T"
+    assert _expr_entity({"Measure": {"Expression": {"SourceRef": {"Entity": "M"}}, "Property": "m"}}) == "M"
+    assert _expr_entity({"Aggregation": {"Expression": {"Column": {
+        "Expression": {"SourceRef": {"Entity": "A"}}, "Property": "c"}}, "Function": 0}}) == "A"
+    assert _expr_entity({"HierarchyLevel": {"Expression": {"Hierarchy": {
+        "Expression": {"SourceRef": {"Entity": "H"}}, "Hierarchy": "h"}}, "Level": "Year"}}) == "H"
+    assert _expr_entity({"Literal": {"Value": "1L"}}) is None
+    assert _expr_entity(None) is None
+
+
+def test_build_query_state_uniquifies_native_refs_end_to_end():
+    # Whole-emitter proof: the de-dup post-pass runs inside _build_query_state, so a real worksheet's
+    # emitted queryState never carries a duplicate native name across its projections.
+    ws = _worksheet("By Region", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Region:nk]", deps_extra=_INST)
+    vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
+    refs = [p["nativeQueryRef"]
+            for role in vj["visual"]["query"]["queryState"].values()
+            for p in role.get("projections", []) if p.get("nativeQueryRef")]
+    assert len(refs) == len(set(refs))
 
 
 # -- data labels (Tableau "Show Mark Labels" toggle) ---------------------------

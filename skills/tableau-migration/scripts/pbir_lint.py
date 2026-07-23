@@ -16,12 +16,17 @@ the two static defects the Microsoft ``powerbi-report-author validate`` CLI flag
      internal ``name``. Any mismatch makes the theme fail to load, silently dropping the palette
      (``PBIR_THEME_FILE_NAME_MISMATCH`` / ``PBIR_THEME_NAME_MISSING_JSON_EXT``).
 
-Plus one FIDELITY guard on the emitter's own output:
+Plus two FIDELITY / VALIDITY guards on the emitter's own output:
 
   3. CARD DISPLAY UNITS (R5) -- a ``card`` / ``multiRowCard`` must pin its value ``labelDisplayUnits``
      to None (``1D``). Power BI defaults it to Auto (0), which abbreviates the big number
      (2,747 -> "3K"); this guard catches a regression that leaves it Auto or unset, so a migrated KPI
      never silently abbreviates versus the Tableau text / BAN mark.
+  4. NATIVE QUERY REF UNIQUENESS (R6) -- every projection in ONE visual's ``queryState`` must carry a
+     DISTINCT ``nativeQueryRef``. Two fields from different tables that share a column name (e.g.
+     ``Program[Name]`` + ``Service[Name]``) otherwise both serialize ``'Name'`` and the visual query
+     collides -> "Error fetching data" at render. The emitter uniquifies them; this guard catches a
+     regression that lets a duplicate native name slip back into a single visual.
 
 The valid-visual-type catalog below was ground-truthed against ``powerbi-report-author validate``
 v0.1.4: every type the emitter can produce was confirmed KNOWN, and only genuinely invalid strings
@@ -158,6 +163,52 @@ def _lint_card_display_units(parts):
     return problems
 
 
+# Native-query-ref uniqueness (validity R6): every projection in ONE visual's queryState must carry
+# a DISTINCT ``nativeQueryRef``. Two fields from different tables that share a column name (e.g.
+# ``Program[Name]`` + ``Service[Name]``) otherwise both serialize ``'Name'`` and the visual query
+# collides -> "Error fetching data" at render. The emitter uniquifies them (see
+# ``twb_to_pbir._dedupe_native_query_refs``); this guard catches a regression that lets a duplicate
+# native name slip back into a single visual.
+def _visual_native_refs(visual):
+    """Ordered list of every projection ``nativeQueryRef`` across all queryState roles of a visual."""
+    refs = []
+    query = visual.get("query") if isinstance(visual, dict) else None
+    state = query.get("queryState") if isinstance(query, dict) else None
+    if not isinstance(state, dict):
+        return refs
+    for role in state.values():
+        if not isinstance(role, dict):
+            continue
+        for proj in (role.get("projections") or []):
+            nref = proj.get("nativeQueryRef") if isinstance(proj, dict) else None
+            if nref:
+                refs.append(nref)
+    return refs
+
+
+def _lint_native_query_refs(parts):
+    problems = []
+    for path in sorted(parts):
+        if not path.endswith("visual.json"):
+            continue
+        doc = _load_json(parts, path)
+        visual = doc.get("visual") if isinstance(doc, dict) else None
+        if not isinstance(visual, dict):
+            continue
+        refs = _visual_native_refs(visual)
+        seen, dupes = set(), []
+        for nref in refs:
+            if nref in seen and nref not in dupes:
+                dupes.append(nref)
+            seen.add(nref)
+        for nref in dupes:
+            problems.append(
+                "%s: duplicate nativeQueryRef %r across the visual's projections -- two fields "
+                "with the same native name collide in the visual query and render 'Error fetching "
+                "data'; qualify one with its source entity" % (path, nref))
+    return problems
+
+
 def _registered_items(report):
     """Yield each ``RegisteredResources`` item dict, tolerating both the flat
     ``{name,type,items}`` shape the emitter writes and the wrapped ``{resourcePackage:{...}}`` shape
@@ -239,7 +290,8 @@ def lint_pbir_parts(parts):
     silently skipped so the linter is safe to run on every migration.
     """
     parts = parts or {}
-    return _lint_visual_types(parts) + _lint_theme(parts) + _lint_card_display_units(parts)
+    return (_lint_visual_types(parts) + _lint_theme(parts)
+            + _lint_card_display_units(parts) + _lint_native_query_refs(parts))
 
 
 def lint_pbir_report(report_dir):

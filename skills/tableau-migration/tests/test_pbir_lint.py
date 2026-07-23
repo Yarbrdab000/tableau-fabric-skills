@@ -268,3 +268,58 @@ def test_lint_catches_card_display_units_regression():
     parts[vkey] = json.dumps(doc)
     problems = lint_pbir_parts(parts)
     assert any("labelDisplayUnits" in p for p in problems)
+
+
+# -- R6: nativeQueryRef uniqueness within a visual -----------------------------
+def _visual_parts_with_refs(*role_refs):
+    """A minimal ``{path: visual.json}`` whose queryState roles carry the given nativeQueryRefs.
+    ``role_refs`` is a sequence of ``(role, [nref, ...])`` pairs."""
+    state = {}
+    for i, (role, nrefs) in enumerate(role_refs):
+        state[role] = {"projections": [
+            {"field": {"Column": {"Expression": {"SourceRef": {"Entity": "T"}}, "Property": n}},
+             "queryRef": f"q{i}_{j}", "nativeQueryRef": n} for j, n in enumerate(nrefs)]}
+    doc = {"visual": {"visualType": "barChart", "query": {"queryState": state}}}
+    return {"definition/pages/p/visuals/v/visual.json": json.dumps(doc)}
+
+
+def test_native_query_refs_unique_is_clean():
+    parts = _visual_parts_with_refs(("Category", ["Name"]), ("Y", ["Sales"]))
+    assert lint_pbir_parts(parts) == []
+
+
+def test_native_query_refs_duplicate_across_roles_flagged():
+    parts = _visual_parts_with_refs(("Category", ["Name"]), ("Series", ["Name"]))
+    problems = lint_pbir_parts(parts)
+    assert len(problems) == 1 and "duplicate nativeQueryRef 'Name'" in problems[0]
+
+
+def test_native_query_refs_duplicate_flagged_once_per_name():
+    # three "Name" projections -> exactly one problem for that name (not one per extra occurrence)
+    parts = _visual_parts_with_refs(("Category", ["Name", "Name"]), ("Series", ["Name"]))
+    problems = lint_pbir_parts(parts)
+    assert len([p for p in problems if "'Name'" in p]) == 1
+
+
+def test_lint_catches_native_query_ref_regression():
+    # prove the R6 guard CATCHES a regression: force two projections back to the same native name.
+    parts = dict(emit_pbir(parse_twb(_representative_workbook())))
+    vkey = next(k for k in parts if k.endswith("visual.json")
+                and "queryState" in _as_text_or_empty(parts[k]))
+    doc = json.loads(parts[vkey])
+    projs = [p for role in doc["visual"]["query"]["queryState"].values()
+             for p in role.get("projections", [])]
+    assert len(projs) >= 2
+    projs[0]["nativeQueryRef"] = projs[1]["nativeQueryRef"] = "Collide"
+    parts[vkey] = json.dumps(doc)
+    problems = lint_pbir_parts(parts)
+    assert any("duplicate nativeQueryRef 'Collide'" in p for p in problems)
+
+
+def _as_text_or_empty(value):
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return value.decode("utf-8-sig")
+        except Exception:
+            return ""
+    return value or ""
