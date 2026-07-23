@@ -1158,7 +1158,7 @@ def test_object_id_row_count_binds_when_target_supplied():
 
 
 def test_pilot_line_chart_object_id_count_over_continuous_date_is_a_line():
-    # The Comcast pilot "Line chart" shape: an Automatic mark plotting the implicit object-id COUNT
+    # The Acme pilot "Line chart" shape: an Automatic mark plotting the implicit object-id COUNT
     # (rows) over a CONTINUOUS truncated date (cols). With a row_count_binding the COUNT binds to a
     # model measure AND the continuous date makes it a LINE (not a column) -- the chart type Tableau
     # actually renders. Ties the row-count binding and the continuous-date routing together.
@@ -1852,7 +1852,7 @@ def test_field_alias_map_unit_maps_ref_to_caption_and_tolerates_no_model_table()
 
 
 def test_field_alias_map_maps_star_schema_date_rebind_back_to_source_caption():
-    # the headline COMCAST remodel: a continuous-date axis rebound to the marked Date dimension
+    # the headline ACME remodel: a continuous-date axis rebound to the marked Date dimension
     # emits ``Date.Date`` but the Tableau source is ``Order Date`` -- the alias resolves that exact
     # field-NAME divergence so a name-based structural compare reads the visual as faithful.
     from twb_to_pbir import _field_alias_map
@@ -6056,7 +6056,7 @@ def test_title_style_non_hex_color_is_deferred():
 
 
 # -- nested formula table-calc chain -> nested Visual Calculations (Feature A) --
-# The Comcast use case: a displayed calc ``Rank = RANK([composit])`` over a composite
+# The Acme use case: a displayed calc ``Rank = RANK([composit])`` over a composite
 # ``composit = RUNNING_SUM(SUM([Sales]))*.15 + RUNNING_SUM(SUM([Quantity]))*15`` is a calc that
 # references another calc (a nested chain). It rebuilds as nested Power BI Visual Calculations --
 # hidden base measures + a hidden inner ``composit Calc`` VC + the shown outer ``Rank`` VC -- rather
@@ -6213,7 +6213,7 @@ def test_title_style_standalone_path_emits_font():
 # ``_Measures`` measures. Binding is DETERMINISTIC (token-keyed) and only for translated /
 # assisted-approved measures (warn-never-wrong). Default (no binding) -> byte-unchanged.
 def _pcdf_heat_workbook():
-    # The Comcast pilot heat grid: a percent-difference quick-table-calc (``pcdf:``) drives the cell
+    # The Acme pilot heat grid: a percent-difference quick-table-calc (``pcdf:``) drives the cell
     # colour; the displayed value is SUM(Sales). Without a measure binding this DEFERS (no model
     # measure for the table calc); with one it lights up.
     calc_col = ("<column caption='Percent Difference' datatype='real' name='[Calculation_1]' "
@@ -6295,7 +6295,7 @@ def test_measure_binding_default_none_is_byte_unchanged():
 
 
 def _pcdf_pilot_heat_workbook():
-    # The Comcast pilot's heat-grid colour pill carries the FULL extractor instance token -- INCLUDING
+    # The Acme pilot's heat-grid colour pill carries the FULL extractor instance token -- INCLUDING
     # the ``usr:`` addressing segment AND the ``:qk`` suffix (pcdf:usr:Calculation_*:qk). The model
     # build stamps ``calc_instance_token`` = the extractor's ``TableCalcUsage.instance`` VERBATIM, so
     # the join must be byte-identical on that token; the bare calc id alone resolves to the BASE value
@@ -6924,7 +6924,7 @@ TECH_HIERARCHY_TWB = _workbook(
     "<dashboard name='Tech Hierarchy'><size maxwidth='1400' maxheight='1000' /><zones>"
     + _text_object_container(
         _text_object_ws_zone("Placeholder"),
-        _text_object_zone("ATTI/ATTR Tech Hierarchy", fill="#5a23b9", color="#ffffff",
+        _text_object_zone("Sample Tech Hierarchy", fill="#5a23b9", color="#ffffff",
                           x=0, y=0, w=100000, h=9245, zid="99"),
         _text_object_zone("Director", fill="#5a23b9c1", color="#ffffff",
                           x=0, y=25000, w=25000, h=5000, zid="10"),
@@ -6961,7 +6961,7 @@ BANNER_ONLY_TWB = _workbook(
     "<dashboard name='Banner Only'><zones>"
     + _text_object_container(
         _text_object_ws_zone("Solo"),
-        _text_object_zone("ATTI/ATTR Tech Hierarchy", fill="#5a23b9", color="#ffffff",
+        _text_object_zone("Sample Tech Hierarchy", fill="#5a23b9", color="#ffffff",
                           x=0, y=0, w=100000, h=9245, zid="99"),
     )
     + "</zones></dashboard>",
@@ -6998,8 +6998,8 @@ def test_all_text_objects_captured_tech_hierarchy():
     texts = {t["text"] for t in db["text_objects"]}
     assert {"Director", "Manager", "Supervisor", "Technician"} <= texts
     # banner is kept as title_banner and NOT duplicated in text_objects
-    assert db["title_banner"]["text"] == "ATTI/ATTR Tech Hierarchy"
-    assert not any(t["text"] == "ATTI/ATTR Tech Hierarchy" for t in db["text_objects"])
+    assert db["title_banner"]["text"] == "Sample Tech Hierarchy"
+    assert not any(t["text"] == "Sample Tech Hierarchy" for t in db["text_objects"])
     # 8-digit fills split into rgb + transparency
     director = next(t for t in db["text_objects"] if t["text"] == "Director")
     assert director["fill"] == "#5a23b9" and director["transparency"] == 24

@@ -190,8 +190,8 @@ def test_download_workbook_url_include_extract_flag():
 
 # -- pick_workbook --------------------------------------------------------------------------
 def test_pick_workbook_one_match_case_insensitive():
-    wb = [{"id": "a", "name": "Comcast Test"}, {"id": "b", "name": "Other"}]
-    assert F.pick_workbook(wb, "comcast test") == ("a", "Comcast Test")
+    wb = [{"id": "a", "name": "Acme Test"}, {"id": "b", "name": "Other"}]
+    assert F.pick_workbook(wb, "acme test") == ("a", "Acme Test")
 
 
 def test_pick_workbook_none_raises_with_available_list():
@@ -378,11 +378,11 @@ def test_resolve_workbook_luid_parses_rest_shape(monkeypatch):
 
     def _fake_http_json(method, url, token=None):
         captured["url"] = url
-        return {"workbooks": {"workbook": [{"id": "wb-luid", "name": "Comcast Test"}]}}
+        return {"workbooks": {"workbook": [{"id": "wb-luid", "name": "Acme Test"}]}}
 
     monkeypatch.setattr(F, "_http_json", _fake_http_json)
-    assert F.resolve_workbook_luid("h", "3.24", "SITE", "tok", "Comcast Test") == (
-        "wb-luid", "Comcast Test")
+    assert F.resolve_workbook_luid("h", "3.24", "SITE", "tok", "Acme Test") == (
+        "wb-luid", "Acme Test")
     assert "/sites/SITE/workbooks?" in captured["url"]
 
 
@@ -393,23 +393,23 @@ def _make_twbx(twb_text, extra=None):
         zf.writestr("Data/extract.hyper", b"\x00\x01binary")
         if extra:
             zf.writestr(extra, "x")
-        zf.writestr("Comcast Test.twb", twb_text)
+        zf.writestr("Acme Test.twb", twb_text)
     return buf.getvalue()
 
 
 def test_save_outputs_workbook_plain_twb(tmp_path):
     raw = b"<workbook name='x'/>"
-    doc_path, archive = F.save_outputs(raw, str(tmp_path), "Comcast Test", kind="workbook")
+    doc_path, archive = F.save_outputs(raw, str(tmp_path), "Acme Test", kind="workbook")
     assert archive is None
     # Reuses the same derive_filename sanitization as the datasource path (space -> "_").
-    assert os.path.basename(doc_path) == "Comcast_Test.twb"
+    assert os.path.basename(doc_path) == "Acme_Test.twb"
     with open(doc_path, "rb") as fh:
         assert fh.read() == raw
 
 
 def test_save_outputs_workbook_twbx_extracts_inner_twb(tmp_path):
     raw = _make_twbx("<workbook name='inner'/>")
-    doc_path, archive = F.save_outputs(raw, str(tmp_path), "Comcast Test", kind="workbook")
+    doc_path, archive = F.save_outputs(raw, str(tmp_path), "Acme Test", kind="workbook")
     assert archive is not None and archive.endswith(".twbx")
     assert doc_path.endswith(".twb")
     with open(doc_path, encoding="utf-8") as fh:
@@ -433,11 +433,11 @@ def test_save_outputs_default_kind_is_datasource(tmp_path):
 # -- main() selector + dispatch (offline dry-run) -------------------------------------------
 def test_main_dry_run_workbook_plans_workbook_endpoints(capsys):
     rc = F.main(["--server", "10ay.online.tableau.com", "--site", "s",
-                 "--workbook-name", "Comcast Test", "--dry-run"])
+                 "--workbook-name", "Acme Test", "--dry-run"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "/sites/<SITE_ID>/workbooks?" in out
-    assert "/workbooks/name:eq:Comcast Test/content" in out
+    assert "/workbooks/name:eq:Acme Test/content" in out
     assert "save .twb/.twbx" in out
 
 

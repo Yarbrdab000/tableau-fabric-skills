@@ -617,7 +617,7 @@ def test_emit_value_parameter_reports_consumed_source_params():
 
 def _numlist_param(caption="Date Selection", internal="[Parameter 0014172370878491]",
                    members=("15.", "30.", "41."), default="15.", aliases="__default__"):
-    # Mirrors the real Comcast "Date Selection": a real-typed LIST param whose integer-ish members
+    # Mirrors the real Acme "Date Selection": a real-typed LIST param whose integer-ish members
     # (Tableau serializes the keys with a trailing dot) carry friendly display aliases.
     if aliases == "__default__":
         aliases = {"15.": "Current Orders", "30.": "Previous Orders", "41.": "All Orders"}

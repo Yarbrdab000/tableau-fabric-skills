@@ -1227,7 +1227,7 @@ def test_calc_column_report_and_coverage_artifact():
 
 # -- assisted (human-approved) landing for a STUBBED dimension calc: the column-mode peer of the
 #    measures' approved_calc_dax path -- i.e. the second-compiler loop for a dimension-role calc.
-#    Exercises the real Comcast pilot needs_review calc "Highest Selling City By State (name)".
+#    Exercises the real Acme pilot needs_review calc "Highest Selling City By State (name)".
 _PILOT_NAME_FORMULA = (
     "IF \n{fixed [State/Province]:Max(\n{fixed [State/Province],[City]: SUM([Sales])}\n)}\n"
     "= \n{fixed [State/Province],[City]: SUM([Sales])}\nthen [State/Province]\nEND")
@@ -2044,7 +2044,7 @@ _DATE_BAND_SQLSERVER = """<?xml version='1.0' encoding='utf-8' ?>
 
 
 def _date_band_model():
-    """A faithful Comcast-shape date band: an aliased numeric LIST param (Date Selection) +
+    """A faithful Acme-shape date band: an aliased numeric LIST param (Date Selection) +
     a band-case "Date Filter" calc whose inner ref resolves to a LAST() calc. The descriptor
     carries an Order Date column so the shared Date dimension (the anchor) actually generates."""
     params = [

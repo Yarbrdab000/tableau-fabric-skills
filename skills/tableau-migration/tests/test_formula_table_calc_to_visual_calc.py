@@ -1,6 +1,6 @@
 """Tests for the formula-authored table-calc -> nested Visual-Calculation compiler.
 
-Proves the faithful happy paths (the real Comcast composit + Rank chain, non-blend and blend
+Proves the faithful happy paths (the real Acme composit + Rank chain, non-blend and blend
 shapes) and the fail-closed boundary (anything outside the subset -> a review reason, never a
 guessed translation).
 """
