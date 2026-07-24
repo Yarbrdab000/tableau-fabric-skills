@@ -13,6 +13,34 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.0.0` → `2.1.0`): Report-fidelity bundle — KPI title-card, measure
+  trellis, dynamic caption tokens, slicer-format canonicalization, and a card display-units (R5)
+  scoping correction.** A batch of session-accumulated, additive report-side improvements committed
+  together (each fail-closed → the prior output is byte-identical when its pattern does not fire):
+  - **KPI title-card** (`_detect_kpi_title_card` / `_emit_kpi_title_card`) — a Tableau BAN worksheet
+    that embeds its headline measure inside the worksheet *title* (a large dynamic field run above a
+    trend mark) is rebuilt as a real Power BI `card` bound to that measure, sitting above the retained
+    sparkline, instead of losing the number to an inert title string.
+  - **Measure trellis** (`_detect_measure_trellis` / `_emit_measure_trellis`) — 2+ distinct measure
+    pills `+`-concatenated on one bar/column shelf (Tableau draws one pane per measure) fan out into N
+    side-by-side single-measure charts on a shared category axis, rather than collapsing into one
+    clustered block sharing a single axis (Power BI has no native multi-measure trellis). Fail-closed:
+    a Series legend, a `SmallMultiple` role, `[Measure Values]`, or a single measure → the existing
+    clustered chart, unchanged.
+  - **Dynamic caption tokens** (`_resolve_dynamic_text_tokens`) — a parameter/field reference woven
+    into an authored text/caption is resolved to its literal value so the caption reads as authored.
+  - **Slicer-format canonicalization** (`_slicer_font_props` / `_apply_slicer_format`) — centralizes
+    slicer header/item font styling and emits the correct PBIR `textSize` property (not the invalid
+    `fontSize`, which Power BI silently drops), plus the header caption and plate fill.
+  - **Field-expression aggregation recovery on column rebind** — a derived field rebound to a numeric
+    column recovers its aggregation; a non-numeric column correctly does not.
+  - **Grid font objects** — a `tableEx` targets the `total` font object (not `rowHeaders`/`subtotals`);
+    a `matrix` keeps `rowHeaders` + `subtotals`.
+  - **pbir_lint R5 scoping fix** — the card display-units guard is scoped to `card` only and reads the
+    value object `labels.labelDisplayUnits`; a `multiRowCard`'s value object is `dataLabels`, which has
+    no `labelDisplayUnits` channel, so R5 no longer misfires on it.
+  Additive; no report-schema or default-path change beyond the intended fidelity improvements.
+  Suite 3038 → 3047.
 - **tableau-migration (skill `1.99.0` → `2.0.0`): A symbol (bubble) map sized by an average now
   raises a legibility caveat (sf-npo Lesson 8).** On an azureMap/symbol map the bubble radius encodes
   the Size measure; sizing by an AVERAGE gives every location a near-identical radius (each place

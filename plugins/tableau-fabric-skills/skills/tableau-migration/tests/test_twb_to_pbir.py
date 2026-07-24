@@ -1373,6 +1373,37 @@ def test_apply_override_keeps_aggregation_pill_aggregation():
     assert "Aggregation" in expr
 
 
+def test_field_expression_recovers_derivation_aggregation_on_column_rebind():
+    # A VALUE pill carrying a Tableau aggregation in ``derivation`` (a calc measure materialised as a
+    # model column, so ``_apply_override`` flips measure->column) must still AGGREGATE -- a bare column
+    # in a card/KPI value well with ``summarizeBy: none`` renders a Power BI error visual. The source
+    # AVG must survive as AVERAGE(column), not collapse to an un-aggregated column. (sf-npo Intake:
+    # "Avg. Days to Close Inbound Referrals" KPI card broke exactly this way.)
+    fld = {"caption": "Days to Close", "kind": "value", "role": "measure", "is_calc": True,
+           "derivation": "Avg", "aggregation": None, "datatype": "integer",
+           "entity": "_Measures", "property": "Days to Close", "binding": "measure"}
+    fm = {"Days to Close": {"entity": "Case", "property": "Days to Close"}}
+    entity, prop, binding = _apply_override(fld, "Sheet1", fm)
+    assert (entity, prop, binding) == ("Case", "Days to Close", "column")
+    expr, qref, nref = _field_expression(fld, "Sheet1", fm)
+    assert "Aggregation" in expr and "Column" in expr["Aggregation"]["Expression"]
+    assert expr["Aggregation"]["Function"] == 1  # Average
+    assert qref == "Avg(Case.Days to Close)"
+    assert nref == "Avg of Days to Close"
+
+
+def test_field_expression_skips_derivation_aggregation_on_non_numeric_column():
+    # Guard: a non-numeric column must NOT be wrapped in a numeric aggregation (that itself errors) --
+    # mirror the resolve-time numeric guard so the recovery stays fail-closed.
+    fld = {"caption": "Segment", "kind": "value", "role": "measure", "is_calc": True,
+           "derivation": "Sum", "aggregation": None, "datatype": "string",
+           "entity": "_Measures", "property": "Segment", "binding": "measure"}
+    fm = {"Segment": {"entity": "Orders", "property": "Segment"}}
+    expr, qref, _ = _field_expression(fld, "Orders", fm)
+    assert "Column" in expr and "Aggregation" not in expr
+    assert qref == "Orders.Segment"
+
+
 def test_apply_override_keeps_plain_column_pill_column():
     fld = _ir_field("Category", "column")
     fm = {"Category": {"entity": "Orders", "property": "Category"}}
@@ -2202,6 +2233,95 @@ def test_pct_of_total_without_series_not_native():
     assert "Series" not in _query_state(vis)
 
 
+# -- measure-trellis fan-out (N '+'-concatenated distinct measures) ------------
+# Tableau lays several measures side by side by concatenating separate pills with
+# '+' on one shelf, drawing one pane per measure. Power BI has no native
+# multi-measure trellis (a clustered chart with 2+ Y renders GROUPED bars on one
+# axis), so the faithful rebuild is N side-by-side single-measure charts sharing
+# a category axis. See _detect_measure_trellis / _emit_measure_trellis.
+def _bool_show(objs, key):
+    return objs[key][0]["properties"]["show"]["expr"]["Literal"]["Value"]
+
+
+def test_measure_trellis_fans_out_into_side_by_side_charts():
+    # two DISTINCT measures '+'-concatenated on cols + a dimension on rows, no
+    # colour legend -> fan into 2 side-by-side bar charts on a shared category axis.
+    ws = _worksheet("Trellis", "Bar",
+                    rows="[federated.abc].[none:Category:nk]",
+                    cols="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+                    deps_extra=_INST)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["uses_measure_values"] is False
+    vis = list(_visual_parts(emit_pbir(ir)).values())
+    assert len(vis) == 2  # one chart per measure, not a single grouped clustered bar
+    # each fanned chart carries exactly ONE (distinct) measure on Y
+    ys = []
+    for v in vis:
+        yq = _query_state(v)["Y"]["projections"]
+        assert len(yq) == 1
+        ys.append(yq[0]["field"]["Aggregation"]["Expression"]["Column"]["Property"])
+    assert ys == ["Sales_Amount", "Profit"]
+    first, rest = vis[0], vis[1:]
+    # the FIRST chart shows the category axis (row labels appear once, on the left);
+    # the value axis is hidden on ALL (data labels carry the numbers -> compact strip)
+    assert _bool_show(first["visual"]["objects"], "categoryAxis") == "true"
+    assert _bool_show(first["visual"]["objects"], "valueAxis") == "false"
+    for v in rest:
+        assert _bool_show(v["visual"]["objects"], "categoryAxis") == "false"
+        assert _bool_show(v["visual"]["objects"], "valueAxis") == "false"
+    # geometry: N+1 logical columns (label gutter + one band per measure); chart 0
+    # spans gutter+first band (width 2u), later charts a single band (width u),
+    # laid left-to-right with no overlap and a shared height.
+    xs = [v["position"]["x"] for v in vis]
+    assert xs == sorted(xs)
+    assert first["position"]["width"] > rest[0]["position"]["width"]
+    assert abs(first["position"]["width"] - 2 * rest[0]["position"]["width"]) < 1.0
+    assert rest[0]["position"]["x"] >= first["position"]["x"] + first["position"]["width"] - 1.0
+    assert all(v["position"]["height"] == first["position"]["height"] for v in rest)
+    # the fan-out is disclosed (Power BI has no native multi-measure trellis)
+    assert any("measure-trellis" in w["reason"] for w in ir["warnings"])
+
+
+def test_single_measure_bar_is_not_a_trellis():
+    # exactly one measure -> no fan-out; the existing single clustered chart is kept.
+    ws = _worksheet("One Measure", "Bar",
+                    rows="[federated.abc].[none:Category:nk]",
+                    cols="[federated.abc].[sum:Sales:qk]",
+                    deps_extra=_INST)
+    vis = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())
+    assert len(vis) == 1
+    assert vis[0]["visual"]["visualType"] == "clusteredBarChart"
+
+
+def test_detect_measure_trellis_guards():
+    from twb_to_pbir import _detect_measure_trellis
+    p = {"field": {"Measure": {"Property": "X"}}}
+    c = {"field": {"Column": {"Property": "D"}}}
+    fires = {"visual_type": "bar", "uses_measure_values": False}
+    state = {"Y": {"projections": [p, p]}, "Category": {"projections": [c]}}
+    # fires on the canonical shape: bar, 2+ Y, 1+ Category, no series/MV/small-multiple
+    assert _detect_measure_trellis(fires, state) == [p, p]
+    assert _detect_measure_trellis({"visual_type": "column", "uses_measure_values": False},
+                                   state) == [p, p]
+    # a single Y is not a trellis
+    assert _detect_measure_trellis(fires, {"Y": {"projections": [p]},
+                                           "Category": {"projections": [c]}}) is None
+    # no Category axis -> not a trellis
+    assert _detect_measure_trellis(fires, {"Y": {"projections": [p, p]}}) is None
+    # Measure Values shelf is the grouped/series idiom (one shared axis), never a fan-out
+    assert _detect_measure_trellis({"visual_type": "bar", "uses_measure_values": True},
+                                   state) is None
+    # a colour-legend Series is a genuine grouped/stacked chart
+    ser = dict(state, Series={"projections": [c]})
+    assert _detect_measure_trellis(fires, ser) is None
+    # an existing native SmallMultiple trellis is left alone
+    sm = dict(state, SmallMultiple={"projections": [c]})
+    assert _detect_measure_trellis(fires, sm) is None
+    # non-bar/column marks never fan out
+    assert _detect_measure_trellis({"visual_type": "line", "uses_measure_values": False},
+                                   state) is None
+
+
 # -- degenerate visuals are skipped (not emitted as empty shells) --------------
 def test_chart_missing_required_role_is_skipped_by_emit_gate():
     # a column visual whose shelves resolved to nothing must not emit an empty shell
@@ -2817,16 +2937,63 @@ def test_shape_map_objects_emit_diverging_saturation_gradient_centred_at_zero():
     dp = vis["visual"]["objects"]["dataPoint"][0]["properties"]
     grad = dp["fillRule"]["linearGradient3"]
     # orange -> white -> blue, white PINNED at the 0 centre (mid carries a value anchor; min/max
-    # stay value-less so they auto-scale to the data low/high)
-    assert grad["min"]["color"]["expr"]["Literal"]["Value"] == "'#FEA043'"
-    assert grad["mid"]["color"]["expr"]["Literal"]["Value"] == "'#FFFFFF'"
-    assert grad["max"]["color"]["expr"]["Literal"]["Value"] == "'#4A88C2'"
-    assert grad["mid"]["value"]["expr"]["Literal"]["Value"] == "0D"   # centre pinned at break-even
+    # stay value-less so they auto-scale to the data low/high). Each stop is an UNWRAPPED literal
+    # (no ``expr`` wrapper) -- the ``expr`` form fails to load (PBIR_FILLRULE_STOP_DOUBLE_WRAP).
+    assert grad["min"]["color"]["Literal"]["Value"] == "'#FEA043'"
+    assert grad["mid"]["color"]["Literal"]["Value"] == "'#FFFFFF'"
+    assert grad["max"]["color"]["Literal"]["Value"] == "'#4A88C2'"
+    assert grad["mid"]["value"]["Literal"]["Value"] == "0D"          # centre pinned at break-even
     assert "value" not in grad["min"]                                 # endpoints auto-scale...
     assert "value" not in grad["max"]                                 # ...to the data range
-    assert grad["nullColoringStrategy"]["strategy"]["expr"]["Literal"]["Value"] == "'asZero'"
+    assert grad["nullColoringStrategy"]["strategy"]["Literal"]["Value"] == "'asZero'"
     assert dp["showAllDataPoints"]["expr"]["Literal"]["Value"] == "true"
     assert "linearGradient2" not in dp["fillRule"]  # not the old sequential 2-colour ramp
+
+
+def test_grid_font_objects_tableex_uses_total_not_rowheaders_or_subtotals():
+    # A flat tableEx exposes NO rowHeaders / subTotals objects (only columnHeaders / values / total).
+    # Emitting rowHeaders/subTotals on a tableEx trips PBIR_FORMATTING_OBJECT_UNKNOWN and Power BI
+    # silently drops the styling, so the total-row style must land on the ``total`` object instead.
+    from twb_to_pbir import _grid_font_objects, VT_TABLE
+    ws = {
+        "visual_type": VT_TABLE,
+        "grid_styles": {
+            "header": {"font_size": "11D", "bold": True},
+            "header_fill": {"fill": "#DDDDDD"},
+            "body": {"font_size": "9D"},
+            "total": {"font_size": "10D", "bold": True},
+            "subtotal_fill": {"fill": "#EEEEEE"},
+        },
+    }
+    fo = _grid_font_objects(ws)
+    assert "rowHeaders" not in fo          # invalid on tableEx
+    assert "subTotals" not in fo           # invalid on tableEx
+    assert "columnHeaders" in fo
+    assert "values" in fo
+    assert "total" in fo                   # total-row style routed to the valid ``total`` object
+    tot = fo["total"][0]["properties"]
+    assert tot["fontSize"]["expr"]["Literal"]["Value"] == "10D"
+    assert tot["backColor"]["solid"]["color"]["expr"]["Literal"]["Value"] == "'#EEEEEE'"
+
+
+def test_grid_font_objects_matrix_keeps_rowheaders_and_subtotals():
+    # A matrix (pivotTable) DOES expose rowHeaders + per-group subTotals -- both valid there -- so the
+    # type-aware split must leave the matrix path unchanged (no regression from the tableEx fix).
+    from twb_to_pbir import _grid_font_objects, VT_MATRIX
+    ws = {
+        "visual_type": VT_MATRIX,
+        "grid_styles": {
+            "header": {"font_size": "11D", "bold": True},
+            "body": {"font_size": "9D"},
+            "total": {"font_size": "10D"},
+        },
+    }
+    fo = _grid_font_objects(ws)
+    assert "rowHeaders" in fo
+    assert "subTotals" in fo
+    assert "columnHeaders" in fo
+    assert "values" in fo
+    assert "total" not in fo               # matrix uses subTotals for the total-row style
 
 
 # Country/Region declared with its own geo semantic-role, so both it AND State carry a geo_area and
@@ -5655,14 +5822,16 @@ def test_card_label_colours_emit_category_and_data_label_objects():
     assert cat == "'{0}'".format(_SALES_HEX)
     assert val == "'{0}'".format(_PROFIT_HEX)
     assert size == "14D"
-    # Card display units (fidelity): the value object also pins labelDisplayUnits to None ('1D') so
-    # the recoloured big number is not abbreviated -- merged alongside the colour, never clobbering it.
-    assert objs["dataLabels"][0]["properties"]["labelDisplayUnits"]["expr"]["Literal"]["Value"] == "1D"
+    # A multiRowCard's value object is ``dataLabels`` (verified against ``formatting list-objects``),
+    # which -- unlike a ``card``'s ``labels`` -- has NO ``labelDisplayUnits`` channel, so display units
+    # are not (and cannot be) pinned on it. (A ``card`` pins them under ``labels`` -- see below.)
+    assert "labelDisplayUnits" not in objs["dataLabels"][0]["properties"]
 
 
-def test_card_without_recoloured_label_pins_display_units_none():
-    # A plain KPI card (no customized-label) carries no card_label_colors and no categoryLabels; its
-    # value object exists only to pin labelDisplayUnits to None ('1D') -- no colour / fontSize added.
+def test_multirow_card_without_recoloured_label_has_no_display_units():
+    # A plain two-measure KPI (no customized-label) -> a multiRowCard with no card_label_colors and no
+    # categoryLabels. Its value object ``dataLabels`` has no ``labelDisplayUnits`` channel, so none is
+    # pinned (a ``card``'s ``labels`` is where display units live -- see the single-measure test).
     ws = _worksheet("Plain KPIs", "Bar",
                     rows="[federated.abc].[sum:Sales:qk]",
                     cols="[federated.abc].[sum:Profit:qk]",
@@ -5670,33 +5839,71 @@ def test_card_without_recoloured_label_pins_display_units_none():
     ir = parse_twb(_workbook(ws))
     assert ir["worksheets"][0]["card_label_colors"] is None
     vj = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vj["visual"]["visualType"] == "multiRowCard"
     objs = vj["visual"].get("objects", {})
     assert "categoryLabels" not in objs
-    props = objs["dataLabels"][0]["properties"]
-    assert props["labelDisplayUnits"]["expr"]["Literal"]["Value"] == "1D"
-    assert "color" not in props and "fontSize" not in props
+    for entry in objs.get("dataLabels", []):
+        assert "labelDisplayUnits" not in entry.get("properties", {})
+    assert "labels" not in objs
 
 
 def test_single_measure_card_pins_display_units_none():
-    # A single measure with no dimension -> a "card" (not multiRowCard); it too pins None display units.
+    # A single measure with no dimension -> a "card" (not multiRowCard); its value object is ``labels``
+    # (NOT ``dataLabels`` -- that is multiRowCard's), which is where a card pins display units to None.
     ws = _worksheet("One KPI", "Bar",
                     rows="[federated.abc].[sum:Sales:qk]", cols="", deps_extra=_INST)
     vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
     assert vj["visual"]["visualType"] == "card"
     objs = vj["visual"]["objects"]
-    assert objs["dataLabels"][0]["properties"]["labelDisplayUnits"]["expr"]["Literal"]["Value"] == "1D"
+    assert objs["labels"][0]["properties"]["labelDisplayUnits"]["expr"]["Literal"]["Value"] == "1D"
+    assert "dataLabels" not in objs
 
 
 def test_non_card_visual_gets_no_card_display_units():
     # Additivity: display-units pinning is scoped to the card family; a bar/column visual with a real
-    # dimension never gains a dataLabels.labelDisplayUnits property.
+    # dimension never gains a card ``labels.labelDisplayUnits`` (nor a ``dataLabels`` one).
     ws = _worksheet("Sales by Cat", "Bar",
                     rows="[federated.abc].[sum:Sales:qk]",
                     cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
     vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
     assert vj["visual"]["visualType"] not in ("card", "multiRowCard")
-    for entry in vj["visual"].get("objects", {}).get("dataLabels", []):
-        assert "labelDisplayUnits" not in entry.get("properties", {})
+    objs = vj["visual"].get("objects", {})
+    for key in ("dataLabels", "labels"):
+        for entry in objs.get(key, []):
+            assert "labelDisplayUnits" not in entry.get("properties", {})
+
+
+# -- slicer header/items font -> textSize (not fontSize) -----------------------
+# A slicer ``header``/``items`` object's SIZE channel is ``textSize`` -- NOT the ``fontSize`` every
+# title/axis/grid channel uses. Emitting ``fontSize`` there is rejected by the PBIR validator
+# (``PBIR_FORMATTING_PROP_UNKNOWN``) and the caption silently clips. ``_slicer_font_props`` renames the
+# one divergent key while keeping every other font key identical to the shared builder.
+def test_slicer_font_props_renames_font_size_to_text_size():
+    from twb_to_pbir import _slicer_font_props
+    props = _slicer_font_props({"font_size": "10D", "font_color": "#203040",
+                                "bold": True, "font_family": "Segoe UI"})
+    assert "fontSize" not in props
+    assert props["textSize"]["expr"]["Literal"]["Value"] == "10D"
+    # every non-size key is unchanged from the shared font builder
+    assert props["fontColor"]["solid"]["color"]["expr"]["Literal"]["Value"] == "'#203040'"
+    assert props["bold"]["expr"]["Literal"]["Value"] == "true"
+    assert props["fontFamily"]["expr"]["Literal"]["Value"] == "'Segoe UI'"
+
+
+def test_apply_slicer_format_emits_text_size_and_header_caption():
+    from twb_to_pbir import _apply_slicer_format
+    visual = {}
+    _apply_slicer_format(visual, hdr_style={"font_size": "9D"}, itm_style={"font_size": "8D"},
+                         header_text="Program Issue Area")
+    hdr = visual["objects"]["header"][0]["properties"]
+    itm = visual["objects"]["items"][0]["properties"]
+    # SIZE key is textSize on both header and items; fontSize must NEVER appear on a slicer object
+    assert hdr["textSize"]["expr"]["Literal"]["Value"] == "9D"
+    assert itm["textSize"]["expr"]["Literal"]["Value"] == "8D"
+    assert "fontSize" not in hdr and "fontSize" not in itm
+    # the authored Tableau caption overrides the header Title text (shown, faithful name)
+    assert hdr["text"]["expr"]["Literal"]["Value"] == "'Program Issue Area'"
+    assert hdr["show"]["expr"]["Literal"]["Value"] == "true"
 
 
 # -- nativeQueryRef collision guard (sf-npo Lesson 2) --------------------------
@@ -5896,14 +6103,17 @@ def test_data_labels_absent_emits_nothing():
 
 
 def test_data_labels_on_card_not_applicable():
-    # A card already displays its value, so a label toggle on a card emits no labels object and no
-    # fact (the label types exclude card / table / matrix / map).
+    # A card already displays its value, so the data-label TOGGLE does not apply to a card: it emits no
+    # data-labels fact and no label-toggle ``show`` (the label types exclude card/table/matrix/map).
+    # (A card DOES carry a ``labels`` object, but only to pin display units to None -- a separate R5
+    # fidelity concern -- never a ``show`` toggle.)
     ws = _worksheet("KPI", "Text",
                     rows="[federated.abc].[sum:Sales:qk]", cols="",
                     deps_extra=_INST, pane_extra=_label_style(True))
     res = migrate_twb_to_pbir(_workbook(ws))
     vj = list(_visual_parts(res["parts"]).values())[0]
-    assert _labels_objects(vj) is None
+    for entry in (_labels_objects(vj) or []):
+        assert "show" not in entry.get("properties", {})
     assert _dl_fact(res["candidate_records"], "KPI") is None
 
 

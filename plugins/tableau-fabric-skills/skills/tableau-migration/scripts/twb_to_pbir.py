@@ -1992,6 +1992,82 @@ def _parse_worksheet_title(ws):
     return text, bool(_TITLE_DYNAMIC_RE.search(text))
 
 
+# A Tableau KPI ("BAN" / big-number) worksheet embeds its headline number IN the title: a static
+# caption run plus a LARGE dynamic field-ref run (the live measure), drawn above a small sparkline
+# mark. Power BI cannot embed a live measure in a container title, so the number is rebuilt as a
+# real ``card`` bound to that measure (see ``_emit_kpi_title_card``) while the worksheet's own visual
+# keeps the sparkline. A whole ``<[ds].[field]>`` run at >= this point size is the number; a small
+# inline ``<[Parameters]...>`` token (a parameter woven into a caption) is NOT -- it stays deferred.
+_KPI_TITLE_MIN_SIZE = 18.0
+_TITLE_FULL_REF_RE = re.compile(r"^<(\[[^<>\[\]]*\]\.\[[^<>\[\]]*\])>$")
+
+
+def _detect_kpi_title_card(ws):
+    """Detect a KPI title-card worksheet -> ``{"caption", "ref", "value_color", "value_size"}`` or
+    ``None``.
+
+    The signature (confirmed against the real workbook): the title's ``<formatted-text>`` carries a
+    single dynamic ``<[ds].[usr:Calculation...]>`` run at a large font size (the headline number) --
+    NOT a ``[Parameters]`` reference (a parameter woven into a caption is a different, deferred case)
+    -- alongside one or more static caption runs. ``caption`` is those static runs cleaned of the
+    ``U+FFFD`` replacement char and the hidden white ``_`` spacer run; ``ref`` is the ``[ds].[field]``
+    token (brackets kept) for the embedded measure; ``value_color`` / ``value_size`` carry the run's
+    authored colour / point size for the rebuilt card's big number.
+    """
+    layout = _first(ws, "layout-options")
+    title = _first(layout, "title") if layout is not None else None
+    ft = _first(title, "formatted-text") if title is not None else None
+    if ft is None:
+        return None
+    runs = _findall_local(ft, "run")
+    number_run = None
+    number_idx = None
+    for idx, r in enumerate(runs):
+        m = _TITLE_FULL_REF_RE.match((r.text or "").strip())
+        if not m:
+            continue
+        ref = m.group(1)
+        if "[Parameters]" in ref:
+            continue
+        try:
+            size = float(r.get("fontsize") or 0)
+        except (TypeError, ValueError):
+            size = 0.0
+        if size >= _KPI_TITLE_MIN_SIZE:
+            number_run = (r, ref)
+            number_idx = idx
+            break
+    if number_run is None:
+        return None
+    number, ref = number_run
+
+    def _caption_text(candidate_runs):
+        parts = []
+        for other in candidate_runs:
+            if other is number:
+                continue
+            if (other.get("fontcolor") or "").lower() == "#ffffff":
+                continue  # hidden white ``_`` spacer run
+            parts.append(other.text or "")
+        # Strip Tableau's line-break sentinels (U+FFFD replacement, U+00C6 soft-return marker) and
+        # collapse whitespace; legitimate caption punctuation (``%`` etc.) is preserved.
+        joined = "".join(parts).replace("\ufffd", " ").replace("\u00c6", " ")
+        return re.sub(r"\s+", " ", joined).strip()
+
+    # The caption is the label ABOVE the number: the runs that precede it. Everything after the
+    # number run is trailing decoration (a soft-return sentinel + a hidden white spacer). Fall back
+    # to every non-number run only if there is no leading caption text.
+    caption = _caption_text(runs[:number_idx])
+    if not caption:
+        caption = _caption_text(runs)
+    if not caption:
+        return None
+    color = number.get("fontcolor")
+    color = color if (color and _HEX6_RE.match(color)) else None
+    return {"caption": caption, "ref": ref,
+            "value_color": color, "value_size": _font_size_points(number.get("fontsize"))}
+
+
 # Per-run font attributes on a title's ``<run>`` that Tier-2 title styling reproduces only when it
 # can do so faithfully. ``bold`` and ``fontname`` (font family) are emitted when uniform (family
 # only for a REAL font -- Tableau's internal 'Tableau Bold' / 'Tableau Semibold' etc. have no Power
@@ -3260,14 +3336,44 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                     f"mark class '{mark}' / shelf layout not supported -> no visual emitted"))
 
     title_text, title_dynamic = _parse_worksheet_title(ws)
+    kpi_title_card = None
     if visual_type == VT_UNSUPPORTED:
         title_text = None
     elif title_dynamic:
-        warnings.append(_warn(
-            "worksheet", name,
-            "dynamic title (embeds a field/parameter reference) not reproduced as static text; "
-            "the rebuilt visual keeps its default title"))
-        title_text = None
+        kpi = _detect_kpi_title_card(ws)
+        kpi_fields = _resolve_shelf(
+            kpi["ref"], ds_default, base_cols, instances, index, ds_caption, name, warnings,
+            warn_special=False, internal_fields=internal_fields, date_binding=date_binding,
+            row_count_binding=row_count_binding, measure_binding=measure_binding,
+            column_binding=column_binding) if kpi else []
+        kpi_measures = [f for f in kpi_fields
+                        if f.get("binding") == "measure" or f.get("role") == "measure"]
+        if kpi and kpi_measures:
+            # KPI title-card: keep the static caption as the title and rebuild the headline number
+            # (the big dynamic measure run) as a companion card above the sparkline at emit time.
+            title_text = kpi["caption"]
+            # Bind the card to the worksheet's OWN primary measure (the one the sparkline plots),
+            # NOT the title-embedded reference. A Tableau KPI title number is almost always a
+            # cumulative table-calc wrapper -- ``TOTAL([X])`` / ``IF LAST()=0 THEN RUNNING_SUM([X])
+            # END`` -- around that same base metric; in a card (no time axis) the base measure
+            # aggregates to the grand total, which equals the wrapper's final value, AND the base
+            # measure is a real translated measure whereas the table-calc wrapper is typically a
+            # deterministic stub (``= 0``) that would render a blank ``0``. Fall back to the title
+            # reference only when the worksheet carries no measure of its own on Rows/Cols.
+            ws_measures = meas_rows + meas_cols
+            card_measures = (ws_measures or kpi_measures)[:1]
+            kpi_title_card = {"caption": kpi["caption"], "measure_fields": card_measures,
+                              "value_color": kpi["value_color"], "value_size": kpi["value_size"]}
+            warnings.append(_warn(
+                "worksheet", name,
+                "KPI title number (a dynamic measure embedded in the title) rebuilt as a companion "
+                "card above the visual; the static caption is kept as the title"))
+        else:
+            warnings.append(_warn(
+                "worksheet", name,
+                "dynamic title (embeds a field/parameter reference) not reproduced as static text; "
+                "the rebuilt visual keeps its default title"))
+            title_text = None
 
     title_style = _parse_title_style(ws) if title_text else None
 
@@ -3377,6 +3483,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "reference_line_constants": reference_line_constants,
         "rows": rows,
         "cols": cols,
+        "uses_measure_values": uses_mv,
         "encodings": encodings,
         "filters": filters,
         "swap_controls": swap_controls,
@@ -3385,6 +3492,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "lollipop": lollipop,
         "lollipop_color": lollipop_color,
         "sort": sort,
+        "kpi_title_card": kpi_title_card,
     }
 
 
@@ -3418,11 +3526,17 @@ def _zone_formatted_text(zone):
     """Flatten a dashboard zone's ``<formatted-text>`` ``<run>`` descendants to plain text.
 
     STRUCTURAL content only (the concatenated run text, stripped); per-run font attributes are read
-    separately (see ``_zone_run_color``). Returns ``""`` when the zone carries no formatted text."""
+    separately (see ``_zone_run_color``). Returns ``""`` when the zone carries no formatted text.
+
+    Tableau encodes a HARD line break inside a text box as the sentinel ``\\u00c6`` (Æ) immediately
+    followed by a real newline in its own ``<run>`` (e.g. a two-line column header "New Inbound" /
+    "Referrals"). We drop the Æ sentinel and keep the newline so the break survives without leaking a
+    literal "Æ" onto the page."""
     ft = _first(zone, "formatted-text")
     if ft is None:
         return ""
-    return "".join((r.text or "") for r in _findall_local(ft, "run")).strip()
+    joined = "".join((r.text or "") for r in _findall_local(ft, "run"))
+    return joined.replace("\u00c6\n", "\n").replace("\u00c6", "").strip()
 
 
 def _zone_run_color(zone):
@@ -3868,12 +3982,57 @@ def _parse_parameters(root):
                 if key not in seen:
                     seen.add(key)
                     members.append({"value": key, "alias": disp})
+            # The parameter's CURRENT value is the column's own ``value`` attribute; its display is
+            # the column ``alias`` (Tableau writes the resolved alias inline) or the matching member
+            # alias, else the raw literal. Tableau renders a ``<[Parameters].[<id>]>`` token woven
+            # into a caption/text zone AS this current display value (e.g. "Program Name"), so we
+            # capture it here to resolve those tokens at emit instead of leaking raw markup.
+            cur_val = _strip_member_literal(col.get("value")) if col.get("value") is not None else None
+            cur_display = col.get("alias")
+            if not cur_display and cur_val is not None:
+                cur_display = next((m.get("alias") for m in members
+                                    if m["value"] == cur_val and m.get("alias")), None)
+            if not cur_display and cur_val is not None:
+                cur_display = cur_val
             params[pid] = {
                 "caption": col.get("caption") or pid,
                 "datatype": (col.get("datatype") or "").lower(),
                 "members": members,
+                "current_value": cur_val,
+                "current_display": cur_display,
             }
     return params
+
+
+_PARAM_TOKEN_RE = re.compile(r"<\[Parameters\]\.\[(?P<pid>[^\]]+)\]>")
+_FIELD_TOKEN_RE = re.compile(r"<\[[^<>]+\]\.\[[^<>]+\]>")
+
+
+def _resolve_dynamic_text_tokens(text, params):
+    """Resolve/strip Tableau dynamic ``<...>`` markup in a dashboard text zone -> literal string.
+
+    Tableau text zones can weave a live token into their caption -- most commonly
+    ``<[Parameters].[<id>]>``, which renders as the parameter's CURRENT display value (e.g. the
+    "Show by Dimension" table-column header that reads "Program Name"). The deterministic emit path
+    has no live parameter, so a raw token would surface as literal ``<[Parameters].[...]>`` markup on
+    the page. We resolve every parameter token to its current display value (via ``params``) and
+    strip any remaining unresolvable field-ref token (``<[ds].[field]>``) rather than leak markup.
+    Returns the cleaned text (whitespace-collapsed); an all-token zone collapses to ``""`` so the
+    caller can drop the now-empty text object. Byte-identical for text carrying no dynamic token."""
+    if not text or "<" not in text:
+        return text
+
+    def _sub_param(mo):
+        pid = mo.group("pid")
+        info = params.get(pid) if params else None
+        disp = info.get("current_display") if info else None
+        return disp if disp else ""
+
+    out = _PARAM_TOKEN_RE.sub(_sub_param, text)
+    out = _FIELD_TOKEN_RE.sub("", out)
+    # Collapse only horizontal whitespace so a hard line break (Æ-sentinel newline) is preserved.
+    out = re.sub(r"[ \t]+", " ", out)
+    return "\n".join(ln.strip() for ln in out.split("\n")).strip()
 
 
 def _detect_sheet_swaps(worksheets, dashboards, params, warnings):
@@ -3978,6 +4137,21 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
         dashboards.append(parsed)
 
     params = _parse_parameters(root)
+    # Resolve any live ``<[Parameters].[<id>]>`` / field-ref markup woven into a dashboard text zone
+    # to the parameter's current display value (Tableau renders these as literal text -- e.g. the
+    # "Program Name" column header driven by the "Show by Dimension" parameter). A text object that
+    # was ONLY a dynamic token collapses to empty and is dropped, so no raw ``<[Parameters]...>``
+    # markup ever reaches the page. Byte-identical for text objects that carry no dynamic token.
+    for db in dashboards:
+        resolved_tobs = []
+        for tob in db.get("text_objects") or []:
+            new_text = _resolve_dynamic_text_tokens(tob.get("text", ""), params)
+            if not new_text:
+                continue
+            if new_text != tob.get("text"):
+                tob = dict(tob, text=new_text)
+            resolved_tobs.append(tob)
+        db["text_objects"] = resolved_tobs
     parameter_controls = _resolve_parameter_controls(dashboards, params, warnings, param_binding)
     sheet_swaps = _detect_sheet_swaps(worksheets, dashboards, params, warnings)
     visual_flags = _resolve_visual_flags(param_binding, ws_by_name, warnings)
@@ -4033,6 +4207,21 @@ def _field_expression(field, model_table, field_map):
         expr = {"Aggregation": {"Expression": column, "Function": func}}
         fname = field["aggregation"]
         return expr, f"{fname}({entity}.{prop})", f"{fname} of {prop}"
+    # A VALUE pill (kind="value") that carries a Tableau aggregation in its ``derivation`` but has been
+    # redirected to a model COLUMN (e.g. a calc materialised as a column, so ``_apply_override`` flipped
+    # ``measure`` -> ``column``) must still aggregate. A bare column in a value well cannot scalarise --
+    # a Power BI card/KPI over an un-aggregated column with ``summarizeBy: none`` renders an error visual
+    # ("See details"). Recover the source aggregation from ``derivation`` (dropped by the measure->column
+    # flip, which never carried it onto ``aggregation``) so e.g. ``AVG([Days to Close])`` stays an average.
+    if binding == "column" and field.get("kind") == "value":
+        deriv = field.get("derivation")
+        dt = field.get("datatype")
+        if deriv in _AGG_FUNC and not (
+                (deriv in _NUMERIC_AGGS and dt not in _NUMERIC_TYPES)
+                or (deriv in ("Min", "Max") and dt not in (_NUMERIC_TYPES | _DATE_TYPES))):
+            func = _AGG_FUNC[deriv]
+            expr = {"Aggregation": {"Expression": column, "Function": func}}
+            return expr, f"{deriv}({entity}.{prop})", f"{deriv} of {prop}"
     return column, f"{entity}.{prop}", prop
 
 
@@ -4635,6 +4824,139 @@ def _pbir_vtype(vt, state):
             # the column-stacking differs, so the binding path is unchanged.
             return "lineStackedColumnComboChart"
     return _VT_TO_PBIR[vt]
+
+
+def _bool_literal(value):
+    """A PBIR semantic-query boolean literal (``{"expr": {"Literal": {"Value": "true"|"false"}}}``)."""
+    return {"expr": {"Literal": {"Value": "true" if value else "false"}}}
+
+
+def _detect_measure_trellis(ws, state):
+    """Return the ordered list of Y measure projections when a bar/column worksheet is a Tableau
+    *measure-trellis* (2+ DISTINCT measure pills ``+``-concatenated on one shelf, drawing one
+    adjacent pane per measure), else ``None`` (fail-closed -> the existing single clustered chart,
+    byte-identical).
+
+    Tableau lays several measures side by side by concatenating separate pills with ``+`` on the
+    Columns shelf (horizontal bars) or Rows shelf (vertical bars); each measure gets its OWN axis /
+    pane. Power BI has no native multi-measure trellis -- a clustered bar/column with 2+ Y measures
+    renders them as GROUPED bars sharing ONE axis, which reads as a single clustered block rather
+    than the separate per-measure panels Tableau draws. The faithful rebuild is N side-by-side
+    single-measure charts aligned on a shared category axis (see ``_emit_measure_trellis``).
+
+    Guards (any miss -> ``None``):
+      * the mark is a bar or column;
+      * NO Series (a colour-dimension legend is a genuine grouped/stacked chart, not a trellis) and
+        NO SmallMultiple role (already a native trellis);
+      * 2+ Y measure projections and 1+ Category dimension;
+      * the worksheet does NOT use the ``[Measure Values]`` shelf -- that pseudo-field is the
+        clustered/series idiom (its member measures share ONE axis, routed elsewhere); only distinct
+        ``+``-concatenated measure pills form the separate-pane trellis this rebuilds. (In Tableau
+        the ONLY way to get grouped bars on one axis is Measure Values/Names, so distinct concatenated
+        measures are always separate panes -- making this signature exact.)
+    """
+    if ws["visual_type"] not in (VT_BAR, VT_COLUMN):
+        return None
+    if ws.get("uses_measure_values"):
+        return None
+    if state.get("Series", {}).get("projections"):
+        return None
+    if "SmallMultiple" in state:
+        return None
+    y_projs = state.get("Y", {}).get("projections", [])
+    cat_projs = state.get("Category", {}).get("projections", [])
+    if len(y_projs) < 2 or len(cat_projs) < 1:
+        return None
+    return list(y_projs)
+
+
+def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
+                          page_name, page_display, model_table, field_map, vname_base,
+                          sort_definition, label_objects, data_point_objects, warnings):
+    """Fan a measure-trellis into N side-by-side single-measure ``clustered{Bar,Column}Chart``
+    visuals aligned on a shared category axis. Returns ``(visuals, records)``.
+
+    Geometry: the source band is split into N+1 equal logical columns (a category-label gutter plus
+    one column per measure, so ``u = w / (N + 1)``). The FIRST chart spans the label gutter + its
+    measure band (width ``2u``) with the category axis SHOWN; each later chart occupies a single
+    measure band (width ``u``) with the category axis HIDDEN -- so the row labels appear once on the
+    left and every band lines up under its header. The numeric value axis is hidden on all (the data
+    labels carry the numbers, matching the compact Tableau strip); every chart shares the SAME
+    category binding + sort, so their rows stay aligned across the strip. Per-chart titles are
+    omitted because the dashboard's own column-header textboxes already caption each band.
+    """
+    visuals, records = [], []
+    n = len(measures)
+    u = w / (n + 1) if n else w
+    for k, proj in enumerate(measures):
+        if k == 0:
+            xk, wk, cat_shown = x, 2 * u, True
+        else:
+            xk, wk, cat_shown = x + (k + 1) * u, u, False
+        sub_state = dict(state)
+        sub_state["Y"] = {"projections": [proj]}
+        vtype = _pbir_vtype(ws["visual_type"], sub_state)
+        vname_k = _sanitize(f"{vname_base}-mt{k}")
+        pos = _position(xk, y, wk, h, tab=tab)
+        extra = {
+            "valueAxis": [{"properties": {"show": _bool_literal(False)}}],
+            "categoryAxis": [{"properties": {"show": _bool_literal(cat_shown)}}],
+        }
+        visuals.append(_visual_json(
+            vname_k, vtype, pos, sub_state, sort_definition,
+            label_objects=label_objects, data_point_objects=data_point_objects,
+            extra_objects=extra))
+        rec = _candidate_record(page_name, vname_k, ws, vtype, sub_state, pos,
+                                page_display=page_display,
+                                model_table=model_table, field_map=field_map)
+        rec["measure_trellis"] = {"index": k, "of": n,
+                                  "category_axis_shown": cat_shown}
+        records.append(rec)
+    warnings.append(_warn(
+        "worksheet", ws["name"],
+        f"measure-trellis ({n} measures on one axis) rebuilt as {n} side-by-side "
+        f"bar charts aligned on a shared category axis (Power BI has no native multi-measure "
+        f"trellis; the source draws one pane per measure)"))
+    return visuals, records
+
+
+def _emit_kpi_title_card(ws, kpi, x, y, w, h, tab, page_name, page_display,
+                         model_table, field_map, vname_base):
+    """Rebuild a KPI worksheet's title-embedded headline number as a companion Power BI ``card``.
+
+    Returns ``(visual, record)`` for the card, or ``None`` when the embedded measure could not be
+    resolved to a projection (the caller then leaves the sparkline captioned as-is). The card is
+    bound to the title measure, styled in the source's authored number colour / size, captioned with
+    the static title text, and placed in the TOP band of the zone; the caller shrinks the worksheet's
+    own sparkline into the band below it. The auto category label (the measure name) is hidden -- the
+    caption title already names the KPI, matching Tableau's caption-over-number layout.
+    """
+    projections = _role_projections(kpi["measure_fields"], model_table, field_map, set())
+    if not projections:
+        return None
+    state = {"Values": {"projections": projections}}
+    pos = _position(x, y, w, h, tab=tab)
+    value_props = {}
+    if kpi.get("value_color"):
+        value_props["color"] = {"solid": {"color": {"expr": {"Literal": {
+            "Value": _semantic_string_literal(kpi["value_color"])}}}}}
+    if kpi.get("value_size"):
+        value_props["fontSize"] = {"expr": {"Literal": {"Value": kpi["value_size"]}}}
+    card_label_objects = {"categoryLabels": [{"properties": {
+        "show": {"expr": {"Literal": {"Value": "false"}}}}}]}
+    if value_props:
+        # A ``card``'s big-number value object is ``labels`` (NOT ``dataLabels`` -- that is
+        # ``multiRowCard``'s; a ``dataLabels`` on a ``card`` is rejected FORMATTING_OBJECT_UNKNOWN and
+        # the colour/size are silently dropped at render). This KPI-title tile is always a ``card``.
+        card_label_objects["labels"] = [{"properties": value_props}]
+    vname = _sanitize(f"{vname_base}-kpi")
+    visual = _visual_json(vname, "card", pos, state, None,
+                          title=kpi["caption"], card_label_objects=card_label_objects)
+    rec = _candidate_record(page_name, vname, ws, "card", state, pos,
+                            page_display=page_display,
+                            model_table=model_table, field_map=field_map)
+    rec["kpi_title_card"] = {"caption": kpi["caption"]}
+    return visual, rec
 
 
 def _detect_native_pct_stacked(ws, state, vc_index):
@@ -5755,6 +6077,17 @@ def _chart_continuous_fill(ws, state, vtype, model_table, field_map, warnings):
 _CARD_LABEL_COLOR_TYPES = ("card", "multiRowCard")
 
 
+def _card_value_object_name(vtype):
+    """The card-family big-number VALUE formatting object name for the emitted ``vtype``.
+
+    A ``card`` exposes its value callout as ``labels``; a ``multiRowCard`` exposes it as ``dataLabels``
+    (verified against ``formatting list-objects card`` / ``multiRowCard`` -- a ``dataLabels`` on a
+    ``card`` OR a ``labels`` on a ``multiRowCard`` is rejected ``PBIR_FORMATTING_OBJECT_UNKNOWN`` and
+    the value colour / size / display-units are silently dropped at render).
+    """
+    return "labels" if vtype == "card" else "dataLabels"
+
+
 def _card_label_objects(ws, vtype):
     """Card label colours -> ``{categoryLabels, dataLabels}`` objects entry, or ``None``.
 
@@ -5776,30 +6109,33 @@ def _card_label_objects(ws, vtype):
     if cc.get("value_size"):
         value_props["fontSize"] = {"expr": {"Literal": {"Value": cc["value_size"]}}}
     if value_props:
-        out["dataLabels"] = [{"properties": value_props}]
+        out[_card_value_object_name(vtype)] = [{"properties": value_props}]
     return out or None
 
 
-# Card value display units (fidelity): a Power BI ``card`` / ``multiRowCard`` defaults its big-number
-# ``labelDisplayUnits`` to Auto (0), which ABBREVIATES (2,747 -> "3K") and breaks fidelity vs the
-# Tableau text / BAN mark, which shows the value in full. Setting it to Auto (0) does NOT disable the
-# abbreviation -- "None" is the display-units enum value 1, emitted as the Double literal ``1D``. We
-# force None on every rebuilt card so the big number reads in full. The property lives on the SAME
-# value object the card family already uses for its colour / size (``dataLabels``); merge-safe via
-# ``setdefault`` so an author-recoloured value keeps its properties and only gains the display units.
+# Card value display units (fidelity): a Power BI ``card`` defaults its big-number ``labelDisplayUnits``
+# to Auto (0), which ABBREVIATES (2,747 -> "3K") and breaks fidelity vs the Tableau text / BAN mark,
+# which shows the value in full. Setting it to Auto (0) does NOT disable the abbreviation -- "None" is
+# the display-units enum value 1, emitted as the Double literal ``1D``. We force None on every rebuilt
+# ``card`` so the big number reads in full. The property lives on the ``card`` value object ``labels``
+# (merge-safe via ``setdefault`` so an author-recoloured value keeps its properties and only gains the
+# display units). A ``multiRowCard``'s value object is ``dataLabels``, which has NO ``labelDisplayUnits``
+# channel (verified against ``formatting describe-object multiRowCard dataLabels``) -> display units
+# cannot be pinned there, so this is a no-op for it (and every non-card visual).
 def _apply_card_display_units(visual, vtype):
-    """Force ``dataLabels.labelDisplayUnits = None`` (``1D``) on a rebuilt card / multiRowCard.
+    """Force ``labels.labelDisplayUnits = None`` (``1D``) on a rebuilt ``card`` so it reads in full.
 
-    A no-op for every non-card visual type. Never clobbers an existing ``dataLabels`` value object
-    (author colour / font size); it only adds the display-units property when absent.
+    A no-op for ``multiRowCard`` (its ``dataLabels`` object has no display-units property) and every
+    non-card visual. Never clobbers an existing ``labels`` value object (author colour / font size);
+    it only adds the display-units property when absent.
     """
-    if vtype not in _CARD_LABEL_COLOR_TYPES:
+    if vtype != "card":
         return
     objs = visual.setdefault("objects", {})
-    data_labels = objs.setdefault("dataLabels", [{"properties": {}}])
-    if not data_labels:
-        data_labels.append({"properties": {}})
-    props = data_labels[0].setdefault("properties", {})
+    labels = objs.setdefault("labels", [{"properties": {}}])
+    if not labels:
+        labels.append({"properties": {}})
+    props = labels[0].setdefault("properties", {})
     props.setdefault("labelDisplayUnits", {"expr": {"Literal": {"Value": "1D"}}})
 
 
@@ -5993,26 +6329,30 @@ def _shape_map_datapoint_objects():
     measure. We therefore pin the ``mid`` stop's ``value`` to 0 (``_SHAPE_MAP_DIVERGING_CENTRE``) so
     white lands on break-even; ``min``/``max`` stay value-less = auto data low/high.
     ``nullColoringStrategy`` ``'asZero'`` and ``showAllDataPoints`` are Desktop's own defaults.
-    Structure verified byte-for-byte against a real Desktop-authored ``filledMap``/shapeMap
-    ``visual.json`` whose ``linearGradient3`` stops carry both a ``color`` and a value-anchor
-    (``value.expr.Literal.Value`` = e.g. ``"0D"``); explicit hex colour literals are valid here.
+    Structure verified against a real Desktop-authored ``filledMap``/shapeMap ``visual.json`` whose
+    ``linearGradient3`` stops carry both a ``color`` and a value-anchor. A fillRule colour/value/
+    strategy stop is an UNWRAPPED literal (``{"Literal": {"Value": ...}}``) -- NOT the ``{"expr":
+    {"Literal": ...}}`` wrapper a plain formatting property uses: the ``expr`` wrapper makes the stop
+    fail to load (``PBIR_FILLRULE_STOP_DOUBLE_WRAP``) and the choropleth reverts to a flat fill. This
+    matches the chart/tableEx gradient builder :func:`_gradient_color_stops` exactly; only
+    ``showAllDataPoints`` (an ordinary boolean property, not a fillRule stop) keeps the ``expr`` wrapper.
     """
     return [{
         "properties": {
             "fillRule": {
                 "linearGradient3": {
-                    "min": {"color": {"expr": {"Literal": {
-                        "Value": _semantic_string_literal(_SHAPE_MAP_DIVERGING_MIN)}}}},
+                    "min": {"color": {"Literal": {
+                        "Value": _semantic_string_literal(_SHAPE_MAP_DIVERGING_MIN)}}},
                     "mid": {
-                        "color": {"expr": {"Literal": {
-                            "Value": _semantic_string_literal(_SHAPE_MAP_DIVERGING_MID)}}},
-                        "value": {"expr": {"Literal": {
-                            "Value": _SHAPE_MAP_DIVERGING_CENTRE}}},
+                        "color": {"Literal": {
+                            "Value": _semantic_string_literal(_SHAPE_MAP_DIVERGING_MID)}},
+                        "value": {"Literal": {
+                            "Value": _SHAPE_MAP_DIVERGING_CENTRE}},
                     },
-                    "max": {"color": {"expr": {"Literal": {
-                        "Value": _semantic_string_literal(_SHAPE_MAP_DIVERGING_MAX)}}}},
+                    "max": {"color": {"Literal": {
+                        "Value": _semantic_string_literal(_SHAPE_MAP_DIVERGING_MAX)}}},
                     "nullColoringStrategy": {
-                        "strategy": {"expr": {"Literal": {"Value": "'asZero'"}}}},
+                        "strategy": {"Literal": {"Value": "'asZero'"}}},
                 },
             },
             "showAllDataPoints": {"expr": {"Literal": {"Value": "true"}}},
@@ -6313,9 +6653,16 @@ def _title_style_props(title_style):
 
 
 def _grid_font_objects(ws):
-    """Build the matrix/table per-channel format objects (columnHeaders / rowHeaders / values /
-    subTotals) from the worksheet's resolved grid styles, each carrying resolved font props and/or a
-    backColor plate. Only the grid family; None for anything else so other visuals stay unchanged."""
+    """Build the matrix/table per-channel format objects from the worksheet's resolved grid styles,
+    each carrying resolved font props and/or a backColor plate. Only the grid family; None for
+    anything else so other visuals stay unchanged.
+
+    TYPE-AWARE object names (a flat table and a matrix expose DIFFERENT formatting objects):
+    a ``pivotTable`` (matrix) has ``rowHeaders`` + per-group ``subTotals`` (both valid there), while a
+    flat ``tableEx`` has NEITHER -- it exposes only ``columnHeaders`` / ``values`` / ``total``.
+    Emitting ``rowHeaders`` / ``subTotals`` on a ``tableEx`` trips ``PBIR_FORMATTING_OBJECT_UNKNOWN``
+    and Power BI silently drops the styling, so on a table the total-row style maps to the ``total``
+    object (same font/fill props) and no ``rowHeaders`` object is emitted."""
     if not ws or ws.get("visual_type") not in (VT_MATRIX, VT_TABLE):
         return None
     gs = ws.get("grid_styles") or {}
@@ -6331,9 +6678,12 @@ def _grid_font_objects(ws):
             fo[channel] = [{"properties": props}]
 
     _put("columnHeaders", gs.get("header"), gs.get("header_fill"))
-    _put("rowHeaders", gs.get("header"), gs.get("header_fill"))
     _put("values", gs.get("body"), gs.get("body_fill"))
-    _put("subTotals", gs.get("total"), gs.get("subtotal_fill"))
+    if ws.get("visual_type") == VT_MATRIX:
+        _put("rowHeaders", gs.get("header"), gs.get("header_fill"))
+        _put("subTotals", gs.get("total"), gs.get("subtotal_fill"))
+    else:
+        _put("total", gs.get("total"), gs.get("subtotal_fill"))
     return fo or None
 
 
@@ -6561,7 +6911,21 @@ def _tableau_param_control_mode_to_pbi(mode):
     return "Dropdown"
 
 
-def _apply_slicer_format(visual, hdr_style=None, itm_style=None, plate_fill=None):
+def _slicer_font_props(style):
+    """Like :func:`_font_style_props` but for a slicer ``header`` / ``items`` object, whose *size*
+    channel is ``textSize`` -- NOT the ``fontSize`` every title/axis/grid channel uses (verified
+    against ``formatting describe-object slicer header``/``items`` -> the only size key is
+    ``textSize``; a ``fontSize`` there is rejected as ``PBIR_FORMATTING_PROP_UNKNOWN`` and the header
+    caption clips). Every other key (``fontColor``/``bold``/``fontFamily``) is identical, so we reuse
+    the shared builder and rename the one divergent key rather than duplicating the block.
+    """
+    props = _font_style_props(style)
+    if "fontSize" in props:
+        props["textSize"] = props.pop("fontSize")
+    return props
+
+
+def _apply_slicer_format(visual, hdr_style=None, itm_style=None, plate_fill=None, header_text=None):
     """Stamp the resolved Tableau quick-filter style onto an already-built slicer visual.
 
     ``hdr_style`` / ``itm_style`` are resolved font dicts (family/size/weight/color) for the slicer
@@ -6572,13 +6936,26 @@ def _apply_slicer_format(visual, hdr_style=None, itm_style=None, plate_fill=None
     ``font_objects`` channel-merge) with ``setdefault(...).update(...)`` so an existing header/items
     object or plate is composed with, not clobbered. A falsy arg is skipped -> that face keeps its
     Power BI default.
+
+    ``header_text`` (optional) overrides the slicer header's *Title text* with the Tableau field
+    CAPTION (the filter card's authored title). Without it Power BI shows the bound model column's
+    raw name (``pmdm__ProgramIssueArea__c`` / ``Name``) instead of the faithful ``Program Issue
+    Area`` / ``Program Name`` the source dashboard displays. The header ``text`` property is the
+    slicer ``header`` object's authoritative title-text channel (``formatting describe-object slicer
+    header`` -> ``text``: "Title text"); emitted as the same single-quoted semantic string literal
+    every other text property uses, alongside ``show:true`` so the retitled header is guaranteed
+    visible.
     """
+    if header_text:
+        hdr = visual.setdefault("objects", {}).setdefault("header", [{"properties": {}}])[0]["properties"]
+        hdr["show"] = {"expr": {"Literal": {"Value": "true"}}}
+        hdr["text"] = {"expr": {"Literal": {"Value": _semantic_string_literal(str(header_text))}}}
     if hdr_style:
         visual.setdefault("objects", {}).setdefault(
-            "header", [{"properties": {}}])[0]["properties"].update(_font_style_props(hdr_style))
+            "header", [{"properties": {}}])[0]["properties"].update(_slicer_font_props(hdr_style))
     if itm_style:
         visual.setdefault("objects", {}).setdefault(
-            "items", [{"properties": {}}])[0]["properties"].update(_font_style_props(itm_style))
+            "items", [{"properties": {}}])[0]["properties"].update(_slicer_font_props(itm_style))
     cont = _container_background_props(plate_fill) if plate_fill else None
     if cont:
         visual.setdefault("visualContainerObjects", {}).setdefault(
@@ -6601,7 +6978,8 @@ def _slicer_json(name, field, position, model_table, field_map, *, mode=None, wa
         out["visual"],
         hdr_style=(field.get("_slicer_hdr") if isinstance(field, dict) else None) or _default_pt,
         itm_style=(field.get("_slicer_itm") if isinstance(field, dict) else None) or _default_pt,
-        plate_fill=(field.get("_slicer_plate") if isinstance(field, dict) else None))
+        plate_fill=(field.get("_slicer_plate") if isinstance(field, dict) else None),
+        header_text=(field.get("caption") if isinstance(field, dict) else None))
     return out
 
 
@@ -6705,7 +7083,11 @@ def _text_object_textbox_visual(name, position, tob):
     style = {"fontSize": font_size, "color": color}
     if tob.get("bold"):
         style["fontWeight"] = "bold"
-    run = {"value": tob["text"], "textStyle": style}
+    # A hard line break (Tableau's Æ-sentinel newline, e.g. a two-line column header) becomes its own
+    # paragraph so the break renders in Power BI; single-line text stays one paragraph (unchanged).
+    lines = tob["text"].split("\n")
+    paragraphs = [{"textRuns": [{"value": ln, "textStyle": style}],
+                   "horizontalTextAlignment": "left"} for ln in lines]
     fill = tob.get("fill")
     if fill:
         background = {"properties": {
@@ -6720,8 +7102,7 @@ def _text_object_textbox_visual(name, position, tob):
     visual = {
         "visualType": "textbox",
         "objects": {
-            "general": [{"properties": {"paragraphs": [
-                {"textRuns": [run], "horizontalTextAlignment": "left"}]}}]
+            "general": [{"properties": {"paragraphs": paragraphs}}]
         },
         "visualContainerObjects": {
             "background": [background],
@@ -7248,11 +7629,39 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 data_point_objects = _shape_map_datapoint_objects()
             analytics_objects = _reference_line_analytics_objects(ws)
             lollipop_objects = _lollipop_objects(ws) if ws.get("lollipop") else None
+            trellis_measures = _detect_measure_trellis(ws, state)
+            if trellis_measures:
+                # Measure-trellis: fan the N '+'-concatenated measures into N side-by-side bar
+                # charts aligned on a shared category axis (no native PBI multi-measure trellis).
+                tvis, trecs = _emit_measure_trellis(
+                    ws, state, trellis_measures, x, y, w, h, i,
+                    page_name, db["name"] or page_name, model_table, field_map, vname,
+                    _sort_definition(ws, state, model_table, field_map),
+                    label_objects, data_point_objects, warnings)
+                visuals += tvis
+                records += trecs
+                continue
+            spark_title = ws.get("title")
+            kpi_card = ws.get("kpi_title_card")
+            if kpi_card:
+                # KPI title-card: rebuild the title-embedded headline number as a companion card in
+                # the top band of the zone and shrink the sparkline into the band below it. The card
+                # carries the caption, so the sparkline drops its (duplicate) title.
+                card_h = int(round(h * 0.58))
+                card_out = _emit_kpi_title_card(
+                    ws, kpi_card, x, y, w, card_h, i, page_name, db["name"] or page_name,
+                    model_table, field_map, vname)
+                if card_out is not None:
+                    card_vis, card_rec = card_out
+                    visuals.append(card_vis)
+                    records.append(card_rec)
+                    pos = _position(x, y + card_h, w, h - card_h, tab=i)
+                    spark_title = None
             visuals.append(_visual_json(
                 vname, vtype, pos, state,
                 _sort_definition(ws, state, model_table, field_map),
                 filter_config=flag_fc,
-                title=ws.get("title"), title_style=ws.get("title_style"),
+                title=spark_title, title_style=ws.get("title_style"),
                 axis_titles=ws.get("axis_titles"),
                 value_objects=value_objects, data_point_objects=data_point_objects,
                 label_objects=label_objects, legend_objects=legend_objects,
@@ -7421,11 +7830,41 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             data_point_objects = _shape_map_datapoint_objects()
         analytics_objects = _reference_line_analytics_objects(ws)
         lollipop_objects = _lollipop_objects(ws) if ws.get("lollipop") else None
+        trellis_measures = _detect_measure_trellis(ws, state)
+        if trellis_measures:
+            # Measure-trellis on a standalone worksheet page: fan into N side-by-side bar charts
+            # across the page band (no dashboard header row here, so each carries no title either --
+            # the fan-out stays faithful to the one-pane-per-measure source layout).
+            px, py, pw, ph = 40, 40, 880, 620
+            tvis, trecs = _emit_measure_trellis(
+                ws, state, trellis_measures, px, py, pw, ph, 0,
+                page_name, ws["name"], model_table, field_map, vname,
+                _sort_definition(ws, state, model_table, field_map),
+                label_objects, data_point_objects, warnings)
+            records += trecs
+            visuals = tvis + _emit_slicers([ws], page_name, model_table, field_map, warnings)
+            _emit_page(parts, page_name, ws["name"], visuals)
+            page_order.append(page_name)
+            continue
+        spark_title = ws.get("title")
+        kpi_card = ws.get("kpi_title_card")
+        if kpi_card:
+            # KPI title-card on a standalone page: card (top band) + sparkline (below).
+            card_h = int(round(620 * 0.58))
+            card_out = _emit_kpi_title_card(
+                ws, kpi_card, 40, 40, 880, card_h, 0, page_name, ws["name"],
+                model_table, field_map, vname)
+            if card_out is not None:
+                card_vis, card_rec = card_out
+                visuals.append(card_vis)
+                records.append(card_rec)
+                pos = _position(40, 40 + card_h, 880, 620 - card_h)
+                spark_title = None
         main = _visual_json(
             vname, vtype, pos, state,
             _sort_definition(ws, state, model_table, field_map),
             filter_config=flag_fc,
-            title=ws.get("title"), title_style=ws.get("title_style"),
+            title=spark_title, title_style=ws.get("title_style"),
             axis_titles=ws.get("axis_titles"),
             value_objects=value_objects, data_point_objects=data_point_objects,
             label_objects=label_objects, shape_objects=shape_objects,
@@ -7674,18 +8113,40 @@ def _reflow_worksheets_below_slicers(visuals, page_h, *, gap=8.0, tol=1.0):
 
     Guard: only fires when a worksheet visual actually intersects the slicer band -- a dashboard whose
     slicers sit in their own clear band (no overlap) is untouched (never-regress). Slicers (``z==1``) and
-    the banner (``z==1000``) are never moved; only worksheet content is reflowed."""
+    the banner (``z==1000``) are never moved; only worksheet content is reflowed.
+
+    Banding: a dashboard can surface TWO separate slicer strips -- a top filter row and a lower
+    ``Selections``/parameter-control row -- with authored content (e.g. a KPI-card band) SANDWICHED
+    between them. Collapsing every slicer into one ``min(top)..max(bottom)`` band makes that band span
+    the gap and swallow the sandwiched content, shoving it far below and scrambling the layout. Instead
+    the slicers are grouped into CONTIGUOUS vertical bands (a new band starts once the next slicer's top
+    is more than one slicer-height below the running band bottom), and we reflow only against the
+    topmost band that content actually collides with. A dashboard with a single slicer strip is
+    unaffected (one band == the old behaviour)."""
     slicers = [v for v in visuals if (v.get("position") or {}).get("z") == 1]
     content = [v for v in visuals if (v.get("position") or {}).get("z") == 0]
     if not slicers or not content:
         return
-    band_top = min(v["position"]["y"] for v in slicers)
-    band_bottom = max(v["position"]["y"] + v["position"]["height"] for v in slicers)
-    intersect = [v for v in content
-                 if v["position"]["y"] < band_bottom - tol
-                 and v["position"]["y"] + v["position"]["height"] > band_top + tol]
-    if not intersect:
+    slicers.sort(key=lambda v: v["position"]["y"])
+    cluster_gap = max(v["position"]["height"] for v in slicers)
+    bands = []
+    for v in slicers:
+        top = v["position"]["y"]
+        bot = top + v["position"]["height"]
+        if bands and top <= bands[-1][1] + cluster_gap:
+            bands[-1][1] = max(bands[-1][1], bot)
+        else:
+            bands.append([top, bot])
+    band = None
+    for band_top, band_bottom in bands:
+        if any(v["position"]["y"] < band_bottom - tol
+               and v["position"]["y"] + v["position"]["height"] > band_top + tol
+               for v in content):
+            band = (band_top, band_bottom)
+            break
+    if band is None:
         return
+    band_top, band_bottom = band
     # Move every sheet at or below the band start (content strictly ABOVE the band -- e.g. a header
     # sheet -- stays put). Compress the [orig_top, page_h] span into [new_top, page_h].
     movable = [v for v in content

@@ -147,10 +147,13 @@ def test_no_custom_theme_item_flagged():
 # -- unit: card display units (R5) ---------------------------------------------
 def _card_parts(units="1D", visual_type="card"):
     """A baseTheme-only report (no theme checks) + one card-family visual whose value object carries
-    ``labelDisplayUnits`` = ``units`` (``None`` -> the property is omitted entirely)."""
+    ``labelDisplayUnits`` = ``units`` (``None`` -> the property is omitted entirely). The value object
+    is type-appropriate: ``labels`` for a ``card`` (its display-units channel), ``dataLabels`` for a
+    ``multiRowCard`` (which has no display-units channel -- so R5 never applies to it)."""
+    value_obj = "labels" if visual_type == "card" else "dataLabels"
     visual = {"visualType": visual_type}
     if units is not None:
-        visual["objects"] = {"dataLabels": [{"properties": {
+        visual["objects"] = {value_obj: [{"properties": {
             "labelDisplayUnits": {"expr": {"Literal": {"Value": units}}}}}]}
     return {
         "definition/report.json": json.dumps(_report_json(ct_name=None)),
@@ -174,9 +177,11 @@ def test_card_auto_display_units_flagged():
     assert len(problems) == 1 and "Auto" in problems[0]
 
 
-def test_multirowcard_missing_display_units_flagged():
-    problems = lint_pbir_parts(_card_parts(units=None, visual_type="multiRowCard"))
-    assert len(problems) == 1 and "multiRowCard" in problems[0]
+def test_multirowcard_display_units_not_applicable():
+    # A ``multiRowCard``'s value object is ``dataLabels``, which has NO ``labelDisplayUnits`` channel
+    # (verified against ``formatting describe-object multiRowCard dataLabels``), so display units cannot
+    # be pinned there and R5 is inapplicable -- a multiRowCard without them stays clean, never flagged.
+    assert lint_pbir_parts(_card_parts(units=None, visual_type="multiRowCard")) == []
 
 
 def test_non_card_missing_display_units_clean():
@@ -254,7 +259,7 @@ def test_emitted_card_pins_display_units_and_lints_clean():
     assert lint_pbir_parts(parts) == []
     vj = next(iter(_visual_parts(parts).values()))
     assert vj["visual"]["visualType"] == "card"
-    units = vj["visual"]["objects"]["dataLabels"][0]["properties"]["labelDisplayUnits"]
+    units = vj["visual"]["objects"]["labels"][0]["properties"]["labelDisplayUnits"]
     assert units["expr"]["Literal"]["Value"] == "1D"
 
 
@@ -264,7 +269,7 @@ def test_lint_catches_card_display_units_regression():
     parts = dict(emit_pbir(parse_twb(_workbook(ws))))
     vkey = next(k for k in parts if k.endswith("visual.json"))
     doc = json.loads(parts[vkey])
-    doc["visual"]["objects"].pop("dataLabels", None)
+    doc["visual"]["objects"].pop("labels", None)
     parts[vkey] = json.dumps(doc)
     problems = lint_pbir_parts(parts)
     assert any("labelDisplayUnits" in p for p in problems)
