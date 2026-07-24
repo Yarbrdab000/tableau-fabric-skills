@@ -6988,15 +6988,15 @@ def _position(x, y, w, h, z=0, tab=0):
             "width": round(w, 2), "height": round(h, 2), "tabOrder": tab}
 
 
-def _scale_zone(zone, ref_w, ref_h):
+def _scale_zone(zone, ref_w, ref_h, min_w=40.0, min_h=40.0):
     pw = _page_w()
     ph = _page_h()
     sx = pw / ref_w if ref_w else 1
     sy = ph / ref_h if ref_h else 1
     x = max(0.0, min(zone["x"] * sx, pw - 1))
     y = max(0.0, min(zone["y"] * sy, ph - 1))
-    w = max(40.0, min(zone["w"] * sx, pw - x))
-    h = max(40.0, min(zone["h"] * sy, ph - y))
+    w = max(min_w, min(zone["w"] * sx, pw - x))
+    h = max(min_h, min(zone["h"] * sy, ph - y))
     return x, y, w, h
 
 
@@ -7065,6 +7065,24 @@ def _banner_textbox_visual(name, position, banner):
 
 
 _TEXT_OBJECT_FONT_SIZE = "12pt"
+
+# --- Zone Geometry v2 (readability-first layout) -------------------------------------------------
+# USER DIRECTIVE (2026-07-24): faithful *placement* is NOT a hard goal. The non-negotiables are
+# completeness (every element present), correct numbers, and faithful graphs; ARRANGEMENT is flexible.
+# Start from Tableau's layout as a scaffold (keep grouping + reading order), then optimise for
+# readability / tidiness. Pixel-perfect reproduction of a floating canvas is explicitly a non-goal --
+# and is the very source of the inherited-overlap defects (we faithfully copy Tableau's own
+# overlapping coordinates).
+#
+# Slice 1 -- content-aware min-size for caption/text zones. Tableau authors thin caption bands
+# (section headers, instruction lines) at their natural text height (~24-34px). The generic 40px zone
+# floor (``_scale_zone``) *inflated* those bands into unreadable blocks and worsened the overlap they
+# already had with the content beneath. Text zones instead floor to a single line of their OWN font
+# (never inflating a caption already tall enough, never over-expanding a multi-line one) and keep their
+# authored width. Charts / tables / images / banner keep the 40px floor unchanged.
+_TEXTBOX_MIN_H = 20.0   # px: one line of ~12pt body text (never clips a single line)
+_TEXTBOX_MIN_W = 8.0    # px: degenerate-width guard only; never inflate a caption's authored width
+_PT_TO_PX = 96.0 / 72.0
 
 
 def _text_object_textbox_visual(name, position, tob):
@@ -7717,7 +7735,13 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         # caption bar layered over a matrix stays on top. The title banner is already de-duped out of
         # this list upstream, so it is never drawn twice. Empty list -> nothing added (never-regress).
         for j, tob in enumerate(db.get("text_objects") or []):
-            tx, ty, tw, th = _scale_zone(tob, ref_w, ref_h)
+            # Content-aware floor: size to one line of the zone's own font rather than the blanket 40px
+            # zone floor, so a thin caption band renders its text without being inflated into an
+            # overlap-inducing block (Zone Geometry v2 slice 1). ``max()`` with the authored height in
+            # ``_scale_zone`` means a taller / multi-line caption is preserved unchanged -- never-regress
+            # and never over-expanded (a wider tidy pass owns holistic spacing).
+            _tmin_h = max(_TEXTBOX_MIN_H, (tob.get("font_size") or 12.0) * _PT_TO_PX * 1.35)
+            tx, ty, tw, th = _scale_zone(tob, ref_w, ref_h, min_w=_TEXTBOX_MIN_W, min_h=_tmin_h)
             visuals.append(_text_object_textbox_visual(
                 _sanitize("v-%s-text-%d" % (page_name, j)),
                 _position(tx, ty, tw, th, z=900, tab=len(visuals) + 1),

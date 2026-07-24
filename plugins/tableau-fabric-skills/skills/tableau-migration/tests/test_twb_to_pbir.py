@@ -7343,6 +7343,44 @@ def test_fill_less_textbox_is_transparent():
     assert run["textStyle"]["fontSize"] == "10pt"
 
 
+# Zone Geometry v2 slice 1: a thin caption/text zone sizes to one line of its OWN font instead of the
+# blanket 40px chart floor -- so a squashed caption band (Tableau authors them ~24-34px) renders its
+# text without being inflated into an overlap-inducing block. Charts/tables keep the 40px floor.
+_V2_MIN_SIZE_TWB = _workbook(
+    _worksheet("Trend", "Line", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+    "<dashboard name='Tidy'><size maxwidth='1400' maxheight='1000' /><zones>"
+    + _text_object_container(
+        # a worksheet (chart) zone authored thin (24px scaled) -- must STILL floor to 40
+        _text_object_ws_zone("Trend", x=0, y=40000, w=100000, h=2400, zid="2"),
+        # a caption authored equally thin (24px scaled) -- must size to content, NOT inflate to 40
+        _text_object_zone("Section Header", fill=None, color="#000000", bold=False,
+                          size=10, x=0, y=3000, w=40000, h=2400, zid="20"),
+    )
+    + "</zones></dashboard>",
+)
+
+
+def test_thin_caption_sizes_to_content_not_inflated_to_floor():
+    # Both the chart zone and the caption are authored at the same thin height (24px scaled). Before
+    # v2-1 both were floored to 40. Now the caption keeps its content height while the chart still
+    # floors -- proving the content-aware floor is caption-scoped and never lowers the chart floor.
+    res = migrate_twb_to_pbir(_V2_MIN_SIZE_TWB)
+    by_type = {}
+    for k, v in res["parts"].items():
+        if not k.endswith("visual.json"):
+            continue
+        vj = json.loads(v)
+        by_type.setdefault(vj["visual"]["visualType"], []).append(vj["position"]["height"])
+    caption_h = by_type["textbox"][0]
+    chart_h = by_type["lineChart"][0]
+    # caption is no longer inflated: sits at its authored/content height, strictly below the chart floor
+    assert caption_h < 40.0
+    assert caption_h == 24.0
+    # the generic chart/worksheet floor is unchanged (a thin chart zone still clamps up to 40)
+    assert chart_h == 40.0
+
+
 def test_banner_only_dashboard_never_regresses():
     # a dashboard whose only text zone is the top banner keeps text_objects empty after de-dupe,
     # so emit_pbir adds exactly one banner textbox and nothing else.

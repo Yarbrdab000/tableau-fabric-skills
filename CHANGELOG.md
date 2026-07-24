@@ -13,6 +13,19 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.1.0` → `2.2.0`): Zone Geometry v2 slice 1 — content-aware caption/text
+  min-size (no longer inflates thin caption bands to the 40px chart floor).** The generic zone floor in
+  `_scale_zone` applied a blanket `max(40px, …)` to every zone's width *and* height, which inflated the
+  thin caption/section-header/instruction bands Tableau authors at their natural text height (~24–34px)
+  into unreadable 40px blocks — and, by growing them, pushed them into the content beneath, manufacturing
+  overlaps. `_scale_zone` now accepts optional `min_w`/`min_h` (default `40.0` → every existing caller is
+  byte-identical); the dashboard text-object emitter passes a content-aware floor sized to a single line
+  of the caption's *own* font (`max(20px, font_pt × 96/72 × 1.35)`, authored width kept). Because the
+  floor is a `max()` with the scaled height, a taller/multi-line caption is preserved unchanged (never
+  shrunk) and a thin one is never inflated. Charts, tables, images, and the title banner keep the 40px
+  floor. Measured effect on three real workbooks: dashboard overlaps dropped 29 → 23 (Salesforce 9 → 7,
+  ATTI 20 → 16) with the already-clean Superstore held at 0 (clean pages untouched). Additive, fail-safe,
+  `+1` lock-in test (thin caption → content height; thin chart zone → still floors to 40).
 - **tableau-migration (skill `2.0.0` → `2.1.0`): Report-fidelity bundle — KPI title-card, measure
   trellis, dynamic caption tokens, slicer-format canonicalization, and a card display-units (R5)
   scoping correction.** A batch of session-accumulated, additive report-side improvements committed
