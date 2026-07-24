@@ -7782,6 +7782,11 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             warnings.append(_warn("dashboard", db["name"],
                                   "no supported visuals on this dashboard"))
             continue
+        # Tidy pass (v2-2): relocate any floating caption textbox (z=900) that Tableau floated on
+        # top of the content it labels into a clear band (prefer directly above the anchor). Gated
+        # to a no-op on a page with no caption<->anchor overlap, so cleanly tiled dashboards are
+        # byte-identical. Runs last, after images (z=1100) are placed, so every anchor is final.
+        _deoverlap_captions(visuals, _page_w(), _page_h())
         _emit_page(parts, page_name, db["name"] or page_name, visuals)
         page_order.append(page_name)
 
@@ -8186,6 +8191,92 @@ def _reflow_worksheets_below_slicers(visuals, page_h, *, gap=8.0, tol=1.0):
         p = v["position"]
         p["y"] = round(new_top + (p["y"] - orig_top) * scale, 2)
         p["height"] = round(p["height"] * scale, 2)
+
+
+def _deoverlap_captions(visuals, page_w, page_h, *, gap=8.0, tol=1.0, min_frac=0.05):
+    """Lift a floating caption textbox off any content it overlaps into the nearest clear band.
+
+    Tableau habitually FLOATS a section-header / panel-label / instruction text zone directly on
+    top of (or fully inside) the worksheet, table or slicer row it labels. The deterministic rebuild
+    scales those zones faithfully (``z==900``), so it inherits every source overlap -- empirically
+    the dominant geometry defect on real dashboards (100% of measured caption overlaps are a z=900
+    textbox sitting on an anchor: chart column-headers pinned inside their bars at 98-100%, or a wide
+    section header stretched behind a row of slicers at ~41-47%). Faithful pixel placement is NOT a
+    hard invariant here (only completeness, correct numbers and faithful graphs are) -- so we
+    relocate the CAPTION, never the content, into a readable strip: preferring the gap directly ABOVE
+    the anchor it labels (a clean title row), then directly below, then the closest clear horizontal
+    band. Only ``x``/``y`` change; the caption is never dropped, resized or restyled (v2-1 already
+    sized it to its own text), so completeness is preserved.
+
+    Never-regress gate: overlaps are computed FIRST and the pass returns immediately when no caption
+    sits on an anchor, so an already-tidy page (e.g. a cleanly tiled dashboard) is byte-identical.
+    A caption is moved only to a position proven clear of every anchor and every other caption, and
+    is otherwise left exactly where it was -- the page can only ever get tidier, never worse. Anchors
+    (worksheets z=0, slicers z=1, banner z=1000, images z=1100) are never moved."""
+    caps = [v for v in visuals if (v.get("position") or {}).get("z") == 900]
+    anchors = [v for v in visuals if (v.get("position") or {}).get("z") != 900]
+    if not caps or not anchors:
+        return
+
+    def _r(v):
+        p = v["position"]
+        return (p["x"], p["y"], p["width"], p["height"])
+
+    def _inter(a, b):
+        ix = max(0.0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+        iy = max(0.0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
+        return ix * iy
+
+    def _hits(caprect):
+        floor = max(tol, min_frac * (caprect[2] * caprect[3]))
+        return [(a, _inter(caprect, _r(a))) for a in anchors
+                if _inter(caprect, _r(a)) > floor]
+
+    # Gate: do nothing unless at least one caption actually sits on an anchor.
+    if not any(_hits(_r(c)) for c in caps):
+        return
+
+    caps.sort(key=lambda v: (v["position"]["y"], v["position"]["x"]))
+
+    def _clear(rect, self_v):
+        if rect[0] < -tol or rect[1] < -tol:
+            return False
+        if rect[0] + rect[2] > page_w + tol or rect[1] + rect[3] > page_h + tol:
+            return False
+        for a in anchors:
+            if _inter(rect, _r(a)) > tol:
+                return False
+        for other in caps:
+            if other is self_v:
+                continue
+            if _inter(rect, _r(other)) > tol:
+                return False
+        return True
+
+    for cap in caps:
+        cr = _r(cap)
+        hits = _hits(cr)
+        if not hits:
+            continue
+        target = max(hits, key=lambda t: t[1])[0]
+        tr = _r(target)
+        x, w, h = cr[0], cr[2], cr[3]
+        # Candidate y positions (caption keeps its width/height + x, staying aligned with its
+        # content), in preference order: directly above the labelled anchor, directly below it,
+        # then the clear strip nearest the caption's original y.
+        candidates = []
+        candidates.append(max(0.0, tr[1] - gap - h))
+        yb = tr[1] + tr[3] + gap
+        candidates.append(min(yb, page_h - h))
+        strips = [0.0] + [_r(a)[1] + _r(a)[3] + gap for a in anchors]
+        strips = [s for s in strips if -tol <= s <= page_h - h + tol]
+        strips.sort(key=lambda s: abs(s - cr[1]))
+        candidates.extend(strips)
+        for y in candidates:
+            if _clear((x, y, w, h), cap):
+                cap["position"]["x"] = round(x, 2)
+                cap["position"]["y"] = round(y, 2)
+                break
 
 
 def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",

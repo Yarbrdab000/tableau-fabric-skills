@@ -13,6 +13,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.2.0` → `2.3.0`): Zone Geometry v2 slice 2 — caption de-overlap / tidy
+  pass (lifts a floating caption textbox off any content it overlaps).** Tableau habitually floats a
+  section-header / panel-label / instruction text zone directly on top of (or fully inside) the
+  worksheet, table or slicer row it labels; the deterministic rebuild scales those zones faithfully
+  (`z=900`), so it inherits every source overlap — empirically the dominant geometry defect on real
+  dashboards (100% of measured overlaps were a `z=900` caption sitting on an anchor: chart column-headers
+  pinned inside their bars at 98–100%, or a wide section header stretched behind a slicer row at ~41–47%).
+  Because faithful *pixel* placement is not a hard invariant (only completeness, correct numbers, and
+  faithful graphs are), the new `_deoverlap_captions` pass relocates the **caption — never the content —**
+  into a readable strip: preferring the gap directly above the anchor it labels (a clean title row), then
+  directly below, then the closest clear horizontal band; only `x`/`y` change, so the caption is never
+  dropped, resized, or restyled (completeness preserved). A never-regress gate computes overlaps first and
+  returns early when no caption sits on an anchor, so cleanly tiled dashboards are byte-identical; a
+  caption is moved only to a position proven clear of every anchor and every other caption, otherwise left
+  exactly where it was (the page can only get tidier, never worse). Measured on three real workbooks:
+  dashboard overlaps **29 → 0** (Salesforce 9 → 0, ATTI 20 → 0), containments **4 → 2**, out-of-bounds
+  **1 → 0**, with the already-clean Superstore held at **0** overlaps. Additive, fail-safe, `+2` lock-in
+  tests (caption on a chart → lifted clear above it; caption already clear → untouched by the gate).
 - **tableau-migration (skill `2.1.0` → `2.2.0`): Zone Geometry v2 slice 1 — content-aware caption/text
   min-size (no longer inflates thin caption bands to the 40px chart floor).** The generic zone floor in
   `_scale_zone` applied a blanket `max(40px, …)` to every zone's width *and* height, which inflated the

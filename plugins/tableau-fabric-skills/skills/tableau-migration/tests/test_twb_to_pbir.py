@@ -7381,6 +7381,74 @@ def test_thin_caption_sizes_to_content_not_inflated_to_floor():
     assert chart_h == 40.0
 
 
+# v2-2 de-overlap fixtures: a caption Tableau floated ON TOP of the chart it labels (overlapping in
+# 100000-space, so overlapping in emitted px) vs. a caption already sitting in a clear band above it.
+_V2_DEOVERLAP_TWB = _workbook(
+    _worksheet("Trend", "Line", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+    "<dashboard name='Messy'><size maxwidth='1000' maxheight='1000' /><zones>"
+    + _text_object_container(
+        # chart fills the lower canvas (px y 400..900)
+        _text_object_ws_zone("Trend", x=0, y=40000, w=100000, h=50000, zid="2"),
+        # a narrow caption floated mid-chart (px y 450) -- must be lifted clear of the chart
+        _text_object_zone("Chart Label", fill=None, color="#000000", bold=False,
+                          size=10, x=10000, y=45000, w=30000, h=4000, zid="20"),
+    )
+    + "</zones></dashboard>",
+)
+
+_V2_CLEAR_CAPTION_TWB = _workbook(
+    _worksheet("Trend", "Line", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+    "<dashboard name='Clean'><size maxwidth='1000' maxheight='1000' /><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("Trend", x=0, y=40000, w=100000, h=50000, zid="2"),
+        # caption sits in a CLEAR band above the chart (px y 100) -- the gate must leave it untouched
+        _text_object_zone("Header", fill=None, color="#000000", bold=False,
+                          size=10, x=0, y=10000, w=30000, h=4000, zid="20"),
+    )
+    + "</zones></dashboard>",
+)
+
+
+def _rect(vj):
+    p = vj["position"]
+    return (p["x"], p["y"], p["width"], p["height"])
+
+
+def _inter_area(a, b):
+    ix = max(0.0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
+    return ix * iy
+
+
+def test_caption_overlapping_chart_is_lifted_clear():
+    # A caption Tableau floated on top of its chart overlaps in the source; after the v2-2 tidy pass
+    # it is relocated OFF the chart (into the clear band directly above the anchor it labels).
+    res = migrate_twb_to_pbir(_V2_DEOVERLAP_TWB)
+    vis = [json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")]
+    cap = next(v for v in vis if v["visual"]["visualType"] == "textbox")
+    chart = next(v for v in vis if v["visual"]["visualType"] == "lineChart")
+    cr, hr = _rect(cap), _rect(chart)
+    # caption no longer sits on the chart, and specifically was lifted ABOVE it
+    assert _inter_area(cr, hr) <= 1.0
+    assert cr[1] + cr[3] <= hr[1] + 1.0
+
+
+def test_clear_caption_is_untouched_by_deoverlap():
+    # A caption already in a clear band must be byte-identical: the never-regress gate returns early
+    # on a page with no caption<->anchor overlap, so the caption keeps its exact scaled position.
+    res = migrate_twb_to_pbir(_V2_CLEAR_CAPTION_TWB)
+    vis = [json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")]
+    cap = next(v for v in vis if v["visual"]["visualType"] == "textbox")
+    chart = next(v for v in vis if v["visual"]["visualType"] == "lineChart")
+    # authored (x=0, y=10000) in 100000-space on a 1000px canvas -> exactly (0.0, 100.0), unmoved
+    assert cap["position"]["x"] == 0.0
+    assert cap["position"]["y"] == 100.0
+    # and it never overlapped the chart to begin with (so the gate had nothing to do)
+    assert _inter_area(_rect(cap), _rect(chart)) <= 1.0
+
+
 def test_banner_only_dashboard_never_regresses():
     # a dashboard whose only text zone is the top banner keeps text_objects empty after de-dupe,
     # so emit_pbir adds exactly one banner textbox and nothing else.
