@@ -3353,6 +3353,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         if not _plottable:
             caption_only_raw = title_text
     kpi_title_card = None
+    dynamic_title_raw = None
     if visual_type == VT_UNSUPPORTED:
         title_text = None
     elif title_dynamic:
@@ -3385,13 +3386,18 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                 "KPI title number (a dynamic measure embedded in the title) rebuilt as a companion "
                 "card above the visual; the static caption is kept as the title"))
         else:
-            warnings.append(_warn(
-                "worksheet", name,
-                "dynamic title (embeds a field/parameter reference) not reproduced as static text; "
-                "the rebuilt visual keeps its default title"))
+            # v2-4 (resolve dynamic captions on a SUPPORTED visual): a dynamic non-KPI title weaves a
+            # live Tableau token -- a parameter ref (``<[Parameters].[id]>``) and/or a federated
+            # field-ref / runtime special. It was historically dropped outright, so a parameter-driven
+            # title like "Sales by <Show by Dimension>" lost its meaning (or, on a text zone, leaked the
+            # raw token). Capture the RAW title and defer resolution to ``parse_twb`` (once parameters
+            # are known): a title that becomes FULLY static after parameter substitution is kept; one
+            # that still carries a field-ref / runtime special is dropped there (stripping it would leave
+            # a dangling label). ``title_text`` stays ``None`` for now so nothing pre-resolution emits.
+            dynamic_title_raw = title_text
             title_text = None
 
-    title_style = _parse_title_style(ws) if title_text else None
+    title_style = _parse_title_style(ws) if (title_text or dynamic_title_raw) else None
 
     # Font/shading fidelity for any filter cards this worksheet owns: resolve the slicer header
     # (quick-filter-title), items (quick-filter) faces + the card plate from the worksheet's
@@ -3485,6 +3491,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "visual_type": visual_type,
         "title": title_text,
         "caption_only_raw": caption_only_raw,
+        "dynamic_title_raw": dynamic_title_raw,
         "title_style": title_style,
         "filter_hdr_style": filter_hdr_style,
         "filter_itm_style": filter_itm_style,
@@ -4080,6 +4087,37 @@ def _resolve_caption_text(text, params):
     return "\n".join(ln.strip() for ln in out.split("\n")).strip()
 
 
+def _resolve_dynamic_title(text, params):
+    """Resolve a SUPPORTED visual's raw dynamic title to a static Power BI title, or ``None`` (v2-4).
+
+    A non-KPI worksheet title that embeds a live Tableau token cannot be reproduced verbatim by the
+    deterministic emit path (there is no live parameter / field value at build time). Unlike a
+    caption-only status bar (:func:`_resolve_caption_text`, which blanks every unresolved token because
+    a thin band of label scaffolding still reads sensibly), a CHART title must never degrade to a
+    dangling label -- "Days to Ship for <Category>" stripped to "Days to Ship for" reads as broken. So
+    the rule is deliberately conservative and targets the common parameter-driven case: substitute every
+    ``<[Parameters].[id]>`` token with its CURRENT display value, then KEEP the result ONLY when the
+    title is now FULLY static (e.g. "Sales by <Show by Dimension>" -> "Sales by Program Name"). If any
+    ``<...>`` token remains after parameter substitution -- a federated field-ref or a runtime special
+    whose per-row value is unknowable here -- return ``None`` so the caller drops the title (the rebuilt
+    visual keeps its default) rather than emit a partial one. Returns the resolved static title, or
+    ``None`` to drop (also ``None`` for empty input or a title that collapses to whitespace)."""
+    if not text:
+        return None
+
+    def _sub_param(mo):
+        info = params.get(mo.group("pid")) if params else None
+        disp = info.get("current_display") if info else None
+        return disp if disp else ""
+
+    out = _PARAM_TOKEN_RE.sub(_sub_param, text)
+    if _TITLE_DYNAMIC_RE.search(out):
+        return None  # an unresolvable field-ref / runtime special remains -> drop, never dangle
+    out = re.sub(r"[ \t]+", " ", out)
+    out = "\n".join(ln.strip() for ln in out.split("\n")).strip()
+    return out or None
+
+
 def _detect_sheet_swaps(worksheets, dashboards, params, warnings):
     """Group worksheets that toggle within one dashboard zone via a shared swap parameter.
 
@@ -4208,6 +4246,30 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
         raw = w.get("caption_only_raw")
         if raw:
             w["caption_only_text"] = _resolve_caption_text(raw, params)
+    # v2-4: resolve each SUPPORTED visual's DEFERRED dynamic title now that parameters are known. A
+    # title that becomes fully static after parameter substitution is kept (with its parsed style); one
+    # that still carries an unresolvable field-ref / runtime special is dropped (title + style cleared)
+    # and warned exactly as before -- so a parameter-driven title ("Sales by <Show by Dimension>" ->
+    # "Sales by Program Name") is recovered while a per-row dynamic title never degrades to a dangling
+    # label. Additive: a worksheet with no ``dynamic_title_raw`` is untouched.
+    for w in worksheets:
+        raw = w.get("dynamic_title_raw")
+        if not raw:
+            continue
+        resolved = _resolve_dynamic_title(raw, params)
+        if resolved:
+            w["title"] = resolved
+            warnings.append(_warn(
+                "worksheet", w["name"],
+                "dynamic title resolved to its current parameter display value "
+                f"({resolved!r}); a live re-selection at view time is not reproduced"))
+        else:
+            w["title"] = None
+            w["title_style"] = None
+            warnings.append(_warn(
+                "worksheet", w["name"],
+                "dynamic title (embeds a field/parameter reference) not reproduced as static text; "
+                "the rebuilt visual keeps its default title"))
     parameter_controls = _resolve_parameter_controls(dashboards, params, warnings, param_binding)
     sheet_swaps = _detect_sheet_swaps(worksheets, dashboards, params, warnings)
     visual_flags = _resolve_visual_flags(param_binding, ws_by_name, warnings)

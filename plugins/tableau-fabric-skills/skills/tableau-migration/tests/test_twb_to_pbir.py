@@ -4161,7 +4161,66 @@ def test_dynamic_worksheet_title_deferred_and_warned():
     assert "Days to Ship for <" not in blob and "&lt;" not in blob
 
 
-def test_no_title_means_no_visual_container_objects():
+# v2-4: a SUPPORTED visual's DYNAMIC title is resolved (not dropped) when it becomes fully static
+# after parameter substitution. A ``Parameters`` datasource carrying p1 -> display 'Program Name'
+# is injected alongside the standard one (the parser scans every <datasources> block at root).
+_V2_4_PARAM_DS = (
+    "<datasources><datasource name='Parameters'>"
+    "<column caption='Show by Dimension' name='[p1]' datatype='string' "
+    "value='&quot;prog&quot;' alias='Program Name' /></datasource></datasources>")
+
+
+def _workbook_with_param(ws):
+    return _workbook(ws).replace("<worksheets>", _V2_4_PARAM_DS + "<worksheets>", 1)
+
+
+def test_v2_4_param_dynamic_title_resolved_to_display_value():
+    # the core v2-4 win: a title weaving a parameter token resolves to the parameter's CURRENT
+    # display value and is KEPT as a static Power BI title (pre-v2-4 it was dropped entirely).
+    ws = _worksheet("SalesBy", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST,
+                    title="<run>Sales by </run><run>&lt;[Parameters].[p1]&gt;</run>")
+    res = migrate_twb_to_pbir(_workbook_with_param(ws), dataset_name="M", report_name="R")
+    assert res["ir"]["worksheets"][0]["title"] == "Sales by Program Name"
+    vco = _only_visual(res)["visual"]["visualContainerObjects"]
+    assert vco["title"][0]["properties"]["text"]["expr"]["Literal"]["Value"] == "'Sales by Program Name'"
+    assert any("resolved to its current parameter display value" in (w.get("reason") or "")
+               for w in res["warnings"])
+    blob = json.dumps(res["parts"])
+    assert "[Parameters]" not in blob and "&lt;" not in blob
+
+
+def test_v2_4_mixed_param_and_field_ref_title_still_dropped():
+    # v2-4 is conservative: when a field-ref (or runtime special) REMAINS after parameter
+    # substitution, the title is dropped -- stripping it would leave a dangling partial label -- so
+    # neither a partial resolve nor a raw token ever reaches the report.
+    ws = _worksheet("Mixed", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST,
+                    title=("<run>&lt;[Parameters].[p1]&gt;</run><run> for </run>"
+                           "<run>&lt;[federated.abc].[none:Category:nk]&gt;</run>"))
+    res = migrate_twb_to_pbir(_workbook_with_param(ws), dataset_name="M", report_name="R")
+    assert res["ir"]["worksheets"][0]["title"] is None
+    assert "visualContainerObjects" not in _only_visual(res)["visual"]
+    blob = json.dumps(res["parts"])
+    assert "Program Name" not in blob and "&lt;" not in blob
+
+
+def test_v2_4_resolved_param_title_keeps_its_parsed_style():
+    # a resolved dynamic title carries the title's authored font styling (title_style is computed
+    # whenever a dynamic title is captured, and survives resolution).
+    ws = _worksheet("Styled", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST,
+                    title="<run fontsize='18'>Sales by </run><run>&lt;[Parameters].[p1]&gt;</run>")
+    ir = parse_twb(_workbook_with_param(ws))
+    w = ir["worksheets"][0]
+    assert w["title"] == "Sales by Program Name"
+    assert w["title_style"] is not None
     # the common case (no authored title) leaves the visual untitled -> no container objects added.
     ws = _worksheet("Plain", "Bar",
                     rows="[federated.abc].[sum:Sales:qk]",

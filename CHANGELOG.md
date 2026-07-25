@@ -13,6 +13,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.4.0` → `2.5.0`): Zone Geometry v2 slice 4 — resolve dynamic
+  parameter-driven titles on SUPPORTED visuals (no more silently dropped chart titles).** A rebuilt
+  chart, table, or other supported visual whose authored title weaves a Tableau parameter token —
+  e.g. `Sales by <[Parameters].[Show by Dimension]>` — previously had its whole title dropped with a
+  warning, because the token can't be reproduced as a live re-selecting title in Power BI. The title
+  is now resolved: every `<[Parameters].[…]>` token is substituted with the parameter's current
+  display value, and when the result is fully static it is kept as the visual's title (so
+  `Sales by <[Parameters].[p1]>` with p1 currently showing `Program Name` becomes the static title
+  `Sales by Program Name`, reaching the emitted `visualContainerObjects.title` with its authored font
+  style preserved). A positive warning discloses that a live re-selection at view time is not
+  reproduced. The rule is deliberately conservative: if any live field-reference or runtime-special
+  token (`<[federated.…]>`, `<Region>`) REMAINS after parameter substitution, the title is still
+  dropped rather than partially emitted — stripping it would leave a dangling half-label like
+  "Days to Ship for …", so the visual keeps its default title instead. This resolves the D4
+  dynamic-caption defect on the supported-visual path (the v2-3 slice already handles the
+  caption-only-worksheet path) and never leaks a raw `<…>` token or `&lt;` entity into the report.
+  Additive, fail-safe, `+3` lock-in tests (param title resolved + kept + emitted, mixed
+  param+field-ref still dropped, resolved title keeps its parsed style).
 - **tableau-migration (skill `2.3.0` → `2.4.0`): Zone Geometry v2 slice 3 — caption-only worksheet →
   textbox (recovers thin status / refresh / filter-breadcrumb bands that previously vanished).** A
   dashboard-placed worksheet whose only content is its title — a thin "Data as of …" refresh bar, a
