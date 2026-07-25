@@ -3336,6 +3336,22 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                     f"mark class '{mark}' / shelf layout not supported -> no visual emitted"))
 
     title_text, title_dynamic = _parse_worksheet_title(ws)
+    # v2-3 (caption-only worksheet -> textbox): a thin status / refresh / filter-breadcrumb bar that
+    # Tableau builds as a worksheet whose ONLY content is its (often dynamic) title -- no rows, no
+    # cols, no plottable mark channel -- classifies as VT_UNSUPPORTED and would be DROPPED, leaving a
+    # blank band on the dashboard (the user's "a thin view doesn't generate at all" defect). Capture
+    # its RAW title HERE (before the nulling just below) so the page assembler can rebuild it as a
+    # textbox at its authored zone, honouring the completeness invariant (never leave a labeled band
+    # empty). A Detail-only encoding is the title tokens' data source, not a plottable mark, so it
+    # still counts as caption-only; any rows/cols/colour/size/label/angle channel means a real -- if
+    # unsupported -- visual that must NOT be flattened to its title. Dynamic tokens are resolved later
+    # in ``parse_twb`` (once the parameters are known); this only records the raw text.
+    caption_only_raw = None
+    if visual_type == VT_UNSUPPORTED and title_text and title_text.strip():
+        _plottable = bool(rows or cols or encodings.get("color") or encodings.get("size")
+                          or encodings.get("label") or encodings.get("angle"))
+        if not _plottable:
+            caption_only_raw = title_text
     kpi_title_card = None
     if visual_type == VT_UNSUPPORTED:
         title_text = None
@@ -3468,6 +3484,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "mark_class": mark,
         "visual_type": visual_type,
         "title": title_text,
+        "caption_only_raw": caption_only_raw,
         "title_style": title_style,
         "filter_hdr_style": filter_hdr_style,
         "filter_itm_style": filter_itm_style,
@@ -4035,6 +4052,34 @@ def _resolve_dynamic_text_tokens(text, params):
     return "\n".join(ln.strip() for ln in out.split("\n")).strip()
 
 
+def _resolve_caption_text(text, params):
+    """Resolve a caption-only worksheet's raw title to static display text (v2-3).
+
+    A caption-only worksheet (see ``caption_only_raw`` in :func:`_parse_worksheet`) is a thin
+    status / refresh / filter-breadcrumb bar whose title is usually *dynamic* -- woven from
+    ``<[Parameters].[id]>`` tokens, federated field-refs (``<[ds].[field]>``), and Tableau runtime
+    specials (``<Data Update Time>``, ``<Data Connection Name>``, ...). This renders it to a plain
+    literal for the rebuilt textbox: every parameter token becomes its CURRENT display value, and
+    every *other* ``<...>`` token -- field-refs AND runtime specials alike -- is stripped rather than
+    leaked as raw markup (a static build has no live value for them; v2-4 deepens field-ref
+    resolution). Differs from :func:`_resolve_dynamic_text_tokens` (which strips only bracketed
+    field-refs) by clearing ALL residual ``<...>`` so a runtime special never survives. Collapses
+    runs of horizontal whitespace (a hard newline is preserved); returns ``""`` for an all-token
+    caption so the caller drops the now-empty band."""
+    if not text:
+        return ""
+
+    def _sub_param(mo):
+        info = params.get(mo.group("pid")) if params else None
+        disp = info.get("current_display") if info else None
+        return disp if disp else ""
+
+    out = _PARAM_TOKEN_RE.sub(_sub_param, text)
+    out = _TITLE_DYNAMIC_RE.sub("", out)   # strip every remaining field-ref + runtime special
+    out = re.sub(r"[ \t]+", " ", out)
+    return "\n".join(ln.strip() for ln in out.split("\n")).strip()
+
+
 def _detect_sheet_swaps(worksheets, dashboards, params, warnings):
     """Group worksheets that toggle within one dashboard zone via a shared swap parameter.
 
@@ -4130,7 +4175,8 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
         parsed = _parse_dashboard(db, worksheet_names, warnings)
         for z in parsed["zones"]:
             target = ws_by_name.get(z["worksheet"])
-            if target and target["visual_type"] == VT_UNSUPPORTED:
+            if (target and target["visual_type"] == VT_UNSUPPORTED
+                    and not target.get("caption_only_raw")):
                 warnings.append(_warn(
                     "dashboard", parsed["name"],
                     f"worksheet '{z['worksheet']}' is unsupported -> zone left empty"))
@@ -4152,6 +4198,16 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
                 tob = dict(tob, text=new_text)
             resolved_tobs.append(tob)
         db["text_objects"] = resolved_tobs
+    # v2-3: with parameters now known, resolve each caption-only worksheet's raw title to static
+    # display text so the page assembler can rebuild the thin status / refresh / filter-breadcrumb
+    # bar as a textbox (instead of dropping it to a blank band -- the "a thin view doesn't generate
+    # at all" defect). A caption that resolves to non-empty text is recorded on ``caption_only_text``;
+    # one that collapses to empty (an all-token caption with no static value) is left unset, so that
+    # rare band is still dropped. Additive: a worksheet with no ``caption_only_raw`` is untouched.
+    for w in worksheets:
+        raw = w.get("caption_only_raw")
+        if raw:
+            w["caption_only_text"] = _resolve_caption_text(raw, params)
     parameter_controls = _resolve_parameter_controls(dashboards, params, warnings, param_binding)
     sheet_swaps = _detect_sheet_swaps(worksheets, dashboards, params, warnings)
     visual_flags = _resolve_visual_flags(param_binding, ws_by_name, warnings)
@@ -7131,6 +7187,27 @@ def _text_object_textbox_visual(name, position, tob):
     return {"$schema": SCHEMA_VISUAL, "name": name, "position": position, "visual": visual}
 
 
+def _caption_only_textbox_visual(ws, zone, ref_w, ref_h, name, tab=0):
+    """Rebuild a caption-only worksheet (v2-3) as a textbox at its authored dashboard zone.
+
+    A worksheet whose only content is its title -- a thin status / refresh / filter-breadcrumb bar
+    (no rows, no cols, no plottable mark channel; see ``caption_only_raw`` in
+    :func:`_parse_worksheet`) -- classifies as ``VT_UNSUPPORTED`` and would be dropped, leaving a
+    blank band on the dashboard (the "a thin view doesn't generate at all" defect). Emit its resolved
+    caption (``caption_only_text``) as a plain textbox scaled to the zone with the caption-content
+    floor (``_TEXTBOX_MIN_W/H`` -- never the 40px chart floor, so a thin bar is not inflated), at the
+    normal tiled z-order (an anchor, NOT a floating ``z=900`` caption, so the v2-2 de-overlap pass
+    leaves it in its own reserved band). Styling is intentionally minimal (default body font, no
+    fill) -- completeness first; honouring the bar's authored fill/font is a later refinement.
+    Returns ``None`` when there is no caption text to show (an all-token caption that resolved empty),
+    so the caller falls back to the existing deferred-visual handling."""
+    text = ws.get("caption_only_text")
+    if not text:
+        return None
+    x, y, w, h = _scale_zone(zone, ref_w, ref_h, min_w=_TEXTBOX_MIN_W, min_h=_TEXTBOX_MIN_H)
+    return _text_object_textbox_visual(name, _position(x, y, w, h, tab=tab), {"text": text})
+
+
 def _resource_basename(ref):
     """The bare file name of a Tableau image ref (``Image/EBI Logo Black.png`` -> ``EBI Logo
     Black.png``). Tolerates either slash and a bare name."""
@@ -7574,7 +7651,32 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         page_ws = []
         for i, zone in enumerate(zones):
             ws = ws_by_name.get(zone["worksheet"])
-            if not ws or ws["visual_type"] == VT_UNSUPPORTED:
+            if not ws:
+                continue
+            if ws["visual_type"] == VT_UNSUPPORTED:
+                # v2-3: a caption-only worksheet (a thin status / refresh / filter-breadcrumb bar
+                # whose only content is its -- often dynamic -- title, no plottable mark) is rebuilt
+                # as a textbox at its authored zone instead of vanishing, so the dashboard band is
+                # never left empty (completeness). Every other unsupported worksheet is a genuinely
+                # deferred visual and still falls through to the existing "zone left empty" note.
+                cap = _caption_only_textbox_visual(
+                    ws, zone, ref_w, ref_h,
+                    _sanitize(f"v-{page_name}-cap-{i}-{ws['name']}"), tab=i)
+                if cap is not None:
+                    visuals.append(cap)
+                    placed.add(ws["name"])
+                    # Honest disclosure: the label scaffold is preserved, but a caption whose
+                    # values came from live field references (Tableau runtime specials like
+                    # <Data Update Time>, or worksheet field pills) renders those value slots
+                    # BLANK -- only parameter tokens resolve to a current display value. Say so
+                    # when the source caption carried any dynamic token, so the band being present
+                    # is never mistaken for its live values being reproduced.
+                    _had_dynamic = "<" in (ws.get("caption_only_raw") or "")
+                    _reason = ("caption-only worksheet rebuilt as a textbox; dynamic field values "
+                               "render blank (static label scaffold + resolved parameters preserved)"
+                               if _had_dynamic else
+                               "caption-only worksheet rebuilt as a textbox (static caption)")
+                    warnings.append(_warn("worksheet", ws["name"], _reason))
                 continue
             placed.add(ws["name"])
             state = _build_query_state(ws, model_table, field_map, warnings)

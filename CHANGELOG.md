@@ -13,6 +13,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.3.0` → `2.4.0`): Zone Geometry v2 slice 3 — caption-only worksheet →
+  textbox (recovers thin status / refresh / filter-breadcrumb bands that previously vanished).** A
+  dashboard-placed worksheet whose only content is its title — a thin "Data as of …" refresh bar, a
+  "Region : All | System : All" filter breadcrumb, a status strip — has no rows, no columns, and no
+  plottable mark channel, so it classifies as `VT_UNSUPPORTED` and was dropped, leaving the labelled band
+  empty (the "a thin view doesn't generate at all" defect; e.g. ATTI's `data update` and `tech filters`
+  bars were absent from the rebuild). Because completeness is a hard invariant — never leave a labelled
+  band empty — such a worksheet is now rebuilt as a plain `textbox` carrying its resolved caption, placed
+  at its authored dashboard zone at normal tiled z-order (an anchor, not a floating `z=900` caption, so
+  the v2-2 de-overlap pass reserves its band). The caption is resolved through the existing dynamic-token
+  path: parameter tokens (`<[Parameters].[…]>`) become their current display value, while live
+  field-reference tokens — which Power BI cannot reproduce statically — are blanked, keeping the static
+  label scaffold intact. The rebuild is disclosed honestly per band: a static caption notes a plain
+  textbox rebuild, a dynamic one adds that field values render blank (label scaffold + resolved parameters
+  preserved), so a present band is never mistaken for its live values being reproduced. The gate is
+  precise — it fires only when there is a title AND no plottable mark (no rows/cols and none of
+  color/size/label/angle; a detail-only pill that merely feeds the title is fine) — so a genuine chart is
+  never collapsed into a caption (verified: Salesforce's `Stage Legend` and distribution chart are
+  correctly not flagged). Additive, fail-safe, `+4` lock-in tests (IR flag + zone-placed textbox emit +
+  chart-not-converted precision + dynamic-value-blank honest disclosure).
 - **tableau-migration (skill `2.2.0` → `2.3.0`): Zone Geometry v2 slice 2 — caption de-overlap / tidy
   pass (lifts a floating caption textbox off any content it overlaps).** Tableau habitually floats a
   section-header / panel-label / instruction text zone directly on top of (or fully inside) the

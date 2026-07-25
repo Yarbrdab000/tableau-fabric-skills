@@ -7449,6 +7449,115 @@ def test_clear_caption_is_untouched_by_deoverlap():
     assert _inter_area(_rect(cap), _rect(chart)) <= 1.0
 
 
+# -- Zone Geometry v2 slice 3: caption-only worksheet -> textbox --------------------------------
+# A dashboard-placed worksheet whose ONLY content is its title (a thin status / refresh /
+# filter-breadcrumb bar: no rows, no cols, no plottable mark channel) classifies as VT_UNSUPPORTED.
+# Before v2-3 it was dropped, leaving the labelled band empty (the "a thin view doesn't generate at
+# all" defect). Now it is rebuilt as a textbox at its authored zone. The fixture pairs one such
+# caption-only worksheet with a real line chart on the same dashboard, so the same run proves BOTH
+# the rebuild AND that a genuine chart is never mistaken for a caption (gate precision).
+_V2_CAPTION_ONLY_STATIC = _workbook(
+    _worksheet("data update", "Text", rows="", cols="",
+               title="<run>Data as of 2024 | Rows =</run>")
+    + _worksheet("Trend", "Line", "[federated.abc].[sum:Sales:qk]",
+                 "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+    "<dashboard name='Board'><size maxwidth='1400' maxheight='1000' /><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("data update", x=0, y=0, w=100000, h=4000, zid="2"),
+        _text_object_ws_zone("Trend", x=0, y=40000, w=100000, h=50000, zid="3"),
+    )
+    + "</zones></dashboard>",
+)
+
+# A caption whose text carries a dynamic Tableau field-reference token (an escaped &lt;...&gt; run):
+# the value cannot be reproduced statically, so it renders BLANK while the static label scaffold is
+# kept -- and the run discloses that honestly rather than pretending the live value was reproduced.
+_V2_CAPTION_ONLY_DYNAMIC = _workbook(
+    _worksheet("status bar", "Text", rows="", cols="",
+               title="<run>Region : &lt;[federated.abc].[none:Region:nk]&gt; | Count =</run>")
+    + _worksheet("Trend", "Line", "[federated.abc].[sum:Sales:qk]",
+                 "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+    "<dashboard name='Board2'><size maxwidth='1400' maxheight='1000' /><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("status bar", x=0, y=0, w=100000, h=4000, zid="2"),
+        _text_object_ws_zone("Trend", x=0, y=40000, w=100000, h=50000, zid="3"),
+    )
+    + "</zones></dashboard>",
+)
+
+
+def _textbox_text(vj):
+    paras = vj["visual"]["objects"]["general"][0]["properties"]["paragraphs"]
+    runs = []
+    for para in paras:
+        for r in para.get("textRuns", []):
+            val = r.get("value")
+            runs.append(val if isinstance(val, str) else "")
+    return "".join(runs)
+
+
+def test_caption_only_worksheet_flagged_in_ir():
+    # The caption-only worksheet is classed unsupported yet carries a resolved caption; the real
+    # chart worksheet is NOT flagged (the gate keys on "no plottable mark", not merely on the title).
+    ir = parse_twb(_V2_CAPTION_ONLY_STATIC)
+    by = {w["name"]: w for w in ir["worksheets"]}
+    assert by["data update"]["visual_type"] == "unsupported"
+    assert by["data update"]["caption_only_text"] == "Data as of 2024 | Rows ="
+    assert by["Trend"]["visual_type"] == "line"
+    assert not by["Trend"].get("caption_only_text")
+
+
+def test_caption_only_worksheet_emits_textbox_at_its_zone():
+    # The dashboard band is rebuilt as a textbox carrying the caption, at the caption zone (top,
+    # y=0), sized by the caption-content floor (never the 40px chart floor inflating a thin bar).
+    res = migrate_twb_to_pbir(_V2_CAPTION_ONLY_STATIC)
+    vis = [json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")]
+    caps = [v for v in vis if v["visual"]["visualType"] == "textbox"
+            and "Data as of 2024" in _textbox_text(v)]
+    assert len(caps) == 1
+    cap = caps[0]
+    # placed at the authored caption zone: top of canvas, full width (4000/100000*1000 -> 40px tall)
+    assert cap["position"]["y"] == 0.0
+    assert cap["position"]["x"] == 0.0
+    assert cap["position"]["width"] == 1400.0
+    # a positive, honest rebuild disclosure is surfaced (static caption -> no "render blank" caveat)
+    reasons = [w["reason"] for w in res["warnings"]
+               if w.get("name") == "data update" and "caption-only worksheet rebuilt" in w["reason"]]
+    assert len(reasons) == 1
+    assert "static caption" in reasons[0]
+
+
+def test_chart_worksheet_never_rebuilt_as_caption_textbox():
+    # Gate precision: the genuine line chart on the same dashboard stays a lineChart -- it is never
+    # collapsed into a caption textbox (which would silently drop a real visual).
+    res = migrate_twb_to_pbir(_V2_CAPTION_ONLY_STATIC)
+    vis = [json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")]
+    assert any(v["visual"]["visualType"] == "lineChart" for v in vis)
+    # and no textbox accidentally carries the chart's own data
+    charts_as_text = [v for v in vis if v["visual"]["visualType"] == "textbox"
+                      and "Trend" == v.get("name")]
+    assert charts_as_text == []
+
+
+def test_dynamic_caption_renders_blank_values_with_honest_disclosure():
+    # A caption built from a live field reference keeps its static labels but blanks the value slot
+    # (Power BI cannot reproduce the Tableau runtime value); the rebuild warning says so plainly.
+    res = migrate_twb_to_pbir(_V2_CAPTION_ONLY_DYNAMIC)
+    vis = [json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")]
+    caps = [v for v in vis if v["visual"]["visualType"] == "textbox"
+            and _textbox_text(v).startswith("Region :")]
+    assert len(caps) == 1
+    text = _textbox_text(caps[0])
+    # the label scaffold survives; the field-ref value slot is blank (no raw <...> token leaks)
+    assert "Region :" in text and "Count =" in text
+    assert "<" not in text and ">" not in text
+    assert "federated" not in text
+    reasons = [w["reason"] for w in res["warnings"]
+               if w.get("name") == "status bar" and "caption-only worksheet rebuilt" in w["reason"]]
+    assert len(reasons) == 1
+    assert "render blank" in reasons[0]
+
+
 def test_banner_only_dashboard_never_regresses():
     # a dashboard whose only text zone is the top banner keeps text_objects empty after de-dupe,
     # so emit_pbir adds exactly one banner textbox and nothing else.
