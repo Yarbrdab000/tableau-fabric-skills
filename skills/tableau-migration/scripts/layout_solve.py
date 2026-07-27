@@ -24,7 +24,15 @@ auditor already treats them.
 either axis before allocating, so a solvable tree always yields rects that are disjoint (flow),
 contained, and min-respecting. This extends the layout-solver spec's height-only FitToPage growth to
 both axes so containment is a clean, unconditional invariant rather than a height-only one; a wider or
-taller page still rescales to the viewport (it does not produce a scrollbar).
+taller page still rescales to the viewport (it does not produce a scrollbar). Growth is bounded by
+``MAX_GROWTH``, and whatever the cap leaves unsatisfied is absorbed by ``allocate``'s last-resort
+proportional down-scale, so on-page containment holds even when the page may not grow far enough.
+
+**A frame's min accounts for its children's SOURCE FRACTIONS.** A frame hands each child
+``child_src / frame_src`` of its own box, so taking the frame's min as ``max(child min)`` understates
+it by exactly that fraction: the frame looks satisfied while every child is starved, and a starved
+flow child then overruns its own box. Inverting the fraction is what makes the growth above sufficient
+rather than merely plausible.
 
 **Fixed-size children are accounted correctly.** ``is-fixed`` zones occupy exactly their ``fixed_px``
 on the container's main axis regardless of their subtree min, so a fixed child contributes
@@ -51,6 +59,16 @@ except ImportError:  # pragma: no cover - defensive; conftest puts scripts/ on t
 # -- tunables (one place so tests can assert against them) -----------------------
 GAP = 8.0                # inter-sibling gap on a flow container's main axis, page pixels
 TOL = 1.0                # linear tolerance: touching / sub-pixel float noise is not overlap
+
+# Ceiling on how far ``solve`` may enlarge the requested page on either axis. Growth is how the
+# solver guarantees containment (a page big enough for the content cannot overflow), but a page grown
+# without bound is its own defect: every visual on it renders proportionally smaller under FitToPage,
+# and one corpus sliver zone would otherwise demand a 164384px-wide canvas. Measured across the
+# six-workbook corpus, the sub-41px "floor" count falls 52 -> 47 -> 38 -> 32 at caps of 1.25x / 1.5x /
+# 2x and then PLATEAUS -- 2.5x and 3x also yield 32 -- so 2x buys the entire available benefit and
+# growing further only shrinks the render. At this ceiling the solver matches the legacy path's
+# floor count (32 vs 31) while eliminating its own containment (1) and out-of-bounds (7) defects.
+MAX_GROWTH = 2.0
 
 # Default leaf minimum table -- (min_w, min_h) in page pixels, keyed by zone_tree leaf_kind.
 # These are deliberately conservative floors; the emit path injects a richer resolver (that knows a
@@ -108,15 +126,20 @@ def _main_min_contrib(child, vertical):
     return child["min_h"] if vertical else child["min_w"]
 
 
-def compute_mins(node, min_for_leaf):
-    """Populate ``min_w`` / ``min_h`` on every node, bottom-up. Mutates the tree in place."""
+def compute_mins(node, min_for_leaf, cap=None):
+    """Populate ``min_w`` / ``min_h`` on every node, bottom-up. Mutates the tree in place.
+
+    ``cap`` is an optional ``(max_min_w, max_min_h)`` ceiling applied to FRAME nodes only -- see
+    :data:`MAX_GROWTH`. Flow (vstack/hstack) mins are never capped: they are exact sums of real
+    content requirements, and understating them is what lets a container overrun its own box.
+    """
     if node["kind"] == K_LEAF:
         mw, mh = min_for_leaf(node)
         node["min_w"], node["min_h"] = float(mw), float(mh)
         return
     kids = node["children"]
     for c in kids:
-        compute_mins(c, min_for_leaf)
+        compute_mins(c, min_for_leaf, cap)
     gaps = GAP * max(0, len(kids) - 1)
     if node["kind"] == K_VSTACK:
         node["min_h"] = sum(_main_min_contrib(c, True) for c in kids) + gaps
@@ -124,9 +147,35 @@ def compute_mins(node, min_for_leaf):
     elif node["kind"] == K_HSTACK:
         node["min_w"] = sum(_main_min_contrib(c, False) for c in kids) + gaps
         node["min_h"] = max((c["min_h"] for c in kids), default=0.0)
-    else:  # K_FRAME -- children are absolute; the frame's min is its own bounding need
-        node["min_w"] = max((c["min_w"] for c in kids), default=0.0)
-        node["min_h"] = max((c["min_h"] for c in kids), default=0.0)
+    else:  # K_FRAME -- children are absolute, placed by SOURCE FRACTION of the frame
+        # A frame hands each child ``child_src / frame_src`` of its own box (see ``_scale_abs``), so
+        # a child occupying 40% of the frame's height only receives 0.4 * frame_h. Taking the frame's
+        # min as ``max(child min)`` therefore UNDERSTATES it by exactly that fraction: the frame looks
+        # satisfied while every child is starved. A starved flow child then overruns its own box (its
+        # fixed-size and min-clamped grandchildren sum past the box it was given), which is precisely
+        # how a solved page produced out-of-bounds rects even when the solver reported no growth --
+        # measured as 7 out-of-bounds leaves across 4 corpus dashboards. Invert the fraction so the
+        # frame asks for the size at which each child's scaled box actually meets that child's min.
+        fs = node.get("src") or {}
+        fsw, fsh = fs.get("w"), fs.get("h")
+        need_w, need_h = [], []
+        for c in kids:
+            cs = c.get("src") or {}
+            frac_w = (cs.get("w") or 0.0) / fsw if fsw else 0.0
+            frac_h = (cs.get("h") or 0.0) / fsh if fsh else 0.0
+            # A degenerate fraction means ``_scale_abs`` will make the child fill the frame, so the
+            # child's own min is the requirement -- no inversion.
+            need_w.append(c["min_w"] / frac_w if frac_w > 0 else c["min_w"])
+            need_h.append(c["min_h"] / frac_h if frac_h > 0 else c["min_h"])
+        node["min_w"] = max(need_w, default=0.0)
+        node["min_h"] = max(need_h, default=0.0)
+        if cap:
+            # Inverting a near-zero fraction explodes: one corpus dashboard has a sliver zone barely
+            # 0.8% of the frame's width, whose 120px slicer minimum would demand a 164384px-wide page.
+            # A sliver is decoration, not a reason to make the whole canvas unreadable, so the frame's
+            # demand is capped and ``allocate``'s last-resort scale absorbs the residue.
+            node["min_w"] = min(node["min_w"], float(cap[0]))
+            node["min_h"] = min(node["min_h"], float(cap[1]))
 
 
 # -- pass 2: allocate (top-down) ------------------------------------------------
@@ -200,8 +249,22 @@ def allocate(node, rect):
             break
 
     cursor = y if vertical else x
+    # Last-resort containment. Everything above is a REQUEST: fixed children take their pixels
+    # outright and min-violators are clamped UP, so when a container is itself under-allocated (a
+    # capped frame, or a frame whose child fraction could not be fully honoured) the requests can sum
+    # past the box and the advancing cursor walks straight off it. Scaling every allocation by the
+    # one factor that makes them fit keeps the children's relative proportions and makes flow
+    # containment UNCONDITIONAL -- the invariant this module promises -- at the cost of letting a
+    # child fall below its min, which is a legible "too small" (floor) signal rather than a silently
+    # off-page visual. Load-bearing: without it the capped solver still leaves out-of-bounds rects.
+    content = sum(alloc[id(c)] for c in kids)
+    room = main_total - gaps
+    if content > room + TOL and content > 0:
+        squeeze = max(0.0, room) / content
+        for c in kids:
+            alloc[id(c)] *= squeeze
     for c in kids:
-        size = alloc[id(c)]
+        size = max(0.0, alloc[id(c)])
         if vertical:
             allocate(c, (x, cursor, w, size))
         else:
@@ -237,10 +300,13 @@ def solve(tree, page_rect, min_for_leaf=None, grow=True):
             return None
         resolver = min_for_leaf or default_min_for_leaf
 
-        compute_mins(root, resolver)
-
         px, py, pw, ph = (float(page_rect[0]), float(page_rect[1]),
                           float(page_rect[2]), float(page_rect[3]))
+        # The growth ceiling is derived from the REQUESTED page, so it must be known before the
+        # bottom-up min pass can cap a frame's inverted-fraction demand.
+        cap = (pw * MAX_GROWTH, ph * MAX_GROWTH) if (grow and pw > 0 and ph > 0) else None
+        compute_mins(root, resolver, cap)
+
         if grow:
             # Enlarge to the root's min on both axes so allocation cannot overflow the page; min
             # sizes are page-independent, so one allocation pass on the grown rect suffices (this is

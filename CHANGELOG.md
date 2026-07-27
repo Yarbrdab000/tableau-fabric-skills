@@ -12,6 +12,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+- **tableau-migration (skill `2.17.0` → `2.18.0`): solver containment — a frame no longer starves its
+  children — frame/quality track slice 4c (`scripts/layout_solve.py`; still nothing imports the solver
+  in the emit path, so migration output is unchanged).** A `frame` (Tableau `layout-basic`) hands each
+  child `child_src / frame_src` of its own allocated box, but `compute_mins` took a frame's minimum as
+  `max(child min)`. That **understates** the frame's requirement by exactly that fraction — a child
+  occupying 40 % of the frame's height needs the frame to be `child_min / 0.4` tall, not `child_min` —
+  so the frame reported itself satisfied while every child was starved. A starved flow child then
+  overran its own box, because its fixed-size and min-clamped grandchildren sum past whatever it was
+  given and the advancing cursor simply walked off the end. Measured on the six-workbook corpus: **7
+  out-of-bounds leaves across 4 dashboards, on pages the solver reported as not needing to grow.**
+  Three coupled changes close it: (1) a frame's min now **inverts each child's source fraction**;
+  (2) that demand is **capped at `MAX_GROWTH` (2.0) × the requested page**, because inverting a
+  near-zero fraction explodes — one corpus sliver zone barely 0.8 % of its frame's width would
+  otherwise demand a **164 384 px**-wide canvas; and (3) a flow container **scales its allocations
+  down proportionally** when they still exceed its box, which is what makes on-page containment
+  unconditional rather than conditional on the cap being generous (load-bearing: with the cap but
+  without the down-scale the corpus still shows 1 containment + 1 out-of-bounds defect). `MAX_GROWTH`
+  is the measured knee, not a guess: corpus floor counts run 47 → 38 → 32 at caps of 1.25× / 1.5× / 2×
+  and then **plateau** (2.5× and 3× also give 32), so 2× buys the entire available benefit while
+  growing further only shrinks every visual under FitToPage. Corpus result: overlaps **0**,
+  containment **1 → 0**, out-of-bounds **7 → 0**, floor **52 → 32** — parity with the legacy path's
+  0 / 0 / 0 / 31, which clears the A/B flip gate. Also establishes that a solved page's rects are
+  valid **only on the plan's own page** (scored against the originally requested page the same corpus
+  shows 100 out-of-bounds), so a future emit wiring must adopt `plan["page"]`. `compute_mins` gains an
+  optional trailing `cap` argument (additive; existing two-argument calls behave as before), flow
+  minimums are never capped, and the stale "out-of-bounds is owned by a later track" concession in the
+  slice-2 test contract is corrected. +16 tests (`tests/test_layout_containment.py`).
+
 ### Added
 - **tableau-migration (skill `2.16.0` → `2.17.0`): per-dashboard layout PLAN — frame/quality track
   slice 4b (new `scripts/layout_plan.py`, stdlib-only, nothing imports it yet, zero behaviour

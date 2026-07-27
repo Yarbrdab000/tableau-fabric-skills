@@ -15,9 +15,11 @@ Scope of each invariant (deliberate, and documented so the contract is honest):
   Frames are covered by their own small test set (overlap is representable; a within-bounds child is
   contained; a degenerate frame source makes a child fill the frame).
 * The opt-in real-workbook golden asserts the slice gate -- the solver never raises on a real tree
-  and produces **zero flow overlaps** -- not containment, because a real frame nesting a flow subtree
-  can squash it below its min (an out-of-bounds concern owned by the later quality track, never an
-  overlap).
+  and produces **zero flow overlaps**. Containment is NOT asserted here, but it is no longer a
+  conceded gap: slice 4c made a frame's min account for its children's source fractions and gave
+  every flow container a last-resort down-scale, so on-page containment is now unconditional. That
+  invariant is owned by ``test_layout_containment.py``; a frame squashing a child BELOW ITS MIN is
+  still permitted (the author pinned that geometry) and surfaces as a legible "too small" signal.
 
 Fixed-size (``is-fixed``) leaves are pinned to ``fixed_px`` on the container main axis regardless of
 their min, so they are exempt from main-axis min-respect (their author pinned them); they still must
