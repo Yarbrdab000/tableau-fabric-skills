@@ -13,6 +13,18 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.19.0` → `2.20.0`): the v2.7.0 geometry goldens now run under BOTH
+  layout engines — frame/quality track slice 4e (`tests/test_layout_engine.py`; test-only, the engine
+  is byte-identical so no migration output can change).** v2.7.0 locked "a clean page stays clean"
+  against the legacy engine only. Those goldens are left byte-for-byte alone; the new parametrized
+  set runs the same four clean-page workbooks and the same shipped auditor under each engine in turn,
+  so the solver path carries the identical regression net rather than an unguarded parallel one — if a
+  future solver change starts manufacturing overlap on a page legacy keeps clean, this fails. Also
+  adds two completeness guards that geometry scoring alone cannot give: a short band must still emit
+  its visual under either engine, and both engines must emit the **same set** of visuals — a solver
+  that silently failed to place a zone would surface as a lost visual, not as a geometry defect.
+
+### Added
 - **tableau-migration (skill `2.18.0` → `2.19.0`): opt-in `--layout solver` — the zone-tree layout
   engine is wired into emit — frame/quality track slice 4d (`scripts/twb_to_pbir.py`,
   `scripts/layout_solve.py`, new `tests/test_layout_engine.py`).** Four branch-only slices built the

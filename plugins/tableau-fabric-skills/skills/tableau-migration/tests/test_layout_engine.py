@@ -326,3 +326,68 @@ def test_emit_pbir_ir_round_trip_under_the_solver():
     one_call = migrate_twb_to_pbir(xml, layout="solver")["parts"]
     two_step = emit_pbir(parse_twb(xml, layout="solver"))
     assert _positions(two_step) == _positions(one_call)
+
+
+# -- the v2.7.0 geometry goldens, now held under BOTH engines --------------------------------
+# v2.7.0 locked "a clean page stays clean" against the legacy engine. Those goldens are left
+# byte-for-byte alone; these run the SAME workbooks and the SAME auditor under each engine in turn,
+# so the solver path carries the identical regression net rather than an unguarded parallel one. If
+# a future solver change starts manufacturing overlap on a page legacy keeps clean, this fails.
+
+_GOLDEN_WORKBOOKS = (
+    ("clean_tiled", "_V27_CLEAN_TILED"),
+    ("deoverlapped", "_V2_DEOVERLAP_TWB"),
+    ("already_clear", "_V2_CLEAR_CAPTION_TWB"),
+    ("caption_only", "_V2_CAPTION_ONLY_STATIC"),
+)
+
+
+def _golden_twb(attr):
+    import test_twb_to_pbir
+
+    return getattr(test_twb_to_pbir, attr)
+
+
+def _worst_page_defects(parts):
+    """The summed geometry defects across every emitted page."""
+    import geometry_audit
+
+    total = {"overlaps": 0, "contain": 0, "oob": 0}
+    for pg in geometry_audit.pages_from_parts(parts).values():
+        if not pg["w"] or not pg["h"]:
+            continue
+        d = geometry_audit.geometry_defects(pg["visuals"], pg["w"], pg["h"])
+        for k in total:
+            total[k] += d[k]
+    return total
+
+
+@pytest.mark.parametrize("engine", LAYOUT_ENGINES)
+@pytest.mark.parametrize("label,attr", _GOLDEN_WORKBOOKS)
+def test_v2_7_goldens_stay_clean_under_both_engines(engine, label, attr):
+    res = migrate_twb_to_pbir(_golden_twb(attr), layout=engine)
+    d = _worst_page_defects(res["parts"])
+    assert d == {"overlaps": 0, "contain": 0, "oob": 0}, f"{label}/{engine}: {d}"
+
+
+@pytest.mark.parametrize("engine", LAYOUT_ENGINES)
+def test_thin_worksheet_still_emits_under_both_engines(engine):
+    # A short band must still GENERATE its visual under either engine -- the solver resolves
+    # geometry, it must never drop a zone.
+    res = migrate_twb_to_pbir(_golden_twb("_V27_THIN_WS"), layout=engine)
+    import geometry_audit
+
+    kinds = sorted(v["visual"]["visualType"]
+                   for pg in geometry_audit.pages_from_parts(res["parts"]).values()
+                   for v in pg["visuals"])
+    assert kinds == ["clusteredColumnChart", "lineChart"]
+
+
+@pytest.mark.parametrize("engine", LAYOUT_ENGINES)
+def test_no_visual_is_lost_between_the_engines(engine):
+    # The strongest completeness guard: whatever the layout engine, the SAME set of visuals is
+    # emitted. A solver that silently failed to place a zone would show up here, not as geometry.
+    xml = _two_sheet_workbook()
+    baseline = set(_positions(migrate_twb_to_pbir(xml, layout="legacy")["parts"]))
+    assert set(_positions(migrate_twb_to_pbir(xml, layout=engine)["parts"])) == baseline
+
