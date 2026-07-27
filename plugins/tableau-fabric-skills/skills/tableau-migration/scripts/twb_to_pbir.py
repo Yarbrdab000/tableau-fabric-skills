@@ -6733,10 +6733,35 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
 _FILTER_SOURCE_ALIAS = "f"
 
 
+# Zone Geometry v2 slice 5 -- emit-boundary sentinel / mojibake scrub. Tableau reuses the Latin
+# letter 'Æ' (U+00C6) as a soft/hard line-break sentinel inside formatted-text runs, and can leave a
+# U+FFFD replacement char where a source byte failed to decode. Several parse helpers strip these at
+# their own site, but the resolver paths (dynamic caption / title, which preserve a real newline)
+# carry a bare sentinel through -- so a two-line caption emitted "New Inbound<Æ>" / "Referrals". This
+# is the FINAL net at the emit boundary: every string bound for a Literal (via
+# ``_semantic_string_literal``) and every textbox run value passes through it. Crucially 'Æ' is ALSO a
+# legitimate letter (Danish/Norwegian "Ærø"), so it is scrubbed ONLY where it marks a break -- right
+# before a newline, or at the very end of the text -- never mid-word. U+FFFD is never legitimate and
+# is always dropped.
+_SENTINEL_BREAK_RE = re.compile(r"\u00c6(?=[\r\n])|\u00c6\Z")
+_REPLACEMENT_CHAR = "\ufffd"
+
+
+def _scrub_sentinels(text):
+    """Drop Tableau's line-break sentinel (``Æ``) where it marks a break and any ``U+FFFD`` mojibake
+    from a string bound for the report. Non-string or already-clean input is returned unchanged via a
+    fast no-op path, so this is safe to call on every emitted value (colours, hex, geo blobs included).
+    """
+    if not isinstance(text, str) or ("\u00c6" not in text and _REPLACEMENT_CHAR not in text):
+        return text
+    return _SENTINEL_BREAK_RE.sub("", text).replace(_REPLACEMENT_CHAR, "")
+
+
 def _semantic_string_literal(value):
     """A Power BI semantic-query string literal: embedded single quotes, inner apostrophe doubled
-    (``O'Brien`` -> ``'O''Brien'``)."""
-    return "'" + str(value).replace("'", "''") + "'"
+    (``O'Brien`` -> ``'O''Brien'``). Any Tableau line-break sentinel / mojibake is scrubbed first
+    (see :func:`_scrub_sentinels`) so no stray ``Æ`` / ``U+FFFD`` ever reaches an emitted Literal."""
+    return "'" + _scrub_sentinels(str(value)).replace("'", "''") + "'"
 
 
 def _font_style_props(style):
@@ -7160,7 +7185,7 @@ def _banner_textbox_visual(name, position, banner):
     ``visualContainer/1.0.0`` schema this engine stamps for every visual (``SCHEMA_VISUAL``)."""
     fill = banner["fill"]
     color = banner.get("text_color") or "#ffffff"
-    run = {"value": banner["text"],
+    run = {"value": _scrub_sentinels(banner["text"]),
            "textStyle": {"fontWeight": "bold", "fontSize": _BANNER_FONT_SIZE, "color": color}}
     visual = {
         "visualType": "textbox",
@@ -7220,8 +7245,9 @@ def _text_object_textbox_visual(name, position, tob):
     if tob.get("bold"):
         style["fontWeight"] = "bold"
     # A hard line break (Tableau's Æ-sentinel newline, e.g. a two-line column header) becomes its own
-    # paragraph so the break renders in Power BI; single-line text stays one paragraph (unchanged).
-    lines = tob["text"].split("\n")
+    # paragraph so the break renders in Power BI; single-line text stays one paragraph (unchanged). The
+    # sentinel itself is scrubbed at the break so no literal "Æ" ends a line (v2-5).
+    lines = _scrub_sentinels(tob["text"]).split("\n")
     paragraphs = [{"textRuns": [{"value": ln, "textStyle": style}],
                    "horizontalTextAlignment": "left"} for ln in lines]
     fill = tob.get("fill")

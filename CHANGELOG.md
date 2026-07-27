@@ -13,6 +13,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.5.0` → `2.6.0`): Zone Geometry v2 slice 5 — emit-boundary line-break
+  sentinel / mojibake scrub (no more stray `Æ` or `�` on the page).** Tableau reuses the Latin letter
+  `Æ` (U+00C6) as a soft/hard line-break sentinel inside formatted-text runs, and can leave a U+FFFD
+  replacement char where a source byte failed to decode. Several parse helpers already strip these at
+  their own site, but the dynamic caption / title resolvers (which deliberately preserve a real
+  newline) carried a bare sentinel through — so a two-line caption emitted `New Inbound`**`Æ`** /
+  `Referrals`, with a literal `Æ` ending the first line. A single centralized scrub now runs at the
+  emit boundary: every string bound for a semantic-query `Literal` (via `_semantic_string_literal` —
+  titles, matrix/table headers, KPI text, reference-line labels, category labels) and every textbox
+  run value (banner, dashboard text object, and the v2-3 caption-only worksheet rebuild) passes
+  through it. Crucially the scrub is **targeted, not blanket**: because `Æ` is also a legitimate letter
+  (Danish/Norwegian `Ærø`), the sentinel is dropped ONLY where it marks a break — immediately before a
+  newline, or at the very end of the text — never mid-word, so real text is preserved verbatim; U+FFFD
+  is never legitimate and is always dropped. The line break itself survives (the two-line caption
+  becomes two clean paragraphs). Additive, fail-safe, `+5` lock-in tests (helper contract incl. the
+  legitimate-`Æ` over-scrub guard, `_semantic_string_literal` chokepoint, caption-only multiline e2e,
+  container-title mojibake scrub, legitimate-`Æ` title survives end-to-end).
 - **tableau-migration (skill `2.4.0` → `2.5.0`): Zone Geometry v2 slice 4 — resolve dynamic
   parameter-driven titles on SUPPORTED visuals (no more silently dropped chart titles).** A rebuilt
   chart, table, or other supported visual whose authored title weaves a Tableau parameter token —

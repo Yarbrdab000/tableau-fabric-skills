@@ -41,6 +41,8 @@ from twb_to_pbir import (
     _resolve_visual_flags,
     _resource_basename,
     _role_projections,
+    _scrub_sentinels,
+    _semantic_string_literal,
     _tableau_filter_mode_to_pbi,
     _tableau_param_control_mode_to_pbi,
     _text_object_textbox_visual,
@@ -7615,6 +7617,91 @@ def test_dynamic_caption_renders_blank_values_with_honest_disclosure():
                if w.get("name") == "status bar" and "caption-only worksheet rebuilt" in w["reason"]]
     assert len(reasons) == 1
     assert "render blank" in reasons[0]
+
+
+# --- Zone Geometry v2 slice 5: emit-boundary sentinel / mojibake scrub ---------------------------
+_SENT = "\u00c6"       # Tableau's soft/hard line-break sentinel (a reused Latin 'Æ')
+_FFFD = "\ufffd"       # Unicode replacement char (undecodable-byte mojibake)
+
+
+def test_v2_5_scrub_sentinels_contract():
+    # Pin the helper contract: the sentinel is scrubbed ONLY where it marks a break (immediately
+    # before a newline, or at end of text); a legitimate 'Æ' letter is preserved mid-word / leading;
+    # U+FFFD mojibake is always dropped; non-strings and clean strings pass through untouched.
+    assert _scrub_sentinels("New Inbound" + _SENT + "\nReferrals") == "New Inbound\nReferrals"
+    assert _scrub_sentinels("Referrals" + _SENT) == "Referrals"
+    assert _scrub_sentinels("A" + _SENT + "\nB" + _SENT) == "A\nB"
+    # the crucial over-scrub guard: a real 'Æ' letter (Danish/Norwegian) is never touched
+    assert _scrub_sentinels("\u00c6r\u00f8 Municipality") == "\u00c6r\u00f8 Municipality"
+    assert _scrub_sentinels("visited " + _SENT + "R zone") == "visited " + _SENT + "R zone"
+    assert _scrub_sentinels("Total" + _FFFD + "Sales") == "TotalSales"
+    assert _scrub_sentinels("clean title") == "clean title"
+    assert _scrub_sentinels(123) == 123  # non-string passthrough
+
+
+def test_v2_5_semantic_string_literal_scrubs_sentinels():
+    # every Literal-bound string flows through _semantic_string_literal, so a stray sentinel / mojibake
+    # can never reach an emitted Literal Value -- while a legitimate 'Æ' letter survives verbatim.
+    assert _semantic_string_literal("New Inbound" + _SENT + "\nReferrals") == "'New Inbound\nReferrals'"
+    assert _semantic_string_literal("Total" + _FFFD + "Sales") == "'TotalSales'"
+    assert _semantic_string_literal("\u00c6r\u00f8 Region") == "'\u00c6r\u00f8 Region'"
+
+
+def _caption_only_sentinel_workbook(title):
+    # a caption-only worksheet (thin band, no plottable mark) whose title carries the sentinel, above a
+    # real chart -- mirrors the multiline-caption case that leaked a literal 'Æ' onto the page (D5).
+    return _workbook(
+        _worksheet("hdr bar", "Text", rows="", cols="", title="<run>" + title + "</run>")
+        + _worksheet("Trend", "Line", "[federated.abc].[sum:Sales:qk]",
+                     "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+        "<dashboard name='Board'><size maxwidth='1400' maxheight='1000' /><zones>"
+        + _text_object_container(
+            _text_object_ws_zone("hdr bar", x=0, y=0, w=100000, h=4000, zid="2"),
+            _text_object_ws_zone("Trend", x=0, y=40000, w=100000, h=50000, zid="3"),
+        )
+        + "</zones></dashboard>",
+    )
+
+
+def test_v2_5_caption_only_multiline_sentinel_scrubbed_at_emit():
+    # the D5 fix end-to-end: a two-line caption "New Inbound<Æ>\nReferrals" rebuilds as a textbox whose
+    # hard break survives as two paragraphs, with NO literal 'Æ' anywhere in the emitted report.
+    res = migrate_twb_to_pbir(_caption_only_sentinel_workbook("New Inbound" + _SENT + "\nReferrals"))
+    vis = [json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")]
+    caps = [v for v in vis if v["visual"]["visualType"] == "textbox"
+            and "New Inbound" in _textbox_text(v)]
+    assert len(caps) == 1
+    paras = caps[0]["visual"]["objects"]["general"][0]["properties"]["paragraphs"]
+    assert len(paras) == 2                     # the hard break is preserved as two paragraphs
+    assert _textbox_text(caps[0]) == "New InboundReferrals"
+    assert _SENT not in json.dumps(res["parts"], ensure_ascii=False)  # never leaks into the report
+
+
+def test_v2_5_supported_visual_title_sentinel_scrubbed():
+    # the sentinel-scrub also covers the container-title path (via _semantic_string_literal): a static
+    # worksheet title carrying mojibake emits a clean title Literal with no U+FFFD.
+    ws = _worksheet("Titled", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST,
+                    title="<run>Total" + _FFFD + " Sales</run>")
+    res = migrate_twb_to_pbir(_workbook(ws))
+    val = _only_visual(res)["visual"]["visualContainerObjects"]["title"][0]["properties"]["text"]["expr"]["Literal"]["Value"]
+    assert val == "'Total Sales'"
+    assert _FFFD not in json.dumps(res["parts"], ensure_ascii=False)
+
+
+def test_v2_5_legitimate_ae_letter_survives_in_title():
+    # over-scrub guard end-to-end: a title with a real 'Æ' letter (not a break sentinel) is emitted
+    # verbatim -- the scrub must never corrupt legitimate Danish/Norwegian text.
+    ws = _worksheet("Nordic", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST,
+                    title="<run>\u00c6r\u00f8 Sales</run>")
+    res = migrate_twb_to_pbir(_workbook(ws))
+    val = _only_visual(res)["visual"]["visualContainerObjects"]["title"][0]["properties"]["text"]["expr"]["Literal"]["Value"]
+    assert val == "'\u00c6r\u00f8 Sales'"
 
 
 def test_banner_only_dashboard_never_regresses():
