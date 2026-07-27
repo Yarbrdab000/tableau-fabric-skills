@@ -13,6 +13,29 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.10.0` → `2.11.0`): layout solver — Zone Geometry v3 slice 2
+  (`scripts/layout_solve.py` + `tests/test_layout_solve.py`, solver-only, no emit change).** Second slice
+  of the layout-tree rewrite: a pure, deterministic, stdlib-only two-pass flexbox solver that resolves the
+  slice-1 zone tree into absolute page-pixel rectangles. Pass 1 (`compute_mins`, bottom-up) gives every
+  leaf a usable minimum size (slicer/paramctrl/text/worksheet/legend/bitmap/blank floors, with a taller
+  minimum for list-mode filters), a flow container the SUM of its children's main-axis contributions plus
+  gaps (a fixed-size child contributes exactly its `fixed_px`, not its subtree min — the nominal-rect
+  accounting the legacy path gets wrong), and the MAX on the cross axis. Pass 2 (`allocate`, top-down)
+  distributes each container's rect by fraction via a CSS-style freeze loop (fixed children take pixels
+  first; any child below its min is clamped up and its deficit charged to flexible siblings; terminates in
+  ≤ n rounds) and lays children out on a monotonically advancing cursor, so **flow overlap is
+  unrepresentable by construction** — nothing to detect, nothing to repair. `solve(grow=True)` first
+  enlarges the page to the root's min on both axes, making disjointness, containment, and min-respect
+  clean unconditional invariants for flow trees; a `frame` (Tableau `layout-basic`) remains the absolute
+  escape hatch where children keep their scaled source geometry and overlap is allowed by design. The
+  solver **never raises** — an unsolvable tree or any internal error returns `None` so the caller keeps the
+  legacy path — and **does not import `twb_to_pbir`; nothing in the engine imports the solver yet, so
+  migration output is byte-identical.** Proven with ~40 property tests over seeded random flow trees
+  (disjointness, containment, min-respect, coverage, determinism across 100 runs, growth-to-`ceil(min)`,
+  termination on pathological inputs, frame behaviour) plus an opt-in real-workbook gate; and validated
+  out-of-band across a six-workbook corpus (ATTI, both Salesforce Nonprofit workbooks, Salesforce Admin
+  Insights, Time Series, Twitter) — all 13 dashboards solve with **0 flow overlaps**, confirming the
+  "tiled flow zones cannot overlap" premise holds beyond the single motivating workbook.
 - **tableau-migration (skill `2.9.0` → `2.10.0`): zone-tree parser — Zone Geometry v3 slice 1
   (`scripts/zone_tree.py`, parse-only, no emit change).** First slice of the layout-tree rewrite that
   replaces the legacy "scale absolute rects then repair overlaps" path with a deterministic flow-layout
