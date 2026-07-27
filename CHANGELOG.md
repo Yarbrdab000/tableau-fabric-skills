@@ -13,6 +13,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.7.0` → `2.8.0`): Zone Geometry v2 slice 8 — robust caption de-overlap
+  (band-insertion fallback for packed dashboards).** The v2-2 tidy pass only lifted a floating caption
+  when a clear horizontal strip already existed; on a **packed** real dashboard (every band occupied) no
+  strip is free, so section headers / panel labels / instruction lines stayed stuck on top of the content
+  they label — empirically the dominant remaining overlap defect. v2-8 makes `_deoverlap_captions`
+  **open** a band when relocation can't: it pushes the labelled content block (and everything beneath) a
+  caption-height + gap straight **down**, seats the caption in the cleared strip, and grows the
+  `FitToPage` canvas so nothing spills out of bounds (a taller page simply rescales to the viewport, no
+  scrollbar). Side-by-side headers that head the **same** band share **one** inserted band instead of
+  stacking, and a band that would clip a non-shifting item straddling the insertion line is left
+  untouched (never made worse). Only caption/content **y** changes, always downward — nothing is dropped,
+  resized or restyled, so completeness and every horizontal arrangement are preserved. **Never-regress
+  gate is retained**: overlaps are computed first and the pass returns the page height unchanged when no
+  caption sits on an anchor, so cleanly tiled dashboards (e.g. Superstore) stay byte-identical. Measured
+  against the two complex reference workbooks the fallback resolves ATTI_ATTR Hierarchy and Salesforce
+  Nonprofit caption-on-content overlaps to **0 overlaps / 0 containment / 0 out-of-bounds**, growing only
+  the pages where a band was opened and holding clean pages at their authored dimensions. +4 lock-in
+  tests (packed-page band-insertion e2e · side-by-side headers share one band · clean/already-clear page
+  never grows · direct `_deoverlap_captions` return-contract unit). Suite **3073 passed / 4 skipped /
+  1 xfailed**; plugin mirror byte-identical; `rollback/pre-v2.8.0` at `1f5e531`.
 - **tableau-migration (skill `2.6.0` → `2.7.0`): Zone Geometry v2 slice 7 — geometry lock-in golden
   tests (composite-group-aware overlap auditor; donut-stack exemption).** A committed regression net for
   dashboard *layout quality* that formalizes the previously-untracked scratch geometry audit into
