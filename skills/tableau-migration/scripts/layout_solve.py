@@ -60,15 +60,24 @@ except ImportError:  # pragma: no cover - defensive; conftest puts scripts/ on t
 GAP = 8.0                # inter-sibling gap on a flow container's main axis, page pixels
 TOL = 1.0                # linear tolerance: touching / sub-pixel float noise is not overlap
 
-# Ceiling on how far ``solve`` may enlarge the requested page on either axis. Growth is how the
-# solver guarantees containment (a page big enough for the content cannot overflow), but a page grown
-# without bound is its own defect: every visual on it renders proportionally smaller under FitToPage,
-# and one corpus sliver zone would otherwise demand a 164384px-wide canvas. Measured across the
-# six-workbook corpus, the sub-41px "floor" count falls 52 -> 47 -> 38 -> 32 at caps of 1.25x / 1.5x /
-# 2x and then PLATEAUS -- 2.5x and 3x also yield 32 -- so 2x buys the entire available benefit and
-# growing further only shrinks the render. At this ceiling the solver matches the legacy path's
-# floor count (32 vs 31) while eliminating its own containment (1) and out-of-bounds (7) defects.
-MAX_GROWTH = 2.0
+# Ceiling on a FRAME's inverted-fraction height demand, as a multiple of the requested page height.
+#
+# This is a pathology guard, not a size preference. A frame positions each child at
+# ``child_src / frame_src`` of its own box, so satisfying a child's minimum requires inverting that
+# fraction -- and a near-zero fraction inverts to a near-infinite demand: one corpus dashboard has a
+# sliver zone barely 0.8% of its frame's width, whose 120px slicer minimum alone would ask for a
+# 164384px canvas. A sliver is decoration, not a reason to make the whole page unreadable, so the
+# demand is capped and ``allocate``'s proportional squeeze absorbs the residue.
+#
+# It deliberately does NOT double as a growth budget. An earlier version of this constant was tuned
+# by watching the sub-41px "floor" defect count fall as the cap rose -- but that count mechanically
+# improves when the canvas is inflated (nothing can be under 41px once the page doubles), so the
+# metric was rewarding the growth rather than measuring the layout. Page growth is now height-only
+# and exact (see ``solve``); this value only bounds the pathological case.
+FRAME_DEMAND_CAP = 2.0
+
+# Backwards-compatible alias: this used to be the symmetric both-axes growth ceiling.
+MAX_GROWTH = FRAME_DEMAND_CAP
 
 # Default leaf minimum table -- (min_w, min_h) in page pixels, keyed by zone_tree leaf_kind.
 # These are deliberately conservative floors; the emit path injects a richer resolver (that knows a
@@ -94,6 +103,48 @@ _LEAF_MIN = {
     "bitmap": MIN_BITMAP,
     "blank": MIN_BLANK,
 }
+
+# -- preferred sizes and growth weights (quality spec 5.1) -----------------------
+# A minimum answers "how small may this get before it breaks"; it says nothing about how large a
+# thing should be ALLOWED to become. With only a minimum, every child of a flow container is a
+# grower: surplus main-axis space is handed out by fraction, so a one-line caption in a roomy row
+# inflates until it fills its share. Measured on the user's real ATTI dashboard, that is exactly how
+# the "Director" and "Manager" section labels -- one word each -- rendered as 155px purple slabs
+# while the identical labels on a tighter row below rendered correctly at ~22px.
+#
+# ``grow = 0`` on slicers, parameter controls, captions and legends is the consequential entry: it
+# is what stops a two-row slicer band from silently eating a third of the canvas. These controls are
+# fixed-height chrome -- a taller dropdown is not a better dropdown -- so they are capped at their
+# preferred size and the surplus goes to the visuals that actually benefit from it.
+#
+# Scoped to the MAIN AXIS ONLY. Every statement of the rule is about height ("do NOT stretch a
+# slicer ROW to fill the page"), and capping a slicer's WIDTH would make the measured truncation
+# defect worse -- the same ATTI page renders "Ontrac Ma...", "Techsuper...", "Customer ..." because
+# its slicers are already too narrow for their labels. Cross-axis preferences stay unbounded.
+PREF_CHART_H = 240.0             # a chart below this reads as a sparkline, not a chart
+_NOGROW_KINDS = ("filter", "paramctrl", "text", "legend")
+
+INF = float("inf")
+
+
+def default_pref_for_leaf(node, min_wh):
+    """``(pref_w, pref_h, grow)`` for a leaf, given its already-resolved ``(min_w, min_h)``.
+
+    Pure and side-effect free. ``pref`` is a CAP for a non-grower and merely an ordering hint for a
+    grower, so an unbounded (``inf``) preference means "no opinion, take the surplus".
+    """
+    lk = node.get("leaf_kind") or "worksheet"
+    mw, mh = float(min_wh[0]), float(min_wh[1])
+    if lk in _NOGROW_KINDS:
+        # Chrome: its minimum IS its preference. Nothing is gained by making it taller.
+        return (INF, mh, 0)
+    if lk == "worksheet":
+        return (INF, max(mh, PREF_CHART_H), 1)
+    return (INF, INF, 1)          # bitmap / blank: no vertical opinion
+
+
+_PREF_KEYS = ("pref_w", "pref_h")
+
 
 # Tableau filter modes whose control renders as a multi-row list rather than a dropdown.
 _LIST_FILTER_MODES = {"checklist", "typeinandcheckdropdown", "radiolist", "singlevaluelist",
@@ -129,6 +180,17 @@ def _main_min_contrib(child, vertical):
     return child["min_h"] if vertical else child["min_w"]
 
 
+def _main_pref_contrib(child, vertical):
+    """A child's contribution to its flow parent's MAIN-axis PREFERENCE.
+
+    Mirrors :func:`_main_min_contrib`: a pinned child's preference is exactly its pin, since
+    ``fixed_px`` already states the size the author asked for.
+    """
+    if child.get("fixed_px") is not None:
+        return float(child["fixed_px"])
+    return child.get("pref_h", INF) if vertical else child.get("pref_w", INF)
+
+
 def compute_mins(node, min_for_leaf, cap=None):
     """Populate ``min_w`` / ``min_h`` on every node, bottom-up. Mutates the tree in place.
 
@@ -139,17 +201,29 @@ def compute_mins(node, min_for_leaf, cap=None):
     if node["kind"] == K_LEAF:
         mw, mh = min_for_leaf(node)
         node["min_w"], node["min_h"] = float(mw), float(mh)
+        pw, ph, g = default_pref_for_leaf(node, (node["min_w"], node["min_h"]))
+        # A preference below the minimum is incoherent -- the min always wins.
+        node["pref_w"], node["pref_h"] = max(pw, node["min_w"]), max(ph, node["min_h"])
+        node["grow"] = g
         return
     kids = node["children"]
     for c in kids:
         compute_mins(c, min_for_leaf, cap)
     gaps = GAP * max(0, len(kids) - 1)
+    # A container grows only if something inside it wants to. A vstack of nothing but captions and
+    # slicers is itself fixed-height chrome -- this is what makes a whole header BAND stop absorbing
+    # surplus, not just the individual captions in it.
+    node["grow"] = 1 if any(c.get("grow", 1) for c in kids) else 0
     if node["kind"] == K_VSTACK:
         node["min_h"] = sum(_main_min_contrib(c, True) for c in kids) + gaps
         node["min_w"] = max((c["min_w"] for c in kids), default=0.0)
+        node["pref_h"] = sum(_main_pref_contrib(c, True) for c in kids) + gaps
+        node["pref_w"] = max((c.get("pref_w", INF) for c in kids), default=INF)
     elif node["kind"] == K_HSTACK:
         node["min_w"] = sum(_main_min_contrib(c, False) for c in kids) + gaps
         node["min_h"] = max((c["min_h"] for c in kids), default=0.0)
+        node["pref_w"] = sum(_main_pref_contrib(c, False) for c in kids) + gaps
+        node["pref_h"] = max((c.get("pref_h", INF) for c in kids), default=INF)
     else:  # K_FRAME -- children are absolute, placed by SOURCE FRACTION of the frame
         # A frame hands each child ``child_src / frame_src`` of its own box (see ``_scale_abs``), so
         # a child occupying 40% of the frame's height only receives 0.4 * frame_h. Taking the frame's
@@ -278,6 +352,31 @@ def allocate(node, rect):
             break
 
     cursor = y if vertical else x
+    # Quality spec 5.1 -- cap the non-growers, redistribute the surplus.
+    # The freeze loop above hands out every available pixel by fraction, which is correct only if
+    # every child benefits from more space. A slicer, parameter control, caption or legend does not:
+    # past its preferred size the extra pixels become a blank slab. Take the surplus back and give it
+    # to the children that do benefit, weighted by the fraction the author already assigned them.
+    prefkey = "pref_h" if vertical else "pref_w"
+    surplus, growers = 0.0, []
+    for c in flex:
+        pref = float(c.get(prefkey, INF))
+        if not c.get("grow", 1):
+            if alloc[id(c)] > pref + TOL:
+                surplus += alloc[id(c)] - pref
+                alloc[id(c)] = pref
+        else:
+            growers.append(c)
+    if surplus > TOL and growers:
+        tot = sum(c.get("frac") or 0.0 for c in growers)
+        for c in growers:
+            share = ((c.get("frac") or 0.0) / tot) if tot > 0 else (1.0 / len(growers))
+            alloc[id(c)] += surplus * share
+    # When NOTHING in the container grows -- a pure header band of captions and slicers -- the
+    # reclaimed pixels are deliberately left unallocated and become trailing space rather than being
+    # pushed back into the chrome they were just taken from. A row of controls that ends early and
+    # leaves the canvas beneath it free is the intended outcome; that free space is what the visuals
+    # on the rest of the page get to use once the page stops having to grow to fit inflated chrome.
     # Last-resort containment. Everything above is a REQUEST: fixed children take their pixels
     # outright and min-violators are clamped UP, so when a container is itself under-allocated (a
     # capped frame, or a frame whose child fraction could not be fully honoured) the requests can sum
@@ -287,17 +386,31 @@ def allocate(node, rect):
     # child fall below its min, which is a legible "too small" (floor) signal rather than a silently
     # off-page visual. Load-bearing: without it the capped solver still leaves out-of-bounds rects.
     content = sum(alloc[id(c)] for c in kids)
-    if content > room + TOL and content > 0:
-        squeeze = max(0.0, room) / content
+    gap = GAP
+    if room >= 0:
+        if content > room + TOL and content > 0:
+            squeeze = room / content
+            for c in kids:
+                alloc[id(c)] *= squeeze
+    else:
+        # Degenerate box: the inter-sibling GAPS ALONE exceed it, so ``room`` is negative and there
+        # is no content budget to squeeze into. Squeezing only the children then leaves every gap at
+        # its full 8px, and the advancing cursor walks straight off the parent -- a two-child hstack
+        # in a 1px box seats its second child at x=8. The gaps have to shrink with everything else.
+        # Height-only growth is what surfaced this: while the page grew on BOTH axes, a container was
+        # never narrower than its own gaps, so the case was unreachable.
+        total = content + gaps
+        squeeze = (max(0.0, main_total) / total) if total > 0 else 0.0
         for c in kids:
             alloc[id(c)] *= squeeze
+        gap = GAP * squeeze
     for c in kids:
         size = max(0.0, alloc[id(c)])
         if vertical:
             allocate(c, (x, cursor, w, size))
         else:
             allocate(c, (cursor, y, size, h))
-        cursor += size + GAP
+        cursor += size + gap
 
 
 # -- public entry point ---------------------------------------------------------
@@ -330,16 +443,25 @@ def solve(tree, page_rect, min_for_leaf=None, grow=True):
 
         px, py, pw, ph = (float(page_rect[0]), float(page_rect[1]),
                           float(page_rect[2]), float(page_rect[3]))
-        # The growth ceiling is derived from the REQUESTED page, so it must be known before the
-        # bottom-up min pass can cap a frame's inverted-fraction demand.
-        cap = (pw * MAX_GROWTH, ph * MAX_GROWTH) if (grow and pw > 0 and ph > 0) else None
+        # Frame demand is capped before the bottom-up min pass, since inverting a near-zero source
+        # fraction explodes (one corpus sliver zone barely 0.8% of its frame's width would demand a
+        # 164384px canvas). This is a PATHOLOGY GUARD, not a size preference -- see FRAME_DEMAND_CAP.
+        cap = (pw, ph * FRAME_DEMAND_CAP) if (grow and pw > 0 and ph > 0) else None
         compute_mins(root, resolver, cap)
 
         if grow:
-            # Enlarge to the root's min on both axes so allocation cannot overflow the page; min
-            # sizes are page-independent, so one allocation pass on the grown rect suffices (this is
-            # the layout-solver spec's "grow then re-run once", collapsed to a single pass).
-            pw = max(pw, float(math.ceil(root["min_w"])))
+            # Growth is HEIGHT-ONLY, and exact.
+            #
+            # A taller page rescales to the viewport under FitToPage; it does not produce a
+            # scrollbar, so height is the axis where growth is free. WIDTH is not: widening the
+            # canvas makes every visual on it render proportionally smaller and every font
+            # correspondingly less legible, buying nothing, because the content that needed room
+            # needed it vertically. Growing both axes produced 2732px-wide pages on the user's real
+            # workbooks -- 1.32x the authored canvas area -- for content that fit horizontally.
+            #
+            # The width cap above pins the frame demand at exactly the requested width, so a frame
+            # that cannot honour a child's fraction degrades through allocate's proportional squeeze
+            # rather than by inflating the canvas.
             ph = max(ph, float(math.ceil(root["min_h"])))
         if pw <= 0 or ph <= 0:
             return None

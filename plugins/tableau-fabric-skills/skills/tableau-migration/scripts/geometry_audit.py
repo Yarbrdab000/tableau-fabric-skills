@@ -145,6 +145,125 @@ def score_report(parts):
             for pg in pages_from_parts(parts).values()}
 
 
+def quality_report(parts):
+    """Score every page's QUALITY block -> ``{display_name: dict}``.
+
+    Deliberately a SEPARATE entry point rather than extra keys on :func:`score_report`, whose return
+    is a ``Counter`` of hard-gated integers that callers sum and compare. Mixing continuous,
+    report-only measures into that same mapping would let a float land in a gate that was written to
+    read counts."""
+    return {pg["display"]: geometry_quality(pg["visuals"], pg["w"], pg["h"])
+            for pg in pages_from_parts(parts).values()}
+
+
+def _visual_kind(vj):
+    """Coarse role of an emitted visual: ``chrome`` (slicer / caption / legend / image) or ``content``.
+
+    ``chrome_ratio`` asks how much of a page is spent on things that support the data rather than
+    showing it. A page with 16 slicers, 4 caption textboxes and 2 legends has 22 objects competing
+    for space with 4 charts, and arranging 22 objects well is strictly harder than needing 8."""
+    vt = (((vj.get("visual") or {}).get("visualType")) or "").lower()
+    if vt in ("slicer", "advancedslicervisual"):
+        return "slicer"
+    if vt in ("textbox", "actionbutton", "shape"):
+        return "caption"
+    if vt == "image":
+        return "image"
+    return "content"
+
+
+CHROME_KINDS = ("slicer", "caption", "image", "legend")
+
+
+def _edges(rects):
+    """Every x-edge and y-edge in the page, as two lists."""
+    xs, ys = [], []
+    for x, y, w, h in rects:
+        xs.extend((x, x + w))
+        ys.extend((y, y + h))
+    return xs, ys
+
+
+def _misalign(rects, near_lo=2.0, near_hi=12.0):
+    """Edge pairs that are CLOSE but not equal -- the signature of a machine-made layout.
+
+    Two panels whose left edges land at 412.67 and 412.71 read as aligned; 412 and 419 read as a
+    mistake. Anything under ``near_lo`` is already effectively aligned and anything over ``near_hi``
+    is a deliberate offset, so only the band between them is a defect."""
+    n = 0
+    for axis in _edges(rects):
+        vals = sorted(axis)
+        for i, a in enumerate(vals):
+            for b in vals[i + 1:]:
+                d = b - a
+                if d > near_hi:
+                    break
+                if near_lo <= d <= near_hi:
+                    n += 1
+    return n
+
+
+def _gutter_cv(rects, band=24.0):
+    """Coefficient of variation of the gaps between horizontally adjacent visuals in each row.
+
+    Rhythm is about CONSISTENCY, not size: gaps of 8/8/8 read as designed, 6/17/9 reads as
+    accidental, and both have the same mean. Rows are recovered by clustering on y within ``band``
+    because the auditor sees a flat rect list, not the tree."""
+    rows = {}
+    for x, y, w, h in rects:
+        rows.setdefault(round(y / band), []).append((x, w))
+    gaps = []
+    for items in rows.values():
+        items.sort()
+        for (x0, w0), (x1, _w1) in zip(items, items[1:]):
+            g = x1 - (x0 + w0)
+            if -1.0 <= g <= 200.0:
+                gaps.append(max(0.0, g))
+    if len(gaps) < 2:
+        return 0.0
+    mean = sum(gaps) / len(gaps)
+    if mean <= 0.0:
+        return 0.0
+    var = sum((g - mean) ** 2 for g in gaps) / len(gaps)
+    return (var ** 0.5) / mean
+
+
+def geometry_quality(visuals, page_w, page_h):
+    """The per-page QUALITY block -- the second question, reported beside :func:`geometry_defects`.
+
+    The defect counters answer *is this layout broken?* A page can score zero on all four and still
+    look like a machine made it: dead bands, edges that are close but not equal, a caption stretched
+    to fill the row it happens to sit in. Worse, ``floor`` (``w <= 41 or h <= 41``) mechanically
+    IMPROVES when the canvas is inflated -- nothing can be under 41px once the page doubles -- so it
+    must never be read without ``area`` beside it, or growing the page looks like progress.
+
+    Returns a plain dict. **Report, do not assert**: these are continuous and comparative, so a
+    threshold set before the corpus distribution is known produces flaky goldens that teach everyone
+    to ignore them. The four defect counts stay hard-gated at zero; nothing here gates anything."""
+    rects = [rect(v) for v in visuals]
+    area = float(page_w or 0) * float(page_h or 0)
+    ink = sum(w * h for _x, _y, w, h in rects)
+    kinds = [_visual_kind(v) for v in visuals]
+    chrome = sum(1 for k in kinds if k in CHROME_KINDS)
+    # A chart squeezed to 12:1 is unreadable in either direction; captions and slicers are SUPPOSED
+    # to be wide and short, so the ratio is only meaningful for content visuals.
+    aspect = 0
+    for (x, y, w, h), k in zip(rects, kinds):
+        if k != "content" or w <= 0 or h <= 0:
+            continue
+        if max(w / h, h / w) > 8.0:
+            aspect += 1
+    return {
+        "deadspace": round(max(0.0, 1.0 - (ink / area)), 4) if area else 0.0,
+        "misalign": _misalign(rects),
+        "gutter_cv": round(_gutter_cv(rects), 4),
+        "aspect": aspect,
+        "object_count": len(visuals),
+        "chrome_ratio": round(chrome / len(visuals), 4) if visuals else 0.0,
+        "area": round(area, 1),
+    }
+
+
 def parts_from_dir(report_dir):
     """Read a ``.Report`` directory on disk into the ``{relpath: text}`` map ``score_report`` wants."""
     parts = {}

@@ -13,6 +13,40 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.21.0` → `2.22.0`): chrome stops absorbing surplus space, page growth
+  is height-only again, and the auditor reports layout QUALITY beside its defect counts
+  (`scripts/layout_solve.py`, `scripts/geometry_audit.py`, `tests/test_layout_solve.py`).**
+  Rendering the previous slice's output on real customer workbooks — via the Power BI Desktop bridge
+  rather than by reading counters — showed one-word section labels ("Director", "Manager") emitted as
+  155px purple slabs, slicer labels truncated to `Ontrac Ma...`, and canvases inflated to 2732px wide.
+  Three coupled causes, all deviations from the layout/quality specs this track is built to:
+  - **Leaf sizing had a minimum but no preference.** With only a minimum, every flow child is a
+    grower, so surplus main-axis space is handed out by fraction and a one-line caption in a roomy row
+    inflates until it fills its share. Leaves now carry `(min, pref, grow)`: slicers, parameter
+    controls, captions and legends get `grow = 0` and are capped at their preferred size, with the
+    reclaimed pixels redistributed to the visuals that benefit. A container that contains only chrome
+    is itself `grow = 0`, which is what stops a whole header band from eating the canvas. Scoped to
+    the main axis — every statement of the rule is about height, and capping a slicer's *width* would
+    worsen the measured truncation.
+  - **Growth was symmetric.** It is now height-only and exact, as specified: a taller page rescales to
+    the viewport under FitToPage, while a wider one merely renders every visual and font
+    proportionally smaller for content that needed room vertically.
+  - **The growth ceiling was tuned against a metric that growth improves.** `MAX_GROWTH` had been set
+    by watching the sub-41px "floor" defect count fall as the cap rose — but nothing can be under 41px
+    once the page doubles, so that count was rewarding inflation rather than measuring layout. The
+    constant is renamed `FRAME_DEMAND_CAP` (`MAX_GROWTH` kept as an alias) and now bounds only the
+    pathological case it was introduced for: inverting a near-zero frame fraction, where one corpus
+    sliver zone would otherwise demand a 164384px canvas.
+  Also fixes a containment break that height-only growth exposed: when a container's box is narrower
+  than its inter-sibling gaps alone, squeezing only the children left every gap at full width and the
+  advancing cursor walked off the parent. Gaps now squeeze with everything else.
+  `geometry_audit` gains a report-only `geometry_quality` / `quality_report` block — `deadspace`,
+  `misalign`, `gutter_cv`, `aspect`, `object_count`, `chrome_ratio`, `area` — kept deliberately
+  separate from `score_report`, whose `Counter` of hard-gated integers callers sum and compare.
+  Measured on the two real workbooks: canvas area **24.5 → 21.1 Mpx**, over-tall chrome **17 → 14**,
+  extreme aspect ratios **0.06 → 0.00** per page.
+
+### Added
 - **tableau-migration (skill `2.20.0` → `2.21.0`): a squeezed flow row now SHARES the shortfall
   across its fixed children instead of dumping it on the one flexible sibling, and `--layout` is
   finally reachable from `migrate_estate` — frame/quality track slice 4f
