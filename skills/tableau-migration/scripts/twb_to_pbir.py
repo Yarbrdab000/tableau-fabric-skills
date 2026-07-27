@@ -3702,6 +3702,14 @@ def _parse_dashboard(db, worksheet_names, warnings):
     image_zones = []
     seen_images = set()
     ext_w = ext_h = 0.0
+    # Every captured item below additively records ``zone_id`` -- the source zone's ``id`` attribute,
+    # the same key ``zone_tree`` stores on each node and ``layout_solve`` keys its solved rects by.
+    # It is the IDENTITY SEAM the layout-solver emit path needs: without it a captured dict is just a
+    # bag of coordinates and cannot be matched back to its node in the layout tree (matching by rect
+    # is ambiguous -- a single-child ``layout-flow`` wrapper shares its child's rect exactly, which
+    # occurs on 12 of the 13 corpus dashboards). Captured at walk time, so it is exact. Verified
+    # across the corpus: ``id`` is present on every zone (454/454) and unique within a dashboard.
+    # Nothing reads it yet; it is recorded here so the solver wiring is a lookup, not a re-parse.
     for zone in _findall_local(db, "zone"):
         if zone in device_zones:
             continue
@@ -3726,6 +3734,7 @@ def _parse_dashboard(db, worksheet_names, warnings):
                 banner_candidates.append({
                     "text": text, "fill": fill,
                     "text_color": _zone_run_color(zone) or "#ffffff",
+                    "zone_id": zone.get("id"),
                     "x": x, "y": y, "w": w, "h": h})
             # Additively capture EVERY text zone that carries content (fill OPTIONAL) as a general
             # text object -- the section-header caption bars (Director / Manager / Supervisor /
@@ -3742,6 +3751,7 @@ def _parse_dashboard(db, worksheet_names, warnings):
                 text_objects.append({
                     "text": text, "fill": fill2, "transparency": tpct,
                     "text_color": run_color or "#000000", "bold": run_bold, "font_size": run_size,
+                    "zone_id": zone.get("id"),
                     "x": x, "y": y, "w": w, "h": h})
         # A dashboard FILTER card -- the filter the author actually exposed on the dashboard surface
         # (possibly nested inside a collapsible layout container; the zone walk recurses) -- is what
@@ -3768,6 +3778,7 @@ def _parse_dashboard(db, worksheet_names, warnings):
                     filter_zones.append({
                         "token": ftok, "x": x, "y": y, "w": w, "h": h,
                         "mode": zone.get("mode"),
+                        "zone_id": zone.get("id"),
                         "hidden": zone.get("hidden-by-user") == "true",
                     })
             continue
@@ -3780,6 +3791,7 @@ def _parse_dashboard(db, worksheet_names, warnings):
             if pid and pid not in seen_params and None not in (x, y, w, h):
                 seen_params.add(pid)
                 param_controls.append({"param_id": pid, "x": x, "y": y, "w": w, "h": h,
+                                       "zone_id": zone.get("id"),
                                        "mode": zone.get("mode")})
             continue
         # A dashboard IMAGE object: either a straight bitmap (``type-v2='bitmap'`` with
@@ -3805,6 +3817,7 @@ def _parse_dashboard(db, worksheet_names, warnings):
                             seen_images.add(key)
                             image_zones.append({
                                 "id": zone.get("id"),
+                                "zone_id": zone.get("id"),
                                 "kind": "image" if ztype == "bitmap" else "button",
                                 "image": ref, "x": x, "y": y, "w": w, "h": h,
                                 "url": zone.get("url"),
@@ -3817,14 +3830,16 @@ def _parse_dashboard(db, worksheet_names, warnings):
         # it legends; capture its geometry so the report can faithfully reproduce legend show/position
         # (a present zone = the legend is shown at that side; an absent one = the author hid it).
         if ztype == "color" and None not in (x, y, w, h) and w > 0 and h > 0:
-            legend_zones.append({"worksheet": zname, "x": x, "y": y, "w": w, "h": h})
+            legend_zones.append({"worksheet": zname, "zone_id": zone.get("id"),
+                                 "x": x, "y": y, "w": w, "h": h})
             continue
         # worksheet zones carry no decoration type (legends/filters/titles do)
         if ztype:
             continue
         if None in (x, y, w, h) or w <= 0 or h <= 0:
             continue
-        zones.append({"worksheet": zname, "x": x, "y": y, "w": w, "h": h})
+        zones.append({"worksheet": zname, "zone_id": zone.get("id"),
+                      "x": x, "y": y, "w": w, "h": h})
 
     title_banner = _select_title_banner(banner_candidates, ext_w, ext_h)
     if title_banner:

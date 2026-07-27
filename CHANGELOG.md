@@ -13,6 +13,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.15.0` → `2.16.0`): zone-identity seam for solver-backed emit —
+  frame/quality track slice 4a (`scripts/twb_to_pbir.py`, additive keys only, zero behaviour
+  change).** `_parse_dashboard` flattens a dashboard's `<zones>` into per-kind lists of plain
+  coordinate dicts (`zones` / `filter_zones` / `param_controls` / `legend_zones` / `text_objects` /
+  `image_zones` / `title_banner`). Those dicts carried geometry but **no identity**, so a captured
+  item could not be matched back to its node in the layout tree (`zone_tree`) or to its solved
+  rectangle (`layout_solve`) — the lookup every solver-backed emit path needs. Each of the seven
+  capture sites now additively records **`zone_id`** (the source zone's `id`, the same key
+  `zone_tree` stores on each node and `layout_solve` keys its rects by), captured at walk time so it
+  is exact. Matching by rectangle is **not** a viable substitute: a single-child `layout-flow`
+  wrapper persists its child's rect exactly, so one rect names two zones — measured on **12 of the
+  13** corpus dashboards. A load-bearing corpus check first confirmed the seam is sound: `id` is
+  present on **454 of 454** zones, unique within every dashboard, and **268 of 268** emit-captured
+  items resolve to a solver rect. Nothing reads `zone_id` yet — it is recorded so the solver wiring
+  is a lookup rather than a re-parse — and `image_zones` keeps its pre-existing `id` key, so the
+  change is purely additive. +12 tests (`tests/test_zone_identity.py`) pin per-kind capture, the
+  **round-trip** invariant (every captured `zone_id` resolves to a solved rect), the
+  wrapper-shares-child's-rect ambiguity that motivates id-keying, id distinctness, the
+  `<devicelayouts>` exclusion, the untouched pre-existing keys, and the no-`id` / empty-dashboard
+  robustness cases. Full suite **3224 passed / 6 skipped / 1 xfailed**; all pre-existing goldens
+  byte-for-byte unchanged.
+
 - **tableau-migration (skill `2.14.0` → `2.15.0`): floating-overlay classifier —
   frame/quality track slice 3 (`scripts/layout_layers.py`, no emit change).** The third and final
   z-order classifier tier, resolving the residual the first two tiers leave behind. A session
