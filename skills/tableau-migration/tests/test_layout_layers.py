@@ -255,3 +255,127 @@ def test_panel_documented_tunables():
     assert ll.PANEL_KINDS == ("text", "bitmap")
     assert "worksheet" not in ll.PANEL_KINDS
     assert ll._CONTAIN_TOL == 1.0
+
+
+# ===============================================================================
+# floating-OVERLAY classifier (ft3): a control/annotation leaf pinned ON content
+# ===============================================================================
+def test_is_overlay_leaf_kinds():
+    assert ll.is_overlay_leaf(_leaf("text", (0, 0, 10, 10))) is True
+    assert ll.is_overlay_leaf(_leaf("filter", (0, 0, 10, 10))) is True
+    assert ll.is_overlay_leaf(_leaf("paramctrl", (0, 0, 10, 10))) is True
+    # never a float: a worksheet (the guardrail), image decoration, legend, or empty spacer.
+    assert ll.is_overlay_leaf(_leaf("worksheet", (0, 0, 10, 10))) is False
+    assert ll.is_overlay_leaf(_leaf("bitmap", (0, 0, 10, 10))) is False
+    assert ll.is_overlay_leaf(_leaf("legend", (0, 0, 10, 10))) is False
+    assert ll.is_overlay_leaf(_leaf("blank", (0, 0, 10, 10))) is False
+
+
+def test_is_overlay_leaf_robustness():
+    assert ll.is_overlay_leaf(None) is False
+    assert ll.is_overlay_leaf((0, 0, 10, 10)) is False
+    assert ll.is_overlay_leaf({"rect": (0, 0, 10, 10)}) is False  # no leaf_kind
+
+
+def test_text_label_inside_chart_is_float():
+    # The annotation-inside-chart case (Clients / Hierarchy Trending): a caption CONTAINED BY the
+    # chart. panel_leaves cannot catch this (the text does not enclose the chart) -- this tier does.
+    chart = _leaf("worksheet", (0, 0, 600, 400))
+    label = _leaf("text", (40, 20, 150, 30))
+    assert ll.floating_overlay_leaves([chart, label]) == [label]
+    # and it is NOT a panel (the inverse relation): the label encloses nothing.
+    assert ll.panel_leaves([chart, label]) == []
+
+
+def test_filter_and_paramctrl_over_chart_are_floats():
+    # Tech Hierarchy: filters pinned on top of the chart; Staff Capacity: param controls over a chart.
+    chart = _leaf("worksheet", (0, 0, 600, 400))
+    filt = _leaf("filter", (450, 20, 120, 40))    # partly over the chart's top-right
+    pc = _leaf("paramctrl", (20, 350, 200, 40))   # partly over the chart's bottom-left
+    assert ll.floating_overlay_leaves([chart, filt, pc]) == [filt, pc]
+
+
+def test_two_overlapping_worksheets_are_not_floats():
+    # THE guardrail: "data hidden by data" is never exempted -- neither worksheet is a float, so the
+    # pair stays a real, audited defect (this is the one thing the module must never hide).
+    a = _leaf("worksheet", (0, 0, 400, 300))
+    b = _leaf("worksheet", (100, 80, 400, 300))
+    assert ll.floating_overlay_leaves([a, b]) == []
+
+
+def test_control_or_label_colliding_with_nothing_is_not_float():
+    # Relational: a cleanly tiled slicer / caption that overlays nothing is NOT flagged (so it stays
+    # audited like any other tile) -- the exemption only ever fires on a leaf that actually overlays.
+    filt = _leaf("filter", (0, 0, 200, 40))
+    chart = _leaf("worksheet", (0, 100, 300, 200))   # below, no overlap
+    label = _leaf("text", (400, 0, 120, 30))          # off to the side
+    assert ll.floating_overlay_leaves([filt, chart, label]) == []
+
+
+def test_float_stacked_control_and_label():
+    # filter + text overlapping each other (a control with its caption) -- both are overlays, so both
+    # are flagged; the pair is exempt from either side.
+    filt = _leaf("filter", (0, 0, 200, 60))
+    cap = _leaf("text", (10, 40, 150, 40))            # overlaps the filter's lower edge
+    out = ll.floating_overlay_leaves([filt, cap])
+    assert out == [filt, cap]
+
+
+def test_bitmap_icon_over_label_exempt_via_label_side():
+    # An icon (bitmap, NOT a float kind) overlapping a text label (EBI cluster): the bitmap is not
+    # flagged, but the text IS, so the pair is still exempt from the auditor via the label member.
+    icon = _leaf("bitmap", (0, 0, 40, 40))
+    label = _leaf("text", (20, 10, 120, 24))
+    assert ll.floating_overlay_leaves([icon, label]) == [label]
+
+
+def test_float_partial_overlap_honors_auditor_threshold():
+    # A control grazing a chart below the auditor's 2 %-of-smaller floor is NOT a float (it would not
+    # be counted by the auditor either), so the classifier and the auditor agree exactly.
+    chart = _leaf("worksheet", (0, 0, 100, 100))       # area 10000
+    graze = _leaf("filter", (99.5, 0, 100, 100))       # intersection 0.5*100=50 -> 0.5 % < 2 %
+    assert ll.floating_overlay_leaves([chart, graze]) == []
+    real = _leaf("filter", (90, 0, 100, 100))          # intersection 10*100=1000 -> 10 % > 2 %
+    assert ll.floating_overlay_leaves([chart, real]) == [real]
+
+
+def test_rects_collide_matches_auditor_thresholds():
+    # Direct unit of the shared collide test so it can never silently drift from the auditor.
+    a = (0, 0, 100, 100)
+    assert ll._rects_collide(a, (10, 10, 20, 20)) is True          # fully nested -> collide
+    assert ll._rects_collide(a, (90, 0, 100, 100)) is True         # 10 % partial -> collide
+    assert ll._rects_collide(a, (99.5, 0, 100, 100)) is False      # 0.5 % partial -> below floor
+    assert ll._rects_collide((0, 0, 10, 10), (10, 0, 10, 10)) is False  # shared edge -> ia 0
+    assert ll._rects_collide((0, 0, 10, 10), (8, 8, 10, 10)) is False   # ia == 4 -> not > 4
+    assert ll._rects_collide(a, None) is False
+
+
+def test_floating_overlay_leaves_preserves_order_and_filters():
+    f1 = _leaf("filter", (450, 20, 120, 40))     # float (over chart)
+    chart = _leaf("worksheet", (0, 0, 600, 400))  # content
+    t1 = _leaf("text", (40, 20, 150, 30))         # float (inside chart)
+    lone = _leaf("text", (1000, 0, 50, 30))       # caption overlaying nothing
+    ws2 = _leaf("worksheet", (700, 0, 100, 100))  # a second chart, no overlap
+    out = ll.floating_overlay_leaves([f1, chart, t1, lone, ws2])
+    assert out == [f1, t1]
+
+
+def test_floating_overlay_leaves_empty_and_none_input():
+    assert ll.floating_overlay_leaves([]) == []
+    assert ll.floating_overlay_leaves(None) == []
+
+
+def test_floating_overlay_leaves_robust_to_junk_rects():
+    chart = _leaf("worksheet", (0, 0, 600, 400))
+    good = _leaf("text", (40, 20, 150, 30))
+    junk1 = _leaf("filter", None)
+    junk2 = _leaf("text", ("x", "y", "w", "h"))
+    junk3 = {"leaf_kind": "paramctrl"}  # no rect
+    out = ll.floating_overlay_leaves([chart, good, junk1, junk2, junk3])
+    assert out == [good]
+
+
+def test_float_documented_tunables():
+    assert ll.FLOAT_KINDS == ("text", "filter", "paramctrl")
+    assert "worksheet" not in ll.FLOAT_KINDS
+    assert "bitmap" not in ll.FLOAT_KINDS

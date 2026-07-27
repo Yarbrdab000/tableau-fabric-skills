@@ -30,8 +30,9 @@ Pure, deterministic, stdlib-only. NO emit dependency, NO auditor import, NO ``zo
 reads only ``rect`` + ``leaf_kind`` off plain node dicts, so it can be unit-tested in isolation and
 imported by either side without a cycle. Never raises: a malformed node is simply "not a background".
 
-**Two tiers of the same z-order idea.** A background comes in two sizes and both are exempt from the
-colliding-tile scan for the same reason -- decoration the content sits ON TOP OF by design:
+**Three tiers of the same z-order idea.** A z-order layer comes in three flavours and all are exempt
+from the colliding-tile scan for the same reason -- something the content is deliberately stacked WITH
+inside a frame, not a tiling accident:
 
 * PAGE background -- a full-canvas image behind everything (:func:`is_background_leaf` /
   :func:`background_leaves`), the branded backdrop above.
@@ -42,12 +43,24 @@ colliding-tile scan for the same reason -- decoration the content sits ON TOP OF
   frame; faithfully projected, that panel encloses the cluster, which a naive scan miscounts as
   containment (in the reference corpus the branded SF-Admin panels account for ~23 such false
   containments). Sent to back it is a background for its region, not a colliding tile.
+* FLOATING overlay -- an interactive control or annotation (a ``filter`` / ``paramctrl`` slicer or a
+  ``text`` label) the author FLOATS on top of a chart within a frame (:func:`is_overlay_leaf` /
+  :func:`floating_overlay_leaves`). A Tableau ``layout-basic`` frame permits overlap by design, so a
+  filter pinned to a chart corner or a caption dropped inside a plot is intentional geometry the
+  solver faithfully reproduces -- not a defect. This is the inverse relation to a panel: the overlay
+  is the SMALL thing on top (often CONTAINED BY the chart, which the panel test -- decoration that
+  contains -- never catches), so it is detected by "does this control/label collide with anything?"
+  In the reference corpus these floating controls/labels account for the entire residual after the
+  first two tiers (Tech Hierarchy's filter pile over its chart, section labels inside plots, stacked
+  control+caption clusters) -- 42 of 43 remaining collisions.
 
-The sub-region tier is **kind-gated exactly like the page tier**: only ``text`` / ``bitmap`` static
-decoration can be a panel, so a full-bleed WORKSHEET that encloses cards ("Engagements by Dimension")
-is never a panel and its containment stays a real, audited defect. Unlike the page tier, "is a panel"
-is RELATIONAL -- it depends on what else is on the page -- so :func:`panel_leaves` takes the sibling
-set, while the per-leaf :func:`is_decoration_leaf` only reports kind.
+Every tier is **kind-gated**, and that gate is the load-bearing guardrail. For panels only
+``text`` / ``bitmap`` static decoration qualifies; for floating overlays only ``text`` / ``filter`` /
+``paramctrl`` control-or-annotation kinds qualify. A ``worksheet`` is NEVER exempt by any tier, so two
+overlapping worksheets ("data hidden by data") remain a real, audited defect -- the one thing this
+whole module must never hide. The panel and floating tiers are RELATIONAL (they depend on what else is
+on the page), so :func:`panel_leaves` / :func:`floating_overlay_leaves` take the sibling set, while the
+per-leaf :func:`is_decoration_leaf` / :func:`is_overlay_leaf` only report kind.
 """
 from __future__ import annotations
 
@@ -68,6 +81,16 @@ BG_KINDS = ("bitmap",)
 # PANEL_KINDS is deliberately broader than BG_KINDS. A worksheet/filter/legend/paramctrl is data or
 # interactive content and never a panel, whatever it encloses.
 PANEL_KINDS = ("text", "bitmap")
+
+# Control/annotation leaf kinds that can serve as a FLOATING OVERLAY when the author pins them on top
+# of a chart inside a frame: an interactive slicer (``filter`` / ``paramctrl``) or a ``text`` label /
+# caption. A Tableau ``layout-basic`` frame permits overlap by design, so such an overlay collides
+# with the content it floats on BY INTENT, not by accident. Deliberately EXCLUDES ``worksheet`` (two
+# overlapping charts is a real defect this module must never hide) and ``bitmap`` (image decoration is
+# already covered by the background/panel tiers; a small icon that overlaps a label is exempted via
+# the label side of the pair, so it needs no separate kind here). ``legend`` / ``blank`` are excluded
+# too -- neither appears as a residual float in the corpus and both would only broaden the exemption.
+FLOAT_KINDS = ("text", "filter", "paramctrl")
 
 # Edge tolerance for the enclosure test, matching the geometry auditor's ``contains`` (TOL = 1.0) so
 # a panel this module exempts is exactly one the auditor would otherwise have scored as containment.
@@ -188,6 +211,72 @@ def panel_leaves(leaves, tol=_CONTAIN_TOL):
             if i == j or rects[j] is None:
                 continue
             if _rect_contains(rects[i], rects[j], tol=tol):
+                out.append(li)
+                break
+    return out
+
+
+def _rects_collide(a, b, tol=_CONTAIN_TOL):
+    """True when rects ``a`` / ``b`` collide by the geometry auditor's OWN pairwise test.
+
+    Replicates ``geometry_audit.geometry_defects`` exactly so the set of overlays this module exempts
+    is precisely the set of collisions the auditor would otherwise have scored: the raw intersection
+    must exceed 4 px^2 (a shared edge/corner is not a collision), and then the pair counts if one rect
+    is fully nested in the other (within ``tol``) OR the intersection exceeds 2 % of the smaller rect.
+    Both args are ``(x, y, w, h)`` rects (as from :func:`_rect_of`); ``None`` never collides.
+    """
+    if a is None or b is None:
+        return False
+    ix = max(0.0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
+    ia = ix * iy
+    if ia <= 4.0:
+        return False
+    if _rect_contains(a, b, tol=tol) or _rect_contains(b, a, tol=tol):
+        return True
+    small = min(a[2] * a[3], b[2] * b[3]) or 1
+    return (ia / small) > 0.02
+
+
+def is_overlay_leaf(leaf):
+    """True when ``leaf`` is a control/annotation kind that can be a floating overlay.
+
+    These are the only kinds that may be exempted as an author-intended float: an interactive slicer
+    (``filter`` / ``paramctrl``) or a ``text`` label/caption. A worksheet, bitmap, legend or blank is
+    never an overlay here (see :data:`FLOAT_KINDS`). This is the per-leaf KIND test only -- whether
+    such a leaf is *actually* floating additionally requires it to collide with a sibling, which is
+    what :func:`floating_overlay_leaves` decides. Never raises.
+    """
+    return isinstance(leaf, dict) and leaf.get("leaf_kind") in FLOAT_KINDS
+
+
+def floating_overlay_leaves(leaves, tol=_CONTAIN_TOL):
+    """Control/annotation leaves that COLLIDE with >=1 other leaf -- author-intended floats.
+
+    The third z-order tier: a Tableau ``layout-basic`` frame lets the author pin a filter or a caption
+    on top of a chart, and the solver faithfully reproduces that overlap. Such a control/label is not
+    a colliding tile but an intentional overlay, so it is exempted from the overlap/containment scan
+    exactly as a backdrop (:func:`background_leaves`) or a sub-region panel (:func:`panel_leaves`) is.
+
+    KIND-GATED via :func:`is_overlay_leaf` so a ``worksheet`` is NEVER an overlay: a pair of
+    overlapping worksheets ("data hidden by data") has neither member flagged here and therefore
+    stays a real, audited defect -- the guardrail this module exists to protect. RELATIONAL: a
+    control/label that collides with nothing (a cleanly tiled slicer or caption) is NOT flagged, so
+    the exemption only ever fires on a leaf that actually overlays content. Collision is measured with
+    :func:`_rects_collide` (the auditor's own test), so every overlay exempted here is exactly a
+    collision the auditor would otherwise have counted. Order-preserving, does not mutate the nodes,
+    never raises.
+    """
+    items = list(leaves or [])
+    rects = [_rect_of(lf) for lf in items]
+    out = []
+    for i, li in enumerate(items):
+        if rects[i] is None or not is_overlay_leaf(li):
+            continue
+        for j in range(len(items)):
+            if i == j or rects[j] is None:
+                continue
+            if _rects_collide(rects[i], rects[j], tol=tol):
                 out.append(li)
                 break
     return out

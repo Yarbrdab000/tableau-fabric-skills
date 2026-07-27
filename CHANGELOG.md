@@ -13,6 +13,39 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.14.0` → `2.15.0`): floating-overlay classifier —
+  frame/quality track slice 3 (`scripts/layout_layers.py`, no emit change).** The third and final
+  z-order classifier tier, resolving the residual the first two tiers leave behind. A session
+  diagnostic over the six-workbook / thirteen-dashboard corpus showed that **42 of the 43** collisions
+  remaining after the page-background (slice 1) and sub-region-panel (slice 2) exemptions are an
+  **author-intended float** — an interactive `filter` / `paramctrl` slicer or a `text` label the
+  Tableau author pinned on top of a chart inside a `layout-basic` frame (Tech Hierarchy's filter pile
+  over its chart, section labels dropped inside plots, stacked control+caption clusters), which the
+  solver faithfully reproduces and a naive scan miscounts as a defect. New helpers
+  `layout_layers.is_overlay_leaf` / `floating_overlay_leaves` (plus a shared `_rects_collide` that
+  **exactly replicates the auditor's pairwise test** — `> 4 px²` raw-intersection gate, then
+  full-nesting *or* `> 2 %`-of-smaller overlap) classify a colliding control/annotation leaf as a
+  floating overlay and exempt it, exactly as a backdrop or a panel is exempted. It is **kind-gated**
+  (`FLOAT_KINDS = text/filter/paramctrl`), and that gate is the load-bearing guardrail: a `worksheet`
+  is **never** an overlay, so the lone `worksheet`-on-`worksheet` residual (Staff Capacity's floating
+  Stage-Legend worksheet inside another chart) — "data hidden by data" — stays a real, audited defect.
+  The classifier is **relational** (a control/label that overlays nothing is not flagged) and reuses
+  slice 1's default-off `is_background` predicate, so no new auditor surface is added and the shipped
+  v2.7.0 goldens remain **byte-for-byte unchanged** with no emit path touched. +14 tests pin the
+  overlay kinds, the label-inside-chart and filter/param-over-chart cases, the **worksheet+worksheet
+  guardrail**, the overlay-that-collides-with-nothing case, the exact auditor-threshold match, the
+  bitmap-icon-exempt-via-label-side case, and order/empty/None/junk robustness. Measured on the
+  frame-track A/B harness (both engines, RAW → +BG → +PANEL → +FLOAT):
+
+  | engine | overlaps | contain | oob | floor |
+  |---|---|---|---|---|
+  | solver +panel (slice 2) | 26 | 17 | 9 | 49 |
+  | solver **+float (slice 3)** | **0** | **1** | 9 | 49 |
+
+  **Overlaps 26 → 0** and **containment 17 → 1** — the single residual containment is the intentional
+  floating Stage-Legend worksheet, correctly left audited by the guardrail rather than
+  over-exempted. `oob 9` / `floor 49` (min-size squash) are a later pass. Branch-only: not merged to
+  `main` until the whole frame track is complete and validated.
 - **tableau-migration (skill `2.13.0` → `2.14.0`): sub-region decoration-panel classifier —
   frame/quality track slice 2 (`scripts/layout_layers.py`, no emit change).** The second frame-track
   slice generalizes slice 1's *page-level* background to the *sub-region* case. A new relational
