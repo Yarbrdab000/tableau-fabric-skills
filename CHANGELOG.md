@@ -13,6 +13,32 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.16.0` → `2.17.0`): per-dashboard layout PLAN — frame/quality track
+  slice 4b (new `scripts/layout_plan.py`, stdlib-only, nothing imports it yet, zero behaviour
+  change).** The three pure layout modules shipped so far each solve one step and are wired to
+  nothing: `zone_tree.parse_zone_tree` (parse), `layout_solve.solve` (resolve), `layout_layers`
+  (classify). `build_plan(db, …)` composes them into the ONE lookup table an emit path actually
+  needs — `rects` (zone id → page-pixel `(x, y, w, h)`), `kinds` (zone id → leaf kind), the three
+  z-order id sets `background` / `panel` / `overlay`, the resolved `page`, and a `grew` flag —
+  keyed by the `zone_id` slice 4a records on every captured item, plus `is_decoration(plan, id)` to
+  collapse the three tiers into one send-to-back question. **It also closes a real hole in the
+  solver:** `zone_tree` hoists a `floating='true'` subtree out of the flow into `tree["floats"]`,
+  but `solve` walks only `tree["root"]`, so a float gets **no rect** — an emit path built on `solve`
+  alone would silently LOSE those visuals. `build_plan` places each hoisted float by scaling its
+  absolute source rect through the tree extent into the page, applying the leaf minimum as a floor,
+  and clamping it on-page (the six-workbook corpus contains zero floats, so this path is proven by
+  synthetic tests rather than by real data). Page growth is **reported, not silently applied**:
+  `grew` says the content minimum exceeded the requested page, leaving the adopt-vs-fit decision to
+  the emit wiring. Fail-closed throughout — an unparseable dashboard, a genuine source-overlap
+  premise violation, a non-positive page, or junk input all return `None` and never raise, so a
+  caller keeps the legacy path. Verified against the corpus at REAL emit page sizes: the plan
+  reproduces the A/B harness exactly on overlaps `0`, containment `1`, out-of-bounds `7`; its floor
+  count is `52` vs the harness's `51` because the plan deliberately includes `hidden` leaves (emit
+  surfaces hidden filters — Tableau's show/hide toggle is not a delete) and one hidden bitmap icon
+  trips the ≤ 41 px floor. +23 tests (`tests/test_layout_plan.py`) covering the lookup contract, the
+  `_parse_dashboard` zone-id round-trip, synthetic float placement / minimum / clamping / floats
+  inside a floating container, the three tiers and the worksheet guardrail, growth reporting, and
+  every fail-closed trigger.
 - **tableau-migration (skill `2.15.0` → `2.16.0`): zone-identity seam for solver-backed emit —
   frame/quality track slice 4a (`scripts/twb_to_pbir.py`, additive keys only, zero behaviour
   change).** `_parse_dashboard` flattens a dashboard's `<zones>` into per-kind lists of plain
