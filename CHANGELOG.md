@@ -13,6 +13,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.13.0` → `2.14.0`): sub-region decoration-panel classifier —
+  frame/quality track slice 2 (`scripts/layout_layers.py`, no emit change).** The second frame-track
+  slice generalizes slice 1's *page-level* background to the *sub-region* case. A new relational
+  classifier (`layout_layers.is_decoration_leaf` / `panel_leaves`, plus a shared `_rect_contains`
+  matching the auditor's `TOL=1.0`) recognises a **static-decoration leaf** (`text` or `bitmap`) that
+  **encloses** other content — a branded colored section panel with worksheets floated on top, or a
+  title/divider strip over icons/labels — as a **z-order background for its region**, sent to back
+  rather than counted as a colliding tile. It is **kind-gated exactly like the page tier**: only
+  `text`/`bitmap` qualify, so a full-bleed **worksheet** that encloses cards is never a panel and its
+  containment stays a real, audited defect. No new auditor surface was needed — slice 1's default-off
+  `is_background` predicate simply receives more exempt leaves — so the shipped v2.7.0 goldens remain
+  **byte-for-byte unchanged** and no emit path is touched. +13 tests pin the decoration kinds, the
+  panel-encloses-content cases, the **worksheet guardrail**, the enclose-nothing / pure-decoration /
+  tolerance / page-background-subtraction cases, and junk-input robustness. Measured on the
+  six-workbook corpus (frame-track A/B harness, now scoring both engines symmetrically under
+  RAW → +BG → +PANEL):
+
+  | engine | overlaps | contain | oob | floor |
+  |---|---|---|---|---|
+  | legacy (+panel) | 0 | 0 | 0 | 31 |
+  | solver raw | 32 | 93 | 9 | 49 |
+  | solver +bg (slice 1) | 32 | 44 | 9 | 49 |
+  | solver **+panel (slice 2)** | **26** | **17** | 9 | 49 |
+
+  **Containment 44 → 17** — the 23 branded SF-Admin text panels + the 4-icon EBI cluster — and, as a
+  bonus, **overlaps 32 → 26** (the same panels were also scoring partial-overlap false-positives). The
+  residual (contain 17, most overlaps) is now entirely **worksheet-on-worksheet frame geometry**,
+  owned by the next slice; the symmetric exemption also drove *legacy* containment 1 → 0. Branch-only:
+  not merged to `main` until the whole frame track is complete and validated.
 - **tableau-migration (skill `2.12.0` → `2.13.0`): background-layer classifier + background-aware
   auditor — frame/quality track slice 1 (`scripts/layout_layers.py` + additive `geometry_defects`
   param, no emit change).** The first slice of the frame/absolute + z-order track that follows the

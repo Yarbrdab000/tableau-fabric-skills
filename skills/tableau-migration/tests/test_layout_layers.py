@@ -143,3 +143,115 @@ def test_documented_tunable_values():
     assert ll.BG_KINDS == ("bitmap",)
     assert "worksheet" not in ll.BG_KINDS
     assert "text" not in ll.BG_KINDS
+
+
+# ===============================================================================
+# sub-region PANEL classifier (ft2): a static-decoration leaf that ENCLOSES content
+# ===============================================================================
+def test_is_decoration_leaf_kinds():
+    assert ll.is_decoration_leaf(_leaf("text", (0, 0, 10, 10))) is True
+    assert ll.is_decoration_leaf(_leaf("bitmap", (0, 0, 10, 10))) is True
+    assert ll.is_decoration_leaf(_leaf("worksheet", (0, 0, 10, 10))) is False
+    assert ll.is_decoration_leaf(_leaf("filter", (0, 0, 10, 10))) is False
+    assert ll.is_decoration_leaf(_leaf("legend", (0, 0, 10, 10))) is False
+    assert ll.is_decoration_leaf(_leaf("paramctrl", (0, 0, 10, 10))) is False
+
+
+def test_is_decoration_leaf_robustness():
+    assert ll.is_decoration_leaf(None) is False
+    assert ll.is_decoration_leaf((0, 0, 10, 10)) is False
+    assert ll.is_decoration_leaf({"rect": (0, 0, 10, 10)}) is False  # no leaf_kind
+
+
+def test_text_panel_enclosing_worksheet_is_panel():
+    # The SF-Admin case: a branded text/shape panel behind a chart cluster.
+    panel = _leaf("text", (100, 100, 400, 300))
+    chart = _leaf("worksheet", (120, 140, 300, 200))
+    assert ll.panel_leaves([panel, chart]) == [panel]
+
+
+def test_bitmap_cluster_enclosing_icons_is_panel():
+    # The EBI case: a decoration image enclosing smaller images.
+    outer = _leaf("bitmap", (0, 0, 200, 60))
+    i1 = _leaf("bitmap", (5, 5, 40, 40))
+    i2 = _leaf("bitmap", (60, 5, 40, 40))
+    assert ll.panel_leaves([outer, i1, i2]) == [outer]
+
+
+def test_full_bleed_worksheet_enclosing_cards_is_not_panel():
+    # THE guardrail: a real full-bleed chart that contains cards is content, never a panel, so its
+    # containment stays a real defect for the frame-child slice to resolve.
+    chart = _leaf("worksheet", (0, 0, 1280, 720))
+    c1 = _leaf("worksheet", (40, 40, 200, 120))
+    c2 = _leaf("text", (300, 40, 150, 60))
+    assert ll.panel_leaves([chart, c1, c2]) == []
+
+
+def test_decoration_enclosing_nothing_is_not_panel():
+    # A lone caption / KPI text tile that encloses no sibling is not a panel -- it is still audited.
+    a = _leaf("text", (0, 0, 200, 40))
+    b = _leaf("worksheet", (0, 100, 300, 200))  # beside/below, not inside a
+    assert ll.panel_leaves([a, b]) == []
+
+
+def test_panel_may_enclose_pure_decoration():
+    # A thin divider/banner enclosing only a small text label still counts (decoration-over-
+    # decoration is a z-order stack, not a data collision) -- matches the corpus ar~51 divider case.
+    divider = _leaf("text", (0, 0, 600, 12))
+    label = _leaf("text", (10, 2, 80, 8))
+    assert ll.panel_leaves([divider, label]) == [divider]
+
+
+def test_panel_leaves_preserves_order_and_filters():
+    p1 = _leaf("text", (0, 0, 500, 400))       # panel (encloses w1)
+    w1 = _leaf("worksheet", (20, 20, 200, 200))  # content inside p1
+    p2 = _leaf("bitmap", (600, 0, 300, 300))   # panel (encloses w2)
+    w2 = _leaf("worksheet", (620, 20, 100, 100))  # content inside p2
+    lone = _leaf("text", (1000, 0, 50, 50))    # decoration enclosing nothing
+    out = ll.panel_leaves([p1, w1, p2, w2, lone])
+    assert out == [p1, p2]
+
+
+def test_panel_enclosure_honors_tolerance():
+    # Inner edge 1px outside the panel is still "contained" (tol=1.0), matching the auditor.
+    panel = _leaf("text", (100, 100, 200, 200))
+    inner = _leaf("worksheet", (99, 99, 202, 202))  # each edge 1px past -> within tol
+    assert ll.panel_leaves([panel, inner]) == [panel]
+    # 2px past on an edge -> not contained.
+    outside = _leaf("worksheet", (97, 100, 205, 200))
+    assert ll.panel_leaves([panel, outside]) == []
+
+
+def test_page_background_also_appears_in_panels_and_is_subtractable():
+    # A page-blanketing backdrop encloses everything, so it shows up in panel_leaves too; the
+    # INCREMENTAL sub-region set is panel_leaves minus background_leaves.
+    backdrop = _leaf("bitmap", (0, 0, 1280, 720))
+    panel = _leaf("text", (100, 100, 400, 300))
+    chart = _leaf("worksheet", (120, 140, 300, 200))
+    leaves = [backdrop, panel, chart]
+    panels = ll.panel_leaves(leaves)
+    assert backdrop in panels and panel in panels
+    bg = ll.background_leaves(leaves, PAGE)
+    incremental = [p for p in panels if p not in bg]
+    assert incremental == [panel]
+
+
+def test_panel_leaves_empty_and_none_input():
+    assert ll.panel_leaves([]) == []
+    assert ll.panel_leaves(None) == []
+
+
+def test_panel_leaves_robust_to_junk_rects():
+    good = _leaf("text", (0, 0, 400, 300))
+    inner = _leaf("worksheet", (10, 10, 100, 100))
+    junk1 = _leaf("text", None)
+    junk2 = _leaf("bitmap", ("x", "y", "w", "h"))
+    junk3 = {"leaf_kind": "text"}  # no rect
+    out = ll.panel_leaves([good, inner, junk1, junk2, junk3])
+    assert out == [good]
+
+
+def test_panel_documented_tunables():
+    assert ll.PANEL_KINDS == ("text", "bitmap")
+    assert "worksheet" not in ll.PANEL_KINDS
+    assert ll._CONTAIN_TOL == 1.0
