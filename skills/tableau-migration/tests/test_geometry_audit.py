@@ -132,6 +132,52 @@ def test_cross_group_and_ungrouped_still_count():
     assert d["overlaps"] + d["contain"] >= 1
 
 
+# ------------------------------------------------------------------ background-layer exemption (additive)
+def _bg(v):
+    """A predicate marking a visual tagged with ``_bg`` as a background layer (test-only tag)."""
+    return bool(v.get("_bg"))
+
+
+def test_default_no_predicate_is_byte_identical():
+    # Without a predicate the full-canvas backdrop MUST still be counted -- the shipped v2.7.0
+    # behaviour is unchanged, which is what keeps every existing golden valid.
+    backdrop = _vis(0, 0, 1280, 720)
+    chart = _vis(100, 100, 300, 200)
+    d = ga.geometry_defects([backdrop, chart], 1280, 720)
+    assert d["contain"] == 1
+
+
+def test_background_predicate_exempts_backdrop_containment():
+    # Same page, but the backdrop is flagged: it is a z-order layer, so its containment of the
+    # chart is not a defect.
+    backdrop = _vis(0, 0, 1280, 720)
+    backdrop["_bg"] = True
+    chart = _vis(100, 100, 300, 200)
+    d = ga.geometry_defects([backdrop, chart], 1280, 720, is_background=_bg)
+    assert d["contain"] == 0 and d["overlaps"] == 0
+
+
+def test_background_predicate_exempts_only_pairs_touching_a_background():
+    # Two real charts overlap each other AND both sit on a flagged backdrop. The backdrop pairs are
+    # exempt; the genuine chart-vs-chart overlap is still counted.
+    backdrop = _vis(0, 0, 1280, 720)
+    backdrop["_bg"] = True
+    a = _vis(100, 100, 200, 200)
+    b = _vis(150, 150, 200, 200)     # overlaps a for real
+    d = ga.geometry_defects([backdrop, a, b], 1280, 720, is_background=_bg)
+    assert d["contain"] == 0          # backdrop-contains-a and backdrop-contains-b both exempt
+    assert d["overlaps"] == 1         # a vs b still counts
+
+
+def test_background_still_contributes_to_oob_and_floor():
+    # The exemption is scoped to the pairwise scan only; a flagged layer's own oob/floor are
+    # unchanged (surface kept minimal).
+    thin = _vis(-5, 0, 20, 720)       # off the left edge AND <=41 px wide
+    thin["_bg"] = True
+    d = ga.geometry_defects([thin], 1280, 720, is_background=_bg)
+    assert d["oob"] == 1 and d["floor"] == 1
+
+
 # --------------------------------------------------------------------------- part-map plumbing
 def _report_parts():
     return {

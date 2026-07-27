@@ -74,11 +74,19 @@ def composite_group_of(vj):
     return g if g else None
 
 
-def geometry_defects(visuals, page_w, page_h):
+def geometry_defects(visuals, page_w, page_h, is_background=None):
     """The per-page defect catalogue, composite-group-aware.
 
     Returns a ``collections.Counter`` with keys ``overlaps`` / ``contain`` / ``oob`` / ``floor``
-    (missing keys read as 0)."""
+    (missing keys read as 0).
+
+    ``is_background`` is an optional ``visual -> bool`` predicate. When supplied, a pair is skipped
+    in the overlap/containment scan if EITHER member is a background layer -- a full-canvas backdrop
+    (e.g. a branded image sent to back) is a z-order layer the content sits on top of BY DESIGN, not
+    a colliding tile, exactly as a same-group composite pair is exempt. Default ``None`` preserves
+    the v2.7.0 behaviour byte-for-byte (the shipped goldens call this with no predicate); backgrounds
+    still contribute to ``oob`` / ``floor`` as before. See ``scripts/layout_layers.py`` for the
+    kind-aware classifier that produces such a predicate."""
     d = collections.Counter()
     for v in visuals:
         r = rect(v)
@@ -92,6 +100,8 @@ def geometry_defects(visuals, page_w, page_h):
         ga, gb = composite_group_of(a), composite_group_of(b)
         if ga is not None and ga == gb:
             continue  # intentional composite (donut ring + centre card): exempt by design
+        if is_background is not None and (is_background(a) or is_background(b)):
+            continue  # a backdrop layer is z-order background, not a colliding tile
         ra, rb = rect(a), rect(b)
         ia = intersection_area(ra, rb)
         if ia <= 4.0:

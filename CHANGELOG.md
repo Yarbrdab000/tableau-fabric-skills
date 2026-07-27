@@ -13,6 +13,36 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.12.0` → `2.13.0`): background-layer classifier + background-aware
+  auditor — frame/quality track slice 1 (`scripts/layout_layers.py` + additive `geometry_defects`
+  param, no emit change).** The first slice of the frame/absolute + z-order track that follows the
+  slice-3 finding. A new kind-aware classifier (`layout_layers.is_background_leaf` /
+  `background_leaves` / `rect_blankets_page`) recognises a **full-canvas decoration image** — a
+  `bitmap` leaf covering ≥ 85 % of the page area *and* spanning ≥ 85 % of **both** axes — as a
+  z-order **background layer** rather than a colliding tile, and `geometry_audit.geometry_defects`
+  gains an **optional, default-off** `is_background` predicate that exempts such a backdrop from the
+  overlap/containment scan (mirroring the existing donut composite-group exemption). Default `None`
+  keeps the shipped v2.7.0 behaviour **byte-for-byte**, so every existing golden is unchanged; the
+  change is purely additive and touches no emit path. Two new test modules
+  (`tests/test_layout_layers.py`, +the auditor's `is_background` cases) pin the thresholds, the
+  **critical kind guardrail** (a full-bleed *worksheet* is never a background — dropping a real chart
+  would hide a genuine defect), the both-axis blanket geometry, and robustness on junk input. Measured
+  effect on the six-workbook corpus (via the frame-track A/B harness, a session artifact):
+
+  | engine | overlaps | contain | oob | floor |
+  |---|---|---|---|---|
+  | legacy (bg-aware) | 0 | 1 | 0 | 31 |
+  | solver raw (pre-slice-1) | 32 | 93 | 9 | 49 |
+  | solver **bg-aware** | 32 | **44** | 9 | 49 |
+
+  **Containment is cut nearly in half (93 → 44)** — exactly the −49 from the two branded full-canvas
+  backdrops (SF-Admin "Access View" 37 → 12, "Executive Summary" 35 → 11) — while worksheets are never
+  misclassified. Notably the corpus shows the *legacy* path keeps its low containment by **silently
+  dropping** those backdrops (their PNG bytes are packaged, yet no image visual is emitted); the solver
+  track's opportunity is to **keep** the backdrop (more faithful) and send it to back. The remaining
+  solver containment (44) is text banners and large-worksheet-in-frame cases owned by the next slices;
+  overlaps/oob are the frame-child de-overlap slice. This work lands on the frame-track branch only —
+  it is not merged to `main` until the whole track is complete and validated against the corpus.
 - **tableau-migration (skill `2.11.0` → `2.12.0`): geometry auditor promoted + A/B harness — Zone
   Geometry v3 slice 3 (`scripts/geometry_audit.py` + `tests/test_geometry_audit.py`, no emit change).**
   The v2.7.0 per-page layout-defect auditor — previously buried inside `tests/test_twb_to_pbir.py` — is
