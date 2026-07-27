@@ -279,7 +279,15 @@ _LINE_FAMILY_MARKS = {"line", "area"}
 
 # Mark classes for geometry-backed / custom-spatial maps we deliberately defer (basics only:
 # filled + symbol map). These degrade to a structured warning rather than a guessed visual.
-_DEFER_MAP_MARKS = {"multipolygon", "polygon", "density", "heatmap"}
+# Split (v2-6): density/heatmap have no faithful offline Power BI home in any case -> always defer.
+# A Multipolygon/Polygon FILL, by contrast, is how Tableau renders a *standard geography* (a
+# recognized geo-role dimension with generated lat/lon) -- an ordinary choropleth whose faithful
+# home is a shapeMap, recovered in _visual_type() when a spatial signal confirms it. Only a polygon
+# WITHOUT that confirmation is a truly-custom/arbitrary polygon (no built-in topology) that still
+# defers. The union preserves the location-only + caller-warning semantics unchanged.
+_DENSITY_MAP_MARKS = {"density", "heatmap"}
+_POLYGON_MAP_MARKS = {"multipolygon", "polygon"}
+_DEFER_MAP_MARKS = _DENSITY_MAP_MARKS | _POLYGON_MAP_MARKS
 
 # Tableau derivation -> Power BI QueryAggregateFunction code.
 _AGG_FUNC = {
@@ -1414,9 +1422,19 @@ def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
 
     # Geographic maps (basics only): a geo-role dimension on Detail + a measure. The geo dim
     # being on Detail (not an axis) is what separates a map from an ordinary chart that merely
-    # uses a geographic dimension on a shelf. Custom-geometry marks are deferred; ambiguous
-    # marks additionally require a spatial signal (generated lat/lon or a geometry encoding).
+    # uses a geographic dimension on a shelf. Truly-custom-geometry marks (density/heatmap, or a
+    # polygon with no spatial signal) are deferred; ambiguous marks additionally require a spatial
+    # signal (generated lat/lon or a geometry encoding).
     if geo_detail and map_meas:
+        # v2-6: a Multipolygon/Polygon FILL over a recognized geography (we are already inside
+        # geo_detail -- a geo-role dimension on Detail -- with a measure) plus a spatial signal
+        # (generated lat/lon on the axes or a <geometry> encoding) is Tableau's rendering of a
+        # standard-geography choropleth. Its faithful Power BI home is a shapeMap, not a custom
+        # polygon with no built-in topology, so recover it here BEFORE the blanket defer that
+        # previously short-circuited every polygon mark. A polygon with NO spatial signal stays a
+        # truly-custom polygon and still defers; density/heatmap have no offline home, always defer.
+        if m in _POLYGON_MAP_MARKS and map_signal:
+            return VT_SHAPE_MAP
         if m in _DEFER_MAP_MARKS:
             return VT_UNSUPPORTED
         # A geo Location + a measure is a choropleth shaded by that measure -> shapeMap (the faithful

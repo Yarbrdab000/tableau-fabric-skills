@@ -13,6 +13,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.8.0` → `2.9.0`): standard-geography multipolygon → `shapeMap` recovery
+  (map slice v2-6).** A Tableau **filled** map of a recognized geography serialises as a `Multipolygon`
+  (sometimes `Polygon`) mark with the generated lat/lon and/or a `<geometry>` encoding — an ordinary
+  state/country choropleth. The blanket `_DEFER_MAP_MARKS` gate short-circuited **every** polygon mark to
+  `unsupported` *before* the generated-lat/lon map-signal check, so these standard maps were silently
+  dropped (the Superstore "Sale Map" class) even though the engine already emits a `shapeMap` for the
+  equivalent measure-driven choropleth. v2-6 splits the defer set into `_DENSITY_MAP_MARKS`
+  (`density`/`heatmap`, no offline Power BI home → always defer) and `_POLYGON_MAP_MARKS`
+  (`multipolygon`/`polygon`), and recovers a polygon fill to `shapeMap` **only** when it sits over a
+  recognized geo-role dimension (already inside the `geo_detail`+measure block) **and** a spatial signal
+  confirms a real geography (generated lat/lon on the axes or a `<geometry>` encoding). A polygon with
+  **no** spatial signal (a truly-custom polygon with no built-in topology) and every density/heatmap layer
+  still defer, so no map is ever guessed. The `_DEFER_MAP_MARKS` union is byte-identical, keeping the
+  location-only fill path and the caller's defer warning unchanged. +4 lock-in tests (multipolygon
+  recovers via lat/lon; recovers via geometry-only signal with empty axes; signal-less polygon still
+  defers; density/heatmap still defer); the tacked-on obsolete Multipolygon-defer assertion is removed
+  from the gradient-binding test. `resources/viz-rebuild.md` updated to document the recovery. Suite
+  **3077 passed / 4 skipped / 1 xfailed**; plugin mirror byte-identical; `rollback/pre-v2.9.0` at `fbcac33`.
 - **tableau-migration (skill `2.7.0` → `2.8.0`): Zone Geometry v2 slice 8 — robust caption de-overlap
   (band-insertion fallback for packed dashboards).** The v2-2 tidy pass only lifted a floating caption
   when a clear horizontal strip already existed; on a **packed** real dashboard (every band occupied) no

@@ -3044,6 +3044,79 @@ def test_shape_map_explicit_map_mark_needs_no_latlon_signal():
     assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
 
 
+# -- v2-6: Multipolygon/Polygon standard-geography choropleth recovery -------------------------
+# A Tableau FILLED map of a recognized geography (State/Country/...) serialises with a
+# `Multipolygon` (sometimes `Polygon`) mark + Tableau's generated lat/lon and/or a `<geometry>`
+# encoding. That is an ordinary choropleth, whose faithful Power BI home is a shapeMap -- NOT a
+# custom polygon with no built-in topology. Before v2-6 the blanket `_DEFER_MAP_MARKS` gate
+# short-circuited every polygon mark to `unsupported`, silently dropping these standard maps (the
+# Salesforce MailingState / Superstore "Sale Map" class). v2-6 recovers them when the geo-role +
+# measure + a spatial signal all confirm a real geography, while density/heatmap and signal-less
+# (truly-custom) polygons still defer.
+def test_v2_6_multipolygon_standard_geography_recovers_to_shape_map():
+    # Multipolygon + geo-role State on Detail + a colour measure + generated lat/lon (the default
+    # `_geo_ws` axes) -> a standard-geography choropleth, recovered to a shapeMap instead of deferring.
+    enc = ("<encodings>"
+           "<color column='[federated.abc].[sum:Sales:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Sale Map", "Multipolygon", enc)))
+    assert ir["worksheets"][0]["visual_type"] == "shape_map"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "shapeMap"
+    state = _query_state(vis)
+    # geo dimension on Category (finest level); colour measure shades via the "Value" saturation well
+    assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
+    assert state["Value"]["projections"][0]["field"]["Aggregation"]["Function"] == 0  # Sum(Sales)
+    # the recovered map is a real visual, NOT a deferred warning
+    assert not any("deferred" in w["reason"] and w["name"] == "Sale Map" for w in ir["warnings"])
+
+
+def test_v2_6_multipolygon_geometry_signal_recovers_to_shape_map():
+    # The <geometry> (generated) encoding ALONE is a sufficient spatial signal -- with the axes
+    # empty (no generated lat/lon), a Multipolygon fill over a recognized geography still recovers
+    # to a shapeMap, and emit tolerates the leftover geometry encoding (dropped quietly, like lat/lon).
+    enc = ("<encodings>"
+           "<color column='[federated.abc].[sum:Sales:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "<geometry column='[federated.abc].[Geometry (generated)]' />"
+           "</encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Spatial", "Multipolygon", enc, rows="", cols="")))
+    assert ir["worksheets"][0]["visual_type"] == "shape_map"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "shapeMap"
+    assert _query_state(vis)["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
+
+
+def test_v2_6_polygon_without_spatial_signal_still_defers():
+    # A polygon mark over a geo-role dimension + measure but with NO spatial signal (no generated
+    # lat/lon on the axes, no <geometry> encoding) is a truly-custom polygon with no built-in
+    # topology -> it must still defer, never be guessed into a shapeMap.
+    enc = ("<encodings>"
+           "<color column='[federated.abc].[sum:Sales:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Custom Polygon", "Polygon", enc, rows="", cols="")))
+    assert ir["worksheets"][0]["visual_type"] == "unsupported"
+    assert _visual_parts(emit_pbir(ir)) == {}
+    assert any("deferred" in w["reason"] and w["name"] == "Custom Polygon" for w in ir["warnings"])
+
+
+def test_v2_6_density_and_heatmap_marks_over_geography_still_defer():
+    # density/heatmap layers have no faithful offline Power BI home even over a recognized geography
+    # with a spatial signal -> they always defer (the recovery gate is polygon-only, by design).
+    enc = ("<encodings>"
+           "<color column='[federated.abc].[sum:Sales:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    for mark in ("Density", "Heatmap"):
+        ir = parse_twb(_workbook(_geo_ws(f"{mark} Map", mark, enc)))
+        assert ir["worksheets"][0]["visual_type"] == "unsupported", mark
+        assert _visual_parts(emit_pbir(ir)) == {}, mark
+        assert any("deferred" in w["reason"] and w["name"] == f"{mark} Map"
+                   for w in ir["warnings"]), mark
+
+
 def test_symbol_map_circle_mark_with_size_measure():
     enc = ("<encodings>"
            "<size column='[federated.abc].[sum:Sales:qk]' />"
@@ -3077,15 +3150,6 @@ def test_symbol_map_color_measure_binds_gradient_not_color_well():
     assert state["Size"]["projections"][0]["queryRef"] == "Sum(Orders.Sales_Amount)"
     assert state["Gradient"]["projections"][0]["queryRef"] == "Sum(Orders.Profit)"
     assert "Color" not in state
-    enc = ("<encodings>"
-           "<color column='[federated.abc].[sum:Sales:qk]' />"
-           "<lod column='[federated.abc].[none:State:nk]' />"
-           "<geometry column='[federated.abc].[Geometry (generated)]' />"
-           "</encodings>")
-    ir = parse_twb(_workbook(_geo_ws("Spatial", "Multipolygon", enc)))
-    assert ir["worksheets"][0]["visual_type"] == "unsupported"
-    assert _visual_parts(emit_pbir(ir)) == {}
-    assert any("deferred" in w["reason"] and "Spatial" == w["name"] for w in ir["warnings"])
 
 
 def test_filled_map_categorical_color_binds_series_legend():
