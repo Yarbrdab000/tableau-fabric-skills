@@ -522,13 +522,19 @@ the hand-built oracle, which formats only the shown percent.
 Every warning is `{"scope": "worksheet"|"dashboard", "name": <name>, "reason": "manual attention required: ..."}`.
 Cases that degrade to a warning instead of a visual/binding:
 
-- **Unsupported marks**: area, polygon, density/heatmap, Gantt (non-bar), etc. → the worksheet
-  emits **no** visual.
-- **Spatial / custom-geometry maps are deferred** (basics only — filled + symbol map are
-  supported, see above). A worksheet degrades to a warning when it needs custom geometry rather
-  than a plain geo-role binding: `Multipolygon`/custom spatial polygons, `MAKEPOINT`/`MAKELINE`/
-  `BUFFER` constructed geometry, density/heatmap layers, and dual-axis (layered) maps. The real
-  Superstore "Sale Map" (a `Multipolygon` mark) defers this way rather than being rebuilt wrong.
+- **Unsupported marks**: area, Gantt (non-bar), a signal-less `polygon`, density/heatmap, etc. →
+  the worksheet emits **no** visual.
+- **Standard-geography choropleths recover; only custom geometry defers** (basics — filled + symbol
+  map — plus standard filled maps are supported, see above). A `Multipolygon`/`Polygon` **fill** over
+  a recognized geo-role dimension (State/Country/…) with a measure and a spatial signal (Tableau's
+  generated lat/lon on the axes, or a `<geometry>` encoding) is an ordinary state/country choropleth:
+  it is **recovered to a `shapeMap`** (v2-6), not guessed and not dropped. A worksheet degrades to a
+  warning only when it needs **custom** geometry rather than a plain geo-role binding: a `Polygon`/
+  `Multipolygon` with **no** spatial signal (a truly-custom polygon with no built-in topology),
+  `MAKEPOINT`/`MAKELINE`/`BUFFER` constructed geometry, density/heatmap layers, and dual-axis
+  (layered) maps. The real Superstore "Sale Map" (a `Multipolygon` over State with generated lat/lon)
+  now rebuilds as a `shapeMap`; a custom-drawn polygon with no geo-role signal still defers rather
+  than being rebuilt wrong.
 - **KPI target/trend**: a single measure with no dimension becomes a `card`/`multiRowCard`; the
   richer PBIR `kpi` visual (with `Indicator`/`TrendAxis`/`TargetValue` roles) is deferred to a
   Tier-2 analytics pass. When the worksheet carries an explicit **reference / target / trend line**
