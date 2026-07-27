@@ -13,6 +13,120 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.5.0` → `2.6.0`): Zone Geometry v2 slice 5 — emit-boundary line-break
+  sentinel / mojibake scrub (no more stray `Æ` or `�` on the page).** Tableau reuses the Latin letter
+  `Æ` (U+00C6) as a soft/hard line-break sentinel inside formatted-text runs, and can leave a U+FFFD
+  replacement char where a source byte failed to decode. Several parse helpers already strip these at
+  their own site, but the dynamic caption / title resolvers (which deliberately preserve a real
+  newline) carried a bare sentinel through — so a two-line caption emitted `New Inbound`**`Æ`** /
+  `Referrals`, with a literal `Æ` ending the first line. A single centralized scrub now runs at the
+  emit boundary: every string bound for a semantic-query `Literal` (via `_semantic_string_literal` —
+  titles, matrix/table headers, KPI text, reference-line labels, category labels) and every textbox
+  run value (banner, dashboard text object, and the v2-3 caption-only worksheet rebuild) passes
+  through it. Crucially the scrub is **targeted, not blanket**: because `Æ` is also a legitimate letter
+  (Danish/Norwegian `Ærø`), the sentinel is dropped ONLY where it marks a break — immediately before a
+  newline, or at the very end of the text — never mid-word, so real text is preserved verbatim; U+FFFD
+  is never legitimate and is always dropped. The line break itself survives (the two-line caption
+  becomes two clean paragraphs). Additive, fail-safe, `+5` lock-in tests (helper contract incl. the
+  legitimate-`Æ` over-scrub guard, `_semantic_string_literal` chokepoint, caption-only multiline e2e,
+  container-title mojibake scrub, legitimate-`Æ` title survives end-to-end).
+- **tableau-migration (skill `2.4.0` → `2.5.0`): Zone Geometry v2 slice 4 — resolve dynamic
+  parameter-driven titles on SUPPORTED visuals (no more silently dropped chart titles).** A rebuilt
+  chart, table, or other supported visual whose authored title weaves a Tableau parameter token —
+  e.g. `Sales by <[Parameters].[Show by Dimension]>` — previously had its whole title dropped with a
+  warning, because the token can't be reproduced as a live re-selecting title in Power BI. The title
+  is now resolved: every `<[Parameters].[…]>` token is substituted with the parameter's current
+  display value, and when the result is fully static it is kept as the visual's title (so
+  `Sales by <[Parameters].[p1]>` with p1 currently showing `Program Name` becomes the static title
+  `Sales by Program Name`, reaching the emitted `visualContainerObjects.title` with its authored font
+  style preserved). A positive warning discloses that a live re-selection at view time is not
+  reproduced. The rule is deliberately conservative: if any live field-reference or runtime-special
+  token (`<[federated.…]>`, `<Region>`) REMAINS after parameter substitution, the title is still
+  dropped rather than partially emitted — stripping it would leave a dangling half-label like
+  "Days to Ship for …", so the visual keeps its default title instead. This resolves the D4
+  dynamic-caption defect on the supported-visual path (the v2-3 slice already handles the
+  caption-only-worksheet path) and never leaks a raw `<…>` token or `&lt;` entity into the report.
+  Additive, fail-safe, `+3` lock-in tests (param title resolved + kept + emitted, mixed
+  param+field-ref still dropped, resolved title keeps its parsed style).
+- **tableau-migration (skill `2.3.0` → `2.4.0`): Zone Geometry v2 slice 3 — caption-only worksheet →
+  textbox (recovers thin status / refresh / filter-breadcrumb bands that previously vanished).** A
+  dashboard-placed worksheet whose only content is its title — a thin "Data as of …" refresh bar, a
+  "Region : All | System : All" filter breadcrumb, a status strip — has no rows, no columns, and no
+  plottable mark channel, so it classifies as `VT_UNSUPPORTED` and was dropped, leaving the labelled band
+  empty (the "a thin view doesn't generate at all" defect; e.g. ATTI's `data update` and `tech filters`
+  bars were absent from the rebuild). Because completeness is a hard invariant — never leave a labelled
+  band empty — such a worksheet is now rebuilt as a plain `textbox` carrying its resolved caption, placed
+  at its authored dashboard zone at normal tiled z-order (an anchor, not a floating `z=900` caption, so
+  the v2-2 de-overlap pass reserves its band). The caption is resolved through the existing dynamic-token
+  path: parameter tokens (`<[Parameters].[…]>`) become their current display value, while live
+  field-reference tokens — which Power BI cannot reproduce statically — are blanked, keeping the static
+  label scaffold intact. The rebuild is disclosed honestly per band: a static caption notes a plain
+  textbox rebuild, a dynamic one adds that field values render blank (label scaffold + resolved parameters
+  preserved), so a present band is never mistaken for its live values being reproduced. The gate is
+  precise — it fires only when there is a title AND no plottable mark (no rows/cols and none of
+  color/size/label/angle; a detail-only pill that merely feeds the title is fine) — so a genuine chart is
+  never collapsed into a caption (verified: Salesforce's `Stage Legend` and distribution chart are
+  correctly not flagged). Additive, fail-safe, `+4` lock-in tests (IR flag + zone-placed textbox emit +
+  chart-not-converted precision + dynamic-value-blank honest disclosure).
+- **tableau-migration (skill `2.2.0` → `2.3.0`): Zone Geometry v2 slice 2 — caption de-overlap / tidy
+  pass (lifts a floating caption textbox off any content it overlaps).** Tableau habitually floats a
+  section-header / panel-label / instruction text zone directly on top of (or fully inside) the
+  worksheet, table or slicer row it labels; the deterministic rebuild scales those zones faithfully
+  (`z=900`), so it inherits every source overlap — empirically the dominant geometry defect on real
+  dashboards (100% of measured overlaps were a `z=900` caption sitting on an anchor: chart column-headers
+  pinned inside their bars at 98–100%, or a wide section header stretched behind a slicer row at ~41–47%).
+  Because faithful *pixel* placement is not a hard invariant (only completeness, correct numbers, and
+  faithful graphs are), the new `_deoverlap_captions` pass relocates the **caption — never the content —**
+  into a readable strip: preferring the gap directly above the anchor it labels (a clean title row), then
+  directly below, then the closest clear horizontal band; only `x`/`y` change, so the caption is never
+  dropped, resized, or restyled (completeness preserved). A never-regress gate computes overlaps first and
+  returns early when no caption sits on an anchor, so cleanly tiled dashboards are byte-identical; a
+  caption is moved only to a position proven clear of every anchor and every other caption, otherwise left
+  exactly where it was (the page can only get tidier, never worse). Measured on three real workbooks:
+  dashboard overlaps **29 → 0** (Salesforce 9 → 0, ATTI 20 → 0), containments **4 → 2**, out-of-bounds
+  **1 → 0**, with the already-clean Superstore held at **0** overlaps. Additive, fail-safe, `+2` lock-in
+  tests (caption on a chart → lifted clear above it; caption already clear → untouched by the gate).
+- **tableau-migration (skill `2.1.0` → `2.2.0`): Zone Geometry v2 slice 1 — content-aware caption/text
+  min-size (no longer inflates thin caption bands to the 40px chart floor).** The generic zone floor in
+  `_scale_zone` applied a blanket `max(40px, …)` to every zone's width *and* height, which inflated the
+  thin caption/section-header/instruction bands Tableau authors at their natural text height (~24–34px)
+  into unreadable 40px blocks — and, by growing them, pushed them into the content beneath, manufacturing
+  overlaps. `_scale_zone` now accepts optional `min_w`/`min_h` (default `40.0` → every existing caller is
+  byte-identical); the dashboard text-object emitter passes a content-aware floor sized to a single line
+  of the caption's *own* font (`max(20px, font_pt × 96/72 × 1.35)`, authored width kept). Because the
+  floor is a `max()` with the scaled height, a taller/multi-line caption is preserved unchanged (never
+  shrunk) and a thin one is never inflated. Charts, tables, images, and the title banner keep the 40px
+  floor. Measured effect on three real workbooks: dashboard overlaps dropped 29 → 23 (Salesforce 9 → 7,
+  ATTI 20 → 16) with the already-clean Superstore held at 0 (clean pages untouched). Additive, fail-safe,
+  `+1` lock-in test (thin caption → content height; thin chart zone → still floors to 40).
+- **tableau-migration (skill `2.0.0` → `2.1.0`): Report-fidelity bundle — KPI title-card, measure
+  trellis, dynamic caption tokens, slicer-format canonicalization, and a card display-units (R5)
+  scoping correction.** A batch of session-accumulated, additive report-side improvements committed
+  together (each fail-closed → the prior output is byte-identical when its pattern does not fire):
+  - **KPI title-card** (`_detect_kpi_title_card` / `_emit_kpi_title_card`) — a Tableau BAN worksheet
+    that embeds its headline measure inside the worksheet *title* (a large dynamic field run above a
+    trend mark) is rebuilt as a real Power BI `card` bound to that measure, sitting above the retained
+    sparkline, instead of losing the number to an inert title string.
+  - **Measure trellis** (`_detect_measure_trellis` / `_emit_measure_trellis`) — 2+ distinct measure
+    pills `+`-concatenated on one bar/column shelf (Tableau draws one pane per measure) fan out into N
+    side-by-side single-measure charts on a shared category axis, rather than collapsing into one
+    clustered block sharing a single axis (Power BI has no native multi-measure trellis). Fail-closed:
+    a Series legend, a `SmallMultiple` role, `[Measure Values]`, or a single measure → the existing
+    clustered chart, unchanged.
+  - **Dynamic caption tokens** (`_resolve_dynamic_text_tokens`) — a parameter/field reference woven
+    into an authored text/caption is resolved to its literal value so the caption reads as authored.
+  - **Slicer-format canonicalization** (`_slicer_font_props` / `_apply_slicer_format`) — centralizes
+    slicer header/item font styling and emits the correct PBIR `textSize` property (not the invalid
+    `fontSize`, which Power BI silently drops), plus the header caption and plate fill.
+  - **Field-expression aggregation recovery on column rebind** — a derived field rebound to a numeric
+    column recovers its aggregation; a non-numeric column correctly does not.
+  - **Grid font objects** — a `tableEx` targets the `total` font object (not `rowHeaders`/`subtotals`);
+    a `matrix` keeps `rowHeaders` + `subtotals`.
+  - **pbir_lint R5 scoping fix** — the card display-units guard is scoped to `card` only and reads the
+    value object `labels.labelDisplayUnits`; a `multiRowCard`'s value object is `dataLabels`, which has
+    no `labelDisplayUnits` channel, so R5 no longer misfires on it.
+  Additive; no report-schema or default-path change beyond the intended fidelity improvements.
+  Suite 3038 → 3047.
 - **tableau-migration (skill `1.99.0` → `2.0.0`): A symbol (bubble) map sized by an average now
   raises a legibility caveat (sf-npo Lesson 8).** On an azureMap/symbol map the bubble radius encodes
   the Size measure; sizing by an AVERAGE gives every location a near-identical radius (each place

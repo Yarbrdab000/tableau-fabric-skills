@@ -41,6 +41,8 @@ from twb_to_pbir import (
     _resolve_visual_flags,
     _resource_basename,
     _role_projections,
+    _scrub_sentinels,
+    _semantic_string_literal,
     _tableau_filter_mode_to_pbi,
     _tableau_param_control_mode_to_pbi,
     _text_object_textbox_visual,
@@ -1373,6 +1375,37 @@ def test_apply_override_keeps_aggregation_pill_aggregation():
     assert "Aggregation" in expr
 
 
+def test_field_expression_recovers_derivation_aggregation_on_column_rebind():
+    # A VALUE pill carrying a Tableau aggregation in ``derivation`` (a calc measure materialised as a
+    # model column, so ``_apply_override`` flips measure->column) must still AGGREGATE -- a bare column
+    # in a card/KPI value well with ``summarizeBy: none`` renders a Power BI error visual. The source
+    # AVG must survive as AVERAGE(column), not collapse to an un-aggregated column. (sf-npo Intake:
+    # "Avg. Days to Close Inbound Referrals" KPI card broke exactly this way.)
+    fld = {"caption": "Days to Close", "kind": "value", "role": "measure", "is_calc": True,
+           "derivation": "Avg", "aggregation": None, "datatype": "integer",
+           "entity": "_Measures", "property": "Days to Close", "binding": "measure"}
+    fm = {"Days to Close": {"entity": "Case", "property": "Days to Close"}}
+    entity, prop, binding = _apply_override(fld, "Sheet1", fm)
+    assert (entity, prop, binding) == ("Case", "Days to Close", "column")
+    expr, qref, nref = _field_expression(fld, "Sheet1", fm)
+    assert "Aggregation" in expr and "Column" in expr["Aggregation"]["Expression"]
+    assert expr["Aggregation"]["Function"] == 1  # Average
+    assert qref == "Avg(Case.Days to Close)"
+    assert nref == "Avg of Days to Close"
+
+
+def test_field_expression_skips_derivation_aggregation_on_non_numeric_column():
+    # Guard: a non-numeric column must NOT be wrapped in a numeric aggregation (that itself errors) --
+    # mirror the resolve-time numeric guard so the recovery stays fail-closed.
+    fld = {"caption": "Segment", "kind": "value", "role": "measure", "is_calc": True,
+           "derivation": "Sum", "aggregation": None, "datatype": "string",
+           "entity": "_Measures", "property": "Segment", "binding": "measure"}
+    fm = {"Segment": {"entity": "Orders", "property": "Segment"}}
+    expr, qref, _ = _field_expression(fld, "Orders", fm)
+    assert "Column" in expr and "Aggregation" not in expr
+    assert qref == "Orders.Segment"
+
+
 def test_apply_override_keeps_plain_column_pill_column():
     fld = _ir_field("Category", "column")
     fm = {"Category": {"entity": "Orders", "property": "Category"}}
@@ -2202,6 +2235,95 @@ def test_pct_of_total_without_series_not_native():
     assert "Series" not in _query_state(vis)
 
 
+# -- measure-trellis fan-out (N '+'-concatenated distinct measures) ------------
+# Tableau lays several measures side by side by concatenating separate pills with
+# '+' on one shelf, drawing one pane per measure. Power BI has no native
+# multi-measure trellis (a clustered chart with 2+ Y renders GROUPED bars on one
+# axis), so the faithful rebuild is N side-by-side single-measure charts sharing
+# a category axis. See _detect_measure_trellis / _emit_measure_trellis.
+def _bool_show(objs, key):
+    return objs[key][0]["properties"]["show"]["expr"]["Literal"]["Value"]
+
+
+def test_measure_trellis_fans_out_into_side_by_side_charts():
+    # two DISTINCT measures '+'-concatenated on cols + a dimension on rows, no
+    # colour legend -> fan into 2 side-by-side bar charts on a shared category axis.
+    ws = _worksheet("Trellis", "Bar",
+                    rows="[federated.abc].[none:Category:nk]",
+                    cols="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+                    deps_extra=_INST)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["uses_measure_values"] is False
+    vis = list(_visual_parts(emit_pbir(ir)).values())
+    assert len(vis) == 2  # one chart per measure, not a single grouped clustered bar
+    # each fanned chart carries exactly ONE (distinct) measure on Y
+    ys = []
+    for v in vis:
+        yq = _query_state(v)["Y"]["projections"]
+        assert len(yq) == 1
+        ys.append(yq[0]["field"]["Aggregation"]["Expression"]["Column"]["Property"])
+    assert ys == ["Sales_Amount", "Profit"]
+    first, rest = vis[0], vis[1:]
+    # the FIRST chart shows the category axis (row labels appear once, on the left);
+    # the value axis is hidden on ALL (data labels carry the numbers -> compact strip)
+    assert _bool_show(first["visual"]["objects"], "categoryAxis") == "true"
+    assert _bool_show(first["visual"]["objects"], "valueAxis") == "false"
+    for v in rest:
+        assert _bool_show(v["visual"]["objects"], "categoryAxis") == "false"
+        assert _bool_show(v["visual"]["objects"], "valueAxis") == "false"
+    # geometry: N+1 logical columns (label gutter + one band per measure); chart 0
+    # spans gutter+first band (width 2u), later charts a single band (width u),
+    # laid left-to-right with no overlap and a shared height.
+    xs = [v["position"]["x"] for v in vis]
+    assert xs == sorted(xs)
+    assert first["position"]["width"] > rest[0]["position"]["width"]
+    assert abs(first["position"]["width"] - 2 * rest[0]["position"]["width"]) < 1.0
+    assert rest[0]["position"]["x"] >= first["position"]["x"] + first["position"]["width"] - 1.0
+    assert all(v["position"]["height"] == first["position"]["height"] for v in rest)
+    # the fan-out is disclosed (Power BI has no native multi-measure trellis)
+    assert any("measure-trellis" in w["reason"] for w in ir["warnings"])
+
+
+def test_single_measure_bar_is_not_a_trellis():
+    # exactly one measure -> no fan-out; the existing single clustered chart is kept.
+    ws = _worksheet("One Measure", "Bar",
+                    rows="[federated.abc].[none:Category:nk]",
+                    cols="[federated.abc].[sum:Sales:qk]",
+                    deps_extra=_INST)
+    vis = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())
+    assert len(vis) == 1
+    assert vis[0]["visual"]["visualType"] == "clusteredBarChart"
+
+
+def test_detect_measure_trellis_guards():
+    from twb_to_pbir import _detect_measure_trellis
+    p = {"field": {"Measure": {"Property": "X"}}}
+    c = {"field": {"Column": {"Property": "D"}}}
+    fires = {"visual_type": "bar", "uses_measure_values": False}
+    state = {"Y": {"projections": [p, p]}, "Category": {"projections": [c]}}
+    # fires on the canonical shape: bar, 2+ Y, 1+ Category, no series/MV/small-multiple
+    assert _detect_measure_trellis(fires, state) == [p, p]
+    assert _detect_measure_trellis({"visual_type": "column", "uses_measure_values": False},
+                                   state) == [p, p]
+    # a single Y is not a trellis
+    assert _detect_measure_trellis(fires, {"Y": {"projections": [p]},
+                                           "Category": {"projections": [c]}}) is None
+    # no Category axis -> not a trellis
+    assert _detect_measure_trellis(fires, {"Y": {"projections": [p, p]}}) is None
+    # Measure Values shelf is the grouped/series idiom (one shared axis), never a fan-out
+    assert _detect_measure_trellis({"visual_type": "bar", "uses_measure_values": True},
+                                   state) is None
+    # a colour-legend Series is a genuine grouped/stacked chart
+    ser = dict(state, Series={"projections": [c]})
+    assert _detect_measure_trellis(fires, ser) is None
+    # an existing native SmallMultiple trellis is left alone
+    sm = dict(state, SmallMultiple={"projections": [c]})
+    assert _detect_measure_trellis(fires, sm) is None
+    # non-bar/column marks never fan out
+    assert _detect_measure_trellis({"visual_type": "line", "uses_measure_values": False},
+                                   state) is None
+
+
 # -- degenerate visuals are skipped (not emitted as empty shells) --------------
 def test_chart_missing_required_role_is_skipped_by_emit_gate():
     # a column visual whose shelves resolved to nothing must not emit an empty shell
@@ -2817,16 +2939,63 @@ def test_shape_map_objects_emit_diverging_saturation_gradient_centred_at_zero():
     dp = vis["visual"]["objects"]["dataPoint"][0]["properties"]
     grad = dp["fillRule"]["linearGradient3"]
     # orange -> white -> blue, white PINNED at the 0 centre (mid carries a value anchor; min/max
-    # stay value-less so they auto-scale to the data low/high)
-    assert grad["min"]["color"]["expr"]["Literal"]["Value"] == "'#FEA043'"
-    assert grad["mid"]["color"]["expr"]["Literal"]["Value"] == "'#FFFFFF'"
-    assert grad["max"]["color"]["expr"]["Literal"]["Value"] == "'#4A88C2'"
-    assert grad["mid"]["value"]["expr"]["Literal"]["Value"] == "0D"   # centre pinned at break-even
+    # stay value-less so they auto-scale to the data low/high). Each stop is an UNWRAPPED literal
+    # (no ``expr`` wrapper) -- the ``expr`` form fails to load (PBIR_FILLRULE_STOP_DOUBLE_WRAP).
+    assert grad["min"]["color"]["Literal"]["Value"] == "'#FEA043'"
+    assert grad["mid"]["color"]["Literal"]["Value"] == "'#FFFFFF'"
+    assert grad["max"]["color"]["Literal"]["Value"] == "'#4A88C2'"
+    assert grad["mid"]["value"]["Literal"]["Value"] == "0D"          # centre pinned at break-even
     assert "value" not in grad["min"]                                 # endpoints auto-scale...
     assert "value" not in grad["max"]                                 # ...to the data range
-    assert grad["nullColoringStrategy"]["strategy"]["expr"]["Literal"]["Value"] == "'asZero'"
+    assert grad["nullColoringStrategy"]["strategy"]["Literal"]["Value"] == "'asZero'"
     assert dp["showAllDataPoints"]["expr"]["Literal"]["Value"] == "true"
     assert "linearGradient2" not in dp["fillRule"]  # not the old sequential 2-colour ramp
+
+
+def test_grid_font_objects_tableex_uses_total_not_rowheaders_or_subtotals():
+    # A flat tableEx exposes NO rowHeaders / subTotals objects (only columnHeaders / values / total).
+    # Emitting rowHeaders/subTotals on a tableEx trips PBIR_FORMATTING_OBJECT_UNKNOWN and Power BI
+    # silently drops the styling, so the total-row style must land on the ``total`` object instead.
+    from twb_to_pbir import _grid_font_objects, VT_TABLE
+    ws = {
+        "visual_type": VT_TABLE,
+        "grid_styles": {
+            "header": {"font_size": "11D", "bold": True},
+            "header_fill": {"fill": "#DDDDDD"},
+            "body": {"font_size": "9D"},
+            "total": {"font_size": "10D", "bold": True},
+            "subtotal_fill": {"fill": "#EEEEEE"},
+        },
+    }
+    fo = _grid_font_objects(ws)
+    assert "rowHeaders" not in fo          # invalid on tableEx
+    assert "subTotals" not in fo           # invalid on tableEx
+    assert "columnHeaders" in fo
+    assert "values" in fo
+    assert "total" in fo                   # total-row style routed to the valid ``total`` object
+    tot = fo["total"][0]["properties"]
+    assert tot["fontSize"]["expr"]["Literal"]["Value"] == "10D"
+    assert tot["backColor"]["solid"]["color"]["expr"]["Literal"]["Value"] == "'#EEEEEE'"
+
+
+def test_grid_font_objects_matrix_keeps_rowheaders_and_subtotals():
+    # A matrix (pivotTable) DOES expose rowHeaders + per-group subTotals -- both valid there -- so the
+    # type-aware split must leave the matrix path unchanged (no regression from the tableEx fix).
+    from twb_to_pbir import _grid_font_objects, VT_MATRIX
+    ws = {
+        "visual_type": VT_MATRIX,
+        "grid_styles": {
+            "header": {"font_size": "11D", "bold": True},
+            "body": {"font_size": "9D"},
+            "total": {"font_size": "10D"},
+        },
+    }
+    fo = _grid_font_objects(ws)
+    assert "rowHeaders" in fo
+    assert "subTotals" in fo
+    assert "columnHeaders" in fo
+    assert "values" in fo
+    assert "total" not in fo               # matrix uses subTotals for the total-row style
 
 
 # Country/Region declared with its own geo semantic-role, so both it AND State carry a geo_area and
@@ -3994,7 +4163,66 @@ def test_dynamic_worksheet_title_deferred_and_warned():
     assert "Days to Ship for <" not in blob and "&lt;" not in blob
 
 
-def test_no_title_means_no_visual_container_objects():
+# v2-4: a SUPPORTED visual's DYNAMIC title is resolved (not dropped) when it becomes fully static
+# after parameter substitution. A ``Parameters`` datasource carrying p1 -> display 'Program Name'
+# is injected alongside the standard one (the parser scans every <datasources> block at root).
+_V2_4_PARAM_DS = (
+    "<datasources><datasource name='Parameters'>"
+    "<column caption='Show by Dimension' name='[p1]' datatype='string' "
+    "value='&quot;prog&quot;' alias='Program Name' /></datasource></datasources>")
+
+
+def _workbook_with_param(ws):
+    return _workbook(ws).replace("<worksheets>", _V2_4_PARAM_DS + "<worksheets>", 1)
+
+
+def test_v2_4_param_dynamic_title_resolved_to_display_value():
+    # the core v2-4 win: a title weaving a parameter token resolves to the parameter's CURRENT
+    # display value and is KEPT as a static Power BI title (pre-v2-4 it was dropped entirely).
+    ws = _worksheet("SalesBy", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST,
+                    title="<run>Sales by </run><run>&lt;[Parameters].[p1]&gt;</run>")
+    res = migrate_twb_to_pbir(_workbook_with_param(ws), dataset_name="M", report_name="R")
+    assert res["ir"]["worksheets"][0]["title"] == "Sales by Program Name"
+    vco = _only_visual(res)["visual"]["visualContainerObjects"]
+    assert vco["title"][0]["properties"]["text"]["expr"]["Literal"]["Value"] == "'Sales by Program Name'"
+    assert any("resolved to its current parameter display value" in (w.get("reason") or "")
+               for w in res["warnings"])
+    blob = json.dumps(res["parts"])
+    assert "[Parameters]" not in blob and "&lt;" not in blob
+
+
+def test_v2_4_mixed_param_and_field_ref_title_still_dropped():
+    # v2-4 is conservative: when a field-ref (or runtime special) REMAINS after parameter
+    # substitution, the title is dropped -- stripping it would leave a dangling partial label -- so
+    # neither a partial resolve nor a raw token ever reaches the report.
+    ws = _worksheet("Mixed", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST,
+                    title=("<run>&lt;[Parameters].[p1]&gt;</run><run> for </run>"
+                           "<run>&lt;[federated.abc].[none:Category:nk]&gt;</run>"))
+    res = migrate_twb_to_pbir(_workbook_with_param(ws), dataset_name="M", report_name="R")
+    assert res["ir"]["worksheets"][0]["title"] is None
+    assert "visualContainerObjects" not in _only_visual(res)["visual"]
+    blob = json.dumps(res["parts"])
+    assert "Program Name" not in blob and "&lt;" not in blob
+
+
+def test_v2_4_resolved_param_title_keeps_its_parsed_style():
+    # a resolved dynamic title carries the title's authored font styling (title_style is computed
+    # whenever a dynamic title is captured, and survives resolution).
+    ws = _worksheet("Styled", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST,
+                    title="<run fontsize='18'>Sales by </run><run>&lt;[Parameters].[p1]&gt;</run>")
+    ir = parse_twb(_workbook_with_param(ws))
+    w = ir["worksheets"][0]
+    assert w["title"] == "Sales by Program Name"
+    assert w["title_style"] is not None
     # the common case (no authored title) leaves the visual untitled -> no container objects added.
     ws = _worksheet("Plain", "Bar",
                     rows="[federated.abc].[sum:Sales:qk]",
@@ -5655,14 +5883,16 @@ def test_card_label_colours_emit_category_and_data_label_objects():
     assert cat == "'{0}'".format(_SALES_HEX)
     assert val == "'{0}'".format(_PROFIT_HEX)
     assert size == "14D"
-    # Card display units (fidelity): the value object also pins labelDisplayUnits to None ('1D') so
-    # the recoloured big number is not abbreviated -- merged alongside the colour, never clobbering it.
-    assert objs["dataLabels"][0]["properties"]["labelDisplayUnits"]["expr"]["Literal"]["Value"] == "1D"
+    # A multiRowCard's value object is ``dataLabels`` (verified against ``formatting list-objects``),
+    # which -- unlike a ``card``'s ``labels`` -- has NO ``labelDisplayUnits`` channel, so display units
+    # are not (and cannot be) pinned on it. (A ``card`` pins them under ``labels`` -- see below.)
+    assert "labelDisplayUnits" not in objs["dataLabels"][0]["properties"]
 
 
-def test_card_without_recoloured_label_pins_display_units_none():
-    # A plain KPI card (no customized-label) carries no card_label_colors and no categoryLabels; its
-    # value object exists only to pin labelDisplayUnits to None ('1D') -- no colour / fontSize added.
+def test_multirow_card_without_recoloured_label_has_no_display_units():
+    # A plain two-measure KPI (no customized-label) -> a multiRowCard with no card_label_colors and no
+    # categoryLabels. Its value object ``dataLabels`` has no ``labelDisplayUnits`` channel, so none is
+    # pinned (a ``card``'s ``labels`` is where display units live -- see the single-measure test).
     ws = _worksheet("Plain KPIs", "Bar",
                     rows="[federated.abc].[sum:Sales:qk]",
                     cols="[federated.abc].[sum:Profit:qk]",
@@ -5670,33 +5900,71 @@ def test_card_without_recoloured_label_pins_display_units_none():
     ir = parse_twb(_workbook(ws))
     assert ir["worksheets"][0]["card_label_colors"] is None
     vj = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vj["visual"]["visualType"] == "multiRowCard"
     objs = vj["visual"].get("objects", {})
     assert "categoryLabels" not in objs
-    props = objs["dataLabels"][0]["properties"]
-    assert props["labelDisplayUnits"]["expr"]["Literal"]["Value"] == "1D"
-    assert "color" not in props and "fontSize" not in props
+    for entry in objs.get("dataLabels", []):
+        assert "labelDisplayUnits" not in entry.get("properties", {})
+    assert "labels" not in objs
 
 
 def test_single_measure_card_pins_display_units_none():
-    # A single measure with no dimension -> a "card" (not multiRowCard); it too pins None display units.
+    # A single measure with no dimension -> a "card" (not multiRowCard); its value object is ``labels``
+    # (NOT ``dataLabels`` -- that is multiRowCard's), which is where a card pins display units to None.
     ws = _worksheet("One KPI", "Bar",
                     rows="[federated.abc].[sum:Sales:qk]", cols="", deps_extra=_INST)
     vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
     assert vj["visual"]["visualType"] == "card"
     objs = vj["visual"]["objects"]
-    assert objs["dataLabels"][0]["properties"]["labelDisplayUnits"]["expr"]["Literal"]["Value"] == "1D"
+    assert objs["labels"][0]["properties"]["labelDisplayUnits"]["expr"]["Literal"]["Value"] == "1D"
+    assert "dataLabels" not in objs
 
 
 def test_non_card_visual_gets_no_card_display_units():
     # Additivity: display-units pinning is scoped to the card family; a bar/column visual with a real
-    # dimension never gains a dataLabels.labelDisplayUnits property.
+    # dimension never gains a card ``labels.labelDisplayUnits`` (nor a ``dataLabels`` one).
     ws = _worksheet("Sales by Cat", "Bar",
                     rows="[federated.abc].[sum:Sales:qk]",
                     cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
     vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
     assert vj["visual"]["visualType"] not in ("card", "multiRowCard")
-    for entry in vj["visual"].get("objects", {}).get("dataLabels", []):
-        assert "labelDisplayUnits" not in entry.get("properties", {})
+    objs = vj["visual"].get("objects", {})
+    for key in ("dataLabels", "labels"):
+        for entry in objs.get(key, []):
+            assert "labelDisplayUnits" not in entry.get("properties", {})
+
+
+# -- slicer header/items font -> textSize (not fontSize) -----------------------
+# A slicer ``header``/``items`` object's SIZE channel is ``textSize`` -- NOT the ``fontSize`` every
+# title/axis/grid channel uses. Emitting ``fontSize`` there is rejected by the PBIR validator
+# (``PBIR_FORMATTING_PROP_UNKNOWN``) and the caption silently clips. ``_slicer_font_props`` renames the
+# one divergent key while keeping every other font key identical to the shared builder.
+def test_slicer_font_props_renames_font_size_to_text_size():
+    from twb_to_pbir import _slicer_font_props
+    props = _slicer_font_props({"font_size": "10D", "font_color": "#203040",
+                                "bold": True, "font_family": "Segoe UI"})
+    assert "fontSize" not in props
+    assert props["textSize"]["expr"]["Literal"]["Value"] == "10D"
+    # every non-size key is unchanged from the shared font builder
+    assert props["fontColor"]["solid"]["color"]["expr"]["Literal"]["Value"] == "'#203040'"
+    assert props["bold"]["expr"]["Literal"]["Value"] == "true"
+    assert props["fontFamily"]["expr"]["Literal"]["Value"] == "'Segoe UI'"
+
+
+def test_apply_slicer_format_emits_text_size_and_header_caption():
+    from twb_to_pbir import _apply_slicer_format
+    visual = {}
+    _apply_slicer_format(visual, hdr_style={"font_size": "9D"}, itm_style={"font_size": "8D"},
+                         header_text="Program Issue Area")
+    hdr = visual["objects"]["header"][0]["properties"]
+    itm = visual["objects"]["items"][0]["properties"]
+    # SIZE key is textSize on both header and items; fontSize must NEVER appear on a slicer object
+    assert hdr["textSize"]["expr"]["Literal"]["Value"] == "9D"
+    assert itm["textSize"]["expr"]["Literal"]["Value"] == "8D"
+    assert "fontSize" not in hdr and "fontSize" not in itm
+    # the authored Tableau caption overrides the header Title text (shown, faithful name)
+    assert hdr["text"]["expr"]["Literal"]["Value"] == "'Program Issue Area'"
+    assert hdr["show"]["expr"]["Literal"]["Value"] == "true"
 
 
 # -- nativeQueryRef collision guard (sf-npo Lesson 2) --------------------------
@@ -5896,14 +6164,17 @@ def test_data_labels_absent_emits_nothing():
 
 
 def test_data_labels_on_card_not_applicable():
-    # A card already displays its value, so a label toggle on a card emits no labels object and no
-    # fact (the label types exclude card / table / matrix / map).
+    # A card already displays its value, so the data-label TOGGLE does not apply to a card: it emits no
+    # data-labels fact and no label-toggle ``show`` (the label types exclude card/table/matrix/map).
+    # (A card DOES carry a ``labels`` object, but only to pin display units to None -- a separate R5
+    # fidelity concern -- never a ``show`` toggle.)
     ws = _worksheet("KPI", "Text",
                     rows="[federated.abc].[sum:Sales:qk]", cols="",
                     deps_extra=_INST, pane_extra=_label_style(True))
     res = migrate_twb_to_pbir(_workbook(ws))
     vj = list(_visual_parts(res["parts"]).values())[0]
-    assert _labels_objects(vj) is None
+    for entry in (_labels_objects(vj) or []):
+        assert "show" not in entry.get("properties", {})
     assert _dl_fact(res["candidate_records"], "KPI") is None
 
 
@@ -7131,6 +7402,306 @@ def test_fill_less_textbox_is_transparent():
     run = vis["visual"]["objects"]["general"][0]["properties"]["paragraphs"][0]["textRuns"][0]
     assert "fontWeight" not in run["textStyle"]   # not bold
     assert run["textStyle"]["fontSize"] == "10pt"
+
+
+# Zone Geometry v2 slice 1: a thin caption/text zone sizes to one line of its OWN font instead of the
+# blanket 40px chart floor -- so a squashed caption band (Tableau authors them ~24-34px) renders its
+# text without being inflated into an overlap-inducing block. Charts/tables keep the 40px floor.
+_V2_MIN_SIZE_TWB = _workbook(
+    _worksheet("Trend", "Line", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+    "<dashboard name='Tidy'><size maxwidth='1400' maxheight='1000' /><zones>"
+    + _text_object_container(
+        # a worksheet (chart) zone authored thin (24px scaled) -- must STILL floor to 40
+        _text_object_ws_zone("Trend", x=0, y=40000, w=100000, h=2400, zid="2"),
+        # a caption authored equally thin (24px scaled) -- must size to content, NOT inflate to 40
+        _text_object_zone("Section Header", fill=None, color="#000000", bold=False,
+                          size=10, x=0, y=3000, w=40000, h=2400, zid="20"),
+    )
+    + "</zones></dashboard>",
+)
+
+
+def test_thin_caption_sizes_to_content_not_inflated_to_floor():
+    # Both the chart zone and the caption are authored at the same thin height (24px scaled). Before
+    # v2-1 both were floored to 40. Now the caption keeps its content height while the chart still
+    # floors -- proving the content-aware floor is caption-scoped and never lowers the chart floor.
+    res = migrate_twb_to_pbir(_V2_MIN_SIZE_TWB)
+    by_type = {}
+    for k, v in res["parts"].items():
+        if not k.endswith("visual.json"):
+            continue
+        vj = json.loads(v)
+        by_type.setdefault(vj["visual"]["visualType"], []).append(vj["position"]["height"])
+    caption_h = by_type["textbox"][0]
+    chart_h = by_type["lineChart"][0]
+    # caption is no longer inflated: sits at its authored/content height, strictly below the chart floor
+    assert caption_h < 40.0
+    assert caption_h == 24.0
+    # the generic chart/worksheet floor is unchanged (a thin chart zone still clamps up to 40)
+    assert chart_h == 40.0
+
+
+# v2-2 de-overlap fixtures: a caption Tableau floated ON TOP of the chart it labels (overlapping in
+# 100000-space, so overlapping in emitted px) vs. a caption already sitting in a clear band above it.
+_V2_DEOVERLAP_TWB = _workbook(
+    _worksheet("Trend", "Line", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+    "<dashboard name='Messy'><size maxwidth='1000' maxheight='1000' /><zones>"
+    + _text_object_container(
+        # chart fills the lower canvas (px y 400..900)
+        _text_object_ws_zone("Trend", x=0, y=40000, w=100000, h=50000, zid="2"),
+        # a narrow caption floated mid-chart (px y 450) -- must be lifted clear of the chart
+        _text_object_zone("Chart Label", fill=None, color="#000000", bold=False,
+                          size=10, x=10000, y=45000, w=30000, h=4000, zid="20"),
+    )
+    + "</zones></dashboard>",
+)
+
+_V2_CLEAR_CAPTION_TWB = _workbook(
+    _worksheet("Trend", "Line", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+    "<dashboard name='Clean'><size maxwidth='1000' maxheight='1000' /><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("Trend", x=0, y=40000, w=100000, h=50000, zid="2"),
+        # caption sits in a CLEAR band above the chart (px y 100) -- the gate must leave it untouched
+        _text_object_zone("Header", fill=None, color="#000000", bold=False,
+                          size=10, x=0, y=10000, w=30000, h=4000, zid="20"),
+    )
+    + "</zones></dashboard>",
+)
+
+
+def _rect(vj):
+    p = vj["position"]
+    return (p["x"], p["y"], p["width"], p["height"])
+
+
+def _inter_area(a, b):
+    ix = max(0.0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
+    return ix * iy
+
+
+def test_caption_overlapping_chart_is_lifted_clear():
+    # A caption Tableau floated on top of its chart overlaps in the source; after the v2-2 tidy pass
+    # it is relocated OFF the chart (into the clear band directly above the anchor it labels).
+    res = migrate_twb_to_pbir(_V2_DEOVERLAP_TWB)
+    vis = [json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")]
+    cap = next(v for v in vis if v["visual"]["visualType"] == "textbox")
+    chart = next(v for v in vis if v["visual"]["visualType"] == "lineChart")
+    cr, hr = _rect(cap), _rect(chart)
+    # caption no longer sits on the chart, and specifically was lifted ABOVE it
+    assert _inter_area(cr, hr) <= 1.0
+    assert cr[1] + cr[3] <= hr[1] + 1.0
+
+
+def test_clear_caption_is_untouched_by_deoverlap():
+    # A caption already in a clear band must be byte-identical: the never-regress gate returns early
+    # on a page with no caption<->anchor overlap, so the caption keeps its exact scaled position.
+    res = migrate_twb_to_pbir(_V2_CLEAR_CAPTION_TWB)
+    vis = [json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")]
+    cap = next(v for v in vis if v["visual"]["visualType"] == "textbox")
+    chart = next(v for v in vis if v["visual"]["visualType"] == "lineChart")
+    # authored (x=0, y=10000) in 100000-space on a 1000px canvas -> exactly (0.0, 100.0), unmoved
+    assert cap["position"]["x"] == 0.0
+    assert cap["position"]["y"] == 100.0
+    # and it never overlapped the chart to begin with (so the gate had nothing to do)
+    assert _inter_area(_rect(cap), _rect(chart)) <= 1.0
+
+
+# -- Zone Geometry v2 slice 3: caption-only worksheet -> textbox --------------------------------
+# A dashboard-placed worksheet whose ONLY content is its title (a thin status / refresh /
+# filter-breadcrumb bar: no rows, no cols, no plottable mark channel) classifies as VT_UNSUPPORTED.
+# Before v2-3 it was dropped, leaving the labelled band empty (the "a thin view doesn't generate at
+# all" defect). Now it is rebuilt as a textbox at its authored zone. The fixture pairs one such
+# caption-only worksheet with a real line chart on the same dashboard, so the same run proves BOTH
+# the rebuild AND that a genuine chart is never mistaken for a caption (gate precision).
+_V2_CAPTION_ONLY_STATIC = _workbook(
+    _worksheet("data update", "Text", rows="", cols="",
+               title="<run>Data as of 2024 | Rows =</run>")
+    + _worksheet("Trend", "Line", "[federated.abc].[sum:Sales:qk]",
+                 "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+    "<dashboard name='Board'><size maxwidth='1400' maxheight='1000' /><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("data update", x=0, y=0, w=100000, h=4000, zid="2"),
+        _text_object_ws_zone("Trend", x=0, y=40000, w=100000, h=50000, zid="3"),
+    )
+    + "</zones></dashboard>",
+)
+
+# A caption whose text carries a dynamic Tableau field-reference token (an escaped &lt;...&gt; run):
+# the value cannot be reproduced statically, so it renders BLANK while the static label scaffold is
+# kept -- and the run discloses that honestly rather than pretending the live value was reproduced.
+_V2_CAPTION_ONLY_DYNAMIC = _workbook(
+    _worksheet("status bar", "Text", rows="", cols="",
+               title="<run>Region : &lt;[federated.abc].[none:Region:nk]&gt; | Count =</run>")
+    + _worksheet("Trend", "Line", "[federated.abc].[sum:Sales:qk]",
+                 "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+    "<dashboard name='Board2'><size maxwidth='1400' maxheight='1000' /><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("status bar", x=0, y=0, w=100000, h=4000, zid="2"),
+        _text_object_ws_zone("Trend", x=0, y=40000, w=100000, h=50000, zid="3"),
+    )
+    + "</zones></dashboard>",
+)
+
+
+def _textbox_text(vj):
+    paras = vj["visual"]["objects"]["general"][0]["properties"]["paragraphs"]
+    runs = []
+    for para in paras:
+        for r in para.get("textRuns", []):
+            val = r.get("value")
+            runs.append(val if isinstance(val, str) else "")
+    return "".join(runs)
+
+
+def test_caption_only_worksheet_flagged_in_ir():
+    # The caption-only worksheet is classed unsupported yet carries a resolved caption; the real
+    # chart worksheet is NOT flagged (the gate keys on "no plottable mark", not merely on the title).
+    ir = parse_twb(_V2_CAPTION_ONLY_STATIC)
+    by = {w["name"]: w for w in ir["worksheets"]}
+    assert by["data update"]["visual_type"] == "unsupported"
+    assert by["data update"]["caption_only_text"] == "Data as of 2024 | Rows ="
+    assert by["Trend"]["visual_type"] == "line"
+    assert not by["Trend"].get("caption_only_text")
+
+
+def test_caption_only_worksheet_emits_textbox_at_its_zone():
+    # The dashboard band is rebuilt as a textbox carrying the caption, at the caption zone (top,
+    # y=0), sized by the caption-content floor (never the 40px chart floor inflating a thin bar).
+    res = migrate_twb_to_pbir(_V2_CAPTION_ONLY_STATIC)
+    vis = [json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")]
+    caps = [v for v in vis if v["visual"]["visualType"] == "textbox"
+            and "Data as of 2024" in _textbox_text(v)]
+    assert len(caps) == 1
+    cap = caps[0]
+    # placed at the authored caption zone: top of canvas, full width (4000/100000*1000 -> 40px tall)
+    assert cap["position"]["y"] == 0.0
+    assert cap["position"]["x"] == 0.0
+    assert cap["position"]["width"] == 1400.0
+    # a positive, honest rebuild disclosure is surfaced (static caption -> no "render blank" caveat)
+    reasons = [w["reason"] for w in res["warnings"]
+               if w.get("name") == "data update" and "caption-only worksheet rebuilt" in w["reason"]]
+    assert len(reasons) == 1
+    assert "static caption" in reasons[0]
+
+
+def test_chart_worksheet_never_rebuilt_as_caption_textbox():
+    # Gate precision: the genuine line chart on the same dashboard stays a lineChart -- it is never
+    # collapsed into a caption textbox (which would silently drop a real visual).
+    res = migrate_twb_to_pbir(_V2_CAPTION_ONLY_STATIC)
+    vis = [json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")]
+    assert any(v["visual"]["visualType"] == "lineChart" for v in vis)
+    # and no textbox accidentally carries the chart's own data
+    charts_as_text = [v for v in vis if v["visual"]["visualType"] == "textbox"
+                      and "Trend" == v.get("name")]
+    assert charts_as_text == []
+
+
+def test_dynamic_caption_renders_blank_values_with_honest_disclosure():
+    # A caption built from a live field reference keeps its static labels but blanks the value slot
+    # (Power BI cannot reproduce the Tableau runtime value); the rebuild warning says so plainly.
+    res = migrate_twb_to_pbir(_V2_CAPTION_ONLY_DYNAMIC)
+    vis = [json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")]
+    caps = [v for v in vis if v["visual"]["visualType"] == "textbox"
+            and _textbox_text(v).startswith("Region :")]
+    assert len(caps) == 1
+    text = _textbox_text(caps[0])
+    # the label scaffold survives; the field-ref value slot is blank (no raw <...> token leaks)
+    assert "Region :" in text and "Count =" in text
+    assert "<" not in text and ">" not in text
+    assert "federated" not in text
+    reasons = [w["reason"] for w in res["warnings"]
+               if w.get("name") == "status bar" and "caption-only worksheet rebuilt" in w["reason"]]
+    assert len(reasons) == 1
+    assert "render blank" in reasons[0]
+
+
+# --- Zone Geometry v2 slice 5: emit-boundary sentinel / mojibake scrub ---------------------------
+_SENT = "\u00c6"       # Tableau's soft/hard line-break sentinel (a reused Latin 'Æ')
+_FFFD = "\ufffd"       # Unicode replacement char (undecodable-byte mojibake)
+
+
+def test_v2_5_scrub_sentinels_contract():
+    # Pin the helper contract: the sentinel is scrubbed ONLY where it marks a break (immediately
+    # before a newline, or at end of text); a legitimate 'Æ' letter is preserved mid-word / leading;
+    # U+FFFD mojibake is always dropped; non-strings and clean strings pass through untouched.
+    assert _scrub_sentinels("New Inbound" + _SENT + "\nReferrals") == "New Inbound\nReferrals"
+    assert _scrub_sentinels("Referrals" + _SENT) == "Referrals"
+    assert _scrub_sentinels("A" + _SENT + "\nB" + _SENT) == "A\nB"
+    # the crucial over-scrub guard: a real 'Æ' letter (Danish/Norwegian) is never touched
+    assert _scrub_sentinels("\u00c6r\u00f8 Municipality") == "\u00c6r\u00f8 Municipality"
+    assert _scrub_sentinels("visited " + _SENT + "R zone") == "visited " + _SENT + "R zone"
+    assert _scrub_sentinels("Total" + _FFFD + "Sales") == "TotalSales"
+    assert _scrub_sentinels("clean title") == "clean title"
+    assert _scrub_sentinels(123) == 123  # non-string passthrough
+
+
+def test_v2_5_semantic_string_literal_scrubs_sentinels():
+    # every Literal-bound string flows through _semantic_string_literal, so a stray sentinel / mojibake
+    # can never reach an emitted Literal Value -- while a legitimate 'Æ' letter survives verbatim.
+    assert _semantic_string_literal("New Inbound" + _SENT + "\nReferrals") == "'New Inbound\nReferrals'"
+    assert _semantic_string_literal("Total" + _FFFD + "Sales") == "'TotalSales'"
+    assert _semantic_string_literal("\u00c6r\u00f8 Region") == "'\u00c6r\u00f8 Region'"
+
+
+def _caption_only_sentinel_workbook(title):
+    # a caption-only worksheet (thin band, no plottable mark) whose title carries the sentinel, above a
+    # real chart -- mirrors the multiline-caption case that leaked a literal 'Æ' onto the page (D5).
+    return _workbook(
+        _worksheet("hdr bar", "Text", rows="", cols="", title="<run>" + title + "</run>")
+        + _worksheet("Trend", "Line", "[federated.abc].[sum:Sales:qk]",
+                     "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+        "<dashboard name='Board'><size maxwidth='1400' maxheight='1000' /><zones>"
+        + _text_object_container(
+            _text_object_ws_zone("hdr bar", x=0, y=0, w=100000, h=4000, zid="2"),
+            _text_object_ws_zone("Trend", x=0, y=40000, w=100000, h=50000, zid="3"),
+        )
+        + "</zones></dashboard>",
+    )
+
+
+def test_v2_5_caption_only_multiline_sentinel_scrubbed_at_emit():
+    # the D5 fix end-to-end: a two-line caption "New Inbound<Æ>\nReferrals" rebuilds as a textbox whose
+    # hard break survives as two paragraphs, with NO literal 'Æ' anywhere in the emitted report.
+    res = migrate_twb_to_pbir(_caption_only_sentinel_workbook("New Inbound" + _SENT + "\nReferrals"))
+    vis = [json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")]
+    caps = [v for v in vis if v["visual"]["visualType"] == "textbox"
+            and "New Inbound" in _textbox_text(v)]
+    assert len(caps) == 1
+    paras = caps[0]["visual"]["objects"]["general"][0]["properties"]["paragraphs"]
+    assert len(paras) == 2                     # the hard break is preserved as two paragraphs
+    assert _textbox_text(caps[0]) == "New InboundReferrals"
+    assert _SENT not in json.dumps(res["parts"], ensure_ascii=False)  # never leaks into the report
+
+
+def test_v2_5_supported_visual_title_sentinel_scrubbed():
+    # the sentinel-scrub also covers the container-title path (via _semantic_string_literal): a static
+    # worksheet title carrying mojibake emits a clean title Literal with no U+FFFD.
+    ws = _worksheet("Titled", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST,
+                    title="<run>Total" + _FFFD + " Sales</run>")
+    res = migrate_twb_to_pbir(_workbook(ws))
+    val = _only_visual(res)["visual"]["visualContainerObjects"]["title"][0]["properties"]["text"]["expr"]["Literal"]["Value"]
+    assert val == "'Total Sales'"
+    assert _FFFD not in json.dumps(res["parts"], ensure_ascii=False)
+
+
+def test_v2_5_legitimate_ae_letter_survives_in_title():
+    # over-scrub guard end-to-end: a title with a real 'Æ' letter (not a break sentinel) is emitted
+    # verbatim -- the scrub must never corrupt legitimate Danish/Norwegian text.
+    ws = _worksheet("Nordic", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST,
+                    title="<run>\u00c6r\u00f8 Sales</run>")
+    res = migrate_twb_to_pbir(_workbook(ws))
+    val = _only_visual(res)["visual"]["visualContainerObjects"]["title"][0]["properties"]["text"]["expr"]["Literal"]["Value"]
+    assert val == "'\u00c6r\u00f8 Sales'"
 
 
 def test_banner_only_dashboard_never_regresses():

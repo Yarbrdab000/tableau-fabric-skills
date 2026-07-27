@@ -18,10 +18,11 @@ the two static defects the Microsoft ``powerbi-report-author validate`` CLI flag
 
 Plus two FIDELITY / VALIDITY guards on the emitter's own output:
 
-  3. CARD DISPLAY UNITS (R5) -- a ``card`` / ``multiRowCard`` must pin its value ``labelDisplayUnits``
+  3. CARD DISPLAY UNITS (R5) -- a ``card`` must pin its value object ``labels.labelDisplayUnits``
      to None (``1D``). Power BI defaults it to Auto (0), which abbreviates the big number
      (2,747 -> "3K"); this guard catches a regression that leaves it Auto or unset, so a migrated KPI
-     never silently abbreviates versus the Tableau text / BAN mark.
+     never silently abbreviates versus the Tableau text / BAN mark. (A ``multiRowCard``'s value object
+     ``dataLabels`` has no display-units channel, so R5 is scoped to ``card`` only.)
   4. NATIVE QUERY REF UNIQUENESS (R6) -- every projection in ONE visual's ``queryState`` must carry a
      DISTINCT ``nativeQueryRef``. Two fields from different tables that share a column name (e.g.
      ``Program[Name]`` + ``Service[Name]``) otherwise both serialize ``'Name'`` and the visual query
@@ -110,21 +111,24 @@ def _lint_visual_types(parts):
     return problems
 
 
-# Card value display units (fidelity R5): a Power BI ``card`` / ``multiRowCard`` defaults its
-# big-number ``labelDisplayUnits`` to Auto (0), which ABBREVIATES (2,747 -> "3K"). Setting it to
-# Auto (0) does NOT disable the abbreviation -- "None" is the enum value 1 (emitted as ``1D``). The
-# emitter forces None on every rebuilt card (see ``twb_to_pbir._apply_card_display_units``); this
-# guard catches a regression that drops it or leaves Auto, so a migrated KPI never silently
-# abbreviates its value versus the Tableau text / BAN mark.
-_CARD_VISUAL_TYPES = frozenset({"card", "multiRowCard"})
+# Card value display units (fidelity R5): a Power BI ``card`` defaults its big-number
+# ``labelDisplayUnits`` to Auto (0), which ABBREVIATES (2,747 -> "3K"). Setting it to Auto (0) does
+# NOT disable the abbreviation -- "None" is the enum value 1 (emitted as ``1D``). The emitter forces
+# None on every rebuilt ``card`` via its value object ``labels`` (see
+# ``twb_to_pbir._apply_card_display_units``); this guard catches a regression that drops it or leaves
+# Auto, so a migrated KPI never silently abbreviates its value versus the Tableau text / BAN mark. A
+# ``multiRowCard``'s value object is ``dataLabels``, which has NO ``labelDisplayUnits`` channel
+# (verified against ``formatting describe-object multiRowCard dataLabels``), so display units cannot be
+# pinned there and R5 is inapplicable to it -- the guard is scoped to ``card`` only.
+_CARD_DISPLAY_UNITS_TYPE = "card"
 
 
 def _card_value_units(visual):
-    """The card value's ``labelDisplayUnits`` literal string (e.g. ``'1D'``), or ``None`` if unset."""
+    """The ``card`` value's ``labels.labelDisplayUnits`` literal string (e.g. ``'1D'``), or ``None``."""
     objs = visual.get("objects")
     if not isinstance(objs, dict):
         return None
-    for entry in (objs.get("dataLabels") or []):
+    for entry in (objs.get("labels") or []):
         props = entry.get("properties") if isinstance(entry, dict) else None
         if not isinstance(props, dict):
             continue
@@ -152,12 +156,12 @@ def _lint_card_display_units(parts):
             continue
         doc = _load_json(parts, path)
         visual = doc.get("visual") if isinstance(doc, dict) else None
-        if not isinstance(visual, dict) or visual.get("visualType") not in _CARD_VISUAL_TYPES:
+        if not isinstance(visual, dict) or visual.get("visualType") != _CARD_DISPLAY_UNITS_TYPE:
             continue
         units = _card_value_units(visual)
         if units is None or _units_is_auto(units):
             problems.append(
-                "%s: %s visual must set dataLabels.labelDisplayUnits to None ('1D'); Auto (0) "
+                "%s: %s visual must set labels.labelDisplayUnits to None ('1D'); Auto (0) "
                 "silently abbreviates the big number (2,747 -> '3K'), breaking fidelity vs the "
                 "Tableau text mark" % (path, visual.get("visualType")))
     return problems
