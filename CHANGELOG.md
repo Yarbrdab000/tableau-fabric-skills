@@ -13,6 +13,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.6.0` → `2.7.0`): Zone Geometry v2 slice 7 — geometry lock-in golden
+  tests (composite-group-aware overlap auditor; donut-stack exemption).** A committed regression net for
+  dashboard *layout quality* that formalizes the previously-untracked scratch geometry audit into
+  permanent pytest goldens. It locks in the hard invariants on clean pages — **0 overlaps / 0 phantom
+  containment / 0 out-of-bounds** — while deliberately **not** freezing exact coordinates (arrangement
+  stays flexible; completeness, correct numbers, and faithful graphs are the non-negotiables, placement
+  is not). The auditor ports the exact defect algorithm from the scratch tool (TOL=1.0; a squashed-zone
+  floor at ≤41px; a pairwise overlap once the intersection exceeds 2% of the smaller rect; full-nesting
+  classified as containment) and is **composite-group-aware**: two Power BI visuals that share a
+  PBIR-native `parentGroupName` (e.g. a future donut emitted as a ring + a center KPI card intentionally
+  stacked in the hole) are exempt from intra-group overlap flagging, so a faithful donut is never
+  mis-reported as a defect — while an *ungrouped* stray overlap is still caught. Ships **test-only /
+  additive** — the migration engine (`twb_to_pbir.py`) is byte-identical, so no migration output can
+  change. Includes synthetic clean-page fixtures plus an **opt-in real-workbook golden**
+  (`TFMIG_GEOM_GOLDEN_TWB=<path/to/.twb>`) that asserts every emitted dashboard page is overlap-free —
+  honoring "Superstore must stay 0 overlaps" without committing any workbook or extract. Rollback anchor
+  `rollback/pre-v2.7.0`.
 - **tableau-migration (skill `2.5.0` → `2.6.0`): Zone Geometry v2 slice 5 — emit-boundary line-break
   sentinel / mojibake scrub (no more stray `Æ` or `�` on the page).** Tableau reuses the Latin letter
   `Æ` (U+00C6) as a soft/hard line-break sentinel inside formatted-text runs, and can leave a U+FFFD
