@@ -12,6 +12,8 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
+import geometry_audit
+
 from twb_to_pbir import (
     MEASURES_TABLE,
     PAGE_HEIGHT,
@@ -7917,81 +7919,17 @@ def test_image_objects_never_regress_when_resources_none():
 # overlap BETWEEN two same-group members as intentional and never counts it, while every cross-group
 # or ungrouped collision is still a defect. No emitter sets the marker today (donut is a single native
 # donutChart), so the exemption is proven here on synthetic dicts and stands ready for that feature.
-_V27_TOL = 1.0
-
-
-def _v27_rect(vj):
-    p = vj["position"]
-    return (p["x"], p["y"], p.get("width", 0) or 0, p.get("height", 0) or 0)
-
-
-def _v27_inter(a, b):
-    ix = max(0.0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
-    iy = max(0.0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
-    return ix * iy
-
-
-def _v27_contains(a, b, tol=_V27_TOL):
-    return (b[0] >= a[0] - tol and b[1] >= a[1] - tol and
-            b[0] + b[2] <= a[0] + a[2] + tol and b[1] + b[3] <= a[1] + a[3] + tol)
-
-
-def _v27_composite_group_of(vj):
-    """The composite-group id a visual declares, or None.
-
-    Forward contract: the engine stamps every member of a deliberately-stacked composite (e.g. a
-    donut ring + its centre KPI card) with a shared PBIR ``parentGroupName``. An overlap between two
-    members of the SAME group is intentional and exempt; everything else is a real collision."""
-    g = vj.get("parentGroupName")
-    return g if g else None
-
-
-def _v27_geometry_defects(visuals, page_w, page_h):
-    """The scratch audit's exact per-page defect catalogue, made composite-group-aware."""
-    import collections as _c
-    d = _c.Counter()
-    for v in visuals:
-        r = _v27_rect(v)
-        if (r[0] < -_V27_TOL or r[1] < -_V27_TOL
-                or (page_w and r[0] + r[2] > page_w + _V27_TOL)
-                or (page_h and r[1] + r[3] > page_h + _V27_TOL)):
-            d["oob"] += 1
-        if r[2] <= 41.0 or r[3] <= 41.0:
-            d["floor"] += 1
-    import itertools as _it
-    for a, b in _it.combinations(visuals, 2):
-        ga, gb = _v27_composite_group_of(a), _v27_composite_group_of(b)
-        if ga is not None and ga == gb:
-            continue  # intentional composite (donut ring + centre card): exempt by design
-        ra, rb = _v27_rect(a), _v27_rect(b)
-        ia = _v27_inter(ra, rb)
-        if ia <= 4.0:
-            continue
-        small = min(ra[2] * ra[3], rb[2] * rb[3]) or 1
-        frac = ia / small
-        if _v27_contains(ra, rb) or _v27_contains(rb, ra):
-            d["contain"] += 1
-        elif frac > 0.02:
-            d["overlaps"] += 1
-    return d
-
-
-def _v27_pages(parts):
-    """Group emitted parts into {page_name: {display, w, h, visuals[]}} (skips the pages.json index)."""
-    pages = {}
-    for path, txt in parts.items():
-        norm = path.replace("\\", "/")
-        if norm.endswith("/page.json"):
-            name = norm.split("/pages/")[1].split("/")[0]
-            doc = json.loads(txt)
-            pg = pages.setdefault(name, {"display": name, "w": None, "h": None, "visuals": []})
-            pg["w"], pg["h"] = doc.get("width"), doc.get("height")
-            pg["display"] = doc.get("displayName") or name
-        elif norm.endswith("/visual.json"):
-            name = norm.split("/pages/")[1].split("/")[0]
-            pg = pages.setdefault(name, {"display": name, "w": None, "h": None, "visuals": []})
-            pg["visuals"].append(json.loads(txt))
-    return pages
+# The v2.7.0 geometry auditor was PROMOTED to ``scripts/geometry_audit.py`` in Zone Geometry v3
+# slice 3 so the A/B harness can score both engines from outside the test suite. Re-import the exact
+# same functions here under their original private names, so every golden below runs byte-for-byte
+# unchanged against the single shared implementation (a pure move -- no thresholds changed).
+_V27_TOL = geometry_audit.TOL
+_v27_rect = geometry_audit.rect
+_v27_inter = geometry_audit.intersection_area
+_v27_contains = geometry_audit.contains
+_v27_composite_group_of = geometry_audit.composite_group_of
+_v27_geometry_defects = geometry_audit.geometry_defects
+_v27_pages = geometry_audit.pages_from_parts
 
 
 def _v27_defects_for(parts, display):

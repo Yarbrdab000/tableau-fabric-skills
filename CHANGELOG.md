@@ -13,6 +13,37 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.11.0` → `2.12.0`): geometry auditor promoted + A/B harness — Zone
+  Geometry v3 slice 3 (`scripts/geometry_audit.py` + `tests/test_geometry_audit.py`, no emit change).**
+  The v2.7.0 per-page layout-defect auditor — previously buried inside `tests/test_twb_to_pbir.py` — is
+  promoted verbatim to a reusable module (`geometry_defects` / `rect` / `intersection_area` / `contains`
+  / `composite_group_of` / `pages_from_parts` / `score_report`, plus a `python scripts/geometry_audit.py
+  <report.Report dir> [--json]` CLI). A **pure move, thresholds unchanged** (`TOL=1.0`, the > 2 % overlap
+  floor, the 4 px raw-intersection gate, the ≤ 41 px squash floor, full-nesting classified as
+  containment, the donut composite-group exemption); the test file re-imports it under its original
+  names so every v2.7.0 golden runs byte-for-byte unchanged, and 23 new unit tests pin the thresholds,
+  the part-map/directory plumbing, and the CLI. **The point of the slice was to be able to score both
+  engines from outside the suite — and the first run of the A/B harness across the six-workbook corpus
+  produced a load-bearing finding that redirects the roadmap:**
+
+  | engine | overlaps | contain | oob | floor |
+  |---|---|---|---|---|
+  | legacy (shipped) | 0 | 1 | 0 | 31 |
+  | solver projection | 32 | 93 | 9 | 49 |
+
+  The solver's flow guarantee is intact — **flow-sibling overlaps are 0 on all 13 dashboards**, exactly as
+  slice 2 proved — but **every dashboard in the corpus is frame-rooted** (a top-level Tableau
+  `layout-basic` wrapping the flow subtrees). A frame positions children by scaled *source* rect, not by
+  flow, so the solver faithfully reproduces Tableau's absolute geometry **including its overlaps**, and
+  the defect totals are dominated by decoration the legacy path already resolves via z-order / title-merge
+  / deoverlap (e.g. SF-Admin "Access View" has 26 leaves including one **full-page background bitmap** that
+  alone "contains" nearly everything). **Conclusion recorded for the next track:** the flow solver is the
+  correct substrate for flow subtrees but does not by itself move real-dashboard defect counts; the
+  load-bearing work is frame/absolute positioning + z-order/background awareness (the deferred quality
+  track). Wiring the solver into emit and flipping the default before that work exists would regress the
+  corpus, so the roadmap pivots to the frame path next. The A/B harness itself is a session artifact and
+  is **not shipped**; `geometry_audit.py` does not import `twb_to_pbir` and nothing in the engine imports
+  it, so **migration output is byte-identical.**
 - **tableau-migration (skill `2.10.0` → `2.11.0`): layout solver — Zone Geometry v3 slice 2
   (`scripts/layout_solve.py` + `tests/test_layout_solve.py`, solver-only, no emit change).** Second slice
   of the layout-tree rewrite: a pure, deterministic, stdlib-only two-pass flexbox solver that resolves the
