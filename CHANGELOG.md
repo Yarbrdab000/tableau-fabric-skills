@@ -13,6 +13,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.9.0` → `2.10.0`): zone-tree parser — Zone Geometry v3 slice 1
+  (`scripts/zone_tree.py`, parse-only, no emit change).** First slice of the layout-tree rewrite that
+  replaces the legacy "scale absolute rects then repair overlaps" path with a deterministic flow-layout
+  compiler, so dashboard-visual overlap becomes structurally impossible instead of detected-and-patched.
+  `parse_zone_tree(db, device_zones)` reconstructs a Tableau dashboard's `<zones>` element into a nested
+  tree of `vstack` / `hstack` / `frame` / `leaf` nodes (each carrying its absolute source rect, its share
+  of the parent's main axis, fixed-size pixels, float/hidden flags, leaf-kind, and the backing Element),
+  hoists floating subtrees into a flat list, preserves the `<devicelayouts>` exclusion, and **fails
+  CLOSED to `None` (never raises)** when the zones are not a recognizable overlap-free flow tree (no
+  `<zones>`, empty root, zero-sized flow axis, genuine flexible-sibling source overlap, or malformed
+  depth). The premise check is **fixed-size-aware**: a raw-source overlap involving an `is-fixed` zone is
+  a benign persistence artifact (the ATTI z84 band's stored rect is nominal, not the resolved layout —
+  the exact source of the legacy path's un-repairable overlap), while two *flexible* tiled siblings
+  overlapping is a genuine violation. A companion `audit_source_overlaps` diagnostic buckets overlaps
+  into genuine vs fixed-artifact without fail-closing, for A/B harnessing. **The engine
+  (`twb_to_pbir.py`) is byte-identical — nothing imports the parser yet**, so no migration output can
+  change (deliberate, given the rollback-sensitivity of core geometry). +16 tests (15 active: tree shape /
+  kinds / fractions / leaf-kind taxonomy / float hoist / devicelayouts exclusion / fixed-size-benign vs
+  flexible-genuine premise / every fail-closed trigger returns `None` without raising; 1 opt-in real-.twb
+  premise golden `TFMIG_ZONE_TREE_TWB`, proven against ATTI's 3 dashboards = 0 genuine overlaps).
 - **tableau-migration (skill `2.8.0` → `2.9.0`): standard-geography multipolygon → `shapeMap` recovery
   (map slice v2-6).** A Tableau **filled** map of a recognized geography serialises as a `Multipolygon`
   (sometimes `Polygon`) mark with the generated lat/lon and/or a `<geometry>` encoding — an ordinary
