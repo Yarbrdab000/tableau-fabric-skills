@@ -7972,11 +7972,15 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             warnings.append(_warn("dashboard", db["name"],
                                   "no supported visuals on this dashboard"))
             continue
-        # Tidy pass (v2-2): relocate any floating caption textbox (z=900) that Tableau floated on
-        # top of the content it labels into a clear band (prefer directly above the anchor). Gated
-        # to a no-op on a page with no caption<->anchor overlap, so cleanly tiled dashboards are
-        # byte-identical. Runs last, after images (z=1100) are placed, so every anchor is final.
-        _deoverlap_captions(visuals, _page_w(), _page_h())
+        # Tidy pass (v2-2 / v2-8): relocate any floating caption textbox (z=900) that Tableau floated
+        # on top of the content it labels into a clear band (prefer directly above the anchor); on a
+        # packed page with no clear strip, OPEN a band by pushing content down (v2-8) and grow the
+        # page to keep it in-bounds. Gated to a no-op on a page with no caption<->anchor overlap, so
+        # cleanly tiled dashboards are byte-identical. Runs last, after images (z=1100) are placed, so
+        # every anchor is final. The page is FitToPage, so a taller canvas just rescales to the viewport.
+        _grown_h = _deoverlap_captions(visuals, _page_w(), _page_h())
+        if _grown_h and _grown_h > _page_h():
+            _PAGE_H_OVERRIDE = _grown_h
         _emit_page(parts, page_name, db["name"] or page_name, visuals)
         page_order.append(page_name)
 
@@ -8406,7 +8410,7 @@ def _deoverlap_captions(visuals, page_w, page_h, *, gap=8.0, tol=1.0, min_frac=0
     caps = [v for v in visuals if (v.get("position") or {}).get("z") == 900]
     anchors = [v for v in visuals if (v.get("position") or {}).get("z") != 900]
     if not caps or not anchors:
-        return
+        return page_h
 
     def _r(v):
         p = v["position"]
@@ -8424,7 +8428,7 @@ def _deoverlap_captions(visuals, page_w, page_h, *, gap=8.0, tol=1.0, min_frac=0
 
     # Gate: do nothing unless at least one caption actually sits on an anchor.
     if not any(_hits(_r(c)) for c in caps):
-        return
+        return page_h
 
     caps.sort(key=lambda v: (v["position"]["y"], v["position"]["x"]))
 
@@ -8467,6 +8471,75 @@ def _deoverlap_captions(visuals, page_w, page_h, *, gap=8.0, tol=1.0, min_frac=0
                 cap["position"]["x"] = round(x, 2)
                 cap["position"]["y"] = round(y, 2)
                 break
+
+    # v2-8 band-insertion fallback. On a PACKED page every horizontal strip is occupied, so the
+    # relocation loop above finds NO clear candidate and leaves the caption stuck on top of the
+    # content it labels -- the real-workbook overlap defect. Rather than inherit that overlap, OPEN a
+    # band for the caption: shift the content block it heads (and everything beneath) straight DOWN by
+    # the caption's height + gap, then seat the caption in the cleared strip directly above that
+    # block. Only ``y`` changes and only ever downward; nothing is resized or dropped, so completeness
+    # and every side-by-side (horizontal) arrangement are preserved. Side-by-side captions that head
+    # the SAME band (e.g. the left/right headers of a two-up crosstab) share ONE inserted band instead
+    # of stacking. The page grows to keep the pushed content in-bounds -- the page is emitted
+    # ``FitToPage``, so a taller canvas simply rescales to the viewport (no scrollbar). Deterministic:
+    # stuck captions are processed top-to-bottom against LIVE positions so successive insertions
+    # compose; a caption whose opened band would clip a non-shifting item above it is left untouched
+    # (never made worse), and the loop is hard-bounded so it always terminates.
+    def _line_for(cap):
+        cr = _r(cap)
+        hits = _hits(cr)
+        if not hits:
+            return None
+        tops = [_r(a)[1] for a, _ in hits]
+        below = [t for t in tops if t >= cr[1] - tol]
+        return round(min(below) if below else min(tops), 2)
+
+    skip = set()
+    _iter = 0
+    while _iter < len(caps) * 2 + 4:
+        _iter += 1
+        stuck = [c for c in caps if id(c) not in skip and _line_for(c) is not None]
+        if not stuck:
+            break
+        stuck.sort(key=lambda v: (v["position"]["y"], v["position"]["x"]))
+        line = _line_for(stuck[0])
+        # Group every stuck caption that heads this same band and does not horizontally collide with an
+        # already-grouped member, so a row of side-by-side headers opens a single shared band.
+        group, spans = [], []
+        for c in stuck:
+            if _line_for(c) != line:
+                continue
+            cx0 = c["position"]["x"]
+            cx1 = cx0 + c["position"]["width"]
+            if any(not (cx1 <= sx0 + tol or cx0 >= sx1 - tol) for sx0, sx1 in spans):
+                continue
+            group.append(c)
+            spans.append((cx0, cx1))
+        gx0 = min(s[0] for s in spans)
+        gx1 = max(s[1] for s in spans)
+        delta = round(max(c["position"]["height"] for c in group) + gap, 2)
+        # Guard: never open a band that would clip a non-shifting item straddling the insertion line.
+        clip = any(
+            (not any(v is g for g in group))
+            and v["position"]["y"] < line - tol
+            and v["position"]["y"] + v["position"]["height"] > line + tol
+            and not (v["position"]["x"] + v["position"]["width"] <= gx0 + tol
+                     or v["position"]["x"] >= gx1 - tol)
+            for v in visuals)
+        if clip:
+            skip.update(id(c) for c in group)
+            continue
+        for v in visuals:
+            if any(v is g for g in group):
+                continue
+            if v["position"]["y"] >= line - tol:
+                v["position"]["y"] = round(v["position"]["y"] + delta, 2)
+        for c in group:
+            c["position"]["y"] = round(line, 2)
+
+    content_bottom = max((v["position"]["y"] + v["position"]["height"] for v in visuals),
+                         default=page_h)
+    return round(max(page_h, content_bottom + gap), 2)
 
 
 def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",

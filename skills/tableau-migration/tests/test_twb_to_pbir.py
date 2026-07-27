@@ -28,6 +28,7 @@ from twb_to_pbir import (
     _candidate_plan,
     _card_latent_candidates,
     _dedupe_native_query_refs,
+    _deoverlap_captions,
     _drop_resolved_flag_warnings,
     _expr_entity,
     _field_expression,
@@ -8069,3 +8070,141 @@ def test_v2_7_real_workbook_dashboards_have_zero_overlaps():
             continue
         d = _v27_geometry_defects(pg["visuals"], pg["w"], pg["h"])
         assert d["overlaps"] == 0, f"page {pg['display']!r} has {d['overlaps']} overlap(s)"
+
+
+# -- Zone Geometry v2 slice 8: robust caption de-overlap (band-insertion fallback) --------------
+# The v2-2 relocation pass only lifts a floating caption when a clear horizontal strip already
+# exists. On a PACKED dashboard (every band occupied) no strip is free, so the caption stays stuck on
+# the content it labels -- empirically the dominant real-workbook overlap defect (a z=900 caption on a
+# slicer row or buried in a table). v2-8 adds a fallback: when no clear strip exists, OPEN one by
+# pushing the labelled content (and everything below) straight down by the caption height + gap, seat
+# the caption in the cleared strip, and grow the FitToPage canvas so nothing spills out of bounds.
+# Side-by-side captions that head the same band share ONE inserted band instead of stacking. These
+# tests drive the fallback through the REAL emit pipeline (synthetic packed workbooks) AND lock the
+# never-regress contract: a clean / already-clear page never grows and is left untouched.
+
+# Two full-width worksheets stacked with NO gap + a caption floated onto the lower one. Every
+# relocation candidate (above/below/nearest-strip) collides with a chart, so the fallback MUST open a
+# band -- the page grows and the caption is seated clear.
+_V28_PACKED_TWB = _workbook(
+    _worksheet("TopChart", "Bar", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    + _worksheet("BottomChart", "Line", "[federated.abc].[sum:Sales:qk]",
+                 "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+    "<dashboard name='Packed'><size maxwidth='1000' maxheight='1000' /><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("TopChart", x=0, y=0, w=100000, h=50000, zid="2"),
+        _text_object_ws_zone("BottomChart", x=0, y=50000, w=100000, h=50000, zid="3"),
+        # a section header Tableau floated INSIDE the lower chart, with no clear strip anywhere
+        _text_object_zone("Section Header", fill="#333333", color="#ffffff", bold=True,
+                          size=11, x=0, y=52000, w=100000, h=4000, zid="20"),
+    )
+    + "</zones></dashboard>",
+)
+
+# A full-width top chart + two half-width bottom charts, each with its OWN header floated on it at the
+# SAME insertion line. The two headers do not overlap in x, so they must share a single opened band.
+_V28_SIDEBYSIDE_TWB = _workbook(
+    _worksheet("TopChart", "Bar", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    + _worksheet("LeftGrid", "Line", "[federated.abc].[sum:Sales:qk]",
+                 "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST)
+    + _worksheet("RightGrid", "Bar", "[federated.abc].[sum:Profit:qk]",
+                 "[federated.abc].[none:Region:nk]", deps_extra=_INST),
+    "<dashboard name='TwoUp'><size maxwidth='1000' maxheight='1000' /><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("TopChart", x=0, y=0, w=100000, h=50000, zid="2"),
+        _text_object_ws_zone("LeftGrid", x=0, y=50000, w=49000, h=50000, zid="3"),
+        _text_object_ws_zone("RightGrid", x=51000, y=50000, w=49000, h=50000, zid="4"),
+        _text_object_zone("Left Header", fill="#333333", color="#ffffff", bold=True,
+                          size=11, x=0, y=52000, w=49000, h=4000, zid="20"),
+        _text_object_zone("Right Header", fill="#333333", color="#ffffff", bold=True,
+                          size=11, x=51000, y=52000, w=49000, h=4000, zid="21"),
+    )
+    + "</zones></dashboard>",
+)
+
+
+def _v28_page(parts, display):
+    pg = next(p for p in _v27_pages(parts).values() if p["display"] == display)
+    return pg
+
+
+def test_v2_8_packed_page_opens_band_and_clears():
+    # The headline v2-8 case: a caption stuck on a packed page (no clear strip) is resolved by opening
+    # a band -- the emitted page ends with zero geometry defects AND the page grew past its authored
+    # canvas (proof a band was inserted, not merely relocated within the original height).
+    res = migrate_twb_to_pbir(_V28_PACKED_TWB)
+    pg = _v28_page(res["parts"], "Packed")
+    d = _v27_geometry_defects(pg["visuals"], pg["w"], pg["h"])
+    assert d["overlaps"] == 0 and d["contain"] == 0 and d["oob"] == 0
+    assert pg["h"] > 1000.0  # authored maxheight was 1000; the inserted band grew it
+    cap = next(v for v in pg["visuals"] if v["visual"]["visualType"] == "textbox")
+    charts = [v for v in pg["visuals"] if v["visual"]["visualType"] != "textbox"]
+    for ch in charts:
+        assert _inter_area(_rect(cap), _rect(ch)) <= 1.0
+
+
+def test_v2_8_side_by_side_headers_share_one_band():
+    # Two headers heading two side-by-side grids at the same insertion line must open ONE shared band:
+    # both captions land at the SAME y (a single row) at DIFFERENT x, and the page stays clean. If the
+    # fallback stacked them it would seat them at different y's and grow the page by two bands.
+    res = migrate_twb_to_pbir(_V28_SIDEBYSIDE_TWB)
+    pg = _v28_page(res["parts"], "TwoUp")
+    d = _v27_geometry_defects(pg["visuals"], pg["w"], pg["h"])
+    assert d["overlaps"] == 0 and d["contain"] == 0 and d["oob"] == 0
+    caps = [v for v in pg["visuals"] if v["visual"]["visualType"] == "textbox"]
+    assert len(caps) == 2
+    ys = {round(c["position"]["y"], 1) for c in caps}
+    xs = {round(c["position"]["x"], 1) for c in caps}
+    assert len(ys) == 1  # one shared band (same y), not stacked
+    assert len(xs) == 2  # genuinely side by side (distinct x)
+
+
+def test_v2_8_clean_page_never_grows():
+    # Never-regress: a page with no caption<->content overlap must NOT trigger the fallback -- its
+    # emitted height equals the authored canvas exactly (a cleanly tiled page and an already-clear
+    # caption page both stay put). Guards Superstore-style clean dashboards against spurious growth.
+    tiled = _v28_page(migrate_twb_to_pbir(_V27_CLEAN_TILED)["parts"], "Tiled")
+    assert tiled["h"] == 800.0  # authored maxheight, unchanged
+    clear = _v28_page(migrate_twb_to_pbir(_V2_CLEAR_CAPTION_TWB)["parts"], "Clean")
+    assert clear["h"] == 1000.0  # authored maxheight, unchanged
+
+
+def _v28_stack(z, x, y, w, h, vt="clusteredColumnChart"):
+    return {"position": {"x": x, "y": y, "width": w, "height": h, "z": z},
+            "visual": {"visualType": vt}}
+
+
+def test_v2_8_deoverlap_return_contract():
+    # The de-overlap pass now RETURNS the (possibly grown) page height so the caller can grow the
+    # FitToPage canvas. Contract: (a) anchors-only -> page_h unchanged, nothing moved; (b) a caption
+    # already in a clear band -> page_h unchanged, caption unmoved; (c) a caption stuck on a packed
+    # page -> a grown height AND the caption lifted clear of the content.
+
+    # (a) no caption at all -> early return page_h, positions byte-identical
+    a1 = _v28_stack(0, 0, 0, 1000, 500)
+    a2 = _v28_stack(0, 0, 500, 1000, 500)
+    assert _deoverlap_captions([a1, a2], 1000, 1000) == 1000
+    assert (a1["position"]["y"], a2["position"]["y"]) == (0, 500)
+
+    # (b) a caption in a clear band (no overlap) -> gate returns page_h, caption unmoved
+    anchor = _v28_stack(0, 0, 0, 1000, 500)
+    clear_cap = _v28_stack(900, 0, 600, 200, 30, vt="textbox")
+    assert _deoverlap_captions([anchor, clear_cap], 1000, 1000) == 1000
+    assert clear_cap["position"]["y"] == 600
+
+    # (c) a caption stuck on the lower of two stacked charts, no free strip -> grow + lift clear
+    top = _v28_stack(0, 0, 0, 1000, 500)
+    bot = _v28_stack(0, 0, 500, 1000, 500)
+    stuck_cap = _v28_stack(900, 0, 520, 1000, 30, vt="textbox")
+
+    def _r(v):
+        p = v["position"]
+        return (p["x"], p["y"], p["width"], p["height"])
+
+    grown = _deoverlap_captions([top, bot, stuck_cap], 1000, 1000)
+    assert grown > 1000
+    assert _inter_area(_r(stuck_cap), _r(top)) <= 1.0
+    assert _inter_area(_r(stuck_cap), _r(bot)) <= 1.0
+
