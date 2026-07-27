@@ -73,7 +73,10 @@ MAX_GROWTH = 2.0
 # Default leaf minimum table -- (min_w, min_h) in page pixels, keyed by zone_tree leaf_kind.
 # These are deliberately conservative floors; the emit path injects a richer resolver (that knows a
 # worksheet's viz type and a matrix's row count) via the ``min_for_leaf`` callback in a later slice.
-MIN_SLICER = (120.0, 56.0)       # dropdown: label ~20 + control ~28 + padding
+# A leaf minimum must be at least what the EMIT path will actually give that leaf: emit re-floors a
+# slicer to its own dropdown minimum after placement, so a smaller reservation here does not shrink
+# the emitted box, it just makes it overrun whatever the solver seated below it.
+MIN_SLICER = (120.0, 64.0)       # dropdown: matches the emitter's own SLICER_DROPDOWN_MIN_H floor
 MIN_SLICER_LIST_H = 100.0        # list/checklist mode is taller
 MIN_PARAMCTRL = (120.0, 56.0)
 MIN_TEXT = (120.0, 32.0)

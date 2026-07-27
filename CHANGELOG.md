@@ -12,6 +12,41 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+- **tableau-migration (skill `2.18.0` → `2.19.0`): opt-in `--layout solver` — the zone-tree layout
+  engine is wired into emit — frame/quality track slice 4d (`scripts/twb_to_pbir.py`,
+  `scripts/layout_solve.py`, new `tests/test_layout_engine.py`).** Four branch-only slices built the
+  solver stack (`zone_tree` → `layout_solve` → `layout_layers` → `layout_plan`) without letting any of
+  it reach the emitted report. This slice connects it, behind a **default-off** switch: `--layout
+  {legacy,solver}` on the CLI (env `TWB_PBIR_LAYOUT`) and a `layout=` keyword on `parse_twb` /
+  `emit_pbir` / `migrate_twb_to_pbir`. `legacy` remains the default and is **proven byte-identical to
+  the previous release across all six corpus workbooks**, so no existing run can change.
+  - Every substitution goes through the single `_scale_zone` choke point, looked up by the `zone_id`
+    slice 4a records at capture time — one edit, not seven. A solved rect is taken **verbatim**:
+    re-applying the `min_w`/`min_h` floors would re-inflate a box the solver deliberately sized and
+    re-introduce the overlap the tree solve removed. Any zone the plan does not name (and any
+    dashboard whose plan failed to build, raised, or whose solver module is absent) falls back to the
+    legacy scale — fail-closed, never half-solved.
+  - Emit **adopts the page the solve resolved**. Growth is not cosmetic: the solver enlarges the page
+    (bounded by `MAX_GROWTH`) precisely so the content fits, so its rects are valid only on that page.
+    Keeping the authored page while using solved rects measures **100 out-of-bounds visuals** on the
+    corpus versus **0** when the grown page is adopted. New `_dash_page_dims` is now the single
+    definition of the canvas, so the page the plan is solved against and the page emit writes are
+    provably the same number.
+  - **Slicer floor coupling.** The solver reserved 56 px for a filter leaf while the emitter re-floors
+    a dropdown slicer to `SLICER_DROPDOWN_MIN_H` (64 px) *after* placement — so the emitted band grew
+    into whatever the solver had seated below it (13 overlaps on two ATTI dashboards). Fixed on both
+    sides: `layout_solve.MIN_SLICER` height is raised to 64 to match the emitter's own floor, and
+    `_layout_slicers` takes the solved height verbatim when a plan is active (its purely horizontal
+    inset still applies — it only ever shrinks a card, so it cannot introduce a collision).
+  - **A/B flip gate, measured end-to-end on the real emitted PBIR** (27 pages, six workbooks) rather
+    than on plan rects: legacy `{overlaps 0, contain 1, oob 0, floor 31}` vs solver `{overlaps 0,
+    contain 1, oob 0, floor 17}` — solver is ≤ legacy on all four counts and **cuts squashed zones
+    nearly in half**. The default is not flipped in this release.
+  - +25 tests pinning both halves of the contract (default-is-legacy and inert · verbatim solved rects ·
+    each fail-closed fallback · page adoption and reset · the `_dash_page_dims` agreement · the slicer
+    floor coupling · CLI validation and default).
+
 ### Fixed
 - **tableau-migration (skill `2.17.0` → `2.18.0`): solver containment — a frame no longer starves its
   children — frame/quality track slice 4c (`scripts/layout_solve.py`; still nothing imports the solver

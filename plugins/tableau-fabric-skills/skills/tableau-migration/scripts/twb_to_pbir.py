@@ -103,6 +103,16 @@ except ImportError:  # pragma: no cover - flat scripts-on-path
     except ImportError:
         _build_dashboard_audit = None
 
+# Zone Geometry v3 layout solver (opt-in ``--layout solver``). Optional so the emitter still imports
+# and runs the legacy engine unchanged if the solver stack is absent.
+try:
+    from . import layout_plan as _layout_plan
+except ImportError:  # pragma: no cover - flat scripts-on-path
+    try:
+        import layout_plan as _layout_plan
+    except ImportError:
+        _layout_plan = None
+
 
 # -- PBIR schema URLs ----------------------------------------------------------
 _S = "https://developer.microsoft.com/json-schemas/fabric/item/report"
@@ -157,6 +167,17 @@ DASH_DEFAULT_H = 800
 # the default 1280x720 (never-regress).
 _PAGE_W_OVERRIDE = None
 _PAGE_H_OVERRIDE = None
+# -- layout engine (Zone Geometry v3, frame track slice 4d) ----------------------
+# ``legacy`` scales each zone's normalized source rect straight into the page and repairs collisions
+# afterwards; ``solver`` resolves the dashboard's zone TREE first (``layout_plan``), so tiled siblings
+# receive disjoint intervals and overlap is unrepresentable rather than repaired. The engine is
+# OPT-IN: the default stays ``legacy`` so no existing migration changes output until the solver is
+# deliberately selected. ``_LAYOUT_PLAN`` is the plan for the dashboard currently being emitted -- set
+# and reset around each page exactly like the page overrides above -- and is the ONE thing
+# ``_scale_zone`` consults, which is why every emitted item records its ``zone_id`` (slice 4a).
+LAYOUT_ENGINES = ("legacy", "solver")
+LAYOUT_DEFAULT = "legacy"
+_LAYOUT_PLAN = None
 # A Power BI slicer fills its whole rectangle, unlike a Tableau filter *card*, which renders its
 # control inset inside the zone with padding. Tableau packs filter zones edge-to-edge (tangent in
 # BOTH axes) and relies on that per-card padding for the visible gaps, so emitting a slicer at the
@@ -189,6 +210,19 @@ def _page_w():
 def _page_h():
     """Active page height: the per-dashboard aspect-faithful override, else the default."""
     return _PAGE_H_OVERRIDE or PAGE_HEIGHT
+
+
+def _dash_page_dims(size):
+    """The emitted page ``(w, h)`` for a parsed dashboard ``size`` dict.
+
+    The single definition of the dashboard canvas: a fixed ``<size maxwidth/maxheight>`` wins, else
+    the automatic fit-to-window canvas derived from the declared minimum, else Tableau's own default.
+    Extracted so the layout PLAN is solved against exactly the page the emit path will use -- solving
+    against a different page silently invalidates every rect it produces.
+    """
+    auto_w, auto_h = _automatic_canvas_dims(size.get("min_w"), size.get("min_h"))
+    return (float(size.get("w") or auto_w or DASH_DEFAULT_W),
+            float(size.get("h") or auto_h or DASH_DEFAULT_H))
 
 
 def _automatic_canvas_dims(min_w, min_h):
@@ -3661,7 +3695,7 @@ def _select_title_banner(candidates, ext_w, ext_h):
     return picks[0]
 
 
-def _parse_dashboard(db, worksheet_names, warnings):
+def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
     name = db.get("name")
     size_el = _first(db, "size")
     size = {"w": None, "h": None, "min_w": None, "min_h": None, "sizing_mode": None}
@@ -3856,7 +3890,29 @@ def _parse_dashboard(db, worksheet_names, warnings):
             "filter_zones": filter_zones,
             "text_objects": text_objects,
             "image_zones": image_zones,
-            "title_banner": title_banner}
+            "title_banner": title_banner,
+            # The solved layout for this dashboard, or None under the legacy engine / on any solve
+            # failure. Built HERE because this is the only place the source <dashboard> element is in
+            # scope; the emit path consumes it as a lookup rather than re-parsing the XML.
+            "layout_plan": _build_layout_plan(db, size, layout, device_zones)}
+
+
+def _build_layout_plan(db, size, layout, device_zones):
+    """Solve this dashboard's zone tree into a plan, or ``None`` (legacy engine / fail-closed).
+
+    Solved against ``_dash_page_dims(size)`` -- the exact page the emit path derives -- because a plan
+    solved against any other page produces rects that are out of bounds on the page actually emitted.
+    ``device_zones`` is the caller's already-computed phone/tablet exclusion set, reused rather than
+    recomputed so the tree sees exactly the zones the emit walk did.
+    """
+    if layout != "solver" or _layout_plan is None:
+        return None
+    try:
+        page_w, page_h = _dash_page_dims(size)
+        return _layout_plan.build_plan(db, device_zones=device_zones,
+                                       page_w=page_w, page_h=page_h)
+    except Exception:  # pragma: no cover - defensive; the solver is never allowed to break emit
+        return None
 
 
 def _warn(scope, name, reason):
@@ -4202,7 +4258,7 @@ def _detect_sheet_swaps(worksheets, dashboards, params, warnings):
 
 
 def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_binding=None,
-              column_binding=None, param_binding=None):
+              column_binding=None, param_binding=None, layout=LAYOUT_DEFAULT):
     """Parse a Tableau ``.twb`` (workbook XML) into the normalized viz IR.
 
     Accepts ``str`` or ``bytes``; ``.twb`` files carry a UTF-8 BOM, so callers reading from
@@ -4243,7 +4299,7 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
         db_elems.extend(_children_local(h, "dashboard"))
     dashboards = []
     for db in db_elems:
-        parsed = _parse_dashboard(db, worksheet_names, warnings)
+        parsed = _parse_dashboard(db, worksheet_names, warnings, layout=layout)
         for z in parsed["zones"]:
             target = ws_by_name.get(z["worksheet"])
             if (target and target["visual_type"] == VT_UNSUPPORTED
@@ -7165,6 +7221,16 @@ def _position(x, y, w, h, z=0, tab=0):
 
 
 def _scale_zone(zone, ref_w, ref_h, min_w=40.0, min_h=40.0):
+    # THE layout choke point. Under the solver engine a resolved rect for this zone (looked up by the
+    # ``zone_id`` slice 4a records at capture time) replaces the naive scale-and-clamp below: the
+    # solver already resolved the whole dashboard as a tree, so its rect is disjoint from its tiled
+    # siblings and on-page by construction. Applying the min floors here too would re-inflate a box
+    # the solver deliberately sized, re-introducing the very overlap the tree solve removed, so a
+    # solved rect is taken verbatim. Any zone the plan does not know (or any dashboard whose plan
+    # failed to build) falls through to the legacy path unchanged -- fail-closed, never half-solved.
+    solved = _solved_rect(zone)
+    if solved is not None:
+        return solved
     pw = _page_w()
     ph = _page_h()
     sx = pw / ref_w if ref_w else 1
@@ -7174,6 +7240,17 @@ def _scale_zone(zone, ref_w, ref_h, min_w=40.0, min_h=40.0):
     w = max(min_w, min(zone["w"] * sx, pw - x))
     h = max(min_h, min(zone["h"] * sy, ph - y))
     return x, y, w, h
+
+
+def _solved_rect(zone):
+    """The active layout plan's rect for ``zone``, or ``None`` to use the legacy scale."""
+    plan = _LAYOUT_PLAN
+    if not plan:
+        return None
+    zid = zone.get("zone_id") if isinstance(zone, dict) else None
+    if zid is None:
+        return None
+    return plan["rects"].get(zid)
 
 
 def _page_json(name, display_name):
@@ -7748,7 +7825,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     page_order = []
     placed = set()
 
-    global _PAGE_H_OVERRIDE, _PAGE_W_OVERRIDE
+    global _PAGE_H_OVERRIDE, _PAGE_W_OVERRIDE, _LAYOUT_PLAN
     for db in ir["dashboards"]:
         page_name = _sanitize("page-" + (db["name"] or "dashboard"))
         zones = db["zones"]
@@ -7768,6 +7845,15 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         _auto_w, _auto_h = _automatic_canvas_dims(db["size"].get("min_w"), db["size"].get("min_h"))
         _PAGE_W_OVERRIDE = db["size"]["w"] or _auto_w or DASH_DEFAULT_W
         _PAGE_H_OVERRIDE = db["size"]["h"] or _auto_h or DASH_DEFAULT_H
+        # Solver engine: activate this dashboard's plan and ADOPT the page it resolved. Growth is not
+        # cosmetic -- the solver enlarges the page (bounded by MAX_GROWTH) precisely so the content
+        # fits, so its rects are valid ONLY on that page. Keeping the authored page while using solved
+        # rects puts them out of bounds; measured on the corpus that is 100 out-of-bounds visuals
+        # versus 0 when the grown page is adopted. A grown page still rescales to the viewport under
+        # FitToPage, so adopting it costs render scale, never content.
+        _LAYOUT_PLAN = db.get("layout_plan")
+        if _LAYOUT_PLAN:
+            _PAGE_W_OVERRIDE, _PAGE_H_OVERRIDE = _LAYOUT_PLAN["page"]
         visuals = []
         page_ws = []
         for i, zone in enumerate(zones):
@@ -8019,6 +8105,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
 
     _PAGE_W_OVERRIDE = None
     _PAGE_H_OVERRIDE = None
+    _LAYOUT_PLAN = None
     for ws in ir["worksheets"]:
         if ws["name"] in placed or ws["visual_type"] == VT_UNSUPPORTED:
             continue
@@ -8222,9 +8309,18 @@ def _layout_slicers(entries, *, ctrl_h=SLICER_CTRL_H, pad_x=SLICER_PAD_X,
     List/other card keeps its own height (floored at ``ctrl_h``). Nothing is a hardcoded fixed
     size -- the emitted height tracks the source card. When a row's control ends up taller than its
     source zone, the rows below shift down by the growth plus ``gutter`` so tangent bands never
-    overlap. Rows are clustered by top-y (``tol`` px)."""
+    overlap. Rows are clustered by top-y (``tol`` px).
+
+    Under the solver engine the vertical half of that is skipped: the solve already reserved each
+    filter leaf's minimum (``layout_solve.MIN_SLICER``, kept equal to ``SLICER_DROPDOWN_MIN_H``) and
+    seated the rest of the dashboard around the result, so re-flooring the height here would grow a
+    band the solver deliberately sized and overrun whatever it placed below -- the same reason
+    ``_scale_zone`` takes a solved rect verbatim. The purely horizontal inset still applies: it only
+    ever shrinks a card, so it cannot introduce a collision.
+    """
     if not entries:
         return
+    solved = _LAYOUT_PLAN is not None
     rows = []
     for e in sorted(entries, key=lambda z: z["y"]):
         if rows and abs(e["y"] - rows[-1][0]["y"]) <= tol:
@@ -8235,7 +8331,9 @@ def _layout_slicers(entries, *, ctrl_h=SLICER_CTRL_H, pad_x=SLICER_PAD_X,
     for row in rows:
         top = min(e["y"] for e in row) + shift
         zone_h = max(e["h"] for e in row)
-        if any(e.get("mode") == "Dropdown" for e in row):
+        if solved:
+            box = zone_h
+        elif any(e.get("mode") == "Dropdown" for e in row):
             box = max(zone_h, SLICER_DROPDOWN_MIN_H)
         else:
             box = max(zone_h, ctrl_h)
@@ -8578,7 +8676,7 @@ def _deoverlap_captions(visuals, page_w, page_h, *, gap=8.0, tol=1.0, min_frac=0
 def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
                         model_table=None, field_map=None, date_binding=None,
                         row_count_binding=None, measure_binding=None, column_binding=None,
-                        param_binding=None, resources=None):
+                        param_binding=None, resources=None, layout=LAYOUT_DEFAULT):
     """One-call convenience: parse ``.twb`` text and emit the PBIR parts.
 
     Returns ``{"ir": ..., "parts": ..., "warnings": ..., "candidate_records": ...,
@@ -8631,7 +8729,7 @@ def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
     """
     ir = parse_twb(xml_text, date_binding=date_binding, row_count_binding=row_count_binding,
                    measure_binding=measure_binding, column_binding=column_binding,
-                   param_binding=param_binding)
+                   param_binding=param_binding, layout=layout)
     # Recover the workbook's view-only quick table calcs (the quick token is stripped off the
     # resolved value pill, so the addressing facts live only here) and hand them to the emitter, which
     # projects each as a Power BI Visual Calculation. Fail-open: a parse hiccup never blocks the rest
@@ -8717,6 +8815,13 @@ def main(argv=None):
         help="optional: also write the opt-in Tier-3 dashboard AUDIT request JSON here (folds the "
              "worklist + chart-type advice into a full-dashboard, priority-ordered audit for the "
              "assisted tier). Built on demand only; never changes the PBIR.")
+    parser.add_argument(
+        "--layout", choices=LAYOUT_ENGINES,
+        default=os.environ.get("TWB_PBIR_LAYOUT", LAYOUT_DEFAULT),
+        help="dashboard layout engine. 'legacy' (default) scales each zone's absolute Tableau rect "
+             "independently and repairs collisions afterwards. 'solver' resolves the dashboard's "
+             "zone TREE (flow containers + frames) so flow overlap is structurally impossible, and "
+             "adopts the page size that solve resolved. Opt-in; 'legacy' output is unchanged.")
     args = parser.parse_args(argv)
 
     if args.input == "-":
@@ -8727,7 +8832,7 @@ def main(argv=None):
 
     result = migrate_twb_to_pbir(
         xml_text, dataset_name=args.dataset, report_name=args.report,
-        model_table=args.model_table)
+        model_table=args.model_table, layout=args.layout)
     parts, warnings = result["parts"], result["warnings"]
 
     if args.worklist and result.get("worklist") is not None:
