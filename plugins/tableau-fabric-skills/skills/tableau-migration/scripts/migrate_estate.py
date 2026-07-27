@@ -569,12 +569,18 @@ def _eligible_tables(descriptor):
             if r.get("kind") in ("table", "custom_sql") and r.get("columns")]
 
 
-def _viz_adapter(cand):
+def _viz_adapter(cand, layout=None):
     """Adapt a viz entry point to the orchestrator's ``callable(twb_text, name) -> dict`` contract.
 
     Stream B's ``migrate_twb_to_pbir(text, *, report_name, dataset_name)`` takes the target name as
     keyword-only args, while a generic plugin may take ``(text, name)`` positionally. Inspect the
     signature so the workbook display name flows through as the report/dataset name either way.
+
+    ``layout`` names the zone-layout engine (``"legacy"`` / ``"solver"``). It is BOUND HERE rather
+    than passed at each call site, so every path through the orchestrator picks it up and none can
+    silently drop it. Capability-gated like every other optional binding: a viz stage whose
+    signature has no ``layout`` parameter is called exactly as before, so an injected or older
+    plugin keeps working and the default run stays byte-identical.
     """
     try:
         params = set(inspect.signature(cand).parameters)
@@ -589,6 +595,7 @@ def _viz_adapter(cand):
     supports_field_map = "field_map" in params
     supports_column = "column_binding" in params
     supports_resources = "resources" in params
+    supports_layout = "layout" in params
     def _call(twb_text, name, date_binding=None, measure_binding=None, row_count_binding=None,
               param_binding=None, model_table=None, field_map=None, column_binding=None,
               resources=None):
@@ -610,17 +617,23 @@ def _viz_adapter(cand):
                 kwargs["column_binding"] = column_binding
             if supports_resources and resources:
                 kwargs["resources"] = resources
+            if supports_layout and layout:
+                kwargs["layout"] = layout
             return cand(twb_text, **kwargs)
         return cand(twb_text, name)
     return _call
 
 
-def _resolve_viz_stage(injected):
+def _resolve_viz_stage(injected, layout=None):
     """Resolve the optional workbook viz stage without ever hard-depending on it.
 
     An injected callable wins. Otherwise, if a ``twb_to_pbir`` module is importable (Stream B),
     bind the first recognized entry point. Returns a ``callable(twb_text, name) -> dict`` or
     ``None`` when no viz stage is available.
+
+    ``layout`` selects the zone-layout engine and is bound into the adapter, so it reaches every
+    call site through one seam. An injected stage is returned untouched -- a caller that supplies
+    its own viz stage owns its own configuration.
     """
     if injected is not None:
         return injected
@@ -634,7 +647,7 @@ def _resolve_viz_stage(injected):
     for fn in _VIZ_ENTRY_POINTS:
         cand = getattr(mod, fn, None)
         if callable(cand):
-            return _viz_adapter(cand)
+            return _viz_adapter(cand, layout=layout)
     return None
 
 
@@ -2753,7 +2766,7 @@ def _second_compile_prepass(single, wb_id, approved_calc_dax, authored, output_d
 def migrate_workbook(source, *, write_to=None, wb_id=None, name=None, viz_stage=None,
                      approved_calc_dax=None, viz_advice=False, pbip=True,
                      ds_catalog=None, used_folders=None,
-                     second_compile=False, authored=None):
+                     second_compile=False, authored=None, layout=None):
     """Migrate ONE Tableau workbook into an openable Power BI project (model + bound report).
 
     This is the public workbook primitive -- the same faithful rebuild+bind the estate performs per
@@ -2783,6 +2796,9 @@ def migrate_workbook(source, *, write_to=None, wb_id=None, name=None, viz_stage=
     the result UNDER ``approved_calc_dax`` (a human-approved entry always wins), so the very same
     ``--approved-dax`` landing seam carries them into every model build. The landed set is reported on
     the additive ``detail["second_compile"]`` key. When both are omitted the run is byte-identical.
+
+    ``layout`` selects the dashboard zone-layout engine (``"legacy"``, the default, or ``"solver"``).
+    Omitted / ``None`` keeps the established legacy scale, so the default run is byte-identical.
     """
     if not write_to:
         raise ValueError(
@@ -2803,7 +2819,7 @@ def migrate_workbook(source, *, write_to=None, wb_id=None, name=None, viz_stage=
     pbip_dir = os.path.join(write_to, "pbip") if pbip else None
     os.makedirs(write_to, exist_ok=True)
 
-    viz = _resolve_viz_stage(viz_stage)
+    viz = _resolve_viz_stage(viz_stage, layout=layout)
     if used_folders is None:
         used_folders = set()
 
@@ -3192,7 +3208,7 @@ def _build_input_manifest(source, ds_ids, wb_ids):
 
 def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan=None,
                    rebind_bind_stage=None, approved_calc_dax=None, viz_advice=False,
-                   second_compile=False, authored=None):
+                   second_compile=False, authored=None, layout=None):
     """Run the whole estate migration and write the output bundle. Returns the report dict.
 
     ``source`` is any :class:`TableauSource`. ``output_dir`` receives::
@@ -3243,12 +3259,17 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
     gains an additive ``second_compile`` record. When both are omitted the run is byte-identical --
     this opt-in IS the spec's "automatic" second-compiler behavior, kept opt-in so the default remains
     byte-for-byte the committed baseline.
+
+    ``layout`` (optional) selects the dashboard zone-layout engine: ``"legacy"`` (the default) keeps
+    the established per-zone absolute scale, while ``"solver"`` resolves the whole zone TREE so
+    sibling zones cannot overlap by construction. It is bound into the viz stage once, so every
+    workbook in the run uses the same engine. Omitted / ``None`` leaves the run byte-identical.
     """
     sm_dir = os.path.join(output_dir, "semantic_models")
     pbip_dir = os.path.join(output_dir, "pbip") if pbip else None
     os.makedirs(output_dir, exist_ok=True)
 
-    viz = _resolve_viz_stage(viz_stage)
+    viz = _resolve_viz_stage(viz_stage, layout=layout)
     used_folders = set()
 
     ds_catalog = {}
@@ -4188,6 +4209,12 @@ def main(argv=None):
                         help="build even if <output> already holds a prior report.json (overwrite "
                              "in place); the default is to STOP so a new run never silently mixes "
                              "with a previous run's stale outputs")
+    parser.add_argument("--layout", choices=("legacy", "solver"), default="legacy",
+                        help="dashboard zone-layout engine. 'legacy' (default) scales each zone's "
+                             "absolute rect independently and repairs collisions afterwards; "
+                             "'solver' resolves the whole zone TREE, so sibling zones cannot "
+                             "overlap by construction and fewer visuals are squashed to their "
+                             "minimum size. The default run is byte-identical.")
     args = parser.parse_args(argv)
 
     try:
@@ -4246,7 +4273,8 @@ def main(argv=None):
 
     report = migrate_estate(source, args.output, pbip=not args.no_pbip,
                             approved_calc_dax=approved_calc_dax, viz_advice=args.viz_advice,
-                            second_compile=second_compile, authored=authored)
+                            second_compile=second_compile, authored=authored,
+                            layout=args.layout)
     s = report["summary"]
     print(
         f"Datasources: {s['datasources_migrated']}/{s['datasources_total']} migrated "

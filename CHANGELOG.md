@@ -13,6 +13,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.20.0` → `2.21.0`): a squeezed flow row now SHARES the shortfall
+  across its fixed children instead of dumping it on the one flexible sibling, and `--layout` is
+  finally reachable from `migrate_estate` — frame/quality track slice 4f
+  (`scripts/layout_solve.py`, `scripts/migrate_estate.py`, `tests/test_layout_fixed_share.py`).**
+  Slice 4d wired the solver into emit; the first end-to-end build of a real customer workbook found
+  what six workbooks of corpus A/B scoring had not. On a Salesforce dashboard a logo authored as one
+  of four equal quarters was emitted **26px wide** beside three filter cards at 177/205/179, because
+  `allocate` subtracted every child's `fixed_px` from the row's budget unconditionally. But
+  `fixed_px` is a request measured at the container's AUTHORED size, and that row had itself been
+  allocated 611px against ~819 authored — so paying the pins in full made the single flexible child
+  absorb 100% of the 208px shortfall. Nothing caught it: the row never overran (so slice 4c's
+  last-resort squeeze had nothing to fix) and 26 > `MIN_BITMAP` 24 (so no violator fired). It was
+  *satisfied* and wildly out of proportion. The fix caps the pins' collective demand at the room not
+  authored to flexible siblings and scales them into it — never below their own minimum and **never
+  above their own request**, so it may only ever take pixels off a pinned child. The row now solves
+  to 139/161/141/**146**, matching the authored quarters. A no-op whenever the container has room for
+  everyone, which is why the corpus is unchanged (`o0 c0 b0 f31` legacy vs `o0 c0 b0 f17` solver,
+  27 pages). Separately, `--layout {legacy,solver}` existed only on `twb_to_pbir`'s CLI, so the
+  engine could not be chosen from the one-button estate migrator users actually run; it is now
+  threaded through `migrate_estate` and bound once in `_viz_adapter`, capability-gated so a viz stage
+  without a `layout` parameter is called exactly as before. Default stays `legacy`. +15 tests.
+
 - **tableau-migration (skill `2.19.0` → `2.20.0`): the v2.7.0 geometry goldens now run under BOTH
   layout engines — frame/quality track slice 4e (`tests/test_layout_engine.py`; test-only, the engine
   is byte-identical so no migration output can change).** v2.7.0 locked "a clean page stays clean"

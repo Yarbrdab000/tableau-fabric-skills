@@ -228,9 +228,35 @@ def allocate(node, rect):
 
     fixed = [c for c in kids if c.get("fixed_px") is not None]
     flex = [c for c in kids if c.get("fixed_px") is None]
-    avail = main_total - gaps - sum(float(c["fixed_px"]) for c in fixed)
+    room = main_total - gaps
 
     alloc = {id(c): float(c["fixed_px"]) for c in fixed}
+    # A fixed child's pixels are a REQUEST measured at the container's AUTHORED size -- not a first
+    # claim on whatever box an ancestor actually hands it. Paying every fixed child in full out of a
+    # SHRUNKEN box makes the flexible siblings absorb the entire shortfall: on a real dashboard a row
+    # authored as four equal quarters (three fixed filter cards + one flexible logo) solved to
+    # 177/205/179/26 px, because the three cards took 561 of the 587 px available and the logo -- the
+    # only flexible child -- was left the 26 px remainder. It cleared its own 24 px bitmap minimum, so
+    # no violator check fired; the aspect ratio was simply destroyed (204x59 authored -> 26x97).
+    # Cap the fixed children's collective demand at the room NOT authored to flexible siblings and
+    # scale them proportionally into it, never below their own minimum, so a squeeze is SHARED rather
+    # than dumped on whichever sibling happens to be flexible. A no-op whenever the container has room
+    # for everyone -- which is the common case, and why the default corpus result is unchanged.
+    if fixed and flex and room > 0:
+        tot_frac = sum(c.get("frac") or 0.0 for c in kids) or 1.0
+        flex_share = sum(c.get("frac") or 0.0 for c in flex) / tot_frac
+        budget = room * max(0.0, 1.0 - flex_share)
+        fixed_total = sum(alloc[id(c)] for c in fixed)
+        if fixed_total > budget + TOL and fixed_total > 0:
+            scale = budget / fixed_total
+            for c in fixed:
+                request = float(c["fixed_px"])
+                # Floor at the child's own minimum -- but never ABOVE its request, so a child the
+                # author pinned smaller than its min keeps the pinned size it has always had. This
+                # rule may only ever take pixels off a fixed child, never hand it more.
+                alloc[id(c)] = max(min(float(c[minkey]), request), request * scale)
+
+    avail = room - sum(alloc[id(c)] for c in fixed)
     frozen = set()
     # CSS flex freeze loop: distribute `avail` by fraction, clamp violators UP to min and freeze,
     # repeat. Terminates in <= len(flex) + 1 rounds (each round freezes >= 1 child or breaks).
@@ -261,7 +287,6 @@ def allocate(node, rect):
     # child fall below its min, which is a legible "too small" (floor) signal rather than a silently
     # off-page visual. Load-bearing: without it the capped solver still leaves out-of-bounds rects.
     content = sum(alloc[id(c)] for c in kids)
-    room = main_total - gaps
     if content > room + TOL and content > 0:
         squeeze = max(0.0, room) / content
         for c in kids:

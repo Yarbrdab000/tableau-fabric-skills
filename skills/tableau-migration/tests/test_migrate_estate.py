@@ -1020,7 +1020,7 @@ def test_viz_stage_absent_warns(tmp_path, monkeypatch):
     # Stream B's twb_to_pbir now ships in this repo, so explicitly force the "viz stage
     # unavailable" path (no module + none injected) to prove the orchestrator still degrades
     # gracefully into a warning rather than failing.
-    monkeypatch.setattr(me, "_resolve_viz_stage", lambda injected: injected)
+    monkeypatch.setattr(me, "_resolve_viz_stage", lambda injected, **kw: injected)
     src = InMemoryTableauSource(workbooks={"Dash": "<workbook/>"})
     report = migrate_estate(src, str(tmp_path / "b"))  # none injected -> viz None
     wb = report["workbooks"][0]
