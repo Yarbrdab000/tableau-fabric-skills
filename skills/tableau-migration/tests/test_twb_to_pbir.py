@@ -7,6 +7,7 @@ visual, and (c) that unsupported marks/derivations/filters degrade to ``warnings
 producing a wrong visual.
 """
 import json
+import os
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -7831,3 +7832,240 @@ def test_image_objects_never_regress_when_resources_none():
     pkgs = report.get("resourcePackages", [])
     image_items = [it for pkg in pkgs for it in pkg.get("items", []) if it.get("type") == "Image"]
     assert image_items == []
+
+
+# == Zone Geometry v2 slice 7: geometry lock-in golden tests ==================================
+# A committed regression net for LAYOUT QUALITY. Every prior geometry slice (v2-1 overlaps 29->23,
+# v2-2 23->0) was measured by an UNTRACKED scratch audit -- so nothing stopped a future change from
+# silently re-introducing overlaps or squashed zones. This section formalises that audit's exact
+# defect algorithm (TOL=1.0; a pair counts as an overlap when the intersection covers >2% of the
+# smaller rect; full nesting is a `contain`; a zone <=41px on either axis is `floor`; a rect past the
+# canvas edge is `oob`) and runs it through the REAL emit pipeline on synthetic workbooks.
+#
+# These are METRIC snapshots, NOT pixel snapshots: we lock the quality invariants (0 overlaps /
+# contain / oob on a clean page) but deliberately never freeze x/y coordinates -- arrangement stays
+# flexible so future tidy passes can improve a layout without tripping a test.
+#
+# COMPOSITE-GROUP CONTRACT (donut safety): a faithful donut becomes two stacked Power BI visuals --
+# a donutChart ring plus a `card` in the hole -- whose rects overlap BY DESIGN. When the engine emits
+# such a composite it stamps both pieces with a shared PBIR ``parentGroupName``; the auditor treats an
+# overlap BETWEEN two same-group members as intentional and never counts it, while every cross-group
+# or ungrouped collision is still a defect. No emitter sets the marker today (donut is a single native
+# donutChart), so the exemption is proven here on synthetic dicts and stands ready for that feature.
+_V27_TOL = 1.0
+
+
+def _v27_rect(vj):
+    p = vj["position"]
+    return (p["x"], p["y"], p.get("width", 0) or 0, p.get("height", 0) or 0)
+
+
+def _v27_inter(a, b):
+    ix = max(0.0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
+    return ix * iy
+
+
+def _v27_contains(a, b, tol=_V27_TOL):
+    return (b[0] >= a[0] - tol and b[1] >= a[1] - tol and
+            b[0] + b[2] <= a[0] + a[2] + tol and b[1] + b[3] <= a[1] + a[3] + tol)
+
+
+def _v27_composite_group_of(vj):
+    """The composite-group id a visual declares, or None.
+
+    Forward contract: the engine stamps every member of a deliberately-stacked composite (e.g. a
+    donut ring + its centre KPI card) with a shared PBIR ``parentGroupName``. An overlap between two
+    members of the SAME group is intentional and exempt; everything else is a real collision."""
+    g = vj.get("parentGroupName")
+    return g if g else None
+
+
+def _v27_geometry_defects(visuals, page_w, page_h):
+    """The scratch audit's exact per-page defect catalogue, made composite-group-aware."""
+    import collections as _c
+    d = _c.Counter()
+    for v in visuals:
+        r = _v27_rect(v)
+        if (r[0] < -_V27_TOL or r[1] < -_V27_TOL
+                or (page_w and r[0] + r[2] > page_w + _V27_TOL)
+                or (page_h and r[1] + r[3] > page_h + _V27_TOL)):
+            d["oob"] += 1
+        if r[2] <= 41.0 or r[3] <= 41.0:
+            d["floor"] += 1
+    import itertools as _it
+    for a, b in _it.combinations(visuals, 2):
+        ga, gb = _v27_composite_group_of(a), _v27_composite_group_of(b)
+        if ga is not None and ga == gb:
+            continue  # intentional composite (donut ring + centre card): exempt by design
+        ra, rb = _v27_rect(a), _v27_rect(b)
+        ia = _v27_inter(ra, rb)
+        if ia <= 4.0:
+            continue
+        small = min(ra[2] * ra[3], rb[2] * rb[3]) or 1
+        frac = ia / small
+        if _v27_contains(ra, rb) or _v27_contains(rb, ra):
+            d["contain"] += 1
+        elif frac > 0.02:
+            d["overlaps"] += 1
+    return d
+
+
+def _v27_pages(parts):
+    """Group emitted parts into {page_name: {display, w, h, visuals[]}} (skips the pages.json index)."""
+    pages = {}
+    for path, txt in parts.items():
+        norm = path.replace("\\", "/")
+        if norm.endswith("/page.json"):
+            name = norm.split("/pages/")[1].split("/")[0]
+            doc = json.loads(txt)
+            pg = pages.setdefault(name, {"display": name, "w": None, "h": None, "visuals": []})
+            pg["w"], pg["h"] = doc.get("width"), doc.get("height")
+            pg["display"] = doc.get("displayName") or name
+        elif norm.endswith("/visual.json"):
+            name = norm.split("/pages/")[1].split("/")[0]
+            pg = pages.setdefault(name, {"display": name, "w": None, "h": None, "visuals": []})
+            pg["visuals"].append(json.loads(txt))
+    return pages
+
+
+def _v27_defects_for(parts, display):
+    pages = _v27_pages(parts)
+    pg = next(p for p in pages.values() if p["display"] == display)
+    return _v27_geometry_defects(pg["visuals"], pg["w"], pg["h"]), pg
+
+
+# A clean, well-formed dashboard: two worksheets tiled side-by-side with a gutter -- the canonical
+# "good layout" a tidy migration should always produce (0 of every defect, charts full-size).
+_V27_CLEAN_TILED = _workbook(
+    _worksheet("Left", "Bar", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    + _worksheet("Right", "Line", "[federated.abc].[sum:Sales:qk]",
+                 "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+    "<dashboard name='Tiled'><size maxwidth='1200' maxheight='800' /><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("Left", x=0, y=10000, w=48000, h=80000, zid="2"),
+        _text_object_ws_zone("Right", x=52000, y=10000, w=48000, h=80000, zid="3"),
+    )
+    + "</zones></dashboard>",
+)
+
+# A deliberately thin worksheet band paired with a full chart -- guards that a thin view still
+# GENERATES (the "a thin view doesn't render at all" defect) rather than being dropped.
+_V27_THIN_WS = _workbook(
+    _worksheet("Skinny", "Bar", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    + _worksheet("Main", "Line", "[federated.abc].[sum:Sales:qk]",
+                 "[federated.abc].[mn:Order Date:ok]", deps_extra=_INST),
+    "<dashboard name='Thin'><size maxwidth='1200' maxheight='800' /><zones>"
+    + _text_object_container(
+        _text_object_ws_zone("Skinny", x=0, y=0, w=100000, h=3000, zid="2"),
+        _text_object_ws_zone("Main", x=0, y=5000, w=100000, h=85000, zid="3"),
+    )
+    + "</zones></dashboard>",
+)
+
+
+def _v27_stack(vt, x, y, w, h, group=None):
+    d = {"position": {"x": x, "y": y, "width": w, "height": h, "z": 0},
+         "visual": {"visualType": vt}}
+    if group:
+        d["parentGroupName"] = group
+    return d
+
+
+def test_v2_7_auditor_thresholds_contract():
+    # A clear overlap (>2% of the smaller rect) counts; a hairline touch (<=4px^2) does not; full
+    # nesting is a `contain`, not an `overlap`; a rect past the canvas edge is `oob`.
+    big = _v27_stack("clusteredColumnChart", 0, 0, 400, 400)
+    over = _v27_stack("lineChart", 200, 200, 400, 400)          # ~5% overlap of each
+    touch = _v27_stack("card", 400, 400, 100, 100)              # shares only a corner point
+    inside = _v27_stack("card", 50, 50, 60, 60)                 # fully inside `big`
+    oob = _v27_stack("card", 1260, 700, 100, 100)               # spills past a 1280x720 canvas
+    assert _v27_geometry_defects([big, over], 1280, 720)["overlaps"] == 1
+    assert _v27_geometry_defects([big, touch], 1280, 720)["overlaps"] == 0
+    d = _v27_geometry_defects([big, inside], 1280, 720)
+    assert d["contain"] == 1 and d["overlaps"] == 0
+    assert _v27_geometry_defects([oob], 1280, 720)["oob"] == 1
+
+
+def test_v2_7_clean_tiled_dashboard_is_defect_free():
+    # The golden clean page: a well-tiled two-chart dashboard has zero of every geometry defect
+    # (no overlap, no containment, in-bounds, and no chart squashed to the floor).
+    res = migrate_twb_to_pbir(_V27_CLEAN_TILED)
+    d, pg = _v27_defects_for(res["parts"], "Tiled")
+    assert len(pg["visuals"]) == 2
+    assert d["overlaps"] == 0 and d["contain"] == 0 and d["oob"] == 0 and d["floor"] == 0
+
+
+def test_v2_7_deoverlap_drives_messy_page_clean():
+    # Regression guard on the v2-2 tidy pass: a caption Tableau floated ON its chart must leave the
+    # emitted dashboard page with zero overlap / containment / out-of-bounds.
+    res = migrate_twb_to_pbir(_V2_DEOVERLAP_TWB)
+    d, _ = _v27_defects_for(res["parts"], "Messy")
+    assert d["overlaps"] == 0 and d["contain"] == 0 and d["oob"] == 0
+
+
+def test_v2_7_clear_caption_page_has_no_overlap():
+    # A page that was already tidy stays tidy: 0 overlaps, and the never-regress gate leaves it clean.
+    res = migrate_twb_to_pbir(_V2_CLEAR_CAPTION_TWB)
+    d, _ = _v27_defects_for(res["parts"], "Clean")
+    assert d["overlaps"] == 0 and d["contain"] == 0 and d["oob"] == 0
+
+
+def test_v2_7_caption_only_page_has_no_overlap():
+    # The v2-3 caption-only rebuild lands its textbox without colliding with the sibling chart.
+    res = migrate_twb_to_pbir(_V2_CAPTION_ONLY_STATIC)
+    d, _ = _v27_defects_for(res["parts"], "Board")
+    assert d["overlaps"] == 0 and d["contain"] == 0 and d["oob"] == 0
+
+
+def test_v2_7_thin_worksheet_still_emits():
+    # A thin worksheet band must still GENERATE a visual (not be dropped for being short); the full
+    # sibling chart is present too. Both marks reach the dashboard page.
+    res = migrate_twb_to_pbir(_V27_THIN_WS)
+    _, pg = _v27_defects_for(res["parts"], "Thin")
+    kinds = sorted(v["visual"]["visualType"] for v in pg["visuals"])
+    assert kinds == ["clusteredColumnChart", "lineChart"]
+
+
+def test_v2_7_composite_group_exempts_intragroup_stack():
+    # Donut safety: a ring + a centre card sharing a parentGroupName overlap BY DESIGN -> exempt.
+    ring = _v27_stack("donutChart", 100, 100, 200, 200, group="donut_1")
+    card = _v27_stack("card", 150, 150, 100, 100, group="donut_1")
+    d = _v27_geometry_defects([ring, card], 1280, 720)
+    assert d["overlaps"] == 0 and d["contain"] == 0
+
+
+def test_v2_7_ungrouped_stack_is_counted():
+    # The SAME two rects without the shared group are a real defect -- proving the exemption is what
+    # suppresses it, not a hole in the detector.
+    ring = _v27_stack("donutChart", 100, 100, 200, 200)
+    card = _v27_stack("card", 150, 150, 100, 100)
+    d = _v27_geometry_defects([ring, card], 1280, 720)
+    assert d["contain"] == 1
+
+
+def test_v2_7_composite_exemption_is_scoped_not_blanket():
+    # An ungrouped stray overlapping a grouped member is STILL counted: exemption is per-group, never
+    # a page-wide amnesty. (Ring+card grouped = exempt; a third ungrouped card on the ring = defect.)
+    ring = _v27_stack("donutChart", 100, 100, 200, 200, group="donut_1")
+    card = _v27_stack("card", 150, 150, 100, 100, group="donut_1")
+    stray = _v27_stack("card", 120, 120, 90, 90)               # overlaps the ring, no group
+    d = _v27_geometry_defects([ring, card, stray], 1280, 720)
+    assert d["overlaps"] + d["contain"] >= 1
+
+
+@pytest.mark.skipif(not os.environ.get("TFMIG_GEOM_GOLDEN_TWB"),
+                    reason="opt-in: set TFMIG_GEOM_GOLDEN_TWB to a real .twb to run the geometry golden")
+def test_v2_7_real_workbook_dashboards_have_zero_overlaps():
+    # Opt-in guard honouring "Superstore MUST stay 0 overlaps" without committing any workbook: point
+    # TFMIG_GEOM_GOLDEN_TWB at a real .twb locally and every emitted DASHBOARD page must be overlap-free.
+    with open(os.environ["TFMIG_GEOM_GOLDEN_TWB"], "r", encoding="utf-8-sig") as fh:
+        twb = fh.read()
+    res = migrate_twb_to_pbir(twb)
+    for name, pg in _v27_pages(res["parts"]).items():
+        if len(pg["visuals"]) < 2:
+            continue
+        d = _v27_geometry_defects(pg["visuals"], pg["w"], pg["h"])
+        assert d["overlaps"] == 0, f"page {pg['display']!r} has {d['overlaps']} overlap(s)"
