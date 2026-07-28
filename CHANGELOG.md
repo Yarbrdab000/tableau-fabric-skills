@@ -12,6 +12,29 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Changed
+
+- **tableau-migration (skill `2.31.0` -> `2.32.0`): the layout solver is now the DEFAULT engine.**
+  `--layout` still accepts `legacy` as an explicit escape hatch, and legacy remains the per-zone
+  runtime fallback inside solver mode, but a user who simply runs the tool now gets the solved
+  layout. Evidence for the flip, measured on the two-workbook corpus and confirmed by a Power BI
+  Desktop render: legacy places every dashboard title band ONE SLOT ABOVE the object it labels, so
+  on ATTI "Hierarchy Trending" the band "...ATTI (Days)" captions the filter row while
+  "...ATTR (Hours)" captions the table of ATTI *day* values -- a misreading-the-data defect, not a
+  cosmetic one. The solver associates both bands with their own tables. Estate geometry also
+  improves (3 overlaps + 4 containments -> 2 + 1) and the canvas does not inflate: of 17 pages, 12
+  are byte-identical, 3 differ by 1-2px, and 2 are SHORTER. Three `test_twb_to_pbir` tests that
+  assert legacy REPAIR-PASS semantics (the caption de-overlap gate, the 40px chart floor, the 64px
+  dropdown floor) are now pinned to `layout="legacy"`, naming the engine they were always testing;
+  the two CLI default tests assert solver and additionally assert that the legacy escape hatch
+  still reaches the frozen engine.
+  KNOWN OPEN, shipped deliberately: the solver emits more sub-64px dropdown slicers than legacy
+  (37 vs 20 of 62), whose controls Power BI clips. This is a PRE-EXISTING class -- legacy ships 20,
+  shortest 44.0px -- that the solver amplifies rather than introduces. The root cause is
+  `allocate`'s last-resort proportional squeeze, which is load-bearing for the containment
+  invariant; exempting control leaves from `_clamp_to_authored` was tried and rejected (it did not
+  reduce the count at all, and it inflated two canvases by 147px and 208px).
+
 ### Fixed
 
 - **tableau-migration (skill `2.30.0` -> `2.31.0`): parameter-control slicers were the one object class that silently bypassed the layout solver, and they caused every remaining overlap.**

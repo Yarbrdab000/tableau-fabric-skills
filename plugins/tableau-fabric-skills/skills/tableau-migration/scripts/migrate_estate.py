@@ -4209,12 +4209,14 @@ def main(argv=None):
                         help="build even if <output> already holds a prior report.json (overwrite "
                              "in place); the default is to STOP so a new run never silently mixes "
                              "with a previous run's stale outputs")
-    parser.add_argument("--layout", choices=("legacy", "solver"), default="legacy",
-                        help="dashboard zone-layout engine. 'legacy' (default) scales each zone's "
-                             "absolute rect independently and repairs collisions afterwards; "
-                             "'solver' resolves the whole zone TREE, so sibling zones cannot "
-                             "overlap by construction and fewer visuals are squashed to their "
-                             "minimum size. The default run is byte-identical.")
+    parser.add_argument("--layout", choices=("legacy", "solver"), default="solver",
+                        help="dashboard zone-layout engine. 'solver' (default) resolves the whole "
+                             "zone TREE, so sibling zones cannot overlap by construction and fewer "
+                             "visuals are squashed to their minimum size; 'legacy' scales each "
+                             "zone's absolute rect independently and repairs collisions afterwards. "
+                             "'legacy' is also the per-zone fallback inside the solver, so it is "
+                             "never fully bypassed -- pass it explicitly only to reproduce a "
+                             "pre-solver migration.")
     args = parser.parse_args(argv)
 
     try:

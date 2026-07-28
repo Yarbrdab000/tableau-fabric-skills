@@ -202,9 +202,9 @@ def test_migrate_estate_and_migrate_workbook_accept_layout():
     assert "layout" in inspect.signature(me.migrate_workbook).parameters
 
 
-def test_cli_exposes_layout_and_defaults_to_legacy(tmp_path, monkeypatch):
-    # The flag has to reach the ONE-BUTTON entry point, and the default must stay legacy so an
-    # existing run is byte-identical until a user opts in.
+def test_cli_exposes_layout_and_defaults_to_solver(tmp_path, monkeypatch):
+    # The flag has to reach the ONE-BUTTON entry point, and the default is the solver so a user who
+    # just runs the tool gets the placed layout. Legacy stays reachable as an explicit escape hatch.
     src = tmp_path / "in"
     src.mkdir()
     (src / "d.twb").write_text(
@@ -219,8 +219,12 @@ def test_cli_exposes_layout_and_defaults_to_legacy(tmp_path, monkeypatch):
 
     monkeypatch.setattr(me, "migrate_estate", spy)
     me.main(["-i", str(src), "-o", str(tmp_path / "a")])
-    assert seen["layout"] == "legacy"
+    assert seen["layout"] == "solver"
 
     seen.clear()
     me.main(["-i", str(src), "-o", str(tmp_path / "b"), "--layout", "solver"])
     assert seen["layout"] == "solver"
+
+    seen.clear()
+    me.main(["-i", str(src), "-o", str(tmp_path / "c"), "--layout", "legacy"])
+    assert seen["layout"] == "legacy"

@@ -7309,7 +7309,7 @@ def test_dropdown_filter_card_height_is_floored_at_64():
     ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
                     "[federated.abc].[none:Category:nk]", deps_extra=_INST, filters=filt)
     dash = _one_card_dashboard("W", "none:Region:nk", card_h=6000, card_y=90000)
-    slicers = _page_slicers(emit_pbir(parse_twb(_workbook(ws, dash))))
+    slicers = _page_slicers(emit_pbir(parse_twb(_workbook(ws, dash), layout="legacy")))
     assert len(slicers) == 1
     assert slicers[0]["position"]["height"] == 64.0
 
@@ -7550,7 +7550,9 @@ def test_thin_caption_sizes_to_content_not_inflated_to_floor():
     # Both the chart zone and the caption are authored at the same thin height (24px scaled). Before
     # v2-1 both were floored to 40. Now the caption keeps its content height while the chart still
     # floors -- proving the content-aware floor is caption-scoped and never lowers the chart floor.
-    res = migrate_twb_to_pbir(_V2_MIN_SIZE_TWB)
+    # Pinned to the legacy engine: this asserts a legacy REPAIR PASS. The solver seats the caption by
+    # solving the zone tree instead, so it never reaches the floor this test is about.
+    res = migrate_twb_to_pbir(_V2_MIN_SIZE_TWB, layout="legacy")
     by_type = {}
     for k, v in res["parts"].items():
         if not k.endswith("visual.json"):
@@ -7623,7 +7625,9 @@ def test_caption_overlapping_chart_is_lifted_clear():
 def test_clear_caption_is_untouched_by_deoverlap():
     # A caption already in a clear band must be byte-identical: the never-regress gate returns early
     # on a page with no caption<->anchor overlap, so the caption keeps its exact scaled position.
-    res = migrate_twb_to_pbir(_V2_CLEAR_CAPTION_TWB)
+    # Pinned to the legacy engine: the de-overlap gate is a legacy repair pass. Under the solver the
+    # caption is placed by the solve, so there is no "scaled position" to preserve.
+    res = migrate_twb_to_pbir(_V2_CLEAR_CAPTION_TWB, layout="legacy")
     vis = [json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")]
     cap = next(v for v in vis if v["visual"]["visualType"] == "textbox")
     chart = next(v for v in vis if v["visual"]["visualType"] == "lineChart")

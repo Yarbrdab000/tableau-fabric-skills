@@ -172,13 +172,17 @@ _PAGE_H_OVERRIDE = None
 # -- layout engine (Zone Geometry v3, frame track slice 4d) ----------------------
 # ``legacy`` scales each zone's normalized source rect straight into the page and repairs collisions
 # afterwards; ``solver`` resolves the dashboard's zone TREE first (``layout_plan``), so tiled siblings
-# receive disjoint intervals and overlap is unrepresentable rather than repaired. The engine is
-# OPT-IN: the default stays ``legacy`` so no existing migration changes output until the solver is
-# deliberately selected. ``_LAYOUT_PLAN`` is the plan for the dashboard currently being emitted -- set
-# and reset around each page exactly like the page overrides above -- and is the ONE thing
-# ``_scale_zone`` consults, which is why every emitted item records its ``zone_id`` (slice 4a).
+# receive disjoint intervals and overlap is unrepresentable rather than repaired. ``solver`` is the
+# DEFAULT: it resolves every zone on the corpus (no zone falls through), roughly halves the residual
+# collisions, and does not inflate the canvas -- most pages keep their exact legacy dimensions and the
+# two that change get SHORTER, landing on their authored size. ``legacy`` is retained for two reasons,
+# not as a rival engine: it is the per-zone FALLBACK inside ``_scale_zone`` for any zone the plan does
+# not name (fail-closed, never half-solved), and it remains selectable as an escape hatch.
+# ``_LAYOUT_PLAN`` is the plan for the dashboard currently being emitted -- set and reset around each
+# page exactly like the page overrides above -- and is the ONE thing ``_scale_zone`` consults, which
+# is why every emitted item records its ``zone_id`` (slice 4a).
 LAYOUT_ENGINES = ("legacy", "solver")
-LAYOUT_DEFAULT = "legacy"
+LAYOUT_DEFAULT = "solver"
 _LAYOUT_PLAN = None
 # Authored-px -> emitted-px scale for zone PADDING. Tableau stores a zone's margins in real pixels
 # while its rect is in normalized 0..100000 units, so the two need different scales; this is set per

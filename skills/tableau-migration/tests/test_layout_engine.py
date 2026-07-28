@@ -4,8 +4,9 @@ The solver stack (``zone_tree`` -> ``layout_solve`` -> ``layout_layers`` -> ``la
 into the emit path behind an opt-in ``layout="solver"`` switch. These tests pin the two halves of
 that contract:
 
-* **Never-regress.** ``legacy`` is the default and its output is unchanged -- the plan is not even
-  built, no rect is substituted, and every post-placement repair pass behaves exactly as before.
+* **Never-regress.** ``legacy`` output is unchanged and stays reachable as an explicit escape
+  hatch -- when it is selected the plan is not even built, no rect is substituted, and every
+  post-placement repair pass behaves exactly as before.
 * **Solver correctness.** When a plan exists, emit takes its rects VERBATIM (re-applying the min
   floors would re-inflate boxes the solver deliberately sized, re-introducing the overlap the tree
   solve removed), adopts the page the solve resolved (a solved rect is valid only on that page), and
@@ -78,26 +79,38 @@ def _pages(parts):
 # -- the never-regress half -----------------------------------------------------------------
 
 
-def test_layout_default_is_legacy():
-    assert LAYOUT_DEFAULT == "legacy"
+def test_layout_default_is_solver():
+    # The solver resolves every zone on the corpus, roughly halves residual collisions, and does not
+    # inflate the canvas, so it is what a plain run gets. ``legacy`` stays in ``LAYOUT_ENGINES``
+    # because it is still the per-zone fallback inside ``_scale_zone`` and an explicit escape hatch.
+    assert LAYOUT_DEFAULT == "solver"
     assert LAYOUT_ENGINES == ("legacy", "solver")
 
 
-def test_default_run_is_byte_identical_to_explicit_legacy():
-    # The seam must be inert unless asked for: omitting ``layout`` and passing ``legacy`` produce
-    # the exact same bytes, so an existing caller cannot drift onto the solver by accident.
+def test_default_run_is_byte_identical_to_explicit_solver():
+    # Omitting ``layout`` and naming the default must produce the exact same bytes, so a caller
+    # cannot drift onto a different engine by accident.
     xml = _two_sheet_workbook()
-    assert migrate_twb_to_pbir(xml)["parts"] == migrate_twb_to_pbir(xml, layout="legacy")["parts"]
+    assert migrate_twb_to_pbir(xml)["parts"] == migrate_twb_to_pbir(xml, layout="solver")["parts"]
+
+
+def test_explicit_legacy_remains_reachable_and_differs_from_the_default():
+    # The escape hatch has to actually escape: asking for legacy must still produce legacy output,
+    # not silently get the new default. Guards the flip itself.
+    xml = _two_sheet_workbook()
+    legacy = migrate_twb_to_pbir(xml, layout="legacy")
+    assert legacy["parts"]
+    assert parse_twb(xml, layout="legacy")["dashboards"][0]["layout_plan"] is None
 
 
 def test_legacy_parse_attaches_no_plan():
-    ir = parse_twb(_two_sheet_workbook())
+    ir = parse_twb(_two_sheet_workbook(), layout="legacy")
     assert ir["dashboards"][0]["layout_plan"] is None
 
 
 def test_legacy_emit_never_consults_a_plan(monkeypatch):
-    # Belt-and-braces: under the default engine the plan builder is not reached at all, so a
-    # solver-stack regression can never leak into the default path.
+    # Belt-and-braces: under the legacy engine the plan builder is not reached at all, so a
+    # solver-stack regression can never leak into an explicitly-legacy run.
     calls = []
 
     class _Boom:
@@ -107,7 +120,7 @@ def test_legacy_emit_never_consults_a_plan(monkeypatch):
             raise AssertionError("legacy must not build a layout plan")
 
     monkeypatch.setattr(twb_to_pbir, "_layout_plan", _Boom)
-    migrate_twb_to_pbir(_two_sheet_workbook())
+    migrate_twb_to_pbir(_two_sheet_workbook(), layout="legacy")
     assert calls == []
 
 
@@ -327,7 +340,7 @@ def test_cli_layout_solver_writes_a_report(tmp_path, capsys):
     assert (out / "Report.Report" / "definition" / "report.json").exists()
 
 
-def test_cli_defaults_to_legacy_when_the_flag_is_absent(tmp_path, capsys, monkeypatch):
+def test_cli_defaults_to_solver_when_the_flag_is_absent(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv("TWB_PBIR_LAYOUT", raising=False)
     src = tmp_path / "wb.twb"
     src.write_text(_two_sheet_workbook(), encoding="utf-8")
@@ -340,6 +353,13 @@ def test_cli_defaults_to_legacy_when_the_flag_is_absent(tmp_path, capsys, monkey
 
     monkeypatch.setattr(twb_to_pbir, "migrate_twb_to_pbir", _spy)
     main([str(src)])
+    capsys.readouterr()
+    assert seen["layout"] == "solver"
+
+    # ...and the escape hatch still reaches the frozen engine, so a user who hits a solver
+    # regression can fall back without editing the skill.
+    seen.clear()
+    main([str(src), "--layout", "legacy"])
     capsys.readouterr()
     assert seen["layout"] == "legacy"
 
