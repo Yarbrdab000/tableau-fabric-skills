@@ -20,10 +20,15 @@ import pytest
 
 # Build artifacts that legitimately differ between trees (or don't exist in git).
 _EXCLUDE_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
-_EXCLUDE_SUFFIXES = (".pyc", ".pyo")
+# ``.log`` is a RUNTIME artifact, never skill content: the Hyper API drops a ``hyperd.log`` into the
+# working directory, so any test or CLI run launched from a skill tree left one behind, ``robocopy
+# /MIR`` copied it into the plugin package, and this test then failed on a file that is gitignored
+# and ships in neither tree. Excluding it here keeps the guard honest about what actually ships.
+_EXCLUDE_SUFFIXES = (".pyc", ".pyo", ".log")
 
-_SKILL_NAMES = (
+_FALLBACK_SKILL_NAMES = (
     "tableau-datasource-profiler",
+    "tableau-fabric-datasource-comparison",
     "tableau-mcp-landing-zone",
     "tableau-migration",
 )
@@ -49,6 +54,29 @@ def _find_repo_root():
         if parent == cur:
             return None
         cur = parent
+
+
+def _discover_skills():
+    """Every skill in the canonical tree, discovered rather than listed.
+
+    A hardcoded roster silently stops guarding a skill the moment one is added -- which is exactly
+    what happened to ``tableau-fabric-datasource-comparison``, mirrored but unchecked. Discovering
+    the roster means a new skill is covered the day it lands. Falls back to the known names when the
+    repo layout isn't present (installed-skill context), where the test skips anyway.
+    """
+    root = _find_repo_root()
+    if root:
+        skills_dir = os.path.join(root, "skills")
+        found = sorted(
+            name for name in os.listdir(skills_dir)
+            if os.path.isfile(os.path.join(skills_dir, name, "SKILL.md"))
+        )
+        if found:
+            return tuple(found)
+    return _FALLBACK_SKILL_NAMES
+
+
+_SKILL_NAMES = _discover_skills()
 
 
 def _relevant(path_parts, filename):

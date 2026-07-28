@@ -2826,6 +2826,41 @@ def test_cli_main_runs_offline(fixtures_dir, tmp_path, capsys):
     assert "Next step:" in printed          # stubbed-calc check-in surfaced (widget_sales stubs one)
 
 
+def test_cli_main_rejects_an_input_path_that_does_not_exist(tmp_path, capsys):
+    # A typo'd -i used to build an EMPTY bundle and exit 0: "Bundle written to: ..." with 0/0
+    # workbooks reads as success, so the mistake surfaced much later, or never.
+    missing = str(tmp_path / "no_such_folder")
+    with pytest.raises(SystemExit) as exc:
+        me.main(["-i", missing, "-o", str(tmp_path / "out")])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "does not exist" in err
+    assert missing in err
+    assert not os.path.exists(str(tmp_path / "out"))
+
+
+def test_cli_main_rejects_an_input_path_that_is_a_file(tmp_path, capsys):
+    f = tmp_path / "workbook.twb"
+    f.write_text("<workbook/>", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        me.main(["-i", str(f), "-o", str(tmp_path / "out")])
+    assert exc.value.code == 2
+    assert "is not a directory" in capsys.readouterr().err
+
+
+def test_cli_main_says_plainly_when_a_real_folder_holds_nothing_to_migrate(tmp_path, capsys):
+    # An empty-but-valid folder still builds (recoverable, unlike a bad path) but must not read as
+    # a successful migration.
+    indir = tmp_path / "in"
+    indir.mkdir()
+    (indir / "readme.txt").write_text("not a tableau file", encoding="utf-8")
+    rc = me.main(["-i", str(indir), "-o", str(tmp_path / "out")])
+    assert rc == 0
+    printed = capsys.readouterr().out
+    assert "[WARN] Nothing to migrate" in printed
+    assert ".twbx" in printed
+
+
 def test_cli_main_no_pbip_flag_suppresses_projects(fixtures_dir, tmp_path, capsys):
     out = str(tmp_path / "b")
     rc = me.main(["-i", fixtures_dir, "-o", out, "--no-pbip"])

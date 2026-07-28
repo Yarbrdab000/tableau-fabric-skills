@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to this collection are documented here.
 
@@ -13,6 +13,12 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Fixed
+
+- **tableau-migration (skill `2.29.0` -> `2.30.0`): an end-to-end validation sweep found three ways a run could mislead you -- a runtime log leaking into the shipped package, a parity guard that never covered a fourth skill, and a mistyped input path that reported success.**
+  - **The Hyper API wrote its server log into the caller's working directory.** Every CLI run and every test launched from the skill tree dropped a `hyperd.log` there; the canonical copy had grown to 6.5 MB, and because `robocopy /MIR` mirrors whatever it finds, a multi-megabyte runtime log was being copied into the shipped plugin package. It also broke `test_mirror_parity` after *any* test run, which is why the documented workflow had grown a manual delete-then-re-mirror ritual. `hyper_reader` now starts `HyperProcess` with `log_dir` pointed at a temporary directory, falling back to the bare call if the installed `tableauhyperapi` does not accept the parameter -- reading an extract never fails because of a log-location preference. The two stale 10 MB logs are deleted.
+  - **`test_mirror_parity` silently skipped `tableau-fabric-datasource-comparison`.** The roster of skills to guard was a hardcoded list of three, written when the collection had three; the fourth skill has been mirrored but unguarded ever since. The roster is now discovered by walking `skills/*/SKILL.md`, so a new skill is covered the day it is added. A `.log` is also excluded from the comparison: a runtime log is never skill content, it is gitignored, and letting it fail the guard trains you to ignore the guard.
+  - **A mistyped `--input` exited 0 and wrote an empty bundle.** `migrate_estate` reported "Bundle written to: ..." with 0/0 workbooks, which reads as a successful migration, so a typo surfaced much later or never. A nonexistent or non-directory `--input` now fails fast with an actionable message that distinguishes the two cases. An input folder that exists but holds no Tableau file is a different, recoverable case and still builds -- but now says plainly that nothing was found and names the extensions it looked for.
+  - +5 lock-in tests: the log directory is redirected and the fallback still starts; a bad path and a file path are both rejected; an empty-but-real folder still builds and warns.
 
 - **tableau-migration (skill `2.28.0` -> `2.29.0`): every view-only quick table calc -- running total, moving average, percent-of-total -- was deleted from every shipped report.** The user hand-remediated a "Closed Inbound Referrals" running total that the engine had produced correctly in isolation but silently dropped from the bundle.
   - **Root cause: `migrate_estate` runs the visual stage TWICE and only the second pass ships.** Pass 1 runs bare to build the model; pass 2 re-runs rebound to it. `_apply_visual_calcs` yielded to the model whenever the pill's measure was `measure_rebound`, so the transform emitted in pass 1 and was suppressed in pass 2 -- invisible to unit tests, which only ever exercise one pass. Any future "works in a test, missing from the bundle" symptom should check this asymmetry first.

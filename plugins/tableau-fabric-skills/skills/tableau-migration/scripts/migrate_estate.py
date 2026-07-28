@@ -4228,6 +4228,15 @@ def main(argv=None):
         parser.error(str(exc))
     second_compile = bool(args.second_compile or authored)
 
+    # Fail fast on an input path that cannot possibly hold Tableau exports. Without this a typo'd
+    # -i silently produced an EMPTY bundle and exited 0 -- "Bundle written to: ..." with 0/0
+    # workbooks reads as success, so the mistake surfaces much later (or never). An input folder
+    # that exists but holds no Tableau file is a different, recoverable case and still builds.
+    if not os.path.isdir(args.input):
+        what = "is not a directory" if os.path.exists(args.input) else "does not exist"
+        parser.error(f"--input {os.path.abspath(args.input)} {what}. "
+                     "Point -i at a folder of Tableau exports (.twb/.twbx/.tds/.tdsx).")
+
     source = LocalFilesSource(args.input)
 
     if args.scan:
@@ -4289,6 +4298,12 @@ def main(argv=None):
             f"{s['workbook_calcs_needs_review']} need review"
         )
     print(f"Bundle written to: {os.path.abspath(args.output)}")
+    if not (s.get("workbooks_total") or s.get("datasources_total")):
+        # An input folder with nothing Tableau-shaped in it. The bundle is valid but EMPTY, and
+        # "Bundle written to: ..." on its own reads as success -- say plainly that nothing was
+        # found, and name the extensions that would have been, so the mistake is caught here.
+        print(f"[WARN] Nothing to migrate: no .twb/.twbx/.tds/.tdsx found under "
+              f"{os.path.abspath(args.input)} (searched recursively). The bundle is empty.")
     openable = report.get("openable_outputs") or []
     if openable:
         # Emit REAL absolute paths automatically -- the agent should never have to be asked for the

@@ -141,6 +141,26 @@ def _column_name(col):
     return getattr(name, "unescaped", None) or str(name)
 
 
+def _hyper_process(hapi, telemetry):
+    """``HyperProcess`` whose ``hyperd.log`` lands in a temp dir, not the caller's cwd.
+
+    The Hyper API writes its server log to the CURRENT WORKING DIRECTORY by default. Every CLI run
+    and every test run therefore dropped a ``hyperd.log`` into whatever directory it was launched
+    from -- in practice the skill's own source tree, where it grew to megabytes, was copied into the
+    plugin package by ``robocopy /MIR``, and broke the canonical<->mirror parity test after any test
+    run. Redirect it to a temp dir so reading an extract never writes outside ``out_dir``.
+
+    ``log_dir`` is passed as an optional process parameter and dropped if this ``tableauhyperapi``
+    release rejects it, so an older/newer API surface still starts (just with the old cwd behaviour).
+    """
+    log_dir = tempfile.mkdtemp(prefix="tableau_hyperlog_")
+    try:
+        return hapi.HyperProcess(telemetry=telemetry, parameters={"log_dir": log_dir})
+    except Exception:
+        shutil.rmtree(log_dir, ignore_errors=True)
+        return hapi.HyperProcess(telemetry=telemetry)
+
+
 def hyper_to_csv(hyper_path, out_dir, *, hapi=None, row_limit=None):
     """Read every table in ``hyper_path`` and write one local CSV per table into ``out_dir``.
 
@@ -159,7 +179,7 @@ def hyper_to_csv(hyper_path, out_dir, *, hapi=None, row_limit=None):
     # (DO_NOT_SEND_USAGE_DATA -> DO_NOT_SEND_USAGE_DATA_TO_TABLEAU); accept either.
     telemetry = (getattr(hapi.Telemetry, "DO_NOT_SEND_USAGE_DATA_TO_TABLEAU", None)
                  or getattr(hapi.Telemetry, "DO_NOT_SEND_USAGE_DATA"))
-    with hapi.HyperProcess(telemetry=telemetry) as process:
+    with _hyper_process(hapi, telemetry) as process:
         with hapi.Connection(endpoint=process.endpoint, database=str(hyper_path)) as connection:
             catalog = connection.catalog
             for schema in catalog.get_schema_names():
