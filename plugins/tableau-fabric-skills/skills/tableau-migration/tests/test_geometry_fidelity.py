@@ -207,6 +207,32 @@ def test_shape_evidence_outranks_a_bare_footprint_overlap():
     assert recs[0]["emitted"] == (0.0, 300.0, 200.0, 40.0)
 
 
+def test_a_worksheet_split_into_a_card_and_a_chart_matches_the_pieces_in_its_footprint():
+    # Measured on the real estate, and the reason evidence is weighted rather than ranked in tiers.
+    # One Tableau worksheet is routinely emitted as SEVERAL visuals -- a KPI card stacked over a
+    # spark chart -- so no single piece matches the authored size. Preferring shape outright made
+    # this worksheet match a same-size bar chart 380px down the page instead of the card sitting
+    # exactly where it was authored, inventing a whole-band displacement that never happened.
+    db = _dash("<zone id='1' x='23500' y='16500' w='22400' h='22300' type-v2='worksheet'/>")
+    recs = displacement_defects(
+        authored_leaves(db),
+        [_vis(229, 154, 221, 142), _vis(229, 296, 221, 103), _vis(683, 545, 228, 223)],
+        1000, 1000)
+    rec, = recs
+    assert rec["matched"] is True
+    assert rec["emitted"] == (229.0, 154.0, 221.0, 142.0)
+    assert rec["displacement"] < 100.0
+
+
+def test_a_full_page_backdrop_is_not_perfect_evidence_for_every_zone_it_covers():
+    # Overlap is scored intersection-over-UNION. Intersection-over-authored would make a backdrop
+    # that contains a zone score 1.0 -- perfect evidence -- and swallow the match.
+    db = _dash("<zone id='1' x='40000' y='40000' w='10000' h='10000' type-v2='text'/>")
+    recs = displacement_defects(authored_leaves(db),
+                                [_vis(0, 0, 1000, 1000), _vis(400, 600, 100, 100)], 1000, 1000)
+    assert recs[0]["emitted"] == (400.0, 600.0, 100.0, 100.0)
+
+
 def test_unmatched_leaves_rank_above_displacement_and_never_improve_the_summary():
     db = _dash("<zone id='1' x='0' y='0' w='10000' h='10000' type-v2='worksheet'/>"
                "<zone id='2' x='50000' y='0' w='10000' h='10000' type-v2='worksheet'/>")

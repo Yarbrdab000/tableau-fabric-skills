@@ -13,8 +13,37 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.26.0` → `2.27.0`): retract a false defect claim and weigh match
+  evidence instead of ranking it, so a visual split into two pieces stops reading as a moved band
+  (`scripts/geometry_audit.py`, `tests/test_geometry_fidelity.py`).**
+  **The "380px band displacement on the Intake page" reported in `2.26.0` below did not happen.**
+  It was an error in the auditor's own matching, not a defect in any migrated report. Verified
+  before acting on it: the layout plan places that page's charts and its full-width detail table
+  exactly where Tableau authors them, and both layout engines emit the same structure. The auditor
+  was wrong, and the retraction is the point — a measurement that names a defect nobody checked is
+  worse than no measurement.
+  The cause is general, so the fix is too. One Tableau worksheet is routinely emitted as SEVERAL
+  Power BI visuals — a KPI card stacked over a spark chart is the common case — and neither piece
+  then matches the authored worksheet's size. `2.26.0` ranked size evidence strictly above footprint
+  evidence, so a same-size chart 380px down the page beat the card sitting exactly in the authored
+  footprint. Ranking the other way is no better: it makes a caption match the chart it was authored
+  on top of instead of the copy that genuinely moved. Both orderings were measured producing wrong
+  matches on real output.
+  Neither signal deserves precedence, so they now compete on one cost —
+  `(1 - 0.75 * IoU) * (centre distance + size gap)` — with admissibility unchanged (overlap **or**
+  compatible shape). Overlap is scored intersection-over-**union** deliberately: with
+  intersection-over-authored, a full-page backdrop scores as perfect evidence for every zone it
+  covers and swallows one. The descriptive `match` label is now derived from the evidence rather
+  than from a sort tier, so the report schema is unchanged.
+  On the real estate this removes the phantom band displacement entirely (worst `worksheet`
+  displacement 833px → 484px) and lowers unmatched 5 → 4. What remains is a real, cross-workbook
+  class the false claim was masking: **full-width bottom-band objects emitted at roughly a third of
+  their authored width** (`Intake Details` authored 1344px wide, emitted 455px; `Engagements by
+  Dimension` authored 1324px, emitted 546px) — the next thing to fix.
+  +3 lock-in tests, including the card-plus-chart split that caused the false claim and the
+  backdrop case that forces intersection-over-union.
 - **tableau-migration (skill `2.25.0` → `2.26.0`): "unmatched" now really means DROPPED — tiered
-  match evidence, which uncovered a 380px band displacement the previous numbers hid entirely
+  match evidence *(the "380px band displacement" claimed here is RETRACTED — see `2.27.0` above)*
   (`scripts/geometry_audit.py`, `tests/test_geometry_fidelity.py`).**
   The overlap gate shipped in `2.25.0` fixed fabricated matches but introduced the opposite error:
   it can only recognise an object that still sits in its authored footprint, so an object that moved

@@ -462,6 +462,9 @@ def _pair_cost(a, b):
 SHAPE_REL_TOL = 0.15
 SHAPE_ABS_TOL = 8.0
 
+#: How much a strong footprint agreement is allowed to discount a pair's cost.
+OVERLAP_WEIGHT = 0.75
+
 
 def _shape_compatible(a, b, rel=SHAPE_REL_TOL, abs_px=SHAPE_ABS_TOL):
     """Is ``b`` the same SIZE of thing as ``a``, within tolerance on both axes?
@@ -476,6 +479,22 @@ def _shape_compatible(a, b, rel=SHAPE_REL_TOL, abs_px=SHAPE_ABS_TOL):
             and abs(bh - ah) <= max(abs_px, rel * abs(ah)))
 
 
+def _iou(a, b):
+    """Intersection over UNION -- deliberately symmetric.
+
+    Intersection-over-authored would score a full-page backdrop as perfect evidence for every small
+    zone it happens to cover. Union in the denominator means a big container swallowing a small
+    authored box is the weak evidence it actually is, while two rects of similar size sitting on each
+    other score high.
+    """
+    inter = intersection_area(a, b)
+    if inter <= 0:
+        return 0.0
+    union = a[2] * a[3] + b[2] * b[3] - inter
+    return inter / union if union > 0 else 0.0
+
+
+
 
 def displacement_defects(leaves, visuals, page_w, page_h, tolerance=24.0):
     """How far each authored object moved between Tableau and the emitted page.
@@ -488,24 +507,31 @@ def displacement_defects(leaves, visuals, page_w, page_h, tolerance=24.0):
     nothing was emitted for is the worse defect); ``displacement > tolerance`` and every unmatched
     leaf are flagged ``defect: True``.
 
-    Matching is EXCLUSIVE and EVIDENCE-TIERED, which is what makes the numbers trustworthy on a
-    dashboard nobody has looked at. A pair is only allowed on real evidence that the two are the same
-    object, strongest first:
+    Matching is EXCLUSIVE and EVIDENCE-WEIGHTED, which is what makes the numbers trustworthy on a
+    dashboard nobody has looked at. A pair is admissible only on real evidence that the two are the
+    same object -- it either still sits in the authored footprint (they intersect) or it is the same
+    SIZE within tolerance (dimensions are the evidence that survives a long move). The two signals
+    then COMPETE on one cost rather than being ranked in fixed tiers::
 
-    1. ``overlap+shape`` -- the emitted rect intersects the authored content box AND is the same size
-       within tolerance. Both signals agree.
-    2. ``shape`` -- same size, no overlap. This is the object that MOVED FAR; its footprint is gone
-       but its dimensions survived the move. Without this tier a large displacement -- precisely the
-       defect this audit exists to find -- would masquerade as a dropped visual.
-    3. ``overlap`` -- intersects but was substantially RESIZED (a full-width strip emitted at a fifth
-       of its width still sits in its own band).
+        cost = (1 - OVERLAP_WEIGHT * iou) * (centre distance + size gap)
 
-    A leaf with no candidate on any tier is reported ``matched: False``: nothing of that size exists
-    and nothing was emitted into its footprint, so the visual really is gone. That makes unmatched an
-    honest DROPPED-VISUAL signal rather than a mislabelled displacement. Every emitted visual is
-    consumed at most once, assigned greedily over pairs sorted by (tier, cost), so two authored
-    objects can no longer both claim the same tile and no leaf is ever charged a fabricated
-    displacement against the nearest stranger.
+    Fixed tiers get this wrong in both directions, and both errors were measured on real output.
+    Ranking footprint above shape makes a caption match the chart it was authored on top of instead
+    of the copy that moved 90px away. Ranking shape above footprint is worse: one Tableau worksheet
+    is often emitted as SEVERAL visuals (a KPI card stacked over a spark chart), so neither piece
+    matches the authored size, and a same-size chart 380px down the page wins over the card sitting
+    exactly where the worksheet was authored -- inventing a band displacement that never happened.
+    Letting both signals price a single cost resolves both cases without a precedence rule.
+
+    The overlap term uses intersection over UNION on purpose: intersection-over-authored would score
+    a full-page backdrop as perfect evidence for every zone it covers.
+
+    A leaf admissible on neither signal is genuinely gone -- nothing of its size exists anywhere on
+    the page and nothing was emitted into its footprint -- so ``matched: False`` is an honest
+    DROPPED-VISUAL signal rather than a mislabelled displacement. Every emitted visual is consumed at
+    most once, assigned greedily over the globally sorted costs, so two authored objects can never
+    both claim the same tile. Each record carries a ``match`` key naming which evidence admitted it
+    (``overlap+shape`` / ``shape`` / ``overlap``).
 
     It remains a RANKING tool: a rising median for one kind of zone names the class that regressed.
     """
@@ -517,27 +543,27 @@ def displacement_defects(leaves, visuals, page_w, page_h, tolerance=24.0):
         return []
     authored = [content_box(z, page_w, page_h) for z in audit]
 
-    tiers = ("overlap+shape", "shape", "overlap")
     pairs = []
     for li, a in enumerate(authored):
         for vi, b in enumerate(boxes):
-            overlaps = intersection_area(a, b) > 0
+            iou = _iou(a, b)
             shaped = _shape_compatible(a, b)
-            if overlaps and shaped:
-                tier = 0
-            elif shaped:
-                tier = 1
-            elif overlaps:
-                tier = 2
-            else:
+            if iou <= 0 and not shaped:
                 continue
-            pairs.append((tier, _pair_cost(a, b), li, vi))
-    pairs.sort()
+            if iou > 0 and shaped:
+                evidence = "overlap+shape"
+            elif shaped:
+                evidence = "shape"
+            else:
+                evidence = "overlap"
+            cost = (1.0 - OVERLAP_WEIGHT * iou) * _pair_cost(a, b)
+            pairs.append((cost, li, vi, evidence))
+    pairs.sort(key=lambda p: (p[0], p[1], p[2]))
     leaf_of, used = {}, set()
-    for tier, _, li, vi in pairs:
+    for _, li, vi, evidence in pairs:
         if li in leaf_of or vi in used:
             continue
-        leaf_of[li] = (vi, tier)
+        leaf_of[li] = (vi, evidence)
         used.add(vi)
 
     out = []
@@ -552,14 +578,14 @@ def displacement_defects(leaves, visuals, page_w, page_h, tolerance=24.0):
                 "match": None, "dx": None, "dy": None, "displacement": None, "defect": True,
             })
             continue
-        vi, tier = hit
+        vi, evidence = hit
         bx, by, bw, bh = boxes[vi]
         dx = (bx + bw / 2.0) - acx
         dy = (by + bh / 2.0) - acy
         out.append({
             "id": z["id"], "kind": z["kind"], "name": z["name"],
             "authored": (ax, ay, aw, ah), "emitted": (bx, by, bw, bh), "matched": True,
-            "match": tiers[tier],
+            "match": evidence,
             "dx": dx, "dy": dy, "displacement": abs(dx) + abs(dy),
             "defect": (abs(dx) + abs(dy)) > tolerance,
         })
