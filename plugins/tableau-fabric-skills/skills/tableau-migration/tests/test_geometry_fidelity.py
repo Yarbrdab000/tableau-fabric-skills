@@ -168,12 +168,43 @@ def test_records_are_ranked_worst_first():
 def test_an_authored_object_with_no_intersecting_visual_is_unmatched_not_mis_measured():
     # The dropped-visual signal. Nearest-centre matching used to hand this leaf whatever tile
     # happened to be closest and charge it a fabricated displacement, hiding a genuinely missing
-    # visual inside the distance median.
+    # visual inside the distance median. Nothing here shares its footprint OR its size.
     db = _dash("<zone id='1' x='0' y='0' w='10000' h='10000' type-v2='worksheet'/>")
-    rec, = displacement_defects(authored_leaves(db), [_vis(600, 600, 100, 100)], 1000, 1000)
+    rec, = displacement_defects(authored_leaves(db), [_vis(600, 600, 300, 50)], 1000, 1000)
     assert rec["matched"] is False
     assert rec["emitted"] is None and rec["displacement"] is None
     assert rec["defect"] is True
+
+
+def test_an_object_that_moved_far_is_a_displacement_not_a_dropped_visual():
+    # Measured on the real estate: an authored 166x49 caption was emitted 166x45, 93px higher up.
+    # A footprint-only matcher calls that a dropped visual -- mislabelling the single largest
+    # defect this audit exists to find as a different, scarier defect.
+    db = _dash("<zone id='1' x='3100' y='54700' w='16600' h='4900' type-v2='text'/>")
+    rec, = displacement_defects(authored_leaves(db), [_vis(31, 454, 166, 45)], 1000, 1000)
+    assert rec["matched"] is True
+    assert rec["match"] == "shape"
+    assert rec["displacement"] > 24.0 and rec["defect"] is True
+
+
+def test_a_substantially_resized_object_still_matches_on_its_footprint():
+    # The other half: a full-width strip emitted at a fifth of its width keeps no shape evidence,
+    # but it is still sitting in its own band, so it is a resize defect -- not a drop.
+    db = _dash("<zone id='1' x='700' y='73700' w='98600' h='4000' type-v2='worksheet'/>")
+    rec, = displacement_defects(authored_leaves(db), [_vis(291, 735, 259, 34)], 1000, 1000)
+    assert rec["matched"] is True
+    assert rec["match"] == "overlap"
+    assert rec["defect"] is True
+
+
+def test_shape_evidence_outranks_a_bare_footprint_overlap():
+    # Both candidates are admissible for the caption; the same-size one is the real object even
+    # though the chart it was authored on top of also intersects it.
+    db = _dash("<zone id='1' x='0' y='0' w='20000' h='4000' type-v2='text'/>")
+    recs = displacement_defects(authored_leaves(db),
+                                [_vis(0, 0, 600, 400), _vis(0, 300, 200, 40)], 1000, 1000)
+    assert recs[0]["match"] == "shape"
+    assert recs[0]["emitted"] == (0.0, 300.0, 200.0, 40.0)
 
 
 def test_unmatched_leaves_rank_above_displacement_and_never_improve_the_summary():

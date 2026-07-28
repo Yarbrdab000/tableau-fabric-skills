@@ -13,6 +13,31 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.25.0` → `2.26.0`): "unmatched" now really means DROPPED — tiered
+  match evidence, which uncovered a 380px band displacement the previous numbers hid entirely
+  (`scripts/geometry_audit.py`, `tests/test_geometry_fidelity.py`).**
+  The overlap gate shipped in `2.25.0` fixed fabricated matches but introduced the opposite error:
+  it can only recognise an object that still sits in its authored footprint, so an object that moved
+  a long way — precisely the defect this audit exists to find — was reported as a dropped visual.
+  Checked against the real estate, every single one of the nine "dropped" objects was actually
+  present and merely relocated (an authored `166x49` caption emitted `166x45`, 93px higher).
+  Mislabelling the biggest displacement defect as a different, scarier defect is worse than the
+  noise it replaced.
+  - Matching is now **evidence-tiered**, strongest first: `overlap+shape` (intersects its footprint
+    *and* is the same size), then `shape` (same size, moved off its footprint — dimensions are the
+    evidence that survives a move), then `overlap` (still in its band but substantially resized, e.g.
+    a full-width strip emitted at a fifth of its width). Assignment stays exclusive and greedy over
+    pairs sorted by `(tier, cost)`. Each record carries an additive `match` key naming the tier.
+  - A leaf with no candidate on any tier is genuinely gone — nothing of its size exists anywhere and
+    nothing was emitted into its footprint — so `matched: False` is now a trustworthy dropped-visual
+    signal rather than a mislabelled displacement.
+  - Measured over the real estate: unmatched **9 → 5** (all remaining are credible drops — two
+    parameter controls, an image legend, two worksheets), and every phantom `text` drop resolves to
+    the relocation it always was. **The correction immediately paid for itself**: with far-moved
+    objects matched to their true counterparts, the Intake page shows an authored row of four
+    `224x223` charts at `y=165` emitted at `y=545` — an entire band displaced 380px, invisible in the
+    previous run because those objects had been quietly paired with whichever neighbour they happened
+    to overlap.
 - **tableau-migration (skill `2.24.0` → `2.25.0`): the fidelity audit stops crying wolf — exclusive,
   overlap-gated matching plus a real dropped-visual signal (`scripts/geometry_audit.py`,
   `tests/test_geometry_fidelity.py`).**

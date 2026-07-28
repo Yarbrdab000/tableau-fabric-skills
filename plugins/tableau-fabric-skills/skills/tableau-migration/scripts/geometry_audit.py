@@ -458,6 +458,25 @@ def _pair_cost(a, b):
             + abs(bw - aw) + abs(bh - ah))
 
 
+#: A rect this close in BOTH dimensions is the same object even if it moved off its footprint.
+SHAPE_REL_TOL = 0.15
+SHAPE_ABS_TOL = 8.0
+
+
+def _shape_compatible(a, b, rel=SHAPE_REL_TOL, abs_px=SHAPE_ABS_TOL):
+    """Is ``b`` the same SIZE of thing as ``a``, within tolerance on both axes?
+
+    Position-independent on purpose. An object that moved a long way keeps its dimensions, so shape
+    is the evidence that survives displacement -- which is exactly the case footprint overlap cannot
+    see.
+    """
+    _, _, aw, ah = a
+    _, _, bw, bh = b
+    return (abs(bw - aw) <= max(abs_px, rel * abs(aw))
+            and abs(bh - ah) <= max(abs_px, rel * abs(ah)))
+
+
+
 def displacement_defects(leaves, visuals, page_w, page_h, tolerance=24.0):
     """How far each authored object moved between Tableau and the emitted page.
 
@@ -469,17 +488,24 @@ def displacement_defects(leaves, visuals, page_w, page_h, tolerance=24.0):
     nothing was emitted for is the worse defect); ``displacement > tolerance`` and every unmatched
     leaf are flagged ``defect: True``.
 
-    Matching is EXCLUSIVE and OVERLAP-GATED, which is what makes the numbers trustworthy on a
-    dashboard nobody has looked at:
+    Matching is EXCLUSIVE and EVIDENCE-TIERED, which is what makes the numbers trustworthy on a
+    dashboard nobody has looked at. A pair is only allowed on real evidence that the two are the same
+    object, strongest first:
 
-    * A pair is only allowed when the emitted rect actually INTERSECTS the authored content box. An
-      emitted visual that does not touch the footprint it was authored in is not that object, so a
-      leaf with no intersecting candidate is reported ``matched: False`` rather than being assigned
-      the nearest stranger and charged a fabricated displacement. That also turns a genuinely
-      DROPPED visual -- an authored object nothing was emitted for -- into its own honest signal
-      instead of hiding it inside the displacement median.
-    * Every emitted visual is consumed at most once, assigned greedily over the globally sorted
-      pair costs, so two authored objects can no longer both claim the same tile.
+    1. ``overlap+shape`` -- the emitted rect intersects the authored content box AND is the same size
+       within tolerance. Both signals agree.
+    2. ``shape`` -- same size, no overlap. This is the object that MOVED FAR; its footprint is gone
+       but its dimensions survived the move. Without this tier a large displacement -- precisely the
+       defect this audit exists to find -- would masquerade as a dropped visual.
+    3. ``overlap`` -- intersects but was substantially RESIZED (a full-width strip emitted at a fifth
+       of its width still sits in its own band).
+
+    A leaf with no candidate on any tier is reported ``matched: False``: nothing of that size exists
+    and nothing was emitted into its footprint, so the visual really is gone. That makes unmatched an
+    honest DROPPED-VISUAL signal rather than a mislabelled displacement. Every emitted visual is
+    consumed at most once, assigned greedily over pairs sorted by (tier, cost), so two authored
+    objects can no longer both claim the same tile and no leaf is ever charged a fabricated
+    displacement against the nearest stranger.
 
     It remains a RANKING tool: a rising median for one kind of zone names the class that regressed.
     """
@@ -491,38 +517,49 @@ def displacement_defects(leaves, visuals, page_w, page_h, tolerance=24.0):
         return []
     authored = [content_box(z, page_w, page_h) for z in audit]
 
+    tiers = ("overlap+shape", "shape", "overlap")
     pairs = []
     for li, a in enumerate(authored):
         for vi, b in enumerate(boxes):
-            if intersection_area(a, b) <= 0:
+            overlaps = intersection_area(a, b) > 0
+            shaped = _shape_compatible(a, b)
+            if overlaps and shaped:
+                tier = 0
+            elif shaped:
+                tier = 1
+            elif overlaps:
+                tier = 2
+            else:
                 continue
-            pairs.append((_pair_cost(a, b), li, vi))
+            pairs.append((tier, _pair_cost(a, b), li, vi))
     pairs.sort()
     leaf_of, used = {}, set()
-    for _, li, vi in pairs:
+    for tier, _, li, vi in pairs:
         if li in leaf_of or vi in used:
             continue
-        leaf_of[li] = vi
+        leaf_of[li] = (vi, tier)
         used.add(vi)
 
     out = []
     for li, z in enumerate(audit):
         ax, ay, aw, ah = authored[li]
         acx, acy = ax + aw / 2.0, ay + ah / 2.0
-        vi = leaf_of.get(li)
-        if vi is None:
+        hit = leaf_of.get(li)
+        if hit is None:
             out.append({
                 "id": z["id"], "kind": z["kind"], "name": z["name"],
                 "authored": (ax, ay, aw, ah), "emitted": None, "matched": False,
-                "dx": None, "dy": None, "displacement": None, "defect": True,
+                "match": None, "dx": None, "dy": None, "displacement": None, "defect": True,
             })
             continue
+        vi, tier = hit
         bx, by, bw, bh = boxes[vi]
         dx = (bx + bw / 2.0) - acx
         dy = (by + bh / 2.0) - acy
         out.append({
             "id": z["id"], "kind": z["kind"], "name": z["name"],
             "authored": (ax, ay, aw, ah), "emitted": (bx, by, bw, bh), "matched": True,
+            "match": tiers[tier],
             "dx": dx, "dy": dy, "displacement": abs(dx) + abs(dy),
             "defect": (abs(dx) + abs(dy)) > tolerance,
         })
