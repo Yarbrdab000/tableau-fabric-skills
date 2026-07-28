@@ -29,6 +29,12 @@ disk) into pages and scores each one, and exposes a small CLI::
 
     python scripts/geometry_audit.py <report.Report dir> [--json]
 
+A SECOND, complementary audit answers the question the defect catalogue cannot -- "did each object
+land where TABLEAU put it". ``authored_leaves`` / ``displacement_defects`` / ``displacement_summary``
+match authored leaf zones to emitted visuals and rank them by displacement, so a whole CLASS of
+infidelity (a discarded padding model, a mis-scaled axis, an unplaced float) shows up as a rising
+median for one kind of zone instead of as one visibly wrong dashboard.
+
 Pure, deterministic, stdlib-only. NO emit dependency, NO ``twb_to_pbir`` import: the auditor scores
 already-emitted geometry, so it can be re-imported by the test suite and driven by the A/B harness
 in isolation.
@@ -275,6 +281,210 @@ def parts_from_dir(report_dir):
                 with open(full, encoding="utf-8") as fh:
                     parts[rel] = fh.read()
     return parts
+
+
+# ---------------------------------------------------------------------------------------------
+# SOURCE-vs-OUTPUT FIDELITY
+#
+# ``geometry_defects`` above asks "is the emitted page internally well-formed" -- nothing overlaps,
+# nothing is squashed, nothing spills. A page can pass all of that and still be WRONG, because it
+# says nothing about whether an object landed where TABLEAU put it. The check below closes that gap:
+# it matches each authored leaf zone to its emitted visual and measures the displacement, which is
+# what surfaces a whole CLASS of infidelity (a dropped padding model, a mis-scaled axis, an ignored
+# float) rather than one bad dashboard.
+#
+# Two exclusions keep the signal honest, both learned by running it across a real estate:
+#   * DEGENERATE zones (authored width or height ~0) are persistence slivers, not objects -- they
+#     have no meaningful centre, so a "displacement" for them is noise that dominates the ranking.
+#   * CONTAINER zones (``empty`` / ``layout-flow`` / ``layout-basic``) are layout scaffolding that
+#     Power BI has no equivalent for. They are deliberately NOT emitted, so matching them to the
+#     nearest visual compares an object against something it was never meant to be.
+# ---------------------------------------------------------------------------------------------
+
+#: Authored zone kinds that are layout scaffolding rather than a drawn object.
+CONTAINER_ZONE_KINDS = frozenset({"empty", "layout-flow", "layout-basic", "layout-flow-v2"})
+
+#: An authored zone thinner than this (in 0..100000 source units) is a persistence sliver.
+DEGENERATE_ZONE_UNITS = 2.0
+
+_ZONE_SIDES = ("top", "right", "bottom", "left")
+
+#: Tableau's documented default outer padding, in authored pixels.
+_DEFAULT_OUTER_PAD = 4.0
+
+
+def _zone_pad_excess(zone_el):
+    """The ASYMMETRIC part of a zone's outer padding, in authored px, or ``None``.
+
+    Tableau draws an object in the content box left after ``<zone-style><format attr='margin'>``
+    (plus per-side ``margin-top`` / ``-right`` / ``-bottom`` / ``-left`` overrides). Only the excess
+    over the smallest side actually MOVES the content -- a uniform inset shrinks evenly and leaves
+    the centre where it was. Mirrors the emitter's rule so the audit and the emit agree on what
+    "where Tableau drew it" means; if they disagreed, this net would penalise a correct page.
+    """
+    def _local(tag):
+        return tag.rsplit("}", 1)[-1]
+
+    style = next((c for c in zone_el if _local(c.tag) == "zone-style"), None)
+    if style is None:
+        return None
+    sides = dict.fromkeys(_ZONE_SIDES, _DEFAULT_OUTER_PAD)
+    saw = False
+    for fmt in style:
+        if _local(fmt.tag) != "format":
+            continue
+        attr = (fmt.get("attr") or "").strip().lower()
+        if not attr.startswith("margin"):
+            continue
+        try:
+            val = float(fmt.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if attr == "margin":
+            sides = dict.fromkeys(_ZONE_SIDES, val)
+            saw = True
+        elif attr[7:] in _ZONE_SIDES:
+            sides[attr[7:]] = val
+            saw = True
+    if not saw:
+        return None
+    vals = [sides[s] for s in _ZONE_SIDES]
+    if max(vals) - min(vals) < 1.0:
+        return None
+    base = min(vals)
+    return tuple(v - base for v in vals)
+
+
+def authored_leaves(dashboard_el):
+    """Leaf zones of a Tableau ``<dashboard>`` element, in page FRACTIONS (0..1).
+
+    Only the dashboard's default ``<zones>`` subtree is read. ``<devicelayouts>`` re-states the same
+    zone ids with phone/tablet geometry; folding those in silently compares a desktop visual against
+    a phone rect. Each leaf is ``{id, kind, name, fx, fy, fw, fh, pad}``, where ``pad`` is the
+    asymmetric outer-padding excess in authored pixels (or ``None``) -- the difference between the
+    zone rect and the CONTENT BOX Tableau actually draws in. A zone with child zones is a container
+    and is skipped -- only what actually draws is returned.
+    """
+    def _local(tag):
+        return tag.rsplit("}", 1)[-1]
+
+    zones_el = next((c for c in dashboard_el if _local(c.tag) == "zones"), None)
+    if zones_el is None:
+        return []
+    seen, leaves = set(), []
+    for z in zones_el.iter():
+        if _local(z.tag) != "zone":
+            continue
+        zid = z.get("id")
+        if zid is None or zid in seen:
+            continue
+        if any(_local(c.tag) == "zone" for c in z):
+            continue
+        try:
+            x, y, w, h = (float(z.get(k)) for k in ("x", "y", "w", "h"))
+        except (TypeError, ValueError):
+            continue
+        seen.add(zid)
+        leaves.append({
+            "id": zid,
+            "kind": (z.get("type-v2") or z.get("type") or "worksheet"),
+            "name": z.get("name") or z.get("param") or "",
+            "fx": x / 100000.0, "fy": y / 100000.0,
+            "fw": w / 100000.0, "fh": h / 100000.0,
+            "pad": _zone_pad_excess(z),
+            "_units": (w, h),
+        })
+    return leaves
+
+
+def content_box(leaf, page_w, page_h):
+    """The ``(x, y, w, h)`` page-pixel box Tableau DRAWS the leaf in -- its rect minus asymmetric padding.
+
+    This, not the raw zone rect, is the fidelity target: a 133px icon zone carrying
+    ``margin-bottom=85`` draws its icon in a 44px band at the TOP. Measuring against the raw rect
+    would score a correctly-placed icon as displaced and a wrongly-placed one as perfect.
+    """
+    x, y = leaf["fx"] * page_w, leaf["fy"] * page_h
+    w, h = leaf["fw"] * page_w, leaf["fh"] * page_h
+    pad = leaf.get("pad")
+    if not pad:
+        return x, y, w, h
+    top, right, bottom, left = pad
+    nw, nh = w - (left + right), h - (top + bottom)
+    if nw < 1.0 or nh < 1.0:
+        return x, y, w, h
+    return x + left, y + top, nw, nh
+
+
+def auditable_leaves(leaves):
+    """Drop the leaves whose displacement is meaningless (containers + degenerate slivers)."""
+    out = []
+    for z in leaves:
+        if z.get("kind") in CONTAINER_ZONE_KINDS:
+            continue
+        uw, uh = z.get("_units") or (z["fw"] * 100000.0, z["fh"] * 100000.0)
+        if uw < DEGENERATE_ZONE_UNITS or uh < DEGENERATE_ZONE_UNITS:
+            continue
+        out.append(z)
+    return out
+
+
+def displacement_defects(leaves, visuals, page_w, page_h, tolerance=24.0):
+    """How far each authored object moved between Tableau and the emitted page.
+
+    ``leaves`` come from :func:`authored_leaves` (page fractions), ``visuals`` are emitted visual
+    JSON dicts. Each auditable leaf is matched to the emitted visual whose centre is nearest, and the
+    Manhattan distance between the two centres is its displacement -- measured against the leaf's
+    CONTENT BOX (:func:`content_box`), which is where Tableau actually draws, not the raw zone rect.
+    Returns a list of records sorted worst-first; any record with ``displacement > tolerance`` is
+    also flagged ``defect: True``.
+
+    Nearest-centre matching is a heuristic -- it is unambiguous when the page is roughly faithful and
+    degrades gracefully when it is not, which is exactly the regime this check is for. It is a
+    RANKING tool: a rising median for one kind of zone names the class that regressed.
+    """
+    if page_w <= 0 or page_h <= 0:
+        return []
+    boxes = [(rect(v), v) for v in visuals]
+    if not boxes:
+        return []
+    out = []
+    for z in auditable_leaves(leaves):
+        ax, ay, aw, ah = content_box(z, page_w, page_h)
+        acx, acy = ax + aw / 2.0, ay + ah / 2.0
+        best, best_d = None, None
+        for (bx, by, bw, bh), vj in boxes:
+            d = abs(bx + bw / 2.0 - acx) + abs(by + bh / 2.0 - acy)
+            if best_d is None or d < best_d:
+                best, best_d = (bx, by, bw, bh), d
+        dx = (best[0] + best[2] / 2.0) - acx
+        dy = (best[1] + best[3] / 2.0) - acy
+        out.append({
+            "id": z["id"], "kind": z["kind"], "name": z["name"],
+            "authored": (ax, ay, aw, ah), "emitted": best,
+            "dx": dx, "dy": dy, "displacement": abs(dx) + abs(dy),
+            "defect": (abs(dx) + abs(dy)) > tolerance,
+        })
+    out.sort(key=lambda r: -r["displacement"])
+    return out
+
+
+def displacement_summary(records):
+    """Per-zone-kind ``{n, median, p90, max, defects}`` roll-up of :func:`displacement_defects`."""
+    by_kind = collections.defaultdict(list)
+    for r in records:
+        by_kind[r["kind"]].append(r["displacement"])
+    summary = {}
+    for kind, ds in by_kind.items():
+        s = sorted(ds)
+        summary[kind] = {
+            "n": len(s),
+            "median": s[len(s) // 2],
+            "p90": s[min(int(len(s) * 0.9), len(s) - 1)],
+            "max": s[-1],
+            "defects": sum(1 for r in records if r["kind"] == kind and r["defect"]),
+        }
+    return summary
 
 
 def main(argv=None):

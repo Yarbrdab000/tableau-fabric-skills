@@ -115,10 +115,13 @@ def test_rebind_opt_in_does_not_change_canonical_report(tmp_path):
 
     a = json.load(open(os.path.join(plain, "report.json"), encoding="utf-8"))
     b = json.load(open(os.path.join(withp, "report.json"), encoding="utf-8"))
-    # generated_at (timestamp) and openable_outputs (absolute paths under each distinct output dir)
-    # differ by construction between the two runs -- drop both before comparing the canonical content.
+    # generated_at (timestamp), input_manifest.verified_at_utc (a second-resolution wall-clock stamp,
+    # so the two back-to-back runs agree only while they land inside the same UTC second -- on a loaded
+    # machine they straddle it) and openable_outputs (absolute paths under each distinct output dir)
+    # differ by construction between the two runs -- drop all three before comparing canonical content.
     a.pop("generated_at"); b.pop("generated_at")
     a.pop("openable_outputs"); b.pop("openable_outputs")
+    a["input_manifest"].pop("verified_at_utc"); b["input_manifest"].pop("verified_at_utc")
     assert a == b
     assert (tmp_path / "withp" / "semantic_models" / "Orders DS.SemanticModel").is_dir()
 

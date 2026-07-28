@@ -178,6 +178,10 @@ _PAGE_H_OVERRIDE = None
 LAYOUT_ENGINES = ("legacy", "solver")
 LAYOUT_DEFAULT = "legacy"
 _LAYOUT_PLAN = None
+# Authored-px -> emitted-px scale for zone PADDING. Tableau stores a zone's margins in real pixels
+# while its rect is in normalized 0..100000 units, so the two need different scales; this is set per
+# dashboard beside the page overrides and reset with them.
+_ZONE_PAD_SCALE = (1.0, 1.0)
 # A Power BI slicer fills its whole rectangle, unlike a Tableau filter *card*, which renders its
 # control inset inside the zone with padding. Tableau packs filter zones edge-to-edge (tangent in
 # BOTH axes) and relies on that per-card padding for the visible gaps, so emitting a slicer at the
@@ -3769,6 +3773,7 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
                     "text": text, "fill": fill,
                     "text_color": _zone_run_color(zone) or "#ffffff",
                     "zone_id": zone.get("id"),
+                    "pad": _parse_zone_padding(_first(zone, "zone-style")),
                     "x": x, "y": y, "w": w, "h": h})
             # Additively capture EVERY text zone that carries content (fill OPTIONAL) as a general
             # text object -- the section-header caption bars (Director / Manager / Supervisor /
@@ -3786,6 +3791,7 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
                     "text": text, "fill": fill2, "transparency": tpct,
                     "text_color": run_color or "#000000", "bold": run_bold, "font_size": run_size,
                     "zone_id": zone.get("id"),
+                    "pad": _parse_zone_padding(_first(zone, "zone-style")),
                     "x": x, "y": y, "w": w, "h": h})
         # A dashboard FILTER card -- the filter the author actually exposed on the dashboard surface
         # (possibly nested inside a collapsible layout container; the zone walk recurses) -- is what
@@ -3813,6 +3819,7 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
                         "token": ftok, "x": x, "y": y, "w": w, "h": h,
                         "mode": zone.get("mode"),
                         "zone_id": zone.get("id"),
+                        "pad": _parse_zone_padding(_first(zone, "zone-style")),
                         "hidden": zone.get("hidden-by-user") == "true",
                     })
             continue
@@ -3826,6 +3833,7 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
                 seen_params.add(pid)
                 param_controls.append({"param_id": pid, "x": x, "y": y, "w": w, "h": h,
                                        "zone_id": zone.get("id"),
+                                       "pad": _parse_zone_padding(_first(zone, "zone-style")),
                                        "mode": zone.get("mode")})
             continue
         # A dashboard IMAGE object: either a straight bitmap (``type-v2='bitmap'`` with
@@ -3852,6 +3860,7 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
                             image_zones.append({
                                 "id": zone.get("id"),
                                 "zone_id": zone.get("id"),
+                                "pad": _parse_zone_padding(_first(zone, "zone-style")),
                                 "kind": "image" if ztype == "bitmap" else "button",
                                 "image": ref, "x": x, "y": y, "w": w, "h": h,
                                 "url": zone.get("url"),
@@ -7220,6 +7229,59 @@ def _position(x, y, w, h, z=0, tab=0):
             "width": round(w, 2), "height": round(h, 2), "tabOrder": tab}
 
 
+def _zone_pad_inset(zone):
+    """The part of a zone's OUTER padding that actually DISPLACES its content, or ``None``.
+
+    Tableau stores a dashboard object's outer padding as ``<zone-style><format attr='margin'>``
+    (all sides) plus optional per-side ``margin-top`` / ``-right`` / ``-bottom`` / ``-left``
+    overrides, in real pixels. The object is drawn in the CONTENT BOX left after that padding --
+    which is why a 133px-tall icon zone carrying ``margin=4`` + ``margin-bottom=85`` renders its
+    icon in a 44px band at the TOP of the zone, not floating in the middle of it. Power BI has no
+    zone concept: a visual fills its whole rectangle and centres its image, so emitting the raw
+    zone rect drops the icon ~46px below where Tableau draws it.
+
+    Only the ASYMMETRIC excess is returned. A uniform inset (including Tableau's documented 4px
+    default) shrinks an object evenly and does not move its centre, and the layout model already
+    accounts for that separation via its own inter-sibling gap; subtracting it again here would
+    shrink every visual on every dashboard for no fidelity gain. Non-uniform padding is different
+    in kind -- it is the author positioning content WITHIN its zone, and it is the only part we are
+    currently discarding. Returns ``(top, right, bottom, left)`` px, or ``None`` when the padding
+    is uniform/absent.
+    """
+    pad = zone.get("pad") if isinstance(zone, dict) else None
+    if not pad:
+        return None
+    outer = pad.get("outer") or {}
+    try:
+        vals = [float(outer[s]) for s in _SIDES]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if max(vals) - min(vals) < 1.0:
+        return None
+    base = min(vals)
+    return tuple(v - base for v in vals)
+
+
+def _apply_zone_padding(rect, zone):
+    """Inset ``rect`` by the zone's displacing outer padding. Only ever SHRINKS the rect.
+
+    Because the result is strictly contained in the rect it replaces, this can never introduce an
+    overlap the layout engine had already resolved -- the same containment argument that lets the
+    slicer inset run after the solve.
+    """
+    ins = _zone_pad_inset(zone)
+    if ins is None:
+        return rect
+    sx, sy = _ZONE_PAD_SCALE
+    top, right, bottom, left = ins
+    x, y, w, h = rect
+    nx, ny = x + left * sx, y + top * sy
+    nw, nh = w - (left + right) * sx, h - (top + bottom) * sy
+    if nw < 1.0 or nh < 1.0:
+        return rect
+    return nx, ny, nw, nh
+
+
 def _scale_zone(zone, ref_w, ref_h, min_w=40.0, min_h=40.0):
     # THE layout choke point. Under the solver engine a resolved rect for this zone (looked up by the
     # ``zone_id`` slice 4a records at capture time) replaces the naive scale-and-clamp below: the
@@ -7230,7 +7292,7 @@ def _scale_zone(zone, ref_w, ref_h, min_w=40.0, min_h=40.0):
     # failed to build) falls through to the legacy path unchanged -- fail-closed, never half-solved.
     solved = _solved_rect(zone)
     if solved is not None:
-        return solved
+        return _apply_zone_padding(solved, zone)
     pw = _page_w()
     ph = _page_h()
     sx = pw / ref_w if ref_w else 1
@@ -7239,7 +7301,7 @@ def _scale_zone(zone, ref_w, ref_h, min_w=40.0, min_h=40.0):
     y = max(0.0, min(zone["y"] * sy, ph - 1))
     w = max(min_w, min(zone["w"] * sx, pw - x))
     h = max(min_h, min(zone["h"] * sy, ph - y))
-    return x, y, w, h
+    return _apply_zone_padding((x, y, w, h), zone)
 
 
 def _solved_rect(zone):
@@ -7825,7 +7887,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     page_order = []
     placed = set()
 
-    global _PAGE_H_OVERRIDE, _PAGE_W_OVERRIDE, _LAYOUT_PLAN
+    global _PAGE_H_OVERRIDE, _PAGE_W_OVERRIDE, _LAYOUT_PLAN, _ZONE_PAD_SCALE
     for db in ir["dashboards"]:
         page_name = _sanitize("page-" + (db["name"] or "dashboard"))
         zones = db["zones"]
@@ -7845,6 +7907,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         _auto_w, _auto_h = _automatic_canvas_dims(db["size"].get("min_w"), db["size"].get("min_h"))
         _PAGE_W_OVERRIDE = db["size"]["w"] or _auto_w or DASH_DEFAULT_W
         _PAGE_H_OVERRIDE = db["size"]["h"] or _auto_h or DASH_DEFAULT_H
+        _authored_px_w, _authored_px_h = _PAGE_W_OVERRIDE, _PAGE_H_OVERRIDE
         # Solver engine: activate this dashboard's plan and ADOPT the page it resolved. Growth is not
         # cosmetic -- the solver enlarges the page (bounded by MAX_GROWTH) precisely so the content
         # fits, so its rects are valid ONLY on that page. Keeping the authored page while using solved
@@ -7854,6 +7917,11 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         _LAYOUT_PLAN = db.get("layout_plan")
         if _LAYOUT_PLAN:
             _PAGE_W_OVERRIDE, _PAGE_H_OVERRIDE = _LAYOUT_PLAN["page"]
+        # Zone padding is authored in real pixels against the AUTHORED canvas, so it scales by the
+        # authored->emitted page ratio (not by the 0..100000 zone scale). Identity in the normal
+        # case where the emitted page is the authored size.
+        _ZONE_PAD_SCALE = ((_page_w() / _authored_px_w) if _authored_px_w else 1.0,
+                           (_page_h() / _authored_px_h) if _authored_px_h else 1.0)
         visuals = []
         page_ws = []
         for i, zone in enumerate(zones):
@@ -8106,6 +8174,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     _PAGE_W_OVERRIDE = None
     _PAGE_H_OVERRIDE = None
     _LAYOUT_PLAN = None
+    _ZONE_PAD_SCALE = (1.0, 1.0)
     for ws in ir["worksheets"]:
         if ws["name"] in placed or ws["visual_type"] == VT_UNSUPPORTED:
             continue

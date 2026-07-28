@@ -13,6 +13,44 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.23.0` → `2.24.0`): Tableau zone padding is now honored, and a shipped
+  source-vs-output fidelity audit names the class if it ever regresses (`scripts/twb_to_pbir.py`,
+  `scripts/geometry_audit.py`, `tests/test_zone_padding.py`, `tests/test_geometry_fidelity.py`,
+  `tests/test_migrate_estate_rebind.py`).**
+  A Tableau zone is a *box*; the object is drawn in the content area left after the zone's margins.
+  `_parse_zone_padding` had resolved that `<zone-style>` margin model since long before this release
+  and **had zero callers** — every zone was emitted at its raw rect, and Power BI (which centres a
+  visual's image inside its rect) drew the content in the wrong place. On a real customer dashboard
+  the icon strip authored `margin=4` with `margin-bottom=85` — a 44px content box at the *top* of a
+  133px zone — was emitted at the full 133px and rendered ~46px low, under the breadcrumb instead of
+  beside the logo.
+  - **The emitter now applies the padding, but only its ASYMMETRIC EXCESS.** `_zone_pad_inset` returns
+    nothing when the four margins agree within 1px: a uniform inset shrinks a rect evenly, moves no
+    centre, and the layout model already supplies separation through its own gap — subtracting it
+    again would shrink every visual on every dashboard for no fidelity gain. Only the per-side excess
+    over the smallest margin — the part that actually displaces the content — is applied.
+  - **It can only ever shrink.** `_apply_zone_padding` returns a rect strictly inside the one it
+    replaces (and refuses to collapse below 1px), so it cannot re-introduce an overlap the layout
+    solver resolved. It is applied at the single `_scale_zone` choke point, on both the solved-rect
+    and the legacy scale-and-clamp branch, so both engines agree.
+  - Margins are authored **pixels** while zone rects are 0..100000 normalized units, so the inset is
+    converted through a new `_ZONE_PAD_SCALE` derived from the emitted page over the authored size.
+  - **`geometry_audit` gained a source-vs-output displacement audit** (`authored_leaves`,
+    `content_box`, `auditable_leaves`, `displacement_defects`, `displacement_summary`) — additive; the
+    existing per-page defect catalogue is untouched. Building it surfaced a trap worth recording: an
+    audit that measures against the **raw zone rect** scores the *broken* output as perfect and the
+    *correct* output as displaced. It measures against the content box, using the same asymmetric-
+    excess rule as the emitter, so the net can never contradict the fix. Container kinds
+    (`layout-flow`/`layout-basic`/`empty`) and degenerate sub-2-unit slivers are excluded.
+  - Measured over the real two-workbook estate (8 pages, 189 objects): the `dashboard-object` class
+    goes from **6 displacement defects (median 42px) to 0 (median 2px)**, `bitmap` 3 → 1, with page
+    defect and squashed-zone counts unchanged. Render-verified through the Power BI Desktop bridge.
+  - Also fixed a **latent flake** in `test_rebind_opt_in_does_not_change_canonical_report`: it compares
+    two back-to-back `migrate_estate` runs but popped only `generated_at` and `openable_outputs`, while
+    `report["input_manifest"]["verified_at_utc"]` is a second-resolution wall-clock stamp — so the test
+    passed only while both runs landed inside the same UTC second, and failed on a loaded machine. It
+    now pops that stamp too.
+
 - **tableau-migration (skill `2.22.0` → `2.23.0`): a caption can no longer inflate the canvas — the
   page lands at the size the Tableau author drew (`scripts/layout_solve.py`,
   `scripts/layout_plan.py`, `tests/test_layout_containment.py`, `tests/test_layout_solve.py`,
