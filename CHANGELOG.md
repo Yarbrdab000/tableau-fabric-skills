@@ -13,6 +13,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.33.0` -> `2.34.0`): a rebuild no longer re-identifies every object
+  in the model.** Each `lineageTag`, relationship GUID and random `PBI_Id` was a fresh `uuid4()`,
+  so re-running an UNCHANGED migration rewrote all 53 TMDL files and 508 identity GUIDs. Power BI
+  and Fabric Git integration match objects across deploys by exactly those tags, so the churn made
+  review diffs unreadable and let a redeploy drop-and-recreate objects instead of updating them --
+  taking the report bindings, refresh history and per-object settings with them. The tags are now
+  re-derived after assembly from each object's own identity PATH (`table:Orders/column:Sales`) via
+  UUIDv5, so the same model always yields the same tags and a renamed or added object perturbs only
+  its OWN tag. Done as a post-pass over the assembled parts because the owning table name is not in
+  scope inside the column / measure / hierarchy renderers, and a tag keyed on the column name alone
+  would collide the moment two tables share one (every model with two `Date` columns). A
+  relationship is identified by the columns it joins, not its position in the file; a duplicate
+  identity (a role-playing dimension joined twice on the same columns) is disambiguated rather than
+  trusted, since a repeated lineageTag produces a model Power BI refuses to open. Verified by
+  building the corpus twice: 0 of 53 TMDL files differ, 0 duplicate GUIDs across 494, and the
+  rebuilt model still opens, refreshes and renders 13/13 pages identically.
+
 - **tableau-migration (skill `2.32.0` -> `2.33.0`): honour Tableau's per-zone "Show Title" toggle.**
   A dashboard zone serialises `show-title='false'` only when the author unticks the box, so absent
   means shown -- the flag is now read at zone-capture time and carried through to the emitted visual.

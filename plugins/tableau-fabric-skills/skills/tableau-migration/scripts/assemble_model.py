@@ -3237,6 +3237,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         report["table_map"] = dict(tmap)
     if header_reconcile["remaps"] or header_reconcile["mismatches"]:
         report["flatfile_header_reconcile"] = header_reconcile
+    # Stabilize identity GUIDs BEFORE the gate so the self-check validates the bytes that ship.
+    T.stabilize_lineage_tags(parts)
     report["openability_selfcheck"] = check_model_openability(
         parts, flatfile_headers=_gate_flatfile_headers(descriptor, flatfile_path))
     return {"parts": parts, "report": report}
@@ -3506,6 +3508,7 @@ def assemble_directlake_model(*, model_name, tables, measures_tmdl, expression_n
     parts["definition/database.tmdl"] = T.generate_database_tmdl()
     parts["definition.pbism"] = T.generate_pbism()
     parts[".platform"] = T.generate_platform(model_name)
+    T.stabilize_lineage_tags(parts)
     return {"parts": parts}
 
 

@@ -4,6 +4,9 @@ Covers the measure renderer's annotation contract (the audit/repair safety net),
 the Spark->TMDL type mapping that drives DirectLake column typing, identifier
 quoting, and relationship inference / cardinality direction.
 """
+import re
+import uuid
+
 import pytest
 
 from tmdl_generate import (
@@ -17,6 +20,7 @@ from tmdl_generate import (
     q,
     render_relationships_tmdl,
     spark_type_to_tmdl,
+    stabilize_lineage_tags,
     upgrade_relationship_cardinality,
 )
 
@@ -450,3 +454,217 @@ def test_inject_calc_columns_no_duplicate_is_byte_identical():
     idx = base.find("\tpartition ")
     naive = base[:idx] + multi + base[idx:]
     assert enrich_table_tmdl(base, calc_columns=multi) == naive
+
+
+# -- deterministic object identity (lineageTag stability) ----------------------
+def _model():
+    """A miniature two-table model with the shapes that make identity tricky: a column name
+    reused across tables, a hierarchy with levels, and a relationship joining the two."""
+    return {
+        "definition/tables/Orders.tmdl": (
+            "table Orders\n"
+            "\tlineageTag: 11111111-1111-1111-1111-111111111111\n"
+            "\n\tcolumn Sales\n\t\tlineageTag: 22222222-2222-2222-2222-222222222222\n"
+            "\n\tcolumn Qty\n\t\tlineageTag: 33333333-3333-3333-3333-333333333333\n"
+            "\n\thierarchy Calendar\n"
+            "\t\tlineageTag: 44444444-4444-4444-4444-444444444444\n"
+            "\n\t\tlevel Year\n"
+            "\t\t\tlineageTag: 55555555-5555-5555-5555-555555555555\n"
+            "\t\t\tcolumn: Year\n"
+            "\n\tannotation PBI_Id = 0123456789abcdef0123456789abcdef\n"
+        ),
+        "definition/tables/Returns.tmdl": (
+            "table Returns\n"
+            "\tlineageTag: 66666666-6666-6666-6666-666666666666\n"
+            "\n\tcolumn Sales\n\t\tlineageTag: 77777777-7777-7777-7777-777777777777\n"
+        ),
+        "definition/relationships.tmdl": (
+            "relationship 88888888-8888-8888-8888-888888888888\n"
+            "\tfromColumn: Orders.Sales\n"
+            "\ttoColumn: Returns.Sales\n"
+        ),
+    }
+
+
+def _identity_guids(parts):
+    """Every identity GUID in a parts dict, keyed by ``<part>#<ordinal>``."""
+    out = {}
+    for path in sorted(parts):
+        found = re.findall(r"lineageTag: (\S+)|^relationship (\S+)", parts[path], re.M)
+        for i, (tag, rel) in enumerate(found):
+            out["%s#%d" % (path, i)] = tag or rel
+    return out
+
+
+def test_lineage_tags_are_identical_across_two_independent_assemblies():
+    # The whole point: rebuilding an UNCHANGED model must not rewrite a single identity GUID,
+    # or Fabric Git integration sees every object as deleted-and-recreated.
+    a, b = _model(), _model()
+    stabilize_lineage_tags(a)
+    stabilize_lineage_tags(b)
+    assert a == b
+
+
+def test_lineage_tags_do_not_survive_from_the_generator(): 
+    # The random tags the emitters minted must actually be REPLACED, not merely validated.
+    parts = _model()
+    before = set(_identity_guids(parts).values())
+    stabilize_lineage_tags(parts)
+    after = set(_identity_guids(parts).values())
+    assert not (before & after)
+
+
+def test_every_identity_guid_in_the_model_is_unique():
+    # A duplicated lineageTag produces a model Power BI refuses to open.
+    parts = _model()
+    stabilize_lineage_tags(parts)
+    guids = list(_identity_guids(parts).values())
+    assert len(guids) == len(set(guids))
+
+
+def test_same_column_name_in_two_tables_gets_distinct_tags():
+    # The collision this pass exists to prevent -- a tag keyed on the column name alone would
+    # hand Orders[Sales] and Returns[Sales] the same identity.
+    parts = _model()
+    stabilize_lineage_tags(parts)
+    orders = re.search(r"column Sales\n\t\tlineageTag: (\S+)",
+                       parts["definition/tables/Orders.tmdl"]).group(1)
+    returns = re.search(r"column Sales\n\t\tlineageTag: (\S+)",
+                        parts["definition/tables/Returns.tmdl"]).group(1)
+    assert orders != returns
+
+
+def test_renaming_one_column_moves_only_that_columns_tag():
+    # Locality is the property a seeded sequential stream cannot offer: there, inserting or
+    # renaming one object renumbers every object after it.
+    base, renamed = _model(), _model()
+    renamed["definition/tables/Orders.tmdl"] = renamed[
+        "definition/tables/Orders.tmdl"].replace("column Qty", "column Quantity")
+    stabilize_lineage_tags(base)
+    stabilize_lineage_tags(renamed)
+    a, b = _identity_guids(base), _identity_guids(renamed)
+    moved = [k for k in a if a[k] != b.get(k)]
+    assert moved == ["definition/tables/Orders.tmdl#2"], moved
+
+
+def test_hierarchy_level_tag_is_scoped_under_its_hierarchy():
+    # A level is identified by table/hierarchy/level, so two hierarchies may both have a "Year".
+    parts = _model()
+    stabilize_lineage_tags(parts)
+    hier = re.search(r"hierarchy Calendar\n\t\tlineageTag: (\S+)",
+                     parts["definition/tables/Orders.tmdl"]).group(1)
+    level = re.search(r"level Year\n\t\t\tlineageTag: (\S+)",
+                      parts["definition/tables/Orders.tmdl"]).group(1)
+    assert hier != level
+    assert uuid.UUID(hier).version == 5 and uuid.UUID(level).version == 5
+
+
+def test_relationship_identity_is_the_join_not_the_file_position():
+    # Reordering the relationship blocks must not renumber their GUIDs.
+    forward = {"definition/relationships.tmdl":
+               "relationship aaaa\n\tfromColumn: A.x\n\ttoColumn: B.y\n\n"
+               "relationship bbbb\n\tfromColumn: C.x\n\ttoColumn: D.y\n"}
+    reversed_ = {"definition/relationships.tmdl":
+                 "relationship cccc\n\tfromColumn: C.x\n\ttoColumn: D.y\n\n"
+                 "relationship dddd\n\tfromColumn: A.x\n\ttoColumn: B.y\n"}
+    stabilize_lineage_tags(forward)
+    stabilize_lineage_tags(reversed_)
+    f = re.findall(r"(?m)^relationship (\S+)", forward["definition/relationships.tmdl"])
+    r = re.findall(r"(?m)^relationship (\S+)", reversed_["definition/relationships.tmdl"])
+    assert f == list(reversed(r))
+
+
+def test_a_hex_pbi_id_annotation_is_stabilized_too():
+    parts = _model()
+    stabilize_lineage_tags(parts)
+    pbi = re.search(r"annotation PBI_Id = (\S+)",
+                    parts["definition/tables/Orders.tmdl"]).group(1)
+    assert re.fullmatch(r"[0-9a-f]{32}", pbi)
+    assert pbi != "0123456789abcdef0123456789abcdef"
+
+
+def test_a_named_pbi_id_annotation_is_left_alone():
+    # Only the random 32-hex form is churn; ``annotation PBI_Id = _Measures`` is a real name.
+    parts = {"definition/tables/_Measures.tmdl":
+             "table _Measures\n\tlineageTag: x\n\n\tannotation PBI_Id = _Measures\n"}
+    stabilize_lineage_tags(parts)
+    assert "annotation PBI_Id = _Measures" in parts["definition/tables/_Measures.tmdl"]
+
+
+def test_multi_line_dax_body_is_never_mistaken_for_a_declaration():
+    # A DAX / M body is free text this pass must not interpret: it is indented deeper than any
+    # legal declaration (which stops at ``level``, two tabs), and whatever it contains must not
+    # capture the property lines that follow the body.
+    parts = {"definition/tables/T.tmdl": (
+        "table T\n\tlineageTag: a\n"
+        "\n\tmeasure 'M' =\n"
+        "\t\t\tVAR column = 1\n"
+        "\t\t\tRETURN column\n"
+        "\t\tlineageTag: b\n"
+        "\n\tcolumn Real\n\t\tlineageTag: c\n"
+    )}
+    stabilize_lineage_tags(parts)
+    text = parts["definition/tables/T.tmdl"]
+    assert "VAR column = 1" in text and "RETURN column" in text
+    measure = re.search(r"measure 'M' =\n.*?\n.*?\n\t\tlineageTag: (\S+)", text, re.S).group(1)
+    real = re.search(r"column Real\n\t\tlineageTag: (\S+)", text).group(1)
+    assert measure != real
+
+
+def test_non_tmdl_parts_are_untouched():
+    parts = {"definition.pbism": '{"lineageTag": "keep-me"}',
+             "definition/tables/T.tmdl": "table T\n\tlineageTag: a\n"}
+    stabilize_lineage_tags(parts)
+    assert parts["definition.pbism"] == '{"lineageTag": "keep-me"}'
+
+
+def test_stabilize_reports_how_many_identities_it_rewrote():
+    parts = _model()
+    # 7 lineageTags + 1 relationship header + 1 hex PBI_Id
+    assert stabilize_lineage_tags(parts) == 9
+
+
+def test_adding_a_table_does_not_move_any_other_tables_tags():
+    # The Git-stability property, and the reason identity is the FULL path: a tag derived from
+    # the column name alone stays unique only by being suffixed on collision, so a newly added
+    # table sorting ahead of an existing one would steal the unsuffixed identity and shift every
+    # same-named column after it.
+    base, grown = _model(), _model()
+    grown["definition/tables/Aardvark.tmdl"] = (
+        "table Aardvark\n\tlineageTag: 99999999-9999-9999-9999-999999999999\n"
+        "\n\tcolumn Sales\n\t\tlineageTag: 99999999-9999-9999-9999-999999999998\n"
+    )
+    stabilize_lineage_tags(base)
+    stabilize_lineage_tags(grown)
+    a, b = _identity_guids(base), _identity_guids(grown)
+    moved = [k for k in a if a[k] != b.get(k)]
+    assert moved == [], moved
+
+
+def test_inserting_a_column_does_not_move_the_tags_below_it():
+    # Identity must be the object's PATH, never its position: a positional scheme re-tags every
+    # object below an insertion, which is exactly the churn this pass exists to remove.
+    base, grown = _model(), _model()
+    grown["definition/tables/Orders.tmdl"] = grown["definition/tables/Orders.tmdl"].replace(
+        "\n\tcolumn Sales\n",
+        "\n\tcolumn Discount\n\t\tlineageTag: 99999999-9999-9999-9999-999999999997\n"
+        "\n\tcolumn Sales\n")
+    stabilize_lineage_tags(base)
+    stabilize_lineage_tags(grown)
+    a = _identity_guids(base)
+    b = _identity_guids(grown)
+    # every ORIGINAL identity must still be present, unchanged, somewhere in the grown model
+    assert set(a.values()) <= set(b.values())
+
+
+def test_two_identical_joins_still_get_distinct_relationship_guids():
+    # A role-playing dimension is joined twice on the same columns (one active, one not), so the
+    # from/to pair alone is not unique -- the duplicate must be disambiguated, never emitted twice.
+    parts = {"definition/relationships.tmdl": (
+        "relationship aaaa\n\tfromColumn: Orders.OrderDate\n\ttoColumn: Date.Date\n\n"
+        "relationship bbbb\n\tisActive: false\n"
+        "\tfromColumn: Orders.OrderDate\n\ttoColumn: Date.Date\n")}
+    stabilize_lineage_tags(parts)
+    guids = re.findall(r"(?m)^relationship (\S+)", parts["definition/relationships.tmdl"])
+    assert len(guids) == 2
+    assert guids[0] != guids[1]
