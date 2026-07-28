@@ -30,8 +30,10 @@ workbook XML structure were used to build this; it is original, deterministic, a
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -103,6 +105,16 @@ except ImportError:  # pragma: no cover - flat scripts-on-path
     except ImportError:
         _build_dashboard_audit = None
 
+# Zone Geometry v3 layout solver (opt-in ``--layout solver``). Optional so the emitter still imports
+# and runs the legacy engine unchanged if the solver stack is absent.
+try:
+    from . import layout_plan as _layout_plan
+except ImportError:  # pragma: no cover - flat scripts-on-path
+    try:
+        import layout_plan as _layout_plan
+    except ImportError:
+        _layout_plan = None
+
 
 # -- PBIR schema URLs ----------------------------------------------------------
 _S = "https://developer.microsoft.com/json-schemas/fabric/item/report"
@@ -157,6 +169,25 @@ DASH_DEFAULT_H = 800
 # the default 1280x720 (never-regress).
 _PAGE_W_OVERRIDE = None
 _PAGE_H_OVERRIDE = None
+# -- layout engine (Zone Geometry v3, frame track slice 4d) ----------------------
+# ``legacy`` scales each zone's normalized source rect straight into the page and repairs collisions
+# afterwards; ``solver`` resolves the dashboard's zone TREE first (``layout_plan``), so tiled siblings
+# receive disjoint intervals and overlap is unrepresentable rather than repaired. ``solver`` is the
+# DEFAULT: it resolves every zone on the corpus (no zone falls through), roughly halves the residual
+# collisions, and does not inflate the canvas -- most pages keep their exact legacy dimensions and the
+# two that change get SHORTER, landing on their authored size. ``legacy`` is retained for two reasons,
+# not as a rival engine: it is the per-zone FALLBACK inside ``_scale_zone`` for any zone the plan does
+# not name (fail-closed, never half-solved), and it remains selectable as an escape hatch.
+# ``_LAYOUT_PLAN`` is the plan for the dashboard currently being emitted -- set and reset around each
+# page exactly like the page overrides above -- and is the ONE thing ``_scale_zone`` consults, which
+# is why every emitted item records its ``zone_id`` (slice 4a).
+LAYOUT_ENGINES = ("legacy", "solver")
+LAYOUT_DEFAULT = "solver"
+_LAYOUT_PLAN = None
+# Authored-px -> emitted-px scale for zone PADDING. Tableau stores a zone's margins in real pixels
+# while its rect is in normalized 0..100000 units, so the two need different scales; this is set per
+# dashboard beside the page overrides and reset with them.
+_ZONE_PAD_SCALE = (1.0, 1.0)
 # A Power BI slicer fills its whole rectangle, unlike a Tableau filter *card*, which renders its
 # control inset inside the zone with padding. Tableau packs filter zones edge-to-edge (tangent in
 # BOTH axes) and relies on that per-card padding for the visible gaps, so emitting a slicer at the
@@ -181,6 +212,19 @@ SLICER_ROW_GUTTER = 8.0
 SLICER_FONT_PT = 9.0
 
 
+def _whole_px(v):
+    """Round a canvas dimension UP to a whole pixel.
+
+    A Power BI page is measured in integral pixels: a fractional page height emitted verbatim
+    ("height": 830.06) makes the Desktop layout parser reject the ENTIRE report -- "Input string
+    '830.06' is not a valid integer" -- which also blocks render verification. Every producer of the
+    emitted page (authored <size>, the solver plan, and caption band-insertion growth) runs through
+    here. Rounds UP, never down, so a page can never end up fractionally SHORTER than the content
+    that was placed on it.
+    """
+    return float(math.ceil(float(v)))
+
+
 def _page_w():
     """Active page width: the per-dashboard real <size> width override, else the default."""
     return _PAGE_W_OVERRIDE or PAGE_WIDTH
@@ -189,6 +233,19 @@ def _page_w():
 def _page_h():
     """Active page height: the per-dashboard aspect-faithful override, else the default."""
     return _PAGE_H_OVERRIDE or PAGE_HEIGHT
+
+
+def _dash_page_dims(size):
+    """The emitted page ``(w, h)`` for a parsed dashboard ``size`` dict.
+
+    The single definition of the dashboard canvas: a fixed ``<size maxwidth/maxheight>`` wins, else
+    the automatic fit-to-window canvas derived from the declared minimum, else Tableau's own default.
+    Extracted so the layout PLAN is solved against exactly the page the emit path will use -- solving
+    against a different page silently invalidates every rect it produces.
+    """
+    auto_w, auto_h = _automatic_canvas_dims(size.get("min_w"), size.get("min_h"))
+    return (_whole_px(size.get("w") or auto_w or DASH_DEFAULT_W),
+            _whole_px(size.get("h") or auto_h or DASH_DEFAULT_H))
 
 
 def _automatic_canvas_dims(min_w, min_h):
@@ -985,6 +1042,16 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
                                      _mb_base.get("caption"), worksheet)
         if mb is not None:
             m_entity, m_measure = mb
+            # Did the model translate THIS PILL'S OWN table calc, or only the base field under it?
+            # The lookup tries the pill instance token FIRST, then falls back to the bare calc id /
+            # caption -- so re-running it with the instance token ALONE answers the question exactly.
+            # A view-only quick table calc (running total, moving average, ...) is deliberately NOT
+            # given a model measure: the model supplies only its base, and the transform is rebuilt in
+            # the report layer as a Visual Calculation. Conflating the two made every such calc vanish
+            # on the model-fact rebind pass (see ``_apply_visual_calcs``).
+            rebound_to_instance = (
+                field_id is not None
+                and _lookup_measure_binding(measure_binding, field_id, None, None, None) is not None)
             return {
                 "caption": _mb_base.get("caption") or m_measure,
                 "field_id": base_id, "instance": field_id,
@@ -995,6 +1062,7 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
                 "binding": "measure", "kind": "value",
                 "geo_area": None, "formula": _mb_base.get("formula"),
                 "measure_rebound": True,
+                "rebound_to_instance": rebound_to_instance,
             }
 
     # Implicit row count (object-id COUNT(*) / legacy [Number of Records]) -> a COUNTROWS measure.
@@ -3661,7 +3729,7 @@ def _select_title_banner(candidates, ext_w, ext_h):
     return picks[0]
 
 
-def _parse_dashboard(db, worksheet_names, warnings):
+def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
     name = db.get("name")
     size_el = _first(db, "size")
     size = {"w": None, "h": None, "min_w": None, "min_h": None, "sizing_mode": None}
@@ -3702,6 +3770,14 @@ def _parse_dashboard(db, worksheet_names, warnings):
     image_zones = []
     seen_images = set()
     ext_w = ext_h = 0.0
+    # Every captured item below additively records ``zone_id`` -- the source zone's ``id`` attribute,
+    # the same key ``zone_tree`` stores on each node and ``layout_solve`` keys its solved rects by.
+    # It is the IDENTITY SEAM the layout-solver emit path needs: without it a captured dict is just a
+    # bag of coordinates and cannot be matched back to its node in the layout tree (matching by rect
+    # is ambiguous -- a single-child ``layout-flow`` wrapper shares its child's rect exactly, which
+    # occurs on 12 of the 13 corpus dashboards). Captured at walk time, so it is exact. Verified
+    # across the corpus: ``id`` is present on every zone (454/454) and unique within a dashboard.
+    # Nothing reads it yet; it is recorded here so the solver wiring is a lookup, not a re-parse.
     for zone in _findall_local(db, "zone"):
         if zone in device_zones:
             continue
@@ -3726,6 +3802,8 @@ def _parse_dashboard(db, worksheet_names, warnings):
                 banner_candidates.append({
                     "text": text, "fill": fill,
                     "text_color": _zone_run_color(zone) or "#ffffff",
+                    "zone_id": zone.get("id"),
+                    "pad": _parse_zone_padding(_first(zone, "zone-style")),
                     "x": x, "y": y, "w": w, "h": h})
             # Additively capture EVERY text zone that carries content (fill OPTIONAL) as a general
             # text object -- the section-header caption bars (Director / Manager / Supervisor /
@@ -3742,6 +3820,8 @@ def _parse_dashboard(db, worksheet_names, warnings):
                 text_objects.append({
                     "text": text, "fill": fill2, "transparency": tpct,
                     "text_color": run_color or "#000000", "bold": run_bold, "font_size": run_size,
+                    "zone_id": zone.get("id"),
+                    "pad": _parse_zone_padding(_first(zone, "zone-style")),
                     "x": x, "y": y, "w": w, "h": h})
         # A dashboard FILTER card -- the filter the author actually exposed on the dashboard surface
         # (possibly nested inside a collapsible layout container; the zone walk recurses) -- is what
@@ -3768,6 +3848,8 @@ def _parse_dashboard(db, worksheet_names, warnings):
                     filter_zones.append({
                         "token": ftok, "x": x, "y": y, "w": w, "h": h,
                         "mode": zone.get("mode"),
+                        "zone_id": zone.get("id"),
+                        "pad": _parse_zone_padding(_first(zone, "zone-style")),
                         "hidden": zone.get("hidden-by-user") == "true",
                     })
             continue
@@ -3780,6 +3862,8 @@ def _parse_dashboard(db, worksheet_names, warnings):
             if pid and pid not in seen_params and None not in (x, y, w, h):
                 seen_params.add(pid)
                 param_controls.append({"param_id": pid, "x": x, "y": y, "w": w, "h": h,
+                                       "zone_id": zone.get("id"),
+                                       "pad": _parse_zone_padding(_first(zone, "zone-style")),
                                        "mode": zone.get("mode")})
             continue
         # A dashboard IMAGE object: either a straight bitmap (``type-v2='bitmap'`` with
@@ -3805,6 +3889,8 @@ def _parse_dashboard(db, worksheet_names, warnings):
                             seen_images.add(key)
                             image_zones.append({
                                 "id": zone.get("id"),
+                                "zone_id": zone.get("id"),
+                                "pad": _parse_zone_padding(_first(zone, "zone-style")),
                                 "kind": "image" if ztype == "bitmap" else "button",
                                 "image": ref, "x": x, "y": y, "w": w, "h": h,
                                 "url": zone.get("url"),
@@ -3817,14 +3903,16 @@ def _parse_dashboard(db, worksheet_names, warnings):
         # it legends; capture its geometry so the report can faithfully reproduce legend show/position
         # (a present zone = the legend is shown at that side; an absent one = the author hid it).
         if ztype == "color" and None not in (x, y, w, h) and w > 0 and h > 0:
-            legend_zones.append({"worksheet": zname, "x": x, "y": y, "w": w, "h": h})
+            legend_zones.append({"worksheet": zname, "zone_id": zone.get("id"),
+                                 "x": x, "y": y, "w": w, "h": h})
             continue
         # worksheet zones carry no decoration type (legends/filters/titles do)
         if ztype:
             continue
         if None in (x, y, w, h) or w <= 0 or h <= 0:
             continue
-        zones.append({"worksheet": zname, "x": x, "y": y, "w": w, "h": h})
+        zones.append({"worksheet": zname, "zone_id": zone.get("id"),
+                      "x": x, "y": y, "w": w, "h": h})
 
     title_banner = _select_title_banner(banner_candidates, ext_w, ext_h)
     if title_banner:
@@ -3841,7 +3929,29 @@ def _parse_dashboard(db, worksheet_names, warnings):
             "filter_zones": filter_zones,
             "text_objects": text_objects,
             "image_zones": image_zones,
-            "title_banner": title_banner}
+            "title_banner": title_banner,
+            # The solved layout for this dashboard, or None under the legacy engine / on any solve
+            # failure. Built HERE because this is the only place the source <dashboard> element is in
+            # scope; the emit path consumes it as a lookup rather than re-parsing the XML.
+            "layout_plan": _build_layout_plan(db, size, layout, device_zones)}
+
+
+def _build_layout_plan(db, size, layout, device_zones):
+    """Solve this dashboard's zone tree into a plan, or ``None`` (legacy engine / fail-closed).
+
+    Solved against ``_dash_page_dims(size)`` -- the exact page the emit path derives -- because a plan
+    solved against any other page produces rects that are out of bounds on the page actually emitted.
+    ``device_zones`` is the caller's already-computed phone/tablet exclusion set, reused rather than
+    recomputed so the tree sees exactly the zones the emit walk did.
+    """
+    if layout != "solver" or _layout_plan is None:
+        return None
+    try:
+        page_w, page_h = _dash_page_dims(size)
+        return _layout_plan.build_plan(db, device_zones=device_zones,
+                                       page_w=page_w, page_h=page_h)
+    except Exception:  # pragma: no cover - defensive; the solver is never allowed to break emit
+        return None
 
 
 def _warn(scope, name, reason):
@@ -3888,8 +3998,17 @@ def _resolve_parameter_controls(dashboards, params, warnings, param_binding=None
                 "caption": caption,
                 "datatype": meta.get("datatype") or None,
                 "dashboard": db.get("name"),
+                # Carry the zone's IDENTITY, not just its geometry. ``_scale_zone`` looks a solved
+                # rect up by ``zone_id``, so dropping the id here made every parameter-control
+                # slicer INVISIBLE to the layout solver: it alone kept the naive scale-and-clamp
+                # position while its neighbours were re-solved onto a grown page, which is exactly
+                # how a slicer ends up sitting on top of the table beside it. The id is already
+                # captured above; it just never reached the emitter.
+                # (``pad`` is deliberately NOT carried here: padding is applied on both engines, so
+                # adding it would change legacy output too. Tracked separately.)
                 "position": {"x": pc.get("x"), "y": pc.get("y"),
-                             "w": pc.get("w"), "h": pc.get("h")},
+                             "w": pc.get("w"), "h": pc.get("h"),
+                             "zone_id": pc.get("zone_id")},
                 "mode": pc.get("mode"),
             }
             bound = slicers.get(_norm_param_key(pid))
@@ -4187,7 +4306,7 @@ def _detect_sheet_swaps(worksheets, dashboards, params, warnings):
 
 
 def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_binding=None,
-              column_binding=None, param_binding=None):
+              column_binding=None, param_binding=None, layout=LAYOUT_DEFAULT):
     """Parse a Tableau ``.twb`` (workbook XML) into the normalized viz IR.
 
     Accepts ``str`` or ``bytes``; ``.twb`` files carry a UTF-8 BOM, so callers reading from
@@ -4228,7 +4347,7 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
         db_elems.extend(_children_local(h, "dashboard"))
     dashboards = []
     for db in db_elems:
-        parsed = _parse_dashboard(db, worksheet_names, warnings)
+        parsed = _parse_dashboard(db, worksheet_names, warnings, layout=layout)
         for z in parsed["zones"]:
             target = ws_by_name.get(z["worksheet"])
             if (target and target["visual_type"] == VT_UNSUPPORTED
@@ -5678,7 +5797,16 @@ def _apply_visual_calcs(ws, state, vc_index, model_table, field_map, warnings):
     # measure instead of the percent-difference Tableau colours by. It yields ONLY when the colour pill
     # IS the base (no separate label/text value): then the rebound measure may already embody the
     # transform, so re-applying the quick calc would double it -- defer to the model-measure fill.
-    if base_field.get("measure_rebound"):
+    #
+    # ``measure_rebound`` alone does NOT mean the model owns the transform, and treating it that way
+    # silently deleted EVERY view-only quick table calc from the shipped report: the estate runs the viz
+    # stage twice (once bare to build the model, once rebound to it) and only the second pass ships, so a
+    # calc emitted in pass 1 vanished in pass 2. ``rebound_to_instance`` is the exact discriminator --
+    # true only when the model translated THIS PILL'S OWN table-calc instance into a measure (transform
+    # embodied -> yielding is right), false when it merely translated the base field the calc runs over
+    # (the running total exists nowhere but here). Absent -> treated as instance-bound, so a field dict
+    # that predates the flag keeps the old, never-double-transform behaviour.
+    if base_field.get("measure_rebound") and base_field.get("rebound_to_instance", True):
         _color_is_base = base_field is ws["encodings"].get("color")
         if role == "value" or _color_is_base:
             return None, None
@@ -6961,6 +7089,29 @@ def _flag_filter_config_for(ir, ws_name):
     return {"filters": list(containers)} if containers else None
 
 
+def _inherit_flag_filters(visuals, flag_fc):
+    """Stamp a worksheet's keep-flag ``filterConfig`` onto every visual DERIVED from that worksheet.
+
+    One Tableau worksheet often rebuilds as SEVERAL Power BI visuals -- a KPI headline card above its
+    sparkline, or a measure-trellis fanned into one chart per measure. Those derived pieces answer the
+    same question as the worksheet they came from, so they must inherit its filters: Tableau applies a
+    worksheet filter to the whole worksheet, not to one mark layer of it. Leaving a piece unfiltered
+    silently widens it to the entire table, which is why an unfiltered KPI card read 1354 against the
+    source's date-ranged 820 -- a WRONG NUMBER, shown confidently, with no warning anywhere.
+
+    Applied to the split emitters' output rather than inside each one, so a future split path inherits
+    correctly by construction instead of having to remember. Never overwrites a ``filterConfig`` a
+    visual already carries (a piece with its own narrower scope keeps it), and is a no-op when the
+    worksheet has no flags -- byte-for-byte the prior output in that case.
+    """
+    if not flag_fc:
+        return visuals
+    for v in visuals or ():
+        if isinstance(v, dict) and not v.get("filterConfig"):
+            v["filterConfig"] = copy.deepcopy(flag_fc)
+    return visuals
+
+
 def _slicer_filter_config(field, model_table, field_map, name, warnings):
     """Build a slicer ``filterConfig`` from an applied Tableau filter selection/range, else ``None``.
 
@@ -7149,7 +7300,70 @@ def _position(x, y, w, h, z=0, tab=0):
             "width": round(w, 2), "height": round(h, 2), "tabOrder": tab}
 
 
+def _zone_pad_inset(zone):
+    """The part of a zone's OUTER padding that actually DISPLACES its content, or ``None``.
+
+    Tableau stores a dashboard object's outer padding as ``<zone-style><format attr='margin'>``
+    (all sides) plus optional per-side ``margin-top`` / ``-right`` / ``-bottom`` / ``-left``
+    overrides, in real pixels. The object is drawn in the CONTENT BOX left after that padding --
+    which is why a 133px-tall icon zone carrying ``margin=4`` + ``margin-bottom=85`` renders its
+    icon in a 44px band at the TOP of the zone, not floating in the middle of it. Power BI has no
+    zone concept: a visual fills its whole rectangle and centres its image, so emitting the raw
+    zone rect drops the icon ~46px below where Tableau draws it.
+
+    Only the ASYMMETRIC excess is returned. A uniform inset (including Tableau's documented 4px
+    default) shrinks an object evenly and does not move its centre, and the layout model already
+    accounts for that separation via its own inter-sibling gap; subtracting it again here would
+    shrink every visual on every dashboard for no fidelity gain. Non-uniform padding is different
+    in kind -- it is the author positioning content WITHIN its zone, and it is the only part we are
+    currently discarding. Returns ``(top, right, bottom, left)`` px, or ``None`` when the padding
+    is uniform/absent.
+    """
+    pad = zone.get("pad") if isinstance(zone, dict) else None
+    if not pad:
+        return None
+    outer = pad.get("outer") or {}
+    try:
+        vals = [float(outer[s]) for s in _SIDES]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if max(vals) - min(vals) < 1.0:
+        return None
+    base = min(vals)
+    return tuple(v - base for v in vals)
+
+
+def _apply_zone_padding(rect, zone):
+    """Inset ``rect`` by the zone's displacing outer padding. Only ever SHRINKS the rect.
+
+    Because the result is strictly contained in the rect it replaces, this can never introduce an
+    overlap the layout engine had already resolved -- the same containment argument that lets the
+    slicer inset run after the solve.
+    """
+    ins = _zone_pad_inset(zone)
+    if ins is None:
+        return rect
+    sx, sy = _ZONE_PAD_SCALE
+    top, right, bottom, left = ins
+    x, y, w, h = rect
+    nx, ny = x + left * sx, y + top * sy
+    nw, nh = w - (left + right) * sx, h - (top + bottom) * sy
+    if nw < 1.0 or nh < 1.0:
+        return rect
+    return nx, ny, nw, nh
+
+
 def _scale_zone(zone, ref_w, ref_h, min_w=40.0, min_h=40.0):
+    # THE layout choke point. Under the solver engine a resolved rect for this zone (looked up by the
+    # ``zone_id`` slice 4a records at capture time) replaces the naive scale-and-clamp below: the
+    # solver already resolved the whole dashboard as a tree, so its rect is disjoint from its tiled
+    # siblings and on-page by construction. Applying the min floors here too would re-inflate a box
+    # the solver deliberately sized, re-introducing the very overlap the tree solve removed, so a
+    # solved rect is taken verbatim. Any zone the plan does not know (or any dashboard whose plan
+    # failed to build) falls through to the legacy path unchanged -- fail-closed, never half-solved.
+    solved = _solved_rect(zone)
+    if solved is not None:
+        return _apply_zone_padding(solved, zone)
     pw = _page_w()
     ph = _page_h()
     sx = pw / ref_w if ref_w else 1
@@ -7158,7 +7372,18 @@ def _scale_zone(zone, ref_w, ref_h, min_w=40.0, min_h=40.0):
     y = max(0.0, min(zone["y"] * sy, ph - 1))
     w = max(min_w, min(zone["w"] * sx, pw - x))
     h = max(min_h, min(zone["h"] * sy, ph - y))
-    return x, y, w, h
+    return _apply_zone_padding((x, y, w, h), zone)
+
+
+def _solved_rect(zone):
+    """The active layout plan's rect for ``zone``, or ``None`` to use the legacy scale."""
+    plan = _LAYOUT_PLAN
+    if not plan:
+        return None
+    zid = zone.get("zone_id") if isinstance(zone, dict) else None
+    if zid is None:
+        return None
+    return plan["rects"].get(zid)
 
 
 def _page_json(name, display_name):
@@ -7733,7 +7958,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     page_order = []
     placed = set()
 
-    global _PAGE_H_OVERRIDE, _PAGE_W_OVERRIDE
+    global _PAGE_H_OVERRIDE, _PAGE_W_OVERRIDE, _LAYOUT_PLAN, _ZONE_PAD_SCALE
     for db in ir["dashboards"]:
         page_name = _sanitize("page-" + (db["name"] or "dashboard"))
         zones = db["zones"]
@@ -7750,9 +7975,23 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         # (usually LARGER than the min), so we keep its authored ASPECT but scale it UP to cover the
         # 1280x720 screen frame (_automatic_canvas_dims) rather than squashing it into the near-square
         # 1000x800 default. Final fallback (no usable <size> at all): Tableau's own 1000x800 default.
-        _auto_w, _auto_h = _automatic_canvas_dims(db["size"].get("min_w"), db["size"].get("min_h"))
-        _PAGE_W_OVERRIDE = db["size"]["w"] or _auto_w or DASH_DEFAULT_W
-        _PAGE_H_OVERRIDE = db["size"]["h"] or _auto_h or DASH_DEFAULT_H
+        _PAGE_W_OVERRIDE, _PAGE_H_OVERRIDE = _dash_page_dims(db["size"])
+        _authored_px_w, _authored_px_h = _PAGE_W_OVERRIDE, _PAGE_H_OVERRIDE
+        # Solver engine: activate this dashboard's plan and ADOPT the page it resolved. Growth is not
+        # cosmetic -- the solver enlarges the page (bounded by MAX_GROWTH) precisely so the content
+        # fits, so its rects are valid ONLY on that page. Keeping the authored page while using solved
+        # rects puts them out of bounds; measured on the corpus that is 100 out-of-bounds visuals
+        # versus 0 when the grown page is adopted. A grown page still rescales to the viewport under
+        # FitToPage, so adopting it costs render scale, never content.
+        _LAYOUT_PLAN = db.get("layout_plan")
+        if _LAYOUT_PLAN:
+            _PAGE_W_OVERRIDE = _whole_px(_LAYOUT_PLAN["page"][0])
+            _PAGE_H_OVERRIDE = _whole_px(_LAYOUT_PLAN["page"][1])
+        # Zone padding is authored in real pixels against the AUTHORED canvas, so it scales by the
+        # authored->emitted page ratio (not by the 0..100000 zone scale). Identity in the normal
+        # case where the emitted page is the authored size.
+        _ZONE_PAD_SCALE = ((_page_w() / _authored_px_w) if _authored_px_w else 1.0,
+                           (_page_h() / _authored_px_h) if _authored_px_h else 1.0)
         visuals = []
         page_ws = []
         for i, zone in enumerate(zones):
@@ -7864,7 +8103,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                     page_name, db["name"] or page_name, model_table, field_map, vname,
                     _sort_definition(ws, state, model_table, field_map),
                     label_objects, data_point_objects, warnings)
-                visuals += tvis
+                visuals += _inherit_flag_filters(tvis, flag_fc)
                 records += trecs
                 continue
             spark_title = ws.get("title")
@@ -7879,7 +8118,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                     model_table, field_map, vname)
                 if card_out is not None:
                     card_vis, card_rec = card_out
-                    visuals.append(card_vis)
+                    visuals.append(_inherit_flag_filters([card_vis], flag_fc)[0])
                     records.append(card_rec)
                     pos = _position(x, y + card_h, w, h - card_h, tab=i)
                     spark_title = None
@@ -7998,12 +8237,14 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         # every anchor is final. The page is FitToPage, so a taller canvas just rescales to the viewport.
         _grown_h = _deoverlap_captions(visuals, _page_w(), _page_h())
         if _grown_h and _grown_h > _page_h():
-            _PAGE_H_OVERRIDE = _grown_h
+            _PAGE_H_OVERRIDE = _whole_px(_grown_h)
         _emit_page(parts, page_name, db["name"] or page_name, visuals)
         page_order.append(page_name)
 
     _PAGE_W_OVERRIDE = None
     _PAGE_H_OVERRIDE = None
+    _LAYOUT_PLAN = None
+    _ZONE_PAD_SCALE = (1.0, 1.0)
     for ws in ir["worksheets"]:
         if ws["name"] in placed or ws["visual_type"] == VT_UNSUPPORTED:
             continue
@@ -8083,7 +8324,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 _sort_definition(ws, state, model_table, field_map),
                 label_objects, data_point_objects, warnings)
             records += trecs
-            visuals = tvis + _emit_slicers([ws], page_name, model_table, field_map, warnings)
+            visuals = (_inherit_flag_filters(tvis, flag_fc)
+                       + _emit_slicers([ws], page_name, model_table, field_map, warnings))
             _emit_page(parts, page_name, ws["name"], visuals)
             page_order.append(page_name)
             continue
@@ -8097,7 +8339,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 model_table, field_map, vname)
             if card_out is not None:
                 card_vis, card_rec = card_out
-                visuals.append(card_vis)
+                visuals.append(_inherit_flag_filters([card_vis], flag_fc)[0])
                 records.append(card_rec)
                 pos = _position(40, 40 + card_h, 880, 620 - card_h)
                 spark_title = None
@@ -8207,9 +8449,18 @@ def _layout_slicers(entries, *, ctrl_h=SLICER_CTRL_H, pad_x=SLICER_PAD_X,
     List/other card keeps its own height (floored at ``ctrl_h``). Nothing is a hardcoded fixed
     size -- the emitted height tracks the source card. When a row's control ends up taller than its
     source zone, the rows below shift down by the growth plus ``gutter`` so tangent bands never
-    overlap. Rows are clustered by top-y (``tol`` px)."""
+    overlap. Rows are clustered by top-y (``tol`` px).
+
+    Under the solver engine the vertical half of that is skipped: the solve already reserved each
+    filter leaf's minimum (``layout_solve.MIN_SLICER``, kept equal to ``SLICER_DROPDOWN_MIN_H``) and
+    seated the rest of the dashboard around the result, so re-flooring the height here would grow a
+    band the solver deliberately sized and overrun whatever it placed below -- the same reason
+    ``_scale_zone`` takes a solved rect verbatim. The purely horizontal inset still applies: it only
+    ever shrinks a card, so it cannot introduce a collision.
+    """
     if not entries:
         return
+    solved = _LAYOUT_PLAN is not None
     rows = []
     for e in sorted(entries, key=lambda z: z["y"]):
         if rows and abs(e["y"] - rows[-1][0]["y"]) <= tol:
@@ -8220,7 +8471,9 @@ def _layout_slicers(entries, *, ctrl_h=SLICER_CTRL_H, pad_x=SLICER_PAD_X,
     for row in rows:
         top = min(e["y"] for e in row) + shift
         zone_h = max(e["h"] for e in row)
-        if any(e.get("mode") == "Dropdown" for e in row):
+        if solved:
+            box = zone_h
+        elif any(e.get("mode") == "Dropdown" for e in row):
             box = max(zone_h, SLICER_DROPDOWN_MIN_H)
         else:
             box = max(zone_h, ctrl_h)
@@ -8563,7 +8816,7 @@ def _deoverlap_captions(visuals, page_w, page_h, *, gap=8.0, tol=1.0, min_frac=0
 def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
                         model_table=None, field_map=None, date_binding=None,
                         row_count_binding=None, measure_binding=None, column_binding=None,
-                        param_binding=None, resources=None):
+                        param_binding=None, resources=None, layout=LAYOUT_DEFAULT):
     """One-call convenience: parse ``.twb`` text and emit the PBIR parts.
 
     Returns ``{"ir": ..., "parts": ..., "warnings": ..., "candidate_records": ...,
@@ -8616,7 +8869,7 @@ def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
     """
     ir = parse_twb(xml_text, date_binding=date_binding, row_count_binding=row_count_binding,
                    measure_binding=measure_binding, column_binding=column_binding,
-                   param_binding=param_binding)
+                   param_binding=param_binding, layout=layout)
     # Recover the workbook's view-only quick table calcs (the quick token is stripped off the
     # resolved value pill, so the addressing facts live only here) and hand them to the emitter, which
     # projects each as a Power BI Visual Calculation. Fail-open: a parse hiccup never blocks the rest
@@ -8702,6 +8955,13 @@ def main(argv=None):
         help="optional: also write the opt-in Tier-3 dashboard AUDIT request JSON here (folds the "
              "worklist + chart-type advice into a full-dashboard, priority-ordered audit for the "
              "assisted tier). Built on demand only; never changes the PBIR.")
+    parser.add_argument(
+        "--layout", choices=LAYOUT_ENGINES,
+        default=os.environ.get("TWB_PBIR_LAYOUT", LAYOUT_DEFAULT),
+        help="dashboard layout engine. 'legacy' (default) scales each zone's absolute Tableau rect "
+             "independently and repairs collisions afterwards. 'solver' resolves the dashboard's "
+             "zone TREE (flow containers + frames) so flow overlap is structurally impossible, and "
+             "adopts the page size that solve resolved. Opt-in; 'legacy' output is unchanged.")
     args = parser.parse_args(argv)
 
     if args.input == "-":
@@ -8712,7 +8972,7 @@ def main(argv=None):
 
     result = migrate_twb_to_pbir(
         xml_text, dataset_name=args.dataset, report_name=args.report,
-        model_table=args.model_table)
+        model_table=args.model_table, layout=args.layout)
     parts, warnings = result["parts"], result["warnings"]
 
     if args.worklist and result.get("worklist") is not None:

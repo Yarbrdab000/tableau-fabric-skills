@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to this collection are documented here.
 
@@ -12,7 +12,488 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Changed
+
+- **tableau-migration (skill `2.31.0` -> `2.32.0`): the layout solver is now the DEFAULT engine.**
+  `--layout` still accepts `legacy` as an explicit escape hatch, and legacy remains the per-zone
+  runtime fallback inside solver mode, but a user who simply runs the tool now gets the solved
+  layout. Evidence for the flip, measured on the two-workbook corpus and confirmed by a Power BI
+  Desktop render: legacy places every dashboard title band ONE SLOT ABOVE the object it labels, so
+  on ATTI "Hierarchy Trending" the band "...ATTI (Days)" captions the filter row while
+  "...ATTR (Hours)" captions the table of ATTI *day* values -- a misreading-the-data defect, not a
+  cosmetic one. The solver associates both bands with their own tables. Estate geometry also
+  improves (3 overlaps + 4 containments -> 2 + 1) and the canvas does not inflate: of 17 pages, 12
+  are byte-identical, 3 differ by 1-2px, and 2 are SHORTER. Three `test_twb_to_pbir` tests that
+  assert legacy REPAIR-PASS semantics (the caption de-overlap gate, the 40px chart floor, the 64px
+  dropdown floor) are now pinned to `layout="legacy"`, naming the engine they were always testing;
+  the two CLI default tests assert solver and additionally assert that the legacy escape hatch
+  still reaches the frozen engine.
+  KNOWN OPEN, shipped deliberately: the solver emits more sub-64px dropdown slicers than legacy
+  (37 vs 20 of 62), whose controls Power BI clips. This is a PRE-EXISTING class -- legacy ships 20,
+  shortest 44.0px -- that the solver amplifies rather than introduces. The root cause is
+  `allocate`'s last-resort proportional squeeze, which is load-bearing for the containment
+  invariant; exempting control leaves from `_clamp_to_authored` was tried and rejected (it did not
+  reduce the count at all, and it inflated two canvases by 147px and 208px).
+
+### Fixed
+
+- **tableau-migration (skill `2.30.0` -> `2.31.0`): parameter-control slicers were the one object class that silently bypassed the layout solver, and they caused every remaining overlap.**
+  - **Root cause: the zone identity was captured and then dropped one function later.** `_scale_zone` is the single layout choke point, and under the solver engine it looks a solved rect up by `zone_id`. The dashboard parser records that id for every parameter control, but `_resolve_parameter_controls` rebuilt each control into a `position` dict carrying only `{x, y, w, h}` -- so `_solved_rect` bailed on the missing id before ever consulting the plan. The parameter slicer alone kept its naive scale-and-clamp rect while every neighbouring zone was re-solved onto a grown page, which is exactly how a slicer ends up sitting on top of the table beside it.
+  - **The solved rects already existed.** All 44 parameter-control zone ids in the two-workbook corpus were present in the solver's plan and were simply never looked up. Carrying the id through takes solver coverage from **93.9% to 100%** (20 zones fell back to the legacy scale; now none do) and estate collisions from **7 to 3**.
+  - **Legacy output is untouched** -- `_solved_rect` returns `None` whenever no plan is active, so the default engine is unaffected: all 267 emitted report parts are byte-identical before and after.
+  - `pad` is deliberately *not* carried through with the id. Zone padding is applied on both engines, so adding it would change default-engine output; parameter-control padding fidelity is tracked separately.
+  - +2 lock-in tests, both proven to fail without the fix: the id survives to the emitter, and an emitted parameter slicer is placed from the plan rather than the naive scale. The second injects a rect unlike anything the scale can produce, because on a simple tiled dashboard the real solved rect coincides with the naive scale and would make the assertion vacuous.
+
+- **tableau-migration (skill `2.29.0` -> `2.30.0`): an end-to-end validation sweep found three ways a run could mislead you -- a runtime log leaking into the shipped package, a parity guard that never covered a fourth skill, and a mistyped input path that reported success.**
+  - **The Hyper API wrote its server log into the caller's working directory.** Every CLI run and every test launched from the skill tree dropped a `hyperd.log` there; the canonical copy had grown to 6.5 MB, and because `robocopy /MIR` mirrors whatever it finds, a multi-megabyte runtime log was being copied into the shipped plugin package. It also broke `test_mirror_parity` after *any* test run, which is why the documented workflow had grown a manual delete-then-re-mirror ritual. `hyper_reader` now starts `HyperProcess` with `log_dir` pointed at a temporary directory, falling back to the bare call if the installed `tableauhyperapi` does not accept the parameter -- reading an extract never fails because of a log-location preference. The two stale 10 MB logs are deleted.
+  - **`test_mirror_parity` silently skipped `tableau-fabric-datasource-comparison`.** The roster of skills to guard was a hardcoded list of three, written when the collection had three; the fourth skill has been mirrored but unguarded ever since. The roster is now discovered by walking `skills/*/SKILL.md`, so a new skill is covered the day it is added. A `.log` is also excluded from the comparison: a runtime log is never skill content, it is gitignored, and letting it fail the guard trains you to ignore the guard.
+  - **A mistyped `--input` exited 0 and wrote an empty bundle.** `migrate_estate` reported "Bundle written to: ..." with 0/0 workbooks, which reads as a successful migration, so a typo surfaced much later or never. A nonexistent or non-directory `--input` now fails fast with an actionable message that distinguishes the two cases. An input folder that exists but holds no Tableau file is a different, recoverable case and still builds -- but now says plainly that nothing was found and names the extensions it looked for.
+  - +5 lock-in tests: the log directory is redirected and the fallback still starts; a bad path and a file path are both rejected; an empty-but-real folder still builds and warns.
+
+- **tableau-migration (skill `2.28.0` -> `2.29.0`): every view-only quick table calc -- running total, moving average, percent-of-total -- was deleted from every shipped report.** The user hand-remediated a "Closed Inbound Referrals" running total that the engine had produced correctly in isolation but silently dropped from the bundle.
+  - **Root cause: `migrate_estate` runs the visual stage TWICE and only the second pass ships.** Pass 1 runs bare to build the model; pass 2 re-runs rebound to it. `_apply_visual_calcs` yielded to the model whenever the pill's measure was `measure_rebound`, so the transform emitted in pass 1 and was suppressed in pass 2 -- invisible to unit tests, which only ever exercise one pass. Any future "works in a test, missing from the bundle" symptom should check this asymmetry first.
+  - **Why yielding was wrong.** As `assemble_model._visual_calc_base_measures` documents, a view-only quick table calc has NO measure of its own -- the measure path deliberately hands it off and the model supplies only the BASE the transform runs over. A rebind to that base therefore proves the opposite of what the guard assumed.
+  - **The discriminator.** `_field_from_pill` now records `rebound_to_instance`: a second `_lookup_measure_binding` restricted to the pill's own instance token, which answers "did the model translate this pill's table-calc instance, or only its base field?" exactly. The guard yields only when the model bound the INSTANCE. Absent flag defaults to `True`, so behaviour predating it is unchanged and the existing yield tests pass untouched.
+  - Measured on the real estate: **0 -> 5 visual calculations** per report, including the exact `RUNNINGSUM([Closed Inbound Referrals], ROWS)` the user wrote by hand. Render-verified in Power BI Desktop after a full refresh -- the two running-total charts draw cumulative curves beside an un-transformed sibling that stays flat.
+- **tableau-migration: a fractional page height made Power BI Desktop reject the entire report.** An automatic-canvas dashboard resolved to `830.06` and emitted it verbatim; the layout parser fails the whole file with "Input string '830.06' is not a valid integer", which also blocks render verification of everything else. A Power BI page is measured in whole pixels.
+  - `_dash_page_dims` claimed to be "the single definition of the canvas", but `emit_pbir` **duplicated the same computation inline** and the two other producers (the adopted solver page, caption band-insertion growth) fed the override directly. Emit now calls the single definition, and all three producers round through one new `_whole_px` helper. Rounds UP, never down, so a page can never end up fractionally shorter than the content placed on it.
+  - Locked by a test that asserts the EMITTED artifact under both layout engines, not just the helper -- the whole class, not the one dashboard.
+
+- **tableau-migration (skill `2.27.0` -> `2.28.0`): the VALUE layer -- a split visual now inherits its worksheet's filters, and a date parameter's picker spans the dates it actually brackets.** Two defects, one cause: a derived object silently loses a property of the thing it came from.
+  - **Filter inheritance.** One Tableau worksheet routinely emits as SEVERAL Power BI visuals -- a KPI `card` stacked over a spark chart, or a measure trellis fanned into N bar charts. `_flag_filter_config_for` was computed correctly but never handed to the two split emitters (`_emit_kpi_title_card`, `_emit_measure_trellis`), so every derived piece rendered UNFILTERED while its sibling carried the filter. On a real dashboard the KPIs read 1354 / 1100 / 252 against Tableau's 820 / 742 / 81 -- all high, because the date window was missing. New `_inherit_flag_filters` applies the worksheet's filter to the split emitters' OUTPUT (so a future split path inherits by construction rather than by remembering), never overwrites an existing `filterConfig`, deep-copies so pieces don't share state, and is inert without flags. Measured: filter coverage 7/17 -> 12/17 on the page; the 5 remaining are genuinely unfiltered in the source (verified against the workbook's own filter list and its published totals).
+  - **Date-parameter domain.** A Tableau date parameter is a free calendar picker with no data-derived domain, and the rebuild modelled it as `CALENDARAUTO()` -- which scans EVERY date column in the model. One contact birthdate dragged the picker back to **1941** and buried the business range under ~31,000 unusable rows. Restricting to the columns wired into the Date dimension does NOT fix it (a birthdate is legitimately wired). The domain is now the date fields the parameter is actually COMPARED AGAINST in calcs -- exactly the dates it exists to bracket -- emitted as `CALENDAR(MIN(lo, default), MAX(hi, default))` so the author's default always stays selectable. Fails open to the full candidate set when nothing matches, and to `CALENDARAUTO()` when there are no date columns at all: too wide is awkward, too narrow would be wrong.
+  - The slicer's `Dropdown` mode is deliberately left alone -- the parameter table is disconnected and read via `SELECTEDVALUE`, so a range mode would select several rows, blank the `SELECTEDVALUE`, and silently fall back to the default.
+  - +7 regression tests (trellis + KPI inheritance, the helper's never-overwrite/inert contract, and four picker-domain cases incl. a birthdate-style column proven EXCLUDED and the fail-open fallbacks). Suite **3367 passed / 6 skipped / 1 xfailed**.
 ### Added
+- **tableau-migration (skill `2.26.0` → `2.27.0`): retract a false defect claim and weigh match
+  evidence instead of ranking it, so a visual split into two pieces stops reading as a moved band
+  (`scripts/geometry_audit.py`, `tests/test_geometry_fidelity.py`).**
+  **The "380px band displacement on the Intake page" reported in `2.26.0` below did not happen.**
+  It was an error in the auditor's own matching, not a defect in any migrated report. Verified
+  before acting on it: the layout plan places that page's charts and its full-width detail table
+  exactly where Tableau authors them, and both layout engines emit the same structure. The auditor
+  was wrong, and the retraction is the point — a measurement that names a defect nobody checked is
+  worse than no measurement.
+  The cause is general, so the fix is too. One Tableau worksheet is routinely emitted as SEVERAL
+  Power BI visuals — a KPI card stacked over a spark chart is the common case — and neither piece
+  then matches the authored worksheet's size. `2.26.0` ranked size evidence strictly above footprint
+  evidence, so a same-size chart 380px down the page beat the card sitting exactly in the authored
+  footprint. Ranking the other way is no better: it makes a caption match the chart it was authored
+  on top of instead of the copy that genuinely moved. Both orderings were measured producing wrong
+  matches on real output.
+  Neither signal deserves precedence, so they now compete on one cost —
+  `(1 - 0.75 * IoU) * (centre distance + size gap)` — with admissibility unchanged (overlap **or**
+  compatible shape). Overlap is scored intersection-over-**union** deliberately: with
+  intersection-over-authored, a full-page backdrop scores as perfect evidence for every zone it
+  covers and swallows one. The descriptive `match` label is now derived from the evidence rather
+  than from a sort tier, so the report schema is unchanged.
+  On the real estate this removes the phantom band displacement entirely (worst `worksheet`
+  displacement 833px → 484px) and lowers unmatched 5 → 4. What remains is a real, cross-workbook
+  class the false claim was masking: **full-width bottom-band objects emitted at roughly a third of
+  their authored width** (`Intake Details` authored 1344px wide, emitted 455px; `Engagements by
+  Dimension` authored 1324px, emitted 546px) — the next thing to fix.
+  +3 lock-in tests, including the card-plus-chart split that caused the false claim and the
+  backdrop case that forces intersection-over-union.
+- **tableau-migration (skill `2.25.0` → `2.26.0`): "unmatched" now really means DROPPED — tiered
+  match evidence *(the "380px band displacement" claimed here is RETRACTED — see `2.27.0` above)*
+  (`scripts/geometry_audit.py`, `tests/test_geometry_fidelity.py`).**
+  The overlap gate shipped in `2.25.0` fixed fabricated matches but introduced the opposite error:
+  it can only recognise an object that still sits in its authored footprint, so an object that moved
+  a long way — precisely the defect this audit exists to find — was reported as a dropped visual.
+  Checked against the real estate, every single one of the nine "dropped" objects was actually
+  present and merely relocated (an authored `166x49` caption emitted `166x45`, 93px higher).
+  Mislabelling the biggest displacement defect as a different, scarier defect is worse than the
+  noise it replaced.
+  - Matching is now **evidence-tiered**, strongest first: `overlap+shape` (intersects its footprint
+    *and* is the same size), then `shape` (same size, moved off its footprint — dimensions are the
+    evidence that survives a move), then `overlap` (still in its band but substantially resized, e.g.
+    a full-width strip emitted at a fifth of its width). Assignment stays exclusive and greedy over
+    pairs sorted by `(tier, cost)`. Each record carries an additive `match` key naming the tier.
+  - A leaf with no candidate on any tier is genuinely gone — nothing of its size exists anywhere and
+    nothing was emitted into its footprint — so `matched: False` is now a trustworthy dropped-visual
+    signal rather than a mislabelled displacement.
+  - Measured over the real estate: unmatched **9 → 5** (all remaining are credible drops — two
+    parameter controls, an image legend, two worksheets), and every phantom `text` drop resolves to
+    the relocation it always was. **The correction immediately paid for itself**: with far-moved
+    objects matched to their true counterparts, the Intake page shows an authored row of four
+    `224x223` charts at `y=165` emitted at `y=545` — an entire band displaced 380px, invisible in the
+    previous run because those objects had been quietly paired with whichever neighbour they happened
+    to overlap.
+- **tableau-migration (skill `2.24.0` → `2.25.0`): the fidelity audit stops crying wolf — exclusive,
+  overlap-gated matching plus a real dropped-visual signal (`scripts/geometry_audit.py`,
+  `tests/test_geometry_fidelity.py`).**
+  Running the audit shipped one version earlier across the real estate produced a worst-offender list
+  that was mostly the auditor's own noise, which on an unfamiliar dashboard is worse than no audit at
+  all — it names an innocent class and hides the guilty one. Two causes, both fixed:
+  - **Nearest-centre matching invented displacements.** A full-width 1346×40 legend strip was paired
+    with a 273×245 bar chart 250px away purely because nothing closer existed, and charged a 152px
+    "displacement". Matching is now **exclusive and overlap-gated**: a pair is only allowed when the
+    emitted rect actually intersects the authored content box, cost includes the size gap (so a banner
+    is never matched to a chart), each emitted visual is consumed at most once, and assignment is
+    greedy over the globally sorted costs. An authored object with no intersecting candidate is
+    reported `matched: False` instead of being assigned the nearest stranger — which turns a
+    **genuinely dropped visual into its own signal** rather than burying it in the distance median.
+    Unmatched records rank above merely displaced ones and always count as defects, so losing a visual
+    can never improve a score.
+  - **Degeneracy was measured in the wrong space.** The sliver filter compared Tableau's 0..100000
+    source units, but one page pixel is ~73 source units on a 1366px page, so 1px-wide persistence
+    slivers sailed through and reported fabricated 200–320px displacements. It is now judged in
+    emitted page pixels — the space the displacement itself is measured in. `auditable_leaves` takes
+    optional page dimensions; the source-unit path is kept for callers without them.
+  - `displacement_summary` gains an `unmatched` count per kind and reports `None` distances rather
+    than a fake zero for a kind with nothing matched.
+  - Measured over the real estate, the three largest "defects" evaporate as the artifacts they were
+    (`bitmap` max 176 → 5, `paramctrl` max 171 → 9, four 1px `text` slivers dropped), and **9 authored
+    objects across 6 pages are newly surfaced as having no emitted counterpart at all** — the next
+    real class to attack, which the previous numbers actively concealed.
+- **tableau-migration (skill `2.23.0` → `2.24.0`): Tableau zone padding is now honored, and a shipped
+  source-vs-output fidelity audit names the class if it ever regresses (`scripts/twb_to_pbir.py`,
+  `scripts/geometry_audit.py`, `tests/test_zone_padding.py`, `tests/test_geometry_fidelity.py`,
+  `tests/test_migrate_estate_rebind.py`).**
+  A Tableau zone is a *box*; the object is drawn in the content area left after the zone's margins.
+  `_parse_zone_padding` had resolved that `<zone-style>` margin model since long before this release
+  and **had zero callers** — every zone was emitted at its raw rect, and Power BI (which centres a
+  visual's image inside its rect) drew the content in the wrong place. On a real customer dashboard
+  the icon strip authored `margin=4` with `margin-bottom=85` — a 44px content box at the *top* of a
+  133px zone — was emitted at the full 133px and rendered ~46px low, under the breadcrumb instead of
+  beside the logo.
+  - **The emitter now applies the padding, but only its ASYMMETRIC EXCESS.** `_zone_pad_inset` returns
+    nothing when the four margins agree within 1px: a uniform inset shrinks a rect evenly, moves no
+    centre, and the layout model already supplies separation through its own gap — subtracting it
+    again would shrink every visual on every dashboard for no fidelity gain. Only the per-side excess
+    over the smallest margin — the part that actually displaces the content — is applied.
+  - **It can only ever shrink.** `_apply_zone_padding` returns a rect strictly inside the one it
+    replaces (and refuses to collapse below 1px), so it cannot re-introduce an overlap the layout
+    solver resolved. It is applied at the single `_scale_zone` choke point, on both the solved-rect
+    and the legacy scale-and-clamp branch, so both engines agree.
+  - Margins are authored **pixels** while zone rects are 0..100000 normalized units, so the inset is
+    converted through a new `_ZONE_PAD_SCALE` derived from the emitted page over the authored size.
+  - **`geometry_audit` gained a source-vs-output displacement audit** (`authored_leaves`,
+    `content_box`, `auditable_leaves`, `displacement_defects`, `displacement_summary`) — additive; the
+    existing per-page defect catalogue is untouched. Building it surfaced a trap worth recording: an
+    audit that measures against the **raw zone rect** scores the *broken* output as perfect and the
+    *correct* output as displaced. It measures against the content box, using the same asymmetric-
+    excess rule as the emitter, so the net can never contradict the fix. Container kinds
+    (`layout-flow`/`layout-basic`/`empty`) and degenerate sub-2-unit slivers are excluded.
+  - Measured over the real two-workbook estate (8 pages, 189 objects): the `dashboard-object` class
+    goes from **6 displacement defects (median 42px) to 0 (median 2px)**, `bitmap` 3 → 1, with page
+    defect and squashed-zone counts unchanged. Render-verified through the Power BI Desktop bridge.
+  - Also fixed a **latent flake** in `test_rebind_opt_in_does_not_change_canonical_report`: it compares
+    two back-to-back `migrate_estate` runs but popped only `generated_at` and `openable_outputs`, while
+    `report["input_manifest"]["verified_at_utc"]` is a second-resolution wall-clock stamp — so the test
+    passed only while both runs landed inside the same UTC second, and failed on a loaded machine. It
+    now pops that stamp too.
+
+- **tableau-migration (skill `2.22.0` → `2.23.0`): a caption can no longer inflate the canvas — the
+  page lands at the size the Tableau author drew (`scripts/layout_solve.py`,
+  `scripts/layout_plan.py`, `tests/test_layout_containment.py`, `tests/test_layout_solve.py`,
+  `tests/test_layout_plan.py`).**
+  Rendering the previous slice on a real customer dashboard showed the same content emitted on a
+  **1506px** page that Tableau authors at **1000×1000** — a 50% taller canvas, so under `FitToPage`
+  every visual rendered proportionally smaller and the dashboard read as a field of whitespace the
+  source does not have. Instrumenting the solver's demand chain (rather than arguing from defect
+  counts) found two compounding causes, which had to be fixed together:
+  - **Frame inversion multiplied a generic floor into a page-sized demand.** `compute_mins`' frame
+    branch computes `need = child_min / frac` so each proportional child clears its minimum. Against a
+    generic kind floor that explodes: a 21px caption occupying 2.125% of the canvas carried the 32px
+    text floor and therefore demanded `32 / 0.02125 = 1506px` of page. Eleven pixels of caption cost
+    five hundred pixels of canvas. New `_clamp_to_authored` bounds every generic leaf minimum by the
+    size the author actually drew (floored at `MIN_ABSOLUTE = 16px`, and an explicit 0 for a blank
+    stays 0), so `child_min ≤ frac × page` and the inversion can never exceed the page. The floors are
+    heuristics; the author's own layout is evidence, and a worksheet drawn 45px tall is a caption
+    strip, not a chart that needs 160px.
+  - **A fixed-size pin was reported as a minimum.** `_main_min_contrib` returned `fixed_px`, so a
+    stack's minimum was the sum of its pins (871px) instead of its real content (547px) inside a zone
+    the author drew 725px tall. A pin is a *request*, not a requirement — the preference pass already
+    treated it that way — so it now contributes the child's subtree minimum. Removing this alone made
+    the page *worse* (1506 → 1813px), because the pins had been masking the worksheet floors beneath;
+    the two fixes are only correct together.
+  - **Third-order coupling:** `allocate` still *pays* every pin in full, so with pins out of the
+    minimum they ate pixels flexible siblings needed to clear their own. The fixed-child budget now
+    takes the tighter of the fraction ceiling and `room − Σ flexible minimums`, preserving the earlier
+    logo-starvation fix while guaranteeing min-respect. `_place_float` applies the same authored clamp,
+    since a float bypasses the solver entirely.
+  Growth is now gap-driven only — the solver's own 8px inter-sibling gaps, which Tableau's absolute
+  layout never budgeted — so both growth contracts assert exactly `page + (n−1) × GAP`. Measured
+  end-to-end through `migrate_estate` on two real customer workbooks: the page returns to **1000×1000
+  exactly** (was 1506), ink coverage 75% → 85%, canvas area 18.3 Mpx (below legacy's 18.5), deadspace
+  0.310 (best of legacy/previous/current), and total layout defects 5 → 3 with none introduced. Render-
+  verified through the Power BI Desktop bridge, not inferred from counters. Three test contracts that
+  encoded the removed behaviour were corrected and 7 direct tests added (authored-floor ceiling,
+  one-caption-cannot-inflate-canvas, `MIN_ABSOLUTE` floor, blank stays collapsible, pin-is-a-request,
+  float authored clamp, roomy float keeps its kind minimum).
+- **tableau-migration (skill `2.21.0` → `2.22.0`): chrome stops absorbing surplus space, page growth
+  is height-only again, and the auditor reports layout QUALITY beside its defect counts
+  (`scripts/layout_solve.py`, `scripts/geometry_audit.py`, `tests/test_layout_solve.py`).**
+  Rendering the previous slice's output on real customer workbooks — via the Power BI Desktop bridge
+  rather than by reading counters — showed one-word section labels ("Director", "Manager") emitted as
+  155px purple slabs, slicer labels truncated to `Ontrac Ma...`, and canvases inflated to 2732px wide.
+  Three coupled causes, all deviations from the layout/quality specs this track is built to:
+  - **Leaf sizing had a minimum but no preference.** With only a minimum, every flow child is a
+    grower, so surplus main-axis space is handed out by fraction and a one-line caption in a roomy row
+    inflates until it fills its share. Leaves now carry `(min, pref, grow)`: slicers, parameter
+    controls, captions and legends get `grow = 0` and are capped at their preferred size, with the
+    reclaimed pixels redistributed to the visuals that benefit. A container that contains only chrome
+    is itself `grow = 0`, which is what stops a whole header band from eating the canvas. Scoped to
+    the main axis — every statement of the rule is about height, and capping a slicer's *width* would
+    worsen the measured truncation.
+  - **Growth was symmetric.** It is now height-only and exact, as specified: a taller page rescales to
+    the viewport under FitToPage, while a wider one merely renders every visual and font
+    proportionally smaller for content that needed room vertically.
+  - **The growth ceiling was tuned against a metric that growth improves.** `MAX_GROWTH` had been set
+    by watching the sub-41px "floor" defect count fall as the cap rose — but nothing can be under 41px
+    once the page doubles, so that count was rewarding inflation rather than measuring layout. The
+    constant is renamed `FRAME_DEMAND_CAP` (`MAX_GROWTH` kept as an alias) and now bounds only the
+    pathological case it was introduced for: inverting a near-zero frame fraction, where one corpus
+    sliver zone would otherwise demand a 164384px canvas.
+  Also fixes a containment break that height-only growth exposed: when a container's box is narrower
+  than its inter-sibling gaps alone, squeezing only the children left every gap at full width and the
+  advancing cursor walked off the parent. Gaps now squeeze with everything else.
+  `geometry_audit` gains a report-only `geometry_quality` / `quality_report` block — `deadspace`,
+  `misalign`, `gutter_cv`, `aspect`, `object_count`, `chrome_ratio`, `area` — kept deliberately
+  separate from `score_report`, whose `Counter` of hard-gated integers callers sum and compare.
+  Measured on the two real workbooks: canvas area **24.5 → 21.1 Mpx**, over-tall chrome **17 → 14**,
+  extreme aspect ratios **0.06 → 0.00** per page.
+
+### Added
+- **tableau-migration (skill `2.20.0` → `2.21.0`): a squeezed flow row now SHARES the shortfall
+  across its fixed children instead of dumping it on the one flexible sibling, and `--layout` is
+  finally reachable from `migrate_estate` — frame/quality track slice 4f
+  (`scripts/layout_solve.py`, `scripts/migrate_estate.py`, `tests/test_layout_fixed_share.py`).**
+  Slice 4d wired the solver into emit; the first end-to-end build of a real customer workbook found
+  what six workbooks of corpus A/B scoring had not. On a Salesforce dashboard a logo authored as one
+  of four equal quarters was emitted **26px wide** beside three filter cards at 177/205/179, because
+  `allocate` subtracted every child's `fixed_px` from the row's budget unconditionally. But
+  `fixed_px` is a request measured at the container's AUTHORED size, and that row had itself been
+  allocated 611px against ~819 authored — so paying the pins in full made the single flexible child
+  absorb 100% of the 208px shortfall. Nothing caught it: the row never overran (so slice 4c's
+  last-resort squeeze had nothing to fix) and 26 > `MIN_BITMAP` 24 (so no violator fired). It was
+  *satisfied* and wildly out of proportion. The fix caps the pins' collective demand at the room not
+  authored to flexible siblings and scales them into it — never below their own minimum and **never
+  above their own request**, so it may only ever take pixels off a pinned child. The row now solves
+  to 139/161/141/**146**, matching the authored quarters. A no-op whenever the container has room for
+  everyone, which is why the corpus is unchanged (`o0 c0 b0 f31` legacy vs `o0 c0 b0 f17` solver,
+  27 pages). Separately, `--layout {legacy,solver}` existed only on `twb_to_pbir`'s CLI, so the
+  engine could not be chosen from the one-button estate migrator users actually run; it is now
+  threaded through `migrate_estate` and bound once in `_viz_adapter`, capability-gated so a viz stage
+  without a `layout` parameter is called exactly as before. Default stays `legacy`. +15 tests.
+
+- **tableau-migration (skill `2.19.0` → `2.20.0`): the v2.7.0 geometry goldens now run under BOTH
+  layout engines — frame/quality track slice 4e (`tests/test_layout_engine.py`; test-only, the engine
+  is byte-identical so no migration output can change).** v2.7.0 locked "a clean page stays clean"
+  against the legacy engine only. Those goldens are left byte-for-byte alone; the new parametrized
+  set runs the same four clean-page workbooks and the same shipped auditor under each engine in turn,
+  so the solver path carries the identical regression net rather than an unguarded parallel one — if a
+  future solver change starts manufacturing overlap on a page legacy keeps clean, this fails. Also
+  adds two completeness guards that geometry scoring alone cannot give: a short band must still emit
+  its visual under either engine, and both engines must emit the **same set** of visuals — a solver
+  that silently failed to place a zone would surface as a lost visual, not as a geometry defect.
+
+### Added
+- **tableau-migration (skill `2.18.0` → `2.19.0`): opt-in `--layout solver` — the zone-tree layout
+  engine is wired into emit — frame/quality track slice 4d (`scripts/twb_to_pbir.py`,
+  `scripts/layout_solve.py`, new `tests/test_layout_engine.py`).** Four branch-only slices built the
+  solver stack (`zone_tree` → `layout_solve` → `layout_layers` → `layout_plan`) without letting any of
+  it reach the emitted report. This slice connects it, behind a **default-off** switch: `--layout
+  {legacy,solver}` on the CLI (env `TWB_PBIR_LAYOUT`) and a `layout=` keyword on `parse_twb` /
+  `emit_pbir` / `migrate_twb_to_pbir`. `legacy` remains the default and is **proven byte-identical to
+  the previous release across all six corpus workbooks**, so no existing run can change.
+  - Every substitution goes through the single `_scale_zone` choke point, looked up by the `zone_id`
+    slice 4a records at capture time — one edit, not seven. A solved rect is taken **verbatim**:
+    re-applying the `min_w`/`min_h` floors would re-inflate a box the solver deliberately sized and
+    re-introduce the overlap the tree solve removed. Any zone the plan does not name (and any
+    dashboard whose plan failed to build, raised, or whose solver module is absent) falls back to the
+    legacy scale — fail-closed, never half-solved.
+  - Emit **adopts the page the solve resolved**. Growth is not cosmetic: the solver enlarges the page
+    (bounded by `MAX_GROWTH`) precisely so the content fits, so its rects are valid only on that page.
+    Keeping the authored page while using solved rects measures **100 out-of-bounds visuals** on the
+    corpus versus **0** when the grown page is adopted. New `_dash_page_dims` is now the single
+    definition of the canvas, so the page the plan is solved against and the page emit writes are
+    provably the same number.
+  - **Slicer floor coupling.** The solver reserved 56 px for a filter leaf while the emitter re-floors
+    a dropdown slicer to `SLICER_DROPDOWN_MIN_H` (64 px) *after* placement — so the emitted band grew
+    into whatever the solver had seated below it (13 overlaps on two ATTI dashboards). Fixed on both
+    sides: `layout_solve.MIN_SLICER` height is raised to 64 to match the emitter's own floor, and
+    `_layout_slicers` takes the solved height verbatim when a plan is active (its purely horizontal
+    inset still applies — it only ever shrinks a card, so it cannot introduce a collision).
+  - **A/B flip gate, measured end-to-end on the real emitted PBIR** (27 pages, six workbooks) rather
+    than on plan rects: legacy `{overlaps 0, contain 1, oob 0, floor 31}` vs solver `{overlaps 0,
+    contain 1, oob 0, floor 17}` — solver is ≤ legacy on all four counts and **cuts squashed zones
+    nearly in half**. The default is not flipped in this release.
+  - +25 tests pinning both halves of the contract (default-is-legacy and inert · verbatim solved rects ·
+    each fail-closed fallback · page adoption and reset · the `_dash_page_dims` agreement · the slicer
+    floor coupling · CLI validation and default).
+
+### Fixed
+- **tableau-migration (skill `2.17.0` → `2.18.0`): solver containment — a frame no longer starves its
+  children — frame/quality track slice 4c (`scripts/layout_solve.py`; still nothing imports the solver
+  in the emit path, so migration output is unchanged).** A `frame` (Tableau `layout-basic`) hands each
+  child `child_src / frame_src` of its own allocated box, but `compute_mins` took a frame's minimum as
+  `max(child min)`. That **understates** the frame's requirement by exactly that fraction — a child
+  occupying 40 % of the frame's height needs the frame to be `child_min / 0.4` tall, not `child_min` —
+  so the frame reported itself satisfied while every child was starved. A starved flow child then
+  overran its own box, because its fixed-size and min-clamped grandchildren sum past whatever it was
+  given and the advancing cursor simply walked off the end. Measured on the six-workbook corpus: **7
+  out-of-bounds leaves across 4 dashboards, on pages the solver reported as not needing to grow.**
+  Three coupled changes close it: (1) a frame's min now **inverts each child's source fraction**;
+  (2) that demand is **capped at `MAX_GROWTH` (2.0) × the requested page**, because inverting a
+  near-zero fraction explodes — one corpus sliver zone barely 0.8 % of its frame's width would
+  otherwise demand a **164 384 px**-wide canvas; and (3) a flow container **scales its allocations
+  down proportionally** when they still exceed its box, which is what makes on-page containment
+  unconditional rather than conditional on the cap being generous (load-bearing: with the cap but
+  without the down-scale the corpus still shows 1 containment + 1 out-of-bounds defect). `MAX_GROWTH`
+  is the measured knee, not a guess: corpus floor counts run 47 → 38 → 32 at caps of 1.25× / 1.5× / 2×
+  and then **plateau** (2.5× and 3× also give 32), so 2× buys the entire available benefit while
+  growing further only shrinks every visual under FitToPage. Corpus result: overlaps **0**,
+  containment **1 → 0**, out-of-bounds **7 → 0**, floor **52 → 32** — parity with the legacy path's
+  0 / 0 / 0 / 31, which clears the A/B flip gate. Also establishes that a solved page's rects are
+  valid **only on the plan's own page** (scored against the originally requested page the same corpus
+  shows 100 out-of-bounds), so a future emit wiring must adopt `plan["page"]`. `compute_mins` gains an
+  optional trailing `cap` argument (additive; existing two-argument calls behave as before), flow
+  minimums are never capped, and the stale "out-of-bounds is owned by a later track" concession in the
+  slice-2 test contract is corrected. +16 tests (`tests/test_layout_containment.py`).
+
+### Added
+- **tableau-migration (skill `2.16.0` → `2.17.0`): per-dashboard layout PLAN — frame/quality track
+  slice 4b (new `scripts/layout_plan.py`, stdlib-only, nothing imports it yet, zero behaviour
+  change).** The three pure layout modules shipped so far each solve one step and are wired to
+  nothing: `zone_tree.parse_zone_tree` (parse), `layout_solve.solve` (resolve), `layout_layers`
+  (classify). `build_plan(db, …)` composes them into the ONE lookup table an emit path actually
+  needs — `rects` (zone id → page-pixel `(x, y, w, h)`), `kinds` (zone id → leaf kind), the three
+  z-order id sets `background` / `panel` / `overlay`, the resolved `page`, and a `grew` flag —
+  keyed by the `zone_id` slice 4a records on every captured item, plus `is_decoration(plan, id)` to
+  collapse the three tiers into one send-to-back question. **It also closes a real hole in the
+  solver:** `zone_tree` hoists a `floating='true'` subtree out of the flow into `tree["floats"]`,
+  but `solve` walks only `tree["root"]`, so a float gets **no rect** — an emit path built on `solve`
+  alone would silently LOSE those visuals. `build_plan` places each hoisted float by scaling its
+  absolute source rect through the tree extent into the page, applying the leaf minimum as a floor,
+  and clamping it on-page (the six-workbook corpus contains zero floats, so this path is proven by
+  synthetic tests rather than by real data). Page growth is **reported, not silently applied**:
+  `grew` says the content minimum exceeded the requested page, leaving the adopt-vs-fit decision to
+  the emit wiring. Fail-closed throughout — an unparseable dashboard, a genuine source-overlap
+  premise violation, a non-positive page, or junk input all return `None` and never raise, so a
+  caller keeps the legacy path. Verified against the corpus at REAL emit page sizes: the plan
+  reproduces the A/B harness exactly on overlaps `0`, containment `1`, out-of-bounds `7`; its floor
+  count is `52` vs the harness's `51` because the plan deliberately includes `hidden` leaves (emit
+  surfaces hidden filters — Tableau's show/hide toggle is not a delete) and one hidden bitmap icon
+  trips the ≤ 41 px floor. +23 tests (`tests/test_layout_plan.py`) covering the lookup contract, the
+  `_parse_dashboard` zone-id round-trip, synthetic float placement / minimum / clamping / floats
+  inside a floating container, the three tiers and the worksheet guardrail, growth reporting, and
+  every fail-closed trigger.
+- **tableau-migration (skill `2.15.0` → `2.16.0`): zone-identity seam for solver-backed emit —
+  frame/quality track slice 4a (`scripts/twb_to_pbir.py`, additive keys only, zero behaviour
+  change).** `_parse_dashboard` flattens a dashboard's `<zones>` into per-kind lists of plain
+  coordinate dicts (`zones` / `filter_zones` / `param_controls` / `legend_zones` / `text_objects` /
+  `image_zones` / `title_banner`). Those dicts carried geometry but **no identity**, so a captured
+  item could not be matched back to its node in the layout tree (`zone_tree`) or to its solved
+  rectangle (`layout_solve`) — the lookup every solver-backed emit path needs. Each of the seven
+  capture sites now additively records **`zone_id`** (the source zone's `id`, the same key
+  `zone_tree` stores on each node and `layout_solve` keys its rects by), captured at walk time so it
+  is exact. Matching by rectangle is **not** a viable substitute: a single-child `layout-flow`
+  wrapper persists its child's rect exactly, so one rect names two zones — measured on **12 of the
+  13** corpus dashboards. A load-bearing corpus check first confirmed the seam is sound: `id` is
+  present on **454 of 454** zones, unique within every dashboard, and **268 of 268** emit-captured
+  items resolve to a solver rect. Nothing reads `zone_id` yet — it is recorded so the solver wiring
+  is a lookup rather than a re-parse — and `image_zones` keeps its pre-existing `id` key, so the
+  change is purely additive. +12 tests (`tests/test_zone_identity.py`) pin per-kind capture, the
+  **round-trip** invariant (every captured `zone_id` resolves to a solved rect), the
+  wrapper-shares-child's-rect ambiguity that motivates id-keying, id distinctness, the
+  `<devicelayouts>` exclusion, the untouched pre-existing keys, and the no-`id` / empty-dashboard
+  robustness cases. Full suite **3224 passed / 6 skipped / 1 xfailed**; all pre-existing goldens
+  byte-for-byte unchanged.
+
+- **tableau-migration (skill `2.14.0` → `2.15.0`): floating-overlay classifier —
+  frame/quality track slice 3 (`scripts/layout_layers.py`, no emit change).** The third and final
+  z-order classifier tier, resolving the residual the first two tiers leave behind. A session
+  diagnostic over the six-workbook / thirteen-dashboard corpus showed that **42 of the 43** collisions
+  remaining after the page-background (slice 1) and sub-region-panel (slice 2) exemptions are an
+  **author-intended float** — an interactive `filter` / `paramctrl` slicer or a `text` label the
+  Tableau author pinned on top of a chart inside a `layout-basic` frame (Tech Hierarchy's filter pile
+  over its chart, section labels dropped inside plots, stacked control+caption clusters), which the
+  solver faithfully reproduces and a naive scan miscounts as a defect. New helpers
+  `layout_layers.is_overlay_leaf` / `floating_overlay_leaves` (plus a shared `_rects_collide` that
+  **exactly replicates the auditor's pairwise test** — `> 4 px²` raw-intersection gate, then
+  full-nesting *or* `> 2 %`-of-smaller overlap) classify a colliding control/annotation leaf as a
+  floating overlay and exempt it, exactly as a backdrop or a panel is exempted. It is **kind-gated**
+  (`FLOAT_KINDS = text/filter/paramctrl`), and that gate is the load-bearing guardrail: a `worksheet`
+  is **never** an overlay, so the lone `worksheet`-on-`worksheet` residual (Staff Capacity's floating
+  Stage-Legend worksheet inside another chart) — "data hidden by data" — stays a real, audited defect.
+  The classifier is **relational** (a control/label that overlays nothing is not flagged) and reuses
+  slice 1's default-off `is_background` predicate, so no new auditor surface is added and the shipped
+  v2.7.0 goldens remain **byte-for-byte unchanged** with no emit path touched. +14 tests pin the
+  overlay kinds, the label-inside-chart and filter/param-over-chart cases, the **worksheet+worksheet
+  guardrail**, the overlay-that-collides-with-nothing case, the exact auditor-threshold match, the
+  bitmap-icon-exempt-via-label-side case, and order/empty/None/junk robustness. Measured on the
+  frame-track A/B harness (both engines, RAW → +BG → +PANEL → +FLOAT):
+
+  | engine | overlaps | contain | oob | floor |
+  |---|---|---|---|---|
+  | solver +panel (slice 2) | 26 | 17 | 9 | 49 |
+  | solver **+float (slice 3)** | **0** | **1** | 9 | 49 |
+
+  **Overlaps 26 → 0** and **containment 17 → 1** — the single residual containment is the intentional
+  floating Stage-Legend worksheet, correctly left audited by the guardrail rather than
+  over-exempted. `oob 9` / `floor 49` (min-size squash) are a later pass. Branch-only: not merged to
+  `main` until the whole frame track is complete and validated.
+- **tableau-migration (skill `2.13.0` → `2.14.0`): sub-region decoration-panel classifier —
+  frame/quality track slice 2 (`scripts/layout_layers.py`, no emit change).** The second frame-track
+  slice generalizes slice 1's *page-level* background to the *sub-region* case. A new relational
+  classifier (`layout_layers.is_decoration_leaf` / `panel_leaves`, plus a shared `_rect_contains`
+  matching the auditor's `TOL=1.0`) recognises a **static-decoration leaf** (`text` or `bitmap`) that
+  **encloses** other content — a branded colored section panel with worksheets floated on top, or a
+  title/divider strip over icons/labels — as a **z-order background for its region**, sent to back
+  rather than counted as a colliding tile. It is **kind-gated exactly like the page tier**: only
+  `text`/`bitmap` qualify, so a full-bleed **worksheet** that encloses cards is never a panel and its
+  containment stays a real, audited defect. No new auditor surface was needed — slice 1's default-off
+  `is_background` predicate simply receives more exempt leaves — so the shipped v2.7.0 goldens remain
+  **byte-for-byte unchanged** and no emit path is touched. +13 tests pin the decoration kinds, the
+  panel-encloses-content cases, the **worksheet guardrail**, the enclose-nothing / pure-decoration /
+  tolerance / page-background-subtraction cases, and junk-input robustness. Measured on the
+  six-workbook corpus (frame-track A/B harness, now scoring both engines symmetrically under
+  RAW → +BG → +PANEL):
+
+  | engine | overlaps | contain | oob | floor |
+  |---|---|---|---|---|
+  | legacy (+panel) | 0 | 0 | 0 | 31 |
+  | solver raw | 32 | 93 | 9 | 49 |
+  | solver +bg (slice 1) | 32 | 44 | 9 | 49 |
+  | solver **+panel (slice 2)** | **26** | **17** | 9 | 49 |
+
+  **Containment 44 → 17** — the 23 branded SF-Admin text panels + the 4-icon EBI cluster — and, as a
+  bonus, **overlaps 32 → 26** (the same panels were also scoring partial-overlap false-positives). The
+  residual (contain 17, most overlaps) is now entirely **worksheet-on-worksheet frame geometry**,
+  owned by the next slice; the symmetric exemption also drove *legacy* containment 1 → 0. Branch-only:
+  not merged to `main` until the whole frame track is complete and validated.
+- **tableau-migration (skill `2.12.0` → `2.13.0`): background-layer classifier + background-aware
+  auditor — frame/quality track slice 1 (`scripts/layout_layers.py` + additive `geometry_defects`
+  param, no emit change).** The first slice of the frame/absolute + z-order track that follows the
+  slice-3 finding. A new kind-aware classifier (`layout_layers.is_background_leaf` /
+  `background_leaves` / `rect_blankets_page`) recognises a **full-canvas decoration image** — a
+  `bitmap` leaf covering ≥ 85 % of the page area *and* spanning ≥ 85 % of **both** axes — as a
+  z-order **background layer** rather than a colliding tile, and `geometry_audit.geometry_defects`
+  gains an **optional, default-off** `is_background` predicate that exempts such a backdrop from the
+  overlap/containment scan (mirroring the existing donut composite-group exemption). Default `None`
+  keeps the shipped v2.7.0 behaviour **byte-for-byte**, so every existing golden is unchanged; the
+  change is purely additive and touches no emit path. Two new test modules
+  (`tests/test_layout_layers.py`, +the auditor's `is_background` cases) pin the thresholds, the
+  **critical kind guardrail** (a full-bleed *worksheet* is never a background — dropping a real chart
+  would hide a genuine defect), the both-axis blanket geometry, and robustness on junk input. Measured
+  effect on the six-workbook corpus (via the frame-track A/B harness, a session artifact):
+
+  | engine | overlaps | contain | oob | floor |
+  |---|---|---|---|---|
+  | legacy (bg-aware) | 0 | 1 | 0 | 31 |
+  | solver raw (pre-slice-1) | 32 | 93 | 9 | 49 |
+  | solver **bg-aware** | 32 | **44** | 9 | 49 |
+
+  **Containment is cut nearly in half (93 → 44)** — exactly the −49 from the two branded full-canvas
+  backdrops (SF-Admin "Access View" 37 → 12, "Executive Summary" 35 → 11) — while worksheets are never
+  misclassified. Notably the corpus shows the *legacy* path keeps its low containment by **silently
+  dropping** those backdrops (their PNG bytes are packaged, yet no image visual is emitted); the solver
+  track's opportunity is to **keep** the backdrop (more faithful) and send it to back. The remaining
+  solver containment (44) is text banners and large-worksheet-in-frame cases owned by the next slices;
+  overlaps/oob are the frame-child de-overlap slice. This work lands on the frame-track branch only —
+  it is not merged to `main` until the whole track is complete and validated against the corpus.
 - **tableau-migration (skill `2.11.0` → `2.12.0`): geometry auditor promoted + A/B harness — Zone
   Geometry v3 slice 3 (`scripts/geometry_audit.py` + `tests/test_geometry_audit.py`, no emit change).**
   The v2.7.0 per-page layout-defect auditor — previously buried inside `tests/test_twb_to_pbir.py` — is

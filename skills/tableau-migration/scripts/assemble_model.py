@@ -2974,7 +2974,12 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         if nm:
             reserved.add(nm)
     non_consumed = [c for c in all_calcs if (c.get("name") or "").lower() not in consumed_lower]
-    vp = emit_value_parameters(parameters or [], calcs=non_consumed, reserved_names=reserved)
+    vp = emit_value_parameters(parameters or [], calcs=non_consumed, reserved_names=reserved,
+                               date_cols={(_table_display(rel), c["model_name"])
+                                          for rel in tables
+                                          for c in (rel.get("columns") or [])
+                                          if c.get("tmdl_type") == "dateTime"
+                                          and _table_display(rel)})
     param_resolver = vp["param_resolver"] if vp["table_names"] else None
 
     # Parameter-driven positional date-band -> a faithful keep-flag measure (1 keep / BLANK drop)

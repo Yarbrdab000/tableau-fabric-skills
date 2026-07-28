@@ -212,6 +212,58 @@ def test_hyper_to_csv_row_limit(tmp_path):
     assert res["snapshot"]["row_count"] == 2
 
 
+# -- the server log must never land in the caller's working directory ---------
+
+
+class _LogDirRecordingProcess(_FakeProcess):
+    """A HyperProcess that ACCEPTS ``parameters`` and remembers what it was given."""
+
+    seen = []
+
+    def __init__(self, *, telemetry, parameters=None):
+        super().__init__(telemetry=telemetry)
+        type(self).seen.append(parameters)
+
+
+def test_hyper_process_redirects_the_server_log_out_of_the_working_directory(tmp_path):
+    # The Hyper API writes hyperd.log to the CURRENT WORKING DIRECTORY. Every run launched from the
+    # skill tree therefore dropped a log there, where it grew to megabytes, got copied into the
+    # plugin package by robocopy /MIR, and broke canonical<->mirror parity after any test run.
+    _LogDirRecordingProcess.seen = []
+    hapi = _fake_hapi({"t": {"columns": ["A"], "rows": [[1]]}})
+    hapi.HyperProcess = _LogDirRecordingProcess
+
+    hr.hyper_to_csv("x.hyper", str(tmp_path / "out"), hapi=hapi)
+
+    assert len(_LogDirRecordingProcess.seen) == 1
+    params = _LogDirRecordingProcess.seen[0]
+    assert params and "log_dir" in params, "server log was left pointing at the caller's cwd"
+    log_dir = params["log_dir"]
+    assert os.path.isdir(log_dir)
+    assert os.path.abspath(log_dir) != os.path.abspath(os.getcwd())
+
+
+def test_hyper_process_still_starts_when_the_api_rejects_a_log_dir(tmp_path):
+    # Older/newer tableauhyperapi releases may not accept the parameter; reading an extract must not
+    # start failing because of a log-location preference.
+    calls = []
+
+    class _RejectsParameters(_FakeProcess):
+        def __init__(self, *, telemetry, **kw):
+            if kw:
+                calls.append(kw)
+                raise TypeError("unexpected keyword argument")
+            calls.append(None)
+            super().__init__(telemetry=telemetry)
+
+    hapi = _fake_hapi({"t": {"columns": ["A"], "rows": [[1]]}})
+    hapi.HyperProcess = _RejectsParameters
+
+    res = hr.hyper_to_csv("x.hyper", str(tmp_path / "out"), hapi=hapi)
+    assert res["t"]["row_count"] == 1
+    assert len(calls) == 2 and calls[0] and calls[1] is None  # tried with, fell back without
+
+
 # -- missing-dependency contract ----------------------------------------------
 def _hyperapi_installed():
     import importlib.util

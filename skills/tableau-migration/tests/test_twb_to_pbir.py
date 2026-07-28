@@ -3758,6 +3758,39 @@ def test_no_flags_leaves_visuals_and_records_untouched():
     assert all("flag_filters" not in r for r in res["candidate_records"])
 
 
+def test_every_visual_split_out_of_a_worksheet_inherits_its_keep_flag():
+    # Measured on a real migration: a worksheet that rebuilds as SEVERAL visuals had its filter
+    # applied to only ONE of them. Tableau applies a worksheet filter to the whole worksheet, so an
+    # unfiltered sibling silently widens to the entire table -- a KPI card read 1354 against the
+    # source's date-ranged 820, shown confidently with no warning. Every derived piece inherits.
+    ws = _worksheet("Trellis", "Bar",
+                    rows="[federated.abc].[none:Category:nk]",
+                    cols="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+                    deps_extra=_INST + _DATE_FILTER_CALC, filters=_DATE_FILTER_FILT)
+    ir = parse_twb(_workbook(ws), param_binding=_flag_pb(["Trellis"]))
+    vis = list(_visual_parts(emit_pbir(ir)).values())
+    assert len(vis) == 2  # the worksheet fans into one chart per measure ...
+    for v in vis:         # ... and NEITHER piece is left unfiltered
+        conts = [c for c in (v.get("filterConfig") or {}).get("filters", [])
+                 if "Measure" in c.get("field", {})]
+        assert len(conts) == 1
+        assert conts[0]["field"]["Measure"]["Property"] == "Date Filter"
+
+
+def test_inherit_flag_filters_never_overwrites_and_is_inert_without_flags():
+    from twb_to_pbir import _inherit_flag_filters
+    fc = {"filters": [{"name": "flag-x"}]}
+    own = {"filters": [{"name": "its-own-narrower-scope"}]}
+    a, b = {}, {"filterConfig": own}
+    _inherit_flag_filters([a, b], fc)
+    assert a["filterConfig"] == fc
+    assert b["filterConfig"] is own          # a piece with its own scope keeps it
+    assert a["filterConfig"] is not fc       # copied, so pieces never share mutable state
+    bare = {}
+    _inherit_flag_filters([bare], None)
+    assert bare == {}                        # no flags -> byte-for-byte the prior output
+
+
 def test_migrate_twb_to_pbir_flag_filter_lands_on_part_and_candidate_record():
     ws = _flagged_line_worksheet("Line chart")
     res = migrate_twb_to_pbir(_workbook(ws), param_binding=_flag_pb(["Line chart"]))
@@ -6713,6 +6746,29 @@ def test_measure_binding_non_bindable_status_still_defers():
         assert "quick table calc" in fact["reason"]
 
 
+def test_measure_binding_records_whether_it_bound_the_pill_calc_or_only_its_base():
+    # The discriminator that keeps a view-only quick table calc alive through the model-fact rebind.
+    # Binding by the pill INSTANCE token means the model translated this pill's own table calc (the
+    # transform is embodied in the measure); binding by the bare calc id means it translated only the
+    # BASE the calc runs over. Consumers must be able to tell the two apart -- reading a bare
+    # ``measure_rebound`` as "the model owns the transform" silently deleted every running total /
+    # moving average / percent-of-total from every shipped report.
+    def _color_field(mb):
+        res = migrate_twb_to_pbir(_pcdf_heat_workbook(), measure_binding=mb)
+        ws = next(w for w in res["ir"]["worksheets"] if w["name"] == "Heat")
+        return ws["encodings"]["color"]
+
+    by_instance = _color_field({"pcdf:Calculation_1:qk": {
+        "entity": "_Measures", "measure": "Percent Difference", "status": "translated"}})
+    assert by_instance["measure_rebound"] is True
+    assert by_instance["rebound_to_instance"] is True
+
+    by_base = _color_field({"Calculation_1": {
+        "entity": "_Measures", "measure": "Percent Difference", "status": "translated"}})
+    assert by_base["measure_rebound"] is True
+    assert by_base["rebound_to_instance"] is False
+
+
 def test_measure_binding_default_none_is_byte_unchanged():
     # Additivity: omitting the binding == passing None == passing an empty map -> the prior deferred
     # output, byte-for-byte.
@@ -7253,7 +7309,7 @@ def test_dropdown_filter_card_height_is_floored_at_64():
     ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
                     "[federated.abc].[none:Category:nk]", deps_extra=_INST, filters=filt)
     dash = _one_card_dashboard("W", "none:Region:nk", card_h=6000, card_y=90000)
-    slicers = _page_slicers(emit_pbir(parse_twb(_workbook(ws, dash))))
+    slicers = _page_slicers(emit_pbir(parse_twb(_workbook(ws, dash), layout="legacy")))
     assert len(slicers) == 1
     assert slicers[0]["position"]["height"] == 64.0
 
@@ -7494,7 +7550,9 @@ def test_thin_caption_sizes_to_content_not_inflated_to_floor():
     # Both the chart zone and the caption are authored at the same thin height (24px scaled). Before
     # v2-1 both were floored to 40. Now the caption keeps its content height while the chart still
     # floors -- proving the content-aware floor is caption-scoped and never lowers the chart floor.
-    res = migrate_twb_to_pbir(_V2_MIN_SIZE_TWB)
+    # Pinned to the legacy engine: this asserts a legacy REPAIR PASS. The solver seats the caption by
+    # solving the zone tree instead, so it never reaches the floor this test is about.
+    res = migrate_twb_to_pbir(_V2_MIN_SIZE_TWB, layout="legacy")
     by_type = {}
     for k, v in res["parts"].items():
         if not k.endswith("visual.json"):
@@ -7567,7 +7625,9 @@ def test_caption_overlapping_chart_is_lifted_clear():
 def test_clear_caption_is_untouched_by_deoverlap():
     # A caption already in a clear band must be byte-identical: the never-regress gate returns early
     # on a page with no caption<->anchor overlap, so the caption keeps its exact scaled position.
-    res = migrate_twb_to_pbir(_V2_CLEAR_CAPTION_TWB)
+    # Pinned to the legacy engine: the de-overlap gate is a legacy repair pass. Under the solver the
+    # caption is placed by the solve, so there is no "scaled position" to preserve.
+    res = migrate_twb_to_pbir(_V2_CLEAR_CAPTION_TWB, layout="legacy")
     vis = [json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")]
     cap = next(v for v in vis if v["visual"]["visualType"] == "textbox")
     chart = next(v for v in vis if v["visual"]["visualType"] == "lineChart")

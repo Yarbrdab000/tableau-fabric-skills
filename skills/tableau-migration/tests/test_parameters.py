@@ -528,6 +528,52 @@ def test_emit_value_parameter_date_whatif():
     assert res["param_resolver"]("Parameter 5") == ("[Start Date Value]", "date")
 
 
+def test_date_param_picker_spans_the_wired_date_columns_not_every_date_in_the_model():
+    # CALENDARAUTO() scans EVERY date column, so one unrelated column (a contact birthdate) drags a
+    # date parameter's picker back to 1941 and buries the business range under ~30,000 rows. Measured
+    # on a real migration -- where the birthdate was legitimately wired to the Date dimension too, so
+    # only "what is this parameter compared against" narrows it correctly.
+    calc = {"name": "In Range", "role": "dimension",
+            "formula": "[Created Date] >= [Parameters].[Start Date]"}
+    res = P.emit_value_parameters([_date_param()], calcs=[calc], reserved_names=set(),
+                                  date_cols={("Case", "CreatedDate"), ("Contact", "Birthdate")})
+    _fn, tmdl = res["parts"][0]
+    assert "CALENDARAUTO()" not in tmdl
+    assert "Birthdate" not in tmdl
+    assert ("CALENDAR(MIN(MIN('Case'[CreatedDate]), DATE(2020, 1, 1)), "
+            "MAX(MAX('Case'[CreatedDate]), DATE(2020, 1, 1)))") in tmdl
+    assert "sourceColumn: [Date]" in tmdl  # CALENDAR names its column "Date", same as CALENDARAUTO
+
+
+def test_date_param_picker_folds_several_wired_columns_deterministically():
+    # Tableau's "(Intake)" disambiguating qualifier still matches the model's plain column name.
+    calc = {"name": "c", "role": "measure",
+            "formula": "[CreatedDate (Intake)] >= [Parameters].[Start Date] AND "
+                       "[StartDate] <= [Parameters].[Start Date]"}
+    res = P.emit_value_parameters([_date_param()], calcs=[calc], reserved_names=set(),
+                                  date_cols={("Engagement", "StartDate"), ("Case", "CreatedDate"),
+                                             ("Contact", "Birthdate")})
+    _fn, tmdl = res["parts"][0]
+    assert "Birthdate" not in tmdl
+    # sorted, so the same model always emits the same expression
+    assert "MIN(MIN(MIN('Case'[CreatedDate]), MIN('Engagement'[StartDate])), DATE(2020, 1, 1))" in tmdl
+    assert "MAX(MAX(MAX('Case'[CreatedDate]), MAX('Engagement'[StartDate])), DATE(2020, 1, 1))" in tmdl
+
+
+def test_date_param_picker_keeps_every_candidate_when_no_compared_field_matches():
+    # Too wide is merely awkward; excluding the real dates would be WRONG -- so this fails open.
+    calc = {"name": "c", "role": "measure", "formula": "[Parameters].[Start Date]"}
+    res = P.emit_value_parameters([_date_param()], calcs=[calc], reserved_names=set(),
+                                  date_cols={("Case", "CreatedDate")})
+    assert "MIN('Case'[CreatedDate])" in res["parts"][0][1]
+
+
+def test_date_param_picker_falls_back_to_calendarauto_without_wired_columns():
+    calc = {"name": "c", "role": "measure", "formula": "[Parameters].[Start Date]"}
+    res = P.emit_value_parameters([_date_param()], calcs=[calc], reserved_names=set(), date_cols=set())
+    assert "CALENDARAUTO()" in res["parts"][0][1]
+
+
 def test_emit_value_parameter_datetime_default_carries_time():
     p = _date_param(caption="Cutoff", internal="[Parameter 9]", default="#2021-03-31 13:30:00#")
     calc = {"name": "c", "role": "measure", "formula": "[Parameters].[Cutoff]"}

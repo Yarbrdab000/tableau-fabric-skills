@@ -51,7 +51,7 @@ Every file under `skills/<name>/` is duplicated under
 it into the plugin copy before committing**, excluding caches:
 
 ```
-robocopy "skills\<name>" "plugins\tableau-fabric-skills\skills\<name>" /MIR /XD __pycache__ .pytest_cache /XF *.pyc /NFL /NDL /NJH /NJS /NP
+robocopy "skills\<name>" "plugins\tableau-fabric-skills\skills\<name>" /MIR /XD __pycache__ .pytest_cache /XF *.pyc *.log /NFL /NDL /NJH /NJS /NP
 ```
 
 (robocopy exit codes 0–7 are success; 8 or higher is an error.) Root files such as this one are

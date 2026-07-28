@@ -15,9 +15,11 @@ Scope of each invariant (deliberate, and documented so the contract is honest):
   Frames are covered by their own small test set (overlap is representable; a within-bounds child is
   contained; a degenerate frame source makes a child fill the frame).
 * The opt-in real-workbook golden asserts the slice gate -- the solver never raises on a real tree
-  and produces **zero flow overlaps** -- not containment, because a real frame nesting a flow subtree
-  can squash it below its min (an out-of-bounds concern owned by the later quality track, never an
-  overlap).
+  and produces **zero flow overlaps**. Containment is NOT asserted here, but it is no longer a
+  conceded gap: slice 4c made a frame's min account for its children's source fractions and gave
+  every flow container a last-resort down-scale, so on-page containment is now unconditional. That
+  invariant is owned by ``test_layout_containment.py``; a frame squashing a child BELOW ITS MIN is
+  still permitted (the author pinned that geometry) and surfaces as a legible "too small" signal.
 
 Fixed-size (``is-fixed``) leaves are pinned to ``fixed_px`` on the container main axis regardless of
 their min, so they are exempt from main-axis min-respect (their author pinned them); they still must
@@ -151,15 +153,34 @@ def test_children_contained_in_parent(seed):
 
 @pytest.mark.parametrize("seed", _SEEDS)
 def test_nonfixed_leaves_respect_min(seed):
+    """Min-respect is unconditional on HEIGHT, and conditional on width.
+
+    Since growth is height-only (a taller page rescales under FitToPage; a wider one just shrinks
+    every visual on it), the solver can always make room vertically but never horizontally. A page
+    narrower than the root's own ``min_w`` therefore has no honest option left: ``allocate``'s
+    proportional squeeze takes every child below its minimum together, which renders as a legible
+    "too small" signal rather than a visual silently pushed off the page. Width min-respect is
+    asserted only when the page is actually wide enough to deliver it.
+
+    The minimum asserted is the EFFECTIVE one the solver computed, not the raw resolver value: a
+    generic floor is bounded by the size the author drew (``_clamp_to_authored``), and these
+    synthetic leaves each declare a source box of 10% of the canvas, so their floors are legitimately
+    clamped. Asserting the raw value would be asserting that the solver ignores the author.
+    """
     root = _build(seed)
     solve(root, (0, 0, 1280, 720), min_for_leaf=_min_for)
+    wide_enough = root["min_w"] <= 1280 + TOL
     for leaf in _iter_leaves(root):
         if leaf["fixed_px"] is not None:
             continue  # pinned by the author; exempt from main-axis min
-        mw, mh = leaf["_min"]
+        mw, mh = leaf["min_w"], leaf["min_h"]
+        assert (mw, mh) <= leaf["_min"], "the clamp may only ever lower a minimum"
         rw, rh = leaf["rect"][2], leaf["rect"][3]
-        assert rw >= mw - TOL and rh >= mh - TOL, (
-            "seed %d: leaf %r below min (%.1f,%.1f)" % (seed, leaf["rect"], mw, mh))
+        assert rh >= mh - TOL, (
+            "seed %d: leaf %r below min height %.1f" % (seed, leaf["rect"], mh))
+        if wide_enough:
+            assert rw >= mw - TOL, (
+                "seed %d: leaf %r below min width %.1f" % (seed, leaf["rect"], mw))
 
 
 @pytest.mark.parametrize("seed", _SEEDS)
@@ -189,11 +210,17 @@ def test_solve_is_deterministic_across_100_runs():
 # -- growth ---------------------------------------------------------------------
 @pytest.mark.parametrize("seed", [3, 5])
 def test_page_grows_to_ceil_root_min(seed):
+    """Growth is height-only and exact: width is left at the requested value.
+
+    Widening the canvas buys nothing -- FitToPage rescales the page to the viewport, so a wider
+    canvas renders every visual and every font proportionally smaller for content that needed room
+    vertically. Growing both axes inflated the user's real workbooks to 2732px-wide pages at 1.32x
+    the authored area, which is why the both-axes contract this test used to assert was wrong.
+    """
     import math
     root = _build(seed)
     res = solve(root, (0, 0, 1, 1), min_for_leaf=_min_for)          # tiny page -> must grow
-    assert res["page"] == (0.0, 0.0, float(math.ceil(root["min_w"])),
-                           float(math.ceil(root["min_h"])))
+    assert res["page"] == (0.0, 0.0, 1.0, float(math.ceil(root["min_h"])))
     # and the grown solve is still disjoint + contained
     for cont in _iter_flow(root):
         kids = cont["children"]
