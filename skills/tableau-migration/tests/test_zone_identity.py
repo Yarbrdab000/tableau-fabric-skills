@@ -123,6 +123,54 @@ def test_solved_rect_lookup_is_by_id_not_by_rect():
     assert p["zones"][0]["zone_id"] in rects      # the id disambiguates it
 
 
+# -- identity must SURVIVE to the emitter, not merely be captured ---------------
+def test_parameter_control_carries_its_zone_id_through_to_the_emitter():
+    """The capture tests above prove the id is RECORDED. This proves it still exists where the
+    layout choke point actually reads it.
+
+    ``_scale_zone`` looks a solved rect up by ``zone_id``. ``_resolve_parameter_controls`` rebuilds
+    a control into a ``position`` dict for the emitter, and that dict used to carry only geometry --
+    so every parameter-control slicer was invisible to the layout solver and silently kept its naive
+    scale-and-clamp rect while its neighbours were re-solved onto a grown page. Capture was fine;
+    the id was dropped one function later.
+    """
+    p = R._parse_dashboard(_dash(_ALL_KINDS), _WS, [])
+    db = {"name": "D", "param_controls": p["param_controls"]}
+    params = {"Parameter 1": {"caption": "Parameter 1", "datatype": "integer"}}
+    resolved = R._resolve_parameter_controls([db], params, [])
+    assert resolved, "fixture stopped producing a parameter control"
+    for pc in resolved:
+        assert "zone_id" in pc["position"], "position dict lost the zone id"
+        assert pc["position"]["zone_id"] == _EXPECTED["paramctrl"]
+
+
+def test_every_emitted_parameter_slicer_is_placed_by_the_layout_solver():
+    """No object class may silently bypass the layout engine.
+
+    The plan rect here is deliberately UNLIKE anything the naive scale-and-clamp could produce, so
+    this can only pass if the emitter actually consulted the plan. (On a simple tiled dashboard the
+    real solved rect coincides with the naive scale, which would make the assertion vacuous -- the
+    same rect-ambiguity trap ``test_solved_rect_lookup_is_by_id_not_by_rect`` guards against.)
+    """
+    p = R._parse_dashboard(_dash(_ALL_KINDS), _WS, [])
+    zid = p["param_controls"][0]["zone_id"]
+    distinctive = (11.0, 22.0, 33.0, 44.0)
+
+    resolved = R._resolve_parameter_controls(
+        [{"name": "D", "param_controls": p["param_controls"]}],
+        {"Parameter 1": {"caption": "Parameter 1", "datatype": "integer"}}, [])
+    pos = resolved[0]["position"]
+
+    prev_plan = R._LAYOUT_PLAN
+    try:
+        R._LAYOUT_PLAN = {"rects": {zid: distinctive}}
+        got = R._scale_zone(pos, 100000.0, 100000.0)
+    finally:
+        R._LAYOUT_PLAN = prev_plan
+
+    assert tuple(round(v, 3) for v in got) == distinctive
+
+
 # -- identity ------------------------------------------------------------------
 def test_captured_zone_ids_are_distinct():
     ids = [d["zone_id"] for _, d in _captured(_parsed())]

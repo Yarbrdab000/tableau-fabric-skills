@@ -3994,8 +3994,17 @@ def _resolve_parameter_controls(dashboards, params, warnings, param_binding=None
                 "caption": caption,
                 "datatype": meta.get("datatype") or None,
                 "dashboard": db.get("name"),
+                # Carry the zone's IDENTITY, not just its geometry. ``_scale_zone`` looks a solved
+                # rect up by ``zone_id``, so dropping the id here made every parameter-control
+                # slicer INVISIBLE to the layout solver: it alone kept the naive scale-and-clamp
+                # position while its neighbours were re-solved onto a grown page, which is exactly
+                # how a slicer ends up sitting on top of the table beside it. The id is already
+                # captured above; it just never reached the emitter.
+                # (``pad`` is deliberately NOT carried here: padding is applied on both engines, so
+                # adding it would change legacy output too. Tracked separately.)
                 "position": {"x": pc.get("x"), "y": pc.get("y"),
-                             "w": pc.get("w"), "h": pc.get("h")},
+                             "w": pc.get("w"), "h": pc.get("h"),
+                             "zone_id": pc.get("zone_id")},
                 "mode": pc.get("mode"),
             }
             bound = slicers.get(_norm_param_key(pid))
