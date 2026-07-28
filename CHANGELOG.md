@@ -13,6 +13,33 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.24.0` → `2.25.0`): the fidelity audit stops crying wolf — exclusive,
+  overlap-gated matching plus a real dropped-visual signal (`scripts/geometry_audit.py`,
+  `tests/test_geometry_fidelity.py`).**
+  Running the audit shipped one version earlier across the real estate produced a worst-offender list
+  that was mostly the auditor's own noise, which on an unfamiliar dashboard is worse than no audit at
+  all — it names an innocent class and hides the guilty one. Two causes, both fixed:
+  - **Nearest-centre matching invented displacements.** A full-width 1346×40 legend strip was paired
+    with a 273×245 bar chart 250px away purely because nothing closer existed, and charged a 152px
+    "displacement". Matching is now **exclusive and overlap-gated**: a pair is only allowed when the
+    emitted rect actually intersects the authored content box, cost includes the size gap (so a banner
+    is never matched to a chart), each emitted visual is consumed at most once, and assignment is
+    greedy over the globally sorted costs. An authored object with no intersecting candidate is
+    reported `matched: False` instead of being assigned the nearest stranger — which turns a
+    **genuinely dropped visual into its own signal** rather than burying it in the distance median.
+    Unmatched records rank above merely displaced ones and always count as defects, so losing a visual
+    can never improve a score.
+  - **Degeneracy was measured in the wrong space.** The sliver filter compared Tableau's 0..100000
+    source units, but one page pixel is ~73 source units on a 1366px page, so 1px-wide persistence
+    slivers sailed through and reported fabricated 200–320px displacements. It is now judged in
+    emitted page pixels — the space the displacement itself is measured in. `auditable_leaves` takes
+    optional page dimensions; the source-unit path is kept for callers without them.
+  - `displacement_summary` gains an `unmatched` count per kind and reports `None` distances rather
+    than a fake zero for a kind with nothing matched.
+  - Measured over the real estate, the three largest "defects" evaporate as the artifacts they were
+    (`bitmap` max 176 → 5, `paramctrl` max 171 → 9, four 1px `text` slivers dropped), and **9 authored
+    objects across 6 pages are newly surfaced as having no emitted counterpart at all** — the next
+    real class to attack, which the previous numbers actively concealed.
 - **tableau-migration (skill `2.23.0` → `2.24.0`): Tableau zone padding is now honored, and a shipped
   source-vs-output fidelity audit names the class if it ever regresses (`scripts/twb_to_pbir.py`,
   `scripts/geometry_audit.py`, `tests/test_zone_padding.py`, `tests/test_geometry_fidelity.py`,

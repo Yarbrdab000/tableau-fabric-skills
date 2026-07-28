@@ -160,8 +160,62 @@ def test_records_are_ranked_worst_first():
     db = _dash("<zone id='1' x='0' y='0' w='10000' h='10000' type-v2='bitmap'/>"
                "<zone id='2' x='50000' y='0' w='10000' h='10000' type-v2='bitmap'/>")
     recs = displacement_defects(authored_leaves(db),
-                                [_vis(0, 0, 100, 100), _vis(500, 200, 100, 100)], 1000, 1000)
+                                [_vis(0, 0, 100, 100), _vis(500, 60, 100, 100)], 1000, 1000)
+    assert all(r["matched"] for r in recs)
     assert recs[0]["displacement"] >= recs[1]["displacement"]
+
+
+def test_an_authored_object_with_no_intersecting_visual_is_unmatched_not_mis_measured():
+    # The dropped-visual signal. Nearest-centre matching used to hand this leaf whatever tile
+    # happened to be closest and charge it a fabricated displacement, hiding a genuinely missing
+    # visual inside the distance median.
+    db = _dash("<zone id='1' x='0' y='0' w='10000' h='10000' type-v2='worksheet'/>")
+    rec, = displacement_defects(authored_leaves(db), [_vis(600, 600, 100, 100)], 1000, 1000)
+    assert rec["matched"] is False
+    assert rec["emitted"] is None and rec["displacement"] is None
+    assert rec["defect"] is True
+
+
+def test_unmatched_leaves_rank_above_displacement_and_never_improve_the_summary():
+    db = _dash("<zone id='1' x='0' y='0' w='10000' h='10000' type-v2='worksheet'/>"
+               "<zone id='2' x='50000' y='0' w='10000' h='10000' type-v2='worksheet'/>")
+    recs = displacement_defects(authored_leaves(db), [_vis(0, 30, 100, 100)], 1000, 1000)
+    # An object nothing was emitted for outranks a merely displaced one.
+    assert [r["matched"] for r in recs] == [False, True]
+    s = displacement_summary(recs)["worksheet"]
+    assert s["n"] == 2 and s["unmatched"] == 1 and s["defects"] == 2
+    assert s["median"] == 30.0  # the unmatched leaf contributes no fake distance
+
+
+def test_two_authored_objects_cannot_both_claim_the_same_emitted_visual():
+    db = _dash("<zone id='1' x='0' y='0' w='10000' h='10000' type-v2='worksheet'/>"
+               "<zone id='2' x='5000' y='0' w='10000' h='10000' type-v2='worksheet'/>")
+    recs = displacement_defects(authored_leaves(db), [_vis(0, 0, 100, 100)], 1000, 1000)
+    assert sum(1 for r in recs if r["matched"]) == 1
+    assert sum(1 for r in recs if not r["matched"]) == 1
+
+
+def test_matching_is_size_aware_so_a_banner_is_not_matched_to_a_chart():
+    # A full-width 1000x40 banner and a 200x200 chart can have near-identical centres; centre
+    # distance alone would pair them. Size is part of the cost, so each takes its own shape.
+    db = _dash("<zone id='1' x='0' y='0' w='100000' h='4000' type-v2='text'/>"
+               "<zone id='2' x='40000' y='0' w='20000' h='20000' type-v2='worksheet'/>")
+    recs = displacement_defects(authored_leaves(db),
+                                [_vis(400, 0, 200, 200), _vis(0, 0, 1000, 40)], 1000, 1000)
+    by_kind = {r["kind"]: r for r in recs}
+    assert by_kind["text"]["emitted"] == (0.0, 0.0, 1000.0, 40.0)
+    assert by_kind["worksheet"]["emitted"] == (400.0, 0.0, 200.0, 200.0)
+
+
+def test_a_sliver_thinner_than_a_pixel_is_excluded_even_though_it_is_wide_in_source_units():
+    # One page pixel is ~73 source units on a 1000px page, so a source-unit degeneracy test lets a
+    # 1px sliver through; it then matches a neighbour and reports a huge fake displacement.
+    db = _dash("<zone id='1' x='0' y='0' w='73' h='40000' type-v2='text'/>"
+               "<zone id='2' x='0' y='0' w='20000' h='20000' type-v2='worksheet'/>")
+    leaves = authored_leaves(db)
+    assert len(leaves) == 2
+    assert [z["id"] for z in auditable_leaves(leaves, 1000.0, 1000.0)] == ["2"]
+    assert len(auditable_leaves(leaves)) == 2  # source-unit fallback keeps the old behaviour
 
 
 def test_a_page_with_no_visuals_or_no_size_degrades_to_empty_rather_than_raising():
@@ -177,7 +231,7 @@ def test_summary_rolls_up_per_kind_so_a_regression_names_its_class():
                "<zone id='3' x='0' y='50000' w='10000' h='10000' type-v2='worksheet'/>")
     recs = displacement_defects(
         authored_leaves(db),
-        [_vis(0, 200, 100, 100), _vis(500, 400, 100, 100), _vis(0, 500, 100, 100)], 1000, 1000)
+        [_vis(0, 60, 100, 100), _vis(500, 40, 100, 100), _vis(0, 500, 100, 100)], 1000, 1000)
     summary = displacement_summary(recs)
     assert summary["worksheet"]["n"] == 1 and summary["worksheet"]["median"] == 0.0
     assert summary["bitmap"]["n"] == 2 and summary["bitmap"]["defects"] == 2

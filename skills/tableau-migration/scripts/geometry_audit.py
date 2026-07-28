@@ -305,6 +305,11 @@ def parts_from_dir(report_dir):
 CONTAINER_ZONE_KINDS = frozenset({"empty", "layout-flow", "layout-basic", "layout-flow-v2"})
 
 #: An authored zone thinner than this (in 0..100000 source units) is a persistence sliver.
+#: A zone smaller than this in either dimension has no meaningful centre to compare. Judged in
+#: EMITTED PAGE PIXELS (the space displacement is measured in), not Tableau source units.
+DEGENERATE_ZONE_PX = 2.0
+
+#: Source-unit fallback for callers with no page dimensions (0..100000 space).
 DEGENERATE_ZONE_UNITS = 2.0
 
 _ZONE_SIDES = ("top", "right", "bottom", "left")
@@ -416,73 +421,142 @@ def content_box(leaf, page_w, page_h):
     return x + left, y + top, nw, nh
 
 
-def auditable_leaves(leaves):
-    """Drop the leaves whose displacement is meaningless (containers + degenerate slivers)."""
+def auditable_leaves(leaves, page_w=None, page_h=None):
+    """Drop the leaves whose displacement is meaningless (containers + degenerate slivers).
+
+    Degeneracy is judged in EMITTED PAGE PIXELS when ``page_w``/``page_h`` are supplied, because
+    that is the space the displacement is measured in: a zone one pixel wide has no meaningful
+    centre to compare, however many source units that is. Judging it in Tableau's 0..100000 source
+    space instead lets a 1px sliver through (one page pixel is ~73 source units on a 1366px page),
+    and such a sliver then matches an arbitrary neighbour and reports a huge fake displacement.
+    The source-unit fallback is kept for callers that have no page dimensions to hand.
+    """
     out = []
     for z in leaves:
         if z.get("kind") in CONTAINER_ZONE_KINDS:
             continue
-        uw, uh = z.get("_units") or (z["fw"] * 100000.0, z["fh"] * 100000.0)
-        if uw < DEGENERATE_ZONE_UNITS or uh < DEGENERATE_ZONE_UNITS:
-            continue
+        if page_w and page_h:
+            if z["fw"] * page_w < DEGENERATE_ZONE_PX or z["fh"] * page_h < DEGENERATE_ZONE_PX:
+                continue
+        else:
+            uw, uh = z.get("_units") or (z["fw"] * 100000.0, z["fh"] * 100000.0)
+            if uw < DEGENERATE_ZONE_UNITS or uh < DEGENERATE_ZONE_UNITS:
+                continue
         out.append(z)
     return out
+
+
+def _pair_cost(a, b):
+    """Match cost between an authored content box and an emitted rect: centre distance + size gap.
+
+    Size is part of the cost, not just position: a full-width 1346x40 banner and a 273x245 chart are
+    not the same object even if their centres happen to sit close together.
+    """
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return (abs(bx + bw / 2.0 - (ax + aw / 2.0)) + abs(by + bh / 2.0 - (ay + ah / 2.0))
+            + abs(bw - aw) + abs(bh - ah))
 
 
 def displacement_defects(leaves, visuals, page_w, page_h, tolerance=24.0):
     """How far each authored object moved between Tableau and the emitted page.
 
     ``leaves`` come from :func:`authored_leaves` (page fractions), ``visuals`` are emitted visual
-    JSON dicts. Each auditable leaf is matched to the emitted visual whose centre is nearest, and the
-    Manhattan distance between the two centres is its displacement -- measured against the leaf's
-    CONTENT BOX (:func:`content_box`), which is where Tableau actually draws, not the raw zone rect.
-    Returns a list of records sorted worst-first; any record with ``displacement > tolerance`` is
-    also flagged ``defect: True``.
+    JSON dicts. Each auditable leaf is matched to one emitted visual and the Manhattan distance
+    between the two centres is its displacement -- measured against the leaf's CONTENT BOX
+    (:func:`content_box`), which is where Tableau actually draws, not the raw zone rect. Returns a
+    list of records ranked worst-first, unmatched leaves ahead of merely displaced ones (an object
+    nothing was emitted for is the worse defect); ``displacement > tolerance`` and every unmatched
+    leaf are flagged ``defect: True``.
 
-    Nearest-centre matching is a heuristic -- it is unambiguous when the page is roughly faithful and
-    degrades gracefully when it is not, which is exactly the regime this check is for. It is a
-    RANKING tool: a rising median for one kind of zone names the class that regressed.
+    Matching is EXCLUSIVE and OVERLAP-GATED, which is what makes the numbers trustworthy on a
+    dashboard nobody has looked at:
+
+    * A pair is only allowed when the emitted rect actually INTERSECTS the authored content box. An
+      emitted visual that does not touch the footprint it was authored in is not that object, so a
+      leaf with no intersecting candidate is reported ``matched: False`` rather than being assigned
+      the nearest stranger and charged a fabricated displacement. That also turns a genuinely
+      DROPPED visual -- an authored object nothing was emitted for -- into its own honest signal
+      instead of hiding it inside the displacement median.
+    * Every emitted visual is consumed at most once, assigned greedily over the globally sorted
+      pair costs, so two authored objects can no longer both claim the same tile.
+
+    It remains a RANKING tool: a rising median for one kind of zone names the class that regressed.
     """
     if page_w <= 0 or page_h <= 0:
         return []
-    boxes = [(rect(v), v) for v in visuals]
-    if not boxes:
+    boxes = [rect(v) for v in visuals]
+    audit = auditable_leaves(leaves, page_w, page_h)
+    if not boxes or not audit:
         return []
+    authored = [content_box(z, page_w, page_h) for z in audit]
+
+    pairs = []
+    for li, a in enumerate(authored):
+        for vi, b in enumerate(boxes):
+            if intersection_area(a, b) <= 0:
+                continue
+            pairs.append((_pair_cost(a, b), li, vi))
+    pairs.sort()
+    leaf_of, used = {}, set()
+    for _, li, vi in pairs:
+        if li in leaf_of or vi in used:
+            continue
+        leaf_of[li] = vi
+        used.add(vi)
+
     out = []
-    for z in auditable_leaves(leaves):
-        ax, ay, aw, ah = content_box(z, page_w, page_h)
+    for li, z in enumerate(audit):
+        ax, ay, aw, ah = authored[li]
         acx, acy = ax + aw / 2.0, ay + ah / 2.0
-        best, best_d = None, None
-        for (bx, by, bw, bh), vj in boxes:
-            d = abs(bx + bw / 2.0 - acx) + abs(by + bh / 2.0 - acy)
-            if best_d is None or d < best_d:
-                best, best_d = (bx, by, bw, bh), d
-        dx = (best[0] + best[2] / 2.0) - acx
-        dy = (best[1] + best[3] / 2.0) - acy
+        vi = leaf_of.get(li)
+        if vi is None:
+            out.append({
+                "id": z["id"], "kind": z["kind"], "name": z["name"],
+                "authored": (ax, ay, aw, ah), "emitted": None, "matched": False,
+                "dx": None, "dy": None, "displacement": None, "defect": True,
+            })
+            continue
+        bx, by, bw, bh = boxes[vi]
+        dx = (bx + bw / 2.0) - acx
+        dy = (by + bh / 2.0) - acy
         out.append({
             "id": z["id"], "kind": z["kind"], "name": z["name"],
-            "authored": (ax, ay, aw, ah), "emitted": best,
+            "authored": (ax, ay, aw, ah), "emitted": (bx, by, bw, bh), "matched": True,
             "dx": dx, "dy": dy, "displacement": abs(dx) + abs(dy),
             "defect": (abs(dx) + abs(dy)) > tolerance,
         })
-    out.sort(key=lambda r: -r["displacement"])
+    out.sort(key=lambda r: (r["matched"], -(r["displacement"] or 0.0)))
     return out
 
 
 def displacement_summary(records):
-    """Per-zone-kind ``{n, median, p90, max, defects}`` roll-up of :func:`displacement_defects`."""
+    """Per-zone-kind ``{n, median, p90, max, defects, unmatched}`` roll-up.
+
+    ``unmatched`` counts authored objects with no intersecting emitted visual. They are excluded
+    from the distance statistics -- there is no honest distance to report for an object that was
+    never emitted -- but they still count as defects, so a dropped visual can never improve a score.
+    """
     by_kind = collections.defaultdict(list)
+    unmatched = collections.Counter()
+    kinds = []
     for r in records:
-        by_kind[r["kind"]].append(r["displacement"])
+        if r["kind"] not in by_kind and r["kind"] not in kinds:
+            kinds.append(r["kind"])
+        if r.get("matched", True):
+            by_kind[r["kind"]].append(r["displacement"])
+        else:
+            unmatched[r["kind"]] += 1
     summary = {}
-    for kind, ds in by_kind.items():
-        s = sorted(ds)
+    for kind in kinds:
+        s = sorted(by_kind.get(kind) or [])
         summary[kind] = {
-            "n": len(s),
-            "median": s[len(s) // 2],
-            "p90": s[min(int(len(s) * 0.9), len(s) - 1)],
-            "max": s[-1],
+            "n": len(s) + unmatched[kind],
+            "median": s[len(s) // 2] if s else None,
+            "p90": s[min(int(len(s) * 0.9), len(s) - 1)] if s else None,
+            "max": s[-1] if s else None,
             "defects": sum(1 for r in records if r["kind"] == kind and r["defect"]),
+            "unmatched": unmatched[kind],
         }
     return summary
 
