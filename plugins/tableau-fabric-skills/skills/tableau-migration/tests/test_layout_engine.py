@@ -236,6 +236,31 @@ def test_dash_page_dims_is_the_single_definition_of_the_canvas():
         float(auto[0]), float(auto[1]))
 
 
+def test_dash_page_dims_is_always_whole_pixels():
+    # A Power BI page is measured in integral pixels. An automatic dashboard that solved to a
+    # fractional canvas emitted it verbatim ("height": 830.06) and the Desktop layout parser rejected
+    # the ENTIRE report -- "Input string '830.06' is not a valid integer" -- which also blocks render
+    # verification. Rounded UP (never down, so the page can never end up shorter than the content
+    # placed on it) at the single definition of the canvas.
+    assert _dash_page_dims({"w": 1400.4, "h": 830.06, "min_w": None, "min_h": None}) == (1401.0, 831.0)
+    w, h = _dash_page_dims({"w": None, "h": None, "min_w": 1000.0, "min_h": 620.4})
+    assert w == int(w) and h == int(h), f"fractional automatic canvas {(w, h)}"
+
+
+def test_every_emitted_page_dimension_is_a_whole_pixel():
+    # The regression net for the WHOLE class: authored <size>, the adopted solver page, and caption
+    # band-insertion growth are three independent producers of the emitted canvas, and any one of them
+    # leaking a fraction breaks the report. Assert the emitted artifact, not just the helper.
+    for engine in ("legacy", "solver"):
+        parts = migrate_twb_to_pbir(_two_sheet_workbook(), layout=engine)["parts"]
+        pages = [json.loads(v) for k, v in parts.items() if k.endswith("/page.json")]
+        assert pages
+        for page in pages:
+            for key in ("width", "height"):
+                val = page[key]
+                assert val == int(val), f"{engine}: fractional page {key}={val!r}"
+
+
 def test_solver_page_matches_dash_page_dims_when_nothing_grows():
     ir = parse_twb(_two_sheet_workbook(), layout="solver")
     db = ir["dashboards"][0]

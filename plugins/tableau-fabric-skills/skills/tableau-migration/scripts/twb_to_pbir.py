@@ -33,6 +33,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -207,6 +208,19 @@ SLICER_ROW_GUTTER = 8.0
 SLICER_FONT_PT = 9.0
 
 
+def _whole_px(v):
+    """Round a canvas dimension UP to a whole pixel.
+
+    A Power BI page is measured in integral pixels: a fractional page height emitted verbatim
+    ("height": 830.06) makes the Desktop layout parser reject the ENTIRE report -- "Input string
+    '830.06' is not a valid integer" -- which also blocks render verification. Every producer of the
+    emitted page (authored <size>, the solver plan, and caption band-insertion growth) runs through
+    here. Rounds UP, never down, so a page can never end up fractionally SHORTER than the content
+    that was placed on it.
+    """
+    return float(math.ceil(float(v)))
+
+
 def _page_w():
     """Active page width: the per-dashboard real <size> width override, else the default."""
     return _PAGE_W_OVERRIDE or PAGE_WIDTH
@@ -226,8 +240,8 @@ def _dash_page_dims(size):
     against a different page silently invalidates every rect it produces.
     """
     auto_w, auto_h = _automatic_canvas_dims(size.get("min_w"), size.get("min_h"))
-    return (float(size.get("w") or auto_w or DASH_DEFAULT_W),
-            float(size.get("h") or auto_h or DASH_DEFAULT_H))
+    return (_whole_px(size.get("w") or auto_w or DASH_DEFAULT_W),
+            _whole_px(size.get("h") or auto_h or DASH_DEFAULT_H))
 
 
 def _automatic_canvas_dims(min_w, min_h):
@@ -1024,6 +1038,16 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
                                      _mb_base.get("caption"), worksheet)
         if mb is not None:
             m_entity, m_measure = mb
+            # Did the model translate THIS PILL'S OWN table calc, or only the base field under it?
+            # The lookup tries the pill instance token FIRST, then falls back to the bare calc id /
+            # caption -- so re-running it with the instance token ALONE answers the question exactly.
+            # A view-only quick table calc (running total, moving average, ...) is deliberately NOT
+            # given a model measure: the model supplies only its base, and the transform is rebuilt in
+            # the report layer as a Visual Calculation. Conflating the two made every such calc vanish
+            # on the model-fact rebind pass (see ``_apply_visual_calcs``).
+            rebound_to_instance = (
+                field_id is not None
+                and _lookup_measure_binding(measure_binding, field_id, None, None, None) is not None)
             return {
                 "caption": _mb_base.get("caption") or m_measure,
                 "field_id": base_id, "instance": field_id,
@@ -1034,6 +1058,7 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
                 "binding": "measure", "kind": "value",
                 "geo_area": None, "formula": _mb_base.get("formula"),
                 "measure_rebound": True,
+                "rebound_to_instance": rebound_to_instance,
             }
 
     # Implicit row count (object-id COUNT(*) / legacy [Number of Records]) -> a COUNTROWS measure.
@@ -5759,7 +5784,16 @@ def _apply_visual_calcs(ws, state, vc_index, model_table, field_map, warnings):
     # measure instead of the percent-difference Tableau colours by. It yields ONLY when the colour pill
     # IS the base (no separate label/text value): then the rebound measure may already embody the
     # transform, so re-applying the quick calc would double it -- defer to the model-measure fill.
-    if base_field.get("measure_rebound"):
+    #
+    # ``measure_rebound`` alone does NOT mean the model owns the transform, and treating it that way
+    # silently deleted EVERY view-only quick table calc from the shipped report: the estate runs the viz
+    # stage twice (once bare to build the model, once rebound to it) and only the second pass ships, so a
+    # calc emitted in pass 1 vanished in pass 2. ``rebound_to_instance`` is the exact discriminator --
+    # true only when the model translated THIS PILL'S OWN table-calc instance into a measure (transform
+    # embodied -> yielding is right), false when it merely translated the base field the calc runs over
+    # (the running total exists nowhere but here). Absent -> treated as instance-bound, so a field dict
+    # that predates the flag keeps the old, never-double-transform behaviour.
+    if base_field.get("measure_rebound") and base_field.get("rebound_to_instance", True):
         _color_is_base = base_field is ws["encodings"].get("color")
         if role == "value" or _color_is_base:
             return None, None
@@ -7928,9 +7962,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         # (usually LARGER than the min), so we keep its authored ASPECT but scale it UP to cover the
         # 1280x720 screen frame (_automatic_canvas_dims) rather than squashing it into the near-square
         # 1000x800 default. Final fallback (no usable <size> at all): Tableau's own 1000x800 default.
-        _auto_w, _auto_h = _automatic_canvas_dims(db["size"].get("min_w"), db["size"].get("min_h"))
-        _PAGE_W_OVERRIDE = db["size"]["w"] or _auto_w or DASH_DEFAULT_W
-        _PAGE_H_OVERRIDE = db["size"]["h"] or _auto_h or DASH_DEFAULT_H
+        _PAGE_W_OVERRIDE, _PAGE_H_OVERRIDE = _dash_page_dims(db["size"])
         _authored_px_w, _authored_px_h = _PAGE_W_OVERRIDE, _PAGE_H_OVERRIDE
         # Solver engine: activate this dashboard's plan and ADOPT the page it resolved. Growth is not
         # cosmetic -- the solver enlarges the page (bounded by MAX_GROWTH) precisely so the content
@@ -7940,7 +7972,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         # FitToPage, so adopting it costs render scale, never content.
         _LAYOUT_PLAN = db.get("layout_plan")
         if _LAYOUT_PLAN:
-            _PAGE_W_OVERRIDE, _PAGE_H_OVERRIDE = _LAYOUT_PLAN["page"]
+            _PAGE_W_OVERRIDE = _whole_px(_LAYOUT_PLAN["page"][0])
+            _PAGE_H_OVERRIDE = _whole_px(_LAYOUT_PLAN["page"][1])
         # Zone padding is authored in real pixels against the AUTHORED canvas, so it scales by the
         # authored->emitted page ratio (not by the 0..100000 zone scale). Identity in the normal
         # case where the emitted page is the authored size.
@@ -8191,7 +8224,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         # every anchor is final. The page is FitToPage, so a taller canvas just rescales to the viewport.
         _grown_h = _deoverlap_captions(visuals, _page_w(), _page_h())
         if _grown_h and _grown_h > _page_h():
-            _PAGE_H_OVERRIDE = _grown_h
+            _PAGE_H_OVERRIDE = _whole_px(_grown_h)
         _emit_page(parts, page_name, db["name"] or page_name, visuals)
         page_order.append(page_name)
 

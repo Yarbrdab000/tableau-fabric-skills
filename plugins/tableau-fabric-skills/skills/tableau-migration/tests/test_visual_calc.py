@@ -924,6 +924,40 @@ def test_apply_visual_calcs_chart_yields_to_model_measure_path():
     assert len(state["Y"]["projections"]) == 1
 
 
+def test_apply_visual_calcs_chart_survives_a_rebind_to_the_BASE_measure():
+    # The defect that deleted EVERY view-only quick table calc from every shipped report. The estate
+    # runs the viz stage twice -- once bare to build the model, once rebound to it -- and only the
+    # SECOND pass ships. ``measure_rebound`` was read as "the model owns the transform", so a running
+    # total emitted in pass 1 silently vanished in pass 2 and the chart shipped as a raw series.
+    # A view-only quick calc never gets a model measure of its own (the model supplies only the base
+    # it runs over), so a base-bound rebind must NOT make it yield.
+    base = _chart_base_field()
+    base["measure_rebound"] = True
+    base["rebound_to_instance"] = False            # the model bound the BASE, not this pill's calc
+    ws = {"name": "Line", "visual_type": "line", "rows": [], "cols": [base],
+          "encodings": {"color": None, "label": None, "text": None}}
+    state = {"Category": {"projections": [{"nativeQueryRef": "Month"}]},
+             "Y": {"projections": [_chart_base_proj()]}}
+    _vo, fact = _apply_visual_calcs(
+        ws, state, {"Line": [_usage(worksheet="Line", calc_type="CumTotal")]}, None, None, [])
+    assert fact and fact["status"] == "emitted" and fact["family"] == "RUNNING_TOTAL"
+    assert len(state["Y"]["projections"]) == 2      # base (hidden) + the Visual Calculation
+    assert "RUNNINGSUM" in state["Y"]["projections"][-1]["field"][
+        "NativeVisualCalculation"]["Expression"]
+
+
+def test_apply_visual_calcs_matrix_survives_a_rebind_to_the_BASE_measure():
+    base = _base_measure_field()
+    base["measure_rebound"] = True
+    base["rebound_to_instance"] = False
+    ws = {"name": "WS", "encodings": {"color": None, "label": base, "text": None}}
+    state, _ = _matrix_state()
+    _vo, fact = _apply_visual_calcs(
+        ws, state, {"WS": [_usage(calc_type="CumTotal", level_break=None)]}, None, None, [])
+    assert fact and fact["status"] == "emitted"
+    assert len(state["Values"]["projections"]) == 2
+
+
 # -- 12. the shared addressing decomposition + the AGG_DERIVATIONS guard -------
 def test_resolve_addressing_truth_table():
     seg, reg = _pill("Segment"), _pill("Region")

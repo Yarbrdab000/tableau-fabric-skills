@@ -6746,6 +6746,29 @@ def test_measure_binding_non_bindable_status_still_defers():
         assert "quick table calc" in fact["reason"]
 
 
+def test_measure_binding_records_whether_it_bound_the_pill_calc_or_only_its_base():
+    # The discriminator that keeps a view-only quick table calc alive through the model-fact rebind.
+    # Binding by the pill INSTANCE token means the model translated this pill's own table calc (the
+    # transform is embodied in the measure); binding by the bare calc id means it translated only the
+    # BASE the calc runs over. Consumers must be able to tell the two apart -- reading a bare
+    # ``measure_rebound`` as "the model owns the transform" silently deleted every running total /
+    # moving average / percent-of-total from every shipped report.
+    def _color_field(mb):
+        res = migrate_twb_to_pbir(_pcdf_heat_workbook(), measure_binding=mb)
+        ws = next(w for w in res["ir"]["worksheets"] if w["name"] == "Heat")
+        return ws["encodings"]["color"]
+
+    by_instance = _color_field({"pcdf:Calculation_1:qk": {
+        "entity": "_Measures", "measure": "Percent Difference", "status": "translated"}})
+    assert by_instance["measure_rebound"] is True
+    assert by_instance["rebound_to_instance"] is True
+
+    by_base = _color_field({"Calculation_1": {
+        "entity": "_Measures", "measure": "Percent Difference", "status": "translated"}})
+    assert by_base["measure_rebound"] is True
+    assert by_base["rebound_to_instance"] is False
+
+
 def test_measure_binding_default_none_is_byte_unchanged():
     # Additivity: omitting the binding == passing None == passing an empty map -> the prior deferred
     # output, byte-for-byte.
