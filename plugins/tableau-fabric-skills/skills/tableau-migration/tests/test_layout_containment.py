@@ -27,6 +27,7 @@ import pytest
 from layout_solve import (
     GAP,
     MAX_GROWTH,
+    MIN_ABSOLUTE,
     MIN_WORKSHEET,
     TOL,
     compute_mins,
@@ -135,10 +136,24 @@ def test_growth_never_exceeds_the_ceiling_on_either_axis():
 
 
 def test_the_page_still_grows_when_growth_is_modest():
+    """Growth is real, but its cause is now the GAPS -- not a floor the author contradicted.
+
+    A leaf minimum can no longer exceed the size its author drew (``_clamp_to_authored``), so a
+    frame never demands a bigger canvas just to lift one object to a generic floor: doubling a page
+    so a 100px chart reaches a 160px "chart floor" buys nothing, because FitToPage then renders the
+    doubled page at half scale and the chart still occupies 100px of screen.
+
+    What DOES legitimately grow a page is the solver's own 8px inter-sibling gap, which Tableau's
+    absolute layout does not budget for. Five worksheets tiling a 500px canvas need 4 gaps the
+    author never left room for, so the page grows by exactly 32px -- an explainable, bounded amount.
+    """
+    stack = "".join("<zone id='w%d' name='WsA' x='0' y='%d' w='100000' h='20000'/>"
+                    % (i, i * 20000) for i in range(5))
     xml = ("<zone id='f' type-v2='layout-basic' x='0' y='0' w='100000' h='100000'>"
-           "<zone id='a' name='WsA' x='0' y='50000' w='100000' h='50000'/></zone>")
-    res = solve(parse_zone_tree(_dash(xml)), (0.0, 0.0, 1000.0, 200.0))
-    assert res["page"][3] == pytest.approx(2.0 * MIN_WORKSHEET[1], abs=1.0)
+           "<zone id='v' type-v2='layout-flow' param='vert' x='0' y='0' w='100000' h='100000'>"
+           + stack + "</zone></zone>")
+    res = solve(parse_zone_tree(_dash(xml)), (0.0, 0.0, 1000.0, 500.0))
+    assert res["page"][3] == pytest.approx(500.0 + 4 * GAP, abs=1.0)
 
 
 # -- (3) unconditional flow containment -----------------------------------------
@@ -221,3 +236,77 @@ def test_solve_still_fails_closed_and_never_raises():
     # a non-positive page is only fatal when growth cannot rescue it
     assert solve({"root": {"kind": "leaf"}}, (0.0, 0.0, 0.0, 0.0), grow=False) is None
     assert solve(parse_zone_tree(_dash(_REGRESSION)), "nope") is None
+
+
+# -- the authored size is the ceiling on every generic minimum -------------------
+def test_a_generic_floor_never_exceeds_the_size_the_author_drew():
+    """A caption strip the author drew 45px tall is 45px, not the 160px generic chart floor.
+
+    This is the rule that stopped the canvas inflating. The floors in ``_LEAF_MIN`` classify by KIND
+    ("a worksheet is a chart, and a chart under 160px is not a chart"), but an author who draws a
+    worksheet 4.5% of the page tall has classified it more accurately than the kind ever could.
+    """
+    xml = ("<zone id='f' type-v2='layout-basic' x='0' y='0' w='100000' h='100000'>"
+           "<zone id='strip' name='WsA' x='0' y='0' w='100000' h='4500'/>"
+           "<zone id='chart' name='WsB' x='0' y='10000' w='100000' h='50000'/></zone>")
+    tree = parse_zone_tree(_dash(xml))
+    solve(tree, (0.0, 0.0, 1000.0, 1000.0))
+    by_id = {}
+    for leaf in _leaves(tree["root"]):
+        by_id[leaf["zone_id"]] = leaf
+    assert by_id["strip"]["min_h"] == pytest.approx(45.0, abs=1.0)
+    # the roomy sibling is untouched: 500px authored is well above the 160px floor
+    assert by_id["chart"]["min_h"] == pytest.approx(MIN_WORKSHEET[1], abs=1.0)
+
+
+def test_one_small_caption_cannot_inflate_the_whole_canvas():
+    """The shipped defect, as a property: a 21px text line demanded a 1506px canvas.
+
+    A frame hands each child ``child_src / frame_src`` of its own box, so an unclamped 32px text
+    minimum inside a zone occupying 2.1% of the page inverts to a demand for 32 / 0.021 = 1506px --
+    on a 1000x1000 dashboard whose every object already fits. Eleven pixels of caption cost five
+    hundred pixels of page, and every object on it then rendered 50% taller.
+    """
+    xml = ("<zone id='f' type-v2='layout-basic' x='0' y='0' w='100000' h='100000'>"
+           "<zone id='cap' type-v2='text' x='0' y='0' w='100000' h='2125'/>"
+           "<zone id='body' name='WsA' x='0' y='5000' w='100000' h='90000'/></zone>")
+    res = solve(parse_zone_tree(_dash(xml)), (0.0, 0.0, 1000.0, 1000.0))
+    assert res["page"][3] == pytest.approx(1000.0, abs=1.0)
+
+
+def test_the_clamp_never_collapses_an_object_to_nothing():
+    """A sliver zone is bounded by MIN_ABSOLUTE, not by its own vanishing authored size."""
+    xml = ("<zone id='f' type-v2='layout-basic' x='0' y='0' w='100000' h='100000'>"
+           "<zone id='sliver' name='WsA' x='0' y='0' w='100000' h='100'/></zone>")
+    tree = parse_zone_tree(_dash(xml))
+    solve(tree, (0.0, 0.0, 1000.0, 1000.0))
+    assert _leaves(tree["root"])[0]["min_h"] == pytest.approx(MIN_ABSOLUTE, abs=0.01)
+
+
+def test_a_blank_spacer_stays_collapsible_under_the_clamp():
+    """MIN_BLANK is an explicit zero and must survive the clamp -- a spacer that cannot collapse
+    is not a spacer."""
+    node = {"kind": K_LEAF, "leaf_kind": "blank", "children": [],
+            "src": {"x": 0.0, "y": 0.0, "w": 50000.0, "h": 50000.0}}
+    compute_mins(node, default_min_for_leaf, None, (0.01, 0.01))
+    assert (node["min_w"], node["min_h"]) == (0.0, 0.0)
+
+
+def test_a_pin_is_a_request_and_never_raises_a_containers_minimum():
+    """A vstack's minimum is the sum of its children's MINS, never of their pins.
+
+    Counting pins as minimums is what made a real dashboard's table bands -- pinned at 350px each
+    inside a zone the author drew 725px tall -- demand a 1506px canvas.
+    """
+    xml = ("<zone id='v' type-v2='layout-flow' param='vert' x='0' y='0' w='100000' h='100000'>"
+           "<zone id='a' name='WsA' is-fixed='true' fixed-size='900' x='0' y='0' w='100000' h='50000'/>"
+           "<zone id='b' name='WsB' x='0' y='50000' w='100000' h='50000'/></zone>")
+    tree = parse_zone_tree(_dash(xml))
+    root = tree["root"]
+    res = solve(tree, (0.0, 0.0, 1000.0, 1000.0))
+    kids = root["children"]
+    assert abs(root["min_h"] - (sum(c["min_h"] for c in kids) + GAP)) <= 1.0
+    assert root["min_h"] < 900.0, "the 900px pin must not become a 900px floor"
+    # and the flexible sibling still reaches its own minimum rather than being starved by the pin
+    assert kids[1]["rect"][3] >= kids[1]["min_h"] - TOL
+    assert res["page"][3] == pytest.approx(1000.0, abs=1.0)

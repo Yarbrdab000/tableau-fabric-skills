@@ -146,6 +146,47 @@ def default_pref_for_leaf(node, min_wh):
 _PREF_KEYS = ("pref_w", "pref_h")
 
 
+# -- authored size: the ceiling on every generic minimum -------------------------
+MIN_ABSOLUTE = 16.0      # below this an object cannot render at all, authored size notwithstanding
+
+
+def _authored_px(node, scale):
+    """The size the AUTHOR drew this node at, in page pixels -- ``(w, h)``, either possibly ``None``.
+
+    ``scale`` is ``(page_w / root_src_w, page_h / root_src_h)``, so a zone occupying 8.8% of the
+    dashboard's height on a 1000px page measures 88px here. ``None`` scale (root without a source
+    extent) disables the clamp entirely.
+    """
+    if not scale:
+        return None, None
+    src = node.get("src") or {}
+    w, h = src.get("w"), src.get("h")
+    return ((float(w) * scale[0]) if w else None,
+            (float(h) * scale[1]) if h else None)
+
+
+def _clamp_to_authored(m, authored_px):
+    """Bound a generic minimum by the authored size, never dropping below :data:`MIN_ABSOLUTE`.
+
+    The leaf minimums in :data:`_LEAF_MIN` are READABILITY HEURISTICS -- "a chart under 160px is
+    not a chart". The author's own layout is EVIDENCE, and where the two disagree the author wins:
+    a worksheet drawn 88px tall is a caption strip, and a 160px "chart floor" applied to it is
+    simply the wrong classification. Enforcing the floor anyway does not make that strip readable;
+    it makes the strip demand more room than its zone has, and a frame satisfies that demand by
+    scaling the ENTIRE canvas. On a real 1000x1000 dashboard a single 21px text line with a 32px
+    floor -- occupying 2.1% of the page -- demanded 32 / 0.021 = 1506px of canvas, so eleven pixels
+    of caption cost five hundred pixels of page and every object on it rendered 50% taller with the
+    whitespace to match. A heuristic that inflates the whole page to satisfy itself is worth less
+    than the author's own judgement about one object.
+
+    Returns ``m`` unchanged when there is no authored size, and preserves an explicit zero so a
+    genuinely collapsible spacer stays collapsible.
+    """
+    if authored_px is None or authored_px <= 0 or m <= 0:
+        return m
+    return min(float(m), max(float(authored_px), MIN_ABSOLUTE))
+
+
 # Tableau filter modes whose control renders as a multi-row list rather than a dropdown.
 _LIST_FILTER_MODES = {"checklist", "typeinandcheckdropdown", "radiolist", "singlevaluelist",
                       "typeinlist", "list"}
@@ -170,13 +211,21 @@ def default_min_for_leaf(node):
 
 # -- pass 1: min sizes (bottom-up) ----------------------------------------------
 def _main_min_contrib(child, vertical):
-    """A child's contribution to its flow parent's MAIN-axis min.
+    """A child's contribution to its flow parent's MAIN-axis MIN -- always its own subtree min.
 
-    A fixed-size child occupies exactly ``fixed_px`` on the main axis regardless of its subtree min,
-    so it contributes ``fixed_px``; a flexible child contributes its own main-axis min.
+    A pinned child used to contribute ``fixed_px`` here, on the reasoning that it occupies exactly
+    its pin regardless of its subtree. That conflates a REQUEST with a REQUIREMENT, and it is the
+    same confusion ``allocate``'s fixed-share rule already had to undo: a pin is what the author
+    asked for at the container's authored size, not a floor the layout must be enlarged to honour.
+    Propagating it as a minimum makes an ancestor grow to fit the pins -- measured on a real
+    dashboard whose table-band pins summed to 871px inside a zone the author drew 725px tall,
+    demanding a 1506px canvas for a 1000x1000 dashboard whose every object fits.
+
+    The pin is not discarded: it is the child's PREFERENCE (see :func:`_main_pref_contrib`), so a
+    container with room still lays its children out at exactly the pinned sizes, and only a
+    container genuinely short of room trades the pins down -- proportionally, and never below the
+    subtree min this function reports.
     """
-    if child.get("fixed_px") is not None:
-        return float(child["fixed_px"])
     return child["min_h"] if vertical else child["min_w"]
 
 
@@ -191,16 +240,21 @@ def _main_pref_contrib(child, vertical):
     return child.get("pref_h", INF) if vertical else child.get("pref_w", INF)
 
 
-def compute_mins(node, min_for_leaf, cap=None):
+def compute_mins(node, min_for_leaf, cap=None, authored=None):
     """Populate ``min_w`` / ``min_h`` on every node, bottom-up. Mutates the tree in place.
 
     ``cap`` is an optional ``(max_min_w, max_min_h)`` ceiling applied to FRAME nodes only -- see
-    :data:`MAX_GROWTH`. Flow (vstack/hstack) mins are never capped: they are exact sums of real
-    content requirements, and understating them is what lets a container overrun its own box.
+    :data:`FRAME_DEMAND_CAP`. Flow (vstack/hstack) mins are never capped: they are exact sums of
+    real content requirements, and understating them is what lets a container overrun its own box.
+
+    ``authored`` is an optional ``(page_w / root_src_w, page_h / root_src_h)`` scale; when given,
+    every LEAF minimum is bounded by the size its author drew (see :func:`_clamp_to_authored`).
     """
     if node["kind"] == K_LEAF:
         mw, mh = min_for_leaf(node)
-        node["min_w"], node["min_h"] = float(mw), float(mh)
+        aw, ah = _authored_px(node, authored)
+        node["min_w"] = _clamp_to_authored(float(mw), aw)
+        node["min_h"] = _clamp_to_authored(float(mh), ah)
         pw, ph, g = default_pref_for_leaf(node, (node["min_w"], node["min_h"]))
         # A preference below the minimum is incoherent -- the min always wins.
         node["pref_w"], node["pref_h"] = max(pw, node["min_w"]), max(ph, node["min_h"])
@@ -208,7 +262,7 @@ def compute_mins(node, min_for_leaf, cap=None):
         return
     kids = node["children"]
     for c in kids:
-        compute_mins(c, min_for_leaf, cap)
+        compute_mins(c, min_for_leaf, cap, authored)
     gaps = GAP * max(0, len(kids) - 1)
     # A container grows only if something inside it wants to. A vstack of nothing but captions and
     # slicers is itself fixed-height chrome -- this is what makes a whole header BAND stop absorbing
@@ -319,7 +373,22 @@ def allocate(node, rect):
     if fixed and flex and room > 0:
         tot_frac = sum(c.get("frac") or 0.0 for c in kids) or 1.0
         flex_share = sum(c.get("frac") or 0.0 for c in flex) / tot_frac
-        budget = room * max(0.0, 1.0 - flex_share)
+        # Two independent ceilings, and the tighter one binds.
+        #
+        # The first is the author's own split: a fixed child may not claim room the author gave to a
+        # flexible sibling (the ft4f rule -- it is what stops three filter cards from taking 561 of
+        # 587px and leaving a logo the 26px remainder).
+        #
+        # The second is min-respect, and it became load-bearing once ``_main_min_contrib`` stopped
+        # reporting pins as minimums. The container is now sized to the sum of its subtree MINS,
+        # while ``allocate`` still pays every pin in FULL -- so a pin larger than its subtree min
+        # eats into exactly the pixels a flexible sibling needs to reach its own minimum, and the
+        # final squeeze then drags every child below min together. Reserving the flexible minimums
+        # up front makes the pin yield to them instead, which is the correct precedence: a minimum
+        # is a requirement and a pin is a request.
+        budget = min(room * max(0.0, 1.0 - flex_share),
+                     room - sum(float(c[minkey]) for c in flex))
+        budget = max(0.0, budget)
         fixed_total = sum(alloc[id(c)] for c in fixed)
         if fixed_total > budget + TOL and fixed_total > 0:
             scale = budget / fixed_total
@@ -447,7 +516,14 @@ def solve(tree, page_rect, min_for_leaf=None, grow=True):
         # fraction explodes (one corpus sliver zone barely 0.8% of its frame's width would demand a
         # 164384px canvas). This is a PATHOLOGY GUARD, not a size preference -- see FRAME_DEMAND_CAP.
         cap = (pw, ph * FRAME_DEMAND_CAP) if (grow and pw > 0 and ph > 0) else None
-        compute_mins(root, resolver, cap)
+        # The authored scale maps a zone's source extent to page pixels, so a generic leaf floor can
+        # never demand more room than the author gave that object -- the single largest source of
+        # canvas inflation before this. See _clamp_to_authored.
+        rs = root.get("src") or {}
+        rsw, rsh = rs.get("w"), rs.get("h")
+        authored = ((pw / float(rsw), ph / float(rsh))
+                    if (rsw and rsh and float(rsw) > 0 and float(rsh) > 0) else None)
+        compute_mins(root, resolver, cap, authored)
 
         if grow:
             # Growth is HEIGHT-ONLY, and exact.

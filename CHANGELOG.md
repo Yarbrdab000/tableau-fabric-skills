@@ -13,6 +13,44 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 ## [Unreleased]
 
 ### Added
+- **tableau-migration (skill `2.22.0` → `2.23.0`): a caption can no longer inflate the canvas — the
+  page lands at the size the Tableau author drew (`scripts/layout_solve.py`,
+  `scripts/layout_plan.py`, `tests/test_layout_containment.py`, `tests/test_layout_solve.py`,
+  `tests/test_layout_plan.py`).**
+  Rendering the previous slice on a real customer dashboard showed the same content emitted on a
+  **1506px** page that Tableau authors at **1000×1000** — a 50% taller canvas, so under `FitToPage`
+  every visual rendered proportionally smaller and the dashboard read as a field of whitespace the
+  source does not have. Instrumenting the solver's demand chain (rather than arguing from defect
+  counts) found two compounding causes, which had to be fixed together:
+  - **Frame inversion multiplied a generic floor into a page-sized demand.** `compute_mins`' frame
+    branch computes `need = child_min / frac` so each proportional child clears its minimum. Against a
+    generic kind floor that explodes: a 21px caption occupying 2.125% of the canvas carried the 32px
+    text floor and therefore demanded `32 / 0.02125 = 1506px` of page. Eleven pixels of caption cost
+    five hundred pixels of canvas. New `_clamp_to_authored` bounds every generic leaf minimum by the
+    size the author actually drew (floored at `MIN_ABSOLUTE = 16px`, and an explicit 0 for a blank
+    stays 0), so `child_min ≤ frac × page` and the inversion can never exceed the page. The floors are
+    heuristics; the author's own layout is evidence, and a worksheet drawn 45px tall is a caption
+    strip, not a chart that needs 160px.
+  - **A fixed-size pin was reported as a minimum.** `_main_min_contrib` returned `fixed_px`, so a
+    stack's minimum was the sum of its pins (871px) instead of its real content (547px) inside a zone
+    the author drew 725px tall. A pin is a *request*, not a requirement — the preference pass already
+    treated it that way — so it now contributes the child's subtree minimum. Removing this alone made
+    the page *worse* (1506 → 1813px), because the pins had been masking the worksheet floors beneath;
+    the two fixes are only correct together.
+  - **Third-order coupling:** `allocate` still *pays* every pin in full, so with pins out of the
+    minimum they ate pixels flexible siblings needed to clear their own. The fixed-child budget now
+    takes the tighter of the fraction ceiling and `room − Σ flexible minimums`, preserving the earlier
+    logo-starvation fix while guaranteeing min-respect. `_place_float` applies the same authored clamp,
+    since a float bypasses the solver entirely.
+  Growth is now gap-driven only — the solver's own 8px inter-sibling gaps, which Tableau's absolute
+  layout never budgeted — so both growth contracts assert exactly `page + (n−1) × GAP`. Measured
+  end-to-end through `migrate_estate` on two real customer workbooks: the page returns to **1000×1000
+  exactly** (was 1506), ink coverage 75% → 85%, canvas area 18.3 Mpx (below legacy's 18.5), deadspace
+  0.310 (best of legacy/previous/current), and total layout defects 5 → 3 with none introduced. Render-
+  verified through the Power BI Desktop bridge, not inferred from counters. Three test contracts that
+  encoded the removed behaviour were corrected and 7 direct tests added (authored-floor ceiling,
+  one-caption-cannot-inflate-canvas, `MIN_ABSOLUTE` floor, blank stays collapsible, pin-is-a-request,
+  float authored clamp, roomy float keeps its kind minimum).
 - **tableau-migration (skill `2.21.0` → `2.22.0`): chrome stops absorbing surplus space, page growth
   is height-only again, and the auditor reports layout QUALITY beside its defect counts
   (`scripts/layout_solve.py`, `scripts/geometry_audit.py`, `tests/test_layout_solve.py`).**

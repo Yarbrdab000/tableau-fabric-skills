@@ -161,6 +161,11 @@ def test_nonfixed_leaves_respect_min(seed):
     proportional squeeze takes every child below its minimum together, which renders as a legible
     "too small" signal rather than a visual silently pushed off the page. Width min-respect is
     asserted only when the page is actually wide enough to deliver it.
+
+    The minimum asserted is the EFFECTIVE one the solver computed, not the raw resolver value: a
+    generic floor is bounded by the size the author drew (``_clamp_to_authored``), and these
+    synthetic leaves each declare a source box of 10% of the canvas, so their floors are legitimately
+    clamped. Asserting the raw value would be asserting that the solver ignores the author.
     """
     root = _build(seed)
     solve(root, (0, 0, 1280, 720), min_for_leaf=_min_for)
@@ -168,7 +173,8 @@ def test_nonfixed_leaves_respect_min(seed):
     for leaf in _iter_leaves(root):
         if leaf["fixed_px"] is not None:
             continue  # pinned by the author; exempt from main-axis min
-        mw, mh = leaf["_min"]
+        mw, mh = leaf["min_w"], leaf["min_h"]
+        assert (mw, mh) <= leaf["_min"], "the clamp may only ever lower a minimum"
         rw, rh = leaf["rect"][2], leaf["rect"][3]
         assert rh >= mh - TOL, (
             "seed %d: leaf %r below min height %.1f" % (seed, leaf["rect"], mh))

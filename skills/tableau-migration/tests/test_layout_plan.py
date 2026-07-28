@@ -20,7 +20,7 @@ import xml.etree.ElementTree as ET
 import layout_plan as LP
 import twb_to_pbir as R
 from layout_plan import build_plan, is_decoration
-from layout_solve import MIN_TEXT, MIN_WORKSHEET, solve
+from layout_solve import GAP, MIN_ABSOLUTE, MIN_TEXT, solve
 from zone_tree import parse_zone_tree
 
 _WS = {"WsA", "WsB"}
@@ -107,10 +107,30 @@ def test_floating_zone_is_clamped_onto_the_page():
 
 
 def test_floating_zone_gets_the_leaf_minimum_applied():
+    """A degenerate float is floored so it stays visible -- but only to MIN_ABSOLUTE, not to its
+    kind minimum.
+
+    The floor exists so a 1px zone does not emit as an invisible visual, and 16x16 satisfies that.
+    Inflating it to the 120x32 text minimum would be growing an ABSOLUTELY positioned object by
+    120x on one axis, and a float has no flow siblings to push -- it simply expands over whatever
+    the author placed beneath it. That is not hypothetical: on a real dashboard a small floating
+    table floored to its 160x94 kind minimum swallowed the slicer underneath it outright.
+    """
     xml = _FLOAT.replace("x='50000' y='50000' w='20000' h='10000'",
                          "x='10000' y='10000' w='100' h='100'")
     x, y, w, h = build_plan(_dash(xml), page_w=1000.0, page_h=1000.0)["rects"]["f"]
-    assert (w, h) == MIN_TEXT           # 1px scaled box floored to the text minimum
+    assert (w, h) == (MIN_ABSOLUTE, MIN_ABSOLUTE)
+    assert (w, h) < MIN_TEXT, "a float is never inflated to its kind minimum"
+
+
+def test_a_roomy_float_still_gets_its_full_kind_minimum():
+    """The clamp is a ceiling, not a replacement: a float the author drew larger than its kind
+    minimum keeps its authored size, and one drawn between MIN_ABSOLUTE and the kind minimum keeps
+    exactly what the author drew."""
+    xml = _FLOAT.replace("x='50000' y='50000' w='20000' h='10000'",
+                         "x='10000' y='10000' w='5000' h='2000'")
+    _x, _y, w, h = build_plan(_dash(xml), page_w=1000.0, page_h=1000.0)["rects"]["f"]
+    assert (w, h) == (50.0, 20.0)
 
 
 def test_leaves_inside_a_floating_container_are_placed_too():
@@ -183,13 +203,20 @@ def test_blank_leaves_are_skipped_by_classification_but_keep_a_rect():
 
 # -- growth --------------------------------------------------------------------
 def test_growth_is_reported_when_the_minimum_exceeds_the_page():
+    """The plan reports growth -- and the growth is exactly the gaps the author left no room for.
+
+    Five worksheets tile the canvas exactly, so the only thing that does not fit is the solver's own
+    4 x 8px of inter-sibling gap. The page used to grow to 5 x MIN_WORKSHEET (800px on a 200px
+    request) because each 40px worksheet demanded a 160px floor; a minimum may no longer exceed the
+    size its author drew, so the demand is now the honest one.
+    """
     stack = "".join("<zone id='w%d' name='WsA' x='0' y='%d' w='100000' h='20000'/>" % (i, i * 20000)
                     for i in range(5))
     xml = ("<zone id='v' type-v2='layout-flow' param='vert' x='0' y='0' w='100000' h='100000'>"
            + stack + "</zone>")
     p = build_plan(_dash(xml), page_w=1000.0, page_h=200.0)
     assert p["grew"] is True
-    assert p["page"][1] >= 5 * MIN_WORKSHEET[1]
+    assert abs(p["page"][1] - (200.0 + 4 * GAP)) <= 1.0
 
 
 def test_growth_is_not_reported_on_a_roomy_page():

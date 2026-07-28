@@ -36,7 +36,7 @@ NO emit dependency, NO PBIR knowledge, does not import ``twb_to_pbir``.
 from __future__ import annotations
 
 import layout_layers as _layers
-from layout_solve import default_min_for_leaf, solve
+from layout_solve import MIN_ABSOLUTE, default_min_for_leaf, solve
 from zone_tree import K_LEAF, parse_zone_tree
 
 # Growth is reported when the solved page exceeds the requested one by more than this, in page
@@ -94,9 +94,17 @@ def _place_float(node, extent, pw, ph, resolver):
     if sw <= 0 or sh <= 0:
         return None
     kx, ky = pw / float(ew), ph / float(eh)
+    aw, ah = sw * kx, sh * ky
     mw, mh = resolver(node)
-    return _clamp_on_page(
-        (sx * kx, sy * ky, max(sw * kx, float(mw)), max(sh * ky, float(mh))), pw, ph)
+    # A float is floored by the same rule as everything the solver places: a generic minimum may not
+    # exceed the size the author drew (see layout_solve._clamp_to_authored). Floats are hoisted out
+    # of the tree, so without this they were the last objects still being inflated to a kind-based
+    # floor -- and inflating an ABSOLUTELY positioned object is uniquely destructive, since it has no
+    # flow siblings to push and simply grows over whatever it was authored beside. On a real
+    # dashboard a small floating table floored to 160x94 swallowed the slicer underneath it.
+    mw = min(float(mw), max(aw, MIN_ABSOLUTE)) if aw > 0 else float(mw)
+    mh = min(float(mh), max(ah, MIN_ABSOLUTE)) if ah > 0 else float(mh)
+    return _clamp_on_page((sx * kx, sy * ky, max(aw, mw), max(ah, mh)), pw, ph)
 
 
 def build_plan(db, device_zones=None, page_w=1280.0, page_h=720.0, min_for_leaf=None):
