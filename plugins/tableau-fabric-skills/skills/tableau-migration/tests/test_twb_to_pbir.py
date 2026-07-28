@@ -4247,6 +4247,132 @@ def test_static_worksheet_title_emitted_on_visual_container():
     assert res["warnings"] == []
 
 
+# -- Tableau's "Show Title" toggle -------------------------------------------------------------
+# Tableau serialises show-title='false' on a dashboard zone ONLY when the author unticks the box,
+# so absent means shown. The rule the toggle encodes is unconditional: a hidden title stays hidden
+# even when the sheet carries a carefully authored custom caption (authors routinely leave an old
+# title in place and just untick the box). And "hidden" has to be SAID -- a Power BI visual with no
+# title object renders an auto-generated field-name caption, not a blank.
+def _dash_with_zone(ws_name, zone_attrs=""):
+    return f"""
+    <dashboard name='Overview'>
+      <size maxheight='800' maxwidth='1200' />
+      <zones>
+        <zone h='100000' w='100000' x='0' y='0'>
+          <zone h='90000' w='90000' x='5000' y='5000' name='{ws_name}' id='4' {zone_attrs}/>
+        </zone>
+      </zones>
+    </dashboard>"""
+
+
+def _dash_title_props(res, page_hint="Overview"):
+    """The container-title properties of the single worksheet visual on the dashboard page."""
+    vis = [v for v in _visual_parts(res["parts"]).values()
+           if v["visual"]["visualType"] not in ("slicer", "image", "textbox")]
+    assert len(vis) == 1, [v["visual"]["visualType"] for v in vis]
+    vco = vis[0]["visual"].get("visualContainerObjects") or {}
+    assert "title" in vco, "a worksheet visual must always state its title, shown or hidden"
+    return vco["title"][0]["properties"]
+
+
+def test_zone_show_title_false_hides_the_container_title():
+    ws = _worksheet("Trend ATTI", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    res = migrate_twb_to_pbir(
+        _workbook(ws, _dash_with_zone("Trend ATTI", "show-title='false' ")),
+        dataset_name="M", report_name="R")
+    props = _dash_title_props(res)
+    assert props["show"]["expr"]["Literal"]["Value"] == "false"
+    # hidden means hidden: no caption text rides along to be revealed by a later edit
+    assert "text" not in props
+
+
+def test_zone_show_title_false_beats_a_custom_authored_title():
+    # the toggle is unconditional -- an authored caption does NOT override an unticked "Show Title".
+    ws = _worksheet("Days to Close Inbound Referrals", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST,
+                    title="<run>Days to Close</run>")
+    res = migrate_twb_to_pbir(
+        _workbook(ws, _dash_with_zone("Days to Close Inbound Referrals", "show-title='false' ")),
+        dataset_name="M", report_name="R")
+    # the custom title IS parsed -- it is the ZONE that suppresses it, not a failure to read it
+    assert res["ir"]["worksheets"][0]["title"] == "Days to Close"
+    props = _dash_title_props(res)
+    assert props["show"]["expr"]["Literal"]["Value"] == "false"
+    assert "Days to Close" not in json.dumps(props)
+
+
+def test_zone_without_show_title_shows_the_sheet_name_when_uncaptioned():
+    # absent show-title == shown, and Tableau's implicit caption is the SHEET NAME.
+    ws = _worksheet("Quantity by Location", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    res = migrate_twb_to_pbir(_workbook(ws, _dash_with_zone("Quantity by Location")),
+                              dataset_name="M", report_name="R")
+    props = _dash_title_props(res)
+    assert props["show"]["expr"]["Literal"]["Value"] == "true"
+    assert props["text"]["expr"]["Literal"]["Value"] == "'Quantity by Location'"
+
+
+def test_zone_show_title_true_keeps_the_authored_caption():
+    ws = _worksheet("Program Mix", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST,
+                    title="<run>Client Program Mix</run>")
+    res = migrate_twb_to_pbir(_workbook(ws, _dash_with_zone("Program Mix", "show-title='true' ")),
+                              dataset_name="M", report_name="R")
+    props = _dash_title_props(res)
+    assert props["show"]["expr"]["Literal"]["Value"] == "true"
+    assert props["text"]["expr"]["Literal"]["Value"] == "'Client Program Mix'"
+
+
+def test_zone_shows_title_parser_reads_the_attribute_as_a_disable_flag():
+    import xml.etree.ElementTree as _ET
+    from twb_to_pbir import _zone_shows_title as shows
+    assert shows(_ET.fromstring("<zone name='A'/>")) is True          # absent == shown
+    assert shows(_ET.fromstring("<zone name='A' show-title='true'/>")) is True
+    assert shows(_ET.fromstring("<zone name='A' show-title='false'/>")) is False
+    assert shows(_ET.fromstring("<zone name='A' show-title='FALSE'/>")) is False
+    # anything unrecognised falls back to Tableau's own default rather than guessing "hidden"
+    assert shows(_ET.fromstring("<zone name='A' show-title='wat'/>")) is True
+
+
+def test_no_worksheet_visual_ever_leaves_its_title_unstated():
+    # The whole point: silence is not neutral. Every worksheet-backed visual must carry an explicit
+    # title object, because Power BI's default for a missing one is a shown, auto-generated
+    # field-name caption that matches neither the author's title nor a blank.
+    ws_a = _worksheet("Shown Sheet", "Bar",
+                      rows="[federated.abc].[sum:Sales:qk]",
+                      cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    ws_b = _worksheet("Hidden Sheet", "Bar",
+                      rows="[federated.abc].[sum:Profit:qk]",
+                      cols="[federated.abc].[none:Region:nk]", deps_extra=_INST + _CI_SUM_PROFIT + _CI_REGION)
+    dash = """
+    <dashboard name='Overview'>
+      <size maxheight='800' maxwidth='1200' />
+      <zones>
+        <zone h='100000' w='100000' x='0' y='0'>
+          <zone h='45000' w='90000' x='5000' y='5000' name='Shown Sheet' id='4' />
+          <zone h='45000' w='90000' x='5000' y='50000' name='Hidden Sheet' id='5' show-title='false' />
+        </zone>
+      </zones>
+    </dashboard>"""
+    res = migrate_twb_to_pbir(_workbook(ws_a + ws_b, dash), dataset_name="M", report_name="R")
+    states = {}
+    for v in _visual_parts(res["parts"]).values():
+        vt = v["visual"]["visualType"]
+        if vt in ("slicer", "image", "textbox"):
+            continue
+        vco = v["visual"].get("visualContainerObjects") or {}
+        assert "title" in vco, f"{vt} visual left its title unstated"
+        p = vco["title"][0]["properties"]
+        states[p["show"]["expr"]["Literal"]["Value"]] = p.get("text", {}).get(
+            "expr", {}).get("Literal", {}).get("Value")
+    assert states == {"true": "'Shown Sheet'", "false": None}
+
+
 def test_dynamic_worksheet_title_deferred_and_warned():
     # a templated title (an escaped <[field]> token) cannot be a static Power BI title -> defer +
     # warn, never emit the broken literal; no token leaks into the report.
@@ -4258,7 +4384,12 @@ def test_dynamic_worksheet_title_deferred_and_warned():
                     deps_extra=_INST, title=runs)
     res = migrate_twb_to_pbir(_workbook(ws), dataset_name="M", report_name="R")
     assert res["ir"]["worksheets"][0]["title"] is None
-    assert "visualContainerObjects" not in _only_visual(res)["visual"]
+    # Deferred means the TEMPLATE is not emitted -- not that the visual goes uncaptioned. Tableau
+    # falls back to the sheet name; leaving the title object off would instead let Power BI invent a
+    # field-name caption, which is neither the author's title nor a blank.
+    _t = _only_visual(res)["visual"]["visualContainerObjects"]["title"][0]["properties"]
+    assert _t["show"]["expr"]["Literal"]["Value"] == "true"
+    assert _t["text"]["expr"]["Literal"]["Value"] == "'DaystoShip'"
     assert any("dynamic title" in (w.get("reason") or "") for w in res["warnings"])
     blob = json.dumps(res["parts"])
     assert "Days to Ship for <" not in blob and "&lt;" not in blob
@@ -4307,7 +4438,12 @@ def test_v2_4_mixed_param_and_field_ref_title_still_dropped():
                            "<run>&lt;[federated.abc].[none:Category:nk]&gt;</run>"))
     res = migrate_twb_to_pbir(_workbook_with_param(ws), dataset_name="M", report_name="R")
     assert res["ir"]["worksheets"][0]["title"] is None
-    assert "visualContainerObjects" not in _only_visual(res)["visual"]
+    # The unresolvable CUSTOM title is dropped, but the visual is still titled -- Tableau falls back
+    # to the sheet name, and emitting no title object at all would hand Power BI's auto-generated
+    # field-name caption to the reader instead.
+    _t = _only_visual(res)["visual"]["visualContainerObjects"]["title"][0]["properties"]
+    assert _t["show"]["expr"]["Literal"]["Value"] == "true"
+    assert _t["text"]["expr"]["Literal"]["Value"] == "'Mixed'"
     blob = json.dumps(res["parts"])
     assert "Program Name" not in blob and "&lt;" not in blob
 
@@ -4324,14 +4460,17 @@ def test_v2_4_resolved_param_title_keeps_its_parsed_style():
     w = ir["worksheets"][0]
     assert w["title"] == "Sales by Program Name"
     assert w["title_style"] is not None
-    # the common case (no authored title) leaves the visual untitled -> no container objects added.
+    # the common case (no authored title): Tableau's implicit title is the SHEET NAME, so the visual
+    # is titled with it rather than left for Power BI to auto-caption from the field names.
     ws = _worksheet("Plain", "Bar",
                     rows="[federated.abc].[sum:Sales:qk]",
                     cols="[federated.abc].[none:Category:nk]",
                     deps_extra=_INST)
     res = migrate_twb_to_pbir(_workbook(ws))
     assert res["ir"]["worksheets"][0]["title"] is None
-    assert "visualContainerObjects" not in _only_visual(res)["visual"]
+    _t = _only_visual(res)["visual"]["visualContainerObjects"]["title"][0]["properties"]
+    assert _t["show"]["expr"]["Literal"]["Value"] == "true"
+    assert _t["text"]["expr"]["Literal"]["Value"] == "'Plain'"
 
 
 def test_multi_run_static_title_is_joined():

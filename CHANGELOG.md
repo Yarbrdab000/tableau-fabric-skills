@@ -12,6 +12,43 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+- **tableau-migration (skill `2.33.0` -> `2.34.0`): a rebuild no longer re-identifies every object
+  in the model.** Each `lineageTag`, relationship GUID and random `PBI_Id` was a fresh `uuid4()`,
+  so re-running an UNCHANGED migration rewrote all 53 TMDL files and 508 identity GUIDs. Power BI
+  and Fabric Git integration match objects across deploys by exactly those tags, so the churn made
+  review diffs unreadable and let a redeploy drop-and-recreate objects instead of updating them --
+  taking the report bindings, refresh history and per-object settings with them. The tags are now
+  re-derived after assembly from each object's own identity PATH (`table:Orders/column:Sales`) via
+  UUIDv5, so the same model always yields the same tags and a renamed or added object perturbs only
+  its OWN tag. Done as a post-pass over the assembled parts because the owning table name is not in
+  scope inside the column / measure / hierarchy renderers, and a tag keyed on the column name alone
+  would collide the moment two tables share one (every model with two `Date` columns). A
+  relationship is identified by the columns it joins, not its position in the file; a duplicate
+  identity (a role-playing dimension joined twice on the same columns) is disambiguated rather than
+  trusted, since a repeated lineageTag produces a model Power BI refuses to open. Verified by
+  building the corpus twice: 0 of 53 TMDL files differ, 0 duplicate GUIDs across 494, and the
+  rebuilt model still opens, refreshes and renders 13/13 pages identically.
+
+- **tableau-migration (skill `2.32.0` -> `2.33.0`): honour Tableau's per-zone "Show Title" toggle.**
+  A dashboard zone serialises `show-title='false'` only when the author unticks the box, so absent
+  means shown -- the flag is now read at zone-capture time and carried through to the emitted visual.
+  Three cases are stated explicitly where previously only one was:
+  - zone hides the title -> `visualContainerObjects.title.show=false` (and `subTitle` off);
+  - zone shows a custom caption -> unchanged;
+  - zone shows and the author kept the default -> the **worksheet name**, which is Tableau's own
+    implicit title.
+  The hide wins unconditionally: an authored caption on a zone whose toggle is off stays hidden,
+  matching Tableau (authors routinely leave an old title in place and just untick the box).
+  Emitting nothing is NOT neutral -- Power BI's default for a missing title object is a shown,
+  auto-generated field-name caption (e.g. `pmdm__UnitOfMeasurement__c`), so silence rendered a title
+  the source does not show. Measure-trellis strips carry the caption on their first pane only and
+  explicitly suppress it on the rest, replacing N invented per-band headings. On the two-workbook
+  corpus this moves 46 visuals from "unstated" to an explicit hide, 8 to a sheet-name title, and 6
+  from a wrongly-shown caption to hidden; every worksheet-backed visual now states its title, and
+  page/visual geometry is byte-identical (259/259 entries unchanged), so the layout is untouched.
+
+
 ### Changed
 
 - **tableau-migration (skill `2.31.0` -> `2.32.0`): the layout solver is now the DEFAULT engine.**

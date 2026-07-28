@@ -3614,6 +3614,43 @@ def _zone_num(zone, attr):
         return None
 
 
+def _zone_shows_title(zone):
+    """Does this dashboard zone display its worksheet's title? ``True`` unless explicitly disabled.
+
+    Tableau's dashboard zones show the sheet title by default and serialise ``show-title='false'``
+    ONLY when the author unticks "Show Title", so the attribute is a disable flag rather than a
+    state field -- absent means shown. Any other/garbled value is read as shown, matching Tableau's
+    own default rather than guessing.
+
+    This is load-bearing for fidelity because Power BI's default is NOT "no title": a visual that
+    emits no title object gets an auto-generated field-name caption ("Sum of Quantity by Name"),
+    which is neither the author's title nor the blank they asked for. Both branches therefore have
+    to be stated explicitly downstream -- see ``_visual_json``'s ``show_title``.
+    """
+    v = zone.get("show-title")
+    if v is None:
+        return True
+    return str(v).strip().lower() not in ("false", "0", "no")
+
+
+def _title_display(ws, show_title=True):
+    """A worksheet visual's container title as ``(text, show)``.
+
+    Tableau's *implicit* title is the WORKSHEET NAME; ``<layout-options><title>`` only overrides it.
+    ``_worksheet_title`` therefore yields ``None`` for the very common "author kept the default"
+    case, and forwarding that as "no title" is wrong in both directions:
+
+    * shown zones lose the author's caption and get Power BI's auto-generated field-name one
+      instead (e.g. ``pmdm__UnitOfMeasurement__c``), which the reader has no reason to distrust;
+    * hidden zones get that same invented caption rather than the blank that was asked for.
+
+    So resolve the default here and let the caller pass BOTH halves to ``_visual_json``.
+    """
+    if not show_title:
+        return None, False
+    return (ws.get("title") or ws.get("name") or None), True
+
+
 def _zone_background_fill(zone):
     """A dashboard zone's authored background fill -> a ``#rrggbb`` (lower-cased) or ``None``.
 
@@ -3912,6 +3949,10 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
         if None in (x, y, w, h) or w <= 0 or h <= 0:
             continue
         zones.append({"worksheet": zname, "zone_id": zone.get("id"),
+                      # Tableau writes ``show-title`` ONLY when the author turns the title OFF, so an
+                      # absent attribute means shown. Captured per ZONE, not per worksheet: the same
+                      # sheet can be titled on one dashboard and untitled on another.
+                      "show_title": _zone_shows_title(zone),
                       "x": x, "y": y, "w": w, "h": h})
 
     title_banner = _select_title_banner(banner_candidates, ext_w, ext_h)
@@ -5127,7 +5168,8 @@ def _detect_measure_trellis(ws, state):
 
 def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
                           page_name, page_display, model_table, field_map, vname_base,
-                          sort_definition, label_objects, data_point_objects, warnings):
+                          sort_definition, label_objects, data_point_objects, warnings,
+                          title=None, show_title=True):
     """Fan a measure-trellis into N side-by-side single-measure ``clustered{Bar,Column}Chart``
     visuals aligned on a shared category axis. Returns ``(visuals, records)``.
 
@@ -5137,8 +5179,13 @@ def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
     measure band (width ``u``) with the category axis HIDDEN -- so the row labels appear once on the
     left and every band lines up under its header. The numeric value axis is hidden on all (the data
     labels carry the numbers, matching the compact Tableau strip); every chart shares the SAME
-    category binding + sort, so their rows stay aligned across the strip. Per-chart titles are
-    omitted because the dashboard's own column-header textboxes already caption each band.
+    category binding + sort, so their rows stay aligned across the strip.
+
+    Titles: the strip is ONE Tableau zone, so it carries at most one caption. When the zone shows its
+    title, only the FIRST chart carries it and the rest are explicitly captionless; when the zone
+    hides it, all of them are. "Explicitly" matters -- a Power BI visual that emits no title object
+    does not render untitled, it renders an auto-generated field-name caption, which would put a
+    different invented heading over every band.
     """
     visuals, records = [], []
     n = len(measures)
@@ -5157,8 +5204,10 @@ def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
             "valueAxis": [{"properties": {"show": _bool_literal(False)}}],
             "categoryAxis": [{"properties": {"show": _bool_literal(cat_shown)}}],
         }
+        k_title = title if (k == 0 and show_title) else None
         visuals.append(_visual_json(
             vname_k, vtype, pos, sub_state, sort_definition,
+            title=k_title, show_title=bool(k_title),
             label_objects=label_objects, data_point_objects=data_point_objects,
             extra_objects=extra))
         rec = _candidate_record(page_name, vname_k, ws, vtype, sub_state, pos,
@@ -6707,7 +6756,8 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  value_objects=None,
                  data_point_objects=None, label_objects=None, legend_objects=None,
                  shape_objects=None, card_label_objects=None, analytics_objects=None,
-                 slicer_mode=None, font_objects=None, extra_objects=None):
+                 slicer_mode=None, font_objects=None, extra_objects=None,
+                 show_title=None):
     visual = {"visualType": vtype}
     if query_state:
         visual["query"] = {"queryState": query_state}
@@ -6809,7 +6859,17 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     # auto-generated field-name subtitle is suppressed so only the author's title shows. Tier-2
     # title font styling (uniform font size / colour across the title's runs) is merged in when
     # present; all other run styling is deferred (see ``_parse_title_style`` / ``_title_style_props``).
-    if title:
+    if show_title is False:
+        # The author unticked "Show Title" on this zone. Emitting no title object would NOT honour
+        # that: Power BI's own default is a shown, auto-generated field-name caption ("Sum of
+        # Quantity by Name"), so silence here renders a title Tableau does not show. Say hidden
+        # explicitly. Suppressing the title also hands its band back to the plot area, which is why
+        # honouring the flag improves the zone's usable geometry rather than only its chrome.
+        visual["visualContainerObjects"] = {
+            "title": [{"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}],
+            "subTitle": [{"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}],
+        }
+    elif title:
         title_props = {
             "show": {"expr": {"Literal": {"Value": "true"}}},
             "text": {"expr": {"Literal": {"Value": _semantic_string_literal(title)}}},
@@ -8098,15 +8158,17 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             if trellis_measures:
                 # Measure-trellis: fan the N '+'-concatenated measures into N side-by-side bar
                 # charts aligned on a shared category axis (no native PBI multi-measure trellis).
+                _tt, _ts = _title_display(ws, zone.get("show_title", True))
                 tvis, trecs = _emit_measure_trellis(
                     ws, state, trellis_measures, x, y, w, h, i,
                     page_name, db["name"] or page_name, model_table, field_map, vname,
                     _sort_definition(ws, state, model_table, field_map),
-                    label_objects, data_point_objects, warnings)
+                    label_objects, data_point_objects, warnings,
+                    title=_tt, show_title=_ts)
                 visuals += _inherit_flag_filters(tvis, flag_fc)
                 records += trecs
                 continue
-            spark_title = ws.get("title")
+            spark_title, show_title = _title_display(ws, zone.get("show_title", True))
             kpi_card = ws.get("kpi_title_card")
             if kpi_card:
                 # KPI title-card: rebuild the title-embedded headline number as a companion card in
@@ -8121,12 +8183,15 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                     visuals.append(_inherit_flag_filters([card_vis], flag_fc)[0])
                     records.append(card_rec)
                     pos = _position(x, y + card_h, w, h - card_h, tab=i)
-                    spark_title = None
+                    # Drop the sparkline's caption AND say so explicitly: leaving the title object
+                    # off would let Power BI auto-generate a field-name one under the card.
+                    spark_title, show_title = None, False
             visuals.append(_visual_json(
                 vname, vtype, pos, state,
                 _sort_definition(ws, state, model_table, field_map),
                 filter_config=flag_fc,
                 title=spark_title, title_style=ws.get("title_style"),
+                show_title=show_title,
                 axis_titles=ws.get("axis_titles"),
                 value_objects=value_objects, data_point_objects=data_point_objects,
                 label_objects=label_objects, legend_objects=legend_objects,
@@ -8329,7 +8394,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             _emit_page(parts, page_name, ws["name"], visuals)
             page_order.append(page_name)
             continue
-        spark_title = ws.get("title")
+        spark_title, show_title = _title_display(ws)
         kpi_card = ws.get("kpi_title_card")
         if kpi_card:
             # KPI title-card on a standalone page: card (top band) + sparkline (below).
@@ -8342,12 +8407,13 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 visuals.append(_inherit_flag_filters([card_vis], flag_fc)[0])
                 records.append(card_rec)
                 pos = _position(40, 40 + card_h, 880, 620 - card_h)
-                spark_title = None
+                spark_title, show_title = None, False
         main = _visual_json(
             vname, vtype, pos, state,
             _sort_definition(ws, state, model_table, field_map),
             filter_config=flag_fc,
             title=spark_title, title_style=ws.get("title_style"),
+            show_title=show_title,
             axis_titles=ws.get("axis_titles"),
             value_objects=value_objects, data_point_objects=data_point_objects,
             label_objects=label_objects, shape_objects=shape_objects,

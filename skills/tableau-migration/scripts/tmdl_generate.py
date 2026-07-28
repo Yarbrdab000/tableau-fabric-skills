@@ -1523,6 +1523,132 @@ def _decl_name(line, keyword):
     return _read_identifier(line[len(prefix):])
 
 
+# -- deterministic object identity (lineageTag stability) ----------------------
+# Power BI and Fabric Git integration match a semantic-model object across deploys by its
+# ``lineageTag``. Minting a fresh ``uuid4()`` on every run therefore makes each rebuild look like
+# "every object was deleted and recreated": a no-op re-migration rewrites ~48 model files, review
+# diffs drown in GUID noise, and a redeploy can drop and recreate objects rather than update them
+# -- taking with them the report bindings, refresh history and per-object settings that hang off
+# the old identity.
+#
+# So the tags are RE-DERIVED after assembly from each object's own identity PATH in the model
+# (``table:Orders/column:Sales``) via UUIDv5. The same model always yields the same tags, and a
+# renamed or added object perturbs only its OWN tag -- the property a seeded sequential stream
+# cannot offer, since inserting one table there renumbers every object after it.
+#
+# This runs as a post-pass over the assembled parts rather than at the ~20 emit sites because the
+# owning TABLE name is not in scope inside the column / measure / hierarchy renderers, and a tag
+# keyed on the column name alone would COLLIDE the moment two tables share a column name (every
+# model with two ``Date`` columns), which is an invalid model.
+LINEAGE_NAMESPACE = uuid.uuid5(
+    uuid.NAMESPACE_URL, "https://github.com/Yarbrdab000/tableau-fabric-skills#lineage")
+
+# A declaration never sits deeper than two tabs in the TMDL this skill emits (``table`` at 0;
+# ``column`` / ``measure`` / ``hierarchy`` / ``partition`` at 1; ``level`` / ``calculationItem``
+# at 2), whereas a multi-line DAX or M body is indented THREE or more. Bounding the match by
+# indent is what keeps an expression body line from ever being mistaken for a declaration.
+_MAX_DECL_INDENT = 2
+_DECL_KINDS = ("table", "column", "measure", "hierarchy", "level", "role", "expression",
+               "partition", "calculationGroup", "calculationItem")
+_DECL_RE = re.compile(r"^(\t*)(" + "|".join(_DECL_KINDS) + r")[ \t]+(\S.*)$")
+_LINEAGE_RE = re.compile(r"^(\t*)lineageTag:[ \t]*\S.*$")
+_PBI_ID_RE = re.compile(r"^(\t*)annotation PBI_Id = ([0-9a-fA-F]{32})[ \t]*$")
+_RELATION_DECL_RE = re.compile(r"^relationship[ \t]+\S+[ \t]*$")
+_RELATION_END_RE = re.compile(r"^\t(?:from|to)Column:[ \t]*(\S.*?)[ \t]*$")
+
+
+def _lineage_uuid(identity, taken):
+    """A stable UUIDv5 for an object identity path.
+
+    Paths are unique by construction (TMDL forbids two sibling objects sharing a name), but a
+    duplicate is disambiguated rather than trusted: emitting the same lineageTag twice produces a
+    model Power BI refuses to open, which is a far worse failure than a suffixed identity."""
+    candidate, n = identity, 1
+    while candidate in taken:
+        n += 1
+        candidate = "{0}#{1}".format(identity, n)
+    taken.add(candidate)
+    return uuid.uuid5(LINEAGE_NAMESPACE, candidate)
+
+
+def _stabilize_tmdl_text(text, taken):
+    """Rewrite one TMDL part's identity GUIDs deterministically -> ``(text, rewritten_count)``."""
+    lines = text.split("\n")
+    stack = []          # ancestor declarations as (indent, "kind:name"), outermost first
+    rel_header = [None]  # index of the pending ``relationship <guid>`` line
+    rel_ends = []
+    count = [0]
+
+    def ancestors(indent):
+        # The owner of a property at depth N is the declaration chain down to depth N-1.
+        return [tok for depth, tok in stack if depth <= indent - 1]
+
+    def close_relationship():
+        if rel_header[0] is None:
+            return
+        # A relationship's identity is the pair of columns it joins, not its position in the file.
+        identity = "relationship:" + "->".join(rel_ends) if rel_ends else "relationship:unbound"
+        lines[rel_header[0]] = "relationship {0}".format(_lineage_uuid(identity, taken))
+        rel_header[0] = None
+        count[0] += 1
+
+    for i, line in enumerate(lines):
+        if _RELATION_DECL_RE.match(line):
+            close_relationship()
+            rel_header[0] = i
+            del rel_ends[:]
+            continue
+        if rel_header[0] is not None:
+            end = _RELATION_END_RE.match(line)
+            if end:
+                rel_ends.append(end.group(1))
+            continue
+
+        decl = _DECL_RE.match(line)
+        if decl and len(decl.group(1)) <= _MAX_DECL_INDENT:
+            indent = len(decl.group(1))
+            name = _read_identifier(decl.group(3)) or ""
+            while stack and stack[-1][0] >= indent:
+                stack.pop()
+            stack.append((indent, "{0}:{1}".format(decl.group(2), name)))
+            continue
+
+        tag = _LINEAGE_RE.match(line)
+        if tag:
+            indent = len(tag.group(1))
+            identity = "/".join(ancestors(indent)) or "model"
+            lines[i] = "\t" * indent + "lineageTag: {0}".format(_lineage_uuid(identity, taken))
+            count[0] += 1
+            continue
+
+        pbi_id = _PBI_ID_RE.match(line)
+        if pbi_id:
+            indent = len(pbi_id.group(1))
+            identity = ("/".join(ancestors(indent)) or "model") + "#PBI_Id"
+            lines[i] = "\t" * indent + "annotation PBI_Id = {0}".format(
+                _lineage_uuid(identity, taken).hex)
+            count[0] += 1
+
+    close_relationship()
+    return "\n".join(lines), count[0]
+
+
+def stabilize_lineage_tags(parts):
+    """Re-derive every ``lineageTag`` in an assembled parts dict from its object identity path.
+
+    Mutates ``parts`` in place (only ``.tmdl`` text parts are touched) and returns how many
+    identity GUIDs were rewritten. Parts are visited in sorted order so the collision-suffix
+    fallback -- and therefore the whole output -- is reproducible regardless of dict ordering."""
+    taken = set()
+    rewritten = 0
+    for path in sorted(p for p, text in (parts or {}).items()
+                       if isinstance(text, str) and p.endswith(".tmdl")):
+        parts[path], n = _stabilize_tmdl_text(parts[path], taken)
+        rewritten += n
+    return rewritten
+
+
+
 def generate_hierarchy_tmdl(name, levels):
     """Render one TMDL ``hierarchy`` block (a table child object).
 
