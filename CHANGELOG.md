@@ -12,6 +12,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+- **tableau-migration (skill `2.32.0` -> `2.33.0`): honour Tableau's per-zone "Show Title" toggle.**
+  A dashboard zone serialises `show-title='false'` only when the author unticks the box, so absent
+  means shown -- the flag is now read at zone-capture time and carried through to the emitted visual.
+  Three cases are stated explicitly where previously only one was:
+  - zone hides the title -> `visualContainerObjects.title.show=false` (and `subTitle` off);
+  - zone shows a custom caption -> unchanged;
+  - zone shows and the author kept the default -> the **worksheet name**, which is Tableau's own
+    implicit title.
+  The hide wins unconditionally: an authored caption on a zone whose toggle is off stays hidden,
+  matching Tableau (authors routinely leave an old title in place and just untick the box).
+  Emitting nothing is NOT neutral -- Power BI's default for a missing title object is a shown,
+  auto-generated field-name caption (e.g. `pmdm__UnitOfMeasurement__c`), so silence rendered a title
+  the source does not show. Measure-trellis strips carry the caption on their first pane only and
+  explicitly suppress it on the rest, replacing N invented per-band headings. On the two-workbook
+  corpus this moves 46 visuals from "unstated" to an explicit hide, 8 to a sheet-name title, and 6
+  from a wrongly-shown caption to hidden; every worksheet-backed visual now states its title, and
+  page/visual geometry is byte-identical (259/259 entries unchanged), so the layout is untouched.
+
+
 ### Changed
 
 - **tableau-migration (skill `2.31.0` -> `2.32.0`): the layout solver is now the DEFAULT engine.**
