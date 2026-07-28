@@ -364,7 +364,74 @@ def _date_default_literal(param):
     return lit
 
 
-def _emit_one_value_param(param, table_name, column_name, measure_name):
+_FIELD_TOKEN_RE = re.compile(r"\[([^\]]+)\]")
+
+
+def _norm_field(name):
+    """A comparable key for a field name across Tableau and model spellings: case/space/underscore
+    insensitive, with a trailing disambiguating qualifier dropped so Tableau's ``CreatedDate (Intake)``
+    matches the model's ``CreatedDate``."""
+    return re.sub(r"[^a-z0-9]", "", re.sub(r"\s*\([^)]*\)\s*$", "", name or "").lower())
+
+
+def compared_date_fields(param, calcs):
+    """Normalized names of the fields this parameter is COMPARED AGAINST in any calc.
+
+    A date parameter exists to bracket specific date fields, and the calcs say which:
+    ``[Created Date] >= [Parameters].[Start Date] AND ...``. Only formulas that reference this
+    parameter are read, and the ``[Parameters].[...]`` references are stripped first so a parameter
+    never counts itself or its partner endpoint as a compared field.
+    """
+    keys = _param_keys(param)
+    out = set()
+    for c in calcs or ():
+        formula = c.get("formula") or ""
+        refs = {m.strip().lower() for m in re.findall(r"\[Parameters\]\.\[([^\]]+)\]", formula)}
+        if not (refs & keys):
+            continue
+        for tok in _FIELD_TOKEN_RE.findall(
+                re.sub(r"\[Parameters\]\.\[[^\]]+\]", " ", formula)):
+            key = _norm_field(tok)
+            if key:
+                out.add(key)
+    return out
+
+
+def date_picker_domain(date_cols, compared=None):
+    """DAX ``(lo, hi)`` scalar expressions spanning a date parameter's domain, or ``None``.
+
+    A Tableau date parameter is a free calendar picker with no data-derived domain at all, so the
+    Power BI rebuild has to choose one. ``CALENDARAUTO()`` is the obvious choice and is WRONG: it
+    scans *every* date column in the model, so one unrelated column -- a contact birthdate -- drags
+    the picker back to 1941 and buries the business range under ~30,000 unusable rows. Restricting to
+    the columns wired into the Date dimension does NOT fix it either; a birthdate is legitimately
+    wired (measured on a real workbook).
+
+    The honest domain is the date fields the parameter is actually COMPARED AGAINST -- exactly the
+    dates it exists to bracket. Falls back to the full candidate set when nothing matches (a domain
+    that is too wide is merely awkward; one that excludes the real dates would be wrong), and the
+    caller falls back to ``CALENDARAUTO()`` when there are no candidates at all.
+    """
+    cols = sorted({(t, c) for t, c in (date_cols or ()) if t and c})
+    if not cols:
+        return None
+    if compared:
+        narrowed = [(t, c) for t, c in cols if _norm_field(c) in compared]
+        if narrowed:
+            cols = narrowed
+
+    def _fold(fn, terms):
+        expr = terms[0]
+        for t in terms[1:]:
+            expr = f"{fn}({expr}, {t})"
+        return expr
+
+    lo = _fold("MIN", [f"MIN({dax_ref(t, c)})" for t, c in cols])
+    hi = _fold("MAX", [f"MAX({dax_ref(t, c)})" for t, c in cols])
+    return lo, hi
+
+
+def _emit_one_value_param(param, table_name, column_name, measure_name, date_domain=None):
     """Build the TMDL for one value param. Returns ``(tmdl_text, dtype, warnings, picker_column)``
     or ``(None, None, [], None)`` if the param can't be represented as a value control.
     ``picker_column`` is the table column a slicer should bind to (the friendly Label column for an
@@ -421,9 +488,17 @@ def _emit_one_value_param(param, table_name, column_name, measure_name):
         default_literal = _date_default_literal(param)
         if default_literal is None:
             return None, None, [], None
+        # Span the date columns the model actually wires up, not every date it happens to hold, and
+        # always widen to include the Tableau default so the fallback value stays SELECTABLE (and the
+        # range can never come out empty or inverted on a column with no rows).
+        source_expr = "CALENDARAUTO()"
+        if date_domain:
+            lo, hi = date_domain
+            source_expr = (f"CALENDAR(MIN({lo}, {default_literal}), "
+                           f"MAX({hi}, {default_literal}))")
         tmdl = _value_table_tmdl(
             table_name, display_col=column_name, source_col="Date", tmdl_type="dateTime",
-            fmt=None, source_expr="CALENDARAUTO()", measure_name=measure_name,
+            fmt=None, source_expr=source_expr, measure_name=measure_name,
             default_literal=default_literal, measure_fmt=None)
         return tmdl, dtype, [], column_name
 
@@ -968,7 +1043,7 @@ def _uniquify_reserved(name, reserved_lower, *, prefer_suffix=None):
     return final
 
 
-def emit_value_parameters(params, *, calcs, reserved_names=None):
+def emit_value_parameters(params, *, calcs, reserved_names=None, date_cols=None):
     """Emit a disconnected what-if table + value measure for every scalar parameter that any
     ``calcs`` formula references via ``[Parameters].[X]``.
 
@@ -1005,7 +1080,8 @@ def emit_value_parameters(params, *, calcs, reserved_names=None):
         table_name = _uniquify_reserved(caption, reserved, prefer_suffix=" Parameter")
         column_name = table_name
         tmdl, _dtype, warn, picker_column = _emit_one_value_param(
-            p, table_name, column_name, measure_name)
+            p, table_name, column_name, measure_name,
+            date_domain=date_picker_domain(date_cols, compared_date_fields(p, calcs)))
         if tmdl is None:
             reserved.discard(measure_name.lower())
             reserved.discard(table_name.lower())

@@ -3758,6 +3758,39 @@ def test_no_flags_leaves_visuals_and_records_untouched():
     assert all("flag_filters" not in r for r in res["candidate_records"])
 
 
+def test_every_visual_split_out_of_a_worksheet_inherits_its_keep_flag():
+    # Measured on a real migration: a worksheet that rebuilds as SEVERAL visuals had its filter
+    # applied to only ONE of them. Tableau applies a worksheet filter to the whole worksheet, so an
+    # unfiltered sibling silently widens to the entire table -- a KPI card read 1354 against the
+    # source's date-ranged 820, shown confidently with no warning. Every derived piece inherits.
+    ws = _worksheet("Trellis", "Bar",
+                    rows="[federated.abc].[none:Category:nk]",
+                    cols="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+                    deps_extra=_INST + _DATE_FILTER_CALC, filters=_DATE_FILTER_FILT)
+    ir = parse_twb(_workbook(ws), param_binding=_flag_pb(["Trellis"]))
+    vis = list(_visual_parts(emit_pbir(ir)).values())
+    assert len(vis) == 2  # the worksheet fans into one chart per measure ...
+    for v in vis:         # ... and NEITHER piece is left unfiltered
+        conts = [c for c in (v.get("filterConfig") or {}).get("filters", [])
+                 if "Measure" in c.get("field", {})]
+        assert len(conts) == 1
+        assert conts[0]["field"]["Measure"]["Property"] == "Date Filter"
+
+
+def test_inherit_flag_filters_never_overwrites_and_is_inert_without_flags():
+    from twb_to_pbir import _inherit_flag_filters
+    fc = {"filters": [{"name": "flag-x"}]}
+    own = {"filters": [{"name": "its-own-narrower-scope"}]}
+    a, b = {}, {"filterConfig": own}
+    _inherit_flag_filters([a, b], fc)
+    assert a["filterConfig"] == fc
+    assert b["filterConfig"] is own          # a piece with its own scope keeps it
+    assert a["filterConfig"] is not fc       # copied, so pieces never share mutable state
+    bare = {}
+    _inherit_flag_filters([bare], None)
+    assert bare == {}                        # no flags -> byte-for-byte the prior output
+
+
 def test_migrate_twb_to_pbir_flag_filter_lands_on_part_and_candidate_record():
     ws = _flagged_line_worksheet("Line chart")
     res = migrate_twb_to_pbir(_workbook(ws), param_binding=_flag_pb(["Line chart"]))

@@ -30,6 +30,7 @@ workbook XML structure were used to build this; it is original, deterministic, a
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -7041,6 +7042,29 @@ def _flag_filter_config_for(ir, ws_name):
     return {"filters": list(containers)} if containers else None
 
 
+def _inherit_flag_filters(visuals, flag_fc):
+    """Stamp a worksheet's keep-flag ``filterConfig`` onto every visual DERIVED from that worksheet.
+
+    One Tableau worksheet often rebuilds as SEVERAL Power BI visuals -- a KPI headline card above its
+    sparkline, or a measure-trellis fanned into one chart per measure. Those derived pieces answer the
+    same question as the worksheet they came from, so they must inherit its filters: Tableau applies a
+    worksheet filter to the whole worksheet, not to one mark layer of it. Leaving a piece unfiltered
+    silently widens it to the entire table, which is why an unfiltered KPI card read 1354 against the
+    source's date-ranged 820 -- a WRONG NUMBER, shown confidently, with no warning anywhere.
+
+    Applied to the split emitters' output rather than inside each one, so a future split path inherits
+    correctly by construction instead of having to remember. Never overwrites a ``filterConfig`` a
+    visual already carries (a piece with its own narrower scope keeps it), and is a no-op when the
+    worksheet has no flags -- byte-for-byte the prior output in that case.
+    """
+    if not flag_fc:
+        return visuals
+    for v in visuals or ():
+        if isinstance(v, dict) and not v.get("filterConfig"):
+            v["filterConfig"] = copy.deepcopy(flag_fc)
+    return visuals
+
+
 def _slicer_filter_config(field, model_table, field_map, name, warnings):
     """Build a slicer ``filterConfig`` from an applied Tableau filter selection/range, else ``None``.
 
@@ -8033,7 +8057,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                     page_name, db["name"] or page_name, model_table, field_map, vname,
                     _sort_definition(ws, state, model_table, field_map),
                     label_objects, data_point_objects, warnings)
-                visuals += tvis
+                visuals += _inherit_flag_filters(tvis, flag_fc)
                 records += trecs
                 continue
             spark_title = ws.get("title")
@@ -8048,7 +8072,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                     model_table, field_map, vname)
                 if card_out is not None:
                     card_vis, card_rec = card_out
-                    visuals.append(card_vis)
+                    visuals.append(_inherit_flag_filters([card_vis], flag_fc)[0])
                     records.append(card_rec)
                     pos = _position(x, y + card_h, w, h - card_h, tab=i)
                     spark_title = None
@@ -8254,7 +8278,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 _sort_definition(ws, state, model_table, field_map),
                 label_objects, data_point_objects, warnings)
             records += trecs
-            visuals = tvis + _emit_slicers([ws], page_name, model_table, field_map, warnings)
+            visuals = (_inherit_flag_filters(tvis, flag_fc)
+                       + _emit_slicers([ws], page_name, model_table, field_map, warnings))
             _emit_page(parts, page_name, ws["name"], visuals)
             page_order.append(page_name)
             continue
@@ -8268,7 +8293,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 model_table, field_map, vname)
             if card_out is not None:
                 card_vis, card_rec = card_out
-                visuals.append(card_vis)
+                visuals.append(_inherit_flag_filters([card_vis], flag_fc)[0])
                 records.append(card_rec)
                 pos = _position(40, 40 + card_h, 880, 620 - card_h)
                 spark_title = None
