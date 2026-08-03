@@ -200,6 +200,35 @@ def hyper_to_csv(hyper_path, out_dir, *, hapi=None, row_limit=None):
     return results
 
 
+def extract_member_to_csv(source, member, out_dir, *, hapi=None, row_limit=None):
+    """Read ONE named ``.hyper`` member out of an archive into ``out_dir`` (one CSV per table).
+
+    Returns the same ``{qualified_table_name: {"csv_path", "columns", "row_count"}}`` mapping as
+    :func:`hyper_to_csv`. ``member`` is the archive-internal path (the extract's ``dbname``, e.g.
+    ``Data/TableauTemp 1/#TableauTemp_x.hyper``).
+
+    :func:`extract_to_csv` deliberately merges EVERY embedded extract first-wins by table name. That
+    is wrong whenever a workbook bundles one ``.hyper`` per datasource, because Tableau names every
+    single-table extract ``"Extract"."Extract"`` -- so all of them collide and each island but the
+    first would silently receive the FIRST island's rows. Reading one named member keeps each
+    datasource bound to the extract that actually holds its data.
+
+    Raises ``KeyError`` when ``member`` is not in the archive, so a caller never binds to a member
+    that does not exist.
+    """
+    members = list_hyper_in_archive(source)
+    if member not in members:
+        raise KeyError(f"{member!r} is not a .hyper member of {str(source)!r}")
+    stage = tempfile.mkdtemp(prefix="tableau_hyper_")
+    try:
+        hyper_path = os.path.join(stage, os.path.basename(member))
+        with zipfile.ZipFile(source) as zf, zf.open(member) as src, open(hyper_path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        return hyper_to_csv(hyper_path, out_dir, hapi=hapi, row_limit=row_limit)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
 def extract_to_csv(source, out_dir, *, hapi=None, row_limit=None, dest_dir=None):
     """Convenience: resolve ``source`` (``.hyper`` / ``.tdsx`` / ``.twbx``) to its extract(s) and
     write one CSV per table into ``out_dir``.

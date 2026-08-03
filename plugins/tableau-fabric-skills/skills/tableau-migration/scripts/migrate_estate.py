@@ -56,7 +56,7 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .assemble_model import (assemble_import_model, assemble_local_import_model,
                                  materialize_bundled_flatfile_data, write_model_folder,
                                  write_local_pbip, migrate_datasource, list_workbook_datasources,
-                                 _win_long_path)
+                                 _extract_is_only_data, _win_long_path)
     from .parameters import parse_parameters
     from .workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
     from .workbook_calc_usage import workbook_calc_usage
@@ -69,7 +69,7 @@ except ImportError:
     from assemble_model import (assemble_import_model, assemble_local_import_model,
                                 materialize_bundled_flatfile_data, write_model_folder,
                                 write_local_pbip, migrate_datasource, list_workbook_datasources,
-                                _win_long_path)
+                                _extract_is_only_data, _win_long_path)
     from parameters import parse_parameters
     from workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
     from workbook_calc_usage import workbook_calc_usage
@@ -781,7 +781,8 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
     flatfile_path = None
     table_csv_paths = None
     ff_mat = None
-    if descriptor.get("flatfile_filename") or decision.get("import_from_extract"):
+    if (descriptor.get("flatfile_filename") or decision.get("import_from_extract")
+            or _extract_is_only_data(descriptor, decision)):
         if pbip_dir is not None:
             # Land the data INSIDE the openable project (pbip/<name>/<name>.Data, beside the
             # .SemanticModel) so the whole folder is self-contained + portable; a relocatable

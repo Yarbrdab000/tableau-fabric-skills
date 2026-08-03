@@ -12,6 +12,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.38.0` -> `2.39.0`): an EXTRACTED flat-file workbook now loads its
+  rows from the bundled `.hyper` instead of shipping empty partitions.** When Tableau extracts a
+  CSV/Excel datasource it keeps only the author's `directory` on the connection (no `filename`) and
+  does not package the original file, so both materialize gates -- which asked only
+  `flatfile_filename or import_from_extract` -- declined and the emitter wrote
+  `Source = #table(type table [], {})`. The model opened cleanly with **zero rows** while tens of
+  megabytes sat unread in the archive. `parse_tds` now records each enabled `<extract>`'s bundled
+  member (`extract_hyper_member`, from the extract's own `<connection class='hyper' dbname=...>`)
+  plus its `<family>` provenance, a new narrow `_extract_is_only_data` predicate invites the
+  materializer for exactly this shape, and `hyper_reader.extract_member_to_csv` reads ONE named
+  member. Two latent corruptions are fixed with it: `extract_to_csv` merged every embedded extract
+  first-wins under Tableau's shared `"Extract"."Extract"` name (so island 2 silently received
+  island 1's rows), and `_normalize_match_key` stripped the trailing dot segment as a schema
+  qualifier, collapsing `orders.csv` and `returns.csv` onto the single key `csv`. Live-class
+  extracts (Snowflake/Salesforce) are deliberately untouched -- a real upstream is never swapped
+  for a stale offline snapshot. 30 new tests (`tests/test_hyper_extract_binding.py`); all 8 mutants
+  killed.
 - **tableau-migration (skill `2.37.0` -> `2.38.0`): make Tableau's "sort this dimension by a
   measure" actually sort in Power BI.** Tableau's ordinary idiom sorts an axis by a measure that
   is NOT on the shelf -- including the "Sort by" parameter pattern, where the whole point is that

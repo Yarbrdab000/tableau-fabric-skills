@@ -46,7 +46,8 @@ try:  # package or scripts-on-path
         workbook_datasources,
         AmbiguousDatasourceError,
     )
-    from .storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA, FALLBACK_NEEDS_DECISION
+    from .storage_mode import (select_storage_mode, FALLBACK_LAND_TO_DELTA,
+                               FALLBACK_NEEDS_DECISION, FLAT_FILE_CLASSES)
     from .calc_to_dax import (
         translate_tableau_calc_to_dax,
         translate_tableau_calc_to_dax_typed,
@@ -94,7 +95,8 @@ except ImportError:
         workbook_datasources,
         AmbiguousDatasourceError,
     )
-    from storage_mode import select_storage_mode, FALLBACK_LAND_TO_DELTA, FALLBACK_NEEDS_DECISION
+    from storage_mode import (select_storage_mode, FALLBACK_LAND_TO_DELTA,
+                              FALLBACK_NEEDS_DECISION, FLAT_FILE_CLASSES)
     from calc_to_dax import (
         translate_tableau_calc_to_dax,
         translate_tableau_calc_to_dax_typed,
@@ -3282,12 +3284,29 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
 _LOCAL_CSV_CLASS = "csv"
 
 
+# Flat-file extensions a TABLE NAME may legitimately end with. Tableau names a CSV/Excel relation
+# after its file ("sales.csv"), so the trailing dot segment is part of the NAME, not a schema
+# qualifier -- stripping it collapses every such table onto the bare extension ("csv") and makes two
+# different CSV tables indistinguishable (they then share one file's data, silently).
+_FILE_EXT_SUFFIXES = frozenset({
+    "csv", "tsv", "txt", "dat", "json", "parquet",
+    "xls", "xlsx", "xlsm", "xlsb",
+})
+
+
 def _normalize_match_key(name):
-    """Lowercased, bracket/quote/schema-stripped key for matching a relation to a CSV name."""
+    """Lowercased, bracket/quote/schema-stripped key for matching a relation to a CSV name.
+
+    A dot segment is dropped only when it is a SCHEMA qualifier (``"Extract".Foo`` -> ``foo``). When
+    the trailing segment is a flat-file extension the whole name is kept, because Tableau names a
+    flat-file relation after its file -- ``orders.csv`` and ``returns.csv`` must stay distinct keys.
+    """
     raw = str(name or "")
     for ch in '"[]':
         raw = raw.replace(ch, "")
-    raw = raw.rsplit(".", 1)[-1]  # drop a schema qualifier (e.g. "Extract".Foo -> Foo)
+    head, sep, tail = raw.rpartition(".")
+    if sep and head and tail.strip().lower() not in _FILE_EXT_SUFFIXES:
+        raw = tail  # drop a schema qualifier (e.g. "Extract".Foo -> Foo)
     return raw.strip().lower()
 
 
@@ -3314,11 +3333,19 @@ def _extract_base_key(norm_key):
 def _match_csv_path(relation, csv_index, *, single_default=None):
     """Resolve the local CSV path for one relation from a ``{normalized_name: path}`` index.
 
-    Tries the relation's display name then its ``item`` by normalized key. ``single_default`` is
-    used when the model has exactly one table and exactly one CSV (the dominant single-fact-table
-    extract case), so a name mismatch between the ``.tds`` table and the ``.hyper`` table still
-    binds. Returns ``None`` on a miss.
+    ``extract_csv_path`` wins outright: it is the CSV read from the exact bundled ``.hyper`` this
+    relation's own ``<extract>`` names, so it is PROVENANCE, not a guess. Name matching cannot settle
+    this case at all -- Tableau calls every single-table extract ``"Extract"."Extract"``, so a
+    workbook bundling one extract per datasource offers the matcher N identical names.
+
+    Otherwise tries the relation's display name then its ``item`` by normalized key.
+    ``single_default`` is used when the model has exactly one table and exactly one CSV (the dominant
+    single-fact-table extract case), so a name mismatch between the ``.tds`` table and the ``.hyper``
+    table still binds. Returns ``None`` on a miss.
     """
+    pinned = relation.get("extract_csv_path")
+    if pinned:
+        return pinned
     for cand in (_table_display(relation), relation.get("item")):
         key = _normalize_match_key(cand)
         if key in csv_index:
@@ -4282,6 +4309,107 @@ def _archive_path_for(packaged_source):
     return None, False
 
 
+_FLAT_FILE_CONNECTORS = frozenset(FLAT_FILE_CLASSES.values())
+
+
+def _extract_is_only_data(descriptor, decision):
+    """True when a FLAT-FILE source's rows exist ONLY in its bundled ``.hyper`` extract.
+
+    A Tableau workbook that was extracted keeps just the AUTHOR's directory on the flat-file
+    connection (``C:/Users/<someone>/Downloads``) -- no filename, and the original CSV/Excel is not
+    packaged. The emitter therefore has no path to give ``Csv.Document``/``Excel.Workbook`` and writes
+    a ``#table(type table [], {})`` stub, so the model opens with **zero rows** while a full ``.hyper``
+    sits unread inside the archive.
+
+    Deliberately narrow. It fires only when:
+
+    * the storage decision picked a FLAT-FILE connector (a live DB / SaaS / ODBC rebuild is a real
+      upstream and must never be swapped for a stale offline snapshot -- SaaS extracts already have
+      their own route via ``import_from_extract``), AND
+    * the descriptor names no flat file to bind (``flatfile_filename``/``flatfile_path`` absent), so
+      the partition is guaranteed to stub, AND
+    * the source IS an extract whose relations carry the bundled member that holds their rows.
+
+    Every case it admits is one where today's output is an empty partition, so it can only turn a
+    dataless model into a loading one.
+    """
+    desc = descriptor or {}
+    if not desc.get("is_extract"):
+        return False
+    if (decision or {}).get("connector") not in _FLAT_FILE_CONNECTORS:
+        return False
+    if desc.get("flatfile_filename") or desc.get("flatfile_path"):
+        return False
+    rels = [r for r in (desc.get("relations") or [])
+            if r.get("kind") in ("table", "custom_sql")]
+    return bool(rels) and all(r.get("extract_hyper_member") for r in rels)
+
+
+def _extract_csv_paths_by_relation(hr, arc_path, descriptor, hyper_members, out_dir):
+    """CSV path per RELATION for relations that name their own bundled ``.hyper``, or ``{}``.
+
+    ``parse_tds`` stamps ``extract_hyper_member`` on every table relation an enabled ``<extract>``
+    materializes. That provenance is the only reliable way to bind a consolidated workbook's islands:
+    Tableau names each single-table extract ``"Extract"."Extract"``, so binding by Hyper table name
+    would hand every island the FIRST extract's rows.
+
+    Each distinct member is read ONCE into its own ``out_dir`` subfolder (so identically-named extract
+    tables cannot clobber each other on disk) and mapped back to the relations that named it:
+
+    * a member whose extract holds exactly ONE table -> every relation bound to it takes that CSV
+      (the anonymous single-table extract, by far the common shape);
+    * otherwise each relation is matched to a table of THAT member by normalized name, then by
+      Tableau's ``<table>_<32-hex-GUID>`` extract suffix -- unique hits only.
+
+    Returns ``{relation display name: absolute csv path}``, keyed so ``assemble_local_import_model``
+    matches every relation exactly, and PINS the same path on each relation as ``extract_csv_path``
+    so the binding survives regardless of how the names normalize. Fail-closed and total: returns
+    ``{}`` unless EVERY table relation in the descriptor binds, so a partial/ambiguous shape falls
+    through to the previous behaviour rather than emitting a model with some islands silently
+    mis-pointed.
+    """
+    import os as _os
+    rels = [r for r in (descriptor.get("relations") or [])
+            if r.get("kind") in ("table", "custom_sql")]
+    if not rels or not all(r.get("extract_hyper_member") for r in rels):
+        return {}
+    members = {r["extract_hyper_member"] for r in rels}
+    if not members.issubset(set(hyper_members)):
+        return {}  # descriptor names a member this archive does not carry -> never guess
+
+    out = {}
+    for idx, member in enumerate(sorted(members)):
+        group = [r for r in rels if r.get("extract_hyper_member") == member]
+        stem = _os.path.splitext(_os.path.basename(member))[0].lstrip("#") or f"extract{idx + 1}"
+        sub = _os.path.join(out_dir, re.sub(r"[^\w.-]+", "_", stem) or f"extract{idx + 1}")
+        try:
+            mapping = hr.extract_member_to_csv(arc_path, member, sub)
+        except Exception:
+            return {}  # unreadable member (missing hyperapi, corrupt extract) -> fall through
+        if not mapping:
+            return {}
+        if len(mapping) == 1:
+            only = next(iter(mapping.values()))["csv_path"]
+            for rel in group:
+                out[_table_display(rel)] = only
+                rel["extract_csv_path"] = only
+            continue
+        index = {_normalize_match_key(k): v["csv_path"] for k, v in mapping.items()}
+        for rel in group:
+            disp = _table_display(rel)
+            path = _match_csv_path(rel, index)
+            if not path:
+                base = _extract_base_key(_normalize_match_key(disp))
+                cands = [p for k, p in index.items()
+                         if base and _extract_base_key(k) == base]
+                path = cands[0] if len(cands) == 1 else None
+            if not path:
+                return {}  # cannot bind every relation of this member -> fall through
+            out[disp] = path
+            rel["extract_csv_path"] = path
+    return out
+
+
 def materialize_bundled_flatfile_data(packaged_source, descriptor, dest_dir, *, model_name="model"):
     """Land a flat-file datasource's BUNDLED data to ABSOLUTE on-disk paths so the emitted Import
     model loads in Power BI Desktop -- a relative ``File.Contents`` path opens but loads nothing
@@ -4351,6 +4479,16 @@ def materialize_bundled_flatfile_data(packaged_source, descriptor, dest_dir, *, 
         result["hyper_present"] = True
         out_dir = dest_dir or _os.path.join(_tf.mkdtemp(prefix="tableau_extract_"),
                                             f"{model_name}.Data")
+        # 2a. PROVENANCE binding: each relation may name the exact .hyper member that holds its rows
+        #     (parse_tds -> ``extract_hyper_member``). Read those members INDIVIDUALLY and key the
+        #     result by the RELATION's own display name, so a consolidated workbook binds every island
+        #     to its own extract. Without this, the blind merge below keys by Hyper table name -- and
+        #     every single-table Tableau extract is called ``"Extract"."Extract"``, so N islands
+        #     collapse onto the first one's data. Falls through untouched when nothing is bound.
+        by_relation = _extract_csv_paths_by_relation(_hr, arc_path, _desc, hyper_members, out_dir)
+        if by_relation:
+            result.update(kind="csv", table_csv_paths=by_relation)
+            return result
         try:
             mapping = _hr.extract_to_csv(arc_path, out_dir)
         except _hr.HyperApiUnavailable:
@@ -4474,7 +4612,8 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
     # when there is nowhere to land data (no write_to and no flatfile_dest_dir).
     _ff_mat = None
     if (local_data is None and decision.get("mode") is not None
-            and (descriptor.get("flatfile_filename") or decision.get("import_from_extract"))
+            and (descriptor.get("flatfile_filename") or decision.get("import_from_extract")
+                 or _extract_is_only_data(descriptor, decision))
             and not kwargs.get("flatfile_path")):
         import os as _os
         _ff_dest = flatfile_dest_dir or (

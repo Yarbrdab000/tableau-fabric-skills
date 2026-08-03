@@ -965,6 +965,97 @@ def _is_extract_cache_relation(entry):
     )
 
 
+def _extract_hyper_bindings(datasource):
+    """Every ENABLED ``<extract>``'s bundled ``.hyper`` and the logical tables it materializes.
+
+    Returns ``[{"member", "tables", "families"}]``, one entry per enabled extract:
+
+    * ``member`` -- the ``.hyper``'s path INSIDE the ``.twbx``/``.tdsx`` archive, read from the
+      extract's own ``<connection class='hyper' dbname='Data/.../x.hyper'>``. This is the datasource's
+      OWN extract: a workbook with several extract-backed datasources bundles one ``.hyper`` per
+      datasource, and only this attribute says which is which.
+    * ``tables`` -- the physical table identities inside that ``.hyper`` (``[Extract].[Extract]`` for
+      the ubiquitous single-table extract).
+    * ``families`` -- the ``<family>`` of each ``<metadata-record>``, i.e. the LOGICAL relation each
+      extracted column came from. For a single-table extract every family is the one source table's
+      name, which is the only link back from the anonymous ``Extract`` table to the relation it backs.
+
+    Non-secret attributes only. Fail-closed: an extract with no resolvable ``dbname`` is skipped, so
+    a caller can never bind a relation to an archive member that does not exist.
+    """
+    out = []
+    for ex in _findall_local(datasource, "extract"):
+        if (ex.get("enabled") or "true").lower() == "false":
+            continue
+        for conn in _findall_local(ex, "connection"):
+            if (conn.get("class") or "").lower() not in _EXTRACT_ENGINE_CLASSES:
+                continue
+            member = (conn.get("dbname") or "").strip()
+            if not member or not member.lower().endswith(".hyper"):
+                continue
+            tables, families = [], []
+            for rel in _findall_local(conn, "relation"):
+                raw = (rel.get("table") or rel.get("name") or "").strip()
+                if raw and raw not in tables:
+                    tables.append(raw)
+            for rec in _findall_local(conn, "metadata-record"):
+                for fam in _children_local(rec, "family"):
+                    val = (fam.text or "").strip()
+                    if val and val not in families:
+                        families.append(val)
+            out.append({"member": member, "tables": tables, "families": families})
+            break  # one extract element materializes exactly one .hyper
+    return out
+
+
+def _bind_relations_to_extracts(relations, bindings):
+    """Stamp each table relation with the bundled ``.hyper`` that actually holds its rows.
+
+    A flat-file workbook that was extracted no longer carries its source CSV/Excel anywhere -- the
+    ``<connection>`` keeps only the AUTHOR's directory (``C:/Users/<someone>/Downloads``) and the data
+    lives solely in the packaged ``.hyper``. Recording the owning archive member ON THE RELATION lets
+    the materializer read the right extract per island **by provenance**, instead of matching on the
+    anonymous ``Extract`` table name that every single-table Tableau extract shares (which would
+    silently give island 2 island 1's data).
+
+    Sets ``extract_hyper_member`` (+ ``extract_hyper_table`` when the extract names exactly one) on
+    each matched relation, in place. Matching, widest-first and never a guess:
+
+    1. exactly ONE enabled extract -> it backs every table relation in this datasource;
+    2. several extracts -> a relation binds only when exactly ONE extract's ``families`` names it.
+
+    Returns the number of relations stamped. A relation that cannot be bound uniquely is left
+    untouched, so an ambiguous shape degrades to today's behaviour rather than mis-binding.
+    """
+    table_rels = [r for r in (relations or []) if r.get("kind") in ("table", "custom_sql")]
+    usable = [b for b in (bindings or []) if b.get("member")]
+    if not table_rels or not usable:
+        return 0
+
+    def _stamp(rel, binding):
+        rel["extract_hyper_member"] = binding["member"]
+        tbls = binding.get("tables") or []
+        if len(tbls) == 1:
+            rel["extract_hyper_table"] = tbls[0]
+
+    if len(usable) == 1:
+        for rel in table_rels:
+            _stamp(rel, usable[0])
+        return len(table_rels)
+
+    stamped = 0
+    for rel in table_rels:
+        name = (rel.get("name") or rel.get("item") or "").strip().lower()
+        if not name:
+            continue
+        hits = [b for b in usable
+                if any((f or "").strip().lower() == name for f in (b.get("families") or []))]
+        if len(hits) == 1:
+            _stamp(rel, hits[0])
+            stamped += 1
+    return stamped
+
+
 def _extract_relations(datasource, cols_by_parent, nc_map=None):
     """Walk ``<relation>`` elements into a flat, de-duplicated descriptor list.
 
@@ -1720,6 +1811,12 @@ def parse_tds(xml_text, select=None):
     if not is_extract and (cls or "").lower() in _EXTRACT_ENGINE_CLASSES:
         is_extract = True
 
+    # Record WHICH bundled .hyper backs each table, so an extract-backed source whose original file
+    # is not packaged can still land real rows -- and so a workbook bundling one .hyper per datasource
+    # reads the right one per island instead of collapsing them by their shared 'Extract' table name.
+    extract_bindings = _extract_hyper_bindings(datasource)
+    _bind_relations_to_extracts(relations, extract_bindings)
+
     unsupported = []
     table_like = [r for r in relations if r["kind"] in ("table", "custom_sql")]
     for r in table_like:
@@ -1735,6 +1832,7 @@ def parse_tds(xml_text, select=None):
         "http_path": http_path,
         "auth_method": auth_method,
         "is_extract": is_extract,
+        "extract_hyper_members": [b["member"] for b in extract_bindings],
         "named_connection_count": nconns,
         "connections": nc_map,
         "flatfile_filename": ff_filename,
