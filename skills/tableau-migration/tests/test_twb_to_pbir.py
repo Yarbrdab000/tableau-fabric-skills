@@ -4363,14 +4363,39 @@ def test_no_worksheet_visual_ever_leaves_its_title_unstated():
     states = {}
     for v in _visual_parts(res["parts"]).values():
         vt = v["visual"]["visualType"]
+        vco = v["visual"].get("visualContainerObjects") or {}
+        # TOTAL guarantee -- no visual type is exempt. The earlier version of this test skipped
+        # slicer/image/textbox, which is exactly how a real gap shipped while this test stayed
+        # green: any visual reaching the emitter without a resolvable caption fell through both
+        # branches and inherited Power BI's auto-generated field-name title.
+        assert "title" in vco, f"{vt} visual left its title unstated"
+        shown = vco["title"][0]["properties"]["show"]["expr"]["Literal"]["Value"]
+        assert shown in ("true", "false"), f"{vt} title show={shown!r} is not an explicit state"
         if vt in ("slicer", "image", "textbox"):
             continue
-        vco = v["visual"].get("visualContainerObjects") or {}
-        assert "title" in vco, f"{vt} visual left its title unstated"
         p = vco["title"][0]["properties"]
-        states[p["show"]["expr"]["Literal"]["Value"]] = p.get("text", {}).get(
-            "expr", {}).get("Literal", {}).get("Value")
+        states[shown] = p.get("text", {}).get("expr", {}).get("Literal", {}).get("Value")
     assert states == {"true": "'Shown Sheet'", "false": None}
+
+
+def test_untitled_visual_states_hidden_rather_than_inheriting_pbi_caption():
+    # The third case the show/hide fix originally missed: NOT an explicit hide (show_title is not
+    # False) and no resolvable caption. Emitting nothing lets Power BI invent "Sum of X by Y", which
+    # is neither the author's title nor a blank -- and doubles up with a caption textbox when one was
+    # emitted for the zone. The only true statement left is "no title", so say it.
+    vis = _visual_json("v1", "clusteredBarChart", {"x": 0, "y": 0},
+                       {"Values": {"projections": []}}, title=None)
+    props = vis["visual"]["visualContainerObjects"]["title"][0]["properties"]
+    assert props["show"]["expr"]["Literal"]["Value"] == "false"
+    assert "text" not in props
+    # ... and the auto subtitle is suppressed on this path too, exactly as on the explicit-hide path.
+    sub = vis["visual"]["visualContainerObjects"]["subTitle"][0]["properties"]
+    assert sub["show"]["expr"]["Literal"]["Value"] == "false"
+    # An explicit show_title=None must behave identically to omitting it -- None is the default, and
+    # the whole point is that a caller who never thought about titles still gets a stated one.
+    assert _visual_json("v2", "clusteredBarChart", {"x": 0, "y": 0},
+                        {"Values": {"projections": []}}, title=None, show_title=None)[
+        "visual"]["visualContainerObjects"] == vis["visual"]["visualContainerObjects"]
 
 
 def test_dynamic_worksheet_title_deferred_and_warned():

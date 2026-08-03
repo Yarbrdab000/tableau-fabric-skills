@@ -12,6 +12,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.34.0` → `2.35.0`): every visual now states its title — Power BI can
+  no longer invent one.** The 2.33.0 show/hide fix covered two cases (`show_title is False` → state
+  hidden; a resolvable caption → state it) but had no `else`, so a visual with neither an explicit
+  hide nor a resolvable title shipped **no `visualContainerObjects` at all**. Silence is not neutral:
+  Power BI's absent-value default is a *shown*, auto-generated field-name caption ("Sum of Quantity
+  by Name"), which matches neither the author's title nor a blank — and doubles up with the caption
+  textbox already emitted for the zone, producing the overlapping-title artifact. `_visual_json` now
+  has a genuine `else` that states `show=false`, making the title state **total**: every visual it
+  builds says `true` or `false`, never nothing. `_image_visual`, which bypasses `_visual_json`, was
+  closed the same way so a dashboard image no longer renders a stray caption bar that shrinks the
+  artwork. Measured on a real 163-visual workbook: visuals leaving their title unstated went
+  **60 → 0**. The existing `test_no_worksheet_visual_ever_leaves_its_title_unstated` passed
+  throughout the gap because it skipped `slicer`/`image`/`textbox` and only exercised resolvable
+  titles; it is now total (no type exempt, every `show` asserted to be an explicit literal) and is
+  joined by a direct unit test for the third case, proven non-vacuous by mutation.
+
 ### Added
 - **tableau-migration (skill `2.33.0` -> `2.34.0`): a rebuild no longer re-identifies every object
   in the model.** Each `lineageTag`, relationship GUID and random `PBI_Id` was a fresh `uuid4()`,
