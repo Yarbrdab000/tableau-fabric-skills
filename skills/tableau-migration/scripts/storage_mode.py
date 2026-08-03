@@ -307,7 +307,9 @@ def _structurally_unsupported_reason(descriptor):
     when:
 
     * a table can't be routed to a SPECIFIC connection (so we can't tell which upstream a table
-      in a multi-connection source comes from), or
+      in a multi-connection source comes from) -- a table materialized from its OWN bundled
+      ``.hyper`` extract is exempt: its upstream is that archive member, recorded by Tableau, so
+      there is nothing to disambiguate, or
     * one logical table spans several relations as a ``join``/``union`` (a row-level join that no
       single direct query against one source can reproduce), or
     * the shape is unknown / has no typable columns.
@@ -319,7 +321,13 @@ def _structurally_unsupported_reason(descriptor):
     relations = descriptor.get("relations", [])
     table_like = [r for r in relations if r.get("kind") in ("table", "custom_sql")]
     if descriptor.get("named_connection_count", 0) > 1:
-        unrouted = [r for r in table_like if not r.get("connection")]
+        # `extract_hyper_member` names the bundled archive member that physically holds this
+        # table's rows. That is a SPECIFIC upstream -- more specific than a named connection, which
+        # only points at a server -- so such a table is routed even in a multi-connection source.
+        # Without this, a workbook consolidating several extract-backed datasources (each its own
+        # connection) is declared unroutable and never builds a model at all.
+        unrouted = [r for r in table_like
+                    if not r.get("connection") and not r.get("extract_hyper_member")]
         if unrouted:
             names = ", ".join(repr(r.get("name")) for r in unrouted)
             reasons.append(

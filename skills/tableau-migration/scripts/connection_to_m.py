@@ -1008,6 +1008,117 @@ def _extract_hyper_bindings(datasource):
     return out
 
 
+def _extract_materialized_tables(datasource):
+    """Each enabled ``<extract>``'s OWN materialized table identity, from its own records.
+
+    Returns ``[{"member", "schema", "item", "raw_table", "parent"}]``. ``parent`` is the
+    ``<metadata-record><parent-name>`` those records are grouped under -- the key
+    :func:`_columns_by_parent` files the extract's typed columns beneath.
+
+    An extract element describes the table Tableau actually MATERIALIZED: a join/union of live
+    relations is flattened into one physical table, so the extract's records are the schema of the
+    ``.hyper``, not of the pre-extract logical relations. Returns ``[]`` outright if ANY enabled
+    extract is ambiguous (its records span several parents), rather than quietly omitting it --
+    otherwise an unambiguous sibling would be the lone candidate and a caller could collapse onto
+    it, silently discarding the tables the ambiguous extract describes.
+    """
+    out = []
+    for ex in _findall_local(datasource, "extract"):
+        if (ex.get("enabled") or "true").lower() == "false":
+            continue
+        for conn in _findall_local(ex, "connection"):
+            if (conn.get("class") or "").lower() not in _EXTRACT_ENGINE_CLASSES:
+                continue
+            parents = []
+            for rec in _findall_local(conn, "metadata-record"):
+                if (rec.get("class") or "").lower() != "column":
+                    continue
+                els = _children_local(rec, "parent-name")
+                txt = (els[0].text or "").strip() if els and els[0].text is not None else ""
+                p = _strip_brackets(txt)
+                if p and p not in parents:
+                    parents.append(p)
+            if len(parents) > 1:
+                return []  # several tables in one extract -> nothing here is safe to collapse onto
+            if not parents:
+                break  # no typed records at all -> this extract describes nothing
+            rels = _findall_local(conn, "relation")
+            raw = (rels[0].get("table") or "").strip() if rels else ""
+            out.append({
+                "member": (conn.get("dbname") or "").strip() or None,
+                "schema": (conn.get("schema") or "").strip() or None,
+                "item": (conn.get("tablename") or "").strip() or parents[0],
+                "raw_table": raw or None,
+                "parent": parents[0],
+            })
+            break  # one extract element materializes exactly one table
+    return out
+
+
+def _collapse_untyped_relations_to_extract(datasource, relations, cols_by_parent):
+    """Replace PRE-EXTRACT relations that carry no columns with the extract's materialized table.
+
+    Tableau rewrites an extracted datasource's column metadata to describe the ``.hyper`` it built,
+    filing every ``<metadata-record>`` under the extract's own parent (``[Extract]``). The live
+    ``<connection>``'s relations -- the pre-extract logical shape (``Finance``, ``Facts``, a
+    ``Sheet3$``, a ``...#csv``) -- are then left with NO resolvable columns, because those tables no
+    longer physically exist: the extract flattened them into one table. Whole families of workbooks
+    look like this, above all the legacy pre-federation (Tableau 9.x / Public) shape, where the
+    logical->physical bridge is a ``<cols><map>`` and there are no per-relation metadata records at
+    all.
+
+    Left alone, every such relation is reported as "has no resolvable columns", the datasource is
+    declared un-typable, no model is built and the workbook's .pbip is skipped -- even though the
+    extract carries a COMPLETE, typed column list for the exact table its bundled ``.hyper`` holds.
+
+    Collapsing is total or nothing, and only when there is nothing to lose:
+
+    * every table relation must be column-less (if any one types, the live layer is intact and is
+      the better upstream -- a partial collapse would be a guess);
+    * exactly ONE enabled extract must describe exactly one materialized table;
+    * that table's parent must actually carry typed columns.
+
+    On success the column-less relations are REPLACED, in place, by a single relation named after
+    the datasource and carrying the extract's typed columns; join/union containers are dropped with
+    them (their join was materialized into the extract). Returns the new relation, or ``None`` when
+    any precondition fails -- in which case ``relations`` is untouched and the caller degrades to
+    exactly the previous behaviour.
+    """
+    table_like = [r for r in relations if r.get("kind") in ("table", "custom_sql")]
+    if not table_like or any(r.get("columns") for r in table_like):
+        return None
+    mats = _extract_materialized_tables(datasource)
+    if len(mats) != 1:
+        return None
+    mat = mats[0]
+    cols = (cols_by_parent or {}).get(mat["parent"]) or []
+    if not cols:
+        return None
+
+    caption = (datasource.get("caption") or datasource.get("formatted-name")
+               or datasource.get("name") or mat["parent"])
+    new_rel = {
+        "kind": "table",
+        "name": caption,
+        "raw_table": mat["raw_table"] or f"[{mat['item']}]",
+        "catalog": None,
+        "schema": mat["schema"],
+        "item": mat["item"],
+        "columns": cols,
+        # Provenance: this table IS the bundled extract, so the materializer reads its rows from
+        # that member and never has to match the anonymous 'Extract' name across datasources.
+        "materialized_from_extract": True,
+    }
+    if mat["member"]:
+        new_rel["extract_hyper_member"] = mat["member"]
+        if mat["raw_table"]:
+            new_rel["extract_hyper_table"] = mat["raw_table"]
+    relations[:] = [r for r in relations
+                    if r.get("kind") not in ("table", "custom_sql", "join", "union")]
+    relations.append(new_rel)
+    return new_rel
+
+
 def _bind_relations_to_extracts(relations, bindings):
     """Stamp each table relation with the bundled ``.hyper`` that actually holds its rows.
 
@@ -1766,6 +1877,12 @@ def parse_tds(xml_text, select=None):
     odbc_facts = _odbc_facts(_primary_connection_el(datasource))
 
     relations = _extract_relations(datasource, cols_by_parent, nc_map)
+    # An EXTRACTED datasource's live relations are its PRE-extract logical shape; Tableau refiles all
+    # column metadata under the extract's own table, leaving them untypable. Collapse onto the table
+    # the extract actually materialized (the schema of the bundled .hyper) BEFORE relationships are
+    # derived, so a join that the extract already flattened is not also emitted as a model
+    # relationship between tables that no longer exist. A no-op unless every relation is columnless.
+    _collapse_untyped_relations_to_extract(datasource, relations, cols_by_parent)
     relationships, relationship_warnings = _extract_relationships(datasource, relations)
     # Recover join keys from any PHYSICAL join tree as model relationships and merge them in,
     # de-duplicating against the object-graph relationships in either orientation (a datasource

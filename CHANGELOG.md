@@ -12,6 +12,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.39.0` -> `2.40.0`): build a model for an extracted datasource
+  whose live relations carry no column metadata.** Tableau rewrites an extracted datasource's
+  `<metadata-record>`s to describe the `.hyper` it built, filing them all under the extract's own
+  parent. The live `<connection>`'s relations -- the pre-extract logical shape -- are then left
+  untypable, so the whole datasource was reported as "no resolvable column metadata", no model was
+  built and the workbook's `.pbip` was skipped. This hits whole families of workbooks, above all the
+  legacy pre-federation (Tableau 9.x / Public) shape, where the logical-to-physical bridge is a
+  `<cols><map>` and there are no per-relation metadata records at all. Such a datasource now
+  collapses onto the table its extract actually materialized -- which is the physical truth, since
+  the extract flattened any join into one table and the pre-extract relations no longer exist. The
+  collapse is total-or-nothing and declines whenever anything could be lost: if any relation already
+  types (the live layer is intact and is the better upstream), if there is not exactly one enabled
+  single-table extract, or if that extract's parent carries no typed columns. An extract whose
+  records span several tables poisons the decision rather than being skipped, so an unambiguous
+  sibling can never become a lone "safe" candidate. Separately, a table materialized from its own
+  bundled `.hyper` now counts as ROUTED in a multi-connection source: that archive member is a more
+  specific upstream than a named connection, so a workbook consolidating several extract-backed
+  islands no longer fails the multi-connection routing check. Verified end to end on a real
+  Tableau 9.1 workbook that previously produced no model at all: four datasources now type from
+  their extracts, each binds its own `.hyper`, Power BI Desktop completes a full refresh and both
+  visuals render real values.
+
 - **tableau-migration (skill `2.38.0` -> `2.39.0`): an EXTRACTED flat-file workbook now loads its
   rows from the bundled `.hyper` instead of shipping empty partitions.** When Tableau extracts a
   CSV/Excel datasource it keeps only the author's `directory` on the connection (no `filename`) and
