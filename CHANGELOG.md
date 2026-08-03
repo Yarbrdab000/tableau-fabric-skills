@@ -12,6 +12,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.43.0` -> `2.44.0`): find categorical mark-colour palettes
+  stored at the DATASOURCE level.** Tableau writes an explicit member->colour map
+  (`<map to='#hex'><bucket>"Member"</bucket></map>`) ONCE on `<datasource><style>` whenever
+  the assignment is shared across worksheets -- the normal case for a consistently styled
+  multi-sheet dashboard -- and then omits it from each worksheet's own `table/style`. The
+  reader only ever looked at the worksheet, so on such a workbook EVERY palette went unseen
+  and every visual silently fell back to theme colours. Measured on a 107-visual workbook:
+  45 datasource-level palettes covering 34 of the 44 colour-encoded worksheets, and not one
+  of those worksheets carried a local copy. Matching is EXACT, never a guess: the worksheet
+  writes its colour encoding in the qualified `[datasource].[token]` form and the palette is
+  keyed by `(datasource_name, token)`, so two datasources may legitimately colour same-named
+  fields differently. The worksheet-local palette still WINS where both exist (the more
+  specific statement); colour encodings are tried in author order; a `[Measure Names]`
+  palette is excluded (it colours by measure identity and has its own reader and
+  metadata-selector emit path); a continuous `<color-palette>` gradient is excluded; and two
+  conflicting definitions for one key abstain rather than resolving first-wins. 29 new tests
+  (`tests/test_datasource_mark_colors.py`); 9/9 mutants killed.
+
 - **tableau-migration (skill `2.42.0` -> `2.43.0`): honour author-HIDDEN axes.** Tableau
   serialises `Show Header` off explicitly, as
   `worksheet/table/style/style-rule/format[@attr='display'][@value='false']`, in two

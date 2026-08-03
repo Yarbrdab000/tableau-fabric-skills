@@ -2996,41 +2996,142 @@ def _bucket_member(text):
     return s
 
 
-def _parse_mark_colors(table):
-    """Extract an explicit categorical colour palette (member -> hex) from a worksheet's mark
-    colour encoding.
+def _split_field_ref(text):
+    """Split a Tableau field reference into ``(qualifier, inner_token)``.
 
-    Returns ``{"field_token", "members": [{"value", "color"}]}`` when the colour encoding carries a
-    discrete ``<map to='#hex'><bucket>...</bucket></map>`` palette of at least one member, else
-    ``None``. A continuous ``<color-palette>`` gradient (handled by ``_parse_color_gradient``) and a
-    bare single ``mark-color`` default are both ignored here -- only an explicit per-member map is an
-    unambiguous author colour assignment. Tableau author order is preserved.
+    ``[federated.abc].[none:airline_name:nk]`` -> ``("federated.abc", "none:airline_name:nk")``.
+    An unqualified reference (``[none:airline_name:nk]``, the spelling used INSIDE a datasource,
+    which is already scoped) returns ``(None, "none:airline_name:nk")``.
     """
-    if table is None:
-        return None
-    style = _first(table, "style")
-    if style is None:
-        return None
-    for rule in _children_local(style, "style-rule"):
-        if (rule.get("element") or "").lower() != "mark":
+    segs = _FIELD_SEG_RE.findall(text or "")
+    if not segs:
+        return (None, (text or "").strip())
+    return ((segs[0].strip() if len(segs) >= 2 else None), segs[-1].strip())
+
+
+def _datasource_mark_color_palettes(root):
+    """Workbook-wide categorical colour palettes stored on the DATASOURCE, keyed by
+    ``(datasource_name, colour_field_token)``.
+
+    Tableau writes an explicit member->colour map ONCE on ``<datasource><style>`` whenever the
+    assignment is shared across worksheets -- which is the normal case for a consistently styled
+    dashboard -- and then omits it from each worksheet. :func:`_parse_mark_colors` reads only the
+    worksheet-local copy, so on such a workbook every palette went unseen and every visual fell
+    back to theme colours. This reader supplies the shared definition; the worksheet-local copy
+    still WINS where both exist, being the more specific statement.
+
+    The key carries the datasource name because a workbook with several datasources can legitimately
+    define different palettes for same-named fields; the worksheet's colour encoding is written in
+    the qualified ``[datasource].[token]`` form, so the match is EXACT and never a guess. A
+    ``[Measure Names]`` palette is deliberately excluded -- it colours by measure identity, not by a
+    dimension member, and has its own reader (:func:`_parse_measure_color_palette`) and its own
+    metadata-selector emit path.
+
+    Returns ``{(ds_name, token): [{"value", "color"}]}`` with Tableau author order preserved.
+    """
+    palettes = {}
+    datasources = []
+    for holder in _children_local(root, "datasources"):
+        datasources.extend(_children_local(holder, "datasource"))
+    if not datasources and _local(root.tag) == "datasource":
+        datasources = [root]
+    for ds in datasources:
+        ds_name = ds.get("name")
+        style = _first(ds, "style")
+        if style is None:
             continue
-        for enc in _children_local(rule, "encoding"):
-            if (enc.get("attr") or "") != "color":
+        for rule in _children_local(style, "style-rule"):
+            if (rule.get("element") or "").lower() != "mark":
                 continue
-            if _first(enc, "color-palette") is not None:
-                continue  # continuous gradient -> _parse_color_gradient
-            members = []
-            for mp in _children_local(enc, "map"):
-                hexv = (mp.get("to") or "").strip()
-                bucket = _first(mp, "bucket")
-                if not hexv or bucket is None:
+            for enc in _children_local(rule, "encoding"):
+                if (enc.get("attr") or "") != "color":
                     continue
-                value = _bucket_member(bucket.text)
-                if value == "":
+                if _first(enc, "color-palette") is not None:
+                    continue  # continuous gradient -> _parse_color_gradient
+                _, token = _split_field_ref(enc.get("field"))
+                if not token or "Measure Names" in token:
                     continue
-                members.append({"value": value, "color": hexv})
-            if members:
-                return {"field_token": enc.get("field") or "", "members": members}
+                members = []
+                for mp in _children_local(enc, "map"):
+                    hexv = (mp.get("to") or "").strip()
+                    bucket = _first(mp, "bucket")
+                    if not hexv or bucket is None:
+                        continue
+                    value = _bucket_member(bucket.text)
+                    if value == "":
+                        continue
+                    members.append({"value": value, "color": hexv})
+                if not members:
+                    continue
+                key = (ds_name, token)
+                prior = palettes.get(key)
+                if prior is not None and prior != members:
+                    palettes[key] = None  # conflicting definitions -> abstain, never guess
+                elif prior is None and key in palettes:
+                    continue
+                else:
+                    palettes[key] = members
+    return {k: v for k, v in palettes.items() if v}
+
+
+def _pane_color_columns(panes):
+    """Every ``<color column=...>`` reference on the given panes, in author order (deduped)."""
+    out = []
+    for pane in panes or ():
+        for encs in _children_local(pane, "encodings"):
+            for enc in _children_local(encs, "color"):
+                col = (enc.get("column") or "").strip()
+                if col and col not in out:
+                    out.append(col)
+    return out
+
+
+def _parse_mark_colors(table, ds_palettes=None, color_columns=()):
+    """Extract an explicit categorical colour palette (member -> hex) for a worksheet.
+
+    Returns ``{"field_token", "members": [{"value", "color"}]}`` when an explicit discrete
+    ``<map to='#hex'><bucket>...</bucket></map>`` palette of at least one member is found, else
+    ``None``. A continuous ``<color-palette>`` gradient (handled by ``_parse_color_gradient``) and a
+    bare single ``mark-color`` default are both ignored -- only an explicit per-member map is an
+    unambiguous author colour assignment. Tableau author order is preserved.
+
+    The worksheet's own ``table/style`` is consulted FIRST (the most specific statement). Failing
+    that, the worksheet's mark colour encodings are resolved against the workbook's shared
+    datasource-level palettes (see :func:`_datasource_mark_color_palettes`), which is where Tableau
+    actually stores the assignment on a consistently styled multi-sheet dashboard. Colour encodings
+    are tried in author order and the first that resolves wins; nothing is inferred for a colour
+    field the author never assigned.
+    """
+    if table is not None:
+        style = _first(table, "style")
+        if style is not None:
+            for rule in _children_local(style, "style-rule"):
+                if (rule.get("element") or "").lower() != "mark":
+                    continue
+                for enc in _children_local(rule, "encoding"):
+                    if (enc.get("attr") or "") != "color":
+                        continue
+                    if _first(enc, "color-palette") is not None:
+                        continue  # continuous gradient -> _parse_color_gradient
+                    members = []
+                    for mp in _children_local(enc, "map"):
+                        hexv = (mp.get("to") or "").strip()
+                        bucket = _first(mp, "bucket")
+                        if not hexv or bucket is None:
+                            continue
+                        value = _bucket_member(bucket.text)
+                        if value == "":
+                            continue
+                        members.append({"value": value, "color": hexv})
+                    if members:
+                        return {"field_token": enc.get("field") or "", "members": members}
+    if not ds_palettes:
+        return None
+    for column in color_columns or ():
+        qualifier, token = _split_field_ref(column)
+        members = ds_palettes.get((qualifier, token))
+        if members:
+            return {"field_token": column, "members": [dict(m) for m in members]}
     return None
 
 
@@ -3288,7 +3389,7 @@ def _classify_reference_lines(all_panes, visual_type):
 
 def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date_binding=None,
                      row_count_binding=None, measure_binding=None, column_binding=None,
-                     measure_palette=None):
+                     measure_palette=None, ds_color_palettes=None):
     name = ws.get("name")
     table = _first(ws, "table")
     if table is None:
@@ -3684,7 +3785,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     # and turned into PBIR dataPoint per-member fills at emit time -- faithful-or-warn, so a palette
     # on a visual type that cannot carry a per-member fill, or whose coloured dimension is not bound,
     # defers rather than colouring the wrong mark.
-    mark_colors = _parse_mark_colors(table)
+    mark_colors = _parse_mark_colors(
+        table, ds_color_palettes, _pane_color_columns(all_panes))
 
     # Data labels (Tableau "Show Mark Labels"): the worksheet's mark-labels-show toggle. Parsed here
     # (additive IR key) and turned into a PBIR ``visual.objects.labels`` show/hide at emit time --
@@ -4528,6 +4630,7 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
     index, ds_caption, internal_fields = _build_field_index(root)
     warnings = []
     measure_palette = _parse_measure_color_palette(root)
+    ds_color_palettes = _datasource_mark_color_palettes(root)
 
     ws_holder = _children_local(root, "worksheets")
     ws_elems = []
@@ -4540,7 +4643,8 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
                                   row_count_binding=row_count_binding,
                                   measure_binding=measure_binding,
                                   column_binding=column_binding,
-                                  measure_palette=measure_palette)
+                                  measure_palette=measure_palette,
+                                 ds_color_palettes=ds_color_palettes)
         if parsed:
             worksheets.append(parsed)
     worksheet_names = {w["name"] for w in worksheets}
