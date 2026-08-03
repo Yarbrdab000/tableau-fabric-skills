@@ -23,10 +23,12 @@ from twb_to_pbir import (
     SCHEMA_VISUAL_SM,
     _DATE_EXACT_DERIVATIONS,
     _INTEGER_DATE_PART_COLUMNS,
+    _SORT_TOOLTIP_VTYPES,
     _apply_grow_to_fit,
     _apply_formula_table_calc_chain,
     _apply_override,
     _automatic_canvas_dims,
+    _bind_sort_field,
     _candidate_plan,
     _card_latent_candidates,
     _dedupe_native_query_refs,
@@ -619,10 +621,13 @@ def test_computed_sort_on_bound_measure_emits_sort_definition():
     assert sort_field == _query_state(vis)["Y"]["projections"][0]["field"]
 
 
-def test_computed_sort_on_unbound_measure_emits_no_sort_definition():
-    # The dimension is sorted by SUM(Profit), but Profit is not shown anywhere in the visual.
-    # Sorting by an unbound field would be a dangling reference, so warn-never-wrong drops the sort
-    # entirely (the visual still renders in faithful default order).
+def test_computed_sort_on_unbound_measure_binds_it_to_tooltips():
+    # The dimension is sorted by SUM(Profit) -- Tableau's ordinary idiom -- but Profit is not on
+    # any shelf. Power BI only sorts by a field the visual actually QUERIES: a sortDefinition on an
+    # unprojected field is accepted silently, ignored, AND suppresses Power BI's own default sort,
+    # leaving the axis in natural/alphabetical order (render-verified against Desktop). So the
+    # sort-by measure is routed into the Tooltips well -- it joins the query and the tooltip
+    # without drawing -- and the sort is emitted against it.
     sort = ("<computed-sort column='[federated.abc].[none:Category:nk]' direction='DESC' "
             "using='[federated.abc].[sum:Profit:qk]' />")
     ws = _worksheet("Sales by Category", "Bar",
@@ -631,7 +636,135 @@ def test_computed_sort_on_unbound_measure_emits_no_sort_definition():
                     deps_extra=_INST, filters=sort)
     ir = parse_twb(_workbook(ws))
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    sd = _sort_definition(vis)
+    assert sd is not None
+    assert sd["sort"][0]["direction"] == "Descending"
+    state = _query_state(vis)
+    tips = state["Tooltips"]["projections"]
+    assert len(tips) == 1
+    assert tips[0]["field"]["Aggregation"]["Expression"]["Column"]["Property"] == "Profit"
+    # the sort names exactly the tooltip-bound expression (no dangling reference)
+    assert sd["sort"][0]["field"] == tips[0]["field"]
+    assert tips[0]["queryRef"] and tips[0]["nativeQueryRef"]
+
+
+def test_computed_sort_tooltip_rescue_leaves_the_drawn_encoding_untouched():
+    # The rescue must not change what the chart DRAWS -- the sort-by measure would otherwise become
+    # a second series of bars. Y keeps its single authored measure; Category is unchanged.
+    sort = ("<computed-sort column='[federated.abc].[none:Category:nk]' direction='ASC' "
+            "using='[federated.abc].[sum:Profit:qk]' />")
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, filters=sort)
+    state = _query_state(list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0])
+    assert len(state["Y"]["projections"]) == 1
+    assert (state["Y"]["projections"][0]["field"]["Aggregation"]["Expression"]
+            ["Column"]["Property"]) == "Sales_Amount"
+    assert len(state["Category"]["projections"]) == 1
+    assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "Category"
+
+
+def test_computed_sort_declined_when_visual_type_has_no_tooltips_well():
+    # A tableEx has no Tooltips well, so an unprojected sort-by measure cannot be made part of the
+    # query. Emitting the sort anyway would suppress the default order for nothing, so it is
+    # dropped entirely -- fail closed, exactly as before the rescue existed.
+    sort = ("<computed-sort column='[federated.abc].[none:Category:nk]' direction='DESC' "
+            "using='[federated.abc].[sum:Profit:qk]' />")
+    ws = _worksheet("Detail", "Text",
+                    rows="[federated.abc].[none:Category:nk]",
+                    cols="[federated.abc].[sum:Sales:qk]",
+                    deps_extra=_INST, filters=sort)
+    ir = parse_twb(_workbook(ws))
+    assert ir["worksheets"][0]["visual_type"] == "table"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
     assert _sort_definition(vis) is None
+    assert "Tooltips" not in _query_state(vis)
+
+
+def test_manual_sort_still_emits_no_sort_definition():
+    # <manual-sort> is an explicit frozen member order with no faithful Power BI sort expression;
+    # the rescue must not tempt it into one.
+    sort = ("<manual-sort column='[federated.abc].[none:Category:nk]'>"
+            "<dictionary><bucket>&quot;Furniture&quot;</bucket></dictionary></manual-sort>")
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, filters=sort)
+    vis = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
+    assert _sort_definition(vis) is None
+    assert "Tooltips" not in _query_state(vis)
+
+
+# -- _bind_sort_field unit surface --------------------------------------------
+_SORT_EXPR = {"Measure": {"Expression": {"SourceRef": {"Entity": "_Measures"}},
+                          "Property": "Profit"}}
+
+
+def test_bind_sort_field_is_a_noop_when_the_field_is_already_projected():
+    state = {"Y": {"projections": [{"field": _SORT_EXPR, "queryRef": "_Measures.Profit"}]}}
+    assert _bind_sort_field(state, _SORT_EXPR, "_Measures.Profit", "Profit", "bar") is True
+    assert "Tooltips" not in state          # the fast path adds nothing
+
+
+def test_bind_sort_field_adds_a_tooltip_projection_when_unbound():
+    other = {"Measure": {"Expression": {"SourceRef": {"Entity": "_Measures"}},
+                         "Property": "Sales"}}
+    state = {"Y": {"projections": [{"field": other, "queryRef": "_Measures.Sales"}]}}
+    assert _bind_sort_field(state, _SORT_EXPR, "_Measures.Profit", "Profit", "bar") is True
+    assert state["Tooltips"]["projections"] == [
+        {"field": _SORT_EXPR, "queryRef": "_Measures.Profit", "nativeQueryRef": "Profit"}]
+    assert len(state["Y"]["projections"]) == 1   # the drawn encoding is untouched
+
+
+def test_bind_sort_field_declines_for_a_visual_type_without_a_tooltips_well():
+    for vt in ("table", "matrix", "card", "scatter", "map", "filled_map", "shape_map"):
+        state = {"Values": {"projections": []}}
+        assert _bind_sort_field(state, _SORT_EXPR, "_Measures.Profit", "Profit", vt) is False
+        assert state == {"Values": {"projections": []}}
+    assert "table" not in _SORT_TOOLTIP_VTYPES
+    assert {"bar", "column", "line", "area"} <= set(_SORT_TOOLTIP_VTYPES)
+
+
+def test_bind_sort_field_is_copy_on_write_so_shallow_state_copies_stay_isolated():
+    # The measure-trellis fan-out takes dict(state) per band. Mutating a shared Tooltips list in
+    # place would leak one band's rescue into its siblings and the parent.
+    parent = {"Y": {"projections": []},
+              "Tooltips": {"projections": [{"field": {"Measure": {"Property": "Existing"}},
+                                            "queryRef": "_Measures.Existing"}]}}
+    band = dict(parent)
+    assert _bind_sort_field(band, _SORT_EXPR, "_Measures.Profit", "Profit", "bar") is True
+    assert len(band["Tooltips"]["projections"]) == 2      # existing kept + the sort field appended
+    assert len(parent["Tooltips"]["projections"]) == 1    # parent untouched
+    assert band["Tooltips"] is not parent["Tooltips"]
+
+
+def test_bind_sort_field_uniquifies_a_colliding_query_ref():
+    clash = {"Measure": {"Expression": {"SourceRef": {"Entity": "_Measures"}},
+                         "Property": "Other"}}
+    state = {"Y": {"projections": [{"field": clash, "queryRef": "_Measures.Profit"}]}}
+    assert _bind_sort_field(state, _SORT_EXPR, "_Measures.Profit", "Profit", "bar") is True
+    assert state["Tooltips"]["projections"][0]["queryRef"] == "_Measures.Profit 2"
+
+
+def test_measure_trellis_binds_the_sort_in_every_band():
+    # Each band replaces Y with its own single measure, so a sort by one of the trellis measures is
+    # bound in only ONE band. An unhonoured sort still suppresses the default order, which would
+    # break the row alignment the strip depends on -- so every band re-binds it for itself.
+    sort = ("<computed-sort column='[federated.abc].[none:Category:nk]' direction='DESC' "
+            "using='[federated.abc].[sum:Profit:qk]' />")
+    ws = _worksheet("Trellis", "Bar",
+                    rows="[federated.abc].[none:Category:nk]",
+                    cols="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+                    deps_extra=_INST, filters=sort)
+    vis = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())
+    assert len(vis) == 2
+    for v in vis:
+        sd = _sort_definition(v)
+        assert sd is not None
+        bound = [p["field"] for role in _query_state(v).values()
+                 for p in role.get("projections", [])]
+        assert sd["sort"][0]["field"] in bound
 
 
 # -- IR: calculated field -> measure ------------------------------------------

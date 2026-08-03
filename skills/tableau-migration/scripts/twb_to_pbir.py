@@ -5225,6 +5225,16 @@ def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
             xk, wk, cat_shown = x + (k + 1) * u, u, False
         sub_state = dict(state)
         sub_state["Y"] = {"projections": [proj]}
+        # Each band replaces Y with its OWN single measure, so a sort-by measure that was bound in
+        # the parent's multi-measure Y is unbound in every other band -- and an unhonoured sort
+        # still suppresses Power BI's default one, which would break exactly the row alignment this
+        # strip depends on. Re-bind per band (copy-on-write, so bands cannot leak into each other),
+        # and drop the sort for any band where it cannot be bound.
+        sub_sort = sort_definition
+        if sub_sort and ws.get("sort"):
+            _e, _q, _n = _field_expression(ws["sort"]["field"], model_table, field_map)
+            if not _bind_sort_field(sub_state, _e, _q, _n, ws["visual_type"]):
+                sub_sort = None
         vtype = _pbir_vtype(ws["visual_type"], sub_state)
         vname_k = _sanitize(f"{vname_base}-mt{k}")
         pos = _position(xk, y, wk, h, tab=tab)
@@ -5234,7 +5244,7 @@ def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
         }
         k_title = title if (k == 0 and show_title) else None
         visuals.append(_visual_json(
-            vname_k, vtype, pos, sub_state, sort_definition,
+            vname_k, vtype, pos, sub_state, sub_sort,
             title=k_title, show_title=bool(k_title),
             label_objects=label_objects, data_point_objects=data_point_objects,
             extra_objects=extra))
@@ -5539,24 +5549,79 @@ def _candidate_record(page_name, vname, ws, vtype, state, position, page_display
 
 
 # -- PBIR JSON part assembly ---------------------------------------------------
+# Visual types that pair a Tooltips well with a category order a sort can act on, so a sort-by
+# measure the chart does not otherwise show can ride along in the query. A tableEx / card / map /
+# scatter has no such pairing (no Tooltips well, or no category order), so the rescue declines
+# there and the sort stays unemitted rather than being emitted and silently ignored.
+_SORT_TOOLTIP_VTYPES = frozenset({
+    VT_COLUMN, VT_BAR, VT_LINE, VT_AREA, VT_COMBO,
+    VT_RIBBON, VT_WATERFALL, VT_PIE, VT_DONUT, VT_TREEMAP,
+})
+
+
+def _state_projections(state):
+    """Every projection dict currently bound in a visual's ``queryState``."""
+    return [p
+            for role in state.values() if isinstance(role, dict)
+            for p in role.get("projections", [])]
+
+
+def _bind_sort_field(state, expr, qref, nref, visual_type):
+    """Make ``expr`` part of the visual's query so Power BI will honour a sort on it.
+
+    Power BI only sorts a visual by a field the visual actually QUERIES. A ``sortDefinition``
+    naming an unprojected field is accepted with no error or warning -- and then ignored, while
+    still SUPPRESSING Power BI's own default sort, so the category axis silently falls back to
+    natural/alphabetical order. That is strictly worse than emitting nothing, which is why the
+    original guard declined outright. Both halves of this were render-verified against Power BI
+    Desktop (an unprojected sort changed the order but not to the sort measure; the same sort with
+    the measure added to Tooltips ordered exactly by it).
+
+    Tableau's ordinary idiom -- "sort this dimension by a measure that is not on the shelf" -- has
+    no faithful Power BI shape unless that measure joins the query, so route it to the ``Tooltips``
+    well: it participates in the query and the tooltip (which is also what Tableau's own sort-by
+    measure surfaces) without changing the chart's visual encoding. This is exactly the field set
+    Power BI's own "Sort axis" menu offers.
+
+    Mutates ``state`` copy-on-write (never in place), so a shallow ``dict(state)`` -- as the
+    measure-trellis fan-out takes -- cannot leak a projection back into its parent or siblings.
+    Returns True when ``expr`` is bound afterwards (already was, or was just added).
+    """
+    projections = _state_projections(state)
+    if any(p.get("field") == expr for p in projections):
+        return True
+    if visual_type not in _SORT_TOOLTIP_VTYPES:
+        return False
+    used = {p.get("queryRef") for p in projections}
+    unique, i = qref, 1
+    while unique in used:
+        i += 1
+        unique = f"{qref} {i}"
+    role = state.get("Tooltips") if isinstance(state.get("Tooltips"), dict) else {}
+    state["Tooltips"] = dict(role, projections=list(role.get("projections") or []) + [
+        {"field": expr, "queryRef": unique, "nativeQueryRef": nref}])
+    return True
+
+
 def _sort_definition(ws, state, model_table, field_map):
     """Build a PBIR ``sortDefinition`` from a worksheet's ``<computed-sort>``.
 
     Power BI puts the sort on ``visual.query.sortDefinition`` (a sibling of ``queryState``) as an
     ordered ``sort`` array of ``{field, direction}`` (direction ``"Ascending"``/``"Descending"``),
-    where ``field`` reuses the exact same expression shape as a projection. To stay
-    warn-never-wrong we emit a sort ONLY when the sort-by field is already bound as a projection in
-    this visual -- sorting by an unbound field would be a dangling reference. Returns ``None`` when
-    there is no computed-sort or the sort-by field is not bound here.
+    where ``field`` reuses the exact same expression shape as a projection. The sort-by measure
+    must be bound in this visual for Power BI to honour it, so when it is not already projected
+    :func:`_bind_sort_field` adds it to the Tooltips well. Returns ``None`` when there is no
+    computed-sort, or when the sort-by field can neither be projected nor tooltip-bound here --
+    emitting an unhonourable sort is worse than emitting none.
+
+    NOTE: this may MUTATE ``state`` (adding the Tooltips projection), so call it before the
+    ``queryState`` is serialised, and after any helper whose behaviour depends on the role set.
     """
     sort = ws.get("sort")
     if not sort:
         return None
-    expr, _, _ = _field_expression(sort["field"], model_table, field_map)
-    bound = [p["field"]
-             for role in state.values() if isinstance(role, dict)
-             for p in role.get("projections", [])]
-    if expr not in bound:
+    expr, qref, nref = _field_expression(sort["field"], model_table, field_map)
+    if not _bind_sort_field(state, expr, qref, nref, ws.get("visual_type")):
         return None
     return {"sort": [{"field": expr, "direction": sort["direction"]}],
             "isDefaultSort": False}
@@ -8223,10 +8288,13 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 # Measure-trellis: fan the N '+'-concatenated measures into N side-by-side bar
                 # charts aligned on a shared category axis (no native PBI multi-measure trellis).
                 _tt, _ts = _title_display(ws, zone.get("show_title", True))
+                # _sort_definition may add a Tooltips projection to `state`; bind it explicitly
+                # here rather than relying on argument-evaluation order.
+                sort_def = _sort_definition(ws, state, model_table, field_map)
                 tvis, trecs = _emit_measure_trellis(
                     ws, state, trellis_measures, x, y, w, h, i,
                     page_name, db["name"] or page_name, model_table, field_map, vname,
-                    _sort_definition(ws, state, model_table, field_map),
+                    sort_def,
                     label_objects, data_point_objects, warnings,
                     title=_tt, show_title=_ts)
                 visuals += _inherit_flag_filters(tvis, flag_fc)
@@ -8250,9 +8318,10 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                     # Drop the sparkline's caption AND say so explicitly: leaving the title object
                     # off would let Power BI auto-generate a field-name one under the card.
                     spark_title, show_title = None, False
+            sort_def = _sort_definition(ws, state, model_table, field_map)
             visuals.append(_visual_json(
                 vname, vtype, pos, state,
-                _sort_definition(ws, state, model_table, field_map),
+                sort_def,
                 filter_config=flag_fc,
                 title=spark_title, title_style=ws.get("title_style"),
                 show_title=show_title,
@@ -8447,10 +8516,11 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             # across the page band (no dashboard header row here, so each carries no title either --
             # the fan-out stays faithful to the one-pane-per-measure source layout).
             px, py, pw, ph = 40, 40, 880, 620
+            sort_def = _sort_definition(ws, state, model_table, field_map)
             tvis, trecs = _emit_measure_trellis(
                 ws, state, trellis_measures, px, py, pw, ph, 0,
                 page_name, ws["name"], model_table, field_map, vname,
-                _sort_definition(ws, state, model_table, field_map),
+                sort_def,
                 label_objects, data_point_objects, warnings)
             records += trecs
             visuals = (_inherit_flag_filters(tvis, flag_fc)
@@ -8472,9 +8542,10 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 records.append(card_rec)
                 pos = _position(40, 40 + card_h, 880, 620 - card_h)
                 spark_title, show_title = None, False
+        sort_def = _sort_definition(ws, state, model_table, field_map)
         main = _visual_json(
             vname, vtype, pos, state,
-            _sort_definition(ws, state, model_table, field_map),
+            sort_def,
             filter_config=flag_fc,
             title=spark_title, title_style=ws.get("title_style"),
             show_title=show_title,

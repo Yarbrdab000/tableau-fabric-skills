@@ -12,6 +12,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.37.0` -> `2.38.0`): make Tableau's "sort this dimension by a
+  measure" actually sort in Power BI.** Tableau's ordinary idiom sorts an axis by a measure that
+  is NOT on the shelf -- including the "Sort by" parameter pattern, where the whole point is that
+  a slicer selection reorders every chart. Only sorts whose measure happened to already be
+  projected were emitted, so that idiom silently shipped as an unsorted chart: the slicer existed,
+  the `SWITCH` measure existed, and nothing moved. Relaxing the guard is not the fix -- Power BI
+  accepts a `sortDefinition` on an unprojected field with no error, then ignores it while still
+  SUPPRESSING its own default sort, leaving the axis alphabetical (render-verified both ways
+  against Desktop). The sort-by measure is now bound into the visual's `Tooltips` well, so it
+  joins the query and the tooltip without drawing, and the sort is honoured. The rescue is scoped
+  to visual types that pair a Tooltips well with a category order (bar / column / line / area /
+  combo / ribbon / waterfall / pie / donut / treemap); a table / matrix / card / map still fails
+  closed and emits no sort. The measure-trellis fan-out now re-binds the sort per band -- each
+  band replaces `Y` with its own single measure, so a sort bound in the parent was unbound (and
+  therefore order-suppressing) in every other band, breaking the shared row alignment the strip
+  depends on. Measured on a real 164-visual workbook: sorts emitted 3 -> 14, one pre-existing
+  unhonourable sort repaired, 152 visuals byte-identical and no visual added, removed or otherwise
+  changed.
+
 - **tableau-migration (skill `2.36.0` -> `2.37.0`): make Tableau parameter-driven field swaps
   work per datasource island, and start them on the field Tableau started on.** A workbook
   whose dashboards are driven by a "show by" / "sort by" parameter rebuilt with blank charts,
