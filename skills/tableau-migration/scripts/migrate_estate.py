@@ -438,6 +438,30 @@ def _strip_brackets(name):
 _VIZ_ENTRY_POINTS = ("migrate_workbook", "migrate_twb_to_pbir", "build_pbir", "build_report")
 
 
+def _island_qualified_calc_name(caption, datasource, used):
+    """Island-qualified name for a repeat calc caption whose FORMULA differs, or ``None``.
+
+    Tableau scopes calculated fields per DATASOURCE, so one consolidated multi-datasource workbook
+    can legitimately declare the same caption twice with *different* formulas -- typically a
+    dashboard copied to a second datasource whose calc was then edited (a swap calc repointed at
+    that island's own parameter, an ``Age`` redefined as an LOD, ...). Collapsing those into one
+    flat name space keeps the first and silently hands every OTHER island's worksheets the wrong
+    formula: a wrong answer with no error, the worst failure class we ship.
+
+    The suffix mirrors the island tag ``combine_descriptors`` already puts on colliding TABLE names
+    (``pmdm__Program__c (Intake)``), so the same workbook reads the same way at every layer, and
+    ``twb_to_pbir`` can rebuild the key from a pill's own datasource caption.
+
+    Returns ``None`` when there is no datasource to name the repeat by (a worksheet-local
+    ``<datasource-dependencies>`` copy), or when the qualified name is already taken -- the caller
+    then drops the repeat exactly as before. Fail-closed: never invent an ambiguous second name.
+    """
+    if not (caption and datasource):
+        return None
+    name = f"{caption} ({datasource})"
+    return None if name.lower() in used else name
+
+
 def extract_calculations(xml_text, *, include_dimensions=False):
     """Pull measure calculated fields out of ``.tds`` / ``.twb`` XML.
 
@@ -454,6 +478,14 @@ def extract_calculations(xml_text, *, include_dimensions=False):
     formulas, caption-less fields, non-measure (dimension) calcs, and duplicate names are skipped
     and reported. Parsing is namespace-agnostic and tolerant of a leading BOM.
 
+    De-duplication is per ``(caption, formula)``, not per caption: a repeat of a caption ALREADY
+    seen with the SAME formula is skipped as a duplicate (the common case -- worksheet-local
+    ``<datasource-dependencies>`` copies of the same field), but a repeat whose formula DIFFERS is
+    a genuinely different calculation belonging to another datasource island and is kept under an
+    island-qualified name (``"<caption> (<datasource>)"``, see
+    :func:`_island_qualified_calc_name`). Without this the first island's formula silently answered
+    for every island. Repeats we cannot name by island fall back to the original drop.
+
     ``include_dimensions`` (opt-in, default off) changes nothing about the measure path: when set,
     dimension-role calcs are no longer dropped into ``skipped`` but collected into a third returned
     list and the return shape becomes ``(calcs, skipped, dim_calcs)`` -- each dim entry is
@@ -469,7 +501,11 @@ def extract_calculations(xml_text, *, include_dimensions=False):
     except ET.ParseError:
         return (calcs, skipped, dim_calcs) if include_dimensions else (calcs, skipped)
 
-    seen = set()
+    # caption.lower() -> {formula: emitted name}. Keyed by BOTH caption and formula so a repeat of
+    # the same calc collapses (as before) while a same-captioned calc with a DIFFERENT formula --
+    # another datasource island's own version -- survives under an island-qualified name.
+    seen = {}
+    used = set()  # every emitted name, lower-cased; keeps an island-qualified name unique
     # Map each <column> element (by object identity) to its owning datasource caption. In a
     # multi-datasource workbook the same caption means different things per datasource, so a calc's
     # home island must be recorded for the M field resolver to be scoped to it. ``root`` stays alive
@@ -482,6 +518,29 @@ def extract_calculations(xml_text, *, include_dimensions=False):
             continue
         for c in (x for x in ds_el.iter() if _local(x.tag) == "column"):
             col_ds.setdefault(id(c), ds_name)
+
+    def _claim(caption, formula, col_el):
+        """Reserve an emitted name for this calc, or ``None`` when it is a true duplicate.
+
+        First sighting of a caption keeps the caption verbatim (byte-identical to the previous
+        caption-only dedup). A repeat with the same formula is a duplicate. A repeat whose formula
+        differs is another island's calc and gets an island-qualified name when one is available.
+        """
+        low = caption.lower()
+        forms = seen.get(low)
+        if forms is None:
+            seen[low] = {formula: caption}
+            used.add(low)
+            return caption
+        if formula in forms:
+            return None
+        alt = _island_qualified_calc_name(caption, col_ds.get(id(col_el)), used)
+        if alt is None:
+            return None
+        forms[formula] = alt
+        used.add(alt.lower())
+        return alt
+
     for col in (e for e in root.iter() if _local(e.tag) == "column"):
         calc_el = next((c for c in list(col) if _local(c.tag) == "calculation"), None)
         if calc_el is None:
@@ -508,23 +567,27 @@ def extract_calculations(xml_text, *, include_dimensions=False):
             if not include_dimensions:
                 skipped.append({"name": caption, "reason": f"non-measure calculated field (role={role})"})
                 continue
-            if caption in seen:
+            emitted = _claim(caption, formula, col)
+            if emitted is None:
                 skipped.append({"name": caption, "reason": "duplicate calculated-field name"})
                 continue
-            seen.add(caption)
-            dim_entry = {"name": caption, "formula": formula, "role": role}
+            dim_entry = {"name": emitted, "formula": formula, "role": role}
             if internal_name and internal_name.lower() != caption.lower():
                 dim_entry["internal_name"] = internal_name
+            if emitted != caption:
+                dim_entry["base_name"] = caption
             dim_entry["datasource"] = col_ds.get(id(col))
             dim_calcs.append(dim_entry)
             continue
-        if caption in seen:
+        emitted = _claim(caption, formula, col)
+        if emitted is None:
             skipped.append({"name": caption, "reason": "duplicate calculated-field name"})
             continue
-        seen.add(caption)
-        entry = {"name": caption, "formula": formula}
+        entry = {"name": emitted, "formula": formula}
         if internal_name and internal_name.lower() != caption.lower():
             entry["internal_name"] = internal_name
+        if emitted != caption:
+            entry["base_name"] = caption
         entry["datasource"] = col_ds.get(id(col))
         # Author's explicit number format (currency/percent/precision) declared on the calc
         # <column @default-format>. Conservatively decoded (explicit c/n/p/* codes only; the
@@ -1183,6 +1246,34 @@ def _fp_swap_lookup(swap_specs):
     return lut
 
 
+def _ref_entity(field):
+    """Return the ``SourceRef`` entity of a PBIR projection field node, or ``None``."""
+    node = field if isinstance(field, dict) else {}
+    if "Aggregation" in node:
+        node = (node["Aggregation"] or {}).get("Expression", {}) or {}
+    inner = (node.get("Measure") or node.get("Column") or {}) if isinstance(node, dict) else {}
+    expr = (inner or {}).get("Expression") or {}
+    return ((expr.get("SourceRef") or {}).get("Entity")) if isinstance(expr, dict) else None
+
+
+def _fp_display_lookup(swap_specs):
+    """``{(entity_lower, display_col_lower): spec}`` for every convertible field-parameter swap.
+
+    Identifies a projection that names a field parameter's own DISPLAY column -- i.e. an axis the
+    report bound as if the parameter table were an ordinary dimension table. Only specs with at
+    least one resolvable candidate are indexed (an expansion needs a seed field). ``{}`` for
+    ``None``/empty specs, which keeps the no-swap path byte-identical.
+    """
+    lut = {}
+    for spec in (swap_specs or []):
+        if not (isinstance(spec, dict) and (spec.get("entries") or [])):
+            continue
+        table, col = spec.get("table_name"), spec.get("display_col")
+        if table and col:
+            lut.setdefault((table.lower(), col.lower()), spec)
+    return lut
+
+
 def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
     """Reconcile viz projections against the emitted model: REBIND a measure the model remodeled as
     a field parameter, else DROP a reference the model did not emit.
@@ -1205,6 +1296,17 @@ def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
     additive: with no ``swap_specs`` (or no matching swap) the reference falls through to the same
     drop path as before, so the no-swap result is byte-identical.
 
+    A projection that is VALID but names a field parameter's own DISPLAY column is EXPANDED here
+    for the same reason. A calc dimension the model remodeled into a field parameter resolves
+    through ``column_binding`` to ``'<param>'[<param>]``, which is a real column -- so it passes the
+    validity check and used to ship as a plain category axis. Power BI then groups by the
+    parameter's OPTION LABELS ("Program Name", "Owner", ...) and repeats the same total against
+    each: a silently wrong chart, not an error. The fix is the same expansion the measure rescue
+    already builds -- a seed projection on the parameter's first candidate field plus a sibling
+    ``fieldParameters`` binding -- which is what makes the axis actually swap. SLICERS are excluded:
+    a slicer bound to that display column IS the picker (``field_parameter_slicer``), and visuals
+    that already carry a ``fieldParameters`` block are skipped as before.
+
     Anything still unresolved is dropped (warn-never-wrong: drop rather than mis-bind); a visual that
     loses every projection is emptied to a placeholder zone so it never renders broken. Visuals that
     ALREADY encode a field parameter are skipped (a separately validated construct). Returns
@@ -1217,8 +1319,9 @@ def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
     if not (measures or columns):
         return report_parts, drops, rebinds  # no model object inventory -> do not risk false drops
     fp_lut = _fp_swap_lookup(swap_specs)
+    fp_disp = _fp_display_lookup(swap_specs)
     seed_fn = None
-    if fp_lut:  # only reach for the seed-projection builder when a rebind is actually possible
+    if fp_lut or fp_disp:  # only reach for the seed builder when a rebind/expansion is possible
         try:
             from . import twb_to_pbir as _tp
         except ImportError:
@@ -1227,8 +1330,11 @@ def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
             except ImportError:
                 _tp = None
         seed_fn = getattr(_tp, "_fp_seed_projection", None) if _tp else None
+        dflt_fn = getattr(_tp, "_fp_default_entry", None) if _tp else None
         if not callable(seed_fn):
-            fp_lut = {}  # cannot build a valid seed -> disable rebind, fall back to drop
+            fp_lut, fp_disp = {}, {}  # cannot build a valid seed -> disable both, fall back to drop
+        if not callable(dflt_fn):     # seed on the Tableau default when available, else branch 0
+            dflt_fn = lambda spec: ((spec or {}).get("entries") or [None])[0]
     for path, content in list((report_parts or {}).items()):
         if not (isinstance(content, str) and path.endswith("visual.json")):
             continue
@@ -1240,18 +1346,33 @@ def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
         qs = ((vis.get("query") or {}).get("queryState")) or {}
         if not qs or any(isinstance(s, dict) and s.get("fieldParameters") for s in qs.values()):
             continue
+        # A slicer bound to a field parameter's display column IS the picker, never an expansion.
+        is_slicer = "slicer" in str(vis.get("visualType") or "").lower()
         dropped, rebound = [], []
         for role, spec in list(qs.items()):
             if not isinstance(spec, dict):
                 continue
             kept, fp_binds = [], list(spec.get("fieldParameters") or [])
             for p in spec.get("projections", []):
-                name, kind = _ref_name_kind((p or {}).get("field") or {})
+                field = (p or {}).get("field") or {}
+                name, kind = _ref_name_kind(field)
                 low = name.lower() if isinstance(name, str) else None
                 ok = (low in measures if kind == "measure"
                       else low in columns if kind == "column"
                       else True)  # unknown ref shape -> keep (conservative)
                 if ok:
+                    ent = _ref_entity(field) if (kind == "column" and low and not is_slicer) else None
+                    disp = fp_disp.get((ent.lower(), low)) if (ent and seed_fn) else None
+                    if disp:  # a field parameter bound as a plain axis -> expand so it can swap
+                        fp_binds.append({
+                            "parameterExpr": {"Column": {
+                                "Expression": {"SourceRef": {"Entity": disp["table_name"]}},
+                                "Property": disp["display_col"]}},
+                            "index": len(kept), "length": 1})
+                        kept.append(seed_fn(dflt_fn(disp)))
+                        rebound.append(f"{role}:column {name!r} -> field parameter expansion "
+                                       f"{disp['table_name']}[{disp['display_col']}]")
+                        continue
                     kept.append(p)
                     continue
                 fp = fp_lut.get(low) if (kind == "measure" and low and seed_fn) else None
@@ -1261,7 +1382,7 @@ def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
                             "Expression": {"SourceRef": {"Entity": fp["table_name"]}},
                             "Property": fp["display_col"]}},
                         "index": len(kept), "length": 1})
-                    kept.append(seed_fn(fp["entries"][0]))
+                    kept.append(seed_fn(dflt_fn(fp)))
                     rebound.append(f"{role}:measure {name!r} -> field parameter "
                                    f"{fp['table_name']}[{fp['display_col']}]")
                 else:

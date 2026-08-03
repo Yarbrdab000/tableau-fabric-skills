@@ -299,6 +299,70 @@ def test_emit_uniquifies_table_name_against_existing():
     assert res["table_name"] == "Dim calc 1 2"
 
 
+# -- emission: default seed (Tableau's default selection drives the seeded slot) -------------
+def test_emit_field_parameter_default_index_selects_the_tableau_default_branch():
+    # an unselected PBI field parameter shows its SEED slot, so the seed must be the branch the
+    # Tableau parameter defaulted to -- not whichever branch happened to be authored first.
+    sw = P.detect_field_swap(
+        'case [Parameters].[p] when 1 then [Segment] when 2 then [Region] when 3 then [Sales] END',
+        role="dimension")
+    assert P.emit_field_parameter("D", sw, field_locator=_loc, used_names=set(),
+                                  default_key="2")["default_index"] == 1
+    assert P.emit_field_parameter("D", sw, field_locator=_loc, used_names=set(),
+                                  default_key="3")["default_index"] == 2
+    # numeric normalisation: "2.0" / 2 are the same selector as "2"
+    assert P.emit_field_parameter("D", sw, field_locator=_loc, used_names=set(),
+                                  default_key="2.0")["default_index"] == 1
+
+
+@pytest.mark.parametrize("default_key", [None, "", "9", "Segment"])
+def test_emit_field_parameter_default_index_falls_back_to_first_branch(default_key):
+    # absent / unmatched default -> the historical seed, so no existing workbook shifts.
+    sw = P.detect_field_swap(
+        'case [Parameters].[p] when 1 then [Segment] when 2 then [Region] END', role="dimension")
+    res = P.emit_field_parameter("D", sw, field_locator=_loc, used_names=set(),
+                                 default_key=default_key)
+    assert res["default_index"] == 0
+
+
+def test_emit_field_parameter_default_index_ignores_the_else_branch():
+    # an ELSE branch has no selector literal, so it can never BE the default match.
+    sw = P.detect_field_swap(
+        'if [Parameters].[p] = 1 then [Segment] else [Region] end', role="dimension")
+    res = P.emit_field_parameter("D", sw, field_locator=_loc, used_names=set(), default_key="1")
+    assert res["default_index"] == 0
+
+
+def test_emit_field_parameters_threads_per_controller_defaults():
+    calcs = [
+        {"name": "By Dim", "role": "dimension",
+         "formula": 'case [Parameters].[p] when 1 then [Segment] when 2 then [Region] END'},
+        {"name": "By Msr", "role": "measure",
+         "formula": 'case [Parameters].[q] when 1 then [Sales] when 2 then [Profit] END'},
+    ]
+    out = P.emit_field_parameters(calcs, field_locator=_loc, existing_tables=[],
+                                  defaults_by_controller={"p": "2"})
+    by_name = {s["calc_name"]: s for s in out["specs"]}
+    assert by_name["By Dim"]["default_index"] == 1   # controller p defaulted to branch 2
+    assert by_name["By Msr"]["default_index"] == 0   # controller q had no default -> unchanged
+
+
+def test_emit_field_parameters_without_defaults_is_unchanged():
+    calcs = [{"name": "By Dim", "role": "dimension",
+              "formula": 'case [Parameters].[p] when 1 then [Segment] when 2 then [Region] END'}]
+
+    def _norm(out):  # lineageTag / PBI_Id are freshly generated per call; compare everything else
+        import re as _re
+        return [(fn, _re.sub(r"(lineageTag: |PBI_Id = )[0-9a-fA-F-]+", r"\1X", t))
+                for fn, t in out["parts"]]
+
+    a = P.emit_field_parameters(calcs, field_locator=_loc, existing_tables=[])
+    b = P.emit_field_parameters(calcs, field_locator=_loc, existing_tables=[],
+                                defaults_by_controller={})
+    assert _norm(a) == _norm(b)
+    assert [s["default_index"] for s in a["specs"]] == [0]
+
+
 # -- orchestration: emit_field_parameters ---------------------------------------------------
 def test_emit_field_parameters_consumes_and_warns_on_dependency():
     calcs = [

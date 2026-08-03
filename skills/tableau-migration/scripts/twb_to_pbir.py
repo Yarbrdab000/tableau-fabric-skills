@@ -918,12 +918,32 @@ def _measure_binding_entries(measure_binding):
     return inner if isinstance(inner, dict) else measure_binding
 
 
-def _measure_binding_candidate_keys(field_id, base_id, caption, worksheet):
+def _island_binding_key(caption, island):
+    """``"<caption> (<island>)"`` -- the key a per-island calc is emitted under, or ``None``.
+
+    The model build (``migrate_estate._island_qualified_calc_name``) keeps a same-captioned calc
+    from a SECOND datasource island under this name, so a pill can find its OWN island's version
+    instead of silently binding to whichever island happened to be parsed first. Returns ``None``
+    unless both halves are present, and the key simply misses on a model that emitted no
+    island-qualified calc -- so single-island workbooks are byte-unchanged.
+    """
+    if not (caption and island):
+        return None
+    return f"{caption} ({island})"
+
+
+def _measure_binding_candidate_keys(field_id, base_id, caption, worksheet, island=None):
     """Candidate lookup keys in deterministic join priority (token first, never fuzzy):
-    pill instance token > bare calc id > ``worksheet|caption`` > caption. Mirrors the locked
-    contract so a translated calc binds by its stable token even when captions collide."""
+    island-qualified caption > pill instance token > bare calc id > ``worksheet|caption`` >
+    caption. Mirrors the locked contract so a translated calc binds by its stable token even when
+    captions collide.
+
+    The island-qualified caption outranks the token because two islands' copies of one calc can
+    share a Tableau internal name (a datasource duplicated inside the workbook), which makes the
+    token AMBIGUOUS while the island is exact. It is emitted only when the model actually kept a
+    per-island copy, so on every other workbook it misses and the historical order stands."""
     keys = []
-    for k in (field_id, base_id,
+    for k in (_island_binding_key(caption, island), field_id, base_id,
               (f"{worksheet}|{caption}" if worksheet and caption else None),
               caption):
         if k and k not in keys:
@@ -931,7 +951,7 @@ def _measure_binding_candidate_keys(field_id, base_id, caption, worksheet):
     return keys
 
 
-def _lookup_measure_binding(measure_binding, field_id, base_id, caption, worksheet):
+def _lookup_measure_binding(measure_binding, field_id, base_id, caption, worksheet, island=None):
     """Resolve a calc pill to its translated ``(entity, measure)`` model measure, or ``None``.
 
     Binds ONLY when a candidate key hits an entry whose ``status`` is bindable (translated /
@@ -943,7 +963,7 @@ def _lookup_measure_binding(measure_binding, field_id, base_id, caption, workshe
     entries = _measure_binding_entries(measure_binding)
     if not entries:
         return None
-    for key in _measure_binding_candidate_keys(field_id, base_id, caption, worksheet):
+    for key in _measure_binding_candidate_keys(field_id, base_id, caption, worksheet, island):
         entry = entries.get(key)
         if not isinstance(entry, dict):
             continue
@@ -980,18 +1000,24 @@ def _column_binding_entries(column_binding):
     return out
 
 
-def _lookup_column_binding(column_binding, field_id, base_id, caption, worksheet):
+def _lookup_column_binding(column_binding, field_id, base_id, caption, worksheet, island=None):
     """Resolve a calc DIMENSION pill to its model ``(table, column)``, or ``None``.
 
-    Tries candidate keys case-insensitively in a deterministic order (caption, trimmed caption,
-    bare calc id, pill instance token) and returns the first model-confirmed hit; a miss (or no
-    binding supplied) -> ``None`` so the caller degrades to the caption fallback + warns. A pure
-    consumer of the model-built manifest -- never a fuzzy/guessed match.
+    Tries candidate keys case-insensitively in a deterministic order (island-qualified caption,
+    caption, trimmed caption, bare calc id, pill instance token) and returns the first
+    model-confirmed hit; a miss (or no binding supplied) -> ``None`` so the caller degrades to the
+    caption fallback + warns. A pure consumer of the model-built manifest -- never a fuzzy/guessed
+    match.
+
+    The island-qualified caption is tried FIRST so a pill from a second datasource island binds to
+    its OWN version of a same-captioned calc (see ``_island_binding_key``). It misses on every
+    model that kept only one copy, leaving the historical order byte-unchanged.
     """
     entries = _column_binding_entries(column_binding)
     if not entries:
         return None
-    for key in (caption, (caption or "").strip(), base_id, field_id):
+    for key in (_island_binding_key(caption, island),
+                caption, (caption or "").strip(), base_id, field_id):
         if not key:
             continue
         hit = entries.get(str(key).lower())
@@ -1039,7 +1065,8 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
     if measure_binding:
         _mb_base = base_cols.get((ds, base_id)) or {}
         mb = _lookup_measure_binding(measure_binding, field_id, base_id,
-                                     _mb_base.get("caption"), worksheet)
+                                     _mb_base.get("caption"), worksheet,
+                                     island=ds_caption.get(ds))
         if mb is not None:
             m_entity, m_measure = mb
             # Did the model translate THIS PILL'S OWN table calc, or only the base field under it?
@@ -1100,7 +1127,8 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
     # category), never a measure.
     calc_is_axis = (is_calc and bound is None and role != "measure"
                     and deriv not in _AGG_FUNC)
-    calc_col = (_lookup_column_binding(column_binding, field_id, base_id, caption, worksheet)
+    calc_col = (_lookup_column_binding(column_binding, field_id, base_id, caption, worksheet,
+                                       island=ds_caption.get(ds))
                 if calc_is_axis else None)
 
     if bound:
@@ -7856,23 +7884,38 @@ def _fp_seed_projection(entry):
             "nativeQueryRef": label, "displayName": label}
 
 
+def _fp_default_entry(spec):
+    """The candidate a field-parameter slot should SEED with -- the controlling Tableau parameter's
+    default selection (``spec["default_index"]``), falling back to the first candidate.
+
+    An unselected Power BI field parameter shows its seed, so seeding on branch 0 rather than the
+    Tableau default silently opens every such visual on the wrong field. Bounds-checked, so a spec
+    without a ``default_index`` (or with a stale one) behaves exactly as before.
+    """
+    entries = (spec or {}).get("entries") or []
+    if not entries:
+        return None
+    idx = (spec or {}).get("default_index")
+    return entries[idx] if isinstance(idx, int) and 0 <= idx < len(entries) else entries[0]
+
+
 def field_parameter_table_visual(name, specs, position, *, visual_type=VT_TABLE):
     """A ``tableEx``/``pivotTable`` whose Values well EXPANDS a list of field parameters.
 
     ``specs`` is an ordered list of ``emit_field_parameters`` spec dicts
-    (``{table_name, display_col, entries:[{label, table, column, is_measure, order}, ...]}``). Each
-    spec contributes ONE seed projection (its first candidate) and ONE ``fieldParameters`` entry
-    binding that slot's projection index to the parameter's display column (``length`` 1). Slot
-    order follows ``specs`` order, so a 3-dim + 3-measure self-service table reproduces the customer
-    layout 1:1. Specs with no resolved entries are skipped.
+    (``{table_name, display_col, default_index, entries:[{label, table, column, is_measure, order}, ...]}``).
+    Each spec contributes ONE seed projection (its Tableau-default candidate) and ONE
+    ``fieldParameters`` entry binding that slot's projection index to the parameter's display column
+    (``length`` 1). Slot order follows ``specs`` order, so a 3-dim + 3-measure self-service table
+    reproduces the customer layout 1:1. Specs with no resolved entries are skipped.
     """
     projections, field_params = [], []
     for spec in specs or []:
-        entries = spec.get("entries") or []
-        if not entries:
+        seed = _fp_default_entry(spec)
+        if seed is None:
             continue
         idx = len(projections)
-        projections.append(_fp_seed_projection(entries[0]))
+        projections.append(_fp_seed_projection(seed))
         field_params.append({
             "parameterExpr": {"Column": {
                 "Expression": {"SourceRef": {"Entity": spec["table_name"]}},

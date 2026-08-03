@@ -2947,21 +2947,48 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     all_calcs = list(calcs or []) + list(dim_calcs or [])
     measure_names = [c.get("name") for c in (calcs or []) if c.get("name")]
     field_locator = field_locator_from_resolver(resolve, measure_names=measure_names)
+    # Island-scoped locator for field swaps -- the field-parameter peer of the ``resolve_for`` the
+    # measure and calculated-column paths already use. In a CONSOLIDATED workbook a swap branch's
+    # caption (e.g. ``Program Name``) is exposed by several island copies of the same physical table,
+    # so the pooled ``resolve`` fails closed on the collision, every branch is dropped, and the swap
+    # silently degrades to an untranslatable calc (a BLANK() column -> a blank visual). Scoping to the
+    # calc's home island resolves it exactly as the island's own author meant. ``_raw_scoped_resolver``
+    # returns None for an untagged calc / un-combined descriptor, so this is inert on the single-
+    # datasource path and ``emit_field_parameters`` falls back to the pooled locator.
+    _swap_locator_cache = {}
+    def _swap_locator_for(calc):
+        ds = (calc or {}).get("datasource")
+        if not ds:
+            return None
+        if ds not in _swap_locator_cache:
+            r = _raw_scoped_resolver(ds)
+            _swap_locator_cache[ds] = (
+                field_locator_from_resolver(r, measure_names=measure_names)
+                if r is not None else None)
+        return _swap_locator_cache[ds]
+
     label_aliases_by_controller = {}
+    defaults_by_controller = {}
     for p in (parameters or []):
         aliases = p.get("aliases") or {}
-        if not aliases:
+        default = p.get("default")
+        if not aliases and default is None:
             continue
         for key in (p.get("caption"), p.get("internal_name")):
             if not key:
                 continue
-            label_aliases_by_controller[key.strip().lower()] = aliases
-            label_aliases_by_controller[key.strip("[]").strip().lower()] = aliases
+            for k in (key.strip().lower(), key.strip("[]").strip().lower()):
+                if aliases:
+                    label_aliases_by_controller[k] = aliases
+                if default is not None:
+                    defaults_by_controller[k] = default
 
     fp = emit_field_parameters(
         all_calcs, field_locator=field_locator,
         used_names={n.lower() for n in table_names} | {"_measures"},
-        label_aliases_by_controller=label_aliases_by_controller)
+        label_aliases_by_controller=label_aliases_by_controller,
+        defaults_by_controller=defaults_by_controller,
+        field_locator_for=_swap_locator_for)
     consumed = fp["consumed"]
     consumed_lower = {c.lower() for c in consumed}
 

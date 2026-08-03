@@ -12,6 +12,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.36.0` -> `2.37.0`): make Tableau parameter-driven field swaps
+  work per datasource island, and start them on the field Tableau started on.** A workbook
+  whose dashboards are driven by a "show by" / "sort by" parameter rebuilt with blank charts,
+  no picker slicer, or -- worse -- a chart that silently grouped by the parameter's option
+  labels and repeated one total against each. Four independent defects, each of which produced
+  a wrong report rather than an error, are fixed:
+  - **Field swaps are now resolved with a per-island field locator.** Measures and calculated
+    columns already got a datasource-scoped resolver; field parameters were the one consumer
+    still using the pooled one, which fails closed whenever a caption is exposed by more than
+    one island copy of a table -- so every branch was dropped, the swap declined, and the calc
+    stubbed to a blank visual. Falls back to the pooled locator, so single-datasource workbooks
+    are byte-for-byte unchanged.
+  - **Calculated fields are now deduplicated per `(caption, formula)`, not per caption.**
+    Tableau scopes calculated fields to a datasource, so a consolidated workbook legitimately
+    holds several different calcs under one caption; the first island's formula silently
+    answered for all of them. A repeat whose formula differs is kept under an island-qualified
+    name (`"<caption> (<datasource>)"`), and the report side gained a matching highest-priority
+    binding key -- the Tableau internal name is ambiguous across duplicated datasources, the
+    island is exact. Identical repeats (the common worksheet-local copies) still collapse.
+  - **A field parameter bound to a dimension axis is now EXPANDED, not projected.** A plain
+    column projection on the parameter's display column makes Power BI group by the option
+    labels; the correct shape is a seed projection on a concrete field plus a sibling
+    `fieldParameters` block. Applied at the model/report reconciliation pass to charts only --
+    on a slicer that same projection IS the picker and is left untouched.
+  - **The seeded slot now honours the controlling parameter's default value.** An unselected
+    Power BI field parameter shows its seed, so seeding on whichever branch was authored first
+    opened every such visual on the wrong field (a chart titled "Program Name" rendering
+    Program Issue Area). Unmatched or absent defaults keep the previous seed.
+
 - **tableau-migration (skill `2.35.0` -> `2.36.0`): infer join cardinality instead of always
   emitting many-to-many, so `RELATED()` works.** Every relationship recovered from a Tableau
   object-graph "noodle" or physical join tree shipped as many-to-many, which is uniqueness-safe

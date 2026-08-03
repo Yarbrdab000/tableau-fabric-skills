@@ -862,7 +862,7 @@ class MeasureSynthesizer:
 
 
 def emit_field_parameter(display_name, swap, *, field_locator, used_names, label_aliases=None,
-                         measure_synth=None):
+                         measure_synth=None, default_key=None):
     """Build a Power BI field-parameter table for one Tableau swap calc.
 
     ``field_locator(field) -> (table, column, is_measure) | None`` resolves a bare Tableau field
@@ -873,8 +873,15 @@ def emit_field_parameter(display_name, swap, *, field_locator, used_names, label
     For a MEASURE-role swap, a candidate that resolves to a raw column is aggregated through a
     synthesized default-``SUM`` measure (via ``measure_synth``) so the swap collapses the visual to
     the selected grain instead of listing row-level values. Returns a dict
-    ``{ok, table_name, part_filename, tmdl, role, display_col, entries, measures, warnings}`` where
-    ``measures`` are the aggregating measures this swap created (to emit into ``_Measures``).
+    ``{ok, table_name, part_filename, tmdl, role, display_col, entries, default_index, measures,
+    warnings}`` where ``measures`` are the aggregating measures this swap created (to emit into
+    ``_Measures``).
+
+    ``default_key`` is the controlling Tableau parameter's DEFAULT value (e.g. ``"2"``). The branch
+    it selects becomes ``default_index`` -- the slot a visual seeds with, so an unselected field
+    parameter starts on the field Tableau started on instead of on whichever branch happened to be
+    written first. Unmatched / absent -> ``0`` (the historical seed), so this is byte-neutral until
+    a default is actually supplied.
     """
     warnings = []
     branches = swap.get("branches") or []
@@ -905,7 +912,7 @@ def emit_field_parameter(display_name, swap, *, field_locator, used_names, label
         else:
             label = raw
         label = _uniquify_label(label, used_labels, display_name, warnings)
-        resolved.append((label, table, col, bool(is_measure)))
+        resolved.append((label, table, col, bool(is_measure), raw))
 
     if len(resolved) < 2:
         used_names.discard(table_name.lower())
@@ -913,15 +920,19 @@ def emit_field_parameter(display_name, swap, *, field_locator, used_names, label
             f"field-swap '{display_name}': fewer than 2 branches resolved; not converted to a "
             f"field parameter (left for normal translation)")
         return {"ok": False, "table_name": None, "part_filename": None, "tmdl": None,
-                "role": role, "display_col": None, "entries": [], "measures": [],
-                "warnings": warnings}
+                "role": role, "display_col": None, "entries": [], "default_index": 0,
+                "measures": [], "warnings": warnings}
 
     # phase 2 -- build the NAMEOF refs; for a measure swap, point each raw-column candidate at a
     # synthesized aggregating measure (only now that the swap is confirmed convertible).
     synth = measure_synth if measure_synth is not None else MeasureSynthesizer()
     before = len(synth.definitions)
     entries, struct_entries = [], []
-    for order_i, (label, table, col, is_measure) in enumerate(resolved):
+    default_index = 0
+    default_norm = _canon_num_key(default_key) if default_key is not None else None
+    for order_i, (label, table, col, is_measure, raw) in enumerate(resolved):
+        if default_norm is not None and raw is not None and _canon_num_key(raw) == default_norm:
+            default_index = order_i
         if role == "measure" and not is_measure:
             e_table, e_col = synth.aggregate(table, col)
             e_is_measure = True
@@ -943,12 +954,14 @@ def emit_field_parameter(display_name, swap, *, field_locator, used_names, label
     return {"ok": True, "table_name": table_name,
             "part_filename": _safe_filename(table_name),
             "role": role, "display_col": table_name, "entries": struct_entries,
+            "default_index": default_index,
             "measures": measures_created,
             "tmdl": _field_param_table_tmdl(table_name, entries), "warnings": warnings}
 
 
 def emit_field_parameters(calcs, *, field_locator, used_names=None, existing_tables=None,
-                          label_aliases_by_controller=None):
+                          label_aliases_by_controller=None, field_locator_for=None,
+                          defaults_by_controller=None):
     """Detect every field-swap calc in ``calcs`` and emit a field-parameter table per swap.
 
     Returns ``{parts:[(filename, tmdl)], table_names:[...], consumed:set(names), warnings:[...]}``.
@@ -956,19 +969,34 @@ def emit_field_parameters(calcs, *, field_locator, used_names=None, existing_tab
     also translate them as measures/columns. A non-swap calc that references a consumed swap calc
     cannot use it as a scalar; that dependency is reported as a warning (the dependent will stub).
     ``used_names`` (a shared lowercased set) keeps table names unique across the whole model.
+
+    ``field_locator_for`` (optional, ``calc -> locator | None``) selects a PER-CALC locator, so a
+    swap authored in one datasource island of a consolidated workbook resolves its branch fields
+    against THAT island. It is the field-parameter peer of the ``resolve_for`` the measure and
+    calculated-column paths already take: in a multi-datasource model the same caption (``Program
+    Name``) is exposed by several island copies of a table, so the POOLED resolver fails closed on
+    the collision and every branch is dropped -- silently demoting a whole swap to an untranslatable
+    calc. Falls back to ``field_locator`` whenever the callback is absent or returns ``None``, so
+    the single-datasource path is byte-for-byte unchanged.
+
+    ``defaults_by_controller`` (optional, ``{controller_lower: default value}``) carries each
+    controlling Tableau parameter's DEFAULT selection, so the emitted spec records which candidate
+    a visual should seed with. Without it every swap seeds on its first branch, which is only the
+    Tableau default by coincidence.
     """
     used = used_names if used_names is not None else set()
     if used_names is None and existing_tables:
         for t in existing_tables:
             used.add((t or "").lower())
     label_aliases_by_controller = label_aliases_by_controller or {}
+    defaults_by_controller = defaults_by_controller or {}
 
     swaps, swap_names_lower = [], set()
     for c in (calcs or []):
         name = c.get("name") or c.get("caption")
         sw = detect_field_swap(c.get("formula") or "", role=(c.get("role") or "measure"))
         if sw and name:
-            swaps.append((name, sw))
+            swaps.append((name, sw, c))
             swap_names_lower.add(name.lower())
 
     warnings = []
@@ -994,10 +1022,17 @@ def emit_field_parameters(calcs, *, field_locator, used_names=None, existing_tab
     synth = MeasureSynthesizer(reserved_names=synth_reserved)
 
     parts, table_names, consumed, used_files, specs = [], [], set(), set(), []
-    for name, sw in swaps:
-        aliases = label_aliases_by_controller.get((sw.get("controller") or "").lower(), {})
-        res = emit_field_parameter(name, sw, field_locator=field_locator, used_names=used,
-                                   label_aliases=aliases, measure_synth=synth)
+    for name, sw, calc in swaps:
+        ctrl = (sw.get("controller") or "").lower()
+        aliases = label_aliases_by_controller.get(ctrl, {})
+        locator = field_locator
+        if field_locator_for is not None:
+            scoped = field_locator_for(calc)
+            if scoped is not None:
+                locator = scoped
+        res = emit_field_parameter(name, sw, field_locator=locator, used_names=used,
+                                   label_aliases=aliases, measure_synth=synth,
+                                   default_key=defaults_by_controller.get(ctrl))
         warnings.extend(res.get("warnings") or [])
         if not res.get("ok"):
             continue
@@ -1015,6 +1050,7 @@ def emit_field_parameters(calcs, *, field_locator, used_names=None, existing_tab
         specs.append({"calc_name": name, "table_name": res["table_name"],
                       "display_col": res["display_col"], "role": res.get("role"),
                       "controller": sw.get("controller"),
+                      "default_index": res.get("default_index") or 0,
                       "entries": res.get("entries") or []})
     return {"parts": parts, "table_names": table_names, "consumed": consumed,
             "specs": specs, "measures": synth.definitions, "warnings": warnings}
