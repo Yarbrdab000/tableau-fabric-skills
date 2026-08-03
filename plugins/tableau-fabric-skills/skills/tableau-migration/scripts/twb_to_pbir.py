@@ -2077,6 +2077,123 @@ def _route_measure_values(mark, locs, members, dummy_count, has_param_swap, stat
     return vt, "cols", note
 
 
+def _parse_hidden_axes(table, dims_rows, dims_cols, meas_rows, meas_cols):
+    """Which Power BI axes the Tableau author HID (``Show Header`` off).
+
+    Tableau serialises a hidden header/axis as ``format[@attr='display'][@value='false']`` under
+    ``table/style/style-rule``. Two spellings occur and BOTH mean "this shelf's axis is hidden":
+
+    * ``@scope='rows'|'cols'`` -- the shelf named directly (typically under ``style-rule[@element
+      ='axis']``, i.e. the continuous measure axis).
+    * ``@field='<field-id>'`` -- the shelf identified by the field it carries (typically the
+      discrete header, serialised under ``style-rule[@element='label']``).
+
+    Either way the scope is mapped to a Power BI axis STRUCTURALLY by the role of the field(s) on
+    that shelf, reusing :func:`_parse_axis_titles`' rule: a shelf holding only dimensions drives
+    ``categoryAxis``; a shelf holding only measures drives ``valueAxis``. A mixed/empty shelf, an
+    unknown field, or any ``value`` other than ``false`` is skipped -- we never guess which axis a
+    hide belongs to, and never invent a hide the author did not write.
+
+    This matters well beyond cosmetics: dashboards built as tiled composites (a KPI card whose
+    bar strip, dot row and month labels are SEPARATE worksheets stacked in one panel) hide every
+    axis so the pieces align. Rendering those axes both adds furniture Tableau never showed and
+    steals the plot area, which is what forces a scrollbar into a small tile.
+
+    Returns a set of PBIR axis names to hide (subset of ``{"categoryAxis", "valueAxis"}``).
+    """
+    if table is None:
+        return set()
+    style = _first(table, "style")
+    if style is None:
+        return set()
+
+    def _role(dims, meas):
+        if dims and not meas:
+            return "categoryAxis"
+        if meas and not dims:
+            return "valueAxis"
+        return None
+
+    scope_axis = {
+        "cols": _role(dims_cols, meas_cols),
+        "rows": _role(dims_rows, meas_rows),
+    }
+    # field-reference -> shelf, so a hide written against a field resolves to the same role
+    # mapping. A key that would map to BOTH shelves is poisoned rather than resolved first-wins:
+    # picking one would be a guess, and this pass never guesses which axis a hide belongs to.
+    field_scope = {}
+    for scope, fields in (("cols", list(dims_cols or []) + list(meas_cols or [])),
+                          ("rows", list(dims_rows or []) + list(meas_rows or []))):
+        for f in fields:
+            for key in _field_ref_keys(f):
+                if field_scope.get(key, scope) != scope:
+                    field_scope[key] = None
+                else:
+                    field_scope[key] = scope
+
+    hidden = set()
+    for rule in _children_local(style, "style-rule"):
+        for fmt in _children_local(rule, "format"):
+            if (fmt.get("attr") or "") != "display":
+                continue
+            if (fmt.get("value") or "").strip().lower() != "false":
+                continue
+            scope = fmt.get("scope")
+            if scope not in ("rows", "cols"):
+                scope = None
+                for key in _field_ref_keys_from_text(fmt.get("field")):
+                    if key in field_scope:
+                        scope = field_scope[key]
+                        break
+            if scope is None:
+                continue
+            axis = scope_axis.get(scope)
+            if axis is not None:
+                hidden.add(axis)
+    return hidden
+
+
+# A Tableau field reference is written as a bracketed path, e.g. ``[federated.abc].[mn:date:ok]``.
+_FIELD_SEG_RE = re.compile(r"\[([^\[\]]+)\]")
+
+
+def _field_ref_keys(field):
+    """Match keys for a parsed shelf entry (tolerant of the str / dict shapes in use).
+
+    A parsed shelf entry is a dict carrying BOTH an ``instance`` (the shelf-level spelling, e.g.
+    ``mn:date:ok`` -- what a style rule names) and a ``field_id`` (the underlying column, e.g.
+    ``date``). Both are offered as keys so a rule written against either spelling resolves.
+    """
+    if isinstance(field, str):
+        return _field_ref_keys_from_text(field)
+    keys = set()
+    if isinstance(field, dict):
+        for key in ("instance", "field_id", "id", "column", "field", "name"):
+            v = field.get(key)
+            if isinstance(v, str) and v.strip():
+                keys.update(_field_ref_keys_from_text(v))
+    return keys
+
+
+def _field_ref_keys_from_text(text):
+    """Match keys for a field reference as written in the workbook XML.
+
+    Yields the reference verbatim AND its final bracketed segment, so the qualified form the XML
+    uses (``[federated.abc].[mn:date:ok]``) matches the unqualified ``instance`` a parsed shelf
+    entry carries. Returns an empty set for a missing / blank reference.
+    """
+    if not isinstance(text, str):
+        return set()
+    text = text.strip()
+    if not text:
+        return set()
+    keys = {text}
+    segs = _FIELD_SEG_RE.findall(text)
+    if segs:
+        keys.add(segs[-1].strip())
+    return keys
+
+
 # -- worksheet title (structural text only; per-run styling is Tier-2) ----------
 _TITLE_DYNAMIC_RE = re.compile(r"<[^<>]+>")
 
@@ -3537,8 +3654,10 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     }
 
     axis_titles = {}
+    axis_hidden = set()
     if visual_type in _AXIS_TITLE_TYPES:
         axis_titles = _parse_axis_titles(table, dims_rows, dims_cols, meas_rows, meas_cols)
+        axis_hidden = _parse_hidden_axes(table, dims_rows, dims_cols, meas_rows, meas_cols)
 
     # Continuous colour scale on a worksheet's mark colour encoding. On a table / matrix it becomes a
     # cell heat scale (a PBIR ``backColor`` FillRule via ``_conditional_format``); on a cartesian
@@ -3612,6 +3731,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "filter_plate_fill": filter_plate_fill,
         "grid_styles": grid_styles,
         "axis_titles": axis_titles,
+        "axis_hidden": sorted(axis_hidden),
         "color_gradient": color_gradient,
         "mark_colors": mark_colors,
         "measure_colors": measure_colors,
@@ -5643,25 +5763,32 @@ def _sort_definition(ws, state, model_table, field_map):
             "isDefaultSort": False}
 
 
-def _axis_objects(axis_titles):
+def _axis_objects(axis_titles, axis_hidden=None):
     """Build the data-plane ``visual.objects`` categoryAxis/valueAxis entries for author-overridden
-    axis titles. Each axis object is ``[{"properties": {...}}]`` (no ``selector`` needed for a
-    global override). A blanked title (``hide``) emits ``showAxisTitle:false``; a custom caption
-    emits ``titleText`` (single-quoted semantic-query literal) + ``showAxisTitle:true``. Shape
-    verified against multiple real MS PBIR visual.json files + the PBIR enumerations reference.
+    axis titles AND author-hidden axes. Each axis object is ``[{"properties": {...}}]`` (no
+    ``selector`` needed for a global override). A blanked title (``hide``) emits
+    ``showAxisTitle:false``; a custom caption emits ``titleText`` (single-quoted semantic-query
+    literal) + ``showAxisTitle:true``. An axis the author HID (``Show Header`` off, see
+    :func:`_parse_hidden_axes`) emits ``show:false``, which suppresses the whole axis -- labels,
+    ticks and title -- and returns the plot area to the marks. ``show`` and the title properties
+    are independent, so an axis can be hidden with or without a title override and vice versa.
+    Shape verified against multiple real MS PBIR visual.json files + the PBIR enumerations
+    reference.
     """
     objects = {}
+    hidden = set(axis_hidden or ())
     for axis in ("categoryAxis", "valueAxis"):
-        spec = axis_titles.get(axis)
-        if not spec:
-            continue
+        spec = (axis_titles or {}).get(axis)
         props = {}
-        if spec.get("hide"):
-            props["showAxisTitle"] = {"expr": {"Literal": {"Value": "false"}}}
-        elif spec.get("text"):
-            props["titleText"] = {
-                "expr": {"Literal": {"Value": _semantic_string_literal(spec["text"])}}}
-            props["showAxisTitle"] = {"expr": {"Literal": {"Value": "true"}}}
+        if axis in hidden:
+            props["show"] = {"expr": {"Literal": {"Value": "false"}}}
+        if spec:
+            if spec.get("hide"):
+                props["showAxisTitle"] = {"expr": {"Literal": {"Value": "false"}}}
+            elif spec.get("text"):
+                props["titleText"] = {
+                    "expr": {"Literal": {"Value": _semantic_string_literal(spec["text"])}}}
+                props["showAxisTitle"] = {"expr": {"Literal": {"Value": "true"}}}
         if props:
             objects[axis] = [{"properties": props}]
     return objects
@@ -6862,6 +6989,7 @@ def _lollipop_objects(ws):
 
 def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  filter_config=None, title=None, title_style=None, axis_titles=None,
+                 axis_hidden=None,
                  value_objects=None,
                  data_point_objects=None, label_objects=None, legend_objects=None,
                  shape_objects=None, card_label_objects=None, analytics_objects=None,
@@ -6873,13 +7001,13 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
         if sort_definition:
             visual["query"]["sortDefinition"] = sort_definition
     visual["drillFilterOtherVisuals"] = True
-    # Author-overridden axis-title captions (Tier-1 structural labels): the data-plane
-    # ``visual.objects.categoryAxis`` / ``valueAxis`` entries. Shape verified against multiple real
-    # MS PBIR visual.json files + the PBIR enumerations reference (``titleText`` = single-quoted
-    # semantic-query literal; ``showAxisTitle`` = quoted boolean). Only the TITLE is touched -- the
-    # whole-axis ``show`` toggle is deliberately left alone (a different property).
-    if axis_titles:
-        axis_objects = _axis_objects(axis_titles)
+    # Author-overridden axis-title captions AND author-hidden axes (Tier-1 structural): the
+    # data-plane ``visual.objects.categoryAxis`` / ``valueAxis`` entries. Shape verified against
+    # multiple real MS PBIR visual.json files + the PBIR enumerations reference (``titleText`` =
+    # single-quoted semantic-query literal; ``showAxisTitle`` / ``show`` = quoted boolean). An axis
+    # is hidden ONLY where the Tableau author turned its header off (see _parse_hidden_axes).
+    if axis_titles or axis_hidden:
+        axis_objects = _axis_objects(axis_titles, axis_hidden)
         if axis_objects:
             visual["objects"] = axis_objects
     # Background colour scale (Tier-2, lifted for tables/matrices): the data-plane
@@ -8391,6 +8519,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 title=spark_title, title_style=ws.get("title_style"),
                 show_title=show_title,
                 axis_titles=ws.get("axis_titles"),
+                axis_hidden=ws.get("axis_hidden"),
                 value_objects=value_objects, data_point_objects=data_point_objects,
                 label_objects=label_objects, legend_objects=legend_objects,
                 shape_objects=shape_objects, card_label_objects=card_label_objects,
@@ -8617,6 +8746,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             title=spark_title, title_style=ws.get("title_style"),
             show_title=show_title,
             axis_titles=ws.get("axis_titles"),
+            axis_hidden=ws.get("axis_hidden"),
             value_objects=value_objects, data_point_objects=data_point_objects,
             label_objects=label_objects, shape_objects=shape_objects,
             card_label_objects=card_label_objects,

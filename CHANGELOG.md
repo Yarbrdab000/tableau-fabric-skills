@@ -12,6 +12,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.42.0` -> `2.43.0`): honour author-HIDDEN axes.** Tableau
+  serialises `Show Header` off explicitly, as
+  `worksheet/table/style/style-rule/format[@attr='display'][@value='false']`, in two
+  spellings -- one naming the shelf (`@scope='rows'|'cols'`, typically the continuous measure
+  axis) and one naming the field the shelf carries (`@field='[ds].[instance]'`, typically the
+  discrete header). Both are now parsed and mapped to the PBIR `categoryAxis` / `valueAxis`
+  `show: false` toggle. The shelf is mapped to an axis STRUCTURALLY by the role of the fields
+  on it (only-dimensions -> category, only-measures -> value), reusing the axis-title rule; a
+  mixed or empty shelf, an unknown field, a key that appears on BOTH shelves, or any `value`
+  other than `false` is skipped -- the pass never guesses which axis a hide belongs to and
+  never invents a hide the author did not write. This is load-bearing rather than cosmetic:
+  high-design dashboards are tiled composites (a KPI card's bar strip, dot row and month
+  labels are SEPARATE worksheets stacked in one panel) that hide every axis so the pieces
+  align, so rendering those axes both adds furniture Tableau never showed and steals plot
+  area -- which is what forces a scrollbar into a small tile. Measured on a 107-visual
+  workbook: 58 of 84 chart visuals carry an author hide (49 on both axes), and the bar strips
+  now fill their tiles. Render-verified in Power BI Desktop 2.157 (full refresh passes).
+  35 new tests (`tests/test_hidden_axes.py`); 9/9 mutants killed.
+
 - **tableau-migration (skill `2.41.0` -> `2.42.0`): inline a parameter-only dimension calc into the measures that consume it.** A dimension calc whose body reaches only Tableau parameters -- e.g. `MAKEDATE([Parameters].[Year Parameter],[Parameters].[Parameter 1],1)` -- is deliberately NOT emitted as a calculated column, because `SELECTEDVALUE` evaluated in refresh-time row context would freeze at the parameter's default. That correct refusal left the calc with no model column, so every measure referencing it raised `unresolved/ambiguous field` and stubbed, cascading through their dependents. `_try_inline_calc` previously admitted only a pure `bool` body; it now also admits a ROW-INVARIANT body of any type -- one whose sub-parse registers no physical table, making it constant per row and therefore indistinguishable from a column holding that constant. The body is spliced into the consuming MEASURE, where `SELECTEDVALUE` reads live slicer context and tracks the parameter exactly as Tableau does. Row-VARIANT non-boolean bodies still fail closed, and the sub-parse's tables are merged back so cross-table inlines still trip the single-table guards. Reached only where the resolver already returned `None`, so it can convert a stub into a translation but can never alter output that already worked. Measured on a 276-calc workbook: coverage 31.9% -> 74.6% (stubs 188 -> 70), with the purely cascaded `type_or_shape_mismatch` bucket going 66 -> 0; render-verified in Power BI Desktop, where month-over-month KPI deltas that read a constant `0.0%` now show live values.
 
 - **tableau-migration (skill `2.40.0` -> `2.41.0`): a Tableau dashboard background plate is
