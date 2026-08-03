@@ -1723,9 +1723,10 @@ class _Parser:
             if _is_number_of_records(cap):
                 return ("1", "number")
             # A bare reference to a dimension calc the model did NOT emit as a real column -- e.g. a
-            # parameter-driven date-window boolean the column path stubbed (no param_resolver in
-            # column mode). Inline its body here (parsed row-level) so the consuming measure can
-            # translate; fail closed to the original raise when it can't be inlined faithfully.
+            # parameter-driven date-window boolean the column path stubbed, or a parameter-only date
+            # anchor (no param_resolver in column mode, by design). Inline its body here (parsed
+            # row-level) so the consuming measure can translate; fail closed to the original raise
+            # when it can't be inlined faithfully.
             inlined = self._try_inline_calc(cap)
             if inlined is not None:
                 return inlined
@@ -1764,9 +1765,11 @@ class _Parser:
 
     def _try_inline_calc(self, cap):
         # Inline a referenced dimension calc's BODY at row level so a MEASURE consuming a stubbed
-        # pure-boolean dimension calc -- e.g. a parameter-driven date-window filter used inside a
-        # COUNTD(IF ...) -- can translate. Returns (dax, "bool") only when the referenced calc parses
-        # in COLUMN mode as a single, fully-consumed boolean expression; None otherwise (fail closed).
+        # dimension calc -- e.g. a parameter-driven date-window filter used inside a COUNTD(IF ...),
+        # or a parameter-only date anchor compared against a date column -- can translate. Returns
+        # (dax, dtype) only when the referenced calc parses in COLUMN mode as a single, fully-consumed
+        # expression that is EITHER a pure boolean (safe as a filter predicate) OR row-invariant
+        # (constant per row, so faithful anywhere); None otherwise (fail closed).
         key = (cap or "").strip().lower()
         formula = self.inline_calcs.get(key)
         if not formula:
@@ -1777,22 +1780,42 @@ class _Parser:
             toks = _tokenize(formula)
         except _CalcError:
             return None
-        # Nested parser sharing this parser's resolvers/param_resolver + the SAME tables_used set, so
-        # the inlined field's table lands in the caller's table set. A cross-table inline therefore
-        # trips the consumer's single-table guard (e.g. _countd_if) and fails closed for free.
-        sub = _Parser(toks, self.resolver, self.tables_used, mode="column",
+        # Nested parser sharing this parser's resolvers/param_resolver. Its tables land in a FRESH
+        # set so row-invariance is measurable in ISOLATION -- comparing against the caller's set
+        # cannot detect it, because the referenced table is usually already in use by the consuming
+        # formula. The set is merged back unconditionally in the ``finally`` below, which reproduces
+        # the historical shared-set behavior exactly (a cross-table inline still trips the consumer's
+        # single-table guard, e.g. _countd_if, and a partial parse still contributes what it touched).
+        sub_tables = set()
+        sub = _Parser(toks, self.resolver, sub_tables, mode="column",
                       param_resolver=self.param_resolver, measure_refs=self.measure_refs,
                       known_tables=self.known_tables, inline_calcs=self.inline_calcs)
         sub._inline_stack = self._inline_stack | {key}
         try:
-            node = sub._expr()
-        except _CalcError:
+            try:
+                node = sub._expr()
+            except _CalcError:
+                return None
+            if sub.pos != len(sub.toks):
+                return None  # trailing tokens -> not a single clean expression
+            if node[1] == "bool":
+                return (f"({node[0]})", "bool")
+            # Non-boolean body: safe to inline iff it is ROW-INVARIANT -- it referenced no physical
+            # table, so the value is constant across every row and splicing it in is exactly
+            # equivalent to referencing a column that holds that constant (the same reasoning the
+            # _INLINE_REF_SENTINEL path in _row_field already applies to row-invariant foundation
+            # calcs). This is what lets a parameter-only dimension calc -- e.g. MAKEDATE over two
+            # [Parameters], which the calculated-COLUMN path CORRECTLY refuses to emit because
+            # SELECTEDVALUE would freeze at its default in refresh-time row context -- reach the
+            # consuming MEASURE, where SELECTEDVALUE reads live slicer context and tracks the
+            # parameter just as Tableau does. A row-VARIANT non-boolean body still fails closed:
+            # inlining it would duplicate row-level work under an aggregate whose semantics we
+            # have not proven.
+            if not sub_tables:
+                return (f"({node[0]})", node[1])
             return None
-        if sub.pos != len(sub.toks):
-            return None  # trailing tokens -> not a single clean expression
-        if node[1] != "bool":
-            return None  # only a pure row-level boolean is safe to inline into a filter predicate
-        return (f"({node[0]})", "bool")
+        finally:
+            self.tables_used.update(sub_tables)
 
     def _qualified_ref(self, parts, *, allow_param=False):
         # Tableau qualified reference [A].[B] (parameter, datasource-qualified, or blend field).
