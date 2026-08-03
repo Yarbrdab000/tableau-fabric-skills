@@ -37,10 +37,12 @@ try:  # package or scripts-on-path
         emit_table_tmdl_m,
         extract_bundled_flatfile,
         m_partition_review_reason,
+        make_csv_unique_fn,
         extract_calcs,
         parse_tds,
         reconcile_flatfile_headers,
         read_flatfile_headers,
+        resolve_relationship_cardinality,
         workbook_datasources,
         AmbiguousDatasourceError,
     )
@@ -83,10 +85,12 @@ except ImportError:
         emit_table_tmdl_m,
         extract_bundled_flatfile,
         m_partition_review_reason,
+        make_csv_unique_fn,
         extract_calcs,
         parse_tds,
         reconcile_flatfile_headers,
         read_flatfile_headers,
+        resolve_relationship_cardinality,
         workbook_datasources,
         AmbiguousDatasourceError,
     )
@@ -3434,6 +3438,16 @@ def assemble_local_import_model(descriptor, *, model_name, table_csv_paths, calc
     # Prune each relation's columns to what its CSV physically holds (drop phantoms, dedupe twins,
     # alias-remap) so the emitted TMDL + Csv.Document type-transform never reference a missing header.
     new_relations, column_reconcile = _reconcile_local_csv_columns(new_relations, matched)
+
+    # With the data materialized, MEASURE each join's "one" side instead of inferring it from column
+    # names -- this settles keys no naming rule could ever recognise (``SKU``, ``Email``) and, just as
+    # importantly, demotes a column merely NAMED ``Id`` that turns out to be non-unique, which Power
+    # BI would otherwise reject on first refresh. Any table/column the CSVs do not cover measures as
+    # unknown, leaving the data-free verdict from :func:`parse_tds` standing.
+    filt_rels = resolve_relationship_cardinality(
+        filt_rels,
+        unique_fn=make_csv_unique_fn({m["table"]: m["csv_path"] for m in matched}),
+    )
 
     local_desc = {
         **descriptor,

@@ -12,7 +12,9 @@ from connection_to_m import (
     escape_m_string,
     extract_bundled_flatfile,
     m_partition_review_reason,
+    make_csv_unique_fn,
     parse_tds,
+    resolve_relationship_cardinality,
     tableau_type_to_tmdl,
 )
 from connection_to_m import _deescape_custom_sql
@@ -1209,8 +1211,117 @@ def test_parse_physical_join_recovers_relationships_from_clauses():
         ("Orders", "CustomerId", "Customer", "Id"),
         ("Orders", "ManagerId", "Manager", "Id"),
     }
-    # a physical join is uniqueness-agnostic -> emitted many_to_many (crash-proof), like the noodle.
-    assert all(r["cardinality"] == "many_to_many" for r in d["relationships"])
+    # Each predicate's identity side is recognised from names alone (no data), so the join is
+    # emitted many-to-one with the key on `to` -- which is what makes RELATED() legal from the
+    # fact side. See the abstain/override cases below for when this deliberately does NOT fire.
+    assert all(r["cardinality"] == "many_to_one" for r in d["relationships"])
+
+
+# -- relationship cardinality ladder -------------------------------------------
+def _rel(from_table, from_col, to_table, to_col):
+    return {"from_table": from_table, "from_col": from_col,
+            "to_table": to_table, "to_col": to_col, "cardinality": "many_to_many"}
+
+
+def test_identity_side_is_moved_onto_to_even_when_authored_first():
+    """Tableau does not pin the key to either operand position, so orientation is normalised."""
+    # authored key-FIRST: [Contact].[Id] = [Assessment].[ClientId]
+    out = resolve_relationship_cardinality([_rel("Contact", "Id", "Assessment", "ClientRef")])
+    assert len(out) == 1
+    r = out[0]
+    assert (r["from_table"], r["from_col"]) == ("Assessment", "ClientRef")
+    assert (r["to_table"], r["to_col"]) == ("Contact", "Id")
+    assert r["cardinality"] == "many_to_one"
+
+
+def test_join_with_no_identity_column_on_either_side_stays_many_to_many():
+    """Neither operand names a key -> abstain, keeping the crash-proof translation."""
+    out = resolve_relationship_cardinality(
+        [_rel("Engagement", "ContactRef", "Engagement2", "ContactRef")])
+    assert out[0]["cardinality"] == "many_to_many"
+    # operands are left exactly as authored when we abstain
+    assert (out[0]["from_table"], out[0]["to_table"]) == ("Engagement", "Engagement2")
+
+
+def test_join_with_identity_columns_on_both_sides_stays_many_to_many():
+    """A key-to-key (1:1-looking) join is ambiguous -> abstain rather than guess a direction."""
+    out = resolve_relationship_cardinality([_rel("Contact", "Id", "Customer", "Id")])
+    assert out[0]["cardinality"] == "many_to_many"
+
+
+def test_foreign_key_named_after_another_table_is_not_read_as_its_own_identity():
+    """``User[ContactId]`` names Contact, not User, so Contact[Id] is correctly the one side."""
+    out = resolve_relationship_cardinality([_rel("Contact", "Id", "User", "ContactId")])
+    assert out[0]["to_table"] == "Contact" and out[0]["cardinality"] == "many_to_one"
+
+
+def test_measured_uniqueness_promotes_a_key_no_name_rule_could_recognise():
+    """The whole point of the data rung: a key called ``SKU`` is invisible to naming."""
+    naming_only = resolve_relationship_cardinality([_rel("Sales", "ProductSku", "Product", "SKU")])
+    assert naming_only[0]["cardinality"] == "many_to_many"      # names alone cannot tell
+
+    def unique_fn(table, column):
+        return (table, column) == ("Product", "SKU")
+
+    measured = resolve_relationship_cardinality(
+        [_rel("Sales", "ProductSku", "Product", "SKU")], unique_fn=unique_fn)
+    assert measured[0]["cardinality"] == "many_to_one"
+    assert (measured[0]["to_table"], measured[0]["to_col"]) == ("Product", "SKU")
+
+
+def test_measurement_overrides_naming_when_an_id_column_is_not_actually_unique():
+    """A column merely NAMED Id that is measurably non-unique must NOT become many-to-one."""
+    def unique_fn(table, column):
+        return False if (table, column) == ("Contact", "Id") else None
+
+    out = resolve_relationship_cardinality(
+        [_rel("Assessment", "ClientRef", "Contact", "Id")], unique_fn=unique_fn)
+    assert out[0]["cardinality"] == "many_to_many"
+
+
+def test_measured_key_on_the_from_side_is_swapped_onto_to():
+    def unique_fn(table, column):
+        return (table, column) == ("Product", "SKU")
+
+    out = resolve_relationship_cardinality(
+        [_rel("Product", "SKU", "Sales", "ProductSku")], unique_fn=unique_fn)
+    assert (out[0]["to_table"], out[0]["to_col"]) == ("Product", "SKU")
+    assert out[0]["cardinality"] == "many_to_one"
+
+
+def test_unique_fn_that_raises_or_is_unknown_falls_back_to_naming():
+    def boom(table, column):
+        raise RuntimeError("no credentials")
+
+    out = resolve_relationship_cardinality([_rel("Assessment", "ClientRef", "Contact", "Id")],
+                                           unique_fn=boom)
+    assert out[0]["cardinality"] == "many_to_one"       # naming still carries it
+
+
+def test_explicit_non_many_to_many_cardinality_passes_through_untouched():
+    r = _rel("Sales", "OrderDate", "Date", "Date")
+    r["cardinality"] = "many_to_one"
+    r["join_on_date_behavior"] = "datePartOnly"
+    out = resolve_relationship_cardinality([r])
+    assert out[0]["from_table"] == "Sales" and out[0]["to_table"] == "Date"
+    assert out[0]["join_on_date_behavior"] == "datePartOnly"
+
+
+def test_make_csv_unique_fn_measures_real_files_and_admits_ignorance(tmp_path):
+    uniq = tmp_path / "u.csv"
+    uniq.write_text("Id,Name\n1,a\n2,b\n3,c\n", encoding="utf-8")
+    dupe = tmp_path / "d.csv"
+    dupe.write_text("ClientRef,V\nx,1\nx,2\n", encoding="utf-8")
+    blank = tmp_path / "b.csv"
+    blank.write_text("Id,V\n1,a\n,b\n", encoding="utf-8")
+
+    fn = make_csv_unique_fn({"Contact": str(uniq), "Assessment": str(dupe), "Blank": str(blank)})
+    assert fn("Contact", "Id") is True
+    assert fn("contact", "id") is True                  # case-insensitive
+    assert fn("Assessment", "ClientRef") is False
+    assert fn("Blank", "Id") is False                   # a blank key fails PBI's check too
+    assert fn("Contact", "NoSuchColumn") is None        # unknown, not a guess
+    assert fn("NoSuchTable", "Id") is None
 
 
 def test_parse_excel_collection_yields_independent_deduped_tables():

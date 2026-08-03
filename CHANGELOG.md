@@ -12,6 +12,27 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.35.0` -> `2.36.0`): infer join cardinality instead of always
+  emitting many-to-many, so `RELATED()` works.** Every relationship recovered from a Tableau
+  object-graph "noodle" or physical join tree shipped as many-to-many, which is uniqueness-safe
+  but makes `RELATED()` illegal -- calculated columns and measures that look a value up across
+  the join failed with "either doesn't exist or doesn't have a relationship to any table
+  available in the current context" (23 of 24 relationships in one real Salesforce workbook).
+  The "one" side is now resolved by a ladder, strongest evidence first: **measured uniqueness**
+  over the materialized table CSVs (`make_csv_unique_fn`), which is independent of naming and so
+  recognises a key called `SKU` or `Email`; then **identity-column naming**
+  (`Id`/`RowID`/`<Table>Id`), the data-free fallback that keeps a credential-less live or
+  DirectQuery datasource working; then **abstain**, keeping the crash-proof many-to-many.
+  Measurement overrides naming in both directions, so a column merely *named* `Id` that is
+  measurably non-unique is demoted rather than rejected by Power BI on first refresh.
+  Orientation is normalised at the same time -- Tableau does not pin the key to either operand
+  position, so the one side is swapped onto `toColumn`, giving every consumer the invariant
+  "`to` is the lookup side" (this was also why the post-deploy upgrader, which probes only
+  `toColumn`, could never fix half of them). Measured on the reporting workbook: many-to-many
+  39 -> 1 (the single remaining one a genuine foreign-key-to-foreign-key join), a full refresh
+  passes -- Power BI itself validating all 38 targets are unique -- and the previously-erroring
+  Assessments visuals render, with `Count of Contacts with Assessment` evaluating to 895,
+  matching the distinct client count in the source data.
 - **tableau-migration (skill `2.34.0` → `2.35.0`): every visual now states its title — Power BI can
   no longer invent one.** The 2.33.0 show/hide fix covered two cases (`show_title is False` → state
   hidden; a resolvable caption → state it) but had no `else`, so a visual with neither an explicit
