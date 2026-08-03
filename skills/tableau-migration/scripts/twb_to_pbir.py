@@ -6881,6 +6881,19 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
                 "show": {"expr": {"Literal": {"Value": "false"}}},
             }}],
         }
+    else:
+        # Neither an explicit hide NOR a resolvable caption. Leaving the container silent here is
+        # the one outcome that is never faithful: Power BI's absent-value default is a SHOWN,
+        # auto-generated field-name caption ("Sum of Quantity by Name"), so silence renders a title
+        # the source never authored -- and, when a caption textbox was already emitted for the zone,
+        # renders it twice. There is no title text to state, so state the only other thing that is
+        # true: no title. This makes the container's title state total -- every visual this function
+        # builds now says show=true|false, never nothing -- so a future path that forgets to pass
+        # ``show_title`` degrades to "no title" instead of silently inheriting Power BI's caption.
+        visual["visualContainerObjects"] = {
+            "title": [{"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}],
+            "subTitle": [{"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}],
+        }
     # Font/formatting fidelity (Tier-2, resolved from the Tableau <style> cascade): per-channel
     # format objects (columnHeaders/values/... for grids; categoryAxis/valueAxis for axes). Each
     # channel's "properties" dict may carry BOTH font props (_font_style_props) AND a fill (backColor,
@@ -7657,6 +7670,14 @@ def _image_visual(name, position, item_name):
             "PackageType": 1,
             "ItemName": item_name,
         }}}}}]},
+        # A Tableau dashboard image object carries no caption, and Power BI's absent-value default
+        # for a container title is a SHOWN auto-generated one -- on an image that renders as a stray
+        # caption bar above the artwork, shrinking it. This constructor bypasses ``_visual_json``, so
+        # it states the same "no title" that every other visual now states explicitly.
+        "visualContainerObjects": {
+            "title": [{"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}],
+            "subTitle": [{"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}],
+        },
         "drillFilterOtherVisuals": True,
     }
     return {"$schema": SCHEMA_VISUAL, "name": name, "position": position, "visual": visual}

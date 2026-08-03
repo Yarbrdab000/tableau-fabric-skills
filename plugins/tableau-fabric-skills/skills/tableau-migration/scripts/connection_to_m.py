@@ -1189,6 +1189,176 @@ def _equality_operands(relationship):
     return kids[0].get("op"), kids[1].get("op")
 
 
+# -- data-free "one"-side inference for join predicates ------------------------
+# A Tableau join predicate never records cardinality, and we cannot probe the data to find out:
+# a live/DirectQuery datasource is routinely migrated without any database credential. So the
+# "one" side has to be recovered from NAMES alone, and the cost of being wrong is asymmetric --
+# a wrong many-to-one is rejected by Power BI on first refresh and cancels the whole relationship
+# batch, while a missed upgrade merely leaves the faithful many-to-many. The rule below is
+# therefore deliberately narrow and ABSTAINS unless exactly one operand is unambiguously its own
+# table's identity column.
+
+_GENERIC_IDENTITY_COLUMNS = frozenset({"id", "rowid", "oid", "guid", "uid", "objectid"})
+_IDENTITY_SUFFIXES = ("id", "key", "guid", "uid", "pk")
+
+
+def _looks_like_identity_column(table, column):
+    """True if ``column`` is unambiguously ``table``'s own identity (primary-key) column.
+
+    Two accepted forms, both judged on names only (never on data):
+      * a generic row identifier -- ``Id``, ``RowID``, ``OID``, ``GUID``, ``UID``, ``ObjectId``;
+      * the column named after ITS OWN table -- ``CustomerId``/``Customer_Key`` on ``Customer``.
+
+    The table-qualified form is what makes this safe in the common case: a FOREIGN key such as
+    ``User[ContactId]`` names a DIFFERENT table, so it does not read as ``User``'s identity and
+    the predicate ``Contact[Id] = User[ContactId]`` resolves to the correct side. Comparison is
+    case- and separator-insensitive, and a trailing disambiguating suffix on the table display
+    name (``Contact (Assessments)`` -> ``Contact``) is ignored.
+
+    Weak, non-identity-implying names (``Code``, ``No``, ``Number``) are deliberately NOT accepted:
+    ``Product[ProductCode]`` is routinely non-unique, and a false positive here costs a failed
+    refresh whereas a false negative costs nothing but a many-to-many.
+    """
+    canon = re.sub(r"[^a-z0-9]", "", str(column or "").strip().lower())
+    if not canon:
+        return False
+    if canon in _GENERIC_IDENTITY_COLUMNS:
+        return True
+    owner = re.sub(r"\s*\([^)]*\)\s*$", "", str(table or "").strip())
+    owner = re.sub(r"[^a-z0-9]", "", owner.lower())
+    if not owner:
+        return False
+    return any(canon == owner + suffix for suffix in _IDENTITY_SUFFIXES)
+
+
+def _orient_relationship_by_identity(from_table, from_col, to_table, to_col):
+    """Orient a join so the identity ("one") side is the ``to`` side, and report its cardinality.
+
+    Returns ``(from_table, from_col, to_table, to_col, cardinality)``. When exactly one operand is
+    its table's identity column (see :func:`_looks_like_identity_column`) the join is emitted
+    ``many_to_one`` with that operand as ``to`` -- swapping the authored operand order when needed,
+    because Tableau does not pin the key to either position (``Contact[Id] = Assessment[Client]``
+    and ``Assessment[PE] = ProgramEngagement[Id]`` both occur in one workbook). Normalising here is
+    what makes ``RELATED()`` legal from the fact side and gives every downstream consumer a single
+    invariant: ``to`` is the lookup side.
+
+    When BOTH operands look like identities (a 1:1 key-to-key join) or NEITHER does, the function
+    abstains and returns the operands untouched as ``many_to_many`` -- the crash-proof translation.
+    """
+    from_is_key = _looks_like_identity_column(from_table, from_col)
+    to_is_key = _looks_like_identity_column(to_table, to_col)
+    if to_is_key and not from_is_key:
+        return from_table, from_col, to_table, to_col, "many_to_one"
+    if from_is_key and not to_is_key:
+        return to_table, to_col, from_table, from_col, "many_to_one"
+    return from_table, from_col, to_table, to_col, "many_to_many"
+
+
+def make_csv_unique_fn(table_csv_paths):
+    """Build a ``unique_fn(table, column) -> True | False | None`` over materialized table CSVs.
+
+    ``table_csv_paths`` maps a model table display name to the CSV that table's data was landed to
+    (the ``.hyper``-to-CSV / bundled-flat-file materialization the import path already performs).
+    Answers are cached per ``(table, column)``. Returns ``None`` -- never a guess -- when the table
+    has no CSV, the column is absent from its header, or the file cannot be read, so a caller can
+    tell "not unique" apart from "could not tell".
+
+    A key is reported unique only when every row carries a distinct, NON-EMPTY value: Power BI
+    rejects a many-to-one whose target contains a blank as readily as one containing a duplicate.
+    """
+    paths = {str(k).lower(): v for k, v in (table_csv_paths or {}).items()}
+    cache = {}
+
+    def unique_fn(table, column):
+        import os as _os
+        import csv as _csv
+        key = (str(table or "").lower(), str(column or "").lower())
+        if key in cache:
+            return cache[key]
+        verdict = None
+        path = paths.get(key[0])
+        if path and _os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8-sig", newline="") as fh:
+                    reader = _csv.reader(fh)
+                    header = next(reader, None) or []
+                    idx = next((i for i, h in enumerate(header)
+                                if str(h).strip().lower() == key[1]), None)
+                    if idx is not None:
+                        seen, rows, ok = set(), 0, True
+                        for row in reader:
+                            rows += 1
+                            val = row[idx].strip() if idx < len(row) else ""
+                            if not val or val in seen:
+                                ok = False
+                                break
+                            seen.add(val)
+                        verdict = ok if rows else None
+            except Exception:
+                verdict = None
+        cache[key] = verdict
+        return verdict
+
+    return unique_fn
+
+
+def resolve_relationship_cardinality(rels, unique_fn=None):
+    """Decide each relationship's cardinality and orient its "one" side onto ``to``.
+
+    Tableau records NO cardinality for a join (verified absent from every asset in our corpus), and
+    the data often cannot be consulted -- a live/DirectQuery datasource is routinely migrated with no
+    database credential at all. So evidence is applied as a ladder, strongest first, and the rung
+    that fires is whichever is actually available:
+
+    1. **Measured uniqueness** -- ``unique_fn(table, column) -> True | False | None``, supplied by
+       the caller when the data was materialized (see :func:`make_csv_unique_fn`). Definitive and
+       INDEPENDENT OF NAMING, so it recognises a key called ``SKU``, ``Email`` or ``AccountNumber``
+       that no name rule could ever spot.
+    2. **Identity-column naming** (:func:`_looks_like_identity_column`) -- the data-free fallback, so
+       a credential-less live datasource still gets a usable model.
+    3. **Abstain** -- keep the faithful, crash-proof many-to-many.
+
+    Measurement OVERRIDES naming in both directions: a column merely NAMED ``Id`` that is measurably
+    non-unique stays many-to-many, which makes the pair strictly safer than the name rule alone.
+    Only a definitive ``True`` promotes; ``False`` and ``None`` never do.
+
+    Returns a NEW list (inputs untouched); relationships carrying an explicit non-``many_to_many``
+    cardinality (e.g. the generated Date joins) pass through unchanged.
+    """
+    resolved = []
+    for r in rels:
+        if r.get("cardinality") not in (None, "many_to_many"):
+            resolved.append(dict(r))
+            continue
+        ft, fc = r.get("from_table"), r.get("from_col")
+        tt, tc = r.get("to_table"), r.get("to_col")
+
+        def measured(table, column):
+            if unique_fn is None:
+                return None
+            try:
+                return unique_fn(table, column)
+            except Exception:
+                return None
+
+        from_u, to_u = measured(ft, fc), measured(tt, tc)
+        if to_u is True:
+            pair, card = (ft, fc, tt, tc), "many_to_one"
+        elif from_u is True:
+            pair, card = (tt, tc, ft, fc), "many_to_one"          # swap: keys belong on `to`
+        else:
+            n_ft, n_fc, n_tt, n_tc, card = _orient_relationship_by_identity(ft, fc, tt, tc)
+            pair = (n_ft, n_fc, n_tt, n_tc)
+            # Naming proposed a "one" side that measurement DISPROVES -> refuse the upgrade.
+            if card == "many_to_one" and measured(n_tt, n_tc) is False:
+                pair, card = (ft, fc, tt, tc), "many_to_many"
+        out = dict(r)
+        out["from_table"], out["from_col"], out["to_table"], out["to_col"] = pair
+        out["cardinality"] = card
+        resolved.append(out)
+    return resolved
+
+
 def _extract_relationships(datasource, relations):
     """Parse ``<object-graph><relationships>`` into ``[{from_table, from_col, to_table, to_col}]``.
 
@@ -1525,6 +1695,10 @@ def parse_tds(xml_text, select=None):
             _rel_seen.add(key)
             relationships.append(r)
     relationship_warnings = list(relationship_warnings) + join_rel_warnings
+    # Decide each join's cardinality and put its "one" side on `to`. Data-free here (parse_tds is a
+    # pure metadata parser); a caller holding materialized data can refine the result by re-running
+    # `resolve_relationship_cardinality` with a `unique_fn`.
+    relationships = resolve_relationship_cardinality(relationships)
     # Prune the hidden physical schema down to what the datasource actually uses (visible columns +
     # calc-referenced + join-key hidden columns kept, flagged isHidden). Runs AFTER relationships are
     # fully merged so every join key is resolved against the FULL column set before any column is
