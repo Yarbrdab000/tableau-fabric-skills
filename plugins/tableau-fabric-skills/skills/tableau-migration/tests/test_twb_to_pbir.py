@@ -24,6 +24,11 @@ from twb_to_pbir import (
     _DATE_EXACT_DERIVATIONS,
     _INTEGER_DATE_PART_COLUMNS,
     _SORT_TOOLTIP_VTYPES,
+    _Z_BACKDROP,
+    _Z_CAPTION,
+    _Z_CONTENT,
+    _Z_OVERLAY,
+    _Z_SLICER,
     _apply_grow_to_fit,
     _apply_formula_table_calc_chain,
     _apply_override,
@@ -8542,21 +8547,21 @@ def test_v2_8_deoverlap_return_contract():
     # page -> a grown height AND the caption lifted clear of the content.
 
     # (a) no caption at all -> early return page_h, positions byte-identical
-    a1 = _v28_stack(0, 0, 0, 1000, 500)
-    a2 = _v28_stack(0, 0, 500, 1000, 500)
+    a1 = _v28_stack(_Z_CONTENT, 0, 0, 1000, 500)
+    a2 = _v28_stack(_Z_CONTENT, 0, 500, 1000, 500)
     assert _deoverlap_captions([a1, a2], 1000, 1000) == 1000
     assert (a1["position"]["y"], a2["position"]["y"]) == (0, 500)
 
     # (b) a caption in a clear band (no overlap) -> gate returns page_h, caption unmoved
-    anchor = _v28_stack(0, 0, 0, 1000, 500)
-    clear_cap = _v28_stack(900, 0, 600, 200, 30, vt="textbox")
+    anchor = _v28_stack(_Z_CONTENT, 0, 0, 1000, 500)
+    clear_cap = _v28_stack(_Z_CAPTION, 0, 600, 200, 30, vt="textbox")
     assert _deoverlap_captions([anchor, clear_cap], 1000, 1000) == 1000
     assert clear_cap["position"]["y"] == 600
 
     # (c) a caption stuck on the lower of two stacked charts, no free strip -> grow + lift clear
-    top = _v28_stack(0, 0, 0, 1000, 500)
-    bot = _v28_stack(0, 0, 500, 1000, 500)
-    stuck_cap = _v28_stack(900, 0, 520, 1000, 30, vt="textbox")
+    top = _v28_stack(_Z_CONTENT, 0, 0, 1000, 500)
+    bot = _v28_stack(_Z_CONTENT, 0, 500, 1000, 500)
+    stuck_cap = _v28_stack(_Z_CAPTION, 0, 520, 1000, 30, vt="textbox")
 
     def _r(v):
         p = v["position"]

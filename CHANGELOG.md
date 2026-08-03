@@ -12,6 +12,29 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.40.0` -> `2.41.0`): a Tableau dashboard background plate is
+  rebuilt as a layer BENEATH the charts, not painted over them.** Tableau draws dashboard zones
+  in document order, so the same `bitmap` zone is both a full-canvas design plate (written
+  first, meant to sit behind the sheets) and a decorative overlay (written last: a corner logo,
+  a chevron, a toggled help panel). The emitter placed every image on top, which hid every
+  worksheet on a designed dashboard behind its own artwork -- a page that looked pixel-perfect
+  and showed no data. Neither a `floating` flag nor coverage ratio separates the two cases
+  (measured on one real workbook: plate 1.000, help panel 0.652 -- and a help panel can be the
+  larger of the two); document position does, so each image zone now carries its paint ordinal
+  and each dashboard its first-worksheet ordinal, and only an image proven to precede ALL
+  content is demoted. An image interleaved between two sheets stays on top (PBIR carries one `z`
+  per visual, so fail-safe beats symmetrical). The PBIR stacking scheme is now named and
+  non-negative -- backdrop `0` < content `100` < slicer `101` < caption `900` < banner `1000` <
+  overlay `1100`: Power BI Desktop honours a negative `z` for ordering but does not PAINT the
+  visual, so a plate at `z=-100` stops occluding the charts and simultaneously disappears. The
+  backdrop is also excluded from the caption tidy's obstacle set and from the page-height
+  measurement, since it is the page's canvas rather than its content: a full-canvas plate
+  otherwise leaves no clear band anywhere (silently disabling the tidy on exactly the elaborate
+  dashboards that need it) and a plate scaled a few pixels proud of the authored canvas
+  otherwise inflated the page and pushed real content off-screen (one workbook's pages emitted
+  at 997/1123/1024px against an authored 950). Verified by rendering in Power BI Desktop, not by
+  reading JSON. Adds `tests/test_dashboard_image_layering.py` (18 tests, 14/14 mutants killed).
+
 - **tableau-migration (skill `2.39.0` -> `2.40.0`): build a model for an extracted datasource
   whose live relations carry no column metadata.** Tableau rewrites an extracted datasource's
   `<metadata-record>`s to describe the `.hyper` it built, filing them all under the extract's own

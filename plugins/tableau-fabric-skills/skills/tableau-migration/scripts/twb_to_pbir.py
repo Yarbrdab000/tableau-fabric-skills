@@ -3834,6 +3834,15 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
     text_objects = []
     image_zones = []
     seen_images = set()
+    # Tableau paints dashboard zones in DOCUMENT ORDER: a zone written earlier is drawn first and so
+    # sits BENEATH everything written after it. That single fact separates the two opposite roles a
+    # dashboard image plays -- a full-canvas background PLATE (written before the worksheets, so the
+    # sheets draw on top of it) versus a decorative OVERLAY such as a corner logo or a toggled help
+    # panel (written after them, so it covers them). Both are the same ``bitmap`` zone type and are
+    # otherwise indistinguishable, so the walk records each image's paint ordinal here and the
+    # emitter compares it against the first worksheet's. See ``_image_z``.
+    zone_ord = 0
+    first_ws_ord = None
     ext_w = ext_h = 0.0
     # Every captured item below additively records ``zone_id`` -- the source zone's ``id`` attribute,
     # the same key ``zone_tree`` stores on each node and ``layout_solve`` keys its solved rects by.
@@ -3846,6 +3855,7 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
     for zone in _findall_local(db, "zone"):
         if zone in device_zones:
             continue
+        zone_ord += 1
         x, y = _zone_num(zone, "x"), _zone_num(zone, "y")
         w, h = _zone_num(zone, "w"), _zone_num(zone, "h")
         if None not in (x, y, w, h) and w > 0 and h > 0:
@@ -3959,6 +3969,7 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
                                 "kind": "image" if ztype == "bitmap" else "button",
                                 "image": ref, "x": x, "y": y, "w": w, "h": h,
                                 "url": zone.get("url"),
+                                "paint_ord": zone_ord,
                             })
                     continue
         zname = zone.get("name")
@@ -3976,6 +3987,8 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
             continue
         if None in (x, y, w, h) or w <= 0 or h <= 0:
             continue
+        if first_ws_ord is None:
+            first_ws_ord = zone_ord
         zones.append({"worksheet": zname, "zone_id": zone.get("id"),
                       # Tableau writes ``show-title`` ONLY when the author turns the title OFF, so an
                       # absent attribute means shown. Captured per ZONE, not per worksheet: the same
@@ -3998,6 +4011,9 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
             "filter_zones": filter_zones,
             "text_objects": text_objects,
             "image_zones": image_zones,
+            # Paint ordinal of the first worksheet zone, or None when the dashboard has no worksheet
+            # at all. Every image whose ``paint_ord`` is below this was written BENEATH the sheets.
+            "first_ws_ord": first_ws_ord,
             "title_banner": title_banner,
             # The solved layout for this dashboard, or None under the legacy engine / on any solve
             # failure. Built HERE because this is the only place the source <dashboard> element is in
@@ -7461,9 +7477,58 @@ def _slicer_json(name, field, position, model_table, field_map, *, mode=None, wa
     return out
 
 
-def _position(x, y, w, h, z=0, tab=0):
+# ---------------------------------------------------------------------------------------------
+# PBIR stacking scheme. Power BI paints overlapping visuals in ascending ``z``. Two constraints
+# were established by RENDERING (Desktop 2.157), not by reading the schema:
+#
+#   * the schema puts no minimum on ``z`` and Desktop honours a negative value for ORDERING -- but
+#     it does not PAINT the visual at all. A background plate at ``z=-100`` correctly stopped
+#     occluding the charts and simultaneously became invisible, losing the whole authored design.
+#     Every layer therefore has to be >= 0;
+#   * a Tableau background plate has to sit strictly BELOW worksheet content, so content cannot
+#     stay on the natural floor of 0. The whole stack is lifted to leave room underneath it.
+#
+# The layers are named (rather than spelled as literals at each call site) because two later passes
+# SELECT by ``z`` -- the slicer reflow picks out content, the caption tidy picks out captions -- and
+# an unnamed renumber silently changes which visuals those passes act on.
+_Z_BACKDROP = 0     # background image plate: painted before the first worksheet zone
+_Z_CONTENT = 100    # worksheets, tables, cards, tiled text objects
+_Z_SLICER = 101     # surfaced parameter / filter controls
+_Z_CAPTION = 900    # floating caption textbox
+_Z_BANNER = 1000    # dashboard title banner
+_Z_OVERLAY = 1100   # decorative overlay image: logo, icon, toggled help panel
+
+
+def _position(x, y, w, h, z=_Z_CONTENT, tab=0):
     return {"x": round(x, 2), "y": round(y, 2), "z": z,
             "width": round(w, 2), "height": round(h, 2), "tabOrder": tab}
+
+
+def _image_z(image_zone, first_ws_ord):
+    """Which layer a dashboard image belongs on, from Tableau's own paint order.
+
+    Tableau draws dashboard zones in DOCUMENT ORDER, so a zone written earlier sits beneath every
+    zone written after it. Authors exploit this in two opposite ways with the SAME ``bitmap`` zone
+    type: a full-canvas background PLATE (the pre-rendered card frames / header band / sidebar an
+    author designs in Figma and drops behind the sheets) is written FIRST, while a decorative
+    OVERLAY -- a corner logo, an icon, a toggled help panel -- is written LAST so it covers content.
+
+    Nothing about the zone itself distinguishes them: both are ``bitmap``, neither is marked
+    floating, and size does not decide it either (a help panel can be large, a background can be
+    inset). Assuming "image == decoration on top", as a naive rebuild does, silently paints the
+    background plate over every chart on the page and produces a dashboard that looks perfect and
+    shows no data. Position in the document is the author's actual declaration of intent, so it is
+    what we read.
+
+    Falls back to the overlay layer when the dashboard has no worksheet to order against (nothing
+    can be occluded, and a lone image is decoration), which keeps every image-only page byte-stable.
+    """
+    if first_ws_ord is None:
+        return _Z_OVERLAY
+    ordinal = image_zone.get("paint_ord")
+    if ordinal is None:
+        return _Z_OVERLAY
+    return _Z_BACKDROP if ordinal < first_ws_ord else _Z_OVERLAY
 
 
 def _zone_pad_inset(zone):
@@ -7693,7 +7758,7 @@ def _caption_only_textbox_visual(ws, zone, ref_w, ref_h, name, tab=0):
     blank band on the dashboard (the "a thin view doesn't generate at all" defect). Emit its resolved
     caption (``caption_only_text``) as a plain textbox scaled to the zone with the caption-content
     floor (``_TEXTBOX_MIN_W/H`` -- never the 40px chart floor, so a thin bar is not inflated), at the
-    normal tiled z-order (an anchor, NOT a floating ``z=900`` caption, so the v2-2 de-overlap pass
+    normal tiled z-order (an anchor, NOT a floating caption, so the v2-2 de-overlap pass
     leaves it in its own reserved band). Styling is intentionally minimal (default body font, no
     fill) -- completeness first; honouring the bar's authored fill/font is a later refinement.
     Returns ``None`` when there is no caption text to show (an all-token caption that resolved empty),
@@ -8048,7 +8113,7 @@ def build_field_parameter_page(parts, specs, *, page_name="pageSelfService",
         sx = 8 + i * (slot_w + gap)
         sname = _sanitize(f"fpslicer-{page_name}-{i}-{spec['table_name']}")
         visuals.append((sname, field_parameter_slicer(
-            sname, spec, _position(sx, sy, slot_w, sh, z=1, tab=i + 1))))
+            sname, spec, _position(sx, sy, slot_w, sh, z=_Z_SLICER, tab=i + 1))))
 
     for vname, vjson in visuals:
         parts[f"{base}/visuals/{vname}/visual.json"] = _dumps(vjson)
@@ -8372,11 +8437,11 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             bx, by, bw, bh = _scale_zone(banner, ref_w, ref_h)
             visuals.append(_banner_textbox_visual(
                 _sanitize(f"v-{page_name}-banner"),
-                _position(bx, by, bw, bh, z=1000, tab=0),
+                _position(bx, by, bw, bh, z=_Z_BANNER, tab=0),
                 banner))
         # General text objects: every OTHER captured dashboard text zone (section-header caption bars
         # + fill-less instruction/metric lines) rebuilds as its own textbox at its authored position.
-        # ``z=900`` sits below the banner (1000) and images (1100) but above worksheet content, so a
+        # The caption layer sits below the banner and overlay images but above worksheet content, so a
         # caption bar layered over a matrix stays on top. The title banner is already de-duped out of
         # this list upstream, so it is never drawn twice. Empty list -> nothing added (never-regress).
         for j, tob in enumerate(db.get("text_objects") or []):
@@ -8389,7 +8454,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             tx, ty, tw, th = _scale_zone(tob, ref_w, ref_h, min_w=_TEXTBOX_MIN_W, min_h=_tmin_h)
             visuals.append(_text_object_textbox_visual(
                 _sanitize("v-%s-text-%d" % (page_name, j)),
-                _position(tx, ty, tw, th, z=900, tab=len(visuals) + 1),
+                _position(tx, ty, tw, th, z=_Z_CAPTION, tab=len(visuals) + 1),
                 tob))
         # Shown-state reflow: if the slicers we surfaced (a hidden/collapsed Tableau filter band) now
         # collide with a worksheet zone authored at its hidden-state position, push the sheets below the
@@ -8399,7 +8464,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         # Dashboard image / button objects: place each packaged PNG (logo, export/filter/info icon) as
         # a positioned image visual at its own zone geometry. Added AFTER the reflow so a top-corner
         # image is never shoved by the slicer-band compaction (it is decoration, not worksheet
-        # content). ``z=1100`` keeps it above the title banner (z=1000) so a logo overlapping the band
+        # content). ``_image_z`` routes each one to the backdrop or the overlay layer from Tableau's
+        # own paint order; an overlay sits above the title banner so a logo overlapping the band
         # renders on top. An image whose bytes were not packaged is skipped with an honest warning; a
         # click-through URL (a linked logo/help icon) is noted -- the Tier-1 rebuild places the image
         # faithfully but does not recreate the hyperlink action.
@@ -8415,7 +8481,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             ix, iy, iw, ih = _scale_zone(iz, ref_w, ref_h)
             visuals.append(_image_visual(
                 _sanitize("v-%s-img-%s" % (page_name, iz.get("id") or item)),
-                _position(ix, iy, iw, ih, z=1100, tab=len(visuals) + 1),
+                _position(ix, iy, iw, ih, z=_image_z(iz, db.get("first_ws_ord")),
+                          tab=len(visuals) + 1),
                 item))
             if iz.get("url"):
                 warnings.append(_warn(
@@ -8427,11 +8494,11 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             warnings.append(_warn("dashboard", db["name"],
                                   "no supported visuals on this dashboard"))
             continue
-        # Tidy pass (v2-2 / v2-8): relocate any floating caption textbox (z=900) that Tableau floated
+        # Tidy pass (v2-2 / v2-8): relocate any floating caption textbox that Tableau floated
         # on top of the content it labels into a clear band (prefer directly above the anchor); on a
         # packed page with no clear strip, OPEN a band by pushing content down (v2-8) and grow the
         # page to keep it in-bounds. Gated to a no-op on a page with no caption<->anchor overlap, so
-        # cleanly tiled dashboards are byte-identical. Runs last, after images (z=1100) are placed, so
+        # cleanly tiled dashboards are byte-identical. Runs last, after the images are placed, so
         # every anchor is final. The page is FitToPage, so a taller canvas just rescales to the viewport.
         _grown_h = _deoverlap_captions(visuals, _page_w(), _page_h())
         if _grown_h and _grown_h > _page_h():
@@ -8727,7 +8794,7 @@ def _emit_dashboard_slicers(ws_list, page_name, model_table, field_map, filter_z
     for e in entries:
         vname = _sanitize(f"slicer-{page_name}-{e['i']}-{e['f']['property']}")
         visuals.append(_slicer_json(
-            vname, e["f"], _position(e["x"], e["y"], e["w"], e["h"], z=1, tab=100 + e["i"]),
+            vname, e["f"], _position(e["x"], e["y"], e["w"], e["h"], z=_Z_SLICER, tab=100 + e["i"]),
             model_table, field_map, mode=e["mode"], warnings=warnings))
     return visuals
 
@@ -8753,7 +8820,7 @@ def _emit_slicers(ws_list, page_name, model_table, field_map, warnings=None, sho
             break
         vname = _sanitize(f"slicer-{page_name}-{i}-{f['property']}")
         visuals.append(_slicer_json(
-            vname, f, _position(PAGE_WIDTH - 220, y, 200, 100, z=1, tab=100 + i),
+            vname, f, _position(PAGE_WIDTH - 220, y, 200, 100, z=_Z_SLICER, tab=100 + i),
             model_table, field_map, warnings=warnings))
     return visuals
 
@@ -8789,7 +8856,7 @@ def _emit_param_control_slicers(controls, db_name, page_name, ref_w, ref_h, warn
         # so map the captured mode (defaulting to the compact Dropdown Tableau itself defaults to).
         slicer_mode = _tableau_param_control_mode_to_pbi(pc.get("mode"))
         visuals.append(_slicer_json(
-            vname, field, _position(x, y, w, h, z=1, tab=200 + i),
+            vname, field, _position(x, y, w, h, z=_Z_SLICER, tab=200 + i),
             None, None, mode=slicer_mode, warnings=warnings))
     return visuals
 
@@ -8803,12 +8870,12 @@ def _reflow_worksheets_below_slicers(visuals, page_h, *, gap=8.0, tol=1.0):
     reintroduces the band -- so a sheet authored at the hidden-state position now overlaps the slicers
     (the Sample card at y=241 under a filter band at y~211-320). This mirrors what Tableau itself does the
     moment you click "Show Filters": the sheet stack is pushed BELOW the band and compressed to fit the
-    remaining canvas (Sample -> y~351, h~285). We reflow the ``z==0`` worksheet visuals into
+    remaining canvas (Sample -> y~351, h~285). We reflow the worksheet-content visuals into
     ``[band_bottom+gap, page_h]`` proportionally, keeping their relative layout.
 
     Guard: only fires when a worksheet visual actually intersects the slicer band -- a dashboard whose
-    slicers sit in their own clear band (no overlap) is untouched (never-regress). Slicers (``z==1``) and
-    the banner (``z==1000``) are never moved; only worksheet content is reflowed.
+    slicers sit in their own clear band (no overlap) is untouched (never-regress). Slicers, the banner
+    and the backdrop plate are never moved; only worksheet content is reflowed.
 
     Banding: a dashboard can surface TWO separate slicer strips -- a top filter row and a lower
     ``Selections``/parameter-control row -- with authored content (e.g. a KPI-card band) SANDWICHED
@@ -8818,8 +8885,8 @@ def _reflow_worksheets_below_slicers(visuals, page_h, *, gap=8.0, tol=1.0):
     is more than one slicer-height below the running band bottom), and we reflow only against the
     topmost band that content actually collides with. A dashboard with a single slicer strip is
     unaffected (one band == the old behaviour)."""
-    slicers = [v for v in visuals if (v.get("position") or {}).get("z") == 1]
-    content = [v for v in visuals if (v.get("position") or {}).get("z") == 0]
+    slicers = [v for v in visuals if (v.get("position") or {}).get("z") == _Z_SLICER]
+    content = [v for v in visuals if (v.get("position") or {}).get("z") == _Z_CONTENT]
     if not slicers or not content:
         return
     slicers.sort(key=lambda v: v["position"]["y"])
@@ -8865,7 +8932,7 @@ def _deoverlap_captions(visuals, page_w, page_h, *, gap=8.0, tol=1.0, min_frac=0
     Tableau habitually FLOATS a section-header / panel-label / instruction text zone directly on
     top of (or fully inside) the worksheet, table or slicer row it labels. The deterministic rebuild
     scales those zones faithfully (``z==900``), so it inherits every source overlap -- empirically
-    the dominant geometry defect on real dashboards (100% of measured caption overlaps are a z=900
+    the dominant geometry defect on real dashboards (100% of measured caption overlaps are a caption
     textbox sitting on an anchor: chart column-headers pinned inside their bars at 98-100%, or a wide
     section header stretched behind a row of slicers at ~41-47%). Faithful pixel placement is NOT a
     hard invariant here (only completeness, correct numbers and faithful graphs are) -- so we
@@ -8878,9 +8945,15 @@ def _deoverlap_captions(visuals, page_w, page_h, *, gap=8.0, tol=1.0, min_frac=0
     sits on an anchor, so an already-tidy page (e.g. a cleanly tiled dashboard) is byte-identical.
     A caption is moved only to a position proven clear of every anchor and every other caption, and
     is otherwise left exactly where it was -- the page can only ever get tidier, never worse. Anchors
-    (worksheets z=0, slicers z=1, banner z=1000, images z=1100) are never moved."""
-    caps = [v for v in visuals if (v.get("position") or {}).get("z") == 900]
-    anchors = [v for v in visuals if (v.get("position") or {}).get("z") != 900]
+    (worksheets, slicers, the banner and overlay images) are never moved.
+
+    The backdrop plate is deliberately NOT an anchor. It is the author's page design, drawn beneath
+    everything and routinely covering the whole canvas -- treating it as content to avoid would leave
+    no clear band anywhere on the page and silently switch this pass off for exactly the elaborately
+    designed dashboards that need it most. A caption is MEANT to sit on the plate."""
+    caps = [v for v in visuals if (v.get("position") or {}).get("z") == _Z_CAPTION]
+    anchors = [v for v in visuals
+               if (v.get("position") or {}).get("z") not in (_Z_CAPTION, _Z_BACKDROP)]
     if not caps or not anchors:
         return page_h
 
@@ -9009,7 +9082,12 @@ def _deoverlap_captions(visuals, page_w, page_h, *, gap=8.0, tol=1.0, min_frac=0
         for c in group:
             c["position"]["y"] = round(line, 2)
 
-    content_bottom = max((v["position"]["y"] + v["position"]["height"] for v in visuals),
+    # The backdrop plate is excluded from the measurement for the same reason it is excluded from
+    # the anchor set: it is the page's canvas artwork, not content. Letting it drive the height
+    # makes a plate that scaled a few pixels proud of the authored canvas silently inflate the
+    # page, which pushes the real content off-screen -- the opposite of what growing is for.
+    content_bottom = max((v["position"]["y"] + v["position"]["height"] for v in visuals
+                          if (v.get("position") or {}).get("z") != _Z_BACKDROP),
                          default=page_h)
     return round(max(page_h, content_bottom + gap), 2)
 
