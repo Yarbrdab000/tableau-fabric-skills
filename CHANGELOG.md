@@ -12,6 +12,18 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.46.0` -> `2.47.0`): bind EVERY Text/Label pill on a card.**
+  A Tableau KPI "BAN" is one mark carrying many `<text>` encodings -- a static caption, the big
+  number, and a set of mutually exclusive coloured delta measures of which exactly one is
+  non-blank in a given period. `_parse_encodings` kept only the FIRST pill per role, so pills
+  2..N were silently discarded and every card whose live value sat in a later slot rendered
+  `(Blank)`. Retention is additive (`label_fields` beside the unchanged scalar `label`), so only
+  the card path widens; `_pbir_vtype` then resolves two or more values to a native
+  `multiRowCard`. Measured on the reference workbook: 13 cards went from 1 value to 4, and six
+  previously `(Blank)` KPIs now render real figures. Corpus regression over 29 workbooks: zero
+  page/visual/status changes anywhere, and one unrelated Salesforce estate recovered 8 dropped
+  measures across 2 cards -- the fix keys on the Tableau construct, not on any one workbook.
+
 - **tableau-migration (skill `2.45.0` -> `2.46.0`): honour author-hidden dashboard zones.**
   Tableau records a dashboard object the author collapsed behind a show/hide toggle as
   `hidden-by-user='true'` and renders nothing for it on open; the rebuild emitted it anyway.

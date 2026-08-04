@@ -1266,7 +1266,7 @@ def _parse_encodings(pane, ds_default, base_cols, instances, index, ds_caption,
                      date_binding=None, row_count_binding=None, measure_binding=None,
                      column_binding=None):
     enc = {"color": None, "size": None, "label": None, "detail": None, "angle": None,
-           "geo_levels": [], "detail_dims": []}
+           "geo_levels": [], "detail_dims": [], "label_fields": []}
     if pane is None:
         return enc
     holder = _first(pane, "encodings")
@@ -1276,6 +1276,7 @@ def _parse_encodings(pane, ds_default, base_cols, instances, index, ds_caption,
                "label": "label", "lod": "detail", "level-of-detail": "detail",
                "wedge-size": "angle"}
     seen_detail_dims = set()
+    seen_label_fields = set()
     for child in list(holder):
         role = mapping.get(_local(child.tag))
         if not role:
@@ -1289,6 +1290,19 @@ def _parse_encodings(pane, ds_default, base_cols, instances, index, ds_caption,
         if f:
             if enc[role] is None:
                 enc[role] = f
+            # Tableau's Text/Label shelf can carry MANY pills that a rich mark-label template
+            # arranges into one block -- a KPI "BAN" writes a static caption, a big number, and a
+            # set of MUTUALLY EXCLUSIVE coloured delta measures (exactly one is non-blank in a
+            # given month, its colour carrying the direction). ``enc["label"]`` keeps only the
+            # FIRST, so such a card bound whichever pill Tableau happened to serialise first and
+            # rendered "(Blank)" whenever that was not the live one. Retain EVERY label pill, in
+            # template order, so the card can project them all and no slot is silently dropped.
+            # Additive: ``enc["label"]`` is untouched, so every existing reader is unchanged.
+            if role == "label":
+                _lf_key = (f.get("caption"), f.get("field_id"), f.get("aggregation"))
+                if _lf_key not in seen_label_fields:
+                    seen_label_fields.add(_lf_key)
+                    enc["label_fields"].append(f)
             # Retain ALL geo-role Detail pills (not just the first) so a multi-level map binds its
             # Location to the FINEST geography present, not whichever level Tableau serialised first.
             if role == "detail" and f.get("geo_area"):
@@ -4986,6 +5000,9 @@ def _build_query_state(ws, model_table, field_map, warnings):
     rows, cols = ws["rows"], ws["cols"]
     color = ws["encodings"]["color"]
     label = ws["encodings"]["label"]
+    # EVERY Text/Label pill, in template order (see ``_parse_encodings``). ``label`` remains the
+    # first one so all other roles are unchanged; only the card path widens to the full set.
+    label_fields = ws["encodings"].get("label_fields") or ([label] if label else [])
     size = ws["encodings"]["size"]
     detail = ws["encodings"]["detail"]
     angle = ws["encodings"].get("angle")
@@ -5277,8 +5294,14 @@ def _build_query_state(ws, model_table, field_map, warnings):
             state["Y"] = {"projections": _role_projections(
                 vals, model_table, field_map, used_refs)}
     elif vt == VT_CARD:
+        # A Tableau KPI "BAN" arranges MANY Text pills into one rich mark label: a static caption,
+        # a big number, and a set of MUTUALLY EXCLUSIVE coloured delta measures (exactly one is
+        # non-blank in a given month, its colour carrying the direction). Binding only the first
+        # pill rendered "(Blank)" on every card whose live value sat in a later slot. Project every
+        # value-kind label pill so the live one is always present; ``_pbir_vtype`` then resolves
+        # >=2 values to a native multiRowCard, Power BI's row of labelled big numbers.
         vals = _dedupe(values(rows) + values(cols)
-                       + ([label] if label and label["kind"] == "value" else [])
+                       + values(label_fields)
                        + ([size] if size and size["kind"] == "value" else []))
         if vals:
             state["Values"] = {"projections": _role_projections(
