@@ -1441,11 +1441,24 @@ def _classify_parameters(parameters, fp, vp):
         for k in _norm_param_keys(cp):
             value_tbl[k] = (cp.get("table"), cp.get("picker_column") or cp.get("table"))
     field_tbl = {}     # controller key -> (field-parameter table name, display column a slicer binds to)
+    field_sel = {}     # controller key -> {column, value} the slicer must OPEN ON (see below)
     for spec in (fp.get("specs") or []):
         ctrl = (spec.get("controller") or "").strip().strip("[]").strip().lower()
         if ctrl:
             field_tbl.setdefault(ctrl, (spec.get("table_name"),
                                         spec.get("display_col") or spec.get("table_name")))
+            # A field parameter's SELECTABLE identity is its hidden Fields (``groupByColumn``)
+            # column, NOT the visible display column -- established by rendering the same slicer
+            # four ways (display / group-by / composite / order): only group-by opened on the
+            # authored value. The literal is the branch's own ``NAMEOF`` argument text, taken from
+            # the very entry that wrote the partition row, so it is in-domain by construction.
+            entries = spec.get("entries") or []
+            fcol = spec.get("fields_col")
+            idx = spec.get("default_index") or 0
+            if fcol and 0 <= idx < len(entries):
+                ref = (entries[idx] or {}).get("ref")
+                if ref:
+                    field_sel.setdefault(ctrl, {"column": fcol, "value": ref})
 
     out = []
     for p in (parameters or []):
@@ -1469,6 +1482,11 @@ def _classify_parameters(parameters, fp, vp):
             # report binder emits a faithful single-select slicer for the dashboard control (mirrors
             # the value-picker path; without it a field-swap control never became a slicer at all).
             picker = {"table": table, "column": disp}
+            # ...but the slicer is SELECTED through the group-by column, so carry that separately.
+            # ``select`` is additive and optional: a consumer that ignores it keeps today's output.
+            shit = next((field_sel[k] for k in keys if k in field_sel), None)
+            if shit:
+                picker["select"] = dict(shit)
         rec = {"name": name, "internal_name": p.get("internal_name"),
                "kind": kind, "model_object": model_object}
         if picker:

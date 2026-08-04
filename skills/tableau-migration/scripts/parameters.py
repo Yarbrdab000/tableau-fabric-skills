@@ -758,11 +758,23 @@ def _uniquify_label(label, used_labels, owner, warnings):
     return final
 
 
+def field_param_fields_column(table_name):
+    """Name of a field-parameter table's hidden ``Fields`` column (its ``groupByColumn``).
+
+    Single source of truth: the TMDL writer below and the report-side pre-selection both need this
+    name, and a field parameter's SELECTABLE identity is this column -- not the visible display
+    column. That was established by rendering four labelled variants of the same slicer side by
+    side (display column / group-by column / composite of both / order column): only the group-by
+    variant opened on the authored value; the other three read "All".
+    """
+    return f"{table_name} Fields"
+
+
 def _field_param_table_tmdl(table_name, entries):
     """Render the canonical 3-column field-parameter table. ``entries`` is a list of
     ``(display_label, dax_ref_string, order_int)``; the Fields column carries the
     ``ParameterMetadata`` extended property that marks the table as a field parameter."""
-    fields_col = f"{table_name} Fields"
+    fields_col = field_param_fields_column(table_name)
     order_col = f"{table_name} Order"
     tq, fq, oq = q(table_name), q(fields_col), q(order_col)
 
@@ -938,9 +950,15 @@ def emit_field_parameter(display_name, swap, *, field_locator, used_names, label
             e_is_measure = True
         else:
             e_table, e_col, e_is_measure = table, col, is_measure
-        entries.append((label, dax_ref(e_table, e_col, measure=e_is_measure), order_i))
+        ref = dax_ref(e_table, e_col, measure=e_is_measure)
+        entries.append((label, ref, order_i))
+        # ``ref`` is carried on the struct entry because it is the VALUE the hidden Fields column
+        # holds: the partition writes ``NAMEOF(<ref>)`` and NAMEOF evaluates to that reference's
+        # text. A report-side pre-selection has to match the Fields column (see
+        # ``_field_param_selection``), and deriving the literal from the same string that built the
+        # row makes the two identical by construction rather than by a second, driftable rule.
         struct_entries.append({"label": label, "table": e_table, "column": e_col,
-                               "is_measure": e_is_measure, "order": order_i})
+                               "is_measure": e_is_measure, "order": order_i, "ref": ref})
     measures_created = synth.definitions[before:]
 
     if role == "measure":
@@ -953,7 +971,9 @@ def emit_field_parameter(display_name, swap, *, field_locator, used_names, label
     # ``fieldParameters`` expansion binds each slot to '<table_name>'[<table_name>].
     return {"ok": True, "table_name": table_name,
             "part_filename": _safe_filename(table_name),
-            "role": role, "display_col": table_name, "entries": struct_entries,
+            "role": role, "display_col": table_name,
+            "fields_col": field_param_fields_column(table_name),
+            "entries": struct_entries,
             "default_index": default_index,
             "measures": measures_created,
             "tmdl": _field_param_table_tmdl(table_name, entries), "warnings": warnings}
@@ -1048,7 +1068,8 @@ def emit_field_parameters(calcs, *, field_locator, used_names=None, existing_tab
         # report-side spec: lets a visual EXPAND this parameter (seed projection + fieldParameters
         # block). Kept in detection order so the self-service table's slot order is stable.
         specs.append({"calc_name": name, "table_name": res["table_name"],
-                      "display_col": res["display_col"], "role": res.get("role"),
+                      "display_col": res["display_col"],
+                      "fields_col": res.get("fields_col"), "role": res.get("role"),
                       "controller": sw.get("controller"),
                       "default_index": res.get("default_index") or 0,
                       "entries": res.get("entries") or []})

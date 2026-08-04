@@ -4469,6 +4469,14 @@ def _resolve_parameter_controls(dashboards, params, warnings, param_binding=None
                              "w": pc.get("w"), "h": pc.get("h"),
                              "zone_id": pc.get("zone_id")},
                 "mode": pc.get("mode"),
+                # Tableau's CURRENT parameter value travels with the control so the emitter can
+                # open the rebuilt slicer on it. Captured here (where ``_parse_parameters`` output
+                # is in scope) rather than re-parsed downstream.
+                "param_meta": {
+                    "current_value": meta.get("current_value"),
+                    "current_display": meta.get("current_display"),
+                    "members": list(meta.get("members") or []),
+                },
             }
             bound = slicers.get(_norm_param_key(pid))
             if bound:
@@ -4477,6 +4485,8 @@ def _resolve_parameter_controls(dashboards, params, warnings, param_binding=None
                     "single_select": bool(bound.get("single_select", True)),
                     "caption": bound.get("caption") or caption,
                 }
+                if isinstance(bound.get("select"), dict):
+                    rec["resolved"]["select"] = dict(bound["select"])
                 records.append(rec)
                 continue
             records.append(rec)
@@ -7861,6 +7871,105 @@ def _inherit_flag_filters(visuals, flag_fc):
     return visuals
 
 
+def _surfaced_filter_keys(ws_list, db):
+    """``(entity, property)`` of every filter the dashboard exposes as an interactive card.
+
+    A filter the author SURFACED is a control the reader can change, so its restriction belongs on
+    the slicer (as an open-on selection) and must NOT also be baked into the visuals -- baking it
+    would pin the numbers while the slicer appeared to move. A filter the author did NOT surface is
+    a fixed property of the worksheet and has to be applied to the visual instead. Matching on the
+    resolved model column rather than the raw token mirrors the de-duplication
+    :func:`_emit_dashboard_slicers` already does, so a field carded once but filtered under several
+    per-sheet tokens still counts as surfaced.
+    """
+    by_token = _filter_fields_by_token(ws_list)
+    keys = set()
+    for tok in (db.get("filter_field_tokens") or ()):
+        f = by_token.get(tuple(tok))
+        if f and f.get("entity") and f.get("property"):
+            keys.add((f["entity"], f["property"]))
+    return keys
+
+
+def _applied_filter_config_for(ws, surfaced_keys, model_table, field_map, warnings):
+    """A worksheet's UNSURFACED applied filters as a visual-level ``filterConfig``, else ``None``.
+
+    Tableau applies a worksheet filter to that worksheet whether or not a quick-filter card is
+    shown for it. Only the shown ones were ever rebuilt (as slicers), so an applied restriction with
+    no card -- ``Status = Closed``, ``Record Type = <id>``, ``Stage = Waitlisted`` -- was dropped
+    entirely and the visual silently widened to the whole table. That is a WRONG NUMBER shown
+    confidently, the same failure class as the unfiltered KPI card that read 1354 against a
+    date-ranged 820, and it is why several rebuilt sheets disagreed with the source workbook.
+
+    On a CHART, ``filterConfig`` is the real data filter (unlike on a slicer, where it only limits
+    the offered member list) -- so this is the correct slot, and it composes with the keep-flag
+    containers through the same ``filterConfig.filters[]`` array.
+
+    Binding is delegated to :func:`_slicer_filter_config`, so exactly the shapes already proven
+    bindable are applied here and everything else keeps its existing fidelity warning. Filters the
+    dashboard surfaces are skipped: those are the reader's to change.
+    """
+    containers, seen = [], set()
+    for i, f in enumerate(ws.get("filters") or []):
+        if not (f.get("selection") or f.get("range")):
+            continue
+        entity, prop, binding = _apply_override(f, model_table, field_map)
+        if binding != "column" or (entity, prop) in surfaced_keys:
+            continue
+        if (entity, prop) in seen:
+            continue
+        if not _applied_selection_is_bindable(f):
+            warnings.append(_warn(
+                "filter", f.get("caption") or prop,
+                "applied worksheet filter not carried onto the visual (a %s selection has no "
+                "faithful literal against the rebuilt column)" % (f.get("datatype") or "typed")))
+            continue
+        fc = _slicer_filter_config(
+            f, model_table, field_map,
+            _sanitize(f"wsfilter-{ws.get('name')}-{i}-{prop}"), warnings)
+        if fc:
+            seen.add((entity, prop))
+            containers.extend(fc["filters"])
+    return {"filters": containers} if containers else None
+
+
+def _applied_selection_is_bindable(f):
+    """Whether an applied selection has a literal that is type-safe against the rebuilt column.
+
+    On a SLICER a mistyped ``filterConfig`` merely mis-limits the offered member list. On a CHART
+    the same container is the real data filter, and Power BI rejects the whole visual with
+    "Something's wrong with one or more filters" -- an error tile where there used to be a number.
+    So this path has to be stricter than the slicer one, and it fails CLOSED: an uncarried filter
+    leaves the previous (already-shipped) behaviour, while a mistyped one destroys the visual.
+
+    Tableau serialises a boolean member as the STRING ``"true"``/``"false"``, but the rebuilt
+    column is whatever the translated calculation produced -- ``int64`` for both boolean LOD flags
+    in the corpus, one of which is a ``BLANK()`` stub no literal can ever match. There is no value
+    we could emit that is right by construction, and guessing ``1``/``TRUE`` is exactly the kind of
+    unverifiable assumption that renders as an error tile. Ranges are left to
+    :func:`_slicer_filter_config`, which already types them itself.
+    """
+    sel = f.get("selection")
+    if not sel:
+        return True
+    if bool(f.get("date_rebound")) and (f.get("property") in _INTEGER_DATE_PART_COLUMNS):
+        return True
+    return (f.get("datatype") or "").lower() == "string"
+
+
+def _merge_filter_configs(*configs):
+    """Combine several ``{"filters": [...]}`` into one, dropping ``None`` and duplicate names."""
+    out, seen = [], set()
+    for cfg in configs:
+        for cont in ((cfg or {}).get("filters") or ()):
+            nm = cont.get("name")
+            if nm in seen:
+                continue
+            seen.add(nm)
+            out.append(cont)
+    return {"filters": out} if out else None
+
+
 def _slicer_filter_config(field, model_table, field_map, name, warnings):
     """Build a slicer ``filterConfig`` from an applied Tableau filter selection/range, else ``None``.
 
@@ -8023,12 +8132,91 @@ def _apply_slicer_format(visual, hdr_style=None, itm_style=None, plate_fill=None
             "background", [{"properties": {}}])[0]["properties"].update(cont)
 
 
+def _slicer_preselection_object(field, model_table, field_map):
+    """The slicer's OPEN-ON selection (``objects.general[].properties.filter``), else ``None``.
+
+    PBIR keeps two things apart that are easy to conflate, and conflating them is a silent
+    CORRECTNESS bug rather than a cosmetic one:
+
+      * ``filterConfig.filters[]`` constrains the data feeding the slicer -- which members it
+        OFFERS, and nothing else;
+      * ``objects.general[].properties.filter`` (note the doubly-nested ``filter.filter``) is what
+        the slicer opens SELECTED on, and it is the ONLY one of the two that propagates to the
+        rest of the page.
+
+    An applied Tableau filter selection expressed only as the first left the slicer reading "All"
+    AND every other visual unfiltered, so the report showed numbers over rows the source workbook
+    had excluded. Rendering an isolated slicer with the selection and NO ``filterConfig`` produces
+    exactly Tableau's quick-filter shape -- the full member list offered, the authored members
+    checked, and the page genuinely filtered -- which is why :func:`_slicer_json` drops
+    ``filterConfig`` whenever this returns a selection.
+
+    Two ways in, both fail-closed:
+
+      * ``preselect_override`` -- select through a DIFFERENT column than the projected one. A field
+        parameter is projected on its visible display column but is only selectable through its
+        hidden group-by column (rendering the same slicer four ways -- display / group-by /
+        composite / order -- left group-by as the only variant that opened on the authored value).
+      * an applied ``selection``, gated exactly like :func:`_slicer_filter_config` so the two never
+        disagree about what is faithfully bindable.
+
+    EXCLUDE mode declines. On screen a ``Not(In(...))`` selection is indistinguishable from no
+    selection at all, so "it rendered" could not tell a working exclusion from a silently dropped
+    one; every real exclude found in the corpus is either ``%null%``-only (already reduced to
+    nothing here) or a compound/derived set this layer does not bind. Declining keeps today's
+    ``filterConfig`` behaviour, which is strictly better than an unverifiable guess.
+    """
+    field = field or {}
+    override = field.get("preselect_override")
+    sel = field.get("selection")
+    if not override and not sel:
+        return None
+    entity, prop, binding = _apply_override(field, model_table, field_map)
+    if binding != "column":
+        return None
+    if override:
+        col = override.get("property")
+        values = [v for v in (override.get("values") or []) if v not in (None, "")]
+        if not col or not values:
+            return None
+        cond = _categorical_condition(entity, col, values, exclude=False)
+    else:
+        if sel.get("mode") == "exclude":
+            return None
+        dt = (field.get("datatype") or "").lower()
+        numeric = bool(field.get("date_rebound") and prop in _INTEGER_DATE_PART_COLUMNS)
+        if not numeric and dt != "string":
+            return None
+        values = [v for v in sel["values"] if v != "%null%"]
+        if not values:
+            return None
+        if numeric and not all(
+                _semantic_numeric_literal(v) is not None
+                and _semantic_numeric_literal(v).endswith("L") for v in values):
+            return None
+        cond = _categorical_condition(entity, prop, values, exclude=False, numeric=numeric)
+    return {"properties": {"filter": {"filter": {
+        "Version": 2,
+        "From": [{"Name": _FILTER_SOURCE_ALIAS, "Entity": entity, "Type": 0}],
+        "Where": [{"Condition": cond}],
+    }}}}
+
+
 def _slicer_json(name, field, position, model_table, field_map, *, mode=None, warnings=None):
     expr, qref, nref = _field_expression(field, model_table, field_map)
     state = {"Values": {"projections": [
         {"field": expr, "queryRef": qref, "nativeQueryRef": nref}]}}
-    fc = _slicer_filter_config(field, model_table, field_map, name + "-sel",
-                               warnings if warnings is not None else [])
+    # Compute the open-on selection FIRST: it decides whether a ``filterConfig`` is wanted at all.
+    # The two are alternatives, never partners. ``filterConfig`` restricts which members the slicer
+    # OFFERS without filtering the page, so pairing it with a selection would hand the reader a
+    # one-item list they cannot change -- less faithful than Tableau, which shows every member with
+    # the authored ones checked. When the selection declines (exclude mode, date ranges, unbindable
+    # datatypes) ``filterConfig`` still runs, so those paths -- and their warnings -- are unchanged.
+    # A parameter control is a single-value PICKER and never takes a ``filterConfig`` either.
+    pre = _slicer_preselection_object(field, model_table, field_map)
+    fc = None if (pre or (field or {}).get("preselect_only")) else _slicer_filter_config(
+        field, model_table, field_map, name + "-sel",
+        warnings if warnings is not None else [])
     out = _visual_json(name, "slicer", position, state, filter_config=fc, slicer_mode=mode)
     # Slicer face font defaults to Tableau's 9pt quick-filter text; the plate has no default (absent
     # -> Power BI's own slicer background). The ws->field style stash (``_slicer_hdr``/``_slicer_itm``/
@@ -8041,6 +8229,9 @@ def _slicer_json(name, field, position, model_table, field_map, *, mode=None, wa
         itm_style=(field.get("_slicer_itm") if isinstance(field, dict) else None) or _default_pt,
         plate_fill=(field.get("_slicer_plate") if isinstance(field, dict) else None),
         header_text=(field.get("caption") if isinstance(field, dict) else None))
+    # Stamp the open-on selection AFTER formatting so neither clobbers the other's ``objects``.
+    if pre:
+        out["visual"].setdefault("objects", {}).setdefault("general", []).append(pre)
     return out
 
 
@@ -8913,7 +9104,11 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             label_objects, dl_fact = _data_labels(ws, ws["visual_type"], warnings)
             legend_objects, lg_fact = _legend_objects(
                 ws, zone, db.get("legend_zones"), ws["visual_type"])
-            flag_fc = _flag_filter_config_for(ir, ws["name"])
+            flag_fc = _merge_filter_configs(
+                _flag_filter_config_for(ir, ws["name"]),
+                _applied_filter_config_for(
+                    ws, _surfaced_filter_keys(ir.get("worksheets") or [], db),
+                    model_table, field_map, warnings))
             shape_objects = (_shape_map_objects(ws)
                              if ws["visual_type"] == VT_SHAPE_MAP else None)
             # A measure shapeMap needs its colour-saturation gradient written explicitly or
@@ -8994,8 +9189,17 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             if ws.get("title_style"):
                 rec["title_style"] = ws["title_style"]
             if flag_fc:
-                rec["flag_filters"] = [c["field"]["Measure"]["Property"]
-                                       for c in flag_fc["filters"]]
+                # ``flag_fc`` now carries two kinds of container: measure keep-flags and applied
+                # worksheet-filter columns. Report each under its own key so neither is mistaken
+                # for the other, and so a column container cannot crash the measure read.
+                rec_flags = [c["field"]["Measure"]["Property"]
+                             for c in flag_fc["filters"] if "Measure" in (c.get("field") or {})]
+                rec_cols = [c["field"]["Column"]["Property"]
+                            for c in flag_fc["filters"] if "Column" in (c.get("field") or {})]
+                if rec_flags:
+                    rec["flag_filters"] = rec_flags
+                if rec_cols:
+                    rec["applied_filters"] = rec_cols
             records.append(rec)
         visuals += _emit_slicers(
             page_ws, page_name, model_table, field_map, warnings,
@@ -9402,6 +9606,60 @@ def _emit_slicers(ws_list, page_name, model_table, field_map, warnings=None, sho
     return visuals
 
 
+def _param_control_selection(pc):
+    """Tableau's CURRENT parameter value -> a single-member slicer pre-selection, else ``None``.
+
+    A Tableau parameter control always opens on the value the author saved; a Power BI slicer with no
+    selection opens on "All". That difference is not cosmetic. The model rebuilds a list parameter as
+    a picker table keyed on the human-facing label, and downstream DAX reads it with
+    ``SELECTEDVALUE(<picker>, <authored default>)`` -- so an unselected slicer shows "All" while the
+    numbers silently come from the default, and the face of the report disagrees with its own data.
+    For a FIELD parameter it is worse than cosmetic: an empty selection leaves EVERY field active at
+    once, so the visual breaks down by a different dimension than the source workbook.
+
+    Warn-never-wrong gate. A pre-selection is emitted only when the literal is provably inside the
+    bound column's domain:
+
+      * the parameter exposes aliased members (a genuine list parameter -- the only shape the model
+        rebuilds as a label-keyed picker), and
+      * its current display is one of those aliases, and
+      * that display differs from the raw stored value, which is precisely what makes the alias the
+        human-facing text the picker column holds (``2`` -> ``"Program Name"``).
+
+    A date or plain-scalar parameter has no aliased members and its display IS its value, so it
+    declines here and keeps today's faithful "show all" default. That matters: a literal that matches
+    no row would not merely look wrong, it would filter every downstream visual to blank -- strictly
+    worse than showing "All". Declining is byte-identical to the previous behaviour.
+    """
+    meta = (pc or {}).get("param_meta") or {}
+    disp, val = meta.get("current_display"), meta.get("current_value")
+    aliases = {m.get("alias") for m in (meta.get("members") or []) if m.get("alias")}
+    if not disp or disp == val or disp not in aliases:
+        return None
+    return {"mode": "include", "values": [disp]}
+
+
+def _field_param_selection(res):
+    """A field-parameter control's open-on selection, expressed on its GROUP-BY column.
+
+    The model hands the report a ``select`` ``{column, value}`` for a field-parameter picker: the
+    hidden ``<table> Fields`` column plus the ``NAMEOF`` argument text of the branch Tableau opens
+    on. Both come from the entry that wrote the partition row, so the literal is inside the built
+    column's domain by construction -- the property that makes a pre-selection safe to emit.
+
+    Why not the visible display column: rendering one slicer four ways on a single page (display
+    column / group-by column / composite of both / order column) left the group-by variant as the
+    only one that opened on the authored value; the other three all read "All".
+    """
+    sel = (res or {}).get("select")
+    if not isinstance(sel, dict):
+        return None
+    col, val = sel.get("column"), sel.get("value")
+    if not col or val in (None, ""):
+        return None
+    return {"property": col, "values": [val]}
+
+
 def _emit_param_control_slicers(controls, db_name, page_name, ref_w, ref_h, warnings):
     """Emit a single-select slicer for each model-resolved dashboard parameter control.
 
@@ -9423,9 +9681,20 @@ def _emit_param_control_slicers(controls, db_name, page_name, ref_w, ref_h, warn
         if None in (pos.get("x"), pos.get("y"), pos.get("w"), pos.get("h")):
             continue
         x, y, w, h = _scale_zone(pos, ref_w, ref_h)
+        # Open the slicer on the parameter value the author saved. Two disjoint routes:
+        # a FIELD parameter is selected through its group-by column (``preselect_override``), while
+        # a VALUE parameter is selected on the picker column it already projects, but only when that
+        # literal provably exists there (see :func:`_param_control_selection`). ``datatype`` is
+        # declared only alongside a value selection so the verified string-categorical path is the
+        # one that runs; a decline on both routes stays byte-identical to before.
+        override = _field_param_selection(res)
+        sel = None if override else _param_control_selection(pc)
         field = {"entity": res["table"], "property": res["column"], "binding": "column",
                  "caption": res.get("caption") or res["column"], "aggregation": None,
-                 "selection": None, "range": None, "datatype": None}
+                 "selection": sel, "range": None,
+                 "preselect_override": override,
+                 "datatype": "string" if sel else None,
+                 "preselect_only": True}
         vname = _sanitize(f"paramslicer-{page_name}-{i}-{res['column']}")
         # A Tableau parameter control is a single-value picker; its ``mode`` (``compact`` -> dropdown)
         # decides the slicer face. Without an explicit mode Power BI renders its default vertical

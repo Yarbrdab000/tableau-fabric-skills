@@ -1013,6 +1013,28 @@ def _slicer_filter_configs(parts):
             if v["visual"]["visualType"] == "slicer" and v.get("filterConfig")]
 
 
+def _slicer_preselections(parts):
+    """Every slicer's OPEN-ON selection -- the inner ``objects.general[].properties.filter.filter``.
+
+    This is where an applied Tableau selection lands. It is NOT ``filterConfig``: that slot only
+    limits which members a slicer OFFERS and never filters the page, so a selection written there
+    left the slicer reading "All" while the rest of the report showed unfiltered numbers.
+    """
+    out = []
+    for v in _visual_parts(parts).values():
+        if v["visual"]["visualType"] != "slicer":
+            continue
+        for obj in ((v["visual"].get("objects") or {}).get("general") or []):
+            f = ((obj.get("properties") or {}).get("filter") or {}).get("filter")
+            if f:
+                out.append(f)
+    return out
+
+
+def _slicer_preselect_in(parts, i=0):
+    return _slicer_preselections(parts)[i]["Where"][0]["Condition"]["In"]
+
+
 def _filter_scope_warnings(ir):
     return [w["reason"] for w in ir["warnings"] if w["scope"] == "filter"]
 
@@ -1031,15 +1053,20 @@ def test_categorical_include_selection_emits_in_filter_on_slicer():
     assert ir["worksheets"][0]["filters"][0]["selection"] == {
         "mode": "include", "values": ["South", "East"]}
 
-    configs = _slicer_filter_configs(emit_pbir(ir))
-    assert len(configs) == 1
-    cont = configs[0]["filters"][0]
-    assert cont["type"] == "Categorical"
-    assert cont["field"]["Column"]["Property"] == "Region"
-    in_expr = cont["filter"]["Where"][0]["Condition"]["In"]
+    parts = emit_pbir(ir)
+    # The applied selection lands in the slicer's OPEN-ON slot, and the slicer carries NO
+    # filterConfig: the two are alternatives. filterConfig would restrict the offered member list
+    # to South/East while leaving the page unfiltered -- the opposite of what Tableau does, which
+    # is to offer every region with South and East checked.
+    pres = _slicer_preselections(parts)
+    assert len(pres) == 1
+    assert _slicer_filter_configs(parts) == []
+    assert pres[0]["From"][0]["Entity"] == "Orders"
+    in_expr = pres[0]["Where"][0]["Condition"]["In"]
+    assert in_expr["Expressions"][0]["Column"]["Property"] == "Region"
     vals = [row[0]["Literal"]["Value"] for row in in_expr["Values"]]
     assert vals == ["'South'", "'East'"]
-    assert "objects" not in cont  # an include is not an inverted selection
+    assert "Not" not in pres[0]["Where"][0]["Condition"]  # an include is not an inverted selection
 
 
 def test_categorical_exclude_selection_emits_inverted_not_in_filter():
@@ -1071,8 +1098,8 @@ def test_apostrophe_member_is_sql_escaped_in_literal():
                     rows="[federated.abc].[sum:Sales:qk]",
                     cols="[federated.abc].[none:Category:nk]",
                     deps_extra=_INST, filters=filt)
-    cont = _slicer_filter_configs(emit_pbir(parse_twb(_workbook(ws))))[0]["filters"][0]
-    val = cont["filter"]["Where"][0]["Condition"]["In"]["Values"][0][0]["Literal"]["Value"]
+    val = (_slicer_preselect_in(emit_pbir(parse_twb(_workbook(ws))))
+           ["Values"][0][0]["Literal"]["Value"])
     assert val == "'O''Brien'"
 
 
@@ -1865,6 +1892,19 @@ def test_unshown_dashboard_filter_does_not_fabricate_a_slicer():
     mains = [v for v in _visual_parts(parts).values()
              if v["visual"]["visualType"] != "slicer"]
     assert len(mains) == 2  # the charts are still emitted -- only the fabricated slicer is gone
+    # ...but NOT surfacing the filter must never mean DROPPING it. Tableau applies a worksheet
+    # filter to that worksheet whether or not a card is shown, so the restriction moves onto the
+    # visual itself. Without this the chart silently widens to every region and reports a number
+    # the source workbook never showed. Only MapWs is filtered; TrendWs has no filter of its own.
+    by_prop = {}
+    for v in mains:
+        conts = (v.get("filterConfig") or {}).get("filters") or []
+        for c in conts:
+            in_expr = c["filter"]["Where"][0]["Condition"]["In"]
+            by_prop[c["field"]["Column"]["Property"]] = [
+                r[0]["Literal"]["Value"] for r in in_expr["Values"]]
+    assert by_prop == {"Region": ["'West'"]}
+    assert sum(1 for v in mains if v.get("filterConfig")) == 1
 
 
 def test_dashboard_filter_card_in_nested_container_is_still_surfaced_as_slicer():
@@ -2925,11 +2965,10 @@ def test_date_part_month_filter_rebinds_and_emits_integer_selection():
     assert (f0["entity"], f0["property"], f0.get("date_rebound")) == ("Date", "Month", True)
     # the applied Month=4 selection is faithfully bound (no longer deferred) -> no fidelity note
     assert _filter_scope_warnings(ir) == []
-    cont = _slicer_filter_configs(emit_pbir(ir))[0]["filters"][0]
-    assert cont["type"] == "Categorical"
-    assert cont["field"]["Column"]["Property"] == "Month"
-    assert cont["field"]["Column"]["Expression"]["SourceRef"]["Entity"] == "Date"
-    in_expr = cont["filter"]["Where"][0]["Condition"]["In"]
+    pre = _slicer_preselections(emit_pbir(ir))[0]
+    assert pre["From"][0]["Entity"] == "Date"
+    in_expr = pre["Where"][0]["Condition"]["In"]
+    assert in_expr["Expressions"][0]["Column"]["Property"] == "Month"
     # INTEGER literal (4L), not a string ('4') -- a string would match no row on the integer column
     assert [row[0]["Literal"]["Value"] for row in in_expr["Values"]] == ["4L"]
 
@@ -2949,8 +2988,7 @@ def test_date_part_year_filter_multi_member_rebinds_to_integer_in_list():
     ir = parse_twb(_workbook(ws), date_binding=_DATE_BINDING)
     f0 = ir["worksheets"][0]["filters"][0]
     assert (f0["entity"], f0["property"]) == ("Date", "Year")
-    in_expr = (_slicer_filter_configs(emit_pbir(ir))[0]["filters"][0]
-               ["filter"]["Where"][0]["Condition"]["In"])
+    in_expr = _slicer_preselect_in(emit_pbir(ir))
     assert [row[0]["Literal"]["Value"] for row in in_expr["Values"]] == ["2020L", "2021L"]
 
 

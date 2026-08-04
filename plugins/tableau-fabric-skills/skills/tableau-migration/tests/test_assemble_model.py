@@ -1908,8 +1908,14 @@ def test_model_manifest_classifies_parameters_value_field_filter():
     # a field-swap controller ALSO exposes a picker pointing at the field-parameter table's DISPLAY
     # column, so the dashboard control is sliced the same way a value picker is (without this a
     # dimension/measure-swap control never became a slicer -- the dim-swap slicer regression).
-    assert kinds["Measure Picker"]["picker"] == {"table": "Measure Swap", "column": "Measure Swap"}
-    assert kinds["Dim Selector"]["picker"] == {"table": "Dim Swap", "column": "Dim Swap"}
+    # It additionally carries ``select``: the slicer PROJECTS the display column but is only
+    # SELECTABLE through the hidden group-by (Fields) column, so the two are exposed separately.
+    assert kinds["Measure Picker"]["picker"] == {
+        "table": "Measure Swap", "column": "Measure Swap",
+        "select": {"column": "Measure Swap Fields", "value": "[Total Sales]"}}
+    assert kinds["Dim Selector"]["picker"]["table"] == "Dim Swap"
+    assert kinds["Dim Selector"]["picker"]["column"] == "Dim Swap"
+    assert kinds["Dim Selector"]["picker"]["select"]["column"] == "Dim Swap Fields"
     assert kinds["Sales Multiplier"]["kind"] == "value"
     assert kinds["Sales Multiplier"]["model_object"] == "Sales Multiplier"
     # a what-if value param also exposes its model-owned picker (a range param picks its value col)

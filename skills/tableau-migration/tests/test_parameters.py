@@ -224,9 +224,16 @@ def test_emit_field_parameter_exposes_structured_entries_for_report_side():
     assert res["role"] == "dimension"
     assert res["display_col"] == "Dim calc 1"  # display column is named after the table
     assert res["entries"] == [
-        {"label": "Segment", "table": "Orders", "column": "Segment", "is_measure": False, "order": 0},
-        {"label": "Region", "table": "Orders", "column": "Region", "is_measure": False, "order": 1},
+        {"label": "Segment", "table": "Orders", "column": "Segment", "is_measure": False,
+         "order": 0, "ref": "'Orders'[Segment]"},
+        {"label": "Region", "table": "Orders", "column": "Region", "is_measure": False,
+         "order": 1, "ref": "'Orders'[Region]"},
     ]
+    # each entry's ``ref`` is the exact text its partition row NAMEOFs, so a report-side
+    # pre-selection on the Fields column matches the built value by construction.
+    assert res["fields_col"] == "Dim calc 1 Fields"
+    for e in res["entries"]:
+        assert f"NAMEOF({e['ref']})" in res["tmdl"]
 
 
 def test_emit_measure_swap_entries_flag_is_measure():

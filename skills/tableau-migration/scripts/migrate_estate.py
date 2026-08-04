@@ -1787,7 +1787,14 @@ def _param_binding_from_model(res_report):
         column = spec.get("column") or spec.get("property")
         if not table or not column:
             return None
-        return {"table": table, "column": column, "single_select": single}
+        out = {"table": table, "column": column, "single_select": single}
+        # Optional: a picker whose SELECTION lands on a different column than the one projected
+        # (a field parameter is projected on its display column but selected through its hidden
+        # group-by column). Carried verbatim; absent for every other picker shape.
+        sel = spec.get("select")
+        if isinstance(sel, dict) and sel.get("column") and sel.get("value") is not None:
+            out["select"] = {"column": sel["column"], "value": sel["value"]}
+        return out
 
     direct = rr.get("param_binding")
     if isinstance(direct, dict) and (direct.get("slicers") or direct.get("flags")):
