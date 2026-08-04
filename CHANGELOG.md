@@ -12,6 +12,18 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.47.0` -> `2.48.0`): read the Tableau mark-label TEMPLATE.**
+  A KPI "BAN" is one mark whose `<customized-label><formatted-text>` lays many pills out as a
+  block, and that template is the only authoritative statement of which pills share a DISPLAY
+  SLOT. `_parse_label_slots` reads it structurally: runs split into groups at any layout run, and
+  a maximal run of CONSECUTIVE field runs is one slot -- Tableau writes mutually exclusive
+  alternatives adjacently precisely because they occupy the same position. No name matching: a
+  `Pos`/`Neg` prefix is one author's habit, and a name-based prototype silently missed a third
+  member (`Neut`) that adjacency catches. Also decodes Tableau's mark-label line break (a literal
+  `U+00C6` before a newline, confirmed in raw workbook bytes) without mutilating authored text
+  that happens to contain that letter. Pure reader -- nothing consumes it yet, so no emitted
+  report changes (suite unchanged at 3718 passed).
+
 - **tableau-migration (skill `2.46.0` -> `2.47.0`): bind EVERY Text/Label pill on a card.**
   A Tableau KPI "BAN" is one mark carrying many `<text>` encodings -- a static caption, the big
   number, and a set of mutually exclusive coloured delta measures of which exactly one is

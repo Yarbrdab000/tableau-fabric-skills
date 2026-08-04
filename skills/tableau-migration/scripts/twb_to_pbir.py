@@ -3222,6 +3222,92 @@ def _pane_colors_by_measure_names(all_panes):
     return False
 
 
+def _parse_label_slots(all_panes):
+    """Tableau's mark-label TEMPLATE -> the ordered list of DISPLAY SLOTS it actually draws.
+
+    A KPI "BAN" is one mark whose ``<customized-label><formatted-text>`` arranges many pills into a
+    laid-out block. The template is authoritative and structural -- it is the only place that says
+    which pills share a slot::
+
+        "All Passengers"        fontcolor=#666666                  static caption
+        "\\n"
+        <CM Count On-Time...>   bold fontsize=14 #333333           the BIG NUMBER
+        "\\n\\n"
+        <Pos MoM Load Factor>   #49964f  green   |  ADJACENT field runs with
+        <Pos MoM Passenger>     #e63946  red     |  NO separator text between them
+        <Neut MoM Passenger>    #b4b4b4  grey    |  => ONE display slot
+        <Neg MoM Passenger>     #e63946  red     |
+        " "
+        <Calculation_2009...>   #898989 fontsize=8                 a footnote
+
+    THE RULE: runs are split into groups by any run carrying visible text; a maximal run of
+    CONSECUTIVE field runs is ONE display slot. Tableau writes mutually exclusive alternatives
+    (exactly one non-blank per period, its colour carrying the direction) adjacently precisely
+    because they occupy the same position on the card. Binding them as sibling values instead
+    renders the dead alternatives as ``(Blank)`` rows.
+
+    This is deliberately STRUCTURAL: no name matching. A ``Pos``/``Neg`` prefix convention is one
+    author's habit -- and matching on it here would have silently missed this workbook's third
+    member, ``Neut``. Adjacency is what Tableau actually serialises.
+
+    Returns a list of slot dicts ``{"tokens", "colors", "bold", "size", "text"}`` -- ``tokens``
+    empty for a static-text slot -- or ``None`` when the pane carries no mark-label template.
+    """
+    for p in all_panes or []:
+        cl = _first(p, "customized-label")
+        ft = _first(cl, "formatted-text") if cl is not None else None
+        if ft is None:
+            continue
+        slots, group = [], None
+        for run in _findall_local(ft, "run"):
+            text = run.text or ""
+            tokens = _TOKEN_RE.findall(text)
+            if tokens:
+                color = (run.get("fontcolor") or "").strip()
+                if group is None:
+                    group = {"tokens": [], "colors": [], "bold": False, "size": None, "text": ""}
+                    slots.append(group)
+                group["tokens"].extend(tokens)
+                group["colors"].extend([color if _HEX6_RE.match(color) else None] * len(tokens))
+                if (run.get("bold") or "").strip().lower() == "true":
+                    group["bold"] = True
+                size = _font_size_points(run.get("fontsize"))
+                if size and group["size"] is None:
+                    group["size"] = size
+                continue
+            # A run with no field token ENDS the current group. Whitespace-only runs (the
+            # "\n" / "\n\n" spacers) still separate slots -- that is exactly how Tableau lays the
+            # block out -- but only a run with visible text is recorded as a caption.
+            group = None
+            caption = _strip_label_control(text)
+            if caption:
+                slots.append({"tokens": [], "colors": [], "bold": False,
+                              "size": _font_size_points(run.get("fontsize")), "text": caption})
+        if slots:
+            return slots
+    return None
+
+
+# Tableau writes its mark-label LINE BREAK as the literal character ``\u00c6`` immediately followed
+# by a newline (``<run fontalignment='0'>&#xC6;&#10;</run>``, confirmed in the raw workbook bytes).
+# It is layout, not content, so it must not become a caption -- but ``\u00c6`` is also a real letter,
+# so only the marker SEQUENCE is removed, never a bare character inside authored text.
+_LABEL_BREAK_RE = re.compile("\u00c6(?=\r?\n)")
+
+
+def _strip_label_control(text):
+    """Visible caption text of a mark-label run (drops Tableau's layout-only runs).
+
+    A run that is NOTHING but markers and whitespace is layout, so it yields no caption. A run that
+    carries real text keeps it verbatim apart from the break sequence, so an authored caption that
+    genuinely contains ``\u00c6`` is never mutilated.
+    """
+    t = text or ""
+    if not t.replace("\u00c6", "").strip():
+        return ""
+    return _LABEL_BREAK_RE.sub("", t).strip()
+
+
 def _parse_card_label_colors(all_panes):
     """Tableau card ``customized-label`` run colours -> ``{category_color, value_color, value_size}``.
 
