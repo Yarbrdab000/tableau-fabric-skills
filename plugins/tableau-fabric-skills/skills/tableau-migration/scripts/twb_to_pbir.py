@@ -38,6 +38,7 @@ import os
 import re
 import sys
 import xml.etree.ElementTree as ET
+from datetime import datetime
 
 try:  # package or scripts-on-path (mirrors the other cores)
     from .tmdl_generate import clean_col
@@ -7751,6 +7752,31 @@ def _semantic_numeric_literal(value):
         return None
 
 
+def _semantic_datetime_literal(value):
+    """A semantic-query datetime literal from a Tableau ``#...#`` date/datetime literal, else ``None``.
+
+    PBIR slicer preselection proved valid only when expressed as a semantic-query literal
+    (``datetime'2020-01-01T00:00:00'``), not as DAX ``DATE(...)``. The workbook already stores a
+    Tableau date parameter's current value in this exact ``#YYYY-MM-DD#`` / ``#YYYY-MM-DD HH:MM:SS#``
+    form, so parse only those documented shapes and fail closed on anything else.
+    """
+    s = (value or "").strip()
+    m = re.match(
+        r"^#(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{1,2}):(\d{1,2}))?#$",
+        s)
+    if not m:
+        return None
+    year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    hh = int(m.group(4) or 0)
+    mm = int(m.group(5) or 0)
+    ss = int(m.group(6) or 0)
+    try:
+        dt = datetime(year, month, day, hh, mm, ss)
+    except ValueError:
+        return None
+    return "datetime'%s'" % dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
 def _filter_column_ref(entity, prop, *, source=None):
     src = {"Source": source} if source else {"Entity": entity}
     return {"Column": {"Expression": {"SourceRef": src}, "Property": prop}}
@@ -8167,6 +8193,9 @@ def _slicer_preselection_object(field, model_table, field_map):
     ``filterConfig`` behaviour, which is strictly better than an unverifiable guess.
     """
     field = field or {}
+    explicit = field.get("preselect_object")
+    if isinstance(explicit, dict):
+        return explicit
     override = field.get("preselect_override")
     sel = field.get("selection")
     if not override and not sel:
@@ -9626,17 +9655,59 @@ def _param_control_selection(pc):
       * that display differs from the raw stored value, which is precisely what makes the alias the
         human-facing text the picker column holds (``2`` -> ``"Program Name"``).
 
-    A date or plain-scalar parameter has no aliased members and its display IS its value, so it
-    declines here and keeps today's faithful "show all" default. That matters: a literal that matches
-    no row would not merely look wrong, it would filter every downstream visual to blank -- strictly
-    worse than showing "All". Declining is byte-identical to the previous behaviour.
+    A plain string-list parameter whose stored value already IS the picker label (no alias) is also
+    safe: the current value itself must appear in the member list. Date/numeric scalars still decline
+    here; they use the dedicated exact-literal path in :func:`_param_control_preselection_object`.
     """
     meta = (pc or {}).get("param_meta") or {}
     disp, val = meta.get("current_display"), meta.get("current_value")
+    members = {m.get("value") for m in (meta.get("members") or []) if m.get("value") is not None}
     aliases = {m.get("alias") for m in (meta.get("members") or []) if m.get("alias")}
-    if not disp or disp == val or disp not in aliases:
+    if disp and disp != val and disp in aliases:
+        return {"mode": "include", "values": [disp]}
+    if val in members:
+        return {"mode": "include", "values": [val]}
+    return None
+
+
+def _comparison_preselection_object(entity, prop, literal):
+    """One exact-value slicer preselection object (``column == literal``)."""
+    return {"properties": {"filter": {"filter": {
+        "Version": 2,
+        "From": [{"Name": _FILTER_SOURCE_ALIAS, "Entity": entity, "Type": 0}],
+        "Where": [{"Condition": {"Comparison": {
+            "ComparisonKind": 0,
+            "Left": _filter_column_ref(entity, prop, source=_FILTER_SOURCE_ALIAS),
+            "Right": {"Literal": {"Value": literal}},
+        }}}],
+    }}}}
+
+
+def _param_control_preselection_object(pc, res):
+    """A model-resolved scalar parameter control's exact open-on selection, else ``None``.
+
+    Global rule, not caption-based: when a dashboard parameter control is bound to a real picker
+    column and the workbook proves its current saved value, open the rebuilt slicer on that value.
+    The proof comes from the parameter's datatype + saved literal + resolved picker column, so the
+    same logic covers every workbook that uses the same parameter class.
+
+    Field parameters and aliased string list parameters already flow through the categorical
+    selection path above; this helper is for the scalar cases that were previously left at ``All``:
+    date/datetime pickers and numeric value pickers.
+    """
+    meta = (pc or {}).get("param_meta") or {}
+    entity, prop = (res or {}).get("table"), (res or {}).get("column")
+    if not entity or not prop:
         return None
-    return {"mode": "include", "values": [disp]}
+    dtype = ((pc or {}).get("datatype") or "").lower()
+    cur = meta.get("current_value")
+    if dtype in ("date", "datetime"):
+        lit = _semantic_datetime_literal(cur)
+        return _comparison_preselection_object(entity, prop, lit) if lit else None
+    if dtype in ("integer", "real"):
+        lit = _semantic_numeric_literal(cur)
+        return _comparison_preselection_object(entity, prop, lit) if lit else None
+    return None
 
 
 def _field_param_selection(res):
@@ -9689,10 +9760,12 @@ def _emit_param_control_slicers(controls, db_name, page_name, ref_w, ref_h, warn
         # one that runs; a decline on both routes stays byte-identical to before.
         override = _field_param_selection(res)
         sel = None if override else _param_control_selection(pc)
+        pre_obj = None if (override or sel) else _param_control_preselection_object(pc, res)
         field = {"entity": res["table"], "property": res["column"], "binding": "column",
                  "caption": res.get("caption") or res["column"], "aggregation": None,
                  "selection": sel, "range": None,
                  "preselect_override": override,
+                 "preselect_object": pre_obj,
                  "datatype": "string" if sel else None,
                  "preselect_only": True}
         vname = _sanitize(f"paramslicer-{page_name}-{i}-{res['column']}")

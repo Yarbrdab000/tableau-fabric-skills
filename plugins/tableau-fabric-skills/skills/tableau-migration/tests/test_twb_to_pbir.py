@@ -3460,6 +3460,13 @@ _PARAMS_DS = """
         </members>
       </column>
     </datasource>"""
+_DATE_PARAM_DS = """
+    <datasource caption='Parameters' name='Parameters'>
+      <column caption='Start Date' datatype='date' name='[Start Param]' role='measure'
+              type='quantitative' value='#2020-01-01#'>
+        <calculation class='tableau' formula='#2020-01-01#' />
+      </column>
+    </datasource>"""
 
 # a pure passthrough control calc ([Parameters].[id]) + its column-instance, added to a worksheet's
 # datasource-dependencies; a categorical filter pinned to one of its members gates the whole sheet.
@@ -3472,6 +3479,17 @@ _SWAP_CTRL_CALC = """
 
 def _workbook_with_params(worksheets, dashboards=""):
     datasources = _DATASOURCE.replace("</datasources>", _PARAMS_DS + "\n  </datasources>")
+    return (
+        "<?xml version='1.0' encoding='utf-8' ?>\n<workbook>"
+        + datasources
+        + "<worksheets>" + worksheets + "</worksheets>"
+        + ("<dashboards>" + dashboards + "</dashboards>" if dashboards else "")
+        + "</workbook>"
+    )
+
+
+def _workbook_with_custom_params(worksheets, param_ds, dashboards=""):
+    datasources = _DATASOURCE.replace("</datasources>", param_ds + "\n  </datasources>")
     return (
         "<?xml version='1.0' encoding='utf-8' ?>\n<workbook>"
         + datasources
@@ -3718,6 +3736,33 @@ def test_migrate_twb_to_pbir_accepts_param_binding_and_places_slicer_in_dashboar
     pos = v["position"]
     assert 0 <= pos["x"] <= PAGE_WIDTH and 0 <= pos["y"] <= PAGE_HEIGHT
     assert pos["x"] > PAGE_WIDTH / 2  # the control was on the right (x=80000 of 100000)
+
+
+def test_date_parameter_control_emits_saved_date_preselection():
+    # A resolved date/datetime parameter control must open on the saved scalar date instead of
+    # Power BI's default "All". The fix is generic: it keys on datatype + saved value + resolved
+    # picker column, not on any parameter caption.
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]", deps_extra=_INST)
+    dash = ("<dashboard name='Dash'><zones>"
+            "<zone h='100000' w='100000' x='0' y='0'>"
+            "<zone h='90000' w='60000' x='0' y='0' name='Sales by Category' id='2' />"
+            + _paramctrl_zone("Start Param", mode="compact") +
+            "</zone></zones></dashboard>")
+    pb = {"slicers": {"[Start Param]": {"table": "Start Date", "column": "Start Date",
+                                        "single_select": True, "caption": "Start Date"}}}
+    res = migrate_twb_to_pbir(
+        _workbook_with_custom_params(ws, _DATE_PARAM_DS, dash), param_binding=pb)
+    slicer_parts = [k for k in res["parts"] if "/paramslicer-" in k]
+    assert len(slicer_parts) == 1
+    v = json.loads(res["parts"][slicer_parts[0]])
+    gen = (v["visual"].get("objects") or {}).get("general") or []
+    pre = gen[0]["properties"]["filter"]["filter"]
+    cmp_ = pre["Where"][0]["Condition"]["Comparison"]
+    assert cmp_["ComparisonKind"] == 0
+    assert cmp_["Left"]["Column"]["Property"] == "Start Date"
+    assert cmp_["Right"]["Literal"]["Value"] == "datetime'2020-01-01T00:00:00'"
 
 
 def test_tableau_param_control_mode_maps_to_pbi_slicer_mode():
