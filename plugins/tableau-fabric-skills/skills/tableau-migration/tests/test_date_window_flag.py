@@ -8,6 +8,7 @@ from date_window_flag import (  # noqa: E402
     parse_band_case,
     recognize_date_window_flag,
     build_dax,
+    build_row_predicate,
     build_date_window_flags,
 )
 
@@ -32,6 +33,17 @@ LOCKED_DAX = (
     "    sel = 15, IF(d > anchor - 15, 1),\n"
     "    sel = 30, IF(d > anchor - 30 && d <= anchor - 15, 1),\n"
     "    sel = 41, 1\n"
+    ")"
+)
+LOCKED_ROW_PREDICATE = (
+    "VAR anchor = CALCULATE(MAX('Orders'[Order Date]), ALL('Orders'))\n"
+    "VAR sel = SELECTEDVALUE('Date Selection'[Date Selection], 15)\n"
+    "RETURN\n"
+    "SWITCH(\n"
+    "    TRUE(),\n"
+    "    sel = 15, 'Orders'[Order Date] > anchor - 15,\n"
+    "    sel = 30, 'Orders'[Order Date] > anchor - 30 && 'Orders'[Order Date] <= anchor - 15,\n"
+    "    sel = 41, TRUE()\n"
     ")"
 )
 
@@ -142,6 +154,16 @@ def test_build_flags_emits_one_measure_and_binding():
     assert b["value"] == 1
     assert b["calc_id"] == "Calculation_0014172371238940"
     assert b["param_internal"] == "Parameter 0014172370878491"
+    assert b["row_filter"] == {
+        "table": "Orders",
+        "predicate_dax": LOCKED_ROW_PREDICATE,
+    }
+
+
+def test_build_row_predicate_uses_fact_row_not_date_dimension():
+    recog = recognize_date_window_flag(
+        _calcs()[0], _calcs(), _parameters(), _consumed(), **_kw())
+    assert build_row_predicate(recog) == LOCKED_ROW_PREDICATE
 
 
 def test_uniquify_rename_branch():

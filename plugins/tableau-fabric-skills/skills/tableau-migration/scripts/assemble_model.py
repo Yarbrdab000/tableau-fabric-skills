@@ -996,6 +996,10 @@ def _param_predicate_flags(calcs, resolve, param_resolver, *, known_tables,
             "value": 1,
             "calc_id": src_id,
             "param_internal": param_internal,
+            "row_filter": {
+                "table": table,
+                "predicate_dax": pred,
+            },
         }
     return flag_measures, filter_bindings
 

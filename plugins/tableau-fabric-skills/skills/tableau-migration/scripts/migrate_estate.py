@@ -1405,6 +1405,278 @@ def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
     return report_parts, drops, rebinds
 
 
+_WRAP_AGG_DAX = {
+    0: "SUM",
+    1: "AVERAGE",
+    2: "DISTINCTCOUNTNOBLANK",
+    3: "MIN",
+    4: "MAX",
+    5: "COUNTA",
+    6: "MEDIAN",
+}
+
+
+def _dax_table_ref(name):
+    return "'" + str(name or "").replace("'", "''") + "'"
+
+
+def _dax_bracket_ref(name):
+    return "[" + str(name or "").replace("]", "]]") + "]"
+
+
+def _projection_base_dax(field):
+    """The DAX scalar/aggregate a PBIR projection field currently represents, or ``None``.
+
+    This is the producer side of the row-predicate wrapper seam: a Tableau boolean calc filter with
+    ``member='true'`` is a ROW keep, so the faithful Power BI form is
+    ``CALCULATE(<this base>, FILTER('<table>', <predicate>))``. Only measure/aggregation projections
+    are wrapped; categories stay untouched. Fail-closed: an unknown shape returns ``None`` so the
+    caller can leave the visual on its standing behavior rather than half-rewrite it.
+    """
+    node = field if isinstance(field, dict) else {}
+    meas = node.get("Measure") if isinstance(node, dict) else None
+    if isinstance(meas, dict):
+        expr = meas.get("Expression") or {}
+        ent = (expr.get("SourceRef") or {}).get("Entity") if isinstance(expr, dict) else None
+        prop = meas.get("Property")
+        if ent and prop:
+            if ent == "_Measures":
+                return _dax_bracket_ref(prop)
+            return f"{_dax_table_ref(ent)}{_dax_bracket_ref(prop)}"
+        return None
+    agg = node.get("Aggregation") if isinstance(node, dict) else None
+    if isinstance(agg, dict):
+        expr = agg.get("Expression") or {}
+        col = expr.get("Column") if isinstance(expr, dict) else None
+        func = _WRAP_AGG_DAX.get(agg.get("Function"))
+        if not (isinstance(col, dict) and func):
+            return None
+        inner = col.get("Expression") or {}
+        ent = (inner.get("SourceRef") or {}).get("Entity") if isinstance(inner, dict) else None
+        prop = col.get("Property")
+        if ent and prop:
+            return f"{func}({_dax_table_ref(ent)}{_dax_bracket_ref(prop)})"
+    return None
+
+
+def _append_measure_blocks_to_measures_table(table_tmdl, measure_blocks):
+    """Insert additive measure TMDL blocks just before the canonical ``_Measures`` partition."""
+    if not (isinstance(table_tmdl, str) and measure_blocks):
+        return table_tmdl
+    marker = "\tpartition _Measures = calculated\n"
+    idx = table_tmdl.find(marker)
+    if idx < 0:
+        return table_tmdl
+    block = "".join(measure_blocks)
+    if block and not block.endswith("\n"):
+        block += "\n"
+    return table_tmdl[:idx] + block + table_tmdl[idx:]
+
+
+def _strip_flag_measure_filters(filter_config, measure_names):
+    """Drop only the flag-measure containers we superseded with wrapped measures."""
+    if not (isinstance(filter_config, dict) and measure_names):
+        return filter_config, []
+    kept, removed = [], []
+    for fc in (filter_config.get("filters") or []):
+        meas = (((fc.get("field") or {}).get("Measure") or {}).get("Property")
+                if isinstance(fc, dict) else None)
+        if meas in measure_names:
+            removed.append(meas)
+            continue
+        kept.append(fc)
+    if not removed:
+        return filter_config, []
+    if not kept:
+        return None, removed
+    out = dict(filter_config)
+    out["filters"] = kept
+    return out, removed
+
+
+def _wrapper_measure_name(projection, row_filters, reserved_lower):
+    """Deterministic hidden-workhorse measure name for one wrapped projection."""
+    seed = (projection.get("nativeQueryRef") or projection.get("queryRef") or "Measure")
+    seed = re.sub(r"\s+", " ", re.sub(r"[^A-Za-z0-9 _.\-]+", " ", str(seed))).strip(" ._-")
+    seed = (seed or "Measure")[:80]
+    suffix = hashlib.sha1(json.dumps({
+        "field": projection.get("field"),
+        "row_filters": row_filters,
+    }, sort_keys=True).encode("utf-8")).hexdigest()[:8]
+    base = f"{seed} (filtered {suffix})"
+    name, i = base, 2
+    while name.lower() in reserved_lower:
+        name = f"{base} {i}"
+        i += 1
+    reserved_lower.add(name.lower())
+    return name
+
+
+def _apply_row_predicate_wrapped_measures(report_parts, model_parts, result, res_report):
+    """Rewrite affected visuals onto wrapped measures and append those measures to ``_Measures``.
+
+    A Tableau boolean calc filter pinned ``member='true'`` is a ROW-level keep. The earlier
+    ``filter_bindings`` seam carried it into PBIR as a visual-level keep-flag measure filter
+    (``[Flag] == 1``), but that is evaluated at the VISUAL GROUP grain and is vacuously true on
+    ungrouped cards. The faithful shape is a model-side wrapper:
+
+        ``CALCULATE(<existing projection>, FILTER('<table>', <row predicate>))``
+
+    This pass consumes only model-confirmed ``row_filter`` metadata in ``report["filter_bindings"]``
+    plus the viz stage's own ``candidate_records`` (worksheet -> visual mapping). It rewrites a
+    visual ONLY when every measure/aggregation projection on that visual can be wrapped; otherwise it
+    leaves the current build untouched (fail-closed). The superseded flag filter containers are
+    removed from that visual's ``filterConfig`` only on success.
+    """
+    fb = (res_report or {}).get("filter_bindings")
+    records = (result or {}).get("candidate_records")
+    if not (isinstance(fb, dict) and isinstance(records, list)
+            and isinstance(report_parts, dict) and isinstance(model_parts, dict)):
+        return report_parts, model_parts, []
+    ws_bindings = {}
+    for token, spec in fb.items():
+        if not isinstance(spec, dict):
+            continue
+        row_filter = spec.get("row_filter") if isinstance(spec.get("row_filter"), dict) else None
+        status = (spec.get("status") or "").lower()
+        visuals = list(spec.get("visuals") or [])
+        if status not in ("translated", "assisted-approved") or not row_filter or not visuals:
+            continue
+        table = row_filter.get("table")
+        pred = row_filter.get("predicate_dax")
+        if not table or not pred:
+            continue
+        for ws in visuals:
+            ws_bindings.setdefault(ws, []).append({
+                "token": token,
+                "flag_measure": spec.get("measure_name") or spec.get("measure"),
+                "table": table,
+                "predicate_dax": pred,
+            })
+    if not ws_bindings:
+        return report_parts, model_parts, []
+    measures_tmdl = model_parts.get("definition/tables/_Measures.tmdl")
+    if not isinstance(measures_tmdl, str):
+        return report_parts, model_parts, []
+
+    try:
+        from . import tmdl_generate as _tg
+    except ImportError:
+        try:
+            import tmdl_generate as _tg
+        except ImportError:
+            return report_parts, model_parts, []
+
+    visual_paths = {}
+    for path in report_parts:
+        if not (isinstance(path, str) and path.endswith("visual.json")):
+            continue
+        norm = path.replace("\\", "/").split("/")
+        if len(norm) >= 2 and norm[-2]:
+            visual_paths.setdefault(norm[-2], path)
+    if not visual_paths:
+        return report_parts, model_parts, []
+
+    existing_measures, _ = _model_object_names(model_parts)
+    reserved_lower = set(existing_measures or ())
+    out_report = dict(report_parts)
+    out_model = dict(model_parts)
+    measure_blocks = []
+    wrap_cache = {}
+    wrapped = []
+
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        ws_name = rec.get("worksheet")
+        specs = ws_bindings.get(ws_name)
+        vis_name = rec.get("visual")
+        path = visual_paths.get(vis_name)
+        if not specs or not vis_name or not path:
+            continue
+        try:
+            j = json.loads(out_report[path])
+        except (TypeError, ValueError):
+            continue
+        vis = j.get("visual") or {}
+        qs = ((vis.get("query") or {}).get("queryState")) or {}
+        if not qs or any(isinstance(role, dict) and role.get("fieldParameters")
+                         for role in qs.values()):
+            continue
+
+        row_filters = sorted(
+            [{"table": s["table"], "predicate_dax": s["predicate_dax"]} for s in specs],
+            key=lambda s: (s["table"], s["predicate_dax"]),
+        )
+        pending = []
+        failed = False
+        for role_spec in qs.values():
+            if not isinstance(role_spec, dict):
+                continue
+            for proj in (role_spec.get("projections") or []):
+                field = (proj or {}).get("field")
+                if not (isinstance(field, dict) and ("Measure" in field or "Aggregation" in field)):
+                    continue
+                base_dax = _projection_base_dax(field)
+                if not base_dax:
+                    failed = True
+                    break
+                key = (
+                    json.dumps(field, sort_keys=True),
+                    tuple((rf["table"], rf["predicate_dax"]) for rf in row_filters),
+                )
+                pending.append((proj, key, base_dax))
+            if failed:
+                break
+        if failed or not pending:
+            continue
+
+        for proj, key, base_dax in pending:
+            wrap = wrap_cache.get(key)
+            if wrap is None:
+                name = _wrapper_measure_name(proj, row_filters, reserved_lower)
+                filters = ", ".join(
+                    f"FILTER({_dax_table_ref(rf['table'])}, {rf['predicate_dax']})"
+                    for rf in row_filters
+                )
+                dax = f"CALCULATE({base_dax}, {filters})"
+                block = _tg.generate_measure_tmdl(
+                    name, "", dax,
+                    translated_by="deterministic (row-predicate visual wrapper)")
+                wrap = {"name": name, "block": block, "dax": dax}
+                wrap_cache[key] = wrap
+                measure_blocks.append(block)
+            proj["field"] = {
+                "Measure": {
+                    "Expression": {"SourceRef": {"Entity": "_Measures"}},
+                    "Property": wrap["name"],
+                }
+            }
+
+        new_fc, removed = _strip_flag_measure_filters(
+            j.get("filterConfig"),
+            {s.get("flag_measure") for s in specs if s.get("flag_measure")},
+        )
+        if removed:
+            if new_fc is None:
+                j.pop("filterConfig", None)
+            else:
+                j["filterConfig"] = new_fc
+        out_report[path] = json.dumps(j, indent=2)
+        wrapped.append({
+            "visual": vis_name,
+            "worksheet": ws_name,
+            "wrapped": len(pending),
+            "removed_flag_filters": sorted(set(removed)),
+        })
+
+    if not measure_blocks:
+        return report_parts, model_parts, []
+    out_model["definition/tables/_Measures.tmdl"] = _append_measure_blocks_to_measures_table(
+        measures_tmdl, measure_blocks)
+    return out_report, out_model, wrapped
+
+
 def _date_binding_from_model(res_report):
     """Derive the report binder's ``date_binding`` from the model build's date-table report.
 
@@ -2422,6 +2694,16 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                           column_binding=column_binding, resources=wb_images or None)
             if isinstance(rebuilt, dict) and rebuilt.get("parts"):
                 report_parts = _rebind_report_byPath(rebuilt["parts"], model_safe)
+                report_parts, wrapped_model_parts, row_wraps = _apply_row_predicate_wrapped_measures(
+                    report_parts, res.get("parts"), rebuilt, res_report)
+                if row_wraps:
+                    res["parts"] = wrapped_model_parts
+                    entry["row_predicate_wrap"] = {
+                        "visuals": len(row_wraps),
+                        "projections": sum(r.get("wrapped", 0) for r in row_wraps),
+                        "worksheets": sorted({r.get("worksheet") for r in row_wraps
+                                              if r.get("worksheet")}),
+                    }
                 if date_binding:
                     entry["date_rebind"] = {"date_table": date_binding["date_table"],
                                              "active_keys": date_binding["active_keys"]}

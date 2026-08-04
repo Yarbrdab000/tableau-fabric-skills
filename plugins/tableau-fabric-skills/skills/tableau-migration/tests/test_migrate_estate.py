@@ -2616,6 +2616,79 @@ def test_crosscheck_unmatched_dangling_measure_still_drops_with_specs_present():
     assert [d["visual"] for d in drops] == ["c"] and drops[0]["emptied"] is True
 
 
+def test_row_predicate_wrapper_rebinds_visual_and_strips_flag_filter():
+    model_parts = {
+        "definition/tables/_Measures.tmdl":
+            "table _Measures\n"
+            "\tmeasure 'Total Sales' = SUM('Orders'[Sales_Amount])\n"
+            "\tpartition _Measures = calculated\n"
+            '\t\tsource = Row("Value", BLANK())\n'
+            "\tannotation PBI_Id = _Measures\n",
+        "definition/tables/Orders.tmdl":
+            "table Orders\n\tcolumn Sales_Amount\n\t\tdataType: double\n",
+    }
+    report_parts = {
+        "definition/pages/p/visuals/card1/visual.json": json.dumps({
+            "name": "card1",
+            "filterConfig": {
+                "filters": [
+                    {"field": {"Measure": {"Expression": {"SourceRef": {"Entity": "_Measures"}},
+                                           "Property": "Date Filter Flag"}}},
+                    {"field": {"Column": {"Expression": {"SourceRef": {"Entity": "Orders"}},
+                                          "Property": "Region"}}},
+                ],
+            },
+            "visual": {
+                "visualType": "card",
+                "query": {
+                    "queryState": {
+                        "Values": {
+                            "projections": [{
+                                "field": {"Measure": {"Expression": {
+                                    "SourceRef": {"Entity": "_Measures"}},
+                                    "Property": "Total Sales"}},
+                                "queryRef": "_Measures.Total Sales",
+                                "nativeQueryRef": "Total Sales",
+                            }],
+                        },
+                    },
+                },
+            },
+        }),
+    }
+    result = {"candidate_records": [{"visual": "card1", "worksheet": "Sales Card"}]}
+    res_report = {"filter_bindings": {"Date Filter": {
+        "measure_name": "Date Filter Flag", "status": "translated",
+        "visuals": ["Sales Card"],
+        "row_filter": {
+            "table": "Orders",
+            "predicate_dax": "('Orders'[Order_Date] >= [Start Date Value] && "
+                             "'Orders'[Order_Date] <= [End Date Value])",
+        },
+    }}}
+
+    out_parts, out_model, wrapped = me._apply_row_predicate_wrapped_measures(
+        report_parts, model_parts, result, res_report)
+
+    assert wrapped == [{
+        "visual": "card1",
+        "worksheet": "Sales Card",
+        "wrapped": 1,
+        "removed_flag_filters": ["Date Filter Flag"],
+    }]
+    visual = json.loads(out_parts["definition/pages/p/visuals/card1/visual.json"])
+    proj = visual["visual"]["query"]["queryState"]["Values"]["projections"][0]
+    assert proj["queryRef"] == "_Measures.Total Sales"  # downstream selectors keep the old alias
+    wrapped_name = proj["field"]["Measure"]["Property"]
+    assert wrapped_name.startswith("Total Sales (filtered ")
+    assert [f["field"] for f in visual["filterConfig"]["filters"]] == [{
+        "Column": {"Expression": {"SourceRef": {"Entity": "Orders"}}, "Property": "Region"},
+    }]
+    measures = out_model["definition/tables/_Measures.tmdl"]
+    assert f"measure '{wrapped_name}' = CALCULATE([Total Sales], FILTER('Orders'," in measures
+    assert "'Orders'[Order_Date] >= [Start Date Value]" in measures
+
+
 def test_workbook_pbip_disabled_when_pbip_false(tmp_path):
     src = InMemoryTableauSource(workbooks={"Exec Dashboard": SUPERSTORE_DASHBOARD_TWB})
     report = migrate_estate(src, str(tmp_path / "b"), pbip=False)

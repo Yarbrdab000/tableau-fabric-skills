@@ -2836,6 +2836,20 @@ def test_stage2_inline_date_window_measure_translates_end_to_end():
     assert "definition/tables/End Date.tmdl" in out["parts"]
 
 
+def test_param_predicate_flag_binding_carries_row_filter_metadata():
+    out = assemble_import_model(
+        parse_tds(_CASES_TDS), model_name="Cases",
+        dim_calcs=_CASES_DIM_CALCS, parameters=_CASES_DATE_PARAMS)
+    fb = out["report"]["filter_bindings"]["Date Filter Case"]
+    assert fb["measure_name"] == "Date Filter Case Flag"
+    assert fb["row_filter"] == {
+        "table": "Cases",
+        "predicate_dax": (
+            "'Cases'[Intake_Created_Date] >= [Start Date Value] && "
+            "'Cases'[Intake_Created_Date] <= [End Date Value]"),
+    }
+
+
 def test_stage2_inline_without_dim_calc_measure_stays_stub():
     # The forcing function: the SAME model + measure + date params but WITHOUT the date-window dim
     # calc gives the inliner no body to splice, so the consumer stays an honest fail-closed stub --

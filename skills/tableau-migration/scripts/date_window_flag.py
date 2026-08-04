@@ -27,6 +27,7 @@ Original work for this skill. stdlib only.
 import re
 
 __all__ = ["parse_band_case", "recognize_date_window_flag", "build_dax",
+           "build_row_predicate",
            "build_date_window_flags"]
 
 
@@ -240,6 +241,40 @@ def build_dax(recog):
     return "\n".join(lines)
 
 
+def build_row_predicate(recog):
+    """The row-level predicate the keep-flag stands for.
+
+    The report-layer ``flag = 1`` filter proved semantically wrong for this class: it is a GROUP-
+    existence test (vacuously true on an ungrouped card), while Tableau's ``member='true'`` filter
+    is a ROW-level keep. The model-layer fix wraps the visual's projected measure in
+    ``CALCULATE(<base>, FILTER('<fact>', <this predicate>))`` so the same controller parameter and
+    anchor date restrict the FACT rows themselves.
+    """
+    ft, fc = recog["anchor_table"], recog["anchor_col"]
+    pt, pc = recog["value_table"], recog["value_col"]
+    vals = recog["bands"]
+    row_date = f"'{ft}'[{fc}]"
+    lines = [
+        f"VAR anchor = CALCULATE(MAX('{ft}'[{fc}]), ALL('{ft}'))",
+        f"VAR sel = SELECTEDVALUE('{pt}'[{pc}], {vals[0]})",
+        "RETURN",
+        "SWITCH(",
+        "    TRUE(),",
+    ]
+    branch_lines = []
+    for k, v in enumerate(vals):
+        if k == 0:
+            expr = f"{row_date} > anchor - {v}"
+        elif k == len(vals) - 1:
+            expr = "TRUE()"
+        else:
+            expr = f"{row_date} > anchor - {v} && {row_date} <= anchor - {vals[k - 1]}"
+        branch_lines.append(f"    sel = {v}, {expr}")
+    lines.append(",\n".join(branch_lines))
+    lines.append(")")
+    return "\n".join(lines)
+
+
 def _uniquify(candidate, reserved_lower, *, exclude=None):
     taken = {r for r in (reserved_lower or set()) if r not in (exclude or set())}
     if candidate.lower() not in taken:
@@ -262,7 +297,9 @@ def build_date_window_flags(calcs, parameters, consumed_params, *,
         tableau_formula, translated_by, source_calc_name, source_calc_id, report_row}``.
         ``_measures_part`` skips the source calc's plain stub and emits the flag instead.
       * ``filter_bindings`` -- ``{token: {model_table, measure_name, status, predicate, value,
-        calc_id, param_internal}}`` keyed by the source calc CAPTION (the stable join token).
+        calc_id, param_internal, row_filter}}`` keyed by the source calc CAPTION (the stable join
+        token). ``row_filter`` carries the FACT table + row predicate a downstream PBIR seam uses to
+        synthesize wrapped measures, because a visual-level ``flag = 1`` filter is not row-faithful.
         Empty ``{}`` when nothing matched, so no-flag reports stay byte-identical.
     """
     flag_measures, filter_bindings = [], {}
@@ -310,5 +347,9 @@ def build_date_window_flags(calcs, parameters, consumed_params, *,
             "value": 1,
             "calc_id": recog["source_internal"],
             "param_internal": recog["controller"],
+            "row_filter": {
+                "table": recog["anchor_table"],
+                "predicate_dax": build_row_predicate(recog),
+            },
         }
     return flag_measures, filter_bindings
