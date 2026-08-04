@@ -1306,6 +1306,11 @@ def _parse_encodings(pane, ds_default, base_cols, instances, index, ds_caption,
                 _lf_key = (f.get("caption"), f.get("field_id"), f.get("aggregation"))
                 if _lf_key not in seen_label_fields:
                     seen_label_fields.add(_lf_key)
+                    # Stamp the SOURCE TOKEN so the mark-label template (which addresses pills by
+                    # that token, not by caption) can be matched back to this resolved field. The
+                    # encodings shelf order and the template order are independent, and the two sets
+                    # need not coincide, so positional pairing would be wrong.
+                    f["label_token"] = (ds or ds_default, fid)
                     enc["label_fields"].append(f)
             # Retain ALL geo-role Detail pills (not just the first) so a multi-level map binds its
             # Location to the FINEST geography present, not whichever level Tableau serialised first.
@@ -3566,6 +3571,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     measure_colors = (dict(measure_palette)
                       if (measure_palette and _colors_by_measure) else None)
     card_label_colors = _parse_card_label_colors(all_panes)
+    label_slots = _parse_label_slots(all_panes)
 
     dims_rows = [f for f in rows if f["kind"] == "category"]
     dims_cols = [f for f in cols if f["kind"] == "category"]
@@ -3942,6 +3948,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "mark_colors": mark_colors,
         "measure_colors": measure_colors,
         "card_label_colors": card_label_colors,
+        "label_slots": label_slots,
         "data_labels": data_labels,
         "reference_lines": reference_lines,
         "reference_line_constants": reference_line_constants,
@@ -5024,7 +5031,14 @@ def _tableau_number_format(default_format):
     return pattern or None
 
 
-def _role_projections(fields, model_table, field_map, used_refs):
+def _role_projections(fields, model_table, field_map, used_refs, pairs_out=None):
+    """Fields -> PBIR projections.
+
+    ``pairs_out``, when a list is supplied, collects ``(field, projection)`` for every field that
+    produced exactly one projection. Purely an OUT parameter -- it lets a caller address the
+    projection a given field became without re-deriving this function's skip rules. Hierarchy
+    expansions produce several projections for one field and are deliberately not paired.
+    """
     out = []
     for f in fields:
         if f.get("hierarchy"):
@@ -5045,6 +5059,114 @@ def _role_projections(fields, model_table, field_map, used_refs):
         if _fmt and f.get("kind") == "value" and "format" not in proj:
             proj["format"] = _fmt
         out.append(proj)
+        if pairs_out is not None:
+            pairs_out.append((f, proj))
+    return out
+
+
+def _slot_group_name(captions, taken):
+    """A display name for a collapsed slot, derived from what its members SHARE.
+
+    Naming it after one member would claim a direction the card may not be showing ("Pos MoM
+    Revenue" on a month that fell), so the name is built from the words common to EVERY member, in
+    the first member's order. When the members share no word at all it falls back to the first
+    caption -- honest, since there is nothing else to say. Uniquified against ``taken`` so the DAX
+    reference cannot be ambiguous.
+    """
+    words = [c.split() for c in captions if c]
+    if not words:
+        return None
+    common = set(words[0])
+    for w in words[1:]:
+        common &= set(w)
+    name = " ".join([w for w in words[0] if w in common]).strip() or captions[0]
+    base, i = name, 1
+    while name in taken:
+        i += 1
+        name = "{0} {1}".format(base, i)
+    return name
+
+
+def _collapse_label_slot_projections(pairs, projections, ws):
+    """Collapse each MUTUALLY EXCLUSIVE mark-label slot into one COALESCE Visual Calculation.
+
+    Tableau lets one mark label stack several measures in a single display position: exactly one is
+    non-blank in any given period and its COLOUR carries the meaning (green up / red down / grey
+    flat). Projected as siblings they become one real row plus N-1 rows reading ``(Blank)``. The
+    template says which pills share a position -- see ``_parse_label_slots`` -- so each such group
+    is hidden behind a single ``COALESCE`` Visual Calculation, the shape the base measures already
+    support and which is render-verified on a ``multiRowCard``.
+
+    TWO INDEPENDENT GUARDS, both required, both structural (no name matching), and both measured
+    against a real workbook rather than assumed:
+
+    * **every member is value-kind.** A dimension slot stacks genuinely DIFFERENT attributes -- an
+      aircraft tile pairs a label calc with ``aircraft_type``, and a summary tile stacks Distance,
+      Hub City and Hub Country. Those must all keep rendering.
+    * **the members carry >= 2 distinct font colours.** Direction colouring IS the idiom; when the
+      author did not colour-code we decline rather than guess, because a wrong collapse LOSES data
+      whereas a declined one merely leaves today's behaviour in place.
+
+    On the reference workbook these two guards agree exactly: all 14 delta groups are 3-colour
+    measure groups and all 7 rejected groups are single-colour DIMENSION groups.
+
+    Records a ``fidelity_note`` (not a warning) -- the collapse is a faithful automatic reshaping,
+    not something needing manual attention -- so the decision stays auditable in the report.
+    """
+    label_slots = ws.get("label_slots")
+    if not label_slots or not projections:
+        return projections
+    by_token = {}
+    for f, proj in pairs:
+        tok = f.get("label_token")
+        if tok and tok not in by_token:
+            by_token[tok] = (f, proj)
+
+    out = list(projections)
+    taken = {p.get("nativeQueryRef") for p in out if p.get("nativeQueryRef")}
+    collapsed = []
+    for slot in label_slots:
+        tokens = slot.get("tokens") or []
+        if len(tokens) < 2:
+            continue
+        keys = [_split_token(t) for t in tokens]
+        members = [by_token[k] for k in keys if k in by_token]
+        if len(members) < 2:
+            continue
+        if any(f.get("kind") != "value" for f, _ in members):
+            continue
+        if len({c for c in (slot.get("colors") or []) if c}) < 2:
+            continue
+        refs = [p.get("nativeQueryRef") for _, p in members]
+        if not all(refs) or len(set(refs)) != len(refs):
+            continue
+        name = _slot_group_name([f.get("caption") or "" for f, _ in members], taken)
+        if not name:
+            continue
+        taken.add(name)
+        for _, p in members:
+            p["hidden"] = True
+        vc = {"field": {"NativeVisualCalculation": {
+                  "Language": "dax",
+                  "Expression": "COALESCE({0})".format(
+                      ", ".join("[{0}]".format(r) for r in refs)),
+                  "Name": name}},
+              "queryRef": "select_vc{0}".format(len(collapsed)),
+              "nativeQueryRef": name}
+        # The members' authored format (the arrow patterns) belongs to the value that is SHOWN, so
+        # it moves onto the calculation; the hidden bases display nothing.
+        fmt = next((p.get("format") for _, p in members if p.get("format")), None)
+        if fmt:
+            vc["format"] = fmt
+        # Insert where the group began, so the card keeps the author's slot order.
+        out.insert(min(out.index(p) for _, p in members), vc)
+        collapsed.append("{0} <- {1}".format(name, " | ".join(refs)))
+    if collapsed:
+        note = ("mark-label slots stacking mutually exclusive measures in one display position "
+                "collapsed to COALESCE visual calculations ({0}), so the card shows the live "
+                "value instead of (Blank) rows".format("; ".join(collapsed)))
+        ws["fidelity_note"] = (ws["fidelity_note"] + "; " + note
+                               if ws.get("fidelity_note") else note)
     return out
 
 
@@ -5433,8 +5555,11 @@ def _build_query_state(ws, model_table, field_map, warnings):
                        + values(label_fields)
                        + ([size] if size and size["kind"] == "value" else []))
         if vals:
-            state["Values"] = {"projections": _role_projections(
-                vals, model_table, field_map, used_refs)}
+            _pairs = []
+            _projs = _role_projections(vals, model_table, field_map, used_refs,
+                                       pairs_out=_pairs)
+            state["Values"] = {"projections": _collapse_label_slot_projections(
+                _pairs, _projs, ws)}
     elif vt == VT_SHAPE_MAP:
         # Shape map (built-in-topology choropleth): the geo-role dimension on Detail is the Category
         # (Location), bound at the FINEST geo level present (State over its parent Country). A single

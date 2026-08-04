@@ -12,6 +12,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.49.0` -> `2.50.0`)**: collapse a mark-label's mutually exclusive
+  delta slot into one value on cards. Tableau's mark-label template routinely places several
+  measures ADJACENT with no separator -- a green Pos twin, a red Neg twin, a grey Neutral -- so
+  that exactly one is non-blank per row and the reader sees a single signed delta. Bound as
+  separate projections these produced one `(Blank)` row per inactive twin. The label template's
+  display slots (2.48.0) are now matched back to their projections by source token and, where the
+  slot is unambiguously a set of alternatives, replaced by a single COALESCE visual calculation;
+  the base measures are HIDDEN rather than removed so the expression cannot dangle. Collapse
+  requires BOTH that every member is value-kind AND that the slot carries >=2 distinct author
+  font colours -- adjacent same-coloured measures are companions (a value and its percent-of-
+  total), not alternatives, and collapsing those would silently DELETE data. The group is named
+  from the words common to every member caption, so it never claims a direction the card may not
+  be showing, and is uniquified against the visual's existing references. Each collapse is
+  recorded as a `rebuilt` fidelity note. Measured on a 107-visual reference workbook: 13 slots
+  collapsed, 9 `(Blank)` KPI rows -> 0, render-verified in Power BI Desktop, with 108 of 121
+  visual files byte-identical to the previous release and 0 visuals added or removed. Across a
+  29-workbook corpus there were 0 structural regressions, and the colour guard empirically
+  declined 3 collapses that would have destroyed data on unrelated workbooks.
+
 - **tableau-migration (skill `2.48.0` -> `2.49.0`): carry the author's number format onto every
   measure projection.** Tableau records each field's authored format on its `<column>` as
   `default-format` -- a one-character family marker followed by an Excel-style pattern, the same
