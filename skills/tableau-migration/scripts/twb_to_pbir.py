@@ -4726,6 +4726,31 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
 
 
 # -- PBIR field expression emission --------------------------------------------
+def _model_bound_category(field, field_map=None):
+    """Whether a categorical colour pill can safely become a Series/Legend projection.
+
+    Tableau's Colour shelf splits marks by the coloured dimension, which is exactly Power BI's
+    Series/Legend well -- so a colour dimension SHOULD project. A raw column always can. A CALC
+    dimension can only be projected when the model build actually materialised it as a column; a
+    calc that never became one (e.g. a row-level calc reaching a Tableau parameter, which cannot
+    be a calculated column because it would freeze at refresh time) would bind to a dangling
+    reference, so it abstains and the caller defers with its existing warning.
+
+    ``column_rebound`` / ``date_rebound`` are the model build's own authoritative statements that
+    the field WAS materialised, and ``field_map`` is that build's manifest of real model columns
+    (see :func:`_apply_override`); a calc present in either is safe to project. A blanket refusal
+    of every calc -- the previous rule, applied at all 8 chart-type sites -- silently dropped the
+    legend on the many real dashboards whose colour rule is a calc.
+    """
+    if not field or field.get("kind") != "category":
+        return False
+    if not field.get("is_calc"):
+        return True
+    if field.get("column_rebound") or field.get("date_rebound"):
+        return True
+    return bool(field_map) and field.get("caption") in field_map
+
+
 def _apply_override(field, model_table, field_map):
     """Return (entity, property, binding) after applying caller overrides.
 
@@ -4961,8 +4986,7 @@ def _build_query_state(ws, model_table, field_map, warnings):
         cat = drop_calc_axis(_dedupe(categories(rows) + categories(cols)))
         y_meas = _dedupe(split.get("Y", []))
         y2_meas = _dedupe(split.get("Y2", []))
-        series = [color] if (color and color["kind"] == "category"
-                             and not color["is_calc"]) else []
+        series = [color] if (_model_bound_category(color, field_map)) else []
         cat = [f for f in cat if f not in series]
         if cat:
             state["Category"] = {"projections": _role_projections(
@@ -4983,8 +5007,7 @@ def _build_query_state(ws, model_table, field_map, warnings):
         # Breakdown role (segments each bar); the per-step gantt size delta is dropped.
         cat = drop_calc_axis(_dedupe(categories(rows) + categories(cols)))
         val = _dedupe(values(rows) + values(cols))
-        breakdown = [color] if (color and color["kind"] == "category"
-                                and not color["is_calc"]) else []
+        breakdown = [color] if (_model_bound_category(color, field_map)) else []
         cat = [f for f in cat if f not in breakdown]
         if cat:
             state["Category"] = {"projections": _role_projections(
@@ -5017,8 +5040,7 @@ def _build_query_state(ws, model_table, field_map, warnings):
         # recomputes the rank from it). The INDEX()/RANK() table-calc rank/spacer axis pills are
         # dropped (they are value-role calc artifacts, never categories, so they never reach a
         # role). Role keys Category/Series/Y verified against real Microsoft PBIR ribbonChart files.
-        series = [color] if (color and color["kind"] == "category"
-                             and not color["is_calc"]) else []
+        series = [color] if (_model_bound_category(color, field_map)) else []
         cat = drop_calc_axis(_dedupe(categories(rows) + categories(cols)))
         cat = [f for f in cat if f not in series]
         ribbon_val = next((f for f in (detail, size, label)
@@ -5063,8 +5085,7 @@ def _build_query_state(ws, model_table, field_map, warnings):
     elif vt in (VT_COLUMN, VT_BAR):
         cat = drop_calc_axis(_dedupe(categories(rows) + categories(cols)))
         val = _dedupe(values(rows) + values(cols))
-        series = [color] if (color and color["kind"] == "category"
-                             and not color["is_calc"]) else []
+        series = [color] if (_model_bound_category(color, field_map)) else []
         cat = [f for f in cat if f not in series]
         if cat:
             state["Category"] = {"projections": _role_projections(
@@ -5085,8 +5106,7 @@ def _build_query_state(ws, model_table, field_map, warnings):
         col_cats = drop_calc_axis(_dedupe(categories(cols)))
         row_cats = drop_calc_axis(_dedupe(categories(rows)))
         val = _dedupe(values(rows) + values(cols))
-        color_series = [color] if (color and color["kind"] == "category"
-                                   and not color["is_calc"]) else []
+        color_series = [color] if (_model_bound_category(color, field_map)) else []
         if col_cats:
             cat = col_cats
             small = row_cats          # rows paning dimension -> small multiples (trellis)
@@ -5178,8 +5198,7 @@ def _build_query_state(ws, model_table, field_map, warnings):
             categories(rows) + categories(cols)
             + ([detail] if detail and detail["kind"] == "category" else [])
             + detail_dims))
-        series = [color] if (color and color["kind"] == "category"
-                             and not color["is_calc"]) else []
+        series = [color] if (_model_bound_category(color, field_map)) else []
         cat = [f for f in cat if f not in series]
         # only bind Size if that measure is not already an axis (avoid double-binding)
         axis_keys = {(f["entity"], f["property"], f["binding"], f["aggregation"])
@@ -5268,8 +5287,7 @@ def _build_query_state(ws, model_table, field_map, warnings):
         # role (a valid filledMap role on a real visual.json); each area is shaded by its legend
         # member. Mutually exclusive with Gradient by construction: Tableau's single Color shelf
         # holds either a measure (Gradient saturation) or a dimension (Series legend), never both.
-        color_series = ([color] if (color and color["kind"] == "category"
-                                    and not color["is_calc"]) else [])
+        color_series = ([color] if (_model_bound_category(color, field_map)) else [])
         color_series = [f for f in color_series if f not in loc]
         if color_series:
             state["Series"] = {"projections": _role_projections(
@@ -5314,8 +5332,7 @@ def _build_query_state(ws, model_table, field_map, warnings):
         # a categorical (dimension) colour binds the map LEGEND -> the "Series" role (verified on a
         # real classic "map" visual.json, e.g. Series=Continent); bubbles are coloured by legend
         # member. Disjoint from Gradient (above): Gradient takes colour only when it is a measure.
-        color_series = ([color] if (color and color["kind"] == "category"
-                                    and not color["is_calc"]) else [])
+        color_series = ([color] if (_model_bound_category(color, field_map)) else [])
         color_series = [f for f in color_series if f not in loc]
         if color_series:
             state["Series"] = {"projections": _role_projections(

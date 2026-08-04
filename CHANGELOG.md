@@ -12,6 +12,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.44.0` -> `2.45.0`): project a CALCULATED colour dimension
+  into the Series/Legend well when the model materialised it.** Tableau's Colour shelf splits
+  marks by the coloured dimension -- exactly what Power BI's Series/Legend well does -- but
+  the emitter refused every calc outright (`not color["is_calc"]`, repeated verbatim at all
+  8 chart-type sites). That silently dropped the legend on the many real dashboards whose
+  colour rule is a calc, and in turn starved the per-member `dataPoint` fill path found in
+  2.44.0, whose selector needs the coloured column to be projected. The refusal is now a
+  single shared `_model_bound_category` test: a raw dimension always projects; a CALC
+  projects only where the model build says the column exists (`column_rebound` /
+  `date_rebound`, or presence in the model manifest). A calc that never became a column --
+  e.g. a row-level calc reaching a Tableau parameter, which cannot be a calculated column
+  because it would freeze at refresh -- still abstains, so nothing binds to a dangling
+  reference. A measure-kind colour (an aggregate calc returning a member name) still never
+  projects: a measure cannot sit in a legend. 15 new tests
+  (`tests/test_calc_colour_legend.py`); 9/9 mutants killed.
+
 - **tableau-migration (skill `2.43.0` -> `2.44.0`): find categorical mark-colour palettes
   stored at the DATASOURCE level.** Tableau writes an explicit member->colour map
   (`<map to='#hex'><bucket>"Member"</bucket></map>`) ONCE on `<datasource><style>` whenever
