@@ -1690,11 +1690,26 @@ def _date_binding_from_model(res_report):
     dr = (res_report or {}).get("date_table") or {}
     if not (dr.get("generated") and dr.get("mark_as_date") and dr.get("table")):
         return None
-    active = [r.get("column") for r in (dr.get("relationships") or [])
-              if r.get("active") and r.get("column")]
+    rels = [r for r in (dr.get("relationships") or []) if r.get("column")]
+    active = [r["column"] for r in rels if r.get("active")]
     if not active:
         return None
-    return {"date_table": dr["table"], "active_keys": active, "key_column": "Date"}
+    # ``ambiguous_keys``: date columns that are ACTIVE on one table and NOT active on another table
+    # that also carries them. The binder identifies a date pill by column name (the field's entity is
+    # still the workbook's relation name at that point, not the model's table), so for these it
+    # cannot tell "the fact that owns the active relationship" from "a different fact with the same
+    # column name". Rebinding the wrong one onto the calendar produces a flat time series, so they
+    # are named here and declined there. Additive: absent when no name is contested.
+    act_names = {(c or "").strip().lower() for c in active}
+    inact_names = {(r["column"] or "").strip().lower()
+                   for r in rels if not r.get("active")}
+    ambiguous = sorted(
+        {r["column"] for r in rels
+         if (r["column"] or "").strip().lower() in act_names & inact_names})
+    out = {"date_table": dr["table"], "active_keys": active, "key_column": "Date"}
+    if ambiguous:
+        out["ambiguous_keys"] = ambiguous
+    return out
 
 
 def _measure_binding_from_model(res_report):

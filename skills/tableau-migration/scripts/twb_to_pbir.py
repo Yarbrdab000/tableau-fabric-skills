@@ -446,8 +446,25 @@ def _rebind_date_axis(field, deriv, date_binding):
     table = date_binding.get("date_table")
     if not table:
         return None
+    # A date column name is safe to rebind only when it is ACTIVE everywhere it appears. Matching on
+    # the name alone is a silent correctness bug: a fact with NO active date relationship still
+    # rebinds its axis to the calendar as soon as some OTHER table's active date shares the column
+    # name (``CreatedDate`` is near-universal). The calendar then cannot filter that fact at all, so
+    # every bucket returns the grand total and the time series renders as a FLAT line / solid block --
+    # confidently wrong, with no warning.
+    #
+    # The gate is expressed on the COLUMN NAME rather than on ``(table, column)`` deliberately: here
+    # the field's ``entity`` is still the WORKBOOK's relation name (a Tableau extract emits
+    # ``Orders_ECFCA1FB690A41FE803BC071773BA862``), not the model's table display name, so a pair
+    # comparison could never hold. ``ambiguous_keys`` names the date columns that are active on one
+    # table and NOT active on another that also carries them -- precisely the case a name match
+    # cannot disambiguate -- and those decline. Additive: a caller that supplies no
+    # ``ambiguous_keys`` keeps the previous behaviour byte-for-byte.
     active = {_norm_date_col(c) for c in (date_binding.get("active_keys") or ())}
-    if _norm_date_col(field.get("property")) not in active:
+    prop = _norm_date_col(field.get("property"))
+    if prop not in active:
+        return None
+    if prop in {_norm_date_col(c) for c in (date_binding.get("ambiguous_keys") or ())}:
         return None
     if deriv in _DATE_PARTS:
         grains = date_binding.get("grain_columns") or _DEFAULT_DATE_GRAIN_COLUMNS

@@ -1811,10 +1811,19 @@ def _inject_field_param_tables(parts, table_names, fp_parts, fp_names):
 def _select_primary_date(date_cols):
     """Pick the primary (active-relationship) date column, or None when it's ambiguous.
 
-    A single date column is always primary. With several, prefer an ORDER_DATE-like name (or a
-    column literally named 'Date'); if exactly one matches it is primary, otherwise the choice is
-    ambiguous and we return None so EVERY date relationship is emitted inactive -- never silently
-    picking the wrong business date (e.g. defaulting the calendar to Ship Date over Order Date).
+    A single date column is always primary. With several, prefer a column carrying one of the
+    explicit primary-date naming conventions -- literally ``Date``, an ORDER_DATE-like name, or a
+    record-CREATION date (``CreatedDate`` / ``Created Date`` / ``Date Created``, the canonical event
+    date in essentially every CRM / case / ticketing schema). If exactly one convention matches it is
+    primary; otherwise the choice is ambiguous and we return None so EVERY date relationship is
+    emitted inactive -- never silently picking the wrong business date (e.g. defaulting the calendar
+    to Ship Date over Order Date).
+
+    Recognising the creation-date convention matters because leaving them ALL inactive is not a
+    neutral outcome: the calendar then cannot filter that fact at all, so every date-axis visual over
+    it returns the grand total in every bucket and renders as a flat line / solid block. A fact whose
+    dates are ``CreatedDate`` + ``ClosedDate`` (no ``Date``/``Order Date`` anywhere) previously hit
+    exactly that, losing its whole time axis.
     """
     if len(date_cols) == 1:
         return date_cols[0]
@@ -1822,8 +1831,15 @@ def _select_primary_date(date_cols):
     def _norm(s):
         return (s or "").strip().lower().replace("_", " ").replace("-", " ")
 
-    hints = [c for c in date_cols
-             if _norm(c) == "date" or ("order" in _norm(c) and "date" in _norm(c))]
+    def _is_primary_name(c):
+        n = _norm(c)
+        if n == "date":
+            return True
+        if "date" not in n:
+            return False
+        return "order" in n or "created" in n
+
+    hints = [c for c in date_cols if _is_primary_name(c)]
     return hints[0] if len(hints) == 1 else None
 
 
@@ -1927,7 +1943,34 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
             f"without it. Pass date_range=(start_year, end_year) (e.g. from the datasource profile's "
             f"date MIN/MAX) to fit the calendar to your data.")
     else:
-        source_expr = "CALENDARAUTO()"
+        # CALENDARAUTO() derives its span by scanning EVERY dateTime column in the model, so ONE
+        # unrelated column -- a contact birthdate, a date-of-birth, an archival timestamp -- drags the
+        # calendar back decades and buries the business range under tens of thousands of empty rows.
+        # Every date axis bound to the calendar then renders its real data as an unreadable sliver at
+        # one edge (measured: a Salesforce case model whose contacts carry birthdates produced a
+        # calendar starting in 1941 for data that begins in 2017). Span only the fact date columns the
+        # calendar actually RELATES to -- the same reasoning ``parameters.date_picker_domain`` already
+        # applies to a date picker -- rounded OUT to whole years so the table still satisfies
+        # Mark-as-Date's contiguous full-year requirement. DAX MIN/MAX ignore blanks, so a fact with
+        # no rows simply does not contribute a bound. Falls back to CALENDARAUTO() when the calendar
+        # relates to nothing (unreachable here, but never emit an empty CALENDAR).
+        span = [(r["from_table"], r["from_col"]) for r in rels]
+        if span:
+            def _fold(fn, terms):
+                expr = terms[0]
+                for t in terms[1:]:
+                    expr = f"{fn}({expr}, {t})"
+                return expr
+
+            def _ref(t, c):
+                return "'" + str(t).replace("'", "''") + "'[" + str(c) + "]"
+
+            lo = _fold("MIN", [f"MIN({_ref(t, c)})" for t, c in span])
+            hi = _fold("MAX", [f"MAX({_ref(t, c)})" for t, c in span])
+            source_expr = (f"CALENDAR(DATE(YEAR({lo}), 1, 1), "
+                           f"DATE(YEAR({hi}), 12, 31))")
+        else:
+            source_expr = "CALENDARAUTO()"
     part = T.generate_date_table_tmdl(date_name, mark_as_date=mark_as_date, source_expr=source_expr)
     report = {"generated": True, "table": date_name, "mark_as_date": mark_as_date,
               "relationships": details, "warnings": warnings}

@@ -14,6 +14,7 @@ from assemble_model import (
     resolve_consolidated_column,
     write_model_folder,
     _date_axis_order_resolver,
+    _select_primary_date,
     _approved_entry,
     _calc_columns_part,
     _split_calcs_by_role,
@@ -2106,6 +2107,26 @@ def test_date_band_supersedes_plain_stub_and_reports_translated():
     assert rows["Date Filter"]["status"] == "translated"
     assert rows["Date Filter"]["source"]["model_table"] == "_Measures"
     assert rows["Date Filter"]["source"]["calc_instance_token"] == "Calculation_0014172371238940"
+
+
+def test_select_primary_date_recognizes_creation_date_convention():
+    # A fact whose dates are CreatedDate + ClosedDate (no 'Date' / 'Order Date' anywhere) previously
+    # returned None -> EVERY date relationship emitted inactive -> the calendar could not filter that
+    # fact -> every date-axis visual over it rendered the grand total in every bucket (a flat solid
+    # block). The record-CREATION date is the canonical event date in CRM / case / ticketing schemas,
+    # so it is recognised as an explicit primary-date convention.
+    assert _select_primary_date(["ClosedDate", "CreatedDate"]) == "CreatedDate"
+    assert _select_primary_date(["Closed Date", "Date Created"]) == "Date Created"
+    assert _select_primary_date(["created_date", "resolved_date"]) == "created_date"
+
+
+def test_select_primary_date_keeps_its_ambiguity_guard():
+    # The conservatism is NOT weakened: a single column is always primary; two competing conventions
+    # stay ambiguous (never silently pick one); and no convention at all stays ambiguous.
+    assert _select_primary_date(["Ship Date"]) == "Ship Date"
+    assert _select_primary_date(["Order Date", "Created Date"]) is None
+    assert _select_primary_date(["Ship Date", "Due Date"]) is None
+    assert _select_primary_date(["Date", "Order Date"]) is None
 
 
 def test_no_date_band_means_no_filter_bindings_key():

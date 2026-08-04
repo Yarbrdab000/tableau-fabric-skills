@@ -3785,6 +3785,38 @@ def test_param_binding_from_model_flag_visuals_default_empty():
     assert pb["flags"]["Date Filter"]["visuals"] == []
 
 
+def test_date_binding_from_model_names_contested_date_columns():
+    # A date column ACTIVE on one table and INACTIVE on another that also carries it cannot be told
+    # apart by name, and the binder only has the name (the field's entity is still the workbook's
+    # relation name at that point). Naming it here lets the binder decline rather than rebind the
+    # wrong fact onto a calendar that cannot filter it -- a flat time series.
+    rr = {"date_table": {
+        "generated": True, "mark_as_date": True, "table": "Date",
+        "relationships": [
+            {"table": "Engagement", "column": "CreatedDate", "active": True},
+            {"table": "Case", "column": "CreatedDate", "active": False},
+            {"table": "Case", "column": "ClosedDate", "active": False},
+        ]}}
+    db = me._date_binding_from_model(rr)
+    assert db["active_keys"] == ["CreatedDate"]
+    assert db["ambiguous_keys"] == ["CreatedDate"]
+
+
+def test_date_binding_from_model_omits_ambiguous_when_uncontested():
+    # The common single-fact shape: the active date is active everywhere it appears, and a purely
+    # secondary date (never active anywhere) is not contested either -- so no key is blocked and the
+    # ordinary rebind proceeds.
+    rr = {"date_table": {
+        "generated": True, "mark_as_date": True, "table": "Date",
+        "relationships": [
+            {"table": "Orders", "column": "Order_Date", "active": True},
+            {"table": "Orders", "column": "Ship_Date", "active": False},
+        ]}}
+    db = me._date_binding_from_model(rr)
+    assert db["active_keys"] == ["Order_Date"]
+    assert "ambiguous_keys" not in db
+
+
 def test_scope_flag_visuals_attaches_worksheets(monkeypatch):
     # The flag's source calc_id is mapped, via workbook_calc_usage, to the worksheets that placed the
     # source Tableau filter calc; those names are written into the binding's ``visuals`` list.

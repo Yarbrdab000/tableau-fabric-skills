@@ -179,13 +179,31 @@ def test_build_date_dimension_directquery_omits_datepartonly():
     assert any("DirectQuery" in w for w in report["warnings"])
 
 
-def test_build_date_dimension_import_uses_calendarauto():
-    # An Import model keeps CALENDARAUTO() -- its data is in the model, so the date-column scan
-    # works at refresh and yields the exact span needed for Mark-as-Date.
+def test_build_date_dimension_import_spans_only_related_fact_dates():
+    # An Import model must NOT use CALENDARAUTO(): it scans EVERY dateTime column in the model, so a
+    # single unrelated column (a contact birthdate) drags the calendar back decades and buries the
+    # business range under tens of thousands of empty rows -- every date axis then renders its real
+    # data as an unreadable sliver. The calendar spans only the fact date columns it actually relates
+    # to, rounded OUT to whole years so Mark-as-Date's contiguous full-year requirement still holds.
     tables = [_rel("Orders", "Order_Date")]
     _name, part, _rels, _report = _build_date_dimension(tables, ["Orders"], [], mode="import")
-    assert "source = CALENDARAUTO()" in part
-    assert "CALENDAR(DATE(" not in part
+    assert ("source = CALENDAR(DATE(YEAR(MIN('Orders'[Order_Date])), 1, 1), "
+            "DATE(YEAR(MAX('Orders'[Order_Date])), 12, 31))") in part
+    assert "CALENDARAUTO" not in part
+
+
+def test_build_date_dimension_import_span_folds_every_related_date_column():
+    # Several related fact dates (including a secondary/inactive one) all contribute a bound, so the
+    # calendar covers every date the model can actually put on an axis -- and nothing else.
+    tables = [_rel("Orders", "Order_Date"), _rel("Orders", "Ship_Date"),
+              _rel("Returns", "Return_Date")]
+    _name, part, rels, _report = _build_date_dimension(
+        tables, ["Orders", "Returns"], [], mode="import")
+    for t, c in (("Orders", "Order_Date"), ("Orders", "Ship_Date"), ("Returns", "Return_Date")):
+        assert f"MIN('{t}'[{c}])" in part and f"MAX('{t}'[{c}])" in part
+    # every emitted relationship's column is represented in the span (no date axis lands off-calendar)
+    assert {(r["from_table"], r["from_col"]) for r in rels} == {
+        ("Orders", "Order_Date"), ("Orders", "Ship_Date"), ("Returns", "Return_Date")}
 
 
 def test_build_date_dimension_directquery_uses_fixed_range_calendar():

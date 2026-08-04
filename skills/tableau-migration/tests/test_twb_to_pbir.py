@@ -2847,6 +2847,47 @@ def test_chart_without_rank_calc_is_not_a_ribbon():
 _DATE_BINDING = {"date_table": "Date", "active_keys": ["Order Date"], "key_column": "Date"}
 
 
+def test_ambiguous_date_key_declines_the_rebind():
+    # REGRESSION (sf-npo Intake): active dates were matched by column NAME alone, so a fact with NO
+    # active date relationship still had its axis rebound to the calendar as soon as some OTHER
+    # table's active date shared the name (``CreatedDate`` is near-universal). The calendar cannot
+    # filter that fact, so every bucket returned the grand total and the chart rendered as a FLAT
+    # solid block -- confidently wrong, no warning. A contested name declines instead.
+    ws = _worksheet("Sales Trend", "Line",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[mn:Order Date:ok]",
+                    deps_extra=_INST)
+    binding = dict(_DATE_BINDING, ambiguous_keys=["Order Date"])
+    col = parse_twb(_workbook(ws), date_binding=binding)["worksheets"][0]["cols"][0]
+    assert col["entity"] == "Orders"          # never pulled onto the calendar
+    assert not col.get("date_rebound")
+
+
+def test_uncontested_active_date_still_rebinds():
+    # The other half: a date column active everywhere it appears is NOT ambiguous, so it rebinds.
+    # This is the common single-fact case and must stay working -- gating it on (table, column)
+    # instead would break it, because the field's entity here is the WORKBOOK relation name (a
+    # Tableau extract emits ``Orders_<hex32>``), not the model's table display name.
+    ws = _worksheet("Sales Trend", "Line",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[mn:Order Date:ok]",
+                    deps_extra=_INST)
+    binding = dict(_DATE_BINDING, ambiguous_keys=["Ship Date"])
+    col = parse_twb(_workbook(ws), date_binding=binding)["worksheets"][0]["cols"][0]
+    assert (col["entity"], col["property"]) == ("Date", "Month")
+
+
+def test_active_keys_only_binding_stays_name_matched():
+    # Back-compat: a binding that supplies no ``ambiguous_keys`` keeps the original name-only match,
+    # so every existing caller is byte-for-byte unchanged.
+    ws = _worksheet("Sales Trend", "Line",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[mn:Order Date:ok]",
+                    deps_extra=_INST)
+    col = parse_twb(_workbook(ws), date_binding=_DATE_BINDING)["worksheets"][0]["cols"][0]
+    assert (col["entity"], col["property"]) == ("Date", "Month")
+
+
 def test_date_part_on_active_date_rebinds_to_date_table():
     ws = _worksheet("Sales Trend", "Line",
                     rows="[federated.abc].[sum:Sales:qk]",
