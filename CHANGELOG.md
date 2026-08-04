@@ -12,6 +12,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.48.0` -> `2.49.0`): carry the author's number format onto every
+  measure projection.** Tableau records each field's authored format on its `<column>` as
+  `default-format` -- a one-character family marker followed by an Excel-style pattern, the same
+  dialect Power BI format strings use (`n#,##0;-#,##0`, `c"$"#,##0,,.00M`, `p0.0%`, and custom
+  `*` patterns that embed literal glyphs). The emitter read that attribute **nowhere**, so every
+  measure rendered raw: a currency KPI as `566788416` instead of `$566.79M`, and a
+  month-over-month delta as `0.0070` instead of the up-arrow percentage the author drew into the
+  format itself. New `_tableau_number_format` maps the numeric families (`n`/`c`/`p`/`*`) and
+  fails closed on everything else -- notably Tableau's `d` date patterns, whose token vocabulary
+  is not the .NET/Excel one and would silently mis-render if passed through. The format rides on
+  the projection as PBIR `RoleProjection.format` (the key the Visual Calculation path already
+  used) and is applied to **value-kind fields only**. Additive: the new `number_format` key was
+  added to all three `_resolve_field` construction sites -- the main dict, the `measure_binding`
+  rebind early-return, and the row-count early-return -- because the rebind path is where the
+  month-over-month measures actually resolve, and omitting it left **0 of 243** projections
+  formatted. Measured on the reference workbook: **68 of 243** projections now carry an authored
+  format; across a 29-workbook corpus regression **17 workbooks gain formats with 0 structural
+  regressions** (identical status, page and visual counts everywhere). Render-verified in Power
+  BI Desktop.
+
 - **tableau-migration (skill `2.47.0` -> `2.48.0`): read the Tableau mark-label TEMPLATE.**
   A KPI "BAN" is one mark whose `<customized-label><formatted-text>` lays many pills out as a
   block, and that template is the only authoritative statement of which pills share a DISPLAY

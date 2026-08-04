@@ -709,6 +709,7 @@ def _parse_dependencies(view):
                 "is_calc": calc_el is not None,
                 "formula": calc_el.get("formula") if calc_el is not None else None,
                 "geo_role": c.get("semantic-role") or "",
+                "number_format": c.get("default-format"),
             }
         for ci in _children_local(dep, "column-instance"):
             iid = _strip_brackets(ci.get("name") or "")
@@ -880,6 +881,7 @@ def _bind_or_warn_row_count(rc, ds, worksheet, base_id, field_id, deriv,
             "entity": entity, "property": measure,
             "binding": "measure", "kind": "value",
             "geo_area": None, "formula": None,
+            "number_format": None,
         }
     if warn_special:
         if rc["kind"] == "object_id" and rc.get("table"):
@@ -1088,6 +1090,7 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
                 "entity": m_entity, "property": m_measure,
                 "binding": "measure", "kind": "value",
                 "geo_area": None, "formula": _mb_base.get("formula"),
+                "number_format": _tableau_number_format(_mb_base.get("number_format")),
                 "measure_rebound": True,
                 "rebound_to_instance": rebound_to_instance,
             }
@@ -1160,6 +1163,7 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
         "binding": None, "kind": None,
         "geo_area": _geo_area(base.get("geo_role", "")) if role != "measure" else None,
         "formula": base.get("formula"),
+        "number_format": _tableau_number_format(base.get("number_format")),
     }
 
     # A model-confirmed calc-DIMENSION binding (from the ``column_binding`` manifest) is AUTHORITATIVE
@@ -4988,6 +4992,38 @@ def _hierarchy_level_projections(field, used_refs):
     return out
 
 
+# Tableau records each field's authored number format on its ``<column>`` as ``default-format``, a
+# TYPE-PREFIXED pattern: one leading marker character selects the family and the remainder is an
+# Excel-style pattern (``positive;negative`` sections, ``,`` scaling, quoted literals) -- which is
+# the same dialect Power BI's format strings use. Observed across the corpus:
+#
+#     n#,##0;-#,##0                        number
+#     c"$"#,##0,,.00M;-"$"#,##0,,.00M      currency, millions-scaled
+#     p0.0%                                percent
+#     *<up>0.0%;<down>0.0%                 custom -- the arrow glyphs the author drew into the format
+#
+# The emitter previously read this attribute NOWHERE, so every measure rendered raw: ``339851``
+# instead of ``339,851``, and a month-over-month delta as ``0.0070`` instead of its authored arrow.
+# Only the numeric families are mapped. Tableau's DATE patterns use its own token vocabulary rather
+# than the .NET/Excel one, so ``d``-prefixed formats are deliberately left alone rather than passed
+# through and silently mis-rendered.
+_TABLEAU_FORMAT_MARKERS = "ncp*"
+
+
+def _tableau_number_format(default_format):
+    """Tableau ``default-format`` -> a Power BI format string (or ``None`` to leave it default).
+
+    Fail-closed: anything without a recognised numeric marker, or with an empty pattern after it,
+    yields ``None`` so the value keeps Power BI's default rendering instead of being handed a
+    pattern that might not mean the same thing.
+    """
+    fmt = (default_format or "").strip()
+    if len(fmt) < 2 or fmt[0] not in _TABLEAU_FORMAT_MARKERS:
+        return None
+    pattern = fmt[1:].strip()
+    return pattern or None
+
+
 def _role_projections(fields, model_table, field_map, used_refs):
     out = []
     for f in fields:
@@ -5001,7 +5037,14 @@ def _role_projections(fields, model_table, field_map, used_refs):
         _e, _p, _b = _apply_override(f, model_table, field_map)
         if not (_p or "").strip().strip("\"'").strip():
             continue
-        out.append(_projection(f, model_table, field_map, used_refs))
+        proj = _projection(f, model_table, field_map, used_refs)
+        # The authored format rides on the projection (PBIR ``RoleProjection.format``, the same key
+        # the Visual Calculation path already uses). Applied to VALUE-kind fields only: a measure's
+        # format is unambiguous, whereas a date/category axis format is Tableau's own token dialect.
+        _fmt = f.get("number_format")
+        if _fmt and f.get("kind") == "value" and "format" not in proj:
+            proj["format"] = _fmt
+        out.append(proj)
     return out
 
 
