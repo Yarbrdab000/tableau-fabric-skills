@@ -4066,6 +4066,26 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
     zone_ord = 0
     first_ws_ord = None
     ext_w = ext_h = 0.0
+    # AUTHOR-HIDDEN ZONES. ``hidden-by-user='true'`` is Tableau's record that the author collapsed a
+    # dashboard object behind a show/hide toggle -- Tableau renders NOTHING for it on open. Emitting
+    # it anyway does not merely add furniture, it OCCLUDES: a toggled help panel is written after the
+    # worksheets (see ``_image_z``) and therefore covers the entire page, and a hidden per-airline
+    # background plate stacks on top of the one that should show. Hidden content is therefore skipped.
+    #
+    # ``filter`` zones are deliberately EXEMPT and keep their long-standing behaviour (surfaced at
+    # their authored position, flagged ``hidden``): a collapsed filter BAND is a control the reader
+    # can still use and it does not paint over anything, and Power BI has no Tier-1 collapse
+    # equivalent. The distinction is occluding CONTENT (skip) versus a usable CONTROL (keep).
+    #
+    # Hiding is inherited: ``_findall_local`` is a flat walk, so a hidden layout container's children
+    # are visited independently and must be pruned with it -- otherwise a container toggled off as a
+    # unit leaks its contents onto the canvas.
+    hidden_zones = set()
+    hidden_skipped = []
+    for _hz in _findall_local(db, "zone"):
+        if (_hz.get("hidden-by-user") or "").strip().lower() == "true":
+            for _desc in _hz.iter("zone"):
+                hidden_zones.add(id(_desc))
     # Every captured item below additively records ``zone_id`` -- the source zone's ``id`` attribute,
     # the same key ``zone_tree`` stores on each node and ``layout_solve`` keys its solved rects by.
     # It is the IDENTITY SEAM the layout-solver emit path needs: without it a captured dict is just a
@@ -4087,6 +4107,17 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
             ext_w = max(ext_w, x + w)
             ext_h = max(ext_h, y + h)
         ztype = zone.get("type-v2") or zone.get("type")
+        # Skip author-hidden CONTENT (see ``hidden_zones`` above). Filter cards are exempt and fall
+        # through to their own branch, which records ``hidden`` for diagnostics and still surfaces
+        # the control. Counted so the fidelity report states what was withheld rather than silently
+        # dropping it.
+        if ztype != "filter" and id(zone) in hidden_zones:
+            hidden_skipped.append({
+                "zone_id": zone.get("id"),
+                "type": ztype or "worksheet",
+                "ref": zone.get("name") or zone.get("param") or "",
+            })
+            continue
         # A title/header zone is a decoration ``type='text'`` zone the author filled and titled
         # (e.g. the full-width crimson band at the very top). It is NOT a worksheet, so it must not
         # enter ``zones`` (existing behaviour below still skips it on the name check); we only
@@ -4226,6 +4257,14 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
                         if not (t["text"] == title_banner["text"]
                                 and t["x"] == title_banner["x"]
                                 and t["y"] == title_banner["y"])]
+    if hidden_skipped:
+        warnings.append(_warn(
+            "dashboard", name,
+            "%d author-hidden zone(s) not rebuilt (Tableau 'hidden-by-user' show/hide toggle -- "
+            "Tableau renders nothing for them on open): %s" % (
+                len(hidden_skipped),
+                ", ".join("%s[%s]" % (z["type"], z["ref"] or z["zone_id"])
+                          for z in hidden_skipped[:8]))))
     return {"name": name, "size": size,
             "extent": {"w": ext_w or None, "h": ext_h or None}, "zones": zones,
             "param_controls": param_controls, "legend_zones": legend_zones,
@@ -4237,6 +4276,8 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
             # at all. Every image whose ``paint_ord`` is below this was written BENEATH the sheets.
             "first_ws_ord": first_ws_ord,
             "title_banner": title_banner,
+            # Author-hidden zones withheld from the rebuild, for the fidelity report.
+            "hidden_zones_skipped": hidden_skipped,
             # The solved layout for this dashboard, or None under the legacy engine / on any solve
             # failure. Built HERE because this is the only place the source <dashboard> element is in
             # scope; the emit path consumes it as a lookup rather than re-parsing the XML.
@@ -8464,6 +8505,14 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     global _PAGE_H_OVERRIDE, _PAGE_W_OVERRIDE, _LAYOUT_PLAN, _ZONE_PAD_SCALE
     for db in ir["dashboards"]:
         page_name = _sanitize("page-" + (db["name"] or "dashboard"))
+        # A worksheet whose ONLY appearance on this dashboard is an author-hidden zone is still
+        # PLACED -- the author put it on the dashboard and then collapsed it. Seeding ``placed``
+        # keeps it from falling through to the standalone-worksheet pass below, which would give a
+        # deliberately hidden sheet (e.g. a help/guidelines panel) its own visible report page --
+        # the opposite of the author's intent.
+        for _hz in db.get("hidden_zones_skipped") or []:
+            if _hz.get("ref"):
+                placed.add(_hz["ref"])
         zones = db["zones"]
         ref_w = (db["extent"]["w"] or max((z["x"] + z["w"] for z in zones), default=0)
                  or db["size"]["w"])

@@ -12,6 +12,19 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.45.0` -> `2.46.0`): honour author-hidden dashboard zones.**
+  Tableau records a dashboard object the author collapsed behind a show/hide toggle as
+  `hidden-by-user='true'` and renders nothing for it on open; the rebuild emitted it anyway.
+  Because a toggled panel is painted after the worksheets, this did not merely add furniture --
+  it OCCLUDED: on the reference workbook an entire dashboard page was covered end to end by a
+  hidden help/guidelines panel, three per-airline background plates stacked over the one that
+  should show, and six hidden parameter cards surfaced as stray slicers. Author-hidden CONTENT
+  is now skipped, with hiding INHERITED by a hidden container's whole subtree. `filter` zones
+  remain deliberately EXEMPT (a collapsed filter band is a usable, non-occluding control and
+  Power BI has no collapse equivalent), keeping their existing `hidden` flag. A worksheet whose
+  only appearance is a hidden zone counts as PLACED, so it never becomes its own report page.
+  Each dashboard reports what was withheld. Render-verified in Power BI Desktop 2.157.
+
 - **tableau-migration (skill `2.44.0` -> `2.45.0`): project a CALCULATED colour dimension
   into the Series/Legend well when the model materialised it.** Tableau's Colour shelf splits
   marks by the coloured dimension -- exactly what Power BI's Series/Legend well does -- but
