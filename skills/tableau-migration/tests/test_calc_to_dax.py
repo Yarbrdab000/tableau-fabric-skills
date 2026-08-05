@@ -1142,6 +1142,90 @@ def test_table_calc_falls_back(formula, order_by):
     assert translate_tableau_table_calc_to_dax(formula, _resolver, (), order_by)[0] is None
 
 
+# A table-calc head is a PRIMARY, so it composes: heads can be multiplied, compared, divided by one
+# another, nested inside row functions, and used as an IF condition/branch. Every head in one formula
+# shares the single worksheet addressing, which is what makes composing them well-defined.
+TABLE_CALC_COMPOSITES = [
+    ('WINDOW_MAX(SUM([Sales])) * 1.2', (), _ORDER,
+     "MAXX(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales]))) * 1.2"),
+    ('INDEX() / SIZE()', (), _ORDER,                          # two argument-less heads
+     "DIVIDE(ROWNUMBER(ORDERBY('Orders'[Order_Date], ASC)), "
+     "COUNTROWS(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC))))"),
+    ('WINDOW_AVG(SUM([Sales])) + (WINDOW_STDEV(SUM([Sales])) * 2)', (), _ORDER,  # control-chart band
+     "AVERAGEX(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales]))) + "
+     "(STDEVX.S(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales]))) * 2)"),
+    ('SUM([Sales]) = WINDOW_MAX(SUM([Sales]))', (), _ORDER,   # head compared to a plain aggregate
+     "SUM('Orders'[Sales]) = MAXX(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ('IF LAST() = 0 THEN RUNNING_SUM(SUM([Sales])) END', (), _ORDER,  # head in a condition AND a branch
+     "IF(COUNTROWS(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC))) - "
+     "ROWNUMBER(ORDERBY('Orders'[Order_Date], ASC)) = 0, "
+     "SUMX(WINDOW(1, ABS, 0, REL, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales]))))"),
+    ('SUM([Sales]) / TOTAL(SUM([Sales]))', (), _ORDER,        # rank-like head (raw refs, not the spec)
+     "DIVIDE(SUM('Orders'[Sales]), "
+     "CALCULATE(SUM('Orders'[Sales]), ALLSELECTED('Orders'[Order_Date])))"),
+    ('WINDOW_SUM(SUM([Sales])) - WINDOW_AVG(SUM([Profit]))', _PART, _ORDER,  # both heads take PARTITIONBY
+     "SUMX(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC), "
+     "PARTITIONBY('Orders'[Region])), CALCULATE(SUM('Orders'[Sales]))) - "
+     "AVERAGEX(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC), "
+     "PARTITIONBY('Orders'[Region])), CALCULATE(SUM('Orders'[Profit])))"),
+    ('ZN(WINDOW_SUM(SUM([Sales])))', (), _ORDER,              # head nested inside a row function
+     "COALESCE(SUMX(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales]))), 0)"),
+    ('RUNNING_SUM(SUM([Sales])) / WINDOW_SUM(SUM([Sales]))', (), _ORDER,  # running share-of-total
+     "DIVIDE(SUMX(WINDOW(1, ABS, 0, REL, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales]))), "
+     "SUMX(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales]))))"),
+]
+
+
+@pytest.mark.parametrize(
+    "formula,partition_by,order_by,expected",
+    TABLE_CALC_COMPOSITES,
+    ids=[t[0] for t in TABLE_CALC_COMPOSITES],
+)
+def test_table_calc_composite_translates(formula, partition_by, order_by, expected):
+    assert translate_tableau_table_calc_to_dax(
+        formula, _resolver, partition_by, order_by)[0] == expected
+
+
+# Composing heads must not weaken ANY guard: the same checks that reject a bare head still reject it
+# when it is one term of a larger expression, and the reason text is unchanged.
+TABLE_CALC_COMPOSITE_FALLBACKS = [
+    ("WINDOW_SUM(SUM([Sales])) * 2", (), "order-by"),                 # no addressing
+    ("WINDOW_SUM(SUM([People Count])) * 2", _ORDER, "cross-table"),   # inner + addressing span tables
+    ("WINDOW_SUM(SUM([Sales])) * 2 )", _ORDER, "trailing tokens"),    # unbalanced -> not silently kept
+    ("PREVIOUS_VALUE(SUM([Sales])) * 2", _ORDER, "unsupported table calculation"),
+    ("WINDOW_MAX(MAX([Region])) + 1", _ORDER, "numeric/date"),        # non-numeric inner
+    ("SUM([Sales]) + 1", _ORDER, "unsupported table calculation"),    # no head at all
+    ("[Sales] + 1", _ORDER, "not a table calculation"),               # not even a function call
+]
+
+
+@pytest.mark.parametrize(
+    "formula,order_by,expected_reason",
+    TABLE_CALC_COMPOSITE_FALLBACKS,
+    ids=[repr(f[0]) for f in TABLE_CALC_COMPOSITE_FALLBACKS],
+)
+def test_table_calc_composite_falls_back(formula, order_by, expected_reason):
+    dax, reason, _ = translate_tableau_table_calc_to_dax(formula, _resolver, (), order_by)
+    assert dax is None
+    assert expected_reason in reason
+
+
+def test_table_calc_head_stays_unsupported_on_the_plain_measure_path():
+    # Composition is enabled ONLY by the table-calc entry point, which is the only caller that has
+    # the worksheet addressing to compile against. The ordinary measure path must be unchanged.
+    dax, reason, _ = translate_tableau_calc_to_dax("WINDOW_SUM(SUM([Sales])) * 2", _resolver)
+    assert dax is None
+    assert "unsupported function WINDOW_SUM" in reason
+
+
 def test_table_calc_cross_table_falls_back():
     # Inner field (People) and addressing (Orders) span two tables -> fallback.
     dax, reason, _ = translate_tableau_table_calc_to_dax(

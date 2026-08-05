@@ -16,6 +16,8 @@ from workbook_table_calcs import Pill, TableCalcUsage, extract_table_calc_usages
 from table_calc_to_dax import (
     translate_table_calc_usage,
     translate_table_calc_usages,
+    _formula_is_aggregate,
+    _inline_scope_calcs,
     _intent_for,
     _rank_formula,
     _is_order_sensitive,
@@ -125,7 +127,7 @@ def test_field_date_grain_partition_hands_off():
     assert "date-grain dimension" in t.reason
 
 
-@pytest.mark.parametrize("token", ["Pane", "Columns", "ColumnInPane",
+@pytest.mark.parametrize("token", ["Pane", "ColumnInPane",
                                     "PaneCol", "CellInPane", "Cell", "Table"])
 def test_scope_relative_tokens_hand_off(token):
     u = _usage(ordering_type=token, ordering_fields=[])
@@ -133,6 +135,15 @@ def test_scope_relative_tokens_hand_off(token):
     assert t.status == "handoff"
     assert "scope-relative addressing" in t.reason
     assert t.handoff["ordering_type"] == token
+
+
+def test_columns_scope_hands_off_an_order_sensitive_cumtotal():
+    # 'Columns' is recovered only where the mirror rule's unevidenced half cannot matter; this
+    # order-sensitive CumTotal is not that case, so it still hands off (with a sharper reason).
+    t = translate_table_calc_usage(_usage(ordering_type="Columns", ordering_fields=[]), resolver)
+    assert t.status == "handoff"
+    assert "order-sensitive" in t.reason
+    assert t.handoff["ordering_type"] == "Columns"
 
 
 # -- Rank (RANKX) -- synthesized from the QTC rank-options, translated by the window seam ------
@@ -382,6 +393,76 @@ def test_rows_scope_order_sensitive_multi_cols_hands_off():
         resolver)
     assert t.status == "handoff"
     assert "multiple Cols" in t.reason
+
+
+def test_rows_scope_aggregate_row_pill_is_skipped_not_a_blocker():
+    # The commonest real shape (a line chart: SUM([Sales]) on Rows, a date on Cols). An AGGREGATED
+    # Rows pill is the mark's measure, not an addressing dimension -- Tableau partitions only by
+    # dimensions -- so it contributes nothing and the calc addresses across the whole table.
+    t = translate_table_calc_usage(
+        _rows_scope_usage(rows=[_pill("Sales", "Sum")]), resolver)
+    assert t.status == "translated"
+    assert t.partition_by == ()
+    assert t.order_by == (("Order Date", "ASC"),)
+    assert "PARTITIONBY" not in t.dax
+
+
+def test_rows_scope_aggregate_row_pill_does_not_drop_a_real_dimension():
+    # Skipping the measure must not swallow a genuine partition dimension sharing the shelf.
+    t = translate_table_calc_usage(
+        _rows_scope_usage(rows=[_pill("Sales", "Sum"), _pill("Segment")]), resolver)
+    assert t.status == "translated"
+    assert t.partition_by == ("Segment",)
+    assert "PARTITIONBY('Orders'[Segment])" in t.dax
+
+
+def test_rows_scope_bare_user_calc_row_pill_still_hands_off():
+    # Fail-closed: an UNAGGREGATED calc pill may itself be a dimension, so dropping it could emit a
+    # confidently wrong window. Only aggregation proves a pill is a measure.
+    t = translate_table_calc_usage(
+        _rows_scope_usage(rows=[_pill("Calc2", "User")]), resolver)
+    assert t.status == "handoff"
+    assert "not a plain dimension" in t.reason
+
+
+def test_rows_scope_aggregating_user_calc_row_pill_is_skipped():
+    # A calc pill whose OWN formula aggregates is a measure just as surely as a Sum pill, so it is
+    # not a partition dimension either. (The Salesforce KPI shape: a measure calc on Rows.)
+    t = translate_table_calc_usage(
+        _rows_scope_usage(rows=[_pill("Calc2", "User")],
+                          scope_formulas={"Calc2": "SUM([Sales]) - SUM([Profit])"}),
+        resolver)
+    assert t.status == "translated"
+    assert t.partition_by == ()
+
+
+def test_rows_scope_row_level_user_calc_row_pill_still_hands_off():
+    # A row-level calc really can be a dimension ([Region] + " - " + [Segment]) -> fail closed.
+    t = translate_table_calc_usage(
+        _rows_scope_usage(rows=[_pill("Calc2", "User")],
+                          scope_formulas={"Calc2": '[Region] + " - " + [Segment]'}),
+        resolver)
+    assert t.status == "handoff"
+    assert "not a plain dimension" in t.reason
+
+
+def test_rows_scope_lod_user_calc_row_pill_still_hands_off():
+    # An LOD aggregates but is routinely used AS a dimension (binning customers by their spend),
+    # so it must NOT count as proof of being a measure.
+    t = translate_table_calc_usage(
+        _rows_scope_usage(rows=[_pill("Calc2", "User")],
+                          scope_formulas={"Calc2": "{FIXED [Customer] : SUM([Sales])}"}),
+        resolver)
+    assert t.status == "handoff"
+    assert "not a plain dimension" in t.reason
+
+
+def test_formula_is_aggregate_ignores_parentheses_inside_field_names():
+    # A Tableau field name can contain parentheses; blinding bracketed refs first stops
+    # "[... (copy)_3899]" being read as a call to REFERRALS(...).
+    assert _formula_is_aggregate("[New Inbound Referrals (copy)_3899]") is False
+    assert _formula_is_aggregate("SUM([New Inbound Referrals (copy)_3899])") is True
+    assert _formula_is_aggregate("") is False
 
 
 # -- percent-difference-from-prior quick table calc (composite; dedicated emitter) ---------------
@@ -853,3 +934,178 @@ def test_synthesize_tolerates_bracketed_column():
     bracketed = translate_table_calc_usage(_usage(column="[Profit]", ordering_fields=["Category"]), resolver)
     assert bracketed.status == "translated"
     assert bracketed.dax == bare.dax
+
+
+# -- a table calc written over a NAMED calc field ------------------------------
+def test_calc_ref_is_inlined_so_the_seam_sees_an_aggregate():
+    # Total([Referrals]) where [Referrals] = COUNTD(...). In measure context a bare [Referrals]
+    # is an unaggregated field and used to fall back; the scope carries its formula, so inlining
+    # makes the table calc self-contained without changing what it computes.
+    u = _rows_scope_usage(
+        formula="WINDOW_SUM([Referrals])",
+        scope_formulas={"Referrals": "SUM([Sales])"})
+    t = translate_table_calc_usage(u, resolver)
+    assert t.status == "translated"
+    assert "SUM('Orders'[Sales])" in t.dax
+    assert "Referrals" not in t.dax
+
+
+def test_calc_ref_inlining_matches_the_hand_written_equivalent():
+    inlined = translate_table_calc_usage(
+        _rows_scope_usage(formula="WINDOW_SUM([Ref])", scope_formulas={"Ref": "SUM([Sales])"}),
+        resolver)
+    direct = translate_table_calc_usage(
+        _rows_scope_usage(formula="WINDOW_SUM((SUM([Sales])))"), resolver)
+    assert inlined.status == direct.status == "translated"
+    assert inlined.dax == direct.dax
+
+
+def test_calc_ref_to_a_nested_table_calc_fails_closed():
+    # [Ref] is ITSELF a table calc -> a stacked second addressing pass. Flattening two passes into
+    # one would compute the wrong thing, so this must hand off rather than translate.
+    t = translate_table_calc_usage(
+        _rows_scope_usage(formula="WINDOW_SUM([Ref])",
+                          scope_formulas={"Ref": "RUNNING_SUM(SUM([Sales]))"}),
+        resolver)
+    assert t.status != "translated"
+    assert "stacked" in (t.reason or "")
+
+
+def test_raw_field_reference_is_not_inlined():
+    # a bracketed reference that is NOT a known calc must survive verbatim for the field resolver.
+    t = translate_table_calc_usage(
+        _rows_scope_usage(formula="WINDOW_SUM(SUM([Sales]))",
+                          scope_formulas={"Ref": "SUM([Profit])"}),
+        resolver)
+    assert t.status == "translated"
+    assert "SUM('Orders'[Sales])" in t.dax
+    assert "Profit" not in t.dax
+
+
+def test_calc_ref_inlining_is_case_insensitive():
+    t = translate_table_calc_usage(
+        _rows_scope_usage(formula="WINDOW_SUM([ref])", scope_formulas={"Ref": "SUM([Sales])"}),
+        resolver)
+    assert t.status == "translated"
+    assert "SUM('Orders'[Sales])" in t.dax
+
+
+def test_no_scope_formulas_leaves_the_formula_untouched():
+    assert _inline_scope_calcs("WINDOW_SUM(SUM([Sales]))", None) == (
+        "WINDOW_SUM(SUM([Sales]))", None)
+    assert _inline_scope_calcs("WINDOW_SUM(SUM([Sales]))", {}) == (
+        "WINDOW_SUM(SUM([Sales]))", None)
+
+
+def test_inline_does_not_mistake_a_parameter_for_a_calc():
+    out, reason = _inline_scope_calcs(
+        "WINDOW_AVG(SUM([Sales])) * [Parameters].[Parameter 4]", {"Ref": "SUM([Profit])"})
+    assert reason is None
+    assert out == "WINDOW_AVG(SUM([Sales])) * [Parameters].[Parameter 4]"
+
+
+def test_inline_cycle_fails_closed_to_verbatim():
+    # a reference chain that loops resolves to None -> left verbatim, never expanded forever.
+    out, reason = _inline_scope_calcs("WINDOW_SUM([A])", {"A": "SUM([B])", "B": "SUM([A])"})
+    assert reason is None
+    assert "[A]" in out
+
+
+def test_inline_declines_a_calc_that_drags_in_a_parameter():
+    # inlining would splice [Parameters].(#2020-01-01#) into the formula and the lexer would blame a
+    # stray '.'; naming the parameter is the truthful reason for the same stub.
+    out, reason = _inline_scope_calcs(
+        "WINDOW_MAX([Closed])",
+        {"Closed": "COUNTD(IF [Closed Date] >= [Parameters].(#2020-01-01#) THEN [Id] END)"})
+    assert out is None
+    assert "unmodeled parameter" in reason
+    assert "[Closed]" in reason
+
+
+# -- the 'Columns' pane scope (Tableau "Table (across)") -----------------------
+def _cols_scope_usage(**kw):
+    """A ``Columns`` pane-scope usage shaped like the live-verified specimen: plain dimensions on
+    Rows, only an aggregated measure on Cols."""
+    defaults = dict(
+        worksheet="Challenge", instance="usr:Calc:qk", column="Calc1", caption="Window Max",
+        kind="field", calc_type=None, derivation="User", aggregation=None,
+        formula="WINDOW_MAX(SUM([Sales])) * 1.2", ordering_type="Columns", ordering_fields=[],
+        rows=[_pill("Category"), _pill("Sub-Category")],
+        cols=[_pill("Sales", "Sum")],
+    )
+    defaults.update(kw)
+    return TableCalcUsage(**defaults)
+
+
+def test_columns_scope_no_col_dim_addresses_over_the_rows_dims():
+    # VERIFIED shape: Cols holds only SUM(Sales), so the partition is empty under EITHER reading of
+    # the mirror rule -- forced, not guessed -- and the calc addresses over the Rows dims.
+    t = translate_table_calc_usage(_cols_scope_usage(), resolver)
+    assert t.status == "translated"
+    assert t.partition_by == ()
+    assert t.order_by == (("Category", "ASC"), ("Sub-Category", "ASC"))
+    assert "PARTITIONBY" not in t.dax
+    assert "ORDERBY('Orders'[Category], ASC, 'Orders'[Sub-Category], ASC)" in t.dax
+
+
+def test_columns_scope_multiple_rows_dims_is_not_ambiguous_when_order_insensitive():
+    # the Rows path hands off on multiple order dims; an order-INSENSITIVE window covers its whole
+    # partition, so their slowest->fastest order cannot change the answer.
+    two = translate_table_calc_usage(_cols_scope_usage(), resolver)
+    one = translate_table_calc_usage(_cols_scope_usage(rows=[_pill("Category")]), resolver)
+    assert two.status == one.status == "translated"
+
+
+def test_columns_scope_order_sensitive_hands_off():
+    t = translate_table_calc_usage(
+        _cols_scope_usage(formula="RUNNING_SUM(SUM([Sales]))"), resolver)
+    assert t.status != "translated"
+    assert "order-sensitive" in t.reason
+
+
+def test_columns_scope_with_a_real_col_dimension_hands_off():
+    # this is precisely the unevidenced half of the mirror rule -- it must stay a handoff.
+    t = translate_table_calc_usage(
+        _cols_scope_usage(cols=[_pill("Region"), _pill("Sales", "Sum")]), resolver)
+    assert t.status != "translated"
+    assert "Cols-shelf dimension" in t.reason
+
+
+def test_columns_scope_aggregating_calc_pill_on_cols_is_a_measure():
+    t = translate_table_calc_usage(
+        _cols_scope_usage(cols=[_pill("KPI", "User")],
+                          scope_formulas={"KPI": "SUM([Sales])"}), resolver)
+    assert t.status == "translated"
+    assert t.partition_by == ()
+
+
+def test_columns_scope_unproven_calc_pill_on_cols_fails_closed():
+    # a row-level calc pill may genuinely BE a dimension -> we cannot assume the partition is empty.
+    t = translate_table_calc_usage(
+        _cols_scope_usage(cols=[_pill("Bucket", "User")],
+                          scope_formulas={"Bucket": "IF [Sales] > 100 THEN 'Big' ELSE 'Small' END"}),
+        resolver)
+    assert t.status != "translated"
+    assert "Cols-shelf dimension" in t.reason
+
+
+def test_columns_scope_no_rows_dimension_hands_off():
+    t = translate_table_calc_usage(_cols_scope_usage(rows=[]), resolver)
+    assert t.status != "translated"
+    assert "no Rows dimension" in t.reason
+
+
+def test_columns_scope_unproven_calc_pill_on_rows_fails_closed():
+    t = translate_table_calc_usage(
+        _cols_scope_usage(rows=[_pill("Bucket", "User")],
+                          scope_formulas={"Bucket": "IF [Sales] > 100 THEN 'Big' ELSE 'Small' END"}),
+        resolver)
+    assert t.status != "translated"
+    assert "does not provably aggregate" in t.reason
+
+
+def test_other_scope_tokens_still_hand_off():
+    for token in ("Pane", "Cell", "Table"):
+        t = translate_table_calc_usage(_cols_scope_usage(ordering_type=token), resolver)
+        assert t.status != "translated", token
+        assert "not recoverable" in t.reason

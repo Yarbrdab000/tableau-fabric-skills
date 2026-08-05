@@ -533,12 +533,24 @@ def _tokenize(formula):
 class _Parser:
     def __init__(self, toks, resolver, tables_used, mode="measure", param_resolver=None,
                  measure_refs=None, known_tables=None, inline_calcs=None, related_tables=None,
-                 conformed_hubs=None, related_wrap=None):
+                 conformed_hubs=None, related_wrap=None, tablecalc=None):
         self.toks = toks
         self.pos = 0
         self.resolver = resolver
         self.tables_used = tables_used
         self.mode = mode          # "measure" (default) or "column" (row-level)
+        # tablecalc: when set (ONLY by translate_tableau_table_calc_to_dax), a table-calculation
+        # head is a legal PRIMARY anywhere an expression is legal, so a composite such as
+        # ``WINDOW_AVG(SUM([Sales])) + WINDOW_STDEV(SUM([Sales])) * [Param]`` or ``INDEX()/SIZE()``
+        # translates instead of falling back. Every head in one formula shares the SAME addressing
+        # (it comes from the one worksheet usage), which is what makes composing them well-defined.
+        # None (the default) keeps the measure/column paths byte-identical: a table calc there is
+        # still an "unsupported function", because those paths have no addressing to compile against.
+        #   {"spec": "ORDERBY(..)[, PARTITIONBY(..)]" | None,   # window-function heads
+        #    "all_refs": [...], "part_refs": [...]}             # RANK*/TOTAL heads
+        self.tablecalc = tablecalc
+        self.tablecalc_heads = 0  # how many heads were consumed -> "is this really a table calc?"
+        self._tc_inner_type = "number"  # dtype of the last table-calc head's inner expression
         self.param_resolver = param_resolver
         # measure_refs: {normalized-key -> (measure_name, dtype)} for cross-calc references.
         # A bare ``[X]`` in a MEASURE that names another already-translated measure becomes a
@@ -643,6 +655,34 @@ class _Parser:
         if not self._is_kw(kw):
             raise _CalcError(f"expected {kw}")
         self._next()
+
+    def _table_calc_head(self, name):
+        """Translate ONE table-calculation head as a primary, inside a larger expression.
+
+        Only reachable when ``self.tablecalc`` is set. Consumes ``name (`` and delegates to the
+        same emitters the single-head seam uses, so a head nested in arithmetic emits byte-identical
+        DAX to that head standing alone.
+        """
+        if self.mode == "column":
+            raise _CalcError(f"table calculation {name} not valid in a row-level column calc")
+        tc = self.tablecalc
+        self._next()             # the table-calc name
+        self._expect_op("(")
+        self.tablecalc_heads += 1
+        self._tc_inner_type = "number"   # emitters overwrite this with the real inner dtype
+        if name in _TABLECALC_RANKLIKE:
+            # RANK*/TOTAL need the raw addressing/partition COLUMNS (to enumerate marks and restrict
+            # to the current partition), not the ORDERBY/PARTITIONBY window spec.
+            part_refs, addr_refs = tc["rank_refs"]()
+            if not addr_refs:
+                raise _CalcError("table calc requires an explicit order-by spec")
+            dax = _emit_rank(name, self, part_refs + addr_refs, part_refs)
+        else:
+            spec = tc["spec"]()
+            if spec is None:
+                raise _CalcError("table calc requires an explicit order-by spec")
+            dax = _emit_table_calc(name, self, spec)
+        return (dax, _table_calc_result_type(name, self._tc_inner_type))
 
     @staticmethod
     def _expect_bool(node):
@@ -962,6 +1002,8 @@ class _Parser:
                 return self._scalar_fn(u)
             if u in _ROW_LEVEL_FNS:
                 return self._row_fn(u)
+            if self.tablecalc is not None and u in _TABLE_CALCS:
+                return self._table_calc_head(u)
             raise _CalcError(f"unsupported function {v}")
         if k == "field":
             if self.mode == "column":
@@ -2899,6 +2941,7 @@ def _emit_rank(name, p, mark_refs, part_refs):
     # mark_refs enumerate the marks (partition + addressing columns); part_refs are the partition
     # subset. Computes the current mark's rank (or partition total) among all marks in its partition.
     inner = p._expr()  # measure-context inner; an aggregate (a bare row-level field falls back)
+    p._tc_inner_type = inner[1]
     is_total = name == "TOTAL"
     if not is_total and inner[1] != "number":
         # The RANK family ranks a numeric measure; TOTAL re-aggregates any supported inner
@@ -2996,6 +3039,21 @@ def _window_frame(p, spec, default):
     return f"WINDOW({start}, REL, {end}, REL, {spec})"
 
 
+def _table_calc_result_type(name, inner_type):
+    """The dtype a table-calc head yields, given its inner expression's dtype.
+
+    Most heads are numeric: they count, position, rank, or sum/average. Three families are
+    VALUE-PRESERVING and must carry the inner type through -- MIN/MAX windows re-pick an existing
+    value, LOOKUP re-evaluates the same expression at another row, and TOTAL re-aggregates the same
+    inner aggregate over a wider scope. Typing those ``number`` would make a legitimate date
+    comparison (``ATTR([Order Date]) = WINDOW_MAX(MAX([Order Date]))``) look like incomparable types.
+    """
+    aggx = _TABLECALC_X.get(name) or _TABLECALC_WINDOW_X.get(name)
+    if aggx in ("MINX", "MAXX") or name in ("LOOKUP", "TOTAL"):
+        return inner_type
+    return "number"
+
+
 def _emit_table_calc(name, p, spec):
     # p is a measure-context _Parser positioned just after the table-calc's '('. spec is the
     # "ORDERBY(...)[, PARTITIONBY(...)]" addressing tail shared by every window function.
@@ -3013,6 +3071,7 @@ def _emit_table_calc(name, p, spec):
         # LAST: offset to the last row: 0 on the last row, 1 on the previous, ...
         return f"COUNTROWS({whole}) - ROWNUMBER({spec})"
     inner = p._expr()  # measure-context inner (must be an aggregate, else it falls back)
+    p._tc_inner_type = inner[1]
     if name in _TABLECALC_X or name in _TABLECALC_WINDOW_X:
         aggx = _TABLECALC_X.get(name) or _TABLECALC_WINDOW_X[name]
         if aggx in ("SUMX", "AVERAGEX") and inner[1] != "number":
@@ -3113,34 +3172,53 @@ def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), orde
         return None, "empty formula", tables_used
     try:
         toks = _tokenize(f)
-        if len(toks) < 3 or toks[0][0] != "id" or toks[1] != ("op", "("):
-            return None, "not a table calculation", tables_used
-        name = toks[0][1].upper()
-        if name not in _TABLE_CALCS:
+        # Does this formula contain a table-calc head ANYWHERE (not just at position 0)? Answering
+        # structurally, before parsing, keeps the historical fallback reasons byte-identical for
+        # formulas that are not table calcs at all.
+        heads = {t[1].upper() for i, t in enumerate(toks)
+                 if t[0] == "id" and toks[i + 1:i + 2] == [("op", "(")]}
+        if not (heads & _TABLE_CALCS):
+            if len(toks) < 3 or toks[0][0] != "id" or toks[1] != ("op", "("):
+                return None, "not a table calculation", tables_used
             return None, f"unsupported table calculation {toks[0][1]}", tables_used
-        p = _Parser(toks, resolver, tables_used, mode="measure", known_tables=known_tables)
-        p.pos = 2  # consume the table-calc name and '('
-        if name in _TABLECALC_RANKLIKE:
-            # The RANK family + TOTAL need the raw addressing/partition COLUMNS (to enumerate marks
-            # + restrict to the current partition), not the ORDERBY/PARTITIONBY window spec -- their
-            # value is independent of the addressing sort. order_by supplies the addressing dim(s).
-            part_refs = _resolve_refs(partition_by, resolver, tables_used)
-            addr_refs = _resolve_refs(_order_captions(order_by), resolver, tables_used,
-                                      order_resolver=order_resolver, required_facts=required_facts)
-            if not addr_refs:
-                return None, "table calc requires an explicit order-by spec", tables_used
-            dax = _emit_rank(name, p, part_refs + addr_refs, part_refs)
-        else:
-            order_clause = _orderby_clause(order_by, resolver, tables_used,
-                                           order_resolver=order_resolver,
-                                           required_facts=required_facts)
-            if order_clause is None:
-                return None, "table calc requires an explicit order-by spec", tables_used
-            part_clause = _partitionby_clause(partition_by, resolver, tables_used)
-            spec = order_clause if part_clause is None else f"{order_clause}, {part_clause}"
-            dax = _emit_table_calc(name, p, spec)
+
+        # Compile the addressing LAZILY, and separately per head family: RANK*/TOTAL consume raw
+        # column refs while the window heads consume the ORDERBY/PARTITIONBY spec. Deferring means a
+        # formula does exactly the resolution its heads actually need -- so an unresolvable order
+        # field surfaces the same fallback reason it always did, rather than a reason borrowed from
+        # the other family. Results are cached: every head in one formula shares one addressing.
+        _cache = {}
+
+        def _spec():
+            if "spec" not in _cache:
+                order_clause = _orderby_clause(order_by, resolver, tables_used,
+                                               order_resolver=order_resolver,
+                                               required_facts=required_facts)
+                if order_clause is None:
+                    _cache["spec"] = None
+                else:
+                    part_clause = _partitionby_clause(partition_by, resolver, tables_used)
+                    _cache["spec"] = (order_clause if part_clause is None
+                                      else f"{order_clause}, {part_clause}")
+            return _cache["spec"]
+
+        def _rank_refs():
+            if "rank" not in _cache:
+                part_refs = _resolve_refs(partition_by, resolver, tables_used)
+                addr_refs = _resolve_refs(_order_captions(order_by), resolver, tables_used,
+                                          order_resolver=order_resolver,
+                                          required_facts=required_facts)
+                _cache["rank"] = (part_refs, addr_refs)
+            return _cache["rank"]
+
+        p = _Parser(toks, resolver, tables_used, mode="measure", known_tables=known_tables,
+                    tablecalc={"spec": _spec, "rank_refs": _rank_refs})
+        result = p._expr()
         if p.pos != len(toks):
             raise _CalcError("unexpected trailing tokens after table calculation")
+        if p.tablecalc_heads == 0:  # defensive: the structural pre-check said there was one
+            return None, "not a table calculation", tables_used
+        dax = result[0]
         if len(tables_used) > 1:
             return None, "cross-table terms (fields span multiple tables)", tables_used
         guard = _addressing_fact_guard(tables_used, required_facts)

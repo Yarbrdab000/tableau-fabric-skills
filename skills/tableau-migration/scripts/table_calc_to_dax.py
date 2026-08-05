@@ -38,8 +38,34 @@ from calc_to_dax import (
     translate_percent_diff_to_dax,
     translate_difference_to_dax,
     translate_percent_of_total_to_dax,
+    _AGG_MAP,
+    _TABLE_CALCS,
 )
 from workbook_table_calcs import AGG_DERIVATIONS
+
+# Field references are blinded FIRST: a Tableau field name may itself contain parentheses
+# (``[New Inbound Referrals (copy)_3899]``), which a naive ``NAME(`` scan reads as a call.
+_BRACKETED = re.compile(r"\[[^\[\]]*\]")
+_CALL = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_LOD = re.compile(r"\{\s*(FIXED|INCLUDE|EXCLUDE)\b", re.I)
+# Any aggregate, plus the table calcs (a table calc is an aggregate result by construction).
+_MEASURE_FNS = {n.upper() for n in _AGG_MAP} | {n.upper() for n in _TABLE_CALCS}
+
+
+def _formula_is_aggregate(formula):
+    """True iff ``formula`` provably defines a MEASURE (so it cannot be a partition dimension).
+
+    Fail-closed on two shapes. A formula with no aggregate at all is row-level -- it may well be a
+    dimension (``[Region] + " - " + [Segment]``), so we cannot skip it. And a level-of-detail
+    expression returns False even though it aggregates: a FIXED LOD is routinely used AS a dimension
+    (``{FIXED [Customer] : SUM([Sales])}`` to bin customers), so treating it as a measure could drop
+    a genuine partition and emit a confidently wrong window.
+    """
+    f = formula or ""
+    if not f.strip() or _LOD.search(f):
+        return False
+    blind = _BRACKETED.sub(" ", f)
+    return any(m.group(1).upper() in _MEASURE_FNS for m in _CALL.finditer(blind))
 
 
 # -- intent classification -----------------------------------------------------
@@ -391,16 +417,27 @@ def _scope_relative_rows_addressing(usage, order_sensitive):
     ``Table`` / the compound ones) still hands off, because its direction is not recoverable from
     the workbook alone.
 
-    Gates (fail-closed): a partition (Rows) pill must be a **plain** dimension -- an aggregate or a
-    date-grain partition is not faithfully expressible through the window seam. The order (Cols)
-    axis must carry at least one dimension and no aggregate; a **date-grain** order pill IS allowed
-    (it is the natural chronological order). An order-sensitive calc addressed across more than one
-    Cols dimension hands off (their slowest->fastest order is ambiguous), mirroring the Field-scope
-    rule.
+    Gates (fail-closed): a partition (Rows) pill must be a **plain** dimension -- a date-grain
+    partition is not faithfully expressible through the window seam. An **aggregated** Rows pill is
+    not a blocker and is SKIPPED: aggregation makes a pill a measure (the mark's value / the axis of
+    a line chart), and Tableau partitions only by DIMENSIONS, so it contributes no partitioning --
+    with SUM([Sales]) alone on Rows the calc addresses across the whole table, which is exactly
+    Tableau's "Table (Across)". A ``User`` calc pill is skipped on the SAME proof, but only when its
+    own formula provably aggregates (:func:`_formula_is_aggregate`); a row-level or LOD calc pill
+    still hands off, because it may genuinely BE a dimension and silently dropping a real partition
+    would emit a confidently wrong window. The order (Cols) axis must carry at least one dimension
+    and no aggregate; a **date-grain** order pill IS allowed (it is the natural chronological
+    order). An order-sensitive calc addressed across more than one Cols dimension hands off (their
+    slowest->fastest order is ambiguous), mirroring the Field-scope rule.
     """
+    scope = getattr(usage, "scope_formulas", None) or {}
     partition = []
     for pill in usage.rows:
-        if pill.derivation in _AGG_DERIVATIONS or pill.derivation == "User":
+        if pill.derivation in _AGG_DERIVATIONS:
+            continue  # an aggregated pill is a measure, not an addressing dimension
+        if pill.derivation == "User":
+            if _formula_is_aggregate(scope.get(pill.column)):
+                continue  # a calc pill whose own formula aggregates is likewise a measure
             return None, None, ("Rows-shelf partition carries an aggregate/calc pill "
                                 f"[{pill.column}]/{pill.derivation} (not a plain dimension)")
         if pill.derivation != "None":
@@ -426,19 +463,79 @@ def _scope_relative_rows_addressing(usage, order_sensitive):
     return order_by, tuple(partition), None
 
 
+def _scope_relative_columns_addressing(usage, order_sensitive):
+    """Recover ``(order_by, partition_by, None)`` for the scope-relative ``Columns`` pane scope, or
+    ``(None, None, reason)``.
+
+    ``Columns`` is the MIRROR of the verified ``Rows`` rule -- Tableau's "Table (across)": the
+    Cols-shelf dimensions partition and the calc addresses over the Rows-shelf dimensions. Only the
+    ADDRESSING half of that mirror is evidenced (a live-verified percent-of-total whose denominator
+    is ``ALLSELECTED(<the two Rows dims>)`` in a view whose Cols shelf holds only ``SUM(Sales)``);
+    the PARTITION half is not, because that specimen had no Cols dimension to partition by. So this
+    deliberately handles only the slice where the unevidenced half cannot matter:
+
+    * an **order-sensitive** calc hands off -- the slowest->fastest direction over the Rows dims is
+      not pinned, and getting it wrong silently reorders a running/offset calc.
+    * a surviving **Cols dimension** hands off -- that is exactly the unevidenced partition half.
+      With no Cols dimension the partition is empty under either reading, so it is forced, not
+      guessed. Aggregated and provably-aggregating ``User`` pills are measures (the mark's value),
+      not partitioning dimensions, and are skipped on the same proof as the ``Rows`` path.
+
+    Within that slice the answer is fully determined: partition = (), addressing = the Rows dims.
+    An order-INSENSITIVE window covers its whole partition, so the order among several Rows dims is
+    immaterial (unlike the ``Rows`` path, which must hand off on multiple order dims) -- but DAX
+    still requires an ORDERBY for a relation-less window, so the Rows dims are emitted as the order.
+    """
+    if order_sensitive:
+        return None, None, ("scope-relative 'Columns' addressing on an order-sensitive table calc: "
+                            "the slowest->fastest direction over the Rows dimensions is not pinned")
+
+    scope = getattr(usage, "scope_formulas", None) or {}
+
+    def _is_measure(pill):
+        if pill.derivation in _AGG_DERIVATIONS:
+            return True
+        return pill.derivation == "User" and _formula_is_aggregate(scope.get(pill.column))
+
+    for pill in usage.cols:
+        if _is_measure(pill):
+            continue
+        return None, None, ("scope-relative 'Columns' addressing with a Cols-shelf dimension "
+                            f"[{pill.column}]/{pill.derivation}: whether it partitions is not "
+                            "recoverable from the workbook encoding")
+
+    order_dims = []
+    for pill in usage.rows:
+        if _is_measure(pill):
+            continue  # a measure on Rows is the mark's value, not an addressing dimension
+        if pill.derivation == "User":
+            return None, None, ("addressing (Rows) axis carries a calc pill "
+                                f"[{pill.column}]/{pill.derivation} that does not provably aggregate")
+        if pill.column not in order_dims:
+            order_dims.append(pill.column)
+    if not order_dims:
+        return None, None, ("scope-relative 'Columns' addressing with no Rows dimension to address "
+                            "over: the calc's scope is not recoverable")
+    return tuple((c, "ASC") for c in order_dims), (), None
+
+
 # -- public API ----------------------------------------------------------------
 def _addressing_for(usage, order_sensitive):
     """Recover ``(order_by, partition_by, reason)`` for a usage from its addressing scope.
 
     The explicit ``Field`` scope ("Specific Dimensions") is recovered from the stated ordering
     fields; the ``Rows`` pane scope is recovered from the worksheet shelves (VERIFIED: partition =
-    the Rows-shelf dims, order = across the Cols-shelf dims). Every other scope-relative token stays
-    a handoff -- its across/down direction is not recoverable from the workbook encoding here.
+    the Rows-shelf dims, order = across the Cols-shelf dims). ``Columns`` is that rule's mirror and
+    is recovered only where its unevidenced half cannot matter (see
+    :func:`_scope_relative_columns_addressing`). Every other scope-relative token stays a handoff --
+    its across/down direction is not recoverable from the workbook encoding here.
     """
     if usage.ordering_type == "Field":
         return _field_scope_addressing(usage, order_sensitive)
     if usage.ordering_type == "Rows":
         return _scope_relative_rows_addressing(usage, order_sensitive)
+    if usage.ordering_type == "Columns":
+        return _scope_relative_columns_addressing(usage, order_sensitive)
     return (None, None,
             f"scope-relative addressing {usage.ordering_type!r}: the across/down direction that "
             "fixes the partition is not recoverable from the workbook encoding")
@@ -643,6 +740,60 @@ def _translate_composite_over_base(usage, intent, resolver, *, base_formula_look
         translated_by="deterministic (workbook addressing)")
 
 
+_PARAM_REF = re.compile(r"\[Parameters\]\s*\.")
+
+
+def _has_table_calc_head(formula):
+    """True iff ``formula`` calls a table-calculation function (field refs blinded first)."""
+    blind = _BRACKETED.sub(" ", formula or "")
+    return any(m.group(1).upper() in _TABLE_CALCS for m in _CALL.finditer(blind))
+
+
+def _inline_scope_calcs(formula, scope_formulas):
+    """Inline references to OTHER calc fields on the same worksheet.
+
+    A table calc is routinely written over a NAMED calc (``Total([New Inbound Referrals])``). The
+    seam parses in measure context, where a bare ``[calc]`` reference is just an unaggregated field
+    and falls back -- but the referenced calc's own formula supplies the aggregate. Inlining it
+    makes the formula self-contained without changing its meaning.
+
+    Returns ``(formula, None)``, or ``(None, reason)`` when a referenced calc is ITSELF a table
+    calculation: that is a stacked second addressing pass, which Tier 0 does not model, and
+    flattening it into one pass would silently compute the wrong thing. It likewise declines when
+    the expansion would drag in an unmodeled ``[Parameters].`` reference -- the calc is genuinely
+    untranslatable either way, and reporting the parameter is truthful, whereas inlining it lets the
+    lexer trip on the ``.`` and blame a stray character.
+    """
+    if not formula or not scope_formulas:
+        return formula, None
+    lookup = {str(k).strip().lower(): v for k, v in scope_formulas.items() if v}
+    if not lookup:
+        return formula, None
+    stacked = []
+    parameterised = []
+
+    def _sub(m):
+        inner = _inline_calc_formula(m.group(1), lookup, set())
+        if inner is None:
+            return m.group(0)           # a raw field / parameter -- leave verbatim
+        if _has_table_calc_head(inner):
+            stacked.append(m.group(1))
+            return m.group(0)
+        if _PARAM_REF.search(inner):
+            parameterised.append(m.group(1))
+            return m.group(0)
+        return f"({inner})"
+
+    out = re.sub(r"\[([^\[\]]+)\]", _sub, formula)
+    if stacked:
+        return None, (f"references calc field [{stacked[0]}], itself a table calculation: that is "
+                      "a stacked second addressing pass Tier 0 does not model")
+    if parameterised:
+        return None, (f"references calc field [{parameterised[0]}], whose formula uses an unmodeled "
+                      "parameter reference ([Parameters]. ...)")
+    return out, None
+
+
 def translate_table_calc_usage(usage, resolver, known_tables=None,
                                base_formula_lookup=None, order_resolver=None) -> TableCalcTranslation:
     """Map one :class:`TableCalcUsage` to faithful DAX or a structured Tier-1 handoff.
@@ -698,6 +849,11 @@ def translate_table_calc_usage(usage, resolver, known_tables=None,
         formula = (usage.formula or "").strip()
         if not formula:
             return _handoff(usage, intent, "user calc field carries no formula")
+        # A table calc written over a NAMED calc needs that calc's formula inlined to become a
+        # self-contained aggregate the measure-context seam can parse.
+        formula, reason = _inline_scope_calcs(formula, getattr(usage, "scope_formulas", None))
+        if formula is None:
+            return _handoff(usage, intent, reason)
 
     # 3) addressing -- recovered from the explicit Field scope or the Rows-shelf layout (never
     #    hard-coded); every other scope-relative token hands off.
