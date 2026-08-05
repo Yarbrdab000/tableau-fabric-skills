@@ -12,6 +12,49 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### tableau-migration (skill `2.61.0` -> `2.62.0`)
+
+Four whole-class defects that silently changed what a rebuilt dashboard SHOWS, all measured on a
+customer highlight table and confirmed against the 29-workbook corpus.
+
+- **A dashboard filter CARD is resolved against every worksheet on the page, not just the drawn
+  ones.** A card carries only a raw field token; its field was looked up in the worksheets that had
+  produced a visual. A worksheet that exists purely to HOST filter controls (empty shelves, a name
+  like `filters Main Summary`) classifies as unsupported and is skipped before that list is built,
+  so exactly the sheets that are all-filter contributed no filters and their cards vanished.
+  Shape-selective and silent: a field also filtered on a drawn sheet still resolved, so a dashboard
+  rebuilt SOME of its band and lost the rest. Measured: 3 authored controls, 2 rebuilt, no warning.
+  A card that still resolves to nothing now WARNS instead of disappearing.
+- **A date filter card keeps the fact's own column instead of rebinding to the shared calendar.**
+  The Date-table rebind exists for a date AXIS (time intelligence through the marked dimension).
+  Applied to a FILTER it is destructive: Tableau's card enumerates the values PRESENT IN THE FACT
+  column (a discrete `FiscalMonth` holds three or four month stamps) while the calendar is a
+  generated contiguous range, so the control listed every day it spanned. The authored selection is
+  a fact-column member, so the preselection gate could no longer prove it in-domain, declined, and
+  the slicer opened on "All" -- the page rendered UNFILTERED behind a control that looked right.
+  Date PARTS still rebind (a Year filter wants the calendar's integer `Year` column); parts narrow
+  the domain, the exact-date key column explodes it.
+- **An enumerated keep-list written with `ui-enumeration='inclusive'` is honoured.** Tableau
+  serialises a union keep-list two ways -- `op='manual'`, or its intent attribute
+  `ui-enumeration='inclusive'` with `ui-marker='enumerate'` and no `op`. Only the first was read.
+  Across every available real workbook `ui-enumeration` is perfectly consistent (`all` on the
+  non-narrowing `level-members` form, `inclusive` on enumerated keeps -- including the
+  single-`member` include shape already honoured -- and `exclusive` only ever with `except`), so
+  the second form is unambiguously a keep. Corpus effect: `0067_global_filter`, a workbook *about*
+  a global filter, previously shipped with its authored South+West selection dropped entirely.
+- **A three-hue named diverging palette keeps its ends and midpoint.** Tableau names such a palette
+  after its two ENDS then its MIDDLE (`red_blue_white_diverging` = red .. white .. blue). Reading
+  it as "first .. neutral .. last" put the wrong hue at the top end and replaced the author's
+  midpoint with grey, so a rank column coloured green-through-gold-to-red rebuilt as
+  red-through-grey-to-gold -- an INVERSION of the reader's good/bad intuition. Verified two ways:
+  the customer encoding is `reverse='true'` over `red_green_gold_diverging_10_0`, and the source
+  render's cells run green -> gold -> red across the ranks. Midpoint hues (`white`, `grey`) added
+  so `*_white_diverging` names no longer degrade to the generic default ramp.
+
+Validation: suite 3954 passed / 6 skipped / 1 xfailed (20 new tests across 2 files); corpus 29/29
+with 0 files added or removed and exactly one workbook changed, additively and for the better;
+10/10 mutants killed across two harnesses.
+
 - **tableau-migration (skill `2.60.0` -> `2.61.0`): layered table calcs, highlight tables, and
   three silent output-destroying defects.** Driven end-to-end against a real customer workbook whose
   main table rebuilt EMPTY; it now matches its Tableau oracle on all 104 data cells, row order and

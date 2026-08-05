@@ -424,8 +424,24 @@ def _norm_date_col(name):
     return re.sub(r"\s+", " ", (name or "").strip().lower().replace("_", " ").replace("-", " "))
 
 
-def _rebind_date_axis(field, deriv, date_binding):
+def _rebind_date_axis(field, deriv, date_binding, for_filter=False):
     """Redirect a date axis pill to the model's shared Date table, or ``None`` to leave it as-is.
+
+    ``for_filter`` marks a pill that becomes a FILTER CARD rather than an axis, and it declines the
+    exact/plain-date rebind. A Tableau date filter card enumerates the DISTINCT VALUES PRESENT IN
+    THE FACT COLUMN -- a discrete ``FiscalMonth`` dimension offers the three or four month stamps
+    the data actually contains. The shared calendar is a generated contiguous range, so rebinding a
+    filter to ``Date[Date]`` replaces that short authored domain with EVERY day it spans: the
+    control lists 1/1/2026, 1/2/2026, ... instead of 4/21, 5/21, 6/21, and the authored selection
+    (a fact-column member) is no longer provably inside the bound column's domain, so the
+    preselection gate declines and the slicer opens on "All" -- leaving the page UNFILTERED and the
+    numbers silently wrong. Measured on a customer workbook: a 3-member Fiscal Month card rebuilt as
+    a 365-entry day picker with no selection.
+
+    Date PARTS still rebind on a filter, deliberately and with evidence: a Year filter binds to the
+    calendar's INTEGER ``Date[Year]`` column, whose domain is small and whose members match the
+    integer-year literals Tableau writes (binding those to a datetime column matches nothing and
+    silently empties the visual). Parts narrow the domain; the exact-date key column explodes it.
 
     Fires ONLY for the single ACTIVE business date the model build selected, so a secondary or
     inactive date (e.g. Ship Date, or any date when the primary is ambiguous) is never bound to the
@@ -471,6 +487,10 @@ def _rebind_date_axis(field, deriv, date_binding):
         col = grains.get(deriv)
         return {"entity": table, "property": col} if col else None
     if deriv in ("None", "", None) or deriv in _DATE_EXACT_DERIVATIONS:
+        if for_filter:
+            # A filter card keeps the fact's own column so the control offers exactly the members
+            # the data holds (and the authored selection stays inside the bound domain).
+            return None
         # plain / continuous exact date, or a discrete exact-date VALUE (e.g. MDY = the full date
         # shown as "Month, Day, Year") -> the marked calendar key column. Both are the same
         # underlying date, so the exact-date-value display format binds exactly like a plain date.
@@ -1049,7 +1069,7 @@ def _lookup_column_binding(column_binding, field_id, base_id, caption, worksheet
 def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
                    worksheet, warnings, warn_special=True, internal_fields=None,
                    date_binding=None, row_count_binding=None, measure_binding=None,
-                   column_binding=None):
+                   column_binding=None, for_filter=False):
     """Resolve one shelf/encoding pill into an IR field dict (or ``None`` if it must be dropped).
 
     Records a structured warning whenever a token cannot be bound to a model field, or is
@@ -1225,7 +1245,7 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
     # intelligence runs through the calendar rather than the fact's raw date column. Secondary /
     # inactive dates, unmapped grains and continuous TRUNCs fall through to the degrade-and-warn
     # path below -- they are never silently rebound to the wrong date.
-    rebind = _rebind_date_axis(field, deriv, date_binding)
+    rebind = _rebind_date_axis(field, deriv, date_binding, for_filter=for_filter)
     if rebind is not None:
         field["entity"] = rebind["entity"]
         if "hierarchy" in rebind:
@@ -1704,11 +1724,22 @@ def _parse_filter_selection(filt):
 
     Returns ``{"mode": "include"|"exclude", "values": [str, ...]}`` for a cleanly enumerated
     selection, else ``None`` (an "all members" filter, or a structure we cannot read faithfully).
-    Mirrors the three real Tableau serialisations: a single ``function='member'`` child, a
-    ``function='union' op='manual'`` keep-list (include), or a ``function='except'`` wrapper
-    (exclude). A non-narrowing or ambiguous filter returns ``None`` so the slicer stays at its
-    faithful default (warn-never-wrong: never invent a selection that could hide real data wrong).
-    """
+    Mirrors the real Tableau serialisations: a single ``function='member'`` child, a
+    ``function='union'`` keep-list, or a ``function='except'`` wrapper (exclude). A non-narrowing or
+    ambiguous filter returns ``None`` so the slicer stays at its faithful default (warn-never-wrong:
+    never invent a selection that could hide real data wrong).
+
+    A union keep-list is written TWO ways and both mean the same thing. The long-recognised form
+    carries ``op='manual'``; the other carries Tableau's own intent attribute
+    ``ui-enumeration='inclusive'`` with ``ui-marker='enumerate'`` and no ``op`` at all. Surveying
+    every categorical filter across the corpus and the customer workbooks, ``ui-enumeration`` takes
+    exactly three values and is perfectly consistent: ``all`` on the non-narrowing ``level-members``
+    form (134), ``inclusive`` on enumerated keep-lists -- including the single-``member`` include
+    shape already treated as a keep (106) -- and ``exclusive`` only ever paired with ``except`` (6).
+    So ``inclusive`` is Tableau stating "the enumerated members are the KEPT set", and reading only
+    ``op='manual'`` silently discarded the other 6. The cost was not cosmetic: an authored Fiscal
+    Month card enumerating two months parsed as "no selection", so the rebuilt slicer opened on All
+    and the page rendered UNFILTERED -- right-looking control, wrong numbers, and no warning."""
     children = _children_local(filt, "groupfilter")
     if not children:
         return None
@@ -1716,12 +1747,13 @@ def _parse_filter_selection(filt):
     for child in children:
         fn = child.get("function")
         op = _attr_local(child, "op")
+        enum = _attr_local(child, "ui-enumeration")
         if fn == "except":
             ex = _filter_member_literals(child)
             return {"mode": "exclude", "values": _dedupe_str(ex)} if ex else None
         if fn == "member" and child.get("member") is not None:
             members.append(_strip_member_literal(child.get("member")))
-        elif fn == "union" and op == "manual":
+        elif fn == "union" and (op == "manual" or enum == "inclusive"):
             members.extend(_filter_member_literals(child))
     members = _dedupe_str([m for m in members if m != ""])
     return {"mode": "include", "values": members} if members else None
@@ -1772,7 +1804,8 @@ def _parse_filters(ws, ds_default, base_cols, instances, index, ds_caption,
         # inactive date, or any workbook with no date_binding, is byte-identical to before.
         f = _resolve_field(ds or ds_default, fid, base_cols, instances, index,
                            ds_caption, worksheet, warnings, warn_special=warn_special,
-                           internal_fields=internal_fields, date_binding=date_binding)
+                           internal_fields=internal_fields, date_binding=date_binding,
+                           for_filter=True)
         if f is None:
             continue
         # Parameter-driven sheet swap: a filter pinned to a pure passthrough control calc
@@ -2879,6 +2912,11 @@ _DEFAULT_DIVERGING_COLORS = ("#ca0020", "#f7f7f7", "#0571b0")
 _NAMED_HUE_STOPS = {
     "orange": "#f28e2b", "blue": "#4e79a7", "red": "#d62728", "green": "#59a14f",
     "purple": "#b07aa1", "brown": "#9c755f", "teal": "#4e9caf", "gold": "#edc948",
+    # Midpoint hues. Tableau names a diverging palette after its two ENDS and then its MIDDLE
+    # (``red_blue_white_diverging`` = red .. white .. blue), so the third token is frequently a
+    # neutral that never appears as an endpoint. Without these the token is unrecognised and the
+    # whole name silently degrades to the generic default ramp.
+    "white": "#ffffff", "grey": "#bab0ac", "gray": "#bab0ac",
 }
 _NAMED_NEUTRAL_MID = "#bab0ac"
 
@@ -2910,14 +2948,31 @@ def _named_family_stops(name, diverging):
     """Reconstruct a DISCLOSED stand-in ramp from the hue tokens of a Tableau built-in continuous
     palette NAME (``orange_blue_diverging`` -> orange .. grey .. blue). Author token order is
     preserved (first -> min, last -> max). Returns ``None`` when no hue is recognised, so the caller
-    falls back to the generic ColorBrewer default; never guesses beyond the named hues."""
+    falls back to the generic ColorBrewer default; never guesses beyond the named hues.
+
+    A THREE-hue diverging name is read as ``<low>_<high>_<middle>``: Tableau names such a palette
+    after its two ENDS and then its MIDDLE, so ``red_blue_white_diverging`` is red .. white .. blue
+    and ``red_green_gold_diverging`` is red .. gold .. green. Reading it as "first .. neutral ..
+    last" instead put the wrong hue at the top end and discarded the author's midpoint for grey --
+    a rank column the author coloured green-through-gold-to-red rebuilt as red-through-grey-to-gold,
+    which inverts the reader's good/bad intuition. Verified two ways on a customer highlight table:
+    the encoding carries ``reverse='true'`` over ``red_green_gold_diverging_10_0``, and the source
+    render's cell backgrounds run green (#b0ceba) -> gold (#fbefc8) -> red (#eebcbc) across the
+    ranks -- i.e. the un-reversed palette is red .. gold .. green, exactly this reading.
+
+    TWO-hue diverging names keep the neutral middle (``orange_blue_diverging`` -> orange .. grey ..
+    blue), which is unchanged.
+    """
     tokens = []
     for tok in re.split(r"[^a-z]+", (name or "").lower()):
         if tok in _NAMED_HUE_STOPS and tok not in tokens:
             tokens.append(tok)
     if diverging:
-        if len(tokens) >= 2:
-            return [_NAMED_HUE_STOPS[tokens[0]], _NAMED_NEUTRAL_MID, _NAMED_HUE_STOPS[tokens[-1]]]
+        if len(tokens) >= 3:
+            return [_NAMED_HUE_STOPS[tokens[0]], _NAMED_HUE_STOPS[tokens[2]],
+                    _NAMED_HUE_STOPS[tokens[1]]]
+        if len(tokens) == 2:
+            return [_NAMED_HUE_STOPS[tokens[0]], _NAMED_NEUTRAL_MID, _NAMED_HUE_STOPS[tokens[1]]]
         return None
     if tokens:
         return ["#f7f7f7", _NAMED_HUE_STOPS[tokens[-1]]]
@@ -9359,10 +9414,19 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                            (_page_h() / _authored_px_h) if _authored_px_h else 1.0)
         visuals = []
         page_ws = []
+        # A dashboard filter CARD carries only a raw field token; its slicer field is resolved from
+        # the filter shelves of the worksheets on the page. Resolving against ``page_ws`` alone loses
+        # every card whose owning sheet produced no visual -- and a worksheet that exists PURELY to
+        # host filter cards (empty shelves, a name like "filters <dashboard>") is a standard Tableau
+        # idiom, so exactly the sheets that are all-filter were the ones contributing no filters.
+        # Index every worksheet the dashboard references instead, so a card is dropped only when its
+        # token genuinely resolves to nothing.
+        card_ws = []
         for i, zone in enumerate(zones):
             ws = ws_by_name.get(zone["worksheet"])
             if not ws:
                 continue
+            card_ws.append(ws)
             if ws["visual_type"] == VT_UNSUPPORTED:
                 # v2-3: a caption-only worksheet (a thin status / refresh / filter-breadcrumb bar
                 # whose only content is its -- often dynamic -- title, no plottable mark) is rebuilt
@@ -9549,7 +9613,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         visuals += _emit_slicers(
             page_ws, page_name, model_table, field_map, warnings,
             shown_tokens={tuple(t) for t in (db.get("filter_field_tokens") or ())},
-            filter_zones=db.get("filter_zones") or [], ref_w=ref_w, ref_h=ref_h)
+            filter_zones=db.get("filter_zones") or [], ref_w=ref_w, ref_h=ref_h,
+            filter_ws=card_ws)
         visuals += _emit_param_control_slicers(
             ir.get("parameter_controls", []), db["name"], page_name, ref_w, ref_h, warnings)
         # Header band: rebuild the author's full-width title banner (crimson fill + white title) as a
@@ -9912,6 +9977,13 @@ def _emit_dashboard_slicers(ws_list, page_name, model_table, field_map, filter_z
     for i, fz in enumerate(filter_zones):
         f = by_token.get(tuple(fz.get("token") or ()))
         if f is None:
+            # Never drop a control in silence: an authored filter card that resolves to no field is
+            # a missing interaction on the rebuilt dashboard, and the reader must be told which one.
+            if warnings is not None:
+                _tok = ".".join(str(p) for p in (fz.get("token") or ())) or "(no token)"
+                warnings.append(_warn(
+                    "dashboard", page_name,
+                    f"filter card {_tok} resolved to no model field (slicer not rebuilt)"))
             continue
         key = (f["entity"], f["property"])
         if key in seen:
@@ -9933,7 +10005,7 @@ def _emit_dashboard_slicers(ws_list, page_name, model_table, field_map, filter_z
 
 
 def _emit_slicers(ws_list, page_name, model_table, field_map, warnings=None, shown_tokens=None,
-                  filter_zones=None, ref_w=None, ref_h=None):
+                  filter_zones=None, ref_w=None, ref_h=None, filter_ws=None):
     """Emit the page's filter slicers.
 
     On a dashboard page ``filter_zones`` carries the parsed filter *cards* (geometry + Tableau
@@ -9941,10 +10013,15 @@ def _emit_slicers(ws_list, page_name, model_table, field_map, warnings=None, sho
     dropdown/List mode and no page-height cap (see :func:`_emit_dashboard_slicers`). The standalone
     worksheet-page surface has no dashboard card geometry, so ``filter_zones`` is ``None``/empty
     there and the original synthetic right-rail stack is kept byte-for-byte (``shown_tokens`` gate
-    unchanged)."""
+    unchanged).
+
+    ``filter_ws`` is the worksheet list used to RESOLVE card tokens; it is broader than ``ws_list``
+    (which is the rendered set) because a filter-host worksheet contributes cards without
+    contributing a visual. It falls back to ``ws_list`` when not supplied."""
     if filter_zones:
         return _emit_dashboard_slicers(
-            ws_list, page_name, model_table, field_map, filter_zones, ref_w, ref_h, warnings)
+            filter_ws if filter_ws is not None else ws_list,
+            page_name, model_table, field_map, filter_zones, ref_w, ref_h, warnings)
     visuals = []
     fields = _filter_slicer_fields(ws_list, shown_tokens)
     for i, f in enumerate(fields):
