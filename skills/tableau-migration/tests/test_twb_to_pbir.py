@@ -3546,6 +3546,75 @@ def _swap_filter(member):
             "level='[none:CalcCtrl:nk]' /></filter>")
 
 
+def _swap_filter_quant(value):
+    """Tableau's NUMERIC swap pin: a quantitative range degenerated to a single value."""
+    return ("<filter class='quantitative' column='[federated.abc].[none:CalcCtrl:nk]' "
+            "included-values='in-range'>"
+            f"<min>{value}</min><max>{value}</max></filter>")
+
+
+def test_numeric_sheet_swap_pin_is_recognised_not_warned_as_measure_filter():
+    # Tableau writes a swap pin two ways: a discrete control emits a CATEGORICAL member list, a
+    # NUMERIC one emits a quantitative range degenerated to a single value (min == max, "show this
+    # sheet when the parameter equals N"). Only the categorical form was recognised, so every numeric
+    # swap fell through to the aggregate/measure-filter warning and the worksheet lost its control --
+    # 8 identical warnings on one real workbook for a single pair of PY-vs-Goal KPI sheets.
+    ws1 = _worksheet("GoalSheet", "Bar",
+                     rows="[federated.abc].[sum:Sales:qk]",
+                     cols="[federated.abc].[none:Category:nk]",
+                     deps_extra=_INST + _SWAP_CTRL_CALC, filters=_swap_filter_quant("2"))
+    ws2 = _worksheet("PYSheet", "Bar",
+                     rows="[federated.abc].[sum:Profit:qk]",
+                     cols="[federated.abc].[none:Category:nk]",
+                     deps_extra=_INST + _SWAP_CTRL_CALC, filters=_swap_filter_quant("1"))
+    ir = parse_twb(_workbook_with_params(ws1 + ws2))
+
+    # recognised as a swap control on each sheet, pinned to its own value ...
+    by_ws = {w["name"]: w["swap_controls"] for w in ir["worksheets"]}
+    assert by_ws["GoalSheet"][0]["param_id"] == "Parameter 1"
+    assert by_ws["GoalSheet"][0]["members"] == ["2"]
+    assert by_ws["PYSheet"][0]["members"] == ["1"]
+    # ... never mis-warned as an unmappable aggregate/measure filter ...
+    assert not any("aggregate/measure filter" in x["reason"] for x in ir["warnings"])
+    # ... and it is NOT emitted as a real data filter on the sheet.
+    for w in ir["worksheets"]:
+        assert w["filters"] == []
+
+
+def test_open_or_spanning_range_on_a_passthrough_is_still_a_real_filter():
+    # Fail-closed guard: only a CLOSED, DEGENERATE range (min == max) is a swap pin. A genuine
+    # spanning range on the same passthrough calc is a real data restriction and must NOT be
+    # silently reclassified as a visibility control.
+    span = ("<filter class='quantitative' column='[federated.abc].[none:CalcCtrl:nk]' "
+            "included-values='in-range'><min>1</min><max>3</max></filter>")
+    ws = _worksheet("Spanning", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST + _SWAP_CTRL_CALC, filters=span)
+    ir = parse_twb(_workbook_with_params(ws))
+    assert ir["worksheets"][0]["swap_controls"] == []
+
+
+@pytest.mark.parametrize("bounds, label", [
+    ("<min>5</min>", "half-open low"),
+    ("<max>5</max>", "half-open high"),
+    ("", "unbounded"),
+])
+def test_half_open_range_on_a_passthrough_is_never_a_swap_pin(bounds, label):
+    # An absent bound is NOT equality. Both bounds must be PRESENT before comparing them -- comparing
+    # two missing bounds stringwise ("None" == "None") reads as degenerate and would pin the control
+    # to the literal member "None", inventing a swap out of an open-ended range. Tableau writes
+    # genuinely half-open ranges ("at least 5"), so this is a reachable shape, not a theoretical one.
+    filt = ("<filter class='quantitative' column='[federated.abc].[none:CalcCtrl:nk]' "
+            f"included-values='in-range'>{bounds}</filter>")
+    ws = _worksheet("HalfOpen", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST + _SWAP_CTRL_CALC, filters=filt)
+    ir = parse_twb(_workbook_with_params(ws))
+    assert ir["worksheets"][0]["swap_controls"] == [], label
+
+
 def test_parameter_sheet_swap_is_grouped_and_not_warned_as_measure_filter():
     ws1 = _worksheet("LineSheet", "Bar",
                      rows="[federated.abc].[sum:Sales:qk]",

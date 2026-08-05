@@ -1775,18 +1775,36 @@ def _parse_filters(ws, ds_default, base_cols, instances, index, ds_caption,
                            internal_fields=internal_fields, date_binding=date_binding)
         if f is None:
             continue
-        # Parameter-driven sheet swap: a categorical filter pinned to a pure passthrough control
-        # calc ([Parameters].[id]) gates this whole worksheet's visibility -- it is not a data
-        # filter, so record it as a swap control (parse_twb groups partners) and do NOT warn.
-        if cls == "categorical":
-            ctrl_formula = (base_cols.get((ds or ds_default, f["field_id"])) or {}).get("formula")
-            pid = _param_control_ref(ctrl_formula)
-            if pid:
-                sel = _parse_filter_selection(filt)
+        # Parameter-driven sheet swap: a filter pinned to a pure passthrough control calc
+        # ([Parameters].[id]) gates this whole worksheet's VISIBILITY -- it is not a data filter, so
+        # record it as a swap control (parse_twb groups partners) and do NOT warn.
+        #
+        # Tableau writes the pin two ways and both mean the same thing. A discrete control writes a
+        # CATEGORICAL member list; a NUMERIC one writes a QUANTITATIVE range degenerated to a single
+        # value (``<min>2</min><max>2</max>``, "show this sheet when the parameter equals 2"). Only
+        # the categorical form was recognised, so every numeric swap fell through to the
+        # aggregate/measure-filter warning and its worksheet lost the control -- measured at 8
+        # identical warnings on one real workbook for a single pair of PY-vs-Goal KPI sheets. A range
+        # is a swap pin ONLY when it is closed and degenerate (min == max); a genuine open or spanning
+        # range on a passthrough calc is a real data filter and still falls through.
+        ctrl_formula = (base_cols.get((ds or ds_default, f["field_id"])) or {}).get("formula")
+        pid = _param_control_ref(ctrl_formula)
+        if pid and cls == "categorical":
+            sel = _parse_filter_selection(filt)
+            swap_controls.append({
+                "param_id": pid,
+                "calc_caption": f["caption"],
+                "members": list(sel["values"]) if sel and sel.get("mode") == "include" else [],
+            })
+            continue
+        if pid and cls == "quantitative":
+            rng = _parse_filter_range(filt) or {}
+            lo, hi = rng.get("min"), rng.get("max")
+            if lo is not None and hi is not None and str(lo).strip() == str(hi).strip():
                 swap_controls.append({
                     "param_id": pid,
                     "calc_caption": f["caption"],
-                    "members": list(sel["values"]) if sel and sel.get("mode") == "include" else [],
+                    "members": [str(lo).strip()],
                 })
                 continue
         # A slicer binds a raw column. An aggregate (SUM(Sales)) or a measure-role /
