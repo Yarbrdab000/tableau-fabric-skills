@@ -12,6 +12,48 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### tableau-migration (skill `2.64.0` -> `2.65.0`)
+
+Table calcs on the FILTERS shelf are now handled as the distinct class they are. In Tableau's order
+of operations such a filter runs LAST -- after aggregation -- so it HIDES marks rather than removing
+data, and every OTHER table calc in the view is unaffected by it. Power BI cannot express that: a
+visual calculation cannot filter, and a visual-level filter genuinely REMOVES rows.
+
+- **Deterministic detection (`table-calc-filter`).** A filter whose resolved calc formula carries a
+  table-calc head (`INDEX` / `SIZE` / `FIRST` / `LAST` / `LOOKUP` / `TOTAL` / `RANK*` / `RUNNING_*` /
+  `WINDOW_*`) is classified as its own class -- a pure string test over a resolved formula, so no
+  judgement is involved. Matching requires `NAME(`, so a field REFERENCE that merely contains the
+  word (`[Last Year Sales]`, `[Total Cost]`) is never a false positive. Validated against three real
+  corpus specimens: `WINDOW_AVG` on *Customers above avg.*, `WINDOW_MAX` on *Filter to Most Recent
+  Date*, and `LOOKUP` in `0077_table_calculation_breaks_with_filter` -- each of which also carries
+  2-3 other table calcs, i.e. every one is the cascade case.
+- **Honest disclosure instead of a mis-diagnosis.** These were reported as "aggregate/measure filter
+  ... is not mapped to a slicer", which frames the failure as a missing CONTROL when the actual
+  consequence is that the rebuilt visual shows EVERY mark instead of the author's slice -- and says
+  nothing about the neighbours. The warning now names the idiom, states the hide-vs-exclude
+  semantics, and reports how many table calcs share the view.
+- **Cascade guard on the keep-flag path (a correctness fix, not just wording).** A keep-flag whose
+  source calc is a table calc (e.g. `IF LAST()<=15 THEN 1 END`) was applied as a visual-level filter
+  on any scoped worksheet. That is SAFE only where nothing spans the boundary; on a sheet that also
+  carries table calcs it silently re-scopes them -- a running sum restarts, a percent-of-total's
+  denominator shrinks -- producing output that renders cleanly with the correct ROW COUNT and wrong
+  values, the one failure a row-count check cannot catch. The flag is now applied only on the safe
+  branch and declined with an explicit reason on the cascade branch.
+- **Every distinct worksheet warning reaches the report.** `_viz_fidelity` collapsed a worksheet's
+  warnings with `setdefault`, so a sheet failing in several ways disclosed ONE cause with no signal
+  that others existed -- and the most SPECIFIC finding lost whenever a coarser one was recorded
+  first (measured: the `table-calc filter` diagnosis disappeared behind a generic "no usable field
+  bindings" note). Kept additive: `reason` still carries the first warning byte-for-byte and every
+  existing count is unchanged; the rest appear under a new `additional_reasons` key.
+
+Also confirmed by measurement, not assumption: the positional primitives were already correct --
+Tableau's `INDEX`/`LAST`/`FIRST`/`SIZE` are POSITIONAL while Power BI's same-named visual-calc
+functions are VALUE-retrieval, and the engine emits `ROWNUMBER`/`COUNTROWS` forms rather than the
+false friends. The 1-based/0-based off-by-one between `INDEX()` and `LAST()` is now pinned by test.
+
+Validation: suite 4001 passed / 6 skipped / 1 xfailed (23 new tests across 2 files); corpus 29/29
+with ZERO visual, model or `.pbir` changes -- the only diffs are the added disclosures.
+
 ### tableau-migration (skill `2.63.0` -> `2.64.0`)
 
 - **A diverging gradient is never pinned to a centre the workbook did not declare.**

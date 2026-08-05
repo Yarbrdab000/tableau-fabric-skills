@@ -4071,12 +4071,16 @@ def test_param_binding_flag_applies_measure_filter_to_scoped_visual():
 
 def test_param_binding_flag_clears_aggregate_measure_filter_warning():
     ws = _flagged_line_worksheet("Line chart")
-    # without the flag the worksheet keeps its honest "not mapped to a slicer" warning ...
+    # The calc is `IF LAST()<=15 THEN 1 END`, so without the flag the worksheet keeps its honest
+    # table-calc-filter warning (the class is named now -- the old wording framed it as a missing
+    # slicer, which mis-describes the consequence).
     bare = parse_twb(_workbook(ws))
-    assert any("aggregate/measure filter on 'Date Filter'" in w["reason"] for w in bare["warnings"])
-    # ... and the model keep-flag supersedes it (the visual filters on the measure instead)
+    assert any("table-calc filter on 'Date Filter'" in w["reason"] for w in bare["warnings"])
+    # ... and the model keep-flag supersedes it (the visual filters on the measure instead). This
+    # sheet carries no other table calc, so hide and exclude are indistinguishable here -- the safe
+    # branch of the cascade.
     ir = parse_twb(_workbook(ws), param_binding=_flag_pb(["Line chart"]))
-    assert not any("aggregate/measure filter on 'Date Filter'" in w["reason"]
+    assert not any("table-calc filter on 'Date Filter'" in w["reason"]
                    for w in ir["warnings"])
 
 
@@ -4087,8 +4091,25 @@ def test_param_binding_flag_scoped_to_absent_worksheet_applies_nothing():
     assert any("not in the workbook" in w["reason"] for w in ir["warnings"])
     # warn-never-wrong: the real visual gets NO measure filter (the scope is never guessed) ...
     assert _measure_filter_containers(emit_pbir(ir)) == []
-    # ... and the worksheet keeps its own honest aggregate-filter warning
-    assert any("aggregate/measure filter on 'Date Filter'" in w["reason"] for w in ir["warnings"])
+    # ... and the worksheet keeps its own honest table-calc-filter warning
+    assert any("table-calc filter on 'Date Filter'" in w["reason"] for w in ir["warnings"])
+
+
+def test_table_calc_filter_flag_is_declined_when_table_calcs_share_the_view():
+    """The cascade guard: hide-vs-exclude only matters when something else spans the boundary.
+
+    ``Date Filter`` is ``IF LAST()<=15 THEN 1 END`` -- a table calc on the Filters shelf, which in
+    Tableau HIDES marks after aggregation and leaves the view's other table calcs untouched. The
+    visual-level filter this path builds genuinely REMOVES rows, so on a sheet that also carries a
+    table calc it would silently re-scope it: same row count, different numbers. That is the one
+    failure a row-count check cannot catch, so the flag is declined and the reason is stated.
+    """
+    ws = _flagged_line_worksheet("Line chart").replace(
+        "</rows>", "</rows><table-calc ordering-type='Rows' />", 1)
+    ir = parse_twb(_workbook(ws), param_binding=_flag_pb(["Line chart"]))
+    assert _measure_filter_containers(emit_pbir(ir)) == []
+    assert any("left UNAPPLIED" in w["reason"] and "re-scope" in w["reason"]
+               for w in ir["warnings"])
 
 
 def test_no_flags_leaves_visuals_and_records_untouched():

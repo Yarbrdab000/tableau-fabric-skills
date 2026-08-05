@@ -1077,10 +1077,24 @@ def _viz_fidelity(result):
     worksheets = (ir or {}).get("worksheets", []) if isinstance(ir, dict) else []
     ws_names = {w.get("name") for w in worksheets}
 
-    warned_ws, extra = {}, []
+    # One worksheet can fail in SEVERAL distinct ways -- an unbound row count, a dropped filter, a
+    # deferred visual -- and only the FIRST was ever carried into the report; the rest were discarded
+    # here, silently. That is the honesty contract inverted: the reader is told a worksheet is warned
+    # and given one cause, with no signal that others exist. It also hides the most specific finding
+    # whenever a coarser one happens to be recorded first (measured: a `table-calc filter` diagnosis
+    # disappeared behind a generic "no usable field bindings" note on the same sheet).
+    #
+    # Kept ADDITIVE: `reason` still carries the first warning byte-for-byte, so every existing
+    # consumer is unchanged, and the remainder are exposed under a new `additional_reasons` key that
+    # is present only when there IS more to say.
+    warned_ws, warned_more, extra = {}, {}, []
     for w in warnings:
         if w.get("scope") == "worksheet" and w.get("name") in ws_names:
-            warned_ws.setdefault(w.get("name"), w.get("reason"))
+            nm = w.get("name")
+            if nm not in warned_ws:
+                warned_ws[nm] = w.get("reason")
+            elif w.get("reason") not in (warned_ws[nm],) + tuple(warned_more.get(nm, ())):
+                warned_more.setdefault(nm, []).append(w.get("reason"))
         else:
             extra.append(w)
 
@@ -1088,9 +1102,12 @@ def _viz_fidelity(result):
     for ws in worksheets:
         nm, vt = ws.get("name"), ws.get("visual_type")
         if nm in warned_ws:
-            fidelity.append({"worksheet": nm, "visual_type": vt,
-                             "status": "warned", "reason": warned_ws[nm],
-                             "tier": _fidelity_tier("warned", vt, warned_ws[nm])})
+            _row = {"worksheet": nm, "visual_type": vt,
+                    "status": "warned", "reason": warned_ws[nm],
+                    "tier": _fidelity_tier("warned", vt, warned_ws[nm])}
+            if warned_more.get(nm):
+                _row["additional_reasons"] = list(warned_more[nm])
+            fidelity.append(_row)
         elif vt in (None, "unsupported"):
             _r = "manual attention required: unsupported visual type"
             fidelity.append({"worksheet": nm, "visual_type": vt, "status": "warned",

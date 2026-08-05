@@ -1759,6 +1759,45 @@ def _parse_filter_selection(filt):
     return {"mode": "include", "values": members} if members else None
 
 
+# A Tableau table calculation placed on the FILTERS shelf is a migration class of its own. In
+# Tableau's order of operations it runs LAST -- after aggregation, after the viz LOD is materialised
+# -- so it HIDES marks rather than removing data, and every OTHER table calc in the view is
+# unaffected by it. Power BI has no equivalent: a visual calculation cannot filter at all, and a
+# visual-level filter genuinely REMOVES rows, which would silently re-scope the neighbouring table
+# calcs (a running sum restarts, a percent-of-total's denominator shrinks, a moving average loses its
+# lead-in). That failure renders cleanly, keeps the right ROW COUNT, and is wrong only in the values
+# -- the worst shape in the migration surface, and the reason a row-count check can never verify this
+# class.
+#
+# Detection is mechanical and needs no judgement: resolve the filter's field to its formula and test
+# for a table-calc head. These are the heads the translator itself recognises (``_TABLECALC_ALL`` in
+# ``calc_to_dax``), kept as a literal pattern here so the report layer stays import-free.
+_TABLE_CALC_HEAD_RE = re.compile(
+    r"\b(INDEX|SIZE|FIRST|LAST|LOOKUP|TOTAL|RANK|RANK_DENSE|RANK_MODIFIED|RANK_PERCENTILE"
+    r"|RUNNING_[A-Z_]+|WINDOW_[A-Z_]+|SCRIPT_[A-Z_]+)\s*\(", re.IGNORECASE)
+
+
+def _table_calc_filter_idioms(formula):
+    """The table-calc heads a filter formula uses, or ``()`` when it is an ordinary filter.
+
+    Matches ``NAME(`` only, so a field REFERENCE that merely contains the word (``[Last Year
+    Sales]``, ``[Total Cost]``) never trips it -- Tableau writes those inside brackets."""
+    if not formula:
+        return ()
+    return tuple(sorted({m.group(1).upper() for m in _TABLE_CALC_HEAD_RE.finditer(formula)}))
+
+
+def _worksheet_table_calc_count(ws):
+    """How many ``<table-calc>`` elements the worksheet carries -- the cascade signal.
+
+    A table-calc filter alongside other table calcs is the branch where translating the filter as an
+    ordinary data filter would corrupt its neighbours' values, so the count is reported to the reader
+    rather than left for them to discover."""
+    if ws is None:
+        return 0
+    return len(_findall_local(ws, "table-calc"))
+
+
 def _parse_filter_range(filt):
     """Extract a quantitative/date range filter's bounds: ``{"min": str|None, "max": str|None}``
     (or ``None`` when neither bound is present). Tableau wraps date literals in ``#...#``."""
@@ -1784,7 +1823,7 @@ def _dedupe_str(values):
 
 def _parse_filters(ws, ds_default, base_cols, instances, index, ds_caption,
                    worksheet, warnings, warn_special=True, internal_fields=None,
-                   date_binding=None):
+                   date_binding=None, table_calc_filters=None, table_calc_peers=0):
     """Returns ``(filters, swap_controls)``. ``swap_controls`` carries any parameter-driven
     sheet-swap visibility controls detected on this worksheet (a categorical filter pinned to a
     pure parameter-passthrough calc). Recognising them structurally keeps them from being
@@ -1847,6 +1886,31 @@ def _parse_filters(ws, ds_default, base_cols, instances, index, ds_caption,
         # only calcs that (a) roll up to a measure or (b) compare against a parameter
         # (whose value isn't a column the slicer can bind) stay warned-and-dropped.
         _calc_formula = (base_cols.get((ds or ds_default, f["field_id"])) or {}).get("formula") or ""
+        # TABLE-CALC FILTER -- its own class (see `_table_calc_filter_idioms`). Classified BEFORE the
+        # generic aggregate/measure branch below, because that message mis-frames the failure: it
+        # reads as a missing CONTROL ("not mapped to a slicer") when the actual consequence is that
+        # the rebuilt visual shows EVERY mark instead of the author's slice. Naming the idiom, the
+        # hide-vs-exclude semantics and the cascade turns a misleading note into something a reader
+        # can act on -- and steers them off the "obvious" fix (re-adding it as a visual-level
+        # filter), which is the dangerous one.
+        _tc_idioms = _table_calc_filter_idioms(_calc_formula)
+        if _tc_idioms:
+            _peers = table_calc_peers
+            if table_calc_filters is not None:
+                table_calc_filters.append({
+                    "caption": f["caption"], "idioms": list(_tc_idioms), "peers": _peers})
+            _cascade = (
+                f"; {_peers} other table calc(s) share this view and would be silently re-scoped if "
+                f"it were re-added as an ordinary filter (their values change, the row count does not)"
+                if _peers else
+                "; no other table calc shares this view, so a visual-level filter over an equivalent "
+                "model measure is a safe manual rebuild")
+            warnings.append(_warn(
+                "worksheet", worksheet,
+                f"table-calc filter on '{f['caption']}' ({', '.join(_tc_idioms)}) is not reproduced: "
+                f"it runs after aggregation and HIDES marks, which Power BI cannot express as a "
+                f"filter, so the visual shows all marks{_cascade}"))
+            continue
         _calc_unsliceable = f["is_calc"] and (
             f["role"] == "measure" or "[Parameters]" in _calc_formula)
         if f["binding"] == "aggregation" or _calc_unsliceable:
@@ -3780,9 +3844,12 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                                  internal_fields=internal_fields, date_binding=date_binding,
                                  row_count_binding=row_count_binding, measure_binding=measure_binding,
                                  column_binding=column_binding)
+    _tc_filters = []
     filters, swap_controls = _parse_filters(view, ds_default, base_cols, instances, index,
                                             ds_caption, name, warnings, warn_special=warn_special,
-                                            internal_fields=internal_fields, date_binding=date_binding)
+                                            internal_fields=internal_fields, date_binding=date_binding,
+                                            table_calc_filters=_tc_filters,
+                                            table_calc_peers=_worksheet_table_calc_count(ws))
     sort = _parse_sort(view, ds_default, base_cols, instances, index,
                        ds_caption, name, warnings, internal_fields=internal_fields)
 
@@ -4225,6 +4292,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "uses_measure_values": uses_mv,
         "encodings": encodings,
         "filters": filters,
+        "table_calc_filters": _tc_filters,
         "swap_controls": swap_controls,
         "fidelity_note": fidelity_note,
         "combo_split": combo_split,
@@ -4814,6 +4882,28 @@ def _resolve_visual_flags(param_binding, ws_by_name, warnings):
                     f"model keep-flag '{measure}' scoped to worksheet '{ws_name}', which is not in "
                     f"the workbook -> skipped for that worksheet"))
                 continue
+            # CASCADE GUARD. A keep-flag whose source calc is a TABLE CALC (e.g. `IF LAST()<=15`)
+            # is a Tableau *table-calc filter*: it runs after aggregation and HIDES marks, leaving
+            # every other table calc in the view untouched. The visual-level filter we build here
+            # genuinely REMOVES rows, so on a sheet that also carries table calcs it silently
+            # re-scopes them -- a running sum restarts, a percent-of-total's denominator shrinks.
+            # That output renders cleanly and keeps the right ROW COUNT; only the values are wrong,
+            # which is why a row-count check can never catch it.
+            #
+            # So the filter is applied only on the branch where it is SAFE -- no other table calc in
+            # the view, where hide and exclude are indistinguishable. Where they differ, we decline
+            # and say why: an honest gap beats a confidently wrong number.
+            _tcf = next((t for t in (ws_by_name[ws_name].get("table_calc_filters") or ())
+                         if t.get("caption") == token), None)
+            if _tcf and _tcf.get("peers"):
+                warnings.append(_warn(
+                    "worksheet", ws_name,
+                    f"table-calc filter '{token}' ({', '.join(_tcf.get('idioms') or ())}) left "
+                    f"UNAPPLIED on this worksheet: it hides marks after aggregation, but a "
+                    f"visual-level filter removes rows, which would silently re-scope the "
+                    f"{_tcf['peers']} table calc(s) in this view (their values change, the row "
+                    f"count does not)"))
+                continue
             name = _sanitize(f"flag-{ws_name}-{token}")
             by_ws.setdefault(ws_name, []).append(
                 _flag_filter_container(entity, measure, literal, name))
@@ -4835,7 +4925,8 @@ def _drop_resolved_flag_warnings(warnings, resolved):
             reason = w.get("reason") or ""
             for ws_name, token in obsolete:
                 if (w.get("name") == ws_name
-                        and f"aggregate/measure filter on '{token}'" in reason):
+                        and (f"aggregate/measure filter on '{token}'" in reason
+                             or f"table-calc filter on '{token}'" in reason)):
                     drop = True
                     break
         if not drop:
