@@ -2996,7 +2996,25 @@ def _default_continuous_gradient(enc):
     spans_zero = lo is not None and hi is not None and lo < 0 < hi
     diverging = center is not None or "diverging" in name.lower() or spans_zero
     if center is None and diverging:
-        center = 0.0 if spans_zero or lo is None or hi is None else (lo + hi) / 2.0
+        # NEVER invent a centre out of thin air. A fabricated centre is not a cosmetic default: the
+        # emitter pins the mid stop at that literal value, so if it falls OUTSIDE the data range the
+        # whole dataset lands on one side of it and only HALF the ramp is ever used. Pinning an
+        # unknown centre at 0 did exactly that to every all-positive measure -- a rank column over
+        # 1..13 rendered gold-through-red with the green end unreachable, because 0 sits below the
+        # minimum. Measured on a customer highlight table, and confirmed by the fix a reader reached
+        # for by hand in Desktop: tick "Add a middle color" and set Center to the middle of the range
+        # (6.5 for 1..13) and the authored green -> gold -> red returns.
+        #
+        # So a centre is emitted only when it is KNOWN: the author pinned one (handled above), or the
+        # declared domain straddles zero (a genuinely signed measure diverges about 0), or the domain
+        # is declared and its midpoint is therefore computable. With none of those, leave it None --
+        # `_gradient_color_stops` then omits the value and Power BI centres the mid stop on the data
+        # midpoint, which is precisely what Tableau does for a diverging palette whose centre the
+        # author never set.
+        if spans_zero:
+            center = 0.0
+        elif lo is not None and hi is not None:
+            center = (lo + hi) / 2.0
     colors = _named_family_stops(name, diverging)
     if colors is None:
         colors = list(_DEFAULT_DIVERGING_COLORS if diverging else _DEFAULT_SEQUENTIAL_COLORS)

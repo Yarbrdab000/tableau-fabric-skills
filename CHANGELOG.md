@@ -12,6 +12,29 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### tableau-migration (skill `2.63.0` -> `2.64.0`)
+
+- **A diverging gradient is never pinned to a centre the workbook did not declare.**
+  `_gradient_color_stops` already emitted the mid stop's VALUE only when known, precisely so Power
+  BI could centre the middle colour on the data midpoint otherwise -- but that intent was defeated
+  upstream, where an unknown centre was fabricated as `0`. The mid stop is an ABSOLUTE value on the
+  measure's scale, so a centre outside the data range puts the whole dataset on one side of it and
+  only HALF the ramp is reachable. Every all-positive measure hit this: a rank column over 1..13
+  carrying an authored green -> gold -> red palette rendered gold-through-red with the green end
+  unreachable, because 0 sits below the minimum. Now the centre is emitted only when it is KNOWN --
+  the author pinned one, the declared domain straddles zero, or the domain is declared and its
+  midpoint computable -- and is otherwise left open.
+- **Why open beats any baked-in number, under interaction.** Tableau recomputes a continuous colour
+  domain against the FILTERED data unless the author fixed the range. An omitted centre lets Power
+  BI do the same, so the ramp tracks a slicer exactly as the source does; any constant (0, or the
+  unfiltered midpoint) would drift out of range the moment a reader filtered. Where the author DID
+  fix the range, Tableau serialises the numbers and we emit them, so those stay pinned in both
+  tools. The behaviour is therefore read from the workbook rather than chosen for it.
+
+Render-verified in Power BI Desktop against the customer highlight table: the two named-palette
+rank columns now run green -> gold -> red across ranks 1..13, matching the source. Validation:
+suite 3978 passed / 6 skipped / 1 xfailed (12 new tests); corpus 29/29.
+
 ### tableau-migration (skill `2.62.0` -> `2.63.0`)
 
 - **A table calc on a subtotal / grand-total row reproduces Tableau's single-mark window.** A
