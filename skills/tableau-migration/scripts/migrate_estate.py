@@ -1494,16 +1494,31 @@ def _strip_flag_measure_filters(filter_config, measure_names):
     return out, removed
 
 
-def _wrapper_measure_name(projection, row_filters, reserved_lower):
-    """Deterministic hidden-workhorse measure name for one wrapped projection."""
+def _wrapper_measure_name(projection, row_filters, reserved_lower, tokens=None):
+    """Reader-facing name for one wrapped projection.
+
+    This name is NOT internal: several visual types (cards, multi-row cards, map tooltips) label a
+    field with the MODEL MEASURE NAME rather than the projection's ``nativeQueryRef``, so whatever is
+    chosen here is read by a human looking at the report. An opaque content hash surfaced as
+    ``Number of Clients (filtered ed813d64)`` -- machine noise on the face of the report -- and
+    naming every contributing filter surfaced as a two-line label that crowded the card. The measure
+    therefore carries the SHORT, stable suffix ``(filtered)``; the full provenance (which Tableau
+    filters narrowed it, and the predicate itself) lives in the measure's TMDL annotations, where an
+    author inspecting the model can read it without it intruding on the page. A content hash is
+    appended ONLY to break a genuine collision, so the common case stays legible and deterministic.
+    """
     seed = (projection.get("nativeQueryRef") or projection.get("queryRef") or "Measure")
     seed = re.sub(r"\s+", " ", re.sub(r"[^A-Za-z0-9 _.\-]+", " ", str(seed))).strip(" ._-")
     seed = (seed or "Measure")[:80]
+    base = "%s (filtered)" % seed
+    if base.lower() not in reserved_lower:
+        reserved_lower.add(base.lower())
+        return base
     suffix = hashlib.sha1(json.dumps({
         "field": projection.get("field"),
         "row_filters": row_filters,
     }, sort_keys=True).encode("utf-8")).hexdigest()[:8]
-    base = f"{seed} (filtered {suffix})"
+    base = "%s (filtered %s)" % (seed, suffix)
     name, i = base, 2
     while name.lower() in reserved_lower:
         name = f"{base} {i}"
@@ -1634,14 +1649,20 @@ def _apply_row_predicate_wrapped_measures(report_parts, model_parts, result, res
         for proj, key, base_dax in pending:
             wrap = wrap_cache.get(key)
             if wrap is None:
+                srcs = sorted({s.get("token") for s in specs if s.get("token")})
                 name = _wrapper_measure_name(proj, row_filters, reserved_lower)
                 filters = ", ".join(
                     f"FILTER({_dax_table_ref(rf['table'])}, {rf['predicate_dax']})"
                     for rf in row_filters
                 )
                 dax = f"CALCULATE({base_dax}, {filters})"
+                # The Tableau filter(s) this wrapper stands for travel in the measure's OWN
+                # provenance annotation rather than in its name: an author inspecting the model can
+                # see exactly what narrowed the number, while the page keeps a short, legible label.
                 block = _tg.generate_measure_tmdl(
-                    name, "", dax,
+                    name,
+                    "filtered by %s" % ", ".join(srcs) if srcs else "",
+                    dax,
                     translated_by="deterministic (row-predicate visual wrapper)")
                 wrap = {"name": name, "block": block, "dax": dax}
                 wrap_cache[key] = wrap

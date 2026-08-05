@@ -2680,13 +2680,15 @@ def test_row_predicate_wrapper_rebinds_visual_and_strips_flag_filter():
     proj = visual["visual"]["query"]["queryState"]["Values"]["projections"][0]
     assert proj["queryRef"] == "_Measures.Total Sales"  # downstream selectors keep the old alias
     wrapped_name = proj["field"]["Measure"]["Property"]
-    assert wrapped_name.startswith("Total Sales (filtered ")
+    assert wrapped_name == "Total Sales (filtered)", wrapped_name   # short + legible on the page
     assert [f["field"] for f in visual["filterConfig"]["filters"]] == [{
         "Column": {"Expression": {"SourceRef": {"Entity": "Orders"}}, "Property": "Region"},
     }]
     measures = out_model["definition/tables/_Measures.tmdl"]
     assert f"measure '{wrapped_name}' = CALCULATE([Total Sales], FILTER('Orders'," in measures
     assert "'Orders'[Order_Date] >= [Start Date Value]" in measures
+    # provenance rides the measure's annotation, not the label the reader sees on the page
+    assert "filtered by Date Filter" in measures
 
 
 def test_workbook_pbip_disabled_when_pbip_false(tmp_path):

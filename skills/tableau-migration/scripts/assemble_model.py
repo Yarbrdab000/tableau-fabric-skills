@@ -902,7 +902,7 @@ def translate_flag_gated_measure(formula, resolver, flag_ref_lookup, *, param_re
 
 
 def _param_predicate_flags(calcs, resolve, param_resolver, *, known_tables,
-                           reserved_names=None, skip_lower=None):
+                           reserved_names=None, skip_lower=None, resolve_for=None):
     """Recognize a row-level BOOLEAN calc of parameter(s) vs a data column used as a keep-filter.
 
     The peer of :func:`build_date_window_flags` for the *general* parameter-range predicate — e.g.
@@ -930,6 +930,25 @@ def _param_predicate_flags(calcs, resolve, param_resolver, *, known_tables,
         return flag_measures, filter_bindings
     reserved_lower = {(r or "").lower() for r in (reserved_names or set())}
     skip_lower = {(s or "").lower() for s in (skip_lower or set())}
+    # ISLAND SCOPING. On a consolidated multi-datasource workbook the SAME physical table is emitted
+    # once per island (``pmdm__ProgramEngagement__c`` + ``... (Intake)`` + ``... (Assessments)`` ...),
+    # so a bare field reference is AMBIGUOUS against the pooled resolver and the predicate stubs with
+    # "unresolved/ambiguous field" -- the calc then wins no keep-flag and every worksheet that filtered
+    # on it silently loses its filter. The measure path already resolves each calc inside its OWN
+    # island (see ``_measures_part`` / ``_reroute_row_level_measure_calcs``); this does the same, so a
+    # boolean parameter predicate is judged with the same field vocabulary its formula was authored
+    # against. ``resolve_for`` None (a single, un-consolidated datasource) falls through to the pooled
+    # ``resolve`` and is byte-for-byte unchanged.
+    _island_dss = {(c or {}).get("datasource") for c in (calcs or [])}
+    _island_dss = {d for d in _island_dss if d}
+
+    def _rc(calc):
+        if not resolve_for:
+            return resolve
+        return _best_scoped_resolver(
+            (calc or {}).get("formula", ""), (calc or {}).get("datasource"),
+            resolve_for, _island_dss, resolve)
+
     for calc in calcs or []:
         name = calc.get("name")
         formula = calc.get("formula")
@@ -941,7 +960,7 @@ def _param_predicate_flags(calcs, resolve, param_resolver, *, known_tables,
         if "[parameters]" not in formula.lower():
             continue
         pred, _reason, tables, dtype = translate_tableau_calc_to_column_dax_typed(
-            formula, resolve, known_tables=known_tables, param_resolver=param_resolver)
+            formula, _rc(calc), known_tables=known_tables, param_resolver=param_resolver)
         if not pred or dtype != "bool" or len(tables) != 1:
             continue
         table = next(iter(tables))
@@ -3100,7 +3119,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     _pred_flags, _pred_bindings = _param_predicate_flags(
         all_calcs, resolve, param_resolver, known_tables=set(table_names),
         reserved_names=reserved | {(fm.get("measure") or "").lower() for fm in flag_measures},
-        skip_lower=_band_flag_sources)
+        skip_lower=_band_flag_sources, resolve_for=_raw_scoped_resolver)
     flag_measures.extend(_pred_flags)
     for _tok, _spec in _pred_bindings.items():
         filter_bindings.setdefault(_tok, _spec)
