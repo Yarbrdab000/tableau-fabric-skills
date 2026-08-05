@@ -12,6 +12,37 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### tableau-migration (skill `2.65.0` -> `2.66.0`)
+
+- **The openability gate now resolves DAX references (`dax_references_resolve`).** Every
+  `[Measure]` and `'Table'[Column]` a measure names must exist in the model. No other check looks
+  INSIDE a DAX expression, so a model naming an object that exists nowhere deserialized cleanly,
+  linted clean, and OPENED -- failing only when a visual ran the query, far from the cause and
+  looking like a data problem. This is the "deserializes clean, fails at query time" trap
+  `SKILL.md` warns about in prose; the code did not enforce it.
+- **Measured, not hypothetical.** Reproduced at HEAD: an assisted-translation pass that authored
+  DAX against Tableau's internal calc ids (`[Calculation_2768024947633754122]`) instead of the
+  resolved model names landed the reference verbatim, and the run reported **95% coverage,
+  `openability_selfcheck.ok = true`, and a `warn` definition-of-done**. Honest inert stubs had been
+  traded for silent query-time errors and the coverage number went UP. The gate now returns
+  `ok: false` naming the offending identifier and its owning measure, and because
+  `_dod_openability_failure` already treats a failed self-check as loud, the definition-of-done
+  escalates to **`failed`** -- so this can no longer ship as a warning.
+- **Whole-class, not a guard on one flag.** The check runs over the EMITTED model, so it catches an
+  unresolved reference from any path -- deterministic, assisted/`--approved-dax`, second-compiler,
+  or a future emitter -- rather than only the one that produced the observed failure.
+- **Deliberately conservative**, because a false positive here fails a sound migration: an
+  unqualified `[Name]` resolves against measures OR any declared column (Power BI accepts that in a
+  row context); comparison is case-insensitive, matching the engine; `annotation` and other
+  metadata lines are stripped before scanning, so a preserved `TableauFormula` -- which
+  legitimately names Tableau ids that must NOT exist in the model -- is never mistaken for a live
+  reference; string literals are blanked; and a reference to a table the model does not declare at
+  all is left alone as a different failure.
+
+Validation: suite 4013 passed / 6 skipped / 1 xfailed (13 new tests); 6/6 mutants killed; corpus
+29/29 with **zero** false positives and the only diff anywhere being the new check reporting
+`true`.
+
 ### tableau-migration (skill `2.64.0` -> `2.65.0`)
 
 Table calcs on the FILTERS shelf are now handled as the distinct class they are. In Tableau's order

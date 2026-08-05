@@ -68,6 +68,24 @@ _EXPRESSION_DECL_RE = re.compile(
     r"^expression\s+(?P<q>'?)(?P<name>[^'\s=]+)(?P=q)\s*=", re.MULTILINE)
 _M_PARAM_REF_RE = re.compile(r'#"([^"\n]+)"')
 
+# DAX IDENTIFIER REFERENCES inside a measure or calculated-column expression.
+# ``'Table'[Column]`` / ``Table[Column]`` is a fully-qualified column; a bare ``[Name]`` is a
+# measure reference (or an unqualified column in the declaring table's own row context).
+_DAX_QUALIFIED_REF_RE = re.compile(r"(?:'((?:[^']|'')+)'|\b([A-Za-z_][\w ]*?))\[([^\]\r\n]+)\]")
+_DAX_BARE_REF_RE = re.compile(r"(?<![\w'\]])\[([^\]\r\n]+)\]")
+# A measure/calc-column declaration and the expression that follows it, so an unresolved reference
+# can be reported against the object that carries it. Captures single-line and `= ```` block forms.
+_MEASURE_DECL_RE = re.compile(
+    r"^\tmeasure\s+(?P<name>'(?:[^']|'')*'|\"[^\"]*\"|[^\t\n=]+?)\s*=(?P<expr>.*?)(?=^\t(?:measure|column|partition|hierarchy)\s|\Z)",
+    re.MULTILINE | re.DOTALL)
+# Lines inside an object body that are metadata, not expression -- excluded before scanning for
+# references so a preserved Tableau formula (`annotation TableauFormula = rank([Calculation_123])`)
+# is never mistaken for a live DAX reference. That annotation legitimately names Tableau's internal
+# ids, which do not and should not exist in the model.
+_NON_EXPR_LINE_RE = re.compile(
+    r"^\s*(?:annotation|lineageTag|formatString|displayFolder|description|isHidden|"
+    r"dataType|summarizeBy|sourceColumn|dataCategory|///)\b.*$", re.MULTILINE)
+
 
 def _unquote(token):
     """Normalise a TMDL identifier: strip surrounding ``'..'``/``".."`` and unescape a doubled quote."""
@@ -143,6 +161,34 @@ def _duplicates(seq):
             dups.append(item)
         seen.add(key)
     return dups
+
+
+def _expression_body(text):
+    """Strip metadata lines from an object body, leaving only DAX expression text.
+
+    A measure legitimately PRESERVES its Tableau source as
+    ``annotation TableauFormula = rank([Calculation_123], 'desc')``. Those brackets name Tableau's
+    internal ids, which do not exist in the model and must not -- scanning them as live references
+    would make every faithfully-annotated measure look broken."""
+    return _NON_EXPR_LINE_RE.sub("", text or "")
+
+
+def _dax_references(expr):
+    """``(qualified, bare)`` identifier references in a DAX expression.
+
+    ``qualified`` is ``{(table, column)}`` from ``'Table'[Column]`` / ``Table[Column]``; ``bare`` is
+    ``{name}`` from a standalone ``[Name]`` -- a measure reference, or a column named without its
+    table inside its own row context. String literals are removed first so a quoted ``"[not a ref]"``
+    is never scanned."""
+    body = re.sub(r'"(?:[^"\\]|\\.)*"', '""', expr or "")
+    qualified, bare = set(), set()
+    for m in _DAX_QUALIFIED_REF_RE.finditer(body):
+        tbl = _unquote("'%s'" % m.group(1)) if m.group(1) is not None else (m.group(2) or "").strip()
+        if tbl:
+            qualified.add((tbl, m.group(3).strip()))
+    for m in _DAX_BARE_REF_RE.finditer(body):
+        bare.add(m.group(1).strip())
+    return qualified, bare
 
 
 def check_model_openability(parts, flatfile_headers=None):
@@ -277,11 +323,82 @@ def check_model_openability(parts, flatfile_headers=None):
                       % (name, ", ".join(sorted(referenced_params[name]))),
         })
 
+    # DAX REFERENCE RESOLUTION. Every ``[Measure]`` and ``'Table'[Column]`` a measure names must
+    # exist in the model. Nothing else here catches an undefined identifier: such a model is
+    # syntactically valid TMDL, lints clean, deserializes, and OPENS -- it fails only when the visual
+    # runs the query, so the defect surfaces far from its cause and reads like a data problem. This
+    # is the "deserializes clean, fails at query time" trap SKILL.md warns about, and it was the one
+    # check an operator could reasonably believe `openability_selfcheck: ok` already covered.
+    #
+    # Measured on a real run: an assisted-translation pass authored DAX against Tableau's internal
+    # calc ids (`[Calculation_2768024947633754122]`) instead of the resolved model names. Five
+    # measures landed referencing objects that exist nowhere, three more were rebound onto them, and
+    # the report announced 95% coverage with `openability_selfcheck.ok = true`. Ten honest inert
+    # stubs had been traded for eight silent query-time errors, and coverage went UP.
+    #
+    # Deliberately conservative -- it must never fire on a sound model:
+    #   * an unqualified `[Name]` resolves against measures OR any declared column (Power BI accepts
+    #     an unqualified column reference in a row context);
+    #   * comparison is case-insensitive, matching the engine;
+    #   * `annotation`/metadata lines are stripped first, so a preserved Tableau formula (which
+    #     legitimately names Tableau ids) is never scanned;
+    #   * a reference to a table the model does not declare at all is left alone here -- that is a
+    #     different failure and is not this check's business to guess at.
+    refs_ok = True
+    all_measures = set()
+    all_columns = set()
+    columns_by_table = {}
+    for path in sorted(parts):
+        text = parts[path]
+        if not (isinstance(text, str) and path.endswith(".tmdl")):
+            continue
+        tname = _table_name(text)
+        for c in _declared_columns(text):
+            all_columns.add(c.casefold())
+            if tname:
+                columns_by_table.setdefault(tname.casefold(), set()).add(c.casefold())
+        for m in _MEASURE_DECL_RE.finditer(text):
+            all_measures.add(_unquote(m.group("name")).casefold())
+
+    for path in sorted(parts):
+        text = parts[path]
+        if not (isinstance(text, str) and path.endswith(".tmdl")):
+            continue
+        for m in _MEASURE_DECL_RE.finditer(text):
+            owner = _unquote(m.group("name"))
+            qualified, bare = _dax_references(_expression_body(m.group("expr")))
+            for tbl, col in sorted(qualified):
+                known = columns_by_table.get(tbl.casefold())
+                if known is None:
+                    continue          # unknown table -- not this check's call
+                if col.casefold() in known or col.casefold() in all_measures:
+                    continue
+                refs_ok = False
+                issues.append({
+                    "check": "dax_references_resolve",
+                    "part": path,
+                    "detail": "measure %r references '%s'[%s], which the model does not declare -- "
+                              "the model opens but errors when the visual queries it"
+                              % (owner, tbl, col),
+                })
+            for name in sorted(bare):
+                if name.casefold() in all_measures or name.casefold() in all_columns:
+                    continue
+                refs_ok = False
+                issues.append({
+                    "check": "dax_references_resolve",
+                    "part": path,
+                    "detail": "measure %r references [%s], which is neither a measure nor a column "
+                              "in the model -- the model opens but errors when the visual queries it"
+                              % (owner, name),
+                })
+
     checks = {
         "tmdl_wellformed": wellformed,
         "no_duplicate_columns": no_dupes,
         "typed_columns_declared": typed_declared,
         "m_parameters_defined": params_ok,
+        "dax_references_resolve": refs_ok,
     }
     if header_check_ran:
         checks["typed_columns_in_header"] = typed_in_header
