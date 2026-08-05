@@ -1054,37 +1054,44 @@ TABLE_CALC_TRANSLATIONS = [
     # --- RANK / RANK_DENSE: competition (Skip) vs dense (Dense) ranking within the partition.
     # The rank value is independent of the addressing SORT, so the emit consumes the raw
     # partition/addressing COLUMNS (ALLSELECTED marks + per-partition FILTER), not the window spec.
+    # Each rank is guarded on ISINSCOPE of the ADDRESSING column: on a subtotal/grand-total row the
+    # Tableau window collapses to a single mark, so the rank there is 1 (a percentile 0.0). Without
+    # the guard DAX ranks the TOTAL's value among the individual marks and returns a meaningless
+    # middle ordinal -- measured at 9 where the source renders 1.
     ("RANK(SUM([Sales]))", _PART, _ORDER,
-     "RANKX(FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
-     "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])), CALCULATE(SUM('Orders'[Sales])), , DESC, Skip)"),
+     "IF(ISINSCOPE('Orders'[Order_Date]), RANKX(FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
+     "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])), CALCULATE(SUM('Orders'[Sales])), , DESC, Skip), 1)"),
     ("RANK_DENSE(SUM([Sales]))", _PART, _ORDER,
-     "RANKX(FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
-     "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])), CALCULATE(SUM('Orders'[Sales])), , DESC, Dense)"),
+     "IF(ISINSCOPE('Orders'[Order_Date]), RANKX(FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
+     "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])), CALCULATE(SUM('Orders'[Sales])), , DESC, Dense), 1)"),
     ("RANK(SUM([Sales]), 'asc')", _PART, _ORDER,
-     "RANKX(FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
-     "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])), CALCULATE(SUM('Orders'[Sales])), , ASC, Skip)"),
+     "IF(ISINSCOPE('Orders'[Order_Date]), RANKX(FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
+     "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])), CALCULATE(SUM('Orders'[Sales])), , ASC, Skip), 1)"),
     ("RANK(AVG([Sales]))", (), _ORDER,                                # no partition -> no FILTER
-     "RANKX(ALLSELECTED('Orders'[Order_Date]), CALCULATE(AVERAGE('Orders'[Sales])), , DESC, Skip)"),
+     "IF(ISINSCOPE('Orders'[Order_Date]), "
+     "RANKX(ALLSELECTED('Orders'[Order_Date]), CALCULATE(AVERAGE('Orders'[Sales])), , DESC, Skip), 1)"),
     # --- RANK_MODIFIED / RANK_PERCENTILE: modified-competition rank (ties take the HIGHEST ordinal)
     # and its percentile normalisation, counted over the SAME per-partition relation as RANK. DAX has
     # no modified RANKX mode, so they count marks on the better-or-equal side of the current mark.
     ("RANK_MODIFIED(SUM([Sales]))", _PART, _ORDER,                    # default DESC -> count >=
      "VAR _rel = FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
      "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])) VAR _cur = CALCULATE(SUM('Orders'[Sales])) "
-     "VAR _rank = COUNTROWS(FILTER(_rel, CALCULATE(SUM('Orders'[Sales])) >= _cur)) RETURN _rank"),
+     "VAR _rank = COUNTROWS(FILTER(_rel, CALCULATE(SUM('Orders'[Sales])) >= _cur)) "
+     "RETURN IF(ISINSCOPE('Orders'[Order_Date]), _rank, 1)"),
     ("RANK_MODIFIED(SUM([Sales]), 'asc')", _PART, _ORDER,             # asc -> count <=
      "VAR _rel = FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
      "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])) VAR _cur = CALCULATE(SUM('Orders'[Sales])) "
-     "VAR _rank = COUNTROWS(FILTER(_rel, CALCULATE(SUM('Orders'[Sales])) <= _cur)) RETURN _rank"),
+     "VAR _rank = COUNTROWS(FILTER(_rel, CALCULATE(SUM('Orders'[Sales])) <= _cur)) "
+     "RETURN IF(ISINSCOPE('Orders'[Order_Date]), _rank, 1)"),
     ("RANK_PERCENTILE(SUM([Sales]))", _PART, _ORDER,                  # percentile defaults to ASC
      "VAR _rel = FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "
      "'Orders'[Region] = SELECTEDVALUE('Orders'[Region])) VAR _cur = CALCULATE(SUM('Orders'[Sales])) "
      "VAR _rank = COUNTROWS(FILTER(_rel, CALCULATE(SUM('Orders'[Sales])) <= _cur)) "
-     "RETURN DIVIDE(_rank - 1, COUNTROWS(_rel) - 1, 0)"),
+     "RETURN IF(ISINSCOPE('Orders'[Order_Date]), DIVIDE(_rank - 1, COUNTROWS(_rel) - 1, 0), 0)"),
     ("RANK_PERCENTILE(SUM([Sales]), 'desc')", (), _ORDER,            # no partition -> bare ALLSELECTED
      "VAR _rel = ALLSELECTED('Orders'[Order_Date]) VAR _cur = CALCULATE(SUM('Orders'[Sales])) "
      "VAR _rank = COUNTROWS(FILTER(_rel, CALCULATE(SUM('Orders'[Sales])) >= _cur)) "
-     "RETURN DIVIDE(_rank - 1, COUNTROWS(_rel) - 1, 0)"),
+     "RETURN IF(ISINSCOPE('Orders'[Order_Date]), DIVIDE(_rank - 1, COUNTROWS(_rel) - 1, 0), 0)"),
     # --- TOTAL: re-aggregate the inner across the whole partition (CALCULATE over that relation).
     ("TOTAL(SUM([Sales]))", _PART, _ORDER,
      "CALCULATE(SUM('Orders'[Sales]), FILTER(ALLSELECTED('Orders'[Region], 'Orders'[Order_Date]), "

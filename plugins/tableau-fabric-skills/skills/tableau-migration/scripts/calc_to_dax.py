@@ -2967,11 +2967,25 @@ def _emit_rank(name, p, mark_refs, part_refs):
         relation = f"FILTER({marks}, {pred})"
     else:
         relation = marks
+    # SUBTOTAL / GRAND TOTAL ROW. A Tableau table calc is evaluated inside its own window, and on a
+    # total row that window collapses to a SINGLE mark -- so every rank there is 1 (and a percentile
+    # 0.0), which is what the source renders. In DAX the addressing column is simply out of scope on
+    # that row, so `CALCULATE(<inner>)` yields the TOTAL's value and RANKX happily ranks that total
+    # against the individual marks -- returning a middle ordinal that corresponds to nothing. Measured
+    # against a customer render: a rank total came out 9 where the source shows 1, and because a
+    # composite score was built from three such ranks the error propagated into a headline number
+    # (96.30 against the source's 100.5 = 101 - (0.15 + 0.20 + 0.20) * 1 -- an identity that only
+    # holds when each constituent rank is 1). Guarding on ISINSCOPE of the ADDRESSING columns
+    # reproduces the single-mark window; a calc with no addressing column keeps its previous shape.
+    addr_refs = [c for c in mark_refs if c not in set(part_refs or ())]
+    in_window = " && ".join(f"ISINSCOPE({c})" for c in addr_refs) if addr_refs else None
     if name in _TABLECALC_RANK:
         ties = "Skip" if name == "RANK" else "Dense"  # competition vs dense ranking
-        return f"RANKX({relation}, CALCULATE({inner[0]}), , {direction}, {ties})"
+        ranked = f"RANKX({relation}, CALCULATE({inner[0]}), , {direction}, {ties})"
+        return ranked if in_window is None else f"IF({in_window}, {ranked}, 1)"
     if is_total:
-        # Recompute the inner aggregate over every addressing mark in the current partition.
+        # Recompute the inner aggregate over every addressing mark in the current partition. On a
+        # total row the single-mark window IS that re-aggregation, so this needs no guard.
         return f"CALCULATE({inner[0]}, {relation})"
     # RANK_MODIFIED / RANK_PERCENTILE: modified-competition rank by counting marks on the
     # "better-or-equal" side of the current mark (DESC counts values >= the current value, ASC
@@ -2984,8 +2998,14 @@ def _emit_rank(name, p, mark_refs, part_refs):
         f"VAR _rank = COUNTROWS(FILTER(_rel, CALCULATE({inner[0]}) {op} _cur)) "
     )
     if name == "RANK_MODIFIED":
-        return prefix + "RETURN _rank"
-    return prefix + "RETURN DIVIDE(_rank - 1, COUNTROWS(_rel) - 1, 0)"
+        body = "_rank"
+        collapsed = "1"
+    else:
+        body = "DIVIDE(_rank - 1, COUNTROWS(_rel) - 1, 0)"
+        collapsed = "0"  # a one-mark window is the degenerate N == 1 case
+    if in_window is None:
+        return prefix + f"RETURN {body}"
+    return prefix + f"RETURN IF({in_window}, {body}, {collapsed})"
 
 
 def _partitionby_clause(partition_by, resolver, tables_used):

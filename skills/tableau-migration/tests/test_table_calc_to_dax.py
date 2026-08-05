@@ -211,8 +211,11 @@ def test_field_rank_competition_translates_as_rankx():
     assert t.partition_by == ()                      # ranks across all sub-categories
     assert t.order_by == (("Sub-Category", "ASC"),)
     # competition ranking (Skip ties), highest profit -> rank 1 (DESC), no partition FILTER.
-    assert t.dax == ("RANKX(ALLSELECTED('Orders'[Sub-Category]), "
-                     "CALCULATE(SUM('Orders'[Profit])), , DESC, Skip)")
+    # Guarded on ISINSCOPE of the addressing column so a total row reproduces Tableau's
+    # single-mark window (rank 1) instead of ranking the total among the marks.
+    assert t.dax == ("IF(ISINSCOPE('Orders'[Sub-Category]), "
+                     "RANKX(ALLSELECTED('Orders'[Sub-Category]), "
+                     "CALCULATE(SUM('Orders'[Profit])), , DESC, Skip), 1)")
 
 
 def test_field_rank_dense_ascending_translates():

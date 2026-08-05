@@ -12,6 +12,32 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### tableau-migration (skill `2.62.0` -> `2.63.0`)
+
+- **A table calc on a subtotal / grand-total row reproduces Tableau's single-mark window.** A
+  Tableau table calculation is evaluated inside its own window, and on a total row that window
+  collapses to ONE mark -- so every rank there is 1 (a percentile 0.0), which is what the source
+  renders. Translated to DAX the addressing column is simply out of scope on that row, so
+  `CALCULATE(<inner>)` yields the TOTAL's value and `RANKX` ranks that total against the individual
+  marks, returning a plausible middle ordinal that corresponds to nothing. It does not stay in the
+  rank column either: a composite score built from several ranks inherits every wrong ordinal, so
+  the error surfaces in a headline number far from its cause. Measured on a customer render:
+  `Weighted Rank` totalled **9** against the source's **1**, and `Weighted Rank Score` totalled
+  **96.30** against the source's **100.5**. The second is decisive -- that score is
+  `101 - (0.15*RankGMC + 0.20*RankMH + 0.20*RankANS)`, and 100.5 is reachable only when every
+  constituent rank equals 1 (`101 - 0.55 = 100.45`), an identity that holds algebraically rather
+  than by reading a screenshot. Now guarded on `ISINSCOPE` of the ADDRESSING columns only;
+  partition columns still scope the window as before, `TOTAL` needs no guard (its re-aggregation
+  IS the single-mark window), and a calc whose addressing is fully covered by its partition keeps
+  its previous shape byte-for-byte. Render-verified in Power BI Desktop: the total row now reads
+  1 / 100.45, and every per-region value is unchanged.
+
+Validation: suite 3966 passed / 6 skipped / 1 xfailed (12 new tests); corpus 29/29 with zero model
+or report changes. Stated plainly: **the corpus contains no RANKX at all**, so it evidences
+no-regression only -- the positive evidence for this fix is the unit tests plus the rendered
+customer workbook. Nine existing golden-DAX assertions were updated to the corrected semantics
+(expectations changed, coverage not reduced).
+
 ### tableau-migration (skill `2.61.0` -> `2.62.0`)
 
 Four whole-class defects that silently changed what a rebuilt dashboard SHOWS, all measured on a
