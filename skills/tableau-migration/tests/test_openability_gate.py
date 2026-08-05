@@ -66,6 +66,64 @@ def test_clean_model_is_open():
     assert "typed_columns_in_header" not in verdict["checks"]
 
 
+# -- M parameter reachability (issue #91) -----------------------------------------------------
+
+def _parts_with_partition(source_m, expressions=None):
+    parts = _clean_parts()
+    parts["definition/tables/Fact.tmdl"] = (
+        "table Fact\n\tlineageTag: t-fact\n"
+        "\tcolumn Amount\n\t\tdataType: double\n\t\tsourceColumn: Amount\n"
+        "\tpartition Fact = m\n\t\tmode: directQuery\n"
+        "\t\tsource =\n\t\t\tlet\n\t\t\t\tSource = %s\n\t\t\tin\n\t\t\t\tSource\n" % source_m
+    )
+    if expressions is not None:
+        parts["definition/expressions.tmdl"] = expressions
+    return parts
+
+
+def test_undefined_m_parameter_is_flagged():
+    # A partition referencing a parameter that expressions.tmdl never defines produces a model that
+    # CANNOT REFRESH ("The name 'Warehouse' wasn't recognized"), yet it is valid TMDL, lints clean
+    # and opens fine -- so without this check the defect surfaces only at refresh, far from its
+    # cause, and reads like a credential or binding problem.
+    parts = _parts_with_partition(
+        'Snowflake.Databases(#"Server", #"Warehouse")',
+        expressions='expression Server = "h" meta [IsParameterQuery=true]\n')
+    verdict = check_model_openability(parts)
+    assert verdict["ok"] is False
+    assert verdict["checks"]["m_parameters_defined"] is False
+    bad = [i for i in verdict["issues"] if i["check"] == "m_parameters_defined"]
+    assert len(bad) == 1 and "Warehouse" in bad[0]["detail"]
+    assert "cannot refresh" in bad[0]["detail"]
+
+
+def test_every_referenced_m_parameter_defined_passes():
+    parts = _parts_with_partition(
+        'Snowflake.Databases(#"Server", #"Warehouse")',
+        expressions=('expression Server = "h" meta [IsParameterQuery=true]\n\n'
+                     'expression Warehouse = "WH" meta [IsParameterQuery=true]\n'))
+    verdict = check_model_openability(parts)
+    assert verdict["checks"]["m_parameters_defined"] is True
+    assert not [i for i in verdict["issues"] if i["check"] == "m_parameters_defined"]
+
+
+def test_suffixed_federated_parameters_resolve():
+    # The federated shape the per-connection parameter fix emits must satisfy the same gate.
+    parts = _parts_with_partition(
+        'Sql.Database(#"Server_sqlserver", #"Database_sqlserver")',
+        expressions=('expression Server_sqlserver = "h" meta [IsParameterQuery=true]\n\n'
+                     'expression Database_sqlserver = "db" meta [IsParameterQuery=true]\n'))
+    assert check_model_openability(parts)["checks"]["m_parameters_defined"] is True
+
+
+def test_model_with_no_parameters_at_all_passes():
+    # A flat-file Import model references no parameters and ships no expressions.tmdl; the check
+    # must stay inert rather than treat an absent file as a failure.
+    verdict = check_model_openability(_clean_parts())
+    assert verdict["checks"]["m_parameters_defined"] is True
+    assert verdict["ok"] is True
+
+
 # -- duplicate columns ---------------------------------------------------------------------
 
 def test_duplicate_column_is_flagged():

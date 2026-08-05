@@ -62,6 +62,12 @@ _SOURCE_COL_RE = re.compile(r"^\t+sourceColumn:\s*(?P<name>'(?:[^']|'')*'|\"[^\"
 # the first quoted string inside each ``{ "Col", <type> }`` pair of a column-type list
 _TYPE_PAIR_RE = re.compile(r"\{\s*\"((?:[^\"\\]|\\.)*)\"\s*,")
 
+# An `expression <Name> = ...` declaration in expressions.tmdl, and a `#"Name"` reference to one
+# from anywhere else in the model. Together they decide whether every M parameter resolves.
+_EXPRESSION_DECL_RE = re.compile(
+    r"^expression\s+(?P<q>'?)(?P<name>[^'\s=]+)(?P=q)\s*=", re.MULTILINE)
+_M_PARAM_REF_RE = re.compile(r'#"([^"\n]+)"')
+
 
 def _unquote(token):
     """Normalise a TMDL identifier: strip surrounding ``'..'``/``".."`` and unescape a doubled quote."""
@@ -239,10 +245,43 @@ def check_model_openability(parts, flatfile_headers=None):
                         "detail": "relationship references column %r not declared on table %r" % (col, tbl),
                     })
 
+    # M PARAMETER REACHABILITY. Every partition that references #"Name" needs a matching
+    # `expression Name` in expressions.tmdl, or the model cannot refresh -- it fails with
+    # `The name 'Warehouse' wasn't recognized`. Nothing else here catches that: such a model is
+    # syntactically valid TMDL, lints clean, and opens fine, so the defect surfaces far from its
+    # cause and is easily misread as a credential or binding problem. Checked over the EMITTED
+    # parts rather than the descriptor, so it holds regardless of which connector or code path
+    # produced them, and catches any future emitter gap for free.
+    params_ok = True
+    defined_params = set()
+    for m in _EXPRESSION_DECL_RE.finditer(parts.get("definition/expressions.tmdl") or ""):
+        defined_params.add(m.group("name"))
+    referenced_params = {}
+    for path in sorted(parts):
+        text = parts[path]
+        if not (isinstance(text, str) and path.endswith(".tmdl")):
+            continue
+        if path.endswith("expressions.tmdl"):
+            continue
+        for m in _M_PARAM_REF_RE.finditer(text):
+            referenced_params.setdefault(m.group(1), set()).add(path)
+    for name in sorted(referenced_params):
+        if name in defined_params:
+            continue
+        params_ok = False
+        issues.append({
+            "check": "m_parameters_defined",
+            "part": sorted(referenced_params[name])[0],
+            "detail": 'M parameter #"%s" is referenced by %s but never defined in '
+                      "expressions.tmdl -- the model cannot refresh"
+                      % (name, ", ".join(sorted(referenced_params[name]))),
+        })
+
     checks = {
         "tmdl_wellformed": wellformed,
         "no_duplicate_columns": no_dupes,
         "typed_columns_declared": typed_declared,
+        "m_parameters_defined": params_ok,
     }
     if header_check_ran:
         checks["typed_columns_in_header"] = typed_in_header

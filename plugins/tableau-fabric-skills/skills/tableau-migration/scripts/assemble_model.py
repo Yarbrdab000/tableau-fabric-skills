@@ -33,6 +33,7 @@ try:  # package or scripts-on-path
     from .connection_to_m import (
         build_m_field_resolver,
         connection_details_for_bind,
+        connection_parameter_specs,
         emit_connection_parameters,
         emit_table_tmdl_m,
         extract_bundled_flatfile,
@@ -82,6 +83,7 @@ except ImportError:
     from connection_to_m import (
         build_m_field_resolver,
         connection_details_for_bind,
+        connection_parameter_specs,
         emit_connection_parameters,
         emit_table_tmdl_m,
         extract_bundled_flatfile,
@@ -211,11 +213,15 @@ def _build_ci_field_index(descriptor, resolve_field):
 
 
 def _expression_names(descriptor):
-    names = []
-    if descriptor.get("server"):
-        names.append("Server")
-    if descriptor.get("database"):
-        names.append("Database")
+    """The model's M parameter names, in query order.
+
+    Derived from ``connection_parameter_specs`` -- the SAME function that writes the definitions --
+    so ``model.tmdl``'s ``PBI_QueryOrder`` can never disagree with ``expressions.tmdl`` about which
+    parameters exist. It previously guessed from raw descriptor keys and got both directions wrong
+    on a Snowflake source: it declared a ``Database`` that is never defined (Snowflake reaches its
+    database by navigation) and omitted the ``Warehouse`` that is.
+    """
+    names = [name for name, _value, _todo in connection_parameter_specs(descriptor)]
     if descriptor.get("flatfile_source_folder"):
         names.append("SourceFolder")
     return names

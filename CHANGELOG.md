@@ -12,6 +12,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.59.0` -> `2.60.0`): per-connection M parameters for a federated
+  datasource, and a reachability gate that makes an unrefreshable model impossible to ship (#91).**
+  - A federated datasource routes each table to its OWN upstream, but `emit_connection_parameters`
+    emitted ONE shared `Server` / `Database` / `Warehouse` / `HttpPath` set for the whole
+    datasource. Measured on a real 3-connector workbook (Azure SQL + Snowflake + Databricks): two of
+    three tables referenced parameters that were **never defined**, and all three resolved to the
+    first connection's host. The model could not refresh. Each distinct upstream now gets its own
+    set, suffixed by connector class (`Server_snowflake`, `Warehouse_snowflake`), with a numeric
+    tail when one datasource federates two connections of the same class. A single-connection
+    datasource keeps the bare names, so its emitted M is byte-identical.
+  - The parameter set is now computed ONCE by `connection_parameter_specs` and consumed by all
+    three places that previously derived it independently (the definitions, `model.tmdl`'s
+    `PBI_QueryOrder`, and each partition's `Source`). They disagreed: a Snowflake source
+    declared a `Database` that is never defined while omitting the `Warehouse` that is, and a
+    Databricks source did the same to its `HttpPath`.
+  - **New openability check `m_parameters_defined`**: any `#"Name"` a partition references must
+    be defined in `expressions.tmdl`. This is the class fix -- such a model is valid TMDL, lints
+    clean and opens fine, so the failure appeared only at refresh (`The name 'Warehouse' wasn't
+    recognized`), far from its cause. Checked over the EMITTED parts, so it holds for any future
+    connector or code path.
+  Corpus: 29/29, 0 files added or removed, and **zero** TMDL changes -- the only delta is the new
+  check reporting `true` on all 24 models that have parameters.
 - **tableau-migration (skill `2.58.0` -> `2.59.0`): fail-closed layering guard (#89) and
   workbook-path datasource telemetry (#90).**
   - **#89** -- `_image_z` decides an image's layer from Tableau's document paint order, which is

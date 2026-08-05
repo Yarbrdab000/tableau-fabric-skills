@@ -50,8 +50,40 @@ from test_connection_to_m import (
     DATABRICKS_CUSTOM_SQL,
     DATABRICKS_CUSTOM_SQL_DOUBLED,
     DATABRICKS_CUSTOM_SQL_PARAM,
+    SNOWFLAKE,
     SNOWFLAKE_CUSTOM_SQL,
+    MULTI_CONN,
 )
+
+
+def _defined_expressions(parts):
+    return re.findall(r"^expression\s+(\S+)\s*=",
+                      parts.get("definition/expressions.tmdl") or "", re.M)
+
+
+def _query_order(parts):
+    m = re.search(r"annotation PBI_QueryOrder = \[(.*?)\]", parts["definition/model.tmdl"])
+    return re.findall(r'"([^"]+)"', m.group(1)) if m else []
+
+
+@pytest.mark.parametrize("fixture", [SNOWFLAKE, LIVE_SQLSERVER, MULTI_CONN])
+def test_query_order_matches_the_parameters_actually_defined(fixture):
+    # model.tmdl's PBI_QueryOrder and expressions.tmdl were derived independently and disagreed:
+    # a Snowflake source declared a "Database" that is never defined (Snowflake reaches its
+    # database by navigation) while omitting the "Warehouse" that is. Both now come from one
+    # function, so the two can never drift apart again.
+    out = assemble_import_model(parse_tds(fixture), model_name="M", calcs=[])
+    assert _query_order(out["parts"]) == _defined_expressions(out["parts"])
+
+
+def test_federated_model_passes_the_m_parameter_gate():
+    # Issue #91 end to end: every table of a federation binds to its OWN connection's parameters,
+    # so nothing references a parameter the model never defines.
+    out = assemble_import_model(parse_tds(MULTI_CONN), model_name="M", calcs=[])
+    verdict = check_model_openability(out["parts"])
+    assert verdict["checks"]["m_parameters_defined"] is True, verdict["issues"]
+    defined = _defined_expressions(out["parts"])
+    assert "Server_snowflake" in defined and "Server_sqlserver" in defined
 
 
 def _decode(part):

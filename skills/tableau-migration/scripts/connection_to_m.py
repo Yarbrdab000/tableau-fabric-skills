@@ -2171,6 +2171,112 @@ def combine_descriptors(descriptors, *, captions=None):
 _PARAM_META = 'meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=true]'
 
 
+def _param_token(text):
+    """A TMDL/M-safe token for a parameter-name suffix."""
+    return re.sub(r"[^0-9A-Za-z]+", "_", (text or "conn")).strip("_") or "conn"
+
+
+def _connection_identity(conn):
+    """What makes one upstream connection distinct from another, for parameter naming.
+
+    Content, not object identity: the relation's connection dict and the descriptor's entry for it
+    are separate objects, and two entries describing the SAME upstream legitimately share one
+    parameter set.
+    """
+    c = conn or {}
+    return (c.get("connection_class"), c.get("server"), c.get("database"),
+            c.get("warehouse"), c.get("http_path"))
+
+
+def connection_parameter_suffixes(descriptor):
+    """Map each distinct upstream connection to the suffix its M parameters carry.
+
+    Empty for a single-connection datasource -- that case keeps the bare ``Server`` / ``Database`` /
+    ``Warehouse`` / ``HttpPath`` names, so its emitted M and TMDL are byte-identical to before.
+
+    A FEDERATED datasource is the reason this exists. Each of its tables binds to its own upstream
+    (``_effective_connection``), so a single shared parameter set cannot describe them: two tables
+    end up referencing parameters that are never defined, and every table silently points at the
+    first connection's host. Suffixing by connector class keeps the names readable
+    (``Server_snowflake``, ``Warehouse_snowflake``) and a numeric tail disambiguates the case where
+    one datasource federates two connections of the SAME class.
+    """
+    conns = (descriptor or {}).get("connections") or {}
+    if len(conns) <= 1:
+        return {}
+    used = {}
+    out = {}
+    for key in sorted(conns):
+        ident = _connection_identity(conns[key])
+        if ident in out:
+            continue
+        base = _param_token(conns[key].get("connection_class") if conns[key] else None)
+        used[base] = used.get(base, 0) + 1
+        out[ident] = base if used[base] == 1 else f"{base}{used[base]}"
+    return out if len(out) > 1 else {}
+
+
+def connection_parameter_specs(descriptor):
+    """Every M parameter this descriptor's partitions will reference: ``[(name, value, todo)]``.
+
+    THE single source of truth for the connection-parameter set. Three consumers previously derived
+    it independently and disagreed with each other: ``emit_connection_parameters`` wrote the
+    definitions, ``_expression_names`` declared them in ``model.tmdl``'s query order, and
+    ``_connect_expr`` referenced them from each partition. A Snowflake source, for instance, got
+    ``Database`` declared in the query order but never defined (Snowflake reaches its database by
+    navigation) while the ``Warehouse`` it does define went undeclared. Deriving all three from one
+    function makes those disagreements unrepresentable.
+    """
+    descriptor = descriptor or {}
+    cls = (descriptor.get("connection_class") or "").lower()
+    # Generic ODBC (and native engines routed over ODBC) inline the whole connection string inside
+    # Odbc.Query/Odbc.DataSource and never reference these parameters, so emitting them would only
+    # leave unused expressions.
+    if cls in (ODBC_CLASSES | NATIVE_ODBC_ENGINES):
+        return []
+
+    suffixes = connection_parameter_suffixes(descriptor)
+    if suffixes:
+        conns = descriptor.get("connections") or {}
+        specs = []
+        seen = set()
+        for key in sorted(conns):
+            ident = _connection_identity(conns[key])
+            if ident in seen:
+                continue
+            seen.add(ident)
+            specs.extend(_one_connection_param_specs(conns[key], suffixes.get(ident, "")))
+        return specs
+    return _one_connection_param_specs(descriptor, "")
+
+
+def _one_connection_param_specs(conn, suffix):
+    """The parameter set for ONE upstream connection, named with ``suffix`` when federated."""
+    conn = conn or {}
+    sfx = f"_{suffix}" if suffix else ""
+    spec = connector_spec(conn.get("connection_class"))
+    connect_style = spec[1] if spec else None
+    no_database = ("server_only", "server_warehouse", "server_httppath")
+    out = []
+    if conn.get("server"):
+        out.append((f"Server{sfx}", conn["server"], None))
+    if conn.get("database") and connect_style not in no_database:
+        out.append((f"Database{sfx}", conn["database"], None))
+    if connect_style == "server_warehouse":
+        raw = (conn.get("warehouse") or "").strip()
+        todo = None if raw else (
+            f'TODO: the Snowflake warehouse was empty in the .tds; set #"Warehouse{sfx}" '
+            "to a valid compute warehouse before refresh")
+        out.append((f"Warehouse{sfx}", raw, todo))
+    if connect_style == "server_httppath":
+        raw = (conn.get("http_path") or "").strip()
+        todo = None if raw else (
+            f'TODO: the Databricks HTTP path was not found in the .tds; set #"HttpPath{sfx}" '
+            "to the SQL warehouse HTTP path before refresh")
+        out.append((f"HttpPath{sfx}", raw, todo))
+    return out
+
+
 def emit_connection_parameters(descriptor):
     """Emit ``expression Server``/``Database``/``Warehouse``/``HttpPath`` parameter TMDL for a
     relational descriptor.
@@ -2184,43 +2290,23 @@ def emit_connection_parameters(descriptor):
     it -- see ``_HTTP_PATH_ATTRS``; a real ``.tds`` typically does carry the SQL-warehouse HTTP
     path, but it may be absent on some exports, in which case the parameter is emitted empty and
     requires manual completion).
+
+    A FEDERATED datasource emits one such set PER upstream connection (suffixed by connector
+    class), because each of its tables binds to its own connection -- see
+    ``connection_parameter_specs``.
     """
-    spec = connector_spec(descriptor.get("connection_class"))
-    connect_style = spec[1] if spec else None
-    # Generic ODBC (and the native query engines routed over ODBC) inline the entire connection
-    # string inside Odbc.Query/Odbc.DataSource (see _emit_odbc_partition); they never reference
-    # #"Server"/#"Database", so emitting those params would only leave unused expressions.
-    # connector_spec is None for these classes, so without this guard the server/database below
-    # would emit anyway. Fail-safe: skip them for every ODBC-bound class.
-    if (descriptor.get("connection_class") or "").lower() in (ODBC_CLASSES | NATIVE_ODBC_ENGINES):
-        return ""
-    no_database = ("server_only", "server_warehouse", "server_httppath")
     lines = []
-    if descriptor.get("server"):
-        lines.append(f'expression Server = "{escape_m_string(descriptor["server"])}" {_PARAM_META}\n')
-    if descriptor.get("database") and connect_style not in no_database:
-        lines.append(f'expression Database = "{escape_m_string(descriptor["database"])}" {_PARAM_META}\n')
-    if connect_style == "server_warehouse":
-        raw_warehouse = (descriptor.get("warehouse") or "").strip()
-        warehouse = escape_m_string(raw_warehouse)
-        wh_line = f'expression Warehouse = "{warehouse}" {_PARAM_META}\n'
-        if not raw_warehouse:
-            # The .tds carried no compute warehouse (Snowflake stores it as warehouse=''). Keep the
-            # #"Warehouse" parameter so Snowflake.Databases(#"Server", #"Warehouse") stays a valid
-            # call, but attach a TMDL description (///, documented + deploy-safe) flagging that an
-            # empty warehouse cannot run queries and must be set before refresh. Combined into one
-            # element so the description sits immediately above the expression it annotates.
-            wh_line = (
-                '/// TODO: the Snowflake warehouse was empty in the .tds; set #"Warehouse" '
-                "to a valid compute warehouse before refresh\n" + wh_line)
-        lines.append(wh_line)
-    if connect_style == "server_httppath":
-        http_path = escape_m_string(descriptor.get("http_path") or "")
-        lines.append(f'expression HttpPath = "{http_path}" {_PARAM_META}\n')
+    for name, value, todo in connection_parameter_specs(descriptor):
+        line = f'expression {name} = "{escape_m_string(value or "")}" {_PARAM_META}\n'
+        if todo:
+            # A TMDL description (///, documented + deploy-safe) sits immediately above the
+            # expression it annotates, so an unusable default is flagged where it is read.
+            line = f"/// {todo}\n" + line
+        lines.append(line)
     # Flat-file Import landed inside the .pbip: a relocatable SourceFolder parameter (default = the
     # absolute .Data folder) that the emitted File.Contents references, so the project survives being
     # moved/zipped -- the recipient re-points this one parameter instead of every hard-coded path.
-    if descriptor.get("flatfile_source_folder"):
+    if (descriptor or {}).get("flatfile_source_folder"):
         lines.append(
             f'expression SourceFolder = "{escape_m_string(descriptor["flatfile_source_folder"])}" '
             f'{_PARAM_META}\n')
@@ -2695,24 +2781,34 @@ def emit_flatfile_source(relation, conn, cls):
     return f"let\n\t\t\t\t{body}\n\t\t\tin\n\t\t\t\t{prev}"
 
 
-def _connect_expr(connector, connect_style):
+def _connect_expr(connector, connect_style, suffix=""):
     """Build the right-hand side of ``Source = ...`` for a fully-supported connector.
 
     Exhaustive on ``connect_style`` -- an unrecognized style raises rather than silently falling
     back to the ``(server, database)`` form (which would emit wrong M for a different connector).
+
+    ``suffix`` names the parameters of ONE upstream connection in a federated datasource (see
+    ``connection_parameter_suffixes``); it is empty for the single-connection case, which keeps the
+    emitted M byte-identical.
     """
+    sfx = f"_{suffix}" if suffix else ""
     if connect_style == "server_database":  # SQL Server protocol family
-        return f'{connector}(#"Server", #"Database")'
+        return f'{connector}(#"Server{sfx}", #"Database{sfx}")'
     if connect_style == "server_only":
         # Oracle: the service/SID lives in #"Server" and there is no separate database argument;
         # HierarchicalNavigation defaults false, so we set it explicitly so the flat Schema/Item
         # selector is correct rather than default-reliant.
-        return f'{connector}(#"Server", [HierarchicalNavigation=false])'
+        return f'{connector}(#"Server{sfx}", [HierarchicalNavigation=false])'
     if connect_style == "server_warehouse":
-        return f'{connector}(#"Server", #"Warehouse")'
+        return f'{connector}(#"Server{sfx}", #"Warehouse{sfx}")'
     if connect_style == "server_httppath":  # Databricks SQL warehouse (host, httpPath)
-        return f'{connector}(#"Server", #"HttpPath")'
+        return f'{connector}(#"Server{sfx}", #"HttpPath{sfx}")'
     raise ValueError(f"unhandled connect_style {connect_style!r} for connector {connector!r}")
+
+
+def _param_suffix_for(conn, descriptor):
+    """The parameter-name suffix THIS relation's connection uses, or ``""`` when not federated."""
+    return connection_parameter_suffixes(descriptor).get(_connection_identity(conn), "")
 
 
 def _effective_connection(relation, descriptor):
@@ -2860,7 +2956,7 @@ def _emit_m_partition_review(relation, descriptor, mode):
         sql = escape_m_string(relation.get("sql", ""))
         if connect_style == "server_database":
             # SQL Server family: Value.NativeQuery folds against the database handle directly.
-            steps = [f'Source = {connector}(#"Server", #"Database")']
+            steps = [f'Source = {_connect_expr(connector, connect_style, _param_suffix_for(conn, descriptor))}']
             nq_target = "Source"
         elif nav_style == "database_schema_table" and cls in NATIVE_QUERY_CATALOG_DRILL:
             # Databricks (live-verified): the connector's ROOT collection rejects native queries
@@ -2875,7 +2971,7 @@ def _emit_m_partition_review(relation, descriptor, mode):
                     "custom SQL needs the catalog/database for the native-query drill; "
                     "not resolvable from this .tds")
             steps = [
-                f'Source = {_connect_expr(connector, connect_style)}',
+                f'Source = {_connect_expr(connector, connect_style, _param_suffix_for(conn, descriptor))}',
                 f'Catalog = Source{{[Name="{escape_m_string(database)}", Kind="Database"]}}[Data]',
             ]
             nq_target = "Catalog"
@@ -2908,7 +3004,7 @@ def _emit_m_partition_review(relation, descriptor, mode):
                 "replace them with a literal or a bound parameter before refresh")
         return f"let\n\t\t\t\t{body}\n\t\t\tin\n\t\t\t\t{prev}", param_reason
 
-    source = _connect_expr(connector, connect_style)
+    source = _connect_expr(connector, connect_style, _param_suffix_for(conn, descriptor))
 
     if nav_style == "database_schema_table":
         # Snowflake / Databricks: database(or catalog) -> schema -> table, each hop keyed by

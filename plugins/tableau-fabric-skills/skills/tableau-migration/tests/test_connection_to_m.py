@@ -1,10 +1,14 @@
 """Tableau ``.tds`` parsing + M-emission tests (realistic XML fixtures)."""
+import re
+
 import pytest
 
 from connection_to_m import (
     build_m_field_resolver,
     combine_descriptors,
     connection_details_for_bind,
+    connection_parameter_specs,
+    connection_parameter_suffixes,
     custom_sql_parameter_refs,
     emit_connection_parameters,
     emit_m_partition_source,
@@ -2321,8 +2325,12 @@ def test_multi_connection_rebuilds_direct_by_default():
 
 
 def test_multi_connection_routes_each_relation_to_its_own_connector():
-    # Each relation must emit using ITS OWN named connection's connector function, not a single
-    # global one: the snowflake table emits Snowflake.Databases, the sqlserver table Sql.Database.
+    # Each relation must emit using ITS OWN named connection's connector function AND that
+    # connection's OWN parameters: the snowflake table emits Snowflake.Databases against the
+    # snowflake parameter set, the sqlserver table Sql.Database against the sqlserver set. Sharing
+    # one Server/Database/Warehouse set across a federation emits a model that cannot refresh --
+    # two of three tables reference parameters that are never defined, and every table points at
+    # the first connection's host.
     d = parse_tds(MULTI_CONN)
     by_name = {r["name"]: r for r in d["relations"]}
     assert "connection" in by_name["SALE"] and "connection" in by_name["DimDate"]
@@ -2330,8 +2338,94 @@ def test_multi_connection_routes_each_relation_to_its_own_connector():
     date_body = emit_m_partition_source(by_name["DimDate"], d, "DirectQuery")
     assert "Snowflake.Databases" in sale_body
     assert "Sql.Database" not in sale_body
-    assert 'Source = Sql.Database(#"Server", #"Database")' in date_body
+    assert 'Source = Sql.Database(#"Server_sqlserver", #"Database_sqlserver")' in date_body
     assert "Snowflake.Databases" not in date_body
+    # the two tables must not share a single Server parameter
+    assert '#"Server_snowflake"' in sale_body
+    assert '#"Server_sqlserver"' not in sale_body
+
+
+def test_federated_datasource_defines_a_parameter_set_per_connection():
+    # Issue #91. A federation emits one shared Server/Database/Warehouse/HttpPath set for the whole
+    # datasource, so on a real 3-connector workbook two of three tables referenced parameters that
+    # were NEVER DEFINED and all three resolved to the first connection's host. Every structural
+    # check passed -- valid TMDL, tmdl_lint clean, .pbip opens -- and it failed only at refresh.
+    d = parse_tds(MULTI_CONN)
+    tmdl = emit_connection_parameters(d)
+    defined = set(re.findall(r"^expression\s+(\S+)\s*=", tmdl, re.M))
+    # every parameter each relation's partition references must be defined
+    referenced = set()
+    for rel in d["relations"]:
+        body = emit_m_partition_source(rel, d, "DirectQuery")
+        referenced |= set(re.findall(r'#"([^"]+)"', body))
+    assert referenced - defined == set(), (
+        "undefined M parameters: %s" % sorted(referenced - defined))
+    # and the two upstreams must NOT share a Server
+    assert "Server_snowflake" in defined and "Server_sqlserver" in defined
+    assert "Server" not in defined
+
+
+def test_single_connection_parameters_keep_their_bare_names():
+    # Never-regress: only a federation is suffixed. A single-connection source keeps the
+    # established bare names so its emitted M and TMDL are byte-identical.
+    d = parse_tds(SNOWFLAKE)
+    tmdl = emit_connection_parameters(d)
+    defined = set(re.findall(r"^expression\s+(\S+)\s*=", tmdl, re.M))
+    assert "Server" in defined
+    assert not any(n.startswith("Server_") for n in defined)
+
+
+def test_connection_parameter_specs_is_the_single_source_of_truth():
+    # The set of parameters DEFINED must equal the set the model declares in its query order.
+    # These were computed independently and disagreed: a Snowflake source declared a "Database"
+    # that is never defined (Snowflake reaches its database by navigation) while omitting the
+    # "Warehouse" that is.
+    d = parse_tds(SNOWFLAKE)
+    names = [n for n, _v, _t in connection_parameter_specs(d)]
+    defined = re.findall(r"^expression\s+(\S+)\s*=", emit_connection_parameters(d), re.M)
+    assert names == defined
+    assert "Warehouse" in names and "Database" not in names
+
+
+def test_same_class_connections_get_distinct_parameter_suffixes():
+    # Two connections of the SAME connector class must not collide onto one parameter set --
+    # they are different servers.
+    d = {"connections": {
+        "sqlserver.a": {"connection_class": "sqlserver", "server": "a.example.net",
+                        "database": "A"},
+        "sqlserver.b": {"connection_class": "sqlserver", "server": "b.example.net",
+                        "database": "B"},
+    }}
+    names = [n for n, _v, _t in connection_parameter_specs(d)]
+    assert len(set(names)) == len(names) == 4, names
+    assert sorted(names) == ["Database_sqlserver", "Database_sqlserver2",
+                             "Server_sqlserver", "Server_sqlserver2"]
+
+
+def test_connections_differing_only_by_server_stay_distinct():
+    # The SERVER alone can be what separates two upstreams (same connector, same database name on
+    # two hosts -- prod and DR, or two tenants). Folding them together would point one set of
+    # tables at the wrong host while every structural check still passed.
+    d = {"connections": {
+        "sqlserver.a": {"connection_class": "sqlserver", "server": "a.example.net",
+                        "database": "Sales"},
+        "sqlserver.b": {"connection_class": "sqlserver", "server": "b.example.net",
+                        "database": "Sales"},
+    }}
+    specs = connection_parameter_specs(d)
+    servers = {v for n, v, _t in specs if n.startswith("Server")}
+    assert servers == {"a.example.net", "b.example.net"}
+    assert len({n for n, _v, _t in specs}) == 4
+
+
+def test_identical_connections_share_one_parameter_set():
+    # Two entries describing the SAME upstream are one connection for parameter purposes --
+    # duplicating them would emit redundant parameters a user has to keep in sync by hand, and
+    # suffixing a datasource that only ever touches one server would churn its output for nothing.
+    same = {"connection_class": "sqlserver", "server": "a.example.net", "database": "A"}
+    d = dict(same, connections={"sqlserver.a": dict(same), "sqlserver.b": dict(same)})
+    assert connection_parameter_suffixes(d) == {}
+    assert [n for n, _v, _t in connection_parameter_specs(d)] == ["Server", "Database"]
 
 
 def test_single_connection_ignores_per_relation_connection_byte_identical():
