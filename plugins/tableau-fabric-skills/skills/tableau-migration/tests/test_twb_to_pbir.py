@@ -42,6 +42,10 @@ from twb_to_pbir import (
     _expr_entity,
     _field_expression,
     _flag_filter_container,
+    _demote_occluding_overlays,
+    _Z_BACKDROP,
+    _Z_CONTENT,
+    _Z_OVERLAY,
     _image_item_name,
     _image_visual,
     _norm_param_key,
@@ -8358,6 +8362,91 @@ IMAGE_BUTTON_TWB = _workbook(
 
 _PNG = b"\x89PNG\r\n\x1a\nFAKE"
 _PNG2 = b"\x89PNG\r\n\x1a\nICON"
+
+
+def _fullpage_image_zone(zid="60"):
+    """A full-canvas background PLATE, written where paint order reads it as an overlay."""
+    return (f"<zone type-v2='bitmap' param='Image/Backdrop.png' h='100000' w='100000' "
+            f"x='0' y='0' id='{zid}' />")
+
+
+BACKDROP_LAST_TWB = _workbook(
+    _worksheet("Sheet1", "Bar", "[federated.abc].[sum:Sales:qk]",
+               "[federated.abc].[none:Category:nk]", deps_extra=_INST),
+    "<dashboard name='Designed'><size maxwidth='1200' maxheight='800' /><zones>"
+    + _text_object_container(_text_object_ws_zone("Sheet1"), _fullpage_image_zone())
+    + "</zones></dashboard>",
+)
+
+
+def test_full_canvas_image_never_occludes_rebuilt_visuals():
+    # The single most destructive layering failure this rebuild has: a full-canvas plate painted
+    # ON TOP of every chart renders the page completely blank while each visual underneath is
+    # correctly built, bound and populated -- and a fully-occluded page validates with ZERO
+    # schema errors, so nothing else catches it. Here document paint order says "overlay"
+    # (the plate is written AFTER the worksheet), which is exactly the case the ordering
+    # heuristic gets wrong; geometry has to override it.
+    result = migrate_twb_to_pbir(
+        BACKDROP_LAST_TWB, resources={"Image/Backdrop.png": _PNG})
+    vis = [json.loads(v) for k, v in result["parts"].items() if k.endswith("visual.json")]
+    img = next(v for v in vis if v["visual"]["visualType"] == "image")
+    data = [v for v in vis if v["visual"]["visualType"] != "image"]
+    assert data, "expected the worksheet to be rebuilt"
+
+    def _rect(v):
+        p = v["position"]
+        return (p["x"], p["y"], p["x"] + p["width"], p["y"] + p["height"])
+
+    ir, dr = _rect(img), _rect(data[0])
+    assert ir[0] <= dr[0] and ir[1] <= dr[1] and ir[2] >= dr[2] and ir[3] >= dr[3], (
+        "test is only meaningful if the image really does cover the visual")
+    assert img["position"]["z"] < data[0]["position"]["z"]
+
+
+def test_small_overlay_image_is_left_on_top():
+    # The counterpart guard the fix must not break: a corner logo or icon is LEGITIMATELY above
+    # the content. Containment is what separates them -- a small overlay cannot contain a chart,
+    # so only a plate big enough to erase content is ever moved.
+    result = migrate_twb_to_pbir(
+        IMAGE_BUTTON_TWB, resources={"Image/Logo.png": _PNG, "Image/Icon.png": _PNG2})
+    vis = [json.loads(v) for k, v in result["parts"].items() if k.endswith("visual.json")]
+    imgs = [v for v in vis if v["visual"]["visualType"] == "image"]
+    assert imgs, "expected the logo image to be emitted"
+    assert all(v["position"]["z"] > 100 for v in imgs)
+
+
+def test_demote_occluding_overlays_is_a_noop_without_containment():
+    # Pure unit guard on the predicate: an overlay that merely OVERLAPS content is not demoted,
+    # only one that would cover it whole.
+    def _v(name, z, x, y, w, h, kind):
+        return {"name": name, "position": {"x": x, "y": y, "z": z, "width": w, "height": h},
+                "visual": {"visualType": kind}}
+
+    partial = [_v("img", _Z_OVERLAY, 0, 0, 100, 100, "image"),
+               _v("chart", _Z_CONTENT, 50, 50, 100, 100, "barChart")]
+    assert _demote_occluding_overlays(partial) == []
+    assert partial[0]["position"]["z"] == _Z_OVERLAY
+
+    # An image offset DOWN-RIGHT of the content overlaps it heavily but starts inside it, so it
+    # cannot be covering it. Every edge has to be compared against the matching edge -- a predicate
+    # that compares a left edge against a right one calls this containment and buries a legitimate
+    # overlay.
+    offset = [_v("img", _Z_OVERLAY, 60, 60, 500, 500, "image"),
+              _v("chart", _Z_CONTENT, 50, 50, 100, 100, "barChart")]
+    assert _demote_occluding_overlays(offset) == []
+    assert offset[0]["position"]["z"] == _Z_OVERLAY
+
+    covering = [_v("img", _Z_OVERLAY, 0, 0, 500, 500, "image"),
+                _v("chart", _Z_CONTENT, 50, 50, 100, 100, "barChart")]
+    assert len(_demote_occluding_overlays(covering)) == 1
+    assert covering[0]["position"]["z"] == _Z_BACKDROP
+
+    # An image the paint order ALREADY placed correctly is not this pass's business: it must
+    # report nothing, so the warning stays a real signal that document order was overridden
+    # rather than firing on every well-formed designed dashboard.
+    already = [_v("img", _Z_BACKDROP, 0, 0, 500, 500, "image"),
+               _v("chart", _Z_CONTENT, 50, 50, 100, 100, "barChart")]
+    assert _demote_occluding_overlays(already) == []
 
 
 def test_resource_basename_handles_slashes_and_none():

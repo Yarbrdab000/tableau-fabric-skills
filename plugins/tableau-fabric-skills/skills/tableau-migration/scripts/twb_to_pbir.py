@@ -9338,6 +9338,13 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             warnings.append(_warn("dashboard", db["name"],
                                   "no supported visuals on this dashboard"))
             continue
+        # Fail-closed layering backstop: demote any image that would fully cover a rebuilt visual
+        # beneath the content. ``_image_z`` reads Tableau's document paint order, which is correct
+        # on every workbook measured, but it is a heuristic whose fallbacks favour the overlay
+        # layer -- and getting this wrong renders the whole page BLANK while validating clean.
+        # Geometry decides it independently: an image that would erase content cannot be
+        # decoration. Runs before the caption tidy so a demoted plate stops acting as an anchor.
+        _demote_occluding_overlays(visuals, warnings, db["name"])
         # Tidy pass (v2-2 / v2-8): relocate any floating caption textbox that Tableau floated
         # on top of the content it labels into a clear band (prefer directly above the anchor); on a
         # packed page with no clear strip, OPEN a band by pushing content down (v2-8) and grow the
@@ -9878,6 +9885,61 @@ def _reflow_worksheets_below_slicers(visuals, page_h, *, gap=8.0, tol=1.0):
         p = v["position"]
         p["y"] = round(new_top + (p["y"] - orig_top) * scale, 2)
         p["height"] = round(p["height"] * scale, 2)
+
+
+def _demote_occluding_overlays(visuals, warnings=None, dashboard=None):
+    """Fail-closed backstop: an image that would BLANK the page cannot be an overlay.
+
+    ``_image_z`` decides an image's layer from Tableau's document paint order, which is the
+    author's real declaration of intent and is right on every workbook measured. But it is a
+    HEURISTIC over a signal that can be absent or misleading, and its two fallbacks both return
+    the overlay layer -- so it fails toward the single most destructive outcome this rebuild has:
+    a full-canvas background plate painted on top of every chart, which renders the page
+    completely blank while every visual underneath is correctly built, bound and populated. That
+    failure is invisible to schema validation (a fully-occluded page validates with zero errors)
+    and it masquerades as a data-binding bug, so it costs far more to diagnose than to prevent.
+
+    Geometry settles it independently of document order: if an emitted image would cover a data
+    visual whole, it CANNOT be decoration, because the source dashboard would have been just as
+    blank in Tableau and no author ships that. Such an image is therefore the page's backdrop and
+    is demoted beneath the content. The test is containment, not size, which is what keeps the
+    legitimate case intact -- a corner logo or a 17x18 icon cannot contain a chart, so overlays
+    stay on top; only a plate big enough to erase content is moved.
+
+    Ordering is a no-op by construction: the demoted plate lands on the same layer a correctly
+    ordered backdrop would already occupy, so this only ever converts a blank page into the page
+    the author designed, never rearranges a page that was already right.
+    """
+    imgs = [v for v in visuals
+            if (v.get("position") or {}).get("z", 0) > _Z_CONTENT
+            and ((v.get("visual") or {}).get("visualType") == "image")]
+    content = [v for v in visuals
+               if (v.get("position") or {}).get("z") in (_Z_CONTENT, _Z_SLICER)]
+    if not imgs or not content:
+        return []
+
+    def _rect(v):
+        p = v["position"]
+        return (p["x"], p["y"], p["x"] + p["width"], p["y"] + p["height"])
+
+    def _contains(outer, inner, tol=1.0):
+        return (outer[0] <= inner[0] + tol and outer[1] <= inner[1] + tol
+                and outer[2] >= inner[2] - tol and outer[3] >= inner[3] - tol)
+
+    demoted = []
+    for img in imgs:
+        r = _rect(img)
+        hidden = [c for c in content if _contains(r, _rect(c))]
+        if not hidden:
+            continue
+        img["position"]["z"] = _Z_BACKDROP
+        demoted.append({"visual": img.get("name"), "hidden": len(hidden)})
+        if warnings is not None:
+            warnings.append(_warn(
+                "dashboard", dashboard,
+                "background image re-layered beneath %d visual(s) it would have hidden "
+                "(Tableau paint order implied an overlay)" % len(hidden)))
+    return demoted
 
 
 def _deoverlap_captions(visuals, page_w, page_h, *, gap=8.0, tol=1.0, min_frac=0.05):

@@ -12,6 +12,32 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.58.0` -> `2.59.0`): fail-closed layering guard (#89) and
+  workbook-path datasource telemetry (#90).**
+  - **#89** -- `_image_z` decides an image's layer from Tableau's document paint order, which is
+    correct on every workbook measured, but it is a heuristic whose fallbacks both favour the
+    OVERLAY layer -- so it fails toward the most destructive outcome this rebuild has: a
+    full-canvas background painted over every chart, rendering the page blank while each visual
+    underneath is correctly built, bound and populated. That failure is invisible to schema
+    validation and masquerades as a data-binding bug. Geometry now settles it independently: an
+    image that would cover a rebuilt visual WHOLE cannot be decoration, because the source
+    dashboard would have been just as blank in Tableau. Containment (not size) is the test, so a
+    corner logo or icon stays on top. Verified against a workbook whose plate is written AFTER the
+    sheets -- the exact shape paint order gets wrong.
+  - **#90** -- a workbook owns no standalone datasource asset, so the whole datasource block of
+    `report.json` stayed empty even though the workbook path had already parsed every embedded
+    datasource and emitted correct, distinct connectors. For a credential gate an empty
+    `connectors_seen` does not read as "unknown", it reads as "nothing to authenticate". The
+    workbook path now reports `embedded_datasources` (per datasource AND per federated
+    connection, with server / database / warehouse / auth method) plus `model_facts` taken from
+    what the build actually emitted, and folds them into `connectors_seen`, `storage_modes`,
+    `tables_translated`, `columns_translated` and a new `datasources_embedded_total`.
+    Measured across the 29-workbook corpus: workbooks reporting no connector went **29 -> 0**.
+    Telemetry survives a failed model build, so a workbook that could not land still reports which
+    systems it would have touched.
+  Corpus: 29/29 build, 0 files added or removed, and **zero** PBIR or TMDL changes -- the layering
+  guard never had to fire, and the telemetry is report-only.
+
 - **tableau-migration (skill `2.57.0` -> `2.58.0`): a row-predicate wrapper measure keeps the
   format the author declared.** The 2.52.0 wrapper replaces a projection with a NEW measure, and a
   new measure inherits nothing. For an AGGREGATION projection that is a true regression rather than

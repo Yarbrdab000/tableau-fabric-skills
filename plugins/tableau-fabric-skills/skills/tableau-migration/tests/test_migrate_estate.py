@@ -915,6 +915,80 @@ def test_summarize_datasource_only_run_leaves_workbook_calc_keys_inert():
     assert s["needs_review_total"] == 0
 
 
+def test_summarize_folds_workbook_datasource_telemetry_issue_90():
+    # A workbook owns no standalone datasource asset, so nothing fed the datasource block and every
+    # field in it stayed empty -- while the workbook path had already parsed each embedded datasource
+    # and emitted correct, distinct connectors. For a credential gate an empty ``connectors_seen``
+    # does not read as "unknown", it reads as "nothing to authenticate", which is the one wrong
+    # answer it must never be given.
+    wb_details = [{
+        "embedded_datasources": [
+            # one datasource FEDERATING three live systems: all three must be reported, not just
+            # the datasource's primary class
+            {"caption": "Federated", "connection_class": "sqlserver", "table_count": 3,
+             "connections": [{"connection_class": "sqlserver"},
+                             {"connection_class": "snowflake"},
+                             {"connection_class": "databricks"}]},
+            {"caption": "Extra", "connection_class": "excel-direct", "table_count": 1,
+             "connections": []},
+        ],
+        "model_facts": {"storage_mode": "Import", "table_count": 4, "column_count": 37},
+    }]
+    s = me._summarize(ds_details=[], wb_details=wb_details, viz_available=True)
+    assert s["connectors_seen"] == ["databricks", "excel-direct", "snowflake", "sqlserver"]
+    assert s["datasources_embedded_total"] == 2
+    assert s["tables_translated"] == 4
+    assert s["columns_translated"] == 37
+    assert s["storage_modes"]["Import"] == 1
+
+
+def test_summarize_counts_a_workbook_whose_model_never_landed_as_fallback():
+    # A workbook that HAD embedded datasources but produced no model storage mode routed to the
+    # needs-storage-decision fallback. Counting it keeps the mode tally a complete census of
+    # attempted models instead of quietly omitting the ones that did not land -- and the connectors
+    # must still be reported, so "which systems would this have touched" survives a failed build.
+    wb_details = [{
+        "embedded_datasources": [
+            {"caption": "Access", "connection_class": "msaccess", "connections": []},
+            {"caption": "Excel", "connection_class": "excel-direct", "connections": []},
+        ],
+        "model_facts": None,
+    }]
+    s = me._summarize(ds_details=[], wb_details=wb_details, viz_available=True)
+    assert s["storage_modes"] == {"Import": 0, "DirectQuery": 0, "fallback": 1}
+    assert s["connectors_seen"] == ["excel-direct", "msaccess"]
+    assert s["tables_translated"] == 0          # honest: no model was emitted
+
+
+def test_summarize_datasource_only_run_leaves_workbook_telemetry_inert():
+    # Never-regress guard: a datasource-only run must be untouched by the workbook fold-in.
+    s = me._summarize(ds_details=[], wb_details=[], viz_available=True)
+    assert s["connectors_seen"] == []
+    assert s["datasources_embedded_total"] == 0
+    assert s["tables_translated"] == 0
+    assert s["columns_translated"] == 0
+    assert s["storage_modes"] == {"Import": 0, "DirectQuery": 0, "fallback": 0}
+
+
+def test_connection_facts_reports_every_federated_connection():
+    # The per-connection breakout a credential gate consumes. A datasource that binds three systems
+    # yields three entries with their own server/auth, so "which systems does this touch" is
+    # answerable from report.json instead of by re-parsing connector names out of the TMDL.
+    facts = me._connection_facts({"connections": {
+        "b": {"connection_class": "snowflake", "server": "acme.snowflakecomputing.com",
+              "warehouse": "WH", "auth_method": "username-password"},
+        "a": {"connection_class": "sqlserver", "server": "sql.example.net", "database": "Sales"},
+        "junk": "not-a-dict",
+    }})
+    assert [f["connection_class"] for f in facts] == ["sqlserver", "snowflake"]   # sorted by id
+    assert facts[0]["server"] == "sql.example.net"
+    assert facts[1]["server"] == "acme.snowflakecomputing.com"
+    assert facts[1]["auth_method"] == "username-password"
+    assert facts[0]["database"] == "Sales" and facts[0]["warehouse"] is None
+    assert facts[1]["warehouse"] == "WH"
+    assert me._connection_facts({}) == [] and me._connection_facts(None) == []
+
+
 def test_summarize_folds_workbook_path_column_prune_into_estate_total():
     # Telemetry-gap fix: a consolidated workbook prunes hidden columns inside its OWN model build, so the
     # prune count lives on the workbook detail's ``column_prune`` -- NOT in ds_details. A pure-workbook run

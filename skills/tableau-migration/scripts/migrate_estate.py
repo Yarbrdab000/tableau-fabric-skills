@@ -2749,6 +2749,19 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
             return
 
     report_parts = _rebind_report_byPath(result["parts"], model_safe)
+    # Authoritative emitted-model facts for the workbook path (additive). Recorded HERE, after any
+    # published-datasource fallback recovery has settled which model actually won, and taken from
+    # what the build PRODUCED rather than from the source inventory -- so the storage mode and the
+    # table/column counts a consumer reads are the ones in the emitted TMDL, not an estimate of them.
+    _sd = res_report.get("storage_decision") or {}
+    _manifest = res_report.get("model_manifest") or {}
+    _tabs = _manifest.get("tables") or res_report.get("tables") or []
+    entry["model_facts"] = {
+        "storage_mode": _sd.get("mode"),
+        "connector": _sd.get("connector"),
+        "table_count": len(_tabs),
+        "column_count": len(_manifest.get("columns") or []),
+    }
     # Model-fact rebind: now that the real model is in hand, re-run the viz stage ONCE with the
     # model build's facts so the report binds to what the model actually emitted (the contract is
     # model build -> facts -> single-pass viz). Two consumed facts, both additive + best-effort:
@@ -2927,6 +2940,64 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
         entry["partitions_needs_review"] = _needs_review
 
 
+def _connection_facts(descriptor):
+    """Every distinct upstream connection a descriptor binds, as credential-gate facts.
+
+    A Tableau datasource can federate SEVERAL live systems at once (Azure SQL + Snowflake +
+    Databricks in one datasource is a real, shipped shape), and the emitted model binds each table
+    to its own connection. Reporting only the datasource's primary ``connection_class`` therefore
+    understates what a migration will actually touch -- for a credential gate that is not merely
+    incomplete, it reads as "one system to authenticate" when the true answer is three.
+    """
+    conns = (descriptor or {}).get("connections") or {}
+    out = []
+    for cid in sorted(conns):
+        c = conns[cid]
+        if not isinstance(c, dict):
+            continue
+        out.append({
+            "connection_class": c.get("connection_class"),
+            "server": c.get("server") or None,
+            "database": c.get("database") or None,
+            "warehouse": c.get("warehouse") or None,
+            "schema": c.get("schema") or None,
+            "auth_method": c.get("auth_method") or None,
+        })
+    return out
+
+
+def _embedded_datasource_telemetry(twb_text, all_ds):
+    """Per-embedded-datasource connection telemetry for the WORKBOOK path.
+
+    The datasource path reports what it connected to (``connector``, ``storage_mode``, counts) from
+    ``ds_details``; a workbook has no standalone datasource asset, so that block stayed empty even
+    though the workbook path had already parsed every embedded datasource and emitted correct,
+    distinct connectors for them. Anything consuming ``report.json`` to answer "what live systems
+    will this model touch?" got ``[]`` and had to re-derive the answer by parsing connector function
+    names back out of the emitted TMDL -- fragile, and a duplicate of work already done here.
+
+    Best-effort by construction: a datasource whose descriptor will not parse still reports the
+    inventory facts it does have, so one bad datasource cannot blank the whole block.
+    """
+    out = []
+    for ds in all_ds or []:
+        label = ds.get("label") or ds.get("caption") or ds.get("name")
+        entry = {
+            "caption": ds.get("caption") or ds.get("name") or label,
+            "label": label,
+            "connection_class": ds.get("connection_class"),
+            "named_connection_count": ds.get("named_connection_count"),
+            "table_count": ds.get("table_count"),
+            "connections": [],
+        }
+        try:
+            entry["connections"] = _connection_facts(parse_tds(twb_text, label))
+        except Exception:
+            pass
+        out.append(entry)
+    return out
+
+
 def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None, ds_catalog=None,
                           approved_calc_dax=None, wb_id=None):
     """Build ONE openable, self-contained workbook ``.pbip`` project and record it on ``detail``.
@@ -2970,6 +3041,10 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
     model_safe = _fs_safe(primary.get("caption") or primary.get("name") or label, "Model")
     detail["bound_datasource"] = label
     viz_name = detail.get("name") or safe_base
+    # Connection telemetry for the workbook path (additive). Recorded BEFORE the single/multi split
+    # so both shapes report identically, and before any build step that can bail out -- a workbook
+    # whose model fails to land still tells a consumer which systems it would have touched.
+    detail["embedded_datasources"] = _embedded_datasource_telemetry(twb_text, all_ds)
 
     # SINGLE embedded datasource (the common case): keep the established FLAT ``pbip/<WB>/`` layout so
     # the top-level detail keys and the on-disk paths stay byte-identical. The report binds to the one
@@ -3900,6 +3975,39 @@ def _summarize(ds_details, wb_details, viz_available):
         else:
             error += 1
 
+    # WORKBOOK-PATH datasource telemetry. A workbook owns no standalone datasource asset, so nothing
+    # above this point contributes to the datasource block and every field in it stayed empty -- while
+    # the workbook path had already parsed each embedded datasource and emitted correct, distinct
+    # connectors for them. For a consumer asking "what live systems will this model touch?" an empty
+    # ``connectors_seen`` does not read as "unknown", it reads as "nothing to authenticate", which is
+    # the one wrong answer a credential gate must never be given. Folded in from facts the pipeline
+    # already had: connectors from every embedded datasource AND every federated connection inside
+    # them (a single datasource can bind three different systems), storage mode and table/column
+    # counts from what the model build actually emitted.
+    embedded_total = 0
+    for w in wb_details:
+        emb = w.get("embedded_datasources") or []
+        embedded_total += len(emb)
+        for e in emb:
+            if e.get("connection_class"):
+                connectors.add(e["connection_class"])
+            for c in (e.get("connections") or []):
+                if c.get("connection_class"):
+                    connectors.add(c["connection_class"])
+        facts = w.get("model_facts") or {}
+        mode = facts.get("storage_mode")
+        if mode in modes:
+            modes[mode] += 1
+        elif emb:
+            # The workbook had embedded datasources but produced no model storage mode: its build
+            # routed to the needs-storage-decision fallback (recorded loud in ``pbip_warnings``).
+            # Counting it keeps the mode tally a complete census of attempted models rather than
+            # quietly omitting the ones that did not land -- the fallback total is exactly the
+            # number a reader is looking for when the estate under-delivers.
+            modes["fallback"] += 1
+        tables += facts.get("table_count") or 0
+        columns += facts.get("column_count") or 0
+
     # Workbook-model calc rollup. A consolidated workbook builds its OWN semantic model (from the
     # workbook's embedded/published datasources); that model's calc-translation summary lives on
     # ``model_translation_handoff`` -- NOT in ``ds_details``. Without this fold-in, a workbook's calcs
@@ -3970,6 +4078,7 @@ def _summarize(ds_details, wb_details, viz_available):
 
     return {
         "datasources_total": len(ds_details),
+        "datasources_embedded_total": embedded_total,
         "datasources_migrated": migrated,
         "datasources_partial": partial,
         "datasources_fallback": fallback,
