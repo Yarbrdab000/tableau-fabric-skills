@@ -6107,20 +6107,23 @@ def _build_query_state(ws, model_table, field_map, warnings):
                        + ([color] if color and color["kind"] == "value" else [])
                        + ([label] if label and label["kind"] == "value" else [])
                        + ([size] if size and size["kind"] == "value" else []))
-        # Heat-grid colour DRIVER -> tooltip, not a visible column. When a continuous colour scale
-        # colours a DISTINCT displayed value (Tableau "colour by a different field"), the colour
-        # measure is not shown as its own matrix column: it is surfaced on the TOOLTIP (faithful to
-        # Tableau's default colour-card tooltip) and referenced by the background-gradient FillRule.
+        # Heat-grid colour DRIVER -> not a visible column. When a continuous colour scale colours a
+        # DISTINCT displayed value (Tableau "colour by a different field"), the colour measure must
+        # not appear as its own matrix column -- it only drives the background gradient, which the
+        # `FillRule` references by MODEL name and therefore does not need projected into the query.
         # Only fires when there is another displayed value AND a gradient is present, so the classic
         # highlight table (colour == the shown measure) is unchanged.
-        tooltip_meas = []
+        #
+        # It used to ride along in a ``Tooltips`` role. A pivotTable has NO Tooltips well, so that
+        # role made the visual invalid and it failed to render -- adjudicated on a ground-truth run
+        # as a deterministic-rule defect ("remove invalid Tooltips role from pivotTable", 2 pages).
+        # Dropping the projection entirely is both the fix and the faithful shape.
         if ws.get("color_gradient") and color and color["kind"] == "value":
             ck = (color["entity"], color["property"], color["binding"], color["aggregation"])
             others = [f for f in vals
                       if (f["entity"], f["property"], f["binding"], f["aggregation"]) != ck]
             if others:
                 vals = others
-                tooltip_meas = [color]
         if row_dims:
             state["Rows"] = {"projections": _role_projections(
                 row_dims, model_table, field_map, used_refs)}
@@ -6130,9 +6133,6 @@ def _build_query_state(ws, model_table, field_map, warnings):
         if vals:
             state["Values"] = {"projections": _role_projections(
                 vals, model_table, field_map, used_refs)}
-        if tooltip_meas:
-            state["Tooltips"] = {"projections": _role_projections(
-                tooltip_meas, model_table, field_map, used_refs)}
     elif vt == VT_TABLE:
         ordered = drop_calc_axis(_dedupe(
             categories(rows) + categories(cols))) + _dedupe(
@@ -7060,21 +7060,32 @@ def _conditional_format(ws, state, model_table, field_map, warnings):
     }
 
     values = (state.get("Values") or {}).get("projections", [])
-    tooltips = (state.get("Tooltips") or {}).get("projections", [])
 
     def _match(field):
         if not field:
             return None
         expr, _, _ = _field_expression(field, model_table, field_map)
-        # The colour driver may be surfaced on the matrix Tooltips (heat-grid "colour by a different
-        # field") rather than as a visible Values column -- search both so the FillRule binds to the
-        # exact projected queryRef wherever it lives.
-        for p in values + tooltips:
+        for p in values:
             if p["field"] == expr:
                 return p
         return None
 
     driver_proj = _match(color)
+    # COLOUR BY A DIFFERENT FIELD. The driver measure is not a visible column here, and a matrix has
+    # no Tooltips well to park it in -- emitting one made the visual invalid and it did not render
+    # (adjudicated on a ground-truth run as a det-rule defect). Power BI does not require the driver
+    # to be projected at all: the FillRule's ``Input`` is resolved against the MODEL, and only the
+    # ``selector.metadata`` (which column receives the fill) must name a projected queryRef.
+    # Confirmed on the adjudicated ground-truth `.pbip` for this very workbook: its matrix carries
+    # roles ['Values'] only, projects Category/Profit/Sales, and its fills reference ``Total Profit``
+    # / ``Total Sales`` -- measures that appear in NO projection.
+    driver_expr = None
+    driver_ref = None
+    if driver_proj is not None:
+        driver_expr = driver_proj["field"]
+        driver_ref = driver_proj.get("queryRef")
+    elif color and color.get("kind") == "value" and values:
+        driver_expr, driver_ref, _nr = _field_expression(color, model_table, field_map)
     # A quick table calc normally defers (the model carries no equivalent measure). But when the
     # colour pill was REBOUND to a real model measure via the model<->viz contract
     # (``measure_rebound``), it IS a bindable measure now -- so the table-calc gate is lifted and the
@@ -7082,7 +7093,7 @@ def _conditional_format(ws, state, model_table, field_map, warnings):
     is_table_calc_defer = cg["is_table_calc"] and not (color or {}).get("measure_rebound")
     if (color is None or color["kind"] != "value"
             or color["binding"] not in ("aggregation", "measure")
-            or is_table_calc_defer or driver_proj is None):
+            or is_table_calc_defer or driver_expr is None):
         reason = ("colour driver is a quick table calc -- no equivalent model measure yet"
                   if is_table_calc_defer
                   else "colour driver is not bound to a model measure in this visual")
@@ -7096,18 +7107,27 @@ def _conditional_format(ws, state, model_table, field_map, warnings):
 
     # Colour the displayed cell value: a distinct text/label measure when present (Tableau's "color
     # by a different field" pattern), else self-colour the driver measure itself.
-    target_proj = _match(ws["encodings"].get("label")) or driver_proj
+    target_proj = _match(ws["encodings"].get("label")) or driver_proj or (values[0] if values else None)
+    if target_proj is None:
+        reason = "no projected column to receive the fill"
+        warnings.append(_warn(
+            "worksheet", ws["name"],
+            "background colour scale deferred ({0}); the visual is emitted without "
+            "conditional formatting".format(reason)))
+        fact["status"] = "deferred"
+        fact["reason"] = reason
+        return None, fact
     value_objects = [{
         "properties": {
             "backColor": {"solid": {"color": {"expr": {"FillRule": {
-                "Input": driver_proj["field"],
+                "Input": driver_expr,
                 "FillRule": _gradient_color_stops(cg)}}}}}},
         "selector": {
             "data": [{"dataViewWildcard": {"matchingOption": 1}}],
             "metadata": target_proj["queryRef"]},
     }]
     fact["status"] = "emitted"
-    fact["bound_measure"] = driver_proj["queryRef"]
+    fact["bound_measure"] = driver_ref or "(model measure)"
     fact["target"] = target_proj["queryRef"]
     if cg.get("default_palette"):
         fact["default_palette"] = True

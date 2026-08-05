@@ -12,6 +12,29 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### tableau-migration (skill `2.67.0` -> `2.68.0`)
+
+- **A matrix no longer emits an invalid `Tooltips` role.** For Tableau's "colour by a different
+  field" heat grid, the colour driver was parked in a `Tooltips` well so it would not show as a
+  visible column. A `pivotTable` HAS no Tooltips well, so that role made the visual invalid and it
+  did not render. Found by auditing the corpus against its own adjudicated ground truth, which
+  records this as a `det-rule` fix ("remove invalid Tooltips role from pivotTable", 2 pages) on a
+  run whose rendered-visual count went 9 -> 21 once fixed.
+- **The fill's driver no longer has to be projected.** Power BI resolves a `FillRule`'s `Input`
+  against the MODEL; only `selector.metadata` (which column receives the fill) must name a
+  projected `queryRef`. Our gate was stricter, which is why the driver had to ride somewhere. The
+  relaxation is not inferred -- the adjudicated ground-truth `.pbip` for that exact workbook
+  (`0069_multiple_kpi`) carries roles `['Values']` only, projects `Category`/`Profit`/`Sales`, and
+  its fills reference `Total Profit` / `Total Sales`, which appear in NO projection.
+- **Corpus formatting audit added as evidence.** All 504 emitted visuals were checked against the
+  corpus's own literal-encoding rules (quoted booleans, doubles missing the `D` suffix, unquoted
+  colours -- each a SILENT no-op): **zero violations**. The other two adjudicated `det-rule` fixes
+  were verified as already implemented (`HierarchyLevel` with `active: true`, 46/46).
+
+Validation: suite 4034 passed / 6 skipped / 1 xfailed; 2/2 mutants killed; corpus 29/29 with
+exactly ONE visual changed -- the one the adjudication flagged -- and all 40 conditional-fill
+blocks preserved.
+
 ### tableau-migration (skill `2.66.0` -> `2.67.0`)
 
 **Dynamic titles and text boxes now resolve every token the view PINS.** Tableau weaves live tokens

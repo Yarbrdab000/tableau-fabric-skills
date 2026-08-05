@@ -5726,9 +5726,12 @@ def test_diverging_scale_with_center_emits_lineargradient3_mid_pinned():
 
 def test_color_by_different_measure_targets_displayed_value():
     # Tableau "colour by a different field": text shows SUM(Sales), colour driven by SUM(Profit).
-    # The FillRule Input is Profit; the selector targets the displayed Sales column. The colour
-    # driver is surfaced on the matrix TOOLTIPS (faithful to Tableau's colour-card tooltip), not as
-    # a visible Values column -- so Sales is the only displayed value and Profit rides the tooltip.
+    # The FillRule Input is Profit; the selector targets the displayed Sales column. The driver is
+    # NOT projected at all -- a pivotTable has no Tooltips well, and parking it there made the
+    # visual invalid so it did not render (adjudicated det-rule defect). Power BI resolves a
+    # FillRule ``Input`` against the MODEL, so only ``selector.metadata`` has to name a projected
+    # column. Confirmed on the adjudicated ground-truth `.pbip` for 0069_multiple_kpi: roles are
+    # ['Values'] only, and the fills reference measures that appear in no projection.
     style = _mark_color_style("[federated.abc].[sum:Profit:qk]", "ordered-sequential",
                               ["#ffffff", "#1f77b4"])
     enc = ("<encodings><color column='[federated.abc].[sum:Profit:qk]' />"
@@ -5742,9 +5745,8 @@ def test_color_by_different_measure_targets_displayed_value():
     assert vo[0]["selector"]["metadata"] == "Sum(Orders.Sales_Amount)"
     qs = _query_state(vj)
     val_refs = {p["queryRef"] for p in qs["Values"]["projections"]}
-    tip_refs = {p["queryRef"] for p in qs["Tooltips"]["projections"]}
     assert val_refs == {"Sum(Orders.Sales_Amount)"}       # only the displayed value is a column
-    assert tip_refs == {"Sum(Orders.Profit)"}             # the colour driver rides the tooltip
+    assert "Tooltips" not in qs                            # a pivotTable has no Tooltips well
 
 
 def test_table_calc_colour_driver_defers_with_palette_preserved():
@@ -7232,9 +7234,8 @@ def test_measure_binding_lights_up_heat_grid_via_pcdf_instance_token():
     vj = list(_visual_parts(res["parts"]).values())[0]
     qs = _query_state(vj)
     val_refs = {p["queryRef"] for p in qs["Values"]["projections"]}
-    tip_refs = {p["queryRef"] for p in qs["Tooltips"]["projections"]}
     assert val_refs == {"Sum(Orders.Sales_Amount)"}            # displayed value only
-    assert tip_refs == {"_Measures.Percent Difference"}        # colour driver on the tooltip
+    assert "Tooltips" not in qs                                # pivotTable has no Tooltips well
     # the conditional-format fill lights up against the contracted measure
     fr = _fill_rule(_values_objects(vj))
     assert fr["Input"]["Measure"]["Property"] == "Percent Difference"
@@ -7255,8 +7256,11 @@ def test_measure_binding_keyed_by_bare_calc_id_and_wrapper_form():
                                          "status": "assisted-approved"}}}
     res = migrate_twb_to_pbir(_pcdf_heat_workbook(), measure_binding=mb)
     vj = list(_visual_parts(res["parts"]).values())[0]
-    tip_refs = {p["queryRef"] for p in _query_state(vj)["Tooltips"]["projections"]}
-    assert tip_refs == {"_Measures.Percent Difference"}
+    # The bound measure drives the fill WITHOUT being projected: a pivotTable has no Tooltips well
+    # (see test_color_by_different_measure_targets_displayed_value), and Power BI resolves a
+    # FillRule ``Input`` against the model.
+    assert "Tooltips" not in _query_state(vj)
+    assert _fill_rule(_values_objects(vj))["Input"]["Measure"]["Property"] == "Percent Difference"
     assert _cf_fact(res["candidate_records"], "Heat")["status"] == "emitted"
 
 
