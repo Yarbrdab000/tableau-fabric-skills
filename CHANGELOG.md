@@ -12,6 +12,63 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### tableau-migration (skill `2.66.0` -> `2.67.0`)
+
+**Dynamic titles and text boxes now resolve every token the view PINS.** Tableau weaves live tokens
+into a worksheet title or a text zone; a static Power BI textbox cannot evaluate them at render
+time, so they must be resolved at BUILD time or the reader loses the sentence. Only
+`<[Parameters].[id]>` was ever resolved -- field references, runtime specials and authored number
+formats were all dropped, turning an authored status band into a scaffold with holes in it.
+
+Measured on a customer workbook built deliberately to be hard (40 parameters, seven sharing the
+caption `Select Metric Rank - Network...`, so nothing resolves by caption):
+
+    before   Sort By = % Multi-Home (MH) | Region =AE | Fiscal Month = HQ500000
+    after    Sort By = % Multi-Home (MH) | Region = Big South | Fiscal Month =6/21/2026
+             HQ$500KDyanmic Titles and Text Boxes7/24/2026 11:33:40 AM6/21/2026
+    Tableau  ... character-for-character identical, except it renders the refresh stamp
+             4:33:40 AM (see the time-zone note below).
+
+Every rule is read from the workbook, never inferred from a name:
+
+- **Parameters** resolve by internal id to their alias, else their authored `default-format`, else
+  the raw literal -- so `0` renders `HQ` and `500000` renders `$500K`. The format evaluator covers
+  the shapes that appear in the wild (sections, quoted literals, grouping, decimals, trailing-comma
+  1000x scaling, `%`) and rounds HALF AWAY FROM ZERO like Excel, not half-to-even like Python, so a
+  scaled `$2.5M` cannot disagree with the source. Ambiguous precision codes (`n2`, which does not
+  state whether grouping was wanted) decline to the raw value.
+- **Field references** resolve to the value this view pins them to: the single member its filter
+  selects (`Big South`), or `All` when the filter is unrestricted. Both confirmed against source
+  renders of two independent customer workbooks. A selection of SEVERAL specific members is left
+  unresolved -- the evidence there is ambiguous, and a wrong literal in a header is worse than a
+  blank one.
+- **Runtime specials** resolve from the file: workbook name, sheet name, and the extract's recorded
+  refresh stamp. `<Page Name>` resolves to empty WITHOUT vetoing the title, because Tableau itself
+  renders nothing for it on a view with no Pages shelf (confirmed: five of six tokens in that run
+  produced text).
+- **Everything else fails closed.** A bare `<Region>` or a viewer-dependent `<User Name>` is
+  reported unresolved, so a chart title declines rather than leaking raw markup. This also fixed a
+  latent hole found while building it: the previous "any residual `<...>`" check was the only thing
+  stopping unknown token shapes from surviving as literal text.
+- **The `AE` (U+00C6) line-break sentinel is scrubbed from titles**, as `_zone_text` already did for
+  dashboard text zones -- but narrowly, because it is also a real letter. Only two shapes are
+  markers: the sentinel immediately before a hard newline, and a run whose ENTIRE content is the
+  sentinel plus whitespace. Danish/Norwegian text (`AEroe Sales`) is untouched.
+
+**Time-zone note (deliberate).** `<Data Update Time>` is emitted exactly as recorded. Tableau
+renders that stamp in the VIEWER's time zone; converting at build time would swap a deterministic
+value for one that changes with whatever machine ran the build, so a corpus diff would flip between
+runs. The caption warning discloses this instead of silently picking an offset.
+
+The rebuild warning also stopped overstating the gap: it used to say dynamic values "render blank",
+which is no longer true. It now states the real residual limit -- the text is STATIC, so it does not
+re-resolve when a reader changes a slicer.
+
+Validation: suite 4035 passed / 6 skipped / 1 xfailed (21 new tests); 9/9 mutants killed; corpus
+29/29 with zero visual, model or `.pbir` changes -- and two corpus workbooks
+(`0085_time_series_style_palette`, `0088_salesforce_nonprofit_case_mgmt`) recovered titles they
+previously dropped.
+
 ### tableau-migration (skill `2.65.0` -> `2.66.0`)
 
 - **The openability gate now resolves DAX references (`dax_references_resolve`).** Every

@@ -31,6 +31,7 @@ workbook XML structure were used to build this; it is original, deterministic, a
 from __future__ import annotations
 
 import copy
+import decimal
 import hashlib
 import json
 import math
@@ -41,9 +42,9 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 
 try:  # package or scripts-on-path (mirrors the other cores)
-    from .tmdl_generate import clean_col
+    from .tmdl_generate import clean_col, tableau_default_format_to_pbi
 except ImportError:
-    from tmdl_generate import clean_col
+    from tmdl_generate import clean_col, tableau_default_format_to_pbi
 
 # View-only Quick Table Calc -> Power BI Visual Calculation (additive; report-layer counterpart to
 # the model measure path). These three cooperate: ``extract_table_calc_usages`` recovers the quick
@@ -1940,6 +1941,20 @@ def _parse_filters(ws, ds_default, base_cols, instances, index, ds_caption,
         f["filter_token"] = (ds, fid)
         f["selection"] = _parse_filter_selection(filt) if cls == "categorical" else None
         f["range"] = _parse_filter_range(filt) if cls == "quantitative" else None
+        # A title/text zone can embed this field as a live token (``<[ds].[field]>``), which Tableau
+        # renders as the field's value IN THIS VIEW. That is knowable exactly when the sheet pins it:
+        # one selected member renders as that member, and an unrestricted filter renders "All".
+        # Both are confirmed against source renders of two independent customer workbooks (Region
+        # filtered to one member showed "Big South"; the same field unrestricted showed "All").
+        # A selection of SEVERAL specific members is deliberately left unresolved -- the observed
+        # evidence is ambiguous there, and a wrong literal in a header is worse than a blank one.
+        f["title_display"] = None
+        if cls == "categorical":
+            sel = f["selection"]
+            if _filter_is_unrestricted(filt):
+                f["title_display"] = "All"
+            elif sel and sel.get("mode") == "include" and len(sel.get("values") or ()) == 1:
+                f["title_display"] = _filter_member_display(sel["values"][0])
         filters.append(f)
     return filters, swap_controls
 
@@ -2392,7 +2407,23 @@ def _parse_worksheet_title(ws):
         return None, False
     ft = _first(title, "formatted-text")
     runs = _findall_local(ft, "run") if ft is not None else []
-    text = "".join((r.text or "") for r in runs).strip()
+    # Tableau encodes a title's LAYOUT MARKERS with the sentinel ``\u00c6`` (Æ) -- the same idiom
+    # ``_zone_text`` already scrubs for dashboard text zones, but it was never scrubbed here, so a
+    # customer status band rebuilt as ``Region =Æ Big South``.
+    #
+    # ``Æ`` is ALSO a real letter, so the scrub has to be narrow or it mutilates legitimate
+    # Danish/Norwegian text (``Ærø Sales``). Two shapes are markers and nothing else is touched:
+    #   * ``Æ`` immediately before a hard newline -- the long-known line-break sentinel; and
+    #   * a run whose ENTIRE content is ``Æ`` plus whitespace -- a separator/spacer run, which no
+    #     real word can be (a word carries its other letters in the same run).
+    # Surrounding whitespace is preserved either way, so the spacing the author saw is kept.
+    parts = []
+    for r in runs:
+        rt = r.text or ""
+        if rt.strip() == "\u00c6":
+            rt = rt.replace("\u00c6", "")
+        parts.append(rt)
+    text = "".join(parts).replace("\u00c6\n", "\n").strip()
     if not text:
         return None, False
     return text, bool(_TITLE_DYNAMIC_RE.search(text))
@@ -4981,6 +5012,12 @@ def _parse_parameters(root):
             if not cur_display and cur_val is not None:
                 cur_display = next((m.get("alias") for m in members
                                     if m["value"] == cur_val and m.get("alias")), None)
+            # No alias -> honour the author's NUMBER FORMAT before falling back to the raw literal.
+            # A range parameter has no members to alias, so its format code is the only statement of
+            # how the value is meant to READ: `$500K` is the authored display of 500000, and leaking
+            # the raw integer into a title changes what the number appears to say.
+            if not cur_display and cur_val is not None and col.get("default-format"):
+                cur_display = _format_number_literal(cur_val, col.get("default-format"))
             if not cur_display and cur_val is not None:
                 cur_display = cur_val
             params[pid] = {
@@ -4989,12 +5026,97 @@ def _parse_parameters(root):
                 "members": members,
                 "current_value": cur_val,
                 "current_display": cur_display,
+                "default_format": col.get("default-format"),
             }
     return params
 
 
 _PARAM_TOKEN_RE = re.compile(r"<\[Parameters\]\.\[(?P<pid>[^\]]+)\]>")
 _FIELD_TOKEN_RE = re.compile(r"<\[[^<>]+\]\.\[[^<>]+\]>")
+
+# A quoted literal inside a Tableau/Excel number-format code, and the numeric placeholder run.
+_FMT_QUOTED_RE = re.compile(r'"([^"]*)"')
+_FMT_PATTERN_RE = re.compile(r"[#0][#0,.]*")
+
+
+def _format_number_literal(value, code):
+    """Render ``value`` through a Tableau ``default-format`` code, or ``None`` if it cannot.
+
+    Tableau persists an author's parameter/field number format as an Excel-style code
+    (``c"$"#,##0,K;("$"#,##0,K)``). A MEASURE can carry that straight through as a Power BI
+    ``formatString`` (see ``tableau_default_format_to_pbi``), but a title or text box is STATIC
+    text in Power BI -- there is no format to apply at render time, so the literal has to be
+    computed here or the reader sees the raw number. Measured: an authored ``$500K`` rebuilt as
+    ``500000``, which is not just uglier, it is a different claim about the value's scale.
+
+    Implements the subset that actually appears in the wild, and declines anything else rather than
+    approximate it: section split on ``;`` (positive/negative), quoted literals, thousands grouping,
+    a fixed number of decimals, TRAILING commas as 1000x scaling (``#,##0,K`` -> 500000 renders
+    ``500K``), and ``%`` as a 100x scale. Returns ``None`` when the code has no numeric placeholder
+    or the value is not numeric, so the caller keeps the raw value instead of inventing a format.
+    """
+    if value is None or code is None:
+        return None
+    try:
+        num = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    body = tableau_default_format_to_pbi(str(code))
+    if not body:
+        return None
+    # Negative values use the second section when the author supplied one.
+    sections = body.split(";")
+    section = sections[0]
+    if len(sections) > 1 and num < 0:
+        section = sections[1]
+        num = abs(num)
+    # Tableau also writes a PRECISION code rather than a placeholder pattern: ``p1%`` is "percent to
+    # one decimal". Only the percent form is unambiguous -- a bare ``n2`` does not say whether the
+    # author wanted thousands grouping, so it declines to the raw value rather than guess.
+    pct_precision = re.match(r"^(\d+)%$", section.strip())
+    if pct_precision:
+        return ("{:.%df}%%" % int(pct_precision.group(1))).format(num * 100.0)
+    literals = []
+
+    def _stash(mo):
+        literals.append(mo.group(1))
+        return "\x00"           # digit-free sentinel: a digit here would be read as the pattern
+
+    section = _FMT_QUOTED_RE.sub(_stash, section)
+    m = _FMT_PATTERN_RE.search(section)
+    if not m:
+        return None
+    pattern = m.group(0)
+    prefix, suffix = section[:m.start()], section[m.end():]
+
+    scale = len(pattern) - len(pattern.rstrip(","))
+    pattern = pattern.rstrip(",")
+    if "%" in prefix or "%" in suffix:
+        num *= 100.0
+    num /= (1000.0 ** scale)
+
+    if "." in pattern:
+        decimals = len(pattern.split(".", 1)[1].replace(",", ""))
+    else:
+        decimals = 0
+    grouped = "," in pattern.split(".", 1)[0]
+    # Excel/Tableau round HALF AWAY FROM ZERO; Python's format() rounds half to EVEN, so a value
+    # landing exactly on .5 renders one lower (2.5 -> "2" instead of "3"). Quantize explicitly so a
+    # scaled figure like $2.5M does not silently disagree with the source render.
+    try:
+        q = decimal.Decimal(repr(num)).quantize(
+            decimal.Decimal(1).scaleb(-decimals), rounding=decimal.ROUND_HALF_UP)
+    except (decimal.InvalidOperation, ValueError):
+        q = num
+    text = ("{:,.%df}" % decimals).format(q) if grouped else ("{:.%df}" % decimals).format(q)
+
+    lits = iter(literals)
+
+    def _restore(s):
+        return "".join(next(lits, "") if ch == "\x00" else ch for ch in s)
+
+    return (_restore(prefix) + text + _restore(suffix)).strip()
+
 
 
 def _resolve_dynamic_text_tokens(text, params):
@@ -5024,35 +5146,186 @@ def _resolve_dynamic_text_tokens(text, params):
     return "\n".join(ln.strip() for ln in out.split("\n")).strip()
 
 
-def _resolve_caption_text(text, params):
+def _filter_is_unrestricted(filt):
+    """True when a categorical filter narrows NOTHING -- Tableau's "(All)" state.
+
+    Serialised as a lone ``<groupfilter function='level-members' ui-enumeration='all'>`` with no
+    member children. Distinguished from a filter we simply could not READ (which also yields no
+    selection) so a title token can render ``All`` on the former and stay blank on the latter."""
+    children = _children_local(filt, "groupfilter")
+    if not children:
+        return False
+    for ch in children:
+        if ch.get("function") != "level-members":
+            return False
+        if _attr_local(ch, "ui-enumeration") != "all":
+            return False
+        if _children_local(ch, "groupfilter"):
+            return False
+    return True
+
+
+def _filter_member_display(raw):
+    """Render one Tableau filter member literal as Tableau displays it in a title.
+
+    ``"Big South"`` -> ``Big South`` (quotes are serialisation, not content) and ``#2026-06-21#`` ->
+    ``6/21/2026`` (Tableau's default short-date display, no leading zeros). Anything else passes
+    through stripped. Returns ``""`` for an empty member."""
+    s = _strip_member_literal(raw)
+    if not s:
+        return ""
+    m = re.match(r"^#(\d{4})-(\d{2})-(\d{2})(?:\s.*)?#$", s.strip())
+    if m:
+        y, mo, d = m.group(1), int(m.group(2)), int(m.group(3))
+        return "%d/%d/%s" % (mo, d, y)
+    return s
+
+
+# Tableau runtime specials that a title/text zone can embed. Only the ones whose value is knowable
+# from the workbook itself are resolved; the rest stay unresolved so the caller can decline rather
+# than invent a value (``<User Name>``/``<Server Name>`` depend on who is viewing, not on the file).
+_RUNTIME_SPECIAL_RE = re.compile(
+    r"<(Workbook Name|Sheet Name|Page Name|Data Update Time)>")
+
+
+def _substitute_dynamic_tokens(text, params, field_values=None, specials=None):
+    """Substitute every resolvable dynamic token; return ``(text, unresolved_tokens)``.
+
+    Tableau weaves four kinds of live token into a title or text zone, and all four are resolvable
+    from the workbook alone when the view pins them:
+
+      * ``<[Parameters].[id]>`` -- the parameter's CURRENT display value (its alias when it has one,
+        else its authored number format, else the raw literal);
+      * ``<[ds].[field]>`` -- the field's value in this view's context, which is knowable exactly
+        when the worksheet FILTERS that field to a single member (``Big South``) or leaves it
+        unrestricted (``All``);
+      * ``<Workbook Name>`` / ``<Sheet Name>`` -- names we already hold;
+      * ``<Data Update Time>`` -- the extract's recorded refresh stamp.
+
+    Anything still unresolved is returned to the caller rather than guessed at, so the two call
+    sites can apply their own policy (a status band blanks them; a chart title declines entirely).
+    """
+    unresolved = []
+
+    def _sub_param(mo):
+        info = params.get(mo.group("pid")) if params else None
+        disp = info.get("current_display") if info else None
+        if disp:
+            return str(disp)
+        unresolved.append(mo.group(0))
+        return ""
+
+    out = _PARAM_TOKEN_RE.sub(_sub_param, text)
+
+    def _sub_special(mo):
+        val = (specials or {}).get(mo.group(1))
+        if val:
+            return str(val)
+        # A special the workbook cannot answer (no Pages shelf -> <Page Name> is genuinely empty in
+        # Tableau too) resolves to nothing WITHOUT being called unresolved, so it does not veto an
+        # otherwise-static title.
+        if mo.group(1) in (specials or {}):
+            return ""
+        unresolved.append(mo.group(0))
+        return ""
+
+    out = _RUNTIME_SPECIAL_RE.sub(_sub_special, out)
+
+    def _sub_field(mo):
+        key = mo.group(0)[1:-1].strip()
+        val = (field_values or {}).get(key)
+        if val is not None:
+            return str(val)
+        unresolved.append(mo.group(0))
+        return ""
+
+    out = _FIELD_TOKEN_RE.sub(_sub_field, out)
+    # FAIL CLOSED. Anything still wrapped in <...> is a token shape none of the resolvers above
+    # claimed -- a bare field name (``<Region>``), a runtime special we deliberately do not answer
+    # (``<User Name>``), or something Tableau adds later. Report it as unresolved so a caller that
+    # must not dangle still declines. Without this the residue would survive as RAW MARKUP in the
+    # rendered text, which is strictly worse than dropping the title.
+    unresolved.extend(_TITLE_DYNAMIC_RE.findall(out))
+    return out, unresolved
+
+
+def _worksheet_field_token_values(ws):
+    """``{"[ds].[field]": display}`` for every field this worksheet's filters PIN to a value.
+
+    Keyed on the exact raw token a title embeds, which is the same ``[datasource].[field-instance]``
+    string the filter's ``column`` attribute carries -- so the lookup is a direct match, never a
+    name heuristic."""
+    out = {}
+    for f in (ws.get("filters") or ()):
+        tok = f.get("filter_token")
+        disp = f.get("title_display")
+        if tok and disp is not None:
+            out["[%s].[%s]" % (tok[0], tok[1])] = disp
+    return out
+
+
+def _extract_update_time(root):
+    """The extract's recorded refresh stamp (``<connection @update-time>``), or ``None``.
+
+    Tableau writes this on the ``.hyper`` connection and renders it for ``<Data Update Time>``,
+    normalising it to its short display style (``07/24/2026 11:33:40 AM`` -> ``7/24/2026 11:33:40
+    AM``), which is what this returns.
+
+    The CLOCK TIME is emitted exactly as recorded. Tableau renders this stamp in the VIEWER's time
+    zone, which a static Power BI textbox cannot track -- converting here would swap a deterministic
+    value for one that changes with whatever machine ran the build, so a corpus diff would flip
+    between runs. The caller discloses the caveat instead."""
+    for conn in root.iter():
+        if conn.tag.split("}")[-1] != "connection":
+            continue
+        ut = (conn.get("update-time") or "").strip()
+        if not ut:
+            continue
+        m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})\b(.*)$", ut)
+        if m:
+            return "%d/%d/%s%s" % (int(m.group(1)), int(m.group(2)), m.group(3), m.group(4))
+        return ut
+    return None
+
+
+def _runtime_specials(sheet_name, workbook_name, update_time):
+    """The runtime-special values this workbook can answer.
+
+    A key present with an empty value resolves to empty text WITHOUT vetoing an otherwise-static
+    title -- which is what Tableau itself does for ``<Page Name>`` on a view with no Pages shelf
+    (confirmed against a source render: the token contributed nothing while the other five in the
+    same title all rendered). A key that is ABSENT stays unresolved, so a title that depends on it
+    declines rather than silently loses meaning."""
+    return {
+        "Sheet Name": sheet_name or "",
+        "Workbook Name": workbook_name or "",
+        "Data Update Time": update_time or "",
+        "Page Name": "",
+    }
+
+
+def _resolve_caption_text(text, params, field_values=None, specials=None):
     """Resolve a caption-only worksheet's raw title to static display text (v2-3).
 
     A caption-only worksheet (see ``caption_only_raw`` in :func:`_parse_worksheet`) is a thin
     status / refresh / filter-breadcrumb bar whose title is usually *dynamic* -- woven from
     ``<[Parameters].[id]>`` tokens, federated field-refs (``<[ds].[field]>``), and Tableau runtime
     specials (``<Data Update Time>``, ``<Data Connection Name>``, ...). This renders it to a plain
-    literal for the rebuilt textbox: every parameter token becomes its CURRENT display value, and
-    every *other* ``<...>`` token -- field-refs AND runtime specials alike -- is stripped rather than
-    leaked as raw markup (a static build has no live value for them; v2-4 deepens field-ref
-    resolution). Differs from :func:`_resolve_dynamic_text_tokens` (which strips only bracketed
-    field-refs) by clearing ALL residual ``<...>`` so a runtime special never survives. Collapses
+    literal for the rebuilt textbox: every token this view PINS is substituted with its live display
+    value (see :func:`_substitute_dynamic_tokens` -- parameters by alias/format, filtered fields by
+    their selected member or ``All``, workbook/sheet names, the extract's refresh stamp), and any
+    token that remains genuinely unknowable is stripped rather than leaked as raw markup. Collapses
     runs of horizontal whitespace (a hard newline is preserved); returns ``""`` for an all-token
     caption so the caller drops the now-empty band."""
     if not text:
         return ""
-
-    def _sub_param(mo):
-        info = params.get(mo.group("pid")) if params else None
-        disp = info.get("current_display") if info else None
-        return disp if disp else ""
-
-    out = _PARAM_TOKEN_RE.sub(_sub_param, text)
-    out = _TITLE_DYNAMIC_RE.sub("", out)   # strip every remaining field-ref + runtime special
+    out, _unresolved = _substitute_dynamic_tokens(text, params, field_values, specials)
+    out = _TITLE_DYNAMIC_RE.sub("", out)   # strip anything still unresolved
     out = re.sub(r"[ \t]+", " ", out)
     return "\n".join(ln.strip() for ln in out.split("\n")).strip()
 
 
-def _resolve_dynamic_title(text, params):
+def _resolve_dynamic_title(text, params, field_values=None, specials=None):
     """Resolve a SUPPORTED visual's raw dynamic title to a static Power BI title, or ``None`` (v2-4).
 
     A non-KPI worksheet title that embeds a live Tableau token cannot be reproduced verbatim by the
@@ -5060,24 +5333,20 @@ def _resolve_dynamic_title(text, params):
     caption-only status bar (:func:`_resolve_caption_text`, which blanks every unresolved token because
     a thin band of label scaffolding still reads sensibly), a CHART title must never degrade to a
     dangling label -- "Days to Ship for <Category>" stripped to "Days to Ship for" reads as broken. So
-    the rule is deliberately conservative and targets the common parameter-driven case: substitute every
-    ``<[Parameters].[id]>`` token with its CURRENT display value, then KEEP the result ONLY when the
-    title is now FULLY static (e.g. "Sales by <Show by Dimension>" -> "Sales by Program Name"). If any
-    ``<...>`` token remains after parameter substitution -- a federated field-ref or a runtime special
-    whose per-row value is unknowable here -- return ``None`` so the caller drops the title (the rebuilt
-    visual keeps its default) rather than emit a partial one. Returns the resolved static title, or
-    ``None`` to drop (also ``None`` for empty input or a title that collapses to whitespace)."""
+    the rule is deliberately conservative and targets the case the view PINS: substitute every token
+    whose value this worksheet fixes (see :func:`_substitute_dynamic_tokens` -- a parameter's current
+    display, a field the sheet filters to one member or leaves unrestricted, the workbook/sheet name,
+    the extract's refresh stamp), then KEEP the result ONLY when the title is now FULLY static
+    (e.g. "Sales by <Show by Dimension>" -> "Sales by Program Name"). If any token remains
+    unresolvable -- a per-row field whose value varies down the view -- return ``None`` so the caller
+    drops the title (the rebuilt visual keeps its default) rather than emit a partial one. Returns
+    the resolved static title, or ``None`` to drop (also ``None`` for empty input or a title that
+    collapses to whitespace)."""
     if not text:
         return None
-
-    def _sub_param(mo):
-        info = params.get(mo.group("pid")) if params else None
-        disp = info.get("current_display") if info else None
-        return disp if disp else ""
-
-    out = _PARAM_TOKEN_RE.sub(_sub_param, text)
-    if _TITLE_DYNAMIC_RE.search(out):
-        return None  # an unresolvable field-ref / runtime special remains -> drop, never dangle
+    out, unresolved = _substitute_dynamic_tokens(text, params, field_values, specials)
+    if unresolved:
+        return None  # something is still per-row unknowable -> drop, never dangle
     out = re.sub(r"[ \t]+", " ", out)
     out = "\n".join(ln.strip() for ln in out.split("\n")).strip()
     return out or None
@@ -5134,7 +5403,8 @@ def _detect_sheet_swaps(worksheets, dashboards, params, warnings):
 
 
 def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_binding=None,
-              column_binding=None, param_binding=None, layout=LAYOUT_DEFAULT):
+              column_binding=None, param_binding=None, layout=LAYOUT_DEFAULT,
+              workbook_name=None):
     """Parse a Tableau ``.twb`` (workbook XML) into the normalized viz IR.
 
     Accepts ``str`` or ``bytes``; ``.twb`` files carry a UTF-8 BOM, so callers reading from
@@ -5189,6 +5459,7 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
         dashboards.append(parsed)
 
     params = _parse_parameters(root)
+    update_time = _extract_update_time(root)
     # Resolve any live ``<[Parameters].[<id>]>`` / field-ref markup woven into a dashboard text zone
     # to the parameter's current display value (Tableau renders these as literal text -- e.g. the
     # "Program Name" column header driven by the "Show by Dimension" parameter). A text object that
@@ -5213,7 +5484,9 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
     for w in worksheets:
         raw = w.get("caption_only_raw")
         if raw:
-            w["caption_only_text"] = _resolve_caption_text(raw, params)
+            w["caption_only_text"] = _resolve_caption_text(
+                raw, params, _worksheet_field_token_values(w),
+                _runtime_specials(w["name"], workbook_name, update_time))
     # v2-4: resolve each SUPPORTED visual's DEFERRED dynamic title now that parameters are known. A
     # title that becomes fully static after parameter substitution is kept (with its parsed style); one
     # that still carries an unresolvable field-ref / runtime special is dropped (title + style cleared)
@@ -5224,7 +5497,9 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
         raw = w.get("dynamic_title_raw")
         if not raw:
             continue
-        resolved = _resolve_dynamic_title(raw, params)
+        resolved = _resolve_dynamic_title(
+            raw, params, _worksheet_field_token_values(w),
+            _runtime_specials(w["name"], workbook_name, update_time))
         if resolved:
             w["title"] = resolved
             warnings.append(_warn(
@@ -9548,15 +9823,20 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 if cap is not None:
                     visuals.append(cap)
                     placed.add(ws["name"])
-                    # Honest disclosure: the label scaffold is preserved, but a caption whose
-                    # values came from live field references (Tableau runtime specials like
-                    # <Data Update Time>, or worksheet field pills) renders those value slots
-                    # BLANK -- only parameter tokens resolve to a current display value. Say so
-                    # when the source caption carried any dynamic token, so the band being present
-                    # is never mistaken for its live values being reproduced.
-                    _had_dynamic = "<" in (ws.get("caption_only_raw") or "")
-                    _reason = ("caption-only worksheet rebuilt as a textbox; dynamic field values "
-                               "render blank (static label scaffold + resolved parameters preserved)"
+                    # Honest disclosure. The dynamic tokens this view PINS are now resolved to their
+                    # live display values (parameters by alias/format, filtered fields by their
+                    # selected member or "All", workbook/sheet names, the extract refresh stamp), so
+                    # the band reads as the author wrote it. What a STATIC textbox still cannot do is
+                    # re-resolve on a slicer change, so say that rather than claim the values are
+                    # missing -- and call out the refresh stamp's time zone, which Tableau renders in
+                    # the VIEWER's zone while this carries the value exactly as recorded.
+                    _raw = ws.get("caption_only_raw") or ""
+                    _had_dynamic = "<" in _raw
+                    _tz = ("; <Data Update Time> is the extract's recorded stamp -- Tableau renders "
+                           "it in the viewer's time zone" if "<Data Update Time>" in _raw else "")
+                    _reason = ("caption-only worksheet rebuilt as a textbox with its dynamic tokens "
+                               "resolved to current values; the text is STATIC, so it does not "
+                               "re-resolve when a reader changes a slicer" + _tz
                                if _had_dynamic else
                                "caption-only worksheet rebuilt as a textbox (static caption)")
                     warnings.append(_warn("worksheet", ws["name"], _reason))
@@ -10631,7 +10911,7 @@ def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
     """
     ir = parse_twb(xml_text, date_binding=date_binding, row_count_binding=row_count_binding,
                    measure_binding=measure_binding, column_binding=column_binding,
-                   param_binding=param_binding, layout=layout)
+                   param_binding=param_binding, layout=layout, workbook_name=report_name)
     # Recover the workbook's view-only quick table calcs (the quick token is stripped off the
     # resolved value pill, so the addressing facts live only here) and hand them to the emitter, which
     # projects each as a Power BI Visual Calculation. Fail-open: a parse hiccup never blocks the rest

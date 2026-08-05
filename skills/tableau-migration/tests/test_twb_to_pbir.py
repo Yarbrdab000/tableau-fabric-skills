@@ -8255,23 +8255,24 @@ def test_chart_worksheet_never_rebuilt_as_caption_textbox():
     assert charts_as_text == []
 
 
-def test_dynamic_caption_renders_blank_values_with_honest_disclosure():
-    # A caption built from a live field reference keeps its static labels but blanks the value slot
-    # (Power BI cannot reproduce the Tableau runtime value); the rebuild warning says so plainly.
+def test_dynamic_caption_resolves_values_with_honest_disclosure():
+    # A caption built from live tokens keeps its static labels and now resolves every token the view
+    # PINS; anything genuinely unknowable is still blanked (never leaked as raw <...> markup). The
+    # rebuild warning states the real residual limit: the text is static, so it does not re-resolve.
     res = migrate_twb_to_pbir(_V2_CAPTION_ONLY_DYNAMIC)
     vis = [json.loads(v) for k, v in res["parts"].items() if k.endswith("visual.json")]
     caps = [v for v in vis if v["visual"]["visualType"] == "textbox"
             and _textbox_text(v).startswith("Region :")]
     assert len(caps) == 1
     text = _textbox_text(caps[0])
-    # the label scaffold survives; the field-ref value slot is blank (no raw <...> token leaks)
+    # the label scaffold survives; no raw <...> token leaks
     assert "Region :" in text and "Count =" in text
     assert "<" not in text and ">" not in text
     assert "federated" not in text
     reasons = [w["reason"] for w in res["warnings"]
                if w.get("name") == "status bar" and "caption-only worksheet rebuilt" in w["reason"]]
     assert len(reasons) == 1
-    assert "render blank" in reasons[0]
+    assert "does not re-resolve" in reasons[0]
 
 
 # --- Zone Geometry v2 slice 5: emit-boundary sentinel / mojibake scrub ---------------------------
