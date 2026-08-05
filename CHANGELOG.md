@@ -12,6 +12,19 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.57.0` -> `2.58.0`): a row-predicate wrapper measure keeps the
+  format the author declared.** The 2.52.0 wrapper replaces a projection with a NEW measure, and a
+  new measure inherits nothing. For an AGGREGATION projection that is a true regression rather than
+  an omission: `SUM('T'[Col])` picks up `T[Col]`'s `formatString` automatically, but
+  `CALCULATE(SUM('T'[Col]), ...)` bound as a measure does not, so the author's declared precision
+  was silently replaced by a general format. A wrapper now inherits the declared format of what it
+  replaces -- a measure reference from that measure, an aggregation from its source COLUMN.
+  Render-measured on a real 164-visual workbook: the aggregation case is the one that actually
+  changes on screen (a `#,0.00` average rendered `10.2` and now renders `10.19`); the
+  measure-reference case is belt-and-braces, because DAX already propagates a base measure's format
+  through `CALCULATE` -- 12 of 13 pages render byte-identically and the 13th improves. Fail-open:
+  an undeclared format emits no `formatString` line, reproducing prior output exactly.
+
 - **tableau-migration (skill `2.56.0` -> `2.57.0`): recognise the NUMERIC spelling of a
   parameter-driven sheet swap.** Tableau serialises a swap pin two ways and both mean the same
   thing: a discrete control writes a CATEGORICAL member list, a numeric one writes a QUANTITATIVE

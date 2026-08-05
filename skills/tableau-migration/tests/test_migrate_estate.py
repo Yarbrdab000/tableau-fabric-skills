@@ -2691,6 +2691,93 @@ def test_row_predicate_wrapper_rebinds_visual_and_strips_flag_filter():
     assert "filtered by Date Filter" in measures
 
 
+def _fmt_wrapper_parts(*, measure_format=None, column_format=None, aggregate=False):
+    """A minimal row-predicate wrapper scenario, optionally declaring author formats."""
+    meas = "\tmeasure 'Total Sales' = SUM('Orders'[Sales_Amount])\n"
+    if measure_format:
+        meas += f"\t\tformatString: {measure_format}\n"
+    col = "\tcolumn Sales_Amount\n\t\tdataType: double\n"
+    if column_format:
+        col += f"\t\tformatString: {column_format}\n"
+    model_parts = {
+        "definition/tables/_Measures.tmdl":
+            "table _Measures\n" + meas +
+            "\tpartition _Measures = calculated\n"
+            '\t\tsource = Row("Value", BLANK())\n'
+            "\tannotation PBI_Id = _Measures\n",
+        "definition/tables/Orders.tmdl": "table Orders\n" + col,
+    }
+    if aggregate:
+        field = {"Aggregation": {"Function": 0, "Expression": {"Column": {
+            "Expression": {"SourceRef": {"Entity": "Orders"}}, "Property": "Sales_Amount"}}}}
+    else:
+        field = {"Measure": {"Expression": {"SourceRef": {"Entity": "_Measures"}},
+                             "Property": "Total Sales"}}
+    report_parts = {
+        "definition/pages/p/visuals/card1/visual.json": json.dumps({
+            "name": "card1",
+            "visual": {"visualType": "card", "query": {"queryState": {"Values": {
+                "projections": [{"field": field, "queryRef": "_Measures.Total Sales",
+                                 "nativeQueryRef": "Total Sales"}]}}}},
+        }),
+    }
+    result = {"candidate_records": [{"visual": "card1", "worksheet": "Sales Card"}]}
+    res_report = {"filter_bindings": {"Date Filter": {
+        "measure_name": "Date Filter Flag", "status": "translated",
+        "visuals": ["Sales Card"],
+        "row_filter": {"table": "Orders",
+                       "predicate_dax": "('Orders'[Order_Date] >= [Start Date Value])"},
+    }}}
+    return report_parts, model_parts, result, res_report
+
+
+def test_wrapped_measure_inherits_the_base_measures_declared_format():
+    # A wrapper is a NEW measure and a new measure inherits nothing, so the author's declared
+    # currency / percent / precision was dropped and Power BI fell back to a general format --
+    # an average asked to render as '#,##0' came out as 28.4285714285714.
+    out_report, out_model, wrapped = me._apply_row_predicate_wrapped_measures(
+        *_fmt_wrapper_parts(measure_format="#,##0;-#,##0"))
+    assert wrapped and wrapped[0]["wrapped"] == 1
+    measures = out_model["definition/tables/_Measures.tmdl"]
+    block = measures.split("measure 'Total Sales (filtered)'")[1]
+    assert "formatString: #,##0;-#,##0" in block.split("\tpartition")[0]
+
+
+def test_wrapped_aggregation_inherits_the_source_columns_declared_format():
+    # For an AGGREGATION the loss is a true regression, not an omission: SUM('T'[Col]) picks up
+    # T[Col]'s format automatically, but CALCULATE(SUM('T'[Col]), ...) bound as a measure does not.
+    out_report, out_model, wrapped = me._apply_row_predicate_wrapped_measures(
+        *_fmt_wrapper_parts(column_format="0.0%", aggregate=True))
+    assert wrapped and wrapped[0]["wrapped"] == 1
+    measures = out_model["definition/tables/_Measures.tmdl"]
+    assert "formatString: 0.0%" in measures.split("\tpartition")[0]
+
+
+def test_wrapper_emits_no_format_when_the_base_declares_none():
+    # Fail-open: nothing to inherit must reproduce the previous output exactly, so a model that
+    # never declared a format gains no formatString line.
+    out_report, out_model, wrapped = me._apply_row_predicate_wrapped_measures(
+        *_fmt_wrapper_parts())
+    assert wrapped and wrapped[0]["wrapped"] == 1
+    measures = out_model["definition/tables/_Measures.tmdl"]
+    block = measures.split("measure 'Total Sales (filtered)'")[1].split("\tpartition")[0]
+    assert "formatString" not in block
+
+
+def test_declared_format_index_reads_measures_and_qualified_columns():
+    idx = me._declared_format_index({
+        "a.tmdl": "table Orders\n"
+                  "\tcolumn 'Unit Price'\n\t\tdataType: double\n\t\tformatString: \\$#,##0.00\n"
+                  "\tcolumn Qty\n\t\tdataType: int64\n",
+        "b.tmdl": "table _Measures\n"
+                  "\tmeasure 'Margin %' = DIVIDE(1,2)\n\t\tformatString: 0.0%\n"
+                  "\tmeasure Plain = 1\n",
+    })
+    assert idx["measures"] == {"Margin %": "0.0%"}
+    # a column is keyed by (table, column) -- an unqualified name would collide across tables
+    assert idx["columns"] == {("Orders", "Unit Price"): "\\$#,##0.00"}
+
+
 def test_workbook_pbip_disabled_when_pbip_false(tmp_path):
     src = InMemoryTableauSource(workbooks={"Exec Dashboard": SUPERSTORE_DASHBOARD_TWB})
     report = migrate_estate(src, str(tmp_path / "b"), pbip=False)

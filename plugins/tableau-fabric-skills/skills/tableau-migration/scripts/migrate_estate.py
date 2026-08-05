@@ -1459,6 +1459,83 @@ def _projection_base_dax(field):
     return None
 
 
+_TMDL_MEASURE_RE = re.compile(
+    r"\n\tmeasure\s+('?)(?P<name>[^'\n=]+?)\1\s*=\s*(?P<body>.*?)"
+    r"(?=\n\tmeasure |\n\tcolumn |\n\tpartition |\n\thierarchy |\Z)", re.S)
+_TMDL_COLUMN_RE = re.compile(
+    r"\n\tcolumn\s+('?)(?P<name>[^'\n=]+?)\1\s*(?:=|\n)(?P<body>.*?)"
+    r"(?=\n\tmeasure |\n\tcolumn |\n\tpartition |\n\thierarchy |\Z)", re.S)
+_TMDL_TABLE_RE = re.compile(r"^table\s+('?)(?P<name>.+?)\1\s*$", re.M)
+_TMDL_FORMAT_RE = re.compile(r"^\s*formatString:\s*(?P<fmt>.+?)\s*$", re.M)
+
+
+def _declared_format_index(model_parts):
+    """Map every model measure and column to the ``formatString`` it declares, if any.
+
+    The row-predicate wrapper replaces a projection with a NEW measure, and a new measure inherits
+    nothing -- so without this the author's declared currency / percent / precision is silently
+    dropped and Power BI falls back to a general format (an average renders as
+    ``28.4285714285714`` where the author asked for ``#,##0``). For an AGGREGATION projection the
+    loss is a true regression rather than an omission: ``SUM('T'[Col])`` picks up ``T[Col]``'s
+    format automatically, but ``CALCULATE(SUM('T'[Col]), ...)`` bound as a measure does not.
+
+    Returns ``{"measures": {name: fmt}, "columns": {(table, column): fmt}}``, holding only entries
+    that actually declare a format so a caller can treat a miss and an absent format alike.
+    """
+    measures, columns = {}, {}
+    for text in (model_parts or {}).values():
+        if not isinstance(text, str) or "\n\t" not in text:
+            continue
+        tm = _TMDL_TABLE_RE.search(text)
+        table = tm.group("name").strip() if tm else None
+        for m in _TMDL_MEASURE_RE.finditer(text):
+            fmt = _TMDL_FORMAT_RE.search(m.group("body"))
+            if fmt:
+                measures.setdefault(m.group("name").strip(), fmt.group("fmt"))
+        if not table:
+            continue
+        for m in _TMDL_COLUMN_RE.finditer(text):
+            fmt = _TMDL_FORMAT_RE.search(m.group("body"))
+            if fmt:
+                columns.setdefault((table, m.group("name").strip()), fmt.group("fmt"))
+    return {"measures": measures, "columns": columns}
+
+
+def _inherited_format_string(field, index):
+    """The ``formatString`` a wrapped projection should keep from what it replaces, else ``None``.
+
+    Mirrors ``_projection_base_dax``'s two accepted shapes so the two can never disagree about what
+    a projection stands for: a measure reference inherits that measure's declared format, and an
+    aggregation inherits its source COLUMN's. Fail-open by design -- an unknown shape or an
+    undeclared format simply yields ``None``, which reproduces the previous output exactly.
+    """
+    node = field if isinstance(field, dict) else {}
+    measures = (index or {}).get("measures") or {}
+    columns = (index or {}).get("columns") or {}
+    meas = node.get("Measure")
+    if isinstance(meas, dict):
+        prop = meas.get("Property")
+        expr = meas.get("Expression") or {}
+        ent = (expr.get("SourceRef") or {}).get("Entity") if isinstance(expr, dict) else None
+        if not prop:
+            return None
+        # A measure lives in _Measures by construction, but a model that carries it on its own
+        # table must still resolve -- so try the qualified column key as a fallback, never instead.
+        return measures.get(prop) or (columns.get((ent, prop)) if ent else None)
+    agg = node.get("Aggregation")
+    if isinstance(agg, dict):
+        expr = agg.get("Expression") or {}
+        col = expr.get("Column") if isinstance(expr, dict) else None
+        if not isinstance(col, dict):
+            return None
+        inner = col.get("Expression") or {}
+        ent = (inner.get("SourceRef") or {}).get("Entity") if isinstance(inner, dict) else None
+        prop = col.get("Property")
+        if ent and prop:
+            return columns.get((ent, prop))
+    return None
+
+
 def _append_measure_blocks_to_measures_table(table_tmdl, measure_blocks):
     """Insert additive measure TMDL blocks just before the canonical ``_Measures`` partition."""
     if not (isinstance(table_tmdl, str) and measure_blocks):
@@ -1596,6 +1673,7 @@ def _apply_row_predicate_wrapped_measures(report_parts, model_parts, result, res
     reserved_lower = set(existing_measures or ())
     out_report = dict(report_parts)
     out_model = dict(model_parts)
+    format_index = _declared_format_index(model_parts)
     measure_blocks = []
     wrap_cache = {}
     wrapped = []
@@ -1663,7 +1741,8 @@ def _apply_row_predicate_wrapped_measures(report_parts, model_parts, result, res
                     name,
                     "filtered by %s" % ", ".join(srcs) if srcs else "",
                     dax,
-                    translated_by="deterministic (row-predicate visual wrapper)")
+                    translated_by="deterministic (row-predicate visual wrapper)",
+                    format_string=_inherited_format_string(proj.get("field"), format_index))
                 wrap = {"name": name, "block": block, "dax": dax}
                 wrap_cache[key] = wrap
                 measure_blocks.append(block)
