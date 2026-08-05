@@ -12,6 +12,48 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.60.0` -> `2.61.0`): layered table calcs, highlight tables, and
+  three silent output-destroying defects.** Driven end-to-end against a real customer workbook whose
+  main table rebuilt EMPTY; it now matches its Tableau oracle on all 104 data cells, row order and
+  column set.
+  - **Extract-backed workbooks lost every table calculation.** A bundled `.hyper` routes through
+    the local-CSV branch, which bypassed the auto-extraction of table-calc addressing entirely -- so
+    every RANK / WINDOW_ / RUNNING_ calc stubbed to `= 0`. Threaded through like `parameters`
+    already was (override-safe: an explicit `[]` still disables).
+  - **RANK was classified order-SENSITIVE**, contradicting `calc_to_dax` (which emits `RANKX`
+    and states the opposite). A rank counts marks holding a better value, so traversal order cannot
+    change it. `RANK_UNIQUE` -- which breaks ties BY traversal order -- correctly still defers.
+  - **Order-sensitivity read only the LEADING head**, so a composite like
+    `101 - (RANK(a)*.15 + RANK(b)*.25)` deferred despite every component being order-independent.
+    Now judged over every head in the expression.
+  - **A LAYERED table calc was misread as a stacked SECONDARY calculation.** Tableau writes one
+    `<table-calc>` per calc in the dependency chain (each naming its target in `field`); counting
+    all children called an ordinary layered calc a second pass. Now counts only the pill's OWN
+    passes, and a nested calc at the SAME addressing inlines (a genuine second pass still defers).
+  - **A trailing `//` comment in an inlined formula** commented out the caller's closing paren,
+    surfacing only as `expected ')'`.
+  - **Applied DATE filters never bound** -- the preselection gate accepted strings only, so a
+    date-scoped worksheet rebuilt reading "All" with every number computed over full history.
+  - **Windows MAX_PATH**: a 77-char workbook title produced a 278-char `visual.json`. The files
+    wrote fine (the writer lifts the limit via `\\?\`) but Power BI Desktop could not READ them,
+    so the project opened with an EMPTY canvas while the run reported success. Folder bases are now
+    capped at 64 chars with a collision-safe content hash, and stdout no longer claims "Openable"
+    without surfacing the warning.
+  - **Whitespace in a Tableau caption dropped whole columns.** The model names objects from the
+    caption stripped; the report kept it verbatim, so `'Weighted Rank Score '` matched nothing and
+    the column was silently removed. Normalised at the single choke point every reference shape
+    derives from, so `Property` / `queryRef` / `nativeQueryRef` can never disagree.
+  - **Highlight tables coloured only the STYLED measures.** Tableau records the Colour shelf as
+    `<card type='color'>` under `windows/window` -- the authoritative list -- while a
+    `<style>` palette only covers the ones explicitly styled. 8 measures sat on Colour but only 5
+    carried palettes, so three visibly-shaded columns rebuilt with no fill. Unstyled members now get
+    the automatic default ramp (disclosed).
+  - Measure Values on BOTH colour and text is a highlight table, not a chart; per-measure fills;
+    diverging palettes with no explicit centre keep their neutral midpoint; a leading discrete
+    measure on Rows restores the row sort (gated to table/matrix -- the corpus caught a scatter
+    over-reach).
+  Corpus 29/29, 0 files added or removed, 1 workbook changed (a stubbed calc now translates). Suite
+  **3935 passed**; 29 new tests; 11/12 mutants killed, the survivor proven equivalent.
 - **tableau-migration (skill `2.59.0` -> `2.60.0`): per-connection M parameters for a federated
   datasource, and a reachability gate that makes an unrefreshable model impossible to ship (#91).**
   - A federated datasource routes each table to its OWN upstream, but `emit_connection_parameters`

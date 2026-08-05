@@ -4177,3 +4177,34 @@ def test_rebuild_from_published_match_calc_union_fail_closed(monkeypatch):
     assert res is not None
     names = [c.get("name") for c in (captured.get("calcs") or [])]
     assert names == ["WB Calc"]    # exactly the workbook's own calc, unchanged
+
+
+# -- filesystem-path safety + name normalisation (2.61.0) ---------------------------------------
+
+def test_long_workbook_name_is_capped_so_the_pbip_stays_readable():
+    # A rebuilt PBIR project nests the SAME base name TWICE before a deeply-nested
+    # definition/pages/<page>/visuals/<visual>/visual.json tail, so a long title is spent twice
+    # against the Windows MAX_PATH budget. Measured on a real customer workbook: a 77-char title
+    # pushed visual.json to 278 chars -- the files WERE written (the writer lifts MAX_PATH via
+    # \\?\) but Power BI Desktop could not read them, so the project opened with an empty canvas
+    # while the run reported success. That is the worst failure mode available: everything correct
+    # on disk, nothing visible.
+    long_name = "Layered Table Calcs, Conditional Formatting, Parameters, Date Calcs, Examples"
+    safe = me._fs_safe(long_name)
+    assert len(safe) <= me._MAX_FS_BASE
+    assert safe.startswith("Layered Table Calcs")
+
+
+def test_capped_names_stay_collision_safe():
+    # Truncation must not collapse two distinct workbooks onto one folder -- a content hash of the
+    # FULL name keeps them apart, and is deterministic so a re-run lands in the same place.
+    a = "A very long workbook title that exceeds the cap by a wide margin -- variant one"
+    b = "A very long workbook title that exceeds the cap by a wide margin -- variant two"
+    assert me._fs_safe(a) != me._fs_safe(b)
+    assert me._fs_safe(a) == me._fs_safe(a)
+
+
+def test_short_names_are_untouched():
+    # Never-regress: anything inside the cap keeps its exact name, so existing outputs do not churn.
+    for nm in ("Superstore", "Sales Dashboard", "A" * me._MAX_FS_BASE):
+        assert me._fs_safe(nm) == nm

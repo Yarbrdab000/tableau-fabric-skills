@@ -425,3 +425,58 @@ def test_quick_usage_carries_no_scope():
     assert running.scope_formulas is None
     assert running.scope_captions is None
 
+
+
+# -- layered vs stacked table calcs (2.61.0) ----------------------------------------------------
+
+LAYERED = """<?xml version='1.0' encoding='utf-8'?>
+<workbook>
+  <worksheets>
+    <worksheet name='Layered'>
+      <table>
+        <view>
+          <datasource-dependencies datasource='ds0'>
+            <column aggregation='Sum' datatype='real' name='[Sales]' role='measure' type='quantitative' caption='Sales' />
+            <column datatype='string' name='[Region]' role='dimension' type='nominal' />
+            <column caption='Inner Rank' datatype='real' name='[Calc_Inner]' role='measure' type='quantitative'>
+              <calculation class='tableau' formula='RANK(SUM([Sales]))' />
+            </column>
+            <column caption='Outer Rank' datatype='real' name='[Calc_Outer]' role='measure' type='quantitative'>
+              <calculation class='tableau' formula='RANK([Calc_Inner])' />
+            </column>
+            <column-instance column='[Calc_Outer]' derivation='User' name='[usr:Calc_Outer:qk]' pivot='key' type='quantitative'>
+              <table-calc ordering-type='Columns' />
+              <table-calc field='[ds0].[Calc_Inner]' ordering-type='Columns' />
+            </column-instance>
+            <column-instance column='[Region]' derivation='None' name='[none:Region:nk]' pivot='key' type='nominal' />
+          </datasource-dependencies>
+        </view>
+        <rows>[ds0].[usr:Calc_Outer:qk]</rows>
+        <cols>[ds0].[none:Region:nk]</cols>
+      </table>
+    </worksheet>
+  </worksheets>
+</workbook>
+"""
+
+
+def test_referenced_calc_addressing_is_not_a_secondary_calculation():
+    # Tableau writes ONE <table-calc> per calc in the dependency chain -- each REFERENCED calc named
+    # in a ``field`` attribute, the pill's OWN addressing being the single entry with no ``field``.
+    # Counting all children called a plain LAYERED calc a stacked second pass, so it handed off and
+    # stubbed to 0; measured on a real workbook that emptied the column driving the table's sort.
+    u = next(x for x in extract_table_calc_usages(LAYERED) if x.caption == "Outer Rank")
+    assert u.secondary is False
+    assert u.ordering_type == "Columns"
+    # the referenced calc's addressing is exposed so a consumer can tell same-pass from second-pass
+    assert u.scope_addressing.get("Calc_Inner") == "Columns"
+
+
+def test_two_own_passes_is_still_a_secondary_calculation():
+    # The genuine stacked shape -- TWO addressing entries for the pill ITSELF (neither naming a
+    # ``field``) -- must keep handing off: Tier 0 synthesizes only the primary pass.
+    stacked = LAYERED.replace(
+        "<table-calc field='[ds0].[Calc_Inner]' ordering-type='Columns' />",
+        "<table-calc ordering-type='Rows' />")
+    u = next(x for x in extract_table_calc_usages(stacked) if x.caption == "Outer Rank")
+    assert u.secondary is True

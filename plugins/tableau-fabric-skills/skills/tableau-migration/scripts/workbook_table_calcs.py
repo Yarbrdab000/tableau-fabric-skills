@@ -171,6 +171,13 @@ class TableCalcUsage:
     # ``None`` for quick usages (they never nest), keeping their facts unchanged.
     scope_formulas: Optional[dict] = None
     scope_captions: Optional[dict] = None
+    # Addressing Tableau recorded for each NESTED calc this pill's formula reaches, as
+    # ``{referenced field id: ordering-type}``. Tableau writes one ``<table-calc>`` per calc in the
+    # dependency chain, each naming its target in a ``field`` attribute (the pill's OWN addressing
+    # is the single entry with no ``field``). This is what lets a consumer tell a LAYERED table calc
+    # -- inner and outer evaluated at the SAME addressing, i.e. one pass -- from a genuine second
+    # addressing pass, which cannot be flattened.
+    scope_addressing: Optional[dict] = None
 
     def to_dict(self) -> dict:
         d = dict(self.__dict__)
@@ -245,6 +252,29 @@ def _resolve_field_id(token: Optional[str], instances: dict) -> Optional[str]:
     return pill.column if pill else inst
 
 
+def _scope_addressing(ci, instances) -> dict:
+    """``{referenced field id: ordering-type}`` for every NESTED calc addressed on this pill.
+
+    When a table calc is LAYERED over other calcs, Tableau records the addressing for each calc in
+    the dependency chain on the CONSUMING pill: one ``<table-calc>`` per referenced calc, naming its
+    target in a ``field`` attribute. The pill's own addressing is the single entry with NO ``field``
+    and is reported separately as ``ordering_type``.
+
+    A consumer needs this to distinguish two cases that look identical from the formula alone: an
+    inner table calc evaluated at the SAME addressing as its consumer (one evaluation pass, so the
+    nesting can be rendered directly as nested window functions), versus one at a DIFFERENT
+    addressing (a genuine second pass, which cannot be flattened without computing the wrong thing).
+    """
+    out = {}
+    for tc in _children_local(ci, "table-calc"):
+        target = tc.get("field")
+        if not target:
+            continue
+        fid = _resolve_field_id(target, instances) or target
+        out[str(fid).strip().strip("[]")] = tc.get("ordering-type") or "Table"
+    return out
+
+
 def _detect_secondary(ci, tc) -> bool:
     """True iff a stacked "Add Secondary Calculation" is present on this pill.
 
@@ -253,14 +283,27 @@ def _detect_secondary(ci, tc) -> bool:
     primary pass, so any secondary must hand off rather than emit faithful-looking DAX that
     silently drops the second pass.
 
-    VERIFIED encoding (real "secondary calc example.twbx" — Running Total, then Percent of
+    VERIFIED encoding (real "secondary calc example.twbx" -- Running Total, then Percent of
     Total): the pill carries **two** ``<table-calc>`` children. The primary pass has an
     ``aggregation`` attribute and a ``level-break``; the secondary pass has a ``level-address``
-    and no ``aggregation``. The robust, version-agnostic signal is simply ">1 ``<table-calc>``
-    on the pill"; the ``secondary`` / ``compute-using`` attr/child checks below are extra
-    defensive nets for other encodings. Over-detecting only causes more (safe) handoffs.
+    and no ``aggregation``.
+
+    Counting children is NOT a usable signal for this, though, and the naive ">1 child" rule was
+    badly wrong. Tableau also writes ONE ``<table-calc>`` PER REFERENCED CALC when a table calc is
+    LAYERED over other calcs -- each addressing entry naming its target in a ``field`` attribute,
+    with the pill's own addressing being the single entry that has NO ``field``. A rank over a calc
+    that itself references four others therefore carries six children while being a perfectly
+    ordinary single-pass calc. Measured on a real workbook: three such calcs -- including the one
+    driving the ROW SORT -- were declared secondary and stubbed to ``= 0``, which flattened the
+    table's order and emptied two columns.
+
+    So the rule counts only the entries that describe THIS pill's own passes: the ones without a
+    ``field`` target. Two or more of those is a genuine stacked calculation. The
+    ``secondary`` / ``compute-using`` attr/child checks stay as defensive nets for other encodings;
+    over-detecting there only causes more (safe) handoffs.
     """
-    if len(_children_local(ci, "table-calc")) > 1:
+    own_passes = [c for c in _children_local(ci, "table-calc") if not c.get("field")]
+    if len(own_passes) > 1:
         return True
     for attr in tc.attrib:
         al = _local(attr).lower()
@@ -404,6 +447,7 @@ def extract_table_calc_usages(xml_text: str) -> List[TableCalcUsage]:
                     cols=cols,
                     scope_formulas=(dict(formulas) if kind == "field" else None),
                     scope_captions=(dict(captions) if kind == "field" else None),
+                    scope_addressing=_scope_addressing(ci, instances),
                 ))
     return usages
 

@@ -43,6 +43,13 @@ from twb_to_pbir import (
     _field_expression,
     _flag_filter_container,
     _demote_occluding_overlays,
+    _slicer_preselection_object,
+    _color_card_instances,
+    _row_header_sort,
+    VT_SCATTER,
+    VT_TABLE,
+    VT_MATRIX,
+    VT_BAR,
     _Z_BACKDROP,
     _Z_CONTENT,
     _Z_OVERLAY,
@@ -8854,3 +8861,138 @@ def test_v2_8_deoverlap_return_contract():
     assert _inter_area(_r(stuck_cap), _r(top)) <= 1.0
     assert _inter_area(_r(stuck_cap), _r(bot)) <= 1.0
 
+
+
+# -- highlight-table colour cards, name normalisation, row-header sort (2.61.0) ------------------
+
+def test_colour_cards_are_the_authoritative_list_of_coloured_measures():
+    # Tableau records the Colour shelf as <card type='color'> under windows/window, NOT in the
+    # worksheet element and NOT alongside the <style> palettes. The cards say WHICH measures are
+    # coloured; an <encoding attr='color'> only supplies a palette for the ones explicitly styled.
+    # Reading only the encodings under-counts a highlight table -- measured on a real workbook,
+    # 8 measures sat on Colour but only 5 carried palettes, so three visibly-shaded columns
+    # rebuilt with no fill at all.
+    xml = """<?xml version='1.0' encoding='utf-8'?>
+<workbook>
+  <windows>
+    <window name='Sheet1'>
+      <cards><edge name='right'><strip>
+        <card param='[ds].[usr:Calc_A:qk]' type='color' />
+        <card param='[ds].[usr:Calc_B:qk]' type='color' />
+        <card param='[ds].[usr:Calc_C:qk]' type='size' />
+      </strip></edge></cards>
+    </window>
+    <window name='Other'>
+      <cards><edge name='right'><strip>
+        <card param='[ds].[usr:Calc_Z:qk]' type='color' />
+      </strip></edge></cards>
+    </window>
+  </windows>
+</workbook>
+"""
+    root = ET.fromstring(xml)
+    got = _color_card_instances(root, "Sheet1")
+    assert got == {"usr:Calc_A:qk", "usr:Calc_B:qk"}          # size card excluded
+    assert _color_card_instances(root, "Other") == {"usr:Calc_Z:qk"}   # scoped per worksheet
+    assert _color_card_instances(root, "Missing") == set()
+    assert _color_card_instances(None, "Sheet1") == set()      # fail-safe
+
+
+def test_reference_property_is_normalised_to_the_model_object_name():
+    # A model object is named from its Tableau caption STRIPPED, so a caption carrying stray
+    # whitespace -- which authors leave constantly and Tableau renders no differently -- would emit
+    # a reference naming an object that does not exist. Measured on a real workbook: the caption
+    # 'Weighted Rank Score ' produced a reference the model-vs-report crosscheck could not match,
+    # so the whole column was dropped while its correctly-translated measure sat unused.
+    field = {"entity": "_Measures", "property": "Weighted Rank Score ",
+             "binding": "measure", "caption": "Weighted Rank Score ", "kind": "value"}
+    expr, qref, nref = _field_expression(field, None, None)
+    # all THREE must agree -- a Property/queryRef mismatch renders an error tile, not a blank cell
+    assert expr["Measure"]["Property"] == "Weighted Rank Score"
+    assert qref == "_Measures.Weighted Rank Score"
+    assert nref == "Weighted Rank Score"
+
+
+def test_row_header_sort_only_applies_to_a_table_or_matrix():
+    # A leading discrete measure on Rows is a text-table ROW HEADER, which orders the rows. The same
+    # pill on a cartesian chart is an axis and carries no ordering role -- the corpus caught a
+    # scatter chart picking up a spurious sort before this gate existed.
+    rows = [{"kind": "value", "caption": "Sort by"}, {"kind": "category", "caption": "Region"}]
+    assert _row_header_sort({"visual_type": VT_MATRIX, "rows": rows})["direction"] == "Ascending"
+    assert _row_header_sort({"visual_type": VT_TABLE, "rows": rows}) is not None
+    assert _row_header_sort({"visual_type": VT_SCATTER, "rows": rows}) is None
+    assert _row_header_sort({"visual_type": VT_BAR, "rows": rows}) is None
+    # a dimension-first shelf is an ordinary row header, not a sort pin
+    assert _row_header_sort({"visual_type": VT_MATRIX, "rows": list(reversed(rows))}) is None
+    # a measure with no dimension after it has nothing to order
+    assert _row_header_sort({"visual_type": VT_MATRIX, "rows": rows[:1]}) is None
+
+
+def test_applied_date_selection_preselects_the_slicer():
+    # An applied DATE filter must bind: the gate accepted only strings, so a date-scoped worksheet
+    # rebuilt with its slicer reading "All" and NOTHING filtered -- every number on the page then
+    # computed over the full history the source workbook had excluded. Measured on a real workbook
+    # as an entire ranked table drifting off its oracle because one month filter never applied.
+    field = {"entity": "Date", "property": "Date", "binding": "column", "caption": "Fiscal Month",
+             "kind": "category", "datatype": "date",
+             "selection": {"mode": "include", "values": ["#2026-06-21#"]}}
+    obj = _slicer_preselection_object(field, None, None)
+    assert obj is not None, "an applied date selection must produce an open-on selection"
+    vals = obj["properties"]["filter"]["filter"]["Where"][0]["Condition"]["In"]["Values"]
+    # emitted as a semantic-query datetime literal, never a quoted string (which matches no row)
+    assert vals[0][0]["Literal"]["Value"] == "datetime'2026-06-21T00:00:00'"
+
+
+def test_unparseable_date_member_declines_rather_than_binding_a_partial_set():
+    # Fail-closed: every member must parse as a date literal, or the selection declines. Binding a
+    # subset would silently filter to fewer rows than the author asked for.
+    field = {"entity": "Date", "property": "Date", "binding": "column", "caption": "Fiscal Month",
+             "kind": "category", "datatype": "date",
+             "selection": {"mode": "include", "values": ["#2026-06-21#", "not-a-date"]}}
+    assert _slicer_preselection_object(field, None, None) is None
+
+
+_HL_STYLE = """<style><style-rule element='mark'>
+  <encoding attr='color' field='[federated.abc].[sum:Sales:qk]' type='custom-interpolated'>
+    <color-palette custom='true' name='' type='ordered-sequential'>
+      <color>#f7f7f7</color><color>#00ff00</color>
+    </color-palette>
+  </encoding>
+</style-rule></style>"""
+
+_HL_WINDOWS = """  <windows>
+    <window name='Heat'><cards><edge name='right'><strip>
+      <card param='[federated.abc].[sum:Sales:qk]' type='color' />
+      <card param='[federated.abc].[sum:Profit:qk]' type='color' />
+    </strip></edge></cards></window>
+  </windows>
+</workbook>"""
+
+
+def _highlight_twb():
+    """A highlight table: Measure Values on BOTH colour and text, two carded measures, one styled."""
+    encodings = ("<encodings>"
+                 "<color column='[federated.abc].[Multiple Values]' separate-domains='true' />"
+                 "<text column='[federated.abc].[Multiple Values]' />"
+                 "</encodings>")
+    ws = _worksheet("Heat", "Square",
+                    rows="[federated.abc].[none:Category:nk]",
+                    cols="[federated.abc].[:Measure Names]",
+                    deps_extra=_INST, encodings=encodings,
+                    filters=_mv_filter(["[federated.abc].[sum:Sales:qk]",
+                                        "[federated.abc].[sum:Profit:qk]"]),
+                    style=_HL_STYLE)
+    return _workbook(ws).replace("</workbook>", _HL_WINDOWS)
+
+
+def test_highlight_table_colours_every_carded_measure_end_to_end():
+    # Integration guard on the WIRING, not just the card reader: a measure with a colour card but no
+    # explicit <style> palette must still get a fill (Tableau's automatic default ramp), or a
+    # highlight table rebuilds with visibly-shaded columns unshaded. Sales carries an explicit green
+    # palette, Profit carries none -- BOTH must end up with a gradient.
+    ir = parse_twb(_highlight_twb())
+    ws = next(w for w in ir["worksheets"] if w["name"] == "Heat")
+    scales = {s["caption"]: s["gradient"] for s in (ws.get("mv_color_scales") or [])}
+    assert set(scales) == {"Sales", "Profit"}, scales
+    assert scales["Sales"]["colors"][-1] == "#00ff00"          # the author's explicit palette
+    assert scales["Profit"].get("default_palette") is True     # synthesised + disclosed

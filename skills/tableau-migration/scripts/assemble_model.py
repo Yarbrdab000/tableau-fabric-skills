@@ -2194,7 +2194,106 @@ def _related_date_dax(date_table, column):
 _DTYPE_TO_TMDL = {"text": "string", "number": "decimal", "date": "dateTime", "bool": "boolean"}
 
 
-def _build_column_refs(calcs, rc, known_tables, *, consumed_lower=None, relationships=None):
+def build_parameter_constant_resolver(parameters):
+    """A ``param_resolver`` answering only for parameters whose value CANNOT vary.
+
+    A Tableau parameter reference inside a MEASURE becomes a live ``SELECTEDVALUE`` read of the
+    what-if table, so a slicer keeps driving it. A CALCULATED COLUMN cannot do that: it is evaluated
+    at refresh, before any selection exists, so the column path omits a resolver and the calc stubs.
+
+    Stubbing is a bad failure for a DIMENSION. A stubbed measure shows a visibly wrong number; a
+    stubbed row-header column evaluates to ``BLANK()`` for every row, collapsing the whole table into
+    one empty group -- the visual looks broken rather than approximate, and it reads like a data or
+    binding fault. Measured on a real workbook: one
+    ``IF [Parameters].[View] = 'Region only' THEN [Region] END`` row header wiped out all 13 rows.
+
+    The fix is deliberately NARROW: only a parameter whose domain admits exactly ONE value is folded
+    to that value. Then the usual objection to pinning -- "the user moves the slicer and the column
+    does not react" -- cannot arise, because there is no other value to move to; Power BI's
+    row-context limitation costs nothing. A genuinely variable parameter (a what-if range, a
+    multi-member list) still stubs, so a live control is never silently frozen into a constant that
+    merely looks right.
+
+    Returns ``None`` when nothing qualifies, so callers stay byte-identical.
+    """
+    index = {}
+    for p in parameters or []:
+        if not _parameter_is_invariant(p):
+            continue
+        value = p.get("default")
+        if value is None:
+            continue
+        dtype = _PARAM_DTYPE_TO_CALC.get((p.get("datatype") or "").strip().lower(), "text")
+        literal = _param_constant_literal(value, dtype)
+        if literal is None:
+            continue
+        for key in (p.get("caption"), p.get("internal_name")):
+            if key:
+                index[str(key).strip().strip("[]").strip().lower()] = (literal, dtype)
+
+    def resolve(name):
+        key = str(name or "").strip()
+        # A reference arrives as ``[Parameters].[Parameter 1 3]`` or a bare caption; try the whole
+        # string and its last bracketed segment so both spellings resolve.
+        for cand in (key, key.split("].[")[-1]):
+            hit = index.get(cand.strip().strip("[]").strip().lower())
+            if hit:
+                return hit
+        return None
+
+    return resolve if index else None
+
+
+def _parameter_is_invariant(p):
+    """True when a parameter's domain admits exactly ONE value, so folding it changes nothing.
+
+    A single-member list is the shape an author uses to pin a view mode. Anything else -- a range,
+    an open domain, or a list offering a real choice -- can change at runtime and must NOT be folded
+    into a calculated column, where it would freeze silently.
+    """
+    if (p.get("domain") or "").strip().lower() != "list":
+        return False
+    if p.get("range"):
+        return False
+    return len(p.get("members") or []) == 1
+
+
+# Tableau parameter datatypes -> the calc translator's type lattice.
+_PARAM_DTYPE_TO_CALC = {
+    "string": "text", "boolean": "bool", "date": "date", "datetime": "date",
+    "integer": "number", "real": "number",
+}
+
+
+def _param_constant_literal(value, dtype):
+    """One saved Tableau parameter value -> a DAX literal of ``dtype``, or ``None`` if unusable."""
+    raw = str(value).strip()
+    if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+        raw = raw[1:-1]
+    raw = raw.replace('\\"', '"')
+    if dtype == "text":
+        return '"%s"' % raw.replace('"', '""')
+    if dtype == "number":
+        try:
+            float(raw)
+        except (TypeError, ValueError):
+            return None
+        return raw
+    if dtype == "bool":
+        low = raw.strip().lower()
+        if low in ("true", "false"):
+            return "TRUE()" if low == "true" else "FALSE()"
+        return None
+    if dtype == "date":
+        m = re.match(r"^#?\s*(\d{4})-(\d{2})-(\d{2})", raw)
+        if m:
+            return "DATE(%d, %d, %d)" % (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        return None
+    return None
+
+
+def _build_column_refs(calcs, rc, known_tables, *, consumed_lower=None, relationships=None,
+                       param_resolver=None):
     """Fix-point map ``{ref_key: (home_table, caption, tmdl_type)}`` of the deterministically
     translatable, single-home, typed calc COLUMNS among ``calcs``.
 
@@ -2228,7 +2327,8 @@ def _build_column_refs(calcs, rc, known_tables, *, consumed_lower=None, relation
             cname = calc["name"]
             cdax, _cr, ctabs, cdt = translate_tableau_calc_to_column_dax_typed(
                 calc.get("formula", ""), rc(calc), known_tables=known_tables,
-                column_refs=column_refs, relationships=relationships)
+                column_refs=column_refs, relationships=relationships,
+                param_resolver=param_resolver)
             if cdax and len(ctabs) == 1 and cdt:
                 entry = (next(iter(ctabs)), cname, _DTYPE_TO_TMDL.get(cdt, "string"))
                 column_refs[cname.strip().lower()] = entry
@@ -2263,7 +2363,7 @@ def _build_column_refs(calcs, rc, known_tables, *, consumed_lower=None, relation
 def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
                        date_table=None, active_date_cols=None, consumed=None,
                        approved_calc_dax=None, known_tables=None, resolve_for=None,
-                       relationships=None):
+                       relationships=None, param_resolver=None):
     """Translate row-level (dimension) ``dim_calcs`` via column mode and group the rendered
     calculated-column TMDL by target table, plus a per-column report.
 
@@ -2359,7 +2459,7 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
     # ``_build_column_refs`` so the row-level reroute pre-router uses the EXACT same semantics. Empty
     # when no calc references a sibling -> the main loop is byte-identical to the prior single pass.
     column_refs = _build_column_refs(dim_calcs, _arc, known_tables, consumed_lower=consumed_lower,
-                                     relationships=relationships)
+                                     relationships=relationships, param_resolver=param_resolver)
     for calc in dim_calcs or []:
         name, formula = calc["name"], calc.get("formula", "")
         if name.lower() in consumed_lower:
@@ -2400,7 +2500,8 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
             })
             continue
         dax, reason, tables_used = translate_tableau_calc_to_column_dax(
-            formula, _arc(calc), column_refs=column_refs, relationships=relationships)
+            formula, _arc(calc), column_refs=column_refs, relationships=relationships,
+            param_resolver=param_resolver)
         if dax and len(tables_used) == 1:
             target = next(iter(tables_used))
         elif len(tables_used) == 1:          # untranslatable but single known home
@@ -3162,6 +3263,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         date_table=date_name, active_date_cols=active_date_cols,
         approved_calc_dax=approved_calc_dax, known_tables=set(table_names),
         resolve_for=_raw_scoped_resolver, relationships=all_rels,
+        param_resolver=build_parameter_constant_resolver(parameters),
         consumed=(set(consumed) | flag_source_names) if flag_source_names else consumed)
     # FIX C -- keep the INLINE-sentinel foundation entries OUT of the measure-side resolver. A
     # row-invariant foundation calc (``_INLINE_REF_SENTINEL`` first slot) is meaningful only to the
@@ -4739,6 +4841,26 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
         if "parameters" not in kwargs:
             try:
                 kwargs["parameters"] = parse_parameters(tds_text)
+            except Exception:
+                pass
+        # Same gap, same cause, for TABLE-CALC ADDRESSING. A table calculation is an
+        # addressing/partitioning expression over the viz rows, and that addressing lives in the
+        # workbook's worksheets -- so without it every RANK / WINDOW_ / RUNNING_ calc stubs to ``= 0``.
+        # ``migrate_tds_to_semantic_model`` auto-extracts it from the source text; this local-CSV
+        # branch bypasses that function entirely, so an EXTRACT-BACKED workbook (a bundled ``.hyper``,
+        # which is the common shape) silently lost every table calculation -- measured on a real
+        # workbook as 6 rank measures emitting 0, which in turn flattened the row sort and left the
+        # conditional-format gradients with nothing to grade. Fail-closed and override-safe, exactly
+        # like ``parameters`` above: a parse error leaves it absent, and an explicit caller value
+        # (including ``[]`` to disable) always wins.
+        if "table_calc_usages" not in kwargs:
+            try:
+                kwargs["table_calc_usages"] = extract_table_calc_usages(tds_text)
+            except Exception:
+                pass
+        if "calc_outer_aggs" not in kwargs:
+            try:
+                kwargs["calc_outer_aggs"] = extract_calc_outer_aggs(tds_text)
             except Exception:
                 pass
         table_csv_paths = _resolve_local_csv_paths(

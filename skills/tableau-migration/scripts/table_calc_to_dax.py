@@ -142,6 +142,36 @@ _PCT_DIFF_LABEL = "% Difference"
 # order-SENSITIVE: its value changes with the slowest->fastest order among addressing dims.
 _ORDER_INSENSITIVE_HEADS = ("WINDOW_SUM", "WINDOW_AVG", "WINDOW_MIN", "WINDOW_MAX")
 
+# The RANK family and TOTAL are order-independent too, but for a DIFFERENT reason, so they are
+# tracked separately rather than folded into the window set above.
+#
+# A window aggregate is order-independent because it covers the whole partition. A rank is
+# order-independent because of what it MEASURES: each mark's rank is the count of marks holding a
+# better value, and counting cannot depend on the sequence the marks are visited in. The direction
+# argument that does affect it (``'asc'`` / ``'desc'``) is written in the FORMULA, not in the
+# addressing. ``calc_to_dax`` -- the module that actually emits the DAX -- already states this
+# ("unlike the WINDOW/RUNNING family the rank value is independent of the addressing SORT") and
+# emits ``RANKX`` over the mark set accordingly; classifying rank as order-sensitive HERE made the
+# two modules contradict each other, and the gate won: every rank in a scope-relative view was
+# handed off and stubbed to ``= 0``. Measured on a real workbook, that emptied three ranked columns
+# and, because the row sort read one of them, also destroyed the row order.
+#
+# ``TOTAL`` re-aggregates its whole partition, so it is order-independent on the window argument.
+#
+# ``RANK_UNIQUE`` is deliberately ABSENT: it breaks ties by Tableau's internal traversal order, so
+# it is genuinely order-sensitive and must keep handing off. That is why this test matches the head
+# EXACTLY rather than by prefix -- a ``startswith`` on ``"RANK"`` would silently capture it.
+_ORDER_INDEPENDENT_VALUE_HEADS = frozenset(
+    {"RANK", "RANK_DENSE", "RANK_MODIFIED", "RANK_PERCENTILE", "TOTAL"})
+
+_LEADING_HEAD_RE = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+def _leading_head(formula):
+    """The EXACT leading function name of a formula (upper-cased), or ``""``."""
+    m = _LEADING_HEAD_RE.match(formula or "")
+    return m.group(1).upper() if m else ""
+
 # Pill derivations that mean "an aggregated measure", not a partition dimension. Shared with the
 # view-layer path: the canonical set now lives in :mod:`workbook_table_calcs` (next to the ``Pill``
 # both paths import); this alias keeps the local references below behaviour-identical. An equality
@@ -203,17 +233,46 @@ def _has_moving_bounds(formula: str) -> bool:
     return False
 
 
-def _is_order_sensitive(formula: str) -> bool:
-    """True unless the formula is a FULL-PARTITION window aggregate (order-independent value).
+def _table_calc_heads(formula):
+    """Every table-calculation function called anywhere in ``formula`` (upper-cased)."""
+    blind = _BRACKETED.sub(" ", formula or "")
+    return {m.group(1).upper() for m in _CALL.finditer(blind)
+            if m.group(1).upper() in _TABLE_CALCS}
 
-    The four WINDOW_SUM/AVG/MIN/MAX heads are order-independent ONLY in their bare whole-partition
-    form; the SAME head with explicit moving (start, end) bounds is a sliding frame whose value
-    depends on the addressing order, so it is order-sensitive like every other table calc.
+
+def _is_order_sensitive(formula: str) -> bool:
+    """True unless the formula's value is INDEPENDENT of the addressing order.
+
+    Judged over EVERY table-calc head in the expression, not just the leading one. A composite
+    such as ``101 - (RANK(a) * .15 + RANK(b) * .25)`` has no table-calc head in leading position at
+    all, yet its value cannot depend on traversal order because each component rank is
+    order-independent and arithmetic preserves that. Reading only the head classified such an
+    expression as order-sensitive and handed it off -- which, measured on a real workbook, stubbed
+    the composite score that the whole table sorts by.
+
+    Two disjoint reasons a head can be order-independent:
+
+    * a **full-partition window aggregate** (``WINDOW_SUM``/``AVG``/``MIN``/``MAX``) -- it covers the
+      whole partition, so traversal order cannot change the total. The SAME head WITH explicit
+      moving ``(start, end)`` bounds is a sliding frame and IS order-sensitive, which the bounds
+      check preserves;
+    * a **rank / TOTAL** head -- see ``_ORDER_INDEPENDENT_VALUE_HEADS``. Matched on the exact head
+      name, so ``RANK_UNIQUE`` (which breaks ties by traversal order) stays order-sensitive.
+
+    Fail-closed: an expression with no recognisable table-calc head is treated as order-sensitive,
+    exactly as before.
     """
-    head = (formula or "").lstrip().upper()
-    if not any(head.startswith(h) for h in _ORDER_INSENSITIVE_HEADS):
+    heads = _table_calc_heads(formula)
+    if not heads:
         return True
-    return _has_moving_bounds(formula)
+    moving = _has_moving_bounds(formula)
+    for head in heads:
+        if head in _ORDER_INDEPENDENT_VALUE_HEADS:
+            continue
+        if head in _ORDER_INSENSITIVE_HEADS and not moving:
+            continue
+        return True
+    return False
 
 
 # -- result --------------------------------------------------------------------
@@ -749,7 +808,7 @@ def _has_table_calc_head(formula):
     return any(m.group(1).upper() in _TABLE_CALCS for m in _CALL.finditer(blind))
 
 
-def _inline_scope_calcs(formula, scope_formulas):
+def _inline_scope_calcs(formula, scope_formulas, scope_addressing=None, own_addressing=None):
     """Inline references to OTHER calc fields on the same worksheet.
 
     A table calc is routinely written over a NAMED calc (``Total([New Inbound Referrals])``). The
@@ -757,37 +816,62 @@ def _inline_scope_calcs(formula, scope_formulas):
     and falls back -- but the referenced calc's own formula supplies the aggregate. Inlining it
     makes the formula self-contained without changing its meaning.
 
-    Returns ``(formula, None)``, or ``(None, reason)`` when a referenced calc is ITSELF a table
-    calculation: that is a stacked second addressing pass, which Tier 0 does not model, and
-    flattening it into one pass would silently compute the wrong thing. It likewise declines when
-    the expansion would drag in an unmodeled ``[Parameters].`` reference -- the calc is genuinely
-    untranslatable either way, and reporting the parameter is truthful, whereas inlining it lets the
-    lexer trip on the ``.`` and blame a stray character.
+    A referenced calc that is ITSELF a table calculation is the LAYERED case, and whether it can be
+    inlined turns on ONE fact: the addressing each is evaluated at.
+
+    * SAME addressing -> one evaluation pass. Tableau computes the inner value per mark and the
+      outer over those values, which is exactly what nested window functions do; the seam already
+      renders a table-calc head nested inside another (verified: ``RANK(101 - RANK(x))`` emits
+      nested ``RANKX``). Inlining is faithful, not a flattening.
+    * DIFFERENT addressing -> a genuine second addressing pass. Flattening would silently compute
+      the wrong thing, so it still declines.
+
+    Tableau records the per-nested-calc addressing on the consuming pill, so this is read from the
+    workbook rather than assumed (see ``workbook_table_calcs._scope_addressing``). When that record
+    is absent the old conservative behaviour stands: any nested table calc declines.
+
+    Returns ``(formula, None)`` or ``(None, reason)``. It likewise declines when the expansion would
+    drag in an unmodeled ``[Parameters].`` reference -- the calc is genuinely untranslatable either
+    way, and reporting the parameter is truthful, whereas inlining it lets the lexer trip on the
+    ``.`` and blame a stray character.
     """
     if not formula or not scope_formulas:
         return formula, None
     lookup = {str(k).strip().lower(): v for k, v in scope_formulas.items() if v}
     if not lookup:
         return formula, None
+    addressing = {str(k).strip().lower(): v
+                  for k, v in (scope_addressing or {}).items()}
     stacked = []
     parameterised = []
+
+    def _same_addressing(ref):
+        nested = addressing.get(str(ref).strip().lower())
+        return nested is not None and own_addressing is not None and nested == own_addressing
 
     def _sub(m):
         inner = _inline_calc_formula(m.group(1), lookup, set())
         if inner is None:
             return m.group(0)           # a raw field / parameter -- leave verbatim
-        if _has_table_calc_head(inner):
+        if _has_table_calc_head(inner) and not _same_addressing(m.group(1)):
             stacked.append(m.group(1))
             return m.group(0)
         if _PARAM_REF.search(inner):
             parameterised.append(m.group(1))
             return m.group(0)
-        return f"({inner})"
+        # The NEWLINE before the closing paren is load-bearing. A Tableau formula may end with a
+        # ``//`` line comment (authors routinely leave a commented-out branch at the end), and
+        # splicing that inline would comment out whatever the CALLER wrote after the reference --
+        # measured on a real workbook as a trailing ``//END`` swallowing the ``), 'desc')`` that
+        # closed the enclosing RANK, which surfaced only as a bare "expected ')'" parse error.
+        # Terminating the inlined text with a newline bounds any such comment to its own line.
+        return f"({inner}\n)"
 
     out = re.sub(r"\[([^\[\]]+)\]", _sub, formula)
     if stacked:
-        return None, (f"references calc field [{stacked[0]}], itself a table calculation: that is "
-                      "a stacked second addressing pass Tier 0 does not model")
+        return None, (f"references calc field [{stacked[0]}], itself a table calculation at a "
+                      "DIFFERENT addressing: that is a stacked second addressing pass Tier 0 does "
+                      "not model")
     if parameterised:
         return None, (f"references calc field [{parameterised[0]}], whose formula uses an unmodeled "
                       "parameter reference ([Parameters]. ...)")
@@ -851,9 +935,20 @@ def translate_table_calc_usage(usage, resolver, known_tables=None,
             return _handoff(usage, intent, "user calc field carries no formula")
         # A table calc written over a NAMED calc needs that calc's formula inlined to become a
         # self-contained aggregate the measure-context seam can parse.
-        formula, reason = _inline_scope_calcs(formula, getattr(usage, "scope_formulas", None))
+        formula, reason = _inline_scope_calcs(
+            formula, getattr(usage, "scope_formulas", None),
+            scope_addressing=getattr(usage, "scope_addressing", None),
+            own_addressing=getattr(usage, "ordering_type", None))
         if formula is None:
             return _handoff(usage, intent, reason)
+        # A parameter reference the table-calc seam cannot model: report it as the parameter
+        # reference it is. The seam parses no ``[Parameters].`` form, so left alone the lexer trips
+        # on the ``.`` and blames a stray character -- a reason that sends a reader hunting for a
+        # syntax error that does not exist. Mirrors the identical guard on the INLINED path.
+        if _PARAM_REF.search(formula):
+            return _handoff(usage, intent,
+                            "formula uses an unmodeled parameter reference ([Parameters]. ...): a "
+                            "table calc's addressing seam cannot read a slicer selection")
 
     # 3) addressing -- recovered from the explicit Field scope or the Rows-shelf layout (never
     #    hard-coded); every other scope-relative token hands off.

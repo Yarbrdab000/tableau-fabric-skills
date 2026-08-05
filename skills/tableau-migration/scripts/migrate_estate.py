@@ -605,9 +605,34 @@ def extract_calculations(xml_text, *, include_dimensions=False):
 _INVALID_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
+# Longest folder/report base name this tool will emit. A rebuilt PBIR project nests the SAME base
+# name TWICE (``pbip/<base>/<base>.Report/...``) before a deeply-nested
+# ``definition/pages/<page>/visuals/<visual>/visual.json`` tail, so an untrimmed base is spent twice
+# against the Windows MAX_PATH budget. Measured on a real customer workbook: a 77-char title pushed
+# ``visual.json`` to 278 chars. The files were written correctly (the writer uses ``\\?\``), but
+# Power BI Desktop could not READ them, so the project opened with an empty canvas -- the worst
+# possible failure, because every artifact is present and correct on disk.
+#
+# 64 keeps both copies plus the ~101-char structural tail inside the budget for any reasonable output
+# root, while staying long enough that real titles remain recognisable. Truncation is deterministic
+# and collision-safe: a content hash of the FULL name is appended, so two workbooks sharing a long
+# prefix still land in distinct folders and the same workbook always yields the same folder.
+_MAX_FS_BASE = 64
+
+
 def _fs_safe(name, default="model"):
-    """A filesystem-safe base for a name (no estate-wide de-duplication)."""
-    return _INVALID_FS.sub("_", name or "").strip().rstrip(".") or default
+    """A filesystem-safe base for a name (no estate-wide de-duplication).
+
+    Long names are truncated to ``_MAX_FS_BASE`` with a short content hash appended, so the emitted
+    path stays inside the Windows MAX_PATH budget (see ``_MAX_FS_BASE``) without ever collapsing two
+    distinct names onto one folder.
+    """
+    safe = _INVALID_FS.sub("_", name or "").strip().rstrip(".") or default
+    if len(safe) <= _MAX_FS_BASE:
+        return safe
+    digest = hashlib.sha256(safe.encode("utf-8")).hexdigest()[:8]
+    keep = _MAX_FS_BASE - len(digest) - 1
+    return f"{safe[:keep].strip().rstrip('.')}-{digest}"
 
 
 def _safe_folder(name, used):
@@ -1275,6 +1300,39 @@ def _fp_display_lookup(swap_specs):
     return lut
 
 
+def _strip_objects_for_refs(visual, dropped_refs):
+    """Remove formatting objects scoped to a queryRef the visual no longer projects.
+
+    PBIR scopes a per-column formatting rule with ``selector.metadata = <queryRef>``. When the
+    reference crosscheck removes a projection -- typically a measure whose Tableau calc did not
+    translate -- any rule scoped to it survives as a DANGLING reference into a measure the model
+    does not contain. The visual then ships a conditional fill for a column that is not there.
+
+    Exact-match only: an object is removed solely when its metadata is one of the queryRefs just
+    dropped, so rules on surviving columns, and rules with no metadata scope at all (which apply to
+    the whole visual), are left untouched. Returns the number of objects removed.
+    """
+    objects = visual.get("objects")
+    if not (isinstance(objects, dict) and dropped_refs):
+        return 0
+    removed = 0
+    for key in list(objects):
+        entries = objects[key]
+        if not isinstance(entries, list):
+            continue
+        kept = [e for e in entries
+                if not (isinstance(e, dict)
+                        and ((e.get("selector") or {}).get("metadata") in dropped_refs))]
+        removed += len(entries) - len(kept)
+        if kept:
+            objects[key] = kept
+        else:
+            del objects[key]
+    if not objects:
+        visual.pop("objects", None)
+    return removed
+
+
 def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
     """Reconcile viz projections against the emitted model: REBIND a measure the model remodeled as
     a field parameter, else DROP a reference the model did not emit.
@@ -1350,6 +1408,7 @@ def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
         # A slicer bound to a field parameter's display column IS the picker, never an expansion.
         is_slicer = "slicer" in str(vis.get("visualType") or "").lower()
         dropped, rebound = [], []
+        dropped_refs = set()
         for role, spec in list(qs.items()):
             if not isinstance(spec, dict):
                 continue
@@ -1357,7 +1416,15 @@ def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
             for p in spec.get("projections", []):
                 field = (p or {}).get("field") or {}
                 name, kind = _ref_name_kind(field)
-                low = name.lower() if isinstance(name, str) else None
+                # STRIP as well as lowercase. The model names a measure from the calc caption
+                # ``.strip()``-ed, but the report keeps the caption VERBATIM -- so a Tableau field
+                # whose name carries a trailing space (authors leave them constantly; Tableau shows
+                # no difference) produced ``'Weighted Rank Score '`` in the report against
+                # ``'Weighted Rank Score'`` in the model. The names then failed to match, the
+                # crosscheck concluded the model never emitted it, and the column was silently
+                # dropped from the visual -- a whole column missing from an otherwise correct table,
+                # with a correctly-translated measure sitting unused in the model.
+                low = name.strip().lower() if isinstance(name, str) else None
                 ok = (low in measures if kind == "measure"
                       else low in columns if kind == "column"
                       else True)  # unknown ref shape -> keep (conservative)
@@ -1388,6 +1455,8 @@ def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
                                    f"{fp['table_name']}[{fp['display_col']}]")
                 else:
                     dropped.append(f"{role}:{kind or '?'} {name!r}")
+                    if p.get("queryRef"):
+                        dropped_refs.add(p["queryRef"])
             spec["projections"] = kept
             if fp_binds:
                 spec["fieldParameters"] = fp_binds
@@ -1397,6 +1466,14 @@ def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
             emptied = not qs
             if emptied:
                 vis.pop("query", None)
+            # A formatting object scoped to a projection we just dropped is now a dangling
+            # reference: its ``selector.metadata`` names a queryRef the visual no longer projects.
+            # Conditional fills are the common case -- a measure whose calc did not translate keeps
+            # its per-column backColor rule -- and the leftover rule points at a measure the model
+            # does not contain. Pruned by EXACT queryRef match against what was removed, so no
+            # object scoped to a surviving projection is ever touched.
+            if dropped_refs:
+                _strip_objects_for_refs(vis, dropped_refs)
             report_parts[path] = json.dumps(j, indent=2)
             if dropped:
                 drops.append({"visual": j.get("name"), "dropped": dropped, "emptied": emptied})
@@ -4948,6 +5025,16 @@ def main(argv=None):
         print(f"Openable projects: {len(openable)} (double-click the .pbip in Power BI Desktop)")
         for o in openable:
             print(f"  {o['name']} ({o['kind']}): {o['pbip']}")
+        # A project whose deepest file sits past the Windows MAX_PATH budget is written correctly
+        # (the writer uses ``\\?\``) but Power BI Desktop CANNOT READ it -- it opens showing an empty
+        # canvas, with every artifact present and correct on disk. Calling that "openable" on stdout
+        # while the explanation sits buried in report.json is the worst of both worlds, so surface it
+        # here, next to the claim it contradicts.
+        _too_long = [w for wb in (report.get("workbooks") or [])
+                     for w in (wb.get("pbip_warnings") or [])
+                     if "MAX_PATH" in w]
+        for w in _too_long:
+            print(f"[WARN] {w}")
     if s.get("needs_review_total"):
         print(f"Next step: OFFER the second-compiler pass -- {s['needs_review_total']} calculation(s) "
               f"stubbed -> present them to the user and run the second compiler only on an explicit GO "

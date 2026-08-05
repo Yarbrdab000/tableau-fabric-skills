@@ -38,6 +38,7 @@ from assemble_model import (
 )
 from calc_to_dax import translate_tableau_calc_to_dax
 from connection_to_m import parse_tds, combine_descriptors
+import assemble_model as me_asm
 from openability_gate import check_model_openability
 from workbook_table_calcs import TableCalcUsage, Pill
 from test_connection_to_m import (
@@ -2983,3 +2984,55 @@ def test_flag_gated_measure_fails_closed_on_nonnull_else():
     assert dax is None
     assert "ELSE" in reason
 
+
+
+# -- local-CSV path must not lose workbook-only facts (2.61.0) ----------------------------------
+
+def test_local_csv_path_auto_extracts_table_calc_addressing():
+    # A table calculation's addressing lives in the WORKBOOK's worksheets, never in the datasource
+    # schema. migrate_tds_to_semantic_model auto-extracts it; the local-CSV branch (taken by any
+    # EXTRACT-backed workbook -- a bundled .hyper, the common shape) bypasses that function entirely,
+    # so every RANK / WINDOW_ / RUNNING_ calc silently stubbed to ``= 0``. Measured on a real
+    # workbook: 6 rank measures emitted 0, which flattened the row sort and left the conditional-
+    # format gradients with nothing to grade.
+    seen = {}
+    real = me_asm.assemble_local_import_model
+
+    def spy(descriptor, **kwargs):
+        seen.update(kwargs)
+        raise RuntimeError("stop after the kwargs are assembled")
+
+    me_asm.assemble_local_import_model = spy
+    try:
+        me_asm.migrate_datasource(LIVE_SQLSERVER, model_name="M",
+                                  local_data={"Orders": "orders.csv"})
+    except Exception:
+        pass
+    finally:
+        me_asm.assemble_local_import_model = real
+    # threaded through, not silently absent
+    assert "table_calc_usages" in seen
+    assert "calc_outer_aggs" in seen
+    assert "parameters" in seen
+
+
+def test_explicit_caller_value_still_wins_on_the_local_csv_path():
+    # Override-safe: an explicit caller value (including [] to disable table calcs) must not be
+    # clobbered by the auto-extraction.
+    seen = {}
+    real = me_asm.assemble_local_import_model
+
+    def spy(descriptor, **kwargs):
+        seen.update(kwargs)
+        raise RuntimeError("stop")
+
+    me_asm.assemble_local_import_model = spy
+    try:
+        me_asm.migrate_datasource(LIVE_SQLSERVER, model_name="M",
+                                  local_data={"Orders": "orders.csv"},
+                                  table_calc_usages=[])
+    except Exception:
+        pass
+    finally:
+        me_asm.assemble_local_import_model = real
+    assert seen.get("table_calc_usages") == []

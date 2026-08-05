@@ -1932,16 +1932,35 @@ def _uses_measure_values(rows_text, cols_text, pane):
 
 
 def _mv_shelf_locations(rows_text, cols_text, pane):
-    """Where the Measure Names pill and the Measure Values placeholder sit (shelf / encoding role)."""
-    locs = {"names": None, "values": None}
+    """Where the Measure Names pill and the Measure Values placeholder sit (shelf / encoding role).
+
+    ``values`` reports the location that decides the SHAPE of the rebuild, which is not simply the
+    first one encountered. Tableau's HIGHLIGHT TABLE places Measure Values on BOTH ``text`` (the
+    number shown in each cell) and ``color`` (the cell's background), and serialises ``<color>``
+    before ``<text>``. Taking whichever came first therefore reported ``color``, the shape decision
+    was made as though the numbers were never displayed, and a plain text table with conditional
+    formatting was misread as a chart -- then deferred as small multiples, dropping the entire
+    worksheet. Ranking the roles instead makes the answer independent of serialisation order: a
+    SHELF (rows/cols) outranks ``text``/``label``, which outranks a pure visual encoding like
+    ``color`` or ``size``.
+
+    ``values_roles`` additionally reports EVERY role Measure Values occupies, so a caller can see
+    that a table is also colour-encoded (and rebuild that as conditional formatting) rather than
+    having to choose between the two facts.
+    """
+    locs = {"names": None, "values": None, "values_roles": set()}
+    rank = {"rows": 0, "cols": 0, "text": 1, "label": 1}
 
     def mark(where, col):
         if not col:
             return
         if ":Measure Names]" in col and locs["names"] is None:
             locs["names"] = where
-        if ("[Multiple Values]" in col or ":Measure Values]" in col) and locs["values"] is None:
-            locs["values"] = where
+        if "[Multiple Values]" in col or ":Measure Values]" in col:
+            locs["values_roles"].add(where)
+            current = locs["values"]
+            if current is None or rank.get(where, 2) < rank.get(current, 2):
+                locs["values"] = where
 
     mark("rows", rows_text)
     mark("cols", cols_text)
@@ -2983,6 +3002,106 @@ def _automatic_color_gradient(color_enc):
     }
 
 
+def _color_card_instances(root, worksheet_name):
+    """Instance tokens of every pill on this worksheet's COLOUR shelf.
+
+    Tableau records the Colour shelf as ``<card type='color'>`` entries under
+    ``workbook/windows/window[@name=<worksheet>]/cards/...`` -- NOT in the worksheet element, and not
+    alongside the ``<style>`` palettes. That distinction matters: the cards are the authoritative
+    record of WHICH measures are colour-encoded, while a ``<style-rule>`` ``<encoding attr='color'>``
+    only supplies a palette for those the author explicitly styled. A measure with a card but no
+    encoding is still coloured -- Tableau just paints it with the automatic default ramp.
+
+    Reading only the encodings therefore UNDER-counts a highlight table. Measured on a real
+    workbook: 8 measures sat on the Colour shelf but only 5 carried explicit palettes, so three
+    columns that are visibly shaded in Tableau rebuilt with no fill at all.
+
+    Returns a set of raw instance tokens (e.g. ``usr:Calculation_123:qk``); empty when the workbook
+    records no cards for this worksheet, which keeps every previously-handled sheet byte-identical.
+    """
+    out = set()
+    if root is None or not worksheet_name:
+        return out
+    for window in _findall_local(root, "window"):
+        if (window.get("name") or "") != worksheet_name:
+            continue
+        for card in window.iter():
+            if _local(card.tag) != "card" or (card.get("type") or "") != "color":
+                continue
+            _, fid = _split_token_attr(card.get("param"))
+            if fid:
+                out.add(fid)
+    return out
+
+
+def _parse_color_gradients_by_field(table):
+    """Every per-field continuous colour scale on a worksheet: ``{field_token: gradient_spec}``.
+
+    ``_parse_color_gradient`` answers "what is THE colour scale for this chart" and returns the
+    first one, which is right for a chart whose marks share one legend. A Tableau HIGHLIGHT TABLE
+    with ``separate-domains='true'`` is the opposite case: Measure Values sits on Colour and each
+    member measure carries its OWN palette and its OWN domain, so the worksheet holds one colour
+    encoding PER measure. Collapsing those to a single scale would paint every column from one
+    palette -- visibly wrong wherever the author chose different hues per metric, which is the whole
+    point of the idiom.
+
+    Keyed by the encoding's raw ``field`` token so a caller can match each scale to the projection
+    built from the same pill. Only encodings that yield a real gradient are included, so a miss is
+    simply an absent key.
+    """
+    out = {}
+    if table is None:
+        return out
+    style = _first(table, "style")
+    if style is None:
+        return out
+    for rule in _children_local(style, "style-rule"):
+        if (rule.get("element") or "").lower() != "mark":
+            continue
+        for enc in _children_local(rule, "encoding"):
+            if (enc.get("attr") or "") != "color":
+                continue
+            token = enc.get("field") or ""
+            if not token or token in out:
+                continue
+            spec = _gradient_from_encoding(enc)
+            if spec is not None:
+                out[token] = spec
+    return out
+
+
+def _gradient_from_encoding(enc):
+    """One colour encoding -> a gradient spec, or ``None`` when it carries no continuous scale.
+
+    Extracted from ``_parse_color_gradient`` so the single-scale and per-measure readers share one
+    definition of what a gradient IS and can never diverge on palette handling.
+    """
+    enc_type = (enc.get("type") or "").lower()
+    interpolated = "interpolated" in enc_type
+    palette = _first(enc, "color-palette")
+    if palette is not None:
+        pal_type = (palette.get("type") or "").lower()
+        if interpolated or pal_type in _GRADIENT_PALETTE_TYPES:
+            colors = [(c.text or "").strip()
+                      for c in _children_local(palette, "color")
+                      if (c.text or "").strip()]
+            if len(colors) >= 2:
+                center = _parse_gradient_center(enc)
+                _, fid = _split_token_attr(enc.get("field"))
+                return {
+                    "field_token": enc.get("field") or "",
+                    "center": center,
+                    "palette_type": (pal_type or ("ordered-diverging" if center is not None
+                                                  else "ordered-sequential")),
+                    "colors": colors,
+                    "interpolated": interpolated,
+                    "is_table_calc": _instance_is_table_calc(fid),
+                }
+    if interpolated:
+        return _default_continuous_gradient(enc)
+    return None
+
+
 def _parse_color_gradient(table):
     """Extract a continuous background colour-scale spec from a worksheet's mark colour encoding.
 
@@ -3534,7 +3653,7 @@ def _classify_reference_lines(all_panes, visual_type):
 
 def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date_binding=None,
                      row_count_binding=None, measure_binding=None, column_binding=None,
-                     measure_palette=None, ds_color_palettes=None):
+                     measure_palette=None, ds_color_palettes=None, workbook_root=None):
     name = ws.get("name")
     table = _first(ws, "table")
     if table is None:
@@ -3618,6 +3737,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     combo_split = None
     lollipop = False
     lollipop_color = None
+    mv_color_scales = []
     if uses_mv:
         # Measure Values/Names (M1.0): expand [Measure Values] to its ordered member measures in
         # the value well and route by mark + where the (implicit) Measure Names pill sits. The
@@ -3634,6 +3754,34 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                 rows = rows + members
             else:
                 cols = cols + members
+            # HIGHLIGHT TABLE: Measure Values is on Colour as well as Text, so each member measure
+            # carries its OWN palette (``separate-domains``). Pair each member with the colour
+            # encoding built from the SAME pill -- matching on the instance token, which is what
+            # both the shelf pill and the colour encoding name -- so the emitter can lay one
+            # independent conditional-fill scale per column. Members with no colour encoding simply
+            # get no entry, so a partially coloured table colours exactly the columns the author did.
+            if "color" in (locs.get("values_roles") or ()):
+                by_field = _parse_color_gradients_by_field(table)
+                by_instance = {}
+                for token, spec in by_field.items():
+                    _, fid = _split_token_attr(token)
+                    if fid:
+                        by_instance[fid] = spec
+                # Every pill on the Colour shelf is coloured, whether or not the author styled it.
+                # One with a card but no explicit palette gets Tableau's automatic default ramp --
+                # the same synthesis the single-scale path already performs -- so a highlight table
+                # rebuilds with a fill on every column Tableau shades, not just the styled ones.
+                carded = _color_card_instances(workbook_root, name)
+                mv_color_scales = []
+                for member in members:
+                    inst = member.get("instance")
+                    spec = by_instance.get(inst)
+                    if spec is None and inst in carded and member.get("kind") == "value":
+                        spec = _automatic_color_gradient(member)
+                    if spec is not None:
+                        mv_color_scales.append({"caption": member.get("caption"),
+                                                "instance": inst,
+                                                "gradient": spec})
     else:
         # marks-card encodings also carry fields: color/detail can be the disaggregating
         # dimension (scatter) and label/size can be the measure of a bare card / KPI tile.
@@ -3927,6 +4075,15 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                     and _color_enc_g.get("binding") in ("aggregation", "measure")):
                 color_gradient = _automatic_color_gradient(_color_enc_g)
 
+    # Per-measure colour scales. A highlight table puts Measure Values on Colour with
+    # ``separate-domains``, so each member measure owns its own palette and domain; the single
+    # ``color_gradient`` above cannot represent that. Parsed for every table/matrix (additive IR key)
+    # and consumed only when the worksheet actually colours by Measure Values, so a chart or a
+    # single-scale table is unaffected.
+    color_gradients = {}
+    if visual_type in (VT_MATRIX, VT_TABLE):
+        color_gradients = _parse_color_gradients_by_field(table)
+
     # Explicit categorical mark-colour palette (author member -> hex). Parsed here (additive IR key)
     # and turned into PBIR dataPoint per-member fills at emit time -- faithful-or-warn, so a palette
     # on a visual type that cannot carry a per-member fill, or whose coloured dimension is not bound,
@@ -3981,6 +4138,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "axis_titles": axis_titles,
         "axis_hidden": sorted(axis_hidden),
         "color_gradient": color_gradient,
+        "color_gradients": color_gradients,
+        "mv_color_scales": mv_color_scales,
         "mark_colors": mark_colors,
         "measure_colors": measure_colors,
         "card_label_colors": card_label_colors,
@@ -4842,7 +5001,8 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
                                   measure_binding=measure_binding,
                                   column_binding=column_binding,
                                   measure_palette=measure_palette,
-                                 ds_color_palettes=ds_color_palettes)
+                                 ds_color_palettes=ds_color_palettes,
+                                 workbook_root=root)
         if parsed:
             worksheets.append(parsed)
     worksheet_names = {w["name"] for w in worksheets}
@@ -4962,12 +5122,24 @@ def _apply_override(field, model_table, field_map):
     ``model_table`` fallback must not re-pin it onto the fact and produce a dangling ``Sheet1[<calc>]``.
     """
     entity, prop, binding = field["entity"], field["property"], field["binding"]
+    # A model object is named from its Tableau caption STRIPPED, so a caption carrying stray
+    # leading/trailing whitespace -- which authors leave constantly, and which Tableau renders no
+    # differently -- would emit a reference naming an object that does not exist. Measured on a real
+    # workbook: a caption ``'Weighted Rank Score '`` produced a report reference the model-vs-report
+    # crosscheck could not match, so the whole column was dropped from the table while its correctly
+    # translated measure sat unused in the model. Normalised HERE, at the single choke point every
+    # reference shape derives ``prop`` from, so ``Property``, ``queryRef`` and ``nativeQueryRef``
+    # can never disagree about the name -- a mismatch between them renders an error tile.
+    if isinstance(prop, str):
+        prop = prop.strip() or prop
     if field.get("date_rebound") or field.get("column_rebound"):
         return entity, prop, binding
     if field_map and field["caption"] in field_map:
         ov = field_map[field["caption"]]
         entity = ov.get("entity", entity)
         prop = ov.get("property", prop)
+        if isinstance(prop, str):
+            prop = prop.strip() or prop
         # ``field_map`` targets are always model COLUMNS (measure calcs are rebound via
         # ``measure_binding``, never here). An explicit override ``binding`` still wins; otherwise a
         # raw ``measure``-kind ref whose caption resolves to a column is rebound TO that column --
@@ -6224,6 +6396,37 @@ def _bind_sort_field(state, expr, qref, nref, visual_type):
     return True
 
 
+def _row_header_sort(ws):
+    """A leading DISCRETE measure on the Rows shelf, as an implicit ascending row sort.
+
+    Tableau renders a discrete (blue) measure pill on the Rows shelf as a row HEADER column, and a
+    text table's rows are ordered by their headers left to right -- so a numeric pill placed before
+    the dimension is how authors pin a custom row order without a ``<computed-sort>``. The workbook
+    records no sort element for this at all; the order is a consequence of the shelf layout.
+
+    The rebuild routes that pill into the matrix's Values well (it is a measure), which drops its
+    ordering role, and the rows then fall back to alphabetical. Measured against a real dashboard:
+    the whole table came out A-Z instead of ranked, which reads as the migration having lost the
+    ranking even though every value was correct.
+
+    Restricted to a TABLE / MATRIX. The reading depends on the pill being rendered as a row header,
+    which only happens in a text table -- a cartesian chart puts the same pill on an axis, where it
+    carries no ordering role. The corpus caught this: without the gate a scatter chart picked up a
+    spurious sort on its measure.
+
+    Fail-closed otherwise: only a measure pill that PRECEDES every dimension on the shelf qualifies,
+    since that is what makes it the leading header. Ascending, matching Tableau's header order.
+    """
+    if ws.get("visual_type") not in (VT_MATRIX, VT_TABLE):
+        return None
+    rows = ws.get("rows") or []
+    if len(rows) < 2 or (rows[0] or {}).get("kind") != "value":
+        return None
+    if not any((p or {}).get("kind") == "category" for p in rows[1:]):
+        return None
+    return {"field": rows[0], "direction": "Ascending"}
+
+
 def _sort_definition(ws, state, model_table, field_map):
     """Build a PBIR ``sortDefinition`` from a worksheet's ``<computed-sort>``.
 
@@ -6235,10 +6438,13 @@ def _sort_definition(ws, state, model_table, field_map):
     computed-sort, or when the sort-by field can neither be projected nor tooltip-bound here --
     emitting an unhonourable sort is worse than emitting none.
 
+    Falls back to :func:`_row_header_sort` -- a leading discrete measure on the Rows shelf, which
+    orders a Tableau text table without any sort element being written.
+
     NOTE: this may MUTATE ``state`` (adding the Tooltips projection), so call it before the
     ``queryState`` is serialised, and after any helper whose behaviour depends on the role set.
     """
-    sort = ws.get("sort")
+    sort = ws.get("sort") or _row_header_sort(ws)
     if not sort:
         return None
     expr, qref, nref = _field_expression(sort["field"], model_table, field_map)
@@ -6301,10 +6507,20 @@ def _gradient_color_stops(cg):
         return stop
 
     nulls = {"strategy": {"Literal": {"Value": "'asZero'"}}}
-    if cg.get("center") is not None and len(colors) >= 3:
+    # A palette is diverging when the author pinned a CENTER, or when Tableau typed the palette
+    # itself ``ordered-diverging``. The second case matters on its own: a highlight table's
+    # per-measure palettes are typed diverging but carry no center, and reducing those to a
+    # two-stop ramp interpolates end-to-end THROUGH the middle (orange straight to blue, muddying
+    # every mid-range cell) instead of passing through the neutral the author chose. The centre
+    # VALUE is only emitted when it is known -- with none, Power BI centres the mid stop on the data
+    # midpoint, which is exactly what Tableau does for an uncentred diverging ramp -- so the hue
+    # path is preserved without inventing a breakpoint.
+    diverging = (cg.get("center") is not None
+                 or (cg.get("palette_type") or "") == "ordered-diverging")
+    if diverging and len(colors) >= 3:
         return {"linearGradient3": {
             "min": _stop(colors[0]),
-            "mid": _stop(colors[len(colors) // 2], value=cg["center"]),
+            "mid": _stop(colors[len(colors) // 2], value=cg.get("center")),
             "max": _stop(colors[-1]),
             "nullColoringStrategy": nulls}}
     return {"linearGradient2": {
@@ -6342,7 +6558,8 @@ def _conditional_format(ws, state, model_table, field_map, warnings):
     to the visual's projections, so the fill never references something the query does not.
     """
     cg = ws.get("color_gradient")
-    if not cg:
+    scales = ws.get("mv_color_scales") or []
+    if not cg and not scales:
         return None, None
     if ws["visual_type"] not in (VT_MATRIX, VT_TABLE):
         # A cartesian chart's continuous mark colour is owned by ``_chart_continuous_fill``
@@ -6350,6 +6567,51 @@ def _conditional_format(ws, state, model_table, field_map, warnings):
         # gradient is also parsed for charts, skip silently here rather than feign a
         # conditional-format deferral for a visual that never carries a cell fill.
         return None, None
+
+    # HIGHLIGHT TABLE: one INDEPENDENT conditional-fill scale per measure column. Tableau builds
+    # this by putting Measure Values on Colour with ``separate-domains``, giving each member measure
+    # its own palette and its own domain -- so the faithful rebuild is N scoped ``values[]`` entries,
+    # each ``selector.metadata``-bound to the one column it colours, NOT a single scale stretched
+    # across the table. The whole worksheet was previously dropped for this shape, taking the
+    # conditional formatting with it; both are the same defect.
+    if scales:
+        values = (state.get("Values") or {}).get("projections", [])
+        # Match on the STRIPPED name: the projection's ``nativeQueryRef`` is normalised to the
+        # model's object name, while a Tableau member caption keeps whatever whitespace the author
+        # left on it, so a raw-caption lookup silently misses and the column loses its fill.
+        by_ref = {str(p.get("nativeQueryRef") or "").strip(): p for p in values}
+        value_objects, bound, missed = [], [], []
+        for entry in scales:
+            proj = by_ref.get(str(entry.get("caption") or "").strip())
+            if proj is None:
+                missed.append(entry.get("caption"))
+                continue
+            value_objects.append({
+                "properties": {
+                    "backColor": {"solid": {"color": {"expr": {"FillRule": {
+                        "Input": proj["field"],
+                        "FillRule": _gradient_color_stops(entry["gradient"])}}}}}},
+                "selector": {
+                    "data": [{"dataViewWildcard": {"matchingOption": 1}}],
+                    "metadata": proj["queryRef"]},
+            })
+            bound.append(proj["queryRef"])
+        fact = {
+            "kind": "background_color_scale_per_measure",
+            "status": "emitted" if value_objects else "deferred",
+            "scales": len(scales),
+            "bound_measures": bound,
+        }
+        if missed:
+            # Never silent: a member whose column is not projected (e.g. its calc did not translate)
+            # loses its fill, and the reader is told which one.
+            fact["unbound"] = sorted(missed)
+            warnings.append(_warn(
+                "worksheet", ws["name"],
+                "conditional fill not applied to %d measure column(s) that are not projected in "
+                "this visual (%s)" % (len(missed), ", ".join(sorted(m or "?" for m in missed)))))
+        return (value_objects or None), fact
+
     color = ws["encodings"].get("color")
     fact = {
         "kind": "background_color_scale",
@@ -7838,11 +8100,18 @@ def _filter_container(entity, prop, condition, name, *, ftype, inverted=False):
     return container
 
 
-def _categorical_condition(entity, prop, values, *, exclude, numeric=False):
+def _categorical_condition(entity, prop, values, *, exclude, numeric=False, datey=False):
     # ``numeric=True`` emits integer literals (``4L``) instead of quoted strings -- used when an
     # applied date-part selection (month ``4``, year ``2021``) has been rebound onto an INTEGER
     # calendar column (Date[Month]/[Year]/...), where a string literal would match no row.
-    lit = _semantic_numeric_literal if numeric else _semantic_string_literal
+    # ``datey=True`` emits semantic-query ``datetime'...'`` literals for an applied selection on a
+    # real DATE column, where a quoted string likewise matches no row.
+    if datey:
+        lit = _semantic_datetime_literal
+    elif numeric:
+        lit = _semantic_numeric_literal
+    else:
+        lit = _semantic_string_literal
     col = _filter_column_ref(entity, prop, source=_FILTER_SOURCE_ALIAS)
     in_expr = {"In": {
         "Expressions": [col],
@@ -8249,7 +8518,18 @@ def _slicer_preselection_object(field, model_table, field_map):
             return None
         dt = (field.get("datatype") or "").lower()
         numeric = bool(field.get("date_rebound") and prop in _INTEGER_DATE_PART_COLUMNS)
-        if not numeric and dt != "string":
+        # A DATE column carrying explicit date members is bindable too. Tableau writes an applied
+        # date filter as ``#YYYY-MM-DD#`` literals, and PBIR accepts those as semantic-query
+        # ``datetime'...'`` literals -- the exact form the scalar date PARAMETER pickers already
+        # open on. Without this a date-scoped worksheet rebuilt with its slicer reading "All" and
+        # NOTHING filtered, so every number on the page was computed over the full history the
+        # source workbook had excluded: measured on a real workbook as a whole ranked table drifting
+        # off its oracle because one month filter never applied. Fail-closed as ever -- every member
+        # must parse as a date literal, or the selection declines rather than binding a partial set.
+        datey = (not numeric and dt in ("date", "datetime")
+                 and all(_semantic_datetime_literal(v) is not None
+                         for v in sel.get("values") or [] if v != "%null%"))
+        if not numeric and not datey and dt != "string":
             return None
         values = [v for v in sel["values"] if v != "%null%"]
         if not values:
@@ -8258,7 +8538,8 @@ def _slicer_preselection_object(field, model_table, field_map):
                 _semantic_numeric_literal(v) is not None
                 and _semantic_numeric_literal(v).endswith("L") for v in values):
             return None
-        cond = _categorical_condition(entity, prop, values, exclude=False, numeric=numeric)
+        cond = _categorical_condition(entity, prop, values, exclude=False,
+                                      numeric=numeric, datey=datey)
     return {"properties": {"filter": {"filter": {
         "Version": 2,
         "From": [{"Name": _FILTER_SOURCE_ALIAS, "Entity": entity, "Type": 0}],

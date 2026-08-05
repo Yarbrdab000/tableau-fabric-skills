@@ -1109,3 +1109,37 @@ def test_other_scope_tokens_still_hand_off():
         t = translate_table_calc_usage(_cols_scope_usage(ordering_type=token), resolver)
         assert t.status != "translated", token
         assert "not recoverable" in t.reason
+
+
+# -- order-independence of the RANK family (2.61.0) ---------------------------------------------
+
+@pytest.mark.parametrize("formula, order_sensitive", [
+    # A rank counts marks that hold a better value, and counting cannot depend on the sequence the
+    # marks are visited in -- so a rank is order-INDEPENDENT and does not need a pinned direction.
+    ("RANK(SUM([Sales]),'desc')", False),
+    ("rank([Calc], 'asc')", False),
+    ("RANK_DENSE(SUM([Sales]))", False),
+    ("RANK_MODIFIED(SUM([Sales]))", False),
+    ("RANK_PERCENTILE(SUM([Sales]))", False),
+    ("TOTAL(SUM([Sales]))", False),
+    # RANK_UNIQUE breaks ties by Tableau's internal traversal order, so it IS order-sensitive and
+    # must keep handing off. Matched on the exact head so a prefix test cannot capture it.
+    ("RANK_UNIQUE(SUM([Sales]))", True),
+    # A full-partition window aggregate is order-independent; the same head with MOVING bounds is a
+    # sliding frame and is not.
+    ("WINDOW_SUM(SUM([Sales]))", False),
+    ("WINDOW_SUM(SUM([Sales]),-2,0)", True),
+    # Genuinely positional heads stay order-sensitive.
+    ("RUNNING_SUM(SUM([Sales]))", True),
+    ("INDEX()", True),
+    ("LOOKUP(SUM([Sales]),-1)", True),
+    # Judged over EVERY head, not just the leading one: a composite whose components are all
+    # order-independent is itself order-independent, even with no table-calc head in lead position.
+    ("101 - (RANK(SUM([a]),'desc') * .15 + RANK(SUM([b]),'asc') * .25)", False),
+    ("101 - (RANK(SUM([a])) + RUNNING_SUM(SUM([b])))", True),
+    ("RANK(101 - RANK(SUM([a])))", False),
+    # Fail-closed: no recognisable table-calc head at all -> treated as order-sensitive.
+    ("SUM([Sales])", True),
+])
+def test_order_sensitivity_classification(formula, order_sensitive):
+    assert _is_order_sensitive(formula) is order_sensitive
