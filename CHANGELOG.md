@@ -1,4 +1,4 @@
-﻿# Changelog
+# Changelog
 
 All notable changes to this collection are documented here.
 
@@ -11,6 +11,34 @@ collection follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html) at
 own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
+
+- **tableau-migration (skill `2.68.0` -> `2.69.0`): consolidating plain single-connection
+  datasources no longer declines the whole workbook rebuild.** Tableau writes a
+  `<named-connections>` block only for a FEDERATED datasource; a plain single-upstream datasource
+  stores its connection as the scalar attributes of its one `<connection>` element, so its relations
+  carry no `connection` attribute -- correctly, since inside that datasource there is nothing to
+  disambiguate. The moment two such datasources were CONSOLIDATED into one model the combined
+  descriptor became multi-connection by construction, every one of those relations looked unroutable
+  to `storage_mode._structurally_unsupported_reason`, and the ENTIRE rebuild was declined -- no
+  model, no report, no `.pbip` at all. Measured on the deterministic corpus: **5 of 29 workbooks
+  produced zero openable output**, every one of them a Challenge/Solution or "(copy)" pair of plain
+  Excel/Access datasources. `connection_to_m._self_connection_facts` now reconstructs such an
+  island's lone upstream from its own scalar facts, in the exact key shape a resolved federated
+  `relation["connection"]` already holds, so the existing per-relation routing
+  (`_effective_connection`, `_flatfile_path_for`, `migrate_estate._land_combined_flatfiles`) applies
+  unchanged and each island lands and loads its OWN data file. Fail-closed: reconstruction fires
+  only when an island has NO named-connection map to trust -- a table inside a genuinely
+  multi-connection island keeps its real ambiguity and still declines. Corpus effect (same-harness
+  baseline): openable outputs 24 -> 28, DoD `failed` 5 -> 1, visuals rebuilt 51 -> 54, workbook calcs
+  translated 240 -> 253; the one remaining failure is a different, honest gap (MS Access has no
+  direct-M connector). All four recovered workbooks pass `openability_selfcheck`.
+- **tableau-migration: a quoted Excel sheet name now navigates the real worksheet.** Tableau quotes
+  an identifier containing a space inside its brackets (`['Master Date List$']`), doubling any inner
+  quote. `_excel_sheet_name` stripped only the brackets, so the emitted
+  `Item="'Master Date List$'"` matched no sheet -- the partition opened and loaded ZERO rows without
+  erroring. Verified against a workbook whose sheets are `Orders` / `Master Date List` / `Sheet1`.
+  The unquote requires a MATCHED pair, so an unquoted name and a name that merely contains an
+  apostrophe (`John's Data$`) are both left untouched.
 
 ### tableau-migration (skill `2.67.0` -> `2.68.0`)
 

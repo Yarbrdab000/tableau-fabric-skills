@@ -2044,6 +2044,55 @@ _COMBINE_SCALAR_KEYS = (
 )
 
 
+def _self_connection_facts(desc):
+    """Reconstruct the lone upstream of a datasource that declares NO ``<named-connection>``.
+
+    Tableau writes a ``<named-connections>`` block only for a FEDERATED datasource. A plain
+    single-upstream datasource stores its connection as the scalar attributes of its one
+    ``<connection>`` element, so ``parse_tds`` returns ``connections == {}`` and its relations carry
+    no ``connection`` attribute -- correctly, because inside that datasource there is nothing to
+    disambiguate.
+
+    That becomes a false negative the moment several such datasources are CONSOLIDATED into one
+    model: the combined descriptor is multi-connection by construction, and every one of those
+    relations then looks unroutable to ``storage_mode._structurally_unsupported_reason``, which
+    declines the whole rebuild ("multiple named connections but N table(s) don't resolve to a
+    specific connection") -- so a workbook embedding two plain datasources produces NO model and NO
+    report at all. Measured on the deterministic corpus: 5 of 29 workbooks, every one of them a
+    Challenge/Solution or "(copy)" pair of plain Excel/Access datasources over the SAME file.
+
+    Each such relation's upstream is not ambiguous, it is simply implicit -- it is that datasource's
+    single connection -- so rebuild it here in the exact key shape :func:`_connection_facts`
+    produces, which is what a resolved federated ``relation["connection"]`` already holds and what
+    ``_effective_connection`` / ``_flatfile_path_for`` / ``migrate_estate._land_combined_flatfiles``
+    all consume. ``flatfile_path`` is deliberately NOT carried: ``_connection_facts`` has no such
+    key, and the relative path it would hold is exactly what ``_flatfile_path_for`` rebuilds from
+    ``directory`` + ``filename`` anyway (the driver's ABSOLUTE path is pinned per-relation, above
+    the connection).
+
+    Fail-closed: returns ``None`` when the datasource names no connector class, so nothing is
+    attributed on a shape we cannot describe.
+    """
+    cls = (desc.get("connection_class") or "").strip()
+    if not cls:
+        return None
+    facts = {
+        "connection_class": cls,
+        "server": desc.get("server"),
+        "database": desc.get("database"),
+        "warehouse": desc.get("warehouse"),
+        "http_path": desc.get("http_path"),
+        "schema": None,
+        "auth_method": desc.get("auth_method"),
+        "filename": desc.get("flatfile_filename"),
+        "directory": desc.get("flatfile_directory"),
+    }
+    for key, val in desc.items():
+        if key.startswith("odbc") or key in ("driver", "dsn", "port"):
+            facts[key] = val
+    return facts
+
+
 def combine_descriptors(descriptors, *, captions=None):
     """Combine several single-datasource descriptors (each from :func:`parse_tds`) into ONE.
 
@@ -2097,8 +2146,14 @@ def combine_descriptors(descriptors, *, captions=None):
         # A single-connection datasource never stamps a per-relation `connection` (its scalar facts
         # ARE the connection). In the combined multi-connection descriptor each table must route to
         # its OWN upstream, so inherit that lone connection's facts onto this datasource's tables.
+        # A PLAIN (non-federated) datasource declares no `<named-connection>` at all, so its map is
+        # empty rather than one-entry -- reconstruct its lone upstream from its own scalar facts
+        # (see `_self_connection_facts`), otherwise consolidating two such datasources makes every
+        # relation look unroutable and the whole workbook rebuild is declined.
         dconns = list((desc.get("connections") or {}).values())
         origin_conn = dconns[0] if len(dconns) == 1 else None
+        if origin_conn is None and not dconns:
+            origin_conn = _self_connection_facts(desc)
         rename = {}  # old display -> new display, for THIS datasource only
         for rel in desc.get("relations", []) or []:
             if rel.get("kind") not in ("table", "custom_sql"):
@@ -2357,9 +2412,24 @@ def _excel_sheet_name(relation):
 
     Tableau exposes a worksheet as ``[<sheet>$]`` (the ODBC sheet convention); Power Query's
     ``Excel.Workbook`` navigation keys the sheet by its bare name with ``Kind="Sheet"``.
+
+    A sheet whose name contains a SPACE (or other special) is additionally QUOTED inside those
+    brackets -- ``['Master Date List$']`` -- with any inner quote doubled, exactly like a quoted SQL
+    identifier. Stripping only the brackets leaves ``'Master Date List$'``, and the emitted
+    ``Item="'Master Date List$'"`` matches no sheet in the workbook, so the partition opens and loads
+    ZERO rows without erroring -- silently wrong. Verified on a real workbook whose sheets are
+    ``Orders`` / ``Master Date List`` / ``Sheet1``.
+
+    The unquote is fail-closed: it fires only when the FIRST and LAST characters are the SAME quote
+    character and something remains between them, so an unquoted name (``Orders$``) and a name that
+    merely contains an apostrophe (``John's Data$``) are both left untouched.
     """
     raw = relation.get("raw_table") or relation.get("item") or relation.get("name") or ""
     s = _strip_brackets(raw).strip()
+    for q in ("'", '"'):
+        if len(s) > 2 and s[0] == q and s[-1] == q:
+            s = s[1:-1].replace(q + q, q)
+            break
     return s[:-1] if s.endswith("$") else s
 
 
