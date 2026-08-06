@@ -160,3 +160,108 @@ def test_unresolved_bare_reference_fails_closed():
         "RANK([Mystery])", axis="ROWS",
         resolve_aggregate=_agg_primary, resolve_reference=lambda n, ds: None)
     assert expr is None and "Mystery" in reason
+
+
+# -- TOTAL -> COLLAPSEALL ------------------------------------------------------
+# Tableau's TOTAL returns the partition total, RE-EVALUATING the aggregate over the partition's
+# underlying rows. COLLAPSEALL is the view-side counterpart: "retrieves a context at the highest
+# level ... returns its value in the new context". Microsoft's own doc example,
+# `TotalValue = COLLAPSEALL([SalesAmount], ROWS)`, is exactly Tableau's percent-of-total idiom.
+def test_total_of_an_aggregate_compiles_to_collapseall():
+    expr, deps, reason = compile_expression(
+        "TOTAL(SUM([Sales]))", axis="ROWS",
+        resolve_aggregate=_agg_primary, resolve_reference=lambda n, ds: None)
+    assert reason is None
+    assert expr == "COLLAPSEALL([Sum of Sales], ROWS)"
+    assert deps == []
+
+
+def test_total_of_a_calc_reference_nests_and_records_the_dependency():
+    """The real corpus shape: Total([Some Calc]) -- the argument is another calc, not an aggregate."""
+    expr, deps, reason = compile_expression(
+        "TOTAL([Open Intakes])", axis="ROWS",
+        resolve_aggregate=_agg_primary,
+        resolve_reference=lambda n, ds: ("calc", "Open Intakes"))
+    assert reason is None
+    assert expr == "COLLAPSEALL([Open Intakes], ROWS)"
+    assert deps == ["Open Intakes"]            # nested VC dependency recorded
+
+
+def test_total_of_a_base_measure_reference():
+    expr, deps, reason = compile_expression(
+        "TOTAL([Referrals])", axis="ROWS",
+        resolve_aggregate=_agg_primary,
+        resolve_reference=lambda n, ds: ("measure", "Referrals"))
+    assert reason is None
+    assert expr == "COLLAPSEALL([Referrals], ROWS)"
+    assert deps == []                          # a base measure is not a nested-VC dependency
+
+
+def test_total_threads_the_axis():
+    expr, _, reason = compile_expression(
+        "TOTAL(SUM([Sales]))", axis="COLUMNS",
+        resolve_aggregate=_agg_primary, resolve_reference=lambda n, ds: None)
+    assert reason is None
+    assert expr == "COLLAPSEALL([Sum of Sales], COLUMNS)"
+
+
+def test_total_composes_the_percent_of_total_idiom():
+    """The canonical use, and the exact shape of Microsoft's COLLAPSEALL doc example."""
+    expr, _, reason = compile_expression(
+        "SUM([Sales]) / TOTAL(SUM([Sales]))", axis="ROWS",
+        resolve_aggregate=_agg_primary, resolve_reference=lambda n, ds: None)
+    assert reason is None
+    assert expr == "[Sum of Sales] / COLLAPSEALL([Sum of Sales], ROWS)"
+
+
+def test_total_is_case_insensitive():
+    """The corpus writes it as `Total([x])`, not `TOTAL([x])`."""
+    expr, _, reason = compile_expression(
+        "Total(SUM([Sales]))", axis="ROWS",
+        resolve_aggregate=_agg_primary, resolve_reference=lambda n, ds: None)
+    assert reason is None
+    assert expr == "COLLAPSEALL([Sum of Sales], ROWS)"
+
+
+def test_total_rejects_a_direction_argument():
+    """Tableau's TOTAL takes exactly one argument -- same guard the model-layer seam draws."""
+    expr, _, reason = compile_expression(
+        "TOTAL(SUM([Sales]), 'asc')", axis="ROWS",
+        resolve_aggregate=_agg_primary, resolve_reference=lambda n, ds: None)
+    assert expr is None
+    assert reason
+
+
+def test_total_rejects_an_inline_expression_argument():
+    expr, _, reason = compile_expression(
+        "TOTAL(SUM([Sales]) + 1)", axis="ROWS",
+        resolve_aggregate=_agg_primary, resolve_reference=lambda n, ds: None)
+    assert expr is None
+    assert reason
+
+
+def test_total_of_an_unresolvable_reference_falls_back():
+    expr, _, reason = compile_expression(
+        "TOTAL([Nope])", axis="ROWS",
+        resolve_aggregate=_agg_primary, resolve_reference=lambda n, ds: None)
+    assert expr is None
+    assert reason
+
+
+# -- the semantic line COLLAPSEALL must NOT be pushed across ---------------------------------------
+def test_window_family_is_still_unsupported_and_never_becomes_collapseall():
+    """COLLAPSEALL is total-level RE-EVALUATION; the WINDOW_* family is per-mark aggregation.
+
+    They coincide for SUM but diverge for a non-additive inner (Tableau's TOTAL(AVG([x])) averages
+    all underlying rows; WINDOW_AVG(AVG([x])) averages the per-mark averages). Mapping a WINDOW_*
+    head to COLLAPSEALL would therefore ship silently wrong numbers, so the window family must keep
+    failing closed until it earns its own verified form.
+    """
+    for formula in ("WINDOW_MAX(SUM([Sales]))", "WINDOW_SUM(SUM([Sales]))",
+                    "WINDOW_AVG(SUM([Sales]))", "WINDOW_MAX([Some Calc]) * 1.2"):
+        expr, _, reason = compile_expression(
+            formula, axis="ROWS", resolve_aggregate=_agg_primary,
+            resolve_reference=lambda n, ds: ("calc", "Some Calc"))
+        assert expr is None, formula
+        assert "COLLAPSEALL" not in (expr or ""), formula
+        assert reason

@@ -20,8 +20,10 @@ the exact DAX conventions of :mod:`visual_calc_emitter`.
 
 Closed, **fail-closed** subset (v1 -- the surface proven faithful cell-for-cell):
 
-  * table-calc functions ``RUNNING_SUM`` -> ``RUNNINGSUM`` and ``RANK`` / ``RANK_DENSE`` ->
-    ``RANK(SKIP|DENSE, ORDERBY(x, DESC|ASC))`` (Tableau defaults: competition ties, descending);
+  * table-calc functions ``RUNNING_SUM`` -> ``RUNNINGSUM``, ``RANK`` / ``RANK_DENSE`` ->
+    ``RANK(SKIP|DENSE, ORDERBY(x, DESC|ASC))`` (Tableau defaults: competition ties, descending), and
+    ``TOTAL`` -> ``COLLAPSEALL(x, axis)`` (the partition total, re-evaluated at the axis's highest
+    level -- see the ``_TOTAL`` note on why this maps TOTAL only and never the WINDOW_* family);
   * the aggregates ``SUM`` / ``AVG`` / ``MIN`` / ``MAX`` / ``COUNT`` / ``COUNTD`` of a *single*
     column, each resolved by the caller to a base measure present in the visual;
   * ``+ - * /``, unary minus, numeric constants, and parentheses;
@@ -55,6 +57,18 @@ _RUNNING = {"RUNNING_SUM": "RUNNINGSUM"}
 # DENSE. RANK_MODIFIED / RANK_UNIQUE / RANK_PERCENTILE have no faithful native tie rule and fail
 # closed (same line the QTC path draws).
 _RANK = {"RANK": "SKIP", "RANK_DENSE": "DENSE"}
+# TOTAL(x) -> COLLAPSEALL(x, axis). Tableau's TOTAL "returns the total for the given expression in a
+# table calculation partition", and -- the load-bearing detail -- it RE-EVALUATES the aggregate over
+# the partition's underlying rows rather than aggregating the per-mark values. COLLAPSEALL is the
+# same operation on the view side: "retrieves a context at the highest level ... returns its value in
+# the new context" (its own doc example, `TotalValue = COLLAPSEALL([SalesAmount], ROWS)`, is exactly
+# Tableau's percent-of-total idiom `SUM([Sales]) / TOTAL(SUM([Sales]))`).
+#
+# Re-evaluation vs re-aggregation is what makes this faithful and is NOT interchangeable with the
+# WINDOW_* family: for a non-additive inner the two disagree (Tableau's `TOTAL(AVG([x]))` averages all
+# underlying rows, while `WINDOW_AVG(AVG([x]))` averages the per-mark averages). So COLLAPSEALL maps
+# TOTAL only -- never WINDOW_MAX/WINDOW_SUM, whose per-mark semantics it would silently break.
+_TOTAL = "TOTAL"
 # Aggregations the caller can resolve to a base measure. The set the deterministic measure engine
 # already treats as faithful column aggregates.
 _AGG = {"SUM", "AVG", "MIN", "MAX", "COUNT", "COUNTD", "MEDIAN", "STDEV", "STDEVP", "VAR", "VARP"}
@@ -244,6 +258,14 @@ class _Compiler:
                 direction = _RANK_DIR[dtok[1].lower()]
             self._expect_op(")")
             return f"RANK({_RANK[fn]}, ORDERBY({arg}, {direction}))"
+        if fn == _TOTAL:
+            # Tableau TOTAL takes exactly ONE argument (no direction) -- a trailing ',' trips the
+            # ')' check below and falls back, matching the model-layer seam's identical guard.
+            arg = self._single_column_arg(fn)
+            if self._peek() != ("op", ")"):
+                raise _CompileError(f"{fn} argument must be a single aggregate or field reference")
+            self._next()
+            return f"COLLAPSEALL({arg}, {self.axis})"
         raise _CompileError(f"unsupported function {fn_raw}")
 
     # -- SUM([field]) etc: the aggregate wraps exactly one column, resolved to a base measure --

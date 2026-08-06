@@ -12,6 +12,31 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.79.0` -> `2.80.0`): the formula-authored visual-calc compiler learns
+  Tableau `TOTAL` -> Power BI `COLLAPSEALL`.** `formula_table_calc_to_visual_calc`'s vocabulary was
+  `RUNNING_SUM` / `RANK` / `RANK_DENSE` only, so a calc written as `Total([x])` failed the whole chain
+  with *"unsupported function Total"* and the visual shipped **with the base value only** -- i.e. the
+  un-totalled number where the author intended the partition total. Tableau's `TOTAL` "returns the
+  total for the given expression in a table calculation partition", RE-EVALUATING the aggregate over
+  the partition's underlying rows; Power BI's `COLLAPSEALL` is the same operation on the view side
+  ("retrieves a context at the highest level ... returns its value in the new context"), and
+  Microsoft's own doc example -- `TotalValue = COLLAPSEALL([SalesAmount], ROWS)` -- is literally
+  Tableau's `SUM([Sales]) / TOTAL(SUM([Sales]))` percent-of-total idiom. The axis threads through, so
+  a COLUMNS-axis visual emits `COLLAPSEALL(x, COLUMNS)`, and a `Total([Some Calc])` argument records
+  the nested-VC dependency exactly as `RUNNING_SUM` already does.
+  **The mapping is deliberately confined to `TOTAL`.** Re-evaluation and per-mark aggregation coincide
+  for an additive inner but diverge otherwise (Tableau's `TOTAL(AVG([x]))` averages all underlying
+  rows; `WINDOW_AVG(AVG([x]))` averages the per-mark averages), so aliasing the `WINDOW_*` family onto
+  `COLLAPSEALL` would ship silently wrong numbers -- a test asserts the window family keeps failing
+  closed and never emits `COLLAPSEALL`. 10 tests; 4/5 mutants killed and the 5th reported honestly as
+  equivalent (removing the single-argument guard leaves the outer trailing-token check rejecting the
+  same inputs, differing only in message).
+  **Corpus effect today: none visible, stated plainly.** On `0088` the four `Total([...])` chains now
+  compile past `TOTAL` and fail one level deeper on their referenced calc -- conditional
+  `COUNTD(IF [x] = "..." THEN [id] END)` measures, which the view-layer subset rightly refuses. That
+  next blocker is now precisely located: `compile_chain._resolve_reference` classifies any name in
+  `calc_formulas` as a nested visual calculation BEFORE consulting `resolve_measure`, and the emitter
+  passes `resolve_measure=None`, so a reference to a plain model measure can never resolve as one.
 - **tableau-migration (skill `2.78.0` -> `2.79.0`): `WINDOW_*` bounds accept Tableau's `FIRST()`/`LAST()`
   partition anchors, not just integer literals.** Every `WINDOW_*` entry in the Tableau reference states
   the same contract -- *"The window is defined by means of offsets from the current row. Use `FIRST()+n`
