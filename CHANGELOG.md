@@ -12,6 +12,30 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.80.0` -> `2.81.0`): new `scripts/reference_images.py` -- one seam that
+  acquires the TABLEAU reference image for every dashboard, whatever the user has.** The rebuilt report
+  is visually checked against an image of the original dashboard; producing that image had working code
+  (`fidelity_reference.py`) that **the runbook never called**, so in practice no run acquired one. This
+  is the single entry point: `--mode export` (a Print-to-PDF, a **PowerPoint** export, or a folder of
+  PNGs), `--mode rest` (server-rendered, delegating to `fidelity_reference`), `--mode drop`
+  (hand-placed files) and `--mode skip`. Output is `<run>/out/reference_images/` + a `manifest.json`.
+  **The join key is the EXACT Tableau dashboard name, never a filename** -- three incompatible
+  sanitizers are in play (this module's, `fidelity_reference.safe_filename`'s lower-cased one, and the
+  PBIR emitter's hashed slug) and none derives from another, so a consumer that re-derives a filename
+  silently mismatches while one joining on `images[n].dashboard` against the report page's
+  `displayName` does not (verified equal on corpus `0088`).
+  **The PowerPoint route needs no guesswork:** Tableau records the sheet name on the picture shape
+  itself (`<p:cNvPr descr='Dashboard 1'>`) with the image in the slide's relationships, measured 13/13
+  on a real export -- so it is labelled `named`, a *higher* confidence than the PDF route's inferred
+  `content`. (The rels quote with SINGLE quotes; assuming double yields a silently empty mapping, and a
+  test pins both.) The PDF route reuses the vendored `scripts/capture/extract_dashboards.py` as a
+  **subprocess**, keeping this module stdlib-only and importable on a machine with no image libraries.
+  **Non-negotiable invariant, enforced by tests: this NEVER blocks a migration.** `main` returns **0
+  whenever it ran** -- coverage lives in the manifest, never the exit code, so no caller can gate a run
+  on it by accident; `skip` and total failure still write a manifest so "no images" is an explicit
+  queryable state; a partial result is recorded as acquired + missing rather than an error; and no
+  failure path raises. 24 tests, 7/7 mutants killed -- including a CLI that returns non-zero on missing
+  images, i.e. exactly the freeze this invariant exists to prevent. Corpus 29/29, byte-unaffected.
 - **tableau-migration (skill `2.79.0` -> `2.80.0`): the formula-authored visual-calc compiler learns
   Tableau `TOTAL` -> Power BI `COLLAPSEALL`.** `formula_table_calc_to_visual_calc`'s vocabulary was
   `RUNNING_SUM` / `RANK` / `RANK_DENSE` only, so a calc written as `Total([x])` failed the whole chain
