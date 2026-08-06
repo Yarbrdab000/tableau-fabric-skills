@@ -12,6 +12,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.76.0` -> `2.77.0`): new `scripts/estate_survey.py` -- published-datasource
+  dependency graph resolved from REST ground truth, so estate sizing stops lying (#98).** Sizing an estate
+  from the Metadata API's `embeddedDatasources` (the natural one-call way) scores every workbook backed by
+  a PUBLISHED datasource as trivially simple, because its calculated fields live in that datasource and
+  only a `sqlproxy` stub travels with the workbook -- so the hardest workbooks look like the easiest.
+  Measured on a live site: `0 of 13` dependencies reported where REST `/workbooks/{id}/connections`
+  (`type: sqlproxy`) shows `9 of 13`. The new read-only survey emits, per workbook, its published
+  dependencies and a `complexity_understated` flag; a `fetch_order` placing every required datasource
+  ahead of the workbooks that need it (a `sqlproxy` edge is a hard predecessor, the same rule STEP 1.5
+  enforces later); and `unresolved_dependencies`. It **exits non-zero** while any dependency is
+  unresolved. Dependencies join **by name, never by the connection's `datasource.id`** -- that id is not
+  the datasource's site LUID, so an id-join matches nothing and reads as "no dependencies", failing in the
+  same silent direction as the sizing gap; the id is recorded but never used. A name matching several
+  projects is reported `ambiguous` and resolved to nothing rather than guessed. Both observed connection
+  serialisations are read (nested `type`/`datasource{}`, and flat `connectionType`/`datasourceName`), and
+  listing is fully paginated so a >100-item site is not silently truncated. The offline core
+  (`build_survey` / `resolve_dependency` / `fetch_order`) takes plain payloads and `survey_site(call,
+  site_id)` takes an injected transport, so the whole survey is unit-testable with no Tableau server.
+  Wired into the runbook as **STEP 0.5** (live estate scope only) plus two `troubleshooting.md` rows.
+  20 tests, 6/6 mutants killed. Additive: no existing behaviour or report key changes.
 - **tableau-migration (skill `2.75.0` -> `2.76.0`):** resolved the contradictory `inconclusive`
   reconciliation policy documented in two places (#94). Behaviour is unchanged and was already
   correct -- `reconciliation_oracle` is a **veto on proven divergence**, so `pass` and `inconclusive`

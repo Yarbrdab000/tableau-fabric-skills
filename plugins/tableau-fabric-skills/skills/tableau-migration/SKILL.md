@@ -231,6 +231,40 @@ PowerShell (Windows lead). Run every command from `$RUN` (pinned in Phase 0B); c
 `"$SKILL\scripts\…"`. Starting a fresh shell? Re-run `Set-Location $RUN ; . .\migration.vars.local.ps1`
 first.
 
+**STEP 0.5 (D1=A live, estate scope only) — survey the site before you size or order anything**
+
+Skip this for D1=B (local files) and for a single named asset. When the scope is "an estate" — several
+workbooks, or "all" — run the read-only survey **first**. It downloads nothing:
+
+```powershell
+py -3.11 "$SKILL\scripts\estate_survey.py" --server $SITE_URL --site $SITE_NAME `
+  --auth pat --pat-name $PAT_NAME --json .\out\survey.json
+```
+
+> **⛔ Never size a Tableau estate from workbook-local fields.** A workbook bound to a **published**
+> datasource keeps its calculated fields in that *datasource* — only a `sqlproxy` stub travels with
+> the workbook. So the Metadata API's `embeddedDatasources` (the natural one-call way to size an
+> estate) scores exactly the **hardest** workbooks as the **easiest**: measured on a live site, it
+> reported **0 of 13** published-datasource dependencies where REST showed **9 of 13**. Any workbook
+> the survey marks `complexity_understated` cannot be sized until its datasource is in scope.
+
+The survey answers three planning questions from REST ground truth, and **exits non-zero** while any
+dependency is unresolved:
+
+- **`fetch_order`** — every required published datasource **before** the workbooks that need it. A
+  `sqlproxy` edge is a hard predecessor, not a preference (STEP 1.5 enforces the same rule later).
+- **`unresolved_dependencies`** — a name that matches **several** datasources across projects is
+  reported `ambiguous` and resolved to nothing; pick the project yourself. One that matches none is
+  `not_found`. Neither is ever guessed.
+- **`complexity_understated`** — per workbook, whether a size estimate built on its own fields lies.
+
+> **Join published-datasource dependencies by NAME, never by the connection's `datasource.id`.** That
+> id is *not* the datasource's site LUID; joining on it matches nothing and reads as "no
+> dependencies" — failing in the same silent, safe-looking direction as the sizing gap above. The
+> survey records the id but never joins on it.
+
+Feed `fetch_order` straight into STEP 1.
+
 **STEP 1 — assemble `.\in`: get every scoped name into the folder (one `fetch_tds.py` call each)**
 
 Every name in D2 scope — datasource **or** workbook — is fetched the same way, always with
@@ -548,6 +582,7 @@ The pure-Python cores are offline, deterministic, and stdlib-only (no Spark / pa
 | [`scripts/connection_to_m.py`](scripts/connection_to_m.py) | Parse Tableau `.tds`/`.twb` → descriptor (`parse_tds(text, select=None)`); **`extract_calcs`** (calculated fields → `calcs=`); **`workbook_datasources`** (list selectable datasources, skipping `Parameters` + worksheet stubs); emit M partitions + bind details (`connection_details_for_bind`); M-path field resolver. |
 | [`scripts/assemble_model.py`](scripts/assemble_model.py) | Tier-1 orchestrator: `.tds`/`.twb` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`), base64 deploy payload. **One-call `migrate_datasource(.tdsx/.tds/.twbx/.twb/text, datasource=None)` → `{parts, report, bind}`** (auto-extracts calcs; `datasource=` selects from a multi-datasource workbook; a genuine fallback returns `parts={}` + `report["landing_plan"]` via `directlake_landing_plan`); `list_workbook_datasources`, `write_model_folder` / **`write_local_pbip`** for local output. |
 | [`scripts/migrate_estate.py`](scripts/migrate_estate.py) | **Estate + workbook orchestrator.** `migrate_estate(source, out)` migrates a whole folder / site (every datasource + workbook) in one run. **`--scan`** is a read-only pre-build gate: it writes `<out>/scan.json` naming each workbook's published datasource and whether it's in scope, and **exits non-zero** while any is missing (run it before building so a published-backed workbook is never rebuilt to an empty report — see STEP 1.5). **`migrate_workbook(source, write_to=…, name=None)`** is the single-workbook primitive the estate loops: it rebuilds the workbook's embedded datasource(s) into one semantic model **and** the workbook's report bound to it — an openable `pbip/<Name>/` (plus a bare `reports/<Name>.Report`); a multi-datasource workbook consolidates every embedded datasource into one model (disconnected table islands, each bound to its own connection) with a single report bound to it. Reach for it (over `migrate_datasource`) whenever the input is a **workbook** and you want the **report**, not just a datasource model. |
+| [`scripts/estate_survey.py`](scripts/estate_survey.py) | **Estate planning surface (read-only, pre-fetch).** Surveys a live site's **published-datasource dependency graph from REST ground truth** (`/workbooks/{id}/connections` → `type: sqlproxy`), because sizing an estate from the Metadata API's `embeddedDatasources` scores published-backed workbooks as trivially simple — their calcs live in the *datasource*, and only a `sqlproxy` stub travels with the workbook (measured: 0 of 13 dependencies reported where REST shows 9 of 13). Emits `fetch_order` (every required datasource before the workbooks needing it), per-workbook `complexity_understated`, and `unresolved_dependencies`; **exits non-zero** while any is unresolved. Joins **by name, never by the connection's `datasource.id`** (that id is not the site LUID — an id-join matches nothing and reads as "no dependencies"); a name matching several projects is reported `ambiguous`, never guessed. Fully paginated. The offline core (`build_survey` / `resolve_dependency` / `fetch_order`) takes plain payloads and `survey_site(call, site_id)` takes an injected transport, so all of it is testable without a server. |
 | [`scripts/deploy_to_fabric.py`](scripts/deploy_to_fabric.py) | Self-contained Fabric REST deploy (stdlib-only urllib): createOrUpdate / updateDefinition of the SemanticModel, 202 LRO polling, optional refresh + gateway bind. **Also deploys the workbook's REPORT** as a Fabric `reports` item — `deploy_pbip` / `deploy_report` + the fail-closed `rebind_report_byConnection` (rewrites `definition.pbir` to a **`byConnection`** `semanticmodelid=<id>` reference, required for REST deploy) via `--pbip` / `--report-dir`. Importable `acquire_token` (handles `az` on Windows) + `refresh_dataset` / **`recalc_dataset`** (a default, credential-free `type: Calculate` ProcessRecalc that processes the Import calc tables so a composite model opens without benign warning triangles; `--no-recalc` to skip) for post-deploy ops. Lets the skill finish **in Fabric** without depending on a peer skill. |
 | [`scripts/remediation_worklist.py`](scripts/remediation_worklist.py) | **Assisted tier (opt-in), producer.** Folds the engine's `warnings` + `candidate_records` into ONE structured, machine-readable, per-visual **remediation worklist** that covers the ENTIRE dashboard (every rebuilt visual, `ok` or `needs_attention`), is a **superset of the warnings**, and tags each item with a deterministic category + severity + remediation hint. Emitted additively as the `worklist` key on `migrate_twb_to_pbir(...)` and via the `--worklist PATH` CLI sidecar. Read-only — never touches the emitted PBIR. |
 | [`scripts/monotonic_gate.py`](scripts/monotonic_gate.py) | **Assisted tier (opt-in), safety net.** A deterministic selector that scores a deterministic-baseline visual and an assisted-candidate visual on the SAME axes — **structural** (reuses `fidelity_oracle`: type/fields/roles/position) + **feature** (continuous colour-fill richness, per-point colour, data labels, legend, title, read off the emitted objects) — and keeps the assisted visual ONLY when it regresses no scored component; otherwise reverts to the deterministic object by identity. Makes opting into the assisted tier **provably ≥ the deterministic tier, per visual**. Pure `decide()` core + batch `gate_changes()` + `verify_monotonic()`. |
