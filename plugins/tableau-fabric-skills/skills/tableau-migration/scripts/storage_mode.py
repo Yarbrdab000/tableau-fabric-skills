@@ -142,6 +142,12 @@ FLAT_FILE_CLASSES = {
     "excel": "Excel.Workbook",
     "textscan": "Csv.Document",
     "csv": "Csv.Document",
+    # Microsoft Access is a FILE database, not a server: Tableau records it exactly like Excel/CSV
+    # (a `<connection class='msaccess' filename='...mdb'>` with plain table relations, and the file
+    # bundled inside the .twbx), and Power Query reaches it the same way -- Access.Database over
+    # File.Contents. It belongs here rather than in DIRECT_CONNECTORS, which are (server, database)
+    # style. Its NAVIGATION differs from a sheet's, so `emit_flatfile_source` branches on it.
+    "msaccess": "Access.Database",
 }
 
 # Generic ODBC. Unlike the DIRECT_CONNECTORS, an ODBC source has no fixed connector function:

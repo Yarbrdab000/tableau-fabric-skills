@@ -2500,30 +2500,45 @@ _M_TYPE = {
 }
 
 
+def _unquote_tableau_identifier(raw):
+    """Strip Tableau's ``[...]`` brackets and, inside them, its identifier QUOTING.
+
+    A name containing a space (or other special) is quoted inside the brackets --
+    ``['Master Date List$']`` -- with any inner quote doubled, exactly like a quoted SQL identifier.
+    Stripping only the brackets leaves the quotes embedded in the name, which then matches no sheet
+    / no table and yields a partition that opens and loads ZERO rows without erroring.
+
+    Fail-closed: the unquote fires only when the FIRST and LAST characters are the SAME quote
+    character and something remains between them, so an unquoted name and a name that merely
+    contains an apostrophe (``John's Data``) are both left untouched.
+    """
+    s = _strip_brackets(raw or "").strip()
+    for q in ("'", '"'):
+        if len(s) > 2 and s[0] == q and s[-1] == q:
+            return s[1:-1].replace(q + q, q)
+    return s
+
+
 def _excel_sheet_name(relation):
     """The Excel sheet name to navigate for a relation (``[Orders$]`` -> ``Orders``).
 
     Tableau exposes a worksheet as ``[<sheet>$]`` (the ODBC sheet convention); Power Query's
-    ``Excel.Workbook`` navigation keys the sheet by its bare name with ``Kind="Sheet"``.
-
-    A sheet whose name contains a SPACE (or other special) is additionally QUOTED inside those
-    brackets -- ``['Master Date List$']`` -- with any inner quote doubled, exactly like a quoted SQL
-    identifier. Stripping only the brackets leaves ``'Master Date List$'``, and the emitted
-    ``Item="'Master Date List$'"`` matches no sheet in the workbook, so the partition opens and loads
-    ZERO rows without erroring -- silently wrong. Verified on a real workbook whose sheets are
-    ``Orders`` / ``Master Date List`` / ``Sheet1``.
-
-    The unquote is fail-closed: it fires only when the FIRST and LAST characters are the SAME quote
-    character and something remains between them, so an unquoted name (``Orders$``) and a name that
-    merely contains an apostrophe (``John's Data$``) are both left untouched.
+    ``Excel.Workbook`` navigation keys the sheet by its bare name with ``Kind="Sheet"``. The
+    trailing ``$`` strip is Excel-specific and deliberately not shared with other file connectors.
     """
-    raw = relation.get("raw_table") or relation.get("item") or relation.get("name") or ""
-    s = _strip_brackets(raw).strip()
-    for q in ("'", '"'):
-        if len(s) > 2 and s[0] == q and s[-1] == q:
-            s = s[1:-1].replace(q + q, q)
-            break
+    s = _unquote_tableau_identifier(
+        relation.get("raw_table") or relation.get("item") or relation.get("name") or "")
     return s[:-1] if s.endswith("$") else s
+
+
+def _access_table_name(relation):
+    """The Access table name to navigate for a relation (``[factTable]`` -> ``factTable``).
+
+    Unlike a sheet there is no ``$`` suffix convention, so the name is used as written (minus
+    Tableau's brackets/quoting) -- an Access table may legitimately end in ``$``.
+    """
+    return _unquote_tableau_identifier(
+        relation.get("raw_table") or relation.get("item") or relation.get("name") or "")
 
 
 def _flatfile_path_for(conn):
@@ -2917,12 +2932,28 @@ def emit_flatfile_source(relation, conn, cls):
         steps.append(f'Source = Excel.Workbook({contents}, null, true)')
         steps.append(f'Navigation = Source{{[Item="{sheet}", Kind="Sheet"]}}[Data]')
         steps.append("Promoted = Table.PromoteHeaders(Navigation, [PromoteAllScalars=true])")
+        prev = "Promoted"
+    elif connector == "Access.Database":
+        # Access.Database(database as binary, optional options) -- doc-verified signature. The
+        # `options` record is deliberately OMITTED: its only relevant member,
+        # `CreateNavigationProperties`, defaults to false, and setting it true (what the Power BI
+        # UI generates) grafts relationship-navigation COLUMNS onto the returned table -- columns
+        # the TMDL never declares, so the partition would no longer match the model.
+        #
+        # An Access table is keyed `[Schema="", Item="<table>"]` -- Access has no schema concept, so
+        # the schema is the empty string, NOT absent. There is also NO Table.PromoteHeaders step:
+        # unlike a sheet or a CSV, Access returns a real table whose column names are already its
+        # own; promoting would consume the first data ROW as the header.
+        table = escape_m_string(_access_table_name(relation))
+        steps.append(f'Source = Access.Database({contents})')
+        steps.append(f'Navigation = Source{{[Schema="", Item="{table}"]}}[Data]')
+        prev = "Navigation"
     else:  # Csv.Document
         steps.append(
             f'Source = Csv.Document({contents}, '
             '[Delimiter=",", Encoding=1252, QuoteStyle=QuoteStyle.Csv])')
         steps.append("Promoted = Table.PromoteHeaders(Source, [PromoteAllScalars=true])")
-    prev = "Promoted"
+        prev = "Promoted"
 
     # Type by the RAW promoted header (the Tableau remote name) and STOP there: the query output
     # keeps the raw header names, and each TMDL column binds to that raw name via its sourceColumn.

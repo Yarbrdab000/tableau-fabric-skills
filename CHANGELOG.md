@@ -12,6 +12,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.71.0` -> `2.72.0`): Microsoft Access rebuilds as an
+  `Access.Database` file partition -- the deterministic corpus now reaches 29/29 openable outputs.**
+  Access is a FILE database, not a server: Tableau records it exactly like Excel/CSV (a
+  `<connection class='msaccess' filename='...mdb'>` with plain table relations, the `.mdb` bundled
+  inside the `.twbx`), and Power Query reaches it the same way. Left unmapped, `msaccess` was
+  declined as "connector class not mapped for direct M" and the whole workbook produced no output --
+  the LAST such workbook in the corpus. `msaccess` now joins `FLAT_FILE_CLASSES` as
+  `Access.Database`, so routing, bundled-file landing and per-relation connection attribution all
+  apply unchanged. The M shape is doc-verified: navigation is keyed `[Schema="", Item="<table>"]`
+  (Access has no schema concept, so the schema is the EMPTY STRING, not absent); there is **no**
+  `Table.PromoteHeaders` step, because unlike a sheet or a CSV an Access table already carries its
+  own column names and promoting would consume the first DATA ROW as the header; and the `options`
+  record is omitted, because `CreateNavigationProperties=true` (what the Power BI UI generates)
+  grafts relationship-navigation COLUMNS onto the returned table that the TMDL never declares.
+  Identifier unquoting is now shared with the Excel path via `_unquote_tableau_identifier`, but the
+  trailing-`$` strip stays Excel-only -- an Access table may legitimately end in `$`. Verified by
+  rendering `0067_global_filter` in Power BI Desktop: full model refresh succeeds and BOTH islands
+  plot real data (Superstore from Excel, Coffee Chain from the Access `.mdb`).
+
 - **tableau-migration (skill `2.70.0` -> `2.71.0`): FCP-prefixed connection attributes are read
   against the document-format manifest (issue #92).** While a Tableau document-format feature is in
   transition, Tableau writes a connection attribute under BOTH spellings in the SAME element -- and
