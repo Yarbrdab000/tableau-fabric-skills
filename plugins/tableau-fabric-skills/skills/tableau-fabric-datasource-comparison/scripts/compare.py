@@ -23,6 +23,7 @@ from __future__ import annotations
 import difflib
 import math
 import re
+import unicodedata
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # --------------------------------------------------------------------------------------
@@ -139,7 +140,11 @@ def canonical_connector(value: Optional[str]) -> str:
 # --------------------------------------------------------------------------------------
 # Normalisation helpers
 # --------------------------------------------------------------------------------------
-_TOKEN_SPLIT = re.compile(r"[^a-z0-9]+")
+# Token splitting is Unicode-aware: ``\W`` under Python's default str semantics keeps letters and
+# digits of EVERY script, so a CJK / Cyrillic / Greek / Arabic name survives as a real token instead
+# of folding to the empty string. ``_`` is excluded explicitly (``\w`` includes it) to preserve the
+# long-standing behaviour of treating ``net_bookings`` as two tokens.
+_TOKEN_SPLIT = re.compile(r"[\W_]+", re.UNICODE)
 # Noise tokens that shouldn't drive a name match on their own.
 _NAME_STOPWORDS = {
     "the", "a", "an", "of", "and",
@@ -149,18 +154,47 @@ _NAME_STOPWORDS = {
 }
 
 
+def _fold(value: str) -> str:
+    """Case- and diacritic-fold a string, keeping letters/digits of every script.
+
+    ``NFKD`` decomposes compatibility forms (fullwidth ``Ａ`` -> ``A``) and splits a base character
+    from its diacritics; dropping the nonspacing marks (category ``Mn``) makes ``Café`` and ``Cafe``
+    the same token. ``NFC`` then recomposes -- necessary because NFKD also decomposes Hangul
+    syllables into jamo, and we want ``한`` back, not three letters. ``casefold`` beats ``lower`` for
+    non-ASCII (``ß`` -> ``ss``, Greek final sigma -> ``σ``).
+
+    Pure-ASCII input is unaffected at every step, so existing scores are unchanged.
+    """
+    decomposed = unicodedata.normalize("NFKD", value)
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return unicodedata.normalize("NFC", stripped).casefold()
+
+
 def normalize_token(value: Optional[str]) -> str:
-    """Lower-case and strip every non-alphanumeric character (``[Sales Amount]`` -> ``salesamount``)."""
+    """Case/diacritic-fold and strip every non-alphanumeric character (``[Sales Amount]`` -> ``salesamount``).
+
+    Alphanumeric is judged per Unicode, not ASCII: a name written only in a non-Latin script (``売上``,
+    ``Продажи``) keeps its characters instead of normalising to ``""``. That empty form was why two
+    *identical* non-ASCII names scored 0.0 -- the exact-match short-circuit in :func:`name_similarity`
+    requires a non-empty normalised form, so an international estate leaned entirely on column and
+    source overlap and under-counted "already exists".
+    """
     if value is None:
         return ""
-    return _TOKEN_SPLIT.sub("", str(value).lower())
+    return "".join(ch for ch in _fold(str(value)) if ch.isalnum())
 
 
 def tokenize_name(value: Optional[str]) -> set:
-    """Split a display name into a set of meaningful lower-case tokens (stopwords removed)."""
+    """Split a display name into a set of meaningful folded tokens (stopwords removed).
+
+    Unicode-aware, so a Cyrillic or Greek multi-word name tokenises normally. Scripts written without
+    spaces (Chinese, Japanese) yield ONE token per run of characters -- correct for an exact match,
+    and deliberately not "solved" further: real word segmentation for those scripts is a dictionary
+    problem, not a regex one, and guessing boundaries would manufacture false partial matches.
+    """
     if not value:
         return set()
-    toks = {t for t in _TOKEN_SPLIT.split(str(value).lower()) if t}
+    toks = {t for t in _TOKEN_SPLIT.split(_fold(str(value))) if t}
     meaningful = {t for t in toks if t not in _NAME_STOPWORDS}
     return meaningful or toks  # never return empty if the name was all-stopwords
 

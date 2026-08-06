@@ -12,6 +12,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-fabric-datasource-comparison (skill `1.8.0` -> `1.9.0`): Unicode-aware name matching --
+  non-ASCII names no longer contribute 0 to the name signal (#5).** `normalize_token` folded on
+  `[^a-z0-9]+`, stripping ALL non-ASCII, so a name written only in a non-Latin script normalised to
+  `""`. Because `name_similarity`'s exact-match short-circuit requires a non-empty normalised form
+  (`na and na == nb`), two **identical** CJK / Cyrillic / Greek / Arabic / Hebrew / Thai names scored
+  **0.0** and a name-only match failed outright -- so an international estate leaned entirely on column
+  and source overlap, under-counting "already exists" and inflating "needs rebuild", the opposite of the
+  skill's purpose. Normalisation is now NFKD-decompose -> drop combining marks -> NFC-recompose ->
+  `casefold` -> keep Unicode alphanumerics. Each step earns its place: dropping combining marks folds
+  diacritics (`Café` == `Cafe`, which previously normalised to `caf` -- neither name); the NFC
+  recomposition is required because NFKD also shatters Hangul syllables into jamo; `casefold` beats
+  `lower` for non-ASCII (`Straße` == `Strasse`); and NFKD folds fullwidth forms (`Ｓａｌｅｓ` == `Sales`).
+  Tokenisation splits on `[\W_]+` under Unicode semantics, keeping the long-standing treatment of `_`
+  as a separator. Scripts written without spaces yield one token per run -- correct for an exact match,
+  and deliberately not "solved" further, since word segmentation there is a dictionary problem and
+  guessing boundaries would manufacture false partial matches. **ASCII scoring is provably unchanged:**
+  a randomised differential against the pre-fix implementation over 20,007 printable-ASCII names found
+  0 differences in both `normalize_token` and `tokenize_name`. Punctuation-only and emoji-only names
+  still normalise to `""` and still do not match, so no name is matchable that was not before on merit.
+  22 new tests (405 -> 428), 6/6 mutants killed. Additive: no report key changes.
 - **tableau-migration (skill `2.77.0` -> `2.78.0`): new `scripts/fabric_oracle.py` -- the `fabric_oracle`
   seam, so the Tier-1 empirical loop is finally REACHABLE (#96).** `translation_reconcile` is the offline
   half of the second compiler's numeric proof and deliberately executes nothing; the executing half is an
