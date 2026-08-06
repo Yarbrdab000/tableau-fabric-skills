@@ -183,7 +183,7 @@ def test_every_failure_mode_still_returns_a_manifest_and_never_raises(tmp_path):
         dict(mode="export", source=str(tmp_path)),                   # empty folder
         dict(mode="export", source=str(tmp_path / "x.bin")),         # unsupported type
         dict(mode="drop", source=str(tmp_path / "absent")),          # nothing dropped
-        dict(mode="capture"),                                        # route not installed yet
+        dict(mode="capture", capture_runner=lambda *a: (1, "", "no tableau here")),
         dict(mode="nonsense"),                                       # unknown mode
     ]
     for kw in cases:
@@ -199,7 +199,9 @@ def test_cli_always_exits_zero_even_when_nothing_was_acquired(tmp_path):
     for argv in (["--mode", "skip", "--workbook", wb, "--out", str(tmp_path / "a")],
                  ["--mode", "export", "--workbook", wb, "--source", str(tmp_path / "nope.pdf"),
                   "--out", str(tmp_path / "b")],
-                 ["--mode", "capture", "--workbook", wb, "--out", str(tmp_path / "c")]):
+                 # a nonexistent workbook makes preflight BLOCK, so no UI is ever driven
+                 ["--mode", "capture", "--workbook", str(tmp_path / "gone.twbx"),
+                  "--out", str(tmp_path / "c")]):
         assert R.main(argv) == 0, argv
 
 
@@ -262,3 +264,140 @@ def test_weak_matches_are_surfaced_for_human_verification(tmp_path):
         runner=_fake_pdf_run(str(out), "content (WEAK margin - verify)"))
     m = R.build_manifest("export", "wb", ["Dashboard 1"], imgs)
     assert "VERIFY" in R.format_manifest(m)
+
+
+# --- (h) the capture route: preflight, bounded, and sharing Stage 2 --------------------------------
+# All driven through injected runners: the real route needs Tableau Desktop, which no CI has.
+def _ok_preflight(exe="C:\\Tableau\\tableau.exe"):
+    return {"ok": True, "blockers": [], "warnings": [], "tableau_exe": exe}
+
+
+def _stage1(pdf_path, code=0, extra_stdout=""):
+    """Fake Stage 1: writes a PDF and prints its path, exactly like PrintPdfWorker.ps1."""
+    seen = {}
+
+    def run(cmd, timeout):
+        seen["cmd"], seen["timeout"] = cmd, timeout
+        os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
+        with open(pdf_path, "wb") as fh:
+            fh.write(b"%PDF-1.4\n%%EOF\n")
+        return code, extra_stdout + str(pdf_path) + "\n", ""
+    return run, seen
+
+
+def test_capture_runs_stage1_then_shares_stage2_with_the_manual_pdf_route(tmp_path):
+    out = tmp_path / "ref"
+    pdf = out / "_pdf" / "Book_001.pdf"
+    s1, seen = _stage1(str(pdf))
+    imgs, warns = R._capture(str(tmp_path / "Book.twbx"), str(out), runner=s1,
+                             pdf_runner=_fake_pdf_run(str(out), "content"),
+                             preflight=_ok_preflight())
+    assert [i["dashboard"] for i in imgs] == ["Dashboard 1"]
+    assert imgs[0]["confidence"] == R.CONF_CONTENT      # Stage 2 labelled it, same as a manual PDF
+    assert warns == []
+
+
+def test_capture_invokes_powershell_51_with_STA_and_an_explicit_tableau_path(tmp_path):
+    """-STA is required for UI Automation, and the worker's own default Tableau path is HARD-CODED
+    to one version -- so the detected exe must be passed explicitly or another version launches
+    nothing."""
+    out = tmp_path / "ref"
+    s1, seen = _stage1(str(out / "_pdf" / "B.pdf"))
+    R._capture(str(tmp_path / "B.twbx"), str(out), runner=s1,
+               pdf_runner=_fake_pdf_run(str(out), "content"), preflight=_ok_preflight("C:\\T\\t.exe"))
+    cmd = seen["cmd"]
+    assert cmd[0] == "powershell.exe"          # NOT pwsh: the worker needs Windows PowerShell 5.1
+    assert "-STA" in cmd
+    assert "-TableauExe" in cmd and "C:\\T\\t.exe" in cmd
+
+
+def test_capture_is_bounded_by_a_wall_clock(tmp_path):
+    out = tmp_path / "ref"
+    s1, seen = _stage1(str(out / "_pdf" / "B.pdf"))
+    R._capture(str(tmp_path / "B.twbx"), str(out), timeout=42, runner=s1,
+               pdf_runner=_fake_pdf_run(str(out), "content"), preflight=_ok_preflight())
+    assert seen["timeout"] == 42
+
+
+def test_a_hung_or_timed_out_capture_degrades_instead_of_raising(tmp_path):
+    def boom(_cmd, _timeout):
+        raise subprocess.TimeoutExpired(cmd="powershell.exe", timeout=1)
+
+    imgs, warns = R._capture(str(tmp_path / "B.twbx"), str(tmp_path / "o"), runner=boom,
+                             preflight=_ok_preflight())
+    assert imgs == [] and warns and "did not complete" in warns[0]
+
+
+def test_a_failed_stage1_is_a_warning_not_an_exception(tmp_path):
+    def failed(_cmd, _timeout):
+        return 1, "", "Tableau never opened"
+
+    imgs, warns = R._capture(str(tmp_path / "B.twbx"), str(tmp_path / "o"), runner=failed,
+                             preflight=_ok_preflight())
+    assert imgs == [] and any("capture failed" in w for w in warns)
+
+
+def test_stage1_that_prints_no_pdf_path_is_caught(tmp_path):
+    def chatty(_cmd, _timeout):
+        return 0, "everything is fine\n", ""
+
+    imgs, warns = R._capture(str(tmp_path / "B.twbx"), str(tmp_path / "o"), runner=chatty,
+                             preflight=_ok_preflight())
+    assert imgs == [] and warns
+
+
+def test_blocked_preflight_short_circuits_and_never_launches_anything(tmp_path):
+    def never(_cmd, _timeout):
+        raise AssertionError("Stage 1 must not run when preflight is blocked")
+
+    imgs, warns = R._capture(str(tmp_path / "B.twbx"), str(tmp_path / "o"), runner=never,
+                             preflight={"ok": False, "blockers": ["Tableau Desktop was not found"],
+                                        "warnings": [], "tableau_exe": None})
+    assert imgs == []
+    assert any("not found" in w for w in warns)
+
+
+def test_preflight_reports_blockers_without_raising(tmp_path):
+    pre = R.capture_preflight(str(tmp_path / "absent.twbx"))
+    assert set(pre) == {"ok", "blockers", "warnings", "tableau_exe"}
+    assert isinstance(pre["ok"], bool)
+    assert any("workbook not found" in b for b in pre["blockers"])
+
+
+def test_capture_mode_still_exits_zero_when_the_route_is_unavailable(tmp_path):
+    """The whole point of the invariant: no Tableau must not stall a migration."""
+    wb = _twbx(tmp_path)
+    m = R.acquire("capture", workbook=wb, outdir=str(tmp_path / "o"),
+                  capture_runner=lambda *a: (1, "", "no tableau"))
+    assert m["schema"] == R.SCHEMA_VERSION
+    assert m["missing"] == ["Dashboard 1"]
+    # NOTE: a REAL workbook here would drive real Tableau UI. Tests must never do that,
+    # so this asserts the CLI path with a workbook preflight rejects.
+    assert R.main(["--mode", "capture", "--workbook", str(tmp_path / "gone.twbx"),
+                   "--out", str(tmp_path / "p")]) == 0
+
+
+def test_preflight_cli_changes_nothing_and_exits_zero(tmp_path):
+    assert R.main(["--mode", "capture", "--preflight",
+                   "--workbook", str(tmp_path / "x.twbx")]) == 0
+    assert not (tmp_path / "manifest.json").exists()
+
+def test_a_nonzero_stage1_is_rejected_even_when_it_left_a_pdf_behind(tmp_path):
+    """The worker can fail LATE, after writing a truncated PDF. Exit code is authoritative:
+    trusting the file's mere existence would ship a partial export as a reference image."""
+    out = tmp_path / "ref"
+    pdf = out / "_pdf" / "Book_001.pdf"
+
+    def failed_but_wrote(_cmd, _timeout):
+        os.makedirs(os.path.dirname(pdf), exist_ok=True)
+        with open(pdf, "wb") as fh:
+            fh.write(b"%PDF-1.4\ntruncated, no EOF")
+        return 1, str(pdf) + "\n", "export aborted"
+
+    def never(_cmd, _timeout):
+        raise AssertionError("Stage 2 must not run on a failed Stage 1")
+
+    imgs, warns = R._capture(str(tmp_path / "B.twbx"), str(out), runner=failed_but_wrote,
+                             pdf_runner=never, preflight=_ok_preflight())
+    assert imgs == []
+    assert any("capture failed" in w for w in warns)

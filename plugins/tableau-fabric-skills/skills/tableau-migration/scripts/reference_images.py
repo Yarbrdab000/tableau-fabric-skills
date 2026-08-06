@@ -329,6 +329,127 @@ def _run(cmd, timeout):  # pragma: no cover -- exercised through an injected run
 
 
 # =====================================================================================
+# Route: drive Tableau Desktop on this machine (Stage 1 -> the shared Stage 2 above)
+# =====================================================================================
+_TABLEAU_GLOBS = (
+    r"C:\Program Files\Tableau\Tableau *\bin\tableau.exe",
+    r"C:\Program Files (x86)\Tableau\Tableau *\bin\tableau.exe",
+)
+
+
+def find_tableau_exe():
+    """Newest installed Tableau Desktop, or ``None``.
+
+    Detected rather than assumed: the vendored worker defaults to a HARD-CODED
+    ``Tableau 2026.2`` path, so on any other version it would launch nothing and fail obscurely.
+    Sorting descending puts the newest install first.
+    """
+    import glob
+    found = []
+    for pattern in _TABLEAU_GLOBS:
+        found.extend(glob.glob(pattern))
+    found.sort(reverse=True)
+    return found[0] if found else None
+
+
+def _worker_path():
+    here = os.path.dirname(os.path.abspath(__file__))
+    cand = os.path.join(here, "capture", "PrintPdfWorker.ps1")
+    return cand if os.path.isfile(cand) else None
+
+
+def _running_tableau_pids():
+    """PIDs of any Tableau already running. Never raises -> ``[]`` when it cannot tell."""
+    try:
+        import ctypes
+        if not hasattr(ctypes, "windll"):
+            return []
+    except Exception:
+        return []
+    try:
+        proc = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq tableau.exe", "/NH", "/FO", "CSV"],
+            capture_output=True, text=True, timeout=20)
+        return [ln.split(",")[1].strip('" ') for ln in (proc.stdout or "").splitlines()
+                if ln.lower().startswith('"tableau.exe"')]
+    except Exception:
+        return []
+
+
+def capture_preflight(workbook=None):
+    """Can the capture route run here? -> ``{"ok", "blockers", "warnings", "tableau_exe"}``.
+
+    Every check DEGRADES: a blocker means "do not offer / do not run this route", never an error.
+    Reported before anything is launched so a caller can present the option honestly instead of
+    starting a UI automation that cannot finish.
+    """
+    blockers, warnings = [], []
+    if os.name != "nt":
+        blockers.append("the capture route drives Windows UI automation; this is not Windows")
+    exe = find_tableau_exe()
+    if not exe:
+        blockers.append("Tableau Desktop was not found on this machine")
+    if not _worker_path():
+        blockers.append("the capture worker (capture/PrintPdfWorker.ps1) is not installed")
+    if workbook and not os.path.isfile(workbook):
+        blockers.append("workbook not found: %s" % workbook)
+    if not _extractor_path():
+        blockers.append("the PDF extractor (capture/extract_dashboards.py) is not installed")
+    running = _running_tableau_pids()
+    if running:
+        # The worker filters by the PID it launched, so a pre-existing instance is not fatal -- but
+        # it is worth surfacing, because an unexpected modal on THAT window can still steal focus.
+        warnings.append("Tableau is already running (pid %s); the capture drives its own instance"
+                        % ", ".join(running))
+    return {"ok": not blockers, "blockers": blockers, "warnings": warnings, "tableau_exe": exe}
+
+
+def _capture(workbook, outdir, scale=2.0, timeout=600, runner=None, pdf_runner=None,
+             preflight=None):
+    """Stage 1 (Tableau Desktop -> PDF) then the SHARED Stage 2 (PDF -> per-dashboard PNGs).
+
+    Stage 2 is deliberately the same code path a user-supplied Print-to-PDF takes, because it IS the
+    same artifact -- so the automatic and manual routes cannot drift apart.
+
+    Bounded by ``timeout``: this drives real UI, so a hung Tableau, an unexpected modal or a
+    credential prompt must give up and hand control back rather than stall the run.
+    """
+    pre = preflight if preflight is not None else capture_preflight(workbook)
+    warnings = list(pre.get("warnings") or [])
+    if not pre.get("ok"):
+        return [], warnings + list(pre.get("blockers") or [])
+
+    pdf_dir = os.path.join(outdir, "_pdf")
+    try:
+        os.makedirs(pdf_dir, exist_ok=True)
+    except Exception:
+        pass
+    cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-File",
+           _worker_path(), "-Twbx", str(workbook), "-OutDir", pdf_dir,
+           "-LogPath", os.path.join(pdf_dir, "capture.log")]
+    if pre.get("tableau_exe"):
+        cmd += ["-TableauExe", pre["tableau_exe"]]
+    run = runner or _run
+    try:
+        code, out, err = run(cmd, timeout)
+    except Exception as exc:
+        # A timeout lands here too: report it and move on, never re-raise.
+        return [], warnings + ["Tableau capture did not complete: %s" % str(exc)[:180]]
+    pdf = None
+    for line in reversed((out or "").splitlines()):
+        line = line.strip()
+        if line.lower().endswith(".pdf"):
+            pdf = line
+            break
+    if code != 0 or not pdf or not os.path.isfile(pdf):
+        return [], warnings + [
+            "Tableau capture failed (exit %s): %s" % (code, (err or out or "").strip()[:200])]
+    images, w2, _data = _extract_from_pdf(pdf, workbook, outdir, scale, runner=pdf_runner)
+    return images, warnings + list(w2)
+
+
+
+# =====================================================================================
 # Manifest
 # =====================================================================================
 def _image_record(dashboard, png_path, confidence, source_detail=None):
@@ -403,7 +524,7 @@ def format_manifest(manifest):
 # Dispatch
 # =====================================================================================
 def acquire(mode, workbook=None, outdir=None, source=None, scale=2.0, declared=None,
-            rest_kwargs=None, pdf_runner=None):
+            rest_kwargs=None, pdf_runner=None, capture_runner=None, capture_timeout=900):
     """Acquire reference images by ``mode`` and return the manifest. Never raises."""
     outdir = os.path.abspath(outdir or ".")
     try:
@@ -442,8 +563,8 @@ def acquire(mode, workbook=None, outdir=None, source=None, scale=2.0, declared=N
     elif mode == "rest":
         images, warnings = _acquire_rest(declared, outdir, rest_kwargs or {})
     elif mode == "capture":
-        warnings.append("the capture route is not installed yet; use --mode export with a "
-                        "Print-to-PDF or PowerPoint export")
+        images, warnings = _capture(workbook, outdir, scale, timeout=capture_timeout,
+                                    runner=capture_runner, pdf_runner=pdf_runner)
     else:
         warnings.append("unknown mode %r" % mode)
     return build_manifest(mode, workbook, declared, images, warnings)
@@ -491,6 +612,10 @@ def main(argv=None):
     ap.add_argument("--run", help="run folder; --out defaults to <run>/out/%s" % SUBDIR)
     ap.add_argument("--source", help="the export (.pdf/.pptx/folder) for --mode export|drop")
     ap.add_argument("--scale", type=float, default=2.0, help="PDF render scale (1.0 = native px)")
+    ap.add_argument("--capture-timeout", type=int, default=900,
+                    help="wall-clock cap for the Tableau capture (it drives real UI)")
+    ap.add_argument("--preflight", action="store_true",
+                    help="report whether --mode capture can run here, then exit (changes nothing)")
     # --mode rest
     ap.add_argument("--server")
     ap.add_argument("--site", default="")
@@ -500,9 +625,23 @@ def main(argv=None):
     ap.add_argument("--resolution")
     args = ap.parse_args(argv)
 
+    if args.preflight:
+        pre = capture_preflight(args.workbook)
+        print("[PREFLIGHT] capture route: %s" % ("AVAILABLE" if pre["ok"] else "NOT AVAILABLE"))
+        if pre.get("tableau_exe"):
+            print("  Tableau: %s" % pre["tableau_exe"])
+        for b in pre["blockers"]:
+            print("  [BLOCKER] %s" % b)
+        for w in pre["warnings"]:
+            print("  [WARN] %s" % w)
+        if not pre["ok"]:
+            print("  -> offer --mode export (a Print-to-PDF or PowerPoint export) or --mode skip.")
+        return 0
+
     outdir = args.out or (os.path.join(args.run, "out", SUBDIR) if args.run else SUBDIR)
     manifest = acquire(
         args.mode, workbook=args.workbook, outdir=outdir, source=args.source, scale=args.scale,
+        capture_timeout=args.capture_timeout,
         rest_kwargs={"server": args.server, "site": args.site, "pat_name": args.pat_name,
                      "pat_secret": os.environ.get(args.pat_secret_env),
                      "workbook_id": args.workbook_id, "resolution": args.resolution})

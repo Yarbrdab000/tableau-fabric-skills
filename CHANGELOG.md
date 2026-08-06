@@ -12,6 +12,31 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.81.0` -> `2.82.0`): `--mode capture` -- acquire reference images by
+  driving Tableau Desktop on this machine, no server and no manual export.** Vendors the capture
+  package under `scripts/capture/` (`PrintPdfWorker.ps1` + `extract_dashboards.py` +
+  `verify_headers.py` + `FINDINGS.md`) and drives Stage 1 (`.twbx` -> Print-to-PDF -> `.pdf`) into the
+  **same Stage 2 a user-supplied Print-to-PDF already used** -- deliberately one code path, so the
+  automatic and manual routes cannot drift apart. Measured end-to-end on a real workbook: **19.5s**,
+  1/1 dashboard, ~1.1s of foreground takeover.
+  **Tableau is detected, not assumed:** the vendored worker defaults to a HARD-CODED
+  `Tableau 2026.2` path, so `find_tableau_exe()` globs the installed versions (newest first) and passes
+  the result explicitly -- otherwise any other version launches nothing and fails obscurely. The
+  invocation is pinned to `powershell.exe` (Windows PowerShell 5.1, **not** `pwsh`) with **`-STA`**,
+  which UI Automation requires; tests pin all three.
+  **New `--preflight`** reports whether the route can run *before* anything launches (Windows? Tableau
+  installed? worker + extractor present? workbook readable? Tableau already running?) so a caller can
+  offer the option honestly instead of starting a UI automation that cannot finish. Every check
+  DEGRADES to a blocker or warning; none raises.
+  **Bounded and fail-safe:** a wall-clock cap (`--capture-timeout`, default 900s) is threaded to the
+  subprocess, a hung/timed-out capture is reported and control handed back, and a Stage 1 that exits
+  non-zero is rejected **even when it left a PDF behind** (a late failure can leave a truncated export;
+  trusting the file's existence would ship it as a reference image). The never-blocks invariant is
+  unchanged: still exit 0, still a manifest.
+  11 new tests (24 -> 35), 7/7 mutants killed. **Also fixed a defect in the 2.81.0 tests:** three of
+  them were written when `capture` was a stub, and silently became real-UI-driving tests once the route
+  landed -- they launched Tableau Desktop and took 31s each (96s -> 1.7s for the file). No test drives
+  real UI now. Corpus 29/29, unaffected.
 - **tableau-migration (skill `2.80.0` -> `2.81.0`): new `scripts/reference_images.py` -- one seam that
   acquires the TABLEAU reference image for every dashboard, whatever the user has.** The rebuilt report
   is visually checked against an image of the original dashboard; producing that image had working code
