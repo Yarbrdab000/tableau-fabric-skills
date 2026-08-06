@@ -34,6 +34,7 @@ try:  # package or scripts-on-path
         build_m_field_resolver,
         connection_details_for_bind,
         connection_parameter_specs,
+        connection_parameter_suffixes,
         emit_connection_parameters,
         emit_table_tmdl_m,
         extract_bundled_flatfile,
@@ -84,6 +85,7 @@ except ImportError:
         build_m_field_resolver,
         connection_details_for_bind,
         connection_parameter_specs,
+        connection_parameter_suffixes,
         emit_connection_parameters,
         emit_table_tmdl_m,
         extract_bundled_flatfile,
@@ -3464,8 +3466,19 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         report["flatfile_header_reconcile"] = header_reconcile
     # Stabilize identity GUIDs BEFORE the gate so the self-check validates the bytes that ship.
     T.stabilize_lineage_tags(parts)
+    # ``expected_endpoints`` is the number of DISTINCT upstreams this descriptor declares -- the same
+    # content identity ``connection_parameter_suffixes`` groups by, NOT the raw named-connection
+    # count (two named connections can legitimately describe one upstream). Supplying it turns on the
+    # ``endpoints_distinct`` check, which is the only one that can see a model collapsed onto a
+    # shared endpoint: such a model passes every other check, opens, and refreshes -- then reads the
+    # wrong source. Falls back to None (check skipped) if the identity can't be derived.
+    try:
+        _expected = len(connection_parameter_suffixes(descriptor)) or 1
+    except Exception:  # pragma: no cover - defensive; never block the build on a diagnostic
+        _expected = None
     report["openability_selfcheck"] = check_model_openability(
-        parts, flatfile_headers=_gate_flatfile_headers(descriptor, flatfile_path))
+        parts, flatfile_headers=_gate_flatfile_headers(descriptor, flatfile_path),
+        expected_endpoints=_expected)
     return {"parts": parts, "report": report}
 
 

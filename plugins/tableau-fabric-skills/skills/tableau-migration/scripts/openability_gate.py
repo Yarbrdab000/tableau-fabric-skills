@@ -68,6 +68,15 @@ _EXPRESSION_DECL_RE = re.compile(
     r"^expression\s+(?P<q>'?)(?P<name>[^'\s=]+)(?P=q)\s*=", re.MULTILINE)
 _M_PARAM_REF_RE = re.compile(r'#"([^"\n]+)"')
 
+# One connection-parameter declaration: its KIND (which routing fact), its per-upstream SUFFIX
+# (empty for a single-upstream model, which keeps the bare names) and its literal VALUE. Used by the
+# ``endpoints_distinct`` check to reassemble how many DISTINCT upstreams the emitted model actually
+# resolves. Value is read non-greedily to the closing quote so the trailing ``meta [...]`` is ignored.
+_ENDPOINT_DECL_RE = re.compile(
+    r"^expression\s+'?(?P<kind>Server|Database|Warehouse|HttpPath)(?:_(?P<suffix>[^'\s=]+))?'?\s*="
+    r'\s*"(?P<value>[^"]*)"',
+    re.MULTILINE)
+
 # DAX IDENTIFIER REFERENCES inside a measure or calculated-column expression.
 # ``'Table'[Column]`` / ``Table[Column]`` is a fully-qualified column; a bare ``[Name]`` is a
 # measure reference (or an unqualified column in the declaring table's own row context).
@@ -191,12 +200,15 @@ def _dax_references(expr):
     return qualified, bare
 
 
-def check_model_openability(parts, flatfile_headers=None):
+def check_model_openability(parts, flatfile_headers=None, expected_endpoints=None):
     """Structurally validate a built model's ``parts`` dict; return a verdict.
 
     ``parts`` -- the ``{relative_path: tmdl_text}`` mapping ``assemble_import_model`` returns.
     ``flatfile_headers`` -- optional ``{table_display_name: [physical_header, ...]}`` map; when a
     table's headers are supplied the ``typed_columns_in_header`` check runs for it.
+    ``expected_endpoints`` -- optional count of DISTINCT upstreams the source datasource declares;
+    when supplied the ``endpoints_distinct`` check runs (see below). Omitted -> that check is
+    skipped and the verdict is byte-identical to before.
 
     Returns ``{"ok": bool, "checks": {name: bool}, "issues": [{"check", "table"/"part", "detail"}]}``.
     ``ok`` is True iff no issue was found. Purely diagnostic -- never raises, never mutates ``parts``.
@@ -323,6 +335,51 @@ def check_model_openability(parts, flatfile_headers=None):
                       % (name, ", ".join(sorted(referenced_params[name]))),
         })
 
+    # ENDPOINT DISTINCTNESS. Every check above asks whether the model is well FORMED. This one asks
+    # whether it points at the right NUMBER OF PLACES -- the one question nothing else was asking.
+    #
+    # A model whose tables have been collapsed onto a single upstream is structurally perfect: valid
+    # TMDL, lints clean, passes every other check here, opens in Desktop, and REFRESHES SUCCESSFULLY.
+    # It then reads the wrong server and returns wrong data, with no signal anywhere. That is one rung
+    # further from the cause than the `m_parameters_defined` case (which at least fails at refresh),
+    # and it is the rung where nothing at all was watching. ``m_parameters_defined`` cannot see it:
+    # it asks whether each REFERENCED parameter is DEFINED, and in a collapsed model both are.
+    #
+    # This is not hypothetical -- it shipped. A workbook consolidating two plain single-connection
+    # datasources on DIFFERENT servers emitted one shared parameter set, so the second fact silently
+    # read the first server's data (fixed in 2.70.0). The corpus could not catch it either: it is
+    # entirely flat-file, and a flat-file partition references no connection parameters at all.
+    #
+    # Counted by SUFFIX GROUP because that is the mechanism the emitter uses -- each distinct upstream
+    # gets its own ``Server_<x>`` / ``Database_<x>`` / ``Warehouse_<x>`` / ``HttpPath_<x>`` set, and a
+    # single-upstream model keeps the bare unsuffixed names. Grouping then deduping by VALUE TUPLE
+    # matches ``_connection_identity``'s content identity, so two named connections that genuinely
+    # describe the same upstream legitimately collapse to one group and do NOT trip the check.
+    # Fail-closed: skipped entirely unless the caller supplies ``expected_endpoints``.
+    endpoints_ok = True
+    if expected_endpoints is not None and int(expected_endpoints) > 1:
+        groups = {}
+        for m in _ENDPOINT_DECL_RE.finditer(parts.get("definition/expressions.tmdl") or ""):
+            groups.setdefault(m.group("suffix") or "", {})[m.group("kind")] = m.group("value")
+        resolved = {tuple(sorted(g.items())) for g in groups.values() if g}
+        # A model that emits NO endpoint parameters at all cannot be judged this way: a FLAT-FILE
+        # island reaches its upstream through a literal ``File.Contents("...")`` path inside the
+        # partition, not through a shared parameter, so several distinct files legitimately produce
+        # zero parameter groups. Reading that as "collapsed to 0 endpoints" is a false positive --
+        # measured on the corpus, which is entirely flat-file and where three multi-datasource
+        # workbooks (Excel+Access, and two multi-file consolidations) tripped it. The check is about
+        # PARAMETERISED endpoints; with none present it has nothing to say and stays silent.
+        if resolved and len(resolved) < int(expected_endpoints):
+            endpoints_ok = False
+            issues.append({
+                "check": "endpoints_distinct",
+                "part": "definition/expressions.tmdl",
+                "detail": "the source declares %d distinct upstream(s) but the model resolves only "
+                          "%d -- tables have been collapsed onto a shared endpoint and will read "
+                          "the wrong source (this model refreshes successfully and returns wrong "
+                          "data)" % (int(expected_endpoints), len(resolved)),
+            })
+
     # DAX REFERENCE RESOLUTION. Every ``[Measure]`` and ``'Table'[Column]`` a measure names must
     # exist in the model. Nothing else here catches an undefined identifier: such a model is
     # syntactically valid TMDL, lints clean, deserializes, and OPENS -- it fails only when the visual
@@ -400,6 +457,8 @@ def check_model_openability(parts, flatfile_headers=None):
         "m_parameters_defined": params_ok,
         "dax_references_resolve": refs_ok,
     }
+    if expected_endpoints is not None and int(expected_endpoints) > 1:
+        checks["endpoints_distinct"] = endpoints_ok
     if header_check_ran:
         checks["typed_columns_in_header"] = typed_in_header
     if rels_present:

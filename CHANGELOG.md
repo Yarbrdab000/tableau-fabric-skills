@@ -12,6 +12,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.74.0` -> `2.75.0`): new `endpoints_distinct` openability check --
+  a model collapsed onto one upstream no longer passes silently (issue #93).** Every other check asks
+  whether the model is well FORMED. A model whose tables have been collapsed onto a single endpoint
+  is structurally perfect: valid TMDL, lints clean, passes all five other checks, opens in Desktop,
+  and **refreshes successfully** -- then reads the wrong server and returns wrong data, with no
+  signal anywhere. `m_parameters_defined` cannot see it: it asks whether each REFERENCED parameter is
+  DEFINED, and in a collapsed model both are. The unasked question was whether the set of endpoints
+  the model RESOLVES matches the set the source DECLARES. Not hypothetical -- this exact shape
+  shipped in 2.69.0 and was fixed in 2.70.0; this is the alarm for that fire. The check groups the
+  emitted `Server*` / `Database*` / `Warehouse*` / `HttpPath*` expressions by per-upstream SUFFIX
+  (the mechanism the emitter uses) and dedupes by VALUE TUPLE, matching `_connection_identity`'s
+  content identity -- so two named connections describing one upstream do not trip it, while a
+  collapse that KEEPS its suffixes but copies the values still does. Fully offline: no probe, no
+  refresh, no credentials, no new dependency. Fail-closed twice over -- skipped unless the caller
+  supplies `expected_endpoints > 1` (so existing callers are byte-identical), and skipped when the
+  model emits no endpoint parameters at all, because a FLAT-FILE island reaches its upstream through
+  a literal `File.Contents` path rather than a shared parameter (measured: three corpus workbooks
+  tripped that false positive before the guard). Wired into `assemble_import_model`, which derives
+  the expected count from `connection_parameter_suffixes`.
+
 - **tableau-migration (skill `2.73.0` -> `2.74.0`): the estate path now CARRIES the remediation
   worklist (issue #95), and reference capture survives a mid-loop Tableau Cloud session death
   (issue #97).**
