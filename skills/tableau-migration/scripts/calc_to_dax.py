@@ -3022,41 +3022,97 @@ def _partitionby_clause(partition_by, resolver, tables_used):
     return "PARTITIONBY(" + ", ".join(cols) + ")"
 
 
-def _parse_window_bound(p):
-    """Parse a Tableau WINDOW_* relative bound: an (optionally signed) INTEGER literal offset.
+# Tableau's two documented partition ANCHORS for a window bound. Every WINDOW_* entry in the
+# reference repeats the same sentence: "The window is defined by means of offsets from the current
+# row. Use FIRST()+n and LAST()-n for offsets from the first or last row in the partition."
+# The values are DAX ABS positions: 1 is the partition's first row, -1 its last.
+_WINDOW_ANCHORS = {"FIRST": 1, "LAST": -1}
 
-    Only integer literals are supported. FIRST()/LAST()/expression bounds raise -> the caller
-    falls back, keeping the faithful-or-stub contract (those forms are not yet oracle-certified).
+
+def _parse_window_bound(p):
+    """Parse one Tableau ``WINDOW_*`` bound -> ``(value, "REL"|"ABS")``.
+
+    Two documented forms, and only those:
+
+      * an (optionally signed) INTEGER literal -- an offset RELATIVE to the current row (``-2`` is
+        two rows back, ``0`` the current row) -> ``REL``;
+      * a partition ANCHOR -- ``FIRST()``, ``FIRST()+n``, ``LAST()``, ``LAST()-n`` -> ``ABS``, DAX's
+        absolute position within the partition (``1`` first row, ``-1`` last row).
+
+    The anchor arithmetic is Tableau's own: ``FIRST()`` is the first row (ABS ``1``), so ``FIRST()+n``
+    is the (n+1)-th row (ABS ``1 + n``) -- which is exactly the reference's worked example, where
+    ``WINDOW_SUM(SUM([Profit]), FIRST()+1, 0)`` sums "from the **second** row to the current row".
+    Symmetrically ``LAST()`` is the last row (ABS ``-1``) and ``LAST()-n`` is ABS ``-(1 + n)``.
+
+    A useful consistency check falls out of this and is locked by tests: ``WINDOW_SUM(x, FIRST(), 0)``
+    emits ``WINDOW(1, ABS, 0, REL, ...)``, byte-identical to the already oracle-certified frame that
+    ``RUNNING_SUM(x)`` emits -- which is what those two Tableau forms mean.
+
+    ``FIRST()-n`` and ``LAST()+n`` point OUTSIDE the partition. Tableau documents neither form, so how
+    it clamps them is unverified: they raise, and the caller falls back to a faithful stub rather than
+    guess. Any other bound (a parameter, a nested expression, a float) raises for the same reason.
     """
-    sign = ""
     k, v = p._peek()
+    if k == "id" and v.upper() in _WINDOW_ANCHORS:
+        anchor = v.upper()
+        base = _WINDOW_ANCHORS[anchor]
+        p._next()
+        p._expect_op("(")
+        p._expect_op(")")
+        k, v = p._peek()
+        if not (k == "op" and v in "+-"):
+            return base, "ABS"
+        # Only the documented direction moves INTO the partition: FIRST()+n, LAST()-n.
+        inward = "+" if anchor == "FIRST" else "-"
+        if v != inward:
+            raise _CalcError(
+                f"WINDOW bound {anchor}(){v}n points outside the partition; Tableau documents only "
+                f"{anchor}(){inward}n")
+        p._next()
+        k, v = p._peek()
+        if k != "num" or "." in v:
+            raise _CalcError(f"WINDOW bound {anchor}(){inward} must be offset by an integer literal")
+        p._next()
+        offset = int(v)
+        if offset < 0:
+            raise _CalcError(f"WINDOW bound {anchor}() offset must not be negative")
+        # FIRST()+n -> ABS 1+n (n rows INTO the partition); LAST()-n -> ABS -(1+n).
+        return (base + offset if anchor == "FIRST" else base - offset), "ABS"
+
+    sign = ""
     if k == "op" and v in "+-":
         if v == "-":
             sign = "-"
         p._next()
         k, v = p._peek()
     if k != "num" or "." in v:
-        raise _CalcError("WINDOW bound must be an integer literal")
+        raise _CalcError("WINDOW bound must be an integer literal or a FIRST()/LAST() anchor")
     p._next()
-    return int(sign + v)
+    return int(sign + v), "REL"
 
 
 def _window_frame(p, spec, default):
     """Optional Tableau moving-window bounds on a WINDOW_* call: ``WINDOW_*(expr, start, end)``.
 
-    When a ``, start, end`` tail follows the inner expression, both must be integer literals and
-    map directly to a relative frame ``WINDOW(start, REL, end, REL, spec)`` (oracle-certified
-    faithful for SUM/AVG/MIN/MAX/COUNT to ~1e-15, edge-clamped exactly as Tableau clamps a moving
-    window at the partition boundary). With no tail the frame is ``default`` (the whole partition).
+    With no ``, start, end`` tail the frame is ``default`` (the whole partition). With one, each bound
+    is parsed by :func:`_parse_window_bound` into a value plus its DAX positioning mode:
+
+      * integer literals -> ``WINDOW(start, REL, end, REL, spec)`` -- a moving frame relative to the
+        current row (oracle-certified faithful for SUM/AVG/MIN/MAX/COUNT to ~1e-15, edge-clamped
+        exactly as Tableau clamps a moving window at the partition boundary);
+      * ``FIRST()``/``LAST()`` anchors -> ``ABS`` positions, so the two modes MIX in one frame:
+        ``WINDOW_MAX(x, FIRST(), 0)`` -> ``WINDOW(1, ABS, 0, REL, spec)``.
+
+    An unparseable bound raises, and the caller falls back to a faithful stub.
     """
     k, v = p._peek()
     if not (k == "op" and v == ","):
         return default
     p._next()
-    start = _parse_window_bound(p)
+    start, start_mode = _parse_window_bound(p)
     p._expect_op(",")
-    end = _parse_window_bound(p)
-    return f"WINDOW({start}, REL, {end}, REL, {spec})"
+    end, end_mode = _parse_window_bound(p)
+    return f"WINDOW({start}, {start_mode}, {end}, {end_mode}, {spec})"
 
 
 def _table_calc_result_type(name, inner_type):

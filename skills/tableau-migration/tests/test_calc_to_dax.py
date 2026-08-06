@@ -1044,6 +1044,33 @@ TABLE_CALC_TRANSLATIONS = [
     ("WINDOW_COUNT(SUM([Sales]), -2, 0)", _PART, _ORDER,
      "COUNTX(WINDOW(-2, REL, 0, REL, ORDERBY('Orders'[Order_Date], ASC), PARTITIONBY('Orders'[Region])), "
      "CALCULATE(SUM('Orders'[Sales])))"),
+    # --- FIRST()/LAST() partition ANCHORS as bounds -> DAX ABS positions, mixable with REL ---
+    # Every WINDOW_* entry in the Tableau reference says: "The window is defined by means of offsets
+    # from the current row. Use FIRST()+n and LAST()-n for offsets from the first or last row in the
+    # partition." FIRST() is the partition's first row (DAX ABS 1); LAST() is its last (ABS -1).
+    ("WINDOW_SUM(SUM([Sales]), FIRST(), 0)", (), _ORDER,
+     "SUMX(WINDOW(1, ABS, 0, REL, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales])))"),                             # == RUNNING_SUM (see below)
+    ("WINDOW_AVG(SUM([Sales]), FIRST(), 0)", _PART, _ORDER,
+     "AVERAGEX(WINDOW(1, ABS, 0, REL, ORDERBY('Orders'[Order_Date], ASC), "
+     "PARTITIONBY('Orders'[Region])), CALCULATE(SUM('Orders'[Sales])))"),
+    # The reference's OWN worked example: "computes the sum of SUM(Profit) from the SECOND row to the
+    # current row" -> FIRST()+1 is the 2nd row, i.e. ABS 2.
+    ("WINDOW_SUM(SUM([Sales]), FIRST()+1, 0)", (), _ORDER,
+     "SUMX(WINDOW(2, ABS, 0, REL, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("WINDOW_MAX(SUM([Sales]), 0, LAST())", (), _ORDER,               # current row -> last row
+     "MAXX(WINDOW(0, REL, -1, ABS, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("WINDOW_AVG(SUM([Sales]), LAST()-2, LAST())", (), _ORDER,        # trailing 3 rows of partition
+     "AVERAGEX(WINDOW(-3, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("WINDOW_SUM(SUM([Sales]), FIRST(), LAST())", (), _ORDER,         # explicit whole partition
+     "SUMX(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
+    ("WINDOW_COUNT(SUM([Sales]), FIRST(), 0)", (), _ORDER,
+     "COUNTX(WINDOW(1, ABS, 0, REL, ORDERBY('Orders'[Order_Date], ASC)), "
+     "CALCULATE(SUM('Orders'[Sales])))"),
     # --- WINDOW_PERCENTILE(<agg>, k): k-th percentile over the whole partition (PERCENTILEX.INC) ---
     ("WINDOW_PERCENTILE(SUM([Sales]), 0.75)", _PART, _ORDER,
      "PERCENTILEX.INC(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders'[Order_Date], ASC), "
@@ -1135,7 +1162,12 @@ TABLE_CALC_FALLBACKS = [
     ("LOOKUP(SUM([Sales]))", _ORDER),             # LOOKUP missing its offset
     ("WINDOW_AVG(SUM([Sales]), -2)", _ORDER),     # moving window needs BOTH bounds
     ("WINDOW_SUM(SUM([Sales]), -2.5, 0)", _ORDER),  # non-integer moving bound
-    ("WINDOW_AVG(SUM([Sales]), FIRST(), 0)", _ORDER),  # FIRST()/LAST() bounds not supported
+    # FIRST()/LAST() anchors that point OUTSIDE the partition. Tableau documents only FIRST()+n and
+    # LAST()-n (both move INWARD), so how it clamps the other direction is unverified -> stay stubbed.
+    ("WINDOW_SUM(SUM([Sales]), FIRST()-1, 0)", _ORDER),
+    ("WINDOW_SUM(SUM([Sales]), 0, LAST()+1)", _ORDER),
+    ("WINDOW_SUM(SUM([Sales]), FIRST()+1.5, 0)", _ORDER),  # anchor offset must be an integer
+    ("WINDOW_SUM(SUM([Sales]), INDEX(), 0)", _ORDER),      # only FIRST()/LAST() are anchors
     ("WINDOW_MEDIAN(SUM([Sales]), -2, 0)", _ORDER),  # moving STDEV/VAR/MEDIAN not certified
     ("RUNNING_SUM(SUM([Sales]), -2, 0)", _ORDER),  # RUNNING_* takes no bounds
     ("WINDOW_PERCENTILE(SUM([Sales]))", _ORDER),   # WINDOW_PERCENTILE needs its k argument

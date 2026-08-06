@@ -12,6 +12,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.78.0` -> `2.79.0`): `WINDOW_*` bounds accept Tableau's `FIRST()`/`LAST()`
+  partition anchors, not just integer literals.** Every `WINDOW_*` entry in the Tableau reference states
+  the same contract -- *"The window is defined by means of offsets from the current row. Use `FIRST()+n`
+  and `LAST()-n` for offsets from the first or last row in the partition."* Only the relative
+  integer-literal half was implemented; an anchor bound raised and the whole calc fell back to an inert
+  stub. `_parse_window_bound` now returns a value **plus its positioning mode**, so one frame can MIX
+  DAX's two modes: `FIRST()` -> `ABS 1` (partition's first row), `LAST()` -> `ABS -1` (its last), and a
+  plain integer stays `REL`. `WINDOW_MAX(SUM([Sales]), FIRST(), 0)` now emits
+  `MAXX(WINDOW(1, ABS, 0, REL, ...), CALCULATE(SUM(...)))`. The anchor arithmetic is Tableau's own:
+  `FIRST()+n` is the (n+1)-th row, matching the reference's worked example where
+  `WINDOW_SUM(SUM([Profit]), FIRST()+1, 0)` sums *"from the second row to the current row"*.
+  **Fail-closed is preserved and tested:** `FIRST()-n` / `LAST()+n` point OUTSIDE the partition and
+  Tableau documents neither, so how it clamps them is unverified -- those still stub rather than guess,
+  as do non-integer anchor offsets, non-anchor functions (`INDEX()`), and parameter bounds.
+  **Two self-consistency properties fall out and are asserted**, since these are the same window in
+  Tableau: `WINDOW_<agg>(x, FIRST(), 0)` emits DAX byte-identical to `RUNNING_<agg>(x)` (verified for
+  SUM/AVG/MAX/MIN), and `WINDOW_<agg>(x, FIRST(), LAST())` is byte-identical to the omitted-bounds
+  whole-partition form. Corpus: **1 measure newly landed, 0 regressions** (`0070_new_max`'s
+  `SUM([Sales]) = WINDOW_MAX(SUM([Sales]), FIRST(),0)`), 29/29 still openable. 11 test cases, 7/7
+  mutants killed. Additive: no report key changes, and no addressing rule is inferred anywhere.
 - **tableau-fabric-datasource-comparison (skill `1.8.0` -> `1.9.0`): Unicode-aware name matching --
   non-ASCII names no longer contribute 0 to the name signal (#5).** `normalize_token` folded on
   `[^a-z0-9]+`, stripping ALL non-ASCII, so a name written only in a non-Latin script normalised to
