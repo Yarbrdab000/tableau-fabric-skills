@@ -12,6 +12,27 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.82.0` -> `2.83.0`): reference images become part of the RUN -- new
+  **D7** decision + **STEP 1.6**.** The acquisition machinery existed but nothing invoked it, so no run
+  produced an image. D7 is a single follow-up question whose options are **conditional on D1**: a live
+  run is offered the REST pull; a local run is offered "I''ll provide an export (Print-to-PDF or
+  **PowerPoint**)" or "capture them here from Tableau Desktop". Only the applicable branch is shown.
+  **`S` (skip) is always present, and is explicitly accepted AT ANY POINT -- including after a route has
+  already failed or stalled**, so a user can never be cornered into finishing an acquisition they cannot
+  complete. STEP 1.6 sits after the STEP 1.5 scan gate and is documented as its **opposite**: 1.5 is a
+  hard gate, 1.6 exits `0` whatever happens and must **never** gate STEP 2.
+  Guidance the runbook now gives explicitly: run `--preflight` before ever offering the capture route
+  (so an option that cannot run is not presented); warn the user before it takes the foreground for
+  ~1.5s; **prefer a PowerPoint export** when the pairing matters, because Tableau writes each sheet''s
+  name onto the slide picture (`confidence: named`) whereas a PDF page is matched by inferred text
+  content; and surface any `[VERIFY]` weak match rather than trusting it.
+  **Join on the dashboard NAME, never a filename** -- stated in SKILL.md, the scripts table and two new
+  `troubleshooting.md` rows, and now proven end-to-end in one run directory: the manifest key
+  `''Dashboard 1''` matches the rebuilt page''s `displayName`, while the PBIR page name
+  (`page-Dashboard118f162c9`) and the PNG filename (`Dashboard_1.png`) match neither it nor each other.
+  Also adds the Confirmation-Ledger line, the scripts-table entry, and 4 `troubleshooting.md` rows.
+  Verified by running the documented commands verbatim against a fresh `new_run.py` folder. Docs +
+  wiring only: no engine change, corpus 29/29 unaffected, suite green.
 - **tableau-migration (skill `2.81.0` -> `2.82.0`): `--mode capture` -- acquire reference images by
   driving Tableau Desktop on this machine, no server and no manual export.** Vendors the capture
   package under `scripts/capture/` (`PrintPdfWorker.ps1` + `extract_dashboards.py` +

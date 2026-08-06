@@ -98,6 +98,37 @@ D6 — CREDENTIAL ACCESS  (only if D1=A; how I obtain the PAT / Connected-App se
    C) Interactive terminal      (no Key Vault — you type it into a hidden prompt; a real human-attended terminal ONLY)
 ```
 
+**Then ask D7 — one follow-up question whose options depend on D1.** Present ONLY the branch that
+applies; never show the live options for a local run or vice-versa.
+
+```
+D7 — REFERENCE IMAGES  (optional — a picture of each ORIGINAL Tableau dashboard, for visual checking)
+   when D1=A (live pull):
+      A) Pull them over the Tableau REST API      [default — no extra work for you]
+      S) Skip — migrate without a visual reference
+
+   when D1=B (local files):
+      A) I'll provide an export   (a Print-to-PDF "Entire Workbook", or a PowerPoint export — from
+                                   Tableau Desktop or from the Cloud/Server web UI)
+      B) Capture them here        (I drive your Tableau Desktop: ~20s per workbook, and it takes the
+                                   foreground for about 1.5s. Needs Tableau Desktop installed.)
+      S) Skip — migrate without a visual reference
+```
+
+> **D7 is OPTIONAL and NEVER blocks the migration.** `S` is always available and is accepted *at any
+> point* — including after a route has already failed or stalled. Reference images are an additive
+> visual aid: with them, a later pass can compare the rebuilt report against the original; without
+> them, the migration is byte-for-byte identical and completes exactly the same way. **Never let image
+> acquisition stop, gate, or delay a build** — if it fails, record it and move on.
+>
+> **Only offer D7=B when it can actually run.** Check first with
+> `py -3.11 "$SKILL\scripts\reference_images.py" --mode capture --preflight --workbook <file>`; it
+> reports Tableau Desktop's presence and any blocker, changes nothing, and exits 0. If it says NOT
+> AVAILABLE, offer A or S only — do not present an option that will fail.
+>
+> **Tell the user before running D7=B.** It takes the foreground for ~1.5 seconds while it drives
+> Tableau's Print menu. Warn first; never fire it silently.
+
 > **A workbook's datasource migrates first, then the report binds to it — exactly like an embedded
 > datasource.** You never hand-classify a workbook: `migrate_estate.py` auto-detects whether it
 > **embeds** its datasource or connects to a **published** one (the STEP 1.5 scan, before any build; you
@@ -215,6 +246,7 @@ LEDGER — confirm, then reply GO
   outputs    : <D3 A both / B Fabric only / C local only>
   conflicts  : <D4 overwrite | skip | stop>
   auth       : <D5 PAT | Connected App JWT>   (D6 secret via <Key Vault KV_NAME/SECRET_NAME | .env/keyring file | interactive terminal prompt>)
+  ref images : <D7 A REST pull | A export you provide | B capture from Tableau Desktop | S skip>   (optional; never blocks the build)
   fabric ws  : <FABRIC_WORKSPACE>             (omit if D3=C)
 ```
 
@@ -375,6 +407,42 @@ py -3.11 "$SKILL\scripts\fetch_tds.py" --server $SITE_URL --site $SITE_NAME `
 
 **Checkpoint 1.5:** `.\out\scan.json` shows `missing_published_datasources: []` and the command exited
 `0`. If not, fetch the named datasource(s) and re-scan — never proceed to STEP 2 with a missing one.
+
+**STEP 1.6 — reference images (D7; optional, never blocks)**
+
+Skip this entirely when D7=S. Otherwise run **one** command per the D7 answer — it writes
+`.\out\reference_images\` plus a `manifest.json` and **always exits 0**:
+
+```powershell
+# D7=A, live (D1=A): server-rendered, row-level security applied as the signed-in user
+py -3.11 "$SKILL\scripts\reference_images.py" --mode rest --run $RUN `
+  --workbook ".\in\<Workbook>.twbx" --server $SITE_URL --site $SITE_NAME --pat-name $PAT_NAME
+
+# D7=A, local (D1=B): an export the user provides -- a Print-to-PDF, a PowerPoint, or a folder of PNGs
+py -3.11 "$SKILL\scripts\reference_images.py" --mode export --run $RUN `
+  --workbook ".\in\<Workbook>.twbx" --source "<the .pdf / .pptx / folder>"
+
+# D7=B, local (D1=B): drive Tableau Desktop here (preflight FIRST -- see D7 above)
+py -3.11 "$SKILL\scripts\reference_images.py" --mode capture --run $RUN `
+  --workbook ".\in\<Workbook>.twbx"
+```
+
+> **This step can fail and the migration still ships.** It exits `0` whatever happens — coverage lives
+> in the manifest, never in the exit code — so **never gate STEP 2 on it**. That is the opposite of the
+> STEP 1.5 scan above, which *is* a hard gate. If images are missing, say so plainly and continue.
+>
+> **A PowerPoint export is the best-labelled source**, and worth preferring when the user has a choice:
+> Tableau writes each sheet's name onto the slide's picture, so the dashboard↔image pairing is exact.
+> A PDF is matched by page content instead, which is reliable but inferred — the manifest records
+> `confidence` (`named` > `content` > `content-weak` > `tab-order`) per image, and `format_manifest`
+> prints a `[VERIFY]` line for any weak match. Surface those to the user rather than trusting them.
+>
+> **The join key is the dashboard NAME** (`manifest["images"][n]["dashboard"]`), which equals the
+> rebuilt report page's `displayName`. **Never pair images by filename** — this script, the REST path
+> and the PBIR emitter all sanitize differently and none can be derived from another.
+
+**Checkpoint 1.6:** `.\out\reference_images\manifest.json` exists. `summary.acquired` vs
+`summary.declared` tells you the coverage; anything in `missing` simply has no visual reference.
 
 **STEP 2 — build the Fabric bundle**
 
@@ -582,6 +650,7 @@ The pure-Python cores are offline, deterministic, and stdlib-only (no Spark / pa
 | [`scripts/connection_to_m.py`](scripts/connection_to_m.py) | Parse Tableau `.tds`/`.twb` → descriptor (`parse_tds(text, select=None)`); **`extract_calcs`** (calculated fields → `calcs=`); **`workbook_datasources`** (list selectable datasources, skipping `Parameters` + worksheet stubs); emit M partitions + bind details (`connection_details_for_bind`); M-path field resolver. |
 | [`scripts/assemble_model.py`](scripts/assemble_model.py) | Tier-1 orchestrator: `.tds`/`.twb` → full Fabric SemanticModel definition (TMDL parts + `.platform` + `.pbism`), base64 deploy payload. **One-call `migrate_datasource(.tdsx/.tds/.twbx/.twb/text, datasource=None)` → `{parts, report, bind}`** (auto-extracts calcs; `datasource=` selects from a multi-datasource workbook; a genuine fallback returns `parts={}` + `report["landing_plan"]` via `directlake_landing_plan`); `list_workbook_datasources`, `write_model_folder` / **`write_local_pbip`** for local output. |
 | [`scripts/migrate_estate.py`](scripts/migrate_estate.py) | **Estate + workbook orchestrator.** `migrate_estate(source, out)` migrates a whole folder / site (every datasource + workbook) in one run. **`--scan`** is a read-only pre-build gate: it writes `<out>/scan.json` naming each workbook's published datasource and whether it's in scope, and **exits non-zero** while any is missing (run it before building so a published-backed workbook is never rebuilt to an empty report — see STEP 1.5). **`migrate_workbook(source, write_to=…, name=None)`** is the single-workbook primitive the estate loops: it rebuilds the workbook's embedded datasource(s) into one semantic model **and** the workbook's report bound to it — an openable `pbip/<Name>/` (plus a bare `reports/<Name>.Report`); a multi-datasource workbook consolidates every embedded datasource into one model (disconnected table islands, each bound to its own connection) with a single report bound to it. Reach for it (over `migrate_datasource`) whenever the input is a **workbook** and you want the **report**, not just a datasource model. |
+| [`scripts/reference_images.py`](scripts/reference_images.py) | **Reference-image acquisition (D7 / STEP 1.6) — optional, and NEVER blocks a build.** One seam that produces a PNG of every ORIGINAL Tableau dashboard, whatever the user has: `--mode rest` (server-rendered via `fidelity_reference`, RLS applied), `--mode export` (a Print-to-PDF, a **PowerPoint** export, or a folder of PNGs), `--mode capture` (drives Tableau Desktop here — vendored `scripts/capture/`, ~20s, ~1.5s foreground takeover; run `--preflight` first to see whether it can), `--mode drop` (hand-placed files) and `--mode skip`. Writes `<run>/out/reference_images/` + `manifest.json`. **Always exits 0** — coverage lives in the manifest, never the exit code, so nothing can gate a migration on it; `skip` and total failure still write a manifest so "no images" is explicit. **Join on `images[n].dashboard` (the exact Tableau name, = the report page's `displayName`), never on a filename** — three different sanitizers are in play and none derives from another. Each image carries a `confidence` (`named` from a PowerPoint's per-slide sheet name > `content` inferred from PDF page text > `content-weak` > `tab-order`). |
 | [`scripts/estate_survey.py`](scripts/estate_survey.py) | **Estate planning surface (read-only, pre-fetch).** Surveys a live site's **published-datasource dependency graph from REST ground truth** (`/workbooks/{id}/connections` → `type: sqlproxy`), because sizing an estate from the Metadata API's `embeddedDatasources` scores published-backed workbooks as trivially simple — their calcs live in the *datasource*, and only a `sqlproxy` stub travels with the workbook (measured: 0 of 13 dependencies reported where REST shows 9 of 13). Emits `fetch_order` (every required datasource before the workbooks needing it), per-workbook `complexity_understated`, and `unresolved_dependencies`; **exits non-zero** while any is unresolved. Joins **by name, never by the connection's `datasource.id`** (that id is not the site LUID — an id-join matches nothing and reads as "no dependencies"); a name matching several projects is reported `ambiguous`, never guessed. Fully paginated. The offline core (`build_survey` / `resolve_dependency` / `fetch_order`) takes plain payloads and `survey_site(call, site_id)` takes an injected transport, so all of it is testable without a server. |
 | [`scripts/fabric_oracle.py`](scripts/fabric_oracle.py) | **The `fabric_oracle` seam (opt-in, off by default).** `translation_reconcile` is the offline half of the Tier-1 empirical proof and executes nothing; the executing half is an injected `fabric_oracle(dax_query) -> result` callable that nothing used to pass, leaving the loop written, tested and **unreachable**. This module is the wiring — it still executes no DAX and adds no dependency. It defines the contract (`normalize_result` delegates to `translation_reconcile.extract_scalar`, so there is one parser, not two), lets any executor **self-certify offline** against it (`conforms`), adapts an external process into the callable shape (`subprocess_oracle`, and `persistent_oracle` for an executor whose startup is expensive — opening and refreshing a PBIP costs minutes), and drives the loop over an emitted model (`verify_model`). The measures come from the emitted **TMDL**, which already carries BOTH sides — the landed DAX and the original `annotation TableauFormula` — so no report-schema change is needed. **Nothing reads `verified` without both sides present**: no oracle, no ground truth, an oracle that errors, or one that raises all yield `not-evaluated` *by construction*. CLI sidecar `--model-dir … [--oracle-cmd … [--persistent]] [--ground-truth …]`; exits non-zero only on a proven `mismatch`. |
 | [`scripts/deploy_to_fabric.py`](scripts/deploy_to_fabric.py) | Self-contained Fabric REST deploy (stdlib-only urllib): createOrUpdate / updateDefinition of the SemanticModel, 202 LRO polling, optional refresh + gateway bind. **Also deploys the workbook's REPORT** as a Fabric `reports` item — `deploy_pbip` / `deploy_report` + the fail-closed `rebind_report_byConnection` (rewrites `definition.pbir` to a **`byConnection`** `semanticmodelid=<id>` reference, required for REST deploy) via `--pbip` / `--report-dir`. Importable `acquire_token` (handles `az` on Windows) + `refresh_dataset` / **`recalc_dataset`** (a default, credential-free `type: Calculate` ProcessRecalc that processes the Import calc tables so a composite model opens without benign warning triangles; `--no-recalc` to skip) for post-deploy ops. Lets the skill finish **in Fabric** without depending on a peer skill. |
