@@ -12,6 +12,33 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.70.0` -> `2.71.0`): FCP-prefixed connection attributes are read
+  against the document-format manifest (issue #92).** While a Tableau document-format feature is in
+  transition, Tableau writes a connection attribute under BOTH spellings in the SAME element -- and
+  the two variants carry DIFFERENT MEANINGS, not one value under two names:
+  `_.fcp.DatabricksCatalog.false...dbname` is the legacy slot holding the **HTTP path**, while
+  `_.fcp.DatabricksCatalog.true...dbname` is the **Unity catalog**. Reading neither emitted an empty
+  `HttpPath` and degraded the table to `#table(type table [], {})`; blindly stripping the prefix is
+  worse, writing `/sql/1.0/warehouses/...` into `database` -- a wrong value that looks entirely
+  plausible and passes every structural check. Which variant is live is recorded in
+  `<document-format-change-manifest>`, whose ENTRY carries the same prefix while the feature is
+  unpromoted (`<_.fcp.DatabricksCatalog.true...DatabricksCatalog />`) and is bare once promoted
+  (`<DatabricksCatalog />`). `_resolve_fcp_attributes` now resolves the live state onto the plain
+  attribute names in ONE pass over the datasource, before any connection reader runs, so
+  `_live_connection` / `_connection_facts` / `_http_path_of` / `_odbc_facts` need no knowledge of
+  FCP. Connector-agnostic: the rule comes from the manifest, not a per-connector table. Fail-closed
+  on four counts -- a feature the manifest does not name as unpromoted is skipped entirely; only the
+  named state is read (so `.false...dbname` can never become `database`); an empty live value never
+  overwrites or materialises a plain attribute; and a manifest entry whose suffix does not repeat
+  its own feature is not a state declaration. An unset catalog is still never invented -- the
+  partition scaffolds with an honest reason rather than guessing `main`/`hive_metastore`. Verified
+  against the real Tableau 2021.3 export published on #92 (HTTP path recovered, catalog correctly
+  left unset, and with a catalog present the partition emits real
+  `Databricks.Catalogs(#"Server", #"HttpPath")` navigation with every M parameter defined), and
+  proven a no-op across **52 real Tableau assets** (15 Databricks / Snowflake / Azure SQL exports
+  among them, all carrying the promoted shape and ZERO FCP attributes) plus the full 29-workbook
+  corpus, byte-for-byte.
+
 - **tableau-migration (skill `2.69.0` -> `2.70.0`): a reconstructed plain island gets its OWN M
   parameter set (closes the gap 2.69.0 opened, and issue #91's shape for a new input class).**
   2.69.0 reconstructed a plain datasource's lone upstream onto its RELATIONS, which is what routing

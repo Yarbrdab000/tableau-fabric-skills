@@ -322,6 +322,82 @@ def _named_connections(datasource):
 _HTTP_PATH_ATTRS = ("v-http-path", "http-path", "httppath", "http_path")
 
 
+# Tableau's "forward-compatible persistence" (FCP) namespace. While a document-format feature is in
+# transition, Tableau writes a connection attribute under BOTH spellings in the SAME element:
+#
+#   _.fcp.DatabricksCatalog.false...dbname      = '/sql/1.0/warehouses/...'   <- legacy slot
+#   _.fcp.DatabricksCatalog.true...dbname       = ''                          <- the Unity catalog
+#   _.fcp.DatabricksCatalog.true...v-http-path  = '/sql/1.0/warehouses/...'   <- the HTTP path
+#
+# The two variants carry DIFFERENT MEANINGS, not one value under two names, so a blind prefix-strip
+# is worse than not reading them at all: taking `.false...dbname` writes an HTTP path into
+# `database` -- a wrong value that looks entirely plausible and passes every structural check.
+#
+# Which variant is live is recorded in the datasource's <document-format-change-manifest>, and the
+# manifest ENTRY is prefixed in exactly the same way while the feature is unpromoted:
+#
+#   <_.fcp.DatabricksCatalog.true...DatabricksCatalog />   -> unpromoted; the live state is `true`
+#   <DatabricksCatalog />                                  -> promoted; attributes are written plain
+#
+# That gives a deterministic, connector-agnostic rule rather than a per-connector guess: read the
+# state the manifest names, ignore every other state. Ground truth: the promoted shape is what
+# current Tableau writes (verified across 15 real Databricks / Snowflake / Azure SQL exports, ZERO
+# of which carry an FCP attribute); the prefixed shape comes from a real Tableau 2021.3 export.
+_FCP_ATTR_RE = re.compile(r"^_\.fcp\.([A-Za-z0-9]+)\.([A-Za-z0-9]+)\.\.\.(.+)$")
+
+
+def _fcp_live_states(datasource):
+    """``{feature: live-state}`` for every UNPROMOTED feature the manifest names.
+
+    A promoted entry (bare ``<DatabricksCatalog />``) is deliberately absent from the result: its
+    attributes are already written under their plain names, so there is nothing to resolve.
+    """
+    states = {}
+    for manifest in _findall_local(datasource, "document-format-change-manifest"):
+        for entry in list(manifest):
+            m = _FCP_ATTR_RE.match(_local(entry.tag))
+            if m and m.group(3) == m.group(1):
+                states[m.group(1)] = m.group(2)
+    return states
+
+
+def _resolve_fcp_attributes(datasource):
+    """Rewrite live FCP-prefixed connection attributes under their plain names, in place.
+
+    Applied once, to the whole datasource subtree, BEFORE any connection reader runs -- so
+    ``_live_connection`` / ``_connection_facts`` / ``_http_path_of`` / ``_odbc_facts`` all see the
+    resolved attribute without knowing FCP exists.
+
+    Fail-closed on three counts, each of which prevents a plausible-looking wrong value:
+
+    * a feature the manifest does not name as unpromoted is skipped entirely (we do not guess which
+      of the two variants is live);
+    * only the state the manifest names is read -- the other state's attributes are left untouched
+      and never consulted, so ``.false...dbname`` can never become ``database``;
+    * an EMPTY live value never overwrites an existing plain attribute (an unset Unity catalog must
+      not erase a real one), and the FCP attributes are left in place rather than deleted, so this
+      is purely additive.
+
+    No manifest, or no FCP attributes, is a no-op -- which is every currently-shipping Tableau
+    export we have measured.
+    """
+    states = _fcp_live_states(datasource)
+    if not states:
+        return
+    for conn in datasource.iter():
+        if _local(conn.tag) != "connection":
+            continue
+        for raw, value in list(conn.attrib.items()):
+            m = _FCP_ATTR_RE.match(raw)
+            if not m:
+                continue
+            feature, state, attr = m.groups()
+            if states.get(feature) != state:
+                continue
+            if value and not conn.get(attr):
+                conn.set(attr, value)
+
+
 def _http_path_of(conn):
     """Return the Databricks SQL-warehouse HTTP path from whichever attribute carries it, or None."""
     for attr in _HTTP_PATH_ATTRS:
@@ -1867,6 +1943,12 @@ def parse_tds(xml_text, select=None):
     """
     root = ET.fromstring(xml_text)
     datasource = _choose_datasource(root, select)
+
+    # Resolve any live FCP-prefixed connection attributes onto their plain names BEFORE any
+    # connection reader runs, so a transitional document-format export (e.g. Tableau 2021.3's
+    # `_.fcp.DatabricksCatalog.true...v-http-path`) is read exactly like a current one. No-op
+    # without an unpromoted manifest entry. See `_resolve_fcp_attributes`.
+    _resolve_fcp_attributes(datasource)
 
     cls, server, dbname, warehouse, http_path, auth_method, nconns = _live_connection(datasource)
     cols_by_parent = _columns_by_parent(datasource)
