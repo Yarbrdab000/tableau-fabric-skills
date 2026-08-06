@@ -12,6 +12,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.72.0` -> `2.73.0`): Tableau's AUTOMATIC continuous colour ramp is
+  now curated from Tableau's own rendered output instead of a generic ColorBrewer stand-in.** When
+  the author keeps the default palette, Tableau serialises the colour encoding
+  (`type='interpolated'`) but NO `<color-palette>` element, so the ramp is not recoverable from the
+  XML -- it is a curated constant, disclosed via `default_palette` (warn-never-wrong). The previous
+  stand-ins ("Blues" sequential / "RdBu" diverging) had the right DIRECTION but the wrong HUE. Two
+  corpus workbooks serialise an unnamed `interpolated` encoding AND ship a reference render of what
+  Tableau actually drew; pixel-sampling both gives one coherent GREEN family: `0063` (SUM(Sales),
+  positive-only, filled map) is entirely green -- palest `#dde4bc` through mid `#95cb7d`, with no red
+  anywhere -- while `0064` (SUM(Profit), signed, bar chart) runs dark green `#076229` at the maximum,
+  near-white at zero, to red `#cc1617` at the minimum. ONE palette explains both: red at the negative
+  extreme, near-white at zero, green at the positive extreme, with an all-positive measure simply
+  never reaching the red arm. The sequential default is therefore that palette's white->green arm, so
+  the two constants stay in the same family. Corpus effect: exactly ONE visual changes
+  (`0064`'s Challenge chart), 29/29 openable outputs and zero DoD failures unchanged;
+  render-verified in Power BI Desktop (per-bar green ramp, October darkest, May palest). An
+  explicitly NAMED palette still wins over the default, `reverse` still flips it, and the disclosure
+  flag is now pinned by test.
+
 - **tableau-migration (skill `2.71.0` -> `2.72.0`): Microsoft Access rebuilds as an
   `Access.Database` file partition -- the deterministic corpus now reaches 29/29 openable outputs.**
   Access is a FILE database, not a server: Tableau records it exactly like Excel/CSV (a

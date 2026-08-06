@@ -2983,16 +2983,37 @@ _GRADIENT_PALETTE_TYPES = ("ordered-diverging", "ordered-sequential")
 
 # Tableau hard-codes its "automatic" continuous colour ramp: when the author keeps the default, it
 # serialises the colour encoding (``type='interpolated'``) but NO ``<color-palette>`` element, so the
-# exact ramp cannot be recovered from the workbook XML. These standard ColorBrewer ramps -- "Blues"
-# (sequential) and "RdBu" (diverging), the published colour-science families Tableau's own defaults
-# derive from -- stand in for that default with faithful DIRECTION (low -> light, high -> dark) and
-# are DISCLOSED at emit time, so a default heat scale is reconstructed rather than silently dropped.
-# Provenance: original work. The stop values are an unprotectable published colour-science fact
-# (ColorBrewer, Cynthia Brewer / Penn State), sourced independently -- not copied from any migration
-# tool. The reference tool cyphou/Tableau-To-PowerBI keys all colour handling on an explicit
-# ``<color-palette>`` and has no default-ramp handling, so this default-synthesis path is entirely ours.
-_DEFAULT_SEQUENTIAL_COLORS = ("#eff3ff", "#08519c")
-_DEFAULT_DIVERGING_COLORS = ("#ca0020", "#f7f7f7", "#0571b0")
+# exact ramp cannot be recovered from the workbook XML -- it is a CURATED CONSTANT, disclosed via
+# ``default_palette`` (warn-never-wrong), not a parse.
+#
+# The stops below are MEASURED from Tableau's own rendered output, replacing an earlier pair of
+# generic ColorBrewer stand-ins ("Blues" / "RdBu") that had the right DIRECTION but the wrong HUE.
+# Two corpus workbooks serialise an ``interpolated`` colour encoding with no palette AND ship a
+# reference render of what Tableau actually drew; pixel-sampling both (skipping neutral chrome) gives
+# one coherent GREEN family, not blue:
+#
+#   * positive-only measure  (0063, SUM(Sales) on a filled map): every mark is GREEN --
+#     palest ``#dde4bc`` through mid ``#95cb7d`` to dark green. NO red appears at all.
+#   * signed measure         (0064, SUM(Profit) on a bar chart): dark green ``#076229`` at the
+#     maximum (+38.4k), fading through near-white around zero, to red ``#cc1617`` at the minimum
+#     (-25.1k). Mid greens ``#257f36`` / ``#73a86b`` and mid reds ``#dd4738`` / ``#f57d69`` sit
+#     between, so it is a continuous ramp, not a two-tone split.
+#
+# ONE palette explains both: red at the negative extreme, near-white at zero, green at the positive
+# extreme -- an all-positive measure simply never reaches the red arm, which is exactly the
+# single-hue green 0063 shows. The sequential pair is therefore that palette's white->green arm, so
+# the two constants stay in the same family instead of disagreeing.
+#
+# CONFIDENCE: two workbooks, two reference renders, pixel-sampled -- a curated constant, and the
+# corpus's own rule table classifies "Tableau's built-in default palette endpoints" as exactly that
+# (not derivable from the XML; needs a curated table plus a confidence flag). The DIRECTION
+# (low -> light, high -> dark) is unchanged and was never in doubt.
+#
+# Provenance: original work -- measured from reference renders in our own corpus. The reference tool
+# cyphou/Tableau-To-PowerBI keys all colour handling on an explicit ``<color-palette>`` and has no
+# default-ramp handling, so this default-synthesis path is entirely ours.
+_DEFAULT_SEQUENTIAL_COLORS = ("#dde4bc", "#076229")
+_DEFAULT_DIVERGING_COLORS = ("#cc1617", "#f7f7f7", "#076229")
 
 # Tableau also ships BUILT-IN NAMED continuous palettes (e.g. ``orange_blue_diverging_10_0``) that it
 # serialises by NAME + ``min`` / ``max`` / ``reverse`` only -- NO explicit ``<color-palette>`` stops --
