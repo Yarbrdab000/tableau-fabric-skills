@@ -12,6 +12,17 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.83.0` -> `2.84.0`): Tier-3 work order generator.** New
+  `scripts/work_order.py` turns a finished run into one per-dashboard handoff document for the agent
+  that takes the report to full visual fidelity. It PUSHES pre-resolved answers rather than telling the
+  reader where to look: every item carries the exact emitted `visual.json` path (joined on the
+  worklist's recorded visual name, so no searching and no guessing), items are batched by FIX
+  MECHANISM so one procedure covers N visuals and costs one verify cycle, each batch states that
+  procedure explicitly, and mechanism-relevant corpus precedent is inlined. A `PART B` lists visuals
+  nothing was flagged against so they are not re-audited, and is deliberately conservative: a visual is
+  only listed there when it can be proven unflagged by NAME. The document imposes no time or step
+  budget, and says so -- turns are measured, never imposed -- and `PART D` states that finishing the
+  list is the start of the reader's judgement, not the end of the work.
 - **tableau-migration (skill `2.82.0` -> `2.83.0`): reference images become part of the RUN -- new
   **D7** decision + **STEP 1.6**.** The acquisition machinery existed but nothing invoked it, so no run
   produced an image. D7 is a single follow-up question whose options are **conditional on D1**: a live
