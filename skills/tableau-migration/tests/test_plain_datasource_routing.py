@@ -16,6 +16,7 @@ navigation defect it made reachable.
 """
 
 import os
+import re
 import sys
 
 import pytest
@@ -23,6 +24,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "scripts"))
 
+from assemble_model import assemble_import_model  # noqa: E402
 from connection_to_m import (  # noqa: E402
     _excel_sheet_name,
     _self_connection_facts,
@@ -73,6 +75,22 @@ def _plain_sql_tds(ds_name, server, dbname, table="Orders"):
         <metadata-record class='column'>
           <remote-name>Name</remote-name><local-name>[Name]</local-name>
           <parent-name>[{table}]</parent-name><local-type>string</local-type>
+        </metadata-record>
+      </metadata-records>
+    </datasource>
+    """
+
+
+def _plain_snowflake_tds(ds_name, server, warehouse, table="Returns"):
+    return f"""
+    <datasource name='{ds_name}'>
+      <connection class='snowflake' server='{server}' dbname='SnowDb' warehouse='{warehouse}'>
+        <relation name='{table}' table='[PUBLIC].[{table}]' type='table' />
+      </connection>
+      <metadata-records>
+        <metadata-record class='column'>
+          <remote-name>Id</remote-name><local-name>[Id]</local-name>
+          <parent-name>[{table}]</parent-name><local-type>integer</local-type>
         </metadata-record>
       </metadata-records>
     </datasource>
@@ -144,6 +162,120 @@ def test_reconstructed_facts_match_the_federated_named_connection_key_shape():
         assert key in facts, key
     assert "flatfile_path" not in facts, (
         "the driver pins the ABSOLUTE path per-relation; a relative one here would win over it")
+
+
+# -- each reconstructed island needs its OWN M parameter set (issue #91's shape) --------------
+
+
+def _m_params(descriptor):
+    """``(defined, referenced)`` M parameter names for an assembled model."""
+    parts = assemble_import_model(descriptor, model_name="probe", date_table=False)["parts"]
+    expr = parts.get("definition/expressions.tmdl", "")
+    defined = set(re.findall(r"^expression\s+(\S+)\s*=", expr, re.M))
+    referenced = set()
+    for path, txt in parts.items():
+        if "/tables/" in path:
+            referenced |= set(re.findall(r'#"([^"]+)"', txt))
+    return defined, referenced, expr, parts
+
+
+def test_reconstructed_islands_get_per_connection_m_parameters():
+    """Registering the reconstructed upstream on the RELATIONS alone is not enough: the parameter
+    SETS are derived from ``descriptor["connections"]``. Leaving that empty emitted one shared
+    Server/Database/Warehouse set while every relation routed to its own upstream -- the
+    refresh-breaking shape fixed for federated sources in 2.60.0 (an undefined ``#"Warehouse"``)."""
+    sql = parse_tds(_plain_sql_tds("SQL DS", "hostA.example.com", "DbA", table="Orders"))
+    snow = parse_tds(_plain_snowflake_tds("SNOW DS", "acct.snowflakecomputing.com", "WH1"))
+    combined = combine_descriptors([sql, snow], captions=["SQL DS", "SNOW DS"])
+
+    defined, referenced, _expr, _parts = _m_params(combined)
+    assert not (referenced - defined), (
+        f"partitions reference M parameters that are never defined: {sorted(referenced - defined)}")
+    assert "Warehouse_snowflake" in defined
+    assert "Server_sqlserver" in defined
+
+
+def test_two_same_class_islands_never_collapse_onto_one_server():
+    """The SILENT variant, and the worse one: two plain Azure SQL datasources on DIFFERENT servers.
+    Nothing is undefined, so nothing fails -- the second table just quietly points at the FIRST
+    server and either errors with "invalid object name" or returns the WRONG data. The invariant:
+    N distinct (server, database) pairs must emit N distinct parameter sets."""
+    sales = parse_tds(_plain_sql_tds("Sales", "sales-sql.example.net", "salesdb", table="Orders"))
+    hr = parse_tds(_plain_sql_tds("HR", "hr-sql.example.net", "hrdb", table="Employees"))
+    combined = combine_descriptors([sales, hr], captions=["Sales", "HR"])
+
+    defined, referenced, expr, parts = _m_params(combined)
+    assert not (referenced - defined)
+
+    values = dict(re.findall(r'expression\s+(\S+)\s*=\s*"([^"]*)"', expr))
+    servers = {v for k, v in values.items() if k.startswith("Server")}
+    assert servers == {"sales-sql.example.net", "hr-sql.example.net"}, servers
+
+    sources = {p.split("/")[-1]: t for p, t in parts.items() if "/tables/" in p}
+    orders = sources["Orders.tmdl"]
+    employees = sources["Employees.tmdl"]
+    assert values[re.search(r'Sql\.Database\(#"([^"]+)"', orders).group(1)] == "sales-sql.example.net"
+    assert values[re.search(r'Sql\.Database\(#"([^"]+)"', employees).group(1)] == "hr-sql.example.net"
+
+
+def test_two_islands_over_the_same_upstream_share_one_parameter_set():
+    """Identity is by CONTENT: a Challenge/Solution pair over the SAME file is one upstream, so it
+    must NOT be split into two redundant parameter sets (that is the whole corpus shape)."""
+    a = parse_tds(_plain_sql_tds("DS A", "host.example.com", "Db", table="Orders"))
+    b = parse_tds(_plain_sql_tds("DS B", "host.example.com", "Db", table="Returns"))
+    combined = combine_descriptors([a, b], captions=["DS A", "DS B"])
+
+    defined, referenced, _expr, _parts = _m_params(combined)
+    assert not (referenced - defined)
+    assert defined == {"Server", "Database"}, (
+        f"one distinct upstream must keep the bare, unsuffixed names; got {sorted(defined)}")
+
+
+def test_flat_file_islands_reference_no_connection_parameters():
+    """A flat-file island navigates a literal ``File.Contents`` path and references no parameters,
+    so registering its reconstructed connection must not start emitting empty ones."""
+    a = parse_tds(_plain_excel_tds("DS A", "Data/A.xlsx"))
+    b = parse_tds(_plain_excel_tds("DS B", "Data/B.xlsx"))
+    combined = combine_descriptors([a, b], captions=["DS A", "DS B"])
+
+    defined, referenced, expr, _parts = _m_params(combined)
+    assert not expr.strip(), f"flat files need no connection parameters, got: {expr!r}"
+    assert not defined and not referenced
+
+
+def test_a_federated_island_and_a_plain_island_each_keep_their_own_parameters():
+    """The mixed shape: one FEDERATED island (its upstream already in the named-connection map) plus
+    one PLAIN island (reconstructed). Both upstreams must be represented exactly once."""
+    federated = """
+    <datasource name='Fed'>
+      <connection class='federated'>
+        <named-connections>
+          <named-connection name='c1'>
+            <connection class='snowflake' server='acct.snowflakecomputing.com' dbname='SnowDb'
+                        warehouse='WH1' />
+          </named-connection>
+        </named-connections>
+        <relation connection='c1' name='Returns' table='[PUBLIC].[Returns]' type='table' />
+      </connection>
+      <metadata-records>
+        <metadata-record class='column'>
+          <remote-name>Id</remote-name><local-name>[Id]</local-name>
+          <parent-name>[Returns]</parent-name><local-type>integer</local-type>
+        </metadata-record>
+      </metadata-records>
+    </datasource>
+    """
+    combined = combine_descriptors(
+        [parse_tds(federated), parse_tds(_plain_sql_tds("SQL DS", "hostA.example.com", "DbA"))],
+        captions=["Fed", "SQL DS"])
+
+    defined, referenced, expr, _parts = _m_params(combined)
+    assert not (referenced - defined), sorted(referenced - defined)
+    values = dict(re.findall(r'expression\s+(\S+)\s*=\s*"([^"]*)"', expr))
+    assert sorted(v for k, v in values.items() if k.startswith("Server")) == [
+        "acct.snowflakecomputing.com", "hostA.example.com"]
+    assert len([k for k in values if k.startswith("Warehouse")]) == 1, (
+        "the federated island's upstream must be represented exactly ONCE")
 
 
 # -- fail-closed ----------------------------------------------------------------------------

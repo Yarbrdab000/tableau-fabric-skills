@@ -2154,6 +2154,17 @@ def combine_descriptors(descriptors, *, captions=None):
         origin_conn = dconns[0] if len(dconns) == 1 else None
         if origin_conn is None and not dconns:
             origin_conn = _self_connection_facts(desc)
+            if origin_conn is not None:
+                # Register the reconstructed upstream as a first-class connection of the combined
+                # descriptor, not only on its relations. `connection_parameter_suffixes` /
+                # `connection_parameter_specs` derive the M parameter SETS from
+                # `descriptor["connections"]`, so leaving it empty here would emit ONE shared
+                # Server/Database/Warehouse set while each relation routed to its own upstream --
+                # exactly the refresh-breaking (and, between two servers of the same class, SILENTLY
+                # wrong-data) shape fixed for federated sources in 2.60.0. Keyed by island position
+                # so the id is deterministic, unique, and cannot collide with a Tableau
+                # named-connection id.
+                combined["connections"][f"__island{i}__"] = origin_conn
         rename = {}  # old display -> new display, for THIS datasource only
         for rel in desc.get("relations", []) or []:
             if rel.get("kind") not in ("table", "custom_sql"):

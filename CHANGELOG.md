@@ -12,6 +12,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.69.0` -> `2.70.0`): a reconstructed plain island gets its OWN M
+  parameter set (closes the gap 2.69.0 opened, and issue #91's shape for a new input class).**
+  2.69.0 reconstructed a plain datasource's lone upstream onto its RELATIONS, which is what routing
+  consumes -- but the M parameter SETS are derived from `descriptor["connections"]`, which stayed
+  empty. So a workbook consolidating two plain LIVE-DATABASE datasources emitted one shared
+  `Server`/`Database`/`Warehouse` set while each relation routed to its own upstream: exactly the
+  refresh-breaking shape fixed for federated sources in 2.60.0 (`The name 'Warehouse' wasn't
+  recognized`), and -- between two servers of the SAME class -- the strictly worse SILENT variant,
+  where nothing is undefined, the model refreshes, and the second table quietly reads the FIRST
+  server. Before 2.69.0 that input was declined outright, so this was a regression in kind.
+  `combine_descriptors` now also registers each reconstructed upstream in `combined["connections"]`
+  under a deterministic per-island key, so `connection_parameter_suffixes` /
+  `connection_parameter_specs` see it and the invariant issue #91 asked for holds: **N distinct
+  (server, database) pairs emit N distinct parameter sets.** Identity is by CONTENT, so a
+  Challenge/Solution pair over the SAME upstream still shares one unsuffixed set. Verified
+  byte-for-byte no-op across the whole 29-workbook corpus (all flat file, which references no
+  connection parameters -- and is why 2.69.0's corpus validation could not have caught this).
+
 - **tableau-migration (skill `2.68.0` -> `2.69.0`): consolidating plain single-connection
   datasources no longer declines the whole workbook rebuild.** Tableau writes a
   `<named-connections>` block only for a FEDERATED datasource; a plain single-upstream datasource
