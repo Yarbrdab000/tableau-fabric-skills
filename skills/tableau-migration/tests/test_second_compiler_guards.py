@@ -7,7 +7,8 @@ rejection filters -- they never author or alter a candidate:
     generated model (catches the ``(copy)_NNNN`` duplicate-name trap); a bare reference to an inert
     SIBLING measure (the dependency graph's own job) only WARNS, never blocks; and
   * the RECONCILIATION oracle -- a candidate whose value diverges from the Tableau formula over landed
-    data is rejected (PASS and INCONCLUSIVE both land -- a false PASS is worse than a stub).
+    data is rejected; PASS and INCONCLUSIVE both land, because ``inconclusive`` means "not checkable
+    here", not "wrong", and so must leave the candidate exactly where the syntactic gate left it.
 
 The load-bearing invariant: ``guards=None`` is byte-identical to the unguarded driver, so the 2467
 existing tests are untouched and these only exercise the additive rejection behaviour + telemetry.
@@ -144,7 +145,7 @@ def test_gate_ok_oracle_fail_rejects_and_pass_lands():
                        tableau_formula="SUM([Sales])") is True
 
 
-# --- (f) PASS and INCONCLUSIVE both land (a false PASS is worse than a stub) ----------------------
+# --- (f) PASS and INCONCLUSIVE both land ("not checkable" is not "wrong") -------------------------
 def test_gate_ok_oracle_inconclusive_lands():
     guards = {"surface": None, "tables": {"Orders": {"columns": ["Sales"], "rows": [{"Sales": 10}]}},
               "resolver": lambda _c: None}
@@ -191,3 +192,64 @@ def test_guard_verdicts_telemetry_present_for_landed_calcs():
     for nm in ("Base", "Plus", "Ratio"):
         assert gv[nm]["reference"] == "ok"             # all references resolve in the model surface
         assert gv[nm]["oracle"] == "skipped"           # no landed data -> oracle not consulted
+
+
+# --- (j) the documented VETO contract: the oracle strictly SUBTRACTS ------------------------------
+# An `inconclusive` verdict means "not checkable here", NOT "wrong", so it must leave a candidate
+# exactly where the syntactic gate left it. Locked at the DRIVER level (not just `_gate_ok`) because
+# this is the safety policy `reconciliation_oracle` documents: turning the oracle on may only ever
+# REMOVE candidates that a numeric divergence proves wrong -- never add, alter, or withhold one.
+def _oracle_guards():
+    """Data-only guards (no surface) whose oracle can genuinely run over landed rows."""
+    return {"surface": None, "tables": _num_tables(), "resolver": _num_resolver}
+
+
+def test_inconclusive_population_lands_identically_with_and_without_the_oracle():
+    # Every calc in _STUB_CHAIN is out of the v1 subset (SCRIPT_REAL / unresolved calc refs) -> the
+    # oracle can check NONE of them. Guarded output must be byte-identical to unguarded.
+    wb = _wb(_STUB_CHAIN)
+    authored = {"Base": "SUM('Orders'[Sales])"}
+    unguarded = SC.land_second_compiler(wb, authored=authored)
+    guarded = SC.land_second_compiler(wb, authored=authored, guards=_oracle_guards())
+    assert guarded == unguarded
+    assert set(guarded) == {"Base", "Plus", "Ratio"}       # the pass is not neutered by guards
+
+
+# A checkable calc: `SUM([Sales])` is inside the oracle's v1 subset, so a divergent candidate for it
+# is genuinely provable-wrong (the ONLY thing the oracle is allowed to reject).
+_CHECKABLE = "\n".join([
+    _col("Base", "Calculation_base", 'SCRIPT_REAL(&quot;x&quot;, SUM([Sales]))'),
+    _col("Total", "Calculation_total", "SUM([Sales])"),
+])
+
+
+def test_driver_rejects_only_the_provably_divergent_candidate():
+    detail = SC._land(_wb(_CHECKABLE),
+                      authored={"Base": "SUM('Orders'[Sales])",        # INCONCLUSIVE -> lands
+                                "Total": "SUM('Orders'[Profit])"},     # FAIL (30 != 3) -> rejected
+                      guards=_oracle_guards())
+    assert "Base" in detail["approved"]
+    assert "Total" in detail["gate_failures"]
+    assert "Total" not in detail["approved"]
+    # Control: without the oracle the SAME divergent candidate lands, proving the block is its doing.
+    plain = SC._land(_wb(_CHECKABLE), authored={"Base": "SUM('Orders'[Sales])",
+                                                "Total": "SUM('Orders'[Profit])"})
+    assert "Total" in plain["approved"]
+
+
+def test_oracle_absence_and_error_both_fail_open_like_inconclusive():
+    guards = _oracle_guards()
+    # (1) no Tableau formula to reconcile against -> nothing to prove -> lands
+    assert SC._gate_ok("SUM('Orders'[Sales])", True, guards=guards, tableau_formula=None) is True
+    # (2) the oracle itself raising must never reject a syntactically clean candidate
+    real = SC._reconciliation_oracle.reconcile
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("oracle exploded")
+
+    SC._reconciliation_oracle.reconcile = _boom
+    try:
+        assert SC._gate_ok("SUM('Orders'[Sales])", True, guards=guards,
+                           tableau_formula="SUM([Sales])") is True
+    finally:
+        SC._reconciliation_oracle.reconcile = real

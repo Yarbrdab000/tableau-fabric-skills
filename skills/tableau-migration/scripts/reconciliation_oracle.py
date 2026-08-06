@@ -14,8 +14,29 @@ worst possible outcome, strictly worse than leaving a stub. So the oracle:
   * evaluates both over the real landed rows at the grand total (plus any caller-supplied grain),
   * returns ``pass`` ONLY when both sides parse inside a tight supported subset, evaluate without
     error, and agree over the data; a mismatch is ``fail``; anything else (out of subset, no data,
-    unresolved reference, multi-table) is ``inconclusive`` -- which, under faithful-or-stub, keeps
-    the stub.
+    unresolved reference, multi-table) is ``inconclusive`` -- which means "NOT CHECKABLE HERE", not
+    "wrong".
+
+That conservatism governs the VERDICT, not the landing decision. This module is a **veto on proven
+divergence**, never a certifier: its consumer (:func:`second_compiler._oracle_ok`) rejects ``fail``
+and nothing else, so ``pass`` and ``inconclusive`` BOTH LAND. Stated outright because the wording
+here used to imply the opposite:
+
+  * ``inconclusive`` leaves a candidate at exactly the confidence the syntactic and reference gates
+    already gave it -- byte-identical to running the driver with ``guards=None``. The oracle strictly
+    SUBTRACTS; it can only ever reject candidates that would otherwise have landed. That is the same
+    fail-open policy already applied when there is no landed data, no Tableau formula, or the oracle
+    raises -- ``inconclusive`` is simply that absence expressed as a verdict.
+  * it is also the only coherent policy for a v1 subset this narrow. The second compiler exists to
+    land the calcs the deterministic translator could NOT (LOD, table-calc and idiom forms), which
+    are by construction mostly OUTSIDE the subset below -- so rejecting ``inconclusive`` would veto
+    nearly everything the pass produces, making "guards on" equivalent to "pass off".
+
+*Faithful-or-stub* is a separate, UPSTREAM contract and does not decide this: it binds the
+TRANSLATOR (never emit an approximation; with no faithful form, keep the inert stub -- see
+``resources/second-compiler.md``). It says nothing about an oracle being unable to check a form that
+was already authored faithfully, and the human authorization for the whole pass happens before any
+of this runs.
 
 Supported subset (v1): a measure that is an arithmetic combination (``+ - * /`` / ``DIVIDE``) of
 single-column aggregations (``SUM/AVG/MIN/MAX/COUNT/COUNTD/MEDIAN`` and the ``*X`` row-iterator

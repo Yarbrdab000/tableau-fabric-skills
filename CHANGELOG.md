@@ -12,6 +12,16 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.75.0` -> `2.76.0`):** resolved the contradictory `inconclusive`
+  reconciliation policy documented in two places (#94). Behaviour is unchanged and was already
+  correct -- `reconciliation_oracle` is a **veto on proven divergence**, so `pass` and `inconclusive`
+  both land -- but its own module docstring claimed `inconclusive` "keeps the stub", a policy nothing
+  enforces and the opposite of what the consumer does. Rewrote it to state the veto contract, why
+  `inconclusive` ("not checkable here") must fail open exactly like the existing no-data / no-formula
+  / oracle-raised paths, and that *faithful-or-stub* is the upstream **translator** contract that
+  does not decide this. Added driver-level tests locking the strictly-subtractive invariant: an
+  entirely-inconclusive population lands byte-identically with and without the oracle, and only a
+  provably divergent candidate is rejected.
 - **tableau-migration (skill `2.74.0` -> `2.75.0`): new `endpoints_distinct` openability check --
   a model collapsed onto one upstream no longer passes silently (issue #93).** Every other check asks
   whether the model is well FORMED. A model whose tables have been collapsed onto a single endpoint

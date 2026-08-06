@@ -187,7 +187,16 @@ def _reference_ok(dax, guards):
 
 
 def _oracle_ok(dax, guards, tableau_formula):
-    """Reconciliation oracle: reject ONLY a genuine numeric divergence (FAIL); PASS/INCONCLUSIVE land."""
+    """Reconciliation oracle: a VETO on proven divergence -- reject FAIL only; PASS/INCONCLUSIVE land.
+
+    ``inconclusive`` means the oracle could not CHECK this candidate (out of its narrow subset, no
+    landed rows, unresolved reference), not that the candidate is wrong -- so it leaves the candidate
+    exactly where the syntactic and reference gates left it, identical to ``guards=None``. Divergence,
+    and only divergence, is evidence of a wrong answer. Rejecting ``inconclusive`` would turn this
+    filter into a second translator and veto most of what the pass exists to land; ``faithful-or-stub``
+    is the upstream TRANSLATOR contract and is not what decides this. See
+    :mod:`reconciliation_oracle` for the full rationale.
+    """
     tables = guards.get("tables")
     if not tables or not tableau_formula:
         return True
