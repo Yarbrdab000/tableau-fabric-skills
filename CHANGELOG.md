@@ -12,6 +12,30 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.77.0` -> `2.78.0`): new `scripts/fabric_oracle.py` -- the `fabric_oracle`
+  seam, so the Tier-1 empirical loop is finally REACHABLE (#96).** `translation_reconcile` is the offline
+  half of the second compiler's numeric proof and deliberately executes nothing; the executing half is an
+  injected `fabric_oracle(dax_query) -> result` callable that **nothing in the repo ever passed**, leaving
+  that half written, tested and unreachable. This module is the wiring, and it still executes no DAX and
+  adds no dependency. It (a) states the contract, with `normalize_result` delegating to
+  `translation_reconcile.extract_scalar` so there is exactly ONE envelope parser and the two cannot drift;
+  (b) lets an arbitrary executor **self-certify offline** with a single trivial probe (`conforms` checks
+  callable / one-positional-DAX-string / does-not-raise / readable-result, and distinguishes an oracle that
+  honestly REPORTED an error from one that returned an unreadable shape); (c) adapts an external process
+  into the callable shape -- `subprocess_oracle` for cheap startup, `persistent_oracle` (a context manager
+  speaking newline-delimited JSON) for an executor whose startup is expensive, since opening and refreshing
+  a PBIP in Desktop costs minutes and re-launching per query is not viable; and (d) drives the loop with
+  `verify_model`. Measures are read from the emitted **TMDL**, which already carries BOTH sides -- the
+  landed DAX and the original `annotation TableauFormula` -- so no report-schema change was needed.
+  **The safety property: nothing reads `verified` without both sides present.** No oracle, no ground truth,
+  an oracle that returns `{"error": ...}`, and an oracle that raises all yield `not-evaluated` *by
+  construction*, so an unverified model can never be misread as green, and a failed executor can never
+  become a fabricated `0` that compares equal to a real one. CLI sidecar
+  `--model-dir ... [--oracle-cmd ... [--persistent]] [--ground-truth ...]`, exiting non-zero only on a
+  proven `mismatch`. Opt-in and off the default migrate path (byte-identical when unused). The TMDL reader
+  is validated against **4,591 real emitted measures across 2,520 corpus TMDL files** (zero discrepancies,
+  zero property leaks) plus round-trips through the real `tmdl_generate` emitter for the multi-line
+  `VAR`/`RETURN` block form the corpus happens not to contain. 33 tests, 7/7 mutants killed.
 - **tableau-migration (skill `2.76.0` -> `2.77.0`): new `scripts/estate_survey.py` -- published-datasource
   dependency graph resolved from REST ground truth, so estate sizing stops lying (#98).** Sizing an estate
   from the Metadata API's `embeddedDatasources` (the natural one-call way) scores every workbook backed by
