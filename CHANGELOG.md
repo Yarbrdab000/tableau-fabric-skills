@@ -12,6 +12,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.73.0` -> `2.74.0`): the estate path now CARRIES the remediation
+  worklist (issue #95), and reference capture survives a mid-loop Tableau Cloud session death
+  (issue #97).**
+  - **#95** -- `twb_to_pbir` already built the per-visual remediation worklist and handed it back on
+    `result["worklist"]`, but `migrate_estate` had zero references to it, so the richest
+    machine-readable artifact the engine produces was computed and then dropped exactly where an
+    agent or CI job reads it. A consumer saw `pending_gates[{gate: "dashboard_audit", count: N}]` --
+    HOW MANY visuals need attention but not WHICH -- and had to re-derive the targets from the
+    emitted PBIR, the very drift the worklist exists to prevent. Each `workbooks[]` entry now carries
+    `remediation_worklist` alongside `viz_fidelity` (which stays: it is the thinner per-worksheet
+    projection the report's own rollups count). Additive and fail-closed -- absent when the worklist
+    module is unimportable. Verified across the corpus: 29/29 workbooks now carry it, with per-visual
+    ids, severity and category.
+  - **#97** -- `acquire_reference_images` signed in ONCE and reused that token for every worksheet.
+    On Tableau Cloud a single REST session starts returning `401002` on the view-export endpoints
+    after an unpredictable number of exports and does NOT recover on that token. The per-sheet
+    exception catch could not tell "this sheet failed" from "the session died and every remaining
+    sheet will now fail", so the run **completed successfully having captured only the first few
+    worksheets** while the manifest looked structurally complete. Reported measurement on Cloud
+    (10ax, REST 3.29, 8 views, sequential): one sign-in captured **1/8**, a fresh sign-in per export
+    captured **8/8**. `401002` is now treated as a retryable SESSION-LOSS signal -- re-authenticate
+    once and retry that sheet -- and a retry that fails again is recorded as `session_lost` (distinct
+    from `error`) so a truncated capture is visible rather than looking like unrelated per-sheet
+    problems. Matched on the error CODE, not prose. Fail-closed: any other error stays a per-sheet
+    error and never burns a re-authentication. The additive `session_lost` / `session_recoveries`
+    keys appear only when non-zero, so a run that never loses its session returns exactly the
+    previous shape. Root cause deliberately NOT claimed -- the reporter tested and disproved three
+    hypotheses; the behaviour and the remedy are what is relied on.
+
 - **tableau-migration (skill `2.72.0` -> `2.73.0`): Tableau's AUTOMATIC continuous colour ramp is
   now curated from Tableau's own rendered output instead of a generic ColorBrewer stand-in.** When
   the author keeps the default palette, Tableau serialises the colour encoding

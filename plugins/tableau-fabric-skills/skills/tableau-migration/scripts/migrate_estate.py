@@ -1063,6 +1063,30 @@ def _fidelity_tier(status, visual_type, reason):
     return "degraded"
 
 
+def _viz_worklist(result):
+    """The per-visual remediation worklist a viz result already carries, or ``None``.
+
+    ``twb_to_pbir`` COMPUTES this (``remediation_worklist.build_worklist`` over the same warnings +
+    candidate records ``_viz_fidelity`` summarises) and hands it back on ``result["worklist"]`` -- but
+    nothing on the ESTATE path carried it into ``report.json``, so the richest machine-readable
+    artifact the engine produces was computed and then dropped exactly where an agent or CI job would
+    read it. A consumer saw ``pending_gates[{gate: "dashboard_audit", count: N}]`` -- HOW MANY visuals
+    need attention but not WHICH -- and had to re-derive the targets from the emitted PBIR, which is
+    the drift the worklist exists to prevent.
+
+    ``viz_fidelity`` is a thinner projection of the same facts (one row per worksheet); this is the
+    full per-ITEM audit with severity, category and remediation text. Both are kept: the summary is
+    what the report's own rollups count, the worklist is what a remediator acts on.
+
+    Returns ``None`` when the worklist module was unimportable or the viz stage produced none, so a
+    run without it is byte-identical to before (additive, never raises).
+    """
+    if not isinstance(result, dict):
+        return None
+    wl = result.get("worklist")
+    return wl if isinstance(wl, dict) else None
+
+
 def _viz_fidelity(result):
     """Per-worksheet rebuild fidelity from a viz result: ``[{worksheet, visual_type, status, reason, tier}]``.
 
@@ -2952,6 +2976,12 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                 # reported fidelity matches the project the user actually opens (warn-never-wrong: any
                 # warning the rebound run still emits is carried, never masked).
                 entry["viz_fidelity"] = _viz_fidelity(rebuilt)
+                # Carry the full per-visual remediation worklist too (see ``_viz_worklist``): the
+                # rebound pass is what lands in the openable .pbip, so its worklist is the one a
+                # remediator should act on.
+                _wl = _viz_worklist(rebuilt)
+                if _wl is not None:
+                    entry["remediation_worklist"] = _wl
                 entry["viz_implicit_row_count"] = sum(
                     1 for w in (rebuilt.get("warnings") or [])
                     if "implicit row count" in (w.get("reason") or ""))
@@ -3266,6 +3296,12 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_di
                   output_folder=output_folder,
                   viz_fidelity=_viz_fidelity(result),
                   viz_implicit_row_count=rc_unbound)
+
+    # The full per-visual remediation worklist (see ``_viz_worklist``) -- additive; absent when the
+    # worklist module is unimportable, so a run without it is byte-identical to before.
+    worklist = _viz_worklist(result)
+    if worklist is not None:
+        detail["remediation_worklist"] = worklist
 
     vc_rollup = _visual_calc_rollup(result)
     if vc_rollup:

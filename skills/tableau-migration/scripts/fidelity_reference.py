@@ -155,6 +155,32 @@ def list_views(server, site_id, token, rest_version=None, workbook_id=None):
     return views
 
 
+# Tableau's error code for an expired / invalidated REST session. On Tableau Cloud a single session
+# starts returning this on the view-export endpoints after an UNPREDICTABLE number of exports (1, 2,
+# 3 and 6 have all been observed), and once it starts the token is dead for everything -- subsequent
+# metadata calls 401 too. The root cause is deliberately NOT claimed here: three hypotheses were
+# tested and disproved (image calls specifically, one-export-per-session, and load-balancer node
+# affinity -- call #3 succeeded and call #4 failed on the SAME backend node, with no cookies set at
+# all). What is established is the behaviour and the remedy: re-authenticating recovers.
+#
+# Matched on the CODE, not on prose: the code is the stable, localisation-independent part of the
+# ``<error code='401002'>`` body, whereas the summary/detail text is neither.
+_SESSION_LOST_CODE = "401002"
+
+
+def _is_session_loss(exc):
+    """True when an exception carries Tableau's session-expired code (see ``_SESSION_LOST_CODE``).
+
+    Deliberately narrow: a genuinely bad worksheet must keep failing as a per-sheet error, so only
+    this one code triggers re-authentication. Never raises -- an exception whose text cannot be read
+    is simply not a session loss.
+    """
+    try:
+        return _SESSION_LOST_CODE in str(exc)
+    except Exception:  # pragma: no cover - defensive; str() on a pathological exception
+        return False
+
+
 def fetch_view_image(server, site_id, token, view_id, rest_version=None,
                      resolution=DEFAULT_RESOLUTION):
     """Return the server-rendered PNG **bytes** for one view (RLS applied as the authed user)."""
@@ -193,9 +219,16 @@ def acquire_reference_images(server, site_content_url, output_dir, worksheet_nam
 
         {"available": True,
          "site_id": "...",
-         "results": {worksheet: {"status": "saved"|"not_found"|"error", "path": ..., "view_id": ...,
-                                 "error": ...}},
-         "saved": [worksheet, ...], "not_found": [worksheet, ...]}
+         "results": {worksheet: {"status": "saved"|"not_found"|"error"|"session_lost",
+                                 "path": ..., "view_id": ..., "error": ...,
+                                 "session_recovered": True}},
+         "saved": [worksheet, ...], "not_found": [worksheet, ...],
+         "session_lost": [worksheet, ...], "session_recoveries": <int>}
+
+    ``session_lost`` / ``session_recoveries`` are ADDITIVE and present only when non-zero, so a run
+    whose session never expires returns exactly the previous shape. A ``session_lost`` sheet is one
+    whose re-authentication or retry ALSO failed -- distinguished from a plain ``error`` so a
+    truncated capture is visible to the caller instead of looking like unrelated per-sheet problems.
 
     Data-bearing PNGs are written **only** under ``output_dir``. The PAT secret is never logged or
     returned. Degrades to ``{"available": False, "reason": ...}`` when ``fetch_tds`` is unavailable.
@@ -205,8 +238,13 @@ def acquire_reference_images(server, site_content_url, output_dir, worksheet_nam
                 "reason": "fetch_tds unavailable; use the local-exclusive reference path."}
     os.makedirs(os.path.abspath(output_dir), exist_ok=True)
     tds = _tds
-    token, site_id = tds.sign_in(server, _rest_version(rest_version), site_content_url,
-                                 pat_name=pat_name, pat_secret=pat_secret, jwt=jwt)
+
+    def _sign_in():
+        return tds.sign_in(server, _rest_version(rest_version), site_content_url,
+                           pat_name=pat_name, pat_secret=pat_secret, jwt=jwt)
+
+    token, site_id = _sign_in()
+    session_recoveries = 0
     results = {}
     try:
         views = list_views(server, site_id, token, rest_version, workbook_id)
@@ -220,12 +258,43 @@ def acquire_reference_images(server, site_content_url, output_dir, worksheet_nam
             path = reference_image_path(output_dir, ws)
             try:
                 png = fetch_view_image(server, site_id, token, view["id"], rest_version, resolution)
+            except Exception as exc:  # noqa: BLE001 - one failed sheet must not abort the rest
+                # SESSION LOSS vs a bad sheet. On Tableau Cloud a single REST session starts
+                # returning 401002 after an unpredictable number of view exports, and it does NOT
+                # recover on that token -- subsequent metadata calls 401 too, so the whole session is
+                # gone. The per-sheet catch below is right for a bad sheet, but it cannot tell that
+                # apart from "the session died and EVERY remaining sheet will now fail": the loop
+                # then runs to completion recording per-sheet errors, the manifest looks structurally
+                # complete, and the image tier silently has a reference for only the first few
+                # worksheets. Measured on Cloud (10ax, API 3.29, 8 views, strictly sequential): one
+                # sign-in captured 1/8; a fresh sign-in per export captured 8/8.
+                #
+                # So re-authenticate ONCE per sheet on that signal and retry. Fail-closed: any other
+                # error, and a retry that fails again, still records a per-sheet error exactly as
+                # before -- and the recovery is recorded (``session_recovered`` + the run-level
+                # ``session_recoveries``) so a truncated-then-recovered capture is visible rather
+                # than looking like unrelated per-sheet problems.
+                if not _is_session_loss(exc):
+                    results[ws] = {"status": "error", "path": None, "view_id": view["id"],
+                                   "error": str(exc)[:200]}
+                    continue
+                try:
+                    token, site_id = _sign_in()
+                    session_recoveries += 1
+                    png = fetch_view_image(server, site_id, token, view["id"], rest_version,
+                                           resolution)
+                except Exception as exc2:  # noqa: BLE001 - re-auth or retry failed; stay per-sheet
+                    results[ws] = {"status": "session_lost", "path": None, "view_id": view["id"],
+                                   "error": str(exc2)[:200]}
+                    continue
                 with open(path, "wb") as fh:
                     fh.write(png)
-                results[ws] = {"status": "saved", "path": path, "view_id": view["id"]}
-            except Exception as exc:  # noqa: BLE001 - one failed sheet must not abort the rest
-                results[ws] = {"status": "error", "path": None, "view_id": view["id"],
-                               "error": str(exc)[:200]}
+                results[ws] = {"status": "saved", "path": path, "view_id": view["id"],
+                               "session_recovered": True}
+                continue
+            with open(path, "wb") as fh:
+                fh.write(png)
+            results[ws] = {"status": "saved", "path": path, "view_id": view["id"]}
     finally:
         try:
             tds.sign_out(server, _rest_version(rest_version), token)
@@ -233,8 +302,16 @@ def acquire_reference_images(server, site_content_url, output_dir, worksheet_nam
             pass
     saved = [w for w, r in results.items() if r["status"] == "saved"]
     not_found = [w for w, r in results.items() if r["status"] == "not_found"]
-    return {"available": True, "site_id": site_id, "results": results,
-            "saved": saved, "not_found": not_found}
+    session_lost = [w for w, r in results.items() if r["status"] == "session_lost"]
+    out = {"available": True, "site_id": site_id, "results": results,
+           "saved": saved, "not_found": not_found}
+    # Additive, and only when non-zero, so an on-prem run that never loses its session is
+    # byte-identical to before.
+    if session_lost:
+        out["session_lost"] = session_lost
+    if session_recoveries:
+        out["session_recoveries"] = session_recoveries
+    return out
 
 
 def build_acquisition_plan(worksheet_names, reference_dir):
