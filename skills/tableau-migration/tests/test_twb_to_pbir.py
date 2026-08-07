@@ -385,8 +385,13 @@ def test_dual_axis_bar_plus_line_is_combo_chart_y_and_y2():
 
 
 def test_two_measures_same_mark_stay_clustered_not_combo():
-    # Two measures both drawn as Bar (no line family) is NOT a combo -- it stays an ordinary
-    # multi-measure clustered column chart (both measures in Y). Guards against false combos.
+    # Two Bar measures on a DUAL AXIS is a combo, because the whole point of the source's second
+    # axis is its own SCALE. This test previously asserted a plain clustered chart (both measures in
+    # Y). That was DISPROVEN BY RENDER: on a `SUM(Sales)` + `AVG(Sales)` sheet the average is ~1/40th
+    # of the sum, so on one shared axis it drew as an invisible sliver where Tableau shows it at a
+    # third of the plot height. An invisible series is the same failure as an error tile, so the
+    # secondary-axis measure goes to Y2 and keeps its scale -- trading one mark type (Power BI draws
+    # a Y2 series as a line) for both series actually being visible.
     panes = (
         "<panes>"
         "<pane><mark class='Bar' /></pane>"
@@ -400,6 +405,26 @@ def test_two_measures_same_mark_stay_clustered_not_combo():
         rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
         cols="[federated.abc].[mn:Order Date:ok]",
         panes=panes, deps_extra=_INST)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["visual_type"] == "combo"
+    # shelf order decides which axis is secondary: Tableau writes the primary first
+    assert [f["caption"] for f in w["combo_split"]["Y"]] == ["Sales"]
+    assert [f["caption"] for f in w["combo_split"]["Y2"]] == ["Profit"]
+
+
+def test_two_measures_same_mark_WITHOUT_a_dual_axis_stay_clustered():
+    # The guard against FALSE combos still holds: with no second measure axis in the source there is
+    # no second scale to preserve, so two same-mark measures keep the ordinary clustered chart with
+    # both in Y. Only the dual-axis spelling promotes one of them to Y2.
+    panes = ("<panes><pane><mark class='Bar' /></pane></panes>")
+    ws = _combo_worksheet(
+        "Both Bars Flat",
+        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+        cols="[federated.abc].[mn:Order Date:ok]",
+        panes=panes, deps_extra=_INST)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["visual_type"] == "column"
+    assert not w.get("combo_split")
     w = parse_twb(_workbook(ws))["worksheets"][0]
     assert w["visual_type"] == "column"
     assert w["combo_split"] is None

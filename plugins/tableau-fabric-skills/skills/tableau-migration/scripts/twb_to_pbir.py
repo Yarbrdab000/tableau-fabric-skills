@@ -1442,9 +1442,24 @@ def _pane_mark_map(table):
 
     A dual-axis worksheet serialises one ``<pane>`` per measure axis. Each non-primary pane
     carries ``y-axis-name`` (the measure field ref, whose last bracketed token is the column
-    instance, e.g. ``sum:Sales:qk``) and its own ``<mark class>``; a secondary axis additionally
-    carries ``y-index`` >= 1. Returns ``(mark_by_instance, primary_mark, has_secondary_axis)``
-    where ``mark_by_instance`` maps a measure instance token to that axis's mark class.
+    instance, e.g. ``sum:Sales:qk``) and its own ``<mark class>``. Returns
+    ``(mark_by_instance, primary_mark, has_secondary_axis)`` where ``mark_by_instance`` maps a
+    measure instance token to that axis's mark class.
+
+    TWO spellings mean "a second measure axis in the SAME pane rectangle", and reading only the
+    first misclassified a whole family of sheets:
+
+    * ``y-index`` >= 1 -- how Tableau distinguishes two axes over the SAME measure (a line + its
+      area fill, a lollipop's stick + head): the name alone cannot tell them apart, so it numbers
+      them;
+    * TWO OR MORE DISTINCT ``y-axis-name`` values -- how it spells two axes over DIFFERENT measures
+      (e.g. ``SUM(Sales)`` and ``AVG(Sales)``), where the names already disambiguate so no index is
+      written.
+
+    Only the first was detected, so a different-measure dual axis looked like an ordinary sheet and
+    was rebuilt as a measure TRELLIS -- separate panes -- when the source draws both series overlaid
+    in one plot area. Confirmed by pixel-measuring the Tableau render: both series span the full
+    plot height from a shared baseline, so there is one pane, not two.
     """
     mark_by_instance = {}
     primary_mark = None
@@ -1465,6 +1480,8 @@ def _pane_mark_map(table):
                 mark_by_instance[toks[-1]] = mk
         elif primary_mark is None and mk:
             primary_mark = mk
+    if len(mark_by_instance) > 1:
+        has_secondary_axis = True
     return mark_by_instance, primary_mark, has_secondary_axis
 
 
@@ -1477,7 +1494,8 @@ def _mark_family(mark):
     return None
 
 
-def _detect_combo(meas_rows, meas_cols, has_category, mark_by_instance, primary_mark):
+def _detect_combo(meas_rows, meas_cols, has_category, mark_by_instance, primary_mark,
+                  dual_axis=False):
     """Classify a dual-axis combo: measures on one shelf that split into a column-family group
     and a line-family group, against a shared category dimension.
 
@@ -1485,11 +1503,27 @@ def _detect_combo(meas_rows, meas_cols, has_category, mark_by_instance, primary_
     combo); otherwise ``(None, None)`` so the caller keeps the ordinary single-mark visual. This
     is deliberately conservative -- same-mark multi-measure shelves and unresolvable measures
     never trigger a combo (warn-never-wrong).
+
+    SAME-FAMILY DUAL AXIS STILL NEEDS TWO AXES. When the sheet is dual-axis over DIFFERENT measures
+    but both panes draw the same mark family (e.g. Bar + Bar), the family split finds nothing -- yet
+    the whole point of the source's second axis is its own SCALE. Collapsing both onto one Power BI
+    axis is not a cosmetic loss: measured on a `SUM(Sales)` + `AVG(Sales)` sheet, the average is
+    ~1/40th of the sum, so it rendered as an invisible sliver where Tableau draws it at a third of
+    the plot height. An invisible series is the same failure as an error tile, so the secondary-axis
+    measure goes to Y2 and keeps its scale. Power BI draws a Y2 series as a LINE, so this trades one
+    mark type for both series actually being visible -- disclosed by the caller's fidelity note.
+
+    Which measure is secondary comes from SHELF ORDER: Tableau writes the primary axis first.
+
+    Gated on the PRIMARY axis already being a column family, because Power BI's combo always draws
+    its Y well as COLUMNS. Promoting a line-primary dual axis would turn the main series into bars --
+    measured as a regression on a three-line running-total sheet that came back as stacked columns.
     """
     if not has_category:
         return None, None
+    measures = list(meas_rows) + list(meas_cols)
     column_meas, line_meas = [], []
-    for f in list(meas_rows) + list(meas_cols):
+    for f in measures:
         fam = _mark_family(mark_by_instance.get(f.get("instance"), primary_mark))
         if fam == "column":
             column_meas.append(f)
@@ -1497,6 +1531,10 @@ def _detect_combo(meas_rows, meas_cols, has_category, mark_by_instance, primary_
             line_meas.append(f)
     if column_meas and line_meas:
         return column_meas, line_meas
+    if dual_axis and len(measures) > 1 and not line_meas:
+        distinct = {str(f.get("instance") or f.get("caption")) for f in measures}
+        if len(distinct) > 1:
+            return measures[:1], measures[1:]
     return None, None
 
 
@@ -4060,16 +4098,27 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         # combo chart so the column measure(s) land on Y and the line measure(s) on Y2. Same-mark
         # multi-measure shelves keep their ordinary single-mark visual (no false combos).
         if visual_type in (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA):
-            mark_by_instance, primary_mark, _ = _pane_mark_map(table)
+            mark_by_instance, primary_mark, dual_axis = _pane_mark_map(table)
             column_meas, line_meas = _detect_combo(
                 meas_rows, meas_cols, bool(dims_rows or dims_cols),
-                mark_by_instance, primary_mark)
+                mark_by_instance, primary_mark, dual_axis=dual_axis)
             if column_meas and line_meas:
                 visual_type = VT_COMBO
                 combo_split = {"Y": column_meas, "Y2": line_meas}
                 fidelity_note = (
                     "dual-axis combo: column measure(s) on the primary axis + line measure(s) "
                     "on the secondary axis -> lineClusteredColumnComboChart")
+            elif dual_axis and visual_type == VT_LINE and "area" in _all_pane_marks(table):
+                # A LINE axis overlaid with an AREA axis over the same measure is Tableau's
+                # "line with a filled area" idiom -- the second pane exists only to draw the fill
+                # under the first. Power BI's areaChart IS a line with the region below filled, so
+                # the whole two-pane construct collapses to one areaChart. Reading only the primary
+                # pane's mark left the fill off entirely: a bare line where the source is a filled
+                # mountain.
+                visual_type = VT_AREA
+                fidelity_note = (
+                    "dual-axis line + area over the same measure (Tableau's filled-line idiom) -> "
+                    "areaChart, whose fill is the second pane")
 
         # Dual-axis lollipop: a Bar (stick) pane + a Circle/Shape/Point (head) pane plotting the SAME
         # measure against a shared category. Power BI has no native lollipop, so re-route to a combo --
@@ -4387,6 +4436,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "canvas_fill": canvas_fill,
         "axis_titles": axis_titles,
         "continuous_axis": continuous_axis,
+        "dual_axis": _pane_mark_map(table)[2],
         "axis_hidden": sorted(axis_hidden),
         "color_gradient": color_gradient,
         "color_gradients": color_gradients,
@@ -6554,6 +6604,13 @@ def _detect_measure_trellis(ws, state):
       * NO Series (a colour-dimension legend is a genuine grouped/stacked chart, not a trellis) and
         NO SmallMultiple role (already a native trellis);
       * 2+ Y measure projections and 1+ Category dimension;
+      * the worksheet is not DUAL-AXIS. A trellis and a dual axis both put 2+ measure pills on one
+        shelf, but they draw opposite things: a trellis gives each measure its OWN pane, a dual axis
+        overlays them in ONE pane. Rebuilding a dual axis as a trellis splits a single plot area into
+        separate charts -- measured on a ``SUM(Sales) + AVG(Sales)`` sheet whose Tableau render has
+        both series spanning the full plot height from a shared baseline (so: one pane), which came
+        out as two. A dual axis keeps the ordinary single clustered chart, where both measures share
+        the one plot area;
       * the worksheet does NOT use the ``[Measure Values]`` shelf -- that pseudo-field is the
         clustered/series idiom (its member measures share ONE axis, routed elsewhere); only distinct
         ``+``-concatenated measure pills form the separate-pane trellis this rebuilds. (In Tableau
@@ -6563,6 +6620,8 @@ def _detect_measure_trellis(ws, state):
     if ws["visual_type"] not in (VT_BAR, VT_COLUMN):
         return None
     if ws.get("uses_measure_values"):
+        return None
+    if ws.get("dual_axis"):
         return None
     if state.get("Series", {}).get("projections"):
         return None

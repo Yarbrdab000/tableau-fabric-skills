@@ -14,6 +14,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **tableau-migration (skill `2.98.0` -> `2.99.0`): a second measure axis is a second SCALE, and a
+  line overlaid with an area is a filled line.** Tableau spells "another measure axis in the same
+  pane" TWO ways and only one was being read, so a whole family of dual-axis sheets was
+  misclassified.
+  - **Detection.** `y-index >= 1` distinguishes two axes over the SAME measure (a line + its fill, a
+    lollipop's stick + head), where the name cannot. TWO OR MORE DISTINCT `y-axis-name` values spell
+    two axes over DIFFERENT measures, where no index is written. Only the first was detected.
+  - **A dual axis is not a trellis.** Both put 2+ measure pills on one shelf, but a trellis gives
+    each its OWN pane while a dual axis overlays them in ONE. A `SUM(Sales) + AVG(Sales)` sheet was
+    being split into separate charts; pixel-measuring the Tableau render showed both series spanning
+    the full plot height from a shared baseline, i.e. one pane. The trellis now declines on a dual
+    axis.
+  - **Same-family dual axis still needs two axes.** With both panes drawing bars the family split
+    finds nothing, yet the point of the second axis is its own scale: the average is ~1/40th of the
+    sum, so on one shared Power BI axis it rendered as an invisible sliver where Tableau draws it at
+    a third of the plot height. An invisible series is the same failure as an error tile, so the
+    secondary-axis measure now goes to Y2 and keeps its scale (Power BI draws Y2 as a line -- one
+    mark type traded for both series being visible). Gated on the PRIMARY axis already being a
+    column family, because Power BI's combo always draws Y as columns; without that guard a
+    three-line running-total sheet came back as stacked columns.
+  - **Line + area over the same measure is Tableau's filled-line idiom.** The second pane exists only
+    to draw the fill under the first, and Power BI's `areaChart` IS a line with the region below
+    filled, so the two-pane construct collapses to one `areaChart`. Reading only the primary pane's
+    mark left a bare line where the source draws a filled mountain.
+  - Verified end to end: the Area sheet now matches its Tableau reference, the two-measure sheet
+    renders both series on their own scales, and the three-line running total is unchanged. Suite
+    4285 passed / 6 skipped / 1 xfailed; corpus 29/29.
+### Fixed
+
 - **tableau-migration (skill `2.97.0` -> `2.98.0`): a measure trellis fans along the shelf its
   measures sit on.** Tableau splits the pane along whichever shelf the `+`-concatenated measure pills
   are on: measures on ROWS (vertical bars) draw one pane ABOVE the other sharing the category axis at
