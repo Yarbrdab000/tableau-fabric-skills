@@ -440,6 +440,72 @@ def partition_items(items):
     return not_rebuilt, silent_wrong
 
 
+def visual_calculation_overrides(report_dir, page_info):
+    """Visuals whose displayed number comes from an injected VISUAL CALCULATION, not the measure.
+
+    The most invisible defect class found so far, and the worklist does not carry it -- it is a fact
+    about what we EMITTED, not about what failed to translate. The chart renders perfectly: axes,
+    bars, legend, labels all correct. It is simply showing a different quantity than the one the
+    Tableau view shows (a percent-of-total where the target shows counts). Nothing about the picture
+    says "this is the wrong measure", so it survives a careful visual comparison.
+
+    Found by scanning the emitted PBIR because that is where the truth is.
+    """
+    out = []
+    for vis in (page_info or {}).get("visuals", []):
+        try:
+            with open(vis["path"], encoding="utf-8-sig") as fh:
+                blob = fh.read()
+        except Exception:
+            continue
+        if "NativeVisualCalculation" not in blob:
+            continue
+        try:
+            doc = json.loads(blob)
+        except Exception:
+            continue
+        v = doc.get("visual") or doc
+        shown, masked = [], []
+        for role, state in ((v.get("query") or {}).get("queryState") or {}).items():
+            for proj in (state.get("projections") or []):
+                label = proj.get("displayName") or proj.get("queryRef") or "?"
+                if "NativeVisualCalculation" in json.dumps(proj):
+                    shown.append("%s (%s)" % (label, role))
+                elif proj.get("hidden"):
+                    masked.append("%s (%s)" % (label, role))
+        if shown:
+            out.append({"visual": vis.get("name"), "type": vis.get("type"), "path": vis.get("path"),
+                        "shown": shown, "masked": masked})
+    return out
+
+
+# The `federated.<datasource-guid>.none:` prefix Tableau puts on a filter-card id. The field name is
+# the only part a reader can act on; the guid is 40+ characters of noise in front of it, and burying
+# the message behind it is why one run reported "the note never said the slicers were missing" about
+# a note that said exactly that.
+_FILTER_ID = re.compile(r"federated\.[0-9a-z]+\.none:(?P<field>[^:]+):\w+")
+
+
+def readable_reason(reason):
+    """The engine's reason with machine ids reduced to the part a human acts on."""
+    return _FILTER_ID.sub(lambda m: "`%s`" % m.group("field").strip(), reason or "")
+
+
+# Shapes Power BI Desktop rejects HARD, kept deliberately short and only for traps that have actually
+# cost a measured run. Sorting earned its place twice: one run concluded "no valid PBIR sort syntax
+# was identified" and gave up, and another guessed `queryState/Category/sort`, which raised a modal
+# error dialog that ended the session. Neither image hints at any of this.
+_PBIR_HAZARDS = [
+    ("Sorting a visual", "`sortDefinition` is a **sibling of `queryState`**, i.e. "
+     "`visual.query.sortDefinition`, and names a field the visual already QUERIES. It is not a "
+     "property of `queryState`, and not a key on a projection -- putting it there is rejected."),
+    ("Boolean properties", "PBIR booleans are UNQUOTED (`{\"Literal\":{\"Value\":\"false\"}}`). A "
+     "quoted `'false'` silently no-ops, so the setting appears to apply and does nothing."),
+    ("If Desktop raises a modal error", "Stop and report it. Do not drive the dialog with keyboard "
+     "automation -- a mis-aimed keystroke has closed Desktop mid-run and ended the session."),
+]
+
+
 def exhausted_route_cards(corpus_root, limit=1):
     """Corpus precedent for marks with NO native Power BI equivalent.
 
@@ -542,22 +608,34 @@ def render(order):
             L.append("")
 
     wrong = order["silent_wrong"]
-    L.append("## 2. Numbers that render plausibly but are WRONG (%d)" % len(wrong))
+    vcalcs = order.get("visual_calcs") or []
+    L.append("## 2. Numbers that render plausibly but are WRONG (%d)" % (len(wrong) + len(vcalcs)))
     L.append("")
-    if not wrong:
+    if not wrong and not vcalcs:
         L.append("_None._")
     else:
         L.append("Something WAS emitted for each of these, and it looks entirely reasonable -- but the "
-                 "engine dropped part of the calculation, so the value is not the value Tableau "
-                 "shows. Check each against the reference image; nothing about them looks wrong.")
+                 "value is not the value Tableau shows. Nothing about them looks wrong, so a careful "
+                 "visual comparison will not find them.")
         L.append("")
-        for it in wrong:
-            L.append("- %s" % (it.get("reason") or ""))
-            if it.get("worksheet"):
-                L.append("  - source worksheet: `%s`" % it["worksheet"])
-            for p in it.get("paths") or []:
-                L.append("  - `%s`" % p)
-            L.append("")
+    for vc in vcalcs:
+        L.append("- **`%s` (`%s`) is displaying a VISUAL CALCULATION, not its measure.**"
+                 % (vc["visual"], vc["type"]))
+        L.append("  - showing: %s" % ", ".join("`%s`" % s for s in vc["shown"]))
+        if vc["masked"]:
+            L.append("  - hidden behind it: %s" % ", ".join("`%s`" % s for s in vc["masked"]))
+        L.append("  - The axes, bars, legend and labels are all correct -- it is charting a "
+                 "different quantity (e.g. a percent-of-total where the target shows counts). "
+                 "Remove the visual-calculation projection and unhide the real one.")
+        L.append("  - `%s`" % vc["path"])
+        L.append("")
+    for it in wrong:
+        L.append("- %s" % readable_reason(it.get("reason") or ""))
+        if it.get("worksheet"):
+            L.append("  - source worksheet: `%s`" % it["worksheet"])
+        for p in it.get("paths") or []:
+            L.append("  - `%s`" % p)
+        L.append("")
 
     missing = order["not_rebuilt"]
     L.append("## 3. In Tableau, absent from the report (%d)" % len(missing))
@@ -570,7 +648,7 @@ def render(order):
                  "-- which is the part that costs time to rediscover.")
         L.append("")
         for it in missing:
-            L.append("- %s" % (it.get("reason") or ""))
+            L.append("- %s" % readable_reason(it.get("reason") or ""))
             if it.get("worksheet"):
                 L.append("  - source worksheet: `%s` -- find it in the reference image to see what it "
                          "should look like" % it["worksheet"])
@@ -592,6 +670,15 @@ def render(order):
             L.append("")
             L.append("</details>")
             L.append("")
+
+    L.append("## 4. PBIR shapes Desktop rejects")
+    L.append("")
+    L.append("Not styling advice -- these are edits that FAIL, and each one has already cost a "
+             "measured run. Nothing in either image hints at any of them.")
+    L.append("")
+    for name, detail in _PBIR_HAZARDS:
+        L.append("- **%s.** %s" % (name, detail))
+    L.append("")
 
     L.append(_CLOSING)
     return "\n".join(L)
@@ -633,6 +720,7 @@ def build_order(workbook_entry, dashboard, pages, references, corpus_root=None, 
         "reference_dir": os.path.join(run_dir, "out", "reference_images") if run_dir else None,
         "stubs": stubs,
         "silent_wrong": silent_wrong,
+        "visual_calcs": visual_calculation_overrides(report_dir, page_info),
         "not_rebuilt": not_rebuilt,
         "route_cards": exhausted_route_cards(corpus_root) if (corpus_root and not_rebuilt) else [],
     }

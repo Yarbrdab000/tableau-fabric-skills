@@ -12,6 +12,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.85.0` -> `2.86.0`): the work order now reports injected visual
+  calculations, readable filter-card names, and the PBIR shapes Desktop rejects.** All three come
+  from a clean, uncontended measurement of the downstream agent (49.7 min, and it named these as its
+  three biggest time sinks). (1) A visual whose displayed number comes from an injected
+  `NativeVisualCalculation` renders perfectly -- axes, bars, legend and labels all correct -- while
+  charting a different quantity than the target, so a careful visual comparison does not find it. The
+  remediation worklist does not carry this because it is a fact about what we EMITTED, not about what
+  failed to translate; it is now found by scanning the emitted PBIR, and the masked real projection
+  is named alongside it. (2) Filter-card reasons had 40+ characters of `federated.<guid>.none:`
+  machine id in front of the field name, which is why one run reported the note "never said the
+  slicers were missing" about a note that said exactly that. (3) A short list of PBIR shapes that
+  FAIL, each already paid for: `sortDefinition` is a sibling of `queryState` (one run gave up on
+  sorting, another guessed `queryState/Category/sort` and raised a modal dialog that ended the
+  session), booleans are unquoted, and a modal error must be reported rather than driven with
+  keyboard automation.
 - **tableau-migration (skill `2.84.0` -> `2.85.0`): the Tier-3 work order now carries ONLY what
   the reference image cannot show.** Measured against the downstream agent: working from the Tableau
   PNG alone it reached near-perfect fidelity in 1h40m, but the same agent handed 2.84.0's

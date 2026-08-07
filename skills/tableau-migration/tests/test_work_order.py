@@ -161,6 +161,82 @@ def test_a_corpus_string_is_not_iterated_character_by_character():
 
 
 # ---------------------------------------------------------------------------------------------
+# the three misses reported by the 2026-08-06 clean run
+# ---------------------------------------------------------------------------------------------
+def test_an_injected_visual_calculation_is_reported(tmp_path):
+    """The most invisible class found so far, and the worklist does not carry it -- it is a fact
+    about what we EMITTED. The chart renders perfectly (axes, bars, legend, labels all correct) and
+    simply charts a different quantity, so a careful visual comparison does not find it. The clean
+    run called this out as "missed entirely" and said the axis would have stayed broken without it."""
+    order = _build(tmp_path)
+    assert [v["visual"] for v in order["visual_calcs"]] == ["v1"]
+    assert order["visual_calcs"][0]["shown"]
+
+
+def test_the_masked_real_projection_is_named(tmp_path):
+    """Knowing a visual calculation is present is only half the fix; the reader also needs the
+    projection it is hiding, or they have to reverse-engineer what the chart should have shown."""
+    assert order_masked(_build(tmp_path)) == ["CountD(Sheet2.*_Id) (Y)"]
+
+
+def order_masked(order):
+    return order["visual_calcs"][0]["masked"]
+
+
+def test_a_visual_with_no_injected_calculation_is_not_reported(tmp_path):
+    """Guards against the section firing on every visual, which would make it noise."""
+    run = _run_dir(tmp_path)
+    vis = os.path.join(run, "out", "pbip", "WB", "WB.Report", "definition", "pages", "p1",
+                       "visuals", "v1", "visual.json")
+    with open(vis, "w", encoding="utf-8") as fh:
+        json.dump({"visual": {"visualType": "columnChart", "query": {"queryState": {
+            "Y": {"projections": [{"queryRef": "Sheet2.Count"}]}}}}}, fh)
+    data = W.load_run(run)
+    wb = W.workbook_entries(data["report"])[0]
+    pages = W.index_visuals(W.find_report_dir(wb, run))
+    assert W.build_order(wb, "D1", pages, data["references"], None, run)["visual_calcs"] == []
+
+
+def test_a_filter_card_id_is_reduced_to_the_field_name():
+    """The `federated.<guid>.none:` prefix is 40+ characters of machine id in front of the only part
+    a reader can act on. Burying the message behind it is why one run reported that the note "never
+    said the slicers were missing" about a note that said exactly that."""
+    out = W.readable_reason(
+        "filter card federated.0gcnwq804g9e3p0zw2dho0bwawms.none:*Global Team:nk resolved to no "
+        "model field (slicer not rebuilt)")
+    assert "federated" not in out
+    assert "`*Global Team`" in out
+
+
+def test_a_reason_with_no_machine_id_is_left_alone():
+    reason = "mark class 'Circle' / shelf layout not supported -> no visual emitted"
+    assert W.readable_reason(reason) == reason
+
+
+def test_no_raw_machine_id_survives_into_the_rendered_document(tmp_path):
+    """Tests the WIRING, not just the helper. A correct ``readable_reason`` that the renderer never
+    calls looks identical in unit tests and identical in review -- and the reader still gets 40
+    characters of guid in front of the only word they can act on."""
+    text = _doc(tmp_path)
+    assert "federated." not in text
+    assert "filter card `Team`" in text
+
+
+def test_the_document_gives_the_correct_pbir_sort_location(tmp_path):
+    """Earned its place twice in one day: one run concluded "no valid PBIR sort syntax was
+    identified" and gave up; another guessed `queryState/Category/sort`, which raised a modal error
+    dialog that ended the session."""
+    text = _doc(tmp_path)
+    assert "sibling of `queryState`" in text
+    assert "visual.query.sortDefinition" in text
+
+
+def test_the_document_forbids_keyboard_automation_on_a_modal_dialog(tmp_path):
+    """A mis-aimed Tab+Space hit "Close Desktop" and ended a run at the 50 minute mark."""
+    assert "Do not drive the dialog with keyboard automation" in _doc(tmp_path)
+
+
+# ---------------------------------------------------------------------------------------------
 # whole-document invariants
 # ---------------------------------------------------------------------------------------------
 def _run_dir(tmp_path):
@@ -173,8 +249,15 @@ def _run_dir(tmp_path):
         json.dumps({"name": "p1", "displayName": "D1"}), encoding="utf-8")
     (vis / "v1" / "visual.json").write_text(json.dumps({
         "visual": {"visualType": "multiRowCard",
-                   "query": {"queryState": {"Values": {"projections": [
-                       {"queryRef": "_Measures.* CY CSAT"}]}}}}}), encoding="utf-8")
+                   "query": {"queryState": {
+                       "Values": {"projections": [{"queryRef": "_Measures.* CY CSAT"}]},
+                       "Y": {"projections": [
+                           {"queryRef": "select", "displayName": "select",
+                            "field": {"NativeVisualCalculation": {
+                                "Language": "dax", "Expression": "PERCENTOFTOTAL(...)"}}},
+                           {"queryRef": "CountD(Sheet2.*_Id)",
+                            "displayName": "CountD(Sheet2.*_Id)", "hidden": True},
+                       ]}}}}}), encoding="utf-8")
     (out / "report.json").write_text(json.dumps({"workbooks": [{
         "name": "WB",
         "pbip_folder": str(out / "pbip" / "WB" / "WB.pbip"),
