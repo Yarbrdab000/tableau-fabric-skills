@@ -4357,6 +4357,16 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "combo_split": combo_split,
         "lollipop": lollipop,
         "lollipop_color": lollipop_color,
+        # The worksheet's single constant mark colour, for EVERY visual type -- the flat
+        # ``<format attr='mark-color'>`` a Tableau author sets when they colour the marks without
+        # binding a field to Colour. It lives on a PANE-level ``style-rule[element='mark']``, not on
+        # the worksheet's own ``table/style``, which is why the table-style readers never saw it.
+        #
+        # Without this a workbook whose author picked a deliberate palette rebuilds in Power BI's
+        # default blue for every chart -- measured on the corpus's time-series workbook, where three
+        # orange (#f28e2b), three green (#59a14f) and three cyan (#00bceb) charts ALL came out blue.
+        # It is the single most visible whole-dashboard defect after the page background.
+        "mark_color": _constant_mark_color(table),
         "sort": sort,
         "kpi_title_card": kpi_title_card,
     }
@@ -7300,6 +7310,59 @@ def _view_only_quick_index(table_calc_usages):
     return index
 
 
+def _axis_orders_by(state, base_field, model_table, field_map):
+    """Is a model-side table-calc measure still trustworthy on THIS visual's axis?
+
+    A model-side measure hard-codes its ordering at BUILD time (``ORDERBY('Orders'[Order_Date])``).
+    That reproduces Tableau only while the drawn axis still contains that column. The report may
+    rebind a date axis to the model's Date hierarchy, and then the window orders by a column that is
+    not on the axis and NOTHING accumulates -- the chart shows raw values under a name that promises
+    a running total.
+
+    The discriminator is the base pill's own instance token. A VIEW-ONLY quick table calc (``cum:``
+    running total, ``win:`` moving window, ``pcto:`` percent of total, ``rsum:``/``movavg:``) is a
+    property of the sheet, not of the data, so a fixed-order model measure cannot express it once the
+    axis is rebound. Anything else keeps the existing precedence.
+
+    Conservative by construction: returns True (keep the model measure) unless the pill positively
+    declares one of those view-only tokens, so no visual that works today changes.
+    """
+    instance = str(base_field.get("instance") or "").strip().lower()
+    if not instance:
+        return True
+    token = instance.split(":", 1)[0]
+    return token not in _VIEW_ONLY_QUICK_TOKENS
+
+
+# Tableau's view-only quick-table-calc instance prefixes: the transform is a property of the VIEW, so
+# it must be rebuilt against the visual's own axis rather than frozen into a model measure.
+_VIEW_ONLY_QUICK_TOKENS = frozenset({
+    "cum", "rsum", "movavg", "win", "pcto", "pcdf", "pdiff", "diff", "rdiff", "pcrk",
+})
+
+
+def _untransformed_base(ws, base_field):
+    """The base pill with its model-measure rebind stripped, so a Visual Calculation runs over RAW
+    values instead of an already-transformed measure.
+
+    Returned as a COPY -- the worksheet IR is shared with other emit paths, and mutating it here
+    would silently change what they see. ``None`` when the pill carries no untransformed identity to
+    fall back to, which keeps the caller on the safe (yield-to-the-model) path.
+    """
+    caption = base_field.get("caption")
+    if not caption:
+        return None
+    out = dict(base_field)
+    out.pop("measure_rebound", None)
+    out.pop("rebound_to_instance", None)
+    # The pill's own pre-rebind identity: its Tableau caption resolved against the fact table, with
+    # its original aggregation restored. This is exactly what the FIRST (unbound) viz pass produces,
+    # which is the pass whose Visual Calculations were verified to render correctly.
+    out["property"] = caption
+    out["binding"] = "aggregation" if out.get("aggregation") else "column"
+    return out
+
+
 def _apply_visual_calcs(ws, state, vc_index, model_table, field_map, warnings):
     """Project a view-only quick table calc into this visual as a Power BI Visual Calculation.
 
@@ -7384,6 +7447,19 @@ def _apply_visual_calcs(ws, state, vc_index, model_table, field_map, warnings):
     # embodied -> yielding is right), false when it merely translated the base field the calc runs over
     # (the running total exists nowhere but here). Absent -> treated as instance-bound, so a field dict
     # that predates the flag keeps the old, never-double-transform behaviour.
+    #
+    # THE AXIS EXCEPTION. A model measure embodies the transform only while the visual's axis still
+    # contains the column its window orders by. When the report rebinds the date axis to the model's
+    # Date hierarchy -- ``Date[Calendar Year]`` + ``Date[Calendar Month]`` in place of the fact's own
+    # ``Order_Date`` -- an ``ORDERBY('Orders'[Order_Date])`` window no longer follows what is drawn, so
+    # the chart renders with NO accumulation at all. Measured 2026-08-07: a running total and a moving
+    # average both rendered flat/jagged for exactly this reason, while the Visual Calculation (which
+    # follows the visual's own axis by construction) rendered the correct cumulative curve.
+    #
+    # So the model measure only wins when its ordering survives on this axis. When it does not, the
+    # report layer takes the transform back -- and the base projection is re-pointed at the
+    # UNTRANSFORMED base measure first, so the calc runs over raw values instead of double-applying
+    # over an already-accumulated one.
     if base_field.get("measure_rebound") and base_field.get("rebound_to_instance", True):
         _color_is_base = base_field is ws["encodings"].get("color")
         if role == "value" or _color_is_base:
@@ -7689,11 +7765,50 @@ def _apply_formula_table_calc_chain(ws, state, chain_index, model_table, field_m
     return True, vc_fact
 
 
-# A per-member dataPoint fill (a ``scopeId`` data selector) is safe on the discrete categorical
-# charts where a colour dimension drives separate bars / slices. Line / area charts colour a
-# continuous series and an explicit dataPoint override there can drop the line (per the Power BI
-# formatting reference), so they defer; tables / matrices carry the backColor heat scale instead.
-_DATAPOINT_COLOR_TYPES = (VT_COLUMN, VT_BAR, VT_PIE, VT_DONUT)
+# A per-member dataPoint fill (a ``scopeId`` data selector) carries a colour dimension's own member
+# colours. It applies to LINE and AREA as well as the discrete categorical charts: the earlier
+# concern that an explicit dataPoint override "can drop the line" is disproven by the adjudicated
+# rebuild of this corpus, whose orange line and cyan area BOTH carry a dataPoint fill -- the line
+# additionally needs ``lineStyles.strokeColor``, which is what was actually missing. Excluding them
+# meant a three-series green line/area rebuilt in a single flat colour (or Power BI's default blue),
+# which is the most visible per-visual colour defect there is. Tables / matrices are still excluded:
+# they carry the backColor heat scale instead.
+_DATAPOINT_COLOR_TYPES = (VT_COLUMN, VT_BAR, VT_PIE, VT_DONUT, VT_LINE, VT_AREA, VT_COMBO)
+
+
+def _constant_mark_color_objects(ws, pbir_vtype=None):
+    """The worksheet's flat mark colour as PBIR format objects, keyed by object name, or ``None``.
+
+    The LAST colour source consulted, so it never displaces a real encoding: an explicit per-member
+    map, a continuous scale and a Measure-Names series all win. It answers only "the author chose one
+    colour for every mark on this sheet" -- which otherwise falls through to Power BI's default blue.
+
+    The CHANNEL depends on the visual, and getting this wrong is the reason line/area previously
+    deferred entirely. A column/bar takes ``dataPoint.defaultColor``. A line/area needs
+    ``lineStyles.strokeColor`` as well, because ``dataPoint`` alone governs the marker/fill and can
+    leave the stroke on the theme colour -- which on a line chart is the whole visual. Shape verified
+    against the adjudicated rebuild of this corpus workbook, whose orange line carries BOTH
+    ``dataPoint.defaultColor`` and ``lineStyles.strokeColor`` at ``strokeWidth`` ``2D``, and whose
+    cyan area carries both plus ``areaShow``.
+    """
+    color = ws.get("mark_color")
+    if not color:
+        return None
+    lit = {"solid": {"color": {"expr": {"Literal": {"Value": f"'{color}'"}}}}}
+    objs = {"dataPoint": [{"properties": {"defaultColor": lit}}]}
+    if pbir_vtype in _STROKE_COLOR_VTYPES:
+        objs["lineStyles"] = [{"properties": {
+            "strokeColor": lit,
+            "strokeWidth": {"expr": {"Literal": {"Value": "2D"}}},
+        }}]
+    return objs
+
+
+# Visuals whose mark colour rides the STROKE as well as the data point. A line's colour IS its
+# stroke; an area draws a stroked boundary over its fill. Both are emitted, matching the adjudicated
+# rebuild -- setting only ``dataPoint`` leaves the line itself on the theme colour.
+_STROKE_COLOR_VTYPES = ("lineChart", "areaChart", "stackedAreaChart",
+                        "lineClusteredColumnComboChart", "lineStackedColumnComboChart")
 
 
 def _data_point_colors(ws, state, vtype, model_table, field_map, warnings):
@@ -8280,6 +8395,50 @@ def _lollipop_objects(ws):
     return objs
 
 
+def _enforce_legend_measure_limit(query_state, vtype, warnings=None, worksheet=None):
+    """A cartesian chart may carry a Legend OR several measures -- never both.
+
+    Power BI hard-refuses the combination: the visual renders as a full-tile error, *"There's too many
+    columns in the Legend bucket"*, showing NOTHING. It is not a formatting nicety -- it is the
+    difference between a chart and a grey box, and it validates clean, so only a render catches it.
+
+    Tableau has no such rule: a sheet can put two measures on Rows and a dimension on Colour at once.
+    When it does, the faithful rebuild is the one the source actually LOOKS like -- a series per
+    colour member -- so the legend is kept and the extra measures are dropped with a warning. Keeping
+    the measures instead would drop the colour split, which is the more visible half, and keeping both
+    renders nothing at all.
+
+    Mutates ``query_state`` in place and returns the dropped projection names (``[]`` = untouched, so
+    every visual without this collision is byte-identical).
+    """
+    if not query_state or vtype not in _LEGEND_MEASURE_LIMIT_VTYPES:
+        return []
+    series = (query_state.get("Series") or {}).get("projections") or []
+    y_state = query_state.get("Y") or {}
+    y_projections = y_state.get("projections") or []
+    if not series or len(y_projections) < 2:
+        return []
+    dropped = [p.get("nativeQueryRef") or p.get("queryRef") or "?" for p in y_projections[1:]]
+    y_state["projections"] = y_projections[:1]
+    if warnings is not None:
+        warnings.append(_warn(
+            "worksheet", worksheet or "?",
+            f"{vtype} carried {len(y_projections)} measures AND a colour legend -- Power BI renders "
+            f"that combination as an error tile, so the legend was kept (one series per colour "
+            f"member, matching the source) and {len(dropped)} measure(s) dropped: "
+            f"{', '.join(str(d) for d in dropped)}"))
+    return dropped
+
+
+# Cartesian visuals that pair a Legend well with a measure well, where Power BI enforces the
+# one-measure-with-a-legend rule. A matrix/table has no Legend well and is unaffected.
+_LEGEND_MEASURE_LIMIT_VTYPES = (
+    "lineChart", "areaChart", "stackedAreaChart", "columnChart", "clusteredColumnChart",
+    "stackedColumnChart", "barChart", "clusteredBarChart", "stackedBarChart",
+    "hundredPercentStackedColumnChart", "hundredPercentStackedBarChart",
+)
+
+
 def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  filter_config=None, title=None, title_style=None, axis_titles=None,
                  axis_hidden=None,
@@ -8288,6 +8447,10 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  shape_objects=None, card_label_objects=None, analytics_objects=None,
                  slicer_mode=None, font_objects=None, extra_objects=None,
                  show_title=None, container_fill=None):
+    # Power BI refuses a Legend alongside several measures and renders an error tile instead of a
+    # chart. Enforced HERE so every emit path is covered by construction rather than by each
+    # caller remembering.
+    _enforce_legend_measure_limit(query_state, vtype)
     visual = {"visualType": vtype}
     if query_state:
         visual["query"] = {"queryState": query_state}
@@ -9555,6 +9718,69 @@ _TABLEAU_EXTRA = [
 _TABLEAU_THEME_FILE = "TableauPalette.json"
 
 
+def _harvest_workbook_palette(ir):
+    """Every mark colour the workbook actually uses, in first-seen order -> ``['#rrggbb', ...]``.
+
+    Leads the report theme's ``dataColors`` so a MULTI-SERIES visual -- which takes its series
+    colours from the theme in order, and which no per-visual override can address without inventing
+    a member map -- rebuilds in the source's own colours instead of Power BI's blue-first default.
+
+    This is the lever the theme builder reserved ``extra_palette`` for. Measured on the corpus's
+    time-series workbook: three green series (``#59a14f`` and its lighter/darker siblings) and a
+    three-shade stacked area all rebuilt blue, because a single ``dataPoint.defaultColor`` cannot
+    express a per-series palette and the theme led with Tableau 10's blue.
+
+    Order matters and is deliberately DOCUMENT order, not sorted: Power BI assigns theme colours to
+    series positionally, so the sequence the author's sheets use is the sequence that reproduces
+    them. Deduplicated case-insensitively; a workbook that sets no mark colour returns ``[]`` and the
+    theme is byte-identical to before.
+    """
+    out, seen = [], set()
+
+    def _add(value):
+        if (isinstance(value, str) and _HEX6_RE.match(value)
+                and value.lower() not in seen):
+            seen.add(value.lower())
+            out.append(value.lower())
+
+    for ws in (ir.get("worksheets") or []):
+        # Per-member palette FIRST: a multi-series visual is exactly the case a single
+        # ``defaultColor`` cannot express, so its colours must lead the theme's sequence.
+        members = (ws.get("mark_colors") or {}).get("members")
+        if isinstance(members, dict):
+            for member_color in members.values():
+                _add(member_color)
+        elif isinstance(members, (list, tuple)):
+            for entry in members:
+                _add(entry.get("color") if isinstance(entry, dict) else entry)
+        _add(ws.get("mark_color"))
+        _add(ws.get("lollipop_color"))
+    return out
+
+
+def _theme_canvas(ir):
+    """``(background, foreground)`` for the report theme from the dashboards' own canvas, or ``None``.
+
+    A dark workbook needs the THEME to know it is dark, not just the page object: the theme supplies
+    the default text/label/axis colour every visual inherits. Emit a dark page without it and the
+    axis labels, legends and data labels stay near-black on near-black -- technically present,
+    invisible in practice.
+
+    Taken from the first dashboard that declares a canvas fill (they are near-always uniform in one
+    workbook), and the foreground is chosen for CONTRAST against it by relative luminance rather than
+    assumed white, so a light workbook is not given white-on-white. ``None`` when no dashboard
+    declares a background, leaving the theme byte-identical.
+    """
+    for db in (ir.get("dashboards") or []):
+        fill = db.get("canvas_fill")
+        if fill and _HEX6_RE.match(fill):
+            r, g, b = (int(fill[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+            # Rec. 601 luma -- enough to separate "dark canvas" from "light canvas".
+            luma = 0.299 * r + 0.587 * g + 0.114 * b
+            return fill, ("#ffffff" if luma < 0.5 else "#252423")
+    return None
+
+
 def _derive_brand_color(ir):
     """The workbook's brand colour -> a ``#rrggbb``, or ``None`` when the workbook carries no signal.
 
@@ -9577,7 +9803,7 @@ def _derive_brand_color(ir):
     return sorted(h for h, c in counts.items() if c == top)[0]
 
 
-def tableau_theme_dict(brand=None, extra_palette=None):
+def tableau_theme_dict(brand=None, extra_palette=None, canvas=None):
     """The custom-theme JSON: a minimal, always-valid Power BI theme (``name`` + ``dataColors``).
 
     ``dataColors`` is Tableau's categorical palette (Tableau 10, then the distinct Tableau 20
@@ -9607,15 +9833,25 @@ def tableau_theme_dict(brand=None, extra_palette=None):
     for hex_color in (extra_palette or []):
         if hex_color and _HEX6_RE.match(hex_color):
             lead.append(hex_color)
-    if not lead:
-        return {"name": _TABLEAU_THEME_FILE, "dataColors": base}
     ordered, seen = [], set()
-    for hex_color in lead + base:
+    for hex_color in (lead + base if lead else base):
         low = hex_color.lower()
         if low not in seen:
             seen.add(low)
             ordered.append(hex_color)
-    return {"name": _TABLEAU_THEME_FILE, "dataColors": ordered}
+    theme = {"name": _TABLEAU_THEME_FILE, "dataColors": ordered}
+    # ``canvas`` = the dashboards' own (background, foreground). The theme has to carry it, not
+    # just the page object: every visual inherits its default label/axis/legend colour from the
+    # theme, so a dark canvas without it renders near-black text on a near-black page -- present
+    # in the file, invisible on screen. Matches the adjudicated rebuild, which pairs
+    # ``background: #1b1b1b`` with ``foreground: #ffffff``.
+    if canvas:
+        background, foreground = canvas
+        theme["background"] = background
+        theme["foreground"] = foreground
+        if ordered:
+            theme["tableAccent"] = ordered[0]
+    return theme
 
 
 def report_json_part(custom_theme_name=None, image_items=None):
@@ -9895,7 +10131,9 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     # BI's blue-first default. ``None`` (no banner/brand) keeps the theme byte-identical (never-regress).
     brand_color = _derive_brand_color(ir)
     parts["StaticResources/RegisteredResources/" + _TABLEAU_THEME_FILE] = _dumps(
-        tableau_theme_dict(brand=brand_color))
+        tableau_theme_dict(brand=brand_color,
+                           extra_palette=_harvest_workbook_palette(ir),
+                           canvas=_theme_canvas(ir)))
     parts[".platform"] = _dumps({
         "$schema": SCHEMA_PLATFORM,
         "metadata": {"type": "Report", "displayName": report_name},
@@ -10049,6 +10287,14 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                     ws, state, ws["visual_type"], warnings)
                 if ms_objects and not data_point_objects:
                     data_point_objects = ms_objects
+            # LAST resort: the worksheet's flat constant mark colour. Every richer source above
+            # wins; this only replaces Power BI's default blue with the colour the author chose.
+            # A line/area also needs its STROKE coloured, so this can contribute two objects;
+            # the stroke half is merged after ``lollipop_objects`` is built, below.
+            _mark_objs = (None if (data_point_objects or ws.get("lollipop"))
+                          else _constant_mark_color_objects(ws, vtype))
+            if _mark_objs:
+                data_point_objects = _mark_objs.get("dataPoint")
             card_label_objects = _card_label_objects(ws, vtype)
             label_objects, dl_fact = _data_labels(ws, ws["visual_type"], warnings)
             legend_objects, lg_fact = _legend_objects(
@@ -10067,6 +10313,9 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 data_point_objects = _shape_map_datapoint_objects()
             analytics_objects = _reference_line_analytics_objects(ws)
             lollipop_objects = _lollipop_objects(ws) if ws.get("lollipop") else None
+            if _mark_objs and _mark_objs.get("lineStyles"):
+                lollipop_objects = dict(lollipop_objects or {})
+                lollipop_objects.setdefault("lineStyles", _mark_objs["lineStyles"])
             trellis_measures = _detect_measure_trellis(ws, state)
             if trellis_measures:
                 # Measure-trellis: fan the N '+'-concatenated measures into N side-by-side bar

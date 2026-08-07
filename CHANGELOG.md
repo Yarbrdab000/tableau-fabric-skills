@@ -12,6 +12,29 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.93.0` -> `2.94.0`): the workbook's own colours, on every chart.**
+  Four related fixes, all verified by rendering the rebuild and comparing it to the source image.
+  (1) **Flat mark colour, every visual type.** A Tableau author who colours the marks without binding
+  a field to Colour writes `<format attr='mark-color'>` on a PANE-level `style-rule`, one level
+  below the worksheet `table/style` every existing reader looked at, so it was never seen: nine
+  charts whose author picked orange, green and cyan all rebuilt in Power BI's default blue. Now read
+  for all types (it was previously wired only to the lollipop), as `dataPoint.defaultColor` -- plus
+  `lineStyles.strokeColor` on a line/area, because a line's colour IS its stroke. (2) **Per-member
+  palettes now apply to LINE and AREA.** They were excluded on the belief that a `dataPoint`
+  override "can drop the line"; the adjudicated rebuild of the corpus's own workbook carries a
+  `dataPoint` fill on both its line and its area, and what was actually missing was the stroke. A
+  three-series green line had been rebuilding as one flat colour. (3) **The report theme carries the
+  workbook's palette and canvas.** `dataColors` now leads with every mark colour the workbook
+  actually uses, in document order, so a MULTI-series visual -- which takes series colours from the
+  theme positionally and which no per-visual override can address -- reproduces the source; and
+  `background`/`foreground` come from the dashboard canvas (foreground chosen by luminance for
+  contrast, never assumed white), because every visual inherits its default label/axis colour from
+  the theme, so a dark page without it renders near-black text on near-black. (4) **A Legend plus
+  several measures is refused.** Power BI renders that combination as a full-tile error -- *"There's
+  too many columns in the Legend bucket"* -- showing nothing, and it validates clean, so only a
+  render catches it. Tableau allows it; the faithful rebuild keeps the legend (a series per colour
+  member, which is what the source looks like) and drops the extra measures with a warning. Corpus
+  29/29 openable.
 - **tableau-migration (skill `2.92.0` -> `2.93.0`): a model-measure rebind is authoritative over
   the caption-keyed `field_map`.** The estate runs the viz stage TWICE -- once bare to build the
   model, once rebound to it -- and only the SECOND pass ships as the openable `.pbip`. In that

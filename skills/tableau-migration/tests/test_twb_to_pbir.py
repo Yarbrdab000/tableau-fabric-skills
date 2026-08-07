@@ -6055,9 +6055,14 @@ def test_categorical_palette_fact_recorded_emitted():
     assert [(m["value"], m["color"]) for m in fact["members"]] == _REGION_PALETTE
 
 
-def test_categorical_palette_on_line_defers_with_palette_preserved():
-    # Line / area charts colour a continuous series; an explicit dataPoint override can drop the
-    # line, so the palette defers (theme colours kept) with the raw palette preserved on the record.
+def test_categorical_palette_on_a_line_is_APPLIED_not_deferred():
+    # A colour dimension's member palette applies to LINE and AREA, not just the discrete
+    # categorical charts. The old rule deferred here on the belief that an explicit dataPoint
+    # override "can drop the line" -- disproven by the adjudicated rebuild of the time-series
+    # corpus workbook, whose orange line and cyan area BOTH carry a dataPoint fill (the line
+    # additionally needs lineStyles.strokeColor, which is what was actually missing). Deferring
+    # meant a three-series green line rebuilt in one flat colour, which is the most visible
+    # per-visual colour defect there is.
     enc = "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings>"
     ws = _worksheet("Trend", "Line",
                     rows="[federated.abc].[sum:Sales:qk]",
@@ -6067,11 +6072,14 @@ def test_categorical_palette_on_line_defers_with_palette_preserved():
     res = migrate_twb_to_pbir(_workbook(ws))
     vj = list(_visual_parts(res["parts"]).values())[0]
     assert vj["visual"]["visualType"] == "lineChart"
-    assert _data_point_objects(vj) is None
+    objs = _data_point_objects(vj)
+    assert objs, "a line chart must carry its authored member colours"
+    emitted = [o["properties"]["fill"]["solid"]["color"]["expr"]["Literal"]["Value"].strip("'")
+               for o in objs if "fill" in o.get("properties", {})]
+    assert [c for _v, c in _REGION_PALETTE] == emitted
     fact = _mc_fact(res["candidate_records"], "Trend")
-    assert fact["status"] == "deferred"
+    assert fact["status"] == "emitted"
     assert [(m["value"], m["color"]) for m in fact["members"]] == _REGION_PALETTE
-    assert any("categorical mark colours deferred" in w["reason"] for w in res["warnings"])
 
 
 def test_categorical_palette_unprojected_dimension_defers():
