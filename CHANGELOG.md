@@ -12,6 +12,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **tableau-migration (skill `2.95.0` -> `2.96.0`): the author's mark colour reached a chart only if
+  it was on a DASHBOARD.** A worksheet is emitted by two paths -- one per dashboard zone, one per
+  standalone worksheet page -- and the constant-mark-colour step existed on the dashboard path only.
+  A workbook of loose worksheets (or any sheet not placed on a dashboard) therefore rebuilt every
+  chart in Power BI's default blue, discarding the colour the author chose, while the SAME sheet on a
+  dashboard came out correct. Measured on a nine-sheet workbook: three orange charts all rendered
+  blue, and a line lost its stroke colour as well as its fill.
+  - The step is now a single shared function (`_with_constant_mark_color`) called by BOTH paths, so
+    they cannot drift apart again -- the fix is one call site, not two copies of the same four lines.
+  - It now also DECLINES when the sheet colours by an ENCODING. Tableau writes a `mark-color` rule on
+    every worksheet, including the inert default emitted when the author chose nothing; once a field
+    sits on the Color shelf the marks are coloured per member and that flat value is dead metadata.
+    Applying it would repaint a whole segmented chart one colour. `mark_colors` alone cannot guard
+    this -- it holds only an EXPLICIT member palette, so a Color encoding with no authored palette
+    leaves it empty while still owning the colour.
+  - Verified end to end on a nine-worksheet workbook: the three orange sheets render orange, the
+    three Segment-coloured sheets keep their per-member greens. Suite 4277 passed / 6 skipped /
+    1 xfailed; corpus 29/29.
 ### Changed
 
 - **tableau-migration (skill `2.94.0` -> `2.95.0`): a date TRUNCATION is a scalar grain column, not a

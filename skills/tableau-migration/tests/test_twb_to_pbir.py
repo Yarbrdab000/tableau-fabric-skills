@@ -6160,8 +6160,12 @@ def test_chart_without_palette_emits_no_datapoint():
 
 
 def test_single_default_mark_color_is_not_emitted():
-    # A bare single ``mark-color`` is Tableau's default fill (written even when the author chose
-    # nothing); it is deliberately NOT turned into a defaultColor -- only an explicit member map is.
+    # Tableau writes a ``mark-color`` rule on EVERY worksheet, including the inert default it emits
+    # when the author chose nothing. Once a field sits on the Color shelf the marks are coloured PER
+    # MEMBER and that flat value is dead metadata -- applying it would repaint the whole segmented
+    # chart one colour (here Tableau's default #b4b4b4, flattening a Region-coloured bar to grey).
+    # ``mark_colors`` alone cannot guard this: it holds only an EXPLICIT member palette, so a Color
+    # encoding with no authored palette leaves it empty while still owning the colour.
     style = ("<style><style-rule element='mark'><format attr='mark-color' value='#b4b4b4' />"
              "</style-rule></style>")
     enc = "<encodings><color column='[federated.abc].[none:Region:nk]' /></encodings>"
@@ -6173,6 +6177,39 @@ def test_single_default_mark_color_is_not_emitted():
     assert ir["worksheets"][0]["mark_colors"] is None
     vj = list(_visual_parts(emit_pbir(ir)).values())[0]
     assert _data_point_objects(vj) is None
+
+
+def test_a_constant_mark_color_lands_on_a_standalone_worksheet_page_too():
+    # A worksheet is emitted by TWO paths -- one per dashboard zone, one per standalone worksheet
+    # page -- and this step existed on the dashboard path only. A workbook of LOOSE worksheets
+    # therefore rebuilt every chart in Power BI's default blue while the SAME sheet on a dashboard
+    # came out correct. Measured on a nine-sheet workbook: three orange charts all rendered blue.
+    style = ("<style><style-rule element='mark'><format attr='mark-color' value='#F28E2B' />"
+             "</style-rule></style>")
+    ws = _worksheet("Small Bar", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, style=style)
+    vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
+    dp = _data_point_objects(vj)
+    assert dp[0]["properties"]["defaultColor"]["solid"]["color"]["expr"][
+        "Literal"]["Value"] == "'#f28e2b'"
+
+
+def test_a_constant_mark_color_on_a_standalone_line_page_colours_the_stroke():
+    # A line's colour IS its stroke: ``dataPoint`` alone leaves the line on the theme colour. The
+    # standalone path was dropping the stroke half as well as the fill.
+    style = ("<style><style-rule element='mark'><format attr='mark-color' value='#F28E2B' />"
+             "</style-rule></style>")
+    tmonth = ("<column-instance column='[Order Date]' derivation='Month-Trunc' "
+              "name='[tmn:Order Date:qk]' pivot='key' type='quantitative' />")
+    ws = _worksheet("Moving Avg", "Line",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[tmn:Order Date:qk]",
+                    deps_extra=_INST + tmonth, style=style)
+    vj = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]
+    stroke = vj["visual"]["objects"]["lineStyles"][0]["properties"]["strokeColor"]
+    assert stroke["solid"]["color"]["expr"]["Literal"]["Value"] == "'#f28e2b'"
 
 
 # -- measure-series colours (datasource "Measure Names" palette) ---------------

@@ -7863,6 +7863,45 @@ _STROKE_COLOR_VTYPES = ("lineChart", "areaChart", "stackedAreaChart",
                         "lineClusteredColumnComboChart", "lineStackedColumnComboChart")
 
 
+def _with_constant_mark_color(ws, pbir_vtype, data_point_objects, extra_objects):
+    """Fold the worksheet's flat mark colour into ``(data_point_objects, extra_objects)``.
+
+    A worksheet is emitted by TWO paths -- one per dashboard zone, one per standalone worksheet page
+    -- and this step existed on the dashboard path only. The consequence was silent and total: a
+    workbook of LOOSE worksheets (or any sheet not placed on a dashboard) rebuilt every chart in
+    Power BI's default blue, discarding the author's chosen mark colour, while the same sheet on a
+    dashboard came out correct. Measured on a nine-sheet workbook: two orange charts and an orange
+    scatter all rendered blue.
+
+    Shared here so the two paths cannot drift again -- the fix is the single call site, not two
+    copies of the same four lines.
+
+    DECLINES WHEN THE SHEET COLOURS BY AN ENCODING. Tableau writes a ``mark-color`` rule on every
+    worksheet, including the inert default it emits when the author chose nothing. Once a field sits
+    on the Color shelf the marks are coloured PER MEMBER and that flat value is dead metadata --
+    applying it would repaint a whole segmented chart in one colour (measured: Tableau's default
+    ``#b4b4b4`` flattening a Region-coloured bar chart to grey). ``mark_colors`` alone is not a
+    sufficient guard because it holds only an EXPLICIT member palette; a Color encoding with no
+    authored palette leaves it empty while still owning the colour.
+
+    Remaining precedence is preserved: any richer colour source (an explicit per-member palette, a
+    continuous scale, a Measure-Names series) already populated ``data_point_objects`` and wins, and
+    a lollipop owns its own colour objects. The stroke half rides ``extra_objects`` (merged last by
+    ``_visual_json``) with ``setdefault``, so a mark rule that already set ``lineStyles`` keeps it.
+    """
+    if data_point_objects or ws.get("lollipop"):
+        return data_point_objects, extra_objects
+    if (ws.get("encodings") or {}).get("color"):
+        return data_point_objects, extra_objects
+    objs = _constant_mark_color_objects(ws, pbir_vtype)
+    if not objs:
+        return data_point_objects, extra_objects
+    if objs.get("lineStyles"):
+        extra_objects = dict(extra_objects or {})
+        extra_objects.setdefault("lineStyles", objs["lineStyles"])
+    return objs.get("dataPoint"), extra_objects
+
+
 def _data_point_colors(ws, state, vtype, model_table, field_map, warnings):
     """Explicit categorical mark-colour palette (member -> hex) -> (data_point_objects, fact).
 
@@ -10402,12 +10441,6 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                     data_point_objects = ms_objects
             # LAST resort: the worksheet's flat constant mark colour. Every richer source above
             # wins; this only replaces Power BI's default blue with the colour the author chose.
-            # A line/area also needs its STROKE coloured, so this can contribute two objects;
-            # the stroke half is merged after ``lollipop_objects`` is built, below.
-            _mark_objs = (None if (data_point_objects or ws.get("lollipop"))
-                          else _constant_mark_color_objects(ws, vtype))
-            if _mark_objs:
-                data_point_objects = _mark_objs.get("dataPoint")
             card_label_objects = _card_label_objects(ws, vtype)
             label_objects, dl_fact = _data_labels(ws, ws["visual_type"], warnings)
             legend_objects, lg_fact = _legend_objects(
@@ -10426,9 +10459,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 data_point_objects = _shape_map_datapoint_objects()
             analytics_objects = _reference_line_analytics_objects(ws)
             lollipop_objects = _lollipop_objects(ws) if ws.get("lollipop") else None
-            if _mark_objs and _mark_objs.get("lineStyles"):
-                lollipop_objects = dict(lollipop_objects or {})
-                lollipop_objects.setdefault("lineStyles", _mark_objs["lineStyles"])
+            data_point_objects, lollipop_objects = _with_constant_mark_color(
+                ws, vtype, data_point_objects, lollipop_objects)
             trellis_measures = _detect_measure_trellis(ws, state)
             if trellis_measures:
                 # Measure-trellis: fan the N '+'-concatenated measures into N side-by-side bar
@@ -10679,6 +10711,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             data_point_objects = _shape_map_datapoint_objects()
         analytics_objects = _reference_line_analytics_objects(ws)
         lollipop_objects = _lollipop_objects(ws) if ws.get("lollipop") else None
+        data_point_objects, lollipop_objects = _with_constant_mark_color(
+            ws, vtype, data_point_objects, lollipop_objects)
         trellis_measures = _detect_measure_trellis(ws, state)
         if trellis_measures:
             # Measure-trellis on a standalone worksheet page: fan into N side-by-side bar charts
