@@ -12,6 +12,21 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.90.0` -> `2.91.0`): an unplaced calc borrows addressing from its
+  IDENTICAL placed twin.** Tableau recovers a table calc's Compute-Using (partition + order) from
+  where the pill sits on a worksheet, so a calc authored but never dropped on a shelf has no
+  addressing and stubs as `missing_addressing_intent`. That is right when nothing else knows the
+  answer -- but when a sibling calc with a byte-identical formula IS placed, the answer is already
+  recovered and sitting in the same model. Measured 2026-08-07: `Rank GMC` and `Rank GMC %` are
+  both `rank([Calculation_2768024947633754122], 'desc')` -- same function, same operand, same
+  direction -- and the placed one shipped as a live partitioned `RANKX` while its twin shipped as a
+  placeholder. On that workbook this takes the deterministic result from **3 stubs to 1**, and the
+  remaining stub is genuinely irreducible (it references a field that exists nowhere in the
+  workbook); `Weight Raw Score` translated for free once its operand went live. A lookup, not an
+  inference -- identical formula + identical addressing is identical DAX by construction, and the
+  emitted twin DAX is verified byte-identical to its donor's. Fails closed both ways that could make
+  it a guess: a calc with its OWN placement is never overridden, and placed twins that DISAGREE on
+  addressing lend nothing rather than being resolved by picking one.
 - **tableau-migration (skill `2.89.0` -> `2.90.0`): the input guard now compares BYTES, not just
   names.** `input_manifest.json` already recorded a SHA256 per input and never compared them: its
   collision check keyed on the filename stem alone. So the same file staged twice under different

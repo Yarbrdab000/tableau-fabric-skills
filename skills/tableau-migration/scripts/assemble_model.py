@@ -27,6 +27,7 @@ with its original formula preserved as a ``TableauFormula`` annotation.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import re
 
 try:  # package or scripts-on-path
@@ -322,6 +323,106 @@ def _date_axis_order_resolver(resolve, date_table, active_date_cols, date_key="D
         return None
 
     return _order_resolver
+
+
+def _addressing_signature(usage):
+    """The addressing facts that make one table-calc usage's window equal to another's."""
+    return (
+        getattr(usage, "ordering_type", None),
+        tuple(getattr(usage, "ordering_fields", None) or ()),
+        getattr(usage, "sort_field", None),
+        getattr(usage, "sort_direction", None),
+        getattr(usage, "level_break", None),
+        getattr(usage, "level_address", None),
+        getattr(usage, "diff_options", None),
+        getattr(usage, "secondary", False),
+    )
+
+
+def _twin_addressing_usages(calcs, usages):
+    """Lend a PLACED calc's addressing to an UNPLACED calc carrying the IDENTICAL formula.
+
+    Tableau recovers a table calc's Compute-Using (partition + order) from where the pill sits on a
+    worksheet, so a calc that was authored but never dropped on a shelf has no addressing and stubs
+    as ``missing_addressing_intent``. That is correct when nothing else in the workbook knows the
+    answer -- but when a SIBLING calc with a byte-identical formula IS placed, the answer is already
+    recovered and sitting in the same model.
+
+    Measured 2026-08-07 on a real workbook: ``Rank GMC`` and ``Rank GMC %`` are both
+    ``rank([Calculation_2768024947633754122], 'desc')`` -- same function, same operand, same
+    direction. ``Rank GMC`` is on a worksheet and translated to a live partitioned ``RANKX``;
+    ``Rank GMC %`` is placed nowhere and stubbed. One of a pair of identical formulas shipped as a
+    working measure while its twin shipped as a placeholder.
+
+    This is a lookup, not an inference: identical formula + identical addressing is identical DAX by
+    construction. Fail-closed in both directions that could make it a guess -- a calc with its OWN
+    usage is never touched (its real placement always wins), and a formula whose placed twins
+    DISAGREE on addressing is skipped rather than resolved by picking one. Returns the synthetic
+    usages to append; ``[]`` leaves every caller byte-for-byte unchanged.
+    """
+    usage_list = list(usages or [])
+    if not usage_list or not calcs:
+        return []
+
+    # Identities that already carry their own addressing -- never re-lend to these.
+    placed = set()
+    for u in usage_list:
+        for key in (getattr(u, "column", ""), getattr(u, "caption", "")):
+            key = str(key or "").strip().strip("[]").lower()
+            if key:
+                placed.add(key)
+
+    formula_of = {}
+    for c in (calcs or []):
+        formula = (c.get("formula") or "").strip()
+        if not formula:
+            continue
+        for key in (c.get("name"), c.get("internal_name")):
+            key = str(key or "").strip().lower()
+            if key:
+                formula_of[key] = formula
+
+    # {formula -> the single agreed addressing} ; a formula whose placed twins disagree maps to None
+    # and is therefore never lent.
+    donor = {}
+    for u in usage_list:
+        for key in (getattr(u, "column", ""), getattr(u, "caption", "")):
+            key = str(key or "").strip().strip("[]").lower()
+            formula = formula_of.get(key)
+            if not formula:
+                continue
+            sig = _addressing_signature(u)
+            if formula not in donor:
+                donor[formula] = (sig, u)
+            elif donor[formula] is not None and donor[formula][0] != sig:
+                donor[formula] = None  # ambiguous: two placements, two windows -> refuse to choose
+            break
+
+    out = []
+    for c in (calcs or []):
+        name = str(c.get("name") or "").strip()
+        tid = str(c.get("internal_name") or "").strip()
+        formula = (c.get("formula") or "").strip()
+        if not formula or not (name or tid):
+            continue
+        if name.lower() in placed or tid.lower() in placed:
+            continue  # this calc has its own placement; that is the authoritative window
+        match = donor.get(formula)
+        if not match:
+            continue
+        _sig, source_usage = match
+        try:
+            out.append(dataclasses.replace(
+                source_usage,
+                column=tid or name,
+                caption=name or tid,
+                instance=f"twin:{(tid or name)}",
+            ))
+        except Exception:
+            continue  # a usage shape that cannot be cloned is simply not lent to
+        placed.add(name.lower())
+        placed.add(tid.lower())
+    return out
 
 
 def _table_calc_measures(usages, resolve, known_tables, consumed_lower, base_formula_lookup=None,
@@ -1150,7 +1251,8 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         if tid:
             base_formula_lookup[tid] = formula
     tablecalc_rows, superseded = _table_calc_measures(
-        table_calc_usages, resolve, known_tables, consumed_lower,
+        list(table_calc_usages or []) + _twin_addressing_usages(calcs, table_calc_usages),
+        resolve, known_tables, consumed_lower,
         base_formula_lookup=base_formula_lookup, order_resolver=order_resolver)
     # Force-translate UNPLACED percent-difference calcs (referenced only inside a colour rule /
     # tooltip) by inheriting a window from their placed consumer. These are emitted alongside the

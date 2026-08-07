@@ -39,7 +39,6 @@ from assemble_model import (
 from calc_to_dax import translate_tableau_calc_to_dax
 from connection_to_m import parse_tds, combine_descriptors
 import assemble_model as me_asm
-import migrate_estate as me_est
 from openability_gate import check_model_openability
 from workbook_table_calcs import TableCalcUsage, Pill
 from test_connection_to_m import (
@@ -3039,8 +3038,84 @@ def test_explicit_caller_value_still_wins_on_the_local_csv_path():
     assert seen.get("table_calc_usages") == []
 
 
+# -- lending a placed calc's addressing to its unplaced identical twin -------------
+import migrate_estate as me_est
+
+
 def me_asm_local_source(root):
     return me_est.LocalFilesSource(root)
+
+
+def _rank_usage(**kw):
+    """A PLACED rank table calc: addressing recovered from the worksheet (partition on a Rows dim)."""
+    d = dict(
+        worksheet="Dash", instance="usr:Calculation_AAA:qk",
+        column="Calculation_AAA", caption="Rank GMC",
+        kind="field", formula="rank([Calculation_BBB], 'desc')",
+        ordering_type="Columns", rows=[Pill("none:Row1:nk", "Row1", "None")], cols=[],
+    )
+    d.update(kw)
+    return TableCalcUsage(**d)
+
+
+def test_an_unplaced_calc_borrows_addressing_from_its_identical_placed_twin():
+    """Measured on a real workbook: 'Rank GMC' and 'Rank GMC %' are both
+    ``rank([Calculation_...], 'desc')`` -- same function, same operand, same direction. The first is
+    on a worksheet and translated to a live partitioned RANKX; the second is placed nowhere and
+    stubbed. One of an identical pair shipped working, its twin shipped as a placeholder."""
+    calcs = [
+        {"name": "Rank GMC", "internal_name": "Calculation_AAA",
+         "formula": "rank([Calculation_BBB], 'desc')"},
+        {"name": "Rank GMC %", "internal_name": "Calculation_CCC",
+         "formula": "rank([Calculation_BBB], 'desc')"},
+    ]
+    lent = me_asm._twin_addressing_usages(calcs, [_rank_usage()])
+    assert [u.caption for u in lent] == ["Rank GMC %"]
+    # identical formula + identical addressing == identical DAX, by construction
+    assert me_asm._addressing_signature(lent[0]) == me_asm._addressing_signature(_rank_usage())
+
+
+def test_a_calc_with_its_own_placement_is_never_relent():
+    """Real placement always wins -- it is evidence, where a twin's window is only a match."""
+    calcs = [{"name": "Rank GMC", "internal_name": "Calculation_AAA",
+              "formula": "rank([Calculation_BBB], 'desc')"}]
+    assert me_asm._twin_addressing_usages(calcs, [_rank_usage()]) == []
+
+
+def test_a_differing_formula_never_borrows():
+    """The whole safety of this rests on the formulas being IDENTICAL. A near-match is a guess."""
+    calcs = [
+        {"name": "Rank GMC", "internal_name": "Calculation_AAA",
+         "formula": "rank([Calculation_BBB], 'desc')"},
+        {"name": "Rank Other", "internal_name": "Calculation_CCC",
+         "formula": "rank([Calculation_BBB], 'asc')"},      # different direction
+    ]
+    assert me_asm._twin_addressing_usages(calcs, [_rank_usage()]) == []
+
+
+def test_placed_twins_that_disagree_on_addressing_lend_nothing():
+    """Two placements of one formula with different windows: there is no single right answer, so
+    refuse to choose rather than silently pick the first."""
+    calcs = [
+        {"name": "Rank GMC", "internal_name": "Calculation_AAA",
+         "formula": "rank([Calculation_BBB], 'desc')"},
+        {"name": "Rank GMC 2", "internal_name": "Calculation_DDD",
+         "formula": "rank([Calculation_BBB], 'desc')"},
+        {"name": "Rank GMC %", "internal_name": "Calculation_CCC",
+         "formula": "rank([Calculation_BBB], 'desc')"},
+    ]
+    placed_two = [
+        _rank_usage(),
+        _rank_usage(column="Calculation_DDD", caption="Rank GMC 2", ordering_type="Rows"),
+    ]
+    assert me_asm._twin_addressing_usages(calcs, placed_two) == []
+
+
+def test_no_usages_at_all_lends_nothing():
+    """Byte-for-byte unchanged for every workbook with no recovered table-calc addressing."""
+    calcs = [{"name": "X", "internal_name": "Calculation_AAA", "formula": "rank([B], 'desc')"}]
+    assert me_asm._twin_addressing_usages(calcs, []) == []
+    assert me_asm._twin_addressing_usages([], [_rank_usage()]) == []
 
 
 # -- duplicate input bytes ---------------------------------------------------------
@@ -3084,6 +3159,27 @@ def test_a_clean_input_folder_emits_no_banner():
     assert me_est._input_collision_banner({"input_manifest": {"collisions": [],
                                                               "duplicate_bytes": []}}) == []
 
+
+def test_the_unplaced_twin_lands_as_a_LIVE_measure_end_to_end():
+    """The WIRING, not just the helper. A correct ``_twin_addressing_usages`` that the assembler
+    never calls looks identical in unit tests and identical in review -- and every twin still ships
+    as a placeholder. Proven by the emitted TMDL: both measures live, with the SAME DAX (identical
+    Tableau formulas cannot translate to different DAX)."""
+    twin = dict(_sod_usage().__dict__)
+    calcs = [
+        {"name": "Standard of Deviation", "internal_name": "Calculation_0014172373577763",
+         "formula": twin["formula"], "role": "measure"},
+        {"name": "SoD Copy", "internal_name": "Calculation_9998887776665554",
+         "formula": twin["formula"], "role": "measure"},
+    ]
+    out = assemble_import_model(parse_tds(LIVE_SQLSERVER), model_name="Superstore",
+                                calcs=calcs, table_calc_usages=[_sod_usage()])
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    assert "measure 'SoD Copy' =" in measures
+    # the twin is LIVE, not an inert placeholder
+    assert "measure 'SoD Copy' = 0\n" not in measures
+    assert "measure 'SoD Copy' = BLANK()\n" not in measures
+    assert measures.count("STDEVX.S") >= 2
 
 
 def test_the_duplicate_banner_explains_what_is_inflated(tmp_path):
