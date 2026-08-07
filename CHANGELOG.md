@@ -12,6 +12,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.84.0` -> `2.85.0`): the Tier-3 work order now carries ONLY what
+  the reference image cannot show.** Measured against the downstream agent: working from the Tableau
+  PNG alone it reached near-perfect fidelity in 1h40m, but the same agent handed 2.84.0's
+  comprehensive "audit" work order took 3h and produced a WORSE report. The document had negative
+  value, for two reasons, both now fixed. (1) It asserted a set of visuals were "checked and CORRECT
+  -- do not re-audit", derived from "the worklist did not flag them" -- but the worklist records
+  TRANSLATION failures and has no opinion on whether a visual LOOKS right. The correlation runs
+  backwards: a visual that translated cleanly is the one still wearing the default theme, so the
+  section suppressed the highest-value work and named the three visuals the solo agent rebuilt. That
+  section is deleted, and the document now states explicitly that absence from it is not approval.
+  (2) It spent its length on things the reader can SEE -- palette, axis titles, sort order, layout --
+  which the agent reads off the image faster and more accurately than we can describe. Those are
+  dropped. What remains is three classes that are genuinely invisible: calculations emitted as a
+  placeholder `0` (with the Tableau source, the model columns they need, and **which visual is
+  showing the placeholder**), values that render plausibly but are wrong, and constructs never
+  rebuilt at all. Also fixed: dashboard-scope items stamped with the PBIR page id instead of the
+  dashboard name were silently dropped (5 real findings on the test workbook), a `(None, None)`
+  reference tuple rendered as a literal `None` path, the reference image is now absolute, and a
+  swallowed render exception no longer surfaces as "no dashboards found".
 - **tableau-migration (skill `2.83.0` -> `2.84.0`): Tier-3 work order generator.** New
   `scripts/work_order.py` turns a finished run into one per-dashboard handoff document for the agent
   that takes the report to full visual fidelity. It PUSHES pre-resolved answers rather than telling the

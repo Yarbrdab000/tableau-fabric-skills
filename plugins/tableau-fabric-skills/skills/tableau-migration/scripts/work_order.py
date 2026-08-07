@@ -71,6 +71,24 @@ VISUAL_CLASS_MAP = {
     "combochart": "combochart",
 }
 
+# Corpus classes reachable only by MECHANISM, never by our emitted visual type.
+#
+# The gap this closes is an inversion, and it is the worst one available here. Cards are normally
+# found by mapping the type we emitted -- but when the engine emitted NOTHING (mark class unsupported,
+# no usable field bindings) there is no type to map, so the hardest item on the page got zero corpus
+# support while nine already-working charts each got a card. Help was densest where it was least
+# needed.
+#
+# ``customvisual`` is exactly the right destination for those: it is where the corpus records what to
+# do when the NATIVE route is exhausted (its lollipop card documents the native combo-chart attempt
+# failing across three runs before a Deneb/Vega-Lite build worked). ``page`` and ``shape`` are
+# likewise unreachable from any visual type, because no visual carries them.
+MECHANISM_CORPUS_CLASS = {
+    "unrebuilt-visual": "customvisual",
+    "hidden-zone": "page",
+    "filter-card-binding": "slicer",
+}
+
 # Worklist categories that share ONE fix mechanism get batched into a single item. The mechanism is
 # the unit of work for an editor -- fixing nine identical colour defaults is one pass, not nine.
 MECHANISM_OF_CATEGORY = {
@@ -257,85 +275,6 @@ def page_for_dashboard(pages, dashboard):
 # =====================================================================================
 # Corpus: pull the answer IN, never send the reader out to fetch it
 # =====================================================================================
-def corpus_class_for(visual_type):
-    return VISUAL_CLASS_MAP.get(re.sub(r"[^a-z]", "", (visual_type or "").lower()))
-
-
-# The procedure for a whole mechanism. The engine's own per-item ``remediation`` often falls back to
-# "Review this item against the source and remediate", which tells a reader nothing they did not
-# already know -- reproducing it faithfully would make this document a reformatted worklist. These say
-# what to actually DO, once, for the batch. Keyed on mechanism, so they can never drift onto a
-# workbook-specific special case.
-_PROCEDURE = {
-    "colour": (
-        "Tableau assigned explicit per-member mark colours; the emitted visual fell back to the theme "
-        "palette. Read the member->hex pairs off the Tableau image, then add a "
-        "`visual.objects.dataPoint` entry per member -- each a `fill` targeted by a `scopeId` data "
-        "selector (ComparisonKind 0 Equal; Left = the coloured column, Right = the member literal). "
-        "Hex literals inside a fill are QUOTED (`'#5CA35C'`)."
-    ),
-    "nested-table-calc": (
-        "The engine parsed the base value but refused the nested formula, so the visual currently "
-        "shows the UNADJUSTED number. Open the source calc named in the reason, write the DAX "
-        "equivalent as a model measure, then repoint the visual's projection at it. Check against the "
-        "Tableau image -- a base value usually looks plausible, so a wrong number here will not "
-        "announce itself."
-    ),
-    "table-calc-scope": (
-        "A quick table calc whose ordering scope does not decompose into a single DAX window. Decide "
-        "the partition and the order from the Tableau view, then express it explicitly (`CALCULATE` + "
-        "`ALLSELECTED` over the partition columns) rather than relying on visual order."
-    ),
-    "filter-card-binding": (
-        "A Tableau filter card resolved to no model field, so no slicer was emitted. Find the model "
-        "column matching the name in the reason (the `federated.*` prefix is a Tableau datasource id, "
-        "not part of the field name), add a `slicer` visual bound to it, and place it to match the "
-        "filter shelf in the Tableau image."
-    ),
-    "hidden-zone": (
-        "Tableau's show/hide toggle hides these zones on open, and the engine did not rebuild them. "
-        "Confirm against the Tableau image FIRST: if the zone is not visible there, the correct action "
-        "is to leave it out and say so -- rebuilding it would ADD something the target does not show."
-    ),
-    "unrebuilt-visual": (
-        "No visual was emitted at all, so this is new construction, not a repair. Build it from the "
-        "Tableau image and the worksheet's fields; choose the Power BI visual type whose encoding "
-        "matches what the image shows, not the one closest in name."
-    ),
-    "field-binding": (
-        "The field did not bind to a model column. Map it to the real table/column, and treat a "
-        "caption-only match as unproven until you have confirmed the column exists."
-    ),
-}
-
-# Which corpus text actually speaks to a mechanism. Cards are indexed by VISUAL CLASS, so a lineChart
-# batch about colour otherwise attracts a lineChart card about axis display units -- true, verified,
-# and irrelevant. An irrelevant card is not free: it costs reading time and teaches the reader that
-# the corpus block is skippable, which is exactly the habit this document depends on not forming.
-_MECHANISM_TERMS = {
-    "colour": ("color", "colour", "fill", "palette", "datapoint", "gradient"),
-    "nested-table-calc": ("measure", "dax", "calculate", "window", "running"),
-    "table-calc-scope": ("window", "allselected", "partition", "order"),
-    "filter-card-binding": ("slicer", "filter"),
-    "field-binding": ("column", "projection", "binding", "displayname"),
-}
-
-
-def card_matches(card, mechanism):
-    """Does this corpus card speak to this mechanism? Unknown mechanism -> keep it (fail open)."""
-    terms = _MECHANISM_TERMS.get(mechanism)
-    if not terms:
-        return True
-    hay = " ".join(_as_list(card.get("props")) + _as_list(card.get("gotchas"))).lower()
-    return any(t in hay for t in terms)
-
-
-# The engine's own catch-all remediation. Matched so it can be dropped where a batch procedure says
-# something real; matched LOOSELY on purpose, because the cost of missing one is a redundant line
-# while the cost of over-matching is losing a specific instruction.
-_GENERIC_REMEDIATION = re.compile(
-    r"^(review (this )?item|review .{0,24}against the source)", re.I)
-
 
 def _clip(text, limit):
     """Trim to ``limit`` chars on a WORD boundary, marking the cut with an ellipsis.
@@ -403,29 +342,302 @@ def load_corpus_cards(corpus_root, visual_class, limit=2):
     return cards
 
 
-def load_build_checklist(corpus_root, limit=9):
-    """The corpus's cross-cutting checks -- its ONLY push layer.
+# =====================================================================================
+# Selection: what belongs in this document at all
+# =====================================================================================
+# The scope rule, and the reason the first version of this file failed.
+#
+# Measured 2026-08-06 on `Sales Operations Cases Portfolio`: the downstream agent working ALONE, with
+# only the Tableau PNG and the rebuilt report, reached near-perfect fidelity in 1h40m. The same agent
+# handed a comprehensive "audit" work order took 3h and produced a WORSE report. The document had
+# negative value.
+#
+# Two causes, both design errors:
+#
+#   1. It asserted a section of visuals were "checked and CORRECT -- do not re-audit", derived from
+#      "the engine's worklist did not flag them". But the worklist records TRANSLATION failures, and
+#      says nothing about whether a visual LOOKS like the target. Those are different claims. Worse,
+#      the correlation runs backwards: a visual that translated cleanly is exactly the one still
+#      wearing the default theme, so the section suppressed the highest-value work on the page. It
+#      named the three visuals the solo agent rebuilt.
+#
+#   2. It spent its length on things the reader can SEE -- palette, axis titles, sort order, layout.
+#      The agent reads those off the reference image faster and more accurately than we can describe
+#      them, so every such line is pure cost.
+#
+# So this document now carries ONLY what the picture cannot tell you: a number that is a placeholder
+# rather than a measurement, a construct that is missing with no trace to notice, and a number that
+# is quietly wrong while looking completely reasonable. The image is the specification for everything
+# else, and it is a better one than we could write.
+_SILENT_WRONG = re.compile(
+    r"routed to review|emitted with the base value only|does not decompose", re.I)
 
-    Its own preamble is the argument for including it: an agent migrating a workbook ran 10 lookups,
-    "none about theme, colour or layout", and shipped a white-background report against a dark
-    original. The corpus HELD the answer; retrieval never surfaced it, "because retrieval only answers
-    questions that get asked."
+_NOT_REBUILT = re.compile(
+    r"no visual emitted|no usable field bindings|not supported|skipped|"
+    r"resolved to no model field|not rebuilt", re.I)
+
+
+def stub_requests(workbook_entry):
+    """Calculations the engine could not translate, with the Tableau source it refused.
+
+    These are the highest-value facts available. A stub is emitted as a measure returning ``0``, so on
+    the canvas it renders as a confident, plausible number -- ``0`` where the truth is ``96%``. No
+    amount of looking at the two images tells you that tile is a placeholder rather than a
+    measurement; you have to be told.
     """
-    path = os.path.join(corpus_root or "", "BUILD-CHECKLIST.md")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            text = fh.read()
-    except Exception:
-        return []
-    out = []
-    for row in re.findall(r"^\|\s*\d+\s*\|\s*\*\*(.+?)\*\*\s*\|\s*(\d+)\s*\|", text, re.M):
-        out.append({"ask": row[0].strip(), "anti_patterns": int(row[1])})
-    return out[:limit]
+    handoff = workbook_entry.get("model_translation_handoff") or {}
+    return [r for r in (handoff.get("requests") or []) if isinstance(r, dict)]
+
+
+def stub_usage(report_dir, stub_names):
+    """``{stub_name: [visual dicts]}`` -- which tile on the canvas is showing each placeholder.
+
+    This is the join the reader would otherwise do by hand, and it is what converts "8 measures failed
+    to translate" (a fact about a model) into "THIS card is lying to you" (a fact about the picture).
+    """
+    usage = {}
+    if not report_dir:
+        return usage
+    for page_info in (index_visuals(report_dir) or {}).values():
+        for vis in page_info.get("visuals", []):
+            try:
+                with open(vis["path"], encoding="utf-8-sig") as fh:
+                    blob = fh.read()
+            except Exception:
+                continue
+            for name in stub_names:
+                # Substring match on the measure name as it appears in the projection. Deliberately
+                # loose: a false positive costs the reader one glance, a false negative hides a lying
+                # tile, and those costs are nowhere near equal.
+                if name and name in blob:
+                    usage.setdefault(name, []).append(vis)
+    return usage
+
+
+def partition_items(items):
+    """Split the worklist into the two classes the picture cannot reveal, dropping the rest.
+
+    ``not_rebuilt``  -- Tableau had it, the report has nothing. A gap is visible, but not WHAT is
+                       missing or why the deterministic route refused, which is the expensive part.
+    ``silent_wrong`` -- something WAS emitted and renders plausibly, but the number is not the
+                       number. The worst class in the document: nothing about it looks wrong.
+
+    Everything else (deferred colours, theme palettes, axis titles, layout) is deliberately dropped.
+    The reader can see all of it, and listing it is what made the previous version slower AND worse.
+    """
+    not_rebuilt, silent_wrong = [], []
+    seen = set()
+    for item in items or []:
+        reason = item.get("reason") or ""
+        key = (item.get("worksheet"), item.get("visual"), reason[:80])
+        if key in seen:
+            continue
+        seen.add(key)
+        if _SILENT_WRONG.search(reason):
+            silent_wrong.append(item)
+        elif _NOT_REBUILT.search(reason):
+            not_rebuilt.append(item)
+    return not_rebuilt, silent_wrong
+
+
+def exhausted_route_cards(corpus_root, limit=1):
+    """Corpus precedent for marks with NO native Power BI equivalent.
+
+    Narrow on purpose. Almost all corpus knowledge is about styling, which the reader gets from the
+    image for free. The exception is the record of which native routes were already tried and found
+    to fail -- a lollipop rebuilt three times as a combo chart before a Deneb build worked. That is a
+    negative result, it is invisible in both images, and rediscovering it costs hours.
+    """
+    return load_corpus_cards(corpus_root, "customvisual", limit=limit)
 
 
 # =====================================================================================
-# PART A -- batch the flagged work by MECHANISM
+# Rendering
 # =====================================================================================
+_HEADER = """## What this is
+
+The rebuilt Power BI report is open and the original Tableau dashboard is captured as an image. Your
+job is to make the report match that image.
+
+**This document is not an audit, and it is not a task list.** It is the short list of things that are
+true about this migration but are IMPOSSIBLE TO SEE in either image. Everything else -- colours,
+fonts, layout, sort order, chart styling, spacing -- you should take from the reference image, which
+is a more accurate specification than anything written here.
+
+Read this once, keep it in mind, then work from the picture.
+
+**Nothing here is a claim that any other part of the report is correct.** Absence from this document
+means only that the deterministic engine had nothing to say -- most often because the visual
+translated cleanly, which usually means it is still wearing the default theme.
+"""
+
+_CLOSING = """## When is this done?
+
+When the report looks like the image. Not when this document is exhausted -- it is a handful of facts
+the engine happened to know, not a definition of done.
+
+There is no time limit and no step budget. Correctness is the only target.
+"""
+
+
+def render(order):
+    L = ["# %s -- what the picture cannot tell you" % order["dashboard"], ""]
+    L.append("> Workbook: `%s`  ·  generated %s  ·  schema `%s`"
+             % (order["workbook"], order["generated"], SCHEMA_VERSION))
+    L.append("")
+    L.append(_HEADER)
+
+    ref = order.get("reference_image")
+    path, confidence = (ref if isinstance(ref, (tuple, list)) else (ref, None)) if ref else (None, None)
+    L.append("## The reference image")
+    L.append("")
+    if path:
+        # The manifest stores a bare filename. Emit an absolute path: this is the ONE file the reader
+        # must open before doing anything, and making them hunt for it is the exact cost this
+        # document exists to remove.
+        if order.get("reference_dir") and not os.path.isabs(str(path)):
+            path = os.path.join(order["reference_dir"], str(path))
+        L.append("- **Tableau (the target):** `%s`%s"
+                 % (path, ("  _(match confidence: %s)_" % confidence) if confidence else ""))
+    else:
+        L.append("- _No reference image was captured for this dashboard._ Everything below still "
+                 "applies, but you have no target to match against -- say so rather than guessing.")
+    if order.get("page_name"):
+        L.append("- The Power BI page for this dashboard is `%s`." % order["page_name"])
+    L.append("")
+
+    stubs = order["stubs"]
+    L.append("## 1. Numbers that are placeholders, not measurements (%d)" % len(stubs))
+    L.append("")
+    if not stubs:
+        L.append("_None -- every calculation translated._")
+    else:
+        L.append("The engine could not translate these Tableau calculations, so each was emitted as a "
+                 "measure returning **0**. On the canvas that renders as a confident number. A card "
+                 "reading `0` here is not a measurement of zero -- it is a gap. **This is the single "
+                 "thing in this migration you cannot discover by looking.**")
+        L.append("")
+        for s in stubs:
+            L.append("### `%s`" % s.get("name"))
+            L.append("")
+            L.append("- **Renders now as:** `0`")
+            L.append("- **Tableau source:** `%s`" % _clip(s.get("formula"), 400))
+            L.append("- **Refused because:** %s" % (s.get("fallback_reason") or "unknown"))
+            fields = s.get("fields")
+            if isinstance(fields, list) and fields:
+                cols = ", ".join(
+                    "`%s`.`%s`" % (f.get("table"), f.get("column"))
+                    for f in fields if isinstance(f, dict) and f.get("column"))
+                if cols:
+                    L.append("- **Model columns it needs:** %s" % _clip(cols, 300))
+            for vis in s.get("used_by") or []:
+                L.append("- **Showing this placeholder:** `%s` (`%s`)"
+                         % (vis.get("name"), vis.get("type")))
+                L.append("  - `%s`" % vis.get("path"))
+            if not (s.get("used_by") or []):
+                L.append("- _No visual on this page projects it -- fixing it changes nothing visible; "
+                         "treat it as lower priority than the ones that do._")
+            if s.get("category_guidance"):
+                L.append("- **Why this class is hard:** %s" % _clip(s["category_guidance"], 320))
+            L.append("")
+
+    wrong = order["silent_wrong"]
+    L.append("## 2. Numbers that render plausibly but are WRONG (%d)" % len(wrong))
+    L.append("")
+    if not wrong:
+        L.append("_None._")
+    else:
+        L.append("Something WAS emitted for each of these, and it looks entirely reasonable -- but the "
+                 "engine dropped part of the calculation, so the value is not the value Tableau "
+                 "shows. Check each against the reference image; nothing about them looks wrong.")
+        L.append("")
+        for it in wrong:
+            L.append("- %s" % (it.get("reason") or ""))
+            if it.get("worksheet"):
+                L.append("  - source worksheet: `%s`" % it["worksheet"])
+            for p in it.get("paths") or []:
+                L.append("  - `%s`" % p)
+            L.append("")
+
+    missing = order["not_rebuilt"]
+    L.append("## 3. In Tableau, absent from the report (%d)" % len(missing))
+    L.append("")
+    if not missing:
+        L.append("_None -- every zone was rebuilt._")
+    else:
+        L.append("The engine emitted nothing for these. You can see a gap in the image; what you "
+                 "cannot see is what was supposed to be there or why the deterministic route refused "
+                 "-- which is the part that costs time to rediscover.")
+        L.append("")
+        for it in missing:
+            L.append("- %s" % (it.get("reason") or ""))
+            if it.get("worksheet"):
+                L.append("  - source worksheet: `%s` -- find it in the reference image to see what it "
+                         "should look like" % it["worksheet"])
+            L.append("")
+        for card in order.get("route_cards") or []:
+            L.append("<details><summary>Before hand-building an unusual mark, read this "
+                     "(corpus `%s`)</summary>" % card.get("id"))
+            L.append("")
+            L.append("A previously harvested build of a mark Power BI has no native equivalent for. "
+                     "It records which native routes were tried and FAILED, which is the part you "
+                     "cannot see in any image and would otherwise pay for in runs.")
+            L.append("")
+            for line in (card.get("props") or [])[:4]:
+                L.append("- `%s`" % _clip(line, 420))
+            for line in (card.get("gotchas") or [])[:3]:
+                L.append("- ⚠ %s" % _clip(line, 420))
+            if card.get("exemplar"):
+                L.append("- copy from: `%s`" % card["exemplar"])
+            L.append("")
+            L.append("</details>")
+            L.append("")
+
+    L.append(_CLOSING)
+    return "\n".join(L)
+
+
+def build_order(workbook_entry, dashboard, pages, references, corpus_root=None, run_dir=None):
+    report_dir = find_report_dir(workbook_entry, run_dir)
+    page_name, page_info = page_for_dashboard(pages, dashboard)
+    worklist = (workbook_entry.get("remediation_worklist") or {})
+    # The engine stamps ``page_display`` with EITHER the Tableau dashboard name or the emitted PBIR
+    # page id, depending on which layer raised the item -- dashboard-scope findings (filter cards,
+    # hidden zones) carry the page id. Accepting only one form silently dropped five real items here,
+    # and a silent drop is the worst outcome available: the reader cannot tell the difference between
+    # "nothing was wrong" and "we forgot to tell you".
+    keys = {k for k in (dashboard, page_name) if k}
+    items = [i for i in (worklist.get("items") or [])
+             if not i.get("page_display") or i.get("page_display") in keys]
+
+    not_rebuilt, silent_wrong = partition_items(items)
+    by_name, by_type = _visual_lookup(page_info or {})
+    for it in silent_wrong:
+        paths, exact = locate(it, by_name, by_type)
+        it["paths"] = paths if exact else []
+
+    stubs = [dict(s) for s in stub_requests(workbook_entry)]
+    usage = stub_usage(report_dir, [s.get("name") for s in stubs])
+    for s in stubs:
+        s["used_by"] = usage.get(s.get("name")) or []
+    # A stub nothing projects cannot change the picture, so it must not head the list.
+    stubs.sort(key=lambda s: (not s["used_by"], s.get("name") or ""))
+
+    return {
+        "schema": SCHEMA_VERSION,
+        "workbook": workbook_entry.get("name") or workbook_entry.get("workbook") or "?",
+        "dashboard": dashboard,
+        "generated": _now(),
+        "page_name": page_name,
+        "reference_image": reference_image_for(references, dashboard),
+        "reference_dir": os.path.join(run_dir, "out", "reference_images") if run_dir else None,
+        "stubs": stubs,
+        "silent_wrong": silent_wrong,
+        "not_rebuilt": not_rebuilt,
+        "route_cards": exhausted_route_cards(corpus_root) if (corpus_root and not_rebuilt) else [],
+    }
+
+
 def _visual_lookup(page_info):
     """``({visual_name: rec}, {type: [rec]})`` -- exact match first, type as the fallback."""
     by_name, by_type = {}, {}
@@ -439,11 +651,11 @@ def _visual_lookup(page_info):
 def locate(item, by_name, by_type):
     """Resolve an item to its emitted file(s) -> ``(paths, exact)``.
 
-    The worklist records the emitted visual NAME (``item["visual"]``), which is the same string as the
-    visual's folder on disk -- so most items resolve to exactly one file and the reader never searches
-    or guesses. Only an item with no recorded name falls back to matching on visual TYPE, which
-    narrows to a candidate set rather than a file; ``exact`` says which happened so the document can
-    be honest about it.
+    The worklist records the emitted visual NAME, which is the same string as the visual's folder on
+    disk, so most items resolve to exactly one file. An item without one falls back to matching on
+    visual TYPE, which narrows to a candidate SET rather than a file -- ``exact`` says which happened,
+    and only an exact hit is ever printed as a path. Printing a candidate set as if it were the answer
+    sends the reader to edit visuals that are not broken.
     """
     name = item.get("visual")
     if name and name in by_name:
@@ -451,305 +663,14 @@ def locate(item, by_name, by_type):
     return [v["path"] for v in by_type.get((item.get("visual_type") or "").lower(), [])], False
 
 
-def batch_items(items, page_info, corpus_root=None):
-    """Group worklist items into mechanism batches, each pre-localised to real files.
-
-    One batch = one edit pass = ONE verify cycle. Duplicates are collapsed first: the engine can file
-    the same finding twice (once per emitted visual of a split trellis, say), and a reader who fixes
-    it once then meets it again spends a turn re-deriving that there is nothing left to do.
-    """
-    by_name, by_type = _visual_lookup(page_info)
-    seen, deduped = set(), []
-    for item in items:
-        # Key on (emitted visual, mechanism) where the visual is known, else (worksheet, type,
-        # mechanism): the engine states the same finding more than one way ("categorical mark colours
-        # deferred (the area visual type does not carry a per-member mark colour)" and "the area
-        # visual type does not carry a per-member mark colour" are ONE issue). Keying on the prose
-        # leaves the reader to notice the duplication itself.
-        key = (item.get("visual") or (item.get("worksheet"), item.get("visual_type")),
-               mechanism_of(item) or (item.get("reason") or "")[:120])
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(item)
-
-    batches, singles = {}, []
-    for item in deduped:
-        mech = mechanism_of(item)
-        paths, exact = locate(item, by_name, by_type)
-        enriched = dict(item)
-        enriched["paths"] = paths
-        enriched["exact"] = exact
-        if mech:
-            batches.setdefault(mech, []).append(enriched)
-        else:
-            singles.append(enriched)
-    out = []
-    for mech, group in sorted(batches.items()):
-        classes = {corpus_class_for(i.get("visual_type")) for i in group}
-        cards = []
-        for cls in sorted(c for c in classes if c):
-            cards.extend(c for c in load_corpus_cards(corpus_root, cls, limit=2)
-                         if card_matches(c, mech))
-        out.append({"mechanism": mech, "items": group, "cards": cards[:2],
-                    "procedure": _PROCEDURE.get(mech),
-                    "severity": min((_SEVERITY_RANK.get(i.get("severity"), 9) for i in group),
-                                    default=9)})
-    for item in singles:
-        cards = load_corpus_cards(corpus_root, corpus_class_for(item.get("visual_type")), limit=1)
-        out.append({"mechanism": None, "items": [item], "cards": cards, "procedure": None,
-                    "severity": _SEVERITY_RANK.get(item.get("severity"), 9)})
-    out.sort(key=lambda b: (b["severity"], b["mechanism"] or "zz"))
-    return out
-
-
-# =====================================================================================
-# PART B -- what was checked and is CORRECT (the subtractive section)
-# =====================================================================================
-def verified_correct(page_info, flagged_names, ambiguous_types):
-    """Visuals nothing was flagged against -- examined and raising nothing.
-
-    Two exclusions, and the second is the honest one. A visual is dropped when it is named by an item
-    (precise), OR when its TYPE was only narrowed to a candidate set -- because then we cannot prove
-    which member of that set is the clean one. This section's whole value is that a reader can trust
-    it and skip the re-audit, so listing a visual that might be the broken one would destroy it.
-    """
-    rows = []
-    for v in (page_info or {}).get("visuals", []):
-        if v.get("name") in flagged_names:
-            continue
-        if (v.get("type") or "").lower() in ambiguous_types:
-            continue
-        rows.append({"visual": v.get("name"), "type": v.get("type"),
-                     "objects": v.get("objects") or [], "path": v.get("path")})
-    return rows
-
-
-# =====================================================================================
-# Rendering
-# =====================================================================================
-_PROTOCOL = """## How to use this work order
-
-You are finishing a Tableau -> Power BI dashboard migration that a deterministic engine has already
-built. This document is everything that engine knows and would otherwise discard.
-
-1. **Look at both images first** (linked below). Everything else here is a claim about them.
-2. **Work PART A top to bottom.** Each item is batched by FIX MECHANISM and carries the file path and
-   the property to change, so you never need to search for anything. Fix a whole batch, then verify
-   once -- not once per visual.
-3. **Trust PART B.** Those were examined and are correct. Re-auditing them is the single largest
-   waste of effort available to you.
-4. **PART C is honest ignorance,** not an oversight -- the engine could not determine these. They are
-   yours to judge.
-5. **Then read PART D.** It matters more than the rest.
-
-There is no time limit and no step budget. Correctness is the only target.
-"""
-
-_CLOSING = """## PART D -- when is this done?
-
-**Finishing every item above is the START of your judgement, not the end of your work.**
-
-This work order lists what the engine could detect. It cannot see everything. Now compare the two
-images yourself, as a whole dashboard rather than visual by visual, and ask the question the engine
-cannot: *does this read as the same dashboard?*
-
-Anything you find that is not listed above is a gap this work order MISSED. Fix it, and say so in
-your report -- an unlisted gap is the most valuable feedback there is, because it makes the next
-work order better.
-
-**Done means the dashboard matches its source. Not "the items are complete."**
-"""
-
-
-def render(order):
-    """Render one dashboard's work order as markdown."""
-    L = []
-    L.append("# Work order -- %s" % order["dashboard"])
-    L.append("")
-    L.append("> Workbook: `%s`  ·  generated %s  ·  schema `%s`"
-             % (order.get("workbook") or "?", order["generated_at_utc"], SCHEMA_VERSION))
-    L.append("")
-    L.append(_PROTOCOL)
-
-    L.append("## The two images")
-    L.append("")
-    ref = order.get("reference_image")
-    if ref:
-        L.append("- **Tableau (the target):** `%s`%s" % (
-            ref, "  _(match confidence: %s)_" % order["reference_confidence"]
-            if order.get("reference_confidence") else ""))
-    else:
-        L.append("- **Tableau (the target):** _not captured_ -- you are working without the source "
-                 "image. Everything below is structural; the visual comparison is yours to make.")
-    L.append("- **Power BI (what was built):** capture it yourself from the open report "
-             "(`powerbi-desktop screenshot <page-id>`); the page for this dashboard is `%s`."
-             % (order.get("page_name") or "?"))
-    L.append("")
-
-    L.append("## PART A -- pre-resolved work (%d batch(es))" % len(order["batches"]))
-    L.append("")
-    if not order["batches"]:
-        L.append("_Nothing was flagged on this dashboard._")
-    for i, batch in enumerate(order["batches"], 1):
-        n = len(batch["items"])
-        if batch["mechanism"]:
-            heading = ("**A%d. %s** -- %d item%s; ONE fix procedure, so do them together and verify "
-                       "once." % (i, batch["mechanism"], n, "" if n == 1 else "s")) if n > 1 else \
-                      ("**A%d. %s**" % (i, batch["mechanism"]))
-        else:
-            heading = "**A%d.** %s" % (i, batch["items"][0].get("category") or "item")
-        L.append(heading)
-        L.append("")
-        if batch.get("procedure"):
-            L.append("> **How to fix this class:** %s" % batch["procedure"])
-            L.append("")
-        for it in batch["items"]:
-            L.append("- _(%s)_ %s" % (it.get("severity") or "?", it.get("reason") or ""))
-            # Suppress the engine's generic fallback where a batch procedure already says more. Two
-            # instructions where the second is vaguer than the first trains the reader to skim both.
-            rem = (it.get("remediation") or "").strip()
-            if rem and not (batch.get("procedure") and _GENERIC_REMEDIATION.match(rem)):
-                L.append("  - **do:** %s" % rem)
-            if it.get("worksheet"):
-                L.append("  - source worksheet: `%s`" % it["worksheet"])
-            paths = it.get("paths") or []
-            if paths and it.get("exact"):
-                L.append("  - **file:** `%s`" % paths[0])
-            elif paths:
-                L.append("  - **%d candidates** of type `%s` -- the worklist recorded no emitted "
-                         "visual for this item, so identify the one built from worksheet `%s`:"
-                         % (len(paths), it.get("visual_type") or "?", it.get("worksheet") or "?"))
-                for p in paths[:12]:
-                    L.append("    - `%s`" % p)
-            else:
-                L.append("  - _(no visual of this type on this page -- it may be a dashboard-scope "
-                         "item, or the visual was not emitted)_")
-        for card in batch["cards"]:
-            if not (card.get("props") or card.get("gotchas")):
-                continue
-            L.append("")
-            L.append("  <details><summary>verified precedent (corpus `%s`)</summary>" % card["id"])
-            L.append("")
-            for prop in card["props"][:6]:
-                L.append("  - `%s`" % prop)
-            for g in card["gotchas"][:3]:
-                L.append("  - ⚠ %s" % g)
-            if card.get("exemplar"):
-                L.append("  - copy from: `%s`" % card["exemplar"])
-            L.append("")
-            L.append("  </details>")
-        L.append("")
-
-    L.append("## PART B -- checked and CORRECT (do not re-audit)")
-    L.append("")
-    ok = order["verified"]
-    if ok:
-        L.append("%d visual(s) on this page are of a type nothing was flagged against. Their emitted "
-                 "property groups are listed so you can see what was actually set." % len(ok))
-        L.append("")
-        L.append("| visual | type | properties set |")
-        L.append("|---|---|---|")
-        for r in ok:
-            L.append("| `%s` | %s | %s |" % (r["visual"], r["type"] or "?",
-                                             ", ".join("`%s`" % o for o in r["objects"]) or "_none_"))
-    else:
-        L.append("_No visual on this page could be cleared: every emitted visual type appears in at "
-                 "least one PART A item. That is a limit of the flagging, not proof that all ten are "
-                 "wrong -- see the candidate-set notes above._")
-    L.append("")
-
-    L.append("## PART C -- could NOT be determined")
-    L.append("")
-    if order["undetermined"]:
-        for u in order["undetermined"]:
-            L.append("- **%s** -- %s" % (u.get("what"), u.get("why")))
-    else:
-        L.append("_Nothing outstanding._")
-    L.append("")
-
-    if order.get("stubs"):
-        L.append("### Calculations still stubbed (%d)" % len(order["stubs"]))
-        L.append("")
-        for s in order["stubs"]:
-            L.append("- **`%s`** (%s)" % (s.get("name"), s.get("category") or "?"))
-            if s.get("formula"):
-                L.append("  - Tableau: `%s`" % _clip(s["formula"], 200))
-            if s.get("fallback_reason"):
-                L.append("  - why it stubbed: %s" % s["fallback_reason"])
-            if s.get("category_guidance"):
-                L.append("  - guidance: %s" % _clip(s["category_guidance"], 400))
-        L.append("")
-
-    if order.get("checklist"):
-        L.append("### Cross-cutting checks (things nobody thinks to ask)")
-        L.append("")
-        L.append("_Ranked by how often each has actually gone wrong across %d harvested workbooks._"
-                 % 41)
-        L.append("")
-        for c in order["checklist"]:
-            L.append("- %s _(%d harvested anti-pattern(s))_" % (c["ask"], c["anti_patterns"]))
-        L.append("")
-
-    L.append(_CLOSING)
-    return "\n".join(L)
-
-
-# =====================================================================================
-# Assembly
-# =====================================================================================
-def build_order(workbook_entry, dashboard, pages, references, corpus_root=None, run_dir=None):
-    """Assemble one dashboard's work order (data only; :func:`render` turns it into markdown)."""
-    page_name, page_info = page_for_dashboard(pages, dashboard)
-    worklist = (workbook_entry.get("remediation_worklist") or {})
-    # An empty source worksheet has nothing to rebuild, so it is not work -- but the engine files it
-    # "blocking", which would put three no-ops at the very top of PART A and cost the reader its
-    # first impression on nothing. Route them to PART C as context instead.
-    all_items = [i for i in (worklist.get("items") or []) if isinstance(i, dict)]
-    empty_ws = [i for i in all_items if i.get("category") == "empty_worksheet"]
-    actionable = [i for i in all_items if i.get("category") != "empty_worksheet"]
-    items = [i for i in actionable
-             if (i.get("page_display") or i.get("page")) in (dashboard, page_name)
-             or i.get("scope") in ("dashboard", "worksheet")]
-    batches = batch_items(items, page_info, corpus_root)
-    flagged_names = {i.get("visual") for b in batches for i in b["items"] if i.get("visual")}
-    ambiguous_types = {(i.get("visual_type") or "").lower()
-                       for b in batches for i in b["items"]
-                       if not i.get("exact") and i.get("visual_type")}
-
-    undetermined = []
-    for i in actionable:
-        if i.get("severity") == "blocking" and not mechanism_of(i):
-            undetermined.append({"what": i.get("category"), "why": i.get("reason")})
-    for i in empty_ws:
-        undetermined.append({
-            "what": "empty source worksheet %r" % (i.get("worksheet") or "?"),
-            "why": "no fields on any shelf, so nothing was rebuilt -- confirm it is intentionally "
-                   "empty rather than a parse gap"})
-
-    handoff = workbook_entry.get("model_translation_handoff") or {}
-    ref_png, ref_conf = reference_image_for(references, dashboard)
-    return {
-        "schema": SCHEMA_VERSION,
-        "dashboard": dashboard,
-        "workbook": workbook_entry.get("name"),
-        "page_name": page_name,
-        "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "reference_image": ref_png,
-        "reference_confidence": ref_conf,
-        "batches": batches,
-        "verified": verified_correct(page_info, flagged_names, ambiguous_types),
-        "undetermined": undetermined,
-        "stubs": list(handoff.get("requests") or []),
-        "checklist": load_build_checklist(corpus_root),
-    }
+def _now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def generate(run_dir, corpus_root=None, outdir=None):
     """Write one work order per dashboard. Returns ``[(dashboard, path)]``. Never raises."""
     data = load_run(run_dir)
     references = data["references"]
-    references["_manifest_path"] = os.path.join(run_dir, "out", "reference_images", "manifest.json")
     outdir = outdir or os.path.join(run_dir, "out", SUBDIR)
     try:
         os.makedirs(outdir, exist_ok=True)
@@ -761,31 +682,35 @@ def generate(run_dir, corpus_root=None, outdir=None):
         pages = index_visuals(report_dir)
         for dash in dashboards_of(wb, references):
             order = build_order(wb, dash, pages, references, corpus_root, run_dir)
-            stem = re.sub(r"[^\w.-]+", "_", dash, flags=re.UNICODE).strip("_") or "dashboard"
-            path = os.path.join(outdir, stem + ".md")
+            safe = re.sub(r"[^0-9A-Za-z]+", "_", dash).strip("_") or "dashboard"
+            path = os.path.join(outdir, safe + ".md")
             try:
                 with open(path, "w", encoding="utf-8") as fh:
                     fh.write(render(order))
                 written.append((dash, path))
-            except Exception:
+            except Exception as exc:
+                # Report the failure instead of letting the caller read an empty result as "this
+                # dashboard was clean". A swallowed exception here previously surfaced as
+                # "nothing to write (no dashboards found)", which is a different and false claim.
+                print("[WORK ORDER] FAILED for %r: %s: %s" % (dash, type(exc).__name__, exc))
                 continue
     return written
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(
-        description="Generate a Tier-3 work order per dashboard from a completed migration run.")
-    ap.add_argument("--run", required=True, help="run folder (holds out/report.json)")
-    ap.add_argument("--corpus", help="tc-corpus root, for inlined precedent + the build checklist")
-    ap.add_argument("--out", help="output folder (default: <run>/out/%s)" % SUBDIR)
+    ap = argparse.ArgumentParser(description="Build the Tier-3 work order for a finished run.")
+    ap.add_argument("--run", required=True)
+    ap.add_argument("--corpus")
+    ap.add_argument("--out")
     args = ap.parse_args(argv)
     written = generate(args.run, args.corpus, args.out)
-    for dash, path in written:
-        print("[WORK ORDER] %-40s -> %s" % (dash, path))
     if not written:
-        print("[WORK ORDER] nothing to write (no report.json, or no dashboards declared)")
+        print("[WORK ORDER] nothing to write (no dashboards found)")
+        return 0
+    for dash, path in written:
+        print("[WORK ORDER] %-46s -> %s" % (_clip(dash, 46), path))
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     raise SystemExit(main())

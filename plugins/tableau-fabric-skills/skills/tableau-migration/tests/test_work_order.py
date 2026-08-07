@@ -1,9 +1,10 @@
 """Tier-3 work order generator.
 
-The document's whole value is that a reader can act on it WITHOUT re-deriving anything, so the tests
-here are mostly about honesty rather than formatting: a path that is claimed exactly must be exact, a
-visual called verified must actually be unflagged, and a batch must represent one real shared fix.
-A pretty document that is wrong on any of those is worse than no document, because it is believed.
+The document earns its place only if every line is something the reader CANNOT SEE. Measured
+2026-08-06: the same downstream agent reached near-perfect fidelity in 1h40m working from the
+reference image alone, but took 3h and produced a WORSE report when handed a comprehensive "audit"
+work order. So these tests are mostly about restraint -- that the document keeps the few facts the
+engine uniquely knows, drops everything visible, and never asserts a visual is correct.
 """
 import json
 import os
@@ -17,183 +18,146 @@ import work_order as W  # noqa: E402
 
 
 # ---------------------------------------------------------------------------------------------
-# mechanism batching
+# selection -- what earns a place in the document
 # ---------------------------------------------------------------------------------------------
-@pytest.mark.parametrize("reason,expected", [
-    ("categorical mark colours deferred (the line visual type does not carry a per-member mark "
-     "colour)", "colour"),
-    ("nested formula table calc routed to review ([* CY CSAT]: unsupported character '=')",
-     "nested-table-calc"),
-    ("view-only quick table calc routed to review (ordering scope 'CellInPane' does not decompose)",
-     "table-calc-scope"),
-    ("filter card federated.0gcnwq804g9e3p0zw2dho0bwawms.none:*Global Team:nk resolved to no model "
-     "field (slicer not rebuilt)", "filter-card-binding"),
-    ("1 author-hidden zone(s) not rebuilt (Tableau 'hidden-by-user' show/hide toggle)",
-     "hidden-zone"),
-    ("combo visual has no usable field bindings (skipped)", "unrebuilt-visual"),
-    ("mark class 'Circle' / shelf layout not supported -> no visual emitted", "unrebuilt-visual"),
-    ("unsupported derivation 'Attribute' on '*Analyst Tenure' (skipped)", "field-binding"),
+@pytest.mark.parametrize("reason", [
+    "nested formula table calc routed to review ([* CY CSAT]: unsupported character '='); the visual "
+    "is emitted with the base value only",
+    "view-only quick table calc routed to review (ordering scope 'CellInPane' does not decompose)",
 ])
-def test_engine_phrases_classify_to_a_mechanism(reason, expected):
-    """Each pattern matches a phrase the ENGINE emits for a whole class, not one workbook's wording.
-
-    These strings were taken verbatim from real report.json output. If the engine rewords one, this
-    test fails rather than the document silently regressing to one-batch-per-item.
-    """
-    assert W.mechanism_of({"category": "other", "reason": reason}) == expected
+def test_a_plausible_but_wrong_number_is_kept(reason):
+    """The worst class in the document: something rendered, it looks fine, the value is not the
+    value. Nothing about it announces itself, so it cannot be left to the reader's eye."""
+    _, wrong = W.partition_items([{"reason": reason}])
+    assert len(wrong) == 1
 
 
-def test_an_unrecognised_reason_is_left_standalone_not_force_fitted():
-    """A batch claims "these share one fix". A wrong batch is worse than no batch, because it invites
-    the reader to apply one procedure to something it does not fit."""
-    assert W.mechanism_of({"category": "other", "reason": "something nobody has seen before"}) is None
+@pytest.mark.parametrize("reason", [
+    "combo visual has no usable field bindings (skipped)",
+    "mark class 'Circle' / shelf layout not supported -> no visual emitted",
+    "filter card federated.abc.none:*Global Team:nk resolved to no model field (slicer not rebuilt)",
+    "1 author-hidden zone(s) not rebuilt (Tableau 'hidden-by-user' show/hide toggle)",
+])
+def test_a_construct_that_was_never_rebuilt_is_kept(reason):
+    """The gap is visible; WHAT is missing and why the deterministic route refused is not."""
+    missing, _ = W.partition_items([{"reason": reason}])
+    assert len(missing) == 1
 
 
-def test_batching_collapses_a_repeated_mechanism_into_one_batch():
+@pytest.mark.parametrize("reason", [
+    "categorical mark colours deferred (the line visual type does not carry a per-member mark colour)",
+    "the table visual type does not carry a per-member mark colour",
+    "axis title not applied",
+    "chart type used a fallback approximation",
+])
+def test_anything_visible_in_the_image_is_dropped(reason):
+    """The reader takes colour, axis titles and chart shape off the reference image faster and more
+    accurately than we can describe them. Listing these is what made the previous version both
+    slower and worse, so their exclusion is a behaviour worth locking down."""
+    missing, wrong = W.partition_items([{"reason": reason}])
+    assert (missing, wrong) == ([], [])
+
+
+def test_the_same_finding_stated_twice_is_deduplicated():
     items = [
-        {"category": "other", "reason": "nested formula table calc routed to review ([A]: x)",
-         "worksheet": "S1", "visual": "v1", "severity": "medium"},
-        {"category": "other", "reason": "nested formula table calc routed to review ([B]: y)",
-         "worksheet": "S2", "visual": "v2", "severity": "medium"},
-        {"category": "other", "reason": "nested formula table calc routed to review ([C]: z)",
-         "worksheet": "S3", "visual": "v3", "severity": "medium"},
+        {"worksheet": "S", "visual": "v1", "reason": "combo visual has no usable field bindings"},
+        {"worksheet": "S", "visual": "v1", "reason": "combo visual has no usable field bindings"},
     ]
-    batches = W.batch_items(items, {"visuals": []}, None)
-    assert len(batches) == 1
-    assert len(batches[0]["items"]) == 3
-
-
-def test_the_same_finding_stated_two_ways_is_deduplicated():
-    """The engine states one finding both long-form and short-form. Keying dedup on the PROSE would
-    keep both and leave the reader to notice the duplication."""
-    items = [
-        {"category": "other", "visual": "v1", "worksheet": "S", "visual_type": "lineChart",
-         "reason": "categorical mark colours deferred (the line visual type does not carry a "
-                   "per-member mark colour); the visual is emitted with theme colours"},
-        {"category": "other", "visual": "v1", "worksheet": "S", "visual_type": "lineChart",
-         "reason": "the line visual type does not carry a per-member mark colour"},
-    ]
-    batches = W.batch_items(items, {"visuals": []}, None)
-    assert sum(len(b["items"]) for b in batches) == 1
-
-
-def test_two_different_visuals_sharing_a_mechanism_are_kept_separate():
-    """Dedup must not swallow real work: same mechanism, different visual = two things to fix."""
-    items = [
-        {"category": "other", "visual": "v1", "worksheet": "A", "visual_type": "lineChart",
-         "reason": "categorical mark colours deferred"},
-        {"category": "other", "visual": "v2", "worksheet": "B", "visual_type": "lineChart",
-         "reason": "categorical mark colours deferred"},
-    ]
-    batches = W.batch_items(items, {"visuals": []}, None)
-    assert sum(len(b["items"]) for b in batches) == 2
+    missing, _ = W.partition_items(items)
+    assert len(missing) == 1
 
 
 # ---------------------------------------------------------------------------------------------
-# localisation -- the claim that costs the most if it is wrong
+# PART B must never come back
 # ---------------------------------------------------------------------------------------------
-def _page(*visuals):
-    return {"visuals": [{"name": n, "type": t, "path": p, "objects": []}
-                        for n, t, p in visuals]}
+def test_the_module_makes_no_verified_correct_claim(tmp_path):
+    """The regression that mattered. The previous version derived "checked and CORRECT -- do not
+    re-audit" from "the worklist did not flag it", but the worklist records TRANSLATION failures and
+    has no opinion on whether a visual LOOKS right. The correlation even runs backwards: a visual
+    that translated cleanly is the one still wearing the default theme. That section named the three
+    visuals the solo agent rebuilt, and telling it not to touch them is how the document made it
+    worse."""
+    assert not hasattr(W, "verified_correct")
+    text = _doc(tmp_path)
+    assert "do not re-audit" not in text
+    assert "checked and CORRECT" not in text
+    # The one visual in the fixture translated cleanly apart from a colour deferral, so the old
+    # version would have listed it as verified. Nothing may vouch for it now.
+    assert "v1" not in text.split("## 1.")[0]
 
 
-def test_a_recorded_visual_name_resolves_to_exactly_one_file():
-    page = _page(("v1", "lineChart", "/x/v1/visual.json"), ("v2", "lineChart", "/x/v2/visual.json"))
+# ---------------------------------------------------------------------------------------------
+# stubs -- the highest-value facts, and the join that makes them actionable
+# ---------------------------------------------------------------------------------------------
+def test_stub_requests_are_read_from_the_handoff():
+    wb = {"model_translation_handoff": {"requests": [{"name": "* CY CSAT", "formula": "TOTAL(...)"}]}}
+    assert [s["name"] for s in W.stub_requests(wb)] == ["* CY CSAT"]
+
+
+def test_a_workbook_with_no_handoff_yields_no_stubs():
+    assert W.stub_requests({}) == []
+
+
+def test_a_stub_no_visual_projects_sorts_below_one_that_is_rendered(tmp_path):
+    """A stub nothing displays cannot change the picture. Leading with it would put the reader's
+    first action on the one item that provably alters nothing."""
+    order = _build(tmp_path)
+    used = [bool(s["used_by"]) for s in order["stubs"]]
+    assert used == sorted(used, reverse=True)
+
+
+def test_the_stub_to_visual_join_names_the_tile_that_is_lying(tmp_path):
+    """Converts "8 measures failed to translate" (a fact about a model, which the reader cannot act
+    on) into "THIS card shows a placeholder" (a fact about the picture, which they can)."""
+    order = _build(tmp_path)
+    lying = [s for s in order["stubs"] if s["used_by"]]
+    assert lying and lying[0]["used_by"][0]["name"] == "v1"
+
+
+# ---------------------------------------------------------------------------------------------
+# item routing
+# ---------------------------------------------------------------------------------------------
+def test_a_dashboard_scope_item_stamped_with_the_page_id_is_not_dropped(tmp_path):
+    """The engine stamps ``page_display`` with EITHER the dashboard name or the emitted PBIR page id
+    depending on which layer raised the item. Accepting one form silently dropped five real findings,
+    and a silent drop is indistinguishable from "nothing was wrong"."""
+    order = _build(tmp_path)
+    assert any("filter card" in (i.get("reason") or "") for i in order["not_rebuilt"])
+
+
+def test_only_an_exact_visual_match_is_printed_as_a_path():
+    """A type fallback narrows to a candidate SET. Printing it as the answer sends the reader to edit
+    visuals that are not broken."""
+    page = {"visuals": [{"name": "v1", "type": "lineChart", "path": "/x/v1", "objects": []},
+                        {"name": "v2", "type": "lineChart", "path": "/x/v2", "objects": []}]}
     by_name, by_type = W._visual_lookup(page)
-    paths, exact = W.locate({"visual": "v2", "visual_type": "lineChart"}, by_name, by_type)
-    assert exact is True
-    assert paths == ["/x/v2/visual.json"]
-
-
-def test_no_recorded_name_falls_back_to_type_and_says_it_is_not_exact():
-    """The fallback narrows to a candidate SET. Presenting that as the answer would send the reader
-    to edit visuals that are not broken, so ``exact`` must be False and the renderer must say so."""
-    page = _page(("v1", "lineChart", "/x/v1/visual.json"), ("v2", "lineChart", "/x/v2/visual.json"))
-    by_name, by_type = W._visual_lookup(page)
-    paths, exact = W.locate({"visual": None, "visual_type": "lineChart"}, by_name, by_type)
+    assert W.locate({"visual": "v2", "visual_type": "lineChart"}, by_name, by_type) == (["/x/v2"], True)
+    _, exact = W.locate({"visual": None, "visual_type": "lineChart"}, by_name, by_type)
     assert exact is False
-    assert len(paths) == 2
 
 
-def test_a_stale_visual_name_does_not_silently_resolve_to_the_wrong_file():
-    """A name recorded in the worklist but absent from the emitted PBIR must NOT fall through to
-    "some visual of the same type" while still claiming to be exact."""
-    page = _page(("v1", "lineChart", "/x/v1/visual.json"))
+def test_a_stale_visual_name_does_not_resolve_to_some_other_file():
+    page = {"visuals": [{"name": "v1", "type": "lineChart", "path": "/x/v1", "objects": []}]}
     by_name, by_type = W._visual_lookup(page)
-    paths, exact = W.locate({"visual": "GONE", "visual_type": "lineChart"}, by_name, by_type)
+    _, exact = W.locate({"visual": "GONE", "visual_type": "lineChart"}, by_name, by_type)
     assert exact is False
-
-
-# ---------------------------------------------------------------------------------------------
-# PART B -- the only subtractive section, so the only one that can waste a reader's trust
-# ---------------------------------------------------------------------------------------------
-def test_a_flagged_visual_is_never_called_verified():
-    page = _page(("v1", "lineChart", "/x/v1"), ("v2", "barChart", "/x/v2"))
-    rows = W.verified_correct(page, flagged_names={"v1"}, ambiguous_types=set())
-    assert [r["visual"] for r in rows] == ["v2"]
-
-
-def test_an_ambiguous_type_disqualifies_every_visual_of_that_type():
-    """If an item only narrowed to "one of the three lineCharts", we cannot prove WHICH is clean, so
-    none of them may be listed as verified."""
-    page = _page(("v1", "lineChart", "/x/v1"), ("v2", "lineChart", "/x/v2"),
-                 ("v3", "barChart", "/x/v3"))
-    rows = W.verified_correct(page, flagged_names=set(), ambiguous_types={"linechart"})
-    assert [r["visual"] for r in rows] == ["v3"]
-
-
-def test_exact_localisation_lets_a_sibling_of_the_same_type_stay_verified():
-    """The payoff of exact naming: flagging v1 no longer taints v2 just for sharing its type."""
-    page = _page(("v1", "lineChart", "/x/v1"), ("v2", "lineChart", "/x/v2"))
-    rows = W.verified_correct(page, flagged_names={"v1"}, ambiguous_types=set())
-    assert [r["visual"] for r in rows] == ["v2"]
-
-
-# ---------------------------------------------------------------------------------------------
-# corpus handling
-# ---------------------------------------------------------------------------------------------
-def test_a_corpus_field_that_is_a_string_is_not_iterated_character_by_character():
-    """Some cards store ``making_it_props`` as a STRING. Iterating it yields one bullet per character
-    ("- P", "- a", "- l") which still renders as plausible markdown, so it would ship silently."""
-    assert W._as_list("valueAxis NORMAL") == ["valueAxis NORMAL"]
-    assert W._as_list(["a", "b"]) == ["a", "b"]
-    assert W._as_list(None) == []
-
-
-def test_a_card_is_dropped_when_it_does_not_speak_to_the_mechanism():
-    card = {"props": ["valueAxis.labelDisplayUnits = '0'"], "gotchas": []}
-    assert W.card_matches(card, "colour") is False
-
-
-def test_a_card_is_kept_when_it_does_speak_to_the_mechanism():
-    card = {"props": ["dataPoint.defaultColor.solid.color = '#d8504c'"], "gotchas": []}
-    assert W.card_matches(card, "colour") is True
-
-
-def test_an_unknown_mechanism_keeps_the_card_rather_than_emitting_nothing():
-    """Fail open: a missing card reads as "the corpus has nothing to say", which is a lie of
-    omission the reader cannot detect."""
-    assert W.card_matches({"props": ["anything"]}, "some-new-mechanism") is True
 
 
 # ---------------------------------------------------------------------------------------------
 # text handling
 # ---------------------------------------------------------------------------------------------
 def test_clipping_lands_on_a_word_boundary_and_marks_the_cut():
-    out = W._clip("alpha beta gamma delta", 14)
-    assert out == "alpha beta ..."
-    assert not out.replace(" ...", "").endswith("gam")
-
-
-def test_short_text_is_returned_unchanged_and_unmarked():
+    """A hard character slice ends instructions mid-word, which reads as a CORRUPTED document rather
+    than an abbreviated one -- and a reader who cannot tell has to go find the full text."""
+    assert W._clip("alpha beta gamma delta", 14) == "alpha beta ..."
     assert W._clip("alpha beta", 80) == "alpha beta"
 
 
-def test_the_generic_engine_remediation_is_recognised():
-    """It is suppressed only where a real batch procedure replaces it."""
-    assert W._GENERIC_REMEDIATION.match("Review this item against the source and remediate.")
-    assert not W._GENERIC_REMEDIATION.match(
-        "Provide field bindings so the table can be rebuilt with real columns.")
+def test_a_corpus_string_is_not_iterated_character_by_character():
+    """Some cards store the field as a STRING; iterating yields one bullet per character, which
+    renders as plausible markdown rather than an error, so it would ship silently."""
+    assert W._as_list("valueAxis NORMAL") == ["valueAxis NORMAL"]
+    assert W._as_list(None) == []
 
 
 # ---------------------------------------------------------------------------------------------
@@ -201,51 +165,101 @@ def test_the_generic_engine_remediation_is_recognised():
 # ---------------------------------------------------------------------------------------------
 def _run_dir(tmp_path):
     out = tmp_path / "out"
+    vis = (out / "pbip" / "WB" / "WB.Report" / "definition" / "pages" / "p1" / "visuals")
+    (vis / "v1").mkdir(parents=True)
     (out / "reference_images").mkdir(parents=True)
-    report = {"workbooks": [{
-        "workbook": "WB",
-        "remediation_worklist": {"items": [
-            {"category": "other", "severity": "medium", "visual": "v1", "visual_type": "lineChart",
-             "worksheet": "S1", "page_display": "D1", "reason": "categorical mark colours deferred",
-             "remediation": "Review this item against the source and remediate."},
+    (out / "pbip" / "WB" / "WB.pbip").write_text("{}", encoding="utf-8")
+    (vis.parent / "page.json").write_text(
+        json.dumps({"name": "p1", "displayName": "D1"}), encoding="utf-8")
+    (vis / "v1" / "visual.json").write_text(json.dumps({
+        "visual": {"visualType": "multiRowCard",
+                   "query": {"queryState": {"Values": {"projections": [
+                       {"queryRef": "_Measures.* CY CSAT"}]}}}}}), encoding="utf-8")
+    (out / "report.json").write_text(json.dumps({"workbooks": [{
+        "name": "WB",
+        "pbip_folder": str(out / "pbip" / "WB" / "WB.pbip"),
+        "model_translation_handoff": {"requests": [
+            {"name": "* CY CSAT", "formula": "TOTAL(COUNTD(...))",
+             "fallback_reason": "unsupported function TOTAL", "role": "measure",
+             "fields": [{"table": "Sheet2", "column": "Fiscal_Year"}]},
+            {"name": "*Max Date", "formula": "DATEPARSE(...)",
+             "fallback_reason": "unsupported function DATEPARSE", "role": "measure"},
         ]},
-    }]}
-    (out / "report.json").write_text(json.dumps(report), encoding="utf-8")
+        "remediation_worklist": {"items": [
+            {"reason": "categorical mark colours deferred (theme colours used)",
+             "worksheet": "S1", "visual": "v1", "visual_type": "multiRowCard",
+             "page_display": "D1"},
+            {"reason": "filter card federated.abc.none:Team:nk resolved to no model field "
+                       "(slicer not rebuilt)", "page_display": "p1"},
+            {"reason": "nested formula table calc routed to review ([* CY CSAT]); the visual is "
+                       "emitted with the base value only",
+             "worksheet": "S1", "visual": "v1", "visual_type": "multiRowCard",
+             "page_display": "D1"},
+        ]},
+    }]}), encoding="utf-8")
     (out / "reference_images" / "manifest.json").write_text(json.dumps({
         "schema": "reference_images/1", "mode": "capture",
+        "declared_dashboards": ["D1"],
         "images": [{"dashboard": "D1", "png": "D1.png", "confidence": "content"}],
         "missing": [], "warnings": [],
     }), encoding="utf-8")
     return str(tmp_path)
 
 
-def test_a_generated_document_states_no_time_or_step_budget(tmp_path):
-    """A budget buys speed by shipping a worse report -- the same failure class as a false PASS.
-    Turns are an OUTPUT we measure, never an input we impose on the reader."""
+def _build(tmp_path):
     run = _run_dir(tmp_path)
-    written = W.generate(run, corpus_root=None)
-    text = open(written[0][1], encoding="utf-8").read()
-    assert "no time limit and no step budget" in text.lower()
+    data = W.load_run(run)
+    wb = W.workbook_entries(data["report"])[0]
+    pages = W.index_visuals(W.find_report_dir(wb, run))
+    return W.build_order(wb, "D1", pages, data["references"], None, run)
 
 
-def test_a_generated_document_tells_the_reader_the_list_is_not_the_finish_line(tmp_path):
-    """The anchoring counterweight: a document saying "these N are wrong" can stop a reader at N."""
-    run = _run_dir(tmp_path)
-    text = open(W.generate(run, corpus_root=None)[0][1], encoding="utf-8").read()
-    assert "START of your judgement" in text
+def _doc(tmp_path):
+    written = W.generate(_run_dir(tmp_path), corpus_root=None)
+    assert written, "generate wrote nothing"
+    return open(written[0][1], encoding="utf-8").read()
 
 
-def test_the_batch_procedure_replaces_the_engines_generic_line(tmp_path):
-    run = _run_dir(tmp_path)
-    text = open(W.generate(run, corpus_root=None)[0][1], encoding="utf-8").read()
-    assert "How to fix this class" in text
-    assert "Review this item against the source" not in text
+def test_the_document_says_the_image_is_the_specification(tmp_path):
+    text = _doc(tmp_path)
+    assert "not an audit" in text
+    assert "IMPOSSIBLE TO SEE" in text
+
+
+def test_the_document_denies_being_a_definition_of_done(tmp_path):
+    """The anchoring counterweight. A list of N facts will otherwise be read as "fix these N and
+    stop", which caps the result at whatever the engine happened to detect."""
+    assert "Not when this document is exhausted" in _doc(tmp_path)
+
+
+def test_the_document_states_no_time_or_step_budget(tmp_path):
+    """A budget buys speed by shipping a worse report -- the same failure class as a false PASS."""
+    assert "no time limit and no step budget" in _doc(tmp_path).lower()
+
+
+def test_the_document_warns_that_absence_is_not_approval(tmp_path):
+    """Everything the previous version got wrong, stated as its opposite."""
+    assert "Nothing here is a claim that any other part of the report is correct" in _doc(tmp_path)
+
+
+def test_a_visible_only_finding_never_reaches_the_document(tmp_path):
+    assert "mark colours deferred" not in _doc(tmp_path)
+
+
+def test_the_reference_image_is_given_as_an_absolute_path(tmp_path):
+    """The one file the reader must open first. A bare filename makes them hunt for it, which is the
+    exact cost this document exists to remove."""
+    assert os.path.join("reference_images", "D1.png") in _doc(tmp_path)
 
 
 def test_generation_survives_a_run_with_no_reference_image(tmp_path):
-    """Reference images are additive by charter -- their absence must degrade, never fail."""
+    """Reference images are additive by charter -- absence must degrade, never fail."""
     out = tmp_path / "out"
     out.mkdir(parents=True)
     (out / "report.json").write_text(json.dumps({"workbooks": [{
-        "workbook": "WB", "remediation_worklist": {"items": []}}]}), encoding="utf-8")
-    assert W.generate(str(tmp_path), corpus_root=None) is not None
+        "name": "WB", "remediation_worklist": {"items": [
+            {"reason": "mark class 'Circle' not supported -> no visual emitted",
+             "page_display": "D9", "worksheet": "S"}]}}]}), encoding="utf-8")
+    written = W.generate(str(tmp_path), corpus_root=None)
+    assert written
+    assert "No reference image was captured" in open(written[0][1], encoding="utf-8").read()
