@@ -3932,6 +3932,7 @@ def _build_input_manifest(source, ds_ids, wb_ids):
         "verifier": "migrate_estate/input_identity/1",
         "assets": [],
         "collisions": [],
+        "duplicate_bytes": [],
     }
     if not isinstance(source, LocalFilesSource):
         return manifest
@@ -3961,6 +3962,21 @@ def _build_input_manifest(source, ds_ids, wb_ids):
     manifest["collisions"] = [
         {"kind": kind, "stem": stem, "paths": sorted(paths)}
         for (kind, stem), paths in sorted(seen.items()) if len(paths) > 1
+    ]
+    # The SAME BYTES staged twice under different NAMES. The name-stem check above cannot see this,
+    # and it is the more damaging case: the scanner migrates both copies, so every count in the
+    # report doubles (workbooks, calcs, stubs, warned visuals) and the operator reads a doubled
+    # ledger as fact. Measured 2026-08-07: one input folder held `<uuid>-Network Ops.twbx` and
+    # `Network Ops.twbx` -- byte-identical, 116,779 bytes, one sha256 -- and reported 2 workbooks /
+    # 40 calcs / 6 stubs where the truth was 1 / 20 / 3. ``collisions`` was `[]` throughout, because
+    # the transfer-layer uuid prefix made the two stems differ.
+    #
+    # The digest was already being computed and simply never compared. Identical sha256 is PROOF of
+    # a duplicate, not an inference, so this needs no heuristic. Reported, never fatal -- same
+    # rationale as ``collisions``: one ambiguous pair must not abort an estate of 200 assets.
+    manifest["duplicate_bytes"] = [
+        {"kind": kind, "sha256": digest, "paths": sorted(paths)}
+        for (kind, digest), paths in sorted(by_digest.items()) if len(paths) > 1
     ]
     return manifest
 
@@ -4617,29 +4633,55 @@ def _openable_outputs_md(outs):
 
 
 def _input_collision_banner(report):
-    """Render a loud ``summary.md`` warning when the input folder held cross-directory name collisions.
+    """Render a loud ``summary.md`` warning when the input folder was not staged clean.
 
-    ``[]`` (byte-identical summary) whenever inputs were clean -- the overwhelming case -- so this only
-    ever appears when a stale like-named copy sat beside the intended one. Not a definition-of-done gate
-    and not fatal: it just makes a not-clean input folder impossible to miss and points at the manifest.
+    Two distinct signals, because they have different causes and different blast radii:
+
+    * **Same asset NAME at two paths** -- the run may have migrated a different copy than intended.
+    * **Same BYTES staged twice under different names** -- worse, because the scanner migrates BOTH
+      copies and every count in the report doubles. A reader has no way to tell a doubled ledger from
+      a real one.
+
+    ``[]`` (byte-identical summary) whenever inputs were clean -- the overwhelming case. Not a
+    definition-of-done gate and not fatal: it just makes a not-clean input folder impossible to miss.
     """
-    collisions = (report.get("input_manifest") or {}).get("collisions") or []
-    if not collisions:
+    manifest = report.get("input_manifest") or {}
+    collisions = manifest.get("collisions") or []
+    duplicates = manifest.get("duplicate_bytes") or []
+    if not collisions and not duplicates:
         return []
-    out = [
-        "## \u26a0\ufe0f INPUT IDENTITY WARNING -- same asset name found at multiple paths",
-        "",
-        ("The input folder contained more than one file with the same asset name in different "
-         "directories, so this run may have migrated a **different copy than you intended** (for "
-         "example a stale file left over from a prior run). If you meant to migrate an exact file you "
-         "attached, re-run with that file staged **alone** in a fresh, empty input folder. Every path "
-         "and hash actually consumed is recorded in `input_manifest.json`."),
-        "",
-    ]
-    for c in collisions:
-        out.append(f"- **{c['stem']}** ({c['kind']}) found at:")
-        out += [f"  - `{p}`" for p in c["paths"]]
-    out.append("")
+    out = []
+    if duplicates:
+        out += [
+            "## \u26a0\ufe0f INPUT IDENTITY WARNING -- the SAME FILE was staged more than once",
+            "",
+            ("Two or more input files are **byte-identical** (same SHA256) under different names, so "
+             "this run migrated the same asset more than once and **every count below is inflated** "
+             "-- workbooks, calculations, stubs and warned visuals are all multiplied by the number "
+             "of copies. Do not read these totals as fact. Re-run with exactly one copy staged in a "
+             "fresh, empty input folder. A common cause is a chat/portal download whose transfer-layer "
+             "UUID prefix makes one copy *look* like a different asset."),
+            "",
+        ]
+        for d in duplicates:
+            out.append(f"- **{d['kind']}** sha256 `{d['sha256'][:16]}...` staged at:")
+            out += [f"  - `{p}`" for p in d["paths"]]
+        out.append("")
+    if collisions:
+        out += [
+            "## \u26a0\ufe0f INPUT IDENTITY WARNING -- same asset name found at multiple paths",
+            "",
+            ("The input folder contained more than one file with the same asset name in different "
+             "directories, so this run may have migrated a **different copy than you intended** (for "
+             "example a stale file left over from a prior run). If you meant to migrate an exact file "
+             "you attached, re-run with that file staged **alone** in a fresh, empty input folder. "
+             "Every path and hash actually consumed is recorded in `input_manifest.json`."),
+            "",
+        ]
+        for c in collisions:
+            out.append(f"- **{c['stem']}** ({c['kind']}) found at:")
+            out += [f"  - `{p}`" for p in c["paths"]]
+        out.append("")
     return out
 
 

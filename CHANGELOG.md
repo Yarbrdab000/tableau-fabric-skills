@@ -12,6 +12,16 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.89.0` -> `2.90.0`): the input guard now compares BYTES, not just
+  names.** `input_manifest.json` already recorded a SHA256 per input and never compared them: its
+  collision check keyed on the filename stem alone. So the same file staged twice under different
+  names sailed through with `"collisions": []` while the estate scanner migrated BOTH copies --
+  and every count in the report doubled. Measured 2026-08-07: an input folder holding
+  `<uuid>-Network Ops.twbx` and `Network Ops.twbx` (byte-identical, 116,779 bytes, one SHA256)
+  reported 2 workbooks / 40 calcs / 6 stubs where the truth was 1 / 20 / 3, and a reader has no way
+  to tell a doubled ledger from a real one. New additive `duplicate_bytes` reports it, and the
+  `summary.md` banner names exactly which totals are inflated. Reported, never fatal -- same
+  rationale as `collisions`: one ambiguous pair must not abort an estate of 200 assets.
 - **tableau-migration (skill `2.88.0` -> `2.89.0`): a transfer-layer UUID prefix no longer
   becomes the asset name.** Chat/Copilot attachments, portal and ticketing downloads and SharePoint
   stamp a canonical UUID on the front of a filename. It is never part of a Tableau author's name, and

@@ -39,6 +39,7 @@ from assemble_model import (
 from calc_to_dax import translate_tableau_calc_to_dax
 from connection_to_m import parse_tds, combine_descriptors
 import assemble_model as me_asm
+import migrate_estate as me_est
 from openability_gate import check_model_openability
 from workbook_table_calcs import TableCalcUsage, Pill
 from test_connection_to_m import (
@@ -3036,3 +3037,61 @@ def test_explicit_caller_value_still_wins_on_the_local_csv_path():
     finally:
         me_asm.assemble_local_import_model = real
     assert seen.get("table_calc_usages") == []
+
+
+def me_asm_local_source(root):
+    return me_est.LocalFilesSource(root)
+
+
+# -- duplicate input bytes ---------------------------------------------------------
+def test_the_same_bytes_staged_under_two_names_is_reported(tmp_path):
+    """The name-stem collision check cannot see this, and it is the more damaging case: the scanner
+    migrates BOTH copies, so every count in the report doubles and the reader has no way to tell a
+    doubled ledger from a real one. Measured 2026-08-07 -- a folder holding `<uuid>-Network Ops.twbx`
+    and `Network Ops.twbx`, byte-identical, reported 2 workbooks / 40 calcs / 6 stubs where the truth
+    was 1 / 20 / 3, with `collisions` empty throughout."""
+    (tmp_path / "a.twb").write_text("<workbook/>", encoding="utf-8")
+    (tmp_path / "uuid-a.twb").write_text("<workbook/>", encoding="utf-8")
+    src = me_asm_local_source(str(tmp_path))
+    manifest = me_est._build_input_manifest(src, [], [str(tmp_path / "a.twb"),
+                                                     str(tmp_path / "uuid-a.twb")])
+    assert manifest["collisions"] == []           # the original guard is genuinely blind to this
+    assert len(manifest["duplicate_bytes"]) == 1
+    assert len(manifest["duplicate_bytes"][0]["paths"]) == 2
+
+
+def test_distinct_inputs_report_no_duplicate_bytes(tmp_path):
+    (tmp_path / "a.twb").write_text("<workbook a=''/>", encoding="utf-8")
+    (tmp_path / "b.twb").write_text("<workbook b=''/>", encoding="utf-8")
+    src = me_asm_local_source(str(tmp_path))
+    manifest = me_est._build_input_manifest(src, [], [str(tmp_path / "a.twb"),
+                                                     str(tmp_path / "b.twb")])
+    assert manifest["duplicate_bytes"] == []
+
+
+def test_the_duplicate_banner_says_the_counts_are_inflated(tmp_path):
+    """A manifest key nobody reads is not a guard. The banner has to say what it means for the
+    numbers, because the failure mode is a reader trusting a doubled total."""
+    report = {"input_manifest": {"collisions": [],
+                                 "duplicate_bytes": [{"kind": "workbook", "sha256": "abc123def456",
+                                                      "paths": ["/x/a.twb", "/x/uuid-a.twb"]}]}}
+    banner = "\n".join(me_est._input_collision_banner(report))
+    assert "SAME FILE was staged more than once" in banner
+    assert "inflated" in banner
+
+
+def test_a_clean_input_folder_emits_no_banner():
+    assert me_est._input_collision_banner({"input_manifest": {"collisions": [],
+                                                              "duplicate_bytes": []}}) == []
+
+
+
+def test_the_duplicate_banner_explains_what_is_inflated(tmp_path):
+    """A warning that says "inflated" without saying WHICH numbers leaves the reader unable to act
+    on it -- and a doubled ledger reads as perfectly plausible."""
+    report = {"input_manifest": {"collisions": [],
+                                 "duplicate_bytes": [{"kind": "workbook", "sha256": "abc123def456",
+                                                      "paths": ["/x/a.twb", "/x/uuid-a.twb"]}]}}
+    banner = "\n".join(me_est._input_collision_banner(report))
+    for term in ("workbooks", "calculations", "stubs", "warned visuals", "multiplied"):
+        assert term in banner, f"banner must name {term!r} as inflated"
