@@ -7415,6 +7415,39 @@ def _untransformed_base(ws, base_field):
     return out
 
 
+def _reclaim_transform(ws, base_field, values, model_table, field_map):
+    """Re-point the base projection at the RAW measure so the report can own the transform.
+
+    Used only when a model-side table-calc measure cannot survive this visual's axis (see
+    :func:`_axis_orders_by`). The projection currently names the model's pre-transformed measure
+    (``_Measures.Sales (running total (cumulative))``); a Visual Calculation appended on top of that
+    would accumulate an already-accumulated series. Swapping it back to ``Sum(Orders[Sales])`` -- the
+    exact shape the FIRST, unbound viz pass emits, and the pass whose Visual Calculations were
+    verified to render correctly -- makes the calc run over raw values.
+
+    Mutates the projection dict IN PLACE (it is the one already sitting in ``state``) and returns the
+    untransformed base field, or ``None`` if anything cannot be resolved -- in which case the caller
+    keeps the safe yield-to-the-model behaviour rather than shipping a dangling reference. Every step
+    is verified before the swap: a half-applied rewrite is what blanks a visual.
+    """
+    raw = _untransformed_base(ws, base_field)
+    if raw is None:
+        return None
+    _, rebound_qref, _ = _field_expression(base_field, model_table, field_map)
+    proj = next((p for p in values if p.get("queryRef") == rebound_qref), None)
+    if proj is None:
+        return None
+    expr, qref, nref = _field_expression(raw, model_table, field_map)
+    if not expr or not qref:
+        return None
+    proj["field"], proj["queryRef"] = expr, qref
+    if nref:
+        proj["nativeQueryRef"] = nref
+    else:
+        proj.pop("nativeQueryRef", None)
+    return raw
+
+
 def _apply_visual_calcs(ws, state, vc_index, model_table, field_map, warnings):
     """Project a view-only quick table calc into this visual as a Power BI Visual Calculation.
 
@@ -7515,7 +7548,14 @@ def _apply_visual_calcs(ws, state, vc_index, model_table, field_map, warnings):
     if base_field.get("measure_rebound") and base_field.get("rebound_to_instance", True):
         _color_is_base = base_field is ws["encodings"].get("color")
         if role == "value" or _color_is_base:
-            return None, None
+            if _axis_orders_by(state, base_field, model_table, field_map):
+                return None, None
+            # The model measure's frozen ORDERBY does not survive this axis. Take the transform back
+            # into the report, re-pointing the base at the RAW measure first so the Visual Calculation
+            # runs over unaccumulated values instead of double-applying.
+            base_field = _reclaim_transform(ws, base_field, values, model_table, field_map)
+            if base_field is None:
+                return None, None
     _, base_qref, base_nref = _field_expression(base_field, model_table, field_map)
     base_proj = next((p for p in values if p.get("queryRef") == base_qref), None)
     if base_proj is None:
@@ -8499,6 +8539,14 @@ def _enforce_legend_measure_limit(query_state, vtype, warnings=None, worksheet=N
     the measures instead would drop the colour split, which is the more visible half, and keeping both
     renders nothing at all.
 
+    A VISUAL CALCULATION IS NOT ONE OF THOSE MEASURES. The rule is about how many measure COLUMNS the
+    legend has to cross-join; a Visual Calculation is an expression evaluated INSIDE the visual over a
+    projection that is already there, so it adds no column to cross-join. Counting it as one was
+    silently fatal: a running total over a colour-split chart projects its base measure HIDDEN and the
+    calc VISIBLE, and dropping ``projections[1:]`` deleted exactly the visible half -- leaving a legend
+    and a single hidden measure, i.e. an empty chart. Measured on two colour-split running-total sheets
+    that both rendered blank while the same calc on a legend-free sheet rendered correctly.
+
     Mutates ``query_state`` in place and returns the dropped projection names (``[]`` = untouched, so
     every visual without this collision is byte-identical).
     """
@@ -8507,18 +8555,30 @@ def _enforce_legend_measure_limit(query_state, vtype, warnings=None, worksheet=N
     series = (query_state.get("Series") or {}).get("projections") or []
     y_state = query_state.get("Y") or {}
     y_projections = y_state.get("projections") or []
-    if not series or len(y_projections) < 2:
+    if not series:
         return []
-    dropped = [p.get("nativeQueryRef") or p.get("queryRef") or "?" for p in y_projections[1:]]
-    y_state["projections"] = y_projections[:1]
+    calcs = [p for p in y_projections if _is_visual_calculation(p)]
+    measures = [p for p in y_projections if not _is_visual_calculation(p)]
+    if len(measures) < 2:
+        return []
+    dropped = [p.get("nativeQueryRef") or p.get("queryRef") or "?" for p in measures[1:]]
+    # Keep source order (base measure, then anything computed over it).
+    keep = measures[:1] + calcs
+    y_state["projections"] = [p for p in y_projections if p in keep]
     if warnings is not None:
         warnings.append(_warn(
             "worksheet", worksheet or "?",
-            f"{vtype} carried {len(y_projections)} measures AND a colour legend -- Power BI renders "
+            f"{vtype} carried {len(measures)} measures AND a colour legend -- Power BI renders "
             f"that combination as an error tile, so the legend was kept (one series per colour "
             f"member, matching the source) and {len(dropped)} measure(s) dropped: "
             f"{', '.join(str(d) for d in dropped)}"))
     return dropped
+
+
+def _is_visual_calculation(projection):
+    """True when a projection is an in-visual expression rather than a model measure column."""
+    field = (projection or {}).get("field") or {}
+    return "NativeVisualCalculation" in field or "VisualCalculation" in field
 
 
 # Cartesian visuals that pair a Legend well with a measure well, where Power BI enforces the

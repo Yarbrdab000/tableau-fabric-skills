@@ -9313,3 +9313,86 @@ def test_a_non_cartesian_visual_is_left_alone_by_the_scrollbar_suppression():
         visual = {"visualType": vtype}
         _szs(visual, vtype, continuous_axis=True)
         assert "objects" not in visual, vtype
+
+def test_a_visual_calculation_is_not_an_extra_measure_for_the_legend_limit():
+    # The legend/measure rule is about how many measure COLUMNS the legend has to cross-join. A
+    # Visual Calculation is an expression evaluated INSIDE the visual over a projection that is
+    # already there, so it adds no column. Counting it as one was silently fatal: a running total
+    # over a colour-split chart projects its base HIDDEN and the calc VISIBLE, so dropping
+    # ``projections[1:]`` deleted exactly the visible half -- a legend plus one hidden measure, i.e.
+    # an empty chart. Measured on two colour-split running-total sheets that both rendered blank.
+    from twb_to_pbir import _enforce_legend_measure_limit as _limit
+    base = {"field": {"Measure": {"Property": "Sum of Sales"}},
+            "queryRef": "Sum(Orders.Sales)", "hidden": True}
+    calc = {"field": {"NativeVisualCalculation": {
+                "Language": "dax", "Expression": "RUNNINGSUM([Sum of Sales], ROWS)",
+                "Name": "Running Total"}},
+            "queryRef": "select"}
+    qs = {"Y": {"projections": [base, calc]},
+          "Series": {"projections": [{"queryRef": "Orders.Segment"}]}}
+    assert _limit(qs, "columnChart") == []
+    assert qs["Y"]["projections"] == [base, calc]
+
+
+def test_two_real_measures_with_a_legend_still_drop_to_one_and_keep_the_calc():
+    # The rule itself is unchanged for real measure columns -- and when a calc rides along it is
+    # kept, in source order, behind the surviving base.
+    from twb_to_pbir import _enforce_legend_measure_limit as _limit
+    warnings = []
+    m1 = {"field": {"Measure": {"Property": "Sum of Sales"}}, "queryRef": "Sum(Orders.Sales)"}
+    m2 = {"field": {"Measure": {"Property": "Avg of Sales"}}, "queryRef": "Avg(Orders.Sales)",
+          "nativeQueryRef": "Avg of Sales"}
+    calc = {"field": {"NativeVisualCalculation": {
+                "Language": "dax", "Expression": "RUNNINGSUM([Sum of Sales], ROWS)",
+                "Name": "Running Total"}}, "queryRef": "select"}
+    qs = {"Y": {"projections": [m1, m2, calc]},
+          "Series": {"projections": [{"queryRef": "Orders.Segment"}]}}
+    assert _limit(qs, "columnChart", warnings, "WS") == ["Avg of Sales"]
+    assert qs["Y"]["projections"] == [m1, calc]
+    assert warnings and "colour legend" in warnings[0]["reason"]
+
+
+def test_a_view_only_quick_calc_takes_the_transform_back_from_the_model_measure():
+    # A model-side table-calc measure freezes its ordering at BUILD time
+    # (``ORDERBY('Orders'[Order_Date])``) and only reproduces Tableau while the DRAWN axis still
+    # contains that column. The report binds a month truncation to ``Date[Month Start]``, so the
+    # window orders by a column that is not in the group-by and NOTHING accumulates -- the chart
+    # shows raw values under a name that promises a running total. A view-only quick calc therefore
+    # declines to trust the model measure...
+    from twb_to_pbir import _axis_orders_by, _reclaim_transform
+    for token in ("cum", "rsum", "movavg", "win", "pcto"):
+        assert not _axis_orders_by(
+            {}, {"instance": f"{token}:sum:Sales:qk"}, None, {}), token
+    # ...while anything that is not a view-only transform keeps the existing precedence.
+    for instance in ("sum:Sales:qk", "avg:Sales:qk", "usr:Calculation_1:qk", ""):
+        assert _axis_orders_by({}, {"instance": instance}, None, {}), instance
+
+    # Taking it back re-points the base projection at the RAW measure, IN PLACE, so the Visual
+    # Calculation runs over unaccumulated values instead of double-applying over the model's
+    # already-accumulated one.
+    base_field = {"caption": "Sales", "instance": "cum:sum:Sales:qk", "property": "Sales",
+                  "entity": "Orders", "binding": "measure", "aggregation": "Sum",
+                  "measure_rebound": True, "rebound_to_instance": True, "kind": "value"}
+    _, rebound_qref, _ = _field_expression(base_field, "Orders", {})
+    projections = [{"field": {}, "queryRef": rebound_qref, "nativeQueryRef": "x"}]
+    raw = _reclaim_transform({}, base_field, projections, "Orders", {})
+    assert raw is not None
+    assert not raw.get("measure_rebound")
+    assert projections[0]["queryRef"] != rebound_qref
+    assert "running total" not in projections[0]["queryRef"].lower()
+    # The worksheet IR is shared with other emit paths, so the original pill is never mutated.
+    assert base_field["measure_rebound"] is True
+
+
+def test_reclaiming_the_transform_is_all_or_nothing():
+    # A half-applied rewrite is what blanks a visual, so every step is verified before the swap:
+    # when the rebound projection is not present, nothing is touched and the caller keeps the safe
+    # yield-to-the-model behaviour.
+    from twb_to_pbir import _reclaim_transform
+    base_field = {"caption": "Sales", "instance": "cum:sum:Sales:qk", "property": "Sales",
+                  "entity": "Orders", "binding": "measure", "aggregation": "Sum", "kind": "value"}
+    projections = [{"field": {}, "queryRef": "something.else", "nativeQueryRef": "x"}]
+    assert _reclaim_transform({}, base_field, projections, "Orders", {}) is None
+    assert projections == [{"field": {}, "queryRef": "something.else", "nativeQueryRef": "x"}]
+    # ...and a pill with no caption has no untransformed identity to fall back to.
+    assert _reclaim_transform({}, {"instance": "cum:sum:Sales:qk"}, [], "Orders", {}) is None

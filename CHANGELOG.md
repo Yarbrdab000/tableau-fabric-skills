@@ -14,6 +14,31 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **tableau-migration (skill `2.96.0` -> `2.97.0`): running totals and moving averages accumulate
+  again -- and a colour-split one no longer renders blank.** Two separate defects combined to defeat
+  every view-only quick table calc on a rebound axis.
+  - **The model measure's frozen ordering.** A model-side table-calc measure hard-codes
+    `ORDERBY('Orders'[Order_Date])` at BUILD time, and a DAX window can only order by a column that
+    is in the query's group-by. The report binds a month truncation to `Date[Month Start]`, so the
+    window ordered by a column that is not on the axis and nothing accumulated -- the chart showed
+    raw values under a name that promised a running total. The report layer now takes the transform
+    back as a Visual Calculation (which follows the visual's own axis by construction) whenever the
+    pill carries a view-only token (`cum:`, `rsum:`, `movavg:`, `win:`, `pcto:`, ...), re-pointing the
+    base projection at the RAW measure first so the calc cannot double-apply. The swap is all or
+    nothing: every step is verified before it is made, because a half-applied rewrite is what blanks
+    a visual.
+  - **The legend/measure limiter was eating the calc.** That rule exists because Power BI cannot
+    cross-join a legend with several measure COLUMNS. A Visual Calculation is an expression evaluated
+    INSIDE the visual over a projection that is already present, so it adds no column -- but it was
+    being counted as one. Since a reclaimed calc projects its base HIDDEN and the calc VISIBLE,
+    dropping `projections[1:]` deleted exactly the visible half, leaving a legend and one hidden
+    measure: an empty chart. Measured on two colour-split running-total sheets that both rendered
+    blank while the same calc on a legend-free sheet rendered correctly.
+  - Verified end to end on a nine-worksheet workbook: the two running-total sheets render smooth
+    cumulative curves matching the Tableau reference, and the moving-average sheet loses the spike it
+    had been drawing from raw values. Suite 4281 passed / 6 skipped / 1 xfailed; corpus 29/29.
+### Fixed
+
 - **tableau-migration (skill `2.95.0` -> `2.96.0`): the author's mark colour reached a chart only if
   it was on a DASHBOARD.** A worksheet is emitted by two paths -- one per dashboard zone, one per
   standalone worksheet page -- and the constant-mark-colour step existed on the dashboard path only.
