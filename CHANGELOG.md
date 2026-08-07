@@ -12,6 +12,19 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.92.0` -> `2.93.0`): a model-measure rebind is authoritative over
+  the caption-keyed `field_map`.** The estate runs the viz stage TWICE -- once bare to build the
+  model, once rebound to it -- and only the SECOND pass ships as the openable `.pbip`. In that
+  second pass `_apply_override` treated `date_rebound` and `column_rebound` as authoritative but
+  NOT `measure_rebound`, so a calc correctly bound to its own model measure fell through to
+  `field_map`, which is keyed by CAPTION and whose targets are always model COLUMNS. A quick table
+  calc over `[Sales]` is captioned `Sales`, so it was retargeted onto the raw `Orders[Sales]`
+  column AND flipped `measure` -> `column`, after which the value-pill aggregation recovery
+  re-emitted it as a plain `Sum(Orders.Sales)`. Measured 2026-08-07: the model held a real
+  `Sales (running total (cumulative))` measure, the emitted `_Measures.tmdl` contained it, and
+  **no visual referenced it** -- the chart showed the raw un-accumulated number and nothing warned,
+  because every layer believed it had succeeded. Corpus: visuals bound to a table-calc measure
+  **0 -> 4**, 29/29 still openable.
 - **tableau-migration (skill `2.91.0` -> `2.92.0`): container backgrounds -- the dashboard canvas
   and each chart's own canvas.** Tableau spells "the background of this whole container" exactly one
   way, a `style-rule` whose `element` is `table`, and the container it hangs from decides what

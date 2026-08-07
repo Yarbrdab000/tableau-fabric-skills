@@ -471,6 +471,16 @@ def _table_calc_measures(usages, resolve, known_tables, consumed_lower, base_for
             # A derived measure: distinct NAME (intent-suffixed) so it never collides with the base
             # measure it transforms, and NO claim on the bare token -- the dashboard binds a quick
             # table calc by its full instance token; the bare token stays the base measure's key.
+            #
+            # KNOWN LIMIT (open, measured 2026-08-07): this measure's ORDERBY is fixed at BUILD time,
+            # so it is only correct while the visual's axis still contains that column. When the
+            # report rebinds a date axis to the model's Date hierarchy, a window ordered by
+            # ``'Orders'[Order_Date]`` no longer follows the drawn axis and the chart renders with no
+            # accumulation at all -- and because the measure EXISTS, ``_apply_visual_calcs`` yields to
+            # it and suppresses the axis-relative Visual Calculation that would have been correct.
+            # The fix belongs at that precedence point (the report layer owns a view-only transform),
+            # not here: deleting these measures also removes them from the cases where they ARE the
+            # right answer. See the ``visual-calc-vs-model-measure-precedence`` finding.
             name = f"{base_name} ({t.intent})"
             calc_id = None
             base_calc_id = bare or None

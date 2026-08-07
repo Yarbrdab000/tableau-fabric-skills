@@ -1195,7 +1195,7 @@ def _visual_calc_rollup(result):
     for f in emitted:
         fam = f.get("family") or "unknown"
         families[fam] = families.get(fam, 0) + 1
-    return {
+    rollup = {
         "emitted_total": len(emitted),
         "review_total": len(review),
         "by_role": {
@@ -1211,6 +1211,7 @@ def _visual_calc_rollup(result):
              "axis": f.get("axis"), "reason": f.get("reason")}
             for f in facts],
     }
+    return rollup
 
 
 def _color_scale_rollup(result):
@@ -3328,6 +3329,9 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_di
     if worklist is not None:
         detail["remediation_worklist"] = worklist
 
+    # NOTE: the pre-rebind detail path. Its parts are NOT what ships when the estate re-runs the viz
+    # stage bound to the model, so this summarises the routing DECISION only -- see the open
+    # ``visual-calc-report-unverified`` finding.
     vc_rollup = _visual_calc_rollup(result)
     if vc_rollup:
         detail["visual_calculations"] = vc_rollup

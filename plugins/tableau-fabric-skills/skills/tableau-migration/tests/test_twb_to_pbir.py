@@ -9142,3 +9142,47 @@ def test_a_hidden_title_still_keeps_its_hidden_state_alongside_a_background():
     assert vco["title"][0]["properties"]["show"]["expr"]["Literal"]["Value"] == "false"
     assert vco["background"][0]["properties"]["color"]["solid"]["color"]["expr"]["Literal"]["Value"] \
         == "'#333333'"
+
+
+from twb_to_pbir import _apply_override, _field_expression
+
+
+# -- a model-measure rebind is authoritative over the caption-keyed field_map -----
+def test_a_measure_rebind_is_not_overwritten_by_the_caption_field_map():
+    """The estate runs the viz stage twice and only the SECOND (model-bound) pass ships. ``field_map``
+    is keyed by CAPTION and its targets are always model COLUMNS, so a calc whose caption matches a
+    physical column -- the normal case, since a quick table calc over ``[Sales]`` is captioned
+    ``Sales`` -- was retargeted off its own measure onto that raw column and flipped measure->column,
+    after which the value-pill aggregation recovery re-emitted it as a plain ``Sum(Orders.Sales)``.
+
+    Measured 2026-08-07: the model held a real ``Sales (running total (cumulative))`` measure and NO
+    visual referenced it; the chart showed the raw un-accumulated value and nothing warned, because
+    every layer believed it had succeeded."""
+    field = {"caption": "Sales", "entity": "_Measures",
+             "property": "Sales (running total (cumulative))", "binding": "measure",
+             "kind": "value", "measure_rebound": True, "aggregation": None}
+    field_map = {"Sales": {"entity": "Orders", "property": "Sales"}}
+    entity, prop, binding = _apply_override(field, "Orders", field_map)
+    assert (entity, prop, binding) == ("_Measures", "Sales (running total (cumulative))", "measure")
+
+
+def test_the_rebound_measure_survives_into_the_emitted_projection():
+    """Tests the OUTCOME, not just the resolver: a correct ``_apply_override`` whose result is then
+    re-aggregated downstream looks identical in a unit test and still ships the wrong number."""
+    field = {"caption": "Sales", "entity": "_Measures",
+             "property": "Sales (running total (cumulative))", "binding": "measure",
+             "kind": "value", "measure_rebound": True, "aggregation": None}
+    expr, qref, nref = _field_expression(field, "Orders", {"Sales": {"entity": "Orders",
+                                                                    "property": "Sales"}})
+    assert "Measure" in expr
+    assert nref == "Sales (running total (cumulative))"
+    assert "Sum(" not in qref
+
+
+def test_a_field_map_still_retargets_an_ORDINARY_column_pill():
+    """The guard must not disable field_map generally -- only defend an explicit measure rebind."""
+    field = {"caption": "Sales", "entity": "Sheet1", "property": "Sales", "binding": "column",
+             "kind": "dimension"}
+    entity, prop, binding = _apply_override(field, "Orders", {"Sales": {"entity": "Orders",
+                                                                       "property": "Sales_Amt"}})
+    assert (entity, prop, binding) == ("Orders", "Sales_Amt", "column")

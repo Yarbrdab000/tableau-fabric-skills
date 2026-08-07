@@ -5631,6 +5631,21 @@ def _apply_override(field, model_table, field_map):
     AUTHORITATIVE for the same reason: the model materialised it into a specific table (a field-parameter
     axis lands in its OWN ``calculated`` table, e.g. ``'Choose Date'[Choose Date]``), so the
     ``model_table`` fallback must not re-pin it onto the fact and produce a dangling ``Sheet1[<calc>]``.
+
+    A calc MEASURE resolved by ``measure_binding`` (``measure_rebound``) is AUTHORITATIVE on the same
+    grounds, and its absence here was a silent data defect rather than a naming one. ``field_map`` is
+    keyed by CAPTION and its targets are always model COLUMNS (see below), so a calc whose caption
+    matches a physical column -- which is the normal case, since a quick table calc over ``[Sales]``
+    is captioned ``Sales`` -- was retargeted from its own measure onto that raw column AND flipped
+    ``measure`` -> ``column``, after which the value-pill aggregation recovery re-emitted it as a plain
+    ``Sum(Orders.Sales)``.
+
+    Measured 2026-08-07: the model translated ``cum:sum:Sales:qk`` to a real
+    ``Sales (running total (cumulative))`` measure and ``win:sum:Sales:qk`` to ``Sales (moving
+    window)``; both sat in the emitted ``_Measures.tmdl`` and NO visual referenced either. The chart
+    showed the raw un-accumulated measure. Nothing warned, because every layer believed it had
+    succeeded -- the model emitted its measure, the Visual-Calculation path correctly yielded to it
+    ("the model owns this transform"), and only this override quietly undid the binding in between.
     """
     entity, prop, binding = field["entity"], field["property"], field["binding"]
     # A model object is named from its Tableau caption STRIPPED, so a caption carrying stray
@@ -5643,7 +5658,7 @@ def _apply_override(field, model_table, field_map):
     # can never disagree about the name -- a mismatch between them renders an error tile.
     if isinstance(prop, str):
         prop = prop.strip() or prop
-    if field.get("date_rebound") or field.get("column_rebound"):
+    if field.get("date_rebound") or field.get("column_rebound") or field.get("measure_rebound"):
         return entity, prop, binding
     if field_map and field["caption"] in field_map:
         ov = field_map[field["caption"]]
