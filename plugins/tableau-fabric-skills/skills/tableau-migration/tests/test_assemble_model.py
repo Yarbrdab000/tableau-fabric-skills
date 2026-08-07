@@ -141,7 +141,7 @@ def test_assemble_measure_report_translates_and_stubs():
     # every formula is preserved as an annotation regardless of translation
     measures = out["parts"]["definition/tables/_Measures.tmdl"]
     assert "annotation TableauFormula = SUM([Sales])/SUM([Quantity])" in measures
-    assert "measure 'Profit Bucket' = 0" in measures
+    assert "measure 'Profit Bucket' = BLANK()" in measures
     assert "TranslatedBy" in measures              # only the translated one
 
 

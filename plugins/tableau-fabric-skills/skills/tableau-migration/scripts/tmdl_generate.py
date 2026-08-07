@@ -329,10 +329,20 @@ def generate_measure_tmdl(field_name, formula, dax=None, *, suggestion=None,
     formatString line is written -- byte-for-byte identical to prior output.
 
     `suggestion` is an OPTIONAL assisted-translation suggestion dict (``{"pattern", "dax"}``)
-    attached ONLY to a stub (`dax` is None): the measure stays inert `= 0` but carries
+    attached ONLY to a stub (`dax` is None): the measure stays inert `= BLANK()` but carries
     `TranslationSuggestion` + `TranslationSuggestionPattern` annotations so a human can review
-    and approve it. The suggestion is NEVER the live expression until approved."""
-    expr = dax if dax else "0"
+    and approve it. The suggestion is NEVER the live expression until approved.
+
+    An untranslated measure is ``BLANK()``, never ``0``. ``0`` is a MEASUREMENT -- it renders on a
+    card as a confident number, and nothing about "CSAT 0%" says "this calculation was never
+    migrated". Measured 2026-08-06: it was the first thing every downstream agent chased on a real
+    workbook, on a dashboard whose true value was 96%. It also poisons dependents, because a
+    year-over-year built on a zero denominator yields an infinity or a divide error rather than an
+    absence. ``BLANK()`` renders as empty, propagates as absence through arithmetic, and cannot be
+    mistaken for data. This is what a stubbed calculated COLUMN has always emitted
+    (:func:`generate_calc_column_tmdl`); measures were the lone inconsistency. Provenance is
+    unaffected -- the Tableau formula is still on the ``TableauFormula`` annotation."""
+    expr = dax if dax else "BLANK()"
     out = _tmdl_assignment(f"\n\tmeasure {q(field_name)}", expr)
     if format_string:
         out += f"\t\tformatString: {format_string}\n"

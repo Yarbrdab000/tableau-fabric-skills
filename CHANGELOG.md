@@ -12,6 +12,15 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.87.0` -> `2.88.0`): an untranslated measure is `BLANK()`, never
+  `0`.** A stub emitted as `= 0` is a MEASUREMENT: it renders on a card as a confident number, and
+  nothing about "CSAT 0%" says the calculation was never migrated. Measured 2026-08-06 on a real
+  workbook whose true value was 96%; it was the first thing every downstream agent chased. It also
+  poisons dependents, because a year-over-year over a zero denominator yields an infinity or a divide
+  error rather than an absence. `BLANK()` renders empty, propagates as absence through arithmetic,
+  and cannot be mistaken for data. This is what a stubbed calculated COLUMN has always emitted
+  (`generate_calc_column_tmdl`) -- measures were the lone inconsistency. Provenance is unchanged:
+  the Tableau formula is still on the `TableauFormula` annotation.
 - **tableau-migration (skill `2.86.0` -> `2.87.0`): the Tier-3 work order is REMOVED.** It shipped
   across 2.84.0-2.86.0 and is deleted here, along with its tests and its `SKILL.md` entry, because
   it was never validated against the agent it exists for and the evidence we do have argues against

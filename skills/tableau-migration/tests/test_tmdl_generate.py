@@ -39,7 +39,13 @@ def test_translated_measure_carries_dax_and_annotations():
 
 def test_stub_measure_is_inert_and_preserves_formula_on_one_line():
     m = generate_measure_tmdl("Complex", "IF [x]>0\nTHEN 1\nEND", None)
-    assert "= 0" in m
+    # An untranslated measure is BLANK(), never 0. A 0 is a MEASUREMENT: it renders on a card as a
+    # confident number, and nothing about "CSAT 0%" says the calculation was never migrated (the
+    # real value on the workbook that exposed this was 96%). It also poisons dependents -- a
+    # year-over-year over a zero denominator yields an infinity or a divide error rather than an
+    # absence. This matches what a stubbed calculated COLUMN has always emitted.
+    assert "= BLANK()" in m
+    assert "= 0" not in m
     # multi-line Tableau formula must be normalized onto a single annotation line.
     assert "annotation TableauFormula = IF [x]>0 THEN 1 END" in m
     # a stub must never claim it was translated.

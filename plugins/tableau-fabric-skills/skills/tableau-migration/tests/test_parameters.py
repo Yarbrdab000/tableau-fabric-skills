@@ -484,7 +484,7 @@ def test_assemble_import_model_unresolvable_swap_stays_stub():
     parts, report = out["parts"], out["report"]
     assert "definition/tables/Metric.tmdl" not in parts
     measures = parts["definition/tables/_Measures.tmdl"]
-    assert "measure Metric = 0" in measures
+    assert "measure Metric = BLANK()" in measures
     assert "CASE [Parameters].[m] WHEN 1 THEN [Nope1] WHEN 2 THEN [Nope2] END" in measures
     assert report["field_parameters"]["consumed"] == []
     statuses = {r["measure"]: r["status"] for r in report["measures"]}

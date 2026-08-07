@@ -202,7 +202,7 @@ _TMDL = """table _Measures
 \t\tannotation TableauFormula = SUM([Profit])/SUM([Sales])
 \t\tannotation TranslatedBy = deterministic
 
-\tmeasure Stubbed = 0
+\tmeasure Stubbed = BLANK()
 \t\tannotation TableauFormula = SCRIPT_REAL("x", SUM([Sales]))
 
 \tpartition _Measures = calculated
@@ -216,7 +216,7 @@ def test_measures_from_tmdl_reads_dax_and_the_preserved_tableau_formula():
     assert set(by_name) == {"Gross Profit Ratio", "Stubbed"}
     assert by_name["Gross Profit Ratio"]["dax"].startswith("DIVIDE(SUM(")
     assert by_name["Gross Profit Ratio"]["tableau_formula"] == "SUM([Profit])/SUM([Sales])"
-    assert by_name["Stubbed"]["dax"] == "0"   # the sibling partition block must not leak in
+    assert by_name["Stubbed"]["dax"] == "BLANK()"   # the sibling partition block must not leak in
     assert "SCRIPT_REAL" in by_name["Stubbed"]["tableau_formula"]
 
 
@@ -352,7 +352,7 @@ def test_roundtrips_a_MULTI_LINE_var_return_body_from_the_real_emitter():
 
 def test_roundtrips_an_inert_stub_and_keeps_its_preserved_formula():
     row = _roundtrip("Scripted", 'SCRIPT_REAL("x", SUM([Sales]))', None)
-    assert row["dax"] == "0"                       # the inert stub, not a guess
+    assert row["dax"] == "BLANK()"                       # the inert stub, not a guess
     assert "SCRIPT_REAL" in row["tableau_formula"]
 
 

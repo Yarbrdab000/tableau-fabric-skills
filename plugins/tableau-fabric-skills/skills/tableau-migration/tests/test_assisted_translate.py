@@ -230,7 +230,7 @@ def test_measures_part_surfaces_suggestion_and_keeps_stub():
     # the live measure is STILL inert; the suggestion is a non-binding annotation
     assert "TranslationSuggestion = " in tmdl
     assert "TranslationSuggestionPattern = argmax-dimension" in tmdl
-    assert "\tmeasure 'city with the most sales' = 0\n" in tmdl
+    assert "\tmeasure 'city with the most sales' = BLANK()\n" in tmdl
 
 
 def test_measures_part_approval_flips_to_real_measure():
@@ -255,7 +255,7 @@ def test_non_idiom_stub_is_byte_for_byte_unchanged():
     assert report[0]["status"] == "stub"
     assert suggestions == []
     assert "TranslationSuggestion" not in tmdl
-    assert "\tmeasure 'weird calc' = 0\n" in tmdl
+    assert "\tmeasure 'weird calc' = BLANK()\n" in tmdl
 
 
 # ------------------------------------------------------- first/last-value-by-date detector
