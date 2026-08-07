@@ -9396,3 +9396,83 @@ def test_reclaiming_the_transform_is_all_or_nothing():
     assert projections == [{"field": {}, "queryRef": "something.else", "nativeQueryRef": "x"}]
     # ...and a pill with no caption has no untransformed identity to fall back to.
     assert _reclaim_transform({}, {"instance": "cum:sum:Sales:qk"}, [], "Orders", {}) is None
+
+# The SAME measure aggregated two ways is as ordinary a Tableau trellis as two different measures --
+# `SUM(Sales) + AVG(Sales)` on one shelf draws two panes exactly like `SUM(Sales) + SUM(Profit)`.
+_CI_AVG_SALES = ("<column-instance column='[Sales]' derivation='Avg' name='[avg:Sales:qk]' "
+                 "pivot='key' type='quantitative' />")
+
+
+def _trellis_boxes(ws_xml):
+    """(x, y, w, h, category-axis-shown, Y-queryRef) per measure-trellis band, in emit order."""
+    out = []
+    for vis in _visual_parts(emit_pbir(parse_twb(_workbook(ws_xml)))).values():
+        p = vis["position"]
+        ca = (vis["visual"].get("objects", {}).get("categoryAxis") or [{}])[0].get("properties", {})
+        ys = _query_state(vis)["Y"]["projections"]
+        out.append((p["x"], p["y"], p["width"], p["height"],
+                    ca.get("show", {}).get("expr", {}).get("Literal", {}).get("Value"),
+                    ys[0]["queryRef"] if len(ys) == 1 else [q["queryRef"] for q in ys]))
+    return out
+
+
+def test_a_measure_trellis_fans_along_the_shelf_its_measures_sit_on():
+    # Tableau splits the pane along the shelf the measures are concatenated on. Measures on ROWS
+    # (vertical bars) draw one pane ABOVE the other sharing the category axis at the bottom; measures
+    # on COLUMNS (horizontal bars) draw them left and right sharing the labels down the left. The
+    # emitter fanned horizontally for BOTH, so a two-measure column sheet came out as two unrelated
+    # charts side by side instead of the stacked pair the source draws.
+    boxes = _trellis_boxes(_worksheet(
+        "Two Measures", "Bar",
+        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+        cols="[federated.abc].[none:Category:nk]", deps_extra=_INST))
+    assert len(boxes) == 2
+    # stacked: same x and width, increasing y, EQUAL heights (a row of category labels is drawn
+    # inside the band that shows them -- it does not need a slot of its own)
+    assert boxes[0][0] == boxes[1][0] and boxes[0][2] == boxes[1][2]
+    assert boxes[1][1] > boxes[0][1]
+    assert abs(boxes[0][3] - boxes[1][3]) < 1.0
+    # the category labels live at the BOTTOM, so the LAST band carries them
+    assert boxes[0][4] == "false" and boxes[1][4] == "true"
+
+
+def test_a_horizontal_measure_trellis_still_fans_side_by_side():
+    # Measures on COLUMNS keep the original left-to-right strip, labels down the left on the FIRST
+    # band, which keeps its double-width slot -- member names need real WIDTH, unlike the single row
+    # of text an X axis draws. Unchanged, so every horizontal trellis that worked before still does.
+    boxes = _trellis_boxes(_worksheet(
+        "Two Measures", "Bar",
+        rows="[federated.abc].[none:Category:nk]",
+        cols="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+        deps_extra=_INST))
+    assert len(boxes) == 2
+    assert boxes[0][1] == boxes[1][1] and boxes[0][3] == boxes[1][3]
+    assert boxes[1][0] > boxes[0][0]
+    assert boxes[0][4] == "true" and boxes[1][4] == "false"
+    assert abs(boxes[0][2] - 2 * boxes[1][2]) < 1.0
+
+
+def test_a_trellis_of_ONE_measure_aggregated_two_ways_fans_like_any_other():
+    # `SUM(Sales) + AVG(Sales)` is the same field twice under different aggregations. Tableau draws
+    # two panes for it exactly as it does for two different fields, and the rebuild must too -- the
+    # trellis signature is "two measure PILLS on one shelf", not "two distinct columns". Verified in
+    # BOTH orientations, and each band must carry its OWN aggregation (a rebuild that collapsed them
+    # to one projection would silently show the same number twice).
+    stacked = _trellis_boxes(_worksheet(
+        "Sum vs Avg", "Bar",
+        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[avg:Sales:qk])",
+        cols="[federated.abc].[none:Category:nk]", deps_extra=_INST + _CI_AVG_SALES))
+    assert len(stacked) == 2
+    assert [b[5] for b in stacked] == ["Sum(Orders.Sales_Amount)", "Avg(Orders.Sales_Amount)"]
+    assert stacked[0][0] == stacked[1][0] and stacked[1][1] > stacked[0][1]
+    assert stacked[0][4] == "false" and stacked[1][4] == "true"
+
+    fanned = _trellis_boxes(_worksheet(
+        "Sum vs Avg", "Bar",
+        rows="[federated.abc].[none:Category:nk]",
+        cols="([federated.abc].[sum:Sales:qk] + [federated.abc].[avg:Sales:qk])",
+        deps_extra=_INST + _CI_AVG_SALES))
+    assert len(fanned) == 2
+    assert [b[5] for b in fanned] == ["Sum(Orders.Sales_Amount)", "Avg(Orders.Sales_Amount)"]
+    assert fanned[0][1] == fanned[1][1] and fanned[1][0] > fanned[0][0]
+    assert fanned[0][4] == "true" and fanned[1][4] == "false"

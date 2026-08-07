@@ -14,6 +14,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **tableau-migration (skill `2.97.0` -> `2.98.0`): a measure trellis fans along the shelf its
+  measures sit on.** Tableau splits the pane along whichever shelf the `+`-concatenated measure pills
+  are on: measures on ROWS (vertical bars) draw one pane ABOVE the other sharing the category axis at
+  the bottom, measures on COLUMNS (horizontal bars) draw them left and right sharing the labels down
+  the left. The emitter fanned horizontally for BOTH, so a two-measure column sheet came out as two
+  unrelated charts side by side instead of the stacked pair the source draws.
+  - The label gutter is now asymmetric, because the two axes need different room. Category labels
+    down the LEFT carry member names and need real WIDTH, so that band keeps its double-width slot.
+    Category labels along the BOTTOM are a single row of text Power BI draws inside the visual's own
+    rectangle, so the stacked bands are simply EQUAL -- matching Tableau's equal panes. Giving the
+    last band a double slot there handed a third of the chart to a strip of month names.
+  - Confirmed the trellis signature is "two measure PILLS on one shelf", not "two distinct columns":
+    `SUM(Sales) + AVG(Sales)` -- the same field under two aggregations -- fans exactly like
+    `SUM(Sales) + SUM(Profit)`, in both orientations, each band carrying its own aggregation. Locked
+    by test in all four combinations.
+  - Verified end to end: the two-aggregation sheet renders as stacked panes sharing the month axis,
+    matching the Tableau reference. Suite 4284 passed / 6 skipped / 1 xfailed; corpus 29/29.
+### Fixed
+
 - **tableau-migration (skill `2.96.0` -> `2.97.0`): running totals and moving averages accumulate
   again -- and a colour-split one no longer renders blank.** Two separate defects combined to defeat
   every view-only quick table calc on a rebound axis.

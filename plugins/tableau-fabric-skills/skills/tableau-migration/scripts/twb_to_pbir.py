@@ -6579,16 +6579,29 @@ def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
                           page_name, page_display, model_table, field_map, vname_base,
                           sort_definition, label_objects, data_point_objects, warnings,
                           title=None, show_title=True):
-    """Fan a measure-trellis into N side-by-side single-measure ``clustered{Bar,Column}Chart``
-    visuals aligned on a shared category axis. Returns ``(visuals, records)``.
+    """Fan a measure-trellis into N single-measure ``clustered{Bar,Column}Chart`` visuals aligned on a
+    shared category axis. Returns ``(visuals, records)``.
 
-    Geometry: the source band is split into N+1 equal logical columns (a category-label gutter plus
-    one column per measure, so ``u = w / (N + 1)``). The FIRST chart spans the label gutter + its
-    measure band (width ``2u``) with the category axis SHOWN; each later chart occupies a single
-    measure band (width ``u``) with the category axis HIDDEN -- so the row labels appear once on the
-    left and every band lines up under its header. The numeric value axis is hidden on all (the data
-    labels carry the numbers, matching the compact Tableau strip); every chart shares the SAME
-    category binding + sort, so their rows stay aligned across the strip.
+    ORIENTATION FOLLOWS THE SHELF THE MEASURES SIT ON, because that is what Tableau splits:
+
+    * measures on COLUMNS (horizontal bars, category on Rows) -> panes SIDE BY SIDE, category labels
+      down the left, so the FIRST band carries the label gutter and shows the category axis;
+    * measures on ROWS (vertical bars, category on Columns) -> panes STACKED, category labels along
+      the bottom, so the LAST band carries the gutter and shows the category axis.
+
+    Emitting the horizontal fan for both was measured wrong on a two-measure column sheet: Tableau
+    drew one pane above the other sharing the month axis, the rebuild drew them left and right, and
+    the resulting pair read as two unrelated charts.
+
+    Geometry: the label gutter is asymmetric, because the two axes need different room. CATEGORY
+    LABELS DOWN THE LEFT (the fanned case) carry member names and need real WIDTH, so the band that
+    shows them is given a double slot -- the source band is split into N+1 columns and the first
+    spans two. CATEGORY LABELS ALONG THE BOTTOM (the stacked case) are a single row of text that
+    Power BI draws inside the visual's own rectangle, so the bands are simply equal, matching
+    Tableau's equal panes; giving the last band a double slot there would hand a third of the chart
+    to a strip of month names. The numeric value axis is hidden on all (the data labels carry the
+    numbers, matching the compact Tableau strip); every chart shares the SAME category binding +
+    sort, so the bands stay aligned.
 
     Titles: the strip is ONE Tableau zone, so it carries at most one caption. When the zone shows its
     title, only the FIRST chart carries it and the rest are explicitly captionless; when the zone
@@ -6598,12 +6611,20 @@ def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
     """
     visuals, records = [], []
     n = len(measures)
-    u = w / (n + 1) if n else w
+    # A column chart's measures came off the ROWS shelf, so its panes stack; a bar chart's came off
+    # COLUMNS, so its panes sit side by side.
+    stacked = ws["visual_type"] == VT_COLUMN
+    # The band that carries the category labels is the one nearest them: bottom when stacked, left
+    # when fanned. Only the fanned case reserves an extra slot for them (see above).
+    gutter_k = n - 1 if stacked else 0
+    u = (h / n if n else h) if stacked else (w / (n + 1) if n else w)
     for k, proj in enumerate(measures):
-        if k == 0:
-            xk, wk, cat_shown = x, 2 * u, True
+        cat_shown = (k == gutter_k)
+        if stacked:
+            xk, yk, wk, hk = x, y + k * u, w, u
         else:
-            xk, wk, cat_shown = x + (k + 1) * u, u, False
+            # Slots consumed before this band: the gutter band is two columns wide.
+            xk, yk, wk, hk = x + (k if k == 0 else k + 1) * u, y, (2 * u if cat_shown else u), h
         sub_state = dict(state)
         sub_state["Y"] = {"projections": [proj]}
         # Each band replaces Y with its OWN single measure, so a sort-by measure that was bound in
@@ -6618,7 +6639,7 @@ def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
                 sub_sort = None
         vtype = _pbir_vtype(ws["visual_type"], sub_state)
         vname_k = _sanitize(f"{vname_base}-mt{k}")
-        pos = _position(xk, y, wk, h, tab=tab)
+        pos = _position(xk, yk, wk, hk, tab=tab)
         extra = {
             "valueAxis": [{"properties": {"show": _bool_literal(False)}}],
             "categoryAxis": [{"properties": {"show": _bool_literal(cat_shown)}}],
@@ -6628,18 +6649,20 @@ def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
             vname_k, vtype, pos, sub_state, sub_sort,
             title=k_title, show_title=bool(k_title),
             label_objects=label_objects, data_point_objects=data_point_objects,
-            extra_objects=extra, container_fill=ws.get("canvas_fill")))
+            extra_objects=extra, container_fill=ws.get("canvas_fill"),
+            continuous_axis=ws.get("continuous_axis")))
         rec = _candidate_record(page_name, vname_k, ws, vtype, sub_state, pos,
                                 page_display=page_display,
                                 model_table=model_table, field_map=field_map)
         rec["measure_trellis"] = {"index": k, "of": n,
-                                  "category_axis_shown": cat_shown}
+                                  "category_axis_shown": cat_shown,
+                                  "orientation": "stacked" if stacked else "side-by-side"}
         records.append(rec)
     warnings.append(_warn(
         "worksheet", ws["name"],
-        f"measure-trellis ({n} measures on one axis) rebuilt as {n} side-by-side "
-        f"bar charts aligned on a shared category axis (Power BI has no native multi-measure "
-        f"trellis; the source draws one pane per measure)"))
+        f"measure-trellis ({n} measures on one axis) rebuilt as {n} "
+        f"{'stacked' if stacked else 'side-by-side'} charts aligned on a shared category axis "
+        f"(Power BI has no native multi-measure trellis; the source draws one pane per measure)"))
     return visuals, records
 
 
