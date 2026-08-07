@@ -12,6 +12,19 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.88.0` -> `2.89.0`): a transfer-layer UUID prefix no longer
+  becomes the asset name.** Chat/Copilot attachments, portal and ticketing downloads and SharePoint
+  stamp a canonical UUID on the front of a filename. It is never part of a Tableau author's name, and
+  it does real damage rather than looking untidy: 36 characters plus a separator consume most of the
+  64-char filesystem-name budget, so the author's ACTUAL name is truncated and a disambiguation hash
+  appended. Measured on a real run, `…-Network Operational PowerBI Mock - 24Jul26 ORC.twbx` emitted
+  as `0e7f6d6d-…-c13-Network Operationa-ac65b89d` -- the meaningful part of the name survived as the
+  word "Operationa". It also defeats the name-based workbook<->datasource rebind index, because two
+  attachments of one asset carry DIFFERENT uuids and stop matching each other. Stripped for the
+  LOCAL-FILE source only (a live/server name comes from Tableau and is authoritative), and
+  deliberately strict -- the canonical 8-4-4-4-12 shape, anchored at position 0, with a separator, and
+  only when a non-empty remainder survives, so a date-prefixed name like `2026-08-07-Monthly Report`
+  is untouched.
 - **tableau-migration (skill `2.87.0` -> `2.88.0`): an untranslated measure is `BLANK()`, never
   `0`.** A stub emitted as `= 0` is a MEASUREMENT: it renders on a card as a confident number, and
   nothing about "CSAT 0%" says the calculation was never migrated. Measured 2026-08-06 on a real

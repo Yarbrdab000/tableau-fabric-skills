@@ -423,6 +423,55 @@ def test_local_files_source_enumeration_and_naming(fixtures_dir):
     assert src.describe() == {"kind": "LocalFilesSource", "root": fixtures_dir}
 
 
+# -- transfer-layer UUID prefixes ----------------------------------------------
+def test_a_transfer_layer_uuid_prefix_is_dropped_from_the_asset_name():
+    """Chat/portal/SharePoint downloads stamp a UUID on the front of the filename. It is never part
+    of the author's name, and it is not merely untidy -- see the truncation test below."""
+    assert me.strip_transfer_uuid(
+        "0e7f6d6d-3d7b-44b3-bbb2-83cd83194c13-Network Operational PowerBI Mock - 24Jul26 ORC"
+    ) == "Network Operational PowerBI Mock - 24Jul26 ORC"
+
+
+@pytest.mark.parametrize("stem", [
+    "Network Operational PowerBI Mock - 24Jul26 ORC",   # no prefix at all
+    "0e7f6d6d3d7b44b3bbb283cd83194c13-No Dashes",       # hex, but not the canonical shape
+    "0e7f6d6d-3d7b-44b3-bbb2-83cd83194c13",             # the prefix IS the whole name
+    "2026-08-07-Monthly Report",                        # a DATE -- a looser pattern would eat this
+    "abc-Sales",                                        # short hex-ish token
+    "",
+])
+def test_only_a_canonical_uuid_prefix_is_touched(stem):
+    """Deliberately strict. A false positive silently renames a real asset, so the pattern is
+    anchored at position 0, requires the exact 8-4-4-4-12 shape plus a separator, and keeps the
+    original whenever nothing would survive."""
+    assert me.strip_transfer_uuid(stem) == stem
+
+
+def test_the_uuid_prefix_no_longer_truncates_the_real_name_out_of_the_folder():
+    """The reason this matters. 36 characters plus a separator consume most of the 64-char
+    filesystem budget, so the author's actual name is truncated and a disambiguation hash appended.
+    Measured on a real run, the meaningful part of the name survived as the word "Operationa"."""
+    raw = ("0e7f6d6d-3d7b-44b3-bbb2-83cd83194c13-Network Operational PowerBI Mock - 24Jul26 ORC")
+    assert me._fs_safe(raw) == "0e7f6d6d-3d7b-44b3-bbb2-83cd83194c13-Network Operationa-ac65b89d"
+    assert me._fs_safe(me.strip_transfer_uuid(raw)) == "Network Operational PowerBI Mock - 24Jul26 ORC"
+
+
+def test_a_live_server_asset_name_is_never_rewritten():
+    """A server-side name comes from Tableau itself and is authoritative. Only a LOCAL FILE can
+    carry a transfer-layer prefix, so only the local source strips one."""
+    src = me.LiveTableauSource.__new__(me.LiveTableauSource)
+    src._name_by_id = {"id-1": "0e7f6d6d-3d7b-44b3-bbb2-83cd83194c13-Real Server Name"}
+    assert src.asset_name("id-1") == "0e7f6d6d-3d7b-44b3-bbb2-83cd83194c13-Real Server Name"
+
+
+def test_two_attachments_of_one_asset_now_share_a_name(tmp_path):
+    """Each attachment gets a DIFFERENT uuid, so before this the workbook and its datasource no
+    longer matched each other in the name-based rebind index."""
+    a = me.strip_transfer_uuid("7efb9e08-19e0-496b-894d-d787fc07ea75-Sales")
+    b = me.strip_transfer_uuid("0e7f6d6d-3d7b-44b3-bbb2-83cd83194c13-Sales")
+    assert a == b == "Sales"
+
+
 def _packaged_zip_bytes(arcname, text):
     """Pack one BOM-encoded member into an in-memory zip -- a ``.tdsx``/``.twbx`` IS a zip."""
     buf = io.BytesIO()

@@ -188,7 +188,9 @@ class LocalFilesSource(TableauSource):
         return load_workbook_xml(wb_id)
 
     def asset_name(self, asset_id):
-        return os.path.splitext(os.path.basename(asset_id))[0]
+        # The filename stem, minus any transfer-layer UUID prefix (see _TRANSFER_UUID_PREFIX).
+        # Naming only -- ``asset_id`` stays the real path, so discovery and reads are untouched.
+        return strip_transfer_uuid(os.path.splitext(os.path.basename(asset_id))[0])
 
     def describe(self):
         return {"kind": type(self).__name__, "root": str(self.root)}
@@ -618,6 +620,29 @@ _INVALID_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 # and collision-safe: a content hash of the FULL name is appended, so two workbooks sharing a long
 # prefix still land in distinct folders and the same workbook always yields the same folder.
 _MAX_FS_BASE = 64
+
+# A canonical UUID stamped on the FRONT of a filename by a TRANSFER layer -- chat/Copilot
+# attachments, portal and ticketing downloads, SharePoint -- e.g.
+# ``0e7f6d6d-3d7b-44b3-bbb2-83cd83194c13-Network Operational PowerBI Mock - 24Jul26 ORC.twbx``.
+# It is never part of a Tableau author's name, and it does real damage rather than just looking
+# untidy: 36 characters plus a separator consume most of the ``_MAX_FS_BASE`` budget, so the
+# author's ACTUAL name is truncated and a disambiguation hash appended. Measured on a real run --
+# ``0e7f6d6d-3d7b-44b3-bbb2-83cd83194c13-Network Operationa-ac65b89d`` -- where the meaningful part
+# of the name survived as the word "Operationa". It also defeats the name-based
+# workbook<->datasource rebind index, because two attachments of the same asset carry DIFFERENT
+# uuids and so no longer match each other.
+#
+# Strict by design: the canonical 8-4-4-4-12 hex shape, anchored at position 0, followed by a
+# separator, and applied only when a non-empty remainder survives. Local-file source ONLY -- a
+# live/server asset name comes from Tableau itself and is authoritative, so it is never rewritten.
+_TRANSFER_UUID_PREFIX = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}[-_ ]+")
+
+
+def strip_transfer_uuid(stem):
+    """Drop a transfer-layer UUID prefix from a filename stem. A no-op when none is present."""
+    stripped = _TRANSFER_UUID_PREFIX.sub("", stem or "", count=1).strip()
+    return stripped or (stem or "")
 
 
 def _fs_safe(name, default="model"):
@@ -3912,6 +3937,7 @@ def _build_input_manifest(source, ds_ids, wb_ids):
         return manifest
     manifest["root"] = str(source.root)
     seen = {}
+    by_digest = {}
     for kind, asset_id in ([("datasource", i) for i in ds_ids]
                            + [("workbook", i) for i in wb_ids]):
         rec = {"kind": kind, "name": source.asset_name(asset_id),
@@ -3930,6 +3956,8 @@ def _build_input_manifest(source, ds_ids, wb_ids):
         # output families), so they must not raise a false collision.
         stem = os.path.splitext(os.path.basename(asset_id))[0].lower()
         seen.setdefault((kind, stem), set()).add(rec["staged_input_path"])
+        if rec.get("sha256"):
+            by_digest.setdefault((kind, rec["sha256"]), set()).add(rec["staged_input_path"])
     manifest["collisions"] = [
         {"kind": kind, "stem": stem, "paths": sorted(paths)}
         for (kind, stem), paths in sorted(seen.items()) if len(paths) > 1
