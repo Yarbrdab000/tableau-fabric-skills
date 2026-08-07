@@ -2944,11 +2944,17 @@ def test_secondary_date_is_never_rebound():
     assert any("date part" in x["reason"].lower() for x in ir["warnings"])
 
 
-def test_continuous_trunc_on_active_date_rebinds_to_calendar_hierarchy():
-    # A continuous month truncation (green `tmn:` pill) on the ACTIVE business date is a display-grain
-    # axis -> the marked Date table's Calendar drill hierarchy, drilled to the truncation grain
-    # (Year + Month). This matches a Desktop-authored rebuild whose area/line date axis carries the
-    # Calendar Year + Month levels (never the flat fact date column, never an undrillable key column).
+def test_continuous_trunc_on_active_date_rebinds_to_the_scalar_grain_column():
+    # A month truncation (`tmn:` pill) on the ACTIVE business date is DATETRUNC -- ONE DATE VALUE per
+    # month -> the Date table's scalar grain column ``Date[Month Start]``, NOT the Calendar drill.
+    #
+    # This test previously asserted the Calendar Year + Month hierarchy. That expectation was
+    # DISPROVEN BY RENDER, not by preference: a hierarchy binding is categorical by construction, so
+    # Power BI builds Year x Month category slots, refuses a Scalar axis, and PAGES the surplus
+    # behind a scrollbar. Measured on a 45-month dashboard: 21 months drawn, 24 silently hidden, on
+    # every one of nine tiles. It also renders nested Year/Month headers that Tableau never shows for
+    # a single truncation pill. The Calendar hierarchy is still correct for date PARTS (covered by
+    # its own tests) -- those really are drill levels.
     tmonth = ("<column-instance column='[Order Date]' derivation='Month-Trunc' "
               "name='[tmn:Order Date:qk]' pivot='key' type='quantitative' />")
     ws = _worksheet("Monthly Trend", "Line",
@@ -2958,18 +2964,40 @@ def test_continuous_trunc_on_active_date_rebinds_to_calendar_hierarchy():
     ir = parse_twb(_workbook(ws), date_binding=_DATE_BINDING)
     col = ir["worksheets"][0]["cols"][0]
     assert col["entity"] == "Date"
-    assert col["hierarchy"] == {"name": "Calendar", "levels": ["Year", "Month"]}
+    assert col["property"] == "Month Start"
+    assert not col.get("hierarchy")
     # rebound to the calendar -> the "grain not applied" degrade warning is gone
     assert not any("grain not applied" in x["reason"].lower() for x in ir["warnings"])
-    # emits one HierarchyLevel projection per level (Year + Month), each active, against Date.Calendar
+    # ONE scalar Column projection, not a level-per-grain drill
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
     cats = _query_state(vis)["Category"]["projections"]
-    assert [(p["field"]["HierarchyLevel"]["Level"], p["queryRef"], p.get("active")) for p in cats] == [
-        ("Year", "Date.Calendar.Year", True), ("Month", "Date.Calendar.Month", True)]
-    hexpr = cats[0]["field"]["HierarchyLevel"]["Expression"]["Hierarchy"]
-    assert hexpr["Hierarchy"] == "Calendar"
-    assert hexpr["Expression"]["SourceRef"]["Entity"] == "Date"
-    assert cats[0]["nativeQueryRef"] == "Calendar Year"
+    assert len(cats) == 1
+    assert cats[0]["field"]["Column"]["Property"] == "Month Start"
+    assert cats[0]["queryRef"] == "Date.Month Start"
+    assert cats[0]["field"]["Column"]["Expression"]["SourceRef"]["Entity"] == "Date"
+
+
+def test_a_continuous_pill_asks_for_a_scalar_axis_a_discrete_one_does_not():
+    # Both spellings bind to the same scalar grain column; the pill's own continuity decides only how
+    # the axis is DRAWN. Tableau stamps it as the trailing role code on the instance -- `:qk` is
+    # continuous (green), `:ok` is discrete (blue) -- and the derivation is `Month-Trunc` for both,
+    # so nothing except that suffix can tell them apart.
+    def _axis_type(role):
+        inst = ("<column-instance column='[Order Date]' derivation='Month-Trunc' "
+                f"name='[tmn:Order Date:{role}]' pivot='key' type='quantitative' />")
+        ws = _worksheet("Monthly", "Bar",
+                        rows="[federated.abc].[sum:Sales:qk]",
+                        cols=f"[federated.abc].[tmn:Order Date:{role}]",
+                        deps_extra=_INST + inst)
+        ir = parse_twb(_workbook(ws), date_binding=_DATE_BINDING)
+        vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+        props = vis["visual"]["objects"]["categoryAxis"][0]["properties"]
+        assert vis["visual"]["query"]["queryState"]["Category"]["projections"][0][
+            "field"]["Column"]["Property"] == "Month Start"
+        return props.get("axisType", {}).get("expr", {}).get("Literal", {}).get("Value")
+
+    assert _axis_type("qk") == "'Scalar'"
+    assert _axis_type("ok") is None
 
 
 def test_subday_trunc_on_active_date_is_deferred():
@@ -4593,6 +4621,22 @@ def _only_visual(res):
     return vis[0]
 
 
+def _axis_title_props(vis):
+    """The AXIS-TITLE properties a visual carries, keyed ``<axis>.<prop>``.
+
+    Every cartesian visual unconditionally carries a scrollbar-suppression block, so ``objects`` is
+    never empty and "no axis styling" can only be asserted on the title keys themselves.
+    """
+    objs = vis["visual"].get("objects") or {}
+    out = {}
+    for axis in ("categoryAxis", "valueAxis"):
+        props = (objs.get(axis) or [{}])[0].get("properties", {})
+        for k, v in props.items():
+            if "title" in k.lower():
+                out[f"{axis}.{k}"] = v
+    return out
+
+
 def test_static_worksheet_title_emitted_on_visual_container():
     # an authored static caption -> the visual's visualContainerObjects.title.text (single-quoted
     # semantic-query literal), show=true, and the auto field-name subtitle suppressed.
@@ -4992,7 +5036,10 @@ def test_no_axis_style_means_no_axis_objects():
                     deps_extra=_INST)
     res = migrate_twb_to_pbir(_workbook(ws))
     assert res["ir"]["worksheets"][0]["axis_titles"] == {}
-    assert "objects" not in _only_visual(res)["visual"]
+    # Asserted on the AXIS-TITLE keys specifically. Every cartesian visual now carries an unavoidable
+    # scrollbar-suppression block (zoom / general / categoryAxis.preferredCategoryWidth), so a blanket
+    # "no objects at all" would only be re-testing that block's existence, not this rule.
+    assert _axis_title_props(_only_visual(res)) == {}
 
 
 def test_quick_filter_title_rule_is_not_an_axis_title():
@@ -5006,7 +5053,7 @@ def test_quick_filter_title_rule_is_not_an_axis_title():
                     deps_extra=_INST, style=style)
     res = migrate_twb_to_pbir(_workbook(ws))
     assert res["ir"]["worksheets"][0]["axis_titles"] == {}
-    assert "objects" not in _only_visual(res)["visual"]
+    assert _axis_title_props(_only_visual(res)) == {}
 
 
 def test_non_cartesian_visual_ignores_axis_titles():
@@ -9194,3 +9241,38 @@ def test_a_field_map_still_retargets_an_ORDINARY_column_pill():
     entity, prop, binding = _apply_override(field, "Orders", {"Sales": {"entity": "Orders",
                                                                        "property": "Sales_Amt"}})
     assert (entity, prop, binding) == ("Orders", "Sales_Amt", "column")
+
+
+def test_every_cartesian_visual_defeats_the_axis_paging_scrollbar():
+    # Tableau draws EVERY mark in its pane -- the axis compresses until they fit, and there is no
+    # scrollbar because there is nothing to scroll to. Power BI reserves a minimum width per category
+    # and pages the surplus behind one, HIDING DATA: measured on a 45-month dashboard, 21 months drawn
+    # and 24 silently missing on every tile. Nothing in the source can ask for this, so the emitter
+    # turns it off unconditionally. Three properties are required -- a build carrying only `zoom` and
+    # only `zoom` + `general.responsive` was rendered and kept every scrollbar.
+    ws = _worksheet("Plain", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST)
+    objs = _only_visual(migrate_twb_to_pbir(_workbook(ws)))["visual"]["objects"]
+
+    def _lit(obj, prop):
+        return obj[0]["properties"][prop]["expr"]["Literal"]["Value"]
+
+    # UNQUOTED booleans -- a quoted 'false' validates clean and silently no-ops.
+    for prop in ("show", "showOnCategoryAxis", "showOnValueAxis"):
+        assert _lit(objs["zoom"], prop) == "false"
+    assert _lit(objs["general"], "responsive") == "false"
+    # ...and a TYPED DOUBLE for the width (not "1", not "'1'").
+    assert _lit(objs["categoryAxis"], "preferredCategoryWidth") == "1D"
+
+
+def test_a_non_cartesian_visual_is_left_alone_by_the_scrollbar_suppression():
+    # A card / pie / table has no category axis and no zoom control, so touching it would only add
+    # dead properties. The gate is the visual type, asserted here directly against the suppressor so
+    # the negative case is unambiguous.
+    from twb_to_pbir import _suppress_zoom_sliders as _szs
+    for vtype in ("card", "pieChart", "donutChart", "tableEx", "pivotTable", "slicer"):
+        visual = {"visualType": vtype}
+        _szs(visual, vtype, continuous_axis=True)
+        assert "objects" not in visual, vtype

@@ -93,6 +93,28 @@ def test_date_table_tmdl_structure():
     assert "source = CALENDARAUTO()" in tmdl
 
 
+def test_date_table_carries_a_scalar_column_for_every_continuous_truncation_grain():
+    # Tableau's green `t*:` pill is DATETRUNC: one DATE VALUE per period, drawn on a CONTINUOUS axis.
+    # Power BI can only express that as a scalar date column -- a Calendar drill level is categorical
+    # by construction, so an axis bound to the hierarchy gets cross-product category slots, refuses a
+    # Scalar axis, and pages the surplus behind a scrollbar (measured: half a 45-month series hidden).
+    # These columns are the truncation's honest landing spot, one per grain the binder supports.
+    tmdl = T.generate_date_table_tmdl("Date")
+    assert "column 'Year Start' = DATE(YEAR('Date'[Date]), 1, 1)" in tmdl
+    assert ("column 'Quarter Start' = "
+            "DATE(YEAR('Date'[Date]), (QUARTER('Date'[Date]) - 1) * 3 + 1, 1)") in tmdl
+    assert "column 'Month Start' = DATE(YEAR('Date'[Date]), MONTH('Date'[Date]), 1)" in tmdl
+    assert "column 'Week Start' = 'Date'[Date] - WEEKDAY('Date'[Date], 2) + 1" in tmdl
+    # Each is an explicitly typed, date-formatted column: an INFERRED type would let Desktop treat it
+    # as text, and the Scalar axis that depends on it would silently fall back to categorical.
+    for grain in ("Year Start", "Quarter Start", "Month Start", "Week Start"):
+        body = tmdl.split(f"column '{grain}' =", 1)[1].split("column ", 1)[0]
+        assert "dataType: dateTime" in body
+        assert "formatString: Short Date" in body
+    # Day-Trunc needs no column of its own -- it IS the key column.
+    assert "column 'Day Start'" not in tmdl
+
+
 def test_date_table_tmdl_unmarked_drops_time_category_and_key():
     tmdl = T.generate_date_table_tmdl("Date", mark_as_date=False)
     assert "dataCategory: Time" not in tmdl

@@ -12,6 +12,36 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Changed
+
+- **tableau-migration (skill `2.94.0` -> `2.95.0`): a date TRUNCATION is a scalar grain column, not a
+  drill hierarchy -- and the scrollbar it caused was hiding half the data.** A Tableau green `t*:`
+  pill is `DATETRUNC`: one DATE VALUE per period. It was binding to the shared Date table's Calendar
+  drill hierarchy (`Month-Trunc` -> `Year` + `Month`), on the stated grounds that "this is what a
+  Desktop-authored rebuild does". Render disproved that. A hierarchy binding is CATEGORICAL by
+  construction, so Power BI builds `Year x Month` category slots, refuses a Scalar axis, and PAGES
+  the surplus behind a grey scrollbar. Measured on a 45-month 3x3 dashboard: **21 months drawn, 24
+  silently hidden, on every one of the nine tiles** -- a data-loss defect that validated clean and
+  looked merely cosmetic. It also rendered nested Year/Month headers Tableau never shows for a single
+  truncation pill, and left running-total windows ordering by a column that is not on the axis.
+  - The generated Date dimension gains a scalar column per truncation grain -- `Year Start`,
+    `Quarter Start`, `Month Start`, `Week Start` -- each explicitly `dataType: dateTime` +
+    `formatString: Short Date`, because an inferred type lets Desktop treat it as text and the Scalar
+    axis silently falls back to categorical. `Day-Trunc` needs none: it IS the key column.
+  - Every `*-Trunc` pill now binds to its grain column whatever colour it is. The Calendar hierarchy
+    stays correct for date PARTS, which really are drill levels.
+  - The pill's own CONTINUITY, read from Tableau's encoding (the trailing role code on the instance:
+    `:qk` continuous / `:ok`,`:nk` discrete -- the derivation is `Month-Trunc` for BOTH spellings, so
+    nothing else can tell them apart), now decides only how the axis is DRAWN:
+    `categoryAxis.axisType: 'Scalar'` for a continuous pill.
+  - Scrollbar suppression completed on every cartesian visual: `zoom` (the slider control),
+    `general.responsive: false` (responsive layout reflows by paging the axis), and
+    `categoryAxis.preferredCategoryWidth: 1D` (the default reserves per-category width). All three
+    are required -- builds carrying only the first, then only the first two, were rendered and kept
+    every scrollbar. Literal types differ and a wrong one no-ops silently: unquoted `false`, the
+    typed double `1D`, the quoted string `'Scalar'`.
+  - Verified end to end on `0085_time_series_style_palette`: all nine tiles lose their scrollbar and
+    render the full 45-month series. Suite 4275 passed / 6 skipped / 1 xfailed; corpus 29/29.
 - **tableau-migration (skill `2.93.0` -> `2.94.0`): the workbook's own colours, on every chart.**
   Four related fixes, all verified by rendering the rebuild and comparing it to the source image.
   (1) **Flat mark colour, every visual type.** A Tableau author who colours the marks without binding

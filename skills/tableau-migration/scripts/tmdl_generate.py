@@ -437,10 +437,16 @@ def generate_measures_table_tmdl(measures_tmdl):
 # requires. Derived parts are calculated columns; Month/Quarter sort by a numeric helper so
 # they order chronologically rather than alphabetically.
 _DATE_INT_FMT = "0"  # no thousands separator (years/days/weeks must not render as "2,025")
+# A continuous-truncation grain column holds a real DATE (the first instant of the period), so it is
+# explicitly typed and date-formatted -- an inferred type would let Desktop treat it as text and the
+# Scalar axis that depends on it would silently fall back to categorical.
+_TRUNC_COL = {"dtype": "dateTime", "fmt": "Short Date"}
 
-def _date_calc_column(name, dax, *, hidden=False, fmt=None, sort_by=None):
+def _date_calc_column(name, dax, *, hidden=False, fmt=None, sort_by=None, dtype=None):
     """One calculated column on the Date table (``column <name> = <dax>``)."""
     lines = [f"\tcolumn {q(name)} = {dax}"]
+    if dtype is not None:
+        lines.append(f"\t\tdataType: {dtype}")
     if hidden:
         lines.append("\t\tisHidden")
     if fmt is not None:
@@ -487,6 +493,23 @@ def generate_date_table_tmdl(table_name="Date", *, mark_as_date=True,
     cols += _date_calc_column("Quarter", f'"Q" & QUARTER({d})', sort_by="Quarter No")
     cols += _date_calc_column("Month No", f"MONTH({d})", hidden=True, fmt=_DATE_INT_FMT)
     cols += _date_calc_column("Month", f'FORMAT({d}, "MMM")', sort_by="Month No")
+    # CONTINUOUS-truncation grain columns: Tableau's green ``t*:`` date pill is DATETRUNC -- one
+    # DATE VALUE per period, plotted on a CONTINUOUS axis. Power BI can only express that as a
+    # scalar date column; a Calendar drill level is categorical by construction, so an axis bound to
+    # the hierarchy gets Year x Month category slots, cannot be a Scalar axis, and Power BI pages it
+    # behind a scrollbar (measured: HALF the months hidden on a 45-month series). These columns give
+    # the truncation an honest scalar landing spot, one per grain the binder supports. Day-Trunc
+    # needs none -- it IS the key column. Emitted unconditionally: they are cheap derived columns and
+    # a date dimension legitimately carries them, which keeps the model free of a "which grains did
+    # the report use" dependency on the viz stage.
+    cols += _date_calc_column("Year Start", f"DATE(YEAR({d}), 1, 1)", **_TRUNC_COL)
+    cols += _date_calc_column(
+        "Quarter Start", f"DATE(YEAR({d}), (QUARTER({d}) - 1) * 3 + 1, 1)", **_TRUNC_COL)
+    cols += _date_calc_column(
+        "Month Start", f"DATE(YEAR({d}), MONTH({d}), 1)", **_TRUNC_COL)
+    # ISO week start (Monday), matching the ISO convention the Weekday No / ISO Year columns use.
+    cols += _date_calc_column(
+        "Week Start", f"{d} - WEEKDAY({d}, 2) + 1", **_TRUNC_COL)
     cols += _date_calc_column(
         "Week of Month",
         f"WEEKNUM({d}) - WEEKNUM(DATE(YEAR({d}), MONTH({d}), 1)) + 1",

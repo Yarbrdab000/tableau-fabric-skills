@@ -418,6 +418,33 @@ _DATE_TRUNC_HIERARCHY_LEVELS = {
     "Week": ("Year", "Month", "Week"),
     "Day": ("Year", "Month", "Day"),
 }
+# The scalar Date-table column that carries each CONTINUOUS truncation grain (see
+# ``generate_date_table_tmdl``). Day-Trunc is the key column itself, so it maps to ``None`` and the
+# caller substitutes the marked key column.
+_DATE_TRUNC_SCALAR_COLUMNS = {
+    "Year": "Year Start",
+    "Quarter": "Quarter Start",
+    "Month": "Month Start",
+    "Week": "Week Start",
+    "Day": None,
+}
+
+
+def _is_continuous_pill(field):
+    """True when a Tableau shelf pill is CONTINUOUS (green), read from Tableau's own encoding.
+
+    Tableau stamps continuity on the pill INSTANCE, as the trailing role code: ``:qk`` is
+    quantitative/continuous, ``:ok`` (ordinal) and ``:nk`` (nominal) are discrete. The workbook that
+    exposed this carries both spellings of the same truncated month --
+    ``[tmn:Order Date:qk]`` and ``[tmn:Order Date:ok]`` -- so the derivation alone (``Month-Trunc``
+    for both) cannot tell them apart; only this suffix can.
+
+    Deliberately conservative: anything that is not explicitly ``qk`` (including a synthesized
+    caption-fallback instance with no role code) reads as DISCRETE, which is Power BI's own default,
+    so an unrecognised pill keeps the previous behaviour rather than being guessed onto a scalar
+    axis it cannot support.
+    """
+    return str(field.get("instance") or "").rsplit(":", 1)[-1].strip().lower() == "qk"
 
 
 def _norm_date_col(name):
@@ -449,11 +476,10 @@ def _rebind_date_axis(field, deriv, date_binding, for_filter=False):
     calendar and therefore can't silently display the active date's values -- the exact "break a lot
     of stuff" risk. A discrete date PART rebinds to its calendar column (Year -> Date[Year]); a plain
     exact/continuous date, OR a discrete exact-date VALUE (e.g. MDY -- the full date shown as "Month,
-    Day, Year"), rebinds to the marked key column (Date[Date]); a day-or-coarser CONTINUOUS
-    truncation (Day/Week/Month/Quarter/Year-Trunc, the green ``t*:`` pills) rebinds to the marked Date
-    table's Calendar drill hierarchy, drilled to the truncation grain (Month-Trunc -> Year + Month) --
-    this is what a Desktop-authored rebuild does (its area/line date axis carries the Calendar levels,
-    not a flat date column). A SUB-DAY truncation (Hour/Minute/Second-Trunc) can't be represented by a
+    Day, Year"), rebinds to the marked key column (Date[Date]); a day-or-coarser TRUNCATION
+    (Day/Week/Month/Quarter/Year-Trunc) rebinds to the Date table's scalar GRAIN column
+    (Month-Trunc -> Date[Month Start]) because DATETRUNC yields one date value per period, not a
+    drill. A SUB-DAY truncation (Hour/Minute/Second-Trunc) can't be represented by a
     day-grain calendar, and any part with no calendar column, return ``None`` (deferred -- the caller
     keeps the source column + warns). Returns a rebind dict -- ``{"entity","property"}`` for a column
     or ``{"entity","hierarchy","levels"}`` for the drill hierarchy -- else ``None``.
@@ -496,15 +522,33 @@ def _rebind_date_axis(field, deriv, date_binding, for_filter=False):
         # shown as "Month, Day, Year") -> the marked calendar key column. Both are the same
         # underlying date, so the exact-date-value display format binds exactly like a plain date.
         return {"entity": table, "property": date_binding.get("key_column") or "Date"}
-    # A continuous DAY-or-coarser truncation (Day/Week/Month/Quarter/Year-Trunc, the green `t*:`
-    # pills) on the active business date is a display-grain axis -> the marked Date table's Calendar
-    # drill hierarchy, drilled to the truncation grain (Month-Trunc -> Year + Month). This is what a
-    # Desktop-authored rebuild does: its area/line date axis carries the Calendar levels, not a flat
-    # date column. A SUB-DAY truncation (Hour/Minute/Second-Trunc) has no day-grain calendar level,
-    # so it stays deferred (caller keeps the source column + warns; warn-never-wrong).
+    # A DAY-or-coarser date TRUNCATION (Day/Week/Month/Quarter/Year-Trunc) is DATETRUNC: ONE DATE
+    # VALUE per period. That is a scalar date column in the model, so it binds to the Date table's
+    # grain column (Month-Trunc -> ``Date[Month Start]``) whatever colour the pill is -- a truncation
+    # is a single flat series of period stamps, NOT a drill. Binding it to the Calendar hierarchy
+    # instead was measured to be wrong in three separate ways: it builds a Year x Month CROSS-PRODUCT
+    # of category slots, so Power BI refuses a Scalar axis and PAGES the surplus behind a scrollbar
+    # (45-month series -> 21 shown, 24 silently hidden); it renders nested Year/Month headers Tableau
+    # never shows for a single truncation pill; and it leaves a running-total window ordering by a
+    # column that is not on the axis. The Calendar hierarchy remains correct for date PARTS, which
+    # are handled above -- those really are drill levels.
+    #
+    # The pill's CONTINUITY decides only how the axis is DRAWN, not what it binds to: a green ``:qk``
+    # pill is a continuous number line (``axisType: Scalar``, applied downstream from
+    # ``continuous_axis``), a blue ``:ok`` pill is the same members drawn as discrete headers.
+    #
+    # A SUB-DAY truncation (Hour/Minute/Second-Trunc) has no day-grain calendar column, so it stays
+    # deferred (caller keeps the source column + warns; warn-never-wrong).
     m = re.match(r"(Year|Quarter|Month|Week|Day)-Trunc$", str(deriv or ""))
     if m:
-        levels = _DATE_TRUNC_HIERARCHY_LEVELS.get(m.group(1))
+        grain = m.group(1)
+        if grain in _DATE_TRUNC_SCALAR_COLUMNS:
+            col = _DATE_TRUNC_SCALAR_COLUMNS[grain]
+            if col:
+                return {"entity": table, "property": col}
+            # Day-Trunc IS the key column.
+            return {"entity": table, "property": date_binding.get("key_column") or "Date"}
+        levels = _DATE_TRUNC_HIERARCHY_LEVELS.get(grain)
         if levels:
             return {"entity": table,
                     "hierarchy": date_binding.get("date_hierarchy") or _DEFAULT_DATE_HIERARCHY,
@@ -3925,6 +3969,13 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     meas_rows = [f for f in rows if f["kind"] == "value"]
     meas_cols = [f for f in cols if f["kind"] == "value"]
 
+    # Does the DIMENSION axis carry a continuous (green) Tableau pill? A continuous axis is a
+    # number line, not a row of category slots, so the rebuilt visual must ask Power BI for a Scalar
+    # category axis. Read from both shelves because the dimension axis is ``cols`` on a vertical
+    # chart and ``rows`` on a horizontal bar; a chart normally carries its dimension on exactly one,
+    # and a second DISCRETE pill (a trellis dimension) reads False and cannot flip the answer.
+    continuous_axis = any(_is_continuous_pill(f) for f in (dims_rows + dims_cols))
+
     fidelity_note = None
     combo_split = None
     lollipop = False
@@ -4335,6 +4386,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "grid_styles": grid_styles,
         "canvas_fill": canvas_fill,
         "axis_titles": axis_titles,
+        "continuous_axis": continuous_axis,
         "axis_hidden": sorted(axis_hidden),
         "color_gradient": color_gradient,
         "color_gradients": color_gradients,
@@ -8439,6 +8491,63 @@ _LEGEND_MEASURE_LIMIT_VTYPES = (
 )
 
 
+def _suppress_zoom_sliders(visual, vtype, continuous_axis=False):
+    """Turn OFF the scrollbar Power BI puts under and beside a busy cartesian chart.
+
+    A Tableau worksheet draws EVERY mark in its pane: the axis compresses until they all fit, and
+    there is no scrollbar because there is nothing to scroll to. Power BI instead reserves a minimum
+    width per category and, when they no longer fit, PAGES the axis behind a grey scrollbar -- so a
+    faithful rebuild of a dense time series grows one on every chart AND SHOWS ONLY PART OF THE DATA.
+    Measured on a 45-month series in a 3x3 dashboard: 21 months rendered, 24 silently hidden, on
+    every one of the nine tiles. Nothing in the source asks for this, so nothing in the source can
+    turn it off -- it is a Power BI default the emitter has to actively defeat.
+
+    THREE mechanisms produce it, and turning off fewer than all three leaves it on screen. This was
+    established by render, one property at a time:
+
+    * ``categoryAxis.axisType = 'Scalar'`` -- THE decisive one, and only legal when the category
+      field is a scalar date/number. A scalar axis is a number line: it has no category slots, so
+      there is nothing to page and the scrollbar cannot exist. Gated on ``continuous_axis`` (the
+      Tableau pill's own ``:qk`` continuity) because a genuinely DISCRETE axis must stay categorical.
+    * ``categoryAxis.preferredCategoryWidth = 1D`` -- for the categorical case that remains: the
+      default reserves per-category width, so N categories claim N * default pixels and page the
+      moment that exceeds the plot. ``1D`` lets a category compress to one pixel, which is Tableau's
+      "fit the pane" behaviour.
+    * ``zoom`` + ``general.responsive`` -- the zoom slider control itself, and responsive layout,
+      which reflows a dense chart BY paging its axis.
+
+    LITERAL TYPES DIFFER and a wrong one validates clean while silently no-opping: the flags are
+    UNQUOTED ``false``, the width is the typed double ``1D`` (not ``1``, not ``'1'``), and the axis
+    type is a QUOTED string ``'Scalar'``.
+
+    ``setdefault`` throughout, so a mark rule that deliberately set one of these earlier keeps it.
+    """
+    if vtype not in _ZOOM_SLIDER_VTYPES:
+        return
+    off = {"expr": {"Literal": {"Value": "false"}}}
+    objs = visual.setdefault("objects", {})
+    objs.setdefault("zoom", [{"properties": {}}])
+    objs["zoom"][0]["properties"].update({
+        "show": off, "showOnCategoryAxis": off, "showOnValueAxis": off,
+    })
+    objs.setdefault("general", [{"properties": {}}])
+    objs["general"][0]["properties"].setdefault("responsive", off)
+    objs.setdefault("categoryAxis", [{"properties": {}}])
+    ca = objs["categoryAxis"][0]["properties"]
+    ca.setdefault("preferredCategoryWidth", {"expr": {"Literal": {"Value": "1D"}}})
+    if continuous_axis:
+        ca.setdefault("axisType", {"expr": {"Literal": {"Value": "'Scalar'"}}})
+
+
+# Cartesian visuals that carry Power BI's zoom-slider control.
+_ZOOM_SLIDER_VTYPES = (
+    "lineChart", "areaChart", "stackedAreaChart", "columnChart", "clusteredColumnChart",
+    "stackedColumnChart", "barChart", "clusteredBarChart", "stackedBarChart",
+    "hundredPercentStackedColumnChart", "hundredPercentStackedBarChart",
+    "lineClusteredColumnComboChart", "lineStackedColumnComboChart", "scatterChart",
+)
+
+
 def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  filter_config=None, title=None, title_style=None, axis_titles=None,
                  axis_hidden=None,
@@ -8446,7 +8555,7 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  data_point_objects=None, label_objects=None, legend_objects=None,
                  shape_objects=None, card_label_objects=None, analytics_objects=None,
                  slicer_mode=None, font_objects=None, extra_objects=None,
-                 show_title=None, container_fill=None):
+                 show_title=None, container_fill=None, continuous_axis=False):
     # Power BI refuses a Legend alongside several measures and renders an error tile instead of a
     # chart. Enforced HERE so every emit path is covered by construction rather than by each
     # caller remembering.
@@ -8631,6 +8740,10 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
                 existing[0]["properties"].update(_xv[0]["properties"])
             else:
                 visual["objects"][_xk] = _xv
+    # Power BI shows a zoom slider (a scrollbar) by default on a busy cartesian axis; Tableau has
+    # no such control, so a faithful rebuild turns it off. Applied LAST so it composes with every
+    # objects block assembled above.
+    _suppress_zoom_sliders(visual, vtype, continuous_axis=continuous_axis)
     # Small-multiples visuals need a newer schema (see SCHEMA_VISUAL_SM): Desktop drops a
     # SmallMultiple role on the legacy 1.0.0 stamp. The bump is gated to exactly those visuals so the
     # verified non-trellis gates keep their proven 1.0.0 stamp.
@@ -10359,6 +10472,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 title=spark_title, title_style=ws.get("title_style"),
                 show_title=show_title,
                 axis_titles=ws.get("axis_titles"),
+                continuous_axis=ws.get("continuous_axis"),
                 axis_hidden=ws.get("axis_hidden"),
                 value_objects=value_objects, data_point_objects=data_point_objects,
                 label_objects=label_objects, legend_objects=legend_objects,
@@ -10605,6 +10719,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             title=spark_title, title_style=ws.get("title_style"),
             show_title=show_title,
             axis_titles=ws.get("axis_titles"),
+            continuous_axis=ws.get("continuous_axis"),
             axis_hidden=ws.get("axis_hidden"),
             value_objects=value_objects, data_point_objects=data_point_objects,
             label_objects=label_objects, shape_objects=shape_objects,
