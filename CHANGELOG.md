@@ -12,6 +12,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.91.0` -> `2.92.0`): container backgrounds -- the dashboard canvas
+  and each chart's own canvas.** Tableau spells "the background of this whole container" exactly one
+  way, a `style-rule` whose `element` is `table`, and the container it hangs from decides what
+  gets painted: under `<dashboard>` it is the page canvas, under `<worksheet><table>` it is that
+  one chart's canvas. Neither was read. Both are now, by one reader. Per-tile `zone-style` fills and
+  the `header` / `pane` / `quick-filter` part fills were already handled -- this adds the
+  surface BEHIND them, which is the layer a viewer notices first: a dark workbook previously rebuilt
+  entirely white on both layers. The page paints `objects.background` **and** `objects.outspace`
+  in the same colour, because Tableau has one background where Power BI has a canvas plus the margin
+  shown around it whenever the viewport aspect differs; a chart paints
+  `visualContainerObjects.background` with an explicit `show: true`. Both target shapes are
+  verified against 59 adjudicated `page.json` files and the corpus's own adjudicated dark rebuild,
+  including the two details that fail SILENTLY when wrong -- the quoted hex literal and the unquoted
+  `0D` transparency (Power BI's page background is transparent by default, so a colour without it
+  can render as nothing). Partial-alpha canvases are declined rather than blended: there is no
+  faithful single-hex form, and inventing one would shift every colour composited over it. Corpus
+  delta: pages with a background **0 -> 12**, visuals **70 -> 90**, 29/29 still openable, and the
+  rebuild verified by rendering it in Desktop and looking at it.
 - **tableau-migration (skill `2.90.0` -> `2.91.0`): an unplaced calc borrows addressing from its
   IDENTICAL placed twin.** Tableau recovers a table calc's Compute-Using (partition + order) from
   where the pill sits on a worksheet, so a calc authored but never dropped on a shelf has no

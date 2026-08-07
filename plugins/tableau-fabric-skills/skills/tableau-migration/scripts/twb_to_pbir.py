@@ -4239,6 +4239,12 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "subtotal_fill": (_resolve_element_fill(_tbl_style, "header", data_class="subtotal")
                           or _resolve_element_fill(_tbl_style, "pane", data_class="subtotal")),
     }
+    # The worksheet's OWN canvas colour (``style-rule[@element='table']``) -- the surface behind the
+    # whole chart, not one of its parts. Same Tableau spelling as the dashboard canvas; the container
+    # it hangs from is what differs (see _container_background_fill). Measured across the corpus: a
+    # dark workbook sets this on every worksheet, and without it each chart rebuilds as a white tile
+    # sitting on the (now correct) dark page -- a worse-looking result than getting neither right.
+    canvas_fill = _container_background_fill(table)
 
     axis_titles = {}
     axis_hidden = set()
@@ -4327,6 +4333,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "filter_itm_style": filter_itm_style,
         "filter_plate_fill": filter_plate_fill,
         "grid_styles": grid_styles,
+        "canvas_fill": canvas_fill,
         "axis_titles": axis_titles,
         "axis_hidden": sorted(axis_hidden),
         "color_gradient": color_gradient,
@@ -4398,6 +4405,46 @@ def _title_display(ws, show_title=True):
     if not show_title:
         return None, False
     return (ws.get("title") or ws.get("name") or None), True
+
+
+def _container_background_fill(container):
+    """The background a Tableau ``<style>`` block paints on its OWN container -> ``#rrggbb`` or None.
+
+    Tableau spells "the background of this whole thing" as a ``style-rule`` whose ``element`` is
+    ``table``, and the container it hangs from decides what "this whole thing" means:
+
+    * under ``<dashboard>``          -> the dashboard canvas (the page background)
+    * under ``<worksheet><table>``   -> that one chart's own canvas
+
+    So ONE reader serves both, which is why this takes the container rather than a dashboard. Measured
+    across the 29-workbook corpus: a dark dashboard declares ``#1b1b1b`` at dashboard scope and
+    ``#333333`` on each of its nine worksheets, and neither was read -- the rebuild came out white on
+    both layers, which is the single most visible whole-page fidelity defect available.
+
+    Distinct from :func:`_zone_background_fill`, which reads a ``<zone-style>`` on ONE tile. A zone
+    fill paints a tile; this paints the surface behind every tile.
+
+    Only a well-formed opaque ``#rrggbb`` is returned. Alpha is deliberately NOT blended here: a
+    partial-alpha canvas has no faithful single-hex form, and inventing one would silently change
+    every colour composited over it.
+    """
+    if container is None:
+        return None
+    for style in _children_local(container, "style"):
+        for rule in _children_local(style, "style-rule"):
+            if (rule.get("element") or "").lower() != "table":
+                continue
+            for fmt in _children_local(rule, "format"):
+                if fmt.get("attr") != "background-color":
+                    continue
+                val = (fmt.get("value") or "").strip()
+                if _HEX6_RE.match(val):
+                    return val.lower()
+                # 8-digit #rrggbbaa: honour it only when fully opaque, and treat a fully
+                # transparent canvas as "no authored background" rather than as black.
+                if _HEX8_RE.match(val) and val[7:9].lower() == "ff":
+                    return val[:7].lower()
+    return None
 
 
 def _zone_background_fill(zone):
@@ -4765,6 +4812,10 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
                 ", ".join("%s[%s]" % (z["type"], z["ref"] or z["zone_id"])
                           for z in hidden_skipped[:8]))))
     return {"name": name, "size": size,
+            # The dashboard's own canvas colour (``style-rule[@element='table']``), or None when the
+            # author left it default. Read here because this is the only place the source
+            # <dashboard> element is in scope.
+            "canvas_fill": _container_background_fill(db),
             "extent": {"w": ext_w or None, "h": ext_h or None}, "zones": zones,
             "param_controls": param_controls, "legend_zones": legend_zones,
             "filter_field_tokens": sorted(filter_field_tokens),
@@ -6500,7 +6551,7 @@ def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
             vname_k, vtype, pos, sub_state, sub_sort,
             title=k_title, show_title=bool(k_title),
             label_objects=label_objects, data_point_objects=data_point_objects,
-            extra_objects=extra))
+            extra_objects=extra, container_fill=ws.get("canvas_fill")))
         rec = _candidate_record(page_name, vname_k, ws, vtype, sub_state, pos,
                                 page_display=page_display,
                                 model_table=model_table, field_map=field_map)
@@ -8221,7 +8272,7 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  data_point_objects=None, label_objects=None, legend_objects=None,
                  shape_objects=None, card_label_objects=None, analytics_objects=None,
                  slicer_mode=None, font_objects=None, extra_objects=None,
-                 show_title=None):
+                 show_title=None, container_fill=None):
     visual = {"visualType": vtype}
     if query_state:
         visual["query"] = {"queryState": query_state}
@@ -8358,6 +8409,22 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
             "title": [{"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}],
             "subTitle": [{"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}],
         }
+    # The worksheet's own canvas colour -> this container's background. Merged with ``setdefault``
+    # AFTER the title block above, which assigns ``visualContainerObjects`` wholesale, so it composes
+    # instead of being clobbered by whichever title branch ran.
+    #
+    # Two shape details, both of which fail SILENTLY (the file validates and the colour just does not
+    # appear), verified against the adjudicated rebuild of the corpus's own dark workbook:
+    #   * this is a visualCONTAINERObject, not a data-plane ``visual.objects`` entry -- the corpus
+    #     records a whole run lost to putting a container property under ``objects``;
+    #   * it needs an explicit ``show: true`` (UNQUOTED bool). A colour with no ``show`` is not shown.
+    if container_fill:
+        visual.setdefault("visualContainerObjects", {})["background"] = [{"properties": {
+            "show": {"expr": {"Literal": {"Value": "true"}}},
+            "color": {"solid": {"color": {"expr": {"Literal": {
+                "Value": f"'{container_fill}'"}}}}},
+            "transparency": {"expr": {"Literal": {"Value": "0D"}}},
+        }}]
     # Font/formatting fidelity (Tier-2, resolved from the Tableau <style> cascade): per-channel
     # format objects (columnHeaders/values/... for grids; categoryAxis/valueAxis for axes). Each
     # channel's "properties" dict may carry BOTH font props (_font_style_props) AND a fill (backColor,
@@ -9200,8 +9267,25 @@ def _solved_rect(zone):
     return plan["rects"].get(zid)
 
 
-def _page_json(name, display_name):
-    return {
+def _solid_fill_object(hex_color):
+    """One PBIR fill entry: an opaque solid colour.
+
+    Shape verified against 59 real adjudicated ``page.json`` files. Two details are load-bearing and
+    both fail SILENTLY when wrong -- the file validates either way and the colour simply does not
+    appear:
+
+    * the hex literal is QUOTED (``'#1b1b1b'``), unlike a numeric literal;
+    * ``transparency`` is the UNQUOTED typed double ``0D``. Power BI's page background is
+      transparent by default, so a colour emitted without it can render as nothing at all.
+    """
+    return {"properties": {
+        "color": {"solid": {"color": {"expr": {"Literal": {"Value": f"'{hex_color}'"}}}}},
+        "transparency": {"expr": {"Literal": {"Value": "0D"}}},
+    }}
+
+
+def _page_json(name, display_name, canvas_fill=None):
+    page = {
         "$schema": SCHEMA_PAGE,
         "name": name,
         "displayName": display_name,
@@ -9209,12 +9293,23 @@ def _page_json(name, display_name):
         "height": _page_h(),
         "width": _page_w(),
     }
+    if canvas_fill:
+        # BOTH surfaces, in the same colour, because Tableau has only one. ``background`` is the
+        # canvas itself; ``outspace`` is the margin Power BI shows around it whenever the viewport
+        # aspect differs from the page. Painting only the canvas leaves a dark dashboard sitting in a
+        # bright white surround -- which is what the reader actually sees, and reads as broken.
+        # Matches the adjudicated rebuild of the corpus's own dark dashboard.
+        page["objects"] = {
+            "background": [_solid_fill_object(canvas_fill)],
+            "outspace": [_solid_fill_object(canvas_fill)],
+        }
+    return page
 
 
-def _emit_page(parts, page_name, display_name, visuals):
+def _emit_page(parts, page_name, display_name, visuals, canvas_fill=None):
     """Write a page.json plus its visual.json parts; ``visuals`` is a list of dicts."""
     base = f"definition/pages/{page_name}"
-    parts[f"{base}/page.json"] = _dumps(_page_json(page_name, display_name))
+    parts[f"{base}/page.json"] = _dumps(_page_json(page_name, display_name, canvas_fill))
     for v in visuals:
         parts[f"{base}/visuals/{v['name']}/visual.json"] = _dumps(v)
 
@@ -10005,7 +10100,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 label_objects=label_objects, legend_objects=legend_objects,
                 shape_objects=shape_objects, card_label_objects=card_label_objects,
                 analytics_objects=analytics_objects,
-                font_objects=_grid_font_objects(ws), extra_objects=lollipop_objects))
+                font_objects=_grid_font_objects(ws), extra_objects=lollipop_objects,
+                container_fill=ws.get("canvas_fill")))
             rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                     page_display=db["name"] or page_name,
                                     model_table=model_table, field_map=field_map)
@@ -10130,7 +10226,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         _grown_h = _deoverlap_captions(visuals, _page_w(), _page_h())
         if _grown_h and _grown_h > _page_h():
             _PAGE_H_OVERRIDE = _whole_px(_grown_h)
-        _emit_page(parts, page_name, db["name"] or page_name, visuals)
+        _emit_page(parts, page_name, db["name"] or page_name, visuals,
+                   canvas_fill=db.get("canvas_fill"))
         page_order.append(page_name)
 
     _PAGE_W_OVERRIDE = None
@@ -10249,7 +10346,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             label_objects=label_objects, shape_objects=shape_objects,
             card_label_objects=card_label_objects,
             analytics_objects=analytics_objects,
-            font_objects=_grid_font_objects(ws), extra_objects=lollipop_objects)
+            font_objects=_grid_font_objects(ws), extra_objects=lollipop_objects,
+            container_fill=ws.get("canvas_fill"))
         rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                 page_display=ws["name"],
                                 model_table=model_table, field_map=field_map)

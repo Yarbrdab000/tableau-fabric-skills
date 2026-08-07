@@ -9022,3 +9022,123 @@ def test_highlight_table_colours_every_carded_measure_end_to_end():
     assert set(scales) == {"Sales", "Profit"}, scales
     assert scales["Sales"]["colors"][-1] == "#00ff00"          # the author's explicit palette
     assert scales["Profit"].get("default_palette") is True     # synthesised + disclosed
+
+
+# ============================================================================================
+# Background / canvas colour -- the whole-surface layer
+# ============================================================================================
+# Tableau spells "the background of this whole container" ONE way -- a style-rule whose element is
+# `table` -- and the container it hangs from decides what gets painted. One reader, two surfaces.
+import xml.etree.ElementTree as _BET
+from twb_to_pbir import (_container_background_fill as _cbf, _page_json as _pj,
+                         _visual_json as _vj)
+
+_DASH_DARK = """
+<dashboard name='D'>
+  <style><style-rule element='table'><format attr='background-color' value='#1b1b1b'/></style-rule></style>
+</dashboard>"""
+
+_WS_DARK = """
+<table>
+  <style><style-rule element='table'><format attr='background-color' value='#333333'/></style-rule></style>
+</table>"""
+
+
+def test_a_dashboard_canvas_colour_is_read():
+    """Measured on the corpus's dark workbook: the page came out white because nothing read this."""
+    assert _cbf(_BET.fromstring(_DASH_DARK)) == "#1b1b1b"
+
+
+def test_a_worksheet_canvas_colour_is_read_by_the_same_reader():
+    """Same Tableau spelling, different container -- which is why one function serves both."""
+    assert _cbf(_BET.fromstring(_WS_DARK)) == "#333333"
+
+
+def test_a_container_with_no_authored_background_reads_none():
+    assert _cbf(_BET.fromstring("<dashboard name='D'/>")) is None
+    assert _cbf(None) is None
+
+
+def test_only_the_table_element_is_the_container_background():
+    """`header` / `pane` / `quick-filter` paint PARTS of a worksheet and are already routed to their
+    own PBIR channels. Reading one of those as the canvas would paint the whole surface with a
+    colour the author meant for the header row."""
+    for element in ("header", "pane", "cell", "quick-filter", "parameter-ctrl"):
+        xml = (f"<dashboard name='D'><style><style-rule element='{element}'>"
+               "<format attr='background-color' value='#ff0000'/></style-rule></style></dashboard>")
+        assert _cbf(_BET.fromstring(xml)) is None, element
+
+
+def test_an_opaque_8_digit_hex_is_accepted_and_a_partial_alpha_is_refused():
+    """A partial-alpha canvas has no faithful single-hex form. Inventing a blend would silently
+    shift every colour composited over it, so it is declined rather than guessed."""
+    def dash(v):
+        return _BET.fromstring(f"<dashboard name='D'><style><style-rule element='table'>"
+                               f"<format attr='background-color' value='{v}'/>"
+                               "</style-rule></style></dashboard>")
+    assert _cbf(dash("#1b1b1bff")) == "#1b1b1b"      # opaque alpha -> strip and use
+    assert _cbf(dash("#1b1b1b80")) is None            # half transparent -> refuse
+    assert _cbf(dash("#00000000")) is None            # fully transparent -> not an authored canvas
+    assert _cbf(dash("nonsense")) is None
+
+
+# -- page emit -------------------------------------------------------------------------------
+def test_a_page_with_no_canvas_colour_is_byte_identical():
+    """The overwhelming case. Every workbook that authored nothing must emit exactly what it did
+    before this feature existed."""
+    assert "objects" not in _pj("p1", "Page 1")
+
+
+def test_a_page_canvas_paints_BOTH_background_and_outspace():
+    """Tableau has one dashboard background; Power BI has a canvas AND the margin shown around it
+    whenever the viewport aspect differs. Painting only the canvas leaves a dark dashboard sitting
+    in a bright white surround, which reads as broken. Matches the adjudicated rebuild."""
+    objs = _pj("p1", "Page 1", canvas_fill="#1b1b1b")["objects"]
+    assert sorted(objs) == ["background", "outspace"]
+    for key in ("background", "outspace"):
+        lit = objs[key][0]["properties"]["color"]["solid"]["color"]["expr"]["Literal"]["Value"]
+        assert lit == "'#1b1b1b'", key
+
+
+def test_the_page_colour_literal_is_quoted_and_transparency_is_an_unquoted_0D():
+    """Both fail SILENTLY when wrong -- the file validates and the colour simply never appears.
+    Power BI's page background is transparent by default, so the 0D is what makes it visible."""
+    props = _pj("p1", "P", canvas_fill="#1b1b1b")["objects"]["background"][0]["properties"]
+    assert props["color"]["solid"]["color"]["expr"]["Literal"]["Value"].startswith("'")
+    assert props["transparency"]["expr"]["Literal"]["Value"] == "0D"
+
+
+# -- visual emit -----------------------------------------------------------------------------
+def _one_visual(**kw):
+    return _vj("v1", "columnChart", {"x": 0, "y": 0, "width": 10, "height": 10}, None, **kw)
+
+
+def test_a_visual_with_no_canvas_colour_is_byte_identical():
+    v = _one_visual()["visual"]
+    assert "background" not in (v.get("visualContainerObjects") or {})
+
+
+def test_a_visual_canvas_lands_on_visualContainerObjects_with_an_explicit_show():
+    """Two traps the corpus records costing whole runs: this is a visualCONTAINERObject rather than
+    a data-plane `objects` entry, and a colour with no `show: true` is simply not shown."""
+    vco = _one_visual(container_fill="#333333")["visual"]["visualContainerObjects"]
+    props = vco["background"][0]["properties"]
+    assert props["show"]["expr"]["Literal"]["Value"] == "true"     # UNQUOTED bool
+    assert props["color"]["solid"]["color"]["expr"]["Literal"]["Value"] == "'#333333'"
+    assert props["transparency"]["expr"]["Literal"]["Value"] == "0D"
+
+
+def test_the_visual_canvas_composes_with_the_title_instead_of_clobbering_it():
+    """The title branch assigns `visualContainerObjects` wholesale, so a background merged the wrong
+    way would silently delete the title state -- and Power BI would then auto-generate a caption the
+    source never authored."""
+    vco = _one_visual(title="Sales by Month", container_fill="#333333")["visual"]["visualContainerObjects"]
+    assert sorted(vco) == ["background", "subTitle", "title"]
+    assert vco["title"][0]["properties"]["show"]["expr"]["Literal"]["Value"] == "true"
+
+
+def test_a_hidden_title_still_keeps_its_hidden_state_alongside_a_background():
+    vco = _one_visual(show_title=False, container_fill="#333333")["visual"]["visualContainerObjects"]
+    assert vco["title"][0]["properties"]["show"]["expr"]["Literal"]["Value"] == "false"
+    assert vco["background"][0]["properties"]["color"]["solid"]["color"]["expr"]["Literal"]["Value"] \
+        == "'#333333'"
