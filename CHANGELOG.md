@@ -14,6 +14,49 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **tableau-migration (skill `2.101.0` -> `2.102.0`): a KPI title's headline number is found by what
+  it RENDERS at, and rebuilt in proportion.** Tableau writes a big-number KPI INTO the worksheet
+  title — a static caption run plus a live `<[ds].[Calculation…]>` run. The detector required an
+  explicit `fontsize >= 18` on that run, but Tableau omits `fontsize` entirely on a run that uses the
+  title's own default. Three KPI tiles in one workbook therefore came out titled with the SHEET NAME
+  ("Bar Chart", "Sheet 6") and no number anywhere.
+  - **Rendered size, not declared size.** A run's size is now resolved through the same font cascade
+    every other element uses (workbook → worksheet → `worksheet-title`, over Tableau's documented
+    15pt). A reference qualifies as the headline when it renders LARGER than every static caption run
+    ("Days Left In Sales Year" at 12pt over a 15pt number) **or** stands ALONE on its own line
+    ("Total Sales" / "2,326,534", both 15pt). An inline, no-larger reference ("Sales for `<Region>`")
+    is still a caption with a live token, not a KPI.
+  - **The card shows the measure the title names.** Binding was hard-wired to the worksheet's own
+    primary measure. That is right only for a view-level table calc (`TOTAL(…)` / `RUNNING_*` — no
+    model measure to bind, and a card has no axis for a window to run along), and wrong the moment a
+    title names a different metric: "Days Left In Sales Year", whose number is
+    `DATEDIFF('day', TODAY(), {MAX([Order Date])})` = 145, was rebuilt as the sheet's SUM(Sales) =
+    2,326,534 — a real number, in the right place, measuring the wrong thing.
+  - **Several lines are several cards.** A multi-metric title ("Current: `<this year>`" / "vs Last
+    Year: `<delta>`") is split on the line breaks the author wrote, one card per line with its own
+    label; previously every metric after the first was dropped. A paired STRING measure (Tableau's
+    "Arrow Up" / "Arrow down" glyph calcs) is not a headline number and is excluded.
+  - **A title-only worksheet is its cards.** A sheet with no rows and no cols — its entire content
+    the numbers in its title — classified unsupported and was dropped by the caption path too (the
+    text still held a field ref), so a whole tile came out EMPTY. Tableau blanks such a sheet with an
+    empty-string calc on Text, and that Text encoding alone was enough to mark it "plottable"; the
+    gate is now empty shelves.
+  - **Proportion and size.** The card band was a fixed 58% of the zone, which floated a 15pt number
+    in a half-empty plate and squashed the chart into the rest; it is now the height of the text it
+    holds. Sizes are emitted at what the source renders at instead of being deferred (Power BI's
+    defaults are a ~45pt callout and its own title size), the container title is styled from the
+    CAPTION runs only, and where the authored zone is too short for a stacked caption+callout both
+    scale by the same factor — keeping the authored contrast while fitting the band.
+  - **Tableau's "Automatic" number format is not Power BI's.** A measure that declares no format
+    renders under Automatic, which suppresses decimals on an aggregate; Power BI prints the raw
+    double. A headline read `2,326,534.35` where the source shows `2,326,534`. An unformatted KPI
+    callout now carries `#,0` (confirmed against four ground-truth numbers); an authored format still
+    wins.
+  - Tableau's `Æ` layout sentinel was being counted as a text run by `_parse_title_style`, so a title
+    whose real runs all agreed still deferred its styling.
+
+### Fixed
+
 - **tableau-migration (skill `2.100.0` -> `2.101.0`): an axis the author hid has no title either.**
   `visual.objects.<axis>.show: false` suppresses an axis's line, ticks and labels but NOT its title —
   the code assumed otherwise and said so in a comment. Measured on a 300x300 KPI tile whose source

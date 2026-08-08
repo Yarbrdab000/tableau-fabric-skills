@@ -2519,72 +2519,184 @@ def _parse_worksheet_title(ws):
 # inline ``<[Parameters]...>`` token (a parameter woven into a caption) is NOT -- it stays deferred.
 _KPI_TITLE_MIN_SIZE = 18.0
 _TITLE_FULL_REF_RE = re.compile(r"^<(\[[^<>\[\]]*\]\.\[[^<>\[\]]*\])>$")
+# Tableau's documented worksheet-title point size, used when the workbook is silent at every
+# cascade layer. Kept as a named fallback so the resolver below never invents a number.
+_WORKSHEET_TITLE_DEFAULT_SIZE = 15.0
 
 
-def _detect_kpi_title_card(ws):
-    """Detect a KPI title-card worksheet -> ``{"caption", "ref", "value_color", "value_size"}`` or
-    ``None``.
+def _points(value):
+    """A point size from either a raw Tableau ``fontsize`` ('12') or a PBIR literal ('12D') -> float.
 
-    The signature (confirmed against the real workbook): the title's ``<formatted-text>`` carries a
-    single dynamic ``<[ds].[usr:Calculation...]>`` run at a large font size (the headline number) --
-    NOT a ``[Parameters]`` reference (a parameter woven into a caption is a different, deferred case)
-    -- alongside one or more static caption runs. ``caption`` is those static runs cleaned of the
-    ``U+FFFD`` replacement char and the hidden white ``_`` spacer run; ``ref`` is the ``[ds].[field]``
-    token (brackets kept) for the embedded measure; ``value_color`` / ``value_size`` carry the run's
-    authored colour / point size for the rebuilt card's big number.
+    ``None`` for anything non-numeric or non-positive, so callers can distinguish "declared" from
+    "silent" -- which is the whole basis of :func:`_title_run_size`.
+    """
+    s = str(value or "").strip()
+    if s[-1:] in ("D", "d"):
+        s = s[:-1]
+    try:
+        n = float(s)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _title_default_size(ws):
+    """The point size a title ``<run>`` renders at when it declares no ``fontsize`` of its own.
+
+    Tableau writes ``fontsize`` on a run ONLY when it differs from the title's resolved default. So
+    the run carrying a KPI's HEADLINE NUMBER -- the one the author leaves alone while SHRINKING the
+    caption around it -- carries no ``fontsize`` attribute at all, and any rule that reads the raw
+    attribute sees ``0``. Resolving the default through the same font cascade every other element
+    uses (workbook -> worksheet -> ``worksheet-title`` rule, over Tableau's documented 15pt) is what
+    makes a run's RENDERED size knowable, and therefore comparable.
+    """
+    table = _first(ws, "table") if ws is not None else None
+    style = _first(table, "style") if table is not None else None
+    resolved = _resolve_element_font(style, "worksheet-title") or {}
+    return _points(resolved.get("font_size")) or _WORKSHEET_TITLE_DEFAULT_SIZE
+
+
+def _title_run_size(run, default_size):
+    """One title run's RENDERED point size: its own ``fontsize``, else the title default."""
+    return _points(run.get("fontsize")) or default_size
+
+
+def _run_visible_text(run):
+    """A title run's visible text, with Tableau's layout sentinels removed.
+
+    ``U+00C6`` (soft-return / spacer marker) and ``U+FFFD`` carry no glyph of their own, so a run
+    made only of them is empty for the purpose of "is anything else on this line".
+    """
+    return (run.text or "").replace("\u00c6", "").replace("\ufffd", "").strip()
+
+
+def _detect_kpi_title_cards(ws):
+    """Every KPI headline number a worksheet's title carries -> a list of card specs (may be empty).
+
+    One entry PER TITLE LINE, in document order, each
+    ``{"caption", "ref", "value_color", "value_size", "caption_style"}``. Tableau writes a
+    multi-metric KPI as several lines in ONE title ("Current: <this year>" / "vs Last Year: <delta>"),
+    which no single Power BI card can hold; taking only the first reference silently dropped every
+    metric after it. Splitting on the line breaks the author already wrote keeps each number with the
+    label it belongs to.
+
+    The signature per line: a whole-run dynamic ``<[ds].[Calculation...]>`` reference -- NOT a
+    ``[Parameters]`` reference (a parameter woven into a caption is a different, deferred case) --
+    that reads as a HEADLINE NUMBER rather than as a token inside a sentence, plus the static caption
+    runs on that same line (cleaned of the ``U+FFFD`` replacement char and the hidden white ``_``
+    spacer run). ``value_color`` / ``value_size`` carry the reference run's authored colour and its
+    RENDERED point size; ``caption_style`` the same for its label.
+
+    WHAT MAKES A REFERENCE A HEADLINE. Gating on an explicit ``fontsize >= 18`` missed the entire
+    family, because Tableau omits ``fontsize`` on a run that uses the title's own default: three KPI
+    cards in one workbook came out titled with the SHEET NAME ("Bar Chart", "Sheet 6") and no number
+    anywhere. Sizes are therefore resolved to what each run RENDERS at, and either of two
+    file-grounded signals qualifies a reference:
+
+      * it renders LARGER than every static caption run -- the author shrank the label to make the
+        number the headline ("Days Left In Sales Year" at 12pt over a 15pt number); or
+      * it stands ALONE on its own line -- Tableau's caption-over-number layout, which is a headline
+        even when both lines share one size ("Total Sales" / "2,326,534", both 15pt).
+
+    An inline, no-larger reference ("Sales for <Region>") is a caption with a live token, not a KPI,
+    and is left to the dynamic-title path.
     """
     layout = _first(ws, "layout-options")
     title = _first(layout, "title") if layout is not None else None
     ft = _first(title, "formatted-text") if title is not None else None
     if ft is None:
-        return None
+        return []
     runs = _findall_local(ft, "run")
-    number_run = None
-    number_idx = None
-    for idx, r in enumerate(runs):
-        m = _TITLE_FULL_REF_RE.match((r.text or "").strip())
-        if not m:
-            continue
-        ref = m.group(1)
-        if "[Parameters]" in ref:
-            continue
-        try:
-            size = float(r.get("fontsize") or 0)
-        except (TypeError, ValueError):
-            size = 0.0
-        if size >= _KPI_TITLE_MIN_SIZE:
-            number_run = (r, ref)
-            number_idx = idx
-            break
-    if number_run is None:
-        return None
-    number, ref = number_run
+    default_size = _title_default_size(ws)
 
-    def _caption_text(candidate_runs):
-        parts = []
-        for other in candidate_runs:
-            if other is number:
+    def _is_ref(run):
+        return bool(_TITLE_FULL_REF_RE.match((run.text or "").strip()))
+
+    # A run whose text carries a hard newline is Tableau's line break between title lines. Split the
+    # run list on them so each line's label and number stay together.
+    lines = []
+    current = []
+    for r in runs:
+        current.append(r)
+        if "\n" in (r.text or ""):
+            lines.append(current)
+            current = []
+    if current:
+        lines.append(current)
+
+    caption_size = max(
+        [_title_run_size(r, default_size) for r in runs
+         if _run_visible_text(r) and not _is_ref(r)],
+        default=0.0)
+
+    def _size_literal(pts):
+        return "{0}D".format(int(pts) if pts == int(pts) else pts)
+
+    out = []
+    for line in lines:
+        number = None
+        number_idx = None
+        for idx, r in enumerate(line):
+            m = _TITLE_FULL_REF_RE.match((r.text or "").strip())
+            if not m or "[Parameters]" in m.group(1):
                 continue
-            if (other.get("fontcolor") or "").lower() == "#ffffff":
-                continue  # hidden white ``_`` spacer run
-            parts.append(other.text or "")
-        # Strip Tableau's line-break sentinels (U+FFFD replacement, U+00C6 soft-return marker) and
-        # collapse whitespace; legitimate caption punctuation (``%`` etc.) is preserved.
-        joined = "".join(parts).replace("\ufffd", " ").replace("\u00c6", " ")
-        return re.sub(r"\s+", " ", joined).strip()
+            size = _title_run_size(r, default_size)
+            alone = not any(_run_visible_text(line[j])
+                            for j in range(len(line)) if j != idx)
+            if size >= _KPI_TITLE_MIN_SIZE or size > caption_size or alone:
+                number, number_idx = r, idx
+                break
+        if number is None:
+            continue
+        ref = _TITLE_FULL_REF_RE.match((number.text or "").strip()).group(1)
 
-    # The caption is the label ABOVE the number: the runs that precede it. Everything after the
-    # number run is trailing decoration (a soft-return sentinel + a hidden white spacer). Fall back
-    # to every non-number run only if there is no leading caption text.
-    caption = _caption_text(runs[:number_idx])
-    if not caption:
-        caption = _caption_text(runs)
-    if not caption:
-        return None
-    color = number.get("fontcolor")
-    color = color if (color and _HEX6_RE.match(color)) else None
-    return {"caption": caption, "ref": ref,
-            "value_color": color, "value_size": _font_size_points(number.get("fontsize"))}
+        # The label is the static text BEFORE the number on this line ("Current: "), falling back to
+        # the preceding line when this line is the number alone ("Total Sales" / "2,326,534") -- but
+        # only when that line contributed no card of its own, so a two-metric title never reuses one
+        # label twice.
+        cap_runs = [r for r in line[:number_idx]
+                    if _run_visible_text(r) and (r.get("fontcolor") or "").lower() != "#ffffff"]
+        if not cap_runs and not out:
+            prev = lines[lines.index(line) - 1] if lines.index(line) > 0 else []
+            cap_runs = [r for r in prev
+                        if _run_visible_text(r) and not _is_ref(r)
+                        and (r.get("fontcolor") or "").lower() != "#ffffff"]
+        caption = re.sub(
+            r"\s+", " ",
+            "".join(r.text or "" for r in cap_runs).replace("\ufffd", " ").replace("\u00c6", " ")
+        ).strip()
+        if not caption:
+            continue
+
+        color = number.get("fontcolor")
+        color = color if (color and _HEX6_RE.match(color)) else None
+        # Sizes are the RENDERED ones, not the declared ones. A ``None`` here is not "keep it small"
+        # -- it is "let Power BI choose", and Power BI chooses a ~45pt card callout and its own
+        # container title size, which is how a faithful 300x300 Tableau KPI tile came out as one
+        # oversized number with the caption crowded off the plate. Emitting the size the source
+        # actually renders at is what keeps the rebuilt tile in proportion.
+        cap_size = min([_title_run_size(r, default_size) for r in cap_runs], default=None)
+        cap_colors = {(r.get("fontcolor") or "").lower() for r in cap_runs if r.get("fontcolor")}
+        caption_style = {}
+        if cap_size:
+            caption_style["font_size"] = _size_literal(cap_size)
+        if len(cap_colors) == 1 and _HEX6_RE.match(next(iter(cap_colors))):
+            caption_style["font_color"] = next(iter(cap_colors))
+        if cap_runs and all(r.get("bold") == "true" for r in cap_runs):
+            caption_style["bold"] = True
+        out.append({"caption": caption, "ref": ref, "value_color": color,
+                    "value_size": _size_literal(_title_run_size(number, default_size)),
+                    "caption_style": caption_style or None})
+    return out
+
+
+def _detect_kpi_title_card(ws):
+    """The FIRST KPI headline number in a worksheet's title, or ``None``.
+
+    Thin wrapper over :func:`_detect_kpi_title_cards` for callers that only ever handled one.
+    """
+    cards = _detect_kpi_title_cards(ws)
+    return cards[0] if cards else None
 
 
 # Per-run font attributes on a title's ``<run>`` that Tier-2 title styling reproduces only when it
@@ -2614,7 +2726,7 @@ def _font_size_points(value):
     return "{0}D".format(int(n) if n == int(n) else n)
 
 
-def _parse_title_style(ws):
+def _parse_title_style(ws, static_only=False):
     """Uniform font styling for a worksheet's static title -> a Tier-2 title-style dict.
 
     Reads the per-run font attributes on the title's ``<run>`` elements (the styling that
@@ -2627,6 +2739,13 @@ def _parse_title_style(ws):
     underline / alignment and Tableau-internal font families are always deferred. Returns the style
     dict (with an additive ``deferred`` list of property names seen but not emitted), or ``None``
     when the title carries no font styling at all.
+
+    ``static_only`` drops the whole-run field references from the sample. Once a KPI's headline
+    number has been lifted out into its own card, those runs are no longer part of the caption the
+    container title shows -- and leaving them in is what made the surviving caption defer its size:
+    the number run declares no ``fontsize`` (it uses the title default) while the caption declares
+    one, so ``_uniform`` saw a partial declaration, emitted nothing, and Power BI applied its own
+    much larger default to a 300x300 tile.
     """
     layout = _first(ws, "layout-options")
     title = _first(layout, "title") if layout is not None else None
@@ -2634,7 +2753,13 @@ def _parse_title_style(ws):
     if ft is None:
         return None
     runs = _findall_local(ft, "run")
-    text_runs = [r for r in runs if (r.text or "").strip()]
+    # Tableau's layout sentinels (``Æ`` before a soft return, ``U+FFFD``) carry no glyph, so a run
+    # made only of them is not TEXT -- but it declares no font either, and counting it as a text run
+    # made ``_uniform`` see a partial declaration and defer every property the real runs agreed on.
+    text_runs = [r for r in runs if _run_visible_text(r)]
+    if static_only:
+        text_runs = [r for r in text_runs
+                     if not _TITLE_FULL_REF_RE.match((r.text or "").strip())]
     if not text_runs:
         return None
 
@@ -4285,51 +4410,82 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         if not _plottable:
             caption_only_raw = title_text
     kpi_title_card = None
+    kpi_title_cards = []
     dynamic_title_raw = None
-    if visual_type == VT_UNSUPPORTED:
-        title_text = None
-    elif title_dynamic:
-        kpi = _detect_kpi_title_card(ws)
-        kpi_fields = _resolve_shelf(
-            kpi["ref"], ds_default, base_cols, instances, index, ds_caption, name, warnings,
-            warn_special=False, internal_fields=internal_fields, date_binding=date_binding,
-            row_count_binding=row_count_binding, measure_binding=measure_binding,
-            column_binding=column_binding) if kpi else []
-        kpi_measures = [f for f in kpi_fields
-                        if f.get("binding") == "measure" or f.get("role") == "measure"]
-        if kpi and kpi_measures:
+    # A TITLE-ONLY KPI worksheet (no rows, no cols -- its entire content is the number(s) in its
+    # title) classifies VT_UNSUPPORTED, and the branch below used to skip it outright: the caption
+    # path then dropped it too, because the text still held a field ref. The zone came out EMPTY -- a
+    # whole "Current: 745,568 / vs Last Year: 131,634" tile missing from the dashboard. A title whose
+    # references resolve to real measures is exactly what the card path is for, whether or not the
+    # sheet also draws a mark.
+    #
+    # The gate is EMPTY SHELVES, not ``caption_only_raw``: Tableau blanks such a sheet by dropping an
+    # empty-string calc onto Text, and that Text encoding alone was enough to mark it "plottable" and
+    # withhold the caption. An unsupported sheet WITH shelves is a genuinely deferred visual and must
+    # not be quietly replaced by cards.
+    if title_dynamic and (visual_type != VT_UNSUPPORTED or not (rows or cols)):
+        specs = _detect_kpi_title_cards(ws)
+        for spec in specs:
+            fields = _resolve_shelf(
+                spec["ref"], ds_default, base_cols, instances, index, ds_caption, name, warnings,
+                warn_special=False, internal_fields=internal_fields, date_binding=date_binding,
+                row_count_binding=row_count_binding, measure_binding=measure_binding,
+                column_binding=column_binding)
+            # A STRING measure is a conditional glyph, not a headline number -- Tableau's paired
+            # "Arrow Up" / "Arrow down" calcs return an arrow character or "" so exactly one shows.
+            # A card bound to one would render a lone arrow (or a blank) as if it were the metric.
+            measures = [f for f in fields
+                        if (f.get("binding") == "measure" or f.get("role") == "measure")
+                        and (f.get("datatype") or "") != "string"]
+            if not measures:
+                continue
+            # WHICH measure the card shows is the title's OWN reference -- that is literally what the
+            # title says. The one exception is a VIEW-LEVEL table calc (a quick-table-calc pill, or a
+            # formula built on ``TOTAL`` / ``RUNNING_*`` / ``WINDOW_*`` / ``LAST``): those have no
+            # model measure to bind (they translate to deterministic ``= 0`` stubs that would render a
+            # blank ``0``), and in a card -- which has no axis for a window to run along -- the base
+            # metric's grand total equals the wrapper's final value, so the worksheet's own measure is
+            # the faithful stand-in. That exception is why this branch existed.
+            #
+            # Preferring the worksheet's measure UNCONDITIONALLY was wrong the moment a title named a
+            # DIFFERENT metric: "Days Left In Sales Year", whose number is
+            # ``DATEDIFF('day', TODAY(), {MAX([Order Date])})`` = 145, rebuilt as the sheet's
+            # SUM(Sales) = 2,326,534 -- a real number, in the right place, measuring the wrong thing.
+            ws_measures = meas_rows + meas_cols
+            if _is_view_level_calc(measures[0]):
+                card_measures = (ws_measures or measures)[:1]
+            else:
+                card_measures = measures[:1]
+            kpi_title_cards.append({
+                "caption": spec["caption"], "measure_fields": card_measures,
+                "value_color": spec["value_color"], "value_size": spec["value_size"],
+                "caption_style": spec.get("caption_style")})
+        if kpi_title_cards:
             # KPI title-card: keep the static caption as the title and rebuild the headline number
             # (the big dynamic measure run) as a companion card above the sparkline at emit time.
-            title_text = kpi["caption"]
-            # Bind the card to the worksheet's OWN primary measure (the one the sparkline plots),
-            # NOT the title-embedded reference. A Tableau KPI title number is almost always a
-            # cumulative table-calc wrapper -- ``TOTAL([X])`` / ``IF LAST()=0 THEN RUNNING_SUM([X])
-            # END`` -- around that same base metric; in a card (no time axis) the base measure
-            # aggregates to the grand total, which equals the wrapper's final value, AND the base
-            # measure is a real translated measure whereas the table-calc wrapper is typically a
-            # deterministic stub (``= 0``) that would render a blank ``0``. Fall back to the title
-            # reference only when the worksheet carries no measure of its own on Rows/Cols.
-            ws_measures = meas_rows + meas_cols
-            card_measures = (ws_measures or kpi_measures)[:1]
-            kpi_title_card = {"caption": kpi["caption"], "measure_fields": card_measures,
-                              "value_color": kpi["value_color"], "value_size": kpi["value_size"]}
+            title_text = kpi_title_cards[0]["caption"]
+            kpi_title_card = kpi_title_cards[0]
+            caption_only_raw = None
             warnings.append(_warn(
                 "worksheet", name,
-                "KPI title number (a dynamic measure embedded in the title) rebuilt as a companion "
-                "card above the visual; the static caption is kept as the title"))
-        else:
-            # v2-4 (resolve dynamic captions on a SUPPORTED visual): a dynamic non-KPI title weaves a
-            # live Tableau token -- a parameter ref (``<[Parameters].[id]>``) and/or a federated
-            # field-ref / runtime special. It was historically dropped outright, so a parameter-driven
-            # title like "Sales by <Show by Dimension>" lost its meaning (or, on a text zone, leaked the
-            # raw token). Capture the RAW title and defer resolution to ``parse_twb`` (once parameters
-            # are known): a title that becomes FULLY static after parameter substitution is kept; one
-            # that still carries a field-ref / runtime special is dropped there (stripping it would leave
-            # a dangling label). ``title_text`` stays ``None`` for now so nothing pre-resolution emits.
-            dynamic_title_raw = title_text
-            title_text = None
+                "KPI title number(s) (dynamic measures embedded in the title) rebuilt as companion "
+                "card(s) above the visual; the static captions are kept as their titles"))
+    if visual_type == VT_UNSUPPORTED and not kpi_title_cards:
+        title_text = None
+    elif title_dynamic and not kpi_title_cards:
+        # v2-4 (resolve dynamic captions on a SUPPORTED visual): a dynamic non-KPI title weaves a
+        # live Tableau token -- a parameter ref (``<[Parameters].[id]>``) and/or a federated
+        # field-ref / runtime special. It was historically dropped outright, so a parameter-driven
+        # title like "Sales by <Show by Dimension>" lost its meaning (or, on a text zone, leaked the
+        # raw token). Capture the RAW title and defer resolution to ``parse_twb`` (once parameters
+        # are known): a title that becomes FULLY static after parameter substitution is kept; one
+        # that still carries a field-ref / runtime special is dropped there (stripping it would leave
+        # a dangling label). ``title_text`` stays ``None`` for now so nothing pre-resolution emits.
+        dynamic_title_raw = title_text
+        title_text = None
 
-    title_style = _parse_title_style(ws) if (title_text or dynamic_title_raw) else None
+    title_style = (_parse_title_style(ws, static_only=bool(kpi_title_card))
+                   if (title_text or dynamic_title_raw) else None)
 
     # Font/shading fidelity for any filter cards this worksheet owns: resolve the slicer header
     # (quick-filter-title), items (quick-filter) faces + the card plate from the worksheet's
@@ -4485,6 +4641,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "mark_color": _constant_mark_color(table),
         "sort": sort,
         "kpi_title_card": kpi_title_card,
+        "kpi_title_cards": kpi_title_cards,
     }
 
 
@@ -6753,6 +6910,14 @@ def _emit_kpi_title_card(ws, kpi, x, y, w, h, tab, page_name, page_display,
     projections = _role_projections(kpi["measure_fields"], model_table, field_map, set())
     if not projections:
         return None
+    # TABLEAU'S "AUTOMATIC" NUMBER FORMAT IS NOT POWER BI'S. A Tableau measure that declares no
+    # number format renders under Automatic, which suppresses the decimals on an aggregated value --
+    # 2,326,534.35 is shown as "2,326,534", 745,567.53 as "745,568" (rounded, not truncated). Power
+    # BI, given no format, prints the raw double, so a headline KPI came out as "2,326,534.35" where
+    # the source shows a clean whole number. An AUTHORED format always wins (``_role_projections``
+    # has already put it on the projection); this only fills the silence.
+    for proj in projections:
+        proj.setdefault("format", _TABLEAU_AUTOMATIC_NUMBER_FORMAT)
     state = {"Values": {"projections": projections}}
     pos = _position(x, y, w, h, tab=tab)
     value_props = {}
@@ -6768,14 +6933,106 @@ def _emit_kpi_title_card(ws, kpi, x, y, w, h, tab, page_name, page_display,
         # ``multiRowCard``'s; a ``dataLabels`` on a ``card`` is rejected FORMATTING_OBJECT_UNKNOWN and
         # the colour/size are silently dropped at render). This KPI-title tile is always a ``card``.
         card_label_objects["labels"] = [{"properties": value_props}]
-    vname = _sanitize(f"{vname_base}-kpi")
+    vname = _sanitize(f"{vname_base}-kpi{kpi.get('ordinal') or ''}")
     visual = _visual_json(vname, "card", pos, state, None,
-                          title=kpi["caption"], card_label_objects=card_label_objects)
+                          title=kpi["caption"], title_style=kpi.get("caption_style"),
+                          card_label_objects=card_label_objects)
     rec = _candidate_record(page_name, vname, ws, "card", state, pos,
                             page_display=page_display,
                             model_table=model_table, field_map=field_map)
     rec["kpi_title_card"] = {"caption": kpi["caption"]}
     return visual, rec
+
+
+# Vertical breathing room a Power BI ``card`` adds around its caption + callout, in device pixels.
+# Measured off a rendered 300x300 KPI tile.
+_KPI_CARD_PADDING_PX = 12.0
+# Tableau's "Automatic" number format for an aggregated measure: thousands separators, no decimals.
+# Confirmed against four ground-truth KPI numbers in one workbook (2,326,534.35 -> "2,326,534";
+# 745,567.53 -> "745,568"; 131,633.95 -> "131,634"; 145 -> "145").
+_TABLEAU_AUTOMATIC_NUMBER_FORMAT = "#,0"
+# No KPI text is shrunk below this; past it the number stops being a headline.
+_KPI_MIN_FONT_PT = 7.0
+
+
+def _scaled_font_literal(size_literal, factor, fallback):
+    """A ``'15D'`` font literal scaled by ``factor`` (floored), or ``None`` when there is nothing."""
+    pts = _points(size_literal) or fallback
+    if not pts:
+        return None
+    pts = max(_KPI_MIN_FONT_PT, pts * factor)
+    pts = round(pts, 1)
+    return "{0}D".format(int(pts) if pts == int(pts) else pts)
+
+
+def _emit_kpi_title_cards(ws, x, y, w, h, tab, page_name, page_display,
+                          model_table, field_map, vname_base, flag_fc=None):
+    """Every KPI card a worksheet's title carries, stacked top-down -> ``(visuals, records, used_h)``.
+
+    A Tableau KPI title can name SEVERAL metrics on its own lines ("Current: <this year>" /
+    "vs Last Year: <delta>"); each becomes its own card, sharing the band equally, in title order.
+    ``used_h`` is how much of the zone the cards consumed, so the caller can shrink the worksheet's
+    own sparkline into whatever is left. ``(.., .., 0)`` when nothing resolved -- the caller then
+    leaves the visual captioned as it was.
+    """
+    cards = ws.get("kpi_title_cards") or (
+        [ws["kpi_title_card"]] if ws.get("kpi_title_card") else [])
+    if not cards:
+        return [], [], 0
+    # HOW TALL THE BAND IS, from the text it holds. A fixed 58% of the zone put a 15pt number in the
+    # middle of a half-empty plate and squashed the sparkline into the remainder -- the source draws
+    # the caption and number as two ordinary lines at the TOP and gives everything else to the mark.
+    # So each card is one caption line plus one value line at their AUTHORED point sizes: points ->
+    # pixels is 96/72, and a rendered line box is about 1.25x its point size, hence 1.67 px per
+    # point, plus the card's own padding.
+    def _line_px(size_literal, fallback):
+        return (_points(size_literal) or fallback) * 96.0 / 72.0 * 1.25
+
+    natural = 0
+    for card in cards:
+        cap = (card.get("caption_style") or {}).get("font_size")
+        natural += (_line_px(cap, _WORKSHEET_TITLE_DEFAULT_SIZE)
+                    + _line_px(card.get("value_size"), _WORKSHEET_TITLE_DEFAULT_SIZE)
+                    + _KPI_CARD_PADDING_PX)
+    # A title-only worksheet has no mark to leave room for, so its cards take the whole zone; one
+    # that also draws a mark keeps the band to what the text needs, capped so a tall caption can
+    # never starve the chart.
+    if ws.get("visual_type") == VT_UNSUPPORTED:
+        band = h
+    else:
+        band = int(min(round(natural), round(h * 0.58)))
+    band = max(1, band)
+    each = max(1, band // len(cards))
+    # FIT THE TEXT TO THE BAND THE AUTHOR DREW. Tableau renders "Current: 745,568" as ONE line -- the
+    # label and the number side by side -- so two metrics fit a 67px zone comfortably. A Power BI card
+    # STACKS its container title above its callout, needing roughly half as much again; at the same
+    # 67px the 9pt caption and 15pt number overlapped and the number was clipped. Scaling both by the
+    # same factor keeps the authored 9:15 contrast while fitting the zone, which is the closest a
+    # stacked control gets to the source's inline line.
+    fit = min(1.0, (each * len(cards)) / natural) if natural else 1.0
+    visuals, records, used = [], [], 0
+    for i, card in enumerate(cards):
+        spec = dict(card)
+        spec["ordinal"] = i or ""
+        if fit < 1.0:
+            spec["value_size"] = _scaled_font_literal(
+                card.get("value_size"), fit, _WORKSHEET_TITLE_DEFAULT_SIZE)
+            cap_style = dict(card.get("caption_style") or {})
+            scaled_cap = _scaled_font_literal(
+                cap_style.get("font_size"), fit, _WORKSHEET_TITLE_DEFAULT_SIZE)
+            if scaled_cap:
+                cap_style["font_size"] = scaled_cap
+            spec["caption_style"] = cap_style or None
+        out = _emit_kpi_title_card(
+            ws, spec, x, y + i * each, w, each, tab, page_name, page_display,
+            model_table, field_map, vname_base)
+        if out is None:
+            continue
+        vis, rec = out
+        visuals.append(_inherit_flag_filters([vis], flag_fc)[0] if flag_fc else vis)
+        records.append(rec)
+        used = (i + 1) * each
+    return visuals, records, used
 
 
 def _detect_native_pct_stacked(ws, state, vc_index):
@@ -10539,6 +10796,21 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 continue
             card_ws.append(ws)
             if ws["visual_type"] == VT_UNSUPPORTED:
+                # A TITLE-ONLY KPI worksheet -- no rows, no cols, its entire content is the live
+                # number(s) in its title -- has no mark to draw, but it is not a caption either. The
+                # caption path dropped it outright (the text still holds a field ref), so a whole
+                # "Current: 745,568 / vs Last Year: 131,634" tile came out EMPTY. Emit its cards at
+                # the authored zone; only fall through to the static caption when nothing resolved.
+                if ws.get("kpi_title_cards"):
+                    x, y, w, h = _scale_zone(zone, ref_w, ref_h)
+                    kvis, krecs, _kh = _emit_kpi_title_cards(
+                        ws, x, y, w, h, i, page_name, db["name"] or page_name,
+                        model_table, field_map, _sanitize(f"v-{page_name}-{i}-{ws['name']}"))
+                    if kvis:
+                        visuals.extend(kvis)
+                        records.extend(krecs)
+                        placed.add(ws["name"])
+                        continue
                 # v2-3: a caption-only worksheet (a thin status / refresh / filter-breadcrumb bar
                 # whose only content is its -- often dynamic -- title, no plottable mark) is rebuilt
                 # as a textbox at its authored zone instead of vanishing, so the dashboard band is
@@ -10670,15 +10942,13 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 # KPI title-card: rebuild the title-embedded headline number as a companion card in
                 # the top band of the zone and shrink the sparkline into the band below it. The card
                 # carries the caption, so the sparkline drops its (duplicate) title.
-                card_h = int(round(h * 0.58))
-                card_out = _emit_kpi_title_card(
-                    ws, kpi_card, x, y, w, card_h, i, page_name, db["name"] or page_name,
-                    model_table, field_map, vname)
-                if card_out is not None:
-                    card_vis, card_rec = card_out
-                    visuals.append(_inherit_flag_filters([card_vis], flag_fc)[0])
-                    records.append(card_rec)
-                    pos = _position(x, y + card_h, w, h - card_h, tab=i)
+                card_vis, card_recs, card_h = _emit_kpi_title_cards(
+                    ws, x, y, w, h, i, page_name, db["name"] or page_name,
+                    model_table, field_map, vname, flag_fc=flag_fc)
+                if card_vis:
+                    visuals.extend(card_vis)
+                    records.extend(card_recs)
+                    pos = _position(x, y + card_h, w, max(1, h - card_h), tab=i)
                     # Drop the sparkline's caption AND say so explicitly: leaving the title object
                     # off would let Power BI auto-generate a field-name one under the card.
                     spark_title, show_title = None, False
@@ -10921,15 +11191,13 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         kpi_card = ws.get("kpi_title_card")
         if kpi_card:
             # KPI title-card on a standalone page: card (top band) + sparkline (below).
-            card_h = int(round(620 * 0.58))
-            card_out = _emit_kpi_title_card(
-                ws, kpi_card, 40, 40, 880, card_h, 0, page_name, ws["name"],
-                model_table, field_map, vname)
-            if card_out is not None:
-                card_vis, card_rec = card_out
-                visuals.append(_inherit_flag_filters([card_vis], flag_fc)[0])
-                records.append(card_rec)
-                pos = _position(40, 40 + card_h, 880, 620 - card_h)
+            card_vis, card_recs, card_h = _emit_kpi_title_cards(
+                ws, 40, 40, 880, 620, 0, page_name, ws["name"],
+                model_table, field_map, vname, flag_fc=flag_fc)
+            if card_vis:
+                visuals.extend(card_vis)
+                records.extend(card_recs)
+                pos = _position(40, 40 + card_h, 880, max(1, 620 - card_h))
                 spark_title, show_title = None, False
         sort_def = _sort_definition(ws, state, model_table, field_map)
         main = _visual_json(
