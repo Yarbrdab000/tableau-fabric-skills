@@ -14,6 +14,36 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **tableau-migration (skill `2.103.0` -> `2.104.0`): a dashboard's stored zone rects ARE the layout
+  Tableau resolved, and a KPI's trend arrow is part of its line.**
+  - **Zone geometry.** `fixed-size` is an INPUT to Tableau's layout engine; `x/y/w/h` are its
+    OUTPUT. The solver treated every `is-fixed` child's rect as merely "nominal" and re-flowed the
+    container from the pin. Measured on a real 1000x800 dashboard whose four top-strip columns are
+    stored at x = 800 / 25400 / 50000 / 74600, each w = 24600 (8 / 254 / 500 / 746 px, each 246
+    wide): pixel-measuring Tableau's own render puts the column gutters at 254 / 493 / 740 and the
+    map's top rule at 174 — the stored rects are exactly what Tableau drew. The pins read
+    166 / 264 / 239, which re-flowed the strip to 166 / 264 / 239 / 291 at 8 / 182 / 454 / 701:
+    every column the wrong width, three of the four in the wrong place. The rebuild now lands at
+    8 / 256 / 504 / 752.
+  - **The pin premise still holds where it was earned.** A pin is kept when it describes an
+    INTRINSIC control size (a filter or parameter card, a legend, a text block, an image — things
+    that need N pixels to be usable at any dashboard size), and when it simply RESTATES the stored
+    rect's own proportion (releasing it there would trade a squeeze-proof ratio for a min-clamped
+    approximation of the same answer). It is discarded only for content — a worksheet or a nested
+    container — whose siblings already tile the container and whose pin contradicts that tiling.
+  - **The trend arrow.** Tableau writes a delta KPI as "vs Last Year: `<number>` `<Arrow Up>`
+    `<Arrow down>`", where the paired calcs return a glyph or `""` so exactly one shows. They are
+    STRING measures, so they were excluded from the card binding — and thereby dropped entirely,
+    silently removing the up/down indicator the KPI exists to show. They are now rebuilt as narrow,
+    title-less tiles beside the number, in their authored colour. A numeric format string is no
+    longer applied to a string measure.
+  - Tableau's `mark-transparency` is an ALPHA BYTE (0..255), not the 0..100 percentage its UI shows
+    — confirmed against two renders (stems written `70` draw at 27% opacity; an area fill written
+    `91` at 36%; `255` is opaque). It was ignored entirely, so every translucent Tableau mark came
+    back at full strength. It now maps to `dataPoint.transparency`.
+
+### Fixed
+
 - **tableau-migration (skill `2.102.0` -> `2.103.0`): a horizontal dual axis is still a dual axis,
   and its member names survive.** Tableau names a pane's measure axis after the shelf the measures
   sit on — `y-axis-name` / `y-index` for Rows (a vertical chart), `x-axis-name` / `x-index` for Cols

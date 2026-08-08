@@ -206,6 +206,82 @@ def _compute_fracs(kind, node):
     return True
 
 
+# How much of a flow container's main axis its CONTENT children must cover before their stored rects
+# are accepted as the resolved layout. Below this they are leaving room for something the tree does
+# not model, so the fixed-size re-flow stays in charge.
+_TILE_COVERAGE = 0.92
+# How far a pin's share of the pinned set may drift from its rect's share before the two are read as
+# contradicting each other. A pin that merely restates the rect is left alone.
+_PIN_AGREEMENT = 0.02
+
+
+def _pin_is_intrinsic(child):
+    """True when this child's ``fixed-size`` pin describes an INTRINSIC control size.
+
+    Tableau pins a *control* -- a filter or parameter card, a legend, a text block, an image --
+    because the control needs N pixels to be usable whatever the dashboard size, and its stored rect
+    really is nominal. It does not pin a WORKSHEET's proportion, nor a nested layout container's:
+    for those the stored rect is the layout Tableau itself resolved.
+    """
+    if child["kind"] != K_LEAF:
+        return False
+    return child.get("leaf_kind") != "worksheet"
+
+
+def _drop_nominal_fixed(kind, node):
+    """Discard ``fixed_px`` on CONTENT children whose own rects already are the resolved layout.
+
+    ``fixed-size`` is an INPUT to Tableau's layout engine; ``x/y/w/h`` are its OUTPUT. The premise
+    that a fixed-size child's stored rect is merely "nominal" holds for a pinned CONTROL, whose size
+    is intrinsic -- and not for a worksheet or a nested container, where preferring the hint throws
+    away the exact answer.
+
+    Measured on a real 1000x800 dashboard whose four top-strip columns are stored at
+    x = 800 / 25400 / 50000 / 74600, each w = 24600 (8 / 254 / 500 / 746 px, each 246 wide -- a
+    gapless, perfectly disjoint tiling). Pixel-measuring Tableau's own render of that dashboard puts
+    the column gutters at 254 / 493 / 740 and the map's top rule at 174: the stored rects ARE what
+    Tableau drew. Their ``fixed-size`` hints read 166 / 264 / 239, which re-flowed the strip to
+    166 / 264 / 239 / 291 at 8 / 182 / 454 / 701 -- every column the wrong width, three of the four
+    in the wrong place.
+
+    So: when a flow container's children tile it along the main axis -- pairwise disjoint and
+    together spanning it within tolerance -- the CONTENT children's rects are the resolved layout and
+    the fractions computed from them drive allocation. A pinned control keeps its pixels; anything
+    that does not tile keeps the fixed-size re-flow that repairs the genuinely nominal case.
+    """
+    if kind not in (K_VSTACK, K_HSTACK):
+        return
+    kids = [c for c in node["children"] if not c["floating"] and _rect_ok(c["src"])]
+    if len(kids) < 2:
+        return
+    releasable = [c for c in kids
+                  if c["fixed_px"] is not None and not _pin_is_intrinsic(c)]
+    if not releasable:
+        return
+    pos, size = ("y", "h") if kind == K_VSTACK else ("x", "w")
+    main = node["src"].get(size) or 0
+    if main <= 0:
+        return
+    # A pin that AGREES with the stored rect is not in conflict with it -- releasing it would only
+    # trade the pin's squeeze-proof ratio for a min-clamped approximation of the same answer. Only a
+    # pin that CONTRADICTS the resolved geometry is discarded.
+    pin_total = sum(c["fixed_px"] for c in releasable)
+    rect_total = sum(c["src"][size] for c in releasable)
+    if pin_total > 0 and rect_total > 0 and all(
+            abs(c["fixed_px"] / pin_total - c["src"][size] / rect_total) <= _PIN_AGREEMENT
+            for c in releasable):
+        return
+    spans = sorted((c["src"][pos], c["src"][pos] + c["src"][size]) for c in kids)
+    for (_a0, a1), (b0, _b1) in zip(spans, spans[1:]):
+        if b0 < a1 - _TOL:                      # they overlap -> genuinely nominal rects
+            return
+    covered = sum(hi - lo for lo, hi in spans)
+    if covered < main * _TILE_COVERAGE:
+        return
+    for c in releasable:
+        c["fixed_px"] = None
+
+
 def _extent(roots, device_zones):
     ew = eh = 0.0
     seen = roots[0].iter() if len(roots) == 1 else _iter_many(roots)
@@ -250,6 +326,8 @@ def _build(zone, depth, device_zones, floats, diagnostics, state):
     if not _compute_fracs(kind, node):
         diagnostics.append("flow container id=%s has a zero-sized main axis" % zone.get("id"))
         state["ok"] = False
+
+    _drop_nominal_fixed(kind, node)
 
     for a, b, ox, oy in _flow_overlaps(kind, node["children"]):
         diagnostics.append(

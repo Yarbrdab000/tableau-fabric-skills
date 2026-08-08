@@ -2841,9 +2841,25 @@ def _detect_kpi_title_cards(ws):
             caption_style["font_color"] = next(iter(cap_colors))
         if cap_runs and all(r.get("bold") == "true" for r in cap_runs):
             caption_style["bold"] = True
+        # THE TREND ARROW IS PART OF THE LINE. Tableau writes a delta KPI as
+        # "vs Last Year: <number> <Arrow Up><Arrow down>", where the two arrow calcs return a glyph
+        # or "" so exactly one shows. They are measures, but STRING ones -- a card bound to one
+        # would print a lone arrow as if it were the metric -- so they are carried here as trailing
+        # GLYPH references, rebuilt beside the number rather than in place of it. Dropping them (the
+        # previous behaviour) silently removed the up/down indicator the KPI exists to show.
+        glyphs = []
+        for r in line[number_idx + 1:]:
+            m = _TITLE_FULL_REF_RE.match((r.text or "").strip())
+            if not m or "[Parameters]" in m.group(1):
+                continue
+            gcolor = r.get("fontcolor")
+            glyphs.append({"ref": m.group(1),
+                           "color": gcolor if (gcolor and _HEX6_RE.match(gcolor)) else None,
+                           "size": _size_literal(_title_run_size(r, default_size))})
         out.append({"caption": caption, "ref": ref, "value_color": color,
                     "value_size": _size_literal(_title_run_size(number, default_size)),
-                    "caption_style": caption_style or None})
+                    "caption_style": caption_style or None,
+                    "glyphs": glyphs})
     return out
 
 
@@ -4644,10 +4660,25 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                 card_measures = (ws_measures or measures)[:1]
             else:
                 card_measures = measures[:1]
+            # The trailing GLYPH references on this line (Tableau's paired up/down arrow calcs) are
+            # resolved to their own measures and carried alongside, to be drawn beside the number.
+            glyph_specs = []
+            for g in spec.get("glyphs") or []:
+                gfields = _resolve_shelf(
+                    g["ref"], ds_default, base_cols, instances, index, ds_caption, name, warnings,
+                    warn_special=False, internal_fields=internal_fields, date_binding=date_binding,
+                    row_count_binding=row_count_binding, measure_binding=measure_binding,
+                    column_binding=column_binding)
+                gmeas = [f for f in gfields
+                         if f.get("binding") == "measure" or f.get("role") == "measure"]
+                if gmeas:
+                    glyph_specs.append({"measure_fields": gmeas[:1],
+                                        "color": g.get("color"), "size": g.get("size")})
             kpi_title_cards.append({
                 "caption": spec["caption"], "measure_fields": card_measures,
                 "value_color": spec["value_color"], "value_size": spec["value_size"],
-                "caption_style": spec.get("caption_style")})
+                "caption_style": spec.get("caption_style"),
+                "glyphs": glyph_specs})
         if kpi_title_cards:
             # KPI title-card: keep the static caption as the title and rebuild the headline number
             # (the big dynamic measure run) as a companion card above the sparkline at emit time.
@@ -4834,6 +4865,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         # orange (#f28e2b), three green (#59a14f) and three cyan (#00bceb) charts ALL came out blue.
         # It is the single most visible whole-dashboard defect after the page background.
         "mark_color": _constant_mark_color(table),
+        "mark_transparency": _mark_transparency_pct(table),
         "sort": sort,
         "kpi_title_card": kpi_title_card,
         "kpi_title_cards": kpi_title_cards,
@@ -7109,10 +7141,13 @@ def _emit_kpi_title_card(ws, kpi, x, y, w, h, tab, page_name, page_display,
     # number format renders under Automatic, which suppresses the decimals on an aggregated value --
     # 2,326,534.35 is shown as "2,326,534", 745,567.53 as "745,568" (rounded, not truncated). Power
     # BI, given no format, prints the raw double, so a headline KPI came out as "2,326,534.35" where
-    # the source shows a clean whole number. An AUTHORED format always wins (``_role_projections``
-    # has already put it on the projection); this only fills the silence.
-    for proj in projections:
-        proj.setdefault("format", _TABLEAU_AUTOMATIC_NUMBER_FORMAT)
+    # An AUTHORED format always wins (``_role_projections`` has already put it on the projection);
+    # this only fills the silence -- and only for a NUMBER. A trend-arrow tile is bound to a STRING
+    # measure, where a numeric format string has nothing to format.
+    _numeric = all((f.get("datatype") or "") != "string" for f in kpi["measure_fields"])
+    if _numeric:
+        for proj in projections:
+            proj.setdefault("format", _TABLEAU_AUTOMATIC_NUMBER_FORMAT)
     state = {"Values": {"projections": projections}}
     pos = _position(x, y, w, h, tab=tab)
     value_props = {}
@@ -7131,6 +7166,7 @@ def _emit_kpi_title_card(ws, kpi, x, y, w, h, tab, page_name, page_display,
     vname = _sanitize(f"{vname_base}-kpi{kpi.get('ordinal') or ''}")
     visual = _visual_json(vname, "card", pos, state, None,
                           title=kpi["caption"], title_style=kpi.get("caption_style"),
+                          show_title=bool(kpi["caption"]),
                           card_label_objects=card_label_objects)
     rec = _candidate_record(page_name, vname, ws, "card", state, pos,
                             page_display=page_display,
@@ -7148,6 +7184,9 @@ _KPI_CARD_PADDING_PX = 12.0
 _TABLEAU_AUTOMATIC_NUMBER_FORMAT = "#,0"
 # No KPI text is shrunk below this; past it the number stops being a headline.
 _KPI_MIN_FONT_PT = 7.0
+# Width of a trend-arrow tile beside a KPI number, in device pixels. One glyph, so it only needs to
+# clear the character plus the card's own padding.
+_KPI_GLYPH_WIDTH_PX = 26
 
 
 def _scaled_font_literal(size_literal, factor, fallback):
@@ -7218,14 +7257,37 @@ def _emit_kpi_title_cards(ws, x, y, w, h, tab, page_name, page_display,
             if scaled_cap:
                 cap_style["font_size"] = scaled_cap
             spec["caption_style"] = cap_style or None
+        # The trend arrow sits to the RIGHT of the number on the same line, as Tableau draws it.
+        # Each glyph measure gets its own narrow, title-less card; exactly one is ever non-empty
+        # (the paired calcs return a glyph or ""), so the reader sees a single arrow.
+        glyphs = [g for g in (card.get("glyphs") or []) if g.get("measure_fields")]
+        num_w = w - len(glyphs) * _KPI_GLYPH_WIDTH_PX if glyphs else w
+        if num_w < _KPI_GLYPH_WIDTH_PX:
+            glyphs, num_w = [], w
         out = _emit_kpi_title_card(
-            ws, spec, x, y + i * each, w, each, tab, page_name, page_display,
+            ws, spec, x, y + i * each, num_w, each, tab, page_name, page_display,
             model_table, field_map, vname_base)
         if out is None:
             continue
         vis, rec = out
         visuals.append(_inherit_flag_filters([vis], flag_fc)[0] if flag_fc else vis)
         records.append(rec)
+        for gi, g in enumerate(glyphs):
+            gspec = {"caption": None, "measure_fields": g["measure_fields"],
+                     "value_color": g.get("color"),
+                     "value_size": (_scaled_font_literal(g.get("size"), fit,
+                                                        _WORKSHEET_TITLE_DEFAULT_SIZE)
+                                    if fit < 1.0 else g.get("size")),
+                     "ordinal": "%s-g%d" % (i or "", gi)}
+            gout = _emit_kpi_title_card(
+                ws, gspec, x + num_w + gi * _KPI_GLYPH_WIDTH_PX, y + i * each,
+                _KPI_GLYPH_WIDTH_PX, each, tab, page_name, page_display,
+                model_table, field_map, vname_base)
+            if gout is None:
+                continue
+            gvis, grec = gout
+            visuals.append(_inherit_flag_filters([gvis], flag_fc)[0] if flag_fc else gvis)
+            records.append(grec)
         used = (i + 1) * each
     return visuals, records, used
 
@@ -8446,6 +8508,49 @@ def _apply_formula_table_calc_chain(ws, state, chain_index, model_table, field_m
 _DATAPOINT_COLOR_TYPES = (VT_COLUMN, VT_BAR, VT_PIE, VT_DONUT, VT_LINE, VT_AREA, VT_COMBO)
 
 
+def _mark_transparency_pct(table):
+    """A worksheet's mark opacity as a Power BI ``transparency`` percent (0 = opaque), or ``None``.
+
+    ``<format attr='mark-transparency' value='N'/>`` is an ALPHA BYTE (0..255), not the 0..100
+    percentage Tableau's UI shows -- confirmed against two renders: stems written ``70`` draw as a
+    very pale green (70/255 = 27% opacity) and an area fill written ``91`` draws as pale pink
+    (36%), while ``255`` is fully opaque. Reading it as a percentage would have made a 27%-opacity
+    mark 70% opaque; ignoring it entirely (what happened) painted every translucent Tableau mark at
+    full strength, which is why pale fills came back as flat blocks of colour.
+
+    An axis pane outranks the leading all-panes pane for the same reason the colour does (see
+    :func:`_constant_mark_color`): once per-axis panes exist, they are what draws. A fully opaque
+    mark returns ``None`` so nothing is emitted.
+    """
+    if table is None:
+        return None
+    def _values(scope):
+        out = []
+        for el in scope.iter():
+            if _local(el.tag) != "format" or (el.get("attr") or "") != "mark-transparency":
+                continue
+            try:
+                n = float(el.get("value"))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= n <= 255:
+                out.append(n)
+        return out
+
+    panes_el = _first(table, "panes")
+    axis_vals = []
+    for pane in (_children_local(panes_el, "pane") if panes_el is not None else []):
+        if any(_attr_local(pane, a) not in (None, "")
+               for a in ("x-axis-name", "y-axis-name", "x-index", "y-index")):
+            axis_vals.extend(_values(pane))
+    vals = axis_vals or _values(table)
+    if not vals:
+        return None
+    alpha = max(vals)
+    pct = int(round((1.0 - alpha / 255.0) * 100))
+    return pct if pct > 0 else None
+
+
 def _constant_mark_color_objects(ws, pbir_vtype=None):
     """The worksheet's flat mark colour as PBIR format objects, keyed by object name, or ``None``.
 
@@ -8465,7 +8570,11 @@ def _constant_mark_color_objects(ws, pbir_vtype=None):
     if not color:
         return None
     lit = {"solid": {"color": {"expr": {"Literal": {"Value": f"'{color}'"}}}}}
-    objs = {"dataPoint": [{"properties": {"defaultColor": lit}}]}
+    props = {"defaultColor": lit}
+    tpct = ws.get("mark_transparency")
+    if tpct:
+        props["transparency"] = {"expr": {"Literal": {"Value": "%dD" % tpct}}}
+    objs = {"dataPoint": [{"properties": props}]}
     if pbir_vtype in _STROKE_COLOR_VTYPES:
         objs["lineStyles"] = [{"properties": {
             "strokeColor": lit,
