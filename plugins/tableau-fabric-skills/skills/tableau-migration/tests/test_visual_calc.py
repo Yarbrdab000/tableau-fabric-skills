@@ -770,13 +770,13 @@ _MATRIX_DEPS = """
             <column-instance column='[Sales]' derivation='Sum' name='[sum:Sales:qk]' pivot='key' type='quantitative' />"""
 
 
-def _matrix_workbook(ws_name, encodings):
+def _matrix_workbook(ws_name, encodings, deps=None):
     ws = f"""
     <worksheet name='{ws_name}'>
       <table>
         <view>
           <datasources><datasource caption='S' name='federated.abc' /></datasources>
-          <datasource-dependencies datasource='federated.abc'>{_MATRIX_DEPS}</datasource-dependencies>
+          <datasource-dependencies datasource='federated.abc'>{deps or _MATRIX_DEPS}</datasource-dependencies>
         </view>
         <panes><pane><mark class='Text' />{encodings}</pane></panes>
         <rows>[federated.abc].[none:Segment:nk]</rows>
@@ -796,14 +796,32 @@ def _values_projections(parts):
 
 
 def test_emit_pbir_projects_visual_calculation_for_a_quick_calc_worksheet():
-    # The quick-calc token does not survive onto the resolved value pill; the wiring correlates the
-    # recovered usage to the worksheet by NAME. So a plain aggregate base + a quick usage for the same
-    # worksheet is exactly the real pipeline's shape.
-    wb = _matrix_workbook("Running Total",
-                          "<encodings><text column='[federated.abc].[sum:Sales:qk]' /></encodings>")
+    # A QUICK TABLE CALC CARRIES ITS TOKEN ONTO THE PILL IT TRANSFORMS. This test used to assert the
+    # opposite -- "the quick-calc token does not survive onto the resolved value pill", so a plain
+    # ``sum:Sales:qk`` base plus any usage for the same worksheet was treated as the real shape. Three
+    # real worksheets across two workbooks disprove it: "Running total with stacked bar chart" plots
+    # ``[cum:sum:Sales:qk]``, "running total with end point dot" plots ``([cum:sum:Sales:qk] + ...)``,
+    # and "Bar with Moving Average" plots ``[win:sum:Sales:qk]`` -- the transformed instance is what
+    # sits on the shelf, and ``_resolve_field`` keeps it as the field's ``instance``.
+    #
+    # Correlating by worksheet NAME alone let a calc parked on Detail hijack the axis: a sparkline
+    # whose Rows shelf holds the RAW ``sum:Sales`` (its ``cum:sum:Sales`` on an ``<lod>`` encoding,
+    # drawing nothing) was rebuilt with RUNNINGSUM and rendered a smooth cumulative ramp where the
+    # source draws a jagged monthly series. So the fixture now plots the calc's OWN pill, which is
+    # what Tableau writes.
+    deps = _MATRIX_DEPS + (
+        "\n            <column-instance column='[Sales]' derivation='Sum'"
+        " name='[cum:sum:Sales:qk]' pivot='key' type='quantitative'>"
+        "<table-calc aggregation='Sum' ordering-type='Rows' type='CumTotal' />"
+        "</column-instance>")
+    wb = _matrix_workbook(
+        "Running Total",
+        "<encodings><text column='[federated.abc].[cum:sum:Sales:qk]' /></encodings>",
+        deps=deps)
     ir = parse_twb(wb)
     assert ir["worksheets"][0]["visual_type"] == "matrix"
-    usage = _usage(worksheet="Running Total", calc_type="CumTotal", level_break=None,
+    usage = _usage(worksheet="Running Total", instance="cum:sum:Sales:qk", column="Sales",
+                   caption="Sales", calc_type="CumTotal", level_break=None,
                    rows=[_pill("Segment", "None")], cols=[_pill("Order Date", "Year")])
 
     parts = emit_pbir(ir, table_calc_usages=[usage])

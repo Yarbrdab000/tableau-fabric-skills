@@ -14,6 +14,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **tableau-migration (skill `2.99.0` -> `2.100.0`): a table calc transforms the pill it sits on,
+  not the first one the sheet happens to declare.** `datasource-dependencies` lists every table-calc
+  instance a worksheet DECLARES, which is not the same as every one it PLOTS — Tableau parks a pill
+  on Detail (an `<lod>` encoding, drawing nothing) in that same list alongside the pills on Rows and
+  Cols. Taking `usages[0]` unconditionally let a parked calc hijack the axis.
+  - **Measured.** A sparkline whose Rows shelf holds the RAW `sum:Sales`, with `cum:sum:Sales` parked
+    on Detail, was rebuilt with `RUNNINGSUM` over its Y measure: it rendered a smooth cumulative ramp
+    where the source draws a jagged monthly series — the wrong shape and the wrong numbers.
+  - **The binding.** A quick table calc DOES carry its token onto the pill it transforms
+    (`[cum:sum:Sales:qk]`, `[win:sum:Sales:qk]` — confirmed on three real worksheets across two
+    workbooks), and `_resolve_field` keeps it as the field's `instance`. The calc applied is now the
+    one whose instance IS the shown pill.
+  - **Fail-open where the file is silent.** A base pill that is itself a table calc keeps the first
+    usage (instances can legitimately differ across encodings); a base pill recording no instance at
+    all keeps the long-standing behaviour rather than lose a real calc. Only a PLAIN measure pill —
+    which has no calc of its own — is now left exactly as the author plotted it.
+  - `test_emit_pbir_projects_visual_calculation_for_a_quick_calc_worksheet` asserted the opposite
+    premise ("the quick-calc token does not survive onto the resolved value pill"); it now plots the
+    calc's own pill, with the disproving evidence recorded in the test.
+
+### Fixed
+
 - **tableau-migration (skill `2.98.0` -> `2.99.0`): a second measure axis is a second SCALE, and a
   line overlaid with an area is a filled line.** Tableau spells "another measure axis in the same
   pane" TWO ways and only one was being read, so a whole family of dual-axis sheets was

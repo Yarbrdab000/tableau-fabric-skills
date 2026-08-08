@@ -3054,6 +3054,20 @@ def _instance_is_table_calc(instance):
     return seg in _TABLE_CALC_CODES
 
 
+def _is_view_level_calc(field):
+    """True when a resolved field is a VIEW-level table calc rather than a model measure.
+
+    Two independent spellings: a quick-table-calc pill (the instance token's leading code), and a
+    hand-written formula whose head is a table-calc function (``TOTAL`` / ``RUNNING_*`` /
+    ``WINDOW_*`` / ``LOOKUP`` / ``FIRST`` / ``LAST`` / ``INDEX`` / ``RANK*`` / ``SCRIPT_*``). Both
+    compute over the VIEW's own partition, so neither survives as a standalone model measure -- they
+    translate to inert stubs. An ordinary aggregate or LOD (``{SUM([Sales])}``,
+    ``DATEDIFF('day', TODAY(), {MAX([Order Date])})``) is NOT one of these and binds directly.
+    """
+    return bool(_instance_is_table_calc(field.get("instance"))
+                or _table_calc_filter_idioms(field.get("formula")))
+
+
 # A continuous (heat) colour scale lives at
 # ``worksheet/table/style/style-rule[@element='mark']/encoding[@attr='color']`` with an inner
 # ``<color-palette>`` and either an interpolated encoding ``type`` (``custom-interpolated`` /
@@ -7575,8 +7589,6 @@ def _apply_visual_calcs(ws, state, vc_index, model_table, field_map, warnings):
     if not values:
         return None, None
 
-    usage = usages[0]
-
     if is_chart:
         # A chart's category axis is the "rows" of its result matrix, so any chart Visual Calculation
         # runs along ROWS regardless of the Tableau ordering token; the calc is always the shown value.
@@ -7593,6 +7605,31 @@ def _apply_visual_calcs(ws, state, vc_index, model_table, field_map, warnings):
         # The base measure the calc runs over is the displayed value pill (label / text / colour).
         base_field = (ws["encodings"].get("label") or ws["encodings"].get("text")
                       or ws["encodings"].get("color"))
+
+    # A TABLE CALC BELONGS TO ITS OWN PILL. ``usages`` is every table-calc instance the worksheet
+    # DECLARES, which is not the same as every one it PLOTS -- Tableau keeps a pill parked on Detail
+    # (an ``<lod>`` encoding) in the very same dependency list as the pills on Rows and Cols. Taking
+    # ``usages[0]`` unconditionally let a parked calc hijack the axis: a sparkline whose Rows shelf
+    # holds the RAW ``sum:Sales`` (and whose ``cum:sum:Sales`` sits on Detail, drawing nothing) was
+    # rebuilt with ``RUNNINGSUM`` over its Y measure and rendered as a smooth cumulative ramp where
+    # the source draws a jagged monthly series -- the wrong shape AND the wrong numbers.
+    #
+    # A quick table calc DOES carry its token onto the pill it transforms: "Running total with
+    # stacked bar chart" plots ``[cum:sum:Sales:qk]``, "running total with end point dot" plots
+    # ``([cum:sum:Sales:qk] + ...)``, "Bar with Moving Average" plots ``[win:sum:Sales:qk]``, and
+    # ``_resolve_field`` keeps that token as the field's ``instance``.
+    #
+    # So the calc that transforms the shown value is the one whose instance IS the shown pill. When
+    # none matches, a base pill that is itself a table calc keeps the first usage (the instances can
+    # legitimately differ across encodings); a base pill that is a PLAIN measure has no calc of its
+    # own and is left exactly as the author plotted it. A base pill that records NO instance says
+    # nothing either way, so it keeps the long-standing behaviour rather than lose a real calc.
+    _base_inst = (base_field or {}).get("instance") if isinstance(base_field, dict) else None
+    usage = next((u for u in usages if getattr(u, "instance", None) == _base_inst), None)
+    if usage is None:
+        if _base_inst and not _instance_is_table_calc(_base_inst):
+            return None, None
+        usage = usages[0]
 
     # Yield to the model measure path when the base pill was rebound to a real model measure (precedence).
     if not base_field or base_field.get("kind") != "value":
