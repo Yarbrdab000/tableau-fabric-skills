@@ -1437,22 +1437,22 @@ def _split_token_attr(value):
 _BRACKET_TOKEN_RE = re.compile(r"\[([^\]]+)\]")
 
 
-def _pane_mark_map(table):
+def _pane_mark_map(table, measure_axis=None):
     """Index a worksheet's per-axis marks for dual-axis / combo detection.
 
     A dual-axis worksheet serialises one ``<pane>`` per measure axis. Each non-primary pane
-    carries ``y-axis-name`` (the measure field ref, whose last bracketed token is the column
-    instance, e.g. ``sum:Sales:qk``) and its own ``<mark class>``. Returns
+    carries the measure field ref of its axis (whose last bracketed token is the column instance,
+    e.g. ``sum:Sales:qk``) and its own ``<mark class>``. Returns
     ``(mark_by_instance, primary_mark, has_secondary_axis)`` where ``mark_by_instance`` maps a
     measure instance token to that axis's mark class.
 
     TWO spellings mean "a second measure axis in the SAME pane rectangle", and reading only the
     first misclassified a whole family of sheets:
 
-    * ``y-index`` >= 1 -- how Tableau distinguishes two axes over the SAME measure (a line + its
+    * an axis INDEX >= 1 -- how Tableau distinguishes two axes over the SAME measure (a line + its
       area fill, a lollipop's stick + head): the name alone cannot tell them apart, so it numbers
       them;
-    * TWO OR MORE DISTINCT ``y-axis-name`` values -- how it spells two axes over DIFFERENT measures
+    * TWO OR MORE DISTINCT axis NAMES -- how it spells two axes over DIFFERENT measures
       (e.g. ``SUM(Sales)`` and ``AVG(Sales)``), where the names already disambiguate so no index is
       written.
 
@@ -1460,6 +1460,14 @@ def _pane_mark_map(table):
     was rebuilt as a measure TRELLIS -- separate panes -- when the source draws both series overlaid
     in one plot area. Confirmed by pixel-measuring the Tableau render: both series span the full
     plot height from a shared baseline, so there is one pane, not two.
+
+    ORIENTATION. Tableau names the measure axis after the shelf the measures sit on: ``y-axis-name``
+    / ``y-index`` when they are on Rows (a vertical chart), ``x-axis-name`` / ``x-index`` when they
+    are on Cols (a HORIZONTAL one). Reading only ``y`` meant a horizontal dual axis was invisible --
+    a horizontal lollipop, whose stick and head both live on Cols, came back as an ordinary bar
+    chart in the wrong colour. ``measure_axis`` is ``"x"`` or ``"y"``; ``None`` keeps the historical
+    y-only read, which is also the right answer when measures sit on BOTH shelves (a scatter, where
+    each axis is its own measure and neither is a second axis over the other).
     """
     mark_by_instance = {}
     primary_mark = None
@@ -1467,15 +1475,18 @@ def _pane_mark_map(table):
     panes_el = _first(table, "panes")
     if panes_el is None:
         return mark_by_instance, primary_mark, has_secondary_axis
+    axis = measure_axis if measure_axis in ("x", "y") else "y"
+    name_attr = "{0}-axis-name".format(axis)
+    index_attr = "{0}-index".format(axis)
     for pane in _children_local(panes_el, "pane"):
         mk_el = _first(pane, "mark")
         mk = mk_el.get("class") if mk_el is not None else None
-        y_index = _attr_local(pane, "y-index")
-        if y_index not in (None, "", "0"):
+        idx = _attr_local(pane, index_attr)
+        if idx not in (None, "", "0"):
             has_secondary_axis = True
-        y_axis = _attr_local(pane, "y-axis-name")
-        if y_axis:
-            toks = _BRACKET_TOKEN_RE.findall(y_axis)
+        axis_name = _attr_local(pane, name_attr)
+        if axis_name:
+            toks = _BRACKET_TOKEN_RE.findall(axis_name)
             if toks:
                 mark_by_instance[toks[-1]] = mk
         elif primary_mark is None and mk:
@@ -1483,6 +1494,19 @@ def _pane_mark_map(table):
     if len(mark_by_instance) > 1:
         has_secondary_axis = True
     return mark_by_instance, primary_mark, has_secondary_axis
+
+
+def _measure_shelf_axis(meas_rows, meas_cols):
+    """Which pane axis carries this worksheet's measures: ``"y"`` (Rows), ``"x"`` (Cols), else None.
+
+    Measures on BOTH shelves is a scatter -- each axis is its own measure, so neither is a "second
+    axis" over the other -- and returns ``None`` so the caller keeps the conservative y-only read.
+    """
+    if meas_rows and not meas_cols:
+        return "y"
+    if meas_cols and not meas_rows:
+        return "x"
+    return None
 
 
 def _mark_family(mark):
@@ -1562,14 +1586,35 @@ def _all_pane_marks(table):
 
 def _constant_mark_color(table):
     """A worksheet's single constant mark colour -- the ``<format attr='mark-color' value='#hex'/>``
-    on a ``mark`` style-rule (first valid hex in document order) -- lower-cased, or ``None``.
+    on a ``mark`` style-rule -- lower-cased, or ``None``.
 
     This is the flat per-mark default that :func:`_parse_mark_colors` deliberately skips (that reader
     only takes an explicit per-member palette). The lollipop stick/dot colour is sourced from here,
     falling back to the theme when the worksheet set no constant colour.
+
+    AN AXIS PANE OUTRANKS PANE 0. A dual-axis worksheet writes a leading pane that carries no axis
+    of its own -- Tableau's all-panes default, which draws nothing once per-axis panes exist -- and
+    it can hold a STALE colour from before the second axis was added. Taking the first hex in
+    document order therefore painted a lollipop in the cyan its pane 0 still remembered while both
+    drawing panes said green. Any colour declared on a pane that owns an axis wins.
     """
     if table is None:
         return None
+    axis_color = None
+    panes_el = _first(table, "panes")
+    for pane in (_children_local(panes_el, "pane") if panes_el is not None else []):
+        owns_axis = any(_attr_local(pane, a) not in (None, "")
+                        for a in ("x-axis-name", "y-axis-name", "x-index", "y-index"))
+        if not owns_axis:
+            continue
+        for el in pane.iter():
+            if _local(el.tag) != "format" or (el.get("attr") or "") != "mark-color":
+                continue
+            v = (el.get("value") or "").strip()
+            if re.fullmatch(r"#[0-9A-Fa-f]{6}", v):
+                axis_color = axis_color or v.lower()
+    if axis_color:
+        return axis_color
     for el in table.iter():
         if _local(el.tag) != "format":
             continue
@@ -1601,6 +1646,15 @@ def _detect_lollipop(table, meas_rows, meas_cols, has_category):
     ``None``. Deliberately conservative -- requires a head mark AND a Bar mark AND a single measure
     identity across >=2 axes, so ordinary bar/line charts, area overlays (line+area, no bar), and
     different-measure dual-scale combos never misfire (warn-never-wrong).
+
+    AN ``Automatic`` HEAD IS STILL A HEAD. Tableau writes ``class="Automatic"`` on a pane whose mark
+    the author never picked by hand, so a real lollipop can reach us as Bar + Automatic and the
+    head-mark test found nothing -- the sheet fell through to a plain bar chart. What identifies the
+    second pane as the head, without having to resolve what Automatic means, is its SIZE: it is
+    markedly FATTER than the stick (measured 1.86 against 0.81 on one workbook, 1.86 against 0.39 on
+    another). Two bars over the same measure where the one drawn second is the WIDER and fully
+    opaque is not a chart anyone builds -- it would hide the first completely -- so a same-measure
+    second axis that is much wider than its Bar partner is a point mark, whatever the file calls it.
     """
     if not has_category:
         return None
@@ -1612,7 +1666,51 @@ def _detect_lollipop(table, meas_rows, meas_cols, has_category):
     marks = _all_pane_marks(table)
     if (marks & _LOLLIPOP_HEAD_MARKS) and "bar" in marks:
         return measures[:1]
+    if "bar" in marks and "automatic" in marks and _has_oversized_second_pane(table):
+        return measures[:1]
     return None
+
+
+# How much fatter than its Bar partner a same-measure second pane must be before it is read as a
+# point mark rather than a second bar. Well below the smallest measured ratio (1.86 / 0.81 = 2.3).
+_LOLLIPOP_HEAD_SIZE_RATIO = 1.6
+
+
+def _pane_mark_size(pane):
+    """A pane's ``<format attr='size'>`` mark size as a float, or ``None`` when it declares none."""
+    for rule in _findall_local(pane, "style-rule"):
+        if (rule.get("element") or "").lower() != "mark":
+            continue
+        for fmt in _children_local(rule, "format"):
+            if (fmt.get("attr") or "") == "size":
+                try:
+                    return float(fmt.get("value"))
+                except (TypeError, ValueError):
+                    return None
+    return None
+
+
+def _has_oversized_second_pane(table):
+    """True when some pane's mark size is >= :data:`_LOLLIPOP_HEAD_SIZE_RATIO` x a Bar pane's size.
+
+    The lollipop's head-vs-stick signal that survives an ``Automatic`` mark class (see
+    :func:`_detect_lollipop`). Both sizes must be declared -- an undeclared size is Tableau's
+    default and says nothing about the author's intent.
+    """
+    panes_el = _first(table, "panes")
+    if panes_el is None:
+        return False
+    bar_sizes, other_sizes = [], []
+    for pane in _children_local(panes_el, "pane"):
+        mk_el = _first(pane, "mark")
+        cls = (mk_el.get("class") if mk_el is not None else "") or ""
+        size = _pane_mark_size(pane)
+        if size is None or size <= 0:
+            continue
+        (bar_sizes if cls.strip().lower() == "bar" else other_sizes).append(size)
+    if not bar_sizes or not other_sizes:
+        return False
+    return max(other_sizes) >= min(bar_sizes) * _LOLLIPOP_HEAD_SIZE_RATIO
 
 
 _RUNNING_TOTAL_RE = re.compile(r"\.\[cum:")
@@ -2050,23 +2148,53 @@ def _parse_sort(view, ds_default, base_cols, instances, index, ds_caption, works
     "Ascending"|"Descending"}`` for the first computed-sort whose ``using`` measure resolves, else
     ``None``. ``<manual-sort>`` (an explicit, frozen member order) has no faithful Power BI sort
     expression, so it is deliberately ignored here (the default model order is used instead).
+
+    A RECENT TABLEAU WRITES THE SAME SORT DIFFERENTLY. Newer builds serialise it as
+    ``<shelf-sorts><shelf-sort-v2 dimension-to-sort='[dim]' measure-to-sort-by='[measure]'
+    direction='ASC|DESC' shelf='rows|cols' /></shelf-sorts>``, and reading only ``<computed-sort>``
+    meant those sheets shipped in the model's own order: a ranked bar chart whose whole point is
+    "biggest first" came back scrambled, with no warning, because nothing was missing -- only
+    unread. Both spellings are the same directive and are read the same way.
     """
     for cs in _findall_local(view, "computed-sort"):
         using = _attr_local(cs, "using")
         if not using:
             continue
-        uds, ufid = _split_token_attr(using)
-        if ufid is None:
-            continue
-        by = _resolve_field(uds or ds_default, ufid, base_cols, instances, index,
-                            ds_caption, worksheet, warnings, warn_special=False,
-                            internal_fields=internal_fields)
-        if not by or by["kind"] != "value":
-            continue
-        direction = (_attr_local(cs, "direction") or "ASC").strip().upper()
-        return {"field": by,
-                "direction": "Descending" if direction == "DESC" else "Ascending"}
+        parsed = _sort_from_measure_token(
+            using, _attr_local(cs, "direction"), ds_default, base_cols, instances, index,
+            ds_caption, worksheet, warnings, internal_fields)
+        if parsed:
+            return parsed
+    for ss in _findall_local(view, "shelf-sort-v2"):
+        parsed = _sort_from_measure_token(
+            _attr_local(ss, "measure-to-sort-by"), _attr_local(ss, "direction"),
+            ds_default, base_cols, instances, index, ds_caption, worksheet, warnings,
+            internal_fields)
+        if parsed:
+            return parsed
     return None
+
+
+def _sort_from_measure_token(token, direction, ds_default, base_cols, instances, index,
+                             ds_caption, worksheet, warnings, internal_fields):
+    """One sort directive's measure token + direction -> the IR sort dict, or ``None``.
+
+    Shared by both spellings of a Tableau axis sort (``<computed-sort using=…>`` and
+    ``<shelf-sort-v2 measure-to-sort-by=…>``) so neither can drift from the other.
+    """
+    if not token:
+        return None
+    uds, ufid = _split_token_attr(token)
+    if ufid is None:
+        return None
+    by = _resolve_field(uds or ds_default, ufid, base_cols, instances, index,
+                        ds_caption, worksheet, warnings, warn_special=False,
+                        internal_fields=internal_fields)
+    if not by or by["kind"] != "value":
+        return None
+    direction = (direction or "ASC").strip().upper()
+    return {"field": by,
+            "direction": "Descending" if direction == "DESC" else "Ascending"}
 
 
 # -- Measure Values / Measure Names expansion (M1.0) ---------------------------
@@ -2422,7 +2550,36 @@ def _parse_hidden_axes(table, dims_rows, dims_cols, meas_rows, meas_cols):
             axis = scope_axis.get(scope)
             if axis is not None:
                 hidden.add(axis)
+    # A CATEGORY HEADER HIDDEN ONLY BECAUSE ITS MEMBERS ARE DRAWN INSIDE THE MARKS MUST STAY.
+    # Tableau's horizontal-lollipop idiom turns the row header off and writes each member's NAME
+    # into the bar as a mark label (``<customized-label>`` referencing that same dimension). Power
+    # BI has no "category name inside the bar" label -- its data labels show the MEASURE -- so
+    # honouring the hide deleted the only copy of the names: four unlabelled green bars where the
+    # source reads "Sadie Pawthorne / Chuck Magee / ...". Keeping the axis moves the names beside
+    # the bars instead of inside them, which loses placement but not information.
+    if "categoryAxis" in hidden and _members_drawn_as_labels(table, dims_rows, dims_cols):
+        hidden.discard("categoryAxis")
     return hidden
+
+
+def _members_drawn_as_labels(table, dims_rows, dims_cols):
+    """True when a pane's ``<customized-label>`` prints one of the axis DIMENSIONS as a mark label.
+
+    That is Tableau saying "the member names are inside the marks", which is why the author could
+    turn the header off. Only an AXIS dimension counts -- a label naming some other field is
+    ordinary annotation and says nothing about the category header.
+    """
+    keys = set()
+    for f in list(dims_rows or []) + list(dims_cols or []):
+        keys.update(_field_ref_keys(f))
+    if not keys:
+        return False
+    for label in _findall_local(table, "customized-label"):
+        for run in _findall_local(label, "run"):
+            for key in _field_ref_keys_from_text(run.text or ""):
+                if key in keys:
+                    return True
+    return False
 
 
 # A Tableau field reference is written as a bracketed path, e.g. ``[federated.abc].[mn:date:ok]``.
@@ -4237,7 +4394,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         # combo chart so the column measure(s) land on Y and the line measure(s) on Y2. Same-mark
         # multi-measure shelves keep their ordinary single-mark visual (no false combos).
         if visual_type in (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA):
-            mark_by_instance, primary_mark, dual_axis = _pane_mark_map(table)
+            mark_by_instance, primary_mark, dual_axis = _pane_mark_map(
+                table, _measure_shelf_axis(meas_rows, meas_cols))
             column_meas, line_meas = _detect_combo(
                 meas_rows, meas_cols, bool(dims_rows or dims_cols),
                 mark_by_instance, primary_mark, dual_axis=dual_axis)
@@ -4269,7 +4427,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         if visual_type in (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA) and combo_split is None:
             lolli_meas = _detect_lollipop(
                 table, meas_rows, meas_cols, bool(dims_rows or dims_cols))
-            if lolli_meas:
+            if lolli_meas and _measure_shelf_axis(meas_rows, meas_cols) == "y":
                 visual_type = VT_COMBO
                 combo_split = {"Y": lolli_meas, "Y2": list(lolli_meas)}
                 lollipop = True
@@ -4277,6 +4435,23 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                 fidelity_note = (
                     "dual-axis lollipop (Bar stick + Circle/Shape/Point head, same measure) -> "
                     "lineClusteredColumnComboChart (thin columns = sticks; marker-only line = heads)")
+            elif lolli_meas:
+                # A HORIZONTAL lollipop has no combo to go to. Power BI's only combo
+                # (``lineClusteredColumnComboChart``) draws its columns VERTICALLY, so rerouting a
+                # sheet whose measures sit on Cols would rotate the whole chart -- trading a missing
+                # dot layer for a wrong orientation, which is the worse loss. Keep the horizontal
+                # bars (the sticks, which ARE the source's own Bar pane), take the stick colour from
+                # the drawing panes, and say plainly that the head layer has no horizontal home.
+                lollipop_color = _constant_mark_color(table)
+                fidelity_note = (
+                    "dual-axis horizontal lollipop (Bar stick + point head over the same measure): "
+                    "the sticks are rebuilt as a clusteredBarChart in the source's own mark colour. "
+                    "Power BI has no horizontal combo chart, so the head layer is not drawn")
+                warnings.append(_warn(
+                    "worksheet", name,
+                    "horizontal lollipop: sticks rebuilt faithfully (orientation, colour, labels); "
+                    "the round heads have no native horizontal marker layer in Power BI and are "
+                    "left off rather than rotating the chart to fit one"))
 
         # Bump / rank chart hack: a manual rank built from an INDEX()/RANK() table calc plotted on
         # an axis (often a doubled dual-axis spacer), with the real ranked measure on a marks-card
@@ -4391,6 +4566,19 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                 warnings.append(_warn(
                     "worksheet", name,
                     f"mark class '{mark}' / shelf layout not supported -> no visual emitted"))
+
+    # A shapeMap draws NOTHING until Desktop's preview feature is switched on. Measured: a US-state
+    # choropleth emitted as a schema-valid ``shapeMap`` (correct topology, correct gradient, correct
+    # bindings) rendered as an empty rectangle on a default Desktop install, while the same query on
+    # a ``filledMap`` drew a real map -- "Shape map visual" lives under Options -> Preview features
+    # and ships OFF. Nothing in the file is wrong and nothing the emitter can write turns it on, so
+    # the honest thing is to say so rather than let a reader conclude the migration lost the map.
+    if visual_type == VT_SHAPE_MAP:
+        warnings.append(_warn(
+            "worksheet", name,
+            "rebuilt as a Power BI shapeMap (built-in topology choropleth). Power BI Desktop ships "
+            "the shape map visual OFF: enable Options -> Preview features -> 'Shape map visual' and "
+            "reopen, or the visual renders as an empty rectangle"))
 
     title_text, title_dynamic = _parse_worksheet_title(ws)
     # v2-3 (caption-only worksheet -> textbox): a thin status / refresh / filter-breadcrumb bar that
@@ -4521,6 +4709,13 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     if visual_type in _AXIS_TITLE_TYPES:
         axis_titles = _parse_axis_titles(table, dims_rows, dims_cols, meas_rows, meas_cols)
         axis_hidden = _parse_hidden_axes(table, dims_rows, dims_cols, meas_rows, meas_cols)
+        # A category axis RESCUED from a hide (because the member names existed only as mark
+        # labels) is shown for its members, not for a caption -- the author displayed no header at
+        # all, so Power BI's auto field-name title ("Regional_Man...") is furniture the source never
+        # had, and it steals a slice of the plot on a small tile.
+        if _members_drawn_as_labels(table, dims_rows, dims_cols):
+            axis_titles = dict(axis_titles or {})
+            axis_titles.setdefault("categoryAxis", {"hide": True})
 
     # Continuous colour scale on a worksheet's mark colour encoding. On a table / matrix it becomes a
     # cell heat scale (a PBIR ``backColor`` FillRule via ``_conditional_format``); on a cartesian

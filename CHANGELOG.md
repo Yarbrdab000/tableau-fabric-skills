@@ -14,6 +14,44 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **tableau-migration (skill `2.102.0` -> `2.103.0`): a horizontal dual axis is still a dual axis,
+  and its member names survive.** Tableau names a pane's measure axis after the shelf the measures
+  sit on — `y-axis-name` / `y-index` for Rows (a vertical chart), `x-axis-name` / `x-index` for Cols
+  (a HORIZONTAL one). Only `y` was read, so every horizontal dual-axis sheet was invisible to the
+  detector: a horizontal lollipop, whose stick and head both live on Cols, came back as an ordinary
+  bar chart in the wrong colour with no names and in the wrong order.
+  - **Orientation.** The pane axis read now follows the measure shelf. Measures on BOTH shelves (a
+    scatter — each axis its own measure, neither a second axis over the other) keeps the
+    conservative y-only read.
+  - **An `Automatic` head is still a head.** Tableau writes `class="Automatic"` on a pane whose mark
+    the author never picked by hand, so a real lollipop reaches us as Bar + Automatic. What
+    identifies the second pane as the head without resolving what Automatic means is its SIZE: two
+    bars over the same measure where the one drawn second is the WIDER and fully opaque is not a
+    chart anyone builds — it would hide the first completely.
+  - **No horizontal combo, so no rotation.** Power BI's only combo draws its columns vertically;
+    rerouting a horizontal lollipop there would trade a missing dot layer for a wrong orientation.
+    The sticks are rebuilt as a `clusteredBarChart` in the source's own colour and the missing head
+    layer is disclosed.
+  - **An axis pane outranks pane 0 for the mark colour.** A dual-axis worksheet writes a leading
+    pane that owns no axis — Tableau's all-panes default, which draws nothing once per-axis panes
+    exist — and it can hold a stale colour. The lollipop was painted the cyan pane 0 still
+    remembered while both drawing panes said green.
+  - **A recent Tableau writes the sort differently.** Newer builds serialise an axis sort as
+    `<shelf-sort-v2 dimension-to-sort=… measure-to-sort-by=… direction=…>` instead of
+    `<computed-sort using=…>`. Reading only the older spelling shipped those sheets in the model's
+    own order with no warning — nothing was missing from the file, it was only unread.
+  - **A category header hidden only because its members are drawn inside the marks must stay.**
+    Tableau turns the row header off and writes each member's NAME into the bar as a mark label;
+    Power BI has no such label (its data labels show the MEASURE), so honouring the hide deleted the
+    only copy of the names. The axis is kept — moving the names beside the bars rather than inside
+    them — and its auto field-name title is suppressed, because the author showed no header at all.
+  - A `shapeMap` now warns that Power BI Desktop ships the shape map visual OFF (Options → Preview
+    features): measured, a schema-valid US-state choropleth rendered as an empty rectangle on a
+    default install while the same query on a `filledMap` drew a real map. Nothing in the file is
+    wrong and nothing the emitter can write turns it on, so it is disclosed instead.
+
+### Fixed
+
 - **tableau-migration (skill `2.101.0` -> `2.102.0`): a KPI title's headline number is found by what
   it RENDERS at, and rebuilt in proportion.** Tableau writes a big-number KPI INTO the worksheet
   title — a static caption run plus a live `<[ds].[Calculation…]>` run. The detector required an

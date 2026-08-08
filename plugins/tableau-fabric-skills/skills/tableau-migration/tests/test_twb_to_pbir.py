@@ -662,8 +662,30 @@ def test_computed_sort_on_bound_measure_emits_sort_definition():
     assert sort_field == _query_state(vis)["Y"]["projections"][0]["field"]
 
 
-def test_computed_sort_on_unbound_measure_binds_it_to_tooltips():
-    # The dimension is sorted by SUM(Profit) -- Tableau's ordinary idiom -- but Profit is not on
+def test_shelf_sort_v2_is_the_same_directive_as_computed_sort():
+    # A RECENT TABLEAU WRITES THE SORT DIFFERENTLY. Newer builds serialise an axis sort as
+    # <shelf-sorts><shelf-sort-v2 dimension-to-sort=... measure-to-sort-by=... direction=... /></>
+    # instead of <computed-sort using=...>. Reading only the older spelling shipped those sheets in
+    # the model's own order with no warning -- nothing was missing from the file, it was only unread.
+    # Measured on a real ranked bar chart whose members came back scrambled.
+    sort = ("<shelf-sorts><shelf-sort-v2 "
+            "dimension-to-sort='[federated.abc].[none:Category:nk]' direction='DESC' "
+            "is-on-innermost-dimension='true' "
+            "measure-to-sort-by='[federated.abc].[sum:Sales:qk]' shelf='cols' /></shelf-sorts>")
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST, filters=sort)
+    ir = parse_twb(_workbook(ws))
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    sd = _sort_definition(vis)
+    assert sd is not None
+    assert sd["sort"][0]["direction"] == "Descending"
+    # the sort names exactly the expression bound in the Y role (no dangling reference)
+    assert sd["sort"][0]["field"] == _query_state(vis)["Y"]["projections"][0]["field"]
+
+
+def test_computed_sort_on_unbound_measure_binds_it_to_tooltips():    # The dimension is sorted by SUM(Profit) -- Tableau's ordinary idiom -- but Profit is not on
     # any shelf. Power BI only sorts by a field the visual actually QUERIES: a sortDefinition on an
     # unprojected field is accepted silently, ignored, AND suppresses Power BI's own default sort,
     # leaving the axis in natural/alphabetical order (render-verified against Desktop). So the
