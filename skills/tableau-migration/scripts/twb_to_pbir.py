@@ -7157,13 +7157,20 @@ def _axis_objects(axis_titles, axis_hidden=None):
         props = {}
         if axis in hidden:
             props["show"] = {"expr": {"Literal": {"Value": "false"}}}
+            # ``show:false`` does NOT take the title with it. Measured on a 300x300 KPI tile whose
+            # source hides every axis: the plot lost its ticks and labels as asked, and Power BI went
+            # on drawing a rotated "Sales" caption down the left edge that the source does not have,
+            # eating a fifth of the plot width. An axis the author hid has no title either.
+            props["showAxisTitle"] = {"expr": {"Literal": {"Value": "false"}}}
         if spec:
             if spec.get("hide"):
                 props["showAxisTitle"] = {"expr": {"Literal": {"Value": "false"}}}
             elif spec.get("text"):
                 props["titleText"] = {
                     "expr": {"Literal": {"Value": _semantic_string_literal(spec["text"])}}}
-                props["showAxisTitle"] = {"expr": {"Literal": {"Value": "true"}}}
+                # The author's caption is preserved either way, but a HIDDEN axis shows none of it.
+                props["showAxisTitle"] = {"expr": {"Literal": {
+                    "Value": "false" if axis in hidden else "true"}}}
         if props:
             objects[axis] = [{"properties": props}]
     return objects

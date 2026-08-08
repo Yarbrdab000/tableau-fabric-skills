@@ -14,6 +14,17 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **tableau-migration (skill `2.100.0` -> `2.101.0`): an axis the author hid has no title either.**
+  `visual.objects.<axis>.show: false` suppresses an axis's line, ticks and labels but NOT its title —
+  the code assumed otherwise and said so in a comment. Measured on a 300x300 KPI tile whose source
+  hides every axis: the plot lost its ticks and labels as asked, and Power BI went on drawing a
+  rotated `Sales` caption down the left edge that the source does not have, eating a fifth of the
+  plot width. A hidden axis now also emits `showAxisTitle: false`. An authored caption is still
+  preserved on the object (`titleText`) so nothing is lost from the file — it is simply not shown on
+  an axis the author turned off.
+
+### Fixed
+
 - **tableau-migration (skill `2.99.0` -> `2.100.0`): a table calc transforms the pill it sits on,
   not the first one the sheet happens to declare.** `datasource-dependencies` lists every table-calc
   instance a worksheet DECLARES, which is not the same as every one it PLOTS — Tableau parks a pill
