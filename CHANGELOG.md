@@ -12,6 +12,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.123.0` -> `2.124.0`): a table that landed related to NOTHING says
+  so.** An unrelated dimension does not error -- it returns that table's GRAND TOTAL identically on
+  every row of a breakdown, while `relationship_columns_exist`, TMDL deserialization, open and
+  refresh all pass. Reported on a Snowflake datasource where `DIM_CUSTOMER` and `DIM_DATE` both
+  landed orphaned and the fact related only to the synthetic `Date` table, so a *revenue by region*
+  and a *customer segment breakdown* would each have shown one repeated number (issue #107).
+  Verified first that a DECLARED join is recovered -- it is -- so an orphan here means the source
+  declared none, which is common for a warehouse datasource whose joins live in the warehouse. That
+  cannot be invented (a guessed relationship returns a different wrong number rather than the right
+  one), so each orphan is reported with the columns it SHARES with the largest other table: evidence
+  for a human, never an automatic join. The fact for a given orphan is the largest OTHER table, so a
+  table is never compared with itself -- the first cut listed a table's own columns as its candidate
+  join keys.
+  `duplicate_date_dimension` flags the sharper signal the issue identified: a source-provided date
+  dimension landed orphaned while a synthetic `Date` table also exists and took the fact's
+  relationship, so the model carries two date tables and the real one is unusable.
+  Additive `report["orphan_tables"]`. Found orphans in **7 of 29** corpus workbooks, every one
+  previously silent.
+
 - **tableau-migration (skill `2.122.0` -> `2.123.0`): Tableau DECLARES its blend links, and nothing
   read them.** A blended secondary datasource landed in the model related to **nothing but Date**, so
   any visual slicing it returned the whole table's grand total identically for every member --

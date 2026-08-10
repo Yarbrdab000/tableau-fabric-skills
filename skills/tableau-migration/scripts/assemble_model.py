@@ -1998,6 +1998,67 @@ def _row_scalar_table_resolver(relations, table_names):
     return resolve
 
 
+def _orphan_table_report(table_names, relationships, relations, date_table=None):
+    """Tables that landed with NO relationship to anything -> ``[{table, ...}]``.
+
+    A dimension that lands unrelated to its fact does not error. It returns that table's GRAND TOTAL
+    identically on every row of a breakdown, and every structural gate passes:
+    ``relationship_columns_exist`` is satisfied by whatever relationships DO exist, the TMDL
+    deserialises, the model opens and refreshes. Reported on a Snowflake datasource where
+    ``DIM_CUSTOMER`` and ``DIM_DATE`` both landed orphaned while the fact related only to the
+    synthetic ``Date`` table (issue #107) -- so the two workbooks binding it, a *revenue by region*
+    and a *customer segment breakdown*, would both have shown one repeated number.
+
+    Where the source declares a join we already recover it, so an orphan here means the source
+    declared none (common for a warehouse datasource whose joins live in the warehouse). That cannot
+    be invented -- a guessed relationship returns a different wrong number rather than the right one
+    -- so each orphan is reported with the columns it SHARES with the fact table, which are the
+    candidate keys an operator would use. ``shared_with_fact`` is evidence for a human, never an
+    automatic join.
+
+    ``duplicate_date_dimension`` flags the sharper signal: a source-provided date dimension landed
+    orphaned while a synthetic ``Date`` table was also generated and took the fact's relationship, so
+    the model carries two date tables and the real one is unusable.
+    """
+    data_tables = [t for t in (table_names or []) if t != "_Measures"]
+    if len(data_tables) < 2:
+        return []
+    related = set()
+    for rel in relationships or []:
+        for key in ("from_table", "to_table"):
+            val = rel.get(key) if isinstance(rel, dict) else None
+            if val:
+                related.add(val)
+    cols_by_table = {}
+    for rel in relations or []:
+        disp = _table_display(rel)
+        if disp:
+            cols_by_table.setdefault(disp, set()).update(
+                (c.get("model_name") or c.get("remote_name") or "")
+                for c in (rel.get("columns") or []))
+    out = []
+    for table in data_tables:
+        if table in related or table == date_table:
+            continue
+        # The fact for THIS orphan is the largest OTHER table -- comparing a table to itself would
+        # report its own columns as candidate join keys, which reads as nonsense.
+        others = {t: c for t, c in cols_by_table.items() if t != table and t != date_table}
+        fact = max(others, key=lambda t: len(others[t]), default=None)
+        shared = sorted(c for c in (cols_by_table.get(table) or set())
+                        if c and fact and c in (others.get(fact) or set()))
+        looks_like_date = any(
+            (c.get("tmdl_type") or "").lower() in ("datetime", "date")
+            for rel in (relations or []) if _table_display(rel) == table
+            for c in (rel.get("columns") or []))
+        out.append({
+            "table": table,
+            "shared_with_fact": shared,
+            "fact_table": fact,
+            "duplicate_date_dimension": bool(date_table and looks_like_date),
+        })
+    return out
+
+
 def build_model_manifest(*, table_names, relations, measure_report, calc_column_report,
                          dim_calcs, date_report, parameters, fp, vp):
     """Assemble the additive ``report["model_manifest"]`` -- one cohesive, deterministic view of
@@ -3842,6 +3903,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
             calc_column_report=calc_column_report, dim_calcs=dim_calcs,
             date_report=date_report, parameters=parameters or [], fp=fp, vp=vp),
         "calc_coverage": calc_coverage_artifact(measure_report),
+        "orphan_tables": _orphan_table_report(table_names, all_rels, tables, date_name),
         "calc_columns": calc_column_report,
         "calc_column_coverage": calc_column_coverage_artifact(calc_column_report),
         "assisted_suggestions": assisted_suggestions,

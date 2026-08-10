@@ -2517,7 +2517,12 @@ def test_workbook_pbip_consolidates_multiple_datasources_into_one_model():
         assert wb["bound_model"] == "Multi WB"          # one model named for the workbook
         # every embedded datasource is folded in -- none silently dropped or warned away
         assert not any("secondary datasource" in w for w in wb["pbip_warnings"])
-        assert wb["pbip_warnings"] == []
+        # The only warnings permitted are the ORPHAN-TABLE report (issue #107): this fixture
+        # consolidates two INDEPENDENT datasource islands into one model, and two unrelated
+        # tables in one model is exactly the silent-grand-total risk that report names. The
+        # assertion stays exact rather than becoming a blanket "ignore warnings".
+        assert all("landed with NO relationship" in w for w in wb["pbip_warnings"]), \
+            wb["pbip_warnings"]
         # the consolidation audit trail lists every island that landed (anti-silent-drop proof)
         assert set(wb["consolidated_datasources"]) == {"Sales Source", "Inventory Source"}
         # no per-datasource split: the legacy nested rollup key is not set

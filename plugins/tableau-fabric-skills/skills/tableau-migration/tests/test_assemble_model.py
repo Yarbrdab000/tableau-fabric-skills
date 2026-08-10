@@ -3452,3 +3452,75 @@ def test_the_duplicate_banner_explains_what_is_inflated(tmp_path):
     banner = "\n".join(me_est._input_collision_banner(report))
     for term in ("workbooks", "calculations", "stubs", "warned visuals", "multiplied"):
         assert term in banner, f"banner must name {term!r} as inflated"
+
+
+# -- orphaned tables are reported, never joined by guess (issue #107) ---------------------------
+# A dimension that lands unrelated to its fact does not error: it returns that table's GRAND TOTAL
+# identically on every row of a breakdown, while relationship_columns_exist, TMDL deserialization,
+# open and refresh all pass. Measured on a Snowflake datasource where DIM_CUSTOMER and DIM_DATE both
+# landed orphaned and the fact related only to the synthetic Date table.
+
+_ORPHAN_RELATIONS = [
+    {"name": "FACT_ORDERS", "kind": "table", "columns": [
+        {"model_name": "ORDER_ID", "tmdl_type": "string"},
+        {"model_name": "CUSTOMER_ID", "tmdl_type": "string"},
+        {"model_name": "ORDER_DATE", "tmdl_type": "dateTime"},
+        {"model_name": "AMOUNT", "tmdl_type": "double"}]},
+    {"name": "DIM_CUSTOMER", "kind": "table", "columns": [
+        {"model_name": "CUSTOMER_ID", "tmdl_type": "string"},
+        {"model_name": "REGION", "tmdl_type": "string"}]},
+    {"name": "DIM_DATE", "kind": "table", "columns": [
+        {"model_name": "DATE_KEY", "tmdl_type": "dateTime"},
+        {"model_name": "FISCAL_QTR", "tmdl_type": "string"}]},
+]
+_ORPHAN_NAMES = ["FACT_ORDERS", "DIM_CUSTOMER", "DIM_DATE", "Date", "_Measures"]
+_ONLY_SYNTHETIC_DATE = [{"from_table": "FACT_ORDERS", "from_col": "ORDER_DATE",
+                         "to_table": "Date", "to_col": "Date"}]
+
+
+def test_an_orphaned_dimension_is_reported_with_its_candidate_join_keys():
+    rows = {r["table"]: r for r in am._orphan_table_report(
+        _ORPHAN_NAMES, _ONLY_SYNTHETIC_DATE, _ORPHAN_RELATIONS, date_table="Date")}
+    assert set(rows) == {"DIM_CUSTOMER", "DIM_DATE"}
+    # the shared column is EVIDENCE for a human, never an automatic join
+    assert rows["DIM_CUSTOMER"]["shared_with_fact"] == ["CUSTOMER_ID"]
+    assert rows["DIM_CUSTOMER"]["fact_table"] == "FACT_ORDERS"
+
+
+def test_a_source_date_dimension_orphaned_beside_the_synthetic_one_is_flagged():
+    # The sharper signal: the model carries TWO date tables, and the fact is related to the
+    # synthetic one, so the source's real date dimension is unusable.
+    rows = {r["table"]: r for r in am._orphan_table_report(
+        _ORPHAN_NAMES, _ONLY_SYNTHETIC_DATE, _ORPHAN_RELATIONS, date_table="Date")}
+    assert rows["DIM_DATE"]["duplicate_date_dimension"] is True
+    assert rows["DIM_CUSTOMER"]["duplicate_date_dimension"] is False
+
+
+def test_the_orphan_report_is_empty_when_every_table_is_related():
+    # A check that has never been silent proves nothing.
+    related = _ONLY_SYNTHETIC_DATE + [
+        {"from_table": "FACT_ORDERS", "from_col": "CUSTOMER_ID",
+         "to_table": "DIM_CUSTOMER", "to_col": "CUSTOMER_ID"},
+        {"from_table": "FACT_ORDERS", "from_col": "ORDER_DATE",
+         "to_table": "DIM_DATE", "to_col": "DATE_KEY"}]
+    assert am._orphan_table_report(_ORPHAN_NAMES, related, _ORPHAN_RELATIONS,
+                                   date_table="Date") == []
+    # ...and a single-table model has nothing to be orphaned FROM
+    assert am._orphan_table_report(["Orders", "_Measures"], [], _ORPHAN_RELATIONS) == []
+
+
+def test_an_orphan_never_reports_its_own_columns_as_the_join_keys():
+    # The fact for a given orphan is the largest OTHER table; comparing a table to itself listed its
+    # own columns as candidate keys, which reads as nonsense (measured on a two-island fixture).
+    two_islands = [
+        {"name": "Sales", "kind": "table", "columns": [
+            {"model_name": "Amount", "tmdl_type": "double"},
+            {"model_name": "Category", "tmdl_type": "string"}]},
+        {"name": "Inventory", "kind": "table", "columns": [
+            {"model_name": "Category", "tmdl_type": "string"}]},
+    ]
+    rows = {r["table"]: r for r in am._orphan_table_report(
+        ["Sales", "Inventory", "_Measures"], [], two_islands)}
+    assert rows["Sales"]["fact_table"] == "Inventory"
+    assert rows["Inventory"]["fact_table"] == "Sales"
+    assert rows["Sales"]["shared_with_fact"] == ["Category"]

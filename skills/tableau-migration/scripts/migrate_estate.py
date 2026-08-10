@@ -3226,6 +3226,24 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
     # because the model manifest (which says where each field landed) only exists once the model is
     # built. See ``_blend_link_warnings``: the keys are quoted from Tableau, not guessed.
     warns.extend(_blend_link_warnings(twb_text, res_report))
+    # A landed table with NO relationship to anything returns its GRAND TOTAL identically on every
+    # row of a breakdown, and every structural gate passes. Where the source declares a join we
+    # already recover it, so an orphan means the source declared none -- which cannot be invented,
+    # only reported (issue #107).
+    for _orphan in (res_report or {}).get("orphan_tables") or []:
+        _shared = _orphan.get("shared_with_fact") or []
+        _extra = ("; it shares %s with %r, which are the candidate join keys"
+                  % (", ".join(repr(c) for c in _shared[:6]), _orphan.get("fact_table"))
+                  if _shared and _orphan.get("fact_table") else "")
+        _dupe = (" This also means the model carries TWO date tables: this one from the source, and "
+                 "the synthetic Date table the fact is actually related to."
+                 if _orphan.get("duplicate_date_dimension") else "")
+        warns.append(
+            _PBIP_WARN + ("table %r landed with NO relationship to any other table -- a measure "
+                          "broken down by its columns returns the whole table's GRAND TOTAL "
+                          "identically for every member, and no structural gate can see that. The "
+                          "source declared no join for it, so none was invented%s.%s"
+                          % (_orphan.get("table"), _extra, _dupe)))
     # ISSUE #103, option (b). Where one datasource genuinely carries the same caption on two of its
     # tables, no datasource-scoped key could be emitted (there is nothing to prefer), so resolution
     # falls through to the bare caption -- i.e. the FIRST table written claims it. That is a guess,
