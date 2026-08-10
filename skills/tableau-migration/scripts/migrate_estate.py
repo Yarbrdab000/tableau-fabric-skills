@@ -50,7 +50,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 
 try:  # works whether imported as a package or run with scripts/ on sys.path
-    from .connection_to_m import (parse_tds, extract_bundled_flatfile, extract_calcs,
+    from .connection_to_m import (parse_tds, locale_dependent_flatfile_relations, extract_bundled_flatfile, extract_calcs,
                                   combine_descriptors)
     from .storage_mode import select_storage_mode, FALLBACK_NEEDS_DECISION
     from .assemble_model import (assemble_import_model, assemble_local_import_model,
@@ -63,7 +63,7 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .tmdl_generate import tableau_measure_format_to_pbi
     from . import fetch_tds as F
 except ImportError:
-    from connection_to_m import (parse_tds, extract_bundled_flatfile, extract_calcs,
+    from connection_to_m import (parse_tds, locale_dependent_flatfile_relations, extract_bundled_flatfile, extract_calcs,
                                  combine_descriptors)
     from storage_mode import select_storage_mode, FALLBACK_NEEDS_DECISION
     from assemble_model import (assemble_import_model, assemble_local_import_model,
@@ -3277,6 +3277,39 @@ def _embedded_datasource_telemetry(twb_text, all_ds):
     return out
 
 
+def _locale_dependent_flatfile_warnings(twb_text, all_ds):
+    """Warnings for relations whose typed M would depend on the machine's ambient locale.
+
+    A legacy ACE workbook (``.xls``/``.xlsb``) returns its cells as text ALREADY RENDERED in the
+    host's locale, so ``Table.TransformColumnTypes`` parses them with whatever locale refreshes the
+    model. On a comma-decimal host every decimal column is silently corrupted by ``10^decimals`` --
+    measured at 493x on one column and 6,285x on another IN THE SAME TABLE, with the model building,
+    refreshing, and passing TMDL deserialization, M syntax, the openability self-check and a
+    persisted cache (issue #110). Only a numeric oracle caught it.
+
+    No culture can be PROVEN for that source -- the rendering locale is not knowable at generation
+    time and not observable from within M -- and a wrong guess is worse than none, so this reports
+    it with the remedy instead. Every other flat file has its culture pinned at emission.
+    """
+    warns = []
+    for ds in all_ds or []:
+        label = ds.get("label") or ds.get("caption") or ds.get("name")
+        try:
+            rows = locale_dependent_flatfile_relations(parse_tds(twb_text, label))
+        except Exception:
+            continue
+        for row in rows:
+            warns.append(
+                _PBIP_WARN + ("table %r reads a LEGACY Excel workbook (%s), whose cells arrive as "
+                              "text already rendered in the refreshing machine's locale -- on a "
+                              "comma-decimal host every decimal column inflates by 10^decimals and "
+                              "every structural gate still passes. Convert the source to .xlsx or "
+                              "CSV (or add an explicit culture to this partition) before trusting "
+                              "its numbers"
+                              % (row["table"], os.path.basename(row.get("path") or "") or "unknown")))
+    return warns
+
+
 def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None, ds_catalog=None,
                           approved_calc_dax=None, wb_id=None):
     """Build ONE openable, self-contained workbook ``.pbip`` project and record it on ``detail``.
@@ -3324,6 +3357,7 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
     # so both shapes report identically, and before any build step that can bail out -- a workbook
     # whose model fails to land still tells a consumer which systems it would have touched.
     detail["embedded_datasources"] = _embedded_datasource_telemetry(twb_text, all_ds)
+    warns.extend(_locale_dependent_flatfile_warnings(twb_text, all_ds))
 
     # SINGLE embedded datasource (the common case): keep the established FLAT ``pbip/<WB>/`` layout so
     # the top-level detail keys and the on-disk paths stay byte-identical. The report binds to the one

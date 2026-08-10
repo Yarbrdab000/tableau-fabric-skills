@@ -2519,6 +2519,107 @@ def _unquote_tableau_identifier(raw):
     return s
 
 
+# The culture emitted for a flat file whose rendering WE control. ``hyper_reader.write_rows_csv``
+# renders every cell with Python's ``str()``, which is invariant: ``.`` decimal separator, no group
+# separators, ISO-ish dates. ``en-US`` is the closest stock culture to that rendering, and naming it
+# explicitly is what makes the artifact locale-PROOF rather than merely correct on the build host.
+INVARIANT_CSV_CULTURE = "en-US"
+
+# A decimal value as our own exporter writes it: optional sign, digits, optional ``.`` fraction, and
+# never a group separator. Anything else in a decimal column means the file was NOT written by us.
+_INVARIANT_DECIMAL_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+_COMMA_DECIMAL_RE = re.compile(r"^-?\d{1,3}(?:\.\d{3})*,\d+$|^-?\d+,\d+$")
+
+
+def _sniff_csv_decimal_convention(path, sample_bytes=65536):
+    """Classify a landed CSV's decimal convention as ``"dot"`` / ``"comma"`` / ``None``.
+
+    ``Csv.Document`` hands Power Query the file's TEXT verbatim -- it does not render anything -- so
+    the decimal convention is a property of the FILE and can be read off it deterministically. That
+    matters because ``Table.TransformColumnTypes`` with no culture parses that text with the
+    REFRESHING machine's locale, so a dot-decimal file silently becomes garbage on a comma-decimal
+    host (measured: ``261.96`` read as ``26196``, and an inflation ratio of ``10^decimals`` that
+    differs per column -- issue #110).
+
+    Parsed with the ``csv`` module rather than split on commas, because a comma-decimal file writes
+    its numbers QUOTED (``"1.234,56"``) -- naive splitting tears that into ``1.234`` and ``56``, and
+    the leading fragment then reads as a dot-decimal, classifying a European file as American: the
+    exact inversion this function exists to prevent.
+
+    Fail-closed by design: a file that shows BOTH conventions, or neither, returns ``None`` and the
+    emitter omits the culture exactly as before rather than guessing a locale onto the user's data.
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(sample_bytes)
+    except OSError:
+        return None
+    text = raw.decode("utf-8-sig", "replace")
+    lines = text.splitlines()
+    if len(lines) < 2:
+        return None
+    dot = comma = 0
+    try:
+        import csv as _csv
+        rows = list(_csv.reader(lines[1:201]))
+    except Exception:
+        return None
+    for row in rows:
+        for cell in row:
+            cell = (cell or "").strip()
+            if not cell:
+                continue
+            if _INVARIANT_DECIMAL_RE.match(cell) and "." in cell:
+                dot += 1
+            elif _COMMA_DECIMAL_RE.match(cell):
+                comma += 1
+    if dot and not comma:
+        return "dot"
+    if comma and not dot:
+        return "comma"
+    return None
+
+
+def flatfile_culture(path, connector, relation=None):
+    """The culture to pin on ``Table.TransformColumnTypes``, plus why -> ``(culture, reason)``.
+
+    Generated M must never depend on the ambient locale of the machine that generated it, nor of the
+    machine that refreshes it. A missing culture makes it depend on BOTH, and the failure is
+    invisible: the model builds, refreshes, and passes every structural gate while returning numbers
+    inflated by orders of magnitude (issue #110 measured ``SUM(Sales)`` at 1,131,591,720 against a
+    true 2,297,200.86, with 25/75 numeric oracle checks passing and every structural gate green).
+
+    Three cases, and only the ones we can PROVE get a culture:
+
+    * **A CSV this engine wrote** (an extract materialised through ``hyper_reader``) -- rendering is
+      ours and is invariant, so ``en-US`` is provably correct and the artifact becomes portable.
+    * **A user's CSV** -- ``Csv.Document`` passes the file's text through unchanged, so the
+      convention is a property of the file and is sniffed from it. A dot-decimal file gets ``en-US``;
+      a comma-decimal file gets ``de-DE``. An inconclusive sniff yields ``None``.
+    * **A legacy ACE workbook** (``.xls``/``.xlsb`` via ``Excel.Workbook``) -- the reader returns
+      cells as text ALREADY RENDERED in the host's locale, which is not observable at generation
+      time and not observable from within M either (``Culture.Current`` returns the model's
+      ``sourceQueryCulture``, not the Windows locale). No culture can be proven, so none is emitted
+      and the reason names the remedy. An OOXML ``.xlsx``/``.xlsm`` is unaffected: it stores numbers
+      as invariant doubles, so ``Excel.Workbook`` returns real numbers rather than rendered text.
+    """
+    rel = relation or {}
+    if connector == "Excel.Workbook":
+        if _is_zip_readable_excel_path(path):
+            return None, "ooxml-numeric"
+        return None, "legacy-ace-host-rendered"
+    if connector != "Csv.Document":
+        return None, "not-a-text-source"
+    if rel.get("engine_written_csv") or rel.get("materialised_csv"):
+        return INVARIANT_CSV_CULTURE, "engine-written"
+    convention = _sniff_csv_decimal_convention(path)
+    if convention == "dot":
+        return INVARIANT_CSV_CULTURE, "sniffed-dot"
+    if convention == "comma":
+        return "de-DE", "sniffed-comma"
+    return None, "inconclusive"
+
+
 def _excel_navigation(relation):
     """The ``(item, kind)`` pair to navigate an Excel relation with, e.g. ``("Orders", "Sheet")``.
 
@@ -2968,6 +3069,44 @@ def _flatfile_contents_expr(path, conn):
     return f'File.Contents("{escape_m_string(path)}")'
 
 
+def locale_dependent_flatfile_relations(descriptor):
+    """``[{table, path, reason}]`` for relations whose typed M would depend on the AMBIENT locale.
+
+    Generated M must never depend on the locale of the machine that generated it, nor of the machine
+    that refreshes it. :func:`flatfile_culture` pins a culture wherever the rendering can be proven,
+    which covers a CSV outright. What it cannot cover is a LEGACY ACE workbook (``.xls``/``.xlsb``):
+    that reader returns cells as text already rendered in the host's locale, and the rendering
+    locale is neither knowable at generation time nor observable from within M -- ``Culture.Current``
+    returns the model's ``sourceQueryCulture``, not the Windows locale. So that case is REPORTED
+    rather than guessed, because a wrong guess is worse than none: pinning ``en-US`` on a comma-
+    decimal host is a no-op that leaves the values corrupt, and pinning the wrong European culture
+    fixes the dates while leaving the numbers wrong.
+
+    Returns ``[]`` for every source whose culture is proven or irrelevant, so a clean model reports
+    nothing.
+    """
+    out = []
+    conns = {}
+    for c in (descriptor.get("connections") or []):
+        if isinstance(c, dict) and c.get("name"):
+            conns[c["name"]] = c
+    for rel in descriptor.get("relations") or []:
+        if rel.get("kind") not in ("table", "custom_sql"):
+            continue
+        conn = conns.get(rel.get("connection")) or descriptor
+        cls = (conn.get("class") or conn.get("connection_class")
+               or descriptor.get("connection_class") or "").lower()
+        connector = FLAT_FILE_CLASSES.get(cls)
+        if connector is None:
+            continue
+        path = (rel.get("flatfile_path") or _flatfile_path_for(conn)
+                or _flatfile_path_for(descriptor))
+        culture, reason = flatfile_culture(path, connector, rel)
+        if culture is None and reason == "legacy-ace-host-rendered":
+            out.append({"table": _table_display(rel), "path": path, "reason": reason})
+    return out
+
+
 def emit_flatfile_source(relation, conn, cls):
     """Emit a real, typed Import ``let ... in`` body for an Excel/CSV ("full data") relation.
 
@@ -3042,7 +3181,17 @@ def emit_flatfile_source(relation, conn, cls):
         if mt:
             type_pairs.append(f'{{"{escape_m_string(remote)}", {mt}}}')
     if type_pairs:
-        steps.append(f"Typed = Table.TransformColumnTypes({prev}, {{{', '.join(type_pairs)}}})")
+        # CULTURE. Without a third argument, Table.TransformColumnTypes parses with the AMBIENT
+        # locale -- of whichever machine refreshes the model -- so a dot-decimal source silently
+        # becomes garbage on a comma-decimal host (issue #110: SUM(Sales) 1,131,591,720 against a
+        # true 2,297,200.86, every structural gate green). Pinned only where the rendering can be
+        # PROVEN; an unprovable case emits exactly what it did before rather than guessing a locale
+        # onto the user's data, which would corrupt a genuinely European file the other way.
+        culture, _reason = flatfile_culture(path, connector, relation)
+        culture_arg = f', "{escape_m_string(culture)}"' if culture else ""
+        steps.append(
+            f"Typed = Table.TransformColumnTypes({prev}, "
+            f"{{{', '.join(type_pairs)}}}{culture_arg})")
         prev = "Typed"
 
     body = ",\n\t\t\t\t".join(steps)

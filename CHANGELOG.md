@@ -12,6 +12,31 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.118.0` -> `2.119.0`): generated M no longer depends on the ambient
+  locale.** `Table.TransformColumnTypes` with no culture parses with the locale of whichever machine
+  REFRESHES the model, so a dot-decimal source is silently corrupted on a comma-decimal host: issue
+  #110 measured `SUM(Sales)` at **1,131,591,720 against a true 2,297,200.86**, with 25/75 numeric
+  oracle checks passing while TMDL deserialization, M syntax, the openability self-check and a
+  persisted cache were all green. The inflation ratio is `10^decimals`, so it DIFFERS PER COLUMN --
+  493x on one, 6,285x on another in the same table -- which is the fingerprint.
+  A culture is now pinned wherever the rendering can be **proven**, and only there:
+  a CSV this engine wrote (`hyper_reader.write_rows_csv` renders with Python `str()`, which is
+  invariant) gets `en-US`; a user's CSV has its convention **read off the file** -- `Csv.Document`
+  passes text through unchanged, so the convention is a property of the file, not a guess -- and gets
+  `en-US` or `de-DE` accordingly. That sniff parses with the `csv` module rather than splitting on
+  commas, because a comma-decimal file writes its numbers QUOTED (`"1.234,56"`) and a naive split
+  tears that into `1.234` + `56`, classifying a European file as American: the exact inversion the
+  check exists to prevent (measured while building it).
+  A **legacy ACE workbook** (`.xls`/`.xlsb`) gets NO culture and a loud warning instead. Its reader
+  returns cells already rendered in the host's locale; that locale is not knowable at generation time
+  and not observable from within M (`Culture.Current` returns `sourceQueryCulture`, not the Windows
+  locale), so no culture can be proven -- and the obvious guess is actively wrong, since pinning
+  `en-US` on a comma-decimal host is a no-op that leaves the values corrupt. OOXML `.xlsx`/`.xlsm`
+  are unaffected: they store numbers as invariant doubles, so nothing is parsed from text.
+  Corpus 29/29: culture coverage `0/70` -> `11` pinned, every remaining unpinned CSV partition has
+  **zero decimal columns** (no exposure), and all **3** legacy `.xls` partitions now warn, with no
+  false positives.
+
 - **tableau-migration (skill `2.117.0` -> `2.118.0`): an Excel navigation key is decided from the
   ACE identifier, KIND included -- and can no longer carry a `$`.** Tableau records an Excel object
   with the legacy ACE/OLEDB identifier (`table='[Orders$]'`), which `Excel.Workbook` does not

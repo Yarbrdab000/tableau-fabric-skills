@@ -3651,3 +3651,111 @@ def test_emitted_excel_M_never_carries_a_dollar_suffixed_navigation_key():
     assert 'Item="Orders", Kind="Sheet"' in m
     assert "Orders$" not in m
     assert "Excel.Workbook(" in m
+
+
+# -- M culture: generated M must not depend on the ambient locale (issue #110) -------------------
+# Table.TransformColumnTypes with no culture parses with the locale of whichever machine REFRESHES
+# the model. On a comma-decimal host a dot-decimal source is silently corrupted by 10^decimals --
+# measured SUM(Sales) at 1,131,591,720 against a true 2,297,200.86, with every structural gate green
+# (TMDL deserialization, M syntax, openability self-check, persisted cache). Only a numeric oracle
+# caught it, and the inflation ratio DIFFERS PER COLUMN, which is the fingerprint.
+
+def _csv(tmp_path, name, text):
+    p = tmp_path / name
+    p.write_text(text, encoding="utf-8", newline="")
+    return str(p)
+
+
+def test_sniff_reads_the_decimal_convention_off_the_FILE(tmp_path):
+    # Csv.Document passes the file's text through unchanged, so the convention is a property of the
+    # FILE and is decidable rather than guessable.
+    us = _csv(tmp_path, "us.csv", "Region,Sales\nWest,261.96\nEast,1000.5\n")
+    assert _C._sniff_csv_decimal_convention(us) == "dot"
+    eu = _csv(tmp_path, "eu.csv", 'Region,Sales\nWest,"1.234,56"\nEast,"2.000,10"\n')
+    assert _C._sniff_csv_decimal_convention(eu) == "comma"
+
+
+def test_sniff_parses_csv_properly_so_a_quoted_european_number_is_not_read_as_american(tmp_path):
+    # THE INVERSION THIS PREVENTS. A comma-decimal file writes its numbers QUOTED ("1.234,56");
+    # splitting naively on commas tears that into `1.234` and `56`, and the leading fragment reads as
+    # a dot-decimal -- classifying a European file as American and pinning the culture that corrupts
+    # it. Measured while building this: the naive split returned "dot" for the file below.
+    eu = _csv(tmp_path, "eu2.csv", 'A,B\n"1.234,56","7.890,12"\n')
+    assert _C._sniff_csv_decimal_convention(eu) == "comma"
+    assert _C.flatfile_culture(eu, "Csv.Document") == ("de-DE", "sniffed-comma")
+
+
+def test_sniff_is_fail_closed_when_the_file_shows_both_or_neither(tmp_path):
+    # A guess is worse than nothing here: pinning en-US on a European file corrupts it the other way.
+    mixed = _csv(tmp_path, "mixed.csv", 'A,B\nWest,1.5\nEast,"2,5"\n')
+    assert _C._sniff_csv_decimal_convention(mixed) is None
+    ints = _csv(tmp_path, "ints.csv", "Region,Qty\nWest,3\nEast,4\n")
+    assert _C._sniff_csv_decimal_convention(ints) is None
+    # an ambiguous DATE (01/02/2024) is not a decimal signal either, and must not be read as one
+    dates = _csv(tmp_path, "dates.csv", "Region,D\nWest,01/02/2024\n")
+    assert _C._sniff_csv_decimal_convention(dates) is None
+    assert _C.flatfile_culture(dates, "Csv.Document") == (None, "inconclusive")
+
+
+def test_a_csv_this_engine_wrote_gets_the_invariant_culture(tmp_path):
+    # hyper_reader.write_rows_csv renders every cell with Python str() -- invariant by construction --
+    # so en-US is PROVEN, not assumed, and the artifact becomes portable.
+    p = _csv(tmp_path, "x.csv", "A\n1\n")
+    assert _C.flatfile_culture(p, "Csv.Document", {"engine_written_csv": True}) == (
+        "en-US", "engine-written")
+
+
+def test_a_legacy_ACE_workbook_gets_no_culture_and_is_reported_instead():
+    # The .xls reader returns cells ALREADY RENDERED in the host locale. That locale is not knowable
+    # at generation time and not observable from within M (Culture.Current returns the model's
+    # sourceQueryCulture, not the Windows locale), so no culture can be proven -- and a wrong guess
+    # is worse than none: en-US on a comma-decimal host is a no-op that leaves the values corrupt.
+    assert _C.flatfile_culture(r"C:\d\a.xls", "Excel.Workbook") == (
+        None, "legacy-ace-host-rendered")
+    assert _C.flatfile_culture(r"C:\d\a.xlsb", "Excel.Workbook")[1] == "legacy-ace-host-rendered"
+    # ...whereas OOXML stores numbers as invariant doubles, so Excel.Workbook returns real numbers
+    # and there is nothing to parse with a culture at all.
+    assert _C.flatfile_culture(r"C:\d\a.xlsx", "Excel.Workbook") == (None, "ooxml-numeric")
+
+
+def test_emitted_M_pins_the_culture_it_can_prove(tmp_path):
+    p = _csv(tmp_path, "sales.csv", "Region,Sales\nWest,261.96\n")
+    rel = {"kind": "table", "name": "Sales", "flatfile_path": p,
+           "columns": [{"remote_name": "Sales", "model_name": "Sales", "tmdl_type": "double"}]}
+    m = _C.emit_flatfile_source(rel, {"flatfile_path": p}, "textscan")
+    assert 'Table.TransformColumnTypes(Promoted, {{"Sales", type number}}, "en-US")' in m
+
+
+def test_emitted_M_omits_the_culture_it_cannot_prove(tmp_path):
+    # Byte-unchanged from before for the unprovable case -- never a guessed locale on user data.
+    p = _csv(tmp_path, "amb.csv", "Region,Qty\nWest,3\n")
+    rel = {"kind": "table", "name": "Q", "flatfile_path": p,
+           "columns": [{"remote_name": "Qty", "model_name": "Qty", "tmdl_type": "int64"}]}
+    m = _C.emit_flatfile_source(rel, {"flatfile_path": p}, "textscan")
+    assert "Table.TransformColumnTypes(Promoted, {{\"Qty\", Int64.Type}})" in m
+    assert "en-US" not in m
+
+
+def test_locale_dependent_relations_names_the_legacy_workbook_and_nothing_else():
+    d = _C.parse_tds("""<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='X' inline='true' version='18.1'>
+  <connection class='excel-direct' filename='Sample - Superstore.xls' directory='C:/data'>
+    <relation connection='excel-direct.1' name='Orders' table='[Orders$]' type='table' />
+  </connection>
+  <column datatype='string' name='[Region]' role='dimension' type='nominal' />
+</datasource>""")
+    rows = _C.locale_dependent_flatfile_relations(d)
+    assert [r["table"] for r in rows] == ["Orders"]
+    assert rows[0]["reason"] == "legacy-ace-host-rendered"
+
+
+def test_locale_dependent_relations_is_silent_for_a_modern_workbook():
+    # The report has to be able to be EMPTY, or it says nothing.
+    d = _C.parse_tds("""<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='X' inline='true' version='18.1'>
+  <connection class='excel-direct' filename='Book.xlsx' directory='C:/data'>
+    <relation connection='excel-direct.1' name='Orders' table='[Orders$]' type='table' />
+  </connection>
+  <column datatype='string' name='[Region]' role='dimension' type='nominal' />
+</datasource>""")
+    assert _C.locale_dependent_flatfile_relations(d) == []
