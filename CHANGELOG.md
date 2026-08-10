@@ -12,6 +12,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.117.0` -> `2.118.0`): an Excel navigation key is decided from the
+  ACE identifier, KIND included -- and can no longer carry a `$`.** Tableau records an Excel object
+  with the legacy ACE/OLEDB identifier (`table='[Orders$]'`), which `Excel.Workbook` does not
+  accept: the model validates, opens and passes the definition of done, then fails at **refresh**
+  in Desktop with *"The key didn't match any rows in the table"* -- a failure no structural gate
+  can see, and which cost a reported ~90 minutes of an agent sitting on it (issue #108).
+  `_excel_navigation` now returns `(item, kind)` from one reading of the identifier and covers the
+  forms that previously slipped through: a quoted-then-bracketed `'[Orders$]'` (only one peel was
+  applied, so the brackets survived), a workbook-qualified `[Book].[Orders$]` (mangled), a RANGE
+  `[Sheet1$A1:D100]` (emitted verbatim -- the range bounds are not a navigation key, so its SHEET
+  is), and a **named range** `[MyNamedRange]`, which is not a worksheet at all and needs
+  `Kind="DefinedName"` -- navigating it as `Kind="Sheet"` failed identically. A bare `name`
+  fallback carries no kind information, so it stays `Sheet` rather than being guessed.
+  `_is_excel_path` now recognises the LEGACY binary formats (`.xls`/`.xlsb`) -- #108 was filed
+  against a `.xls`, and treating it as not-Excel skipped the sheet decision for exactly the files
+  that need it most. Sheet READING is split out into `_is_zip_readable_excel_path`, since a binary
+  workbook is not a zip, so header reconciliation still degrades fail-closed instead of mis-parsing.
+  Ships with an emitter-level guard that strips a surviving `$` unconditionally: no Excel sheet name
+  may contain `$`, so it cannot fire on legitimate input, and it turns "this path normalises" into a
+  guarantee that holds however the relation reached the emitter. Corpus 29/29 with **zero** change to
+  any navigation key and no `$`-suffixed key anywhere in emitted output.
+
 - **tableau-migration (skill `2.116.0` -> `2.117.0`): a lost Tableau session must not read as
   "this workbook has no dependencies".** The `401002` handling from #97 lived in
   `fidelity_reference` only, so `estate_survey` -- written later on the same transport -- inherited

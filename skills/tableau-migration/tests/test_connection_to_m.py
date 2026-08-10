@@ -3586,3 +3586,68 @@ def test_hidden_prune_noop_when_nothing_hidden():
     assert len(case) == 7 and not any(case.values())
     contact = _prune_cols(desc, "Contact")
     assert len(contact) == 3 and not any(contact.values())
+
+
+# -- Excel navigation key + kind (issue #108) --------------------------------------------------
+# Tableau records an Excel object with the legacy ACE/OLEDB identifier (`table='[Orders$]'`).
+# Power Query does not accept that form: the model validates, opens and passes the definition of
+# done, then fails at REFRESH in Desktop with "The key didn't match any rows in the table" -- a
+# failure no structural gate can see.
+import connection_to_m as _C
+
+
+def test_excel_navigation_maps_the_ace_identifier_to_a_power_query_key():
+    assert _C._excel_navigation({"raw_table": "[Orders$]"}) == ("Orders", "Sheet")
+    assert _C._excel_navigation({"item": "Orders$"}) == ("Orders", "Sheet")
+    # the relation's plain name never carried the $ convention and is already correct
+    assert _C._excel_navigation({"name": "Orders"}) == ("Orders", "Sheet")
+    # raw_table wins over name, and both agree after normalisation
+    assert _C._excel_navigation({"raw_table": "[Orders$]", "name": "Orders"}) == ("Orders", "Sheet")
+
+
+def test_excel_navigation_handles_quoted_and_qualified_identifiers():
+    # a quoted-then-bracketed identifier needs both peels
+    assert _C._excel_navigation({"raw_table": "'[Orders$]'"}) == ("Orders", "Sheet")
+    # a workbook/schema-qualified identifier keeps only the object itself
+    assert _C._excel_navigation({"raw_table": "[Book].[Orders$]"}) == ("Orders", "Sheet")
+
+
+def test_excel_navigation_derives_the_KIND_not_just_the_name():
+    # No $ on an authoritative identifier means it is NOT a worksheet. Navigating a defined name
+    # with Kind="Sheet" fails at refresh exactly like the $-suffixed key does.
+    assert _C._excel_navigation({"raw_table": "[MyNamedRange]"}) == ("MyNamedRange", "DefinedName")
+    # ...but a bare `name` fallback carries no kind information, so it stays a Sheet (historical and
+    # overwhelmingly common behaviour) rather than being guessed into a DefinedName.
+    assert _C._excel_navigation({"name": "MyNamedRange"}) == ("MyNamedRange", "Sheet")
+
+
+def test_excel_navigation_of_a_RANGE_navigates_its_sheet():
+    # `Sheet1$A1:D100` is a range ON a sheet; the range bounds are not expressible as a navigation
+    # key, and a sheet name cannot contain `$`, so the sheet is the navigable object.
+    assert _C._excel_navigation({"raw_table": "[Sheet1$A1:D100]"}) == ("Sheet1", "Sheet")
+
+
+def test_is_excel_path_recognises_the_LEGACY_binary_formats():
+    # #108 was filed against a .xls. Treating it as not-Excel skipped the sheet-name decision for
+    # exactly the files that need it most.
+    for ext in (".xls", ".xlsx", ".xlsm", ".xlsb"):
+        assert _C._is_excel_path("book" + ext), ext
+    assert not _C._is_excel_path("book.csv")
+    # ...but only the OOXML (zip) formats can actually have their sheets READ, so header
+    # reconciliation still degrades to "cannot read" for the binary ones rather than mis-parsing.
+    assert _C._is_zip_readable_excel_path("book.xlsx")
+    assert not _C._is_zip_readable_excel_path("book.xls")
+    assert not _C._is_zip_readable_excel_path("book.xlsb")
+
+
+def test_emitted_excel_M_never_carries_a_dollar_suffixed_navigation_key():
+    # End-to-end on the emitter, with the exact relation shape from the issue.
+    rel = {"kind": "table", "name": "Orders", "raw_table": "[Orders$]", "item": "Orders$",
+           "flatfile_path": r"C:\data\Sample - Superstore.xls",
+           "columns": [{"remote_name": "Region", "model_name": "Region", "tmdl_type": "string"}]}
+    m = _C.emit_flatfile_source(rel, {"flatfile_path": r"C:\data\Sample - Superstore.xls"},
+                                "excel-direct")
+    assert m is not None
+    assert 'Item="Orders", Kind="Sheet"' in m
+    assert "Orders$" not in m
+    assert "Excel.Workbook(" in m

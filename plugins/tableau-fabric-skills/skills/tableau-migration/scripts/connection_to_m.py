@@ -2519,16 +2519,61 @@ def _unquote_tableau_identifier(raw):
     return s
 
 
+def _excel_navigation(relation):
+    """The ``(item, kind)`` pair to navigate an Excel relation with, e.g. ``("Orders", "Sheet")``.
+
+    Tableau records an Excel object with the legacy ACE/OLEDB identifier in the relation's ``table``
+    attribute, and Power Query's ``Excel.Workbook`` does not accept that form -- a ``$``-suffixed key
+    refreshes as *"The key didn't match any rows in the table"*, a failure that appears ONLY at
+    refresh in Desktop, long after every structural gate has passed (issue #108).
+
+    The ACE convention carries the object's KIND, so both halves are decided here from one reading:
+
+    * ``[Orders$]``            -> ``("Orders", "Sheet")``        -- a worksheet.
+    * ``[Sheet1$A1:D100]``     -> ``("Sheet1", "Sheet")``        -- a RANGE on a sheet; Power Query
+      navigates the sheet, and the range's own bounds are not expressible as a navigation key.
+    * ``[MyNamedRange]``       -> ``("MyNamedRange", "DefinedName")`` -- no ``$`` means it is not a
+      worksheet, and navigating it as ``Kind="Sheet"`` fails the same way.
+    * ``[Book].[Orders$]``     -> ``("Orders", "Sheet")``        -- a schema-qualified identifier
+      keeps only its LAST segment.
+
+    The kind is inferred ONLY from the authoritative ``raw_table``/``item`` (which carry the ``$``
+    convention). When neither is present the relation's plain ``name`` is used, and that name never
+    carried the convention in the first place -- so the kind stays ``Sheet``, which is both the
+    overwhelmingly common case and the historical behaviour.
+    """
+    authoritative = relation.get("raw_table") or relation.get("item") or ""
+    raw = authoritative or relation.get("name") or ""
+    s = _unquote_tableau_identifier(raw)
+    # A quoted-then-bracketed identifier ('[Orders$]') needs both peels, in either order.
+    for _ in range(3):
+        peeled = _unquote_tableau_identifier(s)
+        if peeled == s:
+            break
+        s = peeled
+    if "].[" in s:                      # schema/workbook-qualified -> keep the object itself
+        s = _unquote_tableau_identifier(s.rsplit("].[", 1)[-1])
+    s = s.strip()
+    if not s:
+        return "", "Sheet"
+    if "$" in s:
+        sheet, _, tail = s.partition("$")
+        # ``Sheet1$`` is the sheet; ``Sheet1$A1:D100`` is a range ON that sheet. Either way the
+        # navigable object is the sheet, and a sheet name cannot itself contain ``$``.
+        return (sheet or s), "Sheet"
+    if authoritative:
+        return s, "DefinedName"
+    return s, "Sheet"
+
+
 def _excel_sheet_name(relation):
     """The Excel sheet name to navigate for a relation (``[Orders$]`` -> ``Orders``).
 
-    Tableau exposes a worksheet as ``[<sheet>$]`` (the ODBC sheet convention); Power Query's
-    ``Excel.Workbook`` navigation keys the sheet by its bare name with ``Kind="Sheet"``. The
-    trailing ``$`` strip is Excel-specific and deliberately not shared with other file connectors.
+    Thin wrapper over :func:`_excel_navigation` kept for the header-reconciliation caller, which
+    needs the sheet name only. A named range resolves to its own name, which is what
+    ``read_flatfile_headers`` should look for.
     """
-    s = _unquote_tableau_identifier(
-        relation.get("raw_table") or relation.get("item") or relation.get("name") or "")
-    return s[:-1] if s.endswith("$") else s
+    return _excel_navigation(relation)[0]
 
 
 def _access_table_name(relation):
@@ -2706,6 +2751,26 @@ def _read_xlsx_sheet_headers(path):
 
 
 def _is_excel_path(path):
+    """True for any Excel workbook, INCLUDING the legacy binary formats.
+
+    ``.xls``/``.xlsb`` are not readable as zips, so header RECONCILIATION still degrades to "cannot
+    read" for them -- but they are unambiguously Excel, and treating them as not-Excel meant the
+    sheet-name decision was skipped for exactly the legacy files that need it most (issue #108 was
+    filed against a ``.xls``).
+    """
+    try:
+        return str(path).lower().endswith((".xlsx", ".xlsm", ".xls", ".xlsb"))
+    except Exception:
+        return False
+
+
+def _is_zip_readable_excel_path(path):
+    """True only for the OOXML (zip) Excel formats whose sheets this module can actually read.
+
+    ``read_flatfile_headers`` opens a workbook as a zip; a legacy ``.xls``/``.xlsb`` is OLE/binary
+    and simply is not readable that way, so header reconciliation must skip it (fail-closed) rather
+    than mis-parse it.
+    """
     try:
         return str(path).lower().endswith((".xlsx", ".xlsm"))
     except Exception:
@@ -2791,7 +2856,7 @@ def reconcile_flatfile_headers(descriptor):
         path = rel.get("flatfile_path") or ff_path
         if not path:
             continue
-        sheet = _excel_sheet_name(rel) if _is_excel_path(path) else None
+        sheet = _excel_sheet_name(rel) if _is_zip_readable_excel_path(path) else None
         headers = read_flatfile_headers(path, sheet=sheet)
         if not headers:
             continue
@@ -2928,9 +2993,18 @@ def emit_flatfile_source(relation, conn, cls):
     contents = _flatfile_contents_expr(path, conn)
     steps = []
     if connector == "Excel.Workbook":
-        sheet = escape_m_string(_excel_sheet_name(relation))
+        item, kind = _excel_navigation(relation)
+        # Belt AND braces. The identifier normalisation above is the fix; this assertion is what
+        # makes it a GUARANTEE rather than a claim, because the failure it prevents is invisible to
+        # every structural gate -- the model validates, opens, and passes the definition of done,
+        # then fails at refresh in Desktop with "The key didn't match any rows in the table".
+        # A ``$``-suffixed key can only mean an un-normalised ACE identifier reached this point, and
+        # no Excel sheet name may contain ``$``, so this can never fire on legitimate input.
+        if item.endswith("$"):
+            item = item[:-1]
+        sheet = escape_m_string(item)
         steps.append(f'Source = Excel.Workbook({contents}, null, true)')
-        steps.append(f'Navigation = Source{{[Item="{sheet}", Kind="Sheet"]}}[Data]')
+        steps.append(f'Navigation = Source{{[Item="{sheet}", Kind="{kind}"]}}[Data]')
         steps.append("Promoted = Table.PromoteHeaders(Navigation, [PromoteAllScalars=true])")
         prev = "Promoted"
     elif connector == "Access.Database":
