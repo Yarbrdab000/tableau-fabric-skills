@@ -14,6 +14,27 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **tableau-migration (skill `2.107.0` -> `2.108.0`): a measure name has to be referenceable in DAX**
+  (issue #102, part 1). Tableau names an unnamed calc after its own FORMULA, so measures landed
+  called `SUM([Sales])-SUM([Sales Target].[Sales Target])`. TMDL round-trips that and every
+  structural gate passes — but `[` and `]` **delimit an identifier in DAX**, so any query that
+  references the measure by name dies with `Invalid token, Line 8, Offset 66, ]`, far from the cause.
+  Latent while the measure is a stub; a hard failure the moment real DAX is authored for it or a
+  visual binds it by name.
+  - Brackets are **removed**, not substituted: `SUM(Sales)-SUM(Sales Target.Sales Target)` is what a
+    person would have called it anyway. The workbook's original caption is preserved verbatim on the
+    `TableauFormula` annotation, and the naming map now keys the ORIGINAL caption to the emitted
+    name, so everything that joins on the caption still resolves.
+  - Applied at the single point every measure is emitted, so it covers all eleven emission paths;
+    the report rows, the cross-calc reference targets (`measure_refs`) and the calc bindings all
+    record the name the measure was actually emitted under, so a renamed measure can never be
+    referenced as something the model does not contain.
+  - Stripping can make two names collide, which is safe because the emitter already de-duplicates
+    measure names (2.106.0).
+  - **Measured across the corpus: 17 un-referenceable measure names -> 0**, with 29/29 workbooks
+    still building. Locked by a test asserting the invariant over the whole `_Measures` table rather
+    than the one observed name, plus a purity/idempotence test on the helper.
+
 - **tableau-migration (skill `2.106.0` -> `2.107.0`): a worksheet field belongs to its OWN
   datasource's copy of a table.** On a workbook that consolidates several embedded datasources, a
   dashboard's slicers filtered **nothing** and grouping by a dimension returned the **grand total on

@@ -134,6 +134,31 @@ except ImportError:
     import linguistic as L
 
 
+def dax_safe_measure_name(name):
+    """A measure name that can actually be REFERENCED in DAX. Pure, deterministic, idempotent.
+
+    Tableau names an unnamed calc after its own formula, so a measure can land called
+    ``SUM([Sales])-SUM([Sales Target].[Sales Target])``. TMDL round-trips that happily and every
+    structural gate passes -- but ``[`` and ``]`` DELIMIT AN IDENTIFIER in DAX, so any query that
+    references the measure by name dies with ``Invalid token, Line 8, Offset 66, ]`` far from the
+    cause. It is latent while the measure is a stub and becomes a hard failure the moment someone
+    authors real DAX for it or a visual binds it by name.
+
+    Brackets are removed rather than substituted: ``SUM(Sales)-SUM(Sales Target.Sales Target)`` is
+    what a person would have called it anyway, whereas swapping in parentheses keeps the noise
+    without the meaning. Stripping can make two distinct names collide, which is safe here because
+    the emitter already de-duplicates measure names (see ``_gen_measure``). The original is always
+    preserved verbatim on the ``TableauFormula`` annotation, so nothing is lost.
+    """
+    text = str(name or "")
+    if "[" not in text and "]" not in text:
+        return text
+    cleaned = text.replace("[", "").replace("]", "")
+    # Collapse whitespace the removal may have doubled up, and never return an empty name.
+    cleaned = " ".join(cleaned.split())
+    return cleaned or text
+
+
 def _table_display(rel):
     return rel.get("name") or rel.get("item") or "Table"
 
@@ -1239,7 +1264,7 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
 
     def _gen_measure(name, formula, dax=None, **kw):
         """Emit one measure into ``_measure_parts``, keeping names unique. -> emitted name."""
-        base = (name or "").strip()
+        base = dax_safe_measure_name(name).strip()
         expr = dax if dax else "BLANK()"
         prior = _emitted_measures.get(base.lower())
         if prior is not None and prior == expr:
@@ -1350,7 +1375,7 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         _adax, _atbl = _approved_entry(_aval)
         if not _adax:
             continue
-        _aentry = (_anm, _approved_dtype(_aval) or "number")
+        _aentry = (dax_safe_measure_name(_anm), _approved_dtype(_aval) or "number")
         measure_refs[_anm.lower()] = _aentry
         if _atid:
             measure_refs[_atid.lower()] = _aentry
@@ -1368,7 +1393,8 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                 measure_refs=measure_refs, known_tables=known_tables, inline_calcs=inline_calcs,
                 related_tables=related_tables, conformed_hubs=conformed_hubs)
             if cdax:
-                entry = (cname, cdtype or "number")
+                # The reference must name the measure as EMITTED, not as Tableau captioned it.
+                entry = (dax_safe_measure_name(cname), cdtype or "number")
                 measure_refs[cname.strip().lower()] = entry
                 tid = calc.get("internal_name")
                 if tid:
@@ -1443,7 +1469,7 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             if _fdax:
                 dax, reason, flag_gated = _fdax, "ok", True
         row = {
-            "measure": name,
+            "measure": dax_safe_measure_name(name),
             "status": "translated" if dax else "stub",
             "reason": reason,
             "dax": dax,
@@ -1510,7 +1536,10 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     # preserves its original Tableau formula as ``TableauFormula`` and is tagged with the addressing
     # provenance; its ``source`` carries the full instance token + bare calc id the binder joins on.
     for r in tablecalc_rows:
-        _gen_measure(
+        # Record the name the measure was actually EMITTED under: a derived table-calc name is built
+        # from its base's Tableau caption, so it inherits any DAX-hostile brackets and would leave
+        # the report row naming an object the model does not contain.
+        r["measure"] = _gen_measure(
             r["measure"], r["tableau_formula"], r["dax"],
             translated_by=r.get("translated_by") or "deterministic (workbook addressing)",
             format_string=_fmt(r["measure"]))
@@ -1518,10 +1547,13 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     # Emit the synthesized parameter-driven date-window keep-flag measures last. Each supersedes
     # its source calc's plain stub (skipped above) and preserves the original Tableau formula.
     for fm in (flag_measures or []):
-        _gen_measure(
+        _emitted = _gen_measure(
             fm["measure"], fm.get("tableau_formula", ""), fm["dax"],
             translated_by=fm.get("translated_by") or "deterministic (parameter-driven date window)",
             format_string=_fmt(fm["measure"]))
+        fm["measure"] = _emitted
+        if isinstance(fm.get("report_row"), dict):
+            fm["report_row"]["measure"] = _emitted
         report.append(fm["report_row"])
     # View-only quick table calcs (running total, YTD, moving average, ...) are reproduced in the
     # REPORT layer as Power BI Visual Calculations, not model measures -- but each references a
@@ -1531,7 +1563,7 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     # the workbook actually carries such a view-only quick table calc. The appended rows flow into
     # ``_row_count_targets`` so the viz layer binds the implicit-count pill to this measure for free.
     for br in _visual_calc_base_measures(table_calc_usages, known_tables, report):
-        _gen_measure(
+        br["measure"] = _gen_measure(
             br["measure"], br["tableau_formula"], br["dax"],
             translated_by=br.get("translated_by") or "deterministic (visual-calculation base measure)",
             format_string=_fmt(br["measure"]))
@@ -1861,6 +1893,11 @@ def build_model_manifest(*, table_names, relations, measure_report, calc_column_
         measures.append({"model_table": mtbl, "model_name": nm,
                          "status": row.get("status"), "source": src})
         _name(nm, mtbl, nm, "measure")
+        # A measure whose name had to be made DAX-safe (Tableau names an unnamed calc after its own
+        # formula, and ``[``/``]`` delimit an identifier in DAX) is emitted under a DIFFERENT name
+        # than the workbook's caption. The viz layer joins on the CAPTION, so key that too or every
+        # reference to a renamed measure dangles.
+        _name(src.get("field_caption"), mtbl, nm, "measure")
         for tok in (src.get("calc_instance_token"), src.get("calc_id")):
             if tok:
                 _name(str(tok), mtbl, nm, "measure")

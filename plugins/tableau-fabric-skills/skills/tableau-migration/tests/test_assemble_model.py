@@ -204,6 +204,42 @@ def test_every_emitted_measure_name_is_unique_across_the_whole_measures_table():
     assert len(names) == len(set(names)), sorted(names)
 
 
+def test_measure_names_are_referenceable_in_dax_no_brackets_survive():
+    # Issue #102. Tableau names an unnamed calc after its own FORMULA, so a measure can land called
+    # `SUM([Sales])-SUM([Sales Forecast])`. TMDL round-trips it and every structural gate passes --
+    # but "[" and "]" delimit an identifier in DAX, so any query referencing the measure by name
+    # fails to parse ("Invalid token, Line 8, Offset 66, ]") far from the cause. Latent while the
+    # measure is a stub; a hard failure the moment real DAX is authored for it or a visual binds it.
+    #
+    # The invariant, stated over the WHOLE _Measures table rather than the one observed name.
+    calcs = [
+        {"name": "SUM([Sales])-SUM([Sales Forecast])", "formula": "SUM([Sales])-SUM([Sales])"},
+        {"name": "Profit Ratio", "formula": "SUM([Sales])/SUM([Quantity])"},
+    ]
+    out = migrate_tds_to_semantic_model(LIVE_SQLSERVER, model_name="Superstore", calcs=calcs)
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    names = re.findall(r"^\s*measure\s+('(?:[^']|'')*'|[^\s=]+)\s*=", measures, re.M)
+    assert names, "expected at least one measure"
+    offenders = [n for n in names if "[" in n or "]" in n]
+    assert not offenders, offenders
+
+    # the ordinary name is untouched, and the original caption survives verbatim as provenance
+    assert "measure 'Profit Ratio'" in measures
+    assert "annotation TableauFormula = SUM([Sales])-SUM([Sales])" in measures
+
+
+def test_dax_safe_measure_name_is_pure_and_idempotent():
+    # Pure helper, so it can be reasoned about on its own: bracket-free names pass through
+    # UNCHANGED (a single-datasource model must not churn), and applying it twice changes nothing.
+    from assemble_model import dax_safe_measure_name as f
+    assert f("Profit Ratio") == "Profit Ratio"
+    assert f("SUM([Sales])-SUM([Sales Target].[Sales Target])") == "SUM(Sales)-SUM(Sales Target.Sales Target)"
+    assert f(f("SUM([Sales])")) == f("SUM([Sales])")
+    # never returns an empty name, whatever the input
+    assert f("[]") == "[]"
+    assert f("") == ""
+
+
 def test_row_level_measure_role_calc_reroutes_to_column():
     # Tableau labels a purely row-level numeric calc a *measure* (by output type), so it lands on the
     # measure path where its bare field references correctly stub. The faithful Power BI form is a DAX
@@ -967,10 +1003,17 @@ def _pcdf_usage(**kw):
 
 
 def test_pct_diff_quick_calc_emits_second_measure_keyed_by_instance_token():
-    # The pilot's TWO-measure pcdf shape: the NAMED base [count orders] + 100 emits as an ordinary
+    # The pilot's TWO-measure pcdf shape: the NAMED base "[count orders] + 100" emits as an ordinary
     # measure under its BARE token, and the percent-difference quick table calc OVER it emits as a
     # SEPARATE derived measure (intent-suffixed name) bound ONLY by its full instance token -- the
     # bare token stays the base's key, so the heat grid never mis-binds to the untransformed base.
+    #
+    # The EMITTED names drop the brackets. This test previously asserted the bracketed Tableau
+    # caption verbatim; that was a latent hard failure, not a naming preference: "[" and "]" delimit
+    # an identifier in DAX, so any query referencing the measure by name dies with
+    # "Invalid token, ... ]" far from the cause (issue #102, hit while querying a real Superstore
+    # model). The workbook caption is still preserved verbatim on the TableauFormula annotation and
+    # still resolves through the naming map, so nothing that joins on the caption is affected.
     calcs = [
         {"name": "count orders", "formula": f"ZN(COUNT({_OID}))",
          "internal_name": "Calculation_0014172369248279"},
@@ -982,10 +1025,10 @@ def test_pct_diff_quick_calc_emits_second_measure_keyed_by_instance_token():
     rows = {r["measure"]: r for r in out["report"]["measures"]}
 
     # the untransformed base measure emits under its own name (the bare-token binding)
-    assert rows["[count orders] + 100"]["status"] == "translated"
+    assert rows["count orders + 100"]["status"] == "translated"
 
     # the pcdf emits as a DISTINCT, intent-suffixed measure -- not a duplicate of the base
-    pcdf_name = "[count orders] + 100 (percent difference from a prior row)"
+    pcdf_name = "count orders + 100 (percent difference from a prior row)"
     pr = rows[pcdf_name]
     assert pr["status"] == "translated"
     assert pr["dax"].startswith("DIVIDE(")
@@ -1001,7 +1044,7 @@ def test_pct_diff_quick_calc_emits_second_measure_keyed_by_instance_token():
     # binding: the pcdf joins by its full instance token; the BARE token still resolves to the BASE
     b = out["report"]["calc_bindings"]
     assert b["pcdf:usr:Calculation_0014172369735704:qk"]["measure_name"] == pcdf_name
-    assert b["Calculation_0014172369735704"]["measure_name"] == "[count orders] + 100"
+    assert b["Calculation_0014172369735704"]["measure_name"] == "count orders + 100"
 
 
 def _rank_quick_usage(**kw):
