@@ -14,6 +14,30 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **tableau-migration (skill `2.109.0` -> `2.110.0`): the trellis collapse, fixed for BOTH spellings
+  this time.** 2.105.0 fixed only half of it. Tableau writes "another axis in the same rectangle"
+  **two** ways — a FOLD (two axes over different measures) and an **INDEX** (two axes over the same
+  measure) — and 2.105.0 gated only the fold. The index branch still set "this sheet is dual-axis"
+  unconditionally, so a trellis whose **first column happens to be internally dual** collapsed
+  exactly as before: measured on `Engagements by Dimension` (the Staff Capacity dashboard), where a
+  single `x-index='1'` pane rebuilt a four-chart block as ONE combo chart spanning the dashboard.
+  - **One rule now replaces both branches**, so there is no third spelling left to miss: count
+    RECTANGLES as `distinct axis names - folded ones`, and the sheet is a dual axis only when they
+    collapse to one. An index needs no subtraction — it repeats a name already counted, and
+    subtracting it too would erase a rectangle that genuinely exists.
+  - **Why the two spellings are treated differently rather than symmetrically:** across every
+    workbook available, exactly ONE sheet pairs an index with 2+ distinct axis names — and it is the
+    trellis above. Every real different-measure dual axis (SUM+AVG, pareto, control chart,
+    previous-vs-current-year) carries a fold and no index. One long-standing test fixture asserted
+    the index-only spelling for a Bar+Bar dual axis; it has been corrected to the fold its own source
+    sheet (`0085 "Small Bar (2)"`) actually writes, because relying on a shape Tableau does not emit
+    is what let this through.
+  - **Verified globally, not on the reported workbook.** A classifier reads the source XML of every
+    worksheet in every corpus workbook, computes the rectangle count, and cross-checks the emitted
+    output: **27 multi-axis sheets across 9 workbooks — 20 dual, 7 trellis — and zero trellises
+    collapse into a wide combo.** Staff Capacity's block went from 1 combo to 4 side-by-side bar
+    charts, matching the Tableau render. Suite 4300, corpus 29/29.
+
 - **tableau-migration (skill `2.108.0` -> `2.109.0`): a sentinel date column must not bound the
   calendar** (issue #102, part 2). A small lookup whose date column is a PLACEHOLDER — every row the
   same `1/1/02` or `1900-01-01`, a very common Excel/CSV idiom — is still a related fact date column,

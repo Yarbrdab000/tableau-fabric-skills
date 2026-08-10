@@ -1521,35 +1521,49 @@ def _pane_mark_map(table, measure_axis=None):
     axis = measure_axis if measure_axis in ("x", "y") else "y"
     name_attr = "{0}-axis-name".format(axis)
     index_attr = "{0}-index".format(axis)
+    axis_panes = 0
     for pane in _children_local(panes_el, "pane"):
         mk_el = _first(pane, "mark")
         mk = mk_el.get("class") if mk_el is not None else None
         idx = _attr_local(pane, index_attr)
-        if idx not in (None, "", "0"):
-            has_secondary_axis = True
+        is_indexed = idx not in (None, "", "0")
         axis_name = _attr_local(pane, name_attr)
+        if axis_name or is_indexed:
+            axis_panes += 1
         if axis_name:
             toks = _BRACKET_TOKEN_RE.findall(axis_name)
             if toks:
                 mark_by_instance[toks[-1]] = mk
         elif primary_mark is None and mk:
             primary_mark = mk
-    if len(mark_by_instance) > 1:
-        # DISTINCT AXIS NAMES ALONE ARE NOT A DUAL AXIS -- they are also exactly how Tableau
-        # spells a SIDE-BY-SIDE measure trellis, which serialises identically (leading blank pane
-        # + one named pane per measure, no index anywhere). Treating the two as the same thing
-        # rebuilt a 5-measure trellis as ONE combo chart spanning the whole dashboard where the
-        # source draws five separate bar charts (measured on the "Intake Details" sheet, whose
-        # Tableau render is five side-by-side panes).
-        #
-        # What separates them is which axes share a RECTANGLE: a folded axis is drawn on top of
-        # another, so the rectangle count is (distinct axis names - folded ones). One rectangle
-        # with 2+ names is a genuine dual axis; two or more rectangles is a trellis -- including
-        # the mixed case of a trellis whose columns are each internally dual (6 names, 3 folded
-        # -> 3 rectangles), which must still split.
-        folded = _folded_axis_instances(table, axis)
-        if len(set(mark_by_instance) - folded) <= 1:
-            has_secondary_axis = True
+    # ONE RULE FOR BOTH SPELLINGS: a dual axis is measure axes that share ONE RECTANGLE.
+    #
+    # Tableau writes "another axis in the same rectangle" two ways -- an INDEX >= 1 (two axes over the
+    # SAME measure: a line + its area fill, a lollipop's stick + head) and a FOLD (two axes over
+    # DIFFERENT measures, where the names already disambiguate). Neither spelling means "dual axis" on
+    # its own, because both also occur INSIDE a side-by-side measure trellis, which is serialised
+    # identically: a leading blank pane plus one named pane per measure.
+    #
+    # Gating only the fold left the index ungated, and a trellis whose FIRST column happens to be
+    # internally dual still collapsed: measured on "Engagements by Dimension" (Staff Capacity), five
+    # measures on Cols where the first is drawn on two axes -- one ``x-index='1'`` pane was enough to
+    # rebuild the whole block as ONE combo chart spanning the dashboard.
+    #
+    # So count RECTANGLES: distinct axis NAMES minus the FOLDED ones. An index needs no subtraction --
+    # it repeats a name already in the map, so the dedupe by instance has counted that rectangle once
+    # already. Subtracting it too would erase a rectangle that genuinely exists, turning a two-column
+    # trellis whose first column is dual back into a combo.
+    #
+    # Evidence for treating the two spellings differently rather than symmetrically: across every
+    # workbook available, exactly ONE sheet pairs an index with 2+ distinct axis names -- and it is
+    # the trellis above. Every real DIFFERENT-measure dual axis (SUM+AVG, pareto, control chart,
+    # previous-vs-current-year) carries a fold and no index.
+    #
+    # ``axis_panes >= 2`` keeps an ordinary single-axis chart out of it.
+    overlaid = _folded_axis_instances(table, axis)
+    rectangles = len(set(mark_by_instance) - overlaid)
+    if axis_panes >= 2 and rectangles <= 1:
+        has_secondary_axis = True
     return mark_by_instance, primary_mark, has_secondary_axis
 
 

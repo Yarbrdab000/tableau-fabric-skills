@@ -394,24 +394,91 @@ def test_two_measures_same_mark_stay_clustered_not_combo():
     # third of the plot height. An invisible series is the same failure as an error tile, so the
     # secondary-axis measure goes to Y2 and keeps its scale -- trading one mark type (Power BI draws
     # a Y2 series as a line) for both series actually being visible.
+    #
+    # The fixture carries the FOLD marker rather than an index, because that is how the real sheet it
+    # was derived from (0085 "Small Bar (2)") spells it. Checked across every available workbook:
+    # every DIFFERENT-measure dual axis carries a fold and no index, and the single real sheet that
+    # pairs an index with 2+ distinct axis names is a side-by-side TRELLIS, not a dual axis. The
+    # earlier index-only spelling here was therefore a shape Tableau does not emit for this case, and
+    # relying on it is what let a trellis whose first column is internally dual collapse into one
+    # combo chart.
+    style = (
+        "<style><style-rule element='axis'>"
+        "<encoding attr='space' class='0' field='[federated.abc].[sum:Profit:qk]' "
+        "field-type='quantitative' fold='true' scope='rows' synchronized='true' type='space' />"
+        "</style-rule></style>")
     panes = (
         "<panes>"
         "<pane><mark class='Bar' /></pane>"
         "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'>"
         "<mark class='Bar' /></pane>"
-        "<pane id='2' y-index='1' y-axis-name='[federated.abc].[sum:Profit:qk]'>"
+        "<pane id='2' y-axis-name='[federated.abc].[sum:Profit:qk]'>"
         "<mark class='Bar' /></pane>"
         "</panes>")
     ws = _combo_worksheet(
         "Both Bars",
         rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
         cols="[federated.abc].[mn:Order Date:ok]",
-        panes=panes, deps_extra=_INST)
+        panes=panes, deps_extra=_INST, style=style)
     w = parse_twb(_workbook(ws))["worksheets"][0]
     assert w["visual_type"] == "combo"
     # shelf order decides which axis is secondary: Tableau writes the primary first
     assert [f["caption"] for f in w["combo_split"]["Y"]] == ["Sales"]
     assert [f["caption"] for f in w["combo_split"]["Y2"]] == ["Profit"]
+
+
+def test_a_trellis_whose_column_is_internally_dual_still_splits():
+    # REGRESSION ON THE REGRESSION. 2.105.0 fixed the FOLD spelling but left the INDEX spelling
+    # ungated, so this shape still collapsed: a five-measure trellis whose FIRST column is itself
+    # drawn on two axes. One `x-index='1'` pane was enough to rebuild the whole block as ONE combo
+    # chart spanning the dashboard. Measured on "Engagements by Dimension" (the Staff Capacity
+    # dashboard of the Salesforce Nonprofit workbook), whose Tableau render is four side-by-side
+    # charts -- the same failure the previous fix was supposed to have ended.
+    #
+    # Tableau writes "another axis in the same rectangle" TWO ways and BOTH occur inside a trellis,
+    # so neither can mean "dual axis" on its own. The rule counts RECTANGLES: an axis overlaid on
+    # another -- folded OR indexed -- does not occupy one of its own. Here that is
+    # 3 distinct names - 1 indexed = 2 rectangles -> a trellis.
+    panes = (
+        "<panes>"
+        "<pane><mark class='Bar' /></pane>"
+        "<pane id='1' x-axis-name='[federated.abc].[sum:Sales:qk]'>"
+        "<mark class='Bar' /></pane>"
+        # the first column's SECOND axis: same measure, overlaid via the index
+        "<pane id='2' x-index='1' x-axis-name='[federated.abc].[sum:Sales:qk]'>"
+        "<mark class='Bar' /></pane>"
+        "<pane id='3' x-axis-name='[federated.abc].[sum:Profit:qk]'>"
+        "<mark class='Bar' /></pane>"
+        "</panes>")
+    ws = _combo_worksheet(
+        "Trellis With A Dual Column",
+        rows="[federated.abc].[none:Category:nk]",
+        cols="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+        panes=panes, deps_extra=_INST)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["combo_split"] is None
+    assert w["visual_type"] != "combo"
+
+
+def test_two_axes_over_the_same_measure_are_still_one_dual_axis():
+    # The other side of the same rule, so the fix above cannot be satisfied by simply never
+    # detecting a dual axis: two axes over the SAME measure (a lollipop's stick + head, a line and
+    # its area fill) are one rectangle and stay a dual axis. 1 distinct name - 1 indexed = 0.
+    panes = (
+        "<panes>"
+        "<pane><mark class='Bar' /></pane>"
+        "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'>"
+        "<mark class='Bar' /></pane>"
+        "<pane id='2' y-index='1' y-axis-name='[federated.abc].[sum:Sales:qk]'>"
+        "<mark class='Line' /></pane>"
+        "</panes>")
+    ws = _combo_worksheet(
+        "Same Measure Dual Axis",
+        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Sales:qk])",
+        cols="[federated.abc].[mn:Order Date:ok]",
+        panes=panes, deps_extra=_INST)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["dual_axis"] is True
 
 
 def test_side_by_side_measure_trellis_is_not_a_dual_axis():
