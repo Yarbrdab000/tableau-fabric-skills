@@ -14,6 +14,43 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **tableau-migration (skill `2.112.0` -> `2.113.0`): the PBIR objects and roles we emit have to be
+  the ones the visual actually installs** (issue #100). Every name below was checked against the
+  installed visual capabilities (`catalog describe` / `formatting describe-object`), and the result
+  measured with Microsoft's own PBIR validator across the corpus:
+  **10 of 29 reports had errors -> 3; 32 total errors -> 4** (the remaining 4 are a pre-existing,
+  unrelated `PBIR_ROLE_MAX_EXCEEDED`).
+  - **Small multiples used an invented role and object.** The role is `Rows` (displayName "Small
+    multiples"), not `SmallMultiple`; the card is `smallMultiplesLayout` with `layoutType` /
+    `rowCount` / `columnCount`, not `smallMultiple` with `layoutMode` / `maxItemsPerRow` /
+    `showEmptyItems`. Both were rejected outright, so **the paning dimension was lost on every
+    trellis** and the chart collapsed to one aggregated panel. This also answers the issue's own
+    open question: `stackedAreaChart` **does** support small multiples.
+  - **`Rows` is an overloaded role, which the rename exposed.** A `pivotTable`/matrix also has a
+    `Rows` role — its ROW HEADERS — and installs no `smallMultiplesLayout`, so keying the card on the
+    role alone leaked it onto every matrix. The card is now gated on the visual TYPE, from a list
+    where each entry was checked for both the role and the object (`scatterChart` and
+    `waterfallChart` were in the first draft and have neither).
+  - **`labels` is not universal.** `scatterChart` installs no `labels` object — its point labels are
+    `categoryLabels` — and `pivotTable`/`tableEx` install neither. The data-label toggle now routes
+    by what the target visual installs.
+  - **`dataPoint` is not universal either.** `card`, `multiRowCard`, `pivotTable`, `tableEx`,
+    `waterfallChart` and `slicer` install no such object, so a mark-colour block aimed at one was
+    discarded.
+  - **`lineStyles.strokeColor` does not exist on the COMBO charts.** It is real on
+    `lineChart`/`areaChart`/`stackedAreaChart` (the original finding stands for those), but emitting
+    it on `lineClusteredColumnComboChart` discarded the whole `lineStyles` card — taking `strokeWidth`
+    with it.
+  - **Dropdown slicers were emitted below the height their own chrome needs.** The floor is 76px
+    (header 28 + selector 32 + padding 8/8); below it the header or the selector is clipped and the
+    control is unusable. The previous 64.0 was an estimate of where clipping starts; 76 is the
+    arithmetic. **The floor now lives at the single point every slicer is built** — it had been in
+    the filter-card layout only, so raising the constant fixed the filter slicers and left nine
+    PARAMETER-CONTROL slicers (a different emitter) still clipped at 44-75px. A test asserts the
+    floor over every dropdown slicer, so a future third emitter is covered the day it is written.
+
+### Fixed
+
 - **tableau-migration (skill `2.111.0` -> `2.112.0`): the report must name a measure the way the
   model does.** 2.108.0 taught the MODEL to strip DAX identifier brackets from a measure name; the
   REPORT still bound calcs by their raw Tableau caption, so the two ends disagreed and the reference

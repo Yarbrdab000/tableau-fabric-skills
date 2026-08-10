@@ -253,13 +253,16 @@ def test_line_chart_truncated_date_stays_on_x_axis_region_to_series():
     assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "Order_Date"
     assert {p["field"]["Aggregation"]["Expression"]["Column"]["Property"]
             for p in state["Y"]["projections"]} == {"Sales_Amount", "Profit"}
-    # the Rows paning dimension lands on Small multiples (Tableau trellis), not the x-axis
-    assert state["SmallMultiple"]["projections"][0]["field"]["Column"]["Property"] == "Region"
+    # the Rows paning dimension lands on Small multiples (Tableau trellis), not the x-axis.
+    # The PBIR role is "Rows" (displayName "Small multiples"); this test asserted the invented
+    # name "SmallMultiple", which the installed capabilities reject as PBIR_ROLE_UNKNOWN -- so the
+    # paning dimension was lost on every trellis we emitted (issue #100).
+    assert state["Rows"]["projections"][0]["field"]["Column"]["Property"] == "Region"
     assert "Series" not in state
 
 
 def test_small_multiples_visual_uses_newer_schema_others_stay_1_0_0():
-    # A visual that binds a SmallMultiple (trellis) role must be stamped at the newer
+    # A visual that binds the small-multiples role ("Rows") must be stamped at the newer
     # visualContainer schema -- Power BI Desktop silently DROPS the small-multiples role on the
     # legacy 1.0.0 stamp (the chart collapses to a single aggregated panel). The bump is gated to
     # ONLY trellis visuals so the verified non-trellis gates keep their proven 1.0.0 stamp.
@@ -271,13 +274,15 @@ def test_small_multiples_visual_uses_newer_schema_others_stay_1_0_0():
                          cols="[federated.abc].[tmn:Order Date:qk]",
                          deps_extra=_INST + tmonth)
     vis = list(_visual_parts(emit_pbir(parse_twb(_workbook(trellis)))).values())[0]
-    assert "SmallMultiple" in vis["visual"]["query"]["queryState"]
+    assert "Rows" in vis["visual"]["query"]["queryState"]
     assert vis["$schema"] == SCHEMA_VISUAL_SM
     # the data-plane formatting card that actually lays the panes out (without it the role binds
-    # but no trellis renders)
-    sm = vis["visual"]["objects"]["smallMultiple"][0]["properties"]
-    assert sm["layoutMode"]["expr"]["Literal"]["Value"] == "'flow'"
-    assert sm["maxItemsPerRow"]["expr"]["Literal"]["Value"] == "3L"
+    # but no trellis renders). The object is "smallMultiplesLayout" and its properties are
+    # layoutType / rowCount / columnCount -- confirmed against the installed capabilities. The
+    # previously asserted "smallMultiple" card with layoutMode / maxItemsPerRow / showEmptyItems
+    # is rejected wholesale as PBIR_FORMATTING_OBJECT_UNKNOWN.
+    sm = vis["visual"]["objects"]["smallMultiplesLayout"][0]["properties"]
+    assert sm["layoutType"]["expr"]["Literal"]["Value"] == "'auto'"
 
     # a plain bar (no paning dimension -> no SmallMultiple role) keeps the proven 1.0.0 stamp
     plain = _worksheet("Sales by Region", "Bar",
@@ -2685,8 +2690,8 @@ def test_detect_measure_trellis_guards():
     # a colour-legend Series is a genuine grouped/stacked chart
     ser = dict(state, Series={"projections": [c]})
     assert _detect_measure_trellis(fires, ser) is None
-    # an existing native SmallMultiple trellis is left alone
-    sm = dict(state, SmallMultiple={"projections": [c]})
+    # an existing native small-multiples trellis (the "Rows" role) is left alone
+    sm = dict(state, Rows={"projections": [c]})
     assert _detect_measure_trellis(fires, sm) is None
     # non-bar/column marks never fan out
     assert _detect_measure_trellis({"visual_type": "line", "uses_measure_values": False},
@@ -8100,9 +8105,42 @@ def test_automatic_canvas_dims_unit():
     assert _automatic_canvas_dims(1000, 0) == (None, None)
 
 
-def test_dropdown_filter_card_height_is_floored_at_64():
+def test_every_dropdown_slicer_is_floored_including_parameter_controls():
+    # THE REGRESSION GUARD FOR THE SECOND DOOR. The floor originally lived in the filter-card layout
+    # only, so raising it fixed the filter slicers and left the PARAMETER-CONTROL slicers -- a
+    # different emitter that calls _slicer_json directly -- still emitting 44px to 75px boxes
+    # (issue #100: nine of them, every one clipped). The floor now lives at the single point every
+    # slicer is built, so no caller can miss it.
+    #
+    # Asserted over EVERY dropdown slicer on the page rather than a chosen one, so a future third
+    # emitter is covered by this test the day it is written.
+    from twb_to_pbir import SLICER_DROPDOWN_MIN_H, _slicer_json
+
+    field = {"entity": "T", "property": "C", "binding": "column", "caption": "C",
+             "aggregation": None, "selection": None, "range": None, "preselect_only": True}
+    tiny = {"x": 0.0, "y": 0.0, "width": 120.0, "height": 44.0, "z": 0, "tabOrder": 0}
+    out = _slicer_json("s", field, dict(tiny), None, None, mode="Dropdown")
+    assert out["position"]["height"] == SLICER_DROPDOWN_MIN_H
+
+    # a slicer already tall enough is left exactly as the source sized it
+    tall = dict(tiny, height=300.0)
+    assert _slicer_json("s", field, tall, None, None,
+                        mode="Dropdown")["position"]["height"] == 300.0
+
+    # and a LIST-mode slicer is not a dropdown, so the dropdown chrome floor does not apply
+    assert _slicer_json("s", field, dict(tiny), None, None,
+                        mode="List")["position"]["height"] == 44.0
+
+
+def test_dropdown_filter_card_height_is_floored_at_the_chrome_minimum():
     # §13.3: a scaled filter card (h=6000 -> 6000*0.008 = 48px) in Dropdown mode is
-    # floored at SLICER_DROPDOWN_MIN_H (64) so Power BI never clips the control.
+    # floored at SLICER_DROPDOWN_MIN_H so Power BI never clips the control.
+    #
+    # The floor is 76, not the 64 this test previously asserted. 64 was an ESTIMATE of where Power
+    # BI starts clipping; 76 is the arithmetic of the chrome itself -- header 28 + selector 32 +
+    # padding 8/8 -- and below it the header or the selector is clipped and the control is unusable
+    # (issue #100). The failure is validation-invisible: the JSON is well-formed and the report
+    # opens, so only rendering or the PBIR validator shows it.
     filt = ("<filter class='categorical' column='[federated.abc].[none:Region:nk]'>"
             "<groupfilter function='member' level='[none:Region:nk]' /></filter>")
     ws = _worksheet("W", "Bar", "[federated.abc].[sum:Sales:qk]",
@@ -8110,7 +8148,7 @@ def test_dropdown_filter_card_height_is_floored_at_64():
     dash = _one_card_dashboard("W", "none:Region:nk", card_h=6000, card_y=90000)
     slicers = _page_slicers(emit_pbir(parse_twb(_workbook(ws, dash), layout="legacy")))
     assert len(slicers) == 1
-    assert slicers[0]["position"]["height"] == 64.0
+    assert slicers[0]["position"]["height"] == 76.0
 
 
 def test_checklist_filter_card_height_tracks_the_scaled_zone():

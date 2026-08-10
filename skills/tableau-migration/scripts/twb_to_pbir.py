@@ -205,10 +205,19 @@ _ZONE_PAD_SCALE = (1.0, 1.0)
 SLICER_CTRL_H = 40.0
 # A DROPDOWN-mode slicer's height is the real scaled Tableau card height, translated DIRECTLY (no
 # chrome pad added) -- the emitted box tracks the SOURCE card number-for-number, per the user. A small
-# absolute floor (SLICER_DROPDOWN_MIN_H) guarantees a degenerate tiny card still renders its control:
-# Power BI clips a dropdown below ~40px (only the field name shows), so the floor keeps it usable
-# without inflating a card that is already tall enough.
-SLICER_DROPDOWN_MIN_H = 64.0
+# absolute floor (SLICER_DROPDOWN_MIN_H) guarantees a degenerate tiny card still renders its control.
+#
+# The floor is 76px because that is what a Power BI dropdown slicer's own chrome costs: header 28 +
+# selector 32 + padding 8/8. Below it the header or the selector is CLIPPED and the control is
+# unusable -- a validation-invisible rendering bug, since the JSON is well-formed and the report
+# opens (issue #100: 16 slicers emitted between 45px and 64px, every one clipped). The previous 64.0
+# was an estimate of where Power BI starts clipping; the 76 is the arithmetic of the chrome itself.
+#
+# This deliberately overrides "track the source card number-for-number" ONLY at the bottom end: a
+# Tableau filter card and a Power BI dropdown have different chrome, so a faithful pixel copy of a
+# short Tableau card produces a control the reader cannot use. Every card at or above the floor is
+# still translated directly.
+SLICER_DROPDOWN_MIN_H = 76.0
 SLICER_PAD_X = 7.0
 SLICER_ROW_GUTTER = 8.0
 SLICER_FONT_PT = 9.0
@@ -6799,7 +6808,11 @@ def _build_query_state(ws, model_table, field_map, warnings):
             state["Series"] = {"projections": _role_projections(
                 series, model_table, field_map, used_refs)}
         if small:
-            state["SmallMultiple"] = {"projections": _role_projections(
+            # The small-multiples role is "Rows" (displayName "Small multiples"), NOT
+            # "SmallMultiple". Confirmed on the installed capabilities for lineChart,
+            # stackedAreaChart and the clustered/stacked column+bar family; the invented name is
+            # rejected as PBIR_ROLE_UNKNOWN and the paning dimension is simply lost (issue #100).
+            state["Rows"] = {"projections": _role_projections(
                 small, model_table, field_map, used_refs)}
     elif vt == VT_MATRIX:
         row_dims = drop_calc_axis(_dedupe(categories(rows)))
@@ -7132,7 +7145,7 @@ def _detect_measure_trellis(ws, state):
         return None
     if state.get("Series", {}).get("projections"):
         return None
-    if "SmallMultiple" in state:
+    if "Rows" in state:
         return None
     y_projs = state.get("Y", {}).get("projections", [])
     cat_projs = state.get("Category", {}).get("projections", [])
@@ -8695,8 +8708,15 @@ def _constant_mark_color_objects(ws, pbir_vtype=None):
 # Visuals whose mark colour rides the STROKE as well as the data point. A line's colour IS its
 # stroke; an area draws a stroked boundary over its fill. Both are emitted, matching the adjudicated
 # rebuild -- setting only ``dataPoint`` leaves the line itself on the theme colour.
-_STROKE_COLOR_VTYPES = ("lineChart", "areaChart", "stackedAreaChart",
-                        "lineClusteredColumnComboChart", "lineStackedColumnComboChart")
+#
+# The COMBO types are deliberately absent even though they draw a line: checked against the installed
+# capabilities, ``lineStyles`` on ``lineClusteredColumnComboChart`` / ``lineStackedColumnComboChart``
+# installs NO ``strokeColor`` (it is a real property on lineChart / areaChart / stackedAreaChart, so
+# the original finding holds for those). Emitting it on a combo is rejected as
+# PBIR_FORMATTING_PROP_UNKNOWN and the whole ``lineStyles`` card is discarded -- taking the
+# ``strokeWidth`` with it. A combo's line colour comes from its ``dataPoint`` entry instead (issue
+# #100).
+_STROKE_COLOR_VTYPES = ("lineChart", "areaChart", "stackedAreaChart")
 
 
 def _with_constant_mark_color(ws, pbir_vtype, data_point_objects, extra_objects):
@@ -9482,13 +9502,22 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     # verified against the Power BI formatting reference's per-category scope-identity selector.
     # A measure shapeMap reuses this same channel to carry its default saturation gradient (the
     # diverging ``linearGradient3`` block from ``_shape_map_datapoint_objects``) so it renders on open.
-    if data_point_objects:
+    if data_point_objects and vtype not in _NO_DATA_POINT_TYPES:
         visual.setdefault("objects", {})["dataPoint"] = data_point_objects
     # Data labels (Tableau "Show Mark Labels"): the data-plane ``visual.objects.labels`` ``show``
     # toggle, applied uniformly (no selector). Per the Power BI formatting reference, ``labels`` is a
     # visual-wide object; only show/hide is set here (label detail styling is Tier-2).
+    #
+    # ``labels`` is NOT universal, so the object name is chosen by what the target visual actually
+    # installs. Surveyed the installed capabilities of every type we emit: all the cartesian /
+    # pie / treemap / funnel / combo families expose ``labels``; ``scatterChart`` is the lone chart
+    # that does NOT -- its point labels are ``categoryLabels`` -- and ``pivotTable`` / ``tableEx``
+    # expose neither (a grid has no mark labels at all). Emitting ``labels`` on a scatter is
+    # rejected as PBIR_FORMATTING_OBJECT_UNKNOWN and the toggle is silently lost (issue #100).
     if label_objects:
-        visual.setdefault("objects", {})["labels"] = label_objects
+        _labels_key = _DATA_LABEL_OBJECT.get(vtype, "labels")
+        if _labels_key:
+            visual.setdefault("objects", {})[_labels_key] = label_objects
     # Legend (Tableau dashboard colour-legend zone): the data-plane ``visual.objects.legend``
     # ``show`` / ``position`` toggle, applied uniformly (no selector). Per the Power BI formatting
     # reference, ``legend`` is a visual-wide object; only show/position are set here (legend title /
@@ -9537,12 +9566,15 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     # present yet no trellis renders. ``layoutMode`` 'flow' auto-wraps panes; ``maxItemsPerRow``
     # caps the grid width; ``showEmptyItems`` hides empty panes. The single-name role and this card
     # key are unprotectable PBIR-schema interop facts (authored here against our own IR).
-    if query_state and "SmallMultiple" in query_state:
-        visual.setdefault("objects", {})["smallMultiple"] = [{
+    # The "Rows" role is OVERLOADED: on a chart it is the small-multiples paning dimension, but on a
+    # pivotTable/matrix it is the ROW HEADERS -- and a matrix installs no smallMultiplesLayout object
+    # at all. Keying the layout card on the role alone therefore leaked it onto every matrix
+    # (PBIR_FORMATTING_OBJECT_UNKNOWN). Gate on the visual TYPE actually installing the object.
+    if (query_state and "Rows" in query_state
+            and vtype in _SMALL_MULTIPLES_TYPES):
+        visual.setdefault("objects", {})["smallMultiplesLayout"] = [{
             "properties": {
-                "layoutMode": {"expr": {"Literal": {"Value": "'flow'"}}},
-                "maxItemsPerRow": {"expr": {"Literal": {"Value": "3L"}}},
-                "showEmptyItems": {"expr": {"Literal": {"Value": "false"}}},
+                "layoutType": {"expr": {"Literal": {"Value": "'auto'"}}},
             }
         }]
     # Column auto-size ("Grow to fit") -- the table/matrix column-width DEFAULT. Emitted for every
@@ -9643,7 +9675,7 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     # SmallMultiple role on the legacy 1.0.0 stamp. The bump is gated to exactly those visuals so the
     # verified non-trellis gates keep their proven 1.0.0 stamp.
     schema = SCHEMA_VISUAL
-    if query_state and "SmallMultiple" in query_state:
+    if query_state and "Rows" in query_state and vtype in _SMALL_MULTIPLES_TYPES:
         schema = SCHEMA_VISUAL_SM
     out = {
         "$schema": schema,
@@ -10281,6 +10313,24 @@ def _slicer_preselection_object(field, model_table, field_map):
 
 
 def _slicer_json(name, field, position, model_table, field_map, *, mode=None, warnings=None):
+    # THE floor, applied here so it cannot be missed by a caller. A Power BI DROPDOWN slicer's own
+    # chrome costs 76px -- header 28 + selector 32 + padding 8/8 -- and below that the header or the
+    # selector is CLIPPED and the control is unusable. It is a validation-invisible rendering bug in
+    # the classic sense: the JSON is well-formed, the model is fine, the report opens, and the
+    # slicers are simply broken.
+    #
+    # Enforced at the single point every slicer is built rather than at each layout site, because
+    # that is exactly the mistake this fix already made once: the filter-card path had a floor and
+    # the PARAMETER-CONTROL path did not, so raising the shared constant fixed the filter slicers
+    # and left nine parameter slicers between 44px and 75px still clipped (issue #100). A caller
+    # that grows a slicer beyond the floor keeps its own height untouched.
+    if position and str(mode or "").lower() == "dropdown":
+        try:
+            if float(position.get("height") or 0) < SLICER_DROPDOWN_MIN_H:
+                position = dict(position)
+                position["height"] = SLICER_DROPDOWN_MIN_H
+        except (TypeError, ValueError):
+            pass
     expr, qref, nref = _field_expression(field, model_table, field_map)
     state = {"Values": {"projections": [
         {"field": expr, "queryRef": qref, "nativeQueryRef": nref}]}}
@@ -10451,6 +10501,43 @@ def _solved_rect(zone):
     if zid is None:
         return None
     return plan["rects"].get(zid)
+
+
+# Which formatting object carries a visual's MARK LABELS. ``labels`` for nearly everything, but not
+# universally -- surveyed against the installed visual capabilities (``catalog describe <type>``):
+#   * ``scatterChart``  -> ``categoryLabels`` (it installs no ``labels`` object at all)
+#   * ``pivotTable`` / ``tableEx`` -> NEITHER; a grid has no mark labels, so the toggle is dropped
+# Anything absent from this map keeps ``labels``, which every other emitted type does install.
+# Visual types that install NO ``dataPoint`` formatting object, so a mark-colour block aimed at one
+# is rejected as PBIR_FORMATTING_OBJECT_UNKNOWN and silently discarded. Checked against the installed
+# capabilities of every type this emitter produces. The card family colours through
+# ``dataLabels``/``categoryLabels`` (already handled by ``_card_label_objects``), a grid has no marks
+# to colour, a waterfall colours through its own ``sentimentColors``, and a slicer through ``items``.
+_NO_DATA_POINT_TYPES = frozenset({
+    "card", "multiRowCard", "pivotTable", "tableEx", "waterfallChart", "slicer",
+})
+
+
+# Visual types whose "Rows" role means SMALL MULTIPLES (and which therefore install the
+# ``smallMultiplesLayout`` card). A pivotTable/matrix also has a "Rows" role -- its ROW HEADERS --
+# and installs no such object, so the role name alone cannot decide this. Every entry was CHECKED
+# against the installed capabilities (``catalog describe <type>``) for BOTH a ``Rows`` role and a
+# ``smallMultiplesLayout`` object; ``scatterChart`` and ``waterfallChart`` were in the first draft
+# of this list and have NEITHER, so they are deliberately absent.
+_SMALL_MULTIPLES_TYPES = frozenset({
+    "lineChart", "areaChart", "stackedAreaChart", "columnChart", "barChart",
+    "clusteredColumnChart", "clusteredBarChart",
+    "hundredPercentStackedColumnChart", "hundredPercentStackedBarChart",
+    "lineClusteredColumnComboChart", "lineStackedColumnComboChart",
+    "ribbonChart",
+})
+
+
+_DATA_LABEL_OBJECT = {
+    "scatterChart": "categoryLabels",
+    "pivotTable": None,
+    "tableEx": None,
+}
 
 
 def _solid_fill_object(hex_color):
