@@ -12,6 +12,17 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.120.0` -> `2.121.0`): a needs-decision message says WHICH kind of
+  problem it is.** *"I cannot see the schema"* and *"I can see it but will not choose a storage mode
+  for you"* read identically, and they need opposite responses from the operator (issue #109). The
+  rationale now names the state: a `schema-not-visible` case says the columns could not be read from
+  anything available offline and asks for a connection or a typed artifact; anything else says the
+  schema IS readable and that what is missing is a storage-mode choice.
+  The issue's primary case -- a JOINED flat-file datasource reporting *"relation 'Orders.csv' has no
+  resolvable columns"* and skipping the workbook -- is resolved by the 2.120.0 multi-table extract
+  expansion; verified here on the reported shape (a nested 3-way CSV join, extracted), which now
+  types all three relations from their own extract tables and reports `mode=Import`.
+
 - **tableau-migration (skill `2.119.0` -> `2.120.0`): a MULTI-table extract types each relation
   from its own parent instead of skipping the workbook.** A single-table extract collapses onto its
   one materialised table. A multi-table extract correctly refuses to collapse -- folding three tables

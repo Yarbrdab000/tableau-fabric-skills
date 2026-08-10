@@ -303,6 +303,53 @@ def _odbc_reconstructable(descriptor):
                 or (descriptor.get("odbc_driver") or "").strip())
 
 
+def _structurally_unsupported_detail(descriptor):
+    """``(reason, categories)`` -- why a direct rebuild is unsafe, and of WHICH kind.
+
+    Two states get folded into one message otherwise, and they need opposite responses from the
+    operator (issue #109):
+
+    * ``schema-not-visible`` -- the engine cannot read the columns at all, so nothing can be typed.
+      The operator must supply a connection, or an artifact that carries typed columns.
+    * ``shape-not-directly-rebuildable`` / ``connection-not-routable`` -- the schema IS visible; what
+      is missing is a storage-mode choice or an upstream binding, which is a decision, not a gap in
+      the evidence.
+
+    Same reason string as :func:`_structurally_unsupported_reason` (which delegates here), so no
+    existing caller changes.
+    """
+    reasons, categories = list(descriptor.get("unsupported_reasons", [])), []
+    if reasons:
+        categories.append("shape-not-directly-rebuildable")
+    relations = descriptor.get("relations", [])
+    table_like = [r for r in relations if r.get("kind") in ("table", "custom_sql")]
+    if descriptor.get("named_connection_count", 0) > 1:
+        # `extract_hyper_member` names the bundled archive member that physically holds this
+        # table's rows. That is a SPECIFIC upstream -- more specific than a named connection, which
+        # only points at a server -- so such a table is routed even in a multi-connection source.
+        # Without this, a workbook consolidating several extract-backed datasources (each its own
+        # connection) is declared unroutable and never builds a model at all.
+        unrouted = [r for r in table_like
+                    if not r.get("connection") and not r.get("extract_hyper_member")]
+        if unrouted:
+            names = ", ".join(repr(r.get("name")) for r in unrouted)
+            reasons.append(
+                f"multiple named connections but {len(unrouted)} table(s) don't resolve to a "
+                f"specific connection ({names}); can't bind them to a single upstream")
+            categories.append("connection-not-routable")
+    kinds = {r.get("kind") for r in relations}
+    if kinds & {"join", "union", "unknown"}:
+        reasons.append("join/union relation tree (one logical table spans multiple relations)")
+        categories.append("shape-not-directly-rebuildable")
+    if not table_like:
+        reasons.append("no table or custom-SQL relations found")
+        categories.append("schema-not-visible")
+    elif all(not r.get("columns") for r in table_like):
+        reasons.append("no resolvable column metadata (cannot type the model deterministically)")
+        categories.append("schema-not-visible")
+    return "; ".join(dict.fromkeys(reasons)) or None, list(dict.fromkeys(categories))
+
+
 def _structurally_unsupported_reason(descriptor):
     """Return a reason string if the datasource shape can't be rebuilt directly, else None.
 
@@ -323,30 +370,7 @@ def _structurally_unsupported_reason(descriptor):
     Only those fall back to land-to-Delta + DirectLake (offered as an explicit option, not the
     default). A single named connection is always fine.
     """
-    reasons = list(descriptor.get("unsupported_reasons", []))
-    relations = descriptor.get("relations", [])
-    table_like = [r for r in relations if r.get("kind") in ("table", "custom_sql")]
-    if descriptor.get("named_connection_count", 0) > 1:
-        # `extract_hyper_member` names the bundled archive member that physically holds this
-        # table's rows. That is a SPECIFIC upstream -- more specific than a named connection, which
-        # only points at a server -- so such a table is routed even in a multi-connection source.
-        # Without this, a workbook consolidating several extract-backed datasources (each its own
-        # connection) is declared unroutable and never builds a model at all.
-        unrouted = [r for r in table_like
-                    if not r.get("connection") and not r.get("extract_hyper_member")]
-        if unrouted:
-            names = ", ".join(repr(r.get("name")) for r in unrouted)
-            reasons.append(
-                f"multiple named connections but {len(unrouted)} table(s) don't resolve to a "
-                f"specific connection ({names}); can't bind them to a single upstream")
-    kinds = {r.get("kind") for r in relations}
-    if kinds & {"join", "union", "unknown"}:
-        reasons.append("join/union relation tree (one logical table spans multiple relations)")
-    if not table_like:
-        reasons.append("no table or custom-SQL relations found")
-    elif all(not r.get("columns") for r in table_like):
-        reasons.append("no resolvable column metadata (cannot type the model deterministically)")
-    return "; ".join(dict.fromkeys(reasons)) or None
+    return _structurally_unsupported_detail(descriptor)[0]
 
 
 def select_storage_mode(descriptor):
@@ -387,15 +411,26 @@ def select_storage_mode(descriptor):
 
     # 1. structurally unsupported -> no safe direct rebuild; route to an honest needs-decision
     #    state (DirectLake is opt-in only and is never auto-stamped here).
-    reason = _structurally_unsupported_reason(descriptor)
+    reason, categories = _structurally_unsupported_detail(descriptor)
     if reason:
+        # Two very different states used to read the same. "I cannot SEE the schema" needs the
+        # operator to supply a connection or a typed artifact; "I can see it but will not choose a
+        # storage mode for you" needs a decision. Saying which one this is turns a dead end into an
+        # actionable next step (issue #109).
+        if "schema-not-visible" in categories:
+            guidance = ("the column schema could not be read from anything available offline, so "
+                        "nothing can be typed -- supply a connection (or an artifact that carries "
+                        "typed columns, e.g. a packaged extract) and re-run")
+        else:
+            guidance = ("the column schema IS readable -- what is missing is a storage-mode "
+                        "choice: default to a direct-to-source Import rebuild once a connection "
+                        "can be supplied, or opt in to land-to-Delta + DirectLake (never "
+                        "auto-selected)")
         return _decision(
             None, None,
             fallback=FALLBACK_NEEDS_DECISION,
             score=SCORE_FALLBACK,
-            rationale=f"Direct-upstream rebuild not safe ({reason}); storage decision required -- "
-                      f"default to a direct-to-source Import rebuild once a connection can be "
-                      f"supplied, or opt in to land-to-Delta + DirectLake (never auto-selected).",
+            rationale=f"Direct-upstream rebuild not safe ({reason}); {guidance}.",
             manual_followups=base_followups + [_NEEDS_DECISION_FOLLOWUP],
         )
 

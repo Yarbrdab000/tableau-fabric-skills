@@ -3853,3 +3853,59 @@ def test_extract_parent_match_key_strips_the_guid_and_folds_punctuation():
     assert _C._extract_parent_match_key("Orders#csv") == "orderscsv"
     # a 32-hex tail that is NOT a GUID suffix (no underscore) is left alone
     assert _C._extract_parent_match_key("") == ""
+
+
+# -- joined flat-file: the packaged extract IS the schema (issue #109) --------------------------
+
+def test_a_JOINED_flat_file_datasource_types_from_the_packaged_extract():
+    # A 3-way join over CSVs, extracted. Every relation used to report "has no resolvable columns",
+    # the datasource "needs a storage decision", and the workbook's .pbip was skipped -- while the
+    # packaged .hyper held each relation as a separate, fully typed table.
+    from storage_mode import select_storage_mode
+    parents = ["Orders.csv" + _G1, "Customers.csv" + _G2, "Products.csv" + _G3]
+    recs = "".join(_md_rec(p, "C1") + _md_rec(p, "C2") for p in parents)
+    tds = ("""<?xml version=\'1.0\' encoding=\'utf-8\' ?>
+<datasource caption=\'Big Data Source\' formatted-name=\'X\' inline=\'true\' version=\'18.1\'>
+  <connection class=\'federated\'>
+    <named-connections><named-connection caption=\'c\' name=\'textscan.1\'>
+      <connection class=\'textscan\' filename=\'Orders.csv\' directory=\'C:/d\' /></named-connection></named-connections>
+    <relation join=\'left\' type=\'join\'>
+      <clause type=\'join\'><expression op=\'=\'/></clause>
+      <relation join=\'inner\' type=\'join\'>
+        <clause type=\'join\'><expression op=\'=\'/></clause>
+        <relation connection=\'textscan.1\' name=\'Orders.csv\' table=\'[Orders#csv]\' type=\'table\' />
+        <relation connection=\'textscan.1\' name=\'Customers.csv\' table=\'[Customers#csv]\' type=\'table\' />
+      </relation>
+      <relation connection=\'textscan.1\' name=\'Products.csv\' table=\'[Products#csv]\' type=\'table\' />
+    </relation>
+  </connection>
+  <extract enabled=\'true\'><connection class=\'hyper\' dbname=\'Data/Extracts/big.hyper\' schema=\'Extract\' tablename=\'Extract\'>
+    <relation name=\'Extract\' table=\'[Extract].[Extract]\' type=\'table\' />%s</connection></extract>
+</datasource>""" % recs)
+    d = parse_tds(tds)
+    assert _typed(d) == {"Orders.csv": 2, "Customers.csv": 2, "Products.csv": 2}
+    # the NESTED join tree is dropped -- the extract materialised each table separately
+    assert not [r for r in d["relations"] if r.get("kind") in ("join", "union")]
+    assert select_storage_mode(d).get("mode") == "Import"
+
+
+def test_the_needs_decision_message_distinguishes_cannot_see_from_will_not_choose():
+    # "I cannot SEE the schema" and "I can see it but will not choose a storage mode" used to read
+    # identically, and they need opposite responses from the operator.
+    from storage_mode import select_storage_mode, _structurally_unsupported_detail
+    blind = {"connection_class": "textscan", "named_connection_count": 1,
+             "relations": [{"kind": "table", "name": "T", "columns": []}]}
+    _r, cats = _structurally_unsupported_detail(blind)
+    assert "schema-not-visible" in cats
+    assert "could not be read" in select_storage_mode(blind)["rationale"]
+
+    seen_but_undecided = {"connection_class": "textscan", "named_connection_count": 1,
+                          "relations": [{"kind": "join"},
+                                        {"kind": "table", "name": "T",
+                                         "columns": [{"remote_name": "C", "model_name": "C",
+                                                      "tmdl_type": "string"}]}]}
+    _r2, cats2 = _structurally_unsupported_detail(seen_but_undecided)
+    assert "schema-not-visible" not in cats2
+    rationale = select_storage_mode(seen_but_undecided)["rationale"]
+    assert "schema IS readable" in rationale
+    assert "storage-mode" in rationale
