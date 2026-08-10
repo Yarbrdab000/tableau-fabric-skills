@@ -228,6 +228,28 @@ def test_measure_names_are_referenceable_in_dax_no_brackets_survive():
     assert "annotation TableauFormula = SUM([Sales])-SUM([Sales])" in measures
 
 
+def test_report_and_model_agree_on_dax_safe_measure_names():
+    # The report binds a calc by caption; the model names the measure. Both apply the same
+    # bracket-stripping rule, in two files, because the report layer does not depend on the model
+    # layer. If they ever disagree the reference names an object the model does not contain -- and
+    # the failure is SILENT: the report/model cross-check drops the projection, so the visual simply
+    # loses that field. Measured when the model-side strip landed alone: a RUNNING_SUM measure was
+    # dropped and its chart lost the Y measure, with no error and no validation failure.
+    from twb_to_pbir import dax_safe_measure_name as report_rule
+    from assemble_model import dax_safe_measure_name as model_rule
+
+    names = [
+        "IF NOT ISNULL(SUM([Current Year Quantity])) THEN RUNNING_SUM([X]) END",
+        "SUM([Sales])-SUM([Sales Target].[Sales Target])",
+        "WINDOW_MAX([Count of Engagements]) * 1.2",
+        "Profit Ratio",            # no brackets -> must pass through untouched, on both sides
+        "Clients per Staff above Goal \u25b2",
+        "[]", "", "   spaced   ",
+    ]
+    for n in names:
+        assert report_rule(n) == model_rule(n), n
+
+
 def test_dax_safe_measure_name_is_pure_and_idempotent():
     # Pure helper, so it can be reasoned about on its own: bracket-free names pass through
     # UNCHANGED (a single-datasource model must not churn), and applying it twice changes nothing.

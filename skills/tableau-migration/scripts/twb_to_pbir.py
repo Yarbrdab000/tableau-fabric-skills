@@ -1111,6 +1111,29 @@ def _lookup_column_binding(column_binding, field_id, base_id, caption, worksheet
     return None
 
 
+def dax_safe_measure_name(name):
+    """The measure name the MODEL will emit for ``name`` -- kept identical to the model-side rule.
+
+    The model strips DAX identifier brackets from a measure name, because Tableau names an unnamed
+    calc after its own FORMULA and ``[``/``]`` delimit an identifier in DAX, so a measure called
+    ``IF NOT ISNULL(SUM([Sales])) ...`` cannot be referenced by name at all. The REPORT must apply
+    the same rule when it binds a calc by caption, or the two ends disagree and the reference names
+    an object the model does not contain: measured after the model-side strip landed, a
+    ``RUNNING_SUM`` measure reference was dropped by the report/model cross-check and its visual
+    lost the Y measure entirely -- a silent fidelity loss, since a dropped projection neither errors
+    nor fails validation.
+
+    Deliberately a small duplicate of :func:`assemble_model.dax_safe_measure_name` rather than an
+    import: the report layer does not depend on the model layer. ``test_report_and_model_agree_on_
+    dax_safe_measure_names`` asserts the two implementations agree, so they cannot drift.
+    """
+    text = str(name or "")
+    if "[" not in text and "]" not in text:
+        return text
+    cleaned = " ".join(text.replace("[", "").replace("]", "").split())
+    return cleaned or text
+
+
 def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
                    worksheet, warnings, warn_special=True, internal_fields=None,
                    date_binding=None, row_count_binding=None, measure_binding=None,
@@ -1224,7 +1247,7 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
     elif calc_col is not None:
         entity, prop = calc_col
     elif is_calc and not calc_is_axis:
-        entity, prop = MEASURES_TABLE, caption
+        entity, prop = MEASURES_TABLE, dax_safe_measure_name(caption)
     else:
         # A plain field with no datasource metadata, OR a calc dimension with no model-confirmed
         # column: bind by caption fallback and warn. A calc's model column name is the trimmed

@@ -3043,31 +3043,6 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                 # reported fidelity matches the project the user actually opens (warn-never-wrong: any
                 # warning the rebound run still emits is carried, never masked).
                 entry["viz_fidelity"] = _viz_fidelity(rebuilt)
-                # Every model reference a VISUAL names must exist in the model that ships beside it.
-                # reference_gate proves this for the DAX the second compiler writes; nothing proved
-                # it for PBIR, where the same defect is WORSE -- a visual bound to a column the model
-                # does not contain neither errors nor fails validation, it just renders EMPTY, so it
-                # reads as a data problem rather than a binding problem. Checked against the REBOUND
-                # pass, because that is what lands in the openable .pbip.
-                #
-                # The surface is built from the emitted TMDL, NOT from ``model_manifest``: the
-                # manifest covers the data tables, so a manifest-built surface does not know about
-                # the generated Date table's calculated columns or the parameter tables, and reports
-                # every perfectly valid reference to them as dangling (measured: 48 false positives
-                # on one workbook, every one of them real). The TMDL is what Power BI actually loads.
-                # Fail-safe: any import or surface problem leaves the run exactly as it was.
-                try:
-                    import pbir_lint as _pbir_lint
-                    import reference_gate as _ref_gate
-                    _surface = _ref_gate.build_model_surface(
-                        tmdl_parts=(res or {}).get("parts") or {})
-                    _dangling = _pbir_lint.lint_visual_model_bindings(
-                        (rebuilt or {}).get("parts") or {}, _surface)
-                except Exception:
-                    _dangling = []
-                if _dangling:
-                    entry["viz_dangling_bindings"] = {
-                        "count": len(_dangling), "problems": _dangling[:20]}
                 # Carry the full per-visual remediation worklist too (see ``_viz_worklist``): the
                 # rebound pass is what lands in the openable .pbip, so its worklist is the one a
                 # remediator should act on.
@@ -3111,6 +3086,34 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
             tail = " (visual emptied)" if d["emptied"] else ""
             warns.append(_PBIP_WARN + f"visual {d['visual']!r} dropped {len(d['dropped'])} "
                          f"reference(s) the model did not emit: {', '.join(d['dropped'])}{tail}")
+    # PROVE the cross-check above actually left nothing dangling, on the BYTES THAT SHIP.
+    # ``_crosscheck_report_refs`` is supposed to drop or rebind every reference the model did not
+    # emit; this asserts the result rather than trusting it. reference_gate proves the same invariant
+    # for the DAX the second compiler writes -- nothing proved it for PBIR, where the failure is
+    # WORSE: a visual bound to a column or measure the model does not contain neither errors nor
+    # fails validation, it just renders EMPTY, so it reads as a data problem rather than a binding
+    # problem, and ``powerbi-report-author validate`` reports 0 errors for it.
+    #
+    # Checked on ``report_parts`` AFTER the cross-check, because that is the .pbip the user opens.
+    # Linting the pre-crosscheck parts instead reports references this stage has already removed --
+    # the same first-pass-vs-shipped-artifact trap that makes ``out/reports/`` look wrong when the
+    # project beside it is correct. The surface comes from the emitted TMDL, not ``model_manifest``:
+    # the manifest covers data tables, so it does not know the generated Date table's calculated
+    # columns or the parameter tables, and flags every valid reference to them (measured: 48 false
+    # positives on one workbook). Fail-safe: any problem here leaves the run exactly as it was.
+    try:
+        import pbir_lint as _pbir_lint
+        import reference_gate as _ref_gate
+        _dangling = _pbir_lint.lint_visual_model_bindings(
+            report_parts or {},
+            _ref_gate.build_model_surface(tmdl_parts=(res or {}).get("parts") or {}))
+    except Exception:
+        _dangling = []
+    if _dangling:
+        entry["viz_dangling_bindings"] = {"count": len(_dangling), "problems": _dangling[:20]}
+        warns.append(_PBIP_WARN + f"{len(_dangling)} visual field reference(s) name a model object "
+                     f"that does not exist -- those visuals render EMPTY and report no error; "
+                     f"first: {_dangling[0]}")
     projected = _longest_projected_path(dest, model_safe, res.get("parts"), report_base, report_parts)
     if os.name == "nt" and len(projected) >= MAX_PATH:
         # 1a (long-path era): the writer lifts MAX_PATH via ``\\?\`` so the build no longer FAILS on a

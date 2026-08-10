@@ -12,6 +12,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **tableau-migration (skill `2.111.0` -> `2.112.0`): the report must name a measure the way the
+  model does.** 2.108.0 taught the MODEL to strip DAX identifier brackets from a measure name; the
+  REPORT still bound calcs by their raw Tableau caption, so the two ends disagreed and the reference
+  named an object the model no longer contained. Caught by the binding gate landed one release
+  earlier, on a workbook every other gate passes.
+  - **The failure was silent, which is why it needed a gate to find.** The report/model cross-check
+    dutifully DROPPED the dangling projection, so nothing errored and nothing failed validation — a
+    chart simply lost its Y measure. Measured on the Salesforce Nonprofit workbook: references
+    dropped went **0 -> 1** at 2.108.0 and **1 -> 0** with this fix.
+  - The report now applies the same bracket-stripping rule at the single point it binds a calc by
+    caption. It is a deliberate small duplicate rather than an import, because the report layer does
+    not depend on the model layer — and a test asserts the two implementations agree on a spread of
+    real names, so they cannot drift apart again.
+  - Also **moves the 2.111.0 binding gate onto the bytes that actually ship**: it now lints
+    `report_parts` AFTER `_crosscheck_report_refs`, which is the `.pbip` the user opens. Linting the
+    pre-crosscheck parts reported references that stage had already removed — the same
+    first-pass-vs-shipped-artifact confusion that makes `out/reports/` look wrong while the project
+    beside it is correct. A dangling reference that survives the cross-check now also raises a
+    warning, not just a report entry.
+
 ### Added
 
 - **tableau-migration (skill `2.110.0` -> `2.111.0`): a gate that proves every VISUAL's model
