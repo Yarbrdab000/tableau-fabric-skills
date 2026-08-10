@@ -14,6 +14,27 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **tableau-migration (skill `2.108.0` -> `2.109.0`): a sentinel date column must not bound the
+  calendar** (issue #102, part 2). A small lookup whose date column is a PLACEHOLDER — every row the
+  same `1/1/02` or `1900-01-01`, a very common Excel/CSV idiom — is still a related fact date column,
+  so it set the calendar's lower bound. Measured on a Superstore rebuild: a 41-row commission lookup
+  with **one distinct date** stretched `Date` to `2002-01-01..2027-12-31` (~9,496 rows) for data
+  spanning 2021-2024. Nothing is numerically wrong; every Year/Quarter slicer just carries ~21 empty
+  years, which is the first thing a business reviewer points at.
+  - **Structural test, not a heuristic about which dates "look like" sentinels:** a column whose
+    `MIN` equals its `MAX` has one distinct value and therefore carries no range information, so it
+    cannot bound anything. Such columns drop out of the bounds; `COALESCE` falls back to the plain
+    fold if that would leave nothing, so the calendar is never empty.
+  - **Verified in live DAX** against a refreshed model: the unguarded fold over a sentinel returned
+    `2002-01-01`, the guarded form returned `2017-01-07` (the real data's start), and an
+    all-degenerate span fell back rather than producing an empty calendar. The whole expression was
+    confirmed to process — the model refreshes with data.
+  - **Only applied with 2+ contributing columns.** A lone column is the only bound there is, so
+    excluding it would be meaningless — and skipping the guard keeps every single-fact model
+    byte-for-byte unchanged, which confines the blast radius to models that actually have another
+    date column to fall back on. Confirmed inert where nothing is degenerate: on a 16-column
+    Salesforce model the span was unchanged (2008 comes from real `ClosedDate` data). Corpus 29/29.
+
 - **tableau-migration (skill `2.107.0` -> `2.108.0`): a measure name has to be referenceable in DAX**
   (issue #102, part 1). Tableau names an unnamed calc after its own FORMULA, so measures landed
   called `SUM([Sales])-SUM([Sales Target].[Sales Target])`. TMDL round-trips that and every

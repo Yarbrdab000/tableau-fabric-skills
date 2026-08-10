@@ -228,6 +228,46 @@ def test_build_date_dimension_import_span_folds_every_related_date_column():
         ("Orders", "Order_Date"), ("Orders", "Ship_Date"), ("Returns", "Return_Date")}
 
 
+def test_a_single_distinct_date_column_does_not_bound_the_calendar():
+    # Issue #102 part 2. A small lookup whose date column is a PLACEHOLDER -- every row the same
+    # 1/1/02 or 1900-01-01, a very common Excel/CSV idiom -- is still a related fact date column, so
+    # it set the calendar's lower bound. Measured on a Superstore rebuild: a 41-row commission
+    # lookup with ONE distinct date stretched Date to 2002-01-01..2027-12-31 (~9,496 rows) for data
+    # spanning 2021-2024, putting ~21 empty years in every Year/Quarter slicer.
+    #
+    # The test is structural rather than a guess about which dates "look like" sentinels: a column
+    # whose MIN equals its MAX has one distinct value and cannot bound a range. Verified in live DAX
+    # against a real model -- unguarded MIN over a sentinel returned 2002-01-01, the guarded form
+    # returned 2017-01-07 (the real data's start), and an all-degenerate span fell back rather than
+    # producing an empty calendar.
+    tables = [_rel("Orders", "Order_Date"), _rel("Commission", "Order_Date")]
+    _name, part, _rels, _report = _build_date_dimension(
+        tables, ["Orders", "Commission"], [], mode="import")
+    # each contributing column is guarded by its own MIN<>MAX test ...
+    for t in ("Orders", "Commission"):
+        assert (f"IF(MIN('{t}'[Order_Date]) <> MAX('{t}'[Order_Date]), "
+                f"MIN('{t}'[Order_Date]))") in part
+        assert (f"IF(MIN('{t}'[Order_Date]) <> MAX('{t}'[Order_Date]), "
+                f"MAX('{t}'[Order_Date]))") in part
+    # ... and the guarded bound falls back to the plain fold, so the calendar is never empty
+    assert "COALESCE(MINX({" in part and "COALESCE(MAXX({" in part
+    assert "}, [Value])" in part
+    assert "CALENDARAUTO" not in part
+
+
+def test_a_lone_date_column_is_not_guarded_because_it_is_the_only_bound():
+    # A single contributing column cannot be excluded -- it is the only bound there is -- so the
+    # guard is skipped entirely. This also keeps every single-fact model byte-for-byte unchanged,
+    # which is what confines the blast radius of the fix above to models that actually have a
+    # second date column to fall back on.
+    tables = [_rel("Orders", "Order_Date")]
+    _name, part, _rels, _report = _build_date_dimension(tables, ["Orders"], [], mode="import")
+    assert ("source = CALENDAR(DATE(YEAR(MIN('Orders'[Order_Date])), 1, 1), "
+            "DATE(YEAR(MAX('Orders'[Order_Date])), 12, 31))") in part
+    assert "COALESCE" not in part
+    assert "MINX(" not in part
+
+
 def test_build_date_dimension_directquery_uses_fixed_range_calendar():
     # CALENDARAUTO() on a DirectQuery model has to query the source to find its span and fails to
     # process without it (the user's "date table isn't working"). A self-contained fixed-range

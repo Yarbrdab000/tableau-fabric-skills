@@ -2185,6 +2185,32 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
 
             lo = _fold("MIN", [f"MIN({_ref(t, c)})" for t, c in span])
             hi = _fold("MAX", [f"MAX({_ref(t, c)})" for t, c in span])
+            # A SENTINEL date column must not set the bounds. A small lookup whose date column is a
+            # placeholder -- every row the same 1/1/02 or 1900-01-01, a very common Excel/CSV idiom --
+            # is still a related fact date column, so it dragged the calendar back two decades:
+            # measured on a Superstore rebuild, a 41-row commission lookup with ONE distinct date
+            # stretched Date to 2002-01-01..2027-12-31 (~9,496 rows) for data that spans 2021-2024.
+            # Nothing is numerically wrong; every Year/Quarter slicer just shows ~21 empty years,
+            # which is the first thing a reviewer points at (issue #102, part 2).
+            #
+            # The test is structural, not a guess about which dates "look like" sentinels: a column
+            # whose MIN equals its MAX has ONE distinct value and therefore carries no range
+            # information, so it cannot bound anything. Such columns drop out of the bounds; if that
+            # leaves nothing (every column degenerate) COALESCE falls back to the unguarded fold, so
+            # the calendar is never empty.
+            #
+            # Only applied with 2+ contributing columns: a lone column is the only bound there is, so
+            # excluding it would be meaningless -- and skipping the guard keeps single-fact models
+            # byte-for-byte unchanged.
+            if len(span) > 1:
+                def _guarded(agg, t, c):
+                    ref = _ref(t, c)
+                    return f"IF(MIN({ref}) <> MAX({ref}), {agg}({ref}))"
+
+                lo_terms = ", ".join(_guarded("MIN", t, c) for t, c in span)
+                hi_terms = ", ".join(_guarded("MAX", t, c) for t, c in span)
+                lo = f"COALESCE(MINX({{{lo_terms}}}, [Value]), {lo})"
+                hi = f"COALESCE(MAXX({{{hi_terms}}}, [Value]), {hi})"
             source_expr = (f"CALENDAR(DATE(YEAR({lo}), 1, 1), "
                            f"DATE(YEAR({hi}), 12, 31))")
         else:
