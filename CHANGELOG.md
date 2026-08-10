@@ -12,6 +12,27 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.119.0` -> `2.120.0`): a MULTI-table extract types each relation
+  from its own parent instead of skipping the workbook.** A single-table extract collapses onto its
+  one materialised table. A multi-table extract correctly refuses to collapse -- folding three tables
+  onto one would silently discard two -- but that refusal used to END the story: every relation was
+  reported as *"has no resolvable columns"*, the datasource was declared un-typable, and the whole
+  workbook's `.pbip` was **skipped** with `definition_of_done: failed`, while a complete typed schema
+  and 11,807 rows sat in the bundled `.hyper` the entire time. Measured at **4 of 6** workbooks in a
+  standard Tableau training corpus (issue #104), and the shape is common -- an analyst unions a few
+  CSVs and publishes an extract.
+  The information was already there: the extract files **one parent per table**, each with its own
+  typed `metadata-record` columns. What was missing was a per-relation mapping, not a schema. Each
+  column-less relation is now typed from its OWN parent, matched on the GUID-stripped, case- and
+  punctuation-folded name (`Orders.csv` <-> `Orders.csv_96FB...`), and stamped with that parent's own
+  `.hyper` identity so the materialiser reads the right rows per table.
+  Every guarantee the original guard protected is kept, and the mapping must be **one-to-one or
+  nothing**: an unmatched relation, an ambiguous name, two relations claiming one parent, or a parent
+  with no typed columns each leave the relations untouched and degrade to exactly the previous
+  behaviour. Verified with those negative controls plus the positive: the reported datasource now
+  reports `mode=Import` where it previously reported "needs a storage decision". Corpus 29/29 with
+  identical status counts -- the construct does not occur there, which is why it went unnoticed.
+
 - **tableau-migration (skill `2.118.0` -> `2.119.0`): generated M no longer depends on the ambient
   locale.** `Table.TransformColumnTypes` with no culture parses with the locale of whichever machine
   REFRESHES the model, so a dot-decimal source is silently corrupted on a comma-decimal host: issue

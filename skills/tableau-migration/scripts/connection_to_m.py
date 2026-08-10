@@ -1131,6 +1131,130 @@ def _extract_materialized_tables(datasource):
     return out
 
 
+_EXTRACT_GUID_SUFFIX_RE = re.compile(r"_[0-9A-Fa-f]{32}$")
+
+
+def _extract_parent_match_key(name):
+    """Normalise an extract parent / relation name for one-to-one matching.
+
+    A Tableau extract names each materialised table ``<source>_<32-hex-GUID>`` (``Orders.csv`` ->
+    ``Orders.csv_96FB...``), so the GUID is stripped, then punctuation and case are folded. Returns
+    ``""`` for anything that normalises away, which never matches.
+    """
+    s = _strip_brackets(str(name or "").strip())
+    s = _EXTRACT_GUID_SUFFIX_RE.sub("", s)
+    return re.sub(r"[^0-9a-z]+", "", s.lower())
+
+
+def _extract_materialized_tables_by_parent(datasource):
+    """Every parent an enabled ``<extract>`` materialised, one entry each.
+
+    The sibling :func:`_extract_materialized_tables` answers "is there exactly ONE table to collapse
+    everything onto", and deliberately returns ``[]`` the moment an extract spans several parents.
+    This answers the different question the multi-table case needs: *which* tables did it
+    materialise, so each column-less relation can be mapped onto its OWN one.
+
+    Returns ``[{"member", "schema", "item", "parent"}]``, in document order.
+    """
+    out = []
+    for ex in _findall_local(datasource, "extract"):
+        if (ex.get("enabled") or "true").lower() == "false":
+            continue
+        for conn in _findall_local(ex, "connection"):
+            if (conn.get("class") or "").lower() not in _EXTRACT_ENGINE_CLASSES:
+                continue
+            member = (conn.get("dbname") or "").strip() or None
+            schema = (conn.get("schema") or "").strip() or None
+            seen = set()
+            for rec in _findall_local(conn, "metadata-record"):
+                if (rec.get("class") or "").lower() != "column":
+                    continue
+                els = _children_local(rec, "parent-name")
+                txt = (els[0].text or "").strip() if els and els[0].text is not None else ""
+                parent = _strip_brackets(txt)
+                if parent and parent not in seen:
+                    seen.add(parent)
+                    out.append({"member": member, "schema": schema,
+                                "item": parent, "parent": parent})
+            break  # one extract element materialises one .hyper member
+    return out
+
+
+def _expand_untyped_relations_to_extract_tables(datasource, relations, cols_by_parent):
+    """Type each column-less relation from its OWN table in a MULTI-table extract.
+
+    The sibling collapse handles the single-table extract. When an extract materialises SEVERAL
+    tables it correctly refuses to collapse -- folding three tables onto one would silently discard
+    two -- but that refusal used to end the story, and the whole workbook was skipped: *"relation
+    'Orders.csv' has no resolvable columns"*, `pbip: skipped`, `definition_of_done: failed`, while a
+    complete typed schema and 11,807 rows sat in the bundled ``.hyper`` the entire time. Measured at
+    **4 of 6** workbooks in a standard Tableau training corpus (issue #104), and the shape is common:
+    an analyst unions a few CSVs and publishes an extract.
+
+    The information needed was already present -- the extract files one parent PER TABLE, each with
+    its own typed ``metadata-record`` columns. What was missing was a per-relation mapping, not a
+    schema. This supplies it, and keeps every guarantee the collapse guard was protecting:
+
+    * every table relation must be column-less (if any one types, the live layer is intact and is the
+      better upstream);
+    * each relation must match EXACTLY ONE extract parent, and no two relations may claim the same
+      parent -- a one-to-one mapping or nothing;
+    * every matched parent must actually carry typed columns.
+
+    Anything short of that returns ``None`` with ``relations`` untouched, so an ambiguous extract
+    degrades to exactly the previous behaviour instead of guessing which table is which. Matching is
+    on the GUID-stripped, case- and punctuation-folded name, which is how Tableau relates
+    ``Orders.csv`` to the ``Orders.csv_96FB...`` it materialised.
+    """
+    table_like = [r for r in relations if r.get("kind") in ("table", "custom_sql")]
+    if len(table_like) < 2 or any(r.get("columns") for r in table_like):
+        return None
+    parents = _extract_materialized_tables_by_parent(datasource)
+    if len(parents) < 2:
+        return None      # the single-table case belongs to the collapse, not here
+
+    by_key = {}
+    for mat in parents:
+        key = _extract_parent_match_key(mat["parent"])
+        if not key:
+            continue
+        by_key.setdefault(key, []).append(mat)
+
+    pairs, claimed = [], set()
+    for rel in table_like:
+        candidates = []
+        for ref in (rel.get("name"), rel.get("item"), rel.get("raw_table")):
+            key = _extract_parent_match_key(ref)
+            if key and key in by_key:
+                candidates = by_key[key]
+                break
+        if len(candidates) != 1:
+            return None                       # ambiguous or unmatched -> never a guess
+        mat = candidates[0]
+        if mat["parent"] in claimed:
+            return None                       # two relations claiming one table
+        cols = (cols_by_parent or {}).get(mat["parent"]) or []
+        if not cols:
+            return None
+        claimed.add(mat["parent"])
+        pairs.append((rel, mat, cols))
+
+    for rel, mat, cols in pairs:
+        rel["columns"] = cols
+        rel["schema"] = mat["schema"]
+        rel["item"] = mat["item"]
+        rel["raw_table"] = f"[{mat['item']}]"
+        rel["materialized_from_extract"] = True
+        if mat["member"]:
+            rel["extract_hyper_member"] = mat["member"]
+            rel["extract_hyper_table"] = f"[{mat['item']}]"
+    # The join/union containers described the PRE-extract shape; the extract materialised each table
+    # separately, so the containers no longer describe anything physical. Relationships between the
+    # now-typed tables are re-derived from the extract's own tables by the caller.
+    relations[:] = [r for r in relations if r.get("kind") not in ("join", "union")]
+    return [rel for rel, _m, _c in pairs]
+
+
 def _collapse_untyped_relations_to_extract(datasource, relations, cols_by_parent):
     """Replace PRE-EXTRACT relations that carry no columns with the extract's materialized table.
 
@@ -1964,7 +2088,13 @@ def parse_tds(xml_text, select=None):
     # the extract actually materialized (the schema of the bundled .hyper) BEFORE relationships are
     # derived, so a join that the extract already flattened is not also emitted as a model
     # relationship between tables that no longer exist. A no-op unless every relation is columnless.
-    _collapse_untyped_relations_to_extract(datasource, relations, cols_by_parent)
+    if _collapse_untyped_relations_to_extract(datasource, relations, cols_by_parent) is None:
+        # A MULTI-table extract cannot be collapsed onto one table -- doing so would discard the
+        # others -- but it still carries a complete typed schema for each table it materialised, one
+        # parent apiece. Map each column-less relation onto its OWN parent instead of declaring the
+        # whole datasource un-typable and skipping the workbook (issue #104: 4 of 6 workbooks in a
+        # standard training corpus). Fail-closed: anything short of a one-to-one match is a no-op.
+        _expand_untyped_relations_to_extract_tables(datasource, relations, cols_by_parent)
     relationships, relationship_warnings = _extract_relationships(datasource, relations)
     # Recover join keys from any PHYSICAL join tree as model relationships and merge them in,
     # de-duplicating against the object-graph relationships in either orientation (a datasource

@@ -3759,3 +3759,97 @@ def test_locale_dependent_relations_is_silent_for_a_modern_workbook():
   <column datatype='string' name='[Region]' role='dimension' type='nominal' />
 </datasource>""")
     assert _C.locale_dependent_flatfile_relations(d) == []
+
+
+# -- multi-table extract: type each relation from its OWN parent (issue #104) -------------------
+# A single-table extract COLLAPSES onto its one materialised table. A multi-table extract correctly
+# refuses to collapse -- folding three tables onto one would discard two -- but that refusal used to
+# end the story and the whole workbook was skipped ("relation 'Orders.csv' has no resolvable
+# columns", pbip: skipped, definition_of_done: failed) while a complete typed schema and 11,807 rows
+# sat in the bundled .hyper. Measured at 4 of 6 workbooks in a standard Tableau training corpus.
+
+_G1 = "_96FB1234567890ABCDEF1234567890AB"
+_G2 = "_263BAAAABBBBCCCCDDDDEEEEFFFF0000"
+_G3 = "_1FCF9999888877776666555544443333"
+
+
+def _md_rec(parent, col, dtype="string"):
+    return ("<metadata-record class=\'column\'><remote-name>%s</remote-name>"
+            "<remote-type>129</remote-type><local-name>[%s]</local-name>"
+            "<parent-name>[%s]</parent-name><remote-alias>%s</remote-alias>"
+            "<local-type>%s</local-type><ordinal>0</ordinal></metadata-record>"
+            % (col, col, parent, col, dtype))
+
+
+def _extract_tds(rel_names, parents):
+    rels = "".join("<relation connection=\'textscan.1\' name=\'%s\' table=\'[%s]\' type=\'table\' />"
+                   % (n, n.replace(".", "#")) for n in rel_names)
+    recs = "".join(_md_rec(p, "C1") + _md_rec(p, "C2") for p in parents)
+    return ("""<?xml version=\'1.0\' encoding=\'utf-8\' ?>
+<datasource caption=\'DS\' formatted-name=\'X\' inline=\'true\' version=\'18.1\'>
+  <connection class=\'federated\'>
+    <named-connections><named-connection caption=\'c\' name=\'textscan.1\'>
+      <connection class=\'textscan\' filename=\'a.csv\' directory=\'C:/d\' /></named-connection></named-connections>
+    <relation join=\'inner\' type=\'join\'><clause type=\'join\'><expression op=\'=\'/></clause>%s</relation>
+  </connection>
+  <extract enabled=\'true\'><connection class=\'hyper\' dbname=\'Data/x.hyper\' schema=\'Extract\' tablename=\'Extract\'>
+    <relation name=\'Extract\' table=\'[Extract].[Extract]\' type=\'table\' />%s</connection></extract>
+</datasource>""" % (rels, recs))
+
+
+def _typed(descriptor):
+    return {r.get("name"): len(r.get("columns") or [])
+            for r in descriptor["relations"] if r.get("kind") == "table"}
+
+
+def test_a_multi_table_extract_types_each_relation_from_its_own_parent():
+    d = parse_tds(_extract_tds(["Orders.csv", "Customers.csv"],
+                               ["Orders.csv" + _G1, "Customers.csv" + _G2]))
+    assert _typed(d) == {"Orders.csv": 2, "Customers.csv": 2}
+    rels = {r["name"]: r for r in d["relations"] if r.get("kind") == "table"}
+    # each carries its OWN extract table identity, so the materializer reads the right rows
+    assert rels["Orders.csv"]["item"] == "Orders.csv" + _G1
+    assert rels["Customers.csv"]["item"] == "Customers.csv" + _G2
+    assert all(r["extract_hyper_member"] == "Data/x.hyper" for r in rels.values())
+    assert all(r["materialized_from_extract"] for r in rels.values())
+    # the join container described the PRE-extract shape and no longer describes anything physical
+    assert not [r for r in d["relations"] if r.get("kind") in ("join", "union")]
+
+
+def test_a_multi_table_extract_now_yields_a_storage_decision_instead_of_a_skip():
+    # The whole point: this datasource used to report "needs a storage decision (no resolvable
+    # columns)" and the workbook's .pbip was skipped entirely.
+    from storage_mode import select_storage_mode
+    d = parse_tds(_extract_tds(["Orders.csv", "Customers.csv"],
+                               ["Orders.csv" + _G1, "Customers.csv" + _G2]))
+    assert select_storage_mode(d).get("mode") == "Import"
+
+
+def test_an_unmatched_relation_makes_the_expansion_a_no_op():
+    # Fail-closed. One relation with no extract parent means the mapping is not one-to-one, so
+    # NOTHING is typed -- guessing which table is which is the failure this guard exists to prevent.
+    d = parse_tds(_extract_tds(["Orders.csv", "Widgets.csv"],
+                               ["Orders.csv" + _G1, "Customers.csv" + _G2]))
+    assert _typed(d) == {"Orders.csv": 0, "Widgets.csv": 0}
+
+
+def test_a_single_table_extract_still_takes_the_COLLAPSE_path():
+    # Unchanged behaviour: one parent collapses onto one relation named for the datasource.
+    d = parse_tds(_extract_tds(["Orders.csv", "Customers.csv"], ["Orders.csv" + _G1]))
+    assert _typed(d) == {"DS": 2}
+
+
+def test_an_extract_parent_no_relation_references_is_simply_unused():
+    # The live relations define the model's tables; an extra materialised table nothing references
+    # is not a reason to refuse the two that ARE referenced.
+    d = parse_tds(_extract_tds(["Orders.csv", "Customers.csv"],
+                               ["Orders.csv" + _G1, "Customers.csv" + _G2, "Products.csv" + _G3]))
+    assert _typed(d) == {"Orders.csv": 2, "Customers.csv": 2}
+
+
+def test_extract_parent_match_key_strips_the_guid_and_folds_punctuation():
+    assert _C._extract_parent_match_key("[Orders.csv" + _G1 + "]") == "orderscsv"
+    assert _C._extract_parent_match_key("Orders.csv") == "orderscsv"
+    assert _C._extract_parent_match_key("Orders#csv") == "orderscsv"
+    # a 32-hex tail that is NOT a GUID suffix (no underscore) is left alone
+    assert _C._extract_parent_match_key("") == ""
