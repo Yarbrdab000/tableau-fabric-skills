@@ -12,6 +12,29 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.116.0` -> `2.117.0`): a lost Tableau session must not read as
+  "this workbook has no dependencies".** The `401002` handling from #97 lived in
+  `fidelity_reference` only, so `estate_survey` -- written later on the same transport -- inherited
+  none of it, and its failure mode was the exact one it exists to eliminate: a **silent zero**. Once
+  a Cloud session died mid-run, every remaining workbook recorded `[]`, which reads downstream as
+  *independent, migrate in any order*; `connection_read_errors` reached neither `summary` nor the
+  exit code, so the run wrote a clean-looking `survey.json` and **exited 0**. Separately, a `401002`
+  on page 3 of 5 escaped `paged_list` entirely and the script died with **no survey written at all**.
+  Fixed in the SHARED layer so every current and future script inherits it (issue #99):
+  `_http` now returns the synthetic status `0` for a network fault (reset connection, DNS blip, read
+  timeout) instead of letting a raw `OSError` escape; `classify_http_failure` sorts a failure into
+  transient / session_loss / credential / fatal, testing **transient first** so a gateway `503` whose
+  body happens to contain the word "authentication" is still retried; `_http_json` retries the
+  transient class with bounded exponential backoff honouring `Retry-After`, recovers a session loss
+  through a caller-supplied re-auth hook, and **never retries** `400081` /
+  `FederatedDataSourceException` -- Tableau itself cannot query that source, so no retry conjures a
+  credential and the remedy is surfaced instead. `fidelity_reference` now sources the code from the
+  shared constant so the two cannot drift again.
+  `estate_survey` distinguishes **unknown from empty**: an unread workbook is marked
+  `dependencies_unknown` and counted as understated rather than independent, a partial listing is
+  reported as an INCOMPLETE estate rather than crashing, and the survey carries a `degraded` flag
+  that the report text and the **exit code** both honour.
+
 - **tableau-migration (skill `2.115.0` -> `2.116.0`): a Tableau aggregation over a ROW-LEVEL SCALAR
   is `n*k`, not `k` -- and two derivations of one calc are two columns, not one.** A calc built only
   from parameters and literals references no column, so its value is identical on every row; Tableau

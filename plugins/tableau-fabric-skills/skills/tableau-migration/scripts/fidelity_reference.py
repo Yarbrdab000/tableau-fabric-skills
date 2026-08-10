@@ -165,7 +165,11 @@ def list_views(server, site_id, token, rest_version=None, workbook_id=None):
 #
 # Matched on the CODE, not on prose: the code is the stable, localisation-independent part of the
 # ``<error code='401002'>`` body, whereas the summary/detail text is neither.
-_SESSION_LOST_CODE = "401002"
+#
+# Sourced from the SHARED transport rather than re-declared, so the two cannot drift. The original
+# per-script constant is exactly how this fix ended up living in one module while ``estate_survey``
+# -- written later on the same transport -- inherited none of it and reported a silent zero.
+_SESSION_LOST_CODE = getattr(_tds, "SESSION_LOST_CODE", "401002")
 
 
 def _is_session_loss(exc):

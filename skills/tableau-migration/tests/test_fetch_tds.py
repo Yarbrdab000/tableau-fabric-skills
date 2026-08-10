@@ -448,3 +448,148 @@ def test_main_requires_exactly_one_selector():
     # Datasource + workbook together -> mutually-exclusive error.
     with pytest.raises(SystemExit):
         F.main(["--server", "h", "--datasource-name", "D", "--workbook-name", "W", "--dry-run"])
+
+
+# -- shared transport: fault classification + bounded retry (issue #99) ------------------------
+# The 401002 fix originally landed in fidelity_reference ONLY, so estate_survey -- written later on
+# this same transport -- inherited none of it and answered a mid-run session loss with a silent zero.
+# These lock the behaviour in the SHARED layer, where every current and future script gets it.
+
+def test_classify_transient_is_checked_before_any_credential_marker():
+    # ORDER MATTERS: a gateway 503 whose body happens to contain the word "authentication" is a blip,
+    # not a credential failure, and must still be retried.
+    assert F.classify_http_failure(503, "authentication gateway unavailable") == "transient"
+    assert F.classify_http_failure(503, "400081 FederatedDataSourceException") == "transient"
+    for status in (0, 408, 429, 500, 502, 503, 504):
+        assert F.classify_http_failure(status, "") == "transient", status
+
+
+def test_classify_session_loss_and_credential_are_opposite_answers():
+    assert F.classify_http_failure(401, "<error code='401002'>Unauthorized Access</error>") \
+        == "session_loss"
+    # 400081 means TABLEAU cannot query the source. No retry conjures a credential.
+    assert F.classify_http_failure(
+        400, "<error code='400081'>FederatedDataSourceException</error>") == "credential"
+    assert F.classify_http_failure(401, "400081 FederatedDataSourceException") == "credential"
+    # anything else is a real error and must surface unchanged
+    assert F.classify_http_failure(404, "not found") == "fatal"
+    assert F.classify_http_failure(403, "403007 forbidden") == "fatal"
+
+
+def test_http_returns_status_zero_for_a_network_fault_instead_of_raising(monkeypatch):
+    # A reset connection / DNS blip / read timeout produces NO http status, so it used to escape as a
+    # raw OSError: estate_survey crashed with no survey written, and fidelity_reference turned a blip
+    # into a permanent unretried per-sheet error.
+    def boom(*_a, **_k):
+        raise OSError("Connection reset by peer")
+    monkeypatch.setattr(F.urllib.request, "urlopen", boom)
+    status, headers, body = F._http("GET", "https://host/x")
+    assert status == 0 and headers == {}
+    assert b"OSError" in body and b"Connection reset" in body
+
+
+def test_http_json_retries_a_transient_status_then_succeeds():
+    calls, slept = [], []
+
+    def fake_http(method, url, headers=None, body=None, timeout=120):
+        calls.append(1)
+        if len(calls) < 3:
+            return 503, {}, b"service unavailable"
+        return 200, {}, b'{"ok": true}'
+
+    orig = F._http
+    try:
+        F._http = fake_http
+        out = F._http_json("GET", "https://host/x", sleep=slept.append)
+    finally:
+        F._http = orig
+    assert out == {"ok": True}
+    assert len(calls) == 3
+    assert slept == [1.0, 2.0]          # bounded exponential backoff, not an immediate hammer
+
+
+def test_http_json_honours_retry_after():
+    calls, slept = [], []
+
+    def fake_http(method, url, headers=None, body=None, timeout=120):
+        calls.append(1)
+        if len(calls) == 1:
+            return 429, {"Retry-After": "7"}, b"slow down"
+        return 200, {}, b"{}"
+
+    orig = F._http
+    try:
+        F._http = fake_http
+        F._http_json("GET", "https://host/x", sleep=slept.append)
+    finally:
+        F._http = orig
+    assert slept == [7.0]
+
+
+def test_http_json_recovers_a_session_loss_by_re_authenticating():
+    calls = []
+
+    def fake_http(method, url, headers=None, body=None, timeout=120):
+        calls.append((headers or {}).get("X-Tableau-Auth"))
+        if len(calls) == 1:
+            return 401, {}, b"<error code='401002'>Unauthorized Access</error>"
+        return 200, {}, b'{"connections": {}}'
+
+    orig = F._http
+    try:
+        F._http = fake_http
+        out = F._http_json("GET", "https://host/x", token="dead", reauth=lambda: "fresh",
+                           sleep=lambda _s: None)
+    finally:
+        F._http = orig
+    assert out == {"connections": {}}
+    assert calls == ["dead", "fresh"]   # the retry used the NEW token, not the dead one
+
+
+def test_http_json_never_retries_the_credential_class():
+    calls = []
+
+    def fake_http(method, url, headers=None, body=None, timeout=120):
+        calls.append(1)
+        return 400, {}, b"<error code='400081'>FederatedDataSourceException</error>"
+
+    orig = F._http
+    try:
+        F._http = fake_http
+        with pytest.raises(RuntimeError) as err:
+            F._http_json("GET", "https://host/x", reauth=lambda: "fresh", sleep=lambda _s: None)
+    finally:
+        F._http = orig
+    assert len(calls) == 1              # one attempt; the budget is not spent on a certain failure
+    assert "Re-authorise the DATASOURCE" in str(err.value)
+
+
+def test_http_json_gives_up_after_a_bounded_number_of_attempts():
+    calls = []
+
+    def fake_http(method, url, headers=None, body=None, timeout=120):
+        calls.append(1)
+        return 503, {}, b"still down"
+
+    orig = F._http
+    try:
+        F._http = fake_http
+        with pytest.raises(RuntimeError):
+            F._http_json("GET", "https://host/x", max_attempts=3, sleep=lambda _s: None)
+    finally:
+        F._http = orig
+    assert len(calls) == 3
+
+
+def test_a_session_loss_without_a_reauth_hook_says_exactly_that():
+    def fake_http(method, url, headers=None, body=None, timeout=120):
+        return 401, {}, b"<error code='401002'>Unauthorized Access</error>"
+
+    orig = F._http
+    try:
+        F._http = fake_http
+        with pytest.raises(RuntimeError) as err:
+            F._http_json("GET", "https://host/x", sleep=lambda _s: None)
+    finally:
+        F._http = orig
+    assert "no re-authentication hook" in str(err.value)

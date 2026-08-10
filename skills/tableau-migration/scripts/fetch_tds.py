@@ -66,6 +66,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import http.client
 import io
 import json
 import os
@@ -255,7 +256,15 @@ def build_connected_app_jwt(client_id, secret_id, secret_value, username, scopes
 # == thin HTTP layer (the only network code) =================================================
 
 def _http(method, url, headers=None, body=None, timeout=120):
-    """Issue one request. Returns ``(status_code, headers_dict, body_bytes)``."""
+    """Issue one request. Returns ``(status_code, headers_dict, body_bytes)``.
+
+    A NETWORK fault -- reset connection, DNS failure, read timeout -- produces no HTTP status at
+    all, so it is returned as the synthetic status ``0`` rather than escaping as a raw ``OSError``.
+    Letting it escape meant every caller had to guess: ``estate_survey`` crashed without writing its
+    survey, and ``fidelity_reference``'s catch-all turned a blip into a permanent, unretried
+    per-sheet error. Status ``0`` is classified transient, so the shared retry handles it like any
+    other blip, and callers still see one uniform ``(status, headers, body)`` contract.
+    """
     data = None
     hdrs = dict(headers or {})
     if body is not None:
@@ -268,15 +277,99 @@ def _http(method, url, headers=None, body=None, timeout=120):
             return resp.status, dict(resp.headers), resp.read()
     except urllib.error.HTTPError as exc:
         return exc.code, dict(exc.headers), exc.read()
+    except (OSError, http.client.HTTPException) as exc:  # urllib.error.URLError IS an OSError
+        return 0, {}, f"{type(exc).__name__}: {exc}".encode("utf-8", "replace")
 
 
-def _http_json(method, url, token=None, body=None, timeout=120):
-    headers = {"X-Tableau-Auth": token} if token else {}
-    status, resp_headers, raw = _http(method, url, headers=headers, body=body, timeout=timeout)
-    text = raw.decode("utf-8") if raw else ""
-    if status != 200:
-        raise RuntimeError(f"{method} {url} failed ({status}): {text[:500]}")
-    return json.loads(text) if text else {}
+# Tableau's session-expired error code. A Cloud session can die mid-run -- measured intermittently
+# after anywhere from 1 to 58 calls -- and the only faithful response is to sign in again and retry.
+SESSION_LOST_CODE = "401002"
+
+# Tableau itself cannot query the source (expired OAuth refresh token on the DATASOURCE, not on our
+# session). No retry conjures a credential, so this must fail fast with the remedy surfaced rather
+# than spending the retry budget on a guaranteed failure.
+CREDENTIAL_CODES = ("400081", "FederatedDataSourceException")
+
+# Statuses worth retrying: rate limiting, gateway/backend blips, and the synthetic 0 that ``_http``
+# returns for a network fault.
+TRANSIENT_STATUSES = frozenset({0, 408, 429, 500, 502, 503, 504})
+
+
+def classify_http_failure(status, text):
+    """Classify a failed response as ``transient`` / ``session_loss`` / ``credential`` / ``fatal``.
+
+    ORDER MATTERS. Transient is tested FIRST, so a gateway ``503`` whose body happens to contain the
+    word "authentication" is still retried instead of being mistaken for a credential failure. Then
+    session loss (recoverable by signing in again), then the credential class (never retried), then
+    everything else, which is a real error and must surface unchanged.
+    """
+    body = str(text or "")
+    if status in TRANSIENT_STATUSES:
+        return "transient"
+    if SESSION_LOST_CODE in body or (status == 401 and not any(c in body for c in CREDENTIAL_CODES)):
+        return "session_loss"
+    if any(code in body for code in CREDENTIAL_CODES):
+        return "credential"
+    return "fatal"
+
+
+def _retry_after_seconds(headers, default):
+    """Honour a ``Retry-After`` header (seconds form) when the server sends one, else ``default``."""
+    raw = None
+    for key, value in (headers or {}).items():
+        if str(key).lower() == "retry-after":
+            raw = value
+            break
+    try:
+        wait = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(wait, 60.0))
+
+
+def _http_json(method, url, token=None, body=None, timeout=120, *,
+               reauth=None, max_attempts=4, sleep=None):
+    """GET/POST JSON with bounded retry for the failures that are worth retrying.
+
+    Retries a **transient** status (429/5xx and the synthetic ``0`` a network fault produces) with
+    exponential backoff, honouring ``Retry-After``; recovers a **session loss** (``401002``) by
+    calling ``reauth()`` for a fresh token and retrying once per attempt; and fails FAST on the
+    credential class (``400081`` / ``FederatedDataSourceException``), which no retry can fix.
+
+    ``reauth`` is an optional ``() -> token`` supplied by the caller that owns the sign-in
+    (``fetch_tds`` deliberately does not cache credentials). Without it a session loss is still
+    classified and reported precisely -- it simply cannot be recovered.
+
+    Defaults are byte-compatible with the previous behaviour for a 200 and still raise
+    ``RuntimeError`` on a real failure, so existing callers are unchanged apart from surviving blips.
+    """
+    sleeper = sleep if sleep is not None else time.sleep
+    attempt, delay, last = 0, 1.0, ""
+    while True:
+        attempt += 1
+        headers = {"X-Tableau-Auth": token} if token else {}
+        status, resp_headers, raw = _http(method, url, headers=headers, body=body, timeout=timeout)
+        text = raw.decode("utf-8", "replace") if raw else ""
+        if status == 200:
+            return json.loads(text) if text else {}
+        kind = classify_http_failure(status, text)
+        last = f"{method} {url} failed ({status}, {kind}): {text[:500]}"
+        if attempt >= max_attempts or kind in ("fatal", "credential"):
+            if kind == "credential":
+                raise RuntimeError(
+                    last + " -- Tableau itself cannot query this source (its stored credential or "
+                    "OAuth refresh token has expired). Re-authorise the DATASOURCE in Tableau; no "
+                    "retry can fix this.")
+            raise RuntimeError(last)
+        if kind == "session_loss":
+            if reauth is None:
+                raise RuntimeError(
+                    last + " -- the Tableau session expired mid-run and no re-authentication hook "
+                    "was supplied, so this call cannot be recovered.")
+            token = reauth()
+            continue
+        sleeper(_retry_after_seconds(resp_headers, delay))
+        delay = min(delay * 2, 30.0)
 
 
 # == orchestration ===========================================================================
