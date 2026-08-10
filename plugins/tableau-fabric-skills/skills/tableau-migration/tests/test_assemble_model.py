@@ -145,6 +145,65 @@ def test_assemble_measure_report_translates_and_stubs():
     assert "TranslatedBy" in measures              # only the translated one
 
 
+def test_two_calcs_sharing_one_caption_do_not_produce_a_duplicate_measure():
+    # A duplicate measure NAME is not a cosmetic blemish, it is a HARD LOAD FAILURE. TMDL merges
+    # two objects declaring the same name, so the second one's `expression` collides and Power BI
+    # Desktop refuses to open the whole project:
+    #   "TMDL objects cannot be merged because both declare the same property: expression
+    #    1st object: type=Measure, name='IF LAST()=0 THEN RUNNING_SUM([Closed Inbound Referrals])END'
+    #    2nd object: type=Measure, name='IF LAST()=0 THEN RUNNING_SUM([Closed Inbound Referrals])END'"
+    # Observed on the Salesforce Nonprofit "(Intake Only)" workbook. It is reachable from ordinary
+    # workbooks because Tableau identifies a calc by its INTERNAL name and lets two calcs share one
+    # caption, while we name measures by caption.
+    #
+    # Same caption + same formula means the same calculation, so it is emitted ONCE.
+    calcs = [
+        {"name": "Repeat Calc", "formula": "SUM([Sales])/SUM([Quantity])",
+         "internal_name": "[Calculation_1]"},
+        {"name": "Repeat Calc", "formula": "SUM([Sales])/SUM([Quantity])",
+         "internal_name": "[Calculation_2]"},
+    ]
+    out = migrate_tds_to_semantic_model(LIVE_SQLSERVER, model_name="Superstore", calcs=calcs)
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    assert measures.count("measure 'Repeat Calc'") == 1
+
+
+def test_two_calcs_sharing_a_caption_but_not_a_formula_both_survive_under_unique_names():
+    # The other half of the rule: a shared caption over DIFFERENT expressions is two genuinely
+    # different calculations. Dropping one would lose a translation, so the later is renamed --
+    # keeping the model loadable AND keeping both calculations.
+    calcs = [
+        {"name": "Repeat Calc", "formula": "SUM([Sales])/SUM([Quantity])",
+         "internal_name": "[Calculation_1]"},
+        {"name": "Repeat Calc", "formula": "SUM([Profit])/SUM([Quantity])",
+         "internal_name": "[Calculation_2]"},
+    ]
+    out = migrate_tds_to_semantic_model(LIVE_SQLSERVER, model_name="Superstore", calcs=calcs)
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    names = re.findall(r"^\s*measure\s+('(?:[^']|'')*'|[^\s=]+)\s*=", measures, re.M)
+    assert len(names) == len(set(n.lower() for n in names)), names
+    assert "measure 'Repeat Calc' =" in measures
+    assert "measure 'Repeat Calc 2' =" in measures
+
+
+def test_every_emitted_measure_name_is_unique_across_the_whole_measures_table():
+    # The invariant itself, stated once: whatever mix of translated calcs, stubs, table calcs,
+    # flag measures and synthesized bases a workbook produces, no two measures in _Measures may
+    # share a name. This is the assertion that would have caught the defect above no matter which
+    # of the eleven emission paths created the collision.
+    calcs = [
+        {"name": "Profit Ratio", "formula": "SUM([Sales])/SUM([Quantity])"},
+        {"name": "Profit Bucket", "formula": 'REGEXP_MATCH([Region], "^A")'},
+        {"name": "Profit Ratio", "formula": "SUM([Sales])/SUM([Quantity])"},
+        {"name": "Profit Bucket", "formula": 'REGEXP_MATCH([Region], "^Z")'},
+    ]
+    out = migrate_tds_to_semantic_model(LIVE_SQLSERVER, model_name="Superstore", calcs=calcs)
+    measures = out["parts"]["definition/tables/_Measures.tmdl"]
+    names = [n.lower() for n in
+             re.findall(r"^\s*measure\s+('(?:[^']|'')*'|[^\s=]+)\s*=", measures, re.M)]
+    assert len(names) == len(set(names)), sorted(names)
+
+
 def test_row_level_measure_role_calc_reroutes_to_column():
     # Tableau labels a purely row-level numeric calc a *measure* (by output type), so it lands on the
     # measure path where its bare field references correctly stub. The faithful Power BI form is a DAX

@@ -14,6 +14,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **tableau-migration (skill `2.105.0` -> `2.106.0`): two calcs sharing one caption must not become
+  two measures with one name.** A duplicate measure name is not cosmetic — TMDL *merges* two objects
+  that declare the same name, so the second one's `expression` collides and Power BI Desktop refuses
+  to open the project at all: *"TMDL objects cannot be merged because both declare the same property:
+  expression"*. The migration reports success and produces a file nobody can open.
+  - **Reachable from ordinary workbooks.** Tableau identifies a calc by its INTERNAL name and happily
+    lets two calcs share a caption; we name measures by caption. Observed on the Salesforce Nonprofit
+    "(Intake Only)" workbook, which carries two copies of
+    `IF LAST()=0 THEN RUNNING_SUM([Closed Inbound Referrals])END` — same caption, same formula,
+    different internal names.
+  - **Two collisions, two answers.** Same caption + same expression is the same calculation, so it is
+    emitted once and both binder entries resolve to it. Same caption + different expression is two
+    different calculations, so the later is renamed rather than dropped — keeping the model loadable
+    without losing a translation.
+  - Enforced at the single point every measure is emitted, so it holds for all eleven emission paths
+    (translated calcs, stubs, assisted suggestions, approved DAX, workbook table calcs, date-window
+    flag measures, visual-calculation base measures, measure-swap aggregations). Locked by a test
+    asserting the invariant over the whole `_Measures` table, not just the observed case.
+
 - **tableau-migration (skill `2.104.0` -> `2.105.0`): a side-by-side measure trellis is not a dual
   axis.** Regression shipped in 2.103.0 and caught on the Salesforce Nonprofit "Intake" dashboard:
   a block that 2.102.0 rebuilt as **five side-by-side bar charts** came back as **one combo chart

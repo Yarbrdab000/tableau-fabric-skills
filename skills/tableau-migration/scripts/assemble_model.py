@@ -1216,6 +1216,47 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     measures_tmdl = ""
     report = []
     suggestions = []
+    # A measure NAME must be unique inside _Measures. TMDL merges two objects that declare the same
+    # name, so a second one carrying its own `expression` is not a duplicate to be ignored -- it is a
+    # HARD LOAD FAILURE: "TMDL objects cannot be merged because both declare the same property:
+    # expression", and Power BI Desktop refuses to open the project at all. Nothing downstream can
+    # recover from it, so uniqueness is enforced here, at the single point every measure is emitted.
+    #
+    # This is reachable from ordinary workbooks: Tableau identifies a calc by its INTERNAL name and
+    # lets two distinct calcs share one caption, while we name measures by caption. Observed on the
+    # Salesforce Nonprofit "(Intake Only)" workbook, which carries two copies of
+    # `IF LAST()=0 THEN RUNNING_SUM([Closed Inbound Referrals])END` -- same caption, same formula,
+    # different internal names -- and whose migrated project would not open.
+    #
+    # Two collisions, two different right answers:
+    #   * SAME name + SAME expression -> the two source calcs are the same calculation, so emit it
+    #     ONCE. Both binder entries then resolve to that one measure, which is what they mean.
+    #   * SAME name + DIFFERENT expression -> genuinely different calculations that happen to share
+    #     a caption. Renaming is the only way to keep both, so suffix the later one and hand the
+    #     caller the emitted name to record on its report row.
+    _emitted_measures = {}
+    _measure_parts = []
+
+    def _gen_measure(name, formula, dax=None, **kw):
+        """Emit one measure into ``_measure_parts``, keeping names unique. -> emitted name."""
+        base = (name or "").strip()
+        expr = dax if dax else "BLANK()"
+        prior = _emitted_measures.get(base.lower())
+        if prior is not None and prior == expr:
+            return base
+        final = base
+        if prior is not None:
+            # Same caption, DIFFERENT expression: two genuinely different calcs. Renaming keeps
+            # both rather than dropping one, at the cost that a report reference written against
+            # the shared caption resolves to the first. That is a disclosed degradation; an
+            # unopenable project is not.
+            n = 2
+            while ("%s %d" % (base, n)).lower() in _emitted_measures:
+                n += 1
+            final = "%s %d" % (base, n)
+        _emitted_measures[final.lower()] = expr
+        _measure_parts.append(T.generate_measure_tmdl(final, formula, dax, **kw))
+        return final
     # Author-declared number format per calc (currency/percent/precision), decoded conservatively
     # at extraction onto ``format_string`` (see ``tableau_measure_format_to_pbi``). Keyed by BOTH
     # caption and internal ``Calculation_*`` token, case-insensitive, so a measure emitted under
@@ -1339,7 +1380,7 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     # Aggregating measures synthesized for measure-swap field parameters (a NAMEOF'd raw column is
     # grouped-by, not aggregated, so each measure-swap candidate needs a real SUM measure to point at).
     for sm in (synth_measures or []):
-        measures_tmdl += T.generate_measure_tmdl(
+        _gen_measure(
             sm["name"], sm.get("tableau_formula", ""), sm["dax"],
             translated_by="deterministic (measure-swap aggregation)",
             format_string=_fmt(sm["name"]))
@@ -1420,22 +1461,22 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         }
         if dax:
             if agg_provenance:
-                measures_tmdl += T.generate_measure_tmdl(
+                _gen_measure(
                     name, formula, dax,
                     translated_by=f"deterministic (parameter-driven {agg_provenance} over row-level calc)",
                     format_string=_fmt(name))
             elif flag_gated:
-                measures_tmdl += T.generate_measure_tmdl(
+                _gen_measure(
                     name, formula, dax,
                     translated_by="deterministic (flag-gated inner measure over date-window keep-flag)",
                     format_string=_fmt(name))
             elif lod_gated:
-                measures_tmdl += T.generate_measure_tmdl(
+                _gen_measure(
                     name, formula, dax,
                     translated_by="deterministic (default-SUM over param-gated row-level FIXED LOD)",
                     format_string=_fmt(name))
             else:
-                measures_tmdl += T.generate_measure_tmdl(name, formula, dax,
+                _gen_measure(name, formula, dax,
                                                           format_string=_fmt(name))
             report.append(row)
             continue
@@ -1447,7 +1488,7 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         approved_dax, _approved_tbl = _approved_entry(approved_lower.get(name.lower()))
         if approved_dax:
             approved_expr = " ".join(approved_dax.split())  # collapse to one valid DAX line
-            measures_tmdl += T.generate_measure_tmdl(
+            _gen_measure(
                 name, formula, approved_expr,
                 translated_by="assisted translation (human-approved)",
                 format_string=_fmt(name))
@@ -1456,20 +1497,20 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             if sugg:
                 row["assisted_pattern"] = sugg["pattern"]
         elif sugg:
-            measures_tmdl += T.generate_measure_tmdl(name, formula, None, suggestion=sugg,
+            _gen_measure(name, formula, None, suggestion=sugg,
                                                      format_string=_fmt(name))
             row["status"] = "assisted-suggested"
             row["assisted_suggestion"] = sugg
             suggestions.append({"measure": name, **sugg})
         else:
-            measures_tmdl += T.generate_measure_tmdl(name, formula, None,
+            _gen_measure(name, formula, None,
                                                      format_string=_fmt(name))
         report.append(row)
     # Emit the translated workbook table calcs (addressing-bearing) after the plain measures. Each
     # preserves its original Tableau formula as ``TableauFormula`` and is tagged with the addressing
     # provenance; its ``source`` carries the full instance token + bare calc id the binder joins on.
     for r in tablecalc_rows:
-        measures_tmdl += T.generate_measure_tmdl(
+        _gen_measure(
             r["measure"], r["tableau_formula"], r["dax"],
             translated_by=r.get("translated_by") or "deterministic (workbook addressing)",
             format_string=_fmt(r["measure"]))
@@ -1477,7 +1518,7 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     # Emit the synthesized parameter-driven date-window keep-flag measures last. Each supersedes
     # its source calc's plain stub (skipped above) and preserves the original Tableau formula.
     for fm in (flag_measures or []):
-        measures_tmdl += T.generate_measure_tmdl(
+        _gen_measure(
             fm["measure"], fm.get("tableau_formula", ""), fm["dax"],
             translated_by=fm.get("translated_by") or "deterministic (parameter-driven date window)",
             format_string=_fmt(fm["measure"]))
@@ -1490,11 +1531,12 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     # the workbook actually carries such a view-only quick table calc. The appended rows flow into
     # ``_row_count_targets`` so the viz layer binds the implicit-count pill to this measure for free.
     for br in _visual_calc_base_measures(table_calc_usages, known_tables, report):
-        measures_tmdl += T.generate_measure_tmdl(
+        _gen_measure(
             br["measure"], br["tableau_formula"], br["dax"],
             translated_by=br.get("translated_by") or "deterministic (visual-calculation base measure)",
             format_string=_fmt(br["measure"]))
         report.append(br)
+    measures_tmdl = "".join(_measure_parts)
     return T.generate_measures_table_tmdl(measures_tmdl), report, suggestions
 
 
