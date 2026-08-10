@@ -14,7 +14,7 @@ Two layers:
 import json
 
 import pbir_lint
-from pbir_lint import lint_pbir_parts, VALID_VISUAL_TYPES
+from pbir_lint import lint_pbir_parts, VALID_VISUAL_TYPES, lint_visual_model_bindings
 
 import twb_to_pbir as R
 from twb_to_pbir import emit_pbir, parse_twb
@@ -328,3 +328,60 @@ def _as_text_or_empty(value):
         except Exception:
             return ""
     return value or ""
+
+# =================================================================================================
+# Visual -> model binding references. reference_gate proves this invariant for the DAX the second
+# compiler writes; these lock it for the PBIR side, where the same defect is WORSE -- a visual bound
+# to a column the model does not contain neither errors nor fails validation, it just renders EMPTY.
+# =================================================================================================
+import reference_gate as _reference_gate
+
+
+_BIND_TMDL = {
+    "definition/tables/Orders.tmdl": "table Orders\n\tcolumn Sales\n\tcolumn Region\n",
+    "definition/tables/_Measures.tmdl":
+        "table _Measures\n\tmeasure 'Total Sales' = SUM('Orders'[Sales])\n",
+}
+
+
+def _bind_surface():
+    return _reference_gate.build_model_surface(tmdl_parts=_BIND_TMDL)
+
+
+def _visual_with(entity, prop, kind="Column"):
+    field = {kind: {"Expression": {"SourceRef": {"Entity": entity}}, "Property": prop}}
+    doc = {"visual": {"visualType": "clusteredColumnChart",
+                      "query": {"queryState": {"Category": {"projections": [{"field": field}]}}}}}
+    return {"pages/p/visuals/v/visual.json": json.dumps(doc)}
+
+
+def test_visual_binding_to_a_real_column_lints_clean():
+    assert lint_visual_model_bindings(_visual_with("Orders", "Sales"), _bind_surface()) == []
+
+
+def test_visual_binding_to_a_missing_column_is_caught():
+    # The defect this exists for: Power BI renders an EMPTY visual and `validate` reports 0 errors,
+    # because a reference to a missing column is structurally well-formed JSON.
+    problems = lint_visual_model_bindings(_visual_with("Orders", "CreatedDate"), _bind_surface())
+    assert len(problems) == 1
+    assert "PBIR_VISUAL_REF_MISSING" in problems[0]
+    assert "CreatedDate" in problems[0] and "Orders" in problems[0]
+
+
+def test_visual_binding_to_a_missing_table_is_caught():
+    problems = lint_visual_model_bindings(_visual_with("NoSuchTable", "Sales"), _bind_surface())
+    assert len(problems) == 1
+    assert "PBIR_VISUAL_REF_TABLE_MISSING" in problems[0]
+
+
+def test_a_measure_resolves_model_globally_not_per_table():
+    # A measure is model-global in DAX, so a reference qualified by some other table still resolves.
+    # Checking only the named table would flag a reference that works perfectly.
+    parts = _visual_with("Orders", "Total Sales", kind="Measure")
+    assert lint_visual_model_bindings(parts, _bind_surface()) == []
+
+
+def test_binding_check_is_a_no_op_without_a_surface():
+    # Callers with no model in scope must be completely unaffected.
+    assert lint_visual_model_bindings(_visual_with("Nope", "Nope"), None) == []
+    assert lint_pbir_parts(_visual_with("Nope", "Nope")) == []

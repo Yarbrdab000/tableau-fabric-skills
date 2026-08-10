@@ -3043,6 +3043,31 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                 # reported fidelity matches the project the user actually opens (warn-never-wrong: any
                 # warning the rebound run still emits is carried, never masked).
                 entry["viz_fidelity"] = _viz_fidelity(rebuilt)
+                # Every model reference a VISUAL names must exist in the model that ships beside it.
+                # reference_gate proves this for the DAX the second compiler writes; nothing proved
+                # it for PBIR, where the same defect is WORSE -- a visual bound to a column the model
+                # does not contain neither errors nor fails validation, it just renders EMPTY, so it
+                # reads as a data problem rather than a binding problem. Checked against the REBOUND
+                # pass, because that is what lands in the openable .pbip.
+                #
+                # The surface is built from the emitted TMDL, NOT from ``model_manifest``: the
+                # manifest covers the data tables, so a manifest-built surface does not know about
+                # the generated Date table's calculated columns or the parameter tables, and reports
+                # every perfectly valid reference to them as dangling (measured: 48 false positives
+                # on one workbook, every one of them real). The TMDL is what Power BI actually loads.
+                # Fail-safe: any import or surface problem leaves the run exactly as it was.
+                try:
+                    import pbir_lint as _pbir_lint
+                    import reference_gate as _ref_gate
+                    _surface = _ref_gate.build_model_surface(
+                        tmdl_parts=(res or {}).get("parts") or {})
+                    _dangling = _pbir_lint.lint_visual_model_bindings(
+                        (rebuilt or {}).get("parts") or {}, _surface)
+                except Exception:
+                    _dangling = []
+                if _dangling:
+                    entry["viz_dangling_bindings"] = {
+                        "count": len(_dangling), "problems": _dangling[:20]}
                 # Carry the full per-visual remediation worklist too (see ``_viz_worklist``): the
                 # rebound pass is what lands in the openable .pbip, so its worklist is the one a
                 # remediator should act on.

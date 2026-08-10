@@ -12,6 +12,32 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+
+- **tableau-migration (skill `2.110.0` -> `2.111.0`): a gate that proves every VISUAL's model
+  references resolve.** `reference_gate` has always proved this invariant for the DAX the second
+  compiler writes. Nothing proved it for PBIR — where the same defect is **worse**: a visual bound to
+  a column or measure the model does not contain neither errors nor fails validation, it just renders
+  **EMPTY**, so it reads as a data problem rather than a binding problem.
+  `powerbi-report-author validate` returns 0 errors for it, because a reference to a missing object
+  is structurally well-formed JSON.
+  - `pbir_lint.lint_visual_model_bindings(parts, surface)` resolves every `Column` / `Measure`
+    reference against a `reference_gate.build_model_surface` result. Wired into every migration
+    against the **rebound** pass (what actually lands in the `.pbip`), reported as
+    `viz_dangling_bindings`. Additive and fail-safe: it records, it does not fail a build.
+  - **Two mistakes of my own that the discipline caught before shipping**, both worth recording
+    because either would have made the gate lie:
+    (1) building the surface from `model_manifest` reported **48 false positives** on one workbook —
+    the manifest covers data tables, so it does not know the generated `Date` table's calculated
+    columns or the parameter tables. The surface is built from the emitted **TMDL**, which is what
+    Power BI actually loads. (2) Reading the visual JSON with a regex reported **8 more** — a
+    visual.json escapes non-ASCII as `\uXXXX`, so a measure named `... above Goal ▲` was compared as
+    an escape sequence against its decoded model name. The parsed document is walked instead.
+  - Proven to FIRE, not just to pass: negative controls corrupt a `Property` and an `Entity` in real
+    emitted output and assert each is caught. A check that has never fired proves nothing.
+  - **It immediately found two real dangling references** on a workbook every other gate passes,
+    including one introduced by 2.110.0's own predecessor — logged for fix, not silently absorbed.
+
 ### Fixed
 
 - **tableau-migration (skill `2.109.0` -> `2.110.0`): the trellis collapse, fixed for BOTH spellings

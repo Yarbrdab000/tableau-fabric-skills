@@ -286,19 +286,110 @@ def _lint_theme(parts):
     return problems
 
 
-def lint_pbir_parts(parts):
+
+def _iter_model_refs(node):
+    """Yield ``(kind, entity, property)`` for every model reference in a parsed visual.json.
+
+    Walks the PARSED document rather than the raw text: a visual.json escapes non-ASCII as ``\\uXXXX``
+    (a measure named ``... above Goal \u25b2`` is stored escaped), so a regex over the text compares an
+    escape sequence against a decoded model name and reports a perfectly valid reference as dangling.
+    Measured: 8 such false positives on one workbook before this was parsed properly.
+    """
+    if isinstance(node, dict):
+        for kind in ("Column", "Measure"):
+            ref = node.get(kind)
+            if isinstance(ref, dict) and isinstance(ref.get("Property"), str):
+                src = ((ref.get("Expression") or {}).get("SourceRef") or {})
+                entity = src.get("Entity")
+                if isinstance(entity, str):
+                    yield kind, entity, ref["Property"]
+        for value in node.values():
+            for hit in _iter_model_refs(value):
+                yield hit
+    elif isinstance(node, list):
+        for value in node:
+            for hit in _iter_model_refs(value):
+                yield hit
+
+
+def lint_visual_model_bindings(parts, model_surface):
+    """Every ``'Table'[Column]`` / ``[Measure]`` a VISUAL names must exist in the model.
+
+    :mod:`reference_gate` proves this invariant for the DAX the second compiler writes. Nothing
+    proved it for the PBIR side, where the same class of defect is *worse*: a visual bound to a
+    column the model does not contain does not error and does not fail validation -- Power BI simply
+    renders an EMPTY chart. ``powerbi-report-author validate`` returns 0 errors for it, because a
+    reference to a missing column is structurally well-formed JSON; only opening the report, or
+    running the query by hand, reveals it.
+
+    ``model_surface`` is a :func:`reference_gate.build_model_surface` result (case-insensitive
+    lookups over ``{table -> {"columns": {...}, "measures": {...}}}``). Passing ``None`` makes this a
+    no-op, so callers without a model in scope are unaffected.
+
+    Deliberately reports the ENTITY as missing only when the model has no such table at all: a
+    reference into a table that exists but lacks the column is the more common and more diagnostic
+    case, and naming the column is what points at the cause.
+    """
+    problems = []
+    if not isinstance(model_surface, dict):
+        return problems
+    tables = model_surface.get("tables") or {}
+    if not tables:
+        return problems
+    columns = model_surface.get("columns") or {}
+    measure_by_table = model_surface.get("measure_by_table") or {}
+    measures = model_surface.get("measures") or {}
+    for path, content in sorted((parts or {}).items()):
+        if not path.endswith("visual.json") or not isinstance(content, str):
+            continue
+        try:
+            doc = json.loads(content)
+        except (ValueError, TypeError):
+            continue          # a malformed part is another check's problem, never this one's
+        seen = set()
+        for kind, entity, prop in _iter_model_refs(doc):
+            key = (kind, entity, prop)
+            if key in seen:
+                continue
+            seen.add(key)
+            ent_l, prop_l = entity.lower(), prop.lower()
+            if ent_l not in tables:
+                problems.append(
+                    "PBIR_VISUAL_REF_TABLE_MISSING: %s references table %r, which the model does "
+                    "not contain (%s %r)" % (path, entity, kind.lower(), prop))
+                continue
+            if kind == "Measure":
+                # A measure is model-global in DAX, so a qualified reference resolves if the model
+                # holds that measure anywhere -- checking only the named table would flag a
+                # correctly-working reference.
+                ok = prop_l in measure_by_table.get(ent_l, {}) or prop_l in measures
+            else:
+                ok = prop_l in columns.get(ent_l, {})
+            if not ok:
+                problems.append(
+                    "PBIR_VISUAL_REF_MISSING: %s binds %s %r on table %r, which the model does not "
+                    "contain -- the visual renders EMPTY and validation reports no error"
+                    % (path, kind.lower(), prop, entity))
+    return problems
+
+
+def lint_pbir_parts(parts, model_surface=None):
     """Return a list of PBIR validity violations for an emitted ``{path: content}`` parts dict.
 
-    An empty list means the report is free of the two known static PBIR validity defects (an unknown
+    An empty list means the report is free of the known static PBIR validity defects (an unknown
     ``visualType`` and a ``customTheme`` name mismatch). Never raises; a malformed / absent part is
     silently skipped so the linter is safe to run on every migration.
+
+    ``model_surface`` is OPTIONAL: supply a :func:`reference_gate.build_model_surface` result to also
+    prove every visual's model references resolve. Omitting it leaves the result unchanged.
     """
     parts = parts or {}
     return (_lint_visual_types(parts) + _lint_theme(parts)
-            + _lint_card_display_units(parts) + _lint_native_query_refs(parts))
+            + _lint_card_display_units(parts) + _lint_native_query_refs(parts)
+            + lint_visual_model_bindings(parts, model_surface))
 
 
-def lint_pbir_report(report_dir):
+def lint_pbir_report(report_dir, model_surface=None):
     """Lint an on-disk ``*.Report`` folder: read every file under it into a ``{relpath: text}`` parts
     dict (forward-slash paths, ``utf-8-sig``) and apply :func:`lint_pbir_parts`."""
     import os
@@ -317,7 +408,7 @@ def lint_pbir_report(report_dir):
                         parts[rel] = handle.read()
                 except OSError:
                     continue
-    return lint_pbir_parts(parts)
+    return lint_pbir_parts(parts, model_surface)
 
 
 def _main(argv):
