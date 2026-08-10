@@ -3811,9 +3811,10 @@ def test_field_map_from_model_builds_entity_property_from_naming_columns():
         "Choose Metric": {"model_table": "Measure Swap calc 1",
                           "model_name": "Measure Swap calc 1", "kind": "parameter"},
     }}}
-    model_table, field_map = me._field_map_from_model(res_report)
+    model_table, field_map, ambiguous = me._field_map_from_model(res_report)
     # fact table = the one owning the most columns (Orders: 3 vs People: 1)
     assert model_table == "Orders"
+    assert ambiguous == []
     # columns are mapped with {entity, property} and NO binding override (aggregations survive)
     assert field_map["Sales"] == {"entity": "Orders", "property": "Sales"}
     assert field_map["Order Date"] == {"entity": "Orders", "property": "Order_Date"}
@@ -3832,20 +3833,74 @@ def test_field_map_from_model_skips_incomplete_entries():
         "NoTable": {"model_table": None, "model_name": "X", "kind": "column"},
         "NoName": {"model_table": "Orders", "model_name": None, "kind": "column"},
     }}}
-    model_table, field_map = me._field_map_from_model(res_report)
+    model_table, field_map, _amb = me._field_map_from_model(res_report)
     assert model_table == "Orders"
     assert field_map == {"Good": {"entity": "Orders", "property": "Good"}}
 
 
 def test_field_map_from_model_none_when_no_columns():
-    # No usable column naming -> (None, None) so the viz re-run keeps its standing field bindings
+    # No usable column naming -> (None, None, []) so the viz re-run keeps its standing field bindings
     # (warn-never-wrong; byte-unchanged until a real map exists).
-    assert me._field_map_from_model(None) == (None, None)
-    assert me._field_map_from_model({}) == (None, None)
-    assert me._field_map_from_model({"model_manifest": {"naming": {}}}) == (None, None)
+    assert me._field_map_from_model(None) == (None, None, [])
+    assert me._field_map_from_model({}) == (None, None, [])
+    assert me._field_map_from_model({"model_manifest": {"naming": {}}}) == (None, None, [])
     only_measure = {"model_manifest": {"naming": {
         "M": {"model_table": "_Measures", "model_name": "M", "kind": "measure"}}}}
-    assert me._field_map_from_model(only_measure) == (None, None)
+    assert me._field_map_from_model(only_measure) == (None, None, [])
+
+
+def test_field_map_from_model_datasource_scoped_key_survives_a_relation_name_miss():
+    # ISSUE #103. An EXTRACTED datasource carries two relations for the same logical table -- the live
+    # one and the ``Extract`` materialisation -- so `table_map` keys the live name while the worksheet
+    # field names ``Extract``. The relation-qualified key misses, and without a datasource-scoped
+    # fallback resolution drops to the BARE caption, which whichever table was written first claims.
+    # Measured: the Commission dashboard's `Sales` bound Orders[Sales] (2,326,534) instead of
+    # `Sales Commission.csv`[Sales] (15,357,898) -- a 6.6x error that renders perfectly.
+    res_report = {
+        "table_map": {
+            "Superstore||Orders": "Orders",
+            "Commission||Sales Commission.csv": "Sales Commission.csv",
+        },
+        "model_manifest": {
+            "naming": {"Sales": {"model_table": "Orders", "model_name": "Sales",
+                                 "kind": "column"}},
+            "columns": [
+                {"model_table": "Orders", "model_name": "Sales", "tableau_field": "Sales"},
+                {"model_table": "Sales Commission.csv", "model_name": "Sales",
+                 "tableau_field": "Sales"},
+            ],
+        },
+    }
+    _mt, field_map, ambiguous = me._field_map_from_model(res_report)
+    # relation-qualified keys still exist for the relations the model DOES know
+    assert field_map["Commission||Sales Commission.csv||Sales"] == {
+        "entity": "Sales Commission.csv", "property": "Sales"}
+    # ...and the datasource-scoped key catches a pill whose relation is `Extract` instead
+    assert field_map["Commission||Sales"] == {
+        "entity": "Sales Commission.csv", "property": "Sales"}
+    assert field_map["Superstore||Sales"] == {"entity": "Orders", "property": "Sales"}
+    # the bare caption is untouched (first writer), so a single-datasource workbook is unaffected
+    assert field_map["Sales"] == {"entity": "Orders", "property": "Sales"}
+    assert ambiguous == []
+
+
+def test_field_map_from_model_withholds_a_datasource_scoped_key_that_is_ambiguous():
+    # Where ONE datasource genuinely carries the same caption on two tables there is nothing to
+    # prefer, so no datasource-scoped key is emitted (resolution falls through to the bare caption
+    # exactly as before) and the caption is REPORTED rather than silently guessed.
+    res_report = {
+        "table_map": {"SF||Case": "Case", "SF||User": "User"},
+        "model_manifest": {
+            "naming": {"Name": {"model_table": "Case", "model_name": "Name", "kind": "column"}},
+            "columns": [
+                {"model_table": "Case", "model_name": "Name", "tableau_field": "Name"},
+                {"model_table": "User", "model_name": "Name", "tableau_field": "Name"},
+            ],
+        },
+    }
+    _mt, field_map, ambiguous = me._field_map_from_model(res_report)
+    assert "SF||Name" not in field_map
+    assert ambiguous == ["SF||Name"]
 
 
 def test_viz_adapter_forwards_model_table_and_field_map_only_when_supported():

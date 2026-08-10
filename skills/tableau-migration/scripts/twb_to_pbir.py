@@ -6287,6 +6287,13 @@ def _apply_override(field, model_table, field_map):
         _ds = field.get("datasource")
         if _ds and entity:
             ov = field_map.get("%s||%s||%s" % (_ds, entity, field["caption"]))
+        if ov is None and _ds:
+            # The relation name did not match -- an EXTRACTED datasource carries two relations for
+            # the same logical table (the live one and ``Extract``), and a worksheet bound to the
+            # extract names the one the model did not key. Fall back to the pill's own DATASOURCE,
+            # which is still far narrower than the bare caption: this key exists only where the
+            # caption is unambiguous within that datasource (issue #103).
+            ov = field_map.get("%s||%s" % (_ds, field["caption"]))
         if ov is None:
             ov = field_map.get(field["caption"])
     if ov is not None:

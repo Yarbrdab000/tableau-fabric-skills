@@ -12,6 +12,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.113.0` -> `2.114.0`): a field belongs to the datasource the PILL came
+  from, even when the relation name does not match.** An EXTRACTED datasource carries TWO relations
+  for one logical table -- the live one (`Sales Commission.csv`) and the extract materialisation
+  (`Extract`) -- and the model keys the live name while a worksheet bound to the extract carries
+  `Extract`. The (datasource, relation, caption) key then missed and resolution fell through to the
+  BARE caption, which in a multi-table model is claimed by whichever table was written first.
+  Measured on Superstore (issue #103): the Commission dashboard's `Sales` bound `Orders[Sales]`
+  (2,326,534) instead of `Sales Commission.csv[Sales]` (15,357,898) -- a **6.6x error that renders
+  perfectly**, on a page where every sibling projection used the right table, and which the engine
+  reported as `status: "rebuilt"` with an empty work order. Adds a DATASOURCE-SCOPED fallback
+  between the two, recorded only where the caption is unambiguous within that datasource; where a
+  datasource genuinely carries the same caption on two tables the key is WITHHELD rather than
+  guessed and the caption is reported as an ambiguous binding (the issue's option (b)), so a silent
+  guess becomes visible. Verified globally rather than on the reported workbook: 48 of 83 available
+  workbooks carry an extract, and across 10 of them the new path fired **212 times** -- 209
+  confirmed the binding the bare caption already gave (hence a byte-identical 29/29 corpus,
+  normalised for lineage tags), and **3 corrected a wrong table**, with no case where it disagreed
+  with a previously-correct answer.
+
 ### Fixed
 
 - **tableau-migration (skill `2.112.0` -> `2.113.0`): the PBIR objects and roles we emit have to be

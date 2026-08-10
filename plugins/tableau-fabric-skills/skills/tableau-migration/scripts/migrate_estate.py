@@ -2576,9 +2576,10 @@ def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog, appr
 
 
 def _field_map_from_model(res_report):
-    """Build ``(model_table, field_map)`` for the viz re-run from the model build's authoritative
-    naming map, so a published-datasource workbook's column pills bind to the REAL migrated tables
-    (``Orders``/``Date``) instead of the workbook's own unusable ``sqlproxy`` proxy entity.
+    """Build ``(model_table, field_map, ambiguous)`` for the viz re-run from the model build's
+    authoritative naming map, so a published-datasource workbook's column pills bind to the REAL
+    migrated tables (``Orders``/``Date``) instead of the workbook's own unusable ``sqlproxy`` proxy
+    entity.
 
     ``field_map`` keys VERBATIM on each column's Tableau field caption / remote name (the same
     ``model_manifest['naming']`` join convention the model->viz contract guarantees never dangles)
@@ -2586,8 +2587,9 @@ def _field_map_from_model(res_report):
     (``SUM([Sales])``) keeps its aggregation while its entity is corrected to the fact table.
     ``model_table`` is the fact table (the one owning the most columns) and acts as the fallback for
     any column pill not present in the map. Measures are intentionally EXCLUDED here -- the
-    token-keyed ``measure_binding`` already rebinds them onto ``_Measures``. Returns ``(None, None)``
-    when no naming map is available (the re-run then keeps its standing field bindings).
+    token-keyed ``measure_binding`` already rebinds them onto ``_Measures``. Returns
+    ``(None, None, [])`` when no naming map is available (the re-run then keeps its standing field
+    bindings).
 
     DATASOURCE-QUALIFIED KEYS. A bare caption is not a unique name when a workbook consolidates
     SEVERAL embedded datasources into one model. Tableau duplicates its datasource per dashboard, so
@@ -2624,7 +2626,7 @@ def _field_map_from_model(res_report):
         field_map[ref] = {"entity": model_table, "property": model_name}
         counts[model_table] = counts.get(model_table, 0) + 1
     if not field_map:
-        return None, None
+        return None, None, []
     fact_table = max(counts, key=counts.get)
 
     # A consolidated table may be reached from more than one (datasource, relation) pair -- identical
@@ -2634,18 +2636,40 @@ def _field_map_from_model(res_report):
         ds, _, relation = str(key).partition("||")
         if ds.strip() and relation.strip() and consolidated:
             pairs_by_table.setdefault(consolidated, []).append((ds.strip(), relation.strip()))
+    ds_scoped = {}      # "<ds>||<caption>" -> [ {entity, property}, ... ]  (ambiguity detector)
     for col in manifest.get("columns") or []:
         model_table = col.get("model_table")
         model_name = col.get("model_name")
         if not model_table or not model_name:
             continue
+        target = {"entity": model_table, "property": model_name}
         for ds, relation in pairs_by_table.get(model_table, ()):
             for ref in (col.get("tableau_field"), col.get("source_column")):
                 if ref:
-                    field_map.setdefault(
-                        "%s||%s||%s" % (ds, relation, ref),
-                        {"entity": model_table, "property": model_name})
-    return fact_table, field_map
+                    field_map.setdefault("%s||%s||%s" % (ds, relation, ref), target)
+                    ds_scoped.setdefault("%s||%s" % (ds, ref), []).append(target)
+    # DATASOURCE-SCOPED fallback, for when the relation name does not match. An EXTRACTED datasource
+    # carries TWO relations for the same logical table -- the live one (``Sales Commission.csv``) and
+    # the extract materialisation (``Extract``) -- and the model keys the live name while a worksheet
+    # bound to the extract carries ``Extract``. The relation-qualified key then misses and resolution
+    # fell through to the BARE caption, which in a multi-table model is claimed by whichever table
+    # happened to be written first. Measured on Superstore (issue #103): the Commission dashboard's
+    # ``Sales`` bound ``Orders[Sales]`` (2,326,534) instead of ``Sales Commission.csv[Sales]``
+    # (15,357,898) -- a 6.6x error that renders perfectly, on a page where every sibling projection
+    # used the right table.
+    #
+    # Only recorded where the caption is UNAMBIGUOUS within its own datasource. Where a datasource
+    # genuinely has the same column name on two tables there is nothing to prefer, so the key is
+    # withheld rather than guessed, and the caller falls through to the bare caption exactly as
+    # before. Those captions are reported (see ``ambiguous_by_name``) so a silent guess is visible.
+    ambiguous = []
+    for key, targets in ds_scoped.items():
+        distinct = {(t["entity"], t["property"]) for t in targets}
+        if len(distinct) == 1:
+            field_map.setdefault(key, targets[0])
+        else:
+            ambiguous.append(key)
+    return fact_table, field_map, sorted(ambiguous)
 
 
 # -- Windows MAX_PATH guard for the openable .pbip write ----------------------------------------
@@ -2986,7 +3010,20 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
         merged.update(wb_slicers)
         param_binding["slicers"] = merged
         param_binding.setdefault("flags", {})
-    field_model_table, field_map = _field_map_from_model(res_report)
+    field_model_table, field_map, _ambiguous_names = _field_map_from_model(res_report)
+    # ISSUE #103, option (b). Where one datasource genuinely carries the same caption on two of its
+    # tables, no datasource-scoped key could be emitted (there is nothing to prefer), so resolution
+    # falls through to the bare caption -- i.e. the FIRST table written claims it. That is a guess,
+    # and a guess that renders perfectly while being arithmetically wrong is the worst failure mode
+    # this pipeline has. Report it, so the reader can check the one pill instead of trusting silence.
+    for _amb in _ambiguous_names or []:
+        _ds, _, _cap = str(_amb).partition("||")
+        warns.append(
+            _PBIP_WARN + ("field %r is ambiguous within datasource %r (the same column name exists "
+                          "on more than one of its tables) -- any visual using it without a "
+                          "matching Tableau relation name binds to whichever table was written "
+                          "first; verify its table is the one you expect"
+                          % (_cap or _amb, _ds)))
     # column_binding -- calc DIMENSION pills (a crosstab axis built from a Tableau calculated field)
     # rebind to the REAL model table+column the datasource build emitted, so a calc-dimension crosstab
     # stays a matrix bound to real fields (e.g. Sheet1[Director]) instead of the datasource-caption
