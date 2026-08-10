@@ -1927,6 +1927,7 @@ def build_model_manifest(*, table_names, relations, measure_report, calc_column_
         "measures": measures,
         "date": date_section,
         "row_count": _row_count_targets(measure_report),
+        "row_count_columns": _row_count_column_targets(calc_column_report),
         "parameters": param_rows,
         "naming": naming,
     }
@@ -2683,19 +2684,23 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
         name, formula = calc["name"], calc.get("formula", "")
         if name.lower() in consumed_lower:
             continue
-        if _is_stock_row_count_calc(calc):
-            # Tableau's stock 1-per-row field -> a real column of 1s on the fact (anchor) table,
-            # int64 + summarizeBy sum so dropping it into a visual SUMs to the row count (matching
-            # Tableau's auto-aggregation). Faithful, unlike the nonsense ``measure = 1`` the naive
-            # measure path would emit. Deliberately NOT registered in ``column_refs``: a measure's
+        if _is_row_level_constant_calc(calc):
+            # Tableau's row-level constant (its stock 1-per-row field, or any hand-written literal
+            # calc) -> a real column of that constant on the fact (anchor) table, summarizeBy sum so
+            # dropping it into a visual SUMs to n*k, matching Tableau's auto-aggregation. Faithful,
+            # unlike the nonsense ``measure = k`` the measure path would emit -- which evaluates once
+            # and always returns k, so ``SUM([Number of Records])`` came back 1 instead of the row
+            # count. Deliberately NOT registered in ``column_refs``: a measure's
             # ``SUM([Number of Records])`` keeps using the compiler's COUNTROWS path, which fails
             # closed on an ambiguous multi-table count -- a guarantee a blanket column ref would lose.
+            _lit = (calc.get("formula") or "").strip()
+            _int = "." not in _lit
             by_table[anchor_table] = by_table.get(anchor_table, "") + T.generate_calc_column_tmdl(
-                name, formula, "1", tmdl_type="int64", summarize="sum",
-                translated_by="deterministic (stock row-count field)")
+                name, formula, _lit, tmdl_type="int64" if _int else "double", summarize="sum",
+                translated_by="deterministic (row-level constant)")
             report.append({
                 "column": name, "table": anchor_table, "status": "translated",
-                "reason": "ok", "dax": "1", "tableau_formula": formula,
+                "reason": "ok", "dax": _lit, "tableau_formula": formula,
                 "date_bound": False, "date_table": None, "date_attribute": None,
             })
             continue
@@ -3465,6 +3470,29 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     # designated MEASURE landing -- a human-approved / second-compiler ``approved_calc_dax`` entry --
     # is left on the measure path to receive it (that opt-in tier owns the measure-vs-column choice).
     _measure_landed = {(k or "").strip().lower() for k in (approved_calc_dax or {})}
+    # A row-level CONSTANT calc translates as a measure perfectly well -- and is wrong. Tableau
+    # evaluates a row-level calc once PER ROW and then aggregates it on the shelf, so
+    # ``SUM([Number of Records])`` (formula ``1``) is the row count; a DAX ``measure = 1`` evaluates
+    # once and returns 1, discarding the row multiplicity entirely. Because it never STUBS, the
+    # row-level pre-router below cannot see it -- its gate is "the measure translator failed" -- so
+    # constants are routed here explicitly. As a calculated column of ``k`` with ``summarizeBy:
+    # sum`` every Tableau aggregation lands exactly: SUM -> n*k, AVG/MIN/MAX -> k, CNT -> n.
+    #
+    # Deliberately keyed on the FORMULA, never the name. There already was a name-gated reroute
+    # (``Number of Records`` / ``Count of <Table>``) inside ``_split_calcs_by_role``, but it runs
+    # only when calcs were AUTO-EXTRACTED -- so the workbook path, which passes ``calcs=``
+    # explicitly, missed it entirely and shipped ``measure = 1`` in 5 of 29 corpus models with 7
+    # visuals projecting it. A user is free to rename the stock field (measured: ``1 (Intake)``),
+    # and a hand-written ``1`` calc is the same thing, so the name carries no information the
+    # formula does not. LITERALS ONLY: a parameter-referencing scalar must stay a measure, since a
+    # calculated column is baked at refresh and would freeze against the what-if slicer.
+    _const_moved = [c for c in (calcs or []) if _is_row_level_constant_calc(c)
+                    and (c.get("name") or "").strip().lower() not in
+                    (set(consumed) | flag_source_names | _measure_landed)]
+    if _const_moved:
+        _cm_ids = {id(c) for c in _const_moved}
+        calcs = [c for c in calcs if id(c) not in _cm_ids]
+        dim_calcs = list(dim_calcs or []) + _const_moved
     calcs, dim_calcs, _rerouted_row_level = _reroute_row_level_measure_calcs(
         calcs, dim_calcs, resolve, known_tables=set(table_names),
         param_resolver=param_resolver,
@@ -4469,6 +4497,64 @@ def list_workbook_datasources(source):
 # constant-1 gate keeps this fail-closed: a user field that merely borrows the name but computes
 # something else is NOT reclassified.
 _COUNT_OF_TABLE_RE = re.compile(r"^count of\s+\S", re.IGNORECASE)
+
+
+_ROW_LEVEL_CONSTANT_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+
+
+def _is_row_level_constant_calc(calc):
+    """True for a calc whose formula is a bare numeric LITERAL (``1``, ``0``, ``2.5``).
+
+    Such a calc is row-level: Tableau evaluates it once per row and aggregates it on the shelf, so
+    it is faithfully a calculated COLUMN of that constant, never ``measure = k`` (which evaluates
+    once and discards the row multiplicity -- ``SUM([Number of Records])`` returns 1 instead of the
+    row count). Keyed on the FORMULA only, so a renamed stock row-count field or a hand-written
+    ``1`` calc is caught identically.
+
+    LITERALS ONLY, deliberately. A calc that references a PARAMETER is also scalar, but a DAX
+    calculated column is materialised at refresh and would freeze against the what-if slicer, so
+    those stay on the measure path.
+    """
+    return bool(_ROW_LEVEL_CONSTANT_RE.match((calc.get("formula") or "").strip()))
+
+
+def _row_count_column_targets(calc_column_report):
+    """Map each row-level CONSTANT calc that landed as a calculated column to its model target.
+
+    The viz layer's implicit-row-count channel binds ``[Number of Records]`` to a COUNTROWS measure.
+    When the constant instead lands (faithfully) as a COLUMN of 1s with ``summarizeBy: sum``, that
+    channel has no measure to find -- so this surfaces the column as an equally faithful target:
+    aggregating it on the shelf reproduces every Tableau aggregation exactly (SUM -> n*k, AVG -> k,
+    CNT -> n), which a single COUNTROWS measure cannot do.
+
+    Shape: ``{"columns": {<tableau field>: {"entity", "column"}}, "default_column": {...}}``. The
+    default is the stock row-count field when present (that is precisely what the viz layer's
+    ``numrec`` kind means); with several constants and no stock name there is nothing to prefer, so
+    no default is offered and the channel warns exactly as before.
+    """
+    columns, default = {}, None
+    for row in calc_column_report or []:
+        if row.get("status") != "translated":
+            continue
+        if not _ROW_LEVEL_CONSTANT_RE.match(str(row.get("dax") or "").strip()):
+            continue
+        name, table = (row.get("column") or "").strip(), row.get("table")
+        if not name or not table:
+            continue
+        target = {"entity": table, "column": name}
+        columns[name] = target
+        if name.casefold() == "number of records" or _COUNT_OF_TABLE_RE.match(name):
+            default = target
+    if not columns:
+        return {}
+    out = {"columns": columns}
+    if default is None and len(columns) == 1:
+        # A single constant column in the whole model is unambiguous -- a renamed stock row-count
+        # field (measured in the corpus as ``1 (Intake)``) still binds.
+        default = next(iter(columns.values()))
+    if default:
+        out["default_column"] = default
+    return out
 
 
 def _is_stock_row_count_calc(calc):

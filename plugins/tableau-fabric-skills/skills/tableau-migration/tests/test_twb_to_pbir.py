@@ -15,8 +15,8 @@ import pytest
 import geometry_audit
 
 from twb_to_pbir import (
-    MEASURES_TABLE,
-    PAGE_HEIGHT,
+    _row_count_column_target,
+    MEASURES_TABLE,    PAGE_HEIGHT,
     PAGE_WIDTH,
     SCHEMA_VISUAL,
     SCHEMA_VISUAL_FP,
@@ -1581,6 +1581,49 @@ def test_numrec_row_count_binds_via_default():
     assert len(rows) == 1 and rows[0]["binding"] == "measure"
     assert rows[0]["entity"] == "Orders" and rows[0]["property"] == "Rows"
     assert _count_warns(ir) == []
+
+
+def test_numrec_row_count_binds_to_a_constant_COLUMN_when_the_model_landed_one():
+    # A row-level constant lands more faithfully as a calculated COLUMN of 1s (summarizeBy sum) than
+    # as a COUNTROWS measure -- aggregating it reproduces EVERY Tableau aggregation (SUM -> n*k,
+    # AVG -> k, CNT -> n), which one COUNTROWS measure cannot. But the implicit-row-count channel
+    # only knew how to find a MEASURE, so it warned "left unbound" and DROPPED the pill; on
+    # 0068_market_basket that took the matrix visual's last binding with it and the report shipped
+    # with ZERO pages. The column target closes that.
+    ws = _worksheet("Recs", "Bar",
+                    rows=_NUMREC_PILL,
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST + _COL_NUMREC + _CI_SUM_NUMREC)
+    rcb = {"default_column": {"entity": "Orders", "column": "Number of Records"}}
+    ir = parse_twb(_workbook(ws), row_count_binding=rcb)
+    rows = ir["worksheets"][0]["rows"]
+    assert len(rows) == 1 and rows[0]["binding"] == "column"
+    assert rows[0]["entity"] == "Orders" and rows[0]["property"] == "Number of Records"
+    # the pill carries its own shelf aggregation, so SUM([Number of Records]) is a real row count
+    assert rows[0]["aggregation"] == "Sum"
+    assert _count_warns(ir) == []
+
+
+def test_a_countrows_measure_still_wins_over_a_constant_column():
+    # Purely additive: where the model supplies a real COUNTROWS measure the binding is unchanged,
+    # so no existing output moves.
+    ws = _worksheet("Recs", "Bar",
+                    rows=_NUMREC_PILL,
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST + _COL_NUMREC + _CI_SUM_NUMREC)
+    rcb = {"default": {"entity": "_Measures", "measure": "Rows"},
+           "default_column": {"entity": "Orders", "column": "Number of Records"}}
+    rows = parse_twb(_workbook(ws), row_count_binding=rcb)["worksheets"][0]["rows"]
+    assert rows[0]["binding"] == "measure" and rows[0]["property"] == "Rows"
+
+
+def test_an_object_id_count_never_binds_to_a_constant_column():
+    # An object-id COUNT names a SPECIFIC fact table, so it is answered by that fact's own COUNTROWS
+    # measure -- never by a constant column that may live on another table. Fail-closed: it keeps
+    # its precise warning.
+    rc = {"kind": "object_id", "table": "Orders", "candidates": ["Orders"]}
+    assert _row_count_column_target(
+        rc, {"default_column": {"entity": "People", "column": "Number of Records"}}) is None
 
 
 def test_real_countd_on_column_is_not_a_row_count():

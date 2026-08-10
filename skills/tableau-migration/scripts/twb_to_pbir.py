@@ -953,6 +953,28 @@ def _row_count_measure_target(rc, row_count_binding):
     return None
 
 
+def _row_count_column_target(rc, row_count_binding):
+    """Resolve the ``(entity, column)`` constant COLUMN to bind an implicit row count to, or ``None``.
+
+    The model may land Tableau's row-level constant (the stock ``Number of Records`` field, or any
+    literal calc) as a calculated COLUMN of 1s with ``summarizeBy: sum`` rather than as a COUNTROWS
+    measure -- which is the more faithful shape, because aggregating it on the shelf reproduces
+    every Tableau aggregation (``SUM`` -> n*k, ``AVG`` -> k, ``CNT`` -> n) where a single COUNTROWS
+    measure only reproduces the count. This is the column-side twin of
+    :func:`_row_count_measure_target` and is consulted only AFTER it, so a model that supplies a
+    real COUNTROWS measure binds exactly as before.
+
+    ``object_id`` counts are deliberately excluded: they name a specific fact table and are answered
+    by that fact's own COUNTROWS measure, never by a constant column that may live elsewhere.
+    """
+    if not row_count_binding or rc.get("kind") != "numrec":
+        return None
+    d = row_count_binding.get("default_column") or {}
+    if d.get("entity") and d.get("column"):
+        return (d["entity"], d["column"])
+    return None
+
+
 def _bind_or_warn_row_count(rc, ds, worksheet, base_id, field_id, deriv,
                             warnings, warn_special, row_count_binding):
     """Bind an implicit row count to a COUNTROWS measure, or warn (warn-never-wrong).
@@ -972,6 +994,23 @@ def _bind_or_warn_row_count(rc, ds, worksheet, base_id, field_id, deriv,
             "derivation": deriv, "aggregation": None,
             "entity": entity, "property": measure,
             "binding": "measure", "kind": "value",
+            "geo_area": None, "formula": None,
+            "number_format": None,
+        }
+    col_target = _row_count_column_target(rc, row_count_binding)
+    if col_target is not None:
+        # The constant COLUMN carries the pill's OWN shelf aggregation (Tableau's implicit row-count
+        # pill is ``SUM([Number of Records])``, but the same field is legitimately averaged or
+        # counted), so the visual reproduces the source aggregation rather than being pinned to a
+        # count. ``Sum`` is the default only because that is the aggregation Tableau applies when
+        # the pill carries none.
+        entity, column = col_target
+        return {
+            "caption": column, "field_id": base_id, "instance": field_id,
+            "role": "measure", "datatype": "integer", "is_calc": False,
+            "derivation": deriv, "aggregation": deriv if deriv in _AGG_FUNC else "Sum",
+            "entity": entity, "property": column,
+            "binding": "column", "kind": "value",
             "geo_area": None, "formula": None,
             "number_format": None,
         }

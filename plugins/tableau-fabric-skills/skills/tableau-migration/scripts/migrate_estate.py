@@ -2149,8 +2149,31 @@ def _row_count_binding_from_model(res_report):
                 (rr.get("model_manifest") or {}).get("row_count")):
         shaped = _from_obj(src)
         if shaped:
-            return shaped
-    return None
+            break
+    else:
+        shaped = None
+
+    # COLUMN targets, for the row-level constant the model landed as a calculated column of 1s
+    # (``summarizeBy: sum``) rather than a COUNTROWS measure. Aggregating that column on the shelf
+    # reproduces EVERY Tableau aggregation exactly (SUM -> n*k, AVG -> k, CNT -> n), which one
+    # COUNTROWS measure cannot; without this the implicit-row-count channel finds no measure, warns
+    # "left unbound", and the pill is DROPPED -- which took a matrix visual's last binding with it
+    # and emitted a page-less report. Purely additive: measure targets keep absolute priority, so a
+    # model that supplies COUNTROWS binds byte-identically to before.
+    rcc = (rr.get("model_manifest") or {}).get("row_count_columns") or rr.get("row_count_columns")
+    if isinstance(rcc, dict) and rcc:
+        cols = {}
+        for name, c in (rcc.get("columns") or {}).items():
+            if isinstance(c, dict) and c.get("entity") and c.get("column"):
+                cols[name] = {"entity": c["entity"], "column": c["column"]}
+        dflt = rcc.get("default_column")
+        if cols or isinstance(dflt, dict):
+            shaped = dict(shaped or {})
+            if cols:
+                shaped["columns"] = cols
+            if isinstance(dflt, dict) and dflt.get("entity") and dflt.get("column"):
+                shaped["default_column"] = {"entity": dflt["entity"], "column": dflt["column"]}
+    return shaped or None
 
 
 def _filter_param_target_field(formula, param_inner):

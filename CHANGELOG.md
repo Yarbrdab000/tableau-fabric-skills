@@ -12,6 +12,27 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.114.0` -> `2.115.0`): a row-level CONSTANT is a column of `k`, not
+  `measure = k`.** Tableau evaluates a row-level calc once PER ROW and aggregates it on the shelf,
+  so `SUM([Number of Records])` (formula `1`) is the row count -- but a DAX `measure = 1` evaluates
+  ONCE and returns 1, discarding row multiplicity entirely. Measured on the corpus: **6 constant
+  measures** shipped across **5 of 29 models**, with **7 visuals projecting one**, every one showing
+  1 instead of a count. A handler existed but was gated on the NAME (`Number of Records` /
+  `Count of <Table>`) *and* only ran when calcs were auto-extracted, so the workbook path -- the main
+  path -- never reached it, and a renamed field (measured: `1 (Intake)`) missed it regardless.
+  Routing now happens at the shared pre-router chokepoint and is keyed on the **formula**, never the
+  name. Literals only: a parameter-referencing scalar stays a measure, because a calculated column is
+  baked at refresh and would freeze against the what-if slicer.
+  Ships with the paired BINDER change that makes it safe: the viz layer's implicit-row-count channel
+  knew only how to find a COUNTROWS measure, so moving the calc left it unbound -- it warned and
+  DROPPED the pill, which took a matrix visual's last binding with it and emitted a **page-less**
+  report. The model now offers the constant column as an equally faithful target (`row_count_columns`,
+  an additive manifest section) and the pill binds it with its OWN shelf aggregation, so SUM -> n*k,
+  AVG -> k and CNT -> n all land exactly -- which a single COUNTROWS measure cannot do. A real
+  COUNTROWS measure keeps absolute priority, and an object-id count never binds to a constant column.
+  Corpus-wide before/after: constant measures **6 -> 0**, and **zero** lost pages, visuals or
+  projections -- net **+1 page, +1 visual, +5 projections** that were previously dropped.
+
 - **tableau-migration (skill `2.113.0` -> `2.114.0`): a field belongs to the datasource the PILL came
   from, even when the relation name does not match.** An EXTRACTED datasource carries TWO relations
   for one logical table -- the live one (`Sales Commission.csv`) and the extract materialisation

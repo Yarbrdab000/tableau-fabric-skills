@@ -5,6 +5,7 @@ import re
 
 import pytest
 
+import assemble_model as am
 from assemble_model import (
     assemble_import_model,
     calc_coverage_artifact,
@@ -1814,6 +1815,76 @@ def test_stock_number_of_records_emits_as_sum_aggregated_column_of_ones():
         "definition/tables/_Measures.tmdl", "")
 
 
+def test_row_level_constant_calc_on_the_MEASURE_path_still_lands_as_a_column():
+    # THE ROUTING, not just the handler. The test above hands the calc in as ``dim_calcs=``, which is
+    # the shape only the AUTO-EXTRACT path produces; the workbook path passes ``calcs=`` explicitly,
+    # and the name-gated reroute inside ``_split_calcs_by_role`` runs only when calcs were
+    # auto-extracted. So the main path shipped ``measure = 1`` -- measured in 5 of 29 corpus models
+    # with 7 visuals projecting it, every one showing 1 instead of the row count. Routing a
+    # row-level constant to the column path is now done at the shared pre-router chokepoint, so it
+    # holds however the calc arrived.
+    out = _model_with_calc_cols_and_measures(
+        dim_calcs=[], calcs=[{"name": "Number of Records", "formula": "1", "role": "measure"}])
+    assert "column 'Number of Records' = 1" in out["parts"]["definition/tables/Orders.tmdl"]
+    assert "measure 'Number of Records'" not in out["parts"].get(
+        "definition/tables/_Measures.tmdl", "")
+
+
+def test_row_level_constant_calc_is_keyed_on_the_FORMULA_not_the_name():
+    # A user is free to rename Tableau's stock row-count field (measured in the corpus as
+    # ``1 (Intake)``), and a hand-written literal calc is semantically the same thing -- so the name
+    # carries no information the formula does not. ``measure = k`` is never a faithful translation of
+    # a row-level constant, whatever it is called.
+    out = _model_with_calc_cols_and_measures(
+        dim_calcs=[], calcs=[{"name": "Renamed Row Count", "formula": "1", "role": "measure"},
+                             {"name": "Half", "formula": "0.5", "role": "measure"}])
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "column 'Renamed Row Count' = 1" in orders
+    assert "column Half = 0.5" in orders
+    measures = out["parts"].get("definition/tables/_Measures.tmdl", "")
+    assert "measure 'Renamed Row Count'" not in measures
+    assert "measure Half" not in measures
+
+
+def test_a_parameter_scalar_calc_stays_a_MEASURE_so_the_what_if_slicer_still_drives_it():
+    # LITERALS ONLY. A parameter-referencing calc is also scalar, but a DAX calculated column is
+    # materialised at REFRESH -- turning one into a column would freeze it against the what-if
+    # slicer, trading a wrong number for an unresponsive report. It stays on the measure path.
+    out = _model_with_calc_cols_and_measures(
+        dim_calcs=[], calcs=[{"name": "Goal", "formula": "[Parameters].[Target]", "role": "measure"}])
+    assert "column Goal" not in out["parts"]["definition/tables/Orders.tmdl"]
+    assert "column 'Goal'" not in out["parts"]["definition/tables/Orders.tmdl"]
+
+
+def test_row_count_column_targets_offers_the_constant_column_to_the_viz_binder():
+    # The viz layer's implicit-row-count channel binds ``[Number of Records]`` to a COUNTROWS
+    # measure. Once the constant lands as a COLUMN instead, that channel finds nothing, warns
+    # "left unbound" and DROPS the pill -- which took a matrix visual's last binding with it and
+    # emitted a page-less report. So the model offers the column as an equally faithful target.
+    rep = [{"column": "Number of Records", "table": "Orders", "status": "translated", "dax": "1"},
+           {"column": "Margin", "table": "Orders", "status": "translated",
+            "dax": "[Sales] - [Cost]"}]
+    got = am._row_count_column_targets(rep)
+    assert got["columns"] == {"Number of Records": {"entity": "Orders",
+                                                    "column": "Number of Records"}}
+    assert got["default_column"] == {"entity": "Orders", "column": "Number of Records"}
+    # a non-constant calc column is never offered as a row count
+    assert "Margin" not in got["columns"]
+    # nothing to offer -> empty, so the channel warns exactly as before
+    assert am._row_count_column_targets([]) == {}
+
+
+def test_row_count_column_default_is_withheld_when_several_constants_compete():
+    # With more than one constant column and no stock row-count name there is nothing to prefer, so
+    # no default is offered and the channel keeps its precise "left unbound" warning rather than
+    # binding the pill to an arbitrary constant.
+    rep = [{"column": "One", "table": "Orders", "status": "translated", "dax": "1"},
+           {"column": "Two", "table": "People", "status": "translated", "dax": "2"}]
+    got = am._row_count_column_targets(rep)
+    assert set(got["columns"]) == {"One", "Two"}
+    assert "default_column" not in got
+
+
 
 #    real assemble_model resolver. LIVE_SQLSERVER lacks State + City, so the detector (which resolves
 #    its fields against the model) could not fire there; this minimal model carries them. This is the
@@ -2043,9 +2114,13 @@ def _manifest_param_model():
 
 
 def test_model_manifest_has_seven_sections():
+    # ``row_count_columns`` is the eighth, additive section: the constant-column targets the viz
+    # layer's implicit-row-count channel binds when the model landed a row-level constant as a
+    # calculated column instead of a COUNTROWS measure. Kept in this exact-set assertion (rather
+    # than a subset check) so a future section is a deliberate change, never an accident.
     mf = _manifest_param_model()["report"]["model_manifest"]
     assert set(mf) == {"tables", "columns", "measures", "date", "row_count",
-                       "parameters", "naming"}
+                       "row_count_columns", "parameters", "naming"}
     # tables never lists the _Measures holder; columns carry the original Tableau caption.
     assert "_Measures" not in mf["tables"]
     by_field = {c["tableau_field"]: c for c in mf["columns"]}
