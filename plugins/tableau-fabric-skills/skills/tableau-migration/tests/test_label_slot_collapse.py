@@ -432,7 +432,7 @@ def _parse(pills, ds=DS):
                            "table": "Facts", "hidden": False} for i in ids}
     index = {(ds, i): {"entity": "Facts", "property": i, "caption": i,
                        "datatype": "real", "role": "measure", "table": "Facts"} for i in ids}
-    return _parse_encodings(_pane(pills), ds, base_cols, {}, index, "Facts", "BAN", [])
+    return _parse_encodings(_pane(pills), ds, base_cols, {}, index, {ds: "Facts"}, "BAN", [])
 
 
 def test_parse_encodings_stamps_the_source_token_on_every_label_pill():

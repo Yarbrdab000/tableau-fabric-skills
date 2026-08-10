@@ -14,6 +14,38 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **tableau-migration (skill `2.106.0` -> `2.107.0`): a worksheet field belongs to its OWN
+  datasource's copy of a table.** On a workbook that consolidates several embedded datasources, a
+  dashboard's slicers filtered **nothing** and grouping by a dimension returned the **grand total on
+  every row** — silently, because the emitted reference resolves against a real table; just the wrong
+  one.
+  - **Cause.** Tableau duplicates its datasource per dashboard, so the same physical table arrives
+    several times and the model keeps one copy each, suffixing the later ones (`pmdm__Program__c` +
+    `pmdm__Program__c (Intake)`). The model->viz join map is built with `setdefault` on the BARE
+    Tableau caption, so the first datasource claimed every shared caption and the rest never entered
+    the map. A field bound correctly only when its table name happened to be unique across all
+    datasources. Measured on the Salesforce Nonprofit workbook (Service Delivery / Intake / Client
+    Enrollment and participation / Assessments): `Case` and `caseman__Intake__c` are unique and were
+    right, while the Intake dashboard's Program and Owner slicers bound Service Delivery's
+    `pmdm__Program__c` / `User`, which have no relationship to `Case` at all.
+  - **Fix.** The map now also carries `"<datasource>||<relation>||<caption>"` keys, and a pill
+    resolves on its own (datasource, relation, caption) before falling back to the bare caption — so
+    single-datasource workbooks are byte-identical. Qualifying by datasource ALONE is not enough: a
+    Salesforce model has a `Name` column on Program, User, Contact and Case alike, so the relation is
+    part of the key. Built from `model_manifest['columns']` (a LIST — every datasource's columns
+    survive there, unlike the collapsed `naming` map) joined to `table_map`, the same surface
+    `resolve_consolidated_column` already used.
+  - **Verified functionally, not just structurally.** Grouping by `pmdm__Program__c (Intake)[Name]`
+    in the rebuilt model now returns 119 / 148 / 591 / 2 / 240 — the Tableau reference values —
+    where before every row returned the grand total.
+  - **Blast radius:** 34 of 272 emitted visuals changed, confined to the four multi-datasource
+    workbooks in the corpus, and every change moves a binding onto the correct copy. It also
+    corrected two cross-table mis-bindings that were rendering confident wrong numbers: `Case`'s
+    `Status` had resolved to `pmdm__Program__c[pmdm__Status__c]` (different table AND column), and a
+    global-filter chart plotted `Orders$[Region]` against `factTable[Sales]`. Corpus 29/29.
+  - Also corrects two test fixtures that passed `ds_caption` as a bare string where production always
+    passes a dict — they would have masked this.
+
 - **tableau-migration (skill `2.105.0` -> `2.106.0`): two calcs sharing one caption must not become
   two measures with one name.** A duplicate measure name is not cosmetic — TMDL *merges* two objects
   that declare the same name, so the second one's `expression` collides and Power BI Desktop refuses

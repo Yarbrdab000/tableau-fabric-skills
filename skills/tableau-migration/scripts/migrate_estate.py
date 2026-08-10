@@ -2588,6 +2588,28 @@ def _field_map_from_model(res_report):
     any column pill not present in the map. Measures are intentionally EXCLUDED here -- the
     token-keyed ``measure_binding`` already rebinds them onto ``_Measures``. Returns ``(None, None)``
     when no naming map is available (the re-run then keeps its standing field bindings).
+
+    DATASOURCE-QUALIFIED KEYS. A bare caption is not a unique name when a workbook consolidates
+    SEVERAL embedded datasources into one model. Tableau duplicates its datasource per dashboard, so
+    the same physical table arrives many times; the model keeps one copy per datasource, suffixing
+    the later ones (``pmdm__Program__c`` + ``pmdm__Program__c (Intake)``). ``naming`` is built with
+    ``setdefault`` on the bare ref, so the FIRST datasource claims every shared caption and the rest
+    never enter the map -- every worksheet in every other datasource then binds to a table that has
+    no relationship to its own facts. Measured on the Salesforce Nonprofit workbook (4 datasources:
+    Service Delivery / Intake / Client Enrollment and participation / Assessments): the Intake
+    dashboard's Program and Owner slicers filtered NOTHING and grouping by Owner returned the grand
+    total on every row, because they bound Service Delivery's ``pmdm__Program__c`` / ``User`` while
+    the relationships run to ``pmdm__Program__c (Intake)`` and ``Case`` has no path to ``User`` at
+    all. Only tables whose name happens to be unique across all four (``Case``) bound correctly.
+
+    So this ALSO emits ``"<datasource>||<relation>||<caption>"`` keys -- qualified by the pill's own
+    Tableau RELATION as well as its datasource, because a bare caption is not even unique WITHIN one
+    datasource (a Salesforce model has a ``Name`` column on Program, User, Contact and Case alike).
+    They are built from ``model_manifest['columns']`` (a LIST -- every datasource's columns survive
+    there, unlike ``naming``) joined to ``table_map`` (``"<datasource>||<relation>" -> <consolidated
+    table>``), which is exactly the mapping :func:`assemble_model.resolve_consolidated_column` uses.
+    The bare keys are kept untouched as the fallback, so a single-datasource workbook resolves
+    exactly as before.
     """
     manifest = (res_report or {}).get("model_manifest") or {}
     naming = manifest.get("naming") or {}
@@ -2604,6 +2626,25 @@ def _field_map_from_model(res_report):
     if not field_map:
         return None, None
     fact_table = max(counts, key=counts.get)
+
+    # A consolidated table may be reached from more than one (datasource, relation) pair -- identical
+    # tables are de-duplicated -- so every owning pair gets its own qualified key.
+    pairs_by_table = {}
+    for key, consolidated in ((res_report or {}).get("table_map") or {}).items():
+        ds, _, relation = str(key).partition("||")
+        if ds.strip() and relation.strip() and consolidated:
+            pairs_by_table.setdefault(consolidated, []).append((ds.strip(), relation.strip()))
+    for col in manifest.get("columns") or []:
+        model_table = col.get("model_table")
+        model_name = col.get("model_name")
+        if not model_table or not model_name:
+            continue
+        for ds, relation in pairs_by_table.get(model_table, ()):
+            for ref in (col.get("tableau_field"), col.get("source_column")):
+                if ref:
+                    field_map.setdefault(
+                        "%s||%s||%s" % (ds, relation, ref),
+                        {"entity": model_table, "property": model_name})
     return fact_table, field_map
 
 

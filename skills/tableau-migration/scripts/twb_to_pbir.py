@@ -1240,6 +1240,10 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
 
     field = {
         "caption": caption, "field_id": base_id, "instance": field_id,
+        # The datasource (island) this pill came from. A caption is NOT a unique name when a
+        # workbook consolidates several embedded datasources into one model, so ``_apply_override``
+        # resolves "<datasource>||<caption>" before the bare caption.
+        "datasource": ds_caption.get(ds, ds),
         "role": role, "datatype": datatype, "is_calc": is_calc,
         "derivation": deriv, "aggregation": None,
         "entity": entity, "property": prop,
@@ -6223,8 +6227,23 @@ def _apply_override(field, model_table, field_map):
         prop = prop.strip() or prop
     if field.get("date_rebound") or field.get("column_rebound") or field.get("measure_rebound"):
         return entity, prop, binding
-    if field_map and field["caption"] in field_map:
-        ov = field_map[field["caption"]]
+    # A caption is only a unique name in a SINGLE-datasource workbook -- and not even then across
+    # tables. Tableau duplicates its datasource per dashboard, so a consolidated model holds one copy
+    # of the same physical table per datasource (``pmdm__Program__c`` + ``pmdm__Program__c (Intake)``),
+    # and the bare-caption map is first-writer-wins: every worksheet outside the first datasource
+    # bound to a table with NO relationship to its own facts. Its slicers then filtered nothing and
+    # grouping by it returned the grand total on every row -- silently, because the reference itself
+    # resolves. Resolve on the pill's own (datasource, RELATION, caption) -- ``field["entity"]`` is
+    # still the Tableau relation here, before any override -- and fall back to the bare caption so
+    # single-datasource output is unchanged.
+    ov = None
+    if field_map:
+        _ds = field.get("datasource")
+        if _ds and entity:
+            ov = field_map.get("%s||%s||%s" % (_ds, entity, field["caption"]))
+        if ov is None:
+            ov = field_map.get(field["caption"])
+    if ov is not None:
         entity = ov.get("entity", entity)
         prop = ov.get("property", prop)
         if isinstance(prop, str):

@@ -80,7 +80,7 @@ def _parse(pills, ds=DS):
     index = {(ds, i): {"entity": "Facts", "property": i, "caption": i,
                        "datatype": "real", "role": "measure", "table": "Facts"} for i in ids}
     warnings = []
-    enc = _parse_encodings(_pane(pills), ds, base_cols, instances, index, "Facts",
+    enc = _parse_encodings(_pane(pills), ds, base_cols, instances, index, {ds: "Facts"},
                            "BAN", warnings)
     return enc, warnings
 
@@ -151,12 +151,12 @@ class TestLabelRetention:
     def test_missing_encodings_holder_returns_the_key(self):
         """Callers index ``label_fields`` unconditionally, so the key must always exist."""
         warnings = []
-        enc = _parse_encodings(ET.Element("pane"), DS, {}, {}, {}, "Facts", "BAN", warnings)
+        enc = _parse_encodings(ET.Element("pane"), DS, {}, {}, {}, {DS: "Facts"}, "BAN", warnings)
         assert enc["label_fields"] == []
 
     def test_none_pane_returns_the_key(self):
         warnings = []
-        enc = _parse_encodings(None, DS, {}, {}, {}, "Facts", "BAN", warnings)
+        enc = _parse_encodings(None, DS, {}, {}, {}, {DS: "Facts"}, "BAN", warnings)
         assert enc["label_fields"] == []
 
 
