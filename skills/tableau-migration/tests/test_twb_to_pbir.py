@@ -334,8 +334,9 @@ def test_explicit_bar_mark_with_continuous_date_stays_column():
 
 
 # -- IR + emit: dual-axis combo ------------------------------------------------
-def _combo_worksheet(name, rows, cols, panes, deps_extra=""):
-    # like _worksheet but with an explicit multi-pane <panes> block (dual axis)
+def _combo_worksheet(name, rows, cols, panes, deps_extra="", style=""):
+    # like _worksheet but with an explicit multi-pane <panes> block (dual axis) and, optionally,
+    # the worksheet <style> block that carries Tableau's dual-axis marker (fold='true')
     return f"""
     <worksheet name='{name}'>
       <table>
@@ -346,6 +347,7 @@ def _combo_worksheet(name, rows, cols, panes, deps_extra=""):
           <datasource-dependencies datasource='federated.abc'>{_DEPS_COLUMNS}{deps_extra}
           </datasource-dependencies>
         </view>
+        {style}
         {panes}
         <rows>{rows}</rows>
         <cols>{cols}</cols>
@@ -408,6 +410,66 @@ def test_two_measures_same_mark_stay_clustered_not_combo():
     w = parse_twb(_workbook(ws))["worksheets"][0]
     assert w["visual_type"] == "combo"
     # shelf order decides which axis is secondary: Tableau writes the primary first
+    assert [f["caption"] for f in w["combo_split"]["Y"]] == ["Sales"]
+    assert [f["caption"] for f in w["combo_split"]["Y2"]] == ["Profit"]
+
+
+def test_side_by_side_measure_trellis_is_not_a_dual_axis():
+    # REGRESSION (shipped in 2.103.0, caught on the "Intake Details" sheet of the Salesforce
+    # Nonprofit workbook). Distinct *-axis-name values across panes were read as "a second measure
+    # axis". They are ALSO exactly how Tableau spells a SIDE-BY-SIDE measure trellis, and the two
+    # are otherwise byte-identical: a leading blank pane, one named pane per measure, no index on
+    # any of them. The engine rebuilt a 5-measure trellis as ONE combo chart spanning the whole
+    # dashboard where Tableau (and our own 2.102.0 output) draws five separate bar charts.
+    #
+    # The separator is the worksheet <style> axis rule: Tableau writes NO "dual-axis" attribute
+    # anywhere in a .twb (verified across the whole corpus), only fold='true' on the secondary
+    # axis's <encoding attr='space'>. No fold => the axes keep their own rectangles => trellis.
+    panes = (
+        "<panes>"
+        "<pane><mark class='Automatic' /></pane>"
+        "<pane id='1' x-axis-name='[federated.abc].[sum:Sales:qk]'>"
+        "<mark class='Automatic' /></pane>"
+        "<pane id='2' x-axis-name='[federated.abc].[sum:Profit:qk]'>"
+        "<mark class='Automatic' /></pane>"
+        "</panes>")
+    ws = _combo_worksheet(
+        "Trellis No Fold",
+        rows="[federated.abc].[none:Category:nk]",
+        cols="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+        panes=panes, deps_extra=_INST)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["combo_split"] is None
+    assert w["visual_type"] != "combo"
+
+
+def test_folded_axis_is_the_dual_axis_marker_when_no_index_is_written():
+    # The positive half of the same rule, and the reason 2.99.0's SUM+AVG finding still stands: two
+    # DIFFERENT measures with no index ARE a dual axis when the secondary axis is folded onto the
+    # primary's rectangle. Shape taken from a real workbook (0085 'Small Bar (2)'):
+    #   <style-rule element='axis'>
+    #     <encoding attr='space' field='[...avg:Sales...]' fold='true' scope='rows'
+    #               synchronized='true' type='space' />
+    style = (
+        "<style><style-rule element='axis'>"
+        "<encoding attr='space' class='0' field='[federated.abc].[sum:Profit:qk]' "
+        "field-type='quantitative' fold='true' scope='rows' synchronized='true' type='space' />"
+        "</style-rule></style>")
+    panes = (
+        "<panes>"
+        "<pane><mark class='Bar' /></pane>"
+        "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'>"
+        "<mark class='Bar' /></pane>"
+        "<pane id='2' y-axis-name='[federated.abc].[sum:Profit:qk]'>"
+        "<mark class='Bar' /></pane>"
+        "</panes>")
+    ws = _combo_worksheet(
+        "Folded Dual Axis",
+        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+        cols="[federated.abc].[mn:Order Date:ok]",
+        panes=panes, deps_extra=_INST, style=style)
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["visual_type"] == "combo"
     assert [f["caption"] for f in w["combo_split"]["Y"]] == ["Sales"]
     assert [f["caption"] for f in w["combo_split"]["Y2"]] == ["Profit"]
 

@@ -1437,6 +1437,43 @@ def _split_token_attr(value):
 _BRACKET_TOKEN_RE = re.compile(r"\[([^\]]+)\]")
 
 
+def _folded_axis_instances(table, axis):
+    """Measure instances whose axis is FOLDED onto another -- Tableau's spelling of a dual axis.
+
+    Tableau writes no ``dual-axis`` attribute anywhere in a ``.twb`` (searched the whole corpus:
+    the only literal "dual" is in product names). What it writes is a worksheet
+    ``<style><style-rule element='axis'>`` whose ``<encoding attr='space'>`` for the SECONDARY
+    measure carries ``fold='true'`` (usually alongside ``synchronized='true'``) -- literally "fold
+    this axis into the other one's rectangle".
+
+    That flag is the ONLY difference between a dual axis and a side-by-side measure trellis, which
+    are otherwise serialised identically: a leading blank pane plus one ``*-axis-name`` pane per
+    measure, no index on any of them. ``scope`` names the shelf (``rows`` for a y axis, ``cols``
+    for an x one) and is treated as a filter only when present.
+    """
+    folded = set()
+    style = _first(table, "style")
+    if style is None:
+        return folded
+    scope = "rows" if axis == "y" else "cols"
+    for rule in _children_local(style, "style-rule"):
+        if _attr_local(rule, "element") != "axis":
+            continue
+        for enc in _children_local(rule, "encoding"):
+            if _attr_local(enc, "attr") != "space":
+                continue
+            if (_attr_local(enc, "fold") or "").strip().lower() != "true":
+                continue
+            enc_scope = _attr_local(enc, "scope")
+            if enc_scope and enc_scope != scope:
+                continue
+            field = _attr_local(enc, "field") or ""
+            toks = _BRACKET_TOKEN_RE.findall(field)
+            if toks:
+                folded.add(toks[-1])
+    return folded
+
+
 def _pane_mark_map(table, measure_axis=None):
     """Index a worksheet's per-axis marks for dual-axis / combo detection.
 
@@ -1452,9 +1489,11 @@ def _pane_mark_map(table, measure_axis=None):
     * an axis INDEX >= 1 -- how Tableau distinguishes two axes over the SAME measure (a line + its
       area fill, a lollipop's stick + head): the name alone cannot tell them apart, so it numbers
       them;
-    * TWO OR MORE DISTINCT axis NAMES -- how it spells two axes over DIFFERENT measures
-      (e.g. ``SUM(Sales)`` and ``AVG(Sales)``), where the names already disambiguate so no index is
-      written.
+    * TWO OR MORE DISTINCT axis NAMES **whose axes fold onto one rectangle** -- how it spells two
+      axes over DIFFERENT measures (e.g. ``SUM(Sales)`` and ``AVG(Sales)``), where the names
+      already disambiguate so no index is written. The fold is essential: distinct names on their
+      own are ALSO how Tableau spells a side-by-side measure trellis, and the two are otherwise
+      byte-identical. See :func:`_folded_axis_instances`.
 
     Only the first was detected, so a different-measure dual axis looked like an ordinary sheet and
     was rebuilt as a measure TRELLIS -- separate panes -- when the source draws both series overlaid
@@ -1492,7 +1531,21 @@ def _pane_mark_map(table, measure_axis=None):
         elif primary_mark is None and mk:
             primary_mark = mk
     if len(mark_by_instance) > 1:
-        has_secondary_axis = True
+        # DISTINCT AXIS NAMES ALONE ARE NOT A DUAL AXIS -- they are also exactly how Tableau
+        # spells a SIDE-BY-SIDE measure trellis, which serialises identically (leading blank pane
+        # + one named pane per measure, no index anywhere). Treating the two as the same thing
+        # rebuilt a 5-measure trellis as ONE combo chart spanning the whole dashboard where the
+        # source draws five separate bar charts (measured on the "Intake Details" sheet, whose
+        # Tableau render is five side-by-side panes).
+        #
+        # What separates them is which axes share a RECTANGLE: a folded axis is drawn on top of
+        # another, so the rectangle count is (distinct axis names - folded ones). One rectangle
+        # with 2+ names is a genuine dual axis; two or more rectangles is a trellis -- including
+        # the mixed case of a trellis whose columns are each internally dual (6 names, 3 folded
+        # -> 3 rectangles), which must still split.
+        folded = _folded_axis_instances(table, axis)
+        if len(set(mark_by_instance) - folded) <= 1:
+            has_secondary_axis = True
     return mark_by_instance, primary_mark, has_secondary_axis
 
 

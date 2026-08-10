@@ -14,6 +14,38 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **tableau-migration (skill `2.104.0` -> `2.105.0`): a side-by-side measure trellis is not a dual
+  axis.** Regression shipped in 2.103.0 and caught on the Salesforce Nonprofit "Intake" dashboard:
+  a block that 2.102.0 rebuilt as **five side-by-side bar charts** came back as **one combo chart
+  spanning the whole dashboard**, all five measures crammed into Y/Y2, horizontal bars rotated to
+  vertical columns.
+  - **Cause.** 2.103.0 made the measure-axis read orientation-aware, so a worksheet with measures on
+    **Cols** started reporting its `x-axis-name` panes. The pre-existing rule "2+ distinct axis names
+    means a second measure axis" (2.99.0) then fired on all five. That rule was derived from a real
+    `SUM(Sales)` + `AVG(Sales)` sheet and is right for it — but distinct axis names are ALSO exactly
+    how Tableau spells a side-by-side measure trellis. The two are otherwise byte-identical: a
+    leading blank pane, one `*-axis-name` pane per measure, and **no index on any of them**.
+  - **The discriminator.** Tableau writes no `dual-axis` attribute anywhere in a `.twb` — searched
+    every workbook in the corpus; the only literal "dual" is in product names. What it writes is
+    `<style><style-rule element='axis'><encoding attr='space' ... fold='true' scope='rows|cols'>`
+    on the SECONDARY axis: "fold this axis into the other's rectangle". So the axis-rectangle count
+    is `distinct axis names - folded ones`; one rectangle with 2+ names is a genuine dual axis, two
+    or more rectangles is a trellis.
+  - **Verified against every ambiguous sheet in the corpus** (18 of them, across 8 workbooks). Every
+    sheet independently identifiable as an overlay carries a fold (pareto, control chart, cumulative
+    distribution, the `SUM`+`AVG` sheet, four Previous-Year-vs-Current-Year sheets); every trellis
+    carries none (`Intake Details` 5, `Service Provider Details` 6, small-multiples' "In line Bar
+    chart" 5, crosstab-with-sparklines 3). A simple measure COUNT would have been wrong — two of the
+    trellises have exactly two measures.
+  - **Blast radius:** corpus 29/29, **zero visuals changed in place**. 10 combo charts that had
+    swallowed a trellis became 40 separate bar charts, across the four workbooks that own those
+    sheets; every genuine dual-axis combo survived untouched, as did the whole 2.102-2.104 KPI-card
+    and lollipop family (KPI Cards workbook: 22 visuals, 0 changed).
+  - **Known limit, unchanged from the 2.102.0 baseline:** a trellis whose columns are each
+    internally dual (`Service Provider Details`: 6 names, 3 folded -> 3 rectangles) splits per axis
+    NAME, giving 6 charts where Tableau draws 3 overlaid columns. Restoring the baseline is what
+    this release does; splitting per rectangle is a separate additive change.
+
 - **tableau-migration (skill `2.103.0` -> `2.104.0`): a dashboard's stored zone rects ARE the layout
   Tableau resolved, and a KPI's trend arrow is part of its line.**
   - **Zone geometry.** `fixed-size` is an INPUT to Tableau's layout engine; `x/y/w/h` are its
