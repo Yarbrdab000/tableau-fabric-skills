@@ -12,6 +12,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.122.0` -> `2.123.0`): Tableau DECLARES its blend links, and nothing
+  read them.** A blended secondary datasource landed in the model related to **nothing but Date**, so
+  any visual slicing it returned the whole table's grand total identically for every member --
+  measured on Superstore at **4.4x high and constant** (Consumer 13,625 against Tableau's 3,086),
+  while the fact's own measures on the very same rows matched Tableau exactly, which is what made it
+  hard to see: the chart is half right. The same root cause refused three calcs as *"qualified
+  reference ... (unmodeled)"* for a field that WAS modelled, as `Sheet1[Sales_Target]`, 4,603 rows.
+  The join keys were never a guess -- Tableau writes them in `<datasource-relationships>` with an
+  explicit `<column-mapping>`, and that block was not parsed anywhere in the engine. It is now, and
+  a declared blend whose two sides landed as UNRELATED tables is reported with the exact columns
+  Tableau declared, de-duplicated across the per-derivation `<map>` entries Tableau writes for one
+  date field. Each side resolves through its OWN datasource via `table_map`, never the bare caption:
+  `naming` is first-writer-wins on a caption, so resolving `Category` by name puts both sides on one
+  datasource and the link reads as a self-join (measured -- the first cut reported nothing).
+  The relationship is deliberately NOT invented: a blend is a composite-key link at a chosen date
+  grain with no single-column Power BI equivalent, and a wrong relationship returns a number that
+  renders perfectly. The refusal reason now names where the field landed and what to add, instead of
+  denying data the model contains. Found a **second, previously silent** case in the corpus
+  (`0073_comparing_attributes_within_a_dimension`).
+
 - **tableau-migration (skill `2.121.0` -> `2.122.0`): a published datasource is indexed under EVERY
   name it answers to, so a `sqlproxy` workbook binds the model its datasource just produced.** The
   rebind machinery already existed; the JOIN did not fire. A published datasource travels to a

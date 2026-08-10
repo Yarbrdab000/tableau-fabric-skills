@@ -4376,3 +4376,74 @@ def test_rebuild_from_published_match_treats_an_ambiguous_alias_as_a_miss():
                                  "published_ds_name": "Meridian Sales (Live Snowflake)"}}
     catalog = {me._norm_ds("Meridian Sales (Live Snowflake)"): me._AMBIGUOUS_CATALOG_ENTRY}
     assert me._rebuild_from_published_match(detail, "<workbook/>", "M", catalog) is None
+
+
+# -- Tableau DECLARES its blend links; nothing read them (issue #101) ---------------------------
+# A blended secondary datasource landed related to NOTHING but Date, so any visual slicing it
+# returned the whole table's total identically for every member -- measured on Superstore at 4.4x
+# high and constant, while the fact's own measures on the very same rows matched Tableau exactly.
+# The join keys were never a guess: Tableau writes them in <datasource-relationships>.
+
+_BLEND_TWB = """<?xml version='1.0' encoding='utf-8' ?>
+<workbook version='18.1'>
+  <datasources>
+    <datasource caption='Sample - Superstore' inline='true' name='federated.aaa' version='18.1' />
+    <datasource caption='Sales Target' inline='true' name='federated.bbb' version='18.1' />
+  </datasources>
+  <datasource-relationships>
+    <datasource-relationship source='federated.aaa' target='federated.bbb'>
+      <column-mapping>
+        <map key='[federated.aaa].[none:Category:nk]' value='[federated.bbb].[none:Category:nk]' />
+        <map key='[federated.aaa].[none:Segment:nk]' value='[federated.bbb].[none:Segment:nk]' />
+        <map key='[federated.aaa].[mn:Order Date:ok]' value='[federated.bbb].[mn:Order Date:ok]' />
+        <map key='[federated.aaa].[yr:Order Date:ok]' value='[federated.bbb].[yr:Order Date:ok]' />
+      </column-mapping>
+    </datasource-relationship>
+  </datasource-relationships>
+</workbook>"""
+
+_BLEND_REPORT = {"table_map": {"Sample - Superstore||Orders": "Orders",
+                               "Sample - Superstore||People": "People",
+                               "Sales Target||Sheet1": "Sheet1"}}
+
+
+def test_workbook_blend_links_are_read_from_the_declaration_not_guessed():
+    links = me._workbook_blend_links(_BLEND_TWB)
+    assert len(links) == 1
+    assert links[0]["source"] == "federated.aaa" and links[0]["target"] == "federated.bbb"
+    # Tableau writes one <map> per DERIVATION of the same field (mn:/yr: of one date); they are all
+    # the same underlying link, so the pairs are de-duplicated to the base captions.
+    assert links[0]["pairs"] == [("Category", "Category"), ("Segment", "Segment"),
+                                 ("Order Date", "Order Date")]
+
+
+def test_blend_field_caption_unwraps_a_column_instance_token():
+    assert me._blend_field_caption("[none:Category:nk]") == "Category"
+    assert me._blend_field_caption("[mn:Order Date:ok]") == "Order Date"
+    assert me._blend_field_caption("[Sales]") == "Sales"     # a plain field reference
+
+
+def test_a_declared_blend_across_unrelated_landed_tables_is_reported_with_its_real_keys():
+    warns = me._blend_link_warnings(_BLEND_TWB, _BLEND_REPORT)
+    assert len(warns) == 1
+    w = warns[0]
+    assert "Sample - Superstore" in w and "Sales Target" in w
+    assert "'Category'" in w and "'Segment'" in w and "'Order Date'" in w
+    assert "Sheet1" in w and "Orders" in w
+    assert "GRAND TOTAL" in w
+
+
+def test_each_blend_side_resolves_through_its_OWN_datasource_not_the_bare_caption():
+    # `naming` is first-writer-wins on a caption, so resolving 'Category' by name puts BOTH sides on
+    # whichever datasource was written first and the link looks like a self-join -- which is exactly
+    # why this reported nothing at first. Resolution is by datasource via table_map.
+    same_table = {"table_map": {"Sample - Superstore||Orders": "Orders",
+                                "Sales Target||Orders": "Orders"}}
+    assert me._blend_link_warnings(_BLEND_TWB, same_table) == []
+
+
+def test_a_workbook_with_no_declared_blend_reports_nothing():
+    # The report has to be able to be EMPTY, or it says nothing.
+    assert me._workbook_blend_links("<workbook version='18.1'/>") == []
+    assert me._blend_link_warnings("<workbook version='18.1'/>", _BLEND_REPORT) == []
+    assert me._workbook_blend_links("<not xml") == []

@@ -2527,6 +2527,138 @@ def _workbook_binding_signal(twb_text, ir):
     }
 
 
+_BLEND_INSTANCE_RE = re.compile(r"^\[(?P<ds>[^\]]+)\]\.\[(?P<inst>[^\]]+)\]$")
+
+
+def _blend_field_caption(instance):
+    """The base field caption inside a Tableau column-instance token.
+
+    ``[none:Category:nk]`` -> ``Category``; ``[mn:Order Date:ok]`` -> ``Order Date``. A token that is
+    not in the ``<derivation>:<field>:<kind>`` shape is returned as-is (minus brackets), so a plain
+    field reference still names its field.
+    """
+    tok = _strip_brackets(str(instance or "").strip())
+    parts = tok.split(":")
+    if len(parts) >= 3:
+        return ":".join(parts[1:-1]).strip()
+    return tok
+
+
+def _workbook_blend_links(twb_text):
+    """Tableau's DECLARED cross-datasource blend links -> ``[{source, target, pairs}]``.
+
+    A Tableau data BLEND is not a join inside either datasource -- it is a workbook-level link, and
+    Tableau records it explicitly in ``<datasource-relationships>``::
+
+        <datasource-relationship source='federated.10nn...' target='federated.0hgp...'>
+          <column-mapping>
+            <map key='[federated.10nn...].[none:Category:nk]'
+                 value='[federated.0hgp...].[none:Category:nk]' />
+
+    Nothing read this block, so a blended secondary datasource landed in the model related to
+    NOTHING but the Date dimension, and any visual slicing it returned the whole table's total
+    identically for every member -- measured on Superstore at 4.4x high and constant, while the
+    fact's own measures on the very same rows matched Tableau exactly (issue #101). Because the
+    links are declared, the join keys are GROUND TRUTH rather than a name-match heuristic.
+
+    ``pairs`` is ``[(source field caption, target field caption)]`` de-duplicated in document order;
+    Tableau writes one ``<map>`` per DERIVATION of the same field (``mn:`` / ``yr:`` / ``tmn:`` of one
+    date), which are all the same underlying link. Returns ``[]`` for a workbook with no blend, or
+    one that will not parse.
+    """
+    try:
+        root = ET.fromstring((twb_text or "").lstrip("\ufeff"))
+    except Exception:
+        return []
+    out = []
+    for rel in root.iter():
+        if _local(rel.tag) != "datasource-relationship":
+            continue
+        src, tgt = (rel.get("source") or "").strip(), (rel.get("target") or "").strip()
+        if not src or not tgt:
+            continue
+        pairs = []
+        for mp in rel.iter():
+            if _local(mp.tag) != "map":
+                continue
+            km = _BLEND_INSTANCE_RE.match((mp.get("key") or "").strip())
+            vm = _BLEND_INSTANCE_RE.match((mp.get("value") or "").strip())
+            if not km or not vm:
+                continue
+            pair = (_blend_field_caption(km.group("inst")), _blend_field_caption(vm.group("inst")))
+            if all(pair) and pair not in pairs:
+                pairs.append(pair)
+        if pairs:
+            out.append({"source": src, "target": tgt, "pairs": pairs})
+    return out
+
+
+def _workbook_datasource_captions(twb_text):
+    """``{internal datasource name -> caption}`` for every datasource the workbook declares.
+
+    A blend link names its two sides by INTERNAL name (``federated.0hgpf...``), while the model's
+    ``table_map`` is keyed by datasource CAPTION -- so the two only meet through this map.
+    """
+    try:
+        root = ET.fromstring((twb_text or "").lstrip("\ufeff"))
+    except Exception:
+        return {}
+    out = {}
+    for el in root.iter():
+        if _local(el.tag) != "datasource":
+            continue
+        name, caption = (el.get("name") or "").strip(), (el.get("caption") or "").strip()
+        if name and caption:
+            out.setdefault(name, caption)
+    return out
+
+
+def _blend_link_warnings(twb_text, res_report):
+    """Warn for each DECLARED blend whose two sides landed as UNRELATED model tables.
+
+    A blend is Tableau's answer to "these live in different datasources"; Power BI's answer is a
+    relationship, and one cannot be invented safely -- Tableau blends on a COMPOSITE key at a chosen
+    date grain, which has no single-column equivalent, and a wrong relationship returns a number that
+    renders perfectly. So this reports the link with the exact columns Tableau declared, which is a
+    precise instruction rather than a name-match guess: the operator knows which two tables and which
+    keys, and can add the relationship (or a composite key column) deliberately.
+
+    Each side is resolved through its OWN DATASOURCE (via ``table_map``), never through the bare
+    caption: ``naming`` is first-writer-wins on a caption, so both sides of a blend on ``Category``
+    resolve to whichever datasource was written first and the link looks like a self-join. Silent
+    when the two sides share a landed table, or when the workbook declares no blend.
+    """
+    links = _workbook_blend_links(twb_text)
+    if not links:
+        return []
+    captions = _workbook_datasource_captions(twb_text)
+    tables_by_ds = {}
+    for key, consolidated in ((res_report or {}).get("table_map") or {}).items():
+        ds, _, _rel = str(key).partition("||")
+        if ds.strip() and consolidated:
+            tables_by_ds.setdefault(ds.strip(), set()).add(consolidated)
+
+    warns = []
+    for link in links:
+        src_tables = tables_by_ds.get(captions.get(link["source"], ""), set())
+        tgt_tables = tables_by_ds.get(captions.get(link["target"], ""), set())
+        if not src_tables or not tgt_tables or (src_tables & tgt_tables):
+            continue        # unresolved, or already one table -- nothing to relate
+        keys = [src if src == tgt else f"{src} <-> {tgt}" for src, tgt in link["pairs"]]
+        warns.append(
+            _PBIP_WARN + ("Tableau BLENDS %r with %r on %s, but the tables they landed as (%s | %s) "
+                          "have no relationship between them -- a measure from one sliced by the "
+                          "other's columns returns that table's GRAND TOTAL identically for every "
+                          "member. A blend is a composite-key link with no single-column Power BI "
+                          "equivalent, so it is reported rather than guessed: add a relationship (or "
+                          "a COMBINEVALUES key column on both tables) using exactly these columns"
+                          % (captions.get(link["source"], link["source"]),
+                             captions.get(link["target"], link["target"]),
+                             ", ".join(repr(k) for k in keys),
+                             ", ".join(sorted(src_tables)), ", ".join(sorted(tgt_tables)))))
+    return warns
+
+
 def _norm_ds(name):
     """Connector-agnostic match key: lowercased with all non-alphanumerics removed, so a workbook's
     published-datasource name ('Superstore - Extract') matches the migrated datasource it became
@@ -3090,6 +3222,10 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
         param_binding["slicers"] = merged
         param_binding.setdefault("flags", {})
     field_model_table, field_map, _ambiguous_names = _field_map_from_model(res_report)
+    # A DECLARED Tableau blend whose two sides landed as unrelated model tables. Reported here
+    # because the model manifest (which says where each field landed) only exists once the model is
+    # built. See ``_blend_link_warnings``: the keys are quoted from Tableau, not guessed.
+    warns.extend(_blend_link_warnings(twb_text, res_report))
     # ISSUE #103, option (b). Where one datasource genuinely carries the same caption on two of its
     # tables, no datasource-scoped key could be emitted (there is nothing to prefer), so resolution
     # falls through to the bare caption -- i.e. the FIRST table written claims it. That is a guess,
@@ -3414,7 +3550,6 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
     # whose model fails to land still tells a consumer which systems it would have touched.
     detail["embedded_datasources"] = _embedded_datasource_telemetry(twb_text, all_ds)
     warns.extend(_locale_dependent_flatfile_warnings(twb_text, all_ds))
-
     # SINGLE embedded datasource (the common case): keep the established FLAT ``pbip/<WB>/`` layout so
     # the top-level detail keys and the on-disk paths stay byte-identical. The report binds to the one
     # rebuilt model.
