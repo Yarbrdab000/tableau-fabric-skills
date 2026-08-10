@@ -1112,7 +1112,7 @@ def test_geo_dimension_on_detail_only_is_location_only_filled_map():
     ir = parse_twb(_workbook(ws))
     assert ir["worksheets"][0]["visual_type"] == "filled_map"
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
-    assert vis["visual"]["visualType"] == "filledMap"
+    assert vis["visual"]["visualType"] == "azureMap"
     state = _query_state(vis)
     assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
     assert "Tooltips" not in state
@@ -3368,89 +3368,131 @@ def test_shape_map_from_geo_detail_and_color_measure():
     ir = parse_twb(_workbook(_geo_ws("Sales by State", "Automatic", enc)))
     assert ir["worksheets"][0]["visual_type"] == "shape_map"
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
-    assert vis["visual"]["visualType"] == "shapeMap"
+    assert vis["visual"]["visualType"] == "azureMap"
     state = _query_state(vis)
-    # Category = the geographic dimension; the colour-saturation measure binds the "Value" role
-    # (the PBIR well behind shapeMap "Color saturation"), so the choropleth shades by the measure.
+    # Category = the geographic dimension; the shading measure binds ``Tooltips`` -- azureMap has NO
+    # ``Value`` and no ``Gradient`` role, and Tooltips IS a real measure role, so the measure is
+    # genuinely in the dataview and the referenceLayer FillRule's Input resolves against it.
     assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
-    assert state["Value"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
-    assert "Tooltips" not in state  # the measure is the colour driver, not a redundant tooltip copy
+    assert state["Tooltips"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
+    assert "Value" not in state and "Gradient" not in state
     # generated lat/lon are dropped quietly, not bound as fields
     assert "no model binding" not in json.dumps(ir["warnings"])
 
 
 def test_shape_map_measure_binds_value_color_saturation_well():
     # A Tableau measure on the Color shelf of a filled map is the choropleth's saturation driver.
-    # The faithful Power BI home is the shapeMap "Value" role (its "Color saturation" well), NOT
-    # Tooltips/Gradient -- so Power BI actually shades each state by the measure with its default ramp.
+    # Its faithful Power BI home is azureMap's ``Tooltips`` role: `catalog describe azureMap` gives
+    # Category/Y/X/Series/Size/Tooltips/PathID/PointOrder -- there is NO Value and NO Gradient -- and
+    # Tooltips is a real MEASURE role, so the referenceLayer's FillRule Input resolves against it.
     enc = ("<encodings>"
            "<color column='[federated.abc].[sum:Profit:qk]' />"
            "<lod column='[federated.abc].[none:State:nk]' />"
            "</encodings>")
     ir = parse_twb(_workbook(_geo_ws("Profit by State", "Automatic", enc)))
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
-    assert vis["visual"]["visualType"] == "shapeMap"
+    assert vis["visual"]["visualType"] == "azureMap"
     state = _query_state(vis)
-    # the measure lands on Value (colour saturation), and ONLY there -- no redundant Tooltips copy
-    assert "Value" in state
-    assert "Tooltips" not in state
-    assert "Gradient" not in state
-    assert state["Value"]["projections"][0]["field"]["Aggregation"]["Function"] == 0  # Sum(Profit)
+    # the shading measure lands on Tooltips, and there is no Value/Gradient well to land on
+    assert "Tooltips" in state
+    assert "Gradient" not in state and "Value" not in state
+    assert state["Tooltips"]["projections"][0]["field"]["Aggregation"]["Function"] == 0  # Sum(Profit)
     # the geo dimension is still the Location/Category at the finest level
     assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
 
 
-def test_shape_map_objects_pin_usa_states_topo_built_in_map():
-    # A state-grain choropleth emits the objects.shape block that pins Power BI's built-in
-    # "usa.states.topo" SHARED map (PackageType 2) + the albersUsa projection, so the shapeMap
-    # renders OFFLINE with no bundled TopoJSON. Shape verified against real Desktop shapeMap JSON.
+def test_azure_map_objects_bind_a_data_driven_reference_layer_choropleth():
+    # REPLACES the shapeMap "usa.states.topo" test. That built-in SHARED map was believed to render a
+    # US-state choropleth offline; a render control disproved it -- a byte-identical shapeMap drew
+    # COMPLETELY BLANK in Desktop while an azureMap with a data-bound referenceLayer, same machine
+    # and same data, drew a real choropleth. So the topology block is gone and this locks the
+    # encoding that was proven to render (issues #106 / #112).
     enc = ("<encodings>"
            "<color column='[federated.abc].[sum:Profit:qk]' />"
            "<lod column='[federated.abc].[none:State:nk]' />"
            "</encodings>")
     ir = parse_twb(_workbook(_geo_ws("Profit by State", "Automatic", enc)))
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
-    assert vis["visual"]["visualType"] == "shapeMap"
-    shape = vis["visual"]["objects"]["shape"][0]["properties"]
-    geo = shape["map"]["geoJson"]
-    assert geo["type"]["expr"]["Literal"]["Value"] == "'shared'"
-    assert geo["name"]["expr"]["Literal"]["Value"] == "'usa.states.topo'"
-    rpi = geo["content"]["expr"]["ResourcePackageItem"]
-    assert rpi == {"PackageName": "SharedResources", "PackageType": 2,
-                   "ItemName": "usa.states.topo"}
-    assert shape["projectionEnum"]["expr"]["Literal"]["Value"] == "'albersUsa'"
+    assert vis["visual"]["visualType"] == "azureMap"
+    objs = vis["visual"]["objects"]
+    assert "shape" not in objs        # the dead shapeMap topology block is not emitted
+
+    # referenceLayer is a TWO-entry array: [0] the layer, [1] the data-bound fill under a
+    # dataViewWildcard selector. One merged entry does not shade.
+    ref = objs["referenceLayer"]
+    assert len(ref) == 2
+    layer = ref[0]["properties"]
+    assert layer["datasourceType"]["expr"]["Literal"]["Value"] == "'url'"
+    assert "us-states.json" in layer["referenceLayerUrl"]["expr"]["Literal"]["Value"]
+    assert layer["unmappedObjectVisibility"]["expr"]["Literal"]["Value"] == "false"
+    fill = ref[1]
+    assert fill["selector"] == {"data": [{"dataViewWildcard": {"matchingOption": 1}}]}
+    rule = fill["properties"]["polygonFillColor"]["solid"]["color"]["expr"]["FillRule"]
+    # the FillRule Input is the SAME field expression the Tooltips projection carries, so the two
+    # cannot drift apart
+    state = _query_state(vis)
+    assert rule["Input"] == state["Tooltips"]["projections"][0]["field"]
+
+    # bubbleLayer OFF is REQUIRED: without it Azure Maps draws a bubble on every state centroid on
+    # top of the shaded polygons (observed in the render control).
+    assert objs["bubbleLayer"][0]["properties"]["show"]["expr"]["Literal"]["Value"] == "false"
+
+    # chrome: Tableau's map has a plain white background and no controls. blank_accessible + a soft
+    # grey stroke was the closest of four rendered variants; plain `blank` lost the borders entirely
+    # (white on white) and grayscale_light drew a grey basemap with Canada/Mexico.
+    ctl = objs["mapControls"][0]["properties"]
+    assert ctl["defaultStyle"]["expr"]["Literal"]["Value"] == "'blank_accessible'"
+    assert ctl["showStylePicker"]["expr"]["Literal"]["Value"] == "false"
+    assert ctl["showNavigationControls"]["expr"]["Literal"]["Value"] == "false"
 
 
-def test_shape_map_objects_emit_diverging_saturation_gradient_centred_at_zero():
-    # A measure shapeMap must carry an explicit objects.dataPoint colour-saturation gradient or
-    # Desktop renders a FLAT fill until the Value field is nudged off-and-on. We emit a DIVERGING
-    # linearGradient3 -- orange (loss) -> white (0) -> blue (high profit) -- matching Tableau's
-    # Orange-Blue map palette. Power BI does NOT default the centre to 0 (it auto-centres on the
-    # data midpoint), so we PIN the mid stop's value to 0; white then lands on break-even with the
-    # min/max stops left to auto-scale. Verified against a real Desktop filledMap/shapeMap visual.json.
+def test_a_symbol_map_gets_no_reference_layer():
+    # A symbol/bubble map's geography is the POINT, not an area -- a polygon overlay would be an
+    # invention -- and its bubbles must stay visible.
+    enc = ("<encodings><size column='[federated.abc].[sum:Sales:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' /></encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Sales by State", "Circle", enc)))
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "azureMap"
+    objs = vis["visual"]["objects"]
+    assert "referenceLayer" not in objs
+    assert "bubbleLayer" not in objs          # left ON (the default)
+    assert objs["mapControls"][0]["properties"]["defaultStyle"]["expr"]["Literal"]["Value"] \
+        == "'blank_accessible'"
+
+
+def test_a_public_geojson_choropleth_warns_that_an_offline_tenant_must_re_point_it():
+    # The choropleth depends on a PUBLIC boundary URL. A locked-down tenant cannot reach it, and a
+    # map that silently draws no polygons is the failure mode this whole change exists to remove.
+    enc = ("<encodings><color column='[federated.abc].[sum:Profit:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' /></encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Profit by State", "Automatic", enc)))
+    emit_pbir(ir)
+    text = json.dumps(ir["warnings"])
+    assert "referenceLayerUrl" in text and "offline" in text
+
+def test_azure_map_choropleth_gradient_is_diverging_and_centred_at_zero():
+    # Same palette and the same pinned centre the shapeMap path used -- orange (loss) -> white (0)
+    # -> blue (high) -- but it now rides the referenceLayer's polygonFillColor FillRule instead of
+    # objects.dataPoint, because the fill is a polygon property on azureMap. Power BI does NOT
+    # default the centre to 0 (it auto-centres on the DATA midpoint), so the mid stop is PINNED;
+    # otherwise break-even states paint orange on a mostly-positive measure. Each stop is an
+    # UNWRAPPED literal -- the ``expr`` form fails to load (PBIR_FILLRULE_STOP_DOUBLE_WRAP) and the
+    # choropleth reverts to a flat fill.
     enc = ("<encodings>"
            "<color column='[federated.abc].[sum:Profit:qk]' />"
            "<lod column='[federated.abc].[none:State:nk]' />"
            "</encodings>")
     ir = parse_twb(_workbook(_geo_ws("Profit by State", "Automatic", enc)))
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
-    assert vis["visual"]["visualType"] == "shapeMap"
-    dp = vis["visual"]["objects"]["dataPoint"][0]["properties"]
-    grad = dp["fillRule"]["linearGradient3"]
-    # orange -> white -> blue, white PINNED at the 0 centre (mid carries a value anchor; min/max
-    # stay value-less so they auto-scale to the data low/high). Each stop is an UNWRAPPED literal
-    # (no ``expr`` wrapper) -- the ``expr`` form fails to load (PBIR_FILLRULE_STOP_DOUBLE_WRAP).
+    assert vis["visual"]["visualType"] == "azureMap"
+    ref = vis["visual"]["objects"]["referenceLayer"][1]["properties"]
+    grad = ref["polygonFillColor"]["solid"]["color"]["expr"]["FillRule"]["FillRule"]["linearGradient3"]
     assert grad["min"]["color"]["Literal"]["Value"] == "'#FEA043'"
     assert grad["mid"]["color"]["Literal"]["Value"] == "'#FFFFFF'"
     assert grad["max"]["color"]["Literal"]["Value"] == "'#4A88C2'"
-    assert grad["mid"]["value"]["Literal"]["Value"] == "0D"          # centre pinned at break-even
-    assert "value" not in grad["min"]                                 # endpoints auto-scale...
-    assert "value" not in grad["max"]                                 # ...to the data range
-    assert grad["nullColoringStrategy"]["strategy"]["Literal"]["Value"] == "'asZero'"
-    assert dp["showAllDataPoints"]["expr"]["Literal"]["Value"] == "true"
-    assert "linearGradient2" not in dp["fillRule"]  # not the old sequential 2-colour ramp
-
-
+    assert grad["mid"]["value"]["Literal"]["Value"] == "0D"
+    assert "expr" not in grad["min"]["color"]
 def test_grid_font_objects_tableex_uses_total_not_rowheaders_or_subtotals():
     # A flat tableEx exposes NO rowHeaders / subTotals objects (only columnHeaders / values / total).
     # Emitting rowHeaders/subTotals on a tableEx trips PBIR_FORMATTING_OBJECT_UNKNOWN and Power BI
@@ -3522,11 +3564,11 @@ def test_shape_map_binds_finest_geo_level_not_coarsest():
     ir = parse_twb(_workbook(ws))
     assert ir["worksheets"][0]["visual_type"] == "shape_map"
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
-    assert vis["visual"]["visualType"] == "shapeMap"
+    assert vis["visual"]["visualType"] == "azureMap"
     state = _query_state(vis)
     cat = [p["field"]["Column"]["Property"] for p in state["Category"]["projections"]]
     assert cat == ["State"]   # finest level only, NOT the coarser Country/Region
-    assert state["Value"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
+    assert state["Tooltips"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
 
 
 def test_shape_map_explicit_map_mark_needs_no_latlon_signal():
@@ -3560,11 +3602,11 @@ def test_v2_6_multipolygon_standard_geography_recovers_to_shape_map():
     ir = parse_twb(_workbook(_geo_ws("Sale Map", "Multipolygon", enc)))
     assert ir["worksheets"][0]["visual_type"] == "shape_map"
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
-    assert vis["visual"]["visualType"] == "shapeMap"
+    assert vis["visual"]["visualType"] == "azureMap"
     state = _query_state(vis)
     # geo dimension on Category (finest level); colour measure shades via the "Value" saturation well
     assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
-    assert state["Value"]["projections"][0]["field"]["Aggregation"]["Function"] == 0  # Sum(Sales)
+    assert state["Tooltips"]["projections"][0]["field"]["Aggregation"]["Function"] == 0  # Sum(Sales)
     # the recovered map is a real visual, NOT a deferred warning
     assert not any("deferred" in w["reason"] and w["name"] == "Sale Map" for w in ir["warnings"])
 
@@ -3581,7 +3623,7 @@ def test_v2_6_multipolygon_geometry_signal_recovers_to_shape_map():
     ir = parse_twb(_workbook(_geo_ws("Spatial", "Multipolygon", enc, rows="", cols="")))
     assert ir["worksheets"][0]["visual_type"] == "shape_map"
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
-    assert vis["visual"]["visualType"] == "shapeMap"
+    assert vis["visual"]["visualType"] == "azureMap"
     assert _query_state(vis)["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
 
 
@@ -3622,7 +3664,7 @@ def test_symbol_map_circle_mark_with_size_measure():
     ir = parse_twb(_workbook(_geo_ws("Bubble Map", "Circle", enc)))
     assert ir["worksheets"][0]["visual_type"] == "map"
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
-    assert vis["visual"]["visualType"] == "map"
+    assert vis["visual"]["visualType"] == "azureMap"
     state = _query_state(vis)
     assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
     assert state["Size"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
@@ -3640,12 +3682,12 @@ def test_symbol_map_color_measure_binds_gradient_not_color_well():
     ir = parse_twb(_workbook(_geo_ws("Bubble Map", "Circle", enc)))
     assert ir["worksheets"][0]["visual_type"] == "map"
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
-    assert vis["visual"]["visualType"] == "map"
+    assert vis["visual"]["visualType"] == "azureMap"
     state = _query_state(vis)
     assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
     # size keeps its own measure; the distinct colour measure shades via Gradient, never "Color"
     assert state["Size"]["projections"][0]["queryRef"] == "Sum(Orders.Sales_Amount)"
-    assert state["Gradient"]["projections"][0]["queryRef"] == "Sum(Orders.Profit)"
+    assert state["Tooltips"]["projections"][0]["queryRef"] == "Sum(Orders.Profit)"
     assert "Color" not in state
 
 
@@ -3660,11 +3702,11 @@ def test_filled_map_categorical_color_binds_series_legend():
     ir = parse_twb(_workbook(_geo_ws("Region Map", "Automatic", enc, rows="", cols="")))
     assert ir["worksheets"][0]["visual_type"] == "filled_map"
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
-    assert vis["visual"]["visualType"] == "filledMap"
+    assert vis["visual"]["visualType"] == "azureMap"
     state = _query_state(vis)
     assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
     assert state["Series"]["projections"][0]["field"]["Column"]["Property"] == "Region"
-    assert "Gradient" not in state   # a dimension colour is a legend, not a saturation measure
+    assert "Gradient" not in state and "Value" not in state   # a dimension colour is a legend, not a saturation measure
 
 
 def test_symbol_map_categorical_color_binds_series_legend():
@@ -3678,12 +3720,12 @@ def test_symbol_map_categorical_color_binds_series_legend():
     ir = parse_twb(_workbook(_geo_ws("Bubble Legend Map", "Circle", enc)))
     assert ir["worksheets"][0]["visual_type"] == "map"
     vis = list(_visual_parts(emit_pbir(ir)).values())[0]
-    assert vis["visual"]["visualType"] == "map"
+    assert vis["visual"]["visualType"] == "azureMap"
     state = _query_state(vis)
     assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
     assert state["Size"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
     assert state["Series"]["projections"][0]["field"]["Column"]["Property"] == "Region"
-    assert "Gradient" not in state
+    assert "Gradient" not in state and "Value" not in state
 
 
 # -- sf-npo Lesson 8: symbol-map bubble-size legibility caveat ----------------------------------
@@ -5767,10 +5809,13 @@ def test_golden_visual_types_lock_full_bindings():
         "Golden Card": ("card", {"Values": ["Sum(Orders.Sales_Amount)"]}),
         "Golden MultiCard": ("multiRowCard",
                              {"Values": ["Sum(Orders.Sales_Amount)", "Sum(Orders.Profit)"]}),
-        "Golden ShapeMap": ("shapeMap",
+        # Every map is an azureMap: shapeMap rendered BLANK in a Desktop control, and the Bing
+        # map/filledMap are deprecated with a modal in Desktop. azureMap has no Value/Gradient role,
+        # so the shading measure rides Tooltips (a real measure role).
+        "Golden ShapeMap": ("azureMap",
                             {"Category": ["Orders.State"],
-                             "Value": ["Sum(Orders.Sales_Amount)"]}),
-        "Golden SymbolMap": ("map",
+                             "Tooltips": ["Sum(Orders.Sales_Amount)"]}),
+        "Golden SymbolMap": ("azureMap",
                              {"Category": ["Orders.State"], "Size": ["Sum(Orders.Sales_Amount)"]}),
         "Golden MeasureValues": ("pivotTable",
                                  {"Rows": ["Orders.Region"],
@@ -6566,7 +6611,7 @@ def test_measure_palette_does_not_leak_into_map():
     res = migrate_twb_to_pbir(_measure_palette_workbook(
         _geo_ws("Profit by State", "Automatic", enc)))
     vj = list(_visual_parts(res["parts"]).values())[0]
-    assert vj["visual"]["visualType"] == "shapeMap"
+    assert vj["visual"]["visualType"] == "azureMap"
     assert _metadata_fills(vj) == {}
     assert not any("measure series colours deferred" in w["reason"] for w in res["warnings"])
 

@@ -12,6 +12,30 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.124.0` -> `2.125.0`): every map is an `azureMap` -- and `shapeMap`
+  was not merely deprecated, it was rendering BLANK.** A 4-visual control page in Power BI Desktop
+  established, by render rather than inference: `azureMap` draws basemap + bubbles; `azureMap` with a
+  data-bound `referenceLayer` draws a real choropleth; and a **byte-identical `shapeMap`** -- what
+  this engine emitted for every measure choropleth -- drew **completely blank**, same machine, same
+  data, same shared `usa.states.topo` resource. So the main choropleth path was shipping an empty
+  visual, while the location-only path shipped a Bing `filledMap` that now raises a *"Bing map visuals
+  are going away"* modal in Desktop (issues #106, #112).
+  All three map routes now emit `azureMap` with the render-proven encoding: the shading measure moves
+  off `Value`/`Gradient` onto **`Tooltips`** (azureMap has neither -- `catalog describe azureMap` gives
+  Category/Y/X/Series/Size/Tooltips/PathID/PointOrder -- and Tooltips is a real MEASURE role, so the
+  FillRule's `Input` resolves); `referenceLayer` is a **two-entry** array, the layer plus a
+  `dataViewWildcard`-selected `polygonFillColor` (one merged entry does not shade); `bubbleLayer.show`
+  is forced **false** on a choropleth, without which Azure Maps draws a bubble on every centroid ON TOP
+  of the polygons; and `mapControls.defaultStyle` is `blank_accessible` with a `#D9D9D9` stroke, the
+  closest of four rendered variants to Tableau's own white-background, no-chrome map.
+  Fail-closed where it must be: a SYMBOL map gets no reference layer (its geography is the point, not
+  an area) and keeps its bubbles, and a non-US or coarser geography gets basemap + bubbles rather than
+  a polygon layer keyed on names we have not proven line up. The choropleth depends on a PUBLIC GeoJSON
+  URL, so it now WARNS that an offline or locked-down tenant must re-point `referenceLayerUrl`.
+  Ships the reporter's suggested static guard: no route in `_VT_TO_PBIR` may resolve to `map`,
+  `filledMap` or `shapeMap`, and `azureMap` must be reachable so the guard cannot pass by emitting no
+  map at all. Corpus: **5 `shapeMap` + 1 `map` -> 6 `azureMap`**, 29/29.
+
 - **tableau-migration (skill `2.123.0` -> `2.124.0`): a table that landed related to NOTHING says
   so.** An unrelated dimension does not error -- it returns that table's GRAND TOTAL identically on
   every row of a breakdown, while `relationship_columns_exist`, TMDL deserialization, open and

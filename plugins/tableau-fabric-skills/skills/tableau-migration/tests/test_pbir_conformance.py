@@ -90,6 +90,12 @@ VERIFIED_NON_CORPUS_VISUAL_TYPES = frozenset({
     # Emitter literals outside the _VT_TO_PBIR mark map:
     "card", "multiRowCard",           # _resolve_visual_type card split
     "listSlicer",                     # field-parameter self-service page
+    # azureMap -- provenance is a RENDER, which is stronger than a corpus sighting. A 4-visual
+    # control page in Power BI Desktop showed azureMap drawing basemap + bubbles, and a data-bound
+    # referenceLayer drawing a real choropleth, while a byte-identical shapeMap on the same machine
+    # and data drew COMPLETELY BLANK. `catalog list` additionally reports map and filledMap as
+    # deprecated, and Desktop now raises a modal about Bing going away. See issues #106 / #112.
+    "azureMap",
 })
 VERIFIED_NON_CORPUS_ROLE_KEYS = frozenset({
     "Y2", "Series", "Breakdown",      # combo / waterfall / ribbon legend
@@ -99,6 +105,7 @@ VERIFIED_NON_CORPUS_ROLE_KEYS = frozenset({
     "X", "Size",                      # scatter / bubble map
     "Value",                          # shapeMap "Color saturation" well (singular)
     "Gradient",                       # Bing-map "Color saturation" well
+    "Tooltips",                       # azureMap's measure role -- it has NO Value and NO Gradient
 })
 
 REAL_PBIR_VISUAL_TYPES = CORPUS_NATIVE_VISUAL_TYPES | VERIFIED_NON_CORPUS_VISUAL_TYPES
@@ -377,7 +384,11 @@ def test_every_emitted_role_key_is_a_real_pbir_role():
     # and pins the Color->Gradient defect class -- a colour MEASURE lands on Gradient, never
     # a nonexistent "Color" role).
     assert {"Category", "Y", "Values"} <= emitted_roles
-    assert "Gradient" in emitted_roles      # driven by the bubble-map colour measure
+    # A map's colour/shading measure now lands on ``Tooltips``: azureMap (which every map migrates
+    # to) has NO ``Value`` and NO ``Gradient`` role -- `catalog describe azureMap` gives
+    # Category/Y/X/Series/Size/Tooltips/PathID/PointOrder -- and Tooltips is a real MEASURE role, so
+    # the measure is genuinely in the dataview and the referenceLayer FillRule's Input resolves.
+    assert "Tooltips" in emitted_roles      # driven by the map's shading/colour measure
     assert "Series" in emitted_roles        # driven by the categorical-colour map legend
     assert "Color" not in emitted_roles     # the historical binds-nowhere defect
 
@@ -429,3 +440,21 @@ def test_queryref_grammar_tolerates_dedup_suffix_without_over_accepting():
     assert _conforms_queryref("Sum(Orders.Profit) 2")   # dedup suffix stripped on retry
     assert _conforms_queryref("Orders.Sales 2024")      # legit trailing digits match raw (kept)
     assert not _conforms_queryref("Orders 2")           # bare token + digit is still not Table.Column
+
+
+# -- no deprecated Bing map may ever be emitted (issue #112's suggested guard) -------------------
+DEPRECATED_BING_VISUAL_TYPES = frozenset({"map", "filledMap", "shapeMap"})
+
+
+def test_no_deprecated_bing_map_visual_type_is_reachable():
+    # The reporter's suggested guard, as a static check on the registry: no mark route may resolve to
+    # a Bing-backed map. `map` and `filledMap` are deprecated (Desktop raises a once-per-session
+    # "Bing map visuals are going away" modal that automated screenshotting never surfaces), and
+    # `shapeMap` was measured rendering COMPLETELY BLANK against a byte-identical azureMap control.
+    from twb_to_pbir import _VT_TO_PBIR
+    emitted = set(_VT_TO_PBIR.values())
+    assert not (emitted & DEPRECATED_BING_VISUAL_TYPES), \
+        "deprecated Bing map visualType(s) reachable from _VT_TO_PBIR: %r" % (
+            emitted & DEPRECATED_BING_VISUAL_TYPES)
+    # ...and the replacement really is reachable, so this cannot pass by emitting no map at all.
+    assert "azureMap" in emitted

@@ -313,9 +313,17 @@ _VT_TO_PBIR = {
     # legacy Bing filledMap; it is retained only for location-only / categorical-legend maps (a
     # measure-less geo Detail) -- shapes shapeMap cannot express -- and stays an image-oracle
     # candidate the assisted tier may restore.
-    VT_FILLED_MAP: "filledMap",
-    VT_MAP: "map",
-    VT_SHAPE_MAP: "shapeMap",
+    # ALL THREE Tableau map shapes migrate to ``azureMap``. Microsoft deprecates the Bing-backed
+    # ``map`` and ``filledMap`` (Desktop now shows a modal "Bing map visuals are going away"), and
+    # ``shapeMap`` -- which the choropleth path used to take -- was measured rendering COMPLETELY
+    # BLANK: a 4-visual control page proved azureMap draws bubbles and a data-bound referenceLayer
+    # choropleth on the same machine and the same data where a byte-identical shapeMap drew nothing.
+    # So this is not merely a deprecation swap; shapeMap was emitting an empty visual (issues #106,
+    # #112). The three constants are kept distinct because they still select DIFFERENT azureMap
+    # layers and query-state shapes (choropleth vs symbol vs categorical legend).
+    VT_FILLED_MAP: "azureMap",
+    VT_MAP: "azureMap",
+    VT_SHAPE_MAP: "azureMap",
     # Dual-axis / combo: a column-family measure share an axis with a line-family measure. Power
     # BI's combo chart puts the column measure(s) on Y (primary axis) and the line measure(s) on
     # Y2 (secondary axis). Role keys (Category/Series/Y/Y2) verified against real Microsoft PBIR
@@ -7051,7 +7059,11 @@ def _build_query_state(ws, model_table, field_map, warnings):
             state["Category"] = {"projections": _role_projections(
                 loc, model_table, field_map, used_refs)}
         if meas:
-            state["Value"] = {"projections": _role_projections(
+            # azureMap has NO ``Value`` and no ``Gradient`` role (catalog describe azureMap ->
+            # Category/Y/X/Series/Size/Tooltips/PathID/PointOrder). ``Tooltips`` IS a real measure
+            # role, so the shading measure is genuinely in the dataview and the referenceLayer's
+            # FillRule ``Input`` resolves against it.
+            state["Tooltips"] = {"projections": _role_projections(
                 meas[:1], model_table, field_map, used_refs)}
     elif vt == VT_FILLED_MAP:
         # Filled map (Bing choropleth): the geo-role dimension on Detail is the Category (Location),
@@ -7071,7 +7083,9 @@ def _build_query_state(ws, model_table, field_map, warnings):
             state["Category"] = {"projections": _role_projections(
                 loc, model_table, field_map, used_refs)}
         if meas:
-            state["Gradient"] = {"projections": _role_projections(
+            # azureMap has no ``Gradient`` role; the shading measure rides ``Tooltips`` (a real
+            # measure role) so the referenceLayer FillRule can resolve it. See VT_SHAPE_MAP above.
+            state["Tooltips"] = {"projections": _role_projections(
                 meas[:1], model_table, field_map, used_refs)}
         # a categorical (dimension) colour on the Color shelf is the map LEGEND -> the "Series"
         # role (a valid filledMap role on a real visual.json); each area is shaded by its legend
@@ -7117,7 +7131,8 @@ def _build_query_state(ws, model_table, field_map, warnings):
                     f"near-uniform bubble radii -- prefer a count or sum measure on Size so the "
                     f"bubbles are differentiable"))
         if color_sel:
-            state["Gradient"] = {"projections": _role_projections(
+            # azureMap has no ``Gradient`` role; a symbol map's colour measure rides ``Tooltips``.
+            state["Tooltips"] = {"projections": _role_projections(
                 color_sel, model_table, field_map, used_refs)}
         # a categorical (dimension) colour binds the map LEGEND -> the "Series" role (verified on a
         # real classic "map" visual.json, e.g. Series=Continent); bubbles are coloured by legend
@@ -9274,6 +9289,153 @@ _SHAPE_MAP_DIVERGING_MIN = "#FEA043"    # orange -> most-negative (loss); value-
 _SHAPE_MAP_DIVERGING_MID = "#FFFFFF"    # white  -> pinned at 0 / break-even
 _SHAPE_MAP_DIVERGING_MAX = "#4A88C2"    # blue   -> most-positive (high profit); value-less = auto data high
 _SHAPE_MAP_DIVERGING_CENTRE = "0D"      # PBIR double-literal 0 -> the pinned centre value (break-even)
+
+
+_AZURE_MAP_US_STATES_GEOJSON = (
+    "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json")
+# Closest render-verified match to Tableau's own map chrome: white background, soft grey borders, no
+# controls. Four variants were compared in Desktop; `blank` lost the state borders (white on white),
+# `grayscale_light` drew a grey basemap with Canada/Mexico, and plain `blank` with the default stroke
+# drew a loud blue outline. `blank_accessible` + #D9D9D9 was the closest to the Tableau reference.
+_AZURE_MAP_DEFAULT_STYLE = "blank_accessible"
+_AZURE_MAP_POLYGON_STROKE = "#D9D9D9"
+
+
+def _azure_map_objects(ws, visual_type, shading_field=None):
+    """The ``objects`` block for an ``azureMap``, or ``None``.
+
+    Render-proven, not inferred. A 4-visual control page in Power BI Desktop established:
+
+    * ``azureMap`` with a Category renders basemap + bubbles;
+    * ``azureMap`` with a data-bound ``referenceLayer`` renders a real choropleth;
+    * a byte-identical ``shapeMap`` -- what this engine used to emit -- rendered **completely
+      blank**, on the same machine, same data, with the shared ``usa.states.topo`` resource.
+
+    Two pieces are non-obvious and were each proved by rendering:
+
+    * ``bubbleLayer.show = false`` is REQUIRED on a choropleth. Without it Azure Maps draws a bubble
+      on every state centroid ON TOP of the shaded polygons.
+    * ``referenceLayer`` is a TWO-entry array: entry ``[0]`` (no selector) carries the layer itself,
+      and entry ``[1]`` (a ``dataViewWildcard`` selector) carries the data-bound ``polygonFillColor``.
+      One merged entry does not shade.
+
+    The choropleth depends on a PUBLIC GeoJSON URL, so an offline or locked-down tenant must
+    re-point ``referenceLayerUrl`` -- the caller warns about exactly that.
+    """
+    controls = {
+        "showStylePicker": {"expr": {"Literal": {"Value": "false"}}},
+        "showNavigationControls": {"expr": {"Literal": {"Value": "false"}}},
+        "showSelectionControl": {"expr": {"Literal": {"Value": "false"}}},
+        "defaultStyle": {"expr": {"Literal": {
+            "Value": _semantic_string_literal(_AZURE_MAP_DEFAULT_STYLE)}}},
+    }
+    objects = {"mapControls": [{"properties": dict(controls)}]}
+
+    if visual_type == VT_MAP or shading_field is None:
+        # A symbol/bubble map keeps the bubble layer and gets NO reference layer: its geography is
+        # the point itself, not an area, so a polygon overlay would be an invention.
+        return objects
+
+    if _azure_map_state_grain(ws) is None:
+        # Only a US-state grain has a verified boundary file whose feature ``name`` matches Tableau's
+        # state captions. A coarser or non-US geography gets the basemap + bubbles rather than a
+        # polygon layer keyed on names we have not proven line up (fail-closed).
+        return objects
+
+    objects["mapControls"][0]["properties"]["autoZoomIncludesReferenceLayer"] = {
+        "expr": {"Literal": {"Value": "true"}}}
+    objects["bubbleLayer"] = [{"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}]
+    objects["referenceLayer"] = [
+        {"properties": {
+            "show": {"expr": {"Literal": {"Value": "true"}}},
+            "datasourceType": {"expr": {"Literal": {"Value": "'url'"}}},
+            "referenceLayerUrl": {"expr": {"Literal": {
+                "Value": _semantic_string_literal(_AZURE_MAP_US_STATES_GEOJSON)}}},
+            "unmappedObjectVisibility": {"expr": {"Literal": {"Value": "false"}}},
+            "polygonStrokeColor": {"solid": {"color": {"expr": {"Literal": {
+                "Value": _semantic_string_literal(_AZURE_MAP_POLYGON_STROKE)}}}}},
+            "polygonStrokeWidth": {"expr": {"Literal": {"Value": "1D"}}},
+        }},
+        {"properties": {
+            "polygonFillColor": {"solid": {"color": {"expr": {"FillRule": {
+                "Input": shading_field,
+                "FillRule": _azure_map_fill_rule(),
+            }}}}},
+        },
+         "selector": {"data": [{"dataViewWildcard": {"matchingOption": 1}}]}},
+    ]
+    return objects
+
+
+def _azure_map_state_grain(ws):
+    """The state-grain geo field for an azureMap choropleth, or ``None``.
+
+    Same granularity test the shapeMap path used: the reference boundary file IS US states, and its
+    feature ``name`` property is the full state name, which is what Tableau's state captions carry.
+    """
+    geo_levels = [g for g in (ws["encodings"].get("geo_levels") or [])
+                  if g.get("kind") == "category"]
+    finest = (max(geo_levels, key=lambda g: _geo_rank(g.get("geo_area")))
+              if geo_levels else ws["encodings"].get("detail"))
+    area = finest.get("geo_area") if finest else None
+    return finest if _geo_rank(area) == _GEO_GRANULARITY["state"] else None
+
+
+def _azure_map_fill_rule():
+    """The diverging ``linearGradient3`` an azureMap choropleth shades with.
+
+    Same palette and the same value-anchored ``mid`` the shapeMap path used -- orange (loss) ->
+    white (break-even, pinned to 0) -> blue (high) -- because Power BI otherwise auto-centres on the
+    DATA midpoint and paints break-even states orange on a mostly-positive measure. A fillRule stop
+    is an UNWRAPPED literal; the ``{"expr": ...}`` wrapper makes the stop fail to load and the
+    choropleth reverts to a flat fill.
+    """
+    return {
+        "linearGradient3": {
+            "min": {"color": {"Literal": {
+                "Value": _semantic_string_literal(_SHAPE_MAP_DIVERGING_MIN)}}},
+            "mid": {"color": {"Literal": {
+                "Value": _semantic_string_literal(_SHAPE_MAP_DIVERGING_MID)}},
+                "value": {"Literal": {"Value": _SHAPE_MAP_DIVERGING_CENTRE}}},
+            "max": {"color": {"Literal": {
+                "Value": _semantic_string_literal(_SHAPE_MAP_DIVERGING_MAX)}}},
+            "nullColoringStrategy": {"strategy": {"Literal": {"Value": "'asZero'"}}},
+        },
+    }
+
+
+def _merge_extra_objects(*blocks):
+    """Merge several ``extra_objects`` dicts, later keys winning. ``None`` when all are empty."""
+    out = {}
+    for block in blocks:
+        if block:
+            out.update(block)
+    return out or None
+
+
+def _azure_map_objects_for(ws, state, warnings):
+    """``extra_objects`` for a map worksheet, or ``None`` for anything that is not a map.
+
+    Pulls the shading measure's field expression straight out of the emitted ``Tooltips`` projection
+    -- that is the SAME expression the referenceLayer's ``FillRule.Input`` must name, so reading it
+    back from the query state guarantees the two agree rather than rebuilding it and hoping.
+    """
+    vt = ws.get("visual_type")
+    if vt not in (VT_SHAPE_MAP, VT_FILLED_MAP, VT_MAP):
+        return None
+    shading = None
+    for proj in ((state.get("Tooltips") or {}).get("projections") or []):
+        if proj.get("field"):
+            shading = proj["field"]
+            break
+    objects = _azure_map_objects(ws, vt, shading)
+    if objects and objects.get("referenceLayer"):
+        warnings.append(_warn(
+            "worksheet", ws["name"],
+            "map choropleth shades a PUBLIC GeoJSON boundary file "
+            f"({_AZURE_MAP_US_STATES_GEOJSON}) -- an offline or locked-down tenant must re-point "
+            "the visual's referenceLayerUrl at its own hosted copy"))
+    return objects
 
 
 def _shape_map_objects(ws):
@@ -11504,13 +11666,12 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 _applied_filter_config_for(
                     ws, _surfaced_filter_keys(ir.get("worksheets") or [], db),
                     model_table, field_map, warnings))
-            shape_objects = (_shape_map_objects(ws)
-                             if ws["visual_type"] == VT_SHAPE_MAP else None)
-            # A measure shapeMap needs its colour-saturation gradient written explicitly or
-            # Desktop renders a flat fill until the Value field is nudged off-and-on. Route it
-            # through the ``dataPoint`` channel (a measure choropleth has no categorical colours).
-            if ws["visual_type"] == VT_SHAPE_MAP and not data_point_objects:
-                data_point_objects = _shape_map_datapoint_objects()
+            shape_objects = None
+            # Every map is an azureMap now (shapeMap rendered blank; Bing map/filledMap are
+            # deprecated and pop a modal in Desktop). Its whole appearance -- basemap style, the
+            # data-bound referenceLayer choropleth, and the bubbleLayer suppression that stops a
+            # bubble being drawn on every centroid -- rides ``extra_objects``.
+            azure_objects = _azure_map_objects_for(ws, state, warnings)
             analytics_objects = _reference_line_analytics_objects(ws)
             lollipop_objects = _lollipop_objects(ws) if ws.get("lollipop") else None
             data_point_objects, lollipop_objects = _with_constant_mark_color(
@@ -11562,7 +11723,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 label_objects=label_objects, legend_objects=legend_objects,
                 shape_objects=shape_objects, card_label_objects=card_label_objects,
                 analytics_objects=analytics_objects,
-                font_objects=_grid_font_objects(ws), extra_objects=lollipop_objects,
+                font_objects=_grid_font_objects(ws),
+                extra_objects=_merge_extra_objects(lollipop_objects, azure_objects),
                 container_fill=ws.get("canvas_fill")))
             rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                     page_display=db["name"] or page_name,
@@ -11757,10 +11919,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         card_label_objects = _card_label_objects(ws, vtype)
         label_objects, dl_fact = _data_labels(ws, ws["visual_type"], warnings)
         flag_fc = _flag_filter_config_for(ir, ws["name"])
-        shape_objects = (_shape_map_objects(ws)
-                         if ws["visual_type"] == VT_SHAPE_MAP else None)
-        if ws["visual_type"] == VT_SHAPE_MAP and not data_point_objects:
-            data_point_objects = _shape_map_datapoint_objects()
+        shape_objects = None
+        azure_objects = _azure_map_objects_for(ws, state, warnings)
         analytics_objects = _reference_line_analytics_objects(ws)
         lollipop_objects = _lollipop_objects(ws) if ws.get("lollipop") else None
         data_point_objects, lollipop_objects = _with_constant_mark_color(
@@ -11809,7 +11969,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             label_objects=label_objects, shape_objects=shape_objects,
             card_label_objects=card_label_objects,
             analytics_objects=analytics_objects,
-            font_objects=_grid_font_objects(ws), extra_objects=lollipop_objects,
+            font_objects=_grid_font_objects(ws),
+                extra_objects=_merge_extra_objects(lollipop_objects, azure_objects),
             container_fill=ws.get("canvas_fill"))
         rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                 page_display=ws["name"],
