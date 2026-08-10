@@ -4312,3 +4312,67 @@ def test_short_names_are_untouched():
     # Never-regress: anything inside the cap keeps its exact name, so existing outputs do not churn.
     for nm in ("Superstore", "Sales Dashboard", "A" * me._MAX_FS_BASE):
         assert me._fs_safe(nm) == nm
+
+
+# -- published-datasource rebind: index every name the datasource answers to (issue #105) --------
+# A published datasource travels to a workbook as a `sqlproxy` stub whose caption is the
+# datasource's DISPLAY NAME on the server ("Meridian Sales (Live Snowflake)"), while the exported
+# .tds is usually named for the content ("MeridianSales.tds"). Keying the catalog only on the file
+# stem missed a match sitting right there, and the workbook was skipped ("relation 'sqlproxy' has no
+# resolvable columns") even though its datasource migrated successfully in the SAME RUN. Measured at
+# 9 of 38 workbooks on a live site -- and the fraction GROWS with governance, because a shared
+# published datasource is the recommended Tableau pattern.
+
+_PUB_TDS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource caption='Meridian Sales (Live Snowflake)' formatted-name='federated.mer1'
+            inline='true' version='18.1'>
+  <connection class='federated'><named-connections /></connection>
+</datasource>"""
+
+
+def test_catalog_aliases_cover_caption_and_formatted_name_not_just_the_file_stem():
+    aliases = me._datasource_catalog_aliases("MeridianSales", _PUB_TDS)
+    keys = {me._norm_ds(a) for a in aliases}
+    assert "meridiansales" in keys                      # the file stem
+    assert "meridiansaleslivesnowflake" in keys         # the published DISPLAY name the workbook uses
+    assert "federatedmer1" in keys                      # the internal name a <datasource name=> carries
+
+
+def test_catalog_aliases_degrade_to_the_file_name_when_the_tds_will_not_parse():
+    assert me._datasource_catalog_aliases("MeridianSales", "<not xml") == ["MeridianSales"]
+    assert me._datasource_catalog_aliases("MeridianSales", "") == ["MeridianSales"]
+
+
+def test_a_name_two_datasources_both_answer_to_is_withheld_not_resolved():
+    # Binding to whichever migrated LAST would attach a model with the wrong schema, and it would
+    # render perfectly -- so an ambiguous alias identifies neither and keeps the honest skip.
+    catalog = {}
+
+    def _record(name, text):
+        entry = {"name": name, "text": text, "safe_base": name,
+                 "flatfile_path": None, "table_csv_paths": None}
+        for alias in me._datasource_catalog_aliases(name, text):
+            key = me._norm_ds(alias)
+            if not key:
+                continue
+            if key in catalog and catalog[key].get("name") != name:
+                catalog[key] = me._AMBIGUOUS_CATALOG_ENTRY
+            elif key not in catalog or catalog[key] is me._AMBIGUOUS_CATALOG_ENTRY:
+                catalog[key] = entry
+        catalog[me._norm_ds(name)] = entry
+
+    shared = _PUB_TDS.replace("federated.mer1", "federated.other")
+    _record("SalesA", _PUB_TDS)
+    _record("SalesB", shared)
+    # both claim the same DISPLAY name -> that key is ambiguous
+    assert catalog[me._norm_ds("Meridian Sales (Live Snowflake)")].get("__ambiguous__") is True
+    # ...but each file's OWN name still resolves to itself
+    assert catalog[me._norm_ds("SalesA")]["name"] == "SalesA"
+    assert catalog[me._norm_ds("SalesB")]["name"] == "SalesB"
+
+
+def test_rebuild_from_published_match_treats_an_ambiguous_alias_as_a_miss():
+    detail = {"binding_signal": {"kind": "published",
+                                 "published_ds_name": "Meridian Sales (Live Snowflake)"}}
+    catalog = {me._norm_ds("Meridian Sales (Live Snowflake)"): me._AMBIGUOUS_CATALOG_ENTRY}
+    assert me._rebuild_from_published_match(detail, "<workbook/>", "M", catalog) is None

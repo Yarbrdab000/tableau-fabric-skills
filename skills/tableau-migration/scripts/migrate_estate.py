@@ -999,9 +999,30 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
         manual_followups=followups,
     )
     if ds_catalog is not None:
-        ds_catalog[_norm_ds(name)] = {"name": name, "text": text, "safe_base": safe_base,
-                                      "flatfile_path": flatfile_path,
-                                      "table_csv_paths": table_csv_paths}
+        entry = {"name": name, "text": text, "safe_base": safe_base,
+                 "flatfile_path": flatfile_path,
+                 "table_csv_paths": table_csv_paths}
+        # Index under EVERY name this datasource answers to, not just the one the file happens to be
+        # called. A published datasource travels to a workbook as a ``sqlproxy`` stub whose caption is
+        # the datasource's DISPLAY NAME on the server ("Meridian Sales (Live Snowflake)"), while the
+        # exported ``.tds`` is usually named for the content ("MeridianSales.tds") -- so keying only
+        # the file stem missed a match that was sitting right there, and the workbook was skipped
+        # ("relation 'sqlproxy' has no resolvable columns") even though its datasource had migrated
+        # successfully in the SAME RUN. Measured at 9 of 38 workbooks on a live site (issue #105), and
+        # the fraction GROWS with governance: a shared published datasource is the recommended
+        # Tableau pattern, so a well-run estate is mostly sqlproxy.
+        #
+        # A key that two different datasources both claim is AMBIGUOUS and is withheld rather than
+        # letting whichever migrated last win -- the same rule the field and row-count resolvers use.
+        for alias in _datasource_catalog_aliases(name, text):
+            key = _norm_ds(alias)
+            if not key:
+                continue
+            if key in ds_catalog and ds_catalog[key].get("name") != name:
+                ds_catalog[key] = _AMBIGUOUS_CATALOG_ENTRY
+            elif key not in ds_catalog or ds_catalog[key] is _AMBIGUOUS_CATALOG_ENTRY:
+                ds_catalog[key] = entry
+        ds_catalog[_norm_ds(name)] = entry      # the file's own name always wins for itself
     return detail
 
 
@@ -2513,6 +2534,38 @@ def _norm_ds(name):
     return re.sub(r"[^a-z0-9]", "", (name or "").lower())
 
 
+# A catalog key two different datasources both answer to. Recorded rather than resolved: binding a
+# workbook to whichever one migrated last would attach a model with the wrong schema, and it would
+# render perfectly. The lookup treats this exactly like a miss.
+_AMBIGUOUS_CATALOG_ENTRY = {"__ambiguous__": True}
+
+
+def _datasource_catalog_aliases(name, text):
+    """Every name a migrated datasource can legitimately be looked up by.
+
+    A published datasource is referenced from a workbook by its DISPLAY NAME on the server, which is
+    the ``.tds``'s own ``caption`` -- but the file it is exported to is usually named for the content
+    instead, so the file stem and the caption routinely differ. Indexing both (plus the internal
+    ``formatted-name``, which is what the workbook's ``<datasource name=...>`` carries) is what lets
+    the join happen at all; keying only the stem is why it did not.
+
+    Best-effort and never raises: a ``.tds`` that will not parse contributes only its file name.
+    """
+    aliases = [name]
+    try:
+        root = ET.fromstring((text or "").lstrip("\ufeff"))
+    except Exception:
+        return [a for a in aliases if a]
+    els = [root] if _local(root.tag) == "datasource" else []
+    els += [d for d in root.iter() if _local(d.tag) == "datasource"]
+    for el in els[:8]:
+        for attr in ("caption", "formatted-name", "name"):
+            val = (el.get(attr) or "").strip()
+            if val and val not in aliases:
+                aliases.append(val)
+    return [a for a in aliases if a]
+
+
 def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog, approved_calc_dax=None):
     """Rebuild a published-datasource workbook's model from the matching ALREADY-MIGRATED published
     datasource (its real schema) instead of the workbook's own unusable ``sqlproxy`` proxy stub --
@@ -2527,7 +2580,10 @@ def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog, appr
     if sig.get("kind") != "published":
         return None
     match = ds_catalog.get(_norm_ds(sig.get("published_ds_name")))
-    if not match:
+    if not match or match.get("__ambiguous__"):
+        # A name two migrated datasources both answer to identifies neither. Binding to whichever
+        # migrated last would attach a model with the WRONG schema, and it would render perfectly --
+        # so an ambiguous name keeps the honest skip.
         return None
     try:
         wb_calcs, _skipped, wb_dim_calcs = extract_calculations(twb_text, include_dimensions=True)
@@ -2895,7 +2951,7 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
         for _d in combine_datasources:
             cat = (ds_catalog or {}).get(
                 _norm_ds(_d.get("caption") or _d.get("name") or _d.get("label")))
-            if cat:
+            if cat and not cat.get("__ambiguous__"):
                 if cat.get("table_csv_paths"):
                     merged_local.update(cat["table_csv_paths"])
                 if ff_path is None and cat.get("flatfile_path"):
@@ -2909,7 +2965,7 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
         # <<< PATCH
     elif ds_catalog:
         cat = ds_catalog.get(_norm_ds(ds.get("caption") or ds.get("name") or label))
-        if cat:
+        if cat and not cat.get("__ambiguous__"):
             ff_path = cat.get("flatfile_path")
             local_data = cat.get("table_csv_paths")
     # Consolidated model (combined descriptor): migrate_datasource would auto-extract calcs scoped to

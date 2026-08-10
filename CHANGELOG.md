@@ -12,6 +12,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.121.0` -> `2.122.0`): a published datasource is indexed under EVERY
+  name it answers to, so a `sqlproxy` workbook binds the model its datasource just produced.** The
+  rebind machinery already existed; the JOIN did not fire. A published datasource travels to a
+  workbook as a `sqlproxy` stub whose caption is the datasource's DISPLAY NAME on the server
+  (`Meridian Sales (Live Snowflake)`), while the exported `.tds` is normally named for the content
+  (`MeridianSales.tds`) -- and the catalog was keyed on the FILE STEM alone, so
+  `meridiansaleslivesnowflake` missed `meridiansales` and the workbook was skipped with *"relation
+  'sqlproxy' has no resolvable columns"* while its datasource sat migrated in the same run.
+  Measured at **9 of 38 workbooks (24%)** on a live site (issue #105), and the fraction GROWS with
+  governance -- a shared published datasource is the recommended Tableau pattern, so a well-run
+  estate is mostly `sqlproxy`.
+  The catalog now indexes the file stem, the `.tds`'s own `caption`, and its `formatted-name`. A key
+  that two different datasources both answer to identifies neither, so it is **withheld** rather than
+  letting whichever migrated last win -- binding the wrong schema would render perfectly -- and every
+  lookup treats an ambiguous key exactly like a miss. Verified on the reported shape: a published
+  `.tds` plus the workbook that binds it now goes from `0/1` reports bound (`definition_of_done:
+  skipped`, no `.pbip`) to **1/1 bound, `pass`, and an openable project**, with the recovered model
+  carrying the real Snowflake-bound schema and the published datasource's own calculated field.
+
 - **tableau-migration (skill `2.120.0` -> `2.121.0`): a needs-decision message says WHICH kind of
   problem it is.** *"I cannot see the schema"* and *"I can see it but will not choose a storage mode
   for you"* read identically, and they need opposite responses from the operator (issue #109). The
