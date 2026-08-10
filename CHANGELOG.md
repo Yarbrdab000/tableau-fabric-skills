@@ -12,6 +12,29 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.115.0` -> `2.116.0`): a Tableau aggregation over a ROW-LEVEL SCALAR
+  is `n*k`, not `k` -- and two derivations of one calc are two columns, not one.** A calc built only
+  from parameters and literals references no column, so its value is identical on every row; Tableau
+  still evaluates it PER ROW and aggregates it on the shelf, so `SUM` is `n*k` while a DAX measure
+  evaluates once and returns `k`. Measured on Superstore (issue #103): the `OTE` table reported
+  **$142K against Tableau's $5.82M**, and because a `Sum` pill and an `Avg` pill over that one calc
+  resolved to the SAME measure reference, the second projection was de-duplicated away -- Tableau's
+  *Avg. OTE* column was **missing entirely**, on a visual the engine reported as `rebuilt`.
+  The model now emits `SUMX`/`COUNTX` companions for exactly the two derivations that differ
+  (`Avg`/`Min`/`Max` ARE the scalar, and keep binding the base measure), and the viz binder selects
+  the companion for the pill's own derivation. The companion iterates the calc's **own datasource
+  island** -- a global anchor counts another datasource's rows, which renders perfectly and is wrong
+  -- and is withheld entirely when the island does not name exactly one landed table, so an
+  ambiguous case keeps today's binding rather than inventing a number.
+  Root cause of the collapse was broader than the grain error: **the Measure Values path resolved its
+  members without any of the model's binding channels**, so every member fell back to the standing
+  caption resolution instead of the authoritative model measure. All four channels are now threaded
+  through it. Verified across every available workbook: 22 aggregated pills over parameter-only
+  scalars in **20 of 83** workbooks, 7 carrying the same scalar at two or more derivations. Corpus
+  29/29 with **zero** change to pages, visuals, projections or measure counts (the construct does not
+  occur there), and the reported workbook now emits both columns with `SUMX('Sales Commission.csv',
+  [OTE (Variable)])` for the `Sum` member.
+
 - **tableau-migration (skill `2.114.0` -> `2.115.0`): a row-level CONSTANT is a column of `k`, not
   `measure = k`.** Tableau evaluates a row-level calc once PER ROW and aggregates it on the shelf,
   so `SUM([Number of Records])` (formula `1`) is the row count -- but a DAX `measure = 1` evaluates

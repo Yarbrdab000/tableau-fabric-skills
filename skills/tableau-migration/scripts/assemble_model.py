@@ -1171,7 +1171,8 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    calc_lookup=None, approved_calc_dax=None, synth_measures=None,
                    known_tables=None, table_calc_usages=None, order_resolver=None,
                    flag_measures=None, resolve_for=None, inline_calcs=None,
-                   related_tables=None, conformed_hubs=None, calc_outer_aggs=None):
+                   related_tables=None, conformed_hubs=None, calc_outer_aggs=None,
+                   row_scalar_table=None):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
     ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
@@ -1568,6 +1569,35 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             translated_by=br.get("translated_by") or "deterministic (visual-calculation base measure)",
             format_string=_fmt(br["measure"]))
         report.append(br)
+    # Row-aggregated companions for ROW-LEVEL SCALAR calcs (parameter/literal arithmetic, no column
+    # reference). Tableau evaluates such a calc per row and aggregates it on the shelf, so its SUM is
+    # n*k while a DAX measure returns k -- and because a Sum pill and an Avg pill over the same calc
+    # both resolved to that one measure, the two shelf columns COLLAPSED into one. Emitted last so
+    # the companions see the final measure names and cannot collide with one.
+    _ds_by_calc = {}
+    for _c in (calcs or []):
+        for _k in ((_c.get("name") or "").strip().lower(),
+                   (_c.get("internal_name") or "").strip().strip("[]").lower()):
+            if _k:
+                _ds_by_calc.setdefault(_k, _c.get("datasource"))
+
+    def _row_scalar_table_for(row):
+        if not callable(row_scalar_table):
+            return row_scalar_table
+        src = row.get("source") or {}
+        for _k in ((row.get("measure") or "").strip().lower(),
+                   str(src.get("field_caption") or "").strip().lower(),
+                   str(src.get("calc_id") or "").strip().strip("[]").lower()):
+            if _k in _ds_by_calc:
+                return row_scalar_table({"datasource": _ds_by_calc[_k]})
+        return row_scalar_table({})
+
+    for sr in _scalar_row_aggregate_measures(report, _row_scalar_table_for):
+        sr["measure"] = _gen_measure(
+            sr["measure"], sr["tableau_formula"], sr["dax"],
+            translated_by=sr.get("translated_by") or "deterministic (row-aggregated scalar calc)",
+            format_string=_fmt(sr["measure"]))
+        report.append(sr)
     measures_tmdl = "".join(_measure_parts)
     return T.generate_measures_table_tmdl(measures_tmdl), report, suggestions
 
@@ -1608,6 +1638,11 @@ def _calc_bindings_index(measure_report):
             "measure_name": caption,
             "status": row.get("status"),
         }
+        # Row-aggregated companions for a row-level scalar calc, so the viz binder can bind the
+        # PILL's own derivation (a Sum pill over a scalar is n*k, not k) instead of collapsing every
+        # derivation onto the one scalar measure. Absent on every ordinary calc.
+        if isinstance(row.get("row_aggregates"), dict) and row["row_aggregates"]:
+            entry["row_aggregates"] = dict(row["row_aggregates"])
         if caption:
             bindings.setdefault(caption, entry)
         token = src.get("calc_instance_token")
@@ -1822,6 +1857,145 @@ def _visual_calc_base_measures(table_calc_usages, known_tables, existing_report)
             },
         })
     return rows
+
+
+_AGG_FUNC_IN_FORMULA_RE = re.compile(
+    r"\b(SUM|AVG|MIN|MAX|COUNT|COUNTD|MEDIAN|STDEV|STDEVP|VAR|VARP|ATTR|TOTAL|PERCENTILE"
+    r"|WINDOW_\w+|RUNNING_\w+|INDEX|RANK\w*|FIRST|LAST|SIZE|LOOKUP|PREVIOUS_VALUE)\s*\(",
+    re.IGNORECASE)
+_SCALAR_PARAM_REF_RE = re.compile(r"\[Parameters?\]\.\[[^\]]*\]", re.IGNORECASE)
+_ANY_FIELD_REF_RE = re.compile(r"\[[^\]]+\]")
+
+
+def _is_row_level_scalar_formula(formula):
+    """True for a Tableau formula that is row-level AND constant across rows.
+
+    That means: no aggregate/table-calc function anywhere, and every bracketed reference is a
+    ``[Parameters].[...]`` reference -- so the expression depends only on parameters and literals.
+    Such a calc has the same value on every row, yet Tableau still aggregates it on the shelf, so
+    ``SUM`` is ``n*k`` while the scalar itself is ``k``.
+
+    A BARE literal is excluded: that is the constant-column case (:func:`_is_row_level_constant_calc`),
+    which is handled more faithfully as a calculated column. A parameter-bearing scalar cannot take
+    that route -- a calculated column is materialised at refresh and would freeze against the
+    what-if slicer -- so it stays a measure and gets a row-aggregated companion instead.
+    """
+    text = (formula or "").strip()
+    if not text or _AGG_FUNC_IN_FORMULA_RE.search(text):
+        return False
+    if _ROW_LEVEL_CONSTANT_RE.match(text):
+        return False
+    stripped = _SCALAR_PARAM_REF_RE.sub(" ", text)
+    if "[Parameters]" in stripped or "[Parameter]" in stripped:
+        return False
+    if _ANY_FIELD_REF_RE.search(stripped):
+        return False
+    return bool(_SCALAR_PARAM_REF_RE.search(text))
+
+
+def _scalar_row_aggregate_measures(existing_report, table_for):
+    """Synthesize row-aggregated companions for calcs that are ROW-LEVEL SCALARS.
+
+    A Tableau calc built purely from parameters and literals -- e.g.
+    ``[Parameters].[Base Salary] + ([Parameters].[Commission Rate]*[Parameters].[New Quota])/100`` --
+    references no column, so its value is the same on every row. Tableau still evaluates it PER ROW
+    and applies the shelf aggregation, so ``SUM`` over n rows is ``n*k`` while ``AVG``/``MIN``/``MAX``
+    are ``k``. A DAX measure evaluates ONCE and returns ``k``, so the ``SUM`` pill silently reported
+    the per-row value: measured on Superstore (issue #103) the ``OTE`` table showed $142K against
+    Tableau's $5.82M -- and because both pills resolved to that one identical measure, the two
+    columns collapsed into one, so the second was not merely wrong but missing.
+
+    Only ``Sum`` and ``Count`` differ from the scalar itself, so only those get a companion
+    (``SUMX``/``COUNTX`` over the row set); ``Avg``/``Min``/``Max`` keep binding the base measure,
+    which is already exactly right. The companion is context-aware by construction: inside a visual
+    grouped by a dimension, ``SUMX`` iterates only that group's rows, reproducing Tableau's
+    per-partition aggregation rather than a global constant.
+
+    ``table_for`` maps a report row to the table its Tableau aggregation iterates -- the calc's own
+    DATASOURCE island, since a global anchor is the wrong table in a consolidated model. It returns
+    ``None`` when the island does not name exactly one table; no companion is emitted then and the
+    pill keeps binding the base measure, because guessing which table Tableau iterated would produce
+    a number that renders perfectly and is wrong.
+
+    Additive + fail-closed: returns ``[]`` when there is no row-level scalar calc, so an unaffected
+    workbook is byte-for-byte unchanged. The base row is annotated with ``row_aggregates`` so the viz
+    binder can pick the companion for the pill's own derivation.
+    """
+    existing_names = {(r.get("measure") or "").strip().lower() for r in (existing_report or [])}
+    rows = []
+    for row in existing_report or []:
+        if row.get("status") not in ("translated", "assisted-approved"):
+            continue
+        base = (row.get("measure") or "").strip()
+        if not base or not _is_row_level_scalar_formula(row.get("tableau_formula")):
+            continue
+        table = table_for(row) if callable(table_for) else table_for
+        if not table:
+            continue
+        companions = {}
+        for deriv, fn in (("Sum", "SUMX"), ("Count", "COUNTX")):
+            name = f"{base} (row {deriv.lower()})"
+            if name.strip().lower() in existing_names:
+                continue
+            existing_names.add(name.strip().lower())
+            companions[deriv] = name
+            rows.append({
+                "measure": name,
+                "status": "translated",
+                "reason": None,
+                "dax": f"{fn}('{table}', [{base}])",
+                "tableau_formula": f"{deriv.upper()}([{base}])",
+                "translated_by": "deterministic (row-aggregated scalar calc)",
+                "source": {
+                    "kind": "scalar_row_aggregate",
+                    "model_table": "_Measures",
+                    "field_caption": name,
+                    "base_measure": base,
+                    "fact_table": table,
+                    "intent": deriv.lower(),
+                },
+            })
+        if companions:
+            # Read by ``_calc_bindings_index`` -> ``measure_binding`` -> the viz binder, which swaps
+            # in the companion when the PILL's own derivation is one of these.
+            row["row_aggregates"] = companions
+    return rows
+
+
+def _row_scalar_table_resolver(relations, table_names):
+    """Build ``calc -> row table`` for the row-aggregated scalar companion, fail-closed.
+
+    A row-level scalar's Tableau aggregation iterates the rows of the calc's OWN datasource, so in a
+    consolidated multi-datasource model a global anchor is simply the wrong table (measured on
+    Superstore: the ``Sales Commission`` calc would have iterated ``Orders``). Relations carry
+    ``source_datasource``, so the calc's island names its tables directly.
+
+    Returns a callable yielding the island's table when that island contributes EXACTLY ONE table,
+    else the single data table when the whole model has only one, else ``None`` -- in which case no
+    companion is emitted and the pill keeps binding the base measure exactly as before. Guessing
+    which of several tables Tableau iterated would produce a number that renders perfectly and is
+    wrong, which is the failure mode this whole change exists to remove.
+    """
+    by_ds = {}
+    data_tables = [t for t in (table_names or []) if t != "_Measures"]
+    landed = set(data_tables)
+    for rel in relations or []:
+        ds = (rel.get("source_datasource") or "").strip()
+        disp = _table_display(rel)
+        # Only tables that actually LANDED count. An extracted datasource carries two relations for
+        # one logical table -- the live one and the ``Extract`` materialisation -- and just one of
+        # them becomes a model table; counting both would read as ambiguous and suppress the
+        # companion on exactly the single-table islands it is meant for.
+        if ds and disp and disp in landed:
+            by_ds.setdefault(ds, set()).add(disp)
+    only_table = data_tables[0] if len(data_tables) == 1 else None
+
+    def resolve(calc):
+        tables = by_ds.get(((calc or {}).get("datasource") or "").strip())
+        if tables and len(tables) == 1:
+            return next(iter(tables))
+        return only_table
+    return resolve
 
 
 def build_model_manifest(*, table_names, relations, measure_report, calc_column_report,
@@ -3612,6 +3786,9 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
         approved_calc_dax=approved_calc_dax, synth_measures=fp.get("measures"),
         known_tables=set(table_names), table_calc_usages=table_calc_usages,
+        # Resolves the row set a ROW-LEVEL SCALAR calc's Tableau aggregation iterates, per the
+        # calc's OWN datasource island -- a global anchor is the wrong table in a consolidated model.
+        row_scalar_table=_row_scalar_table_resolver(tables, table_names),
         # ADD #1's date-axis ORDERBY redirect is DISABLED. It rewrote a positional table-calc's
         # ORDERBY to the calendar key Date[Date] while the partition + inner aggregate stayed on the
         # fact (Orders), producing an OFFSET/WINDOW whose orderBy and partitionBy span two tables with

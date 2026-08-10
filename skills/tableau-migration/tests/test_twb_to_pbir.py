@@ -16,6 +16,7 @@ import geometry_audit
 
 from twb_to_pbir import (
     _row_count_column_target,
+    _resolve_measure_values,
     MEASURES_TABLE,    PAGE_HEIGHT,
     PAGE_WIDTH,
     SCHEMA_VISUAL,
@@ -1624,6 +1625,20 @@ def test_an_object_id_count_never_binds_to_a_constant_column():
     rc = {"kind": "object_id", "table": "Orders", "candidates": ["Orders"]}
     assert _row_count_column_target(
         rc, {"default_column": {"entity": "People", "column": "Number of Records"}}) is None
+
+
+def test_measure_values_members_receive_the_model_binding_channels():
+    # The Measure Values path resolved its members WITHOUT measure_binding, so every member fell back
+    # to the standing caption resolution instead of the authoritative model measure. Two pills over
+    # one calc at different derivations therefore produced the SAME reference and the second
+    # projection was de-duplicated away -- measured on Superstore (issue #103), Tableau's "Avg. OTE"
+    # column vanished entirely and the survivor reported the wrong grain.
+    import inspect
+    sig = inspect.signature(_resolve_measure_values)
+    for chan in ("measure_binding", "row_count_binding", "column_binding", "date_binding"):
+        assert chan in sig.parameters, chan
+    src = inspect.getsource(_resolve_measure_values)
+    assert "measure_binding=measure_binding" in src
 
 
 def test_real_countd_on_column_is_not_a_row_count():

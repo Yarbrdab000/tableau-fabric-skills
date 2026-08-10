@@ -1182,6 +1182,35 @@ def dax_safe_measure_name(name):
     return cleaned or text
 
 
+def _lookup_scalar_row_aggregate(measure_binding, field_id, base_id, caption, worksheet,
+                                 island, deriv):
+    """The row-aggregated companion measure for this pill's own derivation, or ``None``.
+
+    A Tableau calc built only from parameters and literals is row-level but constant across rows, so
+    Tableau's ``SUM`` of it is ``n*k`` while the DAX measure returns ``k``. The model emits a
+    ``SUMX``/``COUNTX`` companion for exactly the two derivations that differ; ``Avg``/``Min``/``Max``
+    are the scalar itself and keep binding the base measure.
+
+    This also un-collapses the shelf. Two pills over the same calc at different derivations used to
+    resolve to one identical measure reference, so the second projection was de-duplicated away --
+    measured on Superstore (issue #103), the ``OTE`` table lost Tableau's *Avg. OTE* column entirely
+    and reported the remaining one at the wrong grain.
+    """
+    if not measure_binding or not deriv:
+        return None
+    entries = _measure_binding_entries(measure_binding)
+    if not entries:
+        return None
+    for key in _measure_binding_candidate_keys(field_id, base_id, caption, worksheet, island):
+        entry = entries.get(key)
+        if not isinstance(entry, dict):
+            continue
+        alt = (entry.get("row_aggregates") or {}).get(deriv)
+        if alt:
+            return alt
+    return None
+
+
 def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
                    worksheet, warnings, warn_special=True, internal_fields=None,
                    date_binding=None, row_count_binding=None, measure_binding=None,
@@ -1225,6 +1254,15 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
                                      island=ds_caption.get(ds))
         if mb is not None:
             m_entity, m_measure = mb
+            # A ROW-LEVEL SCALAR calc (parameter/literal arithmetic, no column reference) is constant
+            # per row but still aggregated by Tableau on the shelf, so a Sum pill means n*k while the
+            # measure returns k. Bind this pill's OWN derivation to the model's row-aggregated
+            # companion when one exists; Avg/Min/Max are the scalar itself and keep the base measure.
+            _alt = _lookup_scalar_row_aggregate(measure_binding, field_id, base_id,
+                                                _mb_base.get("caption"), worksheet,
+                                                ds_caption.get(ds), deriv)
+            if _alt:
+                m_measure = _alt
             # Did the model translate THIS PILL'S OWN table calc, or only the base field under it?
             # The lookup tries the pill instance token FIRST, then falls back to the bare calc id /
             # caption -- so re-running it with the instance token ALONE answers the question exactly.
@@ -2496,7 +2534,9 @@ def _measure_value_member_ids(view, ds_default):
 
 
 def _resolve_measure_values(view, ds_default, base_cols, instances, index, ds_caption,
-                            worksheet, warnings, internal_fields=None):
+                            worksheet, warnings, internal_fields=None,
+                            measure_binding=None, row_count_binding=None, column_binding=None,
+                            date_binding=None):
     """Resolve the ordered Measure Values members to value fields.
 
     Drops numeric-literal dummy spacers (the path-hack constant). Returns
@@ -2515,7 +2555,10 @@ def _resolve_measure_values(view, ds_default, base_cols, instances, index, ds_ca
         if _is_param_swap(formula):
             has_param_swap = True
         f = _resolve_field(ds, fid, base_cols, instances, index, ds_caption,
-                           worksheet, warnings, internal_fields=internal_fields)
+                           worksheet, warnings, internal_fields=internal_fields,
+                           measure_binding=measure_binding,
+                           row_count_binding=row_count_binding,
+                           column_binding=column_binding, date_binding=date_binding)
         if f and f["kind"] == "value":
             members.append(f)
     return members, dummy_count, has_param_swap, status
@@ -4480,7 +4523,14 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         locs = _mv_shelf_locations(rows_text, cols_text, pane)
         members, dummy_count, has_param_swap, mv_status = _resolve_measure_values(
             view, ds_default, base_cols, instances, index, ds_caption, name, warnings,
-            internal_fields=internal_fields)
+            internal_fields=internal_fields,
+            # The Measure Values path used to resolve its members WITHOUT the model's binding
+            # channels, so every member fell back to the standing caption resolution instead of the
+            # authoritative model measure -- which is how two pills over one calc at different
+            # derivations collapsed into a single identical reference (issue #103: Tableau's
+            # "Avg. OTE" column vanished and the survivor reported the wrong grain).
+            measure_binding=measure_binding, row_count_binding=row_count_binding,
+            column_binding=column_binding, date_binding=date_binding)
         visual_type, inject_shelf, fidelity_note = _route_measure_values(
             mark, locs, members, dummy_count, has_param_swap, mv_status,
             dims_rows, dims_cols, name, warnings)

@@ -1885,6 +1885,68 @@ def test_row_count_column_default_is_withheld_when_several_constants_compete():
     assert "default_column" not in got
 
 
+def test_is_row_level_scalar_formula_accepts_parameter_arithmetic_and_nothing_else():
+    # A calc built only from parameters and literals is row-level AND constant per row: Tableau
+    # evaluates it once per row and aggregates on the shelf, so SUM is n*k while a DAX measure
+    # returns k. That is the class this detects.
+    assert am._is_row_level_scalar_formula(
+        "[Parameters].[Base Salary] + ([Parameters].[Commission Rate]*[Parameters].[New Quota])/100")
+    assert am._is_row_level_scalar_formula("[Parameters].[Target] * 2")
+    # anything touching a COLUMN varies by row on its own -- ordinary measure semantics apply
+    assert not am._is_row_level_scalar_formula("[Sales] - [Cost]")
+    assert not am._is_row_level_scalar_formula("[Sales] * [Parameters].[Rate]")
+    # an aggregate is already grain-correct as a measure
+    assert not am._is_row_level_scalar_formula("SUM([Sales]) - MIN([Parameters].[Goal])")
+    assert not am._is_row_level_scalar_formula("WINDOW_AVG(SUM([Sales]))")
+    # a BARE literal is the calculated-column case, handled more faithfully there
+    assert not am._is_row_level_scalar_formula("1")
+    assert not am._is_row_level_scalar_formula("")
+
+
+def test_scalar_row_aggregate_emits_sum_and_count_companions_over_the_calcs_own_island():
+    # SUM of a row-level scalar is n*k. The companion iterates the calc's OWN datasource island --
+    # a global anchor would count another datasource's rows, which renders perfectly and is wrong.
+    rep = [{"measure": "OTE (Variable)", "status": "translated",
+            "tableau_formula": "[Parameters].[Base] + [Parameters].[Rate]"}]
+    rows = am._scalar_row_aggregate_measures(rep, lambda r: "Sales Commission.csv")
+    dax = {r["measure"]: r["dax"] for r in rows}
+    assert dax["OTE (Variable) (row sum)"] == "SUMX('Sales Commission.csv', [OTE (Variable)])"
+    assert dax["OTE (Variable) (row count)"] == "COUNTX('Sales Commission.csv', [OTE (Variable)])"
+    # the base row now tells the viz binder which companion answers which derivation. Avg/Min/Max
+    # are the scalar itself, so they are deliberately absent and keep binding the base measure.
+    assert rep[0]["row_aggregates"] == {"Sum": "OTE (Variable) (row sum)",
+                                        "Count": "OTE (Variable) (row count)"}
+
+
+def test_scalar_row_aggregate_is_withheld_when_the_row_table_is_ambiguous():
+    # Fail-closed. Guessing which table Tableau iterated produces a number that renders perfectly
+    # and is wrong -- exactly the failure this change exists to remove -- so no companion is emitted
+    # and the pill keeps binding the base measure.
+    rep = [{"measure": "Goal", "status": "translated",
+            "tableau_formula": "[Parameters].[Target]"}]
+    assert am._scalar_row_aggregate_measures(rep, lambda r: None) == []
+    assert "row_aggregates" not in rep[0]
+
+
+def test_row_scalar_table_resolver_ignores_a_relation_that_never_landed():
+    # An EXTRACTED datasource carries two relations for one logical table -- the live one and the
+    # ``Extract`` materialisation -- but only one becomes a model table. Counting both would read as
+    # ambiguous and suppress the companion on exactly the single-table islands it is meant for.
+    relations = [{"source_datasource": "Sales Commission", "kind": "table",
+                  "name": "Sales Commission.csv"},
+                 {"source_datasource": "Sales Commission", "kind": "table", "name": "Extract"},
+                 {"source_datasource": "Superstore", "kind": "table", "name": "Orders"},
+                 {"source_datasource": "Superstore", "kind": "table", "name": "People"}]
+    resolve = am._row_scalar_table_resolver(
+        relations, ["Orders", "People", "Sales Commission.csv", "_Measures"])
+    assert resolve({"datasource": "Sales Commission"}) == "Sales Commission.csv"
+    # a multi-table island stays ambiguous -> no companion
+    assert resolve({"datasource": "Superstore"}) is None
+    # an unknown island falls back to the model's single data table when there is exactly one
+    single = am._row_scalar_table_resolver([], ["Orders", "_Measures"])
+    assert single({"datasource": "anything"}) == "Orders"
+
+
 
 #    real assemble_model resolver. LIVE_SQLSERVER lacks State + City, so the detector (which resolves
 #    its fields against the model) could not fire there; this minimal model carries them. This is the
