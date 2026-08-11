@@ -1936,6 +1936,84 @@ def _composite_key_columns_tmdl(specs, known_tables):
     return by_table
 
 
+def _guard_bidirectional_ambiguity(rels):
+    """Demote ``cross_filter='both'`` wherever it would give Power BI two filter paths.
+
+    Bidirectional filtering is what reproduces a Tableau physical join, but Power BI REFUSES to load
+    a model containing an ambiguous path -- two routes for a filter to travel between the same pair of
+    tables -- and refusing means the project does not open at all. So this runs over the FULL
+    relationship set, after the generated Date dimension exists, because Date is the usual culprit.
+
+    Direction is what makes the difference, and it is why the one-directional model loads today with
+    the very same tables. A single-direction relationship propagates only ``to`` -> ``from``
+    (lookup -> fact), so several facts hanging off one Date hub is unambiguous: nothing travels back
+    UP into Date. Turn a fact<->fact join bidirectional and a filter can now leave Date, cross into a
+    fact, and walk onwards -- and if two such walks reach the same table, the model is refused.
+    Measured on a Salesforce case-management workbook: *"There are ambiguous paths between 'Contact'
+    and 'Date': 'Contact'->'pmdm__ProgramEngagement__c'->'pmdm__ServiceDelivery__c'->'Date' and
+    'Contact'->'caseman__CasePlan__c'->'caseman__Goal__c'->'Date'"*.
+
+    So the graph is built with bidirectional edges UNDIRECTED (a filter may cross either way) and
+    single-direction edges as themselves, and bidirectional edges are accepted greedily only while
+    the undirected union stays a FOREST. Union-find, so the outcome is deterministic in input order.
+    Inactive relationships are ignored entirely: they carry no filter until ``USERELATIONSHIP``
+    activates them, so they cannot create a path.
+
+    A demoted relationship is never lost -- it still filters lookup -> fact exactly as it did before
+    this behaviour existed. Each demotion is returned so the fallback (wrapping the affected measure
+    in ``CALCULATE(..., CROSSFILTER(..., BOTH))``) is a visible decision rather than a silent one.
+    """
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return False
+        parent[ra] = rb
+        return True
+
+    out, warnings = [], []
+    # Bidirectional candidates are offered to the forest FIRST: they carry real Tableau join
+    # semantics, whereas a single-direction edge is unambiguous wherever it lands.
+    for r in rels:
+        if r.get("is_active") is False or r.get("cross_filter") != "both":
+            continue
+        a, b = str(r.get("from_table", "")).lower(), str(r.get("to_table", "")).lower()
+        if not union(a, b):
+            r["_demote_bidi"] = True
+    for r in rels:
+        if r.get("is_active") is False or r.get("cross_filter") == "both":
+            continue
+        a, b = str(r.get("from_table", "")).lower(), str(r.get("to_table", "")).lower()
+        if a and b and not union(a, b):
+            # This single edge closes a loop that a bidirectional edge already spans, so the pair is
+            # reachable two ways. Single edges cannot be demoted (they are the only join there is),
+            # so every bidirectional edge in that component gives way.
+            for other in rels:
+                if other.get("cross_filter") == "both" and find(
+                        str(other.get("from_table", "")).lower()) == find(a):
+                    other["_demote_bidi"] = True
+    for r in rels:
+        if r.pop("_demote_bidi", False):
+            r = dict(r)
+            r.pop("cross_filter", None)
+            warnings.append(
+                "physical join '%s' -> '%s' stays one-directional: making it bidirectional would "
+                "create a second filter path, which Power BI rejects as ambiguous (the project would "
+                "not open). A measure aggregating '%s' broken down by '%s' returns the grand total "
+                "unless wrapped in CALCULATE(..., CROSSFILTER(..., BOTH))."
+                % (r.get("from_table"), r.get("to_table"), r.get("to_table"), r.get("from_table")))
+        out.append(r)
+    return out, warnings
+
+
 def _boolean_colour_twin_measures(existing_report):
     """A hex-returning colour twin for every BOOLEAN measure -> ``[report rows]``.
 
@@ -2384,6 +2462,59 @@ def _select_primary_date(date_cols):
 
     hints = [c for c in date_cols if _is_primary_name(c)]
     return hints[0] if len(hints) == 1 else None
+
+
+def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date=True,
+                           mode="import", date_range=None):
+    """One Date dimension PER DATASOURCE ISLAND -> ``([(name, part)], rels, report)``.
+
+    A workbook with several datasources keeps them as ISLANDS: Tableau never lets one datasource's
+    filters reach another's marks. A single shared calendar related to facts in every island breaks
+    that in the quietest possible way -- a date slicer silently filters all four dashboards' visuals
+    at once -- and it is also the usual cause of the ambiguous-path refusal that stops the whole
+    project opening, because one hub touching every island manufactures second routes between tables
+    that are otherwise a clean star.
+
+    It is redundant besides. Tableau's own mechanism for a filter that spans datasources is a
+    PARAMETER, not a shared dimension -- parameters are global and belong to no datasource -- and
+    that already translates: a date-window parameter lands as a disconnected what-if table whose
+    ``[Start Date Value]`` / ``[End Date Value]`` measures are read by each island's own row-filter
+    flag measure. So the cross-island date filter keeps working with no relationship at all, which is
+    exactly how the source behaved.
+
+    Islands come from each relation's ``source_datasource`` tag (stamped by ``combine_descriptors``).
+    A descriptor with fewer than two distinct tags -- every single-datasource workbook, and the whole
+    existing corpus -- takes the original single-calendar path with the original ``"Date"`` name, so
+    its output is byte-identical.
+    """
+    islands = []
+    for rel in tables or []:
+        ds = (rel.get("source_datasource") or "").strip()
+        if ds and ds not in islands:
+            islands.append(ds)
+    if len(islands) < 2:
+        name, part, rels, report = _build_date_dimension(
+            tables, emitted_names, relationships, mark_as_date=mark_as_date, mode=mode,
+            date_range=date_range)
+        return ([(name, part)] if part is not None else []), rels, report
+
+    built, all_rels, reports = [], [], []
+    taken = list(emitted_names)
+    for ds in islands:
+        own = [r for r in tables if (r.get("source_datasource") or "").strip() == ds]
+        if not own:
+            continue
+        name, part, rels, report = _build_date_dimension(
+            own, taken, relationships, mark_as_date=mark_as_date,
+            name_pref="Date (%s)" % ds, mode=mode, date_range=date_range)
+        if part is None:
+            continue
+        built.append((name, part))
+        taken.append(name)
+        all_rels.extend(rels)
+        reports.append(dict(report, island=ds))
+    return built, all_rels, {"generated": bool(built), "per_island": True,
+                             "tables": [n for n, _ in built], "islands": reports}
 
 
 def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=True,
@@ -3667,17 +3798,30 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     date_name = None
     active_date_cols = set()
     if date_table:
-        date_name, date_part, date_rels, date_report = _build_date_dimension(
+        _date_built, date_rels, date_report = _build_date_dimensions(
             tables, table_names, all_rels, mark_as_date=mark_as_date, mode=mode,
             date_range=date_range)
-        if date_part is not None:
-            parts[f"definition/tables/{date_name}.tmdl"] = date_part
-            table_names.append(date_name)
+        for _dn, _dp in _date_built:
+            parts[f"definition/tables/{_dn}.tmdl"] = _dp
+            table_names.append(_dn)
+        if _date_built:
+            # ``date_name`` stays the FIRST calendar for every downstream consumer that assumes a
+            # single one (date-hierarchy wiring, the model manifest). With one island -- every
+            # single-datasource workbook -- that is the only calendar, exactly as before.
+            date_name = _date_built[0][0]
             all_rels = all_rels + date_rels
             active_date_cols = {(r["from_table"], r["from_col"])
                                 for r in date_rels if r.get("is_active")}
         else:
             date_name = None
+
+    # Bidirectional cross-filtering must be demoted wherever it would give Power BI two filter paths,
+    # and that can only be judged HERE -- the generated Date dimension is the usual culprit and does
+    # not exist until the block above has run. Measured: 23 bidirectional physical joins loaded fine
+    # in isolation, then Desktop refused the whole project with *"There are ambiguous paths between
+    # 'Contact' and 'Date'"*, because Date reaches Contact via both
+    # Date->ServiceDelivery->ProgramEngagement->Contact and Date->Goal->CasePlan->Contact.
+    all_rels, _amb_warnings = _guard_bidirectional_ambiguity(all_rels)
 
     # ----- Parameter wiring (field swaps -> field parameters; value params -> what-if tables) -----
     # Build the swap/param model objects BEFORE translating calcs so a consumed swap is excluded

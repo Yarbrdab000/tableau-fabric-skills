@@ -12,6 +12,46 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.128.0` -> `2.129.0`): a Tableau physical join is one flat rowset, so
+  it must filter both ways — plus per-island calendars and two hard formatting errors.** A reader's
+  Salesforce case-management workbook rebuilt with *every number on its headline chart wrong*, and
+  the cause was one architectural mismatch repeated everywhere.
+  **Physical joins now cross-filter bidirectionally.** Tableau's model has two layers that map onto
+  Power BI exactly: a **physical join** (`<relation type='join'>`) pre-joins rows into ONE
+  denormalized rowset so a filter on any column restricts every column, while a **logical
+  relationship** (the 2020.2+ "noodle") joins per query exactly as a Power BI relationship does. Both
+  were emitted one-directional. Because a Power BI relationship propagates only lookup -> fact, any
+  measure aggregating a lookup-side column and broken down by a fact-side column silently returned
+  the GRAND TOTAL on every mark — validating clean and rendering fine. Measured: "Clients by
+  Engagement Stage" read 2,638 on all seven bars instead of 708/85/30/25/24/20/17. Emitting
+  `crossFilteringBehavior: bothDirections` for physical joins only fixes every number with **no change
+  to any measure**. Logical relationships are untouched.
+  **An ambiguity guard, because Power BI refuses ambiguous models outright.** The first attempt marked
+  23 joins bidirectional and Desktop rejected the entire project: *"There are ambiguous paths between
+  'Contact' and 'Date'"*. Direction is what makes that possible — several facts on one Date hub is
+  unambiguous one-directionally because nothing travels back UP into Date. So the guard runs over the
+  FULL relationship set, after the generated calendar exists, keeping bidirectional edges only while
+  they form a forest; inactive relationships are ignored (they carry no filter). A demoted
+  relationship still filters lookup -> fact exactly as before and is reported, so the per-measure
+  `CROSSFILTER` fallback is a visible choice.
+  **One Date dimension per datasource island.** Separate Tableau datasources are islands — one never
+  filters another — but a single shared calendar related to facts in every island meant a date slicer
+  silently filtered all four dashboards at once. It was redundant too: Tableau's mechanism for a
+  cross-datasource filter is a **parameter**, which already translates (a disconnected what-if table
+  whose `[Start Date Value]`/`[End Date Value]` measures each island's own row-filter flag reads), so
+  splitting the calendar removes a filter path Tableau never had. Fewer than two islands takes the
+  original single-calendar path under the original `Date` name, so single-datasource workbooks are
+  byte-identical.
+  **Two hard formatting errors fixed.** An `azureMap` has no `dataPoint` object at all — its marks are
+  drawn by layers — so a flat mark colour there was `PBIR_FORMATTING_PROP_UNKNOWN`, an **error** that
+  fails the whole report rather than losing one colour (5 of them on the reporter's workbook). It now
+  rides `bubbleLayer.fillColor`. Separately, and pre-existing since long before this release, Power BI
+  does not agree with itself on what transparency is called: a bar/column/pie fill is
+  `fillTransparency`, an area/line surface is `transparency`, and scatter/funnel have neither. The name
+  is now taken per visual type from the visual catalog, and a flat colour is dropped entirely for
+  `treemap`/`waterfallChart`/`azureMap`, which have no `dataPoint.defaultColor`. This took the corpus
+  from 28/29 to **29/29 validating with zero errors**.
+
 - **tableau-migration (skill `2.127.0` -> `2.128.0`): aggregating a table-scoped LOD is Tableau
   syntax, not arithmetic — so the DAX drops it.** The reporter's workbook highlights its best
   sub-category with

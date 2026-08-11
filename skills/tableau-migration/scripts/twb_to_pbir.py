@@ -8894,6 +8894,34 @@ def _mark_transparency_pct(table):
     return pct if pct > 0 else None
 
 
+_DATAPOINT_TRANSPARENCY_PROP = {
+    # Power BI does NOT agree with itself on what "transparency" is called, and using the wrong name
+    # is a HARD validation error (``PBIR_FORMATTING_PROP_UNKNOWN``) that fails the entire report
+    # rather than losing one property. Taken verbatim from the visual catalog
+    # (``powerbi-report-author formatting describe-object <type> dataPoint``), not inferred:
+    # a bar/column/pie fill uses ``fillTransparency``; an area/line surface uses ``transparency``.
+    "clusteredColumnChart": "fillTransparency",
+    "clusteredBarChart": "fillTransparency",
+    "barChart": "fillTransparency",
+    "columnChart": "fillTransparency",
+    "hundredPercentStackedBarChart": "fillTransparency",
+    "hundredPercentStackedColumnChart": "fillTransparency",
+    "pieChart": "fillTransparency",
+    "donutChart": "fillTransparency",
+    "ribbonChart": "fillTransparency",
+    "areaChart": "transparency",
+    "stackedAreaChart": "transparency",
+    "lineChart": "transparency",
+    "lineClusteredColumnComboChart": "transparency",
+    "lineStackedColumnComboChart": "transparency",
+    # scatterChart / funnel expose no dataPoint transparency at all -> omitted deliberately.
+}
+
+# Visual types whose ``dataPoint`` object has no ``defaultColor`` property. Emitting one is a hard
+# validation error, so a flat mark colour is dropped for these rather than failing the report.
+_NO_DATAPOINT_DEFAULT_COLOR = frozenset({"treemap", "waterfallChart", "azureMap"})
+
+
 def _constant_mark_color_objects(ws, pbir_vtype=None):
     """The worksheet's flat mark colour as PBIR format objects, keyed by object name, or ``None``.
 
@@ -8913,10 +8941,26 @@ def _constant_mark_color_objects(ws, pbir_vtype=None):
     if not color:
         return None
     lit = {"solid": {"color": {"expr": {"Literal": {"Value": f"'{color}'"}}}}}
+    if pbir_vtype == "azureMap":
+        # An azureMap has NO ``dataPoint`` object at all -- its marks are drawn by layers, so the
+        # cartesian channel is not merely ineffective here, it is a HARD validation error
+        # (``PBIR_FORMATTING_PROP_UNKNOWN`` on both ``dataPoint.defaultColor`` and
+        # ``dataPoint.transparency``), which fails the whole report rather than just losing a colour.
+        # The bubble layer owns the fill, so the flat mark colour rides ``bubbleLayer.fillColor``.
+        # Transparency is deliberately dropped rather than guessed onto the layer: the map's own
+        # default opacity is a defensible rendering, an invented property name is not.
+        return {"bubbleLayer": [{"properties": {"fillColor": lit}}]}
+    if pbir_vtype in _NO_DATAPOINT_DEFAULT_COLOR:
+        # No dataPoint.defaultColor on this visual -- emitting one is a hard validation error, and
+        # losing a flat colour is strictly better than losing the report.
+        return None
     props = {"defaultColor": lit}
     tpct = ws.get("mark_transparency")
     if tpct:
-        props["transparency"] = {"expr": {"Literal": {"Value": "%dD" % tpct}}}
+        # Named per visual type; omitted entirely where the visual has no such property.
+        tprop = _DATAPOINT_TRANSPARENCY_PROP.get(pbir_vtype)
+        if tprop:
+            props[tprop] = {"expr": {"Literal": {"Value": "%dD" % tpct}}}
     objs = {"dataPoint": [{"properties": props}]}
     if pbir_vtype in _STROKE_COLOR_VTYPES:
         objs["lineStyles"] = [{"properties": {
