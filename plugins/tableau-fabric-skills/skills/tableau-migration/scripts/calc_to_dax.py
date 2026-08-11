@@ -2345,10 +2345,33 @@ class _Parser:
             # aggregation -> fall back rather than emit a window Tableau never computes.
             raise _CalcError("re-aggregating an EXCLUDE LOD is not supported")
         if not cols:
-            # A table-scoped LOD is already a single value evaluated over the whole table;
-            # re-aggregating it has no SUMMARIZE grain to iterate, so fall back rather than emit
-            # a degenerate window.
-            raise _CalcError("re-aggregating a table-scoped LOD is not supported")
+            # A TABLE-SCOPED LOD is one value for the WHOLE table, so it is coarser than every
+            # possible view grain -- and Tableau documents that the outer aggregation is then simply
+            # discarded: *"When no aggregation is needed (because the expression's level of detail is
+            # coarser than the view's), the aggregation you specified is still shown when the
+            # expression is on a shelf, but it is IGNORED."* (Tableau Help, "How Level of Detail
+            # Expressions Work"). The same page explains why the wrapper is there at all: Tableau
+            # *"always automatically wraps LOD expressions in an aggregate"* to satisfy its
+            # aggregate/non-aggregate mixing rule, so `SUM({MAX({FIXED [Sub-Category] : SUM([Profit])})})`
+            # is an inert SUM around a scalar, NOT an instruction to add anything up.
+            #
+            # This is the one case where the collapse is unconditionally safe. The notorious "SUM of a
+            # FIXED LOD multiplies by the row count" gotcha needs a grain BETWEEN row level and the
+            # view -- a partly-replicated value that a real SUM then double-counts. A table-scoped LOD
+            # has no such middle grain: it is the coarsest value there is, identical on every row, so
+            # no view can make the wrapper meaningful. Which outer aggregate was written is therefore
+            # irrelevant, and it is dropped rather than modelled.
+            #
+            # DAX needs no equivalent wrapper -- a measure is already scalar in its filter context --
+            # so this emits exactly the bare table-scoped form, `CALCULATE(inner, ALL('T'))`. ALL (not
+            # ALLSELECTED) is what makes it faithful: FIXED *"ignores all the filters in the view other
+            # than context filters, data source filters, and extract filters"*, because it is evaluated
+            # BEFORE dimension filters in Tableau's order of operations. The sibling table-calc idiom
+            # (`WINDOW_MAX`) is the one that follows the visible marks, and it maps to ALLSELECTED --
+            # see ``table_calc_to_dax``. Two Tableau constructs, two DIFFERENT DAX functions.
+            if kind != "FIXED":
+                raise _CalcError("re-aggregating a table-scoped %s LOD is not supported" % kind)
+            return (f"CALCULATE({inner[0]}, ALL({_dax_table(table)}))", inner[1])
         if outer_agg in ("SUM", "AVG", "MEDIAN") and inner[1] != "number":
             raise _CalcError(f"{outer_agg} over an LOD requires a numeric inner expression")
         if outer_agg in ("MIN", "MAX") and inner[1] not in ("number", "date"):

@@ -12,6 +12,39 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.127.0` -> `2.128.0`): aggregating a table-scoped LOD is Tableau
+  syntax, not arithmetic — so the DAX drops it.** The reporter's workbook highlights its best
+  sub-category with
+  `IF SUM([Profit]) = SUM({MAX({FIXED [Sub-Category] : SUM([Profit])})}) THEN TRUE ELSE FALSE END`,
+  and the engine stubbed it on *"re-aggregating a table-scoped LOD is not supported"* — so that bar
+  chart shipped one flat colour while its sibling sheet, which expresses the identical intent as a
+  table calculation (`WINDOW_MAX(SUM([Profit]))`), highlighted correctly.
+  **The outer aggregate is inert, and Tableau documents both halves of that.** It is present only
+  because *"Level of detail expressions are always automatically wrapped in an aggregate when they
+  are added to a shelf in the view"* — Tableau's aggregate/non-aggregate mixing rule needs a wrapper
+  and Tableau types one in for you. And it computes nothing because *"When no aggregation is needed
+  (because the expression's level of detail is coarser than the view's), the aggregation you
+  specified is still shown when the expression is on a shelf, but it is ignored."* A **table-scoped**
+  LOD is the coarsest value that exists — one number for the whole table, identical on every row — so
+  it is coarser than every possible view grain and that clause always holds. Which outer aggregate
+  was written is therefore irrelevant, and it is discarded rather than modelled.
+  **This is the one LOD shape where the collapse is unconditionally safe**, which is what keeps the
+  notorious "SUM of a FIXED LOD multiplies by the row count" gotcha out of scope: that needs a grain
+  BETWEEN row level and the view — a partly-replicated value a real SUM then double-counts — and a
+  table-scoped LOD has no such middle grain. A *dimensioned* LOD still takes the SUMMARIZE
+  re-aggregation path untouched, and re-aggregating a table-scoped INCLUDE/EXCLUDE still falls back,
+  since the justification is FIXED's semantics specifically.
+  **ALL, not ALLSELECTED — and the same workbook proves the difference is real.** FIXED *"ignores all
+  the filters in the view other than context filters, data source filters, and extract filters"*
+  because Tableau evaluates it before dimension filters, so it maps to `ALL`; `WINDOW_MAX` runs over
+  the marks in the partition, so it maps to `ALLSELECTED`. Identical unfiltered, divergent the moment
+  a reader touches a slicer — two Tableau constructs, two different DAX functions.
+  Emits `CALCULATE(MAXX(SUMMARIZE('Orders', 'Orders'[Sub-Category]), CALCULATE(SUM('Orders'[Profit]))),
+  ALL('Orders'))`. Rendered in Power BI Desktop against a refreshed model, the collapsed LOD and the
+  table-calc sibling independently highlight the same bar — the cross-check that the collapse really
+  computes what Tableau computed. No corpus workbook used this shape (61 stubbed calcs before and
+  after, 29/29 fixtures), which is exactly why it survived to a reader.
+
 - **tableau-migration (skill `2.126.0` -> `2.127.0`): a boolean on the Colour shelf stops killing the
   visual, and a multi-dimension scatter stops losing its grain.** Two defects a reader supplied a
   workbook for, both of which shipped clean through validation:

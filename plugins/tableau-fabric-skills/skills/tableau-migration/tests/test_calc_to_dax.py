@@ -338,7 +338,6 @@ FALLBACKS = [
     "{EXCLUDE [Region], [People Count] : SUM([Sales])}",  # cross-table EXCLUDE dimensions
     "COUNTD({INCLUDE [Region] : SUM([Sales])})",  # COUNTD cannot re-aggregate an LOD
     "{FIXED [Region] : [Sales]}",                 # bare row-level inner (not aggregated)
-    "SUM({SUM([Sales])})",                        # re-aggregating a table-scoped LOD has no grain
     "COUNTD({FIXED [Region] : SUM([Sales])})",    # COUNTD cannot re-aggregate an LOD
     "{FIXED [Region], [People Count] : SUM([Sales])}",            # cross-table LOD dimensions
     "AVG({FIXED [Region], [Order Date] : MAX({FIXED [Region] : SUM([Sales])})})",  # nested non-superset
