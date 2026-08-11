@@ -1598,6 +1598,13 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             translated_by=sr.get("translated_by") or "deterministic (row-aggregated scalar calc)",
             format_string=_fmt(sr["measure"]))
         report.append(sr)
+    # Colour twins for boolean measures -- the editable, grain-preserving way to rebuild Tableau's
+    # discrete colour encoding. Emitted last so they see every final measure name and cannot collide.
+    for cr in _boolean_colour_twin_measures(report):
+        cr["measure"] = _gen_measure(
+            cr["measure"], cr["tableau_formula"], cr["dax"],
+            translated_by=cr.get("translated_by") or "deterministic (discrete colour measure)")
+        report.append(cr)
     measures_tmdl = "".join(_measure_parts)
     return T.generate_measures_table_tmdl(measures_tmdl), report, suggestions
 
@@ -1891,6 +1898,88 @@ def _is_row_level_scalar_formula(formula):
     if _ANY_FIELD_REF_RE.search(stripped):
         return False
     return bool(_SCALAR_PARAM_REF_RE.search(text))
+
+
+_DISCRETE_COLOUR_TRUE = "#4E79A7"      # Tableau default blue   -> TRUE member
+_DISCRETE_COLOUR_FALSE = "#F28E2B"     # Tableau default orange -> FALSE member
+_COLOUR_MEASURE_SUFFIX = " (colour)"
+_BOOLEAN_DAX_RE = re.compile(r"\bTRUE\s*\(\s*\)|\bFALSE\s*\(\s*\)", re.IGNORECASE)
+
+
+def _composite_key_columns_tmdl(specs, known_tables):
+    """``{table: tmdl}`` for the scatter composite grain keys the report requested.
+
+    A Power BI scatter takes ONE field in its Values well, while Tableau grains marks by the distinct
+    COMBINATION of every Detail dimension. Microsoft's documented answer is a concatenated field that
+    *"must be unique for each point you want to plot"*, so the report asks for one and this emits it.
+
+    The concatenation is written directly rather than through the calc translator on purpose: the
+    translator wraps string ``+`` in ``ISBLANK`` guards that collapse the WHOLE key to BLANK when any
+    component is blank, which would merge exactly the marks the key exists to separate. Each
+    component is coerced with ``FORMAT(..., "")`` so a numeric or date component concatenates without
+    a type error, and the separator is a character that cannot occur in a Tableau field value.
+
+    Fail-closed: a spec naming an unknown table, or fewer than two columns, is skipped.
+    """
+    by_table = {}
+    for spec in specs or []:
+        table, name = spec.get("table"), spec.get("name")
+        cols = [c for c in (spec.get("columns") or []) if c]
+        if not table or not name or len(cols) < 2 or (known_tables and table not in known_tables):
+            continue
+        parts = " & \" | \" & ".join("FORMAT('%s'[%s], \"\")" % (table, c) for c in cols)
+        by_table.setdefault(table, "")
+        by_table[table] += T.generate_calc_column_tmdl(
+            name, "(scatter composite grain key: %s)" % ", ".join(cols), parts,
+            tmdl_type="string", summarize="none", is_hidden=True,
+            translated_by="deterministic (scatter composite grain key)")
+    return by_table
+
+
+def _boolean_colour_twin_measures(existing_report):
+    """A hex-returning colour twin for every BOOLEAN measure -> ``[report rows]``.
+
+    Tableau's idiom for "colour these marks two ways" is a boolean calc on the Colour shelf
+    (``IF SUM([Profit]) > 0 THEN TRUE ELSE FALSE END``). Power BI cannot drive a native categorical
+    legend from a MEASURE -- a legend needs a grouping column, which is row-level and would change
+    the mark grain -- so the idiomatic Power BI answer, and Microsoft's own documented one, is a DAX
+    measure that RETURNS A COLOUR, applied through conditional formatting:
+
+        *"You can create a DAX measure that returns color values based on your business logic."*
+
+    Emitting the twin in the MODEL (rather than injecting raw JSON into the visual) is what makes the
+    encoding discoverable and editable: it appears in the field list, its DAX is readable, and the
+    visual references it as the `Field value` format style -- so a user can open Desktop's `fx`
+    dialog and see exactly what drives the colour. An injected fill rule is unreachable JSON.
+
+    Emitted for every boolean measure, not only those currently on a Colour shelf: the model layer
+    cannot see the shelves, a boolean measure has no numeric use anyway, and an unreferenced twin is
+    inert. Additive and fail-closed -- ``[]`` when the workbook has no boolean measure.
+    """
+    existing = {(r.get("measure") or "").strip().lower() for r in (existing_report or [])}
+    rows = []
+    for row in existing_report or []:
+        if row.get("status") not in ("translated", "assisted-approved"):
+            continue
+        base = (row.get("measure") or "").strip()
+        dax = str(row.get("dax") or "")
+        if not base or not _BOOLEAN_DAX_RE.search(dax):
+            continue
+        name = dax_safe_measure_name(base + _COLOUR_MEASURE_SUFFIX)
+        if name.strip().lower() in existing:
+            continue
+        existing.add(name.strip().lower())
+        rows.append({
+            "measure": name,
+            "status": "translated",
+            "reason": None,
+            "dax": 'IF([%s], "%s", "%s")' % (base, _DISCRETE_COLOUR_TRUE, _DISCRETE_COLOUR_FALSE),
+            "tableau_formula": "(colour encoding for [%s])" % base,
+            "translated_by": "deterministic (discrete colour measure)",
+            "source": {"kind": "discrete_colour_twin", "model_table": "_Measures",
+                       "field_caption": name, "base_measure": base},
+        })
+    return rows
 
 
 def _scalar_row_aggregate_measures(existing_report, table_for):
@@ -3440,7 +3529,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                           hierarchies=None, display_folders=None, rls_roles=None,
                           date_table=True, mark_as_date=True, flatfile_path=None,
                           calc_lookup=None, approved_calc_dax=None, date_range=None,
-                          parameters=None, table_calc_usages=None, calc_outer_aggs=None):
+                          parameters=None, table_calc_usages=None, calc_outer_aggs=None,
+                          scatter_keys=None):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -3762,6 +3852,16 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
             if not (isinstance(v, tuple) and len(v) == 3 and v[0] == _INLINE_REF_SENTINEL)
         }
     for disp, block in calc_columns_by_table.items():
+        path = f"definition/tables/{disp}.tmdl"
+        if path in parts:
+            parts[path] = T.enrich_table_tmdl(parts[path], calc_columns=block)
+
+    # Scatter composite grain keys. A Power BI scatter takes ONE field in its Values well while
+    # Tableau grains marks by the distinct COMBINATION of every Detail dimension, so the report asks
+    # for a concatenated key -- Microsoft's own documented workaround -- and it is emitted here as a
+    # hidden calculated column. Additive and fail-closed: ``scatter_keys`` is empty for any report
+    # with no multi-dimension scatter, so output is byte-identical.
+    for disp, block in _composite_key_columns_tmdl(scatter_keys, set(table_names)).items():
         path = f"definition/tables/{disp}.tmdl"
         if path in parts:
             parts[path] = T.enrich_table_tmdl(parts[path], calc_columns=block)
@@ -4453,7 +4553,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                   date_table=True, mark_as_date=True, flatfile_path=None,
                                   approved_calc_dax=None, date_range=None, select=None,
                                   parameters=None, table_calc_usages=None, descriptor=None,
-                                  emit_linguistic=False, calc_outer_aggs=None):
+                                  emit_linguistic=False, calc_outer_aggs=None,
+                                  scatter_keys=None):
     """One-call convenience: parse ``.tds``/``.twb`` text and assemble the Import/DirectQuery model.
 
     ``calcs`` are the MEASURE-role calculated fields and ``dim_calcs`` the DIMENSION/row-level ones
@@ -4560,7 +4661,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                    calc_lookup=calc_lookup, approved_calc_dax=approved_calc_dax,
                                    date_range=date_range, parameters=parameters,
                                    table_calc_usages=table_calc_usages,
-                                   calc_outer_aggs=calc_outer_aggs)
+                                   calc_outer_aggs=calc_outer_aggs,
+                                   scatter_keys=scatter_keys)
     # Splice harvested Group/Bin calc columns onto their resolved home tables -- the same additive
     # pre-partition injection as dim_calcs (byte-for-byte unchanged when there are no groups/bins).
     harvest_parts = result.get("parts") if isinstance(result, dict) else None

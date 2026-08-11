@@ -2880,9 +2880,16 @@ def test_scatter_detail_measures_before_dimension_still_scatter():
     assert set(state) >= {"X", "Y", "Category"}
     assert state["X"]["projections"][0]["field"]["Aggregation"]["Expression"]["Column"]["Property"] == "Sales_Amount"
     assert state["Y"]["projections"][0]["field"]["Aggregation"]["Expression"]["Column"]["Property"] == "Profit"
-    # both detail dimensions land on Category/Details, in order, deduped (Region appears once)
+    # Both detail dimensions still determine the grain -- but as ONE composite key, not two
+    # projections. This assertion used to read ``["Category", "Region"]``, which was PBIR the report
+    # could not open: ``scatterChart``'s Category role is ``maxPerRole = 1``, so a second projection
+    # is a hard ``PBIR_ROLE_MAX_EXCEEDED``. Dropping one pill instead would validate and render while
+    # silently collapsing the marks, so the grain is preserved in a concatenated key (see
+    # ``tests/test_scatter_composite_key.py`` for why, in full).
     cats = [p["field"]["Column"]["Property"] for p in state["Category"]["projections"]]
-    assert cats == ["Category", "Region"]
+    assert len(cats) == 1
+    assert cats[0] == scatter_composite_key_name(parsed["encodings"]["detail_dims"])
+    assert "Category" in cats[0] and "Region" in cats[0]
 
 
 def test_circle_dot_plot_one_dim_one_measure_is_column():
@@ -9580,6 +9587,7 @@ def test_a_hidden_title_still_keeps_its_hidden_state_alongside_a_background():
 
 
 from twb_to_pbir import _apply_override, _field_expression
+from twb_to_pbir import scatter_composite_key_name
 
 
 # -- a model-measure rebind is authoritative over the caption-keyed field_map -----

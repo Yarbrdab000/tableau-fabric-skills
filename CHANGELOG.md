@@ -12,6 +12,52 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.126.0` -> `2.127.0`): a boolean on the Colour shelf stops killing the
+  visual, and a multi-dimension scatter stops losing its grain.** Two defects a reader supplied a
+  workbook for, both of which shipped clean through validation:
+  **A discrete measure on Colour is no longer rebuilt as a continuous gradient.** Tableau's ordinary
+  idiom for "colour these marks two ways" is a boolean calc on Colour
+  (`IF SUM([Profit]) > 0 THEN TRUE ELSE FALSE END`). It is a *discrete* pill -- Tableau paints two
+  swatches and offers no ramp -- but any unbound calc on Colour was classified continuous and became a
+  `linearGradient3`. Power BI evaluates `MIN` over the fill input to find the ramp's endpoints, cannot
+  do that to a boolean, and the visual dies at query time with *"Error fetching data for this visual"*.
+  The JSON is well-formed, so PBIR validation passed and every one of the reporter's 7 sheets was dead
+  on open. The classifier now reads the pill's own role code (`:nk` discrete / `:qk` continuous, which
+  `_is_continuous_pill` already parsed but nothing consulted) plus the calc's datatype, and an
+  unconditional crash guard in `_chart_continuous_fill` refuses a gradient over a non-numeric driver
+  even if a future caller bypasses the classifier. A genuinely continuous numeric measure keeps the
+  gradient it always had.
+  **The rebuild is the idiomatic Power BI one, not merely a working one.** The model now emits a
+  hex-returning **colour twin** for every boolean measure (`good/bad (colour)` =
+  `IF([good/bad], "#4E79A7", "#F28E2B")`, Tableau's own default pair) and the visual binds it as
+  conditional formatting -- Microsoft's documented approach, *"a DAX measure that returns color values
+  based on your business logic"*. Because the twin lives in the model it appears in the field list and
+  round-trips **editably** into Desktop's `fx` dialog, rather than being unreachable injected JSON. The
+  alternative rebuild -- putting a column on Legend -- is deliberately not offered even as an opt-in: a
+  column is row-level, so it changes the mark grain (one bar becomes stacked segments) and silently
+  alters the numbers.
+  **The `dataViewWildcard` selector is emitted, and is asserted by test.** Power BI honours a
+  `dataPoint.fill` colour expression without it -- validation passes, the visual renders, nothing warns
+  -- but evaluates it in ONE context and paints every mark identically. Proven by render: without the
+  selector every bar was one colour; with it, Bookcases/Supplies/Tables split from the profitable
+  sub-categories. This is a validation-invisible failure mode, so there is a test for the selector
+  itself.
+  **A scatter grained by several Detail dimensions gets one composite key.** A Power BI `scatterChart`
+  takes exactly one field in Values (`maxPerRole = 1`) while Tableau grains marks by the distinct
+  combination of every Detail dimension, so the rebuilt report failed to open with
+  `PBIR_ROLE_MAX_EXCEEDED` -- losing the whole page. Capping to one pill is worse than the failure: it
+  validates clean and renders, having collapsed ~5,000 marks into 3. No positional rule is safe either
+  (the identifying dimension is first in the reporter's workbook and last in corpus fixtures
+  `0081_correlation_r_squared` and `0090_small_multiples`). The dimensions are instead folded into one
+  hidden calculated column -- Microsoft's own documented workaround, *"create a field to concatenate
+  your x and y values together ... unique for each point you want to plot"* -- which by construction
+  has exactly Tableau's distinct-tuple count. The key is written directly rather than through the calc
+  translator on purpose: the translator wraps string concatenation in `ISBLANK` guards that would
+  collapse the whole key to BLANK on any blank component, merging exactly the marks it exists to
+  separate. Report and model derive the key's name from the same function, so no handshake table can
+  drift, and the case that cannot be a column (a grain spanning two tables) fails closed with a
+  warning.
+
 - **tableau-migration (skill `2.125.0` -> `2.126.0`): a density map is a heat layer, a pie-on-a-map
   keeps its geography, and a flattened dual-axis map says which layers it lost.** Three map gaps that
   each ended with output that looked finished (issues #111, #112):
