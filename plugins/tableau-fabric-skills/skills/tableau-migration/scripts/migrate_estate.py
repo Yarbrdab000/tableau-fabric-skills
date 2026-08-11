@@ -3038,6 +3038,25 @@ def _land_combined_flatfiles(packaged_source, descriptor, dest_dir):
     return landed
 
 
+def _scatter_keys_from_ir(result):
+    """The scatter composite grain keys this workbook's IR requires, or ``[]``.
+
+    Pure reader of the first viz pass. Never raises: an IR that cannot be read simply requests no
+    keys, and the scatter then degrades to the single-pill behaviour with its own warning.
+    """
+    try:
+        ir = (result or {}).get("ir") if isinstance(result, dict) else None
+        if not ir:
+            return []
+        try:
+            from . import twb_to_pbir as _tp
+        except ImportError:
+            import twb_to_pbir as _tp
+        return _tp.scatter_composite_keys(ir)
+    except Exception:
+        return []
+
+
 def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, model_safe, dest,
                            folder_rel, report_base, viz_name, viz=None, ds_catalog=None,
                            approved_calc_dax=None, wb_id=None, pbip_dir=None,
@@ -3121,7 +3140,12 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                                  calcs=calcs, dim_calcs=dim_calcs,
                                  approved_calc_dax=approved_calc_dax,
                                  packaged_source=wb_id, flatfile_dest_dir=_ff_dest,
-                                 flatfile_path=ff_path, local_data=local_data)
+                                 flatfile_path=ff_path, local_data=local_data,
+                                 # Composite grain keys for any scatter Tableau grains by 2+ Detail
+                                 # dimensions. Read from the FIRST viz pass's IR, so the model emits
+                                 # the key column before the second pass binds it. Empty (and the
+                                 # model byte-identical) unless such a scatter exists.
+                                 scatter_keys=_scatter_keys_from_ir(result))
     except Exception as exc:
         warns.append(_PBIP_WARN + f"could not rebuild embedded datasource {label!r} "
                      f"({type(exc).__name__}: {exc}) -- workbook .pbip skipped")

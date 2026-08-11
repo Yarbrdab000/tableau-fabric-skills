@@ -1598,6 +1598,13 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             translated_by=sr.get("translated_by") or "deterministic (row-aggregated scalar calc)",
             format_string=_fmt(sr["measure"]))
         report.append(sr)
+    # Colour twins for boolean measures -- the editable, grain-preserving way to rebuild Tableau's
+    # discrete colour encoding. Emitted last so they see every final measure name and cannot collide.
+    for cr in _boolean_colour_twin_measures(report):
+        cr["measure"] = _gen_measure(
+            cr["measure"], cr["tableau_formula"], cr["dax"],
+            translated_by=cr.get("translated_by") or "deterministic (discrete colour measure)")
+        report.append(cr)
     measures_tmdl = "".join(_measure_parts)
     return T.generate_measures_table_tmdl(measures_tmdl), report, suggestions
 
@@ -1891,6 +1898,166 @@ def _is_row_level_scalar_formula(formula):
     if _ANY_FIELD_REF_RE.search(stripped):
         return False
     return bool(_SCALAR_PARAM_REF_RE.search(text))
+
+
+_DISCRETE_COLOUR_TRUE = "#4E79A7"      # Tableau default blue   -> TRUE member
+_DISCRETE_COLOUR_FALSE = "#F28E2B"     # Tableau default orange -> FALSE member
+_COLOUR_MEASURE_SUFFIX = " (colour)"
+_BOOLEAN_DAX_RE = re.compile(r"\bTRUE\s*\(\s*\)|\bFALSE\s*\(\s*\)", re.IGNORECASE)
+
+
+def _composite_key_columns_tmdl(specs, known_tables):
+    """``{table: tmdl}`` for the scatter composite grain keys the report requested.
+
+    A Power BI scatter takes ONE field in its Values well, while Tableau grains marks by the distinct
+    COMBINATION of every Detail dimension. Microsoft's documented answer is a concatenated field that
+    *"must be unique for each point you want to plot"*, so the report asks for one and this emits it.
+
+    The concatenation is written directly rather than through the calc translator on purpose: the
+    translator wraps string ``+`` in ``ISBLANK`` guards that collapse the WHOLE key to BLANK when any
+    component is blank, which would merge exactly the marks the key exists to separate. Each
+    component is coerced with ``FORMAT(..., "")`` so a numeric or date component concatenates without
+    a type error, and the separator is a character that cannot occur in a Tableau field value.
+
+    Fail-closed: a spec naming an unknown table, or fewer than two columns, is skipped.
+    """
+    by_table = {}
+    for spec in specs or []:
+        table, name = spec.get("table"), spec.get("name")
+        cols = [c for c in (spec.get("columns") or []) if c]
+        if not table or not name or len(cols) < 2 or (known_tables and table not in known_tables):
+            continue
+        parts = " & \" | \" & ".join("FORMAT('%s'[%s], \"\")" % (table, c) for c in cols)
+        by_table.setdefault(table, "")
+        by_table[table] += T.generate_calc_column_tmdl(
+            name, "(scatter composite grain key: %s)" % ", ".join(cols), parts,
+            tmdl_type="string", summarize="none", is_hidden=True,
+            translated_by="deterministic (scatter composite grain key)")
+    return by_table
+
+
+def _guard_bidirectional_ambiguity(rels):
+    """Demote ``cross_filter='both'`` wherever it would give Power BI two filter paths.
+
+    Bidirectional filtering is what reproduces a Tableau physical join, but Power BI REFUSES to load
+    a model containing an ambiguous path -- two routes for a filter to travel between the same pair of
+    tables -- and refusing means the project does not open at all. So this runs over the FULL
+    relationship set, after the generated Date dimension exists, because Date is the usual culprit.
+
+    Direction is what makes the difference, and it is why the one-directional model loads today with
+    the very same tables. A single-direction relationship propagates only ``to`` -> ``from``
+    (lookup -> fact), so several facts hanging off one Date hub is unambiguous: nothing travels back
+    UP into Date. Turn a fact<->fact join bidirectional and a filter can now leave Date, cross into a
+    fact, and walk onwards -- and if two such walks reach the same table, the model is refused.
+    Measured on a Salesforce case-management workbook: *"There are ambiguous paths between 'Contact'
+    and 'Date': 'Contact'->'pmdm__ProgramEngagement__c'->'pmdm__ServiceDelivery__c'->'Date' and
+    'Contact'->'caseman__CasePlan__c'->'caseman__Goal__c'->'Date'"*.
+
+    So the graph is built with bidirectional edges UNDIRECTED (a filter may cross either way) and
+    single-direction edges as themselves, and bidirectional edges are accepted greedily only while
+    the undirected union stays a FOREST. Union-find, so the outcome is deterministic in input order.
+    Inactive relationships are ignored entirely: they carry no filter until ``USERELATIONSHIP``
+    activates them, so they cannot create a path.
+
+    A demoted relationship is never lost -- it still filters lookup -> fact exactly as it did before
+    this behaviour existed. Each demotion is returned so the fallback (wrapping the affected measure
+    in ``CALCULATE(..., CROSSFILTER(..., BOTH))``) is a visible decision rather than a silent one.
+    """
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return False
+        parent[ra] = rb
+        return True
+
+    out, warnings = [], []
+    # Bidirectional candidates are offered to the forest FIRST: they carry real Tableau join
+    # semantics, whereas a single-direction edge is unambiguous wherever it lands.
+    for r in rels:
+        if r.get("is_active") is False or r.get("cross_filter") != "both":
+            continue
+        a, b = str(r.get("from_table", "")).lower(), str(r.get("to_table", "")).lower()
+        if not union(a, b):
+            r["_demote_bidi"] = True
+    for r in rels:
+        if r.get("is_active") is False or r.get("cross_filter") == "both":
+            continue
+        a, b = str(r.get("from_table", "")).lower(), str(r.get("to_table", "")).lower()
+        if a and b and not union(a, b):
+            # This single edge closes a loop that a bidirectional edge already spans, so the pair is
+            # reachable two ways. Single edges cannot be demoted (they are the only join there is),
+            # so every bidirectional edge in that component gives way.
+            for other in rels:
+                if other.get("cross_filter") == "both" and find(
+                        str(other.get("from_table", "")).lower()) == find(a):
+                    other["_demote_bidi"] = True
+    for r in rels:
+        if r.pop("_demote_bidi", False):
+            r = dict(r)
+            r.pop("cross_filter", None)
+            warnings.append(
+                "physical join '%s' -> '%s' stays one-directional: making it bidirectional would "
+                "create a second filter path, which Power BI rejects as ambiguous (the project would "
+                "not open). A measure aggregating '%s' broken down by '%s' returns the grand total "
+                "unless wrapped in CALCULATE(..., CROSSFILTER(..., BOTH))."
+                % (r.get("from_table"), r.get("to_table"), r.get("to_table"), r.get("from_table")))
+        out.append(r)
+    return out, warnings
+
+
+def _boolean_colour_twin_measures(existing_report):
+    """A hex-returning colour twin for every BOOLEAN measure -> ``[report rows]``.
+
+    Tableau's idiom for "colour these marks two ways" is a boolean calc on the Colour shelf
+    (``IF SUM([Profit]) > 0 THEN TRUE ELSE FALSE END``). Power BI cannot drive a native categorical
+    legend from a MEASURE -- a legend needs a grouping column, which is row-level and would change
+    the mark grain -- so the idiomatic Power BI answer, and Microsoft's own documented one, is a DAX
+    measure that RETURNS A COLOUR, applied through conditional formatting:
+
+        *"You can create a DAX measure that returns color values based on your business logic."*
+
+    Emitting the twin in the MODEL (rather than injecting raw JSON into the visual) is what makes the
+    encoding discoverable and editable: it appears in the field list, its DAX is readable, and the
+    visual references it as the `Field value` format style -- so a user can open Desktop's `fx`
+    dialog and see exactly what drives the colour. An injected fill rule is unreachable JSON.
+
+    Emitted for every boolean measure, not only those currently on a Colour shelf: the model layer
+    cannot see the shelves, a boolean measure has no numeric use anyway, and an unreferenced twin is
+    inert. Additive and fail-closed -- ``[]`` when the workbook has no boolean measure.
+    """
+    existing = {(r.get("measure") or "").strip().lower() for r in (existing_report or [])}
+    rows = []
+    for row in existing_report or []:
+        if row.get("status") not in ("translated", "assisted-approved"):
+            continue
+        base = (row.get("measure") or "").strip()
+        dax = str(row.get("dax") or "")
+        if not base or not _BOOLEAN_DAX_RE.search(dax):
+            continue
+        name = dax_safe_measure_name(base + _COLOUR_MEASURE_SUFFIX)
+        if name.strip().lower() in existing:
+            continue
+        existing.add(name.strip().lower())
+        rows.append({
+            "measure": name,
+            "status": "translated",
+            "reason": None,
+            "dax": 'IF([%s], "%s", "%s")' % (base, _DISCRETE_COLOUR_TRUE, _DISCRETE_COLOUR_FALSE),
+            "tableau_formula": "(colour encoding for [%s])" % base,
+            "translated_by": "deterministic (discrete colour measure)",
+            "source": {"kind": "discrete_colour_twin", "model_table": "_Measures",
+                       "field_caption": name, "base_measure": base},
+        })
+    return rows
 
 
 def _scalar_row_aggregate_measures(existing_report, table_for):
@@ -2295,6 +2462,59 @@ def _select_primary_date(date_cols):
 
     hints = [c for c in date_cols if _is_primary_name(c)]
     return hints[0] if len(hints) == 1 else None
+
+
+def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date=True,
+                           mode="import", date_range=None):
+    """One Date dimension PER DATASOURCE ISLAND -> ``([(name, part)], rels, report)``.
+
+    A workbook with several datasources keeps them as ISLANDS: Tableau never lets one datasource's
+    filters reach another's marks. A single shared calendar related to facts in every island breaks
+    that in the quietest possible way -- a date slicer silently filters all four dashboards' visuals
+    at once -- and it is also the usual cause of the ambiguous-path refusal that stops the whole
+    project opening, because one hub touching every island manufactures second routes between tables
+    that are otherwise a clean star.
+
+    It is redundant besides. Tableau's own mechanism for a filter that spans datasources is a
+    PARAMETER, not a shared dimension -- parameters are global and belong to no datasource -- and
+    that already translates: a date-window parameter lands as a disconnected what-if table whose
+    ``[Start Date Value]`` / ``[End Date Value]`` measures are read by each island's own row-filter
+    flag measure. So the cross-island date filter keeps working with no relationship at all, which is
+    exactly how the source behaved.
+
+    Islands come from each relation's ``source_datasource`` tag (stamped by ``combine_descriptors``).
+    A descriptor with fewer than two distinct tags -- every single-datasource workbook, and the whole
+    existing corpus -- takes the original single-calendar path with the original ``"Date"`` name, so
+    its output is byte-identical.
+    """
+    islands = []
+    for rel in tables or []:
+        ds = (rel.get("source_datasource") or "").strip()
+        if ds and ds not in islands:
+            islands.append(ds)
+    if len(islands) < 2:
+        name, part, rels, report = _build_date_dimension(
+            tables, emitted_names, relationships, mark_as_date=mark_as_date, mode=mode,
+            date_range=date_range)
+        return ([(name, part)] if part is not None else []), rels, report
+
+    built, all_rels, reports = [], [], []
+    taken = list(emitted_names)
+    for ds in islands:
+        own = [r for r in tables if (r.get("source_datasource") or "").strip() == ds]
+        if not own:
+            continue
+        name, part, rels, report = _build_date_dimension(
+            own, taken, relationships, mark_as_date=mark_as_date,
+            name_pref="Date (%s)" % ds, mode=mode, date_range=date_range)
+        if part is None:
+            continue
+        built.append((name, part))
+        taken.append(name)
+        all_rels.extend(rels)
+        reports.append(dict(report, island=ds))
+    return built, all_rels, {"generated": bool(built), "per_island": True,
+                             "tables": [n for n, _ in built], "islands": reports}
 
 
 def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=True,
@@ -3440,7 +3660,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                           hierarchies=None, display_folders=None, rls_roles=None,
                           date_table=True, mark_as_date=True, flatfile_path=None,
                           calc_lookup=None, approved_calc_dax=None, date_range=None,
-                          parameters=None, table_calc_usages=None, calc_outer_aggs=None):
+                          parameters=None, table_calc_usages=None, calc_outer_aggs=None,
+                          scatter_keys=None):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -3577,17 +3798,30 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     date_name = None
     active_date_cols = set()
     if date_table:
-        date_name, date_part, date_rels, date_report = _build_date_dimension(
+        _date_built, date_rels, date_report = _build_date_dimensions(
             tables, table_names, all_rels, mark_as_date=mark_as_date, mode=mode,
             date_range=date_range)
-        if date_part is not None:
-            parts[f"definition/tables/{date_name}.tmdl"] = date_part
-            table_names.append(date_name)
+        for _dn, _dp in _date_built:
+            parts[f"definition/tables/{_dn}.tmdl"] = _dp
+            table_names.append(_dn)
+        if _date_built:
+            # ``date_name`` stays the FIRST calendar for every downstream consumer that assumes a
+            # single one (date-hierarchy wiring, the model manifest). With one island -- every
+            # single-datasource workbook -- that is the only calendar, exactly as before.
+            date_name = _date_built[0][0]
             all_rels = all_rels + date_rels
             active_date_cols = {(r["from_table"], r["from_col"])
                                 for r in date_rels if r.get("is_active")}
         else:
             date_name = None
+
+    # Bidirectional cross-filtering must be demoted wherever it would give Power BI two filter paths,
+    # and that can only be judged HERE -- the generated Date dimension is the usual culprit and does
+    # not exist until the block above has run. Measured: 23 bidirectional physical joins loaded fine
+    # in isolation, then Desktop refused the whole project with *"There are ambiguous paths between
+    # 'Contact' and 'Date'"*, because Date reaches Contact via both
+    # Date->ServiceDelivery->ProgramEngagement->Contact and Date->Goal->CasePlan->Contact.
+    all_rels, _amb_warnings = _guard_bidirectional_ambiguity(all_rels)
 
     # ----- Parameter wiring (field swaps -> field parameters; value params -> what-if tables) -----
     # Build the swap/param model objects BEFORE translating calcs so a consumed swap is excluded
@@ -3762,6 +3996,16 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
             if not (isinstance(v, tuple) and len(v) == 3 and v[0] == _INLINE_REF_SENTINEL)
         }
     for disp, block in calc_columns_by_table.items():
+        path = f"definition/tables/{disp}.tmdl"
+        if path in parts:
+            parts[path] = T.enrich_table_tmdl(parts[path], calc_columns=block)
+
+    # Scatter composite grain keys. A Power BI scatter takes ONE field in its Values well while
+    # Tableau grains marks by the distinct COMBINATION of every Detail dimension, so the report asks
+    # for a concatenated key -- Microsoft's own documented workaround -- and it is emitted here as a
+    # hidden calculated column. Additive and fail-closed: ``scatter_keys`` is empty for any report
+    # with no multi-dimension scatter, so output is byte-identical.
+    for disp, block in _composite_key_columns_tmdl(scatter_keys, set(table_names)).items():
         path = f"definition/tables/{disp}.tmdl"
         if path in parts:
             parts[path] = T.enrich_table_tmdl(parts[path], calc_columns=block)
@@ -4453,7 +4697,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                   date_table=True, mark_as_date=True, flatfile_path=None,
                                   approved_calc_dax=None, date_range=None, select=None,
                                   parameters=None, table_calc_usages=None, descriptor=None,
-                                  emit_linguistic=False, calc_outer_aggs=None):
+                                  emit_linguistic=False, calc_outer_aggs=None,
+                                  scatter_keys=None):
     """One-call convenience: parse ``.tds``/``.twb`` text and assemble the Import/DirectQuery model.
 
     ``calcs`` are the MEASURE-role calculated fields and ``dim_calcs`` the DIMENSION/row-level ones
@@ -4560,7 +4805,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                    calc_lookup=calc_lookup, approved_calc_dax=approved_calc_dax,
                                    date_range=date_range, parameters=parameters,
                                    table_calc_usages=table_calc_usages,
-                                   calc_outer_aggs=calc_outer_aggs)
+                                   calc_outer_aggs=calc_outer_aggs,
+                                   scatter_keys=scatter_keys)
     # Splice harvested Group/Bin calc columns onto their resolved home tables -- the same additive
     # pre-partition injection as dim_calcs (byte-for-byte unchanged when there are no groups/bins).
     harvest_parts = result.get("parts") if isinstance(result, dict) else None

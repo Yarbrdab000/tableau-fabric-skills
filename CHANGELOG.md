@@ -12,6 +12,125 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.128.0` -> `2.129.0`): a Tableau physical join is one flat rowset, so
+  it must filter both ways — plus per-island calendars and two hard formatting errors.** A reader's
+  Salesforce case-management workbook rebuilt with *every number on its headline chart wrong*, and
+  the cause was one architectural mismatch repeated everywhere.
+  **Physical joins now cross-filter bidirectionally.** Tableau's model has two layers that map onto
+  Power BI exactly: a **physical join** (`<relation type='join'>`) pre-joins rows into ONE
+  denormalized rowset so a filter on any column restricts every column, while a **logical
+  relationship** (the 2020.2+ "noodle") joins per query exactly as a Power BI relationship does. Both
+  were emitted one-directional. Because a Power BI relationship propagates only lookup -> fact, any
+  measure aggregating a lookup-side column and broken down by a fact-side column silently returned
+  the GRAND TOTAL on every mark — validating clean and rendering fine. Measured: "Clients by
+  Engagement Stage" read 2,638 on all seven bars instead of 708/85/30/25/24/20/17. Emitting
+  `crossFilteringBehavior: bothDirections` for physical joins only fixes every number with **no change
+  to any measure**. Logical relationships are untouched.
+  **An ambiguity guard, because Power BI refuses ambiguous models outright.** The first attempt marked
+  23 joins bidirectional and Desktop rejected the entire project: *"There are ambiguous paths between
+  'Contact' and 'Date'"*. Direction is what makes that possible — several facts on one Date hub is
+  unambiguous one-directionally because nothing travels back UP into Date. So the guard runs over the
+  FULL relationship set, after the generated calendar exists, keeping bidirectional edges only while
+  they form a forest; inactive relationships are ignored (they carry no filter). A demoted
+  relationship still filters lookup -> fact exactly as before and is reported, so the per-measure
+  `CROSSFILTER` fallback is a visible choice.
+  **One Date dimension per datasource island.** Separate Tableau datasources are islands — one never
+  filters another — but a single shared calendar related to facts in every island meant a date slicer
+  silently filtered all four dashboards at once. It was redundant too: Tableau's mechanism for a
+  cross-datasource filter is a **parameter**, which already translates (a disconnected what-if table
+  whose `[Start Date Value]`/`[End Date Value]` measures each island's own row-filter flag reads), so
+  splitting the calendar removes a filter path Tableau never had. Fewer than two islands takes the
+  original single-calendar path under the original `Date` name, so single-datasource workbooks are
+  byte-identical.
+  **Two hard formatting errors fixed.** An `azureMap` has no `dataPoint` object at all — its marks are
+  drawn by layers — so a flat mark colour there was `PBIR_FORMATTING_PROP_UNKNOWN`, an **error** that
+  fails the whole report rather than losing one colour (5 of them on the reporter's workbook). It now
+  rides `bubbleLayer.fillColor`. Separately, and pre-existing since long before this release, Power BI
+  does not agree with itself on what transparency is called: a bar/column/pie fill is
+  `fillTransparency`, an area/line surface is `transparency`, and scatter/funnel have neither. The name
+  is now taken per visual type from the visual catalog, and a flat colour is dropped entirely for
+  `treemap`/`waterfallChart`/`azureMap`, which have no `dataPoint.defaultColor`. This took the corpus
+  from 28/29 to **29/29 validating with zero errors**.
+
+- **tableau-migration (skill `2.127.0` -> `2.128.0`): aggregating a table-scoped LOD is Tableau
+  syntax, not arithmetic — so the DAX drops it.** The reporter's workbook highlights its best
+  sub-category with
+  `IF SUM([Profit]) = SUM({MAX({FIXED [Sub-Category] : SUM([Profit])})}) THEN TRUE ELSE FALSE END`,
+  and the engine stubbed it on *"re-aggregating a table-scoped LOD is not supported"* — so that bar
+  chart shipped one flat colour while its sibling sheet, which expresses the identical intent as a
+  table calculation (`WINDOW_MAX(SUM([Profit]))`), highlighted correctly.
+  **The outer aggregate is inert, and Tableau documents both halves of that.** It is present only
+  because *"Level of detail expressions are always automatically wrapped in an aggregate when they
+  are added to a shelf in the view"* — Tableau's aggregate/non-aggregate mixing rule needs a wrapper
+  and Tableau types one in for you. And it computes nothing because *"When no aggregation is needed
+  (because the expression's level of detail is coarser than the view's), the aggregation you
+  specified is still shown when the expression is on a shelf, but it is ignored."* A **table-scoped**
+  LOD is the coarsest value that exists — one number for the whole table, identical on every row — so
+  it is coarser than every possible view grain and that clause always holds. Which outer aggregate
+  was written is therefore irrelevant, and it is discarded rather than modelled.
+  **This is the one LOD shape where the collapse is unconditionally safe**, which is what keeps the
+  notorious "SUM of a FIXED LOD multiplies by the row count" gotcha out of scope: that needs a grain
+  BETWEEN row level and the view — a partly-replicated value a real SUM then double-counts — and a
+  table-scoped LOD has no such middle grain. A *dimensioned* LOD still takes the SUMMARIZE
+  re-aggregation path untouched, and re-aggregating a table-scoped INCLUDE/EXCLUDE still falls back,
+  since the justification is FIXED's semantics specifically.
+  **ALL, not ALLSELECTED — and the same workbook proves the difference is real.** FIXED *"ignores all
+  the filters in the view other than context filters, data source filters, and extract filters"*
+  because Tableau evaluates it before dimension filters, so it maps to `ALL`; `WINDOW_MAX` runs over
+  the marks in the partition, so it maps to `ALLSELECTED`. Identical unfiltered, divergent the moment
+  a reader touches a slicer — two Tableau constructs, two different DAX functions.
+  Emits `CALCULATE(MAXX(SUMMARIZE('Orders', 'Orders'[Sub-Category]), CALCULATE(SUM('Orders'[Profit]))),
+  ALL('Orders'))`. Rendered in Power BI Desktop against a refreshed model, the collapsed LOD and the
+  table-calc sibling independently highlight the same bar — the cross-check that the collapse really
+  computes what Tableau computed. No corpus workbook used this shape (61 stubbed calcs before and
+  after, 29/29 fixtures), which is exactly why it survived to a reader.
+
+- **tableau-migration (skill `2.126.0` -> `2.127.0`): a boolean on the Colour shelf stops killing the
+  visual, and a multi-dimension scatter stops losing its grain.** Two defects a reader supplied a
+  workbook for, both of which shipped clean through validation:
+  **A discrete measure on Colour is no longer rebuilt as a continuous gradient.** Tableau's ordinary
+  idiom for "colour these marks two ways" is a boolean calc on Colour
+  (`IF SUM([Profit]) > 0 THEN TRUE ELSE FALSE END`). It is a *discrete* pill -- Tableau paints two
+  swatches and offers no ramp -- but any unbound calc on Colour was classified continuous and became a
+  `linearGradient3`. Power BI evaluates `MIN` over the fill input to find the ramp's endpoints, cannot
+  do that to a boolean, and the visual dies at query time with *"Error fetching data for this visual"*.
+  The JSON is well-formed, so PBIR validation passed and every one of the reporter's 7 sheets was dead
+  on open. The classifier now reads the pill's own role code (`:nk` discrete / `:qk` continuous, which
+  `_is_continuous_pill` already parsed but nothing consulted) plus the calc's datatype, and an
+  unconditional crash guard in `_chart_continuous_fill` refuses a gradient over a non-numeric driver
+  even if a future caller bypasses the classifier. A genuinely continuous numeric measure keeps the
+  gradient it always had.
+  **The rebuild is the idiomatic Power BI one, not merely a working one.** The model now emits a
+  hex-returning **colour twin** for every boolean measure (`good/bad (colour)` =
+  `IF([good/bad], "#4E79A7", "#F28E2B")`, Tableau's own default pair) and the visual binds it as
+  conditional formatting -- Microsoft's documented approach, *"a DAX measure that returns color values
+  based on your business logic"*. Because the twin lives in the model it appears in the field list and
+  round-trips **editably** into Desktop's `fx` dialog, rather than being unreachable injected JSON. The
+  alternative rebuild -- putting a column on Legend -- is deliberately not offered even as an opt-in: a
+  column is row-level, so it changes the mark grain (one bar becomes stacked segments) and silently
+  alters the numbers.
+  **The `dataViewWildcard` selector is emitted, and is asserted by test.** Power BI honours a
+  `dataPoint.fill` colour expression without it -- validation passes, the visual renders, nothing warns
+  -- but evaluates it in ONE context and paints every mark identically. Proven by render: without the
+  selector every bar was one colour; with it, Bookcases/Supplies/Tables split from the profitable
+  sub-categories. This is a validation-invisible failure mode, so there is a test for the selector
+  itself.
+  **A scatter grained by several Detail dimensions gets one composite key.** A Power BI `scatterChart`
+  takes exactly one field in Values (`maxPerRole = 1`) while Tableau grains marks by the distinct
+  combination of every Detail dimension, so the rebuilt report failed to open with
+  `PBIR_ROLE_MAX_EXCEEDED` -- losing the whole page. Capping to one pill is worse than the failure: it
+  validates clean and renders, having collapsed ~5,000 marks into 3. No positional rule is safe either
+  (the identifying dimension is first in the reporter's workbook and last in corpus fixtures
+  `0081_correlation_r_squared` and `0090_small_multiples`). The dimensions are instead folded into one
+  hidden calculated column -- Microsoft's own documented workaround, *"create a field to concatenate
+  your x and y values together ... unique for each point you want to plot"* -- which by construction
+  has exactly Tableau's distinct-tuple count. The key is written directly rather than through the calc
+  translator on purpose: the translator wraps string concatenation in `ISBLANK` guards that would
+  collapse the whole key to BLANK on any blank component, merging exactly the marks it exists to
+  separate. Report and model derive the key's name from the same function, so no handshake table can
+  drift, and the case that cannot be a column (a grain spanning two tables) fails closed with a
+  warning.
+
 - **tableau-migration (skill `2.125.0` -> `2.126.0`): a density map is a heat layer, a pie-on-a-map
   keeps its geography, and a flattened dual-axis map says which layers it lost.** Three map gaps that
   each ended with output that looked finished (issues #111, #112):

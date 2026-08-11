@@ -1923,7 +1923,12 @@ def _extract_join_relationships(datasource, relations):
             seen.add(dedup)
             out.append({"from_table": from_table, "from_col": from_col,
                         "to_table": to_table, "to_col": to_col,
-                        "cardinality": "many_to_many"})
+                        "cardinality": "many_to_many",
+                        # A PHYSICAL join is one denormalized rowset in Tableau, so filters travel in
+                        # every direction. See generate_relationships_tmdl for the full reasoning and
+                        # the measured symptom. Demoted back to one-directional by
+                        # _guard_bidirectional_ambiguity wherever it would create a second filter path.
+                        "cross_filter": "both"})
     return out, warnings
 
 

@@ -689,6 +689,21 @@ def generate_relationships_tmdl(rels):
     many-to-one, but without the uniqueness constraint. The generated Date-dimension relationships
     carry no ``cardinality`` key and so stay the default many-to-one (Date[Date] is unique by
     construction).
+
+    ``cross_filter`` -- when ``"both"`` the relationship is emitted
+    ``crossFilteringBehavior: bothDirections``. Set ONLY for a relationship recovered from a Tableau
+    PHYSICAL join (``<relation type='join'>``), and it is what makes those numbers right. A physical
+    join hands Tableau ONE denormalized rowset, so a filter on any column restricts every column; a
+    Power BI relationship propagates one way only, so a measure aggregating the ``to`` (lookup) side
+    and broken down by the ``from`` (fact) side silently returns the GRAND TOTAL on every mark --
+    validating clean and rendering fine. Measured on a Salesforce case-management workbook: all seven
+    Engagement Stage bars read 2,638 (the unfiltered client count) rather than 708/30/17/85/24/25/20.
+
+    Deliberately NOT set for a Tableau LOGICAL relationship (the 2020.2+ "noodle"), which is already
+    a per-query semantic join exactly like Power BI's own and must stay one-directional, nor for the
+    generated Date dimension -- a shared Date bridges several datasources, and making it
+    bidirectional would let one datasource's filters reach another's tables, silently fusing islands
+    the workbook keeps separate.
     """
     if not rels:
         return None
@@ -701,7 +716,10 @@ def generate_relationships_tmdl(rels):
             lines.append(f"\tjoinOnDateBehavior: {r['join_on_date_behavior']}")
         if r.get("cardinality") == "many_to_many":
             lines.append("\ttoCardinality: many")
-            lines.append("\tcrossFilteringBehavior: oneDirection")
+            lines.append("\tcrossFilteringBehavior: %s"
+                         % ("bothDirections" if r.get("cross_filter") == "both" else "oneDirection"))
+        elif r.get("cross_filter") == "both":
+            lines.append("\tcrossFilteringBehavior: bothDirections")
         lines.append(f"\tfromColumn: {q(r['from_table'])}.{q(r['from_col'])}")
         lines.append(f"\ttoColumn: {q(r['to_table'])}.{q(r['to_col'])}")
         blocks.append("\n".join(lines))

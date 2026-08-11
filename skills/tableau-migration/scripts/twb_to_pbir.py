@@ -1299,6 +1299,16 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
                 "number_format": _tableau_number_format(_mb_base.get("number_format")),
                 "measure_rebound": True,
                 "rebound_to_instance": rebound_to_instance,
+                # Carry the DISCRETENESS decision across the rebind. This branch builds a FRESH
+                # field dict, so a flag stamped on the classifier's dict below would be lost -- and
+                # it was: the first (viz-only) pass classified every boolean colour driver discrete,
+                # then the second pass, once the model supplied ``measure_binding``, returned here
+                # and silently dropped it, so only the calcs the model FAILED to translate kept the
+                # discrete encoding. Same two signals as the classifier: a boolean datatype, or a
+                # non-``:qk`` role code on the pill instance.
+                "discrete_measure": (
+                    (_mb_base.get("datatype") or "").strip().lower() == "boolean"
+                    or not _is_continuous_pill({"instance": field_id})),
             }
 
     # Implicit row count (object-id COUNT(*) / legacy [Number of Records]) -> a COUNTROWS measure.
@@ -1393,6 +1403,21 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
     if is_calc and bound is None and not calc_is_axis:
         field["binding"] = "measure"
         field["kind"] = "value"
+        # DISCRETENESS. Tableau states it twice on this pill and the engine used to consult neither,
+        # unconditionally stamping every unbound calc measure CONTINUOUS. A discrete boolean measure
+        # on Colour then flowed into the continuous-gradient path and Power BI evaluated MIN/MAX over
+        # a BOOLEAN -- "The function 'Min' cannot be invoked with the specified arguments" -- so the
+        # visual threw the moment the page rendered (measured on all 7 sheets of the reporting
+        # workbook). The two signals:
+        #   * the pill's own role code -- ``:qk`` is quantitative/continuous, ``:nk`` (nominal) and
+        #     ``:ok`` (ordinal) are DISCRETE. ``_is_continuous_pill`` already reads exactly this.
+        #   * a ``boolean`` datatype, which is a 2-value domain and cannot be a continuous ramp
+        #     whatever the role code says.
+        # Recorded as a flag rather than by flipping ``kind``: this IS still a measure (it must stay
+        # in the value well and keep its per-mark aggregate grain -- that is the whole reason a
+        # Legend column is the wrong answer), it simply drives a DISCRETE colour encoding.
+        field["discrete_measure"] = (
+            (datatype or "").strip().lower() == "boolean" or not _is_continuous_pill(field))
         return field
 
     if deriv in _AGG_FUNC:
@@ -4986,7 +5011,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
             # ``backColor``, incl. the Visual-Calculation-driven heat scale) as an explicit palette.
             _color_enc_g = encodings.get("color")
             if (_color_enc_g and _color_enc_g.get("kind") == "value"
-                    and _color_enc_g.get("binding") in ("aggregation", "measure")):
+                    and _color_enc_g.get("binding") in ("aggregation", "measure")
+                    and not _color_enc_g.get("discrete_measure")):
                 color_gradient = _automatic_color_gradient(_color_enc_g)
 
     # Per-measure colour scales. A highlight table puts Measure Values on Colour with
@@ -7028,6 +7054,42 @@ def _build_query_state(ws, model_table, field_map, warnings):
             state["Y"] = {"projections": _role_projections(
                 y, model_table, field_map, used_refs)}
         if cat:
+            # ONE field only. Power BI's scatter Values/Details well is ``maxPerRole = 1``; several
+            # projections is a hard PBIR_ROLE_MAX_EXCEEDED, and dropping the extras silently changes
+            # the mark grain (measured: keeping the wrong pill collapsed ~5,000 marks into 3, and it
+            # rendered perfectly). Microsoft's documented answer is to concatenate the dimensions
+            # into one field that "must be unique for each point you want to plot" -- the model emits
+            # exactly that key (see ``scatter_composite_keys``), so bind it here.
+            if len(cat) > 1:
+                _tables = {f.get("entity") for f in cat if f.get("entity")}
+                _key_name = scatter_composite_key_name(cat)
+                if len(_tables) == 1:
+                    _dim_names = ", ".join(
+                        repr(f.get("caption") or f.get("property")) for f in cat)
+                    warnings.append(_warn(
+                        "worksheet", ws["name"],
+                        "scatter grain: Tableau plots one mark per distinct combination of %d "
+                        "dimensions (%s), but a Power BI scatter takes ONE field in Values. The "
+                        "dimensions are folded into a composite key column %r so the mark count is "
+                        "preserved exactly. The individual dimensions cannot be shown on the native "
+                        "scatter tooltip (it accepts measures only) -- add a report-page tooltip if "
+                        "they need to be readable on hover"
+                        % (len(cat), _dim_names, _key_name)))
+                    cat = [{**cat[0], "property": _key_name, "caption": _key_name,
+                            "entity": next(iter(_tables)), "binding": "column",
+                            "kind": "category", "aggregation": None,
+                            "is_calc": False, "derivation": "None",
+                            "composite_scatter_key": True}]
+                else:
+                    # A key spanning two tables is not a column. Keep the finest single pill and say
+                    # so, rather than emitting a visual the validator rejects.
+                    warnings.append(_warn(
+                        "worksheet", ws["name"],
+                        "scatter grain: %d dimensions span more than one table, so no single "
+                        "composite key column can be built; only %r is bound and the mark grain is "
+                        "COARSER than Tableau's"
+                        % (len(cat), cat[0].get("caption") or cat[0].get("property"))))
+                    cat = cat[:1]
             state["Category"] = {"projections": _role_projections(
                 cat, model_table, field_map, used_refs)}
         if series:
@@ -8832,6 +8894,34 @@ def _mark_transparency_pct(table):
     return pct if pct > 0 else None
 
 
+_DATAPOINT_TRANSPARENCY_PROP = {
+    # Power BI does NOT agree with itself on what "transparency" is called, and using the wrong name
+    # is a HARD validation error (``PBIR_FORMATTING_PROP_UNKNOWN``) that fails the entire report
+    # rather than losing one property. Taken verbatim from the visual catalog
+    # (``powerbi-report-author formatting describe-object <type> dataPoint``), not inferred:
+    # a bar/column/pie fill uses ``fillTransparency``; an area/line surface uses ``transparency``.
+    "clusteredColumnChart": "fillTransparency",
+    "clusteredBarChart": "fillTransparency",
+    "barChart": "fillTransparency",
+    "columnChart": "fillTransparency",
+    "hundredPercentStackedBarChart": "fillTransparency",
+    "hundredPercentStackedColumnChart": "fillTransparency",
+    "pieChart": "fillTransparency",
+    "donutChart": "fillTransparency",
+    "ribbonChart": "fillTransparency",
+    "areaChart": "transparency",
+    "stackedAreaChart": "transparency",
+    "lineChart": "transparency",
+    "lineClusteredColumnComboChart": "transparency",
+    "lineStackedColumnComboChart": "transparency",
+    # scatterChart / funnel expose no dataPoint transparency at all -> omitted deliberately.
+}
+
+# Visual types whose ``dataPoint`` object has no ``defaultColor`` property. Emitting one is a hard
+# validation error, so a flat mark colour is dropped for these rather than failing the report.
+_NO_DATAPOINT_DEFAULT_COLOR = frozenset({"treemap", "waterfallChart", "azureMap"})
+
+
 def _constant_mark_color_objects(ws, pbir_vtype=None):
     """The worksheet's flat mark colour as PBIR format objects, keyed by object name, or ``None``.
 
@@ -8851,10 +8941,26 @@ def _constant_mark_color_objects(ws, pbir_vtype=None):
     if not color:
         return None
     lit = {"solid": {"color": {"expr": {"Literal": {"Value": f"'{color}'"}}}}}
+    if pbir_vtype == "azureMap":
+        # An azureMap has NO ``dataPoint`` object at all -- its marks are drawn by layers, so the
+        # cartesian channel is not merely ineffective here, it is a HARD validation error
+        # (``PBIR_FORMATTING_PROP_UNKNOWN`` on both ``dataPoint.defaultColor`` and
+        # ``dataPoint.transparency``), which fails the whole report rather than just losing a colour.
+        # The bubble layer owns the fill, so the flat mark colour rides ``bubbleLayer.fillColor``.
+        # Transparency is deliberately dropped rather than guessed onto the layer: the map's own
+        # default opacity is a defensible rendering, an invented property name is not.
+        return {"bubbleLayer": [{"properties": {"fillColor": lit}}]}
+    if pbir_vtype in _NO_DATAPOINT_DEFAULT_COLOR:
+        # No dataPoint.defaultColor on this visual -- emitting one is a hard validation error, and
+        # losing a flat colour is strictly better than losing the report.
+        return None
     props = {"defaultColor": lit}
     tpct = ws.get("mark_transparency")
     if tpct:
-        props["transparency"] = {"expr": {"Literal": {"Value": "%dD" % tpct}}}
+        # Named per visual type; omitted entirely where the visual has no such property.
+        tprop = _DATAPOINT_TRANSPARENCY_PROP.get(pbir_vtype)
+        if tprop:
+            props[tprop] = {"expr": {"Literal": {"Value": "%dD" % tpct}}}
     objs = {"dataPoint": [{"properties": props}]}
     if pbir_vtype in _STROKE_COLOR_VTYPES:
         objs["lineStyles"] = [{"properties": {
@@ -9067,6 +9173,162 @@ def _measure_series_colors(ws, state, vtype, warnings):
 _CHART_CONTINUOUS_FILL_TYPES = (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA, VT_SCATTER, VT_COMBO, VT_TREEMAP)
 
 
+_DISCRETE_COLOUR_TRUE = "#4E79A7"     # Tableau's default blue  -> the TRUE / pass member
+_DISCRETE_COLOUR_FALSE = "#F28E2B"    # Tableau's default orange -> the FALSE / fail member
+_COLOUR_MEASURE_SUFFIX = " (colour)"
+# Power BI's gradient establishes its domain with MIN/MAX over the fill input. Those are invalid on a
+# non-numeric measure, and the visual throws ``rsDataShapeQueryTranslationError`` -- "The function
+# 'Min' cannot be invoked with the specified arguments" -- the moment the page renders.
+_GRADIENT_SAFE_DATATYPES = frozenset({"integer", "real", "number", "float", "decimal", "date",
+                                      "datetime", "date_time"})
+
+
+def _gradient_input_is_safe(color):
+    """True when the colour driver can support a continuous gradient's MIN/MAX domain.
+
+    Fail-closed: an unknown/absent datatype reads as SAFE so an existing numeric heat map is
+    byte-unchanged, but an explicitly non-numeric one (above all ``boolean``) is refused.
+    """
+    if not color:
+        return False
+    if color.get("discrete_measure"):
+        return False
+    dt = (color.get("datatype") or "").strip().lower()
+    return not dt or dt in _GRADIENT_SAFE_DATATYPES
+
+
+def _discrete_colour_measure_name(color):
+    """The name of the colour-twin measure that drives a discrete mark colour.
+
+    Prefers the BOUND model measure name for a rebound pill: the model emits the twin from its own
+    measure name, so keying on the Tableau caption would miss whenever the model renamed the measure
+    (a DAX-unsafe caption, a de-duplicated collision).
+    """
+    color = color or {}
+    base = (color.get("property") if color.get("measure_rebound") else None) \
+        or color.get("caption") or color.get("property") or "colour"
+    return dax_safe_measure_name(str(base).strip() + _COLOUR_MEASURE_SUFFIX)
+
+
+SCATTER_KEY_PREFIX = "_ScatterKey"
+
+
+def scatter_composite_key_name(dims):
+    """Deterministic name for the composite grain key of a multi-dimension scatter.
+
+    Both layers derive the name from the same ordered dimension list, so the model and the report
+    agree without a lookup table travelling between them.
+    """
+    parts = [str((d.get("property") or d.get("caption") or "")).strip() for d in dims]
+    return SCATTER_KEY_PREFIX + " (" + " + ".join(p for p in parts if p) + ")"
+
+
+def scatter_composite_keys(ir):
+    """``[{table, name, columns}]`` -- the composite grain keys this report's scatters need.
+
+    Power BI's scatter allows exactly ONE field in its Values/Details well (PBIR role ``Category``,
+    ``maxPerRole = 1``), while Tableau's Detail shelf takes many and grains the marks by the distinct
+    COMBINATION. Emitting several projections is a hard ``PBIR_ROLE_MAX_EXCEEDED`` error, and simply
+    dropping the extras silently changes the grain -- measured, keeping the wrong pill collapsed
+    ~5,000 marks into 3, which renders perfectly.
+
+    Microsoft documents the fix: *"If your data doesn't include a specific row number or ID, you can
+    create a field to concatenate your x and y values together. The field must be unique for each
+    point you want to plot."* So the dimensions are folded into one key column, which by construction
+    has exactly Tableau's distinct-tuple count.
+
+    Returns ``[]`` for a report with no multi-dimension scatter, so nothing is emitted unless needed.
+    """
+    out, seen = [], set()
+    for ws in (ir or {}).get("worksheets") or []:
+        if ws.get("visual_type") != VT_SCATTER:
+            continue
+        dims = _scatter_category_dims(ws)
+        if len(dims) < 2:
+            continue
+        tables = {d.get("entity") for d in dims if d.get("entity")}
+        if len(tables) != 1:
+            continue        # a key spanning two tables is not a column -- fail closed
+        name = scatter_composite_key_name(dims)
+        key = (next(iter(tables)), name)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"table": key[0], "name": name,
+                    "columns": [d.get("property") or d.get("caption") for d in dims]})
+    return out
+
+
+def _scatter_category_dims(ws):
+    """The ordered category dimensions a scatter worksheet grains its marks by."""
+    enc = ws.get("encodings") or {}
+    detail = enc.get("detail")
+    detail_dims = [f for f in (enc.get("detail_dims") or []) if f and f.get("kind") == "category"]
+    rows, cols = ws.get("rows") or [], ws.get("cols") or []
+    cats = [f for f in (list(rows) + list(cols)) if f and f.get("kind") == "category"]
+    cats += ([detail] if detail and detail.get("kind") == "category" else []) + detail_dims
+    out, seen = [], set()
+    for f in cats:
+        k = (f.get("entity"), f.get("property"))
+        if k not in seen:
+            seen.add(k)
+            out.append(f)
+    return out
+
+
+def _chart_discrete_measure_fill(ws, state, vtype, model_table, field_map, warnings):
+    """A DISCRETE aggregate measure on Tableau's Colour shelf -> ``(dataPoint objects, fact)``.
+
+    Tableau paints marks by CATEGORY when a discrete field sits on Colour. When that field is an
+    *aggregate* measure (``IF SUM([Profit]) > 0 THEN TRUE ELSE FALSE END``) Power BI cannot express
+    it as a native categorical legend: a legend needs a grouping COLUMN, a column is row-level, and
+    a row-level split changes the mark grain (one bar becomes two stacked segments) -- a well-known
+    Power BI pitfall, and a silent corruption of the numbers.
+
+    So this emits what an experienced Power BI developer writes for exactly this problem: a **colour
+    measure** returning a hex string, bound through conditional formatting. Microsoft's own guidance
+    calls this out -- *"You can create a DAX measure that returns color values based on your business
+    logic"* -- and it is the `Field value` format style, so it round-trips **editably** in Desktop's
+    `fx` dialog rather than being unreachable JSON. It also keeps the per-mark AGGREGATE grain, which
+    is the whole point.
+
+    THE SELECTOR IS LOAD-BEARING. Without ``dataViewWildcard`` Power BI still honours the expression
+    but evaluates it in ONE context and paints every mark the same colour -- with a clean validation
+    pass. Rendered proof: with the selector a Sub-Category bar chart split Bookcases/Supplies/Tables
+    from the profitable members, and a scatter split thousands of points on the zero line; without
+    it, every mark was identical. This is a validation-invisible failure, hence the explicit note.
+    """
+    color = ws["encodings"].get("color")
+    if not color or not color.get("discrete_measure"):
+        return None, None
+    if vtype not in _CHART_CONTINUOUS_FILL_TYPES:
+        return None, None
+    if color.get("kind") != "value" or color.get("binding") not in ("aggregation", "measure"):
+        return None, None
+    measure_name = _discrete_colour_measure_name(color)
+    fact = {"kind": "chart_discrete_measure_fill",
+            "colour_measure": measure_name,
+            "source_measure": color.get("caption"),
+            "colors": [_DISCRETE_COLOUR_TRUE, _DISCRETE_COLOUR_FALSE],
+            "status": "emitted"}
+    objects = [{
+        "properties": {"fill": {"solid": {"color": {"expr": {
+            "Measure": {"Expression": {"SourceRef": {"Entity": MEASURES_TABLE}},
+                        "Property": measure_name}}}}}},
+        # REQUIRED -- see the docstring. matchingOption 0 = every data point.
+        "selector": {"data": [{"dataViewWildcard": {"matchingOption": 0}}]},
+    }]
+    warnings.append(_warn(
+        "worksheet", ws["name"],
+        "discrete colour: Tableau colours these marks by a DISCRETE aggregate measure (%r). Power BI "
+        "has no native categorical legend for a measure-driven colour -- a legend needs a grouping "
+        "COLUMN, which is row-level and would change the mark grain -- so this is rebuilt as "
+        "conditional formatting driven by a colour measure %r (Format style 'Field value', editable "
+        "in Desktop's fx dialog). The marks keep their aggregate grain; there is no colour legend"
+        % (color.get("caption"), measure_name)))
+    return objects, fact
+
+
 def _chart_continuous_fill(ws, state, vtype, model_table, field_map, warnings):
     """Continuous colour measure on a chart's marks -> (data_point_objects, fact).
 
@@ -9116,6 +9378,24 @@ def _chart_continuous_fill(ws, state, vtype, model_table, field_map, warnings):
         return None, fact
 
     input_expr, bound_ref, _ = _field_expression(color, model_table, field_map)
+    # CRASH GUARD, unconditional. A gradient establishes its domain with MIN/MAX over this input, and
+    # neither is valid on a non-numeric measure: Power BI throws rsDataShapeQueryTranslationError
+    # ("The function 'Min' cannot be invoked with the specified arguments") the moment the page
+    # renders, and NO structural gate sees it -- the TMDL deserialises, the M is valid, the PBIR
+    # validates clean. The discrete path above should already have claimed such a driver; this is the
+    # belt-and-braces that makes "never emit a visual that errors on open" an invariant rather than a
+    # claim, however the colour scale arrived.
+    if not _gradient_input_is_safe(color):
+        reason = ("colour driver %r is not numeric (%s), so a continuous gradient's MIN/MAX domain "
+                  "cannot be computed over it" % (color.get("caption"),
+                                                  color.get("datatype") or "unknown type"))
+        warnings.append(_warn(
+            "worksheet", ws["name"],
+            "continuous mark colours deferred (%s); the visual is emitted with theme colours rather "
+            "than a gradient that would fail at render" % reason))
+        fact["status"] = "deferred"
+        fact["reason"] = reason
+        return None, fact
     data_point_objects = [{
         "properties": {"fill": {"solid": {"color": {"expr": {
             "FillRule": {
@@ -11722,8 +12002,11 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                     ws, state, model_table, field_map, warnings)
             data_point_objects, mc_fact = _data_point_colors(
                 ws, state, ws["visual_type"], model_table, field_map, warnings)
-            cont_objects, cont_fact = _chart_continuous_fill(
+            cont_objects, cont_fact = _chart_discrete_measure_fill(
                 ws, state, ws["visual_type"], model_table, field_map, warnings)
+            if cont_objects is None:
+                cont_objects, cont_fact = _chart_continuous_fill(
+                    ws, state, ws["visual_type"], model_table, field_map, warnings)
             if cont_objects:
                 # a continuous colour scale owns the mark fill; the Measure-Names series is N/A
                 ms_objects, ms_fact = None, None
@@ -11983,8 +12266,11 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 ws, state, model_table, field_map, warnings)
         data_point_objects, mc_fact = _data_point_colors(
             ws, state, ws["visual_type"], model_table, field_map, warnings)
-        cont_objects, cont_fact = _chart_continuous_fill(
+        cont_objects, cont_fact = _chart_discrete_measure_fill(
             ws, state, ws["visual_type"], model_table, field_map, warnings)
+        if cont_objects is None:
+            cont_objects, cont_fact = _chart_continuous_fill(
+                ws, state, ws["visual_type"], model_table, field_map, warnings)
         if cont_objects:
             # a continuous colour scale owns the mark fill; the Measure-Names series is N/A
             ms_objects, ms_fact = None, None
