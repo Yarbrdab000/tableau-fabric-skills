@@ -12,6 +12,29 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.125.0` -> `2.126.0`): a density map is a heat layer, a pie-on-a-map
+  keeps its geography, and a flattened dual-axis map says which layers it lost.** Three map gaps that
+  each ended with output that looked finished (issues #111, #112):
+  **Density / Heatmap no longer disappears.** The mark was classed "no faithful offline Power BI
+  home" and deferred, which produced **no page at all** for the worksheet -- Tableau's own *6-1 Maps*
+  sample lost its entire Density Map sheet. azureMap has a native `heatMapLayer`, which is exactly
+  this mark, so it is rebuilt: Location on Category, the weighting measure on Size as the layer's
+  intensity field, and the bubble layer switched off so points do not double-draw over the surface.
+  **A pie-on-a-map keeps its map.** A `Pie` mark over a geography fell through to the chart
+  heuristics and emitted a plain `pieChart` with the geography **silently dropped** -- worse than a
+  degraded map, because the result looks complete. It now rebuilds as a bubble map and states that
+  the per-slice split is what was lost.
+  **A dual-axis map names the real loss.** Tableau stacks several mark layers in one worksheet (a
+  Multipolygon choropleth plus Pie marks at a finer LOD); one Power BI map has ONE Location well and
+  ONE Legend well, so the extra layers are dropped. The only thing reported was *"categorical mark
+  colours deferred"* -- true, but a palette detail that reads like a nit, so a reader would never
+  guess two of three layers were gone. The collapse is now named explicitly, lists the mark classes,
+  says it is a structural loss rather than a styling one, and is ranked **first** among that
+  worksheet's warnings.
+  Also fixes a latent drop the azureMap switch introduced: `_query_state_complete` still required the
+  now-nonexistent `Gradient` role, so a symbol map whose only extra encoding was a colour measure
+  would have been judged degenerate and skipped.
+
 - **tableau-migration (skill `2.124.0` -> `2.125.0`): every map is an `azureMap` -- and `shapeMap`
   was not merely deprecated, it was rendering BLANK.** A 4-visual control page in Power BI Desktop
   established, by render rather than inference: `azureMap` draws basemap + bubbles; `azureMap` with a

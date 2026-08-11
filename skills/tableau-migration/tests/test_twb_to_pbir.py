@@ -3641,21 +3641,47 @@ def test_v2_6_polygon_without_spatial_signal_still_defers():
     assert any("deferred" in w["reason"] and w["name"] == "Custom Polygon" for w in ir["warnings"])
 
 
-def test_v2_6_density_and_heatmap_marks_over_geography_still_defer():
-    # density/heatmap layers have no faithful offline Power BI home even over a recognized geography
-    # with a spatial signal -> they always defer (the recovery gate is polygon-only, by design).
+def test_density_and_heatmap_marks_over_geography_rebuild_as_an_azure_heat_layer():
+    # REPLACES "...still_defer". The old contract said density/heatmap have "no faithful offline
+    # Power BI home" and deferred them -- which produced NO PAGE AT ALL for the worksheet (issue
+    # #112: Tableau's own 6-1 Maps sample lost its entire Density Map sheet). azureMap has a native
+    # ``heatMapLayer``, which is exactly this mark, so the worksheet is rebuilt instead of dropped.
     enc = ("<encodings>"
            "<color column='[federated.abc].[sum:Sales:qk]' />"
            "<lod column='[federated.abc].[none:State:nk]' />"
            "</encodings>")
     for mark in ("Density", "Heatmap"):
         ir = parse_twb(_workbook(_geo_ws(f"{mark} Map", mark, enc)))
-        assert ir["worksheets"][0]["visual_type"] == "unsupported", mark
-        assert _visual_parts(emit_pbir(ir)) == {}, mark
-        assert any("deferred" in w["reason"] and w["name"] == f"{mark} Map"
-                   for w in ir["warnings"]), mark
+        assert ir["worksheets"][0]["visual_type"] == "density_map", mark
+        parts = _visual_parts(emit_pbir(ir))
+        assert parts != {}, mark                       # the page is no longer dropped
+        vis = list(parts.values())[0]
+        assert vis["visual"]["visualType"] == "azureMap", mark
+        objs = vis["visual"]["objects"]
+        assert objs["heatMapLayer"][0]["properties"]["show"]["expr"]["Literal"]["Value"] == "true"
+        # bubbles OFF so the points do not double-draw over the heat surface
+        assert objs["bubbleLayer"][0]["properties"]["show"]["expr"]["Literal"]["Value"] == "false"
+        state = _query_state(vis)
+        assert state["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
+        # the weighting measure is the heat layer's intensity field
+        assert state["Size"]["projections"][0]["field"]["Aggregation"]["Function"] == 0
 
 
+def test_a_pie_on_a_map_keeps_its_geography_instead_of_becoming_a_plain_pie():
+    # A Pie mark over a geography used to fall through to the chart heuristics and emit a plain
+    # pieChart -- the geography SILENTLY dropped, and the output looks finished, which is worse than
+    # a degraded map (issue #112). azureMap has no per-point pie, so the faithful degrade is a bubble
+    # map, and the lost per-slice split is stated rather than hidden.
+    enc = ("<encodings>"
+           "<size column='[federated.abc].[sum:Sales:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' />"
+           "</encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Pie Chart Map", "Pie", enc)))
+    assert ir["worksheets"][0]["visual_type"] == "map"
+    vis = list(_visual_parts(emit_pbir(ir)).values())[0]
+    assert vis["visual"]["visualType"] == "azureMap"
+    assert _query_state(vis)["Category"]["projections"][0]["field"]["Column"]["Property"] == "State"
+    assert any("pie-on-a-map" in w["reason"] for w in ir["warnings"])
 def test_symbol_map_circle_mark_with_size_measure():
     enc = ("<encodings>"
            "<size column='[federated.abc].[sum:Sales:qk]' />"
@@ -9793,3 +9819,45 @@ def test_a_trellis_of_ONE_measure_aggregated_two_ways_fans_like_any_other():
     assert [b[5] for b in fanned] == ["Sum(Orders.Sales_Amount)", "Avg(Orders.Sales_Amount)"]
     assert fanned[0][1] == fanned[1][1] and fanned[1][0] > fanned[0][0]
     assert fanned[0][4] == "true" and fanned[1][4] == "false"
+
+# -- a dual-axis map's layer collapse is the finding, not the palette (issue #111) --------------
+
+def test_a_multi_mark_map_names_the_LAYER_COLLAPSE_and_ranks_it_first():
+    # A Tableau dual-axis map stacks several mark layers -- measured on Tableau's own 6-1 Maps
+    # sample: a Multipolygon state choropleth coloured by SUM(Profit) PLUS Pie marks at City LOD
+    # sized by SUM(Sales), three panes, two LODs, two colour encodings. A single Power BI map has ONE
+    # Location well and ONE Legend well, so it structurally cannot host that and the extra layers are
+    # DROPPED. The only thing said about it used to be "categorical mark colours deferred" -- true,
+    # but a palette detail that reads like a nit, so a reader would never guess two of three layers
+    # were gone. It is also not repairable downstream, which is why it is ranked FIRST.
+    from twb_to_pbir import _azure_map_objects_for, VT_SHAPE_MAP
+    ws = {"name": "Combined Map", "visual_type": VT_SHAPE_MAP, "mark_class": "Multipolygon",
+          "pane_marks": ["multipolygon", "pie", "pie"],
+          "encodings": {"geo_levels": [], "detail": None}}
+    warnings = [{"scope": "worksheet", "name": "Combined Map",
+                 "reason": "categorical mark colours deferred"}]
+    _azure_map_objects_for(ws, {}, warnings)
+    first = warnings[0]["reason"]
+    assert "mark layer" in first and "DROPPED" in first
+    assert "multipolygon" in first and "pie" in first
+    assert "structural loss" in first
+    # the pre-existing palette note is kept, just no longer the headline
+    assert any("categorical mark colours" in w["reason"] for w in warnings)
+
+
+def test_a_single_mark_map_does_not_claim_a_layer_collapse():
+    # A check that always fires says nothing. Repeated mark classes are ONE layer, not many.
+    from twb_to_pbir import _azure_map_objects_for, VT_SHAPE_MAP
+    for marks in ([], ["automatic"], ["pie", "pie", "pie"]):
+        ws = {"name": "Solo", "visual_type": VT_SHAPE_MAP, "mark_class": "Automatic",
+              "pane_marks": marks, "encodings": {"geo_levels": [], "detail": None}}
+        warnings = []
+        _azure_map_objects_for(ws, {}, warnings)
+        assert not any("mark layer" in w["reason"] for w in warnings), marks
+def test_a_single_mark_map_does_not_claim_a_layer_collapse():
+    # A check that always fires says nothing.
+    enc = ("<encodings><color column='[federated.abc].[sum:Profit:qk]' />"
+           "<lod column='[federated.abc].[none:State:nk]' /></encodings>")
+    ir = parse_twb(_workbook(_geo_ws("Profit by State", "Automatic", enc)))
+    emit_pbir(ir)
+    assert not any("mark layer" in w["reason"] for w in ir["warnings"])

@@ -289,6 +289,7 @@ VT_PIE = "pie"            # pieChart (angle measure + legend dimension)
 VT_FILLED_MAP = "filled_map"  # filledMap (Bing choropleth: geo Category + saturation measure on the Gradient/Color-saturation well)
 VT_MAP = "map"            # map (symbol/bubble: geo Location + measure Size/Color)
 VT_SHAPE_MAP = "shape_map"  # shapeMap (built-in-topology choropleth: geo Category + measure on the "Value" well)
+VT_DENSITY_MAP = "density_map"  # azureMap heatMapLayer (Tableau's Density/Heatmap mark over a geography)
 VT_COMBO = "combo"        # lineClusteredColumnComboChart (column measure(s) on Y + line measure(s) on Y2)
 VT_WATERFALL = "waterfall"  # waterfallChart (running-total Gantt hack: dimension Category + base measure Y)
 VT_DONUT = "donut"          # donutChart (dual-axis pie/donut hack: legend Category + angle measure Y)
@@ -324,6 +325,11 @@ _VT_TO_PBIR = {
     VT_FILLED_MAP: "azureMap",
     VT_MAP: "azureMap",
     VT_SHAPE_MAP: "azureMap",
+    # Tableau's Density / Heatmap mark over a geography. It used to defer to VT_UNSUPPORTED -- "no
+    # offline home" -- and the whole worksheet produced NO PAGE AT ALL (issue #112). azureMap has a
+    # native ``heatMapLayer`` that is exactly this mark, so the worksheet is now rebuilt instead of
+    # dropped.
+    VT_DENSITY_MAP: "azureMap",
     # Dual-axis / combo: a column-family measure share an axis with a line-family measure. Power
     # BI's combo chart puts the column measure(s) on Y (primary axis) and the line measure(s) on
     # Y2 (secondary axis). Role keys (Category/Series/Y/Y2) verified against real Microsoft PBIR
@@ -1961,6 +1967,11 @@ def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
         # truly-custom polygon and still defers; density/heatmap have no offline home, always defer.
         if m in _POLYGON_MAP_MARKS and map_signal:
             return VT_SHAPE_MAP
+        # Tableau's DENSITY / HEATMAP mark over a geography has a native azureMap home -- the
+        # ``heatMapLayer`` -- so it is rebuilt rather than deferred. Deferring it produced no page at
+        # all for the worksheet (issue #112), which is a worse answer than a faithful heat layer.
+        if m in _DENSITY_MAP_MARKS:
+            return VT_DENSITY_MAP
         if m in _DEFER_MAP_MARKS:
             return VT_UNSUPPORTED
         # A geo Location + a measure is a choropleth shaded by that measure -> shapeMap (the faithful
@@ -1970,6 +1981,13 @@ def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
         if m in ("map", "filled", "filledmap"):
             return VT_SHAPE_MAP
         if m in ("circle", "square", "shape", "point") and map_signal:
+            return VT_MAP
+        # A PIE mark over a geography is Tableau's pie-on-a-map. Falling through to the chart
+        # heuristics turned it into a plain ``pieChart`` -- the geography SILENTLY dropped, and the
+        # output looks finished, which is worse than a degraded map (issue #112). azureMap has no
+        # per-point pie, so the faithful degrade is a bubble layer with the pie's own colour
+        # dimension as the Series legend; the caller warns that the per-slice split is lost.
+        if m == "pie" and map_signal:
             return VT_MAP
         if m in ("automatic", "") and map_signal:
             return VT_SHAPE_MAP
@@ -1981,6 +1999,8 @@ def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
     # is a map, not a text list). The faithful rebuild is a filledMap carrying just the Location
     # (Category); the colour-saturation measure is simply absent. Custom-geometry marks still defer.
     if geo_detail and not map_meas and not axis_dim and not axis_meas:
+        if m in _DENSITY_MAP_MARKS:
+            return VT_DENSITY_MAP
         if m not in _DEFER_MAP_MARKS:
             return VT_FILLED_MAP
 
@@ -5020,6 +5040,12 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "datasource": primary_caption,
         "datasource_name": ds_default,
         "mark_class": mark,
+        # Every mark class present across the worksheet's panes. A Tableau DUAL-AXIS map stacks
+        # several mark layers in one worksheet (a Multipolygon choropleth plus Pie marks at a finer
+        # LOD), and one Power BI map has one Location well and one Legend well, so the extra layers
+        # are dropped -- which has to be SAID (issue #111). Recorded here so the emitter can name the
+        # real loss instead of only the palette detail that follows from it.
+        "pane_marks": _all_pane_marks(table),
         "visual_type": visual_type,
         "title": title_text,
         "caption_only_raw": caption_only_raw,
@@ -7096,6 +7122,21 @@ def _build_query_state(ws, model_table, field_map, warnings):
         if color_series:
             state["Series"] = {"projections": _role_projections(
                 color_series, model_table, field_map, used_refs)}
+    elif vt == VT_DENSITY_MAP:
+        # Density / heat map: the geo dimension is the Category (Location) and the weighting measure
+        # rides ``Size`` -- azureMap's heatMapLayer uses Size as its intensity field, exactly as
+        # Tableau's Density mark weights by the measure on Size/Colour.
+        loc = drop_calc_axis(_dedupe(finest_geo(detail)))
+        meas = _dedupe(
+            ([size] if size and size["kind"] == "value" else [])
+            + ([color] if color and color["kind"] == "value" else [])
+            + values(rows) + values(cols))
+        if loc:
+            state["Category"] = {"projections": _role_projections(
+                loc, model_table, field_map, used_refs)}
+        if meas:
+            state["Size"] = {"projections": _role_projections(
+                meas[:1], model_table, field_map, used_refs)}
     elif vt == VT_MAP:
         # symbol / bubble map: the geo dimension binds the Category role (the map's "Location" well
         # -- role NAME is "Category", displayName "Location"; there is NO role literally named
@@ -7168,8 +7209,15 @@ def _query_state_complete(vt, state):
         # measure is optional (a geo Detail whose measure was dropped is still a location-only map).
         return "Category" in state
     if vt == VT_MAP:
+        # ``Gradient`` no longer exists on the emitted visual (azureMap has no such role -- the
+        # colour measure moved to ``Tooltips``), so a symbol map whose only extra encoding was a
+        # colour measure would have been judged degenerate and DROPPED.
         return "Category" in state and (
-            "Size" in state or "Gradient" in state or "Series" in state)
+            "Size" in state or "Tooltips" in state or "Series" in state)
+    if vt == VT_DENSITY_MAP:
+        # A heat layer needs somewhere to draw: the Location is essential, the weighting measure is
+        # optional (an unweighted density map is a valid point-density surface).
+        return "Category" in state
     if vt == VT_MATRIX:
         return "Values" in state and ("Rows" in state or "Columns" in state)
     if vt == VT_TABLE:
@@ -9331,6 +9379,15 @@ def _azure_map_objects(ws, visual_type, shading_field=None):
     }
     objects = {"mapControls": [{"properties": dict(controls)}]}
 
+    if visual_type == VT_DENSITY_MAP:
+        # Tableau's Density mark IS a heat layer, and azureMap has one natively. The bubble layer is
+        # switched off so the points do not double-draw over the heat surface.
+        objects["heatMapLayer"] = [{"properties": {
+            "show": {"expr": {"Literal": {"Value": "true"}}}}}]
+        objects["bubbleLayer"] = [{"properties": {
+            "show": {"expr": {"Literal": {"Value": "false"}}}}}]
+        return objects
+
     if visual_type == VT_MAP or shading_field is None:
         # A symbol/bubble map keeps the bubble layer and gets NO reference layer: its geography is
         # the point itself, not an area, so a polygon overlay would be an invention.
@@ -9421,8 +9478,30 @@ def _azure_map_objects_for(ws, state, warnings):
     back from the query state guarantees the two agree rather than rebuilding it and hoping.
     """
     vt = ws.get("visual_type")
-    if vt not in (VT_SHAPE_MAP, VT_FILLED_MAP, VT_MAP):
+    if vt not in (VT_SHAPE_MAP, VT_FILLED_MAP, VT_MAP, VT_DENSITY_MAP):
         return None
+    # ISSUE #111: a Tableau DUAL-AXIS map stacks several mark layers -- e.g. a Multipolygon state
+    # choropleth coloured by SUM(Profit) PLUS Pie marks at City LOD sized by SUM(Sales) -- and a
+    # single azureMap has ONE Location well and ONE Legend well, so it structurally cannot host two
+    # LODs with two colour encodings. The layers beyond the first are therefore DROPPED, and the only
+    # thing said about it used to be a note that "categorical mark colours are deferred" -- true, but
+    # a palette detail that reads like a nit, so a reader would never guess two of three layers were
+    # gone. Named first and explicitly, because it is not repairable downstream.
+    _marks = [m for m in (ws.get("pane_marks") or []) if m]
+    if len(dict.fromkeys(_marks)) > 1:
+        warnings.insert(0, _warn(
+            "worksheet", ws["name"],
+            "dual-axis map: %d mark layer(s) (%s) were flattened into ONE visual and layers 2..%d "
+            "are DROPPED -- a single Power BI map has one Location well and one Legend well, so it "
+            "cannot host several LODs with several colour encodings. The faithful rebuild is one "
+            "visual PER layer; this is a structural loss, not a styling one"
+            % (len(_marks), ", ".join(dict.fromkeys(_marks)), len(_marks))))
+    if vt == VT_MAP and (ws.get("mark_class") or "").strip().lower() == "pie":
+        warnings.append(_warn(
+            "worksheet", ws["name"],
+            "pie-on-a-map rebuilt as a BUBBLE map: Power BI has no per-point pie marker, so the "
+            "geography and the sizing measure are kept and the per-slice split is lost. Previously "
+            "this became a plain pieChart with the geography dropped entirely"))
     shading = None
     for proj in ((state.get("Tooltips") or {}).get("projections") or []):
         if proj.get("field"):
