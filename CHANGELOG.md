@@ -12,6 +12,276 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.125.0` -> `2.126.0`): a density map is a heat layer, a pie-on-a-map
+  keeps its geography, and a flattened dual-axis map says which layers it lost.** Three map gaps that
+  each ended with output that looked finished (issues #111, #112):
+  **Density / Heatmap no longer disappears.** The mark was classed "no faithful offline Power BI
+  home" and deferred, which produced **no page at all** for the worksheet -- Tableau's own *6-1 Maps*
+  sample lost its entire Density Map sheet. azureMap has a native `heatMapLayer`, which is exactly
+  this mark, so it is rebuilt: Location on Category, the weighting measure on Size as the layer's
+  intensity field, and the bubble layer switched off so points do not double-draw over the surface.
+  **A pie-on-a-map keeps its map.** A `Pie` mark over a geography fell through to the chart
+  heuristics and emitted a plain `pieChart` with the geography **silently dropped** -- worse than a
+  degraded map, because the result looks complete. It now rebuilds as a bubble map and states that
+  the per-slice split is what was lost.
+  **A dual-axis map names the real loss.** Tableau stacks several mark layers in one worksheet (a
+  Multipolygon choropleth plus Pie marks at a finer LOD); one Power BI map has ONE Location well and
+  ONE Legend well, so the extra layers are dropped. The only thing reported was *"categorical mark
+  colours deferred"* -- true, but a palette detail that reads like a nit, so a reader would never
+  guess two of three layers were gone. The collapse is now named explicitly, lists the mark classes,
+  says it is a structural loss rather than a styling one, and is ranked **first** among that
+  worksheet's warnings.
+  Also fixes a latent drop the azureMap switch introduced: `_query_state_complete` still required the
+  now-nonexistent `Gradient` role, so a symbol map whose only extra encoding was a colour measure
+  would have been judged degenerate and skipped.
+
+- **tableau-migration (skill `2.124.0` -> `2.125.0`): every map is an `azureMap` -- and `shapeMap`
+  was not merely deprecated, it was rendering BLANK.** A 4-visual control page in Power BI Desktop
+  established, by render rather than inference: `azureMap` draws basemap + bubbles; `azureMap` with a
+  data-bound `referenceLayer` draws a real choropleth; and a **byte-identical `shapeMap`** -- what
+  this engine emitted for every measure choropleth -- drew **completely blank**, same machine, same
+  data, same shared `usa.states.topo` resource. So the main choropleth path was shipping an empty
+  visual, while the location-only path shipped a Bing `filledMap` that now raises a *"Bing map visuals
+  are going away"* modal in Desktop (issues #106, #112).
+  All three map routes now emit `azureMap` with the render-proven encoding: the shading measure moves
+  off `Value`/`Gradient` onto **`Tooltips`** (azureMap has neither -- `catalog describe azureMap` gives
+  Category/Y/X/Series/Size/Tooltips/PathID/PointOrder -- and Tooltips is a real MEASURE role, so the
+  FillRule's `Input` resolves); `referenceLayer` is a **two-entry** array, the layer plus a
+  `dataViewWildcard`-selected `polygonFillColor` (one merged entry does not shade); `bubbleLayer.show`
+  is forced **false** on a choropleth, without which Azure Maps draws a bubble on every centroid ON TOP
+  of the polygons; and `mapControls.defaultStyle` is `blank_accessible` with a `#D9D9D9` stroke, the
+  closest of four rendered variants to Tableau's own white-background, no-chrome map.
+  Fail-closed where it must be: a SYMBOL map gets no reference layer (its geography is the point, not
+  an area) and keeps its bubbles, and a non-US or coarser geography gets basemap + bubbles rather than
+  a polygon layer keyed on names we have not proven line up. The choropleth depends on a PUBLIC GeoJSON
+  URL, so it now WARNS that an offline or locked-down tenant must re-point `referenceLayerUrl`.
+  Ships the reporter's suggested static guard: no route in `_VT_TO_PBIR` may resolve to `map`,
+  `filledMap` or `shapeMap`, and `azureMap` must be reachable so the guard cannot pass by emitting no
+  map at all. Corpus: **5 `shapeMap` + 1 `map` -> 6 `azureMap`**, 29/29.
+
+- **tableau-migration (skill `2.123.0` -> `2.124.0`): a table that landed related to NOTHING says
+  so.** An unrelated dimension does not error -- it returns that table's GRAND TOTAL identically on
+  every row of a breakdown, while `relationship_columns_exist`, TMDL deserialization, open and
+  refresh all pass. Reported on a Snowflake datasource where `DIM_CUSTOMER` and `DIM_DATE` both
+  landed orphaned and the fact related only to the synthetic `Date` table, so a *revenue by region*
+  and a *customer segment breakdown* would each have shown one repeated number (issue #107).
+  Verified first that a DECLARED join is recovered -- it is -- so an orphan here means the source
+  declared none, which is common for a warehouse datasource whose joins live in the warehouse. That
+  cannot be invented (a guessed relationship returns a different wrong number rather than the right
+  one), so each orphan is reported with the columns it SHARES with the largest other table: evidence
+  for a human, never an automatic join. The fact for a given orphan is the largest OTHER table, so a
+  table is never compared with itself -- the first cut listed a table's own columns as its candidate
+  join keys.
+  `duplicate_date_dimension` flags the sharper signal the issue identified: a source-provided date
+  dimension landed orphaned while a synthetic `Date` table also exists and took the fact's
+  relationship, so the model carries two date tables and the real one is unusable.
+  Additive `report["orphan_tables"]`. Found orphans in **7 of 29** corpus workbooks, every one
+  previously silent.
+
+- **tableau-migration (skill `2.122.0` -> `2.123.0`): Tableau DECLARES its blend links, and nothing
+  read them.** A blended secondary datasource landed in the model related to **nothing but Date**, so
+  any visual slicing it returned the whole table's grand total identically for every member --
+  measured on Superstore at **4.4x high and constant** (Consumer 13,625 against Tableau's 3,086),
+  while the fact's own measures on the very same rows matched Tableau exactly, which is what made it
+  hard to see: the chart is half right. The same root cause refused three calcs as *"qualified
+  reference ... (unmodeled)"* for a field that WAS modelled, as `Sheet1[Sales_Target]`, 4,603 rows.
+  The join keys were never a guess -- Tableau writes them in `<datasource-relationships>` with an
+  explicit `<column-mapping>`, and that block was not parsed anywhere in the engine. It is now, and
+  a declared blend whose two sides landed as UNRELATED tables is reported with the exact columns
+  Tableau declared, de-duplicated across the per-derivation `<map>` entries Tableau writes for one
+  date field. Each side resolves through its OWN datasource via `table_map`, never the bare caption:
+  `naming` is first-writer-wins on a caption, so resolving `Category` by name puts both sides on one
+  datasource and the link reads as a self-join (measured -- the first cut reported nothing).
+  The relationship is deliberately NOT invented: a blend is a composite-key link at a chosen date
+  grain with no single-column Power BI equivalent, and a wrong relationship returns a number that
+  renders perfectly. The refusal reason now names where the field landed and what to add, instead of
+  denying data the model contains. Found a **second, previously silent** case in the corpus
+  (`0073_comparing_attributes_within_a_dimension`).
+
+- **tableau-migration (skill `2.121.0` -> `2.122.0`): a published datasource is indexed under EVERY
+  name it answers to, so a `sqlproxy` workbook binds the model its datasource just produced.** The
+  rebind machinery already existed; the JOIN did not fire. A published datasource travels to a
+  workbook as a `sqlproxy` stub whose caption is the datasource's DISPLAY NAME on the server
+  (`Meridian Sales (Live Snowflake)`), while the exported `.tds` is normally named for the content
+  (`MeridianSales.tds`) -- and the catalog was keyed on the FILE STEM alone, so
+  `meridiansaleslivesnowflake` missed `meridiansales` and the workbook was skipped with *"relation
+  'sqlproxy' has no resolvable columns"* while its datasource sat migrated in the same run.
+  Measured at **9 of 38 workbooks (24%)** on a live site (issue #105), and the fraction GROWS with
+  governance -- a shared published datasource is the recommended Tableau pattern, so a well-run
+  estate is mostly `sqlproxy`.
+  The catalog now indexes the file stem, the `.tds`'s own `caption`, and its `formatted-name`. A key
+  that two different datasources both answer to identifies neither, so it is **withheld** rather than
+  letting whichever migrated last win -- binding the wrong schema would render perfectly -- and every
+  lookup treats an ambiguous key exactly like a miss. Verified on the reported shape: a published
+  `.tds` plus the workbook that binds it now goes from `0/1` reports bound (`definition_of_done:
+  skipped`, no `.pbip`) to **1/1 bound, `pass`, and an openable project**, with the recovered model
+  carrying the real Snowflake-bound schema and the published datasource's own calculated field.
+
+- **tableau-migration (skill `2.120.0` -> `2.121.0`): a needs-decision message says WHICH kind of
+  problem it is.** *"I cannot see the schema"* and *"I can see it but will not choose a storage mode
+  for you"* read identically, and they need opposite responses from the operator (issue #109). The
+  rationale now names the state: a `schema-not-visible` case says the columns could not be read from
+  anything available offline and asks for a connection or a typed artifact; anything else says the
+  schema IS readable and that what is missing is a storage-mode choice.
+  The issue's primary case -- a JOINED flat-file datasource reporting *"relation 'Orders.csv' has no
+  resolvable columns"* and skipping the workbook -- is resolved by the 2.120.0 multi-table extract
+  expansion; verified here on the reported shape (a nested 3-way CSV join, extracted), which now
+  types all three relations from their own extract tables and reports `mode=Import`.
+
+- **tableau-migration (skill `2.119.0` -> `2.120.0`): a MULTI-table extract types each relation
+  from its own parent instead of skipping the workbook.** A single-table extract collapses onto its
+  one materialised table. A multi-table extract correctly refuses to collapse -- folding three tables
+  onto one would silently discard two -- but that refusal used to END the story: every relation was
+  reported as *"has no resolvable columns"*, the datasource was declared un-typable, and the whole
+  workbook's `.pbip` was **skipped** with `definition_of_done: failed`, while a complete typed schema
+  and 11,807 rows sat in the bundled `.hyper` the entire time. Measured at **4 of 6** workbooks in a
+  standard Tableau training corpus (issue #104), and the shape is common -- an analyst unions a few
+  CSVs and publishes an extract.
+  The information was already there: the extract files **one parent per table**, each with its own
+  typed `metadata-record` columns. What was missing was a per-relation mapping, not a schema. Each
+  column-less relation is now typed from its OWN parent, matched on the GUID-stripped, case- and
+  punctuation-folded name (`Orders.csv` <-> `Orders.csv_96FB...`), and stamped with that parent's own
+  `.hyper` identity so the materialiser reads the right rows per table.
+  Every guarantee the original guard protected is kept, and the mapping must be **one-to-one or
+  nothing**: an unmatched relation, an ambiguous name, two relations claiming one parent, or a parent
+  with no typed columns each leave the relations untouched and degrade to exactly the previous
+  behaviour. Verified with those negative controls plus the positive: the reported datasource now
+  reports `mode=Import` where it previously reported "needs a storage decision". Corpus 29/29 with
+  identical status counts -- the construct does not occur there, which is why it went unnoticed.
+
+- **tableau-migration (skill `2.118.0` -> `2.119.0`): generated M no longer depends on the ambient
+  locale.** `Table.TransformColumnTypes` with no culture parses with the locale of whichever machine
+  REFRESHES the model, so a dot-decimal source is silently corrupted on a comma-decimal host: issue
+  #110 measured `SUM(Sales)` at **1,131,591,720 against a true 2,297,200.86**, with 25/75 numeric
+  oracle checks passing while TMDL deserialization, M syntax, the openability self-check and a
+  persisted cache were all green. The inflation ratio is `10^decimals`, so it DIFFERS PER COLUMN --
+  493x on one, 6,285x on another in the same table -- which is the fingerprint.
+  A culture is now pinned wherever the rendering can be **proven**, and only there:
+  a CSV this engine wrote (`hyper_reader.write_rows_csv` renders with Python `str()`, which is
+  invariant) gets `en-US`; a user's CSV has its convention **read off the file** -- `Csv.Document`
+  passes text through unchanged, so the convention is a property of the file, not a guess -- and gets
+  `en-US` or `de-DE` accordingly. That sniff parses with the `csv` module rather than splitting on
+  commas, because a comma-decimal file writes its numbers QUOTED (`"1.234,56"`) and a naive split
+  tears that into `1.234` + `56`, classifying a European file as American: the exact inversion the
+  check exists to prevent (measured while building it).
+  A **legacy ACE workbook** (`.xls`/`.xlsb`) gets NO culture and a loud warning instead. Its reader
+  returns cells already rendered in the host's locale; that locale is not knowable at generation time
+  and not observable from within M (`Culture.Current` returns `sourceQueryCulture`, not the Windows
+  locale), so no culture can be proven -- and the obvious guess is actively wrong, since pinning
+  `en-US` on a comma-decimal host is a no-op that leaves the values corrupt. OOXML `.xlsx`/`.xlsm`
+  are unaffected: they store numbers as invariant doubles, so nothing is parsed from text.
+  Corpus 29/29: culture coverage `0/70` -> `11` pinned, every remaining unpinned CSV partition has
+  **zero decimal columns** (no exposure), and all **3** legacy `.xls` partitions now warn, with no
+  false positives.
+
+- **tableau-migration (skill `2.117.0` -> `2.118.0`): an Excel navigation key is decided from the
+  ACE identifier, KIND included -- and can no longer carry a `$`.** Tableau records an Excel object
+  with the legacy ACE/OLEDB identifier (`table='[Orders$]'`), which `Excel.Workbook` does not
+  accept: the model validates, opens and passes the definition of done, then fails at **refresh**
+  in Desktop with *"The key didn't match any rows in the table"* -- a failure no structural gate
+  can see, and which cost a reported ~90 minutes of an agent sitting on it (issue #108).
+  `_excel_navigation` now returns `(item, kind)` from one reading of the identifier and covers the
+  forms that previously slipped through: a quoted-then-bracketed `'[Orders$]'` (only one peel was
+  applied, so the brackets survived), a workbook-qualified `[Book].[Orders$]` (mangled), a RANGE
+  `[Sheet1$A1:D100]` (emitted verbatim -- the range bounds are not a navigation key, so its SHEET
+  is), and a **named range** `[MyNamedRange]`, which is not a worksheet at all and needs
+  `Kind="DefinedName"` -- navigating it as `Kind="Sheet"` failed identically. A bare `name`
+  fallback carries no kind information, so it stays `Sheet` rather than being guessed.
+  `_is_excel_path` now recognises the LEGACY binary formats (`.xls`/`.xlsb`) -- #108 was filed
+  against a `.xls`, and treating it as not-Excel skipped the sheet decision for exactly the files
+  that need it most. Sheet READING is split out into `_is_zip_readable_excel_path`, since a binary
+  workbook is not a zip, so header reconciliation still degrades fail-closed instead of mis-parsing.
+  Ships with an emitter-level guard that strips a surviving `$` unconditionally: no Excel sheet name
+  may contain `$`, so it cannot fire on legitimate input, and it turns "this path normalises" into a
+  guarantee that holds however the relation reached the emitter. Corpus 29/29 with **zero** change to
+  any navigation key and no `$`-suffixed key anywhere in emitted output.
+
+- **tableau-migration (skill `2.116.0` -> `2.117.0`): a lost Tableau session must not read as
+  "this workbook has no dependencies".** The `401002` handling from #97 lived in
+  `fidelity_reference` only, so `estate_survey` -- written later on the same transport -- inherited
+  none of it, and its failure mode was the exact one it exists to eliminate: a **silent zero**. Once
+  a Cloud session died mid-run, every remaining workbook recorded `[]`, which reads downstream as
+  *independent, migrate in any order*; `connection_read_errors` reached neither `summary` nor the
+  exit code, so the run wrote a clean-looking `survey.json` and **exited 0**. Separately, a `401002`
+  on page 3 of 5 escaped `paged_list` entirely and the script died with **no survey written at all**.
+  Fixed in the SHARED layer so every current and future script inherits it (issue #99):
+  `_http` now returns the synthetic status `0` for a network fault (reset connection, DNS blip, read
+  timeout) instead of letting a raw `OSError` escape; `classify_http_failure` sorts a failure into
+  transient / session_loss / credential / fatal, testing **transient first** so a gateway `503` whose
+  body happens to contain the word "authentication" is still retried; `_http_json` retries the
+  transient class with bounded exponential backoff honouring `Retry-After`, recovers a session loss
+  through a caller-supplied re-auth hook, and **never retries** `400081` /
+  `FederatedDataSourceException` -- Tableau itself cannot query that source, so no retry conjures a
+  credential and the remedy is surfaced instead. `fidelity_reference` now sources the code from the
+  shared constant so the two cannot drift again.
+  `estate_survey` distinguishes **unknown from empty**: an unread workbook is marked
+  `dependencies_unknown` and counted as understated rather than independent, a partial listing is
+  reported as an INCOMPLETE estate rather than crashing, and the survey carries a `degraded` flag
+  that the report text and the **exit code** both honour.
+
+- **tableau-migration (skill `2.115.0` -> `2.116.0`): a Tableau aggregation over a ROW-LEVEL SCALAR
+  is `n*k`, not `k` -- and two derivations of one calc are two columns, not one.** A calc built only
+  from parameters and literals references no column, so its value is identical on every row; Tableau
+  still evaluates it PER ROW and aggregates it on the shelf, so `SUM` is `n*k` while a DAX measure
+  evaluates once and returns `k`. Measured on Superstore (issue #103): the `OTE` table reported
+  **$142K against Tableau's $5.82M**, and because a `Sum` pill and an `Avg` pill over that one calc
+  resolved to the SAME measure reference, the second projection was de-duplicated away -- Tableau's
+  *Avg. OTE* column was **missing entirely**, on a visual the engine reported as `rebuilt`.
+  The model now emits `SUMX`/`COUNTX` companions for exactly the two derivations that differ
+  (`Avg`/`Min`/`Max` ARE the scalar, and keep binding the base measure), and the viz binder selects
+  the companion for the pill's own derivation. The companion iterates the calc's **own datasource
+  island** -- a global anchor counts another datasource's rows, which renders perfectly and is wrong
+  -- and is withheld entirely when the island does not name exactly one landed table, so an
+  ambiguous case keeps today's binding rather than inventing a number.
+  Root cause of the collapse was broader than the grain error: **the Measure Values path resolved its
+  members without any of the model's binding channels**, so every member fell back to the standing
+  caption resolution instead of the authoritative model measure. All four channels are now threaded
+  through it. Verified across every available workbook: 22 aggregated pills over parameter-only
+  scalars in **20 of 83** workbooks, 7 carrying the same scalar at two or more derivations. Corpus
+  29/29 with **zero** change to pages, visuals, projections or measure counts (the construct does not
+  occur there), and the reported workbook now emits both columns with `SUMX('Sales Commission.csv',
+  [OTE (Variable)])` for the `Sum` member.
+
+- **tableau-migration (skill `2.114.0` -> `2.115.0`): a row-level CONSTANT is a column of `k`, not
+  `measure = k`.** Tableau evaluates a row-level calc once PER ROW and aggregates it on the shelf,
+  so `SUM([Number of Records])` (formula `1`) is the row count -- but a DAX `measure = 1` evaluates
+  ONCE and returns 1, discarding row multiplicity entirely. Measured on the corpus: **6 constant
+  measures** shipped across **5 of 29 models**, with **7 visuals projecting one**, every one showing
+  1 instead of a count. A handler existed but was gated on the NAME (`Number of Records` /
+  `Count of <Table>`) *and* only ran when calcs were auto-extracted, so the workbook path -- the main
+  path -- never reached it, and a renamed field (measured: `1 (Intake)`) missed it regardless.
+  Routing now happens at the shared pre-router chokepoint and is keyed on the **formula**, never the
+  name. Literals only: a parameter-referencing scalar stays a measure, because a calculated column is
+  baked at refresh and would freeze against the what-if slicer.
+  Ships with the paired BINDER change that makes it safe: the viz layer's implicit-row-count channel
+  knew only how to find a COUNTROWS measure, so moving the calc left it unbound -- it warned and
+  DROPPED the pill, which took a matrix visual's last binding with it and emitted a **page-less**
+  report. The model now offers the constant column as an equally faithful target (`row_count_columns`,
+  an additive manifest section) and the pill binds it with its OWN shelf aggregation, so SUM -> n*k,
+  AVG -> k and CNT -> n all land exactly -- which a single COUNTROWS measure cannot do. A real
+  COUNTROWS measure keeps absolute priority, and an object-id count never binds to a constant column.
+  Corpus-wide before/after: constant measures **6 -> 0**, and **zero** lost pages, visuals or
+  projections -- net **+1 page, +1 visual, +5 projections** that were previously dropped.
+
+- **tableau-migration (skill `2.113.0` -> `2.114.0`): a field belongs to the datasource the PILL came
+  from, even when the relation name does not match.** An EXTRACTED datasource carries TWO relations
+  for one logical table -- the live one (`Sales Commission.csv`) and the extract materialisation
+  (`Extract`) -- and the model keys the live name while a worksheet bound to the extract carries
+  `Extract`. The (datasource, relation, caption) key then missed and resolution fell through to the
+  BARE caption, which in a multi-table model is claimed by whichever table was written first.
+  Measured on Superstore (issue #103): the Commission dashboard's `Sales` bound `Orders[Sales]`
+  (2,326,534) instead of `Sales Commission.csv[Sales]` (15,357,898) -- a **6.6x error that renders
+  perfectly**, on a page where every sibling projection used the right table, and which the engine
+  reported as `status: "rebuilt"` with an empty work order. Adds a DATASOURCE-SCOPED fallback
+  between the two, recorded only where the caption is unambiguous within that datasource; where a
+  datasource genuinely carries the same caption on two tables the key is WITHHELD rather than
+  guessed and the caption is reported as an ambiguous binding (the issue's option (b)), so a silent
+  guess becomes visible. Verified globally rather than on the reported workbook: 48 of 83 available
+  workbooks carry an extract, and across 10 of them the new path fired **212 times** -- 209
+  confirmed the binding the bare caption already gave (hence a byte-identical 29/29 corpus,
+  normalised for lineage tags), and **3 corrected a wrong table**, with no case where it disagreed
+  with a previously-correct answer.
+
 ### Fixed
 
 - **tableau-migration (skill `2.112.0` -> `2.113.0`): the PBIR objects and roles we emit have to be

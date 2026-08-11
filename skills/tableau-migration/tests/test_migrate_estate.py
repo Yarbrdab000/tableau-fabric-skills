@@ -2517,7 +2517,12 @@ def test_workbook_pbip_consolidates_multiple_datasources_into_one_model():
         assert wb["bound_model"] == "Multi WB"          # one model named for the workbook
         # every embedded datasource is folded in -- none silently dropped or warned away
         assert not any("secondary datasource" in w for w in wb["pbip_warnings"])
-        assert wb["pbip_warnings"] == []
+        # The only warnings permitted are the ORPHAN-TABLE report (issue #107): this fixture
+        # consolidates two INDEPENDENT datasource islands into one model, and two unrelated
+        # tables in one model is exactly the silent-grand-total risk that report names. The
+        # assertion stays exact rather than becoming a blanket "ignore warnings".
+        assert all("landed with NO relationship" in w for w in wb["pbip_warnings"]), \
+            wb["pbip_warnings"]
         # the consolidation audit trail lists every island that landed (anti-silent-drop proof)
         assert set(wb["consolidated_datasources"]) == {"Sales Source", "Inventory Source"}
         # no per-datasource split: the legacy nested rollup key is not set
@@ -3811,9 +3816,10 @@ def test_field_map_from_model_builds_entity_property_from_naming_columns():
         "Choose Metric": {"model_table": "Measure Swap calc 1",
                           "model_name": "Measure Swap calc 1", "kind": "parameter"},
     }}}
-    model_table, field_map = me._field_map_from_model(res_report)
+    model_table, field_map, ambiguous = me._field_map_from_model(res_report)
     # fact table = the one owning the most columns (Orders: 3 vs People: 1)
     assert model_table == "Orders"
+    assert ambiguous == []
     # columns are mapped with {entity, property} and NO binding override (aggregations survive)
     assert field_map["Sales"] == {"entity": "Orders", "property": "Sales"}
     assert field_map["Order Date"] == {"entity": "Orders", "property": "Order_Date"}
@@ -3832,20 +3838,74 @@ def test_field_map_from_model_skips_incomplete_entries():
         "NoTable": {"model_table": None, "model_name": "X", "kind": "column"},
         "NoName": {"model_table": "Orders", "model_name": None, "kind": "column"},
     }}}
-    model_table, field_map = me._field_map_from_model(res_report)
+    model_table, field_map, _amb = me._field_map_from_model(res_report)
     assert model_table == "Orders"
     assert field_map == {"Good": {"entity": "Orders", "property": "Good"}}
 
 
 def test_field_map_from_model_none_when_no_columns():
-    # No usable column naming -> (None, None) so the viz re-run keeps its standing field bindings
+    # No usable column naming -> (None, None, []) so the viz re-run keeps its standing field bindings
     # (warn-never-wrong; byte-unchanged until a real map exists).
-    assert me._field_map_from_model(None) == (None, None)
-    assert me._field_map_from_model({}) == (None, None)
-    assert me._field_map_from_model({"model_manifest": {"naming": {}}}) == (None, None)
+    assert me._field_map_from_model(None) == (None, None, [])
+    assert me._field_map_from_model({}) == (None, None, [])
+    assert me._field_map_from_model({"model_manifest": {"naming": {}}}) == (None, None, [])
     only_measure = {"model_manifest": {"naming": {
         "M": {"model_table": "_Measures", "model_name": "M", "kind": "measure"}}}}
-    assert me._field_map_from_model(only_measure) == (None, None)
+    assert me._field_map_from_model(only_measure) == (None, None, [])
+
+
+def test_field_map_from_model_datasource_scoped_key_survives_a_relation_name_miss():
+    # ISSUE #103. An EXTRACTED datasource carries two relations for the same logical table -- the live
+    # one and the ``Extract`` materialisation -- so `table_map` keys the live name while the worksheet
+    # field names ``Extract``. The relation-qualified key misses, and without a datasource-scoped
+    # fallback resolution drops to the BARE caption, which whichever table was written first claims.
+    # Measured: the Commission dashboard's `Sales` bound Orders[Sales] (2,326,534) instead of
+    # `Sales Commission.csv`[Sales] (15,357,898) -- a 6.6x error that renders perfectly.
+    res_report = {
+        "table_map": {
+            "Superstore||Orders": "Orders",
+            "Commission||Sales Commission.csv": "Sales Commission.csv",
+        },
+        "model_manifest": {
+            "naming": {"Sales": {"model_table": "Orders", "model_name": "Sales",
+                                 "kind": "column"}},
+            "columns": [
+                {"model_table": "Orders", "model_name": "Sales", "tableau_field": "Sales"},
+                {"model_table": "Sales Commission.csv", "model_name": "Sales",
+                 "tableau_field": "Sales"},
+            ],
+        },
+    }
+    _mt, field_map, ambiguous = me._field_map_from_model(res_report)
+    # relation-qualified keys still exist for the relations the model DOES know
+    assert field_map["Commission||Sales Commission.csv||Sales"] == {
+        "entity": "Sales Commission.csv", "property": "Sales"}
+    # ...and the datasource-scoped key catches a pill whose relation is `Extract` instead
+    assert field_map["Commission||Sales"] == {
+        "entity": "Sales Commission.csv", "property": "Sales"}
+    assert field_map["Superstore||Sales"] == {"entity": "Orders", "property": "Sales"}
+    # the bare caption is untouched (first writer), so a single-datasource workbook is unaffected
+    assert field_map["Sales"] == {"entity": "Orders", "property": "Sales"}
+    assert ambiguous == []
+
+
+def test_field_map_from_model_withholds_a_datasource_scoped_key_that_is_ambiguous():
+    # Where ONE datasource genuinely carries the same caption on two tables there is nothing to
+    # prefer, so no datasource-scoped key is emitted (resolution falls through to the bare caption
+    # exactly as before) and the caption is REPORTED rather than silently guessed.
+    res_report = {
+        "table_map": {"SF||Case": "Case", "SF||User": "User"},
+        "model_manifest": {
+            "naming": {"Name": {"model_table": "Case", "model_name": "Name", "kind": "column"}},
+            "columns": [
+                {"model_table": "Case", "model_name": "Name", "tableau_field": "Name"},
+                {"model_table": "User", "model_name": "Name", "tableau_field": "Name"},
+            ],
+        },
+    }
+    _mt, field_map, ambiguous = me._field_map_from_model(res_report)
+    assert "SF||Name" not in field_map
+    assert ambiguous == ["SF||Name"]
 
 
 def test_viz_adapter_forwards_model_table_and_field_map_only_when_supported():
@@ -4257,3 +4317,138 @@ def test_short_names_are_untouched():
     # Never-regress: anything inside the cap keeps its exact name, so existing outputs do not churn.
     for nm in ("Superstore", "Sales Dashboard", "A" * me._MAX_FS_BASE):
         assert me._fs_safe(nm) == nm
+
+
+# -- published-datasource rebind: index every name the datasource answers to (issue #105) --------
+# A published datasource travels to a workbook as a `sqlproxy` stub whose caption is the
+# datasource's DISPLAY NAME on the server ("Meridian Sales (Live Snowflake)"), while the exported
+# .tds is usually named for the content ("MeridianSales.tds"). Keying the catalog only on the file
+# stem missed a match sitting right there, and the workbook was skipped ("relation 'sqlproxy' has no
+# resolvable columns") even though its datasource migrated successfully in the SAME RUN. Measured at
+# 9 of 38 workbooks on a live site -- and the fraction GROWS with governance, because a shared
+# published datasource is the recommended Tableau pattern.
+
+_PUB_TDS = """<?xml version='1.0' encoding='utf-8' ?>
+<datasource caption='Meridian Sales (Live Snowflake)' formatted-name='federated.mer1'
+            inline='true' version='18.1'>
+  <connection class='federated'><named-connections /></connection>
+</datasource>"""
+
+
+def test_catalog_aliases_cover_caption_and_formatted_name_not_just_the_file_stem():
+    aliases = me._datasource_catalog_aliases("MeridianSales", _PUB_TDS)
+    keys = {me._norm_ds(a) for a in aliases}
+    assert "meridiansales" in keys                      # the file stem
+    assert "meridiansaleslivesnowflake" in keys         # the published DISPLAY name the workbook uses
+    assert "federatedmer1" in keys                      # the internal name a <datasource name=> carries
+
+
+def test_catalog_aliases_degrade_to_the_file_name_when_the_tds_will_not_parse():
+    assert me._datasource_catalog_aliases("MeridianSales", "<not xml") == ["MeridianSales"]
+    assert me._datasource_catalog_aliases("MeridianSales", "") == ["MeridianSales"]
+
+
+def test_a_name_two_datasources_both_answer_to_is_withheld_not_resolved():
+    # Binding to whichever migrated LAST would attach a model with the wrong schema, and it would
+    # render perfectly -- so an ambiguous alias identifies neither and keeps the honest skip.
+    catalog = {}
+
+    def _record(name, text):
+        entry = {"name": name, "text": text, "safe_base": name,
+                 "flatfile_path": None, "table_csv_paths": None}
+        for alias in me._datasource_catalog_aliases(name, text):
+            key = me._norm_ds(alias)
+            if not key:
+                continue
+            if key in catalog and catalog[key].get("name") != name:
+                catalog[key] = me._AMBIGUOUS_CATALOG_ENTRY
+            elif key not in catalog or catalog[key] is me._AMBIGUOUS_CATALOG_ENTRY:
+                catalog[key] = entry
+        catalog[me._norm_ds(name)] = entry
+
+    shared = _PUB_TDS.replace("federated.mer1", "federated.other")
+    _record("SalesA", _PUB_TDS)
+    _record("SalesB", shared)
+    # both claim the same DISPLAY name -> that key is ambiguous
+    assert catalog[me._norm_ds("Meridian Sales (Live Snowflake)")].get("__ambiguous__") is True
+    # ...but each file's OWN name still resolves to itself
+    assert catalog[me._norm_ds("SalesA")]["name"] == "SalesA"
+    assert catalog[me._norm_ds("SalesB")]["name"] == "SalesB"
+
+
+def test_rebuild_from_published_match_treats_an_ambiguous_alias_as_a_miss():
+    detail = {"binding_signal": {"kind": "published",
+                                 "published_ds_name": "Meridian Sales (Live Snowflake)"}}
+    catalog = {me._norm_ds("Meridian Sales (Live Snowflake)"): me._AMBIGUOUS_CATALOG_ENTRY}
+    assert me._rebuild_from_published_match(detail, "<workbook/>", "M", catalog) is None
+
+
+# -- Tableau DECLARES its blend links; nothing read them (issue #101) ---------------------------
+# A blended secondary datasource landed related to NOTHING but Date, so any visual slicing it
+# returned the whole table's total identically for every member -- measured on Superstore at 4.4x
+# high and constant, while the fact's own measures on the very same rows matched Tableau exactly.
+# The join keys were never a guess: Tableau writes them in <datasource-relationships>.
+
+_BLEND_TWB = """<?xml version='1.0' encoding='utf-8' ?>
+<workbook version='18.1'>
+  <datasources>
+    <datasource caption='Sample - Superstore' inline='true' name='federated.aaa' version='18.1' />
+    <datasource caption='Sales Target' inline='true' name='federated.bbb' version='18.1' />
+  </datasources>
+  <datasource-relationships>
+    <datasource-relationship source='federated.aaa' target='federated.bbb'>
+      <column-mapping>
+        <map key='[federated.aaa].[none:Category:nk]' value='[federated.bbb].[none:Category:nk]' />
+        <map key='[federated.aaa].[none:Segment:nk]' value='[federated.bbb].[none:Segment:nk]' />
+        <map key='[federated.aaa].[mn:Order Date:ok]' value='[federated.bbb].[mn:Order Date:ok]' />
+        <map key='[federated.aaa].[yr:Order Date:ok]' value='[federated.bbb].[yr:Order Date:ok]' />
+      </column-mapping>
+    </datasource-relationship>
+  </datasource-relationships>
+</workbook>"""
+
+_BLEND_REPORT = {"table_map": {"Sample - Superstore||Orders": "Orders",
+                               "Sample - Superstore||People": "People",
+                               "Sales Target||Sheet1": "Sheet1"}}
+
+
+def test_workbook_blend_links_are_read_from_the_declaration_not_guessed():
+    links = me._workbook_blend_links(_BLEND_TWB)
+    assert len(links) == 1
+    assert links[0]["source"] == "federated.aaa" and links[0]["target"] == "federated.bbb"
+    # Tableau writes one <map> per DERIVATION of the same field (mn:/yr: of one date); they are all
+    # the same underlying link, so the pairs are de-duplicated to the base captions.
+    assert links[0]["pairs"] == [("Category", "Category"), ("Segment", "Segment"),
+                                 ("Order Date", "Order Date")]
+
+
+def test_blend_field_caption_unwraps_a_column_instance_token():
+    assert me._blend_field_caption("[none:Category:nk]") == "Category"
+    assert me._blend_field_caption("[mn:Order Date:ok]") == "Order Date"
+    assert me._blend_field_caption("[Sales]") == "Sales"     # a plain field reference
+
+
+def test_a_declared_blend_across_unrelated_landed_tables_is_reported_with_its_real_keys():
+    warns = me._blend_link_warnings(_BLEND_TWB, _BLEND_REPORT)
+    assert len(warns) == 1
+    w = warns[0]
+    assert "Sample - Superstore" in w and "Sales Target" in w
+    assert "'Category'" in w and "'Segment'" in w and "'Order Date'" in w
+    assert "Sheet1" in w and "Orders" in w
+    assert "GRAND TOTAL" in w
+
+
+def test_each_blend_side_resolves_through_its_OWN_datasource_not_the_bare_caption():
+    # `naming` is first-writer-wins on a caption, so resolving 'Category' by name puts BOTH sides on
+    # whichever datasource was written first and the link looks like a self-join -- which is exactly
+    # why this reported nothing at first. Resolution is by datasource via table_map.
+    same_table = {"table_map": {"Sample - Superstore||Orders": "Orders",
+                                "Sales Target||Orders": "Orders"}}
+    assert me._blend_link_warnings(_BLEND_TWB, same_table) == []
+
+
+def test_a_workbook_with_no_declared_blend_reports_nothing():
+    # The report has to be able to be EMPTY, or it says nothing.
+    assert me._workbook_blend_links("<workbook version='18.1'/>") == []
+    assert me._blend_link_warnings("<workbook version='18.1'/>", _BLEND_REPORT) == []
+    assert me._workbook_blend_links("<not xml") == []

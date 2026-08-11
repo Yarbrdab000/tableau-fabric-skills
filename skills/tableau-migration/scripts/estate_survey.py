@@ -155,13 +155,17 @@ def resolve_dependency(datasource_name, index):
 
 # == the survey =================================================================================
 
-def build_survey(workbooks, connections_by_workbook, datasources):
+def build_survey(workbooks, connections_by_workbook, datasources, unknown_workbooks=None):
     """Assemble the estate survey from already-fetched REST payloads (no network).
 
     ``workbooks`` / ``datasources`` -- REST list payloads. ``connections_by_workbook`` -- workbook
-    LUID -> that workbook's connection list.
+    LUID -> that workbook's connection list. ``unknown_workbooks`` -- LUIDs whose connections could
+    NOT be read; each is marked ``dependencies_unknown`` so an unread workbook is never reported as
+    an independent one (empty and unknown are opposite answers, and only one of them licenses
+    migrating a workbook without its datasource).
     """
     index = index_published_datasources(datasources)
+    unknown = {u for u in (unknown_workbooks or []) if u}
     wb_rows = []
     required = []           # resolved datasource names, first-needed order
     required_seen = set()
@@ -194,9 +198,13 @@ def build_survey(workbooks, connections_by_workbook, datasources):
             "luid": luid,
             "project": project_name(wb),
             "published_dependencies": resolved_deps,
+            # A workbook whose connections could not be read has UNKNOWN dependencies, not none.
+            "dependencies_unknown": luid in unknown,
             # A workbook with a published dependency keeps its calcs in that datasource, so any
             # complexity number derived from workbook-local fields alone understates the real work.
-            "complexity_understated": bool(resolved_deps),
+            # An unread workbook is treated as understated too -- assuming otherwise is the
+            # "migrate in any order" mistake.
+            "complexity_understated": bool(resolved_deps) or (luid in unknown),
         })
 
     dependent = [w for w in wb_rows if w["complexity_understated"]]
@@ -231,16 +239,23 @@ def fetch_order(workbook_rows, required_datasources):
 # == network layer (injected transport -> the survey above stays offline) ========================
 
 def paged_list(call, path, collection, item, page_size=100, max_pages=1000):
-    """Follow REST pagination to completion -> a flat list.
+    """Follow REST pagination to completion -> ``(rows, error)``.
 
     A site survey that silently stops at the first page under-reports the estate, which is the exact
-    failure class this module exists to prevent -- so every page is walked.
+    failure class this module exists to prevent -- so every page is walked. A page that FAILS is
+    equally dangerous and used to be worse: the exception escaped ``survey_site`` and ``main``, and
+    the run died with no ``survey.json`` written at all. It is now returned as ``error`` alongside
+    the rows read so far, so the caller can report a PARTIAL listing loudly instead of either
+    crashing or passing a truncated list off as complete.
     """
     out = []
     page = 1
     while page <= max_pages:
         sep = "&" if "?" in path else "?"
-        payload = call(f"{path}{sep}pageSize={page_size}&pageNumber={page}")
+        try:
+            payload = call(f"{path}{sep}pageSize={page_size}&pageNumber={page}")
+        except Exception as exc:  # noqa: BLE001 - classified and reported, never swallowed
+            return out, {"path": path, "page": page, "error": str(exc)[:300]}
         block = (payload or {}).get(collection) or {}
         rows = block.get(item) or []
         if isinstance(rows, dict):       # a single-row payload is not wrapped in a list
@@ -253,7 +268,7 @@ def paged_list(call, path, collection, item, page_size=100, max_pages=1000):
         if not rows or len(out) >= total:
             break
         page += 1
-    return out
+    return out, None
 
 
 def survey_site(call, site_id):
@@ -261,12 +276,17 @@ def survey_site(call, site_id):
 
     Read-only: three GET shapes (list workbooks, list datasources, per-workbook connections) and
     nothing else. A per-workbook connections call that fails is recorded rather than raised, so one
-    permission gap cannot void the whole survey.
+    permission gap cannot void the whole survey -- but it is recorded as **UNKNOWN**, never as "no
+    dependency". Those are opposite answers: a mid-run session loss made every remaining workbook
+    record ``[]``, which reads downstream as "this workbook is independent, migrate it in any
+    order" -- the precise wrong answer this module exists to prevent, delivered with exit code 0.
     """
-    workbooks = paged_list(call, f"/sites/{site_id}/workbooks", "workbooks", "workbook")
-    datasources = paged_list(call, f"/sites/{site_id}/datasources", "datasources", "datasource")
+    workbooks, wb_error = paged_list(call, f"/sites/{site_id}/workbooks", "workbooks", "workbook")
+    datasources, ds_error = paged_list(call, f"/sites/{site_id}/datasources",
+                                       "datasources", "datasource")
     conns = {}
     errors = []
+    unknown = []
     for wb in workbooks:
         luid = _text(wb.get("id"))
         if not luid:
@@ -275,11 +295,21 @@ def survey_site(call, site_id):
             payload = call(f"/sites/{site_id}/workbooks/{luid}/connections")
             rows = ((payload or {}).get("connections") or {}).get("connection") or []
             conns[luid] = [rows] if isinstance(rows, dict) else rows
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - recorded per workbook, never fatal
             conns[luid] = []
+            unknown.append(luid)
             errors.append({"workbook": _text(wb.get("name")), "luid": luid, "error": str(exc)[:200]})
-    survey = build_survey(workbooks, conns, datasources)
+    survey = build_survey(workbooks, conns, datasources, unknown_workbooks=unknown)
     survey["connection_read_errors"] = errors
+    listing_errors = [e for e in (wb_error, ds_error) if e]
+    survey["listing_errors"] = listing_errors
+    # One machine-readable flag every consumer (and the exit code) can trust: this survey did NOT
+    # see the whole estate, so its "no dependency" answers are not evidence of independence.
+    survey["degraded"] = bool(errors or listing_errors)
+    survey["summary"]["connection_read_errors"] = len(errors)
+    survey["summary"]["listing_errors"] = len(listing_errors)
+    survey["summary"]["dependencies_unknown"] = len(unknown)
+    survey["summary"]["degraded"] = survey["degraded"]
     return survey
 
 
@@ -306,8 +336,15 @@ def format_survey(survey):
         else:
             lines.append(f"  [ACTION] {u['workbook']!r} needs published datasource "
                          f"{u['datasource_name']!r}, which was NOT FOUND on this site.")
+    for e in survey.get("listing_errors", []):
+        lines.append(f"  [WARN] site listing INCOMPLETE at {e['path']!r} page {e['page']}: "
+                     f"{e['error']} -- workbooks or datasources are MISSING from this survey")
     for e in survey.get("connection_read_errors", []):
         lines.append(f"  [WARN] could not read connections for {e['workbook']!r}: {e['error']}")
+    if survey.get("degraded"):
+        lines.append("  [ACTION] this survey is DEGRADED -- some dependencies could not be read, so "
+                     "a workbook showing no published dependency here is UNKNOWN, not independent. "
+                     "Re-run before using fetch_order to license a migration order.")
     return "\n".join(lines)
 
 
@@ -349,15 +386,27 @@ def main(argv=None):
     pat_name, pat_secret, jwt = fetch_tds._resolve_auth(args)
     token, site_id = fetch_tds.sign_in(args.server, args.rest_version, args.site,
                                        pat_name=pat_name, pat_secret=pat_secret, jwt=jwt)
+    state = {"token": token}
     try:
         base = fetch_tds.rest_base(args.server, args.rest_version)
 
+        def _reauth():
+            # A Tableau Cloud session can die partway through the per-workbook loop -- measured
+            # intermittently after 1 to 58 calls. Signing in again and retrying is the only faithful
+            # response; the alternative recorded every remaining workbook as having NO published
+            # dependency, which is the opposite of the truth.
+            fresh, fresh_site = fetch_tds.sign_in(args.server, args.rest_version, args.site,
+                                                  pat_name=pat_name, pat_secret=pat_secret, jwt=jwt)
+            state["token"] = fresh
+            state["site_id"] = fresh_site
+            return fresh
+
         def call(path):
-            return fetch_tds._http_json("GET", base + path, token=token)
+            return fetch_tds._http_json("GET", base + path, token=state["token"], reauth=_reauth)
 
         survey = survey_site(call, site_id)
     finally:
-        fetch_tds.sign_out(args.server, args.rest_version, token)
+        fetch_tds.sign_out(args.server, args.rest_version, state["token"])
 
     print(format_survey(survey))
     if args.json:
@@ -365,8 +414,12 @@ def main(argv=None):
             json.dump(survey, fh, indent=2)
         print(f"[OK] survey written to {args.json}")
     # A dependency we could not resolve is actionable, not fatal: the planner must disambiguate or
-    # widen scope before STEP 1, so exit non-zero the way the STEP 1.5 scan gate does.
-    return 1 if survey["summary"]["unresolved_dependencies"] else 0
+    # widen scope before STEP 1, so exit non-zero the way the STEP 1.5 scan gate does. A DEGRADED
+    # survey exits non-zero for the same reason and is the more dangerous case: it looks clean.
+    # Reporting "0 published dependencies" because the session died is exactly the "migrate in any
+    # order" outcome the STEP 1.5 gate exists to prevent, so it must be visible to a caller that
+    # only reads the exit code.
+    return 1 if (survey["summary"]["unresolved_dependencies"] or survey.get("degraded")) else 0
 
 
 if __name__ == "__main__":  # pragma: no cover

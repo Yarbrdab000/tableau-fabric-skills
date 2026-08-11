@@ -50,7 +50,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 
 try:  # works whether imported as a package or run with scripts/ on sys.path
-    from .connection_to_m import (parse_tds, extract_bundled_flatfile, extract_calcs,
+    from .connection_to_m import (parse_tds, locale_dependent_flatfile_relations, extract_bundled_flatfile, extract_calcs,
                                   combine_descriptors)
     from .storage_mode import select_storage_mode, FALLBACK_NEEDS_DECISION
     from .assemble_model import (assemble_import_model, assemble_local_import_model,
@@ -63,7 +63,7 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .tmdl_generate import tableau_measure_format_to_pbi
     from . import fetch_tds as F
 except ImportError:
-    from connection_to_m import (parse_tds, extract_bundled_flatfile, extract_calcs,
+    from connection_to_m import (parse_tds, locale_dependent_flatfile_relations, extract_bundled_flatfile, extract_calcs,
                                  combine_descriptors)
     from storage_mode import select_storage_mode, FALLBACK_NEEDS_DECISION
     from assemble_model import (assemble_import_model, assemble_local_import_model,
@@ -999,9 +999,30 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
         manual_followups=followups,
     )
     if ds_catalog is not None:
-        ds_catalog[_norm_ds(name)] = {"name": name, "text": text, "safe_base": safe_base,
-                                      "flatfile_path": flatfile_path,
-                                      "table_csv_paths": table_csv_paths}
+        entry = {"name": name, "text": text, "safe_base": safe_base,
+                 "flatfile_path": flatfile_path,
+                 "table_csv_paths": table_csv_paths}
+        # Index under EVERY name this datasource answers to, not just the one the file happens to be
+        # called. A published datasource travels to a workbook as a ``sqlproxy`` stub whose caption is
+        # the datasource's DISPLAY NAME on the server ("Meridian Sales (Live Snowflake)"), while the
+        # exported ``.tds`` is usually named for the content ("MeridianSales.tds") -- so keying only
+        # the file stem missed a match that was sitting right there, and the workbook was skipped
+        # ("relation 'sqlproxy' has no resolvable columns") even though its datasource had migrated
+        # successfully in the SAME RUN. Measured at 9 of 38 workbooks on a live site (issue #105), and
+        # the fraction GROWS with governance: a shared published datasource is the recommended
+        # Tableau pattern, so a well-run estate is mostly sqlproxy.
+        #
+        # A key that two different datasources both claim is AMBIGUOUS and is withheld rather than
+        # letting whichever migrated last win -- the same rule the field and row-count resolvers use.
+        for alias in _datasource_catalog_aliases(name, text):
+            key = _norm_ds(alias)
+            if not key:
+                continue
+            if key in ds_catalog and ds_catalog[key].get("name") != name:
+                ds_catalog[key] = _AMBIGUOUS_CATALOG_ENTRY
+            elif key not in ds_catalog or ds_catalog[key] is _AMBIGUOUS_CATALOG_ENTRY:
+                ds_catalog[key] = entry
+        ds_catalog[_norm_ds(name)] = entry      # the file's own name always wins for itself
     return detail
 
 
@@ -2149,8 +2170,31 @@ def _row_count_binding_from_model(res_report):
                 (rr.get("model_manifest") or {}).get("row_count")):
         shaped = _from_obj(src)
         if shaped:
-            return shaped
-    return None
+            break
+    else:
+        shaped = None
+
+    # COLUMN targets, for the row-level constant the model landed as a calculated column of 1s
+    # (``summarizeBy: sum``) rather than a COUNTROWS measure. Aggregating that column on the shelf
+    # reproduces EVERY Tableau aggregation exactly (SUM -> n*k, AVG -> k, CNT -> n), which one
+    # COUNTROWS measure cannot; without this the implicit-row-count channel finds no measure, warns
+    # "left unbound", and the pill is DROPPED -- which took a matrix visual's last binding with it
+    # and emitted a page-less report. Purely additive: measure targets keep absolute priority, so a
+    # model that supplies COUNTROWS binds byte-identically to before.
+    rcc = (rr.get("model_manifest") or {}).get("row_count_columns") or rr.get("row_count_columns")
+    if isinstance(rcc, dict) and rcc:
+        cols = {}
+        for name, c in (rcc.get("columns") or {}).items():
+            if isinstance(c, dict) and c.get("entity") and c.get("column"):
+                cols[name] = {"entity": c["entity"], "column": c["column"]}
+        dflt = rcc.get("default_column")
+        if cols or isinstance(dflt, dict):
+            shaped = dict(shaped or {})
+            if cols:
+                shaped["columns"] = cols
+            if isinstance(dflt, dict) and dflt.get("entity") and dflt.get("column"):
+                shaped["default_column"] = {"entity": dflt["entity"], "column": dflt["column"]}
+    return shaped or None
 
 
 def _filter_param_target_field(formula, param_inner):
@@ -2483,11 +2527,175 @@ def _workbook_binding_signal(twb_text, ir):
     }
 
 
+_BLEND_INSTANCE_RE = re.compile(r"^\[(?P<ds>[^\]]+)\]\.\[(?P<inst>[^\]]+)\]$")
+
+
+def _blend_field_caption(instance):
+    """The base field caption inside a Tableau column-instance token.
+
+    ``[none:Category:nk]`` -> ``Category``; ``[mn:Order Date:ok]`` -> ``Order Date``. A token that is
+    not in the ``<derivation>:<field>:<kind>`` shape is returned as-is (minus brackets), so a plain
+    field reference still names its field.
+    """
+    tok = _strip_brackets(str(instance or "").strip())
+    parts = tok.split(":")
+    if len(parts) >= 3:
+        return ":".join(parts[1:-1]).strip()
+    return tok
+
+
+def _workbook_blend_links(twb_text):
+    """Tableau's DECLARED cross-datasource blend links -> ``[{source, target, pairs}]``.
+
+    A Tableau data BLEND is not a join inside either datasource -- it is a workbook-level link, and
+    Tableau records it explicitly in ``<datasource-relationships>``::
+
+        <datasource-relationship source='federated.10nn...' target='federated.0hgp...'>
+          <column-mapping>
+            <map key='[federated.10nn...].[none:Category:nk]'
+                 value='[federated.0hgp...].[none:Category:nk]' />
+
+    Nothing read this block, so a blended secondary datasource landed in the model related to
+    NOTHING but the Date dimension, and any visual slicing it returned the whole table's total
+    identically for every member -- measured on Superstore at 4.4x high and constant, while the
+    fact's own measures on the very same rows matched Tableau exactly (issue #101). Because the
+    links are declared, the join keys are GROUND TRUTH rather than a name-match heuristic.
+
+    ``pairs`` is ``[(source field caption, target field caption)]`` de-duplicated in document order;
+    Tableau writes one ``<map>`` per DERIVATION of the same field (``mn:`` / ``yr:`` / ``tmn:`` of one
+    date), which are all the same underlying link. Returns ``[]`` for a workbook with no blend, or
+    one that will not parse.
+    """
+    try:
+        root = ET.fromstring((twb_text or "").lstrip("\ufeff"))
+    except Exception:
+        return []
+    out = []
+    for rel in root.iter():
+        if _local(rel.tag) != "datasource-relationship":
+            continue
+        src, tgt = (rel.get("source") or "").strip(), (rel.get("target") or "").strip()
+        if not src or not tgt:
+            continue
+        pairs = []
+        for mp in rel.iter():
+            if _local(mp.tag) != "map":
+                continue
+            km = _BLEND_INSTANCE_RE.match((mp.get("key") or "").strip())
+            vm = _BLEND_INSTANCE_RE.match((mp.get("value") or "").strip())
+            if not km or not vm:
+                continue
+            pair = (_blend_field_caption(km.group("inst")), _blend_field_caption(vm.group("inst")))
+            if all(pair) and pair not in pairs:
+                pairs.append(pair)
+        if pairs:
+            out.append({"source": src, "target": tgt, "pairs": pairs})
+    return out
+
+
+def _workbook_datasource_captions(twb_text):
+    """``{internal datasource name -> caption}`` for every datasource the workbook declares.
+
+    A blend link names its two sides by INTERNAL name (``federated.0hgpf...``), while the model's
+    ``table_map`` is keyed by datasource CAPTION -- so the two only meet through this map.
+    """
+    try:
+        root = ET.fromstring((twb_text or "").lstrip("\ufeff"))
+    except Exception:
+        return {}
+    out = {}
+    for el in root.iter():
+        if _local(el.tag) != "datasource":
+            continue
+        name, caption = (el.get("name") or "").strip(), (el.get("caption") or "").strip()
+        if name and caption:
+            out.setdefault(name, caption)
+    return out
+
+
+def _blend_link_warnings(twb_text, res_report):
+    """Warn for each DECLARED blend whose two sides landed as UNRELATED model tables.
+
+    A blend is Tableau's answer to "these live in different datasources"; Power BI's answer is a
+    relationship, and one cannot be invented safely -- Tableau blends on a COMPOSITE key at a chosen
+    date grain, which has no single-column equivalent, and a wrong relationship returns a number that
+    renders perfectly. So this reports the link with the exact columns Tableau declared, which is a
+    precise instruction rather than a name-match guess: the operator knows which two tables and which
+    keys, and can add the relationship (or a composite key column) deliberately.
+
+    Each side is resolved through its OWN DATASOURCE (via ``table_map``), never through the bare
+    caption: ``naming`` is first-writer-wins on a caption, so both sides of a blend on ``Category``
+    resolve to whichever datasource was written first and the link looks like a self-join. Silent
+    when the two sides share a landed table, or when the workbook declares no blend.
+    """
+    links = _workbook_blend_links(twb_text)
+    if not links:
+        return []
+    captions = _workbook_datasource_captions(twb_text)
+    tables_by_ds = {}
+    for key, consolidated in ((res_report or {}).get("table_map") or {}).items():
+        ds, _, _rel = str(key).partition("||")
+        if ds.strip() and consolidated:
+            tables_by_ds.setdefault(ds.strip(), set()).add(consolidated)
+
+    warns = []
+    for link in links:
+        src_tables = tables_by_ds.get(captions.get(link["source"], ""), set())
+        tgt_tables = tables_by_ds.get(captions.get(link["target"], ""), set())
+        if not src_tables or not tgt_tables or (src_tables & tgt_tables):
+            continue        # unresolved, or already one table -- nothing to relate
+        keys = [src if src == tgt else f"{src} <-> {tgt}" for src, tgt in link["pairs"]]
+        warns.append(
+            _PBIP_WARN + ("Tableau BLENDS %r with %r on %s, but the tables they landed as (%s | %s) "
+                          "have no relationship between them -- a measure from one sliced by the "
+                          "other's columns returns that table's GRAND TOTAL identically for every "
+                          "member. A blend is a composite-key link with no single-column Power BI "
+                          "equivalent, so it is reported rather than guessed: add a relationship (or "
+                          "a COMBINEVALUES key column on both tables) using exactly these columns"
+                          % (captions.get(link["source"], link["source"]),
+                             captions.get(link["target"], link["target"]),
+                             ", ".join(repr(k) for k in keys),
+                             ", ".join(sorted(src_tables)), ", ".join(sorted(tgt_tables)))))
+    return warns
+
+
 def _norm_ds(name):
     """Connector-agnostic match key: lowercased with all non-alphanumerics removed, so a workbook's
     published-datasource name ('Superstore - Extract') matches the migrated datasource it became
     ('Superstore-Extract.tds' -> 'Superstore_Extract')."""
     return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+# A catalog key two different datasources both answer to. Recorded rather than resolved: binding a
+# workbook to whichever one migrated last would attach a model with the wrong schema, and it would
+# render perfectly. The lookup treats this exactly like a miss.
+_AMBIGUOUS_CATALOG_ENTRY = {"__ambiguous__": True}
+
+
+def _datasource_catalog_aliases(name, text):
+    """Every name a migrated datasource can legitimately be looked up by.
+
+    A published datasource is referenced from a workbook by its DISPLAY NAME on the server, which is
+    the ``.tds``'s own ``caption`` -- but the file it is exported to is usually named for the content
+    instead, so the file stem and the caption routinely differ. Indexing both (plus the internal
+    ``formatted-name``, which is what the workbook's ``<datasource name=...>`` carries) is what lets
+    the join happen at all; keying only the stem is why it did not.
+
+    Best-effort and never raises: a ``.tds`` that will not parse contributes only its file name.
+    """
+    aliases = [name]
+    try:
+        root = ET.fromstring((text or "").lstrip("\ufeff"))
+    except Exception:
+        return [a for a in aliases if a]
+    els = [root] if _local(root.tag) == "datasource" else []
+    els += [d for d in root.iter() if _local(d.tag) == "datasource"]
+    for el in els[:8]:
+        for attr in ("caption", "formatted-name", "name"):
+            val = (el.get(attr) or "").strip()
+            if val and val not in aliases:
+                aliases.append(val)
+    return [a for a in aliases if a]
 
 
 def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog, approved_calc_dax=None):
@@ -2504,7 +2712,10 @@ def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog, appr
     if sig.get("kind") != "published":
         return None
     match = ds_catalog.get(_norm_ds(sig.get("published_ds_name")))
-    if not match:
+    if not match or match.get("__ambiguous__"):
+        # A name two migrated datasources both answer to identifies neither. Binding to whichever
+        # migrated last would attach a model with the WRONG schema, and it would render perfectly --
+        # so an ambiguous name keeps the honest skip.
         return None
     try:
         wb_calcs, _skipped, wb_dim_calcs = extract_calculations(twb_text, include_dimensions=True)
@@ -2576,9 +2787,10 @@ def _rebuild_from_published_match(detail, twb_text, model_safe, ds_catalog, appr
 
 
 def _field_map_from_model(res_report):
-    """Build ``(model_table, field_map)`` for the viz re-run from the model build's authoritative
-    naming map, so a published-datasource workbook's column pills bind to the REAL migrated tables
-    (``Orders``/``Date``) instead of the workbook's own unusable ``sqlproxy`` proxy entity.
+    """Build ``(model_table, field_map, ambiguous)`` for the viz re-run from the model build's
+    authoritative naming map, so a published-datasource workbook's column pills bind to the REAL
+    migrated tables (``Orders``/``Date``) instead of the workbook's own unusable ``sqlproxy`` proxy
+    entity.
 
     ``field_map`` keys VERBATIM on each column's Tableau field caption / remote name (the same
     ``model_manifest['naming']`` join convention the model->viz contract guarantees never dangles)
@@ -2586,8 +2798,9 @@ def _field_map_from_model(res_report):
     (``SUM([Sales])``) keeps its aggregation while its entity is corrected to the fact table.
     ``model_table`` is the fact table (the one owning the most columns) and acts as the fallback for
     any column pill not present in the map. Measures are intentionally EXCLUDED here -- the
-    token-keyed ``measure_binding`` already rebinds them onto ``_Measures``. Returns ``(None, None)``
-    when no naming map is available (the re-run then keeps its standing field bindings).
+    token-keyed ``measure_binding`` already rebinds them onto ``_Measures``. Returns
+    ``(None, None, [])`` when no naming map is available (the re-run then keeps its standing field
+    bindings).
 
     DATASOURCE-QUALIFIED KEYS. A bare caption is not a unique name when a workbook consolidates
     SEVERAL embedded datasources into one model. Tableau duplicates its datasource per dashboard, so
@@ -2624,7 +2837,7 @@ def _field_map_from_model(res_report):
         field_map[ref] = {"entity": model_table, "property": model_name}
         counts[model_table] = counts.get(model_table, 0) + 1
     if not field_map:
-        return None, None
+        return None, None, []
     fact_table = max(counts, key=counts.get)
 
     # A consolidated table may be reached from more than one (datasource, relation) pair -- identical
@@ -2634,18 +2847,40 @@ def _field_map_from_model(res_report):
         ds, _, relation = str(key).partition("||")
         if ds.strip() and relation.strip() and consolidated:
             pairs_by_table.setdefault(consolidated, []).append((ds.strip(), relation.strip()))
+    ds_scoped = {}      # "<ds>||<caption>" -> [ {entity, property}, ... ]  (ambiguity detector)
     for col in manifest.get("columns") or []:
         model_table = col.get("model_table")
         model_name = col.get("model_name")
         if not model_table or not model_name:
             continue
+        target = {"entity": model_table, "property": model_name}
         for ds, relation in pairs_by_table.get(model_table, ()):
             for ref in (col.get("tableau_field"), col.get("source_column")):
                 if ref:
-                    field_map.setdefault(
-                        "%s||%s||%s" % (ds, relation, ref),
-                        {"entity": model_table, "property": model_name})
-    return fact_table, field_map
+                    field_map.setdefault("%s||%s||%s" % (ds, relation, ref), target)
+                    ds_scoped.setdefault("%s||%s" % (ds, ref), []).append(target)
+    # DATASOURCE-SCOPED fallback, for when the relation name does not match. An EXTRACTED datasource
+    # carries TWO relations for the same logical table -- the live one (``Sales Commission.csv``) and
+    # the extract materialisation (``Extract``) -- and the model keys the live name while a worksheet
+    # bound to the extract carries ``Extract``. The relation-qualified key then misses and resolution
+    # fell through to the BARE caption, which in a multi-table model is claimed by whichever table
+    # happened to be written first. Measured on Superstore (issue #103): the Commission dashboard's
+    # ``Sales`` bound ``Orders[Sales]`` (2,326,534) instead of ``Sales Commission.csv[Sales]``
+    # (15,357,898) -- a 6.6x error that renders perfectly, on a page where every sibling projection
+    # used the right table.
+    #
+    # Only recorded where the caption is UNAMBIGUOUS within its own datasource. Where a datasource
+    # genuinely has the same column name on two tables there is nothing to prefer, so the key is
+    # withheld rather than guessed, and the caller falls through to the bare caption exactly as
+    # before. Those captions are reported (see ``ambiguous_by_name``) so a silent guess is visible.
+    ambiguous = []
+    for key, targets in ds_scoped.items():
+        distinct = {(t["entity"], t["property"]) for t in targets}
+        if len(distinct) == 1:
+            field_map.setdefault(key, targets[0])
+        else:
+            ambiguous.append(key)
+    return fact_table, field_map, sorted(ambiguous)
 
 
 # -- Windows MAX_PATH guard for the openable .pbip write ----------------------------------------
@@ -2848,7 +3083,7 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
         for _d in combine_datasources:
             cat = (ds_catalog or {}).get(
                 _norm_ds(_d.get("caption") or _d.get("name") or _d.get("label")))
-            if cat:
+            if cat and not cat.get("__ambiguous__"):
                 if cat.get("table_csv_paths"):
                     merged_local.update(cat["table_csv_paths"])
                 if ff_path is None and cat.get("flatfile_path"):
@@ -2862,7 +3097,7 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
         # <<< PATCH
     elif ds_catalog:
         cat = ds_catalog.get(_norm_ds(ds.get("caption") or ds.get("name") or label))
-        if cat:
+        if cat and not cat.get("__ambiguous__"):
             ff_path = cat.get("flatfile_path")
             local_data = cat.get("table_csv_paths")
     # Consolidated model (combined descriptor): migrate_datasource would auto-extract calcs scoped to
@@ -2986,7 +3221,42 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
         merged.update(wb_slicers)
         param_binding["slicers"] = merged
         param_binding.setdefault("flags", {})
-    field_model_table, field_map = _field_map_from_model(res_report)
+    field_model_table, field_map, _ambiguous_names = _field_map_from_model(res_report)
+    # A DECLARED Tableau blend whose two sides landed as unrelated model tables. Reported here
+    # because the model manifest (which says where each field landed) only exists once the model is
+    # built. See ``_blend_link_warnings``: the keys are quoted from Tableau, not guessed.
+    warns.extend(_blend_link_warnings(twb_text, res_report))
+    # A landed table with NO relationship to anything returns its GRAND TOTAL identically on every
+    # row of a breakdown, and every structural gate passes. Where the source declares a join we
+    # already recover it, so an orphan means the source declared none -- which cannot be invented,
+    # only reported (issue #107).
+    for _orphan in (res_report or {}).get("orphan_tables") or []:
+        _shared = _orphan.get("shared_with_fact") or []
+        _extra = ("; it shares %s with %r, which are the candidate join keys"
+                  % (", ".join(repr(c) for c in _shared[:6]), _orphan.get("fact_table"))
+                  if _shared and _orphan.get("fact_table") else "")
+        _dupe = (" This also means the model carries TWO date tables: this one from the source, and "
+                 "the synthetic Date table the fact is actually related to."
+                 if _orphan.get("duplicate_date_dimension") else "")
+        warns.append(
+            _PBIP_WARN + ("table %r landed with NO relationship to any other table -- a measure "
+                          "broken down by its columns returns the whole table's GRAND TOTAL "
+                          "identically for every member, and no structural gate can see that. The "
+                          "source declared no join for it, so none was invented%s.%s"
+                          % (_orphan.get("table"), _extra, _dupe)))
+    # ISSUE #103, option (b). Where one datasource genuinely carries the same caption on two of its
+    # tables, no datasource-scoped key could be emitted (there is nothing to prefer), so resolution
+    # falls through to the bare caption -- i.e. the FIRST table written claims it. That is a guess,
+    # and a guess that renders perfectly while being arithmetically wrong is the worst failure mode
+    # this pipeline has. Report it, so the reader can check the one pill instead of trusting silence.
+    for _amb in _ambiguous_names or []:
+        _ds, _, _cap = str(_amb).partition("||")
+        warns.append(
+            _PBIP_WARN + ("field %r is ambiguous within datasource %r (the same column name exists "
+                          "on more than one of its tables) -- any visual using it without a "
+                          "matching Tableau relation name binds to whichever table was written "
+                          "first; verify its table is the one you expect"
+                          % (_cap or _amb, _ds)))
     # column_binding -- calc DIMENSION pills (a crosstab axis built from a Tableau calculated field)
     # rebind to the REAL model table+column the datasource build emitted, so a calc-dimension crosstab
     # stays a matrix bound to real fields (e.g. Sheet1[Director]) instead of the datasource-caption
@@ -3217,6 +3487,39 @@ def _embedded_datasource_telemetry(twb_text, all_ds):
     return out
 
 
+def _locale_dependent_flatfile_warnings(twb_text, all_ds):
+    """Warnings for relations whose typed M would depend on the machine's ambient locale.
+
+    A legacy ACE workbook (``.xls``/``.xlsb``) returns its cells as text ALREADY RENDERED in the
+    host's locale, so ``Table.TransformColumnTypes`` parses them with whatever locale refreshes the
+    model. On a comma-decimal host every decimal column is silently corrupted by ``10^decimals`` --
+    measured at 493x on one column and 6,285x on another IN THE SAME TABLE, with the model building,
+    refreshing, and passing TMDL deserialization, M syntax, the openability self-check and a
+    persisted cache (issue #110). Only a numeric oracle caught it.
+
+    No culture can be PROVEN for that source -- the rendering locale is not knowable at generation
+    time and not observable from within M -- and a wrong guess is worse than none, so this reports
+    it with the remedy instead. Every other flat file has its culture pinned at emission.
+    """
+    warns = []
+    for ds in all_ds or []:
+        label = ds.get("label") or ds.get("caption") or ds.get("name")
+        try:
+            rows = locale_dependent_flatfile_relations(parse_tds(twb_text, label))
+        except Exception:
+            continue
+        for row in rows:
+            warns.append(
+                _PBIP_WARN + ("table %r reads a LEGACY Excel workbook (%s), whose cells arrive as "
+                              "text already rendered in the refreshing machine's locale -- on a "
+                              "comma-decimal host every decimal column inflates by 10^decimals and "
+                              "every structural gate still passes. Convert the source to .xlsx or "
+                              "CSV (or add an explicit culture to this partition) before trusting "
+                              "its numbers"
+                              % (row["table"], os.path.basename(row.get("path") or "") or "unknown")))
+    return warns
+
+
 def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None, ds_catalog=None,
                           approved_calc_dax=None, wb_id=None):
     """Build ONE openable, self-contained workbook ``.pbip`` project and record it on ``detail``.
@@ -3264,7 +3567,7 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
     # so both shapes report identically, and before any build step that can bail out -- a workbook
     # whose model fails to land still tells a consumer which systems it would have touched.
     detail["embedded_datasources"] = _embedded_datasource_telemetry(twb_text, all_ds)
-
+    warns.extend(_locale_dependent_flatfile_warnings(twb_text, all_ds))
     # SINGLE embedded datasource (the common case): keep the established FLAT ``pbip/<WB>/`` layout so
     # the top-level detail keys and the on-disk paths stay byte-identical. The report binds to the one
     # rebuilt model.

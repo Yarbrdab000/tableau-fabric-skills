@@ -3586,3 +3586,326 @@ def test_hidden_prune_noop_when_nothing_hidden():
     assert len(case) == 7 and not any(case.values())
     contact = _prune_cols(desc, "Contact")
     assert len(contact) == 3 and not any(contact.values())
+
+
+# -- Excel navigation key + kind (issue #108) --------------------------------------------------
+# Tableau records an Excel object with the legacy ACE/OLEDB identifier (`table='[Orders$]'`).
+# Power Query does not accept that form: the model validates, opens and passes the definition of
+# done, then fails at REFRESH in Desktop with "The key didn't match any rows in the table" -- a
+# failure no structural gate can see.
+import connection_to_m as _C
+
+
+def test_excel_navigation_maps_the_ace_identifier_to_a_power_query_key():
+    assert _C._excel_navigation({"raw_table": "[Orders$]"}) == ("Orders", "Sheet")
+    assert _C._excel_navigation({"item": "Orders$"}) == ("Orders", "Sheet")
+    # the relation's plain name never carried the $ convention and is already correct
+    assert _C._excel_navigation({"name": "Orders"}) == ("Orders", "Sheet")
+    # raw_table wins over name, and both agree after normalisation
+    assert _C._excel_navigation({"raw_table": "[Orders$]", "name": "Orders"}) == ("Orders", "Sheet")
+
+
+def test_excel_navigation_handles_quoted_and_qualified_identifiers():
+    # a quoted-then-bracketed identifier needs both peels
+    assert _C._excel_navigation({"raw_table": "'[Orders$]'"}) == ("Orders", "Sheet")
+    # a workbook/schema-qualified identifier keeps only the object itself
+    assert _C._excel_navigation({"raw_table": "[Book].[Orders$]"}) == ("Orders", "Sheet")
+
+
+def test_excel_navigation_derives_the_KIND_not_just_the_name():
+    # No $ on an authoritative identifier means it is NOT a worksheet. Navigating a defined name
+    # with Kind="Sheet" fails at refresh exactly like the $-suffixed key does.
+    assert _C._excel_navigation({"raw_table": "[MyNamedRange]"}) == ("MyNamedRange", "DefinedName")
+    # ...but a bare `name` fallback carries no kind information, so it stays a Sheet (historical and
+    # overwhelmingly common behaviour) rather than being guessed into a DefinedName.
+    assert _C._excel_navigation({"name": "MyNamedRange"}) == ("MyNamedRange", "Sheet")
+
+
+def test_excel_navigation_of_a_RANGE_navigates_its_sheet():
+    # `Sheet1$A1:D100` is a range ON a sheet; the range bounds are not expressible as a navigation
+    # key, and a sheet name cannot contain `$`, so the sheet is the navigable object.
+    assert _C._excel_navigation({"raw_table": "[Sheet1$A1:D100]"}) == ("Sheet1", "Sheet")
+
+
+def test_is_excel_path_recognises_the_LEGACY_binary_formats():
+    # #108 was filed against a .xls. Treating it as not-Excel skipped the sheet-name decision for
+    # exactly the files that need it most.
+    for ext in (".xls", ".xlsx", ".xlsm", ".xlsb"):
+        assert _C._is_excel_path("book" + ext), ext
+    assert not _C._is_excel_path("book.csv")
+    # ...but only the OOXML (zip) formats can actually have their sheets READ, so header
+    # reconciliation still degrades to "cannot read" for the binary ones rather than mis-parsing.
+    assert _C._is_zip_readable_excel_path("book.xlsx")
+    assert not _C._is_zip_readable_excel_path("book.xls")
+    assert not _C._is_zip_readable_excel_path("book.xlsb")
+
+
+def test_emitted_excel_M_never_carries_a_dollar_suffixed_navigation_key():
+    # End-to-end on the emitter, with the exact relation shape from the issue.
+    rel = {"kind": "table", "name": "Orders", "raw_table": "[Orders$]", "item": "Orders$",
+           "flatfile_path": r"C:\data\Sample - Superstore.xls",
+           "columns": [{"remote_name": "Region", "model_name": "Region", "tmdl_type": "string"}]}
+    m = _C.emit_flatfile_source(rel, {"flatfile_path": r"C:\data\Sample - Superstore.xls"},
+                                "excel-direct")
+    assert m is not None
+    assert 'Item="Orders", Kind="Sheet"' in m
+    assert "Orders$" not in m
+    assert "Excel.Workbook(" in m
+
+
+# -- M culture: generated M must not depend on the ambient locale (issue #110) -------------------
+# Table.TransformColumnTypes with no culture parses with the locale of whichever machine REFRESHES
+# the model. On a comma-decimal host a dot-decimal source is silently corrupted by 10^decimals --
+# measured SUM(Sales) at 1,131,591,720 against a true 2,297,200.86, with every structural gate green
+# (TMDL deserialization, M syntax, openability self-check, persisted cache). Only a numeric oracle
+# caught it, and the inflation ratio DIFFERS PER COLUMN, which is the fingerprint.
+
+def _csv(tmp_path, name, text):
+    p = tmp_path / name
+    p.write_text(text, encoding="utf-8", newline="")
+    return str(p)
+
+
+def test_sniff_reads_the_decimal_convention_off_the_FILE(tmp_path):
+    # Csv.Document passes the file's text through unchanged, so the convention is a property of the
+    # FILE and is decidable rather than guessable.
+    us = _csv(tmp_path, "us.csv", "Region,Sales\nWest,261.96\nEast,1000.5\n")
+    assert _C._sniff_csv_decimal_convention(us) == "dot"
+    eu = _csv(tmp_path, "eu.csv", 'Region,Sales\nWest,"1.234,56"\nEast,"2.000,10"\n')
+    assert _C._sniff_csv_decimal_convention(eu) == "comma"
+
+
+def test_sniff_parses_csv_properly_so_a_quoted_european_number_is_not_read_as_american(tmp_path):
+    # THE INVERSION THIS PREVENTS. A comma-decimal file writes its numbers QUOTED ("1.234,56");
+    # splitting naively on commas tears that into `1.234` and `56`, and the leading fragment reads as
+    # a dot-decimal -- classifying a European file as American and pinning the culture that corrupts
+    # it. Measured while building this: the naive split returned "dot" for the file below.
+    eu = _csv(tmp_path, "eu2.csv", 'A,B\n"1.234,56","7.890,12"\n')
+    assert _C._sniff_csv_decimal_convention(eu) == "comma"
+    assert _C.flatfile_culture(eu, "Csv.Document") == ("de-DE", "sniffed-comma")
+
+
+def test_sniff_is_fail_closed_when_the_file_shows_both_or_neither(tmp_path):
+    # A guess is worse than nothing here: pinning en-US on a European file corrupts it the other way.
+    mixed = _csv(tmp_path, "mixed.csv", 'A,B\nWest,1.5\nEast,"2,5"\n')
+    assert _C._sniff_csv_decimal_convention(mixed) is None
+    ints = _csv(tmp_path, "ints.csv", "Region,Qty\nWest,3\nEast,4\n")
+    assert _C._sniff_csv_decimal_convention(ints) is None
+    # an ambiguous DATE (01/02/2024) is not a decimal signal either, and must not be read as one
+    dates = _csv(tmp_path, "dates.csv", "Region,D\nWest,01/02/2024\n")
+    assert _C._sniff_csv_decimal_convention(dates) is None
+    assert _C.flatfile_culture(dates, "Csv.Document") == (None, "inconclusive")
+
+
+def test_a_csv_this_engine_wrote_gets_the_invariant_culture(tmp_path):
+    # hyper_reader.write_rows_csv renders every cell with Python str() -- invariant by construction --
+    # so en-US is PROVEN, not assumed, and the artifact becomes portable.
+    p = _csv(tmp_path, "x.csv", "A\n1\n")
+    assert _C.flatfile_culture(p, "Csv.Document", {"engine_written_csv": True}) == (
+        "en-US", "engine-written")
+
+
+def test_a_legacy_ACE_workbook_gets_no_culture_and_is_reported_instead():
+    # The .xls reader returns cells ALREADY RENDERED in the host locale. That locale is not knowable
+    # at generation time and not observable from within M (Culture.Current returns the model's
+    # sourceQueryCulture, not the Windows locale), so no culture can be proven -- and a wrong guess
+    # is worse than none: en-US on a comma-decimal host is a no-op that leaves the values corrupt.
+    assert _C.flatfile_culture(r"C:\d\a.xls", "Excel.Workbook") == (
+        None, "legacy-ace-host-rendered")
+    assert _C.flatfile_culture(r"C:\d\a.xlsb", "Excel.Workbook")[1] == "legacy-ace-host-rendered"
+    # ...whereas OOXML stores numbers as invariant doubles, so Excel.Workbook returns real numbers
+    # and there is nothing to parse with a culture at all.
+    assert _C.flatfile_culture(r"C:\d\a.xlsx", "Excel.Workbook") == (None, "ooxml-numeric")
+
+
+def test_emitted_M_pins_the_culture_it_can_prove(tmp_path):
+    p = _csv(tmp_path, "sales.csv", "Region,Sales\nWest,261.96\n")
+    rel = {"kind": "table", "name": "Sales", "flatfile_path": p,
+           "columns": [{"remote_name": "Sales", "model_name": "Sales", "tmdl_type": "double"}]}
+    m = _C.emit_flatfile_source(rel, {"flatfile_path": p}, "textscan")
+    assert 'Table.TransformColumnTypes(Promoted, {{"Sales", type number}}, "en-US")' in m
+
+
+def test_emitted_M_omits_the_culture_it_cannot_prove(tmp_path):
+    # Byte-unchanged from before for the unprovable case -- never a guessed locale on user data.
+    p = _csv(tmp_path, "amb.csv", "Region,Qty\nWest,3\n")
+    rel = {"kind": "table", "name": "Q", "flatfile_path": p,
+           "columns": [{"remote_name": "Qty", "model_name": "Qty", "tmdl_type": "int64"}]}
+    m = _C.emit_flatfile_source(rel, {"flatfile_path": p}, "textscan")
+    assert "Table.TransformColumnTypes(Promoted, {{\"Qty\", Int64.Type}})" in m
+    assert "en-US" not in m
+
+
+def test_locale_dependent_relations_names_the_legacy_workbook_and_nothing_else():
+    d = _C.parse_tds("""<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='X' inline='true' version='18.1'>
+  <connection class='excel-direct' filename='Sample - Superstore.xls' directory='C:/data'>
+    <relation connection='excel-direct.1' name='Orders' table='[Orders$]' type='table' />
+  </connection>
+  <column datatype='string' name='[Region]' role='dimension' type='nominal' />
+</datasource>""")
+    rows = _C.locale_dependent_flatfile_relations(d)
+    assert [r["table"] for r in rows] == ["Orders"]
+    assert rows[0]["reason"] == "legacy-ace-host-rendered"
+
+
+def test_locale_dependent_relations_is_silent_for_a_modern_workbook():
+    # The report has to be able to be EMPTY, or it says nothing.
+    d = _C.parse_tds("""<?xml version='1.0' encoding='utf-8' ?>
+<datasource formatted-name='X' inline='true' version='18.1'>
+  <connection class='excel-direct' filename='Book.xlsx' directory='C:/data'>
+    <relation connection='excel-direct.1' name='Orders' table='[Orders$]' type='table' />
+  </connection>
+  <column datatype='string' name='[Region]' role='dimension' type='nominal' />
+</datasource>""")
+    assert _C.locale_dependent_flatfile_relations(d) == []
+
+
+# -- multi-table extract: type each relation from its OWN parent (issue #104) -------------------
+# A single-table extract COLLAPSES onto its one materialised table. A multi-table extract correctly
+# refuses to collapse -- folding three tables onto one would discard two -- but that refusal used to
+# end the story and the whole workbook was skipped ("relation 'Orders.csv' has no resolvable
+# columns", pbip: skipped, definition_of_done: failed) while a complete typed schema and 11,807 rows
+# sat in the bundled .hyper. Measured at 4 of 6 workbooks in a standard Tableau training corpus.
+
+_G1 = "_96FB1234567890ABCDEF1234567890AB"
+_G2 = "_263BAAAABBBBCCCCDDDDEEEEFFFF0000"
+_G3 = "_1FCF9999888877776666555544443333"
+
+
+def _md_rec(parent, col, dtype="string"):
+    return ("<metadata-record class=\'column\'><remote-name>%s</remote-name>"
+            "<remote-type>129</remote-type><local-name>[%s]</local-name>"
+            "<parent-name>[%s]</parent-name><remote-alias>%s</remote-alias>"
+            "<local-type>%s</local-type><ordinal>0</ordinal></metadata-record>"
+            % (col, col, parent, col, dtype))
+
+
+def _extract_tds(rel_names, parents):
+    rels = "".join("<relation connection=\'textscan.1\' name=\'%s\' table=\'[%s]\' type=\'table\' />"
+                   % (n, n.replace(".", "#")) for n in rel_names)
+    recs = "".join(_md_rec(p, "C1") + _md_rec(p, "C2") for p in parents)
+    return ("""<?xml version=\'1.0\' encoding=\'utf-8\' ?>
+<datasource caption=\'DS\' formatted-name=\'X\' inline=\'true\' version=\'18.1\'>
+  <connection class=\'federated\'>
+    <named-connections><named-connection caption=\'c\' name=\'textscan.1\'>
+      <connection class=\'textscan\' filename=\'a.csv\' directory=\'C:/d\' /></named-connection></named-connections>
+    <relation join=\'inner\' type=\'join\'><clause type=\'join\'><expression op=\'=\'/></clause>%s</relation>
+  </connection>
+  <extract enabled=\'true\'><connection class=\'hyper\' dbname=\'Data/x.hyper\' schema=\'Extract\' tablename=\'Extract\'>
+    <relation name=\'Extract\' table=\'[Extract].[Extract]\' type=\'table\' />%s</connection></extract>
+</datasource>""" % (rels, recs))
+
+
+def _typed(descriptor):
+    return {r.get("name"): len(r.get("columns") or [])
+            for r in descriptor["relations"] if r.get("kind") == "table"}
+
+
+def test_a_multi_table_extract_types_each_relation_from_its_own_parent():
+    d = parse_tds(_extract_tds(["Orders.csv", "Customers.csv"],
+                               ["Orders.csv" + _G1, "Customers.csv" + _G2]))
+    assert _typed(d) == {"Orders.csv": 2, "Customers.csv": 2}
+    rels = {r["name"]: r for r in d["relations"] if r.get("kind") == "table"}
+    # each carries its OWN extract table identity, so the materializer reads the right rows
+    assert rels["Orders.csv"]["item"] == "Orders.csv" + _G1
+    assert rels["Customers.csv"]["item"] == "Customers.csv" + _G2
+    assert all(r["extract_hyper_member"] == "Data/x.hyper" for r in rels.values())
+    assert all(r["materialized_from_extract"] for r in rels.values())
+    # the join container described the PRE-extract shape and no longer describes anything physical
+    assert not [r for r in d["relations"] if r.get("kind") in ("join", "union")]
+
+
+def test_a_multi_table_extract_now_yields_a_storage_decision_instead_of_a_skip():
+    # The whole point: this datasource used to report "needs a storage decision (no resolvable
+    # columns)" and the workbook's .pbip was skipped entirely.
+    from storage_mode import select_storage_mode
+    d = parse_tds(_extract_tds(["Orders.csv", "Customers.csv"],
+                               ["Orders.csv" + _G1, "Customers.csv" + _G2]))
+    assert select_storage_mode(d).get("mode") == "Import"
+
+
+def test_an_unmatched_relation_makes_the_expansion_a_no_op():
+    # Fail-closed. One relation with no extract parent means the mapping is not one-to-one, so
+    # NOTHING is typed -- guessing which table is which is the failure this guard exists to prevent.
+    d = parse_tds(_extract_tds(["Orders.csv", "Widgets.csv"],
+                               ["Orders.csv" + _G1, "Customers.csv" + _G2]))
+    assert _typed(d) == {"Orders.csv": 0, "Widgets.csv": 0}
+
+
+def test_a_single_table_extract_still_takes_the_COLLAPSE_path():
+    # Unchanged behaviour: one parent collapses onto one relation named for the datasource.
+    d = parse_tds(_extract_tds(["Orders.csv", "Customers.csv"], ["Orders.csv" + _G1]))
+    assert _typed(d) == {"DS": 2}
+
+
+def test_an_extract_parent_no_relation_references_is_simply_unused():
+    # The live relations define the model's tables; an extra materialised table nothing references
+    # is not a reason to refuse the two that ARE referenced.
+    d = parse_tds(_extract_tds(["Orders.csv", "Customers.csv"],
+                               ["Orders.csv" + _G1, "Customers.csv" + _G2, "Products.csv" + _G3]))
+    assert _typed(d) == {"Orders.csv": 2, "Customers.csv": 2}
+
+
+def test_extract_parent_match_key_strips_the_guid_and_folds_punctuation():
+    assert _C._extract_parent_match_key("[Orders.csv" + _G1 + "]") == "orderscsv"
+    assert _C._extract_parent_match_key("Orders.csv") == "orderscsv"
+    assert _C._extract_parent_match_key("Orders#csv") == "orderscsv"
+    # a 32-hex tail that is NOT a GUID suffix (no underscore) is left alone
+    assert _C._extract_parent_match_key("") == ""
+
+
+# -- joined flat-file: the packaged extract IS the schema (issue #109) --------------------------
+
+def test_a_JOINED_flat_file_datasource_types_from_the_packaged_extract():
+    # A 3-way join over CSVs, extracted. Every relation used to report "has no resolvable columns",
+    # the datasource "needs a storage decision", and the workbook's .pbip was skipped -- while the
+    # packaged .hyper held each relation as a separate, fully typed table.
+    from storage_mode import select_storage_mode
+    parents = ["Orders.csv" + _G1, "Customers.csv" + _G2, "Products.csv" + _G3]
+    recs = "".join(_md_rec(p, "C1") + _md_rec(p, "C2") for p in parents)
+    tds = ("""<?xml version=\'1.0\' encoding=\'utf-8\' ?>
+<datasource caption=\'Big Data Source\' formatted-name=\'X\' inline=\'true\' version=\'18.1\'>
+  <connection class=\'federated\'>
+    <named-connections><named-connection caption=\'c\' name=\'textscan.1\'>
+      <connection class=\'textscan\' filename=\'Orders.csv\' directory=\'C:/d\' /></named-connection></named-connections>
+    <relation join=\'left\' type=\'join\'>
+      <clause type=\'join\'><expression op=\'=\'/></clause>
+      <relation join=\'inner\' type=\'join\'>
+        <clause type=\'join\'><expression op=\'=\'/></clause>
+        <relation connection=\'textscan.1\' name=\'Orders.csv\' table=\'[Orders#csv]\' type=\'table\' />
+        <relation connection=\'textscan.1\' name=\'Customers.csv\' table=\'[Customers#csv]\' type=\'table\' />
+      </relation>
+      <relation connection=\'textscan.1\' name=\'Products.csv\' table=\'[Products#csv]\' type=\'table\' />
+    </relation>
+  </connection>
+  <extract enabled=\'true\'><connection class=\'hyper\' dbname=\'Data/Extracts/big.hyper\' schema=\'Extract\' tablename=\'Extract\'>
+    <relation name=\'Extract\' table=\'[Extract].[Extract]\' type=\'table\' />%s</connection></extract>
+</datasource>""" % recs)
+    d = parse_tds(tds)
+    assert _typed(d) == {"Orders.csv": 2, "Customers.csv": 2, "Products.csv": 2}
+    # the NESTED join tree is dropped -- the extract materialised each table separately
+    assert not [r for r in d["relations"] if r.get("kind") in ("join", "union")]
+    assert select_storage_mode(d).get("mode") == "Import"
+
+
+def test_the_needs_decision_message_distinguishes_cannot_see_from_will_not_choose():
+    # "I cannot SEE the schema" and "I can see it but will not choose a storage mode" used to read
+    # identically, and they need opposite responses from the operator.
+    from storage_mode import select_storage_mode, _structurally_unsupported_detail
+    blind = {"connection_class": "textscan", "named_connection_count": 1,
+             "relations": [{"kind": "table", "name": "T", "columns": []}]}
+    _r, cats = _structurally_unsupported_detail(blind)
+    assert "schema-not-visible" in cats
+    assert "could not be read" in select_storage_mode(blind)["rationale"]
+
+    seen_but_undecided = {"connection_class": "textscan", "named_connection_count": 1,
+                          "relations": [{"kind": "join"},
+                                        {"kind": "table", "name": "T",
+                                         "columns": [{"remote_name": "C", "model_name": "C",
+                                                      "tmdl_type": "string"}]}]}
+    _r2, cats2 = _structurally_unsupported_detail(seen_but_undecided)
+    assert "schema-not-visible" not in cats2
+    rationale = select_storage_mode(seen_but_undecided)["rationale"]
+    assert "schema IS readable" in rationale
+    assert "storage-mode" in rationale

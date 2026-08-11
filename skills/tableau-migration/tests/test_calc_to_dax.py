@@ -472,12 +472,24 @@ def test_qualified_reference_reason_is_clean_not_a_dot_error():
         "[Parameters].[Facility Name Parameter]", _resolver)
     assert "parameter reference" in param_reason
     assert "[Parameters].[Facility Name Parameter]" in param_reason
+    # A datasource-qualified reference whose FIELD is modelled is a data BLEND, and saying
+    # "(unmodeled)" about data that IS modelled sent a reader looking for the wrong thing (issue
+    # #101: the field was sitting in the model as Sheet1[Sales_Target] with 4,603 rows). It still
+    # stubs -- a blend spans two unrelated tables -- but the reason now names the landing and the
+    # remedy.
     _, ds_reason, _ = translate_tableau_calc_to_column_dax("[Datasource].[Sales]", _resolver)
-    assert "qualified reference" in ds_reason
+    assert "blended reference" in ds_reason
+    assert "'Orders'[Sales]" in ds_reason
+    assert "no relationship" in ds_reason
+    # ...and a field that genuinely is NOT modelled keeps the original, honest reason.
+    _, missing_reason, _ = translate_tableau_calc_to_column_dax(
+        "[Datasource].[NoSuchField]", _resolver)
+    assert "qualified reference" in missing_reason
+    assert "(unmodeled)" in missing_reason
     # The specific diagnostic also reaches qualified refs nested inside an aggregate (measure path),
     # not just bare ones, so the orchestrator sees the same actionable reason everywhere.
     _, agg_reason, _ = translate_tableau_calc_to_dax("SUM([Datasource].[Sales])", _resolver)
-    assert "qualified reference" in agg_reason
+    assert "blended reference" in agg_reason and "'Orders'[Sales]" in agg_reason
     # Crucially: NOT the cryptic tokenizer-level "unsupported character '.'" of the old behavior.
     for bad in ("unsupported character", "expected a value"):
         assert bad not in param_reason and bad not in ds_reason

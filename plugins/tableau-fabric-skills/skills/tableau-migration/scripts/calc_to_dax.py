@@ -1874,6 +1874,23 @@ class _Parser:
                 if ref:
                     return ref, pdtype
             raise _CalcError(f"parameter reference {pretty} (unmodeled)")
+        # A DATASOURCE-qualified reference -- ``[federated.<hash>].[Sales Target]`` -- names a field
+        # in ANOTHER Tableau datasource, i.e. a data BLEND. Say so, and say whether the field
+        # actually landed, because "(unmodeled)" is wrong when it did: reported on Superstore against
+        # a field sitting in the model as ``Sheet1[Sales_Target]`` with 4,603 rows (issue #101). The
+        # calc still stubs -- a blend is a composite-key link across two tables Power BI has no
+        # relationship between, so translating it would return one table's grand total, which renders
+        # perfectly and is wrong -- but the reason now names the remedy instead of denying the data.
+        if len(parts) >= 2 and self.resolver:
+            try:
+                hit = self.resolver(parts[-1])
+            except Exception:
+                hit = None
+            if hit:
+                raise _CalcError(
+                    f"blended reference {pretty} -> '{hit[0]}'[{hit[1]}]: the field IS modelled, but "
+                    f"it lives in a datasource Tableau BLENDS with this one, and the two tables have "
+                    f"no relationship -- add one (or a COMBINEVALUES key on both) and re-run")
         raise _CalcError(f"qualified reference {pretty} (unmodeled)")
 
     def _row_fn(self, name):

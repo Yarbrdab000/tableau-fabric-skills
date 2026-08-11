@@ -1131,6 +1131,130 @@ def _extract_materialized_tables(datasource):
     return out
 
 
+_EXTRACT_GUID_SUFFIX_RE = re.compile(r"_[0-9A-Fa-f]{32}$")
+
+
+def _extract_parent_match_key(name):
+    """Normalise an extract parent / relation name for one-to-one matching.
+
+    A Tableau extract names each materialised table ``<source>_<32-hex-GUID>`` (``Orders.csv`` ->
+    ``Orders.csv_96FB...``), so the GUID is stripped, then punctuation and case are folded. Returns
+    ``""`` for anything that normalises away, which never matches.
+    """
+    s = _strip_brackets(str(name or "").strip())
+    s = _EXTRACT_GUID_SUFFIX_RE.sub("", s)
+    return re.sub(r"[^0-9a-z]+", "", s.lower())
+
+
+def _extract_materialized_tables_by_parent(datasource):
+    """Every parent an enabled ``<extract>`` materialised, one entry each.
+
+    The sibling :func:`_extract_materialized_tables` answers "is there exactly ONE table to collapse
+    everything onto", and deliberately returns ``[]`` the moment an extract spans several parents.
+    This answers the different question the multi-table case needs: *which* tables did it
+    materialise, so each column-less relation can be mapped onto its OWN one.
+
+    Returns ``[{"member", "schema", "item", "parent"}]``, in document order.
+    """
+    out = []
+    for ex in _findall_local(datasource, "extract"):
+        if (ex.get("enabled") or "true").lower() == "false":
+            continue
+        for conn in _findall_local(ex, "connection"):
+            if (conn.get("class") or "").lower() not in _EXTRACT_ENGINE_CLASSES:
+                continue
+            member = (conn.get("dbname") or "").strip() or None
+            schema = (conn.get("schema") or "").strip() or None
+            seen = set()
+            for rec in _findall_local(conn, "metadata-record"):
+                if (rec.get("class") or "").lower() != "column":
+                    continue
+                els = _children_local(rec, "parent-name")
+                txt = (els[0].text or "").strip() if els and els[0].text is not None else ""
+                parent = _strip_brackets(txt)
+                if parent and parent not in seen:
+                    seen.add(parent)
+                    out.append({"member": member, "schema": schema,
+                                "item": parent, "parent": parent})
+            break  # one extract element materialises one .hyper member
+    return out
+
+
+def _expand_untyped_relations_to_extract_tables(datasource, relations, cols_by_parent):
+    """Type each column-less relation from its OWN table in a MULTI-table extract.
+
+    The sibling collapse handles the single-table extract. When an extract materialises SEVERAL
+    tables it correctly refuses to collapse -- folding three tables onto one would silently discard
+    two -- but that refusal used to end the story, and the whole workbook was skipped: *"relation
+    'Orders.csv' has no resolvable columns"*, `pbip: skipped`, `definition_of_done: failed`, while a
+    complete typed schema and 11,807 rows sat in the bundled ``.hyper`` the entire time. Measured at
+    **4 of 6** workbooks in a standard Tableau training corpus (issue #104), and the shape is common:
+    an analyst unions a few CSVs and publishes an extract.
+
+    The information needed was already present -- the extract files one parent PER TABLE, each with
+    its own typed ``metadata-record`` columns. What was missing was a per-relation mapping, not a
+    schema. This supplies it, and keeps every guarantee the collapse guard was protecting:
+
+    * every table relation must be column-less (if any one types, the live layer is intact and is the
+      better upstream);
+    * each relation must match EXACTLY ONE extract parent, and no two relations may claim the same
+      parent -- a one-to-one mapping or nothing;
+    * every matched parent must actually carry typed columns.
+
+    Anything short of that returns ``None`` with ``relations`` untouched, so an ambiguous extract
+    degrades to exactly the previous behaviour instead of guessing which table is which. Matching is
+    on the GUID-stripped, case- and punctuation-folded name, which is how Tableau relates
+    ``Orders.csv`` to the ``Orders.csv_96FB...`` it materialised.
+    """
+    table_like = [r for r in relations if r.get("kind") in ("table", "custom_sql")]
+    if len(table_like) < 2 or any(r.get("columns") for r in table_like):
+        return None
+    parents = _extract_materialized_tables_by_parent(datasource)
+    if len(parents) < 2:
+        return None      # the single-table case belongs to the collapse, not here
+
+    by_key = {}
+    for mat in parents:
+        key = _extract_parent_match_key(mat["parent"])
+        if not key:
+            continue
+        by_key.setdefault(key, []).append(mat)
+
+    pairs, claimed = [], set()
+    for rel in table_like:
+        candidates = []
+        for ref in (rel.get("name"), rel.get("item"), rel.get("raw_table")):
+            key = _extract_parent_match_key(ref)
+            if key and key in by_key:
+                candidates = by_key[key]
+                break
+        if len(candidates) != 1:
+            return None                       # ambiguous or unmatched -> never a guess
+        mat = candidates[0]
+        if mat["parent"] in claimed:
+            return None                       # two relations claiming one table
+        cols = (cols_by_parent or {}).get(mat["parent"]) or []
+        if not cols:
+            return None
+        claimed.add(mat["parent"])
+        pairs.append((rel, mat, cols))
+
+    for rel, mat, cols in pairs:
+        rel["columns"] = cols
+        rel["schema"] = mat["schema"]
+        rel["item"] = mat["item"]
+        rel["raw_table"] = f"[{mat['item']}]"
+        rel["materialized_from_extract"] = True
+        if mat["member"]:
+            rel["extract_hyper_member"] = mat["member"]
+            rel["extract_hyper_table"] = f"[{mat['item']}]"
+    # The join/union containers described the PRE-extract shape; the extract materialised each table
+    # separately, so the containers no longer describe anything physical. Relationships between the
+    # now-typed tables are re-derived from the extract's own tables by the caller.
+    relations[:] = [r for r in relations if r.get("kind") not in ("join", "union")]
+    return [rel for rel, _m, _c in pairs]
+
+
 def _collapse_untyped_relations_to_extract(datasource, relations, cols_by_parent):
     """Replace PRE-EXTRACT relations that carry no columns with the extract's materialized table.
 
@@ -1964,7 +2088,13 @@ def parse_tds(xml_text, select=None):
     # the extract actually materialized (the schema of the bundled .hyper) BEFORE relationships are
     # derived, so a join that the extract already flattened is not also emitted as a model
     # relationship between tables that no longer exist. A no-op unless every relation is columnless.
-    _collapse_untyped_relations_to_extract(datasource, relations, cols_by_parent)
+    if _collapse_untyped_relations_to_extract(datasource, relations, cols_by_parent) is None:
+        # A MULTI-table extract cannot be collapsed onto one table -- doing so would discard the
+        # others -- but it still carries a complete typed schema for each table it materialised, one
+        # parent apiece. Map each column-less relation onto its OWN parent instead of declaring the
+        # whole datasource un-typable and skipping the workbook (issue #104: 4 of 6 workbooks in a
+        # standard training corpus). Fail-closed: anything short of a one-to-one match is a no-op.
+        _expand_untyped_relations_to_extract_tables(datasource, relations, cols_by_parent)
     relationships, relationship_warnings = _extract_relationships(datasource, relations)
     # Recover join keys from any PHYSICAL join tree as model relationships and merge them in,
     # de-duplicating against the object-graph relationships in either orientation (a datasource
@@ -2519,16 +2649,162 @@ def _unquote_tableau_identifier(raw):
     return s
 
 
+# The culture emitted for a flat file whose rendering WE control. ``hyper_reader.write_rows_csv``
+# renders every cell with Python's ``str()``, which is invariant: ``.`` decimal separator, no group
+# separators, ISO-ish dates. ``en-US`` is the closest stock culture to that rendering, and naming it
+# explicitly is what makes the artifact locale-PROOF rather than merely correct on the build host.
+INVARIANT_CSV_CULTURE = "en-US"
+
+# A decimal value as our own exporter writes it: optional sign, digits, optional ``.`` fraction, and
+# never a group separator. Anything else in a decimal column means the file was NOT written by us.
+_INVARIANT_DECIMAL_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+_COMMA_DECIMAL_RE = re.compile(r"^-?\d{1,3}(?:\.\d{3})*,\d+$|^-?\d+,\d+$")
+
+
+def _sniff_csv_decimal_convention(path, sample_bytes=65536):
+    """Classify a landed CSV's decimal convention as ``"dot"`` / ``"comma"`` / ``None``.
+
+    ``Csv.Document`` hands Power Query the file's TEXT verbatim -- it does not render anything -- so
+    the decimal convention is a property of the FILE and can be read off it deterministically. That
+    matters because ``Table.TransformColumnTypes`` with no culture parses that text with the
+    REFRESHING machine's locale, so a dot-decimal file silently becomes garbage on a comma-decimal
+    host (measured: ``261.96`` read as ``26196``, and an inflation ratio of ``10^decimals`` that
+    differs per column -- issue #110).
+
+    Parsed with the ``csv`` module rather than split on commas, because a comma-decimal file writes
+    its numbers QUOTED (``"1.234,56"``) -- naive splitting tears that into ``1.234`` and ``56``, and
+    the leading fragment then reads as a dot-decimal, classifying a European file as American: the
+    exact inversion this function exists to prevent.
+
+    Fail-closed by design: a file that shows BOTH conventions, or neither, returns ``None`` and the
+    emitter omits the culture exactly as before rather than guessing a locale onto the user's data.
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(sample_bytes)
+    except OSError:
+        return None
+    text = raw.decode("utf-8-sig", "replace")
+    lines = text.splitlines()
+    if len(lines) < 2:
+        return None
+    dot = comma = 0
+    try:
+        import csv as _csv
+        rows = list(_csv.reader(lines[1:201]))
+    except Exception:
+        return None
+    for row in rows:
+        for cell in row:
+            cell = (cell or "").strip()
+            if not cell:
+                continue
+            if _INVARIANT_DECIMAL_RE.match(cell) and "." in cell:
+                dot += 1
+            elif _COMMA_DECIMAL_RE.match(cell):
+                comma += 1
+    if dot and not comma:
+        return "dot"
+    if comma and not dot:
+        return "comma"
+    return None
+
+
+def flatfile_culture(path, connector, relation=None):
+    """The culture to pin on ``Table.TransformColumnTypes``, plus why -> ``(culture, reason)``.
+
+    Generated M must never depend on the ambient locale of the machine that generated it, nor of the
+    machine that refreshes it. A missing culture makes it depend on BOTH, and the failure is
+    invisible: the model builds, refreshes, and passes every structural gate while returning numbers
+    inflated by orders of magnitude (issue #110 measured ``SUM(Sales)`` at 1,131,591,720 against a
+    true 2,297,200.86, with 25/75 numeric oracle checks passing and every structural gate green).
+
+    Three cases, and only the ones we can PROVE get a culture:
+
+    * **A CSV this engine wrote** (an extract materialised through ``hyper_reader``) -- rendering is
+      ours and is invariant, so ``en-US`` is provably correct and the artifact becomes portable.
+    * **A user's CSV** -- ``Csv.Document`` passes the file's text through unchanged, so the
+      convention is a property of the file and is sniffed from it. A dot-decimal file gets ``en-US``;
+      a comma-decimal file gets ``de-DE``. An inconclusive sniff yields ``None``.
+    * **A legacy ACE workbook** (``.xls``/``.xlsb`` via ``Excel.Workbook``) -- the reader returns
+      cells as text ALREADY RENDERED in the host's locale, which is not observable at generation
+      time and not observable from within M either (``Culture.Current`` returns the model's
+      ``sourceQueryCulture``, not the Windows locale). No culture can be proven, so none is emitted
+      and the reason names the remedy. An OOXML ``.xlsx``/``.xlsm`` is unaffected: it stores numbers
+      as invariant doubles, so ``Excel.Workbook`` returns real numbers rather than rendered text.
+    """
+    rel = relation or {}
+    if connector == "Excel.Workbook":
+        if _is_zip_readable_excel_path(path):
+            return None, "ooxml-numeric"
+        return None, "legacy-ace-host-rendered"
+    if connector != "Csv.Document":
+        return None, "not-a-text-source"
+    if rel.get("engine_written_csv") or rel.get("materialised_csv"):
+        return INVARIANT_CSV_CULTURE, "engine-written"
+    convention = _sniff_csv_decimal_convention(path)
+    if convention == "dot":
+        return INVARIANT_CSV_CULTURE, "sniffed-dot"
+    if convention == "comma":
+        return "de-DE", "sniffed-comma"
+    return None, "inconclusive"
+
+
+def _excel_navigation(relation):
+    """The ``(item, kind)`` pair to navigate an Excel relation with, e.g. ``("Orders", "Sheet")``.
+
+    Tableau records an Excel object with the legacy ACE/OLEDB identifier in the relation's ``table``
+    attribute, and Power Query's ``Excel.Workbook`` does not accept that form -- a ``$``-suffixed key
+    refreshes as *"The key didn't match any rows in the table"*, a failure that appears ONLY at
+    refresh in Desktop, long after every structural gate has passed (issue #108).
+
+    The ACE convention carries the object's KIND, so both halves are decided here from one reading:
+
+    * ``[Orders$]``            -> ``("Orders", "Sheet")``        -- a worksheet.
+    * ``[Sheet1$A1:D100]``     -> ``("Sheet1", "Sheet")``        -- a RANGE on a sheet; Power Query
+      navigates the sheet, and the range's own bounds are not expressible as a navigation key.
+    * ``[MyNamedRange]``       -> ``("MyNamedRange", "DefinedName")`` -- no ``$`` means it is not a
+      worksheet, and navigating it as ``Kind="Sheet"`` fails the same way.
+    * ``[Book].[Orders$]``     -> ``("Orders", "Sheet")``        -- a schema-qualified identifier
+      keeps only its LAST segment.
+
+    The kind is inferred ONLY from the authoritative ``raw_table``/``item`` (which carry the ``$``
+    convention). When neither is present the relation's plain ``name`` is used, and that name never
+    carried the convention in the first place -- so the kind stays ``Sheet``, which is both the
+    overwhelmingly common case and the historical behaviour.
+    """
+    authoritative = relation.get("raw_table") or relation.get("item") or ""
+    raw = authoritative or relation.get("name") or ""
+    s = _unquote_tableau_identifier(raw)
+    # A quoted-then-bracketed identifier ('[Orders$]') needs both peels, in either order.
+    for _ in range(3):
+        peeled = _unquote_tableau_identifier(s)
+        if peeled == s:
+            break
+        s = peeled
+    if "].[" in s:                      # schema/workbook-qualified -> keep the object itself
+        s = _unquote_tableau_identifier(s.rsplit("].[", 1)[-1])
+    s = s.strip()
+    if not s:
+        return "", "Sheet"
+    if "$" in s:
+        sheet, _, tail = s.partition("$")
+        # ``Sheet1$`` is the sheet; ``Sheet1$A1:D100`` is a range ON that sheet. Either way the
+        # navigable object is the sheet, and a sheet name cannot itself contain ``$``.
+        return (sheet or s), "Sheet"
+    if authoritative:
+        return s, "DefinedName"
+    return s, "Sheet"
+
+
 def _excel_sheet_name(relation):
     """The Excel sheet name to navigate for a relation (``[Orders$]`` -> ``Orders``).
 
-    Tableau exposes a worksheet as ``[<sheet>$]`` (the ODBC sheet convention); Power Query's
-    ``Excel.Workbook`` navigation keys the sheet by its bare name with ``Kind="Sheet"``. The
-    trailing ``$`` strip is Excel-specific and deliberately not shared with other file connectors.
+    Thin wrapper over :func:`_excel_navigation` kept for the header-reconciliation caller, which
+    needs the sheet name only. A named range resolves to its own name, which is what
+    ``read_flatfile_headers`` should look for.
     """
-    s = _unquote_tableau_identifier(
-        relation.get("raw_table") or relation.get("item") or relation.get("name") or "")
-    return s[:-1] if s.endswith("$") else s
+    return _excel_navigation(relation)[0]
 
 
 def _access_table_name(relation):
@@ -2706,6 +2982,26 @@ def _read_xlsx_sheet_headers(path):
 
 
 def _is_excel_path(path):
+    """True for any Excel workbook, INCLUDING the legacy binary formats.
+
+    ``.xls``/``.xlsb`` are not readable as zips, so header RECONCILIATION still degrades to "cannot
+    read" for them -- but they are unambiguously Excel, and treating them as not-Excel meant the
+    sheet-name decision was skipped for exactly the legacy files that need it most (issue #108 was
+    filed against a ``.xls``).
+    """
+    try:
+        return str(path).lower().endswith((".xlsx", ".xlsm", ".xls", ".xlsb"))
+    except Exception:
+        return False
+
+
+def _is_zip_readable_excel_path(path):
+    """True only for the OOXML (zip) Excel formats whose sheets this module can actually read.
+
+    ``read_flatfile_headers`` opens a workbook as a zip; a legacy ``.xls``/``.xlsb`` is OLE/binary
+    and simply is not readable that way, so header reconciliation must skip it (fail-closed) rather
+    than mis-parse it.
+    """
     try:
         return str(path).lower().endswith((".xlsx", ".xlsm"))
     except Exception:
@@ -2791,7 +3087,7 @@ def reconcile_flatfile_headers(descriptor):
         path = rel.get("flatfile_path") or ff_path
         if not path:
             continue
-        sheet = _excel_sheet_name(rel) if _is_excel_path(path) else None
+        sheet = _excel_sheet_name(rel) if _is_zip_readable_excel_path(path) else None
         headers = read_flatfile_headers(path, sheet=sheet)
         if not headers:
             continue
@@ -2903,6 +3199,44 @@ def _flatfile_contents_expr(path, conn):
     return f'File.Contents("{escape_m_string(path)}")'
 
 
+def locale_dependent_flatfile_relations(descriptor):
+    """``[{table, path, reason}]`` for relations whose typed M would depend on the AMBIENT locale.
+
+    Generated M must never depend on the locale of the machine that generated it, nor of the machine
+    that refreshes it. :func:`flatfile_culture` pins a culture wherever the rendering can be proven,
+    which covers a CSV outright. What it cannot cover is a LEGACY ACE workbook (``.xls``/``.xlsb``):
+    that reader returns cells as text already rendered in the host's locale, and the rendering
+    locale is neither knowable at generation time nor observable from within M -- ``Culture.Current``
+    returns the model's ``sourceQueryCulture``, not the Windows locale. So that case is REPORTED
+    rather than guessed, because a wrong guess is worse than none: pinning ``en-US`` on a comma-
+    decimal host is a no-op that leaves the values corrupt, and pinning the wrong European culture
+    fixes the dates while leaving the numbers wrong.
+
+    Returns ``[]`` for every source whose culture is proven or irrelevant, so a clean model reports
+    nothing.
+    """
+    out = []
+    conns = {}
+    for c in (descriptor.get("connections") or []):
+        if isinstance(c, dict) and c.get("name"):
+            conns[c["name"]] = c
+    for rel in descriptor.get("relations") or []:
+        if rel.get("kind") not in ("table", "custom_sql"):
+            continue
+        conn = conns.get(rel.get("connection")) or descriptor
+        cls = (conn.get("class") or conn.get("connection_class")
+               or descriptor.get("connection_class") or "").lower()
+        connector = FLAT_FILE_CLASSES.get(cls)
+        if connector is None:
+            continue
+        path = (rel.get("flatfile_path") or _flatfile_path_for(conn)
+                or _flatfile_path_for(descriptor))
+        culture, reason = flatfile_culture(path, connector, rel)
+        if culture is None and reason == "legacy-ace-host-rendered":
+            out.append({"table": _table_display(rel), "path": path, "reason": reason})
+    return out
+
+
 def emit_flatfile_source(relation, conn, cls):
     """Emit a real, typed Import ``let ... in`` body for an Excel/CSV ("full data") relation.
 
@@ -2928,9 +3262,18 @@ def emit_flatfile_source(relation, conn, cls):
     contents = _flatfile_contents_expr(path, conn)
     steps = []
     if connector == "Excel.Workbook":
-        sheet = escape_m_string(_excel_sheet_name(relation))
+        item, kind = _excel_navigation(relation)
+        # Belt AND braces. The identifier normalisation above is the fix; this assertion is what
+        # makes it a GUARANTEE rather than a claim, because the failure it prevents is invisible to
+        # every structural gate -- the model validates, opens, and passes the definition of done,
+        # then fails at refresh in Desktop with "The key didn't match any rows in the table".
+        # A ``$``-suffixed key can only mean an un-normalised ACE identifier reached this point, and
+        # no Excel sheet name may contain ``$``, so this can never fire on legitimate input.
+        if item.endswith("$"):
+            item = item[:-1]
+        sheet = escape_m_string(item)
         steps.append(f'Source = Excel.Workbook({contents}, null, true)')
-        steps.append(f'Navigation = Source{{[Item="{sheet}", Kind="Sheet"]}}[Data]')
+        steps.append(f'Navigation = Source{{[Item="{sheet}", Kind="{kind}"]}}[Data]')
         steps.append("Promoted = Table.PromoteHeaders(Navigation, [PromoteAllScalars=true])")
         prev = "Promoted"
     elif connector == "Access.Database":
@@ -2968,7 +3311,17 @@ def emit_flatfile_source(relation, conn, cls):
         if mt:
             type_pairs.append(f'{{"{escape_m_string(remote)}", {mt}}}')
     if type_pairs:
-        steps.append(f"Typed = Table.TransformColumnTypes({prev}, {{{', '.join(type_pairs)}}})")
+        # CULTURE. Without a third argument, Table.TransformColumnTypes parses with the AMBIENT
+        # locale -- of whichever machine refreshes the model -- so a dot-decimal source silently
+        # becomes garbage on a comma-decimal host (issue #110: SUM(Sales) 1,131,591,720 against a
+        # true 2,297,200.86, every structural gate green). Pinned only where the rendering can be
+        # PROVEN; an unprovable case emits exactly what it did before rather than guessing a locale
+        # onto the user's data, which would corrupt a genuinely European file the other way.
+        culture, _reason = flatfile_culture(path, connector, relation)
+        culture_arg = f', "{escape_m_string(culture)}"' if culture else ""
+        steps.append(
+            f"Typed = Table.TransformColumnTypes({prev}, "
+            f"{{{', '.join(type_pairs)}}}{culture_arg})")
         prev = "Typed"
 
     body = ",\n\t\t\t\t".join(steps)

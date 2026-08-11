@@ -174,16 +174,38 @@ def test_paged_list_walks_every_page():
         seen.append(num)
         return pages[num]
 
-    rows = ES.paged_list(call, "/sites/s/workbooks", "workbooks", "workbook", page_size=2)
+    rows, err = ES.paged_list(call, "/sites/s/workbooks", "workbooks", "workbook", page_size=2)
     assert [r["id"] for r in rows] == ["1", "2", "3"]
     assert seen == [1, 2]
+    assert err is None
 
 
 def test_paged_list_handles_a_single_unwrapped_row():
     def call(_p):
         return {"pagination": {"totalAvailable": "1"}, "workbooks": {"workbook": {"id": "only"}}}
 
-    assert ES.paged_list(call, "/sites/s/workbooks", "workbooks", "workbook") == [{"id": "only"}]
+    assert ES.paged_list(call, "/sites/s/workbooks", "workbooks", "workbook") == (
+        [{"id": "only"}], None)
+
+
+def test_paged_list_reports_a_mid_pagination_failure_instead_of_crashing_the_run():
+    # A 401002 on page 3 of 5 used to propagate out of survey_site and main, and the script died with
+    # NO survey.json written at all -- for a module whose own docstring says a survey that stops
+    # early under-reports the estate. The rows read so far are returned WITH the error, so the caller
+    # reports a partial listing loudly rather than crashing or passing a truncated list off as whole.
+    pages = {1: {"pagination": {"totalAvailable": "4"},
+                 "workbooks": {"workbook": [{"id": "1"}, {"id": "2"}]}}}
+
+    def call(path):
+        num = int(path.split("pageNumber=")[1])
+        if num not in pages:
+            raise RuntimeError("GET .../workbooks failed (401, session_loss): "
+                               "<error code='401002'>Unauthorized Access</error>")
+        return pages[num]
+
+    rows, err = ES.paged_list(call, "/sites/s/workbooks", "workbooks", "workbook", page_size=2)
+    assert [r["id"] for r in rows] == ["1", "2"]
+    assert err["page"] == 2 and "401002" in err["error"]
 
 
 # --- (g) survey_site: read-only, and one permission gap cannot void the survey -------------------
@@ -219,8 +241,52 @@ def test_survey_site_records_a_connections_failure_without_aborting():
     survey = ES.survey_site(call, "s")
     assert len(survey["connection_read_errors"]) == 1
     assert survey["connection_read_errors"][0]["workbook"] == "A"
-    assert survey["summary"]["workbooks_with_published_dependency"] == 1   # B still resolved
+    assert survey["required_datasources"][0]["luid"] == "ds1"     # B still resolved
     assert "WARN" in ES.format_survey(survey)
+    # A workbook whose connections could not be read has UNKNOWN dependencies, NOT none. Counting it
+    # as independent is the "migrate in any order" mistake -- so it counts as understated too, and
+    # the two workbooks here are 1 resolved + 1 unknown.
+    assert survey["summary"]["workbooks_with_published_dependency"] == 2
+    assert survey["summary"]["dependencies_unknown"] == 1
+    wb_a = [w for w in survey["workbooks"] if w["name"] == "A"][0]
+    wb_b = [w for w in survey["workbooks"] if w["name"] == "B"][0]
+    assert wb_a["dependencies_unknown"] is True and wb_a["complexity_understated"] is True
+    assert wb_b["dependencies_unknown"] is False
+
+
+def test_a_degraded_survey_is_flagged_and_says_so():
+    # THE SILENT ZERO. A mid-run session loss made every remaining workbook record `[]`, which reads
+    # downstream as "independent, migrate in any order" -- and `connection_read_errors` reached
+    # neither `summary` nor the exit code, so the run wrote a clean-looking survey.json and exited 0.
+    call = _fake_site([_wb("A", "wb1")], [_ds("D", "ds1")], {}, failing={"wb1"})
+    survey = ES.survey_site(call, "s")
+    assert survey["degraded"] is True
+    assert survey["summary"]["degraded"] is True
+    assert survey["summary"]["connection_read_errors"] == 1
+    assert "DEGRADED" in ES.format_survey(survey)
+
+
+def test_a_clean_survey_is_not_flagged_degraded():
+    # The flag has to be able to be FALSE, or it says nothing.
+    call = _fake_site([_wb("A", "wb1")], [_ds("D", "ds1")], {"wb1": []})
+    survey = ES.survey_site(call, "s")
+    assert survey["degraded"] is False
+    assert survey["summary"]["dependencies_unknown"] == 0
+    assert "DEGRADED" not in ES.format_survey(survey)
+
+
+def test_a_listing_failure_is_reported_as_an_incomplete_estate():
+    # Workbooks or datasources missing from the listing means the survey did not see the estate at
+    # all; that must be louder than a per-workbook gap, not quieter.
+    def call(path):
+        if "/workbooks?" in path:
+            raise RuntimeError("<error code='401002'>Unauthorized Access</error>")
+        return {"pagination": {"totalAvailable": "0"}, "datasources": {"datasource": []}}
+
+    survey = ES.survey_site(call, "s")
+    assert survey["degraded"] is True
+    assert survey["summary"]["listing_errors"] == 1
+    assert "INCOMPLETE" in ES.format_survey(survey)
 
 
 def test_survey_site_issues_only_read_calls():

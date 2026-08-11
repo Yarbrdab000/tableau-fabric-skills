@@ -5,6 +5,7 @@ import re
 
 import pytest
 
+import assemble_model as am
 from assemble_model import (
     assemble_import_model,
     calc_coverage_artifact,
@@ -1814,6 +1815,138 @@ def test_stock_number_of_records_emits_as_sum_aggregated_column_of_ones():
         "definition/tables/_Measures.tmdl", "")
 
 
+def test_row_level_constant_calc_on_the_MEASURE_path_still_lands_as_a_column():
+    # THE ROUTING, not just the handler. The test above hands the calc in as ``dim_calcs=``, which is
+    # the shape only the AUTO-EXTRACT path produces; the workbook path passes ``calcs=`` explicitly,
+    # and the name-gated reroute inside ``_split_calcs_by_role`` runs only when calcs were
+    # auto-extracted. So the main path shipped ``measure = 1`` -- measured in 5 of 29 corpus models
+    # with 7 visuals projecting it, every one showing 1 instead of the row count. Routing a
+    # row-level constant to the column path is now done at the shared pre-router chokepoint, so it
+    # holds however the calc arrived.
+    out = _model_with_calc_cols_and_measures(
+        dim_calcs=[], calcs=[{"name": "Number of Records", "formula": "1", "role": "measure"}])
+    assert "column 'Number of Records' = 1" in out["parts"]["definition/tables/Orders.tmdl"]
+    assert "measure 'Number of Records'" not in out["parts"].get(
+        "definition/tables/_Measures.tmdl", "")
+
+
+def test_row_level_constant_calc_is_keyed_on_the_FORMULA_not_the_name():
+    # A user is free to rename Tableau's stock row-count field (measured in the corpus as
+    # ``1 (Intake)``), and a hand-written literal calc is semantically the same thing -- so the name
+    # carries no information the formula does not. ``measure = k`` is never a faithful translation of
+    # a row-level constant, whatever it is called.
+    out = _model_with_calc_cols_and_measures(
+        dim_calcs=[], calcs=[{"name": "Renamed Row Count", "formula": "1", "role": "measure"},
+                             {"name": "Half", "formula": "0.5", "role": "measure"}])
+    orders = out["parts"]["definition/tables/Orders.tmdl"]
+    assert "column 'Renamed Row Count' = 1" in orders
+    assert "column Half = 0.5" in orders
+    measures = out["parts"].get("definition/tables/_Measures.tmdl", "")
+    assert "measure 'Renamed Row Count'" not in measures
+    assert "measure Half" not in measures
+
+
+def test_a_parameter_scalar_calc_stays_a_MEASURE_so_the_what_if_slicer_still_drives_it():
+    # LITERALS ONLY. A parameter-referencing calc is also scalar, but a DAX calculated column is
+    # materialised at REFRESH -- turning one into a column would freeze it against the what-if
+    # slicer, trading a wrong number for an unresponsive report. It stays on the measure path.
+    out = _model_with_calc_cols_and_measures(
+        dim_calcs=[], calcs=[{"name": "Goal", "formula": "[Parameters].[Target]", "role": "measure"}])
+    assert "column Goal" not in out["parts"]["definition/tables/Orders.tmdl"]
+    assert "column 'Goal'" not in out["parts"]["definition/tables/Orders.tmdl"]
+
+
+def test_row_count_column_targets_offers_the_constant_column_to_the_viz_binder():
+    # The viz layer's implicit-row-count channel binds ``[Number of Records]`` to a COUNTROWS
+    # measure. Once the constant lands as a COLUMN instead, that channel finds nothing, warns
+    # "left unbound" and DROPS the pill -- which took a matrix visual's last binding with it and
+    # emitted a page-less report. So the model offers the column as an equally faithful target.
+    rep = [{"column": "Number of Records", "table": "Orders", "status": "translated", "dax": "1"},
+           {"column": "Margin", "table": "Orders", "status": "translated",
+            "dax": "[Sales] - [Cost]"}]
+    got = am._row_count_column_targets(rep)
+    assert got["columns"] == {"Number of Records": {"entity": "Orders",
+                                                    "column": "Number of Records"}}
+    assert got["default_column"] == {"entity": "Orders", "column": "Number of Records"}
+    # a non-constant calc column is never offered as a row count
+    assert "Margin" not in got["columns"]
+    # nothing to offer -> empty, so the channel warns exactly as before
+    assert am._row_count_column_targets([]) == {}
+
+
+def test_row_count_column_default_is_withheld_when_several_constants_compete():
+    # With more than one constant column and no stock row-count name there is nothing to prefer, so
+    # no default is offered and the channel keeps its precise "left unbound" warning rather than
+    # binding the pill to an arbitrary constant.
+    rep = [{"column": "One", "table": "Orders", "status": "translated", "dax": "1"},
+           {"column": "Two", "table": "People", "status": "translated", "dax": "2"}]
+    got = am._row_count_column_targets(rep)
+    assert set(got["columns"]) == {"One", "Two"}
+    assert "default_column" not in got
+
+
+def test_is_row_level_scalar_formula_accepts_parameter_arithmetic_and_nothing_else():
+    # A calc built only from parameters and literals is row-level AND constant per row: Tableau
+    # evaluates it once per row and aggregates on the shelf, so SUM is n*k while a DAX measure
+    # returns k. That is the class this detects.
+    assert am._is_row_level_scalar_formula(
+        "[Parameters].[Base Salary] + ([Parameters].[Commission Rate]*[Parameters].[New Quota])/100")
+    assert am._is_row_level_scalar_formula("[Parameters].[Target] * 2")
+    # anything touching a COLUMN varies by row on its own -- ordinary measure semantics apply
+    assert not am._is_row_level_scalar_formula("[Sales] - [Cost]")
+    assert not am._is_row_level_scalar_formula("[Sales] * [Parameters].[Rate]")
+    # an aggregate is already grain-correct as a measure
+    assert not am._is_row_level_scalar_formula("SUM([Sales]) - MIN([Parameters].[Goal])")
+    assert not am._is_row_level_scalar_formula("WINDOW_AVG(SUM([Sales]))")
+    # a BARE literal is the calculated-column case, handled more faithfully there
+    assert not am._is_row_level_scalar_formula("1")
+    assert not am._is_row_level_scalar_formula("")
+
+
+def test_scalar_row_aggregate_emits_sum_and_count_companions_over_the_calcs_own_island():
+    # SUM of a row-level scalar is n*k. The companion iterates the calc's OWN datasource island --
+    # a global anchor would count another datasource's rows, which renders perfectly and is wrong.
+    rep = [{"measure": "OTE (Variable)", "status": "translated",
+            "tableau_formula": "[Parameters].[Base] + [Parameters].[Rate]"}]
+    rows = am._scalar_row_aggregate_measures(rep, lambda r: "Sales Commission.csv")
+    dax = {r["measure"]: r["dax"] for r in rows}
+    assert dax["OTE (Variable) (row sum)"] == "SUMX('Sales Commission.csv', [OTE (Variable)])"
+    assert dax["OTE (Variable) (row count)"] == "COUNTX('Sales Commission.csv', [OTE (Variable)])"
+    # the base row now tells the viz binder which companion answers which derivation. Avg/Min/Max
+    # are the scalar itself, so they are deliberately absent and keep binding the base measure.
+    assert rep[0]["row_aggregates"] == {"Sum": "OTE (Variable) (row sum)",
+                                        "Count": "OTE (Variable) (row count)"}
+
+
+def test_scalar_row_aggregate_is_withheld_when_the_row_table_is_ambiguous():
+    # Fail-closed. Guessing which table Tableau iterated produces a number that renders perfectly
+    # and is wrong -- exactly the failure this change exists to remove -- so no companion is emitted
+    # and the pill keeps binding the base measure.
+    rep = [{"measure": "Goal", "status": "translated",
+            "tableau_formula": "[Parameters].[Target]"}]
+    assert am._scalar_row_aggregate_measures(rep, lambda r: None) == []
+    assert "row_aggregates" not in rep[0]
+
+
+def test_row_scalar_table_resolver_ignores_a_relation_that_never_landed():
+    # An EXTRACTED datasource carries two relations for one logical table -- the live one and the
+    # ``Extract`` materialisation -- but only one becomes a model table. Counting both would read as
+    # ambiguous and suppress the companion on exactly the single-table islands it is meant for.
+    relations = [{"source_datasource": "Sales Commission", "kind": "table",
+                  "name": "Sales Commission.csv"},
+                 {"source_datasource": "Sales Commission", "kind": "table", "name": "Extract"},
+                 {"source_datasource": "Superstore", "kind": "table", "name": "Orders"},
+                 {"source_datasource": "Superstore", "kind": "table", "name": "People"}]
+    resolve = am._row_scalar_table_resolver(
+        relations, ["Orders", "People", "Sales Commission.csv", "_Measures"])
+    assert resolve({"datasource": "Sales Commission"}) == "Sales Commission.csv"
+    # a multi-table island stays ambiguous -> no companion
+    assert resolve({"datasource": "Superstore"}) is None
+    # an unknown island falls back to the model's single data table when there is exactly one
+    single = am._row_scalar_table_resolver([], ["Orders", "_Measures"])
+    assert single({"datasource": "anything"}) == "Orders"
+
+
 
 #    real assemble_model resolver. LIVE_SQLSERVER lacks State + City, so the detector (which resolves
 #    its fields against the model) could not fire there; this minimal model carries them. This is the
@@ -2043,9 +2176,13 @@ def _manifest_param_model():
 
 
 def test_model_manifest_has_seven_sections():
+    # ``row_count_columns`` is the eighth, additive section: the constant-column targets the viz
+    # layer's implicit-row-count channel binds when the model landed a row-level constant as a
+    # calculated column instead of a COUNTROWS measure. Kept in this exact-set assertion (rather
+    # than a subset check) so a future section is a deliberate change, never an accident.
     mf = _manifest_param_model()["report"]["model_manifest"]
     assert set(mf) == {"tables", "columns", "measures", "date", "row_count",
-                       "parameters", "naming"}
+                       "row_count_columns", "parameters", "naming"}
     # tables never lists the _Measures holder; columns carry the original Tableau caption.
     assert "_Measures" not in mf["tables"]
     by_field = {c["tableau_field"]: c for c in mf["columns"]}
@@ -3315,3 +3452,75 @@ def test_the_duplicate_banner_explains_what_is_inflated(tmp_path):
     banner = "\n".join(me_est._input_collision_banner(report))
     for term in ("workbooks", "calculations", "stubs", "warned visuals", "multiplied"):
         assert term in banner, f"banner must name {term!r} as inflated"
+
+
+# -- orphaned tables are reported, never joined by guess (issue #107) ---------------------------
+# A dimension that lands unrelated to its fact does not error: it returns that table's GRAND TOTAL
+# identically on every row of a breakdown, while relationship_columns_exist, TMDL deserialization,
+# open and refresh all pass. Measured on a Snowflake datasource where DIM_CUSTOMER and DIM_DATE both
+# landed orphaned and the fact related only to the synthetic Date table.
+
+_ORPHAN_RELATIONS = [
+    {"name": "FACT_ORDERS", "kind": "table", "columns": [
+        {"model_name": "ORDER_ID", "tmdl_type": "string"},
+        {"model_name": "CUSTOMER_ID", "tmdl_type": "string"},
+        {"model_name": "ORDER_DATE", "tmdl_type": "dateTime"},
+        {"model_name": "AMOUNT", "tmdl_type": "double"}]},
+    {"name": "DIM_CUSTOMER", "kind": "table", "columns": [
+        {"model_name": "CUSTOMER_ID", "tmdl_type": "string"},
+        {"model_name": "REGION", "tmdl_type": "string"}]},
+    {"name": "DIM_DATE", "kind": "table", "columns": [
+        {"model_name": "DATE_KEY", "tmdl_type": "dateTime"},
+        {"model_name": "FISCAL_QTR", "tmdl_type": "string"}]},
+]
+_ORPHAN_NAMES = ["FACT_ORDERS", "DIM_CUSTOMER", "DIM_DATE", "Date", "_Measures"]
+_ONLY_SYNTHETIC_DATE = [{"from_table": "FACT_ORDERS", "from_col": "ORDER_DATE",
+                         "to_table": "Date", "to_col": "Date"}]
+
+
+def test_an_orphaned_dimension_is_reported_with_its_candidate_join_keys():
+    rows = {r["table"]: r for r in am._orphan_table_report(
+        _ORPHAN_NAMES, _ONLY_SYNTHETIC_DATE, _ORPHAN_RELATIONS, date_table="Date")}
+    assert set(rows) == {"DIM_CUSTOMER", "DIM_DATE"}
+    # the shared column is EVIDENCE for a human, never an automatic join
+    assert rows["DIM_CUSTOMER"]["shared_with_fact"] == ["CUSTOMER_ID"]
+    assert rows["DIM_CUSTOMER"]["fact_table"] == "FACT_ORDERS"
+
+
+def test_a_source_date_dimension_orphaned_beside_the_synthetic_one_is_flagged():
+    # The sharper signal: the model carries TWO date tables, and the fact is related to the
+    # synthetic one, so the source's real date dimension is unusable.
+    rows = {r["table"]: r for r in am._orphan_table_report(
+        _ORPHAN_NAMES, _ONLY_SYNTHETIC_DATE, _ORPHAN_RELATIONS, date_table="Date")}
+    assert rows["DIM_DATE"]["duplicate_date_dimension"] is True
+    assert rows["DIM_CUSTOMER"]["duplicate_date_dimension"] is False
+
+
+def test_the_orphan_report_is_empty_when_every_table_is_related():
+    # A check that has never been silent proves nothing.
+    related = _ONLY_SYNTHETIC_DATE + [
+        {"from_table": "FACT_ORDERS", "from_col": "CUSTOMER_ID",
+         "to_table": "DIM_CUSTOMER", "to_col": "CUSTOMER_ID"},
+        {"from_table": "FACT_ORDERS", "from_col": "ORDER_DATE",
+         "to_table": "DIM_DATE", "to_col": "DATE_KEY"}]
+    assert am._orphan_table_report(_ORPHAN_NAMES, related, _ORPHAN_RELATIONS,
+                                   date_table="Date") == []
+    # ...and a single-table model has nothing to be orphaned FROM
+    assert am._orphan_table_report(["Orders", "_Measures"], [], _ORPHAN_RELATIONS) == []
+
+
+def test_an_orphan_never_reports_its_own_columns_as_the_join_keys():
+    # The fact for a given orphan is the largest OTHER table; comparing a table to itself listed its
+    # own columns as candidate keys, which reads as nonsense (measured on a two-island fixture).
+    two_islands = [
+        {"name": "Sales", "kind": "table", "columns": [
+            {"model_name": "Amount", "tmdl_type": "double"},
+            {"model_name": "Category", "tmdl_type": "string"}]},
+        {"name": "Inventory", "kind": "table", "columns": [
+            {"model_name": "Category", "tmdl_type": "string"}]},
+    ]
+    rows = {r["table"]: r for r in am._orphan_table_report(
+        ["Sales", "Inventory", "_Measures"], [], two_islands)}
+    assert rows["Sales"]["fact_table"] == "Inventory"
+    assert rows["Inventory"]["fact_table"] == "Sales"
+    assert rows["Sales"]["shared_with_fact"] == ["Category"]

@@ -289,6 +289,7 @@ VT_PIE = "pie"            # pieChart (angle measure + legend dimension)
 VT_FILLED_MAP = "filled_map"  # filledMap (Bing choropleth: geo Category + saturation measure on the Gradient/Color-saturation well)
 VT_MAP = "map"            # map (symbol/bubble: geo Location + measure Size/Color)
 VT_SHAPE_MAP = "shape_map"  # shapeMap (built-in-topology choropleth: geo Category + measure on the "Value" well)
+VT_DENSITY_MAP = "density_map"  # azureMap heatMapLayer (Tableau's Density/Heatmap mark over a geography)
 VT_COMBO = "combo"        # lineClusteredColumnComboChart (column measure(s) on Y + line measure(s) on Y2)
 VT_WATERFALL = "waterfall"  # waterfallChart (running-total Gantt hack: dimension Category + base measure Y)
 VT_DONUT = "donut"          # donutChart (dual-axis pie/donut hack: legend Category + angle measure Y)
@@ -313,9 +314,22 @@ _VT_TO_PBIR = {
     # legacy Bing filledMap; it is retained only for location-only / categorical-legend maps (a
     # measure-less geo Detail) -- shapes shapeMap cannot express -- and stays an image-oracle
     # candidate the assisted tier may restore.
-    VT_FILLED_MAP: "filledMap",
-    VT_MAP: "map",
-    VT_SHAPE_MAP: "shapeMap",
+    # ALL THREE Tableau map shapes migrate to ``azureMap``. Microsoft deprecates the Bing-backed
+    # ``map`` and ``filledMap`` (Desktop now shows a modal "Bing map visuals are going away"), and
+    # ``shapeMap`` -- which the choropleth path used to take -- was measured rendering COMPLETELY
+    # BLANK: a 4-visual control page proved azureMap draws bubbles and a data-bound referenceLayer
+    # choropleth on the same machine and the same data where a byte-identical shapeMap drew nothing.
+    # So this is not merely a deprecation swap; shapeMap was emitting an empty visual (issues #106,
+    # #112). The three constants are kept distinct because they still select DIFFERENT azureMap
+    # layers and query-state shapes (choropleth vs symbol vs categorical legend).
+    VT_FILLED_MAP: "azureMap",
+    VT_MAP: "azureMap",
+    VT_SHAPE_MAP: "azureMap",
+    # Tableau's Density / Heatmap mark over a geography. It used to defer to VT_UNSUPPORTED -- "no
+    # offline home" -- and the whole worksheet produced NO PAGE AT ALL (issue #112). azureMap has a
+    # native ``heatMapLayer`` that is exactly this mark, so the worksheet is now rebuilt instead of
+    # dropped.
+    VT_DENSITY_MAP: "azureMap",
     # Dual-axis / combo: a column-family measure share an axis with a line-family measure. Power
     # BI's combo chart puts the column measure(s) on Y (primary axis) and the line measure(s) on
     # Y2 (secondary axis). Role keys (Category/Series/Y/Y2) verified against real Microsoft PBIR
@@ -953,6 +967,28 @@ def _row_count_measure_target(rc, row_count_binding):
     return None
 
 
+def _row_count_column_target(rc, row_count_binding):
+    """Resolve the ``(entity, column)`` constant COLUMN to bind an implicit row count to, or ``None``.
+
+    The model may land Tableau's row-level constant (the stock ``Number of Records`` field, or any
+    literal calc) as a calculated COLUMN of 1s with ``summarizeBy: sum`` rather than as a COUNTROWS
+    measure -- which is the more faithful shape, because aggregating it on the shelf reproduces
+    every Tableau aggregation (``SUM`` -> n*k, ``AVG`` -> k, ``CNT`` -> n) where a single COUNTROWS
+    measure only reproduces the count. This is the column-side twin of
+    :func:`_row_count_measure_target` and is consulted only AFTER it, so a model that supplies a
+    real COUNTROWS measure binds exactly as before.
+
+    ``object_id`` counts are deliberately excluded: they name a specific fact table and are answered
+    by that fact's own COUNTROWS measure, never by a constant column that may live elsewhere.
+    """
+    if not row_count_binding or rc.get("kind") != "numrec":
+        return None
+    d = row_count_binding.get("default_column") or {}
+    if d.get("entity") and d.get("column"):
+        return (d["entity"], d["column"])
+    return None
+
+
 def _bind_or_warn_row_count(rc, ds, worksheet, base_id, field_id, deriv,
                             warnings, warn_special, row_count_binding):
     """Bind an implicit row count to a COUNTROWS measure, or warn (warn-never-wrong).
@@ -972,6 +1008,23 @@ def _bind_or_warn_row_count(rc, ds, worksheet, base_id, field_id, deriv,
             "derivation": deriv, "aggregation": None,
             "entity": entity, "property": measure,
             "binding": "measure", "kind": "value",
+            "geo_area": None, "formula": None,
+            "number_format": None,
+        }
+    col_target = _row_count_column_target(rc, row_count_binding)
+    if col_target is not None:
+        # The constant COLUMN carries the pill's OWN shelf aggregation (Tableau's implicit row-count
+        # pill is ``SUM([Number of Records])``, but the same field is legitimately averaged or
+        # counted), so the visual reproduces the source aggregation rather than being pinned to a
+        # count. ``Sum`` is the default only because that is the aggregation Tableau applies when
+        # the pill carries none.
+        entity, column = col_target
+        return {
+            "caption": column, "field_id": base_id, "instance": field_id,
+            "role": "measure", "datatype": "integer", "is_calc": False,
+            "derivation": deriv, "aggregation": deriv if deriv in _AGG_FUNC else "Sum",
+            "entity": entity, "property": column,
+            "binding": "column", "kind": "value",
             "geo_area": None, "formula": None,
             "number_format": None,
         }
@@ -1143,6 +1196,35 @@ def dax_safe_measure_name(name):
     return cleaned or text
 
 
+def _lookup_scalar_row_aggregate(measure_binding, field_id, base_id, caption, worksheet,
+                                 island, deriv):
+    """The row-aggregated companion measure for this pill's own derivation, or ``None``.
+
+    A Tableau calc built only from parameters and literals is row-level but constant across rows, so
+    Tableau's ``SUM`` of it is ``n*k`` while the DAX measure returns ``k``. The model emits a
+    ``SUMX``/``COUNTX`` companion for exactly the two derivations that differ; ``Avg``/``Min``/``Max``
+    are the scalar itself and keep binding the base measure.
+
+    This also un-collapses the shelf. Two pills over the same calc at different derivations used to
+    resolve to one identical measure reference, so the second projection was de-duplicated away --
+    measured on Superstore (issue #103), the ``OTE`` table lost Tableau's *Avg. OTE* column entirely
+    and reported the remaining one at the wrong grain.
+    """
+    if not measure_binding or not deriv:
+        return None
+    entries = _measure_binding_entries(measure_binding)
+    if not entries:
+        return None
+    for key in _measure_binding_candidate_keys(field_id, base_id, caption, worksheet, island):
+        entry = entries.get(key)
+        if not isinstance(entry, dict):
+            continue
+        alt = (entry.get("row_aggregates") or {}).get(deriv)
+        if alt:
+            return alt
+    return None
+
+
 def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
                    worksheet, warnings, warn_special=True, internal_fields=None,
                    date_binding=None, row_count_binding=None, measure_binding=None,
@@ -1186,6 +1268,15 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
                                      island=ds_caption.get(ds))
         if mb is not None:
             m_entity, m_measure = mb
+            # A ROW-LEVEL SCALAR calc (parameter/literal arithmetic, no column reference) is constant
+            # per row but still aggregated by Tableau on the shelf, so a Sum pill means n*k while the
+            # measure returns k. Bind this pill's OWN derivation to the model's row-aggregated
+            # companion when one exists; Avg/Min/Max are the scalar itself and keep the base measure.
+            _alt = _lookup_scalar_row_aggregate(measure_binding, field_id, base_id,
+                                                _mb_base.get("caption"), worksheet,
+                                                ds_caption.get(ds), deriv)
+            if _alt:
+                m_measure = _alt
             # Did the model translate THIS PILL'S OWN table calc, or only the base field under it?
             # The lookup tries the pill instance token FIRST, then falls back to the bare calc id /
             # caption -- so re-running it with the instance token ALONE answers the question exactly.
@@ -1876,6 +1967,11 @@ def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
         # truly-custom polygon and still defers; density/heatmap have no offline home, always defer.
         if m in _POLYGON_MAP_MARKS and map_signal:
             return VT_SHAPE_MAP
+        # Tableau's DENSITY / HEATMAP mark over a geography has a native azureMap home -- the
+        # ``heatMapLayer`` -- so it is rebuilt rather than deferred. Deferring it produced no page at
+        # all for the worksheet (issue #112), which is a worse answer than a faithful heat layer.
+        if m in _DENSITY_MAP_MARKS:
+            return VT_DENSITY_MAP
         if m in _DEFER_MAP_MARKS:
             return VT_UNSUPPORTED
         # A geo Location + a measure is a choropleth shaded by that measure -> shapeMap (the faithful
@@ -1885,6 +1981,13 @@ def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
         if m in ("map", "filled", "filledmap"):
             return VT_SHAPE_MAP
         if m in ("circle", "square", "shape", "point") and map_signal:
+            return VT_MAP
+        # A PIE mark over a geography is Tableau's pie-on-a-map. Falling through to the chart
+        # heuristics turned it into a plain ``pieChart`` -- the geography SILENTLY dropped, and the
+        # output looks finished, which is worse than a degraded map (issue #112). azureMap has no
+        # per-point pie, so the faithful degrade is a bubble layer with the pie's own colour
+        # dimension as the Series legend; the caller warns that the per-slice split is lost.
+        if m == "pie" and map_signal:
             return VT_MAP
         if m in ("automatic", "") and map_signal:
             return VT_SHAPE_MAP
@@ -1896,6 +1999,8 @@ def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
     # is a map, not a text list). The faithful rebuild is a filledMap carrying just the Location
     # (Category); the colour-saturation measure is simply absent. Custom-geometry marks still defer.
     if geo_detail and not map_meas and not axis_dim and not axis_meas:
+        if m in _DENSITY_MAP_MARKS:
+            return VT_DENSITY_MAP
         if m not in _DEFER_MAP_MARKS:
             return VT_FILLED_MAP
 
@@ -2457,7 +2562,9 @@ def _measure_value_member_ids(view, ds_default):
 
 
 def _resolve_measure_values(view, ds_default, base_cols, instances, index, ds_caption,
-                            worksheet, warnings, internal_fields=None):
+                            worksheet, warnings, internal_fields=None,
+                            measure_binding=None, row_count_binding=None, column_binding=None,
+                            date_binding=None):
     """Resolve the ordered Measure Values members to value fields.
 
     Drops numeric-literal dummy spacers (the path-hack constant). Returns
@@ -2476,7 +2583,10 @@ def _resolve_measure_values(view, ds_default, base_cols, instances, index, ds_ca
         if _is_param_swap(formula):
             has_param_swap = True
         f = _resolve_field(ds, fid, base_cols, instances, index, ds_caption,
-                           worksheet, warnings, internal_fields=internal_fields)
+                           worksheet, warnings, internal_fields=internal_fields,
+                           measure_binding=measure_binding,
+                           row_count_binding=row_count_binding,
+                           column_binding=column_binding, date_binding=date_binding)
         if f and f["kind"] == "value":
             members.append(f)
     return members, dummy_count, has_param_swap, status
@@ -4441,7 +4551,14 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         locs = _mv_shelf_locations(rows_text, cols_text, pane)
         members, dummy_count, has_param_swap, mv_status = _resolve_measure_values(
             view, ds_default, base_cols, instances, index, ds_caption, name, warnings,
-            internal_fields=internal_fields)
+            internal_fields=internal_fields,
+            # The Measure Values path used to resolve its members WITHOUT the model's binding
+            # channels, so every member fell back to the standing caption resolution instead of the
+            # authoritative model measure -- which is how two pills over one calc at different
+            # derivations collapsed into a single identical reference (issue #103: Tableau's
+            # "Avg. OTE" column vanished and the survivor reported the wrong grain).
+            measure_binding=measure_binding, row_count_binding=row_count_binding,
+            column_binding=column_binding, date_binding=date_binding)
         visual_type, inject_shelf, fidelity_note = _route_measure_values(
             mark, locs, members, dummy_count, has_param_swap, mv_status,
             dims_rows, dims_cols, name, warnings)
@@ -4923,6 +5040,12 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "datasource": primary_caption,
         "datasource_name": ds_default,
         "mark_class": mark,
+        # Every mark class present across the worksheet's panes. A Tableau DUAL-AXIS map stacks
+        # several mark layers in one worksheet (a Multipolygon choropleth plus Pie marks at a finer
+        # LOD), and one Power BI map has one Location well and one Legend well, so the extra layers
+        # are dropped -- which has to be SAID (issue #111). Recorded here so the emitter can name the
+        # real loss instead of only the palette detail that follows from it.
+        "pane_marks": _all_pane_marks(table),
         "visual_type": visual_type,
         "title": title_text,
         "caption_only_raw": caption_only_raw,
@@ -6287,6 +6410,13 @@ def _apply_override(field, model_table, field_map):
         _ds = field.get("datasource")
         if _ds and entity:
             ov = field_map.get("%s||%s||%s" % (_ds, entity, field["caption"]))
+        if ov is None and _ds:
+            # The relation name did not match -- an EXTRACTED datasource carries two relations for
+            # the same logical table (the live one and ``Extract``), and a worksheet bound to the
+            # extract names the one the model did not key. Fall back to the pill's own DATASOURCE,
+            # which is still far narrower than the bare caption: this key exists only where the
+            # caption is unambiguous within that datasource (issue #103).
+            ov = field_map.get("%s||%s" % (_ds, field["caption"]))
         if ov is None:
             ov = field_map.get(field["caption"])
     if ov is not None:
@@ -6955,7 +7085,11 @@ def _build_query_state(ws, model_table, field_map, warnings):
             state["Category"] = {"projections": _role_projections(
                 loc, model_table, field_map, used_refs)}
         if meas:
-            state["Value"] = {"projections": _role_projections(
+            # azureMap has NO ``Value`` and no ``Gradient`` role (catalog describe azureMap ->
+            # Category/Y/X/Series/Size/Tooltips/PathID/PointOrder). ``Tooltips`` IS a real measure
+            # role, so the shading measure is genuinely in the dataview and the referenceLayer's
+            # FillRule ``Input`` resolves against it.
+            state["Tooltips"] = {"projections": _role_projections(
                 meas[:1], model_table, field_map, used_refs)}
     elif vt == VT_FILLED_MAP:
         # Filled map (Bing choropleth): the geo-role dimension on Detail is the Category (Location),
@@ -6975,7 +7109,9 @@ def _build_query_state(ws, model_table, field_map, warnings):
             state["Category"] = {"projections": _role_projections(
                 loc, model_table, field_map, used_refs)}
         if meas:
-            state["Gradient"] = {"projections": _role_projections(
+            # azureMap has no ``Gradient`` role; the shading measure rides ``Tooltips`` (a real
+            # measure role) so the referenceLayer FillRule can resolve it. See VT_SHAPE_MAP above.
+            state["Tooltips"] = {"projections": _role_projections(
                 meas[:1], model_table, field_map, used_refs)}
         # a categorical (dimension) colour on the Color shelf is the map LEGEND -> the "Series"
         # role (a valid filledMap role on a real visual.json); each area is shaded by its legend
@@ -6986,6 +7122,21 @@ def _build_query_state(ws, model_table, field_map, warnings):
         if color_series:
             state["Series"] = {"projections": _role_projections(
                 color_series, model_table, field_map, used_refs)}
+    elif vt == VT_DENSITY_MAP:
+        # Density / heat map: the geo dimension is the Category (Location) and the weighting measure
+        # rides ``Size`` -- azureMap's heatMapLayer uses Size as its intensity field, exactly as
+        # Tableau's Density mark weights by the measure on Size/Colour.
+        loc = drop_calc_axis(_dedupe(finest_geo(detail)))
+        meas = _dedupe(
+            ([size] if size and size["kind"] == "value" else [])
+            + ([color] if color and color["kind"] == "value" else [])
+            + values(rows) + values(cols))
+        if loc:
+            state["Category"] = {"projections": _role_projections(
+                loc, model_table, field_map, used_refs)}
+        if meas:
+            state["Size"] = {"projections": _role_projections(
+                meas[:1], model_table, field_map, used_refs)}
     elif vt == VT_MAP:
         # symbol / bubble map: the geo dimension binds the Category role (the map's "Location" well
         # -- role NAME is "Category", displayName "Location"; there is NO role literally named
@@ -7021,7 +7172,8 @@ def _build_query_state(ws, model_table, field_map, warnings):
                     f"near-uniform bubble radii -- prefer a count or sum measure on Size so the "
                     f"bubbles are differentiable"))
         if color_sel:
-            state["Gradient"] = {"projections": _role_projections(
+            # azureMap has no ``Gradient`` role; a symbol map's colour measure rides ``Tooltips``.
+            state["Tooltips"] = {"projections": _role_projections(
                 color_sel, model_table, field_map, used_refs)}
         # a categorical (dimension) colour binds the map LEGEND -> the "Series" role (verified on a
         # real classic "map" visual.json, e.g. Series=Continent); bubbles are coloured by legend
@@ -7057,8 +7209,15 @@ def _query_state_complete(vt, state):
         # measure is optional (a geo Detail whose measure was dropped is still a location-only map).
         return "Category" in state
     if vt == VT_MAP:
+        # ``Gradient`` no longer exists on the emitted visual (azureMap has no such role -- the
+        # colour measure moved to ``Tooltips``), so a symbol map whose only extra encoding was a
+        # colour measure would have been judged degenerate and DROPPED.
         return "Category" in state and (
-            "Size" in state or "Gradient" in state or "Series" in state)
+            "Size" in state or "Tooltips" in state or "Series" in state)
+    if vt == VT_DENSITY_MAP:
+        # A heat layer needs somewhere to draw: the Location is essential, the weighting measure is
+        # optional (an unweighted density map is a valid point-density surface).
+        return "Category" in state
     if vt == VT_MATRIX:
         return "Values" in state and ("Rows" in state or "Columns" in state)
     if vt == VT_TABLE:
@@ -9178,6 +9337,184 @@ _SHAPE_MAP_DIVERGING_MIN = "#FEA043"    # orange -> most-negative (loss); value-
 _SHAPE_MAP_DIVERGING_MID = "#FFFFFF"    # white  -> pinned at 0 / break-even
 _SHAPE_MAP_DIVERGING_MAX = "#4A88C2"    # blue   -> most-positive (high profit); value-less = auto data high
 _SHAPE_MAP_DIVERGING_CENTRE = "0D"      # PBIR double-literal 0 -> the pinned centre value (break-even)
+
+
+_AZURE_MAP_US_STATES_GEOJSON = (
+    "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json")
+# Closest render-verified match to Tableau's own map chrome: white background, soft grey borders, no
+# controls. Four variants were compared in Desktop; `blank` lost the state borders (white on white),
+# `grayscale_light` drew a grey basemap with Canada/Mexico, and plain `blank` with the default stroke
+# drew a loud blue outline. `blank_accessible` + #D9D9D9 was the closest to the Tableau reference.
+_AZURE_MAP_DEFAULT_STYLE = "blank_accessible"
+_AZURE_MAP_POLYGON_STROKE = "#D9D9D9"
+
+
+def _azure_map_objects(ws, visual_type, shading_field=None):
+    """The ``objects`` block for an ``azureMap``, or ``None``.
+
+    Render-proven, not inferred. A 4-visual control page in Power BI Desktop established:
+
+    * ``azureMap`` with a Category renders basemap + bubbles;
+    * ``azureMap`` with a data-bound ``referenceLayer`` renders a real choropleth;
+    * a byte-identical ``shapeMap`` -- what this engine used to emit -- rendered **completely
+      blank**, on the same machine, same data, with the shared ``usa.states.topo`` resource.
+
+    Two pieces are non-obvious and were each proved by rendering:
+
+    * ``bubbleLayer.show = false`` is REQUIRED on a choropleth. Without it Azure Maps draws a bubble
+      on every state centroid ON TOP of the shaded polygons.
+    * ``referenceLayer`` is a TWO-entry array: entry ``[0]`` (no selector) carries the layer itself,
+      and entry ``[1]`` (a ``dataViewWildcard`` selector) carries the data-bound ``polygonFillColor``.
+      One merged entry does not shade.
+
+    The choropleth depends on a PUBLIC GeoJSON URL, so an offline or locked-down tenant must
+    re-point ``referenceLayerUrl`` -- the caller warns about exactly that.
+    """
+    controls = {
+        "showStylePicker": {"expr": {"Literal": {"Value": "false"}}},
+        "showNavigationControls": {"expr": {"Literal": {"Value": "false"}}},
+        "showSelectionControl": {"expr": {"Literal": {"Value": "false"}}},
+        "defaultStyle": {"expr": {"Literal": {
+            "Value": _semantic_string_literal(_AZURE_MAP_DEFAULT_STYLE)}}},
+    }
+    objects = {"mapControls": [{"properties": dict(controls)}]}
+
+    if visual_type == VT_DENSITY_MAP:
+        # Tableau's Density mark IS a heat layer, and azureMap has one natively. The bubble layer is
+        # switched off so the points do not double-draw over the heat surface.
+        objects["heatMapLayer"] = [{"properties": {
+            "show": {"expr": {"Literal": {"Value": "true"}}}}}]
+        objects["bubbleLayer"] = [{"properties": {
+            "show": {"expr": {"Literal": {"Value": "false"}}}}}]
+        return objects
+
+    if visual_type == VT_MAP or shading_field is None:
+        # A symbol/bubble map keeps the bubble layer and gets NO reference layer: its geography is
+        # the point itself, not an area, so a polygon overlay would be an invention.
+        return objects
+
+    if _azure_map_state_grain(ws) is None:
+        # Only a US-state grain has a verified boundary file whose feature ``name`` matches Tableau's
+        # state captions. A coarser or non-US geography gets the basemap + bubbles rather than a
+        # polygon layer keyed on names we have not proven line up (fail-closed).
+        return objects
+
+    objects["mapControls"][0]["properties"]["autoZoomIncludesReferenceLayer"] = {
+        "expr": {"Literal": {"Value": "true"}}}
+    objects["bubbleLayer"] = [{"properties": {"show": {"expr": {"Literal": {"Value": "false"}}}}}]
+    objects["referenceLayer"] = [
+        {"properties": {
+            "show": {"expr": {"Literal": {"Value": "true"}}},
+            "datasourceType": {"expr": {"Literal": {"Value": "'url'"}}},
+            "referenceLayerUrl": {"expr": {"Literal": {
+                "Value": _semantic_string_literal(_AZURE_MAP_US_STATES_GEOJSON)}}},
+            "unmappedObjectVisibility": {"expr": {"Literal": {"Value": "false"}}},
+            "polygonStrokeColor": {"solid": {"color": {"expr": {"Literal": {
+                "Value": _semantic_string_literal(_AZURE_MAP_POLYGON_STROKE)}}}}},
+            "polygonStrokeWidth": {"expr": {"Literal": {"Value": "1D"}}},
+        }},
+        {"properties": {
+            "polygonFillColor": {"solid": {"color": {"expr": {"FillRule": {
+                "Input": shading_field,
+                "FillRule": _azure_map_fill_rule(),
+            }}}}},
+        },
+         "selector": {"data": [{"dataViewWildcard": {"matchingOption": 1}}]}},
+    ]
+    return objects
+
+
+def _azure_map_state_grain(ws):
+    """The state-grain geo field for an azureMap choropleth, or ``None``.
+
+    Same granularity test the shapeMap path used: the reference boundary file IS US states, and its
+    feature ``name`` property is the full state name, which is what Tableau's state captions carry.
+    """
+    geo_levels = [g for g in (ws["encodings"].get("geo_levels") or [])
+                  if g.get("kind") == "category"]
+    finest = (max(geo_levels, key=lambda g: _geo_rank(g.get("geo_area")))
+              if geo_levels else ws["encodings"].get("detail"))
+    area = finest.get("geo_area") if finest else None
+    return finest if _geo_rank(area) == _GEO_GRANULARITY["state"] else None
+
+
+def _azure_map_fill_rule():
+    """The diverging ``linearGradient3`` an azureMap choropleth shades with.
+
+    Same palette and the same value-anchored ``mid`` the shapeMap path used -- orange (loss) ->
+    white (break-even, pinned to 0) -> blue (high) -- because Power BI otherwise auto-centres on the
+    DATA midpoint and paints break-even states orange on a mostly-positive measure. A fillRule stop
+    is an UNWRAPPED literal; the ``{"expr": ...}`` wrapper makes the stop fail to load and the
+    choropleth reverts to a flat fill.
+    """
+    return {
+        "linearGradient3": {
+            "min": {"color": {"Literal": {
+                "Value": _semantic_string_literal(_SHAPE_MAP_DIVERGING_MIN)}}},
+            "mid": {"color": {"Literal": {
+                "Value": _semantic_string_literal(_SHAPE_MAP_DIVERGING_MID)}},
+                "value": {"Literal": {"Value": _SHAPE_MAP_DIVERGING_CENTRE}}},
+            "max": {"color": {"Literal": {
+                "Value": _semantic_string_literal(_SHAPE_MAP_DIVERGING_MAX)}}},
+            "nullColoringStrategy": {"strategy": {"Literal": {"Value": "'asZero'"}}},
+        },
+    }
+
+
+def _merge_extra_objects(*blocks):
+    """Merge several ``extra_objects`` dicts, later keys winning. ``None`` when all are empty."""
+    out = {}
+    for block in blocks:
+        if block:
+            out.update(block)
+    return out or None
+
+
+def _azure_map_objects_for(ws, state, warnings):
+    """``extra_objects`` for a map worksheet, or ``None`` for anything that is not a map.
+
+    Pulls the shading measure's field expression straight out of the emitted ``Tooltips`` projection
+    -- that is the SAME expression the referenceLayer's ``FillRule.Input`` must name, so reading it
+    back from the query state guarantees the two agree rather than rebuilding it and hoping.
+    """
+    vt = ws.get("visual_type")
+    if vt not in (VT_SHAPE_MAP, VT_FILLED_MAP, VT_MAP, VT_DENSITY_MAP):
+        return None
+    # ISSUE #111: a Tableau DUAL-AXIS map stacks several mark layers -- e.g. a Multipolygon state
+    # choropleth coloured by SUM(Profit) PLUS Pie marks at City LOD sized by SUM(Sales) -- and a
+    # single azureMap has ONE Location well and ONE Legend well, so it structurally cannot host two
+    # LODs with two colour encodings. The layers beyond the first are therefore DROPPED, and the only
+    # thing said about it used to be a note that "categorical mark colours are deferred" -- true, but
+    # a palette detail that reads like a nit, so a reader would never guess two of three layers were
+    # gone. Named first and explicitly, because it is not repairable downstream.
+    _marks = [m for m in (ws.get("pane_marks") or []) if m]
+    if len(dict.fromkeys(_marks)) > 1:
+        warnings.insert(0, _warn(
+            "worksheet", ws["name"],
+            "dual-axis map: %d mark layer(s) (%s) were flattened into ONE visual and layers 2..%d "
+            "are DROPPED -- a single Power BI map has one Location well and one Legend well, so it "
+            "cannot host several LODs with several colour encodings. The faithful rebuild is one "
+            "visual PER layer; this is a structural loss, not a styling one"
+            % (len(_marks), ", ".join(dict.fromkeys(_marks)), len(_marks))))
+    if vt == VT_MAP and (ws.get("mark_class") or "").strip().lower() == "pie":
+        warnings.append(_warn(
+            "worksheet", ws["name"],
+            "pie-on-a-map rebuilt as a BUBBLE map: Power BI has no per-point pie marker, so the "
+            "geography and the sizing measure are kept and the per-slice split is lost. Previously "
+            "this became a plain pieChart with the geography dropped entirely"))
+    shading = None
+    for proj in ((state.get("Tooltips") or {}).get("projections") or []):
+        if proj.get("field"):
+            shading = proj["field"]
+            break
+    objects = _azure_map_objects(ws, vt, shading)
+    if objects and objects.get("referenceLayer"):
+        warnings.append(_warn(
+            "worksheet", ws["name"],
+            "map choropleth shades a PUBLIC GeoJSON boundary file "
+            f"({_AZURE_MAP_US_STATES_GEOJSON}) -- an offline or locked-down tenant must re-point "
+            "the visual's referenceLayerUrl at its own hosted copy"))
+    return objects
 
 
 def _shape_map_objects(ws):
@@ -11408,13 +11745,12 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 _applied_filter_config_for(
                     ws, _surfaced_filter_keys(ir.get("worksheets") or [], db),
                     model_table, field_map, warnings))
-            shape_objects = (_shape_map_objects(ws)
-                             if ws["visual_type"] == VT_SHAPE_MAP else None)
-            # A measure shapeMap needs its colour-saturation gradient written explicitly or
-            # Desktop renders a flat fill until the Value field is nudged off-and-on. Route it
-            # through the ``dataPoint`` channel (a measure choropleth has no categorical colours).
-            if ws["visual_type"] == VT_SHAPE_MAP and not data_point_objects:
-                data_point_objects = _shape_map_datapoint_objects()
+            shape_objects = None
+            # Every map is an azureMap now (shapeMap rendered blank; Bing map/filledMap are
+            # deprecated and pop a modal in Desktop). Its whole appearance -- basemap style, the
+            # data-bound referenceLayer choropleth, and the bubbleLayer suppression that stops a
+            # bubble being drawn on every centroid -- rides ``extra_objects``.
+            azure_objects = _azure_map_objects_for(ws, state, warnings)
             analytics_objects = _reference_line_analytics_objects(ws)
             lollipop_objects = _lollipop_objects(ws) if ws.get("lollipop") else None
             data_point_objects, lollipop_objects = _with_constant_mark_color(
@@ -11466,7 +11802,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 label_objects=label_objects, legend_objects=legend_objects,
                 shape_objects=shape_objects, card_label_objects=card_label_objects,
                 analytics_objects=analytics_objects,
-                font_objects=_grid_font_objects(ws), extra_objects=lollipop_objects,
+                font_objects=_grid_font_objects(ws),
+                extra_objects=_merge_extra_objects(lollipop_objects, azure_objects),
                 container_fill=ws.get("canvas_fill")))
             rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                     page_display=db["name"] or page_name,
@@ -11661,10 +11998,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         card_label_objects = _card_label_objects(ws, vtype)
         label_objects, dl_fact = _data_labels(ws, ws["visual_type"], warnings)
         flag_fc = _flag_filter_config_for(ir, ws["name"])
-        shape_objects = (_shape_map_objects(ws)
-                         if ws["visual_type"] == VT_SHAPE_MAP else None)
-        if ws["visual_type"] == VT_SHAPE_MAP and not data_point_objects:
-            data_point_objects = _shape_map_datapoint_objects()
+        shape_objects = None
+        azure_objects = _azure_map_objects_for(ws, state, warnings)
         analytics_objects = _reference_line_analytics_objects(ws)
         lollipop_objects = _lollipop_objects(ws) if ws.get("lollipop") else None
         data_point_objects, lollipop_objects = _with_constant_mark_color(
@@ -11713,7 +12048,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             label_objects=label_objects, shape_objects=shape_objects,
             card_label_objects=card_label_objects,
             analytics_objects=analytics_objects,
-            font_objects=_grid_font_objects(ws), extra_objects=lollipop_objects,
+            font_objects=_grid_font_objects(ws),
+                extra_objects=_merge_extra_objects(lollipop_objects, azure_objects),
             container_fill=ws.get("canvas_fill"))
         rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                 page_display=ws["name"],
