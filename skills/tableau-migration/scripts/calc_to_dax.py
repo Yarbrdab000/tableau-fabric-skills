@@ -2154,7 +2154,22 @@ class _Parser:
         if part == "second":
             return (f"(DATE(YEAR({d}), MONTH({d}), DAY({d})) "
                     f"+ TIME(HOUR({d}), MINUTE({d}), SECOND({d})))")
-        # 'quarter'/'week' need extra arithmetic / a start-of-week setting -> fall back.
+        if part == "week":
+            # Tableau truncates to the START OF THE WEEK, and its default start day is SUNDAY
+            # (Analysis > Date Properties > Week start day; Sunday unless the author changed it).
+            # DAX has no DATETRUNC, so subtract the day-of-week offset: WEEKDAY(d, 1) numbers
+            # Sunday=1..Saturday=7, so ``d - (WEEKDAY(d, 1) - 1)`` lands on that week's Sunday.
+            # Date-only by construction -- the subtraction drops any time component, which matches
+            # DATETRUNC returning midnight.
+            #
+            # This was previously refused with "unsupported DATETRUNC part 'week'", which is not a
+            # cosmetic gap: Tableau's date-bin builder emits exactly this for a "Week numbers" bin
+            # (``user:agg-type='Week-Trunc'``), so the whole column stubbed to BLANK(). On an
+            # ATTI/ATTR dashboard that column was one branch of a Daily/Weekly/Monthly field
+            # parameter, and a branch pointing at a blank column is dropped -- so the reader's date
+            # selector silently lost its Weekly option and offered only Daily and Monthly.
+            return f"({d} - (WEEKDAY({d}, 1) - 1))"
+        # 'quarter' needs extra arithmetic -> fall back.
         raise _CalcError(f"unsupported DATETRUNC part {part!r}")
 
     def _lod_core(self):
