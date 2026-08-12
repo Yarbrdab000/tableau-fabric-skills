@@ -12,6 +12,31 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.129.0` -> `2.130.0`): a hidden parameter control is a control, not
+  furniture — and a filter card wears its own sheet's face.** Two long-standing defects on a reader's
+  ATTI/ATTR technician-hierarchy dashboard, both of which deleted authored interaction silently.
+  **The `Date Selection` parameter was dropped entirely.** `hidden-by-user='true'` marks a Tableau
+  object collapsed behind a show/hide toggle, and the skip that honours it exempted `filter` zones
+  with a stated rule: occluding CONTENT is skipped, a usable CONTROL is kept. `paramctrl` had simply
+  never been added to that exemption, with no reason recorded — so the zone was removed 74 lines
+  before reaching the `paramctrl` branch whose own comment promises it is *"never silently dropped"*.
+  The reader lost the Monthly/Weekly/Daily control that drives the matrix column grain, and the
+  rebuild fell back to raw daily dates. A parameter control is small, interactive and cannot paint
+  over anything, so it now sits on the same side of the line as a filter card. The test asserting the
+  old behaviour carried no docstring, unlike its documented `filter` sibling; it now asserts the
+  control survives, with the reasoning written down.
+  **Filter cards resolved their formatting from the wrong worksheet.** Tableau's `quick-filter-title`
+  / `quick-filter` style rules live on a WORKSHEET, and a dashboard card wears the face of the sheet
+  it belongs to — which the zone names. Style was instead keyed by field token alone, and since one
+  field is filtered on many sheets, it landed on whichever sheet parsed first. Measured: the cards
+  belong to `Trend ATTI` (Segoe UI / bold / `#5a23b9` / 9pt) but resolved through `tech filters`,
+  whose only rule is `font-size 6` — so **55 of 57 captions rebuilt as unreadable 6pt grey**. The
+  zone's owning worksheet is now carried through and its style applied: 4 styled captions -> 58, and
+  every header 9pt instead of 6pt.
+  Both are additive: no corpus workbook has a hidden parameter control or declares filter styling, so
+  corpus output is unchanged (29/29 built, 29/29 validating with zero errors, slicer count and styled
+  count identical before and after).
+
 - **tableau-migration (skill `2.128.0` -> `2.129.0`): a Tableau physical join is one flat rowset, so
   it must filter both ways — plus per-island calendars and two hard formatting errors.** A reader's
   Salesforce case-management workbook rebuilt with *every number on its headline chart wrong*, and
