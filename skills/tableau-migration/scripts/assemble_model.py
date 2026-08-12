@@ -3832,7 +3832,36 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     # the calc/measure output below is byte-for-byte identical to the no-parameter path.
     all_calcs = list(calcs or []) + list(dim_calcs or [])
     measure_names = [c.get("name") for c in (calcs or []) if c.get("name")]
-    field_locator = field_locator_from_resolver(resolve, measure_names=measure_names)
+    # Home table for each CALCULATED COLUMN this build will emit, so a swap branch can bind to one.
+    # The swap is built before the calcs are translated (see the note above -- names must be reserved
+    # first), so ``resolve`` knows only the PHYSICAL columns here and a branch naming a calc column
+    # was dropped fail-closed, silently shortening the selector. Measured on an ATTI/ATTR dashboard
+    # whose ``Choose Date`` swap is Daily / Weekly / Monthly: the Daily and Monthly branches are
+    # physical columns and resolved, while ``Complete Date (Week numbers)`` is a calculated column (a
+    # Tableau week date-bin), so the reader's date selector offered only two of its three options.
+    #
+    # The home follows the same rule the column emitter uses -- the single table the calc's own field
+    # references resolve to -- read here from the formula rather than from the not-yet-built
+    # ``column_refs`` map. A calc whose references span several tables (or none) is omitted rather
+    # than guessed: a NAMEOF pointing at the wrong table is worse than a dropped branch.
+    calc_column_homes = {}
+    _field_ref_re = re.compile(r"\[([^\[\]]+)\]")
+    for _dc in (dim_calcs or []):
+        _nm = (_dc.get("name") or "").strip()
+        if not _nm:
+            continue
+        _tables = set()
+        for _ref in _field_ref_re.findall(_dc.get("formula", "") or ""):
+            try:
+                _hit = resolve(_ref) if resolve else None
+            except Exception:
+                _hit = None
+            if _hit:
+                _tables.add(_hit[0])
+        if len(_tables) == 1:
+            calc_column_homes[_nm] = next(iter(_tables))
+    field_locator = field_locator_from_resolver(
+        resolve, measure_names=measure_names, calc_column_homes=calc_column_homes)
     # Island-scoped locator for field swaps -- the field-parameter peer of the ``resolve_for`` the
     # measure and calculated-column paths already use. In a CONSOLIDATED workbook a swap branch's
     # caption (e.g. ``Program Name``) is exposed by several island copies of the same physical table,
