@@ -26,6 +26,12 @@ import xml.etree.ElementTree as ET
 # Types are driven by the ACTUAL Delta schema (authoritative), NOT Tableau metadata.
 # This is the core DirectLake fix: a DirectLake column's dataType must match the physical
 # Parquet/Delta column, or the model fails to bind (the prior dateTime-over-varchar bug).
+# The model compatibility level we emit. Must be at least what the local Power BI Desktop uses: a
+# LOWER level is silently upgraded in memory, a refresh then persists ``.pbi/cache.abf`` at the
+# upgraded level, and the next COLD open fails hard with "Tabular databases do not support
+# CompatibilityLevel downgrade". 1606 is what Desktop 2.157 (Aug 2026) writes.
+MODEL_COMPATIBILITY_LEVEL = 1606
+
 def spark_type_to_tmdl(t):
     """Map a Spark/Delta simpleString type to a TMDL column dataType (or None to skip)."""
     t = (t or "").lower().strip()
@@ -575,7 +581,23 @@ def generate_model_tmdl(table_names, expression_source_name, role_names=None):
     )
 
 def generate_database_tmdl():
-    return "database\n\tcompatibilityLevel: 1604\n"
+    """``database.tmdl`` -- the model's compatibility level.
+
+    Emitted at ``MODEL_COMPATIBILITY_LEVEL`` rather than the older 1604 because a level BELOW what
+    the local Desktop uses is a trap that only springs after a refresh. Desktop silently upgrades an
+    older model in memory, and a refresh then persists ``.pbi/cache.abf`` at the UPGRADED level; on
+    the next cold open the definition asks for the old level against a newer database and Tabular
+    refuses outright:
+
+        There's a problem with the definition content in your Power BI Project.
+        Tabular databases do not support CompatibilityLevel downgrade.
+        Current CompatibilityLevel: '1606'. Requested CompatibilityLevel: '1604'.
+
+    The report does not open at all. It is invisible until someone closes Desktop and reopens from
+    disk -- every check against the still-loaded session passes, which is exactly how it shipped.
+    Matching the level Desktop writes means there is no upgrade, so there is no mismatch to hit.
+    """
+    return "database\n\tcompatibilityLevel: %d\n" % MODEL_COMPATIBILITY_LEVEL
 
 # -- RELATIONSHIP INFERENCE ----------------------------------------------------
 # Tableau encodes cross-table joins as HIDDEN, disambiguated key fields named

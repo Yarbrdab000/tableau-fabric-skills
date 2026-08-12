@@ -6,7 +6,7 @@ well-formed TMDL, no duplicate columns, and every M-typed column both declared a
 physical header is known) present in the landed file. It is pure-Python and hermetic -- no TOM,
 no file access -- so it lives in the ordinary pytest gate.
 """
-from openability_gate import check_model_openability
+from openability_gate import MIN_COMPATIBILITY_LEVEL, check_model_openability
 
 
 # -- fixtures: table parts assembled from explicit tab/newline escapes --------------------
@@ -49,7 +49,9 @@ def _clean_parts():
     return {
         "definition/tables/Orders.tmdl": _orders_part(CLEAN_COLS, ["Order ID", "Region"]),
         "definition/model.tmdl": "model Model\n\tculture: en-US\n",
-        "definition/database.tmdl": "database\n\tcompatibilityLevel: 1550\n",
+        # A CLEAN model declares a level Desktop will not have to upgrade -- see
+        # test_compatibility_level.py for why a lower one refuses to REOPEN after a refresh.
+        "definition/database.tmdl": "database\n\tcompatibilityLevel: %d\n" % MIN_COMPATIBILITY_LEVEL,
     }
 
 

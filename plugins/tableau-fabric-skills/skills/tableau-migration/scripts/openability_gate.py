@@ -96,6 +96,11 @@ _NON_EXPR_LINE_RE = re.compile(
     r"dataType|summarizeBy|sourceColumn|dataCategory|///)\b.*$", re.MULTILINE)
 
 
+# The lowest model compatibility level that survives a refresh + cold open on a current Power BI
+# Desktop. Kept in step with tmdl_generate.MODEL_COMPATIBILITY_LEVEL; a model emitted below this is
+# upgraded in memory and then refuses to reopen once a refresh has written cache.abf.
+MIN_COMPATIBILITY_LEVEL = 1606
+
 def _unquote(token):
     """Normalise a TMDL identifier: strip surrounding ``'..'``/``".."`` and unescape a doubled quote."""
     if token is None:
@@ -463,5 +468,34 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
         checks["typed_columns_in_header"] = typed_in_header
     if rels_present:
         checks["relationship_columns_exist"] = rels_ok
+
+    # COMPATIBILITY LEVEL. A level BELOW what the local Desktop uses does not fail at build time and
+    # does not fail on the first open -- Desktop silently upgrades the model in memory. It fails on
+    # the NEXT COLD OPEN, after a refresh has persisted ``.pbi/cache.abf`` at the upgraded level:
+    #
+    #   Tabular databases do not support CompatibilityLevel downgrade.
+    #   Current CompatibilityLevel: '1606'. Requested CompatibilityLevel: '1604'.
+    #
+    # The report then does not open at all. This is exactly the shape this gate exists for -- a model
+    # that is structurally broken in a way no build-time signal reports -- and it is invisible to any
+    # check made against a still-loaded Desktop session, which is how it shipped. Hermetic: reads the
+    # emitted ``database.tmdl`` only, so it costs microseconds and needs no Desktop.
+    db_part = next((p for p in parts if p.endswith("database.tmdl")), None)
+    if db_part:
+        _m = re.search(r"compatibilityLevel:\s*(\d+)", parts[db_part] or "")
+        _lvl = int(_m.group(1)) if _m else None
+        cl_ok = _lvl is not None and _lvl >= MIN_COMPATIBILITY_LEVEL
+        checks["compatibility_level_current"] = cl_ok
+        if not cl_ok:
+            issues.append({
+                "check": "compatibility_level_current",
+                "part": db_part,
+                "detail": (
+                    "compatibilityLevel %s is below the %d Power BI Desktop writes. Desktop will "
+                    "upgrade the model in memory, a refresh will persist cache.abf at the upgraded "
+                    "level, and the next COLD open will fail with 'Tabular databases do not support "
+                    "CompatibilityLevel downgrade' -- the report will not open."
+                    % (_lvl if _lvl is not None else "(absent)", MIN_COMPATIBILITY_LEVEL)),
+            })
 
     return {"ok": not issues, "checks": checks, "issues": issues}
