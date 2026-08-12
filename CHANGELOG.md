@@ -12,6 +12,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.130.0` -> `2.131.0`): `DATETRUNC('week', ...)` translates, so a
+  Tableau date bin stops stubbing to `BLANK()`.** Tableau's date-bin builder writes exactly
+  `DATE(DATETRUNC('week', [SomeDate]))` when an author picks a *Week numbers* bin (the column is
+  stamped `user:agg-type='Week-Trunc'`), so this is what a two-click UI gesture generates, not an
+  exotic hand-typed function. It was refused with *"unsupported DATETRUNC part 'week'"* and the whole
+  column stubbed to `BLANK()`. The damage did not stop there: on an ATTI/ATTR technician-hierarchy
+  dashboard that column was one branch of a Daily / Weekly / Monthly field parameter, and a branch
+  pointing at a blank column is dropped -- so the reader's date selector silently offered only Daily
+  and Monthly. A refused calc is rarely contained to its own cell.
+  Tableau truncates to the START of the week, default start day SUNDAY, so the offset is subtracted
+  directly: `WEEKDAY(d, 1)` numbers Sunday=1..Saturday=7, hence `d - (WEEKDAY(d, 1) - 1)` lands on
+  that week's Sunday, dropping any time component exactly as `DATETRUNC` does. `quarter` is still
+  refused deliberately -- it needs fiscal-year-aware arithmetic, and a wrong quarter boundary is
+  worse than an honest fallback.
+  Known remaining gap on that dashboard: the Weekly branch still does not reach the field parameter,
+  because `assemble_model` builds the parameter swap BEFORE translating calcs, so a branch pointing
+  at a *calculated* column cannot resolve while the two physical ones can. That is an ordering fix,
+  tracked separately.
+
 - **tableau-migration (skill `2.129.0` -> `2.130.0`): a hidden parameter control is a control, not
   furniture — and a filter card wears its own sheet's face.** Two long-standing defects on a reader's
   ATTI/ATTR technician-hierarchy dashboard, both of which deleted authored interaction silently.
