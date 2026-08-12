@@ -12,6 +12,36 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.131.0` -> `2.132.0`): Tier 3 gains a formatting touch-up beside the
+  adjudication report.** ADDITIVE in the strict sense: the adjudication path is untouched and
+  byte-identical, polish is a separate capability that runs only on its own explicit GO, and a run
+  that declines it produces exactly what it produced before this existed. The gate now offers both,
+  independently — *"Do you want the adjudication report, as well as a formatting touch-up?"* — and
+  the polish offer fires on EVERY rebuilt report rather than only a warned one, because there has
+  never been an output that could not use it.
+  **Why every rebuild needs it.** Tableau lays a filter band out with a layout-flow container: the
+  author never types coordinates, the container distributes them. Power BI has only absolute rects,
+  so the rebuild has to compute what the container computed, and small per-card differences (a
+  longer caption, a fixed-size zone, a scaled dashboard) accumulate into a visibly ragged band even
+  though every rect came from a faithful reading of the source. Measured on an ATTI/ATTR dashboard:
+  row 1 ran `x=8 w=157` then eight cards at `w=131.4` (gutter 15.0 once, 22.0 after), row 2 started
+  at `x=15` — and row 1's bottom (287) sat below row 2's top (271.7), so the two rows **overlapped
+  by 15.3px** and the second row's captions were drawn under the first row's controls.
+  **What it fixes**, worst first because overlap HIDES content: band-on-band and band-on-content
+  collisions, non-uniform card size within a band, misaligned left edges and tops, uneven gutters.
+  The band keeps its own authored extent — only the distribution inside it is regularised — so a
+  band the author placed narrow stays narrow, it just stops being ragged.
+  **Proven-improving or nothing.** The page is scored, changed on a snapshot, scored again, and the
+  new geometry is kept ONLY when the defect count actually falls; a page that would come out worse
+  is restored exactly and reported unchanged. This is not defensive padding — the first version
+  improved one page 6 -> 3 while pushing another 3 -> 6 by shoving a band into content it had
+  previously cleared. Geometry only: nothing but `position` rects is written, so no field, filter,
+  measure or visual type can move and no number can change. Deterministic and idempotent (every
+  decision is a median or derived pitch over the band's own members), so the gain is provable by
+  re-measuring rather than asserted.
+  Across the 29 corpus reports: layout defects **54 -> 0**, with **zero reports made worse**.
+  New `scripts/polish_layout.py` (offline, stdlib-only, `--dry-run` to measure without writing).
+
 - **tableau-migration (skill `2.130.0` -> `2.131.0`): `DATETRUNC('week', ...)` translates, so a
   Tableau date bin stops stubbing to `BLANK()`.** Tableau's date-bin builder writes exactly
   `DATE(DATETRUNC('week', [SomeDate]))` when an author picks a *Week numbers* bin (the column is
