@@ -12,6 +12,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.132.0` -> `2.133.0`): a field-swap branch may point at a CALCULATED
+  column, not just a physical one.** A Power BI field parameter is built by resolving each branch of
+  a Tableau swap calc to its landed model home so a `NAMEOF` target can be emitted, and a branch that
+  does not resolve is dropped fail-closed. But the swap is assembled BEFORE the calcs are translated
+  — the build reserves every name up front so emitted objects cannot collide — so at that moment the
+  resolver knows only the PHYSICAL columns. Any branch naming a calculated column resolved to
+  nothing and was dropped, silently, so the selector simply came out shorter than the author wrote.
+  Measured on an ATTI/ATTR dashboard whose `Choose Date` swap offers Daily / Weekly / Monthly:
+  `completedatedt` and `FiscalMonth` are physical and survived, while
+  `Complete Date (Week numbers)` — a Tableau week date-bin, and a calculated column — vanished, so
+  the reader could pick Daily or Monthly but never Weekly.
+  The build order is NOT changed (it exists for a reason). A calc column's name and home table are
+  both knowable up front even though its DAX is not yet translated, and a `NAMEOF` target needs
+  nothing more, so the planned homes are handed to the locator as a fallback consulted **only** when
+  the physical resolver comes back empty — a physical column and a measure both still win. A calc
+  whose own field references span several tables (or none) is omitted rather than guessed: a
+  `NAMEOF` aimed at the wrong table is worse than a dropped branch.
+  Corpus `NAMEOF` target count is unchanged (6 before, 6 after), so this only recovers branches that
+  were being lost.
+
 - **tableau-migration (skill `2.131.0` -> `2.132.0`): Tier 3 gains a formatting touch-up beside the
   adjudication report.** ADDITIVE in the strict sense: the adjudication path is untouched and
   byte-identical, polish is a separate capability that runs only on its own explicit GO, and a run

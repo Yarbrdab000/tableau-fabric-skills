@@ -1210,7 +1210,7 @@ def extract_field_swap_calcs(xml):
     return out
 
 
-def field_locator_from_resolver(resolve, *, measure_names=None):
+def field_locator_from_resolver(resolve, *, measure_names=None, calc_column_homes=None):
     """Adapt a model field resolver into the ``field_locator`` ``emit_field_parameters`` expects.
 
     ``resolve(caption) -> (table, clean_col, tmdl_type) | None`` is the orchestrator's M field
@@ -1220,13 +1220,28 @@ def field_locator_from_resolver(resolve, *, measure_names=None):
 
     * a field whose name matches a known model **measure** (``measure_names``) resolves to that
       measure (model-global, ``is_measure=True``), preserving an explicit aggregation; otherwise
+    * a field whose name matches a **calculated column** this build will emit
+      (``calc_column_homes``) resolves to that column on its home table; otherwise
     * it binds to its base **column** (``is_measure=False``). Dropping a base column into a visual
       aggregates it by its ``summarizeBy`` (typically ``SUM``), matching Tableau's drop-and-aggregate
       for a bare measure-swap field. ``emit_field_parameter`` already warns about non-additive cases.
 
+    ``calc_column_homes`` exists because the swap is built BEFORE the calcs are translated -- the
+    caller has to reserve names first so nothing collides -- which means ``resolve`` knows only the
+    PHYSICAL columns at this point. A branch pointing at a calculated column therefore found
+    nothing and was dropped fail-closed, silently shortening the selector. Measured on an ATTI/ATTR
+    dashboard whose ``Choose Date`` swap is Daily / Weekly / Monthly: ``completedatedt`` and
+    ``FiscalMonth`` are physical and resolved, while ``Complete Date (Week numbers)`` is a
+    calculated column (a Tableau week date-bin), so the reader's date selector offered only Daily
+    and Monthly. Passing the planned calc-column homes closes that gap without reordering the build:
+    the NAME and home table are known up front even though the DAX is not yet translated, which is
+    all a ``NAMEOF`` target needs.
+
     A field that does not resolve returns ``None`` (the branch is dropped fail-closed).
     """
     by_name = {(m or "").strip().lower(): m for m in (measure_names or [])}
+    by_col = {(c or "").strip().lower(): (t, c)
+              for c, t in (calc_column_homes or {}).items() if c}
 
     def locate(field):
         key = (field or "").strip().lower()
@@ -1235,7 +1250,9 @@ def field_locator_from_resolver(resolve, *, measure_names=None):
             return (None, actual, True)
         hit = resolve(field) if resolve else None
         if not hit:
-            return None
+            # Not a physical column -- it may be a calculated column this build is about to emit.
+            col = by_col.get(key)
+            return (col[0], col[1], False) if col else None
         return (hit[0], hit[1], False)
 
     return locate
