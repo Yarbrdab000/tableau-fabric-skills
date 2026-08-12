@@ -12,6 +12,25 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.133.0` -> `2.134.0`): layout polish must never push a control band
+  into the content below it.** Caught by rendering the reporter's dashboard through the shipped
+  2.132.0 polish: the pass cleared a row-on-row overlap by moving row 2 from bottom `347.7` to
+  `369.0` — and the matrix below starts at `362.2`, so the filter row was drawn 7px over the
+  `ATTI (Days)` header. It traded a cosmetic collision for one that HIDES DATA, which is strictly
+  worse, and the per-page score called it an improvement (6 -> 2) while the render was visibly
+  wrong. Exactly the failure mode of trusting a measurement over a render.
+  A band is now CLAMPED above the content beneath it: it may be restacked to clear the band above
+  only while it still finishes clear of that content. When there is no room it keeps its authored
+  top — never worse than it shipped — but is still regularised horizontally, because the uniform
+  width, aligned tops and even gutters do not depend on vertical position. (The first attempt at
+  this clamp skipped such a band entirely and took the corpus from 54 defects fixed down to 1.)
+  The pass that SHIFTED content downwards to make room is removed outright. Moving the reader's
+  matrices to accommodate a filter row is redesign, not polish, and it changes a layout the author
+  placed deliberately.
+  Across the 29 corpus reports: layout defects **54 -> 10**, still with **zero reports made worse**;
+  the remainder are band-on-band overlaps that cannot be resolved without pushing into content, so
+  they are correctly left alone.
+
 - **tableau-migration (skill `2.132.0` -> `2.133.0`): a field-swap branch may point at a CALCULATED
   column, not just a physical one.** A Power BI field parameter is built by resolving each branch of
   a Tableau swap calc to its landed model home so a `NAMEOF` target can be emitted, and a branch that
