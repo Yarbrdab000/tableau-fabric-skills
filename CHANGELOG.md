@@ -12,6 +12,27 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.134.0` -> `2.135.0`): a model emitted below Desktop's compatibility
+  level will not REOPEN once it has been refreshed.** The emitter hardcoded `compatibilityLevel:
+  1604`. Power BI Desktop silently upgrades an older model in memory, a refresh then persists
+  `.pbi/cache.abf` at the UPGRADED level, and the next COLD open fails outright:
+  *"Tabular databases do not support CompatibilityLevel downgrade. Current CompatibilityLevel:
+  '1606'. Requested CompatibilityLevel: '1604'."* The report does not open at all — not a degraded
+  visual, not a wrong number, nothing.
+  It is invisible to every check made against a still-loaded session, which is how it shipped: a
+  migrated dashboard was built, polished, PBIR-validated with zero errors, refreshed to 5,000 rows
+  and screenshotted successfully, and each of those ran against a Desktop instance that was already
+  open. Only closing Desktop and reopening from disk reveals it.
+  Two defences, both hermetic — neither needs Power BI installed, because the condition is static
+  even though the symptom only appears on a cold open. The emitter now uses
+  `tmdl_generate.MODEL_COMPATIBILITY_LEVEL` (1606, what Desktop 2.157 writes) so there is no upgrade
+  and therefore no mismatch; and `openability_gate` fails any model declaring a level below
+  `MIN_COMPATIBILITY_LEVEL`, so lowering it again cannot slip through. The two constants are pinned
+  to each other by test.
+  Verified by the sequence that produced the bug: build -> open -> refresh -> **close Desktop** ->
+  reopen cold, which now succeeds. Corpus 29/29 built, all 29 emitting 1606, 29/29 PBIR-validate
+  with zero errors.
+
 - **tableau-migration (skill `2.133.0` -> `2.134.0`): layout polish must never push a control band
   into the content below it.** Caught by rendering the reporter's dashboard through the shipped
   2.132.0 polish: the pass cleared a row-on-row overlap by moving row 2 from bottom `347.7` to
