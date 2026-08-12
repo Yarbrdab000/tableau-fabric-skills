@@ -73,11 +73,25 @@ def test_hidden_bitmap_is_skipped():
     assert _ids(p["hidden_zones_skipped"]) == {"zi"}
 
 
-def test_hidden_paramctrl_is_skipped():
+def test_hidden_paramctrl_is_still_surfaced():
+    """A collapsed parameter control is a usable control -- deliberately NOT dropped.
+
+    This asserted the opposite until it was caught by a reader's dashboard. The rule this skip
+    draws is occluding CONTENT (skip) versus a usable CONTROL (keep), and the ``filter`` exemption
+    right below spells that out; ``paramctrl`` had simply never been added to it, with no stated
+    reason. A parameter control is small, interactive and cannot paint over anything, so it belongs
+    on the same side of the line as a filter card.
+
+    Not academic: on an ATTI/ATTR technician-hierarchy dashboard the hidden zone was ``Date
+    Selection`` (Monthly / Weekly / Daily), the control driving the matrix column grain. Dropping it
+    left the reader no way to change grain and the matrix fell back to raw daily dates. The
+    ``paramctrl`` branch that captures these zones even promises they are "never silently dropped" --
+    it just sat 74 lines after the skip that removed them.
+    """
     p = _parsed("<zone id='zp' type-v2='paramctrl' param='[Parameters].[Parameter 1]'"
                 " hidden-by-user='true' x='0' y='0' w='16000' h='9333' />")
-    assert p["param_controls"] == []
-    assert _ids(p["hidden_zones_skipped"]) == {"zp"}
+    assert [c["param_id"] for c in p["param_controls"]] == ["Parameter 1"]
+    assert _ids(p["hidden_zones_skipped"]) == set()
 
 
 def test_hidden_worksheet_zone_is_skipped():

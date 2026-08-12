@@ -5415,11 +5415,23 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
             ext_w = max(ext_w, x + w)
             ext_h = max(ext_h, y + h)
         ztype = zone.get("type-v2") or zone.get("type")
-        # Skip author-hidden CONTENT (see ``hidden_zones`` above). Filter cards are exempt and fall
-        # through to their own branch, which records ``hidden`` for diagnostics and still surfaces
-        # the control. Counted so the fidelity report states what was withheld rather than silently
-        # dropping it.
-        if ztype != "filter" and id(zone) in hidden_zones:
+        # Skip author-hidden CONTENT (see ``hidden_zones`` above). Filter cards AND parameter
+        # controls are exempt and fall through to their own branches, which record ``hidden`` for
+        # diagnostics and still surface the control. Counted so the fidelity report states what was
+        # withheld rather than silently dropping it.
+        #
+        # ``paramctrl`` belongs in this exemption for exactly the reason ``filter`` does, and leaving
+        # it out silently deleted the single most important control on a dashboard. Measured on an
+        # ATTI/ATTR technician-hierarchy workbook whose ``Date Selection`` parameter (Monthly /
+        # Weekly / Daily) is what drives the matrix column grain: the zone carries
+        # ``hidden-by-user='true'`` because it lives in a collapsible band, so it was skipped as
+        # occluding content 74 lines before reaching the ``paramctrl`` branch below -- the branch
+        # whose own comment promises it is "never silently dropped". The reader lost the control and
+        # the matrix fell back to raw daily dates instead of the authored monthly buckets.
+        #
+        # A parameter control cannot occlude: like a filter card it is a small, usable CONTROL, which
+        # is the distinction this skip is drawing (occluding CONTENT -> skip, usable CONTROL -> keep).
+        if ztype not in ("filter", "paramctrl") and id(zone) in hidden_zones:
             hidden_skipped.append({
                 "zone_id": zone.get("id"),
                 "type": ztype or "worksheet",
@@ -5485,6 +5497,12 @@ def _parse_dashboard(db, worksheet_names, warnings, layout=LAYOUT_DEFAULT):
                         "token": ftok, "x": x, "y": y, "w": w, "h": h,
                         "mode": zone.get("mode"),
                         "zone_id": zone.get("id"),
+                        # The worksheet this card BELONGS to. Tableau's ``quick-filter-title`` /
+                        # ``quick-filter`` style rules live on a worksheet, and a dashboard filter
+                        # card takes its face from its OWNING sheet -- not from whichever sheet
+                        # happens to filter on the same field first. Without this the slicer style
+                        # was resolved by field token alone and landed on an arbitrary sheet.
+                        "owner": zone.get("name"),
                         "pad": _parse_zone_padding(_first(zone, "zone-style")),
                         "hidden": zone.get("hidden-by-user") == "true",
                     })
@@ -12489,6 +12507,19 @@ def _emit_dashboard_slicers(ws_list, page_name, model_table, field_map, filter_z
     band) yields a single slicer."""
     visuals = []
     by_token = _filter_fields_by_token(ws_list)
+    # Tableau's ``quick-filter-title`` / ``quick-filter`` style rules live on a WORKSHEET, and a
+    # dashboard filter card wears the face of the sheet it BELONGS to -- which the zone names. The
+    # token map cannot know that: one field is filtered on many sheets, so keying style by token
+    # alone lands on whichever sheet parsed first. Measured on an ATTI/ATTR dashboard: the cards
+    # belong to ``Trend ATTI`` (Segoe UI / bold / ``#5a23b9`` / 9pt, grey ``#f5f5f5`` plate) but
+    # resolved through ``tech filters``, whose only rule is ``font-size 6`` -- so 55 of 57 captions
+    # rebuilt as unreadable 6pt grey with no plate.
+    ws_style = {}
+    for _ws in ws_list:
+        _nm = _ws.get("name")
+        if _nm:
+            ws_style[_nm] = (_ws.get("filter_hdr_style"), _ws.get("filter_itm_style"),
+                             _ws.get("filter_plate_fill"))
     seen = set()
     entries = []
     for i, fz in enumerate(filter_zones):
@@ -12506,6 +12537,17 @@ def _emit_dashboard_slicers(ws_list, page_name, model_table, field_map, filter_z
         if key in seen:
             continue
         seen.add(key)
+        _own = ws_style.get(fz.get("owner"))
+        if _own and any(_own):
+            # Copy so two cards on different sheets can wear different faces for the same field.
+            _hdr, _itm, _plate = _own
+            f = dict(f)
+            if _hdr:
+                f["_slicer_hdr"] = _hdr
+            if _itm:
+                f["_slicer_itm"] = _itm
+            if _plate:
+                f["_slicer_plate"] = _plate
         x, y, w, h = _scale_zone(fz, ref_w, ref_h)
         entries.append({"x": x, "y": y, "w": w, "h": h,
                         "mode": _tableau_filter_mode_to_pbi(fz.get("mode")),
