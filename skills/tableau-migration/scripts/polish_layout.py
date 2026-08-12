@@ -212,6 +212,24 @@ def polish_page(entries, *, apply=True):
         top = _median([r[1] for _p, _j, r in b])
         if cursor is not None and top < cursor:
             top = cursor               # push the band clear of the one above it
+        # ...but NEVER into the content below it. Clearing a band-on-band overlap by shoving the
+        # band down onto a matrix trades a cosmetic collision for one that HIDES DATA, which is
+        # strictly worse. Measured: row 2 moved from bottom 347.7 to 369.0 while the matrix below
+        # starts at 362, so the rebuilt filter row was drawn 7px over the ATTI (Days) header --
+        # a page my own score called improved (6 -> 2) while the render was visibly worse. If the
+        # band cannot fit above that content, it keeps its original position and this page simply
+        # does not get polished.
+        ceiling = min((oy for (ox, oy, ow, oh) in others
+                       if ox < max(r[0] + r[2] for _p, _j, r in b)
+                       and (ox + ow) > min(r[0] for _p, _j, r in b)
+                       and oy >= _median([r[1] for _p, _j, r in b])), default=None)
+        if ceiling is not None and top + h > ceiling - MIN_BAND_GUTTER:
+            # No room to restack: keep the AUTHORED top -- never worse than it shipped -- but still
+            # regularise the band horizontally. Skipping the band entirely would throw away the
+            # uniform width, aligned tops and even gutters too, which is why the first clamp took
+            # the corpus from 54 defects fixed down to 1. Vertical position is the only thing the
+            # content below constrains.
+            top = _median([r[1] for _p, _j, r in b])
         for i, (path, vj, _r) in enumerate(b):
             nx, ny = left + i * (w + gutter), top
             px, py, pw, ph = _pos(vj)
@@ -223,17 +241,10 @@ def polish_page(entries, *, apply=True):
                 changed.append(path)
         cursor = top + h + MIN_BAND_GUTTER
 
-    # Never leave a band sitting on the content below it: content is the thing readers came for.
-    for b in bands:
-        bot = max(_pos(j)[1] + _pos(j)[3] for _p, j in [(p, j) for p, j, _r in b])
-        for (ox, oy, ow, oh) in others:
-            lo = min(_pos(j)[0] for _p, j in [(p, j) for p, j, _r in b])
-            hi = max(_pos(j)[0] + _pos(j)[2] for _p, j in [(p, j) for p, j, _r in b])
-            if oy < bot - 0.5 and ox < hi and (ox + ow) > lo:
-                shift = bot - oy + MIN_BAND_GUTTER
-                oj = next((j for p, j in entries if _pos(j)[:2] == (ox, oy)), None)
-                if oj is not None:
-                    oj.setdefault("position", {})["y"] = round(oy + shift, 2)
+    # NOTE: an earlier version also SHIFTED the content below a band downwards to clear a collision.
+    # That is not polish, it is redesign -- it moves the reader's charts to make room for a filter
+    # row, changing a layout the author placed deliberately. The band is clamped above the content
+    # instead (see ``ceiling`` in the loop), and a band with no room is left exactly as authored.
 
     after = score_page(entries)
     if after["total"] >= before["total"]:
