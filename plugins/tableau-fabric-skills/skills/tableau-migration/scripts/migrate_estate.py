@@ -4941,7 +4941,36 @@ def _pending_gates(summary):
             "offer": (f"OFFER the LLM-assisted Tier-3 dashboard audit for {warned} warned "
                       "visual(s) before declaring the migration done -- present them and run only "
                       "on an explicit GO. If declined, the deterministic rebuild ships as-is (every "
-                      "faithfully-bound visual intact)."),
+                      "faithfully-bound visual intact). OFFER THE FORMATTING TOUCH-UP IN THE SAME "
+                      "BREATH -- the two are independent, so the user may take either, both or "
+                      "neither: \"Do you want the adjudication report, as well as a formatting "
+                      "touch-up?\""),
+        })
+    # Layout polish is offered on EVERY rebuilt report, not only a warned one. Tableau lays a filter
+    # band out with a layout-flow container and Power BI has only absolute rects, so the rebuild
+    # recomputes what the container computed -- and small per-card differences accumulate into a
+    # visibly ragged band even when every rect came from a faithful reading of the source. There has
+    # never been an output that could not use polish, so the gate does not wait for a warning.
+    #
+    # ADDITIVE beside the audit, never a replacement: it runs only on its own explicit GO, rewrites
+    # only ``position`` rects (so no field, filter, measure or visual type can move and no number can
+    # change), and a run that declines it is byte-identical to one from before polish existed. It is
+    # also proven-improving per page -- a page that would come out worse is restored untouched.
+    if (summary.get("workbooks_pbip_built", 0) or 0) > 0:
+        gates.append({
+            "gate": "layout_polish",
+            "count": summary.get("workbooks_pbip_built", 0) or 0,
+            "trigger": "summary.workbooks_pbip_built",
+            "skill_step": 5,
+            "runbook": "resources/dashboard-audit.md",
+            "offer": ("OFFER the Tier-3 FORMATTING TOUCH-UP alongside the adjudication report -- "
+                      "run only on an explicit GO. It normalises each page's control bands "
+                      "(uniform card size, aligned rows, even gutters, no band drawn over the "
+                      "content below) against the source layout, and keeps a page's new geometry "
+                      "ONLY when the measured defect count falls. Geometry only: no binding, no "
+                      "number, nothing but position rects. Run: "
+                      "py -3.11 \"$SKILL\\scripts\\polish_layout.py\" \"<...>.Report\" "
+                      "(add --dry-run to measure first)."),
         })
     return gates
 
@@ -4951,7 +4980,8 @@ def _pending_gates_banner(gates):
     if not gates:
         return []
     label = {"second_compiler": "Second compiler (stubbed calcs)",
-             "dashboard_audit": "Tier-3 dashboard audit (warned visuals)"}
+             "dashboard_audit": "Tier-3 dashboard audit (warned visuals)",
+             "layout_polish": "Tier-3 formatting touch-up (layout polish)"}
     out = [
         "## \u23f3 PENDING REVIEW GATES -- the migration is NOT done until these are offered",
         "",
