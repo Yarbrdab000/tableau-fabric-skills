@@ -2511,7 +2511,14 @@ def combine_descriptors(descriptors, *, captions=None):
                 lf = dict(lf, table=rename[lf["table"]])
             combined["logical_fields"].append(lf)
         combined["relationship_warnings"].extend(desc.get("relationship_warnings", []) or [])
-        combined["unsupported_reasons"].extend(desc.get("unsupported_reasons", []) or [])
+        # Attribute each island's reason to the datasource that OWNS it. The consolidated model is
+        # reported under the RANKED PRIMARY datasource's caption, so an unattributed reason raised by
+        # a SECONDARY island is read as the primary's. Reported with #124: the failure message named
+        # 'Big Data Source' for two column-less relations that 'Small Data Source' owned, sending the
+        # reader to inspect the one datasource in that workbook with nothing wrong with it.
+        combined["unsupported_reasons"].extend(
+            ("%s: %s" % (caption, r) if caption and not str(r).startswith("%s: " % caption) else r)
+            for r in (desc.get("unsupported_reasons", []) or []))
         for cid, facts in (desc.get("connections") or {}).items():
             combined["connections"].setdefault(cid, facts)
     # This descriptor spans every datasource's upstreams, so it IS a multi-named-connection source:

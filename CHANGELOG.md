@@ -14,6 +14,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.138.0` → `2.139.0`): a storage-decision failure named the one
+  datasource with nothing wrong with it.** Reported alongside #124. A workbook's embedded
+  datasources are consolidated into ONE model, and the fallback message named the **ranked primary**
+  — not the island whose relations actually failed:
+
+  ```
+  embedded datasource 'Big Data Source' needs a storage decision
+    (Direct-upstream rebuild not safe (relation 'Orders.csv' has no resolvable columns;
+     relation 'Orders_Archive.csv' has no resolvable columns))
+  ```
+
+  Both column-less relations belonged to `Small Data Source`. A reader following the only actionable
+  fact in that sentence would open `Big Data Source`, find three cleanly-typed tables, and be no
+  closer to the cause. Two independent things were wrong and both are fixed: the **subject** named
+  one island for a model spanning several, and the **reasons** lost their island as
+  `combine_descriptors` merged them. The same failure now reads:
+
+  ```
+  the consolidated model for 2 embedded datasources ('Big Data Source', 'Small Data Source')
+    needs a storage decision
+    (Direct-upstream rebuild not safe (Small Data Source: relation 'Orders.csv' has no resolvable
+     columns; Small Data Source: relation 'Orders_Archive.csv' has no resolvable columns))
+  ```
+
+  Verified end to end by reproducing the original failure (the union's own metadata removed so
+  promotion declines). Attribution happens only on the consolidation path — `combine_descriptors`
+  returns a lone descriptor unchanged — so a single-datasource workbook's message is byte-identical
+  to before, and re-attribution is idempotent.
+
 - **`tableau-migration` (skill `2.137.0` → `2.138.0`): a UNION is one table, so its container —
   not its members — is the relation.** Reported in #124. Tableau writes the two container kinds
   with opposite metadata, and that difference is the whole defect:

@@ -3057,6 +3057,29 @@ def _scatter_keys_from_ir(result):
         return []
 
 
+def _storage_decision_subject(label, descriptor=None, combine_datasources=None):
+    """Name the thing a storage decision is owed FOR, in a message a reader can act on.
+
+    A workbook's embedded datasources are consolidated into one model, and ``label`` is only the
+    RANKED PRIMARY's caption -- so naming it as the subject of a failure a SECONDARY island owns
+    sends the reader to the wrong datasource. Reported with #124, where the message read
+
+        embedded datasource 'Big Data Source' needs a storage decision
+          (... relation 'Orders.csv' has no resolvable columns ...)
+
+    while both column-less relations belonged to 'Small Data Source' -- 'Big Data Source' was the one
+    datasource in that workbook with nothing wrong with it. When the model spans several islands the
+    subject is the consolidation, and every island is named; the per-island attribution of each
+    individual reason rides inside the rationale (see ``combine_descriptors``).
+    """
+    if descriptor is None or not combine_datasources or len(combine_datasources) < 2:
+        return "embedded datasource %r" % (label,)
+    caps = [(d.get("caption") or d.get("name") or d.get("label")) for d in combine_datasources]
+    caps = [c for c in caps if c]
+    return "the consolidated model for %d embedded datasources (%s)" % (
+        len(combine_datasources), ", ".join(repr(c) for c in caps))
+
+
 def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, model_safe, dest,
                            folder_rel, report_base, viz_name, viz=None, ds_catalog=None,
                            approved_calc_dax=None, wb_id=None, pbip_dir=None,
@@ -3188,8 +3211,10 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                 res_report = res.get("report") or {}
         if res_report.get("fallback"):
             rationale = (res_report.get("storage_decision") or {}).get("rationale") or "undoable shape"
-            warns.append(_PBIP_WARN + f"embedded datasource {label!r} needs a storage decision "
-                         f"({rationale}) -- workbook .pbip skipped (model lands separately)")
+            warns.append(_PBIP_WARN
+                         + f"{_storage_decision_subject(label, descriptor, combine_datasources)} "
+                         f"needs a storage decision ({rationale}) "
+                         f"-- workbook .pbip skipped (model lands separately)")
             return
 
     report_parts = _rebind_report_byPath(result["parts"], model_safe)
