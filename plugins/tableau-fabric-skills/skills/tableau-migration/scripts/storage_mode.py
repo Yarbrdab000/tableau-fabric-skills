@@ -199,7 +199,12 @@ _LIVE_CLASSES = set(DIRECT_CONNECTORS) | set(PARTIAL_LIVE_CONNECTORS)
 # several relations, that was classed structurally unsupported, and the ENTIRE workbook was skipped
 # with "needs a storage decision". Measured: a wildcard-union workbook built 0/1 while its
 # manual-union twin built 1/1 from identical data.
-CONTAINER_RELATION_TYPES = ("join", "union", "batch-union")
+# A UNION is the subset of those containers that produces ONE table with the SAME columns and MORE
+# rows (``Table.Combine``). Tableau files a union's column metadata under the CONTAINER's own name
+# (``[Orders.csv+]``), never under its members, so a union's members are row sources, not tables --
+# unlike a JOIN, whose members each keep their own ``metadata-record`` parent and are real tables.
+UNION_RELATION_TYPES = ("union", "batch-union")
+CONTAINER_RELATION_TYPES = ("join",) + UNION_RELATION_TYPES
 
 def connector_spec(cls):
     """Return the ``(function, connect_style, nav_style)`` spec for a fully-supported direct

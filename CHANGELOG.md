@@ -12,6 +12,70 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.137.0` → `2.138.0`): a UNION is one table, so its container —
+  not its members — is the relation.** Reported in #124. Tableau writes the two container kinds
+  with opposite metadata, and that difference is the whole defect:
+
+  ```
+  union   <relation type='union' name='Orders.csv+'>            <- ALL 11 columns filed under
+              <relation type='table' name='Orders.csv'/>           [Orders.csv+]; the members get
+              <relation type='table' name='Orders_Archive.csv'/>   NO metadata parent at all
+
+  join    <relation type='join'>                                <- each member keeps its OWN
+              <relation type='table' name='Customers.csv'/>        [Customers.csv] parent and
+              <relation type='table' name='Customers_Details.csv'/>   its own columns
+  ```
+
+  That is the semantics, not a quirk: a union produces the SAME columns with MORE rows
+  (`Table.Combine`), so there is one column list and it belongs to the container. A join produces a
+  WIDER row from real tables — which is exactly why we surface join leaves individually and rebuild
+  the join keys as model relationships.
+
+  We surfaced BOTH kinds of leaves individually, so every union member came out column-less. That is
+  survivable while the whole datasource is column-less — the extract collapse or the multi-parent
+  expansion then re-types everything from the `.hyper` — and fatal the moment the datasource is
+  PARTIALLY typed, because both of those rescues open with `any(r["columns"]) -> return None`. A
+  union sitting beside a join is precisely that shape, and the reporter's control ("the join works,
+  the union does not") was exactly right:
+
+  ```
+  embedded datasource needs a storage decision
+    (Direct-upstream rebuild not safe (relation 'Orders.csv' has no resolvable columns;
+     relation 'Orders_Archive.csv' has no resolvable columns))
+    -- workbook .pbip skipped
+  ```
+
+  No model, `definition_of_done: failed` — while the union's own 11 typed columns sat under
+  `[Orders.csv+]` the entire time. **The diagnosis moved during the fix:** the abort is at
+  `connection_to_m.py:1210` (`any(r.get("columns"))`), not the one-to-one extract match at `:1231`,
+  because `Customers.csv` types and short-circuits the expansion before matching ever runs. So no
+  extract mapping was needed at all — the columns were already in the XML, filed under a name we
+  were discarding.
+
+  Measured on the reported workbook (`Section 09 - Filtering Data.twbx`): **0/1 → 1/1**,
+  `failed` → `warn`, 9 tables / 51 columns, 5/5 workbook calcs (100%), PBIR validating with zero
+  errors and zero unresolved report entities. The two union workbooks that already built are
+  unchanged in substance — 21 columns and byte-identical data (2,316 KB manual / 2,425 KB wildcard)
+  — and now name the table `Union`, which is what Tableau's own data pane calls it, instead of
+  leaking the extract's internal `Extract` name or standing the datasource caption in for a table.
+  **Corpus: 29/29 built, 29/29 PBIR-validate, and zero drift** — every summary metric identical to
+  the baseline and 0 of 29 workbooks differing in table or column structure.
+
+  Promotion is fail-safe: the container must resolve columns under its own name AND no member may
+  resolve any, so a union whose members are real typed tables is left alone, and a wholly-untyped
+  union still belongs to the extract collapse/expansion untouched. Members are dropped by element
+  IDENTITY, never by name, so a typed relation that merely shares a member's display name survives.
+
+- **`tableau-migration`: `CONTAINER_RELATION_TYPES` was imported in the flat branch only.** A
+  latent break shipped with 2.137.0: the constant was added to `connection_to_m`'s
+  `except ImportError` branch but not its `from .storage_mode import ...` twin, so a package-style
+  import succeeded and then raised `NameError` at the first container check. Tests run with
+  `scripts/` on `sys.path` and always took the working branch, so nothing caught it. Both branches
+  now bind the same names, and a test parses the import block with `ast` and fails if they ever
+  diverge again.
+
 - **tableau-migration (skill `2.136.0` -> `2.137.0`): a WILDCARD union (`batch-union`) is a container,
   and it carries no member relations at all** (reported in #124). Tableau writes a union two ways and
   only one of them looks like a container: a manual union is `type='union'` with its members listed as

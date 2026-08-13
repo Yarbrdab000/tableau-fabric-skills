@@ -27,17 +27,18 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .tmdl_generate import (clean_col, generate_column_tmdl, q, tableau_default_format_to_pbi,
                                 tableau_measure_format_to_pbi, tableau_geo_role_to_data_category)
     from .storage_mode import (
-        ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
+        ANALYSIS_SERVICES_CLASSES, CONTAINER_RELATION_TYPES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
         NATIVE_ODBC_DRIVER, NATIVE_ODBC_ENGINES,
-        NATIVE_QUERY_CATALOG_DRILL, ODBC_CLASSES, PARTIAL_LIVE_CONNECTORS, connector_spec)
+        NATIVE_QUERY_CATALOG_DRILL, ODBC_CLASSES, PARTIAL_LIVE_CONNECTORS,
+        UNION_RELATION_TYPES, connector_spec)
 except ImportError:
     from tmdl_generate import (clean_col, generate_column_tmdl, q, tableau_default_format_to_pbi,
                                tableau_measure_format_to_pbi, tableau_geo_role_to_data_category)
     from storage_mode import (
-    CONTAINER_RELATION_TYPES,
-        ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
+        ANALYSIS_SERVICES_CLASSES, CONTAINER_RELATION_TYPES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
         NATIVE_ODBC_DRIVER, NATIVE_ODBC_ENGINES,
-        NATIVE_QUERY_CATALOG_DRILL, ODBC_CLASSES, PARTIAL_LIVE_CONNECTORS, connector_spec)
+        NATIVE_QUERY_CATALOG_DRILL, ODBC_CLASSES, PARTIAL_LIVE_CONNECTORS,
+        UNION_RELATION_TYPES, connector_spec)
 
 
 # -- disambiguated caption resolution -----------------------------------------
@@ -1370,6 +1371,81 @@ def _bind_relations_to_extracts(relations, bindings):
     return stamped
 
 
+def _union_containers_to_promote(datasource, cols_by_parent):
+    """Which ``union``/``batch-union`` containers are themselves the table, and which members to drop.
+
+    A union is not a combination of tables the way a join is -- it is ONE table with the same columns
+    and more rows (``Table.Combine``). Tableau writes that fact into the metadata: every column of a
+    union is filed under the CONTAINER's parent name (``[Orders.csv+]``), and its members get no
+    ``metadata-record`` parent at all. A join is the opposite: each member keeps its own parent and
+    its own columns, which is why surfacing join leaves individually is right and surfacing union
+    leaves individually is wrong.
+
+    Surfacing the members anyway leaves each of them column-less. That is survivable when the WHOLE
+    datasource is column-less -- the extract collapse/expansion then re-types everything from the
+    ``.hyper`` -- and fatal when the datasource is PARTIALLY typed, because both of those rescues
+    require every table relation to be untyped (``any(r["columns"])`` aborts them). Issue #124 is
+    exactly that shape: a union beside a join, where ``Customers.csv`` typed and ``Orders.csv`` /
+    ``Orders_Archive.csv`` could not, so no rescue could run and the workbook was skipped with
+    *"relation 'Orders.csv' has no resolvable columns"* -- while the union's own 11 typed columns sat
+    under ``[Orders.csv+]`` the entire time.
+
+    Returns ``({id(container_element): columns}, {id(member_element), ...})``. A container is promoted
+    only when it resolves columns under its OWN name and NO member resolves any -- if a member types
+    on its own, the leaf-surfacing path already has real tables to work with and is left alone.
+    Membership is tracked by element IDENTITY, so a table that is a union input here and an
+    independent relation elsewhere in the same datasource keeps its independent copy.
+    """
+    promote, member_ids = {}, set()
+    for rel in _findall_local(datasource, "relation"):
+        if (rel.get("type") or "").lower() not in UNION_RELATION_TYPES:
+            continue
+        name = rel.get("name")
+        cols = (cols_by_parent or {}).get(_strip_brackets(name)) if name else None
+        if not cols:
+            continue  # nothing filed under the container -- leave today's behaviour alone
+        members = _children_local(rel, "relation")
+        if any(_classify_relation(m, cols_by_parent).get("columns") for m in members):
+            continue  # a member is a real typed table; do not discard it
+        promote[id(rel)] = cols
+        member_ids.update(id(m) for m in members)
+    return promote, member_ids
+
+
+def _union_container_relation(rel, cols, nc_map=None):
+    """Descriptor for a ``union``/``batch-union`` container surfaced as the one table it is.
+
+    The container has no physical ``table=`` identity -- its members do -- so the union's own name
+    becomes the item, which is also the name Tableau filed its columns under and the name the
+    workbook's field references resolve through. ``union_members`` is recorded for provenance (a
+    wildcard union has none: its members are a filename pattern resolved at connect time).
+    """
+    name = rel.get("name")
+    item = _strip_brackets(name) if name else None
+    members = _children_local(rel, "relation")
+    entry = {
+        "kind": "table",
+        "name": name,
+        "raw_table": "[%s]" % item if item else None,
+        "catalog": None,
+        "schema": None,
+        "item": item,
+        "columns": cols,
+        "union_of": [m.get("name") for m in members if m.get("name")],
+    }
+    nc_map = nc_map or {}
+    # The container usually carries no ``connection`` of its own; a union's members must all share
+    # one connection, so a single agreed member connection is the container's connection.
+    refs = [rel.get("connection")] if rel.get("connection") else [
+        m.get("connection") for m in members]
+    refs = [r for r in refs if r]
+    if refs and len(set(refs)) == 1:
+        conn = nc_map.get(refs[0])
+        if conn:
+            entry["connection"] = conn
+    return entry
+
+
 def _extract_relations(datasource, cols_by_parent, nc_map=None):
     """Walk ``<relation>`` elements into a flat, de-duplicated descriptor list.
 
@@ -1379,11 +1455,14 @@ def _extract_relations(datasource, cols_by_parent, nc_map=None):
 
     * ``collection`` containers are dropped; their child tables are emitted as INDEPENDENT
       model tables (multi-sheet Excel / multi-table sources become multiple model tables).
-    * ``join``/``union`` trees are NOT collapsed: the combination container is dropped and each
-      leaf table is surfaced as its OWN independent model table (its join keys become model
-      relationships via ``_extract_join_relationships``), so the source rebuilds directly as a
-      multi-table model -- exactly like a multi-table object-graph source -- instead of an opaque
-      combination the storage policy could only skip.
+    * ``join`` trees are NOT collapsed: the combination container is dropped and each leaf table is
+      surfaced as its OWN independent model table (its join keys become model relationships via
+      ``_extract_join_relationships``), so the source rebuilds directly as a multi-table model --
+      exactly like a multi-table object-graph source -- instead of an opaque combination the storage
+      policy could only skip.
+    * a ``union``/``batch-union`` is the opposite case and IS collapsed, to the ONE table it is:
+      Tableau files a union's columns under the CONTAINER's own name, so the container is surfaced
+      and its members are dropped (see ``_union_containers_to_promote``).
     * duplicate physical/logical copies of the same table (same ``item``) are de-duplicated,
       preferring the copy that actually resolves column metadata, while preserving a resolved
       per-relation ``connection`` from whichever copy carried it.
@@ -1395,18 +1474,24 @@ def _extract_relations(datasource, cols_by_parent, nc_map=None):
     nc_map = nc_map or {}
 
     # First pass: classify every candidate relation so the extract-twin decision can be made with
-    # whole-datasource knowledge before any table is emitted. A join/union COMBINATION node is not
-    # itself a table -- drop the container and let its LEAF tables surface individually (they appear
-    # in the same ``<relation>`` walk), so a join/union tree rebuilds as separate model tables
-    # related by their join keys (recovered by ``_extract_join_relationships``), exactly like a
-    # multi-table object-graph source, instead of collapsing to one opaque combination the storage
-    # policy could only skip.
+    # whole-datasource knowledge before any table is emitted. A JOIN container is not itself a table
+    # -- drop it and let its LEAF tables surface individually (they appear in the same ``<relation>``
+    # walk), so a join tree rebuilds as separate model tables related by their join keys (recovered by
+    # ``_extract_join_relationships``), exactly like a multi-table object-graph source, instead of
+    # collapsing to one opaque combination the storage policy could only skip. A UNION goes the other
+    # way: it IS one table, so the container is promoted and its members are skipped.
+    promote, member_ids = _union_containers_to_promote(datasource, cols_by_parent)
     candidates = []
     for rel in _findall_local(datasource, "relation"):
+        if id(rel) in member_ids:
+            continue  # a union input, not a table: the promoted container above it IS the table
+        if id(rel) in promote:
+            candidates.append(_union_container_relation(rel, promote[id(rel)], nc_map))
+            continue
         if (rel.get("type") or "").lower() == "collection":
             continue  # benign container; its child tables are emitted independently
         if _is_combination_relation(rel):
-            continue  # a join/union container; its leaf tables are surfaced individually
+            continue  # a join container; its leaf tables are surfaced individually
         candidates.append(_classify_relation(rel, cols_by_parent, nc_map))
 
     # Only drop ``[Extract]`` cache twins when at least one live (non-extract) table remains to
