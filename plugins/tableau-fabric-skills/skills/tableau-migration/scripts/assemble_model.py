@@ -2464,6 +2464,27 @@ def _select_primary_date(date_cols):
     return hints[0] if len(hints) == 1 else None
 
 
+# Per-island Date dimensions: OFF. The code below is kept in full because the bug it fixes is real --
+# a single shared calendar wired to facts in every datasource lets a date slicer filter islands
+# Tableau keeps apart -- but it is switched off because it cost more than it bought.
+#
+# MEASURED: splitting the calendar four ways cost THREE calculations on the workbook it was built
+# for. Salesforce NPSP went 118/157 -> 115/157, with `Count of Waitlisted Engagements`, the same
+# `... in Date Range`, and `Sort by Intake` newly refused on "must reference exactly one table".
+# Calc coverage is the headline number of a migration; a silent date-slicer bleed is narrower than
+# three dead measures, so the trade is not worth taking until the resolution issue is fixed.
+#
+# DEAD END ALREADY RULED OUT (do not re-run it): the obvious theory was that the shared calendar
+# BRIDGED the islands in the relationship graph, letting cross-island calcs resolve through it. That
+# was tested by excluding the generated Date relationships from calc path-finding while leaving them
+# in the emitted model -- coverage stayed at 115, so that is NOT the mechanism. The remaining suspect
+# is field-resolution tie-breaking: with four calendars reserved instead of one, `Record ID` resolves
+# to NO table while `pmdm__Stage__c` binds to the Intake island's copy of ProgramEngagement, and a
+# calc spanning two tables is refused. The proper fix is ISLAND-SCOPED FIELD RESOLUTION -- a calc
+# binds within its own datasource no matter how many calendars exist -- which keeps both wins.
+PER_ISLAND_DATE_ENABLED = False
+
+
 def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date=True,
                            mode="import", date_range=None):
     """One Date dimension PER DATASOURCE ISLAND -> ``([(name, part)], rels, report)``.
@@ -2492,7 +2513,7 @@ def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date
         ds = (rel.get("source_datasource") or "").strip()
         if ds and ds not in islands:
             islands.append(ds)
-    if len(islands) < 2:
+    if not PER_ISLAND_DATE_ENABLED or len(islands) < 2:
         name, part, rels, report = _build_date_dimension(
             tables, emitted_names, relationships, mark_as_date=mark_as_date, mode=mode,
             date_range=date_range)
