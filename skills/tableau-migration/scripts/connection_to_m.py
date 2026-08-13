@@ -34,6 +34,7 @@ except ImportError:
     from tmdl_generate import (clean_col, generate_column_tmdl, q, tableau_default_format_to_pbi,
                                tableau_measure_format_to_pbi, tableau_geo_role_to_data_category)
     from storage_mode import (
+    CONTAINER_RELATION_TYPES,
         ANALYSIS_SERVICES_CLASSES, DIRECT_CONNECTORS, FLAT_FILE_CLASSES,
         NATIVE_ODBC_DRIVER, NATIVE_ODBC_ENGINES,
         NATIVE_QUERY_CATALOG_DRILL, ODBC_CLASSES, PARTIAL_LIVE_CONNECTORS, connector_spec)
@@ -47,6 +48,7 @@ except ImportError:
 # disambiguator: matching it to the relation literally named ``<Object>`` reclaims the binding.
 # The leading space before ``(`` is required, so this matches ``Field (Object)`` -- NEVER ``SUM(x)``.
 _OBJECT_SUFFIX_RE = re.compile(r"^(.+) \((.+)\)$")
+
 
 
 def _norm_obj(s):
@@ -1016,7 +1018,7 @@ def _is_combination_relation(rel):
     single combination entry so the storage-mode policy can fall back. A ``collection`` is
     NOT a combination -- it is a container of INDEPENDENT tables."""
     rtype = (rel.get("type") or "").lower()
-    if rtype in ("join", "union"):
+    if rtype in CONTAINER_RELATION_TYPES:
         return True
     if rtype == "collection":
         return False
@@ -1251,7 +1253,8 @@ def _expand_untyped_relations_to_extract_tables(datasource, relations, cols_by_p
     # The join/union containers described the PRE-extract shape; the extract materialised each table
     # separately, so the containers no longer describe anything physical. Relationships between the
     # now-typed tables are re-derived from the extract's own tables by the caller.
-    relations[:] = [r for r in relations if r.get("kind") not in ("join", "union")]
+    relations[:] = [r for r in relations
+                    if r.get("kind") not in CONTAINER_RELATION_TYPES]
     return [rel for rel, _m, _c in pairs]
 
 
@@ -1314,7 +1317,7 @@ def _collapse_untyped_relations_to_extract(datasource, relations, cols_by_parent
         if mat["raw_table"]:
             new_rel["extract_hyper_table"] = mat["raw_table"]
     relations[:] = [r for r in relations
-                    if r.get("kind") not in ("table", "custom_sql", "join", "union")]
+                    if r.get("kind") not in ("table", "custom_sql") + CONTAINER_RELATION_TYPES]
     relations.append(new_rel)
     return new_rel
 
@@ -1458,7 +1461,7 @@ def _classify_relation(rel, cols_by_parent, nc_map=None):
     rtype = (rel.get("type") or "").lower()
     name = rel.get("name")
     # A join/union is either an explicit type or a relation that nests child relations.
-    if rtype in ("join", "union") or _children_local(rel, "relation"):
+    if rtype in CONTAINER_RELATION_TYPES or _children_local(rel, "relation"):
         return {"kind": rtype or "join", "name": name}
     if rtype == "text":  # custom SQL
         item_key = _strip_brackets(name) if name else None

@@ -185,6 +185,22 @@ NATIVE_ODBC_DRIVER = {
 _LIVE_CLASSES = set(DIRECT_CONNECTORS) | set(PARTIAL_LIVE_CONNECTORS)
 
 
+
+# Tableau relation types that COMBINE other relations into one logical table. They describe a shape,
+# not a physical table. Defined HERE (the lower-level module) and imported by the connection parser
+# so a new container type is added in ONE place -- ``batch-union`` slipped through precisely because
+# the list was duplicated across six call sites.
+#
+# ``batch-union`` is a WILDCARD union ("Union" with a filename pattern). It differs from a manual
+# ``union`` in the one way that defeated every check: it carries NO child ``<relation>`` elements --
+# its members are a pattern (``is-recursive`` / ``include-siblings`` / ``path``) resolved at connect
+# time -- so neither a type test nor a "has child relations" fallback matched it. It survived as a
+# relation beside the extract's own table, the datasource looked like one logical table spanning
+# several relations, that was classed structurally unsupported, and the ENTIRE workbook was skipped
+# with "needs a storage decision". Measured: a wildcard-union workbook built 0/1 while its
+# manual-union twin built 1/1 from identical data.
+CONTAINER_RELATION_TYPES = ("join", "union", "batch-union")
+
 def connector_spec(cls):
     """Return the ``(function, connect_style, nav_style)`` spec for a fully-supported direct
     connector class, or ``None`` if the class is not auto-emitted (scaffold / flat / unknown)."""
@@ -338,7 +354,7 @@ def _structurally_unsupported_detail(descriptor):
                 f"specific connection ({names}); can't bind them to a single upstream")
             categories.append("connection-not-routable")
     kinds = {r.get("kind") for r in relations}
-    if kinds & {"join", "union", "unknown"}:
+    if kinds & (set(CONTAINER_RELATION_TYPES) | {"unknown"}):
         reasons.append("join/union relation tree (one logical table spans multiple relations)")
         categories.append("shape-not-directly-rebuildable")
     if not table_like:

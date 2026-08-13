@@ -12,6 +12,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.136.0` -> `2.137.0`): a WILDCARD union (`batch-union`) is a container,
+  and it carries no member relations at all** (reported in #124). Tableau writes a union two ways and
+  only one of them looks like a container: a manual union is `type='union'` with its members listed as
+  child `<relation>` elements, while a wildcard union is `type='batch-union'` with **no children** —
+  its members are a filename pattern (`is-recursive` / `include-siblings` / `path`) resolved at
+  connect time.
+  That defeated every check we had, in the one way that mattered: it is not
+  `type in ("join", "union")`, and the fallback test — *does it nest child relations?* — also fails.
+  So it survived as a relation beside the extract's own materialised table, the datasource looked like
+  one logical table spanning several relations, storage-mode selection classed that
+  `shape-not-directly-rebuildable`, and the whole workbook was skipped with *"needs a storage
+  decision"* — no PBIP, no model, `definition_of_done: failed` — while 21 typed columns and 2.4 MB of
+  unioned rows sat in the packaged `.hyper` the entire time.
+  Measured on a matched pair built from the same four CSVs: the **manual**-union workbook migrated
+  1/1, its **wildcard** twin 0/1. Same data, same extract shape (`[Union]` 22 columns live,
+  `[Extract]` 21 extracted) — the relation type was the only difference. After the fix the wildcard
+  twin builds a 21-column model with 2,426 KB of unioned data and PBIR-validates with zero errors,
+  and the manual twin is unchanged.
+  The fix is a single shared `CONTAINER_RELATION_TYPES` rather than a tuple repeated at six call
+  sites, because that duplication is *why* this got through: six places independently decided what a
+  container was, so adding a Tableau type meant remembering all six, and `batch-union` was added to
+  none. It lives in `storage_mode` (the lower-level module, avoiding an import cycle) and is imported
+  by the connection parser, so there is now exactly one list to extend — asserted by identity, not
+  equality, plus a guard that fails if any call site re-introduces the literal pair.
+  Note for #124: this is a *sibling* of the multi-table-extract union case reported there. A union
+  whose extract materialises a single `[Extract]` parent already worked; the remaining reported shape
+  — a union inside a **multi-parent** extract, where the non-leftmost member matches no parent and
+  aborts the whole expansion — is still open.
+
 - **tableau-migration (skill `2.135.0` -> `2.136.0`): per-island Date dimensions switched OFF, and a
   calc-coverage floor so this class cannot recur silently.** Generating one Date dimension per
   datasource island (2.132.0) was correct in isolation — a single shared calendar wired to facts in
