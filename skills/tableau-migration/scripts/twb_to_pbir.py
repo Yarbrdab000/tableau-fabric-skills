@@ -760,7 +760,7 @@ def _build_field_index(root):
         item_to_rel = {}
         for rel in _findall_local(ds, "relation"):
             rtype = (rel.get("type") or "").lower()
-            if rtype in ("join", "union", "collection"):
+            if rtype in ("join", "union", "batch-union", "collection"):
                 continue
             item = _parse_item(rel.get("table")) or _strip_brackets(rel.get("name") or "")
             if item:
