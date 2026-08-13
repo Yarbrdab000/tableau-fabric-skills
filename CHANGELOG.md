@@ -12,6 +12,33 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **tableau-migration (skill `2.135.0` -> `2.136.0`): per-island Date dimensions switched OFF, and a
+  calc-coverage floor so this class cannot recur silently.** Generating one Date dimension per
+  datasource island (2.132.0) was correct in isolation — a single shared calendar wired to facts in
+  every datasource lets a date slicer filter islands Tableau keeps apart — but it cost **three
+  calculations** on the workbook it was built for. Salesforce NPSP went **118/157 -> 115/157**, with
+  `Count of Waitlisted Engagements`, the same `... in Date Range`, and `Sort by Intake` newly refused
+  on *"must reference exactly one table"*. Calc coverage is the headline number of a migration, and a
+  silent date-slicer bleed is narrower than three dead measures, so the feature is disabled behind
+  `PER_ISLAND_DATE_ENABLED` rather than deleted — the code and its tests are retained (exercised with
+  the switch forced on) so the proper fix has a verified starting point.
+  **The dead end is recorded so it is not re-run.** The obvious theory — that the shared calendar
+  BRIDGED the islands in the relationship graph, letting cross-island calcs resolve through it — was
+  tested by excluding the generated Date relationships from calc path-finding while leaving them in
+  the emitted model. Coverage stayed at 115, so that is *not* the mechanism. The remaining suspect is
+  field-resolution tie-breaking: with four calendars reserved instead of one, `Record ID` resolves to
+  no table while `pmdm__Stage__c` binds to the Intake island's copy of ProgramEngagement. The proper
+  fix is **island-scoped field resolution** — a calc binds within its own datasource however many
+  calendars exist — which keeps both wins.
+  **A coverage floor, because nothing was watching.** The regression passed 4,451 tests, built the
+  corpus 29/29, and PBIR-validated to zero errors; it surfaced only because a human compared a number
+  against one printed earlier the same day. Every existing gate asks *"did it build, and is it
+  well-formed?"* — none asked *"did it translate as much as it used to?"*, and a model can lose a
+  third of its measures and still build, open and render, because a stubbed calc is a perfectly
+  well-formed `BLANK()`. `tests/test_calc_coverage_floor.py` now pins a per-workbook floor; raising
+  one is the normal outcome of a fix, lowering one fails loudly and must be done deliberately with a
+  stated reason. Verified to fire on the exact regression it was written for.
+
 - **tableau-migration (skill `2.134.0` -> `2.135.0`): a model emitted below Desktop's compatibility
   level will not REOPEN once it has been refreshed.** The emitter hardcoded `compatibilityLevel:
   1604`. Power BI Desktop silently upgrades an older model in memory, a refresh then persists

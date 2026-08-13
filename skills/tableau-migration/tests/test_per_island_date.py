@@ -54,10 +54,22 @@ def test_one_tagged_island_is_still_the_original_path():
 
 
 def test_two_islands_get_one_calendar_each():
-    built, rels, report = M._build_date_dimensions(
-        [_rel("Orders", "Order_Date", ds="Sales"),
-         _rel("Tickets", "Opened_Date", ds="Support")],
-        ["Orders", "Tickets"], [])
+    """The per-island behaviour, exercised with the switch forced ON.
+
+    The feature ships DISABLED (``PER_ISLAND_DATE_ENABLED = False``) because splitting the calendar
+    cost three calculations on the workbook it was built for -- see the flag's comment for the full
+    measurement and the dead end already ruled out. The code is kept and still tested so the eventual
+    island-scoped-resolution fix has a working, verified starting point rather than a rewrite.
+    """
+    saved = M.PER_ISLAND_DATE_ENABLED
+    M.PER_ISLAND_DATE_ENABLED = True
+    try:
+        built, rels, report = M._build_date_dimensions(
+            [_rel("Orders", "Order_Date", ds="Sales"),
+             _rel("Tickets", "Opened_Date", ds="Support")],
+            ["Orders", "Tickets"], [])
+    finally:
+        M.PER_ISLAND_DATE_ENABLED = saved
     names = [n for n, _ in built]
     assert len(names) == 2
     assert "Date (Sales)" in names and "Date (Support)" in names
@@ -65,19 +77,37 @@ def test_two_islands_get_one_calendar_each():
 
 
 def test_each_calendar_relates_only_to_its_own_island():
-    """The whole point: a Sales date slicer must not reach a Support visual."""
-    built, rels, _report = M._build_date_dimensions(
-        [_rel("Orders", "Order_Date", ds="Sales"),
-         _rel("Tickets", "Opened_Date", ds="Support")],
-        ["Orders", "Tickets"], [])
+    """The whole point of the feature: a Sales date slicer must not reach a Support visual."""
+    saved = M.PER_ISLAND_DATE_ENABLED
+    M.PER_ISLAND_DATE_ENABLED = True
+    try:
+        built, rels, _report = M._build_date_dimensions(
+            [_rel("Orders", "Order_Date", ds="Sales"),
+             _rel("Tickets", "Opened_Date", ds="Support")],
+            ["Orders", "Tickets"], [])
+    finally:
+        M.PER_ISLAND_DATE_ENABLED = saved
     by_date = {}
     for r in rels:
         by_date.setdefault(r["to_table"], set()).add(r["from_table"])
     assert by_date["Date (Sales)"] == {"Orders"}
     assert by_date["Date (Support)"] == {"Tickets"}
-    # and no calendar reaches across
     for target, facts in by_date.items():
         assert len(facts) == 1, "a calendar related to two islands' facts fuses them"
+
+
+def test_per_island_is_off_by_default_so_one_calendar_is_emitted():
+    """The shipped behaviour: a multi-datasource workbook still gets ONE shared calendar.
+
+    Asserted explicitly because the flag is the whole revert -- if it silently flipped back on, the
+    three Salesforce calculations would go dead again and only a coverage check would notice.
+    """
+    assert M.PER_ISLAND_DATE_ENABLED is False
+    built, _rels, _report = M._build_date_dimensions(
+        [_rel("Orders", "Order_Date", ds="Sales"),
+         _rel("Tickets", "Opened_Date", ds="Support")],
+        ["Orders", "Tickets"], [])
+    assert [n for n, _ in built] == ["Date"]
 
 
 def test_island_calendar_names_do_not_collide_with_emitted_tables():
