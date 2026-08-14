@@ -3682,7 +3682,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                           date_table=True, mark_as_date=True, flatfile_path=None,
                           calc_lookup=None, approved_calc_dax=None, date_range=None,
                           parameters=None, table_calc_usages=None, calc_outer_aggs=None,
-                          scatter_keys=None):
+                          scatter_keys=None, storage_decision=None):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -3728,7 +3728,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     # from the Excel/CSV header row -> "column ... wasn't found" at load). No-op for live/DB sources
     # or when the file can't be read; see connection_to_m.reconcile_flatfile_headers.
     header_reconcile = reconcile_flatfile_headers(descriptor)
-    decision = select_storage_mode(descriptor)
+    decision = select_storage_mode(descriptor, storage_decision=storage_decision)
     if decision["mode"] is None:
         raise ValueError(
             f"datasource '{descriptor.get('datasource_name')}' requires the "
@@ -4748,7 +4748,7 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                   approved_calc_dax=None, date_range=None, select=None,
                                   parameters=None, table_calc_usages=None, descriptor=None,
                                   emit_linguistic=False, calc_outer_aggs=None,
-                                  scatter_keys=None):
+                                  scatter_keys=None, storage_decision=None):
     """One-call convenience: parse ``.tds``/``.twb`` text and assemble the Import/DirectQuery model.
 
     ``calcs`` are the MEASURE-role calculated fields and ``dim_calcs`` the DIMENSION/row-level ones
@@ -4856,7 +4856,7 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                    date_range=date_range, parameters=parameters,
                                    table_calc_usages=table_calc_usages,
                                    calc_outer_aggs=calc_outer_aggs,
-                                   scatter_keys=scatter_keys)
+                                   scatter_keys=scatter_keys, storage_decision=storage_decision)
     # Splice harvested Group/Bin calc columns onto their resolved home tables -- the same additive
     # pre-partition injection as dim_calcs (byte-for-byte unchanged when there are no groups/bins).
     harvest_parts = result.get("parts") if isinstance(result, dict) else None
@@ -5557,7 +5557,8 @@ def materialize_bundled_flatfile_data(packaged_source, descriptor, dest_dir, *, 
 def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, datasource=None,
                        descriptor=None,
                        calcs=None, dim_calcs=None, approved_calc_dax=None, date_range=None,
-                       local_data=None, packaged_source=None, flatfile_dest_dir=None, **kwargs):
+                       local_data=None, packaged_source=None, flatfile_dest_dir=None,
+                       storage_decision=None, **kwargs):
     """**One call** from a downloaded datasource to everything needed to land it in Fabric.
 
     ``source`` may be a path to a ``.tdsx``/``.tds``/``.twbx``/``.twb``, raw bytes, or XML text.
@@ -5630,7 +5631,7 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
 
     if descriptor is None:
         descriptor = parse_tds(tds_text, datasource)
-    decision = select_storage_mode(descriptor)
+    decision = select_storage_mode(descriptor, storage_decision=storage_decision)
 
     # Strict role->mode routing: when calcs were auto-extracted, split off dimension-role calcs to
     # become DAX calculated COLUMNS (column mode) instead of being mis-routed through the measure
@@ -5719,7 +5720,7 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
         result = assemble_local_import_model(
             descriptor, model_name=model_name, calcs=calcs, dim_calcs=dim_calcs,
             table_csv_paths=table_csv_paths, approved_calc_dax=approved_calc_dax,
-            date_range=date_range, **kwargs)
+            date_range=date_range, storage_decision=storage_decision, **kwargs)
     elif decision.get("mode") is None or decision.get("import_from_extract"):
         # Genuinely-undoable shape -> needs-storage-decision hand-off (no parts) rather than raising.
         # An extract-backed SaaS source (import_from_extract) whose .hyper did NOT materialize also
@@ -5732,7 +5733,7 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
         _split_auto_calcs()
         result = migrate_tds_to_semantic_model(
             tds_text, model_name=model_name, calcs=calcs, dim_calcs=dim_calcs, select=datasource,
-            descriptor=descriptor,
+            descriptor=descriptor, storage_decision=storage_decision,
             approved_calc_dax=approved_calc_dax, date_range=date_range, **kwargs)
 
     # Additive, honest record of how flat-file data was (or was not) landed, so a caller -- and the

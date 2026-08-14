@@ -16,6 +16,14 @@ planner needs BEFORE STEP 1 fetches anything:
   * an explicit ``complexity_understated`` flag per dependent workbook, so a size estimate built on
     workbook-local calcs alone is never mistaken for the real migration surface.
 
+**The `--json` payload is a consumed contract (#114).** A downstream assessment layer shells out to
+``--json`` and builds its migration-order graph from specific key paths. A rename fails SILENTLY over
+there -- zero dependency edges is indistinguishable from a site that genuinely has none, and a
+workbook whose datasource never landed then rebuilds to an empty report, which is the exact failure
+this module exists to prevent. The payload therefore carries ``schema_version``
+(:data:`SURVEY_SCHEMA_VERSION`), and :data:`SURVEY_CONTRACT_KEYS` names every path a consumer reads,
+so breaking one is a test failure rather than a rename that looks harmless in review.
+
 **The id trap (do not "fix" this).** A ``sqlproxy`` connection carries a datasource reference that
 LOOKS joinable::
 
@@ -155,6 +163,26 @@ def resolve_dependency(datasource_name, index):
 
 # == the survey =================================================================================
 
+# The `--json` payload is consumed by a downstream assessment layer that builds the migration-order
+# graph from it (issue #114). Semver over the SHAPE, not the tool: bump MINOR when a key is ADDED,
+# MAJOR when any key in SURVEY_CONTRACT_KEYS is renamed, removed, or changes type. A consumer can
+# then refuse a payload it does not understand instead of silently parsing zero dependency edges.
+SURVEY_SCHEMA_VERSION = "1.0"
+
+# The exact key paths a downstream consumer reads. Named here so the change that would break them is
+# a test failure with this list attached, rather than a rename that looks harmless in review. The
+# load-bearing one is `workbooks[].published_dependencies[].datasource_name`: lose it and the graph
+# comes back empty, which reads identically to a site with no published datasources at all.
+SURVEY_CONTRACT_KEYS = (
+    "schema_version",
+    "workbooks[].name",
+    "workbooks[].published_dependencies[].datasource_name",
+    "workbooks[].published_dependencies[].status",
+    "workbooks[].complexity_understated",
+    "required_datasources[].datasource_name",
+)
+
+
 def build_survey(workbooks, connections_by_workbook, datasources, unknown_workbooks=None):
     """Assemble the estate survey from already-fetched REST payloads (no network).
 
@@ -209,6 +237,15 @@ def build_survey(workbooks, connections_by_workbook, datasources, unknown_workbo
 
     dependent = [w for w in wb_rows if w["complexity_understated"]]
     return {
+        # This payload is a CONSUMED CONTRACT, not an internal dump (issue #114): a downstream
+        # assessment layer shells out to `--json` and reads specific key paths to build its
+        # migration-order graph. Renaming one of them fails SILENTLY over there -- zero dependency
+        # edges is indistinguishable from a site that genuinely has none, and a workbook whose
+        # datasource never landed then rebuilds to an EMPTY REPORT. The consumer deliberately refuses
+        # tolerant fallbacks so a rename fails loudly on their side; this version stamp is the other
+        # half of that bargain, offered in the issue and taken up here. Bump MINOR for an additive
+        # key, MAJOR for anything that renames or removes one of SURVEY_CONTRACT_KEYS.
+        "schema_version": SURVEY_SCHEMA_VERSION,
         "workbooks": wb_rows,
         "required_datasources": required,
         "unresolved_dependencies": unresolved,

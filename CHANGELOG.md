@@ -12,6 +12,174 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+
+- **`tableau-migration` (skill `2.140.0` → `2.141.0`): `estate_survey.py --json` declares a schema
+  contract, so a rename cannot fail silently.** Raised in #114 — not a defect report, a heads-up that
+  a downstream assessment tier shells out to this script and builds its migration-order graph from
+  specific key paths. What made it worth acting on is the failure mode, which is the same
+  wrong-direction failure `estate_survey` itself exists to prevent:
+
+  > If that key is renamed, our parser finds zero edges and reports *"migration order unknown"* —
+  > which is indistinguishable from a site that genuinely has no published datasources. A workbook
+  > whose datasource has not landed then rebuilds to an **empty report**.
+
+  They already refuse tolerant fallbacks on their side, deliberately, having been bitten once by
+  their own guess at `datasource`/`name` parsing **zero** edges and reporting "order unknown". Their
+  ask was small ("a note on this issue is enough") with an offer: *"If you would rather we pinned to
+  a schema version field instead, we are happy to consume one."*
+
+  Taken up, plus the half a note cannot give:
+
+  * the payload now carries **`schema_version`** (`SURVEY_SCHEMA_VERSION`, `"1.0"`) — MINOR for an
+    added key, MAJOR for a renamed/removed/retyped one, so a consumer can refuse a payload it does
+    not understand;
+  * **`SURVEY_CONTRACT_KEYS`** names every consumed path, with
+    `workbooks[].published_dependencies[].datasource_name` — the load-bearing one — first among
+    equals;
+  * `tests/test_estate_survey_contract.py` **walks that list against a real payload**, so the list
+    cannot rot into a stale comment and a rename is a test failure with the contract attached rather
+    than a review diff that looks harmless.
+
+  The emitted keys are unchanged; `schema_version` is purely additive.
+
+- **`tableau-migration` (skill `2.139.0` → `2.140.0`): `needs-storage-decision` is no longer
+  terminal — the decision it demands can now be supplied.** Reported in #116, with both halves
+  traced in code rather than inferred from behaviour, and both exactly right:
+
+  * `select_storage_mode(descriptor)` took only a descriptor, and no `migrate_estate.py` flag
+    carried a storage decision, so an operator who *had* made the choice had nowhere to put it;
+  * `FALLBACK_LAND_TO_DELTA` was **read** by `assemble_model` and **assigned by nothing** — the
+    documented "explicit opt-in" to DirectLake branched on a value the engine could not produce.
+
+  Measured by the reporter at **14 of 38 workbooks — 37% of a real estate** — ending with no model
+  and no report, while the message told them a choice was available.
+
+  Two routes, either of which closes it (the issue's own suggestions 1 and 2):
+
+  ```
+  --storage-decision <json>        {"Big Data Source": "DirectLake", "*": "Import"}
+  --accept-recommended-storage     apply each datasource's already-computed recommended_mode
+  ```
+
+  An answer is honoured only where one was actually demanded. A mode the engine chose confidently is
+  returned untouched — this seam supplies a MISSING decision, it does not second-guess a made one —
+  and a `schema-not-visible` datasource is refused outright, because "Import" is not a choice you can
+  make about a model that cannot be typed at all. A misspelt answer raises instead of being ignored,
+  since silently dropping it would reproduce the very dead end the flag exists to clear. Every
+  outcome is stamped `storage_decision` / `storage_decision_applied` / `storage_decision_note`, and
+  the original rationale is prepended to rather than replaced, so the summary still says why a
+  decision was demanded.
+
+  **What is deliberately NOT changed: DirectLake is still never auto-selected.** Silently landing a
+  customer's data in Delta because a CSV path went stale is a far worse failure than stopping.
+  Nothing here fires without an explicit operator answer.
+
+  Verified end to end on the reported shape: `--accept-recommended-storage` takes a previously
+  terminal workbook **0/1 → 1/1** with an openable `.pbip`, and `--storage-decision {"*":
+  "DirectLake"}` writes a real 8-table landing plan to `landing_plans/<wb>.landing_plan.json`. That
+  last part was a second gap found while fixing the first: the DirectLake branch computed a plan and
+  never wrote it anywhere, so the warning promised an artifact that did not exist. It is now written,
+  recorded on the entry, and the message reports an outcome ("was resolved by an OPERATOR DECISION
+  to…") instead of still demanding a decision that was already given.
+
+  **Corpus: zero drift.** With no flag passed the run is a strict no-op — 29/29 built, every summary
+  metric identical, and all 136 emitted table files byte-identical once per-run `lineageTag` GUIDs
+  and the output path are masked.
+
+### Fixed
+
+- **`tableau-migration` (skill `2.138.0` → `2.139.0`): a storage-decision failure named the one
+  datasource with nothing wrong with it.** Reported alongside #124. A workbook's embedded
+  datasources are consolidated into ONE model, and the fallback message named the **ranked primary**
+  — not the island whose relations actually failed:
+
+  ```
+  embedded datasource 'Big Data Source' needs a storage decision
+    (Direct-upstream rebuild not safe (relation 'Orders.csv' has no resolvable columns;
+     relation 'Orders_Archive.csv' has no resolvable columns))
+  ```
+
+  Both column-less relations belonged to `Small Data Source`. A reader following the only actionable
+  fact in that sentence would open `Big Data Source`, find three cleanly-typed tables, and be no
+  closer to the cause. Two independent things were wrong and both are fixed: the **subject** named
+  one island for a model spanning several, and the **reasons** lost their island as
+  `combine_descriptors` merged them. The same failure now reads:
+
+  ```
+  the consolidated model for 2 embedded datasources ('Big Data Source', 'Small Data Source')
+    needs a storage decision
+    (Direct-upstream rebuild not safe (Small Data Source: relation 'Orders.csv' has no resolvable
+     columns; Small Data Source: relation 'Orders_Archive.csv' has no resolvable columns))
+  ```
+
+  Verified end to end by reproducing the original failure (the union's own metadata removed so
+  promotion declines). Attribution happens only on the consolidation path — `combine_descriptors`
+  returns a lone descriptor unchanged — so a single-datasource workbook's message is byte-identical
+  to before, and re-attribution is idempotent.
+
+- **`tableau-migration` (skill `2.137.0` → `2.138.0`): a UNION is one table, so its container —
+  not its members — is the relation.** Reported in #124. Tableau writes the two container kinds
+  with opposite metadata, and that difference is the whole defect:
+
+  ```
+  union   <relation type='union' name='Orders.csv+'>            <- ALL 11 columns filed under
+              <relation type='table' name='Orders.csv'/>           [Orders.csv+]; the members get
+              <relation type='table' name='Orders_Archive.csv'/>   NO metadata parent at all
+
+  join    <relation type='join'>                                <- each member keeps its OWN
+              <relation type='table' name='Customers.csv'/>        [Customers.csv] parent and
+              <relation type='table' name='Customers_Details.csv'/>   its own columns
+  ```
+
+  That is the semantics, not a quirk: a union produces the SAME columns with MORE rows
+  (`Table.Combine`), so there is one column list and it belongs to the container. A join produces a
+  WIDER row from real tables — which is exactly why we surface join leaves individually and rebuild
+  the join keys as model relationships.
+
+  We surfaced BOTH kinds of leaves individually, so every union member came out column-less. That is
+  survivable while the whole datasource is column-less — the extract collapse or the multi-parent
+  expansion then re-types everything from the `.hyper` — and fatal the moment the datasource is
+  PARTIALLY typed, because both of those rescues open with `any(r["columns"]) -> return None`. A
+  union sitting beside a join is precisely that shape, and the reporter's control ("the join works,
+  the union does not") was exactly right:
+
+  ```
+  embedded datasource needs a storage decision
+    (Direct-upstream rebuild not safe (relation 'Orders.csv' has no resolvable columns;
+     relation 'Orders_Archive.csv' has no resolvable columns))
+    -- workbook .pbip skipped
+  ```
+
+  No model, `definition_of_done: failed` — while the union's own 11 typed columns sat under
+  `[Orders.csv+]` the entire time. **The diagnosis moved during the fix:** the abort is at
+  `connection_to_m.py:1210` (`any(r.get("columns"))`), not the one-to-one extract match at `:1231`,
+  because `Customers.csv` types and short-circuits the expansion before matching ever runs. So no
+  extract mapping was needed at all — the columns were already in the XML, filed under a name we
+  were discarding.
+
+  Measured on the reported workbook (`Section 09 - Filtering Data.twbx`): **0/1 → 1/1**,
+  `failed` → `warn`, 9 tables / 51 columns, 5/5 workbook calcs (100%), PBIR validating with zero
+  errors and zero unresolved report entities. The two union workbooks that already built are
+  unchanged in substance — 21 columns and byte-identical data (2,316 KB manual / 2,425 KB wildcard)
+  — and now name the table `Union`, which is what Tableau's own data pane calls it, instead of
+  leaking the extract's internal `Extract` name or standing the datasource caption in for a table.
+  **Corpus: 29/29 built, 29/29 PBIR-validate, and zero drift** — every summary metric identical to
+  the baseline and 0 of 29 workbooks differing in table or column structure.
+
+  Promotion is fail-safe: the container must resolve columns under its own name AND no member may
+  resolve any, so a union whose members are real typed tables is left alone, and a wholly-untyped
+  union still belongs to the extract collapse/expansion untouched. Members are dropped by element
+  IDENTITY, never by name, so a typed relation that merely shares a member's display name survives.
+
+- **`tableau-migration`: `CONTAINER_RELATION_TYPES` was imported in the flat branch only.** A
+  latent break shipped with 2.137.0: the constant was added to `connection_to_m`'s
+  `except ImportError` branch but not its `from .storage_mode import ...` twin, so a package-style
+  import succeeded and then raised `NameError` at the first container check. Tests run with
+  `scripts/` on `sys.path` and always took the working branch, so nothing caught it. Both branches
+  now bind the same names, and a test parses the import block with `ast` and fails if they ever
+  diverge again.
+
 - **tableau-migration (skill `2.136.0` -> `2.137.0`): a WILDCARD union (`batch-union`) is a container,
   and it carries no member relations at all** (reported in #124). Tableau writes a union two ways and
   only one of them looks like a container: a manual union is `type='union'` with its members listed as

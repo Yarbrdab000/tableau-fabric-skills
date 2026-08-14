@@ -35,6 +35,8 @@ surfaced as ``manual_followups``.
 """
 from __future__ import annotations
 
+import re
+
 # Connectors whose M we emit as deploy-ready, doc-verified partitions (never a guessed
 # scaffold). Each entry is `(function, connect_style, nav_style)` -- the two style facts are
 # what make the emission correct rather than guessed:
@@ -199,7 +201,12 @@ _LIVE_CLASSES = set(DIRECT_CONNECTORS) | set(PARTIAL_LIVE_CONNECTORS)
 # several relations, that was classed structurally unsupported, and the ENTIRE workbook was skipped
 # with "needs a storage decision". Measured: a wildcard-union workbook built 0/1 while its
 # manual-union twin built 1/1 from identical data.
-CONTAINER_RELATION_TYPES = ("join", "union", "batch-union")
+# A UNION is the subset of those containers that produces ONE table with the SAME columns and MORE
+# rows (``Table.Combine``). Tableau files a union's column metadata under the CONTAINER's own name
+# (``[Orders.csv+]``), never under its members, so a union's members are row sources, not tables --
+# unlike a JOIN, whose members each keep their own ``metadata-record`` parent and are real tables.
+UNION_RELATION_TYPES = ("union", "batch-union")
+CONTAINER_RELATION_TYPES = ("join",) + UNION_RELATION_TYPES
 
 def connector_spec(cls):
     """Return the ``(function, connect_style, nav_style)`` spec for a fully-supported direct
@@ -389,7 +396,7 @@ def _structurally_unsupported_reason(descriptor):
     return _structurally_unsupported_detail(descriptor)[0]
 
 
-def select_storage_mode(descriptor):
+def select_storage_mode(descriptor, *, storage_decision=None):
     """Choose a storage mode for one Tableau datasource descriptor.
 
     Returns a decision dict: ``mode`` ('Import'|'DirectQuery'|None), ``connector``,
@@ -400,7 +407,112 @@ def select_storage_mode(descriptor):
     less manual remapping) and ``recommended_mode`` (the mode to default to -- equal to ``mode``
     for a direct rebuild, or 'Import' when ``mode`` is None, since unknown/unsupported shapes
     default to a direct-to-source Import rebuild rather than an automatic DirectLake landing).
+
+    ``storage_decision`` (keyword-only, issue #116) is the operator's answer to a
+    ``needs-storage-decision`` outcome: ``'Import'``, ``'DirectQuery'``, ``'DirectLake'`` or
+    ``'recommended'``. Omitting it is the default and returns exactly the decision this function has
+    always returned. See :func:`apply_storage_decision` for what it may and may not override.
     """
+    return apply_storage_decision(_select_storage_mode(descriptor), storage_decision)
+
+
+def normalize_storage_decision(value):
+    """Fold an operator's storage answer to a canonical mode, or raise ``ValueError``.
+
+    Accepts the mode names as written in the message an operator is responding to, case- and
+    punctuation-insensitively (``DirectLake`` / ``direct-lake`` / ``land-to-delta``). ``None`` and
+    ``""`` mean "no answer supplied" and return ``None``. An unrecognised answer RAISES rather than
+    being ignored: a typo in ``--storage-decision`` must not silently reproduce the very dead end the
+    flag exists to resolve.
+    """
+    if value is None:
+        return None
+    key = re.sub(r"[^a-z]+", "", str(value).lower())
+    if not key:
+        return None
+    canonical = {
+        "import": "Import",
+        "directquery": "DirectQuery", "dq": "DirectQuery", "live": "DirectQuery",
+        "directlake": "DirectLake", "landtodelta": "DirectLake",
+        "landtodeltadirectlake": "DirectLake", "delta": "DirectLake",
+        "recommended": "recommended", "recommend": "recommended", "default": "recommended",
+    }.get(key)
+    if canonical is None:
+        raise ValueError(
+            "unrecognised storage decision %r -- expected one of Import, DirectQuery, DirectLake, "
+            "recommended" % (value,))
+    return canonical
+
+
+def apply_storage_decision(decision, storage_decision):
+    """Honour an operator's answer to ``needs-storage-decision`` (issue #116).
+
+    ``needs-storage-decision`` was terminal on the batch path. The message correctly demanded a
+    choice -- *"default to a direct-to-source Import rebuild once a connection can be supplied, or
+    opt in to land-to-Delta + DirectLake (never auto-selected)"* -- but there was nowhere to put the
+    answer: ``select_storage_mode`` took only a descriptor, no CLI flag carried a decision, and
+    ``FALLBACK_LAND_TO_DELTA`` was *read* by ``assemble_model`` and never assigned by anything, so
+    the documented DirectLake opt-in branched on a value nothing could produce. Measured by the
+    reporter at 14 of 38 workbooks -- 37% of a real estate -- ending with no model and no report.
+
+    What an answer may override, and what it may not:
+
+    * only a ``needs-storage-decision`` outcome is overridable. A confident decision the engine
+      already made is returned untouched -- this seam supplies a MISSING decision, it does not
+      second-guess a made one;
+    * ``schema-not-visible`` is refused. "Import" is not a choice you can make about a model that
+      cannot be typed at all; the answer to that is a connection or a typed artifact, and pretending
+      otherwise would emit an empty model instead of an honest stop;
+    * ``'recommended'`` resolves to the ``recommended_mode`` already computed here, so the blanket
+      opt-in applies exactly the documented default rather than a second opinion.
+
+    Refusing to AUTO-select DirectLake stays right and is unchanged: nothing here fires without an
+    explicit operator answer. Every outcome is stamped ``storage_decision`` (what was asked) and
+    ``storage_decision_applied`` (whether it took effect, and if not, why), and the original
+    ``rationale`` is PREPENDED to rather than replaced, so the summary still says why a decision was
+    demanded in the first place.
+    """
+    want = normalize_storage_decision(storage_decision)
+    if want is None:
+        return decision
+    out = dict(decision)
+    out["storage_decision"] = want
+    if decision.get("fallback") != FALLBACK_NEEDS_DECISION:
+        out["storage_decision_applied"] = False
+        out["storage_decision_note"] = (
+            "not applied: this datasource did not need a storage decision "
+            "(mode=%r, fallback=%r)" % (decision.get("mode"), decision.get("fallback")))
+        return out
+    if "schema-not-visible" in (decision.get("unsupported_categories") or []):
+        out["storage_decision_applied"] = False
+        out["storage_decision_note"] = (
+            "not applied: the column schema could not be read, so no storage mode can be honoured "
+            "-- supply a connection or a typed artifact (e.g. a packaged extract) and re-run")
+        return out
+
+    if want == "recommended":
+        want = decision.get("recommended_mode") or "Import"
+    out["storage_decision_applied"] = True
+    if want == "DirectLake":
+        # The documented opt-in, now reachable: this is what makes assemble_model's
+        # FALLBACK_LAND_TO_DELTA branch fire and emit a landing plan.
+        out["fallback"] = FALLBACK_LAND_TO_DELTA
+        out["mode"] = None
+        out["rationale"] = (
+            "%s OPERATOR DECISION: land-to-Delta + DirectLake, supplied explicitly; a landing plan "
+            "is emitted instead of a direct-upstream model." % decision.get("rationale", "")).strip()
+        return out
+    out["mode"] = want
+    out["fallback"] = None
+    out["rationale"] = (
+        "%s OPERATOR DECISION: rebuild direct-to-source as %s, supplied explicitly; the shape was "
+        "not auto-selectable, so verify the emitted partitions against the source."
+        % (decision.get("rationale", ""), want)).strip()
+    return out
+
+
+def _select_storage_mode(descriptor):
+    """The engine's own decision, before any operator answer is applied."""
     cls = (descriptor.get("connection_class") or "").lower()
     uses_native = _has_custom_sql(descriptor)
     base_followups = [_CREDENTIALS_FOLLOWUP]
@@ -448,6 +560,11 @@ def select_storage_mode(descriptor):
             score=SCORE_FALLBACK,
             rationale=f"Direct-upstream rebuild not safe ({reason}); {guidance}.",
             manual_followups=base_followups + [_NEEDS_DECISION_FOLLOWUP],
+            # Additive: carries WHICH kind of undecidable this is, so a caller-supplied storage
+            # decision can be honoured for "readable but undecided" and refused for
+            # "cannot see the schema" -- Import is not a choice you can make about a model that
+            # cannot be typed at all (see :func:`apply_storage_decision`).
+            unsupported_categories=list(categories),
         )
 
     # 1.5 generic ODBC -> Odbc.Query (custom SQL) / Odbc.DataSource (tables), Import by default.
