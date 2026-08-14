@@ -89,6 +89,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.141.0` → `2.142.0`): a caption sized in Tableau does not fit in
+  Power BI, because Power BI adds padding Tableau has not.** Power BI reserves 8px above *and* below
+  a textbox's text by default, so a box's usable height is `height - 16`. Tableau reserves nothing.
+  An author who drew a 24px caption strip drew it to fit 12pt text, and it does — in Tableau.
+  Emitted verbatim, those 24px leave 8px for a line that needs 19, and the band renders **clipped**:
+  descenders sheared off, a scrollbar stub where the text should be.
+
+  Found by rendering a real network-operations dashboard, not by a metric. Two bands on one page:
+  `"Sort By = Network Score | Region = All | Fiscal Month ="` at 24px/12pt, and a section header at
+  31px/16pt. The build validated with **zero errors** — and our own gate already knew, because
+  `powerbi-report-author validate` warns `PBIR_TEXTBOX_HEIGHT_BELOW_FLOOR` using exactly the
+  renderer's formula. We were emitting geometry the gate then told us was wrong, one step too late
+  to matter.
+
+  **The fix is not to grow the box, and that distinction is the whole of it.** Growing it is what
+  the layout solver deliberately refuses to do (`layout_solve._clamp_to_authored`), for a measured
+  reason: a readability floor propagated up a zone tree makes a frame scale the WHOLE canvas to
+  satisfy it — eleven pixels of caption once cost five hundred pixels of page, with every object on
+  it 50% taller. The first version of this fix did exactly that and
+  `test_thin_caption_sizes_to_content_not_inflated_to_floor` caught it, correctly.
+
+  The 16px is not the author's, it is **ours**: a default we never asked for, on a box we emit. So
+  the room comes out of our own padding first, down to zero, and the authored geometry is never
+  touched. A textbox with room to spare emits no padding block at all and is byte-identical to
+  before. Applies to dashboard text objects, caption-only worksheets, and the title banner alike.
+
+  Verified by render: the reported dashboard now shows both bands in full, and the report validates
+  **0 errors / 0 warnings** where it previously carried two.
+
 - **`tableau-migration` (skill `2.138.0` → `2.139.0`): a storage-decision failure named the one
   datasource with nothing wrong with it.** Reported alongside #124. A workbook's embedded
   datasources are consolidated into ONE model, and the fallback message named the **ranked primary**

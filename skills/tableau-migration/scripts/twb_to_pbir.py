@@ -11231,6 +11231,7 @@ def _dumps(obj):
 # few dozen px tall, so a single "reasonably large" bold size reads as a header at any page scale
 # (the source point size, tuned to Tableau's own banner geometry, does not transfer 1:1).
 _BANNER_FONT_SIZE = "18pt"
+_BANNER_FONT_PT = 18.0
 
 
 def _banner_textbox_visual(name, position, banner):
@@ -11264,6 +11265,7 @@ def _banner_textbox_visual(name, position, banner):
         },
         "drillFilterOtherVisuals": True,
     }
+    _fit_textbox_padding(visual, position, _BANNER_FONT_PT)
     return {"$schema": SCHEMA_VISUAL, "name": name, "position": position, "visual": visual}
 
 
@@ -11286,6 +11288,40 @@ _TEXT_OBJECT_FONT_SIZE = "12pt"
 _TEXTBOX_MIN_H = 20.0   # px: one line of ~12pt body text (never clips a single line)
 _TEXTBOX_MIN_W = 8.0    # px: degenerate-width guard only; never inflate a caption's authored width
 _PT_TO_PX = 96.0 / 72.0
+
+# Power BI reserves 8px of padding above AND below a textbox's text by default, so a box's USABLE
+# height is ``height - 16``. Tableau reserves nothing: an author who drew a 24px caption strip drew
+# it to fit 12pt text, and it does -- in Tableau. Emitted verbatim, those 24px leave 8 for a line
+# that needs 19, and the band renders CLIPPED with a scrollbar stub.
+#
+# The geometry is NOT the thing to change (see ``_fit_textbox_padding``); the padding is. These
+# constants are the RENDERER's own, not an estimate: ``max(18, ceil(pt * 25/16)) + padTop + padBottom``
+# reproduces `powerbi-report-author validate`'s PBIR_TEXTBOX_HEIGHT_BELOW_FLOOR numbers exactly
+# (12pt -> 35, 16pt -> 41).
+_TEXTBOX_DEFAULT_PAD = 8.0   # px, per side -- Power BI's default textbox padding
+
+
+def _textbox_text_height(font_pt=None):
+    """Px the RENDERER gives the text itself, before padding: ``max(18, ceil(pt * 25 / 16))``."""
+    return max(18.0, math.ceil(float(font_pt or 12.0) * 25.0 / 16.0))
+
+
+def _textbox_min_height(font_pt=None, pad_top=None, pad_bottom=None):
+    """The smallest textbox height that renders ``font_pt`` text without clipping it.
+
+    Mirrors the renderer's rule that `powerbi-report-author validate` enforces as
+    ``PBIR_TEXTBOX_HEIGHT_BELOW_FLOOR``. Padding defaults to Power BI's 8px per side; pass the
+    authored padding to get the floor for a box whose padding we set ourselves.
+
+    Deliberately NOT used as a ``_scale_zone`` floor. Inflating a caption to reach it is the
+    regression ``test_thin_caption_sizes_to_content_not_inflated_to_floor`` guards, and the reason
+    is measured: a readability floor propagated up a zone tree makes a frame scale the WHOLE canvas
+    to satisfy it (:func:`layout_solve._clamp_to_authored` -- eleven pixels of caption once cost five
+    hundred pixels of page). Sizing is settled by padding instead.
+    """
+    pad = (_TEXTBOX_DEFAULT_PAD if pad_top is None else float(pad_top)) + \
+          (_TEXTBOX_DEFAULT_PAD if pad_bottom is None else float(pad_bottom))
+    return max(_TEXTBOX_MIN_H, _textbox_text_height(font_pt) + pad)
 
 
 def _text_object_textbox_visual(name, position, tob):
@@ -11332,7 +11368,49 @@ def _text_object_textbox_visual(name, position, tob):
         },
         "drillFilterOtherVisuals": True,
     }
+    _fit_textbox_padding(visual, position, size)
     return {"$schema": SCHEMA_VISUAL, "name": name, "position": position, "visual": visual}
+
+
+def _fit_textbox_padding(visual, position, font_pt=None):
+    """Shrink OUR OWN padding so the author's caption height still renders its text.
+
+    Power BI reserves 8px above and below a textbox's text by default, so a box's USABLE height is
+    ``height - 16``. Tableau has no such reserve: an author who drew a 24px caption strip drew it to
+    fit 12pt text, and it does fit -- in Tableau. Emitted verbatim into Power BI, those same 24px
+    become 8 of text in a 12pt line's worth of space, and the band renders CLIPPED with a scrollbar
+    stub. Measured on a real network-operations dashboard: the caption
+    "Sort By = Network Score | Region = All | Fiscal Month =" sheared its descenders at 24px, and a
+    16pt section header did the same at 31px.
+
+    The fix is NOT to grow the box. Growing it is what the layout solver deliberately refuses to do
+    (:func:`layout_solve._clamp_to_authored`) and for good reason -- a readability floor propagated up
+    a zone tree makes a frame scale the WHOLE canvas to satisfy it, and eleven pixels of caption once
+    cost five hundred pixels of page. The author's geometry is evidence and it wins.
+
+    But the 16px is not the author's, it is OURS: a default we never asked for on a box we emit. So
+    give the text the room by spending our own padding first, down to zero, and only then leave the
+    box as authored. Explicit padding is emitted ONLY when the default would clip -- a textbox with
+    room to spare is byte-identical to before.
+
+    Mirrors the renderer's own rule, which ``powerbi-report-author validate`` enforces as
+    ``PBIR_TEXTBOX_HEIGHT_BELOW_FLOOR``: text needs ``max(18, ceil(pt * 25 / 16))`` px, plus padding.
+    """
+    try:
+        height = float((position or {}).get("height") or 0.0)
+    except (TypeError, ValueError):
+        return
+    if height <= 0:
+        return
+    need = _textbox_text_height(font_pt)
+    spare = height - need
+    if spare >= 2 * _TEXTBOX_DEFAULT_PAD:
+        return                      # the default already fits -- emit nothing (never-regress)
+    pad = max(0.0, math.floor(spare / 2.0))
+    visual.setdefault("visualContainerObjects", {})["padding"] = [{"properties": {
+        "top": {"expr": {"Literal": {"Value": "%dD" % int(pad)}}},
+        "bottom": {"expr": {"Literal": {"Value": "%dD" % int(pad)}}},
+    }}]
 
 
 def _caption_only_textbox_visual(ws, zone, ref_w, ref_h, name, tab=0):
