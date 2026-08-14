@@ -14,6 +14,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.140.0` → `2.141.0`): `estate_survey.py --json` declares a schema
+  contract, so a rename cannot fail silently.** Raised in #114 — not a defect report, a heads-up that
+  a downstream assessment tier shells out to this script and builds its migration-order graph from
+  specific key paths. What made it worth acting on is the failure mode, which is the same
+  wrong-direction failure `estate_survey` itself exists to prevent:
+
+  > If that key is renamed, our parser finds zero edges and reports *"migration order unknown"* —
+  > which is indistinguishable from a site that genuinely has no published datasources. A workbook
+  > whose datasource has not landed then rebuilds to an **empty report**.
+
+  They already refuse tolerant fallbacks on their side, deliberately, having been bitten once by
+  their own guess at `datasource`/`name` parsing **zero** edges and reporting "order unknown". Their
+  ask was small ("a note on this issue is enough") with an offer: *"If you would rather we pinned to
+  a schema version field instead, we are happy to consume one."*
+
+  Taken up, plus the half a note cannot give:
+
+  * the payload now carries **`schema_version`** (`SURVEY_SCHEMA_VERSION`, `"1.0"`) — MINOR for an
+    added key, MAJOR for a renamed/removed/retyped one, so a consumer can refuse a payload it does
+    not understand;
+  * **`SURVEY_CONTRACT_KEYS`** names every consumed path, with
+    `workbooks[].published_dependencies[].datasource_name` — the load-bearing one — first among
+    equals;
+  * `tests/test_estate_survey_contract.py` **walks that list against a real payload**, so the list
+    cannot rot into a stale comment and a rename is a test failure with the contract attached rather
+    than a review diff that looks harmless.
+
+  The emitted keys are unchanged; `schema_version` is purely additive.
+
 - **`tableau-migration` (skill `2.139.0` → `2.140.0`): `needs-storage-decision` is no longer
   terminal — the decision it demands can now be supplied.** Reported in #116, with both halves
   traced in code rather than inferred from behaviour, and both exactly right:
