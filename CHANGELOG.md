@@ -14,6 +14,40 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.143.0` → `2.144.0`): a text table's conditional colouring is
+  carried, and it colours the TEXT — not the cell background.** Tableau's ordinary way to
+  colour-code a crosstab is a calc that returns a *label* —
+  `IF SUM([Profit]) < 0 THEN "negative" ELSE "positive" END` — dropped on Colour. Nothing in the
+  rebuild attempted it, so every number came out black: the source's whole point, lost, with no
+  warning.
+
+  Power BI cannot drive a native categorical legend from a MEASURE — a legend needs a grouping
+  COLUMN, a column is row-level, and a row-level split changes the aggregate grain and the row
+  count — so this reuses the pattern already proven for boolean colour: a DAX measure that
+  **returns a colour**, bound through conditional formatting as the `Field value` format style,
+  editable in Desktop's `fx` dialog rather than unreachable JSON. The model gains a twin
+  (`Sign (colour) = SWITCH([Sign], "negative", "#4E79A7", "#F28E2B")`) whose palette is Tableau's
+  default categorical ramp assigned in **sorted member order** — which is how Tableau assigns it,
+  so blue/orange land on the same members the source drew.
+
+  **The channel follows the MARK, because Tableau's Colour shelf paints the mark.** On a `Text` (or
+  `Automatic`) crosstab the mark IS the number, so the colour is `fontColor` and the cell background
+  is left alone. On a `Square` highlight table the mark is a filled rectangle, so the same encoding
+  is `backColor`. Painting a text table's background reproduces neither half: every cell gains a
+  fill the source never drew while the numbers stay black. One entry is emitted per value column —
+  Tableau colours the whole row from one mark colour, and a single unscoped entry colours only the
+  first column — each carrying the `dataViewWildcard` selector, without which Power BI evaluates the
+  expression in one context and paints every cell identically, *with a clean validation pass*.
+
+  The colour driver is also no longer projected as a matrix column: it is a STRING measure, so
+  leaving it in the query rendered a literal `negative`/`positive` column beside the numbers.
+
+  Verified by render, not by metric: the rebuilt matrix draws negative-profit rows entirely blue and
+  positive rows entirely orange, backgrounds untouched, matching the Tableau source. Gated on the
+  Tableau-declared `datatype`, so a numeric measure that merely mentions a string (a `FORMAT`
+  pattern, a `SWITCH` label) can never acquire a bogus twin. Across the corpus this adds exactly one
+  measure and changes no existing visual.
+
 - **`tableau-migration` (skill `2.142.0` → `2.143.0`): an unfiltered Measure Names level means EVERY
   measure, so the most ordinary text table migrates at all.** Tableau writes a bare
   `<groupfilter function='level-members' level='[:Measure Names]'/>` the moment Measure Names lands

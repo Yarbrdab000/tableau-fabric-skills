@@ -7085,18 +7085,22 @@ def _build_query_state(ws, model_table, field_map, warnings):
                        + ([color] if color and color["kind"] == "value" else [])
                        + ([label] if label and label["kind"] == "value" else [])
                        + ([size] if size and size["kind"] == "value" else []))
-        # Heat-grid colour DRIVER -> not a visible column. When a continuous colour scale colours a
+        # Heat-grid colour DRIVER -> not a visible column. When a colour encoding colours a
         # DISTINCT displayed value (Tableau "colour by a different field"), the colour measure must
-        # not appear as its own matrix column -- it only drives the background gradient, which the
-        # `FillRule` references by MODEL name and therefore does not need projected into the query.
-        # Only fires when there is another displayed value AND a gradient is present, so the classic
-        # highlight table (colour == the shown measure) is unchanged.
+        # not appear as its own matrix column -- it only drives the cell colour, which the
+        # `FillRule` / `Field value` expression references by MODEL name and therefore does not need
+        # projected into the query. Fires for a continuous gradient AND for a DISCRETE colour
+        # measure: the latter is a STRING measure, so leaving it projected renders a literal
+        # ``negative``/``positive`` text column next to the numbers the author actually asked for.
+        # Only fires when there is another displayed value, so the classic highlight table
+        # (colour == the shown measure) is unchanged.
         #
         # It used to ride along in a ``Tooltips`` role. A pivotTable has NO Tooltips well, so that
         # role made the visual invalid and it failed to render -- adjudicated on a ground-truth run
         # as a deterministic-rule defect ("remove invalid Tooltips role from pivotTable", 2 pages).
         # Dropping the projection entirely is both the fix and the faithful shape.
-        if ws.get("color_gradient") and color and color["kind"] == "value":
+        if (ws.get("color_gradient") or (color or {}).get("discrete_measure")) \
+                and color and color["kind"] == "value":
             ck = (color["entity"], color["property"], color["binding"], color["aggregation"])
             others = [f for f in vals
                       if (f["entity"], f["property"], f["binding"], f["aggregation"]) != ck]
@@ -8190,6 +8194,92 @@ def _disclose_default_palette(ws, cg, warnings):
         "background colour scale used Tableau's default continuous palette (the source serialised "
         "no explicit colours); applied a default {0} gradient -- verify the colours against the "
         "source".format("diverging" if diverging else "sequential")))
+
+
+# Tableau's Colour shelf paints THE MARK, so which channel a table/matrix cell colour lands on is
+# decided by the MARK TYPE -- and the two are not interchangeable:
+#
+#   * ``Text`` (and ``Automatic``, which draws text on a crosstab) -- the mark IS the number, so
+#     Colour is the FONT colour. The cell keeps its normal background. This is the ordinary
+#     "text table with conditionally coloured numbers".
+#   * ``Square`` -- the mark is a filled rectangle behind the label, so Colour is the CELL
+#     BACKGROUND. This is the classic highlight table.
+#
+# Painting a text table's background reproduces neither: it fills every cell with a colour the
+# source never drew, and the numbers -- the thing the author actually colour-coded -- stay black.
+_TEXT_MARK_CLASSES = frozenset({"", "automatic", "text", "label"})
+
+
+def _cell_colour_property(ws):
+    """``"fontColor"`` or ``"backColor"`` -- the PBIR cell channel this worksheet's mark colours.
+
+    Fail-closed toward the filled cell: only a mark that is explicitly text-drawing colours the
+    font, so an unrecognised mark keeps the long-standing background behaviour.
+    """
+    return ("fontColor" if (ws.get("mark_class") or "").strip().lower() in _TEXT_MARK_CLASSES
+            else "backColor")
+
+
+def _matrix_discrete_measure_colour(ws, state, model_table, field_map, warnings):
+    """A DISCRETE aggregate measure on Colour over a TABLE / MATRIX -> ``(value_objects, fact)``.
+
+    The table-shaped sibling of :func:`_chart_discrete_measure_fill`, and the answer to the most
+    ordinary Tableau text table there is: rows of dimensions, a band of measures, and every number
+    coloured by a calc that returns a LABEL -- ``IF SUM([Profit]) < 0 THEN "negative" ELSE
+    "positive" END``. Power BI cannot drive a categorical legend from a measure (a legend needs a
+    grouping column, which is row-level and would change the aggregate grain and the row count), so
+    this binds the model's hex-returning colour twin through conditional formatting as the
+    ``Field value`` format style -- editable in Desktop's ``fx`` dialog rather than unreachable JSON.
+
+    Emitted per VALUE COLUMN. Tableau colours every measure cell in the row from the one mark
+    colour, so each projected value gets its own ``selector.metadata`` entry naming the column it
+    paints; a single unscoped entry colours only the first column.
+
+    The channel is chosen by MARK TYPE -- font for a text table, background for a Square highlight
+    table (see :data:`_TEXT_MARK_CLASSES`) -- because Tableau's Colour shelf paints the mark, and on
+    a text table the mark is the number itself.
+    """
+    color = ws["encodings"].get("color")
+    if not color or not color.get("discrete_measure"):
+        return None, None
+    if ws.get("visual_type") not in (VT_MATRIX, VT_TABLE):
+        return None, None
+    if color.get("kind") != "value" or color.get("binding") not in ("aggregation", "measure"):
+        return None, None
+    values = (state.get("Values") or {}).get("projections", [])
+    if not values:
+        return None, None
+    measure_name = _discrete_colour_measure_name(color)
+    prop = _cell_colour_property(ws)
+    expr = {"solid": {"color": {"expr": {
+        "Measure": {"Expression": {"SourceRef": {"Entity": MEASURES_TABLE}},
+                    "Property": measure_name}}}}}
+    value_objects = [{
+        "properties": {prop: expr},
+        # matchingOption 1 + metadata = "this column, every data point in it". Without the
+        # wildcard Power BI evaluates the expression in ONE context and paints every cell the same
+        # colour -- with a clean validation pass (see _chart_discrete_measure_fill).
+        "selector": {"data": [{"dataViewWildcard": {"matchingOption": 1}}],
+                     "metadata": p["queryRef"]},
+    } for p in values]
+    fact = {"kind": "cell_discrete_measure_colour",
+            "channel": prop,
+            "mark": ws.get("mark_class"),
+            "colour_measure": measure_name,
+            "source_measure": color.get("caption"),
+            "targets": [p["queryRef"] for p in values],
+            "status": "emitted"}
+    warnings.append(_warn(
+        "worksheet", ws["name"],
+        "discrete colour: Tableau colours these cells by a DISCRETE aggregate measure (%r). Power "
+        "BI has no native categorical legend for a measure-driven colour -- a legend needs a "
+        "grouping COLUMN, which is row-level and would change the aggregate grain -- so this is "
+        "rebuilt as conditional formatting on %s (the %s mark colours the %s) driven by a colour "
+        "measure %r (Format style 'Field value', editable in Desktop's fx dialog), applied to all "
+        "%d value column(s). There is no colour legend"
+        % (color.get("caption"), prop, ws.get("mark_class") or "Automatic",
+           "text" if prop == "fontColor" else "cell background", measure_name, len(values))))
+    return value_objects, fact
 
 
 def _conditional_format(ws, state, model_table, field_map, warnings):
@@ -12103,6 +12193,15 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             else:
                 value_objects, cf_fact = _conditional_format(
                     ws, state, model_table, field_map, warnings)
+                if value_objects is None:
+                    # No CONTINUOUS scale. A DISCRETE colour measure paints the same cells through
+                    # the model's hex-returning colour twin instead -- font or background per the
+                    # Tableau mark. Only consulted when the gradient path emitted nothing, so a
+                    # heat table is byte-unchanged.
+                    _dc_objects, _dc_fact = _matrix_discrete_measure_colour(
+                        ws, state, model_table, field_map, warnings)
+                    if _dc_objects:
+                        value_objects, cf_fact = _dc_objects, _dc_fact
             data_point_objects, mc_fact = _data_point_colors(
                 ws, state, ws["visual_type"], model_table, field_map, warnings)
             cont_objects, cont_fact = _chart_discrete_measure_fill(
@@ -12367,6 +12466,13 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         else:
             value_objects, cf_fact = _conditional_format(
                 ws, state, model_table, field_map, warnings)
+            if value_objects is None:
+                # See the dashboard path: a DISCRETE colour measure paints these cells through the
+                # model's colour twin when there is no continuous scale to own them.
+                _dc_objects, _dc_fact = _matrix_discrete_measure_colour(
+                    ws, state, model_table, field_map, warnings)
+                if _dc_objects:
+                    value_objects, cf_fact = _dc_objects, _dc_fact
         data_point_objects, mc_fact = _data_point_colors(
             ws, state, ws["visual_type"], model_table, field_map, warnings)
         cont_objects, cont_fact = _chart_discrete_measure_fill(

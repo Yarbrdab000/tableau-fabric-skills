@@ -1475,6 +1475,10 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             "reason": reason,
             "dax": dax,
             "tableau_formula": formula,
+            # Tableau's declared result type (additive, absent when the extractor did not supply
+            # one). Read by the categorical colour-twin pass to tell a STRING-valued measure from a
+            # numeric one EXACTLY, rather than inferring it from the shape of the translated DAX.
+            "datatype": calc.get("datatype"),
             # Cross-layer source identity (additive): lets the viz/report layer deterministically
             # bind a worksheet field-instance / calc token to this emitted measure. The status above
             # tells the binder whether to bind now (translated / assisted-approved) or degrade.
@@ -1604,6 +1608,13 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         cr["measure"] = _gen_measure(
             cr["measure"], cr["tableau_formula"], cr["dax"],
             translated_by=cr.get("translated_by") or "deterministic (discrete colour measure)")
+        report.append(cr)
+    # Same idea for a STRING-valued measure, whose members Tableau paints from its categorical
+    # palette. Runs after the boolean pass so both see the same final names and neither can collide.
+    for cr in _categorical_colour_twin_measures(report):
+        cr["measure"] = _gen_measure(
+            cr["measure"], cr["tableau_formula"], cr["dax"],
+            translated_by=cr.get("translated_by") or "deterministic (categorical colour measure)")
         report.append(cr)
     measures_tmdl = "".join(_measure_parts)
     return T.generate_measures_table_tmdl(measures_tmdl), report, suggestions
@@ -1902,6 +1913,13 @@ def _is_row_level_scalar_formula(formula):
 
 _DISCRETE_COLOUR_TRUE = "#4E79A7"      # Tableau default blue   -> TRUE member
 _DISCRETE_COLOUR_FALSE = "#F28E2B"     # Tableau default orange -> FALSE member
+# Tableau's default categorical ramp (Tableau 10), in its own order. A discrete domain takes these
+# in SORTED member order, which is how Tableau assigns them -- so the two-member case reduces to
+# exactly the boolean pair above.
+_CATEGORICAL_COLOUR_PALETTE = [
+    "#4E79A7", "#F28E2B", "#E15759", "#76B7B2", "#59A14F",
+    "#EDC948", "#B07AA1", "#FF9DA7", "#9C755F", "#BAB0AC",
+]
 _COLOUR_MEASURE_SUFFIX = " (colour)"
 _BOOLEAN_DAX_RE = re.compile(r"\bTRUE\s*\(\s*\)|\bFALSE\s*\(\s*\)", re.IGNORECASE)
 
@@ -2058,6 +2076,88 @@ def _boolean_colour_twin_measures(existing_report):
                        "field_caption": name, "base_measure": base},
         })
     return rows
+
+
+def _dax_string_literals(dax):
+    """The distinct double-quoted string literals in ``dax``, in order of first appearance.
+
+    ``""`` inside a DAX string is an escaped quote, so a literal is read greedily across doubled
+    quotes. Empty literals are dropped -- they are a blank result, not a domain member.
+    """
+    out, seen = [], set()
+    for m in re.finditer(r'"((?:[^"]|"")*)"', dax or ""):
+        lit = m.group(1).replace('""', '"')
+        if lit and lit not in seen:
+            seen.add(lit)
+            out.append(lit)
+    return out
+
+
+def _categorical_colour_twin_measures(existing_report):
+    """A hex-returning colour twin for every STRING-valued measure -> ``[report rows]``.
+
+    The categorical sibling of :func:`_boolean_colour_twin_measures`, and the same Power BI answer
+    for the same Tableau idiom. Where a boolean calc splits marks two ways, a string calc
+    (``IF SUM([Profit]) < 0 THEN "negative" ELSE "positive" END``) names its members -- and Tableau
+    puts it on Colour to paint by those names. Power BI still cannot drive a native categorical
+    legend from a MEASURE (a legend needs a grouping column, which is row-level and would change the
+    aggregate grain), so the faithful rebuild is again a DAX measure that RETURNS A COLOUR, applied
+    as the ``Field value`` format style.
+
+    The domain is the measure's own string literals and the palette is Tableau's default categorical
+    ramp assigned in SORTED member order -- which is how Tableau itself assigns colours to an
+    unsorted discrete domain, so ``"negative"`` takes blue and ``"positive"`` orange exactly as the
+    source renders them.
+
+    Gated on the Tableau-declared ``datatype == "string"`` (exact) rather than on the shape of the
+    translated DAX, so a numeric measure that merely mentions a string (a ``FORMAT`` pattern, a
+    ``SWITCH`` default label) can never acquire a bogus colour twin. Additive and fail-closed: an
+    empty list unless the workbook really carries a string measure with an enumerable domain, and a
+    domain larger than the palette, or with only one member, is declined.
+    """
+    existing = {(r.get("measure") or "").strip().lower() for r in (existing_report or [])}
+    rows = []
+    for row in existing_report or []:
+        if row.get("status") not in ("translated", "assisted-approved"):
+            continue
+        if str(row.get("datatype") or "").strip().lower() != "string":
+            continue
+        base = (row.get("measure") or "").strip()
+        dax = str(row.get("dax") or "")
+        if not base or not dax:
+            continue
+        domain = _dax_string_literals(dax)
+        if len(domain) < 2 or len(domain) > len(_CATEGORICAL_COLOUR_PALETTE):
+            continue
+        name = dax_safe_measure_name(base + _COLOUR_MEASURE_SUFFIX)
+        if name.strip().lower() in existing:
+            continue
+        existing.add(name.strip().lower())
+        palette = {m: _CATEGORICAL_COLOUR_PALETTE[i]
+                   for i, m in enumerate(sorted(domain, key=lambda s: (s.casefold(), s)))}
+        # SWITCH over the base measure -- one branch per member, in the measure's OWN literal order
+        # so the DAX reads alongside the source formula. The last member doubles as the default so
+        # the twin never returns BLANK (a BLANK colour paints the theme default, silently losing the
+        # encoding on any row the domain scan did not anticipate).
+        branches = ", ".join('"%s", "%s"' % (_dax_str(m), palette[m]) for m in domain[:-1])
+        default = palette[domain[-1]]
+        rows.append({
+            "measure": name,
+            "status": "translated",
+            "reason": None,
+            "dax": 'SWITCH([%s], %s, "%s")' % (base, branches, default),
+            "tableau_formula": "(colour encoding for [%s])" % base,
+            "translated_by": "deterministic (categorical colour measure)",
+            "source": {"kind": "categorical_colour_twin", "model_table": "_Measures",
+                       "field_caption": name, "base_measure": base,
+                       "domain": list(domain), "colors": [palette[m] for m in domain]},
+        })
+    return rows
+
+
+def _dax_str(text):
+    """Escape a Python string for embedding in a double-quoted DAX literal."""
+    return str(text).replace('"', '""')
 
 
 def _scalar_row_aggregate_measures(existing_report, table_for):

@@ -1,0 +1,122 @@
+"""Tableau's Colour shelf paints THE MARK -- so a table's colour channel follows its MARK TYPE.
+
+On a **text table** the mark IS the number, so a colour encoding is the FONT colour and the cell
+background is left alone. On a **Square** highlight table the mark is a filled rectangle, so the
+identical encoding is the CELL BACKGROUND. The two are not interchangeable, and getting it wrong
+reproduces neither half: painting a text table's background fills every cell with a colour the
+source never drew, while the numbers the author actually colour-coded stay black.
+
+The driver here is a DISCRETE aggregate measure -- Tableau's ordinary "label these marks" calc,
+``IF SUM([Profit]) < 0 THEN "negative" ELSE "positive" END``. Power BI has no native categorical
+legend for a measure-driven colour (a legend needs a grouping COLUMN, which is row-level and would
+change the aggregate grain and the row count), so the rebuild binds the model's hex-returning
+colour twin through conditional formatting as the ``Field value`` format style.
+
+The wildcard selector is load-bearing and invisible to every automated check: without it Power BI
+still HONOURS the expression but evaluates it in ONE context and paints every cell the same colour,
+with a clean validation pass. It is asserted directly for that reason.
+"""
+from twb_to_pbir import emit_pbir, parse_twb
+
+from test_twb_to_pbir import _INST, _query_state, _visual_parts, _workbook, _worksheet
+
+_MV_ALL_FILTER = ("<filter class='categorical' column='[federated.abc].[:Measure Names]'>"
+                  "<groupfilter function='level-members' level='[:Measure Names]' />"
+                  "</filter>")
+
+# a STRING-valued measure calc -- the pill Tableau drops on Colour to label its marks
+_LABEL_CALC = (
+    "<column caption='Sign' datatype='string' name='[Calculation_sign]' role='measure' "
+    "type='nominal'>"
+    "<calculation class='tableau' formula='If SUM([Profit]) &lt; 0 then &quot;negative&quot; "
+    "else &quot;positive&quot; END' /></column>"
+    "<column-instance column='[Calculation_sign]' derivation='User' "
+    "name='[usr:Calculation_sign:nk]' pivot='key' type='nominal' />")
+
+_ENC = ("<encodings><color column='[federated.abc].[usr:Calculation_sign:nk]' />"
+        "<text column='[federated.abc].[Multiple Values]' /></encodings>")
+
+
+def _table_ir(mark):
+    ws = _worksheet("Coloured Table", mark,
+                    rows="[federated.abc].[none:Region:nk]",
+                    cols="[federated.abc].[:Measure Names]",
+                    deps_extra=_INST + _LABEL_CALC, encodings=_ENC, filters=_MV_ALL_FILTER)
+    return parse_twb(_workbook(ws))
+
+
+def _visual(ir):
+    return list(_visual_parts(emit_pbir(ir)).values())[0]
+
+
+class TestChannelFollowsTheMark:
+    def test_a_text_mark_colours_the_text_and_leaves_the_background_alone(self):
+        values = _visual(_table_ir("Text"))["visual"]["objects"]["values"]
+        assert values
+        for entry in values:
+            assert "fontColor" in entry["properties"]
+            assert "backColor" not in entry["properties"]
+
+    def test_an_automatic_mark_draws_text_on_a_crosstab_so_it_colours_the_text(self):
+        values = _visual(_table_ir("Automatic"))["visual"]["objects"]["values"]
+        assert values
+        assert all("fontColor" in e["properties"] for e in values)
+        assert all("backColor" not in e["properties"] for e in values)
+
+    def test_a_square_mark_is_a_filled_cell_so_it_colours_the_background(self):
+        values = _visual(_table_ir("Square"))["visual"]["objects"]["values"]
+        assert values
+        for entry in values:
+            assert "backColor" in entry["properties"]
+            assert "fontColor" not in entry["properties"]
+
+    def test_the_helper_fails_closed_toward_the_filled_cell(self):
+        # An unrecognised mark keeps the long-standing background behaviour rather than silently
+        # switching an existing highlight table to a font colour.
+        import twb_to_pbir as R
+        assert R._cell_colour_property({"mark_class": "Text"}) == "fontColor"
+        assert R._cell_colour_property({"mark_class": None}) == "fontColor"
+        assert R._cell_colour_property({"mark_class": "Square"}) == "backColor"
+        assert R._cell_colour_property({"mark_class": "Circle"}) == "backColor"
+
+
+class TestTheBinding:
+    def test_the_colour_is_the_models_hex_returning_twin(self):
+        entry = _visual(_table_ir("Automatic"))["visual"]["objects"]["values"][0]
+        assert entry["properties"]["fontColor"]["solid"]["color"]["expr"]["Measure"] == {
+            "Expression": {"SourceRef": {"Entity": "_Measures"}}, "Property": "Sign (colour)"}
+
+    def test_every_value_column_is_coloured_not_just_the_first(self):
+        # Tableau colours every measure cell in the row from the one mark colour, so each projected
+        # value needs its own scoped entry; a single unscoped one colours only the first column.
+        visual = _visual(_table_ir("Automatic"))
+        refs = [p["queryRef"] for p in _query_state(visual)["Values"]["projections"]]
+        assert len(refs) > 1
+        assert [v["selector"]["metadata"] for v in visual["visual"]["objects"]["values"]] == refs
+
+    def test_the_dataviewwildcard_selector_is_present_on_every_entry(self):
+        # Load-bearing and validation-invisible: without it every cell paints identically.
+        for entry in _visual(_table_ir("Automatic"))["visual"]["objects"]["values"]:
+            assert entry["selector"]["data"] == [{"dataViewWildcard": {"matchingOption": 1}}]
+
+    def test_the_encoding_is_disclosed_rather_than_applied_silently(self):
+        ir = _table_ir("Automatic")
+        emit_pbir(ir)
+        assert any("discrete colour" in w["reason"] and "fontColor" in w["reason"]
+                   for w in ir["warnings"])
+
+
+class TestTheDriverIsNotAColumn:
+    def test_the_string_colour_driver_is_not_projected_as_a_value(self):
+        # It is a STRING measure: left projected it renders a literal "negative"/"positive" column
+        # beside the numbers the author asked for. The FillRule / Field-value expression resolves
+        # against the MODEL, so the driver never needs to be in the query.
+        visual = _visual(_table_ir("Automatic"))
+        natives = [p["nativeQueryRef"] for p in _query_state(visual)["Values"]["projections"]]
+        assert "Sign" not in natives
+        assert natives, "the real measures still project"
+
+    def test_the_pill_is_classified_discrete(self):
+        color = _table_ir("Automatic")["worksheets"][0]["encodings"]["color"]
+        assert color["discrete_measure"] is True
+        assert color["kind"] == "value" and color["binding"] == "measure"

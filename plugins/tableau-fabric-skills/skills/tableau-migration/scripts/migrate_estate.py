@@ -593,6 +593,12 @@ def extract_calculations(xml_text, *, include_dimensions=False):
         if emitted != caption:
             entry["base_name"] = caption
         entry["datasource"] = col_ds.get(id(col))
+        # Tableau's declared result type, carried so the model build can recognise a STRING-valued
+        # measure (a categorical label calc such as ``IF SUM([Profit]) < 0 THEN "negative" ELSE
+        # "positive" END``) and give it a colour twin. Additive; absent when undeclared.
+        _dt = (col.get("datatype") or "").strip()
+        if _dt:
+            entry["datatype"] = _dt
         # Author's explicit number format (currency/percent/precision) declared on the calc
         # <column @default-format>. Conservatively decoded (explicit c/n/p/* codes only; the
         # ambiguous built-in C<lcid>% form is declined) so the measure keeps the author's format

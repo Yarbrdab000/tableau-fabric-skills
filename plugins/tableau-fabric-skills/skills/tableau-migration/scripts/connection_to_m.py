@@ -2328,6 +2328,12 @@ def extract_calcs(xml_text, select=None):
         role = (col.get("role") or "").strip()
         if role:
             entry["role"] = role
+        # Tableau's declared result type. Carried so a downstream consumer can tell a STRING-valued
+        # measure (a categorical label calc that drives a colour encoding) from a numeric one
+        # without re-reading the XML or guessing from the translated DAX. Additive.
+        datatype = (col.get("datatype") or "").strip()
+        if datatype:
+            entry["datatype"] = datatype
         # Author's explicit number format (currency/percent/precision) from the calc
         # <column @default-format>, conservatively decoded (explicit c/n/p/* codes only).
         # Additive: absent when there is no decodable code, so prior output is unchanged.
