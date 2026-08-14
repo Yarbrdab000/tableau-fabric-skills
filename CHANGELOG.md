@@ -14,6 +14,29 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.142.0` → `2.143.0`): an unfiltered Measure Names level means EVERY
+  measure, so the most ordinary text table migrates at all.** Tableau writes a bare
+  `<groupfilter function='level-members' level='[:Measure Names]'/>` the moment Measure Names lands
+  on a shelf with nothing filtered out. The emitter classified it alongside `except` — and the two
+  are **opposites**: `except` lists the members that were REMOVED, `level-members` means every
+  member of the level. So the worksheet was refused as "an Exclude filter whose displayed set
+  cannot be derived", and when it was the workbook's only sheet the report came out with **zero
+  pages** — while `powerbi-report-author validate` reported 0 errors and the definition-of-done
+  reported PASS. A trivial crosstab of `Segment / Ship Mode / Order ID` against eight measures did
+  not migrate at all.
+
+  Tableau records no explicit member list for the unfiltered case, so the members are recovered from
+  the view's own `<column-instance>` declarations: every `quantitative` pill it depends on, minus
+  every pill it spends on a named shelf or encoding (a measure parked on Tooltip is not a displayed
+  column). Ordering is alphabetical **by caption**, which is how Tableau renders an unsorted Measure
+  Names header — the declaration order it was recovered from is Tableau's internal id sort
+  (`cnt:` &lt; `none:` &lt; `sum:` &lt; `usr:`), which would scatter the calcs to the end of the table.
+
+  Fail-closed and narrow: only a *childless* `level-members` is read as "all members". `except`, a
+  narrowed `level-members`, and a non-manual `union` keep deferring exactly as before, so the guard
+  against surfacing the wrong measure set is untouched. Across the 29-workbook corpus this changes
+  no existing output (every Measure Names filter there is an authoritative `op='manual'` keep-list).
+
 - **`tableau-migration` (skill `2.140.0` → `2.141.0`): `estate_survey.py --json` declares a schema
   contract, so a rename cannot fail silently.** Raised in #114 — not a defect report, a heads-up that
   a downstream assessment tier shells out to this script and builds its migration-order graph from

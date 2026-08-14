@@ -2526,7 +2526,63 @@ def _mv_shelf_locations(rows_text, cols_text, pane):
     return locs
 
 
-def _measure_value_member_ids(view, ds_default):
+def _placed_instance_ids(rows_text, cols_text, panes):
+    """Instance ids this view spends on a NAMED shelf (Rows/Columns) or a pane encoding.
+
+    Encoding children are read generically -- ``color``/``text``/``tooltip``/``size``/``lod``/
+    ``shape``/... all carry the pill on a ``column`` attribute -- so a new encoding kind needs no
+    change here. Ids are returned in the SAME stripped form the instance table is keyed by
+    (``sum:Sales:qk``), because ``<column-instance name>`` keeps its brackets while a shelf token
+    does not: comparing the two raw forms misses by exactly one character on every pill.
+    """
+    out = set()
+    for tok in _TOKEN_RE.findall((rows_text or "") + " " + (cols_text or "")):
+        _ds, fid = _split_token(tok)
+        if fid:
+            out.add(_strip_brackets(fid))
+    for pane in (panes or ()):
+        holder = _first(pane, "encodings")
+        if holder is None:
+            continue
+        for child in list(holder):
+            _ds, fid = _split_token_attr(child.get("column"))
+            if fid:
+                out.add(_strip_brackets(fid))
+    return out
+
+
+def _view_measure_instances(view, ds_default, used_instances=None):
+    """Every measure pill the view declares that is NOT placed on a named shelf/encoding.
+
+    This is the member set of an UNFILTERED Measure Values shelf. Tableau records no explicit
+    member list for that case -- the shelf carries the pseudo-field ``[Multiple Values]`` and the
+    real measures exist only as the view's own ``<column-instance>`` declarations -- so the
+    displayed set is exactly "every measure instance this view depends on, minus the ones it
+    spends somewhere else".
+
+    ``type="quantitative"`` is the measure test rather than the base column's ``role``: Measure
+    Values is a continuous-only container, so a ``role="measure"`` STRING calc (e.g. a
+    ``"positive"``/``"negative"`` label driving Colour, serialised ``type="nominal"``) is a
+    measure that is *not* a Measure Values member. ``used_instances`` carries the instance ids
+    already spent on Rows/Columns/Colour/Size/Text/Tooltip/... so a measure on Tooltip is not
+    mistaken for a displayed column.
+    """
+    used = used_instances or frozenset()
+    out, seen = [], set()
+    for dep in _findall_local(view, "datasource-dependencies"):
+        dsn = dep.get("datasource") or ds_default
+        for ci in _children_local(dep, "column-instance"):
+            if (ci.get("type") or "").strip().lower() != "quantitative":
+                continue
+            iid = _strip_brackets(ci.get("name") or "")
+            if not iid or iid in used or (dsn, iid) in seen:
+                continue
+            seen.add((dsn, iid))
+            out.append((dsn, iid))
+    return out
+
+
+def _measure_value_member_ids(view, ds_default, used_instances=None):
     """Ordered ``(ds, instance_id)`` Measure Values members, plus an enumeration status.
 
     Returns ``(members, status)`` where ``status`` is one of:
@@ -2534,11 +2590,20 @@ def _measure_value_member_ids(view, ds_default):
     - ``"ok"``      -- an authoritative keep-list (a ``<groupfilter function="union" op="manual">``
       whose ``function="member"`` children are the *included* measures, in document = shelf
       order) or, when no such filter is present, the ``<manual-sort>`` dictionary fallback.
-    - ``"exclude"`` -- the Measure Names filter is an Exclude / non-manual structure
-      (``except`` / ``level-members``), where the listed members are the *excluded* set; the
-      displayed set cannot be derived from the workbook alone, so the caller must warn + defer
-      rather than show the wrong measures.
+    - ``"all"``     -- the Measure Names filter is a bare ``<groupfilter function="level-members">``
+      with no member children: Tableau's "every member of the level", which is what it writes the
+      moment Measure Names lands on a shelf with nothing filtered out. Members are enumerated from
+      the view's own measure declarations and carry no authored order, so the caller sorts them.
+    - ``"exclude"`` -- the Measure Names filter is an Exclude / non-manual structure (``except``,
+      or a ``level-members`` that itself carries member children), where the listed members are
+      the *excluded* set; the displayed set cannot be derived from the workbook alone, so the
+      caller must warn + defer rather than show the wrong measures.
     - ``"none"``    -- no member source was found.
+
+    ``except`` and a bare ``level-members`` are OPPOSITES and were previously conflated: ``except``
+    lists the REMOVED members, ``level-members`` means every member. Refusing the latter refused
+    the most ordinary Measure Names worksheet there is, and -- when it was the only sheet -- left
+    the report with zero pages.
 
     The ``<manual-sort>`` dictionary is only a fallback because it keeps stale members that were
     since removed from the shelf.
@@ -2558,14 +2623,17 @@ def _measure_value_member_ids(view, ds_default):
                 or not col.endswith(":Measure Names]"):
             continue
         # the inclusion authority is a *direct* union+manual keep-list; any other top-level group
-        # (except / level-members / non-manual union) is an Exclude action whose member list is
-        # the removed set -- reading it as the keep-list would surface exactly the wrong measures.
-        manual, nonmanual = None, False
+        # (except / narrowed level-members / non-manual union) is an Exclude action whose member
+        # list is the removed set -- reading it as the keep-list would surface the wrong measures.
+        # A CHILDLESS level-members narrows nothing at all and is handled separately.
+        manual, nonmanual, all_members = None, False, False
         for child in _children_local(filt, "groupfilter"):
             fn = child.get("function")
             op = _attr_local(child, "op")
             if fn == "union" and op == "manual":
                 manual = child
+            elif fn == "level-members" and not _children_local(child, "groupfilter"):
+                all_members = True
             elif fn in ("except", "level-members") or (fn == "union" and op != "manual"):
                 nonmanual = True
         if manual is not None:
@@ -2574,6 +2642,10 @@ def _measure_value_member_ids(view, ds_default):
                 return mem, "ok"
         if nonmanual:
             return [], "exclude"
+        if all_members:
+            mem = _view_measure_instances(view, ds_default, used_instances)
+            if mem:
+                return mem, "all"
     for ms in _findall_local(view, "manual-sort"):
         if (ms.get("column") or "").endswith(":Measure Names]"):
             members = []
@@ -2589,14 +2661,14 @@ def _measure_value_member_ids(view, ds_default):
 def _resolve_measure_values(view, ds_default, base_cols, instances, index, ds_caption,
                             worksheet, warnings, internal_fields=None,
                             measure_binding=None, row_count_binding=None, column_binding=None,
-                            date_binding=None):
+                            date_binding=None, used_instances=None):
     """Resolve the ordered Measure Values members to value fields.
 
     Drops numeric-literal dummy spacers (the path-hack constant). Returns
     ``(members, dummy_count, has_param_swap, status)`` where ``status`` is the enumeration
     status from :func:`_measure_value_member_ids`.
     """
-    member_ids, status = _measure_value_member_ids(view, ds_default)
+    member_ids, status = _measure_value_member_ids(view, ds_default, used_instances)
     members, dummy_count, has_param_swap = [], 0, False
     for ds, fid in member_ids:
         inst = instances.get((ds, fid))
@@ -2614,6 +2686,14 @@ def _resolve_measure_values(view, ds_default, base_cols, instances, index, ds_ca
                            column_binding=column_binding, date_binding=date_binding)
         if f and f["kind"] == "value":
             members.append(f)
+    if status == "all":
+        # An unfiltered Measure Names level carries NO authored order -- the member set was
+        # recovered from the view's declarations, whose serialised order is Tableau's internal
+        # id sort (``cnt:`` < ``none:`` < ``sum:`` < ``usr:``), not the display order. Tableau
+        # renders an unsorted Measure Names header alphabetically by caption, so sort on that:
+        # it reproduces the source column order instead of scattering the calcs to the end.
+        members.sort(key=lambda f: ((f.get("caption") or "").strip().casefold(),
+                                    (f.get("caption") or "").strip()))
     return members, dummy_count, has_param_swap, status
 
 
@@ -4583,7 +4663,12 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
             # derivations collapsed into a single identical reference (issue #103: Tableau's
             # "Avg. OTE" column vanished and the survivor reported the wrong grain).
             measure_binding=measure_binding, row_count_binding=row_count_binding,
-            column_binding=column_binding, date_binding=date_binding)
+            column_binding=column_binding, date_binding=date_binding,
+            # Every pill this view spends on a NAMED shelf or encoding. Only consulted when the
+            # Measure Names level is unfiltered and the member set has to be recovered from the
+            # view's own declarations -- it is what keeps a measure parked on Tooltip/Colour from
+            # being mistaken for a displayed Measure Values column.
+            used_instances=_placed_instance_ids(rows_text, cols_text, all_panes))
         visual_type, inject_shelf, fidelity_note = _route_measure_values(
             mark, locs, members, dummy_count, has_param_swap, mv_status,
             dims_rows, dims_cols, name, warnings)
