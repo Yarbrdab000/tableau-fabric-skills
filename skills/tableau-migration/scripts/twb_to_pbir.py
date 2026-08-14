@@ -9416,6 +9416,36 @@ def scatter_composite_key_name(dims):
     return SCATTER_KEY_PREFIX + " (" + " + ".join(p for p in parts if p) + ")"
 
 
+def discrete_colour_palettes(ir):
+    """``{measure caption: [(member, "#rrggbb"), ...]}`` -- AUTHORED colours for each discrete
+    colour measure this report paints with.
+
+    The model owns the hex-returning colour twin (it is a DAX measure), but only the REPORT layer
+    can see which colours the author assigned: Tableau stores them per worksheet as
+    ``<style-rule element='mark'><encoding attr='color'><map to='#hex'><bucket>"member"</bucket>``.
+    So the first viz pass exports them here and the model build consumes them, the same
+    report-informs-model channel the scatter composite grain key already uses.
+
+    Only an EXPLICIT per-member assignment is exported. A worksheet whose author never opened the
+    colour editor yields nothing, and the model then falls back to Tableau's own default categorical
+    assignment -- which is what such a worksheet actually renders, so the fallback is a faithful
+    reproduction rather than a guess. Returns ``{}`` for a report that paints nothing discretely.
+    """
+    out = {}
+    for ws in (ir or {}).get("worksheets") or []:
+        color = (ws.get("encodings") or {}).get("color") or {}
+        if not color.get("discrete_measure") or color.get("kind") != "value":
+            continue
+        caption = (color.get("caption") or "").strip()
+        palette = ws.get("mark_colors") or {}
+        members = [(m.get("value"), m.get("color"))
+                   for m in (palette.get("members") or [])
+                   if m.get("value") and m.get("color")]
+        if caption and members and caption not in out:
+            out[caption] = members
+    return out
+
+
 def scatter_composite_keys(ir):
     """``[{table, name, columns}]`` -- the composite grain keys this report's scatters need.
 

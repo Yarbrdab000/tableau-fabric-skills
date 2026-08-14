@@ -3068,6 +3068,28 @@ def _scatter_keys_from_ir(result):
         return []
 
 
+def _colour_palettes_from_ir(result):
+    """The AUTHORED discrete-colour palettes this workbook's IR carries, or ``{}``.
+
+    Pure reader of the first viz pass, mirroring ``_scatter_keys_from_ir``: only the report layer
+    can see a worksheet's ``<map to='#hex'>`` colour assignment, and only the model can own the
+    hex-returning twin measure, so the fact travels report -> model. Never raises: an IR that
+    cannot be read supplies no palette, and the twin falls back to Tableau's own default
+    categorical ramp (which is what an unauthored worksheet actually renders).
+    """
+    try:
+        ir = (result or {}).get("ir") if isinstance(result, dict) else None
+        if not ir:
+            return {}
+        try:
+            from . import twb_to_pbir as _tp
+        except ImportError:
+            import twb_to_pbir as _tp
+        return _tp.discrete_colour_palettes(ir) or {}
+    except Exception:
+        return {}
+
+
 def _storage_decision_subject(label, descriptor=None, combine_datasources=None):
     """Name the thing a storage decision is owed FOR, in a message a reader can act on.
 
@@ -3094,7 +3116,8 @@ def _storage_decision_subject(label, descriptor=None, combine_datasources=None):
 def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, model_safe, dest,
                            folder_rel, report_base, viz_name, viz=None, ds_catalog=None,
                            approved_calc_dax=None, wb_id=None, pbip_dir=None,
-                           descriptor=None, combine_datasources=None, storage_decisions=None):
+                           descriptor=None, combine_datasources=None, storage_decisions=None,
+                           semantic_colours=False):
     """Rebuild ONE embedded datasource into a self-contained ``.pbip`` and record it on ``entry``.
 
     Extracted verbatim from ``_attach_workbook_pbip`` so a workbook with several embedded datasources
@@ -3180,7 +3203,14 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                                  # dimensions. Read from the FIRST viz pass's IR, so the model emits
                                  # the key column before the second pass binds it. Empty (and the
                                  # model byte-identical) unless such a scatter exists.
-                                 scatter_keys=_scatter_keys_from_ir(result))
+                                 scatter_keys=_scatter_keys_from_ir(result),
+                                 # The author's own discrete colour assignments, read from the
+                                 # first viz pass so the model's colour twin paints the members the
+                                 # colours the workbook actually declares. Empty -> Tableau's own
+                                 # default categorical ramp, which is what an unauthored worksheet
+                                 # renders.
+                                 colour_palettes=_colour_palettes_from_ir(result),
+                                 semantic_colours=semantic_colours)
     except Exception as exc:
         warns.append(_PBIP_WARN + f"could not rebuild embedded datasource {label!r} "
                      f"({type(exc).__name__}: {exc}) -- workbook .pbip skipped")
@@ -3609,7 +3639,8 @@ def _locale_dependent_flatfile_warnings(twb_text, all_ds):
 
 
 def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None, ds_catalog=None,
-                          approved_calc_dax=None, wb_id=None, storage_decisions=None):
+                          approved_calc_dax=None, wb_id=None, storage_decisions=None,
+                          semantic_colours=False):
     """Build ONE openable, self-contained workbook ``.pbip`` project and record it on ``detail``.
 
     Every embedded datasource in the workbook is rebuilt into a SINGLE semantic model. A workbook with
@@ -3665,7 +3696,8 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
                                folder_rel=f"pbip/{safe_base}/{safe_base}.pbip", report_base=safe_base,
                                viz_name=viz_name, viz=viz, ds_catalog=ds_catalog,
                                approved_calc_dax=approved_calc_dax, wb_id=wb_id, pbip_dir=pbip_dir,
-                               storage_decisions=storage_decisions)
+                               storage_decisions=storage_decisions,
+                               semantic_colours=semantic_colours)
         return
 
     # MULTIPLE embedded datasources: rebuild ALL of them into ONE semantic model as disconnected table
@@ -3701,7 +3733,8 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
                            viz_name=viz_name, viz=viz, ds_catalog=ds_catalog,
                            approved_calc_dax=approved_calc_dax, wb_id=wb_id, pbip_dir=pbip_dir,
                            descriptor=combined, combine_datasources=all_ds,
-                           storage_decisions=storage_decisions)
+                           storage_decisions=storage_decisions,
+                           semantic_colours=semantic_colours)
 
 
 def _attach_viz_advice(detail, result, safe_base, reports_dir):
@@ -3732,7 +3765,7 @@ def _attach_viz_advice(detail, result, safe_base, reports_dir):
 
 def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir=None,
                           ds_catalog=None, approved_calc_dax=None, viz_advice=False,
-                          storage_decisions=None):
+                          storage_decisions=None, semantic_colours=False):
     """Run the optional viz stage for one workbook. Returns a report detail dict (never raises).
 
     Beyond the back-compatible bare ``reports/<Name>.Report`` write, when ``pbip_dir`` is given the
@@ -3817,6 +3850,7 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_di
     if parts and pbip_dir is not None:
         _attach_workbook_pbip(detail, text, result, safe_base, pbip_dir, viz=viz,
                           storage_decisions=storage_decisions,
+                          semantic_colours=semantic_colours,
                               ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax, wb_id=wb_id)
     return detail
 
@@ -3990,7 +4024,8 @@ def _second_compile_prepass(single, wb_id, approved_calc_dax, authored, output_d
 def migrate_workbook(source, *, write_to=None, wb_id=None, name=None, viz_stage=None,
                      approved_calc_dax=None, viz_advice=False, pbip=True,
                      ds_catalog=None, used_folders=None,
-                     second_compile=False, authored=None, layout=None, storage_decisions=None):
+                     second_compile=False, authored=None, layout=None, storage_decisions=None,
+                     semantic_colours=False):
     """Migrate ONE Tableau workbook into an openable Power BI project (model + bound report).
 
     This is the public workbook primitive -- the same faithful rebuild+bind the estate performs per
@@ -4054,7 +4089,8 @@ def migrate_workbook(source, *, write_to=None, wb_id=None, name=None, viz_stage=
 
     detail = _migrate_one_workbook(single, wb_id, viz, reports_dir, used_folders, pbip_dir,
                                    ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax,
-                                   viz_advice=viz_advice, storage_decisions=storage_decisions)
+                                   viz_advice=viz_advice, storage_decisions=storage_decisions,
+                                   semantic_colours=semantic_colours)
     if sc_detail is not None:
         detail["second_compile"] = sc_detail
     return detail
@@ -4451,7 +4487,8 @@ def _build_input_manifest(source, ds_ids, wb_ids):
 
 def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan=None,
                    rebind_bind_stage=None, approved_calc_dax=None, viz_advice=False,
-                   second_compile=False, authored=None, layout=None, storage_decisions=None):
+                   second_compile=False, authored=None, layout=None, storage_decisions=None,
+                   semantic_colours=False):
     """Run the whole estate migration and write the output bundle. Returns the report dict.
 
     ``source`` is any :class:`TableauSource`. ``output_dir`` receives::
@@ -4527,7 +4564,8 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
                                    approved_calc_dax=approved_calc_dax, viz_advice=viz_advice,
                                    pbip=pbip, ds_catalog=ds_catalog, used_folders=used_folders,
                                    second_compile=second_compile, authored=authored,
-                                   storage_decisions=storage_decisions)
+                                   storage_decisions=storage_decisions,
+                                   semantic_colours=semantic_colours)
                   for wb_id in wb_ids]
 
     summary = _summarize(ds_details, wb_details, viz is not None)
@@ -5603,6 +5641,15 @@ def main(argv=None):
                         help="also write a reports/<Name>.viz-advice.json sidecar per workbook with "
                              "ranked alternative chart types per visual (Tier-2 viz advisor; "
                              "deterministic, additive, never alters the rebuilt PBIR)")
+    parser.add_argument("--semantic-colours", "--semantic-colors", dest="semantic_colours",
+                        action="store_true",
+                        help="paint an UNAUTHORED two-member polarity colour domain "
+                             "(negative/positive, loss/profit, fail/pass, ...) semantic red/green "
+                             "instead of Tableau's default categorical ramp. Off by default: a "
+                             "workbook that authors no palette still RENDERS in Tableau's own "
+                             "colours, so the default reproduces the source rather than "
+                             "reinterpreting it. An explicitly authored palette always wins over "
+                             "both, with or without this flag")
     parser.add_argument("--second-compile", action="store_true",
                         help="turn on the SECOND-COMPILER landing pre-pass per workbook: land "
                              "keystone-dependent stub calcs as faithful, gated DAX (from the engine's "
@@ -5717,7 +5764,8 @@ def main(argv=None):
     report = migrate_estate(source, args.output, pbip=not args.no_pbip,
                             approved_calc_dax=approved_calc_dax, viz_advice=args.viz_advice,
                             second_compile=second_compile, authored=authored,
-                            layout=args.layout, storage_decisions=storage_decisions)
+                            layout=args.layout, storage_decisions=storage_decisions,
+                            semantic_colours=args.semantic_colours)
     s = report["summary"]
     print(
         f"Datasources: {s['datasources_migrated']}/{s['datasources_total']} migrated "

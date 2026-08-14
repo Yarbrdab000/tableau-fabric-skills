@@ -120,3 +120,85 @@ class TestTheDriverIsNotAColumn:
         color = _table_ir("Automatic")["worksheets"][0]["encodings"]["color"]
         assert color["discrete_measure"] is True
         assert color["kind"] == "value" and color["binding"] == "measure"
+
+
+class TestItIsDiscreteNeverAGradient:
+    """The 2.127.0 trap, re-guarded for a STRING domain.
+
+    A discrete pill on Colour was once rebuilt as a `linearGradient3`. Power BI evaluates MIN/MAX
+    over the fill input to find the ramp's endpoints, cannot do that to a non-numeric driver, and
+    the visual dies at query time with "Error fetching data for this visual" -- through a PBIR
+    validation that reports zero errors. A two-member string domain has no ordering to interpolate,
+    so a gradient over it is not merely wrong, it is fatal.
+    """
+
+    def test_a_matrix_carries_no_gradient_for_a_string_domain(self):
+        import json
+        visual = _visual(_table_ir("Automatic"))
+        blob = json.dumps(visual)
+        assert "linearGradient" not in blob
+        assert "FillRule" not in blob, "a FillRule is the gradient shape; this must be Field value"
+
+    def test_the_worksheet_never_synthesises_a_colour_gradient(self):
+        assert _table_ir("Automatic")["worksheets"][0]["color_gradient"] is None
+
+    def test_the_gradient_guard_refuses_a_string_driver_outright(self):
+        import twb_to_pbir as R
+        color = _table_ir("Automatic")["worksheets"][0]["encodings"]["color"]
+        assert R._gradient_input_is_safe(color) is False
+
+
+class TestTheSameTwinServesMarksAndBars:
+    """One model-side hex twin, every visual family -- "cells or bars or marks or whatever"."""
+
+    def _chart_ir(self, mark):
+        enc = "<encodings><color column='[federated.abc].[usr:Calculation_sign:nk]' /></encodings>"
+        ws = _worksheet("Bars", mark,
+                        rows="[federated.abc].[sum:Profit:qk]",
+                        cols="[federated.abc].[none:Category:nk]",
+                        deps_extra=_INST + _LABEL_CALC, encodings=enc)
+        return parse_twb(_workbook(ws))
+
+    def test_a_bar_chart_fills_its_marks_from_the_same_twin(self):
+        objs = _visual(self._chart_ir("Bar"))["visual"]["objects"]
+        fill = objs["dataPoint"][0]["properties"]["fill"]["solid"]["color"]["expr"]
+        assert fill["Measure"] == {"Expression": {"SourceRef": {"Entity": "_Measures"}},
+                                   "Property": "Sign (colour)"}
+
+    def test_a_chart_mark_fill_carries_the_wildcard_selector(self):
+        # matchingOption 0 = every data point. Without it every mark paints identically.
+        objs = _visual(self._chart_ir("Bar"))["visual"]["objects"]
+        assert objs["dataPoint"][0]["selector"]["data"] == [
+            {"dataViewWildcard": {"matchingOption": 0}}]
+
+    def test_no_chart_family_falls_back_to_a_gradient(self):
+        import json
+        for mark in ("Bar", "Circle", "Automatic"):
+            blob = json.dumps(_visual(self._chart_ir(mark)))
+            assert "linearGradient" not in blob, mark
+
+
+def test_the_ir_exports_only_an_explicitly_authored_palette():
+    # The report->model channel. A worksheet whose author never opened the colour editor exports
+    # nothing, and the model then falls back to Tableau's own assignment.
+    import twb_to_pbir as R
+    assert R.discrete_colour_palettes(_table_ir("Automatic")) == {}
+    assert R.discrete_colour_palettes({"worksheets": []}) == {}
+    assert R.discrete_colour_palettes(None) == {}
+
+
+def test_an_authored_palette_reaches_the_model_channel():
+    import twb_to_pbir as R
+    style = ("<style><style-rule element='mark'>"
+             "<encoding attr='color' field='[federated.abc].[usr:Calculation_sign:nk]' "
+             "type='palette'>"
+             "<map to='#111111'><bucket>&quot;negative&quot;</bucket></map>"
+             "<map to='#222222'><bucket>&quot;positive&quot;</bucket></map>"
+             "</encoding></style-rule></style>")
+    ws = _worksheet("Coloured Table", "Automatic",
+                    rows="[federated.abc].[none:Region:nk]",
+                    cols="[federated.abc].[:Measure Names]",
+                    deps_extra=_INST + _LABEL_CALC, encodings=_ENC, filters=_MV_ALL_FILTER,
+                    style=style)
+    palettes = R.discrete_colour_palettes(parse_twb(_workbook(ws)))
+    assert palettes == {"Sign": [("negative", "#111111"), ("positive", "#222222")]}

@@ -104,3 +104,83 @@ class TestQuotingIsSafe:
             [_row("Q", 'IF(x, "say ""hi""", "no")')])[0]["dax"]
         # the member must survive as a valid DAX literal, doubled quotes and all
         assert '"say ""hi"""' in dax
+
+
+# -- palette resolution: authored > (opt-in) semantic > Tableau's own assignment ----------------
+class TestAuthoredPaletteWins:
+    def test_the_authors_own_colours_are_used_verbatim(self):
+        twin = A._categorical_colour_twin_measures(
+            [_row("Sign", 'IF(x, "negative", "positive")')],
+            colour_palettes={"Sign": [("negative", "#111111"), ("positive", "#222222")]})[0]
+        assert twin["dax"] == 'SWITCH([Sign], "negative", "#111111", "#222222")'
+        assert twin["source"]["palette_origin"] == "authored"
+
+    def test_the_match_is_case_insensitive_on_the_member(self):
+        twin = A._categorical_colour_twin_measures(
+            [_row("Sign", 'IF(x, "Negative", "Positive")')],
+            colour_palettes={"sign": [("NEGATIVE", "#111111"), ("positive", "#222222")]})[0]
+        assert twin["source"]["palette_origin"] == "authored"
+        assert "#111111" in twin["dax"] and "#222222" in twin["dax"]
+
+    def test_a_partial_assignment_is_refused_rather_than_mixed(self):
+        # Mixing would silently RECOLOUR the members the author did choose: the unassigned member
+        # takes a default slot and shifts the others' positions in the ramp.
+        twin = A._categorical_colour_twin_measures(
+            [_row("Sign", 'IF(x, "negative", "positive")')],
+            colour_palettes={"Sign": [("negative", "#111111")]})[0]
+        assert twin["source"]["palette_origin"] == "tableau_default"
+
+    def test_authored_beats_the_semantic_flag(self):
+        twin = A._categorical_colour_twin_measures(
+            [_row("Sign", 'IF(x, "negative", "positive")')],
+            colour_palettes={"Sign": [("negative", "#111111"), ("positive", "#222222")]},
+            semantic_colours=True)[0]
+        assert twin["source"]["palette_origin"] == "authored"
+
+
+class TestSemanticPaletteIsOptIn:
+    def test_off_by_default_the_source_hues_are_reproduced(self):
+        # An unauthored domain is NOT colourless -- Tableau paints it from its own ramp, and that
+        # is what the source workbook renders. Inventing red/green by default would make the
+        # rebuild differ in hue from the thing it reproduces.
+        twin = A._categorical_colour_twin_measures(
+            [_row("Sign", 'IF(x, "negative", "positive")')])[0]
+        assert twin["dax"] == 'SWITCH([Sign], "negative", "#4E79A7", "#F28E2B")'
+        assert twin["source"]["palette_origin"] == "tableau_default"
+
+    def test_on_a_polarity_domain_becomes_red_and_green(self):
+        twin = A._categorical_colour_twin_measures(
+            [_row("Sign", 'IF(x, "negative", "positive")')], semantic_colours=True)[0]
+        assert twin["dax"] == 'SWITCH([Sign], "negative", "#D62728", "#2CA02C")'
+        assert twin["source"]["palette_origin"] == "semantic"
+
+    def test_the_pole_follows_the_member_not_its_position(self):
+        # positive first in the formula -> green must still land on "positive".
+        twin = A._categorical_colour_twin_measures(
+            [_row("Sign", 'IF(x, "positive", "negative")')], semantic_colours=True)[0]
+        assert twin["dax"] == 'SWITCH([Sign], "positive", "#2CA02C", "#D62728")'
+
+    def test_other_polarity_vocabularies_are_recognised(self):
+        for neg, pos in (("loss", "profit"), ("fail", "pass"), ("below", "above")):
+            twin = A._categorical_colour_twin_measures(
+                [_row("B", 'IF(x, "%s", "%s")' % (neg, pos))], semantic_colours=True)[0]
+            assert twin["source"]["palette_origin"] == "semantic"
+            assert "#D62728" in twin["dax"] and "#2CA02C" in twin["dax"]
+
+    def test_a_domain_that_is_not_a_polarity_is_left_alone(self):
+        # "East"/"West" is two members, not good and bad -- painting it red/green would assert a
+        # meaning the author never stated.
+        twin = A._categorical_colour_twin_measures(
+            [_row("Region", 'IF(x, "East", "West")')], semantic_colours=True)[0]
+        assert twin["source"]["palette_origin"] == "tableau_default"
+
+    def test_a_three_member_domain_is_not_a_polarity(self):
+        twin = A._categorical_colour_twin_measures(
+            [_row("B", 'SWITCH(TRUE(), a, "negative", b, "positive", "flat")')],
+            semantic_colours=True)[0]
+        assert twin["source"]["palette_origin"] == "tableau_default"
+
+    def test_both_poles_must_be_recognised(self):
+        # one recognised member is not a polarity domain
+        assert A._semantic_polarity_palette(["negative", "somethingelse"]) is None
+        assert A._semantic_polarity_palette(["negative", "loss"]) is None, "same pole twice"

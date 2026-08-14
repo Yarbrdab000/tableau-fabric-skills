@@ -14,6 +14,43 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.145.0` → `2.146.0`): the discrete colour palette is the AUTHOR's,
+  with an opt-in semantic red/green for polarity domains.** The colour twin landed in `2.144.0`
+  always used Tableau's default categorical ramp. That is right for an unauthored domain — and
+  wrong the moment the author opened Tableau's colour editor, because their assignment lives in the
+  worksheet (`<style-rule element='mark'><encoding attr='color'><map to='#hex'><bucket>`) where only
+  the report layer can see it, while the twin is a DAX measure only the model can own.
+
+  So the first viz pass now exports `discrete_colour_palettes(ir)` and the model build consumes it —
+  the same report-informs-model channel the scatter composite grain key already uses. Resolution is
+  three-tier and the tier that fired is recorded on the measure
+  (`TranslatedBy = deterministic (categorical colour measure, <origin> palette)`), so a default is
+  never presented as the author's choice:
+
+  1. **`authored`** — the workbook's own per-member colours. Always wins. A *partial* assignment is
+     refused rather than mixed with defaults: filling the gaps from the ramp would shift the
+     members the author *did* choose into different slots and silently recolour them.
+  2. **`semantic`** — opt-in via `--semantic-colours`: red `#D62728` / green `#2CA02C` for a domain
+     of exactly two recognised, opposite polarity members (`negative`/`positive`, `loss`/`profit`,
+     `fail`/`pass`, `below`/`above`, …). Both poles must be recognised, so `East`/`West` is never
+     painted as if it meant good and bad.
+  3. **`tableau_default`** — Tableau's own categorical ramp in sorted member order. **The default**,
+     because a workbook that authors no palette is not colourless: Tableau paints it from that ramp
+     and that is what the source actually renders, so reproducing it keeps the rebuild faithful.
+
+  Verified by render both ways on the same workbook: the default build draws negative rows blue and
+  positive orange (matching the Tableau reference exactly), and `--semantic-colours` draws them red
+  and green. In both, the colour is **discrete** — one solid colour per member, bound as
+  `Field value`. Explicitly regression-guarded against the `2.127.0` trap: a string domain must
+  never acquire a `linearGradient`/`FillRule`, on a matrix or on a chart, because Power BI evaluates
+  MIN/MAX over the fill input to find a ramp's endpoints, cannot do that to a string, and kills the
+  visual at query time through a validation that reports zero errors.
+
+  The same single twin drives every family — matrix cells (`values[].fontColor`/`backColor`, chosen
+  by the mark) and chart marks (`dataPoint.fill`) — so bars, circles and cells all follow the one
+  encoding. Across the 29-workbook corpus this changes no colour and no metric: the one existing
+  twin gains its `tableau_default` disclosure and nothing else moves.
+
 - **`tableau-migration` (skill `2.144.0` → `2.145.0`): a report with no pages CRASHES Power BI
   Desktop, so one is never emitted again.** A PBIR whose `pages.json` carries `"pageOrder": []`
   does not open as an empty report — Desktop throws
