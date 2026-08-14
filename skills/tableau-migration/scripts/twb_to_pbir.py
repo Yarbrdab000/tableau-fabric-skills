@@ -11389,6 +11389,12 @@ def _page_json(name, display_name, canvas_fill=None):
     return page
 
 
+# The display name of the placeholder page a page-less report ships so Desktop can open it. Named
+# so a reader who opens the project knows immediately that nothing was rebuilt, rather than
+# wondering which page is missing.
+_EMPTY_REPORT_PAGE_NAME = "No visuals rebuilt"
+
+
 def _emit_page(parts, page_name, display_name, visuals, canvas_fill=None):
     """Write a page.json plus its visual.json parts; ``visuals`` is a list of dicts."""
     base = f"definition/pages/{page_name}"
@@ -12572,6 +12578,24 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         visuals = [main] + _emit_slicers([ws], page_name, model_table, field_map, warnings)
         _emit_page(parts, page_name, ws["name"], visuals)
         page_order.append(page_name)
+
+    # ZERO-PAGE CRASH GUARD. A PBIR whose ``pageOrder`` is empty does not open EMPTY -- Power BI
+    # Desktop throws ``TypeError: Cannot read properties of undefined (reading 'visualContainers')``
+    # and the project fails to open at all, which takes the correctly built semantic model beside it
+    # out of reach too. So a run where every worksheet deferred still ships ONE page.
+    #
+    # Deliberately a page with NO visuals: the emit gate's contract -- "an unsupported mark / a
+    # chart missing a required role emits no visual" -- is exactly right and stays intact. This adds
+    # the container Desktop requires, never a visual the gate refused.
+    if not page_order:
+        _placeholder = _sanitize("page-empty")
+        _emit_page(parts, _placeholder, _EMPTY_REPORT_PAGE_NAME, [])
+        page_order.append(_placeholder)
+        warnings.append(_warn(
+            "workbook", ir.get("name") or "workbook",
+            "no worksheet could be rebuilt, so the report carries a single empty placeholder page: "
+            "a PBIR with no pages CRASHES Power BI Desktop on open (it does not open empty), which "
+            "would also put the semantic model built beside it out of reach"))
 
     parts["definition/pages/pages.json"] = _dumps({
         "$schema": SCHEMA_PAGES,

@@ -3496,6 +3496,11 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                   bound_model=model_safe,
                   column_prune=res_report.get("column_prune"),
                   model_translation_handoff=res_report.get("translation_handoff"))
+    # How many pages the emitted report declares. A report is only openable if it declares at least
+    # one -- Desktop crashes on an empty ``pageOrder`` rather than opening an empty report -- so this
+    # feeds the definition-of-done's loud openability gate. Additive; read from the written PBIR so
+    # it reflects what actually landed on disk, not what the emitter intended.
+    entry["pbip_page_count"] = _pbir_page_count(dest)
     # Surface the model's structural openability self-check (produced by the datasource build) onto the
     # entry so the workbook definition-of-done can FAIL LOUD when a report bound to a non-openable model
     # (e.g. a duplicate column that survived to TMDL) is produced -- a built .pbip is not the same as an
@@ -4805,8 +4810,28 @@ def _dod_warn_reasons(w):
     return reasons
 
 
+def _pbir_page_count(pbip_dest):
+    """Pages declared by the PBIR written under ``pbip_dest``, or ``None`` when unreadable.
+
+    Reads the report's own ``pages.json`` ``pageOrder`` from disk, so the count reflects what
+    actually landed rather than what the emitter meant to write. ``None`` (not ``0``) on any
+    absent/malformed input, so an unreadable report never manufactures a false openability failure.
+    """
+    import glob
+
+    try:
+        hits = glob.glob(os.path.join(pbip_dest, "*.Report", "definition", "pages", "pages.json"))
+        if not hits:
+            return None
+        with open(hits[0], encoding="utf-8-sig") as fh:
+            order = json.load(fh).get("pageOrder")
+        return len(order) if isinstance(order, list) else None
+    except Exception:
+        return None
+
+
 def _dod_openability_failure(w):
-    """A loud reason a workbook's bound model is structurally NOT openable, or ``None`` if it is.
+    """A loud reason a workbook's bound ``.pbip`` is structurally NOT openable, or ``None``.
 
     Reads the ``openability_selfcheck`` (``{"ok", "checks", "issues"}``) recorded on the workbook detail
     (single-datasource path) AND on each ``datasource_pbips`` entry (consolidated path). A built ``.pbip``
@@ -4831,6 +4856,15 @@ def _dod_openability_failure(w):
         if failed:
             return "model is not openable: failed " + ", ".join(sorted(failed))
         return "model is not openable"
+    # A page-less REPORT is the same class of defect on the other side of the project: Power BI
+    # Desktop does not open it as an empty report, it throws ``TypeError: Cannot read properties of
+    # undefined (reading 'visualContainers')`` and the whole project -- including the model that IS
+    # correct -- becomes unreachable. So it fails LOUD rather than being softened to "N visual(s)
+    # rebuilt with warnings", which is what let a crashing project report a green-ish warn.
+    pages = w.get("pbip_page_count")
+    if isinstance(pages, int) and pages <= 0:
+        return ("report is not openable: it declares no pages -- Power BI Desktop crashes on a PBIR "
+                "with an empty pageOrder rather than opening it empty")
     return None
 
 

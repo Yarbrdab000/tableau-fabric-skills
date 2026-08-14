@@ -14,6 +14,40 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.144.0` → `2.145.0`): a report with no pages CRASHES Power BI
+  Desktop, so one is never emitted again.** A PBIR whose `pages.json` carries `"pageOrder": []`
+  does not open as an empty report — Desktop throws
+  `TypeError: Cannot read properties of undefined (reading 'visualContainers')` and refuses the
+  project outright. That is worse than an empty report, because the semantic model built beside it
+  in the same `.pbip` becomes unreachable too: a correct model, lost to a missing page.
+
+  Measured on `Logic example 4` at this branch's base (`56a7ef5`, skill `2.141.0`): its shipped
+  `.pbip` carried `pageOrder: []` with no page folders at all — its one worksheet had been refused —
+  and the definition-of-done reported this as `warn`, not a failure. (`2.143.0` fixes the *cause*
+  for that workbook; this guards the failure mode itself, which any fully-deferred workbook can
+  still reach.)
+
+  Scope of the corpus check, stated plainly: **the guard catches no crashing `.pbip` in the
+  29-workbook corpus** — every shipped project there declares pages both before and after this
+  change. The only page-less artifact is `reports/0068_market_basket.Report`, the **pre-rebind** viz
+  pass, which is not what ships (its `.pbip` has three pages, unchanged by this work). That is still
+  worth guarding, because it is a malformed PBIR and it is the folder a report upload consumes, but
+  it is not corpus evidence of the crash. The justification is the reproduced `Logic example 4`
+  case above.
+
+  Three guards, because the first alone would not keep it from coming back:
+
+  1. The emitter ships one placeholder page (`No visuals rebuilt`) when nothing was rebuilt —
+     **scoped** so the emit gate's own contract is untouched: an unsupported mark, a chart missing a
+     required role and a deliberately deferred shape still emit **no visual**. The placeholder adds
+     the container Desktop requires, never a visual the gate refused.
+  2. `pbir_lint` flags an empty `pageOrder` (validity R7). `powerbi-report-author validate` does
+     catch this as `PBIR_PAGE_ORDER_EMPTY`, but it is an opt-in npm pre-gate an ordinary run never
+     reaches, whereas the hermetic linter runs in the always-on pytest gate.
+  3. The definition-of-done reports a page-less report as **`failed`**, alongside a model that will
+     not load, rather than softening it to a fidelity `warn`. Fail-safe: an unreadable page count is
+     never treated as zero, so it cannot manufacture a false failure.
+
 - **`tableau-migration` (skill `2.143.0` → `2.144.0`): a text table's conditional colouring is
   carried, and it colours the TEXT — not the cell background.** Tableau's ordinary way to
   colour-code a crosstab is a calc that returns a *label* —
