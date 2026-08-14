@@ -52,7 +52,8 @@ from datetime import datetime, timezone
 try:  # works whether imported as a package or run with scripts/ on sys.path
     from .connection_to_m import (parse_tds, locale_dependent_flatfile_relations, extract_bundled_flatfile, extract_calcs,
                                   combine_descriptors)
-    from .storage_mode import select_storage_mode, FALLBACK_NEEDS_DECISION
+    from .storage_mode import (select_storage_mode, normalize_storage_decision,
+                                FALLBACK_LAND_TO_DELTA, FALLBACK_NEEDS_DECISION)
     from .assemble_model import (assemble_import_model, assemble_local_import_model,
                                  materialize_bundled_flatfile_data, write_model_folder,
                                  write_local_pbip, migrate_datasource, list_workbook_datasources,
@@ -65,7 +66,8 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
 except ImportError:
     from connection_to_m import (parse_tds, locale_dependent_flatfile_relations, extract_bundled_flatfile, extract_calcs,
                                  combine_descriptors)
-    from storage_mode import select_storage_mode, FALLBACK_NEEDS_DECISION
+    from storage_mode import (select_storage_mode, normalize_storage_decision,
+                               FALLBACK_LAND_TO_DELTA, FALLBACK_NEEDS_DECISION)
     from assemble_model import (assemble_import_model, assemble_local_import_model,
                                 materialize_bundled_flatfile_data, write_model_folder,
                                 write_local_pbip, migrate_datasource, list_workbook_datasources,
@@ -765,7 +767,7 @@ def _resolve_viz_stage(injected, layout=None):
 
 
 def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, ds_catalog=None,
-                            approved_calc_dax=None):
+                            approved_calc_dax=None, storage_decisions=None):
     """Drive the full per-datasource pipeline. Returns a report detail dict (never raises).
 
     When ``ds_catalog`` is given, a successfully migrated datasource records its source text +
@@ -792,7 +794,10 @@ def _migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir=None, 
         parameters = parse_parameters(text)
     except Exception:
         parameters = []
-    decision = select_storage_mode(descriptor)
+    decision = select_storage_mode(
+        descriptor,
+        storage_decision=_storage_decision_for(descriptor.get("datasource_name") or name, 
+                                              storage_decisions))
     detail.update(connector=connector, skipped_calcs=skipped_calcs, dim_calcs=dim_calcs)
 
     if decision.get("mode") is None:
@@ -3083,7 +3088,7 @@ def _storage_decision_subject(label, descriptor=None, combine_datasources=None):
 def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, model_safe, dest,
                            folder_rel, report_base, viz_name, viz=None, ds_catalog=None,
                            approved_calc_dax=None, wb_id=None, pbip_dir=None,
-                           descriptor=None, combine_datasources=None):
+                           descriptor=None, combine_datasources=None, storage_decisions=None):
     """Rebuild ONE embedded datasource into a self-contained ``.pbip`` and record it on ``entry``.
 
     Extracted verbatim from ``_attach_workbook_pbip`` so a workbook with several embedded datasources
@@ -3158,6 +3163,7 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
             calcs = dim_calcs = None
     try:
         res = migrate_datasource(twb_text, model_name=model_safe,
+                                 storage_decision=_storage_decision_for(label, storage_decisions),
                                  datasource=(None if descriptor is not None else label),
                                  descriptor=descriptor,
                                  calcs=calcs, dim_calcs=dim_calcs,
@@ -3210,9 +3216,31 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                 res = recovered
                 res_report = res.get("report") or {}
         if res_report.get("fallback"):
-            rationale = (res_report.get("storage_decision") or {}).get("rationale") or "undoable shape"
+            _dec = res_report.get("storage_decision") or {}
+            rationale = _dec.get("rationale") or "undoable shape"
+            subject = _storage_decision_subject(label, descriptor, combine_datasources)
+            # An OPERATOR-supplied DirectLake decision is an outcome, not an unanswered question:
+            # the answer WAS given, and what it produces is a landing plan rather than a model. The
+            # plan has to reach disk -- promising one in a warning and writing nothing is exactly
+            # the silent gap #116 reported. Everything else keeps the original demand wording.
+            if _dec.get("fallback") == FALLBACK_LAND_TO_DELTA and res_report.get("landing_plan"):
+                plan_rel = f"landing_plans/{model_safe}.landing_plan.json"
+                try:
+                    plan_abs = os.path.join(pbip_dir or dest, os.pardir, plan_rel)
+                    plan_abs = os.path.normpath(plan_abs)
+                    os.makedirs(os.path.dirname(plan_abs), exist_ok=True)
+                    with open(plan_abs, "w", encoding="utf-8") as fh:
+                        json.dump(res_report["landing_plan"], fh, indent=2)
+                    entry["landing_plan"] = plan_rel
+                    warns.append(_PBIP_WARN + f"{subject} was resolved by an OPERATOR DECISION to "
+                                 f"land-to-Delta + DirectLake, so a landing plan was written to "
+                                 f"{plan_rel} instead of a direct-upstream model ({rationale})")
+                except OSError as exc:
+                    warns.append(_PBIP_WARN + f"{subject} chose land-to-Delta + DirectLake but its "
+                                 f"landing plan could not be written ({exc}) ({rationale})")
+                return
             warns.append(_PBIP_WARN
-                         + f"{_storage_decision_subject(label, descriptor, combine_datasources)} "
+                         + f"{subject} "
                          f"needs a storage decision ({rationale}) "
                          f"-- workbook .pbip skipped (model lands separately)")
             return
@@ -3570,7 +3598,7 @@ def _locale_dependent_flatfile_warnings(twb_text, all_ds):
 
 
 def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=None, ds_catalog=None,
-                          approved_calc_dax=None, wb_id=None):
+                          approved_calc_dax=None, wb_id=None, storage_decisions=None):
     """Build ONE openable, self-contained workbook ``.pbip`` project and record it on ``detail``.
 
     Every embedded datasource in the workbook is rebuilt into a SINGLE semantic model. A workbook with
@@ -3625,7 +3653,8 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
                                model_safe=model_safe, dest=os.path.join(pbip_dir, safe_base),
                                folder_rel=f"pbip/{safe_base}/{safe_base}.pbip", report_base=safe_base,
                                viz_name=viz_name, viz=viz, ds_catalog=ds_catalog,
-                               approved_calc_dax=approved_calc_dax, wb_id=wb_id, pbip_dir=pbip_dir)
+                               approved_calc_dax=approved_calc_dax, wb_id=wb_id, pbip_dir=pbip_dir,
+                               storage_decisions=storage_decisions)
         return
 
     # MULTIPLE embedded datasources: rebuild ALL of them into ONE semantic model as disconnected table
@@ -3660,7 +3689,8 @@ def _attach_workbook_pbip(detail, twb_text, result, safe_base, pbip_dir, viz=Non
                            folder_rel=f"pbip/{safe_base}/{safe_base}.pbip", report_base=safe_base,
                            viz_name=viz_name, viz=viz, ds_catalog=ds_catalog,
                            approved_calc_dax=approved_calc_dax, wb_id=wb_id, pbip_dir=pbip_dir,
-                           descriptor=combined, combine_datasources=all_ds)
+                           descriptor=combined, combine_datasources=all_ds,
+                           storage_decisions=storage_decisions)
 
 
 def _attach_viz_advice(detail, result, safe_base, reports_dir):
@@ -3690,7 +3720,8 @@ def _attach_viz_advice(detail, result, safe_base, reports_dir):
 
 
 def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_dir=None,
-                          ds_catalog=None, approved_calc_dax=None, viz_advice=False):
+                          ds_catalog=None, approved_calc_dax=None, viz_advice=False,
+                          storage_decisions=None):
     """Run the optional viz stage for one workbook. Returns a report detail dict (never raises).
 
     Beyond the back-compatible bare ``reports/<Name>.Report`` write, when ``pbip_dir`` is given the
@@ -3774,6 +3805,7 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_di
 
     if parts and pbip_dir is not None:
         _attach_workbook_pbip(detail, text, result, safe_base, pbip_dir, viz=viz,
+                          storage_decisions=storage_decisions,
                               ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax, wb_id=wb_id)
     return detail
 
@@ -3947,7 +3979,7 @@ def _second_compile_prepass(single, wb_id, approved_calc_dax, authored, output_d
 def migrate_workbook(source, *, write_to=None, wb_id=None, name=None, viz_stage=None,
                      approved_calc_dax=None, viz_advice=False, pbip=True,
                      ds_catalog=None, used_folders=None,
-                     second_compile=False, authored=None, layout=None):
+                     second_compile=False, authored=None, layout=None, storage_decisions=None):
     """Migrate ONE Tableau workbook into an openable Power BI project (model + bound report).
 
     This is the public workbook primitive -- the same faithful rebuild+bind the estate performs per
@@ -4011,7 +4043,7 @@ def migrate_workbook(source, *, write_to=None, wb_id=None, name=None, viz_stage=
 
     detail = _migrate_one_workbook(single, wb_id, viz, reports_dir, used_folders, pbip_dir,
                                    ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax,
-                                   viz_advice=viz_advice)
+                                   viz_advice=viz_advice, storage_decisions=storage_decisions)
     if sc_detail is not None:
         detail["second_compile"] = sc_detail
     return detail
@@ -4408,7 +4440,7 @@ def _build_input_manifest(source, ds_ids, wb_ids):
 
 def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan=None,
                    rebind_bind_stage=None, approved_calc_dax=None, viz_advice=False,
-                   second_compile=False, authored=None, layout=None):
+                   second_compile=False, authored=None, layout=None, storage_decisions=None):
     """Run the whole estate migration and write the output bundle. Returns the report dict.
 
     ``source`` is any :class:`TableauSource`. ``output_dir`` receives::
@@ -4477,12 +4509,14 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
     wb_ids = source.list_workbooks()
     ds_details = [_migrate_one_datasource(source, ds_id, sm_dir, used_folders, pbip_dir,
                                           ds_catalog=ds_catalog,
-                                          approved_calc_dax=approved_calc_dax)
+                                          approved_calc_dax=approved_calc_dax,
+                                          storage_decisions=storage_decisions)
                   for ds_id in ds_ids]
     wb_details = [migrate_workbook(source, write_to=output_dir, wb_id=wb_id, viz_stage=viz,
                                    approved_calc_dax=approved_calc_dax, viz_advice=viz_advice,
                                    pbip=pbip, ds_catalog=ds_catalog, used_folders=used_folders,
-                                   second_compile=second_compile, authored=authored)
+                                   second_compile=second_compile, authored=authored,
+                                   storage_decisions=storage_decisions)
                   for wb_id in wb_ids]
 
     summary = _summarize(ds_details, wb_details, viz is not None)
@@ -5349,6 +5383,55 @@ def _render_summary_md(report):
 
 
 # -- CLI -----------------------------------------------------------------------
+def _load_storage_decisions(path, accept_recommended=False):
+    """Load the operator's answers to ``needs-storage-decision`` (issue #116).
+
+    ``needs-storage-decision`` was terminal on the batch path: the message correctly demanded a
+    choice and there was nowhere to put the answer, so 37% of a real 38-workbook estate ended with
+    no model and no report. This is the seam that carries the answer, mirroring ``--approved-dax``
+    (which already supplies caller decisions per calc).
+
+    The JSON maps a datasource caption/name to ``"Import"``, ``"DirectQuery"``, ``"DirectLake"`` or
+    ``"recommended"``; the key ``"*"`` sets a default for every datasource that has no explicit
+    entry. ``accept_recommended`` is the blanket opt-in (``--accept-recommended-storage``) and is
+    exactly ``{"*": "recommended"}`` -- an explicit per-datasource entry still wins over it.
+
+    Returns ``None`` when nothing was supplied, so the run is byte-identical to today's. Raises
+    ``ValueError`` (fail-fast) on a missing/unreadable file or an unrecognised mode -- a typo must
+    not silently reproduce the dead end the flag exists to resolve. Tolerates a UTF-8 BOM.
+    """
+    data = {}
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8-sig") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            raise ValueError(f"--storage-decision file not found: {path}")
+        except (OSError, ValueError) as exc:  # ValueError covers json.JSONDecodeError
+            raise ValueError(f"--storage-decision file is not readable JSON ({path}): {exc}")
+        if not isinstance(data, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+            raise ValueError(
+                "--storage-decision JSON must map datasource name -> one of Import, DirectQuery, "
+                f'DirectLake, recommended (use "*" for a default) ({path})')
+    out = {}
+    for key, value in data.items():
+        try:
+            out[key.strip().lower()] = normalize_storage_decision(value)
+        except ValueError as exc:
+            raise ValueError(f"--storage-decision {key!r}: {exc}")
+    if accept_recommended:
+        out.setdefault("*", "recommended")
+    return out or None
+
+
+def _storage_decision_for(name, decisions):
+    """The operator's answer for one datasource: its own entry, else the ``"*"`` default, else None."""
+    if not decisions:
+        return None
+    return decisions.get((name or "").strip().lower()) or decisions.get("*")
+
+
 def _load_approved_dax(path):
     """Load a mapping of human-approved assisted translations from a JSON file.
 
@@ -5499,6 +5582,19 @@ def main(argv=None):
                         help="build even if <output> already holds a prior report.json (overwrite "
                              "in place); the default is to STOP so a new run never silently mixes "
                              "with a previous run's stale outputs")
+    parser.add_argument("--storage-decision", metavar="JSON",
+                        help="path to a JSON file supplying the operator's answer to a "
+                             "'needs-storage-decision' outcome, mapping datasource name -> one of "
+                             "Import, DirectQuery, DirectLake, recommended (use \"*\" for a "
+                             "default). Only an outcome that ASKED for a decision is overridden; a "
+                             "mode the engine chose confidently is left alone, and a datasource "
+                             "whose schema could not be read is refused (supply a connection "
+                             "instead). DirectLake emits a landing plan, never data")
+    parser.add_argument("--accept-recommended-storage", action="store_true",
+                        help="blanket opt-in: apply each needs-storage-decision datasource's own "
+                             "already-computed recommended_mode. Equivalent to "
+                             '--storage-decision with {"*": "recommended"}; an explicit '
+                             "per-datasource entry still wins")
     parser.add_argument("--layout", choices=("legacy", "solver"), default="solver",
                         help="dashboard zone-layout engine. 'solver' (default) resolves the whole "
                              "zone TREE, so sibling zones cannot overlap by construction and fewer "
@@ -5519,6 +5615,12 @@ def main(argv=None):
     except ValueError as exc:
         parser.error(str(exc))
     second_compile = bool(args.second_compile or authored)
+
+    try:
+        storage_decisions = _load_storage_decisions(args.storage_decision,
+                                                    args.accept_recommended_storage)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Fail fast on an input path that cannot possibly hold Tableau exports. Without this a typo'd
     # -i silently produced an EMPTY bundle and exited 0 -- "Bundle written to: ..." with 0/0
@@ -5575,7 +5677,7 @@ def main(argv=None):
     report = migrate_estate(source, args.output, pbip=not args.no_pbip,
                             approved_calc_dax=approved_calc_dax, viz_advice=args.viz_advice,
                             second_compile=second_compile, authored=authored,
-                            layout=args.layout)
+                            layout=args.layout, storage_decisions=storage_decisions)
     s = report["summary"]
     print(
         f"Datasources: {s['datasources_migrated']}/{s['datasources_total']} migrated "

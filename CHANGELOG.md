@@ -12,6 +12,52 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+
+- **`tableau-migration` (skill `2.139.0` → `2.140.0`): `needs-storage-decision` is no longer
+  terminal — the decision it demands can now be supplied.** Reported in #116, with both halves
+  traced in code rather than inferred from behaviour, and both exactly right:
+
+  * `select_storage_mode(descriptor)` took only a descriptor, and no `migrate_estate.py` flag
+    carried a storage decision, so an operator who *had* made the choice had nowhere to put it;
+  * `FALLBACK_LAND_TO_DELTA` was **read** by `assemble_model` and **assigned by nothing** — the
+    documented "explicit opt-in" to DirectLake branched on a value the engine could not produce.
+
+  Measured by the reporter at **14 of 38 workbooks — 37% of a real estate** — ending with no model
+  and no report, while the message told them a choice was available.
+
+  Two routes, either of which closes it (the issue's own suggestions 1 and 2):
+
+  ```
+  --storage-decision <json>        {"Big Data Source": "DirectLake", "*": "Import"}
+  --accept-recommended-storage     apply each datasource's already-computed recommended_mode
+  ```
+
+  An answer is honoured only where one was actually demanded. A mode the engine chose confidently is
+  returned untouched — this seam supplies a MISSING decision, it does not second-guess a made one —
+  and a `schema-not-visible` datasource is refused outright, because "Import" is not a choice you can
+  make about a model that cannot be typed at all. A misspelt answer raises instead of being ignored,
+  since silently dropping it would reproduce the very dead end the flag exists to clear. Every
+  outcome is stamped `storage_decision` / `storage_decision_applied` / `storage_decision_note`, and
+  the original rationale is prepended to rather than replaced, so the summary still says why a
+  decision was demanded.
+
+  **What is deliberately NOT changed: DirectLake is still never auto-selected.** Silently landing a
+  customer's data in Delta because a CSV path went stale is a far worse failure than stopping.
+  Nothing here fires without an explicit operator answer.
+
+  Verified end to end on the reported shape: `--accept-recommended-storage` takes a previously
+  terminal workbook **0/1 → 1/1** with an openable `.pbip`, and `--storage-decision {"*":
+  "DirectLake"}` writes a real 8-table landing plan to `landing_plans/<wb>.landing_plan.json`. That
+  last part was a second gap found while fixing the first: the DirectLake branch computed a plan and
+  never wrote it anywhere, so the warning promised an artifact that did not exist. It is now written,
+  recorded on the entry, and the message reports an outcome ("was resolved by an OPERATOR DECISION
+  to…") instead of still demanding a decision that was already given.
+
+  **Corpus: zero drift.** With no flag passed the run is a strict no-op — 29/29 built, every summary
+  metric identical, and all 136 emitted table files byte-identical once per-run `lineageTag` GUIDs
+  and the output path are masked.
+
 ### Fixed
 
 - **`tableau-migration` (skill `2.138.0` → `2.139.0`): a storage-decision failure named the one
