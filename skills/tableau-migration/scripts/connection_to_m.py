@@ -1446,6 +1446,48 @@ def _union_container_relation(rel, cols, nc_map=None):
     return entry
 
 
+def _combination_spans_connections(rel, nc_map=None):
+    """True when a join/union container's leaves need INCOMPATIBLE storage modes.
+
+    The discriminator that decides whether dropping the container is safe (#133), and it is
+    deliberately narrower than "more than one connection".
+
+    Dropping the container is right whenever the leaves can all live under the ONE storage mode the
+    datasource picks. That covers the common multi-connection case: ``0086_hex_tile_maps`` joins two
+    separate ``excel-direct`` workbooks, both Import, and rebuilds correctly as two related tables --
+    gating it on connection COUNT alone regressed that workbook from built to skipped, which is how
+    this predicate got narrowed.
+
+    It is wrong when the leaves straddle the flat-file / live-relational line, because those two
+    cannot share a mode: a flat file is Import-only and a live relational source is chosen for
+    DirectQuery. On the reported shape (``sqlserver`` joined to ``excel-direct``, #133) the
+    datasource took DirectQuery from its primary and emitted
+
+        Flat.tmdl   mode: directQuery   Source = Excel.Workbook(File.Contents(...))
+
+    and an Excel workbook is not a DirectQuery-capable source at all -- a model that builds clean,
+    validates, and is bound wrong.
+
+    Resolves each leaf's connector CLASS through ``nc_map``; a leaf that declares no connection
+    inherits the datasource's single upstream and contributes nothing. Fail-closed -- anything it
+    cannot resolve returns ``False`` and keeps today's leaf-surfacing behaviour exactly.
+    """
+    nc_map = nc_map or {}
+    classes = set()
+    for leaf in _findall_local(rel, "relation"):
+        ref = leaf.get("connection")
+        if not ref:
+            continue
+        facts = nc_map.get(ref) or {}
+        cls = (facts.get("connection_class") or facts.get("class") or "").strip().lower()
+        if cls:
+            classes.add(cls)
+    if len(classes) < 2:
+        return False
+    flat = {c for c in classes if c in FLAT_FILE_CLASSES}
+    return bool(flat) and bool(classes - flat)
+
+
 def _extract_relations(datasource, cols_by_parent, nc_map=None):
     """Walk ``<relation>`` elements into a flat, de-duplicated descriptor list.
 
@@ -1491,7 +1533,31 @@ def _extract_relations(datasource, cols_by_parent, nc_map=None):
         if (rel.get("type") or "").lower() == "collection":
             continue  # benign container; its child tables are emitted independently
         if _is_combination_relation(rel):
-            continue  # a join container; its leaf tables are surfaced individually
+            # A join container is normally dropped so its LEAF tables surface as independent model
+            # tables related by their join keys -- strictly better than skipping the source, and
+            # correct whenever every leaf lives on the same upstream.
+            #
+            # It is NOT correct when the leaves span SEVERAL named connections. Tableau joins those
+            # rows server-side into one rowset; Power BI cannot, and the storage mode is chosen once
+            # for the datasource, so a heterogeneous join emits one mode across incompatible
+            # connectors. Measured on the reported shape (sqlserver + excel-direct joined at the top
+            # level, #133): the model builds clean and emits
+            #     Flat.tmdl   mode: directQuery   Source = Excel.Workbook(File.Contents(...))
+            # and an Excel workbook is not a DirectQuery-capable source at all.
+            #
+            # The gate for this has always existed -- ``storage_mode`` refuses any descriptor whose
+            # relation kinds include a container -- but it became UNREACHABLE when this ``continue``
+            # started skipping the container before ``_classify_relation`` could give it a ``kind``.
+            # The docstring on ``_is_combination_relation`` still describes the old contract
+            # ("reported as a single combination entry so the storage-mode policy can fall back"),
+            # which is the tell the reporter spotted. Emitting the marker restores exactly that
+            # contract for the multi-connection case and leaves the single-connection case -- the
+            # common one, and the one leaf-surfacing was built for -- untouched.
+            if _combination_spans_connections(rel, nc_map):
+                candidates.append({"kind": (rel.get("type") or "join").lower(),
+                                   "name": rel.get("name"),
+                                   "spans_connections": True})
+            continue
         candidates.append(_classify_relation(rel, cols_by_parent, nc_map))
 
     # Only drop ``[Extract]`` cache twins when at least one live (non-extract) table remains to

@@ -2659,6 +2659,35 @@ def _select_primary_date(date_cols):
 PER_ISLAND_DATE_ENABLED = False
 
 
+def _stub_backed_tables(tables):
+    """Display names of tables whose partition is a placeholder, not a real query (#134).
+
+    A connector with no translation emits ``#table(type table [], {})`` plus a ``TODO`` -- an honest
+    placeholder that lets the rest of the model build. The hazard is that an EAGERLY-evaluated
+    calculated table (the generated Date calendar, a Date Parameter) may reference a column in one,
+    and eager evaluation happens at model LOAD: before refresh, before credentials. A reference that
+    does not resolve there does not degrade the table, it stops Power BI Desktop opening the file.
+
+    Identified from the relation's own descriptor rather than by re-parsing emitted M, so it is the
+    same signal the emitter used. Fail-safe: anything unrecognisable is simply not reported as a
+    stub, which keeps today's behaviour.
+    """
+    stubs = set()
+    for rel in tables or ():
+        if not isinstance(rel, dict):
+            continue
+        if rel.get("kind") not in ("table", "custom_sql"):
+            continue
+        name = rel.get("name") or rel.get("item")
+        if not name:
+            continue
+        # No resolvable columns, or an explicitly-flagged placeholder, means the emitted partition
+        # is the ``#table(type table [], {})`` stub rather than a real upstream query.
+        if rel.get("stub_partition") or rel.get("placeholder") or not rel.get("columns"):
+            stubs.add(name)
+    return stubs
+
+
 def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date=True,
                            mode="import", date_range=None):
     """One Date dimension PER DATASOURCE ISLAND -> ``([(name, part)], rels, report)``.
@@ -2823,7 +2852,22 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
         # Mark-as-Date's contiguous full-year requirement. DAX MIN/MAX ignore blanks, so a fact with
         # no rows simply does not contribute a bound. Falls back to CALENDARAUTO() when the calendar
         # relates to nothing (unreachable here, but never emit an empty CALENDAR).
-        span = [(r["from_table"], r["from_col"]) for r in rels]
+        # A STUB-backed column contributes nothing and can cost the whole file. When a connector has
+        # no translation the relation emits a placeholder partition -- ``#table(type table [], {})``
+        # -- and the Date table is a CALCULATED table, so Power BI evaluates it EAGERLY at model
+        # LOAD. A literal ``'Stub'[When]`` reference in the calendar therefore resolves (or fails)
+        # before any refresh and before any credential: reported in #134 as
+        # "Column 'X' in table 'Y' cannot be found or may not be used in this expression" on OPEN,
+        # observed on 11 of ~44 field models.
+        #
+        # Excluding them is right even where the reference happens to resolve, which is the case the
+        # reporter measured locally (their stubs declared columns, so 48 eager references bound
+        # cleanly and nothing failed). A stub holds no rows, so its MIN/MAX is BLANK and it can never
+        # contribute a bound -- it is pure exposure with no benefit. Dropping it narrows the span,
+        # and if that empties the span the existing CALENDARAUTO fallback takes over.
+        _stub = _stub_backed_tables(tables)
+        span = [(r["from_table"], r["from_col"]) for r in rels
+                if r.get("from_table") not in _stub]
         if span:
             def _fold(fn, terms):
                 expr = terms[0]
