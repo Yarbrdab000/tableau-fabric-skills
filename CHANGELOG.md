@@ -14,6 +14,54 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.149.0` → `2.150.0`): a join across incompatible connectors now
+  reaches the storage-mode gate that was built for it.** Reported in #133, with the mechanism traced
+  in code by the reporter and confirmed here end to end — which is exactly the step they said they
+  could not take (*"I have NOT confirmed on a fixture that the `relations` list consumed by
+  `select_storage_mode()` is the one built at connection_to_m.py:1400"*). It is. On their repro shape
+  (a `federated` datasource whose top-level relation is a `join` spanning a `sqlserver` named
+  connection and an `excel-direct` one):
+
+  | | kinds | mode | fallback |
+  |---|---|---|---|
+  | before | `{table}` | `DirectQuery` | `None` |
+  | after | `{join, table}` | `None` | `needs-storage-decision` |
+
+  The gate was never missing — `storage_mode` refuses any descriptor whose relation kinds include a
+  container. It became **unreachable** when `_extract_relations` started `continue`-ing past the
+  container before `_classify_relation` could give it a `kind`, leaving the old contract stranded in
+  `_is_combination_relation`'s docstring (*"reported as a single combination entry so the
+  storage-mode policy can fall back"*). That surviving docstring is the tell the reporter spotted.
+
+  **The harm is sharper than "bound to one upstream."** Each table does route to its own upstream
+  correctly — but the storage *mode* is chosen once per datasource, so the reported shape emitted:
+
+  ```
+  Flat.tmdl   mode: directQuery   Source = Excel.Workbook(File.Contents("//host/share/f.xlsx"))
+  ```
+
+  An Excel workbook is not a DirectQuery-capable source at all. The model builds, validates, and is
+  bound wrong.
+
+  **The discriminator is connector CLASS, not connection count, and the corpus is why.** The first
+  version gated on "leaves span more than one named connection" and regressed
+  `0086_hex_tile_maps` — which joins two separate `excel-direct` workbooks (two connections, both
+  Import, rebuilding correctly as two related tables) — from built to skipped, 29/29 → 28/29. The
+  corpus gate caught it. The predicate is narrowed to the case that genuinely cannot share one mode:
+  leaves straddling the flat-file / live-relational line. Single-connection joins, two-flat-file
+  joins and two-relational joins are all untouched.
+
+  Also answers the reporter's point 3 (*"consider whether `storage_mode.py:341` should still
+  reference `join`/`union` at all — if no code path can produce those kinds, the branch is
+  misleading"*): the branch is now fed rather than narrowed, and a test asserts it is reachable.
+
+  Note this is no longer a dead end for the operator: **2.140.0** added `--storage-decision` /
+  `--accept-recommended-storage`, so a gated datasource can be answered rather than merely refused.
+
+  Corpus: 29/29 built, **zero drift** across 695 emitted files.
+
+### Fixed
+
 - **`tableau-migration` (skill `2.148.0` → `2.149.0`): the last two slicers that pre-selected
   nothing, and a duplicate filter name that a warning-only gate lets through.** Investigated from
   #130, whose reporter filed the general claim and then — commendably — filed a correction against
