@@ -14,6 +14,49 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.148.0` → `2.149.0`): the last two slicers that pre-selected
+  nothing, and a duplicate filter name that a warning-only gate lets through.** Investigated from
+  #130, whose reporter filed the general claim and then — commendably — filed a correction against
+  themselves, found counter-evidence, could not reproduce their own headline, and asked that the
+  issue not be worked until they could run a controlled experiment. This is that experiment's
+  result.
+
+  **The general claim did not hold.** `_slicer_preselection_object` has emitted the open-on selection
+  into `objects.general[].properties.filter` since **2.51.0**, which predates the 2.126.0 they
+  tested. Measured on the 29-workbook corpus at 2.148.0:
+
+  | | count |
+  |---|---|
+  | `general.filter`-only (correct) | **50** |
+  | `filterConfig`-only (the reported bug) | **2** |
+  | both | 0 |
+  | neither (no default) | 22 |
+
+  which matches their own counter-evidence (330 slicers: 36 `general.filter`-only, 0
+  `filterConfig`-only) rather than the headline. But the experiment found the residual two, and both
+  are real:
+
+  **1. A boolean column never pre-selected.** The gate accepted `string`, integer date-parts and real
+  dates and declined everything else, so a boolean selection fell through to `filterConfig` and
+  pre-selected nothing — the reported symptom exactly, surviving in one narrow shape. Both remaining
+  cases were boolean DAX calculated columns (`'X'[a] = 'X'[b]`). The literal must be bare
+  `true`/`false`: those slicers were emitting the STRING `'true'` against a boolean column, which
+  matches no row and reports no error.
+
+  **2. A duplicate filter `name` report-wide.** The reporter listed this as encoding detail #1 and
+  was right, including about why it hides: it emits `PBIR_FILTER_NAME_DUPLICATE_GLOBAL` as a
+  **warning**, so an `errorCount`-only gate passes it. Confirmed live on
+  `0088_salesforce_nonprofit_case_mgmt` *before* any change here, so it is pre-existing rather than
+  introduced — `_inherit_flag_filters` deep-copies one worksheet's filterConfig onto every visual
+  derived from that worksheet, name included. Each stamped copy now carries a visual-unique name.
+
+  After both: that workbook validates **0 errors / 0 warnings** where it previously carried the
+  duplicate-name warning, and the corpus emits **zero** `filterConfig`-only slicers (52
+  `general.filter`, 22 with no default). Drift across 695 emitted files is 3 files, all in the one
+  workbook that had the defect.
+
+### Fixed
+
 - **`tableau-migration` (skill `2.147.0` → `2.148.0`): a map's basemap is a per-worksheet property,
   so a module-level constant cannot be right.** Reported in #128. `_AZURE_MAP_DEFAULT_STYLE =
   "blank_accessible"` was applied to **every** emitted `azureMap` regardless of what the source

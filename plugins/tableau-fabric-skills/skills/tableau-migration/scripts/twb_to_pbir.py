@@ -10809,16 +10809,36 @@ def _filter_container(entity, prop, condition, name, *, ftype, inverted=False):
     return container
 
 
-def _categorical_condition(entity, prop, values, *, exclude, numeric=False, datey=False):
+def _semantic_boolean_literal(value):
+    """A PBIR semantic-query BOOLEAN literal (``true``/``false``), or ``None`` when not boolean-ish.
+
+    Unquoted and lower-case: a boolean column compared against the STRING ``'true'`` matches no row,
+    which is the silent-wrong-data shape rather than an error. Tableau writes an applied boolean
+    filter's members as ``true``/``false`` text, so the conversion is here rather than at the caller.
+    """
+    s = str(value).strip().lower()
+    if s in ("true", "1", "yes"):
+        return "true"
+    if s in ("false", "0", "no"):
+        return "false"
+    return None
+
+
+def _categorical_condition(entity, prop, values, *, exclude, numeric=False, datey=False,
+                           boolean=False):
     # ``numeric=True`` emits integer literals (``4L``) instead of quoted strings -- used when an
     # applied date-part selection (month ``4``, year ``2021``) has been rebound onto an INTEGER
     # calendar column (Date[Month]/[Year]/...), where a string literal would match no row.
     # ``datey=True`` emits semantic-query ``datetime'...'`` literals for an applied selection on a
     # real DATE column, where a quoted string likewise matches no row.
+    # ``boolean=True`` emits bare ``true``/``false`` for a boolean column -- same reasoning: a
+    # boolean compared against the string ``'true'`` matches nothing and reports no error.
     if datey:
         lit = _semantic_datetime_literal
     elif numeric:
         lit = _semantic_numeric_literal
+    elif boolean:
+        lit = _semantic_boolean_literal
     else:
         lit = _semantic_string_literal
     col = _filter_column_ref(entity, prop, source=_FILTER_SOURCE_ALIAS)
@@ -10906,7 +10926,21 @@ def _inherit_flag_filters(visuals, flag_fc):
         return visuals
     for v in visuals or ():
         if isinstance(v, dict) and not v.get("filterConfig"):
-            v["filterConfig"] = copy.deepcopy(flag_fc)
+            fc = copy.deepcopy(flag_fc)
+            # A filter's ``name`` must be unique REPORT-WIDE, not merely within its visual. Stamping
+            # the same worksheet filterConfig onto several derived visuals copies the name with it,
+            # which trips PBIR_FILTER_NAME_DUPLICATE_GLOBAL -- and that is emitted as a WARNING, so a
+            # gate that reads ``errorCount`` alone sails past it (flagged as encoding detail #1 in
+            # #130, and confirmed live on 0088_salesforce_nonprofit_case_mgmt).
+            #
+            # Suffixing with the visual's own name keeps it deterministic and readable, and the
+            # visual name is already unique per report by construction.
+            vname = v.get("name")
+            if vname:
+                for f in (fc.get("filters") or ()):
+                    if isinstance(f, dict) and f.get("name"):
+                        f["name"] = _sanitize("%s-%s" % (f["name"], vname))
+            v["filterConfig"] = fc
     return visuals
 
 
@@ -11238,7 +11272,19 @@ def _slicer_preselection_object(field, model_table, field_map):
         datey = (not numeric and dt in ("date", "datetime")
                  and all(_semantic_datetime_literal(v) is not None
                          for v in sel.get("values") or [] if v != "%null%"))
-        if not numeric and not datey and dt != "string":
+        # A BOOLEAN column is bindable too, and must be, because it is the residual case that still
+        # fell through to ``filterConfig`` after 2.51.0 moved every other selection to the open-on
+        # object. Measured on the corpus at 2.148.0: of 52 slicers carrying a default, 50 used the
+        # open-on object and the only 2 that did not were boolean DAX calculated columns
+        # (``'X'[a] = 'X'[b]``), whose selection therefore pre-selected NOTHING -- the exact "slicer
+        # reads All, page unfiltered" symptom reported in #130, surviving in one narrow shape.
+        #
+        # The literal must be bare ``true``/``false``: those same two slicers were emitting the
+        # STRING ``'true'`` against a boolean column, which matches no row and reports no error.
+        booly = (not numeric and not datey and dt in ("boolean", "bool")
+                 and all(_semantic_boolean_literal(v) is not None
+                         for v in sel.get("values") or [] if v != "%null%"))
+        if not numeric and not datey and not booly and dt != "string":
             return None
         values = [v for v in sel["values"] if v != "%null%"]
         if not values:
@@ -11248,7 +11294,7 @@ def _slicer_preselection_object(field, model_table, field_map):
                 and _semantic_numeric_literal(v).endswith("L") for v in values):
             return None
         cond = _categorical_condition(entity, prop, values, exclude=False,
-                                      numeric=numeric, datey=datey)
+                                      numeric=numeric, datey=datey, boolean=booly)
     return {"properties": {"filter": {"filter": {
         "Version": 2,
         "From": [{"Name": _FILTER_SOURCE_ALIAS, "Entity": entity, "Type": 0}],
