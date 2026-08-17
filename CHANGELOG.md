@@ -14,6 +14,52 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.147.0` → `2.148.0`): a map's basemap is a per-worksheet property,
+  so a module-level constant cannot be right.** Reported in #128. `_AZURE_MAP_DEFAULT_STYLE =
+  "blank_accessible"` was applied to **every** emitted `azureMap` regardless of what the source
+  draws, so a Tableau satellite or dark basemap rebuilt as marks floating on white.
+
+  The structural argument is the one that settles it: **one workbook can contain satellite, dark and
+  light basemaps at once**, so no single constant can serve them. The style now comes from the
+  worksheet's own `<style-rule element='map'><format attr='map-style'>`.
+
+  **The old acceptance criterion was inverted, and Tableau's own render proves it.** The constant's
+  comment recorded that `grayscale_light` was rejected for *"drawing a grey basemap with
+  Canada/Mexico"*. Confirmed independently on the corpus workbook `0063_remove_null_and_all`: its
+  embedded Tableau `<thumbnail>` for `Solution 02` — Tableau's render, not anyone's interpretation —
+  shows exactly that, a light grey basemap with grey Canada and Mexico and country labels beneath a
+  green choropleth. The style had been refused for reproducing the reference faithfully.
+
+  Render-verified after the change: that workbook's map draws the basemap, grey Canada/Mexico, water
+  and state labels, where before it drew polygons on white.
+
+  Mapping keys are harvested from real workbooks, not guessed — across the corpora on this machine:
+  `light` ×20, `tableau-light-gray` ×7, `satellite` ×1, plus two custom `mapbox://` styles. Values
+  are checked against the live enum from
+  `powerbi-report-author formatting describe-object azureMap mapControls`, and a test asserts every
+  emitted value is in it (a typo there is invisible to PBIR validation and shows up only as a map
+  that will not draw).
+
+  Two cases refuse rather than approximate, and say so:
+
+  - a **custom Mapbox** basemap (`mapbox://styles/<user>/<id>`) is an arbitrary third-party design no
+    stock Azure style reproduces — the map keeps the default and the run warns, naming the style;
+  - an **unrecognised token** fails closed, so a Tableau version that spells a style differently
+    keeps today's behaviour rather than being mapped by guesswork.
+
+  **Deliberately NOT changed: the no-signal default.** A worksheet that declares no `map-style` has
+  not told us it wants a blank basemap — it means the author never moved off Tableau's default.
+  Changing that would alter every map this engine has emitted, and `blank_accessible` is the one
+  value that was actually compared against a Tableau reference in Desktop. Left for a render-verified
+  change of its own rather than folded in here on inference. (The reporter also notes our own
+  `powerbi-report-gotchas` skill gave the original advice and has since been corrected; that half is
+  theirs and is done.)
+
+  Corpus: 29/29 built, and the diff across **695** emitted files is exactly the three maps in
+  `0063_remove_null_and_all` moving `blank_accessible` → `grayscale_light`. Nothing else moved.
+
+### Fixed
+
 - **`tableau-migration` (skill `2.146.0` → `2.147.0`): a BIFF8 `.xls` navigation table has no
   `Item`/`Kind` columns, so that key can never match.** Reported in #129 as a sibling of #108 — same
   symptom at refresh, different cause one level down, and the report was right on every point.

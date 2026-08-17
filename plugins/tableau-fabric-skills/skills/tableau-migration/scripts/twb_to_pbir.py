@@ -5167,6 +5167,11 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "filter_plate_fill": filter_plate_fill,
         "grid_styles": grid_styles,
         "canvas_fill": canvas_fill,
+        # The worksheet's own basemap token (#128). Captured HERE, at parse time, because the
+        # emitter only ever sees this dict -- and it is per-worksheet on purpose: one workbook can
+        # draw satellite on one sheet and a dark basemap on the next, so no module-level constant
+        # can serve both. Raw token; `_tableau_map_style` maps it to a Power BI style.
+        "map_style_raw": _worksheet_map_style_raw(ws),
         "axis_titles": axis_titles,
         "continuous_axis": continuous_axis,
         "dual_axis": _pane_mark_map(table)[2],
@@ -9851,6 +9856,89 @@ _AZURE_MAP_US_STATES_GEOJSON = (
 _AZURE_MAP_DEFAULT_STYLE = "blank_accessible"
 _AZURE_MAP_POLYGON_STROKE = "#D9D9D9"
 
+# Tableau's per-worksheet basemap -> the Power BI `azureMap` `mapControls.defaultStyle` that draws
+# the same thing. Reported in #128: the constant above was applied to EVERY emitted map regardless of
+# what the source draws, so a satellite or dark basemap rebuilt as marks floating on white. One
+# workbook can contain satellite, dark and light basemaps at once, so no single constant can be
+# right -- the style has to come from the worksheet.
+#
+# Keys are the values Tableau writes to `<style-rule element='map'><format attr='map-style'>`,
+# harvested from real workbooks rather than guessed (counts across the corpora on this machine:
+# `light` x20, `tableau-light-gray` x7, `satellite` x1, two `mapbox://` customs). `tableau-z-black`
+# is included on the reporter's thumbnail evidence for a dark basemap; it is the one entry here not
+# observed locally, and is safe because an unrecognised key falls through to the default rather than
+# guessing.
+#
+# Values are checked against the live enum, not assumed --
+# `powerbi-report-author formatting describe-object azureMap mapControls` reports exactly:
+#   road, satellite, satellite_road_labels, grayscale_dark, night, grayscale_light,
+#   road_shaded_relief, blank, blank_accessible, high_contrast_dark, high_contrast_light
+_TABLEAU_MAP_STYLE_TO_AZURE = {
+    "satellite": "satellite",
+    "tableau-satellite": "satellite",
+    "light": "grayscale_light",
+    "tableau-light": "grayscale_light",
+    "tableau-light-gray": "grayscale_light",
+    "gray": "grayscale_light",
+    "tableau-gray": "grayscale_light",
+    "dark": "grayscale_dark",
+    "tableau-dark": "grayscale_dark",
+    "tableau-z-black": "night",
+    "black": "night",
+    "normal": "road",
+    "tableau-normal": "road",
+    "streets": "road",
+    "tableau-streets": "road",
+    "outdoors": "road_shaded_relief",
+}
+
+
+def _worksheet_map_style_raw(ws_el):
+    """The raw ``map-style`` token a worksheet ELEMENT declares, or ``None``.
+
+    Read once at parse time (the emitter only ever sees the parsed dict) and stored as
+    ``map_style_raw``. ``<style-rule element='map'><format attr='map-style' value='...'>``.
+    """
+    for rule in _findall_local(ws_el, "style-rule"):
+        if (rule.get("element") or "").lower() != "map":
+            continue
+        for fmt in _children_local(rule, "format"):
+            if (fmt.get("attr") or "") == "map-style":
+                return (fmt.get("value") or "").strip() or None
+    return None
+
+
+def _tableau_map_style(ws):
+    """The worksheet's own basemap as a Power BI ``defaultStyle``, or ``None`` to keep the default.
+
+    Reads the parsed ``map_style_raw`` -- a PER-WORKSHEET signal, which is the point: a single
+    workbook may draw satellite on one sheet and a dark basemap on the next, so a module-level
+    constant cannot be correct for both (#128).
+
+    Returns ``None``, meaning "leave :data:`_AZURE_MAP_DEFAULT_STYLE` alone", in three cases, and
+    each is deliberate:
+
+    * **the worksheet declares no ``map-style``.** Absence is not evidence of a blank basemap -- it
+      means the author never moved off Tableau's default. Changing that case would alter every map
+      this engine has ever emitted, and the current constant is the one value that WAS compared
+      against a Tableau reference in Desktop (see above). Left for a render-verified change of its
+      own rather than folded in here on inference.
+    * **a custom Mapbox style** (``mapbox://styles/<user>/<id>``). The basemap is an arbitrary
+      third-party design that no stock Azure style reproduces; picking a near-miss would silently
+      misrepresent it. The caller warns instead.
+    * **an unrecognised token.** Fail-closed: a Tableau version that spells a style differently keeps
+      today's behaviour rather than being mapped by guesswork.
+    """
+    raw = (ws or {}).get("map_style_raw")
+    if not raw:
+        return None
+    return _TABLEAU_MAP_STYLE_TO_AZURE.get(str(raw).strip().lower())
+
+
+def _tableau_map_style_raw(ws):
+    """The raw ``map-style`` token from the PARSED worksheet, or ``None`` -- for honest warnings."""
+    return (ws or {}).get("map_style_raw")
+
 
 def _azure_map_objects(ws, visual_type, shading_field=None):
     """The ``objects`` block for an ``azureMap``, or ``None``.
@@ -9878,7 +9966,8 @@ def _azure_map_objects(ws, visual_type, shading_field=None):
         "showNavigationControls": {"expr": {"Literal": {"Value": "false"}}},
         "showSelectionControl": {"expr": {"Literal": {"Value": "false"}}},
         "defaultStyle": {"expr": {"Literal": {
-            "Value": _semantic_string_literal(_AZURE_MAP_DEFAULT_STYLE)}}},
+            "Value": _semantic_string_literal(
+                _tableau_map_style(ws) or _AZURE_MAP_DEFAULT_STYLE)}}},
     }
     objects = {"mapControls": [{"properties": dict(controls)}]}
 
@@ -10011,6 +10100,21 @@ def _azure_map_objects_for(ws, state, warnings):
             shading = proj["field"]
             break
     objects = _azure_map_objects(ws, vt, shading)
+    # A custom Mapbox basemap is an arbitrary third-party design (roads, palette, labels all
+    # author-chosen); no stock Azure style reproduces it, and picking a near-miss would silently
+    # misrepresent the source. Say so rather than pretend (#128).
+    _raw_style = _tableau_map_style_raw(ws)
+    if _raw_style and _raw_style.lower().startswith("mapbox://"):
+        warnings.append(_warn(
+            "worksheet", ws["name"],
+            f"map uses a CUSTOM Mapbox basemap ({_raw_style}) that no stock Power BI map style "
+            f"reproduces; the rebuilt map keeps the default basemap -- re-point it at your own "
+            f"tile source, or pick the closest built-in style, before trusting its appearance"))
+    elif _raw_style and _tableau_map_style(ws) is None:
+        warnings.append(_warn(
+            "worksheet", ws["name"],
+            f"map declares an unrecognised Tableau basemap ({_raw_style}); the rebuilt map keeps "
+            f"the default basemap rather than guessing a near-match"))
     if objects and objects.get("referenceLayer"):
         warnings.append(_warn(
             "worksheet", ws["name"],
