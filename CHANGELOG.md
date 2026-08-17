@@ -14,6 +14,39 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.156.0` → `2.157.0`): the CHANGELOG's declared version chain is a
+  gate, not a habit.** Two agents working in parallel shipped the *same* defect within an hour, on
+  the same rebase, and neither was careless: a cross-session rebase merges the `VERSION` stamp
+  cleanly while the **prose describing that stamp** goes stale silently. Both wrote an entry reading
+  `(skill X → Y)` that was true when written and false the moment the other session's commits landed
+  underneath and changed the actual predecessor. Nothing checked it, so only a human comparing two
+  numbers would ever have caught it.
+
+  It is mechanically checkable from the CHANGELOG alone, so it is now checked — three invariants,
+  each pinned to a real failure rather than a tidiness preference:
+
+  - **the chain is continuous** — each entry's declared predecessor equals the successor declared by
+    the entry beneath it, reading newest-first. Deliberately heading-agnostic: the file interleaves
+    `### Added` and `### Fixed`, and a release's category says nothing about its ordering.
+  - **no version is produced twice** — the other half of the same rebase hazard, where an entry is
+    renumbered without being renamed.
+  - **the newest entry matches the shipped `VERSION`** — the one that actually reaches users. The
+    self-update runbook compares installed `VERSION` against the raw `VERSION` on `main` and
+    reinstalls only when main is **newer**, so a CHANGELOG documenting a version above a lower stamp
+    leaves every client that reached the higher number permanently deaf to everything after it.
+
+  Verified by injecting the exact defect both agents shipped into the real file — a top entry
+  declaring predecessor `2.154.0` above an entry ending `2.155.0` — and confirming the gate names
+  both line numbers and both versions, rather than only proving it against a synthetic fixture.
+
+  **One pre-existing break fixed, measured first.** Running the check over the full history (70
+  entries, `2.87.0` → `2.156.0`) found the version *set* already complete — no gaps, no duplicates —
+  but three adjacent chain breaks, all caused by a single displaced entry: `2.141.0 → 2.142.0` (the
+  caption-padding fix) sat below `2.139.0 → 2.140.0` because it was authored before a parallel merge
+  and landed after it. Relocating that one entry to its chronological position resolves all three,
+  so the gate ships with **zero exemptions** — nothing is grandfathered and no history was rewritten
+  beyond moving the block.
+
 - **`tableau-migration` (skill `2.155.0` → `2.156.0`): the conditional-colour compiler back end —
   lowering to Power BI's own "Rules" conditional formatting.** Still unwired (no emitter calls it
   yet, output byte-for-byte unchanged), but this is the rung that makes the rebuild *native* rather
@@ -534,6 +567,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   against surfacing the wrong measure set is untouched. Across the 29-workbook corpus this changes
   no existing output (every Measure Names filter there is an authoritative `op='manual'` keep-list).
 
+- **`tableau-migration` (skill `2.141.0` → `2.142.0`): a caption sized in Tableau does not fit in
+  Power BI, because Power BI adds padding Tableau has not.** Power BI reserves 8px above *and* below
+  a textbox's text by default, so a box's usable height is `height - 16`. Tableau reserves nothing.
+  An author who drew a 24px caption strip drew it to fit 12pt text, and it does — in Tableau.
+  Emitted verbatim, those 24px leave 8px for a line that needs 19, and the band renders **clipped**:
+  descenders sheared off, a scrollbar stub where the text should be.
+
+  Found by rendering a real network-operations dashboard, not by a metric. Two bands on one page:
+  `"Sort By = Network Score | Region = All | Fiscal Month ="` at 24px/12pt, and a section header at
+  31px/16pt. The build validated with **zero errors** — and our own gate already knew, because
+  `powerbi-report-author validate` warns `PBIR_TEXTBOX_HEIGHT_BELOW_FLOOR` using exactly the
+  renderer's formula. We were emitting geometry the gate then told us was wrong, one step too late
+  to matter.
+
+  **The fix is not to grow the box, and that distinction is the whole of it.** Growing it is what
+  the layout solver deliberately refuses to do (`layout_solve._clamp_to_authored`), for a measured
+  reason: a readability floor propagated up a zone tree makes a frame scale the WHOLE canvas to
+  satisfy it — eleven pixels of caption once cost five hundred pixels of page, with every object on
+  it 50% taller. The first version of this fix did exactly that and
+  `test_thin_caption_sizes_to_content_not_inflated_to_floor` caught it, correctly.
+
+  The 16px is not the author's, it is **ours**: a default we never asked for, on a box we emit. So
+  the room comes out of our own padding first, down to zero, and the authored geometry is never
+  touched. A textbox with room to spare emits no padding block at all and is byte-identical to
+  before. Applies to dashboard text objects, caption-only worksheets, and the title banner alike.
+
+  Verified by render: the reported dashboard now shows both bands in full, and the report validates
+  **0 errors / 0 warnings** where it previously carried two.
+
 - **`tableau-migration` (skill `2.140.0` → `2.141.0`): `estate_survey.py --json` declares a schema
   contract, so a rename cannot fail silently.** Raised in #114 — not a defect report, a heads-up that
   a downstream assessment tier shells out to this script and builds its migration-order graph from
@@ -608,35 +670,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   and the output path are masked.
 
 ### Fixed
-
-- **`tableau-migration` (skill `2.141.0` → `2.142.0`): a caption sized in Tableau does not fit in
-  Power BI, because Power BI adds padding Tableau has not.** Power BI reserves 8px above *and* below
-  a textbox's text by default, so a box's usable height is `height - 16`. Tableau reserves nothing.
-  An author who drew a 24px caption strip drew it to fit 12pt text, and it does — in Tableau.
-  Emitted verbatim, those 24px leave 8px for a line that needs 19, and the band renders **clipped**:
-  descenders sheared off, a scrollbar stub where the text should be.
-
-  Found by rendering a real network-operations dashboard, not by a metric. Two bands on one page:
-  `"Sort By = Network Score | Region = All | Fiscal Month ="` at 24px/12pt, and a section header at
-  31px/16pt. The build validated with **zero errors** — and our own gate already knew, because
-  `powerbi-report-author validate` warns `PBIR_TEXTBOX_HEIGHT_BELOW_FLOOR` using exactly the
-  renderer's formula. We were emitting geometry the gate then told us was wrong, one step too late
-  to matter.
-
-  **The fix is not to grow the box, and that distinction is the whole of it.** Growing it is what
-  the layout solver deliberately refuses to do (`layout_solve._clamp_to_authored`), for a measured
-  reason: a readability floor propagated up a zone tree makes a frame scale the WHOLE canvas to
-  satisfy it — eleven pixels of caption once cost five hundred pixels of page, with every object on
-  it 50% taller. The first version of this fix did exactly that and
-  `test_thin_caption_sizes_to_content_not_inflated_to_floor` caught it, correctly.
-
-  The 16px is not the author's, it is **ours**: a default we never asked for, on a box we emit. So
-  the room comes out of our own padding first, down to zero, and the authored geometry is never
-  touched. A textbox with room to spare emits no padding block at all and is byte-identical to
-  before. Applies to dashboard text objects, caption-only worksheets, and the title banner alike.
-
-  Verified by render: the reported dashboard now shows both bands in full, and the report validates
-  **0 errors / 0 warnings** where it previously carried two.
 
 - **`tableau-migration` (skill `2.138.0` → `2.139.0`): a storage-decision failure named the one
   datasource with nothing wrong with it.** Reported alongside #124. A workbook's embedded
