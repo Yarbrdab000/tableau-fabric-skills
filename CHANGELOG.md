@@ -14,6 +14,45 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.152.0` → `2.153.0`): the conditional-colour compiler front end.**
+  Analysis only — nothing is wired to an emitter yet, so output is byte-for-byte unchanged. This is
+  the piece that makes conditional colour *general* rather than a set of recognised templates.
+
+  Tableau's commonest conditional-formatting idiom is a calculation that outputs a **string /
+  dimension value**, placed on Colour, with each output painted its own colour. The structural
+  insight the new `scripts/colour_rules.py` is built on is that **the string output is an
+  intermediate Power BI never needs**:
+
+  ```
+  IF p1 THEN "A" ELSEIF p2 THEN "B" ELSE "C" END
+      ==>  Cases = [ p1 -> colour("A"), p2 -> colour("B") ],  Default = colour("C")
+  ```
+
+  The members collapse into the palette — no string measure, no colour twin, nothing added to the
+  model. All the difficulty therefore lives in the **predicates**, and depth costs nothing because
+  `Conditional.Cases` is an ordered list a nested `IF`/`ELSEIF` chain flattens onto 1:1.
+
+  `analyse_colour_calc(formula)` answers the three questions that decide the rebuild, from the
+  formula's own **properties** rather than by matching templates — so a calculation the engine has
+  never seen still routes:
+
+  1. **What are the branches?** Ordered `(predicate, member)` pairs plus a default, flattened out of
+     arbitrarily nested `IF`/`ELSEIF` and `CASE`/`WHEN` forms. A `CASE <subject> WHEN <v>` arm is
+     normalised to the predicate `<subject> = <v>`, so downstream code sees one predicate shape
+     whichever surface form it came from. Structural depth counts `IF`/`CASE`…`END` as well as
+     brackets, so a conditional nested in a THEN arm never captures the outer scan.
+  2. **Is the member domain CLOSED?** Every outcome a string literal (a static palette can be
+     built), or does an outcome return DATA — `IF x THEN [Category] ELSE "Other" END` — where no
+     static member→colour map exists and a different mechanism is required.
+  3. **What SCOPE does each predicate need?** A lattice, `constant < parameter < row < aggregate <
+     lod < view`, with the least upper bound taken across *all* branches so a cheap first predicate
+     cannot hide an expensive later one. `view` is the consequential one: `WINDOW_*` / `RUNNING_*` /
+     `RANK*` / `TOTAL` / `INDEX` / `FIRST` / `LAST` compare a mark against the **other marks in the
+     view**, which `2.152.0` measured cannot survive as a standalone model measure.
+
+  Fail-closed throughout: an unreadable formula returns `supported=False` with a reason and an empty
+  branch list, never a half-parsed guess.
+
 - **`tableau-migration` (skill `2.151.0` → `2.152.0`): a boolean colour driver is usually a
   comparison, and a view-scoped one must not be painted at all.** Two halves of one defect, both
   measured on `0070_new_max` — the "highlight the bar that set a new max" workbook.
