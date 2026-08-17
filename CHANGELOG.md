@@ -12,6 +12,99 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.147.0` → `2.148.0`): a map's basemap is a per-worksheet property,
+  so a module-level constant cannot be right.** Reported in #128. `_AZURE_MAP_DEFAULT_STYLE =
+  "blank_accessible"` was applied to **every** emitted `azureMap` regardless of what the source
+  draws, so a Tableau satellite or dark basemap rebuilt as marks floating on white.
+
+  The structural argument is the one that settles it: **one workbook can contain satellite, dark and
+  light basemaps at once**, so no single constant can serve them. The style now comes from the
+  worksheet's own `<style-rule element='map'><format attr='map-style'>`.
+
+  **The old acceptance criterion was inverted, and Tableau's own render proves it.** The constant's
+  comment recorded that `grayscale_light` was rejected for *"drawing a grey basemap with
+  Canada/Mexico"*. Confirmed independently on the corpus workbook `0063_remove_null_and_all`: its
+  embedded Tableau `<thumbnail>` for `Solution 02` — Tableau's render, not anyone's interpretation —
+  shows exactly that, a light grey basemap with grey Canada and Mexico and country labels beneath a
+  green choropleth. The style had been refused for reproducing the reference faithfully.
+
+  Render-verified after the change: that workbook's map draws the basemap, grey Canada/Mexico, water
+  and state labels, where before it drew polygons on white.
+
+  Mapping keys are harvested from real workbooks, not guessed — across the corpora on this machine:
+  `light` ×20, `tableau-light-gray` ×7, `satellite` ×1, plus two custom `mapbox://` styles. Values
+  are checked against the live enum from
+  `powerbi-report-author formatting describe-object azureMap mapControls`, and a test asserts every
+  emitted value is in it (a typo there is invisible to PBIR validation and shows up only as a map
+  that will not draw).
+
+  Two cases refuse rather than approximate, and say so:
+
+  - a **custom Mapbox** basemap (`mapbox://styles/<user>/<id>`) is an arbitrary third-party design no
+    stock Azure style reproduces — the map keeps the default and the run warns, naming the style;
+  - an **unrecognised token** fails closed, so a Tableau version that spells a style differently
+    keeps today's behaviour rather than being mapped by guesswork.
+
+  **Deliberately NOT changed: the no-signal default.** A worksheet that declares no `map-style` has
+  not told us it wants a blank basemap — it means the author never moved off Tableau's default.
+  Changing that would alter every map this engine has emitted, and `blank_accessible` is the one
+  value that was actually compared against a Tableau reference in Desktop. Left for a render-verified
+  change of its own rather than folded in here on inference. (The reporter also notes our own
+  `powerbi-report-gotchas` skill gave the original advice and has since been corrected; that half is
+  theirs and is done.)
+
+  Corpus: 29/29 built, and the diff across **695** emitted files is exactly the three maps in
+  `0063_remove_null_and_all` moving `blank_accessible` → `grayscale_light`. Nothing else moved.
+
+### Fixed
+
+- **`tableau-migration` (skill `2.146.0` → `2.147.0`): a BIFF8 `.xls` navigation table has no
+  `Item`/`Kind` columns, so that key can never match.** Reported in #129 as a sibling of #108 — same
+  symptom at refresh, different cause one level down, and the report was right on every point.
+
+  `Excel.Workbook` returns a **different navigation table per container format**:
+
+  ```
+  OOXML (.xlsx/.xlsm)        columns: Name, Item, Kind, Hidden, Data   -> [Item=…, Kind=…] works
+  BIFF8 / OLE2 (legacy .xls) columns: Name, Data                       -> [Item=…] matches NOTHING
+  ```
+
+  The emit site was unconditional, so no return value from `_excel_navigation` could ever produce a
+  `Name=` key. #108 fixed *which sheet* (stripping the ACE `$`); this fixes *which key shape*. The
+  two compose, and a test asserts them together, because fixing either alone still dies at refresh.
+
+  **Measured on the reference corpus, not a synthetic fixture.** `0063_remove_null_and_all` packages
+  a genuine OLE2 workbook (magic `D0 CF 11 E0 A1 B1 1A E1`, verified byte-wise):
+
+  | navigation key | refresh result |
+  |---|---|
+  | `[Item="Sheet1", Kind="Sheet"]` | `Expression.Error: The key didn't match any rows` — **0 rows** |
+  | `[Name="Sheet1"]` | `DATA_OK + PERSISTED` — **8,399 rows** |
+
+  The branch is on the **container**, never the extension, because the extension lies in both
+  directions: a `.xls` may be OOXML (Excel opens a renamed one, and export tools emit them) and an
+  `.xlsx` is never BIFF8. That was the reporter's argument and it is the right one. Fail-closed — an
+  unreadable path keeps today's `Item`/`Kind` emission, which is correct for every OOXML workbook.
+
+  This is another member of the class the reporter named precisely: the model validates, opens, and
+  satisfies the definition of done, and *only then* fails at refresh. Three green gates describing a
+  model that could not load a row.
+
+  **Not changed, and deliberately so:** the same issue reported a missing `culture` on that
+  partition. That is by design and already handled. `flatfile_culture` returns
+  `legacy-ace-host-rendered` for a legacy ACE workbook because the cells arrive as text already
+  rendered in the *refreshing* machine's locale, which is not observable at generation time and not
+  observable from within M either. Rather than guess a locale onto the user's data, the run emits a
+  loud per-table warning naming the remedy, and it fires on exactly this workbook:
+  *"table 'Sheet1$' reads a LEGACY Excel workbook … on a comma-decimal host every decimal column
+  inflates by 10^decimals and every structural gate still passes. Convert the source to .xlsx or CSV
+  (or add an explicit culture to this partition)…"*
+
+  Corpus: 29/29 built, and the diff against the pre-change baseline is exactly the two intended
+  navigation lines and nothing else.
+
 ### Added
 
 - **`tableau-migration` (skill `2.145.0` → `2.146.0`): the discrete colour palette is the AUTHOR's,
