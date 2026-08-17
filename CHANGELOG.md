@@ -14,6 +14,45 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.158.0` → `2.159.0`): datasource selection normalises both sides, so
+  a caption with incidental whitespace can be selected at all.** Raised in #138 from a live customer
+  estate whose real caption was `'DS_Visitor _Device '` — note the trailing space. `_choose_datasource`
+  stripped the **requested** name but not the **candidate** labels, and an asymmetric normalisation
+  can never match, so the datasource was unselectable however correctly it was spelled and the
+  workbook was skipped outright.
+
+  **It broke this module's own documented contract, which is sharper than the filed report.**
+  `workbook_datasources()` returns `label` and documents it as *"the value to pass back as
+  `select=`"*. Measured: handing that exact string straight back was **rejected**, and because both
+  sides print through `repr` the failure read
+
+  ```
+  no datasource named 'DS_Visitor _Device ' in this workbook; available: 'DS_Visitor _Device '
+  ```
+
+  — two **byte-identical** strings, one of which is reported not to exist. So this was never really
+  about a user mistyping a name: an agent following the API exactly could not select the datasource,
+  and the reporter's workaround was to edit the customer's own `.twbx` to get past it.
+
+  Fixed by stripping the candidate labels too. A near-miss hint is added for what symmetric stripping
+  deliberately still refuses: when the request matches a candidate only after **internal** whitespace
+  is collapsed, the error names the closest candidate and says how it differs. That is reporting
+  only — `_squash_ws` is unreachable from the matching path, because collapsing internal whitespace
+  could make two genuinely distinct captions identical and selecting one of those would be a guess.
+
+  **The reporter's two follow-up questions, answered with measurements rather than opinion.**
+  *Should whitespace be normalised at parse time instead, since captions presumably flow into table
+  names and emitted identifiers?* Measured: no. `parse_tds` names the descriptor from the datasource's
+  internal `name` (`federated.abc`), not its caption, and no descriptor value carries the untrimmed
+  string — so the emitted model never sees it, and a parse-time strip would silently rename the
+  author's object for no benefit. *Does the same asymmetry exist elsewhere?* `_choose_datasource` is
+  the only selection site. One **latent** instance does exist — `build_m_field_resolver` stores
+  `source_datasource` raw while `assemble_model` strips it when grouping islands, and a stripped probe
+  against a raw tag loses island scoping entirely (the calc drops to a stub). It is **not live**: the
+  island tags and the calcs' `datasource` values both derive from the same raw caption, so the
+  comparison is raw-vs-raw in production. Deliberately left alone rather than "fixed", since
+  normalising there could collapse two captions that differ only in whitespace into a single island.
+
 - **`tableau-migration` (skill `2.157.0` → `2.158.0`): the view-scoped rung of the conditional-colour
   back end — lowering to a Visual Calculation.** Still unwired (nothing calls it, emitted output
   unchanged). This is the rung with no alternative: when a predicate needs a value that does not
