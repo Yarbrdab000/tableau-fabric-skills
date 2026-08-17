@@ -14,6 +14,39 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.159.0` → `2.160.0`): on-prem Tableau Server is stated as supported
+  and partly gated, instead of working by accident.** Raised in #140, where the reporter did the
+  unusual and useful thing of correcting their own field report before filing — the help text is not
+  literally Cloud-only, it already offers a generic `https://host` form. Their real question was the
+  one worth answering: *is Server deliberately in the test matrix, or does it merely work?*
+
+  **The honest answer was "supported by construction, but untested", and it is now written down.**
+  The module docstring states it plainly rather than reassuringly: no test exercised a Server host,
+  so nothing would have caught an on-prem regression; a successful live on-prem run exists but is a
+  field report, not a gate.
+
+  **Their instinct about where Server and Cloud diverge was exactly right, and the finding is worse
+  than the docs implied.** They flagged API-version negotiation as the likely divergence, "since
+  on-prem Servers can run substantially older REST API versions than Cloud ever does". Measured:
+  **there is no negotiation at all.** `fetch_tds.DEFAULT_REST_VERSION` pins `3.24` and no `serverinfo`
+  call is ever made, so the version is never discovered from the host. The mitigation is explicit
+  rather than automatic — `--rest-version` is already a first-class flag on both scripts — and that is
+  now the documented first thing to try when sign-in fails against an older Server.
+
+  Part of the gap is closed rather than only described. `test_onprem_server_support.py` covers what is
+  genuinely checkable offline — on-prem host shapes (bare host, explicit scheme, trailing slash, and
+  plain `http` on a non-default port, which an internal Server frequently is), identical REST URL
+  construction for Cloud and Server, and that `--rest-version` actually reaches the URL, because a
+  documented flag that silently did nothing would send a user to debug auth instead. It does **not**
+  claim a live on-prem round trip. One test additionally fails if a `serverinfo` call ever appears,
+  so the docstring's claim about itself cannot quietly become untrue.
+
+  Docs: the `--server` help now names both forms (`10ay.online.tableau.com` (Cloud) /
+  `https://tableau.example.com` (Server)). The session-expiry comment kept its Cloud provenance
+  rather than being generalised away — the *handling* is not Cloud-specific, but the measurement was
+  ("intermittently after 1 to 58 calls", on Cloud), and whether an on-prem Server expires on the same
+  cadence is unknown. Recording which half is measured is more useful than a tidier sentence.
+
 - **`tableau-migration` (skill `2.158.0` → `2.159.0`): datasource selection normalises both sides, so
   a caption with incidental whitespace can be selected at all.** Raised in #138 from a live customer
   estate whose real caption was `'DS_Visitor _Device '` — note the trailing space. `_choose_datasource`
