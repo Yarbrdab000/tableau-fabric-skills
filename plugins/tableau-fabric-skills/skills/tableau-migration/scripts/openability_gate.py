@@ -52,6 +52,17 @@ except Exception:  # pragma: no cover - tmdl_generate is a sibling module, alway
         return []
 
 _TABLE_PART_RE = re.compile(r"^definition/tables/.+\.tmdl$")
+# The placeholder partition an untranslatable connector emits (#134): a table that DECLARES a schema
+# but has no real query behind it. Whitespace-tolerant, because the emitted M is indented.
+_STUB_PARTITION_RE = re.compile(r"#table\s*\(\s*type\s+table\s*\[\s*\]\s*,\s*\{\s*\}\s*\)")
+# A calculated table/partition -- the eagerly-evaluated kind, which fails at model LOAD rather than
+# at refresh. TMDL spells the mode either as ``mode: calculated`` or ``source = <DAX>`` under a
+# ``partition ... = calculated`` header.
+_CALCULATED_PARTITION_RE = re.compile(r"=\s*calculated\b|mode:\s*calculated\b")
+# A literal ``'Table'[Column]`` reference inside DAX. Only the quoted form is matched: an unquoted
+# table reference cannot contain the characters that make this ambiguous, and matching it would
+# start flagging measure names.
+_EAGER_TABLE_REF_RE = re.compile(r"'((?:[^']|'')+)'\[([^\]]+)\]")
 # a top-level ``table <name>`` declaration (name bare or quoted)
 _TABLE_DECL_RE = re.compile(r"^table\s+(?P<name>'(?:[^']|'')*'|\"[^\"]*\"|\S+)", re.MULTILINE)
 # a table-level ``column <name>`` declaration: exactly one leading tab, then ``column``.
@@ -497,5 +508,79 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
                     "CompatibilityLevel downgrade' -- the report will not open."
                     % (_lvl if _lvl is not None else "(absent)", MIN_COMPATIBILITY_LEVEL)),
             })
+
+    # EAGER CALCULATED-TABLE REFERENCES INTO A STUB. A distinct failure class from the dangling /
+    # collapsed-upstream categories above, and worth its own check because of WHEN it fires (#134).
+    #
+    # A calculated table is evaluated EAGERLY at model LOAD. An Import column errors on refresh; a
+    # calculated table errors on OPEN -- before any refresh, before any credential -- with
+    #     Column 'X' in table 'Y' cannot be found or may not be used in this expression.
+    # so the file simply does not open and no later gate ever runs. Reported at 11 of ~44 field
+    # models, and invisible to the definition-of-done report.
+    #
+    # Three gates that are not the same thing, and this sits in the gap between them:
+    #   1. deserializes -- TmdlSerializer / powerbi-report-author validate. Shape only.
+    #   2. OPENS in Desktop -- eager evaluation of calculated tables.   <- this check
+    #   3. refreshes -- M execution and column binding.
+    #
+    # Conservative by construction: only a table whose partition IS the placeholder counts as a stub,
+    # and only a LITERAL 'Table'[Column] reference inside a calculated table's own expression counts
+    # as eager. Anything it cannot parse is skipped rather than flagged.
+    # Only a stub whose referenced COLUMN is undeclared can break the open. Settled by experiment,
+    # which is what the reporter asked for ("the most useful thing a maintainer could tell me is
+    # which condition makes the difference -- most likely a variant where the Tableau schema yielded
+    # ZERO columns for the stub"). Their hypothesis was right:
+    #
+    #   stub DECLARES the column  -> the reference RESOLVES; Desktop opens, degraded, showing
+    #                                "One or more calculated objects need to be manually refreshed"
+    #                                and "Some of the tables have incomplete or no data".
+    #                                Measured by cold-opening 0083_previous_workday, whose Date
+    #                                calendar spans a textscan stub that declares 6 columns.
+    #   stub declares NOTHING     -> the reference cannot resolve; the calculated table fails during
+    #                                eager evaluation at model LOAD and the file does not open.
+    #
+    # So the check keys on the undeclared column, not on the mere presence of a stub -- otherwise it
+    # fires on every degraded-but-openable model, which is a different (and already reported)
+    # condition. The first version of this check did exactly that and failed the corpus.
+    stub_columns = {}
+    for path in sorted(parts):
+        if not _TABLE_PART_RE.match(path):
+            continue
+        text = parts[path] or ""
+        if not _STUB_PARTITION_RE.search(text):
+            continue
+        tname = _table_name(text)
+        if tname:
+            stub_columns[tname.casefold()] = {c.casefold() for c in _declared_columns(text)}
+
+    eager_ok = True
+    if stub_columns:
+        for path in sorted(parts):
+            if not _TABLE_PART_RE.match(path):
+                continue
+            text = parts[path] or ""
+            if not _CALCULATED_PARTITION_RE.search(text):
+                continue
+            owner = _table_name(text) or path
+            for ref_table, ref_col in _EAGER_TABLE_REF_RE.findall(text):
+                key = ref_table.replace("''", "'").casefold()
+                if key not in stub_columns:
+                    continue
+                if ref_col.strip().casefold() in stub_columns[key]:
+                    continue          # declared -> resolves -> opens (degraded), not a break
+                eager_ok = False
+                issues.append({
+                    "check": "eager_calc_refs_resolve",
+                    "table": owner,
+                    "part": path,
+                    "detail": (
+                        "calculated table %r references '%s'[%s], and that STUB table (placeholder "
+                        "partition) does not DECLARE that column. A calculated table is evaluated "
+                        "eagerly at model LOAD, so this fails when the file is OPENED -- before any "
+                        "refresh and before any credential -- with \"Column '%s' in table '%s' "
+                        "cannot be found or may not be used in this expression\"."
+                        % (owner, ref_table, ref_col, ref_col, ref_table)),
+                })
+        checks["eager_calc_refs_resolve"] = eager_ok
 
     return {"ok": not issues, "checks": checks, "issues": issues}

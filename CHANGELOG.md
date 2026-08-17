@@ -12,6 +12,44 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+
+- **`tableau-migration` (skill `2.150.0` → `2.151.0`): an eagerly-evaluated calculated table must not
+  reference an undeclared stub column.** Raised in #134, and the answer is the one the reporter asked
+  for: *"the most useful thing a maintainer could tell me is which condition makes the difference."*
+
+  **Settled by experiment.** A real corpus model turned out to have the exact shape they described —
+  `0083_previous_workday`, whose generated `Date` calendar spans a `textscan` stub. Cold-opening it in
+  Desktop:
+
+  | stub | result |
+  |---|---|
+  | **declares** the referenced column | **opens**, degraded — *"One or more calculated objects need to be manually refreshed"* / *"Some of the tables have incomplete or no data"* |
+  | declares **nothing** | the eager reference cannot resolve → the calculated table fails at model LOAD → **the file does not open** |
+
+  Their hypothesis was right. The discriminator is the undeclared column, not the presence of a stub.
+
+  Two changes, because prevention and detection are different jobs:
+
+  - **Prevention** — the calendar span skips stub-backed tables (`_stub_backed_tables`). Correct even
+    where the reference resolves: a stub holds no rows, so its `MIN`/`MAX` is BLANK and it can never
+    contribute a bound. It is pure exposure with no benefit. If that empties the span, the existing
+    `CALENDARAUTO()` fallback takes over.
+  - **Detection** — `check_model_openability` gains `eager_calc_refs_resolve`, naming the class rather
+    than merely avoiding it in the one generator known to hit it. This is the reporter's own framing
+    of why it needed a new check: *deserializes* (validate) passes, *refreshes* never runs because the
+    file will not open, and only *opens* catches it — which nothing automated covered.
+
+  **The corpus caught my first version.** It keyed on the presence of a stub and failed
+  `0083_previous_workday`, a model that opens fine. That over-fire is what prompted the cold-open
+  experiment above, and the check now keys on the unresolvable reference.
+
+  Deliberately unchanged: the engine's avoidance of `CALENDARAUTO()`. It scans every dateTime column
+  model-wide, so one birthdate drags the calendar back decades (measured: a 1941 calendar for 2017+
+  data). "Just use `CALENDARAUTO`" is not the fix, and the reporter said so first.
+
+  Corpus: 29/29 built, **zero drift** across 695 emitted files.
+
 ### Fixed
 
 - **`tableau-migration` (skill `2.149.0` → `2.150.0`): a join across incompatible connectors now
