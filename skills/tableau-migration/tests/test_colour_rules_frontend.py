@@ -7,6 +7,8 @@ PROPERTIES, not matched against templates, so a calculation the engine has never
 The corpus supplies the shapes asserted here: every "real workbook" formula below is copied verbatim
 from a workbook in the 29-workbook regression corpus or from `Logic example 4`.
 """
+import json
+
 import pytest
 
 import colour_rules as CR
@@ -163,3 +165,132 @@ class TestPredicateScope:
                   'ELSE "rest" END')
         assert s.supported and s.closed_domain
         assert s.scope == CR.SCOPE_VIEW
+
+
+# =============================================================================================
+# BACK END -- lowering to a PBIR `Conditional` (rung 1)
+# =============================================================================================
+def _resolve(toks):
+    """A stand-in for the emitter's model binding: SUM([X]) -> an Aggregation over Orders[X]."""
+    if len(toks) == 1 and toks[0][0] == "field":
+        return {"Column": {"Expression": {"SourceRef": {"Entity": "Orders"}},
+                           "Property": toks[0][1]}}
+    if (len(toks) == 4 and toks[0][0] == "id" and toks[1] == ("op", "(")
+            and toks[2][0] == "field" and toks[3] == ("op", ")")):
+        return {"Aggregation": {"Expression": {"Column": {
+            "Expression": {"SourceRef": {"Entity": "Orders"}},
+            "Property": toks[2][1]}}, "Function": 0}}
+    return None
+
+
+_PALETTE2 = {"negative": "#D62728", "positive": "#2CA02C"}
+
+
+class TestDNF:
+    def test_a_predicate_without_or_is_one_disjunct(self):
+        assert len(CR.to_dnf(CR._C._tokenize("SUM([Profit]) < 0"))) == 1
+
+    def test_or_splits_into_disjuncts(self):
+        assert len(CR.to_dnf(CR._C._tokenize("[a] > 1 OR [b] > 2 OR [c] > 3"))) == 3
+
+    def test_and_is_left_intact(self):
+        # AND is a real PBIR node; only OR has to be distributed
+        assert len(CR.to_dnf(CR._C._tokenize("[a] > 1 AND [b] > 2"))) == 1
+
+
+class TestLoweringToConditional:
+    def test_the_shipped_case_lowers_with_no_model_objects(self):
+        spec = _spec('IF SUM([Profit]) < 0 THEN "negative" ELSE "positive" END')
+        expr = CR.lower_to_conditional(spec, _PALETTE2, _resolve)
+        assert expr == {"Conditional": {
+            "Cases": [{"Condition": {"Comparison": {
+                "ComparisonKind": 3,
+                "Left": {"Aggregation": {"Expression": {"Column": {
+                    "Expression": {"SourceRef": {"Entity": "Orders"}},
+                    "Property": "Profit"}}, "Function": 0}},
+                "Right": {"Literal": {"Value": "0D"}}}},
+                "Value": {"Literal": {"Value": "'#D62728'"}}}],
+            "DefaultValue": {"Literal": {"Value": "'#2CA02C'"}}}}
+
+    def test_an_n_way_chain_becomes_n_ordered_cases(self):
+        spec = _spec('IF SUM([Sales]) > 100 THEN "a" ELSEIF SUM([Sales]) > 50 THEN "b" '
+                     'ELSE "c" END')
+        expr = CR.lower_to_conditional(
+            spec, {"a": "#111111", "b": "#222222", "c": "#333333"}, _resolve)
+        cases = expr["Conditional"]["Cases"]
+        assert [c["Value"]["Literal"]["Value"] for c in cases] == ["'#111111'", "'#222222'"]
+        assert expr["Conditional"]["DefaultValue"]["Literal"]["Value"] == "'#333333'"
+
+    def test_OR_becomes_two_cases_sharing_one_colour(self):
+        # PBIR silently ignores an {"Or": ...} node, so disjunction is spelled as repeated Cases
+        spec = _spec('IF SUM([Profit]) < 0 OR SUM([Sales]) < 10 THEN "negative" '
+                     'ELSE "positive" END')
+        expr = CR.lower_to_conditional(spec, _PALETTE2, _resolve)
+        cases = expr["Conditional"]["Cases"]
+        assert len(cases) == 2
+        assert {c["Value"]["Literal"]["Value"] for c in cases} == {"'#D62728'"}
+        # test the JSON KEY, not the substring: a bare "Or" matches inside "Orders"
+        assert '"Or":' not in json.dumps(expr), "an Or node is silently ignored by Power BI"
+
+    def test_AND_is_emitted_as_a_node(self):
+        spec = _spec('IF SUM([Profit]) < 0 AND SUM([Sales]) > 10 THEN "negative" '
+                     'ELSE "positive" END')
+        cond = CR.lower_to_conditional(spec, _PALETTE2, _resolve)["Conditional"]["Cases"][0]
+        assert "And" in cond["Condition"]
+
+    def test_NOT_is_emitted_as_a_node(self):
+        spec = _spec('IF NOT SUM([Profit]) < 0 THEN "positive" ELSE "negative" END')
+        cond = CR.lower_to_conditional(spec, _PALETTE2, _resolve)["Conditional"]["Cases"][0]
+        assert "Not" in cond["Condition"]
+
+    def test_arithmetic_inside_a_comparison(self):
+        spec = _spec('IF SUM([Discount]) * 200 > SUM([Profit]) THEN "negative" '
+                     'ELSE "positive" END')
+        cond = CR.lower_to_conditional(spec, _PALETTE2, _resolve)["Conditional"]["Cases"][0]
+        arith = cond["Condition"]["Comparison"]["Left"]["Arithmetic"]
+        assert arith["Operator"] == 2                      # multiply
+        assert arith["Right"] == {"Literal": {"Value": "200D"}}
+
+    def test_measure_versus_measure(self):
+        spec = _spec('IF SUM([Profit]) > SUM([Sales]) THEN "negative" ELSE "positive" END')
+        cmp_ = CR.lower_to_conditional(spec, _PALETTE2, _resolve)["Conditional"]["Cases"][0]
+        both = cmp_["Condition"]["Comparison"]
+        assert "Aggregation" in both["Left"] and "Aggregation" in both["Right"]
+
+    @pytest.mark.parametrize("op, kind", [("<", 3), ("<=", 4), (">", 1), (">=", 2), ("=", 0)])
+    def test_every_comparison_kind_maps(self, op, kind):
+        spec = _spec('IF SUM([Profit]) %s 0 THEN "negative" ELSE "positive" END' % op)
+        cond = CR.lower_to_conditional(spec, _PALETTE2, _resolve)["Conditional"]["Cases"][0]
+        assert cond["Condition"]["Comparison"]["ComparisonKind"] == kind
+
+    def test_a_case_chain_lowers_through_the_same_path(self):
+        spec = _spec('CASE [Region] WHEN "East" THEN "negative" ELSE "positive" END')
+        cond = CR.lower_to_conditional(spec, _PALETTE2, _resolve)["Conditional"]["Cases"][0]
+        assert cond["Condition"]["Comparison"]["ComparisonKind"] == 0
+        assert cond["Condition"]["Comparison"]["Right"] == {"Literal": {"Value": "'East'"}}
+
+
+class TestLoweringFailsClosed:
+    def test_an_unsupported_spec_lowers_to_nothing(self):
+        assert CR.lower_to_conditional(_spec("SUM([Sales])"), _PALETTE2, _resolve) is None
+
+    def test_an_open_member_domain_lowers_to_nothing(self):
+        # members are DATA -- no static palette exists, so this must fall to another rung
+        spec = _spec('IF SUM([Profit]) < 0 THEN [Category] ELSE "positive" END')
+        assert CR.lower_to_conditional(spec, _PALETTE2, _resolve) is None
+
+    def test_a_missing_palette_entry_lowers_to_nothing(self):
+        spec = _spec('IF SUM([Profit]) < 0 THEN "negative" ELSE "positive" END')
+        assert CR.lower_to_conditional(spec, {"negative": "#D62728"}, _resolve) is None
+
+    def test_an_unresolvable_operand_lowers_to_nothing(self):
+        # the resolver stands in for the model binding; None from it must abort the WHOLE rule
+        # rather than emit a rule with a hole in it
+        spec = _spec('IF WINDOW_MAX(SUM([Profit])) < 0 THEN "negative" ELSE "positive" END')
+        assert CR.lower_to_conditional(spec, _PALETTE2, _resolve) is None
+
+    def test_a_partial_rule_is_never_returned(self):
+        # first branch fine, second unresolvable -> nothing at all
+        spec = _spec('IF SUM([Profit]) < 0 THEN "negative" '
+                     'ELSEIF WINDOW_MAX(SUM([Sales])) > 1 THEN "negative" ELSE "positive" END')
+        assert CR.lower_to_conditional(spec, _PALETTE2, _resolve) is None

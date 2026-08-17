@@ -14,6 +14,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.155.0` → `2.156.0`): the conditional-colour compiler back end —
+  lowering to Power BI's own "Rules" conditional formatting.** Still unwired (no emitter calls it
+  yet, output byte-for-byte unchanged), but this is the rung that makes the rebuild *native* rather
+  than synthesised.
+
+  `lower_to_conditional(spec, palette, resolve)` turns an analysed colour calculation into a PBIR
+  `Conditional{Cases, DefaultValue}` expression — the JSON behind Desktop's **Rules** format style.
+  The Tableau string members never reach Power BI at all: they collapse into `Value` literals, so
+  the rebuild adds **nothing to the model** — no string measure, no colour twin — and opens in the
+  Conditional formatting dialog as rules a user can edit. Today the same encoding costs two
+  synthetic measures and is unreachable from the UI.
+
+  Every shape it emits was render-verified against Desktop first, because all of them pass
+  `powerbi-report-author validate` when they are wrong:
+
+  * `Comparison` × 5 kinds, measure-vs-literal, measure-vs-measure;
+  * `Arithmetic` inside a comparison (`SUM([Discount]) * 200 > SUM([Profit])`);
+  * `And`, `Not`;
+  * N ordered `Cases` + `DefaultValue`, which is what makes arbitrarily nested `IF`/`ELSEIF` free.
+
+  **Disjunction is never emitted as a node.** `{"Or": …}` is silently ignored by Power BI — the
+  whole `Conditional` falls through to its default, with a clean validation pass. Since each `Case`
+  already maps one predicate to one colour, `a OR b -> "X"` is simply two `Cases` both yielding
+  `colour("X")`, so predicates are normalised to **DNF** and one `Case` is emitted per disjunct.
+
+  Fail-closed and all-or-nothing: an unsupported spec, an open member domain (members that are
+  *data*, not literals), a missing palette entry, or any operand the caller's resolver cannot bind
+  returns `None` — never a rule with a hole in it. A caller that gets `None` falls to the next rung.
+
 - **`tableau-migration` (skill `2.154.0` → `2.155.0`): the calendar-span stub exclusion is keyed on
   the emitted artifact, so it actually fires.** Raised in #137 as a follow-up to #134, reproduced
   exactly as filed: `m_partition_review_reason()` returns a reason ("this is a scaffold") while

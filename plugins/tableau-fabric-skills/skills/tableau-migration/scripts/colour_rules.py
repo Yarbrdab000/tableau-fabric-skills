@@ -348,3 +348,168 @@ def _parse_case(toks):
             branches.extend(nested)
             return branches, nested_default, None
         return branches, _member_of(rest), None
+
+
+# =============================================================================================
+# BACK END -- lowering a predicate to a PBIR ``Conditional`` (the "Rules" format style)
+# =============================================================================================
+# Render-verified against Power BI Desktop, because every shape here also passes
+# `powerbi-report-author validate` when it is WRONG. What was proven to work:
+#
+#   Comparison x5 kinds | measure-vs-literal | measure-vs-measure | Arithmetic inside a comparison
+#   And | Not | N ordered Cases + DefaultValue
+#
+# What was proven NOT to work, silently (the whole Conditional falls through to DefaultValue):
+#
+#   {"Or": {"Left": ..., "Right": ...}}   as an expression node
+#
+# So disjunction is never emitted as a node. Because each Case already maps ONE predicate to ONE
+# colour, ``a OR b -> "X"`` is simply two Cases both yielding ``colour("X")`` -- which is why
+# predicates are normalised to DNF here and one Case is emitted per disjunct. Disjunction is free
+# in the target representation; it just cannot be spelled the obvious way.
+
+# Tableau comparison -> PBIR ComparisonKind (schema: semanticQuery/1.4.0).
+_COMPARISON_KIND = {"=": 0, "==": 0, ">": 1, ">=": 2, "<": 3, "<=": 4}
+# Tableau arithmetic -> PBIR Arithmetic Operator.
+_ARITH_OP = {"+": 0, "-": 1, "*": 2, "/": 3}
+
+
+def _find_top(toks, kinds, values):
+    """Index of the LAST top-level token whose ``(kind, value)`` matches -- right-associative split.
+
+    Splitting on the last operator keeps left-to-right evaluation order when the expression is
+    rebuilt as a nested binary tree.
+    """
+    depth, hit = 0, -1
+    for i, t in enumerate(toks):
+        if t[0] == "op" and t[1] in "({":
+            depth += 1
+        elif t[0] == "op" and t[1] in ")}":
+            depth -= 1
+        elif depth == 0 and t[0] in kinds and str(t[1]).upper() in values:
+            hit = i
+    return hit
+
+
+def _unwrap(toks):
+    """Strip one fully-enclosing pair of parentheses, repeatedly."""
+    while (len(toks) >= 2 and toks[0] == ("op", "(") and toks[-1] == ("op", ")")):
+        depth, encloses = 0, True
+        for i, t in enumerate(toks):
+            if t == ("op", "("):
+                depth += 1
+            elif t == ("op", ")"):
+                depth -= 1
+                if depth == 0 and i != len(toks) - 1:
+                    encloses = False
+                    break
+        if not encloses:
+            break
+        toks = toks[1:-1]
+    return toks
+
+
+def to_dnf(toks):
+    """Split a predicate into DISJUNCTS -- ``[tokens, ...]`` -- flattening top-level ``OR``.
+
+    Only ``OR`` is distributed, because that is the only operator PBIR cannot express as a node.
+    ``AND`` and ``NOT`` are left intact for the expression lowering, which handles both.
+    """
+    toks = _unwrap(list(toks))
+    i = _find_top(toks, {"id"}, {"OR"})
+    if i < 0:
+        return [toks]
+    return to_dnf(toks[:i]) + to_dnf(toks[i + 1:])
+
+
+def lower_condition(toks, resolve):
+    """A predicate token list -> a PBIR boolean condition, or ``None`` when not expressible.
+
+    ``resolve(tokens)`` is supplied by the caller (the emitter knows the model binding) and returns
+    a PBIR value expression for a non-boolean sub-expression -- e.g. ``SUM([Profit])`` ->
+    ``{"Aggregation": {...}}``. Returning ``None`` from it makes the whole predicate unexpressible,
+    which is the fail-closed path.
+    """
+    toks = _unwrap(list(toks))
+    if not toks:
+        return None
+    i = _find_top(toks, {"id"}, {"AND"})
+    if i > 0:
+        left = lower_condition(toks[:i], resolve)
+        right = lower_condition(toks[i + 1:], resolve)
+        return {"And": {"Left": left, "Right": right}} if left and right else None
+    if _kw(toks[0]) == "NOT":
+        inner = lower_condition(toks[1:], resolve)
+        return {"Not": {"Expression": inner}} if inner else None
+    i = _find_top(toks, {"cmp"}, set(_COMPARISON_KIND))
+    if i > 0:
+        kind = _COMPARISON_KIND.get(str(toks[i][1]))
+        if kind is None:
+            return None
+        left = lower_value(toks[:i], resolve)
+        right = lower_value(toks[i + 1:], resolve)
+        if left is None or right is None:
+            return None
+        return {"Comparison": {"ComparisonKind": kind, "Left": left, "Right": right}}
+    return None
+
+
+def lower_value(toks, resolve):
+    """A value token list -> a PBIR value expression, or ``None``.
+
+    Literals are emitted directly; arithmetic is rebuilt as nested ``Arithmetic`` nodes; anything
+    else is handed to ``resolve`` (a field, an aggregate call, a measure reference -- all things
+    only the emitter can bind).
+    """
+    toks = _unwrap(list(toks))
+    if not toks:
+        return None
+    if len(toks) == 1:
+        t = toks[0]
+        if t[0] == "num":
+            return {"Literal": {"Value": "%sD" % t[1]}}
+        if t[0] == "str":
+            return {"Literal": {"Value": "'%s'" % str(t[1]).replace("'", "''")}}
+    for ops in (("+", "-"), ("*", "/")):          # lowest precedence first
+        i = _find_top(toks, {"op"}, set(ops))
+        if i > 0:
+            left = lower_value(toks[:i], resolve)
+            right = lower_value(toks[i + 1:], resolve)
+            if left is None or right is None:
+                return None
+            return {"Arithmetic": {"Left": left, "Right": right,
+                                   "Operator": _ARITH_OP[str(toks[i][1])]}}
+    return resolve(toks)
+
+
+def lower_to_conditional(spec, palette, resolve):
+    """A :class:`ColourRuleSpec` + ``{member: hex}`` -> a PBIR ``Conditional`` expression.
+
+    This is rung 1 of the lowering ladder and the reason the whole compiler is worth building: the
+    Tableau string members never reach Power BI at all. They collapse into ``Value`` literals, so
+    the rebuild adds NOTHING to the model -- no string measure, no colour twin -- and opens in
+    Desktop's Conditional formatting dialog as editable rules.
+
+    Returns ``None`` (never a partial rule) when the spec is unsupported, the member domain is not
+    closed, a palette entry is missing, or any predicate cannot be expressed. A caller that gets
+    ``None`` falls to the next rung.
+    """
+    if not spec.supported or not spec.closed_domain:
+        return None
+    cases = []
+    for branch in spec.branches:
+        colour = palette.get(branch.member)
+        if not colour:
+            return None
+        for disjunct in to_dnf(branch.predicate):
+            cond = lower_condition(disjunct, resolve)
+            if cond is None:
+                return None
+            # one Case per disjunct, all yielding the same colour -- this IS the OR
+            cases.append({"Condition": cond,
+                          "Value": {"Literal": {"Value": "'%s'" % colour}}})
+    default = palette.get(spec.default)
+    if not cases or not default:
+        return None
+    return {"Conditional": {"Cases": cases,
+                            "DefaultValue": {"Literal": {"Value": "'%s'" % default}}}}
