@@ -14,6 +14,41 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.157.0` → `2.158.0`): the view-scoped rung of the conditional-colour
+  back end — lowering to a Visual Calculation.** Still unwired (nothing calls it, emitted output
+  unchanged). This is the rung with no alternative: when a predicate needs a value that does not
+  exist until the visual is evaluated — *"the lowest of the displayed bars"*, *"the 90th percentile
+  of what is on screen"* — no model measure can serve it. `2.152.0` measured why: the model-measure
+  form of a `WINDOW` comparison orders by a row-level column while the visual's axis is a grouped
+  one, so it is false on **every** mark.
+
+  `lower_to_visual_calc(spec, palette, resolve)` emits the DAX of a hex-returning Visual Calculation
+  — Microsoft's own documented mechanism for driving conditional formatting — as one nested `IF` per
+  branch in authored order, so the calculation reads alongside the Tableau formula it came from.
+  Tableau's view-scoped vocabulary is rewritten to DAX window functions:
+
+  | Tableau | DAX |
+  |---|---|
+  | `WINDOW_MIN/MAX/SUM/AVG/MEDIAN(x)`, `TOTAL(x)` | `MINX/MAXX/SUMX/AVERAGEX/MEDIANX(WINDOW(1, ABS, -1, ABS), x)` |
+  | `RUNNING_*(x)` | same aggregators over `WINDOW(1, ABS, 0, REL)` — first-row-to-current, a *different frame* |
+  | `WINDOW_PERCENTILE(x, p)` | `PERCENTILEX.INC(WINDOW(1, ABS, -1, ABS), x, p)` |
+  | `RANK(x)` | `RANK(DENSE, ORDERBY(x, DESC))` |
+  | `INDEX()` / `SIZE()` | `ROWNUMBER()` / `COUNTROWS(WINDOW(1, ABS, -1, ABS))` |
+
+  Operands are the visual's **projected column names** (`[Sum of Profit]`), not model measures,
+  because a Visual Calculation addresses the visual's own matrix — the caller supplies that naming.
+  Unlike rung 1 this keeps `||` for disjunction: DAX has a working OR, so no DNF expansion is needed
+  here. The DAX only is returned, not the projection, keeping PBIR assembly with the emitter.
+
+  Two shapes were **refuted by render** and are therefore never emitted, both passing `validate`
+  with 0 errors: a `NativeVisualCalculation` placed *inline* in a formatting property (silently
+  ignored — it must be a declared, hidden projection referenced by `SelectRef`), and an `Or` node.
+
+  Fail-closed and all-or-nothing, as rung 1: an unsupported spec, an open member domain, a missing
+  palette entry, or any operand the resolver cannot bind returns `None` — never a calculation with a
+  hole in it. The two rungs deliberately overlap on aggregate-scope predicates; the router (next)
+  prefers rung 1 because it adds nothing to the model.
+
 - **`tableau-migration` (skill `2.156.0` → `2.157.0`): the CHANGELOG's declared version chain is a
   gate, not a habit.** Two agents working in parallel shipped the *same* defect within an hour, on
   the same rebase, and neither was careless: a cross-session rebase merges the `VERSION` stamp

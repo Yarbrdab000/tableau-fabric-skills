@@ -294,3 +294,110 @@ class TestLoweringFailsClosed:
         spec = _spec('IF SUM([Profit]) < 0 THEN "negative" '
                      'ELSEIF WINDOW_MAX(SUM([Sales])) > 1 THEN "negative" ELSE "positive" END')
         assert CR.lower_to_conditional(spec, _PALETTE2, _resolve) is None
+
+# =============================================================================================
+# BACK END -- lowering to a VISUAL CALCULATION (rung 4)
+# =============================================================================================
+def _resolve_dax(toks):
+    """Stand-in for the emitter: SUM([X]) -> the visual's own projected column name."""
+    if (len(toks) == 4 and toks[0][0] == "id" and toks[1] == ("op", "(")
+            and toks[2][0] == "field" and toks[3] == ("op", ")")):
+        return "[%s of %s]" % (toks[0][1].capitalize(), toks[2][1])
+    if len(toks) == 1 and toks[0][0] == "field":
+        return "[%s]" % toks[0][1]
+    return None
+
+
+class TestVisualCalcLowering:
+    def test_the_highlight_the_lowest_scenario(self):
+        # the user's scenario 1, and 0070_new_max's shape
+        spec = _spec('IF SUM([Sales]) = WINDOW_MIN(SUM([Sales])) THEN "low" ELSE "other" END')
+        dax = CR.lower_to_visual_calc(spec, {"low": "#FF0000", "other": "#999999"}, _resolve_dax)
+        assert dax == ('IF([Sum of Sales] = MINX(WINDOW(1, ABS, -1, ABS), [Sum of Sales]), '
+                       '"#FF0000", "#999999")')
+
+    def test_the_percentile_scenario(self):
+        # "colour marks by what percentile they fall in"
+        spec = _spec('IF SUM([Sales]) >= WINDOW_PERCENTILE(SUM([Sales]), 0.9) THEN "top" '
+                     'ELSE "rest" END')
+        dax = CR.lower_to_visual_calc(spec, {"top": "#FF0000", "rest": "#0000FF"}, _resolve_dax)
+        assert "PERCENTILEX.INC(WINDOW(1, ABS, -1, ABS), [Sum of Sales], 0.9)" in dax
+
+    def test_a_running_window_uses_the_first_to_current_frame(self):
+        # RUNNING_* is first-row-to-current; WINDOW_* is the whole partition. Different frames.
+        spec = _spec('IF RUNNING_MAX(SUM([Sales])) = SUM([Sales]) THEN "new" ELSE "no" END')
+        dax = CR.lower_to_visual_calc(spec, {"new": "#111111", "no": "#222222"}, _resolve_dax)
+        assert "MAXX(WINDOW(1, ABS, 0, REL), [Sum of Sales])" in dax
+        assert "-1, ABS" not in dax
+
+    @pytest.mark.parametrize("fn, agg", [("WINDOW_SUM", "SUMX"), ("WINDOW_AVG", "AVERAGEX"),
+                                         ("WINDOW_MIN", "MINX"), ("WINDOW_MAX", "MAXX"),
+                                         ("WINDOW_MEDIAN", "MEDIANX"), ("TOTAL", "SUMX")])
+    def test_each_window_function_maps_to_its_dax_aggregator(self, fn, agg):
+        spec = _spec('IF SUM([Sales]) > %s(SUM([Sales])) THEN "a" ELSE "b" END' % fn)
+        dax = CR.lower_to_visual_calc(spec, {"a": "#1", "b": "#2"}, _resolve_dax)
+        assert dax.startswith("IF([Sum of Sales] > %s(" % agg), dax
+
+    def test_an_n_way_chain_nests_in_authored_order(self):
+        spec = _spec('IF SUM([Sales]) > 100 THEN "a" ELSEIF SUM([Sales]) > 50 THEN "b" '
+                     'ELSE "c" END')
+        dax = CR.lower_to_visual_calc(spec, {"a": "#1", "b": "#2", "c": "#3"}, _resolve_dax)
+        assert dax == ('IF([Sum of Sales] > 100, "#1", '
+                       'IF([Sum of Sales] > 50, "#2", "#3"))')
+
+    def test_disjunction_keeps_the_dax_or_operator(self):
+        # unlike rung 1, DAX HAS a working OR -- so no DNF expansion is needed here
+        spec = _spec('IF SUM([Sales]) > 100 OR SUM([Profit]) < 0 THEN "a" ELSE "b" END')
+        dax = CR.lower_to_visual_calc(spec, {"a": "#1", "b": "#2"}, _resolve_dax)
+        assert "||" in dax
+
+    def test_conjunction_and_negation(self):
+        spec = _spec('IF NOT SUM([Sales]) > 100 AND SUM([Profit]) < 0 THEN "a" ELSE "b" END')
+        dax = CR.lower_to_visual_calc(spec, {"a": "#1", "b": "#2"}, _resolve_dax)
+        assert "&&" in dax and "NOT(" in dax
+
+    def test_arithmetic_is_parenthesised(self):
+        spec = _spec('IF SUM([Discount]) * 200 > SUM([Profit]) THEN "a" ELSE "b" END')
+        dax = CR.lower_to_visual_calc(spec, {"a": "#1", "b": "#2"}, _resolve_dax)
+        assert "([Sum of Discount] * 200)" in dax
+
+    def test_index_and_size_lower_to_their_visual_calc_equivalents(self):
+        assert CR.dax_value(CR._C._tokenize("INDEX()"), _resolve_dax) == "ROWNUMBER()"
+        assert CR.dax_value(CR._C._tokenize("SIZE()"), _resolve_dax) == \
+            "COUNTROWS(WINDOW(1, ABS, -1, ABS))"
+
+
+class TestVisualCalcFailsClosed:
+    def test_an_unresolvable_leaf_yields_nothing(self):
+        spec = _spec('IF [Parameters].[P] > 1 THEN "a" ELSE "b" END')
+        assert CR.lower_to_visual_calc(spec, {"a": "#1", "b": "#2"}, _resolve_dax) is None
+
+    def test_an_open_member_domain_yields_nothing(self):
+        spec = _spec('IF SUM([Sales]) > 1 THEN [Category] ELSE "b" END')
+        assert CR.lower_to_visual_calc(spec, {"b": "#2"}, _resolve_dax) is None
+
+    def test_a_missing_palette_entry_yields_nothing(self):
+        spec = _spec('IF SUM([Sales]) > 1 THEN "a" ELSE "b" END')
+        assert CR.lower_to_visual_calc(spec, {"a": "#1"}, _resolve_dax) is None
+
+    def test_a_partial_calculation_is_never_returned(self):
+        spec = _spec('IF SUM([Sales]) > 1 THEN "a" '
+                     'ELSEIF [Parameters].[P] > 1 THEN "a" ELSE "b" END')
+        assert CR.lower_to_visual_calc(spec, {"a": "#1", "b": "#2"}, _resolve_dax) is None
+
+
+class TestTheTwoRungsAgreeOnWhatTheyCanDo:
+    """Rung 1 handles what the semantic query can evaluate; rung 4 handles what only the visual can.
+    Neither should silently claim the other's territory."""
+
+    def test_rung1_refuses_a_view_scoped_predicate(self):
+        spec = _spec('IF SUM([Sales]) = WINDOW_MIN(SUM([Sales])) THEN "a" ELSE "b" END')
+        assert spec.scope == CR.SCOPE_VIEW
+        assert CR.lower_to_conditional(spec, {"a": "#1", "b": "#2"}, _resolve) is None
+
+    def test_rung4_can_still_express_an_aggregate_only_predicate(self):
+        # overlap is fine and useful -- the ROUTER prefers rung 1, but rung 4 is a valid fallback
+        spec = _spec('IF SUM([Profit]) < 0 THEN "a" ELSE "b" END')
+        assert spec.scope == CR.SCOPE_AGGREGATE
+        assert CR.lower_to_conditional(spec, {"a": "#1", "b": "#2"}, _resolve) is not None
+        assert CR.lower_to_visual_calc(spec, {"a": "#1", "b": "#2"}, _resolve_dax) is not None

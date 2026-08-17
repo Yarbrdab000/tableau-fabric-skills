@@ -513,3 +513,179 @@ def lower_to_conditional(spec, palette, resolve):
         return None
     return {"Conditional": {"Cases": cases,
                             "DefaultValue": {"Literal": {"Value": "'%s'" % default}}}}
+
+
+# =============================================================================================
+# BACK END -- lowering to a VISUAL CALCULATION (rung 4, the view-scoped rung)
+# =============================================================================================
+# When any predicate needs a value that does not exist until the visual is evaluated -- "the lowest
+# of the displayed bars", "the 90th percentile of what is on screen" -- no model measure can serve
+# it. Measured on 0070_new_max: the model-measure form of a WINDOW comparison orders by a row-level
+# column while the visual's axis is a grouped one, so it is false on EVERY mark.
+#
+# The mechanism that does work is Microsoft's own documented one: a Visual Calculation returning a
+# hex string, consumed as the `Field value` format style. Render-verified, including PERCENTILEX.INC,
+# RANK and MINX over WINDOW(1, ABS, -1, ABS).
+#
+# TWO SHAPES WERE REFUTED BY RENDER, both passing `validate` with 0 errors:
+#   * a NativeVisualCalculation placed INLINE in a formatting property -- silently ignored. It must
+#     be a DECLARED, hidden projection referenced by {"SelectRef": {"ExpressionName": <queryRef>}}.
+#   * an {"Or": ...} node (see rung 1) -- which is why DNF is applied here too.
+#
+# A Visual Calculation addresses the visual's own matrix, so its operands are the PROJECTED column
+# names ([Sum of Profit]), not model measures. The caller supplies that naming through ``resolve``.
+
+# Tableau view-scoped function -> (DAX aggregator, window spec). The window is the whole visual
+# partition for WINDOW_*/TOTAL, and first-row-to-current for RUNNING_*.
+_WHOLE = "WINDOW(1, ABS, -1, ABS)"
+_RUNNING = "WINDOW(1, ABS, 0, REL)"
+_VC_AGGREGATOR = {
+    "WINDOW_SUM": ("SUMX", _WHOLE), "WINDOW_AVG": ("AVERAGEX", _WHOLE),
+    "WINDOW_MIN": ("MINX", _WHOLE), "WINDOW_MAX": ("MAXX", _WHOLE),
+    "WINDOW_MEDIAN": ("MEDIANX", _WHOLE), "WINDOW_COUNT": ("COUNTX", _WHOLE),
+    "TOTAL": ("SUMX", _WHOLE),
+    "RUNNING_SUM": ("SUMX", _RUNNING), "RUNNING_AVG": ("AVERAGEX", _RUNNING),
+    "RUNNING_MIN": ("MINX", _RUNNING), "RUNNING_MAX": ("MAXX", _RUNNING),
+    "RUNNING_COUNT": ("COUNTX", _RUNNING),
+}
+
+_DAX_COMPARISON = {"=": "=", "==": "=", ">": ">", ">=": ">=", "<": "<", "<=": "<="}
+
+
+def _call_args(toks):
+    """``(FN, [arg_tokens, ...])`` when ``toks`` is exactly one function call, else ``None``."""
+    toks = _unwrap(list(toks))
+    if len(toks) < 3 or toks[0][0] != "id" or toks[1] != ("op", "("):
+        return None
+    if toks[-1] != ("op", ")"):
+        return None
+    depth, args, cur = 0, [], []
+    for t in toks[1:]:
+        if t == ("op", "("):
+            depth += 1
+            if depth == 1:
+                continue
+        elif t == ("op", ")"):
+            depth -= 1
+            if depth == 0:
+                args.append(cur)
+                break
+        if depth == 1 and t == ("op", ","):
+            args.append(cur)
+            cur = []
+            continue
+        cur.append(t)
+    # A zero-argument call (``INDEX()`` / ``SIZE()``) collects one EMPTY argument; normalise it away
+    # so "no arguments" is spelled the same as an empty list rather than ``[[]]``, which is truthy.
+    return (toks[0][1].upper(), [a for a in args if a])
+
+
+def dax_value(toks, resolve):
+    """A value token list -> a visual-calculation DAX fragment, or ``None``.
+
+    ``resolve(tokens)`` names the visual's own projected column for a leaf the caller owns
+    (``SUM([Profit])`` -> ``[Sum of Profit]``). Everything view-scoped is rewritten here.
+    """
+    toks = _unwrap(list(toks))
+    if not toks:
+        return None
+    if len(toks) == 1:
+        t = toks[0]
+        if t[0] == "num":
+            return str(t[1])
+        if t[0] == "str":
+            return '"%s"' % str(t[1]).replace('"', '""')
+    for ops in (("+", "-"), ("*", "/")):
+        i = _find_top(toks, {"op"}, set(ops))
+        if i > 0:
+            left = dax_value(toks[:i], resolve)
+            right = dax_value(toks[i + 1:], resolve)
+            if left is None or right is None:
+                return None
+            return "(%s %s %s)" % (left, toks[i][1], right)
+    call = _call_args(toks)
+    if call:
+        fn, args = call
+        if fn in _VC_AGGREGATOR and args:
+            aggregator, window = _VC_AGGREGATOR[fn]
+            inner = dax_value(args[0], resolve)
+            return "%s(%s, %s)" % (aggregator, window, inner) if inner else None
+        if fn == "WINDOW_PERCENTILE" and len(args) >= 2:
+            inner = dax_value(args[0], resolve)
+            pct = dax_value(args[1], resolve)
+            return ("PERCENTILEX.INC(%s, %s, %s)" % (_WHOLE, inner, pct)
+                    if inner and pct else None)
+        if fn in ("RANK", "RANK_DENSE") and args:
+            inner = dax_value(args[0], resolve)
+            return "RANK(DENSE, ORDERBY(%s, DESC))" % inner if inner else None
+        if fn == "INDEX" and not args:
+            return "ROWNUMBER()"
+        if fn == "SIZE" and not args:
+            return "COUNTROWS(%s)" % _WHOLE
+    return resolve(toks)
+
+
+def dax_condition(toks, resolve):
+    """A predicate token list -> a visual-calculation DAX boolean, or ``None``."""
+    toks = _unwrap(list(toks))
+    if not toks:
+        return None
+    i = _find_top(toks, {"id"}, {"AND"})
+    if i > 0:
+        left = dax_condition(toks[:i], resolve)
+        right = dax_condition(toks[i + 1:], resolve)
+        return "(%s && %s)" % (left, right) if left and right else None
+    i = _find_top(toks, {"id"}, {"OR"})
+    if i > 0:
+        left = dax_condition(toks[:i], resolve)
+        right = dax_condition(toks[i + 1:], resolve)
+        return "(%s || %s)" % (left, right) if left and right else None
+    if _kw(toks[0]) == "NOT":
+        inner = dax_condition(toks[1:], resolve)
+        return "NOT(%s)" % inner if inner else None
+    i = _find_top(toks, {"cmp"}, set(_DAX_COMPARISON))
+    if i > 0:
+        op = _DAX_COMPARISON.get(str(toks[i][1]))
+        left = dax_value(toks[:i], resolve)
+        right = dax_value(toks[i + 1:], resolve)
+        if op is None or left is None or right is None:
+            return None
+        return "%s %s %s" % (left, op, right)
+    return None
+
+
+def lower_to_visual_calc(spec, palette, resolve):
+    """A :class:`ColourRuleSpec` -> the DAX of a hex-returning Visual Calculation, or ``None``.
+
+    Emits one nested ``IF`` per branch, in authored order, ending at the default colour -- so the
+    calculation reads alongside the Tableau formula it came from. Unlike rung 1 this keeps ``||``
+    for disjunction (DAX has it; the PBIR expression tree does not), so no DNF expansion is needed.
+
+    The result is destined for a DECLARED, HIDDEN projection
+    (``{"field": {"NativeVisualCalculation": {...}}, "hidden": true}``) referenced from the colour
+    property by ``SelectRef`` -- the inline form does not work. Returning the DAX only, rather than
+    the projection, keeps this module free of PBIR assembly, which the emitter owns.
+
+    Fail-closed: ``None`` on an unsupported spec, an open member domain, a missing palette entry, or
+    any operand that cannot be expressed -- never a calculation with a hole in it.
+    """
+    if not spec.supported or not spec.closed_domain:
+        return None
+    default = palette.get(spec.default)
+    if not default:
+        return None
+    parts = []
+    for branch in spec.branches:
+        colour = palette.get(branch.member)
+        if not colour:
+            return None
+        cond = dax_condition(branch.predicate, resolve)
+        if cond is None:
+            return None
+        parts.append((cond, colour))
+    if not parts:
+        return None
+    dax = '"%s"' % default
+    for cond, colour in reversed(parts):
+        dax = 'IF(%s, "%s", %s)' % (cond, colour, dax)
+    return dax
