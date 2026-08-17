@@ -14,6 +14,45 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.167.0` → `2.175.0`): the conditional-colour compiler is WIRED —
+  a string-member colour calc now paints cells and marks natively, with nothing added to the
+  model.** The three preceding releases were inert by construction; this is the one that changes
+  what ships.
+
+  A Tableau calc that outputs string members and sits on Colour —
+  `IF SUM([Profit]) < 0 THEN "negative" ELSE "positive" END`, or a five-branch `ELSEIF` chain, or a
+  `CASE` over a dimension — is now compiled to a PBIR **Rules** `Conditional` and bound directly to
+  the channel the mark implies: `values[].fontColor` / `backColor` for a matrix or table cell,
+  `dataPoint.fill` for a chart mark. Both sides emit the *same* expression; only the channel differs.
+
+  **The members never reach Power BI.** They collapse into `Value` literals, so the rebuild emits
+  no synthetic string measure and no colour twin, and the result opens in Desktop's Conditional
+  formatting dialog as rules a user can read and edit. Render-verified on `Logic example 4`: cells
+  paint per-row blue/orange exactly as the twin version did, from a `Conditional` comparing
+  `Sum(Orders[Profit])` to `0` — identical output, no model objects.
+
+  Two things only the emitter can supply are wired here, and both reuse existing machinery rather
+  than re-deriving it:
+
+  * **leaf binding** — `AGG([Field])` and bare `[Field]` are routed through `_field_expression`, the
+    same code path that projects the visual's own columns, and are matched against the worksheet's
+    already-resolved fields first, so a rule can never bind a subtly different object than the
+    column beside it;
+  * **the palette** — authored `<map to='#hex'>` first, else Tableau's default categorical ramp in
+    sorted member order, the same precedence the model colour twin uses, so a rule and a twin can
+    never paint one workbook two ways.
+
+  **The colour twin remains the fallback, and the split is by what the calc RETURNS.** A boolean
+  driver (`SUM([Profit]) > 0`) has no members to collapse into a palette and keeps the hex-returning
+  twin it has had since `2.127.0`. View-scoped and untranslatable drivers keep their `2.152.0`
+  deferrals. A native rebuild is deliberately *not* warned about — it is faithful, not a degradation.
+
+  Corpus: 29/29, dangling references still 0, and **no visual changed** — the corpus's own
+  string-member calcs are declined correctly (one has no `ELSE`, so its domain is not closed;
+  another compares against a `[Parameters].[…]` operand the resolver does not yet bind). Fail-closed
+  throughout: anything the compiler cannot express falls to the rung below it, never to a partial
+  rule.
+
 - **`tableau-migration` (skill `2.166.0` → `2.167.0`): the linter catches structurally-invalid PBIR
   the engine can emit — `pbir_lint` R9, required roles.** Raised in #144 as the systemic gap that let
   #143 ship green: a run graded `definition_of_done: warn` / `0 error` / `Viz=built` over a report

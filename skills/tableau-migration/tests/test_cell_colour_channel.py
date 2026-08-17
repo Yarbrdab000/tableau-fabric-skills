@@ -81,10 +81,24 @@ class TestChannelFollowsTheMark:
 
 
 class TestTheBinding:
-    def test_the_colour_is_the_models_hex_returning_twin(self):
+    def test_a_string_member_calc_binds_a_native_RULES_conditional(self):
+        # THE POINT OF THE COMPILER: the Tableau members collapse into Value literals, so the
+        # comparison is against the REAL measure and nothing is added to the model. No twin.
         entry = _visual(_table_ir("Automatic"))["visual"]["objects"]["values"][0]
-        assert entry["properties"]["fontColor"]["solid"]["color"]["expr"]["Measure"] == {
-            "Expression": {"SourceRef": {"Entity": "_Measures"}}, "Property": "Sign (colour)"}
+        expr = entry["properties"]["fontColor"]["solid"]["color"]["expr"]
+        assert "Conditional" in expr, "a lowerable calc must not fall back to a colour twin"
+        case = expr["Conditional"]["Cases"][0]
+        cmp_ = case["Condition"]["Comparison"]
+        assert cmp_["ComparisonKind"] == 3                     # LessThan
+        assert cmp_["Left"]["Aggregation"]["Expression"]["Column"]["Property"] == "Profit"
+        assert cmp_["Right"] == {"Literal": {"Value": "0D"}}
+        assert case["Value"]["Literal"]["Value"].startswith("'#")
+
+    def test_the_rule_references_no_model_measure_at_all(self):
+        import json
+        blob = json.dumps(_visual(_table_ir("Automatic"))["visual"]["objects"]["values"])
+        assert "(colour)" not in blob, "the whole point is that no colour twin is needed"
+        assert '"Measure"' not in blob
 
     def test_every_value_column_is_coloured_not_just_the_first(self):
         # Tableau colours every measure cell in the row from the one mark colour, so each projected
@@ -99,11 +113,13 @@ class TestTheBinding:
         for entry in _visual(_table_ir("Automatic"))["visual"]["objects"]["values"]:
             assert entry["selector"]["data"] == [{"dataViewWildcard": {"matchingOption": 1}}]
 
-    def test_the_encoding_is_disclosed_rather_than_applied_silently(self):
+    def test_a_native_rebuild_is_not_warned_about(self):
+        # A Rules conditional format is a FAITHFUL rebuild, not a degradation -- warning on it would
+        # be false noise. The deferral paths still warn; those are covered in
+        # test_view_scoped_colour_defer.py.
         ir = _table_ir("Automatic")
         emit_pbir(ir)
-        assert any("discrete colour" in w["reason"] and "fontColor" in w["reason"]
-                   for w in ir["warnings"])
+        assert not [w for w in ir["warnings"] if "discrete colour deferred" in w["reason"]]
 
 
 class TestTheDriverIsNotAColumn:
@@ -148,22 +164,22 @@ class TestItIsDiscreteNeverAGradient:
         assert R._gradient_input_is_safe(color) is False
 
 
-class TestTheSameTwinServesMarksAndBars:
-    """One model-side hex twin, every visual family -- "cells or bars or marks or whatever"."""
+class TestTheSameMechanismServesMarksAndBars:
+    """One compiler, every visual family -- "cells or bars or marks or whatever"."""
 
-    def _chart_ir(self, mark):
-        enc = "<encodings><color column='[federated.abc].[usr:Calculation_sign:nk]' /></encodings>"
+    def _chart_ir(self, mark, calc=None, token="usr:Calculation_sign:nk"):
+        enc = "<encodings><color column='[federated.abc].[%s]' /></encodings>" % token
         ws = _worksheet("Bars", mark,
                         rows="[federated.abc].[sum:Profit:qk]",
                         cols="[federated.abc].[none:Category:nk]",
-                        deps_extra=_INST + _LABEL_CALC, encodings=enc)
+                        deps_extra=_INST + (calc or _LABEL_CALC), encodings=enc)
         return parse_twb(_workbook(ws))
 
-    def test_a_bar_chart_fills_its_marks_from_the_same_twin(self):
+    def test_a_bar_chart_fills_its_marks_from_the_same_rules_conditional(self):
         objs = _visual(self._chart_ir("Bar"))["visual"]["objects"]
-        fill = objs["dataPoint"][0]["properties"]["fill"]["solid"]["color"]["expr"]
-        assert fill["Measure"] == {"Expression": {"SourceRef": {"Entity": "_Measures"}},
-                                   "Property": "Sign (colour)"}
+        expr = objs["dataPoint"][0]["properties"]["fill"]["solid"]["color"]["expr"]
+        assert "Conditional" in expr
+        assert expr["Conditional"]["Cases"][0]["Condition"]["Comparison"]["ComparisonKind"] == 3
 
     def test_a_chart_mark_fill_carries_the_wildcard_selector(self):
         # matchingOption 0 = every data point. Without it every mark paints identically.
@@ -171,11 +187,45 @@ class TestTheSameTwinServesMarksAndBars:
         assert objs["dataPoint"][0]["selector"]["data"] == [
             {"dataViewWildcard": {"matchingOption": 0}}]
 
-    def test_no_chart_family_falls_back_to_a_gradient(self):
+    def test_cells_and_bars_agree_on_the_colours_they_paint(self):
+        # the same calc, the same members, the same palette -- only the CHANNEL differs
         import json
-        for mark in ("Bar", "Circle", "Automatic"):
-            blob = json.dumps(_visual(self._chart_ir(mark)))
-            assert "linearGradient" not in blob, mark
+        cell = _visual(_table_ir("Automatic"))["visual"]["objects"]["values"][0]
+        bar = _visual(self._chart_ir("Bar"))["visual"]["objects"]["dataPoint"][0]
+        cell_expr = cell["properties"]["fontColor"]["solid"]["color"]["expr"]
+        bar_expr = bar["properties"]["fill"]["solid"]["color"]["expr"]
+        assert json.dumps(cell_expr, sort_keys=True) == json.dumps(bar_expr, sort_keys=True)
+
+
+# a BOOLEAN driver -- no string members, so the compiler declines and the colour TWIN still serves
+_BOOL_CALC = ("<column caption='Profitable?' datatype='boolean' name='[Calculation_pf]' "
+              "role='measure' type='nominal'><calculation class='tableau' "
+              "formula='SUM([Profit]) &gt; 0' /></column>"
+              "<column-instance column='[Calculation_pf]' derivation='User' "
+              "name='[usr:Calculation_pf:nk]' pivot='key' type='nominal' />")
+
+
+class TestTheColourTwinIsStillTheFallback:
+    """The compiler handles calcs that OUTPUT STRING MEMBERS. A boolean driver has no members to
+    collapse into a palette, so it keeps the hex-returning twin it has had since 2.127.0. The two
+    mechanisms are complementary, and the split is by what the calc RETURNS."""
+
+    def _bool_chart(self):
+        enc = "<encodings><color column='[federated.abc].[usr:Calculation_pf:nk]' /></encodings>"
+        ws = _worksheet("Bars", "Bar",
+                        rows="[federated.abc].[sum:Profit:qk]",
+                        cols="[federated.abc].[none:Category:nk]",
+                        deps_extra=_INST + _BOOL_CALC, encodings=enc)
+        return parse_twb(_workbook(ws))
+
+    def test_a_boolean_driver_is_not_lowerable_to_rules(self):
+        import colour_rules as CR
+        assert CR.analyse_colour_calc("SUM([Profit]) > 0").supported is False
+
+    def test_a_boolean_driver_still_paints_from_the_twin(self):
+        objs = _visual(self._bool_chart())["visual"]["objects"]
+        fill = objs["dataPoint"][0]["properties"]["fill"]["solid"]["color"]["expr"]
+        assert fill["Measure"]["Property"] == "Profitable? (colour)"
 
 
 def test_the_ir_exports_only_an_explicitly_authored_palette():
