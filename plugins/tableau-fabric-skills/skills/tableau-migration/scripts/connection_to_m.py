@@ -3101,6 +3101,33 @@ def _is_excel_path(path):
         return False
 
 
+_OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def is_biff8_workbook(path):
+    """True when ``path`` is a legacy BIFF8 / OLE2 compound-document workbook.
+
+    Decided on the CONTAINER FORMAT (the OLE2 magic bytes), never the extension, because the
+    extension lies in BOTH directions: a ``.xls`` may be OOXML (Excel happily opens a renamed one,
+    and export tools emit them), and an ``.xlsx`` is never BIFF8. Reported in #129, which argued
+    exactly this and was right.
+
+    Why it matters: ``Excel.Workbook`` returns a DIFFERENT navigation table per container. For OOXML
+    the table carries ``Item``/``Kind`` columns; for BIFF8 it carries only ``Name`` and ``Data``, so
+    an ``[Item=..., Kind=...]`` key cannot match and refresh dies with *"The key didn't match any
+    rows in the table"*.
+
+    Fail-closed: an unreadable/missing file returns ``False``, which keeps today's ``Item``/``Kind``
+    emission -- the shape that is correct for every OOXML workbook and for every path this predicate
+    cannot inspect.
+    """
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(8) == _OLE2_MAGIC
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _is_zip_readable_excel_path(path):
     """True only for the OOXML (zip) Excel formats whose sheets this module can actually read.
 
@@ -3379,7 +3406,20 @@ def emit_flatfile_source(relation, conn, cls):
             item = item[:-1]
         sheet = escape_m_string(item)
         steps.append(f'Source = Excel.Workbook({contents}, null, true)')
-        steps.append(f'Navigation = Source{{[Item="{sheet}", Kind="{kind}"]}}[Data]')
+        # ``Excel.Workbook`` hands back a different navigation table per CONTAINER format, so the
+        # key has to follow the container and not the extension (#129). OOXML exposes
+        # ``Item``/``Kind``; a legacy BIFF8/OLE2 workbook exposes only ``Name``/``Data``, so an
+        # ``Item``/``Kind`` key matches nothing and refresh fails with "The key didn't match any
+        # rows in the table" -- after the model has validated, opened, and passed the definition of
+        # done, which is what makes it expensive to find.
+        #
+        # Measured on the reference corpus (0063_remove_null_and_all, which packages a genuine
+        # OLE2 .xls): the Item/Kind form refreshed to that exact error and 0 rows; the Name form
+        # loaded 8,399.
+        if is_biff8_workbook(path):
+            steps.append(f'Navigation = Source{{[Name="{sheet}"]}}[Data]')
+        else:
+            steps.append(f'Navigation = Source{{[Item="{sheet}", Kind="{kind}"]}}[Data]')
         steps.append("Promoted = Table.PromoteHeaders(Navigation, [PromoteAllScalars=true])")
         prev = "Promoted"
     elif connector == "Access.Database":
