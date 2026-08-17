@@ -4894,6 +4894,22 @@ def _dod_openability_failure(w):
         if failed:
             return "model is not openable: failed " + ", ".join(sorted(failed))
         return "model is not openable"
+    # A visual that names a model object the model does not contain is the same class of defect on
+    # the REPORT side: the visual renders EMPTY (or, for a conditional format, silently unpainted),
+    # `powerbi-report-author validate` returns 0 errors, and the run reported success. The binding
+    # lint has always DETECTED this (``viz_dangling_bindings``); it was softened to a fidelity
+    # warning, so a workbook could ship with a visual bound to nothing and still be called done.
+    #
+    # Escalated only now that the corpus is clean: measured 4 dangling references across 3 of the 29
+    # workbooks before 2.152.0 and 0 after, so this is INERT on green and can only fire on a real
+    # regression. Landing it first would have taken the corpus gate 29/29 -> 26/29 and left every
+    # later run measuring against a red baseline.
+    dangling = w.get("viz_dangling_bindings") or {}
+    problems = dangling.get("problems") if isinstance(dangling, dict) else None
+    if isinstance(dangling, dict) and dangling.get("count"):
+        first = (problems or ["(unnamed)"])[0]
+        return ("report binds %d model object(s) that do not exist: %s"
+                % (dangling["count"], str(first)[:220]))
     # A page-less REPORT is the same class of defect on the other side of the project: Power BI
     # Desktop does not open it as an empty report, it throws ``TypeError: Cannot read properties of
     # undefined (reading 'visualContainers')`` and the whole project -- including the model that IS

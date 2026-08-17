@@ -14,6 +14,24 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.153.0` → `2.154.0`): a visual bound to a model object that does
+  not exist now FAILS the definition of done.** `lint_visual_model_bindings` has always *detected*
+  this — the report records `viz_dangling_bindings` and names each offender exactly — but it was
+  softened to a fidelity warning, so a workbook could ship with a visual bound to nothing and still
+  be reported as done. The visual renders EMPTY (or, for a conditional format, silently unpainted)
+  and `powerbi-report-author validate` returns 0 errors, which is precisely why a soft signal was
+  the wrong strength.
+
+  **Sequenced deliberately.** Landing this before `2.152.0` would have taken the corpus gate from
+  29/29 to 26/29 and left every later run measuring against a red baseline: 4 dangling references
+  across 3 of the 29 workbooks (`0070_new_max` ×2, `0080_calculate_slope_and_residuals`,
+  `0081_correlation_r_squared`), all reporting `built`. Measured after `2.152.0`: **0**. So the
+  escalation is inert on green — corpus `29/29 bound, 0 failed, 23 warned`, byte-identical to the
+  run before it — and can fire only on a real regression.
+
+  Ordering guard included: the dangling check must not short-circuit the page-less check that
+  follows it (it did, on first write, and a test now pins it).
+
 - **`tableau-migration` (skill `2.152.0` → `2.153.0`): the conditional-colour compiler front end.**
   Analysis only — nothing is wired to an emitter yet, so output is byte-for-byte unchanged. This is
   the piece that makes conditional colour *general* rather than a set of recognised templates.
