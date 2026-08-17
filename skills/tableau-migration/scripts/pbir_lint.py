@@ -213,6 +213,35 @@ def _lint_native_query_refs(parts):
     return problems
 
 
+def _lint_page_order(parts):
+    """Validity R7: the report must declare at least one page.
+
+    A PBIR whose ``pages.json`` ``pageOrder`` is empty does NOT open as an empty report -- Power BI
+    Desktop throws ``TypeError: Cannot read properties of undefined (reading 'visualContainers')``
+    and refuses the project outright, which also puts the semantic model built beside it out of
+    reach. ``powerbi-report-author validate`` does catch this (``PBIR_PAGE_ORDER_EMPTY``), but that
+    CLI is an opt-in npm pre-gate an ordinary run never reaches, so the hermetic linter -- which
+    runs in the always-on pytest gate -- must catch it too.
+
+    Only checked when a ``pages.json`` is present: a parts dict that carries no report at all (a
+    model-only build) is not a page-less report.
+    """
+    problems = []
+    for path in sorted(parts):
+        if not path.endswith("pages/pages.json"):
+            continue
+        doc = _load_json(parts, path)
+        if not isinstance(doc, dict):
+            continue
+        order = doc.get("pageOrder")
+        if isinstance(order, list) and not order:
+            problems.append(
+                "%s: pageOrder is empty -- a PBIR with no pages CRASHES Power BI Desktop on open "
+                "('Cannot read properties of undefined (reading 'visualContainers')'), taking the "
+                "semantic model beside it out of reach; emit at least a placeholder page" % path)
+    return problems
+
+
 def _registered_items(report):
     """Yield each ``RegisteredResources`` item dict, tolerating both the flat
     ``{name,type,items}`` shape the emitter writes and the wrapped ``{resourcePackage:{...}}`` shape
@@ -386,6 +415,7 @@ def lint_pbir_parts(parts, model_surface=None):
     parts = parts or {}
     return (_lint_visual_types(parts) + _lint_theme(parts)
             + _lint_card_display_units(parts) + _lint_native_query_refs(parts)
+            + _lint_page_order(parts)
             + lint_visual_model_bindings(parts, model_surface))
 
 
