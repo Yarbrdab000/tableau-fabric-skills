@@ -2526,7 +2526,63 @@ def _mv_shelf_locations(rows_text, cols_text, pane):
     return locs
 
 
-def _measure_value_member_ids(view, ds_default):
+def _placed_instance_ids(rows_text, cols_text, panes):
+    """Instance ids this view spends on a NAMED shelf (Rows/Columns) or a pane encoding.
+
+    Encoding children are read generically -- ``color``/``text``/``tooltip``/``size``/``lod``/
+    ``shape``/... all carry the pill on a ``column`` attribute -- so a new encoding kind needs no
+    change here. Ids are returned in the SAME stripped form the instance table is keyed by
+    (``sum:Sales:qk``), because ``<column-instance name>`` keeps its brackets while a shelf token
+    does not: comparing the two raw forms misses by exactly one character on every pill.
+    """
+    out = set()
+    for tok in _TOKEN_RE.findall((rows_text or "") + " " + (cols_text or "")):
+        _ds, fid = _split_token(tok)
+        if fid:
+            out.add(_strip_brackets(fid))
+    for pane in (panes or ()):
+        holder = _first(pane, "encodings")
+        if holder is None:
+            continue
+        for child in list(holder):
+            _ds, fid = _split_token_attr(child.get("column"))
+            if fid:
+                out.add(_strip_brackets(fid))
+    return out
+
+
+def _view_measure_instances(view, ds_default, used_instances=None):
+    """Every measure pill the view declares that is NOT placed on a named shelf/encoding.
+
+    This is the member set of an UNFILTERED Measure Values shelf. Tableau records no explicit
+    member list for that case -- the shelf carries the pseudo-field ``[Multiple Values]`` and the
+    real measures exist only as the view's own ``<column-instance>`` declarations -- so the
+    displayed set is exactly "every measure instance this view depends on, minus the ones it
+    spends somewhere else".
+
+    ``type="quantitative"`` is the measure test rather than the base column's ``role``: Measure
+    Values is a continuous-only container, so a ``role="measure"`` STRING calc (e.g. a
+    ``"positive"``/``"negative"`` label driving Colour, serialised ``type="nominal"``) is a
+    measure that is *not* a Measure Values member. ``used_instances`` carries the instance ids
+    already spent on Rows/Columns/Colour/Size/Text/Tooltip/... so a measure on Tooltip is not
+    mistaken for a displayed column.
+    """
+    used = used_instances or frozenset()
+    out, seen = [], set()
+    for dep in _findall_local(view, "datasource-dependencies"):
+        dsn = dep.get("datasource") or ds_default
+        for ci in _children_local(dep, "column-instance"):
+            if (ci.get("type") or "").strip().lower() != "quantitative":
+                continue
+            iid = _strip_brackets(ci.get("name") or "")
+            if not iid or iid in used or (dsn, iid) in seen:
+                continue
+            seen.add((dsn, iid))
+            out.append((dsn, iid))
+    return out
+
+
+def _measure_value_member_ids(view, ds_default, used_instances=None):
     """Ordered ``(ds, instance_id)`` Measure Values members, plus an enumeration status.
 
     Returns ``(members, status)`` where ``status`` is one of:
@@ -2534,11 +2590,20 @@ def _measure_value_member_ids(view, ds_default):
     - ``"ok"``      -- an authoritative keep-list (a ``<groupfilter function="union" op="manual">``
       whose ``function="member"`` children are the *included* measures, in document = shelf
       order) or, when no such filter is present, the ``<manual-sort>`` dictionary fallback.
-    - ``"exclude"`` -- the Measure Names filter is an Exclude / non-manual structure
-      (``except`` / ``level-members``), where the listed members are the *excluded* set; the
-      displayed set cannot be derived from the workbook alone, so the caller must warn + defer
-      rather than show the wrong measures.
+    - ``"all"``     -- the Measure Names filter is a bare ``<groupfilter function="level-members">``
+      with no member children: Tableau's "every member of the level", which is what it writes the
+      moment Measure Names lands on a shelf with nothing filtered out. Members are enumerated from
+      the view's own measure declarations and carry no authored order, so the caller sorts them.
+    - ``"exclude"`` -- the Measure Names filter is an Exclude / non-manual structure (``except``,
+      or a ``level-members`` that itself carries member children), where the listed members are
+      the *excluded* set; the displayed set cannot be derived from the workbook alone, so the
+      caller must warn + defer rather than show the wrong measures.
     - ``"none"``    -- no member source was found.
+
+    ``except`` and a bare ``level-members`` are OPPOSITES and were previously conflated: ``except``
+    lists the REMOVED members, ``level-members`` means every member. Refusing the latter refused
+    the most ordinary Measure Names worksheet there is, and -- when it was the only sheet -- left
+    the report with zero pages.
 
     The ``<manual-sort>`` dictionary is only a fallback because it keeps stale members that were
     since removed from the shelf.
@@ -2558,14 +2623,17 @@ def _measure_value_member_ids(view, ds_default):
                 or not col.endswith(":Measure Names]"):
             continue
         # the inclusion authority is a *direct* union+manual keep-list; any other top-level group
-        # (except / level-members / non-manual union) is an Exclude action whose member list is
-        # the removed set -- reading it as the keep-list would surface exactly the wrong measures.
-        manual, nonmanual = None, False
+        # (except / narrowed level-members / non-manual union) is an Exclude action whose member
+        # list is the removed set -- reading it as the keep-list would surface the wrong measures.
+        # A CHILDLESS level-members narrows nothing at all and is handled separately.
+        manual, nonmanual, all_members = None, False, False
         for child in _children_local(filt, "groupfilter"):
             fn = child.get("function")
             op = _attr_local(child, "op")
             if fn == "union" and op == "manual":
                 manual = child
+            elif fn == "level-members" and not _children_local(child, "groupfilter"):
+                all_members = True
             elif fn in ("except", "level-members") or (fn == "union" and op != "manual"):
                 nonmanual = True
         if manual is not None:
@@ -2574,6 +2642,10 @@ def _measure_value_member_ids(view, ds_default):
                 return mem, "ok"
         if nonmanual:
             return [], "exclude"
+        if all_members:
+            mem = _view_measure_instances(view, ds_default, used_instances)
+            if mem:
+                return mem, "all"
     for ms in _findall_local(view, "manual-sort"):
         if (ms.get("column") or "").endswith(":Measure Names]"):
             members = []
@@ -2589,14 +2661,14 @@ def _measure_value_member_ids(view, ds_default):
 def _resolve_measure_values(view, ds_default, base_cols, instances, index, ds_caption,
                             worksheet, warnings, internal_fields=None,
                             measure_binding=None, row_count_binding=None, column_binding=None,
-                            date_binding=None):
+                            date_binding=None, used_instances=None):
     """Resolve the ordered Measure Values members to value fields.
 
     Drops numeric-literal dummy spacers (the path-hack constant). Returns
     ``(members, dummy_count, has_param_swap, status)`` where ``status`` is the enumeration
     status from :func:`_measure_value_member_ids`.
     """
-    member_ids, status = _measure_value_member_ids(view, ds_default)
+    member_ids, status = _measure_value_member_ids(view, ds_default, used_instances)
     members, dummy_count, has_param_swap = [], 0, False
     for ds, fid in member_ids:
         inst = instances.get((ds, fid))
@@ -2614,6 +2686,14 @@ def _resolve_measure_values(view, ds_default, base_cols, instances, index, ds_ca
                            column_binding=column_binding, date_binding=date_binding)
         if f and f["kind"] == "value":
             members.append(f)
+    if status == "all":
+        # An unfiltered Measure Names level carries NO authored order -- the member set was
+        # recovered from the view's declarations, whose serialised order is Tableau's internal
+        # id sort (``cnt:`` < ``none:`` < ``sum:`` < ``usr:``), not the display order. Tableau
+        # renders an unsorted Measure Names header alphabetically by caption, so sort on that:
+        # it reproduces the source column order instead of scattering the calcs to the end.
+        members.sort(key=lambda f: ((f.get("caption") or "").strip().casefold(),
+                                    (f.get("caption") or "").strip()))
     return members, dummy_count, has_param_swap, status
 
 
@@ -4583,7 +4663,12 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
             # derivations collapsed into a single identical reference (issue #103: Tableau's
             # "Avg. OTE" column vanished and the survivor reported the wrong grain).
             measure_binding=measure_binding, row_count_binding=row_count_binding,
-            column_binding=column_binding, date_binding=date_binding)
+            column_binding=column_binding, date_binding=date_binding,
+            # Every pill this view spends on a NAMED shelf or encoding. Only consulted when the
+            # Measure Names level is unfiltered and the member set has to be recovered from the
+            # view's own declarations -- it is what keeps a measure parked on Tooltip/Colour from
+            # being mistaken for a displayed Measure Values column.
+            used_instances=_placed_instance_ids(rows_text, cols_text, all_panes))
         visual_type, inject_shelf, fidelity_note = _route_measure_values(
             mark, locs, members, dummy_count, has_param_swap, mv_status,
             dims_rows, dims_cols, name, warnings)
@@ -7000,18 +7085,22 @@ def _build_query_state(ws, model_table, field_map, warnings):
                        + ([color] if color and color["kind"] == "value" else [])
                        + ([label] if label and label["kind"] == "value" else [])
                        + ([size] if size and size["kind"] == "value" else []))
-        # Heat-grid colour DRIVER -> not a visible column. When a continuous colour scale colours a
+        # Heat-grid colour DRIVER -> not a visible column. When a colour encoding colours a
         # DISTINCT displayed value (Tableau "colour by a different field"), the colour measure must
-        # not appear as its own matrix column -- it only drives the background gradient, which the
-        # `FillRule` references by MODEL name and therefore does not need projected into the query.
-        # Only fires when there is another displayed value AND a gradient is present, so the classic
-        # highlight table (colour == the shown measure) is unchanged.
+        # not appear as its own matrix column -- it only drives the cell colour, which the
+        # `FillRule` / `Field value` expression references by MODEL name and therefore does not need
+        # projected into the query. Fires for a continuous gradient AND for a DISCRETE colour
+        # measure: the latter is a STRING measure, so leaving it projected renders a literal
+        # ``negative``/``positive`` text column next to the numbers the author actually asked for.
+        # Only fires when there is another displayed value, so the classic highlight table
+        # (colour == the shown measure) is unchanged.
         #
         # It used to ride along in a ``Tooltips`` role. A pivotTable has NO Tooltips well, so that
         # role made the visual invalid and it failed to render -- adjudicated on a ground-truth run
         # as a deterministic-rule defect ("remove invalid Tooltips role from pivotTable", 2 pages).
         # Dropping the projection entirely is both the fix and the faithful shape.
-        if ws.get("color_gradient") and color and color["kind"] == "value":
+        if (ws.get("color_gradient") or (color or {}).get("discrete_measure")) \
+                and color and color["kind"] == "value":
             ck = (color["entity"], color["property"], color["binding"], color["aggregation"])
             others = [f for f in vals
                       if (f["entity"], f["property"], f["binding"], f["aggregation"]) != ck]
@@ -8105,6 +8194,92 @@ def _disclose_default_palette(ws, cg, warnings):
         "background colour scale used Tableau's default continuous palette (the source serialised "
         "no explicit colours); applied a default {0} gradient -- verify the colours against the "
         "source".format("diverging" if diverging else "sequential")))
+
+
+# Tableau's Colour shelf paints THE MARK, so which channel a table/matrix cell colour lands on is
+# decided by the MARK TYPE -- and the two are not interchangeable:
+#
+#   * ``Text`` (and ``Automatic``, which draws text on a crosstab) -- the mark IS the number, so
+#     Colour is the FONT colour. The cell keeps its normal background. This is the ordinary
+#     "text table with conditionally coloured numbers".
+#   * ``Square`` -- the mark is a filled rectangle behind the label, so Colour is the CELL
+#     BACKGROUND. This is the classic highlight table.
+#
+# Painting a text table's background reproduces neither: it fills every cell with a colour the
+# source never drew, and the numbers -- the thing the author actually colour-coded -- stay black.
+_TEXT_MARK_CLASSES = frozenset({"", "automatic", "text", "label"})
+
+
+def _cell_colour_property(ws):
+    """``"fontColor"`` or ``"backColor"`` -- the PBIR cell channel this worksheet's mark colours.
+
+    Fail-closed toward the filled cell: only a mark that is explicitly text-drawing colours the
+    font, so an unrecognised mark keeps the long-standing background behaviour.
+    """
+    return ("fontColor" if (ws.get("mark_class") or "").strip().lower() in _TEXT_MARK_CLASSES
+            else "backColor")
+
+
+def _matrix_discrete_measure_colour(ws, state, model_table, field_map, warnings):
+    """A DISCRETE aggregate measure on Colour over a TABLE / MATRIX -> ``(value_objects, fact)``.
+
+    The table-shaped sibling of :func:`_chart_discrete_measure_fill`, and the answer to the most
+    ordinary Tableau text table there is: rows of dimensions, a band of measures, and every number
+    coloured by a calc that returns a LABEL -- ``IF SUM([Profit]) < 0 THEN "negative" ELSE
+    "positive" END``. Power BI cannot drive a categorical legend from a measure (a legend needs a
+    grouping column, which is row-level and would change the aggregate grain and the row count), so
+    this binds the model's hex-returning colour twin through conditional formatting as the
+    ``Field value`` format style -- editable in Desktop's ``fx`` dialog rather than unreachable JSON.
+
+    Emitted per VALUE COLUMN. Tableau colours every measure cell in the row from the one mark
+    colour, so each projected value gets its own ``selector.metadata`` entry naming the column it
+    paints; a single unscoped entry colours only the first column.
+
+    The channel is chosen by MARK TYPE -- font for a text table, background for a Square highlight
+    table (see :data:`_TEXT_MARK_CLASSES`) -- because Tableau's Colour shelf paints the mark, and on
+    a text table the mark is the number itself.
+    """
+    color = ws["encodings"].get("color")
+    if not color or not color.get("discrete_measure"):
+        return None, None
+    if ws.get("visual_type") not in (VT_MATRIX, VT_TABLE):
+        return None, None
+    if color.get("kind") != "value" or color.get("binding") not in ("aggregation", "measure"):
+        return None, None
+    values = (state.get("Values") or {}).get("projections", [])
+    if not values:
+        return None, None
+    measure_name = _discrete_colour_measure_name(color)
+    prop = _cell_colour_property(ws)
+    expr = {"solid": {"color": {"expr": {
+        "Measure": {"Expression": {"SourceRef": {"Entity": MEASURES_TABLE}},
+                    "Property": measure_name}}}}}
+    value_objects = [{
+        "properties": {prop: expr},
+        # matchingOption 1 + metadata = "this column, every data point in it". Without the
+        # wildcard Power BI evaluates the expression in ONE context and paints every cell the same
+        # colour -- with a clean validation pass (see _chart_discrete_measure_fill).
+        "selector": {"data": [{"dataViewWildcard": {"matchingOption": 1}}],
+                     "metadata": p["queryRef"]},
+    } for p in values]
+    fact = {"kind": "cell_discrete_measure_colour",
+            "channel": prop,
+            "mark": ws.get("mark_class"),
+            "colour_measure": measure_name,
+            "source_measure": color.get("caption"),
+            "targets": [p["queryRef"] for p in values],
+            "status": "emitted"}
+    warnings.append(_warn(
+        "worksheet", ws["name"],
+        "discrete colour: Tableau colours these cells by a DISCRETE aggregate measure (%r). Power "
+        "BI has no native categorical legend for a measure-driven colour -- a legend needs a "
+        "grouping COLUMN, which is row-level and would change the aggregate grain -- so this is "
+        "rebuilt as conditional formatting on %s (the %s mark colours the %s) driven by a colour "
+        "measure %r (Format style 'Field value', editable in Desktop's fx dialog), applied to all "
+        "%d value column(s). There is no colour legend"
+        % (color.get("caption"), prop, ws.get("mark_class") or "Automatic",
+           "text" if prop == "fontColor" else "cell background", measure_name, len(values))))
+    return value_objects, fact
 
 
 def _conditional_format(ws, state, model_table, field_map, warnings):
@@ -9239,6 +9414,36 @@ def scatter_composite_key_name(dims):
     """
     parts = [str((d.get("property") or d.get("caption") or "")).strip() for d in dims]
     return SCATTER_KEY_PREFIX + " (" + " + ".join(p for p in parts if p) + ")"
+
+
+def discrete_colour_palettes(ir):
+    """``{measure caption: [(member, "#rrggbb"), ...]}`` -- AUTHORED colours for each discrete
+    colour measure this report paints with.
+
+    The model owns the hex-returning colour twin (it is a DAX measure), but only the REPORT layer
+    can see which colours the author assigned: Tableau stores them per worksheet as
+    ``<style-rule element='mark'><encoding attr='color'><map to='#hex'><bucket>"member"</bucket>``.
+    So the first viz pass exports them here and the model build consumes them, the same
+    report-informs-model channel the scatter composite grain key already uses.
+
+    Only an EXPLICIT per-member assignment is exported. A worksheet whose author never opened the
+    colour editor yields nothing, and the model then falls back to Tableau's own default categorical
+    assignment -- which is what such a worksheet actually renders, so the fallback is a faithful
+    reproduction rather than a guess. Returns ``{}`` for a report that paints nothing discretely.
+    """
+    out = {}
+    for ws in (ir or {}).get("worksheets") or []:
+        color = (ws.get("encodings") or {}).get("color") or {}
+        if not color.get("discrete_measure") or color.get("kind") != "value":
+            continue
+        caption = (color.get("caption") or "").strip()
+        palette = ws.get("mark_colors") or {}
+        members = [(m.get("value"), m.get("color"))
+                   for m in (palette.get("members") or [])
+                   if m.get("value") and m.get("color")]
+        if caption and members and caption not in out:
+            out[caption] = members
+    return out
 
 
 def scatter_composite_keys(ir):
@@ -11214,6 +11419,12 @@ def _page_json(name, display_name, canvas_fill=None):
     return page
 
 
+# The display name of the placeholder page a page-less report ships so Desktop can open it. Named
+# so a reader who opens the project knows immediately that nothing was rebuilt, rather than
+# wondering which page is missing.
+_EMPTY_REPORT_PAGE_NAME = "No visuals rebuilt"
+
+
 def _emit_page(parts, page_name, display_name, visuals, canvas_fill=None):
     """Write a page.json plus its visual.json parts; ``visuals`` is a list of dicts."""
     base = f"definition/pages/{page_name}"
@@ -11231,6 +11442,7 @@ def _dumps(obj):
 # few dozen px tall, so a single "reasonably large" bold size reads as a header at any page scale
 # (the source point size, tuned to Tableau's own banner geometry, does not transfer 1:1).
 _BANNER_FONT_SIZE = "18pt"
+_BANNER_FONT_PT = 18.0
 
 
 def _banner_textbox_visual(name, position, banner):
@@ -11264,6 +11476,7 @@ def _banner_textbox_visual(name, position, banner):
         },
         "drillFilterOtherVisuals": True,
     }
+    _fit_textbox_padding(visual, position, _BANNER_FONT_PT)
     return {"$schema": SCHEMA_VISUAL, "name": name, "position": position, "visual": visual}
 
 
@@ -11286,6 +11499,40 @@ _TEXT_OBJECT_FONT_SIZE = "12pt"
 _TEXTBOX_MIN_H = 20.0   # px: one line of ~12pt body text (never clips a single line)
 _TEXTBOX_MIN_W = 8.0    # px: degenerate-width guard only; never inflate a caption's authored width
 _PT_TO_PX = 96.0 / 72.0
+
+# Power BI reserves 8px of padding above AND below a textbox's text by default, so a box's USABLE
+# height is ``height - 16``. Tableau reserves nothing: an author who drew a 24px caption strip drew
+# it to fit 12pt text, and it does -- in Tableau. Emitted verbatim, those 24px leave 8 for a line
+# that needs 19, and the band renders CLIPPED with a scrollbar stub.
+#
+# The geometry is NOT the thing to change (see ``_fit_textbox_padding``); the padding is. These
+# constants are the RENDERER's own, not an estimate: ``max(18, ceil(pt * 25/16)) + padTop + padBottom``
+# reproduces `powerbi-report-author validate`'s PBIR_TEXTBOX_HEIGHT_BELOW_FLOOR numbers exactly
+# (12pt -> 35, 16pt -> 41).
+_TEXTBOX_DEFAULT_PAD = 8.0   # px, per side -- Power BI's default textbox padding
+
+
+def _textbox_text_height(font_pt=None):
+    """Px the RENDERER gives the text itself, before padding: ``max(18, ceil(pt * 25 / 16))``."""
+    return max(18.0, math.ceil(float(font_pt or 12.0) * 25.0 / 16.0))
+
+
+def _textbox_min_height(font_pt=None, pad_top=None, pad_bottom=None):
+    """The smallest textbox height that renders ``font_pt`` text without clipping it.
+
+    Mirrors the renderer's rule that `powerbi-report-author validate` enforces as
+    ``PBIR_TEXTBOX_HEIGHT_BELOW_FLOOR``. Padding defaults to Power BI's 8px per side; pass the
+    authored padding to get the floor for a box whose padding we set ourselves.
+
+    Deliberately NOT used as a ``_scale_zone`` floor. Inflating a caption to reach it is the
+    regression ``test_thin_caption_sizes_to_content_not_inflated_to_floor`` guards, and the reason
+    is measured: a readability floor propagated up a zone tree makes a frame scale the WHOLE canvas
+    to satisfy it (:func:`layout_solve._clamp_to_authored` -- eleven pixels of caption once cost five
+    hundred pixels of page). Sizing is settled by padding instead.
+    """
+    pad = (_TEXTBOX_DEFAULT_PAD if pad_top is None else float(pad_top)) + \
+          (_TEXTBOX_DEFAULT_PAD if pad_bottom is None else float(pad_bottom))
+    return max(_TEXTBOX_MIN_H, _textbox_text_height(font_pt) + pad)
 
 
 def _text_object_textbox_visual(name, position, tob):
@@ -11332,7 +11579,49 @@ def _text_object_textbox_visual(name, position, tob):
         },
         "drillFilterOtherVisuals": True,
     }
+    _fit_textbox_padding(visual, position, size)
     return {"$schema": SCHEMA_VISUAL, "name": name, "position": position, "visual": visual}
+
+
+def _fit_textbox_padding(visual, position, font_pt=None):
+    """Shrink OUR OWN padding so the author's caption height still renders its text.
+
+    Power BI reserves 8px above and below a textbox's text by default, so a box's USABLE height is
+    ``height - 16``. Tableau has no such reserve: an author who drew a 24px caption strip drew it to
+    fit 12pt text, and it does fit -- in Tableau. Emitted verbatim into Power BI, those same 24px
+    become 8 of text in a 12pt line's worth of space, and the band renders CLIPPED with a scrollbar
+    stub. Measured on a real network-operations dashboard: the caption
+    "Sort By = Network Score | Region = All | Fiscal Month =" sheared its descenders at 24px, and a
+    16pt section header did the same at 31px.
+
+    The fix is NOT to grow the box. Growing it is what the layout solver deliberately refuses to do
+    (:func:`layout_solve._clamp_to_authored`) and for good reason -- a readability floor propagated up
+    a zone tree makes a frame scale the WHOLE canvas to satisfy it, and eleven pixels of caption once
+    cost five hundred pixels of page. The author's geometry is evidence and it wins.
+
+    But the 16px is not the author's, it is OURS: a default we never asked for on a box we emit. So
+    give the text the room by spending our own padding first, down to zero, and only then leave the
+    box as authored. Explicit padding is emitted ONLY when the default would clip -- a textbox with
+    room to spare is byte-identical to before.
+
+    Mirrors the renderer's own rule, which ``powerbi-report-author validate`` enforces as
+    ``PBIR_TEXTBOX_HEIGHT_BELOW_FLOOR``: text needs ``max(18, ceil(pt * 25 / 16))`` px, plus padding.
+    """
+    try:
+        height = float((position or {}).get("height") or 0.0)
+    except (TypeError, ValueError):
+        return
+    if height <= 0:
+        return
+    need = _textbox_text_height(font_pt)
+    spare = height - need
+    if spare >= 2 * _TEXTBOX_DEFAULT_PAD:
+        return                      # the default already fits -- emit nothing (never-regress)
+    pad = max(0.0, math.floor(spare / 2.0))
+    visual.setdefault("visualContainerObjects", {})["padding"] = [{"properties": {
+        "top": {"expr": {"Literal": {"Value": "%dD" % int(pad)}}},
+        "bottom": {"expr": {"Literal": {"Value": "%dD" % int(pad)}}},
+    }}]
 
 
 def _caption_only_textbox_visual(ws, zone, ref_w, ref_h, name, tab=0):
@@ -12018,6 +12307,15 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             else:
                 value_objects, cf_fact = _conditional_format(
                     ws, state, model_table, field_map, warnings)
+                if value_objects is None:
+                    # No CONTINUOUS scale. A DISCRETE colour measure paints the same cells through
+                    # the model's hex-returning colour twin instead -- font or background per the
+                    # Tableau mark. Only consulted when the gradient path emitted nothing, so a
+                    # heat table is byte-unchanged.
+                    _dc_objects, _dc_fact = _matrix_discrete_measure_colour(
+                        ws, state, model_table, field_map, warnings)
+                    if _dc_objects:
+                        value_objects, cf_fact = _dc_objects, _dc_fact
             data_point_objects, mc_fact = _data_point_colors(
                 ws, state, ws["visual_type"], model_table, field_map, warnings)
             cont_objects, cont_fact = _chart_discrete_measure_fill(
@@ -12282,6 +12580,13 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         else:
             value_objects, cf_fact = _conditional_format(
                 ws, state, model_table, field_map, warnings)
+            if value_objects is None:
+                # See the dashboard path: a DISCRETE colour measure paints these cells through the
+                # model's colour twin when there is no continuous scale to own them.
+                _dc_objects, _dc_fact = _matrix_discrete_measure_colour(
+                    ws, state, model_table, field_map, warnings)
+                if _dc_objects:
+                    value_objects, cf_fact = _dc_objects, _dc_fact
         data_point_objects, mc_fact = _data_point_colors(
             ws, state, ws["visual_type"], model_table, field_map, warnings)
         cont_objects, cont_fact = _chart_discrete_measure_fill(
@@ -12381,6 +12686,24 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         visuals = [main] + _emit_slicers([ws], page_name, model_table, field_map, warnings)
         _emit_page(parts, page_name, ws["name"], visuals)
         page_order.append(page_name)
+
+    # ZERO-PAGE CRASH GUARD. A PBIR whose ``pageOrder`` is empty does not open EMPTY -- Power BI
+    # Desktop throws ``TypeError: Cannot read properties of undefined (reading 'visualContainers')``
+    # and the project fails to open at all, which takes the correctly built semantic model beside it
+    # out of reach too. So a run where every worksheet deferred still ships ONE page.
+    #
+    # Deliberately a page with NO visuals: the emit gate's contract -- "an unsupported mark / a
+    # chart missing a required role emits no visual" -- is exactly right and stays intact. This adds
+    # the container Desktop requires, never a visual the gate refused.
+    if not page_order:
+        _placeholder = _sanitize("page-empty")
+        _emit_page(parts, _placeholder, _EMPTY_REPORT_PAGE_NAME, [])
+        page_order.append(_placeholder)
+        warnings.append(_warn(
+            "workbook", ir.get("name") or "workbook",
+            "no worksheet could be rebuilt, so the report carries a single empty placeholder page: "
+            "a PBIR with no pages CRASHES Power BI Desktop on open (it does not open empty), which "
+            "would also put the semantic model built beside it out of reach"))
 
     parts["definition/pages/pages.json"] = _dumps({
         "$schema": SCHEMA_PAGES,

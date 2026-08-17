@@ -14,6 +14,134 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.145.0` → `2.146.0`): the discrete colour palette is the AUTHOR's,
+  with an opt-in semantic red/green for polarity domains.** The colour twin landed in `2.144.0`
+  always used Tableau's default categorical ramp. That is right for an unauthored domain — and
+  wrong the moment the author opened Tableau's colour editor, because their assignment lives in the
+  worksheet (`<style-rule element='mark'><encoding attr='color'><map to='#hex'><bucket>`) where only
+  the report layer can see it, while the twin is a DAX measure only the model can own.
+
+  So the first viz pass now exports `discrete_colour_palettes(ir)` and the model build consumes it —
+  the same report-informs-model channel the scatter composite grain key already uses. Resolution is
+  three-tier and the tier that fired is recorded on the measure
+  (`TranslatedBy = deterministic (categorical colour measure, <origin> palette)`), so a default is
+  never presented as the author's choice:
+
+  1. **`authored`** — the workbook's own per-member colours. Always wins. A *partial* assignment is
+     refused rather than mixed with defaults: filling the gaps from the ramp would shift the
+     members the author *did* choose into different slots and silently recolour them.
+  2. **`semantic`** — opt-in via `--semantic-colours`: red `#D62728` / green `#2CA02C` for a domain
+     of exactly two recognised, opposite polarity members (`negative`/`positive`, `loss`/`profit`,
+     `fail`/`pass`, `below`/`above`, …). Both poles must be recognised, so `East`/`West` is never
+     painted as if it meant good and bad.
+  3. **`tableau_default`** — Tableau's own categorical ramp in sorted member order. **The default**,
+     because a workbook that authors no palette is not colourless: Tableau paints it from that ramp
+     and that is what the source actually renders, so reproducing it keeps the rebuild faithful.
+
+  Verified by render both ways on the same workbook: the default build draws negative rows blue and
+  positive orange (matching the Tableau reference exactly), and `--semantic-colours` draws them red
+  and green. In both, the colour is **discrete** — one solid colour per member, bound as
+  `Field value`. Explicitly regression-guarded against the `2.127.0` trap: a string domain must
+  never acquire a `linearGradient`/`FillRule`, on a matrix or on a chart, because Power BI evaluates
+  MIN/MAX over the fill input to find a ramp's endpoints, cannot do that to a string, and kills the
+  visual at query time through a validation that reports zero errors.
+
+  The same single twin drives every family — matrix cells (`values[].fontColor`/`backColor`, chosen
+  by the mark) and chart marks (`dataPoint.fill`) — so bars, circles and cells all follow the one
+  encoding. Across the 29-workbook corpus this changes no colour and no metric: the one existing
+  twin gains its `tableau_default` disclosure and nothing else moves.
+
+- **`tableau-migration` (skill `2.144.0` → `2.145.0`): a report with no pages CRASHES Power BI
+  Desktop, so one is never emitted again.** A PBIR whose `pages.json` carries `"pageOrder": []`
+  does not open as an empty report — Desktop throws
+  `TypeError: Cannot read properties of undefined (reading 'visualContainers')` and refuses the
+  project outright. That is worse than an empty report, because the semantic model built beside it
+  in the same `.pbip` becomes unreachable too: a correct model, lost to a missing page.
+
+  Measured on `Logic example 4` at this branch's base (`56a7ef5`, skill `2.141.0`): its shipped
+  `.pbip` carried `pageOrder: []` with no page folders at all — its one worksheet had been refused —
+  and the definition-of-done reported this as `warn`, not a failure. (`2.143.0` fixes the *cause*
+  for that workbook; this guards the failure mode itself, which any fully-deferred workbook can
+  still reach.)
+
+  Scope of the corpus check, stated plainly: **the guard catches no crashing `.pbip` in the
+  29-workbook corpus** — every shipped project there declares pages both before and after this
+  change. The only page-less artifact is `reports/0068_market_basket.Report`, the **pre-rebind** viz
+  pass, which is not what ships (its `.pbip` has three pages, unchanged by this work). That is still
+  worth guarding, because it is a malformed PBIR and it is the folder a report upload consumes, but
+  it is not corpus evidence of the crash. The justification is the reproduced `Logic example 4`
+  case above.
+
+  Three guards, because the first alone would not keep it from coming back:
+
+  1. The emitter ships one placeholder page (`No visuals rebuilt`) when nothing was rebuilt —
+     **scoped** so the emit gate's own contract is untouched: an unsupported mark, a chart missing a
+     required role and a deliberately deferred shape still emit **no visual**. The placeholder adds
+     the container Desktop requires, never a visual the gate refused.
+  2. `pbir_lint` flags an empty `pageOrder` (validity R7). `powerbi-report-author validate` does
+     catch this as `PBIR_PAGE_ORDER_EMPTY`, but it is an opt-in npm pre-gate an ordinary run never
+     reaches, whereas the hermetic linter runs in the always-on pytest gate.
+  3. The definition-of-done reports a page-less report as **`failed`**, alongside a model that will
+     not load, rather than softening it to a fidelity `warn`. Fail-safe: an unreadable page count is
+     never treated as zero, so it cannot manufacture a false failure.
+
+- **`tableau-migration` (skill `2.143.0` → `2.144.0`): a text table's conditional colouring is
+  carried, and it colours the TEXT — not the cell background.** Tableau's ordinary way to
+  colour-code a crosstab is a calc that returns a *label* —
+  `IF SUM([Profit]) < 0 THEN "negative" ELSE "positive" END` — dropped on Colour. Nothing in the
+  rebuild attempted it, so every number came out black: the source's whole point, lost, with no
+  warning.
+
+  Power BI cannot drive a native categorical legend from a MEASURE — a legend needs a grouping
+  COLUMN, a column is row-level, and a row-level split changes the aggregate grain and the row
+  count — so this reuses the pattern already proven for boolean colour: a DAX measure that
+  **returns a colour**, bound through conditional formatting as the `Field value` format style,
+  editable in Desktop's `fx` dialog rather than unreachable JSON. The model gains a twin
+  (`Sign (colour) = SWITCH([Sign], "negative", "#4E79A7", "#F28E2B")`) whose palette is Tableau's
+  default categorical ramp assigned in **sorted member order** — which is how Tableau assigns it,
+  so blue/orange land on the same members the source drew.
+
+  **The channel follows the MARK, because Tableau's Colour shelf paints the mark.** On a `Text` (or
+  `Automatic`) crosstab the mark IS the number, so the colour is `fontColor` and the cell background
+  is left alone. On a `Square` highlight table the mark is a filled rectangle, so the same encoding
+  is `backColor`. Painting a text table's background reproduces neither half: every cell gains a
+  fill the source never drew while the numbers stay black. One entry is emitted per value column —
+  Tableau colours the whole row from one mark colour, and a single unscoped entry colours only the
+  first column — each carrying the `dataViewWildcard` selector, without which Power BI evaluates the
+  expression in one context and paints every cell identically, *with a clean validation pass*.
+
+  The colour driver is also no longer projected as a matrix column: it is a STRING measure, so
+  leaving it in the query rendered a literal `negative`/`positive` column beside the numbers.
+
+  Verified by render, not by metric: the rebuilt matrix draws negative-profit rows entirely blue and
+  positive rows entirely orange, backgrounds untouched, matching the Tableau source. Gated on the
+  Tableau-declared `datatype`, so a numeric measure that merely mentions a string (a `FORMAT`
+  pattern, a `SWITCH` label) can never acquire a bogus twin. Across the corpus this adds exactly one
+  measure and changes no existing visual.
+
+- **`tableau-migration` (skill `2.142.0` → `2.143.0`): an unfiltered Measure Names level means EVERY
+  measure, so the most ordinary text table migrates at all.** Tableau writes a bare
+  `<groupfilter function='level-members' level='[:Measure Names]'/>` the moment Measure Names lands
+  on a shelf with nothing filtered out. The emitter classified it alongside `except` — and the two
+  are **opposites**: `except` lists the members that were REMOVED, `level-members` means every
+  member of the level. So the worksheet was refused as "an Exclude filter whose displayed set
+  cannot be derived", and when it was the workbook's only sheet the report came out with **zero
+  pages** — while `powerbi-report-author validate` reported 0 errors and the definition-of-done
+  reported PASS. A trivial crosstab of `Segment / Ship Mode / Order ID` against eight measures did
+  not migrate at all.
+
+  Tableau records no explicit member list for the unfiltered case, so the members are recovered from
+  the view's own `<column-instance>` declarations: every `quantitative` pill it depends on, minus
+  every pill it spends on a named shelf or encoding (a measure parked on Tooltip is not a displayed
+  column). Ordering is alphabetical **by caption**, which is how Tableau renders an unsorted Measure
+  Names header — the declaration order it was recovered from is Tableau's internal id sort
+  (`cnt:` &lt; `none:` &lt; `sum:` &lt; `usr:`), which would scatter the calcs to the end of the table.
+
+  Fail-closed and narrow: only a *childless* `level-members` is read as "all members". `except`, a
+  narrowed `level-members`, and a non-manual `union` keep deferring exactly as before, so the guard
+  against surfacing the wrong measure set is untouched. Across the 29-workbook corpus this changes
+  no existing output (every Measure Names filter there is an authoritative `op='manual'` keep-list).
+
 - **`tableau-migration` (skill `2.140.0` → `2.141.0`): `estate_survey.py --json` declares a schema
   contract, so a rename cannot fail silently.** Raised in #114 — not a defect report, a heads-up that
   a downstream assessment tier shells out to this script and builds its migration-order graph from
@@ -88,6 +216,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   and the output path are masked.
 
 ### Fixed
+
+- **`tableau-migration` (skill `2.141.0` → `2.142.0`): a caption sized in Tableau does not fit in
+  Power BI, because Power BI adds padding Tableau has not.** Power BI reserves 8px above *and* below
+  a textbox's text by default, so a box's usable height is `height - 16`. Tableau reserves nothing.
+  An author who drew a 24px caption strip drew it to fit 12pt text, and it does — in Tableau.
+  Emitted verbatim, those 24px leave 8px for a line that needs 19, and the band renders **clipped**:
+  descenders sheared off, a scrollbar stub where the text should be.
+
+  Found by rendering a real network-operations dashboard, not by a metric. Two bands on one page:
+  `"Sort By = Network Score | Region = All | Fiscal Month ="` at 24px/12pt, and a section header at
+  31px/16pt. The build validated with **zero errors** — and our own gate already knew, because
+  `powerbi-report-author validate` warns `PBIR_TEXTBOX_HEIGHT_BELOW_FLOOR` using exactly the
+  renderer's formula. We were emitting geometry the gate then told us was wrong, one step too late
+  to matter.
+
+  **The fix is not to grow the box, and that distinction is the whole of it.** Growing it is what
+  the layout solver deliberately refuses to do (`layout_solve._clamp_to_authored`), for a measured
+  reason: a readability floor propagated up a zone tree makes a frame scale the WHOLE canvas to
+  satisfy it — eleven pixels of caption once cost five hundred pixels of page, with every object on
+  it 50% taller. The first version of this fix did exactly that and
+  `test_thin_caption_sizes_to_content_not_inflated_to_floor` caught it, correctly.
+
+  The 16px is not the author's, it is **ours**: a default we never asked for, on a box we emit. So
+  the room comes out of our own padding first, down to zero, and the authored geometry is never
+  touched. A textbox with room to spare emits no padding block at all and is byte-identical to
+  before. Applies to dashboard text objects, caption-only worksheets, and the title banner alike.
+
+  Verified by render: the reported dashboard now shows both bands in full, and the report validates
+  **0 errors / 0 warnings** where it previously carried two.
 
 - **`tableau-migration` (skill `2.138.0` → `2.139.0`): a storage-decision failure named the one
   datasource with nothing wrong with it.** Reported alongside #124. A workbook's embedded

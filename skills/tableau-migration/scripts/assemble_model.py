@@ -1172,7 +1172,7 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    known_tables=None, table_calc_usages=None, order_resolver=None,
                    flag_measures=None, resolve_for=None, inline_calcs=None,
                    related_tables=None, conformed_hubs=None, calc_outer_aggs=None,
-                   row_scalar_table=None):
+                   row_scalar_table=None, colour_palettes=None, semantic_colours=False):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
     ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
@@ -1475,6 +1475,10 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             "reason": reason,
             "dax": dax,
             "tableau_formula": formula,
+            # Tableau's declared result type (additive, absent when the extractor did not supply
+            # one). Read by the categorical colour-twin pass to tell a STRING-valued measure from a
+            # numeric one EXACTLY, rather than inferring it from the shape of the translated DAX.
+            "datatype": calc.get("datatype"),
             # Cross-layer source identity (additive): lets the viz/report layer deterministically
             # bind a worksheet field-instance / calc token to this emitted measure. The status above
             # tells the binder whether to bind now (translated / assisted-approved) or degrade.
@@ -1604,6 +1608,14 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         cr["measure"] = _gen_measure(
             cr["measure"], cr["tableau_formula"], cr["dax"],
             translated_by=cr.get("translated_by") or "deterministic (discrete colour measure)")
+        report.append(cr)
+    # Same idea for a STRING-valued measure, whose members Tableau paints from its categorical
+    # palette. Runs after the boolean pass so both see the same final names and neither can collide.
+    for cr in _categorical_colour_twin_measures(report, colour_palettes=colour_palettes,
+                                                semantic_colours=semantic_colours):
+        cr["measure"] = _gen_measure(
+            cr["measure"], cr["tableau_formula"], cr["dax"],
+            translated_by=cr.get("translated_by") or "deterministic (categorical colour measure)")
         report.append(cr)
     measures_tmdl = "".join(_measure_parts)
     return T.generate_measures_table_tmdl(measures_tmdl), report, suggestions
@@ -1902,6 +1914,32 @@ def _is_row_level_scalar_formula(formula):
 
 _DISCRETE_COLOUR_TRUE = "#4E79A7"      # Tableau default blue   -> TRUE member
 _DISCRETE_COLOUR_FALSE = "#F28E2B"     # Tableau default orange -> FALSE member
+# Tableau's default categorical ramp (Tableau 10), in its own order. A discrete domain takes these
+# in SORTED member order, which is how Tableau assigns them -- so the two-member case reduces to
+# exactly the boolean pair above.
+_CATEGORICAL_COLOUR_PALETTE = [
+    "#4E79A7", "#F28E2B", "#E15759", "#76B7B2", "#59A14F",
+    "#EDC948", "#B07AA1", "#FF9DA7", "#9C755F", "#BAB0AC",
+]
+# OPT-IN semantic colours for a POLARITY domain (see ``_semantic_polarity_palette``). Deliberately
+# not the default: Tableau assigns its own categorical ramp to an unauthored domain, and that is
+# what the source workbook actually renders, so inventing red/green by default would make the
+# rebuild differ in hue from the thing it is reproducing.
+_SEMANTIC_NEGATIVE = "#D62728"    # red   -> the "bad" pole
+_SEMANTIC_POSITIVE = "#2CA02C"    # green -> the "good" pole
+# Members that name a polarity. Matched whole, case-insensitively, on BOTH sides -- a domain only
+# qualifies when it has exactly two members and each lands in a different pole, so an ordinary
+# two-member domain ("East"/"West") can never be painted as if it meant good and bad.
+_NEGATIVE_MEMBERS = frozenset({
+    "negative", "loss", "losses", "bad", "below", "under", "fail", "failed", "failing",
+    "down", "decline", "declining", "unfavourable", "unfavorable", "off track", "at risk",
+    "no", "false", "0",
+})
+_POSITIVE_MEMBERS = frozenset({
+    "positive", "profit", "profitable", "good", "above", "over", "pass", "passed", "passing",
+    "up", "growth", "growing", "favourable", "favorable", "on track", "healthy",
+    "yes", "true", "1",
+})
 _COLOUR_MEASURE_SUFFIX = " (colour)"
 _BOOLEAN_DAX_RE = re.compile(r"\bTRUE\s*\(\s*\)|\bFALSE\s*\(\s*\)", re.IGNORECASE)
 
@@ -2058,6 +2096,142 @@ def _boolean_colour_twin_measures(existing_report):
                        "field_caption": name, "base_measure": base},
         })
     return rows
+
+
+def _dax_string_literals(dax):
+    """The distinct double-quoted string literals in ``dax``, in order of first appearance.
+
+    ``""`` inside a DAX string is an escaped quote, so a literal is read greedily across doubled
+    quotes. Empty literals are dropped -- they are a blank result, not a domain member.
+    """
+    out, seen = [], set()
+    for m in re.finditer(r'"((?:[^"]|"")*)"', dax or ""):
+        lit = m.group(1).replace('""', '"')
+        if lit and lit not in seen:
+            seen.add(lit)
+            out.append(lit)
+    return out
+
+
+def _authored_palette(domain, authored):
+    """``{member: hex}`` from the AUTHOR's own assignment, or ``None`` when it does not cover the
+    domain. Matched case-insensitively; a partial assignment is refused outright rather than mixed
+    with defaults, because a half-authored palette would silently recolour the members the author
+    DID choose (they would shift position in the default ramp)."""
+    if not authored:
+        return None
+    by_member = {str(k).strip().casefold(): v for k, v in dict(authored).items() if v}
+    got = {m: by_member.get(m.strip().casefold()) for m in domain}
+    return got if all(got.values()) else None
+
+
+def _semantic_polarity_palette(domain):
+    """``{member: hex}`` red/green when ``domain`` is exactly one negative + one positive member.
+
+    OPT-IN (see ``semantic_colours``). Requires BOTH members to be recognised and to sit in
+    OPPOSITE poles, so a domain the lexicon does not understand -- or a two-member domain that
+    simply is not a polarity -- falls through to Tableau's own assignment untouched.
+    """
+    if len(domain) != 2:
+        return None
+    lowered = [m.strip().casefold() for m in domain]
+    neg = [m for m, low in zip(domain, lowered) if low in _NEGATIVE_MEMBERS]
+    pos = [m for m, low in zip(domain, lowered) if low in _POSITIVE_MEMBERS]
+    if len(neg) != 1 or len(pos) != 1:
+        return None
+    return {neg[0]: _SEMANTIC_NEGATIVE, pos[0]: _SEMANTIC_POSITIVE}
+
+
+def _categorical_colour_twin_measures(existing_report, colour_palettes=None,
+                                      semantic_colours=False):
+    """A hex-returning colour twin for every STRING-valued measure -> ``[report rows]``.
+
+    The categorical sibling of :func:`_boolean_colour_twin_measures`, and the same Power BI answer
+    for the same Tableau idiom. Where a boolean calc splits marks two ways, a string calc
+    (``IF SUM([Profit]) < 0 THEN "negative" ELSE "positive" END``) names its members -- and Tableau
+    puts it on Colour to paint by those names. Power BI still cannot drive a native categorical
+    legend from a MEASURE (a legend needs a grouping column, which is row-level and would change the
+    aggregate grain), so the faithful rebuild is again a DAX measure that RETURNS A COLOUR, applied
+    as the ``Field value`` format style. It is a DISCRETE encoding throughout: one solid colour per
+    member, never a ramp. A two-member string domain has no ordering to interpolate, and a gradient
+    over it is not merely wrong but fatal -- Power BI evaluates MIN/MAX over the fill input to find
+    the ramp's endpoints and the visual dies at query time (measured in 2.127.0).
+
+    The palette is resolved in three tiers, and which one fired is recorded on the row's ``source``
+    so a reader is never shown a default dressed up as the author's choice:
+
+    1. ``authored``        -- the colours the author assigned in the workbook (supplied by the
+       report layer via ``colour_palettes``: ``{measure caption: [(member, hex), ...]}``). Always
+       wins; only a palette covering EVERY member is taken.
+    2. ``semantic``        -- OPT-IN via ``semantic_colours``: red/green for a recognised polarity
+       domain (negative/positive, loss/profit, ...). Off by default, because an unauthored domain
+       is not colourless -- Tableau paints it from its own ramp, and that is what the source
+       renders.
+    3. ``tableau_default`` -- Tableau's default categorical ramp in SORTED member order, which is
+       how Tableau itself assigns it, so an unauthored domain reproduces the source's own hues.
+
+    Gated on the Tableau-declared ``datatype == "string"`` (exact) rather than on the shape of the
+    translated DAX, so a numeric measure that merely mentions a string (a ``FORMAT`` pattern, a
+    ``SWITCH`` default label) can never acquire a bogus colour twin. Additive and fail-closed: an
+    empty list unless the workbook really carries a string measure with an enumerable domain, and a
+    domain larger than the palette, or with only one member, is declined.
+    """
+    palettes = {str(k).strip().casefold(): v for k, v in (colour_palettes or {}).items()}
+    existing = {(r.get("measure") or "").strip().lower() for r in (existing_report or [])}
+    rows = []
+    for row in existing_report or []:
+        if row.get("status") not in ("translated", "assisted-approved"):
+            continue
+        if str(row.get("datatype") or "").strip().lower() != "string":
+            continue
+        base = (row.get("measure") or "").strip()
+        dax = str(row.get("dax") or "")
+        if not base or not dax:
+            continue
+        domain = _dax_string_literals(dax)
+        if len(domain) < 2 or len(domain) > len(_CATEGORICAL_COLOUR_PALETTE):
+            continue
+        name = dax_safe_measure_name(base + _COLOUR_MEASURE_SUFFIX)
+        if name.strip().lower() in existing:
+            continue
+        existing.add(name.strip().lower())
+        authored = palettes.get(base.casefold())
+        if authored is None:
+            _caption = str((row.get("source") or {}).get("field_caption") or "").strip()
+            authored = palettes.get(_caption.casefold()) if _caption else None
+        palette = _authored_palette(domain, authored)
+        origin = "authored"
+        if palette is None and semantic_colours:
+            palette = _semantic_polarity_palette(domain)
+            origin = "semantic"
+        if palette is None:
+            palette = {m: _CATEGORICAL_COLOUR_PALETTE[i]
+                       for i, m in enumerate(sorted(domain, key=lambda s: (s.casefold(), s)))}
+            origin = "tableau_default"
+        # SWITCH over the base measure -- one branch per member, in the measure's OWN literal order
+        # so the DAX reads alongside the source formula. The last member doubles as the default so
+        # the twin never returns BLANK (a BLANK colour paints the theme default, silently losing the
+        # encoding on any row the domain scan did not anticipate).
+        branches = ", ".join('"%s", "%s"' % (_dax_str(m), palette[m]) for m in domain[:-1])
+        default = palette[domain[-1]]
+        rows.append({
+            "measure": name,
+            "status": "translated",
+            "reason": None,
+            "dax": 'SWITCH([%s], %s, "%s")' % (base, branches, default),
+            "tableau_formula": "(colour encoding for [%s])" % base,
+            "translated_by": "deterministic (categorical colour measure, %s palette)" % origin,
+            "source": {"kind": "categorical_colour_twin", "model_table": "_Measures",
+                       "field_caption": name, "base_measure": base,
+                       "domain": list(domain), "colors": [palette[m] for m in domain],
+                       "palette_origin": origin},
+        })
+    return rows
+
+
+def _dax_str(text):
+    """Escape a Python string for embedding in a double-quoted DAX literal."""
+    return str(text).replace('"', '""')
 
 
 def _scalar_row_aggregate_measures(existing_report, table_for):
@@ -3682,7 +3856,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                           date_table=True, mark_as_date=True, flatfile_path=None,
                           calc_lookup=None, approved_calc_dax=None, date_range=None,
                           parameters=None, table_calc_usages=None, calc_outer_aggs=None,
-                          scatter_keys=None, storage_decision=None):
+                          scatter_keys=None, storage_decision=None,
+                          colour_palettes=None, semantic_colours=False):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -4144,6 +4319,12 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         # Resolves the row set a ROW-LEVEL SCALAR calc's Tableau aggregation iterates, per the
         # calc's OWN datasource island -- a global anchor is the wrong table in a consolidated model.
         row_scalar_table=_row_scalar_table_resolver(tables, table_names),
+        # The AUTHOR's own discrete colour assignments, exported by the first viz pass (only the
+        # report layer can see a worksheet's <map to='#hex'> palette). Empty -> the colour twin
+        # falls back to Tableau's own default categorical ramp, which is what such a worksheet
+        # actually renders. ``semantic_colours`` is the opt-in red/green override for a polarity
+        # domain, off by default so an unauthored palette is reproduced rather than reinterpreted.
+        colour_palettes=colour_palettes, semantic_colours=semantic_colours,
         # ADD #1's date-axis ORDERBY redirect is DISABLED. It rewrote a positional table-calc's
         # ORDERBY to the calendar key Date[Date] while the partition + inner aggregate stayed on the
         # fact (Orders), producing an OFFSET/WINDOW whose orderBy and partitionBy span two tables with
@@ -4748,7 +4929,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                   approved_calc_dax=None, date_range=None, select=None,
                                   parameters=None, table_calc_usages=None, descriptor=None,
                                   emit_linguistic=False, calc_outer_aggs=None,
-                                  scatter_keys=None, storage_decision=None):
+                                  scatter_keys=None, storage_decision=None,
+                                  colour_palettes=None, semantic_colours=False):
     """One-call convenience: parse ``.tds``/``.twb`` text and assemble the Import/DirectQuery model.
 
     ``calcs`` are the MEASURE-role calculated fields and ``dim_calcs`` the DIMENSION/row-level ones
@@ -4856,7 +5038,9 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                    date_range=date_range, parameters=parameters,
                                    table_calc_usages=table_calc_usages,
                                    calc_outer_aggs=calc_outer_aggs,
-                                   scatter_keys=scatter_keys, storage_decision=storage_decision)
+                                   scatter_keys=scatter_keys, storage_decision=storage_decision,
+                                   colour_palettes=colour_palettes,
+                                   semantic_colours=semantic_colours)
     # Splice harvested Group/Bin calc columns onto their resolved home tables -- the same additive
     # pre-partition injection as dim_calcs (byte-for-byte unchanged when there are no groups/bins).
     harvest_parts = result.get("parts") if isinstance(result, dict) else None
