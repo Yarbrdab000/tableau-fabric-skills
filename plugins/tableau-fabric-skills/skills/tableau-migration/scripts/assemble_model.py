@@ -1317,14 +1317,24 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     # ``[count orders] + 100``); to emit a self-contained aggregate the translator inlines that
     # base's formula, so seed a {calc-id/caption(lower) -> formula} lookup from the calcs here.
     base_formula_lookup = {}
+    base_datatype_lookup = {}
     for c in (calcs or []):
+        nm = (c.get("name") or "").strip().lower()
+        tid = str(c.get("internal_name") or "").strip().lower()
+        # Tableau's declared result type, keyed the same two ways as the formula. A table-calc row is
+        # built from a worksheet USAGE, not from the calc declaration, so it has no datatype of its
+        # own -- and without one the colour-twin pass cannot tell that ``New Max2?`` is a boolean.
+        _dt = str(c.get("datatype") or "").strip()
+        if _dt:
+            if nm:
+                base_datatype_lookup[nm] = _dt
+            if tid:
+                base_datatype_lookup[tid] = _dt
         formula = c.get("formula") or ""
         if not formula:
             continue
-        nm = (c.get("name") or "").strip().lower()
         if nm:
             base_formula_lookup[nm] = formula
-        tid = str(c.get("internal_name") or "").strip().lower()
         if tid:
             base_formula_lookup[tid] = formula
     tablecalc_rows, superseded = _table_calc_measures(
@@ -1340,6 +1350,20 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
         base_formula_lookup=base_formula_lookup, order_resolver=order_resolver)
     tablecalc_rows = tablecalc_rows + forced_rows
     superseded = superseded | forced
+    # Carry the source calc's declared datatype onto the table-calc row. The row was built from a
+    # worksheet usage, so it has none; without it a BOOLEAN table calc on the Colour shelf (the
+    # ordinary "highlight the mark that set a new max" idiom) is invisible to the colour-twin pass,
+    # and the report emits a Field-value reference to a twin the model never creates.
+    for r in tablecalc_rows:
+        if r.get("datatype"):
+            continue
+        _src = r.get("source") or {}
+        for _k in (str(_src.get("calc_id") or "").strip().strip("[]").lower(),
+                   str(_src.get("field_caption") or "").strip().lower(),
+                   str(r.get("measure") or "").strip().lower()):
+            if _k and _k in base_datatype_lookup:
+                r["datatype"] = base_datatype_lookup[_k]
+                break
     for r in tablecalc_rows:
         entry = (r["measure"], "number")
         measure_refs[r["measure"].strip().lower()] = entry
@@ -2071,6 +2095,18 @@ def _boolean_colour_twin_measures(existing_report):
     Emitted for every boolean measure, not only those currently on a Colour shelf: the model layer
     cannot see the shelves, a boolean measure has no numeric use anyway, and an unreferenced twin is
     inert. Additive and fail-closed -- ``[]`` when the workbook has no boolean measure.
+
+    A measure counts as boolean on EITHER signal, because each alone misses real cases:
+
+    * the Tableau-declared ``datatype == "boolean"`` -- exact, and the only signal that catches the
+      commonest shape, a **comparison**: ``SUM([Sales]) = WINDOW_MAX(SUM([Sales]), FIRST(), 0)``
+      translates to ``SUM(...) = MAXX(WINDOW(...), ...)``, which is boolean-valued but contains no
+      ``TRUE()``/``FALSE()`` literal anywhere. Measured on ``0070_new_max``: no twin was generated
+      while the report emitted a Field-value reference to one, so the "highlight the bar that set a
+      new max" encoding bound to a measure that did not exist;
+    * a ``TRUE()``/``FALSE()`` literal in the translated DAX -- retained so a measure whose datatype
+      the extractor did not supply (a bare ``.tds``, an older manifest) keeps the twin it has always
+      had. Dropping it would have been a silent regression.
     """
     existing = {(r.get("measure") or "").strip().lower() for r in (existing_report or [])}
     rows = []
@@ -2079,7 +2115,8 @@ def _boolean_colour_twin_measures(existing_report):
             continue
         base = (row.get("measure") or "").strip()
         dax = str(row.get("dax") or "")
-        if not base or not _BOOLEAN_DAX_RE.search(dax):
+        declared_boolean = str(row.get("datatype") or "").strip().lower() == "boolean"
+        if not base or not (declared_boolean or _BOOLEAN_DAX_RE.search(dax)):
             continue
         name = dax_safe_measure_name(base + _COLOUR_MEASURE_SUFFIX)
         if name.strip().lower() in existing:

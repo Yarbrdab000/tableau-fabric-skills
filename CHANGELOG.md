@@ -14,6 +14,42 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.151.0` → `2.152.0`): a boolean colour driver is usually a
+  comparison, and a view-scoped one must not be painted at all.** Two halves of one defect, both
+  measured on `0070_new_max` — the "highlight the bar that set a new max" workbook.
+
+  **The twin was never generated.** `_boolean_colour_twin_measures` fired only when the translated
+  DAX contained a literal `TRUE()`/`FALSE()`. The commonest boolean calc is a *comparison* —
+  `SUM([Sales]) = WINDOW_MAX(SUM([Sales]), FIRST(), 0)` → `SUM(…) = MAXX(WINDOW(…), …)` — which is
+  boolean-valued and contains neither literal. So no twin was emitted while the report confidently
+  emitted a `Field value` reference to one. It now also triggers on the Tableau-declared
+  `datatype == "boolean"`, which required carrying that datatype onto table-calc measure rows (they
+  are built from a worksheet *usage*, which has none). The literal trigger is retained so a measure
+  whose datatype the extractor did not supply keeps the twin it has always had.
+
+  **Even with the twin, the colour was wrong.** Queried on the rebuilt model, `New Max2?` returned
+  `False` for all four years — on a monotonically rising series where *every* year sets a new
+  maximum. The window orders by row-level `Order_Date` while the visual's axis is `Date[Year]`, so
+  the comparison never aligns: a view-scoped table calc cannot survive as a standalone model
+  measure, exactly as `_is_view_level_calc` already documented and exactly why the CONTINUOUS colour
+  paths have always refused such a driver. The discrete path did not, and that asymmetry is what let
+  a confidently wrong colour ship. Fixing the first half alone would have been **worse than the
+  bug** — it turns "no colour" into "a plausible colour that is backwards" — so both land together.
+
+  Two deferrals now guard the discrete paths (chart marks and matrix/table cells alike), each naming
+  its cause and its remedy rather than failing quietly:
+
+  * the driver is a **view-level table calc** (`WINDOW_*` / `RUNNING_*` / `RANK` / `INDEX` …) — it
+    compares each mark against the other marks in the view, which needs a Visual Calculation;
+  * the driver **has no translated model measure**, so the twin it would be painted from does not
+    exist. Scoped by a new `model_consulted` stamp so it fires only on the model-bound pass — the
+    pre-rebind pass and every direct `parse_twb` caller have no model by construction and are
+    unchanged.
+
+  Corpus: **dangling colour references 4 → 0**, 29/29 still built. Three visuals stop painting a
+  colour that referenced a measure the model never contained; two models gain an (inert, additive)
+  colour twin; `workbook_calcs_translated` 198 → 201.
+
 - **`tableau-migration` (skill `2.150.0` → `2.151.0`): an eagerly-evaluated calculated table must not
   reference an undeclared stub column.** Raised in #134, and the answer is the one the reporter asked
   for: *"the most useful thing a maintainer could tell me is which condition makes the difference."*
