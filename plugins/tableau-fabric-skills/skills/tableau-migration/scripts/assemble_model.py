@@ -2696,6 +2696,27 @@ def _select_primary_date(date_cols):
 PER_ISLAND_DATE_ENABLED = False
 
 
+# The placeholder partition an untranslatable connector emits: ``#table(type table [], {})``. This
+# is the SAME literal ``openability_gate._STUB_PARTITION_RE`` matches, deliberately duplicated
+# rather than imported because the two modules already import each other and a third edge would
+# close the cycle. ``test_stub_marker_definition_matches_openability_gate`` pins them together so
+# they cannot drift -- which is the whole failure this constant exists to end (#137).
+_STUB_PARTITION_RE = re.compile(r"#table\s*\(\s*type\s+table\s*\[\s*\]\s*,\s*\{\s*\}\s*\)")
+
+
+def emitted_partition_is_stub(tmdl_text):
+    """True when an emitted table's TMDL carries the scaffold partition rather than a real query.
+
+    Keyed on the EMITTED ARTIFACT, which is what makes it honest. The tempting signal --
+    ``m_partition_review_reason()`` returning a reason -- is strictly broader than "this is a
+    stub": a surviving Tableau parameter in Custom SQL is a needs-review reason on a partition
+    that still emits a real ``Odbc.Query`` / ``Value.NativeQuery`` and DOES carry rows. Treating
+    those as stubs would drop a populated fact table out of the calendar span and silently narrow
+    the model's date range (#137).
+    """
+    return bool(_STUB_PARTITION_RE.search(tmdl_text or ""))
+
+
 def _stub_backed_tables(tables):
     """Display names of tables whose partition is a placeholder, not a real query (#134).
 
@@ -2705,9 +2726,18 @@ def _stub_backed_tables(tables):
     and eager evaluation happens at model LOAD: before refresh, before credentials. A reference that
     does not resolve there does not degrade the table, it stops Power BI Desktop opening the file.
 
-    Identified from the relation's own descriptor rather than by re-parsing emitted M, so it is the
-    same signal the emitter used. Fail-safe: anything unrecognisable is simply not reported as a
-    stub, which keeps today's behaviour.
+    Two signals, both required for correctness:
+
+    * ``stub_partition`` -- stamped by ``assemble_import_model``'s emit loop from the EMITTED TMDL
+      (see :func:`emitted_partition_is_stub`). This is the branch that catches a stub which
+      DECLARES a schema, i.e. the shape #134 was filed about: Tableau's ``<metadata-record>``
+      supplies typed columns even when the query cannot be translated. Before #137 nothing
+      assigned this key, so the predicate silently collapsed to the zero-column branch below and
+      the fabricated calendar was still emitted for the very shape it was meant to exclude.
+    * ``not columns`` -- the rarer zero-column stub, which has always worked.
+
+    Fail-safe: anything unrecognisable is simply not reported as a stub, which keeps today's
+    behaviour.
     """
     stubs = set()
     for rel in tables or ():
@@ -4027,6 +4057,15 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         disp = _table_display(rel)
         table_names.append(disp)
         parts[f"definition/tables/{disp}.tmdl"] = tmdl
+        # #137: hand the calendar-span gate the EMITTED artifact's own verdict. ``tmdl`` is the
+        # text that actually ships, so "did this table emit the scaffold partition" is answered by
+        # inspection rather than by a flag nothing sets. Stamped in place on ``rel``: ``tables`` is
+        # the same list object passed to ``_build_date_dimensions`` below, so the stamp is visible
+        # to ``_stub_backed_tables`` without threading a new parameter through the date builder.
+        # Deliberately NOT keyed on ``stub_reason``, which is strictly broader -- see
+        # ``emitted_partition_is_stub``.
+        if emitted_partition_is_stub(tmdl):
+            rel["stub_partition"] = True
         # Fail LOUD: a partition that emitted a needs-manual-completion scaffold (e.g. an
         # unverified-connector custom SQL) is recorded here so it surfaces in the report instead
         # of silently passing the build and only failing at deploy. The original SQL is carried so

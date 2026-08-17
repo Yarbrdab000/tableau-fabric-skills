@@ -14,6 +14,54 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.154.0` → `2.155.0`): the calendar-span stub exclusion is keyed on
+  the emitted artifact, so it actually fires.** Raised in #137 as a follow-up to #134, reproduced
+  exactly as filed: `m_partition_review_reason()` returns a reason ("this is a scaffold") while
+  `_stub_backed_tables()` returns an empty set — the emitter and the calendar gate disagreeing about
+  the same relation in the same build. The reporter's diagnosis was correct: `stub_partition` had
+  exactly two occurrences in the tree (one `.get()` read and one hand-set *test fixture*), and
+  `placeholder` was assigned nowhere, so the predicate silently collapsed to its rarer zero-column
+  branch and the fabricated year-2000 calendar was still emitted for the column-declaring stub that
+  motivated #134. The zero-column branch was verified intact (the reporter listed it as unverified).
+
+  **The suggested one-line fix was not taken, because it is over-broad and the corpus cannot show
+  it.** Stamping `stub_partition` whenever `m_partition_review_reason()` returns a reason conflates
+  *needs review* with *is a stub*. Measured: a surviving Tableau parameter in Custom SQL is a review
+  reason on a partition that still emits a real `Odbc.Query` (generic ODBC) or `Value.NativeQuery`
+  (SQL Server family) and **does** carry rows. Stamping those would drop a populated fact table out
+  of the calendar span and silently narrow the model's date range — the same class of harm #134
+  fixed, in the opposite direction. `connection_to_m.py`'s own docstring already says as much: a
+  surviving parameter reference "is a needs-review reason (the partition is still emitted)".
+
+  The discriminator is therefore *"the emitted partition **is** the scaffold"*, answered by
+  inspecting the TMDL that actually ships for the `#table(type table [], {})` literal — the same
+  string `openability_gate._STUB_PARTITION_RE` already matches. The **detection** gate
+  (`eager_calc_refs_resolve`, #134) and the **prevention** gate (`_stub_backed_tables`, #137) now
+  share one definition of "stub" and are pinned together by a test, since drift between them *is*
+  this defect. Both of the reporter's structural points were adopted: the stamp is applied from the
+  assembly loop (not `_scaffold_source()`, which has no relation in scope and 9 call sites), and the
+  tests assert through the emitter rather than a hand-set flag — a test that supplies a signal
+  production never emits is what let this survive in the first place.
+
+  Also recorded, because it explains why this had to be found in the field: **the 29-workbook corpus
+  contains zero Custom SQL relations** (relation types are `table` ×168, `join` ×98, `collection` ×3;
+  no `<relation type='text'>` anywhere, confirmed by XML parse and by raw byte scan). The whole
+  Custom SQL path rests on synthetic-descriptor unit tests, which is precisely the condition that
+  produced this bug.
+
+  **Corpus effect, measured and Desktop-verified.** 29/29 still build and the definition of done is
+  unchanged (29 bound, 0 failed, 23 warned). A masked whole-tree diff against the previous build
+  (masking the full absolute output root — never a bare token — plus timestamps and lineage GUIDs)
+  shows exactly **one** file changed: `0083_previous_workday`'s `Date.tmdl`, whose only data table
+  *is* a stub. Its calendar goes from `CALENDAR(DATE(YEAR(MIN(stub[Date])), 1, 1), …)` to the
+  documented `CALENDARAUTO()` fallback, since excluding the stub empties the span. Verified by cold
+  Desktop open of both builds, identified by process command line rather than by "the instance that
+  is running": the pre-change model loads a **fabricated year-2000 calendar** (`Date` starts
+  `1/1/2000`) — the exact artifact #134/#137 exist to eliminate — while the post-change model opens
+  cleanly with an empty calendar that will derive correctly once the stub is completed and
+  refreshed. `EVALUATE TOPN(1, 'Date')` *executed* rather than erroring, which is what rules out the
+  risk that `CALENDARAUTO()` over a rows-less column stops the file opening.
+
 - **`tableau-migration` (skill `2.153.0` → `2.154.0`): a visual bound to a model object that does
   not exist now FAILS the definition of done.** `lint_visual_model_bindings` has always *detected*
   this — the report records `viz_dangling_bindings` and names each offender exactly — but it was
