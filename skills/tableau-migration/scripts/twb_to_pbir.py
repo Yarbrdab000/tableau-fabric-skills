@@ -11092,7 +11092,17 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     if font_objects:
         for _fk, _fv in font_objects.items():
             visual.setdefault("objects", {}).setdefault(_fk, [{"properties": {}}])
-            visual["objects"][_fk][0]["properties"].update(_fv[0]["properties"])
+            _target = visual["objects"][_fk][0]["properties"]
+            # The cascade is a DEFAULT: it must not overwrite a property an earlier pass already
+            # set on this entry. Entry 0 may be a conditional-format rule bound to one column, and a
+            # blind ``update`` replaces that rule's own ``fontColor`` with the flat cascade colour --
+            # silently, and only for whichever rule happens to sort first. Measured on a merged
+            # container band: the leading column's quartile colouring was replaced by plain black
+            # while the other two columns painted correctly, which reads as "one column didn't work"
+            # rather than as a formatting collision. Keys the entry does NOT set are still applied,
+            # so a gradient entry keeps taking the cascade's font face exactly as before.
+            for _pk, _pv in _fv[0]["properties"].items():
+                _target.setdefault(_pk, _pv)
     # Faithful-mark overlay objects (Tier-1): a ready ``{object_name: [{"properties": {...}}]}`` block
     # a specific mark rule pre-built (e.g. the lollipop's categoryAxis/valueAxis/lineStyles/dataPoint/
     # legend). Merged LAST so it composes with anything an earlier pass added: when the object already
@@ -12830,6 +12840,117 @@ def detect_stitched_table_band(db, ws_by_name):
     return bands
 
 
+def merge_stitched_band_state(state, leader_ws, follower_ws, model_table, field_map, warnings):
+    """Fold the followers' MEASURE columns into the leader's query state -> ``[(ws, state)]``.
+
+    The members all group by the same row dimension and each contributes one measure, so the merged
+    visual is the leader's state plus every follower's measure projections. The shared dimension is
+    contributed once, by the leader; a follower's copy is dropped -- that repeated column is exactly
+    what the author hid and what the un-merged rebuild puts back.
+
+    Returns EVERY member paired with the state its own conditional format must be computed against,
+    the leader included. The leader's is a pre-merge snapshot, because
+    :func:`_matrix_discrete_measure_colour` paints every value projection it is handed: run after the
+    merge it would apply the leader's quartile buckets to the other members' columns too
+    (render-confirmed).
+    """
+    values = (state.get("Values") or {}).get("projections")
+    if values is None:
+        return []
+    leader_own = {"Values": {"projections": list(values)}}
+    seen = {p.get("queryRef") for p in values}
+    shared = {_dumps(p.get("field")) for p in values if "Column" in (p.get("field") or {})}
+    member_states = [(leader_ws, leader_own)]
+    for fw in follower_ws:
+        fstate = _build_query_state(fw, model_table, field_map, warnings)
+        if not _query_state_complete(fw.get("visual_type"), fstate):
+            continue
+        member_states.append((fw, fstate))
+        for p in ((fstate.get("Values") or {}).get("projections") or []):
+            if _dumps(p.get("field")) in shared:
+                continue                      # the row dimension the leader already contributes
+            if p.get("queryRef") in seen:
+                continue
+            seen.add(p.get("queryRef"))
+            values.append(p)
+    return member_states
+
+
+def port_band_member_projections(state, member_state, objects):
+    """Move a member's hidden calculation onto the merged state -> that member's objects, rebound.
+
+    Two things have to happen for a member's conditional format to survive the merge.
+
+    SCOPE. A member's colour emitter paints every projection in the state it was given -- its
+    measure, the shared row dimension, and its own hidden calculation. In a merged visual only the
+    measure is that member's to paint; leaving the rest in would let the last member processed
+    colour the row-label column.
+
+    PORTING, WITH A RENAME. The calculation the member declared lives on the member's state, which
+    the merged visual never serialises, so it must be copied across or the ``SelectRef`` dangles.
+    The refs collide by construction: every member state starts empty, so
+    :func:`_colour_vc_query_ref` hands each the same first free name. Ported naively the last one
+    wins and every column paints from whichever DAX arrived first -- resolving cleanly, reporting
+    nothing. A colliding ref whose EXPRESSION differs is renamed and the member's own ``SelectRef``s
+    are rewritten to match.
+    """
+    values = (state.get("Values") or {}).get("projections")
+    if values is None:
+        return objects
+    own = {p.get("queryRef") for p in ((member_state.get("Values") or {}).get("projections") or [])
+           if not p.get("hidden") and "Column" not in (p.get("field") or {})}
+    objects = [o for o in (objects or [])
+               if ((o.get("selector") or {}).get("metadata") in own)]
+    if not objects:
+        return objects
+    declared = {p.get("queryRef"): _dumps(p.get("field")) for p in values}
+    rename = {}
+    for p in ((member_state.get("Values") or {}).get("projections") or []):
+        if not p.get("hidden"):
+            continue
+        ref, body = p.get("queryRef"), _dumps(p.get("field"))
+        if declared.get(ref) == body:
+            continue                                  # identical calculation already present
+        if ref in declared:
+            fresh, n = ref, 1
+            while fresh in declared:
+                n += 1
+                fresh = "%s%d" % (ref, n)
+            rename[ref] = fresh
+            p = dict(p, queryRef=fresh, nativeQueryRef=fresh)
+            ref = fresh
+        declared[ref] = body
+        values.append(p)
+    if not rename:
+        return objects
+
+    def _rebind(node):
+        if isinstance(node, dict):
+            sel = node.get("SelectRef")
+            if isinstance(sel, dict) and sel.get("ExpressionName") in rename:
+                sel["ExpressionName"] = rename[sel["ExpressionName"]]
+            for v in node.values():
+                _rebind(v)
+        elif isinstance(node, list):
+            for v in node:
+                _rebind(v)
+
+    objects = copy.deepcopy(objects)
+    _rebind(objects)
+    return objects
+
+
+def _stitched_band_zone(zones):
+    """One zone spanning the whole band -- the leader's origin, the band's full width."""
+    xs = [z.get("x") or 0 for z in zones]
+    rights = [(z.get("x") or 0) + (z.get("w") or 0) for z in zones]
+    lead = min(zones, key=lambda z: z.get("x") or 0)
+    merged = dict(lead)
+    merged["x"] = min(xs)
+    merged["w"] = max(rights) - min(xs)
+    return merged
+
+
 def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
               model_table=None, field_map=None, table_calc_usages=None, resources=None):
     """Emit a PBIR report definition (a ``{relative_path: text}`` parts dict) from the IR.
@@ -12976,6 +13097,33 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 % (len(_band["members"]), ", ".join(repr(m) for m in _band["members"]),
                    _band["leader"], len(_band["members"]), len(_band["members"]),
                    len(_band["members"]))))
+        # A container-stitched pseudo-table is MERGED into one visual rather than rebuilt as N
+        # separate tables. Tableau cannot put several independently table-calculated measures in one
+        # view, so the author lays N sheets in a contiguous band and hides the row labels on all but
+        # the first, making the dashboard read as ONE table. Power BI does that natively, so the
+        # faithful rebuild is a merge: the leader's zone widens to the whole band, the followers'
+        # measures join its Values, and each member's conditional formatting comes with it, bound to
+        # its own column.
+        #
+        # Detection is exact (see :func:`detect_stitched_table_band`) and declines BOTH near-misses
+        # in the same source workbook: a single-sheet measure trellis, and a bar-mark band whose
+        # category axes the engine already suppresses correctly.
+        _band_leader, _band_follow, _band_zone = {}, {}, {}
+        for _band in detect_stitched_table_band(db, ws_by_name):
+            _lead = _band["leader"]
+            _band_leader[_lead] = [ws_by_name[m] for m in _band["members"][1:] if m in ws_by_name]
+            _band_zone[_lead] = _stitched_band_zone(_band["zones"])
+            for _m in _band["members"][1:]:
+                _band_follow[_m] = _lead
+            warnings.append(_warn(
+                "dashboard", db["name"],
+                "container-stitched table: %d worksheets (%s) sat in one contiguous band sharing a "
+                "row dimension with the row labels hidden on every sheet but %r -- in Tableau that "
+                "reads as ONE table. Rebuilt as a SINGLE visual with %d value columns, Power BI's "
+                "native form, so the row-label column appears once as the author intended rather "
+                "than %d times. Each column keeps its own conditional formatting"
+                % (len(_band["members"]), ", ".join(repr(m) for m in _band["members"]),
+                   _lead, len(_band["members"]), len(_band["members"]))))
         card_ws = []
         for i, zone in enumerate(zones):
             ws = ws_by_name.get(zone["worksheet"])
@@ -13028,12 +13176,23 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                     warnings.append(_warn("worksheet", ws["name"], _reason))
                 continue
             placed.add(ws["name"])
+            # A band FOLLOWER contributes its measure to the leader's merged visual and emits no
+            # visual of its own. Marked placed above, so it does not fall through to the
+            # standalone-worksheet pass and reappear as its own page.
+            if ws["name"] in _band_follow:
+                continue
+            _band_followers = _band_leader.get(ws["name"]) or []
+            if _band_followers:
+                zone = _band_zone.get(ws["name"], zone)
             state = _build_query_state(ws, model_table, field_map, warnings)
             if not _query_state_complete(ws["visual_type"], state):
                 warnings.append(_warn(
                     "worksheet", ws["name"],
                     f"{ws['visual_type']} visual has no usable field bindings (skipped)"))
                 continue
+            _band_states = merge_stitched_band_state(
+                state, ws, _band_followers, model_table, field_map, warnings) \
+                if _band_followers else []
             page_ws.append(ws)
             x, y, w, h = _scale_zone(zone, ref_w, ref_h)
             vname = _sanitize(f"v-{page_name}-{i}-{ws['name']}")
@@ -13075,10 +13234,21 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                     # the model's hex-returning colour twin instead -- font or background per the
                     # Tableau mark. Only consulted when the gradient path emitted nothing, so a
                     # heat table is byte-unchanged.
-                    _dc_objects, _dc_fact = _matrix_discrete_measure_colour(
-                        ws, state, model_table, field_map, warnings, _param_values)
-                    if _dc_objects:
-                        value_objects, cf_fact = _dc_objects, _dc_fact
+                    if not _band_states:
+                        _dc_objects, _dc_fact = _matrix_discrete_measure_colour(
+                            ws, state, model_table, field_map, warnings, _param_values)
+                        if _dc_objects:
+                            value_objects, cf_fact = _dc_objects, _dc_fact
+                # Each band member owns ONE column and ONE rule. Computed against that member's own
+                # state so its selector names only its own measure, then the calculation it declared
+                # is ported onto the merged state so the SelectRef resolves.
+                for _mw, _mstate in _band_states:
+                    _mo, _mf = _matrix_discrete_measure_colour(
+                        _mw, _mstate, model_table, field_map, warnings, _param_values)
+                    if _mo:
+                        _mo = port_band_member_projections(state, _mstate, _mo)
+                        value_objects = list(value_objects or []) + list(_mo)
+                        cf_fact = cf_fact or _mf
             data_point_objects, mc_fact = _data_point_colors(
                 ws, state, ws["visual_type"], model_table, field_map, warnings)
             cont_objects, cont_fact = _chart_discrete_measure_fill(

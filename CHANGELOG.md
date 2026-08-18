@@ -14,6 +14,41 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.210.0` → `2.211.0`): a container-stitched pseudo-table is MERGED
+  into one visual, and the style cascade stops overwriting conditional formats.** N worksheets in a
+  contiguous band, each contributing one measure, with the row labels hidden on all but the leading
+  sheet, is Tableau faking a single table. Power BI has the real thing, so the rebuild now emits ONE
+  visual with N value columns -- the row-label column appears once, as the author intended, instead
+  of N times.
+
+  * **Each column keeps its OWN conditional format.** Every member's rule is computed against that
+    member's own state so its selector names only its own measure, and the Visual Calculation it
+    declares is ported onto the merged state so the `SelectRef` resolves. The refs collide by
+    construction -- every member state starts empty, so each claims the same first free name -- and
+    a colliding ref whose EXPRESSION differs is renamed with the member's own references rewritten.
+    Ported naively, the last member would win and every column would paint from whichever DAX
+    arrived first, resolving cleanly and reporting nothing.
+
+  * **A LATENT DEFECT THIS EXPOSED: the style cascade was overwriting conditional formats.** The
+    font pass did `objects[k][0]["properties"].update(...)`, replacing whatever the first entry
+    already set. Where entry 0 was a rule bound to a column, its `fontColor` was silently replaced
+    by the flat cascade colour. It went unnoticed because entry 0 was normally the row-dimension
+    entry, which has no rule to lose; merging promoted a real rule into that slot and one column
+    came back uncoloured while the others painted correctly -- reading as "one column didn't work"
+    rather than as a collision. The cascade is now a DEFAULT: keys the entry already sets are left
+    alone, keys it does not set are still applied, so a gradient entry takes the cascade's font
+    exactly as before.
+
+  * **Render-verified against the author's Tableau screenshot.** One table, `Sub-Category` once,
+    Profit / Sales / Quantity as three columns, one Total row, and each column bucketing
+    INDEPENDENTLY -- green on Copiers/Phones/Accessories/Paper in Profit, red on Art in Sales, green
+    on Binders in Quantity, matching the oracle cell for cell.
+
+  * **Corpus, operands named.** `corpus/b212` (built from `1f12c94`) vs `corpus/v212`: 1468 files vs
+    1460, **0 added, 8 removed, 6 differing**. The removals are the follower tables the merge
+    absorbs (two per workbook, in both the pre-rebind and the final tree); the differences are the
+    merged leader plus `report.json`/`summary.md`. **No workbook outside `0132`/`0133` changed.**
+
 - **`tableau-migration` (skill `2.209.0` → `2.210.0`): a container-stitched pseudo-table is
   detected from the source and disclosed.** Tableau cannot put several independently
   table-calculated measures in one view, so authors fake a single table: N worksheets in a
