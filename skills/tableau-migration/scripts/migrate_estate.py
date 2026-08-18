@@ -3174,6 +3174,99 @@ def _colour_palettes_from_ir(result):
         return {}
 
 
+_COLOUR_TWIN_SUFFIX = " (colour)"
+_COLOUR_TWIN_DECL_RE = re.compile(r"^\tmeasure '([^']+ \(colour\))'\s*=", re.M)
+
+
+def _retire_unreferenced_colour_twins(model_parts, report_parts):
+    """Drop colour twins the SHIPPING report does not reference -> ``(parts, [retired names])``.
+
+    A colour twin is a hex-returning measure the report binds through Field-value conditional
+    formatting (rung 3). Rungs 1 and 4 -- a native ``Conditional`` and a declared Visual Calculation
+    -- paint the same encoding while referencing NO model object, so wherever one of them wins the
+    twin is dead weight in the model and a stray entry in Desktop's field list.
+
+    KEYED ON THE EMITTED ARTIFACT, deliberately, and this is the third form this decision has taken:
+
+      1. a PROXY -- re-derive "would a rule win?" from the formula in the model build. Two predicates
+         that must agree forever, which is the assemble/emit divergence this collection keeps fixing.
+      2. a SHARED FACT -- have the report emit its decision and the model read it. Correct in
+         principle, but MEASURED INERT: the report->model channel runs off the FIRST viz pass, which
+         carries facts true of the SOURCE (a worksheet's palette is in the IR before anything binds)
+         and cannot carry facts true of the OUTPUT (which rung wins is decided at emit time, from
+         resolver state that pass does not have). Instrumented on ``0070_new_max``: 3 candidate
+         records, ZERO colour facts.
+      3. THIS -- ask the shipped bytes. No predicate at all, so there is nothing for two layers to
+         disagree about, and it self-corrects if a future rung changes what it references.
+
+    Runs on ``report_parts`` AFTER the reference cross-check, because that is the ``.pbip`` the user
+    opens -- the same reason :func:`pbir_lint` is run there rather than on the first pass.
+
+    Fail-closed in both directions: a twin is retired only when its name appears nowhere in the
+    report AND nowhere else in the model (another measure may reference it), the name match is a
+    substring test so an over-match KEEPS the twin, and any problem leaves ``model_parts``
+    untouched.
+    """
+    try:
+        if not report_parts:
+            # No report to ask. Absence of evidence is not evidence of absence: retiring here would
+            # strip every twin whenever report emission produced nothing, which is exactly when the
+            # model is most likely to still be needed. Fail closed.
+            return model_parts, []
+        report_blob = "".join(str(v) for v in (report_parts or {}).values())
+        names = set()
+        for text in (model_parts or {}).values():
+            names.update(_COLOUR_TWIN_DECL_RE.findall(str(text)))
+        if not names:
+            return model_parts, []
+
+        model_blob = "".join(str(v) for v in (model_parts or {}).values())
+        retired, out = [], dict(model_parts or {})
+        for name in sorted(names):
+            if name in report_blob:
+                continue
+            # A reference from elsewhere in the MODEL keeps it too. Its own declaration and its own
+            # ``TableauFormula`` annotation both contain the name, so count references to the
+            # DAX form ``[name]`` instead, which a declaration never produces.
+            if ("[%s]" % name) in model_blob:
+                continue
+            retired.append(name)
+
+        for name in retired:
+            for path, text in list(out.items()):
+                new = _drop_tmdl_measure_block(str(text), name)
+                if new is not None:
+                    out[path] = new
+        return out, retired
+    except Exception:
+        return model_parts, []
+
+
+def _drop_tmdl_measure_block(text, name):
+    """Remove one ``\\tmeasure '<name>' = ...`` block from TMDL, or ``None`` if it is not there.
+
+    A block owns its declaration line plus every following line that is blank or MORE indented; the
+    next line at the measure's own indent starts a sibling. Written this way rather than by counting
+    a fixed number of property lines because a measure carries a variable set of them (lineageTag,
+    formatString, annotations), and a fixed count would silently eat a sibling's first line.
+    """
+    lines = str(text).split("\n")
+    head = "\tmeasure '%s' =" % name
+    start = next((i for i, l in enumerate(lines) if l.startswith(head)), None)
+    if start is None:
+        return None
+    end = start + 1
+    while end < len(lines) and (not lines[end].strip() or lines[end].startswith("\t\t")):
+        end += 1
+    # Keep one blank separator if the block was followed by a sibling, so the file does not
+    # accumulate blank lines where twins were removed.
+    while end > start + 1 and not lines[end - 1].strip():
+        end -= 1
+    if end < len(lines) and not lines[end].strip():
+        end += 1
+    return "\n".join(lines[:start] + lines[end:])
+
+
 def _storage_decision_subject(label, descriptor=None, combine_datasources=None):
     """Name the thing a storage decision is owed FOR, in a message a reader can act on.
 
@@ -3553,6 +3646,16 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
             tail = " (visual emptied)" if d["emptied"] else ""
             warns.append(_PBIP_WARN + f"visual {d['visual']!r} dropped {len(d['dropped'])} "
                          f"reference(s) the model did not emit: {', '.join(d['dropped'])}{tail}")
+    # A colour twin nothing in the SHIPPING report references is dead weight -- rungs 1 and 4 paint
+    # the same encoding without any model object. Keyed on the emitted bytes rather than on a
+    # predicate, so no two layers can disagree about it. Runs here, after the cross-check, because
+    # this is the .pbip the user opens, and before anything is written -- a fresh build emits no
+    # .pbi/cache.abf at all (measured: 0 across the corpus), so there is no cache to invalidate.
+    _pruned_parts, _retired_twins = _retire_unreferenced_colour_twins(
+        res.get("parts"), report_parts)
+    if _retired_twins:
+        res["parts"] = _pruned_parts
+        entry["colour_twins_retired"] = list(_retired_twins)
     # PROVE the cross-check above actually left nothing dangling, on the BYTES THAT SHIP.
     # ``_crosscheck_report_refs`` is supposed to drop or rebind every reference the model did not
     # emit; this asserts the result rather than trusting it. reference_gate proves the same invariant
