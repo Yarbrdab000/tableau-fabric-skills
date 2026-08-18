@@ -9726,6 +9726,10 @@ def _colour_rule_resolver(ws, model_table, field_map, param_values=None):
     return resolve
 
 
+# A backslash escape inside a serialised mark-colour member value (Tableau writes ``"Top 25\%"``).
+_MARK_COLOUR_ESCAPE_RE = re.compile(r"\\(.)")
+
+
 def _colour_member_palette(ws, members):
     """``{member: hex}`` for the string members of a colour calculation.
 
@@ -9737,7 +9741,17 @@ def _colour_member_palette(ws, members):
     authored = {}
     for m in ((ws.get("mark_colors") or {}).get("members") or []):
         if m.get("value") and m.get("color"):
-            authored[str(m["value"]).strip().casefold()] = m["color"]
+            raw = str(m["value"]).strip()
+            # Index BOTH the raw spelling and the unescaped one. Tableau backslash-escapes some
+            # characters inside a serialised colour-map member -- ``"Top 25\%"`` for a member the
+            # calc itself writes as ``"Top 25%"`` -- so a literal comparison silently misses and the
+            # member falls through to the default ramp. Measured on a dynamic-quartile workbook:
+            # ``middle`` matched while ``Top 25%`` and ``Bottom 25%`` did not, so the author's own
+            # green/red became two arbitrary palette hues, with no warning anywhere. Both forms are
+            # indexed rather than only the unescaped one, so a member whose real name contains a
+            # backslash keeps matching exactly as before.
+            for key in {raw, _MARK_COLOUR_ESCAPE_RE.sub(r"\1", raw)}:
+                authored.setdefault(key.casefold(), m["color"])
     out = {}
     for i, member in enumerate(sorted(members, key=lambda s: (s.casefold(), s))):
         out[member] = authored.get(member.strip().casefold()) or _TABLEAU_10[i % len(_TABLEAU_10)]

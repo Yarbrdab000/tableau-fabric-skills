@@ -14,6 +14,43 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.208.0` → `2.209.0`): Tableau's "how many marks are in this
+  view" idiom, and its escaped colour-map members.** Two independent defects from one real dashboard
+  -- a dynamic-quartile view that ranks rows into Top 25% / middle / Bottom 25% and colours them.
+  Either one alone lost the whole encoding, and neither produced an error anywhere.
+
+  * **`WINDOW_COUNT(COUNTD([<dimension>]))` is now recognised as the view's mark count.**
+    `WINDOW_COUNT` counts the MARKS in its frame for which the argument is non-null -- it does not
+    aggregate the argument -- and a `COUNTD` of a dimension is never null at a mark. Lowering it
+    through the generic aggregator path required resolving `COUNTD([D])` to a projected column,
+    which cannot succeed: the visual GROUPS BY that dimension rather than projecting a distinct
+    count of it. So the operand returned nothing, the whole colour rule declined, and the dashboard
+    rendered with no colour at all. Lowered to the same `COUNTROWS(<frame>)` that Tableau's own
+    `SIZE()` already produced, with the frame taken from the call so explicit bounds are honoured.
+    Gated to `COUNTD` only -- `WINDOW_SUM(COUNTD(x))` is a real sum and still needs its operand.
+
+  * **An escaped colour-map member no longer loses the author's palette.** Tableau serialises the
+    member as `"Top 25\%"` while the calculation writes `"Top 25%"`, so a literal comparison
+    missed and the member fell through to the default categorical ramp. Measured on the source
+    workbook: `middle` matched and kept `#000000`, while `Top 25%` and `Bottom 25%` silently became
+    `#E15759` and `#4E79A7` -- the author's green and red replaced by two arbitrary hues, with no
+    warning. Both the raw and the unescaped spelling are now indexed, so a member whose real name
+    contains a backslash still matches exactly as before.
+
+  * **Corpus: 31 workbooks, and the blast radius is exactly the two that exercise it.** Two new
+    workbooks were added to the corpus for this pattern (`0132_container-formatting-hidden-headers`,
+    `0133_container-formatting-variations`), each with the Tableau oracle image and a verified
+    `lessons.json`. Masked diff, `corpus/b206` (built from `ac4f925`) vs `corpus/v206`: 1468 files
+    vs 1468, 0 added, 0 removed, 19 differing -- **every one of them inside `0132`/`0133` plus
+    `report.json`. None of the original 29 workbooks changed.**
+
+  * **Render-verified against the author's own Tableau screenshot.** Ground truth was computed
+    independently from the emitted values (17 members; Top 25% = rank <= 4.25, Bottom 25% = rank >
+    12.75) and matched the oracle cell for cell: green = Copiers / Phones / Accessories / Paper, red
+    = Machines / Fasteners / Supplies / Bookcases / Tables. Confirmed on BOTH mark types -- font
+    colour on the text tables, bar fill on the bar variants -- and each measure column buckets
+    independently, so a member is black in Profit and red in Sales exactly as the source does it.
+
 - **`tableau-migration` (skill `2.207.0` → `2.208.0`): the remedy we tell the user to run is one they
   can actually run.** `2.207.0` shipped detection of the Newtonsoft/GAC blocker together with a
   remedy naming **`gacutil.exe`** — which is part of the **Windows SDK**, absent from a normal
