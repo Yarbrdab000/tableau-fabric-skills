@@ -3581,6 +3581,32 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
         warns.append(_PBIP_WARN + f"{len(_dangling)} visual field reference(s) name a model object "
                      f"that does not exist -- those visuals render EMPTY and report no error; "
                      f"first: {_dangling[0]}")
+    # THE REST OF THE LINTER, on the same shipped bytes (#144 follow-up). Until now the estate path
+    # called ONLY ``lint_visual_model_bindings``, so R3-R9 -- unknown visualType, theme-name
+    # mismatch, card display units, nativeQueryRef uniqueness, empty pageOrder, dangling SelectRef,
+    # missing required role -- were inert during an actual migration. They ran in pytest against one
+    # representative workbook and nowhere else.
+    #
+    # Found by a per-emit-path corpus reach census: ``lint_pbir_parts`` was reached by 0 of 29
+    # workbooks. That made the #144 fix incomplete in its own terms -- the issue was "the engine DoD
+    # cannot detect structurally-invalid PBIR it emits", and the rule added for it did not run when
+    # the engine emitted. Same exposure applied to R8. It is the #141 shape once more: a check whose
+    # value is decided by whether anything calls it.
+    #
+    # Reported as a WARN rather than a hard failure on first wiring, deliberately: these rules have
+    # never run against real estate output, so their true firing rate is unmeasured on anything but
+    # the corpus. Escalating a never-executed check straight to a build failure is the mistake the
+    # 2.154.0 sequencing note exists to prevent -- fix what fires, prove zero, then escalate.
+    try:
+        _lint = _pbir_lint.lint_pbir_parts(report_parts or {})
+    except Exception:
+        _lint = []
+    # ``lint_visual_model_bindings`` runs inside ``lint_pbir_parts`` too when a surface is supplied;
+    # here it is called without one, so the two result sets are disjoint by construction.
+    if _lint:
+        entry["viz_lint"] = {"count": len(_lint), "problems": _lint[:20]}
+        warns.append(_PBIP_WARN + f"{len(_lint)} PBIR validity violation(s) in the emitted report "
+                     f"(pbir_lint R3-R9); first: {_lint[0]}")
     projected = _longest_projected_path(dest, model_safe, res.get("parts"), report_base, report_parts)
     if os.name == "nt" and len(projected) >= MAX_PATH:
         # 1a (long-path era): the writer lifts MAX_PATH via ``\\?\`` so the build no longer FAILS on a
