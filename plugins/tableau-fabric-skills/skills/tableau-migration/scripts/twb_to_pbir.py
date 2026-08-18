@@ -2803,6 +2803,43 @@ def _route_measure_values(mark, locs, members, dummy_count, has_param_swap, stat
     return vt, "cols", note
 
 
+def _parse_row_labels_hidden(table, dims_rows):
+    """Did the author hide the ROW LABELS of this sheet? ``True`` / ``False``.
+
+    Deliberately separate from :func:`_parse_hidden_axes` rather than folded into it. That function
+    maps a hide onto a Power BI AXIS, which needs the shelf's role, and it resolves cleanly for a
+    cartesian chart but yields nothing for a crosstab -- a text table has no category axis to hide,
+    so the fact was computed and then dropped. This asks the narrower question the container-stitch
+    detector actually needs: is there a ``style-rule[element='label']`` carrying
+    ``format[@attr='display'][@value='false']`` that names a field on the ROWS shelf?
+
+    Kept additive and side-effect free so the chart path is untouched: nothing reads this except the
+    stitched-table detector, and a sheet with no such rule answers ``False`` exactly as before.
+    """
+    if table is None or not dims_rows:
+        return False
+    style = _first(table, "style")
+    if style is None:
+        return False
+    row_keys = set()
+    for f in dims_rows:
+        row_keys.update(_field_ref_keys(f))
+    if not row_keys:
+        return False
+    for rule in _children_local(style, "style-rule"):
+        if (rule.get("element") or "").strip().lower() != "label":
+            continue
+        for fmt in _children_local(rule, "format"):
+            if (fmt.get("attr") or "") != "display":
+                continue
+            if (fmt.get("value") or "").strip().lower() != "false":
+                continue
+            for key in _field_ref_keys_from_text(fmt.get("field")):
+                if key in row_keys:
+                    return True
+    return False
+
+
 def _parse_hidden_axes(table, dims_rows, dims_cols, meas_rows, meas_cols):
     """Which Power BI axes the Tableau author HID (``Show Header`` off).
 
@@ -5075,6 +5112,11 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
 
     axis_titles = {}
     axis_hidden = set()
+    # Computed UNCONDITIONALLY, unlike the axis parsing below. That block is gated on
+    # ``_AXIS_TITLE_TYPES``, which a text table is not a member of -- a crosstab has no axes -- so
+    # the author's row-label hide was parsed for charts and silently dropped for exactly the visual
+    # type the container-stitch idiom uses.
+    row_labels_hidden = _parse_row_labels_hidden(table, dims_rows)
     if visual_type in _AXIS_TITLE_TYPES:
         axis_titles = _parse_axis_titles(table, dims_rows, dims_cols, meas_rows, meas_cols)
         axis_hidden = _parse_hidden_axes(table, dims_rows, dims_cols, meas_rows, meas_cols)
@@ -5184,6 +5226,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "continuous_axis": continuous_axis,
         "dual_axis": _pane_mark_map(table)[2],
         "axis_hidden": sorted(axis_hidden),
+        "row_labels_hidden": row_labels_hidden,
         "color_gradient": color_gradient,
         "color_gradients": color_gradients,
         "mv_color_scales": mv_color_scales,
@@ -12699,6 +12742,94 @@ def _filter_slicer_fields(ws_list, shown_tokens=None):
     return out
 
 
+# -- container-stitched pseudo-table -----------------------------------------------------------
+# Tableau cannot put several independently table-calculated measures in one view, so authors fake a
+# single table: N worksheets laid in a contiguous horizontal container, each contributing one
+# measure, with the row labels suppressed on every sheet but the leading one. The dashboard then
+# READS as one table. Power BI does this natively in one matrix, so the faithful rebuild is a MERGE.
+#
+# The signature is exact in the source and needs no heuristic:
+#   * the zones form a contiguous horizontal band -- same y, same h, and each zone's x continues
+#     where the previous one ended;
+#   * every member worksheet groups by the SAME row dimension;
+#   * the TRAILING members hide their row labels (Tableau's ``style-rule[element='label']`` ->
+#     ``display=false``, which the parser already resolves to a hidden ``categoryAxis``), while the
+#     leader keeps its labels. That asymmetry is what distinguishes a stitched pseudo-table from
+#     three unrelated tables that merely sit side by side, and it is the gate that keeps this from
+#     merging things the author meant to keep separate.
+_BAND_EDGE_TOLERANCE = 2          # Tableau's 100000-unit grid rounds; adjacent edges can differ by 1.
+
+
+def _band_row_signature(ws):
+    """The row dimension a table groups by, as a comparable key -- or ``None`` if it has none."""
+    rows = [f for f in (ws.get("rows") or []) if isinstance(f, dict)]
+    if len(rows) != 1:
+        return None
+    f = rows[0]
+    cap = str(f.get("caption") or f.get("property") or "").strip().casefold()
+    return cap or None
+
+
+def _band_hides_row_labels(ws):
+    """Did the author suppress this sheet's row labels? (``style-rule element='label'`` display=false)
+
+    The parser resolves that Tableau spelling to a hidden ``categoryAxis`` and records it on the
+    worksheet as ``axis_hidden`` (see :func:`_parse_hidden_axes`), so this reads the fact rather
+    than re-deriving it from the source.
+    """
+    return "categoryAxis" in set(ws.get("axis_hidden") or ()) or bool(ws.get("row_labels_hidden"))
+
+
+def detect_stitched_table_band(db, ws_by_name):
+    """Zones that together fake ONE table -> ``[{leader, members, zones}]`` (possibly empty).
+
+    Pure and side-effect free so it can be tested without emitting anything. Returns at most one
+    band per contiguous run; a dashboard may contain several.
+    """
+    tabular = []
+    for z in (db or {}).get("zones") or []:
+        ws = (ws_by_name or {}).get(z.get("worksheet"))
+        if not isinstance(ws, dict):
+            continue
+        if ws.get("visual_type") not in (VT_TABLE, VT_MATRIX):
+            continue
+        if _band_row_signature(ws) is None:
+            continue
+        tabular.append((z, ws))
+    if len(tabular) < 2:
+        return []
+
+    bands, run = [], []
+
+    def _flush():
+        if len(run) >= 2:
+            leader = run[0]
+            # The leader must SHOW its labels and every follower must HIDE them. Anything else is
+            # not a stitched table -- it is several tables that happen to be adjacent.
+            if (not _band_hides_row_labels(leader[1])
+                    and all(_band_hides_row_labels(w) for _z, w in run[1:])):
+                bands.append({
+                    "leader": leader[1]["name"],
+                    "members": [w["name"] for _z, w in run],
+                    "zones": [z for z, _w in run],
+                })
+        del run[:]
+
+    for z, ws in sorted(tabular, key=lambda t: (t[0].get("y") or 0, t[0].get("x") or 0)):
+        if run:
+            pz, pw = run[-1]
+            same_row = _band_row_signature(pw) == _band_row_signature(ws)
+            aligned = (abs((pz.get("y") or 0) - (z.get("y") or 0)) <= _BAND_EDGE_TOLERANCE
+                       and abs((pz.get("h") or 0) - (z.get("h") or 0)) <= _BAND_EDGE_TOLERANCE)
+            adjacent = abs(((pz.get("x") or 0) + (pz.get("w") or 0)) - (z.get("x") or 0)) \
+                <= _BAND_EDGE_TOLERANCE
+            if not (same_row and aligned and adjacent):
+                _flush()
+        run.append((z, ws))
+    _flush()
+    return bands
+
+
 def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
               model_table=None, field_map=None, table_calc_usages=None, resources=None):
     """Emit a PBIR report definition (a ``{relative_path: text}`` parts dict) from the IR.
@@ -12822,6 +12953,29 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         # idiom, so exactly the sheets that are all-filter were the ones contributing no filters.
         # Index every worksheet the dashboard references instead, so a card is dropped only when its
         # token genuinely resolves to nothing.
+        # A container-stitched pseudo-table is DISCLOSED rather than silently rebuilt as N separate
+        # tables. Tableau cannot put several independently table-calculated measures in one view, so
+        # the author lays N sheets in a contiguous band and hides the row labels on all but the
+        # first, making the dashboard read as ONE table. Power BI does that natively in a single
+        # matrix -- but the rebuild currently emits one table per sheet, which repeats the row-label
+        # column N times and breaks the illusion the author built.
+        #
+        # Detection is exact (see :func:`detect_stitched_table_band`) and is verified to fire on the
+        # stitched case while declining BOTH near-misses in the same workbook: a single-sheet measure
+        # trellis, and a bar-mark band whose category axes the engine already suppresses correctly.
+        # Until the merge lands, naming it is strictly better than a silently wrong layout -- the
+        # difference is visible on the page and invisible to every validator.
+        for _band in detect_stitched_table_band(db, ws_by_name):
+            warnings.append(_warn(
+                "dashboard", db["name"],
+                "container-stitched table: %d worksheets (%s) sit in one contiguous band sharing a "
+                "row dimension, with the row labels hidden on every sheet but %r -- in Tableau that "
+                "reads as ONE table. They are rebuilt as %d separate tables, so the row-label column "
+                "repeats %d times. Power BI expresses this natively as a single matrix with %d value "
+                "columns; merge them there to restore the source's appearance"
+                % (len(_band["members"]), ", ".join(repr(m) for m in _band["members"]),
+                   _band["leader"], len(_band["members"]), len(_band["members"]),
+                   len(_band["members"]))))
         card_ws = []
         for i, zone in enumerate(zones):
             ws = ws_by_name.get(zone["worksheet"])

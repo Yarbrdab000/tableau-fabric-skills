@@ -14,6 +14,46 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.209.0` → `2.210.0`): a container-stitched pseudo-table is
+  detected from the source and disclosed.** Tableau cannot put several independently
+  table-calculated measures in one view, so authors fake a single table: N worksheets in a
+  contiguous horizontal container, each contributing one measure, with the row labels hidden on
+  every sheet but the leading one. The dashboard then READS as one table. The rebuild emits one
+  table per sheet, so the row-label column repeats N times and the illusion breaks -- visibly on the
+  page, and invisibly to every validator.
+
+  * **The signature is exact in the source; no image, heuristic or model call.** Contiguous
+    horizontal band (same `y`, same `h`, each `x` continuing where the previous ended), the same row
+    dimension on every member, and the row labels hidden on the TRAILING members while the leader
+    keeps its own. That asymmetry is the whole gate: it separates a stitched pseudo-table from
+    tables that merely sit side by side.
+
+  * **The negatives are what make it trustworthy, and the source workbook supplies both.** A
+    single-sheet MEASURE TRELLIS renders an almost identical picture from completely different
+    source, and a BAR-mark band is already rebuilt correctly because the engine suppresses its
+    category axes. Detection fires on the stitched case and declines both -- verified on the real
+    workbook, not a fixture. This is also the concrete argument for classifying from XML rather than
+    from a rendered image: the image cannot separate cases that look the same.
+
+  * **`row_labels_hidden` exists because the axis path drops the fact for a crosstab.**
+    `_parse_hidden_axes` maps a hide onto a Power BI AXIS, which needs the shelf's role; it resolves
+    for a cartesian chart and yields nothing for a table, because a table has no category axis. The
+    author's hide was therefore parsed and then discarded for exactly the visual type this idiom
+    uses. Added as a separate, additive signal rather than by widening the axis function, so the
+    chart path is untouched.
+
+  * **Disclosed, not silently rebuilt, and NOT shipped as inert plumbing.** The detector feeds a
+    remediation-worklist item naming the sheets, the leader, and the native Power BI answer (one
+    matrix with N value columns). A detector with no consumer is the same shape as a gate nothing
+    calls, so it is wired on arrival rather than left for later.
+
+  * **Corpus, operands named.** `corpus/b210` (built from `5e6d921`) vs `corpus/v210`: 1468 files
+    vs 1468, 0 added, 0 removed, **2 differing -- `report.json` and `summary.md` only.** No
+    `visual.json` and no `.tmdl` changed, which is the correct blast radius for a disclosure.
+
+  * **Still open:** the merge itself. The measure on these crosstabs is not a plain shelf field, so
+    building the merged matrix needs work this increment deliberately does not guess at.
+
 - **`tableau-migration` (skill `2.208.0` → `2.209.0`): Tableau's "how many marks are in this
   view" idiom, and its escaped colour-map members.** Two independent defects from one real dashboard
   -- a dynamic-quartile view that ranks rows into Top 25% / middle / Bottom 25% and colours them.
