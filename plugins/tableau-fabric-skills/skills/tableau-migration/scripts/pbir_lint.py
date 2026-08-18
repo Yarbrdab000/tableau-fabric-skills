@@ -242,6 +242,18 @@ def _lint_page_order(parts):
     return problems
 
 
+# The signature R8 stamps into its finding, and the roster of findings whose failure mode is
+# VALIDATE-CLEAN / RENDER-WRONG: the report opens, `powerbi-report-author validate` reports zero
+# errors, the definition-of-done reports success, and the visual is silently unpainted or empty.
+#
+# Exported so a consumer can treat those findings as FATAL without matching on prose. The
+# definition-of-done needs to know WHICH rule fired, and grepping a message is a proxy for that --
+# the same proxy-versus-artifact mistake `REQUIRED_ROLES` exists to avoid. This module owns the
+# fact; `migrate_estate` reads it. A rule added here becomes fatal with no change on the other side.
+_DANGLING_SELECT_REF = "SelectRef names"
+SILENT_RENDER_FINDINGS = (_DANGLING_SELECT_REF,)
+
+
 def _lint_dangling_select_refs(parts):
     """Validity R8: a ``SelectRef`` must name a projection the SAME visual declares.
 
@@ -290,9 +302,9 @@ def _lint_dangling_select_refs(parts):
         _walk(visual)
         for name in sorted(refs - declared):
             problems.append(
-                "%s: SelectRef names %r, which this visual does not project -- the property "
+                "%s: %s %r, which this visual does not project -- the property "
                 "resolves to nothing, the visual renders with its defaults and reports no error"
-                % (path, name))
+                % (path, _DANGLING_SELECT_REF, name))
     return problems
 
 
