@@ -100,6 +100,54 @@ output**.
 
 ---
 
+## Verifying a rebuild
+
+| Symptom | Cause | Response |
+|---|---|---|
+| A render "proves" the feature works, but so would the bug | The broken and working hypotheses predict the **same picture** | Find a control that forces them apart (see below) |
+| Screenshot comes back empty | Captured before the model was refreshed | `NO_DATA` and "renders nothing" look identical — refresh, then capture |
+| Two Desktop instances disagree | You identified the wrong one | Read each process's **command line** (`Get-CimInstance Win32_Process`); `MainWindowTitle` is the file *name*, which two builds of one workbook share |
+
+**Verify by render — but a render is only evidence if the failure mode would look different.** If the
+broken and the working hypothesis predict the same picture, that picture is worth no more than a clean
+`validate`. Find the control that forces them apart: a second build, a second page, or a deliberately
+altered input whose effect you can predict in advance.
+
+Three measured examples of a render that looked like proof and was not:
+
+* A parameter-thresholded colour rendered **all one colour**. Consistent with "the parameter
+  evaluated" *and* with "the whole `Conditional` silently fell through to `DefaultValue`" — a mode
+  already measured on `Or` nodes and inline visual calculations. The control was a threshold that
+  *must* split the rows (100 → 100,000): the split then landed exactly on the parameter's value.
+* A view-scoped colour painted **all four bars orange**, which is correct for a running max over a
+  monotonically rising series — and identical to an ignored `SelectRef` plus an authored orange mark
+  colour. The control was repointing the window bound from running (`WINDOW(1, ABS, 0, REL)`) to
+  whole-partition (`WINDOW(1, ABS, -1, ABS)`): exactly one bar stayed orange.
+* A calendar fix looked clean on every static signal — 29/29 built, `validate` 0 errors, self-check
+  green. The control was cold-opening **both** builds: the pre-change model loaded a fabricated
+  year-2000 calendar, the post-change one opened correctly.
+
+The same rule applies to the measuring apparatus, not just the artifact:
+
+* **Name both operands of a diff, never just the delta.** A whole-tree diff whose two roots were
+  built from the *same* tree returns `0 differing` — guaranteed, carrying zero information, and
+  indistinguishable from a real result. Report "`b178` (built from `d1c35e6`) vs `v178` (built from
+  `HEAD`): 1384 vs 1378".
+* **Masking normalises representations; any value *derived* from the masked thing escapes it.** A
+  path length already rendered into prose (`"output path is 290 chars"`) survives masking of the
+  path itself, so give both builds output roots of **equal length**. Same for row counts, byte sizes,
+  elapsed times.
+* **`added > 0` with `removed == 0` is suspicious, not a result.** A contiguous one-sided block of
+  "added" files is the signature of an enumeration failure — `os.walk` silently stops at `MAX_PATH`
+  (260) unless the root is passed as `\\?\...`, and if the two roots differ in length the truncation
+  hits one side only.
+* **A substitution that reports success by returning a string is not a substitution.** PowerShell's
+  `-replace` treats `$` in the replacement as a group reference; Python's `str.replace` returns the
+  input unchanged on no match. Both silently no-op. Assert the match count, and read back what you
+  wrote.
+
+---
+
 ## Security
 
 | Symptom | Cause | Response |
