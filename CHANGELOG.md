@@ -14,6 +14,42 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.226.0` → `2.227.0`): a visual that projects an inert `BLANK()` stub
+  is now disclosed.** The first instrument built for the *structurally valid, semantically absent*
+  family named in 2.226.0.
+
+  When a calc cannot be translated the model emits `measure 'X' = BLANK()` so the reference still
+  resolves — and it resolves **perfectly**. The visual binds, `pbir_lint` is clean,
+  `lint_visual_model_bindings` is clean (the measure genuinely exists),
+  `powerbi-report-author validate` returns 0 errors, and the chart renders **empty**. Measured on
+  corpus workbook `0136` before 2.225.0: Sheet 3 projected `complex nested`, a stub, while
+  `viz_fidelity` recorded `{"status": "rebuilt", "reason": null}`. The MODEL layer knew — the
+  translation handoff listed the calc as needs-review — and the VISUAL layer never repeated it.
+
+  Every other gate here asks *is this well-formed*; this one asks *does it say anything*, which is
+  why it reads the measure's EXPRESSION rather than its existence. Reported as
+  `visuals_projecting_stub_measures` (visual, page, measure) on the SHIPPING parts, after the
+  cross-check and after twin retirement, so it describes the `.pbip` the user opens.
+
+  **The narrowness is the feature.** Only an expression that is exactly the stub form counts. A
+  measure that returns blank *conditionally* — `IF(<cond>, 1)`, the shape every keep-flag in this
+  project emits — is doing its job; matching "contains BLANK" would fire on correct output
+  constantly and the finding would be worthless within one release.
+
+  **Proved by control and injection on the same real workbook**, not a fixture: the 2.225.0 build
+  reports `null`, and disabling the alias fix — which restores `complex nested` as a projected stub —
+  makes it emit
+  `[{"measure": "complex nested", "page": "page-ws-Sheet3…", "visual": "v-Sheet38c3a8a7b"}]`.
+  Same data, same build, only the defect differing.
+
+  **Clause 3 run properly, after getting it wrong twice.** Disabling the detector in **both** trees
+  gives `3 failed, 4954 passed` — every failure one of the new tests, so nothing else in the suite
+  catches this. The first two attempts patched canonical only, and mirror parity failed alongside,
+  making the count uninterpretable. Same rider, learned twice: in this repo a source-level injection
+  is a two-tree edit whether you want it to be or not.
+
+  Suite 4950 → **4957**.
+
 - **`tableau-migration` (skill `2.225.0` → `2.226.0`): the day's verification findings collapse into
   one rule, recorded where the next person will read it.** Docs-only; no code, no corpus change.
 

@@ -3178,6 +3178,79 @@ _COLOUR_TWIN_SUFFIX = " (colour)"
 _COLOUR_TWIN_DECL_RE = re.compile(r"^\tmeasure '([^']+ \(colour\))'\s*=", re.M)
 
 
+def _visuals_projecting_stub_measures(model_parts, report_parts):
+    """Visuals that project a measure whose whole expression is an inert ``BLANK()`` stub.
+
+    THE FAMILY THIS BELONGS TO: structurally valid, semantically absent. When a calc cannot be
+    translated the model emits ``measure 'X' = BLANK()`` so the reference still resolves -- and it
+    resolves *perfectly*. The visual binds, `pbir_lint` is clean, `lint_visual_model_bindings` is
+    clean (the measure genuinely exists), `powerbi-report-author validate` returns 0 errors, and the
+    chart renders EMPTY. Measured on corpus workbook 0136 before 2.225.0: Sheet 3 projected
+    ``complex nested``, which was a stub, while ``viz_fidelity`` recorded
+    ``{"status": "rebuilt", "reason": null}``. The MODEL layer knew (the translation handoff lists
+    the calc as needs-review); the VISUAL layer never repeated it.
+
+    Every existing gate here asks "is this well-formed"; none asks "does it SAY anything". That is
+    why no structural check can find this and why it has to read the measure's EXPRESSION.
+
+    Fail-closed, and narrowly: only an expression that is EXACTLY the stub form counts. A measure
+    that returns blank conditionally -- ``IF(<cond>, 1)``, the shape every keep-flag uses -- is
+    doing its job, and flagging it would fire on correct output constantly. A stub is recognised by
+    ``= BLANK()`` alone, optionally parenthesised/whitespaced, never by "contains BLANK".
+
+    Returns ``[{"visual", "page", "measure"}]`` sorted, empty when nothing qualifies -- so a build
+    with no stubbed calc is unaffected.
+    """
+    if not isinstance(model_parts, dict) or not isinstance(report_parts, dict):
+        return []
+    stub_re = re.compile(r"(?m)^\s*measure\s+(?:'([^']+)'|(\S+))\s*=\s*\(?\s*BLANK\s*\(\s*\)\s*\)?\s*$")
+    stubs = set()
+    for path, text in model_parts.items():
+        if not (isinstance(path, str) and path.endswith(".tmdl") and isinstance(text, str)):
+            continue
+        for m in stub_re.finditer(text):
+            name = m.group(1) or m.group(2)
+            if name:
+                stubs.add(name)
+    if not stubs:
+        return []
+
+    out = []
+    for path, content in sorted(report_parts.items()):
+        if not (isinstance(path, str) and path.endswith("visual.json")
+                and isinstance(content, str)):
+            continue
+        try:
+            doc = json.loads(content)
+        except (TypeError, ValueError):
+            continue
+        norm = path.replace("\\", "/").split("/")
+        page = norm[-4] if len(norm) >= 4 else None
+        named = set()
+        for ref in _iter_measure_property_names(doc):
+            if ref in stubs:
+                named.add(ref)
+        for measure in sorted(named):
+            out.append({"visual": doc.get("name") or (norm[-2] if len(norm) >= 2 else None),
+                        "page": page, "measure": measure})
+    return out
+
+
+def _iter_measure_property_names(node):
+    """Every ``Measure.Property`` string anywhere in a visual document."""
+    if isinstance(node, dict):
+        meas = node.get("Measure")
+        if isinstance(meas, dict) and isinstance(meas.get("Property"), str):
+            yield meas["Property"]
+        for value in node.values():
+            for name in _iter_measure_property_names(value):
+                yield name
+    elif isinstance(node, list):
+        for value in node:
+            for name in _iter_measure_property_names(value):
+                yield name
+
+
 def _retire_unreferenced_colour_twins(model_parts, report_parts):
     """Drop colour twins the SHIPPING report does not reference -> ``(parts, [retired names])``.
 
@@ -3656,6 +3729,14 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
     if _retired_twins:
         res["parts"] = _pruned_parts
         entry["colour_twins_retired"] = list(_retired_twins)
+    # DISCLOSE A VISUAL THAT PROJECTS AN INERT STUB. A `= BLANK()` measure resolves perfectly, so
+    # every structural gate above passes while the chart renders empty -- the model layer knows the
+    # calc could not be translated and the visual layer never repeated it. Read on the SHIPPING
+    # parts, after the cross-check and after twin retirement, so it describes the .pbip the user
+    # opens rather than an intermediate.
+    _stub_visuals = _visuals_projecting_stub_measures(res.get("parts"), report_parts)
+    if _stub_visuals:
+        entry["visuals_projecting_stub_measures"] = _stub_visuals
     # PROVE the cross-check above actually left nothing dangling, on the BYTES THAT SHIP.
     # ``_crosscheck_report_refs`` is supposed to drop or rebind every reference the model did not
     # emit; this asserts the result rather than trusting it. reference_gate proves the same invariant
