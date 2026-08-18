@@ -1322,51 +1322,23 @@ def _measure_filter_rollup(result):
 _PBIP_WARN = "manual attention required: "
 
 
-# Roles a visual type cannot render without. HARVESTED from `powerbi-report-author catalog describe`
-# (v0.1.4) -- the same tool whose PBIR_ROLE_REQUIRED_MISSING diagnostic this prevents -- rather than
-# hand-authored, so it states what the validator enforces instead of what we believe it enforces.
-# A visualType absent here is simply never emptied on this account (fail-safe: unknown types keep
-# today's behaviour), which is why only the 38 types that declare required roles are listed.
-_REQUIRED_ROLES = {
-    "advancedSlicerVisual": ("Values",),
-    "areaChart": ("Category", "Y"),
-    "azureMap": ("Category",),
-    "barChart": ("Category", "Y"),
-    "card": ("Values",),
-    "cardVisual": ("Data",),
-    "clusteredBarChart": ("Category", "Y"),
-    "clusteredColumnChart": ("Category", "Y"),
-    "columnChart": ("Category", "Y"),
-    "decompositionTreeVisual": ("Analyze",),
-    "donutChart": ("Category", "Y"),
-    "filledMap": ("Category",),
-    "filterSlicer": ("Values",),
-    "funnel": ("Category", "Y"),
-    "gauge": ("Y",),
-    "hundredPercentStackedAreaChart": ("Category", "Y"),
-    "hundredPercentStackedBarChart": ("Category", "Y"),
-    "hundredPercentStackedColumnChart": ("Category", "Y"),
-    "kpi": ("Indicator",),
-    "lineChart": ("Category", "Y"),
-    "lineClusteredColumnComboChart": ("Category",),
-    "lineStackedColumnComboChart": ("Category",),
-    "listSlicer": ("Values",),
-    "map": ("Category",),
-    "matrix": ("Values",),
-    "multiRowCard": ("Values",),
-    "pieChart": ("Category", "Y"),
-    "pivotTable": ("Values",),
-    "ribbonChart": ("Category", "Y"),
-    "scatterChart": ("X", "Y"),
-    "shapeMap": ("Category",),
-    "slicer": ("Values",),
-    "stackedAreaChart": ("Category", "Y"),
-    "table": ("Values",),
-    "tableEx": ("Values",),
-    "textSlicer": ("Values",),
-    "treemap": ("Values",),
-    "waterfallChart": ("Category", "Y"),
-}
+# The visualType -> required-roles table lives in ``pbir_lint`` (its R9 rule is the standing gate
+# for this defect) and is READ here rather than copied. One table, two consumers: the emitter that
+# must not produce an invalid visual, and the linter that must not let one through. Two copies would
+# drift, and a gate drifting away from the emitter it guards is exactly what #137 was.
+
+
+def _required_roles_table():
+    """The shared table, or ``{}`` when ``pbir_lint`` cannot be imported.
+
+    Fail-safe: an empty table means no visual is ever judged, which is the pre-#143 behaviour. A
+    missing sibling module must not start emptying visuals.
+    """
+    try:
+        import pbir_lint as _pl
+        return _pl.REQUIRED_ROLES
+    except Exception:  # pragma: no cover - sibling module is always importable in-package
+        return {}
 
 
 def _missing_required_role(vis, query_state):
@@ -1375,7 +1347,7 @@ def _missing_required_role(vis, query_state):
     A visual whose ``visualType`` is unknown here returns ``None`` -- unknown means "we cannot
     judge", and emptying a visual we merely failed to recognise would be worse than the defect.
     """
-    required = _REQUIRED_ROLES.get((vis or {}).get("visualType"))
+    required = _required_roles_table().get((vis or {}).get("visualType"))
     if not required:
         return None
     for role in required:

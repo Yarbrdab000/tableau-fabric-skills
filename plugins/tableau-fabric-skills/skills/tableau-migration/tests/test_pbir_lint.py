@@ -294,7 +294,10 @@ def test_native_query_refs_unique_is_clean():
 
 
 def test_native_query_refs_duplicate_across_roles_flagged():
-    parts = _visual_parts_with_refs(("Category", ["Name"]), ("Series", ["Name"]))
+    # Y carries a distinct nref so it adds no R6 problem; it is present only because a barChart
+    # REQUIRES it and pbir_lint R9 (#144) reports a visual that omits a required role. The
+    # assertion below is unchanged.
+    parts = _visual_parts_with_refs(("Category", ["Name"]), ("Series", ["Name"]), ("Y", ["Sales"]))
     problems = lint_pbir_parts(parts)
     assert len(problems) == 1 and "duplicate nativeQueryRef 'Name'" in problems[0]
 
@@ -350,8 +353,15 @@ def _bind_surface():
 
 def _visual_with(entity, prop, kind="Column"):
     field = {kind: {"Expression": {"SourceRef": {"Entity": entity}}, "Property": prop}}
+    # The Y role holds a KNOWN-GOOD reference (Orders[Region] exists in _BIND_TMDL) so this fixture
+    # is structurally valid PBIR: a clusteredColumnChart requires Category AND Y, and pbir_lint R9
+    # (#144) rightly reports a visual missing one. The added projection resolves cleanly, so every
+    # binding assertion below is unchanged -- only the incidental role-incompleteness is fixed.
+    ok = {"Column": {"Expression": {"SourceRef": {"Entity": "Orders"}}, "Property": "Region"}}
     doc = {"visual": {"visualType": "clusteredColumnChart",
-                      "query": {"queryState": {"Category": {"projections": [{"field": field}]}}}}}
+                      "query": {"queryState": {
+                          "Category": {"projections": [{"field": field}]},
+                          "Y": {"projections": [{"field": ok}]}}}}}
     return {"pages/p/visuals/v/visual.json": json.dumps(doc)}
 
 

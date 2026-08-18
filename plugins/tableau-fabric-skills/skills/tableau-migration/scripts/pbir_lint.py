@@ -402,6 +402,116 @@ def lint_visual_model_bindings(parts, model_surface):
     return problems
 
 
+# Roles a visual type cannot render without (#143, #144). HARVESTED from
+# ``powerbi-report-author catalog describe`` (v0.1.4) -- the same tool whose
+# PBIR_ROLE_REQUIRED_MISSING diagnostic this prevents -- across all 38 visual types that declare
+# required roles, so it states what the validator ENFORCES rather than what we believe it enforces.
+# A visual type absent here is never judged: "cannot judge" must not become "declare invalid".
+#
+# SINGLE SOURCE OF TRUTH. ``migrate_estate`` reads this same table to decide whether a projection
+# drop left a visual structurally invalid. Two copies would drift, and a gate drifting away from the
+# emitter it guards is precisely the defect #137 was.
+REQUIRED_ROLES = {
+    "advancedSlicerVisual": ("Values",),
+    "areaChart": ("Category", "Y"),
+    "azureMap": ("Category",),
+    "barChart": ("Category", "Y"),
+    "card": ("Values",),
+    "cardVisual": ("Data",),
+    "clusteredBarChart": ("Category", "Y"),
+    "clusteredColumnChart": ("Category", "Y"),
+    "columnChart": ("Category", "Y"),
+    "decompositionTreeVisual": ("Analyze",),
+    "donutChart": ("Category", "Y"),
+    "filledMap": ("Category",),
+    "filterSlicer": ("Values",),
+    "funnel": ("Category", "Y"),
+    "gauge": ("Y",),
+    "hundredPercentStackedAreaChart": ("Category", "Y"),
+    "hundredPercentStackedBarChart": ("Category", "Y"),
+    "hundredPercentStackedColumnChart": ("Category", "Y"),
+    "kpi": ("Indicator",),
+    "lineChart": ("Category", "Y"),
+    "lineClusteredColumnComboChart": ("Category",),
+    "lineStackedColumnComboChart": ("Category",),
+    "listSlicer": ("Values",),
+    "map": ("Category",),
+    "matrix": ("Values",),
+    "multiRowCard": ("Values",),
+    "pieChart": ("Category", "Y"),
+    "pivotTable": ("Values",),
+    "ribbonChart": ("Category", "Y"),
+    "scatterChart": ("X", "Y"),
+    "shapeMap": ("Category",),
+    "slicer": ("Values",),
+    "stackedAreaChart": ("Category", "Y"),
+    "table": ("Values",),
+    "tableEx": ("Values",),
+    "textSlicer": ("Values",),
+    "treemap": ("Values",),
+    "waterfallChart": ("Category", "Y"),
+}
+
+_REQUIRED_ROLES = REQUIRED_ROLES  # module-internal alias used by the rule below
+
+
+def _lint_required_roles(parts):
+    """Validity R9: a visual must project every role its visual type requires (#144).
+
+    A visual missing a required role is STRUCTURALLY INVALID -- not merely low-fidelity. Power BI
+    Desktop renders it broken, and ``powerbi-report-author validate`` reports
+    ``PBIR_ROLE_REQUIRED_MISSING`` and exits 1. That CLI is an opt-in npm pre-gate an ordinary run
+    never reaches, so the hermetic linter has to catch it too -- which is the exact reasoning
+    ``_lint_page_order`` (R7) already applies to ``PBIR_PAGE_ORDER_EMPTY``.
+
+    This is the MIRROR of ``lint_visual_model_bindings``, and the pair is worth reading together:
+    that rule covers the case where *validate is blind and we can see* (a binding to a model object
+    that does not exist validates clean and renders empty); this one covers the reverse, where
+    *validate can see and we were blind*. Reported in #144 as the systemic gap that let #143 ship
+    green -- the run graded ``definition_of_done: warn`` / ``0 error`` / ``Viz=built`` over a report
+    that could not pass structural validation.
+
+    ``_REQUIRED_ROLES`` is HARVESTED from ``powerbi-report-author catalog describe`` (v0.1.4), the
+    same tool that raises the diagnostic, so it states what the validator enforces rather than what
+    we believe it enforces. A visual type absent from the table is not judged -- "cannot judge" must
+    never become "declare invalid".
+
+    A role counts as occupied by either a projection or a ``fieldParameters`` binding, because a
+    field-parameter expansion legitimately seeds one and rejecting it would flag a repaired visual.
+    """
+    problems = []
+    for path in sorted(parts):
+        if not path.endswith("visual.json"):
+            continue
+        doc = _load_json(parts, path)
+        if not isinstance(doc, dict):
+            continue
+        vis = doc.get("visual")
+        if not isinstance(vis, dict):
+            continue
+        required = _REQUIRED_ROLES.get(vis.get("visualType"))
+        if not required:
+            continue
+        query = vis.get("query")
+        query_state = (query.get("queryState") if isinstance(query, dict) else None) or {}
+        if not isinstance(query_state, dict) or not query_state:
+            # A visual emitted with NO query at all is the deliberate placeholder an emptied visual
+            # becomes (migrate_estate drops ``query`` wholesale). That is the VALID outcome this
+            # rule exists to steer toward, so it must not be flagged as the defect.
+            continue
+        for role in required:
+            spec = query_state.get(role) or {}
+            if not (isinstance(spec, dict)
+                    and (spec.get("projections") or spec.get("fieldParameters"))):
+                problems.append(
+                    "%s: visualType %r requires role %r but the visual does not project it -- this "
+                    "is structurally invalid PBIR (powerbi-report-author validate reports "
+                    "PBIR_ROLE_REQUIRED_MISSING and Power BI Desktop renders it broken); emit the "
+                    "role or emit the visual as an empty placeholder"
+                    % (path, vis.get("visualType"), role))
+    return problems
+
+
 def lint_pbir_parts(parts, model_surface=None):
     """Return a list of PBIR validity violations for an emitted ``{path: content}`` parts dict.
 
@@ -415,7 +525,7 @@ def lint_pbir_parts(parts, model_surface=None):
     parts = parts or {}
     return (_lint_visual_types(parts) + _lint_theme(parts)
             + _lint_card_display_units(parts) + _lint_native_query_refs(parts)
-            + _lint_page_order(parts)
+            + _lint_page_order(parts) + _lint_required_roles(parts)
             + lint_visual_model_bindings(parts, model_surface))
 
 
