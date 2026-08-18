@@ -1322,6 +1322,69 @@ def _measure_filter_rollup(result):
 _PBIP_WARN = "manual attention required: "
 
 
+# Roles a visual type cannot render without. HARVESTED from `powerbi-report-author catalog describe`
+# (v0.1.4) -- the same tool whose PBIR_ROLE_REQUIRED_MISSING diagnostic this prevents -- rather than
+# hand-authored, so it states what the validator enforces instead of what we believe it enforces.
+# A visualType absent here is simply never emptied on this account (fail-safe: unknown types keep
+# today's behaviour), which is why only the 38 types that declare required roles are listed.
+_REQUIRED_ROLES = {
+    "advancedSlicerVisual": ("Values",),
+    "areaChart": ("Category", "Y"),
+    "azureMap": ("Category",),
+    "barChart": ("Category", "Y"),
+    "card": ("Values",),
+    "cardVisual": ("Data",),
+    "clusteredBarChart": ("Category", "Y"),
+    "clusteredColumnChart": ("Category", "Y"),
+    "columnChart": ("Category", "Y"),
+    "decompositionTreeVisual": ("Analyze",),
+    "donutChart": ("Category", "Y"),
+    "filledMap": ("Category",),
+    "filterSlicer": ("Values",),
+    "funnel": ("Category", "Y"),
+    "gauge": ("Y",),
+    "hundredPercentStackedAreaChart": ("Category", "Y"),
+    "hundredPercentStackedBarChart": ("Category", "Y"),
+    "hundredPercentStackedColumnChart": ("Category", "Y"),
+    "kpi": ("Indicator",),
+    "lineChart": ("Category", "Y"),
+    "lineClusteredColumnComboChart": ("Category",),
+    "lineStackedColumnComboChart": ("Category",),
+    "listSlicer": ("Values",),
+    "map": ("Category",),
+    "matrix": ("Values",),
+    "multiRowCard": ("Values",),
+    "pieChart": ("Category", "Y"),
+    "pivotTable": ("Values",),
+    "ribbonChart": ("Category", "Y"),
+    "scatterChart": ("X", "Y"),
+    "shapeMap": ("Category",),
+    "slicer": ("Values",),
+    "stackedAreaChart": ("Category", "Y"),
+    "table": ("Values",),
+    "tableEx": ("Values",),
+    "textSlicer": ("Values",),
+    "treemap": ("Values",),
+    "waterfallChart": ("Category", "Y"),
+}
+
+
+def _missing_required_role(vis, query_state):
+    """Name a required role this visual no longer projects, or ``None`` when it is still valid.
+
+    A visual whose ``visualType`` is unknown here returns ``None`` -- unknown means "we cannot
+    judge", and emptying a visual we merely failed to recognise would be worse than the defect.
+    """
+    required = _REQUIRED_ROLES.get((vis or {}).get("visualType"))
+    if not required:
+        return None
+    for role in required:
+        spec = (query_state or {}).get(role) or {}
+        if not (spec.get("projections") or spec.get("fieldParameters")):
+            return role
+    return None
+
+
 def _model_object_names(model_parts):
     """Collect every measure name and column name emitted by the model (lower-cased).
 
@@ -1506,6 +1569,10 @@ def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
             continue
         # A slicer bound to a field parameter's display column IS the picker, never an expansion.
         is_slicer = "slicer" in str(vis.get("visualType") or "").lower()
+        # Whether this visual ALREADY lacked a required role on the way in (#143). Only a role that
+        # THIS pass empties is ours to act on -- a visual that arrived incomplete for some other
+        # reason is out of scope, and emptying it here would be an unrelated behaviour change.
+        was_missing_required = _missing_required_role(vis, qs)
         dropped, rebound = [], []
         dropped_refs = set()
         for role, spec in list(qs.items()):
@@ -1562,7 +1629,15 @@ def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
             if not kept:
                 del qs[role]
         if dropped or rebound:
-            emptied = not qs
+            # A visual that lost EVERY role is emptied, as before. But losing only SOME roles can
+            # still leave structurally invalid PBIR: a clusteredColumnChart that keeps `Category`
+            # and loses `Y` fails `powerbi-report-author validate` with PBIR_ROLE_REQUIRED_MISSING
+            # and renders broken in Desktop (#143). Emptying it is lossier but always valid, which
+            # is the reporter's own second option and the only one available here -- the first
+            # ("bind the stub measure") cannot apply, because a reference only reaches this branch
+            # when the model did NOT emit that object, so there is nothing to bind to.
+            emptied = not qs or (was_missing_required is None
+                                 and _missing_required_role(vis, qs) is not None)
             if emptied:
                 vis.pop("query", None)
             # A formatting object scoped to a projection we just dropped is now a dangling

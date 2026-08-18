@@ -14,6 +14,45 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.165.0` → `2.166.0`): a visual that loses a required role is
+  emptied, not shipped as structurally invalid PBIR.** Raised in #143. The symptom is real and
+  reproduced: `powerbi-report-author validate` fails pristine engine output with
+  `PBIR_ROLE_REQUIRED_MISSING` for a `clusteredColumnChart` carrying `Category` and no `Y`.
+
+  **The reported cause is not the mechanism, and that changes which fix is available.** The issue
+  states the rule as *"when a calc falls back to a stub, the engine drops its projection from the
+  visual instead of binding it"*. Measured against `_crosscheck_report_refs`: an emitted stub —
+  `measure 'Regional Revenue (FIXED)' = BLANK()` — **binds normally and is not dropped**. Only a
+  reference the model did not emit *at all* is dropped. So the reporter's preferred fix, "bind the
+  stub measure into the required role", cannot apply on this path: a projection reaches the drop
+  branch precisely when there is nothing in the model to bind it to. (Why their measure was absent
+  rather than stubbed is not determined here — their run used the datasource-first split, so the
+  measure may live in the standalone `.SemanticModel` rather than the parts this cross-check
+  compares against. Worth a follow-up with the artifacts.)
+
+  What *is* general is the **outcome**, and that is what is fixed. Dropping a projection deletes its
+  role, and a visual was emptied to a placeholder only when it lost **every** role (`emptied = not
+  qs`). Losing just one *required* role left a partial `queryState` — valid JSON, invalid PBIR,
+  broken in Desktop. This is the reporter's own second option ("drop the whole visual and record it
+  as dropped — lossier, but still valid PBIR"), applied wherever a required role goes missing
+  regardless of cause.
+
+  `_REQUIRED_ROLES` is **harvested** from `powerbi-report-author catalog describe` (v0.1.4) — the
+  same tool that raises the diagnostic — across all 38 visual types that declare required roles, so
+  it encodes what the validator enforces rather than what we believe it enforces. An unrecognised
+  `visualType` is never emptied on this account: "cannot judge" must not become "delete it".
+
+  **Narrowed after an over-fire that an existing test caught.** The first version emptied any visual
+  left missing a required role, which regressed
+  `test_field_parameter_on_a_chart_axis_is_expanded` — a field-parameter axis expansion legitimately
+  builds that shape. The guard now fires only when **this pass** is what emptied the role: a visual
+  that arrived incomplete for unrelated reasons is left exactly as before. That narrowing is itself
+  pinned by a test, and the pre-existing test was not weakened to accommodate the change.
+
+  Corpus: 29/29, definition of done unchanged, and a masked whole-tree diff against the previous
+  build is **empty** (1384 files vs 1384, 0 differing) — no corpus visual loses a required role this
+  way, so the guard is inert on known-good input and lives only where the defect lives.
+
 - **`tableau-migration` (skill `2.162.0` → `2.165.0`): Tableau's cross-project caption suffix no
   longer makes a published datasource unmatchable.** Raised in #145. Tableau appends
   `" | Project : <name>"` to a published-datasource caption when the name alone would be ambiguous
