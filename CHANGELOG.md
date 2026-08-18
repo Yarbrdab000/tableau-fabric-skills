@@ -14,6 +14,58 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.215.0` → `2.225.0`): a calc that reaches across a declared join no
+  longer stubs to `BLANK()` and renders an empty chart.** In corpus workbook
+  `0136_custom_sql_prefix_and_params`, the calc `complex nested` mixes a relation-qualified reference
+  (`[Region (Custom SQL Query2)]`) with plain ones (`[Sales]`, `[Sub-Category]`). That spans two
+  tables, so the translator refuses it — *"SUM(expr) must reference exactly one table"* — correctly,
+  because a row expression cannot be evaluated across an unjoined pair. The calc then stubs to
+  `= BLANK()`, **which binds normally**, so Sheet 3 rendered an empty bar chart while `viz_fidelity`
+  recorded `{"status": "rebuilt", "reason": null}`. Loudly refused in the model, silently wrong in
+  the report.
+
+  **The workbook itself declares the way out.** Its object-graph relationship predicate is literally
+  `[Region] = [Region (Custom SQL Query2)]`, so on every row the join produces the two hold the same
+  value — by the author's declaration, not by inference. Substituting the plain caption is therefore
+  faithful *and* makes the expression single-table. Measured through the real translator, same
+  inputs, only the aliased reference differing:
+
+  | | result | tables |
+  |---|---|---|
+  | before | `None` — *"SUM(expr) must reference exactly one table"* | 2 |
+  | after | `CALCULATE(SUMX('Custom SQL Query', IF(EXACT(…) && EXACT(…), …[Sales])), ALLEXCEPT(…))` | 1 |
+
+  **Why not `RELATED()`**, which is the obvious answer: it needs a many-to-one direction to traverse,
+  and an authored object-graph relationship is emitted **many-to-many on purpose** (see
+  `generate_relationships_tmdl` — it is uniqueness-agnostic, so an m:m join cannot be rejected for a
+  non-unique target and cancel the batch). There is no ONE side, so the reach would have to invent a
+  cardinality the source never stated.
+
+  **Keyed on the declaration, never on the name.** An alias is recorded only when a relationship's
+  single-column `=` predicate names both captions. Two plain captions, two differently-qualified
+  captions, and any non-`=` predicate all yield nothing — collapsing columns the workbook has not
+  declared equal would silently change the answer, and a look-alike name is exactly what that would
+  look like. Substitution is bracket-delimited and longest-first, so `[Regional Manager]` survives an
+  alias on `Region`.
+
+  Workbook calc coverage on 0136: **1/4 → 2/4**. The two that remain are the defensible ones — on no
+  worksheet, so no aggregation is observable anywhere in the artifact, and Tableau records no default
+  aggregation on a calc column; inventing `SUM` would be a guess.
+
+  **Measured, both operands and the count named.** `corpus_b216` (built at `d0f16e7`) vs
+  `corpus_v216`, same **34**-workbook input: 1586 files vs 1586, **0 added, 0 removed, 3 differing** —
+  the one `_Measures.tmdl` that gained the measure, plus `report.json`/`summary.md`. Thirty-three
+  workbooks byte-identical.
+
+  **A wiring bug worth recording, because the trace lied by omission.** The first attempt rewrote the
+  merged `all_calcs`, and an instrumented run confirmed the helper firing exactly as designed —
+  4 calcs in, 2 aliases, 1 rewritten. The measure still emitted `BLANK()`: measure emission reads
+  `calcs` **directly**, so the alias was visible to the flag pipelines and invisible to
+  `_measures_part`. A trace proving your own function ran is not evidence that its effect reached the
+  output; only the emitted artifact is.
+
+  Suite 4938 → **4950**.
+
 - **`tableau-migration` (skill `2.214.0` → `2.215.0`): a CHANGELOG entry that exists but says
   nothing fails the suite.** A cross-session rebase left a header-only duplicate of a renumbered
   entry -- same shape, same `(skill X → Y)` marker, zero prose. Every existing check passed on it,

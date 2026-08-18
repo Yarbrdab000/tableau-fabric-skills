@@ -1879,6 +1879,55 @@ def _equality_operands(relationship):
     return kids[0].get("op"), kids[1].get("op")
 
 
+def relationship_column_aliases(datasource):
+    """``{qualified_caption: plain_caption}`` for each single-column equality relationship.
+
+    A Tableau field reference carries its relation's name when the caption would otherwise be
+    ambiguous -- ``[Region (Custom SQL Query2)]`` next to a plain ``[Region]``. A calc that mixes the
+    two spans TWO tables, and the measure translator correctly refuses it ("SUM(expr) must reference
+    exactly one table"): a row expression cannot be evaluated across an unjoined pair, so the calc
+    stubs to ``BLANK()`` and its visual renders empty.
+
+    But the workbook itself declares the two columns EQUAL. The relationship's own predicate is
+    ``[Region] = [Region (Custom SQL Query2)]``, so for every row the join produces, the qualified
+    reference and the plain one hold the same value -- by the author's declaration, not by
+    inference. Substituting the plain caption is therefore faithful AND makes the expression
+    single-table, which is what unblocks the translation.
+
+    Why this beats reaching across with ``RELATED()``: that requires a many-to-one direction to
+    traverse, and an authored object-graph relationship is emitted many-to-many on purpose (see
+    ``generate_relationships_tmdl``) precisely because it is uniqueness-agnostic -- so there is no
+    ONE side to traverse, and the reach would have to invent a cardinality the source never stated.
+
+    KEYED ON THE DECLARATION, NEVER ON THE NAME. An alias is recorded only when a relationship's
+    single-column ``=`` predicate names both captions. Two columns that merely LOOK related --
+    ``[Region]`` and ``[Region (Other)]`` with no relationship between them -- yield nothing, because
+    their values are not equal and substituting one for the other would silently change the answer.
+
+    Returns an empty dict for a datasource with no such relationship, so a workbook without this
+    shape is byte-for-byte unchanged.
+    """
+    out = {}
+    for og in _findall_object_graph(datasource):
+        for rship in _findall_local(og, "relationship"):
+            ops = _equality_operands(rship)
+            if not ops:
+                continue
+            a, b = (_strip_brackets(o or "") for o in ops)
+            if not a or not b or a == b:
+                continue
+            # The qualified side is the one whose caption is the other's plus a ``(relation)``
+            # suffix. Anything else -- two plain captions, or two differently-qualified ones -- is
+            # NOT an alias: those are genuinely different columns that happen to be joined, and
+            # collapsing them would rewrite the author's meaning.
+            for far, near in ((a, b), (b, a)):
+                if far.startswith(near + " (") and far.endswith(")"):
+                    if out.get(far, near) == near:
+                        out[far] = near
+                    break
+    return out
+
+
 # -- data-free "one"-side inference for join predicates ------------------------
 # A Tableau join predicate never records cardinality, and we cannot probe the data to find out:
 # a live/DirectQuery datasource is routinely migrated without any database credential. So the
@@ -2493,6 +2542,11 @@ def parse_tds(xml_text, select=None):
         "relations": relations,
         "relationships": relationships,
         "relationship_warnings": relationship_warnings,
+        # Qualified-caption aliases the object-graph itself DECLARES equal (e.g.
+        # "Region (Custom SQL Query2)" -> "Region"). Carried on the descriptor because the calc
+        # translation happens far from the XML, and a calc mixing a qualified reference with plain
+        # ones is otherwise refused as multi-table and stubs to BLANK().
+        "column_aliases": relationship_column_aliases(datasource),
         "hidden_prune": hidden_prune,
         "logical_fields": _logical_fields(datasource),
         "unsupported_reasons": unsupported,

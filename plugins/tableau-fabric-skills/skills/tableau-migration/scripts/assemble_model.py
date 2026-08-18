@@ -1167,6 +1167,41 @@ def _param_predicate_flags(calcs, resolve, param_resolver, *, known_tables,
     return flag_measures, filter_bindings
 
 
+def _apply_relationship_column_aliases(calcs, aliases):
+    """Rewrite each calc's qualified field references onto the plain captions declared equal to them.
+
+    ``aliases`` is ``{qualified_caption: plain_caption}`` from
+    :func:`connection_to_m.relationship_column_aliases`, which records a pair ONLY when the
+    workbook's object-graph declares a single-column ``=`` between them.
+
+    Returns the list unchanged (same objects) when there is nothing to do, so a workbook without this
+    shape stays byte-for-byte identical. A rewritten calc is a COPY carrying ``formula_original``, so
+    the authored text survives for annotation and reporting -- the model should still show what the
+    author wrote, not what we translated.
+
+    Substitution is bracket-delimited (``[<caption>]``), never a bare-token replace: a bare replace of
+    ``Region`` would corrupt ``Region (Custom SQL Query2)`` itself, and any caption containing it.
+    Longest captions are substituted FIRST so a qualified name is never partially rewritten by a
+    shorter alias that happens to be its prefix.
+    """
+    if not aliases or not calcs:
+        return calcs
+    ordered = sorted(aliases.items(), key=lambda kv: len(kv[0]), reverse=True)
+    out, changed = [], False
+    for calc in calcs:
+        formula = (calc or {}).get("formula") or ""
+        new = formula
+        for far, near in ordered:
+            new = new.replace("[%s]" % far, "[%s]" % near)
+        if new != formula:
+            calc = dict(calc)
+            calc["formula_original"] = formula
+            calc["formula"] = new
+            changed = True
+        out.append(calc)
+    return out if changed else calcs
+
+
 def _aggregate_predicate_flags(calcs, resolve, param_resolver, *, known_tables,
                                reserved_names=None, skip_lower=None, resolve_for=None):
     """Recognize an AGGREGATE boolean calc of parameter(s) used as a keep-filter.
@@ -4280,6 +4315,13 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     # measure-calc + dim-calc names) so emitted objects never collide. With no parameters and no
     # detectable swaps this whole block is inert: consumed is empty and param_resolver is None, so
     # the calc/measure output below is byte-for-byte identical to the no-parameter path.
+    # ``calcs``/``dim_calcs`` are rewritten (not just the merged ``all_calcs``) because measure and
+    # column emission read those lists DIRECTLY -- rewriting only the merged copy left the alias
+    # visible to the flag pipelines and invisible to ``_measures_part``, so the calc still stubbed.
+    calcs = _apply_relationship_column_aliases(
+        calcs, (descriptor or {}).get("column_aliases"))
+    dim_calcs = _apply_relationship_column_aliases(
+        dim_calcs, (descriptor or {}).get("column_aliases"))
     all_calcs = list(calcs or []) + list(dim_calcs or [])
     measure_names = [c.get("name") for c in (calcs or []) if c.get("name")]
     # Home table for each CALCULATED COLUMN this build will emit, so a swap branch can bind to one.
