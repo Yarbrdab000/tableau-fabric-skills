@@ -14,6 +14,43 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.189.0` → `2.190.0`): the PBIR linter now actually runs during a
+  migration — R3–R9 were inert in the estate path.** A defect in this collection's own `2.167.0` fix
+  for #144, found by the per-emit-path corpus reach census and reported here rather than quietly
+  corrected.
+
+  `migrate_estate` called `lint_visual_model_bindings` and read `REQUIRED_ROLES`, but **never called
+  `lint_pbir_parts`** — the entry point that applies every other rule. So unknown `visualType` (R4),
+  theme-name mismatch (R3), card display units (R5), `nativeQueryRef` uniqueness (R6), empty
+  `pageOrder` (R7), dangling `SelectRef` (R8) and missing required role (R9) did not run when the
+  engine emitted a report. They ran in pytest against one representative workbook and nowhere else.
+
+  That made the `2.167.0` fix incomplete **in its own terms**. #144 was *"the engine DoD cannot
+  detect structurally-invalid PBIR it emits"*; the rule added to close it did not execute at emit
+  time. It is the #141 shape a third time: the value of a check is decided by whether anything calls
+  it. R8 had the same exposure, shipped as a permanent gate one release earlier.
+
+  **How it was found, since the method is the reusable part.** A census instrumented 22 decision
+  points and counted how many of the 29 corpus workbooks reach each. `lint_pbir_parts`,
+  `_lint_required_roles` and `_lint_dangling_select_refs` all read **0 of 29**. The census's own first
+  run was wrong in the opposite direction — it reported 10 zero-coverage paths including
+  `select_storage_mode`, which demonstrably runs everywhere — because callers do
+  `from storage_mode import select_storage_mode` and bind the name at import, so patching the
+  defining module misses them. Corrected by rebinding every attribute in every loaded engine module
+  that points at the function object; five false zeros resolved to 29.
+
+  Wired fail-safe alongside its sibling, recorded on the workbook entry as an additive `viz_lint`
+  key, and reported as a **warning rather than a hard failure on first wiring** — deliberately.
+  These rules have never executed against real estate output, so escalating a never-executed check
+  straight to a build failure is precisely the mistake the `2.154.0` sequencing note exists to
+  prevent: fix what fires, prove zero, *then* escalate. Measured after wiring: **0 of 29 workbooks
+  produce a lint problem**, and the definition of done is unchanged (29 bound, 0 failed, 22 warned).
+
+  The new tests guard the **wiring**, not the rules — the rules have their own tests, and every one
+  of them calls `lint_pbir_parts` directly, so none could ever catch the call site going missing.
+  One additionally asserts each rule is reachable *from* the entry point, which is the same defect
+  one level down.
+
 - **`tableau-migration` (skill `2.188.0` → `2.189.0`): the measurement rules sharpened by three
   harness failures, and the concurrent-release rules sharpened by three renumbers.** Follow-up to
   `2.186.0`, from findings on both sides of a two-session integration.
