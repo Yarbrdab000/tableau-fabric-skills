@@ -14,6 +14,37 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.196.0` → `2.205.0`): rollback anchors are gated — the last artifact
+  in the release ritual with nothing checking it.** Proposed by the parallel colour session after two
+  of their own anchors were found pointing at commits from a discarded renumber that no branch
+  contained.
+
+  The ritual has four artifacts and had gates on three: the CHANGELOG chain is tested, the `VERSION`
+  stamp is tested, mirror parity is tested — and the anchor was a tag someone remembered to move.
+
+  **An orphaned anchor is worse than a missing one, because it looks usable.**
+  `git reset --hard rollback/pre-vX.Y.Z` *succeeds* against a tag pointing at an unreachable commit,
+  lands you on a detached orphan, and nothing warns you. A missing anchor fails loudly and sends you
+  to find the right commit.
+
+  **The invariant is *reachable*, not *on main*.** An anchor cut for work still in flight legitimately
+  points at a commit that has not merged — that is the normal state for the life of a branch, and
+  asserting "ancestor of main" would fail every anchor between cutting it and landing the release.
+  What can never be legitimate is a commit no ref reaches at all.
+
+  **The obvious implementation is tautological, and the first one shipped here was.** `git rev-list
+  --all` includes `refs/tags`, so every anchor makes its own target reachable and the check can never
+  fail — verified by probing it with a deliberately-orphaned anchor, which it passed. Corrected to
+  `--branches --remotes`, then re-probed: it now names the orphan and its short SHA. Also batched
+  from 245 `git rev-parse` calls to a single `git show-ref --tags -d`, cutting the runtime from **39s
+  to 2s** — almost all of it Windows process-spawn cost.
+
+  A second test pins anchor naming, and it was corrected too: the first version forbade a trailing
+  label and failed on real history (`rollback/pre-v1.9.0-comparison`) — the test inventing a
+  convention rather than checking one. Now permits an optional `-<label>`.
+
+  Audited on adoption: **245 local and 243 pushed anchors, all reachable, zero problems.**
+
 - **`tableau-migration` (skill `2.195.0` → `2.196.0`): a dangling `SelectRef` fails the definition
   of done, and `pbir_lint` owns which findings are fatal.** R8 detects a formatting property pointing
   at a projection the visual does not declare: the property resolves to nothing, the visual renders
