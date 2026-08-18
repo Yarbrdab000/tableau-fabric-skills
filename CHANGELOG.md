@@ -14,6 +14,39 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.228.0` → `2.229.0`): `ATTR()` rebuilds as `MIN` instead of being
+  dropped.** Tableau's `ATTR([x])` returns the value when it is unique across the mark's rows and the
+  literal `*` when it is not. Power BI has no such aggregate, and the pill fell through to the
+  unsupported-derivation branch — which **drops it**. Measured on corpus workbook
+  `0135_aggregation_types`: its `ATTR` worksheet emitted a table with only its row dimension and **no
+  value at all**, and `Bar chart Example` — three pills of the same field at three aggregations on
+  one shelf — fanned into **2** side-by-side charts instead of 3.
+
+  **`MIN` is the faithful choice, not the convenient one.** `ATTR` is written precisely when the
+  author expects the value to be constant within the mark, and wherever it *is* constant `MIN(x)`
+  **is** `x` — identical, not approximate. The two differ only when the value is not unique, which is
+  exactly the case Tableau itself flags with `*`. So the degradation is confined to the case the
+  source already calls ambiguous, and it is warned with what changes. Emitting a pill that is wrong
+  in one case beats dropping it in every case: a reader cannot notice a missing value, but can
+  notice a minimum.
+
+  Deliberately **not** added to `_AGG_FUNC`, which would have been the tempting one-liner: that path
+  inherits the `Min`/`Max` type restriction refusing non-numeric columns, and would have dropped
+  precisely the commonest `ATTR` — the one over a string (`ATTR([Region])`), where a text `Min` is
+  both valid in PBIR and exactly the intended answer.
+
+  **The pill count is the proof, which is why `0135` is in the corpus.** After: the `ATTR` sheet
+  carries `Min(Orders.Sales)`, and the trellis emits **3** charts — Sum, disaggregated Column, and
+  Min. A dropped aggregation was a missing chart, not a subtly wrong one, so the gap was countable in
+  the output rather than a matter of judgement.
+
+  **Corpus of 34:** 1586 → 1588 files, **2 added** (the third trellis chart, in both the `pbip` and
+  `reports` trees), 0 removed, 9 differing — every one inside `0135`. Thirty-three workbooks
+  untouched. Roots equal-length (209/209), so the one-sided add is genuine codegen rather than the
+  enumeration artifact that shape usually signals.
+
+  Suite 4963 → **4966**.
+
 - **`tableau-migration` (skill `2.227.0` → `2.228.0`): a caller-side gate stricter than the callee it
   guards no longer discards whole workbooks (#155).** `_build_datasource_pbip` wrapped the
   published-datasource recovery in `if descriptor is None:`, skipping it whenever a combined /

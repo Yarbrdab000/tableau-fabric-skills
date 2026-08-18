@@ -1479,6 +1479,33 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
         field["kind"] = "value" if role == "measure" else "category"
         return field
 
+    if deriv == "Attribute":
+        # Tableau's ATTR([x]): the value when it is unique across the mark's rows, and the literal
+        # ``*`` when it is not. Power BI has no such aggregate, and the previous behaviour was to
+        # DROP the pill -- which is why 0135's ``ATTR`` sheet emitted a table with only its row
+        # dimension and no value at all, and why its 3-pill trellis produced 2 charts instead of 3.
+        #
+        # ``Min`` is EXACT for the case the author is asking about. ATTR is written precisely when
+        # the value is expected to be constant within the mark, and where it is, MIN(x) IS x. The two
+        # differ only when the value is NOT unique -- Tableau prints ``*``, Power BI shows the
+        # minimum -- so the degradation is confined to the case the source itself flags as ambiguous,
+        # and it is warned rather than silent. Emitting the pill wrong-in-one-case beats dropping it
+        # in every case: a missing value cannot be noticed by a reader, a minimum can.
+        #
+        # Not routed through the ``Min`` branch above: that one refuses non-numeric/non-date columns,
+        # and ATTR is most often used on a STRING (``ATTR([Region])``), where a text Min is both
+        # valid in PBIR and exactly the intended answer. Restricting it the same way would drop
+        # precisely the commonest ATTR.
+        warnings.append(_warn(
+            "worksheet", worksheet,
+            f"ATTR('{caption}') rebuilt as MIN -- identical wherever the value is unique within the "
+            f"mark (which is what ATTR asserts); where it is not, Tableau shows '*' and this shows "
+            f"the minimum"))
+        field["aggregation"] = "Min"
+        field["binding"] = "aggregation"
+        field["kind"] = "value"
+        return field
+
     if deriv not in ("None", "", None):
         warnings.append(_warn(
             "worksheet", worksheet,
