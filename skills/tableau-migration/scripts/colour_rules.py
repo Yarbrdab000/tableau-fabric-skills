@@ -237,13 +237,20 @@ def _unsupported(reason, formula):
     return ColourRuleSpec(supported=False, reason=reason, formula=formula)
 
 
-def analyse_colour_calc(formula):
+def analyse_colour_calc(formula, datatype=None):
     """Analyse a Tableau colour calculation into a :class:`ColourRuleSpec`.
 
     Reads ``IF``/``ELSEIF``/``ELSE`` chains and ``CASE``/``WHEN`` chains, at any nesting depth in
     the ELSE position, and normalises both to one ordered branch list. A ``CASE <subject> WHEN <v>``
     arm becomes the predicate ``<subject> = <v>`` so every branch carries a uniform comparison and
     downstream code never needs to know which surface form it came from.
+
+    ``datatype`` is the Tableau-declared result type. When it is ``boolean``, a formula that is a
+    bare EXPRESSION rather than a branch chain -- ``SUM([Sales]) = WINDOW_MAX(SUM([Sales]))``, the
+    "highlight the bar that set a new max" idiom -- is read as the two-member domain it really is:
+    ``IF <expr> THEN True ELSE False``. Tableau paints exactly two swatches for such a pill, so it
+    is the same categorical encoding as a string calc with two members, written shorter. Without
+    this, the commonest boolean driver in the corpus falls out of the compiler entirely.
     """
     formula = formula or ""
     if not formula.strip():
@@ -254,10 +261,33 @@ def analyse_colour_calc(formula):
         return _unsupported("could not tokenize (%s)" % type(exc).__name__, formula)
     branches, default, reason = _parse_chain(toks)
     if reason:
-        return _unsupported(reason, formula)
+        boolean = _boolean_expression_spec(toks, formula, datatype)
+        return boolean if boolean is not None else _unsupported(reason, formula)
     if not branches:
         return _unsupported("no conditional branches", formula)
     return ColourRuleSpec(branches=branches, default=default, supported=True, formula=formula)
+
+
+# The member names a bare boolean expression paints. Tableau shows these two swatches in its own
+# legend, so they are the domain -- not an invention of this module.
+BOOLEAN_TRUE_MEMBER = "True"
+BOOLEAN_FALSE_MEMBER = "False"
+
+
+def _boolean_expression_spec(toks, formula, datatype):
+    """``IF <expr> THEN True ELSE False`` for a bare BOOLEAN-declared expression, else ``None``."""
+    if str(datatype or "").strip().lower() != "boolean":
+        return None
+    body = _strip_end(list(toks))
+    if not body or _kw(body[0]) in _IF_OPENERS:
+        return None
+    # It must actually READ as a predicate; a boolean-declared field reference alone is not a rule.
+    if _find_top(body, {"cmp"}, set(_COMPARISON_KIND)) < 0 and \
+            _find_top(body, {"id"}, {"AND", "OR", "NOT"}) < 0 and _kw(body[0]) != "NOT":
+        return None
+    branch = ColourBranch(body, BOOLEAN_TRUE_MEMBER, [("str", BOOLEAN_TRUE_MEMBER)])
+    return ColourRuleSpec(branches=[branch], default=BOOLEAN_FALSE_MEMBER,
+                          supported=True, formula=formula)
 
 
 def _strip_end(toks):
@@ -552,6 +582,38 @@ _VC_AGGREGATOR = {
 _DAX_COMPARISON = {"=": "=", "==": "=", ">": ">", ">=": ">=", "<": "<", "<=": "<="}
 
 
+def _window_bound(toks):
+    """One Tableau window bound -> a DAX ``WINDOW`` ``(position, relativity)`` pair, or ``None``.
+
+    Tableau writes ``WINDOW_MAX(expr, <start>, <end>)`` where a bound is ``FIRST()`` (the first row
+    of the partition), ``LAST()`` (the last), or an integer OFFSET from the current row -- ``0``
+    being the current row itself. Ignoring these is not cosmetic: ``WINDOW_MAX(x, FIRST(), 0)`` is a
+    RUNNING maximum, and reading it as the whole partition turns "every bar that set a new record"
+    into "only the tallest bar". On a monotonically rising series that is 4 marks versus 1.
+    """
+    toks = _unwrap(list(toks))
+    call = _call_args(toks)
+    if call and call[0] == "FIRST" and not call[1]:
+        return ("1", "ABS")
+    if call and call[0] == "LAST" and not call[1]:
+        return ("-1", "ABS")
+    if len(toks) == 1 and toks[0][0] == "num":
+        return (str(toks[0][1]), "REL")
+    if (len(toks) == 2 and toks[0] == ("op", "-") and toks[1][0] == "num"):
+        return ("-%s" % toks[1][1], "REL")
+    return None
+
+
+def _window_frame(args):
+    """The DAX ``WINDOW(...)`` frame for a Tableau window call's optional bound arguments."""
+    if len(args) < 3:
+        return _WHOLE
+    start, end = _window_bound(args[1]), _window_bound(args[2])
+    if not start or not end:
+        return None
+    return "WINDOW(%s, %s, %s, %s)" % (start[0], start[1], end[0], end[1])
+
+
 def _call_args(toks):
     """``(FN, [arg_tokens, ...])`` when ``toks`` is exactly one function call, else ``None``."""
     toks = _unwrap(list(toks))
@@ -608,6 +670,11 @@ def dax_value(toks, resolve):
         fn, args = call
         if fn in _VC_AGGREGATOR and args:
             aggregator, window = _VC_AGGREGATOR[fn]
+            # Explicit bounds override the function's default frame. RUNNING_* has no bound form.
+            if not fn.startswith("RUNNING_"):
+                window = _window_frame(args)
+                if window is None:
+                    return None
             inner = dax_value(args[0], resolve)
             return "%s(%s, %s)" % (aggregator, window, inner) if inner else None
         if fn == "WINDOW_PERCENTILE" and len(args) >= 2:

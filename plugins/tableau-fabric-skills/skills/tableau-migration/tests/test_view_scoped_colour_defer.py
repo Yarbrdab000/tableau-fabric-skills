@@ -107,7 +107,13 @@ class TestViewScopedDiscreteColourDefers:
         assert R._is_view_level_calc({"formula": "RUNNING_MAX(SUM([Sales])) = SUM([Sales])"}) is True
         assert R._is_view_level_calc({"formula": "SUM([Profit]) > 0"}) is False
 
-    def test_a_windowed_driver_paints_no_mark_fill(self):
+    def test_a_windowed_driver_still_paints_no_mark_fill(self):
+        # RUNG 4 IS NOT WIRED YET. lower_to_visual_calc produces correct DAX (see
+        # TestWindowBoundsAreHonoured), but binding it needs a DECLARED projection, and appending
+        # one to the query state at emit time does not survive -- the emit sites rebuild that state,
+        # so the mutation is discarded and the property is left naming a projection that does not
+        # exist. Measured on 0070_new_max: HALF the visuals shipped a dangling SelectRef. Until the
+        # projection is threaded to the emit site, deferring is the honest outcome.
         ir = _chart_ir(_CALC, "usr:Calculation_nm:nk")
         assert ir["worksheets"][0]["encodings"]["color"]["discrete_measure"] is True
         assert "dataPoint" not in _objects(ir), "a wrong colour is worse than no colour"
@@ -121,6 +127,12 @@ class TestViewScopedDiscreteColourDefers:
         assert "Visual Calculation" in hits[0], "say what would fix it"
         assert "WINDOW_MAX" in hits[0], "quote the offending formula"
 
+    def test_no_visual_ever_ships_a_dangling_selectref(self):
+        # the invariant the reverted wiring broke, pinned so it cannot come back unnoticed
+        import pbir_lint
+        parts = R.emit_pbir(_chart_ir(_CALC, "usr:Calculation_nm:nk"))
+        assert [p for p in pbir_lint.lint_pbir_parts(parts) if "SelectRef" in p] == []
+
     def test_a_plain_boolean_driver_still_paints(self):
         # The gate must be surgical: an ordinary aggregate comparison is NOT view-scoped and keeps
         # the conditional fill it has had since 2.127.0.
@@ -128,3 +140,57 @@ class TestViewScopedDiscreteColourDefers:
         assert "dataPoint" in objs
         fill = objs["dataPoint"][0]["properties"]["fill"]["solid"]["color"]["expr"]
         assert fill["Measure"]["Property"] == "Profitable? (colour)"
+
+
+class TestWindowBoundsAreHonoured:
+    """WINDOW_MAX(x, FIRST(), 0) is a RUNNING maximum. Reading it as the whole partition turns
+    "every bar that set a new record" into "only the tallest bar" -- 4 marks versus 1 on a
+    monotonically rising series, which is exactly the shape 0070_new_max carries."""
+
+    def _dax(self, formula):
+        import colour_rules as CR
+        spec = CR.analyse_colour_calc(formula, datatype="boolean")
+        return CR.lower_to_visual_calc(
+            spec, {CR.BOOLEAN_TRUE_MEMBER: "#111111", CR.BOOLEAN_FALSE_MEMBER: "#222222"},
+            lambda toks: ("[Sum of %s]" % toks[2][1]) if len(toks) == 4 else None)
+
+    def test_first_to_current_is_a_running_frame(self):
+        assert "WINDOW(1, ABS, 0, REL)" in self._dax(
+            "SUM([Sales]) = WINDOW_MAX(SUM([Sales]), FIRST(), 0)")
+
+    def test_no_bounds_is_the_whole_partition(self):
+        assert "WINDOW(1, ABS, -1, ABS)" in self._dax(
+            "SUM([Sales]) = WINDOW_MAX(SUM([Sales]))")
+
+    def test_first_to_last_is_the_whole_partition(self):
+        assert "WINDOW(1, ABS, -1, ABS)" in self._dax(
+            "SUM([Sales]) = WINDOW_MAX(SUM([Sales]), FIRST(), LAST())")
+
+    def test_a_relative_offset_window_is_carried_through(self):
+        assert "WINDOW(-2, REL, 0, REL)" in self._dax(
+            "SUM([Sales]) = WINDOW_MAX(SUM([Sales]), -2, 0)")
+
+    def test_a_bound_that_cannot_be_read_declines_rather_than_guessing(self):
+        assert self._dax("SUM([Sales]) = WINDOW_MAX(SUM([Sales]), SIZE(), 0)") is None
+
+
+class TestABareBooleanIsATwoMemberDomain:
+    """Tableau paints exactly two swatches for a boolean pill, so it IS a categorical encoding --
+    written shorter than an IF chain. Without this the commonest boolean driver in the corpus falls
+    out of the compiler entirely."""
+
+    def test_a_bare_comparison_declared_boolean_is_supported(self):
+        import colour_rules as CR
+        spec = CR.analyse_colour_calc("SUM([Sales]) = WINDOW_MAX(SUM([Sales]))",
+                                      datatype="boolean")
+        assert spec.supported and spec.closed_domain
+        assert spec.members == [CR.BOOLEAN_TRUE_MEMBER, CR.BOOLEAN_FALSE_MEMBER]
+        assert spec.scope == CR.SCOPE_VIEW
+
+    def test_without_the_boolean_hint_it_is_not_a_rule(self):
+        import colour_rules as CR
+        assert CR.analyse_colour_calc("SUM([Sales]) = WINDOW_MAX(SUM([Sales]))").supported is False
+
+    def test_a_bare_field_reference_is_not_a_predicate(self):
+        import colour_rules as CR
+        assert CR.analyse_colour_calc("[Some Flag]", datatype="boolean").supported is False

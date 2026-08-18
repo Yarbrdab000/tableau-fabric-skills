@@ -395,3 +395,50 @@ def test_binding_check_is_a_no_op_without_a_surface():
     # Callers with no model in scope must be completely unaffected.
     assert lint_visual_model_bindings(_visual_with("Nope", "Nope"), None) == []
     assert lint_pbir_parts(_visual_with("Nope", "Nope")) == []
+
+
+# -- R8: a SelectRef must name a projection the same visual declares -----------------------------
+def _selectref_visual(projections, objects):
+    return {"definition/pages/p/visuals/v/visual.json": json.dumps(
+        {"visual": {"visualType": "clusteredColumnChart",
+                    "query": {"queryState": {"Y": {"projections": projections}}},
+                    "objects": objects}})}
+
+
+def test_a_selectref_with_no_matching_projection_is_flagged():
+    # Found the hard way: a projection appended to a query state the emit path later rebuilt left
+    # half a workbook's visuals pointing at a projection that did not exist, and every gate was
+    # silent -- lint_visual_model_bindings proves MODEL refs, and a visual calc is not in the model.
+    parts = _selectref_visual(
+        [{"queryRef": "Sum(Orders.Sales)"}],
+        {"dataPoint": [{"properties": {"fill": {"solid": {"color": {
+            "expr": {"SelectRef": {"ExpressionName": "colourRule"}}}}}}}]})
+    problems = [p for p in lint_pbir_parts(parts) if "SelectRef" in p]
+    assert len(problems) == 1
+    assert "'colourRule'" in problems[0]
+    assert "renders with its defaults" in problems[0]
+
+
+def test_a_selectref_that_matches_a_projection_is_clean():
+    parts = _selectref_visual(
+        [{"queryRef": "Sum(Orders.Sales)"},
+         {"queryRef": "colourRule", "hidden": True,
+          "field": {"NativeVisualCalculation": {"Language": "dax", "Expression": "1"}}}],
+        {"dataPoint": [{"properties": {"fill": {"solid": {"color": {
+            "expr": {"SelectRef": {"ExpressionName": "colourRule"}}}}}}}]})
+    assert [p for p in lint_pbir_parts(parts) if "SelectRef" in p] == []
+
+
+def test_a_visual_with_no_selectref_is_untouched():
+    parts = _selectref_visual([{"queryRef": "Sum(Orders.Sales)"}], {})
+    assert [p for p in lint_pbir_parts(parts) if "SelectRef" in p] == []
+
+
+def test_the_emitted_corpus_shape_stays_clean():
+    # the engine's own quick-table-calc path uses SelectRef legitimately; it must not trip this
+    ws = _worksheet("Sales by Category", "Bar",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[none:Category:nk]",
+                    deps_extra=_INST)
+    parts = emit_pbir(parse_twb(_workbook(ws)))
+    assert [p for p in lint_pbir_parts(parts) if "SelectRef" in p] == []

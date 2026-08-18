@@ -14,6 +14,85 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.175.0` → `2.176.0`): a boolean colour driver is a two-member
+  domain, Tableau's window bounds are honoured, and a dangling `SelectRef` is now a lint error.**
+  Rung 4 (view-scoped colour via a Visual Calculation) was wired during this work and then
+  **deliberately reverted** — see below. The pure pieces it needed are sound, tested, and shipped.
+
+  * **A bare boolean expression is a colour rule.** `SUM([Sales]) = WINDOW_MAX(SUM([Sales]))` — the
+    "highlight the bar that set a new max" idiom, and the commonest boolean driver in the corpus —
+    is not an `IF` chain, so the compiler declined it entirely. Tableau paints exactly two swatches
+    for such a pill, so it *is* a categorical encoding, written shorter. Given the declared
+    `datatype == "boolean"`, it now reads as `IF <expr> THEN True ELSE False`. A boolean-declared
+    *field reference* alone is still refused — it is not a predicate.
+  * **Tableau's window bounds change the answer.** `WINDOW_MAX(x, FIRST(), 0)` is a **running**
+    maximum; reading it as the whole partition turns *"every bar that set a new record"* into
+    *"only the tallest bar"* — 4 marks versus 1 on a monotonically rising series, which is exactly
+    `0070_new_max`'s shape. `FIRST()`/`LAST()`/integer offsets now lower to the matching DAX
+    `WINDOW(...)` frame, and a bound that cannot be read declines rather than guessing.
+  * **`pbir_lint` R8: a `SelectRef` must name a projection the same visual declares** -- and it
+    is NOT colour-compiler-specific. The emitter already wrote `SelectRef` from another site
+    that predates this gate (the continuous-gradient path anchors a table/matrix `backColor`
+    FillRule to an outer Visual Calculation's queryRef), sharing the same hazard: one code path
+    naming a projection a different code path must declare. Measured across the corpus: 519
+    emitted `visual.json` files, **0** SelectRef references -- neither path fires on corpus
+    input, so the exposure is real and has no regression coverage. The gate is the only thing
+    standing under it. A property
+    pointing at an in-visual expression that no projection carries resolves to nothing — the visual
+    renders with its defaults, reports no error, and passes `validate`. `lint_visual_model_bindings`
+    could never have caught it: it proves MODEL references, and a Visual Calculation is not in the
+    model.
+
+  **Why rung 4 is still not wired.** `lower_to_visual_calc` produces correct DAX, but binding it
+  needs a *declared* projection, and appending one to the query state inside the colour emitter does
+  not survive — the emit sites build that state more than once, so the mutation lands on an object
+  that is discarded. Measured on `0070_new_max`: **half the visuals shipped a dangling `SelectRef`**,
+  the same class of defect `2.152.0`/`2.154.0` exist to prevent, and every existing gate stayed
+  silent. Reverted rather than shipped half-working; the projection has to be threaded to the emit
+  site instead. R8 is the gate that would have caught it, and now will.
+
+  Corpus unchanged (29/29, dangling 0, no visual drift).
+
+
+- **`tableau-migration` (skill `2.167.0` → `2.175.0`): the conditional-colour compiler is WIRED —
+  a string-member colour calc now paints cells and marks natively, with nothing added to the
+  model.** The three preceding releases were inert by construction; this is the one that changes
+  what ships.
+
+  A Tableau calc that outputs string members and sits on Colour —
+  `IF SUM([Profit]) < 0 THEN "negative" ELSE "positive" END`, or a five-branch `ELSEIF` chain, or a
+  `CASE` over a dimension — is now compiled to a PBIR **Rules** `Conditional` and bound directly to
+  the channel the mark implies: `values[].fontColor` / `backColor` for a matrix or table cell,
+  `dataPoint.fill` for a chart mark. Both sides emit the *same* expression; only the channel differs.
+
+  **The members never reach Power BI.** They collapse into `Value` literals, so the rebuild emits
+  no synthetic string measure and no colour twin, and the result opens in Desktop's Conditional
+  formatting dialog as rules a user can read and edit. Render-verified on `Logic example 4`: cells
+  paint per-row blue/orange exactly as the twin version did, from a `Conditional` comparing
+  `Sum(Orders[Profit])` to `0` — identical output, no model objects.
+
+  Two things only the emitter can supply are wired here, and both reuse existing machinery rather
+  than re-deriving it:
+
+  * **leaf binding** — `AGG([Field])` and bare `[Field]` are routed through `_field_expression`, the
+    same code path that projects the visual's own columns, and are matched against the worksheet's
+    already-resolved fields first, so a rule can never bind a subtly different object than the
+    column beside it;
+  * **the palette** — authored `<map to='#hex'>` first, else Tableau's default categorical ramp in
+    sorted member order, the same precedence the model colour twin uses, so a rule and a twin can
+    never paint one workbook two ways.
+
+  **The colour twin remains the fallback, and the split is by what the calc RETURNS.** A boolean
+  driver (`SUM([Profit]) > 0`) has no members to collapse into a palette and keeps the hex-returning
+  twin it has had since `2.127.0`. View-scoped and untranslatable drivers keep their `2.152.0`
+  deferrals. A native rebuild is deliberately *not* warned about — it is faithful, not a degradation.
+
+  Corpus: 29/29, dangling references still 0, and **no visual changed** — the corpus's own
+  string-member calcs are declined correctly (one has no `ELSE`, so its domain is not closed;
+  another compares against a `[Parameters].[…]` operand the resolver does not yet bind). Fail-closed
+  throughout: anything the compiler cannot express falls to the rung below it, never to a partial
+  rule.
+
 - **`tableau-migration` (skill `2.166.0` → `2.167.0`): the linter catches structurally-invalid PBIR
   the engine can emit — `pbir_lint` R9, required roles.** Raised in #144 as the systemic gap that let
   #143 ship green: a run graded `definition_of_done: warn` / `0 error` / `Viz=built` over a report
