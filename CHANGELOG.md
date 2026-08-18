@@ -14,6 +14,66 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.212.0` → `2.213.0`): a Tableau parameter inside Custom SQL no
+  longer ships a query the source cannot parse.** Corpus workbook
+  **`0136_custom_sql_prefix_and_params`** — built to spec by the tool's own user against a live
+  **Databricks** warehouse — is added, and with it the first Custom SQL coverage this project has
+  ever had: **0 of 31** corpus workbooks contained a `<relation type='text'>` before it landed,
+  measured by parsing every relation rather than by regex. The engine's whole Custom SQL path
+  (`Value.NativeQuery`, `Odbc.Query`, the DirectQuery storage-forcing rule, parameter detection, the
+  2.155.0 stub gate) had never run against a real workbook. It is also the first corpus workbook on
+  Databricks and the first to emit `mode: directQuery` partitions.
+
+  Its relation 3 embedded a parameter the way Tableau authors do, because Custom SQL is Tableau's
+  only way to push a predicate to the source:
+
+  ```sql
+  SELECT `Region`, SUM(`Sales`) AS REGION_SALES FROM orders
+  WHERE `Region` = <[Parameters].[Parameter 3357119534784517]> GROUP BY `Region`
+  ```
+
+  That token reached the emitted `Value.NativeQuery` verbatim, so Spark rejects the query at parse
+  and the DirectQuery table cannot answer at all.
+
+  **The fix is a classification, not a translation.** Power BI *does* have a direct equivalent —
+  Dynamic M Query Parameters — and it is deliberately NOT used here. When the filtered column is in
+  the query's result set, the idiomatic rebuild is to drop the predicate and let an ordinary slicer
+  on that column filter; in DirectQuery the slicer folds back into a `WHERE` at the source, so
+  nothing is lost. Reaching for a dynamic M binding in that case would ship an exotic construct
+  (strictly 1:1, no RLS, no aggregations, not in Report Server, banned Top-N/contains/exclude/
+  cross-highlight/drill-down slicer operations, and no spaces permitted in the parameter OR table
+  name) to answer a native question. The genuine dynamic-M case — a filtered column absent from the
+  result set, which no model filter can reach — stays warned, but the warning now names the exact
+  Desktop step (*Properties → Advanced → Bind to parameter*) plus its preconditions, because
+  research could not confirm that binding's on-disk form from any Microsoft primary source and a
+  guessed annotation breaks a model at OPEN time, silently.
+
+  The oracle for "is the column in the result set" is the relation's own metadata records — Tableau's
+  account of what the query returns — not a parse of the SELECT list. `SELECT *` then needs no
+  special case, and a hand-parsed projection cannot disagree with the columns the model emits.
+
+  **The refusals are the feature.** Left alone entirely: an `OR` anywhere in the `WHERE`, a parameter
+  inside a subquery, a non-equality comparison, a parameter outside a `WHERE`, and any query with
+  more than one `WHERE`. The rewrite is also **disclosed** rather than silent: stripping the
+  predicate widens what comes back until a slicer narrows it, and trading a loud failure for a quiet
+  difference would be strictly worse than the bug.
+
+  **Measured, both operands named.** Corpus `corpus_b212` (built at `63b34c3`) vs `corpus_v212`,
+  same 32-workbook input: 1504 files vs 1504, **0 added, 0 removed, 2 differing** — the one table
+  that carried the parameter, and `report.json`. Thirty-one workbooks byte-identical.
+
+  **A second tautological guard was found and fixed before shipping**, the same way 2.211.0's was.
+  Disabling the `OR`/subquery guard left the entire new test file green: every case was refused by
+  some *other* check (the exact-conjunct match, or the two-`WHERE` test). The input that
+  distinguishes it is `WHERE A AND B OR C`, where SQL precedence means `(A AND B) OR C` — splitting
+  on `AND` makes `A` look like a clean parameter predicate, and dropping it silently yields
+  `WHERE x = 1 OR y = 2`. That is not the benign widening the whole rewrite relies on: the surviving
+  `C` rows were never constrained by the parameter's column, so no slicer can put them back. Both
+  operand orders are now pinned, and the weaker `OR` test is explicitly labelled as NOT exercising
+  the guard so no future reader cites it as evidence.
+
+  Suite 4896 → **4908**.
+
 - **`tableau-migration` (skill `2.211.0` → `2.212.0`): a parameter filter whose predicate is an
   AGGREGATE now actually filters.** Two workbooks supplied by the tool's own user, built to carry
   shapes a customer field trial reported, are added to the corpus as
