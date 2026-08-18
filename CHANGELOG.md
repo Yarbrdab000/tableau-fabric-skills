@@ -14,6 +14,49 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.190.0` → `2.195.0`): a colour twin the shipped report does not
+  reference is retired.** A colour twin is a hex-returning model measure the report binds through
+  Field-value conditional formatting (rung 3). Rungs 1 and 4 -- a native `Conditional`, and a
+  declared Visual Calculation -- paint the same encoding while referencing NO model object, so
+  wherever one of them wins the twin is dead weight in the model and a stray entry in Desktop's
+  field list. Measured before building anything: **all 6 colour twins in the corpus were referenced
+  by nothing.**
+
+  * **KEYED ON THE EMITTED ARTIFACT, and that is the third form this decision took.** (1) A PROXY --
+    re-derive "would a rule win?" in the model build: two predicates that must agree forever, which
+    is the assemble/emit divergence class. (2) A SHARED FACT -- the report emits its decision, the
+    model reads it: correct in principle and **measured inert**, because the report→model channel
+    runs off the FIRST viz pass, which carries facts true of the SOURCE (a worksheet's palette is in
+    the IR before anything binds) and cannot carry facts true of the OUTPUT (which rung wins is
+    decided at emit time). Instrumented on `0070_new_max`: 3 candidate records, ZERO colour facts.
+    That version was built, measured, and reverted rather than shipped, because it failed CLOSED --
+    a tested, plumbed-through feature that never fires reads as "implemented". (3) THIS -- ask the
+    shipped bytes: retire a twin iff its name appears nowhere in the emitted report. No predicate at
+    all, so nothing can disagree, and it self-corrects if a future rung changes what it references.
+
+  * **Fail-closed in every direction.** A twin survives if the report references it, if any other
+    model measure references it as `[name]`, if the name over-matches (substring test, so ambiguity
+    keeps it), or if there is no report to ask -- absence of evidence is not evidence of absence,
+    and stripping every twin when report emission produced nothing is exactly the wrong failure.
+    That last case was a real fail-open in the first draft, caught by its own test.
+
+  * **Runs before anything is written, and the cache concern does not apply.** Measured across a
+    fresh corpus build: **0 `cache.abf` files, 0 `.pbi` directories**. There is no cache at build
+    time to invalidate; that hazard belongs to a later lifecycle stage, after a human or a refresh
+    script has persisted one.
+
+  * **Corpus, operands named.** `corpus/b195` (built from `6ada43e`) vs `corpus/v195` (built from
+    this commit): 1378 files vs 1378, 0 added, 0 removed, **4 differing** -- the three
+    `_Measures.tmdl` that carried twins, plus `report.json` (which now discloses
+    `colour_twins_retired`). No `visual.json` changed. Colour twins corpus-wide **6 → 0**, and
+    dangling measure references stayed **0**.
+
+  * **Render-verified, because TMDL text surgery can produce a file Desktop refuses to open.**
+    `0070_new_max` rebuilt with 2 of its 5 measures retired, opened COLD, refreshed (9,426 rows,
+    persisted): the model opens, and the rung-4 colouring still paints. Both failure modes are
+    distinguishable -- invalid TMDL would not open at all, and an over-pruned twin would render in
+    the default blue the workbook's own `Challenge` control page shows.
+
 - **`tableau-migration` (skill `2.189.0` → `2.190.0`): the PBIR linter now actually runs during a
   migration — R3–R9 were inert in the estate path.** A defect in this collection's own `2.167.0` fix
   for #144, found by the per-emit-path corpus reach census and reported here rather than quietly
