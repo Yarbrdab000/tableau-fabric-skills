@@ -7482,6 +7482,16 @@ def _detect_measure_trellis(ws, state):
         ``+``-concatenated measure pills form the separate-pane trellis this rebuilds. (In Tableau
         the ONLY way to get grouped bars on one axis is Measure Values/Names, so distinct concatenated
         measures are always separate panes -- making this signature exact.)
+
+    Only VISIBLE projections count. The signature this detects is a property of the SOURCE SHELF --
+    two or more measure pills concatenated on it -- so a projection the visual computes but does not
+    show can never be one of them. Measured on ``0060_adjustable_fixed_axis``, whose ``Challenge``
+    worksheet carries a single ``pcto:sum:Sales:qk`` pill on ``<cols>`` (one percent-of-total quick
+    table calc, no second measure): counting the hidden base measure that the quick-calc keeps only
+    so its Visual Calculation can reference it inferred a trellis the shelf does not describe, and
+    emitted TWO side-by-side charts where Tableau draws one pane -- the second of them drawing a
+    projection explicitly marked ``hidden``. ``0088`` had the same shape. Corpus-wide this invented
+    five bands.
     """
     if ws["visual_type"] not in (VT_BAR, VT_COLUMN):
         return None
@@ -7493,7 +7503,7 @@ def _detect_measure_trellis(ws, state):
         return None
     if "Rows" in state:
         return None
-    y_projs = state.get("Y", {}).get("projections", [])
+    y_projs = [p for p in state.get("Y", {}).get("projections", []) if not p.get("hidden")]
     cat_projs = state.get("Category", {}).get("projections", [])
     if len(y_projs) < 2 or len(cat_projs) < 1:
         return None

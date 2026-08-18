@@ -12,6 +12,38 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.186.0` → `2.187.0`): a measure trellis is inferred from the
+  SOURCE SHELF, so a hidden projection can never be a band.** A pre-existing defect, found while
+  wiring view-scoped colour and fixed first so that work cannot land on top of it.
+
+  * **The rebuild invented panes the worksheet does not declare.** Tableau lays measures side by
+    side by concatenating measure pills with `+` on one shelf, one pane per pill.
+    `0060_adjustable_fixed_axis`'s `Challenge` worksheet declares exactly ONE measure pill --
+    `pcto:sum:Sales:qk`, a single percent-of-total quick table calc -- so Tableau draws one pane.
+    `_detect_measure_trellis` counted the projections in the query instead, which include the raw
+    base measure the quick-calc path keeps as a HIDDEN projection purely so its Visual Calculation
+    can reference it. Two pills were inferred from one, and the rebuild emitted TWO side-by-side
+    charts, the second of them drawing a projection explicitly marked `hidden: true`. `0088` had
+    the same shape.
+
+  * **The signature is a property of the shelf, not of the query.** A projection the visual
+    computes but does not show can never be one of the concatenated pills, so hidden projections
+    are excluded from the count and never returned as bands. The pre-existing guards (mark type,
+    `[Measure Values]`, dual axis, series split, category present) are untouched, and a genuine
+    two-measure trellis is unchanged -- both pinned by test.
+
+  * **Corpus effect is a change of visual SHAPE, stated with its operands.** `corpus/b186` (built
+    from `d1c35e6`) vs `corpus/v186` (built from this commit): 1384 files vs 1378, 6 added, 12
+    removed, 2 differing (`report.json`, `summary.md`). Three pages each collapse two charts into
+    one, in both the pre-rebind and the final tree. pbip-tree visuals **276 → 273** -- the
+    misdetection was inventing three bands.
+
+  * **Render-confirmed, because a collapsed band looks fine in a file listing and wrong on a
+    page.** `0060` reopened cold after refresh: one clustered bar chart, `Percent of Total` on a
+    0-40% axis, three product categories, the hidden base measure not drawn.
+
 ### Added
 
 - **`tableau-migration` (skill `2.185.0` → `2.186.0`): the verification rules this collection learned
