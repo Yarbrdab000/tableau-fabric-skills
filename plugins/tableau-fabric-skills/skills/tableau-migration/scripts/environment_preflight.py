@@ -123,9 +123,14 @@ def newtonsoft_gac_finding(gac_root=None, is_windows=None):
             "including a brand-new blank one -- with \"Method not found: 'Void "
             "Newtonsoft.Json.JsonSerializerSettings..ctor'\". This is a MACHINE condition and has "
             "nothing to do with the migrated output; confirm by creating a blank .pbip in Desktop "
-            "and opening it. Remedy (needs an elevated shell and gacutil.exe from the Windows SDK): "
-            "gacutil.exe -i <path to a %s >= %s Newtonsoft.Json.dll>. Reported by 2 of 3 users in "
-            "one customer trial."
+            "and opening it. REMEDY, in an ELEVATED PowerShell -- no Windows SDK needed, this ships "
+            "with .NET Framework: "
+            "Add-Type -AssemblyName System.EnterpriseServices; "
+            "(New-Object System.EnterpriseServices.Internal.Publish)"
+            ".GacInstall('<path to a %s >= %s Newtonsoft.Json.dll>'). "
+            "Prefer this over gacutil.exe, which is part of the Windows SDK and is absent from a "
+            "normal analyst machine. Re-run this check afterwards to confirm. Reported by 2 of 3 "
+            "users in one customer trial."
             % (_ASSEMBLY, newest_text, _ASSEMBLY, ".".join(str(p) for p in _KNOWN_GOOD))),
     }
 
