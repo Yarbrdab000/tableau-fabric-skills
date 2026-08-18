@@ -24,6 +24,23 @@ this module exists to prevent. The payload therefore carries ``schema_version``
 (:data:`SURVEY_SCHEMA_VERSION`), and :data:`SURVEY_CONTRACT_KEYS` names every path a consumer reads,
 so breaking one is a test failure rather than a rename that looks harmless in review.
 
+**Tableau Server (on-prem) vs Tableau Cloud (#140).** Both work, and the REST surface used here is
+host-agnostic: ``--server`` accepts either a Cloud pod (``10ay.online.tableau.com``) or an on-prem
+host (``https://tableau.example.com``), and every endpoint is the same ``/api/{version}/sites/...``
+shape on both. Stated honestly, because the question asked was whether Server is *deliberately*
+supported or merely works by accident:
+
+* **On-prem Server is NOT in the automated test matrix.** No test exercises a Server host; coverage
+  is host-shape parsing plus mocked REST payloads, which are identical either way. A successful
+  on-prem run has been reported from a live customer environment, but that is a field report, not a
+  gate. Treat Server as *supported by construction and confirmed in the field*, not *regression-tested*.
+* **There is NO API-version negotiation.** ``fetch_tds.DEFAULT_REST_VERSION`` pins ``3.24`` and no
+  ``serverinfo`` call is ever made, so the version is never discovered from the host. This is the
+  most plausible Server/Cloud divergence, since an on-prem Server can run a substantially older REST
+  API than Cloud ever does. The mitigation is explicit rather than automatic: ``--rest-version`` is a
+  first-class flag on both this script and ``fetch_tds``, so an older Server is handled by naming its
+  version. If sign-in fails against an older Server, lower it before assuming anything else is wrong.
+
 **The id trap (do not "fix" this).** A ``sqlproxy`` connection carries a datasource reference that
 LOOKS joinable::
 
@@ -398,7 +415,8 @@ def main(argv=None):
         description="Survey a Tableau site's PUBLISHED-datasource dependencies from REST ground "
                     "truth (read-only; downloads nothing).")
     ap.add_argument("--server", required=True,
-                    help="Tableau server/host, e.g. 10ay.online.tableau.com or https://host")
+                    help="Tableau host, e.g. 10ay.online.tableau.com (Cloud) or "
+                         "https://tableau.example.com (on-prem Server)")
     ap.add_argument("--site", default="",
                     help="site contentUrl (the slug in the URL; empty string for Default)")
     ap.add_argument("--auth", choices=["pat", "jwt"], default="pat", help="auth mode (default pat)")
@@ -428,10 +446,13 @@ def main(argv=None):
         base = fetch_tds.rest_base(args.server, args.rest_version)
 
         def _reauth():
-            # A Tableau Cloud session can die partway through the per-workbook loop -- measured
-            # intermittently after 1 to 58 calls. Signing in again and retrying is the only faithful
-            # response; the alternative recorded every remaining workbook as having NO published
-            # dependency, which is the opposite of the truth.
+            # A Tableau session can die partway through the per-workbook loop. The HANDLING is not
+            # Cloud-specific -- any session can expire mid-run -- but the provenance is, and that is
+            # worth keeping rather than generalising away: measured on Tableau CLOUD, intermittently
+            # after 1 to 58 calls. Whether an on-prem Server expires on the same cadence is UNKNOWN
+            # (see the module docstring on the test matrix). Signing in again and retrying is the
+            # only faithful response; the alternative recorded every remaining workbook as having NO
+            # published dependency, which is the opposite of the truth.
             fresh, fresh_site = fetch_tds.sign_in(args.server, args.rest_version, args.site,
                                                   pat_name=pat_name, pat_secret=pat_secret, jwt=jwt)
             state["token"] = fresh

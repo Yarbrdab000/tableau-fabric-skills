@@ -2157,6 +2157,16 @@ def _real_datasources(root):
     return out
 
 
+def _squash_ws(text):
+    """Casefold and collapse every run of whitespace to one space, for NEAR-MISS REPORTING ONLY.
+
+    Never used to select a datasource: collapsing internal whitespace could make two genuinely
+    distinct captions look identical, and picking one of those would be a guess. It exists so the
+    failure can say *which* candidate was close and how it differed.
+    """
+    return " ".join((text or "").split()).casefold()
+
+
 def _choose_datasource(root, select=None):
     """Select one ``<datasource>`` from a parsed document, skipping the ``Parameters`` pseudo-source.
 
@@ -2165,6 +2175,15 @@ def _choose_datasource(root, select=None):
     first real datasource is returned -- so a single-datasource workbook is unambiguous -- and the
     caller (``migrate_datasource`` / ``list_workbook_datasources``) is responsible for prompting on
     a genuine multi-datasource ambiguity.
+
+    Matching is normalised SYMMETRICALLY (#138). It previously stripped the requested name but not
+    the candidate labels, so a caption carrying incidental whitespace -- authored by hand in Tableau,
+    e.g. ``'DS_Visitor _Device '`` -- could never be matched however correctly it was spelled, and
+    the workbook was skipped outright. That broke this module's own documented round-trip:
+    ``workbook_datasources()`` returns ``label`` as "the value to pass back as ``select=``", and
+    handing that exact string straight back was REJECTED. The failure then printed the requested and
+    available names through ``repr``, which rendered them as two identical-looking strings -- the
+    reporter's workaround was to edit the customer's own ``.twbx`` to get past it.
     """
     real = _real_datasources(root)
     if not real:
@@ -2174,14 +2193,25 @@ def _choose_datasource(root, select=None):
     if select is not None:
         want = str(select).strip().lower()
         for ds in real:
-            labels = {(ds.get("caption") or "").lower(),
-                      (ds.get("formatted-name") or "").lower(),
-                      (ds.get("name") or "").lower()}
+            # ``.strip()`` on BOTH sides: an asymmetric normalisation can never match, which is a
+            # bug rather than a strictness choice.
+            labels = {(ds.get("caption") or "").strip().lower(),
+                      (ds.get("formatted-name") or "").strip().lower(),
+                      (ds.get("name") or "").strip().lower()}
             if want in {lbl for lbl in labels if lbl}:
                 return ds
         avail = ", ".join(repr(_datasource_label(ds)) for ds in real)
+        # Name a near miss rather than print two strings that look alike. Reported, never selected:
+        # the caller is told exactly what to pass, and nothing is guessed on their behalf.
+        squashed = _squash_ws(select)
+        near = [_datasource_label(ds) for ds in real
+                if squashed and _squash_ws(_datasource_label(ds)) == squashed]
+        hint = ""
+        if len(near) == 1:
+            hint = (f"; closest is {near[0]!r}, which differs only in whitespace -- pass it exactly "
+                    f"as listed")
         raise AmbiguousDatasourceError(
-            f"no datasource named {select!r} in this workbook; available: {avail}")
+            f"no datasource named {select!r} in this workbook; available: {avail}{hint}")
     return real[0]
 
 

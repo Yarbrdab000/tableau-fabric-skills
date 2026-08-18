@@ -1384,6 +1384,14 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
         "geo_area": _geo_area(base.get("geo_role", "")) if role != "measure" else None,
         "formula": base.get("formula"),
         "number_format": _tableau_number_format(base.get("number_format")),
+        # Did a MODEL get consulted for this pill at all? Set only when the model<->viz contract
+        # supplied its calc->measure manifest, i.e. on the model-bound pass. Reaching here WITH the
+        # manifest present means the model was asked about this calc and did not claim it (it
+        # stubbed rather than translated). That is a different fact from "no model exists yet"
+        # (the first, pre-rebind viz pass, and every direct ``parse_twb`` caller), where nothing can
+        # be concluded -- so a consumer that must fail closed can tell the two apart instead of
+        # deferring on both.
+        "model_consulted": bool(measure_binding),
     }
 
     # A model-confirmed calc-DIMENSION binding (from the ``column_binding`` manifest) is AUTHORITATIVE
@@ -8251,6 +8259,11 @@ def _matrix_discrete_measure_colour(ws, state, model_table, field_map, warnings)
         return None, None
     if color.get("kind") != "value" or color.get("binding") not in ("aggregation", "measure"):
         return None, None
+    if _is_view_level_calc(color):
+        return None, _discrete_view_scoped_defer(
+            ws, color, "cell_discrete_measure_colour", warnings)
+    if _discrete_colour_twin_unavailable(color):
+        return None, _discrete_unbound_defer(ws, color, "cell_discrete_measure_colour", warnings)
     values = (state.get("Values") or {}).get("projections", [])
     if not values:
         return None, None
@@ -9504,6 +9517,80 @@ def _scatter_category_dims(ws):
     return out
 
 
+def _discrete_colour_twin_unavailable(color):
+    """True when the model provably did NOT produce a colour twin for this driver.
+
+    The twin is emitted only for a base measure the model actually TRANSLATED. A calc the
+    translator could not express lands as an inert ``= BLANK()`` stub and gets no twin -- but the
+    report layer, which derives the twin's NAME from the caption, will happily reference one that
+    does not exist. Measured across the corpus: 4 such dangling references, and Power BI resolves
+    none of them (the visual simply keeps its default colours while the run reports success).
+
+    The signal is the same one the continuous path already trusts: ``measure_rebound``, stamped by
+    the model<->viz contract when the calc was rebound to a REAL translated measure
+    (``_MEASURE_BIND_OK`` = translated / assisted-approved). A calc pill that reaches emit WITH the
+    model's manifest in hand (``model_consulted``) but WITHOUT a rebind was offered to the model and
+    declined by it, so its twin cannot exist.
+
+    ``model_consulted`` is what keeps this from over-firing. Without it the gate cannot tell "the
+    model said no" from "there is no model yet" -- and the pre-rebind viz pass, plus every direct
+    ``parse_twb`` caller, has no model by construction. Gating on the rebind alone therefore
+    deferred every calc-driven colour in the single-pass path. A NON-calc driver (a plain aggregated
+    column) has no twin to miss and is never gated here.
+    """
+    return (bool(color.get("is_calc")) and bool(color.get("model_consulted"))
+            and not color.get("measure_rebound"))
+
+
+def _discrete_unbound_defer(ws, color, kind, warnings):
+    """Defer a DISCRETE colour whose twin the model did not produce, and name the reason."""
+    warnings.append(_warn(
+        "worksheet", ws["name"],
+        "discrete colour deferred: the colour driver %r was not translated into a model measure, "
+        "so the colour measure %r it would be painted from does not exist. Emitting the reference "
+        "anyway produces a visual that binds a missing object -- it renders with default colours "
+        "and reports no error. The visual is emitted unpainted; translate the source calc to "
+        "restore the encoding"
+        % (color.get("caption"), _discrete_colour_measure_name(color))))
+    return {"kind": kind,
+            "colour_measure": _discrete_colour_measure_name(color),
+            "source_measure": color.get("caption"),
+            "status": "deferred",
+            "reason": "colour driver has no translated model measure, so no colour twin exists"}
+
+
+def _discrete_view_scoped_defer(ws, color, kind, warnings):
+    """Defer a DISCRETE colour whose driver is a VIEW-level table calc, and say exactly why.
+
+    A ``WINDOW_*`` / ``RUNNING_*`` / ``RANK`` / ``INDEX`` calc computes across the marks of the
+    VIEW. Translated into a standalone model measure it keeps neither the visual's axis nor its
+    partition, so the comparison it encodes is evaluated against the wrong rows. Measured on
+    ``0070_new_max`` (``SUM([Sales]) = WINDOW_MAX(SUM([Sales]), FIRST(), 0)``, four monotonically
+    rising years where every bar sets a new maximum): the emitted measure returned **False on every
+    bar**, so every bar took the "no" colour. The visual rendered, validated clean, and was wrong.
+
+    The continuous paths have always refused a table-calc driver for exactly this reason
+    (``is_table_calc_defer``); the discrete path did not, which is the asymmetry this closes. Until
+    the driver can be lowered to a Power BI **Visual Calculation** -- which does evaluate against
+    the visual's own matrix -- painting no colour is the honest outcome: the source's colour
+    encoding is disclosed and unpainted rather than reproduced backwards.
+    """
+    warnings.append(_warn(
+        "worksheet", ws["name"],
+        "discrete colour deferred: the colour driver %r is a VIEW-level table calc (%s). Such a "
+        "calc compares each mark against the OTHER MARKS IN THE VIEW, which a standalone model "
+        "measure cannot reproduce -- it would evaluate against the wrong rows and paint a "
+        "confident but incorrect colour (measured: every mark took the same wrong swatch). The "
+        "visual is emitted with its default colours; the encoding needs a Visual Calculation to "
+        "rebuild faithfully"
+        % (color.get("caption"), " ".join(str(color.get("formula") or "").split())[:120])))
+    return {"kind": kind,
+            "colour_measure": _discrete_colour_measure_name(color),
+            "source_measure": color.get("caption"),
+            "status": "deferred",
+            "reason": "colour driver is a view-level table calc (needs a Visual Calculation)"}
+
+
 def _chart_discrete_measure_fill(ws, state, vtype, model_table, field_map, warnings):
     """A DISCRETE aggregate measure on Tableau's Colour shelf -> ``(dataPoint objects, fact)``.
 
@@ -9533,6 +9620,10 @@ def _chart_discrete_measure_fill(ws, state, vtype, model_table, field_map, warni
         return None, None
     if color.get("kind") != "value" or color.get("binding") not in ("aggregation", "measure"):
         return None, None
+    if _is_view_level_calc(color):
+        return None, _discrete_view_scoped_defer(ws, color, "chart_discrete_measure_fill", warnings)
+    if _discrete_colour_twin_unavailable(color):
+        return None, _discrete_unbound_defer(ws, color, "chart_discrete_measure_fill", warnings)
     measure_name = _discrete_colour_measure_name(color)
     fact = {"kind": "chart_discrete_measure_fill",
             "colour_measure": measure_name,

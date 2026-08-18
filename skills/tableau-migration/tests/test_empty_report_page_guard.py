@@ -125,3 +125,31 @@ class TestTheDefinitionOfDoneFailsLoud:
                                                               "table": "Orders"}]},
             "pbip_page_count": 2})
         assert "duplicate column" in reason
+
+
+    def test_a_dangling_visual_binding_is_a_loud_failure(self):
+        # A visual bound to a model object that does not exist renders EMPTY (or, for a conditional
+        # format, silently unpainted) and validates with 0 errors. The lint always DETECTED it; it
+        # was softened to a fidelity warning, so a workbook could ship bound to nothing and be
+        # called done. Escalated only once the corpus measured 0 such references, so it is inert on
+        # green and can fire only on a regression.
+        reason = E._dod_openability_failure({
+            "pbip_status": "built", "pbip_page_count": 1,
+            "viz_dangling_bindings": {"count": 2, "problems": [
+                "PBIR_VISUAL_REF_MISSING: ... binds measure 'New Max1? (colour)' ..."]}})
+        assert reason and "do not exist" in reason
+        assert "New Max1? (colour)" in reason, "name the first offender"
+
+    def test_no_dangling_bindings_is_not_a_failure(self):
+        assert E._dod_openability_failure(
+            {"pbip_status": "built", "pbip_page_count": 1}) is None
+        assert E._dod_openability_failure(
+            {"pbip_status": "built", "pbip_page_count": 1,
+             "viz_dangling_bindings": {"count": 0, "problems": []}}) is None
+
+    def test_the_page_check_still_runs_after_the_dangling_check(self):
+        # ordering guard: the dangling check must not short-circuit the page-less check below it
+        reason = E._dod_openability_failure(
+            {"pbip_status": "built", "pbip_page_count": 0,
+             "viz_dangling_bindings": {"count": 0}})
+        assert reason and "no pages" in reason

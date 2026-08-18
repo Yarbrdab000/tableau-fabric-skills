@@ -14,6 +14,316 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.159.0` → `2.160.0`): on-prem Tableau Server is stated as supported
+  and partly gated, instead of working by accident.** Raised in #140, where the reporter did the
+  unusual and useful thing of correcting their own field report before filing — the help text is not
+  literally Cloud-only, it already offers a generic `https://host` form. Their real question was the
+  one worth answering: *is Server deliberately in the test matrix, or does it merely work?*
+
+  **The honest answer was "supported by construction, but untested", and it is now written down.**
+  The module docstring states it plainly rather than reassuringly: no test exercised a Server host,
+  so nothing would have caught an on-prem regression; a successful live on-prem run exists but is a
+  field report, not a gate.
+
+  **Their instinct about where Server and Cloud diverge was exactly right, and the finding is worse
+  than the docs implied.** They flagged API-version negotiation as the likely divergence, "since
+  on-prem Servers can run substantially older REST API versions than Cloud ever does". Measured:
+  **there is no negotiation at all.** `fetch_tds.DEFAULT_REST_VERSION` pins `3.24` and no `serverinfo`
+  call is ever made, so the version is never discovered from the host. The mitigation is explicit
+  rather than automatic — `--rest-version` is already a first-class flag on both scripts — and that is
+  now the documented first thing to try when sign-in fails against an older Server.
+
+  Part of the gap is closed rather than only described. `test_onprem_server_support.py` covers what is
+  genuinely checkable offline — on-prem host shapes (bare host, explicit scheme, trailing slash, and
+  plain `http` on a non-default port, which an internal Server frequently is), identical REST URL
+  construction for Cloud and Server, and that `--rest-version` actually reaches the URL, because a
+  documented flag that silently did nothing would send a user to debug auth instead. It does **not**
+  claim a live on-prem round trip. One test additionally fails if a `serverinfo` call ever appears,
+  so the docstring's claim about itself cannot quietly become untrue.
+
+  Docs: the `--server` help now names both forms (`10ay.online.tableau.com` (Cloud) /
+  `https://tableau.example.com` (Server)). The session-expiry comment kept its Cloud provenance
+  rather than being generalised away — the *handling* is not Cloud-specific, but the measurement was
+  ("intermittently after 1 to 58 calls", on Cloud), and whether an on-prem Server expires on the same
+  cadence is unknown. Recording which half is measured is more useful than a tidier sentence.
+
+- **`tableau-migration` (skill `2.158.0` → `2.159.0`): datasource selection normalises both sides, so
+  a caption with incidental whitespace can be selected at all.** Raised in #138 from a live customer
+  estate whose real caption was `'DS_Visitor _Device '` — note the trailing space. `_choose_datasource`
+  stripped the **requested** name but not the **candidate** labels, and an asymmetric normalisation
+  can never match, so the datasource was unselectable however correctly it was spelled and the
+  workbook was skipped outright.
+
+  **It broke this module's own documented contract, which is sharper than the filed report.**
+  `workbook_datasources()` returns `label` and documents it as *"the value to pass back as
+  `select=`"*. Measured: handing that exact string straight back was **rejected**, and because both
+  sides print through `repr` the failure read
+
+  ```
+  no datasource named 'DS_Visitor _Device ' in this workbook; available: 'DS_Visitor _Device '
+  ```
+
+  — two **byte-identical** strings, one of which is reported not to exist. So this was never really
+  about a user mistyping a name: an agent following the API exactly could not select the datasource,
+  and the reporter's workaround was to edit the customer's own `.twbx` to get past it.
+
+  Fixed by stripping the candidate labels too. A near-miss hint is added for what symmetric stripping
+  deliberately still refuses: when the request matches a candidate only after **internal** whitespace
+  is collapsed, the error names the closest candidate and says how it differs. That is reporting
+  only — `_squash_ws` is unreachable from the matching path, because collapsing internal whitespace
+  could make two genuinely distinct captions identical and selecting one of those would be a guess.
+
+  **The reporter's two follow-up questions, answered with measurements rather than opinion.**
+  *Should whitespace be normalised at parse time instead, since captions presumably flow into table
+  names and emitted identifiers?* Measured: no. `parse_tds` names the descriptor from the datasource's
+  internal `name` (`federated.abc`), not its caption, and no descriptor value carries the untrimmed
+  string — so the emitted model never sees it, and a parse-time strip would silently rename the
+  author's object for no benefit. *Does the same asymmetry exist elsewhere?* `_choose_datasource` is
+  the only selection site. One **latent** instance does exist — `build_m_field_resolver` stores
+  `source_datasource` raw while `assemble_model` strips it when grouping islands, and a stripped probe
+  against a raw tag loses island scoping entirely (the calc drops to a stub). It is **not live**: the
+  island tags and the calcs' `datasource` values both derive from the same raw caption, so the
+  comparison is raw-vs-raw in production. Deliberately left alone rather than "fixed", since
+  normalising there could collapse two captions that differ only in whitespace into a single island.
+
+- **`tableau-migration` (skill `2.157.0` → `2.158.0`): the view-scoped rung of the conditional-colour
+  back end — lowering to a Visual Calculation.** Still unwired (nothing calls it, emitted output
+  unchanged). This is the rung with no alternative: when a predicate needs a value that does not
+  exist until the visual is evaluated — *"the lowest of the displayed bars"*, *"the 90th percentile
+  of what is on screen"* — no model measure can serve it. `2.152.0` measured why: the model-measure
+  form of a `WINDOW` comparison orders by a row-level column while the visual's axis is a grouped
+  one, so it is false on **every** mark.
+
+  `lower_to_visual_calc(spec, palette, resolve)` emits the DAX of a hex-returning Visual Calculation
+  — Microsoft's own documented mechanism for driving conditional formatting — as one nested `IF` per
+  branch in authored order, so the calculation reads alongside the Tableau formula it came from.
+  Tableau's view-scoped vocabulary is rewritten to DAX window functions:
+
+  | Tableau | DAX |
+  |---|---|
+  | `WINDOW_MIN/MAX/SUM/AVG/MEDIAN(x)`, `TOTAL(x)` | `MINX/MAXX/SUMX/AVERAGEX/MEDIANX(WINDOW(1, ABS, -1, ABS), x)` |
+  | `RUNNING_*(x)` | same aggregators over `WINDOW(1, ABS, 0, REL)` — first-row-to-current, a *different frame* |
+  | `WINDOW_PERCENTILE(x, p)` | `PERCENTILEX.INC(WINDOW(1, ABS, -1, ABS), x, p)` |
+  | `RANK(x)` | `RANK(DENSE, ORDERBY(x, DESC))` |
+  | `INDEX()` / `SIZE()` | `ROWNUMBER()` / `COUNTROWS(WINDOW(1, ABS, -1, ABS))` |
+
+  Operands are the visual's **projected column names** (`[Sum of Profit]`), not model measures,
+  because a Visual Calculation addresses the visual's own matrix — the caller supplies that naming.
+  Unlike rung 1 this keeps `||` for disjunction: DAX has a working OR, so no DNF expansion is needed
+  here. The DAX only is returned, not the projection, keeping PBIR assembly with the emitter.
+
+  Two shapes were **refuted by render** and are therefore never emitted, both passing `validate`
+  with 0 errors: a `NativeVisualCalculation` placed *inline* in a formatting property (silently
+  ignored — it must be a declared, hidden projection referenced by `SelectRef`), and an `Or` node.
+
+  Fail-closed and all-or-nothing, as rung 1: an unsupported spec, an open member domain, a missing
+  palette entry, or any operand the resolver cannot bind returns `None` — never a calculation with a
+  hole in it. The two rungs deliberately overlap on aggregate-scope predicates; the router (next)
+  prefers rung 1 because it adds nothing to the model.
+
+- **`tableau-migration` (skill `2.156.0` → `2.157.0`): the CHANGELOG's declared version chain is a
+  gate, not a habit.** Two agents working in parallel shipped the *same* defect within an hour, on
+  the same rebase, and neither was careless: a cross-session rebase merges the `VERSION` stamp
+  cleanly while the **prose describing that stamp** goes stale silently. Both wrote an entry reading
+  `(skill X → Y)` that was true when written and false the moment the other session's commits landed
+  underneath and changed the actual predecessor. Nothing checked it, so only a human comparing two
+  numbers would ever have caught it.
+
+  It is mechanically checkable from the CHANGELOG alone, so it is now checked — three invariants,
+  each pinned to a real failure rather than a tidiness preference:
+
+  - **the chain is continuous** — each entry's declared predecessor equals the successor declared by
+    the entry beneath it, reading newest-first. Deliberately heading-agnostic: the file interleaves
+    `### Added` and `### Fixed`, and a release's category says nothing about its ordering.
+  - **no version is produced twice** — the other half of the same rebase hazard, where an entry is
+    renumbered without being renamed.
+  - **the newest entry matches the shipped `VERSION`** — the one that actually reaches users. The
+    self-update runbook compares installed `VERSION` against the raw `VERSION` on `main` and
+    reinstalls only when main is **newer**, so a CHANGELOG documenting a version above a lower stamp
+    leaves every client that reached the higher number permanently deaf to everything after it.
+
+  Verified by injecting the exact defect both agents shipped into the real file — a top entry
+  declaring predecessor `2.154.0` above an entry ending `2.155.0` — and confirming the gate names
+  both line numbers and both versions, rather than only proving it against a synthetic fixture.
+
+  **One pre-existing break fixed, measured first.** Running the check over the full history (70
+  entries, `2.87.0` → `2.156.0`) found the version *set* already complete — no gaps, no duplicates —
+  but three adjacent chain breaks, all caused by a single displaced entry: `2.141.0 → 2.142.0` (the
+  caption-padding fix) sat below `2.139.0 → 2.140.0` because it was authored before a parallel merge
+  and landed after it. Relocating that one entry to its chronological position resolves all three,
+  so the gate ships with **zero exemptions** — nothing is grandfathered and no history was rewritten
+  beyond moving the block.
+
+- **`tableau-migration` (skill `2.155.0` → `2.156.0`): the conditional-colour compiler back end —
+  lowering to Power BI's own "Rules" conditional formatting.** Still unwired (no emitter calls it
+  yet, output byte-for-byte unchanged), but this is the rung that makes the rebuild *native* rather
+  than synthesised.
+
+  `lower_to_conditional(spec, palette, resolve)` turns an analysed colour calculation into a PBIR
+  `Conditional{Cases, DefaultValue}` expression — the JSON behind Desktop's **Rules** format style.
+  The Tableau string members never reach Power BI at all: they collapse into `Value` literals, so
+  the rebuild adds **nothing to the model** — no string measure, no colour twin — and opens in the
+  Conditional formatting dialog as rules a user can edit. Today the same encoding costs two
+  synthetic measures and is unreachable from the UI.
+
+  Every shape it emits was render-verified against Desktop first, because all of them pass
+  `powerbi-report-author validate` when they are wrong:
+
+  * `Comparison` × 5 kinds, measure-vs-literal, measure-vs-measure;
+  * `Arithmetic` inside a comparison (`SUM([Discount]) * 200 > SUM([Profit])`);
+  * `And`, `Not`;
+  * N ordered `Cases` + `DefaultValue`, which is what makes arbitrarily nested `IF`/`ELSEIF` free.
+
+  **Disjunction is never emitted as a node.** `{"Or": …}` is silently ignored by Power BI — the
+  whole `Conditional` falls through to its default, with a clean validation pass. Since each `Case`
+  already maps one predicate to one colour, `a OR b -> "X"` is simply two `Cases` both yielding
+  `colour("X")`, so predicates are normalised to **DNF** and one `Case` is emitted per disjunct.
+
+  Fail-closed and all-or-nothing: an unsupported spec, an open member domain (members that are
+  *data*, not literals), a missing palette entry, or any operand the caller's resolver cannot bind
+  returns `None` — never a rule with a hole in it. A caller that gets `None` falls to the next rung.
+
+- **`tableau-migration` (skill `2.154.0` → `2.155.0`): the calendar-span stub exclusion is keyed on
+  the emitted artifact, so it actually fires.** Raised in #137 as a follow-up to #134, reproduced
+  exactly as filed: `m_partition_review_reason()` returns a reason ("this is a scaffold") while
+  `_stub_backed_tables()` returns an empty set — the emitter and the calendar gate disagreeing about
+  the same relation in the same build. The reporter's diagnosis was correct: `stub_partition` had
+  exactly two occurrences in the tree (one `.get()` read and one hand-set *test fixture*), and
+  `placeholder` was assigned nowhere, so the predicate silently collapsed to its rarer zero-column
+  branch and the fabricated year-2000 calendar was still emitted for the column-declaring stub that
+  motivated #134. The zero-column branch was verified intact (the reporter listed it as unverified).
+
+  **The suggested one-line fix was not taken, because it is over-broad and the corpus cannot show
+  it.** Stamping `stub_partition` whenever `m_partition_review_reason()` returns a reason conflates
+  *needs review* with *is a stub*. Measured: a surviving Tableau parameter in Custom SQL is a review
+  reason on a partition that still emits a real `Odbc.Query` (generic ODBC) or `Value.NativeQuery`
+  (SQL Server family) and **does** carry rows. Stamping those would drop a populated fact table out
+  of the calendar span and silently narrow the model's date range — the same class of harm #134
+  fixed, in the opposite direction. `connection_to_m.py`'s own docstring already says as much: a
+  surviving parameter reference "is a needs-review reason (the partition is still emitted)".
+
+  The discriminator is therefore *"the emitted partition **is** the scaffold"*, answered by
+  inspecting the TMDL that actually ships for the `#table(type table [], {})` literal — the same
+  string `openability_gate._STUB_PARTITION_RE` already matches. The **detection** gate
+  (`eager_calc_refs_resolve`, #134) and the **prevention** gate (`_stub_backed_tables`, #137) now
+  share one definition of "stub" and are pinned together by a test, since drift between them *is*
+  this defect. Both of the reporter's structural points were adopted: the stamp is applied from the
+  assembly loop (not `_scaffold_source()`, which has no relation in scope and 9 call sites), and the
+  tests assert through the emitter rather than a hand-set flag — a test that supplies a signal
+  production never emits is what let this survive in the first place.
+
+  Also recorded, because it explains why this had to be found in the field: **the 29-workbook corpus
+  contains zero Custom SQL relations** (relation types are `table` ×168, `join` ×98, `collection` ×3;
+  no `<relation type='text'>` anywhere, confirmed by XML parse and by raw byte scan). The whole
+  Custom SQL path rests on synthetic-descriptor unit tests, which is precisely the condition that
+  produced this bug.
+
+  **Corpus effect, measured and Desktop-verified.** 29/29 still build and the definition of done is
+  unchanged (29 bound, 0 failed, 23 warned). A masked whole-tree diff against the previous build
+  (masking the full absolute output root — never a bare token — plus timestamps and lineage GUIDs)
+  shows exactly **one** file changed: `0083_previous_workday`'s `Date.tmdl`, whose only data table
+  *is* a stub. Its calendar goes from `CALENDAR(DATE(YEAR(MIN(stub[Date])), 1, 1), …)` to the
+  documented `CALENDARAUTO()` fallback, since excluding the stub empties the span. Verified by cold
+  Desktop open of both builds, identified by process command line rather than by "the instance that
+  is running": the pre-change model loads a **fabricated year-2000 calendar** (`Date` starts
+  `1/1/2000`) — the exact artifact #134/#137 exist to eliminate — while the post-change model opens
+  cleanly with an empty calendar that will derive correctly once the stub is completed and
+  refreshed. `EVALUATE TOPN(1, 'Date')` *executed* rather than erroring, which is what rules out the
+  risk that `CALENDARAUTO()` over a rows-less column stops the file opening.
+
+- **`tableau-migration` (skill `2.153.0` → `2.154.0`): a visual bound to a model object that does
+  not exist now FAILS the definition of done.** `lint_visual_model_bindings` has always *detected*
+  this — the report records `viz_dangling_bindings` and names each offender exactly — but it was
+  softened to a fidelity warning, so a workbook could ship with a visual bound to nothing and still
+  be reported as done. The visual renders EMPTY (or, for a conditional format, silently unpainted)
+  and `powerbi-report-author validate` returns 0 errors, which is precisely why a soft signal was
+  the wrong strength.
+
+  **Sequenced deliberately.** Landing this before `2.152.0` would have taken the corpus gate from
+  29/29 to 26/29 and left every later run measuring against a red baseline: 4 dangling references
+  across 3 of the 29 workbooks (`0070_new_max` ×2, `0080_calculate_slope_and_residuals`,
+  `0081_correlation_r_squared`), all reporting `built`. Measured after `2.152.0`: **0**. So the
+  escalation is inert on green — corpus `29/29 bound, 0 failed, 23 warned`, byte-identical to the
+  run before it — and can fire only on a real regression.
+
+  Ordering guard included: the dangling check must not short-circuit the page-less check that
+  follows it (it did, on first write, and a test now pins it).
+
+- **`tableau-migration` (skill `2.152.0` → `2.153.0`): the conditional-colour compiler front end.**
+  Analysis only — nothing is wired to an emitter yet, so output is byte-for-byte unchanged. This is
+  the piece that makes conditional colour *general* rather than a set of recognised templates.
+
+  Tableau's commonest conditional-formatting idiom is a calculation that outputs a **string /
+  dimension value**, placed on Colour, with each output painted its own colour. The structural
+  insight the new `scripts/colour_rules.py` is built on is that **the string output is an
+  intermediate Power BI never needs**:
+
+  ```
+  IF p1 THEN "A" ELSEIF p2 THEN "B" ELSE "C" END
+      ==>  Cases = [ p1 -> colour("A"), p2 -> colour("B") ],  Default = colour("C")
+  ```
+
+  The members collapse into the palette — no string measure, no colour twin, nothing added to the
+  model. All the difficulty therefore lives in the **predicates**, and depth costs nothing because
+  `Conditional.Cases` is an ordered list a nested `IF`/`ELSEIF` chain flattens onto 1:1.
+
+  `analyse_colour_calc(formula)` answers the three questions that decide the rebuild, from the
+  formula's own **properties** rather than by matching templates — so a calculation the engine has
+  never seen still routes:
+
+  1. **What are the branches?** Ordered `(predicate, member)` pairs plus a default, flattened out of
+     arbitrarily nested `IF`/`ELSEIF` and `CASE`/`WHEN` forms. A `CASE <subject> WHEN <v>` arm is
+     normalised to the predicate `<subject> = <v>`, so downstream code sees one predicate shape
+     whichever surface form it came from. Structural depth counts `IF`/`CASE`…`END` as well as
+     brackets, so a conditional nested in a THEN arm never captures the outer scan.
+  2. **Is the member domain CLOSED?** Every outcome a string literal (a static palette can be
+     built), or does an outcome return DATA — `IF x THEN [Category] ELSE "Other" END` — where no
+     static member→colour map exists and a different mechanism is required.
+  3. **What SCOPE does each predicate need?** A lattice, `constant < parameter < row < aggregate <
+     lod < view`, with the least upper bound taken across *all* branches so a cheap first predicate
+     cannot hide an expensive later one. `view` is the consequential one: `WINDOW_*` / `RUNNING_*` /
+     `RANK*` / `TOTAL` / `INDEX` / `FIRST` / `LAST` compare a mark against the **other marks in the
+     view**, which `2.152.0` measured cannot survive as a standalone model measure.
+
+  Fail-closed throughout: an unreadable formula returns `supported=False` with a reason and an empty
+  branch list, never a half-parsed guess.
+
+- **`tableau-migration` (skill `2.151.0` → `2.152.0`): a boolean colour driver is usually a
+  comparison, and a view-scoped one must not be painted at all.** Two halves of one defect, both
+  measured on `0070_new_max` — the "highlight the bar that set a new max" workbook.
+
+  **The twin was never generated.** `_boolean_colour_twin_measures` fired only when the translated
+  DAX contained a literal `TRUE()`/`FALSE()`. The commonest boolean calc is a *comparison* —
+  `SUM([Sales]) = WINDOW_MAX(SUM([Sales]), FIRST(), 0)` → `SUM(…) = MAXX(WINDOW(…), …)` — which is
+  boolean-valued and contains neither literal. So no twin was emitted while the report confidently
+  emitted a `Field value` reference to one. It now also triggers on the Tableau-declared
+  `datatype == "boolean"`, which required carrying that datatype onto table-calc measure rows (they
+  are built from a worksheet *usage*, which has none). The literal trigger is retained so a measure
+  whose datatype the extractor did not supply keeps the twin it has always had.
+
+  **Even with the twin, the colour was wrong.** Queried on the rebuilt model, `New Max2?` returned
+  `False` for all four years — on a monotonically rising series where *every* year sets a new
+  maximum. The window orders by row-level `Order_Date` while the visual's axis is `Date[Year]`, so
+  the comparison never aligns: a view-scoped table calc cannot survive as a standalone model
+  measure, exactly as `_is_view_level_calc` already documented and exactly why the CONTINUOUS colour
+  paths have always refused such a driver. The discrete path did not, and that asymmetry is what let
+  a confidently wrong colour ship. Fixing the first half alone would have been **worse than the
+  bug** — it turns "no colour" into "a plausible colour that is backwards" — so both land together.
+
+  Two deferrals now guard the discrete paths (chart marks and matrix/table cells alike), each naming
+  its cause and its remedy rather than failing quietly:
+
+  * the driver is a **view-level table calc** (`WINDOW_*` / `RUNNING_*` / `RANK` / `INDEX` …) — it
+    compares each mark against the other marks in the view, which needs a Visual Calculation;
+  * the driver **has no translated model measure**, so the twin it would be painted from does not
+    exist. Scoped by a new `model_consulted` stamp so it fires only on the model-bound pass — the
+    pre-rebind pass and every direct `parse_twb` caller have no model by construction and are
+    unchanged.
+
+  Corpus: **dangling colour references 4 → 0**, 29/29 still built. Three visuals stop painting a
+  colour that referenced a measure the model never contained; two models gain an (inert, additive)
+  colour twin; `workbook_calcs_translated` 198 → 201.
+
 - **`tableau-migration` (skill `2.150.0` → `2.151.0`): an eagerly-evaluated calculated table must not
   reference an undeclared stub column.** Raised in #134, and the answer is the one the reporter asked
   for: *"the most useful thing a maintainer could tell me is which condition makes the difference."*
@@ -364,6 +674,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   against surfacing the wrong measure set is untouched. Across the 29-workbook corpus this changes
   no existing output (every Measure Names filter there is an authoritative `op='manual'` keep-list).
 
+- **`tableau-migration` (skill `2.141.0` → `2.142.0`): a caption sized in Tableau does not fit in
+  Power BI, because Power BI adds padding Tableau has not.** Power BI reserves 8px above *and* below
+  a textbox's text by default, so a box's usable height is `height - 16`. Tableau reserves nothing.
+  An author who drew a 24px caption strip drew it to fit 12pt text, and it does — in Tableau.
+  Emitted verbatim, those 24px leave 8px for a line that needs 19, and the band renders **clipped**:
+  descenders sheared off, a scrollbar stub where the text should be.
+
+  Found by rendering a real network-operations dashboard, not by a metric. Two bands on one page:
+  `"Sort By = Network Score | Region = All | Fiscal Month ="` at 24px/12pt, and a section header at
+  31px/16pt. The build validated with **zero errors** — and our own gate already knew, because
+  `powerbi-report-author validate` warns `PBIR_TEXTBOX_HEIGHT_BELOW_FLOOR` using exactly the
+  renderer's formula. We were emitting geometry the gate then told us was wrong, one step too late
+  to matter.
+
+  **The fix is not to grow the box, and that distinction is the whole of it.** Growing it is what
+  the layout solver deliberately refuses to do (`layout_solve._clamp_to_authored`), for a measured
+  reason: a readability floor propagated up a zone tree makes a frame scale the WHOLE canvas to
+  satisfy it — eleven pixels of caption once cost five hundred pixels of page, with every object on
+  it 50% taller. The first version of this fix did exactly that and
+  `test_thin_caption_sizes_to_content_not_inflated_to_floor` caught it, correctly.
+
+  The 16px is not the author's, it is **ours**: a default we never asked for, on a box we emit. So
+  the room comes out of our own padding first, down to zero, and the authored geometry is never
+  touched. A textbox with room to spare emits no padding block at all and is byte-identical to
+  before. Applies to dashboard text objects, caption-only worksheets, and the title banner alike.
+
+  Verified by render: the reported dashboard now shows both bands in full, and the report validates
+  **0 errors / 0 warnings** where it previously carried two.
+
 - **`tableau-migration` (skill `2.140.0` → `2.141.0`): `estate_survey.py --json` declares a schema
   contract, so a rename cannot fail silently.** Raised in #114 — not a defect report, a heads-up that
   a downstream assessment tier shells out to this script and builds its migration-order graph from
@@ -438,35 +777,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   and the output path are masked.
 
 ### Fixed
-
-- **`tableau-migration` (skill `2.141.0` → `2.142.0`): a caption sized in Tableau does not fit in
-  Power BI, because Power BI adds padding Tableau has not.** Power BI reserves 8px above *and* below
-  a textbox's text by default, so a box's usable height is `height - 16`. Tableau reserves nothing.
-  An author who drew a 24px caption strip drew it to fit 12pt text, and it does — in Tableau.
-  Emitted verbatim, those 24px leave 8px for a line that needs 19, and the band renders **clipped**:
-  descenders sheared off, a scrollbar stub where the text should be.
-
-  Found by rendering a real network-operations dashboard, not by a metric. Two bands on one page:
-  `"Sort By = Network Score | Region = All | Fiscal Month ="` at 24px/12pt, and a section header at
-  31px/16pt. The build validated with **zero errors** — and our own gate already knew, because
-  `powerbi-report-author validate` warns `PBIR_TEXTBOX_HEIGHT_BELOW_FLOOR` using exactly the
-  renderer's formula. We were emitting geometry the gate then told us was wrong, one step too late
-  to matter.
-
-  **The fix is not to grow the box, and that distinction is the whole of it.** Growing it is what
-  the layout solver deliberately refuses to do (`layout_solve._clamp_to_authored`), for a measured
-  reason: a readability floor propagated up a zone tree makes a frame scale the WHOLE canvas to
-  satisfy it — eleven pixels of caption once cost five hundred pixels of page, with every object on
-  it 50% taller. The first version of this fix did exactly that and
-  `test_thin_caption_sizes_to_content_not_inflated_to_floor` caught it, correctly.
-
-  The 16px is not the author's, it is **ours**: a default we never asked for, on a box we emit. So
-  the room comes out of our own padding first, down to zero, and the authored geometry is never
-  touched. A textbox with room to spare emits no padding block at all and is byte-identical to
-  before. Applies to dashboard text objects, caption-only worksheets, and the title banner alike.
-
-  Verified by render: the reported dashboard now shows both bands in full, and the report validates
-  **0 errors / 0 warnings** where it previously carried two.
 
 - **`tableau-migration` (skill `2.138.0` → `2.139.0`): a storage-decision failure named the one
   datasource with nothing wrong with it.** Reported alongside #124. A workbook's embedded
