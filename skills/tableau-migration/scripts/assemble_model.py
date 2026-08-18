@@ -3010,14 +3010,27 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
     pure_dims = {t for t in to_tables if t and t not in from_tables}
 
     by_table = []  # (display_name, [date col model_name, ...]) for eligible tables, in order
+    # Date columns on tables the calendar deliberately SKIPS (a pure dimension, or a table that never
+    # landed). They get no relationship, so nothing can propagate a calendar filter to them -- and the
+    # report binder identifies a date pill by COLUMN NAME alone, so a skipped table whose date column
+    # shares a name with some other table's ACTIVE date is rebound onto the calendar anyway and every
+    # bucket returns the grand total (a flat line / solid block, confidently wrong and unwarned).
+    # Reported so ``migrate_estate._date_binding_from_model`` can contest those names. Measured on
+    # Salesforce NPSP: ``caseman__Intake__c`` is only ever the ``one`` side of ``Case ->
+    # caseman__Intake__c.Id``, so it is a pure dim with no calendar join, yet it carries
+    # ``CreatedDate`` -- which IS active on Case / caseman__Goal__c / ProgramEngagement (Intake) --
+    # and its Month axis rebound to ``Date[Month Start]`` and flattened.
+    unrelated = []
     for rel in tables:
         disp = _table_display(rel)
-        if not disp or disp.lower() not in emitted or disp.lower() in pure_dims:
-            continue
         date_cols = [c["model_name"] for c in (rel.get("columns") or [])
                      if c.get("tmdl_type") == "dateTime"]
-        if date_cols:
-            by_table.append((disp, date_cols))
+        if not date_cols:
+            continue
+        if not disp or disp.lower() not in emitted or disp.lower() in pure_dims:
+            unrelated.extend({"table": disp or "", "column": c} for c in date_cols)
+            continue
+        by_table.append((disp, date_cols))
 
     if not by_table:
         return None, None, [], {"generated": False, "reason": "no fact date columns"}
@@ -3149,6 +3162,10 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
     part = T.generate_date_table_tmdl(date_name, mark_as_date=mark_as_date, source_expr=source_expr)
     report = {"generated": True, "table": date_name, "mark_as_date": mark_as_date,
               "relationships": details, "warnings": warnings}
+    if unrelated:
+        # Additive: present only when a skipped table actually carries a date column, so every
+        # model without one keeps its report byte-for-byte.
+        report["unrelated_date_columns"] = unrelated
     return date_name, part, rels, report
 
 

@@ -14,6 +14,39 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.229.0` → `2.230.0`): a date axis on a table the calendar SKIPPED no
+  longer rebinds to the calendar and flatten.** The report binder identifies a date pill by COLUMN
+  NAME — at that point the field's entity is still the workbook's relation name, not the model's table
+  — so `migrate_estate._date_binding_from_model` publishes `ambiguous_keys`: date columns that are
+  active on one table and not on another that also carries them. The binder declines those, because
+  rebinding the wrong fact onto a calendar that cannot filter it returns the grand total in every
+  bucket: a flat line, unwarned and validate-clean.
+
+  That guard computed its contested population from the date RELATIONSHIPS, so it could only ever see
+  tables that received one. A table the calendar deliberately **skips** — a pure dimension, or one
+  that never landed — has no relationship at all, so it never appeared, and the guard was blind to
+  exactly the shape it exists to catch. *No relationship* is a stronger version of *inactive
+  relationship*, not an exemption from it.
+
+  Measured on Salesforce NPSP: `caseman__Intake__c` is only ever the `one` side of
+  `Case → caseman__Intake__c.Id`, so `_build_date_dimension` excludes it as a pure dimension — yet it
+  carries `CreatedDate`, which is ACTIVE on `Case`, `caseman__Goal__c` and
+  `pmdm__ProgramEngagement__c (Intake)`. Its Month axis rebound to `Date[Month Start]` on a table the
+  calendar cannot filter. Before: 9 calendar-bound visuals, 7 correct, **1 flat series**. After: 5
+  calendar-bound, 4 correct, **0 flat**. The 4 that gave up their calendar binding fall back to the
+  fact's own date column — correct values without the calendar hierarchy, which is the guard's
+  existing miss-over-wrong tradeoff applied consistently rather than a new policy.
+
+  `assemble_model._build_date_dimension` now reports `unrelated_date_columns` (table + column for
+  every date column on a table it skipped); `_date_binding_from_model` folds those into the contested
+  set. Both keys are additive and absent when nothing was skipped, so every model whose date-bearing
+  tables all joined the calendar keeps its report byte-for-byte.
+
+  Same shape as 2.226.0 one layer down: the guard was keyed on a PROXY population (relationships)
+  instead of the real one (every table carrying the column name). What wrong looks like, so this is
+  defensible later: the failing visual rendered a *solid block at the grand total* across all months
+  rather than a monthly series — visibly different from the correct render, not merely absent.
+
 - **`tableau-migration` (skill `2.228.0` → `2.229.0`): `ATTR()` rebuilds as `MIN` instead of being
   dropped.** Tableau's `ATTR([x])` returns the value when it is unique across the mark's rows and the
   literal `*` when it is not. Power BI has no such aggregate, and the pill fell through to the

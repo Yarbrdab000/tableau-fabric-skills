@@ -2023,12 +2023,26 @@ def _date_binding_from_model(res_report):
     # cannot tell "the fact that owns the active relationship" from "a different fact with the same
     # column name". Rebinding the wrong one onto the calendar produces a flat time series, so they
     # are named here and declined there. Additive: absent when no name is contested.
+    #
+    # The contested population is EVERY table carrying the column, not just the tables that received
+    # a date relationship. A table the calendar SKIPPED -- a pure dimension, or one that never landed
+    # -- has no relationship at all, so it never appears in ``rels``; keying the guard on ``rels``
+    # alone therefore left invisible exactly the case the guard exists to catch, because "no
+    # relationship" is a stronger version of "inactive relationship", not an exemption from it.
+    # ``unrelated_date_columns`` (from ``assemble_model._build_date_dimension``) supplies them.
+    # Measured on Salesforce NPSP: ``caseman__Intake__c`` is a pure dim carrying ``CreatedDate``,
+    # which is active on three other tables, and its Month axis rebound to ``Date[Month Start]`` on a
+    # table the calendar cannot filter -- one visual rendering the grand total in every bucket.
     act_names = {(c or "").strip().lower() for c in active}
     inact_names = {(r["column"] or "").strip().lower()
                    for r in rels if not r.get("active")}
+    inact_names |= {(u.get("column") or "").strip().lower()
+                    for u in (dr.get("unrelated_date_columns") or ())
+                    if isinstance(u, dict) and u.get("column")}
+    contested = act_names & inact_names
     ambiguous = sorted(
         {r["column"] for r in rels
-         if (r["column"] or "").strip().lower() in act_names & inact_names})
+         if (r["column"] or "").strip().lower() in contested})
     out = {"date_table": dr["table"], "active_keys": active, "key_column": "Date"}
     if ambiguous:
         out["ambiguous_keys"] = ambiguous

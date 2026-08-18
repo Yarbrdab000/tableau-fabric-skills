@@ -185,6 +185,45 @@ def test_build_date_dimension_active_and_inactive():
     assert not report["warnings"]
 
 
+def test_build_date_dimension_reports_dates_on_the_tables_it_skipped():
+    # A skipped table's date columns are REPORTED even though it gets no relationship, because the
+    # report binder matches a date pill by column NAME: a pure dimension carrying a name that is
+    # active on a real fact would otherwise be rebound onto a calendar that cannot filter it, and
+    # every bucket would return the grand total (a flat line). ``migrate_estate`` folds these into
+    # ``ambiguous_keys`` so the binder declines. Measured on Salesforce NPSP's ``caseman__Intake__c``.
+    tables = [_rel("Orders", "CreatedDate"), _rel("People", "CreatedDate", "Hire_Date")]
+    rels = [{"from_table": "Orders", "from_col": "Region",
+             "to_table": "People", "to_col": "Region"}]
+    _name, _part, date_rels, report = _build_date_dimension(
+        tables, ["Orders", "People"], rels)
+
+    # People is a pure dimension -- still no relationship, unchanged behaviour.
+    assert {r["from_table"] for r in date_rels} == {"Orders"}
+    assert report["unrelated_date_columns"] == [
+        {"table": "People", "column": "CreatedDate"},
+        {"table": "People", "column": "Hire_Date"},
+    ]
+
+
+def test_build_date_dimension_omits_unrelated_key_when_nothing_was_skipped():
+    # Additive: a model whose every date-bearing table joined the calendar carries no new key, so
+    # its report stays byte-for-byte what it was.
+    tables = [_rel("Orders", "Order_Date", "Ship_Date")]
+    _name, _part, _rels, report = _build_date_dimension(tables, ["Orders"], [])
+    assert "unrelated_date_columns" not in report
+
+
+def test_build_date_dimension_skipped_table_without_dates_is_not_reported():
+    # Only date columns are contestable; a skipped dimension with no dateTime column contributes
+    # nothing, so the key stays absent rather than appearing empty.
+    tables = [_rel("Orders", "Order_Date"), _rel("People", extra=("Region",))]
+    rels = [{"from_table": "Orders", "from_col": "Region",
+             "to_table": "People", "to_col": "Region"}]
+    _name, _part, _date_rels, report = _build_date_dimension(
+        tables, ["Orders", "People"], rels)
+    assert "unrelated_date_columns" not in report
+
+
 def test_build_date_dimension_directquery_omits_datepartonly():
     # On a DirectQuery model a datePartOnly (datetime-to-date) join is illegal -- Power BI refuses
     # to open the model. The calendar relationships must still be emitted (active + inactive
