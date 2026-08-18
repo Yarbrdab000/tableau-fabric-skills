@@ -14,6 +14,45 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.205.0` → `2.206.0`): the blockers a real customer trial actually hit
+  are documented, and two verification rules are corrected.**
+
+  **The `.pbip` would not open — including a blank one.** Power BI Desktop failed with
+  `Method not found: 'Void Newtonsoft.Json.JsonSerializerSettings..ctor'` because an old
+  `Newtonsoft.Json` was registered in the machine's GAC. **Nothing about the migration is involved**,
+  which is exactly why it wasted time: it presents as "the migrated file is broken". **Two of three
+  users in one customer trial hit it.** `troubleshooting.md` §7 now leads with it, gives the
+  one-line proof that it is environmental (open a *blank* `.pbip` — if that fails too, it is the
+  machine), and the `gacutil -i` remedy with the assembly path.
+
+  Two more from the same trial, both previously undocumented from the user's point of view:
+
+  - **a table whose query is `#table(type table [], {})` and has no data** — the scaffold partition,
+    most often a published/shared Tableau datasource (`sqlproxy`) that carries no query of its own.
+    Disclosed by the run under `needs_review`, but a user staring at an empty table had nowhere to
+    look it up.
+  - **an ODBC table that will not load until the connection string is edited** — the connection
+    arrives with Tableau's own driver string; replacing the first `Odbc.Query` parameter with a
+    resolvable DSN loads the data, and the SQL text carries over intact.
+
+  Section 7's menu entry now says *".pbip won't OPEN at all"*, because that is what the user types.
+
+  **Two verification rules corrected**, both earned by the parallel session probing this collection's
+  own work:
+
+  - **Prove a gate CAN FAIL, not merely that it runs.** The `2.205.0` anchor gate ran on every commit,
+    reported clean, and could never fail — its reachable set came from `git rev-list --all`, which
+    includes `refs/tags`, so every anchor vouched for itself. The general form is not git-specific:
+    **any check whose input set is defined by something the artifact under test contributes to is
+    tautological by construction.**
+  - **The fourth control is opportunistic, not a method.** The within-build control (two views
+    identical but for the encoding under test) is the strongest available — but it was *noticed*, not
+    designed: a tutorial workbook happened to ship `Challenge` and `Solution` pages over the same
+    data. Documented as *look for one, do not assume one exists*, since promising it as a technique
+    would send someone hunting for a control that is not there.
+
+  Documentation only — no engine code, no emitted-output change.
+
 - **`tableau-migration` (skill `2.196.0` → `2.205.0`): rollback anchors are gated — the last artifact
   in the release ritual with nothing checking it.** Proposed by the parallel colour session after two
   of their own anchors were found pointing at commits from a discarded renumber that no branch
