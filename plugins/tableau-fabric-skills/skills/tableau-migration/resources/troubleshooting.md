@@ -20,7 +20,8 @@ What are you running into? Reply with a number and I'll walk you through it:
                                            data/extract/flat-file is missing)
   5) A step errored or the run stalled    (the happy path isn't completing; is WARN a failure?)
   6) Deploy to Fabric failed              (az login, workspace/capacity, refresh / credential wall)
-  7) The output looks wrong               (.pbip "tiny/broken", calcs = 0, a visual missing, numbers off)
+  7) The output looks wrong               (.pbip won't OPEN at all, .pbip "tiny/broken", calcs = 0,
+                                           a visual missing, a table with no data, numbers off)
   8) Not sure / none of these             (describe it and I'll route you)
 ```
 
@@ -148,8 +149,11 @@ Deeper: [migration-gotchas.md](migration-gotchas.md) (**Deploy & validate**); th
 
 | Symptom | Likely cause | Do this now |
 |---|---|---|
+| Power BI Desktop: **`Method not found: 'Void Newtonsoft.Json.JsonSerializerSettings..ctor'`** on opening *any* `.pbip` — **including a brand-new blank one** | **Not our output.** An old `Newtonsoft.Json` is registered in the machine's **GAC** and Desktop binds to it. Nothing about the migration is involved | Prove it first: create a blank `.pbip` in Desktop and open it. If that fails too, it is the environment. Fix by registering the current assembly: find `gacutil.exe` (e.g. `C:\Program Files (x86)\Microsoft SDKs\Windows\v10.0A\bin\NETFX 4.8 Tools\x64\`) and run `.\gacutil.exe -i C:\Windows\Microsoft.NET\assembly\GAC_MSIL\Newtonsoft.Json\13.0.3__30ad4fe6b2a6aeed\Newtonsoft.Json.dll` (expect *"Assembly successfully added to the cache"*). Background: [Fabric community thread](https://community.fabric.microsoft.com/t5/Desktop/Method-not-found-Void-Newtonsoft-Json-JsonSerializerSettings/m-p/5139648). **Reported by 2 of 3 users in one customer trial — expect it, and check it before debugging the migration at all.** |
 | The `.pbip` is "only ~300 bytes / a tiny JSON stub" | That is **exactly** what a correct `.pbip` is — a JSON **pointer** to its sibling folders | **Nothing is wrong. Do NOT zip, repackage, or "fix" it.** Double-click it in Power BI Desktop. Verify with `py -3.11 scripts/deploy_to_fabric.py --verify-pbip <bundle-or-.pbip>`. |
 | Power BI: `Unable to translate bytes [XX] at index N` on open | The `.pbip` was overwritten with a **ZIP** (a `PK..` header fed to a JSON parser) | Someone zipped the pointer. **Restore it** (re-run the migration). Every *sibling* format (`.pbix`/`.twbx`/`.tdsx`) is a zip — the `.pbip` is **not**. |
+| A table's query is `= #table(type table [], {})` and it has no data | The relation emitted a **scaffold partition** — the connector had no offline translation. Common for a **published/shared Tableau datasource** (`sqlproxy`), which carries no query of its own | Expected and disclosed, not silent: the run reports it under `needs_review` / `stubbed_partitions`. Complete the partition by hand, or supply the underlying source. See §4 and [connection-binding.md](connection-binding.md). |
+| An ODBC table won't load until the connection string is edited | The connection came across with **Tableau's own driver string**; the Power BI side needs a DSN it can resolve | Replace the first `Odbc.Query` parameter with your own DSN (e.g. `DSN=QueryFabric`). The **SQL text is carried over intact** — only the connection changes. |
 | A calculated field shows **`= 0`** | A calc outside the safe subset was emitted as an inert stub (its original formula is preserved) | Offer the **second-compiler** pass to author the DAX ([second-compiler.md](second-compiler.md)); don't hand back silent `= 0` stubs. |
 | A visual is missing / a placeholder | A disclosed `warned` rebuild (unsupported visual or no usable bindings) | It's reported, not lost — read the worksheet's `viz_fidelity` / warnings row; offer the assisted dashboard-audit tier. |
 | A number doesn't match Tableau | Different **filter context** on the two sides, or cross-engine rounding | Match the filter context first; compare with a **relative epsilon**, not exact equality. A genuine gap is a real mismatch to investigate. |

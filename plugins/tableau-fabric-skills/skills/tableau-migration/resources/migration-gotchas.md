@@ -120,6 +120,13 @@ of each — a reader who has all three has a template rather than three anecdote
 2. **Vary the mechanism under fixed data.**
 3. **Vary the build under fixed everything.**
 
+A fourth is *opportunistic, not a method*: **when the artifact already contains its own control** —
+two views identical but for the encoding under test — prefer it, because it holds everything constant
+except the thing in question and needs no second build to argue about. **Look** for one before
+building a second build, but do not assume one exists. (The case that produced this was a tutorial
+workbook that happens to ship `Challenge` and `Solution` pages over the same data, one with the colour
+calc and one without. That is luck of the corpus, not a technique you can invoke.)
+
 Three measured examples of a render that looked like proof and was not:
 
 * A parameter-thresholded colour rendered **all one colour**. Consistent with "the parameter
@@ -136,6 +143,17 @@ Three measured examples of a render that looked like proof and was not:
 
 The same rule applies to the measuring apparatus, not just the artifact:
 
+* **Prove the gate CAN FAIL, not merely that it runs.** Those differ, and the difference is not
+  academic: a rollback-anchor gate here ran on every commit, reported clean, and *could never fail* —
+  its reachable set came from `git rev-list --all`, which includes `refs/tags`, so every anchor
+  vouched for itself. Probing it with a deliberately-orphaned anchor is what exposed it. The general
+  form is worth memorising, because it is not git-specific: **any check whose input set is defined by
+  something the artifact under test contributes to is tautological by construction**, and it will
+  pass with total confidence forever.
+* **A test that forbids a shape real history contains is inventing a convention, not checking one.**
+  The same anchor gate's naming test initially rejected `rollback/pre-v1.9.0-comparison`, a legitimate
+  label the repo had used for a year. Same error as a gate keyed on a proxy: asserting what you assume
+  instead of what exists.
 * **The tell is a result inconsistent with what the change could possibly do.** This is the heuristic
   that makes the rest actionable, because it tells you *when* to distrust a number: a report-only
   change cannot touch a `.tmdl`. A diff reporting 74 differing `.tmdl` files for such a change was
