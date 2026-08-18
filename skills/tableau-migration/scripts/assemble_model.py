@@ -1167,6 +1167,127 @@ def _param_predicate_flags(calcs, resolve, param_resolver, *, known_tables,
     return flag_measures, filter_bindings
 
 
+def _aggregate_predicate_flags(calcs, resolve, param_resolver, *, known_tables,
+                               reserved_names=None, skip_lower=None, resolve_for=None):
+    """Recognize an AGGREGATE boolean calc of parameter(s) used as a keep-filter.
+
+    The third sibling of :func:`build_date_window_flags` / :func:`_param_predicate_flags`, for the
+    shape neither of those can see: a boolean whose predicate is an AGGREGATE, e.g.
+    ``IF SUM([Sales]) > [Parameters].[Sales Param] THEN TRUE ELSE FALSE END`` dropped on the filter
+    shelf with ``member='true'`` -- "keep only the customers whose total sales clear the parameter".
+
+    Why it needs its own pipeline rather than a widened gate on ``_param_predicate_flags``: that one
+    is ROW-level by construction (it asks the *column* translator for a pure boolean and wraps the
+    result in ``COUNTROWS(FILTER(...))``), and an aggregate cannot be evaluated per row. The faithful
+    Power BI shape is the opposite one -- a keep-flag MEASURE filtered at the visual's own grain::
+
+        ``<Calc> Flag = IF(<measure-mode boolean>, 1)``   (1 keep / BLANK drop)
+
+    which is exactly Tableau's semantics: the aggregate is computed at the viz level of detail, so a
+    bar chart grouped by customer keeps the customers whose own ``SUM([Sales])`` clears the parameter.
+    Consequently the binding deliberately carries **no** ``row_filter``: the downstream
+    ``_apply_row_predicate_wrapped_measures`` pass must NOT rewrite this into
+    ``CALCULATE(<agg>, FILTER(<table>, <pred>))``, because pushing an aggregate predicate to row grain
+    changes the answer.
+
+    Fail-closed and PROVABLY DISJOINT from the row-level pipeline: a calc qualifies only when it
+    references a parameter, the COLUMN translator does **not** yield a boolean (so the row-level path
+    could never have claimed it), and the MEASURE translator does (``dtype == "bool"``). ``skip_lower``
+    excludes calcs an earlier flag pipeline already consumed. Returns ``(flag_measures,
+    filter_bindings)`` in the shape the other two return, so all three merge directly. Empty when
+    nothing matched, so a workbook without this shape stays byte-for-byte identical.
+    """
+    flag_measures, filter_bindings = [], {}
+    if not param_resolver:
+        return flag_measures, filter_bindings
+    reserved_lower = {(r or "").lower() for r in (reserved_names or set())}
+    skip_lower = {(s or "").lower() for s in (skip_lower or set())}
+    _island_dss = {(c or {}).get("datasource") for c in (calcs or [])}
+    _island_dss = {d for d in _island_dss if d}
+
+    def _rc(calc):
+        if not resolve_for:
+            return resolve
+        return _best_scoped_resolver(
+            (calc or {}).get("formula", ""), (calc or {}).get("datasource"),
+            resolve_for, _island_dss, resolve)
+
+    for calc in calcs or []:
+        name = calc.get("name")
+        formula = calc.get("formula")
+        if not name or not formula or not formula.strip():
+            continue
+        cid = _calc_id_key(calc)
+        if name.lower() in skip_lower or (cid and cid in skip_lower):
+            continue
+        if "[parameters]" not in formula.lower():
+            continue
+        rc = _rc(calc)
+        # DISJOINTNESS, asserted rather than assumed: if the column translator can render this as a
+        # boolean it belongs to the row-level pipeline, which runs first and owns it.
+        _cpred, _cr, _ct, cdtype = translate_tableau_calc_to_column_dax_typed(
+            formula, rc, known_tables=known_tables, param_resolver=param_resolver)
+        if _cpred and cdtype == "bool":
+            continue
+        cond, _reason, _tables, dtype = translate_tableau_calc_to_dax_typed(
+            formula, rc, param_resolver=param_resolver, known_tables=known_tables)
+        if not cond or dtype != "bool":
+            continue
+        raw_cid = str(calc.get("internal_name") or "").strip().strip("[]").strip()
+        src_id = raw_cid or name
+        base_name = name if name.lower() not in reserved_lower else f"{name} Flag"
+        measure_name, i = base_name, 2
+        while measure_name.lower() in reserved_lower:
+            measure_name = f"{base_name} {i}"
+            i += 1
+        reserved_lower.add(measure_name.lower())
+        # The translated boolean is INLINED rather than referenced as ``IF([<calc>], 1)``: the sibling
+        # measure's name/home table is decided by a later pass, so a reference would be a proxy for a
+        # fact this function cannot yet observe. Inlining keeps the flag self-contained and correct.
+        dax = f"IF({cond}, 1)"
+        translated_by = "deterministic (parameter-driven aggregate filter)"
+        param_internal = None
+        m = _PARAM_REF_RE.search(formula)
+        if m:
+            param_internal = m.group(1).strip()
+        report_row = {
+            "measure": measure_name,
+            "status": "translated",
+            "reason": None,
+            "dax": dax,
+            "tableau_formula": formula,
+            "translated_by": translated_by,
+            "source": {
+                "kind": "calc_column",
+                "model_table": "_Measures",
+                "field_caption": name,
+                "calc_instance_token": src_id,
+                "intent": "measure",
+            },
+        }
+        flag_measures.append({
+            "measure": measure_name,
+            "dax": dax,
+            "tableau_formula": formula,
+            "translated_by": translated_by,
+            "source_calc_name": name,
+            "source_calc_id": src_id,
+            "report_row": report_row,
+        })
+        filter_bindings[name] = {
+            "model_table": "_Measures",
+            "measure_name": measure_name,
+            "status": "translated",
+            "predicate": {"op": "==", "value": 1},
+            "value": 1,
+            "calc_id": src_id,
+            "param_internal": param_internal,
+            # No ``row_filter``: an aggregate predicate must stay a visual-grain keep-flag.
+            "aggregate": True,
+        }
+    return flag_measures, filter_bindings
+
+
 def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    calc_lookup=None, approved_calc_dax=None, synth_measures=None,
                    known_tables=None, table_calc_usages=None, order_resolver=None,
@@ -4280,6 +4401,23 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         skip_lower=_band_flag_sources, resolve_for=_raw_scoped_resolver)
     flag_measures.extend(_pred_flags)
     for _tok, _spec in _pred_bindings.items():
+        filter_bindings.setdefault(_tok, _spec)
+    # AGGREGATE parameter boolean filter -> keep-flag measure + binding (the peer of the row-level
+    # pipeline above for e.g. ``IF SUM([Sales]) > [Parameters].[X] THEN TRUE ...`` used as a
+    # member='true' filter). Runs LAST and skips every calc the two earlier pipelines consumed, and
+    # additionally refuses any calc the column translator can render as a boolean -- so the row-level
+    # and aggregate paths are disjoint by construction rather than by ordering luck.
+    _row_flag_sources = set(_band_flag_sources)
+    for _fm in _pred_flags:
+        for _k in (_fm.get("source_calc_name"), _fm.get("source_calc_id")):
+            if _k:
+                _row_flag_sources.add(_k)
+    _agg_flags, _agg_bindings = _aggregate_predicate_flags(
+        all_calcs, resolve, param_resolver, known_tables=set(table_names),
+        reserved_names=reserved | {(fm.get("measure") or "").lower() for fm in flag_measures},
+        skip_lower=_row_flag_sources, resolve_for=_raw_scoped_resolver)
+    flag_measures.extend(_agg_flags)
+    for _tok, _spec in _agg_bindings.items():
         filter_bindings.setdefault(_tok, _spec)
     flag_source_names = set()
     for _fm in flag_measures:

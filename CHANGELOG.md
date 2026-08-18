@@ -14,6 +14,55 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.211.0` → `2.212.0`): a parameter filter whose predicate is an
+  AGGREGATE now actually filters.** Two workbooks supplied by the tool's own user, built to carry
+  shapes a customer field trial reported, are added to the corpus as
+  **`0134_parameter_filters`** and **`0135_aggregation_types`** — closing a hole worth stating
+  plainly: the corpus previously contained **zero** workbooks that filter on a parameter, measured
+  two ways (a parameter directly on the filter shelf: 0 of 29; a `member='true'` filter on a calc
+  that references a parameter: 0 of 29). Every parameter-to-filter seam in the engine was untested
+  against real output.
+
+  `0134` filters five worksheets on five differently-shaped boolean calcs. Four already migrated
+  correctly and are kept as **controls**; the fifth,
+  `IF SUM([Sales]) > [Parameters].[Sales Param] THEN TRUE ELSE FALSE END`, emitted a chart with no
+  `filterConfig` and no wrapper measure — entirely unfiltered. It was warned, so it was visible
+  rather than silent, but the chart was wrong.
+
+  The cause is that `_param_predicate_flags` is **row-level by construction**: it asks the *column*
+  translator for a pure boolean and wraps the result in `COUNTROWS(FILTER(...))`. An aggregate cannot
+  be evaluated per row, so it can never pass that gate. Widening the gate would have been the wrong
+  repair — the faithful Power BI shape for an aggregate is the *opposite* one, a keep-flag measure
+  evaluated at the visual's own grain, which is exactly Tableau's semantics (the aggregate is
+  computed at the viz level of detail, so a chart grouped by customer keeps the customers whose own
+  `SUM([Sales])` clears the parameter). So `_aggregate_predicate_flags` ships as a third sibling of
+  the date-window and row-level pipelines, emitting `IF(<measure-mode boolean>, 1)`.
+
+  Its binding deliberately carries **no** `row_filter`, and that absence is load-bearing:
+  `_apply_row_predicate_wrapped_measures` keys on exactly that field, and rewriting an aggregate into
+  `CALCULATE(<agg>, FILTER(<table>, <pred>))` would push it to row grain and quietly answer a
+  different question. A missing filter is visibly wrong; a row-wrapped aggregate would be
+  *invisibly* wrong, so the two failure modes are not equally bad and the tests say so.
+
+  Disjointness is asserted rather than assumed: a calc the column translator can render as a boolean
+  is refused here even with an empty skip set, so the row-level and aggregate paths cannot both claim
+  one calc regardless of call order.
+
+  **Measured, both operands named.** Corpus `corpus_b209` (built at `ac4f925`) vs `corpus_v209`
+  (built at this change), same 31-workbook input: 1466 files vs 1466, **0 added, 0 removed, 4
+  differing** — the one visual that gained the filter, the one `_Measures.tmdl` that gained the flag
+  measure, and `report.json`/`summary.md` (visuals warned 100 → 99). Nothing changed in the other 30
+  workbooks.
+
+  **A test that could not fail was found and fixed before shipping.** The disjointness test first
+  used `[Param] = [Segment]` as its row-level exemplar and passed with the guard deleted — the
+  *measure* gate refuses that calc outright, so the guard was never reached. Measuring both
+  translators across ten shapes showed only a parameter-only comparison (`[Param] > 5`) types as
+  `bool` in **both** modes, and it is now the exemplar. Both load-bearing assertions were then
+  proven to go red when their guard is removed, per "prove a gate CAN fail, not merely that it runs".
+
+  Suite 4885 → **4896**.
+
 - **`tableau-migration` (skill `2.210.0` → `2.211.0`): a container-stitched pseudo-table is MERGED
   into one visual, and the style cascade stops overwriting conditional formats.** N worksheets in a
   contiguous band, each contributing one measure, with the row labels hidden on all but the leading
