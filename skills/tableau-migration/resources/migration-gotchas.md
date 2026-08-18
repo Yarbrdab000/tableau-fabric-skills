@@ -113,6 +113,13 @@ broken and the working hypothesis predict the same picture, that picture is wort
 `validate`. Find the control that forces them apart: a second build, a second page, or a deliberately
 altered input whose effect you can predict in advance.
 
+There are **three distinct ways** to force the hypotheses apart, and the worked examples below are one
+of each — a reader who has all three has a template rather than three anecdotes:
+
+1. **Vary the input, predicting the output in advance.**
+2. **Vary the mechanism under fixed data.**
+3. **Vary the build under fixed everything.**
+
 Three measured examples of a render that looked like proof and was not:
 
 * A parameter-thresholded colour rendered **all one colour**. Consistent with "the parameter
@@ -129,6 +136,16 @@ Three measured examples of a render that looked like proof and was not:
 
 The same rule applies to the measuring apparatus, not just the artifact:
 
+* **The tell is a result inconsistent with what the change could possibly do.** This is the heuristic
+  that makes the rest actionable, because it tells you *when* to distrust a number: a report-only
+  change cannot touch a `.tmdl`. A diff reporting 74 differing `.tmdl` files for such a change was
+  disbelieved on exactly that ground, and the harness — not the engine — turned out to be wrong.
+* **Build baselines; never copy them.** A copied tree is a build of a *different* commit wearing the
+  right directory name, and every absolute path inside it still says so. Masking substitutes the root
+  you pass in, so it misses all of them.
+* **A baseline you have opened in Power BI Desktop is no longer a pure build of its commit.** A render
+  check writes `.pbi/cache.abf` into the tree and it appears in the next diff. Render from a throwaway
+  copy.
 * **Name both operands of a diff, never just the delta.** A whole-tree diff whose two roots were
   built from the *same* tree returns `0 differing` — guaranteed, carrying zero information, and
   indistinguishable from a real result. Report "`b178` (built from `d1c35e6`) vs `v178` (built from

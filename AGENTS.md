@@ -157,13 +157,20 @@ the same message as that block's first commit.
 
 Two rules make it work:
 
-* **Claim the block ABOVE the current tip, not as a fixed range.** The `VERSION` stamp must stay
-  monotonic, so once the other session's numbers land, any block below the tip is spent — a held
-  range lower than `HEAD`'s version cannot be used and must be re-claimed higher.
+* **Claim the block ABOVE the current tip, and expect it to erode from below.** The `VERSION` stamp
+  must stay monotonic, so a block is alive **only for its portion above `HEAD`** — it is not a
+  reservation that lives or dies whole, it shrinks from the bottom as the tip advances. A block whose
+  whole range has fallen below the tip is dead even if none of it was used; a block whose head was
+  consumed is still good for the rest. Both misreadings of this happened in one exchange, in opposite
+  directions, from the shorthand "claim above the tip".
 * **On a collision, the PUSHED side wins and the unpushed side renumbers.** Decidable without either
   party knowing the other's state, which is the only property that survives a race; a rule that
   alternates who absorbs the cost needs shared memory of whose turn it is, and a race is precisely
   the absence of that.
+* **Never assign a version number to another session.** Allocate only from your own block. Every
+  collision in the run that produced these rules traces to a number travelling in a message, which is
+  the one artifact neither party can keep current — by the time it is read, the sender may already
+  have consumed it. The integrator lands what arrives and objects only on an actual collision.
 
 
 When several features shipped unversioned, catch up per feature: assign each its own MINOR version +

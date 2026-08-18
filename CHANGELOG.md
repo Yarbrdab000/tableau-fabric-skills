@@ -14,6 +14,41 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.188.0` → `2.189.0`): the measurement rules sharpened by three
+  harness failures, and the concurrent-release rules sharpened by three renumbers.** Follow-up to
+  `2.186.0`, from findings on both sides of a two-session integration.
+
+  **The heuristic that makes the apparatus rules actionable** — the one that tells you *when* to
+  distrust a number — is now stated first: **a result inconsistent with what the change could possibly
+  do is the tell.** A report-only change cannot touch a `.tmdl`; a diff claiming 74 differing `.tmdl`
+  files for one was disbelieved on that ground alone, and the harness rather than the engine turned
+  out to be wrong. Three more rules join it:
+
+  - **Build baselines; never copy them.** A copied tree is a build of a *different* commit wearing the
+    right directory name, and every absolute path inside it still says so — masking substitutes the
+    root you pass, so it misses all of them.
+  - **A baseline opened in Power BI Desktop is no longer a pure build of its commit.** A render check
+    writes `.pbi/cache.abf` into the tree and it shows up in the next diff. (Found here, landing
+    someone else's change: my own render of `0060` contaminated the baseline I was measuring against.)
+  - Three distinct **ways to force two hypotheses apart** now head the worked examples — vary the
+    *input* and predict the output; vary the *mechanism* under fixed data; vary the *build* under
+    fixed everything. The three recorded cases are one of each, which makes them a template rather
+    than three anecdotes.
+
+  **The block rule is corrected, because its shorthand produced two opposite errors in one exchange.**
+  "Claim above the tip" implies a block lives or dies whole. It does not: **a block is alive only for
+  its portion above `HEAD`, and erodes from below as the tip advances.** One session's range died
+  entirely (all of it fell below the tip) while the other's survived with only its head consumed —
+  same rule, opposite outcomes, and each party misread it in the direction that suited their own case.
+
+  **And a new rule that removes the cause rather than the symptom: never assign a version number to
+  another session.** Every collision in this run traces to a number travelling in a message — the one
+  artifact neither party can keep current, since by the time it is read the sender may already have
+  consumed it. Allocate only from your own block; the integrator lands what arrives and objects only
+  on an actual collision.
+
+  Documentation only — no engine code, no emitted-output change.
+
 - **`tableau-migration` (skill `2.187.0` → `2.188.0`): rung 4 is wired -- a view-scoped colour
   driver now paints, through a declared Visual Calculation.** "Highlight the bar that set a new
   record" compares a mark against the OTHER marks in the view, so it has no rung-1 form and was
