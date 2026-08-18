@@ -14,6 +14,43 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.177.0` → `2.185.0`): the CHANGELOG chain gate gets the execution
+  point it was missing, and the concurrent-release protocol is written down.** Both come from a
+  defect the parallel colour session found in its own renumbered stack, and the diagnosis is the
+  useful part: the gate shipped in `2.157.0` was never missing an invariant — it was missing a place
+  to run.
+
+  `tests/test_changelog_version_chain.py` runs where pytest runs, which is the **tip** of a branch.
+  The CHANGELOG is a file every commit rewrites, so **the tip masks its own history**: a two-commit
+  stack was correct at HEAD and stale one commit down, because the renumber landed as an `--amend` of
+  the tip while the parent kept its pre-renumber predecessor. Checking out that parent and running the
+  gate there reported the failure immediately. The fix is one flag, now in the `AGENTS.md` versioning
+  ritual and in the test module's own docstring:
+
+  ```
+  git rebase --exec "cd skills/tableau-migration && py -3.11 -m pytest tests/test_changelog_version_chain.py -q" origin/main
+  ```
+
+  ~0.13s per commit, verified on both the broken stack (stops at the offending commit) and a clean one.
+
+  Two traps are recorded with it, because each cost real time: an aborted `--exec` leaves a
+  `rebase-merge` directory, and a later `git rebase --abort` then rewinds the *branch* to that stale
+  state; and a CHANGELOG resolver using `str.replace(old, new, 1)` reports success by returning a
+  string whether or not it matched — the same silent-no-op class as PowerShell's `-replace` treating
+  `$` as a group reference, which no-opped a defect injection earlier in this series and briefly made
+  a gate look like it had fired when it had not.
+
+  **Concurrent releases now have a written protocol**, after four version collisions between two
+  sessions in one day. Each session claims a contiguous block and allocates only inside it, with two
+  rules that are the whole content: claim the block **above the current tip** (a block below `HEAD`'s
+  version is spent, because the `VERSION` stamp must stay monotonic — which is why the earlier
+  `2.165`–`2.174` claim had to be re-claimed as `2.185`–`2.194`), and on a collision **the pushed side
+  wins**. The second is deliberately asymmetric: it is decidable without either party knowing the
+  other's state, which is the only property that survives a race, whereas alternating who absorbs the
+  cost needs shared memory of whose turn it is.
+
+  Docs and one test docstring only — no engine code, no emitted-output change.
+
 - **`tableau-migration` (skill `2.176.0` → `2.177.0`): a conditional-colour rule can compare
   against a Tableau PARAMETER.** "Colour it red when it is above `[Threshold]`" is the canonical
   parameter-driven colour in Tableau, and the rule declined on it: the rung-1 resolver knew

@@ -22,6 +22,16 @@ It is mechanically checkable from the CHANGELOG alone, so it should be a gate ra
 
 Skips rather than fails when the repo layout is absent (an installed-skill context has no root
 ``CHANGELOG.md``), matching ``test_mirror_parity``.
+
+ONE THING THIS MODULE CANNOT DO FOR YOU: it only ever runs where pytest runs, which is normally the
+TIP of a branch. The CHANGELOG is a file every commit rewrites, so a stack can satisfy every
+invariant here at HEAD and violate them one commit down -- measured on a renumbered two-commit stack
+whose tip was correct and whose parent still declared the pre-renumber predecessor. The invariant was
+present; the execution point was missing. Run it across a stack explicitly::
+
+    git rebase --exec "cd skills/tableau-migration && py -3.11 -m pytest tests/test_changelog_version_chain.py -q" origin/main
+
+See the versioning section of ``AGENTS.md``.
 """
 
 import os
