@@ -174,13 +174,25 @@ def test_the_required_role_table_matches_the_validator_that_enforces_it():
 
     Harvested, not authored. If the catalog ever disagrees, this table is the thing that is wrong.
     """
-    assert M._REQUIRED_ROLES["clusteredColumnChart"] == ("Category", "Y")
-    assert M._REQUIRED_ROLES["scatterChart"] == ("X", "Y")
-    assert M._REQUIRED_ROLES["kpi"] == ("Indicator",)
-    assert M._REQUIRED_ROLES["pivotTable"] == ("Values",)
-    assert M._REQUIRED_ROLES["cardVisual"] == ("Data",)
-    assert M._REQUIRED_ROLES["decompositionTreeVisual"] == ("Analyze",)
-    assert "someFutureVisual" not in M._REQUIRED_ROLES
+    import pbir_lint
+
+    table = pbir_lint.REQUIRED_ROLES
+    assert table["clusteredColumnChart"] == ("Category", "Y")
+    assert table["scatterChart"] == ("X", "Y")
+    assert table["kpi"] == ("Indicator",)
+    assert table["pivotTable"] == ("Values",)
+    assert table["cardVisual"] == ("Data",)
+    assert table["decompositionTreeVisual"] == ("Analyze",)
+    assert "someFutureVisual" not in table
+
+
+def test_the_emitter_and_the_linter_read_the_same_table():
+    """One table, two consumers -- the emitter that must not produce an invalid visual and the
+    linter that must not let one through. Two copies would drift, and a gate drifting away from the
+    emitter it guards is exactly what #137 was."""
+    import pbir_lint
+
+    assert M._required_roles_table() is pbir_lint.REQUIRED_ROLES
 
 
 def test_a_field_parameter_binding_satisfies_a_required_role():

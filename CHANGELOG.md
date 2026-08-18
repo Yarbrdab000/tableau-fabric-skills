@@ -14,6 +14,47 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.166.0` → `2.167.0`): the linter catches structurally-invalid PBIR
+  the engine can emit — `pbir_lint` R9, required roles.** Raised in #144 as the systemic gap that let
+  #143 ship green: a run graded `definition_of_done: warn` / `0 error` / `Viz=built` over a report
+  that `powerbi-report-author validate` refused with `PBIR_ROLE_REQUIRED_MISSING` and exit 1.
+
+  The reporter framed the boundary exactly right, and R9 is the missing half of a pair that is worth
+  reading together:
+
+  - `lint_visual_model_bindings` covers *validate is blind and we can see* — a binding to a model
+    object that does not exist validates clean and renders **empty**.
+  - **R9** covers the reverse, *validate can see and we were blind* — a missing required role is
+    **structurally invalid**, and the only tool that reported it was an opt-in npm pre-gate an
+    ordinary run never reaches.
+
+  **Their recommended option 1 was not taken, because it rests on the same premise #143 disproved.**
+  "Don't drop — bind the stub" assumes a stubbed calc is what gets dropped. Measured: an emitted
+  `= BLANK()` stub **binds normally**; only a reference the model did not emit *at all* is dropped,
+  and there is nothing to bind in that case. Option 2 (this rule) is what shipped, as the standing
+  gate behind the 2.166.0 emitter fix. Option 3 (default-on, binding `--validate`) is a separate
+  defaults decision and is not taken here.
+
+  `REQUIRED_ROLES` now lives in `pbir_lint` as the **single source of truth** and `migrate_estate`
+  reads it rather than keeping a copy — two tables would drift, and a gate drifting away from the
+  emitter it guards is precisely what #137 was. A test asserts both consumers read the same object.
+
+  Scoped so that "cannot judge" never becomes "declare invalid": an unrecognised `visualType` is not
+  judged; a role held by a `fieldParameters` binding counts as occupied (the rescue path builds
+  exactly that); and a visual emitted with **no query at all** — the deliberate placeholder an
+  emptied visual becomes — is not flagged, otherwise the 2.166.0 fix would trip the 2.167.0 gate and
+  the two would deadlock.
+
+  **Two existing test fixtures were structurally invalid and are corrected, not the assertions.**
+  R9 flagged a `clusteredColumnChart` with no `Y` and a `barChart` with no `Y` in
+  `test_pbir_lint.py`; both were incidental to what those tests assert. The fixtures now carry a
+  known-good `Y` that resolves cleanly, so **every assertion is unchanged** — no test was weakened to
+  accommodate the rule. A malformed-input test also caught a real robustness bug in the new rule (a
+  non-dict `query` raised), now hardened.
+
+  Corpus: 29/29, definition of done unchanged, **R9 fires on 0 of 29 workbooks**, and a masked
+  whole-tree diff against the previous build is **empty** (1384 files vs 1384, 0 differing).
+
 - **`tableau-migration` (skill `2.165.0` → `2.166.0`): a visual that loses a required role is
   emptied, not shipped as structurally invalid PBIR.** Raised in #143. The symptom is real and
   reproduced: `powerbi-report-author validate` fails pristine engine output with
