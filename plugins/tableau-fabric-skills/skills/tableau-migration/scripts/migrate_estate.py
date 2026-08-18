@@ -3492,15 +3492,30 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
         # estate already built the matching published datasource, rebuild the model from THAT real
         # schema -- carrying the workbook's own calculated fields so its view-local measures
         # translate -- and bind the report to it. Never guesses (a real datasource-name match is
-        # required); any failure keeps the honest skip below (warn-never-wrong). Skipped for a
-        # pre-combined descriptor (its islands are already real schemas -- a fallback there is a
-        # genuinely-undoable shape, so it stubs loud below).
-        if descriptor is None:
-            recovered = _rebuild_from_published_match(wb_detail, twb_text, model_safe, ds_catalog,
-                                                      approved_calc_dax=approved_calc_dax)
-            if recovered is not None:
-                res = recovered
-                res_report = res.get("report") or {}
+        # required); any failure keeps the honest skip below (warn-never-wrong).
+        #
+        # NO ``descriptor is None`` GATE (#155). It used to skip recovery whenever a combined /
+        # federated descriptor was present, on the rationale that "its islands are already real
+        # schemas -- a fallback there is a genuinely-undoable shape". A reader measured the
+        # counter-example: a published datasource PLUS one small embedded federated datasource is
+        # both things at once, and the workbook was skipped entirely with "co-migrate its published
+        # datasource" while the published rebuild was sitting there available -- 52 measures / 86.5%
+        # translated once the gate was bypassed.
+        #
+        # Removing it cannot loosen the safety model, and the reason is structural rather than a
+        # judgement call: this branch only runs when ``res_report["fallback"]`` is already set, i.e.
+        # the model HAS ALREADY FAILED. The gate therefore never protected a good model -- it only
+        # decided whether to attempt a recovery on a build that had nothing left to lose. The three
+        # guards that do the protecting live in the callee, which takes no ``descriptor`` at all: a
+        # catalog must exist, the binding signal must be ``published``, and the name must match
+        # exactly one non-ambiguous entry. It returns None otherwise and the honest skip below
+        # stands. A caller-side condition the callee never asked for is a second predicate that can
+        # disagree with the first -- the same shape as a gate keyed on a proxy.
+        recovered = _rebuild_from_published_match(wb_detail, twb_text, model_safe, ds_catalog,
+                                                  approved_calc_dax=approved_calc_dax)
+        if recovered is not None:
+            res = recovered
+            res_report = res.get("report") or {}
         if res_report.get("fallback"):
             _dec = res_report.get("storage_decision") or {}
             rationale = _dec.get("rationale") or "undoable shape"

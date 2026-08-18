@@ -12,6 +12,47 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.227.0` → `2.228.0`): a caller-side gate stricter than the callee it
+  guards no longer discards whole workbooks (#155).** `_build_datasource_pbip` wrapped the
+  published-datasource recovery in `if descriptor is None:`, skipping it whenever a combined /
+  federated descriptor was present. The reader measured the counter-example: **a published datasource
+  PLUS one small embedded federated datasource is both things at once**, and such a workbook was
+  skipped entirely — *"published-datasource workbook — co-migrate its published datasource"* — while
+  the published rebuild sat there available. Bypassing the gate and changing nothing else produced
+  **52 measures / 86.5% translated, 16 calculated columns / 93.8%**.
+
+  Verified against current code before acting, not taken from the report (it was filed against
+  2.151.0): the gate is still at the call site, and `_rebuild_from_published_match` still takes no
+  `descriptor` parameter at all.
+
+  **Removing it cannot loosen the safety model, and the argument is structural rather than a
+  judgement call.** That branch only runs when `res_report["fallback"]` is already set — *the model
+  has already failed*. The gate therefore never protected a good model; it only decided whether to
+  attempt a recovery on a build with nothing left to lose. All the protection lives in the callee,
+  which is fail-closed three ways: a catalog must exist, the binding signal must be `published`, and
+  the name must match exactly one non-ambiguous entry. Anything else returns `None` and the honest
+  skip stands.
+
+  The general shape is the one this repo keeps rediscovering: **a caller-side condition the callee
+  never asked for is a second predicate that can disagree with the first**, and it will be the one
+  nobody re-derives. Its stated rationale — *"its islands are already real schemas, so a fallback
+  there is a genuinely-undoable shape"* — was a plausible inference that a single real workbook
+  falsified.
+
+  Tests pin the safety where it actually lives: the callee's signature carries no `descriptor`, each
+  of its three guards refuses independently, and the caller no longer gates on `descriptor`. That
+  last one reads the calling function's source and **says so** — a behavioural test would need a
+  published + federated workbook and the corpus has none, so it asserts the narrower thing it can
+  prove rather than implying more.
+
+  **Clause 3 clean on the first attempt** (both trees patched from the start): reintroducing the gate
+  gives `1 failed, 4962 passed` — the single failure is the new test, so nothing else in the suite
+  notices.
+
+  Suite 4957 → **4963**.
+
 ### Added
 
 - **`tableau-migration` (skill `2.226.0` → `2.227.0`): a visual that projects an inert `BLANK()` stub
