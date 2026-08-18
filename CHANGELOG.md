@@ -14,6 +14,47 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.160.0` → `2.162.0`): a self-check that evaluated nothing no longer
+  reports an affirmative pass.** Raised in #141, and the reporter did two unusually careful things
+  worth recording: they explicitly withdrew the larger change I had declined on #133 rather than
+  re-litigating it, and they asked me to spend a minute confirming on the corpus rather than let them
+  claim a result they had not run. Both were right calls.
+
+  `endpoints_distinct` has **three** ways of not running, and only two were detectable. A caller
+  supplying no expected count, or a count of `1`, leaves the key **absent** — recoverable by an
+  operator who knows to look. But entering the branch and resolving no parameter groups still wrote
+  `endpoints_distinct: true`, so *"evaluated, model is clean"* and *"could not evaluate anything"*
+  were indistinguishable. Since this check's own failure text is *"this model refreshes successfully
+  and returns wrong data"*, overstating how often it ran is the worst available direction to be wrong.
+
+  **Confirmed on the corpus, and the answer is worse than the report predicted.** The reporter
+  expected the three flat-file multi-datasource workbooks named in my own code comment. Measured:
+  those three do report an affirmative pass having read nothing — they emit **no
+  `definition/expressions.tmdl` at all**, so the regex scans an empty string. But the aggregate is
+  starker. Of 29 corpus workbooks, `endpoints_distinct` **genuinely evaluated on zero**: 26 never
+  enter the branch (single upstream) and 3 enter it and resolve nothing. The operator question the
+  issue poses — *"on how many of my models did the collapse check actually evaluate anything?"* — had
+  no answer before, and on this corpus the honest answer is **none of them**.
+
+  **The flat-file exemption is correct and untouched.** An island reaching its source through a
+  literal `File.Contents(...)` path legitimately declares zero parameter groups, and reading that as
+  "collapsed to zero endpoints" would be a false positive. Only the reporting of the non-answer
+  changed.
+
+  Implemented as the reporter's **option 2** — an additive sibling key — because that is also what
+  the repo's own schema contract requires: report changes add keys, they never rename or remove
+  them. Their option 1 changes the value's type and option 3 removes the key in case 3, which would
+  silently change what an *absent* key means for anything already reading the payload. `ok`,
+  `checks` and `issues` are untouched, and the corpus confirms it: **the `checks` dict changed on 0
+  of 29 workbooks** and the definition of done is identical (29 bound, 0 failed, 23 warned).
+
+  Entries follow the same shape as `issues` (`check` + prose) rather than the flat list suggested,
+  for consistency with the existing payload; the flat roster an aggregate wants is
+  `[e["check"] for e in selfcheck["not_evaluated"]]`, and a test pins that. The guard that matters
+  most is `test_a_genuine_collapse_still_fails_and_is_not_excused`: the whole risk of this change is
+  muting a true failure by routing it through the new key, so a real collapse must still fail, still
+  raise its issue, and still be absent from `not_evaluated`.
+
 - **`tableau-migration` (skill `2.159.0` → `2.160.0`): on-prem Tableau Server is stated as supported
   and partly gated, instead of working by accident.** Raised in #140, where the reporter did the
   unusual and useful thing of correcting their own field report before filing — the help text is not

@@ -372,7 +372,24 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
     # matches ``_connection_identity``'s content identity, so two named connections that genuinely
     # describe the same upstream legitimately collapse to one group and do NOT trip the check.
     # Fail-closed: skipped entirely unless the caller supplies ``expected_endpoints``.
+    #
+    # ``not_evaluated`` (#141): this check has THREE ways of not running, and before that key existed
+    # only two of them were detectable. A caller that supplies no count, or a count of 1, leaves the
+    # key ABSENT -- recoverable by an operator who knows to look. But the third way, entering the
+    # branch and finding no parameter groups, still wrote ``endpoints_distinct: true`` at the
+    # assembly site below, so "evaluated, model is clean" and "could not evaluate anything" were
+    # indistinguishable. Measured on the 29-workbook corpus: 3 models report an affirmative pass
+    # having read nothing at all -- they emit no ``expressions.tmdl`` whatsoever. Since this check's
+    # own failure text is "this model refreshes successfully and returns wrong data", overstating how
+    # often it ran is the single worst direction to be wrong in.
     endpoints_ok = True
+    endpoints_not_evaluated = None
+    if expected_endpoints is None:
+        endpoints_not_evaluated = ("the caller supplied no expected endpoint count, so there is "
+                                   "nothing to compare the model against")
+    elif int(expected_endpoints) <= 1:
+        endpoints_not_evaluated = ("the source declares a single upstream, so endpoints cannot "
+                                   "collapse onto each other")
     if expected_endpoints is not None and int(expected_endpoints) > 1:
         groups = {}
         for m in _ENDPOINT_DECL_RE.finditer(parts.get("definition/expressions.tmdl") or ""):
@@ -385,7 +402,15 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
         # measured on the corpus, which is entirely flat-file and where three multi-datasource
         # workbooks (Excel+Access, and two multi-file consolidations) tripped it. The check is about
         # PARAMETERISED endpoints; with none present it has nothing to say and stays silent.
-        if resolved and len(resolved) < int(expected_endpoints):
+        #
+        # The exemption is correct and stays. What changes is only how the NON-ANSWER is reported:
+        # silence is now recorded as such rather than published as a pass.
+        if not resolved:
+            endpoints_not_evaluated = (
+                "the model declares no parameterised endpoints, so there is nothing to compare -- a "
+                "flat-file island reaches its source by literal path inside the partition rather "
+                "than through a shared parameter, so zero groups is legitimate, not a collapse")
+        elif len(resolved) < int(expected_endpoints):
             endpoints_ok = False
             issues.append({
                 "check": "endpoints_distinct",
@@ -583,4 +608,20 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
                 })
         checks["eager_calc_refs_resolve"] = eager_ok
 
-    return {"ok": not issues, "checks": checks, "issues": issues}
+    # ``not_evaluated`` (#141) states a NON-ANSWER positively instead of leaving it to be inferred.
+    # Additive by construction: ``ok``, ``checks`` and ``issues`` are untouched and keep their exact
+    # meanings, so no existing consumer changes behaviour. Entries follow the same shape as
+    # ``issues`` (``check`` + prose), and the flat roster an aggregate wants is
+    # ``[e["check"] for e in selfcheck["not_evaluated"]]``.
+    #
+    # Note ``endpoints_distinct`` is still written to ``checks`` exactly as before when the branch is
+    # entered -- deliberately. Removing it there would be the smaller diff and gives the tidier
+    # invariant ("present => evaluated"), but it would change the meaning of an ABSENT key for
+    # anything already reading this payload, and the report schema is additive-only. Cross-reference
+    # the two keys for the tri-state: a check named here did not run, whatever ``checks`` says.
+    not_evaluated = []
+    if endpoints_not_evaluated:
+        not_evaluated.append({"check": "endpoints_distinct",
+                              "reason": endpoints_not_evaluated})
+    return {"ok": not issues, "checks": checks, "issues": issues,
+            "not_evaluated": not_evaluated}
