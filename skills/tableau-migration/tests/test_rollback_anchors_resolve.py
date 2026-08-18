@@ -107,6 +107,54 @@ def test_every_rollback_anchor_names_a_reachable_commit(repo):
         + "\n  ".join(orphaned))
 
 
+def test_every_released_version_has_an_anchor(repo):
+    """Every version in the CHANGELOG must HAVE a ``rollback/pre-v`` tag.
+
+    The sibling test above proves each anchor that EXISTS is reachable. It cannot prove one exists,
+    and absence is the failure this catches -- discovered the hard way.
+
+    WHY AN ANCHOR VANISHES WITHOUT ANYONE MISREPORTING: ``git rev-parse --git-common-dir`` is the
+    SAME ``.git`` for every worktree, so ``refs/tags`` is a single GLOBAL namespace shared by every
+    parallel session. Two sessions that collide on a version number therefore also collide on its
+    anchor name -- one slot, last writer wins. Observed live: session A cut
+    ``rollback/pre-v2.211.0``; session B's identical ``git tag -a`` failed with "already exists",
+    B read it as leftover from its own discarded renumber, deleted it and re-cut at B's commit;
+    A later renumbered away from 2.211.0 and deleted that tag in cleanup -- by then B's. Each
+    session destroyed the other's anchor while truthfully reporting its own as verified.
+
+    Two rules follow, and the second is why this test exists:
+      * never ``git tag -d`` an anchor you did not create (``%(taggerdate)`` tells you in one call);
+      * a version with no anchor is a release with no rollback, so assert it rather than remember it.
+
+    Reads the CHANGELOG's own ``(skill `A` -> `B`)`` chain as the roster of shipped versions, so the
+    roster cannot drift from what was actually released.
+    """
+    import io
+    import re
+
+    path = os.path.join(repo, "CHANGELOG.md")
+    if not os.path.isfile(path):
+        pytest.skip("no CHANGELOG.md in this checkout")
+    text = io.open(path, encoding="utf-8").read()
+    released = []
+    for m in re.finditer(r"\(skill\s+`(\d+\.\d+\.\d+)`\s*\u2192\s*`(\d+\.\d+\.\d+)`\)", text):
+        if m.group(2) not in released:
+            released.append(m.group(2))
+    if not released:
+        pytest.skip("no versioned CHANGELOG entries found")
+
+    tags = set(_tag_commits(repo))
+    missing = [v for v in released if ("rollback/pre-v" + v) not in tags]
+
+    assert not missing, (
+        "released version(s) with no rollback anchor -- `git reset --hard rollback/pre-vX.Y.Z` has "
+        "nothing to resolve, so these releases cannot be backed out:\n  "
+        + "\n  ".join(missing)
+        + "\n\nrefs/tags is shared across ALL worktrees of this repo (one .git), so a parallel "
+          "session can delete an anchor it believes is its own. Re-cut at the release's PARENT "
+          "commit, and never delete an anchor you did not create.")
+
+
 def test_anchor_names_parse_as_semver(repo):
     """A malformed anchor name is unfindable by the runbook's own convention.
 

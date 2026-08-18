@@ -14,6 +14,30 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.213.0` → `2.214.0`): a released version with no rollback anchor now
+  fails the suite.** The 2.205.0 gate proves every anchor that EXISTS names a reachable commit. It
+  cannot prove one exists — and absence turned out to be the live failure, with a cause neither
+  parallel session had named.
+
+  `git rev-parse --git-common-dir` is the **same `.git` for every worktree**, so `refs/tags` is a
+  single GLOBAL namespace shared by all parallel sessions. Two sessions colliding on a version number
+  therefore also collide on its anchor name: one slot, last writer wins. Reconstructed from tagger
+  dates: session A cut `rollback/pre-v2.211.0`; session B's identical `git tag -a` failed with
+  *"already exists"*, B read it as leftover from its own discarded renumber, deleted it and re-cut at
+  B's commit; A later renumbered away from 2.211.0 and deleted that tag during cleanup — by then B's.
+  **Each session destroyed the other's anchor while truthfully reporting its own as verified**, and
+  each then read the other's as "reported but absent".
+
+  `test_every_released_version_has_an_anchor` reads the CHANGELOG's own `(skill A → B)` chain as the
+  roster of shipped versions — so the roster cannot drift from what was actually released — and
+  asserts each has a matching `rollback/pre-v` tag. **Proved it can fail** by deleting a real anchor
+  and watching it name the exact version, then restoring it; a gate that has never been seen to fail
+  is indistinguishable from one that cannot.
+
+  The two rules this makes enforceable rather than remembered: never `git tag -d` an anchor you did
+  not create (`%(taggerdate)` identifies the owner in one call), and a version with no anchor is a
+  release with no rollback.
+
 - **`tableau-migration` (skill `2.212.0` → `2.213.0`): a Tableau parameter inside Custom SQL no
   longer ships a query the source cannot parse.** Corpus workbook
   **`0136_custom_sql_prefix_and_params`** — built to spec by the tool's own user against a live
