@@ -5123,6 +5123,29 @@ def _dod_openability_failure(w):
         first = (problems or ["(unnamed)"])[0]
         return ("report binds %d model object(s) that do not exist: %s"
                 % (dangling["count"], str(first)[:220]))
+    # A dangling ``SelectRef`` is the same class again, one level further in: a formatting property
+    # points at a projection the visual does not declare, so the property resolves to nothing and
+    # the visual renders with its DEFAULT colours -- validate returns 0 errors and the run reports
+    # success. pbir_lint R8 has detected this since 2.176.0, but it only began running during an
+    # actual migration in 2.190.0; until then it guarded the test suite. Escalated only now that it
+    # both RUNS and is measured green: 0 of 29 workbooks report a lint problem, so this is inert on
+    # green and can only fire on a real regression -- the same sequencing as the dangling-binding
+    # escalation above (fix what fires, prove zero, THEN escalate).
+    #
+    # Which findings are fatal is owned by ``pbir_lint`` (``SILENT_RENDER_FINDINGS``) rather than
+    # decided here, so a rule added there becomes fatal with no change on this side and the two can
+    # never disagree about it.
+    lint = w.get("viz_lint") or {}
+    if isinstance(lint, dict) and lint.get("problems"):
+        try:
+            import pbir_lint as _pl
+            fatal_marks = tuple(_pl.SILENT_RENDER_FINDINGS)
+        except Exception:
+            fatal_marks = ()
+        for problem in lint.get("problems") or []:
+            text = str(problem)
+            if any(mark in text for mark in fatal_marks):
+                return ("report is not faithfully bound: %s" % text[:260])
     # A page-less REPORT is the same class of defect on the other side of the project: Power BI
     # Desktop does not open it as an empty report, it throws ``TypeError: Cannot read properties of
     # undefined (reading 'visualContainers')`` and the whole project -- including the model that IS

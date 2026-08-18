@@ -14,6 +14,37 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.195.0` → `2.196.0`): a dangling `SelectRef` fails the definition
+  of done, and `pbir_lint` owns which findings are fatal.** R8 detects a formatting property pointing
+  at a projection the visual does not declare: the property resolves to nothing, the visual renders
+  with its DEFAULT colours, `powerbi-report-author validate` returns zero errors and the run reports
+  success. That is the validate-clean/render-wrong class, so it must fail LOUD rather than be
+  softened to a fidelity warning.
+
+  * **Sequenced deliberately, and only possible now.** R8 shipped in `2.176.0`, but `lint_pbir_parts`
+    was reached by 0 of 29 workbooks during an actual migration until `2.190.0` wired it -- so until
+    then the rule guarded the test suite, not the estate path. This escalates only now that it both
+    RUNS and is measured green: 0 of 29 workbooks report a lint problem, so it is inert on green and
+    can only fire on a real regression. Same order as the `2.154.0` dangling-binding escalation: fix
+    what fires, prove zero, THEN escalate.
+
+  * **Which findings are fatal is owned by `pbir_lint`, not decided by the consumer.**
+    `SILENT_RENDER_FINDINGS` is exported and R8 stamps its own signature into the message it emits,
+    so the roster and the text cannot drift apart. Deciding it in `migrate_estate` by matching prose
+    would be a proxy for "which rule fired" -- the same proxy-versus-artifact mistake `REQUIRED_ROLES`
+    exists to avoid. A rule added to the roster becomes fatal with no change on the other side.
+
+  * **Escalation ORDER is pinned by test.** An unopenable model and a dangling model binding both
+    still outrank the new check, and a page-less report is still reported when the lint is clean --
+    a gate that silently stops evaluating is the defect this whole line keeps re-finding.
+
+  * **Proved by injecting the real defect into a REAL emitted visual, not a fixture.** Control: the
+    unmodified corpus output of `0070_new_max` yields 0 lint problems and no failure. Injection:
+    renaming the declared projection on that same visual so its `SelectRef` no longer resolves
+    yields 1 problem and a `failed` definition of done naming the file and the reference. A gate
+    proved only against a synthetic fixture repeats the `#137` mistake -- a test asserting a signal
+    whose production never happens.
+
 - **`tableau-migration` (skill `2.190.0` → `2.195.0`): a colour twin the shipped report does not
   reference is retired.** A colour twin is a hex-returning model measure the report binds through
   Field-value conditional formatting (rung 3). Rungs 1 and 4 -- a native `Conditional`, and a
