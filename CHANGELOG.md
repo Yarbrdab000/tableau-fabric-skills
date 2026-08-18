@@ -12,6 +12,54 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+
+- **`tableau-migration` (skill `2.187.0` → `2.188.0`): rung 4 is wired -- a view-scoped colour
+  driver now paints, through a declared Visual Calculation.** "Highlight the bar that set a new
+  record" compares a mark against the OTHER marks in the view, so it has no rung-1 form and was
+  deferred. It now emits, bound by `SelectRef`; the inline form was refuted by render (validates
+  clean, paints nothing). Lands on top of `2.186.0`, never over the active trellis defect.
+
+  * **THE EARLIER DIAGNOSIS WAS WRONG, and the stale text is corrected here.** The reverted first
+    attempt was recorded as "a projection appended to the query state does not survive -- the emit
+    sites build it more than once, so the mutation lands on a discarded object", and that claim
+    reached a shipped CHANGELOG entry, two code comments and a test comment. Measured directly by
+    appending a marker projection: it DOES survive, into both the pre-rebind and the final tree.
+    `emit_pbir` does run twice, but over two output trees, each with its own state. The actual
+    cause was that the append targeted a single hard-coded role -- a chart's measures live in `Y`,
+    a matrix's in `Values` -- so on every visual lacking that role the append silently no-opped
+    while the formatting property still emitted a `SelectRef` naming it. That is the unexplained
+    "HALF the visuals". The refuting experiment took one run; the wrong explanation was an
+    inference recorded in the register reserved for measurement.
+
+  * **`_declare_colour_projection` picks a role that exists, or returns `None`.** Measure roles
+    only (`Values`, `Y`, `Y2`, `X`) -- declaring a calculation in a dimension role validates clean
+    and is semantically wrong. `None` means DEFER, never "emit anyway", pinned by test. The
+    declaration is idempotent, so an emitter reached twice reuses the calculation instead of
+    computing the same window twice in the field list.
+
+  * **`pbir_lint` R8 caught its own author.** The first wiring in this change shipped a genuine
+    dangling `SelectRef` and R8 failed the suite on it. That is the strongest available argument
+    against scoping R8 down later.
+
+  * **Proven by render, with a DISCRIMINATING probe.** The shipped semantics paint all four bars of
+    `0070_new_max` orange, which is CORRECT -- sales rise monotonically, so under a running max
+    every year set a record -- and proves nothing on its own, because an ignored `SelectRef` plus
+    an authored orange mark colour looks identical. Two controls force the hypotheses apart. The
+    workbook's own `Challenge` page (same data, same chart, no colour calc) renders BLUE. Then the
+    built DAX was repointed from the running max `WINDOW(1, ABS, 0, REL)` to the whole-partition
+    max `WINDOW(1, ABS, -1, ABS)` and reopened cold: exactly ONE bar (2013, the tallest) came back
+    orange, three blue. That establishes per-mark evaluation, a reference that resolves, and the
+    window BOUND selecting which marks paint -- and independently re-confirms that reading
+    `WINDOW_MAX(x, FIRST(), 0)` as the whole partition turns "every bar that set a record" into
+    "only the tallest".
+
+  * **Corpus, with its operands named.** `corpus/b187` (built from `2.187.0`) vs `corpus/v187`
+    (built from this commit): only `0070_new_max`'s two visuals differ, plus `report.json` and
+    `summary.md`; no shape change, since `2.187.0` already carries the trellis fix. `SelectRef` was
+    0 of 519 emitted visuals and is now 2, with **0 dangling** corpus-wide -- one entry off the
+    zero-coverage roster.
+
 ### Fixed
 
 - **`tableau-migration` (skill `2.186.0` → `2.187.0`): a measure trellis is inferred from the

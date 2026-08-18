@@ -7491,7 +7491,11 @@ def _detect_measure_trellis(ws, state):
     so its Visual Calculation can reference it inferred a trellis the shelf does not describe, and
     emitted TWO side-by-side charts where Tableau draws one pane -- the second of them drawing a
     projection explicitly marked ``hidden``. ``0088`` had the same shape. Corpus-wide this invented
-    five bands.
+    three bands.
+
+    The colour Visual Calculation now adds a hidden projection too, which is what makes this
+    exclusion load-bearing rather than merely tidy: without it, every view-scoped colour would
+    turn its chart into a spurious two-band trellis.
     """
     if ws["visual_type"] not in (VT_BAR, VT_COLUMN):
         return None
@@ -7561,7 +7565,13 @@ def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
             # Slots consumed before this band: the gutter band is two columns wide.
             xk, yk, wk, hk = x + (k if k == 0 else k + 1) * u, y, (2 * u if cat_shown else u), h
         sub_state = dict(state)
-        sub_state["Y"] = {"projections": [proj]}
+        # Each band keeps its OWN single measure -- plus any HIDDEN projection the parent declared,
+        # because a formatting property may already reference one by ``SelectRef``. Dropping those
+        # here is what made the first rung-4 attempt ship a dangling reference on exactly the
+        # trellis bands (the property travelled in ``data_point_objects``, the projection did not).
+        # A hidden projection is never a visible band measure, so carrying it changes nothing else.
+        hidden = [p for p in (state.get("Y") or {}).get("projections", []) if p.get("hidden")]
+        sub_state["Y"] = {"projections": [proj] + hidden}
         # Each band replaces Y with its OWN single measure, so a sort-by measure that was bound in
         # the parent's multi-measure Y is unbound in every other band -- and an unhonoured sort
         # still suppresses Power BI's default one, which would break exactly the row alignment this
@@ -8276,8 +8286,24 @@ def _matrix_discrete_measure_colour(ws, state, model_table, field_map, warnings,
     if color.get("kind") != "value" or color.get("binding") not in ("aggregation", "measure"):
         return None, None
     if _is_view_level_calc(color):
-        # RUNG 4 IS NOT WIRED HERE YET -- see the chart path for why (a declared projection appended
-        # to ``state`` at this point does not survive to the emitted visual).
+        # RUNG 4: a view-scoped driver ("colour the lowest cell") has no rung-1 form, because the
+        # comparison is against the OTHER marks in the view. It survives only as a Visual
+        # Calculation, declared as a hidden projection and referenced by ``SelectRef`` -- the
+        # inline form was refuted by render (validates clean, paints nothing).
+        values = (state.get("Values") or {}).get("projections", [])
+        dax = _discrete_colour_visual_calc(
+            ws, color, values, model_table, field_map, param_values) if values else None
+        qref = _declare_colour_projection(state, dax)
+        if qref:
+            prop = _cell_colour_property(ws)
+            return ([{"properties": {prop: {"solid": {"color": {
+                          "expr": {"SelectRef": {"ExpressionName": qref}}}}}},
+                      "selector": {"data": [{"dataViewWildcard": {"matchingOption": 1}}],
+                                   "metadata": p["queryRef"]}} for p in values],
+                    {"kind": "cell_discrete_measure_colour", "channel": prop,
+                     "mark": ws.get("mark_class"), "style": "visual_calculation",
+                     "source_measure": color.get("caption"),
+                     "query_ref": qref, "status": "emitted"})
         return None, _discrete_view_scoped_defer(
             ws, color, "cell_discrete_measure_colour", warnings)
     values = (state.get("Values") or {}).get("projections", [])
@@ -9744,6 +9770,56 @@ _COLOUR_VC_NAME = "Colour rule"
 _COLOUR_VC_QUERY_REF = "colourRule"
 
 
+# The measure-bearing query roles, in the order a colour Visual Calculation should claim one. A
+# Visual Calculation is a calculation over the visual's MEASURES, so it must be declared in a
+# measure role -- ``Values`` on a matrix/table, ``Y`` (or ``Y2``/``X``) on a chart. The dimension
+# roles (``Category``/``Rows``/``Columns``/``Series``) are deliberately absent: declaring it there
+# validates clean and is semantically wrong.
+#
+# THIS LIST IS THE FIX FOR A MEASURED DEFECT. The first attempt at rung 4 appended to a single
+# hard-coded role, so on every visual that did not have that role the append silently no-opped
+# while the formatting property still emitted a ``SelectRef`` naming it -- a dangling reference on
+# roughly half of ``0070_new_max``'s visuals, invisible to validation. Hence
+# :func:`_declare_colour_projection` returns ``None`` rather than guessing, and every caller must
+# treat ``None`` as "defer", never as "emit anyway".
+_COLOUR_VC_ROLES = ("Values", "Y", "Y2", "X")
+
+
+def _declare_colour_projection(state, dax):
+    """Declare the hidden colour Visual Calculation on ``state``; return its queryRef or ``None``.
+
+    ``state`` is the very object the emit site passes to :func:`_visual_json`, so appending here IS
+    the binding -- measured end to end: the projection appears in the emitted ``visual.json`` on
+    both the pre-rebind and the final tree.
+
+    Returns ``None`` when the visual carries no measure role to host the calculation, which is the
+    only honest answer: there is nothing to attach it to, so a ``SelectRef`` naming it would dangle.
+    """
+    if not isinstance(state, dict) or not dax:
+        return None
+    role = next((state[r] for r in _COLOUR_VC_ROLES
+                 if isinstance(state.get(r), dict)), None)
+    if role is None:
+        return None
+    # Idempotent: an identical calculation already declared on this visual is REUSED rather than
+    # declared again. The colour emitters can be reached more than once for one visual, and a
+    # second copy is not a correctness bug (both references resolve) but it computes the same
+    # window twice and shows a duplicate entry in Desktop's field list.
+    for existing in role.get("projections", []):
+        nvc = (existing.get("field") or {}).get("NativeVisualCalculation") or {}
+        if nvc.get("Expression") == dax and existing.get("queryRef"):
+            return existing["queryRef"]
+    qref = _colour_vc_query_ref(state)
+    role.setdefault("projections", []).append({
+        "field": {"NativeVisualCalculation": {
+            "Language": "dax", "Expression": dax, "Name": _COLOUR_VC_NAME}},
+        "queryRef": qref,
+        "nativeQueryRef": qref,
+        "hidden": True,
+    })
+    return qref
+
+
 def _colour_vc_query_ref(state):
     """A queryRef for the colour Visual Calculation that no existing projection already uses."""
     used = {p.get("queryRef") for role in (state or {}).values()
@@ -9863,14 +9939,30 @@ def _chart_discrete_measure_fill(ws, state, vtype, model_table, field_map, warni
     if color.get("kind") != "value" or color.get("binding") not in ("aggregation", "measure"):
         return None, None
     if _is_view_level_calc(color):
-        # RUNG 4 IS NOT WIRED HERE YET, deliberately. ``lower_to_visual_calc`` produces correct DAX
-        # (tested), but binding it needs a DECLARED projection, and appending one to ``state`` at
-        # this point does not survive: the emit sites build the query state more than once, so the
-        # mutation lands on an object that is discarded and the property is left referencing a
-        # projection that does not exist. Measured on 0070_new_max: HALF the visuals shipped a
-        # dangling ``SelectRef`` -- the same class of defect 2.152.0/2.154.0 exist to prevent, and
-        # invisible to the binding lint until it learned about SelectRef. Deferring is honest until
-        # the projection is threaded to the emit site rather than mutated in.
+        # RUNG 4: the only mechanism that can express "compare this mark to the OTHER marks in the
+        # view". Bound as a hidden Visual Calculation projection + ``SelectRef``; the inline form
+        # was refuted by render (validates clean, paints nothing).
+        #
+        # The first attempt at this shipped a dangling ``SelectRef`` on roughly half of
+        # ``0070_new_max``'s visuals. The cause was NOT that the mutation is discarded -- measured
+        # since: a projection appended to ``state`` here reaches the emitted ``visual.json`` on
+        # both the pre-rebind and the final tree. It was that the append targeted a role the visual
+        # did not have (a chart has ``Y``, not ``Values``), so it silently no-opped while the
+        # property still emitted. :func:`_declare_colour_projection` picks a measure role that
+        # actually exists and returns ``None`` when there is none, and ``None`` means DEFER.
+        measures = next((state[r] for r in _COLOUR_VC_ROLES
+                         if isinstance(state.get(r), dict)), None)
+        projections = (measures or {}).get("projections", [])
+        dax = _discrete_colour_visual_calc(
+            ws, color, projections, model_table, field_map, param_values) if projections else None
+        qref = _declare_colour_projection(state, dax)
+        if qref:
+            return ([{"properties": {"fill": {"solid": {"color": {
+                          "expr": {"SelectRef": {"ExpressionName": qref}}}}}},
+                      "selector": {"data": [{"dataViewWildcard": {"matchingOption": 0}}]}}],
+                    {"kind": "chart_discrete_measure_fill", "style": "visual_calculation",
+                     "source_measure": color.get("caption"),
+                     "query_ref": qref, "status": "emitted"})
         return None, _discrete_view_scoped_defer(ws, color, "chart_discrete_measure_fill", warnings)
     # RUNG 1 first: a native Rules conditional format on the mark fill -- no model objects.
     rule = _discrete_colour_rule(ws, color, model_table, field_map, param_values)
