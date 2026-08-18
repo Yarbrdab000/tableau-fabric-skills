@@ -242,6 +242,60 @@ def _lint_page_order(parts):
     return problems
 
 
+def _lint_dangling_select_refs(parts):
+    """Validity R8: a ``SelectRef`` must name a projection the SAME visual declares.
+
+    ``{"SelectRef": {"ExpressionName": "colourRule"}}`` is how a formatting property points at an
+    in-visual expression (a Visual Calculation). If no projection carries that ``queryRef`` the
+    property resolves to nothing: the visual renders with default colours, reports no error, and
+    passes ``powerbi-report-author validate``.
+
+    :func:`lint_visual_model_bindings` does not cover this -- it proves MODEL references
+    (``Measure`` / ``Column``) against the emitted TMDL, and a Visual Calculation is not in the
+    model at all. The gap was found the hard way: a first attempt at binding a view-scoped colour
+    appended its projection to a query state that the emit path later rebuilt, so half the visuals
+    of one workbook shipped a ``SelectRef`` naming a projection that did not exist, and every
+    existing gate stayed silent.
+    """
+    problems = []
+    for path in sorted(parts):
+        if not path.endswith("visual.json"):
+            continue
+        doc = _load_json(parts, path)
+        visual = doc.get("visual") if isinstance(doc, dict) else None
+        if not isinstance(visual, dict):
+            continue
+        declared, refs = set(), set()
+        # ``query`` may be any JSON value in a malformed part; guard the type rather than assuming
+        # a dict, or the linter raises on the very input it exists to survive.
+        _query = visual.get("query")
+        state = (_query.get("queryState") if isinstance(_query, dict) else None) or {}
+        if isinstance(state, dict):
+            for role in state.values():
+                for proj in ((role or {}).get("projections") or []):
+                    if isinstance(proj, dict) and proj.get("queryRef"):
+                        declared.add(proj["queryRef"])
+
+        def _walk(node):
+            if isinstance(node, dict):
+                ref = node.get("SelectRef")
+                if isinstance(ref, dict) and isinstance(ref.get("ExpressionName"), str):
+                    refs.add(ref["ExpressionName"])
+                for value in node.values():
+                    _walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    _walk(value)
+
+        _walk(visual)
+        for name in sorted(refs - declared):
+            problems.append(
+                "%s: SelectRef names %r, which this visual does not project -- the property "
+                "resolves to nothing, the visual renders with its defaults and reports no error"
+                % (path, name))
+    return problems
+
+
 def _registered_items(report):
     """Yield each ``RegisteredResources`` item dict, tolerating both the flat
     ``{name,type,items}`` shape the emitter writes and the wrapped ``{resourcePackage:{...}}`` shape
@@ -526,6 +580,7 @@ def lint_pbir_parts(parts, model_surface=None):
     return (_lint_visual_types(parts) + _lint_theme(parts)
             + _lint_card_display_units(parts) + _lint_native_query_refs(parts)
             + _lint_page_order(parts) + _lint_required_roles(parts)
+            + _lint_dangling_select_refs(parts)
             + lint_visual_model_bindings(parts, model_surface))
 
 

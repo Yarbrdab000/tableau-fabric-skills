@@ -14,6 +14,46 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.175.0` → `2.176.0`): a boolean colour driver is a two-member
+  domain, Tableau's window bounds are honoured, and a dangling `SelectRef` is now a lint error.**
+  Rung 4 (view-scoped colour via a Visual Calculation) was wired during this work and then
+  **deliberately reverted** — see below. The pure pieces it needed are sound, tested, and shipped.
+
+  * **A bare boolean expression is a colour rule.** `SUM([Sales]) = WINDOW_MAX(SUM([Sales]))` — the
+    "highlight the bar that set a new max" idiom, and the commonest boolean driver in the corpus —
+    is not an `IF` chain, so the compiler declined it entirely. Tableau paints exactly two swatches
+    for such a pill, so it *is* a categorical encoding, written shorter. Given the declared
+    `datatype == "boolean"`, it now reads as `IF <expr> THEN True ELSE False`. A boolean-declared
+    *field reference* alone is still refused — it is not a predicate.
+  * **Tableau's window bounds change the answer.** `WINDOW_MAX(x, FIRST(), 0)` is a **running**
+    maximum; reading it as the whole partition turns *"every bar that set a new record"* into
+    *"only the tallest bar"* — 4 marks versus 1 on a monotonically rising series, which is exactly
+    `0070_new_max`'s shape. `FIRST()`/`LAST()`/integer offsets now lower to the matching DAX
+    `WINDOW(...)` frame, and a bound that cannot be read declines rather than guessing.
+  * **`pbir_lint` R8: a `SelectRef` must name a projection the same visual declares** -- and it
+    is NOT colour-compiler-specific. The emitter already wrote `SelectRef` from another site
+    that predates this gate (the continuous-gradient path anchors a table/matrix `backColor`
+    FillRule to an outer Visual Calculation's queryRef), sharing the same hazard: one code path
+    naming a projection a different code path must declare. Measured across the corpus: 519
+    emitted `visual.json` files, **0** SelectRef references -- neither path fires on corpus
+    input, so the exposure is real and has no regression coverage. The gate is the only thing
+    standing under it. A property
+    pointing at an in-visual expression that no projection carries resolves to nothing — the visual
+    renders with its defaults, reports no error, and passes `validate`. `lint_visual_model_bindings`
+    could never have caught it: it proves MODEL references, and a Visual Calculation is not in the
+    model.
+
+  **Why rung 4 is still not wired.** `lower_to_visual_calc` produces correct DAX, but binding it
+  needs a *declared* projection, and appending one to the query state inside the colour emitter does
+  not survive — the emit sites build that state more than once, so the mutation lands on an object
+  that is discarded. Measured on `0070_new_max`: **half the visuals shipped a dangling `SelectRef`**,
+  the same class of defect `2.152.0`/`2.154.0` exist to prevent, and every existing gate stayed
+  silent. Reverted rather than shipped half-working; the projection has to be threaded to the emit
+  site instead. R8 is the gate that would have caught it, and now will.
+
+  Corpus unchanged (29/29, dangling 0, no visual drift).
+
+
 - **`tableau-migration` (skill `2.167.0` → `2.175.0`): the conditional-colour compiler is WIRED —
   a string-member colour calc now paints cells and marks natively, with nothing added to the
   model.** The three preceding releases were inert by construction; this is the one that changes

@@ -8260,6 +8260,8 @@ def _matrix_discrete_measure_colour(ws, state, model_table, field_map, warnings)
     if color.get("kind") != "value" or color.get("binding") not in ("aggregation", "measure"):
         return None, None
     if _is_view_level_calc(color):
+        # RUNG 4 IS NOT WIRED HERE YET -- see the chart path for why (a declared projection appended
+        # to ``state`` at this point does not survive to the emitted visual).
         return None, _discrete_view_scoped_defer(
             ws, color, "cell_discrete_measure_colour", warnings)
     values = (state.get("Values") or {}).get("projections", [])
@@ -9680,6 +9682,68 @@ def _discrete_colour_rule(ws, color, model_table, field_map):
         _colour_rule_resolver(ws, model_table, field_map))
 
 
+# The hidden Visual Calculation that carries a view-scoped colour, and its queryRef. Named rather
+# than numbered so it is recognisable in the field list; the queryRef is distinct from the
+# ``select*`` names the quick-table-calc path already claims on the same visual.
+_COLOUR_VC_NAME = "Colour rule"
+_COLOUR_VC_QUERY_REF = "colourRule"
+
+
+def _colour_vc_query_ref(state):
+    """A queryRef for the colour Visual Calculation that no existing projection already uses."""
+    used = {p.get("queryRef") for role in (state or {}).values()
+            for p in (role or {}).get("projections", [])}
+    qref, i = _COLOUR_VC_QUERY_REF, 1
+    while qref in used:
+        i += 1
+        qref = "%s%d" % (_COLOUR_VC_QUERY_REF, i)
+    return qref
+
+
+def _colour_projection_dax_resolver(ws, projections, model_table, field_map):
+    """Build ``resolve(tokens) -> "[Projected Column]"`` for the rung-4 lowering.
+
+    A Visual Calculation addresses the visual's OWN matrix, so its operands are the projected column
+    names, not model objects. Each Tableau leaf is therefore lowered to a PBIR expression exactly as
+    rung 1 would, then matched against the projections this visual already carries -- so an operand
+    is only accepted when the visual really shows it. An operand the visual does not project cannot
+    be referenced from a Visual Calculation at all, and returning ``None`` for it aborts the rule,
+    which is the honest outcome rather than a calculation over a column that is not there.
+    """
+    inner = _colour_rule_resolver(ws, model_table, field_map)
+    by_expr = {}
+    for p in projections or []:
+        native = str(p.get("nativeQueryRef") or "").strip()
+        if native:
+            by_expr.setdefault(_dumps(p.get("field")), native)
+
+    def resolve(toks):
+        expr = inner(toks)
+        if expr is None:
+            return None
+        native = by_expr.get(_dumps(expr))
+        return "[%s]" % native if native else None
+
+    return resolve
+
+
+def _discrete_colour_visual_calc(ws, color, projections, model_table, field_map):
+    """Compile a VIEW-SCOPED colour driver into Visual-Calculation DAX, or ``None``.
+
+    Rung 4: the only mechanism that can express "compare this mark to the other marks in the view".
+    Returns the DAX only; the caller declares it as a hidden projection and binds it by ``SelectRef``
+    (the inline form was refuted by render -- it validates clean and paints nothing).
+    """
+    if _CR is None or not color:
+        return None
+    spec = _CR.analyse_colour_calc(color.get("formula"), datatype=color.get("datatype"))
+    if not spec.supported or not spec.closed_domain:
+        return None
+    return _CR.lower_to_visual_calc(
+        spec, _colour_member_palette(ws, spec.members),
+        _colour_projection_dax_resolver(ws, projections, model_table, field_map))
+
+
 def _discrete_view_scoped_defer(ws, color, kind, warnings):
     """Defer a DISCRETE colour whose driver is a VIEW-level table calc, and say exactly why.
 
@@ -9742,6 +9806,14 @@ def _chart_discrete_measure_fill(ws, state, vtype, model_table, field_map, warni
     if color.get("kind") != "value" or color.get("binding") not in ("aggregation", "measure"):
         return None, None
     if _is_view_level_calc(color):
+        # RUNG 4 IS NOT WIRED HERE YET, deliberately. ``lower_to_visual_calc`` produces correct DAX
+        # (tested), but binding it needs a DECLARED projection, and appending one to ``state`` at
+        # this point does not survive: the emit sites build the query state more than once, so the
+        # mutation lands on an object that is discarded and the property is left referencing a
+        # projection that does not exist. Measured on 0070_new_max: HALF the visuals shipped a
+        # dangling ``SelectRef`` -- the same class of defect 2.152.0/2.154.0 exist to prevent, and
+        # invisible to the binding lint until it learned about SelectRef. Deferring is honest until
+        # the projection is threaded to the emit site rather than mutated in.
         return None, _discrete_view_scoped_defer(ws, color, "chart_discrete_measure_fill", warnings)
     # RUNG 1 first: a native Rules conditional format on the mark fill -- no model objects.
     rule = _discrete_colour_rule(ws, color, model_table, field_map)
