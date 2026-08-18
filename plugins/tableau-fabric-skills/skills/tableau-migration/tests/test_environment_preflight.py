@@ -92,6 +92,26 @@ def test_environment_findings_is_a_list_on_a_healthy_machine(tmp_path):
     assert out == []
 
 
+def test_the_remedy_does_not_require_the_windows_sdk(tmp_path):
+    """The first shipped remedy named `gacutil.exe`, which most machines do not have.
+
+    `gacutil` is part of the **Windows SDK** — absent from a normal analyst machine, and absent from
+    the one this was written on. `System.EnterpriseServices.Internal.Publish.GacInstall` does the
+    same job and ships with .NET Framework itself, which every machine running Power BI Desktop has
+    by definition. A remedy the reader cannot run is not a remedy, and that is a defect in the
+    *instruction* rather than in the detection.
+    """
+    finding = EP.newtonsoft_gac_finding(gac_root=_fake_gac(tmp_path, "6.0.0.0"), is_windows=True)
+    detail = finding["detail"]
+    assert "System.EnterpriseServices" in detail
+    assert "GacInstall" in detail
+    assert "ELEVATED" in detail.upper()
+    # gacutil may be MENTIONED as the inferior alternative, but must not be the primary instruction
+    sdk_free = detail.index("GacInstall")
+    gacutil = detail.index("gacutil") if "gacutil" in detail else len(detail)
+    assert sdk_free < gacutil, "the SDK-free remedy must come first"
+
+
 def test_module_never_writes():
     """THE LOAD-BEARING TEST: this module diagnoses, it does not repair.
 

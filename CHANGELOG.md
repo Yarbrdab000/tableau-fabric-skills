@@ -14,6 +14,33 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.207.0` → `2.208.0`): the remedy we tell the user to run is one they
+  can actually run.** `2.207.0` shipped detection of the Newtonsoft/GAC blocker together with a
+  remedy naming **`gacutil.exe`** — which is part of the **Windows SDK**, absent from a normal
+  analyst machine and absent from the machine that wrote it. That was noted in the same commit and
+  still shipped as the instruction, which made it a remedy the reader mostly cannot follow.
+
+  `System.EnterpriseServices.Internal.Publish` exposes `GacInstall` / `GacRemove` and ships with
+  **.NET Framework itself** — so it is present on every machine that runs Power BI Desktop, by
+  definition. Verified available on the development machine, which has no Windows SDK. The finding
+  now leads with:
+
+  ```powershell
+  Add-Type -AssemblyName System.EnterpriseServices
+  (New-Object System.EnterpriseServices.Internal.Publish).GacInstall('<path to Newtonsoft.Json.dll>')
+  ```
+
+  `gacutil` is still mentioned as the inferior alternative, and a test pins that the SDK-free form
+  comes **first** — because the defect here was not the detection, it was the *instruction*, and an
+  instruction the reader cannot execute is worth very little.
+
+  **The detect-don't-repair boundary is unchanged, and the guidance around it is now explicit**:
+  *offer* to run it, never run it unasked. The GAC is machine-wide and the fix needs elevation, so
+  consent is the point — but consent given to an agent that then runs the command in front of the
+  user is a materially better outcome than handing them a link and walking away.
+
+  Documentation and one detail string — no engine code, no emitted-output change.
+
 - **`tableau-migration` (skill `2.206.0` → `2.207.0`): the run now DETECTS the machine condition that
   makes its own output unopenable, instead of only documenting it.** `2.206.0` wrote the
   Newtonsoft/GAC blocker into troubleshooting; this makes the tool say it, unprompted, at the moment
