@@ -128,6 +128,44 @@ anchor to revert a bad release). Do all three, every time:
    ```
    Rollback is then a one-liner: `git reset --hard rollback/pre-v1.62.0`.
 
+4. **Run the CHANGELOG chain gate on EVERY commit of a rebased stack, not just the tip.**
+   `tests/test_changelog_version_chain.py` asserts that each entry's declared predecessor equals the
+   version produced by the entry beneath it, and that the newest entry matches the shipped `VERSION`.
+   But the suite normally runs only at the tip, and **the CHANGELOG is a file every commit rewrites,
+   so the tip masks its own history**: a stack can be correct at HEAD and stale one commit down.
+   Measured — a two-commit stack whose tip declared the right predecessor had the wrong one at the
+   commit below it, and the gate caught it instantly once actually executed there:
+
+   ```
+   git rebase --exec "cd skills/tableau-migration && py -3.11 -m pytest tests/test_changelog_version_chain.py -q" origin/main
+   ```
+
+   ~0.13s per commit. Run it on any stack you renumber or rebase. The invariant was never missing —
+   the **execution point** was.
+
+   Two traps worth knowing before you use it: an aborted `--exec` leaves a `rebase-merge` directory
+   behind, and a later `git rebase --abort` then rewinds the *branch* to that stale state; and a
+   resolver that patches the CHANGELOG with `str.replace(old, new, 1)` reports success by returning a
+   string whether or not it matched, so **assert the match count** rather than trusting the call.
+
+### Concurrent releases: claim a version BLOCK, above the current tip
+
+When two sessions ship into the same repo, "take the next integer" collides whenever their fetches
+straddle a push — fetching narrows that window and cannot close it. So each session claims a
+contiguous **block** (e.g. `2.175`–`2.184`) and allocates only inside it, announcing the next block in
+the same message as that block's first commit.
+
+Two rules make it work:
+
+* **Claim the block ABOVE the current tip, not as a fixed range.** The `VERSION` stamp must stay
+  monotonic, so once the other session's numbers land, any block below the tip is spent — a held
+  range lower than `HEAD`'s version cannot be used and must be re-claimed higher.
+* **On a collision, the PUSHED side wins and the unpushed side renumbers.** Decidable without either
+  party knowing the other's state, which is the only property that survives a race; a rule that
+  alternates who absorbs the cost needs shared memory of whose turn it is, and a race is precisely
+  the absence of that.
+
+
 When several features shipped unversioned, catch up per feature: assign each its own MINOR version +
 CHANGELOG entry + `rollback/pre-v` tag at that feature's pre-change ancestor (see the 1.58.0–1.61.0
 catch-up for the pattern).

@@ -6466,10 +6466,15 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
     parameter_controls = _resolve_parameter_controls(dashboards, params, warnings, param_binding)
     sheet_swaps = _detect_sheet_swaps(worksheets, dashboards, params, warnings)
     visual_flags = _resolve_visual_flags(param_binding, ws_by_name, warnings)
+    # Scalar readers for what-if parameters, so a conditional-colour rule can COMPARE against a
+    # parameter. Resolved here (the only scope holding ``param_binding``) and carried on the IR
+    # rather than re-derived per visual, which is also how ``parameter_controls`` travels.
+    parameter_values = _colour_param_values(param_binding)
 
     return {"worksheets": worksheets, "dashboards": dashboards,
             "sheet_swaps": sheet_swaps, "parameter_controls": parameter_controls,
-            "visual_flags": visual_flags, "warnings": warnings}
+            "visual_flags": visual_flags, "parameter_values": parameter_values,
+            "warnings": warnings}
 
 
 # -- PBIR field expression emission --------------------------------------------
@@ -8233,7 +8238,8 @@ def _cell_colour_property(ws):
             else "backColor")
 
 
-def _matrix_discrete_measure_colour(ws, state, model_table, field_map, warnings):
+def _matrix_discrete_measure_colour(ws, state, model_table, field_map, warnings,
+                                    param_values=None):
     """A DISCRETE aggregate measure on Colour over a TABLE / MATRIX -> ``(value_objects, fact)``.
 
     The table-shaped sibling of :func:`_chart_discrete_measure_fill`, and the answer to the most
@@ -8269,7 +8275,7 @@ def _matrix_discrete_measure_colour(ws, state, model_table, field_map, warnings)
         return None, None
     prop = _cell_colour_property(ws)
     # RUNG 1 first: a native Rules conditional format, which adds nothing to the model at all.
-    rule = _discrete_colour_rule(ws, color, model_table, field_map)
+    rule = _discrete_colour_rule(ws, color, model_table, field_map, param_values)
     if rule is not None:
         return ([{"properties": {prop: {"solid": {"color": {"expr": rule}}}},
                   "selector": {"data": [{"dataViewWildcard": {"matchingOption": 1}}],
@@ -9604,15 +9610,43 @@ def _colour_leaf_fields(ws):
     return out
 
 
-def _colour_rule_resolver(ws, model_table, field_map):
+def _colour_param_values(param_binding):
+    """``{normalised param key: {table, measure}}`` for every what-if parameter with a scalar reader.
+
+    Keyed by BOTH the parameter's internal name and its caption, because a Tableau formula may spell
+    ``[Parameters].[X]`` either way, and normalised through :func:`_norm_param_key` so bracket and
+    case differences at the model<->viz seam cannot cause a near-miss. Derived ONCE at IR-build time
+    (where ``param_binding`` is in scope) and carried on the IR, the same way parameter controls are.
+    """
+    out = {}
+    for pid, v in ((param_binding or {}).get("values") or {}).items():
+        if not isinstance(v, dict) or not v.get("table") or not v.get("measure"):
+            continue
+        rec = {"table": v["table"], "measure": v["measure"]}
+        for key in (pid, v.get("caption")):
+            k = _norm_param_key(key)
+            if k:
+                out.setdefault(k, rec)
+    return out
+
+
+def _colour_rule_resolver(ws, model_table, field_map, param_values=None):
     """Build ``resolve(tokens) -> PBIR expression`` for the rung-1 lowering.
 
-    Recognises the two leaf shapes a colour predicate is built from -- ``AGG([Field])`` and a bare
-    ``[Field]`` -- and routes both through :func:`_field_expression`, so a rule compares against an
-    expression produced by the SAME code path that projects the visual's own columns. Anything else
-    returns ``None``, which aborts the whole rule (fail-closed).
+    Recognises the three leaf shapes a colour predicate is built from -- ``AGG([Field])``, a bare
+    ``[Field]``, and a what-if parameter ``[Parameters].[X]`` -- and routes the first two through
+    :func:`_field_expression`, so a rule compares against an expression produced by the SAME code
+    path that projects the visual's own columns. Anything else returns ``None``, which aborts the
+    whole rule (fail-closed).
+
+    A parameter operand binds to the model's ``SELECTEDVALUE`` measure rather than to the picker
+    column: the picker is a table of CANDIDATE rows, so referencing it in a comparison would compare
+    against the whole domain instead of the current selection. A parameter the model did not turn
+    into a what-if table resolves to nothing and the rule declines, which is correct -- there is no
+    object in the model holding that value.
     """
     known = _colour_leaf_fields(ws)
+    params = dict(param_values or {})
 
     def _synth(caption, aggregation):
         base = known.get(str(caption).strip().lower())
@@ -9628,11 +9662,22 @@ def _colour_rule_resolver(ws, model_table, field_map):
             field.setdefault("kind", "category")
         return field
 
+    def _param(parts):
+        if len(parts) < 2 or _norm_param_key(parts[0]) != "parameters":
+            return None
+        hit = params.get(_norm_param_key(parts[-1]))
+        if not hit:
+            return None
+        return {"Measure": {"Expression": {"SourceRef": {"Entity": hit["table"]}},
+                            "Property": hit["measure"]}}
+
     def resolve(toks):
         toks = list(toks)
         if len(toks) == 1 and toks[0][0] == "field":
             expr, _q, _n = _field_expression(_synth(toks[0][1], None), model_table, field_map)
             return expr
+        if len(toks) == 1 and toks[0][0] == "qfield":
+            return _param(list(toks[0][1] or []))
         if (len(toks) == 4 and toks[0][0] == "id" and toks[1] == ("op", "(")
                 and toks[2][0] == "field" and toks[3] == ("op", ")")):
             agg = str(toks[0][1]).capitalize()
@@ -9663,7 +9708,7 @@ def _colour_member_palette(ws, members):
     return out
 
 
-def _discrete_colour_rule(ws, color, model_table, field_map):
+def _discrete_colour_rule(ws, color, model_table, field_map, param_values=None):
     """Compile the colour driver's calc into a PBIR ``Conditional`` (rung 1), or ``None``.
 
     Rung 1 is preferred over every other mechanism because it adds NOTHING to the model: the Tableau
@@ -9679,7 +9724,7 @@ def _discrete_colour_rule(ws, color, model_table, field_map):
         return None
     return _CR.lower_to_conditional(
         spec, _colour_member_palette(ws, spec.members),
-        _colour_rule_resolver(ws, model_table, field_map))
+        _colour_rule_resolver(ws, model_table, field_map, param_values))
 
 
 # The hidden Visual Calculation that carries a view-scoped colour, and its queryRef. Named rather
@@ -9700,7 +9745,7 @@ def _colour_vc_query_ref(state):
     return qref
 
 
-def _colour_projection_dax_resolver(ws, projections, model_table, field_map):
+def _colour_projection_dax_resolver(ws, projections, model_table, field_map, param_values=None):
     """Build ``resolve(tokens) -> "[Projected Column]"`` for the rung-4 lowering.
 
     A Visual Calculation addresses the visual's OWN matrix, so its operands are the projected column
@@ -9710,7 +9755,7 @@ def _colour_projection_dax_resolver(ws, projections, model_table, field_map):
     be referenced from a Visual Calculation at all, and returning ``None`` for it aborts the rule,
     which is the honest outcome rather than a calculation over a column that is not there.
     """
-    inner = _colour_rule_resolver(ws, model_table, field_map)
+    inner = _colour_rule_resolver(ws, model_table, field_map, param_values)
     by_expr = {}
     for p in projections or []:
         native = str(p.get("nativeQueryRef") or "").strip()
@@ -9727,7 +9772,8 @@ def _colour_projection_dax_resolver(ws, projections, model_table, field_map):
     return resolve
 
 
-def _discrete_colour_visual_calc(ws, color, projections, model_table, field_map):
+def _discrete_colour_visual_calc(ws, color, projections, model_table, field_map,
+                                 param_values=None):
     """Compile a VIEW-SCOPED colour driver into Visual-Calculation DAX, or ``None``.
 
     Rung 4: the only mechanism that can express "compare this mark to the other marks in the view".
@@ -9741,7 +9787,7 @@ def _discrete_colour_visual_calc(ws, color, projections, model_table, field_map)
         return None
     return _CR.lower_to_visual_calc(
         spec, _colour_member_palette(ws, spec.members),
-        _colour_projection_dax_resolver(ws, projections, model_table, field_map))
+        _colour_projection_dax_resolver(ws, projections, model_table, field_map, param_values))
 
 
 def _discrete_view_scoped_defer(ws, color, kind, warnings):
@@ -9776,7 +9822,8 @@ def _discrete_view_scoped_defer(ws, color, kind, warnings):
             "reason": "colour driver is a view-level table calc (needs a Visual Calculation)"}
 
 
-def _chart_discrete_measure_fill(ws, state, vtype, model_table, field_map, warnings):
+def _chart_discrete_measure_fill(ws, state, vtype, model_table, field_map, warnings,
+                                 param_values=None):
     """A DISCRETE aggregate measure on Tableau's Colour shelf -> ``(dataPoint objects, fact)``.
 
     Tableau paints marks by CATEGORY when a discrete field sits on Colour. When that field is an
@@ -9816,7 +9863,7 @@ def _chart_discrete_measure_fill(ws, state, vtype, model_table, field_map, warni
         # the projection is threaded to the emit site rather than mutated in.
         return None, _discrete_view_scoped_defer(ws, color, "chart_discrete_measure_fill", warnings)
     # RUNG 1 first: a native Rules conditional format on the mark fill -- no model objects.
-    rule = _discrete_colour_rule(ws, color, model_table, field_map)
+    rule = _discrete_colour_rule(ws, color, model_table, field_map, param_values)
     if rule is not None:
         return ([{"properties": {"fill": {"solid": {"color": {"expr": rule}}}},
                   "selector": {"data": [{"dataViewWildcard": {"matchingOption": 0}}]}}],
@@ -12558,6 +12605,10 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     records = []
     vc_index = _view_only_quick_index(table_calc_usages)
     chain_index = _view_only_field_chain_index(table_calc_usages)
+    # What-if parameter scalars a colour rule may compare against. Read off the IR (built by
+    # :func:`build_ir`); ``{}`` for any IR built before this key existed, which simply means a
+    # parameter operand does not resolve and the rule declines -- the pre-existing behaviour.
+    _param_values = ir.get("parameter_values") or {}
 
     # Pre-pass: register every referenced-and-packaged dashboard image once, so report.json can list
     # it and each page's image visual can reference it by a stable RegisteredResources item name.
@@ -12755,13 +12806,13 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                     # Tableau mark. Only consulted when the gradient path emitted nothing, so a
                     # heat table is byte-unchanged.
                     _dc_objects, _dc_fact = _matrix_discrete_measure_colour(
-                        ws, state, model_table, field_map, warnings)
+                        ws, state, model_table, field_map, warnings, _param_values)
                     if _dc_objects:
                         value_objects, cf_fact = _dc_objects, _dc_fact
             data_point_objects, mc_fact = _data_point_colors(
                 ws, state, ws["visual_type"], model_table, field_map, warnings)
             cont_objects, cont_fact = _chart_discrete_measure_fill(
-                ws, state, ws["visual_type"], model_table, field_map, warnings)
+                ws, state, ws["visual_type"], model_table, field_map, warnings, _param_values)
             if cont_objects is None:
                 cont_objects, cont_fact = _chart_continuous_fill(
                     ws, state, ws["visual_type"], model_table, field_map, warnings)
@@ -13026,13 +13077,13 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 # See the dashboard path: a DISCRETE colour measure paints these cells through the
                 # model's colour twin when there is no continuous scale to own them.
                 _dc_objects, _dc_fact = _matrix_discrete_measure_colour(
-                    ws, state, model_table, field_map, warnings)
+                    ws, state, model_table, field_map, warnings, _param_values)
                 if _dc_objects:
                     value_objects, cf_fact = _dc_objects, _dc_fact
         data_point_objects, mc_fact = _data_point_colors(
             ws, state, ws["visual_type"], model_table, field_map, warnings)
         cont_objects, cont_fact = _chart_discrete_measure_fill(
-            ws, state, ws["visual_type"], model_table, field_map, warnings)
+            ws, state, ws["visual_type"], model_table, field_map, warnings, _param_values)
         if cont_objects is None:
             cont_objects, cont_fact = _chart_continuous_fill(
                 ws, state, ws["visual_type"], model_table, field_map, warnings)

@@ -14,6 +14,85 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.177.0` → `2.185.0`): the CHANGELOG chain gate gets the execution
+  point it was missing, and the concurrent-release protocol is written down.** Both come from a
+  defect the parallel colour session found in its own renumbered stack, and the diagnosis is the
+  useful part: the gate shipped in `2.157.0` was never missing an invariant — it was missing a place
+  to run.
+
+  `tests/test_changelog_version_chain.py` runs where pytest runs, which is the **tip** of a branch.
+  The CHANGELOG is a file every commit rewrites, so **the tip masks its own history**: a two-commit
+  stack was correct at HEAD and stale one commit down, because the renumber landed as an `--amend` of
+  the tip while the parent kept its pre-renumber predecessor. Checking out that parent and running the
+  gate there reported the failure immediately. The fix is one flag, now in the `AGENTS.md` versioning
+  ritual and in the test module's own docstring:
+
+  ```
+  git rebase --exec "cd skills/tableau-migration && py -3.11 -m pytest tests/test_changelog_version_chain.py -q" origin/main
+  ```
+
+  ~0.13s per commit, verified on both the broken stack (stops at the offending commit) and a clean one.
+
+  Two traps are recorded with it, because each cost real time: an aborted `--exec` leaves a
+  `rebase-merge` directory, and a later `git rebase --abort` then rewinds the *branch* to that stale
+  state; and a CHANGELOG resolver using `str.replace(old, new, 1)` reports success by returning a
+  string whether or not it matched — the same silent-no-op class as PowerShell's `-replace` treating
+  `$` as a group reference, which no-opped a defect injection earlier in this series and briefly made
+  a gate look like it had fired when it had not.
+
+  **Concurrent releases now have a written protocol**, after four version collisions between two
+  sessions in one day. Each session claims a contiguous block and allocates only inside it, with two
+  rules that are the whole content: claim the block **above the current tip** (a block below `HEAD`'s
+  version is spent, because the `VERSION` stamp must stay monotonic — which is why the earlier
+  `2.165`–`2.174` claim had to be re-claimed as `2.185`–`2.194`), and on a collision **the pushed side
+  wins**. The second is deliberately asymmetric: it is decidable without either party knowing the
+  other's state, which is the only property that survives a race, whereas alternating who absorbs the
+  cost needs shared memory of whose turn it is.
+
+  Docs and one test docstring only — no engine code, no emitted-output change.
+
+- **`tableau-migration` (skill `2.176.0` → `2.177.0`): a conditional-colour rule can compare
+  against a Tableau PARAMETER.** "Colour it red when it is above `[Threshold]`" is the canonical
+  parameter-driven colour in Tableau, and the rule declined on it: the rung-1 resolver knew
+  `AGG([Field])` and a bare `[Field]`, and a `[Parameters].[X]` operand returned `None`, which
+  aborts the whole rule (fail-closed). It is also the specific reason corpus `0088` declined.
+
+  * **A what-if parameter binds to its `SELECTEDVALUE` measure, not to its picker column.** The
+    model turns a value parameter into a disconnected table of CANDIDATE rows plus a scalar that
+    reads the current selection. Only the scalar can stand in a comparison; binding the picker
+    column instead validates clean and renders, and silently compares every mark against the whole
+    domain. `_classify_parameters` therefore publishes an additive `value` `{table, measure}`
+    alongside the existing `picker` `{table, column}`, `param_binding` carries a `values` map,
+    and the IR carries the normalised result the same way it already carries `parameter_controls`.
+    Keyed by BOTH internal name and caption, normalised through `_norm_param_key`, because a
+    formula may spell `[Parameters].[X]` either way and a bracket difference at the model/viz seam
+    is a silent near-miss.
+
+  * **Fail-closed is preserved end to end.** A parameter the model never consumed, a half-built
+    `value` record, and a qualified reference that is not a parameter (`[Datasource].[Field]`) each
+    resolve to nothing and decline the rule, rather than guessing at a binding.
+
+  * **Proven by render, with a DISCRIMINATING probe.** The first render was *not* evidence: every
+    row's `SUM([Profit])` exceeded the threshold, so "the parameter evaluated" and "the whole
+    `Conditional` silently fell through to `DefaultValue`" produced the identical all-orange
+    picture -- the same validation-invisible failure already recorded for `Or` nodes and inline
+    visual calculations. Re-probed with a threshold that must split the rows (`SELECTEDVALUE`
+    default 100 → 100,000): Consumer (136,371) orange, Corporate (94,249) and Home Office
+    (61,675) blue. Only the parameter's default changed between the two renders, and the split
+    lands exactly on its value.
+
+  * **Zero corpus coverage, by measurement.** Masked corpus diff against `main`: 1384 files vs
+    1384, 0 added, 0 removed, **0 differing** -- no workbook exercises a parameter-driven colour,
+    so this path rests entirely on its unit tests and the render proof. Fourth named instance of
+    the corpus-coverage gap (after Custom SQL relations, `CALENDARAUTO`-on-a-stub, and
+    `SelectRef`).
+
+  * **Masking cannot reach a DERIVED SCALAR.** The previous corpus diff reported one differing
+    file; the whole delta was the engine's own MAX_PATH warning reading `287 chars` vs `290`, and
+    one workbook sat exactly on the 260 boundary. Masking replaces the path STRING but cannot
+    touch a path LENGTH already rendered into prose as an integer. Fixed upstream of the diff by
+    giving both builds output roots of EQUAL LENGTH, which took this run to 0 differing.
+
 - **`tableau-migration` (skill `2.175.0` → `2.176.0`): a boolean colour driver is a two-member
   domain, Tableau's window bounds are honoured, and a dangling `SelectRef` is now a lint error.**
   Rung 4 (view-scoped colour via a Visual Calculation) was wired during this work and then
