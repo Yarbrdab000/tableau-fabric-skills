@@ -14,6 +14,86 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.187.0` → `2.188.0`): rung 4 is wired -- a view-scoped colour
+  driver now paints, through a declared Visual Calculation.** "Highlight the bar that set a new
+  record" compares a mark against the OTHER marks in the view, so it has no rung-1 form and was
+  deferred. It now emits, bound by `SelectRef`; the inline form was refuted by render (validates
+  clean, paints nothing). Lands on top of `2.186.0`, never over the active trellis defect.
+
+  * **THE EARLIER DIAGNOSIS WAS WRONG, and the stale text is corrected here.** The reverted first
+    attempt was recorded as "a projection appended to the query state does not survive -- the emit
+    sites build it more than once, so the mutation lands on a discarded object", and that claim
+    reached a shipped CHANGELOG entry, two code comments and a test comment. Measured directly by
+    appending a marker projection: it DOES survive, into both the pre-rebind and the final tree.
+    `emit_pbir` does run twice, but over two output trees, each with its own state. The actual
+    cause was that the append targeted a single hard-coded role -- a chart's measures live in `Y`,
+    a matrix's in `Values` -- so on every visual lacking that role the append silently no-opped
+    while the formatting property still emitted a `SelectRef` naming it. That is the unexplained
+    "HALF the visuals". The refuting experiment took one run; the wrong explanation was an
+    inference recorded in the register reserved for measurement.
+
+  * **`_declare_colour_projection` picks a role that exists, or returns `None`.** Measure roles
+    only (`Values`, `Y`, `Y2`, `X`) -- declaring a calculation in a dimension role validates clean
+    and is semantically wrong. `None` means DEFER, never "emit anyway", pinned by test. The
+    declaration is idempotent, so an emitter reached twice reuses the calculation instead of
+    computing the same window twice in the field list.
+
+  * **`pbir_lint` R8 caught its own author.** The first wiring in this change shipped a genuine
+    dangling `SelectRef` and R8 failed the suite on it. That is the strongest available argument
+    against scoping R8 down later.
+
+  * **Proven by render, with a DISCRIMINATING probe.** The shipped semantics paint all four bars of
+    `0070_new_max` orange, which is CORRECT -- sales rise monotonically, so under a running max
+    every year set a record -- and proves nothing on its own, because an ignored `SelectRef` plus
+    an authored orange mark colour looks identical. Two controls force the hypotheses apart. The
+    workbook's own `Challenge` page (same data, same chart, no colour calc) renders BLUE. Then the
+    built DAX was repointed from the running max `WINDOW(1, ABS, 0, REL)` to the whole-partition
+    max `WINDOW(1, ABS, -1, ABS)` and reopened cold: exactly ONE bar (2013, the tallest) came back
+    orange, three blue. That establishes per-mark evaluation, a reference that resolves, and the
+    window BOUND selecting which marks paint -- and independently re-confirms that reading
+    `WINDOW_MAX(x, FIRST(), 0)` as the whole partition turns "every bar that set a record" into
+    "only the tallest".
+
+  * **Corpus, with its operands named.** `corpus/b187` (built from `2.187.0`) vs `corpus/v187`
+    (built from this commit): only `0070_new_max`'s two visuals differ, plus `report.json` and
+    `summary.md`; no shape change, since `2.187.0` already carries the trellis fix. `SelectRef` was
+    0 of 519 emitted visuals and is now 2, with **0 dangling** corpus-wide -- one entry off the
+    zero-coverage roster.
+
+### Fixed
+
+- **`tableau-migration` (skill `2.186.0` → `2.187.0`): a measure trellis is inferred from the
+  SOURCE SHELF, so a hidden projection can never be a band.** A pre-existing defect, found while
+  wiring view-scoped colour and fixed first so that work cannot land on top of it.
+
+  * **The rebuild invented panes the worksheet does not declare.** Tableau lays measures side by
+    side by concatenating measure pills with `+` on one shelf, one pane per pill.
+    `0060_adjustable_fixed_axis`'s `Challenge` worksheet declares exactly ONE measure pill --
+    `pcto:sum:Sales:qk`, a single percent-of-total quick table calc -- so Tableau draws one pane.
+    `_detect_measure_trellis` counted the projections in the query instead, which include the raw
+    base measure the quick-calc path keeps as a HIDDEN projection purely so its Visual Calculation
+    can reference it. Two pills were inferred from one, and the rebuild emitted TWO side-by-side
+    charts, the second of them drawing a projection explicitly marked `hidden: true`. `0088` had
+    the same shape.
+
+  * **The signature is a property of the shelf, not of the query.** A projection the visual
+    computes but does not show can never be one of the concatenated pills, so hidden projections
+    are excluded from the count and never returned as bands. The pre-existing guards (mark type,
+    `[Measure Values]`, dual axis, series split, category present) are untouched, and a genuine
+    two-measure trellis is unchanged -- both pinned by test.
+
+  * **Corpus effect is a change of visual SHAPE, stated with its operands.** `corpus/b186` (built
+    from `d1c35e6`) vs `corpus/v186` (built from this commit): 1384 files vs 1378, 6 added, 12
+    removed, 2 differing (`report.json`, `summary.md`). Three pages each collapse two charts into
+    one, in both the pre-rebind and the final tree. pbip-tree visuals **276 → 273** -- the
+    misdetection was inventing three bands.
+
+  * **Render-confirmed, because a collapsed band looks fine in a file listing and wrong on a
+    page.** `0060` reopened cold after refresh: one clustered bar chart, `Percent of Total` on a
+    0-40% axis, three product categories, the hidden base measure not drawn.
+
+### Added
+
 - **`tableau-migration` (skill `2.185.0` → `2.186.0`): the verification rules this collection learned
   the hard way are written down, in `migration-gotchas.md`.** A new *Verifying a rebuild* section,
   prompted by the parallel colour session and stated in their words: **"verify by render — but a

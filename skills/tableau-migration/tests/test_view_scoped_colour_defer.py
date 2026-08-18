@@ -100,6 +100,20 @@ def _objects(ir):
     return list(_visual_parts(R.emit_pbir(ir)).values())[0]["visual"].get("objects", {})
 
 
+def _iter_select_refs(o):
+    """Every ``{"SelectRef": ...}`` node anywhere in a visual, at any depth."""
+    if isinstance(o, dict):
+        if "SelectRef" in o:
+            yield o
+        for v in o.values():
+            for hit in _iter_select_refs(v):
+                yield hit
+    elif isinstance(o, list):
+        for v in o:
+            for hit in _iter_select_refs(v):
+                yield hit
+
+
 class TestViewScopedDiscreteColourDefers:
     def test_the_helper_recognises_a_windowed_formula(self):
         assert R._is_view_level_calc(
@@ -107,25 +121,115 @@ class TestViewScopedDiscreteColourDefers:
         assert R._is_view_level_calc({"formula": "RUNNING_MAX(SUM([Sales])) = SUM([Sales])"}) is True
         assert R._is_view_level_calc({"formula": "SUM([Profit]) > 0"}) is False
 
-    def test_a_windowed_driver_still_paints_no_mark_fill(self):
-        # RUNG 4 IS NOT WIRED YET. lower_to_visual_calc produces correct DAX (see
-        # TestWindowBoundsAreHonoured), but binding it needs a DECLARED projection, and appending
-        # one to the query state at emit time does not survive -- the emit sites rebuild that state,
-        # so the mutation is discarded and the property is left naming a projection that does not
-        # exist. Measured on 0070_new_max: HALF the visuals shipped a dangling SelectRef. Until the
-        # projection is threaded to the emit site, deferring is the honest outcome.
+    def test_a_windowed_driver_now_paints_through_a_declared_visual_calculation(self):
+        """RUNG 4 IS WIRED. This test previously asserted the opposite, and said why.
+
+        The deferral was correct while the projection could not be bound; the comment it carried
+        named the exact condition for changing it -- "until the projection is threaded to the emit
+        site". It now is, so a view-scoped driver paints instead of deferring.
+
+        What actually blocked it was NOT that the mutation is discarded (measured since: a
+        projection appended to the query state reaches the emitted visual on both the pre-rebind
+        and the final tree). It was that the append targeted a role the visual did not have.
+        """
         ir = _chart_ir(_CALC, "usr:Calculation_nm:nk")
         assert ir["worksheets"][0]["encodings"]["color"]["discrete_measure"] is True
-        assert "dataPoint" not in _objects(ir), "a wrong colour is worse than no colour"
+        objs = _objects(ir)
 
-    def test_the_deferral_names_the_cause_and_the_remedy(self):
-        ir = _chart_ir(_CALC, "usr:Calculation_nm:nk")
-        R.emit_pbir(ir)
-        hits = [w["reason"] for w in ir["warnings"] if "discrete colour deferred" in w["reason"]]
+        assert "dataPoint" in objs, "a view-scoped driver is paintable via a Visual Calculation"
+        expr = objs["dataPoint"][0]["properties"]["fill"]["solid"]["color"]["expr"]
+        assert "SelectRef" in expr, "bound by reference; the inline form renders nothing"
+
+    def test_the_reference_names_a_projection_the_visual_actually_declares(self):
+        """The whole point: the ``SelectRef`` and the hidden projection must agree.
+
+        Asserted structurally here as well as through the lint, because this is the invariant whose
+        violation is invisible -- a dangling reference validates clean and renders with defaults.
+        """
+        import json as _json
+
+        from test_twb_to_pbir import _visual_parts
+        parts = R.emit_pbir(_chart_ir(_CALC, "usr:Calculation_nm:nk"))
+        for vis in _visual_parts(parts).values():
+            blob = _json.dumps(vis)
+            if "SelectRef" not in blob:
+                continue
+            named = {r["SelectRef"]["ExpressionName"]
+                     for r in _iter_select_refs(vis)}
+            declared = {p.get("queryRef")
+                        for role in ((vis["visual"].get("query") or {})
+                                     .get("queryState") or {}).values()
+                        for p in (role or {}).get("projections", [])}
+            assert named and named <= declared, (
+                "SelectRef names %s but the visual declares %s" % (sorted(named), sorted(declared)))
+
+    def test_the_declared_projection_carries_the_lowered_dax(self):
+        from test_twb_to_pbir import _visual_parts
+        parts = R.emit_pbir(_chart_ir(_CALC, "usr:Calculation_nm:nk"))
+        exprs = []
+        for vis in _visual_parts(parts).values():
+            for role in ((vis["visual"].get("query") or {}).get("queryState") or {}).values():
+                for p in (role or {}).get("projections", []):
+                    nvc = (p.get("field") or {}).get("NativeVisualCalculation")
+                    if nvc:
+                        exprs.append(nvc["Expression"])
+
+        assert exprs, "the colour Visual Calculation must be declared, not inlined"
+        assert any("WINDOW" in e.upper() for e in exprs), "the window survives into the DAX"
+
+    def test_a_visual_with_no_measure_role_still_defers_and_says_why(self):
+        """The remaining honest deferral -- and the guard that keeps it honest.
+
+        ``_declare_colour_projection`` returns ``None`` when there is no measure role to host the
+        calculation. Callers must read that as DEFER; emitting the property anyway is exactly the
+        dangling reference this whole path exists to avoid.
+        """
+        ws = {"name": "Sheet 1", "visual_type": R.VT_BAR, "rows": [], "cols": [],
+              "mark_colors": {},
+              "encodings": {"color": {"caption": "New Max?", "kind": "value",
+                                      "binding": "aggregation", "discrete_measure": True,
+                                      "formula": _CALC}}}
+        warnings = []
+        objs, fact = R._chart_discrete_measure_fill(
+            ws, {"Category": {"projections": [{"queryRef": "c"}]}},
+            R.VT_BAR, "Orders", {}, warnings)
+
+        assert objs is None, "no host role -> paint nothing rather than dangle"
+        assert fact["status"] == "deferred"
+        hits = [w["reason"] for w in warnings if "discrete colour deferred" in w["reason"]]
         assert hits, "the deferral must be disclosed, never silent"
-        assert "VIEW-level table calc" in hits[0]
+        assert "VIEW-level table calc" in hits[0], "name the cause"
         assert "Visual Calculation" in hits[0], "say what would fix it"
-        assert "WINDOW_MAX" in hits[0], "quote the offending formula"
+        assert "New Max?" in hits[0], "name the driver so it can be found in the workbook"
+
+    def test_the_declare_helper_refuses_a_dimension_only_state(self):
+        assert R._declare_colour_projection({"Category": {"projections": []}}, "1") is None
+        assert R._declare_colour_projection({}, "1") is None
+        assert R._declare_colour_projection({"Values": {}}, "") is None, "no DAX -> nothing declared"
+
+    def test_the_declare_helper_prefers_a_measure_role_and_returns_its_ref(self):
+        state = {"Category": {"projections": []}, "Y": {"projections": []}}
+        qref = R._declare_colour_projection(state, "MAXX(1,1)")
+
+        assert qref
+        assert [p["queryRef"] for p in state["Y"]["projections"]] == [qref]
+        assert state["Category"]["projections"] == [], "a dimension role is never the host"
+
+    def test_a_second_declaration_does_not_collide(self):
+        state = {"Values": {"projections": []}}
+        first = R._declare_colour_projection(state, "1")
+        second = R._declare_colour_projection(state, "2")
+
+        assert first != second, "two calculations on one visual need distinct refs"
+
+    def test_declaring_the_same_calculation_twice_reuses_the_first(self):
+        """The emitters can be reached twice for one visual; the second must not duplicate it."""
+        state = {"Values": {"projections": []}}
+        first = R._declare_colour_projection(state, "MAXX(1,1)")
+        again = R._declare_colour_projection(state, "MAXX(1,1)")
+
+        assert again == first
+        assert len(state["Values"]["projections"]) == 1, "one calculation, declared once"
 
     def test_no_visual_ever_ships_a_dangling_selectref(self):
         # the invariant the reverted wiring broke, pinned so it cannot come back unnoticed
