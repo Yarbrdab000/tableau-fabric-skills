@@ -14,6 +14,33 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.214.0` → `2.215.0`): a CHANGELOG entry that exists but says
+  nothing fails the suite.** A cross-session rebase left a header-only duplicate of a renumbered
+  entry -- same shape, same `(skill X → Y)` marker, zero prose. Every existing check passed on it,
+  because each asks about the HEADER: the version was present, the chain was continuous, nothing was
+  claimed twice. An entry can EXIST, be WELL-FORMED, and be EMPTY.
+
+  * **Shares the existing parser rather than re-parsing.** A second parser over the same file would
+    be a second predicate, and the two could disagree about what an entry IS while each looked
+    correct alone -- the exact failure this module exists to prevent, reintroduced one level down.
+    An entry's body runs from its header to the next entry, the next Markdown heading, or EOF; the
+    heading stop matters because the file interleaves `### Added` and `### Fixed`, so the last entry
+    in a section would otherwise absorb the next section's header as content.
+
+  * **The threshold is measured, not assumed.** `> 0` rather than a size floor, because across the
+    99 entries in this file the smallest real body is **604 characters over 7 non-blank lines**. A
+    legitimate entry clears the check by roughly two orders of magnitude, so it cannot fire on
+    terse-but-real prose -- only on genuine emptiness.
+
+  * **Proved RED, and proved to catch what the others cannot.** First injection reproduced the rebase
+    artifact exactly and fired three checks at once -- correct, but not evidence that this one adds
+    anything, since a duplicate also breaks the chain. Second injection was a header-only entry that
+    is otherwise PERFECT: unique version, continuous chain (`2.214.0 → 2.215.0` above
+    `2.213.0 → 2.214.0`), and matching the shipped stamp. Chain, duplicate and stamp checks all
+    PASSED; only the body check fired, naming `2.215.0 at L17`. That is the discriminating result --
+    a gate proved only against a defect its neighbours also catch has not been shown to be worth
+    anything.
+
 - **`tableau-migration` (skill `2.213.0` → `2.214.0`): a released version with no rollback anchor now
   fails the suite.** The 2.205.0 gate proves every anchor that EXISTS names a reachable commit. It
   cannot prove one exists — and absence turned out to be the live failure, with a cause neither
