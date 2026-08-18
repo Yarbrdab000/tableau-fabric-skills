@@ -14,6 +14,41 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.185.0` → `2.186.0`): the verification rules this collection learned
+  the hard way are written down, in `migration-gotchas.md`.** A new *Verifying a rebuild* section,
+  prompted by the parallel colour session and stated in their words: **"verify by render — but a
+  render is only evidence if the failure mode would look different."** If the broken and the working
+  hypothesis predict the same picture, that picture is worth no more than a clean `validate`.
+
+  Three measured cases are recorded, each one a render that looked like proof and was not: a
+  parameter-thresholded colour that came back all one colour (equally consistent with "the parameter
+  evaluated" and "the whole `Conditional` fell through to `DefaultValue`"); a view-scoped colour that
+  painted all four bars orange (equally consistent with an ignored `SelectRef` plus an authored mark
+  colour); and a calendar fix that was clean on every static signal while the pre-change build loaded
+  a fabricated year-2000 calendar. In each case the control that forced the hypotheses apart is named.
+
+  The same discipline is recorded for the **measuring apparatus**, because four separate incidents in
+  this series were the instrument failing quietly rather than the artifact being wrong:
+
+  - **Name both operands of a diff, never just the delta.** A whole-tree diff whose roots were built
+    from the *same* tree returns `0 differing` — guaranteed, carrying zero information, and
+    indistinguishable from a real result.
+  - **Masking normalises representations; any value *derived* from the masked thing escapes it.** A
+    path length rendered into prose survives masking of the path, so both roots must be
+    **equal-length**.
+  - **`added > 0` with `removed == 0` is suspicious, not a result** — the signature of `os.walk`
+    truncating at `MAX_PATH` on the longer of two roots.
+  - **A substitution that reports success by returning a string is not a substitution** — PowerShell
+    `-replace` treats `$` as a group reference, Python `str.replace` returns the input unchanged on no
+    match. Both silently no-op.
+
+  Plus two operational traps that cost real time: a screenshot taken before a refresh is
+  indistinguishable from "renders nothing", and two Desktop instances must be told apart by process
+  **command line**, never `MainWindowTitle` — which is the file name, and two builds of one workbook
+  share it.
+
+  Documentation only — no engine code, no emitted-output change.
+
 - **`tableau-migration` (skill `2.177.0` → `2.185.0`): the CHANGELOG chain gate gets the execution
   point it was missing, and the concurrent-release protocol is written down.** Both come from a
   defect the parallel colour session found in its own renumbered stack, and the diagnosis is the
