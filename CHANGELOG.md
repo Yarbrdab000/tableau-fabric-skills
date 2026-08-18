@@ -14,6 +14,33 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.225.0` → `2.226.0`): the day's verification findings collapse into
+  one rule, recorded where the next person will read it.** Docs-only; no code, no corpus change.
+
+  **Read every confirmation at the artifact, never at the mechanism.** A gate going red, a trace
+  firing, a test passing, a validator returning zero errors — all four confirm only that *something
+  you built responded*. None says the file a user opens changed. Four instances, one day, four lanes:
+  a gate keyed on a proxy that passed forever because its input set included the artifact under test
+  (`git rev-list --all` counts `refs/tags`, so every anchor vouched for itself); a trace confirming a
+  helper firing exactly as designed while the emitted measure stayed `= BLANK()`, because the
+  consumer read a different list; eighteen green tests on a feature that was completely inert; an
+  isolated emitter returning three correct objects onto a page that was still wrong.
+
+  The proving sequence, with the clause that actually gets broken: **(1)** it passed → no evidence
+  until seen red; **(2)** it went red → no evidence until the defect is one its *neighbours* do not
+  already catch; **(3)** (2) is only measurable on the **full** suite, with an injection valid in
+  every *other* respect. Both parallel sessions violated clause 3 independently, in the same hour,
+  while stating clauses 1 and 2 — because running the single file is *correct* while iterating and
+  wrong only at the moment of claiming. The discipline attaches to the proof step, not the person.
+  A rider learned by getting it wrong: in this repo a source-level injection is a **two-tree edit**,
+  so patching canonical alone fails mirror parity too and the count stops being interpretable.
+
+  **Structurally valid, semantically absent** — the defect family no structural gate can see, named
+  from three sightings in three unrelated lanes: a calc stubbing to `= BLANK()` (it *binds*, so every
+  binding check passes while the visual renders empty), a CHANGELOG entry that is a header with no
+  body, and a visual whose `SelectRef` names a projection that no longer resolves. Ask whether the
+  emitted artifact **says** anything, not whether it is well-formed.
+
 - **`tableau-migration` (skill `2.215.0` → `2.225.0`): a calc that reaches across a declared join no
   longer stubs to `BLANK()` and renders an empty chart.** In corpus workbook
   `0136_custom_sql_prefix_and_params`, the calc `complex nested` mixes a relation-qualified reference

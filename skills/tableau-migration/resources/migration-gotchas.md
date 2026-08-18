@@ -181,6 +181,52 @@ The same rule applies to the measuring apparatus, not just the artifact:
   input unchanged on no match. Both silently no-op. Assert the match count, and read back what you
   wrote.
 
+### Read every confirmation at the artifact, never at the mechanism
+
+The single rule the ones above are instances of. A gate going red, a trace firing, a test passing, a
+validator returning zero errors — **all four confirm only that something you built responded.** None
+of them says the file a user opens changed. Four ways this bit us in one day, in four different
+lanes:
+
+* a **gate** keyed on a proxy passed forever, because its input set included the artifact under test
+  (`git rev-list --all` counts `refs/tags`, so every rollback anchor vouched for itself);
+* a **trace** confirmed a helper firing exactly as designed — 4 calcs in, 2 aliases matched, 1
+  rewritten — while the emitted measure stayed `= BLANK()`, because the consumer read a different
+  list;
+* **eighteen tests** passed on a feature that was completely inert, because the facts it read did not
+  exist at the moment it ran;
+* an **isolated emitter** returned three correct objects, and the page was still wrong, because a
+  later pass overwrote them.
+
+Every one of those was a true statement about the mechanism and a false impression about the output.
+
+So the proving sequence is: **(1)** it passed → no evidence until you have seen it red; **(2)** it
+went red → no evidence until the defect is one its *neighbours* do not already catch; **(3)** (2) is
+only measurable on the **full** suite, with an injection that is valid in every *other* respect —
+otherwise the failure count is uninterpretable. In this repo a source-level injection is a **two-tree
+edit**: patch canonical only and mirror parity fails too, and you cannot tell your sloppiness from
+the finding.
+
+Clause 3 is the one that gets broken, and not by carelessness: running the single file is *correct*
+while you are iterating, and the moment of proving is exactly when you are deepest in that file. The
+habit and the requirement point in opposite directions, so attach the discipline to the **proof
+step** — "I am about to claim this is proved" triggers a full-suite run, the way "I am about to claim
+this is green" already does.
+
+### Structurally valid, semantically absent
+
+The defect family that no structural gate can see, because the artifact is *well-formed and says
+nothing*. Three sightings from three unrelated lanes, all found only by reading content:
+
+* a calc that stubs to `= BLANK()` — it **binds normally**, so every binding check passes while the
+  visual renders empty and fidelity reports `{"status": "rebuilt", "reason": null}`;
+* a CHANGELOG entry that is a header with no body — unique version, continuous chain, correct stamp,
+  and it documents nothing;
+* a visual whose `SelectRef` names a projection that no longer resolves.
+
+Ask *"does this emitted artifact say anything"*, not *"is it well-formed"*. The two questions have
+different answers far more often than they look like they should.
+
 ---
 
 ## Security
