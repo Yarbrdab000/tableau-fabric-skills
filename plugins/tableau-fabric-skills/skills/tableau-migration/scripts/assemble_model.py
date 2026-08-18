@@ -1720,7 +1720,10 @@ def _classify_parameters(parameters, fp, vp):
     * ``"value"``  -- a scalar/what-if parameter the model turned into a disconnected what-if table
       (``model_object`` = that table); the model also owns its picker, exposed as an additive
       ``picker`` ``{table, column}`` so the viz layer slices the model's own picker column (the
-      friendly Label column for an aliased list) rather than re-deriving a field slicer.
+      friendly Label column for an aliased list) rather than re-deriving a field slicer. It also
+      carries an additive ``value`` ``{table, measure}`` naming the ``SELECTEDVALUE`` measure that
+      reads the current selection -- the only form usable where a SCALAR is required (a comparison
+      operand), as opposed to the picker column, which is the set of candidate rows.
     * ``"field"``  -- a dimension/measure SWAP controller the model turned into a field-parameter
       table (``model_object`` = that table); likewise model-owned, and it too exposes an additive
       ``picker`` ``{table, column}`` pointing at the field-parameter table's DISPLAY column (the
@@ -1731,10 +1734,11 @@ def _classify_parameters(parameters, fp, vp):
     Classification is deterministic and driven by the two emitters' own consumed-source signals
     (``vp["consumed_params"]`` and each ``fp["specs"][*]["controller"]``), never by guessing.
     """
-    value_tbl = {}     # param key -> (what-if table name, picker column a slicer binds to)
+    value_tbl = {}     # param key -> (what-if table, picker column a slicer binds to, value measure)
     for cp in (vp.get("consumed_params") or []):
         for k in _norm_param_keys(cp):
-            value_tbl[k] = (cp.get("table"), cp.get("picker_column") or cp.get("table"))
+            value_tbl[k] = (cp.get("table"), cp.get("picker_column") or cp.get("table"),
+                            cp.get("measure"))
     field_tbl = {}     # controller key -> (field-parameter table name, display column a slicer binds to)
     field_sel = {}     # controller key -> {column, value} the slicer must OPEN ON (see below)
     for spec in (fp.get("specs") or []):
@@ -1759,15 +1763,22 @@ def _classify_parameters(parameters, fp, vp):
     for p in (parameters or []):
         keys = _norm_param_keys(p)
         name = p.get("caption") or p.get("internal_name") or ""
-        kind, model_object, picker = "filter", None, None
+        kind, model_object, picker, value = "filter", None, None, None
         vhit = next((value_tbl[k] for k in keys if k in value_tbl), None)
         fhit = next((field_tbl[k] for k in keys if k in field_tbl), None)
         if vhit is not None:
-            table, picker_col = vhit
+            table, picker_col, value_measure = vhit
             kind, model_object = "value", table
             # A what-if value param needs a control: expose the disconnected picker table column a
             # slicer binds to (the friendly Label column for an aliased list, else the value column).
             picker = {"table": table, "column": picker_col}
+            # ...and, separately, the SCALAR the model created to read the current selection
+            # (``SELECTEDVALUE(...)``). The picker column is a column of candidate rows, so it
+            # cannot stand in a scalar comparison; only this measure can. Carried additively for
+            # consumers that need to COMPARE against a parameter rather than slice on it -- e.g.
+            # a conditional-colour rule lowering ``SUM([Sales]) > [Parameters].[Goal]``.
+            if value_measure:
+                value = {"table": table, "measure": value_measure}
         elif fhit is not None:
             table, disp = fhit
             kind, model_object = "field", table
@@ -1786,6 +1797,8 @@ def _classify_parameters(parameters, fp, vp):
                "kind": kind, "model_object": model_object}
         if picker:
             rec["picker"] = picker
+        if value:
+            rec["value"] = value
         out.append(rec)
     return out
 

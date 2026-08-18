@@ -14,6 +14,48 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.176.0` → `2.177.0`): a conditional-colour rule can compare
+  against a Tableau PARAMETER.** "Colour it red when it is above `[Threshold]`" is the canonical
+  parameter-driven colour in Tableau, and the rule declined on it: the rung-1 resolver knew
+  `AGG([Field])` and a bare `[Field]`, and a `[Parameters].[X]` operand returned `None`, which
+  aborts the whole rule (fail-closed). It is also the specific reason corpus `0088` declined.
+
+  * **A what-if parameter binds to its `SELECTEDVALUE` measure, not to its picker column.** The
+    model turns a value parameter into a disconnected table of CANDIDATE rows plus a scalar that
+    reads the current selection. Only the scalar can stand in a comparison; binding the picker
+    column instead validates clean and renders, and silently compares every mark against the whole
+    domain. `_classify_parameters` therefore publishes an additive `value` `{table, measure}`
+    alongside the existing `picker` `{table, column}`, `param_binding` carries a `values` map,
+    and the IR carries the normalised result the same way it already carries `parameter_controls`.
+    Keyed by BOTH internal name and caption, normalised through `_norm_param_key`, because a
+    formula may spell `[Parameters].[X]` either way and a bracket difference at the model/viz seam
+    is a silent near-miss.
+
+  * **Fail-closed is preserved end to end.** A parameter the model never consumed, a half-built
+    `value` record, and a qualified reference that is not a parameter (`[Datasource].[Field]`) each
+    resolve to nothing and decline the rule, rather than guessing at a binding.
+
+  * **Proven by render, with a DISCRIMINATING probe.** The first render was *not* evidence: every
+    row's `SUM([Profit])` exceeded the threshold, so "the parameter evaluated" and "the whole
+    `Conditional` silently fell through to `DefaultValue`" produced the identical all-orange
+    picture -- the same validation-invisible failure already recorded for `Or` nodes and inline
+    visual calculations. Re-probed with a threshold that must split the rows (`SELECTEDVALUE`
+    default 100 → 100,000): Consumer (136,371) orange, Corporate (94,249) and Home Office
+    (61,675) blue. Only the parameter's default changed between the two renders, and the split
+    lands exactly on its value.
+
+  * **Zero corpus coverage, by measurement.** Masked corpus diff against `main`: 1384 files vs
+    1384, 0 added, 0 removed, **0 differing** -- no workbook exercises a parameter-driven colour,
+    so this path rests entirely on its unit tests and the render proof. Fourth named instance of
+    the corpus-coverage gap (after Custom SQL relations, `CALENDARAUTO`-on-a-stub, and
+    `SelectRef`).
+
+  * **Masking cannot reach a DERIVED SCALAR.** The previous corpus diff reported one differing
+    file; the whole delta was the engine's own MAX_PATH warning reading `287 chars` vs `290`, and
+    one workbook sat exactly on the 260 boundary. Masking replaces the path STRING but cannot
+    touch a path LENGTH already rendered into prose as an integer. Fixed upstream of the diff by
+    giving both builds output roots of EQUAL LENGTH, which took this run to 0 differing.
+
 - **`tableau-migration` (skill `2.175.0` → `2.176.0`): a boolean colour driver is a two-member
   domain, Tableau's window bounds are honoured, and a dangling `SelectRef` is now a lint error.**
   Rung 4 (view-scoped colour via a Visual Calculation) was wired during this work and then

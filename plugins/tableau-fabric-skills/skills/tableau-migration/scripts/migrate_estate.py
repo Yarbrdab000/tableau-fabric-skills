@@ -2395,8 +2395,11 @@ def _param_binding_from_model(res_report):
     model confirmed the target, and a flag binds only for a translated / assisted-approved measure).
 
     Returns ``{"slicers": {<param id>: {"table", "column", "single_select", "caption"}},
-    "flags": {<tableau filter token>: {"entity", "measure", "status", "value"}}}`` or ``None`` when
-    the model exposed nothing bindable (so the report keeps its precise warnings, byte-unchanged).
+    "flags": {<tableau filter token>: {"entity", "measure", "status", "value"}},
+    "values": {<param id>: {"table", "measure", "caption"}}}`` or ``None`` when the model exposed
+    nothing bindable (so the report keeps its precise warnings, byte-unchanged). ``values`` names
+    each what-if parameter's ``SELECTEDVALUE`` measure, which is what a consumer needs when it
+    COMPARES against a parameter instead of slicing on it.
 
     Sources (all additive; passed through, never re-derived), in priority:
       1. ``report["param_binding"]`` -- already in the consumer shape; normalised + passed through.
@@ -2430,12 +2433,14 @@ def _param_binding_from_model(res_report):
         return out
 
     direct = rr.get("param_binding")
-    if isinstance(direct, dict) and (direct.get("slicers") or direct.get("flags")):
+    if isinstance(direct, dict) and (direct.get("slicers") or direct.get("flags")
+                                     or direct.get("values")):
         return {"slicers": dict(direct.get("slicers") or {}),
-                "flags": dict(direct.get("flags") or {})}
+                "flags": dict(direct.get("flags") or {}),
+                "values": dict(direct.get("values") or {})}
 
     manifest = rr.get("model_manifest") or {}
-    slicers, flags = {}, {}
+    slicers, flags, values = {}, {}, {}
 
     for p in (manifest.get("parameters") or []):
         if not isinstance(p, dict):
@@ -2449,6 +2454,13 @@ def _param_binding_from_model(res_report):
         if pid and field:
             field["caption"] = caption
             slicers[pid] = field
+        # Additive, and independent of the slicer: a what-if parameter's SCALAR reader. A consumer
+        # that compares against a parameter (rather than slicing on it) needs this and cannot use
+        # the picker column. Keyed the same way as ``slicers`` so both sides look up alike.
+        val = p.get("value")
+        if pid and isinstance(val, dict) and val.get("table") and val.get("measure"):
+            values[pid] = {"table": val["table"], "measure": val["measure"],
+                           "caption": caption}
 
     fb = rr.get("filter_bindings") or manifest.get("filter_bindings") or {}
     for token, spec in (fb.items() if isinstance(fb, dict) else []):
@@ -2467,9 +2479,9 @@ def _param_binding_from_model(res_report):
             "visuals": list(spec.get("visuals") or []),
         }
 
-    if not slicers and not flags:
+    if not slicers and not flags and not values:
         return None
-    return {"slicers": slicers, "flags": flags}
+    return {"slicers": slicers, "flags": flags, "values": values}
 
 
 def _ds_calc_columns(ds_el):
