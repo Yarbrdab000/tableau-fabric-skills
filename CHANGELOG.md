@@ -14,6 +14,39 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.206.0` → `2.207.0`): the run now DETECTS the machine condition that
+  makes its own output unopenable, instead of only documenting it.** `2.206.0` wrote the
+  Newtonsoft/GAC blocker into troubleshooting; this makes the tool say it, unprompted, at the moment
+  it hands the work over.
+
+  `environment_preflight.py` reads the GAC (directory names only — it opens no file) and reports when
+  an outdated `Newtonsoft.Json` is registered. .NET binds a GAC assembly ahead of the copy an
+  application ships, so Power BI Desktop then fails to open **any** `.pbip`, including a brand-new
+  blank one. Surfaced as an additive `report.json` → `environment.findings` and as a loud
+  `summary.md` banner placed **above** the pending-gates section, because a user who reads it *after*
+  opening the output has already spent the time it exists to save. Also runnable on demand:
+  `py -3.11 scripts/environment_preflight.py`.
+
+  **It detects and instructs. It deliberately never repairs, and that boundary is the design.** The
+  GAC is machine-wide — registering or removing an assembly there changes binding for *every* .NET
+  application on the box, not just Desktop. The remedy needs administrator elevation, and it needs
+  `gacutil.exe` from the **Windows SDK**, which is not installed by default and was absent from the
+  machine this was written on. Most decisively: there is no repro machine for this collection, so an
+  automatic fix would be **untested surgery on someone else's environment** — the one thing this
+  codebase has been consistently unwilling to ship. Detection *is* testable, because the GAC layout
+  is a directory naming convention that can be injected; nine tests do exactly that, on a machine
+  with no `Newtonsoft.Json` registered at all.
+
+  `test_module_never_writes` is the load-bearing one: it asserts the module contains no mutation,
+  elevation or process-execution primitive, and that its only filesystem call is a directory listing.
+  That is what stops a future well-meaning change from quietly turning a read-only diagnosis into a
+  machine mutation. (Its first version was too crude and flagged the module's own *remedy text* —
+  a test asserting a convention rather than a behaviour, corrected before landing.)
+
+  Corpus: 29/29, definition of done unchanged, and the only file that differs from the previous build
+  is `report.json` carrying the new additive key. On a healthy machine the finding list is empty and
+  the banner does not render.
+
 - **`tableau-migration` (skill `2.205.0` → `2.206.0`): the blockers a real customer trial actually hit
   are documented, and two verification rules are corrected.**
 
