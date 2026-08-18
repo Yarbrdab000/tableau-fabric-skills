@@ -4801,6 +4801,18 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
         "pending_gates": _pending_gates(summary),
         "fallbacks": fallbacks,
     }
+    # MACHINE-level blockers, additive and read-only. Distinct from every other signal in this
+    # report: these say nothing about the workbook, the model or the emitted PBIR -- they say this
+    # BOX will fail to open the handover. Surfaced because a customer trial lost time to exactly
+    # that: Power BI Desktop refused to open the .pbip (and a blank one) because an outdated
+    # Newtonsoft.Json sat in the machine's GAC, and every user's first assumption was that the
+    # migration had produced something broken. Detection only -- the remedy is machine-wide, needs
+    # elevation and the Windows SDK, and is never performed here. See environment_preflight.
+    try:
+        import environment_preflight as _envpre
+        report["environment"] = {"findings": _envpre.environment_findings()}
+    except Exception:
+        report["environment"] = {"findings": []}
     # Absolute, copy-pasteable paths to every openable .pbip (additive; [] under --no-pbip). Resolved
     # here where output_dir is in scope, so the report/summary/stdout can hand the user a REAL path
     # instead of the run-relative pbip/<Name>/<Name>.pbip stored per detail.
@@ -5364,6 +5376,24 @@ def _pending_gates(summary):
     return gates
 
 
+def _environment_banner(environment):
+    """Machine-level blockers, ABOVE the gates banner and below the definition of done.
+
+    Placed high deliberately: this is the one section that says the handover will not open on THIS
+    BOX for a reason that has nothing to do with the migration. A user who reads it after opening
+    the .pbip has already spent the time this exists to save.
+    """
+    findings = ((environment or {}).get("findings")) or []
+    if not findings:
+        return []
+    lines = ["> [!WARNING]",
+             "> **This machine will not open the output — and it is not the output's fault.**", ">"]
+    for f in findings:
+        lines.append("> - **%s**: %s" % (f.get("check"), f.get("detail")))
+    lines.append("")
+    return lines
+
+
 def _pending_gates_banner(gates):
     """Render the loud 'not done until offered' section for ``summary.md``; ``[]`` when none owed."""
     if not gates:
@@ -5514,6 +5544,7 @@ def _render_summary_md(report):
         f"from {report['source'].get('kind')}._",
         "",
         *_dod_banner(report.get("definition_of_done")),
+        *_environment_banner(report.get("environment")),
         *_pending_gates_banner(report.get("pending_gates")),
         *_input_collision_banner(report),
         *_openable_outputs_md(report.get("openable_outputs")),
