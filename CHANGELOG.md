@@ -14,6 +14,37 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.162.0` → `2.165.0`): Tableau's cross-project caption suffix no
+  longer makes a published datasource unmatchable.** Raised in #145. Tableau appends
+  `" | Project : <name>"` to a published-datasource caption when the name alone would be ambiguous
+  across projects. `_norm_ds` strips punctuation and case but not **words**, so the suffix survived
+  the alphanumeric squeeze as text:
+
+  ```
+  DS_Tail_Level                                    -> dstaillevel
+  DS_Tail_Level | Project : Enterprise Dashboards  -> dstaillevelprojectenterprisedashboards
+  ```
+
+  Those can never be equal, so an estate build **silently skipped** workbooks with *"published-datasource
+  workbook — co-migrate its published datasource"* while the datasource each one needed had migrated
+  successfully in that same run. Measured in the field at **4 of 12 workbooks**.
+
+  The strip lives **inside `_norm_ds`**, not at the lookup site, so both sides of every comparison
+  are normalised identically — stripping only where the lookup happens would have reintroduced the
+  exact asymmetry #138 was, one layer up. The pattern is anchored to the end and requires the `|`
+  delimiter, so a name that merely contains the word "project" (`Project Apollo`,
+  `Capital Projects 2026`) is untouched, and it tolerates the server's spacing variants.
+
+  **Safe against the ambiguity the suffix exists to encode.** Two same-named datasources in different
+  projects now collapse to one key — which is correct *only* because the catalog already records a
+  contested key as `_AMBIGUOUS_CATALOG_ENTRY` and the lookup treats that as a miss. So such a workbook
+  is skipped with an honest reason rather than bound to whichever migrated last, which would attach a
+  wrong-schema model that renders perfectly. A test pins that failure-closed behaviour rather than
+  assuming it.
+
+  Corpus: 29/29, and a masked whole-tree diff against the previous build is **empty** (1384 files vs
+  1384, 0 differing) — no corpus caption carries the suffix, so this is inert on known-good input.
+
 - **`tableau-migration` (skill `2.160.0` → `2.162.0`): a self-check that evaluated nothing no longer
   reports an affirmative pass.** Raised in #141, and the reporter did two unusually careful things
   worth recording: they explicitly withdrew the larger change I had declined on #133 rather than

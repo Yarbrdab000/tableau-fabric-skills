@@ -2670,11 +2670,36 @@ def _blend_link_warnings(twb_text, res_report):
     return warns
 
 
+# Tableau's own cross-project disambiguation suffix on a published-datasource caption:
+# ``DS_Tail_Level | Project : Enterprise Dashboards``. It is metadata about WHERE the datasource
+# lives, not part of its name, and the server appends it only when the name would otherwise be
+# ambiguous across projects (#145). Stripped before the alphanumeric squeeze because that squeeze
+# removes the ``|`` and ``:`` that identify it. Tolerant of spacing, anchored to the END so a name
+# that merely contains the word "project" is untouched.
+_PROJECT_SUFFIX_RE = re.compile(r"\s*\|\s*project\s*:\s*.*$", re.IGNORECASE)
+
+
 def _norm_ds(name):
     """Connector-agnostic match key: lowercased with all non-alphanumerics removed, so a workbook's
     published-datasource name ('Superstore - Extract') matches the migrated datasource it became
-    ('Superstore-Extract.tds' -> 'Superstore_Extract')."""
-    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+    ('Superstore-Extract.tds' -> 'Superstore_Extract').
+
+    Tableau's cross-project suffix is dropped first (#145). It does not survive the alphanumeric
+    squeeze as punctuation -- it becomes WORDS -- so ``DS_Tail_Level`` keyed ``dstaillevel`` while
+    ``DS_Tail_Level | Project : Enterprise Dashboards`` keyed
+    ``dstaillevelprojectenterprisedashboards``, and the two could never be equal. Measured in the
+    field: 4 of 12 workbooks in one estate build were skipped as "co-migrate its published
+    datasource" while the datasource each needed had migrated successfully in that same run.
+
+    Applied INSIDE this function so both sides of every comparison are normalised identically --
+    stripping only at the lookup site would reintroduce the asymmetry that #138 was, one layer up.
+
+    Safe against the ambiguity it exists to encode: two same-named datasources in different projects
+    now collapse to one key, and the catalog already fails closed on that
+    (:data:`_AMBIGUOUS_CATALOG_ENTRY`), so the workbook is skipped with an honest reason rather than
+    bound to whichever migrated last.
+    """
+    return re.sub(r"[^a-z0-9]", "", _PROJECT_SUFFIX_RE.sub("", (name or "")).lower())
 
 
 # A catalog key two different datasources both answer to. Recorded rather than resolved: binding a
